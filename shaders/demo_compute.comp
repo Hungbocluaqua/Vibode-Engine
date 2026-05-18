@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outputImage;
+
+layout(push_constant) uniform ComputePush {
+    float time;
+    vec2 resolution;
+} pc;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputImage);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
+    vec2 p = uv * 2.0 - 1.0;
+    float wave = 0.5 + 0.5 * sin(14.0 * length(p) - pc.time * 2.4);
+    float sweep = 0.5 + 0.5 * sin((uv.x + uv.y) * 12.0 + pc.time);
+    vec3 color = mix(vec3(0.04, 0.08, 0.14), vec3(0.95, 0.52, 0.18), wave);
+    color += vec3(0.05, 0.16, 0.30) * sweep;
+    imageStore(outputImage, pixel, vec4(color, 1.0));
+}
