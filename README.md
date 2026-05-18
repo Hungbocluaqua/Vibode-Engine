@@ -258,7 +258,10 @@ Recommended next work:
 5. Expand glTF material support and add hardware RT TLAS refit/rebuild paths for transform updates.
 6. Tune temporal reprojection and denoiser debug views against the WebGPU reference.
 7. Split mixed-material hardware RT meshes into opaque, alpha, and single-sided geometry classes so more triangles can use fast opaque traversal without losing glTF material correctness.
-#   V u l k a n - R a y t r a c i n g - E n g i n e  
- #   V u l k a n - R a y t r a c i n g - E n g i n e  
- #   V u l k a n - R a y t r a c i n g - E n g i n e  
+#   V u l k a n - R a y t r a c i n g - E n g i n e 
+ 
+ #   V u l k a n - R a y t r a c i n g - E n g i n e 
+ 
+ #   V u l k a n - R a y t r a c i n g - E n g i n e 
+ 
  
