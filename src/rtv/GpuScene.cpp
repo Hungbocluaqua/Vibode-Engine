@@ -641,6 +641,10 @@ float triangleArea(glm::vec3 v0, glm::vec3 v1, glm::vec3 v2) {
     return 0.5f * glm::length(glm::cross(v1 - v0, v2 - v0));
 }
 
+float luminance(glm::vec3 value) {
+    return glm::dot(value, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+}
+
 std::vector<GpuLightRecord> buildLightRecords(
     const std::vector<GpuMeshRecord>& meshRecords,
     const std::vector<GpuInstanceRecord>& instanceRecords,
@@ -675,14 +679,16 @@ std::vector<GpuLightRecord> buildLightRecords(
             const glm::vec3 v0 = glm::vec3(instance.transform * glm::vec4(glm::vec3(localTriangleData[triBase + 0u]), 1.0f));
             const glm::vec3 v1 = glm::vec3(instance.transform * glm::vec4(glm::vec3(localTriangleData[triBase + 1u]), 1.0f));
             const glm::vec3 v2 = glm::vec3(instance.transform * glm::vec4(glm::vec3(localTriangleData[triBase + 2u]), 1.0f));
+            const glm::vec3 emissive = materialEmissive[material];
             const float area = triangleArea(v0, v1, v2);
             if (area <= 0.0f) {
                 continue;
             }
-            totalArea += area;
+            const float weight = area * std::max(luminance(emissive), 0.0001f);
+            totalArea += weight;
             lights.push_back(GpuLightRecord{
                 .metadata = {0u, packedIndex, material, instanceIndex},
-                .data0 = {area, totalArea, 0.0f, 0.0f},
+                .data0 = {weight, totalArea, 0.0f, area},
             });
         }
     }
@@ -695,17 +701,14 @@ std::vector<GpuLightRecord> buildLightRecords(
             continue;
         }
         const float area = 4.0f * 3.14159265358979323846f * sphere.w * sphere.w;
-        totalArea += area;
+        const float weight = area * std::max(luminance(emissive), 0.0001f);
+        totalArea += weight;
         lights.push_back(GpuLightRecord{
             .metadata = {1u, sphereIndex, 0u, static_cast<uint32_t>(lights.size())},
-            .data0 = {area, totalArea, sphere.w, 0.0f},
+            .data0 = {weight, totalArea, sphere.w, area},
         });
     }
     return lights;
-}
-
-float luminance(glm::vec3 value) {
-    return glm::dot(value, glm::vec3(0.2126f, 0.7152f, 0.0722f));
 }
 
 glm::vec3 safeNormalize(glm::vec3 value, glm::vec3 fallback) {
@@ -727,8 +730,9 @@ std::vector<GpuLightRecord> buildAuthoredLightRecords(const std::vector<SceneLig
         const float size = std::max(light.sizeOrRadius, 0.0001f);
         float weight = std::max(luminance(radiance), 0.0001f);
         const uint32_t type = 2u + std::min(light.type, 2u);
+        const float area = type == 4u ? size * size : 0.0f;
         if (type == 4u) {
-            weight *= size * size;
+            weight *= area;
         }
         totalWeight += weight;
 
@@ -739,7 +743,7 @@ std::vector<GpuLightRecord> buildAuthoredLightRecords(const std::vector<SceneLig
 
         GpuLightRecord record{};
         record.metadata = {type, i, 0u, 0u};
-        record.data0 = {weight, totalWeight, size, 0.0f};
+        record.data0 = {weight, totalWeight, size, area};
         record.data1 = type == 2u ? glm::vec4(toLightDirection, normal.x) : glm::vec4(position, normal.x);
         record.data2 = {radiance, normal.y};
         record.data3 = {normal.z, 0.0f, 0.0f, 0.0f};
@@ -2178,8 +2182,8 @@ void GpuScene::createEnvironment(BufferUploader& uploader) {
         BatchUploader batch(uploader);
         batch.begin();
         batch.enqueueImageUpload(*environmentImage_, halfPixels.data(), sizeof(uint16_t) * halfPixels.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        uploadVectorBatched(batch, envRows_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, importance.rowCdf, "environment row cdf");
-        uploadVectorBatched(batch, envCols_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, importance.columnCdf, "environment col cdf");
+        uploadVectorBatched(batch, envRows_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, importance.rowAlias, "environment row alias");
+        uploadVectorBatched(batch, envCols_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, importance.columnAlias, "environment col alias");
         batch.submit();
     }
 

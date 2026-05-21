@@ -11,6 +11,58 @@ namespace {
     return 0.2126f * r + 0.7152f * g + 0.0722f * b;
 }
 
+[[nodiscard]] std::vector<glm::vec2> buildAliasTable(const std::vector<float>& weights) {
+    const uint32_t count = static_cast<uint32_t>(weights.size());
+    std::vector<glm::vec2> table(count, glm::vec2(1.0f, 0.0f));
+    if (count == 0) {
+        return table;
+    }
+
+    float total = 0.0f;
+    for (float weight : weights) {
+        total += std::max(weight, 0.0f);
+    }
+    if (total <= 1.0e-10f) {
+        for (uint32_t i = 0; i < count; ++i) {
+            table[i] = glm::vec2(1.0f, static_cast<float>(i));
+        }
+        return table;
+    }
+
+    std::vector<float> scaled(count);
+    std::vector<uint32_t> small;
+    std::vector<uint32_t> large;
+    small.reserve(count);
+    large.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        scaled[i] = std::max(weights[i], 0.0f) * static_cast<float>(count) / total;
+        if (scaled[i] < 1.0f) {
+            small.push_back(i);
+        } else {
+            large.push_back(i);
+        }
+    }
+
+    while (!small.empty() && !large.empty()) {
+        const uint32_t s = small.back();
+        small.pop_back();
+        const uint32_t l = large.back();
+        table[s] = glm::vec2(scaled[s], static_cast<float>(l));
+        scaled[l] = (scaled[l] + scaled[s]) - 1.0f;
+        if (scaled[l] < 1.0f) {
+            large.pop_back();
+            small.push_back(l);
+        }
+    }
+    for (uint32_t index : large) {
+        table[index] = glm::vec2(1.0f, static_cast<float>(index));
+    }
+    for (uint32_t index : small) {
+        table[index] = glm::vec2(1.0f, static_cast<float>(index));
+    }
+    return table;
+}
+
 [[nodiscard]] uint16_t float32ToHalf(float value) {
     if (!std::isfinite(value) || value <= 0.0f) {
         return 0;
@@ -37,10 +89,11 @@ namespace {
 
 EnvironmentImportanceData EnvironmentImportanceSampler::build(const float* rgba, uint32_t width, uint32_t height) {
     EnvironmentImportanceData result;
-    result.rowCdf.resize(height);
-    result.columnCdf.resize(static_cast<size_t>(width) * height);
+    result.rowAlias.resize(height);
+    result.columnAlias.resize(static_cast<size_t>(width) * height);
 
     std::vector<float> weightedLuminance(static_cast<size_t>(width) * height);
+    std::vector<float> rowWeights(height);
     float total = 0.0f;
     for (uint32_t y = 0; y < height; ++y) {
         const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
@@ -52,29 +105,21 @@ EnvironmentImportanceData EnvironmentImportanceSampler::build(const float* rgba,
             const float lum = luminance(rgba[rgbaIdx + 0], rgba[rgbaIdx + 1], rgba[rgbaIdx + 2]) * sinTheta;
             weightedLuminance[idx] = lum;
             total += lum;
+            rowWeights[y] += lum;
         }
     }
 
     result.invTotalLuminance = total > 1.0e-10f ? 1.0f / total : 0.0f;
-    float rowAccum = 0.0f;
+    result.rowAlias = buildAliasTable(rowWeights);
     for (uint32_t y = 0; y < height; ++y) {
-        float rowTotal = 0.0f;
+        std::vector<float> columnWeights(width);
         for (uint32_t x = 0; x < width; ++x) {
-            rowTotal += weightedLuminance[static_cast<size_t>(y) * width + x];
+            columnWeights[x] = weightedLuminance[static_cast<size_t>(y) * width + x];
         }
-        rowAccum += rowTotal * result.invTotalLuminance;
-        result.rowCdf[y] = total > 1.0e-10f ? rowAccum : (static_cast<float>(y) + 1.0f) / static_cast<float>(height);
-
-        float colAccum = 0.0f;
+        std::vector<glm::vec2> rowAlias = buildAliasTable(columnWeights);
         for (uint32_t x = 0; x < width; ++x) {
-            const size_t idx = static_cast<size_t>(y) * width + x;
-            colAccum += rowTotal > 1.0e-10f ? weightedLuminance[idx] / rowTotal : 1.0f / static_cast<float>(width);
-            result.columnCdf[idx] = colAccum;
+            result.columnAlias[static_cast<size_t>(y) * width + x] = rowAlias[x];
         }
-        result.columnCdf[static_cast<size_t>(y) * width + width - 1u] = 1.0f;
-    }
-    if (!result.rowCdf.empty()) {
-        result.rowCdf.back() = 1.0f;
     }
     return result;
 }

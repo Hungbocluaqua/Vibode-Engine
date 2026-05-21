@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <vector>
 
+#include <glm/glm.hpp>
+
 namespace rtv {
 
 struct EnvironmentImportanceData {
-    std::vector<float> rowCdf;
-    std::vector<float> columnCdf;
+    std::vector<glm::vec2> rowAlias;
+    std::vector<glm::vec2> columnAlias;
     float invTotalLuminance = 0.0f;
 };
 

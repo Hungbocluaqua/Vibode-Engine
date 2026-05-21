@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 35>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 35> views = {
+const std::array<RendererDebugView, 38>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 38> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -43,6 +43,9 @@ const std::array<RendererDebugView, 35>& editorDebugViews() {
         RendererDebugView::AtmosphereMultiScatter,
         RendererDebugView::TemporalReactiveMask,
         RendererDebugView::TemporalHistoryWeight,
+        RendererDebugView::RestirReservoirAge,
+        RendererDebugView::RestirReservoirConfidence,
+        RendererDebugView::RestirReservoirM,
     };
     return views;
 }

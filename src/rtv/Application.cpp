@@ -38,7 +38,7 @@ constexpr uint64_t largeSceneTriangleThreshold = 1'000'000ull;
 
 RendererDebugView nextDebugView(RendererDebugView view) {
     const uint32_t raw = static_cast<uint32_t>(view);
-    const uint32_t next = raw >= static_cast<uint32_t>(RendererDebugView::TemporalHistoryWeight) ? 0u : raw + 1u;
+    const uint32_t next = raw >= static_cast<uint32_t>(RendererDebugView::RestirReservoirM) ? 0u : raw + 1u;
     return static_cast<RendererDebugView>(next);
 }
 
@@ -106,6 +106,7 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.sunElevation = settings.sunElevation;
     render.sunAngularRadius = settings.sunAngularRadius;
     render.indirectStrength = settings.indirectStrength;
+    render.restirMode = settings.restirMode;
     render.denoiserEnabled = settings.denoiserEnabled;
     render.atrousIterations = settings.atrousIterations;
     render.denoiserStrength = settings.denoiserStrength;
@@ -151,6 +152,7 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.sunElevation = render.sunElevation;
     settings.sunAngularRadius = render.sunAngularRadius;
     settings.indirectStrength = render.indirectStrength;
+    settings.restirMode = render.restirMode;
     settings.denoiserEnabled = render.denoiserEnabled;
     settings.atrousIterations = render.atrousIterations;
     settings.denoiserStrength = render.denoiserStrength;
@@ -260,6 +262,7 @@ Application::Application(
     RendererBackend requestedBackend,
     std::optional<std::filesystem::path> scenePath,
     std::optional<bool> denoiserOverride,
+    std::optional<RestirMode> restirModeOverride,
     bool debugViewOverride)
     : debugView_(debugView),
       requestedBackend_(requestedBackend),
@@ -267,6 +270,7 @@ Application::Application(
       hdrPath_(std::move(hdrPath)),
       scenePath_(std::move(scenePath)),
       denoiserOverride_(denoiserOverride),
+      restirModeOverride_(restirModeOverride),
       debugViewOverride_(debugViewOverride) {
     initWindow();
     initVulkan();
@@ -388,7 +392,11 @@ void Application::initVulkan() {
     if (denoiserOverride_.has_value()) {
         startupSettings.denoiserEnabled = *denoiserOverride_;
     }
-    createPathTracer((loadedSceneDocument || importedScene_.has_value() || denoiserOverride_.has_value()) ? &startupSettings : nullptr);
+    if (restirModeOverride_.has_value()) {
+        startupSettings.restirMode = *restirModeOverride_;
+        syncDocumentRenderSettings(sceneDocument_, startupSettings);
+    }
+    createPathTracer((loadedSceneDocument || importedScene_.has_value() || denoiserOverride_.has_value() || restirModeOverride_.has_value()) ? &startupSettings : nullptr);
     applyActiveSceneCamera();
     sceneDocument_.clearDirty();
     uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_);

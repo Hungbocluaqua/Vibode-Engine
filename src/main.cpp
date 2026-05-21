@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 
 int main(int argc, char** argv) {
     try {
@@ -19,6 +20,7 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> hdrPath;
         std::optional<std::filesystem::path> scenePath;
         std::optional<bool> denoiserOverride;
+        std::optional<rtv::RestirMode> restirModeOverride;
         rtv::RendererBackend backend = rtv::RendererBackend::Auto;
         for (int i = 1; i < argc; ++i) {
             if (std::string_view(argv[i]) == "--frames" && i + 1 < argc) {
@@ -37,10 +39,21 @@ int main(int argc, char** argv) {
             } else if (std::string_view(argv[i]) == "--denoiser" && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 denoiserOverride = !(value == "off" || value == "false" || value == "0");
+            } else if (std::string_view(argv[i]) == "--restir" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "classic" || value == "off" || value == "nee") {
+                    restirModeOverride = rtv::RestirMode::ClassicNee;
+                } else if (value == "restir" || value == "on" || value == "only") {
+                    restirModeOverride = rtv::RestirMode::RestirOnly;
+                } else if (value == "hybrid" || value == "compare") {
+                    restirModeOverride = rtv::RestirMode::HybridCompare;
+                } else {
+                    throw std::runtime_error("Unknown ReSTIR mode: " + std::string(value));
+                }
             }
         }
 
-        rtv::Application app(debugView, gltfPath, hdrPath, backend, scenePath, denoiserOverride, debugViewProvided);
+        rtv::Application app(debugView, gltfPath, hdrPath, backend, scenePath, denoiserOverride, restirModeOverride, debugViewProvided);
         app.run(maxFrames);
         return 0;
     } catch (const std::exception& error) {

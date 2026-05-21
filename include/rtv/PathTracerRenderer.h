@@ -70,6 +70,7 @@ struct RendererSettings {
     float histogramTargetPercentile = 0.60f;
     float sunAngularRadius = 0.0093f;
     float indirectStrength = 1.0f;
+    RestirMode restirMode = RestirMode::ClassicNee;
     float environmentIntensity = 1.0f;
     float environmentRotation = 0.0f;
     float environmentBackgroundIntensity = 0.35f;
@@ -230,10 +231,26 @@ private:
         uint32_t padding = 0;
     };
 
+    struct RestirSpatialParams {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t frameCount = 0;
+        uint32_t enabled = 0;
+    };
+
+    struct RestirReservoirGpu {
+        glm::uvec4 metadata{};
+        glm::vec4 sampleValueConfidence{};
+        glm::vec4 targetPdfWeightSumM{};
+    };
+
     void createResolutionResources(VkExtent2D extent);
     void updateCamera();
     void recordPathTraceGraph(VkCommandBuffer commandBuffer);
     void recordPathTracePass(VkCommandBuffer commandBuffer);
+    void recordRestirSpatial(VkCommandBuffer commandBuffer);
+    void recordRestirSpatialPass(VkCommandBuffer commandBuffer);
+    void recordRestirSpatialCopyPass(VkCommandBuffer commandBuffer);
     void recordDenoiser(VkCommandBuffer commandBuffer);
     void recordDenoiserPass(VkCommandBuffer commandBuffer);
     void recordTaa(VkCommandBuffer commandBuffer);
@@ -251,6 +268,7 @@ private:
     void copyHistoryResourcesPass(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool shouldRunDenoiser() const;
     [[nodiscard]] bool shouldRunTaa() const;
+    [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] const Image& postDenoiseImage() const;
     [[nodiscard]] const Image& hdrPostProcessImage() const;
     void skipDenoiserPass(VkCommandBuffer commandBuffer);
@@ -273,6 +291,7 @@ private:
     RendererSettings settings_{};
     DenoiserParams denoiserParams_{};
     TaaParams taaParams_{};
+    RestirSpatialParams restirSpatialParams_{};
     PrevCameraUniform prevCamera_{};
     RendererDebugParams debugParams_{};
     RendererBackend requestedBackend_ = RendererBackend::Auto;
@@ -298,6 +317,9 @@ private:
     Buffer previousWorldPositionBuffer_;
     Buffer velocityBuffer_;
     Buffer entityIdBuffer_;
+    Buffer restirReservoirBuffer_;
+    Buffer previousRestirReservoirBuffer_;
+    Buffer restirSpatialReservoirBuffer_;
     Buffer selectionParamsBuffer_;
     Buffer histogramBuffer_;
     Buffer exposureBuffer_;
@@ -309,6 +331,7 @@ private:
     std::unique_ptr<ShaderModule> pathTraceShader_;
     std::unique_ptr<ShaderModule> denoiserShader_;
     std::unique_ptr<ShaderModule> taaShader_;
+    std::unique_ptr<ShaderModule> restirSpatialShader_;
     std::unique_ptr<ShaderModule> transmittanceShader_;
     std::unique_ptr<ShaderModule> multiScatterShader_;
     std::unique_ptr<ShaderModule> skyViewShader_;
@@ -328,6 +351,7 @@ private:
     std::unique_ptr<ComputePipeline> pathTracePipeline_;
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
     std::unique_ptr<ComputePipeline> taaPipeline_;
+    std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
     std::unique_ptr<ComputePipeline> selectionOutlinePipeline_;
     std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
     std::unique_ptr<ComputePipeline> exposureReducePipeline_;
@@ -341,6 +365,7 @@ private:
     VkDescriptorSetLayout rayTracingSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout selectionOutlineSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout luminanceHistogramSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout exposureReduceSetLayout_ = VK_NULL_HANDLE;

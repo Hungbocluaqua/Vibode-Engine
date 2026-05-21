@@ -50,6 +50,15 @@ enum class RendererDebugView : uint32_t {
     AtmosphereMultiScatter = 32,
     TemporalReactiveMask = 33,
     TemporalHistoryWeight = 34,
+    RestirReservoirAge = 35,
+    RestirReservoirConfidence = 36,
+    RestirReservoirM = 37,
+};
+
+enum class RestirMode : uint32_t {
+    ClassicNee = 0,
+    RestirOnly = 1,
+    HybridCompare = 2,
 };
 
 struct RendererDebugParams {
@@ -60,6 +69,7 @@ struct RendererDebugParams {
 };
 
 [[nodiscard]] const char* toneMapperName(ToneMapper toneMapper);
+[[nodiscard]] const char* restirModeName(RestirMode mode);
 [[nodiscard]] RendererDebugView parseRendererDebugView(std::string_view value);
 [[nodiscard]] const char* rendererDebugViewName(RendererDebugView view);
 

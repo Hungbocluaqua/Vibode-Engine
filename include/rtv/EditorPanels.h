@@ -103,7 +103,7 @@ struct EditorRequests {
     bool exit = false;
 };
 
-[[nodiscard]] const std::array<RendererDebugView, 35>& editorDebugViews();
+[[nodiscard]] const std::array<RendererDebugView, 38>& editorDebugViews();
 [[nodiscard]] int editorDebugViewIndex(RendererDebugView view);
 void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& changed);
 void requestSettings(EditorRequests& requests, const RendererSettings& settings);
