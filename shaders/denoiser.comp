@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "temporal_common.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -16,11 +19,12 @@ layout(set = 0, binding = 5, std140) uniform DenoiserParams {
     uint height;
     uint atrous_iterations;
     uint debug_view;
-    uint _padding1;
+    uint reset_history;
 } params;
 
 layout(set = 0, binding = 6, std430) readonly buffer WorldPosition { uvec2 world_position[]; };
 layout(set = 0, binding = 7, std430) readonly buffer PrevWorldPosition { uvec2 prev_world_position[]; };
+layout(set = 0, binding = 9, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
 
 layout(set = 0, binding = 8, std140) uniform PrevCamera {
     mat4 view_proj;
@@ -28,6 +32,7 @@ layout(set = 0, binding = 8, std140) uniform PrevCamera {
     mat4 prev_view_proj;
     vec4 current_pos;
     vec4 prev_pos;
+    vec4 jitter;
 } prev_camera;
 
 float luminance(vec3 c) {
@@ -56,6 +61,12 @@ vec2 unpack_snorm2x16(uint packedValue) {
     return unpack_unorm2x16(packedValue) * 2.0 - vec2(1.0);
 }
 
+uint pack_snorm2x16(vec2 value) {
+    vec2 v = clamp(value, vec2(-1.0), vec2(1.0)) * 0.5 + vec2(0.5);
+    uvec2 packedValue = uvec2(round(v * 65535.0));
+    return (packedValue.y << 16u) | packedValue.x;
+}
+
 vec3 decode_octahedral_normal(uint packedValue) {
     vec2 f = unpack_snorm2x16(packedValue);
     vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
@@ -82,15 +93,63 @@ vec3 decode_world_position(uvec2 packedValue, vec3 origin) {
     return origin + vec3(xy.x, xy.y, z) * 8.0;
 }
 
-vec2 reproject_history(ivec2 coords, vec3 worldPos, ivec2 dims) {
-    vec4 clip = prev_camera.prev_view_proj * vec4(worldPos, 1.0);
+vec3 reconstruct_current_world_position(ivec2 coords, float depth, ivec2 dims) {
+    if (!is_surface_depth(depth)) {
+        return vec3(0.0, 1.0e10, 0.0);
+    }
+
+    vec2 uv = (vec2(coords) + vec2(0.5)) / vec2(dims);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 world_far = prev_camera.inv_view_proj * vec4(ndc, 1.0, 1.0);
+    if (abs(world_far.w) <= 1.0e-6) {
+        return decode_world_position(world_position[uint(coords.y) * uint(dims.x) + uint(coords.x)], prev_camera.current_pos.xyz);
+    }
+
+    vec3 ray_dir = world_far.xyz / world_far.w - prev_camera.current_pos.xyz;
+    if (dot(ray_dir, ray_dir) <= 1.0e-8) {
+        return decode_world_position(world_position[uint(coords.y) * uint(dims.x) + uint(coords.x)], prev_camera.current_pos.xyz);
+    }
+
+    return prev_camera.current_pos.xyz + normalize(ray_dir) * depth;
+}
+
+vec2 project_world_to_pixels(mat4 viewProj, vec3 worldPos, ivec2 dims) {
+    vec4 clip = viewProj * vec4(worldPos, 1.0);
     if (clip.w <= 0.0) {
-        return vec2(coords);
+        return vec2(-1.0);
     }
     vec3 ndc = clip.xyz / clip.w;
+    if (ndc.z < 0.0 || ndc.z > 1.0001) {
+        return vec2(-1.0);
+    }
     return vec2(
-        (ndc.x * 0.5 + 0.5) * float(dims.x),
-        (1.0 - (ndc.y * 0.5 + 0.5)) * float(dims.y));
+        (ndc.x * 0.5 + 0.5) * float(dims.x) - 0.5,
+        (ndc.y * 0.5 + 0.5) * float(dims.y) - 0.5);
+}
+
+vec2 project_world_to_history(vec3 worldPos, ivec2 dims) {
+    return project_world_to_pixels(prev_camera.prev_view_proj, worldPos, dims);
+}
+
+vec2 reproject_history(ivec2 coords, vec3 worldPos, ivec2 dims) {
+    return project_world_to_history(worldPos, dims);
+}
+
+vec2 reproject_sky_history(ivec2 coords, ivec2 dims) {
+    vec2 uv = (vec2(coords) + vec2(0.5)) / vec2(dims);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 world_far = prev_camera.inv_view_proj * vec4(ndc, 1.0, 1.0);
+    if (abs(world_far.w) <= 1.0e-6) {
+        return vec2(-1.0);
+    }
+
+    vec3 current_far = world_far.xyz / world_far.w;
+    vec3 sky_dir = current_far - prev_camera.current_pos.xyz;
+    if (dot(sky_dir, sky_dir) <= 1.0e-8) {
+        return vec2(-1.0);
+    }
+
+    return project_world_to_history(prev_camera.prev_pos.xyz + normalize(sky_dir) * 512.0, dims);
 }
 
 vec3 bilinear_history_color(vec2 historyPos, ivec2 dims) {
@@ -123,18 +182,6 @@ vec3 bilinear_prev_world(vec2 historyPos, ivec2 dims) {
     vec3 w01 = decode_world_position(prev_world_position[i01], prev_camera.prev_pos.xyz);
     vec3 w11 = decode_world_position(prev_world_position[i11], prev_camera.prev_pos.xyz);
     return mix(mix(w00, w10, fracValue.x), mix(w01, w11, fracValue.x), fracValue.y);
-}
-
-vec3 clip_history_luminance(vec3 history, vec3 center, float lumMean, float lumSigma, vec3 colorMin, vec3 colorMax, float clipScale) {
-    vec3 paddedMin = max(vec3(0.0), colorMin - vec3(0.02 + lumSigma * 0.35));
-    vec3 paddedMax = colorMax + vec3(0.02 + lumSigma * 0.35);
-    vec3 clipped = clamp(history, paddedMin, paddedMax);
-    float histLum = max(luminance(clipped), 1.0e-5);
-    float minLum = max(0.0, lumMean - lumSigma * clipScale);
-    float maxLum = lumMean + lumSigma * clipScale;
-    float targetLum = clamp(histLum, minLum, maxLum);
-    clipped *= targetLum / histLum;
-    return mix(clipped, center, 0.03);
 }
 
 void main() {
@@ -237,38 +284,47 @@ void main() {
     float lum_variance = max(lum_sq_sum / max(neighborhood_count, 1.0) - lum_mean * lum_mean, 0.0);
     float lum_sigma = sqrt(lum_variance);
 
-    vec3 wp = decode_world_position(world_position[pixel_index], prev_camera.current_pos.xyz);
-    vec2 history_pos = reproject_history(coords, wp, dims);
     bool sky_valid = !is_surface_depth(center_depth);
-    if (sky_valid) {
-        history_pos = vec2(coords);
+    vec3 wp = reconstruct_current_world_position(coords, center_depth, dims);
+    vec2 history_pos = sky_valid ? reproject_sky_history(coords, dims) : reproject_history(coords, wp, dims);
+    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], 64.0);
+    vec2 velocity_history_pos = temporal_reproject_pixel(coords, velocity_pixels);
+    bool velocity_on_screen = temporal_history_pixel_valid(velocity_history_pos, dims, 0.0);
+    if (velocity_on_screen) {
+        history_pos = velocity_history_pos;
     }
-    bool on_screen = sky_valid || (history_pos.x >= 0.0 && history_pos.y >= 0.0 && history_pos.x < float(dims.x - 1) && history_pos.y < float(dims.y - 1));
+    bool on_screen = params.reset_history == 0u && temporal_history_pixel_valid(history_pos, dims, 0.0);
+    vec2 history_sample_pos = on_screen ? history_pos : vec2(coords);
 
-    vec3 history = bilinear_history_color(history_pos, dims);
-    vec3 reprojected_wp = bilinear_prev_world(history_pos, dims);
+    vec3 history = bilinear_history_color(history_sample_pos, dims);
+    vec3 reprojected_wp = bilinear_prev_world(history_sample_pos, dims);
     float pos_diff = length(wp - reprojected_wp);
-    float relative_pos_diff = pos_diff / max(length(wp), 0.25);
-    bool world_valid = is_surface_depth(center_depth) && reprojected_wp.y < 1.0e9;
-    float pos_confidence = sky_valid ? 1.0 : exp(-relative_pos_diff * 18.0);
-    float normal_cone_confidence = smoothstep(0.35, 0.92, normal_cone_min);
-    float depth_edge_confidence = exp(-max_relative_depth_delta * 6.0);
-    float disocclusion_confidence = (on_screen && (world_valid || sky_valid)) ? pos_confidence * normal_cone_confidence * depth_edge_confidence : 0.0;
+    float relative_pos_diff = pos_diff / max(center_depth, 0.25);
+    bool previous_sky_valid = reprojected_wp.y > 9.0e9;
+    bool world_valid = is_surface_depth(center_depth) && !previous_sky_valid;
+    bool history_kind_valid = sky_valid ? previous_sky_valid : world_valid;
+    float disocclusion_confidence = sky_valid
+        ? (on_screen && history_kind_valid ? 1.0 : 0.0)
+        : temporal_disocclusion_confidence(
+            on_screen,
+            history_kind_valid,
+            relative_pos_diff,
+            normal_cone_min,
+            max_relative_depth_delta);
 
     float history_lum_before_clip = luminance(history);
-    history = clip_history_luminance(history, filtered_color, lum_mean, lum_sigma, min_color, max_color, 1.8);
+    history = temporal_clamp_history_ycocg(history, min_color, max_color, lum_sigma);
     float history_lum_after_clip = luminance(history);
     float lum_delta = abs(history_lum_before_clip - center_lum) / (max(center_lum, history_lum_before_clip) + 0.02);
     float clipped_lum_delta = abs(history_lum_before_clip - history_lum_after_clip) / (history_lum_before_clip + 0.02);
-    float reactive_mask = clamp(max(lum_delta - 0.18, clipped_lum_delta) * 2.5, 0.0, 1.0);
+    float neighborhood_lum_delta = abs(history_lum_before_clip - lum_mean) / (lum_mean + lum_sigma + 0.02);
+    float reactive_mask = temporal_reactive_weight(lum_delta, clipped_lum_delta, neighborhood_lum_delta);
 
-    float confidence = exp(-max(center_var, 0.0) * 10.0);
-    float fast_motion = clamp(length(history_pos - vec2(coords)) / 24.0, 0.0, 1.0);
-    float motion_confidence = 1.0 - fast_motion * 0.65;
+    float confidence = temporal_variance_confidence(center_var, 10.0);
+    float motion_confidence = temporal_motion_confidence(velocity_pixels, 24.0, 0.35);
     float specular_rejection = 1.0 - reactive_mask * mix(0.65, 0.95, confidence);
-    float base_alpha = mix(0.04, 0.88, confidence) * disocclusion_confidence * motion_confidence * specular_rejection;
-    float frame_blend = clamp(float(params.frame_count - 1u) / 30.0, 0.0, 1.0);
-    float history_weight = base_alpha * frame_blend;
+    float frame_blend = params.reset_history != 0u ? 0.0 : clamp(float(params.frame_count - 1u) / 30.0, 0.0, 1.0);
+    float history_weight = temporal_history_weight(confidence, disocclusion_confidence, motion_confidence, reactive_mask, frame_blend);
     float denoiser_rejection = 1.0 - clamp(disocclusion_confidence * motion_confidence * specular_rejection, 0.0, 1.0);
 
     vec3 debug_color = filtered_color;
@@ -280,6 +336,13 @@ void main() {
         debug_color = vec3(disocclusion_confidence);
     } else if (params.debug_view == 4u) {
         debug_color = vec3(denoiser_rejection, 1.0 - denoiser_rejection, 0.0);
+    } else if (params.debug_view == 28u) {
+        vec2 visual_velocity = clamp(velocity_pixels / 32.0, vec2(-1.0), vec2(1.0));
+        debug_color = vec3(visual_velocity * 0.5 + vec2(0.5), clamp(length(velocity_pixels) / 32.0, 0.0, 1.0));
+    } else if (params.debug_view == 33u) {
+        debug_color = vec3(reactive_mask, 1.0 - reactive_mask, 0.0);
+    } else if (params.debug_view == 34u) {
+        debug_color = vec3(history_weight);
     }
 
     vec3 denoised = params.debug_view == 0u ? mix(filtered_color, history, history_weight) : debug_color;

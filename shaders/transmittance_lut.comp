@@ -1,0 +1,64 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "atmosphere_phase.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D transmittance_lut;
+
+layout(push_constant) uniform TransmittanceParams {
+    vec4 planet_radius_atmosphere_radius;
+    vec4 rayleigh_scattering;
+    vec4 mie_scattering_anisotropy;
+    vec4 absorption_ground_albedo;
+    vec4 scale_heights;
+    vec4 sun_illuminance;
+} params;
+
+vec3 lut_extinction_at_height(float heightMeters) {
+    float rayleighDensity = exp(-heightMeters / max(params.scale_heights.x, 1.0));
+    float mieDensity = exp(-heightMeters / max(params.scale_heights.y, 1.0));
+    float ozoneDensity = max(1.0 - abs(heightMeters - params.scale_heights.z) / max(params.scale_heights.w, 1.0), 0.0);
+    return params.rayleigh_scattering.xyz * rayleighDensity +
+        params.mie_scattering_anisotropy.xyz * mieDensity +
+        params.absorption_ground_albedo.xyz * ozoneDensity;
+}
+
+vec3 integrate_transmittance(float heightMeters, float mu) {
+    float planetRadius = params.planet_radius_atmosphere_radius.x;
+    float atmosphereRadius = params.planet_radius_atmosphere_radius.y;
+    vec3 origin = vec3(0.0, planetRadius + heightMeters, 0.0);
+    float sinTheta = sqrt(max(1.0 - mu * mu, 0.0));
+    vec3 dir = normalize(vec3(sinTheta, mu, 0.0));
+    float tNear;
+    float tFar;
+    if (!atmosphere_ray_sphere_intersection(origin, dir, atmosphereRadius, tNear, tFar)) {
+        return vec3(1.0);
+    }
+
+    const int sampleCount = 32;
+    float segmentLength = tFar / float(sampleCount);
+    vec3 opticalDepth = vec3(0.0);
+    for (int i = 0; i < sampleCount; ++i) {
+        float t = (float(i) + 0.5) * segmentLength;
+        vec3 samplePos = origin + dir * t;
+        float h = max(length(samplePos) - planetRadius, 0.0);
+        opticalDepth += lut_extinction_at_height(h) * segmentLength;
+    }
+    return exp(-opticalDepth);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(transmittance_lut);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(dims);
+    float heightMeters = uv.y * max(params.planet_radius_atmosphere_radius.y - params.planet_radius_atmosphere_radius.x, 1.0);
+    float mu = mix(-0.20, 1.0, uv.x);
+    vec3 transmittance = integrate_transmittance(heightMeters, mu);
+    imageStore(transmittance_lut, pixel, vec4(transmittance, 1.0));
+}

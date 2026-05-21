@@ -28,7 +28,7 @@ public:
     void setPipelineDemo(PipelineDemo* demo) { pipelineDemo_ = demo; }
     void setPathTracer(PathTracerRenderer* renderer) { pathTracer_ = renderer; }
     void setUiOverlay(UiOverlay* overlay) { uiOverlay_ = overlay; }
-    void drawFrame(float clearPhase);
+    void drawFrame(float clearPhase, float deltaSeconds);
     void waitIdle() const;
 
 private:

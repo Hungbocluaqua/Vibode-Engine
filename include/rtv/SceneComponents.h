@@ -94,18 +94,38 @@ struct Environment {
 
 struct RenderSettings {
     bool pathTracingEnabled = true;
+    bool cameraJitterEnabled = true;
     bool directLightingEnabled = true;
     uint32_t maxBounces = 8;
     uint32_t environmentDirectSamples = 1;
-    float exposure = 0.75f;
+    ToneMapper toneMapper = ToneMapper::ACES;
+    float exposure = 2.0f;
+    float gamma = 2.2f;
+    float contrast = 1.0f;
+    float saturation = 1.0f;
+    float brightness = 0.0f;
+    float whitePoint = 4.0f;
+    bool autoExposureEnabled = false;
+    float targetLuminance = 0.18f;
+    float minExposure = 0.25f;
+    float maxExposure = 8.0f;
+    float adaptationSpeed = 2.0f;
+    float histogramMinLogLuminance = -10.0f;
+    float histogramMaxLogLuminance = 10.0f;
+    float histogramLowPercentile = 0.05f;
+    float histogramHighPercentile = 0.95f;
+    float histogramTargetPercentile = 0.60f;
     bool sunlightEnabled = true;
     float sunIntensity = 1.0f;
     float skyIntensity = 0.8f;
+    float sunElevation = 0.97f;
     float sunAngularRadius = 0.0093f;
     float indirectStrength = 1.0f;
     bool denoiserEnabled = true;
     uint32_t atrousIterations = 4;
     float denoiserStrength = 1.0f;
+    bool taaEnabled = true;
+    float taaFeedback = 0.08f;
     RendererDebugView debugView = RendererDebugView::Beauty;
     bool accumulate = true;
     uint32_t accumulationLimit = 0;
@@ -120,7 +140,9 @@ enum class SceneUpdateKind : uint32_t {
     LightOnly,
     EnvironmentOnly,
     CameraOnly,
-    FullSceneRebuild,
+    VisibilityOnly,
+    TopologyChanged,
+    RendererSettingsOnly,
 };
 
 [[nodiscard]] const char* sceneUpdateKindName(SceneUpdateKind kind);

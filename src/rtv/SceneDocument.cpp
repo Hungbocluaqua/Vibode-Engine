@@ -6,27 +6,14 @@
 #include <iomanip>
 #include <sstream>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
+
+#include <nlohmann/json.hpp>
 
 namespace rtv {
 
 namespace {
-
-std::string escapeJson(std::string_view text) {
-    std::string result;
-    result.reserve(text.size());
-    for (char ch : text) {
-        if (ch == '\\' || ch == '"') {
-            result.push_back('\\');
-        }
-        result.push_back(ch);
-    }
-    return result;
-}
-
-void writeVec3(std::ostream& out, glm::vec3 value) {
-    out << '[' << value.x << ',' << value.y << ',' << value.z << ']';
-}
 
 glm::vec3 translationFromMatrix(const glm::mat4& matrix) {
     return glm::vec3(matrix[3]);
@@ -55,6 +42,25 @@ glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
     return glm::eulerAngles(glm::quat_cast(rotation));
 }
 
+nlohmann::json vec3Json(glm::vec3 value) {
+    return nlohmann::json::array({value.x, value.y, value.z});
+}
+
+glm::vec3 vec3FromJson(const nlohmann::json& json, glm::vec3 fallback = glm::vec3{0.0f}) {
+    if (!json.is_array() || json.size() < 3) {
+        return fallback;
+    }
+    return {
+        json[0].get<float>(),
+        json[1].get<float>(),
+        json[2].get<float>(),
+    };
+}
+
+uint64_t stableEntityKey(EntityId id) {
+    return (static_cast<uint64_t>(id.generation) << 32u) | id.index;
+}
+
 } // namespace
 
 void SceneDocument::setEnvironment(Environment environment) {
@@ -64,7 +70,7 @@ void SceneDocument::setEnvironment(Environment environment) {
 
 void SceneDocument::setRenderSettings(RenderSettings settings) {
     renderSettings_ = settings;
-    markDirty(SceneUpdateKind::CameraOnly);
+    markDirty(SceneUpdateKind::RendererSettingsOnly);
 }
 
 void SceneDocument::setActiveCamera(EntityId id) {
@@ -114,9 +120,11 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
     sceneMaterials_ = scene.materials;
     sceneMeshes_ = scene.meshes;
 
+    std::vector<EntityId> nodeEntities(scene.nodes.size());
     for (uint32_t i = 0; i < scene.nodes.size(); ++i) {
         const SceneNodeAsset& node = scene.nodes[i];
         EntityId id = registry_.createEntity(node.name.empty() ? "Node " + std::to_string(i) : node.name);
+        nodeEntities[i] = id;
         Entity* entity = registry_.entity(id);
         if (entity == nullptr) {
             continue;
@@ -145,8 +153,44 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
         }
     }
 
+    for (uint32_t i = 0; i < scene.nodes.size(); ++i) {
+        Entity* entity = registry_.entity(nodeEntities[i]);
+        if (entity == nullptr) {
+            continue;
+        }
+        const SceneNodeAsset& node = scene.nodes[i];
+        if (node.parent >= 0 && static_cast<uint32_t>(node.parent) < nodeEntities.size()) {
+            entity->parent = nodeEntities[static_cast<uint32_t>(node.parent)];
+        }
+        entity->children.clear();
+        for (uint32_t child : node.children) {
+            if (child < nodeEntities.size() && nodeEntities[child].valid()) {
+                entity->children.push_back(nodeEntities[child]);
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < scene.lights.size(); ++i) {
+        const SceneLightAsset& source = scene.lights[i];
+        EntityId id = registry_.createEntity("Light " + std::to_string(i));
+        Entity* entity = registry_.entity(id);
+        if (entity == nullptr) {
+            continue;
+        }
+        entity->transform.position = translationFromMatrix(source.transform);
+        entity->transform.rotationEuler = eulerFromMatrix(source.transform);
+        entity->transform.scale = scaleFromMatrix(source.transform);
+        Light light;
+        light.type = static_cast<LightType>(std::min(source.type, 2u));
+        light.color = source.color;
+        light.intensity = source.intensity;
+        light.sizeOrRadius = source.sizeOrRadius;
+        light.enabled = source.enabled;
+        entity->light = light;
+    }
+
     clearDirty();
-    markDirty(SceneUpdateKind::FullSceneRebuild);
+    markDirty(SceneUpdateKind::TopologyChanged);
 }
 
 SceneAsset SceneDocument::toSceneAsset() const {
@@ -160,13 +204,18 @@ SceneAsset SceneDocument::toSceneAsset() const {
     scene.meshes = sceneMeshes_;
 
     std::vector<const Entity*> entities = registry_.entities();
+    std::unordered_map<uint64_t, uint32_t> nodeIndexForEntity;
+    nodeIndexForEntity.reserve(entities.size());
     scene.nodes.reserve(entities.size());
     for (const Entity* entity : entities) {
         SceneNodeAsset node;
         node.name = entity->name;
         node.transform = entity->transform.localMatrix();
-        if (entity->meshRenderer.has_value() && entity->meshRenderer->visible && entity->meshRenderer->visibleToCamera) {
+        if (entity->meshRenderer.has_value()) {
             node.mesh = entity->meshRenderer->mesh;
+            node.visible = entity->meshRenderer->visible;
+            node.castShadow = entity->meshRenderer->castShadow;
+            node.visibleToCamera = entity->meshRenderer->visibleToCamera;
             if (node.mesh.valid()) {
                 scene.meshes.push_back(node.mesh);
             }
@@ -177,8 +226,40 @@ SceneAsset SceneDocument::toSceneAsset() const {
                 }
             }
         }
+        nodeIndexForEntity.emplace((static_cast<uint64_t>(entity->id.generation) << 32u) | entity->id.index, static_cast<uint32_t>(scene.nodes.size()));
         scene.nodes.push_back(node);
-        scene.rootNodes.push_back(static_cast<uint32_t>(scene.nodes.size() - 1u));
+    }
+
+    for (size_t i = 0; i < entities.size(); ++i) {
+        const Entity* entity = entities[i];
+        SceneNodeAsset& node = scene.nodes[i];
+        if (entity->parent.valid()) {
+            const uint64_t key = (static_cast<uint64_t>(entity->parent.generation) << 32u) | entity->parent.index;
+            const auto it = nodeIndexForEntity.find(key);
+            if (it != nodeIndexForEntity.end()) {
+                node.parent = static_cast<int32_t>(it->second);
+            }
+        }
+        for (EntityId child : entity->children) {
+            const uint64_t key = (static_cast<uint64_t>(child.generation) << 32u) | child.index;
+            const auto it = nodeIndexForEntity.find(key);
+            if (it != nodeIndexForEntity.end()) {
+                node.children.push_back(it->second);
+            }
+        }
+        if (node.parent < 0) {
+            scene.rootNodes.push_back(static_cast<uint32_t>(i));
+        }
+        if (entity->light.has_value()) {
+            SceneLightAsset light;
+            light.type = static_cast<uint32_t>(entity->light->type);
+            light.transform = entity->transform.localMatrix();
+            light.color = entity->light->color;
+            light.intensity = entity->light->intensity;
+            light.sizeOrRadius = entity->light->sizeOrRadius;
+            light.enabled = entity->light->enabled;
+            scene.lights.push_back(light);
+        }
     }
 
     std::sort(scene.meshes.begin(), scene.meshes.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index < b.index; });
@@ -194,79 +275,118 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         return false;
     }
 
-    out << std::setprecision(9);
-    out << "{\n";
-    out << "  \"sourceGltf\": \"" << escapeJson(sourceGltfPath_.has_value() ? sourceGltfPath_->string() : "") << "\",\n";
-    out << "  \"sourceHdr\": \"" << escapeJson(sourceHdrPath_.has_value() ? sourceHdrPath_->string() : "") << "\",\n";
-    out << "  \"environment\": {\"hdrPath\":\"" << escapeJson(environment_.hdrPath.string()) << "\",\"intensity\":" << environment_.intensity
-        << ",\"rotation\":" << environment_.rotation
-        << ",\"backgroundIntensity\":" << environment_.backgroundIntensity
-        << ",\"enabled\":" << (environment_.enabled ? "true" : "false") << "},\n";
-    out << "  \"renderSettings\": {\"pathTracingEnabled\":" << (renderSettings_.pathTracingEnabled ? "true" : "false")
-        << ",\"directLightingEnabled\":" << (renderSettings_.directLightingEnabled ? "true" : "false")
-        << ",\"maxBounces\":" << renderSettings_.maxBounces
-        << ",\"environmentDirectSamples\":" << renderSettings_.environmentDirectSamples
-        << ",\"exposure\":" << renderSettings_.exposure
-        << ",\"sunlightEnabled\":" << (renderSettings_.sunlightEnabled ? "true" : "false")
-        << ",\"sunIntensity\":" << renderSettings_.sunIntensity
-        << ",\"skyIntensity\":" << renderSettings_.skyIntensity
-        << ",\"sunAngularRadius\":" << renderSettings_.sunAngularRadius
-        << ",\"indirectStrength\":" << renderSettings_.indirectStrength
-        << ",\"denoiserEnabled\":" << (renderSettings_.denoiserEnabled ? "true" : "false")
-        << ",\"atrousIterations\":" << renderSettings_.atrousIterations << ",\"denoiserStrength\":" << renderSettings_.denoiserStrength
-        << ",\"debugView\":" << static_cast<uint32_t>(renderSettings_.debugView)
-        << ",\"resolutionScale\":" << renderSettings_.resolutionScale << "},\n";
-    out << "  \"entities\": [\n";
+    nlohmann::json root;
+    root["version"] = 1;
+    root["sourceGltf"] = sourceGltfPath_.has_value() ? sourceGltfPath_->string() : "";
+    root["sourceHdr"] = sourceHdrPath_.has_value() ? sourceHdrPath_->string() : "";
+    root["activeCamera"] = activeCamera_.valid() ? stableEntityKey(activeCamera_) : 0u;
+    root["environment"] = {
+        {"hdrPath", environment_.hdrPath.string()},
+        {"intensity", environment_.intensity},
+        {"rotation", environment_.rotation},
+        {"backgroundIntensity", environment_.backgroundIntensity},
+        {"enabled", environment_.enabled},
+    };
+    root["renderSettings"] = {
+        {"pathTracingEnabled", renderSettings_.pathTracingEnabled},
+        {"cameraJitterEnabled", renderSettings_.cameraJitterEnabled},
+        {"directLightingEnabled", renderSettings_.directLightingEnabled},
+        {"maxBounces", renderSettings_.maxBounces},
+        {"environmentDirectSamples", renderSettings_.environmentDirectSamples},
+        {"toneMapper", static_cast<uint32_t>(renderSettings_.toneMapper)},
+        {"exposure", renderSettings_.exposure},
+        {"gamma", renderSettings_.gamma},
+        {"contrast", renderSettings_.contrast},
+        {"saturation", renderSettings_.saturation},
+        {"brightness", renderSettings_.brightness},
+        {"whitePoint", renderSettings_.whitePoint},
+        {"autoExposureEnabled", renderSettings_.autoExposureEnabled},
+        {"targetLuminance", renderSettings_.targetLuminance},
+        {"minExposure", renderSettings_.minExposure},
+        {"maxExposure", renderSettings_.maxExposure},
+        {"adaptationSpeed", renderSettings_.adaptationSpeed},
+        {"histogramMinLogLuminance", renderSettings_.histogramMinLogLuminance},
+        {"histogramMaxLogLuminance", renderSettings_.histogramMaxLogLuminance},
+        {"histogramLowPercentile", renderSettings_.histogramLowPercentile},
+        {"histogramHighPercentile", renderSettings_.histogramHighPercentile},
+        {"histogramTargetPercentile", renderSettings_.histogramTargetPercentile},
+        {"sunlightEnabled", renderSettings_.sunlightEnabled},
+        {"sunIntensity", renderSettings_.sunIntensity},
+        {"skyIntensity", renderSettings_.skyIntensity},
+        {"sunElevation", renderSettings_.sunElevation},
+        {"sunAngularRadius", renderSettings_.sunAngularRadius},
+        {"indirectStrength", renderSettings_.indirectStrength},
+        {"denoiserEnabled", renderSettings_.denoiserEnabled},
+        {"atrousIterations", renderSettings_.atrousIterations},
+        {"denoiserStrength", renderSettings_.denoiserStrength},
+        {"taaEnabled", renderSettings_.taaEnabled},
+        {"taaFeedback", renderSettings_.taaFeedback},
+        {"debugView", static_cast<uint32_t>(renderSettings_.debugView)},
+        {"accumulate", renderSettings_.accumulate},
+        {"accumulationLimit", renderSettings_.accumulationLimit},
+        {"resolutionScale", renderSettings_.resolutionScale},
+        {"requestedBackend", static_cast<uint32_t>(renderSettings_.requestedBackend)},
+    };
+
+    root["entities"] = nlohmann::json::array();
     const std::vector<const Entity*> entities = registry_.entities();
-    for (size_t i = 0; i < entities.size(); ++i) {
-        const Entity& entity = *entities[i];
-        out << "    {\"id\":{\"index\":" << entity.id.index << ",\"generation\":" << entity.id.generation << "},";
-        out << "\"name\":\"" << escapeJson(entity.name) << "\",";
-        out << "\"transform\":{\"position\":";
-        writeVec3(out, entity.transform.position);
-        out << ",\"rotationEuler\":";
-        writeVec3(out, entity.transform.rotationEuler);
-        out << ",\"scale\":";
-        writeVec3(out, entity.transform.scale);
-        out << "}";
+    for (const Entity* entityPtr : entities) {
+        const Entity& entity = *entityPtr;
+        nlohmann::json item;
+        item["id"] = {{"index", entity.id.index}, {"generation", entity.id.generation}, {"stable", stableEntityKey(entity.id)}};
+        item["parent"] = entity.parent.valid() ? stableEntityKey(entity.parent) : 0u;
+        item["children"] = nlohmann::json::array();
+        for (EntityId child : entity.children) {
+            item["children"].push_back(stableEntityKey(child));
+        }
+        item["name"] = entity.name;
+        item["locked"] = entity.locked;
+        item["transform"] = {
+            {"position", vec3Json(entity.transform.position)},
+            {"rotationEuler", vec3Json(entity.transform.rotationEuler)},
+            {"scale", vec3Json(entity.transform.scale)},
+        };
         if (entity.meshRenderer.has_value()) {
-            out << ",\"meshRenderer\":{\"mesh\":" << entity.meshRenderer->mesh.index
-                << ",\"visible\":" << (entity.meshRenderer->visible ? "true" : "false")
-                << ",\"castShadow\":" << (entity.meshRenderer->castShadow ? "true" : "false")
-                << ",\"visibleToCamera\":" << (entity.meshRenderer->visibleToCamera ? "true" : "false")
-                << ",\"materialSlots\":[";
+            nlohmann::json renderer;
+            renderer["mesh"] = entity.meshRenderer->mesh.index;
+            renderer["visible"] = entity.meshRenderer->visible;
+            renderer["castShadow"] = entity.meshRenderer->castShadow;
+            renderer["visibleToCamera"] = entity.meshRenderer->visibleToCamera;
+            renderer["materialSlots"] = nlohmann::json::array();
             for (size_t slotIndex = 0; slotIndex < entity.meshRenderer->materialSlots.size(); ++slotIndex) {
                 const MaterialSlot& slot = entity.meshRenderer->materialSlots[slotIndex];
-                out << "{\"name\":\"" << escapeJson(slot.name) << "\",\"material\":" << slot.material.index;
+                nlohmann::json slotJson = {
+                    {"name", slot.name},
+                    {"material", slot.material.index},
+                };
                 if (slot.overrideMaterial.has_value()) {
-                    out << ",\"overrideMaterial\":" << slot.overrideMaterial->index;
+                    slotJson["overrideMaterial"] = slot.overrideMaterial->index;
                 }
-                out << "}";
-                if (slotIndex + 1u < entity.meshRenderer->materialSlots.size()) {
-                    out << ',';
-                }
+                renderer["materialSlots"].push_back(std::move(slotJson));
             }
-            out << "]}";
+            item["meshRenderer"] = std::move(renderer);
         }
         if (entity.light.has_value()) {
-            out << ",\"light\":{\"type\":" << static_cast<uint32_t>(entity.light->type) << ",\"color\":";
-            writeVec3(out, entity.light->color);
-            out << ",\"intensity\":" << entity.light->intensity << ",\"sizeOrRadius\":" << entity.light->sizeOrRadius
-                << ",\"enabled\":" << (entity.light->enabled ? "true" : "false") << "}";
+            item["light"] = {
+                {"type", static_cast<uint32_t>(entity.light->type)},
+                {"color", vec3Json(entity.light->color)},
+                {"intensity", entity.light->intensity},
+                {"sizeOrRadius", entity.light->sizeOrRadius},
+                {"enabled", entity.light->enabled},
+            };
         }
         if (entity.camera.has_value()) {
-            out << ",\"camera\":{\"verticalFovRadians\":" << entity.camera->verticalFovRadians
-                << ",\"nearPlane\":" << entity.camera->nearPlane << ",\"farPlane\":" << entity.camera->farPlane
-                << ",\"active\":" << (entity.camera->active ? "true" : "false") << "}";
+            item["camera"] = {
+                {"verticalFovRadians", entity.camera->verticalFovRadians},
+                {"nearPlane", entity.camera->nearPlane},
+                {"farPlane", entity.camera->farPlane},
+                {"active", entity.camera->active},
+                {"useRenderSettingsExposure", entity.camera->useRenderSettingsExposure},
+            };
         }
-        out << "}";
-        if (i + 1u < entities.size()) {
-            out << ',';
-        }
-        out << '\n';
+        root["entities"].push_back(std::move(item));
     }
-    out << "  ]\n";
-    out << "}\n";
+    out << std::setw(2) << root << '\n';
     return true;
 }
 
@@ -276,159 +396,172 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         return false;
     }
 
-    std::stringstream buffer;
-    buffer << in.rdbuf();
-    const std::string json = buffer.str();
-    auto stringValue = [&](std::string_view key) -> std::optional<std::string> {
-        const std::string needle = "\"" + std::string(key) + "\": \"";
-        size_t begin = json.find(needle);
-        if (begin == std::string::npos) {
-            return std::nullopt;
-        }
-        begin += needle.size();
-        const size_t end = json.find('"', begin);
-        if (end == std::string::npos) {
-            return std::nullopt;
-        }
-        return json.substr(begin, end - begin);
-    };
-
-    if (auto gltf = stringValue("sourceGltf"); gltf.has_value() && !gltf->empty()) {
-        sourceGltfPath_ = *gltf;
-    }
-    if (auto hdr = stringValue("sourceHdr"); hdr.has_value() && !hdr->empty()) {
-        sourceHdrPath_ = *hdr;
-        environment_.hdrPath = *hdr;
+    nlohmann::json root;
+    try {
+        in >> root;
+    } catch (...) {
+        return false;
     }
 
-    auto numberAfter = [](const std::string& text, std::string_view key, float fallback) {
-        const std::string needle = "\"" + std::string(key) + "\":";
-        size_t begin = text.find(needle);
-        if (begin == std::string::npos) {
-            return fallback;
-        }
-        begin += needle.size();
-        return std::strtof(text.c_str() + begin, nullptr);
-    };
-    auto uintAfter = [&](const std::string& text, std::string_view key, uint32_t fallback) {
-        return static_cast<uint32_t>(std::max(0.0f, numberAfter(text, key, static_cast<float>(fallback))));
-    };
-    auto boolAfter = [](const std::string& text, std::string_view key, bool fallback) {
-        const std::string needle = "\"" + std::string(key) + "\":";
-        size_t begin = text.find(needle);
-        if (begin == std::string::npos) {
-            return fallback;
-        }
-        begin += needle.size();
-        return text.compare(begin, 4, "true") == 0 ? true : text.compare(begin, 5, "false") == 0 ? false : fallback;
-    };
-    auto vec3After = [](const std::string& text, std::string_view key, glm::vec3 fallback) {
-        const std::string needle = "\"" + std::string(key) + "\":[";
-        size_t begin = text.find(needle);
-        if (begin == std::string::npos) {
-            return fallback;
-        }
-        begin += needle.size();
-        glm::vec3 value = fallback;
-        value.x = std::strtof(text.c_str() + begin, nullptr);
-        begin = text.find(',', begin);
-        if (begin == std::string::npos) {
-            return value;
-        }
-        value.y = std::strtof(text.c_str() + begin + 1u, nullptr);
-        begin = text.find(',', begin + 1u);
-        if (begin == std::string::npos) {
-            return value;
-        }
-        value.z = std::strtof(text.c_str() + begin + 1u, nullptr);
-        return value;
-    };
-    auto nameAfter = [](const std::string& text, std::string_view key, std::string fallback) {
-        const std::string needle = "\"" + std::string(key) + "\":\"";
-        size_t begin = text.find(needle);
-        if (begin == std::string::npos) {
-            return fallback;
-        }
-        begin += needle.size();
-        const size_t end = text.find('"', begin);
-        return end == std::string::npos ? fallback : text.substr(begin, end - begin);
-    };
+    sourceGltfPath_.reset();
+    sourceHdrPath_.reset();
+    if (const std::string source = root.value("sourceGltf", std::string{}); !source.empty()) {
+        sourceGltfPath_ = source;
+    }
+    if (const std::string source = root.value("sourceHdr", std::string{}); !source.empty()) {
+        sourceHdrPath_ = source;
+        environment_.hdrPath = source;
+    }
 
-    environment_.enabled = boolAfter(json, "enabled", environment_.enabled);
-    environment_.intensity = numberAfter(json, "intensity", environment_.intensity);
-    environment_.rotation = numberAfter(json, "rotation", environment_.rotation);
-    environment_.backgroundIntensity = numberAfter(json, "backgroundIntensity", environment_.backgroundIntensity);
-
-    renderSettings_.pathTracingEnabled = boolAfter(json, "pathTracingEnabled", renderSettings_.pathTracingEnabled);
-    renderSettings_.directLightingEnabled = boolAfter(json, "directLightingEnabled", renderSettings_.directLightingEnabled);
-    renderSettings_.maxBounces = uintAfter(json, "maxBounces", renderSettings_.maxBounces);
-    renderSettings_.environmentDirectSamples = uintAfter(json, "environmentDirectSamples", renderSettings_.environmentDirectSamples);
-    renderSettings_.exposure = numberAfter(json, "exposure", renderSettings_.exposure);
-    renderSettings_.sunlightEnabled = boolAfter(json, "sunlightEnabled", renderSettings_.sunlightEnabled);
-    renderSettings_.sunIntensity = numberAfter(json, "sunIntensity", renderSettings_.sunIntensity);
-    renderSettings_.skyIntensity = numberAfter(json, "skyIntensity", renderSettings_.skyIntensity);
-    renderSettings_.sunAngularRadius = numberAfter(json, "sunAngularRadius", renderSettings_.sunAngularRadius);
-    renderSettings_.indirectStrength = numberAfter(json, "indirectStrength", renderSettings_.indirectStrength);
-    renderSettings_.denoiserEnabled = boolAfter(json, "denoiserEnabled", renderSettings_.denoiserEnabled);
-    renderSettings_.atrousIterations = uintAfter(json, "atrousIterations", renderSettings_.atrousIterations);
-    renderSettings_.denoiserStrength = numberAfter(json, "denoiserStrength", renderSettings_.denoiserStrength);
-    renderSettings_.debugView = static_cast<RendererDebugView>(uintAfter(json, "debugView", static_cast<uint32_t>(renderSettings_.debugView)));
-    renderSettings_.resolutionScale = numberAfter(json, "resolutionScale", renderSettings_.resolutionScale);
+    if (root.contains("environment")) {
+        const nlohmann::json& env = root["environment"];
+        environment_.hdrPath = env.value("hdrPath", environment_.hdrPath.string());
+        environment_.intensity = env.value("intensity", environment_.intensity);
+        environment_.rotation = env.value("rotation", environment_.rotation);
+        environment_.backgroundIntensity = env.value("backgroundIntensity", environment_.backgroundIntensity);
+        environment_.enabled = env.value("enabled", environment_.enabled);
+    }
+    if (root.contains("renderSettings")) {
+        const nlohmann::json& render = root["renderSettings"];
+        renderSettings_.pathTracingEnabled = render.value("pathTracingEnabled", renderSettings_.pathTracingEnabled);
+        renderSettings_.cameraJitterEnabled = render.value("cameraJitterEnabled", renderSettings_.cameraJitterEnabled);
+        renderSettings_.directLightingEnabled = render.value("directLightingEnabled", renderSettings_.directLightingEnabled);
+        renderSettings_.maxBounces = render.value("maxBounces", renderSettings_.maxBounces);
+        renderSettings_.environmentDirectSamples = render.value("environmentDirectSamples", renderSettings_.environmentDirectSamples);
+        renderSettings_.toneMapper = static_cast<ToneMapper>(render.value("toneMapper", static_cast<uint32_t>(renderSettings_.toneMapper)));
+        renderSettings_.exposure = render.value("exposure", renderSettings_.exposure);
+        renderSettings_.gamma = render.value("gamma", renderSettings_.gamma);
+        renderSettings_.contrast = render.value("contrast", renderSettings_.contrast);
+        renderSettings_.saturation = render.value("saturation", renderSettings_.saturation);
+        renderSettings_.brightness = render.value("brightness", renderSettings_.brightness);
+        renderSettings_.whitePoint = render.value("whitePoint", renderSettings_.whitePoint);
+        renderSettings_.autoExposureEnabled = render.value("autoExposureEnabled", renderSettings_.autoExposureEnabled);
+        renderSettings_.targetLuminance = render.value("targetLuminance", renderSettings_.targetLuminance);
+        renderSettings_.minExposure = render.value("minExposure", renderSettings_.minExposure);
+        renderSettings_.maxExposure = render.value("maxExposure", renderSettings_.maxExposure);
+        renderSettings_.adaptationSpeed = render.value("adaptationSpeed", renderSettings_.adaptationSpeed);
+        renderSettings_.histogramMinLogLuminance = render.value("histogramMinLogLuminance", renderSettings_.histogramMinLogLuminance);
+        renderSettings_.histogramMaxLogLuminance = render.value("histogramMaxLogLuminance", renderSettings_.histogramMaxLogLuminance);
+        renderSettings_.histogramLowPercentile = render.value("histogramLowPercentile", renderSettings_.histogramLowPercentile);
+        renderSettings_.histogramHighPercentile = render.value("histogramHighPercentile", renderSettings_.histogramHighPercentile);
+        renderSettings_.histogramTargetPercentile = render.value("histogramTargetPercentile", renderSettings_.histogramTargetPercentile);
+        renderSettings_.sunlightEnabled = render.value("sunlightEnabled", renderSettings_.sunlightEnabled);
+        renderSettings_.sunIntensity = render.value("sunIntensity", renderSettings_.sunIntensity);
+        renderSettings_.skyIntensity = render.value("skyIntensity", renderSettings_.skyIntensity);
+        renderSettings_.sunElevation = render.value("sunElevation", renderSettings_.sunElevation);
+        renderSettings_.sunAngularRadius = render.value("sunAngularRadius", renderSettings_.sunAngularRadius);
+        renderSettings_.indirectStrength = render.value("indirectStrength", renderSettings_.indirectStrength);
+        renderSettings_.denoiserEnabled = render.value("denoiserEnabled", renderSettings_.denoiserEnabled);
+        renderSettings_.atrousIterations = render.value("atrousIterations", renderSettings_.atrousIterations);
+        renderSettings_.denoiserStrength = render.value("denoiserStrength", renderSettings_.denoiserStrength);
+        renderSettings_.taaEnabled = render.value("taaEnabled", renderSettings_.taaEnabled);
+        renderSettings_.taaFeedback = render.value("taaFeedback", renderSettings_.taaFeedback);
+        renderSettings_.debugView = static_cast<RendererDebugView>(render.value("debugView", static_cast<uint32_t>(renderSettings_.debugView)));
+        renderSettings_.accumulate = render.value("accumulate", renderSettings_.accumulate);
+        renderSettings_.accumulationLimit = render.value("accumulationLimit", renderSettings_.accumulationLimit);
+        renderSettings_.resolutionScale = render.value("resolutionScale", renderSettings_.resolutionScale);
+        renderSettings_.requestedBackend = static_cast<RendererBackend>(render.value("requestedBackend", static_cast<uint32_t>(renderSettings_.requestedBackend)));
+    }
 
     registry_ = SceneRegistry{};
     sceneMeshes_.clear();
     sceneMaterials_.clear();
     activeCamera_ = {};
-    std::istringstream lines(json);
-    std::string line;
-    while (std::getline(lines, line)) {
-        if (line.find("\"id\"") == std::string::npos || line.find("\"transform\"") == std::string::npos) {
-            continue;
-        }
 
-        const EntityId id = registry_.createEntity(nameAfter(line, "name", "Entity"));
+    std::unordered_map<uint64_t, EntityId> idMap;
+    std::vector<std::pair<EntityId, uint64_t>> pendingParents;
+    for (const nlohmann::json& item : root.value("entities", nlohmann::json::array())) {
+        const EntityId id = registry_.createEntity(item.value("name", std::string{"Entity"}));
         Entity* entity = registry_.entity(id);
         if (entity == nullptr) {
             continue;
         }
-        entity->transform.position = vec3After(line, "position", entity->transform.position);
-        entity->transform.rotationEuler = vec3After(line, "rotationEuler", entity->transform.rotationEuler);
-        entity->transform.scale = vec3After(line, "scale", entity->transform.scale);
+        const uint64_t stable = item.contains("id") ? item["id"].value("stable", stableEntityKey(id)) : stableEntityKey(id);
+        idMap.emplace(stable, id);
+        pendingParents.push_back({id, item.value("parent", uint64_t{0})});
+        entity->locked = item.value("locked", false);
 
-        if (line.find("\"meshRenderer\"") != std::string::npos) {
+        if (item.contains("transform")) {
+            const nlohmann::json& transform = item["transform"];
+            entity->transform.position = vec3FromJson(transform.value("position", nlohmann::json::array()), entity->transform.position);
+            entity->transform.rotationEuler = vec3FromJson(transform.value("rotationEuler", nlohmann::json::array()), entity->transform.rotationEuler);
+            entity->transform.scale = vec3FromJson(transform.value("scale", nlohmann::json::array()), entity->transform.scale);
+        }
+
+        if (item.contains("meshRenderer")) {
+            const nlohmann::json& source = item["meshRenderer"];
             MeshRenderer renderer;
-            renderer.mesh = MeshAssetHandle{uintAfter(line, "mesh", UINT32_MAX)};
-            renderer.visible = boolAfter(line, "visible", true);
-            renderer.castShadow = boolAfter(line, "castShadow", true);
-            renderer.visibleToCamera = boolAfter(line, "visibleToCamera", true);
+            renderer.mesh = MeshAssetHandle{source.value("mesh", UINT32_MAX)};
+            renderer.visible = source.value("visible", true);
+            renderer.castShadow = source.value("castShadow", true);
+            renderer.visibleToCamera = source.value("visibleToCamera", true);
+            for (const nlohmann::json& slotSource : source.value("materialSlots", nlohmann::json::array())) {
+                MaterialSlot slot;
+                slot.name = slotSource.value("name", std::string{});
+                slot.material = MaterialAssetHandle{slotSource.value("material", UINT32_MAX)};
+                if (slotSource.contains("overrideMaterial")) {
+                    slot.overrideMaterial = MaterialAssetHandle{slotSource.value("overrideMaterial", UINT32_MAX)};
+                }
+                renderer.materialSlots.push_back(slot);
+                if (slot.resolvedMaterial().valid()) {
+                    sceneMaterials_.push_back(slot.resolvedMaterial());
+                }
+            }
             if (renderer.mesh.valid()) {
                 sceneMeshes_.push_back(renderer.mesh);
             }
-            const uint32_t material = uintAfter(line, "material", UINT32_MAX);
-            if (material != UINT32_MAX) {
-                renderer.materialSlots.push_back(MaterialSlot{.name = "slot 0", .material = MaterialAssetHandle{material}});
-                sceneMaterials_.push_back(MaterialAssetHandle{material});
-            }
             entity->meshRenderer = std::move(renderer);
         }
-        if (line.find("\"light\"") != std::string::npos) {
+        if (item.contains("light")) {
+            const nlohmann::json& source = item["light"];
             Light light;
-            light.type = static_cast<LightType>(uintAfter(line, "type", static_cast<uint32_t>(LightType::Point)));
-            light.color = vec3After(line, "color", light.color);
-            light.intensity = numberAfter(line, "intensity", light.intensity);
-            light.sizeOrRadius = numberAfter(line, "sizeOrRadius", light.sizeOrRadius);
-            light.enabled = boolAfter(line, "enabled", true);
+            light.type = static_cast<LightType>(source.value("type", static_cast<uint32_t>(LightType::Point)));
+            light.color = vec3FromJson(source.value("color", nlohmann::json::array()), light.color);
+            light.intensity = source.value("intensity", light.intensity);
+            light.sizeOrRadius = source.value("sizeOrRadius", light.sizeOrRadius);
+            light.enabled = source.value("enabled", true);
             entity->light = light;
         }
-        if (line.find("\"camera\"") != std::string::npos) {
+        if (item.contains("camera")) {
+            const nlohmann::json& source = item["camera"];
             Camera camera;
-            camera.verticalFovRadians = numberAfter(line, "verticalFovRadians", camera.verticalFovRadians);
-            camera.nearPlane = numberAfter(line, "nearPlane", camera.nearPlane);
-            camera.farPlane = numberAfter(line, "farPlane", camera.farPlane);
-            camera.active = boolAfter(line, "active", false);
+            camera.verticalFovRadians = source.value("verticalFovRadians", camera.verticalFovRadians);
+            camera.nearPlane = source.value("nearPlane", camera.nearPlane);
+            camera.farPlane = source.value("farPlane", camera.farPlane);
+            camera.active = source.value("active", false);
+            camera.useRenderSettingsExposure = source.value("useRenderSettingsExposure", camera.useRenderSettingsExposure);
             entity->camera = camera;
             if (camera.active) {
                 activeCamera_ = id;
+            }
+        }
+    }
+
+    for (const auto& [child, parentStable] : pendingParents) {
+        if (parentStable == 0u) {
+            continue;
+        }
+        const auto it = idMap.find(parentStable);
+        Entity* childEntity = registry_.entity(child);
+        Entity* parentEntity = it != idMap.end() ? registry_.entity(it->second) : nullptr;
+        if (childEntity != nullptr && parentEntity != nullptr) {
+            childEntity->parent = parentEntity->id;
+            parentEntity->children.push_back(child);
+        }
+    }
+
+    const uint64_t activeStable = root.value("activeCamera", uint64_t{0});
+    if (activeStable != 0u) {
+        const auto it = idMap.find(activeStable);
+        if (it != idMap.end() && registry_.camera(it->second) != nullptr) {
+            setActiveCamera(it->second);
+        }
+    }
+    if (!activeCamera_.valid()) {
+        for (Entity* entity : registry_.entities()) {
+            if (entity->camera.has_value()) {
+                setActiveCamera(entity->id);
+                break;
             }
         }
     }
@@ -437,7 +570,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     sceneMeshes_.erase(std::unique(sceneMeshes_.begin(), sceneMeshes_.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index == b.index; }), sceneMeshes_.end());
     std::sort(sceneMaterials_.begin(), sceneMaterials_.end(), [](MaterialAssetHandle a, MaterialAssetHandle b) { return a.index < b.index; });
     sceneMaterials_.erase(std::unique(sceneMaterials_.begin(), sceneMaterials_.end(), [](MaterialAssetHandle a, MaterialAssetHandle b) { return a.index == b.index; }), sceneMaterials_.end());
-    markDirty(SceneUpdateKind::FullSceneRebuild);
+    markDirty(SceneUpdateKind::TopologyChanged);
     return true;
 }
 
@@ -451,10 +584,16 @@ SceneUpdateKind SceneDocument::combine(SceneUpdateKind current, SceneUpdateKind 
     if (current == next) {
         return current;
     }
-    if (current == SceneUpdateKind::FullSceneRebuild || next == SceneUpdateKind::FullSceneRebuild) {
-        return SceneUpdateKind::FullSceneRebuild;
+    if (current == SceneUpdateKind::RendererSettingsOnly) {
+        return next;
     }
-    return SceneUpdateKind::FullSceneRebuild;
+    if (next == SceneUpdateKind::RendererSettingsOnly) {
+        return current;
+    }
+    if (current == SceneUpdateKind::TopologyChanged || next == SceneUpdateKind::TopologyChanged) {
+        return SceneUpdateKind::TopologyChanged;
+    }
+    return SceneUpdateKind::TopologyChanged;
 }
 
 } // namespace rtv

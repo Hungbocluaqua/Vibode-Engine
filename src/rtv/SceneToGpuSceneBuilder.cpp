@@ -16,18 +16,38 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     const RenderSettings& render = document.renderSettings();
     const Environment& environment = document.environment();
     result.rendererSettings.pathTracingEnabled = render.pathTracingEnabled;
+    result.rendererSettings.cameraJitterEnabled = render.cameraJitterEnabled;
     result.rendererSettings.directLightingEnabled = render.directLightingEnabled;
     result.rendererSettings.maxBounces = render.maxBounces;
     result.rendererSettings.environmentDirectSamples = render.environmentDirectSamples;
+    result.rendererSettings.toneMapper = render.toneMapper;
     result.rendererSettings.exposure = render.exposure;
+    result.rendererSettings.gamma = render.gamma;
+    result.rendererSettings.contrast = render.contrast;
+    result.rendererSettings.saturation = render.saturation;
+    result.rendererSettings.brightness = render.brightness;
+    result.rendererSettings.whitePoint = render.whitePoint;
+    result.rendererSettings.autoExposureEnabled = render.autoExposureEnabled;
+    result.rendererSettings.targetLuminance = render.targetLuminance;
+    result.rendererSettings.minExposure = render.minExposure;
+    result.rendererSettings.maxExposure = render.maxExposure;
+    result.rendererSettings.adaptationSpeed = render.adaptationSpeed;
+    result.rendererSettings.histogramMinLogLuminance = render.histogramMinLogLuminance;
+    result.rendererSettings.histogramMaxLogLuminance = render.histogramMaxLogLuminance;
+    result.rendererSettings.histogramLowPercentile = render.histogramLowPercentile;
+    result.rendererSettings.histogramHighPercentile = render.histogramHighPercentile;
+    result.rendererSettings.histogramTargetPercentile = render.histogramTargetPercentile;
     result.rendererSettings.sunlightEnabled = render.sunlightEnabled;
     result.rendererSettings.sunIntensity = render.sunIntensity;
     result.rendererSettings.skyIntensity = render.skyIntensity;
+    result.rendererSettings.sunElevation = render.sunElevation;
     result.rendererSettings.sunAngularRadius = render.sunAngularRadius;
     result.rendererSettings.indirectStrength = render.indirectStrength;
     result.rendererSettings.denoiserEnabled = render.denoiserEnabled;
     result.rendererSettings.atrousIterations = render.atrousIterations;
     result.rendererSettings.denoiserStrength = render.denoiserStrength;
+    result.rendererSettings.taaEnabled = render.taaEnabled;
+    result.rendererSettings.taaFeedback = render.taaFeedback;
     result.rendererSettings.debugView = render.debugView;
     result.rendererSettings.environmentEnabled = environment.enabled;
     result.rendererSettings.environmentIntensity = environment.intensity;
@@ -35,14 +55,37 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.environmentBackgroundIntensity = environment.backgroundIntensity;
     result.rendererSettings.renderResolutionScale = render.resolutionScale;
 
-    for (const Entity* entity : document.registry().entities()) {
-        if (entity->meshRenderer.has_value() && entity->meshRenderer->visible && entity->meshRenderer->visibleToCamera) {
-            result.instanceEntities.push_back(entity->id);
+    const std::vector<const Entity*> entities = document.registry().entities();
+    auto appendInstanceEntity = [&](uint32_t nodeIndex) {
+        if (nodeIndex < result.sceneAsset.nodes.size() &&
+            nodeIndex < entities.size() &&
+            result.sceneAsset.nodes[nodeIndex].mesh.valid()) {
+            result.instanceEntities.push_back(entities[nodeIndex]->id);
+        }
+    };
+    auto visitNode = [&](auto&& self, uint32_t nodeIndex) -> void {
+        if (nodeIndex >= result.sceneAsset.nodes.size()) {
+            return;
+        }
+        appendInstanceEntity(nodeIndex);
+        for (uint32_t child : result.sceneAsset.nodes[nodeIndex].children) {
+            self(self, child);
+        }
+    };
+    if (!result.sceneAsset.rootNodes.empty()) {
+        for (uint32_t root : result.sceneAsset.rootNodes) {
+            visitNode(visitNode, root);
+        }
+    } else {
+        for (uint32_t i = 0; i < result.sceneAsset.nodes.size(); ++i) {
+            if (result.sceneAsset.nodes[i].parent < 0) {
+                visitNode(visitNode, i);
+            }
         }
     }
 
     result.accumulationReason = accumulationReasonFor(result.updateKind);
-    result.requiresRendererRebuild = result.updateKind == SceneUpdateKind::FullSceneRebuild;
+    result.requiresRendererRebuild = result.updateKind == SceneUpdateKind::TopologyChanged;
     return result;
 }
 
@@ -54,7 +97,9 @@ AccumulationResetReason SceneToGpuSceneBuilder::accumulationReasonFor(SceneUpdat
     case SceneUpdateKind::LightOnly: return AccumulationResetReason::LightingChanged;
     case SceneUpdateKind::EnvironmentOnly: return AccumulationResetReason::EnvironmentChanged;
     case SceneUpdateKind::CameraOnly: return AccumulationResetReason::CameraMoved;
-    case SceneUpdateKind::FullSceneRebuild: return AccumulationResetReason::SceneChanged;
+    case SceneUpdateKind::VisibilityOnly: return AccumulationResetReason::Manual;
+    case SceneUpdateKind::TopologyChanged: return AccumulationResetReason::SceneChanged;
+    case SceneUpdateKind::RendererSettingsOnly: return AccumulationResetReason::RenderSettingsChanged;
     }
     return AccumulationResetReason::Manual;
 }

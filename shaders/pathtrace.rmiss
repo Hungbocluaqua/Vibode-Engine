@@ -15,6 +15,7 @@ void main() {
     payload.instance_id = 0xffffffffu;
     payload.mesh_id = 0xffffffffu;
     payload.primitive_id = 0xffffffffu;
+    payload.picking = 0u;
     payload.uv = vec2(0.0);
     payload.tangent = vec3(1.0, 0.0, 0.0);
     payload.bitangent = vec3(0.0, 0.0, 1.0);

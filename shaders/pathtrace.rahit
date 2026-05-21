@@ -46,6 +46,12 @@ void main() {
         v0.position_uv_x.w * bary.x + v1.position_uv_x.w * bary.y + v2.position_uv_x.w * bary.z,
         v0.normal_uv_y.w * bary.x + v1.normal_uv_y.w * bary.y + v2.normal_uv_y.w * bary.z);
     apply_material_alpha_texture(material, uv);
+    if (payload.picking != 0u && material.alpha_mode == ALPHA_MODE_BLEND) {
+        if (material.alpha_factor < 0.5) {
+            ignoreIntersectionEXT;
+        }
+        return;
+    }
     uint alphaSeed = instanceIndex * 73856093u ^ gl_PrimitiveID * 19349663u ^ uint(gl_LaunchIDEXT.x) * 83492791u ^ uint(gl_LaunchIDEXT.y);
     if (!accept_material_alpha(material, alphaSeed)) {
         ignoreIntersectionEXT;

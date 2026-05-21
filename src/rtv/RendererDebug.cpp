@@ -21,6 +21,18 @@ namespace {
 
 } // namespace
 
+const char* toneMapperName(ToneMapper toneMapper) {
+    switch (toneMapper) {
+    case ToneMapper::Linear: return "linear";
+    case ToneMapper::Reinhard: return "reinhard";
+    case ToneMapper::ReinhardWhite: return "reinhard-white";
+    case ToneMapper::ACES: return "aces";
+    case ToneMapper::PBRNeutral: return "pbr-neutral";
+    case ToneMapper::AgX: return "agx";
+    }
+    return "aces";
+}
+
 RendererDebugView parseRendererDebugView(std::string_view value) {
     const std::string key = normalized(value);
     if (key == "variance") { return RendererDebugView::Variance; }
@@ -61,6 +73,27 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "whiteenv" || key == "whiteenvironment" || key == "whiteenvironmenttransport" || key == "whitetransport") {
         return RendererDebugView::WhiteEnvironmentTransport;
     }
+    if (key == "motion" || key == "motionvectors" || key == "velocity" || key == "velocitybuffer") {
+        return RendererDebugView::MotionVectors;
+    }
+    if (key == "atmospheresky" || key == "atmosphereskyview" || key == "skyviewlut") {
+        return RendererDebugView::AtmosphereSkyView;
+    }
+    if (key == "atmospheretransmittance" || key == "transmittancelut") {
+        return RendererDebugView::AtmosphereTransmittance;
+    }
+    if (key == "atmosphereaerial" || key == "aerialperspective" || key == "aerialperspectivelut") {
+        return RendererDebugView::AtmosphereAerialPerspective;
+    }
+    if (key == "atmospheremultiscatter" || key == "multiscatter" || key == "multiscatterlut") {
+        return RendererDebugView::AtmosphereMultiScatter;
+    }
+    if (key == "reactive" || key == "reactivemask" || key == "temporalreactive" || key == "temporalreactivemask") {
+        return RendererDebugView::TemporalReactiveMask;
+    }
+    if (key == "historyweight" || key == "temporalhistory" || key == "temporalhistoryweight") {
+        return RendererDebugView::TemporalHistoryWeight;
+    }
     return RendererDebugView::Beauty;
 }
 
@@ -94,6 +127,13 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::BounceCount: return "bounce-count";
     case RendererDebugView::SecondaryEnvironmentRadiance: return "secondary-environment-radiance";
     case RendererDebugView::WhiteEnvironmentTransport: return "white-environment-transport";
+    case RendererDebugView::MotionVectors: return "motion-vectors";
+    case RendererDebugView::AtmosphereSkyView: return "atmosphere-sky-view";
+    case RendererDebugView::AtmosphereTransmittance: return "atmosphere-transmittance";
+    case RendererDebugView::AtmosphereAerialPerspective: return "atmosphere-aerial-perspective";
+    case RendererDebugView::AtmosphereMultiScatter: return "atmosphere-multi-scatter";
+    case RendererDebugView::TemporalReactiveMask: return "temporal-reactive-mask";
+    case RendererDebugView::TemporalHistoryWeight: return "temporal-history-weight";
     }
     return "beauty";
 }

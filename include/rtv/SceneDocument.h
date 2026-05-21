@@ -52,7 +52,7 @@ private:
     RenderSettings renderSettings_{};
     EntityId activeCamera_{};
     bool dirty_ = true;
-    SceneUpdateKind pendingUpdate_ = SceneUpdateKind::FullSceneRebuild;
+    SceneUpdateKind pendingUpdate_ = SceneUpdateKind::TopologyChanged;
     std::string lastChangeReason_ = "SceneChanged";
     std::optional<std::filesystem::path> sourceGltfPath_;
     std::optional<std::filesystem::path> sourceHdrPath_;

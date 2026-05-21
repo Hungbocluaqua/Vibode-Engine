@@ -12,6 +12,7 @@ class ResourceAllocator;
 struct AccelerationStructureDesc {
     VkAccelerationStructureTypeKHR type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
     VkDeviceSize size = 0;
+    bool allowUpdate = false;
     const char* debugName = nullptr;
 };
 
@@ -31,6 +32,7 @@ public:
     [[nodiscard]] VkDeviceAddress deviceAddress() const { return deviceAddress_; }
     [[nodiscard]] VkDeviceSize size() const { return size_; }
     [[nodiscard]] VkAccelerationStructureTypeKHR type() const { return type_; }
+    [[nodiscard]] bool allowUpdate() const { return allowUpdate_; }
 
 private:
     VkDevice device_ = VK_NULL_HANDLE;
@@ -39,6 +41,7 @@ private:
     VkDeviceAddress deviceAddress_ = 0;
     VkDeviceSize size_ = 0;
     VkAccelerationStructureTypeKHR type_ = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    bool allowUpdate_ = false;
 };
 
 } // namespace rtv

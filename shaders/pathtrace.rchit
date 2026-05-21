@@ -55,12 +55,14 @@ void main() {
 
     uint materialIndex = material_for_raw_triangle(firstIndex, gl_PrimitiveID);
 
+    vec3 localPos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
     vec3 worldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
 
     payload.hit = 1u;
     payload.t = gl_HitTEXT;
     payload.world_pos = worldPos;
     payload.material_id = materialIndex;
+    payload.local_pos = localPos;
     payload.geom_normal = worldGeomNormal;
     payload.front_face = frontFace ? 1u : 0u;
     payload.normal = worldNormal;

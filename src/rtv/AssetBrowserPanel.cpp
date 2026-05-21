@@ -89,7 +89,7 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
 
     ImGui::SeparatorText("Scene Document");
     ImGui::PushItemWidth(-260.0f);
-    ImGui::InputTextWithHint("##sceneJsonPath", "C:\\path\\to\\scene.json", scenePath_.data(), scenePath_.size());
+    ImGui::InputTextWithHint("##sceneJsonPath", "C:\\path\\to\\scene.rtlevel", scenePath_.data(), scenePath_.size());
     ImGui::PopItemWidth();
     ImGui::SameLine();
     if (ImGui::Button("Browse##sceneJson")) {
@@ -100,7 +100,7 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Save JSON")) {
+    if (ImGui::Button("Save Level")) {
         std::filesystem::path path{scenePath_.data()};
         if (path.empty()) {
             if (auto selected = saveSceneJsonFileDialog()) {
@@ -114,7 +114,7 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Load JSON")) {
+    if (ImGui::Button("Load Level")) {
         std::filesystem::path path{scenePath_.data()};
         if (!path.empty()) {
             requests.loadSceneJson = path;

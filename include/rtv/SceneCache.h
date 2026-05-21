@@ -103,7 +103,10 @@ struct CachedInstanceBoundsRecord {
 
 struct CachedLightRecord {
     glm::uvec4 metadata{};
-    glm::vec4 data{};
+    glm::vec4 data0{};
+    glm::vec4 data1{};
+    glm::vec4 data2{};
+    glm::vec4 data3{};
 };
 
 struct CachedMeshParams {

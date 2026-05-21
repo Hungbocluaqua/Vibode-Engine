@@ -7,7 +7,10 @@
 #include "rtv/CameraController.h"
 #include "rtv/EditorPanels.h"
 #include "rtv/SceneDocument.h"
+#include "rtv/SceneEventBus.h"
 #include "rtv/SceneToGpuSceneBuilder.h"
+#include "rtv/NotificationManager.h"
+#include "rtv/UndoStack.h"
 
 #include <memory>
 #include <array>
@@ -39,7 +42,10 @@ public:
         RendererDebugView debugView = RendererDebugView::Beauty,
         std::optional<std::filesystem::path> gltfPath = std::nullopt,
         std::optional<std::filesystem::path> hdrPath = std::nullopt,
-        RendererBackend requestedBackend = RendererBackend::Auto);
+        RendererBackend requestedBackend = RendererBackend::Auto,
+        std::optional<std::filesystem::path> scenePath = std::nullopt,
+        std::optional<bool> denoiserOverride = std::nullopt,
+        bool debugViewOverride = false);
     ~Application();
 
     void run(uint32_t maxFrames = 0);
@@ -65,8 +71,14 @@ private:
     void pollAsyncSceneLoad();
     void commitLoadedGltfScene(PendingSceneLoadResult&& result);
     void applyEditorRequests(const EditorRequests& requests, bool allowResourceRebuild);
+    bool applyPendingSceneUpdate(bool allowResourceRebuild);
     void applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange);
     void reloadShadersFromEditor();
+    [[nodiscard]] std::unique_ptr<PathTracerRenderer> makePathTracer(
+        const SceneAsset* sceneAsset,
+        const AssetManager* assets,
+        std::optional<std::filesystem::path> sceneCachePath,
+        const RendererSettings* settingsToRestore);
     void createPathTracer(const RendererSettings* settingsToRestore = nullptr);
     void applyActiveSceneCamera();
     void rebuildGpuSceneAsset();
@@ -78,6 +90,9 @@ private:
     RendererBackend requestedBackend_ = RendererBackend::Auto;
     std::optional<std::filesystem::path> gltfPath_;
     std::optional<std::filesystem::path> hdrPath_;
+    std::optional<std::filesystem::path> scenePath_;
+    std::optional<bool> denoiserOverride_;
+    bool debugViewOverride_ = false;
     AssetManager assets_;
     CameraController cameraController_;
     std::array<unsigned char, 512> keyState_{};
@@ -90,8 +105,12 @@ private:
     int windowedHeight_ = 720;
     std::optional<SceneAsset> importedScene_;
     SceneDocument sceneDocument_;
+    SceneEventBus sceneEventBus_;
+    NotificationManager notifications_;
+    UndoStack undoStack_;
     SceneToGpuSceneBuilder sceneBuilder_;
     std::optional<SceneAsset> gpuSceneAsset_;
+    std::vector<EntityId> gpuInstanceEntities_;
     std::unique_ptr<VulkanContext> context_;
     std::unique_ptr<ResourceAllocator> allocator_;
     std::unique_ptr<UploadContext> uploadContext_;

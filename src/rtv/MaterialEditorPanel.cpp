@@ -9,6 +9,12 @@ namespace rtv {
 
 namespace {
 
+void tooltip(const char* text) {
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("%s", text);
+    }
+}
+
 uint32_t materialIdForSelection(const EditorRuntimeState& state, const EditorSelection& selection) {
     const EditorSelectionId selected = selection.current();
     if (selected.kind == EditorSelectionKind::Material) {
@@ -74,7 +80,9 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     ImGui::Text("Name: %s", edited.name.empty() ? "(unnamed)" : edited.name.c_str());
     changed |= ImGui::ColorEdit4("Base Color", glm::value_ptr(edited.baseColorFactor));
     changed |= ImGui::SliderFloat("Metallic", &edited.metallicFactor, 0.0f, 1.0f, "%.3f");
+    tooltip("0 = dielectric, 1 = metal. Most materials are near one endpoint.");
     changed |= ImGui::SliderFloat("Roughness", &edited.roughnessFactor, 0.0f, 1.0f, "%.3f");
+    tooltip("0 = mirror-like, 1 = diffuse.");
     changed |= ImGui::ColorEdit3("Emissive", glm::value_ptr(edited.emissiveFactor));
     int alphaMode = static_cast<int>(edited.alphaMode);
     changed |= ImGui::Combo("Alpha Mode", &alphaMode, "Opaque\0Mask\0Blend\0");
@@ -91,8 +99,6 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     ImGui::Text("Normal: %u", edited.normalTexture.index);
     ImGui::Text("Metallic roughness: %u", edited.metallicRoughnessTexture.index);
     ImGui::Text("Emissive: %u", edited.emissiveTexture.index);
-    float normalScale = 1.0f;
-    ImGui::InputFloat("Normal Scale", &normalScale, 0.0f, 0.0f, "%.2f", ImGuiInputTextFlags_ReadOnly);
 
     if (changed) {
         requests.materialUpdate = EditorMaterialUpdate{.materialId = materialId, .material = edited};

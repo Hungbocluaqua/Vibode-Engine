@@ -1,0 +1,144 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "atmosphere_phase.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D transmittance_lut;
+layout(set = 0, binding = 1) uniform sampler atmosphere_sampler;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D sky_view_lut;
+layout(set = 0, binding = 3) uniform texture2D multi_scatter_lut;
+
+layout(push_constant) uniform SkyViewParams {
+    vec4 planet_radius_atmosphere_radius;
+    vec4 rayleigh_scattering;
+    vec4 mie_scattering_anisotropy;
+    vec4 absorption_ground_albedo;
+    vec4 scale_heights;
+    vec4 sun_elevation_intensity;
+} params;
+
+vec3 sky_sun_direction() {
+    float elevation = clamp(params.sun_elevation_intensity.x, -0.20, 1.45);
+    float cosElevation = cos(elevation);
+    return normalize(vec3(-cosElevation, sin(elevation), -0.12 * cosElevation));
+}
+
+vec3 sample_transmittance(float heightMeters, float mu) {
+    float atmosphereHeight = max(params.planet_radius_atmosphere_radius.y - params.planet_radius_atmosphere_radius.x, 1.0);
+    vec2 uv = vec2(clamp((mu + 0.20) / 1.20, 0.0, 1.0), clamp(heightMeters / atmosphereHeight, 0.0, 1.0));
+    return texture(sampler2D(transmittance_lut, atmosphere_sampler), uv).rgb;
+}
+
+vec3 sample_multi_scatter(float viewMu, float sunMu) {
+    vec2 uv = vec2(clamp((viewMu + 0.20) / 1.20, 0.0, 1.0), clamp((sunMu + 0.20) / 1.20, 0.0, 1.0));
+    return texture(sampler2D(multi_scatter_lut, atmosphere_sampler), uv).rgb;
+}
+
+float sky_air_mass(float cosZenith) {
+    float y = clamp(cosZenith, -0.08, 1.0);
+    return 1.0 / max(y + 0.15 * pow(max(1.08 - y, 0.0), -1.253), 0.06);
+}
+
+vec3 analytical_sky_fallback(vec3 dir) {
+    vec3 viewDir = normalize(dir);
+    if (viewDir.y < -0.02) {
+        return vec3(0.0);
+    }
+    vec3 sunDir = sky_sun_direction();
+    float viewUp = clamp(viewDir.y, -0.08, 1.0);
+    float sunUp = clamp(sunDir.y, -0.08, 1.0);
+    float cosTheta = clamp(dot(viewDir, sunDir), -1.0, 1.0);
+    float sunVisibility = smoothstep(-0.06, 0.08, sunUp);
+    float horizon = pow(1.0 - clamp(viewUp, 0.0, 1.0), 2.0);
+    vec3 rayleighBeta = vec3(0.170, 0.398, 0.970);
+    vec3 mieBeta = vec3(0.82, 0.74, 0.62);
+    vec3 transmittance = exp(-(rayleighBeta * 0.30 + mieBeta * 0.08) * (sky_air_mass(viewUp) + sky_air_mass(sunUp) * 0.65));
+    vec3 sunsetScatter = vec3(1.0, 0.42, 0.12) * smoothstep(-0.08, 0.18, horizon) * (1.0 - smoothstep(0.05, 0.55, sunUp));
+    vec3 rayleigh = rayleighBeta * atmosphere_rayleigh_phase(cosTheta) * (0.55 + horizon * 0.75);
+    vec3 mie = mieBeta * atmosphere_mie_phase(cosTheta, 0.78) * (0.05 + horizon * 0.26);
+    vec3 night = vec3(0.004, 0.006, 0.012) * smoothstep(-0.25, -0.05, sunUp);
+    float horizonFade = smoothstep(-0.02, 0.04, viewDir.y);
+    return max(((rayleigh + mie + sunsetScatter * 0.22) * transmittance * sunVisibility * 5.5 + night) * params.sun_elevation_intensity.y * horizonFade, vec3(0.0));
+}
+
+vec3 sky_extinction_at_height(float heightMeters) {
+    float rayleighDensity = exp(-heightMeters / max(params.scale_heights.x, 1.0));
+    float mieDensity = exp(-heightMeters / max(params.scale_heights.y, 1.0));
+    float ozoneDensity = max(1.0 - abs(heightMeters - params.scale_heights.z) / max(params.scale_heights.w, 1.0), 0.0);
+    return params.rayleigh_scattering.xyz * rayleighDensity +
+        params.mie_scattering_anisotropy.xyz * mieDensity +
+        params.absorption_ground_albedo.xyz * ozoneDensity;
+}
+
+vec3 integrate_sky(vec3 viewDir) {
+    vec3 sunDir = sky_sun_direction();
+    float sunUp = sunDir.y;
+    float sunVisibility = smoothstep(-0.06, 0.08, sunUp);
+    if (sunVisibility <= 0.0) {
+        return vec3(0.001, 0.0015, 0.003) * params.sun_elevation_intensity.y;
+    }
+
+    vec3 origin = vec3(0.0, params.planet_radius_atmosphere_radius.x + 1.7, 0.0);
+    float tNear;
+    float tFar;
+    if (!atmosphere_ray_sphere_intersection(origin, viewDir, params.planet_radius_atmosphere_radius.y, tNear, tFar)) {
+        return vec3(0.0);
+    }
+    float groundNear;
+    float groundFar;
+    if (atmosphere_ray_sphere_intersection(origin, viewDir, params.planet_radius_atmosphere_radius.x, groundNear, groundFar)) {
+        tFar = min(tFar, groundNear);
+    }
+    if (tFar <= 0.0) {
+        return vec3(0.0);
+    }
+
+    const int sampleCount = 24;
+    float segmentLength = min(tFar, 120000.0) / float(sampleCount);
+    vec3 luminance = vec3(0.0);
+    for (int i = 0; i < sampleCount; ++i) {
+        float t = (float(i) + 0.5) * segmentLength;
+        vec3 samplePos = origin + viewDir * t;
+        float height = max(length(samplePos) - params.planet_radius_atmosphere_radius.x, 0.0);
+        vec3 up = normalize(samplePos);
+        float viewMu = dot(viewDir, up);
+        float sunMu = dot(sunDir, up);
+        float cosTheta = dot(viewDir, sunDir);
+        vec3 viewTransmittance = sample_transmittance(height, viewMu);
+        vec3 sunTransmittance = sample_transmittance(height, sunMu);
+        float rayleighDensity = exp(-height / max(params.scale_heights.x, 1.0));
+        float mieDensity = exp(-height / max(params.scale_heights.y, 1.0));
+        vec3 scattering = params.rayleigh_scattering.xyz * rayleighDensity * atmosphere_rayleigh_phase(cosTheta) +
+            params.mie_scattering_anisotropy.xyz * mieDensity * atmosphere_mie_phase(cosTheta, params.mie_scattering_anisotropy.w);
+        scattering += sample_multi_scatter(viewMu, sunMu) * 0.000012;
+        vec3 extinction = sky_extinction_at_height(height);
+        luminance += viewTransmittance * sunTransmittance * scattering * exp(-extinction * t * 0.25) * segmentLength;
+    }
+    vec3 sunsetTint = mix(vec3(1.0, 0.42, 0.12), vec3(1.0), smoothstep(0.02, 0.35, sunUp));
+    return luminance * sunsetTint * params.sun_elevation_intensity.y * 12.0 * sunVisibility;
+}
+
+vec3 direction_from_latlong(vec2 uv) {
+    float phi = (uv.x - 0.5) * 6.28318530718;
+    float lat = (uv.y - 0.5) * 3.14159265359;
+    float cosLat = cos(lat);
+    return normalize(vec3(cosLat * cos(phi), sin(lat), cosLat * sin(phi)));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(sky_view_lut);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(dims);
+    vec3 dir = direction_from_latlong(uv);
+    vec3 sky = integrate_sky(dir);
+    if (dot(sky, vec3(0.2126, 0.7152, 0.0722)) <= 1.0e-5) {
+        sky = analytical_sky_fallback(dir);
+    }
+    imageStore(sky_view_lut, pixel, vec4(max(sky, vec3(0.0)), 1.0));
+}

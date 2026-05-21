@@ -1,0 +1,44 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "atmosphere_phase.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D transmittance_lut;
+layout(set = 0, binding = 1) uniform sampler atmosphere_sampler;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D multi_scatter_lut;
+
+layout(push_constant) uniform MultiScatterParams {
+    vec4 planet_radius_atmosphere_radius;
+    vec4 rayleigh_scattering;
+    vec4 mie_scattering_anisotropy;
+    vec4 absorption_ground_albedo;
+    vec4 scale_heights;
+    vec4 sun_elevation_intensity;
+} params;
+
+vec3 sample_transmittance(float heightMeters, float mu) {
+    float atmosphereHeight = max(params.planet_radius_atmosphere_radius.y - params.planet_radius_atmosphere_radius.x, 1.0);
+    vec2 uv = vec2(clamp((mu + 0.20) / 1.20, 0.0, 1.0), clamp(heightMeters / atmosphereHeight, 0.0, 1.0));
+    return texture(sampler2D(transmittance_lut, atmosphere_sampler), uv).rgb;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(multi_scatter_lut);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(dims);
+    float viewMu = mix(-0.20, 1.0, uv.x);
+    float sunMu = mix(-0.20, 1.0, uv.y);
+    float heightMeters = 1000.0;
+    vec3 transmittance = sample_transmittance(heightMeters, sunMu);
+    vec3 albedo = params.rayleigh_scattering.xyz / max(params.rayleigh_scattering.xyz + params.mie_scattering_anisotropy.xyz, vec3(1.0e-6));
+    float horizonBoost = pow(1.0 - clamp(abs(viewMu), 0.0, 1.0), 2.0);
+    float sunBoost = smoothstep(-0.05, 0.45, sunMu);
+    vec3 multiple = albedo * (0.18 + 0.35 * horizonBoost) * sunBoost * (1.0 - transmittance * 0.55);
+    imageStore(multi_scatter_lut, pixel, vec4(max(multiple, vec3(0.0)), 1.0));
+}

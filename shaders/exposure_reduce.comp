@@ -1,0 +1,69 @@
+#version 460
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LuminanceHistogram {
+    uint bins[];
+} histogram;
+
+layout(set = 0, binding = 1, std430) buffer ExposureState {
+    float current_exposure;
+    float target_exposure;
+    float percentile_luminance;
+    float padding0;
+} exposure_state;
+
+layout(push_constant) uniform ExposureReduceParams {
+    uint pixel_count;
+    float target_luminance;
+    float min_exposure;
+    float max_exposure;
+    float adaptation_speed;
+    float low_percentile;
+    float high_percentile;
+    float target_percentile;
+    float delta_seconds;
+    float min_log_luminance;
+    float max_log_luminance;
+} params;
+
+void main() {
+    uint total = max(params.pixel_count, 1u);
+    uint low_rank = uint(clamp(params.low_percentile, 0.0, 1.0) * float(total - 1u));
+    uint high_rank = uint(clamp(params.high_percentile, 0.0, 1.0) * float(total - 1u));
+    if (high_rank < low_rank) {
+        uint tmp = low_rank;
+        low_rank = high_rank;
+        high_rank = tmp;
+    }
+
+    uint target_rank = uint(clamp(params.target_percentile, 0.0, 1.0) * float(total - 1u));
+    target_rank = clamp(target_rank, low_rank, high_rank);
+
+    uint accumulated = 0u;
+    uint target_bin = 0u;
+    for (uint i = 0u; i < 128u; ++i) {
+        accumulated += histogram.bins[i];
+        if (accumulated >= target_rank) {
+            target_bin = i;
+            break;
+        }
+    }
+
+    float bin_t = (float(target_bin) + 0.5) / 128.0;
+    float log_lum = mix(params.min_log_luminance, params.max_log_luminance, bin_t);
+    float percentile_luminance = max(exp2(log_lum), 1.0e-4);
+    float target_exposure = clamp(
+        params.target_luminance / percentile_luminance,
+        min(params.min_exposure, params.max_exposure),
+        max(params.min_exposure, params.max_exposure));
+
+    float previous = exposure_state.current_exposure;
+    if (previous <= 0.0 || params.delta_seconds <= 0.0 || params.adaptation_speed <= 0.0) {
+        previous = target_exposure;
+    }
+    float adapt = 1.0 - exp(-params.delta_seconds * params.adaptation_speed);
+    exposure_state.current_exposure = mix(previous, target_exposure, clamp(adapt, 0.0, 1.0));
+    exposure_state.target_exposure = target_exposure;
+    exposure_state.percentile_luminance = percentile_luminance;
+}

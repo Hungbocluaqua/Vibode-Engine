@@ -11,6 +11,8 @@ find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(Stb REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(imguizmo CONFIG REQUIRED)
 find_package(unofficial-spirv-reflect CONFIG REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
@@ -50,6 +52,8 @@ add_executable(rtvulkan
     src/rtv/AccelerationStructure.cpp
     src/rtv/AssetManager.cpp
     src/rtv/AssetBrowserPanel.cpp
+    src/rtv/AtmosphereLutSystem.cpp
+    src/rtv/AtmosphereModel.cpp
     src/rtv/BatchUploader.cpp
     src/rtv/BindlessResources.cpp
     src/rtv/Buffer.cpp
@@ -81,14 +85,18 @@ add_executable(rtvulkan
     src/rtv/Image.cpp
     src/rtv/ImageBarrier.cpp
     src/rtv/InspectorPanel.cpp
+    src/rtv/KeyBindings.cpp
     src/rtv/MaterialEditorPanel.cpp
     src/rtv/MortonCodes.cpp
+    src/rtv/NotificationManager.cpp
     src/rtv/ParallelBvhBuilder.cpp
     src/rtv/PathTracerRenderer.cpp
+    src/rtv/PhysicalCamera.cpp
     src/rtv/PipelineBuilder.cpp
     src/rtv/PipelineCache.cpp
     src/rtv/PipelineDemo.cpp
     src/rtv/RenderSettingsPanel.cpp
+    src/rtv/RenderGraph.cpp
     src/rtv/RendererBackend.cpp
     src/rtv/RendererDebug.cpp
     src/rtv/RayTracingPipeline.cpp
@@ -98,17 +106,23 @@ add_executable(rtvulkan
     src/rtv/SahBuilder.cpp
     src/rtv/SceneComponents.cpp
     src/rtv/SceneDocument.cpp
+    src/rtv/SceneEventBus.cpp
     src/rtv/SceneHierarchyPanel.cpp
+    src/rtv/SceneOperations.cpp
     src/rtv/SceneRegistry.cpp
     src/rtv/SceneToGpuSceneBuilder.cpp
+    src/rtv/SceneUpdateRouter.cpp
     src/rtv/SceneCache.cpp
     src/rtv/ShaderCompiler.cpp
     src/rtv/ShaderModule.cpp
     src/rtv/ShaderReflection.cpp
     src/rtv/Swapchain.cpp
     src/rtv/TextureLoader.cpp
+    src/rtv/TemporalSystem.cpp
     src/rtv/UiOverlay.cpp
+    src/rtv/UndoStack.cpp
     src/rtv/UploadContext.cpp
+    src/rtv/ValidationSceneSuite.cpp
     src/rtv/ViewportPanel.cpp
     src/rtv/VulkanContext.cpp
 )
@@ -120,6 +134,8 @@ target_link_libraries(rtvulkan PRIVATE
     glfw
     glm::glm
     GPUOpen::VulkanMemoryAllocator
+    nlohmann_json::nlohmann_json
+    imguizmo::imguizmo
     unofficial::spirv-reflect
 )
 

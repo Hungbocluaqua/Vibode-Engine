@@ -37,6 +37,8 @@ struct CameraUniform {
     float sunAngularRadius = 0.0093f;
     float indirectStrength = 1.0f;
     uint32_t environmentDirectSamples = 1;
+    glm::vec4 jitter{}; // xy = current subpixel jitter, zw = previous subpixel jitter
+    glm::vec4 atmosphere{}; // x = sun elevation radians, yzw reserved for atmosphere Stage A+
 };
 
 struct MeshParamsUniform {
@@ -77,6 +79,7 @@ struct GpuPrimitiveRecord {
 struct GpuInstanceRecord {
     glm::mat4 transform{1.0f};
     glm::mat4 inverseTransform{1.0f};
+    glm::mat4 prevTransform{1.0f};
     glm::uvec4 metadata{};
 };
 
@@ -93,7 +96,10 @@ struct GpuInstanceBoundsRecord {
 
 struct GpuLightRecord {
     glm::uvec4 metadata{};
-    glm::vec4 data{};
+    glm::vec4 data0{};
+    glm::vec4 data1{};
+    glm::vec4 data2{};
+    glm::vec4 data3{};
 };
 
 struct EnvParamsUniform {
@@ -111,6 +117,13 @@ struct EnvParamsUniform {
     float pad5 = 0.0f;
 };
 
+enum class AccelUpdateMode : uint32_t {
+    Static,
+    RefitTransform,
+    RefitDeform,
+    Rebuild,
+};
+
 struct RayTracingMeshBuildInput {
     uint32_t meshIndex = 0;
     uint32_t firstVertex = 0;
@@ -121,6 +134,7 @@ struct RayTracingMeshBuildInput {
     uint32_t primitiveCount = 0;
     bool containsAlphaTestedGeometry = false;
     bool opaqueTraversalSafe = false;
+    AccelUpdateMode updateMode = AccelUpdateMode::Static;
 };
 
 struct RayTracingInstanceBuildInput {
@@ -189,6 +203,8 @@ public:
     bool setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity);
     void loadEnvironment(BufferUploader& uploader, const std::filesystem::path& path);
     bool updateImportedMaterials(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
+    bool updateSceneLights(BufferUploader& uploader, const SceneAsset& scene);
+    bool updateInstanceTransforms(BufferUploader& uploader, const SceneAsset& scene, const AssetManager& assets);
 
 private:
     void createCornellBox(BufferUploader& uploader);
@@ -199,6 +215,7 @@ private:
     void createCachedMaterialTextures(BufferUploader& uploader, const CachedScene& cached);
     void createEnvironment(BufferUploader& uploader);
     void uploadEnvironmentParams();
+    void uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight);
     void destroyMaterialTextureSamplers();
     void rebuildMaterialSamplerDescriptors(uint32_t slotCount);
 
@@ -237,6 +254,8 @@ private:
     EnvParamsUniform envParams_{};
     std::vector<RayTracingMeshBuildInput> rayTracingMeshes_;
     std::vector<RayTracingInstanceBuildInput> rayTracingInstances_;
+    std::vector<GpuLightRecord> emissiveLightRecords_;
+    std::vector<GpuInstanceRecord> instanceRecordCpu_;
 };
 
 } // namespace rtv

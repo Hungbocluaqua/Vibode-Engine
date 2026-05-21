@@ -22,7 +22,7 @@ EntityId SceneRegistry::createEntity(std::string name) {
     entity.name = std::move(name);
     slot.entity = std::move(entity);
     ++liveCount_;
-    markDirty(SceneUpdateKind::FullSceneRebuild);
+    markDirty(SceneUpdateKind::TopologyChanged);
     return slot.entity->id;
 }
 
@@ -31,11 +31,34 @@ bool SceneRegistry::destroyEntity(EntityId id) {
         return false;
     }
 
+    Entity& removed = *slots_[id.index].entity;
+    if (Entity* parent = entity(removed.parent)) {
+        parent->children.erase(
+            std::remove(parent->children.begin(), parent->children.end(), id),
+            parent->children.end());
+    }
+    for (EntityId childId : removed.children) {
+        if (Entity* child = entity(childId)) {
+            child->parent = {};
+        }
+    }
+    for (Slot& slot : slots_) {
+        if (!slot.entity.has_value()) {
+            continue;
+        }
+        slot.entity->children.erase(
+            std::remove(slot.entity->children.begin(), slot.entity->children.end(), id),
+            slot.entity->children.end());
+        if (slot.entity->parent == id) {
+            slot.entity->parent = {};
+        }
+    }
+
     slots_[id.index].entity.reset();
     ++slots_[id.index].generation;
     freeList_.push_back(id.index);
     --liveCount_;
-    markDirty(SceneUpdateKind::FullSceneRebuild);
+    markDirty(SceneUpdateKind::TopologyChanged);
     return true;
 }
 
@@ -94,7 +117,7 @@ MeshRenderer& SceneRegistry::addMeshRenderer(EntityId id, MeshRenderer renderer)
         throw std::runtime_error("Cannot add MeshRenderer to missing entity");
     }
     item->meshRenderer = std::move(renderer);
-    markDirty(SceneUpdateKind::FullSceneRebuild);
+    markDirty(SceneUpdateKind::TopologyChanged);
     return *item->meshRenderer;
 }
 
@@ -124,7 +147,7 @@ bool SceneRegistry::removeMeshRenderer(EntityId id) {
         return false;
     }
     item->meshRenderer.reset();
-    markDirty(SceneUpdateKind::FullSceneRebuild);
+    markDirty(SceneUpdateKind::TopologyChanged);
     return true;
 }
 
@@ -207,10 +230,16 @@ SceneUpdateKind SceneRegistry::combine(SceneUpdateKind current, SceneUpdateKind 
     if (current == next) {
         return current;
     }
-    if (current == SceneUpdateKind::FullSceneRebuild || next == SceneUpdateKind::FullSceneRebuild) {
-        return SceneUpdateKind::FullSceneRebuild;
+    if (current == SceneUpdateKind::RendererSettingsOnly) {
+        return next;
     }
-    return SceneUpdateKind::FullSceneRebuild;
+    if (next == SceneUpdateKind::RendererSettingsOnly) {
+        return current;
+    }
+    if (current == SceneUpdateKind::TopologyChanged || next == SceneUpdateKind::TopologyChanged) {
+        return SceneUpdateKind::TopologyChanged;
+    }
+    return SceneUpdateKind::TopologyChanged;
 }
 
 } // namespace rtv

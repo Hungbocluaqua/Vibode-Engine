@@ -29,10 +29,12 @@ AccelerationStructure& AccelerationStructure::operator=(AccelerationStructure&& 
         deviceAddress_ = other.deviceAddress_;
         size_ = other.size_;
         type_ = other.type_;
+        allowUpdate_ = other.allowUpdate_;
         other.device_ = VK_NULL_HANDLE;
         other.handle_ = VK_NULL_HANDLE;
         other.deviceAddress_ = 0;
         other.size_ = 0;
+        other.allowUpdate_ = false;
     }
     return *this;
 }
@@ -45,6 +47,7 @@ void AccelerationStructure::create(VkDevice device, ResourceAllocator& allocator
     device_ = device;
     type_ = desc.type;
     size_ = desc.size;
+    allowUpdate_ = desc.allowUpdate;
 
     buffer_.create(allocator, BufferDesc{
         .size = desc.size,
@@ -77,6 +80,7 @@ void AccelerationStructure::destroy() {
     deviceAddress_ = 0;
     size_ = 0;
     device_ = VK_NULL_HANDLE;
+    allowUpdate_ = false;
 }
 
 } // namespace rtv

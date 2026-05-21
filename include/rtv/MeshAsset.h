@@ -63,12 +63,24 @@ struct SceneNodeAsset {
     std::string name;
     glm::mat4 transform{1.0f};
     MeshAssetHandle mesh{};
+    bool visible = true;
+    bool castShadow = true;
+    bool visibleToCamera = true;
     bool hasCamera = false;
     float cameraYfov = 60.0f * 0.017453292519943295f;
     float cameraNear = 0.01f;
     float cameraFar = 1000.0f;
     int32_t parent = -1;
     std::vector<uint32_t> children;
+};
+
+struct SceneLightAsset {
+    uint32_t type = 1;
+    glm::mat4 transform{1.0f};
+    glm::vec3 color{1.0f};
+    float intensity = 1.0f;
+    float sizeOrRadius = 1.0f;
+    bool enabled = true;
 };
 
 struct SceneAsset {
@@ -78,6 +90,7 @@ struct SceneAsset {
     std::vector<MaterialAssetHandle> materials;
     std::vector<MeshAssetHandle> meshes;
     std::vector<SceneNodeAsset> nodes;
+    std::vector<SceneLightAsset> lights;
     std::vector<uint32_t> rootNodes;
 };
 

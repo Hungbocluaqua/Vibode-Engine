@@ -4,10 +4,15 @@ namespace rtv {
 
 EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     EditorRequests requests;
+    if (state.sceneDocument != nullptr && state.sceneDocument->sourceGltfPath().has_value()) {
+        dockspace_.setProfilePath(*state.sceneDocument->sourceGltfPath());
+    } else if (state.gltfPath != nullptr && state.gltfPath->has_value()) {
+        dockspace_.setProfilePath(**state.gltfPath);
+    }
     dockspace_.begin(visibility_, requests);
 
     if (visibility_.viewport) {
-        viewportPanel_.draw(state, requests);
+        viewportPanel_.draw(state, selection_, requests);
     }
     if (visibility_.sceneHierarchy) {
         sceneHierarchyPanel_.draw(state, selection_, requests);
