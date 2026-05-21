@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "sourceGltf": "",
+  "sourceHdr": "",
+  "activeCamera": 1,
+  "environment": {"hdrPath": "", "intensity": 0.6, "rotation": 0.0, "backgroundIntensity": 0.45, "enabled": true},
+  "renderSettings": {
+    "pathTracingEnabled": true,
+    "directLightingEnabled": true,
+    "maxBounces": 5,
+    "environmentDirectSamples": 2,
+    "toneMapper": 3,
+    "exposure": 1.0,
+    "gamma": 2.2,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "brightness": 0.0,
+    "whitePoint": 4.0,
+    "autoExposureEnabled": false,
+    "targetLuminance": 0.18,
+    "minExposure": 0.25,
+    "maxExposure": 8.0,
+    "adaptationSpeed": 2.0,
+    "histogramMinLogLuminance": -10.0,
+    "histogramMaxLogLuminance": 10.0,
+    "histogramLowPercentile": 0.05,
+    "histogramHighPercentile": 0.95,
+    "histogramTargetPercentile": 0.6,
+    "sunlightEnabled": true,
+    "sunIntensity": 1.5,
+    "skyIntensity": 0.65,
+    "sunAngularRadius": 0.00465,
+    "indirectStrength": 1.0,
+    "denoiserEnabled": true,
+    "atrousIterations": 4,
+    "denoiserStrength": 0.8,
+    "debugView": 21,
+    "accumulate": true,
+    "accumulationLimit": 256,
+    "resolutionScale": 1.0,
+    "requestedBackend": 0
+  },
+  "entities": [
+    {
+      "id": {"index": 0, "generation": 1, "stable": 1},
+      "parent": 0,
+      "children": [],
+      "name": "Validation Camera",
+      "transform": {"position": [0.0, 2.0, 6.0], "rotationEuler": [-0.22, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]},
+      "camera": {"verticalFovRadians": 0.785398, "nearPlane": 0.01, "farPlane": 1000.0, "active": true, "useRenderSettingsExposure": true}
+    },
+    {
+      "id": {"index": 1, "generation": 1, "stable": 2},
+      "parent": 0,
+      "children": [],
+      "name": "Large Soft Light",
+      "transform": {"position": [0.0, 5.0, 1.5], "rotationEuler": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]},
+      "light": {"type": 0, "color": [1.0, 0.96, 0.9], "intensity": 60.0, "sizeOrRadius": 1.0, "enabled": true}
+    }
+  ]
+}

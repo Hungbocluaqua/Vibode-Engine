@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <cstdlib>
+#include <unordered_set>
 #include <utility>
 
 namespace rtv {
@@ -72,20 +73,34 @@ bool ShaderCompiler::needsCompile(const std::filesystem::path& source, const std
 }
 
 std::vector<std::filesystem::path> ShaderCompiler::dependenciesFor(const std::filesystem::path& source) const {
-    std::ifstream file(source);
-    if (!file) {
-        return {};
-    }
-
     std::vector<std::filesystem::path> deps;
+    std::unordered_set<std::string> visited;
     std::regex includePattern(R"shader(^\s*#include\s+"([^"]+)")shader");
-    std::string line;
-    while (std::getline(file, line)) {
-        std::smatch match;
-        if (std::regex_search(line, match, includePattern)) {
-            deps.push_back(source.parent_path() / match[1].str());
+
+    auto visit = [&](const std::filesystem::path& current, auto&& visitSelf) -> void {
+        const std::filesystem::path normalized = std::filesystem::weakly_canonical(current);
+        const std::string key = normalized.string();
+        if (!visited.insert(key).second) {
+            return;
         }
-    }
+
+        std::ifstream file(current);
+        if (!file) {
+            return;
+        }
+
+        std::string line;
+        while (std::getline(file, line)) {
+            std::smatch match;
+            if (std::regex_search(line, match, includePattern)) {
+                const std::filesystem::path dependency = current.parent_path() / match[1].str();
+                deps.push_back(dependency);
+                visitSelf(dependency, visitSelf);
+            }
+        }
+    };
+
+    visit(source, visit);
     return deps;
 }
 

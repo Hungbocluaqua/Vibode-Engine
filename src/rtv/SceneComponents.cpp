@@ -10,7 +10,9 @@ const char* sceneUpdateKindName(SceneUpdateKind kind) {
     case SceneUpdateKind::LightOnly: return "LightOnly";
     case SceneUpdateKind::EnvironmentOnly: return "EnvironmentOnly";
     case SceneUpdateKind::CameraOnly: return "CameraOnly";
-    case SceneUpdateKind::FullSceneRebuild: return "FullSceneRebuild";
+    case SceneUpdateKind::VisibilityOnly: return "VisibilityOnly";
+    case SceneUpdateKind::TopologyChanged: return "TopologyChanged";
+    case SceneUpdateKind::RendererSettingsOnly: return "RendererSettingsOnly";
     }
     return "Unknown";
 }

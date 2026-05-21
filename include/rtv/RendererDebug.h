@@ -5,6 +5,15 @@
 
 namespace rtv {
 
+enum class ToneMapper : uint32_t {
+    Linear = 0,
+    Reinhard = 1,
+    ReinhardWhite = 2,
+    ACES = 3,
+    PBRNeutral = 4,
+    AgX = 5,
+};
+
 enum class RendererDebugView : uint32_t {
     Beauty = 0,
     Variance = 1,
@@ -34,15 +43,23 @@ enum class RendererDebugView : uint32_t {
     BounceCount = 25,
     SecondaryEnvironmentRadiance = 26,
     WhiteEnvironmentTransport = 27,
+    MotionVectors = 28,
+    AtmosphereSkyView = 29,
+    AtmosphereTransmittance = 30,
+    AtmosphereAerialPerspective = 31,
+    AtmosphereMultiScatter = 32,
+    TemporalReactiveMask = 33,
+    TemporalHistoryWeight = 34,
 };
 
 struct RendererDebugParams {
     uint32_t view = static_cast<uint32_t>(RendererDebugView::Beauty);
     uint32_t flags = 0;
+    uint32_t selectedInstance = UINT32_MAX;
     float scale = 1.0f;
-    float padding0 = 0.0f;
 };
 
+[[nodiscard]] const char* toneMapperName(ToneMapper toneMapper);
 [[nodiscard]] RendererDebugView parseRendererDebugView(std::string_view value);
 [[nodiscard]] const char* rendererDebugViewName(RendererDebugView view);
 

@@ -1,0 +1,135 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D hdr_texture;
+layout(set = 0, binding = 1) uniform sampler hdr_sampler;
+layout(set = 0, binding = 2, rgba8) writeonly uniform image2D output_image;
+layout(set = 0, binding = 3, std430) readonly buffer ExposureState {
+    float current_exposure;
+    float target_exposure;
+    float percentile_luminance;
+    float padding0;
+} exposure_state;
+
+layout(push_constant) uniform ToneMapParams {
+    uint tone_mapper;
+    uint debug_view;
+    uint auto_exposure_enabled;
+    float exposure;
+    float gamma;
+    float contrast;
+    float saturation;
+    float brightness;
+    float white_point;
+} params;
+
+bool is_hdr_view(uint debug_view) {
+    return debug_view == 0u ||
+           debug_view == 7u ||
+           debug_view == 8u ||
+           debug_view == 9u ||
+           debug_view == 10u ||
+           debug_view == 22u ||
+           debug_view == 27u;
+}
+
+vec3 tone_map_linear(vec3 color) {
+    return clamp(color, vec3(0.0), vec3(1.0));
+}
+
+vec3 tone_map_reinhard(vec3 color) {
+    return color / (color + vec3(1.0));
+}
+
+vec3 tone_map_reinhard_white(vec3 color, float white_point) {
+    float w = max(white_point, 0.001);
+    float w2 = w * w;
+    return clamp((color * (vec3(1.0) + color / w2)) / (vec3(1.0) + color), vec3(0.0), vec3(1.0));
+}
+
+vec3 tone_map_aces(vec3 color) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3(0.0), vec3(1.0));
+}
+
+// Official Khronos PBR Neutral reference implementation.
+// Source: https://github.com/KhronosGroup/ToneMapping/blob/main/PBR_Neutral/pbrNeutral.glsl
+vec3 pbr_neutral_tone_mapping(vec3 color) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) {
+        return color;
+    }
+    const float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / peak;
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, newPeak * vec3(1.0), g);
+}
+
+vec3 adjust_saturation(vec3 color, float saturation) {
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    return mix(vec3(luma), color, saturation);
+}
+
+vec3 apply_color_grading(vec3 color) {
+    color += vec3(params.brightness);
+    color = (color - vec3(0.5)) * params.contrast + vec3(0.5);
+    color = adjust_saturation(color, params.saturation);
+    return clamp(color, vec3(0.0), vec3(1.0));
+}
+
+vec3 linear_to_srgb(vec3 color) {
+    color = clamp(color, vec3(0.0), vec3(1.0));
+    vec3 lo = color * 12.92;
+    vec3 hi = 1.055 * pow(color, vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, lessThanEqual(color, vec3(0.0031308)));
+}
+
+vec3 encode_output(vec3 color) {
+    if (abs(params.gamma - 2.2) < 0.001) {
+        return linear_to_srgb(color);
+    }
+    return pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(1.0 / max(params.gamma, 0.001)));
+}
+
+void main() {
+    ivec2 size = imageSize(output_image);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) {
+        return;
+    }
+
+    vec3 color = texelFetch(sampler2D(hdr_texture, hdr_sampler), p, 0).rgb;
+    if (!is_hdr_view(params.debug_view)) {
+        imageStore(output_image, p, vec4(clamp(color, vec3(0.0), vec3(1.0)), 1.0));
+        return;
+    }
+
+    float exposure = params.auto_exposure_enabled != 0u ? exposure_state.current_exposure : params.exposure;
+    color = max(color, vec3(0.0)) * max(exposure, 0.0);
+
+    if (params.tone_mapper == 0u) {
+        color = tone_map_linear(color);
+    } else if (params.tone_mapper == 1u) {
+        color = tone_map_reinhard(color);
+    } else if (params.tone_mapper == 2u) {
+        color = tone_map_reinhard_white(color, params.white_point);
+    } else if (params.tone_mapper == 4u) {
+        color = clamp(pbr_neutral_tone_mapping(color), vec3(0.0), vec3(1.0));
+    } else {
+        color = tone_map_aces(color);
+    }
+
+    color = apply_color_grading(color);
+    imageStore(output_image, p, vec4(encode_output(color), 1.0));
+}

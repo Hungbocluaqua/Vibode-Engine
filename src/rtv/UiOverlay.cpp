@@ -3,6 +3,7 @@
 #include "rtv/Check.h"
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
+#include "rtv/NotificationManager.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/Swapchain.h"
@@ -127,9 +128,11 @@ EditorRequests UiOverlay::build(
     const AssetManager* assets,
     const std::optional<std::filesystem::path>& gltfPath,
     const std::optional<std::filesystem::path>& hdrPath,
+    const std::vector<EntityId>* instanceEntities,
     const std::string& sceneLoadingStatus,
     const CameraController* camera,
-    float cpuFrameMs) {
+    float cpuFrameMs,
+    NotificationManager* notifications) {
     EditorRequests requests;
     if (!frameBegun_) {
         return requests;
@@ -157,6 +160,7 @@ EditorRequests UiOverlay::build(
         .assets = assets,
         .gltfPath = &gltfPath,
         .hdrPath = &hdrPath,
+        .instanceEntities = instanceEntities,
         .sceneLoadingStatus = &sceneLoadingStatus,
         .camera = camera,
         .swapchainExtent = extent,
@@ -169,6 +173,9 @@ EditorRequests UiOverlay::build(
         },
     };
     requests = editor_.draw(state);
+    if (notifications != nullptr) {
+        notifications->draw();
+    }
 
     ImGui::Render();
     return requests;

@@ -93,6 +93,11 @@ void GpuProfiler::collectCompletedFrame() {
     };
     timings_.pathTraceMs = smooth(timings_.pathTraceMs, elapsedMs(PathTraceStart, PathTraceEnd));
     timings_.denoiserMs = smooth(timings_.denoiserMs, elapsedMs(DenoiserStart, DenoiserEnd));
+    timings_.historyCopyMs = smooth(timings_.historyCopyMs, elapsedMs(HistoryCopyStart, HistoryCopyEnd));
+    timings_.taaMs = smooth(timings_.taaMs, elapsedMs(TaaStart, TaaEnd));
+    timings_.autoExposureMs = smooth(timings_.autoExposureMs, elapsedMs(AutoExposureStart, AutoExposureEnd));
+    timings_.toneMapMs = smooth(timings_.toneMapMs, elapsedMs(ToneMapStart, ToneMapEnd));
+    timings_.selectionOutlineMs = smooth(timings_.selectionOutlineMs, elapsedMs(SelectionOutlineStart, SelectionOutlineEnd));
     timings_.fullscreenMs = smooth(timings_.fullscreenMs, elapsedMs(FullscreenStart, FullscreenEnd));
     submitted_ = false;
 }

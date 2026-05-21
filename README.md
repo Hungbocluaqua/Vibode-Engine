@@ -1,8 +1,8 @@
 # Ray Tracing Engine Vulkan Port
 
-This directory contains the native Vulkan 1.3 / C++20 port of the WebGPU path tracing renderer. The WebGPU renderer remains the visual reference while the Vulkan renderer is migrated and stabilized in stages.
+This directory contains the native Vulkan 1.3 / C++20 port of the WebGPU path tracing renderer. The current development focus is the Vulkan KHR hardware ray tracing backend; the compute path tracer remains available as a legacy fallback/reference path.
 
-The port is operational: it opens a native window, runs a compute path tracer, can optionally use Vulkan KHR hardware ray tracing for triangle traversal, denoises temporally/spatially, presents through a fullscreen pass, supports glTF/HDR inputs, exposes ImGui controls, and includes GPU timing/debug views. It is not yet a finished replacement for the WebGPU renderer because some material, bindless, render graph, and visual-parity work remains.
+The port is operational: it opens a native window, runs a Vulkan KHR hardware ray tracing path tracer on capable devices, retains the legacy compute BVH path, denoises temporally/spatially, presents through a fullscreen pass, supports glTF/HDR inputs, exposes ImGui controls, and includes GPU timing/debug views. It is not yet a finished replacement for the WebGPU renderer because some material, bindless, render graph, and hardware-RT stabilization work remains.
 
 ## Implemented
 
@@ -22,8 +22,8 @@ The port is operational: it opens a native window, runs a compute path tracer, c
 - Per-frame descriptor arenas and transient CPU-visible uniform ring buffers
 - GLSL to SPIR-V shader compilation through `glslangValidator`
 - SPIR-V reflection for descriptor bindings, descriptor types, stage visibility, and push constants
-- Pipeline cache, compute pipeline wrapper, graphics pipeline wrapper, and dynamic-rendering fullscreen pipeline
-- Compute path tracing pass with progressive accumulation
+- Pipeline cache, compute pipeline wrapper, graphics pipeline wrapper, ray tracing pipeline wrapper, and dynamic-rendering fullscreen pipeline
+- Legacy compute path tracing pass with progressive accumulation
 - Compact auxiliary buffers for variance, depth/normal, world position, and temporal history
 - Temporal denoiser with reprojection, disocclusion rejection, luminance clipping, reactive masking, and multi-scale a-trous filtering
 - Cornell-box scene and optional glTF/GLB import through `--gltf`
@@ -40,7 +40,7 @@ The port is operational: it opens a native window, runs a compute path tracer, c
 - GPU timestamp profiling for path tracing, denoising, and fullscreen passes
 - ImGui overlay for renderer settings, HDR path loading, debug view switching, sample count, reset reason, resolution, environment direct sample count, and pass timings
 - WASD/mouse camera controls, pointer release on focus loss, and `F11` borderless fullscreen
-- Optional Vulkan hardware ray tracing backend using `VK_KHR_acceleration_structure` and `VK_KHR_ray_tracing_pipeline`
+- Primary Vulkan hardware ray tracing backend using `VK_KHR_acceleration_structure` and `VK_KHR_ray_tracing_pipeline`
 - Backend selection through `--backend auto`, `--backend compute`, `--backend rt`, and the Render Settings panel
 - BLAS/TLAS construction for fallback and imported glTF triangle meshes
 - Hardware RT path loop with raygen-owned multi-bounce tracing, direct/emissive/environment lighting, shadow rays, MIS/PDF diagnostics, denoiser auxiliary outputs, and alpha-aware any-hit shaders
@@ -52,7 +52,7 @@ The port is operational: it opens a native window, runs a compute path tracer, c
 
 ## Still In Progress
 
-- Further visual parity tuning against the compute reference
+- Hardware RT material, lighting, and traversal stabilization
 - Hardware RT acceleration-structure update/refit paths for transform-heavy editing
 - Finer hardware RT geometry splitting so opaque single-sided and alpha-tested primitives can use different traversal/hit-group policies within the same mesh
 - Further rough dielectric/specular sampling and MIS tuning
@@ -60,7 +60,7 @@ The port is operational: it opens a native window, runs a compute path tracer, c
 - Broader glTF material extension support
 - More complete scene instancing and transform update paths
 - Automatic render graph resource-state tracking and barrier validation
-- More denoiser/reprojection visual parity validation
+- More denoiser/reprojection validation on the hardware RT output
 
 ## Build
 
@@ -97,9 +97,9 @@ Smoke test:
 
 ```powershell
 native\vulkan\build\Debug\rtvulkan.exe --frames 6
-native\vulkan\build\Debug\rtvulkan.exe --frames 6 --backend compute
 native\vulkan\build\Debug\rtvulkan.exe --frames 6 --backend auto
 native\vulkan\build\Debug\rtvulkan.exe --frames 6 --backend rt
+native\vulkan\build\Debug\rtvulkan.exe --frames 6 --backend compute
 ```
 
 ## Runtime Examples
@@ -112,22 +112,22 @@ native\vulkan\build\Debug\rtvulkan.exe --debug-view mis-weight
 native\vulkan\build\Debug\rtvulkan.exe --gltf path\to\scene.glb
 native\vulkan\build\Debug\rtvulkan.exe --hdr path\to\environment.hdr
 native\vulkan\build\Debug\rtvulkan.exe --gltf path\to\scene.glb --hdr path\to\environment.hdr
-native\vulkan\build\Debug\rtvulkan.exe --backend compute
 native\vulkan\build\Debug\rtvulkan.exe --backend auto
 native\vulkan\build\Debug\rtvulkan.exe --backend rt
+native\vulkan\build\Debug\rtvulkan.exe --backend compute
 ```
 
 Backend behavior:
 
-- `--backend compute` always uses the compute BVH renderer.
-- `--backend auto` uses hardware RT when the selected Vulkan device supports the required KHR extensions/features, otherwise compute.
 - `--backend rt` requires hardware RT and fails with a clear startup error if unavailable.
+- `--backend auto` uses hardware RT when the selected Vulkan device supports the required KHR extensions/features, otherwise compute.
+- `--backend compute` uses the legacy compute BVH renderer. Keep new renderer work on hardware RT unless the change is specifically a legacy/fallback fix.
 
 Hardware RT requires `VK_KHR_acceleration_structure`, `VK_KHR_ray_tracing_pipeline`, `VK_KHR_deferred_host_operations`, `VK_KHR_buffer_device_address`, `VK_KHR_spirv_1_4`, and `VK_KHR_shader_float_controls`.
 In hardware RT mode, raygen owns the path loop and launches primary, bounce, and shadow rays explicitly while keeping pipeline recursion depth at `1`.
 Hardware RT uses a correctness-first material policy: alpha and single-sided material rules are enforced by any-hit where needed. Meshes that are known to be alpha-free and double-sided are marked opaque so Vulkan can skip any-hit traversal for that geometry.
 
-Performance note: the compute backend uses a project-specific packed BVH and may still be faster in some scenes. The hardware RT backend now avoids per-hit primitive scans, keeps shadow any-hit minimal, reduces payload size, and skips any-hit for safe opaque meshes, but additional mesh splitting/refit work is still planned.
+Performance note: the compute backend uses a project-specific packed BVH and may still be faster in some scenes, but it is no longer the optimization target. New traversal, material, lighting, and editor-renderer work should target the hardware RT backend first.
 
 ## Runtime Controls
 
@@ -235,10 +235,10 @@ Supported debug views include:
 
 ### Renderer Layer
 
-The renderer executes a compute-heavy frame flow:
+The renderer executes this frame flow:
 
 1. Upload changed uniforms and scene/environment data.
-2. Dispatch path tracing through the selected backend: compute shader BVH traversal or Vulkan KHR hardware RT.
+2. Dispatch path tracing through the selected backend, normally Vulkan KHR hardware RT.
 3. Barrier path tracing outputs for denoiser reads.
 4. Dispatch temporal/a-trous denoising compute.
 5. Update/copy history resources for the next frame.
@@ -262,16 +262,16 @@ The Vulkan scene path is moving from flattened demo data toward scalable GPU sce
 - Instance bounds
 - TLAS nodes and instance indices
 
-This keeps shader logic independent from hardcoded scene geometry and prepares the renderer for larger imported scenes, instancing, streaming, and future backend experimentation.
+This keeps shader logic independent from hardcoded scene geometry and prepares the hardware RT renderer for larger imported scenes, instancing, streaming, and editor-driven scene updates. The compute backend reuses parts of this data but is treated as legacy support.
 
 ## Development Direction
 
 Recommended next work:
 
-1. Continue compute-vs-hardware-RT visual parity validation across Cornell, Sponza, HDR, alpha-cutout, emissive, and normal-map scenes.
-2. Tune rough dielectric/specular BSDFs, PDFs, and MIS weights where RT and compute diverge.
-3. Move fixed texture arrays toward a full bindless descriptor model.
-4. Harden render graph state tracking and barrier validation.
-5. Expand glTF material support and add hardware RT TLAS refit/rebuild paths for transform updates.
-6. Tune temporal reprojection and denoiser debug views against the WebGPU reference.
-7. Split mixed-material hardware RT meshes into opaque, alpha, and single-sided geometry classes so more triangles can use fast opaque traversal without losing glTF material correctness.
+1. Stabilize the hardware RT path across Cornell, Sponza, HDR, alpha-cutout, emissive, and normal-map scenes.
+2. Continue rough dielectric/specular BSDF, PDF, and MIS tuning in the hardware RT shaders.
+3. Add hardware RT TLAS/BLAS refit or rebuild paths for transform-heavy editing.
+4. Split mixed-material hardware RT meshes into opaque, alpha, and single-sided geometry classes so more triangles can use fast opaque traversal without losing glTF material correctness.
+5. Move fixed texture arrays toward a full bindless descriptor model.
+6. Harden render graph state tracking and barrier validation.
+7. Expand glTF material support and tune temporal reprojection/denoising against hardware RT output.

@@ -1,6 +1,7 @@
 #include "rtv/EditorDockspace.h"
 
 #include "rtv/FileDialog.h"
+#include "rtv/KeyBindings.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -49,6 +50,32 @@ void EditorDockspace::requestResetLayout() {
     layoutResetRequested_ = true;
 }
 
+void EditorDockspace::setProfilePath(const std::filesystem::path& scenePath) {
+    std::filesystem::path next = scenePath;
+    if (next.empty()) {
+        return;
+    }
+    next.replace_extension(".layout.ini");
+    if (next == profilePath_) {
+        return;
+    }
+    profilePath_ = std::move(next);
+    loadLayout();
+}
+
+void EditorDockspace::saveLayout() const {
+    if (!profilePath_.empty()) {
+        ImGui::SaveIniSettingsToDisk(profilePath_.string().c_str());
+    }
+}
+
+void EditorDockspace::loadLayout() {
+    if (!profilePath_.empty() && std::filesystem::exists(profilePath_)) {
+        ImGui::LoadIniSettingsFromDisk(profilePath_.string().c_str());
+        layoutResetRequested_ = false;
+    }
+}
+
 void EditorDockspace::buildDefaultLayout() {
     ImGuiID dockspaceId = ImGui::GetID("EditorDockspace");
     ImGui::DockBuilderRemoveNode(dockspaceId);
@@ -93,17 +120,23 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
                 requests.loadHdr = *path;
             }
         }
-        if (ImGui::MenuItem("Open Scene JSON")) {
+        if (ImGui::MenuItem("Open Level")) {
             visibility.assetBrowser = true;
             if (auto path = openSceneJsonFileDialog()) {
                 requests.loadSceneJson = *path;
             }
         }
-        if (ImGui::MenuItem("Save Scene JSON")) {
+        if (ImGui::MenuItem("Save Level")) {
             visibility.assetBrowser = true;
             if (auto path = saveSceneJsonFileDialog()) {
                 requests.saveSceneJson = *path;
+                setProfilePath(*path);
+                saveLayout();
             }
+        }
+        if (ImGui::MenuItem("Save Layout")) {
+            requests.saveLayout = true;
+            saveLayout();
         }
         if (ImGui::MenuItem("Reload Shaders")) {
             requests.reloadShaders = true;
@@ -115,6 +148,16 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
         }
         if (ImGui::MenuItem("Exit")) {
             requests.exit = true;
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Edit")) {
+        if (ImGui::MenuItem("Undo\tCtrl+Z")) {
+            requests.undo = true;
+        }
+        if (ImGui::MenuItem("Redo\tCtrl+Y")) {
+            requests.redo = true;
         }
         ImGui::EndMenu();
     }
@@ -135,13 +178,13 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
     }
 
     if (ImGui::BeginMenu("Render")) {
-        if (ImGui::MenuItem("Reset Accumulation")) {
+        if (ImGui::MenuItem("Reset Accumulation\tR")) {
             requests.resetAccumulation = AccumulationResetReason::Manual;
         }
-        if (ImGui::MenuItem("Toggle Denoiser")) {
+        if (ImGui::MenuItem("Toggle Denoiser\tF2")) {
             requests.toggleDenoiser = true;
         }
-        if (ImGui::MenuItem("Toggle Debug View")) {
+        if (ImGui::MenuItem("Cycle Debug View\tF1")) {
             requests.toggleDebugView = true;
         }
         ImGui::EndMenu();
@@ -163,14 +206,19 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
 
 void EditorDockspace::drawHelpWindows() {
     if (showControls_) {
-        ImGui::SetNextWindowSize(ImVec2(420.0f, 220.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(520.0f, 360.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Controls", &showControls_)) {
-            ImGui::TextUnformatted("Hold right mouse in viewport: look and move camera");
-            ImGui::TextUnformatted("Release right mouse or press Esc: stop camera navigation");
-            ImGui::TextUnformatted("WASD: move while holding right mouse");
-            ImGui::TextUnformatted("Q/E or Ctrl/Space: vertical movement");
-            ImGui::TextUnformatted("Shift: fast movement");
-            ImGui::TextUnformatted("F1-F6, R, +/- and bracket keys remain available when editor widgets are not typing.");
+            std::string currentCategory;
+            bool categoryOpen = false;
+            for (const KeyBinding& binding : allKeyBindings()) {
+                if (binding.category != currentCategory) {
+                    currentCategory = binding.category;
+                    categoryOpen = ImGui::CollapsingHeader(currentCategory.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+                }
+                if (categoryOpen) {
+                    ImGui::BulletText("%s: %s", binding.key.c_str(), binding.description.c_str());
+                }
+            }
         }
         ImGui::End();
     }

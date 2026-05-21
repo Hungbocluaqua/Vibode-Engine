@@ -27,14 +27,20 @@ class RayTracingPipeline;
 class RayTracingScene;
 class ResourceAllocator;
 class ShaderModule;
+class TemporalSystem;
 class VulkanContext;
 class AssetManager;
+class AtmosphereLutSystem;
+struct AtmosphereLutStats;
 struct SceneAsset;
 
 struct RendererSettings {
     bool pathTracingEnabled = true;
+    bool cameraJitterEnabled = true;
     bool denoiserEnabled = true;
     bool denoiseWhileMoving = false;
+    bool taaEnabled = true;
+    float taaFeedback = 0.08f;
     bool sunlightEnabled = true;
     bool directLightingEnabled = true;
     bool environmentEnabled = true;
@@ -44,7 +50,24 @@ struct RendererSettings {
     float denoiserStrength = 1.0f;
     float sunIntensity = 1.0f;
     float skyIntensity = 0.8f;
-    float exposure = 0.75f;
+    float sunElevation = 0.97f;
+    ToneMapper toneMapper = ToneMapper::ACES;
+    float exposure = 2.0f;
+    float gamma = 2.2f;
+    float contrast = 1.0f;
+    float saturation = 1.0f;
+    float brightness = 0.0f;
+    float whitePoint = 4.0f;
+    bool autoExposureEnabled = false;
+    float targetLuminance = 0.18f;
+    float minExposure = 0.25f;
+    float maxExposure = 8.0f;
+    float adaptationSpeed = 2.0f;
+    float histogramMinLogLuminance = -10.0f;
+    float histogramMaxLogLuminance = 10.0f;
+    float histogramLowPercentile = 0.05f;
+    float histogramHighPercentile = 0.95f;
+    float histogramTargetPercentile = 0.60f;
     float sunAngularRadius = 0.0093f;
     float indirectStrength = 1.0f;
     float environmentIntensity = 1.0f;
@@ -62,6 +85,7 @@ struct RayTracingRendererStats {
     uint32_t instanceCount = 0;
     VkDeviceSize accelerationStructureBytes = 0;
     VkDeviceSize sbtBytes = 0;
+    float lastTlasRefitMs = 0.0f;
 };
 
 enum class AccumulationResetReason : uint32_t {
@@ -100,6 +124,7 @@ public:
     ~PathTracerRenderer();
 
     void beginFrame(uint32_t frameIndex, VkExtent2D extent);
+    void setFrameDeltaSeconds(float deltaSeconds) { frameDeltaSeconds_ = deltaSeconds; }
     void recordPathTrace(VkCommandBuffer commandBuffer);
     void recordFullscreen(VkCommandBuffer commandBuffer, VkExtent2D swapchainExtent);
     void recordEditorPresentationStart(VkCommandBuffer commandBuffer);
@@ -111,6 +136,11 @@ public:
     void resetAccumulation(AccumulationResetReason reason = AccumulationResetReason::Manual);
     void loadEnvironment(const std::filesystem::path& path);
     bool updateMaterials(const SceneAsset& scene, const AssetManager& assets);
+    bool updateSceneLights(const SceneAsset& scene);
+    bool updateSceneTransforms(const SceneAsset& scene, const AssetManager& assets);
+    bool updateSceneVisibility(const SceneAsset& scene, const AssetManager& assets);
+    void setSelectedInstanceId(std::optional<uint32_t> instanceId);
+    [[nodiscard]] std::optional<uint32_t> pickInstanceId(glm::vec2 viewportUv);
 
     [[nodiscard]] const RendererSettings& settings() const { return settings_; }
     [[nodiscard]] RendererBackend requestedBackend() const { return requestedBackend_; }
@@ -121,6 +151,9 @@ public:
     [[nodiscard]] const GpuFrameTimings& timings() const;
     [[nodiscard]] AccumulationResetReason lastAccumulationResetReason() const { return lastResetReason_; }
     [[nodiscard]] const RendererValidationLog& validationLog() const { return validationLog_; }
+    [[nodiscard]] RendererValidationLog& validationLog() { return validationLog_; }
+    [[nodiscard]] const TemporalSystem* temporalSystem() const { return temporalSystem_.get(); }
+    [[nodiscard]] AtmosphereLutStats atmosphereLutStats() const;
     [[nodiscard]] const GpuScene& scene() const { return scene_; }
     [[nodiscard]] VkDescriptorImageInfo viewportImageDescriptor() const;
     [[nodiscard]] VkExtent2D renderExtent() const { return extent_; }
@@ -134,7 +167,7 @@ private:
         uint32_t height = 0;
         uint32_t atrousIterations = 4;
         uint32_t debugView = 0;
-        uint32_t padding1 = 0;
+        uint32_t resetHistory = 1;
     };
 
     struct PrevCameraUniform {
@@ -143,21 +176,85 @@ private:
         glm::mat4 prevViewProj{1.0f};
         glm::vec4 currentPos{};
         glm::vec4 prevPos{};
+        glm::vec4 jitter{}; // xy = current subpixel jitter, zw = previous subpixel jitter
     };
 
-    struct FullscreenParams {
-        float exposure = 0.75f;
+    struct ToneMapParams {
+        uint32_t toneMapper = static_cast<uint32_t>(ToneMapper::ACES);
         uint32_t debugView = 0;
-        float padding0 = 0.0f;
-        float padding1 = 0.0f;
+        uint32_t autoExposureEnabled = 0;
+        float exposure = 2.0f;
+        float gamma = 2.2f;
+        float contrast = 1.0f;
+        float saturation = 1.0f;
+        float brightness = 0.0f;
+        float whitePoint = 4.0f;
+    };
+
+    struct HistogramParams {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        float minLogLuminance = -10.0f;
+        float maxLogLuminance = 10.0f;
+    };
+
+    struct ExposureReduceParams {
+        uint32_t pixelCount = 0;
+        float targetLuminance = 0.18f;
+        float minExposure = 0.25f;
+        float maxExposure = 8.0f;
+        float adaptationSpeed = 2.0f;
+        float lowPercentile = 0.05f;
+        float highPercentile = 0.95f;
+        float targetPercentile = 0.60f;
+        float deltaSeconds = 0.0f;
+        float minLogLuminance = -10.0f;
+        float maxLogLuminance = 10.0f;
+    };
+
+    struct SelectionParams {
+        uint32_t selectedInstance = UINT32_MAX;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t enabled = 0;
+    };
+
+    struct TaaParams {
+        uint32_t enabled = 1;
+        uint32_t frameCount = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        float feedback = 0.08f;
+        float velocityScale = 64.0f;
+        uint32_t resetHistory = 1;
+        uint32_t padding = 0;
     };
 
     void createResolutionResources(VkExtent2D extent);
     void updateCamera();
+    void recordPathTraceGraph(VkCommandBuffer commandBuffer);
+    void recordPathTracePass(VkCommandBuffer commandBuffer);
     void recordDenoiser(VkCommandBuffer commandBuffer);
+    void recordDenoiserPass(VkCommandBuffer commandBuffer);
+    void recordTaa(VkCommandBuffer commandBuffer);
+    void recordTaaPass(VkCommandBuffer commandBuffer);
+    void recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer);
+    void recordAutoExposure(VkCommandBuffer commandBuffer);
+    void recordAutoExposureHistogramPass(VkCommandBuffer commandBuffer);
+    void recordAutoExposureReducePass(VkCommandBuffer commandBuffer);
+    void recordToneMap(VkCommandBuffer commandBuffer);
+    void recordToneMapPass(VkCommandBuffer commandBuffer);
+    void recordSelectionOutline(VkCommandBuffer commandBuffer);
+    void recordSelectionOutlinePass(VkCommandBuffer commandBuffer);
+    void recordRenderGraphPlan();
     void copyHistoryResources(VkCommandBuffer commandBuffer);
+    void copyHistoryResourcesPass(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool shouldRunDenoiser() const;
+    [[nodiscard]] bool shouldRunTaa() const;
+    [[nodiscard]] const Image& postDenoiseImage() const;
+    [[nodiscard]] const Image& hdrPostProcessImage() const;
     void skipDenoiserPass(VkCommandBuffer commandBuffer);
+    void skipDenoiserCopyPass(VkCommandBuffer commandBuffer);
     void recordHardwarePathTrace(VkCommandBuffer commandBuffer);
     void recordComputePathTrace(VkCommandBuffer commandBuffer);
     [[nodiscard]] VkPipelineStageFlags2 pathTraceShaderStage() const;
@@ -169,21 +266,27 @@ private:
 
     VkExtent2D extent_{};
     uint32_t frameCount_ = 0;
+    float frameDeltaSeconds_ = 0.0f;
     bool cameraChangedThisFrame_ = false;
     AccumulationResetReason lastResetReason_ = AccumulationResetReason::Startup;
     CameraUniform camera_{};
     RendererSettings settings_{};
     DenoiserParams denoiserParams_{};
+    TaaParams taaParams_{};
     PrevCameraUniform prevCamera_{};
     RendererDebugParams debugParams_{};
     RendererBackend requestedBackend_ = RendererBackend::Auto;
     RendererBackend activeBackend_ = RendererBackend::Compute;
     glm::mat4 previousViewProj_{1.0f};
     glm::vec4 previousCameraPos_{};
+    glm::vec2 previousJitter_{0.0f};
 
     Image rawImage_;
     Image denoisedImage_;
     Image historyImage_;
+    Image taaImage_;
+    Image taaHistoryImage_;
+    Image presentationImage_;
     Buffer cameraBuffer_;
     Buffer denoiserParamsBuffer_;
     Buffer prevCameraBuffer_;
@@ -193,12 +296,27 @@ private:
     Buffer depthNormalBuffer_;
     Buffer worldPositionBuffer_;
     Buffer previousWorldPositionBuffer_;
+    Buffer velocityBuffer_;
+    Buffer entityIdBuffer_;
+    Buffer selectionParamsBuffer_;
+    Buffer histogramBuffer_;
+    Buffer exposureBuffer_;
 
     VkSampler fullscreenSampler_ = VK_NULL_HANDLE;
     std::unique_ptr<DescriptorLayoutCache> layoutCache_;
     std::unique_ptr<PipelineCache> pipelineCache_;
+    std::unique_ptr<AtmosphereLutSystem> atmosphereLutSystem_;
     std::unique_ptr<ShaderModule> pathTraceShader_;
     std::unique_ptr<ShaderModule> denoiserShader_;
+    std::unique_ptr<ShaderModule> taaShader_;
+    std::unique_ptr<ShaderModule> transmittanceShader_;
+    std::unique_ptr<ShaderModule> multiScatterShader_;
+    std::unique_ptr<ShaderModule> skyViewShader_;
+    std::unique_ptr<ShaderModule> aerialPerspectiveShader_;
+    std::unique_ptr<ShaderModule> selectionOutlineShader_;
+    std::unique_ptr<ShaderModule> luminanceHistogramShader_;
+    std::unique_ptr<ShaderModule> exposureReduceShader_;
+    std::unique_ptr<ShaderModule> toneMapShader_;
     std::unique_ptr<ShaderModule> fullscreenVertexShader_;
     std::unique_ptr<ShaderModule> fullscreenFragmentShader_;
     std::unique_ptr<ShaderModule> raygenShader_;
@@ -209,18 +327,31 @@ private:
     std::unique_ptr<ShaderModule> shadowAnyHitShader_;
     std::unique_ptr<ComputePipeline> pathTracePipeline_;
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
+    std::unique_ptr<ComputePipeline> taaPipeline_;
+    std::unique_ptr<ComputePipeline> selectionOutlinePipeline_;
+    std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
+    std::unique_ptr<ComputePipeline> exposureReducePipeline_;
+    std::unique_ptr<ComputePipeline> toneMapPipeline_;
     std::unique_ptr<GraphicsPipeline> graphicsPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingPipeline_;
     std::unique_ptr<RayTracingScene> rayTracingScene_;
+    std::unique_ptr<TemporalSystem> temporalSystem_;
     VkDescriptorSetLayout pathTraceSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout atmosphereSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout rayTracingSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout selectionOutlineSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout luminanceHistogramSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout exposureReduceSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout toneMapSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout graphicsSetLayout_ = VK_NULL_HANDLE;
     std::vector<std::unique_ptr<FrameResources>> frames_;
     std::vector<GpuProfiler> profilers_;
     FrameResources* currentFrame_ = nullptr;
     GpuProfiler* currentProfiler_ = nullptr;
     RendererValidationLog validationLog_;
+    uint32_t selectedInstanceId_ = UINT32_MAX;
 };
 
 } // namespace rtv

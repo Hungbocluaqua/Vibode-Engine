@@ -1,5 +1,8 @@
 #version 450
 #extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_GOOGLE_include_directive : require
+
+#include "atmosphere_phase.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -22,12 +25,24 @@ layout(set = 0, binding = 1, std140) uniform Camera {
     float sun_angular_radius;
     float indirect_strength;
     uint environment_direct_samples;
+    vec4 jitter;
+    vec4 atmosphere;
 } camera;
 
 layout(set = 0, binding = 2, std430) buffer VarianceBuffer { uint variance_buffer[]; };
 layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D output_color;
 layout(set = 0, binding = 4, std430) buffer DepthNormalBuffer { uvec2 depth_normal_buffer[]; };
 layout(set = 0, binding = 5, std430) buffer WorldPositionBuffer { uvec2 world_position_buffer[]; };
+layout(set = 0, binding = 33, std430) buffer EntityIdBuffer { uint entity_id_buffer[]; };
+layout(set = 0, binding = 34, std430) buffer VelocityBuffer { uint velocity_buffer[]; };
+layout(set = 0, binding = 35, std140) uniform PrevCamera {
+    mat4 view_proj;
+    mat4 inv_view_proj;
+    mat4 prev_view_proj;
+    vec4 current_pos;
+    vec4 prev_pos;
+    vec4 jitter;
+} prev_camera;
 layout(set = 0, binding = 6, std430) readonly buffer MeshVertices { vec4 mesh_vertices[]; };
 layout(set = 0, binding = 7, std430) readonly buffer MeshIndices { uint mesh_indices[]; };
 layout(set = 0, binding = 8, std430) readonly buffer BvhNodes { vec4 bvh_nodes[]; };
@@ -80,8 +95,8 @@ layout(set = 0, binding = 17, std430) readonly buffer SceneSpheres { vec4 scene_
 layout(set = 0, binding = 18, std140) uniform RendererDebug {
     uint view;
     uint flags;
+    uint selected_instance;
     float scale;
-    float _debug_pad0;
 } debug_params;
 layout(set = 0, binding = 19) uniform texture2D material_textures[128];
 layout(set = 0, binding = 23) uniform sampler material_samplers[128];
@@ -94,6 +109,7 @@ struct PrimitiveRecord {
 struct InstanceRecord {
     mat4 transform;
     mat4 inverse_transform;
+    mat4 prev_transform;
     uvec4 metadata;
 };
 
@@ -107,7 +123,10 @@ layout(set = 0, binding = 22, std430) readonly buffer SceneInstanceRecords {
 
 struct LightRecord {
     uvec4 metadata;
-    vec4 data;
+    vec4 data0;
+    vec4 data1;
+    vec4 data2;
+    vec4 data3;
 };
 
 layout(set = 0, binding = 24, std430) readonly buffer SceneLightRecords {
@@ -164,6 +183,12 @@ layout(set = 0, binding = 32, std430) readonly buffer TlasInstanceIndices {
     uint tlas_instance_indices[];
 };
 
+layout(set = 1, binding = 0) uniform texture2D atmosphere_transmittance_lut;
+layout(set = 1, binding = 1) uniform texture2D atmosphere_sky_view_lut;
+layout(set = 1, binding = 2) uniform sampler atmosphere_sampler;
+layout(set = 1, binding = 3) uniform texture2D atmosphere_aerial_perspective_lut;
+layout(set = 1, binding = 4) uniform texture2D atmosphere_multi_scatter_lut;
+
 const float PI = 3.14159265358979323846;
 const uint TRI_STRIDE = 12u;
 const uint MATERIAL_STRIDE = 5u;
@@ -202,6 +227,7 @@ struct Material {
 struct HitRecord {
     float t;
     vec3 p;
+    vec3 local_p;
     vec3 normal;
     vec3 light_normal;
     Material material;
@@ -229,6 +255,7 @@ struct PathComponents {
     vec3 first_bounce_throughput;
     float secondary_env_miss;
     vec3 secondary_env_radiance;
+    vec3 first_local_pos;
     uint bounce_count;
     uint traversal_steps;
     uint bvh_depth;
@@ -238,6 +265,7 @@ struct PathComponents {
 };
 
 uint rng_state;
+bool picking_ray = false;
 
 uint pcg_hash(uint inputValue) {
     uint state = inputValue * 747796405u + 2891336453u;
@@ -302,6 +330,54 @@ uint pack_variance(float v) {
 uvec2 pack_world_position(vec3 world_pos) {
     vec3 relative = clamp((world_pos - camera.pos.xyz) / 8.0, vec3(-1.0), vec3(1.0));
     return uvec2(pack_snorm2x16(relative.xy), pack_snorm2x16(vec2(relative.z, 0.0)));
+}
+
+vec2 project_unjittered_to_pixels(mat4 viewProj, vec2 jitterPixels, vec3 worldPos, ivec2 dims) {
+    vec4 clip = viewProj * vec4(worldPos, 1.0);
+    if (clip.w <= 0.0) {
+        return vec2(-1.0);
+    }
+    vec2 invDims = 1.0 / vec2(max(dims, ivec2(1)));
+    clip.xy -= jitterPixels * 2.0 * invDims * clip.w;
+    vec3 ndc = clip.xyz / clip.w;
+    if (ndc.z < 0.0 || ndc.z > 1.0001) {
+        return vec2(-1.0);
+    }
+    return vec2(
+        (ndc.x * 0.5 + 0.5) * float(dims.x) - 0.5,
+        (ndc.y * 0.5 + 0.5) * float(dims.y) - 0.5);
+}
+
+uint pack_velocity_pixels(vec2 velocityPixels) {
+    return pack_snorm2x16(velocityPixels / 64.0);
+}
+
+uint compute_surface_velocity(vec3 currentWorldPos, vec3 localPos, uint instanceId, ivec2 dims) {
+    vec3 previousWorldPos = currentWorldPos;
+    if (instanceId < mesh_params.instance_count) {
+        InstanceRecord instance = instance_records[instanceId];
+        previousWorldPos = (instance.prev_transform * vec4(localPos, 1.0)).xyz;
+    }
+
+    vec2 currentPos = project_unjittered_to_pixels(prev_camera.view_proj, prev_camera.jitter.xy, currentWorldPos, dims);
+    vec2 previousPos = project_unjittered_to_pixels(prev_camera.prev_view_proj, prev_camera.jitter.zw, previousWorldPos, dims);
+    bool valid = currentPos.x >= -0.5 && currentPos.y >= -0.5 &&
+        currentPos.x <= float(dims.x) - 0.5 && currentPos.y <= float(dims.y) - 0.5 &&
+        previousPos.x >= -0.5 && previousPos.y >= -0.5 &&
+        previousPos.x <= float(dims.x) - 0.5 && previousPos.y <= float(dims.y) - 0.5;
+    return valid ? pack_velocity_pixels(currentPos - previousPos) : 0u;
+}
+
+uint compute_sky_velocity(vec3 rayDir, ivec2 dims) {
+    vec3 currentWorldPos = prev_camera.current_pos.xyz + normalize(rayDir) * 512.0;
+    vec3 previousWorldPos = prev_camera.prev_pos.xyz + normalize(rayDir) * 512.0;
+    vec2 currentPos = project_unjittered_to_pixels(prev_camera.view_proj, prev_camera.jitter.xy, currentWorldPos, dims);
+    vec2 previousPos = project_unjittered_to_pixels(prev_camera.prev_view_proj, prev_camera.jitter.zw, previousWorldPos, dims);
+    bool valid = currentPos.x >= -0.5 && currentPos.y >= -0.5 &&
+        currentPos.x <= float(dims.x) - 0.5 && currentPos.y <= float(dims.y) - 0.5 &&
+        previousPos.x >= -0.5 && previousPos.y >= -0.5 &&
+        previousPos.x <= float(dims.x) - 0.5 && previousPos.y <= float(dims.y) - 0.5;
+    return valid ? pack_velocity_pixels(currentPos - previousPos) : 0u;
 }
 
 uint first_scene_table_primitive_count() {
@@ -429,7 +505,7 @@ void apply_material_textures(inout Material material, vec2 uv) {
         material.roughness = clamp(material.roughness * mr.g, 0.02, 1.0);
         material.metallic = clamp(material.metallic * mr.b, 0.0, 1.0);
         if (material.mat_type == 0u || material.mat_type == 3u) {
-            material.mat_type = material.metallic > 0.5 ? 3u : 0u;
+            material.mat_type = 3u;
         }
     }
     if (material.emissive_texture >= 0 && material.emissive_texture < MATERIAL_TEXTURE_LIMIT) {
@@ -447,6 +523,9 @@ bool accept_material_alpha(Material material) {
         return material.alpha_factor >= material.alpha_cutoff;
     }
     if (material.alpha_mode == ALPHA_MODE_BLEND) {
+        if (picking_ray) {
+            return material.alpha_factor >= 0.5;
+        }
         return rand_f32() <= clamp(material.alpha_factor, 0.0, 1.0);
     }
     return true;
@@ -643,7 +722,7 @@ HitRecord hit_bvh(Ray ray, float t_min, float closest_so_far) {
     return best;
 }
 
-void hit_instance_mesh(Ray ray, float t_min, uint instanceIndex, inout HitRecord best) {
+void hit_instance_mesh(Ray ray, float t_min, uint instanceIndex, uint visibilityMask, inout HitRecord best) {
     if (instanceIndex >= mesh_params.instance_count) {
         return;
     }
@@ -653,6 +732,9 @@ void hit_instance_mesh(Ray ray, float t_min, uint instanceIndex, inout HitRecord
     }
 
     InstanceRecord instance = instance_records[instanceIndex];
+    if ((instance.metadata.w & visibilityMask) != visibilityMask) {
+        return;
+    }
     uint meshIndex = instance.metadata.x;
     if (meshIndex >= mesh_params.mesh_count) {
         return;
@@ -760,6 +842,7 @@ void hit_instance_mesh(Ray ray, float t_min, uint instanceIndex, inout HitRecord
                     best.hit = true;
                     best.t = t;
                     best.p = worldPosition;
+                    best.local_p = localRay.origin + localRay.direction * t;
                     best.material = candidateMaterial;
                     best.uv = candidateUv;
                     best.light_normal = worldGeomNormal;
@@ -780,7 +863,7 @@ void hit_instance_mesh(Ray ray, float t_min, uint instanceIndex, inout HitRecord
     }
 }
 
-HitRecord hit_instance_scene(Ray ray, float t_min, float closest_so_far) {
+HitRecord hit_instance_scene(Ray ray, float t_min, float closest_so_far, uint visibilityMask) {
     HitRecord best;
     best.t = closest_so_far;
     best.hit = false;
@@ -823,7 +906,7 @@ HitRecord hit_instance_scene(Ray ray, float t_min, float closest_so_far) {
                 for (uint i = 0u; i < instanceCount; ++i) {
                     uint indexSlot = instanceOffset + i;
                     if (indexSlot < mesh_params.tlas_instance_index_count) {
-                        hit_instance_mesh(ray, t_min, tlas_instance_indices[indexSlot], best);
+                        hit_instance_mesh(ray, t_min, tlas_instance_indices[indexSlot], visibilityMask, best);
                     }
                 }
                 if (rope == 0u) { break; }
@@ -836,7 +919,7 @@ HitRecord hit_instance_scene(Ray ray, float t_min, float closest_so_far) {
     }
 
     for (uint instanceIndex = 0u; instanceIndex < mesh_params.instance_count; ++instanceIndex) {
-        hit_instance_mesh(ray, t_min, instanceIndex, best);
+        hit_instance_mesh(ray, t_min, instanceIndex, visibilityMask, best);
     }
     return best;
 }
@@ -863,6 +946,7 @@ bool hit_sphere(Ray ray, uint i, float t_min, float t_max, out HitRecord rec) {
     }
     rec.t = root;
     rec.p = ray.origin + ray.direction * rec.t;
+    rec.local_p = rec.p;
     vec3 outward = (rec.p - center) / radius;
     rec.front_face = dot(ray.direction, outward) < 0.0;
     rec.normal = rec.front_face ? outward : -outward;
@@ -878,8 +962,8 @@ bool hit_sphere(Ray ray, uint i, float t_min, float t_max, out HitRecord rec) {
     return true;
 }
 
-HitRecord hit_world(Ray ray) {
-    HitRecord rec = hit_instance_scene(ray, 0.0001, 1e30);
+HitRecord hit_world_mask(Ray ray, uint visibilityMask) {
+    HitRecord rec = hit_instance_scene(ray, 0.0001, 1e30, visibilityMask);
     if (mesh_params.instance_count == 0u || mesh_params.local_bvh_node_count == 0u || mesh_params.local_triangle_count == 0u) {
         rec = hit_bvh(ray, 0.0001, 1e30);
     }
@@ -892,6 +976,10 @@ HitRecord hit_world(Ray ray) {
         }
     }
     return rec;
+}
+
+HitRecord hit_world(Ray ray) {
+    return hit_world_mask(ray, 1u | 2u);
 }
 
 vec2 env_uv_from_dir(vec3 dir) {
@@ -913,26 +1001,129 @@ vec3 rotate_y(vec3 v, float angle) {
 }
 
 vec3 analytical_sun_direction() {
-    return rotate_y(normalize(vec3(-0.55057, 0.82812, -0.10531)), -env_params.rotation);
+    float elevation = clamp(camera.atmosphere.x, -0.20, 1.45);
+    float cosElevation = cos(elevation);
+    vec3 localSun = normalize(vec3(-cosElevation, sin(elevation), -0.12 * cosElevation));
+    return rotate_y(localSun, -env_params.rotation);
 }
 
 vec3 analytical_sun_center_radiance() {
     if (camera.sunlight_enabled != 0u) {
-        float sunBrightness = camera.sun_intensity * 16.0;
-        return vec3(sunBrightness, sunBrightness * 0.95, sunBrightness * 0.8);
+        float sunHeight = smoothstep(-0.08, 0.22, analytical_sun_direction().y);
+        vec3 sunsetTint = vec3(1.0, 0.46, 0.16);
+        vec3 noonTint = vec3(1.0, 0.96, 0.84);
+        return mix(sunsetTint, noonTint, sunHeight) * camera.sun_intensity * 32.0;
     }
     return vec3(0.0);
 }
 
-vec3 analytical_sun_radiance(vec3 dir) {
+vec3 analytical_sun_disk_radiance(vec3 dir) {
     if (camera.sunlight_enabled == 0u) {
         return vec3(0.0);
     }
+    float radius = max(camera.sun_angular_radius, 0.00465);
     float cosAngle = dot(normalize(dir), analytical_sun_direction());
-    if (cosAngle <= cos(camera.sun_angular_radius)) {
+    float cosRadius = cos(radius);
+    float disk = smoothstep(cosRadius, mix(cosRadius, 1.0, 0.18), cosAngle);
+    float limb = 0.62 + 0.38 * sqrt(clamp((cosAngle - cosRadius) / max(1.0 - cosRadius, 1.0e-5), 0.0, 1.0));
+    return analytical_sun_center_radiance() * disk * limb;
+}
+
+vec3 fast_sky_radiance(vec3 dir) {
+    vec3 viewDir = normalize(dir);
+    vec3 sunDir = analytical_sun_direction();
+    float viewUp = clamp(viewDir.y, -0.08, 1.0);
+    float sunUp = clamp(sunDir.y, -0.08, 1.0);
+    float cosTheta = clamp(dot(viewDir, sunDir), -1.0, 1.0);
+    float sunVisibility = smoothstep(-0.06, 0.08, sunUp);
+    float viewMass = atmosphere_air_mass(viewUp);
+    float sunMass = atmosphere_air_mass(sunUp);
+    float horizon = pow(1.0 - clamp(viewUp, 0.0, 1.0), 2.0);
+
+    vec3 rayleighBeta = vec3(0.170, 0.398, 0.970);
+    vec3 mieBeta = vec3(0.82, 0.74, 0.62);
+    vec3 transmittance = exp(-(rayleighBeta * 0.30 + mieBeta * 0.08) * (viewMass + sunMass * 0.65));
+    vec3 sunsetScatter = vec3(1.0, 0.42, 0.12) * smoothstep(-0.08, 0.18, horizon) * (1.0 - smoothstep(0.05, 0.55, sunUp));
+
+    vec3 rayleigh = rayleighBeta * atmosphere_rayleigh_phase(cosTheta) * (0.55 + horizon * 0.75);
+    vec3 mie = mieBeta * atmosphere_mie_phase(cosTheta, 0.78) * (0.05 + horizon * 0.26);
+    vec3 sky = (rayleigh + mie + sunsetScatter * 0.22) * transmittance * sunVisibility;
+
+    vec3 night = vec3(0.004, 0.006, 0.012) * smoothstep(-0.25, -0.05, sunUp);
+    return max(sky * camera.sky_intensity * 5.5 + night * camera.sky_intensity, vec3(0.0));
+}
+
+vec3 analytical_sun_radiance(vec3 dir) {
+    return analytical_sun_disk_radiance(dir);
+}
+
+vec2 atmosphere_latlong_uv(vec3 dir) {
+    vec3 d = normalize(dir);
+    return vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5, asin(clamp(d.y, -1.0, 1.0)) / PI + 0.5);
+}
+
+vec3 sample_sky_view_lut(vec3 dir) {
+    vec2 uv = atmosphere_latlong_uv(dir);
+    return texture(sampler2D(atmosphere_sky_view_lut, atmosphere_sampler), vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0))).rgb;
+}
+
+float atmosphere_horizon_visibility(vec3 scenePos, vec3 dir) {
+    vec3 planetary = atmosphere_scene_to_planetary(scenePos);
+    float radius = max(length(planetary), ATMOSPHERE_PLANET_RADIUS + 1.0);
+    float horizonMu = -sqrt(max(1.0 - (ATMOSPHERE_PLANET_RADIUS * ATMOSPHERE_PLANET_RADIUS) / (radius * radius), 0.0));
+    float viewMu = dot(normalize(dir), normalize(planetary));
+    return smoothstep(horizonMu - 0.004, horizonMu + 0.004, viewMu);
+}
+
+vec3 atmosphere_sky_radiance(vec3 dir) {
+    vec3 viewDir = normalize(dir);
+    float horizonVisibility = atmosphere_horizon_visibility(camera.pos.xyz, viewDir);
+    if (horizonVisibility <= 1.0e-4) {
         return vec3(0.0);
     }
-    return analytical_sun_center_radiance();
+    vec3 sampled = sample_sky_view_lut(viewDir);
+    float sampledLuminance = dot(sampled, vec3(0.2126, 0.7152, 0.0722));
+    if (sampledLuminance > 1.0e-5) {
+        return sampled * horizonVisibility;
+    }
+    return fast_sky_radiance(viewDir) * horizonVisibility;
+}
+
+vec3 sample_atmosphere_transmittance_lut(vec3 worldPos, vec3 dir) {
+    vec3 planetary = atmosphere_scene_to_planetary(worldPos);
+    float heightMeters = max(length(planetary) - ATMOSPHERE_PLANET_RADIUS, 0.0);
+    float mu = dot(normalize(dir), normalize(planetary));
+    float atmosphereHeight = max(ATMOSPHERE_TOP_RADIUS - ATMOSPHERE_PLANET_RADIUS, 1.0);
+    vec2 uv = vec2(clamp((mu + 0.20) / 1.20, 0.0, 1.0), clamp(heightMeters / atmosphereHeight, 0.0, 1.0));
+    vec3 sampled = texture(sampler2D(atmosphere_transmittance_lut, atmosphere_sampler), uv).rgb;
+    float sampledLuminance = dot(sampled, vec3(0.2126, 0.7152, 0.0722));
+    return sampledLuminance > 1.0e-5 ? sampled : vec3(1.0);
+}
+
+vec3 sample_multi_scatter_lut_debug(vec3 dir) {
+    vec3 sunDir = analytical_sun_direction();
+    float viewMu = clamp(normalize(dir).y, -0.20, 1.0);
+    float sunMu = clamp(sunDir.y, -0.20, 1.0);
+    vec2 uv = vec2(clamp((viewMu + 0.20) / 1.20, 0.0, 1.0), clamp((sunMu + 0.20) / 1.20, 0.0, 1.0));
+    return texture(sampler2D(atmosphere_multi_scatter_lut, atmosphere_sampler), uv).rgb;
+}
+
+vec3 sun_transmittance(vec3 worldPos, vec3 sunDir) {
+    return sample_atmosphere_transmittance_lut(worldPos, sunDir);
+}
+
+vec3 apply_analytical_aerial_perspective(vec3 radiance, vec3 origin, vec3 direction, float distanceMeters) {
+    if (distanceMeters <= 0.0 || distanceMeters >= 9999.0) {
+        return radiance;
+    }
+    float viewMu = clamp(normalize(direction).y, -0.15, 1.0);
+    vec2 uv = vec2(clamp(sqrt(clamp(distanceMeters / 100000.0, 0.0, 1.0)), 0.0, 1.0), clamp((viewMu + 0.15) / 1.15, 0.0, 1.0));
+    vec4 aerial = texture(sampler2D(atmosphere_aerial_perspective_lut, atmosphere_sampler), uv);
+    float aerialLuminance = dot(aerial.rgb, vec3(0.2126, 0.7152, 0.0722));
+    if (aerial.a <= 1.0e-5 && aerialLuminance <= 1.0e-5) {
+        return radiance;
+    }
+    return radiance * clamp(aerial.a, 0.0, 1.0) + max(aerial.rgb, vec3(0.0));
 }
 
 vec3 environment_radiance(vec3 dir) {
@@ -940,20 +1131,35 @@ vec3 environment_radiance(vec3 dir) {
         return vec3(DEBUG_WHITE_ENV_RADIANCE);
     }
     if (env_params.enabled != 0u) {
+        if (env_params.procedural != 0u) {
+            return atmosphere_sky_radiance(dir) + analytical_sun_disk_radiance(dir);
+        }
         vec3 localDir = rotate_y(dir, env_params.rotation);
         vec2 uv = env_uv_from_dir(localDir);
         vec3 sampled = texture(sampler2D(env_map, env_sampler), vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0))).rgb;
-        float scale = env_params.procedural != 0u ? camera.sky_intensity : env_params.intensity;
-        return sampled * scale + analytical_sun_radiance(dir);
+        return sampled * env_params.intensity + analytical_sun_radiance(dir);
     }
-    float t = 0.5 * (dir.y + 1.0);
-    return mix(vec3(0.70, 0.74, 0.80), vec3(0.56, 0.68, 0.92), t) * camera.sky_intensity + analytical_sun_radiance(dir);
+    return atmosphere_sky_radiance(dir) + analytical_sun_disk_radiance(dir);
 }
 
 vec3 debug_display_tonemap(vec3 color) {
     color = max(color, vec3(0.0));
     color = color / (color + vec3(1.0));
     return pow(color, vec3(1.0 / 2.2));
+}
+
+vec3 clamp_firefly_sample(vec3 sampleColor, vec3 previousAverage, uint frameCount) {
+    sampleColor = max(sampleColor, vec3(0.0));
+    float sampleLum = dot(sampleColor, vec3(0.2126, 0.7152, 0.0722));
+    if (sampleLum <= 1.0e-5) {
+        return sampleColor;
+    }
+
+    float previousLum = dot(max(previousAverage, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    float warmupLimit = mix(96.0, 48.0, clamp(float(frameCount) / 16.0, 0.0, 1.0));
+    float historyLimit = max(48.0, previousLum * 10.0 + 6.0);
+    float maxLum = frameCount <= 1u ? warmupLimit : min(warmupLimit, historyLimit);
+    return sampleColor * min(1.0, maxLum / sampleLum);
 }
 
 vec3 fast_preview_ambient(Material material, vec3 normal) {
@@ -965,7 +1171,7 @@ vec3 fast_preview_ambient(Material material, vec3 normal) {
 
 float environment_pdf(vec3 dir) {
     if (env_params.enabled == 0u || env_params.width == 0u || env_params.height == 0u || env_params.inv_total_lum <= 0.0) {
-        return 0.0;
+        return 1.0 / (4.0 * PI);
     }
     vec3 localDir = rotate_y(dir, env_params.rotation);
     vec2 uv = env_uv_from_dir(localDir);
@@ -978,9 +1184,13 @@ float environment_pdf(vec3 dir) {
 
 vec3 sample_environment_direction(out vec3 out_dir, out float out_pdf) {
     out_pdf = 0.0;
-    if (env_params.enabled == 0u || env_params.width == 0u || env_params.height == 0u) {
-        out_dir = vec3(0.0, 1.0, 0.0);
-        return vec3(0.0);
+    if (env_params.enabled == 0u || env_params.width == 0u || env_params.height == 0u || env_params.inv_total_lum <= 0.0) {
+        float z = 1.0 - 2.0 * rand_f32();
+        float phi = 2.0 * PI * rand_f32();
+        float r = sqrt(max(1.0 - z * z, 0.0));
+        out_dir = vec3(r * cos(phi), z, r * sin(phi));
+        out_pdf = 1.0 / (4.0 * PI);
+        return atmosphere_sky_radiance(out_dir);
     }
 
     float xi0 = rand_f32();
@@ -1011,8 +1221,12 @@ vec3 sample_environment_direction(out vec3 out_dir, out float out_pdf) {
     uint col = colLo;
     vec2 uv = vec2((float(col) + 0.5) / float(env_params.width), (float(row) + 0.5) / float(env_params.height));
     out_dir = rotate_y(env_dir_from_uv(uv), -env_params.rotation);
-    float scale = env_params.procedural != 0u ? camera.sky_intensity : env_params.intensity;
-    vec3 radiance = texelFetch(sampler2D(env_map, env_sampler), ivec2(int(col), int(row)), 0).rgb * scale;
+    if (env_params.procedural != 0u) {
+        vec3 radiance = atmosphere_sky_radiance(out_dir);
+        out_pdf = environment_pdf(out_dir);
+        return radiance;
+    }
+    vec3 radiance = texelFetch(sampler2D(env_map, env_sampler), ivec2(int(col), int(row)), 0).rgb * env_params.intensity;
     out_pdf = environment_pdf(out_dir);
     return radiance;
 }
@@ -1031,6 +1245,19 @@ float reflectance(float cosine, float ref_idx) {
 
 float diffuse_pdf(vec3 normal, vec3 wi) {
     return max(dot(normal, wi), 0.0) / PI;
+}
+
+float brdf_luminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float pbr_specular_sample_probability(Material material) {
+    float metallic = clamp(material.metallic, 0.0, 1.0);
+    vec3 f0 = mix(vec3(0.04), material.color, metallic);
+    vec3 kd = (vec3(1.0) - f0) * (1.0 - metallic);
+    float specularWeight = max(brdf_luminance(f0), 0.0);
+    float diffuseWeight = max(brdf_luminance(kd * material.color * (1.0 / PI)), 0.0);
+    return clamp(specularWeight / max(specularWeight + diffuseWeight, 1e-6), 0.05, 0.95);
 }
 
 vec3 sample_cosine_hemisphere(vec3 normal, out float pdf) {
@@ -1070,6 +1297,15 @@ float smith_g(float roughness, float n_dot_v, float n_dot_l) {
     return smith_g1(roughness, n_dot_v) * smith_g1(roughness, n_dot_l);
 }
 
+vec3 ggx_energy_compensation(vec3 f0, float roughness, float n_dot_v) {
+    float r = clamp(roughness, 0.02, 1.0);
+    float r2 = r * r;
+    float singleScatterEnergy = clamp(1.0 - r2 * (0.45 + 0.25 * (1.0 - clamp(n_dot_v, 0.0, 1.0))), 0.35, 1.0);
+    vec3 averageFresnel = f0 + (vec3(1.0) - f0) * (1.0 / 21.0);
+    vec3 multiScatter = averageFresnel * (1.0 - singleScatterEnergy) / max(singleScatterEnergy, 1e-4);
+    return vec3(1.0) + multiScatter;
+}
+
 vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     float n_dot_v = max(dot(n, wo), 0.0);
     float n_dot_l = max(dot(n, wi), 0.0);
@@ -1077,14 +1313,18 @@ vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
         return vec3(0.0);
     }
 
-    vec3 h = normalize(wo + wi);
+    vec3 halfVector = wo + wi;
+    if (dot(halfVector, halfVector) < 1e-12) {
+        return vec3(0.0);
+    }
+    vec3 h = normalize(halfVector);
     float n_dot_h = max(dot(n, h), 0.0);
     float v_dot_h = max(dot(wo, h), 0.0);
     vec3 f0 = mix(vec3(0.04), material.color, clamp(material.metallic, 0.0, 1.0));
     vec3 f = schlick_fresnel(f0, v_dot_h);
     float d = ggx_ndf(material.roughness, n_dot_h);
     float g = smith_g(material.roughness, n_dot_v, n_dot_l);
-    vec3 specular = f * d * g / max(4.0 * n_dot_v * n_dot_l, 1e-10);
+    vec3 specular = f * d * g * ggx_energy_compensation(f0, material.roughness, n_dot_v) / max(4.0 * n_dot_v * n_dot_l, 1e-10);
 
     vec3 kd = mix(vec3(1.0) - f, vec3(0.0), clamp(material.metallic, 0.0, 1.0));
     vec3 diffuse = kd * material.color * (1.0 / PI);
@@ -1098,11 +1338,21 @@ float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
         return 0.0;
     }
 
-    vec3 h = normalize(wo + wi);
+    vec3 halfVector = wo + wi;
+    if (dot(halfVector, halfVector) < 1e-12) {
+        return 0.0;
+    }
+    vec3 h = normalize(halfVector);
     float n_dot_h = max(dot(n, h), 0.0);
     float v_dot_h = max(dot(wo, h), 0.0);
     float d = ggx_ndf(material.roughness, n_dot_h);
     return d * n_dot_h / max(4.0 * v_dot_h, 1e-10);
+}
+
+float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+    float specularProbability = pbr_specular_sample_probability(material);
+    float diffuseProbability = 1.0 - specularProbability;
+    return diffuseProbability * diffuse_pdf(n, wi) + specularProbability * pdf_ggx_brdf(material, wo, wi, n);
 }
 
 vec3 sample_ggx_brdf(Material material, vec3 wo, vec3 n) {
@@ -1136,15 +1386,22 @@ float pdf_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
         return diffuse_pdf(n, wi);
     }
     if (material.mat_type == 3u || material.mat_type == 4u) {
-        return pdf_ggx_brdf(material, wo, wi, n);
+        return pdf_pbr_brdf(material, wo, wi, n);
     }
     return 0.0;
 }
 
 vec3 sample_brdf(Material material, vec3 wo, vec3 n, out float pdf) {
     if (material.mat_type == 3u || material.mat_type == 4u) {
-        vec3 wi = sample_ggx_brdf(material, wo, n);
-        pdf = pdf_ggx_brdf(material, wo, wi, n);
+        float specularProbability = pbr_specular_sample_probability(material);
+        vec3 wi;
+        if (rand_f32() < specularProbability) {
+            wi = sample_ggx_brdf(material, wo, n);
+        } else {
+            float diffusePdf;
+            wi = sample_cosine_hemisphere(n, diffusePdf);
+        }
+        pdf = pdf_pbr_brdf(material, wo, wi, n);
         return wi;
     }
 
@@ -1175,7 +1432,7 @@ bool sample_emissive_light(vec3 hitPos, out vec3 wi, out vec3 emission, out floa
     uint hi = mesh_params.light_count - 1u;
     for (uint guard = 0u; guard < 32u && lo < hi; ++guard) {
         uint mid = (lo + hi) / 2u;
-        if (targetArea <= light_records[mid].data.y) {
+        if (targetArea <= light_records[mid].data0.y) {
             hi = mid;
         } else {
             lo = mid + 1u;
@@ -1207,7 +1464,7 @@ bool sample_emissive_light(vec3 hitPos, out vec3 wi, out vec3 emission, out floa
         samplePos = v0 * u + v1 * v + v2 * w;
         lightNormal = normalize(transpose(mat3(instance.inverse_transform)) * td3.xyz);
         emission = material.emissive;
-    } else {
+    } else if (selected.metadata.x == 1u) {
         uint sphereIndex = selected.metadata.y;
         Material material = decode_sphere_material(sphereIndex);
         vec4 s = scene_spheres[sphereIndex * 4u];
@@ -1215,6 +1472,25 @@ bool sample_emissive_light(vec3 hitPos, out vec3 wi, out vec3 emission, out floa
         samplePos = s.xyz + n * s.w;
         lightNormal = n;
         emission = material.emissive;
+    } else if (selected.metadata.x == 2u) {
+        wi = normalize(selected.data1.xyz);
+        emission = selected.data2.xyz;
+        pdfSolidAngle = selected.data0.x / max(totalArea, 1e-6);
+        distanceToLight = 10000.0;
+        return length(emission) > 0.0 && pdfSolidAngle > 0.0;
+    } else if (selected.metadata.x == 3u) {
+        samplePos = selected.data1.xyz;
+        lightNormal = normalize(samplePos - hitPos);
+        emission = selected.data2.xyz / max(dot(samplePos - hitPos, samplePos - hitPos), 1e-4);
+    } else {
+        vec3 center = selected.data1.xyz;
+        vec3 n = normalize(vec3(selected.data1.w, selected.data2.w, selected.data3.x));
+        vec3 tangent = normalize(abs(n.y) < 0.99 ? cross(vec3(0.0, 1.0, 0.0), n) : cross(vec3(1.0, 0.0, 0.0), n));
+        vec3 bitangent = normalize(cross(n, tangent));
+        float halfSize = selected.data0.z * 0.5;
+        samplePos = center + tangent * ((rand_f32() * 2.0 - 1.0) * halfSize) + bitangent * ((rand_f32() * 2.0 - 1.0) * halfSize);
+        lightNormal = n;
+        emission = selected.data2.xyz;
     }
 
     vec3 toLight = samplePos - hitPos;
@@ -1222,7 +1498,11 @@ bool sample_emissive_light(vec3 hitPos, out vec3 wi, out vec3 emission, out floa
     distanceToLight = sqrt(max(distSq, 1e-8));
     wi = toLight / distanceToLight;
     float cosLight = max(dot(-wi, lightNormal), 0.0);
-    pdfSolidAngle = cosLight > 1e-6 ? distSq / (cosLight * totalArea) : 0.0;
+    if (selected.metadata.x == 3u) {
+        pdfSolidAngle = selected.data0.x / max(totalArea, 1e-6);
+    } else {
+        pdfSolidAngle = cosLight > 1e-6 ? distSq / (cosLight * totalArea) : 0.0;
+    }
     return length(emission) > 0.0 && pdfSolidAngle > 0.0;
 }
 
@@ -1285,7 +1565,7 @@ vec3 estimate_direct_lighting(
         Ray shadowRay;
         shadowRay.origin = shadow_origin(rec, wi);
         shadowRay.direction = wi;
-        HitRecord shadow = hit_world(shadowRay);
+        HitRecord shadow = hit_world_mask(shadowRay, 1u | 4u);
         bool visible = visible_segment_shadow(shadow, lightDistance);
         float cosSurface = max(dot(lightingNormal, wi), 0.0);
         if (visible && cosSurface > 0.0) {
@@ -1311,7 +1591,7 @@ vec3 estimate_direct_lighting(
         Ray shadowRay;
         shadowRay.origin = shadow_origin(rec, envDir);
         shadowRay.direction = envDir;
-        HitRecord shadow = hit_world(shadowRay);
+        HitRecord shadow = hit_world_mask(shadowRay, 1u | 4u);
         float cosSurface = max(dot(lightingNormal, envDir), 0.0);
         if (visible_directional_shadow(shadow) && cosSurface > 0.0) {
             vec3 bsdf = eval_brdf(material, wo, envDir, lightingNormal);
@@ -1334,11 +1614,11 @@ vec3 estimate_direct_lighting(
         Ray shadowRay;
         shadowRay.origin = shadow_origin(rec, sunDir);
         shadowRay.direction = sunDir;
-        HitRecord shadow = hit_world(shadowRay);
+        HitRecord shadow = hit_world_mask(shadowRay, 1u | 4u);
         float ndl = max(dot(lightingNormal, sunDir), 0.0);
         if (visible_directional_shadow(shadow) && ndl > 0.0) {
             vec3 bsdf = eval_brdf(material, wo, sunDir, lightingNormal);
-            sunContribution = bsdf * analytical_sun_center_radiance() * ndl;
+            sunContribution = bsdf * analytical_sun_center_radiance() * sun_transmittance(rec.p, sunDir) * ndl;
         }
     }
 
@@ -1361,6 +1641,7 @@ vec3 trace_path(Ray ray, out bool did_hit, out float first_depth, out vec3 first
     components.first_bounce_throughput = vec3(0.0);
     components.secondary_env_miss = 0.0;
     components.secondary_env_radiance = vec3(0.0);
+    components.first_local_pos = vec3(0.0);
     components.bounce_count = 0u;
     components.traversal_steps = 0u;
     components.bvh_depth = 0u;
@@ -1407,6 +1688,7 @@ vec3 trace_path(Ray ray, out bool did_hit, out float first_depth, out vec3 first
             first_depth = rec.t;
             first_normal = rec.normal;
             first_position = rec.p;
+            components.first_local_pos = rec.local_p;
             components.first_albedo = rec.material.color;
             components.first_roughness = rec.material.roughness;
             components.instance_id = rec.instance_id;
@@ -1478,7 +1760,7 @@ vec3 trace_path(Ray ray, out bool did_hit, out float first_depth, out vec3 first
             if (camera.sunlight_enabled != 0u && camera.direct_lighting_enabled != 0u) {
                 vec3 sunDir = analytical_sun_direction();
                 float ndl = max(dot(previewNormal, sunDir), 0.0);
-                previewSun = throughput * rec.material.color * (1.0 / PI) * analytical_sun_center_radiance() * ndl;
+                previewSun = throughput * rec.material.color * (1.0 / PI) * analytical_sun_center_radiance() * sun_transmittance(rec.p, sunDir) * ndl;
             }
             radiance += previewSun;
             components.direct_light += previewSun;
@@ -1559,7 +1841,7 @@ void main() {
     uint pixel_index = uint(coords.y * dims.x + coords.x);
     rng_state = pcg_hash(pixel_index + camera.frame_count * 9781u);
 
-    vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(rand_f32(), rand_f32()) : vec2(0.5);
+    vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
     vec2 uv = (vec2(coords) + jitter) / vec2(dims);
     vec2 ndc = uv * 2.0 - 1.0;
     float aspect = float(dims.x) / float(dims.y);
@@ -1575,8 +1857,13 @@ void main() {
     vec3 hit_position;
     PathComponents components;
     vec3 sample_color = trace_path(ray, did_hit, hit_depth, hit_normal, hit_position, components);
+    if (did_hit) {
+        sample_color = apply_analytical_aerial_perspective(sample_color, ray.origin, ray.direction, hit_depth);
+    }
 
     vec4 previous = (camera.frame_count <= 1u || camera.path_tracing_enabled == 0u) ? vec4(0.0) : accumulation_buffer[pixel_index];
+    vec3 previous_average = previous.rgb / max(previous.a, 1.0);
+    sample_color = clamp_firefly_sample(sample_color, previous_average, camera.frame_count);
     vec4 accumulated = previous + vec4(sample_color, 1.0);
     accumulation_buffer[pixel_index] = accumulated;
     vec3 average = camera.path_tracing_enabled != 0u ? accumulated.rgb / max(accumulated.a, 1.0) : sample_color;
@@ -1586,6 +1873,20 @@ void main() {
     variance_buffer[pixel_index] = pack_variance(abs(lum - avgLum));
     depth_normal_buffer[pixel_index] = pack_depth_normal(hit_depth, hit_normal);
     world_position_buffer[pixel_index] = did_hit ? pack_world_position(hit_position) : uvec2(0u);
+    velocity_buffer[pixel_index] = did_hit
+        ? compute_surface_velocity(hit_position, components.first_local_pos, components.instance_id, dims)
+        : compute_sky_velocity(ray.direction, dims);
+
+    vec2 pick_uv = (vec2(coords) + vec2(0.5)) / vec2(dims);
+    vec2 pick_ndc = pick_uv * 2.0 - 1.0;
+    Ray pick_ray;
+    pick_ray.origin = camera.pos.xyz;
+    pick_ray.direction = normalize(camera.forward.xyz + camera.right.xyz * pick_ndc.x * aspect * scale - camera.up.xyz * pick_ndc.y * scale);
+    picking_ray = true;
+    HitRecord pick_hit = hit_world(pick_ray);
+    picking_ray = false;
+    entity_id_buffer[pixel_index] = pick_hit.hit ? pick_hit.instance_id : 0xffffffffu;
+
     vec3 output_value = average;
     if (debug_params.view == 5u) {
         output_value = vec3(clamp(hit_depth / 8.0, 0.0, 1.0));
@@ -1617,7 +1918,7 @@ void main() {
         if (mesh_params.bvh_node_count == 0u) {
             output_value = vec3(0.0);
         } else {
-            HitRecord tlasHit = hit_instance_scene(ray, 0.0001, 1e30);
+            HitRecord tlasHit = hit_instance_scene(ray, 0.0001, 1e30, 1u | 2u);
             HitRecord flatHit = hit_bvh(ray, 0.0001, 1e30);
             bool hitMismatch = tlasHit.hit != flatHit.hit;
             float depthDelta = tlasHit.hit && flatHit.hit ? abs(tlasHit.t - flatHit.t) : 0.0;
@@ -1648,14 +1949,19 @@ void main() {
         output_value = vec3(float(components.bounce_count) / max(float(camera.max_bounces), 1.0));
     } else if (debug_params.view == 26u) {
         output_value = debug_display_tonemap(components.secondary_env_radiance);
-    }
-    if (debug_params.view == 0u ||
-        debug_params.view == 7u ||
-        debug_params.view == 8u ||
-        debug_params.view == 9u ||
-        debug_params.view == 10u ||
-        debug_params.view == 22u) {
-        output_value *= max(camera.exposure, 0.0);
+    } else if (debug_params.view == 29u) {
+        output_value = debug_display_tonemap(atmosphere_sky_radiance(ray.direction) * max(debug_params.scale, 1.0));
+    } else if (debug_params.view == 30u) {
+        vec3 transmittance = sample_atmosphere_transmittance_lut(camera.pos.xyz, ray.direction);
+        output_value = pow(clamp(transmittance, vec3(0.0), vec3(1.0)), vec3(2.0));
+    } else if (debug_params.view == 31u) {
+        float viewMu = clamp(normalize(ray.direction).y, -0.15, 1.0);
+        vec2 lutUv = vec2(0.8, clamp((viewMu + 0.15) / 1.15, 0.0, 1.0));
+        vec4 aerial = texture(sampler2D(atmosphere_aerial_perspective_lut, atmosphere_sampler), lutUv);
+        output_value = debug_display_tonemap((aerial.rgb + vec3(1.0 - aerial.a) * 0.15) * max(debug_params.scale, 1.0) * 3.0);
+    } else if (debug_params.view == 32u) {
+        vec3 multiScatter = sample_multi_scatter_lut_debug(ray.direction);
+        output_value = debug_display_tonemap(multiScatter * max(debug_params.scale, 1.0) * 8.0);
     }
     imageStore(output_color, coords, vec4(output_value, 1.0));
 }

@@ -29,7 +29,7 @@ CommandSystem::~CommandSystem() {
     destroyFrameResources();
 }
 
-void CommandSystem::drawFrame(float clearPhase) {
+void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     FrameResources& frame = frames_[frameIndex_];
     checkVk(vkWaitForFences(context_.device(), 1, &frame.inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 
@@ -65,6 +65,7 @@ void CommandSystem::drawFrame(float clearPhase) {
             checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(editor viewport resize)");
             uiOverlay_->invalidateViewportTexture();
         }
+        pathTracer_->setFrameDeltaSeconds(deltaSeconds);
         pathTracer_->beginFrame(frameIndex_, renderExtent);
     } else if (pipelineDemo_ != nullptr) {
         pipelineDemo_->beginFrame(frameIndex_);

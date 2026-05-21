@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 struct GLFWwindow;
 
@@ -20,6 +21,7 @@ class Swapchain;
 class VulkanContext;
 class AssetManager;
 class CameraController;
+class NotificationManager;
 class SceneDocument;
 struct SceneAsset;
 
@@ -37,9 +39,11 @@ public:
         const AssetManager* assets,
         const std::optional<std::filesystem::path>& gltfPath,
         const std::optional<std::filesystem::path>& hdrPath,
+        const std::vector<EntityId>* instanceEntities,
         const std::string& sceneLoadingStatus,
         const CameraController* camera,
-        float cpuFrameMs);
+        float cpuFrameMs,
+        NotificationManager* notifications);
     void record(VkCommandBuffer commandBuffer);
     void onSwapchainRecreated(const Swapchain& swapchain);
 

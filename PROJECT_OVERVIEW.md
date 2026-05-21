@@ -2,9 +2,9 @@
 
 This document summarizes the current structure and architecture of the native Vulkan renderer in `native/vulkan`.
 
-The project is a C++20 / Vulkan 1.3 port of a path-tracing renderer. It builds a native Windows executable named `rtvulkan` and currently supports compute path tracing, optional Vulkan KHR hardware ray tracing, glTF/GLB scene loading, HDR environment maps, progressive accumulation, temporal/spatial denoising, ImGui editor panels, GPU timing, and renderer debug views.
+The project is a C++20 / Vulkan 1.3 port of a path-tracing renderer. It builds a native Windows executable named `rtvulkan` and currently supports a Vulkan KHR hardware ray tracing path, a legacy compute path tracing backend, glTF/GLB scene loading, HDR environment maps, progressive accumulation, temporal/spatial denoising, histogram auto exposure, compute tone mapping, selection outlines, ImGui editor panels, GPU timing, and renderer debug views.
 
-The renderer is operational, but it is still in migration and stabilization. The README and docs describe remaining work around compute-vs-hardware-RT visual parity, bindless material residency, glTF material coverage, scene transform updates, hardware RT refit paths, render graph/state tracking, and denoiser tuning.
+The renderer is operational, but it is still in migration and stabilization. Current development is focused on the hardware ray tracing backend. The compute backend remains available for legacy fallback and comparison, but new renderer work should target hardware RT unless it is explicitly fixing legacy compute behavior.
 
 ## Repository Shape
 
@@ -17,7 +17,7 @@ Important top-level files and directories:
 - `include/rtv/`: public/internal C++ headers for renderer modules.
 - `src/rtv/`: C++ implementation files.
 - `src/main.cpp`: executable entry point and CLI parsing.
-- `shaders/`: GLSL compute, fullscreen, and ray tracing shaders.
+- `shaders/`: GLSL legacy compute, fullscreen, and hardware ray tracing shaders.
 - `build/`: local CMake build directory.
 - `Sponza/`: local sample scene assets.
 - `citrus_orchard_road_puresky_4k.hdr`: local HDR environment asset.
@@ -26,9 +26,9 @@ Important top-level files and directories:
 
 At the time of inspection, the project contained roughly:
 
-- 65 C++ source files.
+- 66 C++ source files.
 - 71 header files.
-- 12 shader files.
+- 16 shader files.
 - Several migration/stabilization documents.
 
 ## Build System
@@ -296,6 +296,8 @@ Assets are referenced by lightweight handles:
 - Metallic-roughness texture handle.
 - Emissive texture handle.
 
+Imported metallic-roughness materials are uploaded as PBR/GGX materials even when `metallic == 0`, so dielectric roughness now affects stone, plastic, painted, and other non-metal surfaces. The shaders use a diffuse/specular mixture PDF for those materials instead of sampling only the GGX lobe.
+
 `MeshAsset` stores:
 
 - Vertices.
@@ -310,6 +312,7 @@ Assets are referenced by lightweight handles:
 - Material handles.
 - Mesh handles.
 - Scene nodes.
+- Scene lights.
 - Root nodes.
 
 ### Editor Scene
@@ -354,7 +357,7 @@ Scene changes are categorized by `SceneUpdateKind`:
 
 This keeps editor edits separate from the lower-level GPU scene representation.
 
-Current limitation: this conversion path is partial. Mesh entities and render/environment settings are the primary data that reach the renderer. Editor `Light` components and some camera/editor properties exist in the `SceneDocument`, but they are not fully exported into GPU lighting or consistently applied to the active renderer camera on every edit.
+Current limitation: this conversion path is partial. Mesh entities, lights, render settings, and environment settings reach the renderer. Camera edits are applied through the active-camera path, but camera/editor behavior still has more edge cases than material and light edits.
 
 ## GPU Scene Representation
 
@@ -394,9 +397,9 @@ It also owns:
 - Hardware ray tracing mesh build inputs.
 - Hardware ray tracing instance build inputs.
 
-The compute and hardware RT backends share much of this scene data. That is important because the hardware RT backend is intended to match the compute backend visually rather than evolve into a separate renderer.
+The compute and hardware RT backends share much of this scene data. Hardware RT is now the primary renderer path, while compute is retained as legacy support and a useful comparison point.
 
-Lighting note: GPU light records are currently built from emissive mesh and sphere geometry, plus the renderer's sun/environment paths. Newly created editor `Light` components are not yet converted into `GpuLightRecord` data, so creating or editing a point/directional/area light in the editor does not currently affect rendered lighting.
+Lighting note: GPU light records are built from emissive mesh/sphere geometry and authored scene lights. Directional, point, and area lights are merged into the same light-record selection table as emissive geometry; sun and environment lighting remain separate shader paths.
 
 ## Path Tracer Renderer
 
@@ -412,6 +415,7 @@ It owns:
 - Debug parameters.
 - Raw render image.
 - Denoised image.
+- Presentation image.
 - History image.
 - Accumulation buffer.
 - Variance buffer.
@@ -421,11 +425,14 @@ It owns:
 - Descriptor layout cache.
 - Pipeline cache.
 - Shader modules.
-- Compute path tracing pipeline.
+- Legacy compute path tracing pipeline.
 - Denoiser compute pipeline.
 - Fullscreen graphics pipeline.
-- Optional ray tracing pipeline.
-- Optional ray tracing scene.
+- Hardware ray tracing pipeline.
+- Hardware ray tracing scene.
+- Auto-exposure histogram/reduce pipelines.
+- Tone-map compute pipeline.
+- Selection-outline compute pipeline.
 - Per-frame descriptor arenas.
 - GPU profilers.
 - Renderer validation log.
@@ -434,13 +441,15 @@ Main frame flow:
 
 1. Begin the frame and update camera/settings uniforms.
 2. Transition the raw output image for shader writes.
-3. Run path tracing through the selected backend.
+3. Run path tracing through the selected backend, normally hardware RT.
 4. Barrier path tracing outputs for denoiser reads.
 5. Run temporal/spatial denoising if enabled.
 6. Copy history resources for the next frame.
-7. Transition the selected output for fullscreen sampling.
-8. Render fullscreen presentation.
-9. Render the editor overlay.
+7. Optionally build/reduce the luminance histogram for auto exposure.
+8. Tone map into the presentation image.
+9. Optionally run the selection outline compute pass.
+10. Render fullscreen presentation.
+11. Render the editor overlay.
 
 Accumulation resets when relevant state changes:
 
@@ -462,13 +471,15 @@ Accumulation resets when relevant state changes:
 
 The renderer supports three backend modes:
 
-- `Auto`: use hardware RT when available, otherwise compute.
-- `Compute`: always use compute path tracing.
 - `HardwareRayTracing`: require Vulkan KHR hardware RT and fail clearly if unsupported.
+- `Auto`: use hardware RT when available, otherwise compute.
+- `Compute`: use the legacy compute path tracer.
+
+Hardware RT is the active development target. Compute remains in the codebase for fallback, debugging, and historical comparison, but it should not drive new feature design.
 
 ### Compute Backend
 
-The compute backend uses `shaders/pathtrace.comp`.
+The compute backend uses `shaders/pathtrace.comp`. It is a legacy backend.
 
 It performs:
 
@@ -486,7 +497,7 @@ It performs:
 - Debug view output.
 - Denoiser auxiliary buffer output.
 
-It binds scene data directly as storage buffers, sampled images, samplers, and uniforms.
+It binds scene data directly as storage buffers, sampled images, samplers, and uniforms. Keep maintenance here conservative unless a change is needed for fallback correctness or shared data compatibility.
 
 ### Hardware Ray Tracing Backend
 
@@ -517,17 +528,21 @@ The hardware RT backend uses:
 
 The ray generation shader owns the multi-bounce path loop. Hit shaders return compact hit information such as IDs, UVs, normals, and tangent basis. Material decoding and texture evaluation happen after hits are accepted.
 
-The hardware RT descriptor set includes the TLAS and an RT triangle-material-ID buffer in addition to the shared scene/material/environment buffers.
+The hardware RT descriptor set includes the TLAS and an RT triangle-material-ID buffer in addition to the shared scene/material/environment buffers. New material, lighting, traversal, scene-update, and performance work should be implemented here first.
 
 ## Shaders
 
 Shader files:
 
 - `demo_compute.comp`: simple compute demo.
-- `pathtrace.comp`: compute path tracer.
+- `pathtrace.comp`: legacy compute path tracer.
 - `denoiser.comp`: temporal/spatial denoiser.
+- `luminance_histogram.comp`: auto-exposure histogram builder.
+- `exposure_reduce.comp`: auto-exposure percentile reducer/adaptation pass.
+- `tone_map.comp`: HDR exposure, tone mapping, color grading, and output encoding.
+- `selection_outline.comp`: selected-instance outline overlay.
 - `fullscreen.vert`: fullscreen triangle vertex shader.
-- `fullscreen.frag`: fullscreen presentation/debug fragment shader.
+- `fullscreen.frag`: fullscreen presentation copy shader.
 - `pathtrace.rgen`: ray generation shader for hardware RT.
 - `pathtrace.rchit`: closest-hit shader.
 - `pathtrace.rahit`: primary any-hit shader.
@@ -536,7 +551,7 @@ Shader files:
 - `pathtrace_shadow.rmiss`: shadow miss shader.
 - `rt_common.glsl`: shared hardware RT shader declarations and helpers.
 
-The compute shader is the largest shader and acts as the main visual reference. The hardware RT shaders share layout and lighting/material logic where possible.
+The hardware RT shader set is the active renderer path. `pathtrace.comp` remains useful for comparison and fallback, but it is no longer the main visual reference.
 
 ## Denoising
 
@@ -560,11 +575,17 @@ The denoiser performs temporal reprojection and spatial filtering. It can be dis
 
 ## Presentation
 
-Presentation uses a fullscreen dynamic-rendering graphics pass.
+Presentation is split between compute and graphics passes.
+
+`tone_map.comp` reads the raw or denoised HDR renderer output, applies manual or auto exposure, runs the selected tone mapper, applies color grading, and writes the SDR presentation image.
+
+Auto exposure is scene-wide and histogram-based. `luminance_histogram.comp` bins log luminance from the denoised image, and `exposure_reduce.comp` chooses a configured percentile luminance, clamps the exposure target, and temporally adapts the current exposure.
 
 `fullscreen.vert` emits a fullscreen triangle.
 
-`fullscreen.frag` samples either the raw or denoised renderer output and applies exposure/debug presentation logic.
+`fullscreen.frag` samples the already tone-mapped presentation image and writes it to the active render target.
+
+`selection_outline.comp` can run after tone mapping to draw the selected-instance outline using the entity/instance ID buffer and packed depth/normal data.
 
 After the fullscreen pass, the ImGui editor overlay is rendered.
 
@@ -602,11 +623,11 @@ Editor requests include:
 
 Current editor integration limits:
 
-- Creating a camera updates the editor scene and active-camera state, but the renderer does not consistently apply that new camera pose/FOV during the normal `CameraOnly` request path. The camera is reliably applied during renderer creation/rebuild paths.
-- Creating or editing a light updates the editor scene, but editor light components are not uploaded into GPU light records yet.
+- Camera updates apply through the active-camera path, but camera/editor workflows still have more edge cases than material and light edits.
+- Creating or editing a light updates the editor scene and attempts a GPU light-record update without a full renderer rebuild.
 - Several Inspector branches for legacy/imported/fallback selections still show placeholder controls or temporary local values. Those controls can move in the UI without changing renderer state.
 - The Material Editor panel is controlled by panel visibility, not by selection type. It remains visible unless the user hides that panel, and it shows a disabled message when the current selection has no material.
-- Material edits are more connected than light/camera authoring: they update `AssetManager` material data and attempt a GPU material-buffer update through `PathTracerRenderer::updateMaterials`.
+- Material edits update `AssetManager` material data and attempt a GPU material-buffer update through `PathTracerRenderer::updateMaterials`.
 
 ## Runtime Controls
 
@@ -666,7 +687,9 @@ Files can be dropped onto the window:
 
 - Path tracing.
 - Denoising.
-- Fullscreen presentation.
+- Fullscreen/presentation work.
+
+The renderer validation log records finer pass names, including hardware RT vs legacy compute tracing, auto-exposure histogram/reduce, tone map compute, selection outline, history copy, and editor viewport presentation.
 
 The editor also exposes hardware RT stats:
 
@@ -695,29 +718,28 @@ The renderer is functional but not finished. The strongest parts of the architec
 - RAII resource wrappers.
 - Explicit Synchronization2 barriers.
 - Shared GPU scene representation.
-- Compute and hardware RT backend abstraction.
+- Hardware RT backend with legacy compute fallback.
 - Shader reflection-driven descriptor layout construction.
 - Editor request flow separated from immediate renderer mutation.
 - Rich debug and profiling support.
 
 Main active or future work areas:
 
-- Compute-vs-hardware-RT visual parity.
 - Hardware RT acceleration structure updates/refits.
-- Completing editor camera propagation so created/selected active cameras immediately drive the renderer.
-- Exporting editor light components into GPU light records or another renderer lighting path.
+- Hardening editor camera propagation and active-camera edge cases.
+- Hardening authored light updates, GPU light-record weighting, and light editing workflows.
 - Replacing placeholder Inspector controls with controls backed by actual scene/renderer state.
 - Finer geometry splitting for opaque, alpha-tested, and single-sided traversal paths.
-- Rough dielectric/specular sampling and MIS tuning.
+- Further rough dielectric/specular sampling and MIS tuning in the hardware RT path.
 - Fully bindless material texture residency.
 - Broader glTF material extension support.
 - More complete scene instancing and transform update paths.
 - Render graph resource-state tracking and barrier validation.
-- Denoiser and reprojection validation against the WebGPU reference.
+- Denoiser and reprojection validation against hardware RT output and the WebGPU reference.
 
 ## Important Architectural Takeaway
 
-The project is not just a minimal Vulkan sample. It is a staged renderer/editor migration with a real scene pipeline, GPU scene abstraction, compute path tracing backend, hardware ray tracing backend, denoiser, debug tooling, and editor integration.
+The project is not just a minimal Vulkan sample. It is a staged renderer/editor migration with a real scene pipeline, GPU scene abstraction, primary hardware ray tracing backend, legacy compute fallback, denoiser, debug tooling, and editor integration.
 
 The central data flow is:
 
@@ -728,7 +750,8 @@ CLI / editor input
     -> SceneToGpuSceneBuilder
     -> GpuScene
     -> PathTracerRenderer
-    -> compute backend or hardware RT backend
+    -> hardware RT backend
+       or legacy compute fallback
     -> denoiser
     -> fullscreen presentation
     -> ImGui editor overlay

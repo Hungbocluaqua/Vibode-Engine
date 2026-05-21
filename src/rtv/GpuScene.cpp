@@ -25,6 +25,24 @@ namespace rtv {
 
 namespace {
 
+constexpr uint32_t instanceFlagVisible = 1u << 0u;
+constexpr uint32_t instanceFlagVisibleToCamera = 1u << 1u;
+constexpr uint32_t instanceFlagCastShadow = 1u << 2u;
+
+uint32_t nodeInstanceFlags(const SceneNodeAsset& node) {
+    uint32_t flags = 0u;
+    if (node.visible) {
+        flags |= instanceFlagVisible;
+    }
+    if (node.visibleToCamera) {
+        flags |= instanceFlagVisibleToCamera;
+    }
+    if (node.castShadow) {
+        flags |= instanceFlagCastShadow;
+    }
+    return flags;
+}
+
 constexpr uint32_t maxMaterialTextures = 128;
 constexpr uint64_t fastImportedBvhTriangleThreshold = 1'000'000ull;
 constexpr uint32_t materialFlagManualBaseColorSrgb = 1u << 0u;
@@ -33,10 +51,10 @@ constexpr uint32_t materialVec4Stride = 5u;
 
 static_assert(sizeof(GpuMeshRecord) == 64);
 static_assert(sizeof(GpuPrimitiveRecord) == 32);
-static_assert(sizeof(GpuInstanceRecord) == 144);
+static_assert(sizeof(GpuInstanceRecord) == 208);
 static_assert(sizeof(GpuLocalVertex) == 48);
 static_assert(sizeof(GpuInstanceBoundsRecord) == 32);
-static_assert(sizeof(GpuLightRecord) == 32);
+static_assert(sizeof(GpuLightRecord) == 80);
 static_assert(sizeof(MeshParamsUniform) == 80);
 
 bool hasValidGpuCache(const CachedScene& cached, const SceneAsset& scene) {
@@ -126,7 +144,7 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
         const uint32_t flags =
             cachedMaterialTextureFlag(cached, material.baseColorTextureIndex, materialFlagManualBaseColorSrgb) |
             cachedMaterialTextureFlag(cached, material.emissiveTextureIndex, materialFlagManualEmissiveSrgb);
-        const float type = material.metallicFactor > 0.5f ? 3.0f : 0.0f;
+        const float type = 3.0f;
         materialData.push_back({glm::vec3(material.baseColorFactor), material.roughnessFactor});
         materialData.push_back({1.5f, type, material.metallicFactor, static_cast<float>(flags)});
         materialData.push_back({material.emissiveFactor, material.baseColorFactor.a});
@@ -569,10 +587,17 @@ GpuMeshRecord makeMeshRecord(
     };
 }
 
-GpuInstanceRecord makeInstanceRecord(const glm::mat4& transform, uint32_t meshIndex, uint32_t primitiveOffset, uint32_t primitiveCount, uint32_t flags = 0) {
+GpuInstanceRecord makeInstanceRecord(
+    const glm::mat4& transform,
+    uint32_t meshIndex,
+    uint32_t primitiveOffset,
+    uint32_t primitiveCount,
+    uint32_t flags = instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow,
+    const glm::mat4* prevTransform = nullptr) {
     return GpuInstanceRecord{
         .transform = transform,
         .inverseTransform = glm::inverse(transform),
+        .prevTransform = prevTransform != nullptr ? *prevTransform : transform,
         .metadata = {meshIndex, primitiveOffset, primitiveCount, flags},
     };
 }
@@ -627,6 +652,9 @@ std::vector<GpuLightRecord> buildLightRecords(
     std::vector<GpuLightRecord> lights;
     for (uint32_t instanceIndex = 0; instanceIndex < instanceRecords.size(); ++instanceIndex) {
         const GpuInstanceRecord& instance = instanceRecords[instanceIndex];
+        if ((instance.metadata.w & instanceFlagVisible) == 0u) {
+            continue;
+        }
         const uint32_t meshIndex = instance.metadata.x;
         if (meshIndex >= meshRecords.size()) {
             continue;
@@ -654,7 +682,7 @@ std::vector<GpuLightRecord> buildLightRecords(
             totalArea += area;
             lights.push_back(GpuLightRecord{
                 .metadata = {0u, packedIndex, material, instanceIndex},
-                .data = {area, totalArea, 0.0f, 0.0f},
+                .data0 = {area, totalArea, 0.0f, 0.0f},
             });
         }
     }
@@ -670,10 +698,65 @@ std::vector<GpuLightRecord> buildLightRecords(
         totalArea += area;
         lights.push_back(GpuLightRecord{
             .metadata = {1u, sphereIndex, 0u, static_cast<uint32_t>(lights.size())},
-            .data = {area, totalArea, sphere.w, 0.0f},
+            .data0 = {area, totalArea, sphere.w, 0.0f},
         });
     }
     return lights;
+}
+
+float luminance(glm::vec3 value) {
+    return glm::dot(value, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+}
+
+glm::vec3 safeNormalize(glm::vec3 value, glm::vec3 fallback) {
+    const float len2 = glm::dot(value, value);
+    return len2 > 0.000001f ? value * glm::inversesqrt(len2) : fallback;
+}
+
+std::vector<GpuLightRecord> buildAuthoredLightRecords(const std::vector<SceneLightAsset>& lights, float startWeight, float& totalWeight) {
+    totalWeight = startWeight;
+    std::vector<GpuLightRecord> records;
+    records.reserve(lights.size());
+    for (uint32_t i = 0; i < lights.size(); ++i) {
+        const SceneLightAsset& light = lights[i];
+        if (!light.enabled || light.intensity <= 0.0f || luminance(light.color) <= 0.0f) {
+            continue;
+        }
+
+        const glm::vec3 radiance = light.color * light.intensity;
+        const float size = std::max(light.sizeOrRadius, 0.0001f);
+        float weight = std::max(luminance(radiance), 0.0001f);
+        const uint32_t type = 2u + std::min(light.type, 2u);
+        if (type == 4u) {
+            weight *= size * size;
+        }
+        totalWeight += weight;
+
+        const glm::vec3 position = glm::vec3(light.transform[3]);
+        const glm::vec3 forward = safeNormalize(glm::mat3(light.transform) * glm::vec3(0.0f, 0.0f, -1.0f), glm::vec3(0.0f, -1.0f, 0.0f));
+        const glm::vec3 toLightDirection = -forward;
+        const glm::vec3 normal = forward;
+
+        GpuLightRecord record{};
+        record.metadata = {type, i, 0u, 0u};
+        record.data0 = {weight, totalWeight, size, 0.0f};
+        record.data1 = type == 2u ? glm::vec4(toLightDirection, normal.x) : glm::vec4(position, normal.x);
+        record.data2 = {radiance, normal.y};
+        record.data3 = {normal.z, 0.0f, 0.0f, 0.0f};
+        records.push_back(record);
+    }
+    return records;
+}
+
+std::vector<GpuLightRecord> combineLightRecords(const std::vector<GpuLightRecord>& emissiveRecords, const std::vector<SceneLightAsset>& authoredLights, float emissiveWeight, float& totalWeight) {
+    std::vector<GpuLightRecord> records = emissiveRecords;
+    float runningWeight = emissiveWeight;
+    std::vector<GpuLightRecord> authored = buildAuthoredLightRecords(authoredLights, runningWeight, totalWeight);
+    records.insert(records.end(), authored.begin(), authored.end());
+    if (authored.empty()) {
+        totalWeight = runningWeight;
+    }
+    return records;
 }
 
 } // namespace
@@ -690,7 +773,7 @@ GpuScene::GpuScene(
       sceneCachePath_(std::move(sceneCachePath)) {
     bool usedGpuCache = false;
     if (importedScene != nullptr && assets != nullptr && !importedScene->meshes.empty()) {
-        if (sceneCachePath_.has_value()) {
+        if (sceneCachePath_.has_value() && importedScene->lights.empty()) {
             auto cached = SceneCache::load(*sceneCachePath_);
             if (cached.has_value() && hasValidGpuCache(*cached, *importedScene)) {
                 createImportedSceneFromCache(uploader, *cached);
@@ -978,7 +1061,7 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         const glm::vec3 emissive = material != nullptr ? material->emissiveFactor : glm::vec3(0.0f);
         const float roughness = material != nullptr ? material->roughnessFactor : 1.0f;
         const float metallic = material != nullptr ? material->metallicFactor : 0.0f;
-        const uint32_t type = metallic > 0.5f ? 3u : 0u;
+        const uint32_t type = 3u;
         uint32_t flags = 0;
         if (material != nullptr) {
             uint32_t slot = textureSlotIndexFor(material->baseColorTexture);
@@ -1011,6 +1094,134 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         return false;
     }
     uploader.uploadToBuffer(*materials_, materialData.data(), byteSize);
+    return true;
+}
+
+bool GpuScene::updateSceneLights(BufferUploader& uploader, const SceneAsset& scene) {
+    if (lightRecords_ == nullptr || meshParamsBuffer_ == nullptr) {
+        return false;
+    }
+
+    float totalWeight = emissiveLightRecords_.empty() ? 0.0f : emissiveLightRecords_.back().data0.y;
+    std::vector<GpuLightRecord> records = combineLightRecords(emissiveLightRecords_, scene.lights, totalWeight, totalWeight);
+    uploadLightRecords(uploader, std::move(records), totalWeight);
+    return true;
+}
+
+bool GpuScene::updateInstanceTransforms(BufferUploader& uploader, const SceneAsset& scene, const AssetManager& assets) {
+    if (instanceRecords_ == nullptr || instanceBounds_ == nullptr || tlasNodes_ == nullptr || tlasInstanceIndices_ == nullptr || meshParams_.meshCount == 0) {
+        return false;
+    }
+
+    std::unordered_map<uint32_t, uint32_t> meshRecordIndexForAsset;
+    std::vector<CpuBounds> localMeshBounds;
+    std::vector<uint32_t> primitiveOffsets;
+    std::vector<uint32_t> primitiveCounts;
+    localMeshBounds.reserve(scene.meshes.size());
+    primitiveOffsets.reserve(scene.meshes.size());
+    primitiveCounts.reserve(scene.meshes.size());
+
+    uint32_t primitiveOffset = 0;
+    for (MeshAssetHandle handle : scene.meshes) {
+        const MeshAsset* mesh = assets.mesh(handle);
+        if (mesh == nullptr || mesh->vertices.empty() || mesh->indices.empty()) {
+            continue;
+        }
+        CpuBounds bounds;
+        for (const MeshVertex& vertex : mesh->vertices) {
+            includePoint(bounds, vertex.position);
+        }
+        const uint32_t meshRecordIndex = static_cast<uint32_t>(localMeshBounds.size());
+        meshRecordIndexForAsset.emplace(handle.index, meshRecordIndex);
+        localMeshBounds.push_back(bounds);
+        primitiveOffsets.push_back(primitiveOffset);
+        primitiveCounts.push_back(static_cast<uint32_t>(mesh->primitives.size()));
+        primitiveOffset += static_cast<uint32_t>(mesh->primitives.size());
+    }
+
+    std::vector<GpuInstanceRecord> instanceRecords;
+    std::vector<GpuInstanceBoundsRecord> instanceBounds;
+    std::vector<RayTracingInstanceBuildInput> rayTracingInstances;
+    const std::vector<GpuInstanceRecord> previousInstanceRecords = instanceRecordCpu_;
+
+    auto appendInstance = [&](const glm::mat4& transform, MeshAssetHandle meshHandle, uint32_t flags) {
+        const auto recordIt = meshRecordIndexForAsset.find(meshHandle.index);
+        if (recordIt == meshRecordIndexForAsset.end()) {
+            return;
+        }
+        const uint32_t meshRecordIndex = recordIt->second;
+        const uint32_t instanceIndex = static_cast<uint32_t>(instanceRecords.size());
+        const glm::mat4 prevTransform =
+            instanceIndex < previousInstanceRecords.size()
+                ? previousInstanceRecords[instanceIndex].transform
+                : transform;
+        instanceRecords.push_back(makeInstanceRecord(
+            transform,
+            meshRecordIndex,
+            primitiveOffsets[meshRecordIndex],
+            primitiveCounts[meshRecordIndex],
+            flags,
+            &prevTransform));
+        instanceBounds.push_back(makeInstanceBoundsRecord(transformBounds(localMeshBounds[meshRecordIndex], transform), instanceIndex, meshRecordIndex));
+        rayTracingInstances.push_back(RayTracingInstanceBuildInput{
+            .instanceIndex = instanceIndex,
+            .meshIndex = meshRecordIndex,
+            .transform = transform,
+            .flags = flags,
+            .visible = (flags & instanceFlagVisible) != 0u,
+        });
+    };
+
+    auto visitNode = [&](auto&& self, uint32_t nodeIndex, glm::mat4 parent) -> void {
+        if (nodeIndex >= scene.nodes.size()) {
+            return;
+        }
+        const SceneNodeAsset& node = scene.nodes[nodeIndex];
+        const glm::mat4 world = parent * node.transform;
+        if (node.mesh.valid()) {
+            appendInstance(world, node.mesh, nodeInstanceFlags(node));
+        }
+        for (uint32_t child : node.children) {
+            self(self, child, world);
+        }
+    };
+
+    if (!scene.rootNodes.empty()) {
+        for (uint32_t root : scene.rootNodes) {
+            visitNode(visitNode, root, glm::mat4{1.0f});
+        }
+    } else {
+        for (uint32_t i = 0; i < scene.nodes.size(); ++i) {
+            if (scene.nodes[i].parent < 0) {
+                visitNode(visitNode, i, glm::mat4{1.0f});
+            }
+        }
+    }
+
+    if (instanceRecords.empty() || instanceRecords.size() != meshParams_.instanceCount) {
+        return false;
+    }
+
+    std::vector<glm::vec4> tlasData;
+    std::vector<uint32_t> tlasInstanceIndices;
+    buildTlas(instanceBounds, tlasData, tlasInstanceIndices);
+    if (tlasData.empty() || tlasInstanceIndices.empty()) {
+        return false;
+    }
+
+    uploadVector(allocator_, uploader, instanceRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceRecords, "updated instance records");
+    uploadVector(allocator_, uploader, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "updated instance bounds");
+    uploadVector(allocator_, uploader, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasData, "updated tlas nodes");
+    uploadVector(allocator_, uploader, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasInstanceIndices, "updated tlas instance indices");
+
+    instanceRecordCpu_ = instanceRecords;
+    rayTracingInstances_ = std::move(rayTracingInstances);
+    meshParams_.tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u);
+    meshParams_.tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size());
+    if (meshParamsBuffer_) {
+        meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
+        meshParamsBuffer_->flush(sizeof(meshParams_));
+    }
     return true;
 }
 
@@ -1161,6 +1372,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
             0u,
             static_cast<uint32_t>(primitiveRecords.size()),
             materialOpaqueTraversalSafe),
+        .updateMode = AccelUpdateMode::RefitTransform,
     });
     rayTracingInstances_.clear();
     rayTracingInstances_.push_back(RayTracingInstanceBuildInput{
@@ -1191,7 +1403,8 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
     std::vector<glm::vec4> sphereData;
 
     float emissiveTotalArea = 0.0f;
-    const std::vector<GpuLightRecord> lightRecords = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
+    emissiveLightRecords_ = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
+    const std::vector<GpuLightRecord> lightRecords = emissiveLightRecords_;
 
     meshParams_ = {
         .vertexCount = static_cast<uint32_t>(vertices.size()),
@@ -1241,6 +1454,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         batch.submit();
     }
 
+    instanceRecordCpu_ = instanceRecords;
     meshParamsBuffer_ = std::make_unique<Buffer>(allocator_, BufferDesc{
         .size = sizeof(MeshParamsUniform),
         .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -1301,7 +1515,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         const glm::vec3 emissive = material != nullptr ? material->emissiveFactor : glm::vec3(0.0f);
         const float roughness = material != nullptr ? material->roughnessFactor : 1.0f;
         const float metallic = material != nullptr ? material->metallicFactor : 0.0f;
-        const uint32_t type = metallic > 0.5f ? 3u : 0u;
+        const uint32_t type = 3u;
         const float baseColorTexture = material != nullptr ? textureSlotFor(material->baseColorTexture) : -1.0f;
         const float normalTexture = material != nullptr ? textureSlotFor(material->normalTexture) : -1.0f;
         const float metallicRoughnessTexture = material != nullptr ? textureSlotFor(material->metallicRoughnessTexture) : -1.0f;
@@ -1491,12 +1705,13 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
                 prep.primitiveOffset,
                 static_cast<uint32_t>(prep.mesh->primitives.size()),
                 materialOpaqueTraversalSafe),
+            .updateMode = AccelUpdateMode::RefitTransform,
         });
         localMeshBounds.push_back(prep.localBounds);
         meshRecordIndexForAsset.emplace(prep.handle.index, meshRecordIndex);
     }
 
-    auto appendInstance = [&](const glm::mat4& transform, uint32_t meshIndex) {
+    auto appendInstance = [&](const glm::mat4& transform, uint32_t meshIndex, uint32_t flags) {
         auto recordIt = meshRecordIndexForAsset.find(meshIndex);
         if (recordIt == meshRecordIndexForAsset.end()) {
             return;
@@ -1506,11 +1721,13 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         const uint32_t primitiveOffset = meshRecord.primitiveData.x;
         const uint32_t primitiveCount = meshRecord.primitiveData.y;
         const uint32_t instanceIndex = static_cast<uint32_t>(instanceRecords.size());
-        instanceRecords.push_back(makeInstanceRecord(transform, meshRecordIndex, primitiveOffset, primitiveCount));
+        instanceRecords.push_back(makeInstanceRecord(transform, meshRecordIndex, primitiveOffset, primitiveCount, flags));
         rayTracingInstances_.push_back(RayTracingInstanceBuildInput{
             .instanceIndex = instanceIndex,
             .meshIndex = meshRecordIndex,
             .transform = transform,
+            .flags = flags,
+            .visible = (flags & instanceFlagVisible) != 0u,
         });
         instanceBounds.push_back(makeInstanceBoundsRecord(transformBounds(localMeshBounds[meshRecordIndex], transform), instanceIndex, meshRecordIndex));
     };
@@ -1522,7 +1739,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         const SceneNodeAsset& node = importedScene.nodes[nodeIndex];
         const glm::mat4 world = parent * node.transform;
         if (node.mesh.valid()) {
-            appendInstance(world, node.mesh.index);
+            appendInstance(world, node.mesh.index, nodeInstanceFlags(node));
         }
         for (uint32_t child : node.children) {
             self(self, child, world);
@@ -1551,7 +1768,9 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
 
     std::vector<glm::vec4> sphereData;
     float emissiveTotalArea = 0.0f;
-    const std::vector<GpuLightRecord> lightRecords = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
+    emissiveLightRecords_ = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
+    float lightSelectionWeight = emissiveTotalArea;
+    const std::vector<GpuLightRecord> lightRecords = combineLightRecords(emissiveLightRecords_, importedScene.lights, emissiveTotalArea, lightSelectionWeight);
     meshParams_ = {
         .vertexCount = static_cast<uint32_t>(localVertexData.size()),
         .triangleCount = localTriangleCursor,
@@ -1562,7 +1781,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         .primitiveCount = static_cast<uint32_t>(primitiveRecords.size()),
         .instanceCount = static_cast<uint32_t>(instanceRecords.size()),
         .lightCount = static_cast<uint32_t>(lightRecords.size()),
-        .emissiveTotalArea = emissiveTotalArea,
+        .emissiveTotalArea = lightSelectionWeight,
         .meshCount = static_cast<uint32_t>(meshRecords.size()),
         .localVertexCount = static_cast<uint32_t>(localVertexData.size()),
         .localIndexCount = static_cast<uint32_t>(localIndices.size()),
@@ -1601,6 +1820,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         batch.submit();
     }
 
+    instanceRecordCpu_ = instanceRecords;
     meshParamsBuffer_ = std::make_unique<Buffer>(allocator_, BufferDesc{
         .size = sizeof(MeshParamsUniform),
         .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -1611,7 +1831,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
     meshParamsBuffer_->flush(sizeof(meshParams_));
 
-    if (sceneCachePath_.has_value() && !importedScene.sourcePath.empty()) {
+    if (sceneCachePath_.has_value() && !importedScene.sourcePath.empty() && importedScene.lights.empty()) {
         CachedScene gpuCached;
         gpuCached.name = importedScene.name;
         gpuCached.sourceMtime = SceneCache::fileMtime(importedScene.sourcePath);
@@ -1753,7 +1973,10 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         for (const auto& light : lightRecords) {
             CachedLightRecord cachedLight;
             cachedLight.metadata = light.metadata;
-            cachedLight.data = light.data;
+            cachedLight.data0 = light.data0;
+            cachedLight.data1 = light.data1;
+            cachedLight.data2 = light.data2;
+            cachedLight.data3 = light.data3;
             gpuCached.lightRecords.push_back(cachedLight);
         }
         gpuCached.meshParams = toCachedMeshParams(meshParams_);
@@ -1820,6 +2043,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
                 rec.primitiveData.x,
                 rec.primitiveData.y,
                 materialOpaqueTraversalSafe),
+            .updateMode = AccelUpdateMode::RefitTransform,
         });
 
         localBvhData.insert(localBvhData.end(), cachedMesh.localBvh.packedNodes.begin(), cachedMesh.localBvh.packedNodes.end());
@@ -1847,6 +2071,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         GpuInstanceRecord rec{};
         rec.transform = cachedInst.transform;
         rec.inverseTransform = cachedInst.inverseTransform;
+        rec.prevTransform = cachedInst.transform;
         rec.metadata = cachedInst.metadata;
         instanceRecords.push_back(rec);
         rayTracingInstances_.push_back(RayTracingInstanceBuildInput{
@@ -1867,9 +2092,13 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     for (const auto& cachedLight : cached.lightRecords) {
         GpuLightRecord rec{};
         rec.metadata = cachedLight.metadata;
-        rec.data = cachedLight.data;
+        rec.data0 = cachedLight.data0;
+        rec.data1 = cachedLight.data1;
+        rec.data2 = cachedLight.data2;
+        rec.data3 = cachedLight.data3;
         lightRecords.push_back(rec);
     }
+    emissiveLightRecords_ = lightRecords;
 
     const std::vector<uint32_t> rtTriangleMaterialIds =
         buildRtTriangleMaterialIds(primitiveRecords, static_cast<uint32_t>(localIndices.size() / 3u));
@@ -1911,6 +2140,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         batch.submit();
     }
 
+    instanceRecordCpu_ = instanceRecords;
     meshParamsBuffer_ = std::make_unique<Buffer>(allocator_, BufferDesc{
         .size = sizeof(MeshParamsUniform),
         .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -1989,6 +2219,29 @@ void GpuScene::uploadEnvironmentParams() {
     if (envParamsBuffer_) {
         envParamsBuffer_->write(&envParams_, sizeof(envParams_));
         envParamsBuffer_->flush(sizeof(envParams_));
+    }
+}
+
+void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight) {
+    if (lightRecords.empty()) {
+        lightRecords.push_back(GpuLightRecord{});
+        totalWeight = 0.0f;
+    }
+
+    uploadBuffer(
+        allocator_,
+        uploader,
+        lightRecords_,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        lightRecords.data(),
+        sizeof(GpuLightRecord) * lightRecords.size(),
+        "scene light records");
+
+    meshParams_.lightCount = static_cast<uint32_t>(lightRecords.size());
+    meshParams_.emissiveTotalArea = totalWeight;
+    if (meshParamsBuffer_) {
+        meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
+        meshParamsBuffer_->flush(sizeof(meshParams_));
     }
 }
 

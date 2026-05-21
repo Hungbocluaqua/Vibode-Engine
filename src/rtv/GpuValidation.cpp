@@ -11,6 +11,10 @@ void RendererValidationLog::recordBarrier(std::string label, VkPipelineStageFlag
     barrierEvents_.push_back(stream.str());
 }
 
+void RendererValidationLog::recordResourceState(ResourceStateEvent event) {
+    resourceStateEvents_.push_back(std::move(event));
+}
+
 void RendererValidationLog::recordAccumulationInvalidation(std::string reason, uint64_t frame) {
     invalidations_.push_back({std::move(reason), frame});
     if (invalidations_.size() > 64) {
@@ -18,10 +22,25 @@ void RendererValidationLog::recordAccumulationInvalidation(std::string reason, u
     }
 }
 
+void RendererValidationLog::recordSceneUpdateRoute(std::string kind, std::string action) {
+    for (SceneUpdateRouteEvent& route : sceneUpdateRoutes_) {
+        if (route.kind == kind && route.action == action) {
+            ++route.count;
+            return;
+        }
+    }
+    sceneUpdateRoutes_.push_back(SceneUpdateRouteEvent{
+        .kind = std::move(kind),
+        .action = std::move(action),
+        .count = 1,
+    });
+}
+
 void RendererValidationLog::beginFrame(uint64_t frame) {
     currentFrame_ = frame;
     passEvents_.clear();
     barrierEvents_.clear();
+    resourceStateEvents_.clear();
 }
 
 void RendererValidationLog::recordPass(std::string label) {

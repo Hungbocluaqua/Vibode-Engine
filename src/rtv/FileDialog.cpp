@@ -69,7 +69,7 @@ std::optional<std::filesystem::path> openHdrFileDialog() {
 
 std::optional<std::filesystem::path> openSceneJsonFileDialog() {
 #if defined(_WIN32)
-    return openFileDialog(L"Open Scene JSON", L"Scene JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0");
+    return openFileDialog(L"Open Level", L"RT Level (*.rtlevel;*.json)\0*.rtlevel;*.json\0All files (*.*)\0*.*\0\0");
 #else
     return std::nullopt;
 #endif
@@ -77,7 +77,7 @@ std::optional<std::filesystem::path> openSceneJsonFileDialog() {
 
 std::optional<std::filesystem::path> saveSceneJsonFileDialog() {
 #if defined(_WIN32)
-    return saveFileDialog(L"Save Scene JSON", L"Scene JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0", L"json");
+    return saveFileDialog(L"Save Level", L"RT Level (*.rtlevel)\0*.rtlevel\0Scene JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0", L"rtlevel");
 #else
     return std::nullopt;
 #endif

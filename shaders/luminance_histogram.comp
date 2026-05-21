@@ -1,0 +1,33 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D hdr_texture;
+layout(set = 0, binding = 1) uniform sampler hdr_sampler;
+layout(set = 0, binding = 2, std430) buffer LuminanceHistogram {
+    uint bins[];
+} histogram;
+
+layout(push_constant) uniform HistogramParams {
+    uint width;
+    uint height;
+    float min_log_luminance;
+    float max_log_luminance;
+} params;
+
+float luminance(vec3 color) {
+    return max(dot(color, vec3(0.2126, 0.7152, 0.0722)), 1.0e-4);
+}
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= params.width || p.y >= params.height) {
+        return;
+    }
+
+    vec3 color = max(texelFetch(sampler2D(hdr_texture, hdr_sampler), ivec2(p), 0).rgb, vec3(0.0));
+    float log_lum = log2(luminance(color));
+    float t = clamp((log_lum - params.min_log_luminance) / max(params.max_log_luminance - params.min_log_luminance, 0.001), 0.0, 0.999999);
+    uint bin = uint(t * 128.0);
+    atomicAdd(histogram.bins[bin], 1u);
+}

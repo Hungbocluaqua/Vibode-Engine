@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "scenes": [
+    {
+      "name": "Transform Stress",
+      "category": "AS refit",
+      "path": "transform_stress.rtlevel",
+      "referenceChecksum": "pending-reference-transform-stress"
+    },
+    {
+      "name": "Material Grid",
+      "category": "Material/update routing",
+      "path": "material_grid.rtlevel",
+      "referenceChecksum": "pending-reference-material-grid"
+    },
+    {
+      "name": "Temporal Stability",
+      "category": "Velocity/history",
+      "path": "temporal_stability.rtlevel",
+      "referenceChecksum": "pending-reference-temporal-stability"
+    },
+    {
+      "name": "MIS Validation",
+      "category": "Lighting",
+      "path": "mis_validation.rtlevel",
+      "referenceChecksum": "pending-reference-mis-validation"
+    },
+    {
+      "name": "Atmosphere Validation",
+      "category": "Atmosphere",
+      "path": "atmosphere_validation.rtlevel",
+      "referenceChecksum": "pending-reference-atmosphere-validation"
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) uniform image2D color_image;
+layout(set = 0, binding = 1, std430) readonly buffer EntityIdBuffer { uint entity_id_buffer[]; };
+
+layout(set = 0, binding = 2, std140) uniform SelectionParams {
+    uint selected_instance;
+    uint width;
+    uint height;
+    uint enabled;
+} selection;
+
+bool selected_at(ivec2 p) {
+    if (p.x < 0 || p.y < 0 || p.x >= int(selection.width) || p.y >= int(selection.height)) {
+        return false;
+    }
+    uint id = entity_id_buffer[uint(p.y) * selection.width + uint(p.x)];
+    return id == selection.selected_instance;
+}
+
+bool filled_selected_at(ivec2 p) {
+    if (selected_at(p)) {
+        return true;
+    }
+
+    uint count = 0u;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            count += selected_at(p + ivec2(x, y)) ? 1u : 0u;
+        }
+    }
+    return count >= 18u;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(selection.width) || p.y >= int(selection.height)) {
+        return;
+    }
+    if (selection.enabled == 0u || selection.selected_instance == 0xffffffffu) {
+        return;
+    }
+
+    bool center = filled_selected_at(p);
+    bool left = filled_selected_at(p + ivec2(-1, 0));
+    bool right = filled_selected_at(p + ivec2(1, 0));
+    bool up = filled_selected_at(p + ivec2(0, -1));
+    bool down = filled_selected_at(p + ivec2(0, 1));
+    bool nearSelected = left || right || up || down;
+    bool edge = center ? !(left && right && up && down) : nearSelected;
+    if (!edge) {
+        return;
+    }
+
+    vec4 color = imageLoad(color_image, p);
+    vec3 accent = vec3(1.0, 0.72, 0.12);
+    color.rgb = center ? mix(color.rgb, accent * 1.25, 0.35) : mix(color.rgb, accent * 1.75, 0.65);
+    imageStore(color_image, p, color);
+}
