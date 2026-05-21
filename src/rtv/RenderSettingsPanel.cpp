@@ -54,6 +54,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.sunElevation = render.sunElevation;
         settings.sunAngularRadius = render.sunAngularRadius;
         settings.indirectStrength = render.indirectStrength;
+        settings.restirMode = render.restirMode;
         settings.denoiserEnabled = render.denoiserEnabled;
         settings.atrousIterations = render.atrousIterations;
         settings.denoiserStrength = render.denoiserStrength;
@@ -103,6 +104,16 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     changed |= ImGui::Checkbox("Direct Lighting", &settings.directLightingEnabled);
     changed |= ImGui::SliderFloat("Indirect Strength", &settings.indirectStrength, 0.0f, 4.0f, "%.2f");
     tooltip("Multiplier for indirect lighting contribution.");
+    const char* restirModeItems[] = {"Classic NEE", "ReSTIR Only", "Hybrid Compare"};
+    int restirModeIndex = static_cast<int>(settings.restirMode);
+    if (restirModeIndex < 0 || restirModeIndex > 2) {
+        restirModeIndex = 0;
+    }
+    if (ImGui::Combo("ReSTIR Mode", &restirModeIndex, restirModeItems, 3)) {
+        settings.restirMode = static_cast<RestirMode>(restirModeIndex);
+        changed = true;
+    }
+    tooltip("Hybrid ReSTIR direct-light mode. Classic NEE remains the reference baseline.");
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
 
     ImGui::SeparatorText("Tone Mapping");
@@ -184,6 +195,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 render.sunlightEnabled != settings.sunlightEnabled ||
                 render.directLightingEnabled != settings.directLightingEnabled ||
                 render.environmentDirectSamples != settings.environmentDirectSamples ||
+                render.restirMode != settings.restirMode ||
                 std::abs(render.sunIntensity - settings.sunIntensity) > 0.0001f ||
                 std::abs(render.skyIntensity - settings.skyIntensity) > 0.0001f ||
                 std::abs(render.sunElevation - settings.sunElevation) > 0.0001f ||
@@ -216,6 +228,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.sunElevation = settings.sunElevation;
             render.sunAngularRadius = settings.sunAngularRadius;
             render.indirectStrength = settings.indirectStrength;
+            render.restirMode = settings.restirMode;
             render.denoiserEnabled = settings.denoiserEnabled;
             render.atrousIterations = settings.atrousIterations;
             render.denoiserStrength = settings.denoiserStrength;

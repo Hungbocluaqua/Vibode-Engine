@@ -38,7 +38,7 @@ struct CameraUniform {
     float indirectStrength = 1.0f;
     uint32_t environmentDirectSamples = 1;
     glm::vec4 jitter{}; // xy = current subpixel jitter, zw = previous subpixel jitter
-    glm::vec4 atmosphere{}; // x = sun elevation radians, yzw reserved for atmosphere Stage A+
+    glm::vec4 atmosphere{}; // x = sun elevation, y = ReSTIR mode, z = temporal history available
 };
 
 struct MeshParamsUniform {

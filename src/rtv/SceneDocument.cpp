@@ -316,6 +316,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"sunElevation", renderSettings_.sunElevation},
         {"sunAngularRadius", renderSettings_.sunAngularRadius},
         {"indirectStrength", renderSettings_.indirectStrength},
+        {"restirMode", static_cast<uint32_t>(renderSettings_.restirMode)},
         {"denoiserEnabled", renderSettings_.denoiserEnabled},
         {"atrousIterations", renderSettings_.atrousIterations},
         {"denoiserStrength", renderSettings_.denoiserStrength},
@@ -451,6 +452,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.sunElevation = render.value("sunElevation", renderSettings_.sunElevation);
         renderSettings_.sunAngularRadius = render.value("sunAngularRadius", renderSettings_.sunAngularRadius);
         renderSettings_.indirectStrength = render.value("indirectStrength", renderSettings_.indirectStrength);
+        renderSettings_.restirMode = static_cast<RestirMode>(render.value("restirMode", static_cast<uint32_t>(renderSettings_.restirMode)));
         renderSettings_.denoiserEnabled = render.value("denoiserEnabled", renderSettings_.denoiserEnabled);
         renderSettings_.atrousIterations = render.value("atrousIterations", renderSettings_.atrousIterations);
         renderSettings_.denoiserStrength = render.value("denoiserStrength", renderSettings_.denoiserStrength);

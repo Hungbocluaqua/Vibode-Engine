@@ -33,6 +33,15 @@ const char* toneMapperName(ToneMapper toneMapper) {
     return "aces";
 }
 
+const char* restirModeName(RestirMode mode) {
+    switch (mode) {
+    case RestirMode::ClassicNee: return "classic-nee";
+    case RestirMode::RestirOnly: return "restir-only";
+    case RestirMode::HybridCompare: return "hybrid-compare";
+    }
+    return "classic-nee";
+}
+
 RendererDebugView parseRendererDebugView(std::string_view value) {
     const std::string key = normalized(value);
     if (key == "variance") { return RendererDebugView::Variance; }
@@ -94,6 +103,15 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "historyweight" || key == "temporalhistory" || key == "temporalhistoryweight") {
         return RendererDebugView::TemporalHistoryWeight;
     }
+    if (key == "restirage" || key == "restirreservoirage" || key == "reservoirage") {
+        return RendererDebugView::RestirReservoirAge;
+    }
+    if (key == "restirconfidence" || key == "restirreservoirconfidence" || key == "reservoirconfidence") {
+        return RendererDebugView::RestirReservoirConfidence;
+    }
+    if (key == "restirm" || key == "restirreservoirm" || key == "reservoirm" || key == "restirsamplecount") {
+        return RendererDebugView::RestirReservoirM;
+    }
     return RendererDebugView::Beauty;
 }
 
@@ -134,6 +152,9 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::AtmosphereMultiScatter: return "atmosphere-multi-scatter";
     case RendererDebugView::TemporalReactiveMask: return "temporal-reactive-mask";
     case RendererDebugView::TemporalHistoryWeight: return "temporal-history-weight";
+    case RendererDebugView::RestirReservoirAge: return "restir-reservoir-age";
+    case RendererDebugView::RestirReservoirConfidence: return "restir-reservoir-confidence";
+    case RendererDebugView::RestirReservoirM: return "restir-reservoir-m";
     }
     return "beauty";
 }

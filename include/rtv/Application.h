@@ -45,6 +45,7 @@ public:
         RendererBackend requestedBackend = RendererBackend::Auto,
         std::optional<std::filesystem::path> scenePath = std::nullopt,
         std::optional<bool> denoiserOverride = std::nullopt,
+        std::optional<RestirMode> restirModeOverride = std::nullopt,
         bool debugViewOverride = false);
     ~Application();
 
@@ -92,6 +93,7 @@ private:
     std::optional<std::filesystem::path> hdrPath_;
     std::optional<std::filesystem::path> scenePath_;
     std::optional<bool> denoiserOverride_;
+    std::optional<RestirMode> restirModeOverride_;
     bool debugViewOverride_ = false;
     AssetManager assets_;
     CameraController cameraController_;

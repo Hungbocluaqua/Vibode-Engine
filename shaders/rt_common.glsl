@@ -41,6 +41,13 @@ layout(set = 0, binding = 37, std140) uniform PrevCamera {
     vec4 prev_pos;
     vec4 jitter;
 } prev_camera;
+struct RestirReservoir {
+    uvec4 metadata; // x = direct sample type, y = age, z = valid, w = reserved
+    vec4 sample_value_confidence; // rgb = selected/direct contribution, a = confidence
+    vec4 target_pdf_weight_sum_m; // x = target/light pdf, y = weight sum luminance, z = M, w = reserved
+};
+layout(set = 0, binding = 38, std430) buffer RestirReservoirBuffer { RestirReservoir restir_reservoirs[]; };
+layout(set = 0, binding = 39, std430) readonly buffer PreviousRestirReservoirBuffer { RestirReservoir previous_restir_reservoirs[]; };
 layout(set = 0, binding = 10, std430) readonly buffer MeshMaterials { vec4 mesh_materials[]; };
 
 layout(set = 0, binding = 11, std140) uniform MeshParams {
@@ -70,8 +77,8 @@ layout(set = 0, binding = 11, std140) uniform MeshParams {
 
 layout(set = 0, binding = 12) uniform texture2D env_map;
 layout(set = 0, binding = 13) uniform sampler env_sampler;
-layout(set = 0, binding = 14, std430) readonly buffer EnvCdfRows { float env_cdf_rows[]; };
-layout(set = 0, binding = 15, std430) readonly buffer EnvCdfCols { float env_cdf_cols[]; };
+layout(set = 0, binding = 14, std430) readonly buffer EnvAliasRows { vec2 env_alias_rows[]; };
+layout(set = 0, binding = 15, std430) readonly buffer EnvAliasCols { vec2 env_alias_cols[]; };
 layout(set = 0, binding = 16, std140) uniform EnvParams {
     uint enabled;
     float intensity;
@@ -634,32 +641,16 @@ vec3 sample_environment_direction(inout uint state, out vec3 out_dir, out float 
         return atmosphere_sky_radiance(out_dir);
     }
 
-    float xi0 = rand_f32(state);
-    uint rowLo = 0u;
-    uint rowHi = env_params.height - 1u;
-    for (uint guard = 0u; guard < 32u && rowLo < rowHi; ++guard) {
-        uint mid = (rowLo + rowHi) / 2u;
-        if (env_cdf_rows[mid] < xi0) {
-            rowLo = mid + 1u;
-        } else {
-            rowHi = mid;
-        }
-    }
-    uint row = rowLo;
+    float rowSample = rand_f32(state) * float(env_params.height);
+    uint rowCandidate = min(uint(rowSample), env_params.height - 1u);
+    vec2 rowAlias = env_alias_rows[rowCandidate];
+    uint row = fract(rowSample) <= rowAlias.x ? rowCandidate : min(uint(rowAlias.y + 0.5), env_params.height - 1u);
 
-    float xi1 = rand_f32(state);
-    uint colLo = 0u;
-    uint colHi = env_params.width - 1u;
+    float colSample = rand_f32(state) * float(env_params.width);
+    uint colCandidate = min(uint(colSample), env_params.width - 1u);
     uint colOffset = row * env_params.width;
-    for (uint guard = 0u; guard < 32u && colLo < colHi; ++guard) {
-        uint mid = (colLo + colHi) / 2u;
-        if (env_cdf_cols[colOffset + mid] < xi1) {
-            colLo = mid + 1u;
-        } else {
-            colHi = mid;
-        }
-    }
-    uint col = colLo;
+    vec2 colAlias = env_alias_cols[colOffset + colCandidate];
+    uint col = fract(colSample) <= colAlias.x ? colCandidate : min(uint(colAlias.y + 0.5), env_params.width - 1u);
     vec2 uv = vec2((float(col) + 0.5) / float(env_params.width), (float(row) + 0.5) / float(env_params.height));
     out_dir = rotate_y(env_dir_from_uv(uv), -env_params.rotation);
     if (env_params.procedural != 0u) {

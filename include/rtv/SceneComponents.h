@@ -121,6 +121,7 @@ struct RenderSettings {
     float sunElevation = 0.97f;
     float sunAngularRadius = 0.0093f;
     float indirectStrength = 1.0f;
+    RestirMode restirMode = RestirMode::ClassicNee;
     bool denoiserEnabled = true;
     uint32_t atrousIterations = 4;
     float denoiserStrength = 1.0f;

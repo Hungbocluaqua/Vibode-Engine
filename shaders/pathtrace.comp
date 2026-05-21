@@ -43,6 +43,13 @@ layout(set = 0, binding = 35, std140) uniform PrevCamera {
     vec4 prev_pos;
     vec4 jitter;
 } prev_camera;
+struct RestirReservoir {
+    uvec4 metadata; // x = direct sample type, y = age, z = valid, w = reserved
+    vec4 sample_value_confidence; // rgb = selected/direct contribution, a = confidence
+    vec4 target_pdf_weight_sum_m; // x = target/light pdf, y = weight sum luminance, z = M, w = reserved
+};
+layout(set = 0, binding = 36, std430) buffer RestirReservoirBuffer { RestirReservoir restir_reservoirs[]; };
+layout(set = 0, binding = 37, std430) readonly buffer PreviousRestirReservoirBuffer { RestirReservoir previous_restir_reservoirs[]; };
 layout(set = 0, binding = 6, std430) readonly buffer MeshVertices { vec4 mesh_vertices[]; };
 layout(set = 0, binding = 7, std430) readonly buffer MeshIndices { uint mesh_indices[]; };
 layout(set = 0, binding = 8, std430) readonly buffer BvhNodes { vec4 bvh_nodes[]; };
@@ -76,8 +83,8 @@ layout(set = 0, binding = 11, std140) uniform MeshParams {
 
 layout(set = 0, binding = 12) uniform texture2D env_map;
 layout(set = 0, binding = 13) uniform sampler env_sampler;
-layout(set = 0, binding = 14, std430) readonly buffer EnvCdfRows { float env_cdf_rows[]; };
-layout(set = 0, binding = 15, std430) readonly buffer EnvCdfCols { float env_cdf_cols[]; };
+layout(set = 0, binding = 14, std430) readonly buffer EnvAliasRows { vec2 env_alias_rows[]; };
+layout(set = 0, binding = 15, std430) readonly buffer EnvAliasCols { vec2 env_alias_cols[]; };
 
 layout(set = 0, binding = 16, std140) uniform EnvParams {
     uint enabled;
@@ -246,6 +253,7 @@ struct PathComponents {
     vec3 indirect_light;
     vec3 emissive_light;
     vec3 environment_light;
+    vec3 restir_initial_direct_light;
     vec3 first_albedo;
     float first_roughness;
     float first_light_pdf;
@@ -352,6 +360,30 @@ uint pack_velocity_pixels(vec2 velocityPixels) {
     return pack_snorm2x16(velocityPixels / 64.0);
 }
 
+vec2 restir_unpack_unorm2x16(uint packedValue) {
+    return vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
+}
+
+vec2 restir_unpack_velocity_pixels(uint packedVelocity) {
+    return (restir_unpack_unorm2x16(packedVelocity) * 2.0 - vec2(1.0)) * 64.0;
+}
+
+uint restir_mode() {
+    return uint(clamp(camera.atmosphere.y, 0.0, 2.0));
+}
+
+bool temporal_history_available() {
+    return camera.atmosphere.z > 0.5;
+}
+
+RestirReservoir empty_restir_reservoir() {
+    RestirReservoir reservoir;
+    reservoir.metadata = uvec4(0u);
+    reservoir.sample_value_confidence = vec4(0.0);
+    reservoir.target_pdf_weight_sum_m = vec4(0.0);
+    return reservoir;
+}
+
 uint compute_surface_velocity(vec3 currentWorldPos, vec3 localPos, uint instanceId, ivec2 dims) {
     vec3 previousWorldPos = currentWorldPos;
     if (instanceId < mesh_params.instance_count) {
@@ -378,6 +410,75 @@ uint compute_sky_velocity(vec3 rayDir, ivec2 dims) {
         previousPos.x >= -0.5 && previousPos.y >= -0.5 &&
         previousPos.x <= float(dims.x) - 0.5 && previousPos.y <= float(dims.y) - 0.5;
     return valid ? pack_velocity_pixels(currentPos - previousPos) : 0u;
+}
+
+void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, uint packedVelocity, PathComponents components) {
+    if (restir_mode() == 0u) {
+        restir_reservoirs[pixelIndex] = empty_restir_reservoir();
+        return;
+    }
+
+    bool valid = components.first_direct_sample_type != 0u && components.first_light_pdf > 1.0e-6;
+    vec3 sampleValue = valid ? max(components.restir_initial_direct_light, vec3(0.0)) : vec3(0.0);
+    float sampleLum = dot(sampleValue, vec3(0.2126, 0.7152, 0.0722));
+    RestirReservoir current;
+    current.metadata = uvec4(components.first_direct_sample_type, 0u, valid ? 1u : 0u, 0u);
+    current.sample_value_confidence = vec4(sampleValue, valid ? 1.0 : 0.0);
+    current.target_pdf_weight_sum_m = vec4(
+        valid ? components.first_light_pdf : 0.0,
+        sampleLum,
+        valid ? 1.0 : 0.0,
+        0.0);
+
+    if (!valid) {
+        restir_reservoirs[pixelIndex] = current;
+        return;
+    }
+
+    vec2 velocityPixels = restir_unpack_velocity_pixels(packedVelocity);
+    vec2 historyPos = vec2(coords) - velocityPixels;
+    bool historyOnscreen = temporal_history_available() &&
+        historyPos.x >= 0.0 && historyPos.y >= 0.0 &&
+        historyPos.x < float(dims.x) && historyPos.y < float(dims.y);
+
+    if (!historyOnscreen) {
+        current.sample_value_confidence.a = temporal_history_available() ? 0.35 : 1.0;
+        restir_reservoirs[pixelIndex] = current;
+        return;
+    }
+
+    ivec2 historyCoords = clamp(ivec2(round(historyPos)), ivec2(0), dims - ivec2(1));
+    uint historyIndex = uint(historyCoords.y) * uint(dims.x) + uint(historyCoords.x);
+    RestirReservoir previous = previous_restir_reservoirs[historyIndex];
+    bool previousValid = previous.metadata.z != 0u &&
+        previous.metadata.y < 8u &&
+        previous.target_pdf_weight_sum_m.z > 0.0 &&
+        previous.sample_value_confidence.a > 0.0;
+    if (!previousValid) {
+        current.sample_value_confidence.a = 0.35;
+        restir_reservoirs[pixelIndex] = current;
+        return;
+    }
+
+    float currentPdf = max(current.target_pdf_weight_sum_m.x, 1.0e-6);
+    float previousPdf = max(previous.target_pdf_weight_sum_m.x, 1.0e-6);
+    float previousWeight = clamp(previousPdf / (currentPdf + previousPdf), 0.0, 0.85);
+    float currentWeight = 1.0 - previousWeight;
+    float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
+
+    current.metadata.y = min(previous.metadata.y + 1u, 255u);
+    current.sample_value_confidence.rgb =
+        current.sample_value_confidence.rgb * currentWeight +
+        previous.sample_value_confidence.rgb * previousWeight;
+    current.sample_value_confidence.a = clamp(
+        (currentWeight + previous.sample_value_confidence.a * previousWeight) * motionConfidence,
+        0.0,
+        1.0);
+    current.target_pdf_weight_sum_m.y =
+        current.target_pdf_weight_sum_m.y * currentWeight +
+        previous.target_pdf_weight_sum_m.y * previousWeight;
+    current.target_pdf_weight_sum_m.z = min(current.target_pdf_weight_sum_m.z + previous.target_pdf_weight_sum_m.z, 64.0);
+    restir_reservoirs[pixelIndex] = current;
 }
 
 uint first_scene_table_primitive_count() {
@@ -1193,32 +1294,16 @@ vec3 sample_environment_direction(out vec3 out_dir, out float out_pdf) {
         return atmosphere_sky_radiance(out_dir);
     }
 
-    float xi0 = rand_f32();
-    uint rowLo = 0u;
-    uint rowHi = env_params.height - 1u;
-    for (uint guard = 0u; guard < 32u && rowLo < rowHi; ++guard) {
-        uint mid = (rowLo + rowHi) / 2u;
-        if (env_cdf_rows[mid] < xi0) {
-            rowLo = mid + 1u;
-        } else {
-            rowHi = mid;
-        }
-    }
-    uint row = rowLo;
+    float rowSample = rand_f32() * float(env_params.height);
+    uint rowCandidate = min(uint(rowSample), env_params.height - 1u);
+    vec2 rowAlias = env_alias_rows[rowCandidate];
+    uint row = fract(rowSample) <= rowAlias.x ? rowCandidate : min(uint(rowAlias.y + 0.5), env_params.height - 1u);
 
-    float xi1 = rand_f32();
-    uint colLo = 0u;
-    uint colHi = env_params.width - 1u;
+    float colSample = rand_f32() * float(env_params.width);
+    uint colCandidate = min(uint(colSample), env_params.width - 1u);
     uint colOffset = row * env_params.width;
-    for (uint guard = 0u; guard < 32u && colLo < colHi; ++guard) {
-        uint mid = (colLo + colHi) / 2u;
-        if (env_cdf_cols[colOffset + mid] < xi1) {
-            colLo = mid + 1u;
-        } else {
-            colHi = mid;
-        }
-    }
-    uint col = colLo;
+    vec2 colAlias = env_alias_cols[colOffset + colCandidate];
+    uint col = fract(colSample) <= colAlias.x ? colCandidate : min(uint(colAlias.y + 0.5), env_params.width - 1u);
     vec2 uv = vec2((float(col) + 0.5) / float(env_params.width), (float(row) + 0.5) / float(env_params.height));
     out_dir = rotate_y(env_dir_from_uv(uv), -env_params.rotation);
     if (env_params.procedural != 0u) {
@@ -1414,8 +1499,8 @@ float emissive_total_area() {
 }
 
 bool sample_emissive_light(vec3 hitPos, out vec3 wi, out vec3 emission, out float pdfSolidAngle, out float distanceToLight) {
-    float totalArea = emissive_total_area();
-    if (totalArea <= 1e-8 || mesh_params.light_count == 0u) {
+    float totalWeight = emissive_total_area();
+    if (totalWeight <= 1e-8 || mesh_params.light_count == 0u) {
         wi = vec3(0.0, 1.0, 0.0);
         emission = vec3(0.0);
         pdfSolidAngle = 0.0;
@@ -1423,7 +1508,7 @@ bool sample_emissive_light(vec3 hitPos, out vec3 wi, out vec3 emission, out floa
         return false;
     }
 
-    float targetArea = rand_f32() * totalArea;
+    float targetArea = rand_f32() * totalWeight;
     vec3 samplePos = vec3(0.0);
     vec3 lightNormal = vec3(0.0, -1.0, 0.0);
     emission = vec3(0.0);
@@ -1475,7 +1560,7 @@ bool sample_emissive_light(vec3 hitPos, out vec3 wi, out vec3 emission, out floa
     } else if (selected.metadata.x == 2u) {
         wi = normalize(selected.data1.xyz);
         emission = selected.data2.xyz;
-        pdfSolidAngle = selected.data0.x / max(totalArea, 1e-6);
+        pdfSolidAngle = selected.data0.x / max(totalWeight, 1e-6);
         distanceToLight = 10000.0;
         return length(emission) > 0.0 && pdfSolidAngle > 0.0;
     } else if (selected.metadata.x == 3u) {
@@ -1499,9 +1584,11 @@ bool sample_emissive_light(vec3 hitPos, out vec3 wi, out vec3 emission, out floa
     wi = toLight / distanceToLight;
     float cosLight = max(dot(-wi, lightNormal), 0.0);
     if (selected.metadata.x == 3u) {
-        pdfSolidAngle = selected.data0.x / max(totalArea, 1e-6);
+        pdfSolidAngle = selected.data0.x / max(totalWeight, 1e-6);
     } else {
-        pdfSolidAngle = cosLight > 1e-6 ? distSq / (cosLight * totalArea) : 0.0;
+        float selectionPdf = selected.data0.x / max(totalWeight, 1e-6);
+        float area = max(selected.data0.w, 1e-6);
+        pdfSolidAngle = cosLight > 1e-6 ? selectionPdf * distSq / (cosLight * area) : 0.0;
     }
     return length(emission) > 0.0 && pdfSolidAngle > 0.0;
 }
@@ -1557,26 +1644,59 @@ vec3 estimate_direct_lighting(
     }
     vec3 lightingNormal = normalize(rec.light_normal);
 
-    vec3 wi;
-    vec3 lightEmission;
-    float lightPdf;
-    float lightDistance;
-    if (sample_emissive_light(rec.p, wi, lightEmission, lightPdf, lightDistance)) {
+    uint risCandidateCount = restir_mode() != 0u ? 4u : 1u;
+    vec3 selectedWi = vec3(0.0, 1.0, 0.0);
+    vec3 selectedEmission = vec3(0.0);
+    vec3 selectedBsdf = vec3(0.0);
+    float selectedLightPdf = 0.0;
+    float selectedBsdfPdf = 0.0;
+    float selectedDistance = 0.0;
+    float selectedProxy = 0.0;
+    float proxyWeightSum = 0.0;
+    bool selectedCandidate = false;
+    for (uint candidate = 0u; candidate < risCandidateCount; ++candidate) {
+        vec3 candidateWi;
+        vec3 candidateEmission;
+        float candidateLightPdf;
+        float candidateDistance;
+        if (!sample_emissive_light(rec.p, candidateWi, candidateEmission, candidateLightPdf, candidateDistance)) {
+            continue;
+        }
+        float candidateCos = max(dot(lightingNormal, candidateWi), 0.0);
+        if (candidateCos <= 0.0 || candidateLightPdf <= 1.0e-6) {
+            continue;
+        }
+        vec3 candidateBsdf = eval_brdf(material, wo, candidateWi, lightingNormal);
+        float candidateBsdfPdf = pdf_brdf(material, wo, candidateWi, lightingNormal);
+        vec3 candidateEstimate = candidateBsdf * candidateEmission * candidateCos / max(candidateLightPdf, 1.0e-6);
+        float candidateProxy = max(dot(candidateEstimate, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+        proxyWeightSum += candidateProxy;
+        if (candidateProxy > 0.0 && rand_f32() * proxyWeightSum <= candidateProxy) {
+            selectedWi = candidateWi;
+            selectedEmission = candidateEmission;
+            selectedBsdf = candidateBsdf;
+            selectedLightPdf = candidateLightPdf;
+            selectedBsdfPdf = candidateBsdfPdf;
+            selectedDistance = candidateDistance;
+            selectedProxy = candidateProxy;
+            selectedCandidate = true;
+        }
+    }
+    if (selectedCandidate && selectedProxy > 0.0) {
         Ray shadowRay;
-        shadowRay.origin = shadow_origin(rec, wi);
-        shadowRay.direction = wi;
+        shadowRay.origin = shadow_origin(rec, selectedWi);
+        shadowRay.direction = selectedWi;
         HitRecord shadow = hit_world_mask(shadowRay, 1u | 4u);
-        bool visible = visible_segment_shadow(shadow, lightDistance);
-        float cosSurface = max(dot(lightingNormal, wi), 0.0);
+        bool visible = visible_segment_shadow(shadow, selectedDistance);
+        float cosSurface = max(dot(lightingNormal, selectedWi), 0.0);
         if (visible && cosSurface > 0.0) {
-            vec3 bsdf = eval_brdf(material, wo, wi, lightingNormal);
-            float bsdfPdf = pdf_brdf(material, wo, wi, lightingNormal);
-            float weight = power_heuristic(lightPdf, bsdfPdf);
-            sampledLightPdf = lightPdf;
-            sampledBsdfPdf = bsdfPdf;
+            float weight = power_heuristic(selectedLightPdf, selectedBsdfPdf);
+            float risNormalization = risCandidateCount > 1u ? proxyWeightSum / (float(risCandidateCount) * selectedProxy) : 1.0;
+            sampledLightPdf = selectedLightPdf;
+            sampledBsdfPdf = selectedBsdfPdf;
             sampledMisWeight = weight;
             sampledType = 1u;
-            emissiveContribution = bsdf * lightEmission * cosSurface * weight / max(lightPdf, 1e-6);
+            emissiveContribution = selectedBsdf * selectedEmission * cosSurface * weight * risNormalization / max(selectedLightPdf, 1e-6);
         }
     }
 
@@ -1625,13 +1745,14 @@ vec3 estimate_direct_lighting(
     return emissiveContribution + environmentContribution + sunContribution;
 }
 
-vec3 trace_path(Ray ray, out bool did_hit, out float first_depth, out vec3 first_normal, out vec3 first_position, out PathComponents components) {
+vec3 trace_path(Ray ray, uint pixelIndex, ivec2 coords, ivec2 dims, out bool did_hit, out float first_depth, out vec3 first_normal, out vec3 first_position, out PathComponents components) {
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     components.direct_light = vec3(0.0);
     components.indirect_light = vec3(0.0);
     components.emissive_light = vec3(0.0);
     components.environment_light = vec3(0.0);
+    components.restir_initial_direct_light = vec3(0.0);
     components.first_albedo = vec3(1.0);
     components.first_roughness = 1.0;
     components.first_light_pdf = 0.0;
@@ -1740,15 +1861,27 @@ vec3 trace_path(Ray ray, out bool did_hit, out float first_depth, out vec3 first
         float misWeight;
         uint directSampleType;
         vec3 direct = throughput * estimate_direct_lighting(rec, rec.material, wo, emissiveDirect, envDirect, lightPdf, bsdfPdfForLight, misWeight, directSampleType);
-        radiance += direct;
+        vec3 shadedDirect = direct;
+        if (bounce == 0u && restir_mode() != 0u) {
+            RestirReservoir previousReservoir = previous_restir_reservoirs[pixelIndex];
+            bool previousReservoirValid = previousReservoir.metadata.z != 0u &&
+                previousReservoir.sample_value_confidence.a > 0.0 &&
+                previousReservoir.target_pdf_weight_sum_m.z > 0.0;
+            bool useRestir = restir_mode() == 1u || (restir_mode() == 2u && coords.x >= dims.x / 2);
+            if (useRestir && previousReservoirValid) {
+                shadedDirect = previousReservoir.sample_value_confidence.rgb;
+            }
+        }
+        radiance += shadedDirect;
         if (bounce == 0u) {
-            components.direct_light += direct;
+            components.direct_light += shadedDirect;
+            components.restir_initial_direct_light += direct;
             components.first_light_pdf = lightPdf;
             components.first_bsdf_pdf = bsdfPdfForLight;
             components.first_mis_weight = misWeight;
             components.first_direct_sample_type = directSampleType;
         } else {
-            components.indirect_light += direct;
+            components.indirect_light += shadedDirect;
         }
         components.emissive_light += throughput * emissiveDirect;
         components.environment_light += throughput * envDirect;
@@ -1856,7 +1989,7 @@ void main() {
     vec3 hit_normal;
     vec3 hit_position;
     PathComponents components;
-    vec3 sample_color = trace_path(ray, did_hit, hit_depth, hit_normal, hit_position, components);
+    vec3 sample_color = trace_path(ray, pixel_index, coords, dims, did_hit, hit_depth, hit_normal, hit_position, components);
     if (did_hit) {
         sample_color = apply_analytical_aerial_perspective(sample_color, ray.origin, ray.direction, hit_depth);
     }
@@ -1873,9 +2006,11 @@ void main() {
     variance_buffer[pixel_index] = pack_variance(abs(lum - avgLum));
     depth_normal_buffer[pixel_index] = pack_depth_normal(hit_depth, hit_normal);
     world_position_buffer[pixel_index] = did_hit ? pack_world_position(hit_position) : uvec2(0u);
-    velocity_buffer[pixel_index] = did_hit
+    uint packedVelocity = did_hit
         ? compute_surface_velocity(hit_position, components.first_local_pos, components.instance_id, dims)
         : compute_sky_velocity(ray.direction, dims);
+    velocity_buffer[pixel_index] = packedVelocity;
+    store_initial_restir_reservoir(pixel_index, coords, dims, packedVelocity, components);
 
     vec2 pick_uv = (vec2(coords) + vec2(0.5)) / vec2(dims);
     vec2 pick_ndc = pick_uv * 2.0 - 1.0;
@@ -1962,6 +2097,12 @@ void main() {
     } else if (debug_params.view == 32u) {
         vec3 multiScatter = sample_multi_scatter_lut_debug(ray.direction);
         output_value = debug_display_tonemap(multiScatter * max(debug_params.scale, 1.0) * 8.0);
+    } else if (debug_params.view == 35u) {
+        output_value = vec3(clamp(float(restir_reservoirs[pixel_index].metadata.y) / 32.0, 0.0, 1.0));
+    } else if (debug_params.view == 36u) {
+        output_value = vec3(clamp(restir_reservoirs[pixel_index].sample_value_confidence.a, 0.0, 1.0));
+    } else if (debug_params.view == 37u) {
+        output_value = vec3(clamp(restir_reservoirs[pixel_index].target_pdf_weight_sum_m.z, 0.0, 1.0));
     }
     imageStore(output_color, coords, vec4(output_value, 1.0));
 }
