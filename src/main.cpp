@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
         std::optional<bool> denoiserOverride;
         std::optional<rtv::RestirMode> restirModeOverride;
         rtv::RendererBackend backend = rtv::RendererBackend::Auto;
+        bool validationCameraMotion = false;
         for (int i = 1; i < argc; ++i) {
             if (std::string_view(argv[i]) == "--frames" && i + 1 < argc) {
                 maxFrames = static_cast<uint32_t>(std::stoul(argv[++i]));
@@ -50,10 +51,12 @@ int main(int argc, char** argv) {
                 } else {
                     throw std::runtime_error("Unknown ReSTIR mode: " + std::string(value));
                 }
+            } else if (std::string_view(argv[i]) == "--validation-camera-motion") {
+                validationCameraMotion = true;
             }
         }
 
-        rtv::Application app(debugView, gltfPath, hdrPath, backend, scenePath, denoiserOverride, restirModeOverride, debugViewProvided);
+        rtv::Application app(debugView, gltfPath, hdrPath, backend, scenePath, denoiserOverride, restirModeOverride, debugViewProvided, validationCameraMotion);
         app.run(maxFrames);
         return 0;
     } catch (const std::exception& error) {

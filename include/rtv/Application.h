@@ -46,7 +46,8 @@ public:
         std::optional<std::filesystem::path> scenePath = std::nullopt,
         std::optional<bool> denoiserOverride = std::nullopt,
         std::optional<RestirMode> restirModeOverride = std::nullopt,
-        bool debugViewOverride = false);
+        bool debugViewOverride = false,
+        bool validationCameraMotion = false);
     ~Application();
 
     void run(uint32_t maxFrames = 0);
@@ -64,6 +65,7 @@ private:
     void initWindow();
     void initVulkan();
     void mainLoop(uint32_t maxFrames);
+    void applyValidationCameraMotion(uint32_t frameIndex);
     void processRuntimeControls(float deltaSeconds);
     void updateWindowTitle(float seconds);
     void toggleBorderlessFullscreen();
@@ -95,6 +97,7 @@ private:
     std::optional<bool> denoiserOverride_;
     std::optional<RestirMode> restirModeOverride_;
     bool debugViewOverride_ = false;
+    bool validationCameraMotion_ = false;
     AssetManager assets_;
     CameraController cameraController_;
     std::array<unsigned char, 512> keyState_{};

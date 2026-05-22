@@ -28,6 +28,7 @@
 #include <utility>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/constants.hpp>
 
 namespace rtv {
 
@@ -263,7 +264,8 @@ Application::Application(
     std::optional<std::filesystem::path> scenePath,
     std::optional<bool> denoiserOverride,
     std::optional<RestirMode> restirModeOverride,
-    bool debugViewOverride)
+    bool debugViewOverride,
+    bool validationCameraMotion)
     : debugView_(debugView),
       requestedBackend_(requestedBackend),
       gltfPath_(std::move(gltfPath)),
@@ -271,7 +273,8 @@ Application::Application(
       scenePath_(std::move(scenePath)),
       denoiserOverride_(denoiserOverride),
       restirModeOverride_(restirModeOverride),
-      debugViewOverride_(debugViewOverride) {
+      debugViewOverride_(debugViewOverride),
+      validationCameraMotion_(validationCameraMotion) {
     initWindow();
     initVulkan();
 }
@@ -419,6 +422,7 @@ void Application::mainLoop(uint32_t maxFrames) {
             uiOverlay_->beginFrame();
         }
         processRuntimeControls(deltaSeconds);
+        applyValidationCameraMotion(frameCount);
         notifications_.update(deltaSeconds);
         EditorRequests editorRequests;
         if (uiOverlay_ && pathTracer_) {
@@ -779,6 +783,20 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     if (requests.exit && window_ != nullptr) {
         glfwSetWindowShouldClose(window_, GLFW_TRUE);
     }
+}
+
+void Application::applyValidationCameraMotion(uint32_t frameIndex) {
+    if (!validationCameraMotion_ || pathTracer_ == nullptr) {
+        return;
+    }
+    const float angle = static_cast<float>(frameIndex) * 0.035f;
+    const float radius = 4.2f;
+    const glm::vec3 target{0.0f, 0.55f, 0.0f};
+    const glm::vec3 position{
+        std::sin(angle) * radius,
+        0.75f + std::sin(angle * 0.37f) * 0.25f,
+        std::cos(angle) * radius};
+    cameraController_.setPose(position, glm::normalize(target - position), *pathTracer_);
 }
 
 bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {

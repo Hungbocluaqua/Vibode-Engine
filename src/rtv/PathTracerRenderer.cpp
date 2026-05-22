@@ -40,6 +40,7 @@ constexpr VkDeviceSize kFrameDenoiserParamsOffset = 8192;
 constexpr VkDeviceSize kFrameDebugParamsOffset = 12288;
 constexpr VkDeviceSize kFrameTaaParamsOffset = 16384;
 constexpr VkDeviceSize kFrameRestirSpatialParamsOffset = 20480;
+constexpr VkDeviceSize kFrameFogParamsOffset = 24576;
 
 float halton(uint32_t index, uint32_t base) {
     float result = 0.0f;
@@ -184,9 +185,11 @@ PathTracerRenderer::PathTracerRenderer(
     const auto denoiserSpv = compiler.compileIfNeeded(shaderDirectory / "denoiser.comp", shaderOutputDirectory);
     const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
     const auto restirSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_spatial.comp", shaderOutputDirectory);
+    const auto fogSpv = compiler.compileIfNeeded(shaderDirectory / "fog_integrate.comp", shaderOutputDirectory);
     const auto transmittanceSpv = compiler.compileIfNeeded(shaderDirectory / "transmittance_lut.comp", shaderOutputDirectory);
     const auto multiScatterSpv = compiler.compileIfNeeded(shaderDirectory / "multi_scatter_lut.comp", shaderOutputDirectory);
     const auto skyViewSpv = compiler.compileIfNeeded(shaderDirectory / "sky_view_lut.comp", shaderOutputDirectory);
+    const auto skyReprojectSpv = compiler.compileIfNeeded(shaderDirectory / "sky_reproject.comp", shaderOutputDirectory);
     const auto aerialPerspectiveSpv = compiler.compileIfNeeded(shaderDirectory / "aerial_perspective_lut.comp", shaderOutputDirectory);
     const auto selectionSpv = compiler.compileIfNeeded(shaderDirectory / "selection_outline.comp", shaderOutputDirectory);
     const auto histogramSpv = compiler.compileIfNeeded(shaderDirectory / "luminance_histogram.comp", shaderOutputDirectory);
@@ -199,9 +202,11 @@ PathTracerRenderer::PathTracerRenderer(
     denoiserShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(denoiserSpv), "temporal denoiser compute");
     taaShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(taaSpv), "taa compute");
     restirSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirSpatialSpv), "restir spatial compute");
+    fogShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(fogSpv), "height fog integrate compute");
     transmittanceShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(transmittanceSpv), "atmosphere transmittance lut compute");
     multiScatterShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(multiScatterSpv), "atmosphere multi scatter lut compute");
     skyViewShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(skyViewSpv), "atmosphere sky view lut compute");
+    skyReprojectShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(skyReprojectSpv), "atmosphere sky reproject compute");
     aerialPerspectiveShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(aerialPerspectiveSpv), "atmosphere aerial perspective lut compute");
     selectionOutlineShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(selectionSpv), "selection outline compute");
     luminanceHistogramShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(histogramSpv), "luminance histogram compute");
@@ -234,6 +239,7 @@ PathTracerRenderer::PathTracerRenderer(
         *transmittanceShader_,
         *multiScatterShader_,
         *skyViewShader_,
+        *skyReprojectShader_,
         *aerialPerspectiveShader_);
     auto pathTraceBindings = ShaderReflection::bindingsForSet({pathTraceShader_->reflection()}, 0);
     std::vector<VkDescriptorBindingFlags> pathTraceBindingFlags(pathTraceBindings.size(), 0);
@@ -264,6 +270,7 @@ PathTracerRenderer::PathTracerRenderer(
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
     restirSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirSpatialShader_->reflection()}, 0));
+    fogSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({fogShader_->reflection()}, 0));
     selectionOutlineSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({selectionOutlineShader_->reflection()}, 0));
     luminanceHistogramSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({luminanceHistogramShader_->reflection()}, 0));
     exposureReduceSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({exposureReduceShader_->reflection()}, 0));
@@ -312,6 +319,12 @@ PathTracerRenderer::PathTracerRenderer(
         *restirSpatialShader_,
         std::vector<VkDescriptorSetLayout>{restirSpatialSetLayout_},
         ShaderReflection::mergePushConstants({restirSpatialShader_->reflection()}),
+        *pipelineCache_);
+    fogPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *fogShader_,
+        std::vector<VkDescriptorSetLayout>{fogSetLayout_, atmosphereSetLayout_},
+        ShaderReflection::mergePushConstants({fogShader_->reflection()}),
         *pipelineCache_);
     selectionOutlinePipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -993,6 +1006,7 @@ void PathTracerRenderer::updateCamera() {
     taaParams_.feedback = std::clamp(settings_.taaFeedback, 0.01f, 0.5f);
     taaParams_.velocityScale = 64.0f;
     taaParams_.resetHistory = temporalCameraCut ? 1u : 0u;
+    taaParams_.sharpeningStrength = 0.08f;
     frameUniforms.write(&taaParams_, sizeof(taaParams_), kFrameTaaParamsOffset);
     frameUniforms.flush(sizeof(taaParams_), kFrameTaaParamsOffset);
 
@@ -1002,6 +1016,13 @@ void PathTracerRenderer::updateCamera() {
     restirSpatialParams_.enabled = shouldRunRestirSpatial() ? 1u : 0u;
     frameUniforms.write(&restirSpatialParams_, sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
     frameUniforms.flush(sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
+
+    fogParams_.width = extent_.width;
+    fogParams_.height = extent_.height;
+    fogParams_.debugView = debugParams_.view;
+    fogParams_.enabled = settings_.pathTracingEnabled ? 1u : 0u;
+    frameUniforms.write(&fogParams_, sizeof(fogParams_), kFrameFogParamsOffset);
+    frameUniforms.flush(sizeof(fogParams_), kFrameFogParamsOffset);
 
     frameUniforms.write(&debugParams_, sizeof(debugParams_), kFrameDebugParamsOffset);
     frameUniforms.flush(sizeof(debugParams_), kFrameDebugParamsOffset);
@@ -1023,6 +1044,7 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
     currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceStart, traceStage);
     recordPathTraceGraph(commandBuffer);
     recordRestirSpatial(commandBuffer);
+    recordHeightFog(commandBuffer);
     currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceEnd, traceStage);
 
     if (shouldRunDenoiser()) {
@@ -1247,6 +1269,82 @@ void PathTracerRenderer::recordRestirSpatialCopyPass(VkCommandBuffer commandBuff
     vkCmdCopyBuffer(commandBuffer, restirSpatialReservoirBuffer_.handle(), restirReservoirBuffer_.handle(), 1, &copy);
 }
 
+void PathTracerRenderer::recordHeightFog(VkCommandBuffer commandBuffer) {
+    if (fogPipeline_ == nullptr || fogSetLayout_ == VK_NULL_HANDLE || rawImage_.handle() == VK_NULL_HANDLE || depthNormalBuffer_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+
+    RenderGraph graph;
+    auto imageResource = [](const Image& image, const char* name, ResourceAccess initial) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Texture,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .format = image.format(),
+            .extent = image.extent(),
+            .image = image.handle(),
+            .imageRange = image.fullRange(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = initial,
+            .debugName = name,
+        };
+    };
+    auto bufferResource = [](const Buffer& buffer, const char* name, ResourceAccess initial) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = buffer.size(),
+            .buffer = buffer.handle(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = initial,
+            .debugName = name,
+        };
+    };
+
+    const ResourceAccess pathWrite{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    const RenderGraphResourceId raw = graph.createTexture(imageResource(rawImage_, "raw hdr", pathWrite));
+    const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "depth normal", pathWrite));
+    graph.addPass("fog_integrate")
+        .addStorageReadWrite(raw, PipelineDomain::Compute)
+        .addStorageRead(depthNormal, PipelineDomain::Compute)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordHeightFogPass(cmd);
+        });
+    graph.compile();
+    graph.execute(commandBuffer, frameCount_);
+}
+
+void PathTracerRenderer::recordHeightFogPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("height fog integrate");
+    rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(fogSetLayout_);
+    DescriptorSet atmosphereSet = currentFrame_->descriptors().allocate(atmosphereSetLayout_);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameFogParamsOffset, sizeof(FogParams)))
+        .update(context_.device(), set);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->transmittanceLut().sampledDescriptor(VK_NULL_HANDLE))
+        .writeImage(1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->skyViewLut().sampledDescriptor(VK_NULL_HANDLE))
+        .writeImage(2, VK_DESCRIPTOR_TYPE_SAMPLER, VkDescriptorImageInfo{.sampler = atmosphereLutSystem_->sampler()})
+        .writeImage(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->aerialPerspectiveLut().sampledDescriptor(VK_NULL_HANDLE))
+        .writeImage(4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->multiScatterLut().sampledDescriptor(VK_NULL_HANDLE))
+        .update(context_.device(), atmosphereSet);
+
+    fogPipeline_->bind(commandBuffer);
+    const std::array<VkDescriptorSet, 2> descriptorSets{set.handle(), atmosphereSet.handle()};
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, fogPipeline_->layout(), 0, static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 0, nullptr);
+    fogPipeline_->dispatch(commandBuffer, extent_.width, extent_.height);
+}
+
 void PathTracerRenderer::recordRenderGraphPlan() {
     if (rawImage_.handle() == VK_NULL_HANDLE || presentationImage_.handle() == VK_NULL_HANDLE) {
         return;
@@ -1316,6 +1414,9 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageRead(restirSpatialReservoir, PipelineDomain::Transfer)
             .addStorageWrite(restirReservoir, PipelineDomain::Transfer);
     }
+    graph.addPass("fog_integrate")
+        .addStorageReadWrite(raw, PipelineDomain::Compute)
+        .addStorageRead(depthNormal, PipelineDomain::Compute);
 
     RenderGraphResourceId toneInput = raw;
     if (shouldRunDenoiser()) {

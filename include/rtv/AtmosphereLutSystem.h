@@ -36,6 +36,7 @@ public:
         const ShaderModule& transmittanceShader,
         const ShaderModule& multiScatterShader,
         const ShaderModule& skyViewShader,
+        const ShaderModule& skyReprojectShader,
         const ShaderModule& aerialPerspectiveShader);
     ~AtmosphereLutSystem();
 
@@ -71,6 +72,7 @@ private:
     void recordTransmittance(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
     void recordMultiScatter(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
     void recordSkyView(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
+    void recordSkyViewReproject(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
     void recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
 
     VkDevice device_ = VK_NULL_HANDLE;
@@ -78,20 +80,25 @@ private:
     Image transmittanceLut_;
     Image multiScatterLut_;
     Image skyViewLut_;
+    Image rawSkyViewLut_;
+    Image previousSkyViewLut_;
     Image aerialPerspectiveLut_;
     VkSampler sampler_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout transmittanceSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout multiScatterSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout skyViewSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout skyReprojectSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout aerialPerspectiveSetLayout_ = VK_NULL_HANDLE;
     std::unique_ptr<ComputePipeline> transmittancePipeline_;
     std::unique_ptr<ComputePipeline> multiScatterPipeline_;
     std::unique_ptr<ComputePipeline> skyViewPipeline_;
+    std::unique_ptr<ComputePipeline> skyReprojectPipeline_;
     std::unique_ptr<ComputePipeline> aerialPerspectivePipeline_;
     AtmosphereLutStats stats_{};
     bool transmittanceReady_ = false;
     bool multiScatterReady_ = false;
     bool skyViewReady_ = false;
+    bool previousSkyViewReady_ = false;
     float sunElevation_ = 0.97f;
     float skyIntensity_ = 0.8f;
 };

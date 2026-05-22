@@ -95,7 +95,6 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
     uint historyIndex = uint(historyCoords.y) * uint(dims.x) + uint(historyCoords.x);
     RestirReservoir previous = previous_restir_reservoirs[historyIndex];
     bool previousValid = previous.metadata.z != 0u &&
-        previous.metadata.y < 8u &&
         previous.target_pdf_weight_sum_m.z > 0.0 &&
         previous.sample_value_confidence.a > 0.0;
     if (!previousValid) {
@@ -106,9 +105,10 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
 
     float currentPdf = max(current.target_pdf_weight_sum_m.x, 1.0e-6);
     float previousPdf = max(previous.target_pdf_weight_sum_m.x, 1.0e-6);
-    float previousWeight = clamp(previousPdf / (currentPdf + previousPdf), 0.0, 0.85);
-    float currentWeight = 1.0 - previousWeight;
     float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
+    float motionCap = mix(0.85, 0.10, 1.0 - motionConfidence);
+    float previousWeight = clamp(previousPdf / (currentPdf + previousPdf), 0.0, motionCap);
+    float currentWeight = 1.0 - previousWeight;
 
     current.metadata.y = min(previous.metadata.y + 1u, 255u);
     current.sample_value_confidence.rgb =
@@ -534,10 +534,23 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         vec3 direct = throughput * estimate_direct_lighting(rng, hit, material, wo, emissiveDirect, envDirect, lightPdf, bsdfPdfForLight, misWeight, directSampleType);
         vec3 shadedDirect = direct;
         if (bounce == 0u && restir_mode() != 0u) {
-            RestirReservoir previousReservoir = previous_restir_reservoirs[pixelIndex];
+            uint packedFirstVel = compute_surface_velocity(hit.world_pos, hit.local_pos, hit.instance_id, dims);
+            RestirReservoir previousReservoir;
+            bool reprojectionValid = false;
+            if (packedFirstVel != 0u) {
+                vec2 firstVel = restir_unpack_velocity_pixels(packedFirstVel);
+                ivec2 reprojected = ivec2(round(vec2(coords) - firstVel));
+                ivec2 clampedReprojected = clamp(reprojected, ivec2(0), dims - ivec2(1));
+                uint reprojectedIndex = uint(clampedReprojected.y) * uint(dims.x) + uint(clampedReprojected.x);
+                previousReservoir = previous_restir_reservoirs[reprojectedIndex];
+                reprojectionValid = length(firstVel) < float(max(dims.x, dims.y)) * 0.5;
+            } else {
+                previousReservoir = previous_restir_reservoirs[pixelIndex];
+            }
             bool previousReservoirValid = previousReservoir.metadata.z != 0u &&
                 previousReservoir.sample_value_confidence.a > 0.0 &&
-                previousReservoir.target_pdf_weight_sum_m.z > 0.0;
+                previousReservoir.target_pdf_weight_sum_m.z > 0.0 &&
+                reprojectionValid;
             bool useRestir = restir_mode() == 1u || (restir_mode() == 2u && coords.x >= dims.x / 2);
             if (useRestir && previousReservoirValid) {
                 shadedDirect = previousReservoir.sample_value_confidence.rgb;
@@ -670,10 +683,6 @@ void main() {
     vec3 hit_position;
     PathComponents components;
     vec3 sample_color = trace_path(ray, rng, pixel_index, ivec2(pixel), ivec2(size), did_hit, hit_depth, hit_normal, hit_position, components);
-    if (did_hit) {
-        sample_color = apply_analytical_aerial_perspective(sample_color, ray.origin, ray.direction, hit_depth);
-    }
-
     vec4 previous = (camera.frame_count <= 1u || camera.path_tracing_enabled == 0u) ? vec4(0.0) : accumulation_buffer[pixel_index];
     vec3 previous_average = previous.rgb / max(previous.a, 1.0);
     sample_color = clamp_firefly_sample(sample_color, previous_average, camera.frame_count);
