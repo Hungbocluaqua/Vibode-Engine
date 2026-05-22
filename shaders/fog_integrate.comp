@@ -1,0 +1,103 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D color_image;
+layout(set = 0, binding = 1, std430) readonly buffer DepthNormalBuffer { uvec2 depth_normal_buffer[]; };
+layout(set = 0, binding = 2, std140) uniform Camera {
+    vec4 pos;
+    vec4 forward;
+    vec4 right;
+    vec4 up;
+    uint frame_count;
+    float sun_intensity;
+    float sky_intensity;
+    float exposure;
+    uint path_tracing_enabled;
+    uint max_bounces;
+    uint sunlight_enabled;
+    uint direct_lighting_enabled;
+    float fov_y;
+    float sun_angular_radius;
+    float indirect_strength;
+    uint environment_direct_samples;
+    vec4 jitter;
+    vec4 atmosphere;
+} camera;
+layout(set = 0, binding = 3, std140) uniform FogParams {
+    uint width;
+    uint height;
+    uint debug_view;
+    uint enabled;
+    float density;
+    float height_falloff;
+    float max_distance;
+    float _padding0;
+} params;
+
+layout(set = 1, binding = 1) uniform texture2D atmosphere_sky_view_lut;
+layout(set = 1, binding = 2) uniform sampler atmosphere_sampler;
+layout(set = 1, binding = 3) uniform texture2D atmosphere_aerial_perspective_lut;
+
+const float PI = 3.14159265358979323846;
+
+bool is_surface_depth(float depth) {
+    return depth > 0.0 && depth < params.max_distance;
+}
+
+vec2 atmosphere_latlong_uv(vec3 dir) {
+    vec3 d = normalize(dir);
+    return vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5, asin(clamp(d.y, -1.0, 1.0)) / PI + 0.5);
+}
+
+vec3 sample_sky(vec3 dir) {
+    vec2 uv = atmosphere_latlong_uv(dir);
+    vec3 sky = texture(sampler2D(atmosphere_sky_view_lut, atmosphere_sampler), vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0))).rgb;
+    return max(sky, vec3(0.0));
+}
+
+vec4 sample_aerial_lut(vec3 rayDir, float distanceMeters) {
+    float viewMu = clamp(normalize(rayDir).y, -0.15, 1.0);
+    vec2 uv = vec2(
+        clamp(sqrt(clamp(distanceMeters / 100000.0, 0.0, 1.0)), 0.0, 1.0),
+        clamp((viewMu + 0.15) / 1.15, 0.0, 1.0));
+    return texture(sampler2D(atmosphere_aerial_perspective_lut, atmosphere_sampler), uv);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(int(params.width), int(params.height));
+    if (coords.x >= dims.x || coords.y >= dims.y) {
+        return;
+    }
+    if (params.enabled == 0u || params.debug_view >= 5u) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    float depth = uintBitsToFloat(depth_normal_buffer[pixelIndex].x);
+    if (!is_surface_depth(depth)) {
+        return;
+    }
+
+    vec4 color = imageLoad(color_image, coords);
+    vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
+    vec2 uv = (vec2(coords) + jitter) / vec2(dims);
+    vec2 ndc = uv * 2.0 - vec2(1.0);
+    float aspect = float(dims.x) / max(float(dims.y), 1.0);
+    float scale = tan(camera.fov_y * 0.5);
+    vec3 rayDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
+    vec3 hitPos = camera.pos.xyz + rayDir * depth;
+
+    vec4 aerial = sample_aerial_lut(rayDir, depth);
+    float midHeight = max((camera.pos.y + hitPos.y) * 0.5, 0.0);
+    float heightDensity = exp(-midHeight / max(params.height_falloff, 1.0));
+    float distanceFog = 1.0 - exp(-max(depth, 0.0) * max(params.density, 0.0) * heightDensity);
+    float lutFog = clamp(1.0 - aerial.a, 0.0, 1.0);
+    float fogAmount = clamp(max(distanceFog, lutFog * heightDensity), 0.0, 0.98);
+
+    vec3 sky = sample_sky(rayDir);
+    vec3 inscatter = max(aerial.rgb, sky * fogAmount * 0.18);
+    vec3 fogged = color.rgb * (1.0 - fogAmount) + inscatter;
+    imageStore(color_image, coords, vec4(max(fogged, vec3(0.0)), color.a));
+}

@@ -24,6 +24,7 @@ AtmosphereLutSystem::AtmosphereLutSystem(
     const ShaderModule& transmittanceShader,
     const ShaderModule& multiScatterShader,
     const ShaderModule& skyViewShader,
+    const ShaderModule& skyReprojectShader,
     const ShaderModule& aerialPerspectiveShader)
     : device_(device) {
     VkSamplerCreateInfo samplerInfo{};
@@ -55,8 +56,22 @@ AtmosphereLutSystem::AtmosphereLutSystem(
         .width = 256,
         .height = 144,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .debugName = "atmosphere sky view lut",
+    });
+    rawSkyViewLut_.create(allocator, ImageDesc{
+        .width = 256,
+        .height = 144,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "atmosphere raw sky view lut",
+    });
+    previousSkyViewLut_.create(allocator, ImageDesc{
+        .width = 256,
+        .height = 144,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "atmosphere previous sky view lut",
     });
     aerialPerspectiveLut_.create(allocator, ImageDesc{
         .width = 160,
@@ -68,6 +83,7 @@ AtmosphereLutSystem::AtmosphereLutSystem(
     transmittanceSetLayout_ = layoutCache.createLayout(ShaderReflection::bindingsForSet({transmittanceShader.reflection()}, 0));
     multiScatterSetLayout_ = layoutCache.createLayout(ShaderReflection::bindingsForSet({multiScatterShader.reflection()}, 0));
     skyViewSetLayout_ = layoutCache.createLayout(ShaderReflection::bindingsForSet({skyViewShader.reflection()}, 0));
+    skyReprojectSetLayout_ = layoutCache.createLayout(ShaderReflection::bindingsForSet({skyReprojectShader.reflection()}, 0));
     aerialPerspectiveSetLayout_ = layoutCache.createLayout(ShaderReflection::bindingsForSet({aerialPerspectiveShader.reflection()}, 0));
     transmittancePipeline_ = std::make_unique<ComputePipeline>(
         device_,
@@ -86,6 +102,12 @@ AtmosphereLutSystem::AtmosphereLutSystem(
         skyViewShader,
         std::vector<VkDescriptorSetLayout>{skyViewSetLayout_},
         ShaderReflection::mergePushConstants({skyViewShader.reflection()}),
+        pipelineCache);
+    skyReprojectPipeline_ = std::make_unique<ComputePipeline>(
+        device_,
+        skyReprojectShader,
+        std::vector<VkDescriptorSetLayout>{skyReprojectSetLayout_},
+        ShaderReflection::mergePushConstants({skyReprojectShader.reflection()}),
         pipelineCache);
     aerialPerspectivePipeline_ = std::make_unique<ComputePipeline>(
         device_,
@@ -270,27 +292,27 @@ void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, Desc
 }
 
 void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
-    if (!isDirty(LutNode::SkyView) || !transmittanceReady_ || !multiScatterReady_ || skyViewPipeline_ == nullptr || skyViewLut_.handle() == VK_NULL_HANDLE) {
+    if (!isDirty(LutNode::SkyView) || !transmittanceReady_ || !multiScatterReady_ || skyViewPipeline_ == nullptr || rawSkyViewLut_.handle() == VK_NULL_HANDLE) {
         return;
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
-        .image = skyViewLut_.handle(),
-        .oldLayout = skyViewLut_.layout(),
+        .image = rawSkyViewLut_.handle(),
+        .oldLayout = rawSkyViewLut_.layout(),
         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .range = skyViewLut_.fullRange(),
-        .srcStage = skyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .srcAccess = skyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .range = rawSkyViewLut_.fullRange(),
+        .srcStage = rawSkyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccess = rawSkyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .dstAccess = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
     });
-    skyViewLut_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    rawSkyViewLut_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     DescriptorSet set = descriptors.allocate(skyViewSetLayout_);
     DescriptorWriter()
         .writeImage(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, transmittanceLut_.sampledDescriptor(VK_NULL_HANDLE))
         .writeImage(1, VK_DESCRIPTOR_TYPE_SAMPLER, VkDescriptorImageInfo{.sampler = sampler_})
-        .writeImage(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, skyViewLut_.storageDescriptor())
+        .writeImage(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawSkyViewLut_.storageDescriptor())
         .writeImage(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, multiScatterLut_.sampledDescriptor(VK_NULL_HANDLE))
         .update(device_, set);
 
@@ -317,22 +339,126 @@ void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, Descripto
     vkCmdPushConstants(commandBuffer, skyViewPipeline_->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, skyViewPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
-    skyViewPipeline_->dispatch(commandBuffer, skyViewLut_.width(), skyViewLut_.height(), 8, 8);
+    skyViewPipeline_->dispatch(commandBuffer, rawSkyViewLut_.width(), rawSkyViewLut_.height(), 8, 8);
 
     barrier::cmdTransitionImage(commandBuffer, {
-        .image = skyViewLut_.handle(),
-        .oldLayout = skyViewLut_.layout(),
+        .image = rawSkyViewLut_.handle(),
+        .oldLayout = rawSkyViewLut_.layout(),
         .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .range = skyViewLut_.fullRange(),
+        .range = rawSkyViewLut_.fullRange(),
         .srcStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .srcAccess = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
         .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
     });
-    skyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    rawSkyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    recordSkyViewReproject(commandBuffer, descriptors);
     clearDirty(LutNode::SkyView);
     markGenerated(LutNode::SkyView);
     skyViewReady_ = true;
+}
+
+void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+    if (skyReprojectPipeline_ == nullptr || skyViewLut_.handle() == VK_NULL_HANDLE || rawSkyViewLut_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (previousSkyViewReady_) {
+        barrier::cmdTransitionImage(commandBuffer, {
+            .image = previousSkyViewLut_.handle(),
+            .oldLayout = previousSkyViewLut_.layout(),
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .range = previousSkyViewLut_.fullRange(),
+            .srcStage = previousSkyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccess = previousSkyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        });
+        previousSkyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    barrier::cmdTransitionImage(commandBuffer, {
+        .image = skyViewLut_.handle(),
+        .oldLayout = skyViewLut_.layout(),
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .range = skyViewLut_.fullRange(),
+        .srcStage = skyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccess = skyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccess = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    });
+    skyViewLut_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    DescriptorSet set = descriptors.allocate(skyReprojectSetLayout_);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, rawSkyViewLut_.sampledDescriptor(VK_NULL_HANDLE))
+        .writeImage(1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, previousSkyViewReady_ ? previousSkyViewLut_.sampledDescriptor(VK_NULL_HANDLE) : rawSkyViewLut_.sampledDescriptor(VK_NULL_HANDLE))
+        .writeImage(2, VK_DESCRIPTOR_TYPE_SAMPLER, VkDescriptorImageInfo{.sampler = sampler_})
+        .writeImage(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, skyViewLut_.storageDescriptor())
+        .update(device_, set);
+
+    struct SkyReprojectPush {
+        uint32_t hasHistory = 0;
+        float historyWeight = 0.9f;
+        float maxLuminanceDelta = 0.15f;
+        uint32_t padding = 0;
+    };
+    const SkyReprojectPush push{
+        .hasHistory = previousSkyViewReady_ ? 1u : 0u,
+    };
+
+    skyReprojectPipeline_->bind(commandBuffer);
+    vkCmdPushConstants(commandBuffer, skyReprojectPipeline_->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, skyReprojectPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    skyReprojectPipeline_->dispatch(commandBuffer, skyViewLut_.width(), skyViewLut_.height(), 8, 8);
+
+    barrier::cmdTransitionImage(commandBuffer, {
+        .image = skyViewLut_.handle(),
+        .oldLayout = skyViewLut_.layout(),
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .range = skyViewLut_.fullRange(),
+        .srcStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccess = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .dstAccess = VK_ACCESS_2_TRANSFER_READ_BIT,
+    });
+    skyViewLut_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    barrier::cmdTransitionImage(commandBuffer, {
+        .image = previousSkyViewLut_.handle(),
+        .oldLayout = previousSkyViewLut_.layout(),
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .range = previousSkyViewLut_.fullRange(),
+        .srcStage = previousSkyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccess = previousSkyViewLut_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .dstAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+    });
+    previousSkyViewLut_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageCopy copy{};
+    copy.srcSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.dstSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.extent = skyViewLut_.extent();
+    vkCmdCopyImage(
+        commandBuffer,
+        skyViewLut_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        previousSkyViewLut_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
+    previousSkyViewReady_ = true;
+    barrier::cmdTransitionImage(commandBuffer, {
+        .image = skyViewLut_.handle(),
+        .oldLayout = skyViewLut_.layout(),
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .range = skyViewLut_.fullRange(),
+        .srcStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccess = VK_ACCESS_2_TRANSFER_READ_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+    });
+    skyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {

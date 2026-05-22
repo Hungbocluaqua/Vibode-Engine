@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D current_sky_view_lut;
+layout(set = 0, binding = 1) uniform texture2D previous_sky_view_lut;
+layout(set = 0, binding = 2) uniform sampler atmosphere_sampler;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D resolved_sky_view_lut;
+
+layout(push_constant) uniform SkyReprojectParams {
+    uint has_history;
+    float history_weight;
+    float max_luminance_delta;
+    uint _padding0;
+} params;
+
+float luminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(resolved_sky_view_lut);
+    if (pixel.x >= dims.x || pixel.y >= dims.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(dims);
+    vec3 current = texelFetch(sampler2D(current_sky_view_lut, atmosphere_sampler), pixel, 0).rgb;
+    if (params.has_history == 0u) {
+        imageStore(resolved_sky_view_lut, pixel, vec4(max(current, vec3(0.0)), 1.0));
+        return;
+    }
+
+    vec3 previous = texture(sampler2D(previous_sky_view_lut, atmosphere_sampler), uv).rgb;
+    float currentLum = luminance(current);
+    float previousLum = luminance(previous);
+    float relativeDelta = abs(currentLum - previousLum) / (max(max(currentLum, previousLum), 0.01));
+    float confidence = 1.0 - smoothstep(params.max_luminance_delta, params.max_luminance_delta * 2.0, relativeDelta);
+    float historyWeight = clamp(params.history_weight * confidence, 0.0, 0.95);
+    vec3 resolved = mix(current, previous, historyWeight);
+    imageStore(resolved_sky_view_lut, pixel, vec4(max(resolved, vec3(0.0)), 1.0));
+}

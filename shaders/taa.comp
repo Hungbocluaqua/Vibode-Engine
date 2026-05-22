@@ -19,7 +19,7 @@ layout(set = 0, binding = 5, std140) uniform TaaParams {
     float feedback;
     float velocity_scale;
     uint reset_history;
-    uint _padding0;
+    float sharpen_strength;
 } params;
 
 float luminance(vec3 color) {
@@ -66,6 +66,22 @@ vec3 clamp_history(vec3 history, vec3 minColor, vec3 maxColor, float sigmaLum) {
     return temporal_clamp_history_ycocg(history, minColor, maxColor, sigmaLum);
 }
 
+vec3 sharpen_resolved_color(vec3 resolved, vec3 current, ivec2 coords, ivec2 dims, float amount) {
+    if (amount <= 0.0) {
+        return resolved;
+    }
+    vec3 neighborhood = vec3(0.0);
+    neighborhood += texelFetch(sampler2D(input_color, input_sampler), clamp(coords + ivec2(1, 0), ivec2(0), dims - ivec2(1)), 0).rgb;
+    neighborhood += texelFetch(sampler2D(input_color, input_sampler), clamp(coords + ivec2(-1, 0), ivec2(0), dims - ivec2(1)), 0).rgb;
+    neighborhood += texelFetch(sampler2D(input_color, input_sampler), clamp(coords + ivec2(0, 1), ivec2(0), dims - ivec2(1)), 0).rgb;
+    neighborhood += texelFetch(sampler2D(input_color, input_sampler), clamp(coords + ivec2(0, -1), ivec2(0), dims - ivec2(1)), 0).rgb;
+    neighborhood *= 0.25;
+    vec3 highpass = current - neighborhood;
+    float limit = max(luminance(current), 0.05) * 0.35;
+    highpass = clamp(highpass, vec3(-limit), vec3(limit));
+    return max(resolved + highpass * amount, vec3(0.0));
+}
+
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dims = ivec2(int(params.width), int(params.height));
@@ -85,6 +101,7 @@ void main() {
         temporal_history_pixel_valid(history_pos, dims, 0.5);
 
     vec3 output_value = current;
+    float sharpenAmount = params.sharpen_strength * 0.35;
     if (history_valid) {
         vec3 minColor;
         vec3 maxColor;
@@ -103,6 +120,7 @@ void main() {
         float motionConfidence = temporal_motion_confidence(velocity_pixels, 18.0, 0.12);
         float motion = 1.0 - motionConfidence;
         float reactive = temporal_reactive_weight(lumDelta, clipDelta, neighborhoodDelta);
+        sharpenAmount = params.sharpen_strength * (1.0 - clamp(max(motion, reactive), 0.0, 1.0) * 0.65);
 
         if (reactive >= 0.70 || lumDelta >= 0.65 || clipDelta >= 0.55) {
             output_value = current;
@@ -110,6 +128,9 @@ void main() {
             float alpha = mix(params.feedback, 0.88, max(motion, reactive));
             output_value = mix(history, current, clamp(alpha, 0.06, 0.92));
         }
+    }
+    if (params.enabled != 0u && params.reset_history == 0u) {
+        output_value = sharpen_resolved_color(output_value, current, coords, dims, sharpenAmount);
     }
 
     imageStore(output_color, coords, vec4(output_value, 1.0));

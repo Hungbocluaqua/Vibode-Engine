@@ -228,7 +228,7 @@ private:
         float feedback = 0.08f;
         float velocityScale = 64.0f;
         uint32_t resetHistory = 1;
-        uint32_t padding = 0;
+        float sharpeningStrength = 0.08f;
     };
 
     struct RestirSpatialParams {
@@ -236,6 +236,17 @@ private:
         uint32_t height = 0;
         uint32_t frameCount = 0;
         uint32_t enabled = 0;
+    };
+
+    struct FogParams {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t debugView = 0;
+        uint32_t enabled = 1;
+        float density = 0.000035f;
+        float heightFalloff = 1200.0f;
+        float maxDistance = 10000.0f;
+        float padding = 0.0f;
     };
 
     struct RestirReservoirGpu {
@@ -251,6 +262,8 @@ private:
     void recordRestirSpatial(VkCommandBuffer commandBuffer);
     void recordRestirSpatialPass(VkCommandBuffer commandBuffer);
     void recordRestirSpatialCopyPass(VkCommandBuffer commandBuffer);
+    void recordHeightFog(VkCommandBuffer commandBuffer);
+    void recordHeightFogPass(VkCommandBuffer commandBuffer);
     void recordDenoiser(VkCommandBuffer commandBuffer);
     void recordDenoiserPass(VkCommandBuffer commandBuffer);
     void recordTaa(VkCommandBuffer commandBuffer);
@@ -292,6 +305,7 @@ private:
     DenoiserParams denoiserParams_{};
     TaaParams taaParams_{};
     RestirSpatialParams restirSpatialParams_{};
+    FogParams fogParams_{};
     PrevCameraUniform prevCamera_{};
     RendererDebugParams debugParams_{};
     RendererBackend requestedBackend_ = RendererBackend::Auto;
@@ -332,9 +346,11 @@ private:
     std::unique_ptr<ShaderModule> denoiserShader_;
     std::unique_ptr<ShaderModule> taaShader_;
     std::unique_ptr<ShaderModule> restirSpatialShader_;
+    std::unique_ptr<ShaderModule> fogShader_;
     std::unique_ptr<ShaderModule> transmittanceShader_;
     std::unique_ptr<ShaderModule> multiScatterShader_;
     std::unique_ptr<ShaderModule> skyViewShader_;
+    std::unique_ptr<ShaderModule> skyReprojectShader_;
     std::unique_ptr<ShaderModule> aerialPerspectiveShader_;
     std::unique_ptr<ShaderModule> selectionOutlineShader_;
     std::unique_ptr<ShaderModule> luminanceHistogramShader_;
@@ -352,6 +368,7 @@ private:
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
     std::unique_ptr<ComputePipeline> taaPipeline_;
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
+    std::unique_ptr<ComputePipeline> fogPipeline_;
     std::unique_ptr<ComputePipeline> selectionOutlinePipeline_;
     std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
     std::unique_ptr<ComputePipeline> exposureReducePipeline_;
@@ -366,6 +383,7 @@ private:
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout fogSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout selectionOutlineSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout luminanceHistogramSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout exposureReduceSetLayout_ = VK_NULL_HANDLE;
