@@ -1,7 +1,6 @@
 #pragma once
 
 #include "rtv/NonCopyable.h"
-#include "rtv/RendererBackend.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
@@ -42,7 +41,6 @@ public:
         RendererDebugView debugView = RendererDebugView::Beauty,
         std::optional<std::filesystem::path> gltfPath = std::nullopt,
         std::optional<std::filesystem::path> hdrPath = std::nullopt,
-        RendererBackend requestedBackend = RendererBackend::Auto,
         std::optional<std::filesystem::path> scenePath = std::nullopt,
         std::optional<bool> denoiserOverride = std::nullopt,
         std::optional<RestirMode> restirModeOverride = std::nullopt,
@@ -90,7 +88,6 @@ private:
 
     GLFWwindow* window_ = nullptr;
     RendererDebugView debugView_ = RendererDebugView::Beauty;
-    RendererBackend requestedBackend_ = RendererBackend::Auto;
     std::optional<std::filesystem::path> gltfPath_;
     std::optional<std::filesystem::path> hdrPath_;
     std::optional<std::filesystem::path> scenePath_;

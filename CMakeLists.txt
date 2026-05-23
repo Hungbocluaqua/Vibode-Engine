@@ -103,7 +103,6 @@ add_executable(rtvulkan
     src/rtv/PipelineDemo.cpp
     src/rtv/RenderSettingsPanel.cpp
     src/rtv/RenderGraph.cpp
-    src/rtv/RendererBackend.cpp
     src/rtv/RendererDebug.cpp
     src/rtv/RayTracingPipeline.cpp
     src/rtv/RayTracingScene.cpp

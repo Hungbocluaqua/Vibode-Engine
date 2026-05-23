@@ -1,5 +1,4 @@
 #include "rtv/Application.h"
-#include "rtv/RendererBackend.h"
 #include "rtv/RendererDebug.h"
 
 #include <exception>
@@ -21,7 +20,6 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> scenePath;
         std::optional<bool> denoiserOverride;
         std::optional<rtv::RestirMode> restirModeOverride;
-        rtv::RendererBackend backend = rtv::RendererBackend::Auto;
         bool validationCameraMotion = false;
         for (int i = 1; i < argc; ++i) {
             if (std::string_view(argv[i]) == "--frames" && i + 1 < argc) {
@@ -35,9 +33,7 @@ int main(int argc, char** argv) {
                 hdrPath = std::filesystem::path(argv[++i]);
             } else if ((std::string_view(argv[i]) == "--scene" || std::string_view(argv[i]) == "--rtlevel") && i + 1 < argc) {
                 scenePath = std::filesystem::path(argv[++i]);
-            } else if (std::string_view(argv[i]) == "--backend" && i + 1 < argc) {
-                backend = rtv::parseRendererBackend(argv[++i]);
-            } else if (std::string_view(argv[i]) == "--denoiser" && i + 1 < argc) {
+        } else if (std::string_view(argv[i]) == "--denoiser" && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 denoiserOverride = !(value == "off" || value == "false" || value == "0");
             } else if (std::string_view(argv[i]) == "--restir" && i + 1 < argc) {
@@ -56,7 +52,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        rtv::Application app(debugView, gltfPath, hdrPath, backend, scenePath, denoiserOverride, restirModeOverride, debugViewProvided, validationCameraMotion);
+        rtv::Application app(debugView, gltfPath, hdrPath, scenePath, denoiserOverride, restirModeOverride, debugViewProvided, validationCameraMotion);
         app.run(maxFrames);
         return 0;
     } catch (const std::exception& error) {

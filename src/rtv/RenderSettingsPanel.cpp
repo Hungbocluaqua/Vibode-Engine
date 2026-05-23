@@ -63,7 +63,6 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.taaFeedback = render.taaFeedback;
         settings.debugView = render.debugView;
         settings.renderResolutionScale = render.resolutionScale;
-        settings.requestedBackend = render.requestedBackend;
         settings.accumulationLimit = render.accumulationLimit;
         settings.usePhysicalCamera = render.usePhysicalCamera;
         settings.physicalAperture = render.physicalAperture;
@@ -82,23 +81,6 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     uint32_t maxEnvSamples = 8;
     uint32_t minAtrous = 1;
     uint32_t maxAtrous = 5;
-
-    const char* backendItems[] = {"Auto", "Compute", "Hardware Ray Tracing"};
-    int backendIndex = settings.requestedBackend == RendererBackend::Compute
-        ? 1
-        : (settings.requestedBackend == RendererBackend::HardwareRayTracing ? 2 : 0);
-    if (ImGui::Combo("Backend", &backendIndex, backendItems, 3)) {
-        if (backendIndex == 2 && !state.renderer.hardwareRayTracingAvailable()) {
-            settings.requestedBackend = RendererBackend::Auto;
-        } else {
-            settings.requestedBackend = backendIndex == 1
-                ? RendererBackend::Compute
-                : (backendIndex == 2 ? RendererBackend::HardwareRayTracing : RendererBackend::Auto);
-        }
-        changed = true;
-    }
-    ImGui::Text("Active Backend: %s", rendererBackendDisplayName(state.renderer.activeBackend()));
-    ImGui::Text("Hardware RT: %s", state.renderer.hardwareRayTracingAvailable() ? "Available" : "Unavailable");
 
     ImGui::SeparatorText("Rendering");
     editorDebugViewCombo("Debug View", settings, changed);
@@ -275,7 +257,6 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.taaFeedback = settings.taaFeedback;
             render.debugView = settings.debugView;
             render.resolutionScale = settings.renderResolutionScale;
-            render.requestedBackend = settings.requestedBackend;
             render.accumulationLimit = settings.accumulationLimit;
             render.usePhysicalCamera = settings.usePhysicalCamera;
             render.physicalAperture = settings.physicalAperture;

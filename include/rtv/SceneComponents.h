@@ -1,7 +1,6 @@
 #pragma once
 
 #include "rtv/MeshAsset.h"
-#include "rtv/RendererBackend.h"
 #include "rtv/RendererDebug.h"
 
 #include <glm/glm.hpp>
@@ -135,7 +134,6 @@ struct RenderSettings {
     bool accumulate = true;
     uint32_t accumulationLimit = 0;
     float resolutionScale = 1.0f;
-    RendererBackend requestedBackend = RendererBackend::Auto;
 
     bool usePhysicalCamera = false;
     float physicalAperture = 16.0f;
