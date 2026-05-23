@@ -1,5 +1,6 @@
 # Build output
 build/
+build_test/
 cmake-build-*/
 out/
 
@@ -42,9 +43,8 @@ volk.vcxproj*
 *.pdb
 *.ilk
 
-# Compiled shaders (keep source .spv in shaders/ but not build copies)
-# Uncomment next line if you want to ignore compiled shader binaries
-# *.spv
+# Compiled shaders
+*.spv
 
 # IDE
 .idea/
