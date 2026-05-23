@@ -1,0 +1,78 @@
+#version 450
+
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform RestirTemporalParams {
+    uint width;
+    uint height;
+    uint frame_count;
+    uint enabled;
+    float max_age;
+    float temporal_pad;
+} params;
+
+layout(set = 0, binding = 1, std430) buffer InputReservoirs { RestirReservoir input_reservoirs[]; };
+layout(set = 0, binding = 2, std430) readonly buffer PreviousReservoirs { RestirReservoir previous_reservoirs[]; };
+layout(set = 0, binding = 3, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+
+vec2 restir_unpack_velocity_pixels(uint packedVelocity) {
+    vec2 uv = vec2(float(packedVelocity & 0xffffu), float((packedVelocity >> 16u) & 0xffffu)) / 65535.0;
+    return uv * 2.0 - vec2(1.0);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    RestirReservoir current = input_reservoirs[pixelIndex];
+
+    if (params.enabled == 0u || !restir_reservoir_valid(current)) {
+        return;
+    }
+
+    uint packedVelocity = velocity_buffer[pixelIndex];
+    vec2 velocityPixels = restir_unpack_velocity_pixels(packedVelocity);
+    vec2 historyPos = vec2(coords) - velocityPixels;
+
+    if (historyPos.x < 0.0 || historyPos.y < 0.0 ||
+        historyPos.x >= float(params.width) || historyPos.y >= float(params.height)) {
+        current.sample_value_confidence.a = 0.35;
+        input_reservoirs[pixelIndex] = current;
+        return;
+    }
+
+    ivec2 historyCoords = ivec2(round(historyPos));
+    uint historyIndex = uint(historyCoords.y) * params.width + uint(historyCoords.x);
+    RestirReservoir previous = previous_reservoirs[historyIndex];
+
+    if (!restir_reservoir_valid(previous) || previous.metadata.y >= uint(params.max_age)) {
+        current.sample_value_confidence.a = 0.35;
+        input_reservoirs[pixelIndex] = current;
+        return;
+    }
+
+    float currentPdf = max(current.target_pdf_weight_sum_m.x, 1.0e-6);
+    float previousPdf = max(previous.target_pdf_weight_sum_m.x, 1.0e-6);
+    float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
+    float motionCap = mix(0.85, 0.10, 1.0 - motionConfidence);
+    float previousWeight = clamp(previousPdf / (currentPdf + previousPdf), 0.0, motionCap);
+    float currentWeight = 1.0 - previousWeight;
+
+    current.metadata.y = min(previous.metadata.y + 1u, 255u);
+    current.sample_value_confidence.rgb =
+        current.sample_value_confidence.rgb * currentWeight +
+        previous.sample_value_confidence.rgb * previousWeight;
+    current.sample_value_confidence.a = clamp(
+        (currentWeight + previous.sample_value_confidence.a * previousWeight) * motionConfidence, 0.0, 1.0);
+    current.target_pdf_weight_sum_m.y =
+        current.target_pdf_weight_sum_m.y * currentWeight +
+        previous.target_pdf_weight_sum_m.y * previousWeight;
+    current.target_pdf_weight_sum_m.z = min(current.target_pdf_weight_sum_m.z + previous.target_pdf_weight_sum_m.z, 64.0);
+
+    input_reservoirs[pixelIndex] = current;
+}

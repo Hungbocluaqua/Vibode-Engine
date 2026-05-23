@@ -1,0 +1,48 @@
+#version 450
+
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform RestirInitParams {
+    uint width;
+    uint height;
+    uint frame_count;
+    uint enabled;
+    uint restir_mode;
+    float temporal_pad;
+} params;
+
+layout(set = 0, binding = 1, std430) readonly buffer DirectLightBuffer { vec4 direct_light_buffer[]; };
+layout(set = 0, binding = 2, std430) readonly buffer LightPdfBuffer { float light_pdf_buffer[]; };
+layout(set = 0, binding = 3, std430) readonly buffer SampleTypeBuffer { uint sample_type_buffer[]; };
+layout(set = 0, binding = 4, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+layout(set = 0, binding = 5, std430) readonly buffer PreviousReservoirs { RestirReservoir previous_reservoirs[]; };
+layout(set = 0, binding = 6, std430) writeonly buffer OutputReservoirs { RestirReservoir output_reservoirs[]; };
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+
+    if (params.enabled == 0u || params.restir_mode == 0u) {
+        output_reservoirs[pixelIndex] = empty_restir_reservoir();
+        return;
+    }
+
+    uint sampleType = sample_type_buffer[pixelIndex];
+    float lightPdf = light_pdf_buffer[pixelIndex];
+    bool valid = sampleType != 0u && lightPdf > 1.0e-6;
+
+    RestirReservoir current = empty_restir_reservoir();
+    if (valid) {
+        current.metadata = uvec4(sampleType, 0u, 1u, 0u);
+        current.sample_value_confidence = vec4(max(direct_light_buffer[pixelIndex].rgb, vec3(0.0)), 1.0);
+        current.target_pdf_weight_sum_m = vec4(lightPdf,
+            dot(current.sample_value_confidence.rgb, vec3(0.2126, 0.7152, 0.0722)), 1.0, 0.0);
+    }
+    output_reservoirs[pixelIndex] = current;
+}

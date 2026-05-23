@@ -1,0 +1,61 @@
+#version 460
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D sky_view_lut;
+layout(set = 0, binding = 1) uniform sampler sky_sampler;
+layout(set = 0, binding = 2, std430) buffer SkyCdfRows { float sky_cdf_rows[]; };
+layout(set = 0, binding = 3, std430) buffer SkyCdfCols { float sky_cdf_cols[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} push;
+
+shared float shared_lum[256];
+
+void main() {
+    uint totalPixels = push.width * push.height;
+
+    float totalLuminance = 0.0;
+
+    for (uint i = 0; i < totalPixels; ++i) {
+        uint x = i % push.width;
+        uint y = i / push.width;
+
+        vec2 uv = (vec2(x, y) + 0.5) / vec2(push.width, push.height);
+        vec3 radiance = texture(sampler2D(sky_view_lut, sky_sampler), uv).rgb;
+        float lum = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+
+        float lat = (uv.y - 0.5) * 3.14159265359;
+        float sinTheta = max(cos(lat), 0.001);
+        float weighted = lum * sinTheta;
+
+        totalLuminance += weighted;
+        sky_cdf_cols[i] = totalLuminance;
+    }
+
+    float invTotal = 1.0 / max(totalLuminance, 1e-10);
+    for (uint i = 0; i < totalPixels; ++i) {
+        sky_cdf_cols[i] *= invTotal;
+    }
+
+    float rowLuminance = 0.0;
+    for (uint y = 0; y < push.height; ++y) {
+        for (uint x = 0; x < push.width; ++x) {
+            uint idx = y * push.width + x;
+
+            float pdf = sky_cdf_cols[idx];
+            if (idx > 0) {
+                pdf -= sky_cdf_cols[idx - 1];
+            }
+            rowLuminance += pdf;
+        }
+        sky_cdf_rows[y] = rowLuminance;
+    }
+
+    float invRowTotal = 1.0 / max(rowLuminance, 1e-10);
+    for (uint y = 0; y < push.height; ++y) {
+        sky_cdf_rows[y] *= invRowTotal;
+    }
+}

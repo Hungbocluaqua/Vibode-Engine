@@ -4,6 +4,7 @@
 #include "rtv/Image.h"
 #include "rtv/NonCopyable.h"
 
+#include <glm/glm.hpp>
 #include <Volk/volk.h>
 
 #include <array>
@@ -13,6 +14,7 @@
 
 namespace rtv {
 
+class AtmosphereSamplingSystem;
 class ComputePipeline;
 class DescriptorAllocator;
 class DescriptorLayoutCache;
@@ -37,11 +39,15 @@ public:
         const ShaderModule& multiScatterShader,
         const ShaderModule& skyViewShader,
         const ShaderModule& skyReprojectShader,
-        const ShaderModule& aerialPerspectiveShader);
+        const ShaderModule& aerialPerspectiveShader,
+        const ShaderModule& skyCdfShader);
     ~AtmosphereLutSystem();
 
     void record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
     void setSkyParameters(float sunElevation, float skyIntensity);
+    void setAtmosphereParams(float rayleighScaleHeight, float mieScaleHeight, float mieAnisotropy, float groundAlbedo);
+    void setQuality(AtmosphereQuality quality);
+    void setCameraPosition(glm::vec3 position);
     void markDirty();
 
     [[nodiscard]] const Image& transmittanceLut() const { return transmittanceLut_; }
@@ -52,6 +58,7 @@ public:
     [[nodiscard]] bool transmittanceReady() const { return transmittanceReady_; }
     [[nodiscard]] bool skyViewReady() const { return skyViewReady_; }
     [[nodiscard]] AtmosphereLutStats stats() const { return stats_; }
+    [[nodiscard]] const AtmosphereSamplingSystem* samplingSystem() const { return samplingSystem_.get(); }
 
 private:
     enum class LutNode : uint8_t {
@@ -76,6 +83,7 @@ private:
     void recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
 
     VkDevice device_ = VK_NULL_HANDLE;
+    ResourceAllocator& allocator_;
     AtmosphereModel model_{};
     Image transmittanceLut_;
     Image multiScatterLut_;
@@ -94,6 +102,7 @@ private:
     std::unique_ptr<ComputePipeline> skyViewPipeline_;
     std::unique_ptr<ComputePipeline> skyReprojectPipeline_;
     std::unique_ptr<ComputePipeline> aerialPerspectivePipeline_;
+    std::unique_ptr<AtmosphereSamplingSystem> samplingSystem_;
     AtmosphereLutStats stats_{};
     bool transmittanceReady_ = false;
     bool multiScatterReady_ = false;
@@ -101,6 +110,11 @@ private:
     bool previousSkyViewReady_ = false;
     float sunElevation_ = 0.97f;
     float skyIntensity_ = 0.8f;
+    uint32_t skyViewWidth_ = 256;
+    uint32_t skyViewHeight_ = 144;
+    AtmosphereQuality quality_ = AtmosphereQuality::High;
+    glm::vec3 previousCameraPos_{};
+    bool previousCameraPosSet_ = false;
 };
 
 } // namespace rtv

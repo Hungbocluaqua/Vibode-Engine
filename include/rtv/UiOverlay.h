@@ -55,6 +55,7 @@ public:
     [[nodiscard]] bool rendersPathTracerInViewport() const { return true; }
     [[nodiscard]] VkExtent2D desiredRenderExtent(VkExtent2D fallback) const;
     void invalidateViewportTexture();
+    [[nodiscard]] EditorLayer& editor() { return editor_; }
 
 private:
     static void checkVkResult(VkResult result);

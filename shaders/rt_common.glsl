@@ -3,6 +3,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "atmosphere_phase.glsl"
+#include "blue_noise.glsl"
 
 layout(set = 0, binding = 0, std430) buffer AccumulationBuffer { vec4 accumulation_buffer[]; };
 
@@ -29,7 +30,7 @@ layout(set = 0, binding = 1, std140) uniform Camera {
 
 layout(set = 0, binding = 2, std430) buffer VarianceBuffer { uint variance_buffer[]; };
 layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D output_color;
-layout(set = 0, binding = 4, std430) buffer DepthNormalBuffer { uvec2 depth_normal_buffer[]; };
+layout(set = 0, binding = 4, std430) buffer DepthNormalBuffer { uvec3 depth_normal_buffer[]; };
 layout(set = 0, binding = 5, std430) buffer WorldPositionBuffer { uvec2 world_position_buffer[]; };
 layout(set = 0, binding = 35, std430) buffer EntityIdBuffer { uint entity_id_buffer[]; };
 layout(set = 0, binding = 36, std430) buffer VelocityBuffer { uint velocity_buffer[]; };
@@ -100,8 +101,7 @@ layout(set = 0, binding = 18, std140) uniform RendererDebug {
     float scale;
 } debug_params;
 
-layout(set = 0, binding = 19) uniform texture2D material_textures[128];
-layout(set = 0, binding = 23) uniform sampler material_samplers[128];
+layout(set = 0, binding = 41) uniform sampler2D material_textures[];
 
 struct PrimitiveRecord {
     uvec4 index_data;
@@ -157,6 +157,10 @@ layout(set = 0, binding = 34, std430) readonly buffer RtTriangleMaterialIds {
     uint rt_triangle_material_ids[];
 };
 
+layout(set = 0, binding = 40, std430) readonly buffer LightBvhNodes {
+    vec4 light_bvh_nodes[];
+};
+
 layout(set = 0, binding = 30, std430) readonly buffer LocalTriangleData {
     vec4 local_triangle_data[];
 };
@@ -164,8 +168,14 @@ layout(set = 0, binding = 30, std430) readonly buffer LocalTriangleData {
 layout(set = 1, binding = 0) uniform texture2D atmosphere_transmittance_lut;
 layout(set = 1, binding = 1) uniform texture2D atmosphere_sky_view_lut;
 layout(set = 1, binding = 2) uniform sampler atmosphere_sampler;
-layout(set = 1, binding = 3) uniform texture2D atmosphere_aerial_perspective_lut;
+layout(set = 1, binding = 3) uniform texture3D atmosphere_aerial_perspective_lut;
 layout(set = 1, binding = 4) uniform texture2D atmosphere_multi_scatter_lut;
+layout(set = 1, binding = 5, std430) readonly buffer SkyCdfRows { float sky_cdf_rows[]; };
+layout(set = 1, binding = 6, std430) readonly buffer SkyCdfCols { float sky_cdf_cols[]; };
+
+const uint SKY_CDF_WIDTH = 256u;
+const uint SKY_CDF_HEIGHT = 144u;
+const float SKY_CDF_HALF_RCP_PI_SQ = 0.0506605918210689; // 1/(2*PI*PI)
 
 struct Material {
     vec3 color;
@@ -184,6 +194,52 @@ struct Material {
     uint alpha_mode;
     uint double_sided;
 };
+
+const uint MATERIAL_CLOSURE_FLAG_DIFFUSE       = 1u << 0u;
+const uint MATERIAL_CLOSURE_FLAG_SPECULAR      = 1u << 1u;
+const uint MATERIAL_CLOSURE_FLAG_SSS           = 1u << 2u;
+const uint MATERIAL_CLOSURE_FLAG_TRANSMISSION  = 1u << 3u;
+const uint MATERIAL_CLOSURE_FLAG_CLEARCOAT     = 1u << 4u;
+const uint MATERIAL_CLOSURE_FLAG_SHEEN         = 1u << 5u;
+const uint MATERIAL_CLOSURE_FLAG_THIN_FILM     = 1u << 6u;
+const uint MATERIAL_CLOSURE_FLAG_METAL         = 1u << 7u;
+
+struct MaterialClosure {
+    uint flags;
+    float weight;
+    vec3 color;
+    float roughness;
+    float metallic;
+    float ior;
+    float pad;
+};
+
+MaterialClosure material_to_closure(Material m) {
+    MaterialClosure c;
+    c.color = m.color;
+    c.roughness = m.roughness;
+    c.metallic = m.metallic;
+    c.ior = m.ior;
+    c.weight = 1.0;
+    c.pad = 0.0;
+    c.flags = 0u;
+
+    if (m.mat_type == 0u) {
+        c.flags = MATERIAL_CLOSURE_FLAG_DIFFUSE;
+    } else if (m.mat_type == 1u || m.mat_type == 3u) {
+        c.flags = MATERIAL_CLOSURE_FLAG_SPECULAR | MATERIAL_CLOSURE_FLAG_METAL;
+    } else if (m.mat_type == 2u) {
+        c.flags = MATERIAL_CLOSURE_FLAG_SPECULAR | MATERIAL_CLOSURE_FLAG_TRANSMISSION;
+    } else if (m.mat_type == 4u) {
+        c.flags = MATERIAL_CLOSURE_FLAG_SPECULAR | MATERIAL_CLOSURE_FLAG_CLEARCOAT;
+    }
+
+    return c;
+}
+
+bool closure_has_flag(MaterialClosure c, uint flag) {
+    return (c.flags & flag) != 0u;
+}
 
 struct RayPayload {
     uint hit;
@@ -206,7 +262,7 @@ struct RayPayload {
 const float PI = 3.14159265358979323846;
 const uint TRI_STRIDE = 12u;
 const uint MATERIAL_STRIDE = 5u;
-const int MATERIAL_TEXTURE_LIMIT = 128;
+const int MATERIAL_TEXTURE_LIMIT = 1024;
 const uint MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB = 1u << 0u;
 const uint MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB = 1u << 1u;
 const uint ALPHA_MODE_OPAQUE = 0u;
@@ -234,8 +290,8 @@ uint encode_octahedral_normal(vec3 n) {
     return pack_snorm2x16(p);
 }
 
-uvec2 pack_depth_normal(float depth, vec3 normal) {
-    return uvec2(floatBitsToUint(depth), encode_octahedral_normal(normal));
+uvec3 pack_depth_normal(float depth, vec3 normal, float roughness) {
+    return uvec3(floatBitsToUint(depth), encode_octahedral_normal(normal), floatBitsToUint(roughness));
 }
 
 uint pack_variance(float v) {
@@ -364,7 +420,7 @@ void apply_material_textures(inout Material material, vec2 uv) {
     uint flags = uint(round(material.pad2));
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.base_color_texture;
-        vec4 base = texture(sampler2D(material_textures[nonuniformEXT(textureIndex)], material_samplers[nonuniformEXT(textureIndex)]), uv);
+        vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], uv);
         vec3 baseColor = (flags & MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB) != 0u
             ? pow(max(base.rgb, vec3(0.0)), vec3(2.2))
             : base.rgb;
@@ -373,7 +429,7 @@ void apply_material_textures(inout Material material, vec2 uv) {
     }
     if (material.metallic_roughness_texture >= 0 && material.metallic_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.metallic_roughness_texture;
-        vec4 mr = texture(sampler2D(material_textures[nonuniformEXT(textureIndex)], material_samplers[nonuniformEXT(textureIndex)]), uv);
+        vec4 mr = texture(material_textures[nonuniformEXT(textureIndex)], uv);
         material.roughness = clamp(material.roughness * mr.g, 0.02, 1.0);
         material.metallic = clamp(material.metallic * mr.b, 0.0, 1.0);
         if (material.mat_type == 0u || material.mat_type == 3u) {
@@ -382,7 +438,7 @@ void apply_material_textures(inout Material material, vec2 uv) {
     }
     if (material.emissive_texture >= 0 && material.emissive_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.emissive_texture;
-        vec4 emissive = texture(sampler2D(material_textures[nonuniformEXT(textureIndex)], material_samplers[nonuniformEXT(textureIndex)]), uv);
+        vec4 emissive = texture(material_textures[nonuniformEXT(textureIndex)], uv);
         vec3 emissiveColor = (flags & MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB) != 0u
             ? pow(max(emissive.rgb, vec3(0.0)), vec3(2.2))
             : emissive.rgb;
@@ -393,7 +449,7 @@ void apply_material_textures(inout Material material, vec2 uv) {
 void apply_material_alpha_texture(inout Material material, vec2 uv) {
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.base_color_texture;
-        vec4 base = texture(sampler2D(material_textures[nonuniformEXT(textureIndex)], material_samplers[nonuniformEXT(textureIndex)]), uv);
+        vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], uv);
         material.alpha_factor *= base.a;
     }
 }
@@ -414,7 +470,7 @@ vec3 apply_normal_texture(Material material, vec2 uv, vec3 normal, vec3 tangent,
         return normal;
     }
     int textureIndex = material.normal_texture;
-    vec3 tangentSample = texture(sampler2D(material_textures[nonuniformEXT(textureIndex)], material_samplers[nonuniformEXT(textureIndex)]), uv).xyz * 2.0 - 1.0;
+    vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], uv).xyz * 2.0 - 1.0;
     vec3 t = normalize(tangent - normal * dot(normal, tangent));
     vec3 b = normalize(bitangent - normal * dot(normal, bitangent));
     vec3 mapped = normalize(t * tangentSample.x + b * tangentSample.y + normal * max(tangentSample.z, 0.0));
@@ -519,7 +575,7 @@ vec3 fast_sky_radiance(vec3 dir) {
     vec3 sky = (rayleigh + mie + sunsetScatter * 0.22) * transmittance * sunVisibility;
 
     vec3 night = vec3(0.004, 0.006, 0.012) * smoothstep(-0.25, -0.05, sunUp);
-    return max(sky * camera.sky_intensity * 5.5 + night * camera.sky_intensity, vec3(0.0));
+    return max(sky * camera.sky_intensity * max(camera.atmosphere.w, 0.1) + night * camera.sky_intensity, vec3(0.0));
 }
 
 vec3 analytical_sun_radiance(vec3 dir) {
@@ -544,8 +600,14 @@ float atmosphere_horizon_visibility(vec3 scenePos, vec3 dir) {
     return smoothstep(horizonMu - 0.004, horizonMu + 0.004, viewMu);
 }
 
-vec3 atmosphere_sky_radiance(vec3 dir) {
+vec3 atmosphere_sky_radiance(vec3 dir, uint quality) {
     vec3 viewDir = normalize(dir);
+    if (quality == ATMOSPHERE_RAY_QUALITY_MINIMAL) {
+        return vec3(0.0);
+    }
+    if (quality == ATMOSPHERE_RAY_QUALITY_FAST) {
+        return fast_sky_radiance(viewDir) * atmosphere_horizon_visibility(camera.pos.xyz, viewDir);
+    }
     float horizonVisibility = atmosphere_horizon_visibility(camera.pos.xyz, viewDir);
     if (horizonVisibility <= 1.0e-4) {
         return vec3(0.0);
@@ -585,9 +647,15 @@ vec3 apply_analytical_aerial_perspective(vec3 radiance, vec3 origin, vec3 direct
     if (distanceMeters <= 0.0 || distanceMeters >= 9999.0) {
         return radiance;
     }
-    float viewMu = clamp(normalize(direction).y, -0.15, 1.0);
-    vec2 uv = vec2(clamp(sqrt(clamp(distanceMeters / 100000.0, 0.0, 1.0)), 0.0, 1.0), clamp((viewMu + 0.15) / 1.15, 0.0, 1.0));
-    vec4 aerial = texture(sampler2D(atmosphere_aerial_perspective_lut, atmosphere_sampler), uv);
+    vec3 dirNorm = normalize(direction);
+    float viewMu = clamp(dirNorm.y, -0.15, 1.0);
+    float cosZenith = clamp(dot(dirNorm, vec3(0.0, 1.0, 0.0)), -1.0, 1.0);
+    vec3 planetary = atmosphere_scene_to_planetary(origin);
+    float heightMeters = max(length(planetary) - ATMOSPHERE_PLANET_RADIUS, 0.0);
+    float atmosphereHeight = max(ATMOSPHERE_TOP_RADIUS - ATMOSPHERE_PLANET_RADIUS, 1.0);
+    float depthNormalized = log(1.0 + distanceMeters * 0.001) / log(1.0 + 100.0);
+    vec3 uvw = vec3(cosZenith * 0.5 + 0.5, clamp(heightMeters / atmosphereHeight, 0.0, 1.0), clamp(depthNormalized, 0.0, 1.0));
+    vec4 aerial = texture(sampler3D(atmosphere_aerial_perspective_lut, atmosphere_sampler), uvw);
     float aerialLuminance = dot(aerial.rgb, vec3(0.2126, 0.7152, 0.0722));
     if (aerial.a <= 1.0e-5 && aerialLuminance <= 1.0e-5) {
         return radiance;
@@ -595,20 +663,20 @@ vec3 apply_analytical_aerial_perspective(vec3 radiance, vec3 origin, vec3 direct
     return radiance * clamp(aerial.a, 0.0, 1.0) + max(aerial.rgb, vec3(0.0));
 }
 
-vec3 environment_radiance(vec3 dir) {
+vec3 environment_radiance(vec3 dir, uint quality) {
     if (debug_params.view == 27u) {
         return vec3(DEBUG_WHITE_ENV_RADIANCE);
     }
     if (env_params.enabled != 0u) {
         if (env_params.procedural != 0u) {
-            return atmosphere_sky_radiance(dir) + analytical_sun_disk_radiance(dir);
+            return atmosphere_sky_radiance(dir, quality) + analytical_sun_disk_radiance(dir);
         }
         vec3 localDir = rotate_y(dir, env_params.rotation);
         vec2 uv = env_uv_from_dir(localDir);
         vec3 sampled = texture(sampler2D(env_map, env_sampler), vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0))).rgb;
         return sampled * env_params.intensity + analytical_sun_radiance(dir);
     }
-    return atmosphere_sky_radiance(dir) + analytical_sun_disk_radiance(dir);
+    return atmosphere_sky_radiance(dir, quality) + analytical_sun_disk_radiance(dir);
 }
 
 vec3 debug_display_tonemap(vec3 color) {
@@ -619,6 +687,16 @@ vec3 debug_display_tonemap(vec3 color) {
 
 float environment_pdf(vec3 dir) {
     if (env_params.enabled == 0u || env_params.width == 0u || env_params.height == 0u || env_params.inv_total_lum <= 0.0) {
+        if (env_params.procedural != 0u) {
+            vec3 radiance = atmosphere_sky_radiance(dir, ATMOSPHERE_RAY_QUALITY_FULL);
+            float lum = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+            if (lum <= 1.0e-5) {
+                return 1.0 / (4.0 * PI);
+            }
+            float lat = asin(clamp(normalize(dir).y, -1.0, 1.0));
+            float sinTheta = max(cos(lat), 0.001);
+            return lum / (2.0 * PI * PI * max(sinTheta, 0.001));
+        }
         return 1.0 / (4.0 * PI);
     }
     vec3 localDir = rotate_y(dir, env_params.rotation);
@@ -633,12 +711,35 @@ float environment_pdf(vec3 dir) {
 vec3 sample_environment_direction(inout uint state, out vec3 out_dir, out float out_pdf) {
     out_pdf = 0.0;
     if (env_params.enabled == 0u || env_params.width == 0u || env_params.height == 0u || env_params.inv_total_lum <= 0.0) {
+        if (env_params.procedural != 0u && sky_cdf_cols.length() > 0u) {
+            float u = rand_f32(state);
+            uint totalPixels = SKY_CDF_WIDTH * SKY_CDF_HEIGHT;
+            uint low = 0;
+            uint high = totalPixels - 1u;
+            while (low < high) {
+                uint mid = (low + high) / 2u;
+                if (sky_cdf_cols[mid] < u) {
+                    low = mid + 1u;
+                } else {
+                    high = mid;
+                }
+            }
+            uint x = low % SKY_CDF_WIDTH;
+            uint y = low / SKY_CDF_WIDTH;
+            vec2 uv = (vec2(x, y) + vec2(rand_f32(state), rand_f32(state))) / vec2(SKY_CDF_WIDTH, SKY_CDF_HEIGHT);
+            float phi = (uv.x - 0.5) * 2.0 * PI;
+            float lat = (uv.y - 0.5) * PI;
+            float cosLat = cos(lat);
+            out_dir = vec3(cosLat * cos(phi), sin(lat), cosLat * sin(phi));
+            out_pdf = environment_pdf(out_dir);
+            return atmosphere_sky_radiance(out_dir, ATMOSPHERE_RAY_QUALITY_FULL);
+        }
         float z = 1.0 - 2.0 * rand_f32(state);
         float phi = 2.0 * PI * rand_f32(state);
         float r = sqrt(max(1.0 - z * z, 0.0));
         out_dir = vec3(r * cos(phi), z, r * sin(phi));
         out_pdf = 1.0 / (4.0 * PI);
-        return atmosphere_sky_radiance(out_dir);
+        return atmosphere_sky_radiance(out_dir, ATMOSPHERE_RAY_QUALITY_FULL);
     }
 
     float rowSample = rand_f32(state) * float(env_params.height);
@@ -654,7 +755,7 @@ vec3 sample_environment_direction(inout uint state, out vec3 out_dir, out float 
     vec2 uv = vec2((float(col) + 0.5) / float(env_params.width), (float(row) + 0.5) / float(env_params.height));
     out_dir = rotate_y(env_dir_from_uv(uv), -env_params.rotation);
     if (env_params.procedural != 0u) {
-        vec3 radiance = atmosphere_sky_radiance(out_dir);
+        vec3 radiance = atmosphere_sky_radiance(out_dir, ATMOSPHERE_RAY_QUALITY_FULL);
         out_pdf = environment_pdf(out_dir);
         return radiance;
     }
@@ -669,6 +770,62 @@ float power_heuristic(float pdf_a, float pdf_b) {
     return a2 / max(a2 + b2, 1e-8);
 }
 
+uint decode_light_bvh_node_info(float packed, out uint childCount, out uint childOrLightOffset, out uint lightCount) {
+    uint bits = floatBitsToUint(packed);
+    if ((bits & 0x80000000u) != 0u) {
+        lightCount = (bits >> 16u) & 0x3fffu;
+        childOrLightOffset = bits & 0x7fffu;
+        childCount = 0u;
+        return 1u;
+    }
+    childCount = bits & 0xffffu;
+    childOrLightOffset = (bits >> 16u) & 0xffffu;
+    lightCount = 0u;
+    return 0u;
+}
+
+bool sample_light_bvh(inout uint rng, out uint lightIndex) {
+    if (mesh_params.light_count == 0u) {
+        return false;
+    }
+    uint nodeIndex = 0u;
+    for (uint guard = 0u; guard < 64u; ++guard) {
+        vec4 data0 = light_bvh_nodes[nodeIndex * 2u];
+        vec4 data1 = light_bvh_nodes[nodeIndex * 2u + 1u];
+        float totalPower = data0.w;
+        uint childCount;
+        uint childOrLightOffset;
+        uint lightCount;
+        bool isLeaf = decode_light_bvh_node_info(data1.w, childCount, childOrLightOffset, lightCount) != 0u;
+        if (isLeaf) {
+            if (lightCount == 0u || lightCount > mesh_params.light_count || childOrLightOffset >= mesh_params.light_count) {
+                return false;
+            }
+            if (lightCount == 1u) {
+                lightIndex = childOrLightOffset;
+            } else {
+                uint localIndex = min(uint(rand_f32(rng) * float(lightCount)), lightCount - 1u);
+                lightIndex = min(childOrLightOffset + localIndex, mesh_params.light_count - 1u);
+            }
+            return true;
+        }
+        if (childCount == 0u || childOrLightOffset >= 65535u) {
+            return false;
+        }
+        float r = rand_f32(rng) * totalPower;
+        float cumulativePower = 0.0;
+        for (uint ci = 0u; ci < childCount; ++ci) {
+            float childPower = light_bvh_nodes[(childOrLightOffset + ci) * 2u].w;
+            cumulativePower += childPower;
+            if (r <= cumulativePower) {
+                nodeIndex = childOrLightOffset + ci;
+                break;
+            }
+        }
+    }
+    return false;
+}
+
 float reflectance(float cosine, float ref_idx) {
     float r0 = (1.0 - ref_idx) / (1.0 + ref_idx);
     r0 = r0 * r0;
@@ -679,15 +836,20 @@ float diffuse_pdf(vec3 normal, vec3 wi) {
     return max(dot(normal, wi), 0.0) / PI;
 }
 
+float luminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
 float brdf_luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
-float pbr_specular_sample_probability(Material material) {
+float pbr_specular_sample_probability(Material material, float NdotV) {
     float metallic = clamp(material.metallic, 0.0, 1.0);
     vec3 f0 = mix(vec3(0.04), material.color, metallic);
+    vec3 fresnel = f0 + (vec3(1.0) - f0) * pow(1.0 - max(NdotV, 0.0), 5.0);
     vec3 kd = (vec3(1.0) - f0) * (1.0 - metallic);
-    float specularWeight = max(brdf_luminance(f0), 0.0);
+    float specularWeight = max(brdf_luminance(fresnel), 0.0);
     float diffuseWeight = max(brdf_luminance(kd * material.color * (1.0 / PI)), 0.0);
     return clamp(specularWeight / max(specularWeight + diffuseWeight, 1e-6), 0.05, 0.95);
 }
@@ -729,6 +891,13 @@ float smith_g(float roughness, float n_dot_v, float n_dot_l) {
     return smith_g1(roughness, n_dot_v) * smith_g1(roughness, n_dot_l);
 }
 
+float ggx_directional_albedo(float roughness, float n_dot_v) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float mu = clamp(n_dot_v, 0.0, 1.0);
+    return (mu * (1.0 + a2)) / (mu * (1.0 + a2) + a * (1.0 - mu));
+}
+
 vec3 ggx_energy_compensation(vec3 f0, float roughness, float n_dot_v) {
     float r = clamp(roughness, 0.02, 1.0);
     float r2 = r * r;
@@ -736,6 +905,16 @@ vec3 ggx_energy_compensation(vec3 f0, float roughness, float n_dot_v) {
     vec3 averageFresnel = f0 + (vec3(1.0) - f0) * (1.0 / 21.0);
     vec3 multiScatter = averageFresnel * (1.0 - singleScatterEnergy) / max(singleScatterEnergy, 1e-4);
     return vec3(1.0) + multiScatter;
+}
+
+vec3 heitz_ms_ggx(vec3 f0, float roughness, float n_dot_v, float n_dot_l) {
+    float a = roughness * roughness;
+    float E_v = ggx_directional_albedo(roughness, n_dot_v);
+    float E_l = ggx_directional_albedo(roughness, n_dot_l);
+    float E_avg = clamp(1.0 / (1.0 + a * 0.66), 0.0, 1.0);
+    vec3 f_avg = f0 + (vec3(1.0) - f0) / 21.0;
+    vec3 f_ms = f_avg * f_avg / max(vec3(1.0) - f_avg * (1.0 - E_avg), vec3(1e-4));
+    return f_ms * (1.0 - E_v) * (1.0 - E_l) / max(PI * E_v * E_l, 1e-8);
 }
 
 vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
@@ -755,7 +934,9 @@ vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     vec3 f = schlick_fresnel(f0, v_dot_h);
     float d = ggx_ndf(material.roughness, n_dot_h);
     float g = smith_g(material.roughness, n_dot_v, n_dot_l);
-    vec3 specular = f * d * g * ggx_energy_compensation(f0, material.roughness, n_dot_v) / max(4.0 * n_dot_v * n_dot_l, 1e-10);
+    vec3 specular = f * d * g / max(4.0 * n_dot_v * n_dot_l, 1e-10);
+    vec3 msCompensation = heitz_ms_ggx(f0, material.roughness, n_dot_v, n_dot_l);
+    specular += f * msCompensation;
     vec3 kd = mix(vec3(1.0) - f, vec3(0.0), clamp(material.metallic, 0.0, 1.0));
     vec3 diffuse = kd * material.color * (1.0 / PI);
     return diffuse + specular;
@@ -779,7 +960,8 @@ float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
 }
 
 float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
-    float specularProbability = pbr_specular_sample_probability(material);
+    float NdotV = max(dot(n, wo), 0.0);
+    float specularProbability = pbr_specular_sample_probability(material, NdotV);
     float diffuseProbability = 1.0 - specularProbability;
     return diffuseProbability * diffuse_pdf(n, wi) + specularProbability * pdf_ggx_brdf(material, wo, wi, n);
 }
@@ -800,28 +982,63 @@ vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n) {
 }
 
 vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
-    if (material.mat_type == 0u) {
-        return material.color * (1.0 / PI);
+    MaterialClosure c = material_to_closure(material);
+    vec3 result = vec3(0.0);
+
+    float NdotL = max(dot(n, wi), 0.0);
+
+    if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_DIFFUSE)) {
+        result += c.weight * c.color * (1.0 / PI);
     }
-    if (material.mat_type == 3u || material.mat_type == 4u) {
-        return eval_ggx_brdf(material, wo, wi, n);
+    if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SSS)) {
+        float sssRadius = max(c.ior, 0.01);
+        float wrap = NdotL * 0.5 + 0.5;
+        result += c.weight * c.color * (sssRadius / PI) * wrap;
     }
-    return vec3(0.0);
+    if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SHEEN)) {
+        vec3 H = normalize(wo + wi);
+        float NdotH = max(dot(n, H), 0.0);
+        float invAlpha = 1.0 / max(c.roughness * c.roughness, 0.001);
+        float sin2Theta = 1.0 - NdotH * NdotH;
+        float Dcharlie = (2.0 + invAlpha) * pow(max(sin2Theta, 0.0), invAlpha * 0.5) / (2.0 * PI);
+        float NdotV = max(dot(n, wo), 0.0);
+        float V = 1.0 / (4.0 * max(NdotV, 0.01) * max(NdotL, 0.01));
+        result += c.weight * c.color * Dcharlie * V * NdotL;
+    }
+    if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
+        vec3 spec = eval_ggx_brdf(material, wo, wi, n);
+        if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_THIN_FILM)) {
+            float NdotV = max(dot(n, wo), 0.0);
+            float cosTheta = max(dot(reflect(-wo, n), wi), 0.0);
+            float filmThickness = c.ior * 1e-6;
+            float opd = 2.0 * c.ior * filmThickness * sqrt(1.0 - (1.0 - cosTheta * cosTheta) / (c.ior * c.ior));
+            vec3 phase = 2.0 * PI * opd / vec3(650.0, 510.0, 475.0);
+            vec3 iridescence = 0.5 + 0.5 * cos(phase);
+            spec *= iridescence;
+        }
+        result += c.weight * spec;
+    }
+    return result;
 }
 
 float pdf_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
-    if (material.mat_type == 0u) {
-        return diffuse_pdf(n, wi);
-    }
-    if (material.mat_type == 3u || material.mat_type == 4u) {
+    MaterialClosure c = material_to_closure(material);
+    if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
         return pdf_pbr_brdf(material, wo, wi, n);
+    }
+    if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_DIFFUSE) ||
+        closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SSS) ||
+        closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SHEEN)) {
+        return diffuse_pdf(n, wi);
     }
     return 0.0;
 }
 
 vec3 sample_brdf(inout uint state, Material material, vec3 wo, vec3 n, out float pdf) {
-    if (material.mat_type == 3u || material.mat_type == 4u) {
-        float specularProbability = pbr_specular_sample_probability(material);
+    MaterialClosure c = material_to_closure(material);
+    if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
+        float NdotV_sample = max(dot(n, wo), 0.0);
+        float specularProbability = pbr_specular_sample_probability(material, NdotV_sample);
         vec3 wi;
         if (rand_f32(state) < specularProbability) {
             wi = sample_ggx_brdf(state, material, wo, n);

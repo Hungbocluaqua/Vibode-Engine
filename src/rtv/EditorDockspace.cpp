@@ -108,25 +108,25 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
     }
 
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open glTF")) {
+        if (ImGui::MenuItem("Open glTF\tCtrl+O")) {
             visibility.assetBrowser = true;
             if (auto path = openGltfFileDialog()) {
                 requests.loadGltf = *path;
             }
         }
-        if (ImGui::MenuItem("Open HDR")) {
+        if (ImGui::MenuItem("Open HDR\tCtrl+H")) {
             visibility.assetBrowser = true;
             if (auto path = openHdrFileDialog()) {
                 requests.loadHdr = *path;
             }
         }
-        if (ImGui::MenuItem("Open Level")) {
+        if (ImGui::MenuItem("Open Level\tCtrl+L")) {
             visibility.assetBrowser = true;
             if (auto path = openSceneJsonFileDialog()) {
                 requests.loadSceneJson = *path;
             }
         }
-        if (ImGui::MenuItem("Save Level")) {
+        if (ImGui::MenuItem("Save Level\tCtrl+S")) {
             visibility.assetBrowser = true;
             if (auto path = saveSceneJsonFileDialog()) {
                 requests.saveSceneJson = *path;
@@ -138,7 +138,7 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
             requests.saveLayout = true;
             saveLayout();
         }
-        if (ImGui::MenuItem("Reload Shaders")) {
+        if (ImGui::MenuItem("Reload Shaders\tCtrl+R")) {
             requests.reloadShaders = true;
             requests.resetAccumulation = AccumulationResetReason::ShaderReloaded;
         }
@@ -146,7 +146,7 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
             requests.resetLayout = true;
             requestResetLayout();
         }
-        if (ImGui::MenuItem("Exit")) {
+        if (ImGui::MenuItem("Exit\tAlt+F4")) {
             requests.exit = true;
         }
         ImGui::EndMenu();
@@ -170,6 +170,8 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
         ImGui::MenuItem("Material Editor", nullptr, &visibility.materialEditor);
         ImGui::MenuItem("Render Settings", nullptr, &visibility.renderSettings);
         ImGui::MenuItem("Debug / Profiler", nullptr, &visibility.debugProfiler);
+        ImGui::MenuItem("Scene Stats", nullptr, &visibility.sceneStats);
+        ImGui::MenuItem("GPU Diagnostics", nullptr, &visibility.gpuDiagnostics);
         if (ImGui::MenuItem("Reset Dock Layout")) {
             requests.resetLayout = true;
             requestResetLayout();
@@ -187,16 +189,8 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
         if (ImGui::MenuItem("Cycle Debug View\tF1")) {
             requests.toggleDebugView = true;
         }
-        ImGui::EndMenu();
-    }
-
-    if (ImGui::BeginMenu("Help")) {
-        if (ImGui::MenuItem("Show controls")) {
-            showControls_ = true;
-        }
-        if (ImGui::MenuItem("Show renderer info")) {
-            showRendererInfo_ = true;
-            visibility.debugProfiler = true;
+        if (ImGui::MenuItem("Cycle Intermediate Views\tF7")) {
+            requests.cycleIntermediateView = true;
         }
         ImGui::EndMenu();
     }

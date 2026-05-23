@@ -44,6 +44,15 @@ struct MaterialAsset {
     uint32_t shaderCompatibilityMask = 1u;
 };
 
+constexpr uint32_t kMaterialClosureFlagDiffuse      = 1u << 0u;
+constexpr uint32_t kMaterialClosureFlagSpecular     = 1u << 1u;
+constexpr uint32_t kMaterialClosureFlagSss          = 1u << 2u;
+constexpr uint32_t kMaterialClosureFlagTransmission = 1u << 3u;
+constexpr uint32_t kMaterialClosureFlagClearcoat    = 1u << 4u;
+constexpr uint32_t kMaterialClosureFlagSheen        = 1u << 5u;
+constexpr uint32_t kMaterialClosureFlagThinFilm     = 1u << 6u;
+constexpr uint32_t kMaterialClosureFlagMetal        = 1u << 7u;
+
 struct MeshPrimitiveAsset {
     uint32_t firstIndex = 0;
     uint32_t indexCount = 0;

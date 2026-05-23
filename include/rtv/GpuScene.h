@@ -178,6 +178,7 @@ public:
     [[nodiscard]] Buffer& envCols() { return *envCols_; }
     [[nodiscard]] Buffer& meshParamsBuffer() { return *meshParamsBuffer_; }
     [[nodiscard]] Buffer& envParamsBuffer() { return *envParamsBuffer_; }
+    [[nodiscard]] Buffer& lightBvhNodes() { return *lightBvhNodes_; }
     [[nodiscard]] Image& environmentImage() { return *environmentImage_; }
     [[nodiscard]] const Buffer& meshRecords() const { return *meshRecords_; }
     [[nodiscard]] const Buffer& primitiveRecords() const { return *primitiveRecords_; }
@@ -192,8 +193,11 @@ public:
     [[nodiscard]] const Buffer& tlasInstanceIndices() const { return *tlasInstanceIndices_; }
     [[nodiscard]] VkSampler environmentSampler() const { return environmentSampler_; }
     [[nodiscard]] const std::vector<VkDescriptorImageInfo>& materialTextureDescriptors() const { return materialTextureTable_.descriptors(); }
-    [[nodiscard]] const std::vector<VkDescriptorImageInfo>& materialSamplerDescriptors() const { return materialSamplerDescriptors_; }
+    [[nodiscard]] std::vector<VkDescriptorImageInfo> materialCombinedDescriptors() const;
     [[nodiscard]] VkSampler materialSampler() const { return materialSampler_; }
+    [[nodiscard]] const BindlessTextureTable& materialTextureTable() const { return materialTextureTable_; }
+    [[nodiscard]] VkImageView materialTextureImageView(uint32_t index) const { return materialTextureTable_.imageView(index); }
+    [[nodiscard]] uint32_t materialTextureCount() const { return materialTextureTable_.residentCount(); }
 
     [[nodiscard]] const MeshParamsUniform& meshParams() const { return meshParams_; }
     [[nodiscard]] const EnvParamsUniform& envParams() const { return envParams_; }
@@ -216,6 +220,7 @@ private:
     void createEnvironment(BufferUploader& uploader);
     void uploadEnvironmentParams();
     void uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight);
+    void uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords);
     void destroyMaterialTextureSamplers();
     void rebuildMaterialSamplerDescriptors(uint32_t slotCount);
 
@@ -244,12 +249,12 @@ private:
     std::unique_ptr<Buffer> envCols_;
     std::unique_ptr<Buffer> meshParamsBuffer_;
     std::unique_ptr<Buffer> envParamsBuffer_;
+    std::unique_ptr<Buffer> lightBvhNodes_;
     std::unique_ptr<Image> environmentImage_;
     BindlessTextureTable materialTextureTable_;
     VkSampler environmentSampler_ = VK_NULL_HANDLE;
     VkSampler materialSampler_ = VK_NULL_HANDLE;
     std::vector<VkSampler> materialTextureSamplers_;
-    std::vector<VkDescriptorImageInfo> materialSamplerDescriptors_;
     MeshParamsUniform meshParams_{};
     EnvParamsUniform envParams_{};
     std::vector<RayTracingMeshBuildInput> rayTracingMeshes_;

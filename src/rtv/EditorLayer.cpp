@@ -4,6 +4,8 @@ namespace rtv {
 
 EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     EditorRequests requests;
+    state.editorPrefs = &editorPrefs_;
+    state.cameraBookmarks = &cameraBookmarks_;
     if (state.sceneDocument != nullptr && state.sceneDocument->sourceGltfPath().has_value()) {
         dockspace_.setProfilePath(*state.sceneDocument->sourceGltfPath());
     } else if (state.gltfPath != nullptr && state.gltfPath->has_value()) {
@@ -31,6 +33,12 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     }
     if (visibility_.debugProfiler) {
         debugProfilerPanel_.draw(state, requests);
+    }
+    if (visibility_.sceneStats) {
+        sceneStatsPanel_.draw(state);
+    }
+    if (visibility_.gpuDiagnostics) {
+        gpuDiagnosticsPanel_.draw(state);
     }
 
     dockspace_.end();

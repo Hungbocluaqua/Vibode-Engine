@@ -9,9 +9,12 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <string>
 
 namespace rtv {
+
+std::array<char, 256> SceneHierarchyPanel::renameBuffer_{};
 
 namespace {
 
@@ -186,6 +189,16 @@ bool SceneHierarchyPanel::entityContainsFilter(const SceneRegistry& registry, co
     return false;
 }
 
+void recurseFlatten(SceneRegistry& registry, const Entity& entity, std::vector<EntityId>& out) {
+    out.push_back(entity.id);
+    for (EntityId childId : entity.children) {
+        const Entity* child = registry.entity(childId);
+        if (child != nullptr) {
+            recurseFlatten(registry, *child, out);
+        }
+    }
+}
+
 void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity, EditorSelection& selection, EditorRequests& requests, const std::string& filter) {
     if (!entityContainsFilter(registry, entity, filter)) {
         return;
@@ -209,6 +222,30 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
     label += entity.name.empty() ? "Entity" : entity.name;
     label += "##entity" + std::to_string(entity.id.index) + "_" + std::to_string(entity.id.generation);
 
+    if (renameTarget_.has_value() && *renameTarget_ == entity.id) {
+        ImGui::SetKeyboardFocusHere();
+        const size_t len = std::min(entity.name.size(), renameBuffer_.size() - 1);
+        std::memcpy(renameBuffer_.data(), entity.name.c_str(), len);
+        renameBuffer_[len] = '\0';
+        ImGui::PushItemWidth(-1.0f);
+        const bool confirm = ImGui::InputText("##renameInput", renameBuffer_.data(), renameBuffer_.size(),
+            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+        ImGui::PopItemWidth();
+        const bool loseFocus = ImGui::IsItemDeactivated();
+        if (confirm || loseFocus) {
+            std::string newName(renameBuffer_.data());
+            if (!newName.empty()) {
+                entity.name = newName;
+                requests.sceneUpdate = SceneUpdateKind::TransformOnly;
+            }
+            renameTarget_.reset();
+            renameBuffer_.fill('\0');
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            renameTarget_.reset();
+            renameBuffer_.fill('\0');
+        }
+    }
+
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
     if (entity.children.empty()) {
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
@@ -226,8 +263,8 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
         ImGui::SetTooltip("%s", locked ? "Locked" : "Unlocked");
     }
     ImGui::SameLine();
-    if (entity.meshRenderer.has_value()) {
-        bool visible = entity.meshRenderer->visible;
+    {
+        bool visible = entity.visible;
         ImGui::BeginDisabled(entity.locked);
         if (ImGui::Checkbox("##visible", &visible)) {
             requests.setEntityVisibility = EditorEntityBoolChange{.entity = entity.id, .value = visible};
@@ -240,13 +277,65 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
     }
     ImGui::PopID();
     const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+    if (!entity.locked) {
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+            ImGui::SetDragDropPayload("ENTITY", &entity.id, sizeof(entity.id));
+            ImGui::Text("Reparent %s", entity.name.empty() ? "Entity" : entity.name.c_str());
+            ImGui::EndDragDropSource();
+        }
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::AcceptDragDropPayload("ENTITY")) {
+                const EntityId sourceId = *static_cast<const EntityId*>(payload->Data);
+                if (sourceId.valid() && sourceId != entity.id) {
+                    EntityId ancestor = entity.id;
+                    bool valid = true;
+                    while (ancestor.valid()) {
+                        if (ancestor == sourceId) { valid = false; break; }
+                        const Entity* anc = registry.entity(ancestor);
+                        ancestor = anc ? anc->parent : EntityId{};
+                    }
+                    if (valid) {
+                        requests.reparentEntity = std::make_pair(sourceId, entity.id);
+                        requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                    }
+                }
+            }
+            if (const auto* payload = ImGui::AcceptDragDropPayload("MATERIAL")) {
+                const uint32_t materialId = *static_cast<const uint32_t*>(payload->Data);
+                if (entity.meshRenderer.has_value() && materialId < UINT32_MAX) {
+                    requests.materialAssignment = EditorMaterialAssignment{
+                        .mesh = entity.meshRenderer->mesh,
+                        .primitiveIndex = UINT32_MAX,
+                        .material = MaterialAssetHandle{materialId},
+                    };
+                    requests.sceneUpdate = SceneUpdateKind::MaterialOnly;
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+    }
     if (!entity.locked && ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-        selection.selectEntity(entity.id);
+        if (ImGui::GetIO().KeyCtrl) {
+            selection.toggleEntity(entity.id);
+        } else if (ImGui::GetIO().KeyShift && selection.lastClickedId().valid()) {
+            std::vector<EntityId> flattened;
+            for (Entity* root : registry.entities()) {
+                if (!root->parent.valid()) {
+                    recurseFlatten(registry, *root, flattened);
+                }
+            }
+            selection.selectRangeFromFlattenedList(flattened, entity.id);
+        } else {
+            selection.selectEntity(entity.id);
+        }
     }
     if (ImGui::BeginPopupContextItem()) {
         if (ImGui::MenuItem("Duplicate")) {
             requests.duplicateEntity = entity.id;
             requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+        }
+        if (ImGui::MenuItem("Rename")) {
+            renameTarget_ = entity.id;
         }
         if (ImGui::MenuItem("Delete")) {
             requests.deleteEntity = entity.id;

@@ -57,10 +57,6 @@ glm::vec3 vec3FromJson(const nlohmann::json& json, glm::vec3 fallback = glm::vec
     };
 }
 
-uint64_t stableEntityKey(EntityId id) {
-    return (static_cast<uint64_t>(id.generation) << 32u) | id.index;
-}
-
 } // namespace
 
 void SceneDocument::setEnvironment(Environment environment) {
@@ -107,6 +103,14 @@ void SceneDocument::clearDirty() {
     dirty_ = false;
     pendingUpdate_ = SceneUpdateKind::None;
     registry_.clearDirty();
+}
+
+void SceneDocument::setBookmarksJson(const nlohmann::json& json) {
+    bookmarksJson_ = json;
+}
+
+void SceneDocument::clearBookmarksJson() {
+    bookmarksJson_.reset();
 }
 
 SceneUpdateKind SceneDocument::pendingUpdate() const {
@@ -226,7 +230,7 @@ SceneAsset SceneDocument::toSceneAsset() const {
                 }
             }
         }
-        nodeIndexForEntity.emplace((static_cast<uint64_t>(entity->id.generation) << 32u) | entity->id.index, static_cast<uint32_t>(scene.nodes.size()));
+        nodeIndexForEntity.emplace(entity->uuid, static_cast<uint32_t>(scene.nodes.size()));
         scene.nodes.push_back(node);
     }
 
@@ -234,14 +238,16 @@ SceneAsset SceneDocument::toSceneAsset() const {
         const Entity* entity = entities[i];
         SceneNodeAsset& node = scene.nodes[i];
         if (entity->parent.valid()) {
-            const uint64_t key = (static_cast<uint64_t>(entity->parent.generation) << 32u) | entity->parent.index;
+            const Entity* parentEntity = registry_.entity(entity->parent);
+            const uint64_t key = parentEntity != nullptr ? parentEntity->uuid : 0u;
             const auto it = nodeIndexForEntity.find(key);
             if (it != nodeIndexForEntity.end()) {
                 node.parent = static_cast<int32_t>(it->second);
             }
         }
         for (EntityId child : entity->children) {
-            const uint64_t key = (static_cast<uint64_t>(child.generation) << 32u) | child.index;
+            const Entity* childEntity = registry_.entity(child);
+            const uint64_t key = childEntity != nullptr ? childEntity->uuid : 0u;
             const auto it = nodeIndexForEntity.find(key);
             if (it != nodeIndexForEntity.end()) {
                 node.children.push_back(it->second);
@@ -279,7 +285,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
     root["version"] = 1;
     root["sourceGltf"] = sourceGltfPath_.has_value() ? sourceGltfPath_->string() : "";
     root["sourceHdr"] = sourceHdrPath_.has_value() ? sourceHdrPath_->string() : "";
-    root["activeCamera"] = activeCamera_.valid() ? stableEntityKey(activeCamera_) : 0u;
+    root["activeCamera"] = activeCamera_.valid() ? (registry_.entity(activeCamera_) != nullptr ? registry_.entity(activeCamera_)->uuid : 0u) : 0u;
     root["environment"] = {
         {"hdrPath", environment_.hdrPath.string()},
         {"intensity", environment_.intensity},
@@ -327,6 +333,11 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"accumulationLimit", renderSettings_.accumulationLimit},
         {"resolutionScale", renderSettings_.resolutionScale},
         {"requestedBackend", static_cast<uint32_t>(renderSettings_.requestedBackend)},
+        {"usePhysicalCamera", renderSettings_.usePhysicalCamera},
+        {"physicalAperture", renderSettings_.physicalAperture},
+        {"physicalShutterSeconds", renderSettings_.physicalShutterSeconds},
+        {"physicalIso", renderSettings_.physicalIso},
+        {"physicalExposureCompensation", renderSettings_.physicalExposureCompensation},
     };
 
     root["entities"] = nlohmann::json::array();
@@ -334,11 +345,14 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
     for (const Entity* entityPtr : entities) {
         const Entity& entity = *entityPtr;
         nlohmann::json item;
-        item["id"] = {{"index", entity.id.index}, {"generation", entity.id.generation}, {"stable", stableEntityKey(entity.id)}};
-        item["parent"] = entity.parent.valid() ? stableEntityKey(entity.parent) : 0u;
+        item["id"] = {{"index", entity.id.index}, {"generation", entity.id.generation}, {"uuid", entity.uuid}};
+        item["parent"] = entity.parent.valid() ? (registry_.entity(entity.parent) != nullptr ? registry_.entity(entity.parent)->uuid : 0u) : 0u;
         item["children"] = nlohmann::json::array();
         for (EntityId child : entity.children) {
-            item["children"].push_back(stableEntityKey(child));
+            const Entity* childEntity = registry_.entity(child);
+            if (childEntity != nullptr) {
+                item["children"].push_back(childEntity->uuid);
+            }
         }
         item["name"] = entity.name;
         item["locked"] = entity.locked;
@@ -386,6 +400,9 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
             };
         }
         root["entities"].push_back(std::move(item));
+    }
+    if (bookmarksJson_.has_value()) {
+        root["bookmarks"] = *bookmarksJson_;
     }
     out << std::setw(2) << root << '\n';
     return true;
@@ -463,6 +480,11 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.accumulationLimit = render.value("accumulationLimit", renderSettings_.accumulationLimit);
         renderSettings_.resolutionScale = render.value("resolutionScale", renderSettings_.resolutionScale);
         renderSettings_.requestedBackend = static_cast<RendererBackend>(render.value("requestedBackend", static_cast<uint32_t>(renderSettings_.requestedBackend)));
+        renderSettings_.usePhysicalCamera = render.value("usePhysicalCamera", renderSettings_.usePhysicalCamera);
+        renderSettings_.physicalAperture = render.value("physicalAperture", renderSettings_.physicalAperture);
+        renderSettings_.physicalShutterSeconds = render.value("physicalShutterSeconds", renderSettings_.physicalShutterSeconds);
+        renderSettings_.physicalIso = render.value("physicalIso", renderSettings_.physicalIso);
+        renderSettings_.physicalExposureCompensation = render.value("physicalExposureCompensation", renderSettings_.physicalExposureCompensation);
     }
 
     registry_ = SceneRegistry{};
@@ -471,6 +493,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     activeCamera_ = {};
 
     std::unordered_map<uint64_t, EntityId> idMap;
+    uint64_t maxUuid = 0;
     std::vector<std::pair<EntityId, uint64_t>> pendingParents;
     for (const nlohmann::json& item : root.value("entities", nlohmann::json::array())) {
         const EntityId id = registry_.createEntity(item.value("name", std::string{"Entity"}));
@@ -478,7 +501,9 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         if (entity == nullptr) {
             continue;
         }
-        const uint64_t stable = item.contains("id") ? item["id"].value("stable", stableEntityKey(id)) : stableEntityKey(id);
+        const uint64_t stable = item.contains("id") ? item["id"].value("uuid", entity->uuid) : entity->uuid;
+        entity->uuid = stable;
+        maxUuid = std::max(maxUuid, stable);
         idMap.emplace(stable, id);
         pendingParents.push_back({id, item.value("parent", uint64_t{0})});
         entity->locked = item.value("locked", false);
@@ -539,6 +564,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         }
     }
 
+    registry_.ensureUuidCounter(maxUuid);
+
     for (const auto& [child, parentStable] : pendingParents) {
         if (parentStable == 0u) {
             continue;
@@ -572,6 +599,11 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     sceneMeshes_.erase(std::unique(sceneMeshes_.begin(), sceneMeshes_.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index == b.index; }), sceneMeshes_.end());
     std::sort(sceneMaterials_.begin(), sceneMaterials_.end(), [](MaterialAssetHandle a, MaterialAssetHandle b) { return a.index < b.index; });
     sceneMaterials_.erase(std::unique(sceneMaterials_.begin(), sceneMaterials_.end(), [](MaterialAssetHandle a, MaterialAssetHandle b) { return a.index == b.index; }), sceneMaterials_.end());
+    if (root.contains("bookmarks") && root["bookmarks"].is_array()) {
+        bookmarksJson_ = root["bookmarks"];
+    } else {
+        bookmarksJson_.reset();
+    }
     markDirty(SceneUpdateKind::TopologyChanged);
     return true;
 }

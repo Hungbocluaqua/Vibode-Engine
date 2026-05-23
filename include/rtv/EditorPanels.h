@@ -20,6 +20,8 @@ namespace rtv {
 
 class AssetManager;
 class CameraController;
+class CameraBookmarkManager;
+struct EditorPreferences;
 
 struct EditorPanelVisibility {
     bool viewport = true;
@@ -29,6 +31,8 @@ struct EditorPanelVisibility {
     bool materialEditor = true;
     bool renderSettings = true;
     bool debugProfiler = true;
+    bool sceneStats = false;
+    bool gpuDiagnostics = false;
 };
 
 struct EditorViewportState {
@@ -55,6 +59,8 @@ struct EditorRuntimeState {
     const std::vector<EntityId>* instanceEntities = nullptr;
     const std::string* sceneLoadingStatus = nullptr;
     const CameraController* camera = nullptr;
+    EditorPreferences* editorPrefs = nullptr;
+    CameraBookmarkManager* cameraBookmarks = nullptr;
     VkExtent2D swapchainExtent{};
     float cpuFrameMs = 0.0f;
     EditorViewportState viewport{};
@@ -76,6 +82,12 @@ struct EditorEntityBoolChange {
     bool value = false;
 };
 
+struct EditorEntityTransformChange {
+    EntityId entity{};
+    Transform oldTransform{};
+    Transform newTransform{};
+};
+
 struct EditorRequests {
     std::optional<RendererSettings> settings;
     std::optional<AccumulationResetReason> resetAccumulation;
@@ -90,8 +102,10 @@ struct EditorRequests {
     std::optional<EntityId> duplicateEntity;
     std::optional<EntityId> deleteEntity;
     std::optional<EntityId> focusOnEntity;
+    std::optional<std::pair<EntityId, EntityId>> reparentEntity; // child, newParent
     std::optional<EditorEntityBoolChange> setEntityVisibility;
     std::optional<EditorEntityBoolChange> setEntityLocked;
+    std::optional<EditorEntityTransformChange> setEntityTransform;
     bool resetCamera = false;
     bool reloadShaders = false;
     bool undo = false;
@@ -100,7 +114,12 @@ struct EditorRequests {
     bool saveLayout = false;
     bool toggleDenoiser = false;
     bool toggleDebugView = false;
+    bool cycleIntermediateView = false;
     bool exit = false;
+    std::optional<std::string> saveCameraBookmark;
+    std::optional<size_t> loadCameraBookmarkIndex;
+    std::optional<size_t> deleteCameraBookmarkIndex;
+    std::optional<std::string> removeFavorite;
 };
 
 [[nodiscard]] const std::array<RendererDebugView, 38>& editorDebugViews();

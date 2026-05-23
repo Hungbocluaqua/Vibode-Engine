@@ -1,0 +1,12 @@
+{
+  "cameraFastMoveSpeed": 7.5,
+  "cameraMoveSpeed": 2.4000000953674316,
+  "confirmDelete": true,
+  "favoriteFiles": [],
+  "gridVisible": true,
+  "hudScale": 1.0,
+  "recentFiles": [
+    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Sponza\\glTF\\Sponza.gltf"
+  ],
+  "showHud": true
+}

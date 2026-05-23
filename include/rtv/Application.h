@@ -98,6 +98,9 @@ private:
     std::optional<RestirMode> restirModeOverride_;
     bool debugViewOverride_ = false;
     bool validationCameraMotion_ = false;
+    bool pendingOpenLevel_ = false;
+    bool pendingSaveLevel_ = false;
+    bool pendingReloadShaders_ = false;
     AssetManager assets_;
     CameraController cameraController_;
     std::array<unsigned char, 512> keyState_{};

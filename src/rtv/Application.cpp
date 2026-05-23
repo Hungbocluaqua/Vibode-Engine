@@ -2,6 +2,7 @@
 
 #include "rtv/CommandSystem.h"
 #include "rtv/BufferUploader.h"
+#include "rtv/FileDialog.h"
 #include "rtv/GltfLoader.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/PipelineDemo.h"
@@ -287,6 +288,9 @@ Application::~Application() {
         commandSystem_->waitIdle();
     }
 
+    if (uiOverlay_) {
+        uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+    }
     commandSystem_.reset();
     uiOverlay_.reset();
     pathTracer_.reset();
@@ -403,8 +407,12 @@ void Application::initVulkan() {
     applyActiveSceneCamera();
     sceneDocument_.clearDirty();
     uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_);
+    if (loadedSceneDocument) {
+        uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
+    }
     commandSystem_->setPathTracer(pathTracer_.get());
     commandSystem_->setUiOverlay(uiOverlay_.get());
+    uiOverlay_->editor().editorPrefs().load(EditorPreferences::defaultPath());
 }
 
 void Application::mainLoop(uint32_t maxFrames) {
@@ -425,6 +433,28 @@ void Application::mainLoop(uint32_t maxFrames) {
         applyValidationCameraMotion(frameCount);
         notifications_.update(deltaSeconds);
         EditorRequests editorRequests;
+        if (pendingOpenLevel_) {
+            pendingOpenLevel_ = false;
+            if (auto path = openSceneJsonFileDialog()) {
+                editorRequests.loadSceneJson = *path;
+                editorRequests.resetAccumulation = AccumulationResetReason::SceneChanged;
+            }
+        }
+        if (pendingSaveLevel_) {
+            pendingSaveLevel_ = false;
+            if (auto path = saveSceneJsonFileDialog()) {
+                editorRequests.saveSceneJson = *path;
+            }
+        }
+        if (pendingReloadShaders_) {
+            pendingReloadShaders_ = false;
+            editorRequests.reloadShaders = true;
+            editorRequests.resetAccumulation = AccumulationResetReason::ShaderReloaded;
+        }
+        if (pathTracer_ && pathTracer_->shadersNeedReload()) {
+            editorRequests.reloadShaders = true;
+            editorRequests.resetAccumulation = AccumulationResetReason::ShaderReloaded;
+        }
         if (uiOverlay_ && pathTracer_) {
             editorRequests = uiOverlay_->build(
                 *pathTracer_,
@@ -618,6 +648,9 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
     }
 
     sceneLoadingStatus_ = "Loaded glTF: " + result.path.string();
+    if (uiOverlay_) {
+        uiOverlay_->editor().editorPrefs().addRecentFile(result.path);
+    }
     notifications_.notify("Scene loaded", NotificationType::Success);
     std::cout << "Reloaded glTF: " << result.path.string()
               << " meshes=" << importedScene_->meshes.size()
@@ -651,9 +684,23 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             settings.denoiserEnabled = !settings.denoiserEnabled;
             pathTracer_->applySettings(settings);
         }
-        if (requests.toggleDebugView) {
+        if (requests.cycleIntermediateView) {
             RendererSettings settings = pathTracer_->settings();
-            settings.debugView = nextDebugView(settings.debugView);
+            static const RendererDebugView intermediateViews[] = {
+                RendererDebugView::Beauty,
+                RendererDebugView::DirectLighting,
+                RendererDebugView::IndirectLighting,
+                RendererDebugView::Variance,
+                RendererDebugView::Normals,
+                RendererDebugView::Depth,
+                RendererDebugView::MotionVectors,
+            };
+            constexpr int count = sizeof(intermediateViews) / sizeof(intermediateViews[0]);
+            int idx = 0;
+            for (int i = 0; i < count; ++i) {
+                if (intermediateViews[i] == settings.debugView) { idx = (i + 1) % count; break; }
+            }
+            settings.debugView = intermediateViews[idx];
             pathTracer_->applySettings(settings);
         }
         if (requests.resetAccumulation.has_value()) {
@@ -678,6 +725,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         try {
             pathTracer_->loadEnvironment(*requests.loadHdr);
             hdrPath_ = *requests.loadHdr;
+            uiOverlay_->editor().editorPrefs().addRecentFile(*requests.loadHdr);
             sceneDocument_.setSourceHdrPath(hdrPath_);
             RendererSettings settings = pathTracer_->settings();
             settings.environmentEnabled = true;
@@ -689,6 +737,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     }
 
     if (requests.saveSceneJson.has_value()) {
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->editor().cameraBookmarks().serialize(sceneDocument_);
+        }
         if (sceneDocument_.saveJson(*requests.saveSceneJson)) {
             std::cout << "Saved scene JSON: " << requests.saveSceneJson->string() << '\n';
         } else {
@@ -698,6 +749,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
 
     if (requests.loadSceneJson.has_value()) {
         if (sceneDocument_.loadJson(*requests.loadSceneJson)) {
+            if (uiOverlay_ != nullptr) {
+                uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
+            }
             gltfPath_ = sceneDocument_.sourceGltfPath();
             hdrPath_ = sceneDocument_.sourceHdrPath();
             if (gltfPath_.has_value() && std::filesystem::exists(*gltfPath_)) {
@@ -750,12 +804,24 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         (void)sceneOps.deleteEntity(*requests.deleteEntity);
     }
 
+    if (requests.reparentEntity.has_value()) {
+        const auto [child, newParent] = *requests.reparentEntity;
+        (void)sceneOps.reparentEntity(child, newParent);
+    }
+
     if (requests.setEntityVisibility.has_value()) {
         (void)sceneOps.setVisibility(requests.setEntityVisibility->entity, requests.setEntityVisibility->value);
     }
 
     if (requests.setEntityLocked.has_value()) {
         (void)sceneOps.setLocked(requests.setEntityLocked->entity, requests.setEntityLocked->value);
+    }
+
+    if (requests.setEntityTransform.has_value()) {
+        sceneOps.setTransformGizmoDrag(
+            requests.setEntityTransform->entity,
+            requests.setEntityTransform->oldTransform,
+            requests.setEntityTransform->newTransform);
     }
 
     if (requests.focusOnEntity.has_value()) {
@@ -768,6 +834,27 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 cameraController_.setPose(position, glm::normalize(direction), *pathTracer_);
             }
         }
+    }
+
+    if (requests.saveCameraBookmark.has_value()) {
+        uiOverlay_->editor().cameraBookmarks().saveBookmark(
+            cameraController_, *requests.saveCameraBookmark, &pathTracer_->settings());
+    }
+    if (requests.loadCameraBookmarkIndex.has_value()) {
+        const auto& bookmarks = uiOverlay_->editor().cameraBookmarks().bookmarks();
+        const size_t index = *requests.loadCameraBookmarkIndex;
+        if (index < bookmarks.size()) {
+            RendererSettings settings = pathTracer_->settings();
+            uiOverlay_->editor().cameraBookmarks().loadBookmark(
+                bookmarks[index], cameraController_, *pathTracer_, &settings);
+            pathTracer_->applySettings(settings);
+        }
+    }
+    if (requests.deleteCameraBookmarkIndex.has_value()) {
+        uiOverlay_->editor().cameraBookmarks().deleteBookmark(*requests.deleteCameraBookmarkIndex);
+    }
+    if (requests.removeFavorite.has_value()) {
+        uiOverlay_->editor().editorPrefs().removeFavorite(*requests.removeFavorite);
     }
 
     (void)applyPendingSceneUpdate(allowResourceRebuild);
@@ -953,9 +1040,10 @@ void Application::reloadShadersFromEditor() {
     }
     const RendererSettings previousSettings = pathTracer_->settings();
     commandSystem_->waitIdle();
-    if (uiOverlay_) {
-        uiOverlay_->invalidateViewportTexture();
-    }
+        if (uiOverlay_) {
+            uiOverlay_->invalidateViewportTexture();
+            uiOverlay_->editor().invalidateAssetThumbnails();
+        }
     pathTracer_.reset();
     createPathTracer(&previousSettings);
     applyActiveSceneCamera();
@@ -1126,7 +1214,34 @@ void Application::processRuntimeControls(float deltaSeconds) {
         settings.directLightingEnabled = !settings.directLightingEnabled;
         changed = true;
     }
-    const bool resetAccumulationPressed = !shortcutsBlocked && pressedOnce(GLFW_KEY_R);
+    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F7)) {
+        static const RendererDebugView intermediateViews[] = {
+            RendererDebugView::Beauty,
+            RendererDebugView::DirectLighting,
+            RendererDebugView::IndirectLighting,
+            RendererDebugView::Variance,
+            RendererDebugView::Normals,
+            RendererDebugView::Depth,
+            RendererDebugView::MotionVectors,
+        };
+        constexpr int count = sizeof(intermediateViews) / sizeof(intermediateViews[0]);
+        int idx = 0;
+        for (int i = 0; i < count; ++i) {
+            if (intermediateViews[i] == settings.debugView) { idx = (i + 1) % count; break; }
+        }
+        settings.debugView = intermediateViews[idx];
+        changed = true;
+    }
+    if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_R)) {
+        pendingReloadShaders_ = true;
+    }
+    if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_L)) {
+        pendingOpenLevel_ = true;
+    }
+    if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_S)) {
+        pendingSaveLevel_ = true;
+    }
+    const bool resetAccumulationPressed = !shortcutsBlocked && !ctrlDown && pressedOnce(GLFW_KEY_R);
     if (resetAccumulationPressed && !viewportInteraction) {
         pathTracer_->resetAccumulation();
     }
@@ -1209,7 +1324,7 @@ void Application::updateWindowTitle(float seconds) {
           << " | env " << (settings.environmentEnabled ? "on" : "off")
           << " | GPU "
           << std::fixed << std::setprecision(2)
-          << timings.pathTraceMs + timings.denoiserMs + timings.fullscreenMs << " ms";
+          << timings.atmosphereMs + timings.pathTraceMs + timings.restirSpatialMs + timings.fogIntegrateMs + timings.denoiserMs + timings.fullscreenMs << " ms";
     glfwSetWindowTitle(window_, title.str().c_str());
 }
 

@@ -7,6 +7,7 @@
 #include "rtv/BufferUploader.h"
 #include "rtv/Check.h"
 #include "rtv/EnvironmentImportanceSampler.h"
+#include "rtv/LightBvh.h"
 #include "rtv/HdrLoader.h"
 #include "rtv/ResourceAllocator.h"
 
@@ -43,7 +44,7 @@ uint32_t nodeInstanceFlags(const SceneNodeAsset& node) {
     return flags;
 }
 
-constexpr uint32_t maxMaterialTextures = 128;
+constexpr uint32_t maxMaterialTextures = 1024;
 constexpr uint64_t fastImportedBvhTriangleThreshold = 1'000'000ull;
 constexpr uint32_t materialFlagManualBaseColorSrgb = 1u << 0u;
 constexpr uint32_t materialFlagManualEmissiveSrgb = 1u << 1u;
@@ -810,21 +811,20 @@ void GpuScene::destroyMaterialTextureSamplers() {
         }
     }
     materialTextureSamplers_.clear();
-    materialSamplerDescriptors_.clear();
 }
 
-void GpuScene::rebuildMaterialSamplerDescriptors(uint32_t slotCount) {
-    materialSamplerDescriptors_.clear();
-    slotCount = std::max(slotCount, 1u);
-    materialSamplerDescriptors_.reserve(slotCount);
-    for (uint32_t slot = 0; slot < slotCount; ++slot) {
-        VkSampler sampler = materialSampler_;
-        if (!materialTextureSamplers_.empty()) {
-            const uint32_t samplerIndex = slot < materialTextureSamplers_.size() ? slot : 0u;
-            sampler = materialTextureSamplers_[samplerIndex];
-        }
-        materialSamplerDescriptors_.push_back(VkDescriptorImageInfo{.sampler = sampler});
+std::vector<VkDescriptorImageInfo> GpuScene::materialCombinedDescriptors() const {
+    const auto& texDescs = materialTextureTable_.descriptors();
+    std::vector<VkDescriptorImageInfo> result;
+    result.reserve(texDescs.size());
+    for (const auto& tex : texDescs) {
+        VkDescriptorImageInfo combined{};
+        combined.imageView = tex.imageView;
+        combined.imageLayout = tex.imageLayout;
+        combined.sampler = materialSampler_;
+        result.push_back(combined);
     }
+    return result;
 }
 
 bool GpuScene::setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity) {
@@ -852,9 +852,6 @@ void GpuScene::createDefaultMaterialTexture(BufferUploader& uploader) {
     }
 
     if (materialTextureTable_.residentCount() > 0) {
-        if (materialSamplerDescriptors_.empty()) {
-            rebuildMaterialSamplerDescriptors(maxMaterialTextures);
-        }
         return;
     }
     destroyMaterialTextureSamplers();
@@ -871,7 +868,6 @@ void GpuScene::createDefaultMaterialTexture(BufferUploader& uploader) {
     uploader.uploadToImage2D(*image, white.data(), white.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     images.push_back(std::move(image));
     materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
-    rebuildMaterialSamplerDescriptors(maxMaterialTextures);
 }
 
 void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets) {
@@ -911,13 +907,18 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
             name = "default material texture";
         }
 
-        const uint32_t mipLevels = std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u));
+        const uint32_t textureMipLevels = texture != nullptr && texture->isCompressed
+            ? 1u
+            : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u));
+        const VkFormat textureFormat = texture != nullptr && texture->isCompressed
+            ? texture->compressedFormat
+            : (uploadTextureAsSrgb(usage, slot) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
 
         auto image = std::make_unique<Image>(allocator_, ImageDesc{
             .width = width,
             .height = height,
-            .mipLevels = mipLevels,
-            .format = uploadTextureAsSrgb(usage, slot) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
+            .mipLevels = textureMipLevels,
+            .format = textureFormat,
             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             .debugName = name,
         });
@@ -945,7 +946,6 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
     }
 
     materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
-    rebuildMaterialSamplerDescriptors(maxMaterialTextures);
     std::cout << "Material textures resident: " << materialTextureTable_.residentCount() << " / " << materialTextureTable_.slotCount() << " slots\n";
 }
 
@@ -995,12 +995,18 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
             name = "default cached material texture";
         }
 
-        const uint32_t mipLevels = std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u));
+        const bool textureCompressed = texture != nullptr && texture->isCompressed;
+        const uint32_t textureMipLevels = textureCompressed
+            ? 1u
+            : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u));
+        const VkFormat textureFormat = textureCompressed
+            ? static_cast<VkFormat>(texture->compressedFormat)
+            : (srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
         auto image = std::make_unique<Image>(allocator_, ImageDesc{
             .width = width,
             .height = height,
-            .mipLevels = mipLevels,
-            .format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
+            .mipLevels = textureMipLevels,
+            .format = textureFormat,
             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             .debugName = name,
         });
@@ -1026,7 +1032,6 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
     }
 
     materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
-    rebuildMaterialSamplerDescriptors(maxMaterialTextures);
     std::cout << "Cached material textures resident: " << materialTextureTable_.residentCount() << " / " << materialTextureTable_.slotCount() << " slots\n";
 }
 
@@ -1376,7 +1381,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
             0u,
             static_cast<uint32_t>(primitiveRecords.size()),
             materialOpaqueTraversalSafe),
-        .updateMode = AccelUpdateMode::RefitTransform,
+        .updateMode = AccelUpdateMode::Static,
     });
     rayTracingInstances_.clear();
     rayTracingInstances_.push_back(RayTracingInstanceBuildInput{
@@ -1468,6 +1473,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
     });
     meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
     meshParamsBuffer_->flush(sizeof(meshParams_));
+    uploadLightBvh(uploader, lightRecords);
 }
 
 void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets) {
@@ -1709,7 +1715,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
                 prep.primitiveOffset,
                 static_cast<uint32_t>(prep.mesh->primitives.size()),
                 materialOpaqueTraversalSafe),
-            .updateMode = AccelUpdateMode::RefitTransform,
+            .updateMode = AccelUpdateMode::Static,
         });
         localMeshBounds.push_back(prep.localBounds);
         meshRecordIndexForAsset.emplace(prep.handle.index, meshRecordIndex);
@@ -1834,6 +1840,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     });
     meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
     meshParamsBuffer_->flush(sizeof(meshParams_));
+    uploadLightBvh(uploader, lightRecords);
 
     if (sceneCachePath_.has_value() && !importedScene.sourcePath.empty() && importedScene.lights.empty()) {
         CachedScene gpuCached;
@@ -1873,7 +1880,11 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedTex.width = texture->width;
             cachedTex.height = texture->height;
             cachedTex.channels = texture->channels;
+            cachedTex.mipLevels = texture->mipLevels;
             cachedTex.srgb = texture->srgb;
+            cachedTex.fallback = texture->fallback;
+            cachedTex.isCompressed = texture->isCompressed;
+            cachedTex.compressedFormat = static_cast<uint32_t>(texture->compressedFormat);
             cachedTex.rgba8 = texture->rgba8;
             cachedTex.minFilter = static_cast<uint32_t>(texture->sampler.minFilter);
             cachedTex.magFilter = static_cast<uint32_t>(texture->sampler.magFilter);
@@ -2047,7 +2058,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
                 rec.primitiveData.x,
                 rec.primitiveData.y,
                 materialOpaqueTraversalSafe),
-            .updateMode = AccelUpdateMode::RefitTransform,
+            .updateMode = AccelUpdateMode::Static,
         });
 
         localBvhData.insert(localBvhData.end(), cachedMesh.localBvh.packedNodes.begin(), cachedMesh.localBvh.packedNodes.end());
@@ -2154,6 +2165,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     });
     meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
     meshParamsBuffer_->flush(sizeof(meshParams_));
+    uploadLightBvh(uploader, lightRecords);
 }
 
 void GpuScene::createEnvironment(BufferUploader& uploader) {
@@ -2247,6 +2259,28 @@ void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLight
         meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
         meshParamsBuffer_->flush(sizeof(meshParams_));
     }
+    uploadLightBvh(uploader, lightRecords);
+}
+
+void GpuScene::uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords) {
+    std::vector<float> lightPower;
+    lightPower.reserve(lightRecords.size());
+    for (const auto& rec : lightRecords) {
+        lightPower.push_back(std::max(rec.data0.x, 0.0f));
+    }
+    std::vector<LightBvhNode> bvhNodes = buildLightBvh(lightPower, 1);
+    std::vector<glm::vec4> packed = packLightBvhNodesForGpu(bvhNodes);
+    if (packed.empty()) {
+        packed.emplace_back(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    uploadBuffer(
+        allocator_,
+        uploader,
+        lightBvhNodes_,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        packed.data(),
+        sizeof(glm::vec4) * packed.size(),
+        "scene light bvh nodes");
 }
 
 } // namespace rtv

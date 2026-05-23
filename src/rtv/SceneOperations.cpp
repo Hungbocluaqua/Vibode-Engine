@@ -135,10 +135,13 @@ bool SceneOperations::reparentEntity(EntityId child, EntityId newParent) {
 bool SceneOperations::setVisibility(EntityId id, bool visible) {
     const SceneDocument before = document_;
     Entity* entity = document_.registry().entity(id);
-    if (entity == nullptr || entity->locked || !entity->meshRenderer.has_value() || entity->meshRenderer->visible == visible) {
+    if (entity == nullptr || entity->locked || entity->visible == visible) {
         return false;
     }
-    entity->meshRenderer->visible = visible;
+    entity->visible = visible;
+    if (entity->meshRenderer.has_value()) {
+        entity->meshRenderer->visible = visible;
+    }
     document_.markDirty(SceneUpdateKind::VisibilityOnly);
     publish({SceneEventType::VisibilityChanged, id, {}, SceneUpdateKind::VisibilityOnly});
     if (undoStack_ != nullptr) {
@@ -181,6 +184,24 @@ bool SceneOperations::setTransform(EntityId id, const Transform& transform) {
     return true;
 }
 
+void SceneOperations::setTransformGizmoDrag(EntityId id, const Transform& oldTransform, const Transform& newTransform) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked) {
+        return;
+    }
+    const SceneDocument before = document_;
+    entity->transform = oldTransform;
+    const SceneDocument after = document_;
+    entity->transform = newTransform;
+    entity->transform.dirty = true;
+    document_.markDirty(SceneUpdateKind::TransformOnly);
+    publish({SceneEventType::TransformChanged, id, {}, SceneUpdateKind::TransformOnly});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, after, SceneUpdateKind::TransformOnly, "Move Entity"));
+    }
+}
+
 EntityId SceneOperations::duplicateEntityRecursive(const Entity& source, EntityId parent) {
     const EntityId copyId = document_.registry().createEntity(source.name.empty() ? "Entity Copy" : source.name + " Copy");
     Entity* copy = document_.registry().entity(copyId);
@@ -189,6 +210,8 @@ EntityId SceneOperations::duplicateEntityRecursive(const Entity& source, EntityI
     }
     copy->transform = source.transform;
     copy->transform.dirty = true;
+    copy->visible = source.visible;
+    copy->locked = source.locked;
     copy->meshRenderer = source.meshRenderer;
     copy->light = source.light;
     copy->camera = source.camera;

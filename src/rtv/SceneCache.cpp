@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 14;
+constexpr uint32_t kCacheVersion = 15;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -206,12 +206,16 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeUint32(file, tex.width);
         writeUint32(file, tex.height);
         writeUint32(file, tex.channels);
+        writeInt32(file, tex.mipLevels);
         writeUint32(file, tex.srgb ? 1u : 0u);
         writeUint32(file, tex.fallback ? 1u : 0u);
         writeUint32(file, tex.minFilter);
         writeUint32(file, tex.magFilter);
         writeUint32(file, tex.wrapS);
         writeUint32(file, tex.wrapT);
+        writeUint32(file, tex.isCompressed ? 1u : 0u);
+        writeUint32(file, tex.compressedFormat);
+        writeUint32(file, static_cast<uint32_t>(tex.rgba8.size()));
         writeBytes(file, tex.rgba8.data(), tex.rgba8.size());
     }
 
@@ -414,6 +418,9 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readUint32(file, tex.width)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, tex.height)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, tex.channels)) { std::fclose(file); return std::nullopt; }
+        int32_t mipLevelsVal = 1;
+        if (!readInt32(file, mipLevelsVal)) { std::fclose(file); return std::nullopt; }
+        tex.mipLevels = mipLevelsVal;
         uint32_t srgbVal = 0;
         if (!readUint32(file, srgbVal)) { std::fclose(file); return std::nullopt; }
         tex.srgb = srgbVal != 0;
@@ -424,10 +431,15 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readUint32(file, tex.magFilter)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, tex.wrapS)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, tex.wrapT)) { std::fclose(file); return std::nullopt; }
-        size_t pixelSize = static_cast<size_t>(tex.width) * tex.height * tex.channels;
-        tex.rgba8.resize(pixelSize);
-        if (pixelSize > 0) {
-            if (!readBytes(file, tex.rgba8.data(), pixelSize)) { std::fclose(file); return std::nullopt; }
+        uint32_t isCompressedVal = 0;
+        if (!readUint32(file, isCompressedVal)) { std::fclose(file); return std::nullopt; }
+        tex.isCompressed = isCompressedVal != 0;
+        if (!readUint32(file, tex.compressedFormat)) { std::fclose(file); return std::nullopt; }
+        uint32_t dataByteSize = 0;
+        if (!readUint32(file, dataByteSize)) { std::fclose(file); return std::nullopt; }
+        tex.rgba8.resize(dataByteSize);
+        if (dataByteSize > 0) {
+            if (!readBytes(file, tex.rgba8.data(), dataByteSize)) { std::fclose(file); return std::nullopt; }
         }
     }
 

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rtv {
@@ -17,6 +18,8 @@ public:
 
     [[nodiscard]] Entity* entity(EntityId id);
     [[nodiscard]] const Entity* entity(EntityId id) const;
+    [[nodiscard]] Entity* entityByUuid(uint64_t uuid);
+    [[nodiscard]] const Entity* entityByUuid(uint64_t uuid) const;
     [[nodiscard]] bool contains(EntityId id) const { return entity(id) != nullptr; }
 
     [[nodiscard]] std::vector<Entity*> entities();
@@ -36,11 +39,15 @@ public:
     [[nodiscard]] const Light* light(EntityId id) const;
     [[nodiscard]] const Camera* camera(EntityId id) const;
 
+    [[nodiscard]] bool effectiveVisible(EntityId id) const;
+
     void markDirty(SceneUpdateKind kind);
     void clearDirty();
     [[nodiscard]] bool dirty() const { return pendingUpdate_ != SceneUpdateKind::None; }
     [[nodiscard]] SceneUpdateKind pendingUpdate() const { return pendingUpdate_; }
     [[nodiscard]] size_t liveCount() const { return liveCount_; }
+
+    void ensureUuidCounter(uint64_t minUuid);
 
 private:
     struct Slot {
@@ -53,7 +60,9 @@ private:
 
     std::vector<Slot> slots_;
     std::vector<uint32_t> freeList_;
+    std::unordered_map<uint64_t, EntityId> uuidIndex_;
     size_t liveCount_ = 0;
+    uint64_t uuidCounter_ = 1;
     SceneUpdateKind pendingUpdate_ = SceneUpdateKind::None;
 };
 

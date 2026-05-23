@@ -1,6 +1,7 @@
 #include "rtv/ValidationSceneSuite.h"
 
 #include <array>
+#include <fstream>
 
 namespace rtv {
 
@@ -52,6 +53,42 @@ std::span<const ValidationSceneDescriptor> validationSceneSuite() {
 
 std::filesystem::path validationScenePath(const ValidationSceneDescriptor& scene) {
     return std::filesystem::current_path() / std::filesystem::path(scene.relativePath);
+}
+
+std::vector<ValidationSceneResult> validateAllScenes() {
+    std::vector<ValidationSceneResult> results;
+    results.reserve(kValidationScenes.size());
+    for (const auto& scene : kValidationScenes) {
+        ValidationSceneResult result;
+        result.scene = scene;
+        const auto path = validationScenePath(scene);
+        if (!std::filesystem::exists(path)) {
+            result.status = ValidationSceneStatus::FileMissing;
+            result.message = "File not found: " + path.string();
+        } else {
+            std::ifstream file(path, std::ios::binary);
+            if (!file.is_open()) {
+                result.status = ValidationSceneStatus::FileMissing;
+                result.message = "Cannot open: " + path.string();
+            } else {
+                result.status = ValidationSceneStatus::FileReadable;
+                result.message = "OK (" + std::to_string(std::filesystem::file_size(path)) + " bytes)";
+            }
+        }
+        results.push_back(result);
+    }
+    return results;
+}
+
+const char* validationStatusName(ValidationSceneStatus status) {
+    switch (status) {
+        case ValidationSceneStatus::NotChecked: return "Not Checked";
+        case ValidationSceneStatus::FileMissing: return "File Missing";
+        case ValidationSceneStatus::FileReadable: return "Readable";
+        case ValidationSceneStatus::ChecksumMatch: return "Checksum OK";
+        case ValidationSceneStatus::ChecksumMismatch: return "Checksum Mismatch";
+    }
+    return "Unknown";
 }
 
 } // namespace rtv

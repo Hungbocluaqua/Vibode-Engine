@@ -3,7 +3,7 @@
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, rgba16f) uniform image2D color_image;
-layout(set = 0, binding = 1, std430) readonly buffer DepthNormalBuffer { uvec2 depth_normal_buffer[]; };
+layout(set = 0, binding = 1, std430) readonly buffer DepthNormalBuffer { uvec3 depth_normal_buffer[]; };
 layout(set = 0, binding = 2, std140) uniform Camera {
     vec4 pos;
     vec4 forward;
@@ -37,7 +37,7 @@ layout(set = 0, binding = 3, std140) uniform FogParams {
 
 layout(set = 1, binding = 1) uniform texture2D atmosphere_sky_view_lut;
 layout(set = 1, binding = 2) uniform sampler atmosphere_sampler;
-layout(set = 1, binding = 3) uniform texture2D atmosphere_aerial_perspective_lut;
+layout(set = 1, binding = 3) uniform texture3D atmosphere_aerial_perspective_lut;
 
 const float PI = 3.14159265358979323846;
 
@@ -61,7 +61,7 @@ vec4 sample_aerial_lut(vec3 rayDir, float distanceMeters) {
     vec2 uv = vec2(
         clamp(sqrt(clamp(distanceMeters / 100000.0, 0.0, 1.0)), 0.0, 1.0),
         clamp((viewMu + 0.15) / 1.15, 0.0, 1.0));
-    return texture(sampler2D(atmosphere_aerial_perspective_lut, atmosphere_sampler), uv);
+    return texture(sampler3D(atmosphere_aerial_perspective_lut, atmosphere_sampler), vec3(uv, 0.5));
 }
 
 void main() {

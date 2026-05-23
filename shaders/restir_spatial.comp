@@ -10,7 +10,7 @@ struct RestirReservoir {
 
 layout(set = 0, binding = 0, std430) readonly buffer InputReservoirs { RestirReservoir input_reservoirs[]; };
 layout(set = 0, binding = 1, std430) writeonly buffer OutputReservoirs { RestirReservoir output_reservoirs[]; };
-layout(set = 0, binding = 2, std430) readonly buffer DepthNormalBuffer { uvec2 depth_normal_buffer[]; };
+layout(set = 0, binding = 2, std430) readonly buffer DepthNormalBuffer { uvec3 depth_normal_buffer[]; };
 
 layout(set = 0, binding = 3, std140) uniform RestirSpatialParams {
     uint width;
@@ -46,12 +46,31 @@ uint pcg_hash(uint value) {
     return (word >> 22u) ^ word;
 }
 
-ivec2 stochastic_offset(uint pixelIndex, uint roundIndex) {
+float halton(uint index, uint base) {
+    float result = 0.0;
+    float invBase = 1.0 / float(base);
+    float factor = invBase;
+    uint i = index;
+    while (i > 0u) {
+        result += float(i % base) * factor;
+        i /= base;
+        factor *= invBase;
+    }
+    return result;
+}
+
+ivec2 blue_noise_offset(uint pixelIndex, uint roundIndex) {
     uint h = pcg_hash(pixelIndex ^ (roundIndex * 1013904223u));
-    int radius = 1 + int((h >> 4u) & 3u);
-    int sx = ((h & 1u) == 0u) ? -1 : 1;
-    int sy = ((h & 2u) == 0u) ? -1 : 1;
-    return ((h & 4u) == 0u) ? ivec2(sx * radius, sy) : ivec2(sx, sy * radius);
+    float angle = halton(pixelIndex ^ (roundIndex * 71u), 2u) * 2.0 * 3.14159265;
+    float radius = 0.5 + halton(pixelIndex ^ (roundIndex * 113u), 3u) * 3.0;
+    float ca = cos(angle);
+    float sa = sin(angle);
+    ivec2 offset = ivec2(int(floor(ca * radius + 0.5)), int(floor(sa * radius + 0.5)));
+    uint jitterX = h & 1u;
+    uint jitterY = (h >> 1u) & 1u;
+    offset.x += jitterX == 0u ? 0 : 1;
+    offset.y += jitterY == 0u ? 0 : 1;
+    return offset;
 }
 
 bool reservoir_valid(RestirReservoir reservoir) {
@@ -73,13 +92,21 @@ void main() {
         return;
     }
 
-    uvec2 packedCenter = depth_normal_buffer[pixelIndex];
+    uvec3 packedCenter = depth_normal_buffer[pixelIndex];
     float centerDepth = uintBitsToFloat(packedCenter.x);
     vec3 centerNormal = decode_octahedral_normal(packedCenter.y);
+    float centerRoughness = uintBitsToFloat(packedCenter.z);
+    float centerRoughnessClamped = clamp(centerRoughness, 0.01, 1.0);
+    float depthThreshold = mix(0.02, 0.08, centerRoughnessClamped);
+    float normalThreshold = mix(0.92, 0.78, centerRoughnessClamped);
+    float maxMixWeight = mix(0.35, 0.65, centerRoughnessClamped);
+    float neighborLuminanceSum = 0.0;
+    float maxNeighborLum = 0.0;
+    uint neighborCount = 0u;
     float totalWeight = max(luminance(merged.sample_value_confidence.rgb), 0.0) * max(merged.sample_value_confidence.a, 0.05);
 
     for (uint roundIndex = 0u; roundIndex < 4u; ++roundIndex) {
-        ivec2 sampleCoords = coords + stochastic_offset(pixelIndex, roundIndex);
+        ivec2 sampleCoords = coords + blue_noise_offset(pixelIndex, roundIndex);
         if (sampleCoords.x < 0 || sampleCoords.y < 0 || sampleCoords.x >= int(params.width) || sampleCoords.y >= int(params.height)) {
             continue;
         }
@@ -90,11 +117,20 @@ void main() {
             continue;
         }
 
-        uvec2 packedCandidate = depth_normal_buffer[sampleIndex];
+        uvec3 packedCandidate = depth_normal_buffer[sampleIndex];
         float candidateDepth = uintBitsToFloat(packedCandidate.x);
         vec3 candidateNormal = decode_octahedral_normal(packedCandidate.y);
+        float candidateRoughness = uintBitsToFloat(packedCandidate.z);
+        float candidateRoughnessClamped = clamp(candidateRoughness, 0.01, 1.0);
+        float effectiveRoughness = max(centerRoughnessClamped, candidateRoughnessClamped);
         float relativeDepth = abs(candidateDepth - centerDepth) / max(abs(centerDepth), 1.0e-3);
-        if (relativeDepth > 0.08 || dot(centerNormal, candidateNormal) < 0.82) {
+        float depthThresh = mix(0.02, 0.08, effectiveRoughness);
+        float normalThresh = mix(0.92, 0.78, effectiveRoughness);
+        if (relativeDepth > depthThresh || dot(centerNormal, candidateNormal) < normalThresh) {
+            continue;
+        }
+
+        if (effectiveRoughness < 0.06) {
             continue;
         }
 
@@ -104,12 +140,27 @@ void main() {
             continue;
         }
 
-        float mixWeight = clamp(candidateWeight / nextTotal, 0.0, 0.65);
+        float cappedMaxMixWeight = mix(0.35, 0.65, effectiveRoughness);
+        float mixWeight = clamp(candidateWeight / nextTotal, 0.0, cappedMaxMixWeight);
         merged.sample_value_confidence.rgb = mix(merged.sample_value_confidence.rgb, candidate.sample_value_confidence.rgb, mixWeight);
         merged.sample_value_confidence.a = clamp(max(merged.sample_value_confidence.a, candidate.sample_value_confidence.a) * 0.96, 0.0, 1.0);
         merged.target_pdf_weight_sum_m.y += candidate.target_pdf_weight_sum_m.y * mixWeight;
         merged.target_pdf_weight_sum_m.z = min(merged.target_pdf_weight_sum_m.z + candidate.target_pdf_weight_sum_m.z, 64.0);
         totalWeight = nextTotal;
+        float candidateLum = luminance(candidate.sample_value_confidence.rgb);
+        neighborLuminanceSum += candidateLum;
+        maxNeighborLum = max(maxNeighborLum, candidateLum);
+        neighborCount += 1u;
+    }
+
+    if (neighborCount > 0u) {
+        float neighborAvgLum = neighborLuminanceSum / float(neighborCount);
+        float mergedLum = luminance(merged.sample_value_confidence.rgb);
+        float dataDrivenCap = max(neighborAvgLum * 4.0, maxNeighborLum * 2.0);
+        float lumCap = max(dataDrivenCap, 0.05);
+        if (mergedLum > lumCap) {
+            merged.sample_value_confidence.rgb *= lumCap / max(mergedLum, 1.0e-8);
+        }
     }
 
     output_reservoirs[pixelIndex] = merged;

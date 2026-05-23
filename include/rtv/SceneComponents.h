@@ -120,6 +120,10 @@ struct RenderSettings {
     float skyIntensity = 0.8f;
     float sunElevation = 0.97f;
     float sunAngularRadius = 0.0093f;
+    float rayleighScaleHeight = 8000.0f;
+    float mieScaleHeight = 1200.0f;
+    float mieAnisotropy = 0.8f;
+    float groundAlbedo = 0.3f;
     float indirectStrength = 1.0f;
     RestirMode restirMode = RestirMode::ClassicNee;
     bool denoiserEnabled = true;
@@ -132,6 +136,12 @@ struct RenderSettings {
     uint32_t accumulationLimit = 0;
     float resolutionScale = 1.0f;
     RendererBackend requestedBackend = RendererBackend::Auto;
+
+    bool usePhysicalCamera = false;
+    float physicalAperture = 16.0f;
+    float physicalShutterSeconds = 1.0f / 125.0f;
+    float physicalIso = 100.0f;
+    float physicalExposureCompensation = 0.0f;
 };
 
 enum class SceneUpdateKind : uint32_t {

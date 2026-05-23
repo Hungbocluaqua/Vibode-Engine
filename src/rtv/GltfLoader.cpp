@@ -6,6 +6,7 @@
 
 #include "rtv/AssetManager.h"
 #include "rtv/SceneCache.h"
+#include "rtv/TextureLoader.h"
 
 #include <glm/gtc/quaternion.hpp>
 
@@ -136,6 +137,23 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
     return true;
 }
 
+[[nodiscard]] bool isKtx2Data(const std::vector<uint8_t>& data) {
+    constexpr uint8_t ktx2Magic[12] = {
+        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
+    };
+    return data.size() >= sizeof(ktx2Magic) && std::memcmp(data.data(), ktx2Magic, sizeof(ktx2Magic)) == 0;
+}
+
+[[nodiscard]] bool isKtx2Path(const std::string& uri) {
+    if (uri.empty()) return false;
+    const std::string lower = [&] {
+        std::string s = uri;
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        return s;
+    }();
+    return lower.ends_with(".ktx2");
+}
+
 [[nodiscard]] TextureAsset textureFromImage(const tinygltf::Image& image, const std::filesystem::path& gltfPath) {
     TextureAsset texture;
     texture.name = image.name;
@@ -143,6 +161,29 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
     texture.width = static_cast<uint32_t>(std::max(image.width, 1));
     texture.height = static_cast<uint32_t>(std::max(image.height, 1));
     texture.channels = 4;
+
+    if (isKtx2Path(image.uri) || isKtx2Data(image.image)) {
+        std::filesystem::path ktxPath;
+        if (isKtx2Path(image.uri)) {
+            ktxPath = texture.sourcePath;
+        }
+        try {
+            TextureData td = ktxPath.empty()
+                ? TextureLoader::loadKtx2(texture.sourcePath.string())
+                : TextureLoader::loadKtx2(ktxPath.string());
+            texture.width = static_cast<uint32_t>(td.width);
+            texture.height = static_cast<uint32_t>(td.height);
+            texture.channels = 4;
+            texture.mipLevels = td.mipLevels;
+            texture.isCompressed = td.isCompressed;
+            texture.compressedFormat = td.compressedFormat;
+            texture.rgba8 = std::move(td.pixels);
+            texture.fallback = false;
+            return texture;
+        } catch (const std::runtime_error& e) {
+            std::cerr << "KTX2 texture load failed: " << e.what() << ", falling back\n";
+        }
+    }
 
     const size_t pixelCount = static_cast<size_t>(texture.width) * texture.height;
     const size_t expectedRgbaBytes = pixelCount * 4u;
@@ -707,8 +748,11 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedTex.width = texture->width;
         cachedTex.height = texture->height;
         cachedTex.channels = texture->channels;
+        cachedTex.mipLevels = texture->mipLevels;
         cachedTex.srgb = texture->srgb;
         cachedTex.fallback = texture->fallback;
+        cachedTex.isCompressed = texture->isCompressed;
+        cachedTex.compressedFormat = static_cast<uint32_t>(texture->compressedFormat);
         cachedTex.rgba8 = texture->rgba8;
         cachedTex.minFilter = static_cast<uint32_t>(texture->sampler.minFilter);
         cachedTex.magFilter = static_cast<uint32_t>(texture->sampler.magFilter);

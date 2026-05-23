@@ -1,6 +1,20 @@
 #include "rtv/SceneUpdateRouter.h"
 
+#include <algorithm>
+#include <cassert>
+
 namespace rtv {
+
+SceneUpdateRouter& SceneUpdateRouter::instance() {
+    static SceneUpdateRouter router;
+    return router;
+}
+
+uint64_t SceneUpdateRouter::routeCount(SceneUpdateKind kind) const {
+    const auto idx = static_cast<uint32_t>(kind);
+    if (idx >= 10u) return 0;
+    return routeCounts_[idx];
+}
 
 const char* sceneUpdateGpuActionName(SceneUpdateGpuAction action) {
     switch (action) {
@@ -70,6 +84,17 @@ SceneUpdateRoute SceneUpdateRouter::route(SceneUpdateKind kind) {
         return route;
     }
     return route;
+}
+
+void SceneUpdateRouter::record(SceneUpdateKind kind) {
+    lastKind_ = kind;
+    const auto idx = static_cast<uint32_t>(kind);
+    if (idx < 10u) {
+        ++routeCounts_[idx];
+    }
+    if (kind == SceneUpdateKind::TopologyChanged) {
+        assert(routeCounts_[idx] <= 2u && "TopologyChanged (full rebuild) should only occur during initial scene load or explicit user request");
+    }
 }
 
 } // namespace rtv

@@ -17,9 +17,16 @@ namespace rtv {
 struct QueueFamilyIndices {
     std::optional<uint32_t> graphics;
     std::optional<uint32_t> present;
+    std::optional<uint32_t> compute;
 
     [[nodiscard]] bool complete() const {
         return graphics.has_value() && present.has_value();
+    }
+    [[nodiscard]] bool hasDedicatedCompute() const {
+        return compute.has_value() && compute.value() != graphics.value_or(UINT32_MAX);
+    }
+    [[nodiscard]] bool hasAsyncCompute() const {
+        return compute.has_value();
     }
 };
 
@@ -51,12 +58,18 @@ public:
     [[nodiscard]] VkSurfaceKHR surface() const { return surface_; }
     [[nodiscard]] VkQueue graphicsQueue() const { return graphicsQueue_; }
     [[nodiscard]] VkQueue presentQueue() const { return presentQueue_; }
+    [[nodiscard]] VkQueue computeQueue() const { return computeQueue_; }
+    [[nodiscard]] bool hasAsyncComputeQueue() const { return queueFamilies_.hasDedicatedCompute(); }
+    [[nodiscard]] bool canAsyncCompute() const { return queueFamilies_.hasAsyncCompute(); }
     [[nodiscard]] const QueueFamilyIndices& queueFamilies() const { return queueFamilies_; }
     [[nodiscard]] VkPhysicalDeviceProperties physicalDeviceProperties() const { return physicalDeviceProperties_; }
     [[nodiscard]] const BindlessCapabilities& bindlessCapabilities() const { return bindlessCapabilities_; }
     [[nodiscard]] const RayTracingDeviceInfo& rayTracingInfo() const { return rayTracingInfo_; }
     [[nodiscard]] bool supportsHardwareRayTracing() const { return rayTracingInfo_.capabilities.supported; }
     [[nodiscard]] bool supportsBufferDeviceAddress() const { return rayTracingInfo_.capabilities.bufferDeviceAddress; }
+    [[nodiscard]] VkSemaphore timelineSemaphore() const { return timelineSemaphore_; }
+    [[nodiscard]] bool supportsTimelineSemaphore() const { return timelineSemaphore_ != VK_NULL_HANDLE; }
+    [[nodiscard]] bool supportsSER() const { return supportsSER_; }
 
 private:
     void createInstance(GLFWwindow* window);
@@ -84,6 +97,9 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
+    VkQueue computeQueue_ = VK_NULL_HANDLE;
+    VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
+    bool supportsSER_ = false;
     QueueFamilyIndices queueFamilies_{};
 };
 

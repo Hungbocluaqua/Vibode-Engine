@@ -78,6 +78,14 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     bool changed = false;
     ImGui::Text("Material ID: %u", materialId);
     ImGui::Text("Name: %s", edited.name.empty() ? "(unnamed)" : edited.name.c_str());
+    {
+        ImGui::Button("Drag Material to Entity");
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+            ImGui::SetDragDropPayload("MATERIAL", &materialId, sizeof(materialId));
+            ImGui::Text("Material %u", materialId);
+            ImGui::EndDragDropSource();
+        }
+    }
     changed |= ImGui::ColorEdit4("Base Color", glm::value_ptr(edited.baseColorFactor));
     changed |= ImGui::SliderFloat("Metallic", &edited.metallicFactor, 0.0f, 1.0f, "%.3f");
     tooltip("0 = dielectric, 1 = metal. Most materials are near one endpoint.");

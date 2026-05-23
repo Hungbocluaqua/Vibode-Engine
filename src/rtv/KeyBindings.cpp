@@ -22,6 +22,7 @@ const std::vector<KeyBinding>& allKeyBindings() {
         {"Render.ToggleSun", "F4", "Render", "Toggle sunlight"},
         {"Render.ToggleEnvironment", "F5", "Render", "Toggle environment"},
         {"Render.ToggleDirect", "F6", "Render", "Toggle direct lighting"},
+        {"Render.CycleIntermediate", "F7", "Render", "Cycle intermediate buffer view (Beauty, Direct, Indirect, Variance, Normals, Depth, Velocity)"},
         {"Render.ResetAccumulation", "R", "Render", "Reset accumulation outside text fields"},
         {"Window.Fullscreen", "F11", "Window", "Toggle borderless fullscreen"},
     };
