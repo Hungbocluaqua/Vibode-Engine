@@ -285,7 +285,7 @@ uint encode_octahedral_normal(vec3 n) {
     float denom = abs(n.x) + abs(n.y) + abs(n.z) + 1e-8;
     vec2 p = n.xy / denom;
     if (n.z < 0.0) {
-        p = (vec2(1.0) - abs(p.yx)) * sign(p);
+        p = (vec2(1.0) - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
     }
     return pack_snorm2x16(p);
 }
@@ -367,18 +367,11 @@ float rand_f32(inout uint state) {
     return float(state) / float(0xffffffffu);
 }
 
-vec3 rand_in_unit_sphere(inout uint state) {
-    for (int i = 0; i < 64; ++i) {
-        vec3 p = vec3(rand_f32(state), rand_f32(state), rand_f32(state)) * 2.0 - 1.0;
-        if (dot(p, p) < 1.0) {
-            return p;
-        }
-    }
-    return vec3(0.0, 1.0, 0.0);
-}
-
 vec3 rand_unit_vector(inout uint state) {
-    return normalize(rand_in_unit_sphere(state));
+    float z = rand_f32(state) * 2.0 - 1.0;
+    float a = rand_f32(state) * 2.0 * 3.141592653589793;
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    return vec3(r * cos(a), r * sin(a), z);
 }
 
 Material decode_material(uint mat_idx) {
