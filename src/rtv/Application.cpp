@@ -200,14 +200,24 @@ std::filesystem::path resolveProjectRoot() {
 }
 
 glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity) {
-    if (!entity.parent.valid()) {
-        return entity.transform.localMatrix();
+    const Entity* current = &entity;
+    glm::mat4 result(1.0f);
+    constexpr int maxDepth = 512;
+    for (int depth = 0; depth < maxDepth && current != nullptr; ++depth) {
+        result = current->transform.localMatrix() * result;
+        if (!current->parent.valid()) {
+            break;
+        }
+        const Entity* parent = registry.entity(current->parent);
+        if (parent == nullptr) {
+            break;
+        }
+        if (parent == current) {
+            break;
+        }
+        current = parent;
     }
-    const Entity* parent = registry.entity(entity.parent);
-    if (parent == nullptr) {
-        return entity.transform.localMatrix();
-    }
-    return entityWorldMatrix(registry, *parent) * entity.transform.localMatrix();
+    return result;
 }
 
 EntityId duplicateEntityRecursive(SceneRegistry& registry, Entity source, EntityId parent) {
@@ -372,7 +382,6 @@ void Application::initVulkan() {
     }
     sceneDocument_.setSourceHdrPath(hdrPath_);
     rebuildGpuSceneAsset();
-    (void)shaderDir;
     RendererSettings startupSettings{};
     startupSettings.debugView = debugView_;
     if (loadedSceneDocument) {
@@ -1017,10 +1026,10 @@ void Application::reloadShadersFromEditor() {
     }
     const RendererSettings previousSettings = pathTracer_->settings();
     commandSystem_->waitIdle();
-        if (uiOverlay_) {
-            uiOverlay_->invalidateViewportTexture();
-            uiOverlay_->editor().invalidateAssetThumbnails();
-        }
+    if (uiOverlay_) {
+        uiOverlay_->invalidateViewportTexture();
+        uiOverlay_->editor().invalidateAssetThumbnails();
+    }
     pathTracer_.reset();
     createPathTracer(&previousSettings);
     applyActiveSceneCamera();

@@ -49,7 +49,7 @@ public:
     [[nodiscard]] VkDescriptorImageInfo sampledDescriptor(VkSampler sampler) const;
     [[nodiscard]] VkDescriptorImageInfo storageDescriptor() const;
 
-    void setLayout(VkImageLayout layout) { layout_ = layout; }
+    void setLayout(VkImageLayout layout) const { layout_ = layout; }
     void generateMipmaps(VkCommandBuffer commandBuffer);
 
 private:
@@ -58,7 +58,8 @@ private:
     VkImage image_ = VK_NULL_HANDLE;
     VmaAllocation allocation_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE;
-    VkImageLayout layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    mutable VkImageLayout layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+private:
 };
 
 } // namespace rtv

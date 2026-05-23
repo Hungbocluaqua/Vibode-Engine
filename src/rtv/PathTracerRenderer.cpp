@@ -2039,7 +2039,7 @@ void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
 void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("taa resolve");
     const Image& inputImage = postDenoiseImage();
-    const_cast<Image&>(inputImage).setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    inputImage.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     taaHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
