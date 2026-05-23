@@ -1062,11 +1062,11 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         const uint32_t type = 3u;
         uint32_t flags = 0;
         if (material != nullptr) {
-            uint32_t slot = textureSlotIndexFor(material->baseColorTexture);
+            uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
             if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
                 flags |= materialFlagManualBaseColorSrgb;
             }
-            slot = textureSlotIndexFor(material->emissiveTexture);
+            slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
             if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
                 flags |= materialFlagManualEmissiveSrgb;
             }
@@ -1510,11 +1510,11 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         const float emissiveTexture = material != nullptr ? textureSlotFor(material->emissiveTexture) : -1.0f;
         uint32_t flags = 0;
         if (material != nullptr) {
-            uint32_t slot = textureSlotIndexFor(material->baseColorTexture);
+            uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
             if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
                 flags |= materialFlagManualBaseColorSrgb;
             }
-            slot = textureSlotIndexFor(material->emissiveTexture);
+            slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
             if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
                 flags |= materialFlagManualEmissiveSrgb;
             }
