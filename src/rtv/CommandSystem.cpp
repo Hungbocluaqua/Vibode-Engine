@@ -118,7 +118,7 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
 
 void CommandSystem::waitIdle() const {
     if (context_.device() != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(context_.device());
+        checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(CommandSystem)");
     }
 }
 

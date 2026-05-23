@@ -191,12 +191,12 @@ void VulkanContext::pickPhysicalDevice() {
 }
 
 void VulkanContext::createDevice() {
-    const std::set<uint32_t> uniqueFamilies = {
+    std::set<uint32_t> uniqueFamilies = {
         queueFamilies_.graphics.value(),
         queueFamilies_.present.value(),
     };
     if (queueFamilies_.hasDedicatedCompute()) {
-		const_cast<std::set<uint32_t>&>(uniqueFamilies).insert(queueFamilies_.compute.value());
+        uniqueFamilies.insert(queueFamilies_.compute.value());
     }
 
     const float priority = 1.0f;
@@ -288,9 +288,11 @@ void VulkanContext::createDevice() {
         bool supportsInvocationReorder = false;
         {
             uint32_t extCount = 0;
-            vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, nullptr);
+            checkVk(vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, nullptr),
+                    "vkEnumerateDeviceExtensionProperties(count)");
             std::vector<VkExtensionProperties> available(extCount);
-            vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, available.data());
+            checkVk(vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, available.data()),
+                    "vkEnumerateDeviceExtensionProperties(data)");
             for (const auto& ext : available) {
                 if (std::strcmp(ext.extensionName, kVkNvInvocationReorderExtension) == 0) {
                     supportsInvocationReorder = true;
@@ -322,7 +324,8 @@ void VulkanContext::createDevice() {
     VkSemaphoreCreateInfo semCreateInfo{};
     semCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     semCreateInfo.pNext = &timelineCreateInfo;
-    vkCreateSemaphore(device_, &semCreateInfo, nullptr, &timelineSemaphore_);
+    checkVk(vkCreateSemaphore(device_, &semCreateInfo, nullptr, &timelineSemaphore_),
+            "vkCreateSemaphore(timeline)");
 }
 
 bool VulkanContext::validationRequested() const {
