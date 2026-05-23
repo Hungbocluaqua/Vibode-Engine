@@ -257,8 +257,6 @@ PathTracerRenderer::PathTracerRenderer(
     for (VkDescriptorSetLayoutBinding& binding : atmosphereBindings) {
         binding.stageFlags = VK_SHADER_STAGE_ALL;
     }
-    atmosphereBindings.push_back(descriptorBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_ALL));
-    atmosphereBindings.push_back(descriptorBinding(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_ALL));
     atmosphereSetLayout_ = layoutCache_->createLayout(std::move(atmosphereBindings));
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
@@ -524,7 +522,6 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.environmentRotation - settings_.environmentRotation) > 0.0001f ||
         std::abs(next.environmentBackgroundIntensity - settings_.environmentBackgroundIntensity) > 0.0001f ||
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f ||
-        next.requestedBackend != settings_.requestedBackend ||
         std::abs(next.debugScale - settings_.debugScale) > 0.0001f;
     if (!changed) {
         return false;
@@ -1144,6 +1141,7 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     const RenderGraphResourceId worldPosition = graph.createBuffer(bufferResource(worldPositionBuffer_, "world position"));
     const RenderGraphResourceId entityIds = graph.createBuffer(bufferResource(entityIdBuffer_, "entity ids"));
     const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
+    const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
     graph.addPass("path_trace_rt")

@@ -31,6 +31,9 @@ class ResourceDemo;
 class PipelineDemo;
 class PathTracerRenderer;
 class Swapchain;
+class UiOverlay;
+class UploadContext;
+class VulkanContext;
 
 class Application final : private NonCopyable {
 public:
