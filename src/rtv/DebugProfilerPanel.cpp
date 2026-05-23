@@ -119,14 +119,6 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     ImGui::SeparatorText("Debug View");
     ImGui::Text("Active: %s", rendererDebugViewName(settings.debugView));
     editorDebugViewCombo("View", settings, changed);
-    const bool computeTraversalView =
-        settings.debugView == RendererDebugView::TraversalSteps ||
-        settings.debugView == RendererDebugView::BvhDepth ||
-        settings.debugView == RendererDebugView::TlasSteps ||
-        settings.debugView == RendererDebugView::TraversalMismatch;
-    if (computeTraversalView && state.renderer.activeBackend() == RendererBackend::HardwareRayTracing) {
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "This diagnostic is only available on the Compute backend.");
-    }
     changed |= ImGui::SliderFloat("Debug Scale", &settings.debugScale, 0.05f, 10.0f, "%.2f");
     if (changed) {
         requestSettings(requests, settings);

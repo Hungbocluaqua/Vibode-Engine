@@ -6,7 +6,6 @@
 #include "rtv/GpuScene.h"
 #include "rtv/Image.h"
 #include "rtv/PhysicalCamera.h"
-#include "rtv/RendererBackend.h"
 #include "rtv/RendererDebug.h"
 
 #include <Volk/volk.h>
@@ -85,8 +84,6 @@ struct RendererSettings {
     float environmentBackgroundIntensity = 0.35f;
     float renderResolutionScale = 1.0f;
     uint32_t accumulationLimit = 0;
-    RendererBackend requestedBackend = RendererBackend::Auto;
-    bool wavefrontEnabled = false;
     RendererDebugView debugView = RendererDebugView::Beauty;
     float debugScale = 1.0f;
 
@@ -119,7 +116,6 @@ enum class AccumulationResetReason : uint32_t {
     SceneChanged,
     MaterialChanged,
     ShaderReloaded,
-    BackendChanged,
 };
 
 [[nodiscard]] const char* accumulationResetReasonName(AccumulationResetReason reason);
@@ -137,8 +133,7 @@ public:
         const SceneAsset* importedScene = nullptr,
         const AssetManager* assets = nullptr,
         std::optional<std::filesystem::path> environmentPath = std::nullopt,
-        std::optional<std::filesystem::path> sceneCachePath = std::nullopt,
-        RendererBackend requestedBackend = RendererBackend::Auto);
+        std::optional<std::filesystem::path> sceneCachePath = std::nullopt);
     ~PathTracerRenderer();
 
     void beginFrame(uint32_t frameIndex, VkExtent2D extent);
@@ -162,8 +157,6 @@ public:
     [[nodiscard]] std::optional<uint32_t> pickInstanceId(glm::vec2 viewportUv);
 
     [[nodiscard]] const RendererSettings& settings() const { return settings_; }
-    [[nodiscard]] RendererBackend requestedBackend() const { return requestedBackend_; }
-    [[nodiscard]] RendererBackend activeBackend() const { return activeBackend_; }
     [[nodiscard]] bool hardwareRayTracingAvailable() const;
     [[nodiscard]] RayTracingRendererStats rayTracingStats() const;
     [[nodiscard]] uint32_t sampleCount() const { return frameCount_; }
@@ -306,7 +299,6 @@ private:
     void skipDenoiserPass(VkCommandBuffer commandBuffer);
     void skipDenoiserCopyPass(VkCommandBuffer commandBuffer);
     void recordHardwarePathTrace(VkCommandBuffer commandBuffer);
-    void recordComputePathTrace(VkCommandBuffer commandBuffer);
     [[nodiscard]] VkPipelineStageFlags2 pathTraceShaderStage() const;
 
     const VulkanContext& context_;
@@ -327,8 +319,6 @@ private:
     FogParams fogParams_{};
     PrevCameraUniform prevCamera_{};
     RendererDebugParams debugParams_{};
-    RendererBackend requestedBackend_ = RendererBackend::Auto;
-    RendererBackend activeBackend_ = RendererBackend::Compute;
     glm::mat4 previousViewProj_{1.0f};
     glm::vec4 previousCameraPos_{};
     glm::vec2 previousJitter_{0.0f};
@@ -361,7 +351,6 @@ private:
     std::unique_ptr<DescriptorLayoutCache> layoutCache_;
     std::unique_ptr<PipelineCache> pipelineCache_;
     std::unique_ptr<AtmosphereLutSystem> atmosphereLutSystem_;
-    std::unique_ptr<ShaderModule> pathTraceShader_;
     std::unique_ptr<ShaderModule> denoiserShader_;
     std::unique_ptr<ShaderModule> taaShader_;
     std::unique_ptr<ShaderModule> restirSpatialShader_;
@@ -376,8 +365,6 @@ private:
     std::unique_ptr<ShaderModule> luminanceHistogramShader_;
     std::unique_ptr<ShaderModule> exposureReduceShader_;
     std::unique_ptr<ShaderModule> toneMapShader_;
-    std::unique_ptr<ShaderModule> wavefrontGenerateShader_;
-    std::unique_ptr<ShaderModule> wavefrontShadeShader_;
     std::unique_ptr<ShaderModule> fullscreenVertexShader_;
     std::unique_ptr<ShaderModule> fullscreenFragmentShader_;
     std::unique_ptr<ShaderModule> raygenShader_;
@@ -386,7 +373,6 @@ private:
     std::unique_ptr<ShaderModule> closestHitShader_;
     std::unique_ptr<ShaderModule> primaryAnyHitShader_;
     std::unique_ptr<ShaderModule> shadowAnyHitShader_;
-    std::unique_ptr<ComputePipeline> pathTracePipeline_;
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
     std::unique_ptr<ComputePipeline> taaPipeline_;
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
@@ -395,14 +381,11 @@ private:
     std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
     std::unique_ptr<ComputePipeline> exposureReducePipeline_;
     std::unique_ptr<ComputePipeline> toneMapPipeline_;
-    std::unique_ptr<ComputePipeline> wavefrontGeneratePipeline_;
-    std::unique_ptr<ComputePipeline> wavefrontShadePipeline_;
     std::unique_ptr<GraphicsPipeline> graphicsPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingPipeline_;
     std::unique_ptr<RayTracingScene> rayTracingScene_;
     std::unique_ptr<TemporalSystem> temporalSystem_;
     PhysicalCamera physicalCamera_;
-    VkDescriptorSetLayout pathTraceSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout atmosphereSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout rayTracingSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
@@ -413,8 +396,6 @@ private:
     VkDescriptorSetLayout luminanceHistogramSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout exposureReduceSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout toneMapSetLayout_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout wavefrontGenerateSetLayout_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout wavefrontShadeSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout graphicsSetLayout_ = VK_NULL_HANDLE;
     std::vector<std::unique_ptr<FrameResources>> frames_;
     std::vector<GpuProfiler> profilers_;

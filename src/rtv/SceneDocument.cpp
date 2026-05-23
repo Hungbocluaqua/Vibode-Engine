@@ -332,7 +332,6 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"accumulate", renderSettings_.accumulate},
         {"accumulationLimit", renderSettings_.accumulationLimit},
         {"resolutionScale", renderSettings_.resolutionScale},
-        {"requestedBackend", static_cast<uint32_t>(renderSettings_.requestedBackend)},
         {"usePhysicalCamera", renderSettings_.usePhysicalCamera},
         {"physicalAperture", renderSettings_.physicalAperture},
         {"physicalShutterSeconds", renderSettings_.physicalShutterSeconds},
@@ -479,7 +478,6 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.accumulate = render.value("accumulate", renderSettings_.accumulate);
         renderSettings_.accumulationLimit = render.value("accumulationLimit", renderSettings_.accumulationLimit);
         renderSettings_.resolutionScale = render.value("resolutionScale", renderSettings_.resolutionScale);
-        renderSettings_.requestedBackend = static_cast<RendererBackend>(render.value("requestedBackend", static_cast<uint32_t>(renderSettings_.requestedBackend)));
         renderSettings_.usePhysicalCamera = render.value("usePhysicalCamera", renderSettings_.usePhysicalCamera);
         renderSettings_.physicalAperture = render.value("physicalAperture", renderSettings_.physicalAperture);
         renderSettings_.physicalShutterSeconds = render.value("physicalShutterSeconds", renderSettings_.physicalShutterSeconds);

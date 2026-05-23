@@ -457,7 +457,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         {
             std::ostringstream resFmt;
             resFmt << extent.width << "x" << extent.height
-                   << "  " << rendererBackendName(state.renderer.activeBackend())
+                   << "  HW RT"
                    << "  reset:" << accumulationResetReasonName(state.renderer.lastAccumulationResetReason());
             hudText(4, resFmt.str().c_str(), IM_COL32(140, 140, 140, 220));
         }

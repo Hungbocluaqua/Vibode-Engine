@@ -116,7 +116,6 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.taaFeedback = settings.taaFeedback;
     render.debugView = settings.debugView;
     render.resolutionScale = settings.renderResolutionScale;
-    render.requestedBackend = settings.requestedBackend;
     document.setRenderSettings(render);
     Environment environment = document.environment();
     environment.backgroundIntensity = settings.environmentBackgroundIntensity;
@@ -162,7 +161,6 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.taaFeedback = render.taaFeedback;
     settings.debugView = render.debugView;
     settings.renderResolutionScale = render.resolutionScale;
-    settings.requestedBackend = render.requestedBackend;
     settings.environmentEnabled = environment.enabled;
     settings.environmentIntensity = environment.intensity;
     settings.environmentRotation = environment.rotation;
@@ -193,7 +191,7 @@ std::filesystem::path resolveProjectRoot() {
     std::filesystem::path candidate = std::filesystem::current_path();
     while (!candidate.empty()) {
         auto shadersDir = candidate / "native" / "vulkan" / "shaders";
-        if (std::filesystem::exists(shadersDir / "pathtrace.comp")) {
+        if (std::filesystem::exists(shadersDir / "pathtrace.rgen")) {
             return candidate;
         }
         candidate = candidate.parent_path();
@@ -261,14 +259,12 @@ Application::Application(
     RendererDebugView debugView,
     std::optional<std::filesystem::path> gltfPath,
     std::optional<std::filesystem::path> hdrPath,
-    RendererBackend requestedBackend,
     std::optional<std::filesystem::path> scenePath,
     std::optional<bool> denoiserOverride,
     std::optional<RestirMode> restirModeOverride,
     bool debugViewOverride,
     bool validationCameraMotion)
     : debugView_(debugView),
-      requestedBackend_(requestedBackend),
       gltfPath_(std::move(gltfPath)),
       hdrPath_(std::move(hdrPath)),
       scenePath_(std::move(scenePath)),
@@ -379,10 +375,8 @@ void Application::initVulkan() {
     (void)shaderDir;
     RendererSettings startupSettings{};
     startupSettings.debugView = debugView_;
-    startupSettings.requestedBackend = requestedBackend_;
     if (loadedSceneDocument) {
         startupSettings = rendererSettingsFromDocument(sceneDocument_, startupSettings);
-        startupSettings.requestedBackend = requestedBackend_;
         if (debugViewOverride_) {
             startupSettings.debugView = debugView_;
         } else {
@@ -1006,23 +1000,6 @@ void Application::applyRendererSettingsSafely(const RendererSettings& settings, 
     const RendererSettings current = pathTracer_->settings();
     const bool renderResolutionChanged =
         std::abs(settings.renderResolutionScale - current.renderResolutionScale) > 0.0001f;
-    const bool backendChanged = settings.requestedBackend != current.requestedBackend;
-    if (backendChanged && allowRenderResolutionChange) {
-        commandSystem_->waitIdle();
-        if (uiOverlay_) {
-            uiOverlay_->invalidateViewportTexture();
-        }
-        pathTracer_.reset();
-        createPathTracer(&settings);
-        applyActiveSceneCamera();
-        pathTracer_->resetAccumulation(AccumulationResetReason::BackendChanged);
-        commandSystem_->setPathTracer(pathTracer_.get());
-        return;
-    }
-    if (backendChanged) {
-        pendingPostFrameSettings_ = settings;
-        return;
-    }
     if (!renderResolutionChanged || allowRenderResolutionChange) {
         pathTracer_->applySettings(settings);
         return;
@@ -1072,8 +1049,7 @@ std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
         sceneAsset,
         sceneAsset != nullptr ? assets : nullptr,
         hdrPath_,
-        std::move(sceneCachePath),
-        settingsToRestore != nullptr ? settingsToRestore->requestedBackend : requestedBackend_);
+        std::move(sceneCachePath));
     if (settingsToRestore != nullptr) {
         renderer->applySettings(*settingsToRestore);
     }
