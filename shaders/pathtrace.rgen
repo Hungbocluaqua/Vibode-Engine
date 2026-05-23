@@ -173,13 +173,13 @@ bool trace_shadow(vec3 origin, vec3 direction, float tMax) {
     shadow_occluded = 1u;
     traceRayEXT(
         topLevelAS,
-        gl_RayFlagsSkipClosestHitShaderEXT,
+        gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
         0xff,
         1,
         2,
         1,
         origin,
-        0.001,
+        SHADOW_SELF_HIT_EPSILON,
         direction,
         tMax,
         1);
