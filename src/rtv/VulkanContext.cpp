@@ -25,11 +25,14 @@ const std::vector<const char*> requiredDeviceExtensions = {
 const std::vector<const char*> optionalRayTracingDeviceExtensions = {
     VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
     VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+    VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME,
     VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
     VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
     VK_KHR_SPIRV_1_4_EXTENSION_NAME,
     VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
 };
+
+const char* kVkNvInvocationReorderExtension = "VK_NV_ray_tracing_invocation_reorder";
 
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -98,6 +101,9 @@ VulkanContext::VulkanContext(GLFWwindow* window) {
 }
 
 VulkanContext::~VulkanContext() {
+    if (timelineSemaphore_ != VK_NULL_HANDLE) {
+        vkDestroySemaphore(device_, timelineSemaphore_, nullptr);
+    }
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
         vkDestroyDevice(device_, nullptr);
@@ -189,6 +195,9 @@ void VulkanContext::createDevice() {
         queueFamilies_.graphics.value(),
         queueFamilies_.present.value(),
     };
+    if (queueFamilies_.hasDedicatedCompute()) {
+		const_cast<std::set<uint32_t>&>(uniqueFamilies).insert(queueFamilies_.compute.value());
+    }
 
     const float priority = 1.0f;
     std::vector<VkDeviceQueueCreateInfo> queueInfos;
@@ -245,10 +254,28 @@ void VulkanContext::createDevice() {
     if (bindlessCapabilities_.updateAfterBind) {
         descriptorIndexing.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
     }
+    featureTail = &descriptorIndexing;
+
+    VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphore{};
+    timelineSemaphore.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    timelineSemaphore.timelineSemaphore = VK_TRUE;
+    timelineSemaphore.pNext = featureTail;
+
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV serFeatures{};
+    serFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
+    serFeatures.rayTracingInvocationReorder = VK_FALSE;
+    serFeatures.pNext = &timelineSemaphore;
+
+    VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtMaintenance1Features{};
+    rtMaintenance1Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
+    rtMaintenance1Features.rayTracingMaintenance1 = VK_FALSE;
+    rtMaintenance1Features.pNext = &serFeatures;
 
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &descriptorIndexing;
+    features2.features.shaderFloat64 = VK_TRUE;
+    features2.features.pipelineStatisticsQuery = VK_TRUE;
+    features2.pNext = &rtMaintenance1Features;
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -258,6 +285,24 @@ void VulkanContext::createDevice() {
     std::vector<const char*> enabledExtensions = requiredDeviceExtensions;
     if (rayTracingInfo_.capabilities.supported) {
         enabledExtensions.insert(enabledExtensions.end(), optionalRayTracingDeviceExtensions.begin(), optionalRayTracingDeviceExtensions.end());
+        bool supportsInvocationReorder = false;
+        {
+            uint32_t extCount = 0;
+            vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, nullptr);
+            std::vector<VkExtensionProperties> available(extCount);
+            vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, available.data());
+            for (const auto& ext : available) {
+                if (std::strcmp(ext.extensionName, kVkNvInvocationReorderExtension) == 0) {
+                    supportsInvocationReorder = true;
+                    break;
+                }
+            }
+        }
+        if (supportsInvocationReorder) {
+            supportsSER_ = true;
+            serFeatures.rayTracingInvocationReorder = VK_TRUE;
+            enabledExtensions.push_back(kVkNvInvocationReorderExtension);
+        }
     } else if (rayTracingInfo_.capabilities.bufferDeviceAddress) {
         enabledExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }
@@ -267,6 +312,17 @@ void VulkanContext::createDevice() {
     checkVk(vkCreateDevice(physicalDevice_, &createInfo, nullptr, &device_), "vkCreateDevice");
     vkGetDeviceQueue(device_, queueFamilies_.graphics.value(), 0, &graphicsQueue_);
     vkGetDeviceQueue(device_, queueFamilies_.present.value(), 0, &presentQueue_);
+    if (queueFamilies_.compute.has_value()) {
+        vkGetDeviceQueue(device_, queueFamilies_.compute.value(), 0, &computeQueue_);
+    }
+    VkSemaphoreTypeCreateInfo timelineCreateInfo{};
+    timelineCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    timelineCreateInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    timelineCreateInfo.initialValue = 0;
+    VkSemaphoreCreateInfo semCreateInfo{};
+    semCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semCreateInfo.pNext = &timelineCreateInfo;
+    vkCreateSemaphore(device_, &semCreateInfo, nullptr, &timelineSemaphore_);
 }
 
 bool VulkanContext::validationRequested() const {
@@ -309,9 +365,16 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice physicalDev
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, families.data());
 
     QueueFamilyIndices indices;
+    std::optional<uint32_t> dedicatedCompute;
     for (uint32_t i = 0; i < queueFamilyCount; ++i) {
-        if ((families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+        const bool hasGraphics = (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+        const bool hasCompute = (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+
+        if (hasGraphics) {
             indices.graphics = i;
+        }
+        if (hasCompute && !hasGraphics) {
+            dedicatedCompute = i;
         }
 
         VkBool32 presentSupported = VK_FALSE;
@@ -324,6 +387,13 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice physicalDev
             break;
         }
     }
+
+    if (dedicatedCompute.has_value()) {
+        indices.compute = *dedicatedCompute;
+    } else if (indices.graphics.has_value()) {
+        indices.compute = *indices.graphics;
+    }
+
     return indices;
 }
 

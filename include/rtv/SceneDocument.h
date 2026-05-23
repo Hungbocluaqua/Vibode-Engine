@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace rtv {
 
 class SceneDocument {
@@ -31,6 +33,10 @@ public:
     void setSourceHdrPath(std::optional<std::filesystem::path> path);
     [[nodiscard]] const std::optional<std::filesystem::path>& sourceGltfPath() const { return sourceGltfPath_; }
     [[nodiscard]] const std::optional<std::filesystem::path>& sourceHdrPath() const { return sourceHdrPath_; }
+
+    void setBookmarksJson(const nlohmann::json& json);
+    [[nodiscard]] const std::optional<nlohmann::json>& bookmarksJson() const { return bookmarksJson_; }
+    void clearBookmarksJson();
 
     void markDirty(SceneUpdateKind kind);
     void clearDirty();
@@ -56,6 +62,7 @@ private:
     std::string lastChangeReason_ = "SceneChanged";
     std::optional<std::filesystem::path> sourceGltfPath_;
     std::optional<std::filesystem::path> sourceHdrPath_;
+    std::optional<nlohmann::json> bookmarksJson_;
     std::vector<TextureAssetHandle> sceneTextures_;
     std::vector<MaterialAssetHandle> sceneMaterials_;
     std::vector<MeshAssetHandle> sceneMeshes_;

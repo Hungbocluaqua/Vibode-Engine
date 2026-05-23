@@ -19,8 +19,11 @@ struct CachedTextureData {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t channels = 4;
+    int mipLevels = 1;
     bool srgb = false;
     bool fallback = false;
+    bool isCompressed = false;
+    uint32_t compressedFormat = 0;
     std::vector<uint8_t> rgba8;
     uint32_t minFilter = 1;
     uint32_t magFilter = 1;

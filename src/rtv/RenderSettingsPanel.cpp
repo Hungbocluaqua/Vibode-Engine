@@ -1,6 +1,7 @@
 #include "rtv/RenderSettingsPanel.h"
 
 #include <imgui.h>
+#include <rtv/PhysicalCamera.h>
 
 #include <cmath>
 
@@ -63,6 +64,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.debugView = render.debugView;
         settings.renderResolutionScale = render.resolutionScale;
         settings.requestedBackend = render.requestedBackend;
+        settings.accumulationLimit = render.accumulationLimit;
+        settings.usePhysicalCamera = render.usePhysicalCamera;
+        settings.physicalAperture = render.physicalAperture;
+        settings.physicalShutterSeconds = render.physicalShutterSeconds;
+        settings.physicalIso = render.physicalIso;
+        settings.physicalExposureCompensation = render.physicalExposureCompensation;
         settings.environmentEnabled = environment.enabled;
         settings.environmentIntensity = environment.intensity;
         settings.environmentRotation = environment.rotation;
@@ -76,7 +83,6 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     uint32_t minAtrous = 1;
     uint32_t maxAtrous = 5;
 
-    ImGui::SeparatorText("Rendering");
     const char* backendItems[] = {"Auto", "Compute", "Hardware Ray Tracing"};
     int backendIndex = settings.requestedBackend == RendererBackend::Compute
         ? 1
@@ -93,6 +99,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     }
     ImGui::Text("Active Backend: %s", rendererBackendDisplayName(state.renderer.activeBackend()));
     ImGui::Text("Hardware RT: %s", state.renderer.hardwareRayTracingAvailable() ? "Available" : "Unavailable");
+
+    ImGui::SeparatorText("Rendering");
     editorDebugViewCombo("Debug View", settings, changed);
     changed |= ImGui::SliderScalar("Max Bounces", ImGuiDataType_U32, &settings.maxBounces, &minBounces, &maxBounces);
     tooltip("Number of ray bounces. Higher is more accurate and slower; 4-8 for preview, 16 for final.");
@@ -116,67 +124,98 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     tooltip("Hybrid ReSTIR direct-light mode. Classic NEE remains the reference baseline.");
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
 
-    ImGui::SeparatorText("Tone Mapping");
-    const char* toneMapperItems[] = {"Linear", "Reinhard", "Reinhard White", "ACES", "PBR Neutral"};
-    int toneMapperIndex = static_cast<int>(settings.toneMapper);
-    if (toneMapperIndex < 0 || toneMapperIndex > 4) {
-        toneMapperIndex = 3;
-    }
-    if (ImGui::Combo("Tone Mapper", &toneMapperIndex, toneMapperItems, 5)) {
-        settings.toneMapper = static_cast<ToneMapper>(toneMapperIndex);
-        changed = true;
-    }
-    changed |= ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 8.0f, "%.2f");
-    tooltip("Overall brightness multiplier. Higher values make the image brighter.");
-    changed |= ImGui::Checkbox("Auto Exposure", &settings.autoExposureEnabled);
-    if (ImGui::TreeNodeEx("Advanced Tone Mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
-        changed |= ImGui::SliderFloat("Target Luminance", &settings.targetLuminance, 0.01f, 1.0f, "%.3f");
-        changed |= ImGui::SliderFloat("Min Exposure", &settings.minExposure, 0.01f, 8.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Max Exposure", &settings.maxExposure, 0.01f, 16.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Adaptation Speed", &settings.adaptationSpeed, 0.0f, 10.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Contrast", &settings.contrast, 0.0f, 2.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Saturation", &settings.saturation, 0.0f, 2.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Brightness", &settings.brightness, -1.0f, 1.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Gamma", &settings.gamma, 0.1f, 4.0f, "%.2f");
-        changed |= ImGui::SliderFloat("White Point", &settings.whitePoint, 0.1f, 16.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Histogram Min EV", &settings.histogramMinLogLuminance, -20.0f, 0.0f, "%.1f");
-        tooltip("Controls the lower bound of the auto-exposure metering range.");
-        changed |= ImGui::SliderFloat("Histogram Max EV", &settings.histogramMaxLogLuminance, 0.0f, 20.0f, "%.1f");
-        tooltip("Controls the upper bound of the auto-exposure metering range.");
-        changed |= ImGui::SliderFloat("Histogram Low", &settings.histogramLowPercentile, 0.0f, 0.5f, "%.2f");
-        tooltip("Controls the low percentile used by auto-exposure metering.");
-        changed |= ImGui::SliderFloat("Histogram High", &settings.histogramHighPercentile, 0.5f, 1.0f, "%.2f");
-        tooltip("Controls the high percentile used by auto-exposure metering.");
-        changed |= ImGui::SliderFloat("Histogram Target", &settings.histogramTargetPercentile, 0.0f, 1.0f, "%.2f");
-        tooltip("Controls the target percentile used by auto-exposure metering.");
-        ImGui::TreePop();
+    if (ImGui::CollapsingHeader("Tone Mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const char* toneMapperItems2[] = {"Linear", "Reinhard", "Reinhard White", "ACES", "PBR Neutral"};
+        int toneMapperIndex2 = static_cast<int>(settings.toneMapper);
+        if (toneMapperIndex2 < 0 || toneMapperIndex2 > 4) {
+            toneMapperIndex2 = 3;
+        }
+        if (ImGui::Combo("Tone Mapper", &toneMapperIndex2, toneMapperItems2, 5)) {
+            settings.toneMapper = static_cast<ToneMapper>(toneMapperIndex2);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 8.0f, "%.2f");
+        tooltip("Overall brightness multiplier. Higher values make the image brighter.");
+        changed |= ImGui::Checkbox("Auto Exposure", &settings.autoExposureEnabled);
+        changed |= ImGui::Checkbox("Physical Camera", &settings.usePhysicalCamera);
+        tooltip("Use physically based exposure from aperture, shutter speed, and ISO.");
+        if (settings.usePhysicalCamera) {
+            changed |= ImGui::SliderFloat("Aperture (f-stop)", &settings.physicalAperture, 1.0f, 32.0f, "f/%.1f");
+            tooltip("Aperture f-number. Lower values let in more light.");
+            changed |= ImGui::SliderFloat("Shutter Speed", &settings.physicalShutterSeconds, 1.0f / 8000.0f, 30.0f, "%.4f s");
+            tooltip("Shutter duration in seconds.");
+            changed |= ImGui::SliderFloat("ISO", &settings.physicalIso, 50.0f, 12800.0f, "%.0f");
+            tooltip("Sensor sensitivity. Higher values brighten the image but add noise.");
+            changed |= ImGui::SliderFloat("Exposure Compensation", &settings.physicalExposureCompensation, -5.0f, 5.0f, "%.1f EV");
+            tooltip("Exposure compensation offset in EV.");
+            PhysicalCamera pc({settings.physicalAperture, settings.physicalShutterSeconds, settings.physicalIso, settings.physicalExposureCompensation});
+            ImGui::Text("EV100: %.1f", pc.ev100());
+        }
+        if (ImGui::TreeNodeEx("Advanced", ImGuiTreeNodeFlags_DefaultOpen)) {
+            changed |= ImGui::SliderFloat("Target Luminance", &settings.targetLuminance, 0.01f, 1.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Min Exposure", &settings.minExposure, 0.01f, 8.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Max Exposure", &settings.maxExposure, 0.01f, 16.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Adaptation Speed", &settings.adaptationSpeed, 0.0f, 10.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Contrast", &settings.contrast, 0.0f, 2.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Saturation", &settings.saturation, 0.0f, 2.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Brightness", &settings.brightness, -1.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Gamma", &settings.gamma, 0.1f, 4.0f, "%.2f");
+            changed |= ImGui::SliderFloat("White Point", &settings.whitePoint, 0.1f, 16.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Histogram Min EV", &settings.histogramMinLogLuminance, -20.0f, 0.0f, "%.1f");
+            tooltip("Controls the lower bound of the auto-exposure metering range.");
+            changed |= ImGui::SliderFloat("Histogram Max EV", &settings.histogramMaxLogLuminance, 0.0f, 20.0f, "%.1f");
+            tooltip("Controls the upper bound of the auto-exposure metering range.");
+            changed |= ImGui::SliderFloat("Histogram Low", &settings.histogramLowPercentile, 0.0f, 0.5f, "%.2f");
+            tooltip("Controls the low percentile used by auto-exposure metering.");
+            changed |= ImGui::SliderFloat("Histogram High", &settings.histogramHighPercentile, 0.5f, 1.0f, "%.2f");
+            tooltip("Controls the high percentile used by auto-exposure metering.");
+            changed |= ImGui::SliderFloat("Histogram Target", &settings.histogramTargetPercentile, 0.0f, 1.0f, "%.2f");
+            tooltip("Controls the target percentile used by auto-exposure metering.");
+            ImGui::TreePop();
+        }
     }
 
-    ImGui::SeparatorText("Sun");
-    changed |= ImGui::Checkbox("Sunlight", &settings.sunlightEnabled);
-    changed |= ImGui::SliderFloat("Sun Intensity", &settings.sunIntensity, 0.0f, 10.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Sun Elevation", &settings.sunElevation, -0.20f, 1.45f, "%.2f rad");
-    tooltip("Analytical atmosphere sun angle. Low values validate sunset and horizon scattering.");
-    changed |= ImGui::SliderFloat("Sun Size", &settings.sunAngularRadius, 0.0f, 0.08f, "%.4f");
-    changed |= ImGui::SliderFloat("Sky Intensity", &settings.skyIntensity, 0.0f, 3.0f, "%.2f");
+    if (ImGui::CollapsingHeader("Sun / Lighting", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("Sunlight", &settings.sunlightEnabled);
+        changed |= ImGui::SliderFloat("Sun Intensity", &settings.sunIntensity, 0.0f, 10.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Sun Elevation", &settings.sunElevation, -0.20f, 1.45f, "%.2f rad");
+        tooltip("Analytical atmosphere sun angle. Low values validate sunset and horizon scattering.");
+        changed |= ImGui::SliderFloat("Sun Size", &settings.sunAngularRadius, 0.0f, 0.08f, "%.4f");
+        changed |= ImGui::SliderFloat("Sky Intensity", &settings.skyIntensity, 0.0f, 3.0f, "%.2f");
+    }
 
-    ImGui::SeparatorText("Environment");
-    changed |= ImGui::Checkbox("Environment", &settings.environmentEnabled);
-    changed |= ImGui::SliderFloat("Environment Intensity", &settings.environmentIntensity, 0.0f, 8.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Background Intensity", &settings.environmentBackgroundIntensity, 0.0f, 2.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Environment Rotation", &settings.environmentRotation, -6.28318f, 6.28318f, "%.2f");
+    if (ImGui::CollapsingHeader("Atmosphere")) {
+        changed |= ImGui::SliderFloat("Sky Intensity", &settings.skyIntensity, 0.0f, 3.0f, "%.2f");
+        tooltip("Multiplier for atmospheric sky radiance.");
+        changed |= ImGui::SliderFloat("Rayleigh Scale Height", &settings.rayleighScaleHeight, 1000.0f, 20000.0f, "%.0f m");
+        tooltip("Scale height for Rayleigh (molecular) scattering. Higher = thicker blue atmosphere.");
+        changed |= ImGui::SliderFloat("Mie Scale Height", &settings.mieScaleHeight, 200.0f, 5000.0f, "%.0f m");
+        tooltip("Scale height for Mie (aerosol) scattering. Lower = denser horizon haze.");
+        changed |= ImGui::SliderFloat("Mie Anisotropy", &settings.mieAnisotropy, 0.0f, 0.99f, "%.2f");
+        tooltip("Forward/backward scattering asymmetry. Higher = more forward scattered light.");
+        changed |= ImGui::SliderFloat("Ground Albedo", &settings.groundAlbedo, 0.0f, 1.0f, "%.2f");
+        tooltip("Planetary ground reflectance. Affects atmospheric light bouncing off the terrain.");
+    }
 
-    ImGui::SeparatorText("Denoiser");
-    changed |= ImGui::Checkbox("Denoiser", &settings.denoiserEnabled);
-    changed |= ImGui::Checkbox("Denoise While Moving", &settings.denoiseWhileMoving);
-    changed |= ImGui::SliderScalar("A-trous Iterations", ImGuiDataType_U32, &settings.atrousIterations, &minAtrous, &maxAtrous);
-    tooltip("Denoiser iterations. More is smoother and slower.");
-    changed |= ImGui::SliderFloat("Denoiser Strength", &settings.denoiserStrength, 0.05f, 4.0f, "%.2f");
-    tooltip("Higher values denoise more aggressively and may lose detail.");
-    changed |= ImGui::Checkbox("TAA", &settings.taaEnabled);
-    tooltip("HDR temporal anti-aliasing pass after denoising and before tone mapping.");
-    changed |= ImGui::SliderFloat("TAA Feedback", &settings.taaFeedback, 0.01f, 0.5f, "%.2f");
-    tooltip("Lower values keep more history; higher values react faster to motion and lighting changes.");
+    if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("Show Environment", &settings.environmentEnabled);
+        changed |= ImGui::SliderFloat("Environment Intensity", &settings.environmentIntensity, 0.0f, 8.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Background Intensity", &settings.environmentBackgroundIntensity, 0.0f, 2.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Environment Rotation", &settings.environmentRotation, -6.28318f, 6.28318f, "%.2f");
+    }
+
+    if (ImGui::CollapsingHeader("Denoiser / TAA", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::Checkbox("Denoiser", &settings.denoiserEnabled);
+        changed |= ImGui::Checkbox("Denoise While Moving", &settings.denoiseWhileMoving);
+        changed |= ImGui::SliderScalar("A-trous Iterations", ImGuiDataType_U32, &settings.atrousIterations, &minAtrous, &maxAtrous);
+        tooltip("Denoiser iterations. More is smoother and slower.");
+        changed |= ImGui::SliderFloat("Denoiser Strength", &settings.denoiserStrength, 0.05f, 4.0f, "%.2f");
+        tooltip("Higher values denoise more aggressively and may lose detail.");
+        changed |= ImGui::Checkbox("TAA", &settings.taaEnabled);
+        tooltip("HDR temporal anti-aliasing pass after denoising and before tone mapping.");
+        changed |= ImGui::SliderFloat("TAA Feedback", &settings.taaFeedback, 0.01f, 0.5f, "%.2f");
+        tooltip("Lower values keep more history; higher values react faster to motion and lighting changes.");
+    }
 
     if (ImGui::Button("Reset Accumulation")) {
         requests.resetAccumulation = AccumulationResetReason::Manual;
@@ -237,6 +276,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.debugView = settings.debugView;
             render.resolutionScale = settings.renderResolutionScale;
             render.requestedBackend = settings.requestedBackend;
+            render.accumulationLimit = settings.accumulationLimit;
+            render.usePhysicalCamera = settings.usePhysicalCamera;
+            render.physicalAperture = settings.physicalAperture;
+            render.physicalShutterSeconds = settings.physicalShutterSeconds;
+            render.physicalIso = settings.physicalIso;
+            render.physicalExposureCompensation = settings.physicalExposureCompensation;
             environment.enabled = settings.environmentEnabled;
             environment.intensity = settings.environmentIntensity;
             environment.rotation = settings.environmentRotation;

@@ -59,7 +59,7 @@ VkDescriptorPool DescriptorAllocator::createPool() {
     const std::array<VkDescriptorPoolSize, 7> sizes = {{
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, setsPerPool_},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setsPerPool_ * 4},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, setsPerPool_},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, setsPerPool_ * 16384},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, setsPerPool_ * 8},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, setsPerPool_ * 4},
         {VK_DESCRIPTOR_TYPE_SAMPLER, setsPerPool_},

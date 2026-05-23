@@ -70,8 +70,23 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
     }
 
     const EditorSelectionId current = selection.current();
-    if (!current.valid()) {
+    const size_t selCount = selection.selectionCount();
+    if (!current.valid() && selCount == 0) {
         ImGui::TextDisabled("No selection");
+        ImGui::End();
+        return;
+    }
+
+    if (selCount > 1) {
+        ImGui::Text("%zu entities selected", selCount);
+        if (ImGui::Button("Delete Selected")) {
+            for (EntityId id : selection.selectedEntities()) {
+                requests.deleteEntity = id;
+            }
+        }
+        if (ImGui::Button("Clear Selection")) {
+            selection.clear();
+        }
         ImGui::End();
         return;
     }
@@ -254,6 +269,34 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 document.markDirty(SceneUpdateKind::VisibilityOnly);
                 requests.sceneUpdate = SceneUpdateKind::VisibilityOnly;
             }
+        }
+
+        ImGui::SeparatorText("Add Component");
+        if (!entity->light.has_value()) {
+            if (ImGui::Button("Light")) {
+                document.registry().addLight(entity->id, Light{});
+                document.markDirty(SceneUpdateKind::LightOnly);
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            }
+            ImGui::SameLine();
+        }
+        if (!entity->camera.has_value()) {
+            if (ImGui::Button("Camera")) {
+                document.registry().addCamera(entity->id, Camera{});
+                document.markDirty(SceneUpdateKind::CameraOnly);
+                requests.sceneUpdate = SceneUpdateKind::CameraOnly;
+            }
+            ImGui::SameLine();
+        }
+        if (!entity->meshRenderer.has_value()) {
+            if (ImGui::Button("Mesh Renderer")) {
+                document.registry().addMeshRenderer(entity->id, MeshRenderer{});
+                document.markDirty(SceneUpdateKind::TopologyChanged);
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+        }
+        if (entity->light.has_value() || entity->camera.has_value() || entity->meshRenderer.has_value()) {
+            ImGui::TextDisabled("All components attached");
         }
 
         ImGui::Separator();

@@ -1,5 +1,6 @@
 #include "rtv/AtmosphereLutSystem.h"
 
+#include "rtv/AtmosphereSamplingSystem.h"
 #include "rtv/ComputePipeline.h"
 #include "rtv/DescriptorAllocator.h"
 #include "rtv/DescriptorLayoutCache.h"
@@ -25,8 +26,9 @@ AtmosphereLutSystem::AtmosphereLutSystem(
     const ShaderModule& multiScatterShader,
     const ShaderModule& skyViewShader,
     const ShaderModule& skyReprojectShader,
-    const ShaderModule& aerialPerspectiveShader)
-    : device_(device) {
+    const ShaderModule& aerialPerspectiveShader,
+    const ShaderModule& skyCdfShader)
+    : device_(device), allocator_(allocator) {
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -74,8 +76,9 @@ AtmosphereLutSystem::AtmosphereLutSystem(
         .debugName = "atmosphere previous sky view lut",
     });
     aerialPerspectiveLut_.create(allocator, ImageDesc{
-        .width = 160,
-        .height = 32,
+        .width = 96,
+        .height = 96,
+        .depth = 48,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         .debugName = "atmosphere aerial perspective lut",
@@ -115,6 +118,14 @@ AtmosphereLutSystem::AtmosphereLutSystem(
         std::vector<VkDescriptorSetLayout>{aerialPerspectiveSetLayout_},
         ShaderReflection::mergePushConstants({aerialPerspectiveShader.reflection()}),
         pipelineCache);
+    samplingSystem_ = std::make_unique<AtmosphereSamplingSystem>(
+        device_,
+        allocator_,
+        layoutCache,
+        pipelineCache,
+        skyCdfShader,
+        skyViewLut_,
+        sampler_);
     markDirty(LutNode::Transmittance);
 }
 
@@ -132,8 +143,55 @@ void AtmosphereLutSystem::setSkyParameters(float sunElevation, float skyIntensit
     skyIntensity_ = skyIntensity;
 }
 
+void AtmosphereLutSystem::setAtmosphereParams(float rayleighScaleHeight, float mieScaleHeight, float mieAnisotropy, float groundAlbedo) {
+    const auto& p = model_.params();
+    const bool changed =
+        std::abs(p.rayleighScaleHeight - rayleighScaleHeight) > 0.5f ||
+        std::abs(p.mieScaleHeight - mieScaleHeight) > 0.5f ||
+        std::abs(p.miePhaseAnisotropy - mieAnisotropy) > 0.0001f ||
+        std::abs(p.groundAlbedo - groundAlbedo) > 0.0001f;
+    if (!changed) return;
+    AtmosphereParams next = p;
+    next.rayleighScaleHeight = rayleighScaleHeight;
+    next.mieScaleHeight = mieScaleHeight;
+    next.miePhaseAnisotropy = mieAnisotropy;
+    next.groundAlbedo = groundAlbedo;
+    model_.setParams(next);
+    markDirty();
+}
+
+void AtmosphereLutSystem::setQuality(AtmosphereQuality quality) {
+    switch (quality) {
+    case AtmosphereQuality::Low:
+        skyViewWidth_ = 128; skyViewHeight_ = 72; break;
+    case AtmosphereQuality::Medium:
+        skyViewWidth_ = 192; skyViewHeight_ = 108; break;
+    case AtmosphereQuality::High:
+        skyViewWidth_ = 256; skyViewHeight_ = 144; break;
+    case AtmosphereQuality::Cinematic:
+        skyViewWidth_ = 512; skyViewHeight_ = 288; break;
+    }
+    quality_ = quality;
+    markDirty();
+}
+
 void AtmosphereLutSystem::markDirty() {
     markDirty(LutNode::Transmittance);
+    previousCameraPosSet_ = false;
+}
+
+void AtmosphereLutSystem::setCameraPosition(glm::vec3 position) {
+    static constexpr float kCameraMoveRecomputeThreshold = 100.0f;
+    if (!previousCameraPosSet_) {
+        previousCameraPos_ = position;
+        previousCameraPosSet_ = true;
+        return;
+    }
+    float delta = glm::length(position - previousCameraPos_);
+    if (delta > kCameraMoveRecomputeThreshold) {
+        markDirty(LutNode::SkyView);
+    }
+    previousCameraPos_ = position;
 }
 
 void AtmosphereLutSystem::markDirty(LutNode node) {
@@ -353,6 +411,9 @@ void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, Descripto
     });
     rawSkyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     recordSkyViewReproject(commandBuffer, descriptors);
+    if (samplingSystem_ != nullptr) {
+        samplingSystem_->record(commandBuffer, descriptors);
+    }
     clearDirty(LutNode::SkyView);
     markGenerated(LutNode::SkyView);
     skyViewReady_ = true;
@@ -400,7 +461,7 @@ void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, 
     struct SkyReprojectPush {
         uint32_t hasHistory = 0;
         float historyWeight = 0.9f;
-        float maxLuminanceDelta = 0.15f;
+        float varianceGamma = 1.2f;
         uint32_t padding = 0;
     };
     const SkyReprojectPush push{
@@ -509,7 +570,10 @@ void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer,
     vkCmdPushConstants(commandBuffer, aerialPerspectivePipeline_->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, aerialPerspectivePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
-    aerialPerspectivePipeline_->dispatch(commandBuffer, aerialPerspectiveLut_.width(), aerialPerspectiveLut_.height(), 8, 8);
+    const uint32_t groupsX = (aerialPerspectiveLut_.width() + 7) / 8;
+    const uint32_t groupsY = (aerialPerspectiveLut_.height() + 7) / 8;
+    const uint32_t groupsZ = (aerialPerspectiveLut_.extent().depth + 3) / 4;
+    vkCmdDispatch(commandBuffer, groupsX, groupsY, groupsZ);
 
     barrier::cmdTransitionImage(commandBuffer, {
         .image = aerialPerspectiveLut_.handle(),

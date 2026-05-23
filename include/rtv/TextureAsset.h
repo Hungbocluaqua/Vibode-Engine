@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Volk/volk.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -36,9 +38,12 @@ struct TextureAsset {
     uint32_t width = 1;
     uint32_t height = 1;
     uint32_t channels = 4;
+    int mipLevels = 1;
     bool srgb = true;
     bool resident = false;
     bool fallback = false;
+    bool isCompressed = false;
+    VkFormat compressedFormat = VK_FORMAT_UNDEFINED;
     TextureSamplerDesc sampler{};
     std::vector<uint8_t> rgba8;
 };

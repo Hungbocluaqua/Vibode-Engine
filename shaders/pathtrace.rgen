@@ -64,7 +64,11 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
 
     bool valid = components.first_direct_sample_type != 0u && components.first_light_pdf > 1.0e-6;
     vec3 sampleValue = valid ? max(components.restir_initial_direct_light, vec3(0.0)) : vec3(0.0);
-    float sampleLum = dot(sampleValue, vec3(0.2126, 0.7152, 0.0722));
+    float sampleLum = luminance(sampleValue);
+    if (sampleLum > 50.0) {
+        sampleValue *= 50.0 / sampleLum;
+        sampleLum = 50.0;
+    }
     RestirReservoir current;
     current.metadata = uvec4(components.first_direct_sample_type, 0u, valid ? 1u : 0u, 0u);
     current.sample_value_confidence = vec4(sampleValue, valid ? 1.0 : 0.0);
@@ -204,19 +208,16 @@ bool sample_emissive_light(inout uint rng, vec3 hitPos, out vec3 wi, out vec3 em
         return false;
     }
 
-    float targetArea = rand_f32(rng) * totalWeight;
-    uint lo = 0u;
-    uint hi = mesh_params.light_count - 1u;
-    for (uint guard = 0u; guard < 32u && lo < hi; ++guard) {
-        uint mid = (lo + hi) / 2u;
-        if (targetArea <= light_records[mid].data0.y) {
-            hi = mid;
-        } else {
-            lo = mid + 1u;
-        }
+    uint lightIndex;
+    if (!sample_light_bvh(rng, lightIndex)) {
+        wi = vec3(0.0, 1.0, 0.0);
+        emission = vec3(0.0);
+        pdfSolidAngle = 0.0;
+        distanceToLight = 0.0;
+        return false;
     }
 
-    LightRecord selected = light_records[lo];
+    LightRecord selected = light_records[lightIndex];
     if (selected.metadata.x == 2u) {
         wi = normalize(selected.data1.xyz);
         emission = selected.data2.xyz;
@@ -423,12 +424,13 @@ vec3 fast_preview_ambient(Material material, vec3 normal) {
     vec3 up = vec3(0.0, 1.0, 0.0);
     vec3 sampleDir = normalize(normal + up * 0.45);
     float hemisphere = 0.35 + 0.65 * max(dot(normal, up), 0.0);
-    return material.color * environment_radiance(sampleDir) * (0.16 + 0.24 * hemisphere);
+    return material.color * environment_radiance(sampleDir, ATMOSPHERE_RAY_QUALITY_FAST) * (0.16 + 0.24 * hemisphere);
 }
 
 vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 dims, out bool did_hit, out float first_depth, out vec3 first_normal, out vec3 first_position, out PathComponents components) {
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
+    vec3 atmosTransmittance = vec3(1.0);
     components.direct_light = vec3(0.0);
     components.indirect_light = vec3(0.0);
     components.emissive_light = vec3(0.0);
@@ -451,6 +453,8 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     bool previousWasBrdfSample = false;
     float previousBrdfPdf = 0.0;
     vec3 previousSampleOrigin = vec3(0.0);
+    vec3 prevHitPos = ray.origin;
+    vec3 prevRayDir = ray.direction;
     did_hit = false;
     first_depth = 1e30;
     first_normal = vec3(0.0, 1.0, 0.0);
@@ -460,7 +464,8 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     for (uint bounce = 0u; bounce < bounceLimit; ++bounce) {
         RayPayload hit = trace_surface(ray.origin, ray.direction, 0.001, 10000.0);
         if (hit.hit == 0u) {
-            vec3 sky = environment_radiance(ray.direction);
+            const uint envQuality = bounce == 0u ? ATMOSPHERE_RAY_QUALITY_FULL : ATMOSPHERE_RAY_QUALITY_FAST;
+            vec3 sky = environment_radiance(ray.direction, envQuality);
             if (bounce == 0u) {
                 sky *= env_params.background_intensity;
             }
@@ -493,6 +498,19 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.mesh_id = hit.mesh_id;
         }
 
+        if (camera.sunlight_enabled != 0u && debug_params.view != 27u) {
+            float segDist = length(hit.world_pos - prevHitPos);
+            if (segDist > 0.1) {
+                if (bounce == 0u) {
+                    vec3 aerial = apply_analytical_aerial_perspective(vec3(0.0), prevHitPos, prevRayDir, segDist);
+                    radiance += aerial;
+                } else {
+                    vec3 segTrans = atmosphere_segment_transmittance(prevHitPos, prevRayDir, segDist, 8);
+                    atmosTransmittance *= segTrans;
+                }
+            }
+        }
+
         if (bounce == 0u && debug_params.view == 24u) {
             float testPdf;
             vec3 testDir = sample_cosine_hemisphere(rng, hit.normal, testPdf);
@@ -504,12 +522,12 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             float testPdf;
             vec3 testDir = sample_cosine_hemisphere(rng, hit.normal, testPdf);
             RayPayload testHit = trace_surface(hit.world_pos + hit.normal * SHADOW_SELF_HIT_EPSILON, normalize(testDir), 0.001, 10000.0);
-            components.secondary_env_radiance = testHit.hit == 0u ? environment_radiance(normalize(testDir)) : vec3(0.0);
+            components.secondary_env_radiance = testHit.hit == 0u ? environment_radiance(normalize(testDir), ATMOSPHERE_RAY_QUALITY_FAST) : vec3(0.0);
             return debug_display_tonemap(components.secondary_env_radiance);
         }
 
         if (length(material.emissive) > 0.0) {
-            vec3 emit = throughput * material.emissive;
+            vec3 emit = throughput * material.emissive * atmosTransmittance;
             if (previousWasBrdfSample) {
                 float lightPdf = emissive_hit_pdf(hit, material, previousSampleOrigin);
                 if (lightPdf > 0.0) {
@@ -556,19 +574,19 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 shadedDirect = previousReservoir.sample_value_confidence.rgb;
             }
         }
-        radiance += shadedDirect;
+        radiance += shadedDirect * atmosTransmittance;
         if (bounce == 0u) {
-            components.direct_light += shadedDirect;
-            components.restir_initial_direct_light += direct;
+            components.direct_light += shadedDirect * atmosTransmittance;
+            components.restir_initial_direct_light += direct * atmosTransmittance;
             components.first_light_pdf = lightPdf;
             components.first_bsdf_pdf = bsdfPdfForLight;
             components.first_mis_weight = misWeight;
             components.first_direct_sample_type = directSampleType;
         } else {
-            components.indirect_light += shadedDirect;
+            components.indirect_light += shadedDirect * atmosTransmittance;
         }
-        components.emissive_light += throughput * emissiveDirect;
-        components.environment_light += throughput * envDirect;
+        components.emissive_light += throughput * emissiveDirect * atmosTransmittance;
+        components.environment_light += throughput * envDirect * atmosTransmittance;
 
         if (camera.path_tracing_enabled == 0u) {
             vec3 previewNormal = normalize(hit.geom_normal);
@@ -579,10 +597,10 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 float ndl = max(dot(previewNormal, sunDir), 0.0);
                 previewSun = throughput * material.color * (1.0 / PI) * analytical_sun_center_radiance() * sun_transmittance(hit.world_pos, sunDir) * ndl;
             }
-            radiance += previewSun;
-            components.direct_light += previewSun;
-            radiance += previewAmbient;
-            components.indirect_light += previewAmbient;
+            radiance += previewSun * atmosTransmittance;
+            components.direct_light += previewSun * atmosTransmittance;
+            radiance += previewAmbient * atmosTransmittance;
+            components.indirect_light += previewAmbient * atmosTransmittance;
             break;
         }
 
@@ -633,6 +651,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             }
         }
 
+        prevHitPos = hit.world_pos;
+        prevRayDir = ray.direction;
+
         if (bounce > 2u && debug_params.view != 27u) {
             float p = clamp(max(max(throughput.r, throughput.g), throughput.b), 0.05, 0.95);
             if (rand_f32(rng) > p) {
@@ -666,7 +687,8 @@ void main() {
     }
 
     uint pixel_index = pixel.y * size.x + pixel.x;
-    uint rng = pcg_hash(pixel_index + camera.frame_count * 9781u);
+    vec2 blue = blue_noise_2d(ivec2(pixel), camera.frame_count);
+    uint rng = pcg_hash(pixel_index + camera.frame_count * 9781u + uint(blue.x * 65536.0));
     vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
     vec2 uv = (vec2(pixel) + jitter) / vec2(size);
     vec2 ndc = uv * 2.0 - vec2(1.0);
@@ -693,7 +715,7 @@ void main() {
     float lum = dot(sample_color, vec3(0.2126, 0.7152, 0.0722));
     float avgLum = dot(average, vec3(0.2126, 0.7152, 0.0722));
     variance_buffer[pixel_index] = pack_variance(abs(lum - avgLum));
-    depth_normal_buffer[pixel_index] = pack_depth_normal(hit_depth, hit_normal);
+    depth_normal_buffer[pixel_index] = pack_depth_normal(hit_depth, hit_normal, components.first_roughness);
     world_position_buffer[pixel_index] = did_hit ? pack_world_position(hit_position) : uvec2(0u);
     uint packedVelocity = did_hit
         ? compute_surface_velocity(hit_position, components.first_local_pos, components.instance_id, ivec2(size))
@@ -761,14 +783,14 @@ void main() {
     } else if (debug_params.view == 26u) {
         output_value = debug_display_tonemap(components.secondary_env_radiance);
     } else if (debug_params.view == 29u) {
-        output_value = debug_display_tonemap(atmosphere_sky_radiance(ray.direction) * max(debug_params.scale, 1.0));
+        output_value = debug_display_tonemap(atmosphere_sky_radiance(ray.direction, ATMOSPHERE_RAY_QUALITY_FULL) * max(debug_params.scale, 1.0));
     } else if (debug_params.view == 30u) {
         vec3 transmittance = sample_atmosphere_transmittance_lut(camera.pos.xyz, ray.direction);
         output_value = pow(clamp(transmittance, vec3(0.0), vec3(1.0)), vec3(2.0));
     } else if (debug_params.view == 31u) {
         float viewMu = clamp(normalize(ray.direction).y, -0.15, 1.0);
         vec2 lutUv = vec2(0.8, clamp((viewMu + 0.15) / 1.15, 0.0, 1.0));
-        vec4 aerial = texture(sampler2D(atmosphere_aerial_perspective_lut, atmosphere_sampler), lutUv);
+        vec4 aerial = texture(sampler3D(atmosphere_aerial_perspective_lut, atmosphere_sampler), vec3(lutUv, 0.5));
         output_value = debug_display_tonemap((aerial.rgb + vec3(1.0 - aerial.a) * 0.15) * max(debug_params.scale, 1.0) * 3.0);
     } else if (debug_params.view == 32u) {
         vec3 multiScatter = sample_multi_scatter_lut_debug(ray.direction);

@@ -14,6 +14,7 @@ find_package(Stb REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(imguizmo CONFIG REQUIRED)
 find_package(unofficial-spirv-reflect CONFIG REQUIRED)
+find_package(Ktx CONFIG REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
 if(NOT DEFINED ENV{VULKAN_SDK})
@@ -54,8 +55,10 @@ add_executable(rtvulkan
     src/rtv/AssetBrowserPanel.cpp
     src/rtv/AtmosphereLutSystem.cpp
     src/rtv/AtmosphereModel.cpp
+    src/rtv/AtmosphereSamplingSystem.cpp
     src/rtv/BatchUploader.cpp
     src/rtv/BindlessResources.cpp
+    src/rtv/CameraBookmark.cpp
     src/rtv/Buffer.cpp
     src/rtv/BufferUploader.cpp
     src/rtv/BvhBuilder.cpp
@@ -71,12 +74,14 @@ add_executable(rtvulkan
     src/rtv/EditorDockspace.cpp
     src/rtv/EditorLayer.cpp
     src/rtv/EditorPanels.cpp
+    src/rtv/EditorPreferences.cpp
     src/rtv/EditorSelection.cpp
     src/rtv/Entity.cpp
     src/rtv/EnvironmentImportanceSampler.cpp
     src/rtv/FileDialog.cpp
     src/rtv/FrameResources.cpp
     src/rtv/GltfLoader.cpp
+    src/rtv/GpuDiagnosticsPanel.cpp
     src/rtv/GpuProfiler.cpp
     src/rtv/GpuScene.cpp
     src/rtv/GpuValidation.cpp
@@ -86,6 +91,7 @@ add_executable(rtvulkan
     src/rtv/ImageBarrier.cpp
     src/rtv/InspectorPanel.cpp
     src/rtv/KeyBindings.cpp
+    src/rtv/LightBvh.cpp
     src/rtv/MaterialEditorPanel.cpp
     src/rtv/MortonCodes.cpp
     src/rtv/NotificationManager.cpp
@@ -109,9 +115,11 @@ add_executable(rtvulkan
     src/rtv/SceneEventBus.cpp
     src/rtv/SceneHierarchyPanel.cpp
     src/rtv/SceneOperations.cpp
+    src/rtv/SceneStatsPanel.cpp
     src/rtv/SceneRegistry.cpp
     src/rtv/SceneToGpuSceneBuilder.cpp
     src/rtv/SceneUpdateRouter.cpp
+    src/rtv/SkySystem.cpp
     src/rtv/SceneCache.cpp
     src/rtv/ShaderCompiler.cpp
     src/rtv/ShaderModule.cpp
@@ -123,6 +131,7 @@ add_executable(rtvulkan
     src/rtv/UndoStack.cpp
     src/rtv/UploadContext.cpp
     src/rtv/ValidationSceneSuite.cpp
+    src/rtv/VarianceEstimator.cpp
     src/rtv/ViewportPanel.cpp
     src/rtv/VulkanContext.cpp
 )
@@ -137,6 +146,7 @@ target_link_libraries(rtvulkan PRIVATE
     nlohmann_json::nlohmann_json
     imguizmo::imguizmo
     unofficial::spirv-reflect
+    KTX::ktx
 )
 
 if(WIN32)

@@ -15,6 +15,55 @@ public:
     [[nodiscard]] virtual const std::string& label() const = 0;
 };
 
+class MacroCommand final : public ICommand {
+public:
+    explicit MacroCommand(std::string label) : label_(std::move(label)) {}
+
+    void addCommand(std::unique_ptr<ICommand> command) {
+        commands_.push_back(std::move(command));
+    }
+
+    void undo() override {
+        for (auto it = commands_.rbegin(); it != commands_.rend(); ++it) {
+            (*it)->undo();
+        }
+    }
+
+    void redo() override {
+        for (auto& cmd : commands_) {
+            cmd->redo();
+        }
+    }
+
+    [[nodiscard]] const std::string& label() const override { return label_; }
+    [[nodiscard]] size_t commandCount() const { return commands_.size(); }
+
+private:
+    std::string label_;
+    std::vector<std::unique_ptr<ICommand>> commands_;
+};
+
+class UndoStack;
+
+class CommandTransaction {
+public:
+    explicit CommandTransaction(UndoStack& stack, std::string label);
+    ~CommandTransaction();
+
+    CommandTransaction(const CommandTransaction&) = delete;
+    CommandTransaction& operator=(const CommandTransaction&) = delete;
+
+    void append(std::unique_ptr<ICommand> cmd);
+    void commit();
+    void cancel();
+
+private:
+    UndoStack& stack_;
+    std::string label_;
+    std::vector<std::unique_ptr<ICommand>> pending_;
+    bool active_ = true;
+};
+
 class UndoStack {
 public:
     void pushCommand(std::unique_ptr<ICommand> command);

@@ -1,6 +1,7 @@
 #include "rtv/PathTracerRenderer.h"
 
 #include "rtv/AtmosphereLutSystem.h"
+#include "rtv/AtmosphereSamplingSystem.h"
 #include "rtv/BufferUploader.h"
 #include "rtv/Check.h"
 #include "rtv/ComputePipeline.h"
@@ -104,10 +105,8 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(16, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(18, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
-        descriptorBinding(19, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, allRt, 128),
         descriptorBinding(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
-        descriptorBinding(23, VK_DESCRIPTOR_TYPE_SAMPLER, allRt, 128),
         descriptorBinding(24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
@@ -120,6 +119,8 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(37, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, allRt),
         descriptorBinding(38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
+        descriptorBinding(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, allRt, 1024),
     };
 }
 
@@ -180,7 +181,9 @@ PathTracerRenderer::PathTracerRenderer(
     std::cout << "Renderer backend requested: " << rendererBackendName(requestedBackend_)
               << "\nRenderer backend active: " << rendererBackendName(activeBackend_) << '\n';
 
-    ShaderCompiler compiler(glslangPath());
+    shaderCompiler_ = std::make_unique<ShaderCompiler>(glslangPath());
+    shaderOutputDirectory_ = shaderOutputDirectory;
+    ShaderCompiler& compiler = *shaderCompiler_;
     const auto pathSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace.comp", shaderOutputDirectory);
     const auto denoiserSpv = compiler.compileIfNeeded(shaderDirectory / "denoiser.comp", shaderOutputDirectory);
     const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
@@ -191,10 +194,13 @@ PathTracerRenderer::PathTracerRenderer(
     const auto skyViewSpv = compiler.compileIfNeeded(shaderDirectory / "sky_view_lut.comp", shaderOutputDirectory);
     const auto skyReprojectSpv = compiler.compileIfNeeded(shaderDirectory / "sky_reproject.comp", shaderOutputDirectory);
     const auto aerialPerspectiveSpv = compiler.compileIfNeeded(shaderDirectory / "aerial_perspective_lut.comp", shaderOutputDirectory);
+    const auto skyCdfSpv = compiler.compileIfNeeded(shaderDirectory / "sky_cdf.comp", shaderOutputDirectory);
     const auto selectionSpv = compiler.compileIfNeeded(shaderDirectory / "selection_outline.comp", shaderOutputDirectory);
     const auto histogramSpv = compiler.compileIfNeeded(shaderDirectory / "luminance_histogram.comp", shaderOutputDirectory);
     const auto exposureSpv = compiler.compileIfNeeded(shaderDirectory / "exposure_reduce.comp", shaderOutputDirectory);
     const auto toneMapSpv = compiler.compileIfNeeded(shaderDirectory / "tone_map.comp", shaderOutputDirectory);
+    const auto wavefrontGenerateSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_generate.comp", shaderOutputDirectory);
+    const auto wavefrontShadeSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_shade.comp", shaderOutputDirectory);
     const auto vertSpv = compiler.compileIfNeeded(shaderDirectory / "fullscreen.vert", shaderOutputDirectory);
     const auto fragSpv = compiler.compileIfNeeded(shaderDirectory / "fullscreen.frag", shaderOutputDirectory);
 
@@ -208,10 +214,13 @@ PathTracerRenderer::PathTracerRenderer(
     skyViewShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(skyViewSpv), "atmosphere sky view lut compute");
     skyReprojectShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(skyReprojectSpv), "atmosphere sky reproject compute");
     aerialPerspectiveShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(aerialPerspectiveSpv), "atmosphere aerial perspective lut compute");
+    skyCdfShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(skyCdfSpv), "atmosphere sky CDF compute");
     selectionOutlineShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(selectionSpv), "selection outline compute");
     luminanceHistogramShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(histogramSpv), "luminance histogram compute");
     exposureReduceShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(exposureSpv), "exposure reduce compute");
     toneMapShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(toneMapSpv), "tone map compute");
+    wavefrontGenerateShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(wavefrontGenerateSpv), "wavefront generate compute");
+    wavefrontShadeShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(wavefrontShadeSpv), "wavefront shade compute");
     fullscreenVertexShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(vertSpv), "fullscreen vertex");
     fullscreenFragmentShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(fragSpv), "fullscreen fragment");
     if (activeBackend_ == RendererBackend::HardwareRayTracing) {
@@ -229,8 +238,36 @@ PathTracerRenderer::PathTracerRenderer(
         shadowAnyHitShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(shadowAnyHitSpv), "path trace shadow any-hit");
     }
 
+    shaderSources_ = {
+        shaderDirectory / "pathtrace.comp",
+        shaderDirectory / "denoiser.comp",
+        shaderDirectory / "taa.comp",
+        shaderDirectory / "restir_spatial.comp",
+        shaderDirectory / "fog_integrate.comp",
+        shaderDirectory / "transmittance_lut.comp",
+        shaderDirectory / "multi_scatter_lut.comp",
+        shaderDirectory / "sky_view_lut.comp",
+        shaderDirectory / "sky_reproject.comp",
+        shaderDirectory / "aerial_perspective_lut.comp",
+        shaderDirectory / "sky_cdf.comp",
+        shaderDirectory / "selection_outline.comp",
+        shaderDirectory / "luminance_histogram.comp",
+        shaderDirectory / "exposure_reduce.comp",
+        shaderDirectory / "tone_map.comp",
+        shaderDirectory / "fullscreen.vert",
+        shaderDirectory / "fullscreen.frag",
+        shaderDirectory / "wavefront_generate.comp",
+        shaderDirectory / "wavefront_shade.comp",
+        shaderDirectory / "pathtrace.rgen",
+        shaderDirectory / "pathtrace.rmiss",
+        shaderDirectory / "pathtrace_shadow.rmiss",
+        shaderDirectory / "pathtrace.rchit",
+        shaderDirectory / "pathtrace.rahit",
+        shaderDirectory / "pathtrace_shadow.rahit",
+    };
+
     layoutCache_ = std::make_unique<DescriptorLayoutCache>(context_.device());
-    pipelineCache_ = std::make_unique<PipelineCache>(context_.device());
+    pipelineCache_ = std::make_unique<PipelineCache>(context_.device(), shaderOutputDirectory / "pipeline_cache.bin");
     atmosphereLutSystem_ = std::make_unique<AtmosphereLutSystem>(
         context_.device(),
         allocator_,
@@ -240,13 +277,19 @@ PathTracerRenderer::PathTracerRenderer(
         *multiScatterShader_,
         *skyViewShader_,
         *skyReprojectShader_,
-        *aerialPerspectiveShader_);
+        *aerialPerspectiveShader_,
+        *skyCdfShader_);
     auto pathTraceBindings = ShaderReflection::bindingsForSet({pathTraceShader_->reflection()}, 0);
+    for (VkDescriptorSetLayoutBinding& b : pathTraceBindings) {
+        if (b.binding == 41 && b.descriptorCount < 1024) {
+            b.descriptorCount = 1024;
+        }
+    }
     std::vector<VkDescriptorBindingFlags> pathTraceBindingFlags(pathTraceBindings.size(), 0);
     const BindlessCapabilities& bindless = context_.bindlessCapabilities();
     if (bindless.partiallyBound || bindless.updateAfterBind) {
         for (size_t i = 0; i < pathTraceBindings.size(); ++i) {
-            if (pathTraceBindings[i].binding == 19 && pathTraceBindings[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+            if (pathTraceBindings[i].binding == 41) {
                 if (bindless.partiallyBound) {
                     pathTraceBindingFlags[i] |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
                 }
@@ -266,6 +309,8 @@ PathTracerRenderer::PathTracerRenderer(
     for (VkDescriptorSetLayoutBinding& binding : atmosphereBindings) {
         binding.stageFlags = VK_SHADER_STAGE_ALL;
     }
+    atmosphereBindings.push_back(descriptorBinding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_ALL));
+    atmosphereBindings.push_back(descriptorBinding(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_ALL));
     atmosphereSetLayout_ = layoutCache_->createLayout(std::move(atmosphereBindings));
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
@@ -284,11 +329,13 @@ PathTracerRenderer::PathTracerRenderer(
         const auto rtBindings = rayTracingBindings();
         const BindlessCapabilities& rtBindless = context_.bindlessCapabilities();
         for (size_t i = 0; i < rtBindings.size(); ++i) {
-            if ((rtBindings[i].binding == 19 || rtBindings[i].binding == 23) && rtBindless.partiallyBound) {
-                rtBindingFlags[i] |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-            }
-            if (rtBindings[i].binding == 19 && rtBindless.updateAfterBind) {
-                rtBindingFlags[i] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+            if (rtBindings[i].binding == 41) {
+                if (rtBindless.partiallyBound) {
+                    rtBindingFlags[i] |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+                }
+                if (rtBindless.updateAfterBind) {
+                    rtBindingFlags[i] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+                }
             }
         }
         const VkDescriptorSetLayoutCreateFlags rtLayoutFlags =
@@ -383,6 +430,9 @@ PathTracerRenderer::PathTracerRenderer(
     frames_.push_back(std::make_unique<FrameResources>(context_.device(), allocator_, 64 * 1024));
     profilers_.emplace_back(context_.device(), context_.physicalDevice());
     profilers_.emplace_back(context_.device(), context_.physicalDevice());
+    for (auto& p : profilers_) {
+        p.createPipelineStatsQuery(context_.device(), context_.supportsHardwareRayTracing());
+    }
 
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -407,9 +457,24 @@ PathTracerRenderer::PathTracerRenderer(
 }
 
 PathTracerRenderer::~PathTracerRenderer() {
+    if (pipelineCache_ && !shaderOutputDirectory_.empty()) {
+        pipelineCache_->saveToFile(shaderOutputDirectory_ / "pipeline_cache.bin");
+    }
     if (fullscreenSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(context_.device(), fullscreenSampler_, nullptr);
     }
+}
+
+bool PathTracerRenderer::shadersNeedReload() {
+    if (shaderCompiler_ == nullptr) {
+        return false;
+    }
+    for (const auto& source : shaderSources_) {
+        if (shaderCompiler_->needsCompile(source, shaderOutputDirectory_ / source.filename().replace_extension(".spv"))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D extent) {
@@ -464,6 +529,10 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     next.histogramHighPercentile = std::clamp(next.histogramHighPercentile, 0.0f, 1.0f);
     next.histogramTargetPercentile = std::clamp(next.histogramTargetPercentile, 0.0f, 1.0f);
     next.sunAngularRadius = std::max(0.0f, next.sunAngularRadius);
+    next.rayleighScaleHeight = std::clamp(next.rayleighScaleHeight, 1000.0f, 20000.0f);
+    next.mieScaleHeight = std::clamp(next.mieScaleHeight, 200.0f, 5000.0f);
+    next.mieAnisotropy = std::clamp(next.mieAnisotropy, 0.0f, 0.99f);
+    next.groundAlbedo = std::clamp(next.groundAlbedo, 0.0f, 1.0f);
     next.indirectStrength = std::max(0.0f, next.indirectStrength);
     next.environmentIntensity = std::max(0.0f, next.environmentIntensity);
     next.environmentBackgroundIntensity = std::max(0.0f, next.environmentBackgroundIntensity);
@@ -534,7 +603,11 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.sunIntensity - settings_.sunIntensity) > 0.0001f ||
         std::abs(next.skyIntensity - settings_.skyIntensity) > 0.0001f ||
         std::abs(next.sunElevation - settings_.sunElevation) > 0.0001f ||
-        std::abs(next.sunAngularRadius - settings_.sunAngularRadius) > 0.0001f;
+        std::abs(next.sunAngularRadius - settings_.sunAngularRadius) > 0.0001f ||
+        std::abs(next.rayleighScaleHeight - settings_.rayleighScaleHeight) > 0.5f ||
+        std::abs(next.mieScaleHeight - settings_.mieScaleHeight) > 0.5f ||
+        std::abs(next.mieAnisotropy - settings_.mieAnisotropy) > 0.0001f ||
+        std::abs(next.groundAlbedo - settings_.groundAlbedo) > 0.0001f;
     const bool denoiserChanged =
         next.denoiserEnabled != settings_.denoiserEnabled ||
         next.denoiseWhileMoving != settings_.denoiseWhileMoving ||
@@ -556,6 +629,8 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f;
 
     settings_ = next;
+
+    physicalCamera_.setSettings({settings_.physicalAperture, settings_.physicalShutterSeconds, settings_.physicalIso, settings_.physicalExposureCompensation});
     const bool environmentUploaded = scene_.setEnvironmentControls(
         settings_.environmentEnabled,
         settings_.environmentIntensity,
@@ -714,6 +789,14 @@ const GpuFrameTimings& PathTracerRenderer::timings() const {
     return profilers_.empty() ? empty : profilers_.front().timings();
 }
 
+GpuPipelineStatistics PathTracerRenderer::pipelineStats() const {
+    static const GpuPipelineStatistics empty{};
+    if (currentProfiler_ != nullptr) {
+        return currentProfiler_->pipelineStats();
+    }
+    return profilers_.empty() ? empty : profilers_.front().pipelineStats();
+}
+
 bool PathTracerRenderer::hardwareRayTracingAvailable() const {
     return context_.supportsHardwareRayTracing();
 }
@@ -829,10 +912,10 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D extent) {
         .debugName = "path variance packed",
     });
     depthNormalBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(uint32_t) * 2,
+        .size = pixelCount * sizeof(uint32_t) * 3,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory = BufferMemory::GpuOnly,
-        .debugName = "path depth normal packed",
+        .debugName = "path depth normal roughness packed",
     });
     worldPositionBuffer_.create(allocator_, BufferDesc{
         .size = pixelCount * sizeof(uint32_t) * 2,
@@ -936,7 +1019,9 @@ void PathTracerRenderer::updateCamera() {
 
     camera_.sunIntensity = settings_.sunIntensity;
     camera_.skyIntensity = settings_.skyIntensity;
-    camera_.exposure = settings_.exposure;
+    camera_.exposure = settings_.usePhysicalCamera
+        ? 2.0f * std::exp2(14.0f - physicalCamera_.ev100())
+        : settings_.exposure;
     camera_.pathTracingEnabled = settings_.pathTracingEnabled ? 1u : 0u;
     camera_.maxBounces = settings_.maxBounces;
     camera_.sunlightEnabled = settings_.sunlightEnabled ? 1u : 0u;
@@ -950,7 +1035,7 @@ void PathTracerRenderer::updateCamera() {
         settings_.sunElevation,
         static_cast<float>(settings_.restirMode),
         temporalHistoryAvailable ? 1.0f : 0.0f,
-        0.0f);
+        5.5f); // fast sky normalization
     camera_.frameCount = frameCount_;
 
     const float aspect = extent_.height > 0 ? static_cast<float>(extent_.width) / static_cast<float>(extent_.height) : 1.0f;
@@ -1038,14 +1123,23 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
     currentProfiler_->resetForFrame(commandBuffer);
     if (atmosphereLutSystem_ != nullptr) {
         validationLog_.recordPass("atmosphere lut update");
+        currentProfiler_->write(commandBuffer, GpuProfiler::AtmosphereStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
         atmosphereLutSystem_->setSkyParameters(settings_.sunElevation, settings_.skyIntensity);
+        atmosphereLutSystem_->setAtmosphereParams(settings_.rayleighScaleHeight, settings_.mieScaleHeight, settings_.mieAnisotropy, settings_.groundAlbedo);
+        atmosphereLutSystem_->setCameraPosition(glm::vec3(camera_.pos));
         atmosphereLutSystem_->record(commandBuffer, currentFrame_->descriptors());
+        currentProfiler_->write(commandBuffer, GpuProfiler::AtmosphereEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
     currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceStart, traceStage);
     recordPathTraceGraph(commandBuffer);
-    recordRestirSpatial(commandBuffer);
-    recordHeightFog(commandBuffer);
     currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceEnd, traceStage);
+    currentProfiler_->markStatsSubmitted();
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    recordRestirSpatial(commandBuffer);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    currentProfiler_->write(commandBuffer, GpuProfiler::FogIntegrateStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    recordHeightFog(commandBuffer);
+    currentProfiler_->write(commandBuffer, GpuProfiler::FogIntegrateEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     if (shouldRunDenoiser()) {
         recordDenoiser(commandBuffer);
@@ -1077,7 +1171,7 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
 }
 
 void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     auto imageResource = [](const Image& image, const char* name) {
         return RenderGraphResource{
             .type = RenderGraphResource::Type::Texture,
@@ -1140,8 +1234,10 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass(activeBackend_ == RendererBackend::HardwareRayTracing ? "path tracing rt" : "path tracing compute");
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
+    currentProfiler_->beginPipelineStats(commandBuffer);
     if (activeBackend_ == RendererBackend::HardwareRayTracing) {
         recordHardwarePathTrace(commandBuffer);
+        currentProfiler_->endPipelineStats(commandBuffer);
         return;
     }
 
@@ -1167,11 +1263,10 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
         .writeBuffer(16, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.envParamsBuffer().descriptorInfo())
         .writeBuffer(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.spheres().descriptorInfo())
         .writeBuffer(18, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameDebugParamsOffset, sizeof(RendererDebugParams)))
-        .writeImageArray(19, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, scene_.materialTextureDescriptors())
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.primitiveRecords().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
-        .writeImageArray(23, VK_DESCRIPTOR_TYPE_SAMPLER, scene_.materialSamplerDescriptors())
         .writeBuffer(24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightRecords().descriptorInfo())
+        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .writeBuffer(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
         .writeBuffer(26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
         .writeBuffer(27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
@@ -1185,6 +1280,7 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
         .writeBuffer(35, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFramePrevCameraUniformOffset, sizeof(PrevCameraUniform)))
         .writeBuffer(36, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirReservoirBuffer_.descriptorInfo())
         .writeBuffer(37, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirReservoirBuffer_.descriptorInfo())
+        .writeBuffer(38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightBvhNodes().descriptorInfo())
         .update(context_.device(), set);
     DescriptorWriter()
         .writeImage(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->transmittanceLut().sampledDescriptor(VK_NULL_HANDLE))
@@ -1192,6 +1288,8 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
         .writeImage(2, VK_DESCRIPTOR_TYPE_SAMPLER, VkDescriptorImageInfo{.sampler = atmosphereLutSystem_->sampler()})
         .writeImage(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->aerialPerspectiveLut().sampledDescriptor(VK_NULL_HANDLE))
         .writeImage(4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->multiScatterLut().sampledDescriptor(VK_NULL_HANDLE))
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, atmosphereLutSystem_->samplingSystem() != nullptr ? atmosphereLutSystem_->samplingSystem()->cdfRows().descriptorInfo() : scene_.envRows().descriptorInfo())
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, atmosphereLutSystem_->samplingSystem() != nullptr ? atmosphereLutSystem_->samplingSystem()->cdfCols().descriptorInfo() : scene_.envCols().descriptorInfo())
         .update(context_.device(), atmosphereSet);
 
     pathTracePipeline_->bind(commandBuffer);
@@ -1205,7 +1303,7 @@ void PathTracerRenderer::recordRestirSpatial(VkCommandBuffer commandBuffer) {
         return;
     }
 
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     auto bufferResource = [](const Buffer& buffer, const char* name, std::optional<ResourceAccess> initial = std::nullopt) {
         RenderGraphResource resource{
             .type = RenderGraphResource::Type::Buffer,
@@ -1274,7 +1372,7 @@ void PathTracerRenderer::recordHeightFog(VkCommandBuffer commandBuffer) {
         return;
     }
 
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     auto imageResource = [](const Image& image, const char* name, ResourceAccess initial) {
         return RenderGraphResource{
             .type = RenderGraphResource::Type::Texture,
@@ -1337,6 +1435,8 @@ void PathTracerRenderer::recordHeightFogPass(VkCommandBuffer commandBuffer) {
         .writeImage(2, VK_DESCRIPTOR_TYPE_SAMPLER, VkDescriptorImageInfo{.sampler = atmosphereLutSystem_->sampler()})
         .writeImage(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->aerialPerspectiveLut().sampledDescriptor(VK_NULL_HANDLE))
         .writeImage(4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->multiScatterLut().sampledDescriptor(VK_NULL_HANDLE))
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, atmosphereLutSystem_->samplingSystem() != nullptr ? atmosphereLutSystem_->samplingSystem()->cdfRows().descriptorInfo() : scene_.envRows().descriptorInfo())
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, atmosphereLutSystem_->samplingSystem() != nullptr ? atmosphereLutSystem_->samplingSystem()->cdfCols().descriptorInfo() : scene_.envCols().descriptorInfo())
         .update(context_.device(), atmosphereSet);
 
     fogPipeline_->bind(commandBuffer);
@@ -1350,7 +1450,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         return;
     }
 
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     auto imageResource = [](const Image& image, const char* name) {
         return RenderGraphResource{
             .type = RenderGraphResource::Type::Texture,
@@ -1533,11 +1633,10 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
         .writeBuffer(16, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.envParamsBuffer().descriptorInfo())
         .writeBuffer(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.spheres().descriptorInfo())
         .writeBuffer(18, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameDebugParamsOffset, sizeof(RendererDebugParams)))
-        .writeImageArray(19, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, scene_.materialTextureDescriptors())
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.primitiveRecords().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
-        .writeImageArray(23, VK_DESCRIPTOR_TYPE_SAMPLER, scene_.materialSamplerDescriptors())
         .writeBuffer(24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightRecords().descriptorInfo())
+        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .writeBuffer(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
         .writeBuffer(26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
         .writeBuffer(27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
@@ -1549,6 +1648,7 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
         .writeBuffer(37, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFramePrevCameraUniformOffset, sizeof(PrevCameraUniform)))
         .writeBuffer(38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirReservoirBuffer_.descriptorInfo())
         .writeBuffer(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirReservoirBuffer_.descriptorInfo())
+        .writeBuffer(40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightBvhNodes().descriptorInfo())
         .update(context_.device(), set);
     DescriptorWriter()
         .writeImage(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->transmittanceLut().sampledDescriptor(VK_NULL_HANDLE))
@@ -1556,6 +1656,8 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
         .writeImage(2, VK_DESCRIPTOR_TYPE_SAMPLER, VkDescriptorImageInfo{.sampler = atmosphereLutSystem_->sampler()})
         .writeImage(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->aerialPerspectiveLut().sampledDescriptor(VK_NULL_HANDLE))
         .writeImage(4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->multiScatterLut().sampledDescriptor(VK_NULL_HANDLE))
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, atmosphereLutSystem_->samplingSystem() != nullptr ? atmosphereLutSystem_->samplingSystem()->cdfRows().descriptorInfo() : scene_.envRows().descriptorInfo())
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, atmosphereLutSystem_->samplingSystem() != nullptr ? atmosphereLutSystem_->samplingSystem()->cdfCols().descriptorInfo() : scene_.envCols().descriptorInfo())
         .update(context_.device(), atmosphereSet);
 
     rayTracingPipeline_->bind(commandBuffer);
@@ -1574,7 +1676,7 @@ void PathTracerRenderer::recordSelectionOutline(VkCommandBuffer commandBuffer) {
         return;
     }
 
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     const RenderGraphResourceId presentation = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
         .lifetime = RenderGraphResource::Lifetime::Persistent,
@@ -1657,7 +1759,7 @@ VkPipelineStageFlags2 PathTracerRenderer::pathTraceShaderStage() const {
 }
 
 void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     auto imageResource = [](const Image& image, const char* name) {
         return RenderGraphResource{
             .type = RenderGraphResource::Type::Texture,
@@ -1773,7 +1875,7 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
 }
 
 void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     const RenderGraphResourceId denoised = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
         .lifetime = RenderGraphResource::Lifetime::Persistent,
@@ -1966,7 +2068,7 @@ const Image& PathTracerRenderer::hdrPostProcessImage() const {
 }
 
 void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     const Image& inputImage = postDenoiseImage();
     const RenderGraphResourceId input = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
@@ -2114,7 +2216,7 @@ void PathTracerRenderer::recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer)
 }
 
 void PathTracerRenderer::recordAutoExposure(VkCommandBuffer commandBuffer) {
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     const Image& sourceImage = hdrPostProcessImage();
     const RenderGraphResourceId denoised = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
@@ -2245,7 +2347,7 @@ void PathTracerRenderer::recordAutoExposureReducePass(VkCommandBuffer commandBuf
 }
 
 void PathTracerRenderer::recordToneMap(VkCommandBuffer commandBuffer) {
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     const Image& sourceImage = hdrPostProcessImage();
     const RenderGraphResourceId denoised = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
@@ -2317,11 +2419,14 @@ void PathTracerRenderer::recordToneMapPass(VkCommandBuffer commandBuffer) {
     toneMapPipeline_->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = toneMapSet.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, toneMapPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    const float effectiveExposure = settings_.usePhysicalCamera
+        ? 2.0f * std::exp2(14.0f - physicalCamera_.ev100())
+        : settings_.exposure;
     const ToneMapParams toneMapParams{
         .toneMapper = static_cast<uint32_t>(settings_.toneMapper),
         .debugView = static_cast<uint32_t>(settings_.debugView),
         .autoExposureEnabled = settings_.autoExposureEnabled ? 1u : 0u,
-        .exposure = settings_.exposure,
+        .exposure = effectiveExposure,
         .gamma = settings_.gamma,
         .contrast = settings_.contrast,
         .saturation = settings_.saturation,
@@ -2339,7 +2444,7 @@ void PathTracerRenderer::recordToneMapPass(VkCommandBuffer commandBuffer) {
 }
 
 void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
-    RenderGraph graph;
+    RenderGraph graph(&allocator_);
     const RenderGraphResourceId raw = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
         .lifetime = RenderGraphResource::Lifetime::Persistent,

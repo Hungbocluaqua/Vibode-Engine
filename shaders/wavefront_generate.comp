@@ -1,0 +1,88 @@
+#version 450
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_GOOGLE_include_directive : require
+
+#define RAY_QUEUE_CAPACITY (1920 * 1080 * 4)
+#define RAY_STRIDE 11
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer RayQueueOut {
+    uint count;
+    vec4 data[RAY_QUEUE_CAPACITY * RAY_STRIDE];
+} rayQueueOut;
+
+layout(set = 0, binding = 1, std140) uniform CameraParams {
+    vec4 position_time;
+    vec4 forward_fov;
+    vec4 right_ar;
+    vec4 up_sampleIndex;
+} camera;
+
+layout(set = 0, binding = 2, std140) uniform ImageParams {
+    uint width;
+    uint height;
+    uint maxBounces;
+    uint frameIndex;
+} imageParams;
+
+float halton(uint index, uint base) {
+    float result = 0.0;
+    float invBase = 1.0 / float(base);
+    float factor = invBase;
+    uint i = index;
+    while (i > 0u) {
+        result += float(i % base) * factor;
+        i /= base;
+        factor *= invBase;
+    }
+    return result;
+}
+
+uint wang_hash(uint seed) {
+    seed = (seed ^ 61u) ^ (seed >> 16u);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4u);
+    seed *= 0x27d4eb2du;
+    seed = seed ^ (seed >> 15u);
+    return seed;
+}
+
+vec2 jitterSample(uint pixelIndex, uint frameIndex) {
+    float x = halton(pixelIndex ^ frameIndex, 2u);
+    float y = halton(pixelIndex ^ frameIndex, 3u);
+    return vec2(x, y);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(imageParams.width) || coords.y >= int(imageParams.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * imageParams.width + uint(coords.x);
+    vec2 jitter = jitterSample(pixelIndex, imageParams.frameIndex);
+
+    float u = (float(coords.x) + jitter.x) / float(imageParams.width);
+    float v = (float(coords.y) + jitter.y) / float(imageParams.height);
+    float ndcX = u * 2.0 - 1.0;
+    float ndcY = v * 2.0 - 1.0;
+
+    vec3 right = normalize(camera.right_ar.xyz);
+    vec3 up = normalize(-camera.up_sampleIndex.xyz);
+    float halfFov = tan(camera.forward_fov.w * 0.5) * camera.right_ar.w;
+    vec3 rayDir = normalize(camera.forward_fov.xyz + right * ndcX * halfFov + up * ndcY * halfFov);
+
+    uint seed = wang_hash(pixelIndex ^ (imageParams.frameIndex * 0xdeadbeefu));
+
+    uint base = pixelIndex * RAY_STRIDE;
+    rayQueueOut.data[base + 0] = vec4(camera.position_time.xyz, 0.001);
+    rayQueueOut.data[base + 1] = vec4(rayDir, 10000.0);
+    rayQueueOut.data[base + 2] = vec4(1.0, 1.0, 1.0, float(pixelIndex));
+    rayQueueOut.data[base + 3] = vec4(0.0, float(seed >> 16u), float(seed & 0xffffu), 0.0);
+
+    if (pixelIndex == 0u) {
+        rayQueueOut.count = imageParams.width * imageParams.height;
+    }
+}

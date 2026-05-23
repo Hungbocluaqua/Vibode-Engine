@@ -30,7 +30,6 @@ void Swapchain::recreate() {
         glfwGetFramebufferSize(window_, &width, &height);
     }
 
-    vkDeviceWaitIdle(context_.device());
     destroy();
     create();
 }

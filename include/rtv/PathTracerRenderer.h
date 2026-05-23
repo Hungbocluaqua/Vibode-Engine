@@ -5,6 +5,7 @@
 #include "rtv/GpuValidation.h"
 #include "rtv/GpuScene.h"
 #include "rtv/Image.h"
+#include "rtv/PhysicalCamera.h"
 #include "rtv/RendererBackend.h"
 #include "rtv/RendererDebug.h"
 
@@ -14,6 +15,8 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace rtv {
@@ -26,11 +29,13 @@ class PipelineCache;
 class RayTracingPipeline;
 class RayTracingScene;
 class ResourceAllocator;
+class ShaderCompiler;
 class ShaderModule;
 class TemporalSystem;
 class VulkanContext;
 class AssetManager;
 class AtmosphereLutSystem;
+class PhysicalCamera;
 struct AtmosphereLutStats;
 struct SceneAsset;
 
@@ -69,15 +74,27 @@ struct RendererSettings {
     float histogramHighPercentile = 0.95f;
     float histogramTargetPercentile = 0.60f;
     float sunAngularRadius = 0.0093f;
+    float rayleighScaleHeight = 8000.0f;
+    float mieScaleHeight = 1200.0f;
+    float mieAnisotropy = 0.8f;
+    float groundAlbedo = 0.3f;
     float indirectStrength = 1.0f;
     RestirMode restirMode = RestirMode::ClassicNee;
     float environmentIntensity = 1.0f;
     float environmentRotation = 0.0f;
     float environmentBackgroundIntensity = 0.35f;
     float renderResolutionScale = 1.0f;
+    uint32_t accumulationLimit = 0;
     RendererBackend requestedBackend = RendererBackend::Auto;
+    bool wavefrontEnabled = false;
     RendererDebugView debugView = RendererDebugView::Beauty;
     float debugScale = 1.0f;
+
+    bool usePhysicalCamera = false;
+    float physicalAperture = 16.0f;
+    float physicalShutterSeconds = 1.0f / 125.0f;
+    float physicalIso = 100.0f;
+    float physicalExposureCompensation = 0.0f;
 };
 
 struct RayTracingRendererStats {
@@ -136,6 +153,7 @@ public:
     void setCameraFovY(float fovY);
     void resetAccumulation(AccumulationResetReason reason = AccumulationResetReason::Manual);
     void loadEnvironment(const std::filesystem::path& path);
+    [[nodiscard]] bool shadersNeedReload();
     bool updateMaterials(const SceneAsset& scene, const AssetManager& assets);
     bool updateSceneLights(const SceneAsset& scene);
     bool updateSceneTransforms(const SceneAsset& scene, const AssetManager& assets);
@@ -150,6 +168,7 @@ public:
     [[nodiscard]] RayTracingRendererStats rayTracingStats() const;
     [[nodiscard]] uint32_t sampleCount() const { return frameCount_; }
     [[nodiscard]] const GpuFrameTimings& timings() const;
+    [[nodiscard]] GpuPipelineStatistics pipelineStats() const;
     [[nodiscard]] AccumulationResetReason lastAccumulationResetReason() const { return lastResetReason_; }
     [[nodiscard]] const RendererValidationLog& validationLog() const { return validationLog_; }
     [[nodiscard]] RendererValidationLog& validationLog() { return validationLog_; }
@@ -352,10 +371,13 @@ private:
     std::unique_ptr<ShaderModule> skyViewShader_;
     std::unique_ptr<ShaderModule> skyReprojectShader_;
     std::unique_ptr<ShaderModule> aerialPerspectiveShader_;
+    std::unique_ptr<ShaderModule> skyCdfShader_;
     std::unique_ptr<ShaderModule> selectionOutlineShader_;
     std::unique_ptr<ShaderModule> luminanceHistogramShader_;
     std::unique_ptr<ShaderModule> exposureReduceShader_;
     std::unique_ptr<ShaderModule> toneMapShader_;
+    std::unique_ptr<ShaderModule> wavefrontGenerateShader_;
+    std::unique_ptr<ShaderModule> wavefrontShadeShader_;
     std::unique_ptr<ShaderModule> fullscreenVertexShader_;
     std::unique_ptr<ShaderModule> fullscreenFragmentShader_;
     std::unique_ptr<ShaderModule> raygenShader_;
@@ -373,10 +395,13 @@ private:
     std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
     std::unique_ptr<ComputePipeline> exposureReducePipeline_;
     std::unique_ptr<ComputePipeline> toneMapPipeline_;
+    std::unique_ptr<ComputePipeline> wavefrontGeneratePipeline_;
+    std::unique_ptr<ComputePipeline> wavefrontShadePipeline_;
     std::unique_ptr<GraphicsPipeline> graphicsPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingPipeline_;
     std::unique_ptr<RayTracingScene> rayTracingScene_;
     std::unique_ptr<TemporalSystem> temporalSystem_;
+    PhysicalCamera physicalCamera_;
     VkDescriptorSetLayout pathTraceSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout atmosphereSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout rayTracingSetLayout_ = VK_NULL_HANDLE;
@@ -388,12 +413,17 @@ private:
     VkDescriptorSetLayout luminanceHistogramSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout exposureReduceSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout toneMapSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout wavefrontGenerateSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout wavefrontShadeSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout graphicsSetLayout_ = VK_NULL_HANDLE;
     std::vector<std::unique_ptr<FrameResources>> frames_;
     std::vector<GpuProfiler> profilers_;
     FrameResources* currentFrame_ = nullptr;
     GpuProfiler* currentProfiler_ = nullptr;
     RendererValidationLog validationLog_;
+    std::unique_ptr<ShaderCompiler> shaderCompiler_;
+    std::vector<std::filesystem::path> shaderSources_;
+    std::filesystem::path shaderOutputDirectory_;
     uint32_t selectedInstanceId_ = UINT32_MAX;
 };
 

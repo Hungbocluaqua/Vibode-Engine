@@ -20,6 +20,7 @@ public:
     bool setVisibility(EntityId id, bool visible);
     bool setLocked(EntityId id, bool locked);
     bool setTransform(EntityId id, const Transform& transform);
+    void setTransformGizmoDrag(EntityId id, const Transform& oldTransform, const Transform& newTransform);
 
 private:
     [[nodiscard]] EntityId duplicateEntityRecursive(const Entity& source, EntityId parent);

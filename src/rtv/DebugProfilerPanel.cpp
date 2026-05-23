@@ -63,6 +63,9 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     const GpuFrameTimings& timings = state.renderer.timings();
     const float gpuMs =
         timings.pathTraceMs +
+        timings.restirSpatialMs +
+        timings.fogIntegrateMs +
+        timings.atmosphereMs +
         timings.denoiserMs +
         timings.historyCopyMs +
         timings.taaMs +
@@ -73,7 +76,10 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     ImGui::Text("FPS: %.1f", state.cpuFrameMs > 0.0f ? 1000.0f / state.cpuFrameMs : 0.0f);
     ImGui::Text("CPU frame time: %.2f ms", state.cpuFrameMs);
     ImGui::Text("GPU frame time: %.2f ms", gpuMs);
+    ImGui::Text("Atmosphere: %.2f ms", timings.atmosphereMs);
     ImGui::Text("Path trace: %.2f ms", timings.pathTraceMs);
+    ImGui::Text("ReSTIR spatial: %.2f ms", timings.restirSpatialMs);
+    ImGui::Text("Fog integrate: %.2f ms", timings.fogIntegrateMs);
     ImGui::Text("Denoiser: %.2f ms", timings.denoiserMs);
     ImGui::Text("History copy: %.2f ms", timings.historyCopyMs);
     ImGui::Text("TAA: %.2f ms", timings.taaMs);
@@ -83,6 +89,25 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     ImGui::Text("Presentation: %.2f ms", timings.fullscreenMs);
     ImGui::Text("Sample count: %u", state.renderer.sampleCount());
     ImGui::Text("Last reset: %s", accumulationResetReasonName(state.renderer.lastAccumulationResetReason()));
+
+    const GpuPipelineStatistics stats = state.renderer.pipelineStats();
+    if (stats.valid) {
+        ImGui::SeparatorText("Pipeline Statistics");
+        const auto fmtCount = [](uint64_t val) {
+            if (val >= 1000000000ull) {
+                ImGui::Text("%.2f G", static_cast<double>(val) / 1.0e9);
+            } else if (val >= 1000000ull) {
+                ImGui::Text("%.2f M", static_cast<double>(val) / 1.0e6);
+            } else if (val >= 1000ull) {
+                ImGui::Text("%.2f K", static_cast<double>(val) / 1.0e3);
+            } else {
+                ImGui::Text("%llu", static_cast<unsigned long long>(val));
+            }
+        };
+        ImGui::Text("Ray invocations: "); ImGui::SameLine(); fmtCount(stats.rayInvocations);
+        ImGui::Text("Triangle hits: "); ImGui::SameLine(); fmtCount(stats.triangleHits);
+        ImGui::Text("AABB hits: "); ImGui::SameLine(); fmtCount(stats.aabbHits);
+    }
 
     const auto& invalidations = state.renderer.validationLog().invalidations();
     if (invalidations.size() >= 2) {

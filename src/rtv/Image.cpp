@@ -47,12 +47,15 @@ void Image::create(ResourceAllocator& allocator, const ImageDesc& desc) {
     desc_ = desc;
     desc_.width = std::max(desc_.width, 1u);
     desc_.height = std::max(desc_.height, 1u);
+    desc_.depth = std::max(desc_.depth, 1u);
     desc_.mipLevels = std::max(desc_.mipLevels, 1u);
+    VkImageType imageType = desc_.depth > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    VkImageViewType viewType = desc_.depth > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
 
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.extent = {desc_.width, desc_.height, 1};
+    imageInfo.imageType = imageType;
+    imageInfo.extent = {desc_.width, desc_.height, desc_.depth};
     imageInfo.mipLevels = desc_.mipLevels;
     imageInfo.arrayLayers = 1;
     imageInfo.format = desc_.format;
@@ -73,7 +76,7 @@ void Image::create(ResourceAllocator& allocator, const ImageDesc& desc) {
         VkImageViewCreateInfo viewInfo{};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = image_;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.viewType = viewType;
         viewInfo.format = desc_.format;
         viewInfo.subresourceRange = fullRange();
         checkVk(vkCreateImageView(allocator.device(), &viewInfo, nullptr, &view_), "vkCreateImageView(resource)");
