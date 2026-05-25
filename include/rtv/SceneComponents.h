@@ -75,6 +75,13 @@ struct Light {
     bool enabled = true;
 };
 
+struct Sun {
+    bool enabled = true;
+    float illuminanceLux = 100000.0f;
+    float angularRadiusRadians = 0.00465f;
+    float colorTemperatureKelvin = 5778.0f;
+};
+
 struct Camera {
     float verticalFovRadians = 60.0f * 0.017453292519943295f;
     float nearPlane = 0.01f;
@@ -118,7 +125,8 @@ struct RenderSettings {
     float sunIntensity = 1.0f;
     float skyIntensity = 0.8f;
     float sunElevation = 0.97f;
-    float sunAngularRadius = 0.0093f;
+    float sunAzimuth = 3.14159265358979323846f;
+    float sunAngularRadius = 0.00465f;
     float rayleighScaleHeight = 8000.0f;
     float mieScaleHeight = 1200.0f;
     float mieAnisotropy = 0.8f;
@@ -126,14 +134,19 @@ struct RenderSettings {
     float indirectStrength = 1.0f;
     RestirMode restirMode = RestirMode::ClassicNee;
     bool denoiserEnabled = true;
+    bool denoiseWhileMoving = true;
     uint32_t atrousIterations = 4;
     float denoiserStrength = 1.0f;
     bool taaEnabled = true;
     float taaFeedback = 0.08f;
+    float taaSharpeningStrength = 0.08f;
     RendererDebugView debugView = RendererDebugView::Beauty;
     bool accumulate = true;
     uint32_t accumulationLimit = 0;
     float resolutionScale = 1.0f;
+    float shadowRayBias = 0.001f;
+    float shadowDistanceBias = 0.002f;
+    float fireflyClamp = 48.0f;
 
     bool usePhysicalCamera = false;
     float physicalAperture = 16.0f;

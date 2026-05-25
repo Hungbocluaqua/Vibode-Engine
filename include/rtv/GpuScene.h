@@ -7,6 +7,7 @@
 
 #include <glm/glm.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -20,12 +21,15 @@ class ResourceAllocator;
 class AssetManager;
 struct SceneAsset;
 
-struct CameraUniform {
+struct alignas(16) CameraUniform {
     glm::vec4 pos{};
     glm::vec4 forward{};
     glm::vec4 right{};
     glm::vec4 up{};
     uint32_t frameCount = 0;
+    uint32_t temporalFrameIndex = 0;
+    float effectiveJitterScale = 0.0f;
+    uint32_t cameraMoving = 0;
     float sunIntensity = 1.0f;
     float skyIntensity = 0.8f;
     float exposure = 1.0f;
@@ -34,12 +38,23 @@ struct CameraUniform {
     uint32_t sunlightEnabled = 1;
     uint32_t directLightingEnabled = 1;
     float fovY = 60.0f * 0.017453292519943295f;
-    float sunAngularRadius = 0.0093f;
+    float sunAngularRadius = 0.00465f;
     float indirectStrength = 1.0f;
     uint32_t environmentDirectSamples = 1;
+    uint32_t padding0 = 0;
     glm::vec4 jitter{}; // xy = current subpixel jitter, zw = previous subpixel jitter
-    glm::vec4 atmosphere{}; // x = sun elevation, y = ReSTIR mode, z = temporal history available
+    glm::vec4 atmosphere{}; // x = sun elevation, y = ReSTIR mode, z = temporal history available, w = sun azimuth
+    glm::vec4 renderControls{}; // x = shadow ray bias, y = shadow distance bias, z = firefly clamp
+    glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
+    glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
 };
+
+static_assert(offsetof(CameraUniform, jitter) == 128, "CameraUniform::jitter must match std140 layout");
+static_assert(offsetof(CameraUniform, atmosphere) == 144, "CameraUniform::atmosphere must match std140 layout");
+static_assert(offsetof(CameraUniform, renderControls) == 160, "CameraUniform::renderControls must match std140 layout");
+static_assert(offsetof(CameraUniform, sunDirectionIlluminance) == 176, "CameraUniform::sunDirectionIlluminance must match std140 layout");
+static_assert(offsetof(CameraUniform, sunColorAngularRadius) == 192, "CameraUniform::sunColorAngularRadius must match std140 layout");
+static_assert(sizeof(CameraUniform) == 208, "CameraUniform size must match std140 layout");
 
 struct MeshParamsUniform {
     uint32_t vertexCount = 0;
@@ -110,9 +125,9 @@ struct EnvParamsUniform {
     uint32_t height = 1;
     float backgroundIntensity = 0.35f;
     uint32_t procedural = 1;
-    float pad2 = 0.0f;
+    uint32_t skyCdfWidth = 256;
     float invTotalLum = 1.0f;
-    float pad3 = 0.0f;
+    uint32_t skyCdfHeight = 144;
     float pad4 = 0.0f;
     float pad5 = 0.0f;
 };
@@ -205,6 +220,7 @@ public:
     [[nodiscard]] const std::vector<RayTracingInstanceBuildInput>& rayTracingInstances() const { return rayTracingInstances_; }
 
     bool setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity);
+    bool setSkyCdfDimensions(uint32_t width, uint32_t height);
     void loadEnvironment(BufferUploader& uploader, const std::filesystem::path& path);
     bool updateImportedMaterials(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
     bool updateSceneLights(BufferUploader& uploader, const SceneAsset& scene);

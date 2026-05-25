@@ -150,6 +150,16 @@ Light& SceneRegistry::addLight(EntityId id, Light light) {
     return *item->light;
 }
 
+Sun& SceneRegistry::addSun(EntityId id, Sun sun) {
+    Entity* item = entity(id);
+    if (item == nullptr) {
+        throw std::runtime_error("Cannot add Sun to missing entity");
+    }
+    item->sun = sun;
+    markDirty(SceneUpdateKind::LightOnly);
+    return *item->sun;
+}
+
 Camera& SceneRegistry::addCamera(EntityId id, Camera camera) {
     Entity* item = entity(id);
     if (item == nullptr) {
@@ -180,6 +190,16 @@ bool SceneRegistry::removeLight(EntityId id) {
     return true;
 }
 
+bool SceneRegistry::removeSun(EntityId id) {
+    Entity* item = entity(id);
+    if (item == nullptr || !item->sun.has_value()) {
+        return false;
+    }
+    item->sun.reset();
+    markDirty(SceneUpdateKind::LightOnly);
+    return true;
+}
+
 bool SceneRegistry::removeCamera(EntityId id) {
     Entity* item = entity(id);
     if (item == nullptr || !item->camera.has_value()) {
@@ -200,6 +220,11 @@ Light* SceneRegistry::light(EntityId id) {
     return item != nullptr && item->light.has_value() ? &*item->light : nullptr;
 }
 
+Sun* SceneRegistry::sun(EntityId id) {
+    Entity* item = entity(id);
+    return item != nullptr && item->sun.has_value() ? &*item->sun : nullptr;
+}
+
 Camera* SceneRegistry::camera(EntityId id) {
     Entity* item = entity(id);
     return item != nullptr && item->camera.has_value() ? &*item->camera : nullptr;
@@ -213,6 +238,11 @@ const MeshRenderer* SceneRegistry::meshRenderer(EntityId id) const {
 const Light* SceneRegistry::light(EntityId id) const {
     const Entity* item = entity(id);
     return item != nullptr && item->light.has_value() ? &*item->light : nullptr;
+}
+
+const Sun* SceneRegistry::sun(EntityId id) const {
+    const Entity* item = entity(id);
+    return item != nullptr && item->sun.has_value() ? &*item->sun : nullptr;
 }
 
 const Camera* SceneRegistry::camera(EntityId id) const {

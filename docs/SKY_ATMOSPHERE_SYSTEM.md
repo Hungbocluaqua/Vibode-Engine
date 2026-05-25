@@ -26,7 +26,7 @@ PathTracerRenderer
 
 **Descriptor strategy**: All atmosphere resources (LUTs, CDF buffers, uniforms, sampler) live in a single **set 1** descriptor set, owned by `AtmosphereLutSystem`. `AtmosphereSamplingSystem` writes its CDF buffers into this shared set. This keeps per-frame descriptor binds to 2 total (set 0 = scene, set 1 = atmosphere) and avoids fragmentation as clouds, weather textures, shadow LUTs, and volumetric resources are added later.
 
-**Sun direction**: Editable in the editor UI (azimuth + elevation sliders).
+**Sun direction**: Derived from the scene-owned Primary Sun transform. Azimuth and elevation are editor helper views, not serialized render-setting truth.
 
 **Sun/LUT separation**: The sun is **purely analytical** — removed from the sky-view LUT. The sky LUT stores only diffuse atmospheric scattering (sky dome color without the solar disk). The sun is handled entirely through:
 - `analytical_sun_disk_radiance()` — for miss rays and analytic sun disk rendering
@@ -607,7 +607,7 @@ vec3 environment_radiance(vec3 dir) {
 The importance CDF is built **only from the diffuse sky LUT**. The sun is not represented in the CDF because it's a delta light. MIS is performed between:
 - BSDF sampling (cosine-weighted hemisphere)
 - Diffuse sky importance sampling (from CDF)
-- Sun is evaluated separately as a delta light (no PDF weight)
+- Sun is evaluated separately as a finite analytical disk with its own solid-angle PDF.
 
 This avoids double-counting, ensures clean convergence, and keeps the importance CDF representing only the smooth diffuse sky dome.
 
@@ -814,7 +814,7 @@ Multiple Importance Sampling between:
 |-----------|---------|--------------|
 | BSDF sampling | 1 sample | Cosine-weighted hemisphere |
 | Environment importance | 1 sample | Sky LUT CDF (diffuse only) |
-| Sun direct | Separate delta | Analytical (no sampling needed) |
+| Sun direct | Separate finite disk | Analytical solid-angle sampling |
 
 Power heuristic is applied for BSDF vs environment MIS. The sun is evaluated unconditionally as a delta light with probability 1 (no PDF division needed).
 

@@ -120,7 +120,7 @@ void EditorDockspace::drawMainMenu(EditorPanelVisibility& visibility, EditorRequ
                 requests.loadHdr = *path;
             }
         }
-        if (ImGui::MenuItem("Open Level\tCtrl+L")) {
+        if (ImGui::MenuItem("Open Level")) {
             visibility.assetBrowser = true;
             if (auto path = openSceneJsonFileDialog()) {
                 requests.loadSceneJson = *path;

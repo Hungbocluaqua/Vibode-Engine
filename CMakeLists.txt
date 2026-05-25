@@ -122,6 +122,7 @@ add_executable(rtvulkan
     src/rtv/SceneToGpuSceneBuilder.cpp
     src/rtv/SceneUpdateRouter.cpp
     src/rtv/SkySystem.cpp
+    src/rtv/SunController.cpp
     src/rtv/SceneCache.cpp
     src/rtv/ShaderCompiler.cpp
     src/rtv/ShaderModule.cpp

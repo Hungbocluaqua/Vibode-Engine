@@ -1,81 +1,179 @@
 {
-  "version": 1,
-  "sourceGltf": "",
-  "sourceHdr": "",
-  "activeCamera": 1,
-  "environment": {
-    "hdrPath": "",
-    "intensity": 0.85,
-    "rotation": 0.0,
-    "backgroundIntensity": 0.55,
-    "enabled": true
-  },
-  "renderSettings": {
-    "pathTracingEnabled": true,
-    "directLightingEnabled": true,
-    "maxBounces": 4,
-    "environmentDirectSamples": 1,
-    "toneMapper": 3,
-    "exposure": 1.0,
-    "gamma": 2.2,
-    "contrast": 1.0,
-    "saturation": 1.0,
-    "brightness": 0.0,
-    "whitePoint": 4.0,
-    "autoExposureEnabled": false,
-    "targetLuminance": 0.18,
-    "minExposure": 0.25,
-    "maxExposure": 8.0,
-    "adaptationSpeed": 2.0,
-    "histogramMinLogLuminance": -10.0,
-    "histogramMaxLogLuminance": 10.0,
-    "histogramLowPercentile": 0.05,
-    "histogramHighPercentile": 0.95,
-    "histogramTargetPercentile": 0.6,
-    "sunlightEnabled": true,
-    "sunIntensity": 2.0,
-    "skyIntensity": 0.8,
-    "sunAngularRadius": 0.00465,
-    "indirectStrength": 1.0,
-    "denoiserEnabled": true,
-    "atrousIterations": 4,
-    "denoiserStrength": 0.85,
-    "debugView": 0,
-    "accumulate": true,
-    "accumulationLimit": 256,
-    "resolutionScale": 1.0,
-    "requestedBackend": 0
-  },
-  "entities": [
-    {
-      "id": {"index": 0, "generation": 1, "stable": 1},
-      "parent": 0,
-      "children": [2, 3],
-      "name": "Validation Camera",
-      "transform": {"position": [0.0, 1.8, 5.5], "rotationEuler": [-0.2, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]},
-      "camera": {"verticalFovRadians": 0.785398, "nearPlane": 0.01, "farPlane": 1000.0, "active": true, "useRenderSettingsExposure": true}
-    },
-    {
-      "id": {"index": 1, "generation": 1, "stable": 2},
-      "parent": 1,
-      "children": [],
-      "name": "Nested Transform Anchor A",
-      "transform": {"position": [-1.5, 0.0, 0.0], "rotationEuler": [0.0, 0.45, 0.0], "scale": [1.0, 2.0, 1.0]}
-    },
-    {
-      "id": {"index": 2, "generation": 1, "stable": 3},
-      "parent": 1,
-      "children": [],
-      "name": "Nested Transform Anchor B",
-      "transform": {"position": [1.5, 0.0, 0.0], "rotationEuler": [0.0, -0.45, 0.0], "scale": [2.0, 1.0, 1.0]}
-    },
-    {
-      "id": {"index": 3, "generation": 1, "stable": 4},
-      "parent": 0,
-      "children": [],
-      "name": "Key Light",
-      "transform": {"position": [3.0, 4.0, 2.0], "rotationEuler": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]},
-      "light": {"type": 0, "color": [1.0, 0.92, 0.82], "intensity": 35.0, "sizeOrRadius": 0.25, "enabled": true}
-    }
-  ]
+    "version":  2,
+    "sourceGltf":  "",
+    "sourceHdr":  "",
+    "activeCamera":  1,
+    "environment":  {
+                        "hdrPath":  "",
+                        "intensity":  0.85,
+                        "rotation":  0.0,
+                        "backgroundIntensity":  0.55,
+                        "enabled":  true
+                    },
+    "renderSettings":  {
+                           "pathTracingEnabled":  true,
+                           "directLightingEnabled":  true,
+                           "maxBounces":  4,
+                           "environmentDirectSamples":  1,
+                           "toneMapper":  3,
+                           "exposure":  1.0,
+                           "gamma":  2.2,
+                           "contrast":  1.0,
+                           "saturation":  1.0,
+                           "brightness":  0.0,
+                           "whitePoint":  4.0,
+                           "autoExposureEnabled":  false,
+                           "targetLuminance":  0.18,
+                           "minExposure":  0.25,
+                           "maxExposure":  8.0,
+                           "adaptationSpeed":  2.0,
+                           "histogramMinLogLuminance":  -10.0,
+                           "histogramMaxLogLuminance":  10.0,
+                           "histogramLowPercentile":  0.05,
+                           "histogramHighPercentile":  0.95,
+                           "histogramTargetPercentile":  0.6,
+                           "skyIntensity":  0.8,
+                           "indirectStrength":  1.0,
+                           "denoiserEnabled":  true,
+                           "atrousIterations":  4,
+                           "denoiserStrength":  0.85,
+                           "debugView":  0,
+                           "accumulate":  true,
+                           "accumulationLimit":  256,
+                           "resolutionScale":  1.0,
+                           "requestedBackend":  0
+                       },
+    "entities":  [
+                     {
+                         "id":  {
+                                    "index":  0,
+                                    "generation":  1,
+                                    "stable":  1
+                                },
+                         "parent":  0,
+                         "children":  [
+                                          2,
+                                          3
+                                      ],
+                         "name":  "Validation Camera",
+                         "transform":  {
+                                           "position":  [
+                                                            0.0,
+                                                            1.8,
+                                                            5.5
+                                                        ],
+                                           "rotationEuler":  [
+                                                                 -0.2,
+                                                                 0.0,
+                                                                 0.0
+                                                             ],
+                                           "scale":  [
+                                                         1.0,
+                                                         1.0,
+                                                         1.0
+                                                     ]
+                                       },
+                         "camera":  {
+                                        "verticalFovRadians":  0.785398,
+                                        "nearPlane":  0.01,
+                                        "farPlane":  1000.0,
+                                        "active":  true,
+                                        "useRenderSettingsExposure":  true
+                                    }
+                     },
+                     {
+                         "id":  {
+                                    "index":  1,
+                                    "generation":  1,
+                                    "stable":  2
+                                },
+                         "parent":  1,
+                         "children":  [
+
+                                      ],
+                         "name":  "Nested Transform Anchor A",
+                         "transform":  {
+                                           "position":  [
+                                                            -1.5,
+                                                            0.0,
+                                                            0.0
+                                                        ],
+                                           "rotationEuler":  [
+                                                                 0.0,
+                                                                 0.45,
+                                                                 0.0
+                                                             ],
+                                           "scale":  [
+                                                         1.0,
+                                                         2.0,
+                                                         1.0
+                                                     ]
+                                       }
+                     },
+                     {
+                         "id":  {
+                                    "index":  2,
+                                    "generation":  1,
+                                    "stable":  3
+                                },
+                         "parent":  1,
+                         "children":  [
+
+                                      ],
+                         "name":  "Nested Transform Anchor B",
+                         "transform":  {
+                                           "position":  [
+                                                            1.5,
+                                                            0.0,
+                                                            0.0
+                                                        ],
+                                           "rotationEuler":  [
+                                                                 0.0,
+                                                                 -0.45,
+                                                                 0.0
+                                                             ],
+                                           "scale":  [
+                                                         2.0,
+                                                         1.0,
+                                                         1.0
+                                                     ]
+                                       }
+                     },
+                     {
+                         "id":  {
+                                    "index":  3,
+                                    "generation":  1,
+                                    "stable":  4
+                                },
+                         "parent":  0,
+                         "children":  [
+
+                                      ],
+                         "name":  "Key Light",
+                         "transform":  {
+                                           "position":  [
+                                                            3,
+                                                            3.9999999999999996,
+                                                            1.9999999999999998
+                                                        ],
+                                           "rotationEuler":  [
+                                                                 -0.83721500315481345,
+                                                                 0.982793723247329,
+                                                                 0
+                                                             ],
+                                           "scale":  [
+                                                         1.0,
+                                                         1.0,
+                                                         1.0
+                                                     ]
+                                       },
+                         "sun":  {
+                                     "enabled":  true,
+                                     "illuminanceLux":  1575000,
+                                     "angularRadiusRadians":  0.00465,
+                                     "colorTemperatureKelvin":  5778
+                                 }
+                     }
+                 ],
+    "primarySun":  4
 }

@@ -2,9 +2,9 @@
 
 This document summarizes the current structure and architecture of the native Vulkan renderer in `native/vulkan`.
 
-The project is a C++20 / Vulkan 1.3 port of a path-tracing renderer. It builds a native Windows executable named `rtvulkan` and currently supports a Vulkan KHR hardware ray tracing path, a legacy compute path tracing backend, glTF/GLB scene loading, HDR environment maps, progressive accumulation, temporal/spatial denoising, histogram auto exposure, compute tone mapping, selection outlines, ImGui editor panels, GPU timing, and renderer debug views.
+The project is a C++20 / Vulkan 1.3 path-tracing renderer and editor. It builds a native Windows executable named `rtvulkan` and currently supports a Vulkan KHR hardware ray tracing path, a legacy compute path tracing backend, glTF/GLB scene loading, HDR environment maps, progressive accumulation, temporal/spatial denoising, TAA, histogram auto exposure, compute tone mapping, selection outlines, ImGui editor panels, GPU timing, and renderer debug views.
 
-The renderer is operational, but it is still in migration and stabilization. Current development is focused on the hardware ray tracing backend. The compute backend remains available for legacy fallback and comparison, but new renderer work should target hardware RT unless it is explicitly fixing legacy compute behavior.
+The renderer is operational, but it is still in stabilization. Current development is focused on the hardware ray tracing backend and editor-scene synchronization. The compute backend remains available for legacy fallback and comparison, but new renderer work should target hardware RT unless it is explicitly fixing legacy compute behavior.
 
 ## Repository Shape
 
@@ -26,9 +26,9 @@ Important top-level files and directories:
 
 At the time of inspection, the project contained roughly:
 
-- 66 C++ source files.
-- 71 header files.
-- 16 shader files.
+- 66+ C++ source files.
+- 70+ header files.
+- 30+ shader files, including ray tracing, denoising, tone mapping, TAA, atmosphere, and ReSTIR-related compute shaders.
 - Several migration/stabilization documents.
 
 ## Build System
@@ -343,7 +343,9 @@ Scene changes are categorized by `SceneUpdateKind`:
 - `LightOnly`.
 - `EnvironmentOnly`.
 - `CameraOnly`.
-- `FullSceneRebuild`.
+- `VisibilityOnly`.
+- `TopologyChanged`.
+- `RendererSettingsOnly`.
 
 ### Scene Conversion
 
@@ -357,7 +359,7 @@ Scene changes are categorized by `SceneUpdateKind`:
 
 This keeps editor edits separate from the lower-level GPU scene representation.
 
-Current limitation: this conversion path is partial. Mesh entities, lights, render settings, and environment settings reach the renderer. Camera edits are applied through the active-camera path, but camera/editor behavior still has more edge cases than material and light edits.
+Current limitation: this conversion path is still evolving. Mesh entities, lights, render settings, visibility flags, environment settings, and active camera state reach the renderer, but topology-changing editor operations still require careful rebuild/refit routing.
 
 ## GPU Scene Representation
 
@@ -417,6 +419,7 @@ It owns:
 - Denoised image.
 - Presentation image.
 - History image.
+- TAA history and parameter state.
 - Accumulation buffer.
 - Variance buffer.
 - Depth/normal buffer.
@@ -432,6 +435,7 @@ It owns:
 - Hardware ray tracing scene.
 - Auto-exposure histogram/reduce pipelines.
 - Tone-map compute pipeline.
+- TAA compute pipeline.
 - Selection-outline compute pipeline.
 - Per-frame descriptor arenas.
 - GPU profilers.
@@ -444,12 +448,13 @@ Main frame flow:
 3. Run path tracing through the selected backend, normally hardware RT.
 4. Barrier path tracing outputs for denoiser reads.
 5. Run temporal/spatial denoising if enabled.
-6. Copy history resources for the next frame.
-7. Optionally build/reduce the luminance histogram for auto exposure.
-8. Tone map into the presentation image.
-9. Optionally run the selection outline compute pass.
-10. Render fullscreen presentation.
-11. Render the editor overlay.
+6. Run TAA if enabled and update temporal history.
+7. Copy history resources for the next frame.
+8. Optionally build/reduce the luminance histogram for auto exposure.
+9. Tone map into the presentation image.
+10. Optionally run the selection outline compute pass.
+11. Render fullscreen presentation.
+12. Render the editor overlay.
 
 Accumulation resets when relevant state changes:
 
@@ -461,6 +466,7 @@ Accumulation resets when relevant state changes:
 - Lighting change.
 - Environment change.
 - Denoiser setting change.
+- TAA setting change.
 - Debug view change.
 - Scene change.
 - Material change.
@@ -537,6 +543,7 @@ Shader files:
 - `demo_compute.comp`: simple compute demo.
 - `pathtrace.comp`: legacy compute path tracer.
 - `denoiser.comp`: temporal/spatial denoiser.
+- `taa.comp`: temporal anti-aliasing resolve and configurable sharpening.
 - `luminance_histogram.comp`: auto-exposure histogram builder.
 - `exposure_reduce.comp`: auto-exposure percentile reducer/adaptation pass.
 - `tone_map.comp`: HDR exposure, tone mapping, color grading, and output encoding.
@@ -577,7 +584,7 @@ The denoiser performs temporal reprojection and spatial filtering. It can be dis
 
 Presentation is split between compute and graphics passes.
 
-`tone_map.comp` reads the raw or denoised HDR renderer output, applies manual or auto exposure, runs the selected tone mapper, applies color grading, and writes the SDR presentation image.
+`tone_map.comp` reads the raw, denoised, or TAA-resolved HDR renderer output, applies manual or auto exposure, runs the selected tone mapper, applies color grading, and writes the SDR presentation image. Tone mappers currently include Linear, Reinhard, Reinhard White, ACES, PBR Neutral, and AgX.
 
 Auto exposure is scene-wide and histogram-based. `luminance_histogram.comp` bins log luminance from the denoised image, and `exposure_reduce.comp` chooses a configured percentile luminance, clamps the exposure target, and temporally adapts the current exposure.
 
@@ -613,6 +620,10 @@ Editor requests include:
 - Scene JSON save/load.
 - Material update.
 - Scene update.
+- Entity creation/deletion/duplication/reparenting.
+- Component creation for light, camera, and mesh renderer.
+- Light, camera, transform, visibility, cast-shadow, and visible-to-camera edits.
+- Transform gizmo live preview and undoable commit.
 - Camera speed change.
 - Camera reset.
 - Shader reload.
@@ -623,11 +634,12 @@ Editor requests include:
 
 Current editor integration limits:
 
-- Camera updates apply through the active-camera path, but camera/editor workflows still have more edge cases than material and light edits.
-- Creating or editing a light updates the editor scene and attempts a GPU light-record update without a full renderer rebuild.
+- Camera updates apply through the active-camera path and scene-camera piloting, but camera/editor workflows still need more manual validation.
+- Creating or editing lights and cameras is routed through editor requests and scene operations; topology-changing edits require renderer rebuild/refit paths.
 - Several Inspector branches for legacy/imported/fallback selections still show placeholder controls or temporary local values. Those controls can move in the UI without changing renderer state.
-- The Material Editor panel is controlled by panel visibility, not by selection type. It remains visible unless the user hides that panel, and it shows a disabled message when the current selection has no material.
+- The Inspector is the main editing surface for selected entities. The standalone Material Editor exists but is hidden by default.
 - Material edits update `AssetManager` material data and attempt a GPU material-buffer update through `PathTracerRenderer::updateMaterials`.
+- `Ctrl+L` rotates the scene-owned Primary Sun, but there is intentionally no separate sun drag indicator overlay at the moment.
 
 ## Runtime Controls
 
@@ -635,6 +647,7 @@ The app supports keyboard/mouse controls for:
 
 - Camera movement.
 - Mouse look.
+- `Ctrl+L` Primary Sun drag rotation.
 - Fullscreen toggle.
 - Debug view cycling.
 - Accumulation reset.
@@ -652,7 +665,7 @@ Files can be dropped onto the window:
 
 ## Debugging And Profiling
 
-`RendererDebugView` currently defines 28 debug views:
+`RendererDebugView` currently defines 38 parse-compatible debug views. The editor exposes a filtered set of useful/implemented views:
 
 - Beauty.
 - Variance.
@@ -682,6 +695,16 @@ Files can be dropped onto the window:
 - Bounce count.
 - Secondary environment radiance.
 - White environment transport.
+- Motion vectors.
+- Atmosphere sky view.
+- Atmosphere transmittance.
+- Atmosphere aerial perspective.
+- Atmosphere multi-scatter.
+- Temporal reactive mask.
+- Temporal history weight.
+- ReSTIR reservoir age.
+- ReSTIR reservoir confidence.
+- ReSTIR reservoir M.
 
 `GpuProfiler` records GPU timings for major passes:
 
@@ -721,6 +744,8 @@ The renderer is functional but not finished. The strongest parts of the architec
 - Hardware RT backend with legacy compute fallback.
 - Shader reflection-driven descriptor layout construction.
 - Editor request flow separated from immediate renderer mutation.
+- Undo/redo command stack for editor operations.
+- Scene-document-backed renderer settings and JSON persistence.
 - Rich debug and profiling support.
 
 Main active or future work areas:
@@ -728,14 +753,14 @@ Main active or future work areas:
 - Hardware RT acceleration structure updates/refits.
 - Hardening editor camera propagation and active-camera edge cases.
 - Hardening authored light updates, GPU light-record weighting, and light editing workflows.
-- Replacing placeholder Inspector controls with controls backed by actual scene/renderer state.
+- Continuing to replace placeholder Inspector controls with controls backed by actual scene/renderer state.
 - Finer geometry splitting for opaque, alpha-tested, and single-sided traversal paths.
 - Further rough dielectric/specular sampling and MIS tuning in the hardware RT path.
 - Fully bindless material texture residency.
 - Broader glTF material extension support.
 - More complete scene instancing and transform update paths.
 - Render graph resource-state tracking and barrier validation.
-- Denoiser and reprojection validation against hardware RT output and the WebGPU reference.
+- Denoiser, TAA, and reprojection validation against hardware RT output and the WebGPU reference.
 
 ## Important Architectural Takeaway
 

@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -45,6 +46,7 @@ uint32_t nodeInstanceFlags(const SceneNodeAsset& node) {
 }
 
 constexpr uint32_t maxMaterialTextures = 1024;
+constexpr uint32_t sceneLightTypeDirectional = 0u;
 constexpr uint64_t fastImportedBvhTriangleThreshold = 1'000'000ull;
 constexpr uint32_t materialFlagManualBaseColorSrgb = 1u << 0u;
 constexpr uint32_t materialFlagManualEmissiveSrgb = 1u << 1u;
@@ -458,9 +460,21 @@ void uploadBuffer(ResourceAllocator& allocator, BufferUploader& uploader, std::u
     if (allocator.supportsDeviceAddress() && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
         usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
+    const VkDeviceSize requiredSize = std::max<VkDeviceSize>(bytes, 4);
+    const VkBufferUsageFlags requiredUsage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (buffer != nullptr && buffer->size() >= requiredSize && (buffer->usage() & requiredUsage) == requiredUsage) {
+        if (bytes > 0) {
+            uploader.uploadToBuffer(*buffer, data, bytes);
+        }
+        return;
+    }
+    if (buffer != nullptr && buffer->handle() != VK_NULL_HANDLE) {
+        checkVk(vkDeviceWaitIdle(allocator.device()), "vkDeviceWaitIdle(replace scene buffer)");
+        buffer.reset();
+    }
     buffer = std::make_unique<Buffer>(allocator, BufferDesc{
-        .size = std::max<VkDeviceSize>(bytes, 4),
-        .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .size = requiredSize,
+        .usage = requiredUsage,
         .memory = BufferMemory::GpuOnly,
         .debugName = name,
     });
@@ -473,9 +487,11 @@ void uploadBufferBatched(BatchUploader& batch, std::unique_ptr<Buffer>& buffer, 
     if (batch.allocator().supportsDeviceAddress() && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
         usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
+    const VkDeviceSize requiredSize = std::max<VkDeviceSize>(bytes, 4);
+    const VkBufferUsageFlags requiredUsage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buffer = std::make_unique<Buffer>(batch.allocator(), BufferDesc{
-        .size = std::max<VkDeviceSize>(bytes, 4),
-        .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .size = requiredSize,
+        .usage = requiredUsage,
         .memory = BufferMemory::GpuOnly,
         .debugName = name,
     });
@@ -723,6 +739,9 @@ std::vector<GpuLightRecord> buildAuthoredLightRecords(const std::vector<SceneLig
     records.reserve(lights.size());
     for (uint32_t i = 0; i < lights.size(); ++i) {
         const SceneLightAsset& light = lights[i];
+        if (light.type == sceneLightTypeDirectional) {
+            continue;
+        }
         if (!light.enabled || light.intensity <= 0.0f || luminance(light.color) <= 0.0f) {
             continue;
         }
@@ -842,6 +861,19 @@ bool GpuScene::setEnvironmentControls(bool enabled, float intensity, float rotat
     envParams_.intensity = std::max(0.0f, intensity);
     envParams_.rotation = rotation;
     envParams_.backgroundIntensity = std::max(0.0f, backgroundIntensity);
+    uploadEnvironmentParams();
+    return true;
+}
+
+bool GpuScene::setSkyCdfDimensions(uint32_t width, uint32_t height) {
+    width = std::max(width, 1u);
+    height = std::max(height, 1u);
+    if (envParams_.skyCdfWidth == width && envParams_.skyCdfHeight == height) {
+        return false;
+    }
+
+    envParams_.skyCdfWidth = width;
+    envParams_.skyCdfHeight = height;
     uploadEnvironmentParams();
     return true;
 }
@@ -1377,7 +1409,20 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         .instanceIndex = 0u,
         .meshIndex = 0u,
         .transform = glm::mat4{1.0f},
+        .flags = instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow,
+        .visible = true,
     });
+    const bool fallbackCameraVisible = std::any_of(
+        rayTracingInstances_.begin(),
+        rayTracingInstances_.end(),
+        [](const RayTracingInstanceBuildInput& instance) {
+            return instance.visible &&
+                (instance.flags & instanceFlagVisible) != 0u &&
+                (instance.flags & instanceFlagVisibleToCamera) != 0u;
+        });
+    if (!fallbackCameraVisible) {
+        throw std::runtime_error("Cornell fallback has no camera-visible ray tracing instance");
+    }
     const CpuBounds sceneBounds = boundsFromPositions(vertices);
     const std::vector<GpuInstanceBoundsRecord> instanceBounds = {
         makeInstanceBoundsRecord(sceneBounds, 0u, 0u),
@@ -2185,7 +2230,9 @@ void GpuScene::createEnvironment(BufferUploader& uploader) {
         .height = environment.height,
         .backgroundIntensity = 0.35f,
         .procedural = useExternalEnvironment ? 0u : 1u,
+        .skyCdfWidth = 256u,
         .invTotalLum = importance.invTotalLuminance,
+        .skyCdfHeight = 144u,
     };
     envParamsBuffer_ = std::make_unique<Buffer>(allocator_, BufferDesc{
         .size = sizeof(EnvParamsUniform),

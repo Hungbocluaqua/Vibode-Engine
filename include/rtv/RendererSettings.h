@@ -2,6 +2,8 @@
 
 #include "rtv/RendererDebug.h"
 
+#include <glm/glm.hpp>
+
 #include <cstdint>
 
 namespace rtv {
@@ -10,9 +12,10 @@ struct RendererSettings {
     bool pathTracingEnabled = true;
     bool cameraJitterEnabled = true;
     bool denoiserEnabled = true;
-    bool denoiseWhileMoving = false;
+    bool denoiseWhileMoving = true;
     bool taaEnabled = true;
     float taaFeedback = 0.08f;
+    float taaSharpeningStrength = 0.08f;
     bool sunlightEnabled = true;
     bool directLightingEnabled = true;
     bool environmentEnabled = true;
@@ -21,8 +24,13 @@ struct RendererSettings {
     uint32_t environmentDirectSamples = 1;
     float denoiserStrength = 1.0f;
     float sunIntensity = 1.0f;
+    float sunIlluminanceLux = 100000.0f;
+    float sunColorTemperatureKelvin = 5778.0f;
+    glm::vec3 sunColor{1.0f};
+    glm::vec3 sunDirection{0.0f, 0.8240f, -0.5661f};
     float skyIntensity = 0.8f;
     float sunElevation = 0.97f;
+    float sunAzimuth = 3.14159265358979323846f;
     ToneMapper toneMapper = ToneMapper::ACES;
     float exposure = 2.0f;
     float gamma = 2.2f;
@@ -40,7 +48,7 @@ struct RendererSettings {
     float histogramLowPercentile = 0.05f;
     float histogramHighPercentile = 0.95f;
     float histogramTargetPercentile = 0.60f;
-    float sunAngularRadius = 0.0093f;
+    float sunAngularRadius = 0.00465f;
     float rayleighScaleHeight = 8000.0f;
     float mieScaleHeight = 1200.0f;
     float mieAnisotropy = 0.8f;
@@ -54,6 +62,9 @@ struct RendererSettings {
     uint32_t accumulationLimit = 0;
     RendererDebugView debugView = RendererDebugView::Beauty;
     float debugScale = 1.0f;
+    float shadowRayBias = 0.001f;
+    float shadowDistanceBias = 0.002f;
+    float fireflyClamp = 48.0f;
 
     bool usePhysicalCamera = false;
     float physicalAperture = 16.0f;

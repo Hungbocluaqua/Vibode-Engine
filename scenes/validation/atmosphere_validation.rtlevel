@@ -1,61 +1,120 @@
 {
-  "version": 1,
-  "sourceGltf": "",
-  "sourceHdr": "",
-  "activeCamera": 1,
-  "environment": {"hdrPath": "", "intensity": 1.0, "rotation": 0.0, "backgroundIntensity": 1.0, "enabled": true},
-  "renderSettings": {
-    "pathTracingEnabled": true,
-    "directLightingEnabled": true,
-    "maxBounces": 3,
-    "environmentDirectSamples": 1,
-    "toneMapper": 3,
-    "exposure": 1.0,
-    "gamma": 2.2,
-    "contrast": 1.0,
-    "saturation": 1.0,
-    "brightness": 0.0,
-    "whitePoint": 8.0,
-    "autoExposureEnabled": true,
-    "targetLuminance": 0.18,
-    "minExposure": 0.05,
-    "maxExposure": 16.0,
-    "adaptationSpeed": 1.0,
-    "histogramMinLogLuminance": -12.0,
-    "histogramMaxLogLuminance": 14.0,
-    "histogramLowPercentile": 0.02,
-    "histogramHighPercentile": 0.98,
-    "histogramTargetPercentile": 0.6,
-    "sunlightEnabled": true,
-    "sunIntensity": 4.0,
-    "skyIntensity": 1.0,
-    "sunAngularRadius": 0.00465,
-    "indirectStrength": 1.0,
-    "denoiserEnabled": true,
-    "atrousIterations": 3,
-    "denoiserStrength": 0.75,
-    "debugView": 0,
-    "accumulate": true,
-    "accumulationLimit": 256,
-    "resolutionScale": 1.0,
-    "requestedBackend": 0
-  },
-  "entities": [
-    {
-      "id": {"index": 0, "generation": 1, "stable": 1},
-      "parent": 0,
-      "children": [],
-      "name": "Horizon Camera",
-      "transform": {"position": [0.0, 1.7, 8.0], "rotationEuler": [-0.04, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]},
-      "camera": {"verticalFovRadians": 0.872665, "nearPlane": 0.01, "farPlane": 100000.0, "active": true, "useRenderSettingsExposure": true}
-    },
-    {
-      "id": {"index": 1, "generation": 1, "stable": 2},
-      "parent": 0,
-      "children": [],
-      "name": "Low Sun Reference",
-      "transform": {"position": [20.0, 4.0, 10.0], "rotationEuler": [0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]},
-      "light": {"type": 0, "color": [1.0, 0.55, 0.28], "intensity": 80.0, "sizeOrRadius": 0.5, "enabled": true}
-    }
-  ]
+    "version":  2,
+    "sourceGltf":  "",
+    "sourceHdr":  "",
+    "activeCamera":  1,
+    "environment":  {
+                        "hdrPath":  "",
+                        "intensity":  1.0,
+                        "rotation":  0.0,
+                        "backgroundIntensity":  1.0,
+                        "enabled":  true
+                    },
+    "renderSettings":  {
+                           "pathTracingEnabled":  true,
+                           "directLightingEnabled":  true,
+                           "maxBounces":  3,
+                           "environmentDirectSamples":  1,
+                           "toneMapper":  3,
+                           "exposure":  1.0,
+                           "gamma":  2.2,
+                           "contrast":  1.0,
+                           "saturation":  1.0,
+                           "brightness":  0.0,
+                           "whitePoint":  8.0,
+                           "autoExposureEnabled":  true,
+                           "targetLuminance":  0.18,
+                           "minExposure":  0.05,
+                           "maxExposure":  16.0,
+                           "adaptationSpeed":  1.0,
+                           "histogramMinLogLuminance":  -12.0,
+                           "histogramMaxLogLuminance":  14.0,
+                           "histogramLowPercentile":  0.02,
+                           "histogramHighPercentile":  0.98,
+                           "histogramTargetPercentile":  0.6,
+                           "skyIntensity":  0.95,
+                           "indirectStrength":  1.0,
+                           "denoiserEnabled":  true,
+                           "atrousIterations":  3,
+                           "denoiserStrength":  0.75,
+                           "debugView":  0,
+                           "accumulate":  true,
+                           "accumulationLimit":  256,
+                           "resolutionScale":  1.0,
+                           "requestedBackend":  0
+                       },
+    "entities":  [
+                     {
+                         "id":  {
+                                    "index":  0,
+                                    "generation":  1,
+                                    "stable":  1
+                                },
+                         "parent":  0,
+                         "children":  [
+
+                                      ],
+                         "name":  "Horizon Camera",
+                         "transform":  {
+                                           "position":  [
+                                                            0.0,
+                                                            1.7,
+                                                            8.0
+                                                        ],
+                                           "rotationEuler":  [
+                                                                 -0.04,
+                                                                 0.0,
+                                                                 0.0
+                                                             ],
+                                           "scale":  [
+                                                         1.0,
+                                                         1.0,
+                                                         1.0
+                                                     ]
+                                       },
+                         "camera":  {
+                                        "verticalFovRadians":  0.872665,
+                                        "nearPlane":  0.01,
+                                        "farPlane":  100000.0,
+                                        "active":  true,
+                                        "useRenderSettingsExposure":  true
+                                    }
+                     },
+                     {
+                         "id":  {
+                                    "index":  1,
+                                    "generation":  1,
+                                    "stable":  2
+                                },
+                         "parent":  0,
+                         "children":  [
+
+                                      ],
+                         "name":  "Low Sun Reference",
+                         "transform":  {
+                                           "position":  [
+                                                            20,
+                                                            4,
+                                                            10
+                                                        ],
+                                           "rotationEuler":  [
+                                                                 -0.17701314551900355,
+                                                                 1.1071487177940904,
+                                                                 0
+                                                             ],
+                                           "scale":  [
+                                                         1.0,
+                                                         1.0,
+                                                         1.0
+                                                     ]
+                                       },
+                         "sun":  {
+                                     "enabled":  true,
+                                     "illuminanceLux":  3600000,
+                                     "angularRadiusRadians":  0.00465,
+                                     "colorTemperatureKelvin":  5778
+                                 }
+                     }
+                 ],
+    "primarySun":  2
 }

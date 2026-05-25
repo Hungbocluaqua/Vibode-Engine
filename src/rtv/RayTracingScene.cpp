@@ -35,6 +35,12 @@ Buffer createScratch(ResourceAllocator& allocator, VkDeviceSize size, const char
     });
 }
 
+constexpr uint32_t instanceFlagVisible = 1u << 0u;
+constexpr uint32_t instanceFlagVisibleToCamera = 1u << 1u;
+constexpr uint32_t instanceFlagCastShadow = 1u << 2u;
+constexpr uint8_t rayMaskCamera = 0x01u;
+constexpr uint8_t rayMaskShadow = 0x02u;
+
 struct BlasBuildSizes {
     uint32_t meshBuildIndex = 0;
     uint32_t primitiveCount = 0;
@@ -79,7 +85,19 @@ std::vector<VkAccelerationStructureInstanceKHR> buildVkInstances(
         VkAccelerationStructureInstanceKHR vkInstance{};
         vkInstance.transform = toVkTransform(instance.transform);
         vkInstance.instanceCustomIndex = instance.instanceIndex;
-        vkInstance.mask = instance.visible ? 0xff : 0x00;
+        uint8_t mask = 0u;
+        const uint32_t flags = instance.flags == 0u
+            ? (instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow)
+            : instance.flags;
+        if (instance.visible && (flags & instanceFlagVisible) != 0u) {
+            if ((flags & instanceFlagVisibleToCamera) != 0u) {
+                mask |= rayMaskCamera;
+            }
+            if ((flags & instanceFlagCastShadow) != 0u) {
+                mask |= rayMaskShadow;
+            }
+        }
+        vkInstance.mask = mask;
         vkInstance.instanceShaderBindingTableRecordOffset = 0;
         vkInstance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
         vkInstance.accelerationStructureReference = blases[instance.meshIndex].deviceAddress();

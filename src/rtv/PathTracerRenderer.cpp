@@ -419,8 +419,8 @@ void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D extent) {
     currentFrame_ = frames_.at(frameIndex % frames_.size()).get();
     currentProfiler_ = &profilers_.at(frameIndex % profilers_.size());
     currentProfiler_->collectCompletedFrame();
-    validationLog_.beginFrame(frameCount_);
-    if (frameCount_ > 0 && frameCount_ % 120u == 0u) {
+    validationLog_.beginFrame(temporalFrameIndex_);
+    if (temporalFrameIndex_ > 0 && temporalFrameIndex_ % 120u == 0u) {
         const GpuFrameTimings& timings = currentProfiler_->timings();
         std::cout << "GPU timings: path=" << timings.pathTraceMs
                   << " ms, denoise=" << timings.denoiserMs
@@ -435,8 +435,9 @@ void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D extent) {
         resetAccumulation(AccumulationResetReason::Resize);
     }
     ++frameCount_;
+    ++temporalFrameIndex_;
     if (temporalSystem_) {
-        temporalSystem_->beginFrame(frameCount_);
+        temporalSystem_->beginFrame(temporalFrameIndex_);
     }
     updateCamera();
 }
@@ -447,11 +448,26 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     next.atrousIterations = std::clamp(next.atrousIterations, 1u, 5u);
     next.environmentDirectSamples = std::clamp(next.environmentDirectSamples, 1u, 8u);
     next.denoiserStrength = std::max(0.05f, next.denoiserStrength);
+    next.taaSharpeningStrength = std::clamp(next.taaSharpeningStrength, 0.0f, 1.0f);
     next.sunIntensity = std::max(0.0f, next.sunIntensity);
+    next.sunIlluminanceLux = std::max(0.0f, next.sunIlluminanceLux);
+    next.sunColorTemperatureKelvin = std::clamp(next.sunColorTemperatureKelvin, 1000.0f, 40000.0f);
+    next.sunColor = glm::max(next.sunColor, glm::vec3(0.0f));
+    if (glm::dot(next.sunDirection, next.sunDirection) > 1.0e-6f) {
+        next.sunDirection = glm::normalize(next.sunDirection);
+    } else {
+        next.sunDirection = glm::vec3(0.0f, 0.8240f, 0.5661f);
+    }
     next.skyIntensity = std::max(0.0f, next.skyIntensity);
     next.sunElevation = std::clamp(next.sunElevation, -0.20f, 1.45f);
+    constexpr float twoPi = 6.28318530717958647692f;
+    if (std::isfinite(next.sunAzimuth)) {
+        next.sunAzimuth = std::remainder(next.sunAzimuth, twoPi);
+    } else {
+        next.sunAzimuth = 0.0f;
+    }
     next.exposure = std::max(0.05f, next.exposure);
-    if (next.toneMapper == ToneMapper::AgX || static_cast<uint32_t>(next.toneMapper) > static_cast<uint32_t>(ToneMapper::AgX)) {
+    if (static_cast<uint32_t>(next.toneMapper) > static_cast<uint32_t>(ToneMapper::AgX)) {
         next.toneMapper = ToneMapper::ACES;
     }
     next.gamma = std::max(0.1f, next.gamma);
@@ -466,16 +482,25 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     next.histogramLowPercentile = std::clamp(next.histogramLowPercentile, 0.0f, 1.0f);
     next.histogramHighPercentile = std::clamp(next.histogramHighPercentile, 0.0f, 1.0f);
     next.histogramTargetPercentile = std::clamp(next.histogramTargetPercentile, 0.0f, 1.0f);
-    next.sunAngularRadius = std::max(0.0f, next.sunAngularRadius);
+    next.sunAngularRadius = std::isfinite(next.sunAngularRadius)
+        ? std::clamp(next.sunAngularRadius, 0.0f, 0.08f)
+        : 0.00465f;
     next.rayleighScaleHeight = std::clamp(next.rayleighScaleHeight, 1000.0f, 20000.0f);
     next.mieScaleHeight = std::clamp(next.mieScaleHeight, 200.0f, 5000.0f);
     next.mieAnisotropy = std::clamp(next.mieAnisotropy, 0.0f, 0.99f);
     next.groundAlbedo = std::clamp(next.groundAlbedo, 0.0f, 1.0f);
+    next.physicalAperture = std::max(0.1f, next.physicalAperture);
+    next.physicalShutterSeconds = std::max(1.0e-6f, next.physicalShutterSeconds);
+    next.physicalIso = std::max(1.0f, next.physicalIso);
+    next.physicalExposureCompensation = std::clamp(next.physicalExposureCompensation, -10.0f, 10.0f);
     next.indirectStrength = std::max(0.0f, next.indirectStrength);
     next.environmentIntensity = std::max(0.0f, next.environmentIntensity);
     next.environmentBackgroundIntensity = std::max(0.0f, next.environmentBackgroundIntensity);
     next.renderResolutionScale = std::clamp(next.renderResolutionScale, 0.25f, 1.0f);
     next.debugScale = std::max(0.05f, next.debugScale);
+    next.shadowRayBias = std::clamp(next.shadowRayBias, 0.00001f, 0.05f);
+    next.shadowDistanceBias = std::clamp(next.shadowDistanceBias, 0.0f, 0.1f);
+    next.fireflyClamp = std::clamp(next.fireflyClamp, 1.0f, 512.0f);
     if (static_cast<uint32_t>(next.restirMode) > static_cast<uint32_t>(RestirMode::HybridCompare)) {
         next.restirMode = RestirMode::ClassicNee;
     }
@@ -496,11 +521,17 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.debugView != settings_.debugView ||
         next.toneMapper != settings_.toneMapper ||
         next.autoExposureEnabled != settings_.autoExposureEnabled ||
+        next.usePhysicalCamera != settings_.usePhysicalCamera ||
         std::abs(next.taaFeedback - settings_.taaFeedback) > 0.0001f ||
+        std::abs(next.taaSharpeningStrength - settings_.taaSharpeningStrength) > 0.0001f ||
         std::abs(next.denoiserStrength - settings_.denoiserStrength) > 0.0001f ||
         std::abs(next.sunIntensity - settings_.sunIntensity) > 0.0001f ||
+        std::abs(next.sunIlluminanceLux - settings_.sunIlluminanceLux) > 0.5f ||
+        glm::length(next.sunColor - settings_.sunColor) > 0.0001f ||
+        glm::length(next.sunDirection - settings_.sunDirection) > 0.0001f ||
         std::abs(next.skyIntensity - settings_.skyIntensity) > 0.0001f ||
         std::abs(next.sunElevation - settings_.sunElevation) > 0.0001f ||
+        std::abs(next.sunAzimuth - settings_.sunAzimuth) > 0.0001f ||
         std::abs(next.exposure - settings_.exposure) > 0.0001f ||
         std::abs(next.gamma - settings_.gamma) > 0.0001f ||
         std::abs(next.contrast - settings_.contrast) > 0.0001f ||
@@ -517,12 +548,23 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.histogramHighPercentile - settings_.histogramHighPercentile) > 0.0001f ||
         std::abs(next.histogramTargetPercentile - settings_.histogramTargetPercentile) > 0.0001f ||
         std::abs(next.sunAngularRadius - settings_.sunAngularRadius) > 0.0001f ||
+        std::abs(next.rayleighScaleHeight - settings_.rayleighScaleHeight) > 0.5f ||
+        std::abs(next.mieScaleHeight - settings_.mieScaleHeight) > 0.5f ||
+        std::abs(next.mieAnisotropy - settings_.mieAnisotropy) > 0.0001f ||
+        std::abs(next.groundAlbedo - settings_.groundAlbedo) > 0.0001f ||
+        std::abs(next.physicalAperture - settings_.physicalAperture) > 0.0001f ||
+        std::abs(next.physicalShutterSeconds - settings_.physicalShutterSeconds) > 0.000001f ||
+        std::abs(next.physicalIso - settings_.physicalIso) > 0.0001f ||
+        std::abs(next.physicalExposureCompensation - settings_.physicalExposureCompensation) > 0.0001f ||
         std::abs(next.indirectStrength - settings_.indirectStrength) > 0.0001f ||
         std::abs(next.environmentIntensity - settings_.environmentIntensity) > 0.0001f ||
         std::abs(next.environmentRotation - settings_.environmentRotation) > 0.0001f ||
         std::abs(next.environmentBackgroundIntensity - settings_.environmentBackgroundIntensity) > 0.0001f ||
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f ||
-        std::abs(next.debugScale - settings_.debugScale) > 0.0001f;
+        std::abs(next.debugScale - settings_.debugScale) > 0.0001f ||
+        std::abs(next.shadowRayBias - settings_.shadowRayBias) > 0.000001f ||
+        std::abs(next.shadowDistanceBias - settings_.shadowDistanceBias) > 0.000001f ||
+        std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f;
     if (!changed) {
         return false;
     }
@@ -538,8 +580,12 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         next.restirMode != settings_.restirMode ||
         std::abs(next.sunIntensity - settings_.sunIntensity) > 0.0001f ||
+        std::abs(next.sunIlluminanceLux - settings_.sunIlluminanceLux) > 0.5f ||
+        glm::length(next.sunColor - settings_.sunColor) > 0.0001f ||
+        glm::length(next.sunDirection - settings_.sunDirection) > 0.0001f ||
         std::abs(next.skyIntensity - settings_.skyIntensity) > 0.0001f ||
         std::abs(next.sunElevation - settings_.sunElevation) > 0.0001f ||
+        std::abs(next.sunAzimuth - settings_.sunAzimuth) > 0.0001f ||
         std::abs(next.sunAngularRadius - settings_.sunAngularRadius) > 0.0001f ||
         std::abs(next.rayleighScaleHeight - settings_.rayleighScaleHeight) > 0.5f ||
         std::abs(next.mieScaleHeight - settings_.mieScaleHeight) > 0.5f ||
@@ -552,7 +598,8 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.denoiserStrength - settings_.denoiserStrength) > 0.0001f;
     const bool taaChanged =
         next.taaEnabled != settings_.taaEnabled ||
-        std::abs(next.taaFeedback - settings_.taaFeedback) > 0.0001f;
+        std::abs(next.taaFeedback - settings_.taaFeedback) > 0.0001f ||
+        std::abs(next.taaSharpeningStrength - settings_.taaSharpeningStrength) > 0.0001f;
     const bool debugChanged =
         next.debugView != settings_.debugView ||
         std::abs(next.debugScale - settings_.debugScale) > 0.0001f;
@@ -561,11 +608,17 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.cameraJitterEnabled != settings_.cameraJitterEnabled ||
         next.maxBounces != settings_.maxBounces ||
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
-        std::abs(next.indirectStrength - settings_.indirectStrength) > 0.0001f;
+        std::abs(next.indirectStrength - settings_.indirectStrength) > 0.0001f ||
+        std::abs(next.shadowRayBias - settings_.shadowRayBias) > 0.000001f ||
+        std::abs(next.shadowDistanceBias - settings_.shadowDistanceBias) > 0.000001f ||
+        std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f;
     const bool renderResolutionChanged =
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f;
 
     settings_ = next;
+    if (taaChanged || renderResolutionChanged) {
+        taaHistoryValid_ = false;
+    }
 
     physicalCamera_.setSettings({settings_.physicalAperture, settings_.physicalShutterSeconds, settings_.physicalIso, settings_.physicalExposureCompensation});
     const bool environmentUploaded = scene_.setEnvironmentControls(
@@ -630,13 +683,20 @@ void PathTracerRenderer::setCameraFovY(float fovY) {
 
 void PathTracerRenderer::resetAccumulation(AccumulationResetReason reason) {
     lastResetReason_ = reason;
-    validationLog_.recordAccumulationInvalidation(accumulationResetReasonName(reason), frameCount_);
+    validationLog_.recordAccumulationInvalidation(accumulationResetReasonName(reason), temporalFrameIndex_);
     if (temporalSystem_) {
         temporalSystem_->setCameraCut(reason != AccumulationResetReason::CameraMoved, reason);
+    }
+    if (reason != AccumulationResetReason::CameraMoved) {
+        taaHistoryValid_ = false;
     }
     frameCount_ = 0;
     if (reason != AccumulationResetReason::CameraMoved) {
         previousJitter_ = glm::vec2(0.0f);
+        stillFrameCount_ = 0;
+        if (reason == AccumulationResetReason::Resize) {
+            temporalFrameIndex_ = 0;
+        }
     }
 }
 
@@ -689,6 +749,7 @@ bool PathTracerRenderer::updateSceneVisibility(const SceneAsset& scene, const As
         !rayTracingScene_->refitTransforms(context_, allocator_, uploader_, scene_)) {
         return false;
     }
+    resetAccumulation(AccumulationResetReason::SceneChanged);
     return true;
 }
 
@@ -845,7 +906,7 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D extent) {
         .debugName = "path variance packed",
     });
     depthNormalBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(uint32_t) * 3,
+        .size = pixelCount * sizeof(uint32_t) * 4,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory = BufferMemory::GpuOnly,
         .debugName = "path depth normal roughness packed",
@@ -962,14 +1023,32 @@ void PathTracerRenderer::updateCamera() {
     camera_.sunAngularRadius = settings_.sunAngularRadius;
     camera_.indirectStrength = settings_.indirectStrength;
     camera_.environmentDirectSamples = settings_.environmentDirectSamples;
-    const bool temporalCameraCut = temporalSystem_ ? temporalSystem_->isCameraCut() : frameCount_ <= 1u;
+    camera_.renderControls = glm::vec4(settings_.shadowRayBias, settings_.shadowDistanceBias, settings_.fireflyClamp, 0.0f);
+    // Manual exposure in this renderer is still calibrated around the legacy sun scalar.
+    // Keep raw lux only for physical-camera mode where exposure is EV-based.
+    camera_.sunDirectionIlluminance = glm::vec4(
+        settings_.sunDirection,
+        settings_.usePhysicalCamera ? settings_.sunIlluminanceLux : settings_.sunIntensity);
+    camera_.sunColorAngularRadius = glm::vec4(settings_.sunColor, settings_.sunAngularRadius);
+    const bool temporalCameraCut = temporalSystem_ ? temporalSystem_->isCameraCut() : temporalFrameIndex_ <= 1u;
     const bool temporalHistoryAvailable = !temporalCameraCut;
     camera_.atmosphere = glm::vec4(
         settings_.sunElevation,
         static_cast<float>(settings_.restirMode),
         temporalHistoryAvailable ? 1.0f : 0.0f,
-        5.5f); // fast sky normalization
+        settings_.sunAzimuth);
     camera_.frameCount = frameCount_;
+    camera_.temporalFrameIndex = temporalFrameIndex_;
+
+    if (cameraChangedThisFrame_) {
+        stillFrameCount_ = 0;
+    } else {
+        stillFrameCount_ = std::min(stillFrameCount_ + 1u, 60u);
+    }
+    const bool restoreFullJitter = stillFrameCount_ >= 2u;
+    const float effectiveJitterScale = cameraChangedThisFrame_ ? 0.0f : (restoreFullJitter ? 1.0f : 0.0f);
+    camera_.effectiveJitterScale = effectiveJitterScale;
+    camera_.cameraMoving = cameraChangedThisFrame_ ? 1u : 0u;
 
     const float aspect = extent_.height > 0 ? static_cast<float>(extent_.width) / static_cast<float>(extent_.height) : 1.0f;
     const glm::vec3 eye = glm::vec3(camera_.pos);
@@ -977,13 +1056,13 @@ void PathTracerRenderer::updateCamera() {
     const glm::mat4 view = glm::lookAtRH(eye, center, glm::normalize(glm::vec3(camera_.up)));
     glm::mat4 projection = glm::perspectiveRH_ZO(camera_.fovY, aspect, 0.01f, 1000.0f);
     projection[1][1] *= -1.0f;
-    const bool jitterEnabled = settings_.pathTracingEnabled && settings_.cameraJitterEnabled && extent_.width > 0 && extent_.height > 0;
-    const uint32_t jitterIndex = frameCount_ + 1u;
+    const bool jitterEnabled = settings_.pathTracingEnabled && settings_.taaEnabled && settings_.cameraJitterEnabled && effectiveJitterScale > 0.0f && extent_.width > 0 && extent_.height > 0;
+    const uint32_t jitterIndex = temporalFrameIndex_ + 1u;
     const glm::vec2 currentJitter = jitterEnabled
-        ? glm::vec2(halton(jitterIndex, 2u) - 0.5f, halton(jitterIndex, 3u) - 0.5f)
+        ? glm::vec2(halton(jitterIndex, 2u) - 0.5f, halton(jitterIndex, 3u) - 0.5f) * effectiveJitterScale
         : glm::vec2(0.0f);
-    projection[2][0] += currentJitter.x * 2.0f / static_cast<float>(std::max(extent_.width, 1u));
-    projection[2][1] += currentJitter.y * 2.0f / static_cast<float>(std::max(extent_.height, 1u));
+    projection[2][0] -= currentJitter.x * 2.0f / static_cast<float>(std::max(extent_.width, 1u));
+    projection[2][1] -= currentJitter.y * 2.0f / static_cast<float>(std::max(extent_.height, 1u));
     const glm::mat4 viewProj = projection * view;
     camera_.jitter = glm::vec4(currentJitter, previousJitter_);
     Buffer& frameUniforms = currentFrame_->uniformRing();
@@ -1005,10 +1084,11 @@ void PathTracerRenderer::updateCamera() {
         debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalReactiveMask) ||
         debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalHistoryWeight);
     const bool allowDenoiserForDebugView = denoiserDebugView;
-    const bool allowDenoiserWhileMoving = settings_.denoiseWhileMoving || !cameraChangedThisFrame_;
+    const bool stablePreview = shouldRunTaa();
+    const bool allowDenoiserWhileMoving = settings_.denoiseWhileMoving || stablePreview || !cameraChangedThisFrame_;
     denoiserParams_.enabled = settings_.pathTracingEnabled && settings_.denoiserEnabled && allowDenoiserForDebugView && allowDenoiserWhileMoving ? 1u : 0u;
     denoiserParams_.strength = settings_.denoiserStrength;
-    denoiserParams_.frameCount = frameCount_;
+    denoiserParams_.frameCount = temporalFrameIndex_;
     denoiserParams_.width = extent_.width;
     denoiserParams_.height = extent_.height;
     denoiserParams_.atrousIterations = settings_.atrousIterations;
@@ -1018,19 +1098,33 @@ void PathTracerRenderer::updateCamera() {
     frameUniforms.flush(sizeof(denoiserParams_), kFrameDenoiserParamsOffset);
 
     taaParams_.enabled = shouldRunTaa() ? 1u : 0u;
-    taaParams_.frameCount = frameCount_;
+    taaParams_.frameCount = temporalFrameIndex_;
     taaParams_.width = extent_.width;
     taaParams_.height = extent_.height;
-    taaParams_.feedback = std::clamp(settings_.taaFeedback, 0.01f, 0.5f);
+    const float taaFeedback = cameraChangedThisFrame_
+        ? std::min(settings_.taaFeedback, 0.05f)
+        : settings_.taaFeedback;
+    taaParams_.feedback = std::clamp(taaFeedback, 0.01f, 0.5f);
     taaParams_.velocityScale = 64.0f;
     taaParams_.resetHistory = temporalCameraCut ? 1u : 0u;
-    taaParams_.sharpeningStrength = 0.08f;
+    taaParams_.sharpeningStrength = settings_.taaSharpeningStrength;
+    taaParams_.historyValid = taaHistoryValid_ ? 1u : 0u;
+    taaParams_.cameraMoving = cameraChangedThisFrame_ ? 1u : 0u;
     frameUniforms.write(&taaParams_, sizeof(taaParams_), kFrameTaaParamsOffset);
     frameUniforms.flush(sizeof(taaParams_), kFrameTaaParamsOffset);
+    if (temporalFrameIndex_ == 1u || temporalFrameIndex_ % 120u == 0u) {
+        validationLog_.recordPass(
+            "temporal state temporal=" + std::to_string(temporalFrameIndex_) +
+            " accumulation=" + std::to_string(frameCount_) +
+            " jitterScale=" + std::to_string(effectiveJitterScale) +
+            " moving=" + std::to_string(cameraChangedThisFrame_ ? 1u : 0u) +
+            " taaHistory=" + std::to_string(taaHistoryValid_ ? 1u : 0u) +
+            " taaFeedback=" + std::to_string(taaParams_.feedback));
+    }
 
     restirSpatialParams_.width = extent_.width;
     restirSpatialParams_.height = extent_.height;
-    restirSpatialParams_.frameCount = frameCount_;
+    restirSpatialParams_.frameCount = temporalFrameIndex_;
     restirSpatialParams_.enabled = shouldRunRestirSpatial() ? 1u : 0u;
     frameUniforms.write(&restirSpatialParams_, sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
     frameUniforms.flush(sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
@@ -1057,10 +1151,13 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
     if (atmosphereLutSystem_ != nullptr) {
         validationLog_.recordPass("atmosphere lut update");
         currentProfiler_->write(commandBuffer, GpuProfiler::AtmosphereStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        atmosphereLutSystem_->setSkyParameters(settings_.sunElevation, settings_.skyIntensity);
+        atmosphereLutSystem_->setSkyDirection(settings_.sunDirection, settings_.skyIntensity);
         atmosphereLutSystem_->setAtmosphereParams(settings_.rayleighScaleHeight, settings_.mieScaleHeight, settings_.mieAnisotropy, settings_.groundAlbedo);
         atmosphereLutSystem_->setCameraPosition(glm::vec3(camera_.pos));
         atmosphereLutSystem_->record(commandBuffer, currentFrame_->descriptors());
+        if (const AtmosphereSamplingSystem* sampling = atmosphereLutSystem_->samplingSystem()) {
+            scene_.setSkyCdfDimensions(sampling->skyViewWidth(), sampling->skyViewHeight());
+        }
         currentProfiler_->write(commandBuffer, GpuProfiler::AtmosphereEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
     currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceStart, traceStage);
@@ -1158,7 +1255,7 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             recordPathTracePass(cmd);
         });
     graph.compile();
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
 }
 
 void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
@@ -1214,7 +1311,7 @@ void PathTracerRenderer::recordRestirSpatial(VkCommandBuffer commandBuffer) {
             recordRestirSpatialCopyPass(cmd);
         });
     graph.compile();
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
 }
 
 void PathTracerRenderer::recordRestirSpatialPass(VkCommandBuffer commandBuffer) {
@@ -1286,7 +1383,7 @@ void PathTracerRenderer::recordHeightFog(VkCommandBuffer commandBuffer) {
             recordHeightFogPass(cmd);
         });
     graph.compile();
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
 }
 
 void PathTracerRenderer::recordHeightFogPass(VkCommandBuffer commandBuffer) {
@@ -1422,6 +1519,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageRead(toneInput, PipelineDomain::Compute)
             .addStorageReadWrite(taaHistory, PipelineDomain::Compute)
             .addStorageRead(velocity, PipelineDomain::Compute)
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
             .addStorageWrite(taa, PipelineDomain::Compute);
         graph.addPass("taa_history_copy")
             .addStorageRead(taa, PipelineDomain::Transfer)
@@ -1587,7 +1685,7 @@ void PathTracerRenderer::recordSelectionOutline(VkCommandBuffer commandBuffer) {
         });
     graph.compile();
     currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
     presentationImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
@@ -1709,7 +1807,7 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
         });
     graph.compile();
     currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
     currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
@@ -1849,7 +1947,7 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
         });
     graph.compile();
     currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     historyImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
@@ -2012,10 +2110,24 @@ void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
         },
         .debugName = "screen velocity",
     });
+    const RenderGraphResourceId depthNormal = graph.createBuffer(RenderGraphResource{
+        .type = RenderGraphResource::Type::Buffer,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .size = depthNormalBuffer_.size(),
+        .buffer = depthNormalBuffer_.handle(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = pathTraceShaderStage(),
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        },
+        .debugName = "depth normal",
+    });
     graph.addPass("taa_resolve")
         .addStorageRead(input, PipelineDomain::Compute)
         .addStorageReadWrite(history, PipelineDomain::Compute)
         .addStorageRead(velocity, PipelineDomain::Compute)
+        .addStorageRead(depthNormal, PipelineDomain::Compute)
         .addStorageWrite(output, PipelineDomain::Compute)
         .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             recordTaaPass(cmd);
@@ -2028,7 +2140,7 @@ void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
         });
     graph.compile();
     currentProfiler_->write(commandBuffer, GpuProfiler::TaaStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
     taaImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     taaHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
@@ -2049,6 +2161,7 @@ void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
         .writeImage(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, taaImage_.storageDescriptor())
         .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
         .writeBuffer(5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
         .update(context_.device(), set);
 
     taaPipeline_->bind(commandBuffer);
@@ -2078,6 +2191,7 @@ void PathTracerRenderer::recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer)
     if (temporalSystem_) {
         temporalSystem_->markSlotWritten("taa_history");
     }
+    taaHistoryValid_ = true;
 }
 
 void PathTracerRenderer::recordAutoExposure(VkCommandBuffer commandBuffer) {
@@ -2144,7 +2258,7 @@ void PathTracerRenderer::recordAutoExposure(VkCommandBuffer commandBuffer) {
         });
     graph.compile();
     currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
     currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
@@ -2263,7 +2377,7 @@ void PathTracerRenderer::recordToneMap(VkCommandBuffer commandBuffer) {
         });
     graph.compile();
     currentProfiler_->write(commandBuffer, GpuProfiler::ToneMapStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
     presentationImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     currentProfiler_->write(commandBuffer, GpuProfiler::ToneMapEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
@@ -2418,7 +2532,7 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
         });
     graph.compile();
     currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
-    graph.execute(commandBuffer, frameCount_);
+    graph.execute(commandBuffer, temporalFrameIndex_);
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);

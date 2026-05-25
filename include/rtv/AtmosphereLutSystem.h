@@ -44,7 +44,8 @@ public:
     ~AtmosphereLutSystem();
 
     void record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
-    void setSkyParameters(float sunElevation, float skyIntensity);
+    void setSkyParameters(float sunElevation, float sunAzimuth, float skyIntensity);
+    void setSkyDirection(glm::vec3 sunDirection, float skyIntensity);
     void setAtmosphereParams(float rayleighScaleHeight, float mieScaleHeight, float mieAnisotropy, float groundAlbedo);
     void setQuality(AtmosphereQuality quality);
     void setCameraPosition(glm::vec3 position);
@@ -109,6 +110,7 @@ private:
     bool skyViewReady_ = false;
     bool previousSkyViewReady_ = false;
     float sunElevation_ = 0.97f;
+    float sunAzimuth_ = 0.0f;
     float skyIntensity_ = 0.8f;
     uint32_t skyViewWidth_ = 256;
     uint32_t skyViewHeight_ = 144;

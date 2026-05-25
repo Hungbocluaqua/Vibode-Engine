@@ -19,7 +19,7 @@ TransientResourcePool::~TransientResourcePool() {
 VkImage TransientResourcePool::acquireOrCreateImage(uint32_t aliasGroup, const RenderGraphResource& desc) {
     auto it = aliasImages_.find(aliasGroup);
     if (it != aliasImages_.end()) {
-        return it->second;
+        return it->second.image;
     }
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -38,9 +38,10 @@ VkImage TransientResourcePool::acquireOrCreateImage(uint32_t aliasGroup, const R
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     if (vmaCreateImage(allocator_->handle(), &imageInfo, &allocInfo, &image, &allocation, nullptr) == VK_SUCCESS) {
-        aliasImages_[aliasGroup] = image;
-        imagePool_.push_back(image);
         const size_t estimatedBytes = desc.extent.width * desc.extent.height * std::max(desc.extent.depth, 1u) * 4u;
+        TransientImageAllocation transient{image, allocation, estimatedBytes};
+        aliasImages_[aliasGroup] = transient;
+        imagePool_.push_back(transient);
         totalBytesAllocated_ += estimatedBytes;
         activeBytes_ += estimatedBytes;
         peakBytes_ = std::max(peakBytes_, activeBytes_);
@@ -51,7 +52,7 @@ VkImage TransientResourcePool::acquireOrCreateImage(uint32_t aliasGroup, const R
 VkBuffer TransientResourcePool::acquireOrCreateBuffer(uint32_t aliasGroup, const RenderGraphResource& desc) {
     auto it = aliasBuffers_.find(aliasGroup);
     if (it != aliasBuffers_.end()) {
-        return it->second;
+        return it->second.buffer;
     }
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -62,8 +63,9 @@ VkBuffer TransientResourcePool::acquireOrCreateBuffer(uint32_t aliasGroup, const
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     if (vmaCreateBuffer(allocator_->handle(), &bufferInfo, &allocInfo, &buffer, &allocation, nullptr) == VK_SUCCESS) {
-        aliasBuffers_[aliasGroup] = buffer;
-        bufferPool_.push_back(buffer);
+        TransientBufferAllocation transient{buffer, allocation, static_cast<size_t>(desc.size)};
+        aliasBuffers_[aliasGroup] = transient;
+        bufferPool_.push_back(transient);
         activeBytes_ += desc.size;
         totalBytesAllocated_ += desc.size;
         peakBytes_ = std::max(peakBytes_, activeBytes_);
@@ -74,18 +76,26 @@ VkBuffer TransientResourcePool::acquireOrCreateBuffer(uint32_t aliasGroup, const
 void TransientResourcePool::releaseImage(uint32_t aliasGroup) {
     auto it = aliasImages_.find(aliasGroup);
     if (it != aliasImages_.end()) {
-        vmaDestroyImage(allocator_->handle(), it->second, VK_NULL_HANDLE);
+        const TransientImageAllocation allocation = it->second;
+        vmaDestroyImage(allocator_->handle(), allocation.image, allocation.allocation);
         aliasImages_.erase(it);
-        if (activeBytes_ > 0) activeBytes_ = activeBytes_ > 256 ? activeBytes_ - 256 : 0;
+        imagePool_.erase(std::remove_if(imagePool_.begin(), imagePool_.end(), [allocation](const TransientImageAllocation& entry) {
+            return entry.image == allocation.image;
+        }), imagePool_.end());
+        activeBytes_ = activeBytes_ > allocation.estimatedBytes ? activeBytes_ - allocation.estimatedBytes : 0;
     }
 }
 
 void TransientResourcePool::releaseBuffer(uint32_t aliasGroup) {
     auto it = aliasBuffers_.find(aliasGroup);
     if (it != aliasBuffers_.end()) {
-        vmaDestroyBuffer(allocator_->handle(), it->second, VK_NULL_HANDLE);
+        const TransientBufferAllocation allocation = it->second;
+        vmaDestroyBuffer(allocator_->handle(), allocation.buffer, allocation.allocation);
         aliasBuffers_.erase(it);
-        if (activeBytes_ > 1024) activeBytes_ -= 1024;
+        bufferPool_.erase(std::remove_if(bufferPool_.begin(), bufferPool_.end(), [allocation](const TransientBufferAllocation& entry) {
+            return entry.buffer == allocation.buffer;
+        }), bufferPool_.end());
+        activeBytes_ = activeBytes_ > allocation.bytes ? activeBytes_ - allocation.bytes : 0;
     }
 }
 
@@ -95,11 +105,11 @@ void TransientResourcePool::beginFrame() {
 }
 
 void TransientResourcePool::destroyAll() {
-    for (VkImage img : imagePool_) {
-        vmaDestroyImage(allocator_->handle(), img, VK_NULL_HANDLE);
+    for (const TransientImageAllocation& image : imagePool_) {
+        vmaDestroyImage(allocator_->handle(), image.image, image.allocation);
     }
-    for (VkBuffer buf : bufferPool_) {
-        vmaDestroyBuffer(allocator_->handle(), buf, VK_NULL_HANDLE);
+    for (const TransientBufferAllocation& buffer : bufferPool_) {
+        vmaDestroyBuffer(allocator_->handle(), buffer.buffer, buffer.allocation);
     }
     imagePool_.clear();
     bufferPool_.clear();
@@ -259,21 +269,21 @@ RenderGraphPass& RenderGraphPass::addInputAttachment(RenderGraphResourceId id) {
 RenderGraphPass& RenderGraphPass::addStorageRead(RenderGraphResourceId id, PipelineDomain domain) {
     const ResourceState state = domain == PipelineDomain::Transfer
         ? ResourceState::TransferSource
-        : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderRead : ResourceState::ShaderRead);
+        : (domain == PipelineDomain::RayTracing ? ResourceState::RayTracing : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderRead : ResourceState::ShaderRead));
     return addUse(id, state, PassAccess::Read, domain);
 }
 
 RenderGraphPass& RenderGraphPass::addStorageWrite(RenderGraphResourceId id, PipelineDomain domain) {
     const ResourceState state = domain == PipelineDomain::Transfer
         ? ResourceState::TransferDest
-        : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderStorage : ResourceState::ShaderStorage);
+        : (domain == PipelineDomain::RayTracing ? ResourceState::RayTracing : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderStorage : ResourceState::ShaderStorage));
     return addUse(id, state, PassAccess::Write, domain);
 }
 
 RenderGraphPass& RenderGraphPass::addStorageReadWrite(RenderGraphResourceId id, PipelineDomain domain) {
     const ResourceState state = domain == PipelineDomain::Transfer
         ? ResourceState::TransferDest
-        : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderStorage : ResourceState::ShaderStorage);
+        : (domain == PipelineDomain::RayTracing ? ResourceState::RayTracing : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderStorage : ResourceState::ShaderStorage));
     return addUse(id, state, PassAccess::ReadWrite, domain);
 }
 

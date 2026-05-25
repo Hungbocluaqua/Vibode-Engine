@@ -28,6 +28,8 @@ public:
     void setRenderSettings(RenderSettings settings);
     void setActiveCamera(EntityId id);
     [[nodiscard]] EntityId activeCamera() const { return activeCamera_; }
+    void setPrimarySun(EntityId id);
+    [[nodiscard]] EntityId primarySun() const;
 
     void setSourceGltfPath(std::optional<std::filesystem::path> path);
     void setSourceHdrPath(std::optional<std::filesystem::path> path);
@@ -57,6 +59,7 @@ private:
     Environment environment_{};
     RenderSettings renderSettings_{};
     EntityId activeCamera_{};
+    EntityId primarySun_{};
     bool dirty_ = true;
     SceneUpdateKind pendingUpdate_ = SceneUpdateKind::TopologyChanged;
     std::string lastChangeReason_ = "SceneChanged";

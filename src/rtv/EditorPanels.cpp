@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 38>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 38> views = {
+const std::array<RendererDebugView, 34>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 34> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -19,12 +19,8 @@ const std::array<RendererDebugView, 38>& editorDebugViews() {
         RendererDebugView::IndirectLighting,
         RendererDebugView::EmissiveContribution,
         RendererDebugView::EnvironmentContribution,
-        RendererDebugView::TraversalSteps,
-        RendererDebugView::BvhDepth,
         RendererDebugView::InstanceId,
         RendererDebugView::MeshId,
-        RendererDebugView::TlasSteps,
-        RendererDebugView::TraversalMismatch,
         RendererDebugView::LightPdf,
         RendererDebugView::BsdfPdf,
         RendererDebugView::MisWeight,
@@ -61,20 +57,60 @@ int editorDebugViewIndex(RendererDebugView view) {
 }
 
 void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& changed) {
+    auto selectable = [&](RendererDebugView view) {
+        const bool selected = settings.debugView == view;
+        if (ImGui::Selectable(rendererDebugViewName(view), selected)) {
+            settings.debugView = view;
+            changed = true;
+        }
+        if (selected) {
+            ImGui::SetItemDefaultFocus();
+        }
+    };
+
     int selectedDebug = editorDebugViewIndex(settings.debugView);
     if (ImGui::BeginCombo(label, rendererDebugViewName(settings.debugView))) {
-        const auto& views = editorDebugViews();
-        for (int i = 0; i < static_cast<int>(views.size()); ++i) {
-            const bool selected = i == selectedDebug;
-            if (ImGui::Selectable(rendererDebugViewName(views[static_cast<size_t>(i)]), selected)) {
-                selectedDebug = i;
-                settings.debugView = views[static_cast<size_t>(i)];
-                changed = true;
-            }
-            if (selected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
+        (void)selectedDebug;
+        ImGui::SeparatorText("Core");
+        selectable(RendererDebugView::Beauty);
+        selectable(RendererDebugView::Depth);
+        selectable(RendererDebugView::Normals);
+        selectable(RendererDebugView::MotionVectors);
+        selectable(RendererDebugView::Variance);
+        selectable(RendererDebugView::ReprojectionConfidence);
+        selectable(RendererDebugView::DenoiserRejection);
+        ImGui::SeparatorText("Material");
+        selectable(RendererDebugView::Albedo);
+        selectable(RendererDebugView::Roughness);
+        selectable(RendererDebugView::ClayMaterial);
+        selectable(RendererDebugView::InstanceId);
+        selectable(RendererDebugView::MeshId);
+        ImGui::SeparatorText("Lighting");
+        selectable(RendererDebugView::DirectLighting);
+        selectable(RendererDebugView::IndirectLighting);
+        selectable(RendererDebugView::EmissiveContribution);
+        selectable(RendererDebugView::EnvironmentContribution);
+        selectable(RendererDebugView::LightPdf);
+        selectable(RendererDebugView::BsdfPdf);
+        selectable(RendererDebugView::MisWeight);
+        selectable(RendererDebugView::DirectSampleType);
+        ImGui::SeparatorText("Transport");
+        selectable(RendererDebugView::FirstBounceThroughput);
+        selectable(RendererDebugView::SecondaryEnvironmentMiss);
+        selectable(RendererDebugView::BounceCount);
+        selectable(RendererDebugView::SecondaryEnvironmentRadiance);
+        selectable(RendererDebugView::WhiteEnvironmentTransport);
+        ImGui::SeparatorText("Atmosphere");
+        selectable(RendererDebugView::AtmosphereSkyView);
+        selectable(RendererDebugView::AtmosphereTransmittance);
+        selectable(RendererDebugView::AtmosphereAerialPerspective);
+        selectable(RendererDebugView::AtmosphereMultiScatter);
+        ImGui::SeparatorText("Temporal / ReSTIR");
+        selectable(RendererDebugView::TemporalReactiveMask);
+        selectable(RendererDebugView::TemporalHistoryWeight);
+        selectable(RendererDebugView::RestirReservoirAge);
+        selectable(RendererDebugView::RestirReservoirConfidence);
+        selectable(RendererDebugView::RestirReservoirM);
         ImGui::EndCombo();
     }
 }

@@ -34,17 +34,18 @@ vec3 sample_atmosphere_multi_scatter_lut(vec3 dir) {
 
 void sample_atmosphere_aerial_perspective(vec3 worldPos, vec3 viewDir, out vec3 inscatter, out float transmittance) {
     float distanceMeters = length(worldPos - camera.pos.xyz);
-    if (distanceMeters <= 0.0 || distanceMeters >= 9999.0) {
+    if (distanceMeters <= 0.0 || distanceMeters >= 100000.0) {
         inscatter = vec3(0.0);
         transmittance = 1.0;
         return;
     }
     vec3 dirNorm = normalize(viewDir);
-    float cosZenith = clamp(dot(dirNorm, vec3(0.0, 1.0, 0.0)), -1.0, 1.0);
-    vec3 planetary = atmosphere_scene_to_planetary(worldPos);
+    vec3 planetary = atmosphere_scene_to_planetary(camera.pos.xyz);
+    float cosZenith = clamp(dot(dirNorm, normalize(planetary)), -1.0, 1.0);
     float heightMeters = max(length(planetary) - ATMOSPHERE_PLANET_RADIUS, 0.0);
     float atmosphereHeight = max(ATMOSPHERE_TOP_RADIUS - ATMOSPHERE_PLANET_RADIUS, 1.0);
-    float depthNormalized = log(1.0 + distanceMeters * 0.001) / log(1.0 + 100.0);
+    float distanceNormalized = clamp((max(distanceMeters, 1.0) - 1.0) / (100000.0 - 1.0), 0.0, 1.0);
+    float depthNormalized = pow(distanceNormalized, 1.0 / 3.0);
     vec3 uvw = vec3(cosZenith * 0.5 + 0.5, clamp(heightMeters / atmosphereHeight, 0.0, 1.0), clamp(depthNormalized, 0.0, 1.0));
     vec4 aerial = texture(sampler3D(atmosphere_aerial_perspective_lut, atmosphere_sampler), uvw);
     float lum = dot(aerial.rgb, vec3(0.2126, 0.7152, 0.0722));

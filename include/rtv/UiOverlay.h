@@ -43,7 +43,8 @@ public:
         const std::string& sceneLoadingStatus,
         const CameraController* camera,
         float cpuFrameMs,
-        NotificationManager* notifications);
+        NotificationManager* notifications,
+        bool externalMouseCapture = false);
     void record(VkCommandBuffer commandBuffer);
     void onSwapchainRecreated(const Swapchain& swapchain);
 

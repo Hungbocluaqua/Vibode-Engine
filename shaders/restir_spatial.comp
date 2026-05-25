@@ -10,7 +10,7 @@ struct RestirReservoir {
 
 layout(set = 0, binding = 0, std430) readonly buffer InputReservoirs { RestirReservoir input_reservoirs[]; };
 layout(set = 0, binding = 1, std430) writeonly buffer OutputReservoirs { RestirReservoir output_reservoirs[]; };
-layout(set = 0, binding = 2, std430) readonly buffer DepthNormalBuffer { uvec3 depth_normal_buffer[]; };
+layout(set = 0, binding = 2, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
 
 layout(set = 0, binding = 3, std140) uniform RestirSpatialParams {
     uint width;
@@ -92,7 +92,7 @@ void main() {
         return;
     }
 
-    uvec3 packedCenter = depth_normal_buffer[pixelIndex];
+    uvec4 packedCenter = depth_normal_buffer[pixelIndex];
     float centerDepth = uintBitsToFloat(packedCenter.x);
     vec3 centerNormal = decode_octahedral_normal(packedCenter.y);
     float centerRoughness = uintBitsToFloat(packedCenter.z);
@@ -117,7 +117,7 @@ void main() {
             continue;
         }
 
-        uvec3 packedCandidate = depth_normal_buffer[sampleIndex];
+        uvec4 packedCandidate = depth_normal_buffer[sampleIndex];
         float candidateDepth = uintBitsToFloat(packedCandidate.x);
         vec3 candidateNormal = decode_octahedral_normal(packedCandidate.y);
         float candidateRoughness = uintBitsToFloat(packedCandidate.z);

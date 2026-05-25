@@ -21,6 +21,7 @@ struct Entity {
 
     std::optional<MeshRenderer> meshRenderer;
     std::optional<Light> light;
+    std::optional<Sun> sun;
     std::optional<Camera> camera;
 };
 

@@ -1,8 +1,11 @@
 #include "rtv/RenderSettingsPanel.h"
 
+#include "rtv/SunController.h"
+
 #include <imgui.h>
 #include <rtv/PhysicalCamera.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace rtv {
@@ -49,21 +52,23 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.histogramLowPercentile = render.histogramLowPercentile;
         settings.histogramHighPercentile = render.histogramHighPercentile;
         settings.histogramTargetPercentile = render.histogramTargetPercentile;
-        settings.sunlightEnabled = render.sunlightEnabled;
-        settings.sunIntensity = render.sunIntensity;
+        SunController::applyToRendererSettings(*state.sceneDocument, settings);
         settings.skyIntensity = render.skyIntensity;
-        settings.sunElevation = render.sunElevation;
-        settings.sunAngularRadius = render.sunAngularRadius;
         settings.indirectStrength = render.indirectStrength;
         settings.restirMode = render.restirMode;
         settings.denoiserEnabled = render.denoiserEnabled;
+        settings.denoiseWhileMoving = render.denoiseWhileMoving;
         settings.atrousIterations = render.atrousIterations;
         settings.denoiserStrength = render.denoiserStrength;
         settings.taaEnabled = render.taaEnabled;
         settings.taaFeedback = render.taaFeedback;
+        settings.taaSharpeningStrength = render.taaSharpeningStrength;
         settings.debugView = render.debugView;
         settings.renderResolutionScale = render.resolutionScale;
         settings.accumulationLimit = render.accumulationLimit;
+        settings.shadowRayBias = render.shadowRayBias;
+        settings.shadowDistanceBias = render.shadowDistanceBias;
+        settings.fireflyClamp = render.fireflyClamp;
         settings.usePhysicalCamera = render.usePhysicalCamera;
         settings.physicalAperture = render.physicalAperture;
         settings.physicalShutterSeconds = render.physicalShutterSeconds;
@@ -89,8 +94,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     changed |= ImGui::SliderScalar("Environment Samples", ImGuiDataType_U32, &settings.environmentDirectSamples, &minEnvSamples, &maxEnvSamples);
     tooltip("Environment light samples per bounce. Higher values reduce fireflies.");
     changed |= ImGui::Checkbox("Path Tracing", &settings.pathTracingEnabled);
-    changed |= ImGui::Checkbox("Camera Jitter", &settings.cameraJitterEnabled);
-    tooltip("Halton sub-pixel jitter for temporal accumulation and motion-vector validation.");
+    changed |= ImGui::Checkbox("TAA Camera Jitter", &settings.cameraJitterEnabled);
+    tooltip("Halton sub-pixel jitter. It is only applied while TAA is enabled.");
     changed |= ImGui::Checkbox("Direct Lighting", &settings.directLightingEnabled);
     changed |= ImGui::SliderFloat("Indirect Strength", &settings.indirectStrength, 0.0f, 4.0f, "%.2f");
     tooltip("Multiplier for indirect lighting contribution.");
@@ -107,12 +112,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
 
     if (ImGui::CollapsingHeader("Tone Mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
-        const char* toneMapperItems2[] = {"Linear", "Reinhard", "Reinhard White", "ACES", "PBR Neutral"};
+        const char* toneMapperItems2[] = {"Linear", "Reinhard", "Reinhard White", "ACES", "PBR Neutral", "AgX"};
         int toneMapperIndex2 = static_cast<int>(settings.toneMapper);
-        if (toneMapperIndex2 < 0 || toneMapperIndex2 > 4) {
+        if (toneMapperIndex2 < 0 || toneMapperIndex2 > 5) {
             toneMapperIndex2 = 3;
         }
-        if (ImGui::Combo("Tone Mapper", &toneMapperIndex2, toneMapperItems2, 5)) {
+        if (ImGui::Combo("Tone Mapper", &toneMapperIndex2, toneMapperItems2, 6)) {
             settings.toneMapper = static_cast<ToneMapper>(toneMapperIndex2);
             changed = true;
         }
@@ -158,12 +163,16 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     }
 
     if (ImGui::CollapsingHeader("Sun / Lighting", ImGuiTreeNodeFlags_DefaultOpen)) {
-        changed |= ImGui::Checkbox("Sunlight", &settings.sunlightEnabled);
-        changed |= ImGui::SliderFloat("Sun Intensity", &settings.sunIntensity, 0.0f, 10.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Sun Elevation", &settings.sunElevation, -0.20f, 1.45f, "%.2f rad");
-        tooltip("Analytical atmosphere sun angle. Low values validate sunset and horizon scattering.");
-        changed |= ImGui::SliderFloat("Sun Size", &settings.sunAngularRadius, 0.0f, 0.08f, "%.4f");
-        changed |= ImGui::SliderFloat("Sky Intensity", &settings.skyIntensity, 0.0f, 3.0f, "%.2f");
+        if (state.sceneDocument != nullptr) {
+            const SunDerivedState sun = SunController::derivedState(*state.sceneDocument);
+            ImGui::Text("Primary Sun: %s", SunController::primarySunEntity(*state.sceneDocument).valid() ? "Scene" : "Missing");
+            ImGui::Text("Sun: %s  %.0f lux  %.5f rad", sun.enabled ? "On" : "Off", sun.illuminanceLux, sun.angularRadiusRadians);
+            ImGui::Text("Direction: elev %.2f rad, az %.2f rad", sun.elevation, sun.azimuth);
+            if (ImGui::Button("Create Primary Sun")) {
+                requests.ensurePrimarySun = true;
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            }
+        }
     }
 
     if (ImGui::CollapsingHeader("Atmosphere")) {
@@ -197,6 +206,17 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         tooltip("HDR temporal anti-aliasing pass after denoising and before tone mapping.");
         changed |= ImGui::SliderFloat("TAA Feedback", &settings.taaFeedback, 0.01f, 0.5f, "%.2f");
         tooltip("Lower values keep more history; higher values react faster to motion and lighting changes.");
+        changed |= ImGui::SliderFloat("TAA Sharpening", &settings.taaSharpeningStrength, 0.0f, 1.0f, "%.2f");
+        tooltip("Unsharp mask amount applied by the TAA resolve.");
+    }
+
+    if (ImGui::CollapsingHeader("Artifact Controls")) {
+        changed |= ImGui::SliderFloat("Shadow Ray Bias", &settings.shadowRayBias, 0.00001f, 0.05f, "%.5f");
+        tooltip("Surface offset used for secondary shadow rays.");
+        changed |= ImGui::SliderFloat("Shadow Distance Bias", &settings.shadowDistanceBias, 0.0f, 0.1f, "%.5f");
+        tooltip("Reduces the maximum distance of finite shadow rays to avoid self hits at the light.");
+        changed |= ImGui::SliderFloat("Firefly Clamp", &settings.fireflyClamp, 1.0f, 512.0f, "%.1f");
+        tooltip("Luminance clamp for single path samples before accumulation.");
     }
 
     if (ImGui::Button("Reset Accumulation")) {
@@ -213,14 +233,10 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 std::abs(environment.rotation - settings.environmentRotation) > 0.0001f ||
                 std::abs(environment.backgroundIntensity - settings.environmentBackgroundIntensity) > 0.0001f;
             const bool lightingChanged =
-                render.sunlightEnabled != settings.sunlightEnabled ||
                 render.directLightingEnabled != settings.directLightingEnabled ||
                 render.environmentDirectSamples != settings.environmentDirectSamples ||
                 render.restirMode != settings.restirMode ||
-                std::abs(render.sunIntensity - settings.sunIntensity) > 0.0001f ||
-                std::abs(render.skyIntensity - settings.skyIntensity) > 0.0001f ||
-                std::abs(render.sunElevation - settings.sunElevation) > 0.0001f ||
-                std::abs(render.sunAngularRadius - settings.sunAngularRadius) > 0.0001f;
+                std::abs(render.skyIntensity - settings.skyIntensity) > 0.0001f;
             render.pathTracingEnabled = settings.pathTracingEnabled;
             render.cameraJitterEnabled = settings.cameraJitterEnabled;
             render.directLightingEnabled = settings.directLightingEnabled;
@@ -243,21 +259,22 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.histogramLowPercentile = settings.histogramLowPercentile;
             render.histogramHighPercentile = settings.histogramHighPercentile;
             render.histogramTargetPercentile = settings.histogramTargetPercentile;
-            render.sunlightEnabled = settings.sunlightEnabled;
-            render.sunIntensity = settings.sunIntensity;
             render.skyIntensity = settings.skyIntensity;
-            render.sunElevation = settings.sunElevation;
-            render.sunAngularRadius = settings.sunAngularRadius;
             render.indirectStrength = settings.indirectStrength;
             render.restirMode = settings.restirMode;
             render.denoiserEnabled = settings.denoiserEnabled;
+            render.denoiseWhileMoving = settings.denoiseWhileMoving;
             render.atrousIterations = settings.atrousIterations;
             render.denoiserStrength = settings.denoiserStrength;
             render.taaEnabled = settings.taaEnabled;
             render.taaFeedback = settings.taaFeedback;
+            render.taaSharpeningStrength = settings.taaSharpeningStrength;
             render.debugView = settings.debugView;
             render.resolutionScale = settings.renderResolutionScale;
             render.accumulationLimit = settings.accumulationLimit;
+            render.shadowRayBias = settings.shadowRayBias;
+            render.shadowDistanceBias = settings.shadowDistanceBias;
+            render.fireflyClamp = settings.fireflyClamp;
             render.usePhysicalCamera = settings.usePhysicalCamera;
             render.physicalAperture = settings.physicalAperture;
             render.physicalShutterSeconds = settings.physicalShutterSeconds;

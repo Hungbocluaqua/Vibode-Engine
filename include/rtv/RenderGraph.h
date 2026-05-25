@@ -4,6 +4,7 @@
 #include "rtv/RenderGraphResource.h"
 
 #include <Volk/volk.h>
+#include <vk_mem_alloc.h>
 
 #include <cstdint>
 #include <memory>
@@ -52,10 +53,22 @@ public:
     [[nodiscard]] float fragmentationRatio() const { return aliasImages_.size() > 1 ? static_cast<float>(aliasImages_.size() - 1) / static_cast<float>(imagePool_.size()) : 0.0f; }
 
 private:
-    std::unordered_map<uint32_t, VkImage> aliasImages_;
-    std::unordered_map<uint32_t, VkBuffer> aliasBuffers_;
-    std::vector<VkImage> imagePool_;
-    std::vector<VkBuffer> bufferPool_;
+    struct TransientImageAllocation {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation allocation = VK_NULL_HANDLE;
+        size_t estimatedBytes = 0;
+    };
+
+    struct TransientBufferAllocation {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation allocation = VK_NULL_HANDLE;
+        size_t bytes = 0;
+    };
+
+    std::unordered_map<uint32_t, TransientImageAllocation> aliasImages_;
+    std::unordered_map<uint32_t, TransientBufferAllocation> aliasBuffers_;
+    std::vector<TransientImageAllocation> imagePool_;
+    std::vector<TransientBufferAllocation> bufferPool_;
     ResourceAllocator* allocator_ = nullptr;
     size_t totalBytesAllocated_ = 0;
     size_t activeBytes_ = 0;

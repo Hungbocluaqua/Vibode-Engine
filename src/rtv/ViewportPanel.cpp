@@ -4,6 +4,7 @@
 #include "rtv/CameraController.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/SceneOperations.h"
+#include "rtv/SunController.h"
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtc/matrix_transform.hpp>
@@ -88,7 +89,7 @@ glm::mat4 editorViewMatrix(const CameraController& camera) {
 }
 
 glm::mat4 editorProjectionMatrix(float fovY, float aspect) {
-    return glm::perspectiveRH_ZO(fovY, aspect, 0.01f, 1000.0f);
+    return glm::perspectiveRH_NO(fovY, aspect, 0.01f, 1000.0f);
 }
 
 float viewportAspect(const EditorRuntimeState& state) {
@@ -100,14 +101,15 @@ float viewportAspect(const EditorRuntimeState& state) {
 SceneUpdateKind transformUpdateKind(const SceneDocument& document, const Entity& entity) {
     const bool hasMesh = entity.meshRenderer.has_value();
     const bool hasLight = entity.light.has_value();
+    const bool hasSun = entity.sun.has_value();
     const bool hasActiveCamera = entity.camera.has_value() && document.activeCamera() == entity.id;
-    if ((hasLight && hasMesh) || (hasActiveCamera && hasMesh) || (hasActiveCamera && hasLight)) {
+    if (((hasLight || hasSun) && hasMesh) || (hasActiveCamera && hasMesh) || (hasActiveCamera && (hasLight || hasSun))) {
         return SceneUpdateKind::TopologyChanged;
     }
     if (hasActiveCamera) {
         return SceneUpdateKind::CameraOnly;
     }
-    if (hasLight) {
+    if (hasLight || hasSun) {
         return SceneUpdateKind::LightOnly;
     }
     return SceneUpdateKind::TransformOnly;
@@ -156,14 +158,17 @@ void drawSelectedLightOverlay(
     const glm::mat4& view,
     const glm::mat4& projection,
     const Entity& entity) {
-    if (!entity.light.has_value()) {
+    if (!entity.light.has_value() && !entity.sun.has_value()) {
         return;
     }
 
     constexpr float nearPlane = 0.01f;
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const glm::mat4 world = entityWorldMatrix(state.sceneDocument->registry(), entity);
-    const glm::vec3 center = glm::vec3(world[3]);
+    glm::vec3 center = glm::vec3(world[3]);
+    if (entity.sun.has_value() && state.camera != nullptr && glm::dot(center, center) <= 1.0e-6f) {
+        center = state.camera->position() + SunController::derivedState(*state.sceneDocument).direction * 100.0f;
+    }
     const glm::vec3 viewCenter = glm::vec3(view * glm::vec4(center, 1.0f));
     const std::optional<ImVec2> screenCenter = projectViewToScreen(state, projection, viewCenter, nearPlane);
     if (!screenCenter.has_value()) {
@@ -173,6 +178,16 @@ void drawSelectedLightOverlay(
     drawList->AddCircle(*screenCenter, 8.0f, IM_COL32(255, 214, 80, 255), 24, 2.0f);
     drawList->AddLine(ImVec2(screenCenter->x - 10.0f, screenCenter->y), ImVec2(screenCenter->x + 10.0f, screenCenter->y), IM_COL32(255, 214, 80, 220), 2.0f);
     drawList->AddLine(ImVec2(screenCenter->x, screenCenter->y - 10.0f), ImVec2(screenCenter->x, screenCenter->y + 10.0f), IM_COL32(255, 214, 80, 220), 2.0f);
+
+    if (entity.sun.has_value()) {
+        const glm::vec3 direction = SunController::derivedState(*state.sceneDocument).direction;
+        const glm::vec3 tip = center - direction * 5.0f;
+        const std::optional<ImVec2> screenTip = projectViewToScreen(state, projection, glm::vec3(view * glm::vec4(tip, 1.0f)), nearPlane);
+        if (screenTip.has_value()) {
+            drawList->AddLine(*screenCenter, *screenTip, IM_COL32(255, 244, 120, 220), 2.0f);
+        }
+        return;
+    }
 
     const Light& light = *entity.light;
     if (light.type == LightType::Point) {
@@ -222,9 +237,26 @@ void drawSelectionOverlay(const EditorRuntimeState& state, const EditorSelection
     }
     const glm::mat4 view = editorViewMatrix(*state.camera);
     const glm::mat4 projection = editorProjectionMatrix(activeCameraFov(*state.sceneDocument), viewportAspect(state));
-    if (entity->light.has_value()) {
+    if (entity->light.has_value() || entity->sun.has_value()) {
         drawSelectedLightOverlay(state, view, projection, *entity);
     }
+}
+
+void drawPrimarySunOverlay(const EditorRuntimeState& state, const EditorSelection& selection) {
+    if (state.sceneDocument == nullptr || state.camera == nullptr) {
+        return;
+    }
+    const EntityId sunId = SunController::primarySunEntity(*state.sceneDocument);
+    if (!sunId.valid() || sunId == selection.entityId()) {
+        return;
+    }
+    const Entity* entity = state.sceneDocument->registry().entity(sunId);
+    if (entity == nullptr || !entity->sun.has_value()) {
+        return;
+    }
+    const glm::mat4 view = editorViewMatrix(*state.camera);
+    const glm::mat4 projection = editorProjectionMatrix(activeCameraFov(*state.sceneDocument), viewportAspect(state));
+    drawSelectedLightOverlay(state, view, projection, *entity);
 }
 
 void drawGridOverlay(const EditorRuntimeState& state, const CameraController& camera) {
@@ -482,7 +514,8 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             }
         }
 
-            drawSelectionOverlay(state, selection);
+        drawPrimarySunOverlay(state, selection);
+        drawSelectionOverlay(state, selection);
 
         if (state.camera != nullptr) {
             if (showAxes_) drawAxesIndicator(state, *state.camera);
@@ -536,7 +569,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 const glm::mat4 previousWorld = world;
                 ImGuizmo::BeginFrame();
                 ImGuizmo::SetOrthographic(false);
-                ImGuizmo::SetDrawlist();
+                ImGuizmo::SetDrawlist(dl);
                 ImGuizmo::SetRect(state.viewport.imageOrigin.x, state.viewport.imageOrigin.y, state.viewport.imageSize.x, state.viewport.imageSize.y);
                 float snapValues[3] = {};
                 if (snap_.enabled) {
@@ -564,15 +597,43 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                     gizmoDragEntity_ = entity->id;
                     gizmoDragOriginal_ = entity->transform;
                 }
-                updateGizmoState(isOver, isUsing, transformGizmoMode_);
-
-                if (!isUsing && gizmoDragActive_) {
-                    commitGizmoDrag(requests, *state.sceneDocument);
-                }
 
                 if (manipulated && world != previousWorld) {
                     const glm::mat4 local = glm::inverse(parentWorldMatrix(state.sceneDocument->registry(), *entity)) * world;
                     writeLocalTransformFromMatrix(*entity, local);
+                    const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *entity);
+                    state.sceneDocument->markDirty(updateKind);
+                    requests.sceneUpdate = updateKind;
+                    requests.previewEntityTransform = EditorEntityTransformPreview{
+                        .entity = entity->id,
+                        .transform = entity->transform,
+                        .updateKind = updateKind,
+                    };
+                }
+
+                updateGizmoState(isOver, isUsing, transformGizmoMode_);
+
+                if (isUsing) {
+                    const char* label = transformGizmoMode_ == 0
+                        ? "Moving selection"
+                        : (transformGizmoMode_ == 1 ? "Rotating selection" : "Scaling selection");
+                    const ImVec2 textSize = ImGui::CalcTextSize(label);
+                    const ImVec2 labelPos(
+                        state.viewport.imageOrigin.x + state.viewport.imageSize.x * 0.5f - textSize.x * 0.5f - 10.0f,
+                        state.viewport.imageOrigin.y + state.viewport.imageSize.y - 52.0f);
+                    dl->AddRectFilled(
+                        labelPos,
+                        ImVec2(labelPos.x + textSize.x + 20.0f, labelPos.y + textSize.y + 12.0f),
+                        IM_COL32(20, 24, 28, 210),
+                        5.0f);
+                    dl->AddText(
+                        ImVec2(labelPos.x + 10.0f, labelPos.y + 6.0f),
+                        IM_COL32(170, 215, 255, 255),
+                        label);
+                }
+
+                if (!isUsing && gizmoDragActive_) {
+                    commitGizmoDrag(requests, *state.sceneDocument);
                 }
             }
         }

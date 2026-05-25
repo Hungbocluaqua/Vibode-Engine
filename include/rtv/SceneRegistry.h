@@ -27,16 +27,20 @@ public:
 
     MeshRenderer& addMeshRenderer(EntityId id, MeshRenderer renderer = {});
     Light& addLight(EntityId id, Light light = {});
+    Sun& addSun(EntityId id, Sun sun = {});
     Camera& addCamera(EntityId id, Camera camera = {});
     bool removeMeshRenderer(EntityId id);
     bool removeLight(EntityId id);
+    bool removeSun(EntityId id);
     bool removeCamera(EntityId id);
 
     [[nodiscard]] MeshRenderer* meshRenderer(EntityId id);
     [[nodiscard]] Light* light(EntityId id);
+    [[nodiscard]] Sun* sun(EntityId id);
     [[nodiscard]] Camera* camera(EntityId id);
     [[nodiscard]] const MeshRenderer* meshRenderer(EntityId id) const;
     [[nodiscard]] const Light* light(EntityId id) const;
+    [[nodiscard]] const Sun* sun(EntityId id) const;
     [[nodiscard]] const Camera* camera(EntityId id) const;
 
     [[nodiscard]] bool effectiveVisible(EntityId id) const;
