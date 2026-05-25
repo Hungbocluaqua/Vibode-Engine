@@ -16,24 +16,6 @@ namespace rtv {
 
 std::array<char, 256> SceneHierarchyPanel::renameBuffer_{};
 
-namespace {
-
-void placeCreatedEntity(const EditorRuntimeState& state, Entity* entity) {
-    if (entity == nullptr || state.camera == nullptr) {
-        return;
-    }
-    glm::vec3 forward = state.camera->direction();
-    if (glm::dot(forward, forward) <= 0.0f) {
-        forward = glm::vec3(0.0f, 0.0f, -1.0f);
-    } else {
-        forward = glm::normalize(forward);
-    }
-    entity->transform.position = state.camera->position() + forward * 2.5f;
-    entity->transform.dirty = true;
-}
-
-} // namespace
-
 void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
     if (!ImGui::Begin("Scene Hierarchy")) {
         ImGui::End();
@@ -45,29 +27,18 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
         SceneRegistry& registry = document.registry();
 
         if (ImGui::Button("Create Empty")) {
-            const EntityId id = registry.createEntity("Entity");
-            placeCreatedEntity(state, registry.entity(id));
-            selection.selectEntity(id);
+            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty};
             requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
         }
         ImGui::SameLine();
         if (ImGui::Button("Camera")) {
-            const EntityId id = registry.createEntity("Camera");
-            placeCreatedEntity(state, registry.entity(id));
-            Camera camera;
-            camera.active = true;
-            registry.addCamera(id, camera);
-            document.setActiveCamera(id);
-            selection.selectEntity(id);
-            requests.sceneUpdate = SceneUpdateKind::CameraOnly;
+            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera};
+            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
         }
         ImGui::SameLine();
         if (ImGui::Button("Light")) {
-            const EntityId id = registry.createEntity("Point Light");
-            placeCreatedEntity(state, registry.entity(id));
-            registry.addLight(id, Light{});
-            selection.selectEntity(id);
-            requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
+            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
         }
 
         ImGui::Separator();
@@ -78,6 +49,18 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
             return static_cast<char>(std::tolower(ch));
         });
         ImGui::Separator();
+
+        const EntityId selectedEntity = selection.entityId();
+        if (selectedEntity.valid() && registry.contains(selectedEntity) && selectedEntity != lastSelectionForReveal_) {
+            lastSelectionForReveal_ = selectedEntity;
+            pendingRevealSelection_ = selectedEntity;
+            lastScrolledSelection_ = {};
+        }
+        if (!selectedEntity.valid() || !registry.contains(selectedEntity)) {
+            pendingRevealSelection_ = {};
+            lastSelectionForReveal_ = {};
+        }
+
         for (Entity* entity : registry.entities()) {
             if (entity->parent.valid()) {
                 continue;
@@ -205,9 +188,10 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
     }
     const EntityId selected = selection.entityId();
     const bool containsSelection = entityContainsSelection(registry, entity, selected);
-    if (containsSelection && entity.id != selected) {
-        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
-    }
+    const bool revealPending = pendingRevealSelection_.valid() && containsSelection;
+    const bool forceOpenForReveal =
+        (containsSelection && entity.id != selected) ||
+        (revealPending && entity.id == selected && !entity.children.empty());
 
     std::string label;
     if (entity.meshRenderer.has_value()) {
@@ -215,6 +199,9 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
     }
     if (entity.light.has_value()) {
         label += "[L] ";
+    }
+    if (entity.sun.has_value()) {
+        label += "[S] ";
     }
     if (entity.camera.has_value()) {
         label += "[C] ";
@@ -276,6 +263,9 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
         ImGui::SameLine();
     }
     ImGui::PopID();
+    if (forceOpenForReveal) {
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    }
     const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
     if (!entity.locked) {
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
@@ -343,42 +333,16 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
         }
         if (ImGui::BeginMenu("Create Child")) {
             if (ImGui::MenuItem("Empty")) {
-                const EntityId parentId = entity.id;
-                const EntityId childId = registry.createEntity("Entity");
-                if (Entity* child = registry.entity(childId)) {
-                    child->parent = parentId;
-                    if (Entity* parent = registry.entity(parentId)) {
-                        parent->children.push_back(childId);
-                    }
-                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
-                    selection.selectEntity(childId);
-                }
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty, .parent = entity.id};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
             }
             if (ImGui::MenuItem("Camera")) {
-                const EntityId parentId = entity.id;
-                const EntityId childId = registry.createEntity("Camera");
-                if (Entity* child = registry.entity(childId)) {
-                    child->parent = parentId;
-                    if (Entity* parent = registry.entity(parentId)) {
-                        parent->children.push_back(childId);
-                    }
-                    child->camera = Camera{};
-                    requests.sceneUpdate = SceneUpdateKind::CameraOnly;
-                    selection.selectEntity(childId);
-                }
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera, .parent = entity.id};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
             }
             if (ImGui::MenuItem("Light")) {
-                const EntityId parentId = entity.id;
-                const EntityId childId = registry.createEntity("Point Light");
-                if (Entity* child = registry.entity(childId)) {
-                    child->parent = parentId;
-                    if (Entity* parent = registry.entity(parentId)) {
-                        parent->children.push_back(childId);
-                    }
-                    child->light = Light{};
-                    requests.sceneUpdate = SceneUpdateKind::LightOnly;
-                    selection.selectEntity(childId);
-                }
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light, .parent = entity.id};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
             }
             ImGui::EndMenu();
         }
@@ -398,9 +362,12 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
         }
         ImGui::EndPopup();
     }
-    if (selected == entity.id && lastScrolledSelection_ != selected) {
+    if (selected == entity.id && (lastScrolledSelection_ != selected || pendingRevealSelection_ == selected)) {
         ImGui::SetScrollHereY(0.25f);
         lastScrolledSelection_ = selected;
+        if (pendingRevealSelection_ == selected) {
+            pendingRevealSelection_ = {};
+        }
     }
     if (open && !entity.children.empty()) {
         for (EntityId childId : entity.children) {

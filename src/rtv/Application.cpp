@@ -10,6 +10,7 @@
 #include "rtv/ResourceDemo.h"
 #include "rtv/SceneOperations.h"
 #include "rtv/SceneUpdateRouter.h"
+#include "rtv/SunController.h"
 #include "rtv/Swapchain.h"
 #include "rtv/UiOverlay.h"
 #include "rtv/UploadContext.h"
@@ -30,6 +31,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace rtv {
 
@@ -49,9 +51,13 @@ constexpr RendererDebugView intermediateViews[] = {
 };
 
 RendererDebugView nextDebugView(RendererDebugView view) {
-    const uint32_t raw = static_cast<uint32_t>(view);
-    const uint32_t next = raw >= static_cast<uint32_t>(RendererDebugView::RestirReservoirM) ? 0u : raw + 1u;
-    return static_cast<RendererDebugView>(next);
+    const auto& views = editorDebugViews();
+    for (size_t i = 0; i < views.size(); ++i) {
+        if (views[i] == view) {
+            return views[(i + 1u) % views.size()];
+        }
+    }
+    return RendererDebugView::Beauty;
 }
 
 uint64_t countSceneTriangles(const SceneAsset& scene, const AssetManager& assets) {
@@ -88,8 +94,10 @@ RendererSettings interactiveSettingsForScene(RendererSettings settings, const Sc
     return settings;
 }
 
+glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity);
+
 void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings& settings) {
-    RenderSettings render = document.renderSettings();
+    RenderSettings& render = document.renderSettings();
     render.pathTracingEnabled = settings.pathTracingEnabled;
     render.cameraJitterEnabled = settings.cameraJitterEnabled;
     render.directLightingEnabled = settings.directLightingEnabled;
@@ -112,24 +120,32 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.histogramLowPercentile = settings.histogramLowPercentile;
     render.histogramHighPercentile = settings.histogramHighPercentile;
     render.histogramTargetPercentile = settings.histogramTargetPercentile;
-    render.sunlightEnabled = settings.sunlightEnabled;
-    render.sunIntensity = settings.sunIntensity;
     render.skyIntensity = settings.skyIntensity;
-    render.sunElevation = settings.sunElevation;
-    render.sunAngularRadius = settings.sunAngularRadius;
     render.indirectStrength = settings.indirectStrength;
     render.restirMode = settings.restirMode;
     render.denoiserEnabled = settings.denoiserEnabled;
+    render.denoiseWhileMoving = settings.denoiseWhileMoving;
     render.atrousIterations = settings.atrousIterations;
     render.denoiserStrength = settings.denoiserStrength;
     render.taaEnabled = settings.taaEnabled;
     render.taaFeedback = settings.taaFeedback;
+    render.taaSharpeningStrength = settings.taaSharpeningStrength;
     render.debugView = settings.debugView;
     render.resolutionScale = settings.renderResolutionScale;
-    document.setRenderSettings(render);
-    Environment environment = document.environment();
+    render.shadowRayBias = settings.shadowRayBias;
+    render.shadowDistanceBias = settings.shadowDistanceBias;
+    render.fireflyClamp = settings.fireflyClamp;
+    render.usePhysicalCamera = settings.usePhysicalCamera;
+    render.physicalAperture = settings.physicalAperture;
+    render.physicalShutterSeconds = settings.physicalShutterSeconds;
+    render.physicalIso = settings.physicalIso;
+    render.physicalExposureCompensation = settings.physicalExposureCompensation;
+    Environment& environment = document.environment();
+    environment.enabled = settings.environmentEnabled;
+    environment.intensity = settings.environmentIntensity;
+    environment.rotation = settings.environmentRotation;
     environment.backgroundIntensity = settings.environmentBackgroundIntensity;
-    document.setEnvironment(std::move(environment));
+    document.markDirty(SceneUpdateKind::RendererSettingsOnly);
 }
 
 RendererSettings rendererSettingsFromDocument(const SceneDocument& document, RendererSettings settings) {
@@ -157,24 +173,31 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.histogramLowPercentile = render.histogramLowPercentile;
     settings.histogramHighPercentile = render.histogramHighPercentile;
     settings.histogramTargetPercentile = render.histogramTargetPercentile;
-    settings.sunlightEnabled = render.sunlightEnabled;
-    settings.sunIntensity = render.sunIntensity;
     settings.skyIntensity = render.skyIntensity;
-    settings.sunElevation = render.sunElevation;
-    settings.sunAngularRadius = render.sunAngularRadius;
     settings.indirectStrength = render.indirectStrength;
     settings.restirMode = render.restirMode;
     settings.denoiserEnabled = render.denoiserEnabled;
+    settings.denoiseWhileMoving = render.denoiseWhileMoving;
     settings.atrousIterations = render.atrousIterations;
     settings.denoiserStrength = render.denoiserStrength;
     settings.taaEnabled = render.taaEnabled;
     settings.taaFeedback = render.taaFeedback;
+    settings.taaSharpeningStrength = render.taaSharpeningStrength;
     settings.debugView = render.debugView;
     settings.renderResolutionScale = render.resolutionScale;
+    settings.shadowRayBias = render.shadowRayBias;
+    settings.shadowDistanceBias = render.shadowDistanceBias;
+    settings.fireflyClamp = render.fireflyClamp;
+    settings.usePhysicalCamera = render.usePhysicalCamera;
+    settings.physicalAperture = render.physicalAperture;
+    settings.physicalShutterSeconds = render.physicalShutterSeconds;
+    settings.physicalIso = render.physicalIso;
+    settings.physicalExposureCompensation = render.physicalExposureCompensation;
     settings.environmentEnabled = environment.enabled;
     settings.environmentIntensity = environment.intensity;
     settings.environmentRotation = environment.rotation;
     settings.environmentBackgroundIntensity = environment.backgroundIntensity;
+    SunController::applyToRendererSettings(document, settings);
     return settings;
 }
 
@@ -241,6 +264,7 @@ EntityId duplicateEntityRecursive(SceneRegistry& registry, Entity source, Entity
     copy->transform.dirty = true;
     copy->meshRenderer = source.meshRenderer;
     copy->light = source.light;
+    copy->sun = source.sun;
     copy->camera = source.camera;
     if (copy->camera.has_value()) {
         copy->camera->active = false;
@@ -345,9 +369,9 @@ void Application::initWindow() {
     glfwGetWindowPos(window_, &windowedX_, &windowedY_);
     glfwGetWindowSize(window_, &windowedWidth_, &windowedHeight_);
 
-    std::cout << "Controls: hold right mouse in the viewport to look/move, WASD move, QE/Space/Ctrl vertical, Shift fast, F11 borderless fullscreen.\n"
+    std::cout << "Controls: hold right mouse in the viewport to look/move, Ctrl+L drag rotates sun, WASD move, QE/Space/Ctrl vertical, Shift fast, F11 borderless fullscreen.\n"
               << "Settings: F1 debug view, F2 denoiser, F3 denoise while moving, F4 sun, F5 env, F6 direct light, R reset.\n"
-              << "Adjust: +/- exposure, 1-4 tone mapper, 5 auto exposure, </> env intensity, [/ ] env rotation, PageUp/PageDown bounces, Home/End a-trous.\n"
+              << "Adjust: +/- exposure, 1-5 tone mapper, 6 auto exposure, </> env intensity, [/ ] env rotation, PageUp/PageDown bounces, Home/End a-trous.\n"
               << "Files: drop .hdr for environment maps or .gltf/.glb for scene reload.\n";
 }
 
@@ -394,13 +418,11 @@ void Application::initVulkan() {
     rebuildGpuSceneAsset();
     RendererSettings startupSettings{};
     startupSettings.debugView = debugView_;
-    if (loadedSceneDocument) {
-        startupSettings = rendererSettingsFromDocument(sceneDocument_, startupSettings);
-        if (debugViewOverride_) {
-            startupSettings.debugView = debugView_;
-        } else {
-            debugView_ = startupSettings.debugView;
-        }
+    startupSettings = rendererSettingsFromDocument(sceneDocument_, startupSettings);
+    if (debugViewOverride_) {
+        startupSettings.debugView = debugView_;
+    } else if (loadedSceneDocument) {
+        debugView_ = startupSettings.debugView;
     }
     bool largeSceneSettingsChanged = false;
     if (importedScene_.has_value()) {
@@ -416,7 +438,7 @@ void Application::initVulkan() {
         startupSettings.restirMode = *restirModeOverride_;
         syncDocumentRenderSettings(sceneDocument_, startupSettings);
     }
-    createPathTracer((loadedSceneDocument || importedScene_.has_value() || denoiserOverride_.has_value() || restirModeOverride_.has_value()) ? &startupSettings : nullptr);
+    createPathTracer(&startupSettings);
     applyActiveSceneCamera();
     sceneDocument_.clearDirty();
     uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_);
@@ -481,7 +503,8 @@ void Application::mainLoop(uint32_t maxFrames) {
                 sceneLoadingStatus_,
                 &cameraController_,
                 deltaSeconds * 1000.0f,
-                &notifications_);
+                &notifications_,
+                sunDrag_.phase != SunDragPhase::Idle);
         }
         applyEditorRequests(editorRequests, false);
         commandSystem_->drawFrame(seconds, deltaSeconds);
@@ -499,6 +522,7 @@ void Application::mainLoop(uint32_t maxFrames) {
 void Application::onWindowFocusChanged(bool focused) {
     if (!focused && window_ != nullptr) {
         cameraController_.releaseMouse(window_);
+        finishSunDrag(true);
     }
 }
 
@@ -532,7 +556,7 @@ void Application::onFilesDropped(int count, const char** paths) {
             sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
             RendererSettings settings = pathTracer_->settings();
             settings.environmentEnabled = true;
-            pathTracer_->applySettings(settings);
+            applyRendererSettingsSafely(settings, true);
             notifications_.notify("HDR environment loaded", NotificationType::Success);
             std::cout << "Loaded dropped HDR environment: " << path.string() << '\n';
         } catch (const std::exception& error) {
@@ -625,6 +649,9 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
         nextDocument.setSourceGltfPath(result.path);
         nextDocument.setSourceHdrPath(hdrPath_);
         syncDocumentRenderSettings(nextDocument, reloadSettings);
+        (void)SunController::migrateLegacyDirectionalSun(nextDocument);
+        (void)SunController::repairPrimarySunTransform(nextDocument);
+        reloadSettings = rendererSettingsFromDocument(nextDocument, reloadSettings);
         applyDocumentMaterialAssignments(nextDocument, result.assets);
 
         const SceneGpuBuildResult build = sceneBuilder_.build(nextDocument, &result.assets, reloadSettings);
@@ -691,11 +718,18 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         if (requests.settings.has_value()) {
             applyRendererSettingsSafely(*requests.settings, false);
         }
+        if (requests.previewEntityTransform.has_value()) {
+            if (Entity* entity = sceneDocument_.registry().entity(requests.previewEntityTransform->entity)) {
+                entity->transform = requests.previewEntityTransform->transform;
+                entity->transform.dirty = true;
+                sceneDocument_.markDirty(requests.previewEntityTransform->updateKind);
+            }
+        }
         (void)applyPendingSceneUpdate(false);
         if (requests.toggleDenoiser) {
             RendererSettings settings = pathTracer_->settings();
             settings.denoiserEnabled = !settings.denoiserEnabled;
-            pathTracer_->applySettings(settings);
+            applyRendererSettingsSafely(settings, false);
         }
         if (requests.cycleIntermediateView) {
             RendererSettings settings = pathTracer_->settings();
@@ -705,7 +739,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 if (intermediateViews[i] == settings.debugView) { idx = (i + 1) % count; break; }
             }
             settings.debugView = intermediateViews[idx];
-            pathTracer_->applySettings(settings);
+            applyRendererSettingsSafely(settings, false);
         }
         if (requests.resetAccumulation.has_value()) {
             pathTracer_->resetAccumulation(*requests.resetAccumulation);
@@ -733,7 +767,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             sceneDocument_.setSourceHdrPath(hdrPath_);
             RendererSettings settings = pathTracer_->settings();
             settings.environmentEnabled = true;
-            pathTracer_->applySettings(settings);
+            applyRendererSettingsSafely(settings, true);
             std::cout << "Loaded HDR from editor: " << requests.loadHdr->string() << '\n';
         } catch (const std::exception& error) {
             std::cerr << "Editor HDR load failed: " << error.what() << '\n';
@@ -767,6 +801,8 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                     std::cerr << "Referenced glTF load failed for level: " << error.what() << '\n';
                 }
             }
+            (void)SunController::migrateLegacyDirectionalSun(sceneDocument_);
+            (void)SunController::repairPrimarySunTransform(sceneDocument_);
             undoStack_.clear();
             std::cout << "Loaded scene JSON: " << requests.loadSceneJson->string() << '\n';
         } else {
@@ -800,6 +836,47 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
 
     SceneOperations sceneOps(sceneDocument_, &sceneEventBus_);
     sceneOps.setUndoStack(&undoStack_);
+    if (requests.createEntity.has_value()) {
+        const EditorEntityCreateRequest& create = *requests.createEntity;
+        EntityId created{};
+        switch (create.kind) {
+        case EditorEntityCreateKind::Empty:
+            created = sceneOps.createEntity("Entity", create.parent);
+            break;
+        case EditorEntityCreateKind::Camera:
+            created = sceneOps.createEntity("Camera", create.parent);
+            if (created.valid()) {
+                Camera camera;
+                camera.active = true;
+                (void)sceneOps.addCameraComponent(created, camera);
+            }
+            break;
+        case EditorEntityCreateKind::Light:
+            created = sceneOps.createEntity("Point Light", create.parent);
+            if (created.valid()) {
+                (void)sceneOps.addLightComponent(created, Light{});
+            }
+            break;
+        }
+        if (created.valid()) {
+            if (Entity* entity = sceneDocument_.registry().entity(created)) {
+                glm::vec3 forward = cameraController_.direction();
+                if (glm::dot(forward, forward) <= 0.0f) {
+                    forward = glm::vec3(0.0f, 0.0f, -1.0f);
+                } else {
+                    forward = glm::normalize(forward);
+                }
+                entity->transform.position = cameraController_.position() + forward * 2.5f;
+                entity->transform.dirty = true;
+                sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+            }
+        }
+    }
+
+    if (requests.ensurePrimarySun) {
+        (void)SunController::ensurePrimarySun(sceneDocument_);
+    }
+
     if (requests.duplicateEntity.has_value()) {
         (void)sceneOps.duplicateEntity(*requests.duplicateEntity);
     }
@@ -828,6 +905,46 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             requests.setEntityTransform->newTransform);
     }
 
+    if (requests.addComponent.has_value()) {
+        switch (requests.addComponent->kind) {
+        case EditorComponentKind::Light:
+            (void)sceneOps.addLightComponent(requests.addComponent->entity, Light{});
+            break;
+        case EditorComponentKind::Sun:
+            (void)sceneOps.addSunComponent(requests.addComponent->entity, Sun{});
+            break;
+        case EditorComponentKind::Camera:
+            (void)sceneOps.addCameraComponent(requests.addComponent->entity, Camera{});
+            break;
+        case EditorComponentKind::MeshRenderer:
+            (void)sceneOps.addMeshRendererComponent(requests.addComponent->entity, MeshRenderer{});
+            break;
+        }
+    }
+
+    if (requests.setLight.has_value()) {
+        (void)sceneOps.setLight(
+            requests.setLight->entity,
+            requests.setLight->oldLight,
+            requests.setLight->newLight);
+    }
+
+    if (requests.setSun.has_value()) {
+        (void)sceneOps.setSun(
+            requests.setSun->entity,
+            requests.setSun->oldSun,
+            requests.setSun->newSun);
+    }
+
+    if (requests.setCamera.has_value()) {
+        (void)sceneOps.setCamera(
+            requests.setCamera->entity,
+            requests.setCamera->oldCamera,
+            requests.setCamera->newCamera,
+            requests.setCamera->oldActiveCamera,
+            requests.setCamera->newActiveCamera);
+    }
+
     if (requests.focusOnEntity.has_value()) {
         const Entity* entity = sceneDocument_.registry().entity(*requests.focusOnEntity);
         if (entity != nullptr) {
@@ -851,7 +968,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             RendererSettings settings = pathTracer_->settings();
             uiOverlay_->editor().cameraBookmarks().loadBookmark(
                 bookmarks[index], cameraController_, *pathTracer_, &settings);
-            pathTracer_->applySettings(settings);
+            applyRendererSettingsSafely(settings, true);
         }
     }
     if (requests.deleteCameraBookmarkIndex.has_value()) {
@@ -890,6 +1007,164 @@ void Application::applyValidationCameraMotion(uint32_t frameIndex) {
     cameraController_.setPose(position, glm::normalize(target - position), *pathTracer_);
 }
 
+void Application::beginSunDragArm(bool dragEligible) {
+    if (window_ == nullptr || sunDrag_.phase != SunDragPhase::Idle) {
+        return;
+    }
+    glfwGetCursorPos(window_, &sunDrag_.startMouseX, &sunDrag_.startMouseY);
+    sunDrag_.lastMouseX = sunDrag_.startMouseX;
+    sunDrag_.lastMouseY = sunDrag_.startMouseY;
+    sunDrag_.armedTimeSeconds = glfwGetTime();
+    sunDrag_.dragEligible = dragEligible;
+    sunDrag_.suppressOpenLevel = false;
+    if (pathTracer_ != nullptr) {
+        const RendererSettings settings = pathTracer_->settings();
+        sunDrag_.elevation = settings.sunElevation;
+        sunDrag_.azimuth = settings.sunAzimuth;
+    }
+    sunDrag_.phase = SunDragPhase::Armed;
+}
+
+void Application::startSunDrag(double mouseX, double mouseY) {
+    if (window_ == nullptr || pathTracer_ == nullptr || sunDrag_.phase != SunDragPhase::Armed) {
+        return;
+    }
+
+    cameraController_.releaseMouse(window_);
+    sunDrag_.beforeDocument = sceneDocument_;
+    sunDrag_.entity = SunController::ensurePrimarySun(sceneDocument_);
+
+    Entity* sun = sceneDocument_.registry().entity(sunDrag_.entity);
+    if (sun == nullptr || !sun->sun.has_value()) {
+        finishSunDrag(true);
+        return;
+    }
+
+    sunDrag_.originalTransform = sun->transform;
+    SunController::anglesFromWorldTransform(sceneDocument_.registry(), *sun, sunDrag_.elevation, sunDrag_.azimuth);
+    sunDrag_.lastMouseX = mouseX;
+    sunDrag_.lastMouseY = mouseY;
+    sunDrag_.previousCursorMode = glfwGetInputMode(window_, GLFW_CURSOR);
+    glfwSetInputMode(window_, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    sunDrag_.phase = SunDragPhase::Dragging;
+}
+
+void Application::updateSunDrag(double mouseX, double mouseY) {
+    if (sunDrag_.phase != SunDragPhase::Dragging) {
+        return;
+    }
+    Entity* sun = sceneDocument_.registry().entity(sunDrag_.entity);
+    if (sun == nullptr || !sun->sun.has_value()) {
+        finishSunDrag(true);
+        return;
+    }
+
+    constexpr float sensitivity = 0.0035f;
+    const double dx = mouseX - sunDrag_.lastMouseX;
+    const double dy = mouseY - sunDrag_.lastMouseY;
+    sunDrag_.lastMouseX = mouseX;
+    sunDrag_.lastMouseY = mouseY;
+    if (dx == 0.0 && dy == 0.0) {
+        return;
+    }
+
+    sunDrag_.azimuth -= static_cast<float>(dx) * sensitivity;
+    sunDrag_.elevation = std::clamp(
+        sunDrag_.elevation - static_cast<float>(dy) * sensitivity,
+        -0.20f,
+        1.45f);
+    sun->transform = SunController::transformFromWorldAngles(sceneDocument_.registry(), *sun, sun->transform, sunDrag_.elevation, sunDrag_.azimuth);
+    sceneDocument_.markDirty(SceneUpdateKind::LightOnly);
+    (void)applyPendingSceneUpdate(false);
+}
+
+void Application::finishSunDrag(bool cancel) {
+    if (sunDrag_.phase == SunDragPhase::Idle) {
+        return;
+    }
+    const SunDragPhase phase = sunDrag_.phase;
+    if (phase == SunDragPhase::Dragging && window_ != nullptr) {
+        glfwSetInputMode(window_, GLFW_CURSOR, sunDrag_.previousCursorMode);
+    }
+
+    if (phase == SunDragPhase::Dragging) {
+        if (cancel && sunDrag_.beforeDocument.has_value()) {
+            sceneDocument_ = *sunDrag_.beforeDocument;
+            sceneDocument_.markDirty(SceneUpdateKind::LightOnly);
+            (void)applyPendingSceneUpdate(false);
+        } else if (sunDrag_.beforeDocument.has_value()) {
+            SceneOperations sceneOps(sceneDocument_, &sceneEventBus_);
+            sceneOps.setUndoStack(&undoStack_);
+            sceneOps.commitSunDrag(std::move(*sunDrag_.beforeDocument), SceneUpdateKind::LightOnly);
+        }
+    }
+
+    sunDrag_ = SunDragState{};
+}
+
+void Application::processSunDragControls(bool shortcutsBlocked, bool viewportHovered, bool viewportInteraction, bool ctrlDown) {
+    if (window_ == nullptr || pathTracer_ == nullptr) {
+        return;
+    }
+    const bool lDown = glfwGetKey(window_, GLFW_KEY_L) == GLFW_PRESS;
+    const bool escapeDown = glfwGetKey(window_, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+    const bool focused = glfwGetWindowAttrib(window_, GLFW_FOCUSED) == GLFW_TRUE;
+
+    if (sunDrag_.phase == SunDragPhase::Idle) {
+        if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_L)) {
+            beginSunDragArm(viewportHovered || viewportInteraction);
+        }
+        return;
+    }
+
+    if (sunDrag_.phase == SunDragPhase::Armed) {
+        if (escapeDown || !focused) {
+            finishSunDrag(true);
+            return;
+        }
+        double mouseX = 0.0;
+        double mouseY = 0.0;
+        glfwGetCursorPos(window_, &mouseX, &mouseY);
+        constexpr double dragThresholdPixels = 4.0;
+        const double dx = mouseX - sunDrag_.startMouseX;
+        const double dy = mouseY - sunDrag_.startMouseY;
+        const double dragDistanceSq = dx * dx + dy * dy;
+        if (!ctrlDown || !lDown) {
+            constexpr double openLevelTapSeconds = 0.25;
+            const bool quickTap = (glfwGetTime() - sunDrag_.armedTimeSeconds) <= openLevelTapSeconds &&
+                                  dragDistanceSq < dragThresholdPixels * dragThresholdPixels;
+            if (!sunDrag_.suppressOpenLevel && quickTap) {
+                pendingOpenLevel_ = true;
+            }
+            finishSunDrag(false);
+            return;
+        }
+        if (dragDistanceSq >= dragThresholdPixels * dragThresholdPixels) {
+            if (sunDrag_.dragEligible) {
+                startSunDrag(mouseX, mouseY);
+            } else {
+                sunDrag_.suppressOpenLevel = true;
+            }
+        }
+        return;
+    }
+
+    if (sunDrag_.phase == SunDragPhase::Dragging) {
+        if (escapeDown || !focused) {
+            finishSunDrag(true);
+            return;
+        }
+        if (!ctrlDown || !lDown) {
+            finishSunDrag(false);
+            return;
+        }
+        double mouseX = 0.0;
+        double mouseY = 0.0;
+        glfwGetCursorPos(window_, &mouseX, &mouseY);
+        updateSunDrag(mouseX, mouseY);
+    }
+}
+
 bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
     if (!pathTracer_ || !sceneDocument_.dirty()) {
         return false;
@@ -905,7 +1180,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         return true;
     }
     if (!allowResourceRebuild &&
-        (route.requiresRendererRebuild || route.action == SceneUpdateGpuAction::UpdateTransforms)) {
+        route.requiresRendererRebuild) {
         return false;
     }
 
@@ -944,6 +1219,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
     case SceneUpdateGpuAction::UpdateLights:
         gpuSceneAsset_ = ensureBuild().sceneAsset;
         gpuInstanceEntities_ = ensureBuild().instanceEntities;
+        applyRendererSettingsSafely(ensureBuild().rendererSettings, allowResourceRebuild);
         if (!pathTracer_->updateSceneLights(*gpuSceneAsset_)) {
             pathTracer_->resetAccumulation(route.resetReason);
         }
@@ -1011,13 +1287,17 @@ void Application::applyRendererSettingsSafely(const RendererSettings& settings, 
     const bool renderResolutionChanged =
         std::abs(settings.renderResolutionScale - current.renderResolutionScale) > 0.0001f;
     if (!renderResolutionChanged || allowRenderResolutionChange) {
-        pathTracer_->applySettings(settings);
+        if (pathTracer_->applySettings(settings)) {
+            syncDocumentRenderSettings(sceneDocument_, settings);
+        }
         return;
     }
 
     RendererSettings immediate = settings;
     immediate.renderResolutionScale = current.renderResolutionScale;
-    pathTracer_->applySettings(immediate);
+    if (pathTracer_->applySettings(immediate)) {
+        syncDocumentRenderSettings(sceneDocument_, settings);
+    }
     pendingPostFrameSettings_ = settings;
 }
 
@@ -1095,8 +1375,44 @@ void Application::applyActiveSceneCamera() {
     cameraController_.setPose(position, forward, *pathTracer_);
 }
 
+void Application::syncActiveSceneCameraFromController() {
+    const EntityId active = sceneDocument_.activeCamera();
+    if (!active.valid()) {
+        return;
+    }
+    Entity* cameraEntity = sceneDocument_.registry().entity(active);
+    if (cameraEntity == nullptr || !cameraEntity->camera.has_value()) {
+        return;
+    }
+
+    glm::vec3 localPosition = cameraController_.position();
+    glm::vec3 localForward = cameraController_.direction();
+    if (cameraEntity->parent.valid()) {
+        if (const Entity* parent = sceneDocument_.registry().entity(cameraEntity->parent)) {
+            const glm::mat4 invParent = glm::inverse(entityWorldMatrix(sceneDocument_.registry(), *parent));
+            localPosition = glm::vec3(invParent * glm::vec4(localPosition, 1.0f));
+            localForward = glm::normalize(glm::mat3(invParent) * localForward);
+        }
+    }
+
+    const glm::vec3 zAxis = -glm::normalize(localForward);
+    glm::vec3 xAxis = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), zAxis);
+    if (glm::dot(xAxis, xAxis) <= 1.0e-6f) {
+        xAxis = glm::cross(glm::vec3(0.0f, 0.0f, 1.0f), zAxis);
+    }
+    xAxis = glm::normalize(xAxis);
+    const glm::vec3 yAxis = glm::normalize(glm::cross(zAxis, xAxis));
+    const glm::mat3 rotation(xAxis, yAxis, zAxis);
+    cameraEntity->transform.position = localPosition;
+    cameraEntity->transform.rotationEuler = glm::eulerAngles(glm::normalize(glm::quat_cast(rotation)));
+    cameraEntity->transform.dirty = true;
+    sceneDocument_.markDirty(SceneUpdateKind::CameraOnly);
+}
+
 void Application::rebuildGpuSceneAsset() {
     const RendererSettings settings = pathTracer_ != nullptr ? pathTracer_->settings() : RendererSettings{};
+    (void)SunController::migrateLegacyDirectionalSun(sceneDocument_);
+    (void)SunController::repairPrimarySunTransform(sceneDocument_);
     applyDocumentMaterialAssignments(sceneDocument_, assets_);
     SceneGpuBuildResult build = sceneBuilder_.build(sceneDocument_, &assets_, settings);
     gpuSceneAsset_ = std::move(build.sceneAsset);
@@ -1111,6 +1427,17 @@ void Application::initializeFallbackSceneDocument() {
     sceneDocument_.registry().addCamera(camera, cameraComponent);
     sceneDocument_.setActiveCamera(camera);
     (void)sceneDocument_.registry().createEntity("Cornell Fallback");
+    EntityId sun = sceneDocument_.registry().createEntity("Sun");
+    if (Entity* sunEntity = sceneDocument_.registry().entity(sun)) {
+        sunEntity->sun = Sun{};
+        sunEntity->transform = SunController::transformFromWorldAngles(
+            sceneDocument_.registry(),
+            *sunEntity,
+            sunEntity->transform,
+            0.97f,
+            glm::pi<float>());
+    }
+    sceneDocument_.setPrimarySun(sun);
     sceneDocument_.clearDirty();
     sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
 }
@@ -1125,28 +1452,33 @@ void Application::processRuntimeControls(float deltaSeconds) {
     const bool viewportInteraction = uiOverlay_ != nullptr && uiOverlay_->viewportInteractionActive();
     const bool viewportHovered = uiOverlay_ != nullptr && uiOverlay_->viewportHovered();
     const bool cameraCaptured = cameraController_.mouseCaptured();
-    cameraController_.update(
-        window_,
-        deltaSeconds,
-        *pathTracer_,
-        viewportHovered || cameraCaptured,
-        (viewportInteraction || cameraCaptured) && !uiWantsTextInput);
-
-    RendererSettings settings = pathTracer_->settings();
-    bool changed = false;
     const bool ctrlDown =
         glfwGetKey(window_, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
         glfwGetKey(window_, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+    processSunDragControls(shortcutsBlocked, viewportHovered, viewportInteraction, ctrlDown);
+    const bool sunDragCapturing = sunDrag_.phase != SunDragPhase::Idle;
+    const bool cameraMoved = cameraController_.update(
+        window_,
+        deltaSeconds,
+        *pathTracer_,
+        !sunDragCapturing && (viewportHovered || cameraCaptured),
+        !sunDragCapturing && (viewportInteraction || cameraCaptured) && !uiWantsTextInput);
+    if (cameraMoved) {
+        syncActiveSceneCameraFromController();
+    }
+
+    RendererSettings settings = pathTracer_->settings();
+    bool changed = false;
     if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_Z)) {
         if (undoStack_.undo()) {
             notifications_.notify("Undo", NotificationType::Info);
-            (void)applyPendingSceneUpdate(false);
+            (void)applyPendingSceneUpdate(true);
         }
     }
     if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_Y)) {
         if (undoStack_.redo()) {
             notifications_.notify("Redo", NotificationType::Info);
-            (void)applyPendingSceneUpdate(false);
+            (void)applyPendingSceneUpdate(true);
         }
     }
     if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F1)) {
@@ -1174,6 +1506,10 @@ void Application::processRuntimeControls(float deltaSeconds) {
         changed = true;
     }
     if (!shortcutsBlocked && pressedOnce(GLFW_KEY_5)) {
+        settings.toneMapper = ToneMapper::AgX;
+        changed = true;
+    }
+    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_6)) {
         settings.autoExposureEnabled = !settings.autoExposureEnabled;
         changed = true;
     }
@@ -1189,8 +1525,14 @@ void Application::processRuntimeControls(float deltaSeconds) {
         changed = true;
     }
     if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F4)) {
-        settings.sunlightEnabled = !settings.sunlightEnabled;
-        changed = true;
+        const bool hadPrimarySun = SunController::primarySunEntity(sceneDocument_).valid();
+        EntityId sunId = SunController::ensurePrimarySun(sceneDocument_);
+        if (Entity* sun = sceneDocument_.registry().entity(sunId); sun != nullptr && sun->sun.has_value()) {
+            sun->sun->enabled = hadPrimarySun ? !sun->sun->enabled : true;
+            sceneDocument_.markDirty(SceneUpdateKind::LightOnly);
+            (void)applyPendingSceneUpdate(false);
+            settings = pathTracer_->settings();
+        }
     }
     if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F5)) {
         settings.environmentEnabled = !settings.environmentEnabled;
@@ -1211,9 +1553,6 @@ void Application::processRuntimeControls(float deltaSeconds) {
     }
     if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_R)) {
         pendingReloadShaders_ = true;
-    }
-    if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_L)) {
-        pendingOpenLevel_ = true;
     }
     if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_S)) {
         pendingSaveLevel_ = true;
@@ -1269,7 +1608,9 @@ void Application::processRuntimeControls(float deltaSeconds) {
         changed = true;
     }
 
-    if (changed && pathTracer_->applySettings(settings)) {
+    if (changed) {
+        applyRendererSettingsSafely(settings, false);
+        settings = pathTracer_->settings();
         std::cout << "Settings changed: debug=" << rendererDebugViewName(settings.debugView)
                   << " tone=" << toneMapperName(settings.toneMapper)
                   << " autoExposure=" << (settings.autoExposureEnabled ? "on" : "off")

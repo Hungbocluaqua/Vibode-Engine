@@ -6,7 +6,7 @@
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, rgba16f) readonly uniform image2D input_color;
-layout(set = 0, binding = 1, std430) readonly buffer InputDepthNormal { uvec2 input_depth_normal[]; };
+layout(set = 0, binding = 1, std430) readonly buffer InputDepthNormal { uvec4 input_depth_normal[]; };
 layout(set = 0, binding = 2, std430) readonly buffer InputVariance { uint input_variance[]; };
 layout(set = 0, binding = 3, rgba16f) readonly uniform image2D history_color;
 layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D output_denoised;
@@ -76,7 +76,7 @@ vec3 decode_octahedral_normal(uint packedValue) {
     return normalize(n);
 }
 
-vec4 decode_depth_normal(uvec2 packedValue) {
+vec4 decode_depth_normal(uvec4 packedValue) {
     return vec4(uintBitsToFloat(packedValue.x), decode_octahedral_normal(packedValue.y));
 }
 

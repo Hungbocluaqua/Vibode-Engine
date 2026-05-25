@@ -1,15 +1,21 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "atmosphere_phase.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, rgba16f) uniform image2D color_image;
-layout(set = 0, binding = 1, std430) readonly buffer DepthNormalBuffer { uvec3 depth_normal_buffer[]; };
+layout(set = 0, binding = 1, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
 layout(set = 0, binding = 2, std140) uniform Camera {
     vec4 pos;
     vec4 forward;
     vec4 right;
     vec4 up;
     uint frame_count;
+    uint temporal_frame_index;
+    float effective_jitter_scale;
+    uint camera_moving;
     float sun_intensity;
     float sky_intensity;
     float exposure;
@@ -23,6 +29,9 @@ layout(set = 0, binding = 2, std140) uniform Camera {
     uint environment_direct_samples;
     vec4 jitter;
     vec4 atmosphere;
+    vec4 render_controls;
+    vec4 sun_direction_illuminance;
+    vec4 sun_color_angular_radius;
 } camera;
 layout(set = 0, binding = 3, std140) uniform FogParams {
     uint width;
@@ -56,12 +65,36 @@ vec3 sample_sky(vec3 dir) {
     return max(sky, vec3(0.0));
 }
 
+float planet_horizon_visibility(vec3 scenePos, vec3 dir, float width) {
+    vec3 planetary = atmosphere_scene_to_planetary(scenePos);
+    float radius = max(length(planetary), ATMOSPHERE_PLANET_RADIUS + 1.0);
+    float horizonMu = -sqrt(max(1.0 - (ATMOSPHERE_PLANET_RADIUS * ATMOSPHERE_PLANET_RADIUS) / (radius * radius), 0.0));
+    float viewMu = dot(normalize(dir), normalize(planetary));
+    return smoothstep(horizonMu - width, horizonMu + width, viewMu);
+}
+
+vec3 horizon_fog_sky(vec3 rayDir) {
+    vec3 up = normalize(atmosphere_scene_to_planetary(camera.pos.xyz));
+    float viewMu = dot(normalize(rayDir), up);
+    vec3 tangentDir = rayDir - up * viewMu;
+    if (dot(tangentDir, tangentDir) <= 1.0e-6) {
+        tangentDir = camera.forward.xyz - up * dot(camera.forward.xyz, up);
+    }
+    tangentDir = normalize(tangentDir);
+    return sample_sky(normalize(tangentDir + up * 0.035));
+}
+
 vec4 sample_aerial_lut(vec3 rayDir, float distanceMeters) {
-    float viewMu = clamp(normalize(rayDir).y, -0.15, 1.0);
-    vec2 uv = vec2(
-        clamp(sqrt(clamp(distanceMeters / 100000.0, 0.0, 1.0)), 0.0, 1.0),
-        clamp((viewMu + 0.15) / 1.15, 0.0, 1.0));
-    return texture(sampler3D(atmosphere_aerial_perspective_lut, atmosphere_sampler), vec3(uv, 0.5));
+    vec3 planetary = atmosphere_scene_to_planetary(camera.pos.xyz);
+    float atmosphereHeight = max(ATMOSPHERE_TOP_RADIUS - ATMOSPHERE_PLANET_RADIUS, 1.0);
+    float heightMeters = max(length(planetary) - ATMOSPHERE_PLANET_RADIUS, 0.0);
+    float cosZenith = dot(normalize(rayDir), normalize(planetary));
+    float distance01 = clamp((max(distanceMeters, 1.0) - 1.0) / (100000.0 - 1.0), 0.0, 1.0);
+    vec3 uvw = vec3(
+        clamp(cosZenith * 0.5 + 0.5, 0.0, 1.0),
+        clamp(heightMeters / atmosphereHeight, 0.0, 1.0),
+        pow(distance01, 1.0 / 3.0));
+    return texture(sampler3D(atmosphere_aerial_perspective_lut, atmosphere_sampler), uvw);
 }
 
 void main() {
@@ -70,15 +103,12 @@ void main() {
     if (coords.x >= dims.x || coords.y >= dims.y) {
         return;
     }
-    if (params.enabled == 0u || params.debug_view >= 5u) {
+    if (params.enabled == 0u || params.debug_view != 0u) {
         return;
     }
 
     uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
     float depth = uintBitsToFloat(depth_normal_buffer[pixelIndex].x);
-    if (!is_surface_depth(depth)) {
-        return;
-    }
 
     vec4 color = imageLoad(color_image, coords);
     vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
@@ -87,17 +117,28 @@ void main() {
     float aspect = float(dims.x) / max(float(dims.y), 1.0);
     float scale = tan(camera.fov_y * 0.5);
     vec3 rayDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
-    vec3 hitPos = camera.pos.xyz + rayDir * depth;
+    bool surfaceHit = is_surface_depth(depth);
+    float horizonVisibility = planet_horizon_visibility(camera.pos.xyz, rayDir, 0.006);
+    if (!surfaceHit && horizonVisibility >= 0.999) {
+        return;
+    }
 
-    vec4 aerial = sample_aerial_lut(rayDir, depth);
+    float fogDistance = surfaceHit ? depth : min(max(params.max_distance, 50000.0), 100000.0);
+    vec3 baseColor = surfaceHit ? color.rgb : vec3(0.0);
+    vec3 hitPos = camera.pos.xyz + rayDir * fogDistance;
+
+    vec4 aerial = sample_aerial_lut(rayDir, fogDistance);
     float midHeight = max((camera.pos.y + hitPos.y) * 0.5, 0.0);
     float heightDensity = exp(-midHeight / max(params.height_falloff, 1.0));
-    float distanceFog = 1.0 - exp(-max(depth, 0.0) * max(params.density, 0.0) * heightDensity);
+    float distanceFog = 1.0 - exp(-max(fogDistance, 0.0) * max(params.density, 0.0) * heightDensity);
     float lutFog = clamp(1.0 - aerial.a, 0.0, 1.0);
     float fogAmount = clamp(max(distanceFog, lutFog * heightDensity), 0.0, 0.98);
+    if (!surfaceHit) {
+        fogAmount *= 1.0 - horizonVisibility;
+    }
 
-    vec3 sky = sample_sky(rayDir);
-    vec3 inscatter = max(aerial.rgb, sky * fogAmount * 0.18);
-    vec3 fogged = color.rgb * (1.0 - fogAmount) + inscatter;
+    vec3 sky = surfaceHit ? sample_sky(rayDir) : horizon_fog_sky(rayDir);
+    vec3 inscatter = max(aerial.rgb, sky * fogAmount * (surfaceHit ? 0.18 : 0.36));
+    vec3 fogged = baseColor * (1.0 - fogAmount) + inscatter;
     imageStore(color_image, coords, vec4(max(fogged, vec3(0.0)), color.a));
 }

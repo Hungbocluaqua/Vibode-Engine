@@ -1,8 +1,6 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-
-#include "atmosphere_lut_sampling.glsl"
-#include "environment_sampling.glsl"
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -22,6 +20,9 @@ layout(set = 0, binding = 0, std140) uniform Camera {
     float sun_angular_radius;
     float env_intensity;
     float env_rotation;
+    uint sunlight_enabled;
+    vec3 pad4;
+    vec4 atmosphere;
 } camera;
 
 layout(set = 0, binding = 1, std140) uniform DebugParams {
@@ -31,11 +32,28 @@ layout(set = 0, binding = 1, std140) uniform DebugParams {
     uint pad1;
 } debug_params;
 
+layout(set = 0, binding = 3, std140) uniform EnvParams {
+    uint enabled;
+    float intensity;
+    float rotation;
+    uint width;
+    uint height;
+    float background_intensity;
+    uint procedural;
+    uint sky_cdf_width;
+    float inv_total_lum;
+    uint sky_cdf_height;
+    float _pad4;
+    float _pad5;
+} env_params;
+
 layout(set = 1, binding = 0) uniform texture2D atmosphere_transmittance_lut;
 layout(set = 1, binding = 1) uniform texture2D atmosphere_multi_scatter_lut;
 layout(set = 1, binding = 2) uniform texture2D atmosphere_sky_view_lut;
 layout(set = 1, binding = 3) uniform texture3D atmosphere_aerial_perspective_lut;
 layout(set = 1, binding = 4) uniform sampler atmosphere_sampler;
+
+#include "atmosphere_lighting.glsl"
 
 layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D output_image;
 
@@ -48,6 +66,39 @@ vec3 debug_display_tonemap(vec3 color) {
     color = max(color, vec3(0.0));
     color = color / (color + vec3(1.0));
     return pow(color, vec3(1.0 / 2.2));
+}
+
+vec3 sample_debug_sky_view_lut(vec3 dir) {
+    vec3 d = normalize(dir);
+    vec2 uv = vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5, asin(clamp(d.y, -1.0, 1.0)) / PI + 0.5);
+    return texture(sampler2D(atmosphere_sky_view_lut, atmosphere_sampler), vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0))).rgb;
+}
+
+vec3 sample_debug_multi_scatter_lut(vec3 dir) {
+    vec3 sunDir = analytical_sun_direction();
+    float viewMu = clamp(normalize(dir).y, -0.20, 1.0);
+    float sunMu = clamp(sunDir.y, -0.20, 1.0);
+    vec2 uv = vec2(clamp((viewMu + 0.20) / 1.20, 0.0, 1.0), clamp((sunMu + 0.20) / 1.20, 0.0, 1.0));
+    return texture(sampler2D(atmosphere_multi_scatter_lut, atmosphere_sampler), uv).rgb;
+}
+
+void sample_debug_aerial_perspective(vec3 worldPos, vec3 viewDir, out vec3 inscatter, out float transmittance) {
+    float distanceMeters = length(worldPos - camera.pos.xyz);
+    if (distanceMeters <= 0.0 || distanceMeters >= 100000.0) {
+        inscatter = vec3(0.0);
+        transmittance = 1.0;
+        return;
+    }
+    vec3 planetary = atmosphere_scene_to_planetary(camera.pos.xyz);
+    float cosZenith = clamp(dot(normalize(viewDir), normalize(planetary)), -1.0, 1.0);
+    float heightMeters = max(length(planetary) - ATMOSPHERE_PLANET_RADIUS, 0.0);
+    float atmosphereHeight = max(ATMOSPHERE_TOP_RADIUS - ATMOSPHERE_PLANET_RADIUS, 1.0);
+    float distanceNormalized = clamp((max(distanceMeters, 1.0) - 1.0) / (100000.0 - 1.0), 0.0, 1.0);
+    float depthNormalized = pow(distanceNormalized, 1.0 / 3.0);
+    vec3 uvw = vec3(cosZenith * 0.5 + 0.5, clamp(heightMeters / atmosphereHeight, 0.0, 1.0), depthNormalized);
+    vec4 aerial = texture(sampler3D(atmosphere_aerial_perspective_lut, atmosphere_sampler), uvw);
+    inscatter = max(aerial.rgb, vec3(0.0));
+    transmittance = clamp(aerial.a, 0.0, 1.0);
 }
 
 void main() {
@@ -68,22 +119,21 @@ void main() {
 
     switch (pc.debugMode) {
         case 0: {
-            color = sample_atmosphere_sky_view_lut(dir);
+            color = sample_debug_sky_view_lut(dir);
             break;
         }
         case 1: {
-            vec3 planetary = atmosphere_scene_to_planetary(camera.pos.xyz);
-            color = sample_atmosphere_transmittance_lut(camera.pos.xyz, dir);
+            color = sun_transmittance(camera.pos.xyz, dir);
             break;
         }
         case 2: {
-            color = sample_atmosphere_multi_scatter_lut(dir);
+            color = sample_debug_multi_scatter_lut(dir);
             break;
         }
         case 3: {
             vec3 inscatter;
             float transmittance;
-            sample_atmosphere_aerial_perspective(camera.pos.xyz + dir * 1000.0, dir, inscatter, transmittance);
+            sample_debug_aerial_perspective(camera.pos.xyz + dir * 1000.0, dir, inscatter, transmittance);
             color = inscatter;
             break;
         }
@@ -100,7 +150,7 @@ void main() {
             break;
         }
         default: {
-            color = sample_atmosphere_sky_view_lut(dir);
+            color = sample_debug_sky_view_lut(dir);
             break;
         }
     }

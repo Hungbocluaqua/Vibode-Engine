@@ -129,10 +129,11 @@ EditorRequests UiOverlay::build(
     const std::optional<std::filesystem::path>& gltfPath,
     const std::optional<std::filesystem::path>& hdrPath,
     const std::vector<EntityId>* instanceEntities,
-    const std::string& sceneLoadingStatus,
-    const CameraController* camera,
-    float cpuFrameMs,
-    NotificationManager* notifications) {
+        const std::string& sceneLoadingStatus,
+        const CameraController* camera,
+        float cpuFrameMs,
+        NotificationManager* notifications,
+        bool externalMouseCapture) {
     EditorRequests requests;
     if (!frameBegun_) {
         return requests;
@@ -163,14 +164,14 @@ EditorRequests UiOverlay::build(
         .instanceEntities = instanceEntities,
         .sceneLoadingStatus = &sceneLoadingStatus,
         .camera = camera,
-        .swapchainExtent = extent,
-        .cpuFrameMs = cpuFrameMs,
-        .viewport = EditorViewportState{
-            .texture = viewportTexture_,
-            .renderExtent = renderExtent,
-            .textureReady = outputMatchesViewport && viewportTexture_ != VK_NULL_HANDLE,
-            .mouseCaptureActive = camera != nullptr && camera->mouseCaptured(),
-        },
+            .swapchainExtent = extent,
+            .cpuFrameMs = cpuFrameMs,
+            .viewport = EditorViewportState{
+                .texture = viewportTexture_,
+                .renderExtent = renderExtent,
+                .textureReady = outputMatchesViewport && viewportTexture_ != VK_NULL_HANDLE,
+                .mouseCaptureActive = externalMouseCapture || (camera != nullptr && camera->mouseCaptured()),
+            },
     };
     requests = editor_.draw(state);
     if (notifications != nullptr) {

@@ -10,6 +10,7 @@ layout(set = 0, binding = 1) uniform sampler input_sampler;
 layout(set = 0, binding = 2, rgba16f) readonly uniform image2D history_color;
 layout(set = 0, binding = 3, rgba16f) writeonly uniform image2D output_color;
 layout(set = 0, binding = 4, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+layout(set = 0, binding = 6, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
 
 layout(set = 0, binding = 5, std140) uniform TaaParams {
     uint enabled;
@@ -20,6 +21,10 @@ layout(set = 0, binding = 5, std140) uniform TaaParams {
     float velocity_scale;
     uint reset_history;
     float sharpen_strength;
+    uint history_valid;
+    uint camera_moving;
+    uint pad1;
+    uint pad2;
 } params;
 
 float luminance(vec3 color) {
@@ -38,6 +43,40 @@ vec3 load_history_bilinear(vec2 historyPos, ivec2 dims) {
     vec3 c01 = imageLoad(history_color, p01).rgb;
     vec3 c11 = imageLoad(history_color, p11).rgb;
     return mix(mix(c00, c10, fracValue.x), mix(c01, c11, fracValue.x), fracValue.y);
+}
+
+vec3 decode_octahedral_normal(uint packedValue) {
+    vec2 f = vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0 * 2.0 - 1.0;
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    if (n.z < 0.0) {
+        vec2 signs = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * signs;
+    }
+    return normalize(n);
+}
+
+vec4 decode_depth_normal(uvec4 packedValue) {
+    return vec4(uintBitsToFloat(packedValue.x), decode_octahedral_normal(packedValue.y));
+}
+
+bool geometry_history_valid(ivec2 coords, ivec2 dims, float centerDepth, vec3 centerNormal) {
+    if (centerDepth >= 9999.0) {
+        return true;
+    }
+    const ivec2 offsets[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+    float rejection = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 p = clamp(coords + offsets[i], ivec2(0), dims - ivec2(1));
+        vec4 sampleDn = decode_depth_normal(depth_normal_buffer[uint(p.y) * uint(dims.x) + uint(p.x)]);
+        if (sampleDn.x >= 9999.0) {
+            rejection = max(rejection, 1.0);
+            continue;
+        }
+        float relativeDepth = abs(sampleDn.x - centerDepth) / max(centerDepth, 0.01);
+        float normalDelta = 1.0 - clamp(dot(sampleDn.yzw, centerNormal), -1.0, 1.0);
+        rejection = max(rejection, relativeDepth * 5.0 + normalDelta * 2.0);
+    }
+    return rejection < 1.0;
 }
 
 void neighborhood_stats(ivec2 coords, ivec2 dims, vec3 center, out vec3 minColor, out vec3 maxColor, out float meanLum, out float sigmaLum) {
@@ -62,50 +101,46 @@ void neighborhood_stats(ivec2 coords, ivec2 dims, vec3 center, out vec3 minColor
     sigmaLum = sqrt(max(lumSqSum / max(sampleCount, 1.0) - meanLum * meanLum, 0.0));
 }
 
-vec3 clamp_history(vec3 history, vec3 minColor, vec3 maxColor, float sigmaLum) {
-    return temporal_clamp_history_ycocg(history, minColor, maxColor, sigmaLum);
+vec3 clamp_history(vec3 history, vec3 minColor, vec3 maxColor) {
+    vec3 p_clip = 0.5 * (maxColor + minColor);
+    vec3 e_clip = 0.5 * (maxColor - minColor) + vec3(0.001);
+    vec3 v_clip = history - p_clip;
+    vec3 v_unit = v_clip / e_clip;
+    vec3 a_unit = abs(v_unit);
+    float ma_unit = max(a_unit.x, max(a_unit.y, a_unit.z));
+    if (ma_unit > 1.0) {
+        return p_clip + v_clip / ma_unit;
+    }
+    return history;
 }
 
-vec3 sharpen_resolved_color(vec3 center, ivec2 coords, ivec2 dims, float amount) {
+vec3 sharpen_resolved_color(vec3 center, vec3 up, vec3 down, vec3 left, vec3 right, float amount) {
     if (amount <= 0.0) {
         return center;
     }
-    vec3 up    = texelFetch(sampler2D(input_color, input_sampler), clamp(coords + ivec2(0,  1), ivec2(0), dims - ivec2(1)), 0).rgb;
-    vec3 down  = texelFetch(sampler2D(input_color, input_sampler), clamp(coords + ivec2(0, -1), ivec2(0), dims - ivec2(1)), 0).rgb;
-    vec3 left  = texelFetch(sampler2D(input_color, input_sampler), clamp(coords + ivec2(-1, 0), ivec2(0), dims - ivec2(1)), 0).rgb;
-    vec3 right = texelFetch(sampler2D(input_color, input_sampler), clamp(coords + ivec2(1,  0), ivec2(0), dims - ivec2(1)), 0).rgb;
-    vec3 sum = up + down + left + right;
-
-    float peak = luminance(max(max(up, down), max(left, right)));
-    float trough = luminance(min(min(up, down), min(left, right)));
-    float contrast = peak - trough;
-
-    float w = amount / (contrast + 0.05);
-    w = clamp(w, 0.0, amount * 4.0);
-
-    return (sum * w + center) / (4.0 * w + 1.0);
+    vec3 neighborhoodAverage = (up + down + left + right) * 0.25;
+    vec3 sharpened = center + (center - neighborhoodAverage) * amount;
+    vec3 lo = min(center, min(min(up, down), min(left, right)));
+    vec3 hi = max(center, max(max(up, down), max(left, right)));
+    return clamp(sharpened, lo, hi);
 }
 
-void main() {
-    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 dims = ivec2(int(params.width), int(params.height));
-    if (coords.x >= dims.x || coords.y >= dims.y) {
-        return;
-    }
-
+vec3 resolve_taa_pixel(ivec2 coords, ivec2 dims, out float sharpenAmount) {
     vec2 uv = (vec2(coords) + vec2(0.5)) / vec2(dims);
     vec3 current = texture(sampler2D(input_color, input_sampler), uv).rgb;
     uint pixel_index = uint(coords.y) * uint(dims.x) + uint(coords.x);
+    vec4 centerDn = decode_depth_normal(depth_normal_buffer[pixel_index]);
     vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], params.velocity_scale);
     vec2 history_pos = temporal_reproject_pixel(coords, velocity_pixels);
     bool history_valid =
         params.enabled != 0u &&
         params.reset_history == 0u &&
-        params.frame_count > 1u &&
-        temporal_history_pixel_valid(history_pos, dims, 0.5);
+        params.history_valid != 0u &&
+        temporal_history_pixel_valid(history_pos, dims, 0.5) &&
+        geometry_history_valid(coords, dims, centerDn.x, centerDn.yzw);
 
     vec3 output_value = current;
-    float sharpenAmount = params.sharpen_strength * 0.35;
+    sharpenAmount = params.camera_moving != 0u ? 0.0 : params.sharpen_strength * 0.35;
     if (history_valid) {
         vec3 minColor;
         vec3 maxColor;
@@ -114,7 +149,7 @@ void main() {
         neighborhood_stats(coords, dims, current, minColor, maxColor, meanLum, sigmaLum);
 
         vec3 historyRaw = load_history_bilinear(history_pos, dims);
-        vec3 history = clamp_history(historyRaw, minColor, maxColor, sigmaLum);
+        vec3 history = clamp_history(historyRaw, minColor, maxColor);
         float currentLum = luminance(current);
         float historyLum = luminance(historyRaw);
         float clippedHistoryLum = luminance(history);
@@ -126,15 +161,34 @@ void main() {
         float reactive = temporal_reactive_weight(lumDelta, clipDelta, neighborhoodDelta);
         sharpenAmount = params.sharpen_strength * (1.0 - clamp(max(motion, reactive), 0.0, 1.0) * 0.65);
 
-        if (reactive >= 0.70 || lumDelta >= 0.65 || clipDelta >= 0.55) {
-            output_value = current;
+        if (reactive >= 0.82 || lumDelta >= 0.85 || clipDelta >= 0.75) {
+            float rejectAlpha = params.camera_moving != 0u ? 0.95 : 0.98;
+            output_value = mix(history, current, rejectAlpha);
         } else {
-            float alpha = mix(params.feedback, 0.88, max(motion, reactive));
-            output_value = mix(history, current, clamp(alpha, 0.06, 0.92));
+            float motionTarget = params.camera_moving != 0u ? 0.85 : 0.95;
+            float alpha = mix(params.feedback, motionTarget, max(motion, reactive));
+            output_value = mix(history, current, clamp(alpha, 0.06, 0.98));
         }
     }
+    return output_value;
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(int(params.width), int(params.height));
+    if (coords.x >= dims.x || coords.y >= dims.y) {
+        return;
+    }
+
+    float sharpenAmount = 0.0;
+    vec3 output_value = resolve_taa_pixel(coords, dims, sharpenAmount);
     if (params.enabled != 0u && params.reset_history == 0u) {
-        output_value = sharpen_resolved_color(output_value, coords, dims, sharpenAmount);
+        float ignored = 0.0;
+        vec3 up = resolve_taa_pixel(clamp(coords + ivec2(0, 1), ivec2(0), dims - ivec2(1)), dims, ignored);
+        vec3 down = resolve_taa_pixel(clamp(coords + ivec2(0, -1), ivec2(0), dims - ivec2(1)), dims, ignored);
+        vec3 left = resolve_taa_pixel(clamp(coords + ivec2(-1, 0), ivec2(0), dims - ivec2(1)), dims, ignored);
+        vec3 right = resolve_taa_pixel(clamp(coords + ivec2(1, 0), ivec2(0), dims - ivec2(1)), dims, ignored);
+        output_value = sharpen_resolved_color(output_value, up, down, left, right, sharpenAmount);
     }
 
     imageStore(output_color, coords, vec4(output_value, 1.0));

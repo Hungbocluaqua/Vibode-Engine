@@ -127,6 +127,7 @@ public:
 
     void record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
     void setSunElevation(float elevation);
+    void setSunAzimuth(float azimuth);
     void setSkyIntensity(float intensity);
     void markDirty();
 
@@ -141,6 +142,9 @@ private:
     AtmosphereModel model_{};
     AtmosphereTemporalSystem temporalSystem_{};
     AtmosphereLutSystem lutSystem_;
+    float sunElevation_ = 0.97f;
+    float sunAzimuth_ = 0.0f;
+    float skyIntensity_ = 0.8f;
 };
 
 } // namespace rtv

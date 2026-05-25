@@ -186,6 +186,10 @@ private:
         float velocityScale = 64.0f;
         uint32_t resetHistory = 1;
         float sharpeningStrength = 0.08f;
+        uint32_t historyValid = 0;
+        uint32_t cameraMoving = 0;
+        uint32_t _padding1 = 0;
+        uint32_t _padding2 = 0;
     };
 
     struct RestirSpatialParams {
@@ -253,6 +257,8 @@ private:
 
     VkExtent2D extent_{};
     uint32_t frameCount_ = 0;
+    uint32_t temporalFrameIndex_ = 0;
+    uint32_t stillFrameCount_ = 0;
     float frameDeltaSeconds_ = 0.0f;
     bool cameraChangedThisFrame_ = false;
     AccumulationResetReason lastResetReason_ = AccumulationResetReason::Startup;
@@ -267,6 +273,7 @@ private:
     glm::mat4 previousViewProj_{1.0f};
     glm::vec4 previousCameraPos_{};
     glm::vec2 previousJitter_{0.0f};
+    bool taaHistoryValid_ = false;
 
     Image rawImage_;
     Image denoisedImage_;

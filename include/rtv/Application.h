@@ -59,12 +59,38 @@ private:
         SceneAsset scene;
         std::string error;
     };
+    enum class SunDragPhase {
+        Idle,
+        Armed,
+        Dragging,
+    };
+    struct SunDragState {
+        SunDragPhase phase = SunDragPhase::Idle;
+        EntityId entity{};
+        Transform originalTransform{};
+        std::optional<SceneDocument> beforeDocument;
+        double startMouseX = 0.0;
+        double startMouseY = 0.0;
+        double lastMouseX = 0.0;
+        double lastMouseY = 0.0;
+        float elevation = 0.97f;
+        float azimuth = 0.0f;
+        int previousCursorMode = 0;
+        double armedTimeSeconds = 0.0;
+        bool dragEligible = false;
+        bool suppressOpenLevel = false;
+    };
 
     void initWindow();
     void initVulkan();
     void mainLoop(uint32_t maxFrames);
     void applyValidationCameraMotion(uint32_t frameIndex);
     void processRuntimeControls(float deltaSeconds);
+    void processSunDragControls(bool shortcutsBlocked, bool viewportHovered, bool viewportInteraction, bool ctrlDown);
+    void beginSunDragArm(bool dragEligible);
+    void startSunDrag(double mouseX, double mouseY);
+    void updateSunDrag(double mouseX, double mouseY);
+    void finishSunDrag(bool cancel);
     void updateWindowTitle(float seconds);
     void toggleBorderlessFullscreen();
     void reloadGltfScene(const std::filesystem::path& path);
@@ -82,6 +108,7 @@ private:
         const RendererSettings* settingsToRestore);
     void createPathTracer(const RendererSettings* settingsToRestore = nullptr);
     void applyActiveSceneCamera();
+    void syncActiveSceneCameraFromController();
     void rebuildGpuSceneAsset();
     void initializeFallbackSceneDocument();
     [[nodiscard]] bool pressedOnce(int key);
@@ -100,6 +127,7 @@ private:
     bool pendingReloadShaders_ = false;
     AssetManager assets_;
     CameraController cameraController_;
+    SunDragState sunDrag_{};
     std::array<unsigned char, 512> keyState_{};
     float lastFrameSeconds_ = 0.0f;
     float lastTitleUpdateSeconds_ = -1.0f;

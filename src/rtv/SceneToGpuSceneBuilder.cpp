@@ -1,6 +1,10 @@
 #include "rtv/SceneToGpuSceneBuilder.h"
 
 #include "rtv/AssetManager.h"
+#include "rtv/SunController.h"
+
+#include <algorithm>
+#include <cmath>
 
 namespace rtv {
 
@@ -37,23 +41,31 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.histogramLowPercentile = render.histogramLowPercentile;
     result.rendererSettings.histogramHighPercentile = render.histogramHighPercentile;
     result.rendererSettings.histogramTargetPercentile = render.histogramTargetPercentile;
-    result.rendererSettings.sunlightEnabled = render.sunlightEnabled;
-    result.rendererSettings.sunIntensity = render.sunIntensity;
     result.rendererSettings.skyIntensity = render.skyIntensity;
-    result.rendererSettings.sunElevation = render.sunElevation;
-    result.rendererSettings.sunAngularRadius = render.sunAngularRadius;
     result.rendererSettings.indirectStrength = render.indirectStrength;
+    result.rendererSettings.restirMode = render.restirMode;
     result.rendererSettings.denoiserEnabled = render.denoiserEnabled;
+    result.rendererSettings.denoiseWhileMoving = render.denoiseWhileMoving;
     result.rendererSettings.atrousIterations = render.atrousIterations;
     result.rendererSettings.denoiserStrength = render.denoiserStrength;
     result.rendererSettings.taaEnabled = render.taaEnabled;
     result.rendererSettings.taaFeedback = render.taaFeedback;
+    result.rendererSettings.taaSharpeningStrength = render.taaSharpeningStrength;
     result.rendererSettings.debugView = render.debugView;
+    result.rendererSettings.shadowRayBias = render.shadowRayBias;
+    result.rendererSettings.shadowDistanceBias = render.shadowDistanceBias;
+    result.rendererSettings.fireflyClamp = render.fireflyClamp;
+    result.rendererSettings.usePhysicalCamera = render.usePhysicalCamera;
+    result.rendererSettings.physicalAperture = render.physicalAperture;
+    result.rendererSettings.physicalShutterSeconds = render.physicalShutterSeconds;
+    result.rendererSettings.physicalIso = render.physicalIso;
+    result.rendererSettings.physicalExposureCompensation = render.physicalExposureCompensation;
     result.rendererSettings.environmentEnabled = environment.enabled;
     result.rendererSettings.environmentIntensity = environment.intensity;
     result.rendererSettings.environmentRotation = environment.rotation;
     result.rendererSettings.environmentBackgroundIntensity = environment.backgroundIntensity;
     result.rendererSettings.renderResolutionScale = render.resolutionScale;
+    SunController::applyToRendererSettings(document, result.rendererSettings);
 
     const std::vector<const Entity*> entities = document.registry().entities();
     auto appendInstanceEntity = [&](uint32_t nodeIndex) {

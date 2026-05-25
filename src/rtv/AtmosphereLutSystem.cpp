@@ -135,12 +135,28 @@ AtmosphereLutSystem::~AtmosphereLutSystem() {
     }
 }
 
-void AtmosphereLutSystem::setSkyParameters(float sunElevation, float skyIntensity) {
-    if (std::abs(sunElevation_ - sunElevation) > 0.0001f || std::abs(skyIntensity_ - skyIntensity) > 0.0001f) {
+void AtmosphereLutSystem::setSkyParameters(float sunElevation, float sunAzimuth, float skyIntensity) {
+    if (std::abs(sunElevation_ - sunElevation) > 0.0001f ||
+        std::abs(sunAzimuth_ - sunAzimuth) > 0.0001f ||
+        std::abs(skyIntensity_ - skyIntensity) > 0.0001f) {
         markDirty(LutNode::Transmittance);
+        previousSkyViewReady_ = false;
     }
     sunElevation_ = sunElevation;
+    sunAzimuth_ = sunAzimuth;
     skyIntensity_ = skyIntensity;
+}
+
+void AtmosphereLutSystem::setSkyDirection(glm::vec3 sunDirection, float skyIntensity) {
+    const float len2 = glm::dot(sunDirection, sunDirection);
+    if (len2 <= 1.0e-6f) {
+        setSkyParameters(0.97f, 0.0f, skyIntensity);
+        return;
+    }
+    sunDirection *= glm::inversesqrt(len2);
+    const float elevation = std::asin(std::clamp(sunDirection.y, -1.0f, 1.0f));
+    const float azimuth = std::atan2(sunDirection.x, sunDirection.z);
+    setSkyParameters(elevation, azimuth, skyIntensity);
 }
 
 void AtmosphereLutSystem::setAtmosphereParams(float rayleighScaleHeight, float mieScaleHeight, float mieAnisotropy, float groundAlbedo) {
@@ -158,25 +174,21 @@ void AtmosphereLutSystem::setAtmosphereParams(float rayleighScaleHeight, float m
     next.groundAlbedo = groundAlbedo;
     model_.setParams(next);
     markDirty();
+    previousSkyViewReady_ = false;
 }
 
 void AtmosphereLutSystem::setQuality(AtmosphereQuality quality) {
-    switch (quality) {
-    case AtmosphereQuality::Low:
-        skyViewWidth_ = 128; skyViewHeight_ = 72; break;
-    case AtmosphereQuality::Medium:
-        skyViewWidth_ = 192; skyViewHeight_ = 108; break;
-    case AtmosphereQuality::High:
-        skyViewWidth_ = 256; skyViewHeight_ = 144; break;
-    case AtmosphereQuality::Cinematic:
-        skyViewWidth_ = 512; skyViewHeight_ = 288; break;
+    if (quality_ == quality) {
+        return;
     }
     quality_ = quality;
     markDirty();
+    previousSkyViewReady_ = false;
 }
 
 void AtmosphereLutSystem::markDirty() {
     markDirty(LutNode::Transmittance);
+    previousSkyViewReady_ = false;
     previousCameraPosSet_ = false;
 }
 
@@ -324,7 +336,7 @@ void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, Desc
         .mieScatteringAnisotropy = atmosphere.mieScatteringAnisotropy,
         .absorptionGroundAlbedo = atmosphere.absorptionGroundAlbedo,
         .scaleHeights = atmosphere.scaleHeights,
-        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, 0.0f, 0.0f),
+        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, sunAzimuth_, 0.0f),
     };
 
     multiScatterPipeline_->bind(commandBuffer);
@@ -390,7 +402,7 @@ void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, Descripto
         .mieScatteringAnisotropy = atmosphere.mieScatteringAnisotropy,
         .absorptionGroundAlbedo = atmosphere.absorptionGroundAlbedo,
         .scaleHeights = atmosphere.scaleHeights,
-        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, 0.0f, 0.0f),
+        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, sunAzimuth_, 0.0f),
     };
 
     skyViewPipeline_->bind(commandBuffer);
@@ -563,7 +575,7 @@ void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer,
         .mieScatteringAnisotropy = atmosphere.mieScatteringAnisotropy,
         .absorptionGroundAlbedo = atmosphere.absorptionGroundAlbedo,
         .scaleHeights = atmosphere.scaleHeights,
-        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, 0.0f, 0.0f),
+        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, sunAzimuth_, 0.0f),
     };
 
     aerialPerspectivePipeline_->bind(commandBuffer);

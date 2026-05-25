@@ -38,12 +38,20 @@ void SkySystem::record(VkCommandBuffer commandBuffer, DescriptorAllocator& descr
 }
 
 void SkySystem::setSunElevation(float elevation) {
-    lutSystem_.setSkyParameters(elevation, 0.8f);
+    sunElevation_ = elevation;
+    lutSystem_.setSkyParameters(sunElevation_, sunAzimuth_, skyIntensity_);
+    temporalSystem_.markDirty(AtmosphereDirtyBit::SunDirection);
+}
+
+void SkySystem::setSunAzimuth(float azimuth) {
+    sunAzimuth_ = azimuth;
+    lutSystem_.setSkyParameters(sunElevation_, sunAzimuth_, skyIntensity_);
     temporalSystem_.markDirty(AtmosphereDirtyBit::SunDirection);
 }
 
 void SkySystem::setSkyIntensity(float intensity) {
-    lutSystem_.setSkyParameters(0.97f, intensity);
+    skyIntensity_ = intensity;
+    lutSystem_.setSkyParameters(sunElevation_, sunAzimuth_, skyIntensity_);
 }
 
 void SkySystem::markDirty() {
