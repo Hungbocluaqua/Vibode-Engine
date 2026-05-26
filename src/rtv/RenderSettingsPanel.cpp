@@ -66,9 +66,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.debugView = render.debugView;
         settings.renderResolutionScale = render.resolutionScale;
         settings.accumulationLimit = render.accumulationLimit;
+        settings.materialTextureAnisotropy = render.materialTextureAnisotropy;
         settings.shadowRayBias = render.shadowRayBias;
         settings.shadowDistanceBias = render.shadowDistanceBias;
         settings.fireflyClamp = render.fireflyClamp;
+        settings.adaptiveQualityMode = render.adaptiveQualityMode;
+        settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
         settings.usePhysicalCamera = render.usePhysicalCamera;
         settings.physicalAperture = render.physicalAperture;
         settings.physicalShutterSeconds = render.physicalShutterSeconds;
@@ -109,7 +112,29 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed = true;
     }
     tooltip("Hybrid ReSTIR direct-light mode. Classic NEE remains the reference baseline.");
+    const char* tsrPresetItems[] = {"Native", "Quality", "Balanced", "Performance"};
+    int tsrPreset = settings.renderResolutionScale >= 0.99f ? 0 :
+        (settings.renderResolutionScale >= 0.74f ? 1 : (settings.renderResolutionScale >= 0.59f ? 2 : 3));
+    if (ImGui::Combo("TSR Preset", &tsrPreset, tsrPresetItems, 4)) {
+        const float presetScales[] = {1.0f, 0.77f, 0.67f, 0.50f};
+        settings.renderResolutionScale = presetScales[tsrPreset];
+        changed = true;
+    }
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
+    changed |= ImGui::SliderFloat("Material Anisotropy", &settings.materialTextureAnisotropy, 1.0f, 16.0f, "%.1fx");
+    tooltip("Anisotropic filtering level for material textures. Unsupported devices clamp to 1x.");
+    const char* adaptiveItems[] = {"Off", "Conservative", "Balanced", "Aggressive"};
+    int adaptiveIndex = static_cast<int>(settings.adaptiveQualityMode);
+    if (adaptiveIndex < 0 || adaptiveIndex > 3) {
+        adaptiveIndex = 0;
+    }
+    if (ImGui::Combo("Adaptive Quality", &adaptiveIndex, adaptiveItems, 4)) {
+        settings.adaptiveQualityMode = static_cast<AdaptiveQualityMode>(adaptiveIndex);
+        changed = true;
+    }
+    tooltip("Dynamically lowers expensive path-tracing controls while moving or over the GPU frame target.");
+    changed |= ImGui::SliderFloat("Adaptive GPU Target", &settings.adaptiveGpuFrameTargetMs, 4.0f, 100.0f, "%.1f ms");
+    tooltip("Target smoothed GPU frame time used by adaptive quality modes.");
 
     if (ImGui::CollapsingHeader("Tone Mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
         const char* toneMapperItems2[] = {"Linear", "Reinhard", "Reinhard White", "ACES", "PBR Neutral", "AgX"};
@@ -272,9 +297,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.debugView = settings.debugView;
             render.resolutionScale = settings.renderResolutionScale;
             render.accumulationLimit = settings.accumulationLimit;
+            render.materialTextureAnisotropy = settings.materialTextureAnisotropy;
             render.shadowRayBias = settings.shadowRayBias;
             render.shadowDistanceBias = settings.shadowDistanceBias;
             render.fireflyClamp = settings.fireflyClamp;
+            render.adaptiveQualityMode = settings.adaptiveQualityMode;
+            render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
             render.usePhysicalCamera = settings.usePhysicalCamera;
             render.physicalAperture = settings.physicalAperture;
             render.physicalShutterSeconds = settings.physicalShutterSeconds;

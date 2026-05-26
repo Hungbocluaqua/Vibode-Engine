@@ -140,18 +140,16 @@ EditorRequests UiOverlay::build(
     }
 
     const VkExtent2D renderExtent = renderer.renderExtent();
-    VkExtent2D targetExtent = editor_.desiredRenderExtent(extent);
-    const float renderScale = renderer.settings().renderResolutionScale;
-    targetExtent.width = std::max(1u, static_cast<uint32_t>(static_cast<float>(targetExtent.width) * renderScale));
-    targetExtent.height = std::max(1u, static_cast<uint32_t>(static_cast<float>(targetExtent.height) * renderScale));
-    const bool outputMatchesViewport = renderExtent.width == targetExtent.width && renderExtent.height == targetExtent.height;
+    const VkExtent2D displayExtent = renderer.displayExtent();
+    const VkExtent2D targetExtent = editor_.desiredRenderExtent(extent);
+    const bool outputMatchesViewport = displayExtent.width == targetExtent.width && displayExtent.height == targetExtent.height;
 
     const VkDescriptorImageInfo descriptor = outputMatchesViewport ? renderer.viewportImageDescriptor() : VkDescriptorImageInfo{};
     if (descriptor.imageView != VK_NULL_HANDLE && descriptor.imageView != viewportImageView_) {
         invalidateViewportTexture();
         viewportTexture_ = ImGui_ImplVulkan_AddTexture(descriptor.imageView, descriptor.imageLayout);
         viewportImageView_ = descriptor.imageView;
-        viewportTextureExtent_ = renderExtent;
+        viewportTextureExtent_ = displayExtent;
     }
 
     EditorRuntimeState state{
@@ -169,6 +167,7 @@ EditorRequests UiOverlay::build(
             .viewport = EditorViewportState{
                 .texture = viewportTexture_,
                 .renderExtent = renderExtent,
+                .displayExtent = displayExtent,
                 .textureReady = outputMatchesViewport && viewportTexture_ != VK_NULL_HANDLE,
                 .mouseCaptureActive = externalMouseCapture || (camera != nullptr && camera->mouseCaptured()),
             },

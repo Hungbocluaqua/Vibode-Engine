@@ -13,6 +13,8 @@ ResourceAllocator::ResourceAllocator(const VulkanContext& context) {
     device_ = context.device();
     physicalDevice_ = context.physicalDevice();
     supportsDeviceAddress_ = context.supportsBufferDeviceAddress();
+    supportsSamplerAnisotropy_ = context.supportsSamplerAnisotropy();
+    maxSamplerAnisotropy_ = context.maxSamplerAnisotropy();
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;

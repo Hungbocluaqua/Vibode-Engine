@@ -28,7 +28,7 @@ void main() {
     vec3 p1 = v1.position_uv_x.xyz;
     vec3 p2 = v2.position_uv_x.xyz;
     vec3 localGeomNormal = normalize(cross(p1 - p0, p2 - p0));
-    vec3 worldGeomNormal = normalize(transpose(mat3(instance.inverse_transform)) * localGeomNormal);
+    vec3 worldGeomNormal = normalize(mat3(instance.normal_transform) * localGeomNormal);
     bool frontFace = dot(worldGeomNormal, gl_WorldRayDirectionEXT) < 0.0;
 
     uint materialIndex = material_for_raw_triangle(firstIndex, gl_PrimitiveID);

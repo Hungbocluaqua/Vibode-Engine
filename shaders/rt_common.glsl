@@ -121,6 +121,7 @@ layout(set = 0, binding = 21, std430) readonly buffer ScenePrimitiveRecords {
 struct InstanceRecord {
     mat4 transform;
     mat4 inverse_transform;
+    mat4 normal_transform;
     mat4 prev_transform;
     uvec4 metadata;
 };
@@ -273,6 +274,18 @@ const uint MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB = 1u << 1u;
 const uint ALPHA_MODE_OPAQUE = 0u;
 const uint ALPHA_MODE_MASK = 1u;
 const uint ALPHA_MODE_BLEND = 2u;
+const float MATERIAL_DELTA_ROUGHNESS_THRESHOLD = 0.001;
+const float MATERIAL_MIN_GGX_ROUGHNESS = 0.001;
+
+bool material_is_delta(Material material) {
+    return (material.mat_type == 1u || material.mat_type == 2u) &&
+        material.roughness < MATERIAL_DELTA_ROUGHNESS_THRESHOLD;
+}
+
+float ggx_safe_roughness(float roughness) {
+    return clamp(roughness, MATERIAL_MIN_GGX_ROUGHNESS, 1.0);
+}
+
 float shadow_self_hit_epsilon() {
     return max(camera.render_controls.x, 0.00001);
 }
@@ -283,6 +296,10 @@ float shadow_distance_bias() {
 
 float firefly_clamp_luminance() {
     return max(camera.render_controls.z, 1.0);
+}
+
+float russian_roulette_min_survival() {
+    return clamp(camera.render_controls.w, 0.02, 0.50);
 }
 const float DEBUG_WHITE_ENV_RADIANCE = 4.0;
 
@@ -438,7 +455,7 @@ void apply_material_textures(inout Material material, vec2 uv) {
     if (material.metallic_roughness_texture >= 0 && material.metallic_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.metallic_roughness_texture;
         vec4 mr = texture(material_textures[nonuniformEXT(textureIndex)], uv);
-        material.roughness = clamp(material.roughness * mr.g, 0.02, 1.0);
+        material.roughness = clamp(material.roughness * mr.g, 0.0, 1.0);
         material.metallic = clamp(material.metallic * mr.b, 0.0, 1.0);
         if (material.mat_type == 0u || material.mat_type == 3u) {
             material.mat_type = 3u;
@@ -540,6 +557,15 @@ vec3 analytical_sun_direction() {
 float analytical_sun_solid_angle() {
     float radius = clamp(camera.sun_color_angular_radius.w, 0.0001, 0.08);
     return max(2.0 * PI * (1.0 - cos(radius)), 1.0e-8);
+}
+
+float analytical_sun_pdf(vec3 dir) {
+    if (camera.sunlight_enabled == 0u) {
+        return 0.0;
+    }
+    vec3 sunDir = analytical_sun_direction();
+    float radius = clamp(camera.sun_color_angular_radius.w, 0.0001, 0.08);
+    return dot(normalize(dir), sunDir) >= cos(radius) ? 1.0 / analytical_sun_solid_angle() : 0.0;
 }
 
 float atmosphere_planet_horizon_visibility(vec3 scenePos, vec3 dir, float width) {
@@ -978,13 +1004,26 @@ float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
+vec3 pbr_f0(Material material) {
+    return mix(vec3(0.04), material.color, clamp(material.metallic, 0.0, 1.0));
+}
+
+vec3 pbr_average_fresnel(vec3 f0) {
+    return f0 + (vec3(1.0) - f0) * (1.0 / 21.0);
+}
+
+vec3 pbr_diffuse_energy(Material material) {
+    vec3 f0 = pbr_f0(material);
+    return clamp(vec3(1.0) - pbr_average_fresnel(f0), vec3(0.0), vec3(1.0)) *
+        (1.0 - clamp(material.metallic, 0.0, 1.0));
+}
+
 float pbr_specular_sample_probability(Material material, float NdotV) {
     float metallic = clamp(material.metallic, 0.0, 1.0);
     vec3 f0 = mix(vec3(0.04), material.color, metallic);
     vec3 fresnel = f0 + (vec3(1.0) - f0) * pow(1.0 - max(NdotV, 0.0), 5.0);
-    vec3 kd = (vec3(1.0) - f0) * (1.0 - metallic);
     float specularWeight = max(luminance(fresnel), 0.0);
-    float diffuseWeight = max(luminance(kd * material.color * (1.0 / PI)), 0.0);
+    float diffuseWeight = max(luminance(pbr_diffuse_energy(material) * material.color * (1.0 / PI)), 0.0);
     return clamp(specularWeight / max(specularWeight + diffuseWeight, 1e-6), 0.05, 0.95);
 }
 
@@ -1000,8 +1039,22 @@ vec3 sample_cosine_hemisphere(inout uint state, vec3 normal, out float pdf) {
     return dir;
 }
 
+void tangent_frame(vec3 n, out vec3 tangent, out vec3 bitangent) {
+    vec3 axis = abs(n.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    tangent = normalize(cross(axis, n));
+    bitangent = cross(n, tangent);
+}
+
+vec3 to_tangent_space(vec3 v, vec3 tangent, vec3 bitangent, vec3 n) {
+    return vec3(dot(v, tangent), dot(v, bitangent), dot(v, n));
+}
+
+vec3 from_tangent_space(vec3 v, vec3 tangent, vec3 bitangent, vec3 n) {
+    return tangent * v.x + bitangent * v.y + n * v.z;
+}
+
 float ggx_ndf(float roughness, float n_dot_h) {
-    float r = max(roughness, 0.02);
+    float r = ggx_safe_roughness(roughness);
     float a = r * r;
     float a2 = a * a;
     float d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
@@ -1014,26 +1067,51 @@ vec3 schlick_fresnel(vec3 f0, float v_dot_h) {
 }
 
 float smith_g1(float roughness, float n_dot_x) {
-    float r = max(roughness, 0.02);
+    float r = ggx_safe_roughness(roughness);
     float a = r * r;
     float a2 = a * a;
     float n2 = n_dot_x * n_dot_x;
     return 2.0 * n_dot_x / max(n_dot_x + sqrt(a2 + (1.0 - a2) * n2), 1e-10);
 }
 
+float smith_ggx_lambda(float roughness, float n_dot_x) {
+    float r = ggx_safe_roughness(roughness);
+    float a = r * r;
+    float a2 = a * a;
+    float n2 = max(n_dot_x * n_dot_x, 1e-8);
+    float tan2Theta = max(1.0 - n2, 0.0) / n2;
+    return 0.5 * (sqrt(1.0 + a2 * tan2Theta) - 1.0);
+}
+
+float ggx_visible_normal_pdf(Material material, vec3 wo, vec3 h, vec3 n) {
+    float n_dot_v = max(dot(n, wo), 0.0);
+    float n_dot_h = max(dot(n, h), 0.0);
+    float v_dot_h = max(dot(wo, h), 0.0);
+    if (n_dot_v < 1e-6 || n_dot_h < 1e-6 || v_dot_h < 1e-6) {
+        return 0.0;
+    }
+    return ggx_ndf(material.roughness, n_dot_h) * smith_g1(material.roughness, n_dot_v) / max(4.0 * n_dot_v, 1e-10);
+}
+
 float smith_g(float roughness, float n_dot_v, float n_dot_l) {
-    return smith_g1(roughness, n_dot_v) * smith_g1(roughness, n_dot_l);
+    if (n_dot_v <= 0.0 || n_dot_l <= 0.0) {
+        return 0.0;
+    }
+    float lambdaV = smith_ggx_lambda(roughness, n_dot_v);
+    float lambdaL = smith_ggx_lambda(roughness, n_dot_l);
+    return 1.0 / max(1.0 + lambdaV + lambdaL, 1e-8);
 }
 
 float ggx_directional_albedo(float roughness, float n_dot_v) {
-    float a = roughness * roughness;
+    float r = ggx_safe_roughness(roughness);
+    float a = r * r;
     float a2 = a * a;
     float mu = clamp(n_dot_v, 0.0, 1.0);
     return (mu * (1.0 + a2)) / (mu * (1.0 + a2) + a * (1.0 - mu));
 }
 
 vec3 ggx_energy_compensation(vec3 f0, float roughness, float n_dot_v) {
-    float r = clamp(roughness, 0.02, 1.0);
+    float r = ggx_safe_roughness(roughness);
     float r2 = r * r;
     float singleScatterEnergy = clamp(1.0 - r2 * (0.45 + 0.25 * (1.0 - clamp(n_dot_v, 0.0, 1.0))), 0.35, 1.0);
     vec3 averageFresnel = f0 + (vec3(1.0) - f0) * (1.0 / 21.0);
@@ -1042,7 +1120,8 @@ vec3 ggx_energy_compensation(vec3 f0, float roughness, float n_dot_v) {
 }
 
 vec3 heitz_ms_ggx(vec3 f0, float roughness, float n_dot_v, float n_dot_l) {
-    float a = roughness * roughness;
+    float r = ggx_safe_roughness(roughness);
+    float a = r * r;
     float E_v = ggx_directional_albedo(roughness, n_dot_v);
     float E_l = ggx_directional_albedo(roughness, n_dot_l);
     float E_avg = clamp(1.0 / (1.0 + a * 0.66), 0.0, 1.0);
@@ -1064,15 +1143,14 @@ vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     vec3 h = normalize(halfVector);
     float n_dot_h = max(dot(n, h), 0.0);
     float v_dot_h = max(dot(wo, h), 0.0);
-    vec3 f0 = mix(vec3(0.04), material.color, clamp(material.metallic, 0.0, 1.0));
+    vec3 f0 = pbr_f0(material);
     vec3 f = schlick_fresnel(f0, v_dot_h);
     float d = ggx_ndf(material.roughness, n_dot_h);
     float g = smith_g(material.roughness, n_dot_v, n_dot_l);
     vec3 specular = f * d * g / max(4.0 * n_dot_v * n_dot_l, 1e-10);
     vec3 msCompensation = heitz_ms_ggx(f0, material.roughness, n_dot_v, n_dot_l);
-    specular += f * msCompensation;
-    vec3 kd = mix(vec3(1.0) - f, vec3(0.0), clamp(material.metallic, 0.0, 1.0));
-    vec3 diffuse = kd * material.color * (1.0 / PI);
+    specular += msCompensation;
+    vec3 diffuse = pbr_diffuse_energy(material) * material.color * (1.0 / PI);
     return diffuse + specular;
 }
 
@@ -1087,10 +1165,7 @@ float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
         return 0.0;
     }
     vec3 h = normalize(halfVector);
-    float n_dot_h = max(dot(n, h), 0.0);
-    float v_dot_h = max(dot(wo, h), 0.0);
-    float d = ggx_ndf(material.roughness, n_dot_h);
-    return d * n_dot_h / max(4.0 * v_dot_h, 1e-10);
+    return ggx_visible_normal_pdf(material, wo, h, n);
 }
 
 float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
@@ -1101,17 +1176,33 @@ float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
 }
 
 vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n) {
-    float r = max(material.roughness, 0.02);
+    float r = ggx_safe_roughness(material.roughness);
     float a = r * r;
     float r1 = rand_f32(state);
     float r2 = rand_f32(state);
-    float phi = r1 * 2.0 * PI;
-    float cosTheta = sqrt((1.0 - r2) / max(1.0 + (a * a - 1.0) * r2, 1e-8));
-    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
-    vec3 axis = abs(n.x) > 0.1 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 tangent = normalize(cross(axis, n));
-    vec3 bitangent = cross(n, tangent);
-    vec3 h = normalize(tangent * cos(phi) * sinTheta + bitangent * sin(phi) * sinTheta + n * cosTheta);
+    vec3 tangent;
+    vec3 bitangent;
+    tangent_frame(n, tangent, bitangent);
+    vec3 v = to_tangent_space(normalize(wo), tangent, bitangent, n);
+    if (v.z <= 0.0) {
+        return reflect(-wo, n);
+    }
+
+    vec3 vh = normalize(vec3(a * v.x, a * v.y, v.z));
+    float lensq = vh.x * vh.x + vh.y * vh.y;
+    vec3 t1 = lensq > 1.0e-8 ? vec3(-vh.y, vh.x, 0.0) * inversesqrt(lensq) : vec3(1.0, 0.0, 0.0);
+    vec3 t2 = cross(vh, t1);
+
+    float radius = sqrt(r1);
+    float phi = 2.0 * PI * r2;
+    float p1 = radius * cos(phi);
+    float p2 = radius * sin(phi);
+    float blend = 0.5 * (1.0 + vh.z);
+    p2 = mix(sqrt(max(0.0, 1.0 - p1 * p1)), p2, blend);
+
+    vec3 nh = p1 * t1 + p2 * t2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * vh;
+    vec3 hLocal = normalize(vec3(a * nh.x, a * nh.y, max(nh.z, 0.0)));
+    vec3 h = normalize(from_tangent_space(hLocal, tangent, bitangent, n));
     return normalize(2.0 * dot(wo, h) * h - wo);
 }
 
@@ -1156,6 +1247,9 @@ vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
 }
 
 float pdf_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+    if (material_is_delta(material)) {
+        return 0.0;
+    }
     MaterialClosure c = material_to_closure(material);
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
         return pdf_pbr_brdf(material, wo, wi, n);

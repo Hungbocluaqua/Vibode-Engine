@@ -8,6 +8,9 @@ layout(location = 1) rayPayloadEXT uint shadow_occluded;
 
 const uint RAY_MASK_CAMERA = 0x01u;
 const uint RAY_MASK_SHADOW = 0x02u;
+const uint PATH_EVENT_NONE = 0u;
+const uint PATH_EVENT_BSDF = 1u;
+const uint PATH_EVENT_DELTA = 2u;
 
 struct PathComponents {
     vec3 direct_light;
@@ -24,6 +27,13 @@ struct PathComponents {
     vec3 first_bounce_throughput;
     float secondary_env_miss;
     vec3 secondary_env_radiance;
+    float emissive_continuation;
+    float sun_mis_weight;
+    float sun_light_pdf;
+    float sun_previous_bsdf_pdf;
+    float ris_raw_light_pdf;
+    float ris_effective_light_pdf;
+    float ris_pdf_ratio;
     vec3 first_local_pos;
     uint bounce_count;
     uint instance_id;
@@ -285,7 +295,7 @@ bool sample_emissive_light(inout uint rng, vec3 hitPos, out vec3 wi, out vec3 em
     float r2 = rand_f32(rng);
     float sr1 = sqrt(r1);
     vec3 samplePos = v0 * (1.0 - sr1) + v1 * (sr1 * (1.0 - r2)) + v2 * (sr1 * r2);
-    vec3 lightNormal = normalize(transpose(mat3(instance.inverse_transform)) * td3.xyz);
+                vec3 lightNormal = normalize(mat3(instance.normal_transform) * td3.xyz);
     emission = material.emissive;
 
     vec3 toLight = samplePos - hitPos;
@@ -344,16 +354,20 @@ vec3 estimate_direct_lighting(
     out vec3 emissiveContribution,
     out vec3 environmentContribution,
     out float sampledLightPdf,
+    out float sampledRawLightPdf,
+    out float sampledEffectiveLightPdf,
     out float sampledBsdfPdf,
     out float sampledMisWeight,
     out uint sampledType) {
     emissiveContribution = vec3(0.0);
     environmentContribution = vec3(0.0);
     sampledLightPdf = 0.0;
+    sampledRawLightPdf = 0.0;
+    sampledEffectiveLightPdf = 0.0;
     sampledBsdfPdf = 0.0;
     sampledMisWeight = 0.0;
     sampledType = 0u;
-    bool isDelta = material.mat_type == 1u || material.mat_type == 2u;
+    bool isDelta = material_is_delta(material);
     if (camera.direct_lighting_enabled == 0u || isDelta || debug_params.view == 27u) {
         return vec3(0.0);
     }
@@ -401,13 +415,18 @@ vec3 estimate_direct_lighting(
         bool occluded = trace_shadow(shadow_origin(hit, selectedWi), selectedWi, max(selectedDistance - shadow_distance_bias(), 0.0));
         float cosSurface = max(dot(lightingNormal, selectedWi), 0.0);
         if (!occluded && cosSurface > 0.0) {
-            float weight = power_heuristic(selectedLightPdf, selectedBsdfPdf);
-            float risNormalization = risCandidateCount > 1u ? proxyWeightSum / (float(risCandidateCount) * selectedProxy) : 1.0;
-            sampledLightPdf = selectedLightPdf;
+            float effectiveLightPdf = selectedLightPdf;
+            if (risCandidateCount > 1u && proxyWeightSum > 1.0e-8 && selectedProxy > 1.0e-8) {
+                effectiveLightPdf = selectedLightPdf * float(risCandidateCount) * selectedProxy / proxyWeightSum;
+            }
+            float weight = power_heuristic(effectiveLightPdf, selectedBsdfPdf);
+            sampledLightPdf = effectiveLightPdf;
+            sampledRawLightPdf = selectedLightPdf;
+            sampledEffectiveLightPdf = effectiveLightPdf;
             sampledBsdfPdf = selectedBsdfPdf;
             sampledMisWeight = weight;
             sampledType = 1u;
-            emissiveContribution = selectedBsdf * selectedEmission * cosSurface * weight * risNormalization / max(selectedLightPdf, 1e-6);
+            emissiveContribution = selectedBsdf * selectedEmission * cosSurface * weight / max(effectiveLightPdf, 1e-6);
         }
     }
 
@@ -426,6 +445,8 @@ vec3 estimate_direct_lighting(
             float weight = power_heuristic(envPdf, bsdfPdf);
             if (sampledLightPdf <= 0.0) {
                 sampledLightPdf = envPdf;
+                sampledRawLightPdf = envPdf;
+                sampledEffectiveLightPdf = envPdf;
                 sampledBsdfPdf = bsdfPdf;
                 sampledMisWeight = weight;
                 sampledType = 2u;
@@ -448,6 +469,8 @@ vec3 estimate_direct_lighting(
                 float weight = power_heuristic(sunPdf, bsdfPdf);
                 if (sampledLightPdf <= 0.0) {
                     sampledLightPdf = sunPdf;
+                    sampledRawLightPdf = sunPdf;
+                    sampledEffectiveLightPdf = sunPdf;
                     sampledBsdfPdf = bsdfPdf;
                     sampledMisWeight = weight;
                     sampledType = 3u;
@@ -485,12 +508,20 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.first_bounce_throughput = vec3(0.0);
     components.secondary_env_miss = 0.0;
     components.secondary_env_radiance = vec3(0.0);
+    components.emissive_continuation = 0.0;
+    components.sun_mis_weight = 0.0;
+    components.sun_light_pdf = 0.0;
+    components.sun_previous_bsdf_pdf = 0.0;
+    components.ris_raw_light_pdf = 0.0;
+    components.ris_effective_light_pdf = 0.0;
+    components.ris_pdf_ratio = 0.0;
     components.first_local_pos = vec3(0.0);
     components.bounce_count = 0u;
     components.instance_id = 0xffffffffu;
     components.mesh_id = 0xffffffffu;
 
     bool previousWasBrdfSample = false;
+    uint previousEventType = PATH_EVENT_NONE;
     float previousBrdfPdf = 0.0;
     vec3 previousSampleOrigin = vec3(0.0);
     vec3 prevHitPos = ray.origin;
@@ -501,7 +532,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     first_position = vec3(0.0);
 
     uint bounceLimit = camera.path_tracing_enabled != 0u ? max(camera.max_bounces, 1u) : 1u;
+    uint rrStartDepth = clamp(camera.max_bounces / 2u, 3u, 5u);
     for (uint bounce = 0u; bounce < bounceLimit; ++bounce) {
+        rng ^= sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_PATH_SEED);
         RayPayload hit = trace_surface(ray.origin, ray.direction, 0.001, 10000.0);
         if (hit.hit == 0u) {
             const uint envQuality = bounce == 0u ? ATMOSPHERE_RAY_QUALITY_FULL : ATMOSPHERE_RAY_QUALITY_FAST;
@@ -511,12 +544,22 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 sky *= env_params.background_intensity;
             }
             vec3 env = throughput * (sky + sunDisk);
-            if (previousWasBrdfSample && env_params.enabled != 0u && debug_params.view != 27u) {
+            if (previousEventType == PATH_EVENT_BSDF && previousWasBrdfSample && env_params.enabled != 0u && debug_params.view != 27u) {
                 float envPdf = environment_pdf(ray.direction);
                 if (envPdf > 1e-6) {
-                    env = throughput * (sky * power_heuristic(previousBrdfPdf, envPdf) + sunDisk);
+                    float skyWeight = power_heuristic(previousBrdfPdf, envPdf);
+                    float sunPdf = analytical_sun_pdf(ray.direction);
+                    float sunWeight = sunPdf > 1e-6 ? power_heuristic(previousBrdfPdf, sunPdf) : 1.0;
+                    env = throughput * (sky * skyWeight + sunDisk * sunWeight);
+                    if (sunPdf > 1e-6 && luminance(sunDisk) > 0.0) {
+                        components.sun_mis_weight = sunWeight;
+                        components.sun_light_pdf = sunPdf;
+                        components.sun_previous_bsdf_pdf = previousBrdfPdf;
+                    }
                 }
             }
+            float envContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
+            env *= envContributionScale;
             radiance += env;
             if (bounce > 0u) {
                 components.indirect_light += env;
@@ -549,20 +592,24 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
 
         if (bounce == 0u && debug_params.view == 24u) {
             float testPdf;
-            vec3 testDir = sample_cosine_hemisphere(rng, hit.normal, testPdf);
+            uint envTestRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_ENVIRONMENT);
+            vec3 testDir = sample_cosine_hemisphere(envTestRng, hit.normal, testPdf);
             RayPayload testHit = trace_surface(hit.world_pos + hit.normal * shadow_self_hit_epsilon(), normalize(testDir), shadow_self_hit_epsilon(), 10000.0);
             components.secondary_env_miss = testHit.hit == 0u ? 1.0 : 0.0;
             return vec3(components.secondary_env_miss);
         }
         if (bounce == 0u && debug_params.view == 26u) {
             float testPdf;
-            vec3 testDir = sample_cosine_hemisphere(rng, hit.normal, testPdf);
+            uint envTestRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_ENVIRONMENT + 2u);
+            vec3 testDir = sample_cosine_hemisphere(envTestRng, hit.normal, testPdf);
             RayPayload testHit = trace_surface(hit.world_pos + hit.normal * shadow_self_hit_epsilon(), normalize(testDir), shadow_self_hit_epsilon(), 10000.0);
             components.secondary_env_radiance = testHit.hit == 0u ? environment_radiance(normalize(testDir), ATMOSPHERE_RAY_QUALITY_FAST) : vec3(0.0);
             return debug_display_tonemap(components.secondary_env_radiance);
         }
 
-        if (length(material.emissive) > 0.0) {
+        vec3 wo = -ray.direction;
+        bool hitEmissiveSurface = length(material.emissive) > 0.0;
+        if (hitEmissiveSurface) {
             vec3 emit = throughput * material.emissive * atmosTransmittance;
             if (previousWasBrdfSample) {
                 float lightPdf = emissive_hit_pdf(hit, material, previousSampleOrigin);
@@ -570,22 +617,36 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     emit *= power_heuristic(previousBrdfPdf, lightPdf);
                 }
             }
+            emit *= bounce > 0u ? camera.indirect_strength : 1.0;
             radiance += emit;
             if (bounce > 0u) {
                 components.indirect_light += emit;
             }
             components.emissive_light += emit;
-            break;
         }
 
-        vec3 wo = -ray.direction;
         vec3 emissiveDirect;
         vec3 envDirect;
         float lightPdf;
+        float rawLightPdf;
+        float effectiveLightPdf;
         float bsdfPdfForLight;
         float misWeight;
         uint directSampleType;
-        vec3 direct = throughput * estimate_direct_lighting(rng, hit, material, wo, emissiveDirect, envDirect, lightPdf, bsdfPdfForLight, misWeight, directSampleType);
+        vec3 direct = vec3(0.0);
+        emissiveDirect = vec3(0.0);
+        envDirect = vec3(0.0);
+        lightPdf = 0.0;
+        rawLightPdf = 0.0;
+        effectiveLightPdf = 0.0;
+        bsdfPdfForLight = 0.0;
+        misWeight = 0.0;
+        directSampleType = 0u;
+        if (!hitEmissiveSurface) {
+            uint directRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_LIGHT_SELECT);
+            direct = throughput * estimate_direct_lighting(directRng, hit, material, wo, emissiveDirect, envDirect, lightPdf, rawLightPdf, effectiveLightPdf, bsdfPdfForLight, misWeight, directSampleType);
+            rng ^= directRng;
+        }
         vec3 shadedDirect = direct;
         if (bounce == 0u && restir_mode() != 0u) {
             uint packedFirstVel = compute_surface_velocity(hit.world_pos, hit.local_pos, hit.instance_id, dims);
@@ -611,19 +672,29 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 shadedDirect = previousReservoir.sample_value_confidence.rgb;
             }
         }
-        radiance += shadedDirect * atmosTransmittance;
+        float bounceContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
+        vec3 scaledShadedDirect = shadedDirect * atmosTransmittance * bounceContributionScale;
+        radiance += scaledShadedDirect;
         if (bounce == 0u) {
-            components.direct_light += shadedDirect * atmosTransmittance;
+            components.direct_light += scaledShadedDirect;
             components.restir_initial_direct_light += direct * atmosTransmittance;
             components.first_light_pdf = lightPdf;
             components.first_bsdf_pdf = bsdfPdfForLight;
             components.first_mis_weight = misWeight;
             components.first_direct_sample_type = directSampleType;
+            components.ris_raw_light_pdf = rawLightPdf;
+            components.ris_effective_light_pdf = effectiveLightPdf;
+            components.ris_pdf_ratio = rawLightPdf > 1.0e-6 ? effectiveLightPdf / rawLightPdf : 0.0;
+            if (directSampleType == 3u) {
+                components.sun_mis_weight = misWeight;
+                components.sun_light_pdf = lightPdf;
+                components.sun_previous_bsdf_pdf = bsdfPdfForLight;
+            }
         } else {
-            components.indirect_light += shadedDirect * atmosTransmittance;
+            components.indirect_light += scaledShadedDirect;
         }
-        components.emissive_light += throughput * emissiveDirect * atmosTransmittance;
-        components.environment_light += throughput * envDirect * atmosTransmittance;
+        components.emissive_light += throughput * emissiveDirect * atmosTransmittance * bounceContributionScale;
+        components.environment_light += throughput * envDirect * atmosTransmittance * bounceContributionScale;
 
         if (camera.path_tracing_enabled == 0u) {
             vec3 previewNormal = normalize(hit.geom_normal);
@@ -634,44 +705,54 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 float ndl = max(dot(previewNormal, sunDir), 0.0);
                 previewSun = throughput * material.color * (1.0 / PI) * analytical_sun_center_radiance() * analytical_sun_solid_angle() * sun_transmittance(hit.world_pos, sunDir) * ndl;
             }
-            radiance += previewSun * atmosTransmittance;
-            components.direct_light += previewSun * atmosTransmittance;
-            radiance += previewAmbient * atmosTransmittance;
-            components.indirect_light += previewAmbient * atmosTransmittance;
+            vec3 scaledPreviewSun = previewSun * atmosTransmittance * bounceContributionScale;
+            vec3 scaledPreviewAmbient = previewAmbient * atmosTransmittance * bounceContributionScale;
+            radiance += scaledPreviewSun;
+            components.direct_light += scaledPreviewSun;
+            radiance += scaledPreviewAmbient;
+            components.indirect_light += scaledPreviewAmbient;
             break;
         }
 
         previousWasBrdfSample = false;
+        previousEventType = PATH_EVENT_NONE;
         previousBrdfPdf = 0.0;
-        if (material.mat_type == 1u) {
-            vec3 reflected = reflect(ray.direction, hit.normal);
-            ray.direction = normalize(reflected + material.roughness * rand_unit_vector(rng));
+        bool continuedPath = false;
+        if (material.mat_type == 1u && material_is_delta(material)) {
+            ray.direction = normalize(reflect(ray.direction, hit.normal));
             if (dot(ray.direction, hit.normal) <= 0.0) {
                 break;
             }
             ray.origin = hit.world_pos + hit.normal * shadow_self_hit_epsilon();
-            throughput *= material.color * camera.indirect_strength;
+            throughput *= material.color;
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
-        } else if (material.mat_type == 2u) {
+            previousEventType = PATH_EVENT_DELTA;
+            continuedPath = true;
+        } else if (material.mat_type == 2u && material_is_delta(material)) {
             float refractionRatio = hit.front_face != 0u ? (1.0 / max(material.ior, 1.01)) : max(material.ior, 1.01);
             vec3 unitDirection = normalize(ray.direction);
             float cosTheta = min(dot(-unitDirection, hit.normal), 1.0);
             float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
             bool cannotRefract = refractionRatio * sinTheta > 1.0;
-            vec3 scatteredDirection = (cannotRefract || reflectance(cosTheta, refractionRatio) > rand_f32(rng))
+            float dielectricSample = sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_DIELECTRIC);
+            vec3 scatteredDirection = (cannotRefract || reflectance(cosTheta, refractionRatio) > dielectricSample)
                 ? reflect(unitDirection, hit.normal)
                 : refract(unitDirection, hit.normal, refractionRatio);
             ray.direction = normalize(scatteredDirection);
             ray.origin = hit.world_pos + (dot(ray.direction, hit.normal) > 0.0 ? hit.normal : -hit.normal) * shadow_self_hit_epsilon();
-            throughput *= material.color * camera.indirect_strength;
+            throughput *= material.color;
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
+            previousEventType = PATH_EVENT_DELTA;
+            continuedPath = true;
         } else {
             float bsdfPdf;
-            vec3 wi = sample_brdf(rng, material, wo, hit.normal, bsdfPdf);
+            uint bsdfRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_BSDF);
+            vec3 wi = sample_brdf(bsdfRng, material, wo, hit.normal, bsdfPdf);
+            rng ^= bsdfRng;
             float cosTheta = max(dot(hit.normal, wi), 0.0);
             if (bsdfPdf < 1e-6 || cosTheta <= 0.0) {
                 break;
@@ -680,20 +761,27 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             ray.origin = hit.world_pos + hit.normal * shadow_self_hit_epsilon();
             ray.direction = normalize(wi);
             previousWasBrdfSample = true;
+            previousEventType = PATH_EVENT_BSDF;
             previousBrdfPdf = bsdfPdf;
             previousSampleOrigin = ray.origin;
-            throughput *= bsdf * cosTheta / max(bsdfPdf, 1e-6) * camera.indirect_strength;
+            throughput *= bsdf * cosTheta / max(bsdfPdf, 1e-6);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
+            continuedPath = true;
+        }
+
+        if (hitEmissiveSurface && continuedPath && bounce + 1u < bounceLimit) {
+            components.emissive_continuation = 1.0;
         }
 
         prevHitPos = hit.world_pos;
         prevRayDir = ray.direction;
 
-        if (bounce > 2u && debug_params.view != 27u) {
-            float p = clamp(max(max(throughput.r, throughput.g), throughput.b), 0.05, 0.95);
-            if (rand_f32(rng) > p) {
+        uint completedDepth = bounce + 1u;
+        if (completedDepth >= rrStartDepth && completedDepth < bounceLimit && debug_params.view != 27u) {
+            float p = clamp(luminance(throughput), russian_roulette_min_survival(), 0.95);
+            if (sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_RUSSIAN_ROULETTE) > p) {
                 break;
             }
             throughput /= p;
@@ -732,8 +820,7 @@ void main() {
     }
 
     uint pixel_index = pixel.y * size.x + pixel.x;
-    vec2 blue = blue_noise_2d(ivec2(pixel), camera.temporal_frame_index);
-    uint rng = pcg_hash(pixel_index + camera.temporal_frame_index * 9781u + uint(blue.x * 65536.0));
+    uint rng = sample_dimension_seed(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_PATH_SEED);
     vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
     vec2 uv = (vec2(pixel) + jitter) / vec2(size);
     vec2 ndc = uv * 2.0 - vec2(1.0);
@@ -768,13 +855,9 @@ void main() {
     velocity_buffer[pixel_index] = packedVelocity;
     store_initial_restir_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
 
-    vec2 pick_uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
-    vec2 pick_ndc = pick_uv * 2.0 - vec2(1.0);
-    Ray pick_ray;
-    pick_ray.origin = camera.pos.xyz;
-    pick_ray.direction = normalize(camera.forward.xyz + camera.right.xyz * pick_ndc.x * aspect * scale - camera.up.xyz * pick_ndc.y * scale);
-    RayPayload pick_hit = trace_surface_with_mode(pick_ray.origin, pick_ray.direction, 0.001, 10000.0, 1u);
-    entity_id_buffer[pixel_index] = pick_hit.hit != 0u ? pick_hit.instance_id : 0xffffffffu;
+    entity_id_buffer[pixel_index] = did_hit && components.instance_id != 0xffffffffu
+        ? components.instance_id
+        : 0xffffffffu;
 
     vec3 output_value = average;
     if (debug_params.view == 2u) {
@@ -846,6 +929,29 @@ void main() {
         output_value = vec3(clamp(restir_reservoirs[pixel_index].sample_value_confidence.a, 0.0, 1.0));
     } else if (debug_params.view == 37u) {
         output_value = vec3(clamp(restir_reservoirs[pixel_index].target_pdf_weight_sum_m.z, 0.0, 1.0));
+    } else if (debug_params.view == 38u) {
+        output_value = components.emissive_continuation > 0.0 ? vec3(0.05, 0.95, 0.35) : vec3(0.0);
+    } else if (debug_params.view == 39u) {
+        output_value = vec3(clamp(components.sun_mis_weight, 0.0, 1.0));
+    } else if (debug_params.view == 40u) {
+        output_value = vec3(clamp(log2(max(components.sun_light_pdf, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 41u) {
+        output_value = vec3(clamp(log2(max(components.sun_previous_bsdf_pdf, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 42u) {
+        output_value = vec3(clamp(log2(max(components.ris_raw_light_pdf, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 43u) {
+        output_value = vec3(clamp(log2(max(components.ris_effective_light_pdf, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 44u) {
+        output_value = vec3(clamp(log2(max(components.ris_pdf_ratio, 0.0) + 1.0) / 8.0, 0.0, 1.0));
+    } else if (debug_params.view == 45u) {
+        vec2 s = sample_dimension_2d(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_DEBUG);
+        output_value = vec3(s, sample_dimension_1d(ivec2(pixel), camera.temporal_frame_index, 1u, SAMPLE_DIM_DEBUG + 2u));
+    } else if (debug_params.view == 46u) {
+        uint seed = sample_dimension_seed(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_DEBUG);
+        output_value = vec3(
+            sample_uint_to_unit_float(seed),
+            sample_uint_to_unit_float(sample_hash_combine(seed, 17u)),
+            sample_uint_to_unit_float(sample_hash_combine(seed, 31u)));
     }
     imageStore(output_color, ivec2(pixel), vec4(output_value, 1.0));
 }

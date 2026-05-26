@@ -38,6 +38,7 @@ struct EditorPanelVisibility {
 struct EditorViewportState {
     VkDescriptorSet texture = VK_NULL_HANDLE;
     VkExtent2D renderExtent{};
+    VkExtent2D displayExtent{};
     glm::vec2 imageOrigin{};
     glm::vec2 imageSize{};
     glm::vec2 mousePosition{};
@@ -178,7 +179,7 @@ struct EditorRequests {
     std::optional<std::string> removeFavorite;
 };
 
-[[nodiscard]] const std::array<RendererDebugView, 34>& editorDebugViews();
+[[nodiscard]] const std::array<RendererDebugView, 43>& editorDebugViews();
 [[nodiscard]] int editorDebugViewIndex(RendererDebugView view);
 void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& changed);
 void requestSettings(EditorRequests& requests, const RendererSettings& settings);

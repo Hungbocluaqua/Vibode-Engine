@@ -366,9 +366,12 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"accumulate", renderSettings_.accumulate},
         {"accumulationLimit", renderSettings_.accumulationLimit},
         {"resolutionScale", renderSettings_.resolutionScale},
+        {"materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy},
         {"shadowRayBias", renderSettings_.shadowRayBias},
         {"shadowDistanceBias", renderSettings_.shadowDistanceBias},
         {"fireflyClamp", renderSettings_.fireflyClamp},
+        {"adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)},
+        {"adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs},
         {"usePhysicalCamera", renderSettings_.usePhysicalCamera},
         {"physicalAperture", renderSettings_.physicalAperture},
         {"physicalShutterSeconds", renderSettings_.physicalShutterSeconds},
@@ -526,9 +529,12 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.accumulate = render.value("accumulate", renderSettings_.accumulate);
         renderSettings_.accumulationLimit = render.value("accumulationLimit", renderSettings_.accumulationLimit);
         renderSettings_.resolutionScale = render.value("resolutionScale", renderSettings_.resolutionScale);
+        renderSettings_.materialTextureAnisotropy = render.value("materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy);
         renderSettings_.shadowRayBias = render.value("shadowRayBias", renderSettings_.shadowRayBias);
         renderSettings_.shadowDistanceBias = render.value("shadowDistanceBias", renderSettings_.shadowDistanceBias);
         renderSettings_.fireflyClamp = render.value("fireflyClamp", renderSettings_.fireflyClamp);
+        renderSettings_.adaptiveQualityMode = static_cast<AdaptiveQualityMode>(render.value("adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)));
+        renderSettings_.adaptiveGpuFrameTargetMs = render.value("adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs);
         renderSettings_.usePhysicalCamera = render.value("usePhysicalCamera", renderSettings_.usePhysicalCamera);
         renderSettings_.physicalAperture = render.value("physicalAperture", renderSettings_.physicalAperture);
         renderSettings_.physicalShutterSeconds = render.value("physicalShutterSeconds", renderSettings_.physicalShutterSeconds);

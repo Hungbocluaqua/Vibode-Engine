@@ -71,7 +71,7 @@ Phases 49-54 are treated as architecture and memory hardening before OMM, wavefr
 
 Goal: remove known correctness errors that bias the path tracer or waste trivial GPU work.
 
-### Phase 1: Continue Paths After Emissive Hits
+### Phase 1: Continue Paths After Emissive Hits [DONE]
 
 Target files:
 
@@ -92,7 +92,14 @@ Acceptance criteria:
 - No energy spike from double-counting emissive direct light.
 - Cornell box with emissive ceiling converges without dark secondary bounce loss.
 
-### Phase 2: Fix Delta Classification Roughness Check
+Implementation notes:
+
+- `shaders/pathtrace.rgen` now contributes hit emission without unconditionally terminating the path.
+- Direct-light NEE is skipped on the emissive hit itself to avoid self-light double counting; subsequent BSDF continuation updates the usual next-hit MIS state.
+- Added `emissive-continuation` debug view (`RendererDebugView::EmissiveContinuation`, value 38) to color paths that hit emissive geometry and successfully continue.
+- Verified `glslangValidator`, Debug build, Release build, and a 3-frame Debug smoke run with `--debug-view emissive-continuation`.
+
+### Phase 2: Fix Delta Classification Roughness Check [DONE]
 
 Target files:
 
@@ -113,7 +120,15 @@ Acceptance criteria:
 - Roughness `0.001` and above use glossy sampling/PDF logic.
 - No NaN or firefly increase on near-perfect mirrors.
 
-### Phase 3: Remove Double Fresnel From Multi-Scatter Compensation
+Implementation notes:
+
+- Added `MATERIAL_DELTA_ROUGHNESS_THRESHOLD = 0.001` and `material_is_delta(...)` in `shaders/rt_common.glsl`.
+- Texture roughness is preserved down to `0.0`; GGX numerical stability now uses `ggx_safe_roughness(...)` separately.
+- Direct-light delta skipping and path-scatter delta branches now use the threshold; rough specular surfaces fall through to glossy BRDF sampling/PDF.
+- True delta lobes return zero from `pdf_brdf(...)`, keeping MIS from treating them as area-sampled glossy events.
+- Verified with `glslangValidator`, Debug build, Release build, and a 3-frame Debug smoke run with `--debug-view roughness`.
+
+### Phase 3: Remove Double Fresnel From Multi-Scatter Compensation [DONE]
 
 Target files:
 
@@ -132,7 +147,12 @@ Acceptance criteria:
 - Metals do not darken incorrectly at grazing angles.
 - Multi-scatter compensation remains bounded for roughness near 1.
 
-### Phase 4: Remove `indirect_strength` From Russian Roulette Decisions
+Implementation notes:
+
+- `heitz_ms_ggx(...)` already includes average Fresnel through `f_avg`; `eval_ggx_brdf(...)` now adds the returned multi-scatter term directly instead of multiplying by Schlick Fresnel again.
+- Verified with `glslangValidator`, Debug build, Release build, and a 3-frame Debug beauty smoke run.
+
+### Phase 4: Remove `indirect_strength` From Russian Roulette Decisions [DONE]
 
 Target files:
 
@@ -153,7 +173,14 @@ Acceptance criteria:
 - GPU time is stable when varying `indirect_strength`.
 - No biased brightness shift in scenes with low indirect strength.
 
-### Phase 5: MIS-Weight Sun Disk Hits
+Implementation notes:
+
+- Removed `camera.indirect_strength` from path throughput updates in `shaders/pathtrace.rgen`.
+- Applied `indirect_strength` only when adding non-primary-bounce lighting contributions to radiance and debug components.
+- Russian roulette now uses physical throughput rather than the artistic indirect multiplier.
+- Verified with `glslangValidator`, Debug build, Release build, and a 3-frame Debug beauty smoke run.
+
+### Phase 5: MIS-Weight Sun Disk Hits [DONE]
 
 Target files:
 
@@ -178,7 +205,14 @@ Acceptance criteria:
 - No double-bright sun highlight when both BSDF and light sampling can hit the disk.
 - Outdoor HDR scene converges with fewer sun fireflies.
 
-### Phase 6: Use Effective RIS PDF For MIS
+Implementation notes:
+
+- Added `analytical_sun_pdf(...)` in `shaders/rt_common.glsl` so explicit sun sampling and BSDF/environment-miss sun hits share the same solid-angle PDF.
+- `shaders/pathtrace.rgen` now tracks previous path event type (`BSDF` vs `DELTA`) and applies `power_heuristic(previousBsdfPdf, sunPdf)` when a non-delta BSDF ray misses into the analytical sun disk.
+- Added sun-specific debug state and debug views: `sun-mis-weight`, `sun-light-pdf`, and `sun-previous-bsdf-pdf`.
+- Verified with `glslangValidator`, Debug build, Release build, and a 3-frame Debug smoke run with `--debug-view sun-mis-weight`.
+
+### Phase 6: Use Effective RIS PDF For MIS [DONE]
 
 Target files:
 
@@ -203,7 +237,15 @@ Acceptance criteria:
 - Changing RIS candidate count changes variance, not mean brightness.
 - No brightness shift between RIS disabled and RIS enabled after enough samples.
 
-### Phase 15: Lower GGX Roughness Floor
+Implementation notes:
+
+- The emissive RIS path now computes `effectiveLightPdf = rawLightPdf * candidateCount * selectedProxy / proxyWeightSum`.
+- MIS and the direct-light contribution divide use the effective RIS PDF rather than the raw proposal PDF.
+- First-bounce ReSTIR reservoir payloads receive the effective direct-light PDF through `components.first_light_pdf`.
+- Added debug views: `ris-raw-light-pdf`, `ris-effective-light-pdf`, and `ris-pdf-ratio`.
+- Verified with `glslangValidator`, Debug build, Release build, and a 3-frame Debug smoke run with `--debug-view ris-effective-light-pdf`.
+
+### Phase 15: Lower GGX Roughness Floor [DONE]
 
 Target files:
 
@@ -222,7 +264,13 @@ Acceptance criteria:
 - No NaN/Inf pixels in a roughness-0 validation scene.
 - Denoiser does not smear sharp reflections more than before.
 
-### Phase 46: Enable Anisotropic Texture Filtering
+Implementation notes:
+
+- Lowered `MATERIAL_MIN_GGX_ROUGHNESS` in `shaders/rt_common.glsl` from `0.02` to `0.001`.
+- Kept the existing denominator guards in GGX D, G, PDF, and sampling functions.
+- Verified with `glslangValidator`, Debug build, Release build, and a 3-frame Debug smoke run with `--debug-view roughness`.
+
+### Phase 46: Enable Anisotropic Texture Filtering [DONE]
 
 Target files:
 
@@ -245,11 +293,21 @@ Acceptance criteria:
 - Validation layers report sampler feature usage as valid.
 - Unsupported devices run without crashing.
 
+Implementation notes:
+
+- `VulkanContext` now queries `samplerAnisotropy`, enables it at device creation when supported, and exposes the device max anisotropy.
+- `ResourceAllocator` carries sampler-anisotropy support and max anisotropy to resource creation code.
+- Added `RendererSettings::materialTextureAnisotropy`, scene JSON persistence, and a Render Settings UI slider for material texture anisotropy.
+- Material texture samplers in `GpuScene` now use the renderer-controlled anisotropy level, clamp to the device limit, and fall back to 1x when unsupported.
+- `GpuScene` recreates material samplers when the anisotropy setting changes and defers destruction of retired samplers until enough frames have passed for in-flight descriptor use to finish.
+- Combined image sampler descriptors now use the per-texture sampler array when available, preserving imported sampler state while applying the anisotropy level.
+- Verified Debug build, Release build, and a 3-frame Debug smoke run.
+
 ## Batch 2: Quick Wins
 
 Goal: improve frame responsiveness and sampling quality without changing architecture.
 
-### Phase 7: Clamp Delta Time
+### Phase 7: Clamp Delta Time [DONE]
 
 Target files:
 
@@ -269,7 +327,15 @@ Acceptance criteria:
 - Window drag, breakpoint resume, and shader compile stalls do not cause huge camera jumps.
 - Adaptive quality does not enter a long feedback loop after one slow frame.
 
-### Phase 8: Increase Frames In Flight From 2 To 3
+Implementation notes:
+
+- `Application` now computes both raw and clamped frame delta; raw frame time remains visible in the editor/profiler UI, while runtime controls and renderer frame timing use the clamped value.
+- Added `RendererSettings::maxFrameDeltaSeconds` with a default clamp of `1/30s`, sanitized in `PathTracerRenderer::applySettings`.
+- `CameraController` defensively clamps its input delta to `1/30s` before applying keyboard movement.
+- Auto-exposure adaptation receives the clamped frame delta through `PathTracerRenderer::setFrameDeltaSeconds`.
+- Verified Debug build, Release build, and a 3-frame Debug smoke run.
+
+### Phase 8: Increase Frames In Flight From 2 To 3 [DONE]
 
 Target files:
 
@@ -293,7 +359,16 @@ Acceptance criteria:
 - CPU frame time improves or remains stable.
 - Accumulation does not reset incorrectly every third frame.
 
-### Phase 9: Eliminate Per-Frame Picking Ray
+Implementation notes:
+
+- Increased `CommandSystem::framesInFlight` from 2 to 3, giving the command pools, command buffers, acquire semaphores, and fences three independent frame slots.
+- `PathTracerRenderer` now allocates three per-frame descriptor/uniform resources and three GPU profiler query sets.
+- Updated `PipelineDemo` to three per-frame descriptor/uniform resources as part of the frame-resource aliasing audit.
+- Accumulation continues to use logical sample/frame counters (`frameCount_` and `temporalFrameIndex_`) rather than the modulo frame-resource index.
+- Resize and swapchain recreation paths still use device-idle waits, which cover all frame fences for this phase.
+- Verified Debug build, Release build, and a 5-frame Debug smoke run to exercise frame slot wraparound.
+
+### Phase 9: Eliminate Per-Frame Picking Ray [DONE]
 
 Target files:
 
@@ -318,11 +393,14 @@ Acceptance criteria:
 - Click selection still works on opaque and alpha-tested geometry.
 - GPU time improves in path tracing by the expected small percentage.
 
-Implementation note:
+Implementation notes:
 
-- Completed by reusing the alpha-tested primary visibility result for the entity-id buffer instead of tracing a second per-pixel picking ray. A dedicated asynchronous click/request dispatch remains deferred to Phase 52.
+- Completed by reusing the alpha-tested primary visibility result for the entity-id buffer instead of tracing a second per-pixel picking ray.
+- `shaders/pathtrace.rgen` now writes `entity_id_buffer` from the first path-trace hit stored in `PathComponents`.
+- Existing editor click selection continues to read the latest entity-id buffer; a dedicated asynchronous click/request dispatch remains deferred to Phase 52.
+- Verified Debug build, Release build, and a 5-frame Debug smoke run.
 
-### Phase 10: Precompute Normal Matrices
+### Phase 10: Precompute Normal Matrices [DONE]
 
 Target files:
 
@@ -345,7 +423,15 @@ Acceptance criteria:
 - Non-uniformly scaled meshes shade correctly.
 - Shader instruction count decreases.
 
-### Phase 14: VNDF Sampling For GGX
+Implementation notes:
+
+- Added `normalTransform` to `GpuInstanceRecord` and `normal_transform` to the GLSL `InstanceRecord` layout.
+- `makeInstanceRecord(...)` now computes the inverse transform once and stores the CPU-side inverse-transpose normal transform for scene upload and transform refit paths.
+- GPU cache restore reconstructs `normalTransform` from cached inverse transforms, so existing cache data can still load through the new GPU layout.
+- Replaced shader-side `transpose(mat3(instance.inverse_transform))` reconstruction in closest-hit, primary any-hit, shadow any-hit, and emissive-light sampling with `mat3(instance.normal_transform)`.
+- Verified Debug build, Release build, a 5-frame Debug normals smoke run, and a 5-frame Debug normals run against `scenes/validation/transform_stress.rtlevel`.
+
+### Phase 14: VNDF Sampling For GGX [DONE]
 
 Target files:
 
@@ -366,7 +452,15 @@ Acceptance criteria:
 - No brightness shift in rough metal scenes.
 - PDF and eval functions are measure-consistent.
 
-### Phase 16: Height-Correlated Smith G2
+Implementation notes:
+
+- Added tangent-frame helpers and an isotropic Heitz visible-normal GGX sampler in `shaders/rt_common.glsl`.
+- `sample_ggx_brdf(...)` now samples visible GGX normals in the view-aligned stretched space and reflects around the sampled half-vector.
+- `pdf_ggx_brdf(...)` now evaluates the matching visible-normal reflection PDF, `D(h) * G1(v) / (4 * NdotV)`, instead of the old NDF half-vector PDF.
+- The existing Phase 2 delta path remains outside `sample_brdf(...)`, so roughness below `0.001` still uses the explicit delta reflection/refraction branches.
+- Verified Debug build, Release build, a 5-frame Debug beauty smoke run, and a 5-frame Debug run against `scenes/validation/material_grid.rtlevel`.
+
+### Phase 16: Height-Correlated Smith G2 [DONE]
 
 Target files:
 
@@ -384,7 +478,14 @@ Acceptance criteria:
 - Specular lobe shape matches expected GGX behavior.
 - Energy remains bounded in furnace tests.
 
-### Phase 17: Diffuse Energy Compensation
+Implementation notes:
+
+- Added `smith_ggx_lambda(...)` and replaced the uncorrelated `smith_g1(v) * smith_g1(l)` product with height-correlated Smith `G2 = 1 / (1 + lambdaV + lambdaL)`.
+- Kept `smith_g1(...)` for the Phase 14 VNDF visible-normal PDF, where the sampled visible-normal distribution still needs the view masking term.
+- Retained numerical guards for low `NdotV`, low `NdotL`, and near-zero tangent denominators.
+- Verified Debug build, Release build, and a 5-frame Debug material-grid beauty run.
+
+### Phase 17: Diffuse Energy Compensation [DONE]
 
 Target files:
 
@@ -403,7 +504,15 @@ Acceptance criteria:
 - Dielectrics do not exceed unit energy.
 - Diffuse albedo remains visually stable for low-specular materials.
 
-### Phase 29: Reduce Environment Samples
+Implementation notes:
+
+- Added shared PBR helpers for `f0`, Schlick average Fresnel, and diffuse energy allocation in `shaders/rt_common.glsl`.
+- Mixed diffuse/specular BRDF evaluation now scales the diffuse term by `(1 - averageFresnel) * (1 - metallic)` instead of using the half-vector Fresnel term directly.
+- The diffuse/specular sampling probability now uses the same compensated diffuse energy term, while keeping view Fresnel for the specular sampling weight.
+- Pure diffuse material closures remain unchanged.
+- Verified Debug build, Release build, and a 5-frame Debug material-grid beauty run.
+
+### Phase 29: Reduce Environment Samples [DONE]
 
 Target files:
 
@@ -423,7 +532,15 @@ Acceptance criteria:
 - GPU time drops in environment-lit scenes.
 - Variance increase is acceptable and preferably offset by RIS/ReSTIR.
 
-### Phase 30: Tune Russian Roulette
+Implementation notes:
+
+- `RendererSettings`, `RenderSettings`, and `CameraUniform` default `environmentDirectSamples` to `1`.
+- The Render Settings panel exposes a user-configurable `Environment Samples` slider from `1` to `8` for profiling.
+- `shaders/pathtrace.rgen` clamps `camera.environment_direct_samples` to `1..8`, loops over that count, divides the accumulated contribution by the sample count, and keeps MIS PDFs in solid-angle measure for each environment sample.
+- First-sample environment PDFs continue to populate the direct-light debug/ReSTIR payload fields through `sampledLightPdf`, `sampledBsdfPdf`, and `sampledMisWeight`.
+- Verified as part of the Phase 17 Debug/Release builds and material-grid smoke run.
+
+### Phase 30: Tune Russian Roulette [DONE]
 
 Target files:
 
@@ -442,11 +559,20 @@ Acceptance criteria:
 - 5-15 percent GPU reduction in bounce-heavy scenes.
 - No measurable mean brightness bias.
 
+Implementation notes:
+
+- Added `RendererSettings::russianRouletteMinSurvival` with a default of `0.10`, clamped in `PathTracerRenderer::applySettings`.
+- Stored the RR minimum survival value in `CameraUniform::renderControls.w`.
+- `shaders/pathtrace.rgen` now derives RR start depth from `max_bounces` (`max_bounces / 2`, clamped to path depths 3-5) and skips RR on the final possible bounce.
+- Survival probability now uses physical throughput luminance with the configured minimum clamp and a `0.95` maximum, replacing the previous max-RGB survival heuristic.
+- Throughput is divided by the survival probability only after the path survives.
+- Verified Debug build, Release build, and a 5-frame Debug smoke run with `--debug-view path-length`.
+
 ## Batch 3: Core Performance
 
 Goal: improve sample quality, denoiser cost, and interactive responsiveness.
 
-### Phase 13: Sobol, Owen Scrambling, And STBN
+### Phase 13: Sobol, Owen Scrambling, And STBN [DONE]
 
 Target files:
 
@@ -473,15 +599,17 @@ Acceptance criteria:
 
 Implementation notes:
 
-- Added a shared shader sampling API in `blue_noise.glsl` with fixed dimension IDs, Sobol-style low-discrepancy values, Owen-style scrambling, and procedural spatiotemporal blue-noise rotation.
-- Routed path-tracing light selection, light-surface sampling, ReSTIR candidate selection, environment sampling, sun sampling, BSDF sampling, dielectric decisions, and Russian roulette through dimensioned samples.
-- Routed ReSTIR RIS initialization and spatial neighbor offsets through the shared sampler.
-- Added sample-dimension and sample-scramble debug views.
+- Added a shared shader sampling API in `blue_noise.glsl` with fixed dimension IDs, Sobol-style low-discrepancy values, Owen-style hash scrambling, and procedural spatiotemporal blue-noise rotation.
+- Routed path-tracing seed setup, direct-light sampling, environment debug samples, BSDF sampling, dielectric decisions, and Russian roulette through fixed dimension streams.
+- Routed ReSTIR RIS candidate selection and reservoir acceptance through the shared sampler.
+- Routed ReSTIR spatial neighbor offsets through the shared sampler using frame-indexed dimensions.
+- Added sample-dimension and sample-scramble debug views to the renderer enum, parser, editor combo, and raygen debug output.
 - Kept CPU-provided TAA jitter as the camera ray offset so motion vectors and reprojection remain consistent with existing uniforms.
-- Performance follow-up: the heavy Sobol/Owen implementation is now opt-in with `RTV_USE_HEAVY_SOBOL_SAMPLER=1`; the default path uses a cheaper dimensioned hash plus blue-noise rotation to avoid per-sample loop cost in raygen.
-- Precomputed-data follow-up: the opt-in sampler now uses a static Sobol direction table and precomputed digital scramble masks, avoiding procedural direction-number construction and multi-round scramble hashes in shader hot paths.
+- Verified Debug build, beauty smoke, sample-dimension smoke, sample-scramble smoke, and a ReSTIR smoke run.
+- Added `RTV_USE_DIMENSIONED_SAMPLER=0` as a shader compile toggle for comparing against the cheaper hash-based dimension fallback. The shader compiler now tracks shader option signatures so define changes force SPIR-V recompilation.
+- Local 150-frame Debug Cornell smoke at frame 120: dimensioned sampler on `path=8.56 ms`, fallback sampler `path=8.47 ms`. Treat this as a quick spot check rather than a final benchmark.
 
-### Phase 18: Denoiser Shared Memory Optimization
+### Phase 18: Denoiser Shared Memory Optimization [DONE]
 
 Target files:
 
@@ -503,12 +631,15 @@ Acceptance criteria:
 
 Implementation notes:
 
-- Added `RTV_DENOISER_SHARED_TILE` as a shader define with a global-memory fallback path. The fallback is the default after local testing showed the shared-tile path was neutral on the current scene/GPU.
+- Added `RTV_DENOISER_SHARED_TILE` as a shader define with a global-memory fallback path.
 - Tiles the first 5x5 A-trous pass into 20x20 workgroup shared memory for color and packed depth/normal reads.
 - Keeps later wider-step A-trous passes on the original global-memory path to avoid oversized shared-memory tiles.
 - Handles partial workgroups by loading shared tiles before the in-bounds return so barriers remain valid at image edges.
+- Verified Debug build and a 5-frame Debug smoke run with the beauty view.
+- `RTV_DENOISER_SHARED_TILE=0` can compile the original global-memory path for A/B profiling.
+- Local 150-frame Debug Cornell smoke at frame 120: shared-tile denoiser `denoise=0.258 ms`, global-memory fallback `denoise=0.240 ms`, so this scene/GPU currently favors the fallback by a small margin.
 
-### Phase 11: Dynamic Quality Manager
+### Phase 11: Dynamic Quality Manager [DONE]
 
 Target files:
 
@@ -541,8 +672,10 @@ Implementation notes:
 - Uses `GpuProfiler` frame timings plus camera/still-frame state to reduce effective max bounces, environment samples, and denoiser A-trous iterations while moving.
 - Keeps render resolution fixed in this phase to avoid visible pumping before the later TSR/internal-resolution phases.
 - Static frames recover to full settings after a deterministic stable-frame delay.
+- Exposed adaptive quality mode and GPU frame target in the render settings panel.
+- Verified Debug build, a default-off 5-frame smoke run, and an aggressive adaptive-quality validation smoke run.
 
-### Phase 12: Motion-Adaptive Pass Skipping
+### Phase 12: Motion-Adaptive Pass Skipping [DONE]
 
 Target files:
 
@@ -567,12 +700,13 @@ Implementation notes:
 - Balanced/aggressive adaptive quality can skip ReSTIR spatial reuse while moving.
 - Aggressive adaptive quality can skip the denoiser while moving; history-copy fallback still updates required temporal resources and presentation.
 - Validation pass markers record adaptive skips for ReSTIR spatial and denoiser paths.
+- Verified through the aggressive adaptive-quality validation smoke run.
 
 ## Batch 4: Temporal Super Resolution
 
 Goal: split internal render resolution from display resolution and convert TAA into TSR.
 
-### Phase 19: Add Display Extent And Split Resources
+### Phase 19: Add Display Extent And Split Resources [DONE]
 
 Target files:
 
@@ -603,8 +737,9 @@ Implementation notes:
 - Tone mapping dispatches at display extent and samples the render-resolution HDR input with normalized coordinates to avoid out-of-bounds reads at non-1.0 scale.
 - Editor viewport now tracks display extent for the presented texture while still exposing render extent for diagnostics.
 - Selection outline is skipped when render and display extents differ; display-space outline alignment remains a later upgrade.
+- Verified Debug build plus native-scale and 0.5-scale smoke runs.
 
-### Phase 20: Convert TAA To TSR
+### Phase 20: Convert TAA To TSR [DONE]
 
 Target files:
 
@@ -631,10 +766,11 @@ Implementation notes:
 - TAA now resolves display-resolution pixels while sampling render-resolution color, depth/normal, and velocity inputs.
 - The shader reconstructs current color with a clamped 3x3 render-resolution filter and keeps all history reads/writes at display resolution.
 - Render-space velocity is scaled into display pixels before reprojection, so TSR history remains stable when render scale changes.
-- History clipping now uses the shared YCoCg temporal clamp with neighborhood luminance sigma for less color bleeding around disocclusions.
+- History clipping uses the existing neighborhood min/max clamp with luminance sigma/reactive checks for disocclusion stability.
 - Camera-cut and history-valid resets are preserved through the existing TAA uniform path.
+- Verified native-scale TAA smoke and 0.5-scale TSR smoke.
 
-### Phase 21: Update C++ Pipeline For TSR
+### Phase 21: Update C++ Pipeline For TSR [DONE]
 
 Target files:
 
@@ -664,8 +800,9 @@ Implementation notes:
 - The render graph binds the TSR pass against display-sized output/history resources and dispatches it at display extent.
 - Render settings expose TSR presets (`Native`, `Quality`, `Balanced`, `Performance`) plus the existing raw render-resolution scale slider.
 - Existing profiler ranges continue to isolate render-resolution passes such as path trace/denoiser from display-resolution post passes such as TAA/TSR and tone map.
+- Verified runtime resource recreation through 0.5-scale validation scene smoke.
 
-### Phase 22: Update Tone Map And Presentation
+### Phase 22: Update Tone Map And Presentation [DONE]
 
 Target files:
 
@@ -694,6 +831,7 @@ Implementation notes:
 - Auto-exposure histogram policy is explicit: histogram sampling and exposure reduction use the current post-temporal HDR source extent.
 - Picking maps viewport UVs into the render-resolution entity buffer; selection outline remains enabled only when render and display extents match to avoid misaligned display-space outlines until the outline pass is upgraded.
 - No separate screenshot capture path is present in the current codebase; the final presentation image is display-resolution.
+- Verified 0.5-scale TSR plus auto-exposure smoke run.
 
 ### Phase 49: Async Compute Overlap
 

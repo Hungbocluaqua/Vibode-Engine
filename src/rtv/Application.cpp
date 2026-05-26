@@ -39,6 +39,7 @@ namespace {
 constexpr int initialWidth = 1280;
 constexpr int initialHeight = 720;
 constexpr uint64_t largeSceneTriangleThreshold = 1'000'000ull;
+constexpr float defaultMaxFrameDeltaSeconds = 1.0f / 30.0f;
 
 constexpr RendererDebugView intermediateViews[] = {
     RendererDebugView::Beauty,
@@ -58,6 +59,13 @@ RendererDebugView nextDebugView(RendererDebugView view) {
         }
     }
     return RendererDebugView::Beauty;
+}
+
+float clampFrameDeltaSeconds(float rawDeltaSeconds, const PathTracerRenderer* renderer) {
+    const float maxDelta = renderer != nullptr
+        ? std::max(0.001f, renderer->settings().maxFrameDeltaSeconds)
+        : defaultMaxFrameDeltaSeconds;
+    return std::clamp(std::isfinite(rawDeltaSeconds) ? rawDeltaSeconds : 0.0f, 0.0f, maxDelta);
 }
 
 uint64_t countSceneTriangles(const SceneAsset& scene, const AssetManager& assets) {
@@ -132,9 +140,12 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.taaSharpeningStrength = settings.taaSharpeningStrength;
     render.debugView = settings.debugView;
     render.resolutionScale = settings.renderResolutionScale;
+    render.materialTextureAnisotropy = settings.materialTextureAnisotropy;
     render.shadowRayBias = settings.shadowRayBias;
     render.shadowDistanceBias = settings.shadowDistanceBias;
     render.fireflyClamp = settings.fireflyClamp;
+    render.adaptiveQualityMode = settings.adaptiveQualityMode;
+    render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
     render.usePhysicalCamera = settings.usePhysicalCamera;
     render.physicalAperture = settings.physicalAperture;
     render.physicalShutterSeconds = settings.physicalShutterSeconds;
@@ -185,9 +196,12 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.taaSharpeningStrength = render.taaSharpeningStrength;
     settings.debugView = render.debugView;
     settings.renderResolutionScale = render.resolutionScale;
+    settings.materialTextureAnisotropy = render.materialTextureAnisotropy;
     settings.shadowRayBias = render.shadowRayBias;
     settings.shadowDistanceBias = render.shadowDistanceBias;
     settings.fireflyClamp = render.fireflyClamp;
+    settings.adaptiveQualityMode = render.adaptiveQualityMode;
+    settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
     settings.usePhysicalCamera = render.usePhysicalCamera;
     settings.physicalAperture = render.physicalAperture;
     settings.physicalShutterSeconds = render.physicalShutterSeconds;
@@ -458,7 +472,8 @@ void Application::mainLoop(uint32_t maxFrames) {
 
         const auto now = std::chrono::steady_clock::now();
         const float seconds = std::chrono::duration<float>(now - start).count();
-        const float deltaSeconds = std::max(0.0f, seconds - lastFrameSeconds_);
+        const float rawDeltaSeconds = std::max(0.0f, seconds - lastFrameSeconds_);
+        const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
 
         if (uiOverlay_) {
@@ -502,7 +517,7 @@ void Application::mainLoop(uint32_t maxFrames) {
                 &gpuInstanceEntities_,
                 sceneLoadingStatus_,
                 &cameraController_,
-                deltaSeconds * 1000.0f,
+                rawDeltaSeconds * 1000.0f,
                 &notifications_,
                 sunDrag_.phase != SunDragPhase::Idle);
         }

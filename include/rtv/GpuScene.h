@@ -4,6 +4,7 @@
 #include "rtv/BindlessResources.h"
 #include "rtv/Image.h"
 #include "rtv/SceneCache.h"
+#include "rtv/TextureAsset.h"
 
 #include <glm/glm.hpp>
 
@@ -44,7 +45,7 @@ struct alignas(16) CameraUniform {
     uint32_t padding0 = 0;
     glm::vec4 jitter{}; // xy = current subpixel jitter, zw = previous subpixel jitter
     glm::vec4 atmosphere{}; // x = sun elevation, y = ReSTIR mode, z = temporal history available, w = sun azimuth
-    glm::vec4 renderControls{}; // x = shadow ray bias, y = shadow distance bias, z = firefly clamp
+    glm::vec4 renderControls{}; // x = shadow ray bias, y = shadow distance bias, z = firefly clamp, w = RR min survival
     glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
     glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
 };
@@ -94,6 +95,7 @@ struct GpuPrimitiveRecord {
 struct GpuInstanceRecord {
     glm::mat4 transform{1.0f};
     glm::mat4 inverseTransform{1.0f};
+    glm::mat4 normalTransform{1.0f};
     glm::mat4 prevTransform{1.0f};
     glm::uvec4 metadata{};
 };
@@ -213,6 +215,7 @@ public:
     [[nodiscard]] const BindlessTextureTable& materialTextureTable() const { return materialTextureTable_; }
     [[nodiscard]] VkImageView materialTextureImageView(uint32_t index) const { return materialTextureTable_.imageView(index); }
     [[nodiscard]] uint32_t materialTextureCount() const { return materialTextureTable_.residentCount(); }
+    [[nodiscard]] float materialTextureAnisotropy() const { return materialTextureAnisotropy_; }
 
     [[nodiscard]] const MeshParamsUniform& meshParams() const { return meshParams_; }
     [[nodiscard]] const EnvParamsUniform& envParams() const { return envParams_; }
@@ -221,6 +224,8 @@ public:
 
     bool setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity);
     bool setSkyCdfDimensions(uint32_t width, uint32_t height);
+    bool setMaterialTextureAnisotropy(float anisotropy, uint64_t retireFrame);
+    void releaseRetiredMaterialSamplers(uint64_t completedFrame);
     void loadEnvironment(BufferUploader& uploader, const std::filesystem::path& path);
     bool updateImportedMaterials(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
     bool updateSceneLights(BufferUploader& uploader, const SceneAsset& scene);
@@ -238,6 +243,8 @@ private:
     void uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight);
     void uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords);
     void destroyMaterialTextureSamplers();
+    void retireMaterialTextureSampler(VkSampler sampler, uint64_t retireFrame);
+    void recreateMaterialTextureSamplers(uint64_t retireFrame);
     void rebuildMaterialSamplerDescriptors(uint32_t slotCount);
     [[nodiscard]] static uint32_t textureSlotIndexFor(const SceneAsset& scene, TextureAssetHandle texture, uint32_t maxSlots);
 
@@ -272,6 +279,14 @@ private:
     VkSampler environmentSampler_ = VK_NULL_HANDLE;
     VkSampler materialSampler_ = VK_NULL_HANDLE;
     std::vector<VkSampler> materialTextureSamplers_;
+    struct RetiredMaterialSampler {
+        VkSampler sampler = VK_NULL_HANDLE;
+        uint64_t retireFrame = 0;
+    };
+    std::vector<RetiredMaterialSampler> retiredMaterialSamplers_;
+    std::vector<TextureSamplerDesc> materialTextureSamplerDescs_;
+    TextureSamplerDesc materialSamplerDesc_{};
+    float materialTextureAnisotropy_ = 8.0f;
     MeshParamsUniform meshParams_{};
     EnvParamsUniform envParams_{};
     std::vector<RayTracingMeshBuildInput> rayTracingMeshes_;

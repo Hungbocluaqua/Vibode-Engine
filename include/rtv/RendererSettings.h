@@ -59,12 +59,17 @@ struct RendererSettings {
     float environmentRotation = 0.0f;
     float environmentBackgroundIntensity = 0.35f;
     float renderResolutionScale = 1.0f;
+    float materialTextureAnisotropy = 8.0f;
     uint32_t accumulationLimit = 0;
     RendererDebugView debugView = RendererDebugView::Beauty;
     float debugScale = 1.0f;
     float shadowRayBias = 0.001f;
     float shadowDistanceBias = 0.002f;
     float fireflyClamp = 48.0f;
+    float maxFrameDeltaSeconds = 1.0f / 30.0f;
+    float russianRouletteMinSurvival = 0.10f;
+    AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Off;
+    float adaptiveGpuFrameTargetMs = 16.6f;
 
     bool usePhysicalCamera = false;
     float physicalAperture = 16.0f;

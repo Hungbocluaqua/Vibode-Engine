@@ -5,6 +5,10 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+#ifndef RTV_DENOISER_SHARED_TILE
+#define RTV_DENOISER_SHARED_TILE 1
+#endif
+
 layout(set = 0, binding = 0, rgba16f) readonly uniform image2D input_color;
 layout(set = 0, binding = 1, std430) readonly buffer InputDepthNormal { uvec4 input_depth_normal[]; };
 layout(set = 0, binding = 2, std430) readonly buffer InputVariance { uint input_variance[]; };
@@ -38,6 +42,22 @@ layout(set = 0, binding = 8, std140) uniform PrevCamera {
 float luminance(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
+
+#if RTV_DENOISER_SHARED_TILE
+const int DENOISER_TILE_RADIUS = 2;
+const int DENOISER_LOCAL_SIZE_X = 16;
+const int DENOISER_LOCAL_SIZE_Y = 16;
+const int DENOISER_SHARED_SIZE_X = DENOISER_LOCAL_SIZE_X + DENOISER_TILE_RADIUS * 2;
+const int DENOISER_SHARED_SIZE_Y = DENOISER_LOCAL_SIZE_Y + DENOISER_TILE_RADIUS * 2;
+const int DENOISER_SHARED_COUNT = DENOISER_SHARED_SIZE_X * DENOISER_SHARED_SIZE_Y;
+
+shared vec4 shared_color_tile[DENOISER_SHARED_COUNT];
+shared uvec4 shared_depth_normal_tile[DENOISER_SHARED_COUNT];
+
+int denoiser_shared_index(ivec2 tileCoords) {
+    return tileCoords.y * DENOISER_SHARED_SIZE_X + tileCoords.x;
+}
+#endif
 
 float atrous_kernel_weight(int offsetValue) {
     if (offsetValue == 0) {
@@ -187,7 +207,24 @@ vec3 bilinear_prev_world(vec2 historyPos, ivec2 dims) {
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dims = imageSize(input_color);
-    if (coords.x >= dims.x || coords.y >= dims.y) {
+    bool in_bounds = coords.x < dims.x && coords.y < dims.y;
+
+#if RTV_DENOISER_SHARED_TILE
+    ivec2 workgroup_origin = ivec2(gl_WorkGroupID.xy) * ivec2(DENOISER_LOCAL_SIZE_X, DENOISER_LOCAL_SIZE_Y);
+    uint local_linear = gl_LocalInvocationID.y * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint local_count = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    ivec2 max_coords = max(dims - ivec2(1), ivec2(0));
+    for (uint i = local_linear; i < uint(DENOISER_SHARED_COUNT); i += local_count) {
+        ivec2 tile_coords = ivec2(int(i) % DENOISER_SHARED_SIZE_X, int(i) / DENOISER_SHARED_SIZE_X);
+        ivec2 sample_coords = clamp(workgroup_origin + tile_coords - ivec2(DENOISER_TILE_RADIUS), ivec2(0), max_coords);
+        uint sample_index = uint(sample_coords.y) * uint(dims.x) + uint(sample_coords.x);
+        shared_color_tile[i] = imageLoad(input_color, sample_coords);
+        shared_depth_normal_tile[i] = input_depth_normal[sample_index];
+    }
+    barrier();
+#endif
+
+    if (!in_bounds) {
         return;
     }
 
@@ -237,8 +274,22 @@ void main() {
                     continue;
                 }
 
+#if RTV_DENOISER_SHARED_TILE
+                vec3 sample_color;
+                vec4 sample_dn;
+                if (iter == 0u) {
+                    ivec2 tile_coords = ivec2(gl_LocalInvocationID.xy) + ivec2(kx + DENOISER_TILE_RADIUS, ky + DENOISER_TILE_RADIUS);
+                    int tile_index = denoiser_shared_index(tile_coords);
+                    sample_color = shared_color_tile[tile_index].rgb;
+                    sample_dn = decode_depth_normal(shared_depth_normal_tile[tile_index]);
+                } else {
+                    sample_color = imageLoad(input_color, sample_coords).rgb;
+                    sample_dn = decode_depth_normal(input_depth_normal[uint(sample_coords.y) * uint(dims.x) + uint(sample_coords.x)]);
+                }
+#else
                 vec3 sample_color = imageLoad(input_color, sample_coords).rgb;
                 vec4 sample_dn = decode_depth_normal(input_depth_normal[uint(sample_coords.y) * uint(dims.x) + uint(sample_coords.x)]);
+#endif
                 float sample_depth = sample_dn.r;
                 vec3 sample_normal = sample_dn.gba;
                 float sample_lum = luminance(sample_color);

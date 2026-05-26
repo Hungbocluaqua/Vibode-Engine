@@ -53,12 +53,28 @@ enum class RendererDebugView : uint32_t {
     RestirReservoirAge = 35,
     RestirReservoirConfidence = 36,
     RestirReservoirM = 37,
+    EmissiveContinuation = 38,
+    SunMisWeight = 39,
+    SunLightPdf = 40,
+    SunPreviousBsdfPdf = 41,
+    RisRawLightPdf = 42,
+    RisEffectiveLightPdf = 43,
+    RisPdfRatio = 44,
+    SampleDimension = 45,
+    SampleScramble = 46,
 };
 
 enum class RestirMode : uint32_t {
     ClassicNee = 0,
     RestirOnly = 1,
     HybridCompare = 2,
+};
+
+enum class AdaptiveQualityMode : uint32_t {
+    Off = 0,
+    Conservative = 1,
+    Balanced = 2,
+    Aggressive = 3,
 };
 
 struct RendererDebugParams {

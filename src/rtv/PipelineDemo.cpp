@@ -21,6 +21,8 @@ namespace rtv {
 
 namespace {
 
+constexpr uint32_t kDemoFramesInFlight = 3;
+
 std::filesystem::path defaultGlslangPath() {
 #if defined(_MSC_VER)
     char* sdk = nullptr;
@@ -95,8 +97,10 @@ PipelineDemo::PipelineDemo(
         }),
         *pipelineCache_);
 
-    frames_.push_back(std::make_unique<FrameResources>(context_.device(), allocator_, 64 * 1024));
-    frames_.push_back(std::make_unique<FrameResources>(context_.device(), allocator_, 64 * 1024));
+    frames_.reserve(kDemoFramesInFlight);
+    for (uint32_t i = 0; i < kDemoFramesInFlight; ++i) {
+        frames_.push_back(std::make_unique<FrameResources>(context_.device(), allocator_, 64 * 1024));
+    }
 
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;

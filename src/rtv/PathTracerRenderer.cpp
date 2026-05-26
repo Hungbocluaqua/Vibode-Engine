@@ -13,6 +13,7 @@
 #include "rtv/RayTracingPipeline.h"
 #include "rtv/RayTracingScene.h"
 #include "rtv/RenderGraph.h"
+#include "rtv/ResourceAllocator.h"
 #include "rtv/ShaderCompiler.h"
 #include "rtv/ShaderModule.h"
 #include "rtv/ShaderReflection.h"
@@ -42,6 +43,7 @@ constexpr VkDeviceSize kFrameDebugParamsOffset = 12288;
 constexpr VkDeviceSize kFrameTaaParamsOffset = 16384;
 constexpr VkDeviceSize kFrameRestirSpatialParamsOffset = 20480;
 constexpr VkDeviceSize kFrameFogParamsOffset = 24576;
+constexpr uint32_t kRendererFramesInFlight = 3;
 
 float halton(uint32_t index, uint32_t base) {
     float result = 0.0f;
@@ -364,10 +366,12 @@ PathTracerRenderer::PathTracerRenderer(
         std::cout << "RT pipeline: SBT=" << rayTracingPipeline_->sbtBytes() << " bytes\n";
     }
 
-    frames_.push_back(std::make_unique<FrameResources>(context_.device(), allocator_, 64 * 1024));
-    frames_.push_back(std::make_unique<FrameResources>(context_.device(), allocator_, 64 * 1024));
-    profilers_.emplace_back(context_.device(), context_.physicalDevice());
-    profilers_.emplace_back(context_.device(), context_.physicalDevice());
+    frames_.reserve(kRendererFramesInFlight);
+    profilers_.reserve(kRendererFramesInFlight);
+    for (uint32_t i = 0; i < kRendererFramesInFlight; ++i) {
+        frames_.push_back(std::make_unique<FrameResources>(context_.device(), allocator_, 64 * 1024));
+        profilers_.emplace_back(context_.device(), context_.physicalDevice());
+    }
     for (auto& p : profilers_) {
         p.createPipelineStatsQuery(context_.device(), context_.supportsHardwareRayTracing());
     }
@@ -386,6 +390,7 @@ PathTracerRenderer::PathTracerRenderer(
     camera_.right = {1.0f, 0.0f, 0.0f, 0.0f};
     camera_.up = {0.0f, 1.0f, 0.0f, 0.0f};
     previousCameraPos_ = camera_.pos;
+    settings_.materialTextureAnisotropy = scene_.materialTextureAnisotropy();
     settings_.debugView = debugView;
     debugParams_.view = static_cast<uint32_t>(settings_.debugView);
     debugParams_.scale = settings_.debugScale;
@@ -415,11 +420,13 @@ bool PathTracerRenderer::shadersNeedReload() {
     return false;
 }
 
-void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D extent) {
+void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D renderExtent, VkExtent2D displayExtent) {
     currentFrame_ = frames_.at(frameIndex % frames_.size()).get();
     currentProfiler_ = &profilers_.at(frameIndex % profilers_.size());
     currentProfiler_->collectCompletedFrame();
+    scene_.releaseRetiredMaterialSamplers(temporalFrameIndex_);
     validationLog_.beginFrame(temporalFrameIndex_);
+    updateAdaptiveQuality(currentProfiler_->timings());
     if (temporalFrameIndex_ > 0 && temporalFrameIndex_ % 120u == 0u) {
         const GpuFrameTimings& timings = currentProfiler_->timings();
         std::cout << "GPU timings: path=" << timings.pathTraceMs
@@ -427,11 +434,15 @@ void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D extent) {
                   << " ms, fullscreen=" << timings.fullscreenMs << " ms\n";
     }
     currentFrame_->beginFrame();
-    if (extent.width != extent_.width || extent.height != extent_.height || rawImage_.handle() == VK_NULL_HANDLE) {
+    if (renderExtent.width != renderExtent_.width ||
+        renderExtent.height != renderExtent_.height ||
+        displayExtent.width != displayExtent_.width ||
+        displayExtent.height != displayExtent_.height ||
+        rawImage_.handle() == VK_NULL_HANDLE) {
         if (rawImage_.handle() != VK_NULL_HANDLE) {
             checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(resize path tracer)");
         }
-        createResolutionResources(extent);
+        createResolutionResources(renderExtent, displayExtent);
         resetAccumulation(AccumulationResetReason::Resize);
     }
     ++frameCount_;
@@ -440,6 +451,93 @@ void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D extent) {
         temporalSystem_->beginFrame(temporalFrameIndex_);
     }
     updateCamera();
+}
+
+void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
+    adaptiveEffectiveMaxBounces_ = settings_.maxBounces;
+    adaptiveEffectiveEnvironmentSamples_ = settings_.environmentDirectSamples;
+    adaptiveEffectiveAtrousIterations_ = settings_.atrousIterations;
+    adaptiveSkipRestirSpatial_ = false;
+    adaptiveSkipDenoiser_ = false;
+
+    if (settings_.adaptiveQualityMode == AdaptiveQualityMode::Off || !settings_.pathTracingEnabled) {
+        adaptiveQualityTier_ = 0;
+        adaptiveOverBudgetFrames_ = 0;
+        adaptiveSmoothedGpuMs_ = 0.0f;
+        return;
+    }
+
+    const float gpuMs =
+        timings.pathTraceMs +
+        timings.restirSpatialMs +
+        timings.fogIntegrateMs +
+        timings.atmosphereMs +
+        timings.denoiserMs +
+        timings.historyCopyMs +
+        timings.taaMs +
+        timings.autoExposureMs +
+        timings.toneMapMs +
+        timings.selectionOutlineMs +
+        timings.fullscreenMs;
+    if (gpuMs > 0.0f) {
+        adaptiveSmoothedGpuMs_ = adaptiveSmoothedGpuMs_ <= 0.0f
+            ? gpuMs
+            : adaptiveSmoothedGpuMs_ * 0.85f + gpuMs * 0.15f;
+    }
+
+    const uint32_t mode = static_cast<uint32_t>(settings_.adaptiveQualityMode);
+    const uint32_t maxTier = std::clamp(mode, 1u, 3u);
+    const bool moving = cameraChangedThisFrame_;
+    const float targetMs = std::clamp(settings_.adaptiveGpuFrameTargetMs, 4.0f, 100.0f);
+    const bool overBudget = adaptiveSmoothedGpuMs_ > targetMs * 1.15f;
+    const bool underBudget = adaptiveSmoothedGpuMs_ <= 0.0f || adaptiveSmoothedGpuMs_ < targetMs * 0.88f;
+    const uint32_t stableFramesForFullQuality = mode == 1u ? 6u : (mode == 2u ? 10u : 14u);
+
+    if (moving) {
+        adaptiveQualityTier_ = std::max(adaptiveQualityTier_, std::min(maxTier, mode));
+        adaptiveOverBudgetFrames_ = 0;
+    } else if (overBudget) {
+        ++adaptiveOverBudgetFrames_;
+        if (adaptiveOverBudgetFrames_ >= 6u) {
+            adaptiveQualityTier_ = std::min(maxTier, adaptiveQualityTier_ + 1u);
+            adaptiveOverBudgetFrames_ = 0;
+        }
+    } else if (stillFrameCount_ >= stableFramesForFullQuality && underBudget) {
+        adaptiveQualityTier_ = 0;
+        adaptiveOverBudgetFrames_ = 0;
+    }
+
+    if (adaptiveQualityTier_ == 0) {
+        return;
+    }
+
+    if (adaptiveQualityTier_ == 1u) {
+        adaptiveEffectiveMaxBounces_ = std::max(2u, settings_.maxBounces > 1u ? settings_.maxBounces - 1u : settings_.maxBounces);
+        adaptiveEffectiveEnvironmentSamples_ = std::max(1u, settings_.environmentDirectSamples);
+        adaptiveEffectiveAtrousIterations_ = std::max(1u, settings_.atrousIterations > 1u ? settings_.atrousIterations - 1u : settings_.atrousIterations);
+    } else if (adaptiveQualityTier_ == 2u) {
+        adaptiveEffectiveMaxBounces_ = std::max(2u, std::min(settings_.maxBounces, settings_.maxBounces / 2u + 1u));
+        adaptiveEffectiveEnvironmentSamples_ = 1u;
+        adaptiveEffectiveAtrousIterations_ = std::max(1u, settings_.atrousIterations > 2u ? settings_.atrousIterations - 2u : 1u);
+        adaptiveSkipRestirSpatial_ = moving;
+    } else {
+        adaptiveEffectiveMaxBounces_ = std::min(settings_.maxBounces, 2u);
+        adaptiveEffectiveEnvironmentSamples_ = 1u;
+        adaptiveEffectiveAtrousIterations_ = 1u;
+        adaptiveSkipRestirSpatial_ = moving;
+        adaptiveSkipDenoiser_ = moving && debugParams_.view == static_cast<uint32_t>(RendererDebugView::Beauty);
+    }
+
+    if (temporalFrameIndex_ == 1u || temporalFrameIndex_ % 120u == 0u) {
+        validationLog_.recordPass(
+            "adaptive quality tier=" + std::to_string(adaptiveQualityTier_) +
+            " gpuMs=" + std::to_string(adaptiveSmoothedGpuMs_) +
+            " bounces=" + std::to_string(adaptiveEffectiveMaxBounces_) +
+            " envSamples=" + std::to_string(adaptiveEffectiveEnvironmentSamples_) +
+            " atrous=" + std::to_string(adaptiveEffectiveAtrousIterations_) +
+            " skipRestir=" + std::to_string(adaptiveSkipRestirSpatial_ ? 1u : 0u) +
+            " skipDenoiser=" + std::to_string(adaptiveSkipDenoiser_ ? 1u : 0u));
+    }
 }
 
 bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
@@ -497,10 +595,30 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     next.environmentIntensity = std::max(0.0f, next.environmentIntensity);
     next.environmentBackgroundIntensity = std::max(0.0f, next.environmentBackgroundIntensity);
     next.renderResolutionScale = std::clamp(next.renderResolutionScale, 0.25f, 1.0f);
+    const float maxMaterialAnisotropy = allocator_.supportsSamplerAnisotropy() ? allocator_.maxSamplerAnisotropy() : 1.0f;
+    next.materialTextureAnisotropy = std::clamp(
+        std::isfinite(next.materialTextureAnisotropy) ? next.materialTextureAnisotropy : 1.0f,
+        1.0f,
+        maxMaterialAnisotropy);
     next.debugScale = std::max(0.05f, next.debugScale);
     next.shadowRayBias = std::clamp(next.shadowRayBias, 0.00001f, 0.05f);
     next.shadowDistanceBias = std::clamp(next.shadowDistanceBias, 0.0f, 0.1f);
     next.fireflyClamp = std::clamp(next.fireflyClamp, 1.0f, 512.0f);
+    next.maxFrameDeltaSeconds = std::clamp(
+        std::isfinite(next.maxFrameDeltaSeconds) ? next.maxFrameDeltaSeconds : (1.0f / 30.0f),
+        1.0f / 240.0f,
+        1.0f / 5.0f);
+    next.russianRouletteMinSurvival = std::clamp(
+        std::isfinite(next.russianRouletteMinSurvival) ? next.russianRouletteMinSurvival : 0.10f,
+        0.02f,
+        0.50f);
+    if (static_cast<uint32_t>(next.adaptiveQualityMode) > static_cast<uint32_t>(AdaptiveQualityMode::Aggressive)) {
+        next.adaptiveQualityMode = AdaptiveQualityMode::Off;
+    }
+    next.adaptiveGpuFrameTargetMs = std::clamp(
+        std::isfinite(next.adaptiveGpuFrameTargetMs) ? next.adaptiveGpuFrameTargetMs : 16.6f,
+        4.0f,
+        100.0f);
     if (static_cast<uint32_t>(next.restirMode) > static_cast<uint32_t>(RestirMode::HybridCompare)) {
         next.restirMode = RestirMode::ClassicNee;
     }
@@ -561,10 +679,15 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.environmentRotation - settings_.environmentRotation) > 0.0001f ||
         std::abs(next.environmentBackgroundIntensity - settings_.environmentBackgroundIntensity) > 0.0001f ||
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f ||
+        std::abs(next.materialTextureAnisotropy - settings_.materialTextureAnisotropy) > 0.0001f ||
         std::abs(next.debugScale - settings_.debugScale) > 0.0001f ||
         std::abs(next.shadowRayBias - settings_.shadowRayBias) > 0.000001f ||
         std::abs(next.shadowDistanceBias - settings_.shadowDistanceBias) > 0.000001f ||
-        std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f;
+        std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f ||
+        std::abs(next.maxFrameDeltaSeconds - settings_.maxFrameDeltaSeconds) > 0.000001f ||
+        std::abs(next.russianRouletteMinSurvival - settings_.russianRouletteMinSurvival) > 0.0001f ||
+        next.adaptiveQualityMode != settings_.adaptiveQualityMode ||
+        std::abs(next.adaptiveGpuFrameTargetMs - settings_.adaptiveGpuFrameTargetMs) > 0.0001f;
     if (!changed) {
         return false;
     }
@@ -606,16 +729,29 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     const bool renderChanged =
         next.pathTracingEnabled != settings_.pathTracingEnabled ||
         next.cameraJitterEnabled != settings_.cameraJitterEnabled ||
+        next.adaptiveQualityMode != settings_.adaptiveQualityMode ||
         next.maxBounces != settings_.maxBounces ||
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         std::abs(next.indirectStrength - settings_.indirectStrength) > 0.0001f ||
         std::abs(next.shadowRayBias - settings_.shadowRayBias) > 0.000001f ||
         std::abs(next.shadowDistanceBias - settings_.shadowDistanceBias) > 0.000001f ||
-        std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f;
+        std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f ||
+        std::abs(next.adaptiveGpuFrameTargetMs - settings_.adaptiveGpuFrameTargetMs) > 0.0001f ||
+        std::abs(next.russianRouletteMinSurvival - settings_.russianRouletteMinSurvival) > 0.0001f;
     const bool renderResolutionChanged =
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f;
+    const bool materialTextureFilteringChanged =
+        std::abs(next.materialTextureAnisotropy - settings_.materialTextureAnisotropy) > 0.0001f;
 
     settings_ = next;
+    if (renderChanged || denoiserChanged) {
+        adaptiveQualityTier_ = 0;
+        adaptiveOverBudgetFrames_ = 0;
+    }
+    if (materialTextureFilteringChanged) {
+        const uint64_t retireFrame = temporalFrameIndex_ + static_cast<uint64_t>(frames_.size()) + 1ull;
+        scene_.setMaterialTextureAnisotropy(settings_.materialTextureAnisotropy, retireFrame);
+    }
     if (taaChanged || renderResolutionChanged) {
         taaHistoryValid_ = false;
     }
@@ -628,6 +764,8 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         settings_.environmentBackgroundIntensity);
     if (renderResolutionChanged) {
         resetAccumulation(AccumulationResetReason::Resize);
+    } else if (materialTextureFilteringChanged) {
+        resetAccumulation(AccumulationResetReason::RenderSettingsChanged);
     } else if (environmentChanged || environmentUploaded) {
         resetAccumulation(AccumulationResetReason::EnvironmentChanged);
     } else if (lightingChanged) {
@@ -758,13 +896,13 @@ void PathTracerRenderer::setSelectedInstanceId(std::optional<uint32_t> instanceI
 }
 
 std::optional<uint32_t> PathTracerRenderer::pickInstanceId(glm::vec2 viewportUv) {
-    if (entityIdBuffer_.handle() == VK_NULL_HANDLE || entityIdBuffer_.mappedData() == nullptr || extent_.width == 0 || extent_.height == 0) {
+    if (entityIdBuffer_.handle() == VK_NULL_HANDLE || entityIdBuffer_.mappedData() == nullptr || renderExtent_.width == 0 || renderExtent_.height == 0) {
         return std::nullopt;
     }
 
-    const uint32_t x = std::min(extent_.width - 1u, static_cast<uint32_t>(std::clamp(viewportUv.x, 0.0f, 1.0f) * static_cast<float>(extent_.width)));
-    const uint32_t y = std::min(extent_.height - 1u, static_cast<uint32_t>(std::clamp(viewportUv.y, 0.0f, 1.0f) * static_cast<float>(extent_.height)));
-    const VkDeviceSize offset = (static_cast<VkDeviceSize>(y) * extent_.width + x) * sizeof(uint32_t);
+    const uint32_t x = std::min(renderExtent_.width - 1u, static_cast<uint32_t>(std::clamp(viewportUv.x, 0.0f, 1.0f) * static_cast<float>(renderExtent_.width)));
+    const uint32_t y = std::min(renderExtent_.height - 1u, static_cast<uint32_t>(std::clamp(viewportUv.y, 0.0f, 1.0f) * static_cast<float>(renderExtent_.height)));
+    const VkDeviceSize offset = (static_cast<VkDeviceSize>(y) * renderExtent_.width + x) * sizeof(uint32_t);
 
     checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(read entity pick buffer)");
     entityIdBuffer_.invalidate(sizeof(uint32_t), offset);
@@ -820,47 +958,48 @@ VkDescriptorImageInfo PathTracerRenderer::viewportImageDescriptor() const {
     return presentationImage_.sampledDescriptor(VK_NULL_HANDLE);
 }
 
-void PathTracerRenderer::createResolutionResources(VkExtent2D extent) {
-    extent_ = extent;
-    const VkDeviceSize pixelCount = static_cast<VkDeviceSize>(extent.width) * extent.height;
+void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkExtent2D displayExtent) {
+    renderExtent_ = renderExtent;
+    displayExtent_ = displayExtent;
+    const VkDeviceSize pixelCount = static_cast<VkDeviceSize>(renderExtent.width) * renderExtent.height;
     rawImage_.create(allocator_, ImageDesc{
-        .width = extent.width,
-        .height = extent.height,
+        .width = renderExtent.width,
+        .height = renderExtent.height,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .debugName = "path tracer raw hdr",
     });
     denoisedImage_.create(allocator_, ImageDesc{
-        .width = extent.width,
-        .height = extent.height,
+        .width = renderExtent.width,
+        .height = renderExtent.height,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .debugName = "path tracer denoised hdr",
     });
     historyImage_.create(allocator_, ImageDesc{
-        .width = extent.width,
-        .height = extent.height,
+        .width = renderExtent.width,
+        .height = renderExtent.height,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .debugName = "path tracer denoiser history",
     });
     taaImage_.create(allocator_, ImageDesc{
-        .width = extent.width,
-        .height = extent.height,
+        .width = displayExtent.width,
+        .height = displayExtent.height,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .debugName = "path tracer taa hdr",
     });
     taaHistoryImage_.create(allocator_, ImageDesc{
-        .width = extent.width,
-        .height = extent.height,
+        .width = displayExtent.width,
+        .height = displayExtent.height,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .debugName = "path tracer taa history",
     });
     presentationImage_.create(allocator_, ImageDesc{
-        .width = extent.width,
-        .height = extent.height,
+        .width = displayExtent.width,
+        .height = displayExtent.height,
         .format = VK_FORMAT_R8G8B8A8_UNORM,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         .debugName = "path tracer presentation ldr",
@@ -981,25 +1120,25 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D extent) {
         temporalSystem_->createHistorySlot(
             "denoiser_history",
             historyImage_.format(),
-            VkExtent2D{extent.width, extent.height},
+            VkExtent2D{renderExtent.width, renderExtent.height},
             TemporalSystem::TemporalResidency::Persistent,
             1.0f);
         temporalSystem_->createHistorySlot(
             "previous_world_position",
             VK_FORMAT_R32G32_UINT,
-            VkExtent2D{extent.width, extent.height},
+            VkExtent2D{renderExtent.width, renderExtent.height},
             TemporalSystem::TemporalResidency::Persistent,
             0.8f);
         temporalSystem_->createHistorySlot(
             "taa_history",
             taaHistoryImage_.format(),
-            VkExtent2D{extent.width, extent.height},
+            VkExtent2D{displayExtent.width, displayExtent.height},
             TemporalSystem::TemporalResidency::Persistent,
             1.0f);
         temporalSystem_->createHistorySlot(
             "restir_reservoir",
             VK_FORMAT_R32G32B32A32_SFLOAT,
-            VkExtent2D{extent.width, extent.height},
+            VkExtent2D{renderExtent.width, renderExtent.height},
             TemporalSystem::TemporalResidency::Persistent,
             0.75f);
         temporalSystem_->setCameraCut(true, AccumulationResetReason::Resize);
@@ -1017,13 +1156,17 @@ void PathTracerRenderer::updateCamera() {
         ? 2.0f * std::exp2(14.0f - physicalCamera_.ev100())
         : settings_.exposure;
     camera_.pathTracingEnabled = settings_.pathTracingEnabled ? 1u : 0u;
-    camera_.maxBounces = settings_.maxBounces;
+    camera_.maxBounces = adaptiveEffectiveMaxBounces_;
     camera_.sunlightEnabled = settings_.sunlightEnabled ? 1u : 0u;
     camera_.directLightingEnabled = settings_.directLightingEnabled ? 1u : 0u;
     camera_.sunAngularRadius = settings_.sunAngularRadius;
     camera_.indirectStrength = settings_.indirectStrength;
-    camera_.environmentDirectSamples = settings_.environmentDirectSamples;
-    camera_.renderControls = glm::vec4(settings_.shadowRayBias, settings_.shadowDistanceBias, settings_.fireflyClamp, 0.0f);
+    camera_.environmentDirectSamples = adaptiveEffectiveEnvironmentSamples_;
+    camera_.renderControls = glm::vec4(
+        settings_.shadowRayBias,
+        settings_.shadowDistanceBias,
+        settings_.fireflyClamp,
+        settings_.russianRouletteMinSurvival);
     // Manual exposure in this renderer is still calibrated around the legacy sun scalar.
     // Keep raw lux only for physical-camera mode where exposure is EV-based.
     camera_.sunDirectionIlluminance = glm::vec4(
@@ -1050,19 +1193,19 @@ void PathTracerRenderer::updateCamera() {
     camera_.effectiveJitterScale = effectiveJitterScale;
     camera_.cameraMoving = cameraChangedThisFrame_ ? 1u : 0u;
 
-    const float aspect = extent_.height > 0 ? static_cast<float>(extent_.width) / static_cast<float>(extent_.height) : 1.0f;
+    const float aspect = renderExtent_.height > 0 ? static_cast<float>(renderExtent_.width) / static_cast<float>(renderExtent_.height) : 1.0f;
     const glm::vec3 eye = glm::vec3(camera_.pos);
     const glm::vec3 center = eye + glm::normalize(glm::vec3(camera_.forward));
     const glm::mat4 view = glm::lookAtRH(eye, center, glm::normalize(glm::vec3(camera_.up)));
     glm::mat4 projection = glm::perspectiveRH_ZO(camera_.fovY, aspect, 0.01f, 1000.0f);
     projection[1][1] *= -1.0f;
-    const bool jitterEnabled = settings_.pathTracingEnabled && settings_.taaEnabled && settings_.cameraJitterEnabled && effectiveJitterScale > 0.0f && extent_.width > 0 && extent_.height > 0;
+    const bool jitterEnabled = settings_.pathTracingEnabled && settings_.taaEnabled && settings_.cameraJitterEnabled && effectiveJitterScale > 0.0f && renderExtent_.width > 0 && renderExtent_.height > 0;
     const uint32_t jitterIndex = temporalFrameIndex_ + 1u;
     const glm::vec2 currentJitter = jitterEnabled
         ? glm::vec2(halton(jitterIndex, 2u) - 0.5f, halton(jitterIndex, 3u) - 0.5f) * effectiveJitterScale
         : glm::vec2(0.0f);
-    projection[2][0] -= currentJitter.x * 2.0f / static_cast<float>(std::max(extent_.width, 1u));
-    projection[2][1] -= currentJitter.y * 2.0f / static_cast<float>(std::max(extent_.height, 1u));
+    projection[2][0] -= currentJitter.x * 2.0f / static_cast<float>(std::max(renderExtent_.width, 1u));
+    projection[2][1] -= currentJitter.y * 2.0f / static_cast<float>(std::max(renderExtent_.height, 1u));
     const glm::mat4 viewProj = projection * view;
     camera_.jitter = glm::vec4(currentJitter, previousJitter_);
     Buffer& frameUniforms = currentFrame_->uniformRing();
@@ -1086,12 +1229,12 @@ void PathTracerRenderer::updateCamera() {
     const bool allowDenoiserForDebugView = denoiserDebugView;
     const bool stablePreview = shouldRunTaa();
     const bool allowDenoiserWhileMoving = settings_.denoiseWhileMoving || stablePreview || !cameraChangedThisFrame_;
-    denoiserParams_.enabled = settings_.pathTracingEnabled && settings_.denoiserEnabled && allowDenoiserForDebugView && allowDenoiserWhileMoving ? 1u : 0u;
+    denoiserParams_.enabled = settings_.pathTracingEnabled && settings_.denoiserEnabled && allowDenoiserForDebugView && allowDenoiserWhileMoving && !adaptiveSkipDenoiser_ ? 1u : 0u;
     denoiserParams_.strength = settings_.denoiserStrength;
     denoiserParams_.frameCount = temporalFrameIndex_;
-    denoiserParams_.width = extent_.width;
-    denoiserParams_.height = extent_.height;
-    denoiserParams_.atrousIterations = settings_.atrousIterations;
+    denoiserParams_.width = renderExtent_.width;
+    denoiserParams_.height = renderExtent_.height;
+    denoiserParams_.atrousIterations = adaptiveEffectiveAtrousIterations_;
     denoiserParams_.debugView = denoiserDebugView ? debugParams_.view : 0u;
     denoiserParams_.resetHistory = temporalCameraCut ? 1u : 0u;
     frameUniforms.write(&denoiserParams_, sizeof(denoiserParams_), kFrameDenoiserParamsOffset);
@@ -1099,8 +1242,8 @@ void PathTracerRenderer::updateCamera() {
 
     taaParams_.enabled = shouldRunTaa() ? 1u : 0u;
     taaParams_.frameCount = temporalFrameIndex_;
-    taaParams_.width = extent_.width;
-    taaParams_.height = extent_.height;
+    taaParams_.width = displayExtent_.width;
+    taaParams_.height = displayExtent_.height;
     const float taaFeedback = cameraChangedThisFrame_
         ? std::min(settings_.taaFeedback, 0.05f)
         : settings_.taaFeedback;
@@ -1110,6 +1253,8 @@ void PathTracerRenderer::updateCamera() {
     taaParams_.sharpeningStrength = settings_.taaSharpeningStrength;
     taaParams_.historyValid = taaHistoryValid_ ? 1u : 0u;
     taaParams_.cameraMoving = cameraChangedThisFrame_ ? 1u : 0u;
+    taaParams_.renderWidth = renderExtent_.width;
+    taaParams_.renderHeight = renderExtent_.height;
     frameUniforms.write(&taaParams_, sizeof(taaParams_), kFrameTaaParamsOffset);
     frameUniforms.flush(sizeof(taaParams_), kFrameTaaParamsOffset);
     if (temporalFrameIndex_ == 1u || temporalFrameIndex_ % 120u == 0u) {
@@ -1122,15 +1267,15 @@ void PathTracerRenderer::updateCamera() {
             " taaFeedback=" + std::to_string(taaParams_.feedback));
     }
 
-    restirSpatialParams_.width = extent_.width;
-    restirSpatialParams_.height = extent_.height;
+    restirSpatialParams_.width = renderExtent_.width;
+    restirSpatialParams_.height = renderExtent_.height;
     restirSpatialParams_.frameCount = temporalFrameIndex_;
     restirSpatialParams_.enabled = shouldRunRestirSpatial() ? 1u : 0u;
     frameUniforms.write(&restirSpatialParams_, sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
     frameUniforms.flush(sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
 
-    fogParams_.width = extent_.width;
-    fogParams_.height = extent_.height;
+    fogParams_.width = renderExtent_.width;
+    fogParams_.height = renderExtent_.height;
     fogParams_.debugView = debugParams_.view;
     fogParams_.enabled = settings_.pathTracingEnabled ? 1u : 0u;
     frameUniforms.write(&fogParams_, sizeof(fogParams_), kFrameFogParamsOffset);
@@ -1269,6 +1414,9 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
 
 void PathTracerRenderer::recordRestirSpatial(VkCommandBuffer commandBuffer) {
     if (!shouldRunRestirSpatial()) {
+        if (adaptiveSkipRestirSpatial_) {
+            validationLog_.recordPass("adaptive skip restir spatial");
+        }
         return;
     }
 
@@ -1327,7 +1475,7 @@ void PathTracerRenderer::recordRestirSpatialPass(VkCommandBuffer commandBuffer) 
     restirSpatialPipeline_->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirSpatialPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
-    restirSpatialPipeline_->dispatch(commandBuffer, extent_.width, extent_.height);
+    restirSpatialPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
 }
 
 void PathTracerRenderer::recordRestirSpatialCopyPass(VkCommandBuffer commandBuffer) {
@@ -1411,7 +1559,7 @@ void PathTracerRenderer::recordHeightFogPass(VkCommandBuffer commandBuffer) {
     fogPipeline_->bind(commandBuffer);
     const std::array<VkDescriptorSet, 2> descriptorSets{set.handle(), atmosphereSet.handle()};
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, fogPipeline_->layout(), 0, static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 0, nullptr);
-    fogPipeline_->dispatch(commandBuffer, extent_.width, extent_.height);
+    fogPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
 }
 
 void PathTracerRenderer::recordRenderGraphPlan() {
@@ -1542,7 +1690,9 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         .addStorageRead(toneInput, PipelineDomain::Compute)
         .addStorageWrite(presentation, PipelineDomain::Compute);
 
-    if (selectedInstanceId_ != UINT32_MAX) {
+    if (selectedInstanceId_ != UINT32_MAX &&
+        renderExtent_.width == displayExtent_.width &&
+        renderExtent_.height == displayExtent_.height) {
         graph.addPass("selection_outline")
             .addStorageRead(entityIds, PipelineDomain::Compute)
             .addStorageReadWrite(presentation, PipelineDomain::Compute);
@@ -1631,11 +1781,17 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
     rayTracingPipeline_->bind(commandBuffer);
     const std::array<VkDescriptorSet, 2> descriptorSets{set.handle(), atmosphereSet.handle()};
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, rayTracingPipeline_->layout(), 0, static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 0, nullptr);
-    rayTracingPipeline_->traceRays(commandBuffer, extent_.width, extent_.height);
+    rayTracingPipeline_->traceRays(commandBuffer, renderExtent_.width, renderExtent_.height);
 }
 
 void PathTracerRenderer::recordSelectionOutline(VkCommandBuffer commandBuffer) {
     if (selectedInstanceId_ == UINT32_MAX || selectionOutlinePipeline_ == nullptr || selectionOutlineSetLayout_ == VK_NULL_HANDLE) {
+        currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+        return;
+    }
+    if (renderExtent_.width != displayExtent_.width || renderExtent_.height != displayExtent_.height) {
+        validationLog_.recordPass("selection outline skipped: render/display extent mismatch");
         currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
         currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
         return;
@@ -1696,8 +1852,8 @@ void PathTracerRenderer::recordSelectionOutlinePass(VkCommandBuffer commandBuffe
 
     const SelectionParams params{
         .selectedInstance = selectedInstanceId_,
-        .width = extent_.width,
-        .height = extent_.height,
+        .width = renderExtent_.width,
+        .height = renderExtent_.height,
         .enabled = 1u,
     };
     selectionParamsBuffer_.write(&params, sizeof(params));
@@ -1713,7 +1869,7 @@ void PathTracerRenderer::recordSelectionOutlinePass(VkCommandBuffer commandBuffe
     selectionOutlinePipeline_->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, selectionOutlinePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
-    selectionOutlinePipeline_->dispatch(commandBuffer, extent_.width, extent_.height, 8, 8);
+    selectionOutlinePipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height, 8, 8);
 
 }
 
@@ -1834,7 +1990,7 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
     denoiserPipeline_->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, denoiserPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
-    denoiserPipeline_->dispatch(commandBuffer, extent_.width, extent_.height);
+    denoiserPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
 }
 
 void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
@@ -2014,7 +2170,8 @@ bool PathTracerRenderer::shouldRunTaa() const {
 }
 
 bool PathTracerRenderer::shouldRunRestirSpatial() const {
-    return settings_.restirMode != RestirMode::ClassicNee &&
+    return !adaptiveSkipRestirSpatial_ &&
+        settings_.restirMode != RestirMode::ClassicNee &&
         restirSpatialPipeline_ != nullptr &&
         restirSpatialSetLayout_ != VK_NULL_HANDLE &&
         restirReservoirBuffer_.handle() != VK_NULL_HANDLE &&
@@ -2167,7 +2324,7 @@ void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
     taaPipeline_->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, taaPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
-    taaPipeline_->dispatch(commandBuffer, extent_.width, extent_.height);
+    taaPipeline_->dispatch(commandBuffer, displayExtent_.width, displayExtent_.height);
 }
 
 void PathTracerRenderer::recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer) {
@@ -2276,8 +2433,8 @@ void PathTracerRenderer::recordAutoExposureHistogramPass(VkCommandBuffer command
     VkDescriptorSet descriptorSet = histogramSet.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, luminanceHistogramPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     const HistogramParams histogramParams{
-        .width = extent_.width,
-        .height = extent_.height,
+        .width = sourceImage.extent().width,
+        .height = sourceImage.extent().height,
         .minLogLuminance = settings_.histogramMinLogLuminance,
         .maxLogLuminance = settings_.histogramMaxLogLuminance,
     };
@@ -2288,7 +2445,7 @@ void PathTracerRenderer::recordAutoExposureHistogramPass(VkCommandBuffer command
         0,
         sizeof(histogramParams),
         &histogramParams);
-    luminanceHistogramPipeline_->dispatch(commandBuffer, extent_.width, extent_.height);
+    luminanceHistogramPipeline_->dispatch(commandBuffer, sourceImage.extent().width, sourceImage.extent().height);
 }
 
 void PathTracerRenderer::recordAutoExposureReducePass(VkCommandBuffer commandBuffer) {
@@ -2303,7 +2460,7 @@ void PathTracerRenderer::recordAutoExposureReducePass(VkCommandBuffer commandBuf
     VkDescriptorSet descriptorSet = exposureSet.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, exposureReducePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     const ExposureReduceParams exposureParams{
-        .pixelCount = extent_.width * extent_.height,
+        .pixelCount = hdrPostProcessImage().extent().width * hdrPostProcessImage().extent().height,
         .targetLuminance = settings_.targetLuminance,
         .minExposure = settings_.minExposure,
         .maxExposure = settings_.maxExposure,
@@ -2419,7 +2576,7 @@ void PathTracerRenderer::recordToneMapPass(VkCommandBuffer commandBuffer) {
         0,
         sizeof(toneMapParams),
         &toneMapParams);
-    toneMapPipeline_->dispatch(commandBuffer, extent_.width, extent_.height);
+    toneMapPipeline_->dispatch(commandBuffer, displayExtent_.width, displayExtent_.height);
 }
 
 void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
@@ -2539,7 +2696,7 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
 }
 
 void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
-    validationLog_.recordPass("skip denoiser copy");
+    validationLog_.recordPass(adaptiveSkipDenoiser_ ? "adaptive skip denoiser copy" : "skip denoiser copy");
     rawImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
