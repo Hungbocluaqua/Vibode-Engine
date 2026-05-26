@@ -35,6 +35,7 @@ struct PathComponents {
     float ris_effective_light_pdf;
     float ris_pdf_ratio;
     float first_specular_probability;
+    float secondary_hit_distance;
     vec3 first_local_pos;
     uint bounce_count;
     uint instance_id;
@@ -517,6 +518,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.ris_effective_light_pdf = 0.0;
     components.ris_pdf_ratio = 0.0;
     components.first_specular_probability = 0.0;
+    components.secondary_hit_distance = 65504.0;
     components.first_local_pos = vec3(0.0);
     components.bounce_count = 0u;
     components.instance_id = 0xffffffffu;
@@ -583,6 +585,8 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.first_specular_probability = pbr_specular_sample_probability(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.instance_id = hit.instance_id;
             components.mesh_id = hit.mesh_id;
+        } else if (bounce == 1u) {
+            components.secondary_hit_distance = min(hit.t, 65504.0);
         }
 
         if (camera.sunlight_enabled != 0u && debug_params.view != 27u) {
@@ -861,7 +865,7 @@ void main() {
     pathData.direct_diffuse = vec4(components.direct_light * pathDiffuseWeight, did_hit ? 1.0 : 0.0);
     pathData.direct_specular = vec4(components.direct_light * pathSpecularWeight, did_hit ? min(hit_depth, 65504.0) : 65504.0);
     pathData.indirect_diffuse = vec4((components.indirect_light + components.environment_light) * pathDiffuseWeight, confidence);
-    pathData.indirect_specular = vec4((components.indirect_light + components.environment_light) * pathSpecularWeight, did_hit ? pathSpecularWeight : 0.0);
+    pathData.indirect_specular = vec4((components.indirect_light + components.environment_light) * pathSpecularWeight, did_hit ? components.secondary_hit_distance : 65504.0);
     pathData.albedo_roughness_hit_confidence = vec4(
         did_hit ? components.first_albedo : vec3(0.0),
         did_hit ? components.first_roughness : 1.0);
@@ -983,7 +987,13 @@ void main() {
         PathDataRecord pathData = path_data_buffer[pixel_index];
         output_value = vec3(
             clamp(pathData.albedo_roughness_hit_confidence.w, 0.0, 1.0),
-            clamp(log2(pathData.direct_specular.a + 1.0) / 10.0, 0.0, 1.0),
+            temporal_normalized_hit_distance(pathData.direct_specular.a),
+            temporal_normalized_hit_distance(pathData.indirect_specular.a));
+    } else if (debug_params.view == 54u) {
+        PathDataRecord pathData = path_data_buffer[pixel_index];
+        output_value = vec3(
+            temporal_normalized_hit_distance(pathData.direct_specular.a),
+            temporal_normalized_hit_distance(pathData.indirect_specular.a),
             clamp(pathData.indirect_diffuse.a, 0.0, 1.0));
     }
     imageStore(output_color, ivec2(pixel), vec4(output_value, 1.0));

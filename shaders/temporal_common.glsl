@@ -34,6 +34,15 @@ float temporal_variance_confidence(float variance, float scale) {
     return exp(-max(variance, 0.0) * scale);
 }
 
+float temporal_normalized_hit_distance(float hitDistance) {
+    return clamp(log2(max(hitDistance, 0.0) + 1.0) / 10.0, 0.0, 1.0);
+}
+
+float temporal_hit_distance_confidence(float currentNormalized, float historyNormalized, float rejectThreshold) {
+    float delta = abs(currentNormalized - historyNormalized);
+    return 1.0 - smoothstep(rejectThreshold, rejectThreshold * 2.5, delta);
+}
+
 float temporal_disocclusion_confidence(
     bool onScreen,
     bool historyKindValid,

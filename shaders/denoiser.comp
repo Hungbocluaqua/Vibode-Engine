@@ -249,13 +249,21 @@ void main() {
         return;
     }
 
+    PathDataRecord path_data = path_data_buffer[pixel_index];
+    float center_primary_hit_distance = path_data.direct_specular.a;
+    float center_secondary_hit_distance = path_data.indirect_specular.a;
+    float center_primary_hit_normalized = temporal_normalized_hit_distance(center_primary_hit_distance);
+    float center_secondary_hit_normalized = temporal_normalized_hit_distance(center_secondary_hit_distance);
+    float distance_kernel_bias = center_roughness * smoothstep(0.12, 0.55, center_primary_hit_normalized);
+
     float center_lum = luminance(center_color);
     float var_factor = sqrt(max(center_var, 0.0));
     float inv_strength = 1.0 / max(params.strength, 0.001);
     float sigma_color = (0.18 + var_factor * 1.8) * inv_strength;
     float sigma_depth = (0.12 + var_factor * 0.45) * inv_strength;
     float sigma_normal = 0.42 * inv_strength;
-    int adaptive_kernel_radius = int(clamp(ceil(mix(1.0, 2.0, max(center_roughness, clamp(center_var / 4.0, 0.0, 1.0)))), 1.0, 2.0));
+    float kernel_radius_signal = max(max(center_roughness, clamp(center_var / 4.0, 0.0, 1.0)), distance_kernel_bias);
+    int adaptive_kernel_radius = kernel_radius_signal > 0.5 ? 2 : 1;
     uint iterations = clamp(params.atrous_iterations, 1u, 5u);
 
     vec3 filtered_color = center_color;
@@ -268,6 +276,7 @@ void main() {
     float neighborhood_count = 0.0;
     float normal_cone_min = 1.0;
     float max_relative_depth_delta = 0.0;
+    float max_hit_distance_delta = 0.0;
 
     for (uint iter = 0u; iter < 5u; ++iter) {
         if (iter >= iterations) {
@@ -287,6 +296,7 @@ void main() {
                     continue;
                 }
 
+                uint sample_index = uint(sample_coords.y) * uint(dims.x) + uint(sample_coords.x);
 #if RTV_DENOISER_SHARED_TILE
                 vec3 sample_color;
                 vec4 sample_dn;
@@ -297,15 +307,18 @@ void main() {
                     sample_dn = decode_depth_normal(shared_depth_normal_tile[tile_index]);
                 } else {
                     sample_color = imageLoad(input_color, sample_coords).rgb;
-                    sample_dn = decode_depth_normal(input_depth_normal[uint(sample_coords.y) * uint(dims.x) + uint(sample_coords.x)]);
+                    sample_dn = decode_depth_normal(input_depth_normal[sample_index]);
                 }
 #else
                 vec3 sample_color = imageLoad(input_color, sample_coords).rgb;
-                vec4 sample_dn = decode_depth_normal(input_depth_normal[uint(sample_coords.y) * uint(dims.x) + uint(sample_coords.x)]);
+                vec4 sample_dn = decode_depth_normal(input_depth_normal[sample_index]);
 #endif
+                PathDataRecord sample_path_data = path_data_buffer[sample_index];
                 float sample_depth = sample_dn.r;
                 vec3 sample_normal = sample_dn.gba;
                 float sample_lum = luminance(sample_color);
+                float sample_primary_hit_normalized = temporal_normalized_hit_distance(sample_path_data.direct_specular.a);
+                float sample_secondary_hit_normalized = temporal_normalized_hit_distance(sample_path_data.indirect_specular.a);
 
                 float kernel_w = atrous_kernel_weight(kx) * atrous_kernel_weight(ky);
                 float color_diff = abs(sample_lum - center_lum);
@@ -314,7 +327,11 @@ void main() {
                 float depth_w = center_depth < 50.0 ? exp(-depth_diff / (sigma_depth + 0.001)) : 1.0;
                 float normal_diff = 1.0 - clamp(dot(sample_normal, center_normal), -1.0, 1.0);
                 float normal_w = center_depth < 50.0 ? exp(-normal_diff / (sigma_normal + 0.001)) : 1.0;
-                float weight = kernel_w * color_w * depth_w * normal_w;
+                float hit_distance_delta = max(
+                    abs(sample_primary_hit_normalized - center_primary_hit_normalized),
+                    abs(sample_secondary_hit_normalized - center_secondary_hit_normalized) * 0.5);
+                float hit_distance_w = exp(-hit_distance_delta * mix(14.0, 5.0, center_primary_hit_normalized));
+                float weight = kernel_w * color_w * depth_w * normal_w * hit_distance_w;
 
                 pass_color += sample_color * weight;
                 pass_weight += weight;
@@ -328,6 +345,7 @@ void main() {
                     float sample_normal_dot = clamp(dot(sample_normal, center_normal), -1.0, 1.0);
                     normal_cone_min = min(normal_cone_min, sample_normal_dot);
                     max_relative_depth_delta = max(max_relative_depth_delta, depth_diff);
+                    max_hit_distance_delta = max(max_hit_distance_delta, hit_distance_delta);
                 }
             }
         }
@@ -375,6 +393,17 @@ void main() {
             relative_pos_diff,
             normal_cone_min,
             max_relative_depth_delta);
+    float history_primary_hit_normalized = world_valid
+        ? temporal_normalized_hit_distance(length(reprojected_wp - prev_camera.prev_pos.xyz))
+        : center_primary_hit_normalized;
+    float hit_distance_confidence = sky_valid
+        ? 1.0
+        : temporal_hit_distance_confidence(
+            center_primary_hit_normalized,
+            history_primary_hit_normalized,
+            mix(0.035, 0.085, center_primary_hit_normalized));
+    hit_distance_confidence *= 1.0 - smoothstep(0.10, 0.26, max_hit_distance_delta);
+    disocclusion_confidence *= hit_distance_confidence;
 
     float history_lum_before_clip = luminance(history);
     history = temporal_clamp_history_ycocg(history, min_color, max_color, lum_sigma);
@@ -392,7 +421,6 @@ void main() {
     float denoiser_rejection = 1.0 - clamp(disocclusion_confidence * motion_confidence * specular_rejection, 0.0, 1.0);
 
     vec3 debug_color = filtered_color;
-    PathDataRecord path_data = path_data_buffer[pixel_index];
     if (params.debug_view == 1u) {
         debug_color = vec3(center_var / 4.0);
     } else if (params.debug_view == 2u) {
@@ -421,10 +449,15 @@ void main() {
     } else if (params.debug_view == 52u) {
         debug_color = vec3(
             clamp(path_data.albedo_roughness_hit_confidence.w, 0.0, 1.0),
-            clamp(log2(path_data.direct_specular.a + 1.0) / 10.0, 0.0, 1.0),
-            clamp(path_data.indirect_diffuse.a, 0.0, 1.0));
+            center_primary_hit_normalized,
+            center_secondary_hit_normalized);
     } else if (params.debug_view == 53u) {
         debug_color = vec3(float(adaptive_kernel_radius) / 2.0);
+    } else if (params.debug_view == 54u) {
+        debug_color = vec3(
+            center_primary_hit_normalized,
+            center_secondary_hit_normalized,
+            hit_distance_confidence);
     }
 
     vec3 denoised = params.debug_view == 0u ? mix(filtered_color, history, history_weight) : debug_color;

@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 50>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 50> views = {
+const std::array<RendererDebugView, 51>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 51> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -42,6 +42,7 @@ const std::array<RendererDebugView, 50>& editorDebugViews() {
         RendererDebugView::PathDataAlbedo,
         RendererDebugView::PathDataMetrics,
         RendererDebugView::DenoiserKernelRadius,
+        RendererDebugView::DenoiserHitDistance,
         RendererDebugView::ClayMaterial,
         RendererDebugView::FirstBounceThroughput,
         RendererDebugView::SecondaryEnvironmentMiss,
@@ -100,6 +101,7 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::PathDataAlbedo);
         selectable(RendererDebugView::PathDataMetrics);
         selectable(RendererDebugView::DenoiserKernelRadius);
+        selectable(RendererDebugView::DenoiserHitDistance);
         selectable(RendererDebugView::Roughness);
         selectable(RendererDebugView::ClayMaterial);
         selectable(RendererDebugView::InstanceId);

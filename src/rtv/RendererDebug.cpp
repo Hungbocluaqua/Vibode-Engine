@@ -81,8 +81,9 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "pathindirectdiffuse" || key == "indirectdiffuse") { return RendererDebugView::PathIndirectDiffuse; }
     if (key == "pathindirectspecular" || key == "indirectspecular") { return RendererDebugView::PathIndirectSpecular; }
     if (key == "pathdataalbedo" || key == "pathalbedo") { return RendererDebugView::PathDataAlbedo; }
-    if (key == "pathdatametrics" || key == "pathmetrics" || key == "hitconfidence" || key == "hitdistance") { return RendererDebugView::PathDataMetrics; }
+    if (key == "pathdatametrics" || key == "pathmetrics" || key == "pathhitdistance") { return RendererDebugView::PathDataMetrics; }
     if (key == "denoiserkernelradius" || key == "kernelradius" || key == "filterradius") { return RendererDebugView::DenoiserKernelRadius; }
+    if (key == "denoiserhitdistance" || key == "hitdistance" || key == "hitdistancefilter" || key == "hitdistancerejection") { return RendererDebugView::DenoiserHitDistance; }
     if (key == "directsample" || key == "directsampletype" || key == "sampletype") { return RendererDebugView::DirectSampleType; }
     if (key == "albedo" || key == "basecolor" || key == "basecolour") { return RendererDebugView::Albedo; }
     if (key == "clay" || key == "claymaterial" || key == "balancedclay" || key == "balancedclaymaterial" ||
@@ -191,6 +192,7 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::PathDataAlbedo: return "path-data-albedo";
     case RendererDebugView::PathDataMetrics: return "path-data-metrics";
     case RendererDebugView::DenoiserKernelRadius: return "denoiser-kernel-radius";
+    case RendererDebugView::DenoiserHitDistance: return "denoiser-hit-distance";
     }
     return "beauty";
 }

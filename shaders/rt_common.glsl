@@ -338,6 +338,10 @@ uint pack_variance(float v) {
     return pack_unorm2x16(vec2(clamp(v / 64.0, 0.0, 1.0), 0.0));
 }
 
+float temporal_normalized_hit_distance(float hitDistance) {
+    return clamp(log2(max(hitDistance, 0.0) + 1.0) / 10.0, 0.0, 1.0);
+}
+
 uvec2 pack_world_position(vec3 world_pos) {
     vec3 relative = clamp((world_pos - camera.pos.xyz) / 8.0, vec3(-1.0), vec3(1.0));
     return uvec2(pack_snorm2x16(relative.xy), pack_snorm2x16(vec2(relative.z, 0.0)));
