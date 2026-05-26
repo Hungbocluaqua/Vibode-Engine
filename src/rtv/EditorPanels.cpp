@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 54>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 54> views = {
+const std::array<RendererDebugView, 56>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 56> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -46,6 +46,7 @@ const std::array<RendererDebugView, 54>& editorDebugViews() {
         RendererDebugView::DenoiserVirtualMotion,
         RendererDebugView::DenoiserDiffuseHistory,
         RendererDebugView::DenoiserSpecularHistory,
+        RendererDebugView::DenoiserEmissiveClamp,
         RendererDebugView::ClayMaterial,
         RendererDebugView::FirstBounceThroughput,
         RendererDebugView::SecondaryEnvironmentMiss,
@@ -62,6 +63,7 @@ const std::array<RendererDebugView, 54>& editorDebugViews() {
         RendererDebugView::RestirReservoirAge,
         RendererDebugView::RestirReservoirConfidence,
         RendererDebugView::RestirReservoirM,
+        RendererDebugView::RestirPairwiseMis,
     };
     return views;
 }
@@ -108,6 +110,7 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::DenoiserVirtualMotion);
         selectable(RendererDebugView::DenoiserDiffuseHistory);
         selectable(RendererDebugView::DenoiserSpecularHistory);
+        selectable(RendererDebugView::DenoiserEmissiveClamp);
         selectable(RendererDebugView::Roughness);
         selectable(RendererDebugView::ClayMaterial);
         selectable(RendererDebugView::InstanceId);
@@ -151,6 +154,7 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::RestirReservoirAge);
         selectable(RendererDebugView::RestirReservoirConfidence);
         selectable(RendererDebugView::RestirReservoirM);
+        selectable(RendererDebugView::RestirPairwiseMis);
         ImGui::EndCombo();
     }
 }

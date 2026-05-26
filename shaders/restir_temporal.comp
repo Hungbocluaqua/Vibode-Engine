@@ -17,10 +17,42 @@ layout(set = 0, binding = 0, std140) uniform RestirTemporalParams {
 layout(set = 0, binding = 1, std430) buffer InputReservoirs { RestirReservoir input_reservoirs[]; };
 layout(set = 0, binding = 2, std430) readonly buffer PreviousReservoirs { RestirReservoir previous_reservoirs[]; };
 layout(set = 0, binding = 3, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+layout(set = 0, binding = 4, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
 
 vec2 restir_unpack_velocity_pixels(uint packedVelocity) {
     vec2 uv = vec2(float(packedVelocity & 0xffffu), float((packedVelocity >> 16u) & 0xffffu)) / 65535.0;
+    return (uv * 2.0 - vec2(1.0)) * 64.0;
+}
+
+vec2 restir_unpack_snorm2x16(uint packedValue) {
+    vec2 uv = vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
     return uv * 2.0 - vec2(1.0);
+}
+
+vec3 restir_decode_octahedral_normal(uint packedValue) {
+    vec2 f = restir_unpack_snorm2x16(packedValue);
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+float restir_surface_compatibility(uvec4 currentPacked, uvec4 previousPacked) {
+    float currentDepth = uintBitsToFloat(currentPacked.x);
+    float previousDepth = uintBitsToFloat(previousPacked.x);
+    vec3 currentNormal = restir_decode_octahedral_normal(currentPacked.y);
+    vec3 previousNormal = restir_decode_octahedral_normal(previousPacked.y);
+    float currentRoughness = clamp(uintBitsToFloat(currentPacked.z), 0.01, 1.0);
+    float previousRoughness = clamp(uintBitsToFloat(previousPacked.z), 0.01, 1.0);
+    float roughness = max(currentRoughness, previousRoughness);
+    float relativeDepth = abs(currentDepth - previousDepth) / max(abs(currentDepth), 1.0e-3);
+    float depthThreshold = mix(0.02, 0.08, roughness);
+    float normalThreshold = mix(0.96, 0.78, roughness);
+    if (relativeDepth > depthThreshold || dot(currentNormal, previousNormal) < normalThreshold) {
+        return 0.0;
+    }
+    return 1.0;
 }
 
 void main() {
@@ -57,23 +89,9 @@ void main() {
         return;
     }
 
-    float currentPdf = max(current.target_pdf_weight_sum_m.x, 1.0e-6);
-    float previousPdf = max(previous.target_pdf_weight_sum_m.x, 1.0e-6);
     float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
-    float motionCap = mix(0.85, 0.10, 1.0 - motionConfidence);
-    float previousWeight = clamp(previousPdf / (currentPdf + previousPdf), 0.0, motionCap);
-    float currentWeight = 1.0 - previousWeight;
-
-    current.metadata.y = min(previous.metadata.y + 1u, 255u);
-    current.sample_value_confidence.rgb =
-        current.sample_value_confidence.rgb * currentWeight +
-        previous.sample_value_confidence.rgb * previousWeight;
-    current.sample_value_confidence.a = clamp(
-        (currentWeight + previous.sample_value_confidence.a * previousWeight) * motionConfidence, 0.0, 1.0);
-    current.target_pdf_weight_sum_m.y =
-        current.target_pdf_weight_sum_m.y * currentWeight +
-        previous.target_pdf_weight_sum_m.y * previousWeight;
-    current.target_pdf_weight_sum_m.z = min(current.target_pdf_weight_sum_m.z + previous.target_pdf_weight_sum_m.z, 64.0);
-
-    input_reservoirs[pixelIndex] = current;
+    float surfaceCompatibility = restir_surface_compatibility(depth_normal_buffer[pixelIndex], depth_normal_buffer[historyIndex]);
+    input_reservoirs[pixelIndex] = surfaceCompatibility > 0.0
+        ? restir_pairwise_temporal_merge(current, previous, motionConfidence * surfaceCompatibility, params.max_age)
+        : current;
 }

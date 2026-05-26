@@ -73,6 +73,8 @@ enum class RendererDebugView : uint32_t {
     DenoiserVirtualMotion = 55,
     DenoiserDiffuseHistory = 56,
     DenoiserSpecularHistory = 57,
+    DenoiserEmissiveClamp = 58,
+    RestirPairwiseMis = 59,
 };
 
 enum class RestirMode : uint32_t {

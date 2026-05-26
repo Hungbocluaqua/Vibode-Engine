@@ -15,10 +15,6 @@ layout(set = 0, binding = 0, std140) uniform RestirFinalParams {
 layout(set = 0, binding = 1, std430) readonly buffer InputReservoirs { RestirReservoir input_reservoirs[]; };
 layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D output_direct_light;
 
-float restir_luminance(vec3 value) {
-    return dot(value, vec3(0.2126, 0.7152, 0.0722));
-}
-
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
@@ -38,8 +34,6 @@ void main() {
         return;
     }
 
-    float m = max(reservoir.target_pdf_weight_sum_m.z, 1.0);
-    vec3 unbiased = reservoir.sample_value_confidence.rgb / m;
     float confidence = clamp(reservoir.sample_value_confidence.a, 0.0, 1.0);
-    imageStore(output_direct_light, coords, vec4(unbiased * confidence, confidence));
+    imageStore(output_direct_light, coords, vec4(max(reservoir.sample_value_confidence.rgb, vec3(0.0)) * confidence, confidence));
 }

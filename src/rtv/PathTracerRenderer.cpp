@@ -1277,7 +1277,7 @@ void PathTracerRenderer::updateCamera() {
         debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalReactiveMask) ||
         debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalHistoryWeight) ||
         (debugParams_.view >= static_cast<uint32_t>(RendererDebugView::PathDirectDiffuse) &&
-         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularHistory));
+         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserEmissiveClamp));
     const bool allowDenoiserForDebugView = denoiserDebugView;
     const bool stablePreview = shouldRunTaa();
     const bool allowDenoiserWhileMoving = settings_.denoiseWhileMoving || stablePreview || !cameraChangedThisFrame_;
@@ -2380,7 +2380,7 @@ bool PathTracerRenderer::shouldRunDenoiser() const {
         return true;
     }
     if (denoiserParams_.debugView >= static_cast<uint32_t>(RendererDebugView::PathDirectDiffuse) &&
-        denoiserParams_.debugView <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularHistory)) {
+        denoiserParams_.debugView <= static_cast<uint32_t>(RendererDebugView::DenoiserEmissiveClamp)) {
         return true;
     }
     return false;

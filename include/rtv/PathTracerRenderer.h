@@ -214,8 +214,10 @@ private:
     };
 
     struct RestirReservoirGpu {
+        // metadata: sample type, age, valid/visibility bits, temporal compatibility signature.
         glm::uvec4 metadata{};
         glm::vec4 sampleValueConfidence{};
+        // targetPdfWeightSumM: source pdf, target luminance, sample count, pairwise temporal previous weight.
         glm::vec4 targetPdfWeightSumM{};
     };
 

@@ -289,6 +289,8 @@ void main() {
     float specular_lum = luminance(path_data.direct_specular.rgb + path_data.indirect_specular.rgb);
     float diffuse_lum = luminance(path_data.direct_diffuse.rgb + path_data.indirect_diffuse.rgb);
     float specular_signal = clamp(specular_lum / max(specular_lum + diffuse_lum, 1.0e-4), 0.0, 1.0);
+    float emissive_lum = max(path_data.direct_diffuse.a, 0.0);
+    float emissive_signal = smoothstep(0.08, 0.60, temporal_normalized_hit_distance(emissive_lum));
     float distance_kernel_bias = center_roughness * smoothstep(0.12, 0.55, center_primary_hit_normalized);
 
     float center_lum = luminance(center_color);
@@ -533,6 +535,20 @@ void main() {
     float denoiser_rejection = 1.0 - clamp(disocclusion_confidence * motion_confidence * specular_rejection, 0.0, 1.0);
     vec3 resolved_diffuse = mix(current_diffuse, diffuse_history, diffuse_history_weight);
     vec3 resolved_specular = mix(current_specular, specular_history, specular_history_weight);
+    vec3 resolved_color = resolved_diffuse + resolved_specular;
+    float emissive_history_confidence = diffuse_channel_confidence *
+        diffuse_motion_confidence *
+        frame_blend *
+        (1.0 - reactive_mask);
+    float emissive_spike = smoothstep(lum_mean + lum_sigma * 1.5 + 0.15, lum_mean + lum_sigma * 5.0 + 0.5, center_lum);
+    float emissive_clamp_amount = emissive_signal * emissive_spike * emissive_history_confidence;
+    float resolved_lum = luminance(resolved_color);
+    float emissive_history_lum = max(luminance(diffuse_history), luminance(history));
+    float emissive_lum_limit = max(lum_mean + lum_sigma * 2.5 + 0.05, emissive_history_lum * 1.75 + 0.25);
+    vec3 emissive_clamped_color = resolved_color * min(1.0, emissive_lum_limit / max(resolved_lum, 1.0e-4));
+    resolved_color = mix(resolved_color, emissive_clamped_color, emissive_clamp_amount);
+    resolved_diffuse = mix(resolved_diffuse, resolved_color * diffuse_signal, emissive_clamp_amount);
+    resolved_specular = resolved_color - resolved_diffuse;
 
     vec3 debug_color = filtered_color;
     if (params.debug_view == 1u) {
@@ -587,9 +603,14 @@ void main() {
             temporal_effective_history_length(specular_history_weight) / 50.0,
             specular_channel_confidence,
             specular_signal);
+    } else if (params.debug_view == 58u) {
+        debug_color = vec3(
+            emissive_signal,
+            emissive_history_confidence,
+            emissive_clamp_amount);
     }
 
-    vec3 denoised = params.debug_view == 0u ? resolved_diffuse + resolved_specular : debug_color;
+    vec3 denoised = params.debug_view == 0u ? resolved_color : debug_color;
     imageStore(output_diffuse_history, coords, vec4(resolved_diffuse, 1.0));
     imageStore(output_specular_history, coords, vec4(resolved_specular, 1.0));
     imageStore(output_denoised, coords, vec4(denoised, 1.0));

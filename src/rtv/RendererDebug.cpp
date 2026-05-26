@@ -87,6 +87,7 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "denoiservirtualmotion" || key == "virtualmotion" || key == "specularvirtualmotion" || key == "specularvelocity") { return RendererDebugView::DenoiserVirtualMotion; }
     if (key == "denoiserdiffusehistory" || key == "diffusehistory" || key == "diffusehistoryconfidence") { return RendererDebugView::DenoiserDiffuseHistory; }
     if (key == "denoiserspecularhistory" || key == "specularhistory" || key == "specularhistoryconfidence") { return RendererDebugView::DenoiserSpecularHistory; }
+    if (key == "denoiseremissiveclamp" || key == "emissiveclamp" || key == "emissiveantiflicker") { return RendererDebugView::DenoiserEmissiveClamp; }
     if (key == "directsample" || key == "directsampletype" || key == "sampletype") { return RendererDebugView::DirectSampleType; }
     if (key == "albedo" || key == "basecolor" || key == "basecolour") { return RendererDebugView::Albedo; }
     if (key == "clay" || key == "claymaterial" || key == "balancedclay" || key == "balancedclaymaterial" ||
@@ -135,6 +136,9 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     }
     if (key == "restirm" || key == "restirreservoirm" || key == "reservoirm" || key == "restirsamplecount") {
         return RendererDebugView::RestirReservoirM;
+    }
+    if (key == "restirpairwisemis" || key == "restirtemporalweight" || key == "restirmisweight" || key == "pairwisemis") {
+        return RendererDebugView::RestirPairwiseMis;
     }
     return RendererDebugView::Beauty;
 }
@@ -199,6 +203,8 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::DenoiserVirtualMotion: return "denoiser-virtual-motion";
     case RendererDebugView::DenoiserDiffuseHistory: return "denoiser-diffuse-history";
     case RendererDebugView::DenoiserSpecularHistory: return "denoiser-specular-history";
+    case RendererDebugView::DenoiserEmissiveClamp: return "denoiser-emissive-clamp";
+    case RendererDebugView::RestirPairwiseMis: return "restir-pairwise-mis";
     }
     return "beauty";
 }

@@ -71,29 +71,43 @@ RestirReservoir empty_restir_reservoir() {
     return reservoir;
 }
 
+RestirReservoir make_initial_restir_reservoir(vec3 directLight, float lightPdf, uint sampleType, float roughness) {
+    bool valid = sampleType != 0u && lightPdf > 1.0e-6;
+    vec3 sampleValue = valid ? max(directLight, vec3(0.0)) : vec3(0.0);
+    float sampleLum = luminance(sampleValue);
+    if (sampleLum > 50.0) {
+        sampleValue *= 50.0 / sampleLum;
+        sampleLum = 50.0;
+    }
+
+    RestirReservoir current;
+    current.metadata = uvec4(
+        sampleType,
+        0u,
+        restir_pack_validity_visibility(valid, RESTIR_VISIBILITY_VISIBLE),
+        valid ? restir_temporal_signature(sampleType, roughness) : 0u);
+    current.sample_value_confidence = vec4(sampleValue, valid ? 1.0 : 0.0);
+    current.target_pdf_weight_sum_m = vec4(
+        valid ? lightPdf : 0.0,
+        sampleLum,
+        valid ? 1.0 : 0.0,
+        0.0);
+    return current;
+}
+
 void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, uint packedVelocity, PathComponents components) {
     if (restir_mode() == 0u) {
         restir_reservoirs[pixelIndex] = empty_restir_reservoir();
         return;
     }
 
-    bool valid = components.first_direct_sample_type != 0u && components.first_light_pdf > 1.0e-6;
-    vec3 sampleValue = valid ? max(components.restir_initial_direct_light, vec3(0.0)) : vec3(0.0);
-    float sampleLum = luminance(sampleValue);
-    if (sampleLum > 50.0) {
-        sampleValue *= 50.0 / sampleLum;
-        sampleLum = 50.0;
-    }
-    RestirReservoir current;
-    current.metadata = uvec4(components.first_direct_sample_type, 0u, valid ? 1u : 0u, 0u);
-    current.sample_value_confidence = vec4(sampleValue, valid ? 1.0 : 0.0);
-    current.target_pdf_weight_sum_m = vec4(
-        valid ? components.first_light_pdf : 0.0,
-        sampleLum,
-        valid ? 1.0 : 0.0,
-        0.0);
+    RestirReservoir current = make_initial_restir_reservoir(
+        components.restir_initial_direct_light,
+        components.first_light_pdf,
+        components.first_direct_sample_type,
+        components.first_roughness);
 
-    if (!valid) {
+    if (!restir_reservoir_valid(current)) {
         restir_reservoirs[pixelIndex] = current;
         return;
     }
@@ -113,35 +127,14 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
     ivec2 historyCoords = clamp(ivec2(round(historyPos)), ivec2(0), dims - ivec2(1));
     uint historyIndex = uint(historyCoords.y) * uint(dims.x) + uint(historyCoords.x);
     RestirReservoir previous = previous_restir_reservoirs[historyIndex];
-    bool previousValid = previous.metadata.z != 0u &&
-        previous.target_pdf_weight_sum_m.z > 0.0 &&
-        previous.sample_value_confidence.a > 0.0;
-    if (!previousValid) {
+    if (!restir_reservoir_valid(previous)) {
         current.sample_value_confidence.a = 0.35;
         restir_reservoirs[pixelIndex] = current;
         return;
     }
 
-    float currentPdf = max(current.target_pdf_weight_sum_m.x, 1.0e-6);
-    float previousPdf = max(previous.target_pdf_weight_sum_m.x, 1.0e-6);
     float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
-    float motionCap = mix(0.85, 0.10, 1.0 - motionConfidence);
-    float previousWeight = clamp(previousPdf / (currentPdf + previousPdf), 0.0, motionCap);
-    float currentWeight = 1.0 - previousWeight;
-
-    current.metadata.y = min(previous.metadata.y + 1u, 255u);
-    current.sample_value_confidence.rgb =
-        current.sample_value_confidence.rgb * currentWeight +
-        previous.sample_value_confidence.rgb * previousWeight;
-    current.sample_value_confidence.a = clamp(
-        (currentWeight + previous.sample_value_confidence.a * previousWeight) * motionConfidence,
-        0.0,
-        1.0);
-    current.target_pdf_weight_sum_m.y =
-        current.target_pdf_weight_sum_m.y * currentWeight +
-        previous.target_pdf_weight_sum_m.y * previousWeight;
-    current.target_pdf_weight_sum_m.z = min(current.target_pdf_weight_sum_m.z + previous.target_pdf_weight_sum_m.z, 64.0);
-    restir_reservoirs[pixelIndex] = current;
+    restir_reservoirs[pixelIndex] = restir_pairwise_temporal_merge(current, previous, motionConfidence, 32.0);
 }
 
 void reset_payload() {
@@ -659,6 +652,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             uint packedFirstVel = compute_surface_velocity(hit.world_pos, hit.local_pos, hit.instance_id, dims);
             RestirReservoir previousReservoir;
             bool reprojectionValid = false;
+            float restirMotionConfidence = 1.0;
             if (packedFirstVel != 0u) {
                 vec2 firstVel = restir_unpack_velocity_pixels(packedFirstVel);
                 ivec2 reprojected = ivec2(round(vec2(coords) - firstVel));
@@ -666,17 +660,27 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 uint reprojectedIndex = uint(clampedReprojected.y) * uint(dims.x) + uint(clampedReprojected.x);
                 previousReservoir = previous_restir_reservoirs[reprojectedIndex];
                 reprojectionValid = length(firstVel) < float(max(dims.x, dims.y)) * 0.5;
+                restirMotionConfidence = 1.0 - clamp(length(firstVel) / 24.0, 0.0, 0.75);
             } else {
                 previousReservoir = previous_restir_reservoirs[pixelIndex];
+                reprojectionValid = true;
             }
-            bool previousReservoirValid = previousReservoir.metadata.z != 0u &&
-                previousReservoir.sample_value_confidence.a > 0.0 &&
-                previousReservoir.target_pdf_weight_sum_m.z > 0.0 &&
+            bool previousReservoirValid = restir_reservoir_valid(previousReservoir) &&
                 temporal_history_available() &&
                 reprojectionValid;
             bool useRestir = restir_mode() == 1u || (restir_mode() == 2u && coords.x >= dims.x / 2);
             if (useRestir && previousReservoirValid) {
-                shadedDirect = previousReservoir.sample_value_confidence.rgb;
+                RestirReservoir currentReservoir = make_initial_restir_reservoir(
+                    direct * atmosTransmittance,
+                    lightPdf,
+                    directSampleType,
+                    material.roughness);
+                RestirReservoir mergedReservoir = restir_pairwise_temporal_merge(
+                    currentReservoir,
+                    previousReservoir,
+                    restirMotionConfidence,
+                    32.0);
+                shadedDirect = mergedReservoir.sample_value_confidence.rgb / max(atmosTransmittance, vec3(1.0e-3));
             }
         }
         float bounceContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
@@ -862,7 +866,8 @@ void main() {
         ? clamp(1.0 - abs(lum - avgLum) / (max(max(lum, avgLum), 0.0) + 1.0), 0.0, 1.0)
         : 0.0;
     PathDataRecord pathData;
-    pathData.direct_diffuse = vec4(components.direct_light * pathDiffuseWeight, did_hit ? 1.0 : 0.0);
+    float emissiveSignal = luminance(components.emissive_light);
+    pathData.direct_diffuse = vec4(components.direct_light * pathDiffuseWeight, emissiveSignal);
     pathData.direct_specular = vec4(components.direct_light * pathSpecularWeight, did_hit ? min(hit_depth, 65504.0) : 65504.0);
     pathData.indirect_diffuse = vec4((components.indirect_light + components.environment_light) * pathDiffuseWeight, confidence);
     pathData.indirect_specular = vec4((components.indirect_light + components.environment_light) * pathSpecularWeight, did_hit ? components.secondary_hit_distance : 65504.0);
@@ -950,6 +955,9 @@ void main() {
         output_value = vec3(clamp(restir_reservoirs[pixel_index].sample_value_confidence.a, 0.0, 1.0));
     } else if (debug_params.view == 37u) {
         output_value = vec3(clamp(restir_reservoirs[pixel_index].target_pdf_weight_sum_m.z, 0.0, 1.0));
+    } else if (debug_params.view == 59u) {
+        float previousWeight = clamp(restir_reservoirs[pixel_index].target_pdf_weight_sum_m.w, 0.0, 1.0);
+        output_value = vec3(previousWeight, 1.0 - previousWeight, clamp(restir_reservoirs[pixel_index].sample_value_confidence.a, 0.0, 1.0));
     } else if (debug_params.view == 38u) {
         output_value = components.emissive_continuation > 0.0 ? vec3(0.05, 0.95, 0.35) : vec3(0.0);
     } else if (debug_params.view == 39u) {
