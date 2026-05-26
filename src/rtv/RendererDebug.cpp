@@ -140,6 +140,12 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "restirpairwisemis" || key == "restirtemporalweight" || key == "restirmisweight" || key == "pairwisemis") {
         return RendererDebugView::RestirPairwiseMis;
     }
+    if (key == "restirgivalidity" || key == "restirgivalid" || key == "gireservoirvalidity" || key == "givalidity") {
+        return RendererDebugView::RestirGiValidity;
+    }
+    if (key == "restirgiage" || key == "gireservoirage" || key == "giage") {
+        return RendererDebugView::RestirGiAge;
+    }
     return RendererDebugView::Beauty;
 }
 
@@ -205,6 +211,8 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::DenoiserSpecularHistory: return "denoiser-specular-history";
     case RendererDebugView::DenoiserEmissiveClamp: return "denoiser-emissive-clamp";
     case RendererDebugView::RestirPairwiseMis: return "restir-pairwise-mis";
+    case RendererDebugView::RestirGiValidity: return "restir-gi-validity";
+    case RendererDebugView::RestirGiAge: return "restir-gi-age";
     }
     return "beauty";
 }

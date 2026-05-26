@@ -7,9 +7,19 @@ struct RestirReservoir {
     vec4 target_pdf_weight_sum_m;
 };
 
+struct RestirGiReservoir {
+    vec4 hit_position_target_pdf;
+    vec4 normal_roughness;
+    vec4 radiance_weight_sum;
+    vec4 receiver_position_hit_distance;
+    uvec4 metadata;
+};
+
 const uint RESTIR_VISIBILITY_UNKNOWN = 0u;
 const uint RESTIR_VISIBILITY_VISIBLE = 1u;
 const uint RESTIR_VISIBILITY_INVALID = 2u;
+const uint RESTIR_GI_FLAG_VALID = 1u << 0u;
+const uint RESTIR_GI_FLAG_VISIBLE = 1u << 1u;
 
 uint restir_pack_validity_visibility(bool valid, uint visibility) {
     return valid ? (1u | ((visibility & 3u) << 1u)) : 0u;
@@ -31,10 +41,35 @@ RestirReservoir empty_restir_reservoir() {
     return reservoir;
 }
 
+RestirGiReservoir empty_restir_gi_reservoir() {
+    RestirGiReservoir reservoir;
+    reservoir.hit_position_target_pdf = vec4(0.0);
+    reservoir.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
+    reservoir.radiance_weight_sum = vec4(0.0);
+    reservoir.receiver_position_hit_distance = vec4(0.0);
+    reservoir.metadata = uvec4(0u);
+    return reservoir;
+}
+
 bool restir_reservoir_valid(RestirReservoir reservoir) {
     return restir_validity_bit(reservoir.metadata.z) &&
         reservoir.target_pdf_weight_sum_m.z > 0.0 &&
         reservoir.sample_value_confidence.a > 0.0;
+}
+
+bool restir_gi_reservoir_valid(RestirGiReservoir reservoir) {
+    return (reservoir.metadata.z & RESTIR_GI_FLAG_VALID) != 0u &&
+        reservoir.radiance_weight_sum.w > 0.0 &&
+        reservoir.hit_position_target_pdf.w > 0.0 &&
+        reservoir.metadata.x > 0u;
+}
+
+float restir_gi_sample_count(RestirGiReservoir reservoir) {
+    return max(float(reservoir.metadata.x), 1.0);
+}
+
+float restir_gi_age_normalized(RestirGiReservoir reservoir, float maxAge) {
+    return clamp(float(reservoir.metadata.y) / max(maxAge, 1.0), 0.0, 1.0);
 }
 
 float restir_luminance(vec3 value) {
@@ -113,13 +148,18 @@ float restir_pairwise_previous_weight(RestirReservoir current, RestirReservoir p
 RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirReservoir previous, float motionConfidence, float maxAge) {
     float previousWeight = restir_pairwise_previous_weight(current, previous, motionConfidence, maxAge);
     float currentWeight = 1.0 - previousWeight;
+    uint currentVisibility = restir_visibility_state(current);
+    uint previousVisibility = restir_visibility_state(previous);
+    uint mergedVisibility = previousWeight > 0.0
+        ? (currentVisibility == RESTIR_VISIBILITY_VISIBLE && previousVisibility == RESTIR_VISIBILITY_VISIBLE
+            ? RESTIR_VISIBILITY_VISIBLE
+            : RESTIR_VISIBILITY_UNKNOWN)
+        : currentVisibility;
 
     current.metadata.y = previousWeight > 0.0 ? min(previous.metadata.y + 1u, 255u) : 0u;
     current.metadata.z = restir_pack_validity_visibility(
         restir_reservoir_valid(current),
-        previousWeight > 0.0 && restir_visibility_state(previous) == RESTIR_VISIBILITY_VISIBLE
-            ? RESTIR_VISIBILITY_VISIBLE
-            : RESTIR_VISIBILITY_UNKNOWN);
+        mergedVisibility);
     current.sample_value_confidence.rgb =
         current.sample_value_confidence.rgb * currentWeight +
         previous.sample_value_confidence.rgb * previousWeight;

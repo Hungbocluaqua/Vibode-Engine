@@ -17,6 +17,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <optional>
 #include <string>
@@ -53,6 +54,7 @@ public:
     void run(uint32_t maxFrames = 0);
     void runHeadless(uint32_t warmupFrames, uint32_t totalFrames);
     void renderFrames(uint32_t count);
+    void setFrameCaptureCallbacks(std::function<void(uint32_t)> begin, std::function<void(uint32_t)> end);
     void resetAccumulation();
     void applyDebugView(RendererDebugView view);
     void onWindowFocusChanged(bool focused);
@@ -133,6 +135,8 @@ private:
     uint32_t totalFrameCount_ = 0;
     std::vector<float> cpuFrameTimings_;
     std::vector<float> gpuFrameTimings_;
+    std::function<void(uint32_t)> beginFrameCapture_;
+    std::function<void(uint32_t)> endFrameCapture_;
     RendererDebugView debugView_ = RendererDebugView::Beauty;
     std::optional<std::filesystem::path> gltfPath_;
     std::optional<std::filesystem::path> hdrPath_;

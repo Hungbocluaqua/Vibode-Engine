@@ -124,6 +124,7 @@ public:
     [[nodiscard]] VkDeviceSize restirReservoirMemory() const;
 
     void setDumpRenderGraphPath(std::optional<std::filesystem::path> path) { dumpRenderGraphPath_ = std::move(path); }
+    void setDumpRenderGraphDotPath(std::optional<std::filesystem::path> path) { dumpRenderGraphDotPath_ = std::move(path); }
 
 private:
     struct DenoiserParams {
@@ -229,6 +230,15 @@ private:
         glm::vec4 targetPdfWeightSumM{};
     };
 
+    struct RestirGiReservoirGpu {
+        glm::vec4 hitPositionTargetPdf{};
+        glm::vec4 normalRoughness{};
+        glm::vec4 radianceWeightSum{};
+        glm::vec4 receiverPositionHitDistance{};
+        glm::uvec4 metadata{};
+    };
+    static_assert(sizeof(RestirGiReservoirGpu) == 80);
+
     struct PathDataGpu {
         glm::vec4 directDiffuse{};
         glm::vec4 directSpecular{};
@@ -296,6 +306,7 @@ private:
     CameraUniform camera_{};
     RendererSettings settings_{};
     std::optional<std::filesystem::path> dumpRenderGraphPath_;
+    std::optional<std::filesystem::path> dumpRenderGraphDotPath_;
     DenoiserParams denoiserParams_{};
     TaaParams taaParams_{};
     RestirSpatialParams restirSpatialParams_{};
@@ -333,6 +344,9 @@ private:
     Buffer restirReservoirBuffer_;
     Buffer previousRestirReservoirBuffer_;
     Buffer restirSpatialReservoirBuffer_;
+    Buffer restirGiReservoirBuffer_;
+    Buffer previousRestirGiReservoirBuffer_;
+    Buffer restirGiSpatialReservoirBuffer_;
     Buffer selectionParamsBuffer_;
     Buffer histogramBuffer_;
     Buffer exposureBuffer_;

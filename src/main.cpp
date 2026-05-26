@@ -17,6 +17,8 @@
 #include <stdexcept>
 
 #ifdef RTV_HAS_RENDERDOC
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <renderdoc_app.h>
 static RENDERDOC_API_1_6_0* rdocApi = nullptr;
 static std::filesystem::path rdocCapturePath;
@@ -124,6 +126,17 @@ int main(int argc, char** argv) {
         if (diagConfig.headless && maxFrames == 0) {
             maxFrames = diagConfig.totalFrames;
         }
+        if (maxFrames != 0) {
+            diagConfig.totalFrames = maxFrames;
+        }
+
+        if (diagConfig.runValidationSuite) {
+            rtv::HeadlessDiagnostics diag(diagConfig);
+            const auto summary = diag.runValidationSuite();
+            std::cout << "Validation suite: " << summary.totalPass << " passed, "
+                      << summary.totalFail << " failed\n";
+            return summary.totalFail > 0 ? 1 : 0;
+        }
 
         if (diagConfig.headless && !scenePath.has_value()) {
             throw std::runtime_error("--headless requires --scene <path>");
@@ -142,6 +155,9 @@ int main(int argc, char** argv) {
             if (diagConfig.dumpRenderGraphPath.has_value()) {
                 renderer->setDumpRenderGraphPath(diagConfig.dumpRenderGraphPath);
             }
+            if (dumpRenderGraphDot && dotOutputPath.has_value()) {
+                renderer->setDumpRenderGraphDotPath(dotOutputPath);
+            }
             if (diagConfig.disableAsyncCompute || diagConfig.singleQueueFallback) {
                 rtv::RendererSettings settings = renderer->settings();
                 settings.adaptiveQualityMode = rtv::AdaptiveQualityMode::Off;
@@ -153,23 +169,51 @@ int main(int argc, char** argv) {
         if (diagConfig.captureRenderDocPath.has_value()) {
             rdocCaptureRequested = true;
             rdocCapturePath = *diagConfig.captureRenderDocPath;
-            rdocCaptureFrame = diagConfig.captureFrame;
+            rdocCaptureFrame = std::max(1u, diagConfig.captureFrame);
             initRenderDoc();
         }
-#endif
-
-        if (diagConfig.runValidationSuite) {
-            rtv::HeadlessDiagnostics diag(diagConfig);
-            const auto summary = diag.runValidationSuite();
-            std::cout << "Validation suite: " << summary.totalPass << " passed, "
-                      << summary.totalFail << " failed\n";
-            return summary.totalFail > 0 ? 1 : 0;
+#else
+        if (diagConfig.captureRenderDocPath.has_value()) {
+            std::cerr << "Warning: RenderDoc capture requested, but this build was not configured with RENDERDOC_SDK_DIR.\n";
         }
+#endif
 
         rtv::HeadlessDiagnostics diag(diagConfig);
         if (diagConfig.makeDebugPackageDir.has_value()) {
             diag.captureStdout();
         }
+
+#ifdef RTV_HAS_RENDERDOC
+        bool rdocCaptureStarted = false;
+        bool rdocCaptureFinished = false;
+        if (rdocCaptureRequested && rdocApi != nullptr) {
+            const std::filesystem::path absoluteCapturePath = std::filesystem::absolute(rdocCapturePath);
+            const auto captureDir = absoluteCapturePath.parent_path();
+            if (!captureDir.empty()) {
+                std::filesystem::create_directories(captureDir);
+            }
+            rdocApi->SetCaptureFilePathTemplate(absoluteCapturePath.string().c_str());
+            app.setFrameCaptureCallbacks(
+                [&](uint32_t frameNumber) {
+                    if (!rdocCaptureStarted && frameNumber == rdocCaptureFrame) {
+                        rdocApi->StartFrameCapture(nullptr, nullptr);
+                        rdocCaptureStarted = true;
+                        std::cout << "RenderDoc capture started at frame " << frameNumber << "\n";
+                    }
+                },
+                [&](uint32_t frameNumber) {
+                    if (rdocCaptureStarted && !rdocCaptureFinished && frameNumber == rdocCaptureFrame) {
+                        const uint32_t captureSaved = rdocApi->EndFrameCapture(nullptr, nullptr);
+                        rdocCaptureFinished = true;
+                        if (captureSaved != 0u) {
+                            std::cout << "RenderDoc capture saved to template: " << absoluteCapturePath.string() << "\n";
+                        } else {
+                            std::cerr << "Warning: RenderDoc capture ended but was not saved.\n";
+                        }
+                    }
+                });
+        }
+#endif
 
         if (diagConfig.headless) {
             app.runHeadless(diagConfig.warmupFrames, maxFrames);
@@ -178,10 +222,9 @@ int main(int argc, char** argv) {
         }
 
 #ifdef RTV_HAS_RENDERDOC
-        if (rdocCaptureRequested && rdocApi != nullptr) {
-            rdocApi->SetCaptureFilePathTemplate(rdocCapturePath.string().c_str());
-            rdocApi->TriggerCapture();
-            std::cout << "RenderDoc capture triggered to: " << rdocCapturePath.string() << "\n";
+        if (rdocCaptureRequested && rdocApi != nullptr && !rdocCaptureFinished) {
+            std::cerr << "Warning: RenderDoc capture frame " << rdocCaptureFrame
+                      << " was not reached before shutdown.\n";
         }
 #endif
 
@@ -194,12 +237,6 @@ int main(int argc, char** argv) {
             }
             if (diagConfig.saveDebugViewsDir.has_value()) {
                 diag.exportDebugViews(app, *diagConfig.saveDebugViewsDir);
-            }
-            if (dumpRenderGraphDot && dotOutputPath.has_value()) {
-                if (auto* renderer = app.pathTracer()) {
-                    rtv::RenderGraph g;
-                    rtv::dumpRenderGraphDot(g, renderer->timings(), *dotOutputPath);
-                }
             }
             if (diagConfig.makeDebugPackageDir.has_value()) {
                 const std::filesystem::path scnPath = scenePath.value_or("");

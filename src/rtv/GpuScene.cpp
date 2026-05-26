@@ -662,6 +662,48 @@ float luminance(glm::vec3 value) {
     return glm::dot(value, glm::vec3(0.2126f, 0.7152f, 0.0722f));
 }
 
+glm::vec3 lightRecordCentroid(const GpuLightRecord& record) {
+    const uint32_t type = record.metadata.x;
+    if (type == 0u || type == 1u || type == 3u || type == 4u) {
+        return glm::vec3(record.data1);
+    }
+    return glm::vec3(0.0f);
+}
+
+LightBvhPrimitive makeLightBvhPrimitive(const GpuLightRecord& record, uint32_t lightIndex) {
+    const uint32_t type = record.metadata.x;
+    const float power = std::max(record.data0.x, 0.0f);
+    glm::vec3 center = lightRecordCentroid(record);
+    glm::vec3 boundsMin = center;
+    glm::vec3 boundsMax = center;
+
+    if (type == 0u && glm::all(glm::greaterThanEqual(glm::vec3(record.data3), glm::vec3(record.data2)))) {
+        boundsMin = glm::vec3(record.data2);
+        boundsMax = glm::vec3(record.data3);
+        center = (boundsMin + boundsMax) * 0.5f;
+    } else if (type == 1u || type == 3u) {
+        const float radius = std::max(record.data0.z, 0.001f);
+        boundsMin = center - glm::vec3(radius);
+        boundsMax = center + glm::vec3(radius);
+    } else if (type == 4u) {
+        const float halfSize = std::max(record.data0.z * 0.5f, 0.001f);
+        boundsMin = center - glm::vec3(halfSize);
+        boundsMax = center + glm::vec3(halfSize);
+    } else {
+        const float extent = std::sqrt(std::max(record.data0.w, 0.0f)) * 0.5f;
+        boundsMin = center - glm::vec3(std::max(extent, 0.001f));
+        boundsMax = center + glm::vec3(std::max(extent, 0.001f));
+    }
+
+    return LightBvhPrimitive{
+        .boundsMin = boundsMin,
+        .boundsMax = boundsMax,
+        .centroid = center,
+        .power = power,
+        .lightIndex = lightIndex,
+    };
+}
+
 std::vector<GpuLightRecord> buildLightRecords(
     const std::vector<GpuMeshRecord>& meshRecords,
     const std::vector<GpuInstanceRecord>& instanceRecords,
@@ -701,11 +743,17 @@ std::vector<GpuLightRecord> buildLightRecords(
             if (area <= 0.0f) {
                 continue;
             }
+            const glm::vec3 boundsMin = glm::min(v0, glm::min(v1, v2));
+            const glm::vec3 boundsMax = glm::max(v0, glm::max(v1, v2));
+            const glm::vec3 centroid = (v0 + v1 + v2) / 3.0f;
             const float weight = area * std::max(luminance(emissive), 0.0001f);
             totalArea += weight;
             lights.push_back(GpuLightRecord{
                 .metadata = {0u, packedIndex, material, instanceIndex},
                 .data0 = {weight, totalArea, 0.0f, area},
+                .data1 = {centroid, 0.0f},
+                .data2 = {boundsMin, 0.0f},
+                .data3 = {boundsMax, 0.0f},
             });
         }
     }
@@ -723,6 +771,7 @@ std::vector<GpuLightRecord> buildLightRecords(
         lights.push_back(GpuLightRecord{
             .metadata = {1u, sphereIndex, 0u, static_cast<uint32_t>(lights.size())},
             .data0 = {weight, totalArea, sphere.w, area},
+            .data1 = {glm::vec3(sphere), 0.0f},
         });
     }
     return lights;
@@ -2360,12 +2409,20 @@ void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLight
 }
 
 void GpuScene::uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords) {
-    std::vector<float> lightPower;
-    lightPower.reserve(lightRecords.size());
-    for (const auto& rec : lightRecords) {
-        lightPower.push_back(std::max(rec.data0.x, 0.0f));
+    std::vector<LightBvhPrimitive> lightPrimitives;
+    lightPrimitives.reserve(lightRecords.size());
+    for (uint32_t i = 0; i < static_cast<uint32_t>(lightRecords.size()); ++i) {
+        lightPrimitives.push_back(makeLightBvhPrimitive(lightRecords[i], i));
     }
-    std::vector<LightBvhNode> bvhNodes = buildLightBvh(lightPower, 1);
+    std::vector<LightBvhNode> bvhNodes = buildLightBvh(lightPrimitives, 1);
+    const LightBvhStats stats = computeLightBvhStats(bvhNodes);
+    if (stats.nodeCount > 0u) {
+        std::cout << "Light BVH: nodes=" << stats.nodeCount
+                  << " leaves=" << stats.leafCount
+                  << " max_depth=" << stats.maxDepth
+                  << " avg_traversal=" << stats.estimatedAverageTraversalSteps
+                  << " power=[" << stats.minLeafPower << ", " << stats.maxLeafPower << "]\n";
+    }
     std::vector<glm::vec4> packed = packLightBvhNodesForGpu(bvhNodes);
     if (packed.empty()) {
         packed.emplace_back(0.0f, 0.0f, 0.0f, 0.0f);

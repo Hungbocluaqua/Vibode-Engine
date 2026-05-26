@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -152,12 +153,29 @@ void writeSettingsJson(const RendererSettings& settings, const std::filesystem::
     if (file.is_open()) { file << j.dump(2); }
 }
 
+std::string sanitizeSceneName(std::string name) {
+    for (char& ch : name) {
+        if (std::isalnum(static_cast<unsigned char>(ch))) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        } else {
+            ch = '_';
+        }
+    }
+    return name;
+}
+
 } // namespace
 
 HeadlessDiagnostics::HeadlessDiagnostics(const HeadlessDiagnosticsConfig& config)
     : config_(config) {
     if (config.profileJsonPath.has_value()) {
         profileJsonPath_ = *config.profileJsonPath;
+    }
+}
+
+HeadlessDiagnostics::~HeadlessDiagnostics() {
+    if (logCapture_) {
+        (void)releaseStdout();
     }
 }
 
@@ -214,8 +232,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.temporalHistoryBytes = static_cast<uint64_t>(renderer->temporalHistoryMemory());
     profileReport_.memory.restirReservoirBytes = static_cast<uint64_t>(renderer->restirReservoirMemory());
 
-    profileReport_.validationErrorCount = static_cast<uint32_t>(
-        renderer->validationLog().invalidations().size());
+    profileReport_.validationErrorCount = 0;
 
     profileReport_.settings = renderer->settings();
 
@@ -357,34 +374,118 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
 
     struct SceneConfig {
         std::string name;
-        std::string path;
+        std::filesystem::path path;
         uint32_t frames;
         uint32_t warmup;
     };
 
-    const std::vector<SceneConfig> scenes = {
-        {"cornell", "scenes/validation/cornell.rtlevel", 120, 30},
-        {"glossy_metal", "scenes/validation/glossy_metal.rtlevel", 120, 30},
-        {"foliage_alpha", "scenes/validation/foliage_alpha.rtlevel", 120, 30},
-        {"sponza", "scenes/validation/sponza.rtlevel", 60, 20},
-        {"outdoor_hdr", "scenes/validation/outdoor_hdr.rtlevel", 120, 30},
-        {"material_grid", "scenes/validation/material_grid.rtlevel", 120, 30},
-        {"transform_stress", "scenes/validation/transform_stress.rtlevel", 120, 30},
-    };
+    std::vector<SceneConfig> scenes;
+    const std::filesystem::path validationDir = "scenes/validation";
+    const std::filesystem::path manifestPath = validationDir / "manifest.json";
+    if (std::filesystem::exists(manifestPath)) {
+        std::ifstream manifestFile(manifestPath);
+        nlohmann::json manifest;
+        manifestFile >> manifest;
+        for (const auto& scene : manifest.value("scenes", nlohmann::json::array())) {
+            const std::string fileName = scene.value("path", "");
+            if (fileName.empty()) {
+                continue;
+            }
+            const std::filesystem::path scenePath = validationDir / fileName;
+            scenes.push_back(SceneConfig{
+                .name = sanitizeSceneName(scenePath.stem().string()),
+                .path = scenePath,
+                .frames = 120,
+                .warmup = 30,
+            });
+        }
+    }
+    if (scenes.empty()) {
+        scenes = {
+            {"material_grid", validationDir / "material_grid.rtlevel", 120, 30},
+            {"transform_stress", validationDir / "transform_stress.rtlevel", 120, 30},
+        };
+    }
 
     std::filesystem::path outputBase = config_.validationOutputDir.value_or("validation_output");
+    std::filesystem::create_directories(outputBase);
 
     for (const auto& scene : scenes) {
         ValidationSceneResult result;
         result.name = scene.name;
-        result.status = "pass";
         result.framesRendered = scene.frames;
 
         auto sceneOutDir = outputBase / scene.name;
         try {
             std::filesystem::create_directories(sceneOutDir);
+            if (!std::filesystem::exists(scene.path)) {
+                throw std::runtime_error("Missing validation scene: " + scene.path.string());
+            }
+
+            HeadlessDiagnosticsConfig sceneConfig = config_;
+            sceneConfig.headless = true;
+            sceneConfig.profile = true;
+            sceneConfig.runValidationSuite = false;
+            sceneConfig.totalFrames = scene.frames;
+            sceneConfig.warmupFrames = scene.warmup;
+            sceneConfig.fixedSeed = sceneConfig.fixedSeed.value_or(1u);
+            sceneConfig.profileJsonPath = sceneOutDir / "profile.json";
+            sceneConfig.saveDebugViewsDir = sceneOutDir / "debug_views";
+            sceneConfig.makeDebugPackageDir.reset();
+
+            HeadlessDiagnostics sceneDiagnostics(sceneConfig);
+            sceneDiagnostics.captureStdout();
+            Application app(
+                RendererDebugView::Beauty,
+                std::nullopt,
+                std::nullopt,
+                scene.path,
+                std::nullopt,
+                std::nullopt,
+                false,
+                false,
+                true);
+            if (auto* renderer = app.pathTracer()) {
+                RendererSettings settings = renderer->settings();
+                settings.fixedSeed = sceneConfig.fixedSeed;
+                renderer->applySettings(settings);
+            }
+
+            app.runHeadless(scene.warmup, scene.frames);
+            const ProfileReport profile = sceneDiagnostics.run(app);
+            sceneDiagnostics.writeProfileJson(*sceneConfig.profileJsonPath);
+            sceneDiagnostics.exportDebugViews(app, *sceneConfig.saveDebugViewsDir);
+            if (auto* renderer = app.pathTracer()) {
+                writeValidationLog(renderer->validationLog(), sceneOutDir / "validation.txt");
+                writeSettingsJson(renderer->settings(), sceneOutDir / "settings.json");
+            }
+            std::filesystem::copy_file(scene.path, sceneOutDir / "scene_copy.rtlevel",
+                std::filesystem::copy_options::overwrite_existing);
+
+            std::ofstream logFile(sceneOutDir / "log.txt");
+            if (logFile.is_open()) {
+                logFile << sceneDiagnostics.releaseStdout();
+            } else {
+                (void)sceneDiagnostics.releaseStdout();
+            }
+
+            result.gpuMsTotal = profile.gpuFrameMs.avg;
+            result.validationErrors = profile.validationErrorCount;
+            result.status = result.validationErrors == 0 ? "pass" : "fail";
             summary.scenes.push_back(result);
-            summary.totalPass++;
+            if (result.status == "pass") {
+                summary.totalPass++;
+            } else {
+                summary.totalFail++;
+            }
+        } catch (const std::exception& error) {
+            result.status = "fail";
+            std::ofstream logFile(sceneOutDir / "log.txt", std::ios::app);
+            if (logFile.is_open()) {
+                logFile << "Fatal error: " << error.what() << "\n";
+            }
+            summary.scenes.push_back(result);
+            summary.totalFail++;
         } catch (...) {
             result.status = "fail";
             summary.scenes.push_back(result);
@@ -420,9 +521,17 @@ void HeadlessDiagnostics::captureStdout() {
 }
 
 std::string HeadlessDiagnostics::releaseStdout() {
-    if (logCapture_ && oldCout_) { std::cout.rdbuf(oldCout_); }
-    if (logCapture_ && oldCerr_) { std::cerr.rdbuf(oldCerr_); }
-    return logCapture_ ? logCapture_->str() : std::string{};
+    const std::string text = logCapture_ ? logCapture_->str() : std::string{};
+    if (oldCout_ != nullptr) {
+        std::cout.rdbuf(oldCout_);
+        oldCout_ = nullptr;
+    }
+    if (oldCerr_ != nullptr) {
+        std::cerr.rdbuf(oldCerr_);
+        oldCerr_ = nullptr;
+    }
+    logCapture_.reset();
+    return text;
 }
 
 void HeadlessDiagnostics::collectValidationLog(Application& app) {

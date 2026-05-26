@@ -179,7 +179,7 @@ struct EditorRequests {
     std::optional<std::string> removeFavorite;
 };
 
-[[nodiscard]] const std::array<RendererDebugView, 56>& editorDebugViews();
+[[nodiscard]] const std::array<RendererDebugView, 58>& editorDebugViews();
 [[nodiscard]] int editorDebugViewIndex(RendererDebugView view);
 void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& changed);
 void requestSettings(EditorRequests& requests, const RendererSettings& settings);

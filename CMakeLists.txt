@@ -17,11 +17,7 @@ find_package(unofficial-spirv-reflect CONFIG REQUIRED)
 find_package(Ktx CONFIG REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
-option(RENDERDOC_SDK_DIR "Path to RenderDoc SDK directory" "")
-if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
-    target_compile_definitions(rtvulkan PRIVATE RTV_HAS_RENDERDOC=1)
-    target_include_directories(rtvulkan PRIVATE "${RENDERDOC_SDK_DIR}")
-endif()
+set(RENDERDOC_SDK_DIR "" CACHE PATH "Path to RenderDoc SDK directory")
 
 if(NOT DEFINED ENV{VULKAN_SDK})
     message(FATAL_ERROR "VULKAN_SDK is not set. Install the Vulkan SDK and open a new terminal.")
@@ -160,6 +156,11 @@ target_link_libraries(rtvulkan PRIVATE
     unofficial::spirv-reflect
     KTX::ktx
 )
+
+if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
+    target_compile_definitions(rtvulkan PRIVATE RTV_HAS_RENDERDOC=1)
+    target_include_directories(rtvulkan PRIVATE "${RENDERDOC_SDK_DIR}")
+endif()
 
 if(WIN32)
     target_link_libraries(rtvulkan PRIVATE Comdlg32)

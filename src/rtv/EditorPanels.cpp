@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 56>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 56> views = {
+const std::array<RendererDebugView, 58>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 58> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -64,6 +64,8 @@ const std::array<RendererDebugView, 56>& editorDebugViews() {
         RendererDebugView::RestirReservoirConfidence,
         RendererDebugView::RestirReservoirM,
         RendererDebugView::RestirPairwiseMis,
+        RendererDebugView::RestirGiValidity,
+        RendererDebugView::RestirGiAge,
     };
     return views;
 }
@@ -155,6 +157,8 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::RestirReservoirConfidence);
         selectable(RendererDebugView::RestirReservoirM);
         selectable(RendererDebugView::RestirPairwiseMis);
+        selectable(RendererDebugView::RestirGiValidity);
+        selectable(RendererDebugView::RestirGiAge);
         ImGui::EndCombo();
     }
 }

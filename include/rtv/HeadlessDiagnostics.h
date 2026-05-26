@@ -115,6 +115,7 @@ struct ValidationSuiteSummary {
 class HeadlessDiagnostics {
 public:
     explicit HeadlessDiagnostics(const HeadlessDiagnosticsConfig& config);
+    ~HeadlessDiagnostics();
 
     ProfileReport run(Application& app);
     void writeProfileJson(const std::filesystem::path& path) const;

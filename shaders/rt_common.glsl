@@ -63,6 +63,16 @@ struct RestirReservoir {
 };
 layout(set = 0, binding = 38, std430) buffer RestirReservoirBuffer { RestirReservoir restir_reservoirs[]; };
 layout(set = 0, binding = 39, std430) readonly buffer PreviousRestirReservoirBuffer { RestirReservoir previous_restir_reservoirs[]; };
+struct RestirGiReservoir {
+    vec4 hit_position_target_pdf; // xyz = selected indirect hit point, w = target pdf
+    vec4 normal_roughness; // xyz = selected hit normal, w = roughness
+    vec4 radiance_weight_sum; // rgb = selected indirect radiance, w = weight sum
+    vec4 receiver_position_hit_distance; // xyz = receiver point, w = hit distance
+    uvec4 metadata; // x = sample count, y = age, z = flags, w = material id
+};
+layout(set = 0, binding = 43, std430) buffer RestirGiReservoirBuffer { RestirGiReservoir restir_gi_reservoirs[]; };
+layout(set = 0, binding = 44, std430) readonly buffer PreviousRestirGiReservoirBuffer { RestirGiReservoir previous_restir_gi_reservoirs[]; };
+layout(set = 0, binding = 45, std430) buffer RestirGiSpatialReservoirBuffer { RestirGiReservoir restir_gi_spatial_reservoirs[]; };
 layout(set = 0, binding = 10, std430) readonly buffer MeshMaterials { vec4 mesh_materials[]; };
 
 layout(set = 0, binding = 11, std140) uniform MeshParams {
@@ -349,6 +359,8 @@ float restir_luminance(vec3 value) {
 const uint RESTIR_VISIBILITY_UNKNOWN = 0u;
 const uint RESTIR_VISIBILITY_VISIBLE = 1u;
 const uint RESTIR_VISIBILITY_INVALID = 2u;
+const uint RESTIR_GI_FLAG_VALID = 1u << 0u;
+const uint RESTIR_GI_FLAG_VISIBLE = 1u << 1u;
 
 uint restir_pack_validity_visibility(bool valid, uint visibility) {
     return valid ? (1u | ((visibility & 3u) << 1u)) : 0u;
@@ -366,6 +378,17 @@ bool restir_reservoir_valid(RestirReservoir reservoir) {
     return restir_validity_bit(reservoir.metadata.z) &&
         reservoir.target_pdf_weight_sum_m.z > 0.0 &&
         reservoir.sample_value_confidence.a > 0.0;
+}
+
+bool restir_gi_reservoir_valid(RestirGiReservoir reservoir) {
+    return (reservoir.metadata.z & RESTIR_GI_FLAG_VALID) != 0u &&
+        reservoir.radiance_weight_sum.w > 0.0 &&
+        reservoir.hit_position_target_pdf.w > 0.0 &&
+        reservoir.metadata.x > 0u;
+}
+
+float restir_gi_age_normalized(RestirGiReservoir reservoir, float maxAge) {
+    return clamp(float(reservoir.metadata.y) / max(maxAge, 1.0), 0.0, 1.0);
 }
 
 float restir_target_function(RestirReservoir reservoir) {
@@ -444,13 +467,18 @@ float restir_pairwise_previous_weight(RestirReservoir current, RestirReservoir p
 RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirReservoir previous, float motionConfidence, float maxAge) {
     float previousWeight = restir_pairwise_previous_weight(current, previous, motionConfidence, maxAge);
     float currentWeight = 1.0 - previousWeight;
+    uint currentVisibility = restir_visibility_state(current);
+    uint previousVisibility = restir_visibility_state(previous);
+    uint mergedVisibility = previousWeight > 0.0
+        ? (currentVisibility == RESTIR_VISIBILITY_VISIBLE && previousVisibility == RESTIR_VISIBILITY_VISIBLE
+            ? RESTIR_VISIBILITY_VISIBLE
+            : RESTIR_VISIBILITY_UNKNOWN)
+        : currentVisibility;
 
     current.metadata.y = previousWeight > 0.0 ? min(previous.metadata.y + 1u, 255u) : 0u;
     current.metadata.z = restir_pack_validity_visibility(
         restir_reservoir_valid(current),
-        previousWeight > 0.0 && restir_visibility_state(previous) == RESTIR_VISIBILITY_VISIBLE
-            ? RESTIR_VISIBILITY_VISIBLE
-            : RESTIR_VISIBILITY_UNKNOWN);
+        mergedVisibility);
     current.sample_value_confidence.rgb =
         current.sample_value_confidence.rgb * currentWeight +
         previous.sample_value_confidence.rgb * previousWeight;

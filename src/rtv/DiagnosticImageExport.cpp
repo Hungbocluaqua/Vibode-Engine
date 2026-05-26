@@ -39,6 +39,7 @@ bool DiagnosticImageExport::initialize(VkFormat format, VkExtent2D extent) {
         .size = bufferSize,
         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory = BufferMemory::Readback,
+        .persistentMapped = true,
         .debugName = "diagnostic readback buffer",
     });
 

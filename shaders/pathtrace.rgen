@@ -958,6 +958,20 @@ void main() {
     } else if (debug_params.view == 59u) {
         float previousWeight = clamp(restir_reservoirs[pixel_index].target_pdf_weight_sum_m.w, 0.0, 1.0);
         output_value = vec3(previousWeight, 1.0 - previousWeight, clamp(restir_reservoirs[pixel_index].sample_value_confidence.a, 0.0, 1.0));
+    } else if (debug_params.view == 60u) {
+        RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
+        RestirGiReservoir previousReservoir = previous_restir_gi_reservoirs[pixel_index];
+        RestirGiReservoir spatialReservoir = restir_gi_spatial_reservoirs[pixel_index];
+        output_value = vec3(
+            restir_gi_reservoir_valid(reservoir) ? 1.0 : 0.0,
+            restir_gi_reservoir_valid(previousReservoir) ? 1.0 : 0.0,
+            restir_gi_reservoir_valid(spatialReservoir) ? 1.0 : 0.0);
+    } else if (debug_params.view == 61u) {
+        RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
+        output_value = vec3(
+            restir_gi_age_normalized(reservoir, 32.0),
+            clamp(float(reservoir.metadata.x) / 16.0, 0.0, 1.0),
+            clamp(reservoir.hit_position_target_pdf.w / 16.0, 0.0, 1.0));
     } else if (debug_params.view == 38u) {
         output_value = components.emissive_continuation > 0.0 ? vec3(0.05, 0.95, 0.35) : vec3(0.0);
     } else if (debug_params.view == 39u) {

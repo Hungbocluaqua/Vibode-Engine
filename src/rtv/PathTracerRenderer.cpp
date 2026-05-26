@@ -125,6 +125,9 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, allRt, 1024),
         descriptorBinding(42, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
     };
 }
 
@@ -1132,6 +1135,24 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .memory = BufferMemory::GpuOnly,
         .debugName = "restir spatial reservoir",
     });
+    restirGiReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = pixelCount * sizeof(RestirGiReservoirGpu),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "restir gi current reservoir",
+    });
+    previousRestirGiReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = pixelCount * sizeof(RestirGiReservoirGpu),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "restir gi previous reservoir",
+    });
+    restirGiSpatialReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = pixelCount * sizeof(RestirGiReservoirGpu),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "restir gi spatial reservoir",
+    });
     selectionParamsBuffer_.create(allocator_, BufferDesc{
         .size = sizeof(SelectionParams),
         .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -1188,6 +1209,12 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
             1.0f);
         temporalSystem_->createHistorySlot(
             "restir_reservoir",
+            VK_FORMAT_R32G32B32A32_SFLOAT,
+            VkExtent2D{renderExtent.width, renderExtent.height},
+            TemporalSystem::TemporalResidency::Persistent,
+            0.75f);
+        temporalSystem_->createHistorySlot(
+            "restir_gi_reservoir",
             VK_FORMAT_R32G32B32A32_SFLOAT,
             VkExtent2D{renderExtent.width, renderExtent.height},
             TemporalSystem::TemporalResidency::Persistent,
@@ -1440,7 +1467,20 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
+    const RenderGraphResourceId restirGiReservoir = graph.createBuffer(bufferResource(restirGiReservoirBuffer_, "restir gi reservoir"));
+    const RenderGraphResourceId previousRestirGiReservoir = graph.createBuffer(bufferResource(previousRestirGiReservoirBuffer_, "previous restir gi reservoir"));
+    const RenderGraphResourceId restirGiSpatialReservoir = graph.createBuffer(bufferResource(restirGiSpatialReservoirBuffer_, "restir gi spatial reservoir"));
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
+    graph.addPass("restir_gi_clear")
+        .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer)
+        .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+        .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            validationLog_.recordPass("restir gi reservoir clear");
+            vkCmdFillBuffer(cmd, restirGiReservoirBuffer_.handle(), 0, restirGiReservoirBuffer_.size(), 0u);
+            vkCmdFillBuffer(cmd, previousRestirGiReservoirBuffer_.handle(), 0, previousRestirGiReservoirBuffer_.size(), 0u);
+            vkCmdFillBuffer(cmd, restirGiSpatialReservoirBuffer_.handle(), 0, restirGiSpatialReservoirBuffer_.size(), 0u);
+        });
     graph.addPass("path_trace_rt")
         .addStorageWrite(raw, traceDomain)
         .addStorageWrite(entityIds, traceDomain)
@@ -1452,6 +1492,7 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
         .addStorageWrite(pathData, traceDomain)
         .addStorageRead(previousRestirReservoir, traceDomain)
         .addStorageWrite(restirReservoir, traceDomain)
+        .addStorageRead(restirGiReservoir, traceDomain)
         .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             recordPathTracePass(cmd);
         });
@@ -1668,8 +1709,15 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
     const RenderGraphResourceId restirSpatialReservoir = graph.createBuffer(bufferResource(restirSpatialReservoirBuffer_, "restir spatial reservoir"));
+    const RenderGraphResourceId restirGiReservoir = graph.createBuffer(bufferResource(restirGiReservoirBuffer_, "restir gi reservoir"));
+    const RenderGraphResourceId previousRestirGiReservoir = graph.createBuffer(bufferResource(previousRestirGiReservoirBuffer_, "previous restir gi reservoir"));
+    const RenderGraphResourceId restirGiSpatialReservoir = graph.createBuffer(bufferResource(restirGiSpatialReservoirBuffer_, "restir gi spatial reservoir"));
 
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
+    graph.addPass("restir_gi_clear")
+        .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer)
+        .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+        .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer);
     graph.addPass("path_trace_rt")
         .addStorageWrite(raw, traceDomain)
         .addStorageWrite(entityIds, traceDomain)
@@ -1680,7 +1728,8 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         .addStorageWrite(velocity, traceDomain)
         .addStorageWrite(pathData, traceDomain)
         .addStorageRead(previousRestirReservoir, traceDomain)
-        .addStorageWrite(restirReservoir, traceDomain);
+        .addStorageWrite(restirReservoir, traceDomain)
+        .addStorageRead(restirGiReservoir, traceDomain);
 
     if (shouldRunRestirSpatial()) {
         graph.addPass("restir_spatial")
@@ -1773,6 +1822,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         dumpRenderGraphJson(graph, currentProfiler_->timings(), *dumpRenderGraphPath_);
         dumpRenderGraphPath_.reset();
     }
+    if (dumpRenderGraphDotPath_.has_value()) {
+        dumpRenderGraphDot(graph, currentProfiler_->timings(), *dumpRenderGraphDotPath_);
+        dumpRenderGraphDotPath_.reset();
+    }
     validationLog_.recordPass("render graph compiled pass count=" + std::to_string(graph.compiledPassOrder().size()));
     for (uint32_t passIndex : graph.compiledPassOrder()) {
         validationLog_.recordPass("render graph pass: " + graph.passes()[passIndex].name());
@@ -1842,6 +1895,9 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
         .writeBuffer(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirReservoirBuffer_.descriptorInfo())
         .writeBuffer(40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightBvhNodes().descriptorInfo())
         .writeBuffer(42, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeBuffer(43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
+        .writeBuffer(44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirGiReservoirBuffer_.descriptorInfo())
+        .writeBuffer(45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialReservoirBuffer_.descriptorInfo())
         .update(context_.device(), set);
     DescriptorWriter()
         .writeImage(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->transmittanceLut().sampledDescriptor(VK_NULL_HANDLE))
@@ -3047,7 +3103,12 @@ VkDeviceSize PathTracerRenderer::temporalHistoryMemory() const {
 }
 
 VkDeviceSize PathTracerRenderer::restirReservoirMemory() const {
-    return restirReservoirBuffer_.size() + previousRestirReservoirBuffer_.size() + restirSpatialReservoirBuffer_.size();
+    return restirReservoirBuffer_.size() +
+        previousRestirReservoirBuffer_.size() +
+        restirSpatialReservoirBuffer_.size() +
+        restirGiReservoirBuffer_.size() +
+        previousRestirGiReservoirBuffer_.size() +
+        restirGiSpatialReservoirBuffer_.size();
 }
 
 } // namespace rtv

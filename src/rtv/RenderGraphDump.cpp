@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -287,6 +288,11 @@ void dumpRenderGraphJson(
     }
     j["barriers"] = barriersJson;
 
+    const auto dir = outputPath.parent_path();
+    if (!dir.empty()) {
+        std::filesystem::create_directories(dir);
+    }
+
     std::ofstream file(outputPath);
     if (!file.is_open()) {
         throw std::runtime_error("Failed to open render graph JSON output file: " + outputPath.string());
@@ -301,6 +307,11 @@ void dumpRenderGraphDot(
     const auto& passes = graph.passes();
     const auto& compiledOrder = graph.compiledPassOrder();
     const auto& resources = graph.resources();
+
+    const auto dir = outputPath.parent_path();
+    if (!dir.empty()) {
+        std::filesystem::create_directories(dir);
+    }
 
     std::ofstream file(outputPath);
     if (!file.is_open()) {

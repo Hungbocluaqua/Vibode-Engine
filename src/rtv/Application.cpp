@@ -390,7 +390,13 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
         const float rawDeltaSeconds = 1.0f / 60.0f;
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
+        if (beginFrameCapture_) {
+            beginFrameCapture_(frameCount + 1u);
+        }
         commandSystem_->drawFrame(seconds, deltaSeconds);
+        if (endFrameCapture_) {
+            endFrameCapture_(frameCount + 1u);
+        }
         seconds += deltaSeconds;
 
         const auto frameEnd = std::chrono::steady_clock::now();
@@ -415,10 +421,21 @@ void Application::renderFrames(uint32_t count) {
         const float rawDeltaSeconds = 1.0f / 60.0f;
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
+        if (beginFrameCapture_) {
+            beginFrameCapture_(i + 1u);
+        }
         commandSystem_->drawFrame(seconds, deltaSeconds);
+        if (endFrameCapture_) {
+            endFrameCapture_(i + 1u);
+        }
         seconds += deltaSeconds;
     }
     commandSystem_->waitIdle();
+}
+
+void Application::setFrameCaptureCallbacks(std::function<void(uint32_t)> begin, std::function<void(uint32_t)> end) {
+    beginFrameCapture_ = std::move(begin);
+    endFrameCapture_ = std::move(end);
 }
 
 void Application::resetAccumulation() {
@@ -626,7 +643,13 @@ void Application::mainLoop(uint32_t maxFrames) {
                 sunDrag_.phase != SunDragPhase::Idle);
         }
         applyEditorRequests(editorRequests, false);
+        if (beginFrameCapture_) {
+            beginFrameCapture_(frameCount + 1u);
+        }
         commandSystem_->drawFrame(seconds, deltaSeconds);
+        if (endFrameCapture_) {
+            endFrameCapture_(frameCount + 1u);
+        }
         applyEditorRequests(editorRequests, true);
         pollAsyncSceneLoad();
         updateWindowTitle(seconds);
