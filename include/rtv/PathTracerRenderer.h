@@ -176,6 +176,8 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t enabled = 0;
+        uint32_t renderWidth = 0;
+        uint32_t renderHeight = 0;
     };
 
     struct TaaParams {
