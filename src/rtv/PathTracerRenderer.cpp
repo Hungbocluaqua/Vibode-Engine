@@ -1690,9 +1690,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         .addStorageRead(toneInput, PipelineDomain::Compute)
         .addStorageWrite(presentation, PipelineDomain::Compute);
 
-    if (selectedInstanceId_ != UINT32_MAX &&
-        renderExtent_.width == displayExtent_.width &&
-        renderExtent_.height == displayExtent_.height) {
+    if (selectedInstanceId_ != UINT32_MAX) {
         graph.addPass("selection_outline")
             .addStorageRead(entityIds, PipelineDomain::Compute)
             .addStorageReadWrite(presentation, PipelineDomain::Compute);
@@ -1790,13 +1788,6 @@ void PathTracerRenderer::recordSelectionOutline(VkCommandBuffer commandBuffer) {
         currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
         return;
     }
-    if (renderExtent_.width != displayExtent_.width || renderExtent_.height != displayExtent_.height) {
-        validationLog_.recordPass("selection outline skipped: render/display extent mismatch");
-        currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        return;
-    }
-
     RenderGraph graph(&allocator_);
     const RenderGraphResourceId presentation = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
@@ -1852,9 +1843,11 @@ void PathTracerRenderer::recordSelectionOutlinePass(VkCommandBuffer commandBuffe
 
     const SelectionParams params{
         .selectedInstance = selectedInstanceId_,
-        .width = renderExtent_.width,
-        .height = renderExtent_.height,
+        .width = displayExtent_.width,
+        .height = displayExtent_.height,
         .enabled = 1u,
+        .renderWidth = renderExtent_.width,
+        .renderHeight = renderExtent_.height,
     };
     selectionParamsBuffer_.write(&params, sizeof(params));
     selectionParamsBuffer_.flush(sizeof(params));
@@ -1869,7 +1862,7 @@ void PathTracerRenderer::recordSelectionOutlinePass(VkCommandBuffer commandBuffe
     selectionOutlinePipeline_->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, selectionOutlinePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
-    selectionOutlinePipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height, 8, 8);
+    selectionOutlinePipeline_->dispatch(commandBuffer, displayExtent_.width, displayExtent_.height, 8, 8);
 
 }
 

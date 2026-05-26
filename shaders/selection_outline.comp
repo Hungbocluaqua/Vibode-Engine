@@ -10,13 +10,18 @@ layout(set = 0, binding = 2, std140) uniform SelectionParams {
     uint width;
     uint height;
     uint enabled;
+    uint render_width;
+    uint render_height;
 } selection;
 
 bool selected_at(ivec2 p) {
-    if (p.x < 0 || p.y < 0 || p.x >= int(selection.width) || p.y >= int(selection.height)) {
+    ivec2 render_p = ivec2(
+        int(float(p.x) * float(selection.render_width) / float(selection.width)),
+        int(float(p.y) * float(selection.render_height) / float(selection.height)));
+    if (render_p.x < 0 || render_p.y < 0 || render_p.x >= int(selection.render_width) || render_p.y >= int(selection.render_height)) {
         return false;
     }
-    uint id = entity_id_buffer[uint(p.y) * selection.width + uint(p.x)];
+    uint id = entity_id_buffer[uint(render_p.y) * selection.render_width + uint(render_p.x)];
     return id == selection.selected_instance;
 }
 
