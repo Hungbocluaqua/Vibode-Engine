@@ -54,7 +54,7 @@ constexpr uint32_t materialVec4Stride = 5u;
 
 static_assert(sizeof(GpuMeshRecord) == 64);
 static_assert(sizeof(GpuPrimitiveRecord) == 32);
-static_assert(sizeof(GpuInstanceRecord) == 208);
+static_assert(sizeof(GpuInstanceRecord) == 272);
 static_assert(sizeof(GpuLocalVertex) == 48);
 static_assert(sizeof(GpuInstanceBoundsRecord) == 32);
 static_assert(sizeof(GpuLightRecord) == 80);
@@ -533,12 +533,8 @@ bool sameSampler(const TextureSamplerDesc& a, const TextureSamplerDesc& b) {
         a.wrapT == b.wrapT;
 }
 
-void createMaterialSampler(VkDevice device, VkSampler& sampler, const TextureSamplerDesc& desc) {
-    if (sampler != VK_NULL_HANDLE) {
-        vkDestroySampler(device, sampler, nullptr);
-        sampler = VK_NULL_HANDLE;
-    }
-
+VkSampler createMaterialSampler(ResourceAllocator& allocator, const TextureSamplerDesc& desc, float requestedAnisotropy) {
+    VkDevice device = allocator.device();
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = toVkFilter(desc.magFilter);
@@ -548,12 +544,14 @@ void createMaterialSampler(VkDevice device, VkSampler& sampler, const TextureSam
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.mipmapMode = desc.minFilter == TextureFilter::Nearest ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
-    checkVk(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler(material textures)");
-}
-
-VkSampler createOwnedMaterialSampler(VkDevice device, const TextureSamplerDesc& desc) {
+    if (allocator.supportsSamplerAnisotropy() &&
+        requestedAnisotropy > 1.0f &&
+        (desc.minFilter != TextureFilter::Nearest || desc.magFilter != TextureFilter::Nearest)) {
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        samplerInfo.maxAnisotropy = std::clamp(requestedAnisotropy, 1.0f, allocator.maxSamplerAnisotropy());
+    }
     VkSampler sampler = VK_NULL_HANDLE;
-    createMaterialSampler(device, sampler, desc);
+    checkVk(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler(material textures)");
     return sampler;
 }
 
@@ -611,9 +609,11 @@ GpuInstanceRecord makeInstanceRecord(
     uint32_t primitiveCount,
     uint32_t flags = instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow,
     const glm::mat4* prevTransform = nullptr) {
+    const glm::mat4 inverseTransform = glm::inverse(transform);
     return GpuInstanceRecord{
         .transform = transform,
-        .inverseTransform = glm::inverse(transform),
+        .inverseTransform = inverseTransform,
+        .normalTransform = glm::transpose(inverseTransform),
         .prevTransform = prevTransform != nullptr ? *prevTransform : transform,
         .metadata = {meshIndex, primitiveOffset, primitiveCount, flags},
     };
@@ -795,6 +795,9 @@ GpuScene::GpuScene(
     : allocator_(allocator),
       environmentPath_(std::move(environmentPath)),
       sceneCachePath_(std::move(sceneCachePath)) {
+    materialTextureAnisotropy_ = allocator_.supportsSamplerAnisotropy()
+        ? std::clamp(8.0f, 1.0f, allocator_.maxSamplerAnisotropy())
+        : 1.0f;
     bool usedGpuCache = false;
     if (importedScene != nullptr && assets != nullptr && !importedScene->meshes.empty()) {
         if (sceneCachePath_.has_value() && importedScene->lights.empty()) {
@@ -815,6 +818,12 @@ GpuScene::GpuScene(
 
 GpuScene::~GpuScene() {
     destroyMaterialTextureSamplers();
+    for (RetiredMaterialSampler retired : retiredMaterialSamplers_) {
+        if (retired.sampler != VK_NULL_HANDLE) {
+            vkDestroySampler(allocator_.device(), retired.sampler, nullptr);
+        }
+    }
+    retiredMaterialSamplers_.clear();
     if (environmentSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(allocator_.device(), environmentSampler_, nullptr);
     }
@@ -830,6 +839,60 @@ void GpuScene::destroyMaterialTextureSamplers() {
         }
     }
     materialTextureSamplers_.clear();
+    materialTextureSamplerDescs_.clear();
+}
+
+void GpuScene::retireMaterialTextureSampler(VkSampler sampler, uint64_t retireFrame) {
+    if (sampler == VK_NULL_HANDLE) {
+        return;
+    }
+    retiredMaterialSamplers_.push_back(RetiredMaterialSampler{sampler, retireFrame});
+}
+
+void GpuScene::releaseRetiredMaterialSamplers(uint64_t completedFrame) {
+    auto firstLive = std::remove_if(
+        retiredMaterialSamplers_.begin(),
+        retiredMaterialSamplers_.end(),
+        [&](const RetiredMaterialSampler& retired) {
+            if (retired.retireFrame > completedFrame) {
+                return false;
+            }
+            if (retired.sampler != VK_NULL_HANDLE) {
+                vkDestroySampler(allocator_.device(), retired.sampler, nullptr);
+            }
+            return true;
+        });
+    retiredMaterialSamplers_.erase(firstLive, retiredMaterialSamplers_.end());
+}
+
+void GpuScene::recreateMaterialTextureSamplers(uint64_t retireFrame) {
+    VkSampler replacement = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
+    retireMaterialTextureSampler(materialSampler_, retireFrame);
+    materialSampler_ = replacement;
+
+    std::vector<VkSampler> replacements;
+    replacements.reserve(materialTextureSamplerDescs_.size());
+    for (const TextureSamplerDesc& desc : materialTextureSamplerDescs_) {
+        replacements.push_back(createMaterialSampler(allocator_, desc, materialTextureAnisotropy_));
+    }
+    for (VkSampler sampler : materialTextureSamplers_) {
+        retireMaterialTextureSampler(sampler, retireFrame);
+    }
+    materialTextureSamplers_ = std::move(replacements);
+}
+
+bool GpuScene::setMaterialTextureAnisotropy(float anisotropy, uint64_t retireFrame) {
+    const float supportedMax = allocator_.supportsSamplerAnisotropy() ? allocator_.maxSamplerAnisotropy() : 1.0f;
+    const float clamped = std::clamp(std::isfinite(anisotropy) ? anisotropy : 1.0f, 1.0f, supportedMax);
+    if (std::abs(clamped - materialTextureAnisotropy_) <= 0.0001f) {
+        return false;
+    }
+
+    materialTextureAnisotropy_ = clamped;
+    if (materialSampler_ != VK_NULL_HANDLE) {
+        recreateMaterialTextureSamplers(retireFrame);
+    }
+    return true;
 }
 
 std::vector<VkDescriptorImageInfo> GpuScene::materialCombinedDescriptors() const {
@@ -837,10 +900,11 @@ std::vector<VkDescriptorImageInfo> GpuScene::materialCombinedDescriptors() const
     std::vector<VkDescriptorImageInfo> result;
     result.reserve(texDescs.size());
     for (const auto& tex : texDescs) {
+        const size_t index = result.size();
         VkDescriptorImageInfo combined{};
         combined.imageView = tex.imageView;
         combined.imageLayout = tex.imageLayout;
-        combined.sampler = materialSampler_;
+        combined.sampler = index < materialTextureSamplers_.size() ? materialTextureSamplers_[index] : materialSampler_;
         result.push_back(combined);
     }
     return result;
@@ -880,7 +944,8 @@ bool GpuScene::setSkyCdfDimensions(uint32_t width, uint32_t height) {
 
 void GpuScene::createDefaultMaterialTexture(BufferUploader& uploader) {
     if (materialSampler_ == VK_NULL_HANDLE) {
-        createMaterialSampler(allocator_.device(), materialSampler_, TextureSamplerDesc{});
+        materialSamplerDesc_ = TextureSamplerDesc{};
+        materialSampler_ = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
     }
 
     if (materialTextureTable_.residentCount() > 0) {
@@ -907,7 +972,8 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
     destroyMaterialTextureSamplers();
     bool mixedSamplers = false;
     const TextureSamplerDesc materialSamplerDesc = selectMaterialSampler(importedScene, assets, mixedSamplers);
-    createMaterialSampler(allocator_.device(), materialSampler_, materialSamplerDesc);
+    materialSamplerDesc_ = materialSamplerDesc;
+    materialSampler_ = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
     if (mixedSamplers) {
         std::cout << "glTF scene uses mixed texture samplers; using the first sampler until per-texture bindless samplers are enabled.\n";
     }
@@ -972,8 +1038,10 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
 
     std::vector<std::unique_ptr<Image>> images;
     images.reserve(pendingTextures.size());
+    materialTextureSamplerDescs_.reserve(pendingTextures.size());
     for (auto& pending : pendingTextures) {
-        materialTextureSamplers_.push_back(createOwnedMaterialSampler(allocator_.device(), pending.sampler));
+        materialTextureSamplerDescs_.push_back(pending.sampler);
+        materialTextureSamplers_.push_back(createMaterialSampler(allocator_, pending.sampler, materialTextureAnisotropy_));
         images.push_back(std::move(pending.image));
     }
 
@@ -993,7 +1061,8 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
         materialSamplerDesc.wrapS = static_cast<TextureWrap>(first.wrapS);
         materialSamplerDesc.wrapT = static_cast<TextureWrap>(first.wrapT);
     }
-    createMaterialSampler(allocator_.device(), materialSampler_, materialSamplerDesc);
+    materialSamplerDesc_ = materialSamplerDesc;
+    materialSampler_ = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
 
     const uint32_t textureCount = std::min<uint32_t>(static_cast<uint32_t>(cached.textures.size()), maxMaterialTextures);
 
@@ -1058,8 +1127,10 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
 
     std::vector<std::unique_ptr<Image>> images;
     images.reserve(pendingTextures.size());
+    materialTextureSamplerDescs_.reserve(pendingTextures.size());
     for (auto& pending : pendingTextures) {
-        materialTextureSamplers_.push_back(createOwnedMaterialSampler(allocator_.device(), pending.sampler));
+        materialTextureSamplerDescs_.push_back(pending.sampler);
+        materialTextureSamplers_.push_back(createMaterialSampler(allocator_, pending.sampler, materialTextureAnisotropy_));
         images.push_back(std::move(pending.image));
     }
 
@@ -2109,6 +2180,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         GpuInstanceRecord rec{};
         rec.transform = cachedInst.transform;
         rec.inverseTransform = cachedInst.inverseTransform;
+        rec.normalTransform = glm::transpose(cachedInst.inverseTransform);
         rec.prevTransform = cachedInst.transform;
         rec.metadata = cachedInst.metadata;
         instanceRecords.push_back(rec);

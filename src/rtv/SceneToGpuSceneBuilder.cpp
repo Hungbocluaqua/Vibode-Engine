@@ -55,6 +55,9 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.shadowRayBias = render.shadowRayBias;
     result.rendererSettings.shadowDistanceBias = render.shadowDistanceBias;
     result.rendererSettings.fireflyClamp = render.fireflyClamp;
+    result.rendererSettings.adaptiveQualityMode = render.adaptiveQualityMode;
+    result.rendererSettings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
+    result.rendererSettings.materialTextureAnisotropy = render.materialTextureAnisotropy;
     result.rendererSettings.usePhysicalCamera = render.usePhysicalCamera;
     result.rendererSettings.physicalAperture = render.physicalAperture;
     result.rendererSettings.physicalShutterSeconds = render.physicalShutterSeconds;

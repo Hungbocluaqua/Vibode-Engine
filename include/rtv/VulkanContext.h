@@ -70,6 +70,8 @@ public:
     [[nodiscard]] VkSemaphore timelineSemaphore() const { return timelineSemaphore_; }
     [[nodiscard]] bool supportsTimelineSemaphore() const { return timelineSemaphore_ != VK_NULL_HANDLE; }
     [[nodiscard]] bool supportsSER() const { return supportsSER_; }
+    [[nodiscard]] bool supportsSamplerAnisotropy() const { return samplerAnisotropy_; }
+    [[nodiscard]] float maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
 
 private:
     void createInstance(GLFWwindow* window);
@@ -100,6 +102,8 @@ private:
     VkQueue computeQueue_ = VK_NULL_HANDLE;
     VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
     bool supportsSER_ = false;
+    bool samplerAnisotropy_ = false;
+    float maxSamplerAnisotropy_ = 1.0f;
     QueueFamilyIndices queueFamilies_{};
 };
 

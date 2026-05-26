@@ -81,7 +81,7 @@ public:
         std::optional<std::filesystem::path> sceneCachePath = std::nullopt);
     ~PathTracerRenderer();
 
-    void beginFrame(uint32_t frameIndex, VkExtent2D extent);
+    void beginFrame(uint32_t frameIndex, VkExtent2D renderExtent, VkExtent2D displayExtent);
     void setFrameDeltaSeconds(float deltaSeconds) { frameDeltaSeconds_ = deltaSeconds; }
     void recordPathTrace(VkCommandBuffer commandBuffer);
     void recordFullscreen(VkCommandBuffer commandBuffer, VkExtent2D swapchainExtent);
@@ -114,7 +114,8 @@ public:
     [[nodiscard]] AtmosphereLutStats atmosphereLutStats() const;
     [[nodiscard]] const GpuScene& scene() const { return scene_; }
     [[nodiscard]] VkDescriptorImageInfo viewportImageDescriptor() const;
-    [[nodiscard]] VkExtent2D renderExtent() const { return extent_; }
+    [[nodiscard]] VkExtent2D renderExtent() const { return renderExtent_; }
+    [[nodiscard]] VkExtent2D displayExtent() const { return displayExtent_; }
 
 private:
     struct DenoiserParams {
@@ -180,16 +181,16 @@ private:
     struct TaaParams {
         uint32_t enabled = 1;
         uint32_t frameCount = 0;
-        uint32_t width = 0;
-        uint32_t height = 0;
+        uint32_t width = 0; // display width
+        uint32_t height = 0; // display height
         float feedback = 0.08f;
         float velocityScale = 64.0f;
         uint32_t resetHistory = 1;
         float sharpeningStrength = 0.08f;
         uint32_t historyValid = 0;
         uint32_t cameraMoving = 0;
-        uint32_t _padding1 = 0;
-        uint32_t _padding2 = 0;
+        uint32_t renderWidth = 0;
+        uint32_t renderHeight = 0;
     };
 
     struct RestirSpatialParams {
@@ -216,7 +217,7 @@ private:
         glm::vec4 targetPdfWeightSumM{};
     };
 
-    void createResolutionResources(VkExtent2D extent);
+    void createResolutionResources(VkExtent2D renderExtent, VkExtent2D displayExtent);
     void updateCamera();
     void recordPathTraceGraph(VkCommandBuffer commandBuffer);
     void recordPathTracePass(VkCommandBuffer commandBuffer);
@@ -238,6 +239,7 @@ private:
     void recordSelectionOutline(VkCommandBuffer commandBuffer);
     void recordSelectionOutlinePass(VkCommandBuffer commandBuffer);
     void recordRenderGraphPlan();
+    void updateAdaptiveQuality(const GpuFrameTimings& timings);
     void copyHistoryResources(VkCommandBuffer commandBuffer);
     void copyHistoryResourcesPass(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool shouldRunDenoiser() const;
@@ -255,12 +257,21 @@ private:
     BufferUploader& uploader_;
     GpuScene scene_;
 
-    VkExtent2D extent_{};
+    VkExtent2D renderExtent_{};
+    VkExtent2D displayExtent_{};
     uint32_t frameCount_ = 0;
     uint32_t temporalFrameIndex_ = 0;
     uint32_t stillFrameCount_ = 0;
     float frameDeltaSeconds_ = 0.0f;
     bool cameraChangedThisFrame_ = false;
+    float adaptiveSmoothedGpuMs_ = 0.0f;
+    uint32_t adaptiveQualityTier_ = 0;
+    uint32_t adaptiveOverBudgetFrames_ = 0;
+    uint32_t adaptiveEffectiveMaxBounces_ = 8;
+    uint32_t adaptiveEffectiveEnvironmentSamples_ = 1;
+    uint32_t adaptiveEffectiveAtrousIterations_ = 4;
+    bool adaptiveSkipRestirSpatial_ = false;
+    bool adaptiveSkipDenoiser_ = false;
     AccumulationResetReason lastResetReason_ = AccumulationResetReason::Startup;
     CameraUniform camera_{};
     RendererSettings settings_{};

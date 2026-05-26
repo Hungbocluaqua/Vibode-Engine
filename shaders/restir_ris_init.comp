@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
+#include "blue_noise.glsl"
 #include "restir_common.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -46,13 +47,12 @@ void main() {
         return;
     }
 
-    uint rng = pixelIndex * 1013904223u + uint(params.width) * 2891336453u;
     RestirReservoir reservoir = empty_restir_reservoir();
     float totalWeight = 0.0;
 
     uint candidateCount = min(params.candidate_count, 32u);
     for (uint i = 0u; i < candidateCount; ++i) {
-        float r = rand_f32(rng);
+        float r = sample_dimension_1d(coords, 0u, i, SAMPLE_DIM_RESTIR_CANDIDATE);
         float uniformPdf = 1.0 / float(params.width * params.height);
         uint lightIndex = uint(floor(r * float(params.width * params.height)));
         if (lightIndex >= params.width * params.height) {
@@ -65,7 +65,7 @@ void main() {
         totalWeight += targetWeight;
         reservoir.target_pdf_weight_sum_m.z += 1.0;
 
-        if (rand_f32(rng) * totalWeight < targetWeight) {
+        if (sample_dimension_1d(coords, 0u, i, SAMPLE_DIM_RESTIR_CANDIDATE + 1u) * totalWeight < targetWeight) {
             reservoir.metadata = uvec4(1u, 0u, 1u, lightIndex);
             reservoir.sample_value_confidence.rgb = light_buffer.lights[lightIndex].rgb;
             reservoir.target_pdf_weight_sum_m.x = lightPdf;

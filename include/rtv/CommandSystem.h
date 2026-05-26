@@ -19,7 +19,7 @@ class UiOverlay;
 
 class CommandSystem final : private NonCopyable {
 public:
-    static constexpr uint32_t framesInFlight = 2;
+    static constexpr uint32_t framesInFlight = 3;
 
     CommandSystem(const VulkanContext& context, Swapchain& swapchain);
     ~CommandSystem();

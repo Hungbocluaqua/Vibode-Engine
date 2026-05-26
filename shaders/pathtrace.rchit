@@ -37,8 +37,8 @@ void main() {
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
     vec3 localNormal = normalize(v0.normal_uv_y.xyz * bary.x + v1.normal_uv_y.xyz * bary.y + v2.normal_uv_y.xyz * bary.z);
     vec3 localGeomNormal = normalize(cross(p1 - p0, p2 - p0));
-    vec3 worldNormal = normalize(transpose(mat3(instance.inverse_transform)) * localNormal);
-    vec3 worldGeomNormal = normalize(transpose(mat3(instance.inverse_transform)) * localGeomNormal);
+    vec3 worldNormal = normalize(mat3(instance.normal_transform) * localNormal);
+    vec3 worldGeomNormal = normalize(mat3(instance.normal_transform) * localGeomNormal);
     bool frontFace = dot(worldGeomNormal, gl_WorldRayDirectionEXT) < 0.0;
     if (!frontFace) {
         worldGeomNormal = -worldGeomNormal;

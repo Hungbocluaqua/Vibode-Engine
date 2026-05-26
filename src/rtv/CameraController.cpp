@@ -12,6 +12,7 @@ namespace rtv {
 namespace {
 constexpr float mouseSensitivity = 0.0025f;
 constexpr float pitchLimit = 1.52f;
+constexpr float maxCameraDeltaSeconds = 1.0f / 30.0f;
 
 [[nodiscard]] bool keyDown(GLFWwindow* window, int key) {
     return glfwGetKey(window, key) == GLFW_PRESS;
@@ -21,6 +22,7 @@ constexpr float pitchLimit = 1.52f;
 CameraController::CameraController() = default;
 
 bool CameraController::update(GLFWwindow* window, float deltaSeconds, PathTracerRenderer& renderer, bool allowMouseCapture, bool allowKeyboardMove) {
+    deltaSeconds = std::clamp(std::isfinite(deltaSeconds) ? deltaSeconds : 0.0f, 0.0f, maxCameraDeltaSeconds);
     if (glfwGetWindowAttrib(window, GLFW_FOCUSED) != GLFW_TRUE) {
         if (mouseCaptured_) {
             releaseMouse(window);

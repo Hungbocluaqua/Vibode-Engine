@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace rtv {
@@ -17,6 +18,8 @@ public:
 
 private:
     [[nodiscard]] std::vector<std::filesystem::path> dependenciesFor(const std::filesystem::path& source) const;
+    [[nodiscard]] std::string compileSignature() const;
+    [[nodiscard]] std::string compileDefineArgs() const;
 
     std::filesystem::path glslangValidatorPath_;
 };

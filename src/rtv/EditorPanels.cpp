@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 34>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 34> views = {
+const std::array<RendererDebugView, 43>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 43> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -18,12 +18,21 @@ const std::array<RendererDebugView, 34>& editorDebugViews() {
         RendererDebugView::DirectLighting,
         RendererDebugView::IndirectLighting,
         RendererDebugView::EmissiveContribution,
+        RendererDebugView::EmissiveContinuation,
         RendererDebugView::EnvironmentContribution,
         RendererDebugView::InstanceId,
         RendererDebugView::MeshId,
         RendererDebugView::LightPdf,
         RendererDebugView::BsdfPdf,
         RendererDebugView::MisWeight,
+        RendererDebugView::SunMisWeight,
+        RendererDebugView::SunLightPdf,
+        RendererDebugView::SunPreviousBsdfPdf,
+        RendererDebugView::RisRawLightPdf,
+        RendererDebugView::RisEffectiveLightPdf,
+        RendererDebugView::RisPdfRatio,
+        RendererDebugView::SampleDimension,
+        RendererDebugView::SampleScramble,
         RendererDebugView::DirectSampleType,
         RendererDebugView::Albedo,
         RendererDebugView::ClayMaterial,
@@ -89,10 +98,19 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::DirectLighting);
         selectable(RendererDebugView::IndirectLighting);
         selectable(RendererDebugView::EmissiveContribution);
+        selectable(RendererDebugView::EmissiveContinuation);
         selectable(RendererDebugView::EnvironmentContribution);
         selectable(RendererDebugView::LightPdf);
         selectable(RendererDebugView::BsdfPdf);
         selectable(RendererDebugView::MisWeight);
+        selectable(RendererDebugView::SunMisWeight);
+        selectable(RendererDebugView::SunLightPdf);
+        selectable(RendererDebugView::SunPreviousBsdfPdf);
+        selectable(RendererDebugView::RisRawLightPdf);
+        selectable(RendererDebugView::RisEffectiveLightPdf);
+        selectable(RendererDebugView::RisPdfRatio);
+        selectable(RendererDebugView::SampleDimension);
+        selectable(RendererDebugView::SampleScramble);
         selectable(RendererDebugView::DirectSampleType);
         ImGui::SeparatorText("Transport");
         selectable(RendererDebugView::FirstBounceThroughput);

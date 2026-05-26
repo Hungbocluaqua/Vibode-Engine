@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "blue_noise.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -59,10 +62,11 @@ float halton(uint index, uint base) {
     return result;
 }
 
-ivec2 blue_noise_offset(uint pixelIndex, uint roundIndex) {
-    uint h = pcg_hash(pixelIndex ^ (roundIndex * 1013904223u));
-    float angle = halton(pixelIndex ^ (roundIndex * 71u), 2u) * 2.0 * 3.14159265;
-    float radius = 0.5 + halton(pixelIndex ^ (roundIndex * 113u), 3u) * 3.0;
+ivec2 blue_noise_offset(ivec2 coords, uint roundIndex) {
+    vec2 sampleValue = sample_dimension_2d(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL);
+    uint h = sample_dimension_seed(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 2u);
+    float angle = sampleValue.x * 2.0 * 3.14159265;
+    float radius = 0.5 + sampleValue.y * 3.0;
     float ca = cos(angle);
     float sa = sin(angle);
     ivec2 offset = ivec2(int(floor(ca * radius + 0.5)), int(floor(sa * radius + 0.5)));
@@ -106,7 +110,7 @@ void main() {
     float totalWeight = max(luminance(merged.sample_value_confidence.rgb), 0.0) * max(merged.sample_value_confidence.a, 0.05);
 
     for (uint roundIndex = 0u; roundIndex < 4u; ++roundIndex) {
-        ivec2 sampleCoords = coords + blue_noise_offset(pixelIndex, roundIndex);
+        ivec2 sampleCoords = coords + blue_noise_offset(coords, roundIndex);
         if (sampleCoords.x < 0 || sampleCoords.y < 0 || sampleCoords.x >= int(params.width) || sampleCoords.y >= int(params.height)) {
             continue;
         }

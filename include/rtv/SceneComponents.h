@@ -144,9 +144,12 @@ struct RenderSettings {
     bool accumulate = true;
     uint32_t accumulationLimit = 0;
     float resolutionScale = 1.0f;
+    float materialTextureAnisotropy = 8.0f;
     float shadowRayBias = 0.001f;
     float shadowDistanceBias = 0.002f;
     float fireflyClamp = 48.0f;
+    AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Off;
+    float adaptiveGpuFrameTargetMs = 16.6f;
 
     bool usePhysicalCamera = false;
     float physicalAperture = 16.0f;

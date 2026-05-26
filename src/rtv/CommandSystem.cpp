@@ -51,22 +51,27 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     checkVk(vkResetFences(context_.device(), 1, &frame.inFlight), "vkResetFences");
     checkVk(vkResetCommandPool(context_.device(), frame.commandPool, 0), "vkResetCommandPool");
     if (pathTracer_ != nullptr) {
-        VkExtent2D renderExtent = swapchain_.extent();
+        VkExtent2D displayExtent = swapchain_.extent();
         if (uiOverlay_ != nullptr) {
-            renderExtent = uiOverlay_->desiredRenderExtent(renderExtent);
+            displayExtent = uiOverlay_->desiredRenderExtent(displayExtent);
         }
         const float scale = pathTracer_->settings().renderResolutionScale;
+        VkExtent2D renderExtent = displayExtent;
         renderExtent.width = std::max(1u, static_cast<uint32_t>(static_cast<float>(renderExtent.width) * scale));
         renderExtent.height = std::max(1u, static_cast<uint32_t>(static_cast<float>(renderExtent.height) * scale));
         const VkExtent2D currentRenderExtent = pathTracer_->renderExtent();
+        const VkExtent2D currentDisplayExtent = pathTracer_->displayExtent();
         if (uiOverlay_ != nullptr &&
-            currentRenderExtent.width != 0 &&
-            (currentRenderExtent.width != renderExtent.width || currentRenderExtent.height != renderExtent.height)) {
+            (currentRenderExtent.width != 0 || currentDisplayExtent.width != 0) &&
+            (currentRenderExtent.width != renderExtent.width ||
+             currentRenderExtent.height != renderExtent.height ||
+             currentDisplayExtent.width != displayExtent.width ||
+             currentDisplayExtent.height != displayExtent.height)) {
             checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(editor viewport resize)");
             uiOverlay_->invalidateViewportTexture();
         }
         pathTracer_->setFrameDeltaSeconds(deltaSeconds);
-        pathTracer_->beginFrame(frameIndex_, renderExtent);
+        pathTracer_->beginFrame(frameIndex_, renderExtent, displayExtent);
     } else if (pipelineDemo_ != nullptr) {
         pipelineDemo_->beginFrame(frameIndex_);
     }

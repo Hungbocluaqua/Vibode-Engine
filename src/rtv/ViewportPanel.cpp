@@ -362,13 +362,9 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         };
         state.viewport.leftClicked = hovered_ && !state.viewport.mouseCaptureActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 
-        VkExtent2D expectedExtent = lastContentExtent_;
-        const float scale = state.renderer.settings().renderResolutionScale;
-        expectedExtent.width = std::max(1u, static_cast<uint32_t>(static_cast<float>(expectedExtent.width) * scale));
-        expectedExtent.height = std::max(1u, static_cast<uint32_t>(static_cast<float>(expectedExtent.height) * scale));
         const bool imageMatchesPanel =
-            expectedExtent.width == state.viewport.renderExtent.width &&
-            expectedExtent.height == state.viewport.renderExtent.height;
+            lastContentExtent_.width == state.viewport.displayExtent.width &&
+            lastContentExtent_.height == state.viewport.displayExtent.height;
 
         if (imageMatchesPanel && state.viewport.textureReady && state.viewport.texture != VK_NULL_HANDLE) {
             ImGui::Image(
@@ -457,8 +453,9 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
 
         {
             std::ostringstream resFmt;
-            resFmt << extent.width << "x" << extent.height
-                   << "  HW RT"
+            resFmt << "render " << extent.width << "x" << extent.height
+                   << "  display " << state.viewport.displayExtent.width << "x" << state.viewport.displayExtent.height
+                   << "  scale " << std::fixed << std::setprecision(2) << settings.renderResolutionScale
                    << "  reset:" << accumulationResetReasonName(state.renderer.lastAccumulationResetReason());
             hudText(4, resFmt.str().c_str(), IM_COL32(140, 140, 140, 220));
         }

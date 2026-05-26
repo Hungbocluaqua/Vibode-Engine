@@ -53,6 +53,9 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "direct" || key == "directlighting") { return RendererDebugView::DirectLighting; }
     if (key == "indirect" || key == "indirectlighting") { return RendererDebugView::IndirectLighting; }
     if (key == "emissive" || key == "emissivecontribution") { return RendererDebugView::EmissiveContribution; }
+    if (key == "emissivecontinuation" || key == "emissivecontinue" || key == "continuedemissive") {
+        return RendererDebugView::EmissiveContinuation;
+    }
     if (key == "environment" || key == "env" || key == "environmentcontribution") { return RendererDebugView::EnvironmentContribution; }
     if (key == "traversal" || key == "traversalsteps") { return RendererDebugView::TraversalSteps; }
     if (key == "bvh" || key == "bvhdepth") { return RendererDebugView::BvhDepth; }
@@ -63,6 +66,16 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "lightpdf" || key == "directpdf") { return RendererDebugView::LightPdf; }
     if (key == "bsdfpdf" || key == "brdfpdf") { return RendererDebugView::BsdfPdf; }
     if (key == "mis" || key == "misweight") { return RendererDebugView::MisWeight; }
+    if (key == "sunmis" || key == "sunmisweight") { return RendererDebugView::SunMisWeight; }
+    if (key == "sunpdf" || key == "sunlightpdf") { return RendererDebugView::SunLightPdf; }
+    if (key == "sunbsdfpdf" || key == "sunpreviousbsdfpdf" || key == "sunprevbsdfpdf") {
+        return RendererDebugView::SunPreviousBsdfPdf;
+    }
+    if (key == "risrawpdf" || key == "risrawlightpdf") { return RendererDebugView::RisRawLightPdf; }
+    if (key == "riseffectivepdf" || key == "riseffectivelightpdf") { return RendererDebugView::RisEffectiveLightPdf; }
+    if (key == "rispdfratio" || key == "risratio") { return RendererDebugView::RisPdfRatio; }
+    if (key == "sampledimension" || key == "sampledimensions" || key == "samplingdimension") { return RendererDebugView::SampleDimension; }
+    if (key == "samplescramble" || key == "samplescrambling" || key == "scramble") { return RendererDebugView::SampleScramble; }
     if (key == "directsample" || key == "directsampletype" || key == "sampletype") { return RendererDebugView::DirectSampleType; }
     if (key == "albedo" || key == "basecolor" || key == "basecolour") { return RendererDebugView::Albedo; }
     if (key == "clay" || key == "claymaterial" || key == "balancedclay" || key == "balancedclaymaterial" ||
@@ -155,6 +168,15 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirReservoirAge: return "restir-reservoir-age";
     case RendererDebugView::RestirReservoirConfidence: return "restir-reservoir-confidence";
     case RendererDebugView::RestirReservoirM: return "restir-reservoir-m";
+    case RendererDebugView::EmissiveContinuation: return "emissive-continuation";
+    case RendererDebugView::SunMisWeight: return "sun-mis-weight";
+    case RendererDebugView::SunLightPdf: return "sun-light-pdf";
+    case RendererDebugView::SunPreviousBsdfPdf: return "sun-previous-bsdf-pdf";
+    case RendererDebugView::RisRawLightPdf: return "ris-raw-light-pdf";
+    case RendererDebugView::RisEffectiveLightPdf: return "ris-effective-light-pdf";
+    case RendererDebugView::RisPdfRatio: return "ris-pdf-ratio";
+    case RendererDebugView::SampleDimension: return "sample-dimension";
+    case RendererDebugView::SampleScramble: return "sample-scramble";
     }
     return "beauty";
 }

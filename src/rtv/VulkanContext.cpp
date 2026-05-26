@@ -187,6 +187,10 @@ void VulkanContext::pickPhysicalDevice() {
     }
 
     vkGetPhysicalDeviceProperties(physicalDevice_, &physicalDeviceProperties_);
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(physicalDevice_, &features);
+    samplerAnisotropy_ = features.samplerAnisotropy == VK_TRUE;
+    maxSamplerAnisotropy_ = samplerAnisotropy_ ? physicalDeviceProperties_.limits.maxSamplerAnisotropy : 1.0f;
     queueFamilies_ = findQueueFamilies(physicalDevice_);
 }
 
@@ -275,6 +279,7 @@ void VulkanContext::createDevice() {
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.features.shaderFloat64 = VK_TRUE;
     features2.features.pipelineStatisticsQuery = VK_TRUE;
+    features2.features.samplerAnisotropy = samplerAnisotropy_ ? VK_TRUE : VK_FALSE;
     features2.pNext = &rtMaintenance1Features;
 
     VkDeviceCreateInfo createInfo{};
