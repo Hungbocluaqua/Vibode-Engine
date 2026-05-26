@@ -77,6 +77,7 @@ add_executable(rtvulkan
     src/rtv/DescriptorSet.cpp
     src/rtv/DescriptorWriter.cpp
     src/rtv/DiagnosticImageExport.cpp
+    src/rtv/DiagnosticTools.cpp
     src/rtv/EditorDockspace.cpp
     src/rtv/EditorLayer.cpp
     src/rtv/EditorPanels.cpp

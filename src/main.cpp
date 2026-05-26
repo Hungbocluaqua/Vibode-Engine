@@ -1,4 +1,5 @@
 #include "rtv/Application.h"
+#include "rtv/DiagnosticTools.h"
 #include "rtv/HeadlessDiagnostics.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/RendererDebug.h"
@@ -8,6 +9,8 @@
 #include "rtv/GpuProfiler.h"
 
 #include <exception>
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -15,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include <vector>
 
 #ifdef RTV_HAS_RENDERDOC
 #define WIN32_LEAN_AND_MEAN
@@ -56,12 +60,40 @@ int main(int argc, char** argv) {
         rtv::HeadlessDiagnosticsConfig diagConfig;
         bool dumpRenderGraphDot = false;
         std::optional<std::filesystem::path> dotOutputPath;
+        std::optional<std::filesystem::path> compareProfileOldPath;
+        std::optional<std::filesystem::path> compareProfileNewPath;
+        std::optional<std::filesystem::path> compareImageBaselinePath;
+        std::optional<std::filesystem::path> compareImageCurrentPath;
+        std::optional<std::filesystem::path> compareImageOutputPath;
+        bool updateBaseline = false;
+        bool checkBaseline = false;
+        std::filesystem::path baselineRoot = "baselines";
+        std::optional<std::filesystem::path> dumpMemoryPath;
+        std::optional<std::filesystem::path> dumpFrameTimelinePath;
+        std::optional<std::filesystem::path> dumpResourceLifetimesPath;
+        std::optional<std::filesystem::path> dumpShaderReportPath;
+        std::optional<std::filesystem::path> dumpBindingsPath;
+        std::optional<std::filesystem::path> crashDumpPackageDir;
+        std::optional<std::filesystem::path> checkBudgetPath;
+        bool validateGpuLabels = false;
+        bool shaderHotReloadReport = false;
+        std::optional<std::string> cameraName;
+        std::optional<uint32_t> frameIndex;
+        std::vector<std::string> disabledPasses;
 
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
 
             if (arg == "--frames" && i + 1 < argc) {
                 maxFrames = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if (arg == "--compare-profile" && i + 2 < argc) {
+                compareProfileOldPath = std::filesystem::path(argv[++i]);
+                compareProfileNewPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--compare-image" && i + 2 < argc) {
+                compareImageBaselinePath = std::filesystem::path(argv[++i]);
+                compareImageCurrentPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--out" && i + 1 < argc) {
+                compareImageOutputPath = std::filesystem::path(argv[++i]);
             } else if (arg == "--debug-view" && i + 1 < argc) {
                 debugView = rtv::parseRendererDebugView(argv[++i]);
                 debugViewProvided = true;
@@ -120,7 +152,50 @@ int main(int argc, char** argv) {
                 diagConfig.runValidationSuite = true;
             } else if (arg == "--validation-output" && i + 1 < argc) {
                 diagConfig.validationOutputDir = std::filesystem::path(argv[++i]);
+            } else if (arg == "--update-baseline") {
+                updateBaseline = true;
+            } else if (arg == "--check-baseline") {
+                checkBaseline = true;
+            } else if (arg == "--baseline-dir" && i + 1 < argc) {
+                baselineRoot = std::filesystem::path(argv[++i]);
+            } else if (arg == "--dump-memory" && i + 1 < argc) {
+                dumpMemoryPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--dump-frame-timeline" && i + 1 < argc) {
+                dumpFrameTimelinePath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--dump-resource-lifetimes" && i + 1 < argc) {
+                dumpResourceLifetimesPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--dump-shader-report" && i + 1 < argc) {
+                dumpShaderReportPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--dump-bindings" && i + 1 < argc) {
+                dumpBindingsPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--crash-dump-package" && i + 1 < argc) {
+                crashDumpPackageDir = std::filesystem::path(argv[++i]);
+            } else if (arg == "--validate-gpu-labels") {
+                validateGpuLabels = true;
+            } else if (arg == "--check-budget" && i + 1 < argc) {
+                checkBudgetPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--shader-hot-reload-report") {
+                shaderHotReloadReport = true;
+            } else if (arg == "--disable-pass" && i + 1 < argc) {
+                disabledPasses.push_back(argv[++i]);
+            } else if (arg == "--camera" && i + 1 < argc) {
+                cameraName = std::string(argv[++i]);
+            } else if (arg == "--frame-index" && i + 1 < argc) {
+                frameIndex = static_cast<uint32_t>(std::stoul(argv[++i]));
             }
+        }
+
+        if (compareProfileOldPath.has_value() || compareProfileNewPath.has_value()) {
+            if (!compareProfileOldPath.has_value() || !compareProfileNewPath.has_value()) {
+                throw std::runtime_error("--compare-profile requires old.json and new.json");
+            }
+            return rtv::compareProfileCommand(*compareProfileOldPath, *compareProfileNewPath);
+        }
+        if (compareImageBaselinePath.has_value() || compareImageCurrentPath.has_value()) {
+            if (!compareImageBaselinePath.has_value() || !compareImageCurrentPath.has_value()) {
+                throw std::runtime_error("--compare-image requires baseline.png and current.png");
+            }
+            return rtv::compareImageCommand(*compareImageBaselinePath, *compareImageCurrentPath, compareImageOutputPath);
         }
 
         if (diagConfig.headless && maxFrames == 0) {
@@ -138,6 +213,44 @@ int main(int argc, char** argv) {
             return summary.totalFail > 0 ? 1 : 0;
         }
 
+        const bool baselineMode = updateBaseline || checkBaseline;
+        const bool needsProfile =
+            diagConfig.profile ||
+            diagConfig.profileJsonPath.has_value() ||
+            baselineMode ||
+            dumpMemoryPath.has_value() ||
+            dumpFrameTimelinePath.has_value() ||
+            checkBudgetPath.has_value() ||
+            crashDumpPackageDir.has_value();
+        const bool needsRenderGraph =
+            baselineMode ||
+            dumpFrameTimelinePath.has_value() ||
+            dumpResourceLifetimesPath.has_value() ||
+            dumpBindingsPath.has_value() ||
+            validateGpuLabels ||
+            crashDumpPackageDir.has_value();
+        const bool needsDebugViews = baselineMode || crashDumpPackageDir.has_value();
+        if (needsProfile) {
+            diagConfig.profile = true;
+        }
+        const std::filesystem::path artifactBase =
+            rtv::defaultDiagnosticArtifactDir(scenePath.value_or("scene"), "current");
+        if (needsProfile && !diagConfig.profileJsonPath.has_value()) {
+            diagConfig.profileJsonPath = artifactBase / "profile.json";
+        }
+        if (needsRenderGraph && !diagConfig.dumpRenderGraphPath.has_value()) {
+            diagConfig.dumpRenderGraphPath = artifactBase / "rendergraph.json";
+        }
+        if (needsDebugViews && !diagConfig.saveDebugViewsDir.has_value()) {
+            diagConfig.saveDebugViewsDir = artifactBase / "debug_views";
+        }
+        if (shaderHotReloadReport && !dumpShaderReportPath.has_value()) {
+            dumpShaderReportPath = artifactBase / "shader_hot_reload_report.json";
+        }
+        if (frameIndex.has_value() && !diagConfig.fixedSeed.has_value()) {
+            diagConfig.fixedSeed = *frameIndex;
+        }
+
         if (diagConfig.headless && !scenePath.has_value()) {
             throw std::runtime_error("--headless requires --scene <path>");
         }
@@ -147,10 +260,38 @@ int main(int argc, char** argv) {
             diagConfig.headless);
 
         if (auto* renderer = app.pathTracer()) {
+            auto lower = [](std::string value) {
+                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+                    return static_cast<char>(std::tolower(ch));
+                });
+                return value;
+            };
             if (diagConfig.fixedSeed.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();
                 settings.fixedSeed = diagConfig.fixedSeed;
                 renderer->applySettings(settings);
+            }
+            if (!disabledPasses.empty()) {
+                rtv::RendererSettings settings = renderer->settings();
+                for (const std::string& pass : disabledPasses) {
+                    const std::string name = lower(pass);
+                    if (name == "denoiser" || name == "temporaldenoiser") {
+                        settings.denoiserEnabled = false;
+                    } else if (name == "taa" || name == "tsr") {
+                        settings.taaEnabled = false;
+                    } else if (name == "restir" || name == "restirdi" || name == "restirgi" || name == "restirspatial") {
+                        settings.restirMode = rtv::RestirMode::ClassicNee;
+                    } else if (name == "autoexposure") {
+                        settings.autoExposureEnabled = false;
+                    } else {
+                        std::cerr << "Warning: unknown --disable-pass value: " << pass << "\n";
+                    }
+                }
+                renderer->applySettings(settings);
+            }
+            if (cameraName.has_value()) {
+                std::cerr << "Warning: --camera " << *cameraName
+                          << " was parsed, but named camera selection is not exposed by Application yet; using the active scene camera.\n";
             }
             if (diagConfig.dumpRenderGraphPath.has_value()) {
                 renderer->setDumpRenderGraphPath(diagConfig.dumpRenderGraphPath);
@@ -179,7 +320,7 @@ int main(int argc, char** argv) {
 #endif
 
         rtv::HeadlessDiagnostics diag(diagConfig);
-        if (diagConfig.makeDebugPackageDir.has_value()) {
+        if (diagConfig.makeDebugPackageDir.has_value() || crashDumpPackageDir.has_value()) {
             diag.captureStdout();
         }
 
@@ -229,7 +370,11 @@ int main(int argc, char** argv) {
 #endif
 
         if (diagConfig.profile || diagConfig.saveDebugViewsDir.has_value() ||
-            diagConfig.dumpRenderGraphPath.has_value() || diagConfig.makeDebugPackageDir.has_value()) {
+            diagConfig.dumpRenderGraphPath.has_value() || diagConfig.makeDebugPackageDir.has_value() ||
+            dumpMemoryPath.has_value() || dumpFrameTimelinePath.has_value() ||
+            dumpResourceLifetimesPath.has_value() || dumpBindingsPath.has_value() ||
+            dumpShaderReportPath.has_value() || crashDumpPackageDir.has_value() ||
+            baselineMode || validateGpuLabels || checkBudgetPath.has_value()) {
             diag.run(app);
 
             if (diagConfig.profileJsonPath.has_value()) {
@@ -242,9 +387,67 @@ int main(int argc, char** argv) {
                 const std::filesystem::path scnPath = scenePath.value_or("");
                 diag.makeDebugPackage(app, *diagConfig.makeDebugPackageDir, scnPath);
             }
+            if (crashDumpPackageDir.has_value()) {
+                const std::filesystem::path scnPath = scenePath.value_or("");
+                diag.makeDebugPackage(app, *crashDumpPackageDir, scnPath);
+            }
         }
 
-        return 0;
+        std::string capturedLog;
+        if (crashDumpPackageDir.has_value()) {
+            capturedLog = diag.releaseStdout();
+        }
+
+        int finalExitCode = 0;
+        if (dumpMemoryPath.has_value()) {
+            rtv::writeMemoryReport(*dumpMemoryPath, diag.profileReport());
+        }
+        if (dumpFrameTimelinePath.has_value()) {
+            rtv::writeFrameTimeline(*dumpFrameTimelinePath, diag.profileReport(), diagConfig.dumpRenderGraphPath);
+        }
+        if (dumpResourceLifetimesPath.has_value()) {
+            rtv::writeResourceLifetimes(*dumpResourceLifetimesPath, diagConfig.dumpRenderGraphPath);
+        }
+        if (dumpShaderReportPath.has_value()) {
+            const auto shaderDir = std::filesystem::current_path() / "shaders";
+            const auto shaderOutDir = std::filesystem::current_path() / "build" / "shaders";
+            rtv::writeShaderReport(*dumpShaderReportPath, shaderDir, shaderOutDir);
+        }
+        if (dumpBindingsPath.has_value()) {
+            rtv::writeBindingsReport(*dumpBindingsPath, diagConfig.dumpRenderGraphPath);
+        }
+        if (validateGpuLabels) {
+            finalExitCode = std::max(finalExitCode, rtv::validateGpuLabels(diagConfig.dumpRenderGraphPath));
+        }
+        if (checkBudgetPath.has_value()) {
+            finalExitCode = std::max(finalExitCode, rtv::checkBudget(*checkBudgetPath, diag.profileReport()));
+        }
+        if (baselineMode) {
+            const rtv::BaselinePaths paths = rtv::baselinePathsFor(scenePath.value_or("scene"), baselineRoot);
+            if (!diagConfig.profileJsonPath.has_value() ||
+                !diagConfig.dumpRenderGraphPath.has_value() ||
+                !diagConfig.saveDebugViewsDir.has_value()) {
+                throw std::runtime_error("Baseline mode requires profile, render graph, and debug view artifacts");
+            }
+            if (updateBaseline) {
+                rtv::updateBaseline(paths, *diagConfig.profileJsonPath, *diagConfig.dumpRenderGraphPath, *diagConfig.saveDebugViewsDir);
+            }
+            if (checkBaseline) {
+                finalExitCode = std::max(finalExitCode,
+                    rtv::checkBaseline(paths, *diagConfig.profileJsonPath, *diagConfig.dumpRenderGraphPath, *diagConfig.saveDebugViewsDir));
+            }
+        }
+        if (crashDumpPackageDir.has_value()) {
+            rtv::writeCrashDumpPackage(
+                *crashDumpPackageDir,
+                scenePath.value_or(""),
+                diagConfig.profileJsonPath,
+                diagConfig.dumpRenderGraphPath,
+                diagConfig.saveDebugViewsDir,
+                capturedLog);
+        }
+
+        return finalExitCode;
     } catch (const std::exception& error) {
         std::cerr << "Fatal error: " << error.what() << '\n';
         return 1;

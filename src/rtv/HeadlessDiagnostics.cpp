@@ -254,6 +254,24 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["gpu_frame_ms"] = profileReport_.gpuFrameMs;
     j["per_pass_gpu_ms"] = profileReport_.perPassGpuMs;
     j["pipeline_statistics"] = profileReport_.pipelineStatistics;
+    const uint64_t hitCount = profileReport_.pipelineStatistics.triangleHits + profileReport_.pipelineStatistics.aabbHits;
+    j["gpu_debug_counters"] = {
+        {"ray_count", profileReport_.pipelineStatistics.rayInvocations},
+        {"shadow_ray_count", nullptr},
+        {"hit_count", hitCount},
+        {"miss_count", profileReport_.pipelineStatistics.rayInvocations > hitCount ? profileReport_.pipelineStatistics.rayInvocations - hitCount : 0},
+        {"path_length_histogram", nlohmann::json::array()},
+        {"restir_accepted_count", nullptr},
+        {"restir_rejected_count", nullptr},
+        {"taa_history_accepted_count", nullptr},
+        {"taa_history_rejected_count", nullptr},
+        {"denoiser_history_accepted_count", nullptr},
+        {"denoiser_history_rejected_count", nullptr},
+        {"notes", nlohmann::json::array({
+            "ray_count/hit_count/miss_count come from Vulkan pipeline statistics when available",
+            "remaining counters require shader atomic instrumentation and are intentionally null until instrumented"
+        })},
+    };
     j["memory"] = profileReport_.memory;
     j["validation_error_count"] = profileReport_.validationErrorCount;
     j["warnings"] = profileReport_.warnings;
