@@ -50,7 +50,10 @@ struct RayTracingDeviceInfo {
 class VulkanContext final : private NonCopyable {
 public:
     explicit VulkanContext(GLFWwindow* window);
+    static std::unique_ptr<VulkanContext> createHeadless();
     ~VulkanContext();
+
+    [[nodiscard]] bool headless() const { return headless_; }
 
     [[nodiscard]] VkInstance instance() const { return instance_; }
     [[nodiscard]] VkPhysicalDevice physicalDevice() const { return physicalDevice_; }
@@ -74,10 +77,12 @@ public:
     [[nodiscard]] float maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
 
 private:
+    explicit VulkanContext(bool headless);
     void createInstance(GLFWwindow* window);
     void createDebugMessenger();
     void createSurface(GLFWwindow* window);
     void pickPhysicalDevice();
+    void pickPhysicalDeviceHeadless();
     void createDevice();
 
     [[nodiscard]] bool validationRequested() const;
@@ -89,6 +94,7 @@ private:
     [[nodiscard]] RayTracingDeviceInfo queryRayTracingDeviceInfo(VkPhysicalDevice physicalDevice) const;
     [[nodiscard]] int scorePhysicalDevice(VkPhysicalDevice physicalDevice) const;
 
+    bool headless_ = false;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;

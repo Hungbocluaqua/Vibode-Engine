@@ -321,7 +321,8 @@ Application::Application(
     std::optional<bool> denoiserOverride,
     std::optional<RestirMode> restirModeOverride,
     bool debugViewOverride,
-    bool validationCameraMotion)
+    bool validationCameraMotion,
+    bool headless)
     : debugView_(debugView),
       gltfPath_(std::move(gltfPath)),
       hdrPath_(std::move(hdrPath)),
@@ -329,8 +330,11 @@ Application::Application(
       denoiserOverride_(denoiserOverride),
       restirModeOverride_(restirModeOverride),
       debugViewOverride_(debugViewOverride),
-      validationCameraMotion_(validationCameraMotion) {
-    initWindow();
+      validationCameraMotion_(validationCameraMotion),
+      headless_(headless) {
+    if (!headless_) {
+        initWindow();
+    }
     initVulkan();
 }
 
@@ -359,11 +363,77 @@ Application::~Application() {
     if (window_ != nullptr) {
         glfwDestroyWindow(window_);
     }
-    glfwTerminate();
+    if (!headless_) {
+        glfwTerminate();
+    }
 }
 
 void Application::run(uint32_t maxFrames) {
     mainLoop(maxFrames);
+}
+
+void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
+    warmupFrameCount_ = warmupFrames;
+    totalFrameCount_ = totalFrames;
+    cpuFrameTimings_.clear();
+    gpuFrameTimings_.clear();
+    cpuFrameTimings_.reserve(totalFrames);
+    gpuFrameTimings_.reserve(totalFrames);
+
+    const uint32_t renderedFrames = std::max(warmupFrames, totalFrames);
+    const auto start = std::chrono::steady_clock::now();
+    float seconds = 0.0f;
+
+    for (uint32_t frameCount = 0; frameCount < renderedFrames; ++frameCount) {
+        const auto frameStart = std::chrono::steady_clock::now();
+
+        const float rawDeltaSeconds = 1.0f / 60.0f;
+        const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
+        lastFrameSeconds_ = seconds;
+        commandSystem_->drawFrame(seconds, deltaSeconds);
+        seconds += deltaSeconds;
+
+        const auto frameEnd = std::chrono::steady_clock::now();
+        const float cpuMs = std::chrono::duration<float, std::milli>(frameEnd - frameStart).count();
+        cpuFrameTimings_.push_back(cpuMs);
+
+        if (pathTracer_) {
+            const auto& timings = pathTracer_->timings();
+            float gpuTotal = timings.pathTraceMs + timings.restirSpatialMs +
+                timings.fogIntegrateMs + timings.atmosphereMs + timings.denoiserMs +
+                timings.historyCopyMs + timings.taaMs + timings.autoExposureMs +
+                timings.toneMapMs + timings.selectionOutlineMs + timings.fullscreenMs;
+            gpuFrameTimings_.push_back(gpuTotal);
+        }
+    }
+    commandSystem_->waitIdle();
+}
+
+void Application::renderFrames(uint32_t count) {
+    float seconds = lastFrameSeconds_ + 1.0f / 60.0f;
+    for (uint32_t i = 0; i < count; ++i) {
+        const float rawDeltaSeconds = 1.0f / 60.0f;
+        const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
+        lastFrameSeconds_ = seconds;
+        commandSystem_->drawFrame(seconds, deltaSeconds);
+        seconds += deltaSeconds;
+    }
+    commandSystem_->waitIdle();
+}
+
+void Application::resetAccumulation() {
+    if (pathTracer_) {
+        pathTracer_->resetAccumulation(AccumulationResetReason::Manual);
+    }
+}
+
+void Application::applyDebugView(RendererDebugView view) {
+    if (pathTracer_) {
+        RendererSettings settings = pathTracer_->settings();
+        settings.debugView = view;
+        pathTracer_->applySettings(settings);
+        pathTracer_->resetAccumulation(AccumulationResetReason::DebugViewChanged);
+    }
 }
 
 void Application::initWindow() {
@@ -390,12 +460,22 @@ void Application::initWindow() {
 }
 
 void Application::initVulkan() {
-    context_ = std::make_unique<VulkanContext>(window_);
+    if (headless_) {
+        context_ = VulkanContext::createHeadless();
+    } else {
+        context_ = std::make_unique<VulkanContext>(window_);
+    }
     allocator_ = std::make_unique<ResourceAllocator>(*context_);
     uploadContext_ = std::make_unique<UploadContext>(context_->device(), context_->graphicsQueue(), context_->queueFamilies().graphics.value());
     uploader_ = std::make_unique<BufferUploader>(*allocator_, *uploadContext_);
-    swapchain_ = std::make_unique<Swapchain>(*context_, window_);
+    if (headless_) {
+        constexpr VkExtent2D defaultExtent{1280, 720};
+        swapchain_ = std::make_unique<Swapchain>(*context_, defaultExtent);
+    } else {
+        swapchain_ = std::make_unique<Swapchain>(*context_, window_);
+    }
     commandSystem_ = std::make_unique<CommandSystem>(*context_, *swapchain_);
+    commandSystem_->setHeadless(headless_);
     const auto projectRoot = resolveProjectRoot();
     const auto shaderDir = projectRoot / "native" / "vulkan" / "shaders";
     bool loadedSceneDocument = false;
@@ -455,18 +535,42 @@ void Application::initVulkan() {
     createPathTracer(&startupSettings);
     applyActiveSceneCamera();
     sceneDocument_.clearDirty();
-    uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_);
-    if (loadedSceneDocument) {
-        uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
+    if (!headless_) {
+        uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_);
+        if (loadedSceneDocument) {
+            uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
+        }
+        commandSystem_->setUiOverlay(uiOverlay_.get());
+        uiOverlay_->editor().editorPrefs().load(EditorPreferences::defaultPath());
     }
     commandSystem_->setPathTracer(pathTracer_.get());
-    commandSystem_->setUiOverlay(uiOverlay_.get());
-    uiOverlay_->editor().editorPrefs().load(EditorPreferences::defaultPath());
 }
 
 void Application::mainLoop(uint32_t maxFrames) {
+    if (headless_) {
+        runHeadless(0, maxFrames > 0 ? maxFrames : 120);
+        return;
+    }
+
     const auto start = std::chrono::steady_clock::now();
     uint32_t frameCount = 0;
+    const uint32_t totalMaxFrames = (headless_ && maxFrames == 0) ? 120u : maxFrames;
+
+    if (headless_) {
+        while (totalMaxFrames == 0 || frameCount < totalMaxFrames) {
+            const auto now = std::chrono::steady_clock::now();
+            const float seconds = std::chrono::duration<float>(now - start).count();
+            const float rawDeltaSeconds = std::max(0.0f, seconds - lastFrameSeconds_);
+            const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
+            lastFrameSeconds_ = seconds;
+
+            commandSystem_->drawFrame(seconds, deltaSeconds);
+            ++frameCount;
+        }
+        commandSystem_->waitIdle();
+        return;
+    }
+
     while (glfwWindowShouldClose(window_) == GLFW_FALSE) {
         glfwPollEvents();
 

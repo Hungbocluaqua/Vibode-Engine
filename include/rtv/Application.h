@@ -11,6 +11,7 @@
 #include "rtv/SceneToGpuSceneBuilder.h"
 #include "rtv/NotificationManager.h"
 #include "rtv/UndoStack.h"
+#include "rtv/HeadlessDiagnostics.h"
 
 #include <memory>
 #include <array>
@@ -45,12 +46,25 @@ public:
         std::optional<bool> denoiserOverride = std::nullopt,
         std::optional<RestirMode> restirModeOverride = std::nullopt,
         bool debugViewOverride = false,
-        bool validationCameraMotion = false);
+        bool validationCameraMotion = false,
+        bool headless = false);
     ~Application();
 
     void run(uint32_t maxFrames = 0);
+    void runHeadless(uint32_t warmupFrames, uint32_t totalFrames);
+    void renderFrames(uint32_t count);
+    void resetAccumulation();
+    void applyDebugView(RendererDebugView view);
     void onWindowFocusChanged(bool focused);
     void onFilesDropped(int count, const char** paths);
+
+    [[nodiscard]] PathTracerRenderer* pathTracer() { return pathTracer_.get(); }
+    [[nodiscard]] const VulkanContext* vulkanContext() const { return context_.get(); }
+    [[nodiscard]] ResourceAllocator* resourceAllocator() { return allocator_.get(); }
+    [[nodiscard]] Swapchain* swapchain() { return swapchain_.get(); }
+    [[nodiscard]] const std::vector<float>& cpuFrameTimings() const { return cpuFrameTimings_; }
+    [[nodiscard]] const std::vector<float>& gpuFrameTimings() const { return gpuFrameTimings_; }
+    [[nodiscard]] uint32_t warmupFrameCount() const { return warmupFrameCount_; }
 
 private:
     struct PendingSceneLoadResult {
@@ -114,6 +128,11 @@ private:
     [[nodiscard]] bool pressedOnce(int key);
 
     GLFWwindow* window_ = nullptr;
+    bool headless_ = false;
+    uint32_t warmupFrameCount_ = 0;
+    uint32_t totalFrameCount_ = 0;
+    std::vector<float> cpuFrameTimings_;
+    std::vector<float> gpuFrameTimings_;
     RendererDebugView debugView_ = RendererDebugView::Beauty;
     std::optional<std::filesystem::path> gltfPath_;
     std::optional<std::filesystem::path> hdrPath_;

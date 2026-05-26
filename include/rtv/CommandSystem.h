@@ -28,6 +28,7 @@ public:
     void setPipelineDemo(PipelineDemo* demo) { pipelineDemo_ = demo; }
     void setPathTracer(PathTracerRenderer* renderer) { pathTracer_ = renderer; }
     void setUiOverlay(UiOverlay* overlay) { uiOverlay_ = overlay; }
+    void setHeadless(bool headless) { headless_ = headless; }
     void drawFrame(float clearPhase, float deltaSeconds);
     void waitIdle() const;
 
@@ -57,6 +58,8 @@ private:
 
     const VulkanContext& context_;
     Swapchain& swapchain_;
+    bool headless_ = false;
+    uint32_t headlessImageIndex_ = 0;
     ResourceDemo* resourceDemo_ = nullptr;
     PipelineDemo* pipelineDemo_ = nullptr;
     PathTracerRenderer* pathTracer_ = nullptr;

@@ -62,6 +62,7 @@ VkDebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo() {
 } // namespace
 
 VulkanContext::VulkanContext(GLFWwindow* window) {
+    headless_ = false;
     checkVk(volkInitialize(), "volkInitialize");
     createInstance(window);
     volkLoadInstance(instance_);
@@ -98,6 +99,36 @@ VulkanContext::VulkanContext(GLFWwindow* window) {
         }
         std::cout << '\n';
     }
+}
+
+VulkanContext::VulkanContext(bool headless) {
+    headless_ = headless;
+}
+
+std::unique_ptr<VulkanContext> VulkanContext::createHeadless() {
+    auto context = std::unique_ptr<VulkanContext>(new VulkanContext(true));
+    checkVk(volkInitialize(), "volkInitialize");
+    context->createInstance(nullptr);
+    volkLoadInstance(context->instance_);
+    context->createDebugMessenger();
+    context->pickPhysicalDeviceHeadless();
+    context->bindlessCapabilities_ = queryBindlessCapabilities(context->physicalDevice_);
+    context->rayTracingInfo_ = context->queryRayTracingDeviceInfo(context->physicalDevice_);
+    context->createDevice();
+    volkLoadDevice(context->device_);
+
+    std::cout << "Headless Vulkan device: " << context->physicalDeviceProperties_.deviceName << '\n';
+    std::cout << "Descriptor indexing: "
+              << (context->bindlessCapabilities_.descriptorIndexing && context->bindlessCapabilities_.runtimeDescriptorArray ? "available" : "limited")
+              << " (max sampled update-after-bind " << context->bindlessCapabilities_.maxSampledImages << ")\n";
+    if (context->rayTracingInfo_.capabilities.supported) {
+        std::cout << "Hardware ray tracing: available (max recursion depth "
+                  << context->rayTracingInfo_.rayTracingPipelineProperties.maxRayRecursionDepth << ")\n";
+    } else {
+        std::cout << "Hardware ray tracing: unavailable\n";
+    }
+
+    return context;
 }
 
 VulkanContext::~VulkanContext() {
@@ -287,7 +318,10 @@ void VulkanContext::createDevice() {
     createInfo.pNext = &features2;
     createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
     createInfo.pQueueCreateInfos = queueInfos.data();
-    std::vector<const char*> enabledExtensions = requiredDeviceExtensions;
+    std::vector<const char*> enabledExtensions;
+    if (!headless_) {
+        enabledExtensions = requiredDeviceExtensions;
+    }
     if (rayTracingInfo_.capabilities.supported) {
         enabledExtensions.insert(enabledExtensions.end(), optionalRayTracingDeviceExtensions.begin(), optionalRayTracingDeviceExtensions.end());
         bool supportsInvocationReorder = false;
@@ -352,14 +386,23 @@ bool VulkanContext::validationAvailable() const {
     });
 }
 
-std::vector<const char*> VulkanContext::requiredInstanceExtensions(GLFWwindow*) const {
+std::vector<const char*> VulkanContext::requiredInstanceExtensions(GLFWwindow* window) const {
+    (void)window;
+    std::vector<const char*> extensions;
+    if (headless_) {
+        if (validationRequested()) {
+            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
+        return extensions;
+    }
+
     uint32_t glfwExtensionCount = 0;
     const char** glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
     if (glfwExtensions == nullptr || glfwExtensionCount == 0) {
         throw std::runtime_error("GLFW did not report required Vulkan instance extensions");
     }
 
-    std::vector<const char*> extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
+    extensions.assign(glfwExtensions, glfwExtensions + glfwExtensionCount);
     if (validationRequested()) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
@@ -385,10 +428,16 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice physicalDev
             dedicatedCompute = i;
         }
 
-        VkBool32 presentSupported = VK_FALSE;
-        checkVk(vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, i, surface_, &presentSupported), "vkGetPhysicalDeviceSurfaceSupportKHR");
-        if (presentSupported == VK_TRUE) {
-            indices.present = i;
+        if (!headless_ && surface_ != VK_NULL_HANDLE) {
+            VkBool32 presentSupported = VK_FALSE;
+            checkVk(vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, i, surface_, &presentSupported), "vkGetPhysicalDeviceSurfaceSupportKHR");
+            if (presentSupported == VK_TRUE) {
+                indices.present = i;
+            }
+        } else if (headless_) {
+            if (hasGraphics) {
+                indices.present = i;
+            }
         }
 
         if (indices.complete()) {
@@ -410,6 +459,10 @@ bool VulkanContext::deviceSupportsRequiredExtensions(VkPhysicalDevice physicalDe
     checkVk(vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr), "vkEnumerateDeviceExtensionProperties(count)");
     std::vector<VkExtensionProperties> available(extensionCount);
     checkVk(vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, available.data()), "vkEnumerateDeviceExtensionProperties");
+
+    if (headless_) {
+        return true;
+    }
 
     std::set<std::string> missing(requiredDeviceExtensions.begin(), requiredDeviceExtensions.end());
     for (const auto& extension : available) {
@@ -519,12 +572,14 @@ int VulkanContext::scorePhysicalDevice(VkPhysicalDevice physicalDevice) const {
         return -1;
     }
 
-    uint32_t formatCount = 0;
-    checkVk(vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface_, &formatCount, nullptr), "vkGetPhysicalDeviceSurfaceFormatsKHR(count)");
-    uint32_t presentModeCount = 0;
-    checkVk(vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface_, &presentModeCount, nullptr), "vkGetPhysicalDeviceSurfacePresentModesKHR(count)");
-    if (formatCount == 0 || presentModeCount == 0) {
-        return -1;
+    if (!headless_) {
+        uint32_t formatCount = 0;
+        checkVk(vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface_, &formatCount, nullptr), "vkGetPhysicalDeviceSurfaceFormatsKHR(count)");
+        uint32_t presentModeCount = 0;
+        checkVk(vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface_, &presentModeCount, nullptr), "vkGetPhysicalDeviceSurfacePresentModesKHR(count)");
+        if (formatCount == 0 || presentModeCount == 0) {
+            return -1;
+        }
     }
 
     int score = 0;
@@ -533,6 +588,37 @@ int VulkanContext::scorePhysicalDevice(VkPhysicalDevice physicalDevice) const {
     }
     score += static_cast<int>(properties.limits.maxImageDimension2D);
     return score;
+}
+
+void VulkanContext::pickPhysicalDeviceHeadless() {
+    uint32_t deviceCount = 0;
+    checkVk(vkEnumeratePhysicalDevices(instance_, &deviceCount, nullptr), "vkEnumeratePhysicalDevices(count)");
+    if (deviceCount == 0) {
+        throw std::runtime_error("No Vulkan physical devices found");
+    }
+
+    std::vector<VkPhysicalDevice> devices(deviceCount);
+    checkVk(vkEnumeratePhysicalDevices(instance_, &deviceCount, devices.data()), "vkEnumeratePhysicalDevices");
+
+    int bestScore = std::numeric_limits<int>::min();
+    for (VkPhysicalDevice candidate : devices) {
+        const int score = scorePhysicalDevice(candidate);
+        if (score > bestScore) {
+            bestScore = score;
+            physicalDevice_ = candidate;
+        }
+    }
+
+    if (physicalDevice_ == VK_NULL_HANDLE || bestScore < 0) {
+        throw std::runtime_error("No suitable Vulkan 1.3 device with dynamic rendering and synchronization2 support was found");
+    }
+
+    vkGetPhysicalDeviceProperties(physicalDevice_, &physicalDeviceProperties_);
+    VkPhysicalDeviceFeatures features{};
+    vkGetPhysicalDeviceFeatures(physicalDevice_, &features);
+    samplerAnisotropy_ = features.samplerAnisotropy == VK_TRUE;
+    maxSamplerAnisotropy_ = samplerAnisotropy_ ? physicalDeviceProperties_.limits.maxSamplerAnisotropy : 1.0f;
+    queueFamilies_ = findQueueFamilies(physicalDevice_);
 }
 
 } // namespace rtv

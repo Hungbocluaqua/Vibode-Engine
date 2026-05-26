@@ -114,8 +114,16 @@ public:
     [[nodiscard]] AtmosphereLutStats atmosphereLutStats() const;
     [[nodiscard]] const GpuScene& scene() const { return scene_; }
     [[nodiscard]] VkDescriptorImageInfo viewportImageDescriptor() const;
+    [[nodiscard]] VkImage presentationImage() const { return presentationImage_.handle(); }
     [[nodiscard]] VkExtent2D renderExtent() const { return renderExtent_; }
     [[nodiscard]] VkExtent2D displayExtent() const { return displayExtent_; }
+
+    [[nodiscard]] VkDeviceSize estimatedTextureMemory() const;
+    [[nodiscard]] VkDeviceSize estimatedBufferMemory() const;
+    [[nodiscard]] VkDeviceSize temporalHistoryMemory() const;
+    [[nodiscard]] VkDeviceSize restirReservoirMemory() const;
+
+    void setDumpRenderGraphPath(std::optional<std::filesystem::path> path) { dumpRenderGraphPath_ = std::move(path); }
 
 private:
     struct DenoiserParams {
@@ -287,6 +295,7 @@ private:
     AccumulationResetReason lastResetReason_ = AccumulationResetReason::Startup;
     CameraUniform camera_{};
     RendererSettings settings_{};
+    std::optional<std::filesystem::path> dumpRenderGraphPath_;
     DenoiserParams denoiserParams_{};
     TaaParams taaParams_{};
     RestirSpatialParams restirSpatialParams_{};

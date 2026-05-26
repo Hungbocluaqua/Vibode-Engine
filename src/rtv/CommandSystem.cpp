@@ -34,19 +34,26 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     checkVk(vkWaitForFences(context_.device(), 1, &frame.inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 
     uint32_t imageIndex = 0;
-    VkResult acquireResult = vkAcquireNextImageKHR(
-        context_.device(),
-        swapchain_.handle(),
-        UINT64_MAX,
-        frame.imageAvailable,
-        VK_NULL_HANDLE,
-        &imageIndex);
+    VkResult acquireResult = VK_SUCCESS;
 
-    if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
-        recreateSwapchainResources();
-        return;
+    if (headless_) {
+        imageIndex = headlessImageIndex_;
+        headlessImageIndex_ = (headlessImageIndex_ + 1) % swapchain_.imageCount();
+    } else {
+        acquireResult = vkAcquireNextImageKHR(
+            context_.device(),
+            swapchain_.handle(),
+            UINT64_MAX,
+            frame.imageAvailable,
+            VK_NULL_HANDLE,
+            &imageIndex);
+
+        if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+            recreateSwapchainResources();
+            return;
+        }
+        checkVk(acquireResult, "vkAcquireNextImageKHR");
     }
-    checkVk(acquireResult, "vkAcquireNextImageKHR");
 
     checkVk(vkResetFences(context_.device(), 1, &frame.inFlight), "vkResetFences");
     checkVk(vkResetCommandPool(context_.device(), frame.commandPool, 0), "vkResetCommandPool");
@@ -82,25 +89,37 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     commandBufferInfo.commandBuffer = frame.commandBuffer;
 
     VkSemaphoreSubmitInfo waitInfo{};
-    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    waitInfo.semaphore = frame.imageAvailable;
-    waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    VkSemaphoreSubmitInfo signalInfo{};
-    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    signalInfo.semaphore = imageRenderFinished_.at(imageIndex);
-    signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
-
     VkSubmitInfo2 submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    submitInfo.waitSemaphoreInfoCount = 1;
-    submitInfo.pWaitSemaphoreInfos = &waitInfo;
-    submitInfo.commandBufferInfoCount = 1;
-    submitInfo.pCommandBufferInfos = &commandBufferInfo;
-    submitInfo.signalSemaphoreInfoCount = 1;
-    submitInfo.pSignalSemaphoreInfos = &signalInfo;
+
+    if (!headless_) {
+        waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        waitInfo.semaphore = frame.imageAvailable;
+        waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+        VkSemaphoreSubmitInfo signalInfo{};
+        signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        signalInfo.semaphore = imageRenderFinished_.at(imageIndex);
+        signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+        submitInfo.waitSemaphoreInfoCount = 1;
+        submitInfo.pWaitSemaphoreInfos = &waitInfo;
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &commandBufferInfo;
+        submitInfo.signalSemaphoreInfoCount = 1;
+        submitInfo.pSignalSemaphoreInfos = &signalInfo;
+    } else {
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &commandBufferInfo;
+    }
 
     checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &submitInfo, frame.inFlight), "vkQueueSubmit2");
+
+    if (headless_) {
+        frameIndex_ = (frameIndex_ + 1) % framesInFlight;
+        return;
+    }
 
     VkSwapchainKHR swapchainHandle = swapchain_.handle();
     VkPresentInfoKHR presentInfo{};
@@ -187,6 +206,9 @@ void CommandSystem::destroyPresentSemaphores() {
 }
 
 void CommandSystem::recreateSwapchainResources() {
+    if (headless_) {
+        return;
+    }
     waitIdle();
     destroyPresentSemaphores();
     swapchain_.recreate();
@@ -274,7 +296,7 @@ void CommandSystem::recordClearCommands(VkCommandBuffer commandBuffer, uint32_t 
             commandBuffer,
             swapchainImage,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            !headless_ ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_BLIT_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_2_NONE,
@@ -284,7 +306,7 @@ void CommandSystem::recordClearCommands(VkCommandBuffer commandBuffer, uint32_t 
             commandBuffer,
             swapchainImage,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            !headless_ ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_2_NONE,

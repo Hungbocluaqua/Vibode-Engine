@@ -17,6 +17,12 @@ find_package(unofficial-spirv-reflect CONFIG REQUIRED)
 find_package(Ktx CONFIG REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
+option(RENDERDOC_SDK_DIR "Path to RenderDoc SDK directory" "")
+if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
+    target_compile_definitions(rtvulkan PRIVATE RTV_HAS_RENDERDOC=1)
+    target_include_directories(rtvulkan PRIVATE "${RENDERDOC_SDK_DIR}")
+endif()
+
 if(NOT DEFINED ENV{VULKAN_SDK})
     message(FATAL_ERROR "VULKAN_SDK is not set. Install the Vulkan SDK and open a new terminal.")
 endif()
@@ -74,6 +80,7 @@ add_executable(rtvulkan
     src/rtv/DescriptorLayoutCache.cpp
     src/rtv/DescriptorSet.cpp
     src/rtv/DescriptorWriter.cpp
+    src/rtv/DiagnosticImageExport.cpp
     src/rtv/EditorDockspace.cpp
     src/rtv/EditorLayer.cpp
     src/rtv/EditorPanels.cpp
@@ -90,6 +97,7 @@ add_executable(rtvulkan
     src/rtv/GpuValidation.cpp
     src/rtv/GraphicsPipeline.cpp
     src/rtv/HdrLoader.cpp
+    src/rtv/HeadlessDiagnostics.cpp
     src/rtv/Image.cpp
     src/rtv/ImageBarrier.cpp
     src/rtv/InspectorPanel.cpp
@@ -106,6 +114,7 @@ add_executable(rtvulkan
     src/rtv/PipelineDemo.cpp
     src/rtv/RenderSettingsPanel.cpp
     src/rtv/RenderGraph.cpp
+    src/rtv/RenderGraphDump.cpp
     src/rtv/RendererDebug.cpp
     src/rtv/RayTracingPipeline.cpp
     src/rtv/RayTracingScene.cpp

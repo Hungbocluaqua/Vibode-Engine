@@ -13,6 +13,7 @@
 #include "rtv/RayTracingPipeline.h"
 #include "rtv/RayTracingScene.h"
 #include "rtv/RenderGraph.h"
+#include "rtv/RenderGraphDump.h"
 #include "rtv/ResourceAllocator.h"
 #include "rtv/ShaderCompiler.h"
 #include "rtv/ShaderModule.h"
@@ -1033,7 +1034,7 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .width = displayExtent.width,
         .height = displayExtent.height,
         .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .debugName = "path tracer presentation ldr",
     });
     cameraBuffer_.create(allocator_, BufferDesc{
@@ -1231,7 +1232,7 @@ void PathTracerRenderer::updateCamera() {
         temporalHistoryAvailable ? 1.0f : 0.0f,
         settings_.sunAzimuth);
     camera_.frameCount = frameCount_;
-    camera_.temporalFrameIndex = temporalFrameIndex_;
+    camera_.temporalFrameIndex = settings_.fixedSeed.has_value() ? *settings_.fixedSeed : temporalFrameIndex_;
 
     if (cameraChangedThisFrame_) {
         stillFrameCount_ = 0;
@@ -1250,7 +1251,8 @@ void PathTracerRenderer::updateCamera() {
     glm::mat4 projection = glm::perspectiveRH_ZO(camera_.fovY, aspect, 0.01f, 1000.0f);
     projection[1][1] *= -1.0f;
     const bool jitterEnabled = settings_.pathTracingEnabled && settings_.taaEnabled && settings_.cameraJitterEnabled && effectiveJitterScale > 0.0f && renderExtent_.width > 0 && renderExtent_.height > 0;
-    const uint32_t jitterIndex = temporalFrameIndex_ + 1u;
+    const uint32_t jitterBase = settings_.fixedSeed.has_value() ? *settings_.fixedSeed : temporalFrameIndex_;
+    const uint32_t jitterIndex = settings_.fixedSeed.has_value() ? jitterBase : (jitterBase + 1u);
     const glm::vec2 currentJitter = jitterEnabled
         ? glm::vec2(halton(jitterIndex, 2u) - 0.5f, halton(jitterIndex, 3u) - 0.5f) * effectiveJitterScale
         : glm::vec2(0.0f);
@@ -1767,6 +1769,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     }
 
     graph.compile();
+    if (dumpRenderGraphPath_.has_value()) {
+        dumpRenderGraphJson(graph, currentProfiler_->timings(), *dumpRenderGraphPath_);
+        dumpRenderGraphPath_.reset();
+    }
     validationLog_.recordPass("render graph compiled pass count=" + std::to_string(graph.compiledPassOrder().size()));
     for (uint32_t passIndex : graph.compiledPassOrder()) {
         validationLog_.recordPass("render graph pass: " + graph.passes()[passIndex].name());
@@ -2993,6 +2999,55 @@ void PathTracerRenderer::recordEditorPresentationStart(VkCommandBuffer commandBu
 
 void PathTracerRenderer::recordEditorPresentationEnd(VkCommandBuffer commandBuffer) {
     currentProfiler_->write(commandBuffer, GpuProfiler::FullscreenEnd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+}
+
+VkDeviceSize PathTracerRenderer::estimatedTextureMemory() const {
+    VkDeviceSize total = 0;
+    auto texSize = [](const Image& img) {
+        if (img.handle() == VK_NULL_HANDLE) return VkDeviceSize(0);
+        uint32_t bpp = 4;
+        switch (img.format()) {
+        case VK_FORMAT_R16G16B16A16_SFLOAT: bpp = 8; break;
+        case VK_FORMAT_R32G32B32A32_SFLOAT: bpp = 16; break;
+        default: break;
+        }
+        return VkDeviceSize(img.width()) * img.height() * bpp;
+    };
+    total += texSize(rawImage_);
+    total += texSize(denoisedImage_);
+    total += texSize(historyImage_);
+    total += texSize(diffuseResolvedImage_);
+    total += texSize(specularResolvedImage_);
+    total += texSize(diffuseHistoryImage_);
+    total += texSize(specularHistoryImage_);
+    total += texSize(taaImage_);
+    total += texSize(taaHistoryImage_);
+    total += texSize(presentationImage_);
+    return total;
+}
+
+VkDeviceSize PathTracerRenderer::estimatedBufferMemory() const {
+    VkDeviceSize total = 0;
+    total += accumulationBuffer_.size();
+    total += varianceBuffer_.size();
+    total += depthNormalBuffer_.size();
+    total += worldPositionBuffer_.size();
+    total += previousWorldPositionBuffer_.size();
+    total += velocityBuffer_.size();
+    total += entityIdBuffer_.size();
+    total += pathDataBuffer_.size();
+    return total;
+}
+
+VkDeviceSize PathTracerRenderer::temporalHistoryMemory() const {
+    if (temporalSystem_) {
+        return temporalSystem_->totalHistoryMemoryBytes();
+    }
+    return 0;
+}
+
+VkDeviceSize PathTracerRenderer::restirReservoirMemory() const {
+    return restirReservoirBuffer_.size() + previousRestirReservoirBuffer_.size() + restirSpatialReservoirBuffer_.size();
 }
 
 } // namespace rtv

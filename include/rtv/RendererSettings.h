@@ -5,6 +5,7 @@
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <optional>
 
 namespace rtv {
 
@@ -70,6 +71,8 @@ struct RendererSettings {
     float russianRouletteMinSurvival = 0.10f;
     AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Off;
     float adaptiveGpuFrameTargetMs = 16.6f;
+
+    std::optional<uint32_t> fixedSeed;
 
     bool usePhysicalCamera = false;
     float physicalAperture = 16.0f;
