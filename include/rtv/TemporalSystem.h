@@ -53,8 +53,31 @@ public:
         float blendFactor = 1.0f;
     };
 
+    struct SpecularVirtualMotionInput {
+        glm::vec3 surfacePosition{};
+        glm::vec3 surfaceNormal{0.0f, 1.0f, 0.0f};
+        glm::vec3 cameraPosition{};
+        glm::mat4 currentViewProj{1.0f};
+        glm::mat4 previousViewProj{1.0f};
+        glm::vec2 currentPixel{};
+        glm::vec2 renderSize{};
+        glm::vec2 surfaceVelocityPixels{};
+        float secondaryHitDistance = 0.0f;
+        float roughness = 1.0f;
+        float specularSignal = 0.0f;
+    };
+
+    struct SpecularVirtualMotionResult {
+        glm::vec2 velocityPixels{};
+        glm::vec2 historyPixel{};
+        bool valid = false;
+        float confidence = 0.0f;
+    };
+
     [[nodiscard]] static ReprojectResult reproject(glm::vec2 uv, glm::vec2 velocityPixels, glm::vec2 renderSize);
     [[nodiscard]] static ConfidenceResult evaluateConfidence(const ConfidenceInput& input);
+    [[nodiscard]] static SpecularVirtualMotionResult estimateSpecularVirtualMotion(const SpecularVirtualMotionInput& input);
+    [[nodiscard]] static float effectiveHistoryLength(float historyWeight);
     [[nodiscard]] static float reactiveWeight(float localContrast, float luminance);
     [[nodiscard]] static glm::vec3 clampHistoryYCoCg(glm::vec3 history, glm::vec3 minColor, glm::vec3 maxColor, float sigmaLuminance);
 

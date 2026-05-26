@@ -37,6 +37,10 @@ struct PathDataRecord {
     vec4 albedo_roughness_hit_confidence;
 };
 layout(set = 0, binding = 10, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
+layout(set = 0, binding = 11, rgba16f) readonly uniform image2D diffuse_history;
+layout(set = 0, binding = 12, rgba16f) readonly uniform image2D specular_history;
+layout(set = 0, binding = 13, rgba16f) writeonly uniform image2D output_diffuse_history;
+layout(set = 0, binding = 14, rgba16f) writeonly uniform image2D output_specular_history;
 
 layout(set = 0, binding = 8, std140) uniform PrevCamera {
     mat4 view_proj;
@@ -194,6 +198,34 @@ vec3 bilinear_history_color(vec2 historyPos, ivec2 dims) {
     return mix(mix(c00, c10, fracValue.x), mix(c01, c11, fracValue.x), fracValue.y);
 }
 
+vec3 bilinear_diffuse_history_color(vec2 historyPos, ivec2 dims) {
+    ivec2 base = ivec2(floor(historyPos));
+    vec2 fracValue = fract(historyPos);
+    ivec2 p00 = clamp(base, ivec2(0), dims - ivec2(1));
+    ivec2 p10 = clamp(base + ivec2(1, 0), ivec2(0), dims - ivec2(1));
+    ivec2 p01 = clamp(base + ivec2(0, 1), ivec2(0), dims - ivec2(1));
+    ivec2 p11 = clamp(base + ivec2(1, 1), ivec2(0), dims - ivec2(1));
+    vec3 c00 = imageLoad(diffuse_history, p00).rgb;
+    vec3 c10 = imageLoad(diffuse_history, p10).rgb;
+    vec3 c01 = imageLoad(diffuse_history, p01).rgb;
+    vec3 c11 = imageLoad(diffuse_history, p11).rgb;
+    return mix(mix(c00, c10, fracValue.x), mix(c01, c11, fracValue.x), fracValue.y);
+}
+
+vec3 bilinear_specular_history_color(vec2 historyPos, ivec2 dims) {
+    ivec2 base = ivec2(floor(historyPos));
+    vec2 fracValue = fract(historyPos);
+    ivec2 p00 = clamp(base, ivec2(0), dims - ivec2(1));
+    ivec2 p10 = clamp(base + ivec2(1, 0), ivec2(0), dims - ivec2(1));
+    ivec2 p01 = clamp(base + ivec2(0, 1), ivec2(0), dims - ivec2(1));
+    ivec2 p11 = clamp(base + ivec2(1, 1), ivec2(0), dims - ivec2(1));
+    vec3 c00 = imageLoad(specular_history, p00).rgb;
+    vec3 c10 = imageLoad(specular_history, p10).rgb;
+    vec3 c01 = imageLoad(specular_history, p01).rgb;
+    vec3 c11 = imageLoad(specular_history, p11).rgb;
+    return mix(mix(c00, c10, fracValue.x), mix(c01, c11, fracValue.x), fracValue.y);
+}
+
 vec3 bilinear_prev_world(vec2 historyPos, ivec2 dims) {
     ivec2 base = ivec2(floor(historyPos));
     vec2 fracValue = fract(historyPos);
@@ -254,6 +286,9 @@ void main() {
     float center_secondary_hit_distance = path_data.indirect_specular.a;
     float center_primary_hit_normalized = temporal_normalized_hit_distance(center_primary_hit_distance);
     float center_secondary_hit_normalized = temporal_normalized_hit_distance(center_secondary_hit_distance);
+    float specular_lum = luminance(path_data.direct_specular.rgb + path_data.indirect_specular.rgb);
+    float diffuse_lum = luminance(path_data.direct_diffuse.rgb + path_data.indirect_diffuse.rgb);
+    float specular_signal = clamp(specular_lum / max(specular_lum + diffuse_lum, 1.0e-4), 0.0, 1.0);
     float distance_kernel_bias = center_roughness * smoothstep(0.12, 0.55, center_primary_hit_normalized);
 
     float center_lum = luminance(center_color);
@@ -368,24 +403,68 @@ void main() {
 
     bool sky_valid = !is_surface_depth(center_depth);
     vec3 wp = reconstruct_current_world_position(coords, center_depth, dims);
-    vec2 history_pos = sky_valid ? reproject_sky_history(coords, dims) : reproject_history(coords, wp, dims);
+    vec2 surface_history_pos = sky_valid ? reproject_sky_history(coords, dims) : reproject_history(coords, wp, dims);
     vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], 64.0);
     vec2 velocity_history_pos = temporal_reproject_pixel(coords, velocity_pixels);
     bool velocity_on_screen = temporal_history_pixel_valid(velocity_history_pos, dims, 0.0);
     if (velocity_on_screen) {
-        history_pos = velocity_history_pos;
+        surface_history_pos = velocity_history_pos;
     }
+    vec2 specular_history_pos = surface_history_pos;
+    vec3 validation_wp = wp;
+    float validation_hit_normalized = center_primary_hit_normalized;
+    vec2 virtual_velocity_pixels = velocity_pixels;
+    float virtual_motion_confidence = 0.0;
+    if (!sky_valid && center_secondary_hit_distance > 0.001 && center_secondary_hit_distance < 65503.0) {
+        vec3 view_dir = normalize(wp - prev_camera.current_pos.xyz);
+        vec3 reflected_dir = normalize(reflect(view_dir, center_normal));
+        float virtual_distance = clamp(center_secondary_hit_distance, 0.05, 512.0);
+        vec3 virtual_wp = wp + reflected_dir * virtual_distance;
+        vec2 current_virtual_pos = project_world_to_pixels(prev_camera.view_proj, virtual_wp, dims);
+        vec2 previous_virtual_pos = project_world_to_pixels(prev_camera.prev_view_proj, virtual_wp, dims);
+        vec2 candidate_virtual_velocity = current_virtual_pos - previous_virtual_pos;
+        vec2 candidate_virtual_history_pos = vec2(coords) - candidate_virtual_velocity;
+        bool virtual_history_on_screen = temporal_history_pixel_valid(candidate_virtual_history_pos, dims, 0.0);
+        bool virtual_current_finite = current_virtual_pos.x >= -0.5 && current_virtual_pos.y >= -0.5;
+        if (virtual_history_on_screen && virtual_current_finite) {
+            virtual_motion_confidence = temporal_specular_virtual_motion_confidence(
+                center_roughness,
+                specular_signal,
+                center_secondary_hit_normalized,
+                length(velocity_pixels),
+                length(candidate_virtual_velocity - velocity_pixels));
+            specular_history_pos = mix(surface_history_pos, candidate_virtual_history_pos, virtual_motion_confidence);
+            virtual_velocity_pixels = mix(velocity_pixels, candidate_virtual_velocity, virtual_motion_confidence);
+            validation_wp = mix(wp, virtual_wp, virtual_motion_confidence);
+            validation_hit_normalized = mix(
+                center_primary_hit_normalized,
+                temporal_normalized_hit_distance(length(virtual_wp - prev_camera.current_pos.xyz)),
+                virtual_motion_confidence);
+        }
+    }
+    vec2 history_pos = mix(surface_history_pos, specular_history_pos, specular_signal);
     bool on_screen = params.reset_history == 0u && temporal_history_pixel_valid(history_pos, dims, 0.0);
+    bool diffuse_on_screen = params.reset_history == 0u && temporal_history_pixel_valid(surface_history_pos, dims, 0.0);
+    bool specular_on_screen = params.reset_history == 0u && temporal_history_pixel_valid(specular_history_pos, dims, 0.0);
     vec2 history_sample_pos = on_screen ? history_pos : vec2(coords);
+    vec2 diffuse_history_sample_pos = diffuse_on_screen ? surface_history_pos : vec2(coords);
+    vec2 specular_history_sample_pos = specular_on_screen ? specular_history_pos : vec2(coords);
 
-    vec3 history = bilinear_history_color(history_sample_pos, dims);
+    float diffuse_signal = 1.0 - specular_signal;
+    vec3 current_diffuse = filtered_color * diffuse_signal;
+    vec3 current_specular = filtered_color - current_diffuse;
+    vec3 diffuse_history_raw = bilinear_diffuse_history_color(diffuse_history_sample_pos, dims);
+    vec3 specular_history_raw = bilinear_specular_history_color(specular_history_sample_pos, dims);
+    vec3 legacy_history_raw = bilinear_history_color(history_sample_pos, dims);
+    vec3 history_raw = params.reset_history == 0u ? diffuse_history_raw + specular_history_raw : legacy_history_raw;
     vec3 reprojected_wp = bilinear_prev_world(history_sample_pos, dims);
-    float pos_diff = length(wp - reprojected_wp);
-    float relative_pos_diff = pos_diff / max(center_depth, 0.25);
+    float pos_diff = length(validation_wp - reprojected_wp);
+    float validation_depth = mix(center_depth, length(validation_wp - prev_camera.current_pos.xyz), virtual_motion_confidence);
+    float relative_pos_diff = pos_diff / max(validation_depth, 0.25);
     bool previous_sky_valid = reprojected_wp.y > 9.0e9;
     bool world_valid = is_surface_depth(center_depth) && !previous_sky_valid;
     bool history_kind_valid = sky_valid ? previous_sky_valid : world_valid;
-    float disocclusion_confidence = sky_valid
+    float base_disocclusion_confidence = sky_valid
         ? (on_screen && history_kind_valid ? 1.0 : 0.0)
         : temporal_disocclusion_confidence(
             on_screen,
@@ -399,14 +478,31 @@ void main() {
     float hit_distance_confidence = sky_valid
         ? 1.0
         : temporal_hit_distance_confidence(
-            center_primary_hit_normalized,
+            validation_hit_normalized,
             history_primary_hit_normalized,
-            mix(0.035, 0.085, center_primary_hit_normalized));
+            mix(0.035, 0.085, validation_hit_normalized));
     hit_distance_confidence *= 1.0 - smoothstep(0.10, 0.26, max_hit_distance_delta);
-    disocclusion_confidence *= hit_distance_confidence;
+    float diffuse_channel_confidence = base_disocclusion_confidence *
+        (diffuse_on_screen ? 1.0 : 0.0) *
+        (1.0 - smoothstep(0.18, 0.36, max_hit_distance_delta));
+    float specular_channel_confidence = base_disocclusion_confidence *
+        (specular_on_screen ? 1.0 : 0.0) *
+        hit_distance_confidence *
+        (1.0 - smoothstep(0.78, 0.98, center_roughness));
+    float disocclusion_confidence = mix(diffuse_channel_confidence, specular_channel_confidence, specular_signal);
 
-    float history_lum_before_clip = luminance(history);
-    history = temporal_clamp_history_ycocg(history, min_color, max_color, lum_sigma);
+    float history_lum_before_clip = luminance(history_raw);
+    vec3 diffuse_history = temporal_clamp_history_ycocg(
+        diffuse_history_raw,
+        min_color * diffuse_signal,
+        max_color * diffuse_signal,
+        lum_sigma * max(diffuse_signal, 0.1));
+    vec3 specular_history = temporal_clamp_history_ycocg(
+        specular_history_raw,
+        min_color * specular_signal,
+        max_color * specular_signal,
+        lum_sigma * max(specular_signal, 0.1) * 0.65);
+    vec3 history = diffuse_history + specular_history;
     float history_lum_after_clip = luminance(history);
     float lum_delta = abs(history_lum_before_clip - center_lum) / (max(center_lum, history_lum_before_clip) + 0.02);
     float clipped_lum_delta = abs(history_lum_before_clip - history_lum_after_clip) / (history_lum_before_clip + 0.02);
@@ -414,11 +510,29 @@ void main() {
     float reactive_mask = temporal_reactive_weight(lum_delta, clipped_lum_delta, neighborhood_lum_delta);
 
     float confidence = temporal_variance_confidence(center_var, 10.0);
-    float motion_confidence = temporal_motion_confidence(velocity_pixels, 24.0, 0.35);
+    float diffuse_confidence = temporal_variance_confidence(center_var, 6.0);
+    float specular_confidence = temporal_variance_confidence(center_var, 16.0);
+    float diffuse_motion_confidence = temporal_motion_confidence(velocity_pixels, 30.0, 0.45);
+    float specular_motion_confidence = temporal_motion_confidence(virtual_velocity_pixels, 16.0, 0.18);
+    float motion_confidence = mix(diffuse_motion_confidence, specular_motion_confidence, specular_signal);
     float specular_rejection = 1.0 - reactive_mask * mix(0.65, 0.95, confidence);
     float frame_blend = params.reset_history != 0u ? 0.0 : clamp(float(params.frame_count - 1u) / 30.0, 0.0, 1.0);
-    float history_weight = temporal_history_weight(confidence, disocclusion_confidence, motion_confidence, reactive_mask, frame_blend);
+    float diffuse_history_weight = temporal_history_weight(
+        diffuse_confidence,
+        diffuse_channel_confidence,
+        diffuse_motion_confidence,
+        reactive_mask * 0.45,
+        frame_blend);
+    float specular_history_weight = temporal_history_weight(
+        specular_confidence,
+        specular_channel_confidence,
+        specular_motion_confidence,
+        reactive_mask,
+        frame_blend);
+    float history_weight = mix(diffuse_history_weight, specular_history_weight, specular_signal);
     float denoiser_rejection = 1.0 - clamp(disocclusion_confidence * motion_confidence * specular_rejection, 0.0, 1.0);
+    vec3 resolved_diffuse = mix(current_diffuse, diffuse_history, diffuse_history_weight);
+    vec3 resolved_specular = mix(current_specular, specular_history, specular_history_weight);
 
     vec3 debug_color = filtered_color;
     if (params.debug_view == 1u) {
@@ -458,8 +572,25 @@ void main() {
             center_primary_hit_normalized,
             center_secondary_hit_normalized,
             hit_distance_confidence);
+    } else if (params.debug_view == 55u) {
+        vec2 visual_virtual_velocity = clamp(virtual_velocity_pixels / 32.0, vec2(-1.0), vec2(1.0));
+        debug_color = vec3(
+            visual_virtual_velocity * 0.5 + vec2(0.5),
+            virtual_motion_confidence);
+    } else if (params.debug_view == 56u) {
+        debug_color = vec3(
+            temporal_effective_history_length(diffuse_history_weight) / 50.0,
+            diffuse_channel_confidence,
+            diffuse_signal);
+    } else if (params.debug_view == 57u) {
+        debug_color = vec3(
+            temporal_effective_history_length(specular_history_weight) / 50.0,
+            specular_channel_confidence,
+            specular_signal);
     }
 
-    vec3 denoised = params.debug_view == 0u ? mix(filtered_color, history, history_weight) : debug_color;
+    vec3 denoised = params.debug_view == 0u ? resolved_diffuse + resolved_specular : debug_color;
+    imageStore(output_diffuse_history, coords, vec4(resolved_diffuse, 1.0));
+    imageStore(output_specular_history, coords, vec4(resolved_specular, 1.0));
     imageStore(output_denoised, coords, vec4(denoised, 1.0));
 }

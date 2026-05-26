@@ -43,6 +43,20 @@ float temporal_hit_distance_confidence(float currentNormalized, float historyNor
     return 1.0 - smoothstep(rejectThreshold, rejectThreshold * 2.5, delta);
 }
 
+float temporal_specular_virtual_motion_confidence(
+    float roughness,
+    float specularSignal,
+    float normalizedSecondaryHitDistance,
+    float surfaceMotionPixels,
+    float virtualMotionDeltaPixels) {
+    float glossyConfidence = 1.0 - smoothstep(0.22, 0.58, roughness);
+    float specularConfidence = smoothstep(0.25, 0.70, specularSignal);
+    float distanceConfidence = smoothstep(0.02, 0.18, normalizedSecondaryHitDistance) *
+        (1.0 - smoothstep(0.93, 0.99, normalizedSecondaryHitDistance));
+    float motionConfidence = 1.0 - smoothstep(48.0, 160.0, max(surfaceMotionPixels, virtualMotionDeltaPixels));
+    return clamp(glossyConfidence * specularConfidence * distanceConfidence * motionConfidence, 0.0, 0.85);
+}
+
 float temporal_disocclusion_confidence(
     bool onScreen,
     bool historyKindValid,
@@ -70,6 +84,10 @@ float temporal_history_weight(
         motionConfidence *
         reactiveRejection;
     return clamp(baseAlpha * frameBlend, 0.0, 0.98);
+}
+
+float temporal_effective_history_length(float historyWeight) {
+    return clamp(1.0 / max(1.0 - clamp(historyWeight, 0.0, 0.98), 0.02), 1.0, 50.0);
 }
 
 vec3 temporal_rgb_to_ycocg(vec3 c) {

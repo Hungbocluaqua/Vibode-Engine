@@ -827,6 +827,7 @@ void PathTracerRenderer::resetAccumulation(AccumulationResetReason reason) {
         temporalSystem_->setCameraCut(reason != AccumulationResetReason::CameraMoved, reason);
     }
     if (reason != AccumulationResetReason::CameraMoved) {
+        denoiserHistoryValid_ = false;
         taaHistoryValid_ = false;
     }
     frameCount_ = 0;
@@ -963,6 +964,8 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
     renderExtent_ = renderExtent;
     displayExtent_ = displayExtent;
     const VkDeviceSize pixelCount = static_cast<VkDeviceSize>(renderExtent.width) * renderExtent.height;
+    denoiserHistoryValid_ = false;
+    taaHistoryValid_ = false;
     rawImage_.create(allocator_, ImageDesc{
         .width = renderExtent.width,
         .height = renderExtent.height,
@@ -983,6 +986,34 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .debugName = "path tracer denoiser history",
+    });
+    diffuseResolvedImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer current diffuse denoiser history",
+    });
+    specularResolvedImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer current specular denoiser history",
+    });
+    diffuseHistoryImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer diffuse denoiser history",
+    });
+    specularHistoryImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer specular denoiser history",
     });
     taaImage_.create(allocator_, ImageDesc{
         .width = displayExtent.width,
@@ -1131,6 +1162,18 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
             TemporalSystem::TemporalResidency::Persistent,
             1.0f);
         temporalSystem_->createHistorySlot(
+            "denoiser_diffuse_history",
+            diffuseHistoryImage_.format(),
+            VkExtent2D{renderExtent.width, renderExtent.height},
+            TemporalSystem::TemporalResidency::Persistent,
+            0.75f);
+        temporalSystem_->createHistorySlot(
+            "denoiser_specular_history",
+            specularHistoryImage_.format(),
+            VkExtent2D{renderExtent.width, renderExtent.height},
+            TemporalSystem::TemporalResidency::Persistent,
+            0.75f);
+        temporalSystem_->createHistorySlot(
             "previous_world_position",
             VK_FORMAT_R32G32_UINT,
             VkExtent2D{renderExtent.width, renderExtent.height},
@@ -1234,7 +1277,7 @@ void PathTracerRenderer::updateCamera() {
         debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalReactiveMask) ||
         debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalHistoryWeight) ||
         (debugParams_.view >= static_cast<uint32_t>(RendererDebugView::PathDirectDiffuse) &&
-         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserHitDistance));
+         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularHistory));
     const bool allowDenoiserForDebugView = denoiserDebugView;
     const bool stablePreview = shouldRunTaa();
     const bool allowDenoiserWhileMoving = settings_.denoiseWhileMoving || stablePreview || !cameraChangedThisFrame_;
@@ -1245,7 +1288,7 @@ void PathTracerRenderer::updateCamera() {
     denoiserParams_.height = renderExtent_.height;
     denoiserParams_.atrousIterations = adaptiveEffectiveAtrousIterations_;
     denoiserParams_.debugView = denoiserDebugView ? debugParams_.view : 0u;
-    denoiserParams_.resetHistory = temporalCameraCut ? 1u : 0u;
+    denoiserParams_.resetHistory = (temporalCameraCut || !denoiserHistoryValid_) ? 1u : 0u;
     frameUniforms.write(&denoiserParams_, sizeof(denoiserParams_), kFrameDenoiserParamsOffset);
     frameUniforms.flush(sizeof(denoiserParams_), kFrameDenoiserParamsOffset);
 
@@ -1605,6 +1648,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId raw = graph.createTexture(imageResource(rawImage_, "raw hdr"));
     const RenderGraphResourceId denoised = graph.createTexture(imageResource(denoisedImage_, "denoised hdr"));
     const RenderGraphResourceId history = graph.createTexture(imageResource(historyImage_, "history hdr"));
+    const RenderGraphResourceId diffuseResolved = graph.createTexture(imageResource(diffuseResolvedImage_, "current diffuse history hdr"));
+    const RenderGraphResourceId specularResolved = graph.createTexture(imageResource(specularResolvedImage_, "current specular history hdr"));
+    const RenderGraphResourceId diffuseHistory = graph.createTexture(imageResource(diffuseHistoryImage_, "diffuse history hdr"));
+    const RenderGraphResourceId specularHistory = graph.createTexture(imageResource(specularHistoryImage_, "specular history hdr"));
     const RenderGraphResourceId taa = graph.createTexture(imageResource(taaImage_, "taa hdr"));
     const RenderGraphResourceId taaHistory = graph.createTexture(imageResource(taaHistoryImage_, "taa history hdr"));
     const RenderGraphResourceId presentation = graph.createTexture(imageResource(presentationImage_, "presentation ldr"));
@@ -1651,16 +1698,24 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         graph.addPass("temporal_denoiser")
             .addStorageReadWrite(raw, PipelineDomain::Compute)
             .addStorageReadWrite(history, PipelineDomain::Compute)
+            .addStorageReadWrite(diffuseHistory, PipelineDomain::Compute)
+            .addStorageReadWrite(specularHistory, PipelineDomain::Compute)
             .addStorageRead(variance, PipelineDomain::Compute)
             .addStorageRead(depthNormal, PipelineDomain::Compute)
             .addStorageRead(worldPosition, PipelineDomain::Compute)
             .addStorageRead(previousWorldPosition, PipelineDomain::Compute)
             .addStorageRead(velocity, PipelineDomain::Compute)
             .addStorageRead(pathData, PipelineDomain::Compute)
-            .addStorageWrite(denoised, PipelineDomain::Compute);
+            .addStorageWrite(denoised, PipelineDomain::Compute)
+            .addStorageWrite(diffuseResolved, PipelineDomain::Compute)
+            .addStorageWrite(specularResolved, PipelineDomain::Compute);
         graph.addPass("history_copy")
             .addStorageRead(denoised, PipelineDomain::Transfer)
             .addStorageWrite(history, PipelineDomain::Transfer)
+            .addStorageRead(diffuseResolved, PipelineDomain::Transfer)
+            .addStorageWrite(diffuseHistory, PipelineDomain::Transfer)
+            .addStorageRead(specularResolved, PipelineDomain::Transfer)
+            .addStorageWrite(specularHistory, PipelineDomain::Transfer)
             .addStorageRead(worldPosition, PipelineDomain::Transfer)
             .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
             .addStorageRead(restirReservoir, PipelineDomain::Transfer)
@@ -1682,6 +1737,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageReadWrite(taaHistory, PipelineDomain::Compute)
             .addStorageRead(velocity, PipelineDomain::Compute)
             .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageRead(pathData, PipelineDomain::Compute)
             .addStorageWrite(taa, PipelineDomain::Compute);
         graph.addPass("taa_history_copy")
             .addStorageRead(taa, PipelineDomain::Transfer)
@@ -1912,6 +1968,10 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
 
     const RenderGraphResourceId raw = graph.createTexture(imageResource(rawImage_, "raw hdr"));
     const RenderGraphResourceId history = graph.createTexture(imageResource(historyImage_, "history hdr"));
+    const RenderGraphResourceId diffuseResolved = graph.createTexture(imageResource(diffuseResolvedImage_, "current diffuse history hdr"));
+    const RenderGraphResourceId specularResolved = graph.createTexture(imageResource(specularResolvedImage_, "current specular history hdr"));
+    const RenderGraphResourceId diffuseHistory = graph.createTexture(imageResource(diffuseHistoryImage_, "diffuse history hdr"));
+    const RenderGraphResourceId specularHistory = graph.createTexture(imageResource(specularHistoryImage_, "specular history hdr"));
     const RenderGraphResourceId denoised = graph.createTexture(imageResource(denoisedImage_, "denoised hdr"));
     const RenderGraphResourceId variance = graph.createBuffer(bufferResource(varianceBuffer_, "variance"));
     const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "depth normal"));
@@ -1930,6 +1990,30 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
         .stage = historyImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COPY_BIT,
         .access = historyImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_TRANSFER_WRITE_BIT,
         .layout = historyImage_.layout(),
+    };
+    graph.resources()[diffuseHistory.index].hasInitialAccess = true;
+    graph.resources()[diffuseHistory.index].initialAccess = ResourceAccess{
+        .stage = diffuseHistoryImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = diffuseHistoryImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+        .layout = diffuseHistoryImage_.layout(),
+    };
+    graph.resources()[specularHistory.index].hasInitialAccess = true;
+    graph.resources()[specularHistory.index].initialAccess = ResourceAccess{
+        .stage = specularHistoryImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = specularHistoryImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+        .layout = specularHistoryImage_.layout(),
+    };
+    graph.resources()[diffuseResolved.index].hasInitialAccess = true;
+    graph.resources()[diffuseResolved.index].initialAccess = ResourceAccess{
+        .stage = diffuseResolvedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .access = diffuseResolvedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_TRANSFER_READ_BIT,
+        .layout = diffuseResolvedImage_.layout(),
+    };
+    graph.resources()[specularResolved.index].hasInitialAccess = true;
+    graph.resources()[specularResolved.index].initialAccess = ResourceAccess{
+        .stage = specularResolvedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .access = specularResolvedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_TRANSFER_READ_BIT,
+        .layout = specularResolvedImage_.layout(),
     };
     graph.resources()[denoised.index].hasInitialAccess = true;
     graph.resources()[denoised.index].initialAccess = ResourceAccess{
@@ -1966,6 +2050,8 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
     graph.addPass("temporal_denoiser")
         .addStorageReadWrite(raw, PipelineDomain::Compute)
         .addStorageReadWrite(history, PipelineDomain::Compute)
+        .addStorageReadWrite(diffuseHistory, PipelineDomain::Compute)
+        .addStorageReadWrite(specularHistory, PipelineDomain::Compute)
         .addStorageRead(variance, PipelineDomain::Compute)
         .addStorageRead(depthNormal, PipelineDomain::Compute)
         .addStorageRead(worldPosition, PipelineDomain::Compute)
@@ -1973,6 +2059,8 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
         .addStorageRead(velocity, PipelineDomain::Compute)
         .addStorageRead(pathData, PipelineDomain::Compute)
         .addStorageWrite(denoised, PipelineDomain::Compute)
+        .addStorageWrite(diffuseResolved, PipelineDomain::Compute)
+        .addStorageWrite(specularResolved, PipelineDomain::Compute)
         .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             recordDenoiserPass(cmd);
         });
@@ -1987,6 +2075,10 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     historyImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    diffuseResolvedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    specularResolvedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    diffuseHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    specularHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(denoiserSetLayout_);
     DescriptorWriter()
@@ -2001,6 +2093,10 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
         .writeBuffer(8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFramePrevCameraUniformOffset, sizeof(PrevCameraUniform)))
         .writeBuffer(9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
         .writeBuffer(10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeImage(11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, diffuseHistoryImage_.storageDescriptor())
+        .writeImage(12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, specularHistoryImage_.storageDescriptor())
+        .writeImage(13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, diffuseResolvedImage_.storageDescriptor())
+        .writeImage(14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, specularResolvedImage_.storageDescriptor())
         .update(context_.device(), set);
 
     denoiserPipeline_->bind(commandBuffer);
@@ -2054,6 +2150,82 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
             .layout = VK_IMAGE_LAYOUT_GENERAL,
         },
         .debugName = "history hdr",
+    });
+    const RenderGraphResourceId diffuseResolved = graph.createTexture(RenderGraphResource{
+        .type = RenderGraphResource::Type::Texture,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .format = diffuseResolvedImage_.format(),
+        .extent = diffuseResolvedImage_.extent(),
+        .image = diffuseResolvedImage_.handle(),
+        .imageRange = diffuseResolvedImage_.fullRange(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .debugName = "current diffuse history hdr",
+    });
+    const RenderGraphResourceId specularResolved = graph.createTexture(RenderGraphResource{
+        .type = RenderGraphResource::Type::Texture,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .format = specularResolvedImage_.format(),
+        .extent = specularResolvedImage_.extent(),
+        .image = specularResolvedImage_.handle(),
+        .imageRange = specularResolvedImage_.fullRange(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .debugName = "current specular history hdr",
+    });
+    const RenderGraphResourceId diffuseHistory = graph.createTexture(RenderGraphResource{
+        .type = RenderGraphResource::Type::Texture,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .format = diffuseHistoryImage_.format(),
+        .extent = diffuseHistoryImage_.extent(),
+        .image = diffuseHistoryImage_.handle(),
+        .imageRange = diffuseHistoryImage_.fullRange(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .hasFinalAccess = true,
+        .finalAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .debugName = "diffuse history hdr",
+    });
+    const RenderGraphResourceId specularHistory = graph.createTexture(RenderGraphResource{
+        .type = RenderGraphResource::Type::Texture,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .format = specularHistoryImage_.format(),
+        .extent = specularHistoryImage_.extent(),
+        .image = specularHistoryImage_.handle(),
+        .imageRange = specularHistoryImage_.fullRange(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .hasFinalAccess = true,
+        .finalAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .debugName = "specular history hdr",
     });
     const RenderGraphResourceId worldPosition = graph.createBuffer(RenderGraphResource{
         .type = RenderGraphResource::Type::Buffer,
@@ -2110,6 +2282,10 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
     graph.addPass("history_copy")
         .addStorageRead(denoised, PipelineDomain::Transfer)
         .addStorageWrite(history, PipelineDomain::Transfer)
+        .addStorageRead(diffuseResolved, PipelineDomain::Transfer)
+        .addStorageWrite(diffuseHistory, PipelineDomain::Transfer)
+        .addStorageRead(specularResolved, PipelineDomain::Transfer)
+        .addStorageWrite(specularHistory, PipelineDomain::Transfer)
         .addStorageRead(worldPosition, PipelineDomain::Transfer)
         .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
         .addStorageRead(restirReservoir, PipelineDomain::Transfer)
@@ -2122,6 +2298,8 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
     graph.execute(commandBuffer, temporalFrameIndex_);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     historyImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    diffuseHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    specularHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
@@ -2129,6 +2307,10 @@ void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer)
     validationLog_.recordPass("history copy");
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     historyImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    diffuseResolvedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    specularResolvedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    diffuseHistoryImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    specularHistoryImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
     VkImageCopy imageCopy{};
     imageCopy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2145,6 +2327,28 @@ void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer)
         1,
         &imageCopy);
 
+    VkImageCopy diffuseCopy = imageCopy;
+    diffuseCopy.extent = diffuseResolvedImage_.extent();
+    vkCmdCopyImage(
+        commandBuffer,
+        diffuseResolvedImage_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        diffuseHistoryImage_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &diffuseCopy);
+
+    VkImageCopy specularCopy = imageCopy;
+    specularCopy.extent = specularResolvedImage_.extent();
+    vkCmdCopyImage(
+        commandBuffer,
+        specularResolvedImage_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        specularHistoryImage_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &specularCopy);
+
     VkBufferCopy copy{};
     copy.size = worldPositionBuffer_.size();
     vkCmdCopyBuffer(commandBuffer, worldPositionBuffer_.handle(), previousWorldPositionBuffer_.handle(), 1, &copy);
@@ -2153,9 +2357,12 @@ void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer)
     vkCmdCopyBuffer(commandBuffer, restirReservoirBuffer_.handle(), previousRestirReservoirBuffer_.handle(), 1, &restirCopy);
     if (temporalSystem_) {
         temporalSystem_->markSlotWritten("denoiser_history");
+        temporalSystem_->markSlotWritten("denoiser_diffuse_history");
+        temporalSystem_->markSlotWritten("denoiser_specular_history");
         temporalSystem_->markSlotWritten("previous_world_position");
         temporalSystem_->markSlotWritten("restir_reservoir");
     }
+    denoiserHistoryValid_ = true;
 }
 
 bool PathTracerRenderer::shouldRunDenoiser() const {
@@ -2173,7 +2380,7 @@ bool PathTracerRenderer::shouldRunDenoiser() const {
         return true;
     }
     if (denoiserParams_.debugView >= static_cast<uint32_t>(RendererDebugView::PathDirectDiffuse) &&
-        denoiserParams_.debugView <= static_cast<uint32_t>(RendererDebugView::DenoiserHitDistance)) {
+        denoiserParams_.debugView <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularHistory)) {
         return true;
     }
     return false;
@@ -2300,11 +2507,25 @@ void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
         },
         .debugName = "depth normal",
     });
+    const RenderGraphResourceId pathData = graph.createBuffer(RenderGraphResource{
+        .type = RenderGraphResource::Type::Buffer,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .size = pathDataBuffer_.size(),
+        .buffer = pathDataBuffer_.handle(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = pathTraceShaderStage(),
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        },
+        .debugName = "path data",
+    });
     graph.addPass("taa_resolve")
         .addStorageRead(input, PipelineDomain::Compute)
         .addStorageReadWrite(history, PipelineDomain::Compute)
         .addStorageRead(velocity, PipelineDomain::Compute)
         .addStorageRead(depthNormal, PipelineDomain::Compute)
+        .addStorageRead(pathData, PipelineDomain::Compute)
         .addStorageWrite(output, PipelineDomain::Compute)
         .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             recordTaaPass(cmd);
@@ -2339,6 +2560,7 @@ void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
         .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
         .writeBuffer(5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
         .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
         .update(context_.device(), set);
 
     taaPipeline_->bind(commandBuffer);
@@ -2745,6 +2967,7 @@ void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
         temporalSystem_->markSlotWritten("previous_world_position");
         temporalSystem_->markSlotWritten("restir_reservoir");
     }
+    denoiserHistoryValid_ = false;
 }
 
 void PathTracerRenderer::recordFullscreen(VkCommandBuffer commandBuffer, VkExtent2D swapchainExtent) {

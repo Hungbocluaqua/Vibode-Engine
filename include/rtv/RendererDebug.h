@@ -70,6 +70,9 @@ enum class RendererDebugView : uint32_t {
     PathDataMetrics = 52,
     DenoiserKernelRadius = 53,
     DenoiserHitDistance = 54,
+    DenoiserVirtualMotion = 55,
+    DenoiserDiffuseHistory = 56,
+    DenoiserSpecularHistory = 57,
 };
 
 enum class RestirMode : uint32_t {

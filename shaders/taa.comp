@@ -11,6 +11,14 @@ layout(set = 0, binding = 2, rgba16f) readonly uniform image2D history_color;
 layout(set = 0, binding = 3, rgba16f) writeonly uniform image2D output_color;
 layout(set = 0, binding = 4, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
 layout(set = 0, binding = 6, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+};
+layout(set = 0, binding = 7, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 
 layout(set = 0, binding = 5, std140) uniform TaaParams {
     uint enabled;
@@ -131,6 +139,10 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
     ivec2 renderCoords = clamp(ivec2(floor(uv * vec2(renderDims))), ivec2(0), renderDims - ivec2(1));
     uint pixel_index = uint(renderCoords.y) * uint(renderDims.x) + uint(renderCoords.x);
     vec4 centerDn = decode_depth_normal(depth_normal_buffer[pixel_index]);
+    PathDataRecord pathData = path_data_buffer[pixel_index];
+    float specularLum = luminance(pathData.direct_specular.rgb + pathData.indirect_specular.rgb);
+    float diffuseLum = luminance(pathData.direct_diffuse.rgb + pathData.indirect_diffuse.rgb);
+    float specularSignal = clamp(specularLum / max(specularLum + diffuseLum, 1.0e-4), 0.0, 1.0);
     vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], params.velocity_scale);
     vec2 displayVelocityPixels = velocity_pixels * (vec2(displayDims) / max(vec2(renderDims), vec2(1.0)));
     vec2 history_pos = temporal_reproject_pixel(coords, displayVelocityPixels);
@@ -161,14 +173,16 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
         float motionConfidence = temporal_motion_confidence(displayVelocityPixels, 18.0, 0.12);
         float motion = 1.0 - motionConfidence;
         float reactive = temporal_reactive_weight(lumDelta, clipDelta, neighborhoodDelta);
+        float specularReactive = smoothstep(0.35, 0.85, specularSignal) * max(motion, reactive);
         sharpenAmount = params.sharpen_strength * (1.0 - clamp(max(motion, reactive), 0.0, 1.0) * 0.65);
 
-        if (reactive >= 0.82 || lumDelta >= 0.85 || clipDelta >= 0.75) {
+        if (reactive >= 0.82 || lumDelta >= 0.85 || clipDelta >= 0.75 || specularReactive >= 0.72) {
             float rejectAlpha = params.camera_moving != 0u ? 0.95 : 0.98;
             output_value = mix(history, current, rejectAlpha);
         } else {
             float motionTarget = params.camera_moving != 0u ? 0.85 : 0.95;
             float alpha = mix(params.feedback, motionTarget, max(motion, reactive));
+            alpha = max(alpha, mix(0.0, 0.22, specularReactive));
             output_value = mix(history, current, clamp(alpha, 0.06, 0.98));
         }
     }

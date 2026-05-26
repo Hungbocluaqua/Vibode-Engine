@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 51>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 51> views = {
+const std::array<RendererDebugView, 54>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 54> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -43,6 +43,9 @@ const std::array<RendererDebugView, 51>& editorDebugViews() {
         RendererDebugView::PathDataMetrics,
         RendererDebugView::DenoiserKernelRadius,
         RendererDebugView::DenoiserHitDistance,
+        RendererDebugView::DenoiserVirtualMotion,
+        RendererDebugView::DenoiserDiffuseHistory,
+        RendererDebugView::DenoiserSpecularHistory,
         RendererDebugView::ClayMaterial,
         RendererDebugView::FirstBounceThroughput,
         RendererDebugView::SecondaryEnvironmentMiss,
@@ -102,6 +105,9 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::PathDataMetrics);
         selectable(RendererDebugView::DenoiserKernelRadius);
         selectable(RendererDebugView::DenoiserHitDistance);
+        selectable(RendererDebugView::DenoiserVirtualMotion);
+        selectable(RendererDebugView::DenoiserDiffuseHistory);
+        selectable(RendererDebugView::DenoiserSpecularHistory);
         selectable(RendererDebugView::Roughness);
         selectable(RendererDebugView::ClayMaterial);
         selectable(RendererDebugView::InstanceId);

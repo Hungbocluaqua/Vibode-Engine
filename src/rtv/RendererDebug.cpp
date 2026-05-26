@@ -84,6 +84,9 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "pathdatametrics" || key == "pathmetrics" || key == "pathhitdistance") { return RendererDebugView::PathDataMetrics; }
     if (key == "denoiserkernelradius" || key == "kernelradius" || key == "filterradius") { return RendererDebugView::DenoiserKernelRadius; }
     if (key == "denoiserhitdistance" || key == "hitdistance" || key == "hitdistancefilter" || key == "hitdistancerejection") { return RendererDebugView::DenoiserHitDistance; }
+    if (key == "denoiservirtualmotion" || key == "virtualmotion" || key == "specularvirtualmotion" || key == "specularvelocity") { return RendererDebugView::DenoiserVirtualMotion; }
+    if (key == "denoiserdiffusehistory" || key == "diffusehistory" || key == "diffusehistoryconfidence") { return RendererDebugView::DenoiserDiffuseHistory; }
+    if (key == "denoiserspecularhistory" || key == "specularhistory" || key == "specularhistoryconfidence") { return RendererDebugView::DenoiserSpecularHistory; }
     if (key == "directsample" || key == "directsampletype" || key == "sampletype") { return RendererDebugView::DirectSampleType; }
     if (key == "albedo" || key == "basecolor" || key == "basecolour") { return RendererDebugView::Albedo; }
     if (key == "clay" || key == "claymaterial" || key == "balancedclay" || key == "balancedclaymaterial" ||
@@ -193,6 +196,9 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::PathDataMetrics: return "path-data-metrics";
     case RendererDebugView::DenoiserKernelRadius: return "denoiser-kernel-radius";
     case RendererDebugView::DenoiserHitDistance: return "denoiser-hit-distance";
+    case RendererDebugView::DenoiserVirtualMotion: return "denoiser-virtual-motion";
+    case RendererDebugView::DenoiserDiffuseHistory: return "denoiser-diffuse-history";
+    case RendererDebugView::DenoiserSpecularHistory: return "denoiser-specular-history";
     }
     return "beauty";
 }

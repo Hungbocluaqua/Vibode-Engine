@@ -294,11 +294,16 @@ private:
     glm::mat4 previousViewProj_{1.0f};
     glm::vec4 previousCameraPos_{};
     glm::vec2 previousJitter_{0.0f};
+    bool denoiserHistoryValid_ = false;
     bool taaHistoryValid_ = false;
 
     Image rawImage_;
     Image denoisedImage_;
     Image historyImage_;
+    Image diffuseResolvedImage_;
+    Image specularResolvedImage_;
+    Image diffuseHistoryImage_;
+    Image specularHistoryImage_;
     Image taaImage_;
     Image taaHistoryImage_;
     Image presentationImage_;
