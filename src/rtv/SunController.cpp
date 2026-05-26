@@ -91,6 +91,8 @@ EntityId SunController::ensurePrimarySun(SceneDocument& document) {
         return existing;
     }
     EntityId sunId = document.registry().createEntity("Sun");
+    document.registry().clearDirty();
+    document.registry().markDirty(SceneUpdateKind::LightOnly);
     if (Entity* sun = document.registry().entity(sunId)) {
         sun->sun = Sun{};
         sun->transform = transformFromWorldAngles(document.registry(), *sun, sun->transform, defaultSunElevation, defaultSunAzimuth);
