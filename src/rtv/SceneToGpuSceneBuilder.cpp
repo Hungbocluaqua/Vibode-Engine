@@ -55,6 +55,13 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.shadowRayBias = render.shadowRayBias;
     result.rendererSettings.shadowDistanceBias = render.shadowDistanceBias;
     result.rendererSettings.fireflyClamp = render.fireflyClamp;
+    result.rendererSettings.restirGiTemporalMaxAge = render.restirGiTemporalMaxAge;
+    result.rendererSettings.restirGiSpatialRounds = render.restirGiSpatialRounds;
+    result.rendererSettings.restirGiSpatialRadius = render.restirGiSpatialRadius;
+    result.rendererSettings.restirGiDepthThresholdScale = render.restirGiDepthThresholdScale;
+    result.rendererSettings.restirGiSpatialCompatibilityThreshold = render.restirGiSpatialCompatibilityThreshold;
+    result.rendererSettings.restirGiHalfResolution = render.restirGiHalfResolution;
+    result.rendererSettings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
     result.rendererSettings.adaptiveQualityMode = render.adaptiveQualityMode;
     result.rendererSettings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
     result.rendererSettings.materialTextureAnisotropy = render.materialTextureAnisotropy;

@@ -147,7 +147,8 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
 }
 
 float restir_gi_temporal_compatibility(RestirGiReservoir current, RestirGiReservoir previous, float motionConfidence) {
-    if (!restir_gi_reservoir_valid(current) || !restir_gi_reservoir_valid(previous) || previous.metadata.y >= 32u) {
+    uint maxTemporalAge = max(camera.restir_gi_controls.x, 1u);
+    if (!restir_gi_reservoir_valid(current) || !restir_gi_reservoir_valid(previous) || previous.metadata.y >= maxTemporalAge) {
         return 0.0;
     }
     if ((previous.metadata.z & RESTIR_GI_FLAG_VISIBLE) == 0u || current.metadata.w != previous.metadata.w) {
@@ -170,7 +171,7 @@ float restir_gi_temporal_compatibility(RestirGiReservoir current, RestirGiReserv
     float currentTarget = max(current.hit_position_target_pdf.w, 1.0e-5);
     float previousTarget = max(previous.hit_position_target_pdf.w, 1.0e-5);
     float targetConfidence = sqrt(min(currentTarget, previousTarget) / max(currentTarget, previousTarget));
-    float ageConfidence = 1.0 - clamp(float(previous.metadata.y) / 32.0, 0.0, 1.0);
+    float ageConfidence = 1.0 - clamp(float(previous.metadata.y) / float(maxTemporalAge), 0.0, 1.0);
 
     return clamp(motionConfidence, 0.0, 1.0) *
         receiverConfidence *
@@ -189,16 +190,16 @@ RestirGiReservoir restir_gi_temporal_merge(RestirGiReservoir current, RestirGiRe
 
     float currentMass = max(current.hit_position_target_pdf.w, 0.0);
     float previousMass = max(previous.hit_position_target_pdf.w, 0.0) *
-        min(float(previous.metadata.x), 32.0) *
+        min(float(previous.metadata.x), max(float(camera.restir_gi_controls.x), 1.0)) *
         compatibility;
     float previousWeight = previousMass / max(currentMass + previousMass, 1.0e-6);
     previousWeight = clamp(previousWeight, 0.0, mix(0.85, 0.20, 1.0 - clamp(motionConfidence, 0.0, 1.0)));
 
     current.radiance_weight_sum.rgb = mix(current.radiance_weight_sum.rgb, previous.radiance_weight_sum.rgb, previousWeight);
-    current.radiance_weight_sum.w = min(1.0 + previous.radiance_weight_sum.w * previousWeight, 32.0);
+    current.radiance_weight_sum.w = min(1.0 + previous.radiance_weight_sum.w * previousWeight, max(float(camera.restir_gi_controls.x), 1.0));
     current.hit_position_target_pdf.w = max(luminance(current.radiance_weight_sum.rgb), 1.0e-4);
     current.metadata.x = uint(clamp(ceil(current.radiance_weight_sum.w), 1.0, 32.0));
-    current.metadata.y = min(previous.metadata.y + 1u, 255u);
+    current.metadata.y = min(previous.metadata.y + 1u, min(camera.restir_gi_controls.x, 255u));
     current.metadata.z = RESTIR_GI_FLAG_VALID |
         (((current.metadata.z & RESTIR_GI_FLAG_VISIBLE) != 0u && (previous.metadata.z & RESTIR_GI_FLAG_VISIBLE) != 0u)
             ? RESTIR_GI_FLAG_VISIBLE

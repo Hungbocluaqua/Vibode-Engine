@@ -96,6 +96,13 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["white_point"] = s.whitePoint;
     j["auto_exposure_enabled"] = s.autoExposureEnabled;
     j["debug_view"] = rendererDebugViewName(s.debugView);
+    j["restir_gi_temporal_max_age"] = s.restirGiTemporalMaxAge;
+    j["restir_gi_spatial_rounds"] = s.restirGiSpatialRounds;
+    j["restir_gi_spatial_radius"] = s.restirGiSpatialRadius;
+    j["restir_gi_depth_threshold_scale"] = s.restirGiDepthThresholdScale;
+    j["restir_gi_spatial_compatibility_threshold"] = s.restirGiSpatialCompatibilityThreshold;
+    j["restir_gi_half_resolution"] = s.restirGiHalfResolution;
+    j["restir_gi_visibility_ray_budget"] = s.restirGiVisibilityRayBudget;
     j["adaptive_quality_mode"] = s.adaptiveQualityMode == AdaptiveQualityMode::Off ? "off"
         : s.adaptiveQualityMode == AdaptiveQualityMode::Conservative ? "conservative"
         : s.adaptiveQualityMode == AdaptiveQualityMode::Balanced ? "balanced" : "aggressive";

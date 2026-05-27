@@ -69,6 +69,13 @@ struct RendererSettings {
     float fireflyClamp = 48.0f;
     float maxFrameDeltaSeconds = 1.0f / 30.0f;
     float russianRouletteMinSurvival = 0.10f;
+    uint32_t restirGiTemporalMaxAge = 24;
+    uint32_t restirGiSpatialRounds = 4;
+    float restirGiSpatialRadius = 4.25f;
+    float restirGiDepthThresholdScale = 1.0f;
+    float restirGiSpatialCompatibilityThreshold = 0.05f;
+    bool restirGiHalfResolution = false;
+    uint32_t restirGiVisibilityRayBudget = 0;
     AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Off;
     float adaptiveGpuFrameTargetMs = 16.6f;
 

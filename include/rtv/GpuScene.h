@@ -48,6 +48,7 @@ struct alignas(16) CameraUniform {
     glm::vec4 renderControls{}; // x = shadow ray bias, y = shadow distance bias, z = firefly clamp, w = RR min survival
     glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
     glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
+    glm::uvec4 restirGiControls{24u, 0u, 0u, 0u}; // x = temporal max age, y = half-resolution reuse, z = visibility ray budget
 };
 
 static_assert(offsetof(CameraUniform, jitter) == 128, "CameraUniform::jitter must match std140 layout");
@@ -55,7 +56,8 @@ static_assert(offsetof(CameraUniform, atmosphere) == 144, "CameraUniform::atmosp
 static_assert(offsetof(CameraUniform, renderControls) == 160, "CameraUniform::renderControls must match std140 layout");
 static_assert(offsetof(CameraUniform, sunDirectionIlluminance) == 176, "CameraUniform::sunDirectionIlluminance must match std140 layout");
 static_assert(offsetof(CameraUniform, sunColorAngularRadius) == 192, "CameraUniform::sunColorAngularRadius must match std140 layout");
-static_assert(sizeof(CameraUniform) == 208, "CameraUniform size must match std140 layout");
+static_assert(offsetof(CameraUniform, restirGiControls) == 208, "CameraUniform::restirGiControls must match std140 layout");
+static_assert(sizeof(CameraUniform) == 224, "CameraUniform size must match std140 layout");
 
 struct MeshParamsUniform {
     uint32_t vertexCount = 0;

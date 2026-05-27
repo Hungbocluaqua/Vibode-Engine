@@ -410,6 +410,13 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"shadowRayBias", renderSettings_.shadowRayBias},
         {"shadowDistanceBias", renderSettings_.shadowDistanceBias},
         {"fireflyClamp", renderSettings_.fireflyClamp},
+        {"restirGiTemporalMaxAge", renderSettings_.restirGiTemporalMaxAge},
+        {"restirGiSpatialRounds", renderSettings_.restirGiSpatialRounds},
+        {"restirGiSpatialRadius", renderSettings_.restirGiSpatialRadius},
+        {"restirGiDepthThresholdScale", renderSettings_.restirGiDepthThresholdScale},
+        {"restirGiSpatialCompatibilityThreshold", renderSettings_.restirGiSpatialCompatibilityThreshold},
+        {"restirGiHalfResolution", renderSettings_.restirGiHalfResolution},
+        {"restirGiVisibilityRayBudget", renderSettings_.restirGiVisibilityRayBudget},
         {"adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)},
         {"adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs},
         {"usePhysicalCamera", renderSettings_.usePhysicalCamera},
@@ -573,6 +580,13 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.shadowRayBias = render.value("shadowRayBias", renderSettings_.shadowRayBias);
         renderSettings_.shadowDistanceBias = render.value("shadowDistanceBias", renderSettings_.shadowDistanceBias);
         renderSettings_.fireflyClamp = render.value("fireflyClamp", renderSettings_.fireflyClamp);
+        renderSettings_.restirGiTemporalMaxAge = render.value("restirGiTemporalMaxAge", renderSettings_.restirGiTemporalMaxAge);
+        renderSettings_.restirGiSpatialRounds = render.value("restirGiSpatialRounds", renderSettings_.restirGiSpatialRounds);
+        renderSettings_.restirGiSpatialRadius = render.value("restirGiSpatialRadius", renderSettings_.restirGiSpatialRadius);
+        renderSettings_.restirGiDepthThresholdScale = render.value("restirGiDepthThresholdScale", renderSettings_.restirGiDepthThresholdScale);
+        renderSettings_.restirGiSpatialCompatibilityThreshold = render.value("restirGiSpatialCompatibilityThreshold", renderSettings_.restirGiSpatialCompatibilityThreshold);
+        renderSettings_.restirGiHalfResolution = render.value("restirGiHalfResolution", renderSettings_.restirGiHalfResolution);
+        renderSettings_.restirGiVisibilityRayBudget = render.value("restirGiVisibilityRayBudget", renderSettings_.restirGiVisibilityRayBudget);
         renderSettings_.adaptiveQualityMode = static_cast<AdaptiveQualityMode>(render.value("adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)));
         renderSettings_.adaptiveGpuFrameTargetMs = render.value("adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs);
         renderSettings_.usePhysicalCamera = render.value("usePhysicalCamera", renderSettings_.usePhysicalCamera);

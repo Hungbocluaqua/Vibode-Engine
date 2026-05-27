@@ -148,6 +148,13 @@ struct RenderSettings {
     float shadowRayBias = 0.001f;
     float shadowDistanceBias = 0.002f;
     float fireflyClamp = 48.0f;
+    uint32_t restirGiTemporalMaxAge = 24;
+    uint32_t restirGiSpatialRounds = 4;
+    float restirGiSpatialRadius = 4.25f;
+    float restirGiDepthThresholdScale = 1.0f;
+    float restirGiSpatialCompatibilityThreshold = 0.05f;
+    bool restirGiHalfResolution = false;
+    uint32_t restirGiVisibilityRayBudget = 0;
     AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Off;
     float adaptiveGpuFrameTargetMs = 16.6f;
 

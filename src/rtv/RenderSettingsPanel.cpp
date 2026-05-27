@@ -70,6 +70,13 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.shadowRayBias = render.shadowRayBias;
         settings.shadowDistanceBias = render.shadowDistanceBias;
         settings.fireflyClamp = render.fireflyClamp;
+        settings.restirGiTemporalMaxAge = render.restirGiTemporalMaxAge;
+        settings.restirGiSpatialRounds = render.restirGiSpatialRounds;
+        settings.restirGiSpatialRadius = render.restirGiSpatialRadius;
+        settings.restirGiDepthThresholdScale = render.restirGiDepthThresholdScale;
+        settings.restirGiSpatialCompatibilityThreshold = render.restirGiSpatialCompatibilityThreshold;
+        settings.restirGiHalfResolution = render.restirGiHalfResolution;
+        settings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
         settings.adaptiveQualityMode = render.adaptiveQualityMode;
         settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
         settings.usePhysicalCamera = render.usePhysicalCamera;
@@ -89,6 +96,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     uint32_t maxEnvSamples = 8;
     uint32_t minAtrous = 1;
     uint32_t maxAtrous = 5;
+    uint32_t minRestirGiAge = 1;
+    uint32_t maxRestirGiAge = 64;
+    uint32_t minRestirGiRounds = 1;
+    uint32_t maxRestirGiRounds = 8;
+    uint32_t minRestirGiVisibilityRays = 0;
+    uint32_t maxRestirGiVisibilityRays = 4;
 
     ImGui::SeparatorText("Rendering");
     editorDebugViewCombo("Debug View", settings, changed);
@@ -112,6 +125,45 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed = true;
     }
     tooltip("Hybrid ReSTIR direct-light mode. Classic NEE remains the reference baseline.");
+    if (ImGui::CollapsingHeader("ReSTIR GI Tuning")) {
+        const char* presetItems[] = {"Custom", "Reference", "Balanced", "Performance"};
+        int preset = 0;
+        if (ImGui::Combo("GI Preset", &preset, presetItems, 4) && preset != 0) {
+            if (preset == 1) {
+                settings.restirGiTemporalMaxAge = 32;
+                settings.restirGiSpatialRounds = 6;
+                settings.restirGiSpatialRadius = 4.25f;
+                settings.restirGiDepthThresholdScale = 0.85f;
+                settings.restirGiSpatialCompatibilityThreshold = 0.10f;
+                settings.restirGiHalfResolution = false;
+            } else if (preset == 2) {
+                settings.restirGiTemporalMaxAge = 24;
+                settings.restirGiSpatialRounds = 4;
+                settings.restirGiSpatialRadius = 4.25f;
+                settings.restirGiDepthThresholdScale = 1.0f;
+                settings.restirGiSpatialCompatibilityThreshold = 0.05f;
+                settings.restirGiHalfResolution = false;
+            } else {
+                settings.restirGiTemporalMaxAge = 16;
+                settings.restirGiSpatialRounds = 2;
+                settings.restirGiSpatialRadius = 3.0f;
+                settings.restirGiDepthThresholdScale = 1.15f;
+                settings.restirGiSpatialCompatibilityThreshold = 0.0f;
+                settings.restirGiHalfResolution = true;
+            }
+            changed = true;
+        }
+        tooltip("Applies debug-only ReSTIR GI reservoir reuse presets. Custom values remain editable below.");
+        changed |= ImGui::Checkbox("GI Half Resolution Reuse", &settings.restirGiHalfResolution);
+        tooltip("Uses one spatial GI reservoir per 2x2 pixel group for the GI debug/final path.");
+        changed |= ImGui::SliderScalar("GI Temporal Max Age", ImGuiDataType_U32, &settings.restirGiTemporalMaxAge, &minRestirGiAge, &maxRestirGiAge);
+        changed |= ImGui::SliderScalar("GI Spatial Rounds", ImGuiDataType_U32, &settings.restirGiSpatialRounds, &minRestirGiRounds, &maxRestirGiRounds);
+        changed |= ImGui::SliderFloat("GI Spatial Radius", &settings.restirGiSpatialRadius, 1.0f, 8.0f, "%.2f");
+        changed |= ImGui::SliderFloat("GI Depth Threshold Scale", &settings.restirGiDepthThresholdScale, 0.5f, 2.0f, "%.2f");
+        changed |= ImGui::SliderFloat("GI Compatibility Cutoff", &settings.restirGiSpatialCompatibilityThreshold, 0.0f, 0.85f, "%.2f");
+        changed |= ImGui::SliderScalar("GI Visibility Rays", ImGuiDataType_U32, &settings.restirGiVisibilityRayBudget, &minRestirGiVisibilityRays, &maxRestirGiVisibilityRays);
+        tooltip("Reserved budget for the future ray-query visibility validation pass; current GI spatial reuse remains conservative.");
+    }
     const char* tsrPresetItems[] = {"Native", "Quality", "Balanced", "Performance"};
     int tsrPreset = settings.renderResolutionScale >= 0.99f ? 0 :
         (settings.renderResolutionScale >= 0.74f ? 1 : (settings.renderResolutionScale >= 0.59f ? 2 : 3));
@@ -301,6 +353,13 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.shadowRayBias = settings.shadowRayBias;
             render.shadowDistanceBias = settings.shadowDistanceBias;
             render.fireflyClamp = settings.fireflyClamp;
+            render.restirGiTemporalMaxAge = settings.restirGiTemporalMaxAge;
+            render.restirGiSpatialRounds = settings.restirGiSpatialRounds;
+            render.restirGiSpatialRadius = settings.restirGiSpatialRadius;
+            render.restirGiDepthThresholdScale = settings.restirGiDepthThresholdScale;
+            render.restirGiSpatialCompatibilityThreshold = settings.restirGiSpatialCompatibilityThreshold;
+            render.restirGiHalfResolution = settings.restirGiHalfResolution;
+            render.restirGiVisibilityRayBudget = settings.restirGiVisibilityRayBudget;
             render.adaptiveQualityMode = settings.adaptiveQualityMode;
             render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
             render.usePhysicalCamera = settings.usePhysicalCamera;

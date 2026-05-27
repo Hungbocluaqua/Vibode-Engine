@@ -32,6 +32,7 @@ layout(set = 0, binding = 1, std140) uniform Camera {
     vec4 render_controls;
     vec4 sun_direction_illuminance;
     vec4 sun_color_angular_radius;
+    uvec4 restir_gi_controls;
 } camera;
 
 layout(set = 0, binding = 2, std430) buffer VarianceBuffer { uint variance_buffer[]; };
@@ -1168,6 +1169,44 @@ float diffuse_pdf(vec3 normal, vec3 wi) {
     return max(dot(normal, wi), 0.0) / PI;
 }
 
+bool use_lambert_diffuse(Material material) {
+    return material.roughness <= 0.08 || camera.path_tracing_enabled == 0u;
+}
+
+float oren_nayar_diffuse_factor(Material material, vec3 wo, vec3 wi, vec3 n) {
+    if (use_lambert_diffuse(material)) {
+        return 1.0;
+    }
+
+    float n_dot_v = max(dot(n, wo), 0.0);
+    float n_dot_l = max(dot(n, wi), 0.0);
+    if (n_dot_v <= 0.0 || n_dot_l <= 0.0) {
+        return 0.0;
+    }
+
+    float sigma = clamp(material.roughness, 0.0, 1.0) * 1.2217304764; // 70 degrees in radians.
+    float sigma2 = sigma * sigma;
+    float a = 1.0 - 0.5 * sigma2 / (sigma2 + 0.33);
+    float b = 0.45 * sigma2 / (sigma2 + 0.09);
+
+    vec3 viewTangent = wo - n * n_dot_v;
+    vec3 lightTangent = wi - n * n_dot_l;
+    float viewLen2 = dot(viewTangent, viewTangent);
+    float lightLen2 = dot(lightTangent, lightTangent);
+    float cosPhiDiff = viewLen2 > 1.0e-8 && lightLen2 > 1.0e-8
+        ? dot(viewTangent, lightTangent) * inversesqrt(viewLen2 * lightLen2)
+        : 0.0;
+    float sinAlpha = sqrt(max(1.0 - max(n_dot_v, n_dot_l) * max(n_dot_v, n_dot_l), 0.0));
+    float tanBeta = sqrt(max(1.0 - min(n_dot_v, n_dot_l) * min(n_dot_v, n_dot_l), 0.0)) /
+        max(min(n_dot_v, n_dot_l), 1.0e-4);
+
+    return clamp(a + b * max(0.0, cosPhiDiff) * sinAlpha * tanBeta, 0.0, 1.0);
+}
+
+vec3 eval_diffuse_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+    return material.color * (1.0 / PI) * oren_nayar_diffuse_factor(material, wo, wi, n);
+}
+
 float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
@@ -1318,7 +1357,7 @@ vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     vec3 specular = f * d * g / max(4.0 * n_dot_v * n_dot_l, 1e-10);
     vec3 msCompensation = heitz_ms_ggx(f0, material.roughness, n_dot_v, n_dot_l);
     specular += msCompensation;
-    vec3 diffuse = pbr_diffuse_energy(material) * material.color * (1.0 / PI);
+    vec3 diffuse = pbr_diffuse_energy(material) * eval_diffuse_brdf(material, wo, wi, n);
     return diffuse + specular;
 }
 
@@ -1381,7 +1420,7 @@ vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     float NdotL = max(dot(n, wi), 0.0);
 
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_DIFFUSE)) {
-        result += c.weight * c.color * (1.0 / PI);
+        result += c.weight * eval_diffuse_brdf(material, wo, wi, n);
     }
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SSS)) {
         float sssRadius = max(c.ior, 0.01);

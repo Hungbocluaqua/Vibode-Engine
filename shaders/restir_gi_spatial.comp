@@ -15,6 +15,14 @@ layout(set = 0, binding = 3, std140) uniform RestirGiSpatialParams {
     uint height;
     uint frame_count;
     uint enabled;
+    uint gi_spatial_rounds;
+    uint gi_half_resolution;
+    uint gi_temporal_max_age;
+    uint gi_visibility_ray_budget;
+    float gi_spatial_radius;
+    float gi_depth_threshold_scale;
+    float gi_spatial_compatibility_threshold;
+    float _padding0;
 } params;
 
 vec2 unpack_unorm2x16(uint packedValue) {
@@ -52,7 +60,7 @@ ivec2 blue_noise_offset(ivec2 coords, uint roundIndex) {
     vec2 sampleValue = sample_dimension_2d(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 16u);
     uint h = sample_dimension_seed(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 18u);
     float angle = sampleValue.x * 6.28318530718;
-    float radius = 0.75 + sampleValue.y * 4.25;
+    float radius = 0.75 + sampleValue.y * max(params.gi_spatial_radius, 1.0);
     ivec2 offset = ivec2(int(round(cos(angle) * radius)), int(round(sin(angle) * radius)));
     offset.x += (h & 1u) == 0u ? 0 : 1;
     offset.y += ((h >> 1u) & 1u) == 0u ? 0 : 1;
@@ -62,7 +70,7 @@ ivec2 blue_noise_offset(ivec2 coords, uint roundIndex) {
 float receiver_surface_compatibility(SurfaceReuseData center, SurfaceReuseData candidate) {
     float roughness = max(center.roughness, candidate.roughness);
     float relativeDepth = abs(candidate.depth - center.depth) / max(abs(center.depth), 1.0e-3);
-    float depthThreshold = mix(0.012, 0.045, roughness);
+    float depthThreshold = mix(0.012, 0.045, roughness) * clamp(params.gi_depth_threshold_scale, 0.5, 2.0);
     float normalThreshold = mix(0.97, 0.86, roughness);
     float normalAgreement = dot(center.normal, candidate.normal);
     if (relativeDepth > depthThreshold || normalAgreement < normalThreshold) {
@@ -137,15 +145,26 @@ void main() {
     }
 
     uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
-    RestirGiReservoir merged = input_reservoirs[pixelIndex];
+    ivec2 reservoirCoords = params.gi_half_resolution != 0u
+        ? clamp(ivec2((coords.x / 2) * 2, (coords.y / 2) * 2), ivec2(0), ivec2(int(params.width) - 1, int(params.height) - 1))
+        : coords;
+    uint reservoirIndex = uint(reservoirCoords.y) * params.width + uint(reservoirCoords.x);
+    RestirGiReservoir merged = input_reservoirs[reservoirIndex];
     if (params.enabled == 0u || !restir_gi_reservoir_valid(merged)) {
         output_reservoirs[pixelIndex] = merged;
         return;
     }
 
-    SurfaceReuseData centerSurface = decode_surface_reuse_data(depth_normal_buffer[pixelIndex]);
-    for (uint roundIndex = 0u; roundIndex < 4u; ++roundIndex) {
-        ivec2 sampleCoords = coords + blue_noise_offset(coords, roundIndex);
+    if (params.gi_half_resolution != 0u && any(notEqual(coords, reservoirCoords))) {
+        output_reservoirs[pixelIndex] = merged;
+        return;
+    }
+
+    SurfaceReuseData centerSurface = decode_surface_reuse_data(depth_normal_buffer[reservoirIndex]);
+    uint roundCount = clamp(params.gi_spatial_rounds, 1u, 8u);
+    float compatibilityThreshold = clamp(params.gi_spatial_compatibility_threshold, 0.0, 0.85);
+    for (uint roundIndex = 0u; roundIndex < roundCount; ++roundIndex) {
+        ivec2 sampleCoords = reservoirCoords + blue_noise_offset(reservoirCoords, roundIndex);
         if (sampleCoords.x < 0 || sampleCoords.y < 0 || sampleCoords.x >= int(params.width) || sampleCoords.y >= int(params.height)) {
             continue;
         }
@@ -154,7 +173,7 @@ void main() {
         RestirGiReservoir candidate = input_reservoirs[sampleIndex];
         SurfaceReuseData candidateSurface = decode_surface_reuse_data(depth_normal_buffer[sampleIndex]);
         float compatibility = gi_reservoir_compatibility(merged, candidate, centerSurface, candidateSurface);
-        if (compatibility > 0.0) {
+        if (compatibility > compatibilityThreshold) {
             merged = merge_gi_candidate(merged, candidate, compatibility);
         }
     }

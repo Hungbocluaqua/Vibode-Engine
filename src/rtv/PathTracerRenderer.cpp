@@ -637,6 +637,21 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::isfinite(next.russianRouletteMinSurvival) ? next.russianRouletteMinSurvival : 0.10f,
         0.02f,
         0.50f);
+    next.restirGiTemporalMaxAge = std::clamp(next.restirGiTemporalMaxAge, 1u, 64u);
+    next.restirGiSpatialRounds = std::clamp(next.restirGiSpatialRounds, 1u, 8u);
+    next.restirGiSpatialRadius = std::clamp(
+        std::isfinite(next.restirGiSpatialRadius) ? next.restirGiSpatialRadius : 4.25f,
+        1.0f,
+        8.0f);
+    next.restirGiDepthThresholdScale = std::clamp(
+        std::isfinite(next.restirGiDepthThresholdScale) ? next.restirGiDepthThresholdScale : 1.0f,
+        0.5f,
+        2.0f);
+    next.restirGiSpatialCompatibilityThreshold = std::clamp(
+        std::isfinite(next.restirGiSpatialCompatibilityThreshold) ? next.restirGiSpatialCompatibilityThreshold : 0.05f,
+        0.0f,
+        0.85f);
+    next.restirGiVisibilityRayBudget = std::clamp(next.restirGiVisibilityRayBudget, 0u, 4u);
     if (static_cast<uint32_t>(next.adaptiveQualityMode) > static_cast<uint32_t>(AdaptiveQualityMode::Aggressive)) {
         next.adaptiveQualityMode = AdaptiveQualityMode::Off;
     }
@@ -711,6 +726,13 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f ||
         std::abs(next.maxFrameDeltaSeconds - settings_.maxFrameDeltaSeconds) > 0.000001f ||
         std::abs(next.russianRouletteMinSurvival - settings_.russianRouletteMinSurvival) > 0.0001f ||
+        next.restirGiTemporalMaxAge != settings_.restirGiTemporalMaxAge ||
+        next.restirGiSpatialRounds != settings_.restirGiSpatialRounds ||
+        std::abs(next.restirGiSpatialRadius - settings_.restirGiSpatialRadius) > 0.0001f ||
+        std::abs(next.restirGiDepthThresholdScale - settings_.restirGiDepthThresholdScale) > 0.0001f ||
+        std::abs(next.restirGiSpatialCompatibilityThreshold - settings_.restirGiSpatialCompatibilityThreshold) > 0.0001f ||
+        next.restirGiHalfResolution != settings_.restirGiHalfResolution ||
+        next.restirGiVisibilityRayBudget != settings_.restirGiVisibilityRayBudget ||
         next.adaptiveQualityMode != settings_.adaptiveQualityMode ||
         std::abs(next.adaptiveGpuFrameTargetMs - settings_.adaptiveGpuFrameTargetMs) > 0.0001f;
     if (!changed) {
@@ -762,7 +784,14 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.shadowDistanceBias - settings_.shadowDistanceBias) > 0.000001f ||
         std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f ||
         std::abs(next.adaptiveGpuFrameTargetMs - settings_.adaptiveGpuFrameTargetMs) > 0.0001f ||
-        std::abs(next.russianRouletteMinSurvival - settings_.russianRouletteMinSurvival) > 0.0001f;
+        std::abs(next.russianRouletteMinSurvival - settings_.russianRouletteMinSurvival) > 0.0001f ||
+        next.restirGiTemporalMaxAge != settings_.restirGiTemporalMaxAge ||
+        next.restirGiSpatialRounds != settings_.restirGiSpatialRounds ||
+        std::abs(next.restirGiSpatialRadius - settings_.restirGiSpatialRadius) > 0.0001f ||
+        std::abs(next.restirGiDepthThresholdScale - settings_.restirGiDepthThresholdScale) > 0.0001f ||
+        std::abs(next.restirGiSpatialCompatibilityThreshold - settings_.restirGiSpatialCompatibilityThreshold) > 0.0001f ||
+        next.restirGiHalfResolution != settings_.restirGiHalfResolution ||
+        next.restirGiVisibilityRayBudget != settings_.restirGiVisibilityRayBudget;
     const bool renderResolutionChanged =
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f;
     const bool materialTextureFilteringChanged =
@@ -1272,6 +1301,11 @@ void PathTracerRenderer::updateCamera() {
         settings_.sunDirection,
         settings_.usePhysicalCamera ? settings_.sunIlluminanceLux : settings_.sunIntensity);
     camera_.sunColorAngularRadius = glm::vec4(settings_.sunColor, settings_.sunAngularRadius);
+    camera_.restirGiControls = glm::uvec4(
+        settings_.restirGiTemporalMaxAge,
+        settings_.restirGiHalfResolution ? 1u : 0u,
+        settings_.restirGiVisibilityRayBudget,
+        0u);
     const bool temporalCameraCut = temporalSystem_ ? temporalSystem_->isCameraCut() : temporalFrameIndex_ <= 1u;
     const bool temporalHistoryAvailable = !temporalCameraCut;
     camera_.atmosphere = glm::vec4(
@@ -1372,7 +1406,14 @@ void PathTracerRenderer::updateCamera() {
     restirSpatialParams_.width = renderExtent_.width;
     restirSpatialParams_.height = renderExtent_.height;
     restirSpatialParams_.frameCount = temporalFrameIndex_;
-    restirSpatialParams_.enabled = shouldRunRestirSpatial() ? 1u : 0u;
+    restirSpatialParams_.enabled = (shouldRunRestirSpatial() || shouldUseRestirGiReservoirs()) ? 1u : 0u;
+    restirSpatialParams_.giSpatialRounds = settings_.restirGiSpatialRounds;
+    restirSpatialParams_.giHalfResolution = settings_.restirGiHalfResolution ? 1u : 0u;
+    restirSpatialParams_.giTemporalMaxAge = settings_.restirGiTemporalMaxAge;
+    restirSpatialParams_.giVisibilityRayBudget = settings_.restirGiVisibilityRayBudget;
+    restirSpatialParams_.giSpatialRadius = settings_.restirGiSpatialRadius;
+    restirSpatialParams_.giDepthThresholdScale = settings_.restirGiDepthThresholdScale;
+    restirSpatialParams_.giSpatialCompatibilityThreshold = settings_.restirGiSpatialCompatibilityThreshold;
     frameUniforms.write(&restirSpatialParams_, sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
     frameUniforms.flush(sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
 

@@ -209,6 +209,14 @@ private:
         uint32_t height = 0;
         uint32_t frameCount = 0;
         uint32_t enabled = 0;
+        uint32_t giSpatialRounds = 4;
+        uint32_t giHalfResolution = 0;
+        uint32_t giTemporalMaxAge = 32;
+        uint32_t giVisibilityRayBudget = 0;
+        float giSpatialRadius = 4.25f;
+        float giDepthThresholdScale = 1.0f;
+        float giSpatialCompatibilityThreshold = 0.0f;
+        float padding0 = 0.0f;
     };
 
     struct FogParams {

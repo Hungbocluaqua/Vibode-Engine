@@ -144,6 +144,13 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.shadowRayBias = settings.shadowRayBias;
     render.shadowDistanceBias = settings.shadowDistanceBias;
     render.fireflyClamp = settings.fireflyClamp;
+    render.restirGiTemporalMaxAge = settings.restirGiTemporalMaxAge;
+    render.restirGiSpatialRounds = settings.restirGiSpatialRounds;
+    render.restirGiSpatialRadius = settings.restirGiSpatialRadius;
+    render.restirGiDepthThresholdScale = settings.restirGiDepthThresholdScale;
+    render.restirGiSpatialCompatibilityThreshold = settings.restirGiSpatialCompatibilityThreshold;
+    render.restirGiHalfResolution = settings.restirGiHalfResolution;
+    render.restirGiVisibilityRayBudget = settings.restirGiVisibilityRayBudget;
     render.adaptiveQualityMode = settings.adaptiveQualityMode;
     render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
     render.usePhysicalCamera = settings.usePhysicalCamera;
@@ -200,6 +207,13 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.shadowRayBias = render.shadowRayBias;
     settings.shadowDistanceBias = render.shadowDistanceBias;
     settings.fireflyClamp = render.fireflyClamp;
+    settings.restirGiTemporalMaxAge = render.restirGiTemporalMaxAge;
+    settings.restirGiSpatialRounds = render.restirGiSpatialRounds;
+    settings.restirGiSpatialRadius = render.restirGiSpatialRadius;
+    settings.restirGiDepthThresholdScale = render.restirGiDepthThresholdScale;
+    settings.restirGiSpatialCompatibilityThreshold = render.restirGiSpatialCompatibilityThreshold;
+    settings.restirGiHalfResolution = render.restirGiHalfResolution;
+    settings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
     settings.adaptiveQualityMode = render.adaptiveQualityMode;
     settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
     settings.usePhysicalCamera = render.usePhysicalCamera;
