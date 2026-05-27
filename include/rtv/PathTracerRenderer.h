@@ -254,6 +254,7 @@ private:
     void recordRestirSpatial(VkCommandBuffer commandBuffer);
     void recordRestirSpatialPass(VkCommandBuffer commandBuffer);
     void recordRestirSpatialCopyPass(VkCommandBuffer commandBuffer);
+    void recordRestirGiSpatialPass(VkCommandBuffer commandBuffer);
     void recordHeightFog(VkCommandBuffer commandBuffer);
     void recordHeightFogPass(VkCommandBuffer commandBuffer);
     void recordDenoiser(VkCommandBuffer commandBuffer);
@@ -319,6 +320,7 @@ private:
     glm::vec2 previousJitter_{0.0f};
     bool denoiserHistoryValid_ = false;
     bool taaHistoryValid_ = false;
+    bool restirGiHistoryValid_ = false;
 
     Image rawImage_;
     Image denoisedImage_;
@@ -359,6 +361,7 @@ private:
     std::unique_ptr<ShaderModule> denoiserShader_;
     std::unique_ptr<ShaderModule> taaShader_;
     std::unique_ptr<ShaderModule> restirSpatialShader_;
+    std::unique_ptr<ShaderModule> restirGiSpatialShader_;
     std::unique_ptr<ShaderModule> fogShader_;
     std::unique_ptr<ShaderModule> transmittanceShader_;
     std::unique_ptr<ShaderModule> multiScatterShader_;
@@ -381,6 +384,7 @@ private:
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
     std::unique_ptr<ComputePipeline> taaPipeline_;
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
+    std::unique_ptr<ComputePipeline> restirGiSpatialPipeline_;
     std::unique_ptr<ComputePipeline> fogPipeline_;
     std::unique_ptr<ComputePipeline> selectionOutlinePipeline_;
     std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
@@ -396,6 +400,7 @@ private:
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout restirGiSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout fogSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout selectionOutlineSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout luminanceHistogramSetLayout_ = VK_NULL_HANDLE;

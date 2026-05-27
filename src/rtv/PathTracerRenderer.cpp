@@ -179,6 +179,7 @@ PathTracerRenderer::PathTracerRenderer(
     const auto denoiserSpv = compiler.compileIfNeeded(shaderDirectory / "denoiser.comp", shaderOutputDirectory);
     const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
     const auto restirSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_spatial.comp", shaderOutputDirectory);
+    const auto restirGiSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_spatial.comp", shaderOutputDirectory);
     const auto fogSpv = compiler.compileIfNeeded(shaderDirectory / "fog_integrate.comp", shaderOutputDirectory);
     const auto transmittanceSpv = compiler.compileIfNeeded(shaderDirectory / "transmittance_lut.comp", shaderOutputDirectory);
     const auto multiScatterSpv = compiler.compileIfNeeded(shaderDirectory / "multi_scatter_lut.comp", shaderOutputDirectory);
@@ -196,6 +197,7 @@ PathTracerRenderer::PathTracerRenderer(
     denoiserShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(denoiserSpv), "temporal denoiser compute");
     taaShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(taaSpv), "taa compute");
     restirSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirSpatialSpv), "restir spatial compute");
+    restirGiSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiSpatialSpv), "restir gi spatial compute");
     fogShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(fogSpv), "height fog integrate compute");
     transmittanceShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(transmittanceSpv), "atmosphere transmittance lut compute");
     multiScatterShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(multiScatterSpv), "atmosphere multi scatter lut compute");
@@ -226,6 +228,7 @@ PathTracerRenderer::PathTracerRenderer(
         shaderDirectory / "denoiser.comp",
         shaderDirectory / "taa.comp",
         shaderDirectory / "restir_spatial.comp",
+        shaderDirectory / "restir_gi_spatial.comp",
         shaderDirectory / "fog_integrate.comp",
         shaderDirectory / "transmittance_lut.comp",
         shaderDirectory / "multi_scatter_lut.comp",
@@ -268,6 +271,7 @@ PathTracerRenderer::PathTracerRenderer(
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
     restirSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirSpatialShader_->reflection()}, 0));
+    restirGiSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiSpatialShader_->reflection()}, 0));
     fogSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({fogShader_->reflection()}, 0));
     selectionOutlineSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({selectionOutlineShader_->reflection()}, 0));
     luminanceHistogramSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({luminanceHistogramShader_->reflection()}, 0));
@@ -311,6 +315,12 @@ PathTracerRenderer::PathTracerRenderer(
         *restirSpatialShader_,
         std::vector<VkDescriptorSetLayout>{restirSpatialSetLayout_},
         ShaderReflection::mergePushConstants({restirSpatialShader_->reflection()}),
+        *pipelineCache_);
+    restirGiSpatialPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiSpatialShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiSpatialSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiSpatialShader_->reflection()}),
         *pipelineCache_);
     fogPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -833,6 +843,7 @@ void PathTracerRenderer::resetAccumulation(AccumulationResetReason reason) {
     if (reason != AccumulationResetReason::CameraMoved) {
         denoiserHistoryValid_ = false;
         taaHistoryValid_ = false;
+        restirGiHistoryValid_ = false;
     }
     frameCount_ = 0;
     if (reason != AccumulationResetReason::CameraMoved) {
@@ -1478,15 +1489,20 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     }
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
     if (useRestirGiReservoirs) {
-        graph.addPass("restir_gi_clear")
-            .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer)
-            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
-            .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer)
-            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+        RenderGraphPass& restirGiClearPass = graph.addPass("restir_gi_clear")
+            .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer);
+        if (!restirGiHistoryValid_) {
+            restirGiClearPass
+                .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+                .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer);
+        }
+        restirGiClearPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                 validationLog_.recordPass("restir gi reservoir clear");
                 vkCmdFillBuffer(cmd, restirGiReservoirBuffer_.handle(), 0, restirGiReservoirBuffer_.size(), 0u);
-                vkCmdFillBuffer(cmd, previousRestirGiReservoirBuffer_.handle(), 0, previousRestirGiReservoirBuffer_.size(), 0u);
-                vkCmdFillBuffer(cmd, restirGiSpatialReservoirBuffer_.handle(), 0, restirGiSpatialReservoirBuffer_.size(), 0u);
+                if (!restirGiHistoryValid_) {
+                    vkCmdFillBuffer(cmd, previousRestirGiReservoirBuffer_.handle(), 0, previousRestirGiReservoirBuffer_.size(), 0u);
+                    vkCmdFillBuffer(cmd, restirGiSpatialReservoirBuffer_.handle(), 0, restirGiSpatialReservoirBuffer_.size(), 0u);
+                }
             });
     }
     RenderGraphPass& pathTracePass = graph.addPass("path_trace_rt")
@@ -1509,6 +1525,15 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     pathTracePass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
         recordPathTracePass(cmd);
     });
+    if (useRestirGiReservoirs) {
+        graph.addPass("restir_gi_spatial")
+            .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Compute)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirGiSpatialPass(cmd);
+            });
+    }
     graph.compile();
     graph.execute(commandBuffer, temporalFrameIndex_);
 }
@@ -1592,6 +1617,26 @@ void PathTracerRenderer::recordRestirSpatialCopyPass(VkCommandBuffer commandBuff
     VkBufferCopy copy{};
     copy.size = restirReservoirBuffer_.size();
     vkCmdCopyBuffer(commandBuffer, restirSpatialReservoirBuffer_.handle(), restirReservoirBuffer_.handle(), 1, &copy);
+}
+
+void PathTracerRenderer::recordRestirGiSpatialPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("restir gi spatial reuse");
+    if (restirGiSpatialPipeline_ == nullptr || restirGiSpatialSetLayout_ == VK_NULL_HANDLE) {
+        return;
+    }
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(restirGiSpatialSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialReservoirBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)))
+        .update(context_.device(), set);
+
+    restirGiSpatialPipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirGiSpatialPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    restirGiSpatialPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
 }
 
 void PathTracerRenderer::recordHeightFog(VkCommandBuffer commandBuffer) {
@@ -1734,10 +1779,13 @@ void PathTracerRenderer::recordRenderGraphPlan() {
 
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
     if (useRestirGiReservoirs) {
-        graph.addPass("restir_gi_clear")
-            .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer)
-            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
-            .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer);
+        RenderGraphPass& restirGiClearPass = graph.addPass("restir_gi_clear")
+            .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer);
+        if (!restirGiHistoryValid_) {
+            restirGiClearPass
+                .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+                .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer);
+        }
     }
     RenderGraphPass& pathTracePass = graph.addPass("path_trace_rt")
         .addStorageWrite(raw, traceDomain)
@@ -1755,6 +1803,12 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageReadWrite(restirGiReservoir, traceDomain)
             .addStorageRead(previousRestirGiReservoir, traceDomain)
             .addStorageRead(restirGiSpatialReservoir, traceDomain);
+    }
+    if (useRestirGiReservoirs) {
+        graph.addPass("restir_gi_spatial")
+            .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Compute);
     }
 
     if (shouldRunRestirSpatial()) {
@@ -1786,7 +1840,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageWrite(denoised, PipelineDomain::Compute)
             .addStorageWrite(diffuseResolved, PipelineDomain::Compute)
             .addStorageWrite(specularResolved, PipelineDomain::Compute);
-        graph.addPass("history_copy")
+        RenderGraphPass& historyCopyPass = graph.addPass("history_copy")
             .addStorageRead(denoised, PipelineDomain::Transfer)
             .addStorageWrite(history, PipelineDomain::Transfer)
             .addStorageRead(diffuseResolved, PipelineDomain::Transfer)
@@ -1797,15 +1851,25 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
             .addStorageRead(restirReservoir, PipelineDomain::Transfer)
             .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
+        if (useRestirGiReservoirs) {
+            historyCopyPass
+                .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
+                .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+        }
         toneInput = denoised;
     } else {
-        graph.addPass("skip_denoiser_copy")
+        RenderGraphPass& skipDenoiserCopyPass = graph.addPass("skip_denoiser_copy")
             .addStorageRead(raw, PipelineDomain::Transfer)
             .addStorageWrite(denoised, PipelineDomain::Transfer)
             .addStorageRead(worldPosition, PipelineDomain::Transfer)
             .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
             .addStorageRead(restirReservoir, PipelineDomain::Transfer)
             .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
+        if (useRestirGiReservoirs) {
+            skipDenoiserCopyPass
+                .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
+                .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+        }
     }
 
     if (shouldRunTaa()) {
@@ -2367,7 +2431,38 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
         },
         .debugName = "previous restir reservoir",
     });
-    graph.addPass("history_copy")
+    const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
+    RenderGraphResourceId restirGiSpatialReservoir{};
+    RenderGraphResourceId previousRestirGiReservoir{};
+    if (useRestirGiReservoirs) {
+        restirGiSpatialReservoir = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiSpatialReservoirBuffer_.size(),
+            .buffer = restirGiSpatialReservoirBuffer_.handle(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = ResourceAccess{
+                .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            },
+            .debugName = "restir gi spatial reservoir",
+        });
+        previousRestirGiReservoir = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = previousRestirGiReservoirBuffer_.size(),
+            .buffer = previousRestirGiReservoirBuffer_.handle(),
+            .external = true,
+            .hasFinalAccess = true,
+            .finalAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            },
+            .debugName = "previous restir gi reservoir",
+        });
+    }
+    RenderGraphPass& historyCopyPass = graph.addPass("history_copy")
         .addStorageRead(denoised, PipelineDomain::Transfer)
         .addStorageWrite(history, PipelineDomain::Transfer)
         .addStorageRead(diffuseResolved, PipelineDomain::Transfer)
@@ -2377,8 +2472,13 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
         .addStorageRead(worldPosition, PipelineDomain::Transfer)
         .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
         .addStorageRead(restirReservoir, PipelineDomain::Transfer)
-        .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer)
-        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+        .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
+    if (useRestirGiReservoirs) {
+        historyCopyPass
+            .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+    }
+    historyCopyPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             copyHistoryResourcesPass(cmd);
         });
     graph.compile();
@@ -2443,6 +2543,12 @@ void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer)
     VkBufferCopy restirCopy{};
     restirCopy.size = restirReservoirBuffer_.size();
     vkCmdCopyBuffer(commandBuffer, restirReservoirBuffer_.handle(), previousRestirReservoirBuffer_.handle(), 1, &restirCopy);
+    if (shouldUseRestirGiReservoirs()) {
+        VkBufferCopy restirGiCopy{};
+        restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
+        vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        restirGiHistoryValid_ = true;
+    }
     if (temporalSystem_) {
         temporalSystem_->markSlotWritten("denoiser_history");
         temporalSystem_->markSlotWritten("denoiser_diffuse_history");
@@ -3012,14 +3118,50 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
         },
         .debugName = "previous restir reservoir",
     });
-    graph.addPass("skip_denoiser_copy")
+    const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
+    RenderGraphResourceId restirGiSpatialReservoir{};
+    RenderGraphResourceId previousRestirGiReservoir{};
+    if (useRestirGiReservoirs) {
+        restirGiSpatialReservoir = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiSpatialReservoirBuffer_.size(),
+            .buffer = restirGiSpatialReservoirBuffer_.handle(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = ResourceAccess{
+                .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            },
+            .debugName = "restir gi spatial reservoir",
+        });
+        previousRestirGiReservoir = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = previousRestirGiReservoirBuffer_.size(),
+            .buffer = previousRestirGiReservoirBuffer_.handle(),
+            .external = true,
+            .hasFinalAccess = true,
+            .finalAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            },
+            .debugName = "previous restir gi reservoir",
+        });
+    }
+    RenderGraphPass& skipDenoiserCopyGraphPass = graph.addPass("skip_denoiser_copy")
         .addStorageRead(raw, PipelineDomain::Transfer)
         .addStorageWrite(denoised, PipelineDomain::Transfer)
         .addStorageRead(worldPosition, PipelineDomain::Transfer)
         .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
         .addStorageRead(restirReservoir, PipelineDomain::Transfer)
-        .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer)
-        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+        .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
+    if (useRestirGiReservoirs) {
+        skipDenoiserCopyGraphPass
+            .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+    }
+    skipDenoiserCopyGraphPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             skipDenoiserCopyPass(cmd);
         });
     graph.compile();
@@ -3056,6 +3198,12 @@ void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
     VkBufferCopy restirCopy{};
     restirCopy.size = restirReservoirBuffer_.size();
     vkCmdCopyBuffer(commandBuffer, restirReservoirBuffer_.handle(), previousRestirReservoirBuffer_.handle(), 1, &restirCopy);
+    if (shouldUseRestirGiReservoirs()) {
+        VkBufferCopy restirGiCopy{};
+        restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
+        vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        restirGiHistoryValid_ = true;
+    }
     if (temporalSystem_) {
         temporalSystem_->markSlotWritten("previous_world_position");
         temporalSystem_->markSlotWritten("restir_reservoir");
