@@ -543,8 +543,8 @@ vec3 estimate_direct_lighting(
         if (candidateCos <= 0.0 || candidateLightPdf <= 1.0e-6) {
             continue;
         }
-        vec3 candidateBsdf = eval_brdf(material, wo, candidateWi, lightingNormal);
-        float candidateBsdfPdf = pdf_brdf(material, wo, candidateWi, lightingNormal);
+        vec3 candidateBsdf = eval_brdf(material, wo, candidateWi, lightingNormal, hit.tangent, hit.bitangent);
+        float candidateBsdfPdf = pdf_brdf(material, wo, candidateWi, lightingNormal, hit.tangent, hit.bitangent);
         vec3 candidateEstimate = candidateBsdf * candidateEmission * candidateCos / max(candidateLightPdf, 1.0e-6);
         float candidateProxy = max(dot(candidateEstimate, vec3(0.2126, 0.7152, 0.0722)), 0.0);
         proxyWeightSum += candidateProxy;
@@ -588,8 +588,8 @@ vec3 estimate_direct_lighting(
         }
         float cosSurface = max(dot(lightingNormal, envDir), 0.0);
         if (cosSurface > 0.0 && !trace_shadow(shadow_origin(hit, envDir), envDir, 10000.0)) {
-            vec3 bsdf = eval_brdf(material, wo, envDir, lightingNormal);
-            float bsdfPdf = pdf_brdf(material, wo, envDir, lightingNormal);
+            vec3 bsdf = eval_brdf(material, wo, envDir, lightingNormal, hit.tangent, hit.bitangent);
+            float bsdfPdf = pdf_brdf(material, wo, envDir, lightingNormal, hit.tangent, hit.bitangent);
             float weight = power_heuristic(envPdf, bsdfPdf);
             if (sampledLightPdf <= 0.0) {
                 sampledLightPdf = envPdf;
@@ -612,8 +612,8 @@ vec3 estimate_direct_lighting(
         if (sample_sun_light(rng, sunWi, sunRadiance, sunPdf)) {
             float ndl = max(dot(lightingNormal, sunWi), 0.0);
             if (ndl > 0.0 && !trace_shadow(shadow_origin(hit, sunWi), sunWi, 10000.0)) {
-                vec3 bsdf = eval_brdf(material, wo, sunWi, lightingNormal);
-                float bsdfPdf = pdf_brdf(material, wo, sunWi, lightingNormal);
+                vec3 bsdf = eval_brdf(material, wo, sunWi, lightingNormal, hit.tangent, hit.bitangent);
+                float bsdfPdf = pdf_brdf(material, wo, sunWi, lightingNormal, hit.tangent, hit.bitangent);
                 float weight = power_heuristic(sunPdf, bsdfPdf);
                 if (sampledLightPdf <= 0.0) {
                     sampledLightPdf = sunPdf;
@@ -952,13 +952,13 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         } else {
             float bsdfPdf;
             uint bsdfRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_BSDF);
-            vec3 wi = sample_brdf(bsdfRng, material, wo, hit.normal, bsdfPdf);
+            vec3 wi = sample_brdf(bsdfRng, material, wo, hit.normal, hit.tangent, hit.bitangent, bsdfPdf);
             rng ^= bsdfRng;
             float cosTheta = max(dot(hit.normal, wi), 0.0);
             if (bsdfPdf < 1e-6 || cosTheta <= 0.0) {
                 break;
             }
-            vec3 bsdf = eval_brdf(material, wo, wi, hit.normal);
+            vec3 bsdf = eval_brdf(material, wo, wi, hit.normal, hit.tangent, hit.bitangent);
             ray.origin = hit.world_pos + hit.normal * shadow_self_hit_epsilon();
             ray.direction = normalize(wi);
             previousWasBrdfSample = true;

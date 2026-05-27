@@ -50,7 +50,7 @@ constexpr uint32_t sceneLightTypeDirectional = 0u;
 constexpr uint64_t fastImportedBvhTriangleThreshold = 1'000'000ull;
 constexpr uint32_t materialFlagManualBaseColorSrgb = 1u << 0u;
 constexpr uint32_t materialFlagManualEmissiveSrgb = 1u << 1u;
-constexpr uint32_t materialVec4Stride = 5u;
+constexpr uint32_t materialVec4Stride = 8u;
 
 static_assert(sizeof(GpuMeshRecord) == 64);
 static_assert(sizeof(GpuPrimitiveRecord) == 32);
@@ -140,6 +140,53 @@ uint32_t cachedMaterialTextureFlag(const CachedScene& cached, int32_t textureInd
     return cached.textures[static_cast<size_t>(textureIndex)].srgb ? 0u : flag;
 }
 
+glm::vec3 nonnegativeRgb(const glm::vec3& value) {
+    return glm::vec3{
+        std::max(value.x, 0.0f),
+        std::max(value.y, 0.0f),
+        std::max(value.z, 0.0f),
+    };
+}
+
+glm::vec3 approximateConductorKFromF0(const glm::vec3& f0) {
+    const glm::vec3 clamped{
+        std::clamp(f0.x, 0.02f, 0.98f),
+        std::clamp(f0.y, 0.02f, 0.98f),
+        std::clamp(f0.z, 0.02f, 0.98f),
+    };
+    return 2.0f * glm::sqrt(clamped / (glm::vec3{1.0f} - clamped));
+}
+
+void appendConductorOptics(std::vector<glm::vec4>& materialData, const MaterialAsset* material) {
+    const bool enabled = material != nullptr && material->useConductorOptics != 0u;
+    glm::vec3 eta = enabled ? nonnegativeRgb(material->conductorEta) : glm::vec3{0.0f};
+    glm::vec3 k = enabled ? nonnegativeRgb(material->conductorK) : glm::vec3{0.0f};
+    if (enabled && eta.x + eta.y + eta.z + k.x + k.y + k.z <= 1.0e-4f) {
+        eta = glm::vec3{1.0f};
+        k = approximateConductorKFromF0(glm::vec3{material->baseColorFactor});
+    }
+    materialData.push_back({eta, enabled ? 1.0f : 0.0f});
+    materialData.push_back({k, 0.0f});
+    materialData.push_back({
+        material != nullptr ? material->anisotropyStrength : 0.0f,
+        material != nullptr ? material->anisotropyRotation : 0.0f,
+        0.0f,
+        0.0f});
+}
+
+void appendConductorOptics(std::vector<glm::vec4>& materialData, const CachedMaterialData& material) {
+    const bool enabled = material.useConductorOptics != 0u;
+    glm::vec3 eta = enabled ? nonnegativeRgb(material.conductorEta) : glm::vec3{0.0f};
+    glm::vec3 k = enabled ? nonnegativeRgb(material.conductorK) : glm::vec3{0.0f};
+    if (enabled && eta.x + eta.y + eta.z + k.x + k.y + k.z <= 1.0e-4f) {
+        eta = glm::vec3{1.0f};
+        k = approximateConductorKFromF0(glm::vec3{material.baseColorFactor});
+    }
+    materialData.push_back({eta, enabled ? 1.0f : 0.0f});
+    materialData.push_back({k, 0.0f});
+    materialData.push_back({material.anisotropyStrength, material.anisotropyRotation, 0.0f, 0.0f});
+}
+
 std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
     std::vector<glm::vec4> materialData;
     materialData.reserve(std::max<size_t>(1, cached.materials.size()) * materialVec4Stride);
@@ -149,7 +196,7 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
             cachedMaterialTextureFlag(cached, material.emissiveTextureIndex, materialFlagManualEmissiveSrgb);
         const float type = 3.0f;
         materialData.push_back({glm::vec3(material.baseColorFactor), material.roughnessFactor});
-        materialData.push_back({1.5f, type, material.metallicFactor, static_cast<float>(flags)});
+        materialData.push_back({material.iorFactor, type, material.metallicFactor, static_cast<float>(flags)});
         materialData.push_back({material.emissiveFactor, material.baseColorFactor.a});
         materialData.push_back({
             material.baseColorTextureIndex >= 0 ? static_cast<float>(material.baseColorTextureIndex) : -1.0f,
@@ -161,6 +208,7 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
             static_cast<float>(material.alphaMode),
             static_cast<float>(material.doubleSided),
             0.0f});
+        appendConductorOptics(materialData, material);
     }
     if (materialData.empty()) {
         materialData.push_back({0.8f, 0.8f, 0.8f, 1.0f});
@@ -168,6 +216,7 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
         materialData.push_back({0.0f, 0.0f, 0.0f, 1.0f});
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 0.0f, 0.0f});
+        appendConductorOptics(materialData, nullptr);
     }
     return materialData;
 }
@@ -426,6 +475,14 @@ std::vector<TextureColorUsage> classifyTextureUsage(const SceneAsset& scene, con
         if (slot < usage.size()) {
             usage[slot].baseColor = true;
         }
+        slot = slotFor(material->specularColorTexture);
+        if (slot < usage.size()) {
+            usage[slot].baseColor = true;
+        }
+        slot = slotFor(material->sheenColorTexture);
+        if (slot < usage.size()) {
+            usage[slot].baseColor = true;
+        }
         slot = slotFor(material->emissiveTexture);
         if (slot < usage.size()) {
             usage[slot].emissive = true;
@@ -434,7 +491,35 @@ std::vector<TextureColorUsage> classifyTextureUsage(const SceneAsset& scene, con
         if (slot < usage.size()) {
             usage[slot].metallicRoughness = true;
         }
+        slot = slotFor(material->clearcoatTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->clearcoatRoughnessTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->transmissionTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->specularTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->sheenRoughnessTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->anisotropyTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
         slot = slotFor(material->normalTexture);
+        if (slot < usage.size()) {
+            usage[slot].normal = true;
+        }
+        slot = slotFor(material->clearcoatNormalTexture);
         if (slot < usage.size()) {
             usage[slot].normal = true;
         }
@@ -1225,7 +1310,7 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         }
 
         materialData.push_back({glm::vec3(base), roughness});
-        materialData.push_back({1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
+        materialData.push_back({material != nullptr ? material->iorFactor : 1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
         materialData.push_back({emissive, base.a});
         materialData.push_back({
             material != nullptr ? textureSlotFor(material->baseColorTexture) : -1.0f,
@@ -1237,6 +1322,7 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
             material != nullptr ? static_cast<float>(material->alphaMode) : 0.0f,
             material != nullptr ? static_cast<float>(material->doubleSided) : 0.0f,
             0.0f});
+        appendConductorOptics(materialData, material);
     }
 
     const VkDeviceSize byteSize = sizeof(glm::vec4) * materialData.size();
@@ -1560,6 +1646,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         materialData.push_back({m.emissive, 1.0f});
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 1.0f, 0.0f});
+        appendConductorOptics(materialData, nullptr);
         materialEmissive.push_back(m.emissive);
     }
 
@@ -1685,7 +1772,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             }
         }
         materialData.push_back({glm::vec3(base), roughness});
-        materialData.push_back({1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
+        materialData.push_back({material != nullptr ? material->iorFactor : 1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
         materialData.push_back({emissive, base.a});
         materialData.push_back({baseColorTexture, normalTexture, metallicRoughnessTexture, emissiveTexture});
         materialData.push_back({
@@ -1693,6 +1780,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             material != nullptr ? static_cast<float>(material->alphaMode) : 0.0f,
             material != nullptr ? static_cast<float>(material->doubleSided) : 0.0f,
             0.0f});
+        appendConductorOptics(materialData, material);
         materialEmissive.push_back(emissive);
         materialOpaqueTraversalSafe.push_back(material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u);
     }
@@ -1702,6 +1790,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         materialData.push_back({0.0f, 0.0f, 0.0f, 1.0f});
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 0.0f, 0.0f});
+        appendConductorOptics(materialData, nullptr);
         materialEmissive.push_back(glm::vec3(0.0f));
         materialOpaqueTraversalSafe.push_back(false);
     }
@@ -2053,13 +2142,48 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMat.emissiveFactor = material->emissiveFactor;
             cachedMat.metallicFactor = material->metallicFactor;
             cachedMat.roughnessFactor = material->roughnessFactor;
+            cachedMat.iorFactor = material->iorFactor;
             cachedMat.alphaCutoff = material->alphaCutoff;
             cachedMat.alphaMode = material->alphaMode;
             cachedMat.doubleSided = material->doubleSided;
+            cachedMat.hasIor = material->hasIor;
+            cachedMat.hasClearcoat = material->hasClearcoat;
+            cachedMat.clearcoatFactor = material->clearcoatFactor;
+            cachedMat.clearcoatRoughnessFactor = material->clearcoatRoughnessFactor;
+            cachedMat.hasTransmission = material->hasTransmission;
+            cachedMat.transmissionFactor = material->transmissionFactor;
+            cachedMat.hasSpecular = material->hasSpecular;
+            cachedMat.specularFactor = material->specularFactor;
+            cachedMat.specularColorFactor = material->specularColorFactor;
+            cachedMat.hasSheen = material->hasSheen;
+            cachedMat.sheenColorFactor = material->sheenColorFactor;
+            cachedMat.sheenRoughnessFactor = material->sheenRoughnessFactor;
+            cachedMat.hasEmissiveStrength = material->hasEmissiveStrength;
+            cachedMat.emissiveStrength = material->emissiveStrength;
+            cachedMat.hasAnisotropy = material->hasAnisotropy;
+            cachedMat.anisotropyStrength = material->anisotropyStrength;
+            cachedMat.anisotropyRotation = material->anisotropyRotation;
+            cachedMat.useConductorOptics = material->useConductorOptics;
+            cachedMat.conductorEta = material->conductorEta;
+            cachedMat.conductorK = material->conductorK;
             cachedMat.baseColorTextureIndex = getTextureIndex(material->baseColorTexture);
             cachedMat.normalTextureIndex = getTextureIndex(material->normalTexture);
             cachedMat.metallicRoughnessTextureIndex = getTextureIndex(material->metallicRoughnessTexture);
             cachedMat.emissiveTextureIndex = getTextureIndex(material->emissiveTexture);
+            cachedMat.clearcoatTextureIndex = getTextureIndex(material->clearcoatTexture);
+            cachedMat.clearcoatRoughnessTextureIndex = getTextureIndex(material->clearcoatRoughnessTexture);
+            cachedMat.clearcoatNormalTextureIndex = getTextureIndex(material->clearcoatNormalTexture);
+            cachedMat.transmissionTextureIndex = getTextureIndex(material->transmissionTexture);
+            cachedMat.specularTextureIndex = getTextureIndex(material->specularTexture);
+            cachedMat.specularColorTextureIndex = getTextureIndex(material->specularColorTexture);
+            cachedMat.sheenColorTextureIndex = getTextureIndex(material->sheenColorTexture);
+            cachedMat.sheenRoughnessTextureIndex = getTextureIndex(material->sheenRoughnessTexture);
+            cachedMat.anisotropyTextureIndex = getTextureIndex(material->anisotropyTexture);
+            cachedMat.baseColorTextureTransform = material->baseColorTextureTransform;
+            cachedMat.metallicRoughnessTextureTransform = material->metallicRoughnessTextureTransform;
+            cachedMat.normalTextureTransform = material->normalTextureTransform;
+            cachedMat.emissiveTextureTransform = material->emissiveTextureTransform;
+            cachedMat.shaderCompatibilityMask = material->shaderCompatibilityMask;
             gpuCached.materials.push_back(std::move(cachedMat));
         }
 

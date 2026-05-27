@@ -218,6 +218,11 @@ struct Material {
     float alpha_cutoff;
     uint alpha_mode;
     uint double_sided;
+    vec3 conductor_eta;
+    uint use_conductor_optics;
+    vec3 conductor_k;
+    float anisotropy_strength;
+    float anisotropy_rotation;
 };
 
 const uint MATERIAL_CLOSURE_FLAG_DIFFUSE       = 1u << 0u;
@@ -286,7 +291,7 @@ struct RayPayload {
 
 const float PI = 3.14159265358979323846;
 const uint TRI_STRIDE = 12u;
-const uint MATERIAL_STRIDE = 5u;
+const uint MATERIAL_STRIDE = 8u;
 const int MATERIAL_TEXTURE_LIMIT = 1024;
 const uint MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB = 1u << 0u;
 const uint MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB = 1u << 1u;
@@ -582,6 +587,9 @@ Material decode_material(uint mat_idx) {
     vec4 d2 = mesh_materials[idx + 2u];
     vec4 d3 = mesh_materials[idx + 3u];
     vec4 d4 = mesh_materials[idx + 4u];
+    vec4 d5 = mesh_materials[idx + 5u];
+    vec4 d6 = mesh_materials[idx + 6u];
+    vec4 d7 = mesh_materials[idx + 7u];
     Material m;
     m.color = d0.xyz;
     m.roughness = d0.w;
@@ -598,6 +606,11 @@ Material decode_material(uint mat_idx) {
     m.alpha_cutoff = d4.x;
     m.alpha_mode = uint(round(d4.y));
     m.double_sided = uint(round(d4.z));
+    m.conductor_eta = d5.xyz;
+    m.use_conductor_optics = uint(round(d5.w));
+    m.conductor_k = d6.xyz;
+    m.anisotropy_strength = d7.x;
+    m.anisotropy_rotation = d7.y;
     return m;
 }
 
@@ -1212,7 +1225,35 @@ float luminance(vec3 color) {
 }
 
 vec3 pbr_f0(Material material) {
+    if (material.use_conductor_optics != 0u) {
+        vec3 eta = max(material.conductor_eta, vec3(0.0));
+        vec3 k = max(material.conductor_k, vec3(0.0));
+        vec3 etaMinusOne = eta - vec3(1.0);
+        vec3 etaPlusOne = eta + vec3(1.0);
+        vec3 k2 = k * k;
+        return clamp((etaMinusOne * etaMinusOne + k2) / max(etaPlusOne * etaPlusOne + k2, vec3(1.0e-6)), vec3(0.0), vec3(1.0));
+    }
     return mix(vec3(0.04), material.color, clamp(material.metallic, 0.0, 1.0));
+}
+
+vec3 conductor_fresnel(Material material, float v_dot_h) {
+    float cosTheta = clamp(v_dot_h, 0.0, 1.0);
+    vec3 eta = max(material.conductor_eta, vec3(0.0));
+    vec3 k = max(material.conductor_k, vec3(0.0));
+    vec3 eta2 = eta * eta;
+    vec3 k2 = k * k;
+    float cos2 = cosTheta * cosTheta;
+    float sin2 = max(1.0 - cos2, 0.0);
+    vec3 t0 = eta2 - k2 - vec3(sin2);
+    vec3 a2plusb2 = sqrt(max(t0 * t0 + 4.0 * eta2 * k2, vec3(0.0)));
+    vec3 t1 = a2plusb2 + vec3(cos2);
+    vec3 a = sqrt(max((a2plusb2 + t0) * 0.5, vec3(0.0)));
+    vec3 t2 = 2.0 * cosTheta * a;
+    vec3 rs = (t1 - t2) / max(t1 + t2, vec3(1.0e-6));
+    vec3 t3 = cos2 * a2plusb2 + vec3(sin2 * sin2);
+    vec3 t4 = t2 * sin2;
+    vec3 rp = rs * (t3 - t4) / max(t3 + t4, vec3(1.0e-6));
+    return clamp((rp + rs) * 0.5, vec3(0.0), vec3(1.0));
 }
 
 vec3 pbr_average_fresnel(vec3 f0) {
@@ -1226,9 +1267,10 @@ vec3 pbr_diffuse_energy(Material material) {
 }
 
 float pbr_specular_sample_probability(Material material, float NdotV) {
-    float metallic = clamp(material.metallic, 0.0, 1.0);
-    vec3 f0 = mix(vec3(0.04), material.color, metallic);
-    vec3 fresnel = f0 + (vec3(1.0) - f0) * pow(1.0 - max(NdotV, 0.0), 5.0);
+    vec3 f0 = pbr_f0(material);
+    vec3 fresnel = material.use_conductor_optics != 0u
+        ? conductor_fresnel(material, NdotV)
+        : f0 + (vec3(1.0) - f0) * pow(1.0 - max(NdotV, 0.0), 5.0);
     float specularWeight = max(luminance(fresnel), 0.0);
     float diffuseWeight = max(luminance(pbr_diffuse_energy(material) * material.color * (1.0 / PI)), 0.0);
     return clamp(specularWeight / max(specularWeight + diffuseWeight, 1e-6), 0.05, 0.95);
@@ -1273,6 +1315,12 @@ vec3 schlick_fresnel(vec3 f0, float v_dot_h) {
     return f0 + (vec3(1.0) - f0) * f;
 }
 
+bool material_uses_anisotropy(Material material);
+void material_anisotropic_frame(Material material, vec3 n, inout vec3 tangent, inout vec3 bitangent);
+void material_anisotropic_alpha(Material material, out float alphaX, out float alphaY);
+float ggx_anisotropic_ndf(float alphaX, float alphaY, vec3 h, vec3 n, vec3 tangent, vec3 bitangent);
+float smith_g1_anisotropic(float alphaX, float alphaY, vec3 v, vec3 n, vec3 tangent, vec3 bitangent);
+
 float smith_g1(float roughness, float n_dot_x) {
     float r = ggx_safe_roughness(roughness);
     float a = r * r;
@@ -1290,12 +1338,23 @@ float smith_ggx_lambda(float roughness, float n_dot_x) {
     return 0.5 * (sqrt(1.0 + a2 * tan2Theta) - 1.0);
 }
 
-float ggx_visible_normal_pdf(Material material, vec3 wo, vec3 h, vec3 n) {
+float ggx_visible_normal_pdf(Material material, vec3 wo, vec3 h, vec3 n, vec3 tangent, vec3 bitangent) {
     float n_dot_v = max(dot(n, wo), 0.0);
     float n_dot_h = max(dot(n, h), 0.0);
     float v_dot_h = max(dot(wo, h), 0.0);
     if (n_dot_v < 1e-6 || n_dot_h < 1e-6 || v_dot_h < 1e-6) {
         return 0.0;
+    }
+    if (material_uses_anisotropy(material)) {
+        vec3 t = tangent;
+        vec3 b = bitangent;
+        material_anisotropic_frame(material, n, t, b);
+        float alphaX;
+        float alphaY;
+        material_anisotropic_alpha(material, alphaX, alphaY);
+        return ggx_anisotropic_ndf(alphaX, alphaY, h, n, t, b) *
+            smith_g1_anisotropic(alphaX, alphaY, wo, n, t, b) /
+            max(4.0 * n_dot_v, 1e-10);
     }
     return ggx_ndf(material.roughness, n_dot_h) * smith_g1(material.roughness, n_dot_v) / max(4.0 * n_dot_v, 1e-10);
 }
@@ -1307,6 +1366,69 @@ float smith_g(float roughness, float n_dot_v, float n_dot_l) {
     float lambdaV = smith_ggx_lambda(roughness, n_dot_v);
     float lambdaL = smith_ggx_lambda(roughness, n_dot_l);
     return 1.0 / max(1.0 + lambdaV + lambdaL, 1e-8);
+}
+
+bool material_uses_anisotropy(Material material) {
+    return abs(material.anisotropy_strength) > 1.0e-4;
+}
+
+void material_anisotropic_frame(Material material, vec3 n, inout vec3 tangent, inout vec3 bitangent) {
+    tangent -= n * dot(n, tangent);
+    float tangentLen2 = dot(tangent, tangent);
+    if (tangentLen2 <= 1.0e-8) {
+        tangent_frame(n, tangent, bitangent);
+    } else {
+        tangent *= inversesqrt(tangentLen2);
+        bitangent = normalize(cross(n, tangent));
+    }
+    float s = sin(material.anisotropy_rotation);
+    float c = cos(material.anisotropy_rotation);
+    vec3 t = tangent * c + bitangent * s;
+    vec3 b = bitangent * c - tangent * s;
+    tangent = normalize(t);
+    bitangent = normalize(b);
+}
+
+void material_anisotropic_alpha(Material material, out float alphaX, out float alphaY) {
+    float a = max(ggx_safe_roughness(material.roughness) * ggx_safe_roughness(material.roughness), 1.0e-4);
+    float strength = clamp(material.anisotropy_strength, -0.99, 0.99);
+    float aspect = sqrt(max(1.0 - 0.9 * abs(strength), 0.1));
+    alphaX = strength >= 0.0 ? a / aspect : a * aspect;
+    alphaY = strength >= 0.0 ? a * aspect : a / aspect;
+}
+
+float ggx_anisotropic_ndf(float alphaX, float alphaY, vec3 h, vec3 n, vec3 tangent, vec3 bitangent) {
+    float hx = dot(h, tangent);
+    float hy = dot(h, bitangent);
+    float hz = max(dot(h, n), 0.0);
+    float denom = hx * hx / max(alphaX * alphaX, 1.0e-8) +
+        hy * hy / max(alphaY * alphaY, 1.0e-8) +
+        hz * hz;
+    return 1.0 / max(PI * alphaX * alphaY * denom * denom, 1.0e-10);
+}
+
+float smith_ggx_anisotropic_lambda(float alphaX, float alphaY, vec3 v, vec3 n, vec3 tangent, vec3 bitangent) {
+    float vx = dot(v, tangent);
+    float vy = dot(v, bitangent);
+    float vz = max(dot(v, n), 1.0e-6);
+    float tan2 = (alphaX * vx) * (alphaX * vx) + (alphaY * vy) * (alphaY * vy);
+    return 0.5 * (sqrt(1.0 + tan2 / max(vz * vz, 1.0e-8)) - 1.0);
+}
+
+float smith_g1_anisotropic(float alphaX, float alphaY, vec3 v, vec3 n, vec3 tangent, vec3 bitangent) {
+    if (dot(v, n) <= 0.0) {
+        return 0.0;
+    }
+    return 1.0 / max(1.0 + smith_ggx_anisotropic_lambda(alphaX, alphaY, v, n, tangent, bitangent), 1.0e-8);
+}
+
+float smith_g_anisotropic(float alphaX, float alphaY, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
+    if (dot(wo, n) <= 0.0 || dot(wi, n) <= 0.0) {
+        return 0.0;
+    }
+    float lambdaV = smith_ggx_anisotropic_lambda(alphaX, alphaY, wo, n, tangent, bitangent);
+    float lambdaL = smith_ggx_anisotropic_lambda(alphaX, alphaY, wi, n, tangent, bitangent);
+    return 1.0 / max(1.0 + lambdaV + lambdaL, 1.0e-8);
 }
 
 float ggx_directional_albedo(float roughness, float n_dot_v) {
@@ -1337,7 +1459,7 @@ vec3 heitz_ms_ggx(vec3 f0, float roughness, float n_dot_v, float n_dot_l) {
     return f_ms * (1.0 - E_v) * (1.0 - E_l) / max(PI * E_v * E_l, 1e-8);
 }
 
-vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
     float n_dot_v = max(dot(n, wo), 0.0);
     float n_dot_l = max(dot(n, wi), 0.0);
     if (n_dot_v < 1e-6 || n_dot_l < 1e-6) {
@@ -1351,9 +1473,19 @@ vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     float n_dot_h = max(dot(n, h), 0.0);
     float v_dot_h = max(dot(wo, h), 0.0);
     vec3 f0 = pbr_f0(material);
-    vec3 f = schlick_fresnel(f0, v_dot_h);
+    vec3 f = material.use_conductor_optics != 0u
+        ? conductor_fresnel(material, v_dot_h)
+        : schlick_fresnel(f0, v_dot_h);
     float d = ggx_ndf(material.roughness, n_dot_h);
     float g = smith_g(material.roughness, n_dot_v, n_dot_l);
+    if (material_uses_anisotropy(material)) {
+        material_anisotropic_frame(material, n, tangent, bitangent);
+        float alphaX;
+        float alphaY;
+        material_anisotropic_alpha(material, alphaX, alphaY);
+        d = ggx_anisotropic_ndf(alphaX, alphaY, h, n, tangent, bitangent);
+        g = smith_g_anisotropic(alphaX, alphaY, wo, wi, n, tangent, bitangent);
+    }
     vec3 specular = f * d * g / max(4.0 * n_dot_v * n_dot_l, 1e-10);
     vec3 msCompensation = heitz_ms_ggx(f0, material.roughness, n_dot_v, n_dot_l);
     specular += msCompensation;
@@ -1361,7 +1493,7 @@ vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     return diffuse + specular;
 }
 
-float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
     float n_dot_v = max(dot(n, wo), 0.0);
     float n_dot_l = max(dot(n, wi), 0.0);
     if (n_dot_v < 1e-6 || n_dot_l < 1e-6) {
@@ -1372,23 +1504,45 @@ float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
         return 0.0;
     }
     vec3 h = normalize(halfVector);
-    return ggx_visible_normal_pdf(material, wo, h, n);
+    return ggx_visible_normal_pdf(material, wo, h, n, tangent, bitangent);
 }
 
-float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
     float NdotV = max(dot(n, wo), 0.0);
     float specularProbability = pbr_specular_sample_probability(material, NdotV);
     float diffuseProbability = 1.0 - specularProbability;
-    return diffuseProbability * diffuse_pdf(n, wi) + specularProbability * pdf_ggx_brdf(material, wo, wi, n);
+    return diffuseProbability * diffuse_pdf(n, wi) + specularProbability * pdf_ggx_brdf(material, wo, wi, n, tangent, bitangent);
 }
 
-vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n) {
+vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tangent, vec3 bitangent) {
     float r = ggx_safe_roughness(material.roughness);
     float a = r * r;
     float r1 = rand_f32(state);
     float r2 = rand_f32(state);
-    vec3 tangent;
-    vec3 bitangent;
+    if (material_uses_anisotropy(material)) {
+        material_anisotropic_frame(material, n, tangent, bitangent);
+        float alphaX;
+        float alphaY;
+        material_anisotropic_alpha(material, alphaX, alphaY);
+        vec3 vAniso = to_tangent_space(normalize(wo), tangent, bitangent, n);
+        if (vAniso.z <= 0.0) {
+            return reflect(-wo, n);
+        }
+        vec3 vhAniso = normalize(vec3(alphaX * vAniso.x, alphaY * vAniso.y, vAniso.z));
+        float lensqAniso = vhAniso.x * vhAniso.x + vhAniso.y * vhAniso.y;
+        vec3 t1Aniso = lensqAniso > 1.0e-8 ? vec3(-vhAniso.y, vhAniso.x, 0.0) * inversesqrt(lensqAniso) : vec3(1.0, 0.0, 0.0);
+        vec3 t2Aniso = cross(vhAniso, t1Aniso);
+        float radiusAniso = sqrt(r1);
+        float phiAniso = 2.0 * PI * r2;
+        float p1Aniso = radiusAniso * cos(phiAniso);
+        float p2Aniso = radiusAniso * sin(phiAniso);
+        float blendAniso = 0.5 * (1.0 + vhAniso.z);
+        p2Aniso = mix(sqrt(max(0.0, 1.0 - p1Aniso * p1Aniso)), p2Aniso, blendAniso);
+        vec3 nhAniso = p1Aniso * t1Aniso + p2Aniso * t2Aniso + sqrt(max(0.0, 1.0 - p1Aniso * p1Aniso - p2Aniso * p2Aniso)) * vhAniso;
+        vec3 hLocalAniso = normalize(vec3(alphaX * nhAniso.x, alphaY * nhAniso.y, max(nhAniso.z, 0.0)));
+        vec3 hAniso = normalize(from_tangent_space(hLocalAniso, tangent, bitangent, n));
+        return normalize(2.0 * dot(wo, hAniso) * hAniso - wo);
+    }
     tangent_frame(n, tangent, bitangent);
     vec3 v = to_tangent_space(normalize(wo), tangent, bitangent, n);
     if (v.z <= 0.0) {
@@ -1413,7 +1567,7 @@ vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n) {
     return normalize(2.0 * dot(wo, h) * h - wo);
 }
 
-vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
     MaterialClosure c = material_to_closure(material);
     vec3 result = vec3(0.0);
 
@@ -1438,7 +1592,7 @@ vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
         result += c.weight * c.color * Dcharlie * V * NdotL;
     }
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
-        vec3 spec = eval_ggx_brdf(material, wo, wi, n);
+        vec3 spec = eval_ggx_brdf(material, wo, wi, n, tangent, bitangent);
         if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_THIN_FILM)) {
             float NdotV = max(dot(n, wo), 0.0);
             float cosTheta = max(dot(reflect(-wo, n), wi), 0.0);
@@ -1453,13 +1607,13 @@ vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     return result;
 }
 
-float pdf_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+float pdf_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
     if (material_is_delta(material)) {
         return 0.0;
     }
     MaterialClosure c = material_to_closure(material);
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
-        return pdf_pbr_brdf(material, wo, wi, n);
+        return pdf_pbr_brdf(material, wo, wi, n, tangent, bitangent);
     }
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_DIFFUSE) ||
         closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SSS) ||
@@ -1469,19 +1623,19 @@ float pdf_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     return 0.0;
 }
 
-vec3 sample_brdf(inout uint state, Material material, vec3 wo, vec3 n, out float pdf) {
+vec3 sample_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tangent, vec3 bitangent, out float pdf) {
     MaterialClosure c = material_to_closure(material);
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
         float NdotV_sample = max(dot(n, wo), 0.0);
         float specularProbability = pbr_specular_sample_probability(material, NdotV_sample);
         vec3 wi;
         if (rand_f32(state) < specularProbability) {
-            wi = sample_ggx_brdf(state, material, wo, n);
+            wi = sample_ggx_brdf(state, material, wo, n, tangent, bitangent);
         } else {
             float diffusePdf;
             wi = sample_cosine_hemisphere(state, n, diffusePdf);
         }
-        pdf = pdf_pbr_brdf(material, wo, wi, n);
+        pdf = pdf_pbr_brdf(material, wo, wi, n, tangent, bitangent);
         return wi;
     }
     return sample_cosine_hemisphere(state, n, pdf);

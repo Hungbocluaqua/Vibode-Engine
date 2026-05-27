@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 15;
+constexpr uint32_t kCacheVersion = 16;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -230,13 +230,48 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeBytes(file, &mat.emissiveFactor, sizeof(mat.emissiveFactor));
         writeFloat(file, mat.metallicFactor);
         writeFloat(file, mat.roughnessFactor);
+        writeFloat(file, mat.iorFactor);
         writeFloat(file, mat.alphaCutoff);
         writeUint32(file, mat.alphaMode);
         writeUint32(file, mat.doubleSided);
+        writeUint32(file, mat.hasIor);
+        writeUint32(file, mat.hasClearcoat);
+        writeFloat(file, mat.clearcoatFactor);
+        writeFloat(file, mat.clearcoatRoughnessFactor);
+        writeUint32(file, mat.hasTransmission);
+        writeFloat(file, mat.transmissionFactor);
+        writeUint32(file, mat.hasSpecular);
+        writeFloat(file, mat.specularFactor);
+        writeBytes(file, &mat.specularColorFactor, sizeof(mat.specularColorFactor));
+        writeUint32(file, mat.hasSheen);
+        writeBytes(file, &mat.sheenColorFactor, sizeof(mat.sheenColorFactor));
+        writeFloat(file, mat.sheenRoughnessFactor);
+        writeUint32(file, mat.hasEmissiveStrength);
+        writeFloat(file, mat.emissiveStrength);
+        writeUint32(file, mat.hasAnisotropy);
+        writeFloat(file, mat.anisotropyStrength);
+        writeFloat(file, mat.anisotropyRotation);
+        writeUint32(file, mat.useConductorOptics);
+        writeBytes(file, &mat.conductorEta, sizeof(mat.conductorEta));
+        writeBytes(file, &mat.conductorK, sizeof(mat.conductorK));
         writeInt32(file, mat.baseColorTextureIndex);
         writeInt32(file, mat.normalTextureIndex);
         writeInt32(file, mat.metallicRoughnessTextureIndex);
         writeInt32(file, mat.emissiveTextureIndex);
+        writeInt32(file, mat.clearcoatTextureIndex);
+        writeInt32(file, mat.clearcoatRoughnessTextureIndex);
+        writeInt32(file, mat.clearcoatNormalTextureIndex);
+        writeInt32(file, mat.transmissionTextureIndex);
+        writeInt32(file, mat.specularTextureIndex);
+        writeInt32(file, mat.specularColorTextureIndex);
+        writeInt32(file, mat.sheenColorTextureIndex);
+        writeInt32(file, mat.sheenRoughnessTextureIndex);
+        writeInt32(file, mat.anisotropyTextureIndex);
+        writeBytes(file, &mat.baseColorTextureTransform, sizeof(mat.baseColorTextureTransform));
+        writeBytes(file, &mat.metallicRoughnessTextureTransform, sizeof(mat.metallicRoughnessTextureTransform));
+        writeBytes(file, &mat.normalTextureTransform, sizeof(mat.normalTextureTransform));
+        writeBytes(file, &mat.emissiveTextureTransform, sizeof(mat.emissiveTextureTransform));
+        writeUint32(file, mat.shaderCompatibilityMask);
     }
 
     uint32_t meshCount = static_cast<uint32_t>(scene.meshes.size());
@@ -456,13 +491,48 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readBytes(file, &mat.emissiveFactor, sizeof(mat.emissiveFactor))) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.metallicFactor)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.roughnessFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.iorFactor)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.alphaCutoff)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.alphaMode)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.doubleSided)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasIor)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasClearcoat)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.clearcoatFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.clearcoatRoughnessFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasTransmission)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.transmissionFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasSpecular)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.specularFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.specularColorFactor, sizeof(mat.specularColorFactor))) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasSheen)) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.sheenColorFactor, sizeof(mat.sheenColorFactor))) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.sheenRoughnessFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasEmissiveStrength)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.emissiveStrength)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasAnisotropy)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.anisotropyStrength)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.anisotropyRotation)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.useConductorOptics)) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.conductorEta, sizeof(mat.conductorEta))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.conductorK, sizeof(mat.conductorK))) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.baseColorTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.normalTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.metallicRoughnessTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.emissiveTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.clearcoatTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.clearcoatRoughnessTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.clearcoatNormalTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.transmissionTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.specularTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.specularColorTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.sheenColorTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.sheenRoughnessTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.anisotropyTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.baseColorTextureTransform, sizeof(mat.baseColorTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.metallicRoughnessTextureTransform, sizeof(mat.metallicRoughnessTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.normalTextureTransform, sizeof(mat.normalTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.emissiveTextureTransform, sizeof(mat.emissiveTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.shaderCompatibilityMask)) { std::fclose(file); return std::nullopt; }
     }
 
     uint32_t meshCount = 0;

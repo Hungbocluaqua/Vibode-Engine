@@ -28,19 +28,61 @@ struct MeshVertex {
     glm::vec2 texcoord{};
 };
 
+struct TextureTransformAsset {
+    uint32_t enabled = 0;
+    glm::vec2 offset{0.0f};
+    glm::vec2 scale{1.0f};
+    float rotation = 0.0f;
+    uint32_t texCoord = 0;
+};
+
 struct MaterialAsset {
     std::string name;
     glm::vec4 baseColorFactor{1.0f};
     glm::vec3 emissiveFactor{0.0f};
     float metallicFactor = 0.0f;
     float roughnessFactor = 1.0f;
+    float iorFactor = 1.5f;
     float alphaCutoff = 0.5f;
     uint32_t alphaMode = 0;
     uint32_t doubleSided = 0;
+    uint32_t hasIor = 0;
+    uint32_t hasClearcoat = 0;
+    float clearcoatFactor = 0.0f;
+    float clearcoatRoughnessFactor = 0.0f;
+    uint32_t hasTransmission = 0;
+    float transmissionFactor = 0.0f;
+    uint32_t hasSpecular = 0;
+    float specularFactor = 1.0f;
+    glm::vec3 specularColorFactor{1.0f};
+    uint32_t hasSheen = 0;
+    glm::vec3 sheenColorFactor{0.0f};
+    float sheenRoughnessFactor = 0.0f;
+    uint32_t hasEmissiveStrength = 0;
+    float emissiveStrength = 1.0f;
+    uint32_t hasAnisotropy = 0;
+    float anisotropyStrength = 0.0f;
+    float anisotropyRotation = 0.0f;
+    uint32_t useConductorOptics = 0;
+    glm::vec3 conductorEta{0.0f};
+    glm::vec3 conductorK{0.0f};
     TextureAssetHandle baseColorTexture{};
     TextureAssetHandle normalTexture{};
     TextureAssetHandle metallicRoughnessTexture{};
     TextureAssetHandle emissiveTexture{};
+    TextureAssetHandle clearcoatTexture{};
+    TextureAssetHandle clearcoatRoughnessTexture{};
+    TextureAssetHandle clearcoatNormalTexture{};
+    TextureAssetHandle transmissionTexture{};
+    TextureAssetHandle specularTexture{};
+    TextureAssetHandle specularColorTexture{};
+    TextureAssetHandle sheenColorTexture{};
+    TextureAssetHandle sheenRoughnessTexture{};
+    TextureAssetHandle anisotropyTexture{};
+    TextureTransformAsset baseColorTextureTransform{};
+    TextureTransformAsset metallicRoughnessTextureTransform{};
+    TextureTransformAsset normalTextureTransform{};
+    TextureTransformAsset emissiveTextureTransform{};
     uint32_t shaderCompatibilityMask = 1u;
 };
 
