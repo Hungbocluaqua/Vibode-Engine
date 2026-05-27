@@ -64,6 +64,7 @@ private:
 
     GLFWwindow* window_ = nullptr;
     const VulkanContext& context_;
+    VkFormat colorAttachmentFormat_ = VK_FORMAT_UNDEFINED;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     EditorLayer editor_;
     VkImageView viewportImageView_ = VK_NULL_HANDLE;

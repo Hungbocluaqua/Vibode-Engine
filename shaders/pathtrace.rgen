@@ -137,6 +137,35 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
     restir_reservoirs[pixelIndex] = restir_pairwise_temporal_merge(current, previous, motionConfidence, 32.0);
 }
 
+void store_initial_restir_gi_reservoir(uint pixelIndex, bool didHit, vec3 hitPosition, vec3 hitNormal, float hitDepth, PathComponents components) {
+    if (debug_params.view != 60u && debug_params.view != 61u) {
+        return;
+    }
+
+    RestirGiReservoir reservoir;
+    reservoir.hit_position_target_pdf = vec4(0.0);
+    reservoir.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
+    reservoir.radiance_weight_sum = vec4(0.0);
+    reservoir.receiver_position_hit_distance = vec4(0.0);
+    reservoir.metadata = uvec4(0u);
+
+    if (didHit) {
+        vec3 radiance = max(components.indirect_light + components.environment_light, vec3(0.0));
+        float targetPdf = max(luminance(radiance), 1.0e-4);
+        reservoir.hit_position_target_pdf = vec4(hitPosition, targetPdf);
+        reservoir.normal_roughness = vec4(normalize(hitNormal), clamp(components.first_roughness, 0.0, 1.0));
+        reservoir.radiance_weight_sum = vec4(radiance, 1.0);
+        reservoir.receiver_position_hit_distance = vec4(camera.pos.xyz, max(hitDepth, 0.0));
+        reservoir.metadata = uvec4(
+            1u,
+            0u,
+            RESTIR_GI_FLAG_VALID | RESTIR_GI_FLAG_VISIBLE,
+            components.mesh_id == 0xffffffffu ? 0u : components.mesh_id);
+    }
+
+    restir_gi_reservoirs[pixelIndex] = reservoir;
+}
+
 void reset_payload() {
     payload.hit = 0u;
     payload.t = 10000.0;
@@ -880,6 +909,7 @@ void main() {
         : compute_sky_velocity(ray.direction, ivec2(size));
     velocity_buffer[pixel_index] = packedVelocity;
     store_initial_restir_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
+    store_initial_restir_gi_reservoir(pixel_index, did_hit, hit_position, hit_normal, hit_depth, components);
 
     entity_id_buffer[pixel_index] = did_hit && components.instance_id != 0xffffffffu
         ? components.instance_id

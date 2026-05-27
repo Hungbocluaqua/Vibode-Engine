@@ -377,8 +377,10 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
     totalFrameCount_ = totalFrames;
     cpuFrameTimings_.clear();
     gpuFrameTimings_.clear();
+    perFrameGpuTimings_.clear();
     cpuFrameTimings_.reserve(totalFrames);
     gpuFrameTimings_.reserve(totalFrames);
+    perFrameGpuTimings_.reserve(totalFrames);
 
     const uint32_t renderedFrames = std::max(warmupFrames, totalFrames);
     const auto start = std::chrono::steady_clock::now();
@@ -410,6 +412,7 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
                 timings.historyCopyMs + timings.taaMs + timings.autoExposureMs +
                 timings.toneMapMs + timings.selectionOutlineMs + timings.fullscreenMs;
             gpuFrameTimings_.push_back(gpuTotal);
+            perFrameGpuTimings_.push_back(timings);
         }
     }
     commandSystem_->waitIdle();

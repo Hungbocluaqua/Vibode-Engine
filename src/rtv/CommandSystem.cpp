@@ -84,37 +84,32 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     }
     recordClearCommands(frame.commandBuffer, imageIndex, clearPhase);
 
-    VkCommandBufferSubmitInfo commandBufferInfo{};
-    commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    commandBufferInfo.commandBuffer = frame.commandBuffer;
-
-    VkSemaphoreSubmitInfo waitInfo{};
-    VkSubmitInfo2 submitInfo{};
-
     if (!headless_) {
-        waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-        waitInfo.semaphore = frame.imageAvailable;
-        waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        const VkSemaphore waitSemaphore = frame.imageAvailable;
+        const VkSemaphore signalSemaphore = imageRenderFinished_.at(imageIndex);
+        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
-        VkSemaphoreSubmitInfo signalInfo{};
-        signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-        signalInfo.semaphore = imageRenderFinished_.at(imageIndex);
-        signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
-
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-        submitInfo.waitSemaphoreInfoCount = 1;
-        submitInfo.pWaitSemaphoreInfos = &waitInfo;
-        submitInfo.commandBufferInfoCount = 1;
-        submitInfo.pCommandBufferInfos = &commandBufferInfo;
-        submitInfo.signalSemaphoreInfoCount = 1;
-        submitInfo.pSignalSemaphoreInfos = &signalInfo;
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = &waitSemaphore;
+        submitInfo.pWaitDstStageMask = &waitStage;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &frame.commandBuffer;
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &signalSemaphore;
+        checkVk(vkQueueSubmit(context_.graphicsQueue(), 1, &submitInfo, frame.inFlight), "vkQueueSubmit");
     } else {
+        VkCommandBufferSubmitInfo commandBufferInfo{};
+        commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+        commandBufferInfo.commandBuffer = frame.commandBuffer;
+
+        VkSubmitInfo2 submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
         submitInfo.commandBufferInfoCount = 1;
         submitInfo.pCommandBufferInfos = &commandBufferInfo;
+        checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &submitInfo, frame.inFlight), "vkQueueSubmit2");
     }
-
-    checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &submitInfo, frame.inFlight), "vkQueueSubmit2");
 
     if (headless_) {
         frameIndex_ = (frameIndex_ + 1) % framesInFlight;
@@ -299,7 +294,7 @@ void CommandSystem::recordClearCommands(VkCommandBuffer commandBuffer, uint32_t 
             !headless_ ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_BLIT_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_NONE,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             VK_ACCESS_2_NONE);
     } else {
         transitionImage(
@@ -309,7 +304,7 @@ void CommandSystem::recordClearCommands(VkCommandBuffer commandBuffer, uint32_t 
             !headless_ ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_NONE,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             VK_ACCESS_2_NONE);
     }
 

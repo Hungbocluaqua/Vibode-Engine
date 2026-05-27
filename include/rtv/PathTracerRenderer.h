@@ -275,6 +275,7 @@ private:
     [[nodiscard]] bool shouldRunDenoiser() const;
     [[nodiscard]] bool shouldRunTaa() const;
     [[nodiscard]] bool shouldRunRestirSpatial() const;
+    [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
     [[nodiscard]] const Image& postDenoiseImage() const;
     [[nodiscard]] const Image& hdrPostProcessImage() const;
     void skipDenoiserPass(VkCommandBuffer commandBuffer);

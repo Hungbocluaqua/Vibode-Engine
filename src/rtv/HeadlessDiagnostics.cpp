@@ -125,6 +125,50 @@ ProfileReport::MinMaxAvg computeMinMaxAvg(const std::vector<float>& values, uint
     return result;
 }
 
+GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, uint32_t warmupFrames) {
+    GpuFrameTimings result{};
+    if (values.empty()) {
+        return result;
+    }
+
+    size_t startIdx = std::min(static_cast<size_t>(warmupFrames), values.size());
+    if (startIdx >= values.size()) {
+        startIdx = 0;
+    }
+    const size_t count = values.size() - startIdx;
+    if (count == 0) {
+        return result;
+    }
+
+    for (size_t i = startIdx; i < values.size(); ++i) {
+        result.pathTraceMs += values[i].pathTraceMs;
+        result.restirSpatialMs += values[i].restirSpatialMs;
+        result.fogIntegrateMs += values[i].fogIntegrateMs;
+        result.atmosphereMs += values[i].atmosphereMs;
+        result.denoiserMs += values[i].denoiserMs;
+        result.historyCopyMs += values[i].historyCopyMs;
+        result.taaMs += values[i].taaMs;
+        result.autoExposureMs += values[i].autoExposureMs;
+        result.toneMapMs += values[i].toneMapMs;
+        result.selectionOutlineMs += values[i].selectionOutlineMs;
+        result.fullscreenMs += values[i].fullscreenMs;
+    }
+
+    const float invCount = 1.0f / static_cast<float>(count);
+    result.pathTraceMs *= invCount;
+    result.restirSpatialMs *= invCount;
+    result.fogIntegrateMs *= invCount;
+    result.atmosphereMs *= invCount;
+    result.denoiserMs *= invCount;
+    result.historyCopyMs *= invCount;
+    result.taaMs *= invCount;
+    result.autoExposureMs *= invCount;
+    result.toneMapMs *= invCount;
+    result.selectionOutlineMs *= invCount;
+    result.fullscreenMs *= invCount;
+    return result;
+}
+
 void writeValidationLog(const RendererValidationLog& log, const std::filesystem::path& path) {
     std::ofstream file(path);
     if (!file.is_open()) return;
@@ -206,7 +250,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.cpuFrameMs = computeMinMaxAvg(cpuTimings, warmup);
     profileReport_.gpuFrameMs = computeMinMaxAvg(gpuTimingsVec, warmup);
 
-    const auto& timings = renderer->timings();
+    const auto timings = averageGpuTimings(app.perFrameGpuTimings(), warmup);
     profileReport_.perPassGpuMs.pathTrace = timings.pathTraceMs;
     profileReport_.perPassGpuMs.restirSpatial = timings.restirSpatialMs;
     profileReport_.perPassGpuMs.fogIntegrate = timings.fogIntegrateMs;

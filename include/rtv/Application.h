@@ -6,6 +6,7 @@
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorPanels.h"
+#include "rtv/GpuProfiler.h"
 #include "rtv/SceneDocument.h"
 #include "rtv/SceneEventBus.h"
 #include "rtv/SceneToGpuSceneBuilder.h"
@@ -66,6 +67,7 @@ public:
     [[nodiscard]] Swapchain* swapchain() { return swapchain_.get(); }
     [[nodiscard]] const std::vector<float>& cpuFrameTimings() const { return cpuFrameTimings_; }
     [[nodiscard]] const std::vector<float>& gpuFrameTimings() const { return gpuFrameTimings_; }
+    [[nodiscard]] const std::vector<GpuFrameTimings>& perFrameGpuTimings() const { return perFrameGpuTimings_; }
     [[nodiscard]] uint32_t warmupFrameCount() const { return warmupFrameCount_; }
 
 private:
@@ -135,6 +137,7 @@ private:
     uint32_t totalFrameCount_ = 0;
     std::vector<float> cpuFrameTimings_;
     std::vector<float> gpuFrameTimings_;
+    std::vector<GpuFrameTimings> perFrameGpuTimings_;
     std::function<void(uint32_t)> beginFrameCapture_;
     std::function<void(uint32_t)> endFrameCapture_;
     RendererDebugView debugView_ = RendererDebugView::Beauty;

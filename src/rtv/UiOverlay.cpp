@@ -30,12 +30,17 @@ struct ImGuiVulkanLoaderData {
 
 PFN_vkVoidFunction imguiVulkanFunctionLoader(const char* functionName, void* userData) {
     const auto* loader = static_cast<const ImGuiVulkanLoaderData*>(userData);
+    if (loader != nullptr && loader->instance != VK_NULL_HANDLE) {
+        if (PFN_vkVoidFunction function = vkGetInstanceProcAddr(loader->instance, functionName)) {
+            return function;
+        }
+    }
     if (loader != nullptr && loader->device != VK_NULL_HANDLE) {
         if (PFN_vkVoidFunction function = vkGetDeviceProcAddr(loader->device, functionName)) {
             return function;
         }
     }
-    return loader != nullptr ? vkGetInstanceProcAddr(loader->instance, functionName) : nullptr;
+    return nullptr;
 }
 
 } // namespace
@@ -76,8 +81,8 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
     VkPipelineRenderingCreateInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     renderingInfo.colorAttachmentCount = 1;
-    const VkFormat colorFormat = swapchain.format();
-    renderingInfo.pColorAttachmentFormats = &colorFormat;
+    colorAttachmentFormat_ = swapchain.format();
+    renderingInfo.pColorAttachmentFormats = &colorAttachmentFormat_;
 
     ImGui_ImplVulkan_InitInfo initInfo{};
     initInfo.ApiVersion = VK_API_VERSION_1_3;
@@ -190,6 +195,7 @@ void UiOverlay::record(VkCommandBuffer commandBuffer) {
 }
 
 void UiOverlay::onSwapchainRecreated(const Swapchain& swapchain) {
+    colorAttachmentFormat_ = swapchain.format();
     ImGui_ImplVulkan_SetMinImageCount(std::max(2u, swapchain.imageCount()));
 }
 
