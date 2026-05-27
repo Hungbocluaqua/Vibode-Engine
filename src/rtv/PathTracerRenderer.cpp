@@ -1529,6 +1529,10 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
+    const bool resetRestirHistory =
+        settings_.restirMode != RestirMode::ClassicNee &&
+        ((temporalSystem_ != nullptr && temporalSystem_->isCameraCut()) ||
+         (temporalSystem_ == nullptr && temporalFrameIndex_ <= 1u));
     const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
     RenderGraphResourceId restirGiReservoir{};
     RenderGraphResourceId previousRestirGiReservoir{};
@@ -1539,6 +1543,14 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
         restirGiSpatialReservoir = graph.createBuffer(bufferResource(restirGiSpatialReservoirBuffer_, "restir gi spatial reservoir"));
     }
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
+    if (resetRestirHistory) {
+        graph.addPass("restir_history_clear")
+            .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                validationLog_.recordPass("restir history clear");
+                vkCmdFillBuffer(cmd, previousRestirReservoirBuffer_.handle(), 0, previousRestirReservoirBuffer_.size(), 0u);
+            });
+    }
     if (useRestirGiReservoirs) {
         RenderGraphPass& restirGiClearPass = graph.addPass("restir_gi_clear")
             .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer);
@@ -1851,6 +1863,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
     const RenderGraphResourceId restirSpatialReservoir = graph.createBuffer(bufferResource(restirSpatialReservoirBuffer_, "restir spatial reservoir"));
+    const bool resetRestirHistory =
+        settings_.restirMode != RestirMode::ClassicNee &&
+        ((temporalSystem_ != nullptr && temporalSystem_->isCameraCut()) ||
+         (temporalSystem_ == nullptr && temporalFrameIndex_ <= 1u));
     const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
     RenderGraphResourceId restirGiReservoir{};
     RenderGraphResourceId previousRestirGiReservoir{};
@@ -1862,6 +1878,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     }
 
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
+    if (resetRestirHistory) {
+        graph.addPass("restir_history_clear")
+            .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
+    }
     if (useRestirGiReservoirs) {
         RenderGraphPass& restirGiClearPass = graph.addPass("restir_gi_clear")
             .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer);

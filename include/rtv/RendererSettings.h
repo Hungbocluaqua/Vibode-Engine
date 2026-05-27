@@ -66,9 +66,9 @@ struct RendererSettings {
     float debugScale = 1.0f;
     float shadowRayBias = 0.001f;
     float shadowDistanceBias = 0.002f;
-    float fireflyClamp = 48.0f;
+    float fireflyClamp = 10.0f;
     float maxFrameDeltaSeconds = 1.0f / 30.0f;
-    float russianRouletteMinSurvival = 0.10f;
+    float russianRouletteMinSurvival = 0.05f;
     uint32_t restirGiTemporalMaxAge = 24;
     uint32_t restirGiSpatialRounds = 4;
     float restirGiSpatialRadius = 4.25f;

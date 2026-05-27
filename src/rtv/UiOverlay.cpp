@@ -147,7 +147,15 @@ EditorRequests UiOverlay::build(
     const VkExtent2D renderExtent = renderer.renderExtent();
     const VkExtent2D displayExtent = renderer.displayExtent();
     const VkExtent2D targetExtent = editor_.desiredRenderExtent(extent);
-    const bool outputMatchesViewport = displayExtent.width == targetExtent.width && displayExtent.height == targetExtent.height;
+    const float renderScale = renderer.settings().renderResolutionScale;
+    VkExtent2D targetRenderExtent = targetExtent;
+    targetRenderExtent.width = std::max(1u, static_cast<uint32_t>(static_cast<float>(targetRenderExtent.width) * renderScale));
+    targetRenderExtent.height = std::max(1u, static_cast<uint32_t>(static_cast<float>(targetRenderExtent.height) * renderScale));
+    const bool outputMatchesViewport =
+        displayExtent.width == targetExtent.width &&
+        displayExtent.height == targetExtent.height &&
+        renderExtent.width == targetRenderExtent.width &&
+        renderExtent.height == targetRenderExtent.height;
 
     const VkDescriptorImageInfo descriptor = outputMatchesViewport ? renderer.viewportImageDescriptor() : VkDescriptorImageInfo{};
     if (descriptor.imageView != VK_NULL_HANDLE && descriptor.imageView != viewportImageView_) {

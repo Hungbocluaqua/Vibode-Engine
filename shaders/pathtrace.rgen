@@ -72,6 +72,42 @@ bool temporal_history_available() {
     return camera.atmosphere.z > 0.5;
 }
 
+vec3 clamp_luminance_preserve_hue(vec3 value, float maxLum) {
+    value = max(value, vec3(0.0));
+    float valueLum = luminance(value);
+    if (valueLum <= maxLum || valueLum <= 1.0e-6) {
+        return value;
+    }
+    return value * (maxLum / valueLum);
+}
+
+float direct_contribution_luminance_limit(uint bounce, uint sampleType, float roughness) {
+    float base = firefly_clamp_luminance();
+    float bounceScale = bounce == 0u ? 4.0 : 1.75;
+    float sunScale = sampleType == 3u ? 2.0 : 1.0;
+    float roughnessScale = mix(0.75, 1.35, clamp(roughness, 0.0, 1.0));
+    return max(base, base * bounceScale * sunScale * roughnessScale);
+}
+
+float restir_temporal_luminance_limit(vec3 currentDirect) {
+    float base = firefly_clamp_luminance();
+    float currentLum = luminance(max(currentDirect, vec3(0.0)));
+    return max(base * 2.0, currentLum * 4.0);
+}
+
+float throughput_luminance_limit(uint nextBounce, float roughness, bool deltaPath) {
+    float base = max(firefly_clamp_luminance(), 8.0);
+    float depthScale = nextBounce <= 1u ? 2.0 : (nextBounce == 2u ? 1.25 : 0.85);
+    float materialScale = deltaPath ? 2.0 : mix(0.75, 1.25, clamp(roughness, 0.0, 1.0));
+    return max(4.0, base * depthScale * materialScale);
+}
+
+vec3 clamp_path_throughput(vec3 value, uint nextBounce, float roughness, bool deltaPath) {
+    return clamp_luminance_preserve_hue(
+        value,
+        throughput_luminance_limit(nextBounce, roughness, deltaPath));
+}
+
 RestirReservoir empty_restir_reservoir() {
     RestirReservoir reservoir;
     reservoir.metadata = uvec4(0u);
@@ -83,11 +119,10 @@ RestirReservoir empty_restir_reservoir() {
 RestirReservoir make_initial_restir_reservoir(vec3 directLight, float lightPdf, uint sampleType, float roughness) {
     bool valid = sampleType != 0u && lightPdf > 1.0e-6;
     vec3 sampleValue = valid ? max(directLight, vec3(0.0)) : vec3(0.0);
+    sampleValue = clamp_luminance_preserve_hue(
+        sampleValue,
+        direct_contribution_luminance_limit(0u, sampleType, roughness));
     float sampleLum = luminance(sampleValue);
-    if (sampleLum > 50.0) {
-        sampleValue *= 50.0 / sampleLum;
-        sampleLum = 50.0;
-    }
 
     RestirReservoir current;
     current.metadata = uvec4(
@@ -780,11 +815,12 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         }
         vec3 shadedDirect = direct;
         if (bounce == 0u && restir_mode() != 0u) {
+            bool historyAvailable = temporal_history_available();
             uint packedFirstVel = compute_surface_velocity(hit.world_pos, hit.local_pos, hit.instance_id, dims);
-            RestirReservoir previousReservoir;
+            RestirReservoir previousReservoir = empty_restir_reservoir();
             bool reprojectionValid = false;
             float restirMotionConfidence = 1.0;
-            if (packedFirstVel != 0u) {
+            if (historyAvailable && packedFirstVel != 0u) {
                 vec2 firstVel = restir_unpack_velocity_pixels(packedFirstVel);
                 ivec2 reprojected = ivec2(round(vec2(coords) - firstVel));
                 ivec2 clampedReprojected = clamp(reprojected, ivec2(0), dims - ivec2(1));
@@ -792,12 +828,12 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 previousReservoir = previous_restir_reservoirs[reprojectedIndex];
                 reprojectionValid = length(firstVel) < float(max(dims.x, dims.y)) * 0.5;
                 restirMotionConfidence = 1.0 - clamp(length(firstVel) / 24.0, 0.0, 0.75);
-            } else {
+            } else if (historyAvailable) {
                 previousReservoir = previous_restir_reservoirs[pixelIndex];
                 reprojectionValid = true;
             }
             bool previousReservoirValid = restir_reservoir_valid(previousReservoir) &&
-                temporal_history_available() &&
+                historyAvailable &&
                 reprojectionValid;
             bool useRestir = restir_mode() == 1u || (restir_mode() == 2u && coords.x >= dims.x / 2);
             if (useRestir && previousReservoirValid) {
@@ -812,10 +848,16 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     restirMotionConfidence,
                     32.0);
                 shadedDirect = mergedReservoir.sample_value_confidence.rgb / max(atmosTransmittance, vec3(1.0e-3));
+                shadedDirect = clamp_luminance_preserve_hue(
+                    shadedDirect,
+                    restir_temporal_luminance_limit(direct));
             }
         }
         float bounceContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
         vec3 scaledShadedDirect = shadedDirect * atmosTransmittance * bounceContributionScale;
+        scaledShadedDirect = clamp_luminance_preserve_hue(
+            scaledShadedDirect,
+            direct_contribution_luminance_limit(bounce, directSampleType, material.roughness));
         radiance += scaledShadedDirect;
         if (bounce == 0u) {
             components.direct_light += scaledShadedDirect;
@@ -882,6 +924,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             }
             ray.origin = hit.world_pos + hit.normal * shadow_self_hit_epsilon();
             throughput *= material.color;
+            throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, true);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
@@ -900,6 +943,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             ray.direction = normalize(scatteredDirection);
             ray.origin = hit.world_pos + (dot(ray.direction, hit.normal) > 0.0 ? hit.normal : -hit.normal) * shadow_self_hit_epsilon();
             throughput *= material.color;
+            throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, true);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
@@ -922,6 +966,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             previousBrdfPdf = bsdfPdf;
             previousSampleOrigin = ray.origin;
             throughput *= bsdf * cosTheta / max(bsdfPdf, 1e-6);
+            throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, false);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
