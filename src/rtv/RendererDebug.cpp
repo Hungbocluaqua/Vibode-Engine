@@ -146,6 +146,18 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "restirgiage" || key == "gireservoirage" || key == "giage") {
         return RendererDebugView::RestirGiAge;
     }
+    if (key == "restirgiinitial" || key == "restirgiinit" || key == "giinitial") {
+        return RendererDebugView::RestirGiInitial;
+    }
+    if (key == "restirgitemporal" || key == "gitemporal") {
+        return RendererDebugView::RestirGiTemporal;
+    }
+    if (key == "restirgispatial" || key == "gispatial") {
+        return RendererDebugView::RestirGiSpatial;
+    }
+    if (key == "restirgifinal" || key == "gifinal" || key == "restirgicontribution") {
+        return RendererDebugView::RestirGiFinal;
+    }
     return RendererDebugView::Beauty;
 }
 
@@ -213,6 +225,10 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirPairwiseMis: return "restir-pairwise-mis";
     case RendererDebugView::RestirGiValidity: return "restir-gi-validity";
     case RendererDebugView::RestirGiAge: return "restir-gi-age";
+    case RendererDebugView::RestirGiInitial: return "restir-gi-initial";
+    case RendererDebugView::RestirGiTemporal: return "restir-gi-temporal";
+    case RendererDebugView::RestirGiSpatial: return "restir-gi-spatial";
+    case RendererDebugView::RestirGiFinal: return "restir-gi-final";
     }
     return "beauty";
 }

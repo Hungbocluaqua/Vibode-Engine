@@ -278,6 +278,10 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::RestirPairwiseMis,
         RendererDebugView::RestirGiValidity,
         RendererDebugView::RestirGiAge,
+        RendererDebugView::RestirGiInitial,
+        RendererDebugView::RestirGiTemporal,
+        RendererDebugView::RestirGiSpatial,
+        RendererDebugView::RestirGiFinal,
     };
 }
 

@@ -180,6 +180,7 @@ PathTracerRenderer::PathTracerRenderer(
     const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
     const auto restirSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_spatial.comp", shaderOutputDirectory);
     const auto restirGiSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_spatial.comp", shaderOutputDirectory);
+    const auto restirGiFinalSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_final.comp", shaderOutputDirectory);
     const auto fogSpv = compiler.compileIfNeeded(shaderDirectory / "fog_integrate.comp", shaderOutputDirectory);
     const auto transmittanceSpv = compiler.compileIfNeeded(shaderDirectory / "transmittance_lut.comp", shaderOutputDirectory);
     const auto multiScatterSpv = compiler.compileIfNeeded(shaderDirectory / "multi_scatter_lut.comp", shaderOutputDirectory);
@@ -198,6 +199,7 @@ PathTracerRenderer::PathTracerRenderer(
     taaShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(taaSpv), "taa compute");
     restirSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirSpatialSpv), "restir spatial compute");
     restirGiSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiSpatialSpv), "restir gi spatial compute");
+    restirGiFinalShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiFinalSpv), "restir gi final compute");
     fogShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(fogSpv), "height fog integrate compute");
     transmittanceShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(transmittanceSpv), "atmosphere transmittance lut compute");
     multiScatterShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(multiScatterSpv), "atmosphere multi scatter lut compute");
@@ -229,6 +231,7 @@ PathTracerRenderer::PathTracerRenderer(
         shaderDirectory / "taa.comp",
         shaderDirectory / "restir_spatial.comp",
         shaderDirectory / "restir_gi_spatial.comp",
+        shaderDirectory / "restir_gi_final.comp",
         shaderDirectory / "fog_integrate.comp",
         shaderDirectory / "transmittance_lut.comp",
         shaderDirectory / "multi_scatter_lut.comp",
@@ -272,6 +275,7 @@ PathTracerRenderer::PathTracerRenderer(
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
     restirSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirSpatialShader_->reflection()}, 0));
     restirGiSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiSpatialShader_->reflection()}, 0));
+    restirGiFinalSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiFinalShader_->reflection()}, 0));
     fogSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({fogShader_->reflection()}, 0));
     selectionOutlineSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({selectionOutlineShader_->reflection()}, 0));
     luminanceHistogramSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({luminanceHistogramShader_->reflection()}, 0));
@@ -321,6 +325,12 @@ PathTracerRenderer::PathTracerRenderer(
         *restirGiSpatialShader_,
         std::vector<VkDescriptorSetLayout>{restirGiSpatialSetLayout_},
         ShaderReflection::mergePushConstants({restirGiSpatialShader_->reflection()}),
+        *pipelineCache_);
+    restirGiFinalPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiFinalShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiFinalSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiFinalShader_->reflection()}),
         *pipelineCache_);
     fogPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -1534,6 +1544,16 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 recordRestirGiSpatialPass(cmd);
             });
     }
+    if (shouldRunRestirGiFinal()) {
+        graph.addPass("restir_gi_final")
+            .addStorageReadWrite(raw, PipelineDomain::Compute)
+            .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirGiFinalPass(cmd);
+            });
+    }
     graph.compile();
     graph.execute(commandBuffer, temporalFrameIndex_);
 }
@@ -1637,6 +1657,29 @@ void PathTracerRenderer::recordRestirGiSpatialPass(VkCommandBuffer commandBuffer
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirGiSpatialPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     restirGiSpatialPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+}
+
+void PathTracerRenderer::recordRestirGiFinalPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("restir gi final shading");
+    if (restirGiFinalPipeline_ == nullptr || restirGiFinalSetLayout_ == VK_NULL_HANDLE) {
+        return;
+    }
+    rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(restirGiFinalSetLayout_);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirGiReservoirBuffer_.descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialReservoirBuffer_.descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameDebugParamsOffset, sizeof(RendererDebugParams)))
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)))
+        .update(context_.device(), set);
+
+    restirGiFinalPipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirGiFinalPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    restirGiFinalPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
 }
 
 void PathTracerRenderer::recordHeightFog(VkCommandBuffer commandBuffer) {
@@ -1809,6 +1852,13 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
             .addStorageRead(depthNormal, PipelineDomain::Compute)
             .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Compute);
+    }
+    if (shouldRunRestirGiFinal()) {
+        graph.addPass("restir_gi_final")
+            .addStorageReadWrite(raw, PipelineDomain::Compute)
+            .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute);
     }
 
     if (shouldRunRestirSpatial()) {
@@ -2602,7 +2652,16 @@ bool PathTracerRenderer::shouldRunRestirSpatial() const {
 
 bool PathTracerRenderer::shouldUseRestirGiReservoirs() const {
     return settings_.debugView == RendererDebugView::RestirGiValidity ||
-        settings_.debugView == RendererDebugView::RestirGiAge;
+        settings_.debugView == RendererDebugView::RestirGiAge ||
+        settings_.debugView == RendererDebugView::RestirGiInitial ||
+        settings_.debugView == RendererDebugView::RestirGiTemporal ||
+        settings_.debugView == RendererDebugView::RestirGiSpatial ||
+        settings_.debugView == RendererDebugView::RestirGiFinal;
+}
+
+bool PathTracerRenderer::shouldRunRestirGiFinal() const {
+    return settings_.debugView == RendererDebugView::RestirGiSpatial ||
+        settings_.debugView == RendererDebugView::RestirGiFinal;
 }
 
 const Image& PathTracerRenderer::postDenoiseImage() const {

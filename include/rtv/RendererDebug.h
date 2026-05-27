@@ -77,6 +77,10 @@ enum class RendererDebugView : uint32_t {
     RestirPairwiseMis = 59,
     RestirGiValidity = 60,
     RestirGiAge = 61,
+    RestirGiInitial = 62,
+    RestirGiTemporal = 63,
+    RestirGiSpatial = 64,
+    RestirGiFinal = 65,
 };
 
 enum class RestirMode : uint32_t {

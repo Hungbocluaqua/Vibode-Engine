@@ -255,6 +255,7 @@ private:
     void recordRestirSpatialPass(VkCommandBuffer commandBuffer);
     void recordRestirSpatialCopyPass(VkCommandBuffer commandBuffer);
     void recordRestirGiSpatialPass(VkCommandBuffer commandBuffer);
+    void recordRestirGiFinalPass(VkCommandBuffer commandBuffer);
     void recordHeightFog(VkCommandBuffer commandBuffer);
     void recordHeightFogPass(VkCommandBuffer commandBuffer);
     void recordDenoiser(VkCommandBuffer commandBuffer);
@@ -277,6 +278,7 @@ private:
     [[nodiscard]] bool shouldRunTaa() const;
     [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
+    [[nodiscard]] bool shouldRunRestirGiFinal() const;
     [[nodiscard]] const Image& postDenoiseImage() const;
     [[nodiscard]] const Image& hdrPostProcessImage() const;
     void skipDenoiserPass(VkCommandBuffer commandBuffer);
@@ -362,6 +364,7 @@ private:
     std::unique_ptr<ShaderModule> taaShader_;
     std::unique_ptr<ShaderModule> restirSpatialShader_;
     std::unique_ptr<ShaderModule> restirGiSpatialShader_;
+    std::unique_ptr<ShaderModule> restirGiFinalShader_;
     std::unique_ptr<ShaderModule> fogShader_;
     std::unique_ptr<ShaderModule> transmittanceShader_;
     std::unique_ptr<ShaderModule> multiScatterShader_;
@@ -385,6 +388,7 @@ private:
     std::unique_ptr<ComputePipeline> taaPipeline_;
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirGiSpatialPipeline_;
+    std::unique_ptr<ComputePipeline> restirGiFinalPipeline_;
     std::unique_ptr<ComputePipeline> fogPipeline_;
     std::unique_ptr<ComputePipeline> selectionOutlinePipeline_;
     std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
@@ -401,6 +405,7 @@ private:
     VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirGiSpatialSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout restirGiFinalSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout fogSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout selectionOutlineSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout luminanceHistogramSetLayout_ = VK_NULL_HANDLE;
