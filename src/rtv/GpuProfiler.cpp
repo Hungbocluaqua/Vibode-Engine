@@ -110,27 +110,38 @@ void GpuProfiler::collectCompletedFrame() {
         return;
     }
 
-    std::array<uint64_t, Count> timestamps{};
+    struct TimestampResult {
+        uint64_t timestamp = 0;
+        uint64_t available = 0;
+    };
+    std::array<TimestampResult, Count> timestamps{};
     const VkResult result = vkGetQueryPoolResults(
         device_,
         queryPool_,
         0,
         Count,
-        sizeof(uint64_t) * timestamps.size(),
+        sizeof(TimestampResult) * timestamps.size(),
         timestamps.data(),
-        sizeof(uint64_t),
-        VK_QUERY_RESULT_64_BIT);
+        sizeof(TimestampResult),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
 
-    if (result == VK_NOT_READY) {
+    if (result != VK_SUCCESS && result != VK_NOT_READY) {
+        checkVk(result, "vkGetQueryPoolResults(gpu profiler)");
+    }
+    bool anyTimestampAvailable = false;
+    for (const TimestampResult& timestamp : timestamps) {
+        anyTimestampAvailable = anyTimestampAvailable || timestamp.available != 0;
+    }
+    if (!anyTimestampAvailable) {
         return;
     }
-    checkVk(result, "vkGetQueryPoolResults(gpu profiler)");
 
     const auto elapsedMs = [&](Query begin, Query end) {
-        if (timestamps[end] <= timestamps[begin]) {
+        if (timestamps[begin].available == 0 || timestamps[end].available == 0 ||
+            timestamps[end].timestamp <= timestamps[begin].timestamp) {
             return 0.0f;
         }
-        const double ns = static_cast<double>(timestamps[end] - timestamps[begin]) * static_cast<double>(timestampPeriod_);
+        const double ns = static_cast<double>(timestamps[end].timestamp - timestamps[begin].timestamp) * static_cast<double>(timestampPeriod_);
         return static_cast<float>(ns / 1.0e6);
     };
 
@@ -138,16 +149,33 @@ void GpuProfiler::collectCompletedFrame() {
         return previous <= 0.0f ? current : previous * 0.8f + current * 0.2f;
     };
     timings_.pathTraceMs = smooth(timings_.pathTraceMs, elapsedMs(PathTraceStart, PathTraceEnd));
+    timings_.restirHistoryClearMs = smooth(timings_.restirHistoryClearMs, elapsedMs(RestirHistoryClearStart, RestirHistoryClearEnd));
+    timings_.restirGiClearMs = smooth(timings_.restirGiClearMs, elapsedMs(RestirGiClearStart, RestirGiClearEnd));
     timings_.restirSpatialMs = smooth(timings_.restirSpatialMs, elapsedMs(RestirSpatialStart, RestirSpatialEnd));
+    timings_.restirSpatialCopyMs = smooth(timings_.restirSpatialCopyMs, elapsedMs(RestirSpatialCopyStart, RestirSpatialCopyEnd));
+    timings_.restirGiSpatialMs = smooth(timings_.restirGiSpatialMs, elapsedMs(RestirGiSpatialStart, RestirGiSpatialEnd));
+    timings_.restirGiFinalMs = smooth(timings_.restirGiFinalMs, elapsedMs(RestirGiFinalStart, RestirGiFinalEnd));
     timings_.fogIntegrateMs = smooth(timings_.fogIntegrateMs, elapsedMs(FogIntegrateStart, FogIntegrateEnd));
     timings_.atmosphereMs = smooth(timings_.atmosphereMs, elapsedMs(AtmosphereStart, AtmosphereEnd));
+    timings_.atmosphereTransmittanceMs = smooth(timings_.atmosphereTransmittanceMs, elapsedMs(AtmosphereTransmittanceStart, AtmosphereTransmittanceEnd));
+    timings_.atmosphereMultiScatterMs = smooth(timings_.atmosphereMultiScatterMs, elapsedMs(AtmosphereMultiScatterStart, AtmosphereMultiScatterEnd));
+    timings_.atmosphereSkyViewMs = smooth(timings_.atmosphereSkyViewMs, elapsedMs(AtmosphereSkyViewStart, AtmosphereSkyViewEnd));
+    timings_.atmosphereSkyReprojectMs = smooth(timings_.atmosphereSkyReprojectMs, elapsedMs(AtmosphereSkyReprojectStart, AtmosphereSkyReprojectEnd));
+    timings_.atmosphereSkyCdfMs = smooth(timings_.atmosphereSkyCdfMs, elapsedMs(AtmosphereSkyCdfStart, AtmosphereSkyCdfEnd));
+    timings_.atmosphereAerialPerspectiveMs = smooth(timings_.atmosphereAerialPerspectiveMs, elapsedMs(AtmosphereAerialPerspectiveStart, AtmosphereAerialPerspectiveEnd));
     timings_.denoiserMs = smooth(timings_.denoiserMs, elapsedMs(DenoiserStart, DenoiserEnd));
     timings_.historyCopyMs = smooth(timings_.historyCopyMs, elapsedMs(HistoryCopyStart, HistoryCopyEnd));
+    timings_.skipDenoiserCopyMs = smooth(timings_.skipDenoiserCopyMs, elapsedMs(SkipDenoiserCopyStart, SkipDenoiserCopyEnd));
     timings_.taaMs = smooth(timings_.taaMs, elapsedMs(TaaStart, TaaEnd));
-    timings_.autoExposureMs = smooth(timings_.autoExposureMs, elapsedMs(AutoExposureStart, AutoExposureEnd));
+    timings_.taaHistoryCopyMs = smooth(timings_.taaHistoryCopyMs, elapsedMs(TaaHistoryCopyStart, TaaHistoryCopyEnd));
+    timings_.autoExposureHistogramClearMs = smooth(timings_.autoExposureHistogramClearMs, elapsedMs(AutoExposureHistogramClearStart, AutoExposureHistogramClearEnd));
+    timings_.autoExposureHistogramMs = smooth(timings_.autoExposureHistogramMs, elapsedMs(AutoExposureHistogramStart, AutoExposureHistogramEnd));
+    timings_.autoExposureReduceMs = smooth(timings_.autoExposureReduceMs, elapsedMs(AutoExposureReduceStart, AutoExposureReduceEnd));
+    timings_.autoExposureMs = timings_.autoExposureHistogramClearMs + timings_.autoExposureHistogramMs + timings_.autoExposureReduceMs;
     timings_.toneMapMs = smooth(timings_.toneMapMs, elapsedMs(ToneMapStart, ToneMapEnd));
     timings_.selectionOutlineMs = smooth(timings_.selectionOutlineMs, elapsedMs(SelectionOutlineStart, SelectionOutlineEnd));
     timings_.fullscreenMs = smooth(timings_.fullscreenMs, elapsedMs(FullscreenStart, FullscreenEnd));
+    timings_.editorPresentationMs = smooth(timings_.editorPresentationMs, elapsedMs(EditorPresentationStart, EditorPresentationEnd));
     submitted_ = false;
 
     if (!statsSubmitted_ || statsQueryPool_ == VK_NULL_HANDLE) {

@@ -421,11 +421,7 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
 
         if (pathTracer_) {
             const auto& timings = pathTracer_->timings();
-            float gpuTotal = timings.pathTraceMs + timings.restirSpatialMs +
-                timings.fogIntegrateMs + timings.atmosphereMs + timings.denoiserMs +
-                timings.historyCopyMs + timings.taaMs + timings.autoExposureMs +
-                timings.toneMapMs + timings.selectionOutlineMs + timings.fullscreenMs;
-            gpuFrameTimings_.push_back(gpuTotal);
+            gpuFrameTimings_.push_back(timings.totalMs());
             perFrameGpuTimings_.push_back(timings);
         }
     }
@@ -1801,7 +1797,7 @@ void Application::updateWindowTitle(float seconds) {
           << " | env " << (settings.environmentEnabled ? "on" : "off")
           << " | GPU "
           << std::fixed << std::setprecision(2)
-          << timings.atmosphereMs + timings.pathTraceMs + timings.restirSpatialMs + timings.fogIntegrateMs + timings.denoiserMs + timings.fullscreenMs << " ms";
+          << timings.totalMs() << " ms";
     glfwSetWindowTitle(window_, title.str().c_str());
 }
 

@@ -624,17 +624,32 @@ int checkBudget(const std::filesystem::path& budgetPath, const ProfileReport& pr
     const json passBudgets = budget.value("per_pass_gpu_ms", json::object());
     std::map<std::string, double> actual = {
         {"path_trace", profile.perPassGpuMs.pathTrace},
+        {"restir_history_clear", profile.perPassGpuMs.restirHistoryClear},
+        {"restir_gi_clear", profile.perPassGpuMs.restirGiClear},
         {"restir_spatial", profile.perPassGpuMs.restirSpatial},
+        {"restir_spatial_copy", profile.perPassGpuMs.restirSpatialCopy},
+        {"restir_gi_spatial", profile.perPassGpuMs.restirGiSpatial},
+        {"restir_gi_final", profile.perPassGpuMs.restirGiFinal},
         {"fog_integrate", profile.perPassGpuMs.fogIntegrate},
         {"atmosphere", profile.perPassGpuMs.atmosphere},
+        {"atmosphere_transmittance", profile.perPassGpuMs.atmosphereTransmittance},
+        {"atmosphere_multi_scatter", profile.perPassGpuMs.atmosphereMultiScatter},
+        {"atmosphere_sky_view", profile.perPassGpuMs.atmosphereSkyView},
+        {"atmosphere_sky_reproject", profile.perPassGpuMs.atmosphereSkyReproject},
+        {"atmosphere_sky_cdf", profile.perPassGpuMs.atmosphereSkyCdf},
+        {"atmosphere_aerial_perspective", profile.perPassGpuMs.atmosphereAerialPerspective},
         {"denoiser", profile.perPassGpuMs.denoiser},
         {"history_copy", profile.perPassGpuMs.historyCopy},
+        {"skip_denoiser_copy", profile.perPassGpuMs.skipDenoiserCopy},
         {"taa", profile.perPassGpuMs.taa},
+        {"taa_history_copy", profile.perPassGpuMs.taaHistoryCopy},
+        {"auto_exposure_histogram_clear", profile.perPassGpuMs.autoExposureHistogramClear},
         {"auto_exposure_histogram", profile.perPassGpuMs.autoExposureHistogram},
         {"auto_exposure_reduce", profile.perPassGpuMs.autoExposureReduce},
         {"tone_map", profile.perPassGpuMs.toneMap},
         {"selection_outline", profile.perPassGpuMs.selectionOutline},
         {"fullscreen", profile.perPassGpuMs.fullscreen},
+        {"editor_presentation", profile.perPassGpuMs.editorPresentation},
     };
 
     json failures = json::array();

@@ -18,6 +18,7 @@ class AtmosphereSamplingSystem;
 class ComputePipeline;
 class DescriptorAllocator;
 class DescriptorLayoutCache;
+class GpuProfiler;
 class PipelineCache;
 class ResourceAllocator;
 class ShaderModule;
@@ -43,7 +44,7 @@ public:
         const ShaderModule& skyCdfShader);
     ~AtmosphereLutSystem();
 
-    void record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
+    void record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler = nullptr);
     void setSkyParameters(float sunElevation, float sunAzimuth, float skyIntensity);
     void setSkyDirection(glm::vec3 sunDirection, float skyIntensity);
     void setAtmosphereParams(float rayleighScaleHeight, float mieScaleHeight, float mieAnisotropy, float groundAlbedo);
@@ -77,11 +78,11 @@ private:
     void clearDirty(LutNode node);
     void markGenerated(LutNode node);
 
-    void recordTransmittance(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
-    void recordMultiScatter(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
-    void recordSkyView(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
-    void recordSkyViewReproject(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
-    void recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
+    void recordTransmittance(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler);
+    void recordMultiScatter(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler);
+    void recordSkyView(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler);
+    void recordSkyViewReproject(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler);
+    void recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler);
 
     VkDevice device_ = VK_NULL_HANDLE;
     ResourceAllocator& allocator_;

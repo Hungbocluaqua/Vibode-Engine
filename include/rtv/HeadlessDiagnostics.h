@@ -65,17 +65,32 @@ struct ProfileReport {
 
     struct PerPassGpuMs {
         float pathTrace = 0.0f;
+        float restirHistoryClear = 0.0f;
+        float restirGiClear = 0.0f;
         float restirSpatial = 0.0f;
+        float restirSpatialCopy = 0.0f;
+        float restirGiSpatial = 0.0f;
+        float restirGiFinal = 0.0f;
         float fogIntegrate = 0.0f;
         float atmosphere = 0.0f;
+        float atmosphereTransmittance = 0.0f;
+        float atmosphereMultiScatter = 0.0f;
+        float atmosphereSkyView = 0.0f;
+        float atmosphereSkyReproject = 0.0f;
+        float atmosphereSkyCdf = 0.0f;
+        float atmosphereAerialPerspective = 0.0f;
         float denoiser = 0.0f;
         float historyCopy = 0.0f;
+        float skipDenoiserCopy = 0.0f;
         float taa = 0.0f;
+        float taaHistoryCopy = 0.0f;
+        float autoExposureHistogramClear = 0.0f;
         float autoExposureHistogram = 0.0f;
         float autoExposureReduce = 0.0f;
         float toneMap = 0.0f;
         float selectionOutline = 0.0f;
         float fullscreen = 0.0f;
+        float editorPresentation = 0.0f;
     } perPassGpuMs{};
 
     struct PipelineStatistics {

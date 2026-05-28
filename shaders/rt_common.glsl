@@ -1175,7 +1175,14 @@ bool sample_light_bvh(inout uint rng, out uint lightIndex) {
 float reflectance(float cosine, float ref_idx) {
     float r0 = (1.0 - ref_idx) / (1.0 + ref_idx);
     r0 = r0 * r0;
-    return r0 + (1.0 - r0) * pow(clamp(1.0 - cosine, 0.0, 1.0), 5.0);
+    float t = clamp(1.0 - cosine, 0.0, 1.0);
+    float t2 = t * t;
+    return r0 + (1.0 - r0) * (t2 * t2 * t);
+}
+
+float schlick_fresnel_pow5(float t) {
+    float t2 = t * t;
+    return t2 * t2 * t;
 }
 
 float diffuse_pdf(vec3 normal, vec3 wi) {
@@ -1224,6 +1231,10 @@ float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
+bool has_positive_radiance(vec3 color) {
+    return any(greaterThan(color, vec3(0.0)));
+}
+
 vec3 pbr_f0(Material material) {
     if (material.use_conductor_optics != 0u) {
         vec3 eta = max(material.conductor_eta, vec3(0.0));
@@ -1270,7 +1281,7 @@ float pbr_specular_sample_probability(Material material, float NdotV) {
     vec3 f0 = pbr_f0(material);
     vec3 fresnel = material.use_conductor_optics != 0u
         ? conductor_fresnel(material, NdotV)
-        : f0 + (vec3(1.0) - f0) * pow(1.0 - max(NdotV, 0.0), 5.0);
+        : f0 + (vec3(1.0) - f0) * schlick_fresnel_pow5(1.0 - max(NdotV, 0.0));
     float specularWeight = max(luminance(fresnel), 0.0);
     float diffuseWeight = max(luminance(pbr_diffuse_energy(material) * material.color * (1.0 / PI)), 0.0);
     return clamp(specularWeight / max(specularWeight + diffuseWeight, 1e-6), 0.05, 0.95);
@@ -1283,7 +1294,7 @@ vec3 sample_cosine_hemisphere(inout uint state, vec3 normal, out float pdf) {
     vec3 axis = abs(normal.x) > 0.1 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 tangent = normalize(cross(axis, normal));
     vec3 bitangent = cross(normal, tangent);
-    vec3 dir = normalize(tangent * cos(r1) * r2s + bitangent * sin(r1) * r2s + normal * sqrt(max(1.0 - r2, 0.0)));
+    vec3 dir = tangent * cos(r1) * r2s + bitangent * sin(r1) * r2s + normal * sqrt(max(1.0 - r2, 0.0));
     pdf = diffuse_pdf(normal, dir);
     return dir;
 }
@@ -1311,7 +1322,7 @@ float ggx_ndf(float roughness, float n_dot_h) {
 }
 
 vec3 schlick_fresnel(vec3 f0, float v_dot_h) {
-    float f = pow(clamp(1.0 - v_dot_h, 0.0, 1.0), 5.0);
+    float f = schlick_fresnel_pow5(clamp(1.0 - v_dot_h, 0.0, 1.0));
     return f0 + (vec3(1.0) - f0) * f;
 }
 
@@ -1524,7 +1535,7 @@ vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 
         float alphaX;
         float alphaY;
         material_anisotropic_alpha(material, alphaX, alphaY);
-        vec3 vAniso = to_tangent_space(normalize(wo), tangent, bitangent, n);
+        vec3 vAniso = to_tangent_space(wo, tangent, bitangent, n);
         if (vAniso.z <= 0.0) {
             return reflect(-wo, n);
         }
@@ -1541,10 +1552,10 @@ vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 
         vec3 nhAniso = p1Aniso * t1Aniso + p2Aniso * t2Aniso + sqrt(max(0.0, 1.0 - p1Aniso * p1Aniso - p2Aniso * p2Aniso)) * vhAniso;
         vec3 hLocalAniso = normalize(vec3(alphaX * nhAniso.x, alphaY * nhAniso.y, max(nhAniso.z, 0.0)));
         vec3 hAniso = normalize(from_tangent_space(hLocalAniso, tangent, bitangent, n));
-        return normalize(2.0 * dot(wo, hAniso) * hAniso - wo);
+        return 2.0 * dot(wo, hAniso) * hAniso - wo;
     }
     tangent_frame(n, tangent, bitangent);
-    vec3 v = to_tangent_space(normalize(wo), tangent, bitangent, n);
+    vec3 v = to_tangent_space(wo, tangent, bitangent, n);
     if (v.z <= 0.0) {
         return reflect(-wo, n);
     }
@@ -1564,7 +1575,7 @@ vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 
     vec3 nh = p1 * t1 + p2 * t2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * vh;
     vec3 hLocal = normalize(vec3(a * nh.x, a * nh.y, max(nh.z, 0.0)));
     vec3 h = normalize(from_tangent_space(hLocal, tangent, bitangent, n));
-    return normalize(2.0 * dot(wo, h) * h - wo);
+    return 2.0 * dot(wo, h) * h - wo;
 }
 
 vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {

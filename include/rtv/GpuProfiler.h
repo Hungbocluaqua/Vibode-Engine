@@ -11,16 +11,55 @@ namespace rtv {
 
 struct GpuFrameTimings {
     float pathTraceMs = 0.0f;
+    float restirHistoryClearMs = 0.0f;
+    float restirGiClearMs = 0.0f;
     float restirSpatialMs = 0.0f;
+    float restirSpatialCopyMs = 0.0f;
+    float restirGiSpatialMs = 0.0f;
+    float restirGiFinalMs = 0.0f;
     float fogIntegrateMs = 0.0f;
     float atmosphereMs = 0.0f;
+    float atmosphereTransmittanceMs = 0.0f;
+    float atmosphereMultiScatterMs = 0.0f;
+    float atmosphereSkyViewMs = 0.0f;
+    float atmosphereSkyReprojectMs = 0.0f;
+    float atmosphereSkyCdfMs = 0.0f;
+    float atmosphereAerialPerspectiveMs = 0.0f;
     float denoiserMs = 0.0f;
     float historyCopyMs = 0.0f;
+    float skipDenoiserCopyMs = 0.0f;
     float taaMs = 0.0f;
+    float taaHistoryCopyMs = 0.0f;
     float autoExposureMs = 0.0f;
+    float autoExposureHistogramClearMs = 0.0f;
+    float autoExposureHistogramMs = 0.0f;
+    float autoExposureReduceMs = 0.0f;
     float toneMapMs = 0.0f;
     float selectionOutlineMs = 0.0f;
     float fullscreenMs = 0.0f;
+    float editorPresentationMs = 0.0f;
+
+    [[nodiscard]] float totalMs() const {
+        return pathTraceMs +
+            restirHistoryClearMs +
+            restirGiClearMs +
+            restirSpatialMs +
+            restirSpatialCopyMs +
+            restirGiSpatialMs +
+            restirGiFinalMs +
+            fogIntegrateMs +
+            atmosphereMs +
+            denoiserMs +
+            historyCopyMs +
+            skipDenoiserCopyMs +
+            taaMs +
+            taaHistoryCopyMs +
+            autoExposureMs +
+            toneMapMs +
+            selectionOutlineMs +
+            fullscreenMs +
+            editorPresentationMs;
+    }
 };
 
 struct GpuPipelineStatistics {
@@ -35,27 +74,59 @@ public:
     enum Query : uint32_t {
         PathTraceStart = 0,
         PathTraceEnd = 1,
-        RestirSpatialStart = 2,
-        RestirSpatialEnd = 3,
-        FogIntegrateStart = 4,
-        FogIntegrateEnd = 5,
-        AtmosphereStart = 6,
-        AtmosphereEnd = 7,
-        DenoiserStart = 8,
-        DenoiserEnd = 9,
-        HistoryCopyStart = 10,
-        HistoryCopyEnd = 11,
-        TaaStart = 12,
-        TaaEnd = 13,
-        AutoExposureStart = 14,
-        AutoExposureEnd = 15,
-        ToneMapStart = 16,
-        ToneMapEnd = 17,
-        SelectionOutlineStart = 18,
-        SelectionOutlineEnd = 19,
-        FullscreenStart = 20,
-        FullscreenEnd = 21,
-        Count = 22,
+        RestirHistoryClearStart = 2,
+        RestirHistoryClearEnd = 3,
+        RestirGiClearStart = 4,
+        RestirGiClearEnd = 5,
+        RestirSpatialStart = 6,
+        RestirSpatialEnd = 7,
+        RestirSpatialCopyStart = 8,
+        RestirSpatialCopyEnd = 9,
+        RestirGiSpatialStart = 10,
+        RestirGiSpatialEnd = 11,
+        RestirGiFinalStart = 12,
+        RestirGiFinalEnd = 13,
+        FogIntegrateStart = 14,
+        FogIntegrateEnd = 15,
+        AtmosphereStart = 16,
+        AtmosphereEnd = 17,
+        AtmosphereTransmittanceStart = 18,
+        AtmosphereTransmittanceEnd = 19,
+        AtmosphereMultiScatterStart = 20,
+        AtmosphereMultiScatterEnd = 21,
+        AtmosphereSkyViewStart = 22,
+        AtmosphereSkyViewEnd = 23,
+        AtmosphereSkyReprojectStart = 24,
+        AtmosphereSkyReprojectEnd = 25,
+        AtmosphereSkyCdfStart = 26,
+        AtmosphereSkyCdfEnd = 27,
+        AtmosphereAerialPerspectiveStart = 28,
+        AtmosphereAerialPerspectiveEnd = 29,
+        DenoiserStart = 30,
+        DenoiserEnd = 31,
+        HistoryCopyStart = 32,
+        HistoryCopyEnd = 33,
+        SkipDenoiserCopyStart = 34,
+        SkipDenoiserCopyEnd = 35,
+        TaaStart = 36,
+        TaaEnd = 37,
+        TaaHistoryCopyStart = 38,
+        TaaHistoryCopyEnd = 39,
+        AutoExposureHistogramClearStart = 40,
+        AutoExposureHistogramClearEnd = 41,
+        AutoExposureHistogramStart = 42,
+        AutoExposureHistogramEnd = 43,
+        AutoExposureReduceStart = 44,
+        AutoExposureReduceEnd = 45,
+        ToneMapStart = 46,
+        ToneMapEnd = 47,
+        SelectionOutlineStart = 48,
+        SelectionOutlineEnd = 49,
+        FullscreenStart = 50,
+        FullscreenEnd = 51,
+        EditorPresentationStart = 52,
+        EditorPresentationEnd = 53,
+        Count = 54,
     };
 
     GpuProfiler() = default;

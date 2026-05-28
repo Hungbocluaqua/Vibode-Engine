@@ -492,18 +492,7 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
         return;
     }
 
-    const float gpuMs =
-        timings.pathTraceMs +
-        timings.restirSpatialMs +
-        timings.fogIntegrateMs +
-        timings.atmosphereMs +
-        timings.denoiserMs +
-        timings.historyCopyMs +
-        timings.taaMs +
-        timings.autoExposureMs +
-        timings.toneMapMs +
-        timings.selectionOutlineMs +
-        timings.fullscreenMs;
+    const float gpuMs = timings.totalMs();
     if (gpuMs > 0.0f) {
         adaptiveSmoothedGpuMs_ = adaptiveSmoothedGpuMs_ <= 0.0f
             ? gpuMs
@@ -1433,8 +1422,9 @@ void PathTracerRenderer::updateCamera() {
 }
 
 void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
-    const VkPipelineStageFlags2 traceStage = pathTraceShaderStage();
-    recordRenderGraphPlan();
+    if (dumpRenderGraphPath_.has_value() || dumpRenderGraphDotPath_.has_value()) {
+        recordRenderGraphPlan();
+    }
     currentProfiler_->resetForFrame(commandBuffer);
     if (atmosphereLutSystem_ != nullptr) {
         validationLog_.recordPass("atmosphere lut update");
@@ -1442,42 +1432,28 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
         atmosphereLutSystem_->setSkyDirection(settings_.sunDirection, settings_.skyIntensity);
         atmosphereLutSystem_->setAtmosphereParams(settings_.rayleighScaleHeight, settings_.mieScaleHeight, settings_.mieAnisotropy, settings_.groundAlbedo);
         atmosphereLutSystem_->setCameraPosition(glm::vec3(camera_.pos));
-        atmosphereLutSystem_->record(commandBuffer, currentFrame_->descriptors());
+        atmosphereLutSystem_->record(commandBuffer, currentFrame_->descriptors(), currentProfiler_);
         if (const AtmosphereSamplingSystem* sampling = atmosphereLutSystem_->samplingSystem()) {
             scene_.setSkyCdfDimensions(sampling->skyViewWidth(), sampling->skyViewHeight());
         }
         currentProfiler_->write(commandBuffer, GpuProfiler::AtmosphereEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
-    currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceStart, traceStage);
     recordPathTraceGraph(commandBuffer);
-    currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceEnd, traceStage);
     currentProfiler_->markStatsSubmitted();
-    currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     recordRestirSpatial(commandBuffer);
-    currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-    currentProfiler_->write(commandBuffer, GpuProfiler::FogIntegrateStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     recordHeightFog(commandBuffer);
-    currentProfiler_->write(commandBuffer, GpuProfiler::FogIntegrateEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     if (shouldRunDenoiser()) {
         recordDenoiser(commandBuffer);
         copyHistoryResources(commandBuffer);
     } else {
-        currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
         skipDenoiserPass(commandBuffer);
     }
     if (shouldRunTaa()) {
         recordTaa(commandBuffer);
-    } else {
-        currentProfiler_->write(commandBuffer, GpuProfiler::TaaStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
     if (settings_.autoExposureEnabled) {
         recordAutoExposure(commandBuffer);
-    } else {
-        currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
     recordToneMap(commandBuffer);
     recordSelectionOutline(commandBuffer);
@@ -1548,7 +1524,9 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer)
             .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                 validationLog_.recordPass("restir history clear");
+                currentProfiler_->write(cmd, GpuProfiler::RestirHistoryClearStart, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
                 vkCmdFillBuffer(cmd, previousRestirReservoirBuffer_.handle(), 0, previousRestirReservoirBuffer_.size(), 0u);
+                currentProfiler_->write(cmd, GpuProfiler::RestirHistoryClearEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
             });
     }
     if (useRestirGiReservoirs) {
@@ -1561,11 +1539,13 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
         }
         restirGiClearPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                 validationLog_.recordPass("restir gi reservoir clear");
+                currentProfiler_->write(cmd, GpuProfiler::RestirGiClearStart, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
                 vkCmdFillBuffer(cmd, restirGiReservoirBuffer_.handle(), 0, restirGiReservoirBuffer_.size(), 0u);
                 if (!restirGiHistoryValid_) {
                     vkCmdFillBuffer(cmd, previousRestirGiReservoirBuffer_.handle(), 0, previousRestirGiReservoirBuffer_.size(), 0u);
                     vkCmdFillBuffer(cmd, restirGiSpatialReservoirBuffer_.handle(), 0, restirGiSpatialReservoirBuffer_.size(), 0u);
                 }
+                currentProfiler_->write(cmd, GpuProfiler::RestirGiClearEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
             });
     }
     RenderGraphPass& pathTracePass = graph.addPass("path_trace_rt")
@@ -1615,9 +1595,11 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("path tracing rt");
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
+    currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceStart, pathTraceShaderStage());
     currentProfiler_->beginPipelineStats(commandBuffer);
     recordHardwarePathTrace(commandBuffer);
     currentProfiler_->endPipelineStats(commandBuffer);
+    currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceEnd, pathTraceShaderStage());
 }
 
 void PathTracerRenderer::recordRestirSpatial(VkCommandBuffer commandBuffer) {
@@ -1672,6 +1654,7 @@ void PathTracerRenderer::recordRestirSpatial(VkCommandBuffer commandBuffer) {
 
 void PathTracerRenderer::recordRestirSpatialPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("restir spatial reuse");
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     DescriptorSet set = currentFrame_->descriptors().allocate(restirSpatialSetLayout_);
     DescriptorWriter()
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirReservoirBuffer_.descriptorInfo())
@@ -1684,12 +1667,16 @@ void PathTracerRenderer::recordRestirSpatialPass(VkCommandBuffer commandBuffer) 
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirSpatialPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     restirSpatialPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordRestirSpatialCopyPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("restir spatial copy");
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
     VkBufferCopy copy{};
     copy.size = restirReservoirBuffer_.size();
     vkCmdCopyBuffer(commandBuffer, restirSpatialReservoirBuffer_.handle(), restirReservoirBuffer_.handle(), 1, &copy);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
 void PathTracerRenderer::recordRestirGiSpatialPass(VkCommandBuffer commandBuffer) {
@@ -1697,6 +1684,7 @@ void PathTracerRenderer::recordRestirGiSpatialPass(VkCommandBuffer commandBuffer
     if (restirGiSpatialPipeline_ == nullptr || restirGiSpatialSetLayout_ == VK_NULL_HANDLE) {
         return;
     }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiSpatialStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(restirGiSpatialSetLayout_);
     DescriptorWriter()
@@ -1710,6 +1698,7 @@ void PathTracerRenderer::recordRestirGiSpatialPass(VkCommandBuffer commandBuffer
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirGiSpatialPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     restirGiSpatialPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiSpatialEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordRestirGiFinalPass(VkCommandBuffer commandBuffer) {
@@ -1717,6 +1706,7 @@ void PathTracerRenderer::recordRestirGiFinalPass(VkCommandBuffer commandBuffer) 
     if (restirGiFinalPipeline_ == nullptr || restirGiFinalSetLayout_ == VK_NULL_HANDLE) {
         return;
     }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiFinalStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(restirGiFinalSetLayout_);
@@ -1733,6 +1723,7 @@ void PathTracerRenderer::recordRestirGiFinalPass(VkCommandBuffer commandBuffer) 
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirGiFinalPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     restirGiFinalPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiFinalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordHeightFog(VkCommandBuffer commandBuffer) {
@@ -1787,6 +1778,7 @@ void PathTracerRenderer::recordHeightFog(VkCommandBuffer commandBuffer) {
 
 void PathTracerRenderer::recordHeightFogPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("height fog integrate");
+    currentProfiler_->write(commandBuffer, GpuProfiler::FogIntegrateStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(fogSetLayout_);
@@ -1811,6 +1803,7 @@ void PathTracerRenderer::recordHeightFogPass(VkCommandBuffer commandBuffer) {
     const std::array<VkDescriptorSet, 2> descriptorSets{set.handle(), atmosphereSet.handle()};
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, fogPipeline_->layout(), 0, static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 0, nullptr);
     fogPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::FogIntegrateEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordRenderGraphPlan() {
@@ -2000,9 +1993,11 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     if (settings_.autoExposureEnabled) {
         const RenderGraphResourceId histogram = graph.createBuffer(bufferResource(histogramBuffer_, "luminance histogram"));
         const RenderGraphResourceId exposure = graph.createBuffer(bufferResource(exposureBuffer_, "exposure"));
+        graph.addPass("auto_exposure_histogram_clear")
+            .addStorageWrite(histogram, PipelineDomain::Transfer);
         graph.addPass("auto_exposure_histogram")
             .addStorageRead(toneInput, PipelineDomain::Compute)
-            .addStorageWrite(histogram, PipelineDomain::Compute);
+            .addStorageReadWrite(histogram, PipelineDomain::Compute);
         graph.addPass("auto_exposure_reduce")
             .addStorageRead(histogram, PipelineDomain::Compute)
             .addStorageWrite(exposure, PipelineDomain::Compute);
@@ -2019,13 +2014,18 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     }
 
     graph.compile();
+    const bool hasCompletedTimings = currentProfiler_->timings().totalMs() > 0.0f;
     if (dumpRenderGraphPath_.has_value()) {
         dumpRenderGraphJson(graph, currentProfiler_->timings(), *dumpRenderGraphPath_);
-        dumpRenderGraphPath_.reset();
+        if (hasCompletedTimings) {
+            dumpRenderGraphPath_.reset();
+        }
     }
     if (dumpRenderGraphDotPath_.has_value()) {
         dumpRenderGraphDot(graph, currentProfiler_->timings(), *dumpRenderGraphDotPath_);
-        dumpRenderGraphDotPath_.reset();
+        if (hasCompletedTimings) {
+            dumpRenderGraphDotPath_.reset();
+        }
     }
     validationLog_.recordPass("render graph compiled pass count=" + std::to_string(graph.compiledPassOrder().size()));
     for (uint32_t passIndex : graph.compiledPassOrder()) {
@@ -2118,8 +2118,6 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
 
 void PathTracerRenderer::recordSelectionOutline(VkCommandBuffer commandBuffer) {
     if (selectedInstanceId_ == UINT32_MAX || selectionOutlinePipeline_ == nullptr || selectionOutlineSetLayout_ == VK_NULL_HANDLE) {
-        currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-        currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
         return;
     }
     RenderGraph graph(&allocator_);
@@ -2165,14 +2163,13 @@ void PathTracerRenderer::recordSelectionOutline(VkCommandBuffer commandBuffer) {
             recordSelectionOutlinePass(cmd);
         });
     graph.compile();
-    currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     graph.execute(commandBuffer, temporalFrameIndex_);
     presentationImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordSelectionOutlinePass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("selection outline");
+    currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     presentationImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     const SelectionParams params{
@@ -2197,6 +2194,7 @@ void PathTracerRenderer::recordSelectionOutlinePass(VkCommandBuffer commandBuffe
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, selectionOutlinePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     selectionOutlinePipeline_->dispatch(commandBuffer, displayExtent_.width, displayExtent_.height, 8, 8);
+    currentProfiler_->write(commandBuffer, GpuProfiler::SelectionOutlineEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
 }
 
@@ -2328,13 +2326,12 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
             recordDenoiserPass(cmd);
         });
     graph.compile();
-    currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     graph.execute(commandBuffer, temporalFrameIndex_);
-    currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("temporal denoiser compute");
+    currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     historyImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
@@ -2366,6 +2363,7 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, denoiserPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     denoiserPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
@@ -2593,17 +2591,16 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
             copyHistoryResourcesPass(cmd);
         });
     graph.compile();
-    currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
     graph.execute(commandBuffer, temporalFrameIndex_);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     historyImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     diffuseHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     specularHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
-    currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
 void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("history copy");
+    currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     historyImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     diffuseResolvedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2668,6 +2665,7 @@ void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer)
         temporalSystem_->markSlotWritten("restir_reservoir");
     }
     denoiserHistoryValid_ = true;
+    currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
 bool PathTracerRenderer::shouldRunDenoiser() const {
@@ -2856,15 +2854,14 @@ void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
             recordTaaHistoryCopyPass(cmd);
         });
     graph.compile();
-    currentProfiler_->write(commandBuffer, GpuProfiler::TaaStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     graph.execute(commandBuffer, temporalFrameIndex_);
     taaImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     taaHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
-    currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("taa resolve");
+    currentProfiler_->write(commandBuffer, GpuProfiler::TaaStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     const Image& inputImage = postDenoiseImage();
     inputImage.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     taaHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
@@ -2886,10 +2883,12 @@ void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, taaPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     taaPipeline_->dispatch(commandBuffer, displayExtent_.width, displayExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("taa history copy");
+    currentProfiler_->write(commandBuffer, GpuProfiler::TaaHistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
     taaImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     taaHistoryImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkImageCopy copy{};
@@ -2910,6 +2909,7 @@ void PathTracerRenderer::recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer)
         temporalSystem_->markSlotWritten("taa_history");
     }
     taaHistoryValid_ = true;
+    currentProfiler_->write(commandBuffer, GpuProfiler::TaaHistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
 void PathTracerRenderer::recordAutoExposure(VkCommandBuffer commandBuffer) {
@@ -2960,7 +2960,9 @@ void PathTracerRenderer::recordAutoExposure(VkCommandBuffer commandBuffer) {
         .addStorageWrite(histogram, PipelineDomain::Transfer)
         .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             validationLog_.recordPass("auto exposure histogram clear");
+            currentProfiler_->write(cmd, GpuProfiler::AutoExposureHistogramClearStart, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
             vkCmdFillBuffer(cmd, histogramBuffer_.handle(), 0, histogramBuffer_.size(), 0);
+            currentProfiler_->write(cmd, GpuProfiler::AutoExposureHistogramClearEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
         });
     graph.addPass("auto_exposure_histogram")
         .addStorageRead(denoised, PipelineDomain::Compute)
@@ -2975,13 +2977,12 @@ void PathTracerRenderer::recordAutoExposure(VkCommandBuffer commandBuffer) {
             recordAutoExposureReducePass(cmd);
         });
     graph.compile();
-    currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     graph.execute(commandBuffer, temporalFrameIndex_);
-    currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordAutoExposureHistogramPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("auto exposure histogram");
+    currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureHistogramStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     DescriptorSet histogramSet = currentFrame_->descriptors().allocate(luminanceHistogramSetLayout_);
     const Image& sourceImage = hdrPostProcessImage();
     DescriptorWriter()
@@ -3007,10 +3008,12 @@ void PathTracerRenderer::recordAutoExposureHistogramPass(VkCommandBuffer command
         sizeof(histogramParams),
         &histogramParams);
     luminanceHistogramPipeline_->dispatch(commandBuffer, sourceImage.extent().width, sourceImage.extent().height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureHistogramEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordAutoExposureReducePass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("auto exposure reduce");
+    currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureReduceStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     DescriptorSet exposureSet = currentFrame_->descriptors().allocate(exposureReduceSetLayout_);
     DescriptorWriter()
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, histogramBuffer_.descriptorInfo())
@@ -3041,6 +3044,7 @@ void PathTracerRenderer::recordAutoExposureReducePass(VkCommandBuffer commandBuf
         sizeof(exposureParams),
         &exposureParams);
     exposureReducePipeline_->dispatch(commandBuffer, 1, 1, 1, 1);
+    currentProfiler_->write(commandBuffer, GpuProfiler::AutoExposureReduceEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordToneMap(VkCommandBuffer commandBuffer) {
@@ -3094,14 +3098,13 @@ void PathTracerRenderer::recordToneMap(VkCommandBuffer commandBuffer) {
             recordToneMapPass(cmd);
         });
     graph.compile();
-    currentProfiler_->write(commandBuffer, GpuProfiler::ToneMapStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     graph.execute(commandBuffer, temporalFrameIndex_);
     presentationImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    currentProfiler_->write(commandBuffer, GpuProfiler::ToneMapEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordToneMapPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("tone map compute");
+    currentProfiler_->write(commandBuffer, GpuProfiler::ToneMapStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     presentationImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     DescriptorSet toneMapSet = currentFrame_->descriptors().allocate(toneMapSetLayout_);
@@ -3138,6 +3141,7 @@ void PathTracerRenderer::recordToneMapPass(VkCommandBuffer commandBuffer) {
         sizeof(toneMapParams),
         &toneMapParams);
     toneMapPipeline_->dispatch(commandBuffer, displayExtent_.width, displayExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::ToneMapEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
@@ -3285,15 +3289,14 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
             skipDenoiserCopyPass(cmd);
         });
     graph.compile();
-    currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
     graph.execute(commandBuffer, temporalFrameIndex_);
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
 void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass(adaptiveSkipDenoiser_ ? "adaptive skip denoiser copy" : "skip denoiser copy");
+    currentProfiler_->write(commandBuffer, GpuProfiler::SkipDenoiserCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
     rawImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
@@ -3329,6 +3332,7 @@ void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
         temporalSystem_->markSlotWritten("restir_reservoir");
     }
     denoiserHistoryValid_ = false;
+    currentProfiler_->write(commandBuffer, GpuProfiler::SkipDenoiserCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
 void PathTracerRenderer::recordFullscreen(VkCommandBuffer commandBuffer, VkExtent2D swapchainExtent) {
@@ -3349,11 +3353,11 @@ void PathTracerRenderer::recordFullscreen(VkCommandBuffer commandBuffer, VkExten
 
 void PathTracerRenderer::recordEditorPresentationStart(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("editor viewport presentation");
-    currentProfiler_->write(commandBuffer, GpuProfiler::FullscreenStart, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT);
+    currentProfiler_->write(commandBuffer, GpuProfiler::EditorPresentationStart, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordEditorPresentationEnd(VkCommandBuffer commandBuffer) {
-    currentProfiler_->write(commandBuffer, GpuProfiler::FullscreenEnd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+    currentProfiler_->write(commandBuffer, GpuProfiler::EditorPresentationEnd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
 }
 
 VkDeviceSize PathTracerRenderer::estimatedTextureMemory() const {

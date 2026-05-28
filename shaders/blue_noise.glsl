@@ -74,6 +74,10 @@ float sample_radical_inverse_base3(uint value) {
     return reversed;
 }
 
+float sample_additive_recurrence_1d(uint value, float alpha) {
+    return fract((float(value) + 0.5) * alpha);
+}
+
 uint sample_dimension_seed(ivec2 pixel, uint frameIndex, uint bounce, uint dimension) {
     uint x = uint(pixel.x);
     uint y = uint(pixel.y);
@@ -103,7 +107,7 @@ vec2 sample_dimension_2d(ivec2 pixel, uint frameIndex, uint bounce, uint dimensi
 #if RTV_USE_DIMENSIONED_SAMPLER
     uint index = frameIndex + 1u + bounce * 4099u + dimension * 131u;
     float u = sample_radical_inverse_base2(index ^ (seed & 0xffffu));
-    float v = sample_radical_inverse_base3(index ^ ((seed >> 16u) & 0xffffu));
+    float v = sample_additive_recurrence_1d(index, 0.5698402909980532);
     vec2 scramble = vec2(
         sample_uint_to_unit_float(sample_hash_combine(seed, dimension + 1u)),
         sample_uint_to_unit_float(sample_hash_combine(seed, dimension + 2u)));

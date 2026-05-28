@@ -40,17 +40,32 @@ void to_json(nlohmann::json& j, const ProfileReport::MinMaxAvg& m) {
 
 void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
     j["path_trace"] = p.pathTrace;
+    j["restir_history_clear"] = p.restirHistoryClear;
+    j["restir_gi_clear"] = p.restirGiClear;
     j["restir_spatial"] = p.restirSpatial;
+    j["restir_spatial_copy"] = p.restirSpatialCopy;
+    j["restir_gi_spatial"] = p.restirGiSpatial;
+    j["restir_gi_final"] = p.restirGiFinal;
     j["fog_integrate"] = p.fogIntegrate;
     j["atmosphere"] = p.atmosphere;
+    j["atmosphere_transmittance"] = p.atmosphereTransmittance;
+    j["atmosphere_multi_scatter"] = p.atmosphereMultiScatter;
+    j["atmosphere_sky_view"] = p.atmosphereSkyView;
+    j["atmosphere_sky_reproject"] = p.atmosphereSkyReproject;
+    j["atmosphere_sky_cdf"] = p.atmosphereSkyCdf;
+    j["atmosphere_aerial_perspective"] = p.atmosphereAerialPerspective;
     j["denoiser"] = p.denoiser;
     j["history_copy"] = p.historyCopy;
+    j["skip_denoiser_copy"] = p.skipDenoiserCopy;
     j["taa"] = p.taa;
+    j["taa_history_copy"] = p.taaHistoryCopy;
+    j["auto_exposure_histogram_clear"] = p.autoExposureHistogramClear;
     j["auto_exposure_histogram"] = p.autoExposureHistogram;
     j["auto_exposure_reduce"] = p.autoExposureReduce;
     j["tone_map"] = p.toneMap;
     j["selection_outline"] = p.selectionOutline;
     j["fullscreen"] = p.fullscreen;
+    j["editor_presentation"] = p.editorPresentation;
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::PipelineStatistics& s) {
@@ -149,30 +164,64 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
 
     for (size_t i = startIdx; i < values.size(); ++i) {
         result.pathTraceMs += values[i].pathTraceMs;
+        result.restirHistoryClearMs += values[i].restirHistoryClearMs;
+        result.restirGiClearMs += values[i].restirGiClearMs;
         result.restirSpatialMs += values[i].restirSpatialMs;
+        result.restirSpatialCopyMs += values[i].restirSpatialCopyMs;
+        result.restirGiSpatialMs += values[i].restirGiSpatialMs;
+        result.restirGiFinalMs += values[i].restirGiFinalMs;
         result.fogIntegrateMs += values[i].fogIntegrateMs;
         result.atmosphereMs += values[i].atmosphereMs;
+        result.atmosphereTransmittanceMs += values[i].atmosphereTransmittanceMs;
+        result.atmosphereMultiScatterMs += values[i].atmosphereMultiScatterMs;
+        result.atmosphereSkyViewMs += values[i].atmosphereSkyViewMs;
+        result.atmosphereSkyReprojectMs += values[i].atmosphereSkyReprojectMs;
+        result.atmosphereSkyCdfMs += values[i].atmosphereSkyCdfMs;
+        result.atmosphereAerialPerspectiveMs += values[i].atmosphereAerialPerspectiveMs;
         result.denoiserMs += values[i].denoiserMs;
         result.historyCopyMs += values[i].historyCopyMs;
+        result.skipDenoiserCopyMs += values[i].skipDenoiserCopyMs;
         result.taaMs += values[i].taaMs;
+        result.taaHistoryCopyMs += values[i].taaHistoryCopyMs;
         result.autoExposureMs += values[i].autoExposureMs;
+        result.autoExposureHistogramClearMs += values[i].autoExposureHistogramClearMs;
+        result.autoExposureHistogramMs += values[i].autoExposureHistogramMs;
+        result.autoExposureReduceMs += values[i].autoExposureReduceMs;
         result.toneMapMs += values[i].toneMapMs;
         result.selectionOutlineMs += values[i].selectionOutlineMs;
         result.fullscreenMs += values[i].fullscreenMs;
+        result.editorPresentationMs += values[i].editorPresentationMs;
     }
 
     const float invCount = 1.0f / static_cast<float>(count);
     result.pathTraceMs *= invCount;
+    result.restirHistoryClearMs *= invCount;
+    result.restirGiClearMs *= invCount;
     result.restirSpatialMs *= invCount;
+    result.restirSpatialCopyMs *= invCount;
+    result.restirGiSpatialMs *= invCount;
+    result.restirGiFinalMs *= invCount;
     result.fogIntegrateMs *= invCount;
     result.atmosphereMs *= invCount;
+    result.atmosphereTransmittanceMs *= invCount;
+    result.atmosphereMultiScatterMs *= invCount;
+    result.atmosphereSkyViewMs *= invCount;
+    result.atmosphereSkyReprojectMs *= invCount;
+    result.atmosphereSkyCdfMs *= invCount;
+    result.atmosphereAerialPerspectiveMs *= invCount;
     result.denoiserMs *= invCount;
     result.historyCopyMs *= invCount;
+    result.skipDenoiserCopyMs *= invCount;
     result.taaMs *= invCount;
+    result.taaHistoryCopyMs *= invCount;
     result.autoExposureMs *= invCount;
+    result.autoExposureHistogramClearMs *= invCount;
+    result.autoExposureHistogramMs *= invCount;
+    result.autoExposureReduceMs *= invCount;
     result.toneMapMs *= invCount;
     result.selectionOutlineMs *= invCount;
     result.fullscreenMs *= invCount;
+    result.editorPresentationMs *= invCount;
     return result;
 }
 
@@ -259,17 +308,32 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
 
     const auto timings = averageGpuTimings(app.perFrameGpuTimings(), warmup);
     profileReport_.perPassGpuMs.pathTrace = timings.pathTraceMs;
+    profileReport_.perPassGpuMs.restirHistoryClear = timings.restirHistoryClearMs;
+    profileReport_.perPassGpuMs.restirGiClear = timings.restirGiClearMs;
     profileReport_.perPassGpuMs.restirSpatial = timings.restirSpatialMs;
+    profileReport_.perPassGpuMs.restirSpatialCopy = timings.restirSpatialCopyMs;
+    profileReport_.perPassGpuMs.restirGiSpatial = timings.restirGiSpatialMs;
+    profileReport_.perPassGpuMs.restirGiFinal = timings.restirGiFinalMs;
     profileReport_.perPassGpuMs.fogIntegrate = timings.fogIntegrateMs;
     profileReport_.perPassGpuMs.atmosphere = timings.atmosphereMs;
+    profileReport_.perPassGpuMs.atmosphereTransmittance = timings.atmosphereTransmittanceMs;
+    profileReport_.perPassGpuMs.atmosphereMultiScatter = timings.atmosphereMultiScatterMs;
+    profileReport_.perPassGpuMs.atmosphereSkyView = timings.atmosphereSkyViewMs;
+    profileReport_.perPassGpuMs.atmosphereSkyReproject = timings.atmosphereSkyReprojectMs;
+    profileReport_.perPassGpuMs.atmosphereSkyCdf = timings.atmosphereSkyCdfMs;
+    profileReport_.perPassGpuMs.atmosphereAerialPerspective = timings.atmosphereAerialPerspectiveMs;
     profileReport_.perPassGpuMs.denoiser = timings.denoiserMs;
     profileReport_.perPassGpuMs.historyCopy = timings.historyCopyMs;
+    profileReport_.perPassGpuMs.skipDenoiserCopy = timings.skipDenoiserCopyMs;
     profileReport_.perPassGpuMs.taa = timings.taaMs;
-    profileReport_.perPassGpuMs.autoExposureHistogram = timings.autoExposureMs * 0.67f;
-    profileReport_.perPassGpuMs.autoExposureReduce = timings.autoExposureMs * 0.33f;
+    profileReport_.perPassGpuMs.taaHistoryCopy = timings.taaHistoryCopyMs;
+    profileReport_.perPassGpuMs.autoExposureHistogramClear = timings.autoExposureHistogramClearMs;
+    profileReport_.perPassGpuMs.autoExposureHistogram = timings.autoExposureHistogramMs;
+    profileReport_.perPassGpuMs.autoExposureReduce = timings.autoExposureReduceMs;
     profileReport_.perPassGpuMs.toneMap = timings.toneMapMs;
     profileReport_.perPassGpuMs.selectionOutline = timings.selectionOutlineMs;
     profileReport_.perPassGpuMs.fullscreen = timings.fullscreenMs;
+    profileReport_.perPassGpuMs.editorPresentation = timings.editorPresentationMs;
 
     const auto& stats = renderer->pipelineStats();
     profileReport_.pipelineStatistics.rayInvocations = stats.rayInvocations;

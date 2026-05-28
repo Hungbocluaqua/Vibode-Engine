@@ -6,6 +6,7 @@
 #include "rtv/DescriptorAllocator.h"
 #include "rtv/DescriptorLayoutCache.h"
 #include "rtv/DescriptorWriter.h"
+#include "rtv/GpuProfiler.h"
 #include "rtv/Image.h"
 #include "rtv/ImageBarrier.h"
 #include "rtv/PipelineCache.h"
@@ -54,7 +55,10 @@ AtmosphereSamplingSystem::AtmosphereSamplingSystem(
 
 AtmosphereSamplingSystem::~AtmosphereSamplingSystem() = default;
 
-void AtmosphereSamplingSystem::record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereSamplingSystem::record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyCdfStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
     DescriptorSet set = descriptors.allocate(setLayout_);
     DescriptorWriter()
         .writeImage(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, skyViewLut_.sampledDescriptor(VK_NULL_HANDLE))
@@ -76,6 +80,9 @@ void AtmosphereSamplingSystem::record(VkCommandBuffer commandBuffer, DescriptorA
     pipeline_->dispatch(commandBuffer, 1, 1, 1, 1);
 
     ready_ = true;
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyCdfEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
 } // namespace rtv

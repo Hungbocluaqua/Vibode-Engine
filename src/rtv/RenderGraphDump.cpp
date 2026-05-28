@@ -45,16 +45,26 @@ const char* queueNameForDomain(PipelineDomain domain) {
 
 float timingForPassName(const GpuFrameTimings& timings, const std::string& name) {
     if (name.find("path_trace") == 0) return timings.pathTraceMs;
+    if (name.find("restir_history_clear") == 0) return timings.restirHistoryClearMs;
+    if (name.find("restir_gi_clear") == 0) return timings.restirGiClearMs;
+    if (name.find("restir_spatial_copy") == 0) return timings.restirSpatialCopyMs;
     if (name.find("restir_spatial") == 0) return timings.restirSpatialMs;
+    if (name.find("restir_gi_spatial") == 0) return timings.restirGiSpatialMs;
+    if (name.find("restir_gi_final") == 0) return timings.restirGiFinalMs;
     if (name.find("fog") == 0) return timings.fogIntegrateMs;
     if (name.find("atmosphere") == 0) return timings.atmosphereMs;
-    if (name.find("denoiser") == 0) return timings.denoiserMs;
+    if (name.find("temporal_denoiser") == 0) return timings.denoiserMs;
+    if (name.find("skip_denoiser_copy") == 0) return timings.skipDenoiserCopyMs;
     if (name.find("history_copy") == 0) return timings.historyCopyMs;
+    if (name.find("taa_history_copy") == 0) return timings.taaHistoryCopyMs;
     if (name.find("taa") == 0) return timings.taaMs;
-    if (name.find("auto_exposure") == 0) return timings.autoExposureMs;
+    if (name.find("auto_exposure_histogram_clear") == 0) return timings.autoExposureHistogramClearMs;
+    if (name.find("auto_exposure_histogram") == 0) return timings.autoExposureHistogramMs;
+    if (name.find("auto_exposure_reduce") == 0) return timings.autoExposureReduceMs;
     if (name.find("tone_map") == 0) return timings.toneMapMs;
     if (name.find("selection_outline") == 0) return timings.selectionOutlineMs;
     if (name.find("fullscreen") == 0) return timings.fullscreenMs;
+    if (name.find("editor_presentation") == 0) return timings.editorPresentationMs;
     return 0.0f;
 }
 

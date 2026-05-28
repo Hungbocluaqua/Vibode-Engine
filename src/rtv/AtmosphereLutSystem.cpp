@@ -5,6 +5,7 @@
 #include "rtv/DescriptorAllocator.h"
 #include "rtv/DescriptorLayoutCache.h"
 #include "rtv/DescriptorWriter.h"
+#include "rtv/GpuProfiler.h"
 #include "rtv/ImageBarrier.h"
 #include "rtv/PipelineCache.h"
 #include "rtv/ResourceAllocator.h"
@@ -243,17 +244,20 @@ void AtmosphereLutSystem::markGenerated(LutNode node) {
     ++stats_.generationCounts[index];
 }
 
-void AtmosphereLutSystem::record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     std::fill(stats_.generatedThisRecord.begin(), stats_.generatedThisRecord.end(), false);
-    recordTransmittance(commandBuffer, descriptors);
-    recordMultiScatter(commandBuffer, descriptors);
-    recordSkyView(commandBuffer, descriptors);
-    recordAerialPerspective(commandBuffer, descriptors);
+    recordTransmittance(commandBuffer, descriptors, profiler);
+    recordMultiScatter(commandBuffer, descriptors, profiler);
+    recordSkyView(commandBuffer, descriptors, profiler);
+    recordAerialPerspective(commandBuffer, descriptors, profiler);
 }
 
-void AtmosphereLutSystem::recordTransmittance(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordTransmittance(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (!isDirty(LutNode::Transmittance) || transmittancePipeline_ == nullptr || transmittanceLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereTransmittanceStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
@@ -294,11 +298,17 @@ void AtmosphereLutSystem::recordTransmittance(VkCommandBuffer commandBuffer, Des
     clearDirty(LutNode::Transmittance);
     markGenerated(LutNode::Transmittance);
     transmittanceReady_ = true;
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereTransmittanceEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
-void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (!isDirty(LutNode::MultiScatter) || !transmittanceReady_ || multiScatterPipeline_ == nullptr || multiScatterLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereMultiScatterStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
@@ -359,11 +369,17 @@ void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, Desc
     clearDirty(LutNode::MultiScatter);
     markGenerated(LutNode::MultiScatter);
     multiScatterReady_ = true;
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereMultiScatterEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
-void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (!isDirty(LutNode::SkyView) || !transmittanceReady_ || !multiScatterReady_ || skyViewPipeline_ == nullptr || rawSkyViewLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyViewStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
@@ -422,18 +438,24 @@ void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, Descripto
         .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
     });
     rawSkyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    recordSkyViewReproject(commandBuffer, descriptors);
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyViewEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
+    recordSkyViewReproject(commandBuffer, descriptors, profiler);
     if (samplingSystem_ != nullptr) {
-        samplingSystem_->record(commandBuffer, descriptors);
+        samplingSystem_->record(commandBuffer, descriptors, profiler);
     }
     clearDirty(LutNode::SkyView);
     markGenerated(LutNode::SkyView);
     skyViewReady_ = true;
 }
 
-void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (skyReprojectPipeline_ == nullptr || skyViewLut_.handle() == VK_NULL_HANDLE || rawSkyViewLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyReprojectStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     if (previousSkyViewReady_) {
@@ -532,11 +554,17 @@ void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, 
         .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
     });
     skyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyReprojectEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
-void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (!isDirty(LutNode::AerialPerspective) || !transmittanceReady_ || !skyViewReady_ || aerialPerspectivePipeline_ == nullptr || aerialPerspectiveLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereAerialPerspectiveStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
@@ -600,6 +628,9 @@ void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer,
     aerialPerspectiveLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     clearDirty(LutNode::AerialPerspective);
     markGenerated(LutNode::AerialPerspective);
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereAerialPerspectiveEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
 } // namespace rtv

@@ -14,6 +14,7 @@ class Buffer;
 class ComputePipeline;
 class DescriptorAllocator;
 class DescriptorLayoutCache;
+class GpuProfiler;
 class PipelineCache;
 class ResourceAllocator;
 class ShaderModule;
@@ -30,7 +31,7 @@ public:
         VkSampler skySampler);
     ~AtmosphereSamplingSystem();
 
-    void record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
+    void record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler = nullptr);
 
     [[nodiscard]] const Buffer& cdfRows() const { return *cdfRows_; }
     [[nodiscard]] const Buffer& cdfCols() const { return *cdfCols_; }

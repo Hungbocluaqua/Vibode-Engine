@@ -402,9 +402,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 showGrid_ = !showGrid_;
             }
         }
-        const float gpuTotal = timings.pathTraceMs + timings.denoiserMs + timings.historyCopyMs +
-            timings.taaMs + timings.autoExposureMs + timings.toneMapMs + timings.selectionOutlineMs +
-            timings.fullscreenMs;
+        const float gpuTotal = timings.totalMs();
         const ImU32 perfColor = gpuTotal < 16.0f ? IM_COL32(120, 220, 120, 255)
                               : gpuTotal < 33.0f ? IM_COL32(240, 220, 100, 255)
                               : IM_COL32(240, 100, 100, 255);

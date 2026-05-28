@@ -19,27 +19,23 @@ void GpuDiagnosticsPanel::draw(const EditorRuntimeState& state) {
     constexpr double mb = 1024.0 * 1024.0;
 
     ImGui::SeparatorText("Frame Timing");
-    const float gpuMs =
-        timings.pathTraceMs +
-        timings.restirSpatialMs +
-        timings.fogIntegrateMs +
-        timings.atmosphereMs +
-        timings.denoiserMs +
-        timings.historyCopyMs +
-        timings.taaMs +
-        timings.autoExposureMs +
-        timings.toneMapMs +
-        timings.selectionOutlineMs +
-        timings.fullscreenMs;
+    const float gpuMs = timings.totalMs();
 
     ImGui::Text("Total GPU:     %.2f ms", gpuMs);
     ImGui::Text("Atmosphere:    %.2f ms", timings.atmosphereMs);
+    ImGui::Text("  Atmos LUTs:  %.2f / %.2f / %.2f / %.2f / %.2f / %.2f ms",
+        timings.atmosphereTransmittanceMs,
+        timings.atmosphereMultiScatterMs,
+        timings.atmosphereSkyViewMs,
+        timings.atmosphereSkyReprojectMs,
+        timings.atmosphereSkyCdfMs,
+        timings.atmosphereAerialPerspectiveMs);
     ImGui::Text("Path trace:    %.2f ms", timings.pathTraceMs);
-    ImGui::Text("ReSTIR:        %.2f ms", timings.restirSpatialMs);
+    ImGui::Text("ReSTIR:        %.2f ms", timings.restirSpatialMs + timings.restirSpatialCopyMs + timings.restirGiSpatialMs + timings.restirGiFinalMs);
     ImGui::Text("Fog:           %.2f ms", timings.fogIntegrateMs);
     ImGui::Text("Denoiser:      %.2f ms", timings.denoiserMs);
-    ImGui::Text("History copy:  %.2f ms", timings.historyCopyMs);
-    ImGui::Text("TAA:           %.2f ms", timings.taaMs);
+    ImGui::Text("History copy:  %.2f ms", timings.historyCopyMs + timings.skipDenoiserCopyMs);
+    ImGui::Text("TAA:           %.2f ms", timings.taaMs + timings.taaHistoryCopyMs);
     ImGui::Text("Auto exposure: %.2f ms", timings.autoExposureMs);
     ImGui::Text("Tone map:      %.2f ms", timings.toneMapMs);
     ImGui::Text("Selection:     %.2f ms", timings.selectionOutlineMs);

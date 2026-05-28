@@ -61,32 +61,38 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     }
 
     const GpuFrameTimings& timings = state.renderer.timings();
-    const float gpuMs =
-        timings.pathTraceMs +
-        timings.restirSpatialMs +
-        timings.fogIntegrateMs +
-        timings.atmosphereMs +
-        timings.denoiserMs +
-        timings.historyCopyMs +
-        timings.taaMs +
-        timings.autoExposureMs +
-        timings.toneMapMs +
-        timings.selectionOutlineMs +
-        timings.fullscreenMs;
+    const float gpuMs = timings.totalMs();
     ImGui::Text("FPS: %.1f", state.cpuFrameMs > 0.0f ? 1000.0f / state.cpuFrameMs : 0.0f);
     ImGui::Text("CPU frame time: %.2f ms", state.cpuFrameMs);
     ImGui::Text("GPU frame time: %.2f ms", gpuMs);
     ImGui::Text("Atmosphere: %.2f ms", timings.atmosphereMs);
+    ImGui::Text("  Transmittance LUT: %.2f ms", timings.atmosphereTransmittanceMs);
+    ImGui::Text("  Multi-scatter LUT: %.2f ms", timings.atmosphereMultiScatterMs);
+    ImGui::Text("  Sky-view LUT: %.2f ms", timings.atmosphereSkyViewMs);
+    ImGui::Text("  Sky reproject: %.2f ms", timings.atmosphereSkyReprojectMs);
+    ImGui::Text("  Sky CDF: %.2f ms", timings.atmosphereSkyCdfMs);
+    ImGui::Text("  Aerial perspective LUT: %.2f ms", timings.atmosphereAerialPerspectiveMs);
     ImGui::Text("Path trace: %.2f ms", timings.pathTraceMs);
+    ImGui::Text("ReSTIR history clear: %.2f ms", timings.restirHistoryClearMs);
+    ImGui::Text("ReSTIR GI clear: %.2f ms", timings.restirGiClearMs);
     ImGui::Text("ReSTIR spatial: %.2f ms", timings.restirSpatialMs);
+    ImGui::Text("ReSTIR spatial copy: %.2f ms", timings.restirSpatialCopyMs);
+    ImGui::Text("ReSTIR GI spatial: %.2f ms", timings.restirGiSpatialMs);
+    ImGui::Text("ReSTIR GI final: %.2f ms", timings.restirGiFinalMs);
     ImGui::Text("Fog integrate: %.2f ms", timings.fogIntegrateMs);
     ImGui::Text("Denoiser: %.2f ms", timings.denoiserMs);
     ImGui::Text("History copy: %.2f ms", timings.historyCopyMs);
+    ImGui::Text("Denoiser bypass copy: %.2f ms", timings.skipDenoiserCopyMs);
     ImGui::Text("TAA: %.2f ms", timings.taaMs);
+    ImGui::Text("TAA history copy: %.2f ms", timings.taaHistoryCopyMs);
     ImGui::Text("Auto exposure: %.2f ms", timings.autoExposureMs);
+    ImGui::Text("  Histogram clear: %.2f ms", timings.autoExposureHistogramClearMs);
+    ImGui::Text("  Histogram: %.2f ms", timings.autoExposureHistogramMs);
+    ImGui::Text("  Reduce: %.2f ms", timings.autoExposureReduceMs);
     ImGui::Text("Tone map: %.2f ms", timings.toneMapMs);
     ImGui::Text("Selection outline: %.2f ms", timings.selectionOutlineMs);
-    ImGui::Text("Presentation: %.2f ms", timings.fullscreenMs);
+    ImGui::Text("Fullscreen presentation: %.2f ms", timings.fullscreenMs);
+    ImGui::Text("Editor presentation: %.2f ms", timings.editorPresentationMs);
     ImGui::Text("Sample count: %u", state.renderer.sampleCount());
     ImGui::Text("Last reset: %s", accumulationResetReasonName(state.renderer.lastAccumulationResetReason()));
 
