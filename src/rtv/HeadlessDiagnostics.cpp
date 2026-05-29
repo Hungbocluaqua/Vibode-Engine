@@ -272,6 +272,12 @@ std::string sanitizeSceneName(std::string name) {
     return name;
 }
 
+std::string sequenceFrameFileName(uint32_t frameIndex) {
+    std::ostringstream stream;
+    stream << "frame_" << std::setw(4) << std::setfill('0') << frameIndex << ".png";
+    return stream.str();
+}
+
 } // namespace
 
 HeadlessDiagnostics::HeadlessDiagnostics(const HeadlessDiagnosticsConfig& config)
@@ -480,6 +486,87 @@ void HeadlessDiagnostics::exportDebugViews(Application& app, const std::filesyst
     std::cout << "Exported " << exported.size() << " debug views to " << dir.string() << "\n";
 }
 
+void HeadlessDiagnostics::exportFrameSequence(Application& app, const std::filesystem::path& dir) {
+    if (!config_.saveFrameSequenceDir.has_value()) return;
+
+    auto* renderer = app.pathTracer();
+    auto* allocator = app.resourceAllocator();
+    auto* context = app.vulkanContext();
+    if (!renderer || !allocator || !context) return;
+
+    std::filesystem::create_directories(dir);
+
+    DiagnosticImageExport exporter(*context, *allocator);
+    VkExtent2D displayExtent = renderer->displayExtent();
+    if (!exporter.initialize(VK_FORMAT_R8G8B8A8_UNORM, displayExtent)) {
+        std::cerr << "Warning: Failed to initialize frame sequence export\n";
+        return;
+    }
+
+    std::vector<RendererDebugView> views = config_.sequenceViews;
+    if (views.empty()) {
+        views.push_back(RendererDebugView::Beauty);
+    }
+
+    const uint32_t warmupFrames = config_.warmupFrames;
+    const uint32_t step = std::max(1u, config_.sequenceStep);
+    const uint32_t profiledFrames = config_.totalFrames > warmupFrames
+        ? config_.totalFrames - warmupFrames
+        : config_.totalFrames;
+    const uint32_t framesToExport = config_.sequenceFrameCount.value_or(std::max(1u, profiledFrames));
+
+    nlohmann::json manifest;
+    manifest["views"] = nlohmann::json::array();
+    manifest["warmup_frames"] = warmupFrames;
+    manifest["sequence_start_frame"] = config_.sequenceStartFrame;
+    manifest["sequence_frame_count"] = framesToExport;
+    manifest["sequence_step"] = step;
+    manifest["resolution"] = { {"width", displayExtent.width}, {"height", displayExtent.height} };
+    manifest["frames"] = nlohmann::json::object();
+
+    for (RendererDebugView view : views) {
+        const std::string viewName = rendererDebugViewName(view);
+        const std::filesystem::path viewDir = dir / viewName;
+        std::filesystem::create_directories(viewDir);
+        manifest["views"].push_back(viewName);
+        manifest["frames"][viewName] = nlohmann::json::array();
+
+        std::cout << "Exporting frame sequence view: " << viewName << "...\n";
+        app.applyDebugView(view);
+        app.resetDiagnosticFrameCounter(0);
+        if (warmupFrames > 0u) {
+            app.renderFrames(warmupFrames);
+        }
+        if (config_.sequenceStartFrame > 0u) {
+            app.renderFrames(config_.sequenceStartFrame);
+        }
+
+        uint32_t sequenceFrame = config_.sequenceStartFrame;
+        for (uint32_t exported = 0; exported < framesToExport; ++exported) {
+            app.renderFrames(1);
+            const std::string fileName = sequenceFrameFileName(sequenceFrame);
+            const std::filesystem::path outputPath = viewDir / fileName;
+            if (exporter.exportView(*renderer, view, outputPath, 0)) {
+                manifest["frames"][viewName].push_back(fileName);
+            } else {
+                std::cerr << "Warning: Failed to export sequence frame " << fileName
+                          << " for view " << viewName << "\n";
+            }
+            if (step > 1u && exported + 1u < framesToExport) {
+                app.renderFrames(step - 1u);
+            }
+            sequenceFrame += step;
+        }
+    }
+
+    std::ofstream file(dir / "sequence_manifest.json");
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open sequence manifest: " + (dir / "sequence_manifest.json").string());
+    }
+    file << manifest.dump(2);
+    std::cout << "Exported frame sequence to " << dir.string() << "\n";
+}
+
 void HeadlessDiagnostics::makeDebugPackage(Application& app, const std::filesystem::path& dir, const std::filesystem::path& scenePath) {
     if (!std::filesystem::exists(dir)) { std::filesystem::create_directories(dir); }
 
@@ -494,6 +581,13 @@ void HeadlessDiagnostics::makeDebugPackage(Application& app, const std::filesyst
     if (config_.saveDebugViewsDir.has_value() && std::filesystem::exists(*config_.saveDebugViewsDir)) {
         try {
             std::filesystem::copy(*config_.saveDebugViewsDir, dir / "debug_views",
+                std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
+        } catch (...) {}
+    }
+
+    if (config_.saveFrameSequenceDir.has_value() && std::filesystem::exists(*config_.saveFrameSequenceDir)) {
+        try {
+            std::filesystem::copy(*config_.saveFrameSequenceDir, dir / "frame_sequence",
                 std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
         } catch (...) {}
     }

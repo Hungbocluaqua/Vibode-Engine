@@ -19,12 +19,49 @@ struct ImageDiffMetrics {
     double changedPixelPercentage = 0.0;
 };
 
+struct SequenceMetricSummary {
+    uint32_t frameCount = 0;
+    double averageMse = 0.0;
+    double maxMse = 0.0;
+    double averagePsnr = 0.0;
+    double worstPsnr = 99.0;
+    double averageSsim = 1.0;
+    double bestSsim = 1.0;
+    double worstSsim = 1.0;
+    double averageChangedPixelPercentage = 0.0;
+    double maxChangedPixelPercentage = 0.0;
+    uint32_t worstFrame = 0;
+};
+
+struct SequenceTemporalMetrics {
+    uint32_t pairCount = 0;
+    double averageFrameDeltaMse = 0.0;
+    double maxFrameDeltaMse = 0.0;
+    double averageFrameDeltaChangedPixelPercentage = 0.0;
+    double maxFrameDeltaChangedPixelPercentage = 0.0;
+    double temporalVarianceScore = 0.0;
+    uint32_t worstPairStartFrame = 0;
+};
+
+struct SequenceViewComparison {
+    std::string view;
+    SequenceMetricSummary baselineVsCurrent;
+    SequenceTemporalMetrics baselineTemporal;
+    SequenceTemporalMetrics currentTemporal;
+};
+
+struct SequenceComparisonReport {
+    std::vector<SequenceViewComparison> views;
+    std::vector<std::string> warnings;
+};
+
 struct BaselinePaths {
     std::filesystem::path root;
     std::filesystem::path caseDir;
     std::filesystem::path profile;
     std::filesystem::path renderGraph;
     std::filesystem::path beautyImage;
+    std::filesystem::path frameSequence;
 };
 
 [[nodiscard]] int compareProfileCommand(
@@ -36,10 +73,22 @@ struct BaselinePaths {
     const std::filesystem::path& currentPath,
     const std::optional<std::filesystem::path>& diffOutputPath);
 
+[[nodiscard]] int compareImageSequenceCommand(
+    const std::filesystem::path& baselineDir,
+    const std::filesystem::path& currentDir,
+    const std::optional<std::filesystem::path>& outputDir,
+    const std::vector<std::string>& requestedViews);
+
 [[nodiscard]] ImageDiffMetrics compareImages(
     const std::filesystem::path& baselinePath,
     const std::filesystem::path& currentPath,
     const std::optional<std::filesystem::path>& diffOutputPath);
+
+[[nodiscard]] SequenceComparisonReport compareImageSequences(
+    const std::filesystem::path& baselineDir,
+    const std::filesystem::path& currentDir,
+    const std::optional<std::filesystem::path>& outputDir,
+    const std::vector<std::string>& requestedViews);
 
 [[nodiscard]] BaselinePaths baselinePathsFor(
     const std::filesystem::path& scenePath,
@@ -49,7 +98,8 @@ void updateBaseline(
     const BaselinePaths& paths,
     const std::filesystem::path& profilePath,
     const std::filesystem::path& renderGraphPath,
-    const std::filesystem::path& debugViewsDir);
+    const std::filesystem::path& debugViewsDir,
+    const std::optional<std::filesystem::path>& frameSequenceDir = std::nullopt);
 
 [[nodiscard]] int checkBaseline(
     const BaselinePaths& paths,

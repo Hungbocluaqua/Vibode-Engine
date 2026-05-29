@@ -17,6 +17,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -64,6 +65,8 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> compareProfileNewPath;
         std::optional<std::filesystem::path> compareImageBaselinePath;
         std::optional<std::filesystem::path> compareImageCurrentPath;
+        std::optional<std::filesystem::path> compareImageSequenceBaselinePath;
+        std::optional<std::filesystem::path> compareImageSequenceCurrentPath;
         std::optional<std::filesystem::path> compareImageOutputPath;
         bool updateBaseline = false;
         bool checkBaseline = false;
@@ -80,6 +83,25 @@ int main(int argc, char** argv) {
         std::optional<std::string> cameraName;
         std::optional<uint32_t> frameIndex;
         std::vector<std::string> disabledPasses;
+        std::vector<std::string> sequenceViewNames;
+
+        auto splitCsv = [](std::string_view value) {
+            std::vector<std::string> result;
+            std::stringstream stream{std::string(value)};
+            std::string item;
+            while (std::getline(stream, item, ',')) {
+                item.erase(item.begin(), std::find_if(item.begin(), item.end(), [](unsigned char ch) {
+                    return !std::isspace(ch);
+                }));
+                item.erase(std::find_if(item.rbegin(), item.rend(), [](unsigned char ch) {
+                    return !std::isspace(ch);
+                }).base(), item.end());
+                if (!item.empty()) {
+                    result.push_back(item);
+                }
+            }
+            return result;
+        };
 
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
@@ -92,6 +114,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--compare-image" && i + 2 < argc) {
                 compareImageBaselinePath = std::filesystem::path(argv[++i]);
                 compareImageCurrentPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--compare-image-sequence" && i + 2 < argc) {
+                compareImageSequenceBaselinePath = std::filesystem::path(argv[++i]);
+                compareImageSequenceCurrentPath = std::filesystem::path(argv[++i]);
             } else if (arg == "--out" && i + 1 < argc) {
                 compareImageOutputPath = std::filesystem::path(argv[++i]);
             } else if (arg == "--debug-view" && i + 1 < argc) {
@@ -136,6 +161,16 @@ int main(int argc, char** argv) {
                 dotOutputPath = std::filesystem::path(argv[++i]);
             } else if (arg == "--save-debug-views" && i + 1 < argc) {
                 diagConfig.saveDebugViewsDir = std::filesystem::path(argv[++i]);
+            } else if (arg == "--save-frame-sequence" && i + 1 < argc) {
+                diagConfig.saveFrameSequenceDir = std::filesystem::path(argv[++i]);
+            } else if (arg == "--sequence-views" && i + 1 < argc) {
+                sequenceViewNames = splitCsv(argv[++i]);
+            } else if (arg == "--sequence-start-frame" && i + 1 < argc) {
+                diagConfig.sequenceStartFrame = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if (arg == "--sequence-frame-count" && i + 1 < argc) {
+                diagConfig.sequenceFrameCount = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if (arg == "--sequence-step" && i + 1 < argc) {
+                diagConfig.sequenceStep = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
             } else if (arg == "--capture-renderdoc" && i + 1 < argc) {
                 diagConfig.captureRenderDocPath = std::filesystem::path(argv[++i]);
             } else if (arg == "--capture-frame" && i + 1 < argc) {
@@ -197,6 +232,20 @@ int main(int argc, char** argv) {
             }
             return rtv::compareImageCommand(*compareImageBaselinePath, *compareImageCurrentPath, compareImageOutputPath);
         }
+        if (compareImageSequenceBaselinePath.has_value() || compareImageSequenceCurrentPath.has_value()) {
+            if (!compareImageSequenceBaselinePath.has_value() || !compareImageSequenceCurrentPath.has_value()) {
+                throw std::runtime_error("--compare-image-sequence requires baseline_dir and current_dir");
+            }
+            return rtv::compareImageSequenceCommand(
+                *compareImageSequenceBaselinePath,
+                *compareImageSequenceCurrentPath,
+                compareImageOutputPath,
+                sequenceViewNames);
+        }
+
+        for (const std::string& viewName : sequenceViewNames) {
+            diagConfig.sequenceViews.push_back(rtv::parseRendererDebugView(viewName));
+        }
 
         if (diagConfig.headless && maxFrames == 0) {
             maxFrames = diagConfig.totalFrames;
@@ -247,12 +296,21 @@ int main(int argc, char** argv) {
         if (shaderHotReloadReport && !dumpShaderReportPath.has_value()) {
             dumpShaderReportPath = artifactBase / "shader_hot_reload_report.json";
         }
+        if (checkBaseline) {
+            const rtv::BaselinePaths paths = rtv::baselinePathsFor(scenePath.value_or("scene"), baselineRoot);
+            if (std::filesystem::exists(paths.frameSequence) && !diagConfig.saveFrameSequenceDir.has_value()) {
+                diagConfig.saveFrameSequenceDir = artifactBase / "frame_sequence";
+            }
+        }
         if (frameIndex.has_value() && !diagConfig.fixedSeed.has_value()) {
             diagConfig.fixedSeed = *frameIndex;
         }
 
         if (diagConfig.headless && !scenePath.has_value()) {
             throw std::runtime_error("--headless requires --scene <path>");
+        }
+        if (diagConfig.saveFrameSequenceDir.has_value() && !diagConfig.headless) {
+            throw std::runtime_error("--save-frame-sequence requires --headless");
         }
 
         rtv::Application app(debugView, gltfPath, hdrPath, scenePath,
@@ -370,6 +428,7 @@ int main(int argc, char** argv) {
 #endif
 
         if (diagConfig.profile || diagConfig.saveDebugViewsDir.has_value() ||
+            diagConfig.saveFrameSequenceDir.has_value() ||
             diagConfig.dumpRenderGraphPath.has_value() || diagConfig.makeDebugPackageDir.has_value() ||
             dumpMemoryPath.has_value() || dumpFrameTimelinePath.has_value() ||
             dumpResourceLifetimesPath.has_value() || dumpBindingsPath.has_value() ||
@@ -382,6 +441,9 @@ int main(int argc, char** argv) {
             }
             if (diagConfig.saveDebugViewsDir.has_value()) {
                 diag.exportDebugViews(app, *diagConfig.saveDebugViewsDir);
+            }
+            if (diagConfig.saveFrameSequenceDir.has_value()) {
+                diag.exportFrameSequence(app, *diagConfig.saveFrameSequenceDir);
             }
             if (diagConfig.makeDebugPackageDir.has_value()) {
                 const std::filesystem::path scnPath = scenePath.value_or("");
@@ -430,7 +492,8 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Baseline mode requires profile, render graph, and debug view artifacts");
             }
             if (updateBaseline) {
-                rtv::updateBaseline(paths, *diagConfig.profileJsonPath, *diagConfig.dumpRenderGraphPath, *diagConfig.saveDebugViewsDir);
+                rtv::updateBaseline(paths, *diagConfig.profileJsonPath, *diagConfig.dumpRenderGraphPath,
+                    *diagConfig.saveDebugViewsDir, diagConfig.saveFrameSequenceDir);
             }
             if (checkBaseline) {
                 finalExitCode = std::max(finalExitCode,

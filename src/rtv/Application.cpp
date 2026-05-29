@@ -391,6 +391,7 @@ void Application::run(uint32_t maxFrames) {
 void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
     warmupFrameCount_ = warmupFrames;
     totalFrameCount_ = totalFrames;
+    nextDiagnosticFrameIndex_ = 0;
     cpuFrameTimings_.clear();
     gpuFrameTimings_.clear();
     perFrameGpuTimings_.clear();
@@ -408,6 +409,7 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
         const float rawDeltaSeconds = 1.0f / 60.0f;
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
+        applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
         if (beginFrameCapture_) {
             beginFrameCapture_(frameCount + 1u);
         }
@@ -436,6 +438,7 @@ void Application::renderFrames(uint32_t count) {
         const float rawDeltaSeconds = 1.0f / 60.0f;
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
+        applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
         if (beginFrameCapture_) {
             beginFrameCapture_(i + 1u);
         }
@@ -446,6 +449,10 @@ void Application::renderFrames(uint32_t count) {
         seconds += deltaSeconds;
     }
     commandSystem_->waitIdle();
+}
+
+void Application::resetDiagnosticFrameCounter(uint32_t frameIndex) {
+    nextDiagnosticFrameIndex_ = frameIndex;
 }
 
 void Application::setFrameCaptureCallbacks(std::function<void(uint32_t)> begin, std::function<void(uint32_t)> end) {

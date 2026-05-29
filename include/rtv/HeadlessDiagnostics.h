@@ -27,6 +27,11 @@ struct HeadlessDiagnosticsConfig {
     std::optional<std::filesystem::path> profileJsonPath;
     std::optional<std::filesystem::path> dumpRenderGraphPath;
     std::optional<std::filesystem::path> saveDebugViewsDir;
+    std::optional<std::filesystem::path> saveFrameSequenceDir;
+    std::vector<RendererDebugView> sequenceViews;
+    uint32_t sequenceStartFrame = 0;
+    std::optional<uint32_t> sequenceFrameCount;
+    uint32_t sequenceStep = 1;
     std::optional<std::filesystem::path> captureRenderDocPath;
     uint32_t captureFrame = 60;
     std::optional<std::filesystem::path> makeDebugPackageDir;
@@ -144,6 +149,7 @@ public:
     void writeProfileJson(const std::filesystem::path& path) const;
     void writeRenderGraphJson(const std::filesystem::path& path);
     void exportDebugViews(Application& app, const std::filesystem::path& dir);
+    void exportFrameSequence(Application& app, const std::filesystem::path& dir);
     void makeDebugPackage(Application& app, const std::filesystem::path& dir, const std::filesystem::path& scenePath);
     ValidationSuiteSummary runValidationSuite();
 

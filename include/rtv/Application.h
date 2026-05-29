@@ -55,6 +55,7 @@ public:
     void run(uint32_t maxFrames = 0);
     void runHeadless(uint32_t warmupFrames, uint32_t totalFrames);
     void renderFrames(uint32_t count);
+    void resetDiagnosticFrameCounter(uint32_t frameIndex = 0);
     void setFrameCaptureCallbacks(std::function<void(uint32_t)> begin, std::function<void(uint32_t)> end);
     void resetAccumulation();
     void applyDebugView(RendererDebugView view);
@@ -133,6 +134,7 @@ private:
 
     GLFWwindow* window_ = nullptr;
     bool headless_ = false;
+    uint32_t nextDiagnosticFrameIndex_ = 0;
     uint32_t warmupFrameCount_ = 0;
     uint32_t totalFrameCount_ = 0;
     std::vector<float> cpuFrameTimings_;

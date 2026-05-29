@@ -8,14 +8,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <set>
 #include <unordered_map>
 
 namespace rtv {
@@ -187,6 +190,275 @@ json imageMetricsJson(const ImageDiffMetrics& metrics) {
     };
 }
 
+json sequenceMetricSummaryJson(const SequenceMetricSummary& metrics) {
+    return {
+        {"frame_count", metrics.frameCount},
+        {"average_mse", metrics.averageMse},
+        {"max_mse", metrics.maxMse},
+        {"average_psnr", metrics.averagePsnr},
+        {"worst_psnr", metrics.worstPsnr},
+        {"average_ssim", metrics.averageSsim},
+        {"best_ssim", metrics.bestSsim},
+        {"worst_ssim", metrics.worstSsim},
+        {"average_changed_pixel_percentage", metrics.averageChangedPixelPercentage},
+        {"max_changed_pixel_percentage", metrics.maxChangedPixelPercentage},
+        {"worst_frame", metrics.worstFrame},
+    };
+}
+
+json sequenceTemporalMetricsJson(const SequenceTemporalMetrics& metrics) {
+    return {
+        {"pair_count", metrics.pairCount},
+        {"average_frame_delta_mse", metrics.averageFrameDeltaMse},
+        {"max_frame_delta_mse", metrics.maxFrameDeltaMse},
+        {"average_frame_delta_changed_pixel_percentage", metrics.averageFrameDeltaChangedPixelPercentage},
+        {"max_frame_delta_changed_pixel_percentage", metrics.maxFrameDeltaChangedPixelPercentage},
+        {"temporal_variance_score", metrics.temporalVarianceScore},
+        {"worst_pair_start_frame", metrics.worstPairStartFrame},
+    };
+}
+
+struct SequenceFrameSample {
+    std::string fileName;
+    uint32_t frameIndex = 0;
+    ImageDiffMetrics metrics{};
+};
+
+struct InternalSequenceViewComparison {
+    SequenceViewComparison summary;
+    std::vector<SequenceFrameSample> perFrame;
+};
+
+uint32_t frameIndexFromName(const std::string& name, uint32_t fallback) {
+    const size_t dot = name.find_last_of('.');
+    const size_t end = dot == std::string::npos ? name.size() : dot;
+    size_t begin = end;
+    while (begin > 0 && std::isdigit(static_cast<unsigned char>(name[begin - 1u]))) {
+        --begin;
+    }
+    if (begin == end) {
+        return fallback;
+    }
+    return static_cast<uint32_t>(std::stoul(name.substr(begin, end - begin)));
+}
+
+std::string sequenceFrameFileName(uint32_t frameIndex) {
+    std::ostringstream stream;
+    stream << "frame_" << std::setw(4) << std::setfill('0') << frameIndex << ".png";
+    return stream.str();
+}
+
+std::vector<std::string> pngNamesInDir(const std::filesystem::path& dir) {
+    std::vector<std::string> names;
+    if (!std::filesystem::exists(dir)) {
+        return names;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().extension() == ".png") {
+            names.push_back(entry.path().filename().string());
+        }
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::vector<std::string> viewNamesInSequenceDir(const std::filesystem::path& dir) {
+    std::vector<std::string> views;
+    const auto manifestPath = dir / "sequence_manifest.json";
+    if (std::filesystem::exists(manifestPath)) {
+        const json manifest = readJsonFile(manifestPath);
+        for (const auto& view : manifest.value("views", json::array())) {
+            views.push_back(view.get<std::string>());
+        }
+    }
+    if (views.empty() && std::filesystem::exists(dir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            if (entry.is_directory()) {
+                views.push_back(entry.path().filename().string());
+            }
+        }
+    }
+    std::sort(views.begin(), views.end());
+    views.erase(std::unique(views.begin(), views.end()), views.end());
+    return views;
+}
+
+std::vector<std::string> selectedSequenceViews(
+    const std::filesystem::path& baselineDir,
+    const std::filesystem::path& currentDir,
+    const std::vector<std::string>& requestedViews,
+    std::vector<std::string>& warnings) {
+    if (!requestedViews.empty()) {
+        return requestedViews;
+    }
+    std::vector<std::string> baselineViews = viewNamesInSequenceDir(baselineDir);
+    std::vector<std::string> currentViews = viewNamesInSequenceDir(currentDir);
+    std::vector<std::string> common;
+    std::set_intersection(
+        baselineViews.begin(), baselineViews.end(),
+        currentViews.begin(), currentViews.end(),
+        std::back_inserter(common));
+    if (common.empty()) {
+        warnings.push_back("No common sequence views found in baseline and current directories");
+    }
+    return common;
+}
+
+SequenceMetricSummary summarizeFrameSamples(const std::vector<SequenceFrameSample>& samples) {
+    SequenceMetricSummary summary;
+    summary.frameCount = static_cast<uint32_t>(samples.size());
+    if (samples.empty()) {
+        return summary;
+    }
+
+    summary.maxMse = 0.0;
+    summary.bestSsim = -std::numeric_limits<double>::infinity();
+    summary.worstSsim = std::numeric_limits<double>::infinity();
+    summary.worstPsnr = std::numeric_limits<double>::infinity();
+    double sumMse = 0.0;
+    double sumPsnr = 0.0;
+    double sumSsim = 0.0;
+    double sumChanged = 0.0;
+
+    for (const auto& sample : samples) {
+        const auto& m = sample.metrics;
+        sumMse += m.mse;
+        sumPsnr += m.psnr;
+        sumSsim += m.ssim;
+        sumChanged += m.changedPixelPercentage;
+        summary.bestSsim = std::max(summary.bestSsim, m.ssim);
+        summary.worstSsim = std::min(summary.worstSsim, m.ssim);
+        summary.worstPsnr = std::min(summary.worstPsnr, m.psnr);
+        summary.maxChangedPixelPercentage = std::max(summary.maxChangedPixelPercentage, m.changedPixelPercentage);
+        if (m.mse > summary.maxMse) {
+            summary.maxMse = m.mse;
+            summary.worstFrame = sample.frameIndex;
+        }
+    }
+
+    const double inv = 1.0 / static_cast<double>(samples.size());
+    summary.averageMse = sumMse * inv;
+    summary.averagePsnr = sumPsnr * inv;
+    summary.averageSsim = sumSsim * inv;
+    summary.averageChangedPixelPercentage = sumChanged * inv;
+    return summary;
+}
+
+SequenceTemporalMetrics summarizeTemporalPairs(
+    const std::filesystem::path& viewDir,
+    const std::vector<std::string>& frameNames) {
+    SequenceTemporalMetrics metrics;
+    if (frameNames.size() < 2u) {
+        return metrics;
+    }
+
+    double sumMse = 0.0;
+    double sumChanged = 0.0;
+    for (size_t i = 1; i < frameNames.size(); ++i) {
+        const ImageDiffMetrics pair = compareImages(viewDir / frameNames[i - 1u], viewDir / frameNames[i], std::nullopt);
+        ++metrics.pairCount;
+        sumMse += pair.mse;
+        sumChanged += pair.changedPixelPercentage;
+        if (pair.mse > metrics.maxFrameDeltaMse) {
+            metrics.maxFrameDeltaMse = pair.mse;
+            metrics.worstPairStartFrame = frameIndexFromName(frameNames[i - 1u], static_cast<uint32_t>(i - 1u));
+        }
+        metrics.maxFrameDeltaChangedPixelPercentage = std::max(
+            metrics.maxFrameDeltaChangedPixelPercentage,
+            pair.changedPixelPercentage);
+    }
+
+    if (metrics.pairCount > 0u) {
+        const double inv = 1.0 / static_cast<double>(metrics.pairCount);
+        metrics.averageFrameDeltaMse = sumMse * inv;
+        metrics.averageFrameDeltaChangedPixelPercentage = sumChanged * inv;
+        metrics.temporalVarianceScore = metrics.averageFrameDeltaMse *
+            (metrics.averageFrameDeltaChangedPixelPercentage / 100.0);
+    }
+    return metrics;
+}
+
+double pearsonCorrelation(const std::vector<double>& a, const std::vector<double>& b) {
+    if (a.size() != b.size() || a.size() < 2u) {
+        return 0.0;
+    }
+    const double inv = 1.0 / static_cast<double>(a.size());
+    const double meanA = std::accumulate(a.begin(), a.end(), 0.0) * inv;
+    const double meanB = std::accumulate(b.begin(), b.end(), 0.0) * inv;
+    double covariance = 0.0;
+    double varA = 0.0;
+    double varB = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double da = a[i] - meanA;
+        const double db = b[i] - meanB;
+        covariance += da * db;
+        varA += da * da;
+        varB += db * db;
+    }
+    if (varA <= 1.0e-12 || varB <= 1.0e-12) {
+        return 0.0;
+    }
+    return covariance / std::sqrt(varA * varB);
+}
+
+void writeContactSheet(
+    const std::filesystem::path& diffDir,
+    const std::filesystem::path& outputPath,
+    std::vector<SequenceFrameSample> samples,
+    uint32_t maxFrames) {
+    if (samples.empty()) {
+        return;
+    }
+    std::sort(samples.begin(), samples.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.metrics.mse > rhs.metrics.mse;
+    });
+    if (samples.size() > maxFrames) {
+        samples.resize(maxFrames);
+    }
+
+    std::vector<LoadedImage> images;
+    images.reserve(samples.size());
+    for (const auto& sample : samples) {
+        const auto path = diffDir / sample.fileName;
+        if (std::filesystem::exists(path)) {
+            images.push_back(loadImageRgba(path));
+        }
+    }
+    if (images.empty()) {
+        return;
+    }
+
+    const int tileWidth = images.front().width;
+    const int tileHeight = images.front().height;
+    const int columns = std::min<int>(4, static_cast<int>(images.size()));
+    const int rows = (static_cast<int>(images.size()) + columns - 1) / columns;
+    std::vector<unsigned char> sheet(static_cast<size_t>(tileWidth) * tileHeight * columns * rows * 4u, 255u);
+    const int sheetWidth = tileWidth * columns;
+
+    for (size_t index = 0; index < images.size(); ++index) {
+        const LoadedImage& image = images[index];
+        if (image.width != tileWidth || image.height != tileHeight) {
+            continue;
+        }
+        const int dstX = static_cast<int>(index % static_cast<size_t>(columns)) * tileWidth;
+        const int dstY = static_cast<int>(index / static_cast<size_t>(columns)) * tileHeight;
+        for (int y = 0; y < tileHeight; ++y) {
+            const size_t srcOffset = static_cast<size_t>(y) * tileWidth * 4u;
+            const size_t dstOffset = (static_cast<size_t>(dstY + y) * sheetWidth + dstX) * 4u;
+            std::copy_n(image.pixels.data() + srcOffset, static_cast<size_t>(tileWidth) * 4u, sheet.data() + dstOffset);
+        }
+    }
+
+    const auto dir = outputPath.parent_path();
+    if (!dir.empty()) {
+        std::filesystem::create_directories(dir);
+    }
+    stbi_write_png(outputPath.string().c_str(), sheetWidth, tileHeight * rows, 4, sheet.data(), sheetWidth * 4);
+}
+
 std::vector<std::string> passNamesFromRenderGraph(const json& graph) {
     std::vector<std::string> names;
     for (const auto& pass : graph.value("passes", json::array())) {
@@ -340,6 +612,161 @@ int compareImageCommand(
     return 0;
 }
 
+SequenceComparisonReport compareImageSequences(
+    const std::filesystem::path& baselineDir,
+    const std::filesystem::path& currentDir,
+    const std::optional<std::filesystem::path>& outputDir,
+    const std::vector<std::string>& requestedViews) {
+    SequenceComparisonReport report;
+    if (!std::filesystem::exists(baselineDir)) {
+        throw std::runtime_error("Baseline sequence directory does not exist: " + baselineDir.string());
+    }
+    if (!std::filesystem::exists(currentDir)) {
+        throw std::runtime_error("Current sequence directory does not exist: " + currentDir.string());
+    }
+
+    const std::vector<std::string> views = selectedSequenceViews(baselineDir, currentDir, requestedViews, report.warnings);
+    std::vector<InternalSequenceViewComparison> internalViews;
+    bool anyComparableFrames = false;
+
+    for (const std::string& view : views) {
+        const std::filesystem::path baselineViewDir = baselineDir / view;
+        const std::filesystem::path currentViewDir = currentDir / view;
+        if (!std::filesystem::exists(baselineViewDir) || !std::filesystem::exists(currentViewDir)) {
+            report.warnings.push_back("Skipping view with missing directory: " + view);
+            continue;
+        }
+
+        const std::vector<std::string> baselineFrames = pngNamesInDir(baselineViewDir);
+        const std::vector<std::string> currentFrames = pngNamesInDir(currentViewDir);
+        std::vector<std::string> commonFrames;
+        std::set_intersection(
+            baselineFrames.begin(), baselineFrames.end(),
+            currentFrames.begin(), currentFrames.end(),
+            std::back_inserter(commonFrames));
+        if (commonFrames.empty()) {
+            report.warnings.push_back("Skipping view with no matching PNG frames: " + view);
+            continue;
+        }
+        if (commonFrames.size() != baselineFrames.size() || commonFrames.size() != currentFrames.size()) {
+            report.warnings.push_back("View has missing or extra frames: " + view);
+        }
+
+        anyComparableFrames = true;
+        InternalSequenceViewComparison internal;
+        internal.summary.view = view;
+        const std::filesystem::path diffDir = outputDir.has_value() ? (*outputDir / "diffs" / view) : std::filesystem::path{};
+
+        for (size_t index = 0; index < commonFrames.size(); ++index) {
+            const std::string& frameName = commonFrames[index];
+            const std::optional<std::filesystem::path> diffPath = outputDir.has_value()
+                ? std::optional<std::filesystem::path>(diffDir / frameName)
+                : std::nullopt;
+            SequenceFrameSample sample;
+            sample.fileName = frameName;
+            sample.frameIndex = frameIndexFromName(frameName, static_cast<uint32_t>(index));
+            sample.metrics = compareImages(baselineViewDir / frameName, currentViewDir / frameName, diffPath);
+            internal.perFrame.push_back(sample);
+        }
+
+        internal.summary.baselineVsCurrent = summarizeFrameSamples(internal.perFrame);
+        internal.summary.baselineTemporal = summarizeTemporalPairs(baselineViewDir, baselineFrames);
+        internal.summary.currentTemporal = summarizeTemporalPairs(currentViewDir, currentFrames);
+        report.views.push_back(internal.summary);
+        internalViews.push_back(std::move(internal));
+    }
+
+    if (!anyComparableFrames) {
+        throw std::runtime_error("No comparable sequence frames were found");
+    }
+
+    if (outputDir.has_value()) {
+        std::filesystem::create_directories(*outputDir);
+        json out;
+        out["baseline_dir"] = baselineDir.string();
+        out["current_dir"] = currentDir.string();
+        out["warnings"] = report.warnings;
+        out["views"] = json::array();
+        std::map<std::string, std::vector<double>> mseByView;
+
+        for (const auto& internal : internalViews) {
+            json viewJson;
+            viewJson["view"] = internal.summary.view;
+            viewJson["baseline_vs_current"] = sequenceMetricSummaryJson(internal.summary.baselineVsCurrent);
+            viewJson["baseline_temporal"] = sequenceTemporalMetricsJson(internal.summary.baselineTemporal);
+            viewJson["current_temporal"] = sequenceTemporalMetricsJson(internal.summary.currentTemporal);
+            viewJson["frames"] = json::array();
+            for (const auto& sample : internal.perFrame) {
+                viewJson["frames"].push_back({
+                    {"file", sample.fileName},
+                    {"frame", sample.frameIndex},
+                    {"metrics", imageMetricsJson(sample.metrics)},
+                });
+                mseByView[internal.summary.view].push_back(sample.metrics.mse);
+            }
+            out["views"].push_back(viewJson);
+
+            const auto diffDir = *outputDir / "diffs" / internal.summary.view;
+            writeContactSheet(diffDir, *outputDir / ("contact_sheet_" + internal.summary.view + ".png"), internal.perFrame, 8);
+            if (internal.summary.view == "beauty") {
+                auto worstIt = std::find_if(internal.perFrame.begin(), internal.perFrame.end(), [&](const auto& sample) {
+                    return sample.frameIndex == internal.summary.baselineVsCurrent.worstFrame;
+                });
+                const auto worstPath = diffDir / (worstIt != internal.perFrame.end() ? worstIt->fileName : sequenceFrameFileName(internal.summary.baselineVsCurrent.worstFrame));
+                if (std::filesystem::exists(worstPath)) {
+                    std::filesystem::copy_file(worstPath, *outputDir / "worst_beauty_diff.png", std::filesystem::copy_options::overwrite_existing);
+                }
+            } else if (internal.summary.view == "reprojection-confidence") {
+                auto worstIt = std::find_if(internal.perFrame.begin(), internal.perFrame.end(), [&](const auto& sample) {
+                    return sample.frameIndex == internal.summary.baselineVsCurrent.worstFrame;
+                });
+                const auto worstPath = diffDir / (worstIt != internal.perFrame.end() ? worstIt->fileName : sequenceFrameFileName(internal.summary.baselineVsCurrent.worstFrame));
+                if (std::filesystem::exists(worstPath)) {
+                    std::filesystem::copy_file(worstPath, *outputDir / "worst_reprojection_confidence_diff.png", std::filesystem::copy_options::overwrite_existing);
+                }
+            }
+        }
+
+        json correlations = json::object();
+        if (mseByView.contains("beauty")) {
+            for (const char* diagnosticView : {"motion-vectors", "reprojection-confidence", "temporal-history-weight"}) {
+                if (mseByView.contains(diagnosticView)) {
+                    correlations[diagnosticView] = pearsonCorrelation(mseByView["beauty"], mseByView[diagnosticView]);
+                }
+            }
+        }
+        out["motion_debug_correlations"] = correlations;
+        writeJsonFile(*outputDir / "motion_stability_report.json", out);
+    }
+
+    return report;
+}
+
+int compareImageSequenceCommand(
+    const std::filesystem::path& baselineDir,
+    const std::filesystem::path& currentDir,
+    const std::optional<std::filesystem::path>& outputDir,
+    const std::vector<std::string>& requestedViews) {
+    const SequenceComparisonReport report = compareImageSequences(baselineDir, currentDir, outputDir, requestedViews);
+    json result;
+    result["status"] = "pass";
+    result["warnings"] = report.warnings;
+    result["views"] = json::array();
+    for (const auto& view : report.views) {
+        result["views"].push_back({
+            {"view", view.view},
+            {"baseline_vs_current", sequenceMetricSummaryJson(view.baselineVsCurrent)},
+            {"baseline_temporal", sequenceTemporalMetricsJson(view.baselineTemporal)},
+            {"current_temporal", sequenceTemporalMetricsJson(view.currentTemporal)},
+        });
+    }
+    if (outputDir.has_value()) {
+        result["report"] = (*outputDir / "motion_stability_report.json").string();
+    }
+    std::cout << result.dump(2) << "\n";
+    return 0;
+}
+
 BaselinePaths baselinePathsFor(const std::filesystem::path& scenePath, const std::filesystem::path& baselineRoot) {
     const std::string caseName = scenePath.empty() ? "default" : scenePath.stem().string();
     BaselinePaths paths;
@@ -348,6 +775,7 @@ BaselinePaths baselinePathsFor(const std::filesystem::path& scenePath, const std
     paths.profile = paths.caseDir / "profile.json";
     paths.renderGraph = paths.caseDir / "rendergraph.json";
     paths.beautyImage = paths.caseDir / "beauty.png";
+    paths.frameSequence = paths.caseDir / "frame_sequence";
     return paths;
 }
 
@@ -355,15 +783,25 @@ void updateBaseline(
     const BaselinePaths& paths,
     const std::filesystem::path& profilePath,
     const std::filesystem::path& renderGraphPath,
-    const std::filesystem::path& debugViewsDir) {
+    const std::filesystem::path& debugViewsDir,
+    const std::optional<std::filesystem::path>& frameSequenceDir) {
     std::filesystem::create_directories(paths.caseDir);
     std::filesystem::copy_file(profilePath, paths.profile, std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(renderGraphPath, paths.renderGraph, std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(beautyPath(debugViewsDir), paths.beautyImage, std::filesystem::copy_options::overwrite_existing);
+    const std::filesystem::path sequenceDir = frameSequenceDir.value_or(debugViewsDir.parent_path() / "frame_sequence");
+    if (std::filesystem::exists(sequenceDir)) {
+        if (std::filesystem::exists(paths.frameSequence)) {
+            std::filesystem::remove_all(paths.frameSequence);
+        }
+        std::filesystem::copy(sequenceDir, paths.frameSequence,
+            std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
+    }
     json manifest = {
         {"profile", paths.profile.filename().string()},
         {"rendergraph", paths.renderGraph.filename().string()},
         {"beauty", paths.beautyImage.filename().string()},
+        {"frame_sequence", std::filesystem::exists(paths.frameSequence) ? paths.frameSequence.filename().string() : ""},
     };
     writeJsonFile(paths.caseDir / "manifest.json", manifest);
     std::cout << "Updated baseline: " << paths.caseDir.string() << "\n";
@@ -393,7 +831,32 @@ int checkBaseline(
     const double memoryRegression = profileComparison["summary"].value("memory_regression_percent", 0.0);
     const bool imageFailed = imageMetrics.changedPixelPercentage > 0.1 && imageMetrics.psnr < 50.0;
     const bool profileFailed = gpuRegression > 10.0 || memoryRegression > 10.0;
-    const bool failed = imageFailed || profileFailed || renderGraphChanged;
+    bool sequenceFailed = false;
+    json sequenceJson = nullptr;
+    const std::filesystem::path currentSequence = debugViewsDir.parent_path() / "frame_sequence";
+    if (std::filesystem::exists(paths.frameSequence)) {
+        if (!std::filesystem::exists(currentSequence)) {
+            sequenceFailed = true;
+            sequenceJson = {{"status", "fail"}, {"reason", "current frame sequence is missing"}};
+        } else {
+            try {
+                const SequenceComparisonReport sequenceReport = compareImageSequences(paths.frameSequence, currentSequence, std::nullopt, {});
+                sequenceJson = {{"status", "pass"}, {"warnings", sequenceReport.warnings}, {"views", json::array()}};
+                for (const auto& view : sequenceReport.views) {
+                    sequenceJson["views"].push_back({
+                        {"view", view.view},
+                        {"baseline_vs_current", sequenceMetricSummaryJson(view.baselineVsCurrent)},
+                        {"baseline_temporal", sequenceTemporalMetricsJson(view.baselineTemporal)},
+                        {"current_temporal", sequenceTemporalMetricsJson(view.currentTemporal)},
+                    });
+                }
+            } catch (const std::exception& error) {
+                sequenceFailed = true;
+                sequenceJson = {{"status", "fail"}, {"reason", error.what()}};
+            }
+        }
+    }
+    const bool failed = imageFailed || profileFailed || renderGraphChanged || sequenceFailed;
 
     json result = {
         {"status", failed ? "fail" : "pass"},
@@ -404,6 +867,7 @@ int checkBaseline(
             {"baseline_passes", baselinePasses},
             {"current_passes", currentPasses},
         }},
+        {"frame_sequence", sequenceJson},
     };
     std::cout << result.dump(2) << "\n";
     return failed ? 1 : 0;
