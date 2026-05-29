@@ -9,6 +9,7 @@
 #include <ktxvulkan.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
@@ -47,14 +48,52 @@ TextureData TextureLoader::loadRgba8(std::string_view path) {
     int width = 0;
     int height = 0;
     int channels = 0;
-    unsigned char* loaded = stbi_load(std::string(path).c_str(), &width, &height, &channels, STBI_rgb_alpha);
+    const std::string filepath(path);
+
+    if (stbi_is_hdr(filepath.c_str())) {
+        float* loaded = stbi_loadf(filepath.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+        if (loaded == nullptr) {
+            throw std::runtime_error(std::string("stbi_loadf failed for ") + filepath);
+        }
+
+        TextureData result;
+        result.width = width;
+        result.height = height;
+        result.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        result.linearColorSpace = true;
+        const size_t byteSize = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
+        result.pixels.resize(byteSize);
+        std::memcpy(result.pixels.data(), loaded, byteSize);
+        stbi_image_free(loaded);
+        return result;
+    }
+
+    if (stbi_is_16_bit(filepath.c_str())) {
+        stbi_us* loaded = stbi_load_16(filepath.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+        if (loaded == nullptr) {
+            throw std::runtime_error(std::string("stbi_load_16 failed for ") + filepath);
+        }
+
+        TextureData result;
+        result.width = width;
+        result.height = height;
+        result.format = VK_FORMAT_R16G16B16A16_UNORM;
+        const size_t byteSize = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(stbi_us);
+        result.pixels.resize(byteSize);
+        std::memcpy(result.pixels.data(), loaded, byteSize);
+        stbi_image_free(loaded);
+        return result;
+    }
+
+    unsigned char* loaded = stbi_load(filepath.c_str(), &width, &height, &channels, STBI_rgb_alpha);
     if (loaded == nullptr) {
-        throw std::runtime_error(std::string("stbi_load failed for ") + std::string(path));
+        throw std::runtime_error(std::string("stbi_load failed for ") + filepath);
     }
 
     TextureData result;
     result.width = width;
     result.height = height;
+    result.format = VK_FORMAT_R8G8B8A8_UNORM;
     result.pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
     std::memcpy(result.pixels.data(), loaded, result.pixels.size());
     stbi_image_free(loaded);
@@ -83,6 +122,28 @@ namespace {
     default:
         return false;
     }
+}
+
+[[nodiscard]] uint32_t mipExtent(uint32_t base, uint32_t level) {
+    return std::max(base >> level, 1u);
+}
+
+void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, uint64_t byteLength, uint32_t width, uint32_t height, size_t fileSize) {
+    if (byteLength == 0) {
+        return;
+    }
+    if (srcOffset > fileSize || byteLength > fileSize - srcOffset) {
+        throw std::runtime_error("KTX2: level data exceeds file bounds");
+    }
+    const uint64_t dstOffset = static_cast<uint64_t>(tex.pixels.size());
+    tex.pixels.resize(tex.pixels.size() + static_cast<size_t>(byteLength));
+    std::memcpy(tex.pixels.data() + dstOffset, src + srcOffset, static_cast<size_t>(byteLength));
+    tex.mipData.push_back(TextureMipLevel{
+        .offset = dstOffset,
+        .size = byteLength,
+        .width = std::max(width, 1u),
+        .height = std::max(height, 1u),
+    });
 }
 
 [[nodiscard]] TextureData transcodeBasisKtx2(const std::vector<uint8_t>& raw, size_t size) {
@@ -121,11 +182,8 @@ namespace {
     tex.height = static_cast<int>(texture->baseHeight);
     tex.mipLevels = static_cast<int>(texture->numLevels);
     tex.isCompressed = (targetFormat != KTX_TTF_RGBA32);
+    tex.format = outFormat;
     tex.compressedFormat = outFormat;
-
-    ktx_size_t mipOffset = 0;
-    ktxTexture_GetImageOffset(reinterpret_cast<ktxTexture*>(texture), 0, 0, 0, &mipOffset);
-    ktx_size_t mipSize = ktxTexture_GetImageSize(reinterpret_cast<ktxTexture*>(texture), 0);
 
     ktx_uint8_t* imageData = ktxTexture_GetData(reinterpret_cast<ktxTexture*>(texture));
     if (imageData == nullptr) {
@@ -133,8 +191,25 @@ namespace {
         throw std::runtime_error("KTX2: no transcoded image data");
     }
 
-    tex.pixels.resize(mipSize);
-    std::memcpy(tex.pixels.data(), imageData + mipOffset, mipSize);
+    const uint32_t levelCount = std::max<uint32_t>(texture->numLevels, 1u);
+    tex.mipLevels = static_cast<int>(levelCount);
+    for (uint32_t level = 0; level < levelCount; ++level) {
+        ktx_size_t mipOffset = 0;
+        KTX_error_code offsetResult = ktxTexture_GetImageOffset(reinterpret_cast<ktxTexture*>(texture), level, 0, 0, &mipOffset);
+        if (offsetResult != KTX_SUCCESS) {
+            ktxTexture2_Destroy(texture);
+            throw std::runtime_error("KTX2: failed to locate transcoded mip level");
+        }
+        const ktx_size_t mipSize = ktxTexture_GetImageSize(reinterpret_cast<ktxTexture*>(texture), level);
+        appendTextureMip(
+            tex,
+            imageData,
+            static_cast<uint64_t>(mipOffset),
+            static_cast<uint64_t>(mipSize),
+            mipExtent(texture->baseWidth, level),
+            mipExtent(texture->baseHeight, level),
+            static_cast<size_t>(ktxTexture_GetDataSize(reinterpret_cast<ktxTexture*>(texture))));
+    }
 
     ktxTexture2_Destroy(texture);
     return tex;
@@ -164,7 +239,7 @@ TextureData TextureLoader::loadKtx2(std::string_view path) {
     const uint32_t pixelDepth    = readU32(raw.data(), 28);
     const uint32_t layerCount    = readU32(raw.data(), 32);
     const uint32_t faceCount     = readU32(raw.data(), 36);
-    const uint32_t levelCount    = readU32(raw.data(), 40);
+    const uint32_t levelCountRaw = readU32(raw.data(), 40);
     const uint32_t supercompression = readU32(raw.data(), 44);
 
     const uint32_t dfdOffset     = readU32(raw.data(), 48);
@@ -191,33 +266,44 @@ TextureData TextureLoader::loadKtx2(std::string_view path) {
     }
 
     constexpr size_t kHeaderSize = 80;
-    const size_t levelIndexOffset = kHeaderSize + (kvdOffset > 0 ? 0 : 0);
+    constexpr size_t kLevelIndexEntrySize = 24;
+    const uint32_t levelCount = std::max(levelCountRaw, 1u);
+    if (kHeaderSize + static_cast<size_t>(levelCount) * kLevelIndexEntrySize > size) {
+        throw std::runtime_error("KTX2: level index exceeds file bounds");
+    }
 
-    const uint64_t mip0Offset = readU64(raw.data(), levelIndexOffset);
-    const uint64_t mip0Length = readU64(raw.data(), levelIndexOffset + 8);
-
-    if (isBcFormat(vkFormat)) {
+    if (vkFormat != VK_FORMAT_UNDEFINED) {
         TextureData result;
         result.width  = static_cast<int>(pixelWidth);
         result.height = static_cast<int>(pixelHeight);
         result.depth  = static_cast<int>(pixelDepth);
         result.mipLevels = static_cast<int>(levelCount);
-        result.isCompressed = true;
-        result.compressedFormat = static_cast<VkFormat>(vkFormat);
+        result.isCompressed = isBcFormat(vkFormat);
+        result.format = static_cast<VkFormat>(vkFormat);
+        result.compressedFormat = result.isCompressed ? static_cast<VkFormat>(vkFormat) : VK_FORMAT_UNDEFINED;
+        result.linearColorSpace = vkFormat == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                                  vkFormat == VK_FORMAT_R32G32B32A32_SFLOAT ||
+                                  vkFormat == VK_FORMAT_R16G16B16_SFLOAT ||
+                                  vkFormat == VK_FORMAT_R32G32B32_SFLOAT;
 
-        const size_t dataStart = static_cast<size_t>(mip0Offset);
-        const size_t dataEnd   = dataStart + static_cast<size_t>(mip0Length);
-        if (dataEnd > size) {
-            throw std::runtime_error("KTX2: level data exceeds file bounds");
+        for (uint32_t level = 0; level < levelCount; ++level) {
+            const size_t entryOffset = kHeaderSize + static_cast<size_t>(level) * kLevelIndexEntrySize;
+            const uint64_t mipOffset = readU64(raw.data(), entryOffset);
+            const uint64_t mipLength = readU64(raw.data(), entryOffset + 8);
+            appendTextureMip(
+                result,
+                raw.data(),
+                mipOffset,
+                mipLength,
+                mipExtent(pixelWidth, level),
+                mipExtent(pixelHeight, level),
+                size);
         }
-        result.pixels.resize(mip0Length);
-        std::memcpy(result.pixels.data(), raw.data() + dataStart, mip0Length);
+        result.mipLevels = std::max<int>(1, static_cast<int>(result.mipData.size()));
         return result;
     }
 
-    if (!isBcFormat(vkFormat)) {
-        fprintf(stderr, "KTX2: format %u is not a direct GPU block-compressed format, falling back to stb_image\n", vkFormat);
-    }
+    fprintf(stderr, "KTX2: format is undefined, falling back to stb_image\n");
 
     return loadRgba8(path);
 }
@@ -252,9 +338,12 @@ Image TextureLoader::createTexture2D(
         throw std::runtime_error("TextureData is empty");
     }
 
-    const VkFormat format = texture.isCompressed ? texture.compressedFormat : VK_FORMAT_R8G8B8A8_UNORM;
+    const VkFormat format = texture.isCompressed ? texture.compressedFormat : texture.format;
 
     uint32_t mipLevels = texture.mipLevels > 1 ? static_cast<uint32_t>(texture.mipLevels) : 1u;
+    if (!texture.mipData.empty()) {
+        mipLevels = static_cast<uint32_t>(texture.mipData.size());
+    }
     if (mipLevels <= 1 && mipmapped) {
         const int longest = std::max(texture.width, texture.height);
         mipLevels = static_cast<uint32_t>(std::floor(std::log2(static_cast<float>(longest)))) + 1u;
@@ -272,7 +361,7 @@ Image TextureLoader::createTexture2D(
         .debugName = debugName,
     });
 
-    uploader.uploadToImage2D(image, texture.pixels.data(), texture.pixels.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    uploader.uploadToImage2D(image, texture.pixels.data(), texture.pixels.size(), texture.mipData, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return image;
 }
 

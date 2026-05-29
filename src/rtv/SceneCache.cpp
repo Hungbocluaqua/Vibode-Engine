@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 17;
+constexpr uint32_t kCacheVersion = 19;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -214,9 +214,16 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeUint32(file, tex.wrapS);
         writeUint32(file, tex.wrapT);
         writeUint32(file, tex.isCompressed ? 1u : 0u);
+        writeUint32(file, tex.linearColorSpace ? 1u : 0u);
+        writeUint32(file, tex.format);
         writeUint32(file, tex.compressedFormat);
         writeUint32(file, static_cast<uint32_t>(tex.rgba8.size()));
         writeBytes(file, tex.rgba8.data(), tex.rgba8.size());
+        const uint32_t mipDataCount = static_cast<uint32_t>(tex.mipData.size());
+        writeUint32(file, mipDataCount);
+        if (mipDataCount > 0) {
+            writeBytes(file, tex.mipData.data(), sizeof(TextureMipLevel) * mipDataCount);
+        }
     }
 
     uint32_t materialCount = static_cast<uint32_t>(scene.materials.size());
@@ -472,12 +479,22 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         uint32_t isCompressedVal = 0;
         if (!readUint32(file, isCompressedVal)) { std::fclose(file); return std::nullopt; }
         tex.isCompressed = isCompressedVal != 0;
+        uint32_t linearColorVal = 0;
+        if (!readUint32(file, linearColorVal)) { std::fclose(file); return std::nullopt; }
+        tex.linearColorSpace = linearColorVal != 0;
+        if (!readUint32(file, tex.format)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, tex.compressedFormat)) { std::fclose(file); return std::nullopt; }
         uint32_t dataByteSize = 0;
         if (!readUint32(file, dataByteSize)) { std::fclose(file); return std::nullopt; }
         tex.rgba8.resize(dataByteSize);
         if (dataByteSize > 0) {
             if (!readBytes(file, tex.rgba8.data(), dataByteSize)) { std::fclose(file); return std::nullopt; }
+        }
+        uint32_t mipDataCount = 0;
+        if (!readUint32(file, mipDataCount)) { std::fclose(file); return std::nullopt; }
+        tex.mipData.resize(mipDataCount);
+        if (mipDataCount > 0) {
+            if (!readBytes(file, tex.mipData.data(), sizeof(TextureMipLevel) * mipDataCount)) { std::fclose(file); return std::nullopt; }
         }
     }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtv/Image.h"
+#include "rtv/TextureAsset.h"
 
 #include <Volk/volk.h>
 
@@ -19,6 +20,12 @@ public:
 
     void uploadToBuffer(Buffer& destination, const void* data, VkDeviceSize byteSize, VkDeviceSize dstOffset = 0);
     void uploadToImage2D(Image& image, const void* rgbaBytes, VkDeviceSize byteSize, VkImageLayout finalLayout);
+    void uploadToImage2D(
+        Image& image,
+        const void* bytes,
+        VkDeviceSize byteSize,
+        std::span<const TextureMipLevel> mipData,
+        VkImageLayout finalLayout);
 
     template <typename T>
     void uploadToBuffer(Buffer& destination, std::span<const T> values, VkDeviceSize dstOffset = 0) {

@@ -137,7 +137,26 @@ uint32_t cachedMaterialTextureFlag(const CachedScene& cached, int32_t textureInd
     if (textureIndex < 0 || static_cast<size_t>(textureIndex) >= cached.textures.size()) {
         return 0;
     }
-    return cached.textures[static_cast<size_t>(textureIndex)].srgb ? 0u : flag;
+    const CachedTextureData& texture = cached.textures[static_cast<size_t>(textureIndex)];
+    if (texture.linearColorSpace) {
+        return 0;
+    }
+    const VkFormat format = texture.isCompressed
+        ? static_cast<VkFormat>(texture.compressedFormat)
+        : (texture.srgb && texture.format == VK_FORMAT_R8G8B8A8_UNORM
+            ? VK_FORMAT_R8G8B8A8_SRGB
+            : static_cast<VkFormat>(texture.format));
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return 0;
+    default:
+        return flag;
+    }
 }
 
 glm::vec3 nonnegativeRgb(const glm::vec3& value) {
@@ -538,6 +557,111 @@ std::vector<TextureColorUsage> classifyTextureUsage(const SceneAsset& scene, con
 
 bool uploadTextureAsSrgb(const std::vector<TextureColorUsage>& usage, uint32_t slot) {
     return slot < usage.size() && usage[slot].color() && !usage[slot].data();
+}
+
+bool isSrgbTextureFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return true;
+    default:
+        return false;
+    }
+}
+
+VkFormat importedMaterialTextureFormat(const TextureAsset* texture, const std::vector<TextureColorUsage>& usage, uint32_t slot) {
+    if (texture == nullptr || texture->fallback) {
+        return uploadTextureAsSrgb(usage, slot) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    if (texture->isCompressed) {
+        return texture->compressedFormat != VK_FORMAT_UNDEFINED ? texture->compressedFormat : texture->format;
+    }
+    if (texture->format == VK_FORMAT_R8G8B8A8_UNORM && uploadTextureAsSrgb(usage, slot)) {
+        return VK_FORMAT_R8G8B8A8_SRGB;
+    }
+    return texture->format != VK_FORMAT_UNDEFINED ? texture->format : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+VkFormat cachedMaterialTextureFormat(const CachedTextureData* texture) {
+    if (texture == nullptr || texture->fallback) {
+        return texture != nullptr && texture->srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    if (texture->isCompressed) {
+        return texture->compressedFormat != 0u ? static_cast<VkFormat>(texture->compressedFormat) : static_cast<VkFormat>(texture->format);
+    }
+    if (texture->format == VK_FORMAT_R8G8B8A8_UNORM && texture->srgb) {
+        return VK_FORMAT_R8G8B8A8_SRGB;
+    }
+    return texture->format != 0u ? static_cast<VkFormat>(texture->format) : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+bool importedMaterialTextureNeedsManualSrgb(const TextureAsset* texture, const std::vector<TextureColorUsage>& usage, uint32_t slot) {
+    if (slot >= usage.size() || !usage[slot].color() || usage[slot].data()) {
+        return false;
+    }
+    if (texture != nullptr && texture->linearColorSpace) {
+        return false;
+    }
+    return !isSrgbTextureFormat(importedMaterialTextureFormat(texture, usage, slot));
+}
+
+bool isHighPrecisionTextureFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16B16_UNORM:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16B16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32B32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint64_t estimatedTextureBytes(size_t uploadedBytes, uint32_t mipLevels, bool hasExplicitMips) {
+    uint64_t bytes = static_cast<uint64_t>(uploadedBytes);
+    if (!hasExplicitMips && mipLevels > 1) {
+        bytes = (bytes * 4u) / 3u;
+    }
+    return bytes;
+}
+
+void warnHighPrecisionTextureMemory(
+    const char* label,
+    const std::string& name,
+    VkFormat format,
+    uint32_t width,
+    uint32_t height,
+    uint64_t bytes) {
+    constexpr uint64_t oneMiB = 1024ull * 1024ull;
+    if (!isHighPrecisionTextureFormat(format) || bytes < 64ull * oneMiB) {
+        return;
+    }
+    std::cerr << label << " high-precision texture memory warning: "
+              << (name.empty() ? std::string("<unnamed>") : name)
+              << " " << width << "x" << height
+              << " format=" << static_cast<uint32_t>(format)
+              << " estimated=" << (bytes / oneMiB) << " MiB\n";
+}
+
+void warnHighPrecisionTextureBudget(const char* label, uint64_t bytes) {
+    constexpr uint64_t oneMiB = 1024ull * 1024ull;
+    if (bytes < 256ull * oneMiB) {
+        return;
+    }
+    std::cerr << label << " high-precision texture budget warning: estimated "
+              << (bytes / oneMiB) << " MiB across resident material textures\n";
 }
 
 std::vector<uint8_t> fallbackTexturePixels(const std::vector<TextureColorUsage>& usage, uint32_t slot) {
@@ -1130,10 +1254,12 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
     struct PendingTexture {
         std::unique_ptr<Image> image;
         std::vector<uint8_t> pixels;
+        std::vector<TextureMipLevel> mipData;
         TextureSamplerDesc sampler;
     };
     std::vector<PendingTexture> pendingTextures;
     pendingTextures.reserve(std::max(1u, textureCount));
+    uint64_t highPrecisionBytes = 0;
 
     for (uint32_t slot = 0; slot < std::max(1u, textureCount); ++slot) {
         const TextureAsset* texture = slot < textureCount ? assets.texture(importedScene.textures[slot]) : nullptr;
@@ -1151,12 +1277,24 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
             name = "default material texture";
         }
 
-        const uint32_t textureMipLevels = texture != nullptr && texture->isCompressed
-            ? 1u
-            : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u));
-        const VkFormat textureFormat = texture != nullptr && texture->isCompressed
-            ? texture->compressedFormat
-            : (uploadTextureAsSrgb(usage, slot) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
+        const bool hasUploadedMips = texture != nullptr && !texture->mipData.empty();
+        const uint32_t textureMipLevels = hasUploadedMips
+            ? static_cast<uint32_t>(texture->mipData.size())
+            : (texture != nullptr && texture->isCompressed
+                ? std::max(1u, static_cast<uint32_t>(texture->mipLevels))
+                : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u)));
+        const VkFormat textureFormat = importedMaterialTextureFormat(texture, usage, slot);
+        const uint64_t textureBytes = estimatedTextureBytes(pixels.size(), textureMipLevels, hasUploadedMips);
+        if (isHighPrecisionTextureFormat(textureFormat)) {
+            highPrecisionBytes += textureBytes;
+            warnHighPrecisionTextureMemory(
+                "Material",
+                texture != nullptr ? texture->name : std::string{},
+                textureFormat,
+                width,
+                height,
+                textureBytes);
+        }
 
         auto image = std::make_unique<Image>(allocator_, ImageDesc{
             .width = width,
@@ -1171,14 +1309,16 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
         pendingTextures.push_back({
             std::move(image),
             std::move(pixels),
+            texture != nullptr ? texture->mipData : std::vector<TextureMipLevel>{},
             samplerDesc,
         });
     }
+    warnHighPrecisionTextureBudget("Material", highPrecisionBytes);
 
     BatchUploader batch(uploader);
     batch.begin();
     for (auto& pending : pendingTextures) {
-        batch.enqueueImageUpload(*pending.image, pending.pixels.data(), pending.pixels.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        batch.enqueueImageUpload(*pending.image, pending.pixels.data(), pending.pixels.size(), pending.mipData, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     batch.submit();
 
@@ -1215,24 +1355,24 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
     struct PendingTexture {
         std::unique_ptr<Image> image;
         std::vector<uint8_t> pixels;
+        std::vector<TextureMipLevel> mipData;
         TextureSamplerDesc sampler;
     };
     std::vector<PendingTexture> pendingTextures;
     pendingTextures.reserve(std::max(1u, textureCount));
+    uint64_t highPrecisionBytes = 0;
 
     for (uint32_t slot = 0; slot < std::max(1u, textureCount); ++slot) {
         const CachedTextureData* texture = slot < textureCount ? &cached.textures[slot] : nullptr;
         std::vector<uint8_t> pixels;
         uint32_t width = 1;
         uint32_t height = 1;
-        bool srgb = false;
         const char* name = "cached material texture";
         TextureSamplerDesc samplerDesc = materialSamplerDesc;
         if (texture != nullptr && !texture->rgba8.empty() && texture->width > 0 && texture->height > 0) {
             pixels = texture->rgba8;
             width = texture->width;
             height = texture->height;
-            srgb = texture->srgb;
             samplerDesc.minFilter = static_cast<TextureFilter>(texture->minFilter);
             samplerDesc.magFilter = static_cast<TextureFilter>(texture->magFilter);
             samplerDesc.wrapS = static_cast<TextureWrap>(texture->wrapS);
@@ -1243,12 +1383,24 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
         }
 
         const bool textureCompressed = texture != nullptr && texture->isCompressed;
-        const uint32_t textureMipLevels = textureCompressed
-            ? 1u
-            : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u));
-        const VkFormat textureFormat = textureCompressed
-            ? static_cast<VkFormat>(texture->compressedFormat)
-            : (srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
+        const bool hasUploadedMips = texture != nullptr && !texture->mipData.empty();
+        const uint32_t textureMipLevels = hasUploadedMips
+            ? static_cast<uint32_t>(texture->mipData.size())
+            : (textureCompressed
+                ? std::max(1u, static_cast<uint32_t>(texture->mipLevels))
+                : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u)));
+        const VkFormat textureFormat = cachedMaterialTextureFormat(texture);
+        const uint64_t textureBytes = estimatedTextureBytes(pixels.size(), textureMipLevels, hasUploadedMips);
+        if (isHighPrecisionTextureFormat(textureFormat)) {
+            highPrecisionBytes += textureBytes;
+            warnHighPrecisionTextureMemory(
+                "Cached material",
+                texture != nullptr ? texture->name : std::string{},
+                textureFormat,
+                width,
+                height,
+                textureBytes);
+        }
         auto image = std::make_unique<Image>(allocator_, ImageDesc{
             .width = width,
             .height = height,
@@ -1260,14 +1412,16 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
         pendingTextures.push_back({
             std::move(image),
             std::move(pixels),
+            texture != nullptr ? texture->mipData : std::vector<TextureMipLevel>{},
             samplerDesc,
         });
     }
+    warnHighPrecisionTextureBudget("Cached material", highPrecisionBytes);
 
     BatchUploader batch(uploader);
     batch.begin();
     for (auto& pending : pendingTextures) {
-        batch.enqueueImageUpload(*pending.image, pending.pixels.data(), pending.pixels.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        batch.enqueueImageUpload(*pending.image, pending.pixels.data(), pending.pixels.size(), pending.mipData, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     batch.submit();
 
@@ -1312,11 +1466,11 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         uint32_t flags = 0;
         if (material != nullptr) {
             uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
-            if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
+            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->baseColorTexture), textureUsage, slot)) {
                 flags |= materialFlagManualBaseColorSrgb;
             }
             slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
-            if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
+            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->emissiveTexture), textureUsage, slot)) {
                 flags |= materialFlagManualEmissiveSrgb;
             }
         }
@@ -2129,8 +2283,11 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedTex.srgb = texture->srgb;
             cachedTex.fallback = texture->fallback;
             cachedTex.isCompressed = texture->isCompressed;
+            cachedTex.linearColorSpace = texture->linearColorSpace;
+            cachedTex.format = static_cast<uint32_t>(texture->format);
             cachedTex.compressedFormat = static_cast<uint32_t>(texture->compressedFormat);
             cachedTex.rgba8 = texture->rgba8;
+            cachedTex.mipData = texture->mipData;
             cachedTex.minFilter = static_cast<uint32_t>(texture->sampler.minFilter);
             cachedTex.magFilter = static_cast<uint32_t>(texture->sampler.magFilter);
             cachedTex.wrapS = static_cast<uint32_t>(texture->sampler.wrapS);

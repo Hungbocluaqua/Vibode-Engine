@@ -32,6 +32,13 @@ struct TextureSamplerDesc {
     TextureWrap wrapT = TextureWrap::Repeat;
 };
 
+struct TextureMipLevel {
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    uint32_t width = 1;
+    uint32_t height = 1;
+};
+
 struct TextureAsset {
     std::string name;
     std::filesystem::path sourcePath;
@@ -43,9 +50,12 @@ struct TextureAsset {
     bool resident = false;
     bool fallback = false;
     bool isCompressed = false;
+    bool linearColorSpace = false;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkFormat compressedFormat = VK_FORMAT_UNDEFINED;
     TextureSamplerDesc sampler{};
     std::vector<uint8_t> rgba8;
+    std::vector<TextureMipLevel> mipData;
 };
 
 } // namespace rtv

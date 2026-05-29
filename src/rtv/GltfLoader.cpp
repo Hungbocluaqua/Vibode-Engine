@@ -16,9 +16,11 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 namespace rtv {
 
@@ -146,6 +148,20 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
     return data.size() >= sizeof(ktx2Magic) && std::memcmp(data.data(), ktx2Magic, sizeof(ktx2Magic)) == 0;
 }
 
+[[nodiscard]] bool isKtx2Bytes(const unsigned char* bytes, int size) {
+    constexpr uint8_t ktx2Magic[12] = {
+        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
+    };
+    return bytes != nullptr && size >= static_cast<int>(sizeof(ktx2Magic)) &&
+        std::memcmp(bytes, ktx2Magic, sizeof(ktx2Magic)) == 0;
+}
+
+[[nodiscard]] uint32_t readKtx2U32(const unsigned char* bytes, size_t offset) {
+    uint32_t value = 0;
+    std::memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
 [[nodiscard]] bool isKtx2Path(const std::string& uri) {
     if (uri.empty()) return false;
     const std::string lower = [&] {
@@ -154,6 +170,74 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
         return s;
     }();
     return lower.ends_with(".ktx2");
+}
+
+[[nodiscard]] bool isHdrBytes(const unsigned char* bytes, int size) {
+    constexpr char radianceMagic[] = "#?RADIANCE";
+    constexpr char rgbeMagic[] = "#?RGBE";
+    return bytes != nullptr && size >= 7 &&
+        (std::memcmp(bytes, radianceMagic, sizeof(radianceMagic) - 1) == 0 ||
+         std::memcmp(bytes, rgbeMagic, sizeof(rgbeMagic) - 1) == 0);
+}
+
+[[nodiscard]] bool isHdrPath(const std::string& uri) {
+    if (uri.empty()) return false;
+    std::string lower = uri;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return lower.ends_with(".hdr") || lower.ends_with(".rgbe");
+}
+
+[[nodiscard]] std::pair<int, int> readRadianceDimensions(const unsigned char* bytes, int size) {
+    if (bytes == nullptr || size <= 0) {
+        return {1, 1};
+    }
+    const std::string header(reinterpret_cast<const char*>(bytes), static_cast<size_t>(size));
+    const size_t marker = header.find("-Y ");
+    if (marker == std::string::npos) {
+        return {1, 1};
+    }
+    std::istringstream dims(header.substr(marker));
+    std::string yToken;
+    std::string xToken;
+    int height = 1;
+    int width = 1;
+    if (!(dims >> yToken >> height >> xToken >> width) || yToken != "-Y" || xToken != "+X") {
+        return {1, 1};
+    }
+    return {std::max(width, 1), std::max(height, 1)};
+}
+
+bool loadImageDataPreservingKtx2(
+    tinygltf::Image* image,
+    const int imageIndex,
+    std::string* error,
+    std::string* warning,
+    int reqWidth,
+    int reqHeight,
+    const unsigned char* bytes,
+    int size,
+    void* userData) {
+    const bool ktx2 = image != nullptr &&
+        (image->mimeType == "image/ktx2" || isKtx2Path(image->uri) || isKtx2Bytes(bytes, size));
+    const bool hdr = image != nullptr &&
+        (image->mimeType == "image/vnd.radiance" || image->mimeType == "image/hdr" || isHdrPath(image->uri) || isHdrBytes(bytes, size));
+    if (!ktx2 && !hdr) {
+        return tinygltf::LoadImageData(image, imageIndex, error, warning, reqWidth, reqHeight, bytes, size, userData);
+    }
+
+    image->image.assign(bytes, bytes + size);
+    if (ktx2) {
+        image->width = isKtx2Bytes(bytes, size) ? static_cast<int>(readKtx2U32(bytes, 20)) : 1;
+        image->height = isKtx2Bytes(bytes, size) ? static_cast<int>(readKtx2U32(bytes, 24)) : 1;
+    } else {
+        const auto [width, height] = readRadianceDimensions(bytes, size);
+        image->width = width;
+        image->height = height;
+    }
+    image->component = 4;
+    image->bits = 8;
+    image->pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    return true;
 }
 
 [[nodiscard]] TextureAsset textureFromImage(const tinygltf::Image& image, const std::filesystem::path& gltfPath) {
@@ -178,8 +262,11 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
             texture.channels = 4;
             texture.mipLevels = td.mipLevels;
             texture.isCompressed = td.isCompressed;
+            texture.linearColorSpace = td.linearColorSpace;
+            texture.format = td.format;
             texture.compressedFormat = td.compressedFormat;
             texture.rgba8 = std::move(td.pixels);
+            texture.mipData = std::move(td.mipData);
             texture.fallback = false;
             return texture;
         } catch (const std::runtime_error& e) {
@@ -187,8 +274,81 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
         }
     }
 
+    const bool externalImage = !texture.sourcePath.empty() && texture.sourcePath != gltfPath && std::filesystem::exists(texture.sourcePath);
+    if (externalImage) {
+        try {
+            TextureData td = TextureLoader::load(texture.sourcePath.string());
+            texture.width = static_cast<uint32_t>(td.width);
+            texture.height = static_cast<uint32_t>(td.height);
+            texture.channels = 4;
+            texture.mipLevels = td.mipLevels;
+            texture.isCompressed = td.isCompressed;
+            texture.linearColorSpace = td.linearColorSpace;
+            texture.format = td.format;
+            texture.compressedFormat = td.compressedFormat;
+            texture.rgba8 = std::move(td.pixels);
+            texture.mipData = std::move(td.mipData);
+            texture.fallback = false;
+            return texture;
+        } catch (const std::runtime_error& e) {
+            std::cerr << "High-precision texture load failed: " << e.what() << ", trying decoded glTF image data\n";
+        }
+    }
+
     const size_t pixelCount = static_cast<size_t>(texture.width) * texture.height;
     const size_t expectedRgbaBytes = pixelCount * 4u;
+    const size_t componentCount = static_cast<size_t>(std::max(image.component, 0));
+
+    const bool canDecodeFloat =
+        image.bits == 32 &&
+        image.pixel_type == TINYGLTF_COMPONENT_TYPE_FLOAT &&
+        image.component > 0 &&
+        image.component <= 4 &&
+        image.image.size() >= pixelCount * componentCount * sizeof(float);
+    if (canDecodeFloat) {
+        texture.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        texture.linearColorSpace = true;
+        texture.rgba8.resize(pixelCount * 4u * sizeof(float));
+        for (size_t i = 0; i < pixelCount; ++i) {
+            const size_t src = i * componentCount;
+            const size_t dst = i * 4u;
+            float values[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            for (size_t c = 0; c < componentCount; ++c) {
+                std::memcpy(&values[c], image.image.data() + (src + c) * sizeof(float), sizeof(float));
+            }
+            if (componentCount == 1) {
+                values[1] = values[0];
+                values[2] = values[0];
+            }
+            std::memcpy(texture.rgba8.data() + dst * sizeof(float), values, sizeof(values));
+        }
+        return texture;
+    }
+
+    const bool canDecode16Bit =
+        image.bits == 16 &&
+        image.component > 0 &&
+        image.component <= 4 &&
+        image.image.size() >= pixelCount * componentCount * sizeof(uint16_t);
+    if (canDecode16Bit) {
+        texture.format = VK_FORMAT_R16G16B16A16_UNORM;
+        texture.rgba8.resize(pixelCount * 4u * sizeof(uint16_t));
+        for (size_t i = 0; i < pixelCount; ++i) {
+            const size_t src = i * componentCount;
+            const size_t dst = i * 4u;
+            uint16_t values[4] = {0u, 0u, 0u, 65535u};
+            for (size_t c = 0; c < componentCount; ++c) {
+                std::memcpy(&values[c], image.image.data() + (src + c) * sizeof(uint16_t), sizeof(uint16_t));
+            }
+            if (componentCount == 1) {
+                values[1] = values[0];
+                values[2] = values[0];
+            }
+            std::memcpy(texture.rgba8.data() + dst * sizeof(uint16_t), values, sizeof(values));
+        }
+        return texture;
+    }
+
     const bool canDecode8Bit =
         image.bits == 8 &&
         image.component > 0 &&
@@ -206,6 +366,7 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
         return texture;
     }
 
+    texture.format = VK_FORMAT_R8G8B8A8_UNORM;
     texture.rgba8.resize(expectedRgbaBytes);
     if (image.component == 4 && image.image.size() == expectedRgbaBytes) {
         texture.rgba8 = image.image;
@@ -565,6 +726,7 @@ GltfLoader::GltfLoader(AssetManager& assets)
 
 SceneAsset GltfLoader::load(const std::filesystem::path& path) {
     tinygltf::TinyGLTF loader;
+    loader.SetImageLoader(loadImageDataPreservingKtx2, nullptr);
     tinygltf::Model model;
     std::string error;
     std::string warning;
@@ -611,7 +773,7 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
             texture = textureFromImage(model.images[static_cast<size_t>(sourceTexture.source)], path);
         }
         texture.name = texture.name.empty() ? sourceTexture.name : texture.name;
-        texture.srgb = colorTextureUse[textureIndex] && !dataTextureUse[textureIndex];
+        texture.srgb = colorTextureUse[textureIndex] && !dataTextureUse[textureIndex] && !texture.linearColorSpace;
         texture.sampler = samplerFromGltf(model, sourceTexture);
         textureHandles.push_back(assets_.addTexture(std::move(texture)));
     }
@@ -814,9 +976,15 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     texture.width = cachedTex.width;
                     texture.height = cachedTex.height;
                     texture.channels = cachedTex.channels;
+                    texture.mipLevels = cachedTex.mipLevels;
                     texture.srgb = cachedTex.srgb;
                     texture.fallback = cachedTex.fallback;
+                    texture.isCompressed = cachedTex.isCompressed;
+                    texture.linearColorSpace = cachedTex.linearColorSpace;
+                    texture.format = static_cast<VkFormat>(cachedTex.format);
+                    texture.compressedFormat = static_cast<VkFormat>(cachedTex.compressedFormat);
                     texture.rgba8 = cachedTex.rgba8;
+                    texture.mipData = cachedTex.mipData;
                     texture.sampler.minFilter = static_cast<TextureFilter>(cachedTex.minFilter);
                     texture.sampler.magFilter = static_cast<TextureFilter>(cachedTex.magFilter);
                     texture.sampler.wrapS = static_cast<TextureWrap>(cachedTex.wrapS);
@@ -1001,8 +1169,11 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedTex.srgb = texture->srgb;
         cachedTex.fallback = texture->fallback;
         cachedTex.isCompressed = texture->isCompressed;
+        cachedTex.linearColorSpace = texture->linearColorSpace;
+        cachedTex.format = static_cast<uint32_t>(texture->format);
         cachedTex.compressedFormat = static_cast<uint32_t>(texture->compressedFormat);
         cachedTex.rgba8 = texture->rgba8;
+        cachedTex.mipData = texture->mipData;
         cachedTex.minFilter = static_cast<uint32_t>(texture->sampler.minFilter);
         cachedTex.magFilter = static_cast<uint32_t>(texture->sampler.magFilter);
         cachedTex.wrapS = static_cast<uint32_t>(texture->sampler.wrapS);

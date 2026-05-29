@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtv/Image.h"
+#include "rtv/TextureAsset.h"
 
 #include <Volk/volk.h>
 
@@ -18,7 +19,10 @@ struct TextureData {
     int depth = 0;
     int mipLevels = 0;
     std::vector<unsigned char> pixels;
+    std::vector<TextureMipLevel> mipData;
     bool isCompressed = false;
+    bool linearColorSpace = false;
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkFormat compressedFormat = VK_FORMAT_UNDEFINED;
 };
 

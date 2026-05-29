@@ -23,8 +23,11 @@ struct CachedTextureData {
     bool srgb = false;
     bool fallback = false;
     bool isCompressed = false;
+    bool linearColorSpace = false;
+    uint32_t format = VK_FORMAT_R8G8B8A8_UNORM;
     uint32_t compressedFormat = 0;
     std::vector<uint8_t> rgba8;
+    std::vector<TextureMipLevel> mipData;
     uint32_t minFilter = 1;
     uint32_t magFilter = 1;
     uint32_t wrapS = 0;
