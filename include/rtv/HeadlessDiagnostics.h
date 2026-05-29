@@ -104,6 +104,29 @@ struct ProfileReport {
     PerPassGpuMs perPassGpuMsP95{};
     PerPassGpuMs perPassGpuMsP99{};
 
+    struct QueueLaneMs {
+        float graphics = 0.0f;
+        float rayTracing = 0.0f;
+        float compute = 0.0f;
+        float queueWait = 0.0f;
+    } queueLaneMs{};
+
+    struct AsyncComputeReport {
+        bool enabled = false;
+        bool disabledByCli = false;
+        bool singleQueueFallback = false;
+        bool timelineSemaphore = false;
+        bool independentQueue = false;
+        bool dedicatedComputeFamily = false;
+        bool crossFamily = false;
+        std::optional<uint32_t> graphicsFamily;
+        std::optional<uint32_t> computeFamily;
+        uint32_t computeQueueIndex = 0;
+        std::string resourceSharingMode = "exclusive";
+        uint32_t resourceSharingQueueFamilyCount = 0;
+        std::vector<uint32_t> resourceSharingQueueFamilies;
+    } asyncCompute{};
+
     struct PipelineStatistics {
         uint64_t rayInvocations = 0;
         uint64_t triangleHits = 0;

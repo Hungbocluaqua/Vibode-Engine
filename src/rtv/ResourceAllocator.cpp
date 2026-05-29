@@ -15,6 +15,13 @@ ResourceAllocator::ResourceAllocator(const VulkanContext& context) {
     supportsDeviceAddress_ = context.supportsBufferDeviceAddress();
     supportsSamplerAnisotropy_ = context.supportsSamplerAnisotropy();
     maxSamplerAnisotropy_ = context.maxSamplerAnisotropy();
+    const QueueFamilyIndices& queues = context.queueFamilies();
+    if (queues.graphics.has_value() && queues.compute.has_value() && queues.graphics.value() != queues.compute.value()) {
+        graphicsComputeSharingMode_ = VK_SHARING_MODE_CONCURRENT;
+        graphicsComputeQueueFamilyCount_ = 2;
+        graphicsComputeQueueFamilies_[0] = queues.graphics.value();
+        graphicsComputeQueueFamilies_[1] = queues.compute.value();
+    }
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;

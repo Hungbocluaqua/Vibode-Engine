@@ -177,6 +177,27 @@ void GpuProfiler::collectCompletedFrame() {
     timings_.selectionOutlineMs = smooth(timings_.selectionOutlineMs, elapsedMs(SelectionOutlineStart, SelectionOutlineEnd));
     timings_.fullscreenMs = smooth(timings_.fullscreenMs, elapsedMs(FullscreenStart, FullscreenEnd));
     timings_.editorPresentationMs = smooth(timings_.editorPresentationMs, elapsedMs(EditorPresentationStart, EditorPresentationEnd));
+    timings_.queueWaitMs = smooth(timings_.queueWaitMs, elapsedMs(AsyncProducerEnd, AsyncComputeStart));
+    timings_.rayTracingLaneMs = timings_.pathTraceMs;
+    timings_.computeLaneMs =
+        timings_.restirHistoryClearMs +
+        timings_.restirGiClearMs +
+        timings_.restirSpatialMs +
+        timings_.restirSpatialCopyMs +
+        timings_.restirGiSpatialMs +
+        timings_.restirGiFinalMs +
+        timings_.fogIntegrateMs +
+        timings_.atmosphereMs +
+        timings_.denoiserMs +
+        timings_.momentUpdateMs +
+        timings_.historyCopyMs +
+        timings_.skipDenoiserCopyMs +
+        timings_.taaMs +
+        timings_.taaHistoryCopyMs +
+        timings_.autoExposureMs +
+        timings_.toneMapMs +
+        timings_.selectionOutlineMs;
+    timings_.graphicsLaneMs = timings_.fullscreenMs + timings_.editorPresentationMs;
     submitted_ = false;
 
     if (!statsSubmitted_ || statsQueryPool_ == VK_NULL_HANDLE) {

@@ -63,7 +63,11 @@ void Image::create(ResourceAllocator& allocator, const ImageDesc& desc) {
     imageInfo.initialLayout = desc_.initialLayout;
     imageInfo.usage = desc_.usage;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.sharingMode = allocator.graphicsComputeSharingMode();
+    if (imageInfo.sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        imageInfo.queueFamilyIndexCount = allocator.graphicsComputeQueueFamilyCount();
+        imageInfo.pQueueFamilyIndices = allocator.graphicsComputeQueueFamilies();
+    }
 
     VmaAllocationCreateInfo allocationInfo{};
     allocationInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;

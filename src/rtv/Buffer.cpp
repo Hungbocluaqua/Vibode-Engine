@@ -82,7 +82,11 @@ void Buffer::create(ResourceAllocator& allocator, const BufferDesc& desc) {
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = desc.size;
     bufferInfo.usage = desc.usage;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bufferInfo.sharingMode = allocator.graphicsComputeSharingMode();
+    if (bufferInfo.sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        bufferInfo.queueFamilyIndexCount = allocator.graphicsComputeQueueFamilyCount();
+        bufferInfo.pQueueFamilyIndices = allocator.graphicsComputeQueueFamilies();
+    }
 
     VmaAllocationCreateInfo allocationInfo{};
     allocationInfo.usage = memoryUsage(desc.memory);

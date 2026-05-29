@@ -84,7 +84,8 @@ public:
 
     void beginFrame(uint32_t frameIndex, VkExtent2D renderExtent, VkExtent2D displayExtent);
     void setFrameDeltaSeconds(float deltaSeconds) { frameDeltaSeconds_ = deltaSeconds; }
-    void recordPathTrace(VkCommandBuffer commandBuffer);
+    void recordPathTrace(VkCommandBuffer commandBuffer, bool deferPostTraceCompute = false);
+    [[nodiscard]] bool recordAsyncComputeWork(VkCommandBuffer commandBuffer);
     void recordFullscreen(VkCommandBuffer commandBuffer, VkExtent2D swapchainExtent);
     void recordEditorPresentationStart(VkCommandBuffer commandBuffer);
     void recordEditorPresentationEnd(VkCommandBuffer commandBuffer);
@@ -315,12 +316,14 @@ private:
     void recordRestirGiFinalPass(VkCommandBuffer commandBuffer);
     void recordHeightFog(VkCommandBuffer commandBuffer);
     void recordHeightFogPass(VkCommandBuffer commandBuffer);
+    void recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy = false);
     void recordDenoiser(VkCommandBuffer commandBuffer);
     void recordDenoiserPass(VkCommandBuffer commandBuffer);
     void recordMomentUpdate(VkCommandBuffer commandBuffer);
     void recordMomentUpdatePass(VkCommandBuffer commandBuffer);
-    void recordTaa(VkCommandBuffer commandBuffer);
+    void recordTaa(VkCommandBuffer commandBuffer, bool deferHistoryCopy = false);
     void recordTaaPass(VkCommandBuffer commandBuffer);
+    void copyTaaHistory(VkCommandBuffer commandBuffer);
     void recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer);
     void recordAutoExposure(VkCommandBuffer commandBuffer);
     void recordAutoExposureHistogramPass(VkCommandBuffer commandBuffer);
@@ -385,6 +388,9 @@ private:
     bool denoiserHistoryValid_ = false;
     uint32_t denoiserFramesSinceReset_ = 0;
     bool taaHistoryValid_ = false;
+    bool asyncHistoryCopyPending_ = false;
+    bool asyncTaaHistoryCopyPending_ = false;
+    bool asyncPostProcessPending_ = false;
     bool restirGiHistoryValid_ = false;
     bool restirGiUncompressedLayout_ = false;
 

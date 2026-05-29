@@ -46,6 +46,7 @@ constexpr VkDeviceSize kFrameRestirSpatialParamsOffset = 20480;
 constexpr VkDeviceSize kFrameFogParamsOffset = 24576;
 constexpr VkDeviceSize kFrameMomentParamsOffset = 28672;
 constexpr uint32_t kRendererFramesInFlight = 3;
+constexpr VkPipelineStageFlags2 kCrossQueueShaderStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
 float halton(uint32_t index, uint32_t base) {
     float result = 0.0f;
@@ -1600,7 +1601,10 @@ void PathTracerRenderer::updateCamera() {
     previousJitter_ = currentJitter;
 }
 
-void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
+void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer, bool deferPostTraceCompute) {
+    asyncHistoryCopyPending_ = false;
+    asyncTaaHistoryCopyPending_ = false;
+    asyncPostProcessPending_ = false;
     if (dumpRenderGraphPath_.has_value() || dumpRenderGraphDotPath_.has_value()) {
         recordRenderGraphPlan();
     }
@@ -1622,26 +1626,64 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
     recordRestirSpatial(commandBuffer);
     recordHeightFog(commandBuffer);
 
+    if (deferPostTraceCompute) {
+        currentProfiler_->write(commandBuffer, GpuProfiler::AsyncProducerEnd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+        asyncPostProcessPending_ = true;
+    } else {
+        recordPostTraceCompute(commandBuffer, false);
+    }
+    cameraChangedThisFrame_ = false;
+    if (temporalSystem_) {
+        temporalSystem_->endFrame();
+    }
+    currentProfiler_->markSubmitted();
+}
+
+bool PathTracerRenderer::recordAsyncComputeWork(VkCommandBuffer commandBuffer) {
+    const bool recordHistoryCopy = asyncHistoryCopyPending_;
+    const bool recordTaaHistoryCopy = asyncTaaHistoryCopyPending_;
+    const bool recordPostProcess = asyncPostProcessPending_;
+    if (!recordHistoryCopy && !recordTaaHistoryCopy && !recordPostProcess) {
+        return false;
+    }
+    asyncHistoryCopyPending_ = false;
+    asyncTaaHistoryCopyPending_ = false;
+    asyncPostProcessPending_ = false;
+    currentProfiler_->write(commandBuffer, GpuProfiler::AsyncComputeStart, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    if (recordPostProcess) {
+        recordPostTraceCompute(commandBuffer, false);
+    } else {
+        if (recordHistoryCopy) {
+            copyHistoryResources(commandBuffer);
+        }
+        if (recordTaaHistoryCopy) {
+            copyTaaHistory(commandBuffer);
+        }
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::AsyncComputeEnd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    return true;
+}
+
+void PathTracerRenderer::recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy) {
     if (shouldRunDenoiser()) {
         recordMomentUpdate(commandBuffer);
         recordDenoiser(commandBuffer);
-        copyHistoryResources(commandBuffer);
+        if (deferHistoryCopy) {
+            asyncHistoryCopyPending_ = true;
+        } else {
+            copyHistoryResources(commandBuffer);
+        }
     } else {
         skipDenoiserPass(commandBuffer);
     }
     if (shouldRunTaa()) {
-        recordTaa(commandBuffer);
+        recordTaa(commandBuffer, deferHistoryCopy);
     }
     if (settings_.autoExposureEnabled) {
         recordAutoExposure(commandBuffer);
     }
     recordToneMap(commandBuffer);
     recordSelectionOutline(commandBuffer);
-    cameraChangedThisFrame_ = false;
-    if (temporalSystem_) {
-        temporalSystem_->endFrame();
-    }
-    currentProfiler_->markSubmitted();
 }
 
 void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
@@ -2358,13 +2400,13 @@ void PathTracerRenderer::recordSelectionOutline(VkCommandBuffer commandBuffer) {
         .external = true,
         .hasInitialAccess = true,
         .initialAccess = ResourceAccess{
-            .stage = presentationImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .stage = presentationImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
             .access = presentationImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = presentationImage_.layout(),
         },
         .hasFinalAccess = true,
         .finalAccess = ResourceAccess{
-            .stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .stage = kCrossQueueShaderStage,
             .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },
@@ -2511,7 +2553,7 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
     };
     graph.resources()[denoised.index].hasInitialAccess = true;
     graph.resources()[denoised.index].initialAccess = ResourceAccess{
-        .stage = denoisedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .stage = denoisedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
         .access = denoisedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         .layout = denoisedImage_.layout(),
     };
@@ -2820,6 +2862,29 @@ void PathTracerRenderer::recordMomentUpdatePass(VkCommandBuffer commandBuffer) {
 
 void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
     RenderGraph graph(&allocator_);
+    auto copySourceInitialAccess = [](const Image& image) {
+        ResourceAccess access{};
+        access.layout = image.layout();
+        switch (image.layout()) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+            access.stage = VK_PIPELINE_STAGE_2_NONE;
+            access.access = VK_ACCESS_2_NONE;
+            break;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            access.stage = kCrossQueueShaderStage;
+            access.access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+            access.stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            access.access = VK_ACCESS_2_TRANSFER_READ_BIT;
+            break;
+        default:
+            access.stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            access.access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            break;
+        }
+        return access;
+    };
     const RenderGraphResourceId denoised = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
         .lifetime = RenderGraphResource::Lifetime::Persistent,
@@ -2836,7 +2901,7 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
         },
         .hasFinalAccess = true,
         .finalAccess = ResourceAccess{
-            .stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .stage = kCrossQueueShaderStage,
             .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },
@@ -2873,11 +2938,7 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
         .imageRange = diffuseResolvedImage_.fullRange(),
         .external = true,
         .hasInitialAccess = true,
-        .initialAccess = ResourceAccess{
-            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .layout = VK_IMAGE_LAYOUT_GENERAL,
-        },
+        .initialAccess = copySourceInitialAccess(denoisedImage_),
         .debugName = "current diffuse history hdr",
     });
     const RenderGraphResourceId specularResolved = graph.createTexture(RenderGraphResource{
@@ -3305,7 +3366,7 @@ const Image& PathTracerRenderer::hdrPostProcessImage() const {
     return shouldRunTaa() ? taaImage_ : postDenoiseImage();
 }
 
-void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
+void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer, bool deferHistoryCopy) {
     RenderGraph graph(&allocator_);
     const Image& inputImage = postDenoiseImage();
     const RenderGraphResourceId input = graph.createTexture(RenderGraphResource{
@@ -3338,13 +3399,13 @@ void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
         .external = true,
         .hasInitialAccess = true,
         .initialAccess = ResourceAccess{
-            .stage = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .stage = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
             .access = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = taaImage_.layout(),
         },
         .hasFinalAccess = true,
         .finalAccess = ResourceAccess{
-            .stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .stage = kCrossQueueShaderStage,
             .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },
@@ -3421,16 +3482,22 @@ void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer) {
         .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             recordTaaPass(cmd);
         });
-    graph.addPass("taa_history_copy")
-        .addStorageRead(output, PipelineDomain::Transfer)
-        .addStorageWrite(history, PipelineDomain::Transfer)
-        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
-            recordTaaHistoryCopyPass(cmd);
-        });
+    if (!deferHistoryCopy) {
+        graph.addPass("taa_history_copy")
+            .addStorageRead(output, PipelineDomain::Transfer)
+            .addStorageWrite(history, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordTaaHistoryCopyPass(cmd);
+            });
+    }
     graph.compile();
     graph.execute(commandBuffer, temporalFrameIndex_);
     taaImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    taaHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    if (deferHistoryCopy) {
+        asyncTaaHistoryCopyPending_ = true;
+    } else {
+        taaHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    }
 }
 
 void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
@@ -3458,6 +3525,72 @@ void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, taaPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     taaPipeline_->dispatch(commandBuffer, displayExtent_.width, displayExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::copyTaaHistory(VkCommandBuffer commandBuffer) {
+    RenderGraph graph(&allocator_);
+    const RenderGraphResourceId output = graph.createTexture(RenderGraphResource{
+        .type = RenderGraphResource::Type::Texture,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .format = taaImage_.format(),
+        .extent = taaImage_.extent(),
+        .image = taaImage_.handle(),
+        .imageRange = taaImage_.fullRange(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+                ? VK_PIPELINE_STAGE_2_NONE
+                : kCrossQueueShaderStage,
+            .access = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+                ? VK_ACCESS_2_NONE
+                : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .layout = taaImage_.layout(),
+        },
+        .hasFinalAccess = true,
+        .finalAccess = ResourceAccess{
+            .stage = kCrossQueueShaderStage,
+            .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+        .debugName = "taa output hdr",
+    });
+    const RenderGraphResourceId history = graph.createTexture(RenderGraphResource{
+        .type = RenderGraphResource::Type::Texture,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .format = taaHistoryImage_.format(),
+        .extent = taaHistoryImage_.extent(),
+        .image = taaHistoryImage_.handle(),
+        .imageRange = taaHistoryImage_.fullRange(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = taaHistoryImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+                ? VK_PIPELINE_STAGE_2_NONE
+                : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = taaHistoryImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+                ? VK_ACCESS_2_NONE
+                : VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .layout = taaHistoryImage_.layout(),
+        },
+        .hasFinalAccess = true,
+        .finalAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .debugName = "taa history hdr",
+    });
+    graph.addPass("taa_history_copy")
+        .addStorageRead(output, PipelineDomain::Transfer)
+        .addStorageWrite(history, PipelineDomain::Transfer)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordTaaHistoryCopyPass(cmd);
+        });
+    graph.compile();
+    graph.execute(commandBuffer, temporalFrameIndex_);
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    taaHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 }
 
 void PathTracerRenderer::recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer) {
@@ -3501,7 +3634,7 @@ void PathTracerRenderer::recordAutoExposure(VkCommandBuffer commandBuffer) {
         .initialAccess = ResourceAccess{
             .stage = sourceImage.layout() == VK_IMAGE_LAYOUT_UNDEFINED
                 ? VK_PIPELINE_STAGE_2_NONE
-                : (VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT),
+                : kCrossQueueShaderStage,
             .access = sourceImage.layout() == VK_IMAGE_LAYOUT_UNDEFINED
                 ? VK_ACCESS_2_NONE
                 : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
@@ -3644,13 +3777,13 @@ void PathTracerRenderer::recordToneMap(VkCommandBuffer commandBuffer) {
         .external = true,
         .hasInitialAccess = true,
         .initialAccess = ResourceAccess{
-            .stage = presentationImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .stage = presentationImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
             .access = presentationImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = presentationImage_.layout(),
         },
         .hasFinalAccess = true,
         .finalAccess = ResourceAccess{
-            .stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .stage = kCrossQueueShaderStage,
             .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },
@@ -3752,13 +3885,13 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
         .external = true,
         .hasInitialAccess = true,
         .initialAccess = ResourceAccess{
-            .stage = denoisedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .stage = denoisedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
             .access = denoisedImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = denoisedImage_.layout(),
         },
         .hasFinalAccess = true,
         .finalAccess = ResourceAccess{
-            .stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .stage = kCrossQueueShaderStage,
             .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },

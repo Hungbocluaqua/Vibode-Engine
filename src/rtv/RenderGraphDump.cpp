@@ -10,7 +10,6 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 
 namespace rtv {
 
@@ -33,12 +32,13 @@ const char* resourceLifetimeName(RenderGraphResource::Lifetime lifetime) {
     return "Unknown";
 }
 
-const char* queueNameForDomain(PipelineDomain domain) {
+const char* queueNameForDomain(RenderGraphQueueDomain domain) {
     switch (domain) {
-    case PipelineDomain::Graphics:    return "graphics";
-    case PipelineDomain::Compute:     return "compute";
-    case PipelineDomain::RayTracing:  return "raytracing";
-    case PipelineDomain::Transfer:    return "transfer";
+    case RenderGraphQueueDomain::Graphics:          return "graphics";
+    case RenderGraphQueueDomain::RayTracing:        return "raytracing";
+    case RenderGraphQueueDomain::Compute:           return "compute";
+    case RenderGraphQueueDomain::Transfer:          return "transfer";
+    case RenderGraphQueueDomain::SameFamilyCompute: return "same_family_compute";
     }
     return "unknown";
 }
@@ -88,12 +88,13 @@ const char* formatName(VkFormat format) {
     }
 }
 
-const char* domainColor(PipelineDomain domain) {
+const char* domainColor(RenderGraphQueueDomain domain) {
     switch (domain) {
-    case PipelineDomain::Graphics:    return "lightblue";
-    case PipelineDomain::Compute:     return "lightgreen";
-    case PipelineDomain::RayTracing:  return "lightblue";
-    case PipelineDomain::Transfer:    return "lightyellow";
+    case RenderGraphQueueDomain::Graphics:          return "lightblue";
+    case RenderGraphQueueDomain::RayTracing:        return "lightblue";
+    case RenderGraphQueueDomain::Compute:           return "lightgreen";
+    case RenderGraphQueueDomain::SameFamilyCompute: return "palegreen";
+    case RenderGraphQueueDomain::Transfer:          return "lightyellow";
     }
     return "white";
 }
@@ -161,33 +162,13 @@ void dumpRenderGraphJson(
     const auto& barriers = graph.compiledBarriers();
 
     nlohmann::json passesJson = nlohmann::json::array();
-    std::unordered_map<uint32_t, PipelineDomain> passDomains;
-
     for (uint32_t passIndex : compiledOrder) {
         const auto& pass = passes[passIndex];
         nlohmann::json pj;
         pj["name"] = pass.name();
         pj["skipped"] = false;
 
-        PipelineDomain domain = PipelineDomain::Compute;
-        for (const auto& use : pass.uses()) {
-            if (use.domain == PipelineDomain::RayTracing) {
-                domain = PipelineDomain::RayTracing;
-                break;
-            }
-        }
-        if (domain == PipelineDomain::Compute) {
-            for (const auto& use : pass.uses()) {
-                if (use.domain == PipelineDomain::Compute) {
-                    domain = PipelineDomain::Compute;
-                    break;
-                }
-                if (use.domain == PipelineDomain::Graphics) {
-                    domain = PipelineDomain::Graphics;
-                }
-            }
-        }
-        passDomains[passIndex] = domain;
+        const RenderGraphQueueDomain domain = pass.queueDomain();
         pj["queue"] = queueNameForDomain(domain);
 
         nlohmann::json inputs = nlohmann::json::array();
@@ -236,6 +217,8 @@ void dumpRenderGraphJson(
                 bj["resource"] = resName;
                 bj["before_pass"] = beforePassName;
                 bj["after_pass"] = pass.name();
+                bj["before_queue"] = queueNameForDomain(barrier.beforeQueue);
+                bj["after_queue"] = queueNameForDomain(barrier.afterQueue);
                 bj["before"] = {
                     {"stage", vulkanStageName(barrier.before.stage)},
                     {"access", vulkanAccessName(barrier.before.access)},
@@ -285,6 +268,8 @@ void dumpRenderGraphJson(
         bj["resource"] = resName;
         bj["before_pass"] = beforePassName;
         bj["after_pass"] = afterPassName;
+        bj["before_queue"] = queueNameForDomain(barrier.beforeQueue);
+        bj["after_queue"] = queueNameForDomain(barrier.afterQueue);
         bj["before"] = {
             {"stage", vulkanStageName(barrier.before.stage)},
             {"access", vulkanAccessName(barrier.before.access)},
@@ -333,37 +318,19 @@ void dumpRenderGraphDot(
     file << "    rankdir=TB;\n";
     file << "    node [shape=box, style=filled];\n\n";
 
-    std::unordered_map<uint32_t, PipelineDomain> passDomains;
     for (uint32_t passIndex : compiledOrder) {
         const auto& pass = passes[passIndex];
-        PipelineDomain domain = PipelineDomain::Compute;
-        for (const auto& use : pass.uses()) {
-            if (use.domain == PipelineDomain::RayTracing) {
-                domain = PipelineDomain::RayTracing;
-                break;
-            }
-        }
-        if (domain == PipelineDomain::Compute) {
-            for (const auto& use : pass.uses()) {
-                if (use.domain == PipelineDomain::Compute) {
-                    domain = PipelineDomain::Compute;
-                    break;
-                }
-                if (use.domain == PipelineDomain::Graphics) {
-                    domain = PipelineDomain::Graphics;
-                }
-            }
-        }
-        passDomains[passIndex] = domain;
+        const RenderGraphQueueDomain domain = pass.queueDomain();
 
         float gpuMs = timingForPassName(timings, pass.name());
         file << "    \"" << pass.name() << "\" [fillcolor=" << domainColor(domain)
              << ", label=\"" << pass.name() << "\\n(";
         switch (domain) {
-        case PipelineDomain::RayTracing: file << "RayTracing"; break;
-        case PipelineDomain::Compute: file << "Compute"; break;
-        case PipelineDomain::Graphics: file << "Graphics"; break;
-        case PipelineDomain::Transfer: file << "Transfer"; break;
+        case RenderGraphQueueDomain::RayTracing: file << "RayTracing"; break;
+        case RenderGraphQueueDomain::Compute: file << "Compute"; break;
+        case RenderGraphQueueDomain::SameFamilyCompute: file << "SameFamilyCompute"; break;
+        case RenderGraphQueueDomain::Graphics: file << "Graphics"; break;
+        case RenderGraphQueueDomain::Transfer: file << "Transfer"; break;
         }
         file << ")\\n" << gpuMs << "ms\"];\n";
     }

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <set>
 #include <stdexcept>
 
@@ -132,11 +133,11 @@ std::unique_ptr<VulkanContext> VulkanContext::createHeadless() {
 }
 
 VulkanContext::~VulkanContext() {
-    if (timelineSemaphore_ != VK_NULL_HANDLE) {
-        vkDestroySemaphore(device_, timelineSemaphore_, nullptr);
-    }
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
+        if (timelineSemaphore_ != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device_, timelineSemaphore_, nullptr);
+        }
         vkDestroyDevice(device_, nullptr);
     }
     if (surface_ != VK_NULL_HANDLE) {
@@ -226,23 +227,27 @@ void VulkanContext::pickPhysicalDevice() {
 }
 
 void VulkanContext::createDevice() {
-    std::set<uint32_t> uniqueFamilies = {
-        queueFamilies_.graphics.value(),
-        queueFamilies_.present.value(),
+    std::map<uint32_t, uint32_t> queueCounts;
+    auto requireQueue = [&](uint32_t family, uint32_t queueIndex) {
+        queueCounts[family] = std::max(queueCounts[family], queueIndex + 1u);
     };
-    if (queueFamilies_.hasDedicatedCompute()) {
-        uniqueFamilies.insert(queueFamilies_.compute.value());
+    requireQueue(queueFamilies_.graphics.value(), 0);
+    requireQueue(queueFamilies_.present.value(), 0);
+    if (queueFamilies_.compute.has_value()) {
+        requireQueue(queueFamilies_.compute.value(), queueFamilies_.computeQueueIndex);
     }
 
-    const float priority = 1.0f;
     std::vector<VkDeviceQueueCreateInfo> queueInfos;
-    queueInfos.reserve(uniqueFamilies.size());
-    for (uint32_t family : uniqueFamilies) {
+    std::vector<std::vector<float>> queuePriorities;
+    queueInfos.reserve(queueCounts.size());
+    queuePriorities.reserve(queueCounts.size());
+    for (const auto& [family, count] : queueCounts) {
+        queuePriorities.push_back(std::vector<float>(count, 1.0f));
         VkDeviceQueueCreateInfo queueInfo{};
         queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         queueInfo.queueFamilyIndex = family;
-        queueInfo.queueCount = 1;
-        queueInfo.pQueuePriorities = &priority;
+        queueInfo.queueCount = count;
+        queueInfo.pQueuePriorities = queuePriorities.back().data();
         queueInfos.push_back(queueInfo);
     }
 
@@ -250,6 +255,14 @@ void VulkanContext::createDevice() {
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
+
+    VkPhysicalDeviceTimelineSemaphoreFeatures timelineSupport{};
+    timelineSupport.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    VkPhysicalDeviceFeatures2 supportedFeatures{};
+    supportedFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    supportedFeatures.pNext = &timelineSupport;
+    vkGetPhysicalDeviceFeatures2(physicalDevice_, &supportedFeatures);
+    timelineSemaphoreSupported_ = timelineSupport.timelineSemaphore == VK_TRUE;
 
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipeline{};
     rayTracingPipeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
@@ -291,15 +304,19 @@ void VulkanContext::createDevice() {
     }
     featureTail = &descriptorIndexing;
 
-    VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphore{};
-    timelineSemaphore.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
-    timelineSemaphore.timelineSemaphore = VK_TRUE;
-    timelineSemaphore.pNext = featureTail;
-
     VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV serFeatures{};
     serFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
     serFeatures.rayTracingInvocationReorder = VK_FALSE;
-    serFeatures.pNext = &timelineSemaphore;
+
+    VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphore{};
+    timelineSemaphore.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    timelineSemaphore.timelineSemaphore = VK_TRUE;
+    if (timelineSemaphoreSupported_) {
+        timelineSemaphore.pNext = featureTail;
+        serFeatures.pNext = &timelineSemaphore;
+    } else {
+        serFeatures.pNext = featureTail;
+    }
 
     VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtMaintenance1Features{};
     rtMaintenance1Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
@@ -354,17 +371,21 @@ void VulkanContext::createDevice() {
     vkGetDeviceQueue(device_, queueFamilies_.graphics.value(), 0, &graphicsQueue_);
     vkGetDeviceQueue(device_, queueFamilies_.present.value(), 0, &presentQueue_);
     if (queueFamilies_.compute.has_value()) {
-        vkGetDeviceQueue(device_, queueFamilies_.compute.value(), 0, &computeQueue_);
+        vkGetDeviceQueue(device_, queueFamilies_.compute.value(), queueFamilies_.computeQueueIndex, &computeQueue_);
     }
-    VkSemaphoreTypeCreateInfo timelineCreateInfo{};
-    timelineCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
-    timelineCreateInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    timelineCreateInfo.initialValue = 0;
-    VkSemaphoreCreateInfo semCreateInfo{};
-    semCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    semCreateInfo.pNext = &timelineCreateInfo;
-    checkVk(vkCreateSemaphore(device_, &semCreateInfo, nullptr, &timelineSemaphore_),
-            "vkCreateSemaphore(timeline)");
+    if (timelineSemaphoreSupported_) {
+        VkSemaphoreTypeCreateInfo timelineCreateInfo{};
+        timelineCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+        timelineCreateInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        timelineCreateInfo.initialValue = 0;
+        VkSemaphoreCreateInfo semCreateInfo{};
+        semCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        semCreateInfo.pNext = &timelineCreateInfo;
+        checkVk(vkCreateSemaphore(device_, &semCreateInfo, nullptr, &timelineSemaphore_),
+                "vkCreateSemaphore(timeline)");
+    } else {
+        std::cout << "Timeline semaphore: unavailable; async compute will use single-queue fallback\n";
+    }
 }
 
 bool VulkanContext::validationRequested() const {
@@ -417,38 +438,48 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice physicalDev
 
     QueueFamilyIndices indices;
     std::optional<uint32_t> dedicatedCompute;
+    std::optional<uint32_t> sameFamilyCompute;
+    uint32_t sameFamilyComputeQueueIndex = 0;
     for (uint32_t i = 0; i < queueFamilyCount; ++i) {
         const bool hasGraphics = (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
         const bool hasCompute = (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
 
-        if (hasGraphics) {
+        if (hasGraphics && !indices.graphics.has_value()) {
             indices.graphics = i;
         }
         if (hasCompute && !hasGraphics) {
             dedicatedCompute = i;
         }
+        if (hasGraphics && hasCompute && families[i].queueCount > 1 && !sameFamilyCompute.has_value()) {
+            sameFamilyCompute = i;
+            sameFamilyComputeQueueIndex = 1;
+        }
 
         if (!headless_ && surface_ != VK_NULL_HANDLE) {
             VkBool32 presentSupported = VK_FALSE;
             checkVk(vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, i, surface_, &presentSupported), "vkGetPhysicalDeviceSurfaceSupportKHR");
-            if (presentSupported == VK_TRUE) {
+            if (presentSupported == VK_TRUE && !indices.present.has_value()) {
                 indices.present = i;
             }
         } else if (headless_) {
-            if (hasGraphics) {
+            if (hasGraphics && !indices.present.has_value()) {
                 indices.present = i;
             }
         }
 
-        if (indices.complete()) {
-            break;
-        }
+        // Keep scanning after graphics/present are found so a later dedicated compute
+        // family is not missed.
     }
 
     if (dedicatedCompute.has_value()) {
         indices.compute = *dedicatedCompute;
+        indices.computeQueueIndex = 0;
+    } else if (sameFamilyCompute.has_value()) {
+        indices.compute = *sameFamilyCompute;
+        indices.computeQueueIndex = sameFamilyComputeQueueIndex;
     } else if (indices.graphics.has_value()) {
         indices.compute = *indices.graphics;
+        indices.computeQueueIndex = 0;
     }
 
     return indices;

@@ -357,7 +357,9 @@ Application::Application(
     std::optional<bool> restirGiOverride,
     bool debugViewOverride,
     bool validationCameraMotion,
-    bool headless)
+    bool headless,
+    bool disableAsyncCompute,
+    bool singleQueueFallback)
     : debugView_(debugView),
       gltfPath_(std::move(gltfPath)),
       hdrPath_(std::move(hdrPath)),
@@ -368,6 +370,8 @@ Application::Application(
       restirGiOverride_(restirGiOverride),
       debugViewOverride_(debugViewOverride),
       validationCameraMotion_(validationCameraMotion),
+      disableAsyncCompute_(disableAsyncCompute),
+      singleQueueFallback_(singleQueueFallback),
       headless_(headless) {
     if (!headless_) {
         initWindow();
@@ -534,7 +538,7 @@ void Application::initVulkan() {
     } else {
         swapchain_ = std::make_unique<Swapchain>(*context_, window_);
     }
-    commandSystem_ = std::make_unique<CommandSystem>(*context_, *swapchain_);
+    commandSystem_ = std::make_unique<CommandSystem>(*context_, *swapchain_, disableAsyncCompute_, singleQueueFallback_);
     commandSystem_->setHeadless(headless_);
     const auto projectRoot = resolveProjectRoot();
     const auto shaderDir = projectRoot / "native" / "vulkan" / "shaders";

@@ -32,6 +32,11 @@ VkImage TransientResourcePool::acquireOrCreateImage(uint32_t aliasGroup, const R
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.usage = desc.usage;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.sharingMode = allocator_->graphicsComputeSharingMode();
+    if (imageInfo.sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        imageInfo.queueFamilyIndexCount = allocator_->graphicsComputeQueueFamilyCount();
+        imageInfo.pQueueFamilyIndices = allocator_->graphicsComputeQueueFamilies();
+    }
 
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
@@ -58,6 +63,11 @@ VkBuffer TransientResourcePool::acquireOrCreateBuffer(uint32_t aliasGroup, const
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = desc.size;
     bufferInfo.usage = desc.bufferUsage;
+    bufferInfo.sharingMode = allocator_->graphicsComputeSharingMode();
+    if (bufferInfo.sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        bufferInfo.queueFamilyIndexCount = allocator_->graphicsComputeQueueFamilyCount();
+        bufferInfo.pQueueFamilyIndices = allocator_->graphicsComputeQueueFamilies();
+    }
     VmaAllocationCreateInfo allocInfo{};
     allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -291,6 +301,12 @@ RenderGraphPass& RenderGraphPass::addUniformBuffer(RenderGraphResourceId id, Pip
     return addUse(id, ResourceState::UniformBuffer, PassAccess::Read, domain);
 }
 
+RenderGraphPass& RenderGraphPass::setQueueDomain(RenderGraphQueueDomain domain) {
+    queueDomain_ = domain;
+    queueDomainExplicit_ = true;
+    return *this;
+}
+
 RenderGraphPass& RenderGraphPass::setExecuteCallback(ExecuteCallback callback) {
     callback_ = std::move(callback);
     return *this;
@@ -306,6 +322,25 @@ RenderGraphPass& RenderGraphPass::addUse(RenderGraphResourceId id, ResourceState
         .access = access,
         .domain = domain,
     });
+    if (!queueDomainExplicit_) {
+        switch (domain) {
+        case PipelineDomain::RayTracing:
+            queueDomain_ = RenderGraphQueueDomain::RayTracing;
+            break;
+        case PipelineDomain::Compute:
+            if (queueDomain_ != RenderGraphQueueDomain::RayTracing) {
+                queueDomain_ = RenderGraphQueueDomain::Compute;
+            }
+            break;
+        case PipelineDomain::Transfer:
+            if (queueDomain_ != RenderGraphQueueDomain::RayTracing && queueDomain_ != RenderGraphQueueDomain::Compute) {
+                queueDomain_ = RenderGraphQueueDomain::Transfer;
+            }
+            break;
+        case PipelineDomain::Graphics:
+            break;
+        }
+    }
     return *this;
 }
 
@@ -451,6 +486,10 @@ void RenderGraph::compile() {
                         ? resources_[use.resource.index].initialAccess
                         : resourceAccessFor(previous.state, previous.domain),
                     .after = resourceAccessFor(use.state, use.domain),
+                    .beforeQueue = previousUsePass[use.resource.index] == std::numeric_limits<uint32_t>::max()
+                        ? RenderGraphQueueDomain::Graphics
+                        : passes_[previousUsePass[use.resource.index]].queueDomain(),
+                    .afterQueue = passes_[passIndex].queueDomain(),
                 });
             }
             previousUse[use.resource.index] = use;
@@ -470,6 +509,10 @@ void RenderGraph::compile() {
             .afterPass = std::numeric_limits<uint32_t>::max(),
             .before = resourceAccessFor(previous.state, previous.domain),
             .after = resource.finalAccess,
+            .beforeQueue = previousUsePass[resourceIndex] == std::numeric_limits<uint32_t>::max()
+                ? RenderGraphQueueDomain::Graphics
+                : passes_[previousUsePass[resourceIndex]].queueDomain(),
+            .afterQueue = RenderGraphQueueDomain::Graphics,
         });
     }
 
@@ -632,13 +675,9 @@ void RenderGraph::executeAsync(VkCommandBuffer graphicsCommandBuffer, VkCommandB
 
     for (uint32_t passIndex : compiledPassOrder_) {
         const RenderGraphPass& pass = passes_[passIndex];
-        bool computeDomain = false;
-        for (const RenderGraphResourceUse& use : pass.uses()) {
-            if (use.domain == PipelineDomain::Compute || use.domain == PipelineDomain::RayTracing) {
-                computeDomain = true;
-                break;
-            }
-        }
+        const RenderGraphQueueDomain queueDomain = pass.queueDomain();
+        const bool computeDomain = queueDomain == RenderGraphQueueDomain::Compute ||
+            queueDomain == RenderGraphQueueDomain::SameFamilyCompute;
         VkCommandBuffer targetCmd = computeDomain ? computeCommandBuffer : graphicsCommandBuffer;
 
         for (const RenderGraphBarrier& barrier : compiledBarriers_) {

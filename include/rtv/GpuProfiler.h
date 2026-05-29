@@ -39,6 +39,10 @@ struct GpuFrameTimings {
     float selectionOutlineMs = 0.0f;
     float fullscreenMs = 0.0f;
     float editorPresentationMs = 0.0f;
+    float graphicsLaneMs = 0.0f;
+    float rayTracingLaneMs = 0.0f;
+    float computeLaneMs = 0.0f;
+    float queueWaitMs = 0.0f;
 
     [[nodiscard]] float totalMs() const {
         return pathTraceMs +
@@ -130,7 +134,10 @@ public:
         EditorPresentationEnd = 53,
         MomentUpdateStart = 54,
         MomentUpdateEnd = 55,
-        Count = 56,
+        AsyncProducerEnd = 56,
+        AsyncComputeStart = 57,
+        AsyncComputeEnd = 58,
+        Count = 59,
     };
 
     GpuProfiler() = default;

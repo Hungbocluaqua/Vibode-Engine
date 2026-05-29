@@ -22,6 +22,8 @@ struct RenderGraphBarrier {
     uint32_t afterPass = 0;
     ResourceAccess before{};
     ResourceAccess after{};
+    RenderGraphQueueDomain beforeQueue = RenderGraphQueueDomain::Graphics;
+    RenderGraphQueueDomain afterQueue = RenderGraphQueueDomain::Graphics;
 };
 
 struct TransientResourceLifetime {
@@ -97,7 +99,7 @@ public:
     [[nodiscard]] const std::vector<TransientResourceLifetime>& resourceLifetimes() const { return resourceLifetimes_; }
     [[nodiscard]] bool compiled() const { return compiled_; }
 
-    [[nodiscard]] bool hasAsyncCompute() const { return transientPool_.operator bool(); }
+    [[nodiscard]] bool hasAsyncCompute() const { return asyncComputeQueue_ != VK_NULL_HANDLE && timelineSemaphore_ != VK_NULL_HANDLE; }
     void setAsyncComputeQueue(VkQueue queue, uint32_t familyIndex);
     void setTimelineSemaphore(VkSemaphore semaphore);
     [[nodiscard]] uint64_t nextTimelineValue();

@@ -1067,12 +1067,45 @@ void writeFrameTimeline(
             {"barrier_count", pass.value("barriers", json::array()).size()},
         });
     }
+    json asyncCompute = {
+        {"enabled", profile.asyncCompute.enabled},
+        {"disabled_by_cli", profile.asyncCompute.disabledByCli},
+        {"single_queue_fallback", profile.asyncCompute.singleQueueFallback},
+        {"timeline_semaphore", profile.asyncCompute.timelineSemaphore},
+        {"independent_queue", profile.asyncCompute.independentQueue},
+        {"dedicated_compute_family", profile.asyncCompute.dedicatedComputeFamily},
+        {"cross_family", profile.asyncCompute.crossFamily},
+        {"graphics_family", profile.asyncCompute.graphicsFamily.has_value()
+            ? json(*profile.asyncCompute.graphicsFamily)
+            : json(nullptr)},
+        {"compute_family", profile.asyncCompute.computeFamily.has_value()
+            ? json(*profile.asyncCompute.computeFamily)
+            : json(nullptr)},
+        {"compute_queue_index", profile.asyncCompute.computeQueueIndex},
+        {"resource_sharing_mode", profile.asyncCompute.resourceSharingMode},
+        {"resource_sharing_queue_family_count", profile.asyncCompute.resourceSharingQueueFamilyCount},
+        {"resource_sharing_queue_families", profile.asyncCompute.resourceSharingQueueFamilies},
+    };
+    json queueSubmits = json::array();
+    if (profile.asyncCompute.enabled) {
+        queueSubmits.push_back({{"queue", "graphics"}, {"count", 2}, {"role", "producer_and_post"}});
+        queueSubmits.push_back({{"queue", "compute"}, {"count", 1}, {"role", "post_trace_compute"}});
+    } else {
+        queueSubmits.push_back({{"queue", "graphics"}, {"count", 1}, {"role", "single_queue"}});
+    }
     json j = {
         {"cpu_events", {
             {{"name", "frame"}, {"min_ms", profile.cpuFrameMs.min}, {"avg_ms", profile.cpuFrameMs.avg}, {"max_ms", profile.cpuFrameMs.max}},
         }},
         {"gpu_passes", gpuPasses},
-        {"queue_submits", json::array({{{"queue", "graphics"}, {"count", 1}}})},
+        {"queue_submits", queueSubmits},
+        {"queue_lane_ms", {
+            {"graphics", profile.queueLaneMs.graphics},
+            {"ray_tracing", profile.queueLaneMs.rayTracing},
+            {"compute", profile.queueLaneMs.compute},
+            {"queue_wait", profile.queueLaneMs.queueWait},
+        }},
+        {"async_compute", asyncCompute},
         {"semaphores", json::array()},
         {"barriers", graph.value("barriers", json::array())},
         {"presentation", {{"headless", true}}},

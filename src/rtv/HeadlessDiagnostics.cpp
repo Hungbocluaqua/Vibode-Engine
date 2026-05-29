@@ -72,6 +72,33 @@ void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
     j["editor_presentation"] = p.editorPresentation;
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::QueueLaneMs& q) {
+    j["graphics"] = q.graphics;
+    j["ray_tracing"] = q.rayTracing;
+    j["compute"] = q.compute;
+    j["queue_wait"] = q.queueWait;
+}
+
+void to_json(nlohmann::json& j, const ProfileReport::AsyncComputeReport& a) {
+    j["enabled"] = a.enabled;
+    j["disabled_by_cli"] = a.disabledByCli;
+    j["single_queue_fallback"] = a.singleQueueFallback;
+    j["timeline_semaphore"] = a.timelineSemaphore;
+    j["independent_queue"] = a.independentQueue;
+    j["dedicated_compute_family"] = a.dedicatedComputeFamily;
+    j["cross_family"] = a.crossFamily;
+    j["graphics_family"] = a.graphicsFamily.has_value()
+        ? nlohmann::json(*a.graphicsFamily)
+        : nlohmann::json(nullptr);
+    j["compute_family"] = a.computeFamily.has_value()
+        ? nlohmann::json(*a.computeFamily)
+        : nlohmann::json(nullptr);
+    j["compute_queue_index"] = a.computeQueueIndex;
+    j["resource_sharing_mode"] = a.resourceSharingMode;
+    j["resource_sharing_queue_family_count"] = a.resourceSharingQueueFamilyCount;
+    j["resource_sharing_queue_families"] = a.resourceSharingQueueFamilies;
+}
+
 void to_json(nlohmann::json& j, const ProfileReport::PipelineStatistics& s) {
     j["ray_invocations"] = s.rayInvocations;
     j["triangle_hits"] = s.triangleHits;
@@ -161,6 +188,10 @@ std::string formatVulkanVersion(uint32_t version) {
     std::ostringstream ss;
     ss << VK_VERSION_MAJOR(version) << "." << VK_VERSION_MINOR(version) << "." << VK_VERSION_PATCH(version);
     return ss.str();
+}
+
+std::string sharingModeName(VkSharingMode mode) {
+    return mode == VK_SHARING_MODE_CONCURRENT ? "concurrent" : "exclusive";
 }
 
 float percentileOfSorted(const std::vector<float>& sorted, float p) {
@@ -254,7 +285,18 @@ GpuFrameTimings percentileGpuTimings(
     result.selectionOutlineMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::selectionOutlineMs, percentile);
     result.fullscreenMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::fullscreenMs, percentile);
     result.editorPresentationMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::editorPresentationMs, percentile);
+    result.graphicsLaneMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::graphicsLaneMs, percentile);
+    result.rayTracingLaneMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::rayTracingLaneMs, percentile);
+    result.computeLaneMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::computeLaneMs, percentile);
+    result.queueWaitMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::queueWaitMs, percentile);
     return result;
+}
+
+void assignQueueLaneMs(ProfileReport::QueueLaneMs& out, const GpuFrameTimings& timings) {
+    out.graphics = timings.graphicsLaneMs;
+    out.rayTracing = timings.rayTracingLaneMs;
+    out.compute = timings.computeLaneMs;
+    out.queueWait = timings.queueWaitMs;
 }
 
 void assignPerPassGpuMs(ProfileReport::PerPassGpuMs& out, const GpuFrameTimings& timings) {
@@ -333,6 +375,10 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
         result.selectionOutlineMs += values[i].selectionOutlineMs;
         result.fullscreenMs += values[i].fullscreenMs;
         result.editorPresentationMs += values[i].editorPresentationMs;
+        result.graphicsLaneMs += values[i].graphicsLaneMs;
+        result.rayTracingLaneMs += values[i].rayTracingLaneMs;
+        result.computeLaneMs += values[i].computeLaneMs;
+        result.queueWaitMs += values[i].queueWaitMs;
     }
 
     const float invCount = 1.0f / static_cast<float>(count);
@@ -365,6 +411,10 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
     result.selectionOutlineMs *= invCount;
     result.fullscreenMs *= invCount;
     result.editorPresentationMs *= invCount;
+    result.graphicsLaneMs *= invCount;
+    result.rayTracingLaneMs *= invCount;
+    result.computeLaneMs *= invCount;
+    result.queueWaitMs *= invCount;
     return result;
 }
 
@@ -457,8 +507,36 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
 
     const auto timings = averageGpuTimings(app.perFrameGpuTimings(), warmup);
     assignPerPassGpuMs(profileReport_.perPassGpuMs, timings);
+    assignQueueLaneMs(profileReport_.queueLaneMs, timings);
     assignPerPassGpuMs(profileReport_.perPassGpuMsP95, percentileGpuTimings(app.perFrameGpuTimings(), warmup, 0.95f));
     assignPerPassGpuMs(profileReport_.perPassGpuMsP99, percentileGpuTimings(app.perFrameGpuTimings(), warmup, 0.99f));
+
+    const auto& queueFamilies = context->queueFamilies();
+    profileReport_.asyncCompute.disabledByCli = config_.disableAsyncCompute;
+    profileReport_.asyncCompute.singleQueueFallback = config_.singleQueueFallback;
+    profileReport_.asyncCompute.timelineSemaphore = context->supportsTimelineSemaphore();
+    profileReport_.asyncCompute.independentQueue = context->hasIndependentComputeQueue();
+    profileReport_.asyncCompute.dedicatedComputeFamily = queueFamilies.hasDedicatedCompute();
+    profileReport_.asyncCompute.graphicsFamily = queueFamilies.graphics;
+    profileReport_.asyncCompute.computeFamily = queueFamilies.compute;
+    profileReport_.asyncCompute.computeQueueIndex = queueFamilies.computeQueueIndex;
+    profileReport_.asyncCompute.crossFamily = queueFamilies.graphics.has_value() &&
+        queueFamilies.compute.has_value() &&
+        queueFamilies.graphics.value() != queueFamilies.compute.value();
+    profileReport_.asyncCompute.enabled = !profileReport_.asyncCompute.disabledByCli &&
+        !profileReport_.asyncCompute.singleQueueFallback &&
+        context->computeQueue() != VK_NULL_HANDLE &&
+        profileReport_.asyncCompute.independentQueue &&
+        queueFamilies.compute.has_value() &&
+        profileReport_.asyncCompute.timelineSemaphore;
+    if (auto* allocator = app.resourceAllocator()) {
+        profileReport_.asyncCompute.resourceSharingMode = sharingModeName(allocator->graphicsComputeSharingMode());
+        profileReport_.asyncCompute.resourceSharingQueueFamilyCount = allocator->graphicsComputeQueueFamilyCount();
+        const uint32_t* families = allocator->graphicsComputeQueueFamilies();
+        profileReport_.asyncCompute.resourceSharingQueueFamilies.assign(
+            families,
+            families + profileReport_.asyncCompute.resourceSharingQueueFamilyCount);
+    }
 
     const auto& stats = renderer->pipelineStats();
     profileReport_.pipelineStatistics.rayInvocations = stats.rayInvocations;
@@ -514,6 +592,8 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["per_pass_gpu_ms"] = profileReport_.perPassGpuMs;
     j["per_pass_gpu_ms_p95"] = profileReport_.perPassGpuMsP95;
     j["per_pass_gpu_ms_p99"] = profileReport_.perPassGpuMsP99;
+    j["queue_lane_ms"] = profileReport_.queueLaneMs;
+    j["async_compute"] = profileReport_.asyncCompute;
     j["pipeline_statistics"] = profileReport_.pipelineStatistics;
     const uint64_t hitCount = profileReport_.pipelineStatistics.triangleHits + profileReport_.pipelineStatistics.aabbHits;
     j["gpu_debug_counters"] = {
@@ -814,7 +894,9 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
                 std::nullopt,
                 false,
                 false,
-                true);
+                true,
+                sceneConfig.disableAsyncCompute,
+                sceneConfig.singleQueueFallback);
             if (auto* renderer = app.pathTracer()) {
                 RendererSettings settings = renderer->settings();
                 settings.fixedSeed = sceneConfig.fixedSeed;

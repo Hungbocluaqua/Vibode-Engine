@@ -18,6 +18,7 @@ struct QueueFamilyIndices {
     std::optional<uint32_t> graphics;
     std::optional<uint32_t> present;
     std::optional<uint32_t> compute;
+    uint32_t computeQueueIndex = 0;
 
     [[nodiscard]] bool complete() const {
         return graphics.has_value() && present.has_value();
@@ -62,6 +63,7 @@ public:
     [[nodiscard]] VkQueue graphicsQueue() const { return graphicsQueue_; }
     [[nodiscard]] VkQueue presentQueue() const { return presentQueue_; }
     [[nodiscard]] VkQueue computeQueue() const { return computeQueue_; }
+    [[nodiscard]] bool hasIndependentComputeQueue() const { return computeQueue_ != VK_NULL_HANDLE && computeQueue_ != graphicsQueue_; }
     [[nodiscard]] bool hasAsyncComputeQueue() const { return queueFamilies_.hasDedicatedCompute(); }
     [[nodiscard]] bool canAsyncCompute() const { return queueFamilies_.hasAsyncCompute(); }
     [[nodiscard]] const QueueFamilyIndices& queueFamilies() const { return queueFamilies_; }
@@ -71,7 +73,7 @@ public:
     [[nodiscard]] bool supportsHardwareRayTracing() const { return rayTracingInfo_.capabilities.supported; }
     [[nodiscard]] bool supportsBufferDeviceAddress() const { return rayTracingInfo_.capabilities.bufferDeviceAddress; }
     [[nodiscard]] VkSemaphore timelineSemaphore() const { return timelineSemaphore_; }
-    [[nodiscard]] bool supportsTimelineSemaphore() const { return timelineSemaphore_ != VK_NULL_HANDLE; }
+    [[nodiscard]] bool supportsTimelineSemaphore() const { return timelineSemaphoreSupported_ && timelineSemaphore_ != VK_NULL_HANDLE; }
     [[nodiscard]] bool supportsSER() const { return supportsSER_; }
     [[nodiscard]] bool supportsSamplerAnisotropy() const { return samplerAnisotropy_; }
     [[nodiscard]] float maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
@@ -107,6 +109,7 @@ private:
     VkQueue presentQueue_ = VK_NULL_HANDLE;
     VkQueue computeQueue_ = VK_NULL_HANDLE;
     VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
+    bool timelineSemaphoreSupported_ = false;
     bool supportsSER_ = false;
     bool samplerAnisotropy_ = false;
     float maxSamplerAnisotropy_ = 1.0f;

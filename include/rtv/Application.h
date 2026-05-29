@@ -51,7 +51,9 @@ public:
         std::optional<bool> restirGiOverride = std::nullopt,
         bool debugViewOverride = false,
         bool validationCameraMotion = false,
-        bool headless = false);
+        bool headless = false,
+        bool disableAsyncCompute = false,
+        bool singleQueueFallback = false);
     ~Application();
 
     void run(uint32_t maxFrames = 0);
@@ -154,6 +156,8 @@ private:
     std::optional<bool> restirGiOverride_;
     bool debugViewOverride_ = false;
     bool validationCameraMotion_ = false;
+    bool disableAsyncCompute_ = false;
+    bool singleQueueFallback_ = false;
     bool pendingOpenLevel_ = false;
     bool pendingSaveLevel_ = false;
     bool pendingReloadShaders_ = false;

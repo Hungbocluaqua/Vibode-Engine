@@ -11,6 +11,7 @@
 #include <exception>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -29,11 +30,82 @@ static RENDERDOC_API_1_6_0* rdocApi = nullptr;
 static std::filesystem::path rdocCapturePath;
 static uint32_t rdocCaptureFrame = 60;
 static bool rdocCaptureRequested = false;
+static std::optional<std::filesystem::path> rdocDllPathOverride;
+static std::string rdocCaptureTemplate;
+
+static std::optional<std::filesystem::path> renderDocEnvPath(const char* name) {
+    char* value = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&value, &length, name) != 0 || value == nullptr) {
+        return std::nullopt;
+    }
+    std::string result(value);
+    std::free(value);
+    if (result.empty()) {
+        return std::nullopt;
+    }
+    return std::filesystem::path(result);
+}
+
+static void addRenderDocCandidate(std::vector<std::filesystem::path>& candidates, std::filesystem::path path) {
+    if (path.empty()) {
+        return;
+    }
+    if (path.filename() != "renderdoc.dll") {
+        path /= "renderdoc.dll";
+    }
+    candidates.push_back(std::move(path));
+}
+
+static void addRenderDocEnvCandidate(std::vector<std::filesystem::path>& candidates, const char* name) {
+    if (std::optional<std::filesystem::path> path = renderDocEnvPath(name)) {
+        addRenderDocCandidate(candidates, *path);
+        addRenderDocCandidate(candidates, *path / "api" / "app");
+        addRenderDocCandidate(candidates, path->parent_path().parent_path());
+    }
+}
+
+static HMODULE loadRenderDocDll() {
+    if (HMODULE existing = GetModuleHandleA("renderdoc.dll")) {
+        return existing;
+    }
+
+    std::vector<std::filesystem::path> candidates;
+    if (rdocDllPathOverride.has_value()) {
+        addRenderDocCandidate(candidates, *rdocDllPathOverride);
+    }
+    addRenderDocEnvCandidate(candidates, "RENDERDOC_DLL_PATH");
+    addRenderDocEnvCandidate(candidates, "RENDERDOC_DIR");
+    addRenderDocEnvCandidate(candidates, "RENDERDOC_SDK_DIR");
+    addRenderDocCandidate(candidates, std::filesystem::current_path());
+    if (std::optional<std::filesystem::path> programFiles = renderDocEnvPath("ProgramFiles")) {
+        addRenderDocCandidate(candidates, *programFiles / "RenderDoc");
+    }
+    if (std::optional<std::filesystem::path> programFilesX86 = renderDocEnvPath("ProgramFiles(x86)")) {
+        addRenderDocCandidate(candidates, *programFilesX86 / "RenderDoc");
+    }
+
+    for (const std::filesystem::path& candidate : candidates) {
+        if (!std::filesystem::exists(candidate)) {
+            continue;
+        }
+        if (HMODULE loaded = LoadLibraryA(candidate.string().c_str())) {
+            std::cout << "Loaded RenderDoc DLL: " << candidate.string() << "\n";
+            return loaded;
+        }
+    }
+
+    if (HMODULE loaded = LoadLibraryA("renderdoc.dll")) {
+        std::cout << "Loaded RenderDoc DLL from DLL search path\n";
+        return loaded;
+    }
+    return nullptr;
+}
 
 static void initRenderDoc() {
-    HMODULE mod = GetModuleHandleA("renderdoc.dll");
+    HMODULE mod = loadRenderDocDll();
     if (mod == nullptr) {
-        std::cerr << "Warning: RenderDoc DLL not loaded. Run from RenderDoc or inject the layer.\n";
+        std::cerr << "Warning: RenderDoc DLL not loaded. Set --renderdoc-dll <path>, RENDERDOC_DLL_PATH, or install RenderDoc.\n";
         return;
     }
     auto getApi = (pRENDERDOC_GetAPI)GetProcAddress(mod, "RENDERDOC_GetAPI");
@@ -195,6 +267,13 @@ int main(int argc, char** argv) {
                 diagConfig.captureRenderDocPath = std::filesystem::path(argv[++i]);
             } else if (arg == "--capture-frame" && i + 1 < argc) {
                 diagConfig.captureFrame = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if (arg == "--renderdoc-dll" && i + 1 < argc) {
+#ifdef RTV_HAS_RENDERDOC
+                rdocDllPathOverride = std::filesystem::path(argv[++i]);
+#else
+                ++i;
+                std::cerr << "Warning: --renderdoc-dll ignored because this build was not configured with RENDERDOC_SDK_DIR.\n";
+#endif
             } else if (arg == "--make-debug-package" && i + 1 < argc) {
                 diagConfig.makeDebugPackageDir = std::filesystem::path(argv[++i]);
             } else if (arg == "--disable-async-compute") {
@@ -334,10 +413,25 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--save-frame-sequence requires --headless");
         }
 
+#ifdef RTV_HAS_RENDERDOC
+        if (diagConfig.captureRenderDocPath.has_value()) {
+            rdocCaptureRequested = true;
+            rdocCapturePath = *diagConfig.captureRenderDocPath;
+            rdocCaptureFrame = std::max(1u, diagConfig.captureFrame);
+            initRenderDoc();
+        }
+#else
+        if (diagConfig.captureRenderDocPath.has_value()) {
+            std::cerr << "Warning: RenderDoc capture requested, but this build was not configured with RENDERDOC_SDK_DIR.\n";
+        }
+#endif
+
         rtv::Application app(debugView, gltfPath, hdrPath, scenePath,
             denoiserOverride, restirModeOverride, renderPresetOverride, restirGiOverride,
             debugViewProvided, validationCameraMotion,
-            diagConfig.headless);
+            diagConfig.headless,
+            diagConfig.disableAsyncCompute,
+            diagConfig.singleQueueFallback);
 
         if (auto* renderer = app.pathTracer()) {
             auto lower = [](std::string value) {
@@ -413,19 +507,6 @@ int main(int argc, char** argv) {
             }
         }
 
-#ifdef RTV_HAS_RENDERDOC
-        if (diagConfig.captureRenderDocPath.has_value()) {
-            rdocCaptureRequested = true;
-            rdocCapturePath = *diagConfig.captureRenderDocPath;
-            rdocCaptureFrame = std::max(1u, diagConfig.captureFrame);
-            initRenderDoc();
-        }
-#else
-        if (diagConfig.captureRenderDocPath.has_value()) {
-            std::cerr << "Warning: RenderDoc capture requested, but this build was not configured with RENDERDOC_SDK_DIR.\n";
-        }
-#endif
-
         rtv::HeadlessDiagnostics diag(diagConfig);
         if (diagConfig.makeDebugPackageDir.has_value() || crashDumpPackageDir.has_value()) {
             diag.captureStdout();
@@ -440,7 +521,8 @@ int main(int argc, char** argv) {
             if (!captureDir.empty()) {
                 std::filesystem::create_directories(captureDir);
             }
-            rdocApi->SetCaptureFilePathTemplate(absoluteCapturePath.string().c_str());
+            rdocCaptureTemplate = absoluteCapturePath.string();
+            rdocApi->SetCaptureFilePathTemplate(rdocCaptureTemplate.c_str());
             app.setFrameCaptureCallbacks(
                 [&](uint32_t frameNumber) {
                     if (!rdocCaptureStarted && frameNumber == rdocCaptureFrame) {
@@ -454,7 +536,7 @@ int main(int argc, char** argv) {
                         const uint32_t captureSaved = rdocApi->EndFrameCapture(nullptr, nullptr);
                         rdocCaptureFinished = true;
                         if (captureSaved != 0u) {
-                            std::cout << "RenderDoc capture saved to template: " << absoluteCapturePath.string() << "\n";
+                            std::cout << "RenderDoc capture saved to template: " << rdocCaptureTemplate << "\n";
                         } else {
                             std::cerr << "Warning: RenderDoc capture ended but was not saved.\n";
                         }
