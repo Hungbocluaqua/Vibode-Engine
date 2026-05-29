@@ -42,6 +42,7 @@ struct ProfileReport {
     std::string gpuName;
     std::string driverVersion;
     std::string vulkanVersion;
+    std::string restirGiLayout = "compressed";
 
     struct Resolution {
         uint32_t renderWidth = 0;
@@ -106,6 +107,12 @@ struct ProfileReport {
         uint64_t accelerationStructureBytes = 0;
         uint64_t temporalHistoryBytes = 0;
         uint64_t restirReservoirBytes = 0;
+        uint64_t restirDiCurrentBytes = 0;
+        uint64_t restirDiPreviousBytes = 0;
+        uint64_t restirDiSpatialBytes = 0;
+        uint64_t restirGiCurrentBytes = 0;
+        uint64_t restirGiPreviousBytes = 0;
+        uint64_t restirGiSpatialBytes = 0;
     } memory{};
 
     uint32_t validationErrorCount = 0;

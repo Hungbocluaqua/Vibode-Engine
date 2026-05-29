@@ -58,6 +58,11 @@ struct MaterialAsset {
     uint32_t hasSheen = 0;
     glm::vec3 sheenColorFactor{0.0f};
     float sheenRoughnessFactor = 0.0f;
+    uint32_t hasIridescence = 0;
+    float iridescenceFactor = 0.0f;
+    float iridescenceIor = 1.3f;
+    float iridescenceThicknessMinimum = 100.0f;
+    float iridescenceThicknessMaximum = 400.0f;
     uint32_t hasEmissiveStrength = 0;
     float emissiveStrength = 1.0f;
     uint32_t hasAnisotropy = 0;
@@ -79,6 +84,8 @@ struct MaterialAsset {
     TextureAssetHandle specularColorTexture{};
     TextureAssetHandle sheenColorTexture{};
     TextureAssetHandle sheenRoughnessTexture{};
+    TextureAssetHandle iridescenceTexture{};
+    TextureAssetHandle iridescenceThicknessTexture{};
     TextureAssetHandle anisotropyTexture{};
     TextureAssetHandle occlusionTexture{};
     TextureTransformAsset baseColorTextureTransform{};

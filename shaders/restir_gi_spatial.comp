@@ -25,23 +25,6 @@ layout(set = 0, binding = 3, std140) uniform RestirGiSpatialParams {
     float _padding0;
 } params;
 
-vec2 unpack_unorm2x16(uint packedValue) {
-    return vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
-}
-
-vec2 unpack_snorm2x16(uint packedValue) {
-    return unpack_unorm2x16(packedValue) * 2.0 - vec2(1.0);
-}
-
-vec3 decode_octahedral_normal(uint packedValue) {
-    vec2 f = unpack_snorm2x16(packedValue);
-    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
-    float t = clamp(-n.z, 0.0, 1.0);
-    n.x += n.x >= 0.0 ? -t : t;
-    n.y += n.y >= 0.0 ? -t : t;
-    return normalize(n);
-}
-
 struct SurfaceReuseData {
     float depth;
     vec3 normal;
@@ -85,10 +68,10 @@ float gi_reservoir_compatibility(
     RestirGiReservoir candidate,
     SurfaceReuseData centerSurface,
     SurfaceReuseData candidateSurface) {
-    if (!restir_gi_reservoir_valid(candidate) || (candidate.metadata.z & RESTIR_GI_FLAG_VISIBLE) == 0u) {
+    if (!restir_gi_reservoir_valid(candidate) || !restir_gi_visible(candidate)) {
         return 0.0;
     }
-    if (center.metadata.w != candidate.metadata.w) {
+    if (restir_gi_material_id(center) != restir_gi_material_id(candidate)) {
         return 0.0;
     }
 
@@ -106,7 +89,7 @@ float gi_reservoir_compatibility(
     float hitDistance = length(centerToCandidateHit);
     float candidateDistance = max(candidate.receiver_position_hit_distance.w, 0.25);
     float distanceRatio = min(hitDistance, candidateDistance) / max(hitDistance, candidateDistance);
-    float selectedNormalAgreement = dot(normalize(center.normal_roughness.xyz), normalize(candidate.normal_roughness.xyz));
+    float selectedNormalAgreement = dot(restir_gi_normal(center), restir_gi_normal(candidate));
     float selectedNormalConfidence = smoothstep(0.45, 0.92, selectedNormalAgreement);
 
     float currentTarget = max(center.hit_position_target_pdf.w, 1.0e-5);
@@ -128,13 +111,17 @@ RestirGiReservoir merge_gi_candidate(RestirGiReservoir merged, RestirGiReservoir
     float candidateMix = clamp(candidateWeight / totalWeight, 0.0, 0.65);
 
     merged.hit_position_target_pdf.xyz = mix(merged.hit_position_target_pdf.xyz, candidate.hit_position_target_pdf.xyz, candidateMix);
-    merged.normal_roughness.xyz = normalize(mix(merged.normal_roughness.xyz, candidate.normal_roughness.xyz, candidateMix));
-    merged.normal_roughness.w = mix(merged.normal_roughness.w, candidate.normal_roughness.w, candidateMix);
+    restir_gi_set_normal(merged, normalize(mix(restir_gi_normal(merged), restir_gi_normal(candidate), candidateMix)));
+    float mergedRoughness = mix(restir_gi_roughness(merged), restir_gi_roughness(candidate), candidateMix);
     merged.radiance_weight_sum.rgb = mix(merged.radiance_weight_sum.rgb, candidate.radiance_weight_sum.rgb, candidateMix);
     merged.radiance_weight_sum.w = min(merged.radiance_weight_sum.w + candidate.radiance_weight_sum.w * compatibility, 32.0);
     merged.hit_position_target_pdf.w = max(restir_luminance(merged.radiance_weight_sum.rgb), 1.0e-4);
-    merged.metadata.x = uint(clamp(ceil(merged.radiance_weight_sum.w), 1.0, 32.0));
-    merged.metadata.z = RESTIR_GI_FLAG_VALID | RESTIR_GI_FLAG_VISIBLE;
+    restir_gi_set_metadata(
+        merged,
+        uint(clamp(ceil(merged.radiance_weight_sum.w), 1.0, 32.0)),
+        restir_gi_age(merged),
+        RESTIR_GI_FLAG_VALID | RESTIR_GI_FLAG_VISIBLE,
+        mergedRoughness);
     return merged;
 }
 

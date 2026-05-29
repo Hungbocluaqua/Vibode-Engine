@@ -122,6 +122,16 @@ public:
     [[nodiscard]] VkDeviceSize estimatedBufferMemory() const;
     [[nodiscard]] VkDeviceSize temporalHistoryMemory() const;
     [[nodiscard]] VkDeviceSize restirReservoirMemory() const;
+    [[nodiscard]] const char* restirGiReservoirLayoutName() const;
+    struct RestirReservoirMemoryBreakdown {
+        VkDeviceSize diCurrentBytes = 0;
+        VkDeviceSize diPreviousBytes = 0;
+        VkDeviceSize diSpatialBytes = 0;
+        VkDeviceSize giCurrentBytes = 0;
+        VkDeviceSize giPreviousBytes = 0;
+        VkDeviceSize giSpatialBytes = 0;
+    };
+    [[nodiscard]] RestirReservoirMemoryBreakdown restirReservoirMemoryBreakdown() const;
 
     void setDumpRenderGraphPath(std::optional<std::filesystem::path> path) { dumpRenderGraphPath_ = std::move(path); }
     void setDumpRenderGraphDotPath(std::optional<std::filesystem::path> path) { dumpRenderGraphDotPath_ = std::move(path); }
@@ -253,12 +263,21 @@ private:
 
     struct RestirGiReservoirGpu {
         glm::vec4 hitPositionTargetPdf{};
+        glm::vec4 radianceWeightSum{};
+        glm::vec4 receiverPositionHitDistance{};
+        // metadata.x packs sample count, age, flags, and roughness. metadata.y packs octahedral normal.
+        glm::uvec4 metadata{};
+    };
+    static_assert(sizeof(RestirGiReservoirGpu) == 64);
+
+    struct RestirGiReservoirUncompressedGpu {
+        glm::vec4 hitPositionTargetPdf{};
         glm::vec4 normalRoughness{};
         glm::vec4 radianceWeightSum{};
         glm::vec4 receiverPositionHitDistance{};
         glm::uvec4 metadata{};
     };
-    static_assert(sizeof(RestirGiReservoirGpu) == 80);
+    static_assert(sizeof(RestirGiReservoirUncompressedGpu) == 80);
 
     struct PathDataGpu {
         glm::vec4 directDiffuse{};
@@ -303,6 +322,7 @@ private:
     [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
     [[nodiscard]] bool shouldRunRestirGiFinal() const;
+    [[nodiscard]] VkDeviceSize restirGiReservoirStride() const;
     [[nodiscard]] const Image& postDenoiseImage() const;
     [[nodiscard]] const Image& hdrPostProcessImage() const;
     void skipDenoiserPass(VkCommandBuffer commandBuffer);
@@ -349,6 +369,7 @@ private:
     uint32_t denoiserFramesSinceReset_ = 0;
     bool taaHistoryValid_ = false;
     bool restirGiHistoryValid_ = false;
+    bool restirGiUncompressedLayout_ = false;
 
     Image rawImage_;
     Image denoisedImage_;

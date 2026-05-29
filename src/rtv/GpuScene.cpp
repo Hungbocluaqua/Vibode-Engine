@@ -50,7 +50,7 @@ constexpr uint32_t sceneLightTypeDirectional = 0u;
 constexpr uint64_t fastImportedBvhTriangleThreshold = 1'000'000ull;
 constexpr uint32_t materialFlagManualBaseColorSrgb = 1u << 0u;
 constexpr uint32_t materialFlagManualEmissiveSrgb = 1u << 1u;
-constexpr uint32_t materialVec4Stride = 8u;
+constexpr uint32_t materialVec4Stride = 11u;
 
 static_assert(sizeof(GpuMeshRecord) == 64);
 static_assert(sizeof(GpuPrimitiveRecord) == 32);
@@ -176,7 +176,14 @@ glm::vec3 approximateConductorKFromF0(const glm::vec3& f0) {
     return 2.0f * glm::sqrt(clamped / (glm::vec3{1.0f} - clamped));
 }
 
-void appendConductorOptics(std::vector<glm::vec4>& materialData, const MaterialAsset* material, float occlusionTexture = -1.0f) {
+void appendConductorOptics(
+    std::vector<glm::vec4>& materialData,
+    const MaterialAsset* material,
+    float occlusionTexture = -1.0f,
+    float sheenColorTexture = -1.0f,
+    float sheenRoughnessTexture = -1.0f,
+    float iridescenceTexture = -1.0f,
+    float iridescenceThicknessTexture = -1.0f) {
     const bool enabled = material != nullptr && material->useConductorOptics != 0u;
     glm::vec3 eta = enabled ? nonnegativeRgb(material->conductorEta) : glm::vec3{0.0f};
     glm::vec3 k = enabled ? nonnegativeRgb(material->conductorK) : glm::vec3{0.0f};
@@ -191,6 +198,19 @@ void appendConductorOptics(std::vector<glm::vec4>& materialData, const MaterialA
         material != nullptr ? material->anisotropyRotation : 0.0f,
         occlusionTexture,
         material != nullptr ? material->occlusionStrength : 1.0f});
+    materialData.push_back({
+        material != nullptr ? material->sheenColorFactor : glm::vec3{0.0f},
+        material != nullptr ? material->sheenRoughnessFactor : 0.0f});
+    materialData.push_back({
+        sheenColorTexture,
+        sheenRoughnessTexture,
+        material != nullptr ? material->iridescenceFactor : 0.0f,
+        material != nullptr ? material->iridescenceIor : 1.3f});
+    materialData.push_back({
+        material != nullptr ? material->iridescenceThicknessMinimum : 100.0f,
+        material != nullptr ? material->iridescenceThicknessMaximum : 400.0f,
+        iridescenceTexture,
+        iridescenceThicknessTexture});
 }
 
 void appendConductorOptics(std::vector<glm::vec4>& materialData, const CachedMaterialData& material) {
@@ -208,6 +228,17 @@ void appendConductorOptics(std::vector<glm::vec4>& materialData, const CachedMat
         material.anisotropyRotation,
         material.occlusionTextureIndex >= 0 ? static_cast<float>(material.occlusionTextureIndex) : -1.0f,
         material.occlusionStrength});
+    materialData.push_back({material.sheenColorFactor, material.sheenRoughnessFactor});
+    materialData.push_back({
+        material.sheenColorTextureIndex >= 0 ? static_cast<float>(material.sheenColorTextureIndex) : -1.0f,
+        material.sheenRoughnessTextureIndex >= 0 ? static_cast<float>(material.sheenRoughnessTextureIndex) : -1.0f,
+        material.iridescenceFactor,
+        material.iridescenceIor});
+    materialData.push_back({
+        material.iridescenceThicknessMinimum,
+        material.iridescenceThicknessMaximum,
+        material.iridescenceTextureIndex >= 0 ? static_cast<float>(material.iridescenceTextureIndex) : -1.0f,
+        material.iridescenceThicknessTextureIndex >= 0 ? static_cast<float>(material.iridescenceThicknessTextureIndex) : -1.0f});
 }
 
 std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
@@ -506,6 +537,14 @@ std::vector<TextureColorUsage> classifyTextureUsage(const SceneAsset& scene, con
         slot = slotFor(material->sheenColorTexture);
         if (slot < usage.size()) {
             usage[slot].baseColor = true;
+        }
+        slot = slotFor(material->iridescenceTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->iridescenceThicknessTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
         }
         slot = slotFor(material->emissiveTexture);
         if (slot < usage.size()) {
@@ -1488,7 +1527,14 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
             material != nullptr ? static_cast<float>(material->alphaMode) : 0.0f,
             material != nullptr ? static_cast<float>(material->doubleSided) : 0.0f,
             0.0f});
-        appendConductorOptics(materialData, material, material != nullptr ? textureSlotFor(material->occlusionTexture) : -1.0f);
+        appendConductorOptics(
+            materialData,
+            material,
+            material != nullptr ? textureSlotFor(material->occlusionTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->sheenColorTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->sheenRoughnessTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->iridescenceTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->iridescenceThicknessTexture) : -1.0f);
     }
 
     const VkDeviceSize byteSize = sizeof(glm::vec4) * materialData.size();
@@ -1927,14 +1973,18 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         const float metallicRoughnessTexture = material != nullptr ? textureSlotFor(material->metallicRoughnessTexture) : -1.0f;
         const float emissiveTexture = material != nullptr ? textureSlotFor(material->emissiveTexture) : -1.0f;
         const float occlusionTexture = material != nullptr ? textureSlotFor(material->occlusionTexture) : -1.0f;
+        const float sheenColorTexture = material != nullptr ? textureSlotFor(material->sheenColorTexture) : -1.0f;
+        const float sheenRoughnessTexture = material != nullptr ? textureSlotFor(material->sheenRoughnessTexture) : -1.0f;
+        const float iridescenceTexture = material != nullptr ? textureSlotFor(material->iridescenceTexture) : -1.0f;
+        const float iridescenceThicknessTexture = material != nullptr ? textureSlotFor(material->iridescenceThicknessTexture) : -1.0f;
         uint32_t flags = 0;
         if (material != nullptr) {
             uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
-            if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
+            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->baseColorTexture), textureUsage, slot)) {
                 flags |= materialFlagManualBaseColorSrgb;
             }
             slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
-            if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
+            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->emissiveTexture), textureUsage, slot)) {
                 flags |= materialFlagManualEmissiveSrgb;
             }
         }
@@ -1947,7 +1997,14 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             material != nullptr ? static_cast<float>(material->alphaMode) : 0.0f,
             material != nullptr ? static_cast<float>(material->doubleSided) : 0.0f,
             0.0f});
-        appendConductorOptics(materialData, material, occlusionTexture);
+        appendConductorOptics(
+            materialData,
+            material,
+            occlusionTexture,
+            sheenColorTexture,
+            sheenRoughnessTexture,
+            iridescenceTexture,
+            iridescenceThicknessTexture);
         materialEmissive.push_back(emissive);
         materialOpaqueTraversalSafe.push_back(material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u);
     }
@@ -2328,6 +2385,11 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMat.hasSheen = material->hasSheen;
             cachedMat.sheenColorFactor = material->sheenColorFactor;
             cachedMat.sheenRoughnessFactor = material->sheenRoughnessFactor;
+            cachedMat.hasIridescence = material->hasIridescence;
+            cachedMat.iridescenceFactor = material->iridescenceFactor;
+            cachedMat.iridescenceIor = material->iridescenceIor;
+            cachedMat.iridescenceThicknessMinimum = material->iridescenceThicknessMinimum;
+            cachedMat.iridescenceThicknessMaximum = material->iridescenceThicknessMaximum;
             cachedMat.hasEmissiveStrength = material->hasEmissiveStrength;
             cachedMat.emissiveStrength = material->emissiveStrength;
             cachedMat.hasAnisotropy = material->hasAnisotropy;
@@ -2349,6 +2411,8 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMat.specularColorTextureIndex = getTextureIndex(material->specularColorTexture);
             cachedMat.sheenColorTextureIndex = getTextureIndex(material->sheenColorTexture);
             cachedMat.sheenRoughnessTextureIndex = getTextureIndex(material->sheenRoughnessTexture);
+            cachedMat.iridescenceTextureIndex = getTextureIndex(material->iridescenceTexture);
+            cachedMat.iridescenceThicknessTextureIndex = getTextureIndex(material->iridescenceThicknessTexture);
             cachedMat.anisotropyTextureIndex = getTextureIndex(material->anisotropyTexture);
             cachedMat.occlusionTextureIndex = getTextureIndex(material->occlusionTexture);
             cachedMat.baseColorTextureTransform = material->baseColorTextureTransform;

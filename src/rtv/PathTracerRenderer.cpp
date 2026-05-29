@@ -132,6 +132,20 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
     };
 }
 
+bool restirGiUncompressedLayoutFromEnvironment() {
+#if defined(_MSC_VER)
+    char* value = nullptr;
+    size_t length = 0;
+    _dupenv_s(&value, &length, "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT");
+    const bool enabled = value != nullptr && value[0] != '\0' && value[0] != '0';
+    std::free(value);
+    return enabled;
+#else
+    const char* value = std::getenv("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+#endif
+}
+
 } // namespace
 
 const char* accumulationResetReasonName(AccumulationResetReason reason) {
@@ -173,6 +187,10 @@ PathTracerRenderer::PathTracerRenderer(
         throw std::runtime_error("Hardware ray tracing is required but this Vulkan device does not support the required KHR ray tracing features/extensions");
     }
     std::cout << "Renderer backend: hardware ray tracing\n";
+    restirGiUncompressedLayout_ = restirGiUncompressedLayoutFromEnvironment();
+    if (restirGiUncompressedLayout_) {
+        std::cout << "ReSTIR GI reservoir layout: uncompressed validation\n";
+    }
 
     shaderCompiler_ = std::make_unique<ShaderCompiler>(glslangPath());
     shaderOutputDirectory_ = shaderOutputDirectory;
@@ -1272,20 +1290,21 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .memory = BufferMemory::GpuOnly,
         .debugName = "restir spatial reservoir",
     });
+    const VkDeviceSize restirGiReservoirBytes = pixelCount * restirGiReservoirStride();
     restirGiReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirGiReservoirGpu),
+        .size = restirGiReservoirBytes,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory = BufferMemory::GpuOnly,
         .debugName = "restir gi current reservoir",
     });
     previousRestirGiReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirGiReservoirGpu),
+        .size = restirGiReservoirBytes,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory = BufferMemory::GpuOnly,
         .debugName = "restir gi previous reservoir",
     });
     restirGiSpatialReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirGiReservoirGpu),
+        .size = restirGiReservoirBytes,
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory = BufferMemory::GpuOnly,
         .debugName = "restir gi spatial reservoir",
@@ -3162,12 +3181,24 @@ bool PathTracerRenderer::shouldUseRestirGiReservoirs() const {
         settings_.debugView == RendererDebugView::RestirGiInitial ||
         settings_.debugView == RendererDebugView::RestirGiTemporal ||
         settings_.debugView == RendererDebugView::RestirGiSpatial ||
-        settings_.debugView == RendererDebugView::RestirGiFinal;
+        settings_.debugView == RendererDebugView::RestirGiFinal ||
+        settings_.debugView == RendererDebugView::RestirGiNormal ||
+        settings_.debugView == RendererDebugView::RestirGiHitDistance;
 }
 
 bool PathTracerRenderer::shouldRunRestirGiFinal() const {
     return settings_.debugView == RendererDebugView::RestirGiSpatial ||
         settings_.debugView == RendererDebugView::RestirGiFinal;
+}
+
+VkDeviceSize PathTracerRenderer::restirGiReservoirStride() const {
+    return restirGiUncompressedLayout_
+        ? sizeof(RestirGiReservoirUncompressedGpu)
+        : sizeof(RestirGiReservoirGpu);
+}
+
+const char* PathTracerRenderer::restirGiReservoirLayoutName() const {
+    return restirGiUncompressedLayout_ ? "uncompressed" : "compressed";
 }
 
 const Image& PathTracerRenderer::postDenoiseImage() const {
@@ -3871,12 +3902,24 @@ VkDeviceSize PathTracerRenderer::temporalHistoryMemory() const {
 }
 
 VkDeviceSize PathTracerRenderer::restirReservoirMemory() const {
-    return restirReservoirBuffer_.size() +
-        previousRestirReservoirBuffer_.size() +
-        restirSpatialReservoirBuffer_.size() +
-        restirGiReservoirBuffer_.size() +
-        previousRestirGiReservoirBuffer_.size() +
-        restirGiSpatialReservoirBuffer_.size();
+    const RestirReservoirMemoryBreakdown breakdown = restirReservoirMemoryBreakdown();
+    return breakdown.diCurrentBytes +
+        breakdown.diPreviousBytes +
+        breakdown.diSpatialBytes +
+        breakdown.giCurrentBytes +
+        breakdown.giPreviousBytes +
+        breakdown.giSpatialBytes;
+}
+
+PathTracerRenderer::RestirReservoirMemoryBreakdown PathTracerRenderer::restirReservoirMemoryBreakdown() const {
+    return RestirReservoirMemoryBreakdown{
+        .diCurrentBytes = restirReservoirBuffer_.size(),
+        .diPreviousBytes = previousRestirReservoirBuffer_.size(),
+        .diSpatialBytes = restirSpatialReservoirBuffer_.size(),
+        .giCurrentBytes = restirGiReservoirBuffer_.size(),
+        .giPreviousBytes = previousRestirGiReservoirBuffer_.size(),
+        .giSpatialBytes = restirGiSpatialReservoirBuffer_.size(),
+    };
 }
 
 } // namespace rtv

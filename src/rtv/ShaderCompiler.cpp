@@ -114,7 +114,8 @@ bool ShaderCompiler::needsCompile(const std::filesystem::path& source, const std
 
 std::string ShaderCompiler::compileSignature() const {
     return "RTV_USE_DIMENSIONED_SAMPLER=" + environmentValueOrDefault("RTV_USE_DIMENSIONED_SAMPLER", "1") +
-        "\nRTV_DENOISER_SHARED_TILE=" + environmentValueOrDefault("RTV_DENOISER_SHARED_TILE", "1") + "\n";
+        "\nRTV_DENOISER_SHARED_TILE=" + environmentValueOrDefault("RTV_DENOISER_SHARED_TILE", "1") +
+        "\nRTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=" + environmentValueOrDefault("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0") + "\n";
 }
 
 std::string ShaderCompiler::compileDefineArgs() const {
@@ -124,7 +125,8 @@ std::string ShaderCompiler::compileDefineArgs() const {
     };
 
     return defineArg("RTV_USE_DIMENSIONED_SAMPLER", "1") +
-        defineArg("RTV_DENOISER_SHARED_TILE", "1");
+        defineArg("RTV_DENOISER_SHARED_TILE", "1") +
+        defineArg("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0");
 }
 
 std::vector<std::filesystem::path> ShaderCompiler::dependenciesFor(const std::filesystem::path& source) const {

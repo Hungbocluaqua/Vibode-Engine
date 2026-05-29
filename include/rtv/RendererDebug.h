@@ -89,6 +89,8 @@ enum class RendererDebugView : uint32_t {
     RestirGiTemporal = 71,
     RestirGiSpatial = 72,
     RestirGiFinal = 73,
+    RestirGiNormal = 90,
+    RestirGiHitDistance = 91,
     DenoiserDirectDiffuseVariance = 74,
     DenoiserDirectSpecularVariance = 75,
     DenoiserIndirectDiffuseVariance = 76,

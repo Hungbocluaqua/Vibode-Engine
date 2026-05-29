@@ -56,6 +56,11 @@ struct CachedMaterialData {
     uint32_t hasSheen = 0;
     glm::vec3 sheenColorFactor{0.0f};
     float sheenRoughnessFactor = 0.0f;
+    uint32_t hasIridescence = 0;
+    float iridescenceFactor = 0.0f;
+    float iridescenceIor = 1.3f;
+    float iridescenceThicknessMinimum = 100.0f;
+    float iridescenceThicknessMaximum = 400.0f;
     uint32_t hasEmissiveStrength = 0;
     float emissiveStrength = 1.0f;
     uint32_t hasAnisotropy = 0;
@@ -77,6 +82,8 @@ struct CachedMaterialData {
     int32_t specularColorTextureIndex = -1;
     int32_t sheenColorTextureIndex = -1;
     int32_t sheenRoughnessTextureIndex = -1;
+    int32_t iridescenceTextureIndex = -1;
+    int32_t iridescenceThicknessTextureIndex = -1;
     int32_t anisotropyTextureIndex = -1;
     int32_t occlusionTextureIndex = -1;
     TextureTransformAsset baseColorTextureTransform{};

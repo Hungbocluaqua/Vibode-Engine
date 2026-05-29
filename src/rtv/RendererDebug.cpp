@@ -169,6 +169,12 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "restirgifinal" || key == "gifinal" || key == "restirgicontribution") {
         return RendererDebugView::RestirGiFinal;
     }
+    if (key == "restirginormal" || key == "ginormal" || key == "gireservoirnormal") {
+        return RendererDebugView::RestirGiNormal;
+    }
+    if (key == "restirgihitdistance" || key == "gihitdistance" || key == "gireservoirhitdistance") {
+        return RendererDebugView::RestirGiHitDistance;
+    }
     if (key == "denoiserdirectdiffusevariance" || key == "directdiffusevariance" || key == "ddvariance") {
         return RendererDebugView::DenoiserDirectDiffuseVariance;
     }
@@ -287,6 +293,8 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirGiTemporal: return "restir-gi-temporal";
     case RendererDebugView::RestirGiSpatial: return "restir-gi-spatial";
     case RendererDebugView::RestirGiFinal: return "restir-gi-final";
+    case RendererDebugView::RestirGiNormal: return "restir-gi-normal";
+    case RendererDebugView::RestirGiHitDistance: return "restir-gi-hit-distance";
     case RendererDebugView::DenoiserDirectDiffuseVariance: return "denoiser-direct-diffuse-variance";
     case RendererDebugView::DenoiserDirectSpecularVariance: return "denoiser-direct-specular-variance";
     case RendererDebugView::DenoiserIndirectDiffuseVariance: return "denoiser-indirect-diffuse-variance";

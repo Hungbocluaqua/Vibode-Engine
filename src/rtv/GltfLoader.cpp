@@ -429,6 +429,7 @@ bool loadImageDataPreservingKtx2(
         name == "KHR_materials_ior" ||
         name == "KHR_materials_specular" ||
         name == "KHR_materials_sheen" ||
+        name == "KHR_materials_iridescence" ||
         name == "KHR_materials_emissive_strength" ||
         name == "KHR_materials_anisotropy" ||
         name == "KHR_texture_transform";
@@ -602,6 +603,16 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         material.sheenRoughnessTexture = textureHandleMember(*ext, "sheenRoughnessTexture");
         material.shaderCompatibilityMask |= kMaterialClosureFlagSheen;
     }
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_iridescence")) {
+        material.hasIridescence = 1u;
+        material.iridescenceFactor = static_cast<float>(numberMember(*ext, "iridescenceFactor", 0.0));
+        material.iridescenceIor = static_cast<float>(numberMember(*ext, "iridescenceIor", 1.3));
+        material.iridescenceThicknessMinimum = static_cast<float>(numberMember(*ext, "iridescenceThicknessMinimum", 100.0));
+        material.iridescenceThicknessMaximum = static_cast<float>(numberMember(*ext, "iridescenceThicknessMaximum", 400.0));
+        material.iridescenceTexture = textureHandleMember(*ext, "iridescenceTexture");
+        material.iridescenceThicknessTexture = textureHandleMember(*ext, "iridescenceThicknessTexture");
+        material.shaderCompatibilityMask |= kMaterialClosureFlagThinFilm;
+    }
     if (const tinygltf::Value* ext = extensionObject("KHR_materials_anisotropy")) {
         material.hasAnisotropy = 1u;
         material.anisotropyStrength = static_cast<float>(numberMember(*ext, "anisotropyStrength", 0.0));
@@ -615,7 +626,7 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         if (name == "KHR_materials_clearcoat" || name == "KHR_materials_transmission" ||
             name == "KHR_materials_ior" || name == "KHR_materials_specular" ||
             name == "KHR_materials_sheen" || name == "KHR_materials_emissive_strength" ||
-            name == "KHR_materials_anisotropy") {
+            name == "KHR_materials_iridescence" || name == "KHR_materials_anisotropy") {
             continue;
         }
         std::cerr << "glTF material extension warning: material '" << (source.name.empty() ? "(unnamed)" : source.name)
@@ -629,7 +640,7 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         material.emissiveTextureTransform.enabled != 0u;
     if (material.hasIor != 0u || material.hasClearcoat != 0u || material.hasTransmission != 0u ||
         material.hasSpecular != 0u || material.hasSheen != 0u || material.hasEmissiveStrength != 0u ||
-        material.hasAnisotropy != 0u || hasTextureTransform) {
+        material.hasIridescence != 0u || material.hasAnisotropy != 0u || hasTextureTransform) {
         std::cout << "glTF material extensions: material '"
                   << (source.name.empty() ? "(unnamed)" : source.name)
                   << "' ior=" << material.iorFactor
@@ -637,6 +648,7 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
                   << " transmission=" << material.transmissionFactor
                   << " specular=" << material.specularFactor
                   << " sheenRoughness=" << material.sheenRoughnessFactor
+                  << " iridescence=" << material.iridescenceFactor
                   << " emissiveStrength=" << material.emissiveStrength
                   << " anisotropy=" << material.anisotropyStrength
                   << " textureTransform=" << (hasTextureTransform ? "yes" : "no")
@@ -748,20 +760,36 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
 
     std::vector<bool> colorTextureUse(model.textures.size(), false);
     std::vector<bool> dataTextureUse(model.textures.size(), false);
+    auto extensionTextureIndex = [](const tinygltf::Material& material, const char* extensionName, const char* textureName) -> int {
+        const auto extIt = material.extensions.find(extensionName);
+        if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
+            return -1;
+        }
+        const auto& extObject = extIt->second.Get<tinygltf::Value::Object>();
+        const auto texIt = extObject.find(textureName);
+        if (texIt == extObject.end() || !texIt->second.IsObject()) {
+            return -1;
+        }
+        const auto& texObject = texIt->second.Get<tinygltf::Value::Object>();
+        const auto indexIt = texObject.find("index");
+        return indexIt != texObject.end() && indexIt->second.IsInt() ? indexIt->second.Get<int>() : -1;
+    };
+    auto markTextureUse = [&](int textureIndex, std::vector<bool>& use) {
+        if (textureIndex >= 0 && static_cast<size_t>(textureIndex) < use.size()) {
+            use[static_cast<size_t>(textureIndex)] = true;
+        }
+    };
     for (const tinygltf::Material& sourceMaterial : model.materials) {
         const auto& pbr = sourceMaterial.pbrMetallicRoughness;
-        if (pbr.baseColorTexture.index >= 0 && static_cast<size_t>(pbr.baseColorTexture.index) < colorTextureUse.size()) {
-            colorTextureUse[static_cast<size_t>(pbr.baseColorTexture.index)] = true;
-        }
-        if (sourceMaterial.emissiveTexture.index >= 0 && static_cast<size_t>(sourceMaterial.emissiveTexture.index) < colorTextureUse.size()) {
-            colorTextureUse[static_cast<size_t>(sourceMaterial.emissiveTexture.index)] = true;
-        }
-        if (pbr.metallicRoughnessTexture.index >= 0 && static_cast<size_t>(pbr.metallicRoughnessTexture.index) < dataTextureUse.size()) {
-            dataTextureUse[static_cast<size_t>(pbr.metallicRoughnessTexture.index)] = true;
-        }
-        if (sourceMaterial.normalTexture.index >= 0 && static_cast<size_t>(sourceMaterial.normalTexture.index) < dataTextureUse.size()) {
-            dataTextureUse[static_cast<size_t>(sourceMaterial.normalTexture.index)] = true;
-        }
+        markTextureUse(pbr.baseColorTexture.index, colorTextureUse);
+        markTextureUse(sourceMaterial.emissiveTexture.index, colorTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenColorTexture"), colorTextureUse);
+        markTextureUse(pbr.metallicRoughnessTexture.index, dataTextureUse);
+        markTextureUse(sourceMaterial.normalTexture.index, dataTextureUse);
+        markTextureUse(sourceMaterial.occlusionTexture.index, dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenRoughnessTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceThicknessTexture"), dataTextureUse);
     }
 
     std::vector<TextureAssetHandle> textureHandles;
@@ -1022,6 +1050,11 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.hasSheen = cachedMat.hasSheen;
                     material.sheenColorFactor = cachedMat.sheenColorFactor;
                     material.sheenRoughnessFactor = cachedMat.sheenRoughnessFactor;
+                    material.hasIridescence = cachedMat.hasIridescence;
+                    material.iridescenceFactor = cachedMat.iridescenceFactor;
+                    material.iridescenceIor = cachedMat.iridescenceIor;
+                    material.iridescenceThicknessMinimum = cachedMat.iridescenceThicknessMinimum;
+                    material.iridescenceThicknessMaximum = cachedMat.iridescenceThicknessMaximum;
                     material.hasEmissiveStrength = cachedMat.hasEmissiveStrength;
                     material.emissiveStrength = cachedMat.emissiveStrength;
                     material.hasAnisotropy = cachedMat.hasAnisotropy;
@@ -1043,6 +1076,8 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.specularColorTexture = textureHandleFor(cachedMat.specularColorTextureIndex);
                     material.sheenColorTexture = textureHandleFor(cachedMat.sheenColorTextureIndex);
                     material.sheenRoughnessTexture = textureHandleFor(cachedMat.sheenRoughnessTextureIndex);
+                    material.iridescenceTexture = textureHandleFor(cachedMat.iridescenceTextureIndex);
+                    material.iridescenceThicknessTexture = textureHandleFor(cachedMat.iridescenceThicknessTextureIndex);
                     material.anisotropyTexture = textureHandleFor(cachedMat.anisotropyTextureIndex);
                     material.occlusionTexture = textureHandleFor(cachedMat.occlusionTextureIndex);
                     material.baseColorTextureTransform = cachedMat.baseColorTextureTransform;
@@ -1208,6 +1243,11 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.hasSheen = material->hasSheen;
         cachedMat.sheenColorFactor = material->sheenColorFactor;
         cachedMat.sheenRoughnessFactor = material->sheenRoughnessFactor;
+        cachedMat.hasIridescence = material->hasIridescence;
+        cachedMat.iridescenceFactor = material->iridescenceFactor;
+        cachedMat.iridescenceIor = material->iridescenceIor;
+        cachedMat.iridescenceThicknessMinimum = material->iridescenceThicknessMinimum;
+        cachedMat.iridescenceThicknessMaximum = material->iridescenceThicknessMaximum;
         cachedMat.hasEmissiveStrength = material->hasEmissiveStrength;
         cachedMat.emissiveStrength = material->emissiveStrength;
         cachedMat.hasAnisotropy = material->hasAnisotropy;
@@ -1229,6 +1269,8 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.specularColorTextureIndex = getTextureIndex(material->specularColorTexture);
         cachedMat.sheenColorTextureIndex = getTextureIndex(material->sheenColorTexture);
         cachedMat.sheenRoughnessTextureIndex = getTextureIndex(material->sheenRoughnessTexture);
+        cachedMat.iridescenceTextureIndex = getTextureIndex(material->iridescenceTexture);
+        cachedMat.iridescenceThicknessTextureIndex = getTextureIndex(material->iridescenceThicknessTexture);
         cachedMat.anisotropyTextureIndex = getTextureIndex(material->anisotropyTexture);
         cachedMat.occlusionTextureIndex = getTextureIndex(material->occlusionTexture);
         cachedMat.baseColorTextureTransform = material->baseColorTextureTransform;

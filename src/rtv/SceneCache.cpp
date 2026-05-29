@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 19;
+constexpr uint32_t kCacheVersion = 20;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -253,6 +253,11 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeUint32(file, mat.hasSheen);
         writeBytes(file, &mat.sheenColorFactor, sizeof(mat.sheenColorFactor));
         writeFloat(file, mat.sheenRoughnessFactor);
+        writeUint32(file, mat.hasIridescence);
+        writeFloat(file, mat.iridescenceFactor);
+        writeFloat(file, mat.iridescenceIor);
+        writeFloat(file, mat.iridescenceThicknessMinimum);
+        writeFloat(file, mat.iridescenceThicknessMaximum);
         writeUint32(file, mat.hasEmissiveStrength);
         writeFloat(file, mat.emissiveStrength);
         writeUint32(file, mat.hasAnisotropy);
@@ -274,6 +279,8 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeInt32(file, mat.specularColorTextureIndex);
         writeInt32(file, mat.sheenColorTextureIndex);
         writeInt32(file, mat.sheenRoughnessTextureIndex);
+        writeInt32(file, mat.iridescenceTextureIndex);
+        writeInt32(file, mat.iridescenceThicknessTextureIndex);
         writeInt32(file, mat.anisotropyTextureIndex);
         writeInt32(file, mat.occlusionTextureIndex);
         writeBytes(file, &mat.baseColorTextureTransform, sizeof(mat.baseColorTextureTransform));
@@ -527,6 +534,11 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readUint32(file, mat.hasSheen)) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.sheenColorFactor, sizeof(mat.sheenColorFactor))) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.sheenRoughnessFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasIridescence)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.iridescenceFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.iridescenceIor)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.iridescenceThicknessMinimum)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.iridescenceThicknessMaximum)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.hasEmissiveStrength)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.emissiveStrength)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.hasAnisotropy)) { std::fclose(file); return std::nullopt; }
@@ -548,6 +560,8 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readInt32(file, mat.specularColorTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.sheenColorTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.sheenRoughnessTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.iridescenceTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.iridescenceThicknessTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.anisotropyTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.occlusionTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.baseColorTextureTransform, sizeof(mat.baseColorTextureTransform))) { std::fclose(file); return std::nullopt; }

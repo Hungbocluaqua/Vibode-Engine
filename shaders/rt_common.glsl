@@ -5,6 +5,10 @@
 #include "atmosphere_phase.glsl"
 #include "blue_noise.glsl"
 
+#ifndef RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+#define RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT 0
+#endif
+
 layout(set = 0, binding = 0, std430) buffer AccumulationBuffer { vec4 accumulation_buffer[]; };
 
 layout(set = 0, binding = 1, std140) uniform Camera {
@@ -66,10 +70,16 @@ layout(set = 0, binding = 38, std430) buffer RestirReservoirBuffer { RestirReser
 layout(set = 0, binding = 39, std430) readonly buffer PreviousRestirReservoirBuffer { RestirReservoir previous_restir_reservoirs[]; };
 struct RestirGiReservoir {
     vec4 hit_position_target_pdf; // xyz = selected indirect hit point, w = target pdf
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     vec4 normal_roughness; // xyz = selected hit normal, w = roughness
+#endif
     vec4 radiance_weight_sum; // rgb = selected indirect radiance, w = weight sum
     vec4 receiver_position_hit_distance; // xyz = receiver point, w = hit distance
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     uvec4 metadata; // x = sample count, y = age, z = flags, w = material id
+#else
+    uvec4 metadata; // x = sample/age/flags/roughness, y = oct normal, z = material id, w = reserved
+#endif
 };
 layout(set = 0, binding = 43, std430) buffer RestirGiReservoirBuffer { RestirGiReservoir restir_gi_reservoirs[]; };
 layout(set = 0, binding = 44, std430) readonly buffer PreviousRestirGiReservoirBuffer { RestirGiReservoir previous_restir_gi_reservoirs[]; };
@@ -225,6 +235,16 @@ struct Material {
     float anisotropy_rotation;
     int occlusion_texture;
     float occlusion_strength;
+    vec3 sheen_color;
+    float sheen_roughness;
+    int sheen_color_texture;
+    int sheen_roughness_texture;
+    float iridescence_factor;
+    float iridescence_ior;
+    float iridescence_thickness_min;
+    float iridescence_thickness_max;
+    int iridescence_texture;
+    int iridescence_thickness_texture;
     float occlusion;
     float normal_variance;
 };
@@ -268,6 +288,13 @@ MaterialClosure material_to_closure(Material m) {
         c.flags = MATERIAL_CLOSURE_FLAG_SPECULAR | MATERIAL_CLOSURE_FLAG_CLEARCOAT;
     }
 
+    if (dot(max(m.sheen_color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)) > 1.0e-5) {
+        c.flags |= MATERIAL_CLOSURE_FLAG_SHEEN;
+    }
+    if (m.iridescence_factor > 1.0e-5) {
+        c.flags |= MATERIAL_CLOSURE_FLAG_THIN_FILM;
+    }
+
     return c;
 }
 
@@ -295,7 +322,7 @@ struct RayPayload {
 
 const float PI = 3.14159265358979323846;
 const uint TRI_STRIDE = 12u;
-const uint MATERIAL_STRIDE = 8u;
+const uint MATERIAL_STRIDE = 11u;
 const int MATERIAL_TEXTURE_LIMIT = 1024;
 const uint MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB = 1u << 0u;
 const uint MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB = 1u << 1u;
@@ -350,6 +377,30 @@ uint encode_octahedral_normal(vec3 n) {
     return pack_snorm2x16(p);
 }
 
+vec2 unpack_unorm2x16(uint packedValue) {
+    return vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
+}
+
+vec2 unpack_snorm2x16(uint packedValue) {
+    ivec2 quantized = ivec2(int(packedValue & 0xffffu), int((packedValue >> 16u) & 0xffffu));
+    if (quantized.x >= 32768) {
+        quantized.x -= 65536;
+    }
+    if (quantized.y >= 32768) {
+        quantized.y -= 65536;
+    }
+    return clamp(vec2(quantized) / 32767.0, vec2(-1.0), vec2(1.0));
+}
+
+vec3 decode_octahedral_normal(uint packedValue) {
+    vec2 f = unpack_snorm2x16(packedValue);
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
 uvec4 pack_depth_normal(float depth, vec3 normal, float roughness) {
     return uvec4(floatBitsToUint(depth), encode_octahedral_normal(normal), floatBitsToUint(roughness), 0u);
 }
@@ -391,14 +442,112 @@ bool restir_reservoir_valid(RestirReservoir reservoir) {
 }
 
 bool restir_gi_reservoir_valid(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     return (reservoir.metadata.z & RESTIR_GI_FLAG_VALID) != 0u &&
         reservoir.radiance_weight_sum.w > 0.0 &&
         reservoir.hit_position_target_pdf.w > 0.0 &&
         reservoir.metadata.x > 0u;
+#else
+    return ((reservoir.metadata.x >> 16u) & RESTIR_GI_FLAG_VALID) != 0u &&
+        reservoir.radiance_weight_sum.w > 0.0 &&
+        reservoir.hit_position_target_pdf.w > 0.0 &&
+        (reservoir.metadata.x & 0xffu) > 0u;
+#endif
+}
+
+uint restir_gi_sample_count_u(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return max(reservoir.metadata.x, 1u);
+#else
+    return max(reservoir.metadata.x & 0xffu, 1u);
+#endif
+}
+
+float restir_gi_sample_count(RestirGiReservoir reservoir) {
+    return float(restir_gi_sample_count_u(reservoir));
+}
+
+uint restir_gi_age(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.metadata.y;
+#else
+    return (reservoir.metadata.x >> 8u) & 0xffu;
+#endif
+}
+
+uint restir_gi_flags(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.metadata.z;
+#else
+    return (reservoir.metadata.x >> 16u) & 0xffu;
+#endif
+}
+
+bool restir_gi_visible(RestirGiReservoir reservoir) {
+    return (restir_gi_flags(reservoir) & RESTIR_GI_FLAG_VISIBLE) != 0u;
+}
+
+uint restir_gi_material_id(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.metadata.w;
+#else
+    return reservoir.metadata.z;
+#endif
+}
+
+float restir_gi_roughness(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return clamp(reservoir.normal_roughness.w, 0.0, 1.0);
+#else
+    return float((reservoir.metadata.x >> 24u) & 0xffu) / 255.0;
+#endif
+}
+
+vec3 restir_gi_normal(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return normalize(reservoir.normal_roughness.xyz);
+#else
+    return decode_octahedral_normal(reservoir.metadata.y);
+#endif
+}
+
+uint restir_gi_pack_metadata(uint sampleCount, uint age, uint flags, float roughness) {
+    uint sampleBits = min(sampleCount, 255u);
+    uint ageBits = min(age, 255u);
+    uint flagBits = flags & 0xffu;
+    uint roughnessBits = uint(clamp(round(clamp(roughness, 0.0, 1.0) * 255.0), 0.0, 255.0));
+    return sampleBits | (ageBits << 8u) | (flagBits << 16u) | (roughnessBits << 24u);
+}
+
+void restir_gi_set_metadata(inout RestirGiReservoir reservoir, uint sampleCount, uint age, uint flags, float roughness) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.metadata.x = sampleCount;
+    reservoir.metadata.y = age;
+    reservoir.metadata.z = flags;
+    reservoir.normal_roughness.w = clamp(roughness, 0.0, 1.0);
+#else
+    reservoir.metadata.x = restir_gi_pack_metadata(sampleCount, age, flags, roughness);
+#endif
+}
+
+void restir_gi_set_normal(inout RestirGiReservoir reservoir, vec3 normal) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.normal_roughness.xyz = normalize(normal);
+#else
+    reservoir.metadata.y = encode_octahedral_normal(normalize(normal));
+#endif
+}
+
+void restir_gi_set_material_id(inout RestirGiReservoir reservoir, uint materialId) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.metadata.w = materialId;
+#else
+    reservoir.metadata.z = materialId;
+#endif
 }
 
 float restir_gi_age_normalized(RestirGiReservoir reservoir, float maxAge) {
-    return clamp(float(reservoir.metadata.y) / max(maxAge, 1.0), 0.0, 1.0);
+    return clamp(float(restir_gi_age(reservoir)) / max(maxAge, 1.0), 0.0, 1.0);
 }
 
 float restir_target_function(RestirReservoir reservoir) {
@@ -595,6 +744,9 @@ Material decode_material(uint mat_idx) {
     vec4 d5 = mesh_materials[idx + 5u];
     vec4 d6 = mesh_materials[idx + 6u];
     vec4 d7 = mesh_materials[idx + 7u];
+    vec4 d8 = mesh_materials[idx + 8u];
+    vec4 d9 = mesh_materials[idx + 9u];
+    vec4 d10 = mesh_materials[idx + 10u];
     Material m;
     m.color = d0.xyz;
     m.roughness = d0.w;
@@ -618,6 +770,16 @@ Material decode_material(uint mat_idx) {
     m.anisotropy_rotation = d7.y;
     m.occlusion_texture = int(round(d7.z));
     m.occlusion_strength = clamp(d7.w, 0.0, 1.0);
+    m.sheen_color = max(d8.xyz, vec3(0.0));
+    m.sheen_roughness = clamp(d8.w, 0.0, 1.0);
+    m.sheen_color_texture = int(round(d9.x));
+    m.sheen_roughness_texture = int(round(d9.y));
+    m.iridescence_factor = clamp(d9.z, 0.0, 1.0);
+    m.iridescence_ior = max(d9.w, 1.01);
+    m.iridescence_thickness_min = max(d10.x, 0.0);
+    m.iridescence_thickness_max = max(d10.y, m.iridescence_thickness_min);
+    m.iridescence_texture = int(round(d10.z));
+    m.iridescence_thickness_texture = int(round(d10.w));
     m.occlusion = 1.0;
     m.normal_variance = 0.0;
     return m;
@@ -664,6 +826,23 @@ void apply_material_textures(inout Material material, vec2 uv) {
         int textureIndex = material.occlusion_texture;
         float ao = texture(material_textures[nonuniformEXT(textureIndex)], uv).r;
         material.occlusion = mix(1.0, clamp(ao, 0.0, 1.0), material.occlusion_strength);
+    }
+    if (material.sheen_color_texture >= 0 && material.sheen_color_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.sheen_color_texture;
+        material.sheen_color *= texture(material_textures[nonuniformEXT(textureIndex)], uv).rgb;
+    }
+    if (material.sheen_roughness_texture >= 0 && material.sheen_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.sheen_roughness_texture;
+        material.sheen_roughness = clamp(material.sheen_roughness * texture(material_textures[nonuniformEXT(textureIndex)], uv).a, 0.0, 1.0);
+    }
+    if (material.iridescence_texture >= 0 && material.iridescence_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.iridescence_texture;
+        material.iridescence_factor = clamp(material.iridescence_factor * texture(material_textures[nonuniformEXT(textureIndex)], uv).r, 0.0, 1.0);
+    }
+    if (material.iridescence_thickness_texture >= 0 && material.iridescence_thickness_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.iridescence_thickness_texture;
+        float thicknessMix = texture(material_textures[nonuniformEXT(textureIndex)], uv).g;
+        material.iridescence_thickness_min = mix(material.iridescence_thickness_min, material.iridescence_thickness_max, clamp(thicknessMix, 0.0, 1.0));
     }
 }
 
@@ -1306,14 +1485,44 @@ vec3 pbr_diffuse_energy(Material material) {
         (1.0 - clamp(material.metallic, 0.0, 1.0));
 }
 
-float pbr_specular_sample_probability(Material material, float NdotV) {
+float material_sheen_weight(Material material, float NdotV) {
+    float sheenLum = luminance(max(material.sheen_color, vec3(0.0)));
+    if (sheenLum <= 1.0e-5) {
+        return 0.0;
+    }
+    float grazing = schlick_fresnel_pow5(1.0 - clamp(NdotV, 0.0, 1.0));
+    return sheenLum * mix(0.35, 1.0, grazing);
+}
+
+void pbr_lobe_probabilities(Material material, float NdotV, out float diffuseProbability, out float specularProbability, out float sheenProbability) {
     vec3 f0 = pbr_f0(material);
     vec3 fresnel = material.use_conductor_optics != 0u
         ? conductor_fresnel(material, NdotV)
         : f0 + (vec3(1.0) - f0) * schlick_fresnel_pow5(1.0 - max(NdotV, 0.0));
     float specularWeight = max(luminance(fresnel), 0.0);
     float diffuseWeight = max(luminance(pbr_diffuse_energy(material) * material.color * (1.0 / PI)), 0.0);
-    return clamp(specularWeight / max(specularWeight + diffuseWeight, 1e-6), 0.05, 0.95);
+    float sheenWeight = material_sheen_weight(material, NdotV);
+    float totalWeight = max(diffuseWeight + specularWeight + sheenWeight, 1.0e-6);
+    diffuseProbability = diffuseWeight / totalWeight;
+    specularProbability = specularWeight / totalWeight;
+    sheenProbability = sheenWeight / totalWeight;
+    if (sheenWeight > 0.0) {
+        sheenProbability = clamp(sheenProbability, 0.05, 0.35);
+        float remaining = 1.0 - sheenProbability;
+        float baseTotal = max(diffuseWeight + specularWeight, 1.0e-6);
+        diffuseProbability = remaining * diffuseWeight / baseTotal;
+        specularProbability = remaining * specularWeight / baseTotal;
+    }
+    specularProbability = clamp(specularProbability, 0.05, 0.95 - sheenProbability);
+    diffuseProbability = max(1.0 - specularProbability - sheenProbability, 0.0);
+}
+
+float pbr_specular_sample_probability(Material material, float NdotV) {
+    float diffuseProbability;
+    float specularProbability;
+    float sheenProbability;
+    pbr_lobe_probabilities(material, NdotV, diffuseProbability, specularProbability, sheenProbability);
+    return specularProbability;
 }
 
 vec3 sample_cosine_hemisphere(inout uint state, vec3 normal, out float pdf) {
@@ -1499,6 +1708,84 @@ vec3 heitz_ms_ggx(vec3 f0, float roughness, float n_dot_v, float n_dot_l) {
     return f_ms * (1.0 - E_v) * (1.0 - E_l) / max(PI * E_v * E_l, 1e-8);
 }
 
+float charlie_inv_alpha(float roughness) {
+    float alpha = max(roughness * roughness, 0.001);
+    return 1.0 / alpha;
+}
+
+float charlie_ndf(float roughness, float n_dot_h) {
+    float invAlpha = charlie_inv_alpha(roughness);
+    float sin2Theta = max(1.0 - n_dot_h * n_dot_h, 0.0);
+    return (2.0 + invAlpha) * pow(sin2Theta, invAlpha * 0.5) / (2.0 * PI);
+}
+
+float sheen_visibility(float n_dot_v, float n_dot_l) {
+    return 1.0 / max(4.0 * max(n_dot_v, 0.01) * max(n_dot_l, 0.01), 1.0e-4);
+}
+
+vec3 eval_sheen_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+    float n_dot_v = max(dot(n, wo), 0.0);
+    float n_dot_l = max(dot(n, wi), 0.0);
+    if (n_dot_v <= 1.0e-6 || n_dot_l <= 1.0e-6 || luminance(material.sheen_color) <= 1.0e-6) {
+        return vec3(0.0);
+    }
+    vec3 halfVector = wo + wi;
+    if (dot(halfVector, halfVector) < 1.0e-12) {
+        return vec3(0.0);
+    }
+    vec3 h = normalize(halfVector);
+    float n_dot_h = max(dot(n, h), 0.0);
+    return material.sheen_color * charlie_ndf(material.sheen_roughness, n_dot_h) * sheen_visibility(n_dot_v, n_dot_l);
+}
+
+float pdf_sheen_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+    float n_dot_v = max(dot(n, wo), 0.0);
+    float n_dot_l = max(dot(n, wi), 0.0);
+    if (n_dot_v <= 1.0e-6 || n_dot_l <= 1.0e-6 || luminance(material.sheen_color) <= 1.0e-6) {
+        return 0.0;
+    }
+    vec3 halfVector = wo + wi;
+    if (dot(halfVector, halfVector) < 1.0e-12) {
+        return 0.0;
+    }
+    vec3 h = normalize(halfVector);
+    float n_dot_h = max(dot(n, h), 0.0);
+    float v_dot_h = max(dot(wo, h), 1.0e-6);
+    return charlie_ndf(material.sheen_roughness, n_dot_h) * n_dot_h / max(4.0 * v_dot_h, 1.0e-6);
+}
+
+vec3 sample_sheen_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tangent, vec3 bitangent) {
+    tangent_frame(n, tangent, bitangent);
+    float invAlpha = charlie_inv_alpha(material.sheen_roughness);
+    float u1 = rand_f32(state);
+    float u2 = rand_f32(state);
+    float sinTheta = pow(u1, 1.0 / (invAlpha + 2.0));
+    float cosTheta = sqrt(max(1.0 - sinTheta * sinTheta, 0.0));
+    float phi = 2.0 * PI * u2;
+    vec3 h = normalize(from_tangent_space(vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta), tangent, bitangent, n));
+    if (dot(wo, h) <= 0.0) {
+        h = reflect(h, n);
+    }
+    return normalize(2.0 * dot(wo, h) * h - wo);
+}
+
+vec3 thin_film_tint(Material material, float cosTheta) {
+    float factor = clamp(material.iridescence_factor, 0.0, 1.0);
+    if (factor <= 1.0e-5) {
+        return vec3(1.0);
+    }
+    float eta = max(material.iridescence_ior, 1.01);
+    float thicknessNm = clamp(material.iridescence_thickness_min, 0.0, max(material.iridescence_thickness_max, material.iridescence_thickness_min));
+    float sin2T = max(1.0 - cosTheta * cosTheta, 0.0) / (eta * eta);
+    float cosT = sqrt(max(1.0 - sin2T, 0.0));
+    float opticalPathNm = 2.0 * eta * thicknessNm * cosT;
+    vec3 phase = 2.0 * PI * opticalPathNm / vec3(650.0, 510.0, 475.0);
+    vec3 tint = 0.55 + 0.45 * cos(phase);
+    float tintLum = max(luminance(tint), 1.0e-4);
+    tint = clamp(tint / tintLum, vec3(0.25), vec3(1.75));
+    return mix(vec3(1.0), tint, factor);
+}
+
 vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
     Material specMaterial = material;
     specMaterial.roughness = material_specular_roughness(material);
@@ -1518,6 +1805,7 @@ vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, ve
     vec3 f = specMaterial.use_conductor_optics != 0u
         ? conductor_fresnel(specMaterial, v_dot_h)
         : schlick_fresnel(f0, v_dot_h);
+    f *= thin_film_tint(specMaterial, v_dot_h);
     float d = ggx_ndf(specMaterial.roughness, n_dot_h);
     float g = smith_g(specMaterial.roughness, n_dot_v, n_dot_l);
     if (material_uses_anisotropy(specMaterial)) {
@@ -1553,9 +1841,13 @@ float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, ve
 
 float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
     float NdotV = max(dot(n, wo), 0.0);
-    float specularProbability = pbr_specular_sample_probability(material, NdotV);
-    float diffuseProbability = 1.0 - specularProbability;
-    return diffuseProbability * diffuse_pdf(n, wi) + specularProbability * pdf_ggx_brdf(material, wo, wi, n, tangent, bitangent);
+    float diffuseProbability;
+    float specularProbability;
+    float sheenProbability;
+    pbr_lobe_probabilities(material, NdotV, diffuseProbability, specularProbability, sheenProbability);
+    return diffuseProbability * diffuse_pdf(n, wi) +
+        specularProbability * pdf_ggx_brdf(material, wo, wi, n, tangent, bitangent) +
+        sheenProbability * pdf_sheen_brdf(material, wo, wi, n);
 }
 
 vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tangent, vec3 bitangent) {
@@ -1628,27 +1920,10 @@ vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 b
         result += c.weight * c.color * (sssRadius / PI) * wrap;
     }
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SHEEN)) {
-        vec3 H = normalize(wo + wi);
-        float NdotH = max(dot(n, H), 0.0);
-        float invAlpha = 1.0 / max(c.roughness * c.roughness, 0.001);
-        float sin2Theta = 1.0 - NdotH * NdotH;
-        float Dcharlie = (2.0 + invAlpha) * pow(max(sin2Theta, 0.0), invAlpha * 0.5) / (2.0 * PI);
-        float NdotV = max(dot(n, wo), 0.0);
-        float V = 1.0 / (4.0 * max(NdotV, 0.01) * max(NdotL, 0.01));
-        result += c.weight * c.color * Dcharlie * V * NdotL;
+        result += c.weight * eval_sheen_brdf(material, wo, wi, n);
     }
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
-        vec3 spec = eval_ggx_brdf(material, wo, wi, n, tangent, bitangent);
-        if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_THIN_FILM)) {
-            float NdotV = max(dot(n, wo), 0.0);
-            float cosTheta = max(dot(reflect(-wo, n), wi), 0.0);
-            float filmThickness = c.ior * 1e-6;
-            float opd = 2.0 * c.ior * filmThickness * sqrt(1.0 - (1.0 - cosTheta * cosTheta) / (c.ior * c.ior));
-            vec3 phase = 2.0 * PI * opd / vec3(650.0, 510.0, 475.0);
-            vec3 iridescence = 0.5 + 0.5 * cos(phase);
-            spec *= iridescence;
-        }
-        result += c.weight * spec;
+        result += c.weight * eval_ggx_brdf(material, wo, wi, n, tangent, bitangent);
     }
     return result;
 }
@@ -1673,10 +1948,16 @@ vec3 sample_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tang
     MaterialClosure c = material_to_closure(material);
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
         float NdotV_sample = max(dot(n, wo), 0.0);
-        float specularProbability = pbr_specular_sample_probability(material, NdotV_sample);
+        float diffuseProbability;
+        float specularProbability;
+        float sheenProbability;
+        pbr_lobe_probabilities(material, NdotV_sample, diffuseProbability, specularProbability, sheenProbability);
         vec3 wi;
-        if (rand_f32(state) < specularProbability) {
+        float lobeSample = rand_f32(state);
+        if (lobeSample < specularProbability) {
             wi = sample_ggx_brdf(state, material, wo, n, tangent, bitangent);
+        } else if (lobeSample < specularProbability + sheenProbability) {
+            wi = sample_sheen_brdf(state, material, wo, n, tangent, bitangent);
         } else {
             float diffusePdf;
             wi = sample_cosine_hemisphere(state, n, diffusePdf);

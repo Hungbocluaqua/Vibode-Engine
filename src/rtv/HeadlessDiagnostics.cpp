@@ -81,6 +81,12 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryReport& m) {
     j["acceleration_structure_bytes"] = m.accelerationStructureBytes;
     j["temporal_history_bytes"] = m.temporalHistoryBytes;
     j["restir_reservoir_bytes"] = m.restirReservoirBytes;
+    j["restir_di_current_bytes"] = m.restirDiCurrentBytes;
+    j["restir_di_previous_bytes"] = m.restirDiPreviousBytes;
+    j["restir_di_spatial_bytes"] = m.restirDiSpatialBytes;
+    j["restir_gi_current_bytes"] = m.restirGiCurrentBytes;
+    j["restir_gi_previous_bytes"] = m.restirGiPreviousBytes;
+    j["restir_gi_spatial_bytes"] = m.restirGiSpatialBytes;
 }
 
 void to_json(nlohmann::json& j, const RendererSettings& s) {
@@ -349,6 +355,14 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.buffersBytes = static_cast<uint64_t>(renderer->estimatedBufferMemory());
     profileReport_.memory.temporalHistoryBytes = static_cast<uint64_t>(renderer->temporalHistoryMemory());
     profileReport_.memory.restirReservoirBytes = static_cast<uint64_t>(renderer->restirReservoirMemory());
+    const auto reservoirBreakdown = renderer->restirReservoirMemoryBreakdown();
+    profileReport_.memory.restirDiCurrentBytes = static_cast<uint64_t>(reservoirBreakdown.diCurrentBytes);
+    profileReport_.memory.restirDiPreviousBytes = static_cast<uint64_t>(reservoirBreakdown.diPreviousBytes);
+    profileReport_.memory.restirDiSpatialBytes = static_cast<uint64_t>(reservoirBreakdown.diSpatialBytes);
+    profileReport_.memory.restirGiCurrentBytes = static_cast<uint64_t>(reservoirBreakdown.giCurrentBytes);
+    profileReport_.memory.restirGiPreviousBytes = static_cast<uint64_t>(reservoirBreakdown.giPreviousBytes);
+    profileReport_.memory.restirGiSpatialBytes = static_cast<uint64_t>(reservoirBreakdown.giSpatialBytes);
+    profileReport_.restirGiLayout = renderer->restirGiReservoirLayoutName();
 
     profileReport_.validationErrorCount = 0;
 
@@ -364,6 +378,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["gpu_name"] = profileReport_.gpuName;
     j["driver_version"] = profileReport_.driverVersion;
     j["vulkan_version"] = profileReport_.vulkanVersion;
+    j["restir_gi_layout"] = profileReport_.restirGiLayout;
     j["resolution"] = profileReport_.resolution;
     j["frame_count"] = profileReport_.frameCount;
     j["warmup_frames"] = profileReport_.warmupFrames;

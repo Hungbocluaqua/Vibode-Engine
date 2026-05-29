@@ -311,14 +311,19 @@ void main() {
 
     float center_lum = luminance(center_color);
     float var_factor = sqrt(max(center_var, 0.0));
+    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], 64.0);
+    float motion_filter_boost = smoothstep(0.75, 12.0, length(velocity_pixels));
+    float motion_history_available = params.reset_history == 0u ? motion_filter_boost : 0.0;
     float inv_strength = 1.0 / max(params.strength, 0.001);
     float capped_var = min(var_factor, 0.7);
-    float sigma_color = (0.18 + capped_var * 1.2) * inv_strength;
-    float sigma_depth = (0.12 + var_factor * 0.45) * inv_strength;
-    float sigma_normal = 0.42 * inv_strength;
+    float sigma_color = (0.18 + capped_var * 1.2) * inv_strength * mix(1.0, 1.65, motion_filter_boost);
+    float sigma_depth = (0.12 + var_factor * 0.45) * inv_strength * mix(1.0, 1.35, motion_filter_boost);
+    float sigma_normal = 0.42 * inv_strength * mix(1.0, 1.20, motion_filter_boost);
     float kernel_radius_signal = max(max(center_roughness, clamp(center_var / 4.0, 0.0, 1.0)), distance_kernel_bias);
-    float outer_ring_weight = smoothstep(0.3, 0.7, kernel_radius_signal);
+    float outer_ring_weight = max(smoothstep(0.3, 0.7, kernel_radius_signal), motion_filter_boost * 0.55);
     uint iterations = clamp(params.atrous_iterations, 1u, 5u);
+    uint motion_min_iterations = motion_filter_boost > 0.20 ? 3u : 1u;
+    iterations = max(iterations, motion_min_iterations);
 
     vec3 filtered_color = center_color;
     vec3 scale_accumulated_color = vec3(0.0);
@@ -423,7 +428,6 @@ void main() {
     bool sky_valid = !is_surface_depth(center_depth);
     vec3 wp = reconstruct_current_world_position(coords, center_depth, dims);
     vec2 surface_history_pos = sky_valid ? reproject_sky_history(coords, dims) : reproject_history(coords, wp, dims);
-    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], 64.0);
     vec2 velocity_history_pos = temporal_reproject_pixel(coords, velocity_pixels);
     bool velocity_on_screen = temporal_history_pixel_valid(velocity_history_pos, dims, 0.0);
     if (velocity_on_screen) {
@@ -576,6 +580,18 @@ void main() {
         specular_motion_confidence,
         reactive_mask,
         specular_frame_blend);
+    float diffuse_motion_history_floor = motion_history_available *
+        diffuse_channel_confidence *
+        diffuse_frame_blend *
+        (1.0 - reactive_mask * 0.35) *
+        mix(0.28, 0.46, diffuse_confidence);
+    float specular_motion_history_floor = motion_history_available *
+        specular_channel_confidence *
+        specular_frame_blend *
+        (1.0 - reactive_mask * 0.60) *
+        mix(0.10, 0.26, specular_confidence);
+    diffuse_history_weight = min(max(diffuse_history_weight, diffuse_motion_history_floor), 0.90);
+    specular_history_weight = min(max(specular_history_weight, specular_motion_history_floor), 0.78);
     specular_history_weight = mix(
         specular_history_weight,
         max(specular_history_weight, 0.35),

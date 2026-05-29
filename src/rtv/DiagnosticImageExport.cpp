@@ -304,6 +304,8 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::RestirGiTemporal,
         RendererDebugView::RestirGiSpatial,
         RendererDebugView::RestirGiFinal,
+        RendererDebugView::RestirGiNormal,
+        RendererDebugView::RestirGiHitDistance,
     };
 }
 
