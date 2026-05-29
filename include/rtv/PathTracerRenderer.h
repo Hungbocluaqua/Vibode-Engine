@@ -12,6 +12,7 @@
 #include <Volk/volk.h>
 #include <glm/glm.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -104,12 +105,26 @@ public:
     [[nodiscard]] const RendererSettings& settings() const { return settings_; }
     [[nodiscard]] bool hardwareRayTracingAvailable() const;
     [[nodiscard]] RayTracingRendererStats rayTracingStats() const;
-    [[nodiscard]] uint32_t sampleCount() const { return frameCount_; }
+    [[nodiscard]] uint32_t effectiveSamplesPerPixel() const {
+        return settings_.limitSamplesPerPixel ? 1u : std::max(1u, settings_.samplesPerPixel);
+    }
+    [[nodiscard]] uint32_t sampleCount() const { return frameCount_ * effectiveSamplesPerPixel(); }
     [[nodiscard]] const GpuFrameTimings& timings() const;
     [[nodiscard]] GpuPipelineStatistics pipelineStats() const;
     [[nodiscard]] AccumulationResetReason lastAccumulationResetReason() const { return lastResetReason_; }
     [[nodiscard]] const RendererValidationLog& validationLog() const { return validationLog_; }
     [[nodiscard]] RendererValidationLog& validationLog() { return validationLog_; }
+    struct AdaptiveQualityState {
+        float smoothedGpuMs = 0.0f;
+        uint32_t tier = 0;
+        uint32_t overBudgetFrames = 0;
+        uint32_t effectiveMaxBounces = 0;
+        uint32_t effectiveEnvironmentSamples = 0;
+        uint32_t effectiveAtrousIterations = 0;
+        bool skipRestirSpatial = false;
+        bool skipDenoiser = false;
+    };
+    [[nodiscard]] AdaptiveQualityState adaptiveQualityState() const;
     [[nodiscard]] const TemporalSystem* temporalSystem() const { return temporalSystem_.get(); }
     [[nodiscard]] AtmosphereLutStats atmosphereLutStats() const;
     [[nodiscard]] const GpuScene& scene() const { return scene_; }
@@ -225,6 +240,8 @@ private:
         uint32_t cameraMoving = 0;
         uint32_t renderWidth = 0;
         uint32_t renderHeight = 0;
+    float motionFeedback = 0.90f;
+    float reactiveFeedback = 0.98f;
     };
 
     struct RestirSpatialParams {

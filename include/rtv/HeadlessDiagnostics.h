@@ -65,6 +65,8 @@ struct ProfileReport {
         float min = 0.0f;
         float avg = 0.0f;
         float max = 0.0f;
+        float p95 = 0.0f;
+        float p99 = 0.0f;
     };
     MinMaxAvg cpuFrameMs{};
     MinMaxAvg gpuFrameMs{};
@@ -99,6 +101,8 @@ struct ProfileReport {
         float fullscreen = 0.0f;
         float editorPresentation = 0.0f;
     } perPassGpuMs{};
+    PerPassGpuMs perPassGpuMsP95{};
+    PerPassGpuMs perPassGpuMsP99{};
 
     struct PipelineStatistics {
         uint64_t rayInvocations = 0;
@@ -119,6 +123,17 @@ struct ProfileReport {
         uint64_t restirGiPreviousBytes = 0;
         uint64_t restirGiSpatialBytes = 0;
     } memory{};
+
+    struct AdaptiveQualityReport {
+        float smoothedGpuMs = 0.0f;
+        uint32_t tier = 0;
+        uint32_t overBudgetFrames = 0;
+        uint32_t effectiveMaxBounces = 0;
+        uint32_t effectiveEnvironmentSamples = 0;
+        uint32_t effectiveAtrousIterations = 0;
+        bool skipRestirSpatial = false;
+        bool skipDenoiser = false;
+    } adaptiveQuality{};
 
     uint32_t validationErrorCount = 0;
     std::vector<std::string> warnings;

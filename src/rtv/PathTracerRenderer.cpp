@@ -532,8 +532,8 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
     const uint32_t maxTier = std::clamp(mode, 1u, 3u);
     const bool moving = cameraChangedThisFrame_;
     const float targetMs = std::clamp(settings_.adaptiveGpuFrameTargetMs, 4.0f, 100.0f);
-    const bool overBudget = adaptiveSmoothedGpuMs_ > targetMs * 1.15f;
-    const bool underBudget = adaptiveSmoothedGpuMs_ <= 0.0f || adaptiveSmoothedGpuMs_ < targetMs * 0.88f;
+    const bool overBudget = adaptiveSmoothedGpuMs_ > targetMs * 0.96f || gpuMs > targetMs * 1.05f;
+    const bool underBudget = adaptiveSmoothedGpuMs_ <= 0.0f || adaptiveSmoothedGpuMs_ < targetMs * 0.82f;
     const uint32_t stableFramesForFullQuality = mode == 1u ? 6u : (mode == 2u ? 10u : 14u);
 
     if (moving) {
@@ -559,16 +559,13 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
         adaptiveEffectiveEnvironmentSamples_ = std::max(1u, settings_.environmentDirectSamples);
         adaptiveEffectiveAtrousIterations_ = std::max(1u, settings_.atrousIterations > 1u ? settings_.atrousIterations - 1u : settings_.atrousIterations);
     } else if (adaptiveQualityTier_ == 2u) {
-        adaptiveEffectiveMaxBounces_ = std::max(2u, std::min(settings_.maxBounces, settings_.maxBounces / 2u + 1u));
+        adaptiveEffectiveMaxBounces_ = std::max(2u, std::min(settings_.maxBounces, settings_.maxBounces / 2u));
         adaptiveEffectiveEnvironmentSamples_ = 1u;
-        adaptiveEffectiveAtrousIterations_ = std::max(1u, settings_.atrousIterations > 2u ? settings_.atrousIterations - 2u : 1u);
-        adaptiveSkipRestirSpatial_ = moving;
+        adaptiveEffectiveAtrousIterations_ = std::max(2u, settings_.atrousIterations > 1u ? settings_.atrousIterations - 1u : 1u);
     } else {
         adaptiveEffectiveMaxBounces_ = std::min(settings_.maxBounces, 2u);
         adaptiveEffectiveEnvironmentSamples_ = 1u;
         adaptiveEffectiveAtrousIterations_ = 1u;
-        adaptiveSkipRestirSpatial_ = moving;
-        adaptiveSkipDenoiser_ = moving && debugParams_.view == static_cast<uint32_t>(RendererDebugView::Beauty);
     }
 
     if (temporalFrameIndex_ == 1u || temporalFrameIndex_ % 120u == 0u) {
@@ -586,9 +583,27 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
 bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     RendererSettings next = settings;
     next.maxBounces = std::clamp(next.maxBounces, 1u, 16u);
+    next.samplesPerPixel = std::clamp(next.samplesPerPixel, 1u, 8u);
     next.atrousIterations = std::clamp(next.atrousIterations, 1u, 5u);
     next.environmentDirectSamples = std::clamp(next.environmentDirectSamples, 1u, 8u);
     next.denoiserStrength = std::max(0.05f, next.denoiserStrength);
+    next.denoiserMaxHistoryLength = std::clamp(next.denoiserMaxHistoryLength, 4u, 256u);
+    next.momentValidityThreshold = std::clamp(
+        std::isfinite(next.momentValidityThreshold) ? next.momentValidityThreshold : 0.20f,
+        0.05f,
+        0.75f);
+    next.taaFeedback = std::clamp(
+        std::isfinite(next.taaFeedback) ? next.taaFeedback : 0.06f,
+        0.01f,
+        0.5f);
+    next.taaMotionFeedback = std::clamp(
+        std::isfinite(next.taaMotionFeedback) ? next.taaMotionFeedback : 0.90f,
+        0.25f,
+        0.98f);
+    next.taaReactiveFeedback = std::clamp(
+        std::isfinite(next.taaReactiveFeedback) ? next.taaReactiveFeedback : 0.98f,
+        next.taaMotionFeedback,
+        0.99f);
     next.taaSharpeningStrength = std::clamp(next.taaSharpeningStrength, 0.0f, 1.0f);
     next.sunIntensity = std::max(0.0f, next.sunIntensity);
     next.sunIlluminanceLux = std::max(0.0f, next.sunIlluminanceLux);
@@ -680,8 +695,12 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     if (static_cast<uint32_t>(next.restirMode) > static_cast<uint32_t>(RestirMode::HybridCompare)) {
         next.restirMode = RestirMode::ClassicNee;
     }
+    if (static_cast<uint32_t>(next.renderPreset) > static_cast<uint32_t>(RenderPreset::Ultra)) {
+        next.renderPreset = RenderPreset::Custom;
+    }
 
     const bool changed =
+        next.renderPreset != settings_.renderPreset ||
         next.pathTracingEnabled != settings_.pathTracingEnabled ||
         next.cameraJitterEnabled != settings_.cameraJitterEnabled ||
         next.denoiserEnabled != settings_.denoiserEnabled ||
@@ -691,17 +710,24 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.directLightingEnabled != settings_.directLightingEnabled ||
         next.environmentEnabled != settings_.environmentEnabled ||
         next.maxBounces != settings_.maxBounces ||
+        next.samplesPerPixel != settings_.samplesPerPixel ||
+        next.limitSamplesPerPixel != settings_.limitSamplesPerPixel ||
         next.atrousIterations != settings_.atrousIterations ||
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         next.restirMode != settings_.restirMode ||
+        next.restirGiEnabled != settings_.restirGiEnabled ||
         next.specularAaEnabled != settings_.specularAaEnabled ||
         next.debugView != settings_.debugView ||
         next.toneMapper != settings_.toneMapper ||
         next.autoExposureEnabled != settings_.autoExposureEnabled ||
         next.usePhysicalCamera != settings_.usePhysicalCamera ||
         std::abs(next.taaFeedback - settings_.taaFeedback) > 0.0001f ||
+        std::abs(next.taaMotionFeedback - settings_.taaMotionFeedback) > 0.0001f ||
+        std::abs(next.taaReactiveFeedback - settings_.taaReactiveFeedback) > 0.0001f ||
         std::abs(next.taaSharpeningStrength - settings_.taaSharpeningStrength) > 0.0001f ||
         std::abs(next.denoiserStrength - settings_.denoiserStrength) > 0.0001f ||
+        next.denoiserMaxHistoryLength != settings_.denoiserMaxHistoryLength ||
+        std::abs(next.momentValidityThreshold - settings_.momentValidityThreshold) > 0.0001f ||
         std::abs(next.sunIntensity - settings_.sunIntensity) > 0.0001f ||
         std::abs(next.sunIlluminanceLux - settings_.sunIlluminanceLux) > 0.5f ||
         glm::length(next.sunColor - settings_.sunColor) > 0.0001f ||
@@ -768,6 +794,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.directLightingEnabled != settings_.directLightingEnabled ||
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         next.restirMode != settings_.restirMode ||
+        next.restirGiEnabled != settings_.restirGiEnabled ||
         std::abs(next.sunIntensity - settings_.sunIntensity) > 0.0001f ||
         std::abs(next.sunIlluminanceLux - settings_.sunIlluminanceLux) > 0.5f ||
         glm::length(next.sunColor - settings_.sunColor) > 0.0001f ||
@@ -784,10 +811,14 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.denoiserEnabled != settings_.denoiserEnabled ||
         next.denoiseWhileMoving != settings_.denoiseWhileMoving ||
         next.atrousIterations != settings_.atrousIterations ||
-        std::abs(next.denoiserStrength - settings_.denoiserStrength) > 0.0001f;
+        std::abs(next.denoiserStrength - settings_.denoiserStrength) > 0.0001f ||
+        next.denoiserMaxHistoryLength != settings_.denoiserMaxHistoryLength ||
+        std::abs(next.momentValidityThreshold - settings_.momentValidityThreshold) > 0.0001f;
     const bool taaChanged =
         next.taaEnabled != settings_.taaEnabled ||
         std::abs(next.taaFeedback - settings_.taaFeedback) > 0.0001f ||
+        std::abs(next.taaMotionFeedback - settings_.taaMotionFeedback) > 0.0001f ||
+        std::abs(next.taaReactiveFeedback - settings_.taaReactiveFeedback) > 0.0001f ||
         std::abs(next.taaSharpeningStrength - settings_.taaSharpeningStrength) > 0.0001f;
     const bool debugChanged =
         next.debugView != settings_.debugView ||
@@ -798,6 +829,8 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.adaptiveQualityMode != settings_.adaptiveQualityMode ||
         next.specularAaEnabled != settings_.specularAaEnabled ||
         next.maxBounces != settings_.maxBounces ||
+        next.samplesPerPixel != settings_.samplesPerPixel ||
+        next.limitSamplesPerPixel != settings_.limitSamplesPerPixel ||
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         std::abs(next.indirectStrength - settings_.indirectStrength) > 0.0001f ||
         std::abs(next.shadowRayBias - settings_.shadowRayBias) > 0.000001f ||
@@ -996,6 +1029,19 @@ const GpuFrameTimings& PathTracerRenderer::timings() const {
         return currentProfiler_->timings();
     }
     return profilers_.empty() ? empty : profilers_.front().timings();
+}
+
+PathTracerRenderer::AdaptiveQualityState PathTracerRenderer::adaptiveQualityState() const {
+    return AdaptiveQualityState{
+        adaptiveSmoothedGpuMs_,
+        adaptiveQualityTier_,
+        adaptiveOverBudgetFrames_,
+        adaptiveEffectiveMaxBounces_,
+        adaptiveEffectiveEnvironmentSamples_,
+        adaptiveEffectiveAtrousIterations_,
+        adaptiveSkipRestirSpatial_,
+        adaptiveSkipDenoiser_,
+    };
 }
 
 GpuPipelineStatistics PathTracerRenderer::pipelineStats() const {
@@ -1412,6 +1458,11 @@ void PathTracerRenderer::updateCamera() {
         settings_.restirGiHalfResolution ? 1u : 0u,
         settings_.restirGiVisibilityRayBudget,
         settings_.specularAaEnabled ? 1u : 0u);
+    camera_.pathTraceControls = glm::uvec4(
+        settings_.samplesPerPixel,
+        settings_.limitSamplesPerPixel ? 1u : 0u,
+        0u,
+        0u);
     const bool temporalCameraCut = temporalSystem_ ? temporalSystem_->isCameraCut() : temporalFrameIndex_ <= 1u;
     const bool temporalHistoryAvailable = !temporalCameraCut;
     camera_.atmosphere = glm::vec4(
@@ -1506,6 +1557,8 @@ void PathTracerRenderer::updateCamera() {
     taaParams_.cameraMoving = cameraChangedThisFrame_ ? 1u : 0u;
     taaParams_.renderWidth = renderExtent_.width;
     taaParams_.renderHeight = renderExtent_.height;
+    taaParams_.motionFeedback = settings_.taaMotionFeedback;
+    taaParams_.reactiveFeedback = settings_.taaReactiveFeedback;
     frameUniforms.write(&taaParams_, sizeof(taaParams_), kFrameTaaParamsOffset);
     frameUniforms.flush(sizeof(taaParams_), kFrameTaaParamsOffset);
     if (temporalFrameIndex_ == 1u || temporalFrameIndex_ % 120u == 0u) {
@@ -1986,6 +2039,12 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId indirectSpecularMoments = graph.createTexture(imageResource(indirectSpecularMomentsImage_, "indirect specular moments"));
     const RenderGraphResourceId historyLength = graph.createTexture(imageResource(historyLengthImage_, "history length"));
     const RenderGraphResourceId momentDebug = graph.createTexture(imageResource(momentDebugImage_, "moment debug"));
+    const RenderGraphResourceId directDiffuseResolvedMoments = graph.createTexture(imageResource(directDiffuseResolvedMomentsImage_, "current direct diffuse moments"));
+    const RenderGraphResourceId directSpecularResolvedMoments = graph.createTexture(imageResource(directSpecularResolvedMomentsImage_, "current direct specular moments"));
+    const RenderGraphResourceId indirectDiffuseResolvedMoments = graph.createTexture(imageResource(indirectDiffuseResolvedMomentsImage_, "current indirect diffuse moments"));
+    const RenderGraphResourceId indirectSpecularResolvedMoments = graph.createTexture(imageResource(indirectSpecularResolvedMomentsImage_, "current indirect specular moments"));
+    const RenderGraphResourceId historyLengthResolved = graph.createTexture(imageResource(historyLengthResolvedImage_, "current history length"));
+    const RenderGraphResourceId momentDebugResolved = graph.createTexture(imageResource(momentDebugResolvedImage_, "current moment debug"));
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
     const RenderGraphResourceId restirSpatialReservoir = graph.createBuffer(bufferResource(restirSpatialReservoirBuffer_, "restir spatial reservoir"));
@@ -2063,11 +2122,34 @@ void PathTracerRenderer::recordRenderGraphPlan() {
 
     RenderGraphResourceId toneInput = raw;
     if (shouldRunDenoiser()) {
+        graph.addPass("moment_update")
+            .addStorageReadWrite(directDiffuseMoments, PipelineDomain::Compute)
+            .addStorageReadWrite(directSpecularMoments, PipelineDomain::Compute)
+            .addStorageReadWrite(indirectDiffuseMoments, PipelineDomain::Compute)
+            .addStorageReadWrite(indirectSpecularMoments, PipelineDomain::Compute)
+            .addStorageReadWrite(historyLength, PipelineDomain::Compute)
+            .addStorageWrite(directDiffuseResolvedMoments, PipelineDomain::Compute)
+            .addStorageWrite(directSpecularResolvedMoments, PipelineDomain::Compute)
+            .addStorageWrite(indirectDiffuseResolvedMoments, PipelineDomain::Compute)
+            .addStorageWrite(indirectSpecularResolvedMoments, PipelineDomain::Compute)
+            .addStorageWrite(historyLengthResolved, PipelineDomain::Compute)
+            .addStorageWrite(momentDebugResolved, PipelineDomain::Compute)
+            .addStorageRead(pathData, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
+            .addStorageRead(previousWorldPosition, PipelineDomain::Compute)
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageRead(worldPosition, PipelineDomain::Compute);
         graph.addPass("temporal_denoiser")
             .addStorageReadWrite(raw, PipelineDomain::Compute)
             .addStorageReadWrite(history, PipelineDomain::Compute)
             .addStorageReadWrite(diffuseHistory, PipelineDomain::Compute)
             .addStorageReadWrite(specularHistory, PipelineDomain::Compute)
+            .addStorageReadWrite(directDiffuseMoments, PipelineDomain::Compute)
+            .addStorageReadWrite(directSpecularMoments, PipelineDomain::Compute)
+            .addStorageReadWrite(indirectDiffuseMoments, PipelineDomain::Compute)
+            .addStorageReadWrite(indirectSpecularMoments, PipelineDomain::Compute)
+            .addStorageReadWrite(historyLength, PipelineDomain::Compute)
+            .addStorageReadWrite(momentDebug, PipelineDomain::Compute)
             .addStorageRead(variance, PipelineDomain::Compute)
             .addStorageRead(depthNormal, PipelineDomain::Compute)
             .addStorageRead(worldPosition, PipelineDomain::Compute)
@@ -2086,6 +2168,18 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageWrite(specularHistory, PipelineDomain::Transfer)
             .addStorageRead(worldPosition, PipelineDomain::Transfer)
             .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
+            .addStorageRead(directDiffuseResolvedMoments, PipelineDomain::Transfer)
+            .addStorageWrite(directDiffuseMoments, PipelineDomain::Transfer)
+            .addStorageRead(directSpecularResolvedMoments, PipelineDomain::Transfer)
+            .addStorageWrite(directSpecularMoments, PipelineDomain::Transfer)
+            .addStorageRead(indirectDiffuseResolvedMoments, PipelineDomain::Transfer)
+            .addStorageWrite(indirectDiffuseMoments, PipelineDomain::Transfer)
+            .addStorageRead(indirectSpecularResolvedMoments, PipelineDomain::Transfer)
+            .addStorageWrite(indirectSpecularMoments, PipelineDomain::Transfer)
+            .addStorageRead(historyLengthResolved, PipelineDomain::Transfer)
+            .addStorageWrite(historyLength, PipelineDomain::Transfer)
+            .addStorageRead(momentDebugResolved, PipelineDomain::Transfer)
+            .addStorageWrite(momentDebug, PipelineDomain::Transfer)
             .addStorageRead(restirReservoir, PipelineDomain::Transfer)
             .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
         if (useRestirGiReservoirs) {
@@ -3176,7 +3270,8 @@ bool PathTracerRenderer::shouldRunRestirSpatial() const {
 }
 
 bool PathTracerRenderer::shouldUseRestirGiReservoirs() const {
-    return settings_.debugView == RendererDebugView::RestirGiValidity ||
+    return settings_.restirGiEnabled ||
+        settings_.debugView == RendererDebugView::RestirGiValidity ||
         settings_.debugView == RendererDebugView::RestirGiAge ||
         settings_.debugView == RendererDebugView::RestirGiInitial ||
         settings_.debugView == RendererDebugView::RestirGiTemporal ||
@@ -3187,7 +3282,8 @@ bool PathTracerRenderer::shouldUseRestirGiReservoirs() const {
 }
 
 bool PathTracerRenderer::shouldRunRestirGiFinal() const {
-    return settings_.debugView == RendererDebugView::RestirGiSpatial ||
+    return settings_.restirGiEnabled ||
+        settings_.debugView == RendererDebugView::RestirGiSpatial ||
         settings_.debugView == RendererDebugView::RestirGiFinal;
 }
 

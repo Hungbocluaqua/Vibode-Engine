@@ -42,6 +42,24 @@ const char* restirModeName(RestirMode mode) {
     return "classic-nee";
 }
 
+const char* renderPresetName(RenderPreset preset) {
+    switch (preset) {
+    case RenderPreset::Custom: return "custom";
+    case RenderPreset::Low: return "low";
+    case RenderPreset::Balanced: return "balanced";
+    case RenderPreset::Ultra: return "ultra";
+    }
+    return "custom";
+}
+
+RenderPreset parseRenderPreset(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "low" || key == "performance") { return RenderPreset::Low; }
+    if (key == "balanced" || key == "game" || key == "default") { return RenderPreset::Balanced; }
+    if (key == "ultra" || key == "quality" || key == "reference") { return RenderPreset::Ultra; }
+    return RenderPreset::Custom;
+}
+
 RendererDebugView parseRendererDebugView(std::string_view value) {
     const std::string key = normalized(value);
     if (key == "variance") { return RendererDebugView::Variance; }

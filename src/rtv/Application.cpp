@@ -93,6 +93,7 @@ RendererSettings interactiveSettingsForScene(RendererSettings settings, const Sc
     settings.maxBounces = cappedBounces;
     settings.renderResolutionScale = cappedScale;
     settings.denoiserEnabled = true;
+    settings.renderPreset = RenderPreset::Custom;
     if (changed) {
         std::cout << "Large glTF scene detected (" << triangleCount
                   << " triangles); using interactive defaults: bounces="
@@ -106,6 +107,7 @@ glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity)
 
 void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings& settings) {
     RenderSettings& render = document.renderSettings();
+    render.renderPreset = settings.renderPreset;
     render.pathTracingEnabled = settings.pathTracingEnabled;
     render.cameraJitterEnabled = settings.cameraJitterEnabled;
     render.directLightingEnabled = settings.directLightingEnabled;
@@ -131,12 +133,19 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.skyIntensity = settings.skyIntensity;
     render.indirectStrength = settings.indirectStrength;
     render.restirMode = settings.restirMode;
+    render.restirGiEnabled = settings.restirGiEnabled;
     render.denoiserEnabled = settings.denoiserEnabled;
     render.denoiseWhileMoving = settings.denoiseWhileMoving;
+    render.samplesPerPixel = settings.samplesPerPixel;
+    render.limitSamplesPerPixel = settings.limitSamplesPerPixel;
     render.atrousIterations = settings.atrousIterations;
     render.denoiserStrength = settings.denoiserStrength;
+    render.denoiserMaxHistoryLength = settings.denoiserMaxHistoryLength;
+    render.momentValidityThreshold = settings.momentValidityThreshold;
     render.taaEnabled = settings.taaEnabled;
     render.taaFeedback = settings.taaFeedback;
+    render.taaMotionFeedback = settings.taaMotionFeedback;
+    render.taaReactiveFeedback = settings.taaReactiveFeedback;
     render.taaSharpeningStrength = settings.taaSharpeningStrength;
     render.debugView = settings.debugView;
     render.resolutionScale = settings.renderResolutionScale;
@@ -170,6 +179,7 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
 RendererSettings rendererSettingsFromDocument(const SceneDocument& document, RendererSettings settings) {
     const RenderSettings& render = document.renderSettings();
     const Environment& environment = document.environment();
+    settings.renderPreset = render.renderPreset;
     settings.pathTracingEnabled = render.pathTracingEnabled;
     settings.cameraJitterEnabled = render.cameraJitterEnabled;
     settings.directLightingEnabled = render.directLightingEnabled;
@@ -195,12 +205,19 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.skyIntensity = render.skyIntensity;
     settings.indirectStrength = render.indirectStrength;
     settings.restirMode = render.restirMode;
+    settings.restirGiEnabled = render.restirGiEnabled;
     settings.denoiserEnabled = render.denoiserEnabled;
     settings.denoiseWhileMoving = render.denoiseWhileMoving;
+    settings.samplesPerPixel = render.samplesPerPixel;
+    settings.limitSamplesPerPixel = render.limitSamplesPerPixel;
     settings.atrousIterations = render.atrousIterations;
     settings.denoiserStrength = render.denoiserStrength;
+    settings.denoiserMaxHistoryLength = render.denoiserMaxHistoryLength;
+    settings.momentValidityThreshold = render.momentValidityThreshold;
     settings.taaEnabled = render.taaEnabled;
     settings.taaFeedback = render.taaFeedback;
+    settings.taaMotionFeedback = render.taaMotionFeedback;
+    settings.taaReactiveFeedback = render.taaReactiveFeedback;
     settings.taaSharpeningStrength = render.taaSharpeningStrength;
     settings.debugView = render.debugView;
     settings.renderResolutionScale = render.resolutionScale;
@@ -336,6 +353,8 @@ Application::Application(
     std::optional<std::filesystem::path> scenePath,
     std::optional<bool> denoiserOverride,
     std::optional<RestirMode> restirModeOverride,
+    std::optional<RenderPreset> renderPresetOverride,
+    std::optional<bool> restirGiOverride,
     bool debugViewOverride,
     bool validationCameraMotion,
     bool headless)
@@ -345,6 +364,8 @@ Application::Application(
       scenePath_(std::move(scenePath)),
       denoiserOverride_(denoiserOverride),
       restirModeOverride_(restirModeOverride),
+      renderPresetOverride_(renderPresetOverride),
+      restirGiOverride_(restirGiOverride),
       debugViewOverride_(debugViewOverride),
       validationCameraMotion_(validationCameraMotion),
       headless_(headless) {
@@ -566,9 +587,20 @@ void Application::initVulkan() {
     }
     if (denoiserOverride_.has_value()) {
         startupSettings.denoiserEnabled = *denoiserOverride_;
+        startupSettings.renderPreset = RenderPreset::Custom;
+    }
+    if (renderPresetOverride_.has_value()) {
+        applyRenderPreset(startupSettings, *renderPresetOverride_);
+        syncDocumentRenderSettings(sceneDocument_, startupSettings);
     }
     if (restirModeOverride_.has_value()) {
         startupSettings.restirMode = *restirModeOverride_;
+        startupSettings.renderPreset = RenderPreset::Custom;
+        syncDocumentRenderSettings(sceneDocument_, startupSettings);
+    }
+    if (restirGiOverride_.has_value()) {
+        startupSettings.restirGiEnabled = *restirGiOverride_;
+        startupSettings.renderPreset = RenderPreset::Custom;
         syncDocumentRenderSettings(sceneDocument_, startupSettings);
     }
     createPathTracer(&startupSettings);

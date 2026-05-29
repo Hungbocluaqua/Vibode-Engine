@@ -370,6 +370,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"enabled", environment_.enabled},
     };
     root["renderSettings"] = {
+        {"renderPreset", static_cast<uint32_t>(renderSettings_.renderPreset)},
         {"pathTracingEnabled", renderSettings_.pathTracingEnabled},
         {"cameraJitterEnabled", renderSettings_.cameraJitterEnabled},
         {"directLightingEnabled", renderSettings_.directLightingEnabled},
@@ -395,12 +396,19 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"skyIntensity", renderSettings_.skyIntensity},
         {"indirectStrength", renderSettings_.indirectStrength},
         {"restirMode", static_cast<uint32_t>(renderSettings_.restirMode)},
+        {"restirGiEnabled", renderSettings_.restirGiEnabled},
         {"denoiserEnabled", renderSettings_.denoiserEnabled},
         {"denoiseWhileMoving", renderSettings_.denoiseWhileMoving},
+        {"samplesPerPixel", renderSettings_.samplesPerPixel},
+        {"limitSamplesPerPixel", renderSettings_.limitSamplesPerPixel},
         {"atrousIterations", renderSettings_.atrousIterations},
         {"denoiserStrength", renderSettings_.denoiserStrength},
+        {"denoiserMaxHistoryLength", renderSettings_.denoiserMaxHistoryLength},
+        {"momentValidityThreshold", renderSettings_.momentValidityThreshold},
         {"taaEnabled", renderSettings_.taaEnabled},
         {"taaFeedback", renderSettings_.taaFeedback},
+        {"taaMotionFeedback", renderSettings_.taaMotionFeedback},
+        {"taaReactiveFeedback", renderSettings_.taaReactiveFeedback},
         {"taaSharpeningStrength", renderSettings_.taaSharpeningStrength},
         {"debugView", static_cast<uint32_t>(renderSettings_.debugView)},
         {"accumulate", renderSettings_.accumulate},
@@ -536,6 +544,9 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     }
     if (root.contains("renderSettings")) {
         const nlohmann::json& render = root["renderSettings"];
+        renderSettings_.renderPreset = render.contains("renderPreset")
+            ? static_cast<RenderPreset>(render.value("renderPreset", static_cast<uint32_t>(renderSettings_.renderPreset)))
+            : RenderPreset::Custom;
         renderSettings_.pathTracingEnabled = render.value("pathTracingEnabled", renderSettings_.pathTracingEnabled);
         renderSettings_.cameraJitterEnabled = render.value("cameraJitterEnabled", renderSettings_.cameraJitterEnabled);
         renderSettings_.directLightingEnabled = render.value("directLightingEnabled", renderSettings_.directLightingEnabled);
@@ -566,12 +577,19 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.sunAngularRadius = render.value("sunAngularRadius", renderSettings_.sunAngularRadius);
         renderSettings_.indirectStrength = render.value("indirectStrength", renderSettings_.indirectStrength);
         renderSettings_.restirMode = static_cast<RestirMode>(render.value("restirMode", static_cast<uint32_t>(renderSettings_.restirMode)));
+        renderSettings_.restirGiEnabled = render.value("restirGiEnabled", renderSettings_.restirGiEnabled);
         renderSettings_.denoiserEnabled = render.value("denoiserEnabled", renderSettings_.denoiserEnabled);
         renderSettings_.denoiseWhileMoving = render.value("denoiseWhileMoving", renderSettings_.denoiseWhileMoving);
+        renderSettings_.samplesPerPixel = render.value("samplesPerPixel", renderSettings_.samplesPerPixel);
+        renderSettings_.limitSamplesPerPixel = render.value("limitSamplesPerPixel", renderSettings_.limitSamplesPerPixel);
         renderSettings_.atrousIterations = render.value("atrousIterations", renderSettings_.atrousIterations);
         renderSettings_.denoiserStrength = render.value("denoiserStrength", renderSettings_.denoiserStrength);
+        renderSettings_.denoiserMaxHistoryLength = render.value("denoiserMaxHistoryLength", renderSettings_.denoiserMaxHistoryLength);
+        renderSettings_.momentValidityThreshold = render.value("momentValidityThreshold", renderSettings_.momentValidityThreshold);
         renderSettings_.taaEnabled = render.value("taaEnabled", renderSettings_.taaEnabled);
         renderSettings_.taaFeedback = render.value("taaFeedback", renderSettings_.taaFeedback);
+        renderSettings_.taaMotionFeedback = render.value("taaMotionFeedback", renderSettings_.taaMotionFeedback);
+        renderSettings_.taaReactiveFeedback = render.value("taaReactiveFeedback", renderSettings_.taaReactiveFeedback);
         renderSettings_.taaSharpeningStrength = render.value("taaSharpeningStrength", renderSettings_.taaSharpeningStrength);
         renderSettings_.debugView = static_cast<RendererDebugView>(render.value("debugView", static_cast<uint32_t>(renderSettings_.debugView)));
         renderSettings_.accumulate = render.value("accumulate", renderSettings_.accumulate);

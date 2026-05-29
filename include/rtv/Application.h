@@ -47,6 +47,8 @@ public:
         std::optional<std::filesystem::path> scenePath = std::nullopt,
         std::optional<bool> denoiserOverride = std::nullopt,
         std::optional<RestirMode> restirModeOverride = std::nullopt,
+        std::optional<RenderPreset> renderPresetOverride = std::nullopt,
+        std::optional<bool> restirGiOverride = std::nullopt,
         bool debugViewOverride = false,
         bool validationCameraMotion = false,
         bool headless = false);
@@ -148,6 +150,8 @@ private:
     std::optional<std::filesystem::path> scenePath_;
     std::optional<bool> denoiserOverride_;
     std::optional<RestirMode> restirModeOverride_;
+    std::optional<RenderPreset> renderPresetOverride_;
+    std::optional<bool> restirGiOverride_;
     bool debugViewOverride_ = false;
     bool validationCameraMotion_ = false;
     bool pendingOpenLevel_ = false;

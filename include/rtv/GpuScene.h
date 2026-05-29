@@ -49,6 +49,7 @@ struct alignas(16) CameraUniform {
     glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
     glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
     glm::uvec4 restirGiControls{24u, 0u, 0u, 1u}; // x = temporal max age, y = half-resolution reuse, z = visibility ray budget, w = specular AA enabled
+    glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, zw = reserved
 };
 
 static_assert(offsetof(CameraUniform, jitter) == 128, "CameraUniform::jitter must match std140 layout");
@@ -57,7 +58,8 @@ static_assert(offsetof(CameraUniform, renderControls) == 160, "CameraUniform::re
 static_assert(offsetof(CameraUniform, sunDirectionIlluminance) == 176, "CameraUniform::sunDirectionIlluminance must match std140 layout");
 static_assert(offsetof(CameraUniform, sunColorAngularRadius) == 192, "CameraUniform::sunColorAngularRadius must match std140 layout");
 static_assert(offsetof(CameraUniform, restirGiControls) == 208, "CameraUniform::restirGiControls must match std140 layout");
-static_assert(sizeof(CameraUniform) == 224, "CameraUniform size must match std140 layout");
+static_assert(offsetof(CameraUniform, pathTraceControls) == 224, "CameraUniform::pathTraceControls must match std140 layout");
+static_assert(sizeof(CameraUniform) == 240, "CameraUniform size must match std140 layout");
 
 struct MeshParamsUniform {
     uint32_t vertexCount = 0;

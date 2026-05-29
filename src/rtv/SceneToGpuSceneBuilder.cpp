@@ -19,6 +19,7 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
 
     const RenderSettings& render = document.renderSettings();
     const Environment& environment = document.environment();
+    result.rendererSettings.renderPreset = render.renderPreset;
     result.rendererSettings.pathTracingEnabled = render.pathTracingEnabled;
     result.rendererSettings.cameraJitterEnabled = render.cameraJitterEnabled;
     result.rendererSettings.directLightingEnabled = render.directLightingEnabled;
@@ -44,12 +45,19 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.skyIntensity = render.skyIntensity;
     result.rendererSettings.indirectStrength = render.indirectStrength;
     result.rendererSettings.restirMode = render.restirMode;
+    result.rendererSettings.restirGiEnabled = render.restirGiEnabled;
     result.rendererSettings.denoiserEnabled = render.denoiserEnabled;
     result.rendererSettings.denoiseWhileMoving = render.denoiseWhileMoving;
+    result.rendererSettings.samplesPerPixel = render.samplesPerPixel;
+    result.rendererSettings.limitSamplesPerPixel = render.limitSamplesPerPixel;
     result.rendererSettings.atrousIterations = render.atrousIterations;
     result.rendererSettings.denoiserStrength = render.denoiserStrength;
+    result.rendererSettings.denoiserMaxHistoryLength = render.denoiserMaxHistoryLength;
+    result.rendererSettings.momentValidityThreshold = render.momentValidityThreshold;
     result.rendererSettings.taaEnabled = render.taaEnabled;
     result.rendererSettings.taaFeedback = render.taaFeedback;
+    result.rendererSettings.taaMotionFeedback = render.taaMotionFeedback;
+    result.rendererSettings.taaReactiveFeedback = render.taaReactiveFeedback;
     result.rendererSettings.taaSharpeningStrength = render.taaSharpeningStrength;
     result.rendererSettings.debugView = render.debugView;
     result.rendererSettings.shadowRayBias = render.shadowRayBias;

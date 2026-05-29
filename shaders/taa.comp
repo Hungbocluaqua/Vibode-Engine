@@ -33,6 +33,8 @@ layout(set = 0, binding = 5, std140) uniform TaaParams {
     uint camera_moving;
     uint render_width;
     uint render_height;
+    float motion_feedback;
+    float reactive_feedback;
 } params;
 
 float luminance(vec3 color) {
@@ -174,13 +176,15 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
         float motion = 1.0 - motionConfidence;
         float reactive = temporal_reactive_weight(lumDelta, clipDelta, neighborhoodDelta);
         float specularReactive = smoothstep(0.35, 0.85, specularSignal) * max(motion, reactive);
-        sharpenAmount = params.sharpen_strength * (1.0 - clamp(max(motion, reactive), 0.0, 1.0) * 0.65);
+        sharpenAmount = params.camera_moving != 0u
+            ? 0.0
+            : params.sharpen_strength * (1.0 - clamp(max(motion, reactive), 0.0, 1.0) * 0.65);
 
         if (reactive >= 0.82 || lumDelta >= 0.85 || clipDelta >= 0.75 || specularReactive >= 0.72) {
-            float rejectAlpha = params.camera_moving != 0u ? 0.95 : 0.98;
+            float rejectAlpha = params.camera_moving != 0u ? params.reactive_feedback : 0.98;
             output_value = mix(history, current, rejectAlpha);
         } else {
-            float motionTarget = params.camera_moving != 0u ? 0.85 : 0.95;
+            float motionTarget = params.camera_moving != 0u ? params.motion_feedback : 0.95;
             float alpha = mix(params.feedback, motionTarget, max(motion, reactive));
             alpha = max(alpha, mix(0.0, 0.22, specularReactive));
             output_value = mix(history, current, clamp(alpha, 0.06, 0.98));
@@ -199,7 +203,7 @@ void main() {
 
     float sharpenAmount = 0.0;
     vec3 output_value = resolve_taa_pixel(coords, displayDims, renderDims, sharpenAmount);
-    if (params.enabled != 0u && params.reset_history == 0u) {
+    if (params.enabled != 0u && params.reset_history == 0u && sharpenAmount > 0.0) {
         float ignored = 0.0;
         vec3 up = resolve_taa_pixel(clamp(coords + ivec2(0, 1), ivec2(0), displayDims - ivec2(1)), displayDims, renderDims, ignored);
         vec3 down = resolve_taa_pixel(clamp(coords + ivec2(0, -1), ivec2(0), displayDims - ivec2(1)), displayDims, renderDims, ignored);

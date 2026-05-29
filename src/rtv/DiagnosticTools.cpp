@@ -72,6 +72,83 @@ uint64_t uintAt(const json& j, std::initializer_list<const char*> path) {
         : static_cast<uint64_t>(current->is_number() ? current->get<double>() : 0.0);
 }
 
+uint64_t memoryTotalBytes(const ProfileReport::MemoryReport& memory) {
+    return memory.texturesBytes +
+        memory.buffersBytes +
+        memory.accelerationStructureBytes +
+        memory.temporalHistoryBytes +
+        memory.restirReservoirBytes;
+}
+
+uint64_t memoryTotalBytes(const json& memory) {
+    return uintAt(memory, {"textures_bytes"}) +
+        uintAt(memory, {"buffers_bytes"}) +
+        uintAt(memory, {"acceleration_structure_bytes"}) +
+        uintAt(memory, {"temporal_history_bytes"}) +
+        uintAt(memory, {"restir_reservoir_bytes"});
+}
+
+std::map<std::string, uint64_t> profileMemoryBytes(const ProfileReport& profile) {
+    const auto& memory = profile.memory;
+    return {
+        {"textures_bytes", memory.texturesBytes},
+        {"buffers_bytes", memory.buffersBytes},
+        {"acceleration_structure_bytes", memory.accelerationStructureBytes},
+        {"temporal_history_bytes", memory.temporalHistoryBytes},
+        {"restir_reservoir_bytes", memory.restirReservoirBytes},
+        {"restir_di_current_bytes", memory.restirDiCurrentBytes},
+        {"restir_di_previous_bytes", memory.restirDiPreviousBytes},
+        {"restir_di_spatial_bytes", memory.restirDiSpatialBytes},
+        {"restir_gi_current_bytes", memory.restirGiCurrentBytes},
+        {"restir_gi_previous_bytes", memory.restirGiPreviousBytes},
+        {"restir_gi_spatial_bytes", memory.restirGiSpatialBytes},
+        {"total_bytes", memoryTotalBytes(memory)},
+    };
+}
+
+std::map<std::string, double> passGpuMsMap(const ProfileReport::PerPassGpuMs& passes) {
+    return {
+        {"path_trace", passes.pathTrace},
+        {"restir_history_clear", passes.restirHistoryClear},
+        {"restir_gi_clear", passes.restirGiClear},
+        {"restir_spatial", passes.restirSpatial},
+        {"restir_spatial_copy", passes.restirSpatialCopy},
+        {"restir_gi_spatial", passes.restirGiSpatial},
+        {"restir_gi_final", passes.restirGiFinal},
+        {"fog_integrate", passes.fogIntegrate},
+        {"atmosphere", passes.atmosphere},
+        {"atmosphere_transmittance", passes.atmosphereTransmittance},
+        {"atmosphere_multi_scatter", passes.atmosphereMultiScatter},
+        {"atmosphere_sky_view", passes.atmosphereSkyView},
+        {"atmosphere_sky_reproject", passes.atmosphereSkyReproject},
+        {"atmosphere_sky_cdf", passes.atmosphereSkyCdf},
+        {"atmosphere_aerial_perspective", passes.atmosphereAerialPerspective},
+        {"denoiser", passes.denoiser},
+        {"moment_update", passes.momentUpdate},
+        {"history_copy", passes.historyCopy},
+        {"skip_denoiser_copy", passes.skipDenoiserCopy},
+        {"taa", passes.taa},
+        {"taa_history_copy", passes.taaHistoryCopy},
+        {"auto_exposure_histogram_clear", passes.autoExposureHistogramClear},
+        {"auto_exposure_histogram", passes.autoExposureHistogram},
+        {"auto_exposure_reduce", passes.autoExposureReduce},
+        {"tone_map", passes.toneMap},
+        {"selection_outline", passes.selectionOutline},
+        {"fullscreen", passes.fullscreen},
+        {"editor_presentation", passes.editorPresentation},
+    };
+}
+
+uint64_t bytesFromBudgetValue(const json& value) {
+    if (value.is_number_unsigned() || value.is_number_integer()) {
+        return value.get<uint64_t>();
+    }
+    if (value.is_number()) {
+        return static_cast<uint64_t>(value.get<double>());
+    }
+    return 0;
+}
+
 double regressionPercent(double oldValue, double newValue) {
     if (std::abs(oldValue) <= 1.0e-9) {
         return std::abs(newValue) <= 1.0e-9 ? 0.0 : 100.0;
@@ -89,22 +166,10 @@ json metricDelta(double oldValue, double newValue, const char* unit) {
     };
 }
 
-json compareProfilesJson(const json& oldProfile, const json& newProfile) {
-    json result;
-    result["cpu_frame_ms"] = {
-        {"avg", metricDelta(numberAt(oldProfile, {"cpu_frame_ms", "avg"}), numberAt(newProfile, {"cpu_frame_ms", "avg"}), "ms")},
-        {"min", metricDelta(numberAt(oldProfile, {"cpu_frame_ms", "min"}), numberAt(newProfile, {"cpu_frame_ms", "min"}), "ms")},
-        {"max", metricDelta(numberAt(oldProfile, {"cpu_frame_ms", "max"}), numberAt(newProfile, {"cpu_frame_ms", "max"}), "ms")},
-    };
-    result["gpu_frame_ms"] = {
-        {"avg", metricDelta(numberAt(oldProfile, {"gpu_frame_ms", "avg"}), numberAt(newProfile, {"gpu_frame_ms", "avg"}), "ms")},
-        {"min", metricDelta(numberAt(oldProfile, {"gpu_frame_ms", "min"}), numberAt(newProfile, {"gpu_frame_ms", "min"}), "ms")},
-        {"max", metricDelta(numberAt(oldProfile, {"gpu_frame_ms", "max"}), numberAt(newProfile, {"gpu_frame_ms", "max"}), "ms")},
-    };
-
+json comparePassTimingGroup(const json& oldProfile, const json& newProfile, const char* key) {
     json passJson = json::object();
-    const json oldPasses = oldProfile.value("per_pass_gpu_ms", json::object());
-    const json newPasses = newProfile.value("per_pass_gpu_ms", json::object());
+    const json oldPasses = oldProfile.value(key, json::object());
+    const json newPasses = newProfile.value(key, json::object());
     std::vector<std::string> passNames;
     for (auto it = oldPasses.begin(); it != oldPasses.end(); ++it) {
         passNames.push_back(it.key());
@@ -118,7 +183,33 @@ json compareProfilesJson(const json& oldProfile, const json& newProfile) {
     for (const std::string& name : passNames) {
         passJson[name] = metricDelta(oldPasses.value(name, 0.0), newPasses.value(name, 0.0), "ms");
     }
-    result["per_pass_gpu_ms"] = passJson;
+    return passJson;
+}
+
+json compareProfilesJson(const json& oldProfile, const json& newProfile) {
+    json result;
+    result["cpu_frame_ms"] = {
+        {"avg", metricDelta(numberAt(oldProfile, {"cpu_frame_ms", "avg"}), numberAt(newProfile, {"cpu_frame_ms", "avg"}), "ms")},
+        {"min", metricDelta(numberAt(oldProfile, {"cpu_frame_ms", "min"}), numberAt(newProfile, {"cpu_frame_ms", "min"}), "ms")},
+        {"max", metricDelta(numberAt(oldProfile, {"cpu_frame_ms", "max"}), numberAt(newProfile, {"cpu_frame_ms", "max"}), "ms")},
+        {"p95", metricDelta(numberAt(oldProfile, {"cpu_frame_ms", "p95"}), numberAt(newProfile, {"cpu_frame_ms", "p95"}), "ms")},
+        {"p99", metricDelta(numberAt(oldProfile, {"cpu_frame_ms", "p99"}), numberAt(newProfile, {"cpu_frame_ms", "p99"}), "ms")},
+    };
+    result["gpu_frame_ms"] = {
+        {"avg", metricDelta(numberAt(oldProfile, {"gpu_frame_ms", "avg"}), numberAt(newProfile, {"gpu_frame_ms", "avg"}), "ms")},
+        {"min", metricDelta(numberAt(oldProfile, {"gpu_frame_ms", "min"}), numberAt(newProfile, {"gpu_frame_ms", "min"}), "ms")},
+        {"max", metricDelta(numberAt(oldProfile, {"gpu_frame_ms", "max"}), numberAt(newProfile, {"gpu_frame_ms", "max"}), "ms")},
+        {"p95", metricDelta(numberAt(oldProfile, {"gpu_frame_ms", "p95"}), numberAt(newProfile, {"gpu_frame_ms", "p95"}), "ms")},
+        {"p99", metricDelta(numberAt(oldProfile, {"gpu_frame_ms", "p99"}), numberAt(newProfile, {"gpu_frame_ms", "p99"}), "ms")},
+    };
+
+    result["per_pass_gpu_ms"] = comparePassTimingGroup(oldProfile, newProfile, "per_pass_gpu_ms");
+    if (oldProfile.contains("per_pass_gpu_ms_p95") || newProfile.contains("per_pass_gpu_ms_p95")) {
+        result["per_pass_gpu_ms_p95"] = comparePassTimingGroup(oldProfile, newProfile, "per_pass_gpu_ms_p95");
+    }
+    if (oldProfile.contains("per_pass_gpu_ms_p99") || newProfile.contains("per_pass_gpu_ms_p99")) {
+        result["per_pass_gpu_ms_p99"] = comparePassTimingGroup(oldProfile, newProfile, "per_pass_gpu_ms_p99");
+    }
 
     json memoryJson = json::object();
     const json oldMemory = oldProfile.value("memory", json::object());
@@ -133,15 +224,13 @@ json compareProfilesJson(const json& oldProfile, const json& newProfile) {
         }
     }
     std::sort(memoryNames.begin(), memoryNames.end());
-    uint64_t oldTotal = 0;
-    uint64_t newTotal = 0;
     for (const std::string& name : memoryNames) {
         const uint64_t oldValue = oldMemory.value(name, 0ull);
         const uint64_t newValue = newMemory.value(name, 0ull);
-        oldTotal += oldValue;
-        newTotal += newValue;
         memoryJson[name] = metricDelta(static_cast<double>(oldValue), static_cast<double>(newValue), "bytes");
     }
+    const uint64_t oldTotal = memoryTotalBytes(oldMemory);
+    const uint64_t newTotal = memoryTotalBytes(newMemory);
     memoryJson["total_bytes"] = metricDelta(static_cast<double>(oldTotal), static_cast<double>(newTotal), "bytes");
     result["memory"] = memoryJson;
     result["summary"] = {
@@ -379,6 +468,21 @@ SequenceTemporalMetrics summarizeTemporalPairs(
             (metrics.averageFrameDeltaChangedPixelPercentage / 100.0);
     }
     return metrics;
+}
+
+std::vector<double> temporalPairMseValues(
+    const std::filesystem::path& viewDir,
+    const std::vector<std::string>& frameNames) {
+    std::vector<double> values;
+    if (frameNames.size() < 2u) {
+        return values;
+    }
+    values.reserve(frameNames.size() - 1u);
+    for (size_t i = 1; i < frameNames.size(); ++i) {
+        const ImageDiffMetrics pair = compareImages(viewDir / frameNames[i - 1u], viewDir / frameNames[i], std::nullopt);
+        values.push_back(pair.mse);
+    }
+    return values;
 }
 
 double pearsonCorrelation(const std::vector<double>& a, const std::vector<double>& b) {
@@ -688,6 +792,8 @@ SequenceComparisonReport compareImageSequences(
         out["warnings"] = report.warnings;
         out["views"] = json::array();
         std::map<std::string, std::vector<double>> mseByView;
+        std::map<std::string, std::vector<double>> temporalMseByView;
+        std::map<std::string, SequenceTemporalMetrics> currentTemporalByView;
 
         for (const auto& internal : internalViews) {
             json viewJson;
@@ -695,6 +801,7 @@ SequenceComparisonReport compareImageSequences(
             viewJson["baseline_vs_current"] = sequenceMetricSummaryJson(internal.summary.baselineVsCurrent);
             viewJson["baseline_temporal"] = sequenceTemporalMetricsJson(internal.summary.baselineTemporal);
             viewJson["current_temporal"] = sequenceTemporalMetricsJson(internal.summary.currentTemporal);
+            currentTemporalByView[internal.summary.view] = internal.summary.currentTemporal;
             viewJson["frames"] = json::array();
             for (const auto& sample : internal.perFrame) {
                 viewJson["frames"].push_back({
@@ -704,6 +811,8 @@ SequenceComparisonReport compareImageSequences(
                 });
                 mseByView[internal.summary.view].push_back(sample.metrics.mse);
             }
+            const auto currentViewDir = currentDir / internal.summary.view;
+            temporalMseByView[internal.summary.view] = temporalPairMseValues(currentViewDir, pngNamesInDir(currentViewDir));
             out["views"].push_back(viewJson);
 
             const auto diffDir = *outputDir / "diffs" / internal.summary.view;
@@ -736,6 +845,56 @@ SequenceComparisonReport compareImageSequences(
             }
         }
         out["motion_debug_correlations"] = correlations;
+
+        json temporalCorrelations = json::object();
+        double strongestTemporalCorrelation = 0.0;
+        double strongestDenoiserTemporalCorrelation = 0.0;
+        if (temporalMseByView.contains("beauty")) {
+            for (const char* diagnosticView : {
+                     "motion-vectors",
+                     "reprojection-confidence",
+                     "temporal-history-weight",
+                     "variance",
+                     "restir-gi-validity",
+                     "restir-gi-final"}) {
+                if (temporalMseByView.contains(diagnosticView)) {
+                    const double correlation = pearsonCorrelation(temporalMseByView["beauty"], temporalMseByView[diagnosticView]);
+                    temporalCorrelations[diagnosticView] = correlation;
+                    const double absCorrelation = std::abs(correlation);
+                    strongestTemporalCorrelation = std::max(strongestTemporalCorrelation, absCorrelation);
+                    const std::string diagnosticName = diagnosticView;
+                    if (diagnosticName == "reprojection-confidence" ||
+                        diagnosticName == "temporal-history-weight" ||
+                        diagnosticName == "variance") {
+                        strongestDenoiserTemporalCorrelation = std::max(strongestDenoiserTemporalCorrelation, absCorrelation);
+                    }
+                }
+            }
+        }
+        out["temporal_debug_correlations"] = temporalCorrelations;
+
+        json stabilitySummary = json::object();
+        if (currentTemporalByView.contains("beauty")) {
+            const auto& beauty = currentTemporalByView["beauty"];
+            stabilitySummary["beauty_average_frame_delta_mse"] = beauty.averageFrameDeltaMse;
+            stabilitySummary["beauty_max_frame_delta_mse"] = beauty.maxFrameDeltaMse;
+            stabilitySummary["beauty_temporal_variance_score"] = beauty.temporalVarianceScore;
+            stabilitySummary["beauty_worst_pair_start_frame"] = beauty.worstPairStartFrame;
+            stabilitySummary["strongest_temporal_diagnostic_correlation"] = strongestTemporalCorrelation;
+            stabilitySummary["uncorrelated_temporal_noise_score"] = beauty.temporalVarianceScore * (1.0 - std::clamp(strongestTemporalCorrelation, 0.0, 1.0));
+            stabilitySummary["strongest_denoiser_temporal_diagnostic_correlation"] = strongestDenoiserTemporalCorrelation;
+            stabilitySummary["denoiser_residual_noise_score"] = beauty.temporalVarianceScore * (1.0 - std::clamp(strongestDenoiserTemporalCorrelation, 0.0, 1.0));
+        }
+        if (currentTemporalByView.contains("variance")) {
+            stabilitySummary["variance_temporal_variance_score"] = currentTemporalByView["variance"].temporalVarianceScore;
+        }
+        if (currentTemporalByView.contains("temporal-history-weight")) {
+            stabilitySummary["history_weight_temporal_variance_score"] = currentTemporalByView["temporal-history-weight"].temporalVarianceScore;
+        }
+        if (currentTemporalByView.contains("reprojection-confidence")) {
+            stabilitySummary["reprojection_temporal_variance_score"] = currentTemporalByView["reprojection-confidence"].temporalVarianceScore;
+        }
+        out["stability_summary"] = stabilitySummary;
         writeJsonFile(*outputDir / "motion_stability_report.json", out);
     }
 
@@ -1085,50 +1244,102 @@ int validateGpuLabels(const std::optional<std::filesystem::path>& renderGraphPat
 
 int checkBudget(const std::filesystem::path& budgetPath, const ProfileReport& profile) {
     const json budget = readJsonFile(budgetPath);
-    const json passBudgets = budget.value("per_pass_gpu_ms", json::object());
-    std::map<std::string, double> actual = {
-        {"path_trace", profile.perPassGpuMs.pathTrace},
-        {"restir_history_clear", profile.perPassGpuMs.restirHistoryClear},
-        {"restir_gi_clear", profile.perPassGpuMs.restirGiClear},
-        {"restir_spatial", profile.perPassGpuMs.restirSpatial},
-        {"restir_spatial_copy", profile.perPassGpuMs.restirSpatialCopy},
-        {"restir_gi_spatial", profile.perPassGpuMs.restirGiSpatial},
-        {"restir_gi_final", profile.perPassGpuMs.restirGiFinal},
-        {"fog_integrate", profile.perPassGpuMs.fogIntegrate},
-        {"atmosphere", profile.perPassGpuMs.atmosphere},
-        {"atmosphere_transmittance", profile.perPassGpuMs.atmosphereTransmittance},
-        {"atmosphere_multi_scatter", profile.perPassGpuMs.atmosphereMultiScatter},
-        {"atmosphere_sky_view", profile.perPassGpuMs.atmosphereSkyView},
-        {"atmosphere_sky_reproject", profile.perPassGpuMs.atmosphereSkyReproject},
-        {"atmosphere_sky_cdf", profile.perPassGpuMs.atmosphereSkyCdf},
-        {"atmosphere_aerial_perspective", profile.perPassGpuMs.atmosphereAerialPerspective},
-        {"denoiser", profile.perPassGpuMs.denoiser},
-        {"history_copy", profile.perPassGpuMs.historyCopy},
-        {"skip_denoiser_copy", profile.perPassGpuMs.skipDenoiserCopy},
-        {"taa", profile.perPassGpuMs.taa},
-        {"taa_history_copy", profile.perPassGpuMs.taaHistoryCopy},
-        {"auto_exposure_histogram_clear", profile.perPassGpuMs.autoExposureHistogramClear},
-        {"auto_exposure_histogram", profile.perPassGpuMs.autoExposureHistogram},
-        {"auto_exposure_reduce", profile.perPassGpuMs.autoExposureReduce},
-        {"tone_map", profile.perPassGpuMs.toneMap},
-        {"selection_outline", profile.perPassGpuMs.selectionOutline},
-        {"fullscreen", profile.perPassGpuMs.fullscreen},
-        {"editor_presentation", profile.perPassGpuMs.editorPresentation},
+    json failures = json::array();
+
+    auto checkPassBudgets = [&failures](
+                                const json& passBudgets,
+                                const std::map<std::string, double>& actual,
+                                const std::string& group) {
+        for (auto it = passBudgets.begin(); it != passBudgets.end(); ++it) {
+            const std::string pass = it.key();
+            const double maxMs = it.value().get<double>();
+            const double actualMs = actual.contains(pass) ? actual.at(pass) : 0.0;
+            if (actualMs > maxMs) {
+                failures.push_back({
+                    {"metric", group + "." + pass},
+                    {"pass", pass},
+                    {"actual_ms", actualMs},
+                    {"budget_ms", maxMs},
+                });
+            }
+        }
     };
 
-    json failures = json::array();
-    for (auto it = passBudgets.begin(); it != passBudgets.end(); ++it) {
-        const std::string pass = it.key();
-        const double maxMs = it.value().get<double>();
-        const double actualMs = actual.contains(pass) ? actual[pass] : 0.0;
-        if (actualMs > maxMs) {
-            failures.push_back({{"pass", pass}, {"actual_ms", actualMs}, {"budget_ms", maxMs}});
-        }
-    }
+    checkPassBudgets(
+        budget.value("per_pass_gpu_ms", json::object()),
+        passGpuMsMap(profile.perPassGpuMs),
+        "per_pass_gpu_ms");
+    checkPassBudgets(
+        budget.value("per_pass_gpu_ms_p95", json::object()),
+        passGpuMsMap(profile.perPassGpuMsP95),
+        "per_pass_gpu_ms_p95");
+    checkPassBudgets(
+        budget.value("per_pass_gpu_ms_p99", json::object()),
+        passGpuMsMap(profile.perPassGpuMsP99),
+        "per_pass_gpu_ms_p99");
     if (budget.contains("gpu_frame_ms")) {
         const double maxFrame = budget["gpu_frame_ms"].get<double>();
         if (profile.gpuFrameMs.avg > maxFrame) {
-            failures.push_back({{"pass", "gpu_frame"}, {"actual_ms", profile.gpuFrameMs.avg}, {"budget_ms", maxFrame}});
+            failures.push_back({{"metric", "gpu_frame_ms.avg"}, {"actual_ms", profile.gpuFrameMs.avg}, {"budget_ms", maxFrame}});
+        }
+    }
+    if (budget.contains("gpu_frame_ms_avg")) {
+        const double maxFrame = budget["gpu_frame_ms_avg"].get<double>();
+        if (profile.gpuFrameMs.avg > maxFrame) {
+            failures.push_back({{"metric", "gpu_frame_ms.avg"}, {"actual_ms", profile.gpuFrameMs.avg}, {"budget_ms", maxFrame}});
+        }
+    }
+    if (budget.contains("gpu_frame_ms_max")) {
+        const double maxFrame = budget["gpu_frame_ms_max"].get<double>();
+        if (profile.gpuFrameMs.max > maxFrame) {
+            failures.push_back({{"metric", "gpu_frame_ms.max"}, {"actual_ms", profile.gpuFrameMs.max}, {"budget_ms", maxFrame}});
+        }
+    }
+    if (budget.contains("gpu_frame_ms_p95")) {
+        const double maxFrame = budget["gpu_frame_ms_p95"].get<double>();
+        if (profile.gpuFrameMs.p95 > maxFrame) {
+            failures.push_back({{"metric", "gpu_frame_ms.p95"}, {"actual_ms", profile.gpuFrameMs.p95}, {"budget_ms", maxFrame}});
+        }
+    }
+    if (budget.contains("gpu_frame_ms_p99")) {
+        const double maxFrame = budget["gpu_frame_ms_p99"].get<double>();
+        if (profile.gpuFrameMs.p99 > maxFrame) {
+            failures.push_back({{"metric", "gpu_frame_ms.p99"}, {"actual_ms", profile.gpuFrameMs.p99}, {"budget_ms", maxFrame}});
+        }
+    }
+    if (budget.contains("validation_error_count")) {
+        const uint64_t maxValidationErrors = bytesFromBudgetValue(budget["validation_error_count"]);
+        if (profile.validationErrorCount > maxValidationErrors) {
+            failures.push_back({
+                {"metric", "validation_error_count"},
+                {"actual", profile.validationErrorCount},
+                {"budget", maxValidationErrors},
+            });
+        }
+    }
+
+    const std::map<std::string, uint64_t> memoryBytes = profileMemoryBytes(profile);
+    if (budget.contains("memory_total_bytes")) {
+        const uint64_t maxBytes = bytesFromBudgetValue(budget["memory_total_bytes"]);
+        const uint64_t actualBytes = memoryBytes.at("total_bytes");
+        if (actualBytes > maxBytes) {
+            failures.push_back({{"metric", "memory.total_bytes"}, {"actual_bytes", actualBytes}, {"budget_bytes", maxBytes}});
+        }
+    }
+    if (budget.contains("memory_total_mb")) {
+        const double maxMb = budget["memory_total_mb"].get<double>();
+        const double actualMb = static_cast<double>(memoryBytes.at("total_bytes")) / (1024.0 * 1024.0);
+        if (actualMb > maxMb) {
+            failures.push_back({{"metric", "memory.total_mb"}, {"actual_mb", actualMb}, {"budget_mb", maxMb}});
+        }
+    }
+    const json memoryBudgets = budget.value("memory", json::object());
+    for (auto it = memoryBudgets.begin(); it != memoryBudgets.end(); ++it) {
+        const std::string metric = it.key();
+        const uint64_t maxBytes = bytesFromBudgetValue(it.value());
+        const uint64_t actualBytes = memoryBytes.contains(metric) ? memoryBytes.at(metric) : 0;
+        if (actualBytes > maxBytes) {
+            failures.push_back({{"metric", "memory." + metric}, {"actual_bytes", actualBytes}, {"budget_bytes", maxBytes}});
         }
     }
     json result = {{"status", failures.empty() ? "pass" : "fail"}, {"failures", failures}};

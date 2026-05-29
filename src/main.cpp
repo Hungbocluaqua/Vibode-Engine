@@ -56,6 +56,12 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> scenePath;
         std::optional<bool> denoiserOverride;
         std::optional<rtv::RestirMode> restirModeOverride;
+        std::optional<rtv::RenderPreset> renderPresetOverride;
+        std::optional<bool> restirGiOverride;
+        std::optional<float> taaMotionFeedbackOverride;
+        std::optional<float> taaReactiveFeedbackOverride;
+        std::optional<uint32_t> samplesPerPixelOverride;
+        std::optional<bool> sppLimiterOverride;
         bool validationCameraMotion = false;
 
         rtv::HeadlessDiagnosticsConfig diagConfig;
@@ -142,6 +148,20 @@ int main(int argc, char** argv) {
                 } else {
                     throw std::runtime_error("Unknown ReSTIR mode: " + std::string(value));
                 }
+            } else if (arg == "--render-preset" && i + 1 < argc) {
+                renderPresetOverride = rtv::parseRenderPreset(argv[++i]);
+            } else if (arg == "--restir-gi" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirGiOverride = !(value == "off" || value == "false" || value == "0");
+            } else if (arg == "--taa-motion-feedback" && i + 1 < argc) {
+                taaMotionFeedbackOverride = std::stof(argv[++i]);
+            } else if (arg == "--taa-reactive-feedback" && i + 1 < argc) {
+                taaReactiveFeedbackOverride = std::stof(argv[++i]);
+            } else if ((arg == "--spp" || arg == "--samples-per-pixel") && i + 1 < argc) {
+                samplesPerPixelOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if ((arg == "--spp-limit" || arg == "--limit-spp") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                sppLimiterOverride = !(value == "off" || value == "false" || value == "0");
             } else if (arg == "--validation-camera-motion") {
                 validationCameraMotion = true;
             } else if (arg == "--headless") {
@@ -282,8 +302,9 @@ int main(int argc, char** argv) {
         if (needsProfile) {
             diagConfig.profile = true;
         }
+        const std::filesystem::path diagnosticSourcePath = scenePath.value_or(gltfPath.value_or("scene"));
         const std::filesystem::path artifactBase =
-            rtv::defaultDiagnosticArtifactDir(scenePath.value_or("scene"), "current");
+            rtv::defaultDiagnosticArtifactDir(diagnosticSourcePath, "current");
         if (needsProfile && !diagConfig.profileJsonPath.has_value()) {
             diagConfig.profileJsonPath = artifactBase / "profile.json";
         }
@@ -297,7 +318,7 @@ int main(int argc, char** argv) {
             dumpShaderReportPath = artifactBase / "shader_hot_reload_report.json";
         }
         if (checkBaseline) {
-            const rtv::BaselinePaths paths = rtv::baselinePathsFor(scenePath.value_or("scene"), baselineRoot);
+            const rtv::BaselinePaths paths = rtv::baselinePathsFor(diagnosticSourcePath, baselineRoot);
             if (std::filesystem::exists(paths.frameSequence) && !diagConfig.saveFrameSequenceDir.has_value()) {
                 diagConfig.saveFrameSequenceDir = artifactBase / "frame_sequence";
             }
@@ -306,15 +327,16 @@ int main(int argc, char** argv) {
             diagConfig.fixedSeed = *frameIndex;
         }
 
-        if (diagConfig.headless && !scenePath.has_value()) {
-            throw std::runtime_error("--headless requires --scene <path>");
+        if (diagConfig.headless && !scenePath.has_value() && !gltfPath.has_value()) {
+            throw std::runtime_error("--headless requires --scene <path> or --gltf <path>");
         }
         if (diagConfig.saveFrameSequenceDir.has_value() && !diagConfig.headless) {
             throw std::runtime_error("--save-frame-sequence requires --headless");
         }
 
         rtv::Application app(debugView, gltfPath, hdrPath, scenePath,
-            denoiserOverride, restirModeOverride, debugViewProvided, validationCameraMotion,
+            denoiserOverride, restirModeOverride, renderPresetOverride, restirGiOverride,
+            debugViewProvided, validationCameraMotion,
             diagConfig.headless);
 
         if (auto* renderer = app.pathTracer()) {
@@ -329,6 +351,28 @@ int main(int argc, char** argv) {
                 settings.fixedSeed = diagConfig.fixedSeed;
                 renderer->applySettings(settings);
             }
+            if (taaMotionFeedbackOverride.has_value() || taaReactiveFeedbackOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (taaMotionFeedbackOverride.has_value()) {
+                    settings.taaMotionFeedback = *taaMotionFeedbackOverride;
+                }
+                if (taaReactiveFeedbackOverride.has_value()) {
+                    settings.taaReactiveFeedback = *taaReactiveFeedbackOverride;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (samplesPerPixelOverride.has_value() || sppLimiterOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (samplesPerPixelOverride.has_value()) {
+                    settings.samplesPerPixel = *samplesPerPixelOverride;
+                }
+                if (sppLimiterOverride.has_value()) {
+                    settings.limitSamplesPerPixel = *sppLimiterOverride;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
             if (!disabledPasses.empty()) {
                 rtv::RendererSettings settings = renderer->settings();
                 for (const std::string& pass : disabledPasses) {
@@ -337,8 +381,13 @@ int main(int argc, char** argv) {
                         settings.denoiserEnabled = false;
                     } else if (name == "taa" || name == "tsr") {
                         settings.taaEnabled = false;
-                    } else if (name == "restir" || name == "restirdi" || name == "restirgi" || name == "restirspatial") {
+                    } else if (name == "restir") {
                         settings.restirMode = rtv::RestirMode::ClassicNee;
+                        settings.restirGiEnabled = false;
+                    } else if (name == "restirdi" || name == "restirspatial") {
+                        settings.restirMode = rtv::RestirMode::ClassicNee;
+                    } else if (name == "restirgi") {
+                        settings.restirGiEnabled = false;
                     } else if (name == "autoexposure") {
                         settings.autoExposureEnabled = false;
                     } else {
@@ -446,12 +495,10 @@ int main(int argc, char** argv) {
                 diag.exportFrameSequence(app, *diagConfig.saveFrameSequenceDir);
             }
             if (diagConfig.makeDebugPackageDir.has_value()) {
-                const std::filesystem::path scnPath = scenePath.value_or("");
-                diag.makeDebugPackage(app, *diagConfig.makeDebugPackageDir, scnPath);
+                diag.makeDebugPackage(app, *diagConfig.makeDebugPackageDir, diagnosticSourcePath);
             }
             if (crashDumpPackageDir.has_value()) {
-                const std::filesystem::path scnPath = scenePath.value_or("");
-                diag.makeDebugPackage(app, *crashDumpPackageDir, scnPath);
+                diag.makeDebugPackage(app, *crashDumpPackageDir, diagnosticSourcePath);
             }
         }
 
@@ -485,7 +532,7 @@ int main(int argc, char** argv) {
             finalExitCode = std::max(finalExitCode, rtv::checkBudget(*checkBudgetPath, diag.profileReport()));
         }
         if (baselineMode) {
-            const rtv::BaselinePaths paths = rtv::baselinePathsFor(scenePath.value_or("scene"), baselineRoot);
+            const rtv::BaselinePaths paths = rtv::baselinePathsFor(diagnosticSourcePath, baselineRoot);
             if (!diagConfig.profileJsonPath.has_value() ||
                 !diagConfig.dumpRenderGraphPath.has_value() ||
                 !diagConfig.saveDebugViewsDir.has_value()) {
@@ -503,7 +550,7 @@ int main(int argc, char** argv) {
         if (crashDumpPackageDir.has_value()) {
             rtv::writeCrashDumpPackage(
                 *crashDumpPackageDir,
-                scenePath.value_or(""),
+                diagnosticSourcePath,
                 diagConfig.profileJsonPath,
                 diagConfig.dumpRenderGraphPath,
                 diagConfig.saveDebugViewsDir,

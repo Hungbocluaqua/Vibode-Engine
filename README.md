@@ -4,6 +4,14 @@ This directory contains the native Vulkan 1.3 / C++20 port of the WebGPU path tr
 
 The port is operational: it opens a native window, runs a Vulkan KHR hardware ray tracing path tracer on capable devices, denoises temporally/spatially, presents through compute tone mapping and a fullscreen pass, supports glTF/HDR inputs, exposes an ImGui editor, and includes GPU timing/debug views. It is now an editor-oriented renderer prototype with scene hierarchy, inspector, undo/redo, render settings persistence, and incremental scene-update paths, but it still needs more hardware-RT update/refit, material coverage, render-graph, and editor workflow hardening.
 
+## Current Real-Time Defaults
+
+- `Balanced` is the default render preset for interactive/game-style use.
+- The real-time path is capped at effective `1 SPP` by default through `Limit to 1 SPP`; higher requested SPP is opt-in for stills, screenshots, references, or high-end budgets.
+- ReSTIR DI and ReSTIR GI are enabled by default in the beauty path.
+- The Balanced preset targets a 16.6 ms GPU frame budget using render scale `0.65`, max bounces `5`, one environment sample, three a-trous iterations, ReSTIR GI spatial/final passes, temporal denoising, and TAA.
+- Motion stability is prioritized over raw per-frame sampling. Use ReSTIR reuse, denoiser history, moment tracking, and TAA before raising SPP.
+
 ## Implemented
 
 - GLFW window with Vulkan surface creation
@@ -26,6 +34,8 @@ The port is operational: it opens a native window, runs a Vulkan KHR hardware ra
 - Compact auxiliary buffers for variance, depth/normal, world position, and temporal history
 - Temporal denoiser with reprojection, disocclusion rejection, luminance clipping, reactive masking, moving-camera preview support, and multi-scale a-trous filtering
 - Temporal anti-aliasing with independent temporal frame tracking, TAA-only camera jitter, depth/world-position validation, and configurable sharpening
+- Render presets (`Low`, `Balanced`, `Ultra`, `Custom`) that tune path tracing, ReSTIR, denoiser, TAA, SPP limiting, and render scale together
+- True per-frame SPP control with a real-time `1 SPP` limiter, editor slider, CLI overrides, and profile JSON reporting
 - Cornell-box scene and optional glTF/GLB import through `--gltf`
 - glTF camera import into editable camera entities
 - Radiance HDR environment loading through `--hdr`
@@ -37,6 +47,7 @@ The port is operational: it opens a native window, runs a Vulkan KHR hardware ra
 - glTF texture residency through a fixed sampled texture array
 - Shader-side base-color, normal, metallic-roughness, and emissive texture sampling
 - Direct/emissive/environment lighting debug views plus PDF/MIS diagnostics
+- ReSTIR DI and ReSTIR GI reservoir reuse with GI spatial/final beauty-path passes, debug views, and profile/render-graph reporting
 - GPU timestamp profiling for path tracing, denoising, and fullscreen passes
 - ImGui editor with viewport, scene hierarchy, inspector, asset browser, render settings, debug/profiler, optional material editor, sample count, reset reason, resolution, and pass timings
 - Scene hierarchy selection sync, selected-instance outline, transform gizmo preview/commit, active scene-camera piloting, and undo/redo-backed editor operations
@@ -141,7 +152,14 @@ Hardware RT uses a correctness-first material policy: alpha and single-sided mat
 - `PageUp/PageDown` changes max bounces.
 - `Home/End` changes a-trous denoiser iterations.
 
-The ImGui editor exposes the same core controls plus scene hierarchy, inspector editing, asset browsing, render settings, HDR path loading, profiler timing, hardware RT AS/SBT stats, sample count, resolution, debug view selection, accumulation reset reason, TAA sharpening, tone mapper selection, and environment lighting controls.
+The ImGui editor exposes the same core controls plus scene hierarchy, inspector editing, asset browsing, render settings, HDR path loading, profiler timing, hardware RT AS/SBT stats, accumulated sample count, requested/effective SPP controls, resolution, debug view selection, accumulation reset reason, TAA sharpening, tone mapper selection, and environment lighting controls.
+
+SPP control behavior:
+
+- `Limit to 1 SPP` is enabled by default for real-time presets. It forces effective path samples per pixel per frame to `1`, even if the requested SPP slider is higher.
+- `Samples Per Pixel` requests `1..8` path samples per pixel per frame when the limiter is disabled.
+- CLI equivalents are `--spp <N>` / `--samples-per-pixel <N>` and `--spp-limit on|off` / `--limit-spp on|off`.
+- Profile JSON records `samples_per_pixel`, `limit_samples_per_pixel`, and `effective_samples_per_pixel` under `settings`.
 
 Environment control behavior:
 
@@ -237,11 +255,11 @@ The renderer executes this frame flow:
 
 1. Upload changed uniforms and scene/environment data.
 2. Dispatch path tracing through Vulkan KHR hardware RT.
-3. Barrier path tracing outputs for denoiser reads.
-4. Dispatch temporal/a-trous denoising compute.
-5. Update/copy history resources for the next frame.
-6. Present through a fullscreen dynamic-rendering graphics pass.
-7. Render the ImGui overlay.
+3. Run ReSTIR DI/GI spatial reuse and ReSTIR GI final contribution when enabled by the active settings/debug path.
+4. Barrier path tracing/ReSTIR outputs for temporal reads.
+5. Update temporal moments, dispatch temporal/a-trous denoising, and copy history resources for the next frame.
+6. Resolve TAA at display extent.
+7. Tone map/present through fullscreen output and render the ImGui overlay.
 
 Accumulation resets when camera pose, resize, material, lighting, environment, denoiser/TAA, debug, shader, or scene state changes. Temporal/TAA frame tracking is separate from accumulation sample count so editor preview can keep temporal history while path-tracing accumulation resets.
 

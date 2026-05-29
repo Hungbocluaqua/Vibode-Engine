@@ -30,6 +30,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     if (state.sceneDocument != nullptr) {
         const RenderSettings& render = state.sceneDocument->renderSettings();
         const Environment& environment = state.sceneDocument->environment();
+        settings.renderPreset = render.renderPreset;
         settings.pathTracingEnabled = render.pathTracingEnabled;
         settings.cameraJitterEnabled = render.cameraJitterEnabled;
         settings.directLightingEnabled = render.directLightingEnabled;
@@ -56,12 +57,19 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.skyIntensity = render.skyIntensity;
         settings.indirectStrength = render.indirectStrength;
         settings.restirMode = render.restirMode;
+        settings.restirGiEnabled = render.restirGiEnabled;
         settings.denoiserEnabled = render.denoiserEnabled;
         settings.denoiseWhileMoving = render.denoiseWhileMoving;
+        settings.samplesPerPixel = render.samplesPerPixel;
+        settings.limitSamplesPerPixel = render.limitSamplesPerPixel;
         settings.atrousIterations = render.atrousIterations;
         settings.denoiserStrength = render.denoiserStrength;
+        settings.denoiserMaxHistoryLength = render.denoiserMaxHistoryLength;
+        settings.momentValidityThreshold = render.momentValidityThreshold;
         settings.taaEnabled = render.taaEnabled;
         settings.taaFeedback = render.taaFeedback;
+        settings.taaMotionFeedback = render.taaMotionFeedback;
+        settings.taaReactiveFeedback = render.taaReactiveFeedback;
         settings.taaSharpeningStrength = render.taaSharpeningStrength;
         settings.debugView = render.debugView;
         settings.renderResolutionScale = render.resolutionScale;
@@ -91,10 +99,13 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.environmentBackgroundIntensity = environment.backgroundIntensity;
     }
     bool changed = false;
+    bool presetApplied = false;
     uint32_t minBounces = 1;
     uint32_t maxBounces = 16;
     uint32_t minEnvSamples = 1;
     uint32_t maxEnvSamples = 8;
+    uint32_t minSpp = 1;
+    uint32_t maxSpp = 8;
     uint32_t minAtrous = 1;
     uint32_t maxAtrous = 5;
     uint32_t minRestirGiAge = 1;
@@ -105,11 +116,26 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     uint32_t maxRestirGiVisibilityRays = 4;
 
     ImGui::SeparatorText("Rendering");
+    const char* renderPresetItems[] = {"Custom", "Low", "Balanced", "Ultra"};
+    int renderPresetIndex = static_cast<int>(settings.renderPreset);
+    if (renderPresetIndex < 0 || renderPresetIndex > 3) {
+        renderPresetIndex = 0;
+    }
+    if (ImGui::Combo("Render Preset", &renderPresetIndex, renderPresetItems, 4)) {
+        applyRenderPreset(settings, static_cast<RenderPreset>(renderPresetIndex));
+        presetApplied = true;
+        changed = true;
+    }
+    tooltip("Game-ready presets tune path tracing, ReSTIR, denoiser, TAA, and render scale together.");
     editorDebugViewCombo("Debug View", settings, changed);
     changed |= ImGui::SliderScalar("Max Bounces", ImGuiDataType_U32, &settings.maxBounces, &minBounces, &maxBounces);
     tooltip("Number of ray bounces. Higher is more accurate and slower; 4-8 for preview, 16 for final.");
     changed |= ImGui::SliderScalar("Environment Samples", ImGuiDataType_U32, &settings.environmentDirectSamples, &minEnvSamples, &maxEnvSamples);
     tooltip("Environment light samples per bounce. Higher values reduce fireflies.");
+    changed |= ImGui::Checkbox("Limit to 1 SPP", &settings.limitSamplesPerPixel);
+    tooltip("Keeps real-time path tracing at one path sample per pixel per frame. Disable for stills or high-end budgets.");
+    changed |= ImGui::SliderScalar("Samples Per Pixel", ImGuiDataType_U32, &settings.samplesPerPixel, &minSpp, &maxSpp);
+    tooltip("Requested path samples per pixel per frame when the 1 SPP limiter is disabled.");
     changed |= ImGui::Checkbox("Path Tracing", &settings.pathTracingEnabled);
     changed |= ImGui::Checkbox("TAA Camera Jitter", &settings.cameraJitterEnabled);
     tooltip("Halton sub-pixel jitter. It is only applied while TAA is enabled.");
@@ -126,6 +152,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed = true;
     }
     tooltip("Hybrid ReSTIR direct-light mode. Classic NEE remains the reference baseline.");
+    changed |= ImGui::Checkbox("ReSTIR GI", &settings.restirGiEnabled);
+    tooltip("Enables ReSTIR GI reservoir reuse and final GI contribution in normal beauty rendering.");
     if (ImGui::CollapsingHeader("ReSTIR GI Tuning")) {
         const char* presetItems[] = {"Custom", "Reference", "Balanced", "Performance"};
         int preset = 0;
@@ -154,7 +182,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             }
             changed = true;
         }
-        tooltip("Applies debug-only ReSTIR GI reservoir reuse presets. Custom values remain editable below.");
+        tooltip("Applies ReSTIR GI reservoir reuse presets. Custom values remain editable below.");
         changed |= ImGui::Checkbox("GI Half Resolution Reuse", &settings.restirGiHalfResolution);
         tooltip("Uses one spatial GI reservoir per 2x2 pixel group for the GI debug/final path.");
         changed |= ImGui::SliderScalar("GI Temporal Max Age", ImGuiDataType_U32, &settings.restirGiTemporalMaxAge, &minRestirGiAge, &maxRestirGiAge);
@@ -292,6 +320,10 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         tooltip("HDR temporal anti-aliasing pass after denoising and before tone mapping.");
         changed |= ImGui::SliderFloat("TAA Feedback", &settings.taaFeedback, 0.01f, 0.5f, "%.2f");
         tooltip("Lower values keep more history; higher values react faster to motion and lighting changes.");
+        changed |= ImGui::SliderFloat("TAA Motion Feedback", &settings.taaMotionFeedback, 0.25f, 0.98f, "%.2f");
+        tooltip("Current-frame blend target while the camera is moving. Lower values stabilize noisy motion; higher values reduce ghosting.");
+        changed |= ImGui::SliderFloat("TAA Reactive Feedback", &settings.taaReactiveFeedback, 0.25f, 0.99f, "%.2f");
+        tooltip("Current-frame blend used for strong reactive or disocclusion cases while moving.");
         changed |= ImGui::SliderFloat("TAA Sharpening", &settings.taaSharpeningStrength, 0.0f, 1.0f, "%.2f");
         tooltip("Unsharp mask amount applied by the TAA resolve.");
     }
@@ -310,6 +342,9 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     }
 
     if (changed) {
+        if (!presetApplied) {
+            settings.renderPreset = RenderPreset::Custom;
+        }
         if (state.sceneDocument != nullptr) {
             RenderSettings& render = state.sceneDocument->renderSettings();
             Environment& environment = state.sceneDocument->environment();
@@ -322,7 +357,9 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 render.directLightingEnabled != settings.directLightingEnabled ||
                 render.environmentDirectSamples != settings.environmentDirectSamples ||
                 render.restirMode != settings.restirMode ||
+                render.restirGiEnabled != settings.restirGiEnabled ||
                 std::abs(render.skyIntensity - settings.skyIntensity) > 0.0001f;
+            render.renderPreset = settings.renderPreset;
             render.pathTracingEnabled = settings.pathTracingEnabled;
             render.cameraJitterEnabled = settings.cameraJitterEnabled;
             render.directLightingEnabled = settings.directLightingEnabled;
@@ -348,12 +385,19 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.skyIntensity = settings.skyIntensity;
             render.indirectStrength = settings.indirectStrength;
             render.restirMode = settings.restirMode;
+            render.restirGiEnabled = settings.restirGiEnabled;
             render.denoiserEnabled = settings.denoiserEnabled;
             render.denoiseWhileMoving = settings.denoiseWhileMoving;
+            render.samplesPerPixel = settings.samplesPerPixel;
+            render.limitSamplesPerPixel = settings.limitSamplesPerPixel;
             render.atrousIterations = settings.atrousIterations;
             render.denoiserStrength = settings.denoiserStrength;
+            render.denoiserMaxHistoryLength = settings.denoiserMaxHistoryLength;
+            render.momentValidityThreshold = settings.momentValidityThreshold;
             render.taaEnabled = settings.taaEnabled;
             render.taaFeedback = settings.taaFeedback;
+            render.taaMotionFeedback = settings.taaMotionFeedback;
+            render.taaReactiveFeedback = settings.taaReactiveFeedback;
             render.taaSharpeningStrength = settings.taaSharpeningStrength;
             render.debugView = settings.debugView;
             render.resolutionScale = settings.renderResolutionScale;

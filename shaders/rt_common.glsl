@@ -37,6 +37,7 @@ layout(set = 0, binding = 1, std140) uniform Camera {
     vec4 sun_direction_illuminance;
     vec4 sun_color_angular_radius;
     uvec4 restir_gi_controls;
+    uvec4 path_trace_controls;
 } camera;
 
 layout(set = 0, binding = 2, std430) buffer VarianceBuffer { uint variance_buffer[]; };

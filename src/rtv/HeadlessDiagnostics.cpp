@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -36,6 +37,8 @@ void to_json(nlohmann::json& j, const ProfileReport::MinMaxAvg& m) {
     j["min"] = m.min;
     j["avg"] = m.avg;
     j["max"] = m.max;
+    j["p95"] = m.p95;
+    j["p99"] = m.p99;
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
@@ -89,26 +92,46 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryReport& m) {
     j["restir_gi_spatial_bytes"] = m.restirGiSpatialBytes;
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::AdaptiveQualityReport& a) {
+    j["smoothed_gpu_ms"] = a.smoothedGpuMs;
+    j["tier"] = a.tier;
+    j["over_budget_frames"] = a.overBudgetFrames;
+    j["effective_max_bounces"] = a.effectiveMaxBounces;
+    j["effective_environment_samples"] = a.effectiveEnvironmentSamples;
+    j["effective_atrous_iterations"] = a.effectiveAtrousIterations;
+    j["skip_restir_spatial"] = a.skipRestirSpatial;
+    j["skip_denoiser"] = a.skipDenoiser;
+}
+
 void to_json(nlohmann::json& j, const RendererSettings& s) {
+    j["render_preset"] = renderPresetName(s.renderPreset);
     j["path_tracing_enabled"] = s.pathTracingEnabled;
     j["denoiser_enabled"] = s.denoiserEnabled;
     j["max_bounces"] = s.maxBounces;
     j["atrous_iterations"] = s.atrousIterations;
     j["restir_mode"] = restirModeName(s.restirMode);
+    j["restir_gi_enabled"] = s.restirGiEnabled;
     j["tone_mapper"] = toneMapperName(s.toneMapper);
     j["exposure"] = s.exposure;
     j["render_resolution_scale"] = s.renderResolutionScale;
     j["specular_aa_enabled"] = s.specularAaEnabled;
     j["camera_jitter_enabled"] = s.cameraJitterEnabled;
     j["denoise_while_moving"] = s.denoiseWhileMoving;
+    j["samples_per_pixel"] = s.samplesPerPixel;
+    j["limit_samples_per_pixel"] = s.limitSamplesPerPixel;
+    j["effective_samples_per_pixel"] = s.limitSamplesPerPixel ? 1u : s.samplesPerPixel;
     j["taa_enabled"] = s.taaEnabled;
     j["taa_feedback"] = s.taaFeedback;
+    j["taa_motion_feedback"] = s.taaMotionFeedback;
+    j["taa_reactive_feedback"] = s.taaReactiveFeedback;
     j["taa_sharpening_strength"] = s.taaSharpeningStrength;
     j["sunlight_enabled"] = s.sunlightEnabled;
     j["direct_lighting_enabled"] = s.directLightingEnabled;
     j["environment_enabled"] = s.environmentEnabled;
     j["environment_direct_samples"] = s.environmentDirectSamples;
     j["denoiser_strength"] = s.denoiserStrength;
+    j["denoiser_max_history_length"] = s.denoiserMaxHistoryLength;
+    j["moment_validity_threshold"] = s.momentValidityThreshold;
     j["sun_intensity"] = s.sunIntensity;
     j["sun_elevation"] = s.sunElevation;
     j["sun_azimuth"] = s.sunAzimuth;
@@ -140,6 +163,17 @@ std::string formatVulkanVersion(uint32_t version) {
     return ss.str();
 }
 
+float percentileOfSorted(const std::vector<float>& sorted, float p) {
+    if (sorted.empty()) {
+        return 0.0f;
+    }
+    const float scaled = std::clamp(p, 0.0f, 1.0f) * static_cast<float>(sorted.size() - 1u);
+    const size_t lower = static_cast<size_t>(std::floor(scaled));
+    const size_t upper = std::min(sorted.size() - 1u, lower + 1u);
+    const float t = scaled - static_cast<float>(lower);
+    return sorted[lower] * (1.0f - t) + sorted[upper] * t;
+}
+
 ProfileReport::MinMaxAvg computeMinMaxAvg(const std::vector<float>& values, uint32_t warmupFrames) {
     ProfileReport::MinMaxAvg result{};
     if (values.empty()) return result;
@@ -152,7 +186,106 @@ ProfileReport::MinMaxAvg computeMinMaxAvg(const std::vector<float>& values, uint
     double sum = 0.0;
     for (size_t i = startIdx; i < values.size(); ++i) sum += values[i];
     result.avg = static_cast<float>(sum / count);
+
+    std::vector<float> sorted(values.begin() + startIdx, values.end());
+    std::sort(sorted.begin(), sorted.end());
+    result.p95 = percentileOfSorted(sorted, 0.95f);
+    result.p99 = percentileOfSorted(sorted, 0.99f);
     return result;
+}
+
+float percentileGpuTiming(
+    const std::vector<GpuFrameTimings>& values,
+    uint32_t warmupFrames,
+    float GpuFrameTimings::*member,
+    float percentile) {
+    if (values.empty()) {
+        return 0.0f;
+    }
+
+    size_t startIdx = std::min(static_cast<size_t>(warmupFrames), values.size());
+    if (startIdx >= values.size()) {
+        startIdx = 0;
+    }
+    if (startIdx >= values.size()) {
+        return 0.0f;
+    }
+
+    std::vector<float> sorted;
+    sorted.reserve(values.size() - startIdx);
+    for (size_t i = startIdx; i < values.size(); ++i) {
+        sorted.push_back(values[i].*member);
+    }
+    std::sort(sorted.begin(), sorted.end());
+    return percentileOfSorted(sorted, percentile);
+}
+
+GpuFrameTimings percentileGpuTimings(
+    const std::vector<GpuFrameTimings>& values,
+    uint32_t warmupFrames,
+    float percentile) {
+    GpuFrameTimings result{};
+    result.pathTraceMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::pathTraceMs, percentile);
+    result.restirHistoryClearMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirHistoryClearMs, percentile);
+    result.restirGiClearMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiClearMs, percentile);
+    result.restirSpatialMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirSpatialMs, percentile);
+    result.restirSpatialCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirSpatialCopyMs, percentile);
+    result.restirGiSpatialMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiSpatialMs, percentile);
+    result.restirGiFinalMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiFinalMs, percentile);
+    result.fogIntegrateMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::fogIntegrateMs, percentile);
+    result.atmosphereMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereMs, percentile);
+    result.atmosphereTransmittanceMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereTransmittanceMs, percentile);
+    result.atmosphereMultiScatterMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereMultiScatterMs, percentile);
+    result.atmosphereSkyViewMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereSkyViewMs, percentile);
+    result.atmosphereSkyReprojectMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereSkyReprojectMs, percentile);
+    result.atmosphereSkyCdfMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereSkyCdfMs, percentile);
+    result.atmosphereAerialPerspectiveMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereAerialPerspectiveMs, percentile);
+    result.denoiserMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::denoiserMs, percentile);
+    result.momentUpdateMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::momentUpdateMs, percentile);
+    result.historyCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::historyCopyMs, percentile);
+    result.skipDenoiserCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::skipDenoiserCopyMs, percentile);
+    result.taaMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::taaMs, percentile);
+    result.taaHistoryCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::taaHistoryCopyMs, percentile);
+    result.autoExposureMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::autoExposureMs, percentile);
+    result.autoExposureHistogramClearMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::autoExposureHistogramClearMs, percentile);
+    result.autoExposureHistogramMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::autoExposureHistogramMs, percentile);
+    result.autoExposureReduceMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::autoExposureReduceMs, percentile);
+    result.toneMapMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::toneMapMs, percentile);
+    result.selectionOutlineMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::selectionOutlineMs, percentile);
+    result.fullscreenMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::fullscreenMs, percentile);
+    result.editorPresentationMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::editorPresentationMs, percentile);
+    return result;
+}
+
+void assignPerPassGpuMs(ProfileReport::PerPassGpuMs& out, const GpuFrameTimings& timings) {
+    out.pathTrace = timings.pathTraceMs;
+    out.restirHistoryClear = timings.restirHistoryClearMs;
+    out.restirGiClear = timings.restirGiClearMs;
+    out.restirSpatial = timings.restirSpatialMs;
+    out.restirSpatialCopy = timings.restirSpatialCopyMs;
+    out.restirGiSpatial = timings.restirGiSpatialMs;
+    out.restirGiFinal = timings.restirGiFinalMs;
+    out.fogIntegrate = timings.fogIntegrateMs;
+    out.atmosphere = timings.atmosphereMs;
+    out.atmosphereTransmittance = timings.atmosphereTransmittanceMs;
+    out.atmosphereMultiScatter = timings.atmosphereMultiScatterMs;
+    out.atmosphereSkyView = timings.atmosphereSkyViewMs;
+    out.atmosphereSkyReproject = timings.atmosphereSkyReprojectMs;
+    out.atmosphereSkyCdf = timings.atmosphereSkyCdfMs;
+    out.atmosphereAerialPerspective = timings.atmosphereAerialPerspectiveMs;
+    out.denoiser = timings.denoiserMs;
+    out.momentUpdate = timings.momentUpdateMs;
+    out.historyCopy = timings.historyCopyMs;
+    out.skipDenoiserCopy = timings.skipDenoiserCopyMs;
+    out.taa = timings.taaMs;
+    out.taaHistoryCopy = timings.taaHistoryCopyMs;
+    out.autoExposureHistogramClear = timings.autoExposureHistogramClearMs;
+    out.autoExposureHistogram = timings.autoExposureHistogramMs;
+    out.autoExposureReduce = timings.autoExposureReduceMs;
+    out.toneMap = timings.toneMapMs;
+    out.selectionOutline = timings.selectionOutlineMs;
+    out.fullscreen = timings.fullscreenMs;
+    out.editorPresentation = timings.editorPresentationMs;
 }
 
 GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, uint32_t warmupFrames) {
@@ -187,6 +320,7 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
         result.atmosphereSkyCdfMs += values[i].atmosphereSkyCdfMs;
         result.atmosphereAerialPerspectiveMs += values[i].atmosphereAerialPerspectiveMs;
         result.denoiserMs += values[i].denoiserMs;
+        result.momentUpdateMs += values[i].momentUpdateMs;
         result.historyCopyMs += values[i].historyCopyMs;
         result.skipDenoiserCopyMs += values[i].skipDenoiserCopyMs;
         result.taaMs += values[i].taaMs;
@@ -218,6 +352,7 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
     result.atmosphereSkyCdfMs *= invCount;
     result.atmosphereAerialPerspectiveMs *= invCount;
     result.denoiserMs *= invCount;
+    result.momentUpdateMs *= invCount;
     result.historyCopyMs *= invCount;
     result.skipDenoiserCopyMs *= invCount;
     result.taaMs *= invCount;
@@ -321,34 +456,9 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.gpuFrameMs = computeMinMaxAvg(gpuTimingsVec, warmup);
 
     const auto timings = averageGpuTimings(app.perFrameGpuTimings(), warmup);
-    profileReport_.perPassGpuMs.pathTrace = timings.pathTraceMs;
-    profileReport_.perPassGpuMs.restirHistoryClear = timings.restirHistoryClearMs;
-    profileReport_.perPassGpuMs.restirGiClear = timings.restirGiClearMs;
-    profileReport_.perPassGpuMs.restirSpatial = timings.restirSpatialMs;
-    profileReport_.perPassGpuMs.restirSpatialCopy = timings.restirSpatialCopyMs;
-    profileReport_.perPassGpuMs.restirGiSpatial = timings.restirGiSpatialMs;
-    profileReport_.perPassGpuMs.restirGiFinal = timings.restirGiFinalMs;
-    profileReport_.perPassGpuMs.fogIntegrate = timings.fogIntegrateMs;
-    profileReport_.perPassGpuMs.atmosphere = timings.atmosphereMs;
-    profileReport_.perPassGpuMs.atmosphereTransmittance = timings.atmosphereTransmittanceMs;
-    profileReport_.perPassGpuMs.atmosphereMultiScatter = timings.atmosphereMultiScatterMs;
-    profileReport_.perPassGpuMs.atmosphereSkyView = timings.atmosphereSkyViewMs;
-    profileReport_.perPassGpuMs.atmosphereSkyReproject = timings.atmosphereSkyReprojectMs;
-    profileReport_.perPassGpuMs.atmosphereSkyCdf = timings.atmosphereSkyCdfMs;
-    profileReport_.perPassGpuMs.atmosphereAerialPerspective = timings.atmosphereAerialPerspectiveMs;
-    profileReport_.perPassGpuMs.denoiser = timings.denoiserMs;
-    profileReport_.perPassGpuMs.momentUpdate = timings.momentUpdateMs;
-    profileReport_.perPassGpuMs.historyCopy = timings.historyCopyMs;
-    profileReport_.perPassGpuMs.skipDenoiserCopy = timings.skipDenoiserCopyMs;
-    profileReport_.perPassGpuMs.taa = timings.taaMs;
-    profileReport_.perPassGpuMs.taaHistoryCopy = timings.taaHistoryCopyMs;
-    profileReport_.perPassGpuMs.autoExposureHistogramClear = timings.autoExposureHistogramClearMs;
-    profileReport_.perPassGpuMs.autoExposureHistogram = timings.autoExposureHistogramMs;
-    profileReport_.perPassGpuMs.autoExposureReduce = timings.autoExposureReduceMs;
-    profileReport_.perPassGpuMs.toneMap = timings.toneMapMs;
-    profileReport_.perPassGpuMs.selectionOutline = timings.selectionOutlineMs;
-    profileReport_.perPassGpuMs.fullscreen = timings.fullscreenMs;
-    profileReport_.perPassGpuMs.editorPresentation = timings.editorPresentationMs;
+    assignPerPassGpuMs(profileReport_.perPassGpuMs, timings);
+    assignPerPassGpuMs(profileReport_.perPassGpuMsP95, percentileGpuTimings(app.perFrameGpuTimings(), warmup, 0.95f));
+    assignPerPassGpuMs(profileReport_.perPassGpuMsP99, percentileGpuTimings(app.perFrameGpuTimings(), warmup, 0.99f));
 
     const auto& stats = renderer->pipelineStats();
     profileReport_.pipelineStatistics.rayInvocations = stats.rayInvocations;
@@ -369,6 +479,16 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.restirGiPreviousBytes = static_cast<uint64_t>(reservoirBreakdown.giPreviousBytes);
     profileReport_.memory.restirGiSpatialBytes = static_cast<uint64_t>(reservoirBreakdown.giSpatialBytes);
     profileReport_.restirGiLayout = renderer->restirGiReservoirLayoutName();
+
+    const auto adaptiveState = renderer->adaptiveQualityState();
+    profileReport_.adaptiveQuality.smoothedGpuMs = adaptiveState.smoothedGpuMs;
+    profileReport_.adaptiveQuality.tier = adaptiveState.tier;
+    profileReport_.adaptiveQuality.overBudgetFrames = adaptiveState.overBudgetFrames;
+    profileReport_.adaptiveQuality.effectiveMaxBounces = adaptiveState.effectiveMaxBounces;
+    profileReport_.adaptiveQuality.effectiveEnvironmentSamples = adaptiveState.effectiveEnvironmentSamples;
+    profileReport_.adaptiveQuality.effectiveAtrousIterations = adaptiveState.effectiveAtrousIterations;
+    profileReport_.adaptiveQuality.skipRestirSpatial = adaptiveState.skipRestirSpatial;
+    profileReport_.adaptiveQuality.skipDenoiser = adaptiveState.skipDenoiser;
 
     profileReport_.validationErrorCount = 0;
 
@@ -392,6 +512,8 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["cpu_frame_ms"] = profileReport_.cpuFrameMs;
     j["gpu_frame_ms"] = profileReport_.gpuFrameMs;
     j["per_pass_gpu_ms"] = profileReport_.perPassGpuMs;
+    j["per_pass_gpu_ms_p95"] = profileReport_.perPassGpuMsP95;
+    j["per_pass_gpu_ms_p99"] = profileReport_.perPassGpuMsP99;
     j["pipeline_statistics"] = profileReport_.pipelineStatistics;
     const uint64_t hitCount = profileReport_.pipelineStatistics.triangleHits + profileReport_.pipelineStatistics.aabbHits;
     j["gpu_debug_counters"] = {
@@ -412,6 +534,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         })},
     };
     j["memory"] = profileReport_.memory;
+    j["adaptive_quality"] = profileReport_.adaptiveQuality;
     j["validation_error_count"] = profileReport_.validationErrorCount;
     j["warnings"] = profileReport_.warnings;
     j["settings"] = profileReport_.settings;
@@ -685,6 +808,8 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
                 std::nullopt,
                 std::nullopt,
                 scene.path,
+                std::nullopt,
+                std::nullopt,
                 std::nullopt,
                 std::nullopt,
                 false,

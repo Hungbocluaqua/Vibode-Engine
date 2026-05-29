@@ -1053,6 +1053,9 @@ void main() {
     }
 
     uint pixel_index = pixel.y * size.x + pixel.x;
+    uint requestedSpp = clamp(camera.path_trace_controls.x, 1u, 8u);
+    uint effectiveSpp = camera.path_trace_controls.y != 0u ? 1u : requestedSpp;
+    float invSpp = 1.0 / float(effectiveSpp);
     uint rng = sample_dimension_seed(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_PATH_SEED);
     vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
     vec2 uv = (vec2(pixel) + jitter) / vec2(size);
@@ -1069,7 +1072,63 @@ void main() {
     vec3 hit_normal;
     vec3 hit_position;
     PathComponents components;
-    vec3 sample_color = trace_path(ray, rng, pixel_index, ivec2(pixel), ivec2(size), did_hit, hit_depth, hit_normal, hit_position, components);
+    vec3 sample_color;
+    if (effectiveSpp <= 1u) {
+        sample_color = trace_path(ray, rng, pixel_index, ivec2(pixel), ivec2(size), did_hit, hit_depth, hit_normal, hit_position, components);
+    } else {
+        sample_color = vec3(0.0);
+        PathComponents first_components;
+        bool first_did_hit = false;
+        float first_hit_depth = 1.0e30;
+        vec3 first_hit_normal = vec3(0.0, 1.0, 0.0);
+        vec3 first_hit_position = vec3(0.0);
+        vec3 accumulated_direct = vec3(0.0);
+        vec3 accumulated_indirect = vec3(0.0);
+        vec3 accumulated_emissive = vec3(0.0);
+        vec3 accumulated_environment = vec3(0.0);
+        vec3 accumulated_restir_direct = vec3(0.0);
+
+        for (uint sppIndex = 0u; sppIndex < 8u; ++sppIndex) {
+            if (sppIndex >= effectiveSpp) {
+                break;
+            }
+
+            ivec2 sample_coords = ivec2(pixel) + ivec2(int(sppIndex) * 4099, int(sppIndex) * 9176);
+            uint sample_rng = rng ^ sample_dimension_seed(sample_coords, camera.temporal_frame_index, sppIndex, SAMPLE_DIM_PATH_SEED + 23u);
+            PathComponents sample_components;
+            bool sample_did_hit;
+            float sample_hit_depth;
+            vec3 sample_hit_normal;
+            vec3 sample_hit_position;
+            vec3 path_sample = trace_path(ray, sample_rng, pixel_index, sample_coords, ivec2(size), sample_did_hit, sample_hit_depth, sample_hit_normal, sample_hit_position, sample_components);
+            sample_color += path_sample;
+            accumulated_direct += sample_components.direct_light;
+            accumulated_indirect += sample_components.indirect_light;
+            accumulated_emissive += sample_components.emissive_light;
+            accumulated_environment += sample_components.environment_light;
+            accumulated_restir_direct += sample_components.restir_initial_direct_light;
+
+            if (sppIndex == 0u) {
+                first_components = sample_components;
+                first_did_hit = sample_did_hit;
+                first_hit_depth = sample_hit_depth;
+                first_hit_normal = sample_hit_normal;
+                first_hit_position = sample_hit_position;
+            }
+        }
+
+        sample_color *= invSpp;
+        components = first_components;
+        components.direct_light = accumulated_direct * invSpp;
+        components.indirect_light = accumulated_indirect * invSpp;
+        components.emissive_light = accumulated_emissive * invSpp;
+        components.environment_light = accumulated_environment * invSpp;
+        components.restir_initial_direct_light = accumulated_restir_direct * invSpp;
+        did_hit = first_did_hit;
+        hit_depth = first_hit_depth;
+        hit_normal = first_hit_normal;
+        hit_position = first_hit_position;
+    }
     vec4 previous = (camera.frame_count <= 1u || camera.path_tracing_enabled == 0u) ? vec4(0.0) : accumulation_buffer[pixel_index];
     vec3 previous_average = previous.rgb / max(previous.a, 1.0);
     sample_color = clamp_firefly_sample(sample_color, previous_average, camera.frame_count);

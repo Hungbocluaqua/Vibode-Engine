@@ -120,6 +120,13 @@ enum class AdaptiveQualityMode : uint32_t {
     Aggressive = 3,
 };
 
+enum class RenderPreset : uint32_t {
+    Custom = 0,
+    Low = 1,
+    Balanced = 2,
+    Ultra = 3,
+};
+
 struct RendererDebugParams {
     uint32_t view = static_cast<uint32_t>(RendererDebugView::Beauty);
     uint32_t flags = 0;
@@ -129,6 +136,8 @@ struct RendererDebugParams {
 
 [[nodiscard]] const char* toneMapperName(ToneMapper toneMapper);
 [[nodiscard]] const char* restirModeName(RestirMode mode);
+[[nodiscard]] const char* renderPresetName(RenderPreset preset);
+[[nodiscard]] RenderPreset parseRenderPreset(std::string_view value);
 [[nodiscard]] RendererDebugView parseRendererDebugView(std::string_view value);
 [[nodiscard]] const char* rendererDebugViewName(RendererDebugView view);
 
