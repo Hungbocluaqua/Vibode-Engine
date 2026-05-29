@@ -54,6 +54,9 @@ volk.vcxproj*
 *~
 .vscode/
 
+# CodeGraph runtime state
+.codegraph/daemon.pid
+
 # Sponza scenes (large assets)
 Sponza/
 main_sponza/

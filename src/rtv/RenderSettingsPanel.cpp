@@ -279,6 +279,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         tooltip("Denoiser iterations. More is smoother and slower.");
         changed |= ImGui::SliderFloat("Denoiser Strength", &settings.denoiserStrength, 0.05f, 4.0f, "%.2f");
         tooltip("Higher values denoise more aggressively and may lose detail.");
+        const uint32_t minHistory = 4;
+        const uint32_t maxHistory = 256;
+        changed |= ImGui::SliderScalar("Max History Length", ImGuiDataType_U32, &settings.denoiserMaxHistoryLength, &minHistory, &maxHistory);
+        tooltip("Maximum temporal history length for moment tracking. Higher values stabilize static scenes more.");
+        changed |= ImGui::SliderFloat("Moment Validity Threshold", &settings.momentValidityThreshold, 0.05f, 0.75f, "%.2f");
+        tooltip("Threshold for moment history validity. Lower = more history, more ghosting. Higher = stricter, less ghosting, more noise.");
         changed |= ImGui::Checkbox("TAA", &settings.taaEnabled);
         tooltip("HDR temporal anti-aliasing pass after denoising and before tone mapping.");
         changed |= ImGui::SliderFloat("TAA Feedback", &settings.taaFeedback, 0.01f, 0.5f, "%.2f");

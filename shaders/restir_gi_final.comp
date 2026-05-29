@@ -44,12 +44,12 @@ void main() {
     vec3 spatialGi = reservoir_radiance(spatialReservoir);
     float debugScale = max(debug_params.scale, 1.0);
 
-    if (debug_params.view == 64u) {
+    if (debug_params.view == 72u) {
         imageStore(raw_image, coords, vec4(spatialGi * debugScale * 16.0, 1.0));
         return;
     }
 
-    if (debug_params.view != 65u) {
+    if (debug_params.view != 73u) {
         return;
     }
 

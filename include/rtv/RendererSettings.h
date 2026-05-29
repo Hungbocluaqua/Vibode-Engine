@@ -24,6 +24,8 @@ struct RendererSettings {
     uint32_t atrousIterations = 4;
     uint32_t environmentDirectSamples = 1;
     float denoiserStrength = 1.0f;
+    uint32_t denoiserMaxHistoryLength = 64;
+    float momentValidityThreshold = 0.25f;
     float sunIntensity = 1.0f;
     float sunIlluminanceLux = 100000.0f;
     float sunColorTemperatureKelvin = 5778.0f;

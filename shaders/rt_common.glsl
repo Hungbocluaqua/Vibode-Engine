@@ -526,7 +526,8 @@ vec2 project_unjittered_to_pixels(mat4 viewProj, vec2 jitterPixels, vec3 worldPo
 }
 
 uint pack_velocity_pixels(vec2 velocityPixels) {
-    return pack_snorm2x16(velocityPixels / 64.0);
+    ivec2 encoded = ivec2(round(clamp(velocityPixels / 64.0, vec2(-1.0), vec2(1.0)) * 32767.0));
+    return (uint(encoded.x) & 0xffffu) | ((uint(encoded.y) & 0xffffu) << 16u);
 }
 
 uint compute_surface_velocity(vec3 currentWorldPos, vec3 localPos, uint instanceId, ivec2 dims) {

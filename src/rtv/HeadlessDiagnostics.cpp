@@ -55,6 +55,7 @@ void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
     j["atmosphere_sky_cdf"] = p.atmosphereSkyCdf;
     j["atmosphere_aerial_perspective"] = p.atmosphereAerialPerspective;
     j["denoiser"] = p.denoiser;
+    j["moment_update"] = p.momentUpdate;
     j["history_copy"] = p.historyCopy;
     j["skip_denoiser_copy"] = p.skipDenoiserCopy;
     j["taa"] = p.taa;
@@ -323,6 +324,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.perPassGpuMs.atmosphereSkyCdf = timings.atmosphereSkyCdfMs;
     profileReport_.perPassGpuMs.atmosphereAerialPerspective = timings.atmosphereAerialPerspectiveMs;
     profileReport_.perPassGpuMs.denoiser = timings.denoiserMs;
+    profileReport_.perPassGpuMs.momentUpdate = timings.momentUpdateMs;
     profileReport_.perPassGpuMs.historyCopy = timings.historyCopyMs;
     profileReport_.perPassGpuMs.skipDenoiserCopy = timings.skipDenoiserCopyMs;
     profileReport_.perPassGpuMs.taa = timings.taaMs;

@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 62>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 62> views = {
+const std::array<RendererDebugView, 83>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 83> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -44,9 +44,17 @@ const std::array<RendererDebugView, 62>& editorDebugViews() {
         RendererDebugView::DenoiserKernelRadius,
         RendererDebugView::DenoiserHitDistance,
         RendererDebugView::DenoiserVirtualMotion,
-        RendererDebugView::DenoiserDiffuseHistory,
-        RendererDebugView::DenoiserSpecularHistory,
+        RendererDebugView::DenoiserDiffuseDebug,
+        RendererDebugView::DenoiserSpecularDebug,
         RendererDebugView::DenoiserEmissiveClamp,
+        RendererDebugView::DenoiserVarianceConfidence,
+        RendererDebugView::DenoiserDiffuseChannelConfidence,
+        RendererDebugView::DenoiserFrameBlend,
+        RendererDebugView::DenoiserMaxHitDistanceDelta,
+        RendererDebugView::DenoiserDiffuseOnScreen,
+        RendererDebugView::DenoiserBaseDisocclusion,
+        RendererDebugView::DenoiserSpecularChannelConfidence,
+        RendererDebugView::DenoiserSpecularHistoryWeight,
         RendererDebugView::ClayMaterial,
         RendererDebugView::FirstBounceThroughput,
         RendererDebugView::SecondaryEnvironmentMiss,
@@ -70,6 +78,19 @@ const std::array<RendererDebugView, 62>& editorDebugViews() {
         RendererDebugView::RestirGiTemporal,
         RendererDebugView::RestirGiSpatial,
         RendererDebugView::RestirGiFinal,
+        RendererDebugView::DenoiserDirectDiffuseVariance,
+        RendererDebugView::DenoiserDirectSpecularVariance,
+        RendererDebugView::DenoiserIndirectDiffuseVariance,
+        RendererDebugView::DenoiserIndirectSpecularVariance,
+        RendererDebugView::DenoiserDiffuseHistoryLength,
+        RendererDebugView::DenoiserSpecularHistoryLength,
+        RendererDebugView::MomentUpdateValidity,
+        RendererDebugView::MomentDisocclusionConfidence,
+        RendererDebugView::MomentNormalCone,
+        RendererDebugView::MomentDepthDelta,
+        RendererDebugView::MomentHistoryKindValid,
+        RendererDebugView::DenoiserDiffuseRawVariance,
+        RendererDebugView::DenoiserSpecularRawVariance,
     };
     return views;
 }
@@ -114,9 +135,30 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::DenoiserKernelRadius);
         selectable(RendererDebugView::DenoiserHitDistance);
         selectable(RendererDebugView::DenoiserVirtualMotion);
-        selectable(RendererDebugView::DenoiserDiffuseHistory);
-        selectable(RendererDebugView::DenoiserSpecularHistory);
+        selectable(RendererDebugView::DenoiserDiffuseDebug);
+        selectable(RendererDebugView::DenoiserSpecularDebug);
         selectable(RendererDebugView::DenoiserEmissiveClamp);
+        selectable(RendererDebugView::DenoiserVarianceConfidence);
+        selectable(RendererDebugView::DenoiserDiffuseChannelConfidence);
+        selectable(RendererDebugView::DenoiserFrameBlend);
+        selectable(RendererDebugView::DenoiserMaxHitDistanceDelta);
+        selectable(RendererDebugView::DenoiserDiffuseOnScreen);
+        selectable(RendererDebugView::DenoiserBaseDisocclusion);
+        selectable(RendererDebugView::DenoiserSpecularChannelConfidence);
+        selectable(RendererDebugView::DenoiserSpecularHistoryWeight);
+        selectable(RendererDebugView::DenoiserDirectDiffuseVariance);
+        selectable(RendererDebugView::DenoiserDirectSpecularVariance);
+        selectable(RendererDebugView::DenoiserIndirectDiffuseVariance);
+        selectable(RendererDebugView::DenoiserIndirectSpecularVariance);
+        selectable(RendererDebugView::DenoiserDiffuseHistoryLength);
+        selectable(RendererDebugView::DenoiserSpecularHistoryLength);
+        selectable(RendererDebugView::MomentUpdateValidity);
+        selectable(RendererDebugView::MomentDisocclusionConfidence);
+        selectable(RendererDebugView::MomentNormalCone);
+        selectable(RendererDebugView::MomentDepthDelta);
+        selectable(RendererDebugView::MomentHistoryKindValid);
+        selectable(RendererDebugView::DenoiserDiffuseRawVariance);
+        selectable(RendererDebugView::DenoiserSpecularRawVariance);
         selectable(RendererDebugView::Roughness);
         selectable(RendererDebugView::ClayMaterial);
         selectable(RendererDebugView::InstanceId);

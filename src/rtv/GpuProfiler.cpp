@@ -164,6 +164,7 @@ void GpuProfiler::collectCompletedFrame() {
     timings_.atmosphereSkyCdfMs = smooth(timings_.atmosphereSkyCdfMs, elapsedMs(AtmosphereSkyCdfStart, AtmosphereSkyCdfEnd));
     timings_.atmosphereAerialPerspectiveMs = smooth(timings_.atmosphereAerialPerspectiveMs, elapsedMs(AtmosphereAerialPerspectiveStart, AtmosphereAerialPerspectiveEnd));
     timings_.denoiserMs = smooth(timings_.denoiserMs, elapsedMs(DenoiserStart, DenoiserEnd));
+    timings_.momentUpdateMs = smooth(timings_.momentUpdateMs, elapsedMs(MomentUpdateStart, MomentUpdateEnd));
     timings_.historyCopyMs = smooth(timings_.historyCopyMs, elapsedMs(HistoryCopyStart, HistoryCopyEnd));
     timings_.skipDenoiserCopyMs = smooth(timings_.skipDenoiserCopyMs, elapsedMs(SkipDenoiserCopyStart, SkipDenoiserCopyEnd));
     timings_.taaMs = smooth(timings_.taaMs, elapsedMs(TaaStart, TaaEnd));

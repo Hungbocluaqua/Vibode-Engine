@@ -7,7 +7,15 @@ vec2 temporal_unpack_snorm2x16(uint packedValue) {
 }
 
 vec2 temporal_unpack_velocity_pixels(uint packedVelocity, float velocityScale) {
-    return temporal_unpack_snorm2x16(packedVelocity) * velocityScale;
+    int x = int(packedVelocity & 0xffffu);
+    int y = int((packedVelocity >> 16u) & 0xffffu);
+    if (x >= 32768) {
+        x -= 65536;
+    }
+    if (y >= 32768) {
+        y -= 65536;
+    }
+    return vec2(float(x), float(y)) * (velocityScale / 32767.0);
 }
 
 vec2 temporal_reproject_pixel(ivec2 coords, vec2 velocityPixels) {
@@ -67,7 +75,7 @@ float temporal_disocclusion_confidence(
         return 0.0;
     }
     float posConfidence = exp(-max(relativePositionDelta, 0.0) * 18.0);
-    float normalConfidence = smoothstep(0.35, 0.92, normalConeMin);
+    float normalConfidence = smoothstep(0.25, 0.85, normalConeMin);
     float depthConfidence = exp(-max(maxRelativeDepthDelta, 0.0) * 6.0);
     return clamp(posConfidence * normalConfidence * depthConfidence, 0.0, 1.0);
 }

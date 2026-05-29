@@ -44,6 +44,7 @@ constexpr VkDeviceSize kFrameDebugParamsOffset = 12288;
 constexpr VkDeviceSize kFrameTaaParamsOffset = 16384;
 constexpr VkDeviceSize kFrameRestirSpatialParamsOffset = 20480;
 constexpr VkDeviceSize kFrameFogParamsOffset = 24576;
+constexpr VkDeviceSize kFrameMomentParamsOffset = 28672;
 constexpr uint32_t kRendererFramesInFlight = 3;
 
 float halton(uint32_t index, uint32_t base) {
@@ -177,6 +178,7 @@ PathTracerRenderer::PathTracerRenderer(
     shaderOutputDirectory_ = shaderOutputDirectory;
     ShaderCompiler& compiler = *shaderCompiler_;
     const auto denoiserSpv = compiler.compileIfNeeded(shaderDirectory / "denoiser.comp", shaderOutputDirectory);
+    const auto momentUpdateSpv = compiler.compileIfNeeded(shaderDirectory / "moment_update.comp", shaderOutputDirectory);
     const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
     const auto restirSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_spatial.comp", shaderOutputDirectory);
     const auto restirGiSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_spatial.comp", shaderOutputDirectory);
@@ -196,6 +198,7 @@ PathTracerRenderer::PathTracerRenderer(
     const auto fragSpv = compiler.compileIfNeeded(shaderDirectory / "fullscreen.frag", shaderOutputDirectory);
 
     denoiserShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(denoiserSpv), "temporal denoiser compute");
+    momentUpdateShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(momentUpdateSpv), "moment update compute");
     taaShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(taaSpv), "taa compute");
     restirSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirSpatialSpv), "restir spatial compute");
     restirGiSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiSpatialSpv), "restir gi spatial compute");
@@ -228,6 +231,7 @@ PathTracerRenderer::PathTracerRenderer(
 
     shaderSources_ = {
         shaderDirectory / "denoiser.comp",
+        shaderDirectory / "moment_update.comp",
         shaderDirectory / "taa.comp",
         shaderDirectory / "restir_spatial.comp",
         shaderDirectory / "restir_gi_spatial.comp",
@@ -272,6 +276,7 @@ PathTracerRenderer::PathTracerRenderer(
     }
     atmosphereSetLayout_ = layoutCache_->createLayout(std::move(atmosphereBindings));
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
+    momentUpdateSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({momentUpdateShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
     restirSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirSpatialShader_->reflection()}, 0));
     restirGiSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiSpatialShader_->reflection()}, 0));
@@ -307,6 +312,12 @@ PathTracerRenderer::PathTracerRenderer(
         *denoiserShader_,
         std::vector<VkDescriptorSetLayout>{denoiserSetLayout_},
         ShaderReflection::mergePushConstants({denoiserShader_->reflection()}),
+        *pipelineCache_);
+    momentUpdatePipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *momentUpdateShader_,
+        std::vector<VkDescriptorSetLayout>{momentUpdateSetLayout_},
+        ShaderReflection::mergePushConstants({momentUpdateShader_->reflection()}),
         *pipelineCache_);
     taaPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -869,8 +880,9 @@ void PathTracerRenderer::resetAccumulation(AccumulationResetReason reason) {
         temporalSystem_->setCameraCut(reason != AccumulationResetReason::CameraMoved, reason);
     }
     if (reason != AccumulationResetReason::CameraMoved) {
-        denoiserHistoryValid_ = false;
-        taaHistoryValid_ = false;
+    denoiserHistoryValid_ = false;
+    denoiserFramesSinceReset_ = 0;
+    taaHistoryValid_ = false;
         restirGiHistoryValid_ = false;
     }
     frameCount_ = 0;
@@ -1057,6 +1069,90 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .debugName = "path tracer specular denoiser history",
+    });
+    directDiffuseMomentsImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer direct diffuse moments",
+    });
+    directSpecularMomentsImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer direct specular moments",
+    });
+    indirectDiffuseMomentsImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer indirect diffuse moments",
+    });
+    indirectSpecularMomentsImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer indirect specular moments",
+    });
+    historyLengthImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_UINT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer history length",
+    });
+    directDiffuseResolvedMomentsImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer direct diffuse resolved moments",
+    });
+    directSpecularResolvedMomentsImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer direct specular resolved moments",
+    });
+    indirectDiffuseResolvedMomentsImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer indirect diffuse resolved moments",
+    });
+    indirectSpecularResolvedMomentsImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer indirect specular resolved moments",
+    });
+    historyLengthResolvedImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_UINT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer history length resolved",
+    });
+    momentDebugImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer moment debug",
+    });
+    momentDebugResolvedImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer moment debug resolved",
     });
     taaImage_.create(allocator_, ImageDesc{
         .width = displayExtent.width,
@@ -1350,7 +1446,9 @@ void PathTracerRenderer::updateCamera() {
         debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalReactiveMask) ||
         debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalHistoryWeight) ||
         (debugParams_.view >= static_cast<uint32_t>(RendererDebugView::PathDirectDiffuse) &&
-         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserEmissiveClamp));
+         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularHistoryWeight)) ||
+        (debugParams_.view >= static_cast<uint32_t>(RendererDebugView::DenoiserDirectDiffuseVariance) &&
+         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularRawVariance));
     const bool allowDenoiserForDebugView = denoiserDebugView;
     const bool stablePreview = shouldRunTaa();
     const bool allowDenoiserWhileMoving = settings_.denoiseWhileMoving || stablePreview || !cameraChangedThisFrame_;
@@ -1362,6 +1460,13 @@ void PathTracerRenderer::updateCamera() {
     denoiserParams_.atrousIterations = adaptiveEffectiveAtrousIterations_;
     denoiserParams_.debugView = denoiserDebugView ? debugParams_.view : 0u;
     denoiserParams_.resetHistory = (temporalCameraCut || !denoiserHistoryValid_) ? 1u : 0u;
+    if (denoiserParams_.resetHistory != 0u) {
+        denoiserFramesSinceReset_ = 0;
+    }
+    denoiserParams_.framesSinceReset = denoiserFramesSinceReset_;
+    if (denoiserParams_.enabled != 0u || denoiserParams_.debugView != 0u) {
+        ++denoiserFramesSinceReset_;
+    }
     frameUniforms.write(&denoiserParams_, sizeof(denoiserParams_), kFrameDenoiserParamsOffset);
     frameUniforms.flush(sizeof(denoiserParams_), kFrameDenoiserParamsOffset);
 
@@ -1444,6 +1549,7 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer) {
     recordHeightFog(commandBuffer);
 
     if (shouldRunDenoiser()) {
+        recordMomentUpdate(commandBuffer);
         recordDenoiser(commandBuffer);
         copyHistoryResources(commandBuffer);
     } else {
@@ -1853,6 +1959,12 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId previousWorldPosition = graph.createBuffer(bufferResource(previousWorldPositionBuffer_, "previous world position"));
     const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
     const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
+    const RenderGraphResourceId directDiffuseMoments = graph.createTexture(imageResource(directDiffuseMomentsImage_, "direct diffuse moments"));
+    const RenderGraphResourceId directSpecularMoments = graph.createTexture(imageResource(directSpecularMomentsImage_, "direct specular moments"));
+    const RenderGraphResourceId indirectDiffuseMoments = graph.createTexture(imageResource(indirectDiffuseMomentsImage_, "indirect diffuse moments"));
+    const RenderGraphResourceId indirectSpecularMoments = graph.createTexture(imageResource(indirectSpecularMomentsImage_, "indirect specular moments"));
+    const RenderGraphResourceId historyLength = graph.createTexture(imageResource(historyLengthImage_, "history length"));
+    const RenderGraphResourceId momentDebug = graph.createTexture(imageResource(momentDebugImage_, "moment debug"));
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
     const RenderGraphResourceId restirSpatialReservoir = graph.createBuffer(bufferResource(restirSpatialReservoirBuffer_, "restir spatial reservoir"));
@@ -2240,6 +2352,12 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
     const RenderGraphResourceId previousWorldPosition = graph.createBuffer(bufferResource(previousWorldPositionBuffer_, "previous world position"));
     const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
     const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
+    const RenderGraphResourceId directDiffuseMoments = graph.createTexture(imageResource(directDiffuseMomentsImage_, "direct diffuse moments"));
+    const RenderGraphResourceId directSpecularMoments = graph.createTexture(imageResource(directSpecularMomentsImage_, "direct specular moments"));
+    const RenderGraphResourceId indirectDiffuseMoments = graph.createTexture(imageResource(indirectDiffuseMomentsImage_, "indirect diffuse moments"));
+    const RenderGraphResourceId indirectSpecularMoments = graph.createTexture(imageResource(indirectSpecularMomentsImage_, "indirect specular moments"));
+    const RenderGraphResourceId historyLength = graph.createTexture(imageResource(historyLengthImage_, "history length"));
+    const RenderGraphResourceId momentDebug = graph.createTexture(imageResource(momentDebugImage_, "moment debug"));
     graph.resources()[raw.index].hasInitialAccess = true;
     graph.resources()[raw.index].initialAccess = ResourceAccess{
         .stage = pathTraceShaderStage(),
@@ -2307,12 +2425,32 @@ void PathTracerRenderer::recordDenoiser(VkCommandBuffer commandBuffer) {
         .stage = pathTraceShaderStage(),
         .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
     };
+    auto setMomentInitialAccess = [&](RenderGraphResourceId id, const Image& image) {
+        graph.resources()[id.index].hasInitialAccess = true;
+        graph.resources()[id.index].initialAccess = ResourceAccess{
+            .stage = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+            .layout = image.layout(),
+        };
+    };
+    setMomentInitialAccess(directDiffuseMoments, directDiffuseMomentsImage_);
+    setMomentInitialAccess(directSpecularMoments, directSpecularMomentsImage_);
+    setMomentInitialAccess(indirectDiffuseMoments, indirectDiffuseMomentsImage_);
+    setMomentInitialAccess(indirectSpecularMoments, indirectSpecularMomentsImage_);
+    setMomentInitialAccess(historyLength, historyLengthImage_);
+    setMomentInitialAccess(momentDebug, momentDebugImage_);
 
     graph.addPass("temporal_denoiser")
         .addStorageReadWrite(raw, PipelineDomain::Compute)
         .addStorageReadWrite(history, PipelineDomain::Compute)
         .addStorageReadWrite(diffuseHistory, PipelineDomain::Compute)
         .addStorageReadWrite(specularHistory, PipelineDomain::Compute)
+        .addStorageReadWrite(directDiffuseMoments, PipelineDomain::Compute)
+        .addStorageReadWrite(directSpecularMoments, PipelineDomain::Compute)
+        .addStorageReadWrite(indirectDiffuseMoments, PipelineDomain::Compute)
+        .addStorageReadWrite(indirectSpecularMoments, PipelineDomain::Compute)
+        .addStorageReadWrite(historyLength, PipelineDomain::Compute)
+        .addStorageReadWrite(momentDebug, PipelineDomain::Compute)
         .addStorageRead(variance, PipelineDomain::Compute)
         .addStorageRead(depthNormal, PipelineDomain::Compute)
         .addStorageRead(worldPosition, PipelineDomain::Compute)
@@ -2339,6 +2477,7 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
     specularResolvedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     diffuseHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     specularHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    momentDebugImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(denoiserSetLayout_);
     DescriptorWriter()
@@ -2357,6 +2496,12 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
         .writeImage(12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, specularHistoryImage_.storageDescriptor())
         .writeImage(13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, diffuseResolvedImage_.storageDescriptor())
         .writeImage(14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, specularResolvedImage_.storageDescriptor())
+        .writeImage(15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, directDiffuseMomentsImage_.storageDescriptor())
+        .writeImage(16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, directSpecularMomentsImage_.storageDescriptor())
+        .writeImage(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, indirectDiffuseMomentsImage_.storageDescriptor())
+        .writeImage(18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, indirectSpecularMomentsImage_.storageDescriptor())
+        .writeImage(19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, historyLengthImage_.storageDescriptor())
+        .writeImage(20, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, momentDebugImage_.storageDescriptor())
         .update(context_.device(), set);
 
     denoiserPipeline_->bind(commandBuffer);
@@ -2364,6 +2509,198 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, denoiserPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     denoiserPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordMomentUpdate(VkCommandBuffer commandBuffer) {
+    RenderGraph graph(&allocator_);
+    auto imageResource = [](const Image& image, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Texture,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .format = image.format(),
+            .extent = image.extent(),
+            .image = image.handle(),
+            .imageRange = image.fullRange(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+    auto bufferResource = [](const Buffer& buffer, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = buffer.size(),
+            .buffer = buffer.handle(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+
+    const RenderGraphResourceId prev_dd = graph.createTexture(imageResource(directDiffuseMomentsImage_, "prev direct diffuse moments"));
+    const RenderGraphResourceId prev_ds = graph.createTexture(imageResource(directSpecularMomentsImage_, "prev direct specular moments"));
+    const RenderGraphResourceId prev_id = graph.createTexture(imageResource(indirectDiffuseMomentsImage_, "prev indirect diffuse moments"));
+    const RenderGraphResourceId prev_is = graph.createTexture(imageResource(indirectSpecularMomentsImage_, "prev indirect specular moments"));
+    const RenderGraphResourceId prev_hl = graph.createTexture(imageResource(historyLengthImage_, "prev history length"));
+    const RenderGraphResourceId out_dd = graph.createTexture(imageResource(directDiffuseResolvedMomentsImage_, "out direct diffuse moments"));
+    const RenderGraphResourceId out_ds = graph.createTexture(imageResource(directSpecularResolvedMomentsImage_, "out direct specular moments"));
+    const RenderGraphResourceId out_id = graph.createTexture(imageResource(indirectDiffuseResolvedMomentsImage_, "out indirect diffuse moments"));
+    const RenderGraphResourceId out_is = graph.createTexture(imageResource(indirectSpecularResolvedMomentsImage_, "out indirect specular moments"));
+    const RenderGraphResourceId out_hl = graph.createTexture(imageResource(historyLengthResolvedImage_, "out history length"));
+    const RenderGraphResourceId out_md = graph.createTexture(imageResource(momentDebugResolvedImage_, "out moment debug"));
+    const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
+    const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "velocity"));
+    const RenderGraphResourceId prevWorldPos = graph.createBuffer(bufferResource(previousWorldPositionBuffer_, "prev world position"));
+    const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "depth normal"));
+    const RenderGraphResourceId worldPos = graph.createBuffer(bufferResource(worldPositionBuffer_, "world position"));
+
+    graph.resources()[prev_dd.index].hasInitialAccess = true;
+    graph.resources()[prev_dd.index].initialAccess = ResourceAccess{
+        .stage = directDiffuseMomentsImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = directDiffuseMomentsImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        .layout = directDiffuseMomentsImage_.layout(),
+    };
+    graph.resources()[prev_ds.index].hasInitialAccess = true;
+    graph.resources()[prev_ds.index].initialAccess = ResourceAccess{
+        .stage = directSpecularMomentsImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = directSpecularMomentsImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        .layout = directSpecularMomentsImage_.layout(),
+    };
+    graph.resources()[prev_id.index].hasInitialAccess = true;
+    graph.resources()[prev_id.index].initialAccess = ResourceAccess{
+        .stage = indirectDiffuseMomentsImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = indirectDiffuseMomentsImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        .layout = indirectDiffuseMomentsImage_.layout(),
+    };
+    graph.resources()[prev_is.index].hasInitialAccess = true;
+    graph.resources()[prev_is.index].initialAccess = ResourceAccess{
+        .stage = indirectSpecularMomentsImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = indirectSpecularMomentsImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        .layout = indirectSpecularMomentsImage_.layout(),
+    };
+    graph.resources()[prev_hl.index].hasInitialAccess = true;
+    graph.resources()[prev_hl.index].initialAccess = ResourceAccess{
+        .stage = historyLengthImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = historyLengthImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        .layout = historyLengthImage_.layout(),
+    };
+    auto setMomentOutputInitialAccess = [&](RenderGraphResourceId id, const Image& image) {
+        graph.resources()[id.index].hasInitialAccess = true;
+        graph.resources()[id.index].initialAccess = ResourceAccess{
+            .stage = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+            .layout = image.layout(),
+        };
+    };
+    setMomentOutputInitialAccess(out_dd, directDiffuseResolvedMomentsImage_);
+    setMomentOutputInitialAccess(out_ds, directSpecularResolvedMomentsImage_);
+    setMomentOutputInitialAccess(out_id, indirectDiffuseResolvedMomentsImage_);
+    setMomentOutputInitialAccess(out_is, indirectSpecularResolvedMomentsImage_);
+    setMomentOutputInitialAccess(out_hl, historyLengthResolvedImage_);
+    setMomentOutputInitialAccess(out_md, momentDebugResolvedImage_);
+    graph.resources()[pathData.index].hasInitialAccess = true;
+    graph.resources()[pathData.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[velocity.index].hasInitialAccess = true;
+    graph.resources()[velocity.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[prevWorldPos.index].hasInitialAccess = true;
+    graph.resources()[prevWorldPos.index].initialAccess = ResourceAccess{
+        .stage = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+    };
+    graph.resources()[depthNormal.index].hasInitialAccess = true;
+    graph.resources()[depthNormal.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[worldPos.index].hasInitialAccess = true;
+    graph.resources()[worldPos.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+
+    graph.addPass("moment_update")
+        .addStorageReadWrite(prev_dd, PipelineDomain::Compute)
+        .addStorageReadWrite(prev_ds, PipelineDomain::Compute)
+        .addStorageReadWrite(prev_id, PipelineDomain::Compute)
+        .addStorageReadWrite(prev_is, PipelineDomain::Compute)
+        .addStorageReadWrite(prev_hl, PipelineDomain::Compute)
+        .addStorageWrite(out_dd, PipelineDomain::Compute)
+        .addStorageWrite(out_ds, PipelineDomain::Compute)
+        .addStorageWrite(out_id, PipelineDomain::Compute)
+        .addStorageWrite(out_is, PipelineDomain::Compute)
+        .addStorageWrite(out_hl, PipelineDomain::Compute)
+        .addStorageWrite(out_md, PipelineDomain::Compute)
+        .addStorageRead(pathData, PipelineDomain::Compute)
+        .addStorageRead(velocity, PipelineDomain::Compute)
+        .addStorageRead(prevWorldPos, PipelineDomain::Compute)
+        .addStorageRead(depthNormal, PipelineDomain::Compute)
+        .addStorageRead(worldPos, PipelineDomain::Compute)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordMomentUpdatePass(cmd);
+        });
+    graph.compile();
+    graph.execute(commandBuffer, temporalFrameIndex_);
+}
+
+void PathTracerRenderer::recordMomentUpdatePass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("moment update");
+    currentProfiler_->write(commandBuffer, GpuProfiler::MomentUpdateStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+
+    directDiffuseMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    directSpecularMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    indirectDiffuseMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    indirectSpecularMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    historyLengthImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    directDiffuseResolvedMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    directSpecularResolvedMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    indirectDiffuseResolvedMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    indirectSpecularResolvedMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    historyLengthResolvedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    momentDebugResolvedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    momentParams_.resetHistory = denoiserParams_.resetHistory;
+    momentParams_.framesSinceReset = denoiserParams_.framesSinceReset;
+    momentParams_.width = renderExtent_.width;
+    momentParams_.height = renderExtent_.height;
+    momentParams_.maxHistoryLength = settings_.denoiserMaxHistoryLength;
+    momentParams_.validityThreshold = settings_.momentValidityThreshold;
+
+    auto& frameUniforms = currentFrame_->uniformRing();
+    frameUniforms.write(&momentParams_, sizeof(momentParams_), kFrameMomentParamsOffset);
+    frameUniforms.flush(sizeof(momentParams_), kFrameMomentParamsOffset);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(momentUpdateSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeImage(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, directDiffuseMomentsImage_.storageDescriptor())
+        .writeImage(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, directSpecularMomentsImage_.storageDescriptor())
+        .writeImage(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, indirectDiffuseMomentsImage_.storageDescriptor())
+        .writeImage(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, indirectSpecularMomentsImage_.storageDescriptor())
+        .writeImage(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, historyLengthImage_.storageDescriptor())
+        .writeImage(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, directDiffuseResolvedMomentsImage_.storageDescriptor())
+        .writeImage(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, directSpecularResolvedMomentsImage_.storageDescriptor())
+        .writeImage(8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, indirectDiffuseResolvedMomentsImage_.storageDescriptor())
+        .writeImage(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, indirectSpecularResolvedMomentsImage_.storageDescriptor())
+        .writeImage(10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, historyLengthResolvedImage_.storageDescriptor())
+        .writeBuffer(11, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameMomentParamsOffset, sizeof(MomentParams)))
+        .writeBuffer(12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
+        .writeBuffer(13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousWorldPositionBuffer_.descriptorInfo())
+        .writeBuffer(14, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFramePrevCameraUniformOffset, sizeof(PrevCameraUniform)))
+        .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, worldPositionBuffer_.descriptorInfo())
+        .writeImage(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, momentDebugResolvedImage_.storageDescriptor())
+        .update(context_.device(), set);
+
+    momentUpdatePipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, momentUpdatePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    momentUpdatePipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::MomentUpdateEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
@@ -2488,6 +2825,42 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
         },
         .debugName = "specular history hdr",
     });
+    auto momentCopyResource = [](const Image& image, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Texture,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .format = image.format(),
+            .extent = image.extent(),
+            .image = image.handle(),
+            .imageRange = image.fullRange(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = ResourceAccess{
+                .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_GENERAL,
+            },
+            .hasFinalAccess = true,
+            .finalAccess = ResourceAccess{
+                .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_GENERAL,
+            },
+            .debugName = name,
+        };
+    };
+    const RenderGraphResourceId directDiffuseResolvedMoments = graph.createTexture(momentCopyResource(directDiffuseResolvedMomentsImage_, "current direct diffuse moments"));
+    const RenderGraphResourceId directSpecularResolvedMoments = graph.createTexture(momentCopyResource(directSpecularResolvedMomentsImage_, "current direct specular moments"));
+    const RenderGraphResourceId indirectDiffuseResolvedMoments = graph.createTexture(momentCopyResource(indirectDiffuseResolvedMomentsImage_, "current indirect diffuse moments"));
+    const RenderGraphResourceId indirectSpecularResolvedMoments = graph.createTexture(momentCopyResource(indirectSpecularResolvedMomentsImage_, "current indirect specular moments"));
+    const RenderGraphResourceId historyLengthResolved = graph.createTexture(momentCopyResource(historyLengthResolvedImage_, "current history length"));
+    const RenderGraphResourceId momentDebugResolved = graph.createTexture(momentCopyResource(momentDebugResolvedImage_, "current moment debug"));
+    const RenderGraphResourceId directDiffuseMoments = graph.createTexture(momentCopyResource(directDiffuseMomentsImage_, "direct diffuse moments"));
+    const RenderGraphResourceId directSpecularMoments = graph.createTexture(momentCopyResource(directSpecularMomentsImage_, "direct specular moments"));
+    const RenderGraphResourceId indirectDiffuseMoments = graph.createTexture(momentCopyResource(indirectDiffuseMomentsImage_, "indirect diffuse moments"));
+    const RenderGraphResourceId indirectSpecularMoments = graph.createTexture(momentCopyResource(indirectSpecularMomentsImage_, "indirect specular moments"));
+    const RenderGraphResourceId historyLength = graph.createTexture(momentCopyResource(historyLengthImage_, "history length"));
+    const RenderGraphResourceId momentDebug = graph.createTexture(momentCopyResource(momentDebugImage_, "moment debug"));
     const RenderGraphResourceId worldPosition = graph.createBuffer(RenderGraphResource{
         .type = RenderGraphResource::Type::Buffer,
         .lifetime = RenderGraphResource::Lifetime::Persistent,
@@ -2578,6 +2951,18 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
         .addStorageWrite(diffuseHistory, PipelineDomain::Transfer)
         .addStorageRead(specularResolved, PipelineDomain::Transfer)
         .addStorageWrite(specularHistory, PipelineDomain::Transfer)
+        .addStorageRead(directDiffuseResolvedMoments, PipelineDomain::Transfer)
+        .addStorageWrite(directDiffuseMoments, PipelineDomain::Transfer)
+        .addStorageRead(directSpecularResolvedMoments, PipelineDomain::Transfer)
+        .addStorageWrite(directSpecularMoments, PipelineDomain::Transfer)
+        .addStorageRead(indirectDiffuseResolvedMoments, PipelineDomain::Transfer)
+        .addStorageWrite(indirectDiffuseMoments, PipelineDomain::Transfer)
+        .addStorageRead(indirectSpecularResolvedMoments, PipelineDomain::Transfer)
+        .addStorageWrite(indirectSpecularMoments, PipelineDomain::Transfer)
+        .addStorageRead(historyLengthResolved, PipelineDomain::Transfer)
+        .addStorageWrite(historyLength, PipelineDomain::Transfer)
+        .addStorageRead(momentDebugResolved, PipelineDomain::Transfer)
+        .addStorageWrite(momentDebug, PipelineDomain::Transfer)
         .addStorageRead(worldPosition, PipelineDomain::Transfer)
         .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
         .addStorageRead(restirReservoir, PipelineDomain::Transfer)
@@ -2596,6 +2981,18 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
     historyImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     diffuseHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     specularHistoryImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    directDiffuseMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    directSpecularMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    indirectDiffuseMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    indirectSpecularMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    historyLengthImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    momentDebugImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    directDiffuseResolvedMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    directSpecularResolvedMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    indirectDiffuseResolvedMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    indirectSpecularResolvedMomentsImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    historyLengthResolvedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    momentDebugResolvedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 }
 
 void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer) {
@@ -2645,6 +3042,24 @@ void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer)
         1,
         &specularCopy);
 
+    auto copyImage = [&](const Image& src, const Image& dst) {
+        src.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        dst.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy copy{};
+        copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.srcSubresource.layerCount = 1;
+        copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.dstSubresource.layerCount = 1;
+        copy.extent = src.extent();
+        vkCmdCopyImage(commandBuffer, src.handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    };
+    copyImage(directDiffuseResolvedMomentsImage_, directDiffuseMomentsImage_);
+    copyImage(directSpecularResolvedMomentsImage_, directSpecularMomentsImage_);
+    copyImage(indirectDiffuseResolvedMomentsImage_, indirectDiffuseMomentsImage_);
+    copyImage(indirectSpecularResolvedMomentsImage_, indirectSpecularMomentsImage_);
+    copyImage(historyLengthResolvedImage_, historyLengthImage_);
+    copyImage(momentDebugResolvedImage_, momentDebugImage_);
+
     VkBufferCopy copy{};
     copy.size = worldPositionBuffer_.size();
     vkCmdCopyBuffer(commandBuffer, worldPositionBuffer_.handle(), previousWorldPositionBuffer_.handle(), 1, &copy);
@@ -2683,10 +3098,40 @@ bool PathTracerRenderer::shouldRunDenoiser() const {
         return true;
     }
     if (denoiserParams_.debugView >= static_cast<uint32_t>(RendererDebugView::PathDirectDiffuse) &&
-        denoiserParams_.debugView <= static_cast<uint32_t>(RendererDebugView::DenoiserEmissiveClamp)) {
+        denoiserParams_.debugView <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularHistoryWeight)) {
+        return true;
+    }
+    if (denoiserParams_.debugView >= static_cast<uint32_t>(RendererDebugView::DenoiserDirectDiffuseVariance) &&
+        denoiserParams_.debugView <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularRawVariance)) {
         return true;
     }
     return false;
+}
+
+bool PathTracerRenderer::isNonDenoiserDebugView() const {
+    const uint32_t view = debugParams_.view;
+    if (view == 0u) {
+        return false;
+    }
+    if (view <= 4u) {
+        return false;
+    }
+    if (view == static_cast<uint32_t>(RendererDebugView::MotionVectors)) {
+        return false;
+    }
+    if (view == static_cast<uint32_t>(RendererDebugView::TemporalReactiveMask) ||
+        view == static_cast<uint32_t>(RendererDebugView::TemporalHistoryWeight)) {
+        return false;
+    }
+    if (view >= static_cast<uint32_t>(RendererDebugView::PathDirectDiffuse) &&
+        view <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularHistoryWeight)) {
+        return false;
+    }
+    if (view >= static_cast<uint32_t>(RendererDebugView::DenoiserDirectDiffuseVariance) &&
+        view <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularRawVariance)) {
+        return false;
+    }
+    return true;
 }
 
 bool PathTracerRenderer::shouldRunTaa() const {
@@ -3331,7 +3776,11 @@ void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
         temporalSystem_->markSlotWritten("previous_world_position");
         temporalSystem_->markSlotWritten("restir_reservoir");
     }
-    denoiserHistoryValid_ = false;
+    if (isNonDenoiserDebugView()) {
+        denoiserHistoryValid_ = true;
+    } else {
+        denoiserHistoryValid_ = false;
+    }
     currentProfiler_->write(commandBuffer, GpuProfiler::SkipDenoiserCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
@@ -3366,7 +3815,9 @@ VkDeviceSize PathTracerRenderer::estimatedTextureMemory() const {
         if (img.handle() == VK_NULL_HANDLE) return VkDeviceSize(0);
         uint32_t bpp = 4;
         switch (img.format()) {
+        case VK_FORMAT_R16G16_SFLOAT: bpp = 4; break;
         case VK_FORMAT_R16G16B16A16_SFLOAT: bpp = 8; break;
+        case VK_FORMAT_R16G16B16A16_UINT: bpp = 8; break;
         case VK_FORMAT_R32G32B32A32_SFLOAT: bpp = 16; break;
         default: break;
         }
@@ -3379,6 +3830,18 @@ VkDeviceSize PathTracerRenderer::estimatedTextureMemory() const {
     total += texSize(specularResolvedImage_);
     total += texSize(diffuseHistoryImage_);
     total += texSize(specularHistoryImage_);
+    total += texSize(directDiffuseMomentsImage_);
+    total += texSize(directSpecularMomentsImage_);
+    total += texSize(indirectDiffuseMomentsImage_);
+    total += texSize(indirectSpecularMomentsImage_);
+    total += texSize(historyLengthImage_);
+    total += texSize(directDiffuseResolvedMomentsImage_);
+    total += texSize(directSpecularResolvedMomentsImage_);
+    total += texSize(indirectDiffuseResolvedMomentsImage_);
+    total += texSize(indirectSpecularResolvedMomentsImage_);
+    total += texSize(historyLengthResolvedImage_);
+    total += texSize(momentDebugImage_);
+    total += texSize(momentDebugResolvedImage_);
     total += texSize(taaImage_);
     total += texSize(taaHistoryImage_);
     total += texSize(presentationImage_);

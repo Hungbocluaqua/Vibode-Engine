@@ -24,6 +24,7 @@ layout(set = 0, binding = 5, std140) uniform DenoiserParams {
     uint atrous_iterations;
     uint debug_view;
     uint reset_history;
+    uint frames_since_reset;
 } params;
 
 layout(set = 0, binding = 6, std430) readonly buffer WorldPosition { uvec2 world_position[]; };
@@ -41,6 +42,13 @@ layout(set = 0, binding = 11, rgba16f) readonly uniform image2D diffuse_history;
 layout(set = 0, binding = 12, rgba16f) readonly uniform image2D specular_history;
 layout(set = 0, binding = 13, rgba16f) writeonly uniform image2D output_diffuse_history;
 layout(set = 0, binding = 14, rgba16f) writeonly uniform image2D output_specular_history;
+
+layout(set = 0, binding = 15, rg16f) readonly uniform image2D direct_diffuse_moments;
+layout(set = 0, binding = 16, rg16f) readonly uniform image2D direct_specular_moments;
+layout(set = 0, binding = 17, rg16f) readonly uniform image2D indirect_diffuse_moments;
+layout(set = 0, binding = 18, rg16f) readonly uniform image2D indirect_specular_moments;
+layout(set = 0, binding = 19, rgba16ui) readonly uniform uimage2D history_length;
+layout(set = 0, binding = 20, rgba16f) readonly uniform image2D moment_debug;
 
 layout(set = 0, binding = 8, std140) uniform PrevCamera {
     mat4 view_proj;
@@ -91,12 +99,6 @@ vec2 unpack_unorm2x16(uint packedValue) {
 
 vec2 unpack_snorm2x16(uint packedValue) {
     return unpack_unorm2x16(packedValue) * 2.0 - vec2(1.0);
-}
-
-uint pack_snorm2x16(vec2 value) {
-    vec2 v = clamp(value, vec2(-1.0), vec2(1.0)) * 0.5 + vec2(0.5);
-    uvec2 packedValue = uvec2(round(v * 65535.0));
-    return (packedValue.y << 16u) | packedValue.x;
 }
 
 vec3 decode_octahedral_normal(uint packedValue) {
@@ -303,17 +305,19 @@ void main() {
     float diffuse_lum = luminance(path_data.direct_diffuse.rgb + path_data.indirect_diffuse.rgb);
     float specular_signal = clamp(specular_lum / max(specular_lum + diffuse_lum, 1.0e-4), 0.0, 1.0);
     float emissive_lum = max(path_data.direct_diffuse.a, 0.0);
-    float emissive_signal = smoothstep(0.08, 0.60, temporal_normalized_hit_distance(emissive_lum));
+    float emissive_log = log2(max(emissive_lum, 0.0) + 1.0) / 8.0;
+    float emissive_signal = smoothstep(0.10, 0.55, emissive_log);
     float distance_kernel_bias = center_roughness * smoothstep(0.12, 0.55, center_primary_hit_normalized);
 
     float center_lum = luminance(center_color);
     float var_factor = sqrt(max(center_var, 0.0));
     float inv_strength = 1.0 / max(params.strength, 0.001);
-    float sigma_color = (0.18 + var_factor * 1.8) * inv_strength;
+    float capped_var = min(var_factor, 0.7);
+    float sigma_color = (0.18 + capped_var * 1.2) * inv_strength;
     float sigma_depth = (0.12 + var_factor * 0.45) * inv_strength;
     float sigma_normal = 0.42 * inv_strength;
     float kernel_radius_signal = max(max(center_roughness, clamp(center_var / 4.0, 0.0, 1.0)), distance_kernel_bias);
-    int adaptive_kernel_radius = kernel_radius_signal > 0.5 ? 2 : 1;
+    float outer_ring_weight = smoothstep(0.3, 0.7, kernel_radius_signal);
     uint iterations = clamp(params.atrous_iterations, 1u, 5u);
 
     vec3 filtered_color = center_color;
@@ -338,9 +342,6 @@ void main() {
 
         for (int ky = -2; ky <= 2; ++ky) {
             for (int kx = -2; kx <= 2; ++kx) {
-                if (abs(kx) > adaptive_kernel_radius || abs(ky) > adaptive_kernel_radius) {
-                    continue;
-                }
                 ivec2 sample_coords = coords + ivec2(kx * step_width, ky * step_width);
                 if (sample_coords.x < 0 || sample_coords.x >= dims.x || sample_coords.y < 0 || sample_coords.y >= dims.y) {
                     continue;
@@ -371,6 +372,9 @@ void main() {
                 float sample_secondary_hit_normalized = temporal_normalized_hit_distance(sample_path_data.indirect_specular.a);
 
                 float kernel_w = atrous_kernel_weight(kx) * atrous_kernel_weight(ky);
+                if (abs(kx) == 2 || abs(ky) == 2) {
+                    kernel_w *= outer_ring_weight;
+                }
                 float color_diff = abs(sample_lum - center_lum);
                 float color_w = exp(-color_diff / (sigma_color * (1.0 + float(iter) * 0.35) + 0.001));
                 float depth_diff = abs(sample_depth - center_depth) / max(center_depth, 0.01);
@@ -471,8 +475,7 @@ void main() {
     bool reset_history = params.reset_history != 0u;
     vec3 diffuse_history_raw = reset_history ? vec3(0.0) : bilinear_diffuse_history_color(diffuse_history_sample_pos, dims);
     vec3 specular_history_raw = (!reset_history && specular_signal > 1.0e-4) ? bilinear_specular_history_color(specular_history_sample_pos, dims) : vec3(0.0);
-    vec3 legacy_history_raw = reset_history ? bilinear_history_color(history_sample_pos, dims) : vec3(0.0);
-    vec3 history_raw = reset_history ? legacy_history_raw : diffuse_history_raw + specular_history_raw;
+    vec3 history_raw = reset_history ? vec3(0.0) : diffuse_history_raw + specular_history_raw;
     vec3 reprojected_wp = bilinear_prev_world(history_sample_pos, dims);
     float pos_diff = length(validation_wp - reprojected_wp);
     float validation_depth = mix(center_depth, length(validation_wp - prev_camera.current_pos.xyz), virtual_motion_confidence);
@@ -497,14 +500,19 @@ void main() {
             validation_hit_normalized,
             history_primary_hit_normalized,
             mix(0.035, 0.085, validation_hit_normalized));
-    hit_distance_confidence *= 1.0 - smoothstep(0.10, 0.26, max_hit_distance_delta);
-    float diffuse_channel_confidence = base_disocclusion_confidence *
+    hit_distance_confidence *= 1.0 - smoothstep(0.20, 0.55, max_hit_distance_delta);
+    float hit_confidence = 1.0 - smoothstep(0.35, 0.85, max_hit_distance_delta);
+    float diffuse_channel_confidence =
         (diffuse_on_screen ? 1.0 : 0.0) *
-        (1.0 - smoothstep(0.18, 0.36, max_hit_distance_delta));
+        base_disocclusion_confidence *
+        mix(0.35, 1.0, hit_confidence);
     float specular_channel_confidence = base_disocclusion_confidence *
         (specular_on_screen ? 1.0 : 0.0) *
         hit_distance_confidence *
-        (1.0 - smoothstep(0.78, 0.98, center_roughness));
+        (1.0 - smoothstep(0.55, 0.92, center_roughness));
+    float mirror_strength = 1.0 - smoothstep(0.05, 0.25, center_roughness);
+    float mirror_floor = mix(0.15, 0.45, center_roughness);
+    specular_channel_confidence = max(specular_channel_confidence, mirror_floor);
     float disocclusion_confidence = mix(diffuse_channel_confidence, specular_channel_confidence, specular_signal);
 
     float history_lum_before_clip = luminance(history_raw);
@@ -517,7 +525,9 @@ void main() {
         specular_history_raw,
         min_color * specular_signal,
         max_color * specular_signal,
-        lum_sigma * max(specular_signal, 0.1) * 0.65);
+        lum_sigma * max(specular_signal, 0.1) * 0.80);
+    vec3 specular_firefly_clamp = specular_history * 8.0 + 4.0;
+    current_specular = min(current_specular, specular_firefly_clamp);
     vec3 history = diffuse_history + specular_history;
     float history_lum_after_clip = luminance(history);
     float lum_delta = abs(history_lum_before_clip - center_lum) / (max(center_lum, history_lum_before_clip) + 0.02);
@@ -525,26 +535,51 @@ void main() {
     float neighborhood_lum_delta = abs(history_lum_before_clip - lum_mean) / (lum_mean + lum_sigma + 0.02);
     float reactive_mask = temporal_reactive_weight(lum_delta, clipped_lum_delta, neighborhood_lum_delta);
 
-    float confidence = temporal_variance_confidence(center_var, 10.0);
-    float diffuse_confidence = temporal_variance_confidence(center_var, 6.0);
-    float specular_confidence = temporal_variance_confidence(center_var, 16.0);
+    vec2 m_dd = imageLoad(direct_diffuse_moments, coords).rg;
+    vec2 m_ds = imageLoad(direct_specular_moments, coords).rg;
+    vec2 m_id = imageLoad(indirect_diffuse_moments, coords).rg;
+    vec2 m_is = imageLoad(indirect_specular_moments, coords).rg;
+    uvec4 hl = imageLoad(history_length, coords);
+    uint n_is = hl.a & 0x7FFFu;
+    bool moment_valid = (hl.a & 0x8000u) != 0u;
+
+    float diffuse_mean_lum = m_dd.x * path_data.direct_diffuse.a + m_id.x * path_data.indirect_diffuse.a;
+    float specular_mean_lum = m_ds.x * path_data.direct_specular.a + m_is.x * path_data.indirect_specular.a;
+    float diffuse_var = m_dd.y + m_id.y;
+    float specular_var = m_ds.y + m_is.y;
+
+    float diffuse_cv = sqrt(max(diffuse_var, 0.0)) / (max(diffuse_mean_lum, 0.01));
+    float specular_cv = sqrt(max(specular_var, 0.0)) / (max(specular_mean_lum, 0.01));
+    float diffuse_confidence = exp(-diffuse_cv * 4.0);
+    float specular_confidence = exp(-specular_cv * 6.0);
+    float confidence = exp(-sqrt(max(center_var, 0.0)) * 4.0);
+
     float diffuse_motion_confidence = temporal_motion_confidence(velocity_pixels, 30.0, 0.45);
     float specular_motion_confidence = temporal_motion_confidence(virtual_velocity_pixels, 16.0, 0.18);
     float motion_confidence = mix(diffuse_motion_confidence, specular_motion_confidence, specular_signal);
     float specular_rejection = 1.0 - reactive_mask * mix(0.65, 0.95, confidence);
-    float frame_blend = params.reset_history != 0u ? 0.0 : clamp(float(params.frame_count - 1u) / 30.0, 0.0, 1.0);
+
+    float diffuse_hl = float(hl.x + hl.z) * 0.5;
+    float specular_hl = float(hl.y + n_is) * 0.5;
+    float diffuse_frame_blend = params.reset_history != 0u ? 0.0 : clamp(diffuse_hl / 30.0, 0.0, 1.0);
+    float specular_frame_blend = params.reset_history != 0u ? 0.0 : clamp(specular_hl / 30.0, 0.0, 1.0);
+
     float diffuse_history_weight = temporal_history_weight(
         diffuse_confidence,
         diffuse_channel_confidence,
         diffuse_motion_confidence,
         reactive_mask * 0.45,
-        frame_blend);
+        diffuse_frame_blend);
     float specular_history_weight = temporal_history_weight(
         specular_confidence,
         specular_channel_confidence,
         specular_motion_confidence,
         reactive_mask,
-        frame_blend);
+        specular_frame_blend);
+    specular_history_weight = mix(
+        specular_history_weight,
+        max(specular_history_weight, 0.35),
+        mirror_strength);
     float history_weight = mix(diffuse_history_weight, specular_history_weight, specular_signal);
     float denoiser_rejection = 1.0 - clamp(disocclusion_confidence * motion_confidence * specular_rejection, 0.0, 1.0);
     vec3 resolved_diffuse = mix(current_diffuse, diffuse_history, diffuse_history_weight);
@@ -552,7 +587,7 @@ void main() {
     vec3 resolved_color = resolved_diffuse + resolved_specular;
     float emissive_history_confidence = diffuse_channel_confidence *
         diffuse_motion_confidence *
-        frame_blend *
+        diffuse_frame_blend *
         (1.0 - reactive_mask);
     float emissive_spike = smoothstep(lum_mean + lum_sigma * 1.5 + 0.15, lum_mean + lum_sigma * 5.0 + 0.5, center_lum);
     float emissive_clamp_amount = emissive_signal * emissive_spike * emissive_history_confidence;
@@ -564,13 +599,15 @@ void main() {
     resolved_diffuse = mix(resolved_diffuse, resolved_color * diffuse_signal, emissive_clamp_amount);
     resolved_specular = resolved_color - resolved_diffuse;
 
+    float reprojection_confidence = base_disocclusion_confidence;
+
     vec3 debug_color = filtered_color;
     if (params.debug_view == 1u) {
         debug_color = vec3(center_var / 4.0);
     } else if (params.debug_view == 2u) {
         debug_color = center_normal * 0.5 + 0.5;
     } else if (params.debug_view == 3u) {
-        debug_color = vec3(disocclusion_confidence);
+        debug_color = vec3(1.0 - reprojection_confidence, reprojection_confidence, 0.0);
     } else if (params.debug_view == 4u) {
         debug_color = vec3(denoiser_rejection, 1.0 - denoiser_rejection, 0.0);
     } else if (params.debug_view == 28u) {
@@ -596,7 +633,7 @@ void main() {
             center_primary_hit_normalized,
             center_secondary_hit_normalized);
     } else if (params.debug_view == 53u) {
-        debug_color = vec3(float(adaptive_kernel_radius) / 2.0);
+        debug_color = vec3(outer_ring_weight);
     } else if (params.debug_view == 54u) {
         debug_color = vec3(
             center_primary_hit_normalized,
@@ -622,6 +659,56 @@ void main() {
             emissive_signal,
             emissive_history_confidence,
             emissive_clamp_amount);
+    } else if (params.debug_view == 59u) {
+        debug_color = vec3(diffuse_confidence);
+    } else if (params.debug_view == 60u) {
+        debug_color = vec3(diffuse_channel_confidence);
+    } else if (params.debug_view == 61u) {
+        debug_color = vec3(diffuse_frame_blend);
+    } else if (params.debug_view == 62u) {
+        debug_color = vec3(max_hit_distance_delta);
+    } else if (params.debug_view == 63u) {
+        debug_color = vec3(diffuse_on_screen ? 1.0 : 0.0);
+    } else if (params.debug_view == 64u) {
+        debug_color = vec3(base_disocclusion_confidence);
+    } else if (params.debug_view == 65u) {
+        debug_color = vec3(specular_channel_confidence);
+    } else if (params.debug_view == 66u) {
+        debug_color = vec3(specular_history_weight);
+    } else if (params.debug_view == 74u) {
+        debug_color = vec3(m_dd.y / (m_dd.x * m_dd.x + 0.01));
+    } else if (params.debug_view == 75u) {
+        debug_color = vec3(m_ds.y / (m_ds.x * m_ds.x + 0.01));
+    } else if (params.debug_view == 76u) {
+        debug_color = vec3(m_id.y / (m_id.x * m_id.x + 0.01));
+    } else if (params.debug_view == 77u) {
+        debug_color = vec3(m_is.y / (m_is.x * m_is.x + 0.01));
+    } else if (params.debug_view == 78u) {
+        debug_color = vec3(diffuse_hl / 64.0);
+    } else if (params.debug_view == 79u) {
+        debug_color = vec3(specular_hl / 64.0);
+    } else if (params.debug_view == 80u) {
+        debug_color = vec3(moment_valid ? 1.0 : 0.0);
+    } else if (params.debug_view == 81u) {
+        vec4 md = imageLoad(moment_debug, coords);
+        debug_color = vec3(md.r);
+    } else if (params.debug_view == 82u) {
+        vec4 md = imageLoad(moment_debug, coords);
+        debug_color = vec3(md.g);
+    } else if (params.debug_view == 83u) {
+        vec4 md = imageLoad(moment_debug, coords);
+        debug_color = vec3(md.b);
+    } else if (params.debug_view == 84u) {
+        vec4 md = imageLoad(moment_debug, coords);
+        debug_color = vec3(md.a);
+    } else if (params.debug_view == 85u) {
+        debug_color = vec3(diffuse_history_weight);
+    } else if (params.debug_view == 86u) {
+        debug_color = vec3(specular_history_weight);
+    } else if (params.debug_view == 87u) {
+        debug_color = vec3(diffuse_var);
+    } else if (params.debug_view == 88u) {
+        debug_color = vec3(specular_var);
     }
 
     vec3 denoised = params.debug_view == 0u ? resolved_color : debug_color;

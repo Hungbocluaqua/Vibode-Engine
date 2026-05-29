@@ -54,6 +54,7 @@ float timingForPassName(const GpuFrameTimings& timings, const std::string& name)
     if (name.find("fog") == 0) return timings.fogIntegrateMs;
     if (name.find("atmosphere") == 0) return timings.atmosphereMs;
     if (name.find("temporal_denoiser") == 0) return timings.denoiserMs;
+    if (name.find("moment_update") == 0) return timings.momentUpdateMs;
     if (name.find("skip_denoiser_copy") == 0) return timings.skipDenoiserCopyMs;
     if (name.find("history_copy") == 0) return timings.historyCopyMs;
     if (name.find("taa_history_copy") == 0) return timings.taaHistoryCopyMs;

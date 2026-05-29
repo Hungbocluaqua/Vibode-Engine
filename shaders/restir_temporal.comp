@@ -20,8 +20,15 @@ layout(set = 0, binding = 3, std430) readonly buffer VelocityBuffer { uint veloc
 layout(set = 0, binding = 4, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
 
 vec2 restir_unpack_velocity_pixels(uint packedVelocity) {
-    vec2 uv = vec2(float(packedVelocity & 0xffffu), float((packedVelocity >> 16u) & 0xffffu)) / 65535.0;
-    return (uv * 2.0 - vec2(1.0)) * 64.0;
+    int x = int(packedVelocity & 0xffffu);
+    int y = int((packedVelocity >> 16u) & 0xffffu);
+    if (x >= 32768) {
+        x -= 65536;
+    }
+    if (y >= 32768) {
+        y -= 65536;
+    }
+    return vec2(float(x), float(y)) * (64.0 / 32767.0);
 }
 
 vec2 restir_unpack_snorm2x16(uint packedValue) {

@@ -80,6 +80,7 @@ struct ProfileReport {
         float atmosphereSkyCdf = 0.0f;
         float atmosphereAerialPerspective = 0.0f;
         float denoiser = 0.0f;
+        float momentUpdate = 0.0f;
         float historyCopy = 0.0f;
         float skipDenoiserCopy = 0.0f;
         float taa = 0.0f;

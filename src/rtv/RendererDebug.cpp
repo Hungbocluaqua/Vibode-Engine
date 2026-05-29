@@ -85,9 +85,17 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "denoiserkernelradius" || key == "kernelradius" || key == "filterradius") { return RendererDebugView::DenoiserKernelRadius; }
     if (key == "denoiserhitdistance" || key == "hitdistance" || key == "hitdistancefilter" || key == "hitdistancerejection") { return RendererDebugView::DenoiserHitDistance; }
     if (key == "denoiservirtualmotion" || key == "virtualmotion" || key == "specularvirtualmotion" || key == "specularvelocity") { return RendererDebugView::DenoiserVirtualMotion; }
-    if (key == "denoiserdiffusehistory" || key == "diffusehistory" || key == "diffusehistoryconfidence") { return RendererDebugView::DenoiserDiffuseHistory; }
-    if (key == "denoiserspecularhistory" || key == "specularhistory" || key == "specularhistoryconfidence") { return RendererDebugView::DenoiserSpecularHistory; }
+    if (key == "denoiserdiffusehistory" || key == "diffusehistory" || key == "diffusehistoryconfidence" || key == "denoiserdiffusedebug" || key == "diffusedebug") { return RendererDebugView::DenoiserDiffuseDebug; }
+    if (key == "denoiserspecularhistory" || key == "specularhistory" || key == "specularhistoryconfidence" || key == "denoiserspeculardebug" || key == "speculardebug") { return RendererDebugView::DenoiserSpecularDebug; }
     if (key == "denoiseremissiveclamp" || key == "emissiveclamp" || key == "emissiveantiflicker") { return RendererDebugView::DenoiserEmissiveClamp; }
+    if (key == "denoiservarianceconfidence" || key == "varianceconfidence") { return RendererDebugView::DenoiserVarianceConfidence; }
+    if (key == "denoiserdiffusechannelconfidence" || key == "diffusechannelconfidence" || key == "channelconfidence") { return RendererDebugView::DenoiserDiffuseChannelConfidence; }
+    if (key == "denoiserframeblend" || key == "frameblend") { return RendererDebugView::DenoiserFrameBlend; }
+    if (key == "denoisermaxhitdistancedelta" || key == "maxhitdistancedelta" || key == "hitdistancedelta") { return RendererDebugView::DenoiserMaxHitDistanceDelta; }
+    if (key == "denoiserdiffuseonscreen" || key == "diffuseonscreen") { return RendererDebugView::DenoiserDiffuseOnScreen; }
+    if (key == "denoiserbasedisocclusion" || key == "basedisocclusion") { return RendererDebugView::DenoiserBaseDisocclusion; }
+    if (key == "denoiserspecularchannelconfidence" || key == "specularchannelconfidence" || key == "specularconfidence") { return RendererDebugView::DenoiserSpecularChannelConfidence; }
+    if (key == "denoiserspecularhistoryweight" || key == "specularhistoryweight") { return RendererDebugView::DenoiserSpecularHistoryWeight; }
     if (key == "directsample" || key == "directsampletype" || key == "sampletype") { return RendererDebugView::DirectSampleType; }
     if (key == "albedo" || key == "basecolor" || key == "basecolour") { return RendererDebugView::Albedo; }
     if (key == "clay" || key == "claymaterial" || key == "balancedclay" || key == "balancedclaymaterial" ||
@@ -158,6 +166,45 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "restirgifinal" || key == "gifinal" || key == "restirgicontribution") {
         return RendererDebugView::RestirGiFinal;
     }
+    if (key == "denoiserdirectdiffusevariance" || key == "directdiffusevariance" || key == "ddvariance") {
+        return RendererDebugView::DenoiserDirectDiffuseVariance;
+    }
+    if (key == "denoiserdirectspecularvariance" || key == "directspecularvariance" || key == "dsvariance") {
+        return RendererDebugView::DenoiserDirectSpecularVariance;
+    }
+    if (key == "denoiserindirectdiffusevariance" || key == "indirectdiffusevariance" || key == "idvariance") {
+        return RendererDebugView::DenoiserIndirectDiffuseVariance;
+    }
+    if (key == "denoiserindirectspecularvariance" || key == "indirectspecularvariance" || key == "isvariance") {
+        return RendererDebugView::DenoiserIndirectSpecularVariance;
+    }
+    if (key == "denoiserdiffusehistorylength" || key == "diffusehistorylength") {
+        return RendererDebugView::DenoiserDiffuseHistoryLength;
+    }
+    if (key == "denoiserspecularhistorylength" || key == "specularhistorylength") {
+        return RendererDebugView::DenoiserSpecularHistoryLength;
+    }
+    if (key == "momentupdatevalidity" || key == "validity") {
+        return RendererDebugView::MomentUpdateValidity;
+    }
+    if (key == "momentdisocclusionconfidence" || key == "disocclusionconfidence") {
+        return RendererDebugView::MomentDisocclusionConfidence;
+    }
+    if (key == "momentnormalcone" || key == "normalcone") {
+        return RendererDebugView::MomentNormalCone;
+    }
+    if (key == "momentdepthdelta" || key == "depthdelta") {
+        return RendererDebugView::MomentDepthDelta;
+    }
+    if (key == "momenthistorykindvalid" || key == "historykindvalid") {
+        return RendererDebugView::MomentHistoryKindValid;
+    }
+    if (key == "denoiserdiffuserawvariance" || key == "diffuserawvariance") {
+        return RendererDebugView::DenoiserDiffuseRawVariance;
+    }
+    if (key == "denoiserspecularrawvariance" || key == "specularrawvariance") {
+        return RendererDebugView::DenoiserSpecularRawVariance;
+    }
     return RendererDebugView::Beauty;
 }
 
@@ -219,9 +266,17 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::DenoiserKernelRadius: return "denoiser-kernel-radius";
     case RendererDebugView::DenoiserHitDistance: return "denoiser-hit-distance";
     case RendererDebugView::DenoiserVirtualMotion: return "denoiser-virtual-motion";
-    case RendererDebugView::DenoiserDiffuseHistory: return "denoiser-diffuse-history";
-    case RendererDebugView::DenoiserSpecularHistory: return "denoiser-specular-history";
+    case RendererDebugView::DenoiserDiffuseDebug: return "denoiser-diffuse-debug";
+    case RendererDebugView::DenoiserSpecularDebug: return "denoiser-specular-debug";
     case RendererDebugView::DenoiserEmissiveClamp: return "denoiser-emissive-clamp";
+    case RendererDebugView::DenoiserVarianceConfidence: return "denoiser-variance-confidence";
+    case RendererDebugView::DenoiserDiffuseChannelConfidence: return "denoiser-diffuse-channel-confidence";
+    case RendererDebugView::DenoiserFrameBlend: return "denoiser-frame-blend";
+    case RendererDebugView::DenoiserMaxHitDistanceDelta: return "denoiser-max-hit-distance-delta";
+    case RendererDebugView::DenoiserDiffuseOnScreen: return "denoiser-diffuse-on-screen";
+    case RendererDebugView::DenoiserBaseDisocclusion: return "denoiser-base-disocclusion";
+    case RendererDebugView::DenoiserSpecularChannelConfidence: return "denoiser-specular-channel-confidence";
+    case RendererDebugView::DenoiserSpecularHistoryWeight: return "denoiser-specular-history-weight";
     case RendererDebugView::RestirPairwiseMis: return "restir-pairwise-mis";
     case RendererDebugView::RestirGiValidity: return "restir-gi-validity";
     case RendererDebugView::RestirGiAge: return "restir-gi-age";
@@ -229,6 +284,19 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirGiTemporal: return "restir-gi-temporal";
     case RendererDebugView::RestirGiSpatial: return "restir-gi-spatial";
     case RendererDebugView::RestirGiFinal: return "restir-gi-final";
+    case RendererDebugView::DenoiserDirectDiffuseVariance: return "denoiser-direct-diffuse-variance";
+    case RendererDebugView::DenoiserDirectSpecularVariance: return "denoiser-direct-specular-variance";
+    case RendererDebugView::DenoiserIndirectDiffuseVariance: return "denoiser-indirect-diffuse-variance";
+    case RendererDebugView::DenoiserIndirectSpecularVariance: return "denoiser-indirect-specular-variance";
+    case RendererDebugView::DenoiserDiffuseHistoryLength: return "denoiser-diffuse-history-length";
+    case RendererDebugView::DenoiserSpecularHistoryLength: return "denoiser-specular-history-length";
+    case RendererDebugView::MomentUpdateValidity: return "moment-update-validity";
+    case RendererDebugView::MomentDisocclusionConfidence: return "moment-disocclusion-confidence";
+    case RendererDebugView::MomentNormalCone: return "moment-normal-cone";
+    case RendererDebugView::MomentDepthDelta: return "moment-depth-delta";
+    case RendererDebugView::MomentHistoryKindValid: return "moment-history-kind-valid";
+    case RendererDebugView::DenoiserDiffuseRawVariance: return "denoiser-diffuse-raw-variance";
+    case RendererDebugView::DenoiserSpecularRawVariance: return "denoiser-specular-raw-variance";
     }
     return "beauty";
 }

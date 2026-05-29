@@ -26,6 +26,7 @@ struct GpuFrameTimings {
     float atmosphereSkyCdfMs = 0.0f;
     float atmosphereAerialPerspectiveMs = 0.0f;
     float denoiserMs = 0.0f;
+    float momentUpdateMs = 0.0f;
     float historyCopyMs = 0.0f;
     float skipDenoiserCopyMs = 0.0f;
     float taaMs = 0.0f;
@@ -50,6 +51,7 @@ struct GpuFrameTimings {
             fogIntegrateMs +
             atmosphereMs +
             denoiserMs +
+            momentUpdateMs +
             historyCopyMs +
             skipDenoiserCopyMs +
             taaMs +
@@ -126,7 +128,9 @@ public:
         FullscreenEnd = 51,
         EditorPresentationStart = 52,
         EditorPresentationEnd = 53,
-        Count = 54,
+        MomentUpdateStart = 54,
+        MomentUpdateEnd = 55,
+        Count = 56,
     };
 
     GpuProfiler() = default;

@@ -136,6 +136,19 @@ private:
         uint32_t atrousIterations = 4;
         uint32_t debugView = 0;
         uint32_t resetHistory = 1;
+        uint32_t framesSinceReset = 0;
+    };
+
+    struct MomentParams {
+        uint32_t resetHistory = 1;
+        uint32_t framesSinceReset = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t maxHistoryLength = 64;
+        float adaptiveAlphaFloor = 0.02f;
+        float adaptiveAlphaCeiling = 0.50f;
+        float varianceScale = 4.0f;
+        float validityThreshold = 0.25f;
     };
 
     struct PrevCameraUniform {
@@ -268,6 +281,8 @@ private:
     void recordHeightFogPass(VkCommandBuffer commandBuffer);
     void recordDenoiser(VkCommandBuffer commandBuffer);
     void recordDenoiserPass(VkCommandBuffer commandBuffer);
+    void recordMomentUpdate(VkCommandBuffer commandBuffer);
+    void recordMomentUpdatePass(VkCommandBuffer commandBuffer);
     void recordTaa(VkCommandBuffer commandBuffer);
     void recordTaaPass(VkCommandBuffer commandBuffer);
     void recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer);
@@ -283,6 +298,7 @@ private:
     void copyHistoryResources(VkCommandBuffer commandBuffer);
     void copyHistoryResourcesPass(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool shouldRunDenoiser() const;
+    [[nodiscard]] bool isNonDenoiserDebugView() const;
     [[nodiscard]] bool shouldRunTaa() const;
     [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
@@ -320,6 +336,7 @@ private:
     std::optional<std::filesystem::path> dumpRenderGraphPath_;
     std::optional<std::filesystem::path> dumpRenderGraphDotPath_;
     DenoiserParams denoiserParams_{};
+    MomentParams momentParams_{};
     TaaParams taaParams_{};
     RestirSpatialParams restirSpatialParams_{};
     FogParams fogParams_{};
@@ -329,6 +346,7 @@ private:
     glm::vec4 previousCameraPos_{};
     glm::vec2 previousJitter_{0.0f};
     bool denoiserHistoryValid_ = false;
+    uint32_t denoiserFramesSinceReset_ = 0;
     bool taaHistoryValid_ = false;
     bool restirGiHistoryValid_ = false;
 
@@ -339,6 +357,18 @@ private:
     Image specularResolvedImage_;
     Image diffuseHistoryImage_;
     Image specularHistoryImage_;
+    Image directDiffuseMomentsImage_;
+    Image directSpecularMomentsImage_;
+    Image indirectDiffuseMomentsImage_;
+    Image indirectSpecularMomentsImage_;
+    Image historyLengthImage_;
+    Image directDiffuseResolvedMomentsImage_;
+    Image directSpecularResolvedMomentsImage_;
+    Image indirectDiffuseResolvedMomentsImage_;
+    Image indirectSpecularResolvedMomentsImage_;
+    Image historyLengthResolvedImage_;
+    Image momentDebugImage_;
+    Image momentDebugResolvedImage_;
     Image taaImage_;
     Image taaHistoryImage_;
     Image presentationImage_;
@@ -369,6 +399,7 @@ private:
     std::unique_ptr<PipelineCache> pipelineCache_;
     std::unique_ptr<AtmosphereLutSystem> atmosphereLutSystem_;
     std::unique_ptr<ShaderModule> denoiserShader_;
+    std::unique_ptr<ShaderModule> momentUpdateShader_;
     std::unique_ptr<ShaderModule> taaShader_;
     std::unique_ptr<ShaderModule> restirSpatialShader_;
     std::unique_ptr<ShaderModule> restirGiSpatialShader_;
@@ -393,6 +424,7 @@ private:
     std::unique_ptr<ShaderModule> primaryAnyHitShader_;
     std::unique_ptr<ShaderModule> shadowAnyHitShader_;
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
+    std::unique_ptr<ComputePipeline> momentUpdatePipeline_;
     std::unique_ptr<ComputePipeline> taaPipeline_;
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirGiSpatialPipeline_;
@@ -410,6 +442,7 @@ private:
     VkDescriptorSetLayout atmosphereSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout rayTracingSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout momentUpdateSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirGiSpatialSetLayout_ = VK_NULL_HANDLE;
