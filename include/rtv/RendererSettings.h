@@ -63,6 +63,7 @@ struct RendererSettings {
     float environmentBackgroundIntensity = 0.35f;
     float renderResolutionScale = 1.0f;
     float materialTextureAnisotropy = 8.0f;
+    bool specularAaEnabled = true;
     uint32_t accumulationLimit = 0;
     RendererDebugView debugView = RendererDebugView::Beauty;
     float debugScale = 1.0f;

@@ -407,6 +407,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"accumulationLimit", renderSettings_.accumulationLimit},
         {"resolutionScale", renderSettings_.resolutionScale},
         {"materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy},
+        {"specularAaEnabled", renderSettings_.specularAaEnabled},
         {"shadowRayBias", renderSettings_.shadowRayBias},
         {"shadowDistanceBias", renderSettings_.shadowDistanceBias},
         {"fireflyClamp", renderSettings_.fireflyClamp},
@@ -577,6 +578,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.accumulationLimit = render.value("accumulationLimit", renderSettings_.accumulationLimit);
         renderSettings_.resolutionScale = render.value("resolutionScale", renderSettings_.resolutionScale);
         renderSettings_.materialTextureAnisotropy = render.value("materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy);
+        renderSettings_.specularAaEnabled = render.value("specularAaEnabled", renderSettings_.specularAaEnabled);
         renderSettings_.shadowRayBias = render.value("shadowRayBias", renderSettings_.shadowRayBias);
         renderSettings_.shadowDistanceBias = render.value("shadowDistanceBias", renderSettings_.shadowDistanceBias);
         renderSettings_.fireflyClamp = render.value("fireflyClamp", renderSettings_.fireflyClamp);

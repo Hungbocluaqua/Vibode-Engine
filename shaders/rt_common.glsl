@@ -223,6 +223,10 @@ struct Material {
     vec3 conductor_k;
     float anisotropy_strength;
     float anisotropy_rotation;
+    int occlusion_texture;
+    float occlusion_strength;
+    float occlusion;
+    float normal_variance;
 };
 
 const uint MATERIAL_CLOSURE_FLAG_DIFFUSE       = 1u << 0u;
@@ -612,6 +616,10 @@ Material decode_material(uint mat_idx) {
     m.conductor_k = d6.xyz;
     m.anisotropy_strength = d7.x;
     m.anisotropy_rotation = d7.y;
+    m.occlusion_texture = int(round(d7.z));
+    m.occlusion_strength = clamp(d7.w, 0.0, 1.0);
+    m.occlusion = 1.0;
+    m.normal_variance = 0.0;
     return m;
 }
 
@@ -652,6 +660,11 @@ void apply_material_textures(inout Material material, vec2 uv) {
             : emissive.rgb;
         material.emissive *= emissiveColor;
     }
+    if (material.occlusion_texture >= 0 && material.occlusion_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.occlusion_texture;
+        float ao = texture(material_textures[nonuniformEXT(textureIndex)], uv).r;
+        material.occlusion = mix(1.0, clamp(ao, 0.0, 1.0), material.occlusion_strength);
+    }
 }
 
 void apply_material_alpha_texture(inout Material material, vec2 uv) {
@@ -673,16 +686,31 @@ bool accept_material_alpha(Material material, uint stableSeed) {
     return true;
 }
 
-vec3 apply_normal_texture(Material material, vec2 uv, vec3 normal, vec3 tangent, vec3 bitangent, vec3 rayDirection) {
+vec3 apply_normal_texture(inout Material material, vec2 uv, vec3 normal, vec3 tangent, vec3 bitangent, vec3 rayDirection) {
     if (material.normal_texture < 0 || material.normal_texture >= MATERIAL_TEXTURE_LIMIT) {
         return normal;
     }
     int textureIndex = material.normal_texture;
     vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], uv).xyz * 2.0 - 1.0;
+    material.normal_variance = clamp(dot(tangentSample.xy, tangentSample.xy), 0.0, 1.0);
     vec3 t = normalize(tangent - normal * dot(normal, tangent));
     vec3 b = normalize(bitangent - normal * dot(normal, bitangent));
     vec3 mapped = normalize(t * tangentSample.x + b * tangentSample.y + normal * max(tangentSample.z, 0.0));
     return dot(mapped, rayDirection) > 0.0 ? -mapped : mapped;
+}
+
+bool specular_aa_enabled() {
+    return camera.restir_gi_controls.w != 0u;
+}
+
+float material_specular_roughness(Material material) {
+    float roughness = material.roughness;
+    if (!specular_aa_enabled() || material.normal_variance <= 1.0e-5) {
+        return roughness;
+    }
+    float r2 = roughness * roughness;
+    float aaVariance = material.normal_variance * 0.18;
+    return clamp(sqrt(clamp(r2 + aaVariance, 0.0, 1.0)), roughness, 1.0);
 }
 
 Material apply_debug_material_mode(Material material) {
@@ -1472,6 +1500,8 @@ vec3 heitz_ms_ggx(vec3 f0, float roughness, float n_dot_v, float n_dot_l) {
 }
 
 vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
+    Material specMaterial = material;
+    specMaterial.roughness = material_specular_roughness(material);
     float n_dot_v = max(dot(n, wo), 0.0);
     float n_dot_l = max(dot(n, wi), 0.0);
     if (n_dot_v < 1e-6 || n_dot_l < 1e-6) {
@@ -1484,28 +1514,30 @@ vec3 eval_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, ve
     vec3 h = normalize(halfVector);
     float n_dot_h = max(dot(n, h), 0.0);
     float v_dot_h = max(dot(wo, h), 0.0);
-    vec3 f0 = pbr_f0(material);
-    vec3 f = material.use_conductor_optics != 0u
-        ? conductor_fresnel(material, v_dot_h)
+    vec3 f0 = pbr_f0(specMaterial);
+    vec3 f = specMaterial.use_conductor_optics != 0u
+        ? conductor_fresnel(specMaterial, v_dot_h)
         : schlick_fresnel(f0, v_dot_h);
-    float d = ggx_ndf(material.roughness, n_dot_h);
-    float g = smith_g(material.roughness, n_dot_v, n_dot_l);
-    if (material_uses_anisotropy(material)) {
-        material_anisotropic_frame(material, n, tangent, bitangent);
+    float d = ggx_ndf(specMaterial.roughness, n_dot_h);
+    float g = smith_g(specMaterial.roughness, n_dot_v, n_dot_l);
+    if (material_uses_anisotropy(specMaterial)) {
+        material_anisotropic_frame(specMaterial, n, tangent, bitangent);
         float alphaX;
         float alphaY;
-        material_anisotropic_alpha(material, alphaX, alphaY);
+        material_anisotropic_alpha(specMaterial, alphaX, alphaY);
         d = ggx_anisotropic_ndf(alphaX, alphaY, h, n, tangent, bitangent);
         g = smith_g_anisotropic(alphaX, alphaY, wo, wi, n, tangent, bitangent);
     }
     vec3 specular = f * d * g / max(4.0 * n_dot_v * n_dot_l, 1e-10);
-    vec3 msCompensation = heitz_ms_ggx(f0, material.roughness, n_dot_v, n_dot_l);
+    vec3 msCompensation = heitz_ms_ggx(f0, specMaterial.roughness, n_dot_v, n_dot_l);
     specular += msCompensation;
     vec3 diffuse = pbr_diffuse_energy(material) * eval_diffuse_brdf(material, wo, wi, n);
     return diffuse + specular;
 }
 
 float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
+    Material specMaterial = material;
+    specMaterial.roughness = material_specular_roughness(material);
     float n_dot_v = max(dot(n, wo), 0.0);
     float n_dot_l = max(dot(n, wi), 0.0);
     if (n_dot_v < 1e-6 || n_dot_l < 1e-6) {
@@ -1516,7 +1548,7 @@ float pdf_ggx_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, ve
         return 0.0;
     }
     vec3 h = normalize(halfVector);
-    return ggx_visible_normal_pdf(material, wo, h, n, tangent, bitangent);
+    return ggx_visible_normal_pdf(specMaterial, wo, h, n, tangent, bitangent);
 }
 
 float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 bitangent) {
@@ -1527,15 +1559,17 @@ float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, ve
 }
 
 vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tangent, vec3 bitangent) {
-    float r = ggx_safe_roughness(material.roughness);
+    Material specMaterial = material;
+    specMaterial.roughness = material_specular_roughness(material);
+    float r = ggx_safe_roughness(specMaterial.roughness);
     float a = r * r;
     float r1 = rand_f32(state);
     float r2 = rand_f32(state);
-    if (material_uses_anisotropy(material)) {
-        material_anisotropic_frame(material, n, tangent, bitangent);
+    if (material_uses_anisotropy(specMaterial)) {
+        material_anisotropic_frame(specMaterial, n, tangent, bitangent);
         float alphaX;
         float alphaY;
-        material_anisotropic_alpha(material, alphaX, alphaY);
+        material_anisotropic_alpha(specMaterial, alphaX, alphaY);
         vec3 vAniso = to_tangent_space(wo, tangent, bitangent, n);
         if (vAniso.z <= 0.0) {
             return reflect(-wo, n);

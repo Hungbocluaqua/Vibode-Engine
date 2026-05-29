@@ -141,6 +141,7 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.debugView = settings.debugView;
     render.resolutionScale = settings.renderResolutionScale;
     render.materialTextureAnisotropy = settings.materialTextureAnisotropy;
+    render.specularAaEnabled = settings.specularAaEnabled;
     render.shadowRayBias = settings.shadowRayBias;
     render.shadowDistanceBias = settings.shadowDistanceBias;
     render.fireflyClamp = settings.fireflyClamp;
@@ -204,6 +205,7 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.debugView = render.debugView;
     settings.renderResolutionScale = render.resolutionScale;
     settings.materialTextureAnisotropy = render.materialTextureAnisotropy;
+    settings.specularAaEnabled = render.specularAaEnabled;
     settings.shadowRayBias = render.shadowRayBias;
     settings.shadowDistanceBias = render.shadowDistanceBias;
     settings.fireflyClamp = render.fireflyClamp;

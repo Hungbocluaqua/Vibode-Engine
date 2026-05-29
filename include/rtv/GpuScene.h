@@ -48,7 +48,7 @@ struct alignas(16) CameraUniform {
     glm::vec4 renderControls{}; // x = shadow ray bias, y = shadow distance bias, z = firefly clamp, w = RR min survival
     glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
     glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
-    glm::uvec4 restirGiControls{24u, 0u, 0u, 0u}; // x = temporal max age, y = half-resolution reuse, z = visibility ray budget
+    glm::uvec4 restirGiControls{24u, 0u, 0u, 1u}; // x = temporal max age, y = half-resolution reuse, z = visibility ray budget, w = specular AA enabled
 };
 
 static_assert(offsetof(CameraUniform, jitter) == 128, "CameraUniform::jitter must match std140 layout");

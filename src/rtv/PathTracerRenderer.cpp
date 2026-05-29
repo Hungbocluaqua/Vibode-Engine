@@ -676,6 +676,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.atrousIterations != settings_.atrousIterations ||
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         next.restirMode != settings_.restirMode ||
+        next.specularAaEnabled != settings_.specularAaEnabled ||
         next.debugView != settings_.debugView ||
         next.toneMapper != settings_.toneMapper ||
         next.autoExposureEnabled != settings_.autoExposureEnabled ||
@@ -777,6 +778,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.pathTracingEnabled != settings_.pathTracingEnabled ||
         next.cameraJitterEnabled != settings_.cameraJitterEnabled ||
         next.adaptiveQualityMode != settings_.adaptiveQualityMode ||
+        next.specularAaEnabled != settings_.specularAaEnabled ||
         next.maxBounces != settings_.maxBounces ||
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         std::abs(next.indirectStrength - settings_.indirectStrength) > 0.0001f ||
@@ -1390,7 +1392,7 @@ void PathTracerRenderer::updateCamera() {
         settings_.restirGiTemporalMaxAge,
         settings_.restirGiHalfResolution ? 1u : 0u,
         settings_.restirGiVisibilityRayBudget,
-        0u);
+        settings_.specularAaEnabled ? 1u : 0u);
     const bool temporalCameraCut = temporalSystem_ ? temporalSystem_->isCameraCut() : temporalFrameIndex_ <= 1u;
     const bool temporalHistoryAvailable = !temporalCameraCut;
     camera_.atmosphere = glm::vec4(

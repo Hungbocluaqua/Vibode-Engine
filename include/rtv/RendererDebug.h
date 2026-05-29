@@ -102,6 +102,7 @@ enum class RendererDebugView : uint32_t {
     MomentHistoryKindValid = 84,
     DenoiserDiffuseRawVariance = 87,
     DenoiserSpecularRawVariance = 88,
+    MaterialOcclusion = 89,
 };
 
 enum class RestirMode : uint32_t {

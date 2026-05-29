@@ -92,6 +92,7 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["tone_mapper"] = toneMapperName(s.toneMapper);
     j["exposure"] = s.exposure;
     j["render_resolution_scale"] = s.renderResolutionScale;
+    j["specular_aa_enabled"] = s.specularAaEnabled;
     j["camera_jitter_enabled"] = s.cameraJitterEnabled;
     j["denoise_while_moving"] = s.denoiseWhileMoving;
     j["taa_enabled"] = s.taaEnabled;

@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 16;
+constexpr uint32_t kCacheVersion = 17;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -251,6 +251,7 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeUint32(file, mat.hasAnisotropy);
         writeFloat(file, mat.anisotropyStrength);
         writeFloat(file, mat.anisotropyRotation);
+        writeFloat(file, mat.occlusionStrength);
         writeUint32(file, mat.useConductorOptics);
         writeBytes(file, &mat.conductorEta, sizeof(mat.conductorEta));
         writeBytes(file, &mat.conductorK, sizeof(mat.conductorK));
@@ -267,10 +268,12 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeInt32(file, mat.sheenColorTextureIndex);
         writeInt32(file, mat.sheenRoughnessTextureIndex);
         writeInt32(file, mat.anisotropyTextureIndex);
+        writeInt32(file, mat.occlusionTextureIndex);
         writeBytes(file, &mat.baseColorTextureTransform, sizeof(mat.baseColorTextureTransform));
         writeBytes(file, &mat.metallicRoughnessTextureTransform, sizeof(mat.metallicRoughnessTextureTransform));
         writeBytes(file, &mat.normalTextureTransform, sizeof(mat.normalTextureTransform));
         writeBytes(file, &mat.emissiveTextureTransform, sizeof(mat.emissiveTextureTransform));
+        writeBytes(file, &mat.occlusionTextureTransform, sizeof(mat.occlusionTextureTransform));
         writeUint32(file, mat.shaderCompatibilityMask);
     }
 
@@ -512,6 +515,7 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readUint32(file, mat.hasAnisotropy)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.anisotropyStrength)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.anisotropyRotation)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.occlusionStrength)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.useConductorOptics)) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.conductorEta, sizeof(mat.conductorEta))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.conductorK, sizeof(mat.conductorK))) { std::fclose(file); return std::nullopt; }
@@ -528,10 +532,12 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readInt32(file, mat.sheenColorTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.sheenRoughnessTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.anisotropyTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.occlusionTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.baseColorTextureTransform, sizeof(mat.baseColorTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.metallicRoughnessTextureTransform, sizeof(mat.metallicRoughnessTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.normalTextureTransform, sizeof(mat.normalTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.emissiveTextureTransform, sizeof(mat.emissiveTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.occlusionTextureTransform, sizeof(mat.occlusionTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.shaderCompatibilityMask)) { std::fclose(file); return std::nullopt; }
     }
 

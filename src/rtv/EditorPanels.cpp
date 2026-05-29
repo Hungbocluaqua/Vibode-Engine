@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 83>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 83> views = {
+const std::array<RendererDebugView, 84>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 84> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -39,6 +39,7 @@ const std::array<RendererDebugView, 83>& editorDebugViews() {
         RendererDebugView::SampleScramble,
         RendererDebugView::DirectSampleType,
         RendererDebugView::Albedo,
+        RendererDebugView::MaterialOcclusion,
         RendererDebugView::PathDataAlbedo,
         RendererDebugView::PathDataMetrics,
         RendererDebugView::DenoiserKernelRadius,

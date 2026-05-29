@@ -63,6 +63,7 @@ struct MaterialAsset {
     uint32_t hasAnisotropy = 0;
     float anisotropyStrength = 0.0f;
     float anisotropyRotation = 0.0f;
+    float occlusionStrength = 1.0f;
     uint32_t useConductorOptics = 0;
     glm::vec3 conductorEta{0.0f};
     glm::vec3 conductorK{0.0f};
@@ -79,10 +80,12 @@ struct MaterialAsset {
     TextureAssetHandle sheenColorTexture{};
     TextureAssetHandle sheenRoughnessTexture{};
     TextureAssetHandle anisotropyTexture{};
+    TextureAssetHandle occlusionTexture{};
     TextureTransformAsset baseColorTextureTransform{};
     TextureTransformAsset metallicRoughnessTextureTransform{};
     TextureTransformAsset normalTextureTransform{};
     TextureTransformAsset emissiveTextureTransform{};
+    TextureTransformAsset occlusionTextureTransform{};
     uint32_t shaderCompatibilityMask = 1u;
 };
 

@@ -10,6 +10,7 @@
 
 #include <glm/gtc/quaternion.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -393,10 +394,13 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
     material.metallicRoughnessTexture = textureHandle(pbr.metallicRoughnessTexture.index);
     material.normalTexture = textureHandle(source.normalTexture.index);
     material.emissiveTexture = textureHandle(source.emissiveTexture.index);
+    material.occlusionTexture = textureHandle(source.occlusionTexture.index);
+    material.occlusionStrength = static_cast<float>(std::clamp(source.occlusionTexture.strength, 0.0, 1.0));
     material.baseColorTextureTransform = textureTransformFromInfo(pbr.baseColorTexture);
     material.metallicRoughnessTextureTransform = textureTransformFromInfo(pbr.metallicRoughnessTexture);
     material.normalTextureTransform = textureTransformFromInfo(source.normalTexture);
     material.emissiveTextureTransform = textureTransformFromInfo(source.emissiveTexture);
+    material.occlusionTextureTransform = textureTransformFromInfo(source.occlusionTexture);
 
     if (const tinygltf::Value* ext = extensionObject("KHR_materials_ior")) {
         material.hasIor = 1u;
@@ -855,6 +859,7 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.hasAnisotropy = cachedMat.hasAnisotropy;
                     material.anisotropyStrength = cachedMat.anisotropyStrength;
                     material.anisotropyRotation = cachedMat.anisotropyRotation;
+                    material.occlusionStrength = cachedMat.occlusionStrength;
                     material.useConductorOptics = cachedMat.useConductorOptics;
                     material.conductorEta = cachedMat.conductorEta;
                     material.conductorK = cachedMat.conductorK;
@@ -871,10 +876,12 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.sheenColorTexture = textureHandleFor(cachedMat.sheenColorTextureIndex);
                     material.sheenRoughnessTexture = textureHandleFor(cachedMat.sheenRoughnessTextureIndex);
                     material.anisotropyTexture = textureHandleFor(cachedMat.anisotropyTextureIndex);
+                    material.occlusionTexture = textureHandleFor(cachedMat.occlusionTextureIndex);
                     material.baseColorTextureTransform = cachedMat.baseColorTextureTransform;
                     material.metallicRoughnessTextureTransform = cachedMat.metallicRoughnessTextureTransform;
                     material.normalTextureTransform = cachedMat.normalTextureTransform;
                     material.emissiveTextureTransform = cachedMat.emissiveTextureTransform;
+                    material.occlusionTextureTransform = cachedMat.occlusionTextureTransform;
                     material.shaderCompatibilityMask = cachedMat.shaderCompatibilityMask;
                     scene.materials.push_back(assets_.addMaterial(std::move(material)));
                 }
@@ -1035,6 +1042,7 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.hasAnisotropy = material->hasAnisotropy;
         cachedMat.anisotropyStrength = material->anisotropyStrength;
         cachedMat.anisotropyRotation = material->anisotropyRotation;
+        cachedMat.occlusionStrength = material->occlusionStrength;
         cachedMat.useConductorOptics = material->useConductorOptics;
         cachedMat.conductorEta = material->conductorEta;
         cachedMat.conductorK = material->conductorK;
@@ -1051,10 +1059,12 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.sheenColorTextureIndex = getTextureIndex(material->sheenColorTexture);
         cachedMat.sheenRoughnessTextureIndex = getTextureIndex(material->sheenRoughnessTexture);
         cachedMat.anisotropyTextureIndex = getTextureIndex(material->anisotropyTexture);
+        cachedMat.occlusionTextureIndex = getTextureIndex(material->occlusionTexture);
         cachedMat.baseColorTextureTransform = material->baseColorTextureTransform;
         cachedMat.metallicRoughnessTextureTransform = material->metallicRoughnessTextureTransform;
         cachedMat.normalTextureTransform = material->normalTextureTransform;
         cachedMat.emissiveTextureTransform = material->emissiveTextureTransform;
+        cachedMat.occlusionTextureTransform = material->occlusionTextureTransform;
         cachedMat.shaderCompatibilityMask = material->shaderCompatibilityMask;
         cached.materials.push_back(std::move(cachedMat));
     }

@@ -58,6 +58,7 @@ struct CachedMaterialData {
     uint32_t hasAnisotropy = 0;
     float anisotropyStrength = 0.0f;
     float anisotropyRotation = 0.0f;
+    float occlusionStrength = 1.0f;
     uint32_t useConductorOptics = 0;
     glm::vec3 conductorEta{0.0f};
     glm::vec3 conductorK{0.0f};
@@ -74,10 +75,12 @@ struct CachedMaterialData {
     int32_t sheenColorTextureIndex = -1;
     int32_t sheenRoughnessTextureIndex = -1;
     int32_t anisotropyTextureIndex = -1;
+    int32_t occlusionTextureIndex = -1;
     TextureTransformAsset baseColorTextureTransform{};
     TextureTransformAsset metallicRoughnessTextureTransform{};
     TextureTransformAsset normalTextureTransform{};
     TextureTransformAsset emissiveTextureTransform{};
+    TextureTransformAsset occlusionTextureTransform{};
     uint32_t shaderCompatibilityMask = 1u;
 };
 

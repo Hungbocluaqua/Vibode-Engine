@@ -67,6 +67,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.renderResolutionScale = render.resolutionScale;
         settings.accumulationLimit = render.accumulationLimit;
         settings.materialTextureAnisotropy = render.materialTextureAnisotropy;
+        settings.specularAaEnabled = render.specularAaEnabled;
         settings.shadowRayBias = render.shadowRayBias;
         settings.shadowDistanceBias = render.shadowDistanceBias;
         settings.fireflyClamp = render.fireflyClamp;
@@ -175,6 +176,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
     changed |= ImGui::SliderFloat("Material Anisotropy", &settings.materialTextureAnisotropy, 1.0f, 16.0f, "%.1fx");
     tooltip("Anisotropic filtering level for material textures. Unsupported devices clamp to 1x.");
+    changed |= ImGui::Checkbox("Specular AA", &settings.specularAaEnabled);
+    tooltip("Raises effective specular roughness for high-frequency normal maps without changing material roughness.");
     const char* adaptiveItems[] = {"Off", "Conservative", "Balanced", "Aggressive"};
     int adaptiveIndex = static_cast<int>(settings.adaptiveQualityMode);
     if (adaptiveIndex < 0 || adaptiveIndex > 3) {
@@ -356,6 +359,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.resolutionScale = settings.renderResolutionScale;
             render.accumulationLimit = settings.accumulationLimit;
             render.materialTextureAnisotropy = settings.materialTextureAnisotropy;
+            render.specularAaEnabled = settings.specularAaEnabled;
             render.shadowRayBias = settings.shadowRayBias;
             render.shadowDistanceBias = settings.shadowDistanceBias;
             render.fireflyClamp = settings.fireflyClamp;

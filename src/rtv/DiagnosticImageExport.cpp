@@ -220,6 +220,7 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::Variance,
         RendererDebugView::DenoiserRejection,
         RendererDebugView::Albedo,
+        RendererDebugView::MaterialOcclusion,
         RendererDebugView::Normals,
         RendererDebugView::ReprojectionConfidence,
         RendererDebugView::Depth,

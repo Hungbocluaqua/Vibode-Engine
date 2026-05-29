@@ -98,6 +98,9 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "denoiserspecularhistoryweight" || key == "specularhistoryweight") { return RendererDebugView::DenoiserSpecularHistoryWeight; }
     if (key == "directsample" || key == "directsampletype" || key == "sampletype") { return RendererDebugView::DirectSampleType; }
     if (key == "albedo" || key == "basecolor" || key == "basecolour") { return RendererDebugView::Albedo; }
+    if (key == "occlusion" || key == "ao" || key == "materialocclusion" || key == "aotexture") {
+        return RendererDebugView::MaterialOcclusion;
+    }
     if (key == "clay" || key == "claymaterial" || key == "balancedclay" || key == "balancedclaymaterial" ||
         key == "white" || key == "whitematerial" || key == "whitematerialmode") {
         return RendererDebugView::ClayMaterial;
@@ -297,6 +300,7 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::MomentHistoryKindValid: return "moment-history-kind-valid";
     case RendererDebugView::DenoiserDiffuseRawVariance: return "denoiser-diffuse-raw-variance";
     case RendererDebugView::DenoiserSpecularRawVariance: return "denoiser-specular-raw-variance";
+    case RendererDebugView::MaterialOcclusion: return "material-occlusion";
     }
     return "beauty";
 }

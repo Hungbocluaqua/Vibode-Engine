@@ -145,6 +145,7 @@ struct RenderSettings {
     uint32_t accumulationLimit = 0;
     float resolutionScale = 1.0f;
     float materialTextureAnisotropy = 8.0f;
+    bool specularAaEnabled = true;
     float shadowRayBias = 0.001f;
     float shadowDistanceBias = 0.002f;
     float fireflyClamp = 48.0f;

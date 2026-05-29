@@ -20,6 +20,7 @@ struct PathComponents {
     vec3 restir_initial_direct_light;
     vec3 first_albedo;
     float first_roughness;
+    float first_occlusion;
     float first_light_pdf;
     float first_bsdf_pdf;
     float first_mis_weight;
@@ -657,6 +658,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.restir_initial_direct_light = vec3(0.0);
     components.first_albedo = vec3(1.0);
     components.first_roughness = 1.0;
+    components.first_occlusion = 1.0;
     components.first_light_pdf = 0.0;
     components.first_bsdf_pdf = 0.0;
     components.first_mis_weight = 0.0;
@@ -726,6 +728,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 }
             }
             float envContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
+            if (bounce > 0u) {
+                envContributionScale *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
+            }
             env *= envContributionScale;
             radiance += env;
             if (bounce > 0u) {
@@ -745,6 +750,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.first_local_pos = hit.local_pos;
             components.first_albedo = material.color;
             components.first_roughness = material.roughness;
+            components.first_occlusion = material.occlusion;
             components.first_specular_probability = pbr_specular_sample_probability(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.instance_id = hit.instance_id;
             components.mesh_id = hit.mesh_id;
@@ -789,6 +795,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 }
             }
             emit *= bounce > 0u ? camera.indirect_strength : 1.0;
+            if (bounce > 0u) {
+                emit *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
+            }
             radiance += emit;
             if (bounce > 0u) {
                 components.indirect_light += emit;
@@ -862,6 +871,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             }
         }
         float bounceContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
+        if (bounce > 0u) {
+            bounceContributionScale *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
+        }
         vec3 scaledShadedDirect = shadedDirect * atmosTransmittance * bounceContributionScale;
         scaledShadedDirect = clamp_luminance_preserve_hue(
             scaledShadedDirect,
@@ -914,6 +926,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             }
             vec3 scaledPreviewSun = previewSun * atmosTransmittance * bounceContributionScale;
             vec3 scaledPreviewAmbient = previewAmbient * atmosTransmittance * bounceContributionScale;
+            if (bounce == 0u) {
+                scaledPreviewAmbient *= components.first_occlusion;
+            }
             radiance += scaledPreviewSun;
             components.direct_light += scaledPreviewSun;
             radiance += scaledPreviewAmbient;
@@ -1127,6 +1142,8 @@ void main() {
             : (components.first_direct_sample_type == 2u ? vec3(0.05, 0.45, 1.0) : (components.first_direct_sample_type == 3u ? vec3(1.0, 0.95, 0.1) : vec3(0.0)));
     } else if (debug_params.view == 21u) {
         output_value = did_hit ? components.first_albedo : vec3(0.0);
+    } else if (debug_params.view == 89u) {
+        output_value = did_hit ? vec3(clamp(components.first_occlusion, 0.0, 1.0)) : vec3(0.0);
     } else if (debug_params.view == 23u) {
         output_value = components.first_bounce_throughput;
     } else if (debug_params.view == 24u) {
