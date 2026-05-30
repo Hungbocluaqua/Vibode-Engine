@@ -91,6 +91,15 @@ enum class RendererDebugView : uint32_t {
     RestirGiFinal = 73,
     RestirGiNormal = 90,
     RestirGiHitDistance = 91,
+    WavefrontQueueOccupancy = 92,
+    WavefrontPathDepth = 93,
+    WavefrontLiveRays = 94,
+    WavefrontTerminatedRays = 95,
+    WavefrontMaterialBucket = 96,
+    WavefrontRestirDi = 97,
+    WavefrontDirectLighting = 98,
+    WavefrontRestirGi = 99,
+    CausticVisibility = 100,
     DenoiserDirectDiffuseVariance = 74,
     DenoiserDirectSpecularVariance = 75,
     DenoiserIndirectDiffuseVariance = 76,
@@ -133,6 +142,8 @@ struct RendererDebugParams {
     uint32_t selectedInstance = UINT32_MAX;
     float scale = 1.0f;
 };
+
+inline constexpr uint32_t rendererDebugFlagRayTracingCounters = 1u << 0u;
 
 [[nodiscard]] const char* toneMapperName(ToneMapper toneMapper);
 [[nodiscard]] const char* restirModeName(RestirMode mode);

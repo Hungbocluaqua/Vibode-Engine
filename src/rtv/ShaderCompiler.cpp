@@ -39,22 +39,30 @@ ShaderCompiler::ShaderCompiler(std::filesystem::path glslangValidatorPath)
 std::filesystem::path ShaderCompiler::compileIfNeeded(
     const std::filesystem::path& source,
     const std::filesystem::path& outputDirectory) const {
+    return compileIfNeeded(source, outputDirectory, std::string{}, {});
+}
+
+std::filesystem::path ShaderCompiler::compileIfNeeded(
+    const std::filesystem::path& source,
+    const std::filesystem::path& outputDirectory,
+    const std::string& outputSuffix,
+    const std::vector<std::pair<std::string, std::string>>& extraDefines) const {
     if (!std::filesystem::exists(source)) {
         throw std::runtime_error("Shader source does not exist: " + source.string());
     }
 
     std::filesystem::create_directories(outputDirectory);
-    const std::filesystem::path output = outputDirectory / (source.filename().string() + ".spv");
+    const std::filesystem::path output = outputDirectory / (source.filename().string() + outputSuffix + ".spv");
     const std::filesystem::path signaturePath = output.string() + ".options";
-    const std::string signature = compileSignature();
-    if (!needsCompile(source, output)) {
+    const std::string signature = compileSignature(extraDefines);
+    if (!needsCompileWithSignature(source, output, signature)) {
         return output;
     }
 
     const std::string command =
         "\"\"" + glslangValidatorPath_.string() + "\" " +
         "-V --target-env vulkan1.3 " +
-        compileDefineArgs() +
+        compileDefineArgs(extraDefines) +
         "-o \"" + output.string() + "\" " +
         "\"" + source.string() + "\"\"";
     const int result = std::system(command.c_str());
@@ -84,6 +92,13 @@ std::vector<uint32_t> ShaderCompiler::readSpirv(const std::filesystem::path& pat
 }
 
 bool ShaderCompiler::needsCompile(const std::filesystem::path& source, const std::filesystem::path& output) const {
+    return needsCompileWithSignature(source, output, compileSignature());
+}
+
+bool ShaderCompiler::needsCompileWithSignature(
+    const std::filesystem::path& source,
+    const std::filesystem::path& output,
+    const std::string& signature) const {
     if (!std::filesystem::exists(output)) {
         return true;
     }
@@ -96,7 +111,7 @@ bool ShaderCompiler::needsCompile(const std::filesystem::path& source, const std
             std::istreambuf_iterator<char>(signatureFile),
             std::istreambuf_iterator<char>());
     }
-    if (storedSignature != compileSignature()) {
+    if (storedSignature != signature) {
         return true;
     }
 
@@ -112,21 +127,29 @@ bool ShaderCompiler::needsCompile(const std::filesystem::path& source, const std
     return false;
 }
 
-std::string ShaderCompiler::compileSignature() const {
-    return "RTV_USE_DIMENSIONED_SAMPLER=" + environmentValueOrDefault("RTV_USE_DIMENSIONED_SAMPLER", "1") +
+std::string ShaderCompiler::compileSignature(const std::vector<std::pair<std::string, std::string>>& extraDefines) const {
+    std::string signature = "RTV_USE_DIMENSIONED_SAMPLER=" + environmentValueOrDefault("RTV_USE_DIMENSIONED_SAMPLER", "1") +
         "\nRTV_DENOISER_SHARED_TILE=" + environmentValueOrDefault("RTV_DENOISER_SHARED_TILE", "1") +
         "\nRTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=" + environmentValueOrDefault("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0") + "\n";
+    for (const auto& [name, value] : extraDefines) {
+        signature += name + "=" + value + "\n";
+    }
+    return signature;
 }
 
-std::string ShaderCompiler::compileDefineArgs() const {
+std::string ShaderCompiler::compileDefineArgs(const std::vector<std::pair<std::string, std::string>>& extraDefines) const {
     auto defineArg = [](const char* name, const char* fallback) {
         const std::string finalValue = environmentValueOrDefault(name, fallback);
         return std::string("-D") + name + "=" + finalValue + " ";
     };
 
-    return defineArg("RTV_USE_DIMENSIONED_SAMPLER", "1") +
+    std::string args = defineArg("RTV_USE_DIMENSIONED_SAMPLER", "1") +
         defineArg("RTV_DENOISER_SHARED_TILE", "1") +
         defineArg("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0");
+    for (const auto& [name, value] : extraDefines) {
+        args += "-D" + name + "=" + value + " ";
+    }
+    return args;
 }
 
 std::vector<std::filesystem::path> ShaderCompiler::dependenciesFor(const std::filesystem::path& source) const {

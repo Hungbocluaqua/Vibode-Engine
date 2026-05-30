@@ -38,6 +38,9 @@ layout(set = 0, binding = 1, std140) uniform Camera {
     vec4 sun_color_angular_radius;
     uvec4 restir_gi_controls;
     uvec4 path_trace_controls;
+    vec4 dof_controls;
+    vec4 motion_blur_controls;
+    vec4 volume_controls;
 } camera;
 
 layout(set = 0, binding = 2, std430) buffer VarianceBuffer { uint variance_buffer[]; };
@@ -63,23 +66,22 @@ layout(set = 0, binding = 37, std140) uniform PrevCamera {
     vec4 jitter;
 } prev_camera;
 struct RestirReservoir {
-    uvec4 metadata; // x = direct sample type, y = age, z = valid/visibility bits, w = temporal compatibility signature
+    uvec4 metadata; // x = sample type, y = packed source pdf/previous weight, z = age/validity/M, w = temporal compatibility signature
     vec4 sample_value_confidence; // rgb = selected/direct contribution, a = confidence
-    vec4 target_pdf_weight_sum_m; // x = source/light pdf, y = target luminance, z = M, w = pairwise temporal previous weight
 };
 layout(set = 0, binding = 38, std430) buffer RestirReservoirBuffer { RestirReservoir restir_reservoirs[]; };
 layout(set = 0, binding = 39, std430) readonly buffer PreviousRestirReservoirBuffer { RestirReservoir previous_restir_reservoirs[]; };
 struct RestirGiReservoir {
-    vec4 hit_position_target_pdf; // xyz = selected indirect hit point, w = target pdf
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    vec4 hit_position_target_pdf; // xyz = selected indirect hit point, w = target pdf
     vec4 normal_roughness; // xyz = selected hit normal, w = roughness
 #endif
     vec4 radiance_weight_sum; // rgb = selected indirect radiance, w = weight sum
-    vec4 receiver_position_hit_distance; // xyz = receiver point, w = hit distance
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    vec4 receiver_position_hit_distance; // xyz = receiver point, w = hit distance
     uvec4 metadata; // x = sample count, y = age, z = flags, w = material id
 #else
-    uvec4 metadata; // x = sample/age/flags/roughness, y = oct normal, z = material id, w = reserved
+    uvec4 metadata; // x = sample/age/flags/roughness, y = oct normal, z = material id, w = fp16(hit distance, target pdf)
 #endif
 };
 layout(set = 0, binding = 43, std430) buffer RestirGiReservoirBuffer { RestirGiReservoir restir_gi_reservoirs[]; };
@@ -194,6 +196,37 @@ layout(set = 0, binding = 27, std430) readonly buffer LocalMeshIndices {
 layout(set = 0, binding = 34, std430) readonly buffer RtTriangleMaterialIds {
     uint rt_triangle_material_ids[];
 };
+layout(set = 0, binding = 46, std430) readonly buffer RtGeometryTriangleOffsets {
+    uint rt_geometry_triangle_offsets[];
+};
+layout(set = 0, binding = 47, std430) readonly buffer RtMeshGeometryRanges {
+    uvec2 rt_mesh_geometry_ranges[];
+};
+layout(set = 0, binding = 48, std430) buffer RtDiagnosticCounters {
+    uint rt_diagnostic_counters[];
+};
+
+const uint RTV_DEBUG_FLAG_RAY_TRACING_COUNTERS = 1u << 0u;
+const uint RT_DIAG_CAMERA_ANY_HIT_INVOCATIONS = 0u;
+const uint RT_DIAG_CAMERA_ANY_HIT_IGNORED = 1u;
+const uint RT_DIAG_CAMERA_ANY_HIT_ACCEPTED = 2u;
+const uint RT_DIAG_SHADOW_ANY_HIT_INVOCATIONS = 3u;
+const uint RT_DIAG_SHADOW_ANY_HIT_IGNORED = 4u;
+const uint RT_DIAG_SHADOW_ANY_HIT_ACCEPTED = 5u;
+const uint RT_DIAG_SURFACE_TRACE_RAYS = 6u;
+const uint RT_DIAG_SHADOW_TRACE_RAYS = 7u;
+const uint RT_DIAG_CLOSEST_HIT_INVOCATIONS = 8u;
+const uint RT_DIAG_CLOSEST_HIT_ALPHA_MATERIAL = 9u;
+const uint RT_DIAG_CAUSTIC_SHADOW_ATTEMPTS = 10u;
+const uint RT_DIAG_CAUSTIC_TRANSMISSIVE_HITS = 11u;
+const uint RT_DIAG_CAUSTIC_TRANSMISSIVE_VISIBLE = 12u;
+const uint RT_DIAG_CAUSTIC_SHADOW_BLOCKED = 13u;
+
+void record_rt_counter(uint counterIndex) {
+    if (camera.path_trace_controls.z != 0u) {
+        atomicAdd(rt_diagnostic_counters[counterIndex], 1u);
+    }
+}
 
 layout(set = 0, binding = 40, std430) readonly buffer LightBvhNodes {
     vec4 light_bvh_nodes[];
@@ -432,13 +465,51 @@ bool restir_validity_bit(uint value) {
     return (value & 1u) != 0u;
 }
 
+uint restir_pack_state(uint age, uint validityVisibility, uint sampleCount) {
+    return min(age, 255u) |
+        ((validityVisibility & 0xffu) << 8u) |
+        (min(sampleCount, 255u) << 16u);
+}
+
+uint restir_age(RestirReservoir reservoir) {
+    return reservoir.metadata.z & 0xffu;
+}
+
+void restir_set_age(inout RestirReservoir reservoir, uint age) {
+    reservoir.metadata.z = restir_pack_state(age, (reservoir.metadata.z >> 8u) & 0xffu, (reservoir.metadata.z >> 16u) & 0xffu);
+}
+
+uint restir_validity_visibility_bits(RestirReservoir reservoir) {
+    return (reservoir.metadata.z >> 8u) & 0xffu;
+}
+
+void restir_set_validity_visibility(inout RestirReservoir reservoir, uint validityVisibility) {
+    reservoir.metadata.z = restir_pack_state(restir_age(reservoir), validityVisibility, (reservoir.metadata.z >> 16u) & 0xffu);
+}
+
+uint restir_sample_count_u(RestirReservoir reservoir) {
+    return max((reservoir.metadata.z >> 16u) & 0xffu, 1u);
+}
+
+void restir_set_sample_count(inout RestirReservoir reservoir, float sampleCount) {
+    reservoir.metadata.z = restir_pack_state(restir_age(reservoir), restir_validity_visibility_bits(reservoir), uint(clamp(ceil(sampleCount), 1.0, 255.0)));
+}
+
+void restir_set_source_pdf_and_previous_weight(inout RestirReservoir reservoir, float sourcePdf, float previousWeight) {
+    reservoir.metadata.y = packHalf2x16(vec2(clamp(sourcePdf, 1.0e-6, 65504.0), clamp(previousWeight, 0.0, 1.0)));
+}
+
+float restir_previous_weight(RestirReservoir reservoir) {
+    return unpackHalf2x16(reservoir.metadata.y).y;
+}
+
 uint restir_visibility_state(RestirReservoir reservoir) {
-    return (reservoir.metadata.z >> 1u) & 3u;
+    return (restir_validity_visibility_bits(reservoir) >> 1u) & 3u;
 }
 
 bool restir_reservoir_valid(RestirReservoir reservoir) {
-    return restir_validity_bit(reservoir.metadata.z) &&
-        reservoir.target_pdf_weight_sum_m.z > 0.0 &&
+    return restir_validity_bit(restir_validity_visibility_bits(reservoir)) &&
+        restir_sample_count_u(reservoir) > 0u &&
         reservoir.sample_value_confidence.a > 0.0;
 }
 
@@ -451,7 +522,7 @@ bool restir_gi_reservoir_valid(RestirGiReservoir reservoir) {
 #else
     return ((reservoir.metadata.x >> 16u) & RESTIR_GI_FLAG_VALID) != 0u &&
         reservoir.radiance_weight_sum.w > 0.0 &&
-        reservoir.hit_position_target_pdf.w > 0.0 &&
+        unpackHalf2x16(reservoir.metadata.w).y > 0.0 &&
         (reservoir.metadata.x & 0xffu) > 0u;
 #endif
 }
@@ -543,7 +614,32 @@ void restir_gi_set_material_id(inout RestirGiReservoir reservoir, uint materialI
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.metadata.w = materialId;
 #else
-    reservoir.metadata.z = materialId;
+    reservoir.metadata.z = min(materialId, 255u);
+#endif
+}
+
+float restir_gi_hit_distance(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.receiver_position_hit_distance.w;
+#else
+    return unpackHalf2x16(reservoir.metadata.w).x;
+#endif
+}
+
+float restir_gi_target_pdf(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.hit_position_target_pdf.w;
+#else
+    return unpackHalf2x16(reservoir.metadata.w).y;
+#endif
+}
+
+void restir_gi_set_hit_distance_target_pdf(inout RestirGiReservoir reservoir, float hitDistance, float targetPdf) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.hit_position_target_pdf.w = max(targetPdf, 1.0e-4);
+    reservoir.receiver_position_hit_distance.w = max(hitDistance, 0.0);
+#else
+    reservoir.metadata.w = packHalf2x16(vec2(clamp(hitDistance, 0.0, 65504.0), clamp(targetPdf, 1.0e-4, 65504.0)));
 #endif
 }
 
@@ -552,15 +648,15 @@ float restir_gi_age_normalized(RestirGiReservoir reservoir, float maxAge) {
 }
 
 float restir_target_function(RestirReservoir reservoir) {
-    return max(max(reservoir.target_pdf_weight_sum_m.y, restir_luminance(reservoir.sample_value_confidence.rgb)), 0.0);
+    return max(restir_luminance(reservoir.sample_value_confidence.rgb), 0.0);
 }
 
 float restir_source_pdf(RestirReservoir reservoir) {
-    return max(reservoir.target_pdf_weight_sum_m.x, 1.0e-6);
+    return max(unpackHalf2x16(reservoir.metadata.y).x, 1.0e-6);
 }
 
 float restir_sample_count(RestirReservoir reservoir) {
-    return max(reservoir.target_pdf_weight_sum_m.z, 1.0);
+    return float(restir_sample_count_u(reservoir));
 }
 
 uint restir_temporal_signature(uint sampleType, float roughness) {
@@ -569,11 +665,11 @@ uint restir_temporal_signature(uint sampleType, float roughness) {
 }
 
 float restir_age_confidence(RestirReservoir reservoir, float maxAge) {
-    return 1.0 - clamp(float(reservoir.metadata.y) / max(maxAge, 1.0), 0.0, 1.0);
+    return 1.0 - clamp(float(restir_age(reservoir)) / max(maxAge, 1.0), 0.0, 1.0);
 }
 
 float restir_pairwise_compatibility(RestirReservoir current, RestirReservoir previous, float motionConfidence, float maxAge) {
-    if (!restir_reservoir_valid(current) || !restir_reservoir_valid(previous) || previous.metadata.y >= uint(maxAge)) {
+    if (!restir_reservoir_valid(current) || !restir_reservoir_valid(previous) || restir_age(previous) >= uint(maxAge)) {
         return 0.0;
     }
 
@@ -635,10 +731,10 @@ RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirRe
             : RESTIR_VISIBILITY_UNKNOWN)
         : currentVisibility;
 
-    current.metadata.y = previousWeight > 0.0 ? min(previous.metadata.y + 1u, 255u) : 0u;
-    current.metadata.z = restir_pack_validity_visibility(
+    restir_set_age(current, previousWeight > 0.0 ? min(restir_age(previous) + 1u, 255u) : 0u);
+    restir_set_validity_visibility(current, restir_pack_validity_visibility(
         restir_reservoir_valid(current),
-        mergedVisibility);
+        mergedVisibility));
     current.sample_value_confidence.rgb =
         current.sample_value_confidence.rgb * currentWeight +
         previous.sample_value_confidence.rgb * previousWeight;
@@ -647,14 +743,12 @@ RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirRe
             clamp(motionConfidence, 0.0, 1.0),
         0.0,
         1.0);
-    current.target_pdf_weight_sum_m.x =
-        current.target_pdf_weight_sum_m.x * currentWeight +
-        previous.target_pdf_weight_sum_m.x * previousWeight;
-    current.target_pdf_weight_sum_m.y = restir_luminance(current.sample_value_confidence.rgb);
-    current.target_pdf_weight_sum_m.z = min(
+    float sourcePdf = restir_source_pdf(current) * currentWeight +
+        restir_source_pdf(previous) * previousWeight;
+    restir_set_source_pdf_and_previous_weight(current, sourcePdf, previousWeight);
+    restir_set_sample_count(current, min(
         restir_sample_count(current) + restir_sample_count(previous) * previousWeight,
-        64.0);
-    current.target_pdf_weight_sum_m.w = previousWeight;
+        64.0));
     return current;
 }
 
@@ -786,13 +880,28 @@ Material decode_material(uint mat_idx) {
     return m;
 }
 
-uint material_for_raw_triangle(uint meshFirstIndex, uint primitiveId) {
-    uint triangleIndex = meshFirstIndex / 3u + primitiveId;
+uint material_for_triangle_index(uint triangleIndex) {
     uint triangleCount = mesh_params.local_index_count / 3u;
     if (triangleIndex >= triangleCount) {
         return 0u;
     }
     return rt_triangle_material_ids[triangleIndex];
+}
+
+uint material_for_raw_triangle(uint meshFirstIndex, uint primitiveId) {
+    uint triangleIndex = meshFirstIndex / 3u + primitiveId;
+    return material_for_triangle_index(triangleIndex);
+}
+
+uint geometry_triangle_offset(uint meshIndex, uint geometryIndex, uint meshFirstIndex) {
+    if (meshIndex >= mesh_params.mesh_count) {
+        return meshFirstIndex / 3u;
+    }
+    uvec2 range = rt_mesh_geometry_ranges[meshIndex];
+    if (range.y == 0u) {
+        return meshFirstIndex / 3u;
+    }
+    return rt_geometry_triangle_offsets[range.x + min(geometryIndex, range.y - 1u)];
 }
 
 void apply_material_textures(inout Material material, vec2 uv) {

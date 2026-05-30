@@ -103,6 +103,7 @@ add_executable(rtvulkan
     src/rtv/MaterialEditorPanel.cpp
     src/rtv/MortonCodes.cpp
     src/rtv/NotificationManager.cpp
+    src/rtv/OpacityMicromapPreprocess.cpp
     src/rtv/ParallelBvhBuilder.cpp
     src/rtv/PathTracerRenderer.cpp
     src/rtv/PhysicalCamera.cpp

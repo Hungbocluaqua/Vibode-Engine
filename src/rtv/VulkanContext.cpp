@@ -33,7 +33,17 @@ const std::vector<const char*> optionalRayTracingDeviceExtensions = {
     VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
 };
 
-const char* kVkNvInvocationReorderExtension = "VK_NV_ray_tracing_invocation_reorder";
+constexpr const char* kVkNvInvocationReorderExtension = VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME;
+constexpr const char* kVkNvRayTracingMotionBlurExtension = VK_NV_RAY_TRACING_MOTION_BLUR_EXTENSION_NAME;
+constexpr uint32_t kNvidiaVendorId = 0x10DEu;
+
+const char* serReorderingHintName(VkRayTracingInvocationReorderModeNV hint) {
+    switch (hint) {
+        case VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_NV: return "reorder";
+        case VK_RAY_TRACING_INVOCATION_REORDER_MODE_NONE_NV: return "none";
+        default: return "unknown";
+    }
+}
 
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -72,6 +82,9 @@ VulkanContext::VulkanContext(GLFWwindow* window) {
     pickPhysicalDevice();
     bindlessCapabilities_ = queryBindlessCapabilities(physicalDevice_);
     rayTracingInfo_ = queryRayTracingDeviceInfo(physicalDevice_);
+    opacityMicromapInfo_ = queryOpacityMicromapDeviceInfo(physicalDevice_);
+    serInfo_ = querySerDeviceInfo(physicalDevice_);
+    rayTracingMotionBlurInfo_ = queryRayTracingMotionBlurDeviceInfo(physicalDevice_);
     createDevice();
     volkLoadDevice(device_);
 
@@ -100,6 +113,34 @@ VulkanContext::VulkanContext(GLFWwindow* window) {
         }
         std::cout << '\n';
     }
+    std::cout << "VMA memory budget: " << (supportsMemoryBudget_ ? "available" : "unavailable") << '\n';
+    if (opacityMicromapInfo_.supported) {
+        std::cout << "Opacity micromaps: available (2-state subdivision "
+                  << opacityMicromapInfo_.maxOpacity2StateSubdivisionLevel
+                  << ", 4-state subdivision "
+                  << opacityMicromapInfo_.maxOpacity4StateSubdivisionLevel << ")\n";
+    } else {
+        std::cout << "Opacity micromaps: fallback alpha any-hit path ("
+                  << opacityMicromapInfo_.disabledReason << ")\n";
+    }
+    if (serInfo_.supported) {
+        std::cout << "Shader execution reordering: available (hint "
+                  << serReorderingHintName(serInfo_.reorderingHint)
+                  << ", max invocation reorder depth "
+                  << (serInfo_.maxInvocationReorderDepthReported ? std::to_string(serInfo_.maxRayTracingInvocationReorderDepth) : "not reported")
+                  << ")\n";
+    } else {
+        std::cout << "Shader execution reordering: unavailable ("
+                  << serInfo_.disabledReason << ")\n";
+    }
+    if (rayTracingMotionBlurInfo_.supported) {
+        std::cout << "Ray tracing motion blur: available"
+                  << (rayTracingMotionBlurInfo_.rayTracingMotionBlurPipelineTraceRaysIndirect ? " (indirect trace supported)" : "")
+                  << "\n";
+    } else {
+        std::cout << "Ray tracing motion blur: unavailable ("
+                  << rayTracingMotionBlurInfo_.disabledReason << ")\n";
+    }
 }
 
 VulkanContext::VulkanContext(bool headless) {
@@ -115,6 +156,9 @@ std::unique_ptr<VulkanContext> VulkanContext::createHeadless() {
     context->pickPhysicalDeviceHeadless();
     context->bindlessCapabilities_ = queryBindlessCapabilities(context->physicalDevice_);
     context->rayTracingInfo_ = context->queryRayTracingDeviceInfo(context->physicalDevice_);
+    context->opacityMicromapInfo_ = context->queryOpacityMicromapDeviceInfo(context->physicalDevice_);
+    context->serInfo_ = context->querySerDeviceInfo(context->physicalDevice_);
+    context->rayTracingMotionBlurInfo_ = context->queryRayTracingMotionBlurDeviceInfo(context->physicalDevice_);
     context->createDevice();
     volkLoadDevice(context->device_);
 
@@ -128,12 +172,41 @@ std::unique_ptr<VulkanContext> VulkanContext::createHeadless() {
     } else {
         std::cout << "Hardware ray tracing: unavailable\n";
     }
+    std::cout << "VMA memory budget: " << (context->supportsMemoryBudget_ ? "available" : "unavailable") << '\n';
+    if (context->opacityMicromapInfo_.supported) {
+        std::cout << "Opacity micromaps: available (2-state subdivision "
+                  << context->opacityMicromapInfo_.maxOpacity2StateSubdivisionLevel
+                  << ", 4-state subdivision "
+                  << context->opacityMicromapInfo_.maxOpacity4StateSubdivisionLevel << ")\n";
+    } else {
+        std::cout << "Opacity micromaps: fallback alpha any-hit path ("
+                  << context->opacityMicromapInfo_.disabledReason << ")\n";
+    }
+    if (context->serInfo_.supported) {
+        std::cout << "Shader execution reordering: available (hint "
+                  << serReorderingHintName(context->serInfo_.reorderingHint)
+                  << ", max invocation reorder depth "
+                  << (context->serInfo_.maxInvocationReorderDepthReported ? std::to_string(context->serInfo_.maxRayTracingInvocationReorderDepth) : "not reported")
+                  << ")\n";
+    } else {
+        std::cout << "Shader execution reordering: unavailable ("
+                  << context->serInfo_.disabledReason << ")\n";
+    }
+    if (context->rayTracingMotionBlurInfo_.supported) {
+        std::cout << "Ray tracing motion blur: available"
+                  << (context->rayTracingMotionBlurInfo_.rayTracingMotionBlurPipelineTraceRaysIndirect ? " (indirect trace supported)" : "")
+                  << "\n";
+    } else {
+        std::cout << "Ray tracing motion blur: unavailable ("
+                  << context->rayTracingMotionBlurInfo_.disabledReason << ")\n";
+    }
 
     return context;
 }
 
 VulkanContext::~VulkanContext() {
     if (device_ != VK_NULL_HANDLE) {
+        std::cerr << "Device idle wait: VulkanContext teardown\n";
         vkDeviceWaitIdle(device_);
         if (timelineSemaphore_ != VK_NULL_HANDLE) {
             vkDestroySemaphore(device_, timelineSemaphore_, nullptr);
@@ -267,6 +340,7 @@ void VulkanContext::createDevice() {
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipeline{};
     rayTracingPipeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
     rayTracingPipeline.rayTracingPipeline = rayTracingInfo_.capabilities.supported ? VK_TRUE : VK_FALSE;
+    rayTracingPipeline.rayTracingPipelineTraceRaysIndirect = rayTracingInfo_.capabilities.traceRaysIndirect ? VK_TRUE : VK_FALSE;
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructure{};
     accelerationStructure.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
@@ -304,31 +378,54 @@ void VulkanContext::createDevice() {
     }
     featureTail = &descriptorIndexing;
 
+    VkPhysicalDeviceOpacityMicromapFeaturesEXT opacityMicromapFeatures{};
+    opacityMicromapFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+    if (opacityMicromapInfo_.supported) {
+        opacityMicromapFeatures.micromap = VK_TRUE;
+        opacityMicromapFeatures.pNext = featureTail;
+        featureTail = &opacityMicromapFeatures;
+    }
+
     VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV serFeatures{};
     serFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
-    serFeatures.rayTracingInvocationReorder = VK_FALSE;
+    if (serInfo_.supported) {
+        serFeatures.rayTracingInvocationReorder = VK_TRUE;
+        serFeatures.pNext = featureTail;
+        featureTail = &serFeatures;
+    }
+
+    VkPhysicalDeviceRayTracingMotionBlurFeaturesNV motionBlurFeatures{};
+    motionBlurFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MOTION_BLUR_FEATURES_NV;
+    if (rayTracingMotionBlurInfo_.supported) {
+        motionBlurFeatures.rayTracingMotionBlur = VK_TRUE;
+        motionBlurFeatures.rayTracingMotionBlurPipelineTraceRaysIndirect =
+            rayTracingMotionBlurInfo_.rayTracingMotionBlurPipelineTraceRaysIndirect ? VK_TRUE : VK_FALSE;
+        motionBlurFeatures.pNext = featureTail;
+        featureTail = &motionBlurFeatures;
+    }
 
     VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphore{};
     timelineSemaphore.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
     timelineSemaphore.timelineSemaphore = VK_TRUE;
     if (timelineSemaphoreSupported_) {
         timelineSemaphore.pNext = featureTail;
-        serFeatures.pNext = &timelineSemaphore;
-    } else {
-        serFeatures.pNext = featureTail;
+        featureTail = &timelineSemaphore;
     }
 
     VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtMaintenance1Features{};
     rtMaintenance1Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
     rtMaintenance1Features.rayTracingMaintenance1 = VK_FALSE;
-    rtMaintenance1Features.pNext = &serFeatures;
+    if (rayTracingInfo_.capabilities.supported) {
+        rtMaintenance1Features.pNext = featureTail;
+        featureTail = &rtMaintenance1Features;
+    }
 
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.features.shaderFloat64 = VK_TRUE;
     features2.features.pipelineStatisticsQuery = VK_TRUE;
     features2.features.samplerAnisotropy = samplerAnisotropy_ ? VK_TRUE : VK_FALSE;
-    features2.pNext = &rtMaintenance1Features;
+    features2.pNext = featureTail;
 
     VkDeviceCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -339,27 +436,20 @@ void VulkanContext::createDevice() {
     if (!headless_) {
         enabledExtensions = requiredDeviceExtensions;
     }
+    supportsMemoryBudget_ = deviceSupportsExtension(physicalDevice_, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (supportsMemoryBudget_) {
+        enabledExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
     if (rayTracingInfo_.capabilities.supported) {
         enabledExtensions.insert(enabledExtensions.end(), optionalRayTracingDeviceExtensions.begin(), optionalRayTracingDeviceExtensions.end());
-        bool supportsInvocationReorder = false;
-        {
-            uint32_t extCount = 0;
-            checkVk(vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, nullptr),
-                    "vkEnumerateDeviceExtensionProperties(count)");
-            std::vector<VkExtensionProperties> available(extCount);
-            checkVk(vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, available.data()),
-                    "vkEnumerateDeviceExtensionProperties(data)");
-            for (const auto& ext : available) {
-                if (std::strcmp(ext.extensionName, kVkNvInvocationReorderExtension) == 0) {
-                    supportsInvocationReorder = true;
-                    break;
-                }
-            }
+        if (opacityMicromapInfo_.supported) {
+            enabledExtensions.push_back(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
         }
-        if (supportsInvocationReorder) {
-            supportsSER_ = true;
-            serFeatures.rayTracingInvocationReorder = VK_TRUE;
+        if (serInfo_.supported) {
             enabledExtensions.push_back(kVkNvInvocationReorderExtension);
+        }
+        if (rayTracingMotionBlurInfo_.supported) {
+            enabledExtensions.push_back(kVkNvRayTracingMotionBlurExtension);
         }
     } else if (rayTracingInfo_.capabilities.bufferDeviceAddress) {
         enabledExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
@@ -514,6 +604,19 @@ bool VulkanContext::deviceSupportsRequiredFeatures(VkPhysicalDevice physicalDevi
     return features13.dynamicRendering == VK_TRUE && features13.synchronization2 == VK_TRUE;
 }
 
+bool VulkanContext::deviceSupportsExtension(VkPhysicalDevice physicalDevice, const char* extensionName) const {
+    uint32_t extensionCount = 0;
+    checkVk(vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr),
+            "vkEnumerateDeviceExtensionProperties(count support check)");
+    std::vector<VkExtensionProperties> available(extensionCount);
+    checkVk(vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, available.data()),
+            "vkEnumerateDeviceExtensionProperties(support check)");
+
+    return std::any_of(available.begin(), available.end(), [&](const VkExtensionProperties& extension) {
+        return std::strcmp(extension.extensionName, extensionName) == 0;
+    });
+}
+
 RayTracingDeviceInfo VulkanContext::queryRayTracingDeviceInfo(VkPhysicalDevice physicalDevice) const {
     RayTracingDeviceInfo info{};
 
@@ -557,6 +660,7 @@ RayTracingDeviceInfo VulkanContext::queryRayTracingDeviceInfo(VkPhysicalDevice p
     if (rtFeatures.rayTracingPipeline != VK_TRUE) {
         info.capabilities.rayTracingPipeline = false;
     }
+    info.capabilities.traceRaysIndirect = rtFeatures.rayTracingPipelineTraceRaysIndirect == VK_TRUE;
 
     auto require = [&](bool availableFeature, const char* name) {
         if (!availableFeature) {
@@ -583,6 +687,132 @@ RayTracingDeviceInfo VulkanContext::queryRayTracingDeviceInfo(VkPhysicalDevice p
     info.accelerationStructureProperties = asProps;
     info.rayTracingPipelineProperties = rtProps;
 
+    return info;
+}
+
+OpacityMicromapDeviceInfo VulkanContext::queryOpacityMicromapDeviceInfo(VkPhysicalDevice physicalDevice) const {
+    OpacityMicromapDeviceInfo info{};
+    const VkPhysicalDeviceProperties properties = [&] {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &props);
+        return props;
+    }();
+
+    if (!rayTracingInfo_.capabilities.supported) {
+        info.disabledReason = "hardware ray tracing unavailable";
+        return info;
+    }
+    if (properties.vendorID != kNvidiaVendorId) {
+        info.disabledReason = "non-NVIDIA device uses alpha any-hit fallback";
+        return info;
+    }
+
+    info.extensionSupported = deviceSupportsExtension(physicalDevice, VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+    if (!info.extensionSupported) {
+        info.disabledReason = "VK_EXT_opacity_micromap not exposed; pre-RTX-40 or unsupported driver uses alpha any-hit fallback";
+        return info;
+    }
+
+    VkPhysicalDeviceOpacityMicromapFeaturesEXT ommFeatures{};
+    ommFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &ommFeatures;
+    vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+
+    info.micromapFeature = ommFeatures.micromap == VK_TRUE;
+    info.captureReplay = ommFeatures.micromapCaptureReplay == VK_TRUE;
+    info.hostCommands = ommFeatures.micromapHostCommands == VK_TRUE;
+    if (!info.micromapFeature) {
+        info.disabledReason = "VK_EXT_opacity_micromap exposed but micromap feature is unavailable";
+        return info;
+    }
+
+    VkPhysicalDeviceOpacityMicromapPropertiesEXT ommProperties{};
+    ommProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 properties2{};
+    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties2.pNext = &ommProperties;
+    vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
+
+    info.maxOpacity2StateSubdivisionLevel = ommProperties.maxOpacity2StateSubdivisionLevel;
+    info.maxOpacity4StateSubdivisionLevel = ommProperties.maxOpacity4StateSubdivisionLevel;
+    info.supported = true;
+    info.disabledReason.clear();
+    return info;
+}
+
+SerDeviceInfo VulkanContext::querySerDeviceInfo(VkPhysicalDevice physicalDevice) const {
+    SerDeviceInfo info{};
+    if (!rayTracingInfo_.capabilities.supported) {
+        info.disabledReason = "hardware ray tracing unavailable";
+        return info;
+    }
+
+    info.extensionSupported = deviceSupportsExtension(physicalDevice, kVkNvInvocationReorderExtension);
+    if (!info.extensionSupported) {
+        info.disabledReason = "VK_NV_ray_tracing_invocation_reorder not exposed";
+        return info;
+    }
+
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV serFeatures{};
+    serFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &serFeatures;
+    vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+
+    info.invocationReorderFeature = serFeatures.rayTracingInvocationReorder == VK_TRUE;
+    if (!info.invocationReorderFeature) {
+        info.disabledReason = "VK_NV_ray_tracing_invocation_reorder exposed but feature is unavailable";
+        return info;
+    }
+
+    VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV serProperties{};
+    serProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_NV;
+    VkPhysicalDeviceProperties2 properties2{};
+    properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties2.pNext = &serProperties;
+    vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
+
+    info.reorderingHint = serProperties.rayTracingInvocationReorderReorderingHint;
+    info.maxInvocationReorderDepthReported = false;
+    info.maxRayTracingInvocationReorderDepth = 0;
+    info.supported = true;
+    info.disabledReason.clear();
+    return info;
+}
+
+RayTracingMotionBlurDeviceInfo VulkanContext::queryRayTracingMotionBlurDeviceInfo(VkPhysicalDevice physicalDevice) const {
+    RayTracingMotionBlurDeviceInfo info{};
+    if (!rayTracingInfo_.capabilities.supported) {
+        info.disabledReason = "hardware ray tracing unavailable";
+        return info;
+    }
+
+    info.extensionSupported = deviceSupportsExtension(physicalDevice, kVkNvRayTracingMotionBlurExtension);
+    if (!info.extensionSupported) {
+        info.disabledReason = "VK_NV_ray_tracing_motion_blur not exposed";
+        return info;
+    }
+
+    VkPhysicalDeviceRayTracingMotionBlurFeaturesNV motionFeatures{};
+    motionFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MOTION_BLUR_FEATURES_NV;
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &motionFeatures;
+    vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+
+    info.rayTracingMotionBlurFeature = motionFeatures.rayTracingMotionBlur == VK_TRUE;
+    info.rayTracingMotionBlurPipelineTraceRaysIndirect =
+        motionFeatures.rayTracingMotionBlurPipelineTraceRaysIndirect == VK_TRUE;
+    if (!info.rayTracingMotionBlurFeature) {
+        info.disabledReason = "VK_NV_ray_tracing_motion_blur exposed but feature is unavailable";
+        return info;
+    }
+
+    info.supported = true;
+    info.disabledReason.clear();
     return info;
 }
 

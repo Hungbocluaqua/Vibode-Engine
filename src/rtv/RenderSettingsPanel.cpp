@@ -1,6 +1,7 @@
 #include "rtv/RenderSettingsPanel.h"
 
 #include "rtv/SunController.h"
+#include "rtv/VulkanContext.h"
 
 #include <imgui.h>
 #include <rtv/PhysicalCamera.h>
@@ -15,6 +16,14 @@ namespace {
 void tooltip(const char* text) {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         ImGui::SetTooltip("%s", text);
+    }
+}
+
+const char* serReorderingHintName(VkRayTracingInvocationReorderModeNV hint) {
+    switch (hint) {
+        case VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_NV: return "reorder";
+        case VK_RAY_TRACING_INVOCATION_REORDER_MODE_NONE_NV: return "none";
+        default: return "unknown";
     }
 }
 
@@ -76,6 +85,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.accumulationLimit = render.accumulationLimit;
         settings.materialTextureAnisotropy = render.materialTextureAnisotropy;
         settings.specularAaEnabled = render.specularAaEnabled;
+        settings.opacityMicromapsEnabled = render.opacityMicromapsEnabled;
         settings.shadowRayBias = render.shadowRayBias;
         settings.shadowDistanceBias = render.shadowDistanceBias;
         settings.fireflyClamp = render.fireflyClamp;
@@ -93,6 +103,18 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.physicalShutterSeconds = render.physicalShutterSeconds;
         settings.physicalIso = render.physicalIso;
         settings.physicalExposureCompensation = render.physicalExposureCompensation;
+        settings.dofApertureRadius = render.dofApertureRadius;
+        settings.dofFocusDistance = render.dofFocusDistance;
+        settings.dofBladeCount = render.dofBladeCount;
+        settings.dofBokehRotation = render.dofBokehRotation;
+        settings.motionBlurEnabled = render.motionBlurEnabled;
+        settings.motionBlurShutterOpen = render.motionBlurShutterOpen;
+        settings.motionBlurShutterClose = render.motionBlurShutterClose;
+        settings.homogeneousVolumeEnabled = render.homogeneousVolumeEnabled;
+        settings.homogeneousVolumeScattering = render.homogeneousVolumeScattering;
+        settings.homogeneousVolumeAbsorption = render.homogeneousVolumeAbsorption;
+        settings.homogeneousVolumeAnisotropy = render.homogeneousVolumeAnisotropy;
+        settings.mneeCausticsEnabled = render.mneeCausticsEnabled;
         settings.environmentEnabled = environment.enabled;
         settings.environmentIntensity = environment.intensity;
         settings.environmentRotation = environment.rotation;
@@ -206,6 +228,30 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     tooltip("Anisotropic filtering level for material textures. Unsupported devices clamp to 1x.");
     changed |= ImGui::Checkbox("Specular AA", &settings.specularAaEnabled);
     tooltip("Raises effective specular roughness for high-frequency normal maps without changing material roughness.");
+    const OpacityMicromapDeviceInfo& ommInfo = state.renderer.opacityMicromapInfo();
+    if (!ommInfo.supported) {
+        settings.opacityMicromapsEnabled = false;
+    }
+    ImGui::BeginDisabled(!ommInfo.supported);
+    changed |= ImGui::Checkbox("Opacity Micromaps", &settings.opacityMicromapsEnabled);
+    ImGui::EndDisabled();
+    tooltip(ommInfo.supported
+        ? "Builds hardware opacity micromaps for eligible alpha-tested BLAS geometry."
+        : ommInfo.disabledReason.c_str());
+    const SerDeviceInfo& serInfo = state.renderer.serInfo();
+    ImGui::Text("SER: %s", serInfo.supported ? "available" : "unavailable");
+    tooltip(serInfo.supported
+        ? serReorderingHintName(serInfo.reorderingHint)
+        : serInfo.disabledReason.c_str());
+    if (!serInfo.supported) {
+        settings.shaderExecutionReorderingEnabled = false;
+    }
+    ImGui::BeginDisabled(!serInfo.supported);
+    changed |= ImGui::Checkbox("Wavefront SER", &settings.shaderExecutionReorderingEnabled);
+    ImGui::EndDisabled();
+    tooltip(serInfo.supported
+        ? "Enables shader execution reordering hints for the opt-in wavefront trace raygen path."
+        : serInfo.disabledReason.c_str());
     const char* adaptiveItems[] = {"Off", "Conservative", "Balanced", "Aggressive"};
     int adaptiveIndex = static_cast<int>(settings.adaptiveQualityMode);
     if (adaptiveIndex < 0 || adaptiveIndex > 3) {
@@ -243,8 +289,58 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             tooltip("Sensor sensitivity. Higher values brighten the image but add noise.");
             changed |= ImGui::SliderFloat("Exposure Compensation", &settings.physicalExposureCompensation, -5.0f, 5.0f, "%.1f EV");
             tooltip("Exposure compensation offset in EV.");
-            PhysicalCamera pc({settings.physicalAperture, settings.physicalShutterSeconds, settings.physicalIso, settings.physicalExposureCompensation});
+            PhysicalCamera pc({
+                settings.physicalAperture,
+                settings.physicalShutterSeconds,
+                settings.physicalIso,
+                settings.physicalExposureCompensation,
+                settings.dofApertureRadius,
+                settings.dofFocusDistance,
+                settings.dofBladeCount,
+                settings.dofBokehRotation});
             ImGui::Text("EV100: %.1f", pc.ev100());
+        }
+        if (ImGui::TreeNodeEx("Depth of Field", ImGuiTreeNodeFlags_DefaultOpen)) {
+            changed |= ImGui::SliderFloat("Aperture Radius", &settings.dofApertureRadius, 0.0f, 0.25f, "%.4f");
+            tooltip("Thin-lens aperture radius in scene units. Zero keeps the pinhole camera path.");
+            changed |= ImGui::SliderFloat("Focus Distance", &settings.dofFocusDistance, 0.05f, 100.0f, "%.2f");
+            tooltip("Distance from the camera to the sharp focus plane.");
+            int bladeCount = static_cast<int>(settings.dofBladeCount);
+            if (ImGui::SliderInt("Aperture Blades", &bladeCount, 0, 16)) {
+                settings.dofBladeCount = bladeCount <= 0 ? 0u : static_cast<uint32_t>(std::max(bladeCount, 3));
+                changed = true;
+            }
+            tooltip("Use zero for circular bokeh, or 3-16 for polygonal bokeh.");
+            changed |= ImGui::SliderFloat("Bokeh Rotation", &settings.dofBokehRotation, -3.14159f, 3.14159f, "%.2f rad");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNodeEx("Motion Blur", ImGuiTreeNodeFlags_DefaultOpen)) {
+            const RayTracingMotionBlurDeviceInfo& motionInfo = state.renderer.rayTracingMotionBlurInfo();
+            if (!motionInfo.supported) {
+                settings.motionBlurEnabled = false;
+            }
+            ImGui::BeginDisabled(!motionInfo.supported);
+            changed |= ImGui::Checkbox("Ray Traced Motion Blur", &settings.motionBlurEnabled);
+            changed |= ImGui::SliderFloat("Shutter Open", &settings.motionBlurShutterOpen, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Shutter Close", &settings.motionBlurShutterClose, 0.0f, 1.0f, "%.2f");
+            ImGui::EndDisabled();
+            tooltip(motionInfo.supported
+                ? "Samples ray time across previous/current TLAS instance transforms."
+                : motionInfo.disabledReason.c_str());
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNodeEx("Volume", ImGuiTreeNodeFlags_DefaultOpen)) {
+            changed |= ImGui::Checkbox("Homogeneous Volume", &settings.homogeneousVolumeEnabled);
+            changed |= ImGui::SliderFloat("Scattering", &settings.homogeneousVolumeScattering, 0.0f, 0.01f, "%.5f");
+            changed |= ImGui::SliderFloat("Absorption", &settings.homogeneousVolumeAbsorption, 0.0f, 0.01f, "%.5f");
+            changed |= ImGui::SliderFloat("Anisotropy", &settings.homogeneousVolumeAnisotropy, -0.95f, 0.95f, "%.2f");
+            tooltip("Path-traced global homogeneous medium. Values are scene-unit extinction coefficients.");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNodeEx("Caustics", ImGuiTreeNodeFlags_DefaultOpen)) {
+            changed |= ImGui::Checkbox("MNEE Caustics", &settings.mneeCausticsEnabled);
+            tooltip("Experimental single-interface transmissive caustic visibility for delta glass shadow paths.");
+            ImGui::TreePop();
         }
         if (ImGui::TreeNodeEx("Advanced", ImGuiTreeNodeFlags_DefaultOpen)) {
             changed |= ImGui::SliderFloat("Target Luminance", &settings.targetLuminance, 0.01f, 1.0f, "%.3f");
@@ -404,6 +500,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.accumulationLimit = settings.accumulationLimit;
             render.materialTextureAnisotropy = settings.materialTextureAnisotropy;
             render.specularAaEnabled = settings.specularAaEnabled;
+            render.opacityMicromapsEnabled = settings.opacityMicromapsEnabled;
             render.shadowRayBias = settings.shadowRayBias;
             render.shadowDistanceBias = settings.shadowDistanceBias;
             render.fireflyClamp = settings.fireflyClamp;
@@ -421,6 +518,18 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.physicalShutterSeconds = settings.physicalShutterSeconds;
             render.physicalIso = settings.physicalIso;
             render.physicalExposureCompensation = settings.physicalExposureCompensation;
+            render.dofApertureRadius = settings.dofApertureRadius;
+            render.dofFocusDistance = settings.dofFocusDistance;
+            render.dofBladeCount = settings.dofBladeCount;
+            render.dofBokehRotation = settings.dofBokehRotation;
+            render.motionBlurEnabled = settings.motionBlurEnabled;
+            render.motionBlurShutterOpen = settings.motionBlurShutterOpen;
+            render.motionBlurShutterClose = settings.motionBlurShutterClose;
+            render.homogeneousVolumeEnabled = settings.homogeneousVolumeEnabled;
+            render.homogeneousVolumeScattering = settings.homogeneousVolumeScattering;
+            render.homogeneousVolumeAbsorption = settings.homogeneousVolumeAbsorption;
+            render.homogeneousVolumeAnisotropy = settings.homogeneousVolumeAnisotropy;
+            render.mneeCausticsEnabled = settings.mneeCausticsEnabled;
             environment.enabled = settings.environmentEnabled;
             environment.intensity = settings.environmentIntensity;
             environment.rotation = settings.environmentRotation;

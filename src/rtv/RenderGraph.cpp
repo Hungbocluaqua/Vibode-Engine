@@ -139,6 +139,74 @@ bool readsResource(const RenderGraphResourceUse& use) {
     return use.access == PassAccess::Read || use.access == PassAccess::ReadWrite;
 }
 
+VkDeviceSize estimateResourceBytes(const RenderGraphResource& resource) {
+    if (resource.type == RenderGraphResource::Type::Buffer) {
+        return resource.size;
+    }
+    const VkDeviceSize pixelCount = static_cast<VkDeviceSize>(resource.extent.width) *
+        std::max(1u, resource.extent.height) *
+        std::max(1u, resource.extent.depth);
+    VkDeviceSize bytesPerPixel = 4;
+    switch (resource.format) {
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+        bytesPerPixel = 8;
+        break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_UINT:
+        bytesPerPixel = 16;
+        break;
+    case VK_FORMAT_R32G32_SFLOAT:
+        bytesPerPixel = 8;
+        break;
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        bytesPerPixel = 4;
+        break;
+    case VK_FORMAT_R8_UNORM:
+        bytesPerPixel = 1;
+        break;
+    default:
+        bytesPerPixel = 4;
+        break;
+    }
+    return pixelCount * bytesPerPixel;
+}
+
+bool resourcesAliasCompatible(const RenderGraphResource& a, const RenderGraphResource& b) {
+    if (a.type != b.type) {
+        return false;
+    }
+    if (a.type == RenderGraphResource::Type::Buffer) {
+        return a.size == b.size && a.bufferUsage == b.bufferUsage;
+    }
+    return a.format == b.format &&
+        a.extent.width == b.extent.width &&
+        a.extent.height == b.extent.height &&
+        a.extent.depth == b.extent.depth &&
+        a.usage == b.usage;
+}
+
+bool lifetimeOverlaps(const TransientResourceLifetime& a, const TransientResourceLifetime& b) {
+    if (a.firstUsePass == UINT32_MAX || b.firstUsePass == UINT32_MAX) {
+        return true;
+    }
+    return !(a.lastUsePass < b.firstUsePass || b.lastUsePass < a.firstUsePass);
+}
+
+bool resourcesSharePhysicalHandle(const RenderGraphResource& a, const RenderGraphResource& b) {
+    if (a.type != b.type) {
+        return false;
+    }
+    if (a.type == RenderGraphResource::Type::Buffer) {
+        return a.buffer != VK_NULL_HANDLE && a.buffer == b.buffer;
+    }
+    return a.image != VK_NULL_HANDLE && a.image == b.image;
+}
+
 void beginDebugLabel(VkCommandBuffer commandBuffer, const char* name) {
     if (vkCmdBeginDebugUtilsLabelEXT == nullptr || name == nullptr || name[0] == '\0') {
         return;
@@ -214,7 +282,7 @@ void emitBarrier(VkCommandBuffer commandBuffer, const RenderGraphResource& resou
         bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bufferBarrier.buffer = resource.buffer;
-        bufferBarrier.offset = 0;
+        bufferBarrier.offset = resource.bufferOffset;
         bufferBarrier.size = resource.size == 0 ? VK_WHOLE_SIZE : resource.size;
 
         VkDependencyInfo dependency{};
@@ -227,7 +295,8 @@ void emitBarrier(VkCommandBuffer commandBuffer, const RenderGraphResource& resou
 
 } // namespace
 
-RenderGraph::RenderGraph(ResourceAllocator* allocator) {
+RenderGraph::RenderGraph(ResourceAllocator* allocator, bool enableAliasing)
+    : aliasingEnabled_(enableAliasing) {
     if (allocator != nullptr) {
         transientPool_ = std::make_unique<TransientResourcePool>(*allocator);
     }
@@ -521,48 +590,62 @@ void RenderGraph::compile() {
     resourceLifetimes_.clear();
     resourceLifetimes_.resize(resources_.size());
     for (uint32_t i = 0; i < resources_.size(); ++i) {
-        if (resources_[i].lifetime == RenderGraphResource::Lifetime::Transient &&
-            !resources_[i].external) {
-            resourceLifetimes_[i].resourceIndex = i;
-            resourceLifetimes_[i].firstUsePass = UINT32_MAX;
-            resourceLifetimes_[i].lastUsePass = 0;
-        }
+        resourceLifetimes_[i].resourceIndex = i;
+        resourceLifetimes_[i].firstUsePass = UINT32_MAX;
+        resourceLifetimes_[i].lastUsePass = UINT32_MAX;
+        resourceLifetimes_[i].firstReadPass = UINT32_MAX;
+        resourceLifetimes_[i].lastReadPass = UINT32_MAX;
+        resourceLifetimes_[i].firstWritePass = UINT32_MAX;
+        resourceLifetimes_[i].lastWritePass = UINT32_MAX;
+        resourceLifetimes_[i].estimatedBytes = estimateResourceBytes(resources_[i]);
+        resourceLifetimes_[i].aliasEligible = !resources_[i].external &&
+            resources_[i].lifetime == RenderGraphResource::Lifetime::Transient;
     }
 
-    for (uint32_t passIndex = 0; passIndex < passes_.size(); ++passIndex) {
-        if (live[passIndex] == 0) continue;
+    for (uint32_t passIndex : compiledPassOrder_) {
         for (const RenderGraphResourceUse& use : passes_[passIndex].uses()) {
             const uint32_t ri = use.resource.index;
-            if (ri < resourceLifetimes_.size() &&
-                resources_[ri].lifetime == RenderGraphResource::Lifetime::Transient &&
-                !resources_[ri].external) {
-                resourceLifetimes_[ri].firstUsePass = std::min(resourceLifetimes_[ri].firstUsePass, passIndex);
-                resourceLifetimes_[ri].lastUsePass = std::max(resourceLifetimes_[ri].lastUsePass, passIndex);
+            if (ri < resourceLifetimes_.size()) {
+                TransientResourceLifetime& lifetime = resourceLifetimes_[ri];
+                if (lifetime.firstUsePass == UINT32_MAX) {
+                    lifetime.firstUsePass = passIndex;
+                    lifetime.firstUseQueue = passes_[passIndex].queueDomain();
+                    lifetime.firstAccess = resourceAccessFor(use.state, use.domain);
+                }
+                lifetime.lastUsePass = passIndex;
+                lifetime.lastUseQueue = passes_[passIndex].queueDomain();
+                lifetime.lastAccess = resourceAccessFor(use.state, use.domain);
+                if (readsResource(use)) {
+                    lifetime.firstReadPass = std::min(lifetime.firstReadPass, passIndex);
+                    lifetime.lastReadPass = passIndex;
+                }
+                if (writesResource(use)) {
+                    lifetime.firstWritePass = std::min(lifetime.firstWritePass, passIndex);
+                    lifetime.lastWritePass = passIndex;
+                }
             }
         }
     }
 
     uint32_t nextAliasGroup = 1;
     for (uint32_t i = 0; i < resources_.size(); ++i) {
-        if (resources_[i].lifetime != RenderGraphResource::Lifetime::Transient || resources_[i].external) {
+        if (!resourceLifetimes_[i].aliasEligible) {
             continue;
         }
         if (resourceLifetimes_[i].firstUsePass == UINT32_MAX) {
             continue;
         }
         for (uint32_t j = 0; j < i; ++j) {
-            if (resources_[j].lifetime != RenderGraphResource::Lifetime::Transient || resources_[j].external) {
+            if (!resourceLifetimes_[j].aliasEligible) {
                 continue;
             }
             if (resourceLifetimes_[j].firstUsePass == UINT32_MAX) {
                 continue;
             }
-            if (resources_[i].type != resources_[j].type) {
+            if (!resourcesAliasCompatible(resources_[i], resources_[j])) {
                 continue;
             }
-            const bool overlap = !(resourceLifetimes_[i].lastUsePass < resourceLifetimes_[j].firstUsePass ||
-                                   resourceLifetimes_[j].lastUsePass < resourceLifetimes_[i].firstUsePass);
-            if (!overlap && resourceLifetimes_[j].aliasGroup != 0) {
+            if (aliasingEnabled_ && !lifetimeOverlaps(resourceLifetimes_[i], resourceLifetimes_[j]) && resourceLifetimes_[j].aliasGroup != 0) {
                 resourceLifetimes_[i].aliasGroup = resourceLifetimes_[j].aliasGroup;
                 resourceLifetimes_[i].aliased = true;
                 resourceLifetimes_[j].aliased = true;
@@ -571,6 +654,30 @@ void RenderGraph::compile() {
         }
         if (resourceLifetimes_[i].aliasGroup == 0) {
             resourceLifetimes_[i].aliasGroup = nextAliasGroup++;
+        }
+    }
+
+    for (uint32_t i = 0; i < resources_.size(); ++i) {
+        if (resourceLifetimes_[i].firstUsePass == UINT32_MAX) {
+            continue;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (resourceLifetimes_[j].firstUsePass == UINT32_MAX) {
+                continue;
+            }
+            if (!resourcesSharePhysicalHandle(resources_[i], resources_[j])) {
+                continue;
+            }
+            if (lifetimeOverlaps(resourceLifetimes_[i], resourceLifetimes_[j])) {
+                continue;
+            }
+            if (resourceLifetimes_[j].aliasGroup == 0) {
+                resourceLifetimes_[j].aliasGroup = nextAliasGroup++;
+            }
+            resourceLifetimes_[i].aliasGroup = resourceLifetimes_[j].aliasGroup;
+            resourceLifetimes_[i].aliased = true;
+            resourceLifetimes_[j].aliased = true;
+            break;
         }
     }
 }

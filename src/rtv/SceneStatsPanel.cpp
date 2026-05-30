@@ -44,6 +44,9 @@ void SceneStatsPanel::draw(const EditorRuntimeState& state) {
         ImGui::SeparatorText("Hardware RT");
         ImGui::Text("BLAS: %u", rt.blasCount);
         ImGui::Text("Instances: %u", rt.instanceCount);
+        ImGui::Text("Opaque primitives: %u", rt.geometry.opaquePrimitiveCount);
+        ImGui::Text("Alpha-tested primitives: %u", rt.geometry.alphaTestedPrimitiveCount);
+        ImGui::Text("Blended primitives: %u", rt.geometry.blendedPrimitiveCount);
         constexpr double mb = 1024.0 * 1024.0;
         ImGui::Text("AS memory: %.2f MB", static_cast<double>(rt.accelerationStructureBytes) / mb);
         ImGui::Text("SBT: %.2f KB", static_cast<double>(rt.sbtBytes) / 1024.0);

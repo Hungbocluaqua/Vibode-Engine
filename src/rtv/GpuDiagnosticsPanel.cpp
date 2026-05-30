@@ -72,6 +72,10 @@ void GpuDiagnosticsPanel::draw(const EditorRuntimeState& state) {
     const RayTracingRendererStats rt = state.renderer.rayTracingStats();
     if (rt.active) {
         ImGui::Text("AS memory:     %.2f MB", static_cast<double>(rt.accelerationStructureBytes) / mb);
+        ImGui::Text("RT geometry:   opaque %u, alpha %u, blend %u prims",
+            rt.geometry.opaquePrimitiveCount,
+            rt.geometry.alphaTestedPrimitiveCount,
+            rt.geometry.blendedPrimitiveCount);
     }
 
     ImGui::End();

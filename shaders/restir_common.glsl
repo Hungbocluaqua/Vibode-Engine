@@ -8,16 +8,17 @@
 struct RestirReservoir {
     uvec4 metadata;
     vec4 sample_value_confidence;
-    vec4 target_pdf_weight_sum_m;
 };
 
 struct RestirGiReservoir {
-    vec4 hit_position_target_pdf;
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    vec4 hit_position_target_pdf;
     vec4 normal_roughness;
 #endif
     vec4 radiance_weight_sum;
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     vec4 receiver_position_hit_distance;
+#endif
     uvec4 metadata;
 };
 
@@ -97,8 +98,71 @@ void restir_gi_set_material_id(inout RestirGiReservoir reservoir, uint materialI
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.metadata.w = materialId;
 #else
-    reservoir.metadata.z = materialId;
+    reservoir.metadata.z = min(materialId, 255u);
 #endif
+}
+
+float restir_gi_hit_distance(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.receiver_position_hit_distance.w;
+#else
+    return unpackHalf2x16(reservoir.metadata.w).x;
+#endif
+}
+
+float restir_gi_target_pdf(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.hit_position_target_pdf.w;
+#else
+    return unpackHalf2x16(reservoir.metadata.w).y;
+#endif
+}
+
+void restir_gi_set_hit_distance_target_pdf(inout RestirGiReservoir reservoir, float hitDistance, float targetPdf) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.hit_position_target_pdf.w = max(targetPdf, 1.0e-4);
+    reservoir.receiver_position_hit_distance.w = max(hitDistance, 0.0);
+#else
+    reservoir.metadata.w = packHalf2x16(vec2(clamp(hitDistance, 0.0, 65504.0), clamp(targetPdf, 1.0e-4, 65504.0)));
+#endif
+}
+
+uint restir_pack_state(uint age, uint validityVisibility, uint sampleCount) {
+    return min(age, 255u) |
+        ((validityVisibility & 0xffu) << 8u) |
+        (min(sampleCount, 255u) << 16u);
+}
+
+uint restir_age(RestirReservoir reservoir) {
+    return reservoir.metadata.z & 0xffu;
+}
+
+void restir_set_age(inout RestirReservoir reservoir, uint age) {
+    reservoir.metadata.z = restir_pack_state(age, (reservoir.metadata.z >> 8u) & 0xffu, (reservoir.metadata.z >> 16u) & 0xffu);
+}
+
+uint restir_validity_visibility_bits(RestirReservoir reservoir) {
+    return (reservoir.metadata.z >> 8u) & 0xffu;
+}
+
+void restir_set_validity_visibility(inout RestirReservoir reservoir, uint validityVisibility) {
+    reservoir.metadata.z = restir_pack_state(restir_age(reservoir), validityVisibility, (reservoir.metadata.z >> 16u) & 0xffu);
+}
+
+uint restir_sample_count_u(RestirReservoir reservoir) {
+    return max((reservoir.metadata.z >> 16u) & 0xffu, 1u);
+}
+
+void restir_set_sample_count(inout RestirReservoir reservoir, float sampleCount) {
+    reservoir.metadata.z = restir_pack_state(restir_age(reservoir), restir_validity_visibility_bits(reservoir), uint(clamp(ceil(sampleCount), 1.0, 255.0)));
+}
+
+void restir_set_source_pdf_and_previous_weight(inout RestirReservoir reservoir, float sourcePdf, float previousWeight) {
+    reservoir.metadata.y = packHalf2x16(vec2(clamp(sourcePdf, 1.0e-6, 65504.0), clamp(previousWeight, 0.0, 1.0)));
+}
+
+float restir_previous_weight(RestirReservoir reservoir) {
+    return unpackHalf2x16(reservoir.metadata.y).y;
 }
 
 uint restir_pack_validity_visibility(bool valid, uint visibility) {
@@ -110,25 +174,27 @@ bool restir_validity_bit(uint value) {
 }
 
 uint restir_visibility_state(RestirReservoir reservoir) {
-    return (reservoir.metadata.z >> 1u) & 3u;
+    return (restir_validity_visibility_bits(reservoir) >> 1u) & 3u;
 }
 
 RestirReservoir empty_restir_reservoir() {
     RestirReservoir reservoir;
     reservoir.metadata = uvec4(0u);
     reservoir.sample_value_confidence = vec4(0.0);
-    reservoir.target_pdf_weight_sum_m = vec4(0.0);
+    restir_set_source_pdf_and_previous_weight(reservoir, 1.0e-6, 0.0);
     return reservoir;
 }
 
 RestirGiReservoir empty_restir_gi_reservoir() {
     RestirGiReservoir reservoir;
-    reservoir.hit_position_target_pdf = vec4(0.0);
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.hit_position_target_pdf = vec4(0.0);
     reservoir.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
 #endif
     reservoir.radiance_weight_sum = vec4(0.0);
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.receiver_position_hit_distance = vec4(0.0);
+#endif
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.metadata = uvec4(0u);
 #else
@@ -138,8 +204,8 @@ RestirGiReservoir empty_restir_gi_reservoir() {
 }
 
 bool restir_reservoir_valid(RestirReservoir reservoir) {
-    return restir_validity_bit(reservoir.metadata.z) &&
-        reservoir.target_pdf_weight_sum_m.z > 0.0 &&
+    return restir_validity_bit(restir_validity_visibility_bits(reservoir)) &&
+        restir_sample_count_u(reservoir) > 0u &&
         reservoir.sample_value_confidence.a > 0.0;
 }
 
@@ -152,7 +218,7 @@ bool restir_gi_reservoir_valid(RestirGiReservoir reservoir) {
 #else
     return ((reservoir.metadata.x >> 16u) & RESTIR_GI_FLAG_VALID) != 0u &&
         reservoir.radiance_weight_sum.w > 0.0 &&
-        reservoir.hit_position_target_pdf.w > 0.0 &&
+        restir_gi_target_pdf(reservoir) > 0.0 &&
         (reservoir.metadata.x & 0xffu) > 0u;
 #endif
 }
@@ -222,23 +288,23 @@ float restir_luminance(vec3 value) {
 }
 
 float restir_target_function(RestirReservoir reservoir) {
-    return max(max(reservoir.target_pdf_weight_sum_m.y, restir_luminance(reservoir.sample_value_confidence.rgb)), 0.0);
+    return max(restir_luminance(reservoir.sample_value_confidence.rgb), 0.0);
 }
 
 float restir_source_pdf(RestirReservoir reservoir) {
-    return max(reservoir.target_pdf_weight_sum_m.x, 1.0e-6);
+    return max(unpackHalf2x16(reservoir.metadata.y).x, 1.0e-6);
 }
 
 float restir_sample_count(RestirReservoir reservoir) {
-    return max(reservoir.target_pdf_weight_sum_m.z, 1.0);
+    return float(restir_sample_count_u(reservoir));
 }
 
 float restir_age_confidence(RestirReservoir reservoir, float maxAge) {
-    return 1.0 - clamp(float(reservoir.metadata.y) / max(maxAge, 1.0), 0.0, 1.0);
+    return 1.0 - clamp(float(restir_age(reservoir)) / max(maxAge, 1.0), 0.0, 1.0);
 }
 
 float restir_pairwise_compatibility(RestirReservoir current, RestirReservoir previous, float motionConfidence, float maxAge) {
-    if (!restir_reservoir_valid(current) || !restir_reservoir_valid(previous) || previous.metadata.y >= uint(maxAge)) {
+    if (!restir_reservoir_valid(current) || !restir_reservoir_valid(previous) || restir_age(previous) >= uint(maxAge)) {
         return 0.0;
     }
 
@@ -301,10 +367,10 @@ RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirRe
             : RESTIR_VISIBILITY_UNKNOWN)
         : currentVisibility;
 
-    current.metadata.y = previousWeight > 0.0 ? min(previous.metadata.y + 1u, 255u) : 0u;
-    current.metadata.z = restir_pack_validity_visibility(
+    restir_set_age(current, previousWeight > 0.0 ? min(restir_age(previous) + 1u, 255u) : 0u);
+    restir_set_validity_visibility(current, restir_pack_validity_visibility(
         restir_reservoir_valid(current),
-        mergedVisibility);
+        mergedVisibility));
     current.sample_value_confidence.rgb =
         current.sample_value_confidence.rgb * currentWeight +
         previous.sample_value_confidence.rgb * previousWeight;
@@ -313,14 +379,12 @@ RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirRe
             clamp(motionConfidence, 0.0, 1.0),
         0.0,
         1.0);
-    current.target_pdf_weight_sum_m.x =
-        current.target_pdf_weight_sum_m.x * currentWeight +
-        previous.target_pdf_weight_sum_m.x * previousWeight;
-    current.target_pdf_weight_sum_m.y = restir_luminance(current.sample_value_confidence.rgb);
-    current.target_pdf_weight_sum_m.z = min(
+    float sourcePdf = restir_source_pdf(current) * currentWeight +
+        restir_source_pdf(previous) * previousWeight;
+    restir_set_source_pdf_and_previous_weight(current, sourcePdf, previousWeight);
+    restir_set_sample_count(current, min(
         restir_sample_count(current) + restir_sample_count(previous) * previousWeight,
-        64.0);
-    current.target_pdf_weight_sum_m.w = previousWeight;
+        64.0));
     return current;
 }
 

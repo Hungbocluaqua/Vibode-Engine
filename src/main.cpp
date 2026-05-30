@@ -130,11 +130,36 @@ int main(int argc, char** argv) {
         std::optional<rtv::RestirMode> restirModeOverride;
         std::optional<rtv::RenderPreset> renderPresetOverride;
         std::optional<bool> restirGiOverride;
+        std::optional<bool> opacityMicromapOverride;
+        std::optional<uint32_t> opacityMicromapSubdivisionOverride;
+        std::optional<bool> wavefrontQueuesOverride;
+        std::optional<bool> wavefrontPrimaryGenerateOverride;
+        std::optional<bool> wavefrontTraceOverride;
+        std::optional<bool> wavefrontShadeOverride;
+        std::optional<bool> wavefrontShadowTraceOverride;
+        std::optional<bool> wavefrontCompactOverride;
+        std::optional<bool> wavefrontSortOverride;
+        std::optional<bool> wavefrontFinalOutputOverride;
+        std::optional<bool> shaderExecutionReorderingOverride;
+        std::optional<float> dofApertureRadiusOverride;
+        std::optional<float> dofFocusDistanceOverride;
+        std::optional<uint32_t> dofBladeCountOverride;
+        std::optional<float> dofBokehRotationOverride;
+        std::optional<bool> motionBlurOverride;
+        std::optional<float> motionBlurShutterOpenOverride;
+        std::optional<float> motionBlurShutterCloseOverride;
+        std::optional<bool> homogeneousVolumeOverride;
+        std::optional<float> homogeneousVolumeScatteringOverride;
+        std::optional<float> homogeneousVolumeAbsorptionOverride;
+        std::optional<float> homogeneousVolumeAnisotropyOverride;
+        std::optional<bool> mneeCausticsOverride;
+        bool wavefrontValidationMode = false;
         std::optional<float> taaMotionFeedbackOverride;
         std::optional<float> taaReactiveFeedbackOverride;
         std::optional<uint32_t> samplesPerPixelOverride;
         std::optional<bool> sppLimiterOverride;
         bool validationCameraMotion = false;
+        bool validationObjectMotion = false;
 
         rtv::HeadlessDiagnosticsConfig diagConfig;
         bool dumpRenderGraphDot = false;
@@ -156,6 +181,9 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> dumpBindingsPath;
         std::optional<std::filesystem::path> crashDumpPackageDir;
         std::optional<std::filesystem::path> checkBudgetPath;
+        std::optional<std::filesystem::path> descriptorLifetimeStressPath;
+        uint32_t descriptorLifetimeStressCycles = 12;
+        uint32_t descriptorLifetimeStressFrames = 2;
         bool validateGpuLabels = false;
         bool shaderHotReloadReport = false;
         std::optional<std::string> cameraName;
@@ -225,6 +253,67 @@ int main(int argc, char** argv) {
             } else if (arg == "--restir-gi" && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 restirGiOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--opacity-micromaps" || arg == "--omm") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                opacityMicromapOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--omm-subdivision" || arg == "--opacity-micromap-subdivision") && i + 1 < argc) {
+                opacityMicromapSubdivisionOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if (arg == "--wavefront-queues" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                wavefrontQueuesOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--wavefront-primary-generate" || arg == "--wavefront-generate") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                wavefrontPrimaryGenerateOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--wavefront-trace" || arg == "--wavefront-trace-wrapper") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                wavefrontTraceOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--wavefront-shade" || arg == "--wavefront-shade-compute") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                wavefrontShadeOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--wavefront-shadow-trace" || arg == "--wavefront-shadow") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                wavefrontShadowTraceOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--wavefront-compact" || arg == "--wavefront-queue-compact") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                wavefrontCompactOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--wavefront-sort" || arg == "--wavefront-ray-sort") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                wavefrontSortOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--wavefront-final-output" || arg == "--wavefront-renderer") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                wavefrontFinalOutputOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--ser" || arg == "--shader-execution-reordering") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                shaderExecutionReorderingOverride = !(value == "off" || value == "false" || value == "0");
+            } else if (arg == "--dof-aperture-radius" && i + 1 < argc) {
+                dofApertureRadiusOverride = std::stof(argv[++i]);
+            } else if ((arg == "--dof-focus-distance" || arg == "--focus-distance") && i + 1 < argc) {
+                dofFocusDistanceOverride = std::stof(argv[++i]);
+            } else if ((arg == "--dof-blades" || arg == "--dof-blade-count") && i + 1 < argc) {
+                dofBladeCountOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if ((arg == "--dof-bokeh-rotation" || arg == "--bokeh-rotation") && i + 1 < argc) {
+                dofBokehRotationOverride = std::stof(argv[++i]);
+            } else if ((arg == "--motion-blur" || arg == "--rt-motion-blur") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                motionBlurOverride = !(value == "off" || value == "false" || value == "0");
+            } else if (arg == "--motion-blur-shutter-open" && i + 1 < argc) {
+                motionBlurShutterOpenOverride = std::stof(argv[++i]);
+            } else if (arg == "--motion-blur-shutter-close" && i + 1 < argc) {
+                motionBlurShutterCloseOverride = std::stof(argv[++i]);
+            } else if ((arg == "--homogeneous-volume" || arg == "--volume") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                homogeneousVolumeOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--volume-scattering" || arg == "--homogeneous-volume-scattering") && i + 1 < argc) {
+                homogeneousVolumeScatteringOverride = std::stof(argv[++i]);
+            } else if ((arg == "--volume-absorption" || arg == "--homogeneous-volume-absorption") && i + 1 < argc) {
+                homogeneousVolumeAbsorptionOverride = std::stof(argv[++i]);
+            } else if ((arg == "--volume-anisotropy" || arg == "--homogeneous-volume-anisotropy") && i + 1 < argc) {
+                homogeneousVolumeAnisotropyOverride = std::stof(argv[++i]);
+            } else if ((arg == "--mnee-caustics" || arg == "--caustics") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                mneeCausticsOverride = !(value == "off" || value == "false" || value == "0");
+            } else if (arg == "--wavefront-validation") {
+                wavefrontValidationMode = true;
             } else if (arg == "--taa-motion-feedback" && i + 1 < argc) {
                 taaMotionFeedbackOverride = std::stof(argv[++i]);
             } else if (arg == "--taa-reactive-feedback" && i + 1 < argc) {
@@ -236,6 +325,8 @@ int main(int argc, char** argv) {
                 sppLimiterOverride = !(value == "off" || value == "false" || value == "0");
             } else if (arg == "--validation-camera-motion") {
                 validationCameraMotion = true;
+            } else if (arg == "--validation-object-motion") {
+                validationObjectMotion = true;
             } else if (arg == "--headless") {
                 diagConfig.headless = true;
             } else if (arg == "--warmup-frames" && i + 1 < argc) {
@@ -308,6 +399,12 @@ int main(int argc, char** argv) {
                 validateGpuLabels = true;
             } else if (arg == "--check-budget" && i + 1 < argc) {
                 checkBudgetPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--descriptor-lifetime-stress" && i + 1 < argc) {
+                descriptorLifetimeStressPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--descriptor-lifetime-stress-cycles" && i + 1 < argc) {
+                descriptorLifetimeStressCycles = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
+            } else if (arg == "--descriptor-lifetime-stress-frames" && i + 1 < argc) {
+                descriptorLifetimeStressFrames = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
             } else if (arg == "--shader-hot-reload-report") {
                 shaderHotReloadReport = true;
             } else if (arg == "--disable-pass" && i + 1 < argc) {
@@ -352,6 +449,7 @@ int main(int argc, char** argv) {
         if (maxFrames != 0) {
             diagConfig.totalFrames = maxFrames;
         }
+        diagConfig.wavefrontValidationMode = wavefrontValidationMode;
 
         if (diagConfig.runValidationSuite) {
             rtv::HeadlessDiagnostics diag(diagConfig);
@@ -369,7 +467,8 @@ int main(int argc, char** argv) {
             dumpMemoryPath.has_value() ||
             dumpFrameTimelinePath.has_value() ||
             checkBudgetPath.has_value() ||
-            crashDumpPackageDir.has_value();
+            crashDumpPackageDir.has_value() ||
+            wavefrontValidationMode;
         const bool needsRenderGraph =
             baselineMode ||
             dumpFrameTimelinePath.has_value() ||
@@ -412,6 +511,9 @@ int main(int argc, char** argv) {
         if (diagConfig.saveFrameSequenceDir.has_value() && !diagConfig.headless) {
             throw std::runtime_error("--save-frame-sequence requires --headless");
         }
+        if (descriptorLifetimeStressPath.has_value() && !diagConfig.headless) {
+            throw std::runtime_error("--descriptor-lifetime-stress requires --headless");
+        }
 
 #ifdef RTV_HAS_RENDERDOC
         if (diagConfig.captureRenderDocPath.has_value()) {
@@ -428,12 +530,16 @@ int main(int argc, char** argv) {
 
         rtv::Application app(debugView, gltfPath, hdrPath, scenePath,
             denoiserOverride, restirModeOverride, renderPresetOverride, restirGiOverride,
-            debugViewProvided, validationCameraMotion,
+            opacityMicromapOverride,
+            opacityMicromapSubdivisionOverride,
+            debugViewProvided, validationCameraMotion, validationObjectMotion,
             diagConfig.headless,
             diagConfig.disableAsyncCompute,
-            diagConfig.singleQueueFallback);
+            diagConfig.singleQueueFallback,
+            diagConfig.disableResourceAliasing);
 
         if (auto* renderer = app.pathTracer()) {
+            renderer->setRayTracingDiagnosticCountersEnabled(diagConfig.profile);
             auto lower = [](std::string value) {
                 std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
                     return static_cast<char>(std::tolower(ch));
@@ -467,6 +573,172 @@ int main(int argc, char** argv) {
                 settings.renderPreset = rtv::RenderPreset::Custom;
                 renderer->applySettings(settings);
             }
+            if (wavefrontQueuesOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.wavefrontQueuesEnabled = *wavefrontQueuesOverride;
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (wavefrontPrimaryGenerateOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.wavefrontPrimaryGenerateEnabled = *wavefrontPrimaryGenerateOverride;
+                if (*wavefrontPrimaryGenerateOverride) {
+                    settings.wavefrontQueuesEnabled = true;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (wavefrontTraceOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.wavefrontTraceEnabled = *wavefrontTraceOverride;
+                if (*wavefrontTraceOverride) {
+                    settings.wavefrontPrimaryGenerateEnabled = true;
+                    settings.wavefrontQueuesEnabled = true;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (wavefrontShadeOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.wavefrontShadeEnabled = *wavefrontShadeOverride;
+                if (*wavefrontShadeOverride) {
+                    settings.wavefrontTraceEnabled = true;
+                    settings.wavefrontPrimaryGenerateEnabled = true;
+                    settings.wavefrontQueuesEnabled = true;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (wavefrontShadowTraceOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.wavefrontShadowTraceEnabled = *wavefrontShadowTraceOverride;
+                if (*wavefrontShadowTraceOverride) {
+                    settings.wavefrontShadeEnabled = true;
+                    settings.wavefrontTraceEnabled = true;
+                    settings.wavefrontPrimaryGenerateEnabled = true;
+                    settings.wavefrontQueuesEnabled = true;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (wavefrontCompactOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.wavefrontCompactEnabled = *wavefrontCompactOverride;
+                if (*wavefrontCompactOverride) {
+                    settings.wavefrontShadeEnabled = true;
+                    settings.wavefrontTraceEnabled = true;
+                    settings.wavefrontPrimaryGenerateEnabled = true;
+                    settings.wavefrontQueuesEnabled = true;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (wavefrontSortOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.wavefrontSortEnabled = *wavefrontSortOverride;
+                if (*wavefrontSortOverride) {
+                    settings.wavefrontCompactEnabled = true;
+                    settings.wavefrontShadeEnabled = true;
+                    settings.wavefrontTraceEnabled = true;
+                    settings.wavefrontPrimaryGenerateEnabled = true;
+                    settings.wavefrontQueuesEnabled = true;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (wavefrontFinalOutputOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.wavefrontFinalOutputEnabled = *wavefrontFinalOutputOverride;
+                if (*wavefrontFinalOutputOverride) {
+                    settings.wavefrontShadowTraceEnabled = true;
+                    settings.wavefrontCompactEnabled = true;
+                    settings.wavefrontShadeEnabled = true;
+                    settings.wavefrontTraceEnabled = true;
+                    settings.wavefrontPrimaryGenerateEnabled = true;
+                    settings.wavefrontQueuesEnabled = true;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (shaderExecutionReorderingOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.shaderExecutionReorderingEnabled = *shaderExecutionReorderingOverride;
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (dofApertureRadiusOverride.has_value() || dofFocusDistanceOverride.has_value() ||
+                dofBladeCountOverride.has_value() || dofBokehRotationOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (dofApertureRadiusOverride.has_value()) {
+                    settings.dofApertureRadius = *dofApertureRadiusOverride;
+                }
+                if (dofFocusDistanceOverride.has_value()) {
+                    settings.dofFocusDistance = *dofFocusDistanceOverride;
+                }
+                if (dofBladeCountOverride.has_value()) {
+                    settings.dofBladeCount = *dofBladeCountOverride;
+                }
+                if (dofBokehRotationOverride.has_value()) {
+                    settings.dofBokehRotation = *dofBokehRotationOverride;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (motionBlurOverride.has_value() || motionBlurShutterOpenOverride.has_value() || motionBlurShutterCloseOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (motionBlurOverride.has_value()) {
+                    settings.motionBlurEnabled = *motionBlurOverride;
+                }
+                if (motionBlurShutterOpenOverride.has_value()) {
+                    settings.motionBlurShutterOpen = *motionBlurShutterOpenOverride;
+                }
+                if (motionBlurShutterCloseOverride.has_value()) {
+                    settings.motionBlurShutterClose = *motionBlurShutterCloseOverride;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (homogeneousVolumeOverride.has_value() ||
+                homogeneousVolumeScatteringOverride.has_value() ||
+                homogeneousVolumeAbsorptionOverride.has_value() ||
+                homogeneousVolumeAnisotropyOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (homogeneousVolumeOverride.has_value()) {
+                    settings.homogeneousVolumeEnabled = *homogeneousVolumeOverride;
+                } else {
+                    settings.homogeneousVolumeEnabled = true;
+                }
+                if (homogeneousVolumeScatteringOverride.has_value()) {
+                    settings.homogeneousVolumeScattering = *homogeneousVolumeScatteringOverride;
+                }
+                if (homogeneousVolumeAbsorptionOverride.has_value()) {
+                    settings.homogeneousVolumeAbsorption = *homogeneousVolumeAbsorptionOverride;
+                }
+                if (homogeneousVolumeAnisotropyOverride.has_value()) {
+                    settings.homogeneousVolumeAnisotropy = *homogeneousVolumeAnisotropyOverride;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (mneeCausticsOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.mneeCausticsEnabled = *mneeCausticsOverride;
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (wavefrontValidationMode) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.restirMode = rtv::RestirMode::ClassicNee;
+                settings.restirGiEnabled = false;
+                settings.wavefrontQueuesEnabled = true;
+                settings.wavefrontPrimaryGenerateEnabled = true;
+                settings.wavefrontTraceEnabled = true;
+                settings.wavefrontShadeEnabled = true;
+                settings.wavefrontShadowTraceEnabled = true;
+                settings.wavefrontCompactEnabled = true;
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
             if (!disabledPasses.empty()) {
                 rtv::RendererSettings settings = renderer->settings();
                 for (const std::string& pass : disabledPasses) {
@@ -491,8 +763,10 @@ int main(int argc, char** argv) {
                 renderer->applySettings(settings);
             }
             if (cameraName.has_value()) {
-                std::cerr << "Warning: --camera " << *cameraName
-                          << " was parsed, but named camera selection is not exposed by Application yet; using the active scene camera.\n";
+                if (!app.applyNamedCamera(*cameraName)) {
+                    std::cerr << "Warning: --camera " << *cameraName
+                              << " did not match a scene camera or built-in diagnostic camera; using the active scene camera.\n";
+                }
             }
             if (diagConfig.dumpRenderGraphPath.has_value()) {
                 renderer->setDumpRenderGraphPath(diagConfig.dumpRenderGraphPath);
@@ -551,6 +825,14 @@ int main(int argc, char** argv) {
             app.run(maxFrames);
         }
 
+        bool descriptorLifetimeStressPassed = true;
+        if (descriptorLifetimeStressPath.has_value()) {
+            descriptorLifetimeStressPassed = app.runDescriptorLifetimeStress(
+                *descriptorLifetimeStressPath,
+                descriptorLifetimeStressCycles,
+                descriptorLifetimeStressFrames);
+        }
+
 #ifdef RTV_HAS_RENDERDOC
         if (rdocCaptureRequested && rdocApi != nullptr && !rdocCaptureFinished) {
             std::cerr << "Warning: RenderDoc capture frame " << rdocCaptureFrame
@@ -590,8 +872,11 @@ int main(int argc, char** argv) {
         }
 
         int finalExitCode = 0;
+        if (!descriptorLifetimeStressPassed) {
+            finalExitCode = 1;
+        }
         if (dumpMemoryPath.has_value()) {
-            rtv::writeMemoryReport(*dumpMemoryPath, diag.profileReport());
+            rtv::writeMemoryReport(*dumpMemoryPath, diag.profileReport(), diagConfig.dumpRenderGraphPath);
         }
         if (dumpFrameTimelinePath.has_value()) {
             rtv::writeFrameTimeline(*dumpFrameTimelinePath, diag.profileReport(), diagConfig.dumpRenderGraphPath);

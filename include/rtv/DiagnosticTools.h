@@ -109,7 +109,8 @@ void updateBaseline(
 
 void writeMemoryReport(
     const std::filesystem::path& outputPath,
-    const ProfileReport& profile);
+    const ProfileReport& profile,
+    const std::optional<std::filesystem::path>& renderGraphPath = std::nullopt);
 
 void writeFrameTimeline(
     const std::filesystem::path& outputPath,

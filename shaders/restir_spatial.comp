@@ -168,9 +168,11 @@ void main() {
             mix(merged.sample_value_confidence.a, candidate.sample_value_confidence.a, mixWeight) * 0.96,
             0.0,
             1.0);
-        merged.target_pdf_weight_sum_m.x = mix(merged.target_pdf_weight_sum_m.x, candidate.target_pdf_weight_sum_m.x, mixWeight);
-        merged.target_pdf_weight_sum_m.y = restir_luminance(merged.sample_value_confidence.rgb);
-        merged.target_pdf_weight_sum_m.z = min(merged.target_pdf_weight_sum_m.z + candidate.target_pdf_weight_sum_m.z * mixWeight, 64.0);
+        restir_set_source_pdf_and_previous_weight(
+            merged,
+            mix(restir_source_pdf(merged), restir_source_pdf(candidate), mixWeight),
+            restir_previous_weight(merged));
+        restir_set_sample_count(merged, min(restir_sample_count(merged) + restir_sample_count(candidate) * mixWeight, 64.0));
         mergedVisibility = mergedVisibility == RESTIR_VISIBILITY_VISIBLE && candidateVisibility == RESTIR_VISIBILITY_VISIBLE
             ? RESTIR_VISIBILITY_VISIBLE
             : RESTIR_VISIBILITY_UNKNOWN;
@@ -191,6 +193,6 @@ void main() {
         }
     }
 
-    merged.metadata.z = restir_pack_validity_visibility(restir_reservoir_valid(merged), mergedVisibility);
+    restir_set_validity_visibility(merged, restir_pack_validity_visibility(restir_reservoir_valid(merged), mergedVisibility));
     output_reservoirs[pixelIndex] = merged;
 }

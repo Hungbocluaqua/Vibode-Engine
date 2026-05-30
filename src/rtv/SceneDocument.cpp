@@ -416,6 +416,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"resolutionScale", renderSettings_.resolutionScale},
         {"materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy},
         {"specularAaEnabled", renderSettings_.specularAaEnabled},
+        {"opacityMicromapsEnabled", renderSettings_.opacityMicromapsEnabled},
         {"shadowRayBias", renderSettings_.shadowRayBias},
         {"shadowDistanceBias", renderSettings_.shadowDistanceBias},
         {"fireflyClamp", renderSettings_.fireflyClamp},
@@ -433,6 +434,18 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"physicalShutterSeconds", renderSettings_.physicalShutterSeconds},
         {"physicalIso", renderSettings_.physicalIso},
         {"physicalExposureCompensation", renderSettings_.physicalExposureCompensation},
+        {"dofApertureRadius", renderSettings_.dofApertureRadius},
+        {"dofFocusDistance", renderSettings_.dofFocusDistance},
+        {"dofBladeCount", renderSettings_.dofBladeCount},
+        {"dofBokehRotation", renderSettings_.dofBokehRotation},
+        {"motionBlurEnabled", renderSettings_.motionBlurEnabled},
+        {"motionBlurShutterOpen", renderSettings_.motionBlurShutterOpen},
+        {"motionBlurShutterClose", renderSettings_.motionBlurShutterClose},
+        {"homogeneousVolumeEnabled", renderSettings_.homogeneousVolumeEnabled},
+        {"homogeneousVolumeScattering", renderSettings_.homogeneousVolumeScattering},
+        {"homogeneousVolumeAbsorption", renderSettings_.homogeneousVolumeAbsorption},
+        {"homogeneousVolumeAnisotropy", renderSettings_.homogeneousVolumeAnisotropy},
+        {"mneeCausticsEnabled", renderSettings_.mneeCausticsEnabled},
     };
 
     root["entities"] = nlohmann::json::array();
@@ -597,6 +610,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.resolutionScale = render.value("resolutionScale", renderSettings_.resolutionScale);
         renderSettings_.materialTextureAnisotropy = render.value("materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy);
         renderSettings_.specularAaEnabled = render.value("specularAaEnabled", renderSettings_.specularAaEnabled);
+        renderSettings_.opacityMicromapsEnabled = render.value("opacityMicromapsEnabled", renderSettings_.opacityMicromapsEnabled);
         renderSettings_.shadowRayBias = render.value("shadowRayBias", renderSettings_.shadowRayBias);
         renderSettings_.shadowDistanceBias = render.value("shadowDistanceBias", renderSettings_.shadowDistanceBias);
         renderSettings_.fireflyClamp = render.value("fireflyClamp", renderSettings_.fireflyClamp);
@@ -614,6 +628,18 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.physicalShutterSeconds = render.value("physicalShutterSeconds", renderSettings_.physicalShutterSeconds);
         renderSettings_.physicalIso = render.value("physicalIso", renderSettings_.physicalIso);
         renderSettings_.physicalExposureCompensation = render.value("physicalExposureCompensation", renderSettings_.physicalExposureCompensation);
+        renderSettings_.dofApertureRadius = render.value("dofApertureRadius", renderSettings_.dofApertureRadius);
+        renderSettings_.dofFocusDistance = render.value("dofFocusDistance", renderSettings_.dofFocusDistance);
+        renderSettings_.dofBladeCount = render.value("dofBladeCount", renderSettings_.dofBladeCount);
+        renderSettings_.dofBokehRotation = render.value("dofBokehRotation", renderSettings_.dofBokehRotation);
+        renderSettings_.motionBlurEnabled = render.value("motionBlurEnabled", renderSettings_.motionBlurEnabled);
+        renderSettings_.motionBlurShutterOpen = render.value("motionBlurShutterOpen", renderSettings_.motionBlurShutterOpen);
+        renderSettings_.motionBlurShutterClose = render.value("motionBlurShutterClose", renderSettings_.motionBlurShutterClose);
+        renderSettings_.homogeneousVolumeEnabled = render.value("homogeneousVolumeEnabled", renderSettings_.homogeneousVolumeEnabled);
+        renderSettings_.homogeneousVolumeScattering = render.value("homogeneousVolumeScattering", renderSettings_.homogeneousVolumeScattering);
+        renderSettings_.homogeneousVolumeAbsorption = render.value("homogeneousVolumeAbsorption", renderSettings_.homogeneousVolumeAbsorption);
+        renderSettings_.homogeneousVolumeAnisotropy = render.value("homogeneousVolumeAnisotropy", renderSettings_.homogeneousVolumeAnisotropy);
+        renderSettings_.mneeCausticsEnabled = render.value("mneeCausticsEnabled", renderSettings_.mneeCausticsEnabled);
     }
 
     registry_ = SceneRegistry{};

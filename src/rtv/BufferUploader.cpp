@@ -44,6 +44,21 @@ std::vector<VkBufferImageCopy> makeMipCopyRegions(std::span<const TextureMipLeve
 BufferUploader::BufferUploader(ResourceAllocator& allocator, UploadContext& uploadContext)
     : allocator_(allocator), uploadContext_(uploadContext) {}
 
+void BufferUploader::recordUpload(VkDeviceSize byteSize) {
+    stats_.totalUploadedBytes += static_cast<uint64_t>(byteSize);
+    stats_.lastStagingBytes = static_cast<uint64_t>(byteSize);
+    stats_.stagingPeakBytes = std::max(stats_.stagingPeakBytes, stats_.lastStagingBytes);
+    ++stats_.uploadCount;
+}
+
+void BufferUploader::recordBatchUpload(VkDeviceSize byteSize) {
+    if (byteSize == 0) {
+        return;
+    }
+    recordUpload(byteSize);
+    ++stats_.batchUploadCount;
+}
+
 void BufferUploader::uploadToBuffer(Buffer& destination, const void* data, VkDeviceSize byteSize, VkDeviceSize dstOffset) {
     if (data == nullptr || byteSize == 0) {
         return;
@@ -81,6 +96,8 @@ void BufferUploader::uploadToBuffer(Buffer& destination, const void* data, VkDev
         .dstAccess = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
     });
     uploadContext_.submitAndWait(cmd);
+    recordUpload(byteSize);
+    ++stats_.bufferUploadCount;
 }
 
 void BufferUploader::uploadToImage2D(Image& image, const void* rgbaBytes, VkDeviceSize byteSize, VkImageLayout finalLayout) {
@@ -153,6 +170,8 @@ void BufferUploader::uploadToImage2D(
     image.setLayout(finalLayout);
 
     uploadContext_.submitAndWait(cmd);
+    recordUpload(byteSize);
+    ++stats_.imageUploadCount;
 }
 
 } // namespace rtv

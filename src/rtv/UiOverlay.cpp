@@ -17,6 +17,7 @@
 #include <array>
 #include <algorithm>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 
 namespace rtv {
@@ -70,6 +71,13 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 64},
     }};
+    descriptorPoolStats_ = DescriptorPoolStats{
+        .present = true,
+        .maxSets = 256,
+        .combinedImageSamplerDescriptors = 256,
+        .sampledImageDescriptors = 256,
+        .samplerDescriptors = 64,
+    };
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -106,6 +114,7 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
 
 UiOverlay::~UiOverlay() {
     if (context_.device() != VK_NULL_HANDLE) {
+        std::cerr << "Device idle wait: UiOverlay teardown\n";
         vkDeviceWaitIdle(context_.device());
     }
     invalidateViewportTexture();
@@ -161,6 +170,7 @@ EditorRequests UiOverlay::build(
     if (descriptor.imageView != VK_NULL_HANDLE && descriptor.imageView != viewportImageView_) {
         invalidateViewportTexture();
         viewportTexture_ = ImGui_ImplVulkan_AddTexture(descriptor.imageView, descriptor.imageLayout);
+        descriptorPoolStats_.viewportDescriptorAllocated = viewportTexture_ != VK_NULL_HANDLE ? 1u : 0u;
         viewportImageView_ = descriptor.imageView;
         viewportTextureExtent_ = displayExtent;
     }
@@ -242,6 +252,7 @@ void UiOverlay::invalidateViewportTexture() {
     viewportTexture_ = VK_NULL_HANDLE;
     viewportImageView_ = VK_NULL_HANDLE;
     viewportTextureExtent_ = {};
+    descriptorPoolStats_.viewportDescriptorAllocated = 0;
 }
 
 void UiOverlay::checkVkResult(VkResult result) {

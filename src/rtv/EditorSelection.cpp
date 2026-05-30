@@ -8,6 +8,7 @@ void EditorSelection::clear() {
     current_ = {};
     multiSelected_.clear();
     lastClickedId_ = {};
+    pickPending_ = false;
 }
 
 void EditorSelection::selectObject(uint32_t id) {

@@ -37,6 +37,8 @@ vec2 blue_noise_2d(ivec2 pixel, uint frameIndex) {
 }
 
 const uint SAMPLE_DIM_PATH_SEED = 0u;
+const uint SAMPLE_DIM_CAMERA_LENS = 4u;
+const uint SAMPLE_DIM_CAMERA_TIME = 6u;
 const uint SAMPLE_DIM_LIGHT_SELECT = 8u;
 const uint SAMPLE_DIM_LIGHT_SURFACE = 12u;
 const uint SAMPLE_DIM_ENVIRONMENT = 20u;
@@ -44,6 +46,8 @@ const uint SAMPLE_DIM_SUN = 24u;
 const uint SAMPLE_DIM_BSDF = 32u;
 const uint SAMPLE_DIM_DIELECTRIC = 40u;
 const uint SAMPLE_DIM_RUSSIAN_ROULETTE = 44u;
+const uint SAMPLE_DIM_VOLUME_DISTANCE = 48u;
+const uint SAMPLE_DIM_VOLUME_PHASE = 50u;
 const uint SAMPLE_DIM_RESTIR_CANDIDATE = 52u;
 const uint SAMPLE_DIM_RESTIR_SPATIAL = 60u;
 const uint SAMPLE_DIM_DEBUG = 96u;

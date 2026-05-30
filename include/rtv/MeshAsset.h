@@ -96,6 +96,27 @@ struct MaterialAsset {
     uint32_t shaderCompatibilityMask = 1u;
 };
 
+constexpr uint32_t kMaterialAlphaModeOpaque = 0u;
+constexpr uint32_t kMaterialAlphaModeMask = 1u;
+constexpr uint32_t kMaterialAlphaModeBlend = 2u;
+
+constexpr uint32_t kPrimitiveAlphaClassOpaque = 0u;
+constexpr uint32_t kPrimitiveAlphaClassAlphaTested = 1u;
+constexpr uint32_t kPrimitiveAlphaClassBlended = 2u;
+
+[[nodiscard]] inline uint32_t primitiveAlphaClassForMaterial(const MaterialAsset* material) {
+    if (material == nullptr) {
+        return kPrimitiveAlphaClassOpaque;
+    }
+    if (material->alphaMode == kMaterialAlphaModeMask) {
+        return kPrimitiveAlphaClassAlphaTested;
+    }
+    if (material->alphaMode == kMaterialAlphaModeBlend) {
+        return kPrimitiveAlphaClassBlended;
+    }
+    return kPrimitiveAlphaClassOpaque;
+}
+
 constexpr uint32_t kMaterialClosureFlagDiffuse      = 1u << 0u;
 constexpr uint32_t kMaterialClosureFlagSpecular     = 1u << 1u;
 constexpr uint32_t kMaterialClosureFlagSss          = 1u << 2u;
@@ -111,7 +132,19 @@ struct MeshPrimitiveAsset {
     uint32_t firstVertex = 0;
     uint32_t vertexCount = 0;
     MaterialAssetHandle material{};
+    float alphaCutoff = 0.5f;
+    uint32_t alphaMode = kMaterialAlphaModeOpaque;
+    bool containsAlphaTestedGeometry = false;
+    bool containsBlendedGeometry = false;
 };
+
+inline void updatePrimitiveAlphaClassification(MeshPrimitiveAsset& primitive, const MaterialAsset* material) {
+    primitive.alphaCutoff = material != nullptr ? material->alphaCutoff : 0.5f;
+    primitive.alphaMode = material != nullptr ? material->alphaMode : kMaterialAlphaModeOpaque;
+    const uint32_t alphaClass = primitiveAlphaClassForMaterial(material);
+    primitive.containsAlphaTestedGeometry = alphaClass == kPrimitiveAlphaClassAlphaTested;
+    primitive.containsBlendedGeometry = alphaClass == kPrimitiveAlphaClassBlended;
+}
 
 struct MeshAsset {
     std::string name;

@@ -236,6 +236,7 @@ void BatchUploader::submit() {
     }
 
     uploader_.uploadContext().submitAndWait(cmd);
+    uploader_.recordBatchUpload(totalBufferSize);
     reset();
 }
 

@@ -77,7 +77,8 @@ uint64_t memoryTotalBytes(const ProfileReport::MemoryReport& memory) {
         memory.buffersBytes +
         memory.accelerationStructureBytes +
         memory.temporalHistoryBytes +
-        memory.restirReservoirBytes;
+        memory.restirReservoirBytes +
+        memory.stagingUploadPeakBytes;
 }
 
 uint64_t memoryTotalBytes(const json& memory) {
@@ -85,7 +86,8 @@ uint64_t memoryTotalBytes(const json& memory) {
         uintAt(memory, {"buffers_bytes"}) +
         uintAt(memory, {"acceleration_structure_bytes"}) +
         uintAt(memory, {"temporal_history_bytes"}) +
-        uintAt(memory, {"restir_reservoir_bytes"});
+        uintAt(memory, {"restir_reservoir_bytes"}) +
+        uintAt(memory, {"staging_upload_peak_bytes"});
 }
 
 std::map<std::string, uint64_t> profileMemoryBytes(const ProfileReport& profile) {
@@ -102,6 +104,8 @@ std::map<std::string, uint64_t> profileMemoryBytes(const ProfileReport& profile)
         {"restir_gi_current_bytes", memory.restirGiCurrentBytes},
         {"restir_gi_previous_bytes", memory.restirGiPreviousBytes},
         {"restir_gi_spatial_bytes", memory.restirGiSpatialBytes},
+        {"staging_upload_peak_bytes", memory.stagingUploadPeakBytes},
+        {"staging_upload_total_bytes", memory.stagingUploadTotalBytes},
         {"total_bytes", memoryTotalBytes(memory)},
     };
 }
@@ -136,6 +140,15 @@ std::map<std::string, double> passGpuMsMap(const ProfileReport::PerPassGpuMs& pa
         {"selection_outline", passes.selectionOutline},
         {"fullscreen", passes.fullscreen},
         {"editor_presentation", passes.editorPresentation},
+        {"wavefront_trace", passes.wavefrontTrace},
+        {"wavefront_secondary_trace", passes.wavefrontSecondaryTrace},
+        {"wavefront_sorted_trace", passes.wavefrontSortedTrace},
+        {"wavefront_shadow_trace", passes.wavefrontShadowTrace},
+        {"wavefront_shade", passes.wavefrontShade},
+        {"wavefront_secondary_shade", passes.wavefrontSecondaryShade},
+        {"wavefront_sorted_shade", passes.wavefrontSortedShade},
+        {"wavefront_compact", passes.wavefrontCompact},
+        {"wavefront_sort", passes.wavefrontSort},
     };
 }
 
@@ -147,6 +160,48 @@ uint64_t bytesFromBudgetValue(const json& value) {
         return static_cast<uint64_t>(value.get<double>());
     }
     return 0;
+}
+
+json renderGraphOrEmpty(const std::optional<std::filesystem::path>& path);
+
+struct RenderGraphTransientStats {
+    uint64_t estimatedBytes = 0;
+    uint64_t aliasEligibleBytes = 0;
+    uint64_t activeAliasSavedBytes = 0;
+    uint32_t transientResourceCount = 0;
+    uint32_t aliasEligibleResourceCount = 0;
+    uint32_t activeAliasCount = 0;
+};
+
+RenderGraphTransientStats transientStatsFromRenderGraph(const std::optional<std::filesystem::path>& renderGraphPath) {
+    RenderGraphTransientStats stats{};
+    const json graph = renderGraphOrEmpty(renderGraphPath);
+    if (!graph.is_object()) {
+        return stats;
+    }
+
+    for (const auto& resource : graph.value("resources", json::array())) {
+        if (resource.value("lifetime", "") != "Transient") {
+            continue;
+        }
+        ++stats.transientResourceCount;
+        const json aliasing = resource.value("aliasing", json::object());
+        const uint64_t estimatedBytes = uintAt(aliasing, {"estimated_bytes"});
+        stats.estimatedBytes += estimatedBytes;
+        if (aliasing.value("eligible", false)) {
+            stats.aliasEligibleBytes += estimatedBytes;
+            ++stats.aliasEligibleResourceCount;
+        }
+    }
+
+    for (const auto& check : graph.value("alias_checks", json::array())) {
+        if (!check.value("shared_physical_handle", false) || !check.value("physical_alias_candidate", false)) {
+            continue;
+        }
+        ++stats.activeAliasCount;
+        stats.activeAliasSavedBytes += bytesFromBudgetValue(check.value("estimated_saved_bytes", json(0)));
+    }
+    return stats;
 }
 
 double regressionPercent(double oldValue, double newValue) {
@@ -225,8 +280,17 @@ json compareProfilesJson(const json& oldProfile, const json& newProfile) {
     }
     std::sort(memoryNames.begin(), memoryNames.end());
     for (const std::string& name : memoryNames) {
-        const uint64_t oldValue = oldMemory.value(name, 0ull);
-        const uint64_t newValue = newMemory.value(name, 0ull);
+        const json oldValueJson = oldMemory.value(name, json(0));
+        const json newValueJson = newMemory.value(name, json(0));
+        if (!oldValueJson.is_number() || !newValueJson.is_number()) {
+            continue;
+        }
+        const uint64_t oldValue = oldValueJson.is_number_unsigned() || oldValueJson.is_number_integer()
+            ? oldValueJson.get<uint64_t>()
+            : static_cast<uint64_t>(oldValueJson.is_number() ? oldValueJson.get<double>() : 0.0);
+        const uint64_t newValue = newValueJson.is_number_unsigned() || newValueJson.is_number_integer()
+            ? newValueJson.get<uint64_t>()
+            : static_cast<uint64_t>(newValueJson.is_number() ? newValueJson.get<double>() : 0.0);
         memoryJson[name] = metricDelta(static_cast<double>(oldValue), static_cast<double>(newValue), "bytes");
     }
     const uint64_t oldTotal = memoryTotalBytes(oldMemory);
@@ -1032,23 +1096,95 @@ int checkBaseline(
     return failed ? 1 : 0;
 }
 
-void writeMemoryReport(const std::filesystem::path& outputPath, const ProfileReport& profile) {
+void writeMemoryReport(
+    const std::filesystem::path& outputPath,
+    const ProfileReport& profile,
+    const std::optional<std::filesystem::path>& renderGraphPath) {
+    const RenderGraphTransientStats transientStats = transientStatsFromRenderGraph(renderGraphPath);
     const uint64_t persistent =
         profile.memory.texturesBytes +
         profile.memory.buffersBytes +
         profile.memory.accelerationStructureBytes +
         profile.memory.temporalHistoryBytes +
-        profile.memory.restirReservoirBytes;
+        profile.memory.restirReservoirBytes +
+        profile.memory.stagingUploadPeakBytes;
+    const uint64_t totalBytes = persistent + transientStats.estimatedBytes;
+    json heaps = json::array();
+    for (const auto& heap : profile.memory.vmaBudget.heaps) {
+        heaps.push_back({
+            {"heap_index", heap.heapIndex},
+            {"usage_bytes", heap.usageBytes},
+            {"budget_bytes", heap.budgetBytes},
+            {"allocation_bytes", heap.allocationBytes},
+            {"block_bytes", heap.blockBytes},
+            {"allocation_count", heap.allocationCount},
+            {"block_count", heap.blockCount},
+            {"usage_ratio", heap.usageRatio},
+            {"pressure", heap.pressure},
+        });
+    }
+    json vmaBudget = {
+        {"supported", profile.memory.vmaBudget.supported},
+        {"total_usage_bytes", profile.memory.vmaBudget.totalUsageBytes},
+        {"total_budget_bytes", profile.memory.vmaBudget.totalBudgetBytes},
+        {"total_allocation_bytes", profile.memory.vmaBudget.totalAllocationBytes},
+        {"total_block_bytes", profile.memory.vmaBudget.totalBlockBytes},
+        {"peak_usage_bytes", profile.memory.vmaBudget.peakUsageBytes},
+        {"usage_delta_bytes", profile.memory.vmaBudget.usageDeltaBytes},
+        {"allocation_count", profile.memory.vmaBudget.allocationCount},
+        {"block_count", profile.memory.vmaBudget.blockCount},
+        {"max_usage_ratio", profile.memory.vmaBudget.maxUsageRatio},
+        {"pressure", profile.memory.vmaBudget.pressure},
+        {"override_active", profile.memory.vmaBudget.overrideActive},
+        {"heaps", heaps},
+        {"warnings", profile.memory.vmaBudget.warnings},
+    };
+    json descriptorPools = {
+        {"sets_per_pool", profile.memory.descriptors.setsPerPool},
+        {"max_pools", profile.memory.descriptors.maxPools},
+        {"used_pools", profile.memory.descriptors.usedPools},
+        {"free_pools", profile.memory.descriptors.freePools},
+        {"pool_count", profile.memory.descriptors.poolCount},
+        {"capacity_sets", profile.memory.descriptors.capacitySets},
+        {"allocated_sets", profile.memory.descriptors.allocatedSets},
+        {"peak_allocated_sets", profile.memory.descriptors.peakAllocatedSets},
+        {"failed_allocations", profile.memory.descriptors.failedAllocations},
+        {"fragmented_pool_failures", profile.memory.descriptors.fragmentedPoolFailures},
+        {"pool_growth_count", profile.memory.descriptors.poolGrowthCount},
+    };
+    json ui = {
+        {"present", profile.memory.ui.present},
+        {"descriptor_max_sets", profile.memory.ui.descriptorMaxSets},
+        {"combined_image_sampler_descriptors", profile.memory.ui.combinedImageSamplerDescriptors},
+        {"sampled_image_descriptors", profile.memory.ui.sampledImageDescriptors},
+        {"sampler_descriptors", profile.memory.ui.samplerDescriptors},
+        {"viewport_descriptor_allocated", profile.memory.ui.viewportDescriptorAllocated},
+    };
     json j = {
         {"textures_bytes", profile.memory.texturesBytes},
         {"buffers_bytes", profile.memory.buffersBytes},
         {"acceleration_structure_bytes", profile.memory.accelerationStructureBytes},
         {"temporal_history_bytes", profile.memory.temporalHistoryBytes},
         {"restir_reservoir_bytes", profile.memory.restirReservoirBytes},
-        {"transient_resources_bytes", 0},
+        {"staging_upload_total_bytes", profile.memory.stagingUploadTotalBytes},
+        {"staging_upload_peak_bytes", profile.memory.stagingUploadPeakBytes},
+        {"staging_upload_last_bytes", profile.memory.stagingUploadLastBytes},
+        {"staging_upload_count", profile.memory.stagingUploadCount},
+        {"staging_buffer_upload_count", profile.memory.stagingBufferUploadCount},
+        {"staging_image_upload_count", profile.memory.stagingImageUploadCount},
+        {"staging_batch_upload_count", profile.memory.stagingBatchUploadCount},
+        {"transient_resources_bytes", transientStats.estimatedBytes},
+        {"transient_alias_eligible_bytes", transientStats.aliasEligibleBytes},
+        {"rendergraph_active_alias_saved_bytes", transientStats.activeAliasSavedBytes},
+        {"transient_resource_count", transientStats.transientResourceCount},
+        {"transient_alias_eligible_resource_count", transientStats.aliasEligibleResourceCount},
+        {"rendergraph_active_alias_count", transientStats.activeAliasCount},
         {"persistent_resources_bytes", persistent},
-        {"total_bytes", persistent},
-        {"notes", json::array({"transient resource byte accounting is reported as 0 until RenderGraph allocator exposes per-frame alias pool totals"})},
+        {"total_bytes", totalBytes},
+        {"vma_budget", vmaBudget},
+        {"descriptor_pools", descriptorPools},
+        {"ui", ui},
+        {"notes", json::array({"transient_resources_bytes is derived from rendergraph.json lifetime estimates when --dump-rendergraph is provided"})},
     };
     writeJsonFile(outputPath, j);
 }
@@ -1124,11 +1260,15 @@ void writeResourceLifetimes(
             {"name", name},
             {"type", resource.value("type", "unknown")},
             {"lifetime", resource.value("lifetime", "unknown")},
+            {"index", resource.contains("index") ? resource["index"] : json(nullptr)},
+            {"lifetime_interval", resource.value("lifetime_interval", json::object())},
+            {"aliasing", resource.value("aliasing", json::object())},
             {"created_by", nullptr},
             {"destroyed_after", nullptr},
             {"reads", json::array()},
             {"writes", json::array()},
             {"aliases", json::array()},
+            {"alias_rejections", json::array()},
         };
     }
     for (const auto& pass : graph.value("passes", json::array())) {
@@ -1145,12 +1285,40 @@ void writeResourceLifetimes(
             entry["destroyed_after"] = passName;
         }
     }
+    for (const auto& check : graph.value("alias_checks", json::array())) {
+        const std::string a = check.value("resource_a", "");
+        const std::string b = check.value("resource_b", "");
+        if (a.empty() || b.empty()) {
+            continue;
+        }
+        const bool candidate = check.value("schedule_candidate", false);
+        json compact = {
+            {"resource", b},
+            {"lifetimes_overlap", check.value("lifetimes_overlap", true)},
+            {"physical_alias_candidate", check.value("physical_alias_candidate", false)},
+            {"estimated_saved_bytes", check.value("estimated_saved_bytes", 0)},
+            {"reason", check.value("reason", "")},
+        };
+        json reverse = compact;
+        reverse["resource"] = a;
+        if (candidate) {
+            resources[a]["aliases"].push_back(compact);
+            resources[b]["aliases"].push_back(reverse);
+        } else {
+            resources[a]["alias_rejections"].push_back(compact);
+            resources[b]["alias_rejections"].push_back(reverse);
+        }
+    }
     json out = json::array();
     for (auto& [name, resource] : resources) {
         (void)name;
         out.push_back(resource);
     }
-    writeJsonFile(outputPath, {{"resources", out}});
+    writeJsonFile(outputPath, {
+        {"resources", out},
+        {"alias_checks", graph.value("alias_checks", json::array())},
+        {"resource_aliasing", graph.value("resource_aliasing", json::object())},
+    });
 }
 
 void writeShaderReport(

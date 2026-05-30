@@ -193,6 +193,33 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "restirgihitdistance" || key == "gihitdistance" || key == "gireservoirhitdistance") {
         return RendererDebugView::RestirGiHitDistance;
     }
+    if (key == "wavefrontqueueoccupancy" || key == "wavefrontoccupancy" || key == "queueoccupancy") {
+        return RendererDebugView::WavefrontQueueOccupancy;
+    }
+    if (key == "wavefrontpathdepth" || key == "wavefrontdepth" || key == "queuedepth") {
+        return RendererDebugView::WavefrontPathDepth;
+    }
+    if (key == "wavefrontliverays" || key == "wavefrontlive" || key == "liverays") {
+        return RendererDebugView::WavefrontLiveRays;
+    }
+    if (key == "wavefrontterminatedrays" || key == "wavefrontterminated" || key == "terminatedrays") {
+        return RendererDebugView::WavefrontTerminatedRays;
+    }
+    if (key == "wavefrontmaterialbucket" || key == "materialbucket" || key == "materialbuckets") {
+        return RendererDebugView::WavefrontMaterialBucket;
+    }
+    if (key == "wavefrontrestirdi" || key == "wavefrontrestir" || key == "wavefrontreservoir" || key == "wavefrontrestirdireservoir") {
+        return RendererDebugView::WavefrontRestirDi;
+    }
+    if (key == "wavefrontrestirgi" || key == "wavefrontgireservoir" || key == "wavefrontrestirgireservoir") {
+        return RendererDebugView::WavefrontRestirGi;
+    }
+    if (key == "wavefrontdirectlighting" || key == "wavefrontdirect" || key == "wavefrontdirectlight") {
+        return RendererDebugView::WavefrontDirectLighting;
+    }
+    if (key == "causticvisibility" || key == "caustics" || key == "mneecaustics" || key == "causticshadow") {
+        return RendererDebugView::CausticVisibility;
+    }
     if (key == "denoiserdirectdiffusevariance" || key == "directdiffusevariance" || key == "ddvariance") {
         return RendererDebugView::DenoiserDirectDiffuseVariance;
     }
@@ -313,6 +340,15 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirGiFinal: return "restir-gi-final";
     case RendererDebugView::RestirGiNormal: return "restir-gi-normal";
     case RendererDebugView::RestirGiHitDistance: return "restir-gi-hit-distance";
+    case RendererDebugView::WavefrontQueueOccupancy: return "wavefront-queue-occupancy";
+    case RendererDebugView::WavefrontPathDepth: return "wavefront-path-depth";
+    case RendererDebugView::WavefrontLiveRays: return "wavefront-live-rays";
+    case RendererDebugView::WavefrontTerminatedRays: return "wavefront-terminated-rays";
+    case RendererDebugView::WavefrontMaterialBucket: return "wavefront-material-bucket";
+    case RendererDebugView::WavefrontRestirDi: return "wavefront-restir-di";
+    case RendererDebugView::WavefrontDirectLighting: return "wavefront-direct-lighting";
+    case RendererDebugView::WavefrontRestirGi: return "wavefront-restir-gi";
+    case RendererDebugView::CausticVisibility: return "caustic-visibility";
     case RendererDebugView::DenoiserDirectDiffuseVariance: return "denoiser-direct-diffuse-variance";
     case RendererDebugView::DenoiserDirectSpecularVariance: return "denoiser-direct-specular-variance";
     case RendererDebugView::DenoiserIndirectDiffuseVariance: return "denoiser-indirect-diffuse-variance";

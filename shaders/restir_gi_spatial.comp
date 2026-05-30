@@ -80,20 +80,14 @@ float gi_reservoir_compatibility(
         return 0.0;
     }
 
-    vec3 centerToCandidateHit = candidate.hit_position_target_pdf.xyz - center.receiver_position_hit_distance.xyz;
-    float centerFacing = dot(centerSurface.normal, normalize(centerToCandidateHit));
-    if (centerFacing <= 0.03) {
-        return 0.0;
-    }
-
-    float hitDistance = length(centerToCandidateHit);
-    float candidateDistance = max(candidate.receiver_position_hit_distance.w, 0.25);
+    float hitDistance = max(restir_gi_hit_distance(center), 0.25);
+    float candidateDistance = max(restir_gi_hit_distance(candidate), 0.25);
     float distanceRatio = min(hitDistance, candidateDistance) / max(hitDistance, candidateDistance);
     float selectedNormalAgreement = dot(restir_gi_normal(center), restir_gi_normal(candidate));
     float selectedNormalConfidence = smoothstep(0.45, 0.92, selectedNormalAgreement);
 
-    float currentTarget = max(center.hit_position_target_pdf.w, 1.0e-5);
-    float candidateTarget = max(candidate.hit_position_target_pdf.w, 1.0e-5);
+    float currentTarget = max(restir_gi_target_pdf(center), 1.0e-5);
+    float candidateTarget = max(restir_gi_target_pdf(candidate), 1.0e-5);
     float targetConfidence = sqrt(min(currentTarget, candidateTarget) / max(currentTarget, candidateTarget));
 
     return surfaceCompatibility *
@@ -103,19 +97,25 @@ float gi_reservoir_compatibility(
 }
 
 RestirGiReservoir merge_gi_candidate(RestirGiReservoir merged, RestirGiReservoir candidate, float compatibility) {
-    float mergedWeight = max(merged.hit_position_target_pdf.w, 0.0) * restir_gi_sample_count(merged);
-    float candidateWeight = max(candidate.hit_position_target_pdf.w, 0.0) *
+    float mergedWeight = max(restir_gi_target_pdf(merged), 0.0) * restir_gi_sample_count(merged);
+    float candidateWeight = max(restir_gi_target_pdf(candidate), 0.0) *
         min(restir_gi_sample_count(candidate), 16.0) *
         compatibility;
     float totalWeight = max(mergedWeight + candidateWeight, 1.0e-6);
     float candidateMix = clamp(candidateWeight / totalWeight, 0.0, 0.65);
 
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     merged.hit_position_target_pdf.xyz = mix(merged.hit_position_target_pdf.xyz, candidate.hit_position_target_pdf.xyz, candidateMix);
+    merged.receiver_position_hit_distance.xyz = mix(merged.receiver_position_hit_distance.xyz, candidate.receiver_position_hit_distance.xyz, candidateMix);
+#endif
     restir_gi_set_normal(merged, normalize(mix(restir_gi_normal(merged), restir_gi_normal(candidate), candidateMix)));
     float mergedRoughness = mix(restir_gi_roughness(merged), restir_gi_roughness(candidate), candidateMix);
     merged.radiance_weight_sum.rgb = mix(merged.radiance_weight_sum.rgb, candidate.radiance_weight_sum.rgb, candidateMix);
     merged.radiance_weight_sum.w = min(merged.radiance_weight_sum.w + candidate.radiance_weight_sum.w * compatibility, 32.0);
-    merged.hit_position_target_pdf.w = max(restir_luminance(merged.radiance_weight_sum.rgb), 1.0e-4);
+    restir_gi_set_hit_distance_target_pdf(
+        merged,
+        mix(restir_gi_hit_distance(merged), restir_gi_hit_distance(candidate), candidateMix),
+        max(restir_luminance(merged.radiance_weight_sum.rgb), 1.0e-4));
     restir_gi_set_metadata(
         merged,
         uint(clamp(ceil(merged.radiance_weight_sum.w), 1.0, 32.0)),

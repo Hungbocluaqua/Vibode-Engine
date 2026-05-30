@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -66,6 +67,15 @@ float timingForPassName(const GpuFrameTimings& timings, const std::string& name)
     if (name.find("selection_outline") == 0) return timings.selectionOutlineMs;
     if (name.find("fullscreen") == 0) return timings.fullscreenMs;
     if (name.find("editor_presentation") == 0) return timings.editorPresentationMs;
+    if (name == "wavefront_trace_rt") return timings.wavefrontTraceMs;
+    if (name == "wavefront_secondary_trace_rt") return timings.wavefrontSecondaryTraceMs;
+    if (name == "wavefront_sorted_trace_rt") return timings.wavefrontSortedTraceMs;
+    if (name == "wavefront_shadow_trace_rt") return timings.wavefrontShadowTraceMs;
+    if (name == "wavefront_shade") return timings.wavefrontShadeMs;
+    if (name == "wavefront_secondary_shade") return timings.wavefrontSecondaryShadeMs;
+    if (name == "wavefront_sorted_shade") return timings.wavefrontSortedShadeMs;
+    if (name == "wavefront_compact") return timings.wavefrontCompactMs;
+    if (name == "wavefront_sort") return timings.wavefrontSortMs;
     return 0.0f;
 }
 
@@ -99,6 +109,45 @@ const char* domainColor(RenderGraphQueueDomain domain) {
     return "white";
 }
 
+std::string passNameOrNull(const std::vector<RenderGraphPass>& passes, uint32_t passIndex) {
+    if (passIndex == std::numeric_limits<uint32_t>::max()) {
+        return {};
+    }
+    return passIndex < passes.size() ? passes[passIndex].name() : std::string{};
+}
+
+bool lifetimesOverlap(const TransientResourceLifetime& a, const TransientResourceLifetime& b) {
+    if (a.firstUsePass == std::numeric_limits<uint32_t>::max() ||
+        b.firstUsePass == std::numeric_limits<uint32_t>::max()) {
+        return true;
+    }
+    return !(a.lastUsePass < b.firstUsePass || b.lastUsePass < a.firstUsePass);
+}
+
+bool resourcesAliasCompatible(const RenderGraphResource& a, const RenderGraphResource& b) {
+    if (a.type != b.type) {
+        return false;
+    }
+    if (a.type == RenderGraphResource::Type::Buffer) {
+        return a.size == b.size && a.bufferUsage == b.bufferUsage;
+    }
+    return a.format == b.format &&
+        a.extent.width == b.extent.width &&
+        a.extent.height == b.extent.height &&
+        a.extent.depth == b.extent.depth &&
+        a.usage == b.usage;
+}
+
+bool resourcesSharePhysicalHandle(const RenderGraphResource& a, const RenderGraphResource& b) {
+    if (a.type != b.type) {
+        return false;
+    }
+    if (a.type == RenderGraphResource::Type::Buffer) {
+        return a.buffer != VK_NULL_HANDLE && a.buffer == b.buffer;
+    }
+    return a.image != VK_NULL_HANDLE && a.image == b.image;
+}
+
 } // namespace
 
 const char* pipelineDomainName(PipelineDomain domain) {
@@ -126,8 +175,12 @@ const char* vulkanStageName(VkPipelineStageFlags2 stage) {
 
 const char* vulkanAccessName(VkAccessFlags2 access) {
     if (access == VK_ACCESS_2_NONE) return "NONE";
+    if ((access & VK_ACCESS_2_SHADER_READ_BIT) && (access & VK_ACCESS_2_SHADER_WRITE_BIT)) return "SHADER_READ_WRITE";
+    if ((access & VK_ACCESS_2_SHADER_STORAGE_READ_BIT) && (access & VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)) return "SHADER_STORAGE_READ_WRITE";
     if (access & VK_ACCESS_2_SHADER_WRITE_BIT) return "SHADER_WRITE";
     if (access & VK_ACCESS_2_SHADER_READ_BIT) return "SHADER_READ";
+    if (access & VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT) return "SHADER_STORAGE_WRITE";
+    if (access & VK_ACCESS_2_SHADER_STORAGE_READ_BIT) return "SHADER_STORAGE_READ";
     if (access & VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT) return "COLOR_ATTACHMENT_WRITE";
     if (access & VK_ACCESS_2_TRANSFER_WRITE_BIT) return "TRANSFER_WRITE";
     if (access & VK_ACCESS_2_TRANSFER_READ_BIT) return "TRANSFER_READ";
@@ -160,6 +213,12 @@ void dumpRenderGraphJson(
     const auto& compiledOrder = graph.compiledPassOrder();
     const auto& resources = graph.resources();
     const auto& barriers = graph.compiledBarriers();
+    const auto& lifetimes = graph.resourceLifetimes();
+
+    j["resource_aliasing"] = {
+        {"enabled", graph.aliasingEnabled()},
+        {"mode", "diagnostic_lifetimes"},
+    };
 
     nlohmann::json passesJson = nlohmann::json::array();
     for (uint32_t passIndex : compiledOrder) {
@@ -215,6 +274,10 @@ void dumpRenderGraphJson(
                 const char* beforePassName = barrier.beforePass < passes.size() ? passes[barrier.beforePass].name().c_str() : "<external>";
                 nlohmann::json bj;
                 bj["resource"] = resName;
+                if (res.type == RenderGraphResource::Type::Buffer) {
+                    bj["buffer_offset"] = res.bufferOffset;
+                    bj["size_bytes"] = res.size;
+                }
                 bj["before_pass"] = beforePassName;
                 bj["after_pass"] = pass.name();
                 bj["before_queue"] = queueNameForDomain(barrier.beforeQueue);
@@ -240,8 +303,10 @@ void dumpRenderGraphJson(
     j["passes"] = passesJson;
 
     nlohmann::json resourcesJson = nlohmann::json::array();
-    for (const auto& res : resources) {
+    for (uint32_t resourceIndex = 0; resourceIndex < resources.size(); ++resourceIndex) {
+        const auto& res = resources[resourceIndex];
         nlohmann::json rj;
+        rj["index"] = resourceIndex;
         rj["name"] = res.debugName ? res.debugName : "unnamed";
         rj["type"] = resourceTypeName(res.type);
         rj["lifetime"] = resourceLifetimeName(res.lifetime);
@@ -250,10 +315,83 @@ void dumpRenderGraphJson(
             rj["extent"] = { {"width", res.extent.width}, {"height", res.extent.height} };
         } else {
             rj["size_bytes"] = res.size;
+            rj["buffer_offset"] = res.bufferOffset;
+        }
+        if (resourceIndex < lifetimes.size()) {
+            const auto& lifetime = lifetimes[resourceIndex];
+            auto passNameOrJsonNull = [&passes](uint32_t passIndex) -> nlohmann::json {
+                if (passIndex == std::numeric_limits<uint32_t>::max()) {
+                    return nullptr;
+                }
+                return passIndex < passes.size() ? nlohmann::json(passes[passIndex].name()) : nlohmann::json(nullptr);
+            };
+            rj["lifetime_interval"] = {
+                {"first_use_pass", passNameOrJsonNull(lifetime.firstUsePass)},
+                {"last_use_pass", passNameOrJsonNull(lifetime.lastUsePass)},
+                {"first_read_pass", passNameOrJsonNull(lifetime.firstReadPass)},
+                {"last_read_pass", passNameOrJsonNull(lifetime.lastReadPass)},
+                {"first_write_pass", passNameOrJsonNull(lifetime.firstWritePass)},
+                {"last_write_pass", passNameOrJsonNull(lifetime.lastWritePass)},
+                {"first_queue", queueNameForDomain(lifetime.firstUseQueue)},
+                {"last_queue", queueNameForDomain(lifetime.lastUseQueue)},
+                {"first_access", {
+                    {"stage", vulkanStageName(lifetime.firstAccess.stage)},
+                    {"access", vulkanAccessName(lifetime.firstAccess.access)},
+                    {"layout", vulkanLayoutName(lifetime.firstAccess.layout)}
+                }},
+                {"last_access", {
+                    {"stage", vulkanStageName(lifetime.lastAccess.stage)},
+                    {"access", vulkanAccessName(lifetime.lastAccess.access)},
+                    {"layout", vulkanLayoutName(lifetime.lastAccess.layout)}
+                }},
+            };
+            rj["aliasing"] = {
+                {"eligible", lifetime.aliasEligible},
+                {"aliased", lifetime.aliased},
+                {"alias_group", lifetime.aliasGroup},
+                {"estimated_bytes", lifetime.estimatedBytes},
+            };
         }
         resourcesJson.push_back(rj);
     }
     j["resources"] = resourcesJson;
+
+    nlohmann::json aliasChecks = nlohmann::json::array();
+    for (uint32_t i = 0; i < resources.size(); ++i) {
+        if (i >= lifetimes.size() || lifetimes[i].firstUsePass == std::numeric_limits<uint32_t>::max()) {
+            continue;
+        }
+        for (uint32_t k = i + 1; k < resources.size(); ++k) {
+            if (k >= lifetimes.size() || lifetimes[k].firstUsePass == std::numeric_limits<uint32_t>::max()) {
+                continue;
+            }
+            if (!resourcesAliasCompatible(resources[i], resources[k])) {
+                continue;
+            }
+            const bool overlap = lifetimesOverlap(lifetimes[i], lifetimes[k]);
+            const bool sharedPhysicalHandle = resourcesSharePhysicalHandle(resources[i], resources[k]);
+            const bool physicalCandidate = !resources[i].external && !resources[k].external &&
+                lifetimes[i].aliasEligible && lifetimes[k].aliasEligible && !overlap;
+            const bool physicalAliasActive = sharedPhysicalHandle && !overlap;
+            const bool scheduleCandidate = !overlap;
+            nlohmann::json check;
+            check["resource_a"] = resources[i].debugName ? resources[i].debugName : "unnamed";
+            check["resource_b"] = resources[k].debugName ? resources[k].debugName : "unnamed";
+            check["compatible_shape"] = true;
+            check["lifetimes_overlap"] = overlap;
+            check["shared_physical_handle"] = sharedPhysicalHandle;
+            check["schedule_candidate"] = scheduleCandidate;
+            check["physical_alias_candidate"] = physicalCandidate || physicalAliasActive;
+            check["estimated_saved_bytes"] = scheduleCandidate ? std::min(lifetimes[i].estimatedBytes, lifetimes[k].estimatedBytes) : 0;
+            check["reason"] = physicalAliasActive
+                ? "active physical handle reuse"
+                : (overlap
+                ? "lifetimes overlap"
+                : (physicalCandidate ? "eligible transient non-overlap" : "non-overlap but externally allocated or not transient"));
+            aliasChecks.push_back(check);
+        }
+    }
+    j["alias_checks"] = aliasChecks;
 
     nlohmann::json barriersJson = nlohmann::json::array();
     for (const auto& barrier : barriers) {
@@ -266,6 +404,10 @@ void dumpRenderGraphJson(
         const char* afterPassName = barrier.afterPass < passes.size() ? passes[barrier.afterPass].name().c_str() : "<external>";
         nlohmann::json bj;
         bj["resource"] = resName;
+        if (res.type == RenderGraphResource::Type::Buffer) {
+            bj["buffer_offset"] = res.bufferOffset;
+            bj["size_bytes"] = res.size;
+        }
         bj["before_pass"] = beforePassName;
         bj["after_pass"] = afterPassName;
         bj["before_queue"] = queueNameForDomain(barrier.beforeQueue);

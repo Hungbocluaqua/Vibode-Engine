@@ -30,6 +30,16 @@ struct TransientResourceLifetime {
     uint32_t resourceIndex = 0;
     uint32_t firstUsePass = UINT32_MAX;
     uint32_t lastUsePass = UINT32_MAX;
+    uint32_t firstReadPass = UINT32_MAX;
+    uint32_t lastReadPass = UINT32_MAX;
+    uint32_t firstWritePass = UINT32_MAX;
+    uint32_t lastWritePass = UINT32_MAX;
+    RenderGraphQueueDomain firstUseQueue = RenderGraphQueueDomain::Graphics;
+    RenderGraphQueueDomain lastUseQueue = RenderGraphQueueDomain::Graphics;
+    ResourceAccess firstAccess{};
+    ResourceAccess lastAccess{};
+    VkDeviceSize estimatedBytes = 0;
+    bool aliasEligible = false;
     bool aliased = false;
     uint32_t aliasGroup = 0;
 };
@@ -79,7 +89,7 @@ private:
 
 class RenderGraph {
 public:
-    explicit RenderGraph(ResourceAllocator* allocator = nullptr);
+    explicit RenderGraph(ResourceAllocator* allocator = nullptr, bool enableAliasing = true);
 
     RenderGraphResourceId createTexture(const RenderGraphResource& desc);
     RenderGraphResourceId createBuffer(const RenderGraphResource& desc);
@@ -98,6 +108,8 @@ public:
     [[nodiscard]] const std::vector<RenderGraphBarrier>& compiledBarriers() const { return compiledBarriers_; }
     [[nodiscard]] const std::vector<TransientResourceLifetime>& resourceLifetimes() const { return resourceLifetimes_; }
     [[nodiscard]] bool compiled() const { return compiled_; }
+    [[nodiscard]] bool aliasingEnabled() const { return aliasingEnabled_; }
+    void setAliasingEnabled(bool enabled) { aliasingEnabled_ = enabled; compiled_ = false; }
 
     [[nodiscard]] bool hasAsyncCompute() const { return asyncComputeQueue_ != VK_NULL_HANDLE && timelineSemaphore_ != VK_NULL_HANDLE; }
     void setAsyncComputeQueue(VkQueue queue, uint32_t familyIndex);
@@ -118,6 +130,7 @@ private:
     uint32_t asyncComputeFamily_ = UINT32_MAX;
     VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
     uint64_t timelineValue_ = 0;
+    bool aliasingEnabled_ = true;
     bool compiled_ = false;
 };
 

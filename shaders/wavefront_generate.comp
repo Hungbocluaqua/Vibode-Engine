@@ -1,0 +1,173 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "blue_noise.glsl"
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform Camera {
+    vec4 pos;
+    vec4 forward;
+    vec4 right;
+    vec4 up;
+    uint frame_count;
+    uint temporal_frame_index;
+    float effective_jitter_scale;
+    uint camera_moving;
+    float sun_intensity;
+    float sky_intensity;
+    float exposure;
+    uint path_tracing_enabled;
+    uint max_bounces;
+    uint sunlight_enabled;
+    uint direct_lighting_enabled;
+    float fov_y;
+    float sun_angular_radius;
+    float indirect_strength;
+    uint environment_direct_samples;
+    uint padding0;
+    vec4 jitter;
+    vec4 atmosphere;
+    vec4 render_controls;
+    vec4 sun_direction_illuminance;
+    vec4 sun_color_angular_radius;
+    uvec4 restir_gi_controls;
+    uvec4 path_trace_controls;
+    vec4 dof_controls;
+    vec4 motion_blur_controls;
+    vec4 volume_controls;
+} camera;
+
+layout(set = 0, binding = 1, std430) buffer RayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} ray_queue;
+
+layout(set = 0, binding = 2, std430) buffer PixelStateBuffer {
+    WavefrontQueueHeader header;
+    WavefrontPixelState records[];
+} pixel_state;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint frame_index;
+    uint flags;
+    uint camera_cut;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+} pc;
+
+uint hash_combine(uint seed, uint value) {
+    seed ^= value + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
+    seed ^= seed >> 16u;
+    seed *= 0x7feb352du;
+    seed ^= seed >> 15u;
+    seed *= 0x846ca68bu;
+    seed ^= seed >> 16u;
+    return seed;
+}
+
+vec2 concentric_disk_sample(vec2 u) {
+    vec2 offset = u * 2.0 - vec2(1.0);
+    if (abs(offset.x) < 1.0e-7 && abs(offset.y) < 1.0e-7) {
+        return vec2(0.0);
+    }
+
+    float r;
+    float theta;
+    if (abs(offset.x) > abs(offset.y)) {
+        r = offset.x;
+        theta = 0.7853981633974483 * (offset.y / offset.x);
+    } else {
+        r = offset.y;
+        theta = 1.5707963267948966 - 0.7853981633974483 * (offset.x / offset.y);
+    }
+    return r * vec2(cos(theta), sin(theta));
+}
+
+float polygon_aperture_radius(vec2 dir, float bladeCount, float rotation) {
+    if (bladeCount < 3.0 || dot(dir, dir) <= 1.0e-8) {
+        return 1.0;
+    }
+    float blades = clamp(floor(bladeCount + 0.5), 3.0, 16.0);
+    float sector = 6.283185307179586 / blades;
+    float local = mod(atan(dir.y, dir.x) - rotation + sector * 0.5, sector) - sector * 0.5;
+    return cos(3.141592653589793 / blades) / max(cos(local), 1.0e-4);
+}
+
+struct PrimaryRay {
+    vec3 origin;
+    vec3 direction;
+};
+
+PrimaryRay primary_ray(uvec2 pixel) {
+    vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
+    vec2 uv = (vec2(pixel) + jitter) / vec2(max(pc.width, 1u), max(pc.height, 1u));
+    vec2 ndc = uv * 2.0 - vec2(1.0);
+    float aspect = float(pc.width) / max(float(pc.height), 1.0);
+    float scale = tan(camera.fov_y * 0.5);
+    vec3 pinholeDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
+
+    PrimaryRay ray;
+    ray.origin = camera.pos.xyz;
+    ray.direction = pinholeDir;
+
+    float apertureRadius = max(camera.dof_controls.x, 0.0);
+    if (apertureRadius <= 1.0e-6) {
+        return ray;
+    }
+
+    ivec2 sampleCoords = ivec2(pixel);
+    vec2 lens = concentric_disk_sample(sample_dimension_2d(sampleCoords, camera.temporal_frame_index, 0u, SAMPLE_DIM_CAMERA_LENS));
+    lens *= polygon_aperture_radius(lens, camera.dof_controls.z, camera.dof_controls.w) * apertureRadius;
+    float forwardProjection = max(dot(pinholeDir, normalize(camera.forward.xyz)), 1.0e-4);
+    vec3 focusPoint = camera.pos.xyz + pinholeDir * (max(camera.dof_controls.y, 0.01) / forwardProjection);
+    ray.origin = camera.pos.xyz + camera.right.xyz * lens.x + camera.up.xyz * lens.y;
+    ray.direction = normalize(focusPoint - ray.origin);
+    return ray;
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.width || pixel.y >= pc.height) {
+        return;
+    }
+
+    uint pixel_index = pixel.y * pc.width + pixel.x;
+    atomicAdd(ray_queue.header.counters.x, 1u);
+    atomicAdd(pixel_state.header.counters.x, 1u);
+
+    uint common_flags = pc.flags;
+    if (camera.camera_moving != 0u) {
+        common_flags |= 1u;
+    }
+    if (pc.camera_cut != 0u) {
+        common_flags |= 2u;
+    }
+
+    uint rng = hash_combine(hash_combine(pixel_index, camera.temporal_frame_index), pc.frame_index);
+    PrimaryRay primary = primary_ray(pixel);
+
+    if (pixel_index < ray_queue.header.counters.y) {
+        WavefrontRay ray;
+        ray.origin_tmin = vec4(primary.origin, 0.001);
+        ray.direction_tmax = vec4(primary.direction, 10000.0);
+        ray.pixel_depth_rng_flags = uvec4(pixel_index, 0u, rng, common_flags);
+        ray_queue.records[pixel_index] = ray;
+    }
+
+    if (pixel_index < pixel_state.header.counters.y) {
+        WavefrontPixelState state;
+        state.radiance = vec4(0.0);
+        state.throughput = vec4(1.0, 1.0, 1.0, 1.0);
+        state.direct_lighting = vec4(0.0);
+        state.indirect_lighting = vec4(0.0);
+        state.atmosphere_transmittance = vec4(0.0);
+        state.rng_depth_flags = uvec4(rng, 0u, common_flags, pixel_index);
+        state.material_instance_primitive = uvec4(0xffffffffu);
+        pixel_state.records[pixel_index] = state;
+    }
+}

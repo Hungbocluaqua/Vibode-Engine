@@ -1,0 +1,70 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint ray_capacity;
+    uint hit_capacity;
+    uint shadow_capacity;
+    uint pixel_capacity;
+    uint max_path_depth;
+    uint frame_index;
+    uint validation_value;
+    uint flags;
+} pc;
+
+layout(set = 0, binding = 0, std430) buffer RayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} ray_queue;
+
+layout(set = 0, binding = 1, std430) buffer HitQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontHit records[];
+} hit_queue;
+
+layout(set = 0, binding = 2, std430) buffer ShadowQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontShadowRay records[];
+} shadow_queue;
+
+layout(set = 0, binding = 3, std430) buffer PixelStateBuffer {
+    WavefrontQueueHeader header;
+    WavefrontPixelState records[];
+} pixel_state;
+
+void init_header(inout WavefrontQueueHeader header, uint capacity, uint read_offset) {
+    header.counters = uvec4(0u, capacity, read_offset, 0u);
+    header.metadata = uvec4(pc.max_path_depth, pc.frame_index, 0u, pc.flags);
+}
+
+void main() {
+    init_header(ray_queue.header, pc.ray_capacity, pc.pixel_capacity);
+    init_header(hit_queue.header, pc.hit_capacity, 0u);
+    init_header(shadow_queue.header, pc.shadow_capacity, 0u);
+    init_header(pixel_state.header, pc.pixel_capacity, 0u);
+
+    uint previous = atomicAdd(ray_queue.header.metadata.z, 1u);
+    ray_queue.header.metadata.z = (previous == 0u && ray_queue.header.metadata.z == 1u)
+        ? pc.validation_value
+        : 0u;
+    hit_queue.header.metadata.z = pc.validation_value;
+    shadow_queue.header.metadata.z = pc.validation_value;
+    pixel_state.header.metadata.z = pc.validation_value;
+
+    const bool layout_ok =
+        WAVEFRONT_QUEUE_HEADER_STRIDE_BYTES == 32u &&
+        WAVEFRONT_RAY_STRIDE_BYTES == 48u &&
+        WAVEFRONT_HIT_STRIDE_BYTES == 112u &&
+        WAVEFRONT_SHADOW_RAY_STRIDE_BYTES == 48u &&
+        WAVEFRONT_PIXEL_STATE_STRIDE_BYTES == 112u;
+    if (!layout_ok) {
+        ray_queue.header.metadata.z = 0u;
+        hit_queue.header.metadata.z = 0u;
+        shadow_queue.header.metadata.z = 0u;
+        pixel_state.header.metadata.z = 0u;
+    }
+}

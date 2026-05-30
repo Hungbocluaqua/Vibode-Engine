@@ -3,6 +3,7 @@
 #include "rtv/Buffer.h"
 #include "rtv/BindlessResources.h"
 #include "rtv/Image.h"
+#include "rtv/OpacityMicromapPreprocess.h"
 #include "rtv/SceneCache.h"
 #include "rtv/TextureAsset.h"
 
@@ -49,7 +50,10 @@ struct alignas(16) CameraUniform {
     glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
     glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
     glm::uvec4 restirGiControls{24u, 0u, 0u, 1u}; // x = temporal max age, y = half-resolution reuse, z = visibility ray budget, w = specular AA enabled
-    glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, zw = reserved
+    glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, z = RT counters, w = caustic visibility
+    glm::vec4 dofControls{0.0f, 10.0f, 0.0f, 0.0f}; // x = aperture radius, y = focus distance, z = blade count, w = bokeh rotation
+    glm::vec4 motionBlurControls{0.0f, 0.0f, 1.0f, 0.0f}; // x = enabled, y = shutter open, z = shutter close, w = reserved
+    glm::vec4 volumeControls{0.0f, 0.0f, 0.0f, 0.0f}; // x = enabled, y = sigma_s, z = sigma_a, w = anisotropy
 };
 
 static_assert(offsetof(CameraUniform, jitter) == 128, "CameraUniform::jitter must match std140 layout");
@@ -59,7 +63,10 @@ static_assert(offsetof(CameraUniform, sunDirectionIlluminance) == 176, "CameraUn
 static_assert(offsetof(CameraUniform, sunColorAngularRadius) == 192, "CameraUniform::sunColorAngularRadius must match std140 layout");
 static_assert(offsetof(CameraUniform, restirGiControls) == 208, "CameraUniform::restirGiControls must match std140 layout");
 static_assert(offsetof(CameraUniform, pathTraceControls) == 224, "CameraUniform::pathTraceControls must match std140 layout");
-static_assert(sizeof(CameraUniform) == 240, "CameraUniform size must match std140 layout");
+static_assert(offsetof(CameraUniform, dofControls) == 240, "CameraUniform::dofControls must match std140 layout");
+static_assert(offsetof(CameraUniform, motionBlurControls) == 256, "CameraUniform::motionBlurControls must match std140 layout");
+static_assert(offsetof(CameraUniform, volumeControls) == 272, "CameraUniform::volumeControls must match std140 layout");
+static_assert(sizeof(CameraUniform) == 288, "CameraUniform size must match std140 layout");
 
 struct MeshParamsUniform {
     uint32_t vertexCount = 0;
@@ -154,14 +161,28 @@ struct RayTracingMeshBuildInput {
     uint32_t primitiveOffset = 0;
     uint32_t primitiveCount = 0;
     bool containsAlphaTestedGeometry = false;
+    bool containsBlendedGeometry = false;
     bool opaqueTraversalSafe = false;
     AccelUpdateMode updateMode = AccelUpdateMode::Static;
+};
+
+struct RayTracingGeometryStats {
+    uint32_t opaquePrimitiveCount = 0;
+    uint32_t alphaTestedPrimitiveCount = 0;
+    uint32_t blendedPrimitiveCount = 0;
+    uint32_t opaqueTriangleCount = 0;
+    uint32_t alphaTestedTriangleCount = 0;
+    uint32_t blendedTriangleCount = 0;
+    uint32_t meshCountWithOnlyOpaqueGeometry = 0;
+    uint32_t meshCountWithAlphaTestedGeometry = 0;
+    uint32_t meshCountWithBlendedGeometry = 0;
 };
 
 struct RayTracingInstanceBuildInput {
     uint32_t instanceIndex = 0;
     uint32_t meshIndex = 0;
     glm::mat4 transform{1.0f};
+    glm::mat4 previousTransform{1.0f};
     uint32_t flags = 0;
     bool visible = true;
 };
@@ -174,7 +195,8 @@ public:
         const SceneAsset* importedScene = nullptr,
         const AssetManager* assets = nullptr,
         std::optional<std::filesystem::path> environmentPath = std::nullopt,
-        std::optional<std::filesystem::path> sceneCachePath = std::nullopt);
+        std::optional<std::filesystem::path> sceneCachePath = std::nullopt,
+        uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel);
     ~GpuScene();
 
     [[nodiscard]] Buffer& vertices() { return *vertices_; }
@@ -225,17 +247,29 @@ public:
     [[nodiscard]] const EnvParamsUniform& envParams() const { return envParams_; }
     [[nodiscard]] const std::vector<RayTracingMeshBuildInput>& rayTracingMeshes() const { return rayTracingMeshes_; }
     [[nodiscard]] const std::vector<RayTracingInstanceBuildInput>& rayTracingInstances() const { return rayTracingInstances_; }
+    [[nodiscard]] const RayTracingGeometryStats& rayTracingGeometryStats() const { return rayTracingGeometryStats_; }
+    [[nodiscard]] const std::vector<GpuPrimitiveRecord>& primitiveRecordsCpu() const { return primitiveRecordCpu_; }
+    [[nodiscard]] const OpacityMicromapCpuData& opacityMicromapData() const { return opacityMicromapData_; }
 
     bool setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity);
     bool setSkyCdfDimensions(uint32_t width, uint32_t height);
     bool setMaterialTextureAnisotropy(float anisotropy, uint64_t retireFrame);
     void releaseRetiredMaterialSamplers(uint64_t completedFrame);
-    void loadEnvironment(BufferUploader& uploader, const std::filesystem::path& path);
+    void loadEnvironment(BufferUploader& uploader, const std::filesystem::path& path, uint64_t retireFrame);
     bool updateImportedMaterials(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
-    bool updateSceneLights(BufferUploader& uploader, const SceneAsset& scene);
-    bool updateInstanceTransforms(BufferUploader& uploader, const SceneAsset& scene, const AssetManager& assets);
+    bool updateSceneLights(BufferUploader& uploader, const SceneAsset& scene, uint64_t retireFrame);
+    bool updateInstanceTransforms(BufferUploader& uploader, const SceneAsset& scene, const AssetManager& assets, uint64_t retireFrame);
 
 private:
+    struct RetiredBuffer {
+        std::unique_ptr<Buffer> buffer;
+        uint64_t retireFrame = 0;
+    };
+    struct RetiredImage {
+        std::unique_ptr<Image> image;
+        uint64_t retireFrame = 0;
+    };
+
     void createCornellBox(BufferUploader& uploader);
     void createImportedScene(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
     void createImportedSceneFromCache(BufferUploader& uploader, const CachedScene& cached);
@@ -244,10 +278,13 @@ private:
     void createCachedMaterialTextures(BufferUploader& uploader, const CachedScene& cached);
     void createEnvironment(BufferUploader& uploader);
     void uploadEnvironmentParams();
-    void uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight);
-    void uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords);
+    void uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight, uint64_t retireFrame = 0);
+    void uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords, uint64_t retireFrame = 0);
     void destroyMaterialTextureSamplers();
     void retireMaterialTextureSampler(VkSampler sampler, uint64_t retireFrame);
+    void retireBuffer(std::unique_ptr<Buffer> buffer, uint64_t retireFrame);
+    void retireImage(std::unique_ptr<Image> image, uint64_t retireFrame);
+    void retireEnvironmentResources(uint64_t retireFrame);
     void recreateMaterialTextureSamplers(uint64_t retireFrame);
     void rebuildMaterialSamplerDescriptors(uint32_t slotCount);
     [[nodiscard]] static uint32_t textureSlotIndexFor(const SceneAsset& scene, TextureAssetHandle texture, uint32_t maxSlots);
@@ -255,6 +292,7 @@ private:
     ResourceAllocator& allocator_;
     std::optional<std::filesystem::path> environmentPath_;
     std::optional<std::filesystem::path> sceneCachePath_;
+    uint32_t opacityMicromapSubdivisionLevel_ = kDefaultOpacityMicromapSubdivisionLevel;
     std::unique_ptr<Buffer> vertices_;
     std::unique_ptr<Buffer> indices_;
     std::unique_ptr<Buffer> bvhNodes_;
@@ -288,6 +326,8 @@ private:
         uint64_t retireFrame = 0;
     };
     std::vector<RetiredMaterialSampler> retiredMaterialSamplers_;
+    std::vector<RetiredBuffer> retiredBuffers_;
+    std::vector<RetiredImage> retiredImages_;
     std::vector<TextureSamplerDesc> materialTextureSamplerDescs_;
     TextureSamplerDesc materialSamplerDesc_{};
     float materialTextureAnisotropy_ = 8.0f;
@@ -295,6 +335,9 @@ private:
     EnvParamsUniform envParams_{};
     std::vector<RayTracingMeshBuildInput> rayTracingMeshes_;
     std::vector<RayTracingInstanceBuildInput> rayTracingInstances_;
+    RayTracingGeometryStats rayTracingGeometryStats_{};
+    std::vector<GpuPrimitiveRecord> primitiveRecordCpu_;
+    OpacityMicromapCpuData opacityMicromapData_{};
     std::vector<GpuLightRecord> emissiveLightRecords_;
     std::vector<GpuInstanceRecord> instanceRecordCpu_;
 };

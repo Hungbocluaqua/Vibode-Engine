@@ -19,14 +19,19 @@
 #include <Volk/volk.h>
 #include <GLFW/glfw3.h>
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 #include <glm/glm.hpp>
@@ -59,6 +64,14 @@ RendererDebugView nextDebugView(RendererDebugView view) {
         }
     }
     return RendererDebugView::Beauty;
+}
+
+std::string normalizedCameraName(std::string_view name) {
+    std::string result{name};
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char ch) {
+        return ch == '_' ? '-' : static_cast<char>(std::tolower(ch));
+    });
+    return result;
 }
 
 float clampFrameDeltaSeconds(float rawDeltaSeconds, const PathTracerRenderer* renderer) {
@@ -151,6 +164,7 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.resolutionScale = settings.renderResolutionScale;
     render.materialTextureAnisotropy = settings.materialTextureAnisotropy;
     render.specularAaEnabled = settings.specularAaEnabled;
+    render.opacityMicromapsEnabled = settings.opacityMicromapsEnabled;
     render.shadowRayBias = settings.shadowRayBias;
     render.shadowDistanceBias = settings.shadowDistanceBias;
     render.fireflyClamp = settings.fireflyClamp;
@@ -168,6 +182,18 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.physicalShutterSeconds = settings.physicalShutterSeconds;
     render.physicalIso = settings.physicalIso;
     render.physicalExposureCompensation = settings.physicalExposureCompensation;
+    render.dofApertureRadius = settings.dofApertureRadius;
+    render.dofFocusDistance = settings.dofFocusDistance;
+    render.dofBladeCount = settings.dofBladeCount;
+    render.dofBokehRotation = settings.dofBokehRotation;
+    render.motionBlurEnabled = settings.motionBlurEnabled;
+    render.motionBlurShutterOpen = settings.motionBlurShutterOpen;
+    render.motionBlurShutterClose = settings.motionBlurShutterClose;
+    render.homogeneousVolumeEnabled = settings.homogeneousVolumeEnabled;
+    render.homogeneousVolumeScattering = settings.homogeneousVolumeScattering;
+    render.homogeneousVolumeAbsorption = settings.homogeneousVolumeAbsorption;
+    render.homogeneousVolumeAnisotropy = settings.homogeneousVolumeAnisotropy;
+    render.mneeCausticsEnabled = settings.mneeCausticsEnabled;
     Environment& environment = document.environment();
     environment.enabled = settings.environmentEnabled;
     environment.intensity = settings.environmentIntensity;
@@ -223,6 +249,7 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.renderResolutionScale = render.resolutionScale;
     settings.materialTextureAnisotropy = render.materialTextureAnisotropy;
     settings.specularAaEnabled = render.specularAaEnabled;
+    settings.opacityMicromapsEnabled = render.opacityMicromapsEnabled;
     settings.shadowRayBias = render.shadowRayBias;
     settings.shadowDistanceBias = render.shadowDistanceBias;
     settings.fireflyClamp = render.fireflyClamp;
@@ -240,6 +267,18 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.physicalShutterSeconds = render.physicalShutterSeconds;
     settings.physicalIso = render.physicalIso;
     settings.physicalExposureCompensation = render.physicalExposureCompensation;
+    settings.dofApertureRadius = render.dofApertureRadius;
+    settings.dofFocusDistance = render.dofFocusDistance;
+    settings.dofBladeCount = render.dofBladeCount;
+    settings.dofBokehRotation = render.dofBokehRotation;
+    settings.motionBlurEnabled = render.motionBlurEnabled;
+    settings.motionBlurShutterOpen = render.motionBlurShutterOpen;
+    settings.motionBlurShutterClose = render.motionBlurShutterClose;
+    settings.homogeneousVolumeEnabled = render.homogeneousVolumeEnabled;
+    settings.homogeneousVolumeScattering = render.homogeneousVolumeScattering;
+    settings.homogeneousVolumeAbsorption = render.homogeneousVolumeAbsorption;
+    settings.homogeneousVolumeAnisotropy = render.homogeneousVolumeAnisotropy;
+    settings.mneeCausticsEnabled = render.mneeCausticsEnabled;
     settings.environmentEnabled = environment.enabled;
     settings.environmentIntensity = environment.intensity;
     settings.environmentRotation = environment.rotation;
@@ -262,6 +301,7 @@ void applyDocumentMaterialAssignments(const SceneDocument& document, AssetManage
             const MaterialAssetHandle material = slots[i].resolvedMaterial();
             if (material.valid()) {
                 mesh->primitives[i].material = material;
+                updatePrimitiveAlphaClassification(mesh->primitives[i], assets.material(material));
             }
         }
     }
@@ -355,11 +395,15 @@ Application::Application(
     std::optional<RestirMode> restirModeOverride,
     std::optional<RenderPreset> renderPresetOverride,
     std::optional<bool> restirGiOverride,
+    std::optional<bool> opacityMicromapOverride,
+    std::optional<uint32_t> opacityMicromapSubdivisionOverride,
     bool debugViewOverride,
     bool validationCameraMotion,
+    bool validationObjectMotion,
     bool headless,
     bool disableAsyncCompute,
-    bool singleQueueFallback)
+    bool singleQueueFallback,
+    bool disableResourceAliasing)
     : debugView_(debugView),
       gltfPath_(std::move(gltfPath)),
       hdrPath_(std::move(hdrPath)),
@@ -368,10 +412,14 @@ Application::Application(
       restirModeOverride_(restirModeOverride),
       renderPresetOverride_(renderPresetOverride),
       restirGiOverride_(restirGiOverride),
+      opacityMicromapOverride_(opacityMicromapOverride),
+      opacityMicromapSubdivisionOverride_(opacityMicromapSubdivisionOverride),
       debugViewOverride_(debugViewOverride),
       validationCameraMotion_(validationCameraMotion),
+      validationObjectMotion_(validationObjectMotion),
       disableAsyncCompute_(disableAsyncCompute),
       singleQueueFallback_(singleQueueFallback),
+      disableResourceAliasing_(disableResourceAliasing),
       headless_(headless) {
     if (!headless_) {
         initWindow();
@@ -434,11 +482,14 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
         const float rawDeltaSeconds = 1.0f / 60.0f;
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
+        applyValidationObjectMotion(nextDiagnosticFrameIndex_);
         applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
         if (beginFrameCapture_) {
             beginFrameCapture_(frameCount + 1u);
         }
         commandSystem_->drawFrame(seconds, deltaSeconds);
+        ++frameSerial_;
+        releaseRetiredPathTracers();
         if (endFrameCapture_) {
             endFrameCapture_(frameCount + 1u);
         }
@@ -463,17 +514,235 @@ void Application::renderFrames(uint32_t count) {
         const float rawDeltaSeconds = 1.0f / 60.0f;
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
+        applyValidationObjectMotion(nextDiagnosticFrameIndex_);
         applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
         if (beginFrameCapture_) {
             beginFrameCapture_(i + 1u);
         }
         commandSystem_->drawFrame(seconds, deltaSeconds);
+        ++frameSerial_;
+        releaseRetiredPathTracers();
         if (endFrameCapture_) {
             endFrameCapture_(i + 1u);
         }
         seconds += deltaSeconds;
     }
     commandSystem_->waitIdle();
+}
+
+bool Application::runDescriptorLifetimeStress(
+    const std::filesystem::path& outputPath,
+    uint32_t cycles,
+    uint32_t framesPerCycle) {
+    if (!headless_) {
+        throw std::runtime_error("--descriptor-lifetime-stress requires --headless");
+    }
+    if (!pathTracer_ || !allocator_ || !commandSystem_) {
+        throw std::runtime_error("Descriptor lifetime stress requires an initialized renderer");
+    }
+
+    cycles = std::max(1u, cycles);
+    framesPerCycle = std::max(1u, framesPerCycle);
+
+    const RendererSettings originalSettings = pathTracer_->settings();
+    const auto initialDescriptorStats = pathTracer_->descriptorPoolStats();
+    const auto initialBudget = allocator_->memoryBudgetReport();
+
+    uint32_t maxPoolCount = initialDescriptorStats.poolCount;
+    uint32_t maxCapacitySets = initialDescriptorStats.capacitySets;
+    uint32_t maxAllocatedSets = initialDescriptorStats.allocatedSets;
+    uint32_t maxPeakAllocatedSets = initialDescriptorStats.peakAllocatedSets;
+    uint32_t maxFailedAllocations = initialDescriptorStats.failedAllocations;
+    uint32_t maxFragmentedPoolFailures = initialDescriptorStats.fragmentedPoolFailures;
+    uint64_t maxVmaUsageBytes = initialBudget.totalUsageBytes;
+    uint64_t maxVmaAllocationBytes = initialBudget.totalAllocationBytes;
+
+    nlohmann::json samples = nlohmann::json::array();
+
+    auto descriptorJson = [](const DescriptorAllocator::Stats& stats) {
+        return nlohmann::json{
+            {"sets_per_pool", stats.setsPerPool},
+            {"max_pools", stats.maxPools},
+            {"used_pools", stats.usedPools},
+            {"free_pools", stats.freePools},
+            {"pool_count", stats.poolCount},
+            {"capacity_sets", stats.capacitySets},
+            {"allocated_sets", stats.allocatedSets},
+            {"peak_allocated_sets", stats.peakAllocatedSets},
+            {"failed_allocations", stats.failedAllocations},
+            {"fragmented_pool_failures", stats.fragmentedPoolFailures},
+            {"pool_growth_count", stats.poolGrowthCount},
+        };
+    };
+    auto budgetJson = [](const ResourceAllocator::MemoryBudgetReport& budget) {
+        nlohmann::json heaps = nlohmann::json::array();
+        for (const auto& heap : budget.heaps) {
+            heaps.push_back({
+                {"heap_index", heap.heapIndex},
+                {"usage_bytes", heap.usageBytes},
+                {"budget_bytes", heap.budgetBytes},
+                {"allocation_bytes", heap.allocationBytes},
+                {"block_bytes", heap.blockBytes},
+                {"allocation_count", heap.allocationCount},
+                {"block_count", heap.blockCount},
+                {"usage_ratio", heap.usageRatio},
+                {"pressure", heap.pressure},
+            });
+        }
+        return nlohmann::json{
+            {"supported", budget.supported},
+            {"total_usage_bytes", budget.totalUsageBytes},
+            {"total_budget_bytes", budget.totalBudgetBytes},
+            {"total_allocation_bytes", budget.totalAllocationBytes},
+            {"total_block_bytes", budget.totalBlockBytes},
+            {"peak_usage_bytes", budget.peakUsageBytes},
+            {"usage_delta_bytes", budget.usageDeltaBytes},
+            {"allocation_count", budget.allocationCount},
+            {"block_count", budget.blockCount},
+            {"max_usage_ratio", budget.maxUsageRatio},
+            {"pressure", budget.pressure},
+            {"override_active", budget.overrideActive},
+            {"warnings", budget.warnings},
+            {"heaps", heaps},
+        };
+    };
+    auto takeSample = [&](uint32_t cycle, const char* phase) {
+        const auto descriptorStats = pathTracer_->descriptorPoolStats();
+        const auto budget = allocator_->memoryBudgetReport();
+        maxPoolCount = std::max(maxPoolCount, descriptorStats.poolCount);
+        maxCapacitySets = std::max(maxCapacitySets, descriptorStats.capacitySets);
+        maxAllocatedSets = std::max(maxAllocatedSets, descriptorStats.allocatedSets);
+        maxPeakAllocatedSets = std::max(maxPeakAllocatedSets, descriptorStats.peakAllocatedSets);
+        maxFailedAllocations = std::max(maxFailedAllocations, descriptorStats.failedAllocations);
+        maxFragmentedPoolFailures = std::max(maxFragmentedPoolFailures, descriptorStats.fragmentedPoolFailures);
+        maxVmaUsageBytes = std::max(maxVmaUsageBytes, budget.totalUsageBytes);
+        maxVmaAllocationBytes = std::max(maxVmaAllocationBytes, budget.totalAllocationBytes);
+        samples.push_back({
+            {"cycle", cycle},
+            {"phase", phase},
+            {"frame_serial", frameSerial_},
+            {"retired_renderer_count", retiredPathTracers_.size()},
+            {"descriptors", descriptorJson(descriptorStats)},
+            {"vma_budget", budgetJson(budget)},
+        });
+    };
+
+    takeSample(0, "initial");
+    const float originalScale = std::clamp(originalSettings.renderResolutionScale, 0.1f, 1.0f);
+    const float stressScale = std::max(0.5f, std::min(originalScale, 0.75f));
+
+    for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
+        renderFrames(framesPerCycle);
+        takeSample(cycle, "steady_frame");
+
+        RendererSettings resizedSettings = pathTracer_->settings();
+        resizedSettings.renderResolutionScale = (cycle % 2u == 0u) ? stressScale : originalScale;
+        resizedSettings.renderPreset = RenderPreset::Custom;
+        applyRendererSettingsSafely(resizedSettings, true);
+        pathTracer_->resetAccumulation(AccumulationResetReason::RenderSettingsChanged);
+        renderFrames(framesPerCycle);
+        takeSample(cycle, "render_scale_toggle");
+
+        if (gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty()) {
+            if (!pathTracer_->updateMaterials(*gpuSceneAsset_, assets_)) {
+                pathTracer_->resetAccumulation(AccumulationResetReason::MaterialChanged);
+            }
+            renderFrames(framesPerCycle);
+            takeSample(cycle, "material_update");
+        }
+
+        if (scenePath_.has_value()) {
+            const RendererSettings previousSettings = pathTracer_->settings();
+            if (!sceneDocument_.loadJson(*scenePath_)) {
+                throw std::runtime_error("Descriptor lifetime stress scene reload failed: " + scenePath_->string());
+            }
+            gltfPath_ = sceneDocument_.sourceGltfPath();
+            hdrPath_ = sceneDocument_.sourceHdrPath();
+            if (gltfPath_.has_value() && std::filesystem::exists(*gltfPath_)) {
+                assets_.clear();
+                GltfLoader loader(assets_);
+                importedScene_ = loader.loadWithCache(*gltfPath_);
+            }
+            rebuildGpuSceneAsset();
+            std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
+                gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
+                gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
+                gltfPath_.has_value() ? SceneCache::cachePathFor(*gltfPath_) : std::optional<std::filesystem::path>{},
+                &previousSettings);
+            retirePathTracer(std::move(pathTracer_));
+            pathTracer_ = std::move(nextPathTracer);
+            applyActiveSceneCamera();
+            pathTracer_->resetAccumulation(AccumulationResetReason::SceneChanged);
+            commandSystem_->setPathTracer(pathTracer_.get());
+            renderFrames(CommandSystem::framesInFlight + framesPerCycle + 1u);
+            takeSample(cycle, "scene_reload");
+        }
+
+        reloadShadersFromEditor();
+        takeSample(cycle, "renderer_recreated");
+        renderFrames(CommandSystem::framesInFlight + framesPerCycle + 1u);
+        takeSample(cycle, "retirement_drained");
+    }
+
+    applyRendererSettingsSafely(originalSettings, true);
+    renderFrames(CommandSystem::framesInFlight + framesPerCycle + 1u);
+    takeSample(cycles, "final");
+
+    const auto finalDescriptorStats = pathTracer_->descriptorPoolStats();
+    const auto finalBudget = allocator_->memoryBudgetReport();
+    std::vector<std::string> failures;
+    if (maxFailedAllocations > initialDescriptorStats.failedAllocations) {
+        failures.push_back("descriptor allocation failures increased");
+    }
+    if (maxFragmentedPoolFailures > initialDescriptorStats.fragmentedPoolFailures) {
+        failures.push_back("fragmented descriptor-pool failures increased");
+    }
+    if (!retiredPathTracers_.empty()) {
+        failures.push_back("retired renderer queue was not drained");
+    }
+    const bool passed = failures.empty();
+
+    nlohmann::json report;
+    report["schema"] = "rtv_descriptor_lifetime_stress_v1";
+    report["passed"] = passed;
+    report["cycles"] = cycles;
+    report["frames_per_cycle"] = framesPerCycle;
+    report["operations"] = {
+        "steady_frame",
+        "render_scale_toggle",
+        "material_update_when_scene_assets_exist",
+        "scene_reload_when_rtlevel_path_exists",
+        "renderer_recreated_via_shader_reload_path",
+        "retirement_drained"
+    };
+    report["initial_descriptors"] = descriptorJson(initialDescriptorStats);
+    report["final_descriptors"] = descriptorJson(finalDescriptorStats);
+    report["max_descriptors"] = {
+        {"pool_count", maxPoolCount},
+        {"capacity_sets", maxCapacitySets},
+        {"allocated_sets", maxAllocatedSets},
+        {"peak_allocated_sets", maxPeakAllocatedSets},
+        {"failed_allocations", maxFailedAllocations},
+        {"fragmented_pool_failures", maxFragmentedPoolFailures},
+    };
+    report["initial_vma_budget"] = budgetJson(initialBudget);
+    report["final_vma_budget"] = budgetJson(finalBudget);
+    report["max_vma_usage_bytes"] = maxVmaUsageBytes;
+    report["max_vma_allocation_bytes"] = maxVmaAllocationBytes;
+    report["retired_renderer_count_final"] = retiredPathTracers_.size();
+    report["failure_reasons"] = failures;
+    report["samples"] = std::move(samples);
+
+    const auto parent = outputPath.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent);
+    }
+    std::ofstream file(outputPath);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open descriptor lifetime stress output: " + outputPath.string());
+    }
+    file << report.dump(2);
+    return passed;
 }
 
 void Application::resetDiagnosticFrameCounter(uint32_t frameIndex) {
@@ -489,6 +758,60 @@ void Application::resetAccumulation() {
     if (pathTracer_) {
         pathTracer_->resetAccumulation(AccumulationResetReason::Manual);
     }
+}
+
+bool Application::applyNamedCamera(std::string_view cameraName) {
+    if (pathTracer_ == nullptr || cameraName.empty()) {
+        return false;
+    }
+
+    const std::string normalized = normalizedCameraName(cameraName);
+    auto applyPose = [&](glm::vec3 position, glm::vec3 target, float fovY, std::string_view label) {
+        glm::vec3 forward = target - position;
+        if (glm::dot(forward, forward) <= 1.0e-8f) {
+            return false;
+        }
+        pathTracer_->setCameraFovY(fovY);
+        cameraController_.setPose(position, glm::normalize(forward), *pathTracer_);
+        std::cout << "Applied camera: " << label << '\n';
+        return true;
+    };
+
+    if (normalized == "sponza-foliage" || normalized == "lightweight-sponza-foliage") {
+        return applyPose(
+            glm::vec3{2.0f, 1.05f, 1.55f},
+            glm::vec3{-0.52f, 0.82f, -0.30f},
+            1.15f,
+            "sponza-foliage");
+    }
+    if (normalized == "sponza-courtyard" || normalized == "lightweight-sponza-courtyard") {
+        return applyPose(
+            glm::vec3{0.0f, 1.25f, 6.0f},
+            glm::vec3{0.0f, 0.95f, 0.0f},
+            0.872665f,
+            "sponza-courtyard");
+    }
+
+    for (const Entity* entity : sceneDocument_.registry().entities()) {
+        if (entity == nullptr || !entity->camera.has_value()) {
+            continue;
+        }
+        if (normalizedCameraName(entity->name) != normalized) {
+            continue;
+        }
+        const glm::mat4 transform = entityWorldMatrix(sceneDocument_.registry(), *entity);
+        const glm::vec3 position = glm::vec3(transform[3]);
+        glm::vec3 forward = glm::mat3(transform) * glm::vec3(0.0f, 0.0f, -1.0f);
+        if (glm::dot(forward, forward) <= 1.0e-8f) {
+            forward = glm::vec3{0.0f, 0.0f, -1.0f};
+        }
+        pathTracer_->setCameraFovY(entity->camera->verticalFovRadians);
+        cameraController_.setPose(position, glm::normalize(forward), *pathTracer_);
+        std::cout << "Applied scene camera: " << entity->name << '\n';
+        return true;
+    }
+
+    return false;
 }
 
 void Application::applyDebugView(RendererDebugView view) {
@@ -607,6 +930,15 @@ void Application::initVulkan() {
         startupSettings.renderPreset = RenderPreset::Custom;
         syncDocumentRenderSettings(sceneDocument_, startupSettings);
     }
+    if (opacityMicromapOverride_.has_value()) {
+        startupSettings.opacityMicromapsEnabled = *opacityMicromapOverride_;
+        startupSettings.renderPreset = RenderPreset::Custom;
+        syncDocumentRenderSettings(sceneDocument_, startupSettings);
+    }
+    if (opacityMicromapSubdivisionOverride_.has_value()) {
+        startupSettings.opacityMicromapSubdivisionLevel = *opacityMicromapSubdivisionOverride_;
+        startupSettings.renderPreset = RenderPreset::Custom;
+    }
     createPathTracer(&startupSettings);
     applyActiveSceneCamera();
     sceneDocument_.clearDirty();
@@ -640,6 +972,8 @@ void Application::mainLoop(uint32_t maxFrames) {
             lastFrameSeconds_ = seconds;
 
             commandSystem_->drawFrame(seconds, deltaSeconds);
+            ++frameSerial_;
+            releaseRetiredPathTracers();
             ++frameCount;
         }
         commandSystem_->waitIdle();
@@ -659,6 +993,7 @@ void Application::mainLoop(uint32_t maxFrames) {
             uiOverlay_->beginFrame();
         }
         processRuntimeControls(deltaSeconds);
+        applyValidationObjectMotion(frameCount);
         applyValidationCameraMotion(frameCount);
         notifications_.update(deltaSeconds);
         EditorRequests editorRequests;
@@ -705,6 +1040,8 @@ void Application::mainLoop(uint32_t maxFrames) {
             beginFrameCapture_(frameCount + 1u);
         }
         commandSystem_->drawFrame(seconds, deltaSeconds);
+        ++frameSerial_;
+        releaseRetiredPathTracers();
         if (endFrameCapture_) {
             endFrameCapture_(frameCount + 1u);
         }
@@ -857,7 +1194,6 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
         const SceneGpuBuildResult build = sceneBuilder_.build(nextDocument, &result.assets, reloadSettings);
         const std::optional<std::filesystem::path> cachePath = SceneCache::cachePathFor(result.path);
 
-        commandSystem_->waitIdle();
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             build.sceneAsset.meshes.empty() ? nullptr : &build.sceneAsset,
             build.sceneAsset.meshes.empty() ? nullptr : &result.assets,
@@ -877,6 +1213,7 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
         undoStack_.clear();
         gpuSceneAsset_ = std::move(build.sceneAsset);
         gpuInstanceEntities_ = std::move(build.instanceEntities);
+        retirePathTracer(std::move(pathTracer_));
         pathTracer_ = std::move(nextPathTracer);
         applyActiveSceneCamera();
         commandSystem_->setPathTracer(pathTracer_.get());
@@ -1014,6 +1351,17 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         MaterialAsset* material = assets_.material(MaterialAssetHandle{requests.materialUpdate->materialId});
         if (material != nullptr) {
             *material = requests.materialUpdate->material;
+            for (uint32_t meshIndex = 0; meshIndex < assets_.meshes().size(); ++meshIndex) {
+                MeshAsset* mesh = assets_.mesh(MeshAssetHandle{meshIndex});
+                if (mesh == nullptr) {
+                    continue;
+                }
+                for (MeshPrimitiveAsset& primitive : mesh->primitives) {
+                    if (primitive.material.index == requests.materialUpdate->materialId) {
+                        updatePrimitiveAlphaClassification(primitive, material);
+                    }
+                }
+            }
             bool gpuUpdated = false;
             if (gpuSceneAsset_.has_value()) {
                 gpuUpdated = pathTracer_->updateMaterials(*gpuSceneAsset_, assets_);
@@ -1030,6 +1378,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         MeshAsset* mesh = assets_.mesh(requests.materialAssignment->mesh);
         if (mesh != nullptr && requests.materialAssignment->primitiveIndex < mesh->primitives.size()) {
             mesh->primitives[requests.materialAssignment->primitiveIndex].material = requests.materialAssignment->material;
+            updatePrimitiveAlphaClassification(
+                mesh->primitives[requests.materialAssignment->primitiveIndex],
+                assets_.material(requests.materialAssignment->material));
             sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
         }
     }
@@ -1205,6 +1556,45 @@ void Application::applyValidationCameraMotion(uint32_t frameIndex) {
         0.75f + std::sin(angle * 0.37f) * 0.25f,
         std::cos(angle) * radius};
     cameraController_.setPose(position, glm::normalize(target - position), *pathTracer_);
+}
+
+void Application::applyValidationObjectMotion(uint32_t frameIndex) {
+    if (!validationObjectMotion_ || pathTracer_ == nullptr) {
+        return;
+    }
+
+    Entity* entity = validationObjectMotionEntity_.valid()
+        ? sceneDocument_.registry().entity(validationObjectMotionEntity_)
+        : nullptr;
+    if (entity == nullptr || !entity->meshRenderer.has_value()) {
+        validationObjectMotionEntity_ = {};
+        for (Entity* candidate : sceneDocument_.registry().entities()) {
+            if (candidate != nullptr && candidate->meshRenderer.has_value()) {
+                validationObjectMotionEntity_ = candidate->id;
+                validationObjectMotionBaseTransform_ = candidate->transform;
+                entity = candidate;
+                break;
+            }
+        }
+    }
+    if (entity == nullptr || !entity->meshRenderer.has_value()) {
+        return;
+    }
+
+    constexpr float kAmplitude = 0.65f;
+    constexpr float kAngularStep = 0.42f;
+    const float phase = static_cast<float>(frameIndex) * kAngularStep;
+    entity->transform = validationObjectMotionBaseTransform_;
+    entity->transform.position.x += std::sin(phase) * kAmplitude;
+    entity->transform.rotationEuler.y += phase * 0.35f;
+    entity->transform.dirty = true;
+    const RendererSettings currentSettings = pathTracer_->settings();
+    RenderSettings& documentSettings = sceneDocument_.renderSettings();
+    documentSettings.motionBlurEnabled = currentSettings.motionBlurEnabled;
+    documentSettings.motionBlurShutterOpen = currentSettings.motionBlurShutterOpen;
+    documentSettings.motionBlurShutterClose = currentSettings.motionBlurShutterClose;
+    sceneDocument_.markDirty(SceneUpdateKind::TransformOnly);
+    (void)applyPendingSceneUpdate(false);
 }
 
 void Application::beginSunDragArm(bool dragEligible) {
@@ -1398,15 +1788,19 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
     auto rebuildRenderer = [&]() {
         SceneGpuBuildResult& sceneBuild = ensureBuild();
         const RendererSettings previousSettings = pathTracer_->settings();
-        commandSystem_->waitIdle();
         if (uiOverlay_) {
             uiOverlay_->invalidateViewportTexture();
         }
         gpuSceneAsset_ = sceneBuild.sceneAsset;
         gpuInstanceEntities_ = sceneBuild.instanceEntities;
         rebuildGpuSceneAsset();
-        pathTracer_.reset();
-        createPathTracer(&previousSettings);
+        std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
+            gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
+            gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
+            gltfPath_.has_value() ? SceneCache::cachePathFor(*gltfPath_) : std::optional<std::filesystem::path>{},
+            &previousSettings);
+        retirePathTracer(std::move(pathTracer_));
+        pathTracer_ = std::move(nextPathTracer);
         applyActiveSceneCamera();
         pathTracer_->resetAccumulation(route.resetReason);
         commandSystem_->setPathTracer(pathTracer_.get());
@@ -1506,18 +1900,43 @@ void Application::reloadShadersFromEditor() {
         return;
     }
     const RendererSettings previousSettings = pathTracer_->settings();
-    commandSystem_->waitIdle();
+    std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
+        gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
+        gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
+        gltfPath_.has_value() ? SceneCache::cachePathFor(*gltfPath_) : std::optional<std::filesystem::path>{},
+        &previousSettings);
     if (uiOverlay_) {
         uiOverlay_->invalidateViewportTexture();
         uiOverlay_->editor().invalidateAssetThumbnails();
     }
-    pathTracer_.reset();
-    createPathTracer(&previousSettings);
+    retirePathTracer(std::move(pathTracer_));
+    pathTracer_ = std::move(nextPathTracer);
     applyActiveSceneCamera();
     pathTracer_->resetAccumulation(AccumulationResetReason::ShaderReloaded);
     commandSystem_->setPathTracer(pathTracer_.get());
     notifications_.notify("Shaders reloaded", NotificationType::Success);
     std::cout << "Reloaded shaders from editor.\n";
+}
+
+void Application::retirePathTracer(std::unique_ptr<PathTracerRenderer> renderer) {
+    if (renderer == nullptr) {
+        return;
+    }
+    retiredPathTracers_.push_back(RetiredPathTracer{
+        .renderer = std::move(renderer),
+        .releaseFrame = frameSerial_ + CommandSystem::framesInFlight + 1u,
+    });
+}
+
+void Application::releaseRetiredPathTracers() {
+    retiredPathTracers_.erase(
+        std::remove_if(
+            retiredPathTracers_.begin(),
+            retiredPathTracers_.end(),
+            [this](const RetiredPathTracer& retired) {
+                return frameSerial_ >= retired.releaseFrame;
+            }),
+        retiredPathTracers_.end());
 }
 
 std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
@@ -1539,7 +1958,9 @@ std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
         sceneAsset,
         sceneAsset != nullptr ? assets : nullptr,
         hdrPath_,
-        std::move(sceneCachePath));
+        std::move(sceneCachePath),
+        !disableResourceAliasing_,
+        settingsToRestore);
     if (settingsToRestore != nullptr) {
         renderer->applySettings(*settingsToRestore);
     }

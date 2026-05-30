@@ -11,6 +11,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 
 namespace rtv {
 
@@ -67,11 +68,12 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
         checkVk(vkResetCommandPool(context_.device(), frame.computeCommandPool, 0), "vkResetCommandPool(compute)");
     }
     if (pathTracer_ != nullptr) {
+        pathTracer_->refreshMemoryPressureQuality();
         VkExtent2D displayExtent = swapchain_.extent();
         if (uiOverlay_ != nullptr) {
             displayExtent = uiOverlay_->desiredRenderExtent(displayExtent);
         }
-        const float scale = pathTracer_->settings().renderResolutionScale;
+        const float scale = pathTracer_->effectiveRenderResolutionScale();
         VkExtent2D renderExtent = displayExtent;
         renderExtent.width = std::max(1u, static_cast<uint32_t>(static_cast<float>(renderExtent.width) * scale));
         renderExtent.height = std::max(1u, static_cast<uint32_t>(static_cast<float>(renderExtent.height) * scale));
@@ -83,7 +85,6 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
              currentRenderExtent.height != renderExtent.height ||
              currentDisplayExtent.width != displayExtent.width ||
              currentDisplayExtent.height != displayExtent.height)) {
-            checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(editor viewport resize)");
             uiOverlay_->invalidateViewportTexture();
         }
         pathTracer_->setFrameDeltaSeconds(deltaSeconds);
@@ -122,7 +123,21 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
 
 void CommandSystem::waitIdle() const {
     if (context_.device() != VK_NULL_HANDLE) {
+        std::cerr << "Device idle wait: CommandSystem shutdown/diagnostic drain\n";
         checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(CommandSystem)");
+    }
+}
+
+void CommandSystem::waitForFrameFences() const {
+    std::array<VkFence, framesInFlight> fences{};
+    uint32_t count = 0;
+    for (const FrameResources& frame : frames_) {
+        if (frame.inFlight != VK_NULL_HANDLE) {
+            fences[count++] = frame.inFlight;
+        }
+    }
+    if (count > 0) {
+        checkVk(vkWaitForFences(context_.device(), count, fences.data(), VK_TRUE, UINT64_MAX), "vkWaitForFences(CommandSystem frames)");
     }
 }
 
@@ -210,7 +225,7 @@ void CommandSystem::recreateSwapchainResources() {
     if (headless_) {
         return;
     }
-    waitIdle();
+    waitForFrameFences();
     destroyPresentSemaphores();
     swapchain_.recreate();
     createPresentSemaphores();

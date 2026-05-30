@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rtv/OpacityMicromapPreprocess.h"
 #include "rtv/RendererDebug.h"
 
 #include <glm/glm.hpp>
@@ -70,6 +71,17 @@ struct RendererSettings {
     float renderResolutionScale = 0.65f;
     float materialTextureAnisotropy = 4.0f;
     bool specularAaEnabled = true;
+    bool opacityMicromapsEnabled = false;
+    uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel;
+    bool wavefrontQueuesEnabled = false;
+    bool wavefrontPrimaryGenerateEnabled = false;
+    bool wavefrontTraceEnabled = false;
+    bool wavefrontShadeEnabled = false;
+    bool wavefrontShadowTraceEnabled = false;
+    bool wavefrontCompactEnabled = false;
+    bool wavefrontSortEnabled = false;
+    bool wavefrontFinalOutputEnabled = false;
+    bool shaderExecutionReorderingEnabled = false;
     uint32_t accumulationLimit = 0;
     RendererDebugView debugView = RendererDebugView::Beauty;
     float debugScale = 1.0f;
@@ -95,6 +107,18 @@ struct RendererSettings {
     float physicalShutterSeconds = 1.0f / 125.0f;
     float physicalIso = 100.0f;
     float physicalExposureCompensation = 0.0f;
+    float dofApertureRadius = 0.0f;
+    float dofFocusDistance = 10.0f;
+    uint32_t dofBladeCount = 0;
+    float dofBokehRotation = 0.0f;
+    bool motionBlurEnabled = false;
+    float motionBlurShutterOpen = 0.0f;
+    float motionBlurShutterClose = 1.0f;
+    bool homogeneousVolumeEnabled = false;
+    float homogeneousVolumeScattering = 0.0f;
+    float homogeneousVolumeAbsorption = 0.0f;
+    float homogeneousVolumeAnisotropy = 0.0f;
+    bool mneeCausticsEnabled = false;
 };
 
 inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {

@@ -154,6 +154,7 @@ struct RenderSettings {
     float resolutionScale = 0.65f;
     float materialTextureAnisotropy = 4.0f;
     bool specularAaEnabled = true;
+    bool opacityMicromapsEnabled = false;
     float shadowRayBias = 0.001f;
     float shadowDistanceBias = 0.002f;
     float fireflyClamp = 8.0f;
@@ -172,6 +173,18 @@ struct RenderSettings {
     float physicalShutterSeconds = 1.0f / 125.0f;
     float physicalIso = 100.0f;
     float physicalExposureCompensation = 0.0f;
+    float dofApertureRadius = 0.0f;
+    float dofFocusDistance = 10.0f;
+    uint32_t dofBladeCount = 0;
+    float dofBokehRotation = 0.0f;
+    bool motionBlurEnabled = false;
+    float motionBlurShutterOpen = 0.0f;
+    float motionBlurShutterClose = 1.0f;
+    bool homogeneousVolumeEnabled = false;
+    float homogeneousVolumeScattering = 0.0f;
+    float homogeneousVolumeAbsorption = 0.0f;
+    float homogeneousVolumeAnisotropy = 0.0f;
+    bool mneeCausticsEnabled = false;
 };
 
 enum class SceneUpdateKind : uint32_t {

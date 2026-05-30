@@ -240,6 +240,7 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::BsdfPdf,
         RendererDebugView::MisWeight,
         RendererDebugView::DirectSampleType,
+        RendererDebugView::CausticVisibility,
         RendererDebugView::ClayMaterial,
         RendererDebugView::FirstBounceThroughput,
         RendererDebugView::SecondaryEnvironmentMiss,
@@ -306,6 +307,14 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::RestirGiFinal,
         RendererDebugView::RestirGiNormal,
         RendererDebugView::RestirGiHitDistance,
+        RendererDebugView::WavefrontQueueOccupancy,
+        RendererDebugView::WavefrontPathDepth,
+        RendererDebugView::WavefrontLiveRays,
+        RendererDebugView::WavefrontTerminatedRays,
+        RendererDebugView::WavefrontMaterialBucket,
+        RendererDebugView::WavefrontRestirDi,
+        RendererDebugView::WavefrontRestirGi,
+        RendererDebugView::WavefrontDirectLighting,
     };
 }
 

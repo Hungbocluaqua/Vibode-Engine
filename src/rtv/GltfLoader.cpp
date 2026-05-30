@@ -889,6 +889,7 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
             prim.material = primitive.material >= 0 && static_cast<size_t>(primitive.material) < materialHandles.size()
                 ? materialHandles[static_cast<size_t>(primitive.material)]
                 : materialHandles.front();
+            updatePrimitiveAlphaClassification(prim, assets_.material(prim.material));
             finalizePrimitiveVertexFrames(mesh, firstVertex, prim.vertexCount, firstIndex, prim.indexCount, hasNormals, hasTangents, hasTexcoords);
             mesh.primitives.push_back(prim);
         }
@@ -1105,6 +1106,7 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                         } else if (!scene.materials.empty()) {
                             prim.material = scene.materials.front();
                         }
+                        updatePrimitiveAlphaClassification(prim, assets_.material(prim.material));
                         mesh.primitives.push_back(prim);
                     }
                     scene.meshes.push_back(assets_.addMesh(std::move(mesh)));

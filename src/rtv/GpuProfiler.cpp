@@ -177,8 +177,21 @@ void GpuProfiler::collectCompletedFrame() {
     timings_.selectionOutlineMs = smooth(timings_.selectionOutlineMs, elapsedMs(SelectionOutlineStart, SelectionOutlineEnd));
     timings_.fullscreenMs = smooth(timings_.fullscreenMs, elapsedMs(FullscreenStart, FullscreenEnd));
     timings_.editorPresentationMs = smooth(timings_.editorPresentationMs, elapsedMs(EditorPresentationStart, EditorPresentationEnd));
+    timings_.wavefrontTraceMs = smooth(timings_.wavefrontTraceMs, elapsedMs(WavefrontTraceStart, WavefrontTraceEnd));
+    timings_.wavefrontSecondaryTraceMs = smooth(timings_.wavefrontSecondaryTraceMs, elapsedMs(WavefrontSecondaryTraceStart, WavefrontSecondaryTraceEnd));
+    timings_.wavefrontSortedTraceMs = smooth(timings_.wavefrontSortedTraceMs, elapsedMs(WavefrontSortedTraceStart, WavefrontSortedTraceEnd));
+    timings_.wavefrontShadowTraceMs = smooth(timings_.wavefrontShadowTraceMs, elapsedMs(WavefrontShadowTraceStart, WavefrontShadowTraceEnd));
+    timings_.wavefrontShadeMs = smooth(timings_.wavefrontShadeMs, elapsedMs(WavefrontShadeStart, WavefrontShadeEnd));
+    timings_.wavefrontSecondaryShadeMs = smooth(timings_.wavefrontSecondaryShadeMs, elapsedMs(WavefrontSecondaryShadeStart, WavefrontSecondaryShadeEnd));
+    timings_.wavefrontSortedShadeMs = smooth(timings_.wavefrontSortedShadeMs, elapsedMs(WavefrontSortedShadeStart, WavefrontSortedShadeEnd));
+    timings_.wavefrontCompactMs = smooth(timings_.wavefrontCompactMs, elapsedMs(WavefrontCompactStart, WavefrontCompactEnd));
+    timings_.wavefrontSortMs = smooth(timings_.wavefrontSortMs, elapsedMs(WavefrontSortStart, WavefrontSortEnd));
     timings_.queueWaitMs = smooth(timings_.queueWaitMs, elapsedMs(AsyncProducerEnd, AsyncComputeStart));
-    timings_.rayTracingLaneMs = timings_.pathTraceMs;
+    timings_.rayTracingLaneMs = timings_.pathTraceMs +
+        timings_.wavefrontTraceMs +
+        timings_.wavefrontSecondaryTraceMs +
+        timings_.wavefrontSortedTraceMs +
+        timings_.wavefrontShadowTraceMs;
     timings_.computeLaneMs =
         timings_.restirHistoryClearMs +
         timings_.restirGiClearMs +
@@ -196,7 +209,12 @@ void GpuProfiler::collectCompletedFrame() {
         timings_.taaHistoryCopyMs +
         timings_.autoExposureMs +
         timings_.toneMapMs +
-        timings_.selectionOutlineMs;
+        timings_.selectionOutlineMs +
+        timings_.wavefrontShadeMs +
+        timings_.wavefrontSecondaryShadeMs +
+        timings_.wavefrontSortedShadeMs +
+        timings_.wavefrontCompactMs +
+        timings_.wavefrontSortMs;
     timings_.graphicsLaneMs = timings_.fullscreenMs + timings_.editorPresentationMs;
     submitted_ = false;
 

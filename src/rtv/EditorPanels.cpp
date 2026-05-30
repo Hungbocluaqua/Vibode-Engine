@@ -6,8 +6,39 @@
 
 namespace rtv {
 
-const std::array<RendererDebugView, 86>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 86> views = {
+namespace {
+
+[[nodiscard]] bool isWavefrontQueueDebugView(RendererDebugView view) {
+    switch (view) {
+    case RendererDebugView::WavefrontQueueOccupancy:
+    case RendererDebugView::WavefrontPathDepth:
+    case RendererDebugView::WavefrontLiveRays:
+    case RendererDebugView::WavefrontTerminatedRays:
+    case RendererDebugView::WavefrontMaterialBucket:
+    case RendererDebugView::WavefrontRestirDi:
+    case RendererDebugView::WavefrontRestirGi:
+    case RendererDebugView::WavefrontDirectLighting:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void debugViewTooltip(RendererDebugView view) {
+    if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        return;
+    }
+    if (isWavefrontQueueDebugView(view)) {
+        ImGui::SetTooltip("Wavefront queue diagnostic; selecting it enables the wavefront shade probe.");
+    } else {
+        ImGui::SetTooltip("Reference debug view from the current beauty/debug output path.");
+    }
+}
+
+} // namespace
+
+const std::array<RendererDebugView, 95>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 95> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -38,6 +69,7 @@ const std::array<RendererDebugView, 86>& editorDebugViews() {
         RendererDebugView::SampleDimension,
         RendererDebugView::SampleScramble,
         RendererDebugView::DirectSampleType,
+        RendererDebugView::CausticVisibility,
         RendererDebugView::Albedo,
         RendererDebugView::MaterialOcclusion,
         RendererDebugView::PathDataAlbedo,
@@ -94,6 +126,14 @@ const std::array<RendererDebugView, 86>& editorDebugViews() {
         RendererDebugView::MomentHistoryKindValid,
         RendererDebugView::DenoiserDiffuseRawVariance,
         RendererDebugView::DenoiserSpecularRawVariance,
+        RendererDebugView::WavefrontQueueOccupancy,
+        RendererDebugView::WavefrontPathDepth,
+        RendererDebugView::WavefrontLiveRays,
+        RendererDebugView::WavefrontTerminatedRays,
+        RendererDebugView::WavefrontMaterialBucket,
+        RendererDebugView::WavefrontRestirDi,
+        RendererDebugView::WavefrontRestirGi,
+        RendererDebugView::WavefrontDirectLighting,
     };
     return views;
 }
@@ -115,6 +155,7 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
             settings.debugView = view;
             changed = true;
         }
+        debugViewTooltip(view);
         if (selected) {
             ImGui::SetItemDefaultFocus();
         }
@@ -188,6 +229,7 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::SampleDimension);
         selectable(RendererDebugView::SampleScramble);
         selectable(RendererDebugView::DirectSampleType);
+        selectable(RendererDebugView::CausticVisibility);
         ImGui::SeparatorText("Transport");
         selectable(RendererDebugView::FirstBounceThroughput);
         selectable(RendererDebugView::SecondaryEnvironmentMiss);
@@ -214,7 +256,27 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::RestirGiFinal);
         selectable(RendererDebugView::RestirGiNormal);
         selectable(RendererDebugView::RestirGiHitDistance);
+        ImGui::SeparatorText("Wavefront Queue");
+        selectable(RendererDebugView::WavefrontQueueOccupancy);
+        selectable(RendererDebugView::WavefrontPathDepth);
+        selectable(RendererDebugView::WavefrontLiveRays);
+        selectable(RendererDebugView::WavefrontTerminatedRays);
+        selectable(RendererDebugView::WavefrontMaterialBucket);
+        selectable(RendererDebugView::WavefrontRestirDi);
+        selectable(RendererDebugView::WavefrontRestirGi);
+        selectable(RendererDebugView::WavefrontDirectLighting);
         ImGui::EndCombo();
+    }
+    if (isWavefrontQueueDebugView(settings.debugView)) {
+        ImGui::TextDisabled("Wavefront queue view");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Uses wavefront-owned queue/pixel-state output and enables the shade probe.");
+        }
+    } else {
+        ImGui::TextDisabled("Reference debug view");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Uses the current reference output path until wavefront final output owns this view.");
+        }
     }
 }
 

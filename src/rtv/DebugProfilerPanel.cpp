@@ -145,6 +145,10 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     if (rtStats.active) {
         ImGui::SeparatorText("Hardware RT");
         ImGui::Text("BLAS: %u  Instances: %u", rtStats.blasCount, rtStats.instanceCount);
+        ImGui::Text("RT primitives: opaque %u  alpha %u  blend %u",
+            rtStats.geometry.opaquePrimitiveCount,
+            rtStats.geometry.alphaTestedPrimitiveCount,
+            rtStats.geometry.blendedPrimitiveCount);
         ImGui::Text("AS memory: %.2f MB", static_cast<double>(rtStats.accelerationStructureBytes) / (1024.0 * 1024.0));
         ImGui::Text("Last TLAS refit: %.3f ms", rtStats.lastTlasRefitMs);
         ImGui::Text("SBT: %.2f KB", static_cast<double>(rtStats.sbtBytes) / 1024.0);

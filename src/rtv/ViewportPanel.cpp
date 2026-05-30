@@ -601,16 +601,19 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             }
         }
 
-        if (state.viewport.leftClicked && !gizmoHoveredOrUsing) {
-            if (const std::optional<uint32_t> pickedInstance = state.renderer.pickInstanceId(state.viewport.mouseUv)) {
-                if (const std::optional<EntityId> pickedEntity = entityForInstance(state, *pickedInstance)) {
-                    const Entity* entity = state.sceneDocument != nullptr ? state.sceneDocument->registry().entity(*pickedEntity) : nullptr;
-                    if (entity == nullptr || !entity->locked) {
-                        selection.selectEntity(*pickedEntity);
-                    }
+        if (const std::optional<uint32_t> pickedInstance = state.renderer.consumePickedInstanceId()) {
+            if (const std::optional<EntityId> pickedEntity = entityForInstance(state, *pickedInstance)) {
+                const Entity* entity = state.sceneDocument != nullptr ? state.sceneDocument->registry().entity(*pickedEntity) : nullptr;
+                if (entity == nullptr || !entity->locked) {
+                    selection.selectEntity(*pickedEntity);
                 }
             }
         }
+
+        if (state.viewport.leftClicked && !gizmoHoveredOrUsing) {
+            state.renderer.requestPickInstanceId(state.viewport.mouseUv);
+        }
+        selection.setPickPending(state.renderer.pickPending());
 
         const bool gizmoDragging = gizmoState_ == GizmoInteractionState::DraggingTranslate
             || gizmoState_ == GizmoInteractionState::DraggingRotate

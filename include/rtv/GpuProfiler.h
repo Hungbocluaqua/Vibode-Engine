@@ -39,6 +39,15 @@ struct GpuFrameTimings {
     float selectionOutlineMs = 0.0f;
     float fullscreenMs = 0.0f;
     float editorPresentationMs = 0.0f;
+    float wavefrontTraceMs = 0.0f;
+    float wavefrontSecondaryTraceMs = 0.0f;
+    float wavefrontSortedTraceMs = 0.0f;
+    float wavefrontShadowTraceMs = 0.0f;
+    float wavefrontShadeMs = 0.0f;
+    float wavefrontSecondaryShadeMs = 0.0f;
+    float wavefrontSortedShadeMs = 0.0f;
+    float wavefrontCompactMs = 0.0f;
+    float wavefrontSortMs = 0.0f;
     float graphicsLaneMs = 0.0f;
     float rayTracingLaneMs = 0.0f;
     float computeLaneMs = 0.0f;
@@ -64,7 +73,16 @@ struct GpuFrameTimings {
             toneMapMs +
             selectionOutlineMs +
             fullscreenMs +
-            editorPresentationMs;
+            editorPresentationMs +
+            wavefrontTraceMs +
+            wavefrontSecondaryTraceMs +
+            wavefrontSortedTraceMs +
+            wavefrontShadowTraceMs +
+            wavefrontShadeMs +
+            wavefrontSecondaryShadeMs +
+            wavefrontSortedShadeMs +
+            wavefrontCompactMs +
+            wavefrontSortMs;
     }
 };
 
@@ -137,7 +155,25 @@ public:
         AsyncProducerEnd = 56,
         AsyncComputeStart = 57,
         AsyncComputeEnd = 58,
-        Count = 59,
+        WavefrontShadowTraceStart = 59,
+        WavefrontShadowTraceEnd = 60,
+        WavefrontCompactStart = 61,
+        WavefrontCompactEnd = 62,
+        WavefrontSortStart = 63,
+        WavefrontSortEnd = 64,
+        WavefrontShadeStart = 65,
+        WavefrontShadeEnd = 66,
+        WavefrontSortedShadeStart = 67,
+        WavefrontSortedShadeEnd = 68,
+        WavefrontSecondaryShadeStart = 69,
+        WavefrontSecondaryShadeEnd = 70,
+        WavefrontTraceStart = 71,
+        WavefrontTraceEnd = 72,
+        WavefrontSecondaryTraceStart = 73,
+        WavefrontSecondaryTraceEnd = 74,
+        WavefrontSortedTraceStart = 75,
+        WavefrontSortedTraceEnd = 76,
+        Count = 77,
     };
 
     GpuProfiler() = default;

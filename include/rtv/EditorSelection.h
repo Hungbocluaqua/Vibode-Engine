@@ -42,6 +42,8 @@ public:
 
     [[nodiscard]] EntityId lastClickedId() const { return lastClickedId_; }
     void setLastClickedId(EntityId id) { lastClickedId_ = id; }
+    void setPickPending(bool pending) { pickPending_ = pending; }
+    [[nodiscard]] bool pickPending() const { return pickPending_; }
 
     [[nodiscard]] bool isSelected(EntityId id) const;
     [[nodiscard]] size_t selectionCount() const { return multiSelected_.empty() ? 0 : multiSelected_.size(); }
@@ -56,6 +58,7 @@ private:
     EditorSelectionId current_{};
     std::vector<EntityId> multiSelected_;
     EntityId lastClickedId_{};
+    bool pickPending_ = false;
 };
 
 } // namespace rtv
