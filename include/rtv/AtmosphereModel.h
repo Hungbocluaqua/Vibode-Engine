@@ -4,6 +4,20 @@
 
 namespace rtv {
 
+enum class AtmosphereRayQuality : uint32_t {
+    Full = 0,
+    Reduced = 1,
+    Fast = 2,
+    Minimal = 3,
+};
+
+enum class AtmosphereQuality : uint32_t {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    Cinematic = 3,
+};
+
 struct AtmosphereParams {
     float planetRadius = 6'360'000.0f;
     float atmosphereRadius = 6'420'000.0f;

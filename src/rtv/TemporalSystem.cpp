@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <utility>
 
 namespace rtv {
@@ -58,6 +59,47 @@ glm::vec3 yCoCgToRgb(glm::vec3 c) {
     return {r, g, b};
 }
 
+std::optional<glm::vec2> projectWorldToPixels(const glm::mat4& viewProj, glm::vec3 worldPos, glm::vec2 renderSize) {
+    if (renderSize.x <= 0.0f || renderSize.y <= 0.0f) {
+        return std::nullopt;
+    }
+    const glm::vec4 clip = viewProj * glm::vec4(worldPos, 1.0f);
+    if (clip.w <= 0.0f) {
+        return std::nullopt;
+    }
+    const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+    if (ndc.z < 0.0f || ndc.z > 1.0001f) {
+        return std::nullopt;
+    }
+    return glm::vec2{
+        (ndc.x * 0.5f + 0.5f) * renderSize.x - 0.5f,
+        (ndc.y * 0.5f + 0.5f) * renderSize.y - 0.5f,
+    };
+}
+
+float smoothstep(float edge0, float edge1, float x) {
+    const float t = std::clamp((x - edge0) / std::max(edge1 - edge0, 1.0e-6f), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float normalizedHitDistance(float hitDistance) {
+    return std::clamp(std::log2(std::max(hitDistance, 0.0f) + 1.0f) / 10.0f, 0.0f, 1.0f);
+}
+
+float specularVirtualMotionConfidence(
+    float roughness,
+    float specularSignal,
+    float normalizedSecondaryHitDistance,
+    float surfaceMotionPixels,
+    float virtualMotionDeltaPixels) {
+    const float glossyConfidence = 1.0f - smoothstep(0.22f, 0.58f, roughness);
+    const float specularConfidence = smoothstep(0.25f, 0.70f, specularSignal);
+    const float distanceConfidence = smoothstep(0.02f, 0.18f, normalizedSecondaryHitDistance) *
+        (1.0f - smoothstep(0.93f, 0.99f, normalizedSecondaryHitDistance));
+    const float motionConfidence = 1.0f - smoothstep(48.0f, 160.0f, std::max(surfaceMotionPixels, virtualMotionDeltaPixels));
+    return std::clamp(glossyConfidence * specularConfidence * distanceConfidence * motionConfidence, 0.0f, 0.85f);
+}
+
 } // namespace
 
 TemporalSystem::ReprojectResult TemporalSystem::reproject(glm::vec2 uv, glm::vec2 velocityPixels, glm::vec2 renderSize) {
@@ -90,6 +132,54 @@ TemporalSystem::ConfidenceResult TemporalSystem::evaluateConfidence(const Confid
         .reactive = reactive,
         .blendFactor = std::clamp(1.0f - confidence, 0.04f, 0.92f),
     };
+}
+
+TemporalSystem::SpecularVirtualMotionResult TemporalSystem::estimateSpecularVirtualMotion(const SpecularVirtualMotionInput& input) {
+    if (input.renderSize.x <= 0.0f || input.renderSize.y <= 0.0f ||
+        input.secondaryHitDistance <= 0.001f || input.secondaryHitDistance >= 65503.0f) {
+        return {};
+    }
+
+    const glm::vec3 viewDir = glm::normalize(input.surfacePosition - input.cameraPosition);
+    if (!std::isfinite(viewDir.x) || !std::isfinite(viewDir.y) || !std::isfinite(viewDir.z)) {
+        return {};
+    }
+
+    const glm::vec3 normal = glm::normalize(input.surfaceNormal);
+    const glm::vec3 reflectedDir = glm::normalize(glm::reflect(viewDir, normal));
+    const float virtualDistance = std::clamp(input.secondaryHitDistance, 0.05f, 512.0f);
+    const glm::vec3 virtualPosition = input.surfacePosition + reflectedDir * virtualDistance;
+    const auto currentVirtualPixel = projectWorldToPixels(input.currentViewProj, virtualPosition, input.renderSize);
+    const auto previousVirtualPixel = projectWorldToPixels(input.previousViewProj, virtualPosition, input.renderSize);
+    if (!currentVirtualPixel || !previousVirtualPixel) {
+        return {};
+    }
+
+    const glm::vec2 virtualVelocityPixels = *currentVirtualPixel - *previousVirtualPixel;
+    const glm::vec2 historyPixel = input.currentPixel - virtualVelocityPixels;
+    const bool valid = historyPixel.x >= 0.0f && historyPixel.y >= 0.0f &&
+        historyPixel.x < input.renderSize.x - 1.0f &&
+        historyPixel.y < input.renderSize.y - 1.0f;
+    if (!valid) {
+        return {};
+    }
+
+    const float confidence = specularVirtualMotionConfidence(
+        input.roughness,
+        input.specularSignal,
+        normalizedHitDistance(input.secondaryHitDistance),
+        glm::length(input.surfaceVelocityPixels),
+        glm::length(virtualVelocityPixels - input.surfaceVelocityPixels));
+    return SpecularVirtualMotionResult{
+        .velocityPixels = virtualVelocityPixels,
+        .historyPixel = historyPixel,
+        .valid = confidence > 0.0f,
+        .confidence = confidence,
+    };
+}
+
+float TemporalSystem::effectiveHistoryLength(float historyWeight) {
+    return std::clamp(1.0f / std::max(1.0f - std::clamp(historyWeight, 0.0f, 0.98f), 0.02f), 1.0f, 50.0f);
 }
 
 float TemporalSystem::reactiveWeight(float localContrast, float luminance) {

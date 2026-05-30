@@ -1,0 +1,62 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D raw_image;
+layout(set = 0, binding = 1, std430) readonly buffer CurrentGiReservoirs { RestirGiReservoir current_gi_reservoirs[]; };
+layout(set = 0, binding = 2, std430) readonly buffer PreviousGiReservoirs { RestirGiReservoir previous_gi_reservoirs[]; };
+layout(set = 0, binding = 3, std430) readonly buffer SpatialGiReservoirs { RestirGiReservoir spatial_gi_reservoirs[]; };
+
+layout(set = 0, binding = 4, std140) uniform RendererDebug {
+    uint view;
+    uint flags;
+    uint selected_instance;
+    float scale;
+} debug_params;
+
+layout(set = 0, binding = 5, std140) uniform RestirGiFinalParams {
+    uint width;
+    uint height;
+    uint frame_count;
+    uint enabled;
+} params;
+
+vec3 reservoir_radiance(RestirGiReservoir reservoir) {
+    return restir_gi_reservoir_valid(reservoir) ? max(reservoir.radiance_weight_sum.rgb, vec3(0.0)) : vec3(0.0);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    RestirGiReservoir currentReservoir = current_gi_reservoirs[pixelIndex];
+    RestirGiReservoir previousReservoir = previous_gi_reservoirs[pixelIndex];
+    RestirGiReservoir spatialReservoir = spatial_gi_reservoirs[pixelIndex];
+
+    vec3 currentGi = reservoir_radiance(currentReservoir);
+    vec3 previousGi = reservoir_radiance(previousReservoir);
+    vec3 spatialGi = reservoir_radiance(spatialReservoir);
+    float debugScale = max(debug_params.scale, 1.0);
+
+    if (debug_params.view == 72u) {
+        imageStore(raw_image, coords, vec4(spatialGi * debugScale * 16.0, 1.0));
+        return;
+    }
+
+    if (debug_params.view != 73u) {
+        return;
+    }
+
+    vec3 base = max(imageLoad(raw_image, coords).rgb, vec3(0.0));
+    vec3 replacementGi = restir_gi_reservoir_valid(spatialReservoir)
+        ? spatialGi
+        : (restir_gi_reservoir_valid(previousReservoir) ? previousGi : currentGi);
+    vec3 replaced = max(base - currentGi + replacementGi, vec3(0.0));
+    imageStore(raw_image, coords, vec4(replaced, 1.0));
+}

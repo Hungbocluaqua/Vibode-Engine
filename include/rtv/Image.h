@@ -12,6 +12,7 @@ class ResourceAllocator;
 struct ImageDesc {
     uint32_t width = 1;
     uint32_t height = 1;
+    uint32_t depth = 1;
     uint32_t mipLevels = 1;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkImageUsageFlags usage = 0;
@@ -39,7 +40,7 @@ public:
     [[nodiscard]] VkImage handle() const { return image_; }
     [[nodiscard]] VkImageView view() const { return view_; }
     [[nodiscard]] VkFormat format() const { return desc_.format; }
-    [[nodiscard]] VkExtent3D extent() const { return {desc_.width, desc_.height, 1}; }
+    [[nodiscard]] VkExtent3D extent() const { return {desc_.width, desc_.height, desc_.depth}; }
     [[nodiscard]] uint32_t width() const { return desc_.width; }
     [[nodiscard]] uint32_t height() const { return desc_.height; }
     [[nodiscard]] uint32_t mipLevels() const { return desc_.mipLevels; }
@@ -48,7 +49,7 @@ public:
     [[nodiscard]] VkDescriptorImageInfo sampledDescriptor(VkSampler sampler) const;
     [[nodiscard]] VkDescriptorImageInfo storageDescriptor() const;
 
-    void setLayout(VkImageLayout layout) { layout_ = layout; }
+    void setLayout(VkImageLayout layout) const { layout_ = layout; }
     void generateMipmaps(VkCommandBuffer commandBuffer);
 
 private:
@@ -57,7 +58,8 @@ private:
     VkImage image_ = VK_NULL_HANDLE;
     VmaAllocation allocation_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE;
-    VkImageLayout layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    mutable VkImageLayout layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+private:
 };
 
 } // namespace rtv

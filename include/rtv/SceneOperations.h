@@ -20,6 +20,15 @@ public:
     bool setVisibility(EntityId id, bool visible);
     bool setLocked(EntityId id, bool locked);
     bool setTransform(EntityId id, const Transform& transform);
+    void setTransformGizmoDrag(EntityId id, const Transform& oldTransform, const Transform& newTransform);
+    bool addLightComponent(EntityId id, Light light = {});
+    bool addSunComponent(EntityId id, Sun sun = {});
+    bool addCameraComponent(EntityId id, Camera camera = {});
+    bool addMeshRendererComponent(EntityId id, MeshRenderer renderer = {});
+    bool setLight(EntityId id, const Light& oldLight, const Light& newLight);
+    bool setSun(EntityId id, const Sun& oldSun, const Sun& newSun);
+    bool setCamera(EntityId id, const Camera& oldCamera, const Camera& newCamera, EntityId oldActiveCamera, EntityId newActiveCamera);
+    void commitSunDrag(SceneDocument before, SceneUpdateKind updateKind);
 
 private:
     [[nodiscard]] EntityId duplicateEntityRecursive(const Entity& source, EntityId parent);

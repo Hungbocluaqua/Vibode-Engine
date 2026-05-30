@@ -1,8 +1,41 @@
 #include "rtv/UndoStack.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace rtv {
+
+CommandTransaction::CommandTransaction(UndoStack& stack, std::string label)
+    : stack_(stack), label_(std::move(label)) {}
+
+CommandTransaction::~CommandTransaction() {
+    if (active_) {
+        cancel();
+    }
+}
+
+void CommandTransaction::append(std::unique_ptr<ICommand> cmd) {
+    pending_.push_back(std::move(cmd));
+}
+
+void CommandTransaction::commit() {
+    if (pending_.empty()) {
+        active_ = false;
+        return;
+    }
+    auto macro = std::make_unique<MacroCommand>(label_);
+    for (auto& cmd : pending_) {
+        macro->addCommand(std::move(cmd));
+    }
+    pending_.clear();
+    stack_.pushCommand(std::move(macro));
+    active_ = false;
+}
+
+void CommandTransaction::cancel() {
+    pending_.clear();
+    active_ = false;
+}
 
 void UndoStack::pushCommand(std::unique_ptr<ICommand> command) {
     if (!command) {

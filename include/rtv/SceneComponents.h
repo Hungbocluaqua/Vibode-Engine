@@ -1,7 +1,6 @@
 #pragma once
 
 #include "rtv/MeshAsset.h"
-#include "rtv/RendererBackend.h"
 #include "rtv/RendererDebug.h"
 
 #include <glm/glm.hpp>
@@ -76,6 +75,13 @@ struct Light {
     bool enabled = true;
 };
 
+struct Sun {
+    bool enabled = true;
+    float illuminanceLux = 100000.0f;
+    float angularRadiusRadians = 0.00465f;
+    float colorTemperatureKelvin = 5778.0f;
+};
+
 struct Camera {
     float verticalFovRadians = 60.0f * 0.017453292519943295f;
     float nearPlane = 0.01f;
@@ -93,10 +99,11 @@ struct Environment {
 };
 
 struct RenderSettings {
+    RenderPreset renderPreset = RenderPreset::Balanced;
     bool pathTracingEnabled = true;
     bool cameraJitterEnabled = true;
     bool directLightingEnabled = true;
-    uint32_t maxBounces = 8;
+    uint32_t maxBounces = 5;
     uint32_t environmentDirectSamples = 1;
     ToneMapper toneMapper = ToneMapper::ACES;
     float exposure = 2.0f;
@@ -119,19 +126,65 @@ struct RenderSettings {
     float sunIntensity = 1.0f;
     float skyIntensity = 0.8f;
     float sunElevation = 0.97f;
-    float sunAngularRadius = 0.0093f;
+    float sunAzimuth = 3.14159265358979323846f;
+    float sunAngularRadius = 0.00465f;
+    float rayleighScaleHeight = 8000.0f;
+    float mieScaleHeight = 1200.0f;
+    float mieAnisotropy = 0.8f;
+    float groundAlbedo = 0.3f;
     float indirectStrength = 1.0f;
-    RestirMode restirMode = RestirMode::ClassicNee;
+    RestirMode restirMode = RestirMode::RestirOnly;
+    bool restirGiEnabled = true;
     bool denoiserEnabled = true;
-    uint32_t atrousIterations = 4;
-    float denoiserStrength = 1.0f;
+    bool denoiseWhileMoving = true;
+    uint32_t samplesPerPixel = 1;
+    bool limitSamplesPerPixel = true;
+    uint32_t atrousIterations = 3;
+    float denoiserStrength = 1.05f;
+    uint32_t denoiserMaxHistoryLength = 48;
+    float momentValidityThreshold = 0.20f;
     bool taaEnabled = true;
-    float taaFeedback = 0.08f;
+    float taaFeedback = 0.06f;
+    float taaMotionFeedback = 0.90f;
+    float taaReactiveFeedback = 0.98f;
+    float taaSharpeningStrength = 0.05f;
     RendererDebugView debugView = RendererDebugView::Beauty;
     bool accumulate = true;
     uint32_t accumulationLimit = 0;
-    float resolutionScale = 1.0f;
-    RendererBackend requestedBackend = RendererBackend::Auto;
+    float resolutionScale = 0.65f;
+    float materialTextureAnisotropy = 4.0f;
+    bool specularAaEnabled = true;
+    bool opacityMicromapsEnabled = true;
+    float shadowRayBias = 0.001f;
+    float shadowDistanceBias = 0.002f;
+    float fireflyClamp = 8.0f;
+    uint32_t restirGiTemporalMaxAge = 18;
+    uint32_t restirGiSpatialRounds = 3;
+    float restirGiSpatialRadius = 3.75f;
+    float restirGiDepthThresholdScale = 0.85f;
+    float restirGiSpatialCompatibilityThreshold = 0.06f;
+    bool restirGiHalfResolution = false;
+    uint32_t restirGiVisibilityRayBudget = 0;
+    AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Balanced;
+    float adaptiveGpuFrameTargetMs = 16.6f;
+
+    bool usePhysicalCamera = false;
+    float physicalAperture = 16.0f;
+    float physicalShutterSeconds = 1.0f / 125.0f;
+    float physicalIso = 100.0f;
+    float physicalExposureCompensation = 0.0f;
+    float dofApertureRadius = 0.0f;
+    float dofFocusDistance = 10.0f;
+    uint32_t dofBladeCount = 0;
+    float dofBokehRotation = 0.0f;
+    bool motionBlurEnabled = false;
+    float motionBlurShutterOpen = 0.0f;
+    float motionBlurShutterClose = 1.0f;
+    bool homogeneousVolumeEnabled = false;
+    float homogeneousVolumeScattering = 0.0f;
+    float homogeneousVolumeAbsorption = 0.0f;
+    float homogeneousVolumeAnisotropy = 0.0f;
+    bool mneeCausticsEnabled = false;
 };
 
 enum class SceneUpdateKind : uint32_t {

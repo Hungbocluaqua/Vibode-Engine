@@ -1,0 +1,145 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "wavefront_common.glsl"
+#include "restir_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D output_color;
+
+layout(set = 0, binding = 1, std430) readonly buffer RayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} ray_queue;
+
+layout(set = 0, binding = 2, std430) readonly buffer CompactedRayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} compacted_ray_queue;
+
+layout(set = 0, binding = 3, std430) readonly buffer HitQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontHit records[];
+} hit_queue;
+
+layout(set = 0, binding = 4, std430) readonly buffer ShadowQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontShadowRay records[];
+} shadow_queue;
+
+layout(set = 0, binding = 5, std430) readonly buffer PixelStateBuffer {
+    WavefrontQueueHeader header;
+    WavefrontPixelState records[];
+} pixel_state;
+
+layout(set = 0, binding = 6, std430) readonly buffer RestirReservoirBuffer {
+    RestirReservoir restir_reservoirs[];
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer RestirGiReservoirBuffer {
+    RestirGiReservoir restir_gi_reservoirs[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint view;
+    uint max_depth;
+    uint flags;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+} pc;
+
+const uint WAVEFRONT_FLAG_TERMINATED = 1u << 8u;
+const uint DEBUG_WAVEFRONT_QUEUE_OCCUPANCY = 92u;
+const uint DEBUG_WAVEFRONT_PATH_DEPTH = 93u;
+const uint DEBUG_WAVEFRONT_LIVE_RAYS = 94u;
+const uint DEBUG_WAVEFRONT_TERMINATED_RAYS = 95u;
+const uint DEBUG_WAVEFRONT_MATERIAL_BUCKET = 96u;
+const uint DEBUG_WAVEFRONT_RESTIR_DI = 97u;
+const uint DEBUG_WAVEFRONT_DIRECT_LIGHTING = 98u;
+const uint DEBUG_WAVEFRONT_RESTIR_GI = 99u;
+const uint WAVEFRONT_WRITE_FLAG_FINAL_OUTPUT = 1u << 0u;
+
+float safe_ratio(uint value, uint capacity) {
+    return capacity == 0u ? 0.0 : clamp(float(value) / float(capacity), 0.0, 1.0);
+}
+
+uint hash_u32(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+vec3 id_color(uint id) {
+    uint h = hash_u32(id + 1u);
+    return vec3(float(h & 255u), float((h >> 8u) & 255u), float((h >> 16u) & 255u)) / 255.0;
+}
+
+vec3 queue_occupancy_color() {
+    float ray_ratio = safe_ratio(ray_queue.header.counters.x, ray_queue.header.counters.y);
+    float shadow_ratio = safe_ratio(shadow_queue.header.counters.x, shadow_queue.header.counters.y);
+    float compact_ratio = safe_ratio(compacted_ray_queue.header.counters.x, compacted_ray_queue.header.counters.y);
+    return vec3(ray_ratio, shadow_ratio, compact_ratio);
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.width || pixel.y >= pc.height) {
+        return;
+    }
+
+    uint pixel_index = pixel.y * pc.width + pixel.x;
+    vec3 color = vec3(0.0);
+    bool has_state = pixel_index < pixel_state.header.counters.y;
+    WavefrontPixelState state;
+    if (has_state) {
+        state = pixel_state.records[pixel_index];
+    }
+
+    if ((pc.flags & WAVEFRONT_WRITE_FLAG_FINAL_OUTPUT) != 0u) {
+        vec3 radiance = has_state ? state.radiance.rgb + state.direct_lighting.rgb + state.indirect_lighting.rgb : vec3(0.0);
+        color = max(radiance, vec3(0.0));
+    } else if (pc.view == DEBUG_WAVEFRONT_QUEUE_OCCUPANCY) {
+        color = queue_occupancy_color();
+    } else if (pc.view == DEBUG_WAVEFRONT_PATH_DEPTH) {
+        float depth = has_state ? clamp(float(state.rng_depth_flags.y) / float(max(pc.max_depth, 1u)), 0.0, 1.0) : 0.0;
+        color = vec3(depth, depth * depth, 1.0 - depth);
+    } else if (pc.view == DEBUG_WAVEFRONT_LIVE_RAYS) {
+        bool live = has_state && (state.rng_depth_flags.z & WAVEFRONT_FLAG_TERMINATED) == 0u;
+        color = live ? vec3(0.08, 0.95, 0.28) : vec3(0.0);
+    } else if (pc.view == DEBUG_WAVEFRONT_TERMINATED_RAYS) {
+        bool terminated = has_state && (state.rng_depth_flags.z & WAVEFRONT_FLAG_TERMINATED) != 0u;
+        color = terminated ? vec3(1.0, 0.25, 0.08) : vec3(0.0);
+    } else if (pc.view == DEBUG_WAVEFRONT_MATERIAL_BUCKET) {
+        bool shaded = has_state && state.material_instance_primitive.x != 0xffffffffu;
+        color = shaded ? id_color(state.material_instance_primitive.x) : vec3(0.0);
+    } else if (pc.view == DEBUG_WAVEFRONT_RESTIR_DI) {
+        if (pixel_index < pixel_state.header.counters.y) {
+            RestirReservoir reservoir = restir_reservoirs[pixel_index];
+            float confidence = clamp(reservoir.sample_value_confidence.a, 0.0, 1.0);
+            vec3 value = max(reservoir.sample_value_confidence.rgb, vec3(0.0));
+            float lum = dot(value, vec3(0.2126, 0.7152, 0.0722));
+            color = vec3(clamp(log2(lum + 1.0) / 8.0, 0.0, 1.0), confidence, confidence > 0.0 ? 0.15 : 0.0);
+        }
+    } else if (pc.view == DEBUG_WAVEFRONT_RESTIR_GI) {
+        if (pixel_index < pixel_state.header.counters.y) {
+            RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
+            bool valid = restir_gi_reservoir_valid(reservoir);
+            vec3 value = valid ? max(reservoir.radiance_weight_sum.rgb, vec3(0.0)) : vec3(0.0);
+            float lum = dot(value, vec3(0.2126, 0.7152, 0.0722));
+            float confidence = valid ? clamp(reservoir.radiance_weight_sum.w, 0.0, 1.0) : 0.0;
+            float age = valid ? 1.0 - restir_gi_age_normalized(reservoir, float(max(pc.max_depth, 1u))) : 0.0;
+            color = vec3(clamp(log2(lum + 1.0) / 8.0, 0.0, 1.0), confidence, age);
+        }
+    } else if (pc.view == DEBUG_WAVEFRONT_DIRECT_LIGHTING) {
+        color = has_state ? max(state.direct_lighting.rgb, vec3(0.0)) : vec3(0.0);
+    }
+
+    imageStore(output_color, ivec2(pixel), vec4(color, 1.0));
+}

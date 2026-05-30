@@ -1,8 +1,10 @@
 #include "rtv/BindlessResources.h"
 
+#include "rtv/Buffer.h"
 #include "rtv/Image.h"
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 namespace rtv {
@@ -43,6 +45,7 @@ BindlessTextureTable& BindlessTextureTable::operator=(BindlessTextureTable&& oth
         images_ = std::move(other.images_);
         descriptors_ = std::move(other.descriptors_);
         slotCount_ = other.slotCount_;
+        allocator_ = std::move(other.allocator_);
         other.slotCount_ = 0;
     }
     return *this;
@@ -51,6 +54,7 @@ BindlessTextureTable& BindlessTextureTable::operator=(BindlessTextureTable&& oth
 void BindlessTextureTable::setImages(std::vector<std::unique_ptr<Image>> images, uint32_t slotCount) {
     images_ = std::move(images);
     slotCount_ = std::max(slotCount, 1u);
+    rebuildAllocator();
     rebuildDescriptors();
 }
 
@@ -58,6 +62,7 @@ void BindlessTextureTable::clear() {
     images_.clear();
     descriptors_.clear();
     slotCount_ = 0;
+    allocator_.clear();
 }
 
 void BindlessTextureTable::rebuildDescriptors() {
@@ -70,6 +75,85 @@ void BindlessTextureTable::rebuildDescriptors() {
         const uint32_t imageIndex = slot < images_.size() ? slot : 0u;
         descriptors_.push_back(images_[imageIndex]->sampledDescriptor(VK_NULL_HANDLE));
     }
+}
+
+void BindlessTextureTable::rebuildAllocator() {
+    allocator_ = FreeListAllocator<uint32_t>(slotCount_);
+}
+
+VkImageView BindlessTextureTable::imageView(uint32_t index) const {
+    if (index >= images_.size() || images_[index] == nullptr) {
+        return VK_NULL_HANDLE;
+    }
+    return images_[index]->view();
+}
+
+void BindlessMaterialTable::init(uint32_t maxMaterials, Buffer& gpuBuffer) {
+    gpuBuffer_ = &gpuBuffer;
+    allocator_ = FreeListAllocator<uint32_t>(maxMaterials);
+}
+
+MaterialHandle BindlessMaterialTable::registerMaterial(const void* materialData) {
+    const uint32_t index = allocator_.allocate();
+    if (index == UINT32_MAX || gpuBuffer_ == nullptr) {
+        return {};
+    }
+    const size_t offset = static_cast<size_t>(index) * kMaterialStride;
+    gpuBuffer_->write(materialData, kMaterialStride, offset);
+    return MaterialHandle{index};
+}
+
+void BindlessMaterialTable::updateMaterial(MaterialHandle handle, const void* materialData) {
+    if (!handle.valid() || gpuBuffer_ == nullptr) {
+        return;
+    }
+    const size_t offset = static_cast<size_t>(handle.index) * kMaterialStride;
+    gpuBuffer_->write(materialData, kMaterialStride, offset);
+}
+
+void BindlessMaterialTable::removeMaterial(MaterialHandle handle) {
+    if (handle.valid()) {
+        allocator_.free(handle.index);
+    }
+}
+
+void BindlessMaterialTable::clear() {
+    allocator_.clear();
+    gpuBuffer_ = nullptr;
+}
+
+void BindlessMeshTable::init(uint32_t maxMeshes, Buffer& gpuBuffer) {
+    gpuBuffer_ = &gpuBuffer;
+    allocator_ = FreeListAllocator<uint32_t>(maxMeshes);
+}
+
+MeshHandle BindlessMeshTable::registerMesh(const void* meshData, uint32_t stride) {
+    const uint32_t index = allocator_.allocate();
+    if (index == UINT32_MAX || gpuBuffer_ == nullptr) {
+        return {};
+    }
+    const size_t offset = static_cast<size_t>(index) * kMeshStride;
+    gpuBuffer_->write(meshData, std::min(stride, kMeshStride), offset);
+    return MeshHandle{index};
+}
+
+void BindlessMeshTable::updateMesh(MeshHandle handle, const void* meshData, uint32_t stride) {
+    if (!handle.valid() || gpuBuffer_ == nullptr) {
+        return;
+    }
+    const size_t offset = static_cast<size_t>(handle.index) * kMeshStride;
+    gpuBuffer_->write(meshData, std::min(stride, kMeshStride), offset);
+}
+
+void BindlessMeshTable::removeMesh(MeshHandle handle) {
+    if (handle.valid()) {
+        allocator_.free(handle.index);
+    }
+}
+
+void BindlessMeshTable::clear() {
+    allocator_.clear();
+    gpuBuffer_ = nullptr;
 }
 
 } // namespace rtv

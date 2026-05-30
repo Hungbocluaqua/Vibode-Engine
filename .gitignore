@@ -1,7 +1,9 @@
 # Build output
 build/
+build_test/
 cmake-build-*/
 out/
+validation_output/
 
 # Visual Studio
 .vs/
@@ -42,9 +44,8 @@ volk.vcxproj*
 *.pdb
 *.ilk
 
-# Compiled shaders (keep source .spv in shaders/ but not build copies)
-# Uncomment next line if you want to ignore compiled shader binaries
-# *.spv
+# Compiled shaders
+*.spv
 
 # IDE
 .idea/
@@ -53,9 +54,15 @@ volk.vcxproj*
 *~
 .vscode/
 
+# CodeGraph runtime state
+.codegraph/
+
 # Sponza scenes (large assets)
 Sponza/
 main_sponza/
+
+# San Miguel scene (large asset)
+san-miguel/
 
 # OS
 .DS_Store

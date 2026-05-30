@@ -6,16 +6,21 @@
 
 #include "rtv/AssetManager.h"
 #include "rtv/SceneCache.h"
+#include "rtv/TextureLoader.h"
 
 #include <glm/gtc/quaternion.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
+#include <utility>
 
 namespace rtv {
 
@@ -136,6 +141,105 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
     return true;
 }
 
+[[nodiscard]] bool isKtx2Data(const std::vector<uint8_t>& data) {
+    constexpr uint8_t ktx2Magic[12] = {
+        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
+    };
+    return data.size() >= sizeof(ktx2Magic) && std::memcmp(data.data(), ktx2Magic, sizeof(ktx2Magic)) == 0;
+}
+
+[[nodiscard]] bool isKtx2Bytes(const unsigned char* bytes, int size) {
+    constexpr uint8_t ktx2Magic[12] = {
+        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
+    };
+    return bytes != nullptr && size >= static_cast<int>(sizeof(ktx2Magic)) &&
+        std::memcmp(bytes, ktx2Magic, sizeof(ktx2Magic)) == 0;
+}
+
+[[nodiscard]] uint32_t readKtx2U32(const unsigned char* bytes, size_t offset) {
+    uint32_t value = 0;
+    std::memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+[[nodiscard]] bool isKtx2Path(const std::string& uri) {
+    if (uri.empty()) return false;
+    const std::string lower = [&] {
+        std::string s = uri;
+        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        return s;
+    }();
+    return lower.ends_with(".ktx2");
+}
+
+[[nodiscard]] bool isHdrBytes(const unsigned char* bytes, int size) {
+    constexpr char radianceMagic[] = "#?RADIANCE";
+    constexpr char rgbeMagic[] = "#?RGBE";
+    return bytes != nullptr && size >= 7 &&
+        (std::memcmp(bytes, radianceMagic, sizeof(radianceMagic) - 1) == 0 ||
+         std::memcmp(bytes, rgbeMagic, sizeof(rgbeMagic) - 1) == 0);
+}
+
+[[nodiscard]] bool isHdrPath(const std::string& uri) {
+    if (uri.empty()) return false;
+    std::string lower = uri;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return lower.ends_with(".hdr") || lower.ends_with(".rgbe");
+}
+
+[[nodiscard]] std::pair<int, int> readRadianceDimensions(const unsigned char* bytes, int size) {
+    if (bytes == nullptr || size <= 0) {
+        return {1, 1};
+    }
+    const std::string header(reinterpret_cast<const char*>(bytes), static_cast<size_t>(size));
+    const size_t marker = header.find("-Y ");
+    if (marker == std::string::npos) {
+        return {1, 1};
+    }
+    std::istringstream dims(header.substr(marker));
+    std::string yToken;
+    std::string xToken;
+    int height = 1;
+    int width = 1;
+    if (!(dims >> yToken >> height >> xToken >> width) || yToken != "-Y" || xToken != "+X") {
+        return {1, 1};
+    }
+    return {std::max(width, 1), std::max(height, 1)};
+}
+
+bool loadImageDataPreservingKtx2(
+    tinygltf::Image* image,
+    const int imageIndex,
+    std::string* error,
+    std::string* warning,
+    int reqWidth,
+    int reqHeight,
+    const unsigned char* bytes,
+    int size,
+    void* userData) {
+    const bool ktx2 = image != nullptr &&
+        (image->mimeType == "image/ktx2" || isKtx2Path(image->uri) || isKtx2Bytes(bytes, size));
+    const bool hdr = image != nullptr &&
+        (image->mimeType == "image/vnd.radiance" || image->mimeType == "image/hdr" || isHdrPath(image->uri) || isHdrBytes(bytes, size));
+    if (!ktx2 && !hdr) {
+        return tinygltf::LoadImageData(image, imageIndex, error, warning, reqWidth, reqHeight, bytes, size, userData);
+    }
+
+    image->image.assign(bytes, bytes + size);
+    if (ktx2) {
+        image->width = isKtx2Bytes(bytes, size) ? static_cast<int>(readKtx2U32(bytes, 20)) : 1;
+        image->height = isKtx2Bytes(bytes, size) ? static_cast<int>(readKtx2U32(bytes, 24)) : 1;
+    } else {
+        const auto [width, height] = readRadianceDimensions(bytes, size);
+        image->width = width;
+        image->height = height;
+    }
+    image->component = 4;
+    image->bits = 8;
+    image->pixel_type = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    return true;
+}
+
 [[nodiscard]] TextureAsset textureFromImage(const tinygltf::Image& image, const std::filesystem::path& gltfPath) {
     TextureAsset texture;
     texture.name = image.name;
@@ -144,8 +248,107 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
     texture.height = static_cast<uint32_t>(std::max(image.height, 1));
     texture.channels = 4;
 
+    if (isKtx2Path(image.uri) || isKtx2Data(image.image)) {
+        std::filesystem::path ktxPath;
+        if (isKtx2Path(image.uri)) {
+            ktxPath = texture.sourcePath;
+        }
+        try {
+            TextureData td = ktxPath.empty()
+                ? TextureLoader::loadKtx2(texture.sourcePath.string())
+                : TextureLoader::loadKtx2(ktxPath.string());
+            texture.width = static_cast<uint32_t>(td.width);
+            texture.height = static_cast<uint32_t>(td.height);
+            texture.channels = 4;
+            texture.mipLevels = td.mipLevels;
+            texture.isCompressed = td.isCompressed;
+            texture.linearColorSpace = td.linearColorSpace;
+            texture.format = td.format;
+            texture.compressedFormat = td.compressedFormat;
+            texture.rgba8 = std::move(td.pixels);
+            texture.mipData = std::move(td.mipData);
+            texture.fallback = false;
+            return texture;
+        } catch (const std::runtime_error& e) {
+            std::cerr << "KTX2 texture load failed: " << e.what() << ", falling back\n";
+        }
+    }
+
+    const bool externalImage = !texture.sourcePath.empty() && texture.sourcePath != gltfPath && std::filesystem::exists(texture.sourcePath);
+    if (externalImage) {
+        try {
+            TextureData td = TextureLoader::load(texture.sourcePath.string());
+            texture.width = static_cast<uint32_t>(td.width);
+            texture.height = static_cast<uint32_t>(td.height);
+            texture.channels = 4;
+            texture.mipLevels = td.mipLevels;
+            texture.isCompressed = td.isCompressed;
+            texture.linearColorSpace = td.linearColorSpace;
+            texture.format = td.format;
+            texture.compressedFormat = td.compressedFormat;
+            texture.rgba8 = std::move(td.pixels);
+            texture.mipData = std::move(td.mipData);
+            texture.fallback = false;
+            return texture;
+        } catch (const std::runtime_error& e) {
+            std::cerr << "High-precision texture load failed: " << e.what() << ", trying decoded glTF image data\n";
+        }
+    }
+
     const size_t pixelCount = static_cast<size_t>(texture.width) * texture.height;
     const size_t expectedRgbaBytes = pixelCount * 4u;
+    const size_t componentCount = static_cast<size_t>(std::max(image.component, 0));
+
+    const bool canDecodeFloat =
+        image.bits == 32 &&
+        image.pixel_type == TINYGLTF_COMPONENT_TYPE_FLOAT &&
+        image.component > 0 &&
+        image.component <= 4 &&
+        image.image.size() >= pixelCount * componentCount * sizeof(float);
+    if (canDecodeFloat) {
+        texture.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        texture.linearColorSpace = true;
+        texture.rgba8.resize(pixelCount * 4u * sizeof(float));
+        for (size_t i = 0; i < pixelCount; ++i) {
+            const size_t src = i * componentCount;
+            const size_t dst = i * 4u;
+            float values[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            for (size_t c = 0; c < componentCount; ++c) {
+                std::memcpy(&values[c], image.image.data() + (src + c) * sizeof(float), sizeof(float));
+            }
+            if (componentCount == 1) {
+                values[1] = values[0];
+                values[2] = values[0];
+            }
+            std::memcpy(texture.rgba8.data() + dst * sizeof(float), values, sizeof(values));
+        }
+        return texture;
+    }
+
+    const bool canDecode16Bit =
+        image.bits == 16 &&
+        image.component > 0 &&
+        image.component <= 4 &&
+        image.image.size() >= pixelCount * componentCount * sizeof(uint16_t);
+    if (canDecode16Bit) {
+        texture.format = VK_FORMAT_R16G16B16A16_UNORM;
+        texture.rgba8.resize(pixelCount * 4u * sizeof(uint16_t));
+        for (size_t i = 0; i < pixelCount; ++i) {
+            const size_t src = i * componentCount;
+            const size_t dst = i * 4u;
+            uint16_t values[4] = {0u, 0u, 0u, 65535u};
+            for (size_t c = 0; c < componentCount; ++c) {
+                std::memcpy(&values[c], image.image.data() + (src + c) * sizeof(uint16_t), sizeof(uint16_t));
+            }
+            if (componentCount == 1) {
+                values[1] = values[0];
+                values[2] = values[0];
+            }
+            std::memcpy(texture.rgba8.data() + dst * sizeof(uint16_t), values, sizeof(values));
+        }
+        return texture;
+    }
+
     const bool canDecode8Bit =
         image.bits == 8 &&
         image.component > 0 &&
@@ -163,6 +366,7 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
         return texture;
     }
 
+    texture.format = VK_FORMAT_R8G8B8A8_UNORM;
     texture.rgba8.resize(expectedRgbaBytes);
     if (image.component == 4 && image.image.size() == expectedRgbaBytes) {
         texture.rgba8 = image.image;
@@ -219,7 +423,108 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
     return desc;
 }
 
+[[nodiscard]] bool supportedGltfExtension(const std::string& name) {
+    return name == "KHR_materials_clearcoat" ||
+        name == "KHR_materials_transmission" ||
+        name == "KHR_materials_ior" ||
+        name == "KHR_materials_specular" ||
+        name == "KHR_materials_sheen" ||
+        name == "KHR_materials_iridescence" ||
+        name == "KHR_materials_emissive_strength" ||
+        name == "KHR_materials_anisotropy" ||
+        name == "KHR_texture_transform";
+}
+
+void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
+    for (const std::string& name : model.extensionsRequired) {
+        if (!supportedGltfExtension(name)) {
+            std::cerr << "glTF required extension warning: unsupported required extension '" << name << "'\n";
+        }
+    }
+    for (const std::string& name : model.extensionsUsed) {
+        if (!supportedGltfExtension(name)) {
+            std::cerr << "glTF extension warning: unsupported extension '" << name << "'\n";
+        }
+    }
+}
+
 [[nodiscard]] MaterialAsset materialFromGltf(const tinygltf::Material& source, const std::vector<TextureAssetHandle>& textures) {
+    auto textureHandle = [&](int textureIndex) {
+        if (textureIndex >= 0 && static_cast<size_t>(textureIndex) < textures.size()) {
+            return textures[static_cast<size_t>(textureIndex)];
+        }
+        return TextureAssetHandle{};
+    };
+    auto extensionObject = [&](std::string_view name) -> const tinygltf::Value* {
+        const auto it = source.extensions.find(std::string{name});
+        if (it == source.extensions.end() || !it->second.IsObject()) {
+            return nullptr;
+        }
+        return &it->second;
+    };
+    auto valueMember = [](const tinygltf::Value& object, const char* key) -> const tinygltf::Value* {
+        if (!object.IsObject()) {
+            return nullptr;
+        }
+        const auto& values = object.Get<tinygltf::Value::Object>();
+        const auto it = values.find(key);
+        return it != values.end() ? &it->second : nullptr;
+    };
+    auto numberMember = [&](const tinygltf::Value& object, const char* key, double fallback) {
+        const tinygltf::Value* value = valueMember(object, key);
+        return value != nullptr && value->IsNumber() ? value->GetNumberAsDouble() : fallback;
+    };
+    auto intMember = [&](const tinygltf::Value& object, const char* key, int fallback) {
+        const tinygltf::Value* value = valueMember(object, key);
+        return value != nullptr && value->IsInt() ? value->Get<int>() : fallback;
+    };
+    auto vec3Member = [&](const tinygltf::Value& object, const char* key, glm::vec3 fallback) {
+        const tinygltf::Value* value = valueMember(object, key);
+        if (value == nullptr || !value->IsArray()) {
+            return fallback;
+        }
+        const auto& array = value->Get<tinygltf::Value::Array>();
+        if (array.size() < 3 || !array[0].IsNumber() || !array[1].IsNumber() || !array[2].IsNumber()) {
+            return fallback;
+        }
+        return glm::vec3{
+            static_cast<float>(array[0].GetNumberAsDouble()),
+            static_cast<float>(array[1].GetNumberAsDouble()),
+            static_cast<float>(array[2].GetNumberAsDouble()),
+        };
+    };
+    auto textureHandleMember = [&](const tinygltf::Value& object, const char* key) {
+        const tinygltf::Value* textureInfo = valueMember(object, key);
+        if (textureInfo == nullptr || !textureInfo->IsObject()) {
+            return TextureAssetHandle{};
+        }
+        return textureHandle(intMember(*textureInfo, "index", -1));
+    };
+    auto textureTransformFromInfo = [&](const auto& textureInfo) {
+        TextureTransformAsset transform{};
+        const auto extIt = textureInfo.extensions.find("KHR_texture_transform");
+        if (extIt == textureInfo.extensions.end() || !extIt->second.IsObject()) {
+            return transform;
+        }
+        transform.enabled = 1u;
+        const tinygltf::Value& textureTransform = extIt->second;
+        if (const tinygltf::Value* offset = valueMember(textureTransform, "offset"); offset != nullptr && offset->IsArray()) {
+            const auto& array = offset->Get<tinygltf::Value::Array>();
+            if (array.size() >= 2 && array[0].IsNumber() && array[1].IsNumber()) {
+                transform.offset = {static_cast<float>(array[0].GetNumberAsDouble()), static_cast<float>(array[1].GetNumberAsDouble())};
+            }
+        }
+        if (const tinygltf::Value* scale = valueMember(textureTransform, "scale"); scale != nullptr && scale->IsArray()) {
+            const auto& array = scale->Get<tinygltf::Value::Array>();
+            if (array.size() >= 2 && array[0].IsNumber() && array[1].IsNumber()) {
+                transform.scale = {static_cast<float>(array[0].GetNumberAsDouble()), static_cast<float>(array[1].GetNumberAsDouble())};
+            }
+        }
+        transform.rotation = static_cast<float>(numberMember(textureTransform, "rotation", 0.0));
+        transform.texCoord = static_cast<uint32_t>(std::max(intMember(textureTransform, "texCoord", textureInfo.texCoord), 0));
+        return transform;
+    };
+
     MaterialAsset material;
     material.name = source.name;
     const auto& pbr = source.pbrMetallicRoughness;
@@ -247,17 +552,107 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
             static_cast<float>(source.emissiveFactor[2]),
         };
     }
-    if (pbr.baseColorTexture.index >= 0 && static_cast<size_t>(pbr.baseColorTexture.index) < textures.size()) {
-        material.baseColorTexture = textures[static_cast<size_t>(pbr.baseColorTexture.index)];
+    material.baseColorTexture = textureHandle(pbr.baseColorTexture.index);
+    material.metallicRoughnessTexture = textureHandle(pbr.metallicRoughnessTexture.index);
+    material.normalTexture = textureHandle(source.normalTexture.index);
+    material.emissiveTexture = textureHandle(source.emissiveTexture.index);
+    material.occlusionTexture = textureHandle(source.occlusionTexture.index);
+    material.occlusionStrength = static_cast<float>(std::clamp(source.occlusionTexture.strength, 0.0, 1.0));
+    material.baseColorTextureTransform = textureTransformFromInfo(pbr.baseColorTexture);
+    material.metallicRoughnessTextureTransform = textureTransformFromInfo(pbr.metallicRoughnessTexture);
+    material.normalTextureTransform = textureTransformFromInfo(source.normalTexture);
+    material.emissiveTextureTransform = textureTransformFromInfo(source.emissiveTexture);
+    material.occlusionTextureTransform = textureTransformFromInfo(source.occlusionTexture);
+
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_ior")) {
+        material.hasIor = 1u;
+        material.iorFactor = static_cast<float>(numberMember(*ext, "ior", 1.5));
     }
-    if (pbr.metallicRoughnessTexture.index >= 0 && static_cast<size_t>(pbr.metallicRoughnessTexture.index) < textures.size()) {
-        material.metallicRoughnessTexture = textures[static_cast<size_t>(pbr.metallicRoughnessTexture.index)];
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_emissive_strength")) {
+        material.hasEmissiveStrength = 1u;
+        material.emissiveStrength = static_cast<float>(numberMember(*ext, "emissiveStrength", 1.0));
+        material.emissiveFactor *= material.emissiveStrength;
     }
-    if (source.normalTexture.index >= 0 && static_cast<size_t>(source.normalTexture.index) < textures.size()) {
-        material.normalTexture = textures[static_cast<size_t>(source.normalTexture.index)];
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_clearcoat")) {
+        material.hasClearcoat = 1u;
+        material.clearcoatFactor = static_cast<float>(numberMember(*ext, "clearcoatFactor", 0.0));
+        material.clearcoatRoughnessFactor = static_cast<float>(numberMember(*ext, "clearcoatRoughnessFactor", 0.0));
+        material.clearcoatTexture = textureHandleMember(*ext, "clearcoatTexture");
+        material.clearcoatRoughnessTexture = textureHandleMember(*ext, "clearcoatRoughnessTexture");
+        material.clearcoatNormalTexture = textureHandleMember(*ext, "clearcoatNormalTexture");
+        material.shaderCompatibilityMask |= kMaterialClosureFlagClearcoat;
     }
-    if (source.emissiveTexture.index >= 0 && static_cast<size_t>(source.emissiveTexture.index) < textures.size()) {
-        material.emissiveTexture = textures[static_cast<size_t>(source.emissiveTexture.index)];
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_transmission")) {
+        material.hasTransmission = 1u;
+        material.transmissionFactor = static_cast<float>(numberMember(*ext, "transmissionFactor", 0.0));
+        material.transmissionTexture = textureHandleMember(*ext, "transmissionTexture");
+        material.shaderCompatibilityMask |= kMaterialClosureFlagTransmission;
+    }
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_specular")) {
+        material.hasSpecular = 1u;
+        material.specularFactor = static_cast<float>(numberMember(*ext, "specularFactor", 1.0));
+        material.specularColorFactor = vec3Member(*ext, "specularColorFactor", glm::vec3{1.0f});
+        material.specularTexture = textureHandleMember(*ext, "specularTexture");
+        material.specularColorTexture = textureHandleMember(*ext, "specularColorTexture");
+    }
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_sheen")) {
+        material.hasSheen = 1u;
+        material.sheenColorFactor = vec3Member(*ext, "sheenColorFactor", glm::vec3{0.0f});
+        material.sheenRoughnessFactor = static_cast<float>(numberMember(*ext, "sheenRoughnessFactor", 0.0));
+        material.sheenColorTexture = textureHandleMember(*ext, "sheenColorTexture");
+        material.sheenRoughnessTexture = textureHandleMember(*ext, "sheenRoughnessTexture");
+        material.shaderCompatibilityMask |= kMaterialClosureFlagSheen;
+    }
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_iridescence")) {
+        material.hasIridescence = 1u;
+        material.iridescenceFactor = static_cast<float>(numberMember(*ext, "iridescenceFactor", 0.0));
+        material.iridescenceIor = static_cast<float>(numberMember(*ext, "iridescenceIor", 1.3));
+        material.iridescenceThicknessMinimum = static_cast<float>(numberMember(*ext, "iridescenceThicknessMinimum", 100.0));
+        material.iridescenceThicknessMaximum = static_cast<float>(numberMember(*ext, "iridescenceThicknessMaximum", 400.0));
+        material.iridescenceTexture = textureHandleMember(*ext, "iridescenceTexture");
+        material.iridescenceThicknessTexture = textureHandleMember(*ext, "iridescenceThicknessTexture");
+        material.shaderCompatibilityMask |= kMaterialClosureFlagThinFilm;
+    }
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_anisotropy")) {
+        material.hasAnisotropy = 1u;
+        material.anisotropyStrength = static_cast<float>(numberMember(*ext, "anisotropyStrength", 0.0));
+        material.anisotropyRotation = static_cast<float>(numberMember(*ext, "anisotropyRotation", 0.0));
+        material.anisotropyTexture = textureHandleMember(*ext, "anisotropyTexture");
+    }
+    for (const auto& [name, extensionValue] : source.extensions) {
+        if (!extensionValue.IsObject()) {
+            continue;
+        }
+        if (name == "KHR_materials_clearcoat" || name == "KHR_materials_transmission" ||
+            name == "KHR_materials_ior" || name == "KHR_materials_specular" ||
+            name == "KHR_materials_sheen" || name == "KHR_materials_emissive_strength" ||
+            name == "KHR_materials_iridescence" || name == "KHR_materials_anisotropy") {
+            continue;
+        }
+        std::cerr << "glTF material extension warning: material '" << (source.name.empty() ? "(unnamed)" : source.name)
+                  << "' uses unsupported extension '" << name << "'\n";
+    }
+
+    const bool hasTextureTransform =
+        material.baseColorTextureTransform.enabled != 0u ||
+        material.metallicRoughnessTextureTransform.enabled != 0u ||
+        material.normalTextureTransform.enabled != 0u ||
+        material.emissiveTextureTransform.enabled != 0u;
+    if (material.hasIor != 0u || material.hasClearcoat != 0u || material.hasTransmission != 0u ||
+        material.hasSpecular != 0u || material.hasSheen != 0u || material.hasEmissiveStrength != 0u ||
+        material.hasIridescence != 0u || material.hasAnisotropy != 0u || hasTextureTransform) {
+        std::cout << "glTF material extensions: material '"
+                  << (source.name.empty() ? "(unnamed)" : source.name)
+                  << "' ior=" << material.iorFactor
+                  << " clearcoat=" << material.clearcoatFactor
+                  << " transmission=" << material.transmissionFactor
+                  << " specular=" << material.specularFactor
+                  << " sheenRoughness=" << material.sheenRoughnessFactor
+                  << " iridescence=" << material.iridescenceFactor
+                  << " emissiveStrength=" << material.emissiveStrength
+                  << " anisotropy=" << material.anisotropyStrength
+                  << " textureTransform=" << (hasTextureTransform ? "yes" : "no")
+                  << '\n';
     }
     return material;
 }
@@ -343,6 +738,7 @@ GltfLoader::GltfLoader(AssetManager& assets)
 
 SceneAsset GltfLoader::load(const std::filesystem::path& path) {
     tinygltf::TinyGLTF loader;
+    loader.SetImageLoader(loadImageDataPreservingKtx2, nullptr);
     tinygltf::Model model;
     std::string error;
     std::string warning;
@@ -356,6 +752,7 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
     if (!ok) {
         throw std::runtime_error("glTF load failed: " + path.string() + " " + error);
     }
+    reportGltfExtensionDiagnostics(model);
 
     SceneAsset scene;
     scene.name = path.filename().string();
@@ -363,20 +760,36 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
 
     std::vector<bool> colorTextureUse(model.textures.size(), false);
     std::vector<bool> dataTextureUse(model.textures.size(), false);
+    auto extensionTextureIndex = [](const tinygltf::Material& material, const char* extensionName, const char* textureName) -> int {
+        const auto extIt = material.extensions.find(extensionName);
+        if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
+            return -1;
+        }
+        const auto& extObject = extIt->second.Get<tinygltf::Value::Object>();
+        const auto texIt = extObject.find(textureName);
+        if (texIt == extObject.end() || !texIt->second.IsObject()) {
+            return -1;
+        }
+        const auto& texObject = texIt->second.Get<tinygltf::Value::Object>();
+        const auto indexIt = texObject.find("index");
+        return indexIt != texObject.end() && indexIt->second.IsInt() ? indexIt->second.Get<int>() : -1;
+    };
+    auto markTextureUse = [&](int textureIndex, std::vector<bool>& use) {
+        if (textureIndex >= 0 && static_cast<size_t>(textureIndex) < use.size()) {
+            use[static_cast<size_t>(textureIndex)] = true;
+        }
+    };
     for (const tinygltf::Material& sourceMaterial : model.materials) {
         const auto& pbr = sourceMaterial.pbrMetallicRoughness;
-        if (pbr.baseColorTexture.index >= 0 && static_cast<size_t>(pbr.baseColorTexture.index) < colorTextureUse.size()) {
-            colorTextureUse[static_cast<size_t>(pbr.baseColorTexture.index)] = true;
-        }
-        if (sourceMaterial.emissiveTexture.index >= 0 && static_cast<size_t>(sourceMaterial.emissiveTexture.index) < colorTextureUse.size()) {
-            colorTextureUse[static_cast<size_t>(sourceMaterial.emissiveTexture.index)] = true;
-        }
-        if (pbr.metallicRoughnessTexture.index >= 0 && static_cast<size_t>(pbr.metallicRoughnessTexture.index) < dataTextureUse.size()) {
-            dataTextureUse[static_cast<size_t>(pbr.metallicRoughnessTexture.index)] = true;
-        }
-        if (sourceMaterial.normalTexture.index >= 0 && static_cast<size_t>(sourceMaterial.normalTexture.index) < dataTextureUse.size()) {
-            dataTextureUse[static_cast<size_t>(sourceMaterial.normalTexture.index)] = true;
-        }
+        markTextureUse(pbr.baseColorTexture.index, colorTextureUse);
+        markTextureUse(sourceMaterial.emissiveTexture.index, colorTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenColorTexture"), colorTextureUse);
+        markTextureUse(pbr.metallicRoughnessTexture.index, dataTextureUse);
+        markTextureUse(sourceMaterial.normalTexture.index, dataTextureUse);
+        markTextureUse(sourceMaterial.occlusionTexture.index, dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenRoughnessTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceThicknessTexture"), dataTextureUse);
     }
 
     std::vector<TextureAssetHandle> textureHandles;
@@ -388,7 +801,7 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
             texture = textureFromImage(model.images[static_cast<size_t>(sourceTexture.source)], path);
         }
         texture.name = texture.name.empty() ? sourceTexture.name : texture.name;
-        texture.srgb = colorTextureUse[textureIndex] && !dataTextureUse[textureIndex];
+        texture.srgb = colorTextureUse[textureIndex] && !dataTextureUse[textureIndex] && !texture.linearColorSpace;
         texture.sampler = samplerFromGltf(model, sourceTexture);
         textureHandles.push_back(assets_.addTexture(std::move(texture)));
     }
@@ -476,6 +889,7 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
             prim.material = primitive.material >= 0 && static_cast<size_t>(primitive.material) < materialHandles.size()
                 ? materialHandles[static_cast<size_t>(primitive.material)]
                 : materialHandles.front();
+            updatePrimitiveAlphaClassification(prim, assets_.material(prim.material));
             finalizePrimitiveVertexFrames(mesh, firstVertex, prim.vertexCount, firstIndex, prim.indexCount, hasNormals, hasTangents, hasTexcoords);
             mesh.primitives.push_back(prim);
         }
@@ -515,6 +929,35 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
                 scene.nodes[child].parent = static_cast<int32_t>(i);
             }
         }
+    }
+
+    for (size_t i = 0; i < model.lights.size(); ++i) {
+        const tinygltf::Light& srcLight = model.lights[i];
+        SceneLightAsset light;
+        light.color = srcLight.color.size() >= 3
+            ? glm::vec3(static_cast<float>(srcLight.color[0]),
+                         static_cast<float>(srcLight.color[1]),
+                         static_cast<float>(srcLight.color[2]))
+            : glm::vec3(1.0f);
+        light.intensity = static_cast<float>(srcLight.intensity);
+        if (light.intensity <= 0.0f) {
+            light.intensity = srcLight.type == "directional" ? 1.0f : 100.0f;
+        }
+        light.type = srcLight.type == "directional" ? 0u
+                   : srcLight.type == "spot" ? 2u
+                   : 1u;
+        light.enabled = true;
+        if (srcLight.type == "directional") {
+            light.sizeOrRadius = 0.0f;
+        }
+        for (size_t ni = 0; ni < model.nodes.size(); ++ni) {
+            if (model.nodes[ni].light == static_cast<int>(i)) {
+                light.transform = nodeTransform(model.nodes[ni]);
+                light.nodeIndex = static_cast<int32_t>(ni);
+                break;
+            }
+        }
+        scene.lights.push_back(light);
     }
 
     const int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : 0;
@@ -562,9 +1005,15 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     texture.width = cachedTex.width;
                     texture.height = cachedTex.height;
                     texture.channels = cachedTex.channels;
+                    texture.mipLevels = cachedTex.mipLevels;
                     texture.srgb = cachedTex.srgb;
                     texture.fallback = cachedTex.fallback;
+                    texture.isCompressed = cachedTex.isCompressed;
+                    texture.linearColorSpace = cachedTex.linearColorSpace;
+                    texture.format = static_cast<VkFormat>(cachedTex.format);
+                    texture.compressedFormat = static_cast<VkFormat>(cachedTex.compressedFormat);
                     texture.rgba8 = cachedTex.rgba8;
+                    texture.mipData = cachedTex.mipData;
                     texture.sampler.minFilter = static_cast<TextureFilter>(cachedTex.minFilter);
                     texture.sampler.magFilter = static_cast<TextureFilter>(cachedTex.magFilter);
                     texture.sampler.wrapS = static_cast<TextureWrap>(cachedTex.wrapS);
@@ -586,13 +1035,58 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.emissiveFactor = cachedMat.emissiveFactor;
                     material.metallicFactor = cachedMat.metallicFactor;
                     material.roughnessFactor = cachedMat.roughnessFactor;
+                    material.iorFactor = cachedMat.iorFactor;
                     material.alphaCutoff = cachedMat.alphaCutoff;
                     material.alphaMode = cachedMat.alphaMode;
                     material.doubleSided = cachedMat.doubleSided;
+                    material.hasIor = cachedMat.hasIor;
+                    material.hasClearcoat = cachedMat.hasClearcoat;
+                    material.clearcoatFactor = cachedMat.clearcoatFactor;
+                    material.clearcoatRoughnessFactor = cachedMat.clearcoatRoughnessFactor;
+                    material.hasTransmission = cachedMat.hasTransmission;
+                    material.transmissionFactor = cachedMat.transmissionFactor;
+                    material.hasSpecular = cachedMat.hasSpecular;
+                    material.specularFactor = cachedMat.specularFactor;
+                    material.specularColorFactor = cachedMat.specularColorFactor;
+                    material.hasSheen = cachedMat.hasSheen;
+                    material.sheenColorFactor = cachedMat.sheenColorFactor;
+                    material.sheenRoughnessFactor = cachedMat.sheenRoughnessFactor;
+                    material.hasIridescence = cachedMat.hasIridescence;
+                    material.iridescenceFactor = cachedMat.iridescenceFactor;
+                    material.iridescenceIor = cachedMat.iridescenceIor;
+                    material.iridescenceThicknessMinimum = cachedMat.iridescenceThicknessMinimum;
+                    material.iridescenceThicknessMaximum = cachedMat.iridescenceThicknessMaximum;
+                    material.hasEmissiveStrength = cachedMat.hasEmissiveStrength;
+                    material.emissiveStrength = cachedMat.emissiveStrength;
+                    material.hasAnisotropy = cachedMat.hasAnisotropy;
+                    material.anisotropyStrength = cachedMat.anisotropyStrength;
+                    material.anisotropyRotation = cachedMat.anisotropyRotation;
+                    material.occlusionStrength = cachedMat.occlusionStrength;
+                    material.useConductorOptics = cachedMat.useConductorOptics;
+                    material.conductorEta = cachedMat.conductorEta;
+                    material.conductorK = cachedMat.conductorK;
                     material.baseColorTexture = textureHandleFor(cachedMat.baseColorTextureIndex);
                     material.normalTexture = textureHandleFor(cachedMat.normalTextureIndex);
                     material.metallicRoughnessTexture = textureHandleFor(cachedMat.metallicRoughnessTextureIndex);
                     material.emissiveTexture = textureHandleFor(cachedMat.emissiveTextureIndex);
+                    material.clearcoatTexture = textureHandleFor(cachedMat.clearcoatTextureIndex);
+                    material.clearcoatRoughnessTexture = textureHandleFor(cachedMat.clearcoatRoughnessTextureIndex);
+                    material.clearcoatNormalTexture = textureHandleFor(cachedMat.clearcoatNormalTextureIndex);
+                    material.transmissionTexture = textureHandleFor(cachedMat.transmissionTextureIndex);
+                    material.specularTexture = textureHandleFor(cachedMat.specularTextureIndex);
+                    material.specularColorTexture = textureHandleFor(cachedMat.specularColorTextureIndex);
+                    material.sheenColorTexture = textureHandleFor(cachedMat.sheenColorTextureIndex);
+                    material.sheenRoughnessTexture = textureHandleFor(cachedMat.sheenRoughnessTextureIndex);
+                    material.iridescenceTexture = textureHandleFor(cachedMat.iridescenceTextureIndex);
+                    material.iridescenceThicknessTexture = textureHandleFor(cachedMat.iridescenceThicknessTextureIndex);
+                    material.anisotropyTexture = textureHandleFor(cachedMat.anisotropyTextureIndex);
+                    material.occlusionTexture = textureHandleFor(cachedMat.occlusionTextureIndex);
+                    material.baseColorTextureTransform = cachedMat.baseColorTextureTransform;
+                    material.metallicRoughnessTextureTransform = cachedMat.metallicRoughnessTextureTransform;
+                    material.normalTextureTransform = cachedMat.normalTextureTransform;
+                    material.emissiveTextureTransform = cachedMat.emissiveTextureTransform;
+                    material.occlusionTextureTransform = cachedMat.occlusionTextureTransform;
+                    material.shaderCompatibilityMask = cachedMat.shaderCompatibilityMask;
                     scene.materials.push_back(assets_.addMaterial(std::move(material)));
                 }
 
@@ -612,6 +1106,7 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                         } else if (!scene.materials.empty()) {
                             prim.material = scene.materials.front();
                         }
+                        updatePrimitiveAlphaClassification(prim, assets_.material(prim.material));
                         mesh.primitives.push_back(prim);
                     }
                     scene.meshes.push_back(assets_.addMesh(std::move(mesh)));
@@ -707,9 +1202,15 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedTex.width = texture->width;
         cachedTex.height = texture->height;
         cachedTex.channels = texture->channels;
+        cachedTex.mipLevels = texture->mipLevels;
         cachedTex.srgb = texture->srgb;
         cachedTex.fallback = texture->fallback;
+        cachedTex.isCompressed = texture->isCompressed;
+        cachedTex.linearColorSpace = texture->linearColorSpace;
+        cachedTex.format = static_cast<uint32_t>(texture->format);
+        cachedTex.compressedFormat = static_cast<uint32_t>(texture->compressedFormat);
         cachedTex.rgba8 = texture->rgba8;
+        cachedTex.mipData = texture->mipData;
         cachedTex.minFilter = static_cast<uint32_t>(texture->sampler.minFilter);
         cachedTex.magFilter = static_cast<uint32_t>(texture->sampler.magFilter);
         cachedTex.wrapS = static_cast<uint32_t>(texture->sampler.wrapS);
@@ -728,13 +1229,58 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.emissiveFactor = material->emissiveFactor;
         cachedMat.metallicFactor = material->metallicFactor;
         cachedMat.roughnessFactor = material->roughnessFactor;
+        cachedMat.iorFactor = material->iorFactor;
         cachedMat.alphaCutoff = material->alphaCutoff;
         cachedMat.alphaMode = material->alphaMode;
         cachedMat.doubleSided = material->doubleSided;
+        cachedMat.hasIor = material->hasIor;
+        cachedMat.hasClearcoat = material->hasClearcoat;
+        cachedMat.clearcoatFactor = material->clearcoatFactor;
+        cachedMat.clearcoatRoughnessFactor = material->clearcoatRoughnessFactor;
+        cachedMat.hasTransmission = material->hasTransmission;
+        cachedMat.transmissionFactor = material->transmissionFactor;
+        cachedMat.hasSpecular = material->hasSpecular;
+        cachedMat.specularFactor = material->specularFactor;
+        cachedMat.specularColorFactor = material->specularColorFactor;
+        cachedMat.hasSheen = material->hasSheen;
+        cachedMat.sheenColorFactor = material->sheenColorFactor;
+        cachedMat.sheenRoughnessFactor = material->sheenRoughnessFactor;
+        cachedMat.hasIridescence = material->hasIridescence;
+        cachedMat.iridescenceFactor = material->iridescenceFactor;
+        cachedMat.iridescenceIor = material->iridescenceIor;
+        cachedMat.iridescenceThicknessMinimum = material->iridescenceThicknessMinimum;
+        cachedMat.iridescenceThicknessMaximum = material->iridescenceThicknessMaximum;
+        cachedMat.hasEmissiveStrength = material->hasEmissiveStrength;
+        cachedMat.emissiveStrength = material->emissiveStrength;
+        cachedMat.hasAnisotropy = material->hasAnisotropy;
+        cachedMat.anisotropyStrength = material->anisotropyStrength;
+        cachedMat.anisotropyRotation = material->anisotropyRotation;
+        cachedMat.occlusionStrength = material->occlusionStrength;
+        cachedMat.useConductorOptics = material->useConductorOptics;
+        cachedMat.conductorEta = material->conductorEta;
+        cachedMat.conductorK = material->conductorK;
         cachedMat.baseColorTextureIndex = getTextureIndex(material->baseColorTexture);
         cachedMat.normalTextureIndex = getTextureIndex(material->normalTexture);
         cachedMat.metallicRoughnessTextureIndex = getTextureIndex(material->metallicRoughnessTexture);
         cachedMat.emissiveTextureIndex = getTextureIndex(material->emissiveTexture);
+        cachedMat.clearcoatTextureIndex = getTextureIndex(material->clearcoatTexture);
+        cachedMat.clearcoatRoughnessTextureIndex = getTextureIndex(material->clearcoatRoughnessTexture);
+        cachedMat.clearcoatNormalTextureIndex = getTextureIndex(material->clearcoatNormalTexture);
+        cachedMat.transmissionTextureIndex = getTextureIndex(material->transmissionTexture);
+        cachedMat.specularTextureIndex = getTextureIndex(material->specularTexture);
+        cachedMat.specularColorTextureIndex = getTextureIndex(material->specularColorTexture);
+        cachedMat.sheenColorTextureIndex = getTextureIndex(material->sheenColorTexture);
+        cachedMat.sheenRoughnessTextureIndex = getTextureIndex(material->sheenRoughnessTexture);
+        cachedMat.iridescenceTextureIndex = getTextureIndex(material->iridescenceTexture);
+        cachedMat.iridescenceThicknessTextureIndex = getTextureIndex(material->iridescenceThicknessTexture);
+        cachedMat.anisotropyTextureIndex = getTextureIndex(material->anisotropyTexture);
+        cachedMat.occlusionTextureIndex = getTextureIndex(material->occlusionTexture);
+        cachedMat.baseColorTextureTransform = material->baseColorTextureTransform;
+        cachedMat.metallicRoughnessTextureTransform = material->metallicRoughnessTextureTransform;
+        cachedMat.normalTextureTransform = material->normalTextureTransform;
+        cachedMat.emissiveTextureTransform = material->emissiveTextureTransform;
+        cachedMat.occlusionTextureTransform = material->occlusionTextureTransform;
+        cachedMat.shaderCompatibilityMask = material->shaderCompatibilityMask;
         cached.materials.push_back(std::move(cachedMat));
     }
 

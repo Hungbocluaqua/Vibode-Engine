@@ -12,9 +12,29 @@
 
 namespace rtv {
 
+namespace {
+
+uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; ++i) {
+        if ((typeFilter & (1u << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    throw std::runtime_error("Failed to find suitable memory type");
+}
+
+} // namespace
+
 Swapchain::Swapchain(const VulkanContext& context, GLFWwindow* window)
     : context_(context), window_(window) {
     create();
+}
+
+Swapchain::Swapchain(const VulkanContext& context, VkExtent2D extent)
+    : context_(context), headless_(true), imageFormat_(VK_FORMAT_B8G8R8A8_UNORM), extent_(extent) {
+    createHeadlessImages();
 }
 
 Swapchain::~Swapchain() {
@@ -22,6 +42,9 @@ Swapchain::~Swapchain() {
 }
 
 void Swapchain::recreate() {
+    if (headless_) {
+        return;
+    }
     int width = 0;
     int height = 0;
     glfwGetFramebufferSize(window_, &width, &height);
@@ -30,7 +53,6 @@ void Swapchain::recreate() {
         glfwGetFramebufferSize(window_, &width, &height);
     }
 
-    vkDeviceWaitIdle(context_.device());
     destroy();
     create();
 }
@@ -40,7 +62,19 @@ void Swapchain::destroy() {
         vkDestroyImageView(context_.device(), view, nullptr);
     }
     imageViews_.clear();
-    images_.clear();
+
+    if (headless_) {
+        for (size_t i = 0; i < images_.size(); ++i) {
+            if (images_[i] != VK_NULL_HANDLE) {
+                vkDestroyImage(context_.device(), images_[i], nullptr);
+            }
+            if (headlessMemory_[i] != VK_NULL_HANDLE) {
+                vkFreeMemory(context_.device(), headlessMemory_[i], nullptr);
+            }
+        }
+        images_.clear();
+        return;
+    }
 
     if (swapchain_ != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(context_.device(), swapchain_, nullptr);
@@ -173,6 +207,60 @@ void Swapchain::createImageViews() {
         VkImageView view = VK_NULL_HANDLE;
         checkVk(vkCreateImageView(context_.device(), &createInfo, nullptr, &view), "vkCreateImageView");
         imageViews_.push_back(view);
+    }
+}
+
+void Swapchain::createHeadlessImages() {
+    static constexpr uint32_t kImageCount = 2;
+    images_.resize(kImageCount);
+    imageViews_.resize(kImageCount);
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = imageFormat_;
+    imageInfo.extent.width = extent_.width;
+    imageInfo.extent.height = extent_.height;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    for (uint32_t i = 0; i < kImageCount; ++i) {
+        checkVk(vkCreateImage(context_.device(), &imageInfo, nullptr, &images_[i]), "vkCreateImage(headless)");
+
+        VkMemoryRequirements memRequirements;
+        vkGetImageMemoryRequirements(context_.device(), images_[i], &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(context_.physicalDevice(), memRequirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        checkVk(vkAllocateMemory(context_.device(), &allocInfo, nullptr, &headlessMemory_[i]), "vkAllocateMemory(headless)");
+        checkVk(vkBindImageMemory(context_.device(), images_[i], headlessMemory_[i], 0), "vkBindImageMemory(headless)");
+
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = images_[i];
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = imageFormat_;
+        viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        checkVk(vkCreateImageView(context_.device(), &viewInfo, nullptr, &imageViews_[i]), "vkCreateImageView(headless)");
     }
 }
 

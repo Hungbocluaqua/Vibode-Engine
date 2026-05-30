@@ -1,10 +1,19 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#if RTV_MOTION_BLUR_ENABLED
+#extension GL_NV_ray_tracing_motion_blur : require
+#endif
 #include "rt_common.glsl"
 
 layout(set = 0, binding = 33) uniform accelerationStructureEXT topLevelAS;
 layout(location = 0) rayPayloadEXT RayPayload payload;
 layout(location = 1) rayPayloadEXT uint shadow_occluded;
+
+const uint RAY_MASK_CAMERA = 0x01u;
+const uint RAY_MASK_SHADOW = 0x02u;
+const uint PATH_EVENT_NONE = 0u;
+const uint PATH_EVENT_BSDF = 1u;
+const uint PATH_EVENT_DELTA = 2u;
 
 struct PathComponents {
     vec3 direct_light;
@@ -14,6 +23,7 @@ struct PathComponents {
     vec3 restir_initial_direct_light;
     vec3 first_albedo;
     float first_roughness;
+    float first_occlusion;
     float first_light_pdf;
     float first_bsdf_pdf;
     float first_mis_weight;
@@ -21,7 +31,28 @@ struct PathComponents {
     vec3 first_bounce_throughput;
     float secondary_env_miss;
     vec3 secondary_env_radiance;
+    float emissive_continuation;
+    float sun_mis_weight;
+    float sun_light_pdf;
+    float sun_previous_bsdf_pdf;
+    float ris_raw_light_pdf;
+    float ris_effective_light_pdf;
+    float ris_pdf_ratio;
+    float caustic_transmissive_hits;
+    float caustic_visible_paths;
+    float caustic_blocked_paths;
+    float first_specular_probability;
+    float secondary_hit_distance;
     vec3 first_local_pos;
+    uint restir_gi_candidate_valid;
+    vec3 restir_gi_candidate_position;
+    vec3 restir_gi_candidate_normal;
+    vec3 restir_gi_candidate_radiance;
+    vec3 restir_gi_receiver_position;
+    float restir_gi_candidate_roughness;
+    float restir_gi_candidate_hit_distance;
+    float restir_gi_candidate_target_pdf;
+    uint restir_gi_candidate_material_id;
     uint bounce_count;
     uint instance_id;
     uint mesh_id;
@@ -30,14 +61,140 @@ struct PathComponents {
 struct Ray {
     vec3 origin;
     vec3 direction;
+    float time;
 };
+
+bool homogeneous_volume_enabled() {
+    return camera.volume_controls.x > 0.5 &&
+        (max(camera.volume_controls.y, 0.0) + max(camera.volume_controls.z, 0.0)) > 1.0e-7;
+}
+
+float homogeneous_sigma_s() { return max(camera.volume_controls.y, 0.0); }
+float homogeneous_sigma_a() { return max(camera.volume_controls.z, 0.0); }
+float homogeneous_sigma_t() { return homogeneous_sigma_s() + homogeneous_sigma_a(); }
+float homogeneous_anisotropy() { return clamp(camera.volume_controls.w, -0.95, 0.95); }
+
+float homogeneous_transmittance_scalar(float distance) {
+    if (!homogeneous_volume_enabled()) {
+        return 1.0;
+    }
+    return exp(-homogeneous_sigma_t() * max(distance, 0.0));
+}
+
+float sample_homogeneous_medium_distance(ivec2 coords, uint bounce) {
+    if (!homogeneous_volume_enabled()) {
+        return 1.0e30;
+    }
+    float u = sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_VOLUME_DISTANCE);
+    return -log(max(1.0 - u, 1.0e-6)) / max(homogeneous_sigma_t(), 1.0e-7);
+}
+
+float henyey_greenstein_phase(float cosTheta, float g) {
+    float gg = g * g;
+    float denom = max(1.0 + gg - 2.0 * g * cosTheta, 1.0e-4);
+    return (1.0 - gg) / (4.0 * PI * denom * sqrt(denom));
+}
+
+vec3 sample_henyey_greenstein(vec3 incidentDir, ivec2 coords, uint bounce, out float pdf) {
+    vec2 u = sample_dimension_2d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_VOLUME_PHASE);
+    float g = homogeneous_anisotropy();
+    float cosTheta;
+    if (abs(g) < 1.0e-3) {
+        cosTheta = 1.0 - 2.0 * u.x;
+    } else {
+        float s = (1.0 - g * g) / max(1.0 - g + 2.0 * g * u.x, 1.0e-4);
+        cosTheta = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+    }
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    float phi = 2.0 * PI * u.y;
+    vec3 tangent;
+    vec3 bitangent;
+    tangent_frame(normalize(incidentDir), tangent, bitangent);
+    vec3 wi = normalize(tangent * cos(phi) * sinTheta + bitangent * sin(phi) * sinTheta + normalize(incidentDir) * cosTheta);
+    pdf = henyey_greenstein_phase(dot(normalize(incidentDir), wi), g);
+    return wi;
+}
+
+float sample_camera_time(ivec2 sampleCoords, uint sampleIndex) {
+    if (camera.motion_blur_controls.x <= 0.5) {
+        return 0.0;
+    }
+    float shutterOpen = clamp(camera.motion_blur_controls.y, 0.0, 1.0);
+    float shutterClose = clamp(camera.motion_blur_controls.z, shutterOpen, 1.0);
+    float u = sample_dimension_1d(sampleCoords, camera.temporal_frame_index, sampleIndex, SAMPLE_DIM_CAMERA_TIME);
+    return mix(shutterOpen, shutterClose, u);
+}
+
+vec2 concentric_disk_sample(vec2 u) {
+    vec2 offset = u * 2.0 - vec2(1.0);
+    if (abs(offset.x) < 1.0e-7 && abs(offset.y) < 1.0e-7) {
+        return vec2(0.0);
+    }
+
+    float r;
+    float theta;
+    if (abs(offset.x) > abs(offset.y)) {
+        r = offset.x;
+        theta = (PI * 0.25) * (offset.y / offset.x);
+    } else {
+        r = offset.y;
+        theta = (PI * 0.5) - (PI * 0.25) * (offset.x / offset.y);
+    }
+    return r * vec2(cos(theta), sin(theta));
+}
+
+float polygon_aperture_radius(vec2 dir, float bladeCount, float rotation) {
+    if (bladeCount < 3.0 || dot(dir, dir) <= 1.0e-8) {
+        return 1.0;
+    }
+    float blades = clamp(floor(bladeCount + 0.5), 3.0, 16.0);
+    float sector = 2.0 * PI / blades;
+    float local = mod(atan(dir.y, dir.x) - rotation + sector * 0.5, sector) - sector * 0.5;
+    return cos(PI / blades) / max(cos(local), 1.0e-4);
+}
+
+Ray make_camera_ray(uvec2 pixel, uvec2 size, ivec2 sampleCoords, uint sampleIndex) {
+    vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
+    vec2 uv = (vec2(pixel) + jitter) / vec2(size);
+    vec2 ndc = uv * 2.0 - vec2(1.0);
+    float aspect = float(size.x) / max(float(size.y), 1.0);
+    float scale = tan(camera.fov_y * 0.5);
+    vec3 pinholeDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
+
+    Ray ray;
+    ray.origin = camera.pos.xyz;
+    ray.direction = pinholeDir;
+    ray.time = sample_camera_time(sampleCoords, sampleIndex);
+
+    float apertureRadius = max(camera.dof_controls.x, 0.0);
+    if (apertureRadius <= 1.0e-6) {
+        return ray;
+    }
+
+    vec2 lens = concentric_disk_sample(sample_dimension_2d(sampleCoords, camera.temporal_frame_index, sampleIndex, SAMPLE_DIM_CAMERA_LENS));
+    lens *= polygon_aperture_radius(lens, camera.dof_controls.z, camera.dof_controls.w) * apertureRadius;
+    float forwardProjection = max(dot(pinholeDir, normalize(camera.forward.xyz)), 1.0e-4);
+    vec3 focusPoint = camera.pos.xyz + pinholeDir * (max(camera.dof_controls.y, 0.01) / forwardProjection);
+    vec3 lensOrigin = camera.pos.xyz + camera.right.xyz * lens.x + camera.up.xyz * lens.y;
+    ray.origin = lensOrigin;
+    ray.direction = normalize(focusPoint - lensOrigin);
+    return ray;
+}
 
 vec2 restir_unpack_unorm2x16(uint packedValue) {
     return vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
 }
 
 vec2 restir_unpack_velocity_pixels(uint packedVelocity) {
-    return (restir_unpack_unorm2x16(packedVelocity) * 2.0 - vec2(1.0)) * 64.0;
+    int x = int(packedVelocity & 0xffffu);
+    int y = int((packedVelocity >> 16u) & 0xffffu);
+    if (x >= 32768) {
+        x -= 65536;
+    }
+    if (y >= 32768) {
+        y -= 65536;
+    }
+    return vec2(float(x), float(y)) * (64.0 / 32767.0);
 }
 
 uint restir_mode() {
@@ -48,12 +205,65 @@ bool temporal_history_available() {
     return camera.atmosphere.z > 0.5;
 }
 
+vec3 clamp_luminance_preserve_hue(vec3 value, float maxLum) {
+    value = max(value, vec3(0.0));
+    float valueLum = luminance(value);
+    if (valueLum <= maxLum || valueLum <= 1.0e-6) {
+        return value;
+    }
+    return value * (maxLum / valueLum);
+}
+
+float direct_contribution_luminance_limit(uint bounce, uint sampleType, float roughness) {
+    float base = firefly_clamp_luminance();
+    float bounceScale = bounce == 0u ? 4.0 : 1.75;
+    float sunScale = sampleType == 3u ? 2.0 : 1.0;
+    float roughnessScale = mix(0.75, 1.35, clamp(roughness, 0.0, 1.0));
+    return max(base, base * bounceScale * sunScale * roughnessScale);
+}
+
+float restir_temporal_luminance_limit(vec3 currentDirect) {
+    float base = firefly_clamp_luminance();
+    float currentLum = luminance(max(currentDirect, vec3(0.0)));
+    return max(base * 2.0, currentLum * 4.0);
+}
+
+float throughput_luminance_limit(uint nextBounce, float roughness, bool deltaPath) {
+    float base = max(firefly_clamp_luminance(), 8.0);
+    float depthScale = nextBounce <= 1u ? 2.0 : (nextBounce == 2u ? 1.25 : 0.85);
+    float materialScale = deltaPath ? 2.0 : mix(0.75, 1.25, clamp(roughness, 0.0, 1.0));
+    return max(4.0, base * depthScale * materialScale);
+}
+
+vec3 clamp_path_throughput(vec3 value, uint nextBounce, float roughness, bool deltaPath) {
+    return clamp_luminance_preserve_hue(
+        value,
+        throughput_luminance_limit(nextBounce, roughness, deltaPath));
+}
+
 RestirReservoir empty_restir_reservoir() {
     RestirReservoir reservoir;
     reservoir.metadata = uvec4(0u);
     reservoir.sample_value_confidence = vec4(0.0);
-    reservoir.target_pdf_weight_sum_m = vec4(0.0);
+    restir_set_source_pdf_and_previous_weight(reservoir, 1.0e-6, 0.0);
     return reservoir;
+}
+
+RestirReservoir make_initial_restir_reservoir(vec3 directLight, float lightPdf, uint sampleType, float roughness) {
+    bool valid = sampleType != 0u && lightPdf > 1.0e-6;
+    vec3 sampleValue = valid ? max(directLight, vec3(0.0)) : vec3(0.0);
+    sampleValue = clamp_luminance_preserve_hue(
+        sampleValue,
+        direct_contribution_luminance_limit(0u, sampleType, roughness));
+    RestirReservoir current;
+    current.metadata = uvec4(
+        sampleType,
+        0u,
+        restir_pack_state(0u, restir_pack_validity_visibility(valid, RESTIR_VISIBILITY_VISIBLE), valid ? 1u : 0u),
+        valid ? restir_temporal_signature(sampleType, roughness) : 0u);
+    restir_set_source_pdf_and_previous_weight(current, valid ? lightPdf : 1.0e-6, 0.0);
+    current.sample_value_confidence = vec4(sampleValue, valid ? 1.0 : 0.0);
+    return current;
 }
 
 void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, uint packedVelocity, PathComponents components) {
@@ -62,19 +272,13 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
         return;
     }
 
-    bool valid = components.first_direct_sample_type != 0u && components.first_light_pdf > 1.0e-6;
-    vec3 sampleValue = valid ? max(components.restir_initial_direct_light, vec3(0.0)) : vec3(0.0);
-    float sampleLum = dot(sampleValue, vec3(0.2126, 0.7152, 0.0722));
-    RestirReservoir current;
-    current.metadata = uvec4(components.first_direct_sample_type, 0u, valid ? 1u : 0u, 0u);
-    current.sample_value_confidence = vec4(sampleValue, valid ? 1.0 : 0.0);
-    current.target_pdf_weight_sum_m = vec4(
-        valid ? components.first_light_pdf : 0.0,
-        sampleLum,
-        valid ? 1.0 : 0.0,
-        0.0);
+    RestirReservoir current = make_initial_restir_reservoir(
+        components.restir_initial_direct_light,
+        components.first_light_pdf,
+        components.first_direct_sample_type,
+        components.first_roughness);
 
-    if (!valid) {
+    if (!restir_reservoir_valid(current)) {
         restir_reservoirs[pixelIndex] = current;
         return;
     }
@@ -94,35 +298,135 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
     ivec2 historyCoords = clamp(ivec2(round(historyPos)), ivec2(0), dims - ivec2(1));
     uint historyIndex = uint(historyCoords.y) * uint(dims.x) + uint(historyCoords.x);
     RestirReservoir previous = previous_restir_reservoirs[historyIndex];
-    bool previousValid = previous.metadata.z != 0u &&
-        previous.target_pdf_weight_sum_m.z > 0.0 &&
-        previous.sample_value_confidence.a > 0.0;
-    if (!previousValid) {
+    if (!restir_reservoir_valid(previous)) {
         current.sample_value_confidence.a = 0.35;
         restir_reservoirs[pixelIndex] = current;
         return;
     }
 
-    float currentPdf = max(current.target_pdf_weight_sum_m.x, 1.0e-6);
-    float previousPdf = max(previous.target_pdf_weight_sum_m.x, 1.0e-6);
     float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
-    float motionCap = mix(0.85, 0.10, 1.0 - motionConfidence);
-    float previousWeight = clamp(previousPdf / (currentPdf + previousPdf), 0.0, motionCap);
-    float currentWeight = 1.0 - previousWeight;
+    restir_reservoirs[pixelIndex] = restir_pairwise_temporal_merge(current, previous, motionConfidence, 32.0);
+}
 
-    current.metadata.y = min(previous.metadata.y + 1u, 255u);
-    current.sample_value_confidence.rgb =
-        current.sample_value_confidence.rgb * currentWeight +
-        previous.sample_value_confidence.rgb * previousWeight;
-    current.sample_value_confidence.a = clamp(
-        (currentWeight + previous.sample_value_confidence.a * previousWeight) * motionConfidence,
-        0.0,
-        1.0);
-    current.target_pdf_weight_sum_m.y =
-        current.target_pdf_weight_sum_m.y * currentWeight +
-        previous.target_pdf_weight_sum_m.y * previousWeight;
-    current.target_pdf_weight_sum_m.z = min(current.target_pdf_weight_sum_m.z + previous.target_pdf_weight_sum_m.z, 64.0);
-    restir_reservoirs[pixelIndex] = current;
+float restir_gi_temporal_compatibility(RestirGiReservoir current, RestirGiReservoir previous, float motionConfidence) {
+    uint maxTemporalAge = max(camera.restir_gi_controls.x, 1u);
+    if (!restir_gi_reservoir_valid(current) || !restir_gi_reservoir_valid(previous) || restir_gi_age(previous) >= maxTemporalAge) {
+        return 0.0;
+    }
+    if (!restir_gi_visible(previous) || restir_gi_material_id(current) != restir_gi_material_id(previous)) {
+        return 0.0;
+    }
+
+    float roughness = max(restir_gi_roughness(current), restir_gi_roughness(previous));
+    float normalAgreement = dot(restir_gi_normal(current), restir_gi_normal(previous));
+    float normalThreshold = mix(0.92, 0.70, clamp(roughness, 0.0, 1.0));
+    if (normalAgreement < normalThreshold) {
+        return 0.0;
+    }
+
+    float hitDistanceDelta = abs(restir_gi_hit_distance(current) - restir_gi_hit_distance(previous)) /
+        max(restir_gi_hit_distance(current), 0.25);
+    float hitDistanceConfidence = 1.0 - smoothstep(0.20, 0.85, hitDistanceDelta);
+
+    float currentTarget = max(restir_gi_target_pdf(current), 1.0e-5);
+    float previousTarget = max(restir_gi_target_pdf(previous), 1.0e-5);
+    float targetConfidence = sqrt(min(currentTarget, previousTarget) / max(currentTarget, previousTarget));
+    float ageConfidence = 1.0 - clamp(float(restir_gi_age(previous)) / float(maxTemporalAge), 0.0, 1.0);
+
+        return clamp(motionConfidence, 0.0, 1.0) *
+        hitDistanceConfidence *
+        smoothstep(normalThreshold, 1.0, normalAgreement) *
+        targetConfidence *
+        ageConfidence;
+}
+
+RestirGiReservoir restir_gi_temporal_merge(RestirGiReservoir current, RestirGiReservoir previous, float motionConfidence) {
+    float compatibility = restir_gi_temporal_compatibility(current, previous, motionConfidence);
+    if (compatibility <= 0.0) {
+        restir_gi_set_metadata(current, restir_gi_sample_count_u(current), 0u, restir_gi_flags(current), restir_gi_roughness(current));
+        return current;
+    }
+
+    float currentMass = max(restir_gi_target_pdf(current), 0.0);
+    float previousMass = max(restir_gi_target_pdf(previous), 0.0) *
+        min(restir_gi_sample_count(previous), max(float(camera.restir_gi_controls.x), 1.0)) *
+        compatibility;
+    float previousWeight = previousMass / max(currentMass + previousMass, 1.0e-6);
+    previousWeight = clamp(previousWeight, 0.0, mix(0.85, 0.20, 1.0 - clamp(motionConfidence, 0.0, 1.0)));
+
+    current.radiance_weight_sum.rgb = mix(current.radiance_weight_sum.rgb, previous.radiance_weight_sum.rgb, previousWeight);
+    current.radiance_weight_sum.w = min(1.0 + previous.radiance_weight_sum.w * previousWeight, max(float(camera.restir_gi_controls.x), 1.0));
+    restir_gi_set_hit_distance_target_pdf(
+        current,
+        restir_gi_hit_distance(current),
+        max(luminance(current.radiance_weight_sum.rgb), 1.0e-4));
+    restir_gi_set_metadata(
+        current,
+        uint(clamp(ceil(current.radiance_weight_sum.w), 1.0, 32.0)),
+        min(restir_gi_age(previous) + 1u, min(camera.restir_gi_controls.x, 255u)),
+        RESTIR_GI_FLAG_VALID | (restir_gi_visible(current) && restir_gi_visible(previous) ? RESTIR_GI_FLAG_VISIBLE : 0u),
+        restir_gi_roughness(current));
+    return current;
+}
+
+void store_initial_restir_gi_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, uint packedVelocity, PathComponents components) {
+    bool restirGiDebugView = (debug_params.view >= 68u && debug_params.view <= 73u) ||
+        debug_params.view == 90u ||
+        debug_params.view == 91u;
+    if (!restirGiDebugView) {
+        return;
+    }
+
+    RestirGiReservoir reservoir;
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.hit_position_target_pdf = vec4(0.0);
+    reservoir.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
+#endif
+    reservoir.radiance_weight_sum = vec4(0.0);
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.receiver_position_hit_distance = vec4(0.0);
+#endif
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.metadata = uvec4(0u);
+#else
+    reservoir.metadata = uvec4(restir_gi_pack_metadata(0u, 0u, 0u, 1.0), encode_octahedral_normal(vec3(0.0, 1.0, 0.0)), 0u, 0u);
+#endif
+
+    if (components.restir_gi_candidate_valid != 0u) {
+        vec3 radiance = max(components.restir_gi_candidate_radiance, vec3(0.0));
+        float targetPdf = max(components.restir_gi_candidate_target_pdf, 1.0e-4);
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+        reservoir.hit_position_target_pdf.xyz = components.restir_gi_candidate_position;
+        reservoir.receiver_position_hit_distance.xyz = components.restir_gi_receiver_position;
+#endif
+        restir_gi_set_hit_distance_target_pdf(reservoir, components.restir_gi_candidate_hit_distance, targetPdf);
+        restir_gi_set_normal(reservoir, components.restir_gi_candidate_normal);
+        reservoir.radiance_weight_sum = vec4(radiance, 1.0);
+        restir_gi_set_metadata(
+            reservoir,
+            1u,
+            0u,
+            RESTIR_GI_FLAG_VALID | RESTIR_GI_FLAG_VISIBLE,
+            clamp(components.restir_gi_candidate_roughness, 0.0, 1.0));
+        restir_gi_set_material_id(reservoir, components.restir_gi_candidate_material_id);
+    }
+
+    if (debug_params.view != 62u && restir_gi_reservoir_valid(reservoir) && temporal_history_available()) {
+        vec2 velocityPixels = restir_unpack_velocity_pixels(packedVelocity);
+        vec2 historyPos = vec2(coords) - velocityPixels;
+        bool historyOnscreen =
+            historyPos.x >= 0.0 && historyPos.y >= 0.0 &&
+            historyPos.x < float(dims.x) && historyPos.y < float(dims.y);
+        if (historyOnscreen) {
+            ivec2 historyCoords = clamp(ivec2(round(historyPos)), ivec2(0), dims - ivec2(1));
+            uint historyIndex = uint(historyCoords.y) * uint(dims.x) + uint(historyCoords.x);
+            RestirGiReservoir previous = previous_restir_gi_reservoirs[historyIndex];
+            float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
+            reservoir = restir_gi_temporal_merge(reservoir, previous, motionConfidence);
+        }
+    }
+
+    restir_gi_reservoirs[pixelIndex] = reservoir;
 }
 
 void reset_payload() {
@@ -143,13 +447,29 @@ void reset_payload() {
     payload.bitangent = vec3(0.0, 0.0, 1.0);
 }
 
-RayPayload trace_surface_with_mode(vec3 origin, vec3 direction, float tMin, float tMax, uint picking) {
+RayPayload trace_surface_with_mode(vec3 origin, vec3 direction, float tMin, float tMax, float rayTime, uint picking) {
+    record_rt_counter(RT_DIAG_SURFACE_TRACE_RAYS);
     reset_payload();
     payload.picking = picking;
+#if RTV_MOTION_BLUR_ENABLED
+    traceRayMotionNV(
+        topLevelAS,
+        0,
+        RAY_MASK_CAMERA,
+        0,
+        2,
+        0,
+        origin,
+        tMin,
+        direction,
+        tMax,
+        rayTime,
+        0);
+#else
     traceRayEXT(
         topLevelAS,
         0,
-        0xff,
+        RAY_MASK_CAMERA,
         0,
         2,
         0,
@@ -158,33 +478,93 @@ RayPayload trace_surface_with_mode(vec3 origin, vec3 direction, float tMin, floa
         direction,
         tMax,
         0);
+#endif
     return payload;
 }
 
-RayPayload trace_surface(vec3 origin, vec3 direction, float tMin, float tMax) {
-    return trace_surface_with_mode(origin, direction, tMin, tMax, 0u);
+RayPayload trace_surface(vec3 origin, vec3 direction, float tMin, float tMax, float rayTime) {
+    return trace_surface_with_mode(origin, direction, tMin, tMax, rayTime, 0u);
 }
 
-bool trace_shadow(vec3 origin, vec3 direction, float tMax) {
-    shadow_occluded = 1u;
+RayPayload trace_shadow_surface(vec3 origin, vec3 direction, float tMin, float tMax, float rayTime) {
+    record_rt_counter(RT_DIAG_SURFACE_TRACE_RAYS);
+    reset_payload();
+#if RTV_MOTION_BLUR_ENABLED
+    traceRayMotionNV(
+        topLevelAS,
+        0,
+        RAY_MASK_SHADOW,
+        0,
+        2,
+        0,
+        origin,
+        tMin,
+        direction,
+        tMax,
+        rayTime,
+        0);
+#else
     traceRayEXT(
         topLevelAS,
-        gl_RayFlagsSkipClosestHitShaderEXT,
-        0xff,
+        0,
+        RAY_MASK_SHADOW,
+        0,
+        2,
+        0,
+        origin,
+        tMin,
+        direction,
+        tMax,
+        0);
+#endif
+    return payload;
+}
+
+bool trace_shadow(vec3 origin, vec3 direction, float tMax, float rayTime) {
+    record_rt_counter(RT_DIAG_SHADOW_TRACE_RAYS);
+    shadow_occluded = 1u;
+#if RTV_MOTION_BLUR_ENABLED
+    traceRayMotionNV(
+        topLevelAS,
+        gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        RAY_MASK_SHADOW,
         1,
         2,
         1,
         origin,
-        0.001,
+        shadow_self_hit_epsilon(),
+        direction,
+        tMax,
+        rayTime,
+        1);
+#else
+    traceRayEXT(
+        topLevelAS,
+        gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        RAY_MASK_SHADOW,
+        1,
+        2,
+        1,
+        origin,
+        shadow_self_hit_epsilon(),
         direction,
         tMax,
         1);
+#endif
     return shadow_occluded != 0u;
+}
+
+vec3 shadow_transmittance(vec3 origin, vec3 direction, float tMax, float rayTime) {
+    if (trace_shadow(origin, direction, tMax, rayTime)) {
+        return vec3(0.0);
+    }
+    return vec3(homogeneous_transmittance_scalar(tMax));
 }
 
 vec3 shadow_origin(RayPayload hit, vec3 wi) {
     vec3 n = normalize(hit.geom_normal);
-    return hit.world_pos + n * (dot(n, wi) >= 0.0 ? SHADOW_SELF_HIT_EPSILON : -SHADOW_SELF_HIT_EPSILON);
+    float bias = shadow_self_hit_epsilon();
+    return hit.world_pos + n * (dot(n, wi) >= 0.0 ? bias : -bias);
 }
 
 Material material_for_hit(inout RayPayload hit, vec3 rayDirection) {
@@ -192,6 +572,88 @@ Material material_for_hit(inout RayPayload hit, vec3 rayDirection) {
     apply_material_textures(material, hit.uv);
     hit.normal = apply_normal_texture(material, hit.uv, hit.normal, hit.tangent, hit.bitangent, rayDirection);
     return apply_debug_material_mode(material);
+}
+
+vec3 caustic_shadow_transmittance_stats(
+    vec3 origin,
+    vec3 direction,
+    float tMax,
+    float rayTime,
+    out uint transmissiveHits,
+    out uint visiblePath,
+    out uint blockedPath) {
+    transmissiveHits = 0u;
+    visiblePath = 0u;
+    blockedPath = 0u;
+    if (camera.path_trace_controls.w == 0u) {
+        return shadow_transmittance(origin, direction, tMax, rayTime);
+    }
+
+    record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_ATTEMPTS);
+    vec3 throughput = vec3(1.0);
+    vec3 rayOrigin = origin;
+    vec3 rayDir = normalize(direction);
+    float remaining = tMax;
+    for (uint interfaceIndex = 0u; interfaceIndex < 2u; ++interfaceIndex) {
+        RayPayload shadowHit = trace_shadow_surface(rayOrigin, rayDir, shadow_self_hit_epsilon(), remaining, rayTime);
+        if (shadowHit.hit == 0u) {
+            if (transmissiveHits > 0u) {
+                record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_VISIBLE);
+                visiblePath = 1u;
+            }
+            return throughput * vec3(homogeneous_transmittance_scalar(remaining));
+        }
+
+        Material material = material_for_hit(shadowHit, rayDir);
+        if (!(material.mat_type == 2u && material_is_delta(material))) {
+            record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            blockedPath = 1u;
+            return vec3(0.0);
+        }
+        transmissiveHits += 1u;
+        record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_HITS);
+
+        float eta = shadowHit.front_face != 0u ? (1.0 / max(material.ior, 1.01)) : max(material.ior, 1.01);
+        float cosTheta = min(dot(-rayDir, shadowHit.normal), 1.0);
+        float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+        if (eta * sinTheta > 1.0) {
+            record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            blockedPath = 1u;
+            return vec3(0.0);
+        }
+
+        float surfaceT = homogeneous_transmittance_scalar(shadowHit.t);
+        float fresnel = reflectance(cosTheta, eta);
+        throughput *= material.color * surfaceT * (1.0 - fresnel);
+        remaining = max(remaining - shadowHit.t, 0.0);
+        if (remaining <= shadow_distance_bias() || max(max(throughput.r, throughput.g), throughput.b) <= 1.0e-5) {
+            record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            blockedPath = 1u;
+            return vec3(0.0);
+        }
+
+        rayDir = normalize(refract(rayDir, shadowHit.normal, eta));
+        rayOrigin = shadowHit.world_pos + (dot(rayDir, shadowHit.normal) > 0.0 ? shadowHit.normal : -shadowHit.normal) * shadow_self_hit_epsilon();
+    }
+
+    bool blocked = trace_shadow(rayOrigin, rayDir, remaining, rayTime);
+    if (blocked) {
+        record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+        blockedPath = 1u;
+        return vec3(0.0);
+    }
+    if (transmissiveHits > 0u) {
+        record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_VISIBLE);
+        visiblePath = 1u;
+    }
+    return throughput * vec3(homogeneous_transmittance_scalar(remaining));
+}
+
+vec3 caustic_shadow_transmittance(vec3 origin, vec3 direction, float tMax, float rayTime) {
+    uint transmissiveHits;
+    uint visiblePath;
+    uint blockedPath;
+    return caustic_shadow_transmittance_stats(origin, direction, tMax, rayTime, transmissiveHits, visiblePath, blockedPath);
 }
 
 bool sample_emissive_light(inout uint rng, vec3 hitPos, out vec3 wi, out vec3 emission, out float pdfSolidAngle, out float distanceToLight) {
@@ -204,25 +666,22 @@ bool sample_emissive_light(inout uint rng, vec3 hitPos, out vec3 wi, out vec3 em
         return false;
     }
 
-    float targetArea = rand_f32(rng) * totalWeight;
-    uint lo = 0u;
-    uint hi = mesh_params.light_count - 1u;
-    for (uint guard = 0u; guard < 32u && lo < hi; ++guard) {
-        uint mid = (lo + hi) / 2u;
-        if (targetArea <= light_records[mid].data0.y) {
-            hi = mid;
-        } else {
-            lo = mid + 1u;
-        }
+    uint lightIndex;
+    if (!sample_light_bvh(rng, lightIndex)) {
+        wi = vec3(0.0, 1.0, 0.0);
+        emission = vec3(0.0);
+        pdfSolidAngle = 0.0;
+        distanceToLight = 0.0;
+        return false;
     }
 
-    LightRecord selected = light_records[lo];
+    LightRecord selected = light_records[lightIndex];
     if (selected.metadata.x == 2u) {
         wi = normalize(selected.data1.xyz);
         emission = selected.data2.xyz;
         pdfSolidAngle = selected.data0.x / max(totalWeight, 1e-6);
         distanceToLight = 10000.0;
-        return length(emission) > 0.0 && pdfSolidAngle > 0.0;
+        return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
     }
     if (selected.metadata.x == 3u) {
         vec3 samplePos = selected.data1.xyz;
@@ -232,7 +691,7 @@ bool sample_emissive_light(inout uint rng, vec3 hitPos, out vec3 wi, out vec3 em
         wi = toLight / distanceToLight;
         emission = selected.data2.xyz / max(distSq, 1e-4);
         pdfSolidAngle = selected.data0.x / max(totalWeight, 1e-6);
-        return length(emission) > 0.0 && pdfSolidAngle > 0.0;
+        return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
     }
     if (selected.metadata.x == 4u) {
         vec3 center = selected.data1.xyz;
@@ -250,7 +709,7 @@ bool sample_emissive_light(inout uint rng, vec3 hitPos, out vec3 wi, out vec3 em
         float selectionPdf = selected.data0.x / max(totalWeight, 1e-6);
         float area = max(selected.data0.w, 1e-6);
         pdfSolidAngle = cosLight > 1e-6 ? selectionPdf * distSq / (cosLight * area) : 0.0;
-        return length(emission) > 0.0 && pdfSolidAngle > 0.0;
+        return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
     }
     if (selected.metadata.x != 0u) {
         wi = vec3(0.0, 1.0, 0.0);
@@ -280,7 +739,7 @@ bool sample_emissive_light(inout uint rng, vec3 hitPos, out vec3 wi, out vec3 em
     float r2 = rand_f32(rng);
     float sr1 = sqrt(r1);
     vec3 samplePos = v0 * (1.0 - sr1) + v1 * (sr1 * (1.0 - r2)) + v2 * (sr1 * r2);
-    vec3 lightNormal = normalize(transpose(mat3(instance.inverse_transform)) * td3.xyz);
+                vec3 lightNormal = normalize(mat3(instance.normal_transform) * td3.xyz);
     emission = material.emissive;
 
     vec3 toLight = samplePos - hitPos;
@@ -291,12 +750,36 @@ bool sample_emissive_light(inout uint rng, vec3 hitPos, out vec3 wi, out vec3 em
     float selectionPdf = selected.data0.x / max(totalWeight, 1e-6);
     float area = max(selected.data0.w, 1e-6);
     pdfSolidAngle = cosLight > 1e-6 ? selectionPdf * distSq / (cosLight * area) : 0.0;
-    return length(emission) > 0.0 && pdfSolidAngle > 0.0;
+    return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+}
+
+bool sample_sun_light(inout uint rng, out vec3 wi, out vec3 radiance, out float pdfSolidAngle) {
+    if (camera.sunlight_enabled == 0u) {
+        wi = vec3(0.0, 1.0, 0.0);
+        radiance = vec3(0.0);
+        pdfSolidAngle = 0.0;
+        return false;
+    }
+    vec3 sunDir = analytical_sun_direction();
+    float radius = clamp(camera.sun_color_angular_radius.w, 0.0001, 0.08);
+    float cosRadius = cos(radius);
+    float u1 = rand_f32(rng);
+    float u2 = rand_f32(rng);
+    float cosTheta = mix(cosRadius, 1.0, u1);
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    float phi = 2.0 * PI * u2;
+    vec3 axis = abs(sunDir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(axis, sunDir));
+    vec3 bitangent = cross(sunDir, tangent);
+    wi = tangent * cos(phi) * sinTheta + bitangent * sin(phi) * sinTheta + sunDir * cosTheta;
+    pdfSolidAngle = 1.0 / analytical_sun_solid_angle();
+    radiance = analytical_sun_center_radiance();
+    return luminance(radiance) > 0.0 && pdfSolidAngle > 0.0;
 }
 
 float emissive_hit_pdf(RayPayload hit, Material material, vec3 previousOrigin) {
     float totalArea = mesh_params.emissive_total_area;
-    if (totalArea <= 1e-8 || length(material.emissive) <= 0.0) {
+    if (totalArea <= 1e-8 || !has_positive_radiance(material.emissive)) {
         return 0.0;
     }
     vec3 toLight = hit.world_pos - previousOrigin;
@@ -312,19 +795,30 @@ vec3 estimate_direct_lighting(
     RayPayload hit,
     Material material,
     vec3 wo,
+    float rayTime,
     out vec3 emissiveContribution,
     out vec3 environmentContribution,
     out float sampledLightPdf,
+    out float sampledRawLightPdf,
+    out float sampledEffectiveLightPdf,
     out float sampledBsdfPdf,
     out float sampledMisWeight,
-    out uint sampledType) {
+    out uint sampledType,
+    out uint causticTransmissiveHits,
+    out uint causticVisiblePaths,
+    out uint causticBlockedPaths) {
     emissiveContribution = vec3(0.0);
     environmentContribution = vec3(0.0);
     sampledLightPdf = 0.0;
+    sampledRawLightPdf = 0.0;
+    sampledEffectiveLightPdf = 0.0;
     sampledBsdfPdf = 0.0;
     sampledMisWeight = 0.0;
     sampledType = 0u;
-    bool isDelta = material.mat_type == 1u || material.mat_type == 2u;
+    causticTransmissiveHits = 0u;
+    causticVisiblePaths = 0u;
+    causticBlockedPaths = 0u;
+    bool isDelta = material_is_delta(material);
     if (camera.direct_lighting_enabled == 0u || isDelta || debug_params.view == 27u) {
         return vec3(0.0);
     }
@@ -352,8 +846,8 @@ vec3 estimate_direct_lighting(
         if (candidateCos <= 0.0 || candidateLightPdf <= 1.0e-6) {
             continue;
         }
-        vec3 candidateBsdf = eval_brdf(material, wo, candidateWi, lightingNormal);
-        float candidateBsdfPdf = pdf_brdf(material, wo, candidateWi, lightingNormal);
+        vec3 candidateBsdf = eval_brdf(material, wo, candidateWi, lightingNormal, hit.tangent, hit.bitangent);
+        float candidateBsdfPdf = pdf_brdf(material, wo, candidateWi, lightingNormal, hit.tangent, hit.bitangent);
         vec3 candidateEstimate = candidateBsdf * candidateEmission * candidateCos / max(candidateLightPdf, 1.0e-6);
         float candidateProxy = max(dot(candidateEstimate, vec3(0.2126, 0.7152, 0.0722)), 0.0);
         proxyWeightSum += candidateProxy;
@@ -369,16 +863,28 @@ vec3 estimate_direct_lighting(
         }
     }
     if (selectedCandidate && selectedProxy > 0.0) {
-        bool occluded = trace_shadow(shadow_origin(hit, selectedWi), selectedWi, max(selectedDistance - 0.002, 0.0));
+        float shadowDistance = max(selectedDistance - shadow_distance_bias(), 0.0);
+        uint transmissiveHits;
+        uint visiblePath;
+        uint blockedPath;
+        vec3 shadowT = caustic_shadow_transmittance_stats(shadow_origin(hit, selectedWi), selectedWi, shadowDistance, rayTime, transmissiveHits, visiblePath, blockedPath);
+        causticTransmissiveHits += transmissiveHits;
+        causticVisiblePaths += visiblePath;
+        causticBlockedPaths += blockedPath;
         float cosSurface = max(dot(lightingNormal, selectedWi), 0.0);
-        if (!occluded && cosSurface > 0.0) {
-            float weight = power_heuristic(selectedLightPdf, selectedBsdfPdf);
-            float risNormalization = risCandidateCount > 1u ? proxyWeightSum / (float(risCandidateCount) * selectedProxy) : 1.0;
-            sampledLightPdf = selectedLightPdf;
+        if (luminance(shadowT) > 0.0 && cosSurface > 0.0) {
+            float effectiveLightPdf = selectedLightPdf;
+            if (risCandidateCount > 1u && proxyWeightSum > 1.0e-8 && selectedProxy > 1.0e-8) {
+                effectiveLightPdf = selectedLightPdf * float(risCandidateCount) * selectedProxy / proxyWeightSum;
+            }
+            float weight = power_heuristic(effectiveLightPdf, selectedBsdfPdf);
+            sampledLightPdf = effectiveLightPdf;
+            sampledRawLightPdf = selectedLightPdf;
+            sampledEffectiveLightPdf = effectiveLightPdf;
             sampledBsdfPdf = selectedBsdfPdf;
             sampledMisWeight = weight;
             sampledType = 1u;
-            emissiveContribution = selectedBsdf * selectedEmission * cosSurface * weight * risNormalization / max(selectedLightPdf, 1e-6);
+            emissiveContribution = selectedBsdf * selectedEmission * shadowT * cosSurface * weight / max(effectiveLightPdf, 1e-6);
         }
     }
 
@@ -391,28 +897,58 @@ vec3 estimate_direct_lighting(
             continue;
         }
         float cosSurface = max(dot(lightingNormal, envDir), 0.0);
-        if (cosSurface > 0.0 && !trace_shadow(shadow_origin(hit, envDir), envDir, 10000.0)) {
-            vec3 bsdf = eval_brdf(material, wo, envDir, lightingNormal);
-            float bsdfPdf = pdf_brdf(material, wo, envDir, lightingNormal);
+        uint transmissiveHits;
+        uint visiblePath;
+        uint blockedPath;
+        vec3 shadowT = caustic_shadow_transmittance_stats(shadow_origin(hit, envDir), envDir, 10000.0, rayTime, transmissiveHits, visiblePath, blockedPath);
+        causticTransmissiveHits += transmissiveHits;
+        causticVisiblePaths += visiblePath;
+        causticBlockedPaths += blockedPath;
+        if (cosSurface > 0.0 && luminance(shadowT) > 0.0) {
+            vec3 bsdf = eval_brdf(material, wo, envDir, lightingNormal, hit.tangent, hit.bitangent);
+            float bsdfPdf = pdf_brdf(material, wo, envDir, lightingNormal, hit.tangent, hit.bitangent);
             float weight = power_heuristic(envPdf, bsdfPdf);
             if (sampledLightPdf <= 0.0) {
                 sampledLightPdf = envPdf;
+                sampledRawLightPdf = envPdf;
+                sampledEffectiveLightPdf = envPdf;
                 sampledBsdfPdf = bsdfPdf;
                 sampledMisWeight = weight;
                 sampledType = 2u;
             }
-            environmentContribution += bsdf * envRadiance * cosSurface * weight / max(envPdf, 1e-6);
+            environmentContribution += bsdf * envRadiance * shadowT * cosSurface * weight / max(envPdf, 1e-6);
         }
     }
     environmentContribution /= float(envSampleCount);
 
     vec3 sunContribution = vec3(0.0);
-    if (camera.sunlight_enabled != 0u) {
-        vec3 sunDir = analytical_sun_direction();
-        float ndl = max(dot(lightingNormal, sunDir), 0.0);
-        if (ndl > 0.0 && !trace_shadow(shadow_origin(hit, sunDir), sunDir, 10000.0)) {
-            vec3 bsdf = eval_brdf(material, wo, sunDir, lightingNormal);
-            sunContribution = bsdf * analytical_sun_center_radiance() * sun_transmittance(hit.world_pos, sunDir) * ndl;
+    {
+        vec3 sunWi;
+        vec3 sunRadiance;
+        float sunPdf;
+        if (sample_sun_light(rng, sunWi, sunRadiance, sunPdf)) {
+            float ndl = max(dot(lightingNormal, sunWi), 0.0);
+            uint transmissiveHits;
+            uint visiblePath;
+            uint blockedPath;
+            vec3 shadowT = caustic_shadow_transmittance_stats(shadow_origin(hit, sunWi), sunWi, 10000.0, rayTime, transmissiveHits, visiblePath, blockedPath);
+            causticTransmissiveHits += transmissiveHits;
+            causticVisiblePaths += visiblePath;
+            causticBlockedPaths += blockedPath;
+            if (ndl > 0.0 && luminance(shadowT) > 0.0) {
+                vec3 bsdf = eval_brdf(material, wo, sunWi, lightingNormal, hit.tangent, hit.bitangent);
+                float bsdfPdf = pdf_brdf(material, wo, sunWi, lightingNormal, hit.tangent, hit.bitangent);
+                float weight = power_heuristic(sunPdf, bsdfPdf);
+                if (sampledLightPdf <= 0.0) {
+                    sampledLightPdf = sunPdf;
+                    sampledRawLightPdf = sunPdf;
+                    sampledEffectiveLightPdf = sunPdf;
+                    sampledBsdfPdf = bsdfPdf;
+                    sampledMisWeight = weight;
+                    sampledType = 3u;
+                }
+                sunContribution = bsdf * sunRadiance * sun_transmittance(hit.world_pos, sunWi) * shadowT * ndl * weight / max(sunPdf, 1e-6);
+            }
         }
     }
 
@@ -423,12 +959,49 @@ vec3 fast_preview_ambient(Material material, vec3 normal) {
     vec3 up = vec3(0.0, 1.0, 0.0);
     vec3 sampleDir = normalize(normal + up * 0.45);
     float hemisphere = 0.35 + 0.65 * max(dot(normal, up), 0.0);
-    return material.color * environment_radiance(sampleDir) * (0.16 + 0.24 * hemisphere);
+    return material.color * environment_radiance(sampleDir, ATMOSPHERE_RAY_QUALITY_FAST) * (0.16 + 0.24 * hemisphere);
+}
+
+vec3 estimate_volume_direct_lighting(inout uint rng, vec3 scatterPos, vec3 incidentDir, float rayTime) {
+    if (camera.direct_lighting_enabled == 0u || !homogeneous_volume_enabled()) {
+        return vec3(0.0);
+    }
+
+    float g = homogeneous_anisotropy();
+    vec3 result = vec3(0.0);
+    uint envSampleCount = clamp(camera.environment_direct_samples, 1u, 8u);
+    for (uint envSample = 0u; envSample < envSampleCount; ++envSample) {
+        vec3 envDir;
+        float envPdf;
+        vec3 envRadiance = sample_environment_direction(rng, envDir, envPdf);
+        if (envPdf <= 1.0e-6) {
+            continue;
+        }
+        vec3 shadowT = caustic_shadow_transmittance(scatterPos, envDir, 10000.0, rayTime);
+        if (luminance(shadowT) > 0.0) {
+            float phase = henyey_greenstein_phase(dot(normalize(incidentDir), envDir), g);
+            result += envRadiance * shadowT * phase / max(envPdf, 1.0e-6);
+        }
+    }
+    result /= float(envSampleCount);
+
+    vec3 sunWi;
+    vec3 sunRadiance;
+    float sunPdf;
+    if (camera.sunlight_enabled != 0u && sample_sun_light(rng, sunWi, sunRadiance, sunPdf) && sunPdf > 1.0e-6) {
+        vec3 shadowT = caustic_shadow_transmittance(scatterPos, sunWi, 10000.0, rayTime);
+        if (luminance(shadowT) > 0.0) {
+            float phase = henyey_greenstein_phase(dot(normalize(incidentDir), sunWi), g);
+            result += sunRadiance * sun_transmittance(scatterPos, sunWi) * shadowT * phase / max(sunPdf, 1.0e-6);
+        }
+    }
+    return result;
 }
 
 vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 dims, out bool did_hit, out float first_depth, out vec3 first_normal, out vec3 first_position, out PathComponents components) {
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
+    vec3 atmosTransmittance = vec3(1.0);
     components.direct_light = vec3(0.0);
     components.indirect_light = vec3(0.0);
     components.emissive_light = vec3(0.0);
@@ -436,6 +1009,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.restir_initial_direct_light = vec3(0.0);
     components.first_albedo = vec3(1.0);
     components.first_roughness = 1.0;
+    components.first_occlusion = 1.0;
     components.first_light_pdf = 0.0;
     components.first_bsdf_pdf = 0.0;
     components.first_mis_weight = 0.0;
@@ -443,34 +1017,100 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.first_bounce_throughput = vec3(0.0);
     components.secondary_env_miss = 0.0;
     components.secondary_env_radiance = vec3(0.0);
+    components.emissive_continuation = 0.0;
+    components.sun_mis_weight = 0.0;
+    components.sun_light_pdf = 0.0;
+    components.sun_previous_bsdf_pdf = 0.0;
+    components.ris_raw_light_pdf = 0.0;
+    components.ris_effective_light_pdf = 0.0;
+    components.ris_pdf_ratio = 0.0;
+    components.caustic_transmissive_hits = 0.0;
+    components.caustic_visible_paths = 0.0;
+    components.caustic_blocked_paths = 0.0;
+    components.first_specular_probability = 0.0;
+    components.secondary_hit_distance = 65504.0;
     components.first_local_pos = vec3(0.0);
+    components.restir_gi_candidate_valid = 0u;
+    components.restir_gi_candidate_position = vec3(0.0);
+    components.restir_gi_candidate_normal = vec3(0.0, 1.0, 0.0);
+    components.restir_gi_candidate_radiance = vec3(0.0);
+    components.restir_gi_receiver_position = vec3(0.0);
+    components.restir_gi_candidate_roughness = 1.0;
+    components.restir_gi_candidate_hit_distance = 65504.0;
+    components.restir_gi_candidate_target_pdf = 0.0;
+    components.restir_gi_candidate_material_id = 0u;
     components.bounce_count = 0u;
     components.instance_id = 0xffffffffu;
     components.mesh_id = 0xffffffffu;
 
     bool previousWasBrdfSample = false;
+    uint previousEventType = PATH_EVENT_NONE;
     float previousBrdfPdf = 0.0;
     vec3 previousSampleOrigin = vec3(0.0);
+    vec3 prevHitPos = ray.origin;
+    vec3 prevRayDir = ray.direction;
     did_hit = false;
     first_depth = 1e30;
     first_normal = vec3(0.0, 1.0, 0.0);
     first_position = vec3(0.0);
 
     uint bounceLimit = camera.path_tracing_enabled != 0u ? max(camera.max_bounces, 1u) : 1u;
+    uint rrStartDepth = clamp(camera.max_bounces / 2u, 3u, 5u);
     for (uint bounce = 0u; bounce < bounceLimit; ++bounce) {
-        RayPayload hit = trace_surface(ray.origin, ray.direction, 0.001, 10000.0);
+        rng ^= sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_PATH_SEED);
+        RayPayload hit = trace_surface(ray.origin, ray.direction, 0.001, 10000.0, ray.time);
+        float segmentDistance = hit.hit != 0u ? hit.t : 10000.0;
+        float mediumDistance = sample_homogeneous_medium_distance(coords, bounce);
+        if (mediumDistance < segmentDistance) {
+            vec3 scatterPos = ray.origin + ray.direction * mediumDistance;
+            float sigmaT = homogeneous_sigma_t();
+            float albedo = sigmaT > 1.0e-7 ? homogeneous_sigma_s() / sigmaT : 0.0;
+            throughput *= albedo;
+            vec3 volumeDirect = throughput * estimate_volume_direct_lighting(rng, scatterPos, ray.direction, ray.time);
+            radiance += volumeDirect;
+            components.environment_light += volumeDirect;
+            float phasePdf;
+            vec3 nextDir = sample_henyey_greenstein(ray.direction, coords, bounce, phasePdf);
+            if (phasePdf <= 1.0e-6 || max(max(throughput.r, throughput.g), throughput.b) <= 1.0e-5) {
+                break;
+            }
+            ray.origin = scatterPos;
+            ray.direction = nextDir;
+            prevHitPos = scatterPos;
+            prevRayDir = ray.direction;
+            previousWasBrdfSample = false;
+            previousEventType = PATH_EVENT_NONE;
+            previousBrdfPdf = phasePdf;
+            components.bounce_count += 1u;
+            continue;
+        }
         if (hit.hit == 0u) {
-            vec3 sky = environment_radiance(ray.direction);
+            const uint envQuality = bounce == 0u ? ATMOSPHERE_RAY_QUALITY_FULL : ATMOSPHERE_RAY_QUALITY_FAST;
+            vec3 sky = environment_radiance(ray.direction, envQuality);
+            vec3 sunDisk = environment_sun_disk_radiance(ray.direction);
             if (bounce == 0u) {
                 sky *= env_params.background_intensity;
             }
-            vec3 env = throughput * sky;
-            if (previousWasBrdfSample && env_params.enabled != 0u && debug_params.view != 27u) {
+            vec3 env = throughput * (sky + sunDisk);
+            if (previousEventType == PATH_EVENT_BSDF && previousWasBrdfSample && env_params.enabled != 0u && debug_params.view != 27u) {
                 float envPdf = environment_pdf(ray.direction);
                 if (envPdf > 1e-6) {
-                    env = throughput * sky * power_heuristic(previousBrdfPdf, envPdf);
+                    float skyWeight = power_heuristic(previousBrdfPdf, envPdf);
+                    float sunPdf = analytical_sun_pdf(ray.direction);
+                    float sunWeight = sunPdf > 1e-6 ? power_heuristic(previousBrdfPdf, sunPdf) : 1.0;
+                    env = throughput * (sky * skyWeight + sunDisk * sunWeight);
+                    if (sunPdf > 1e-6 && luminance(sunDisk) > 0.0) {
+                        components.sun_mis_weight = sunWeight;
+                        components.sun_light_pdf = sunPdf;
+                        components.sun_previous_bsdf_pdf = previousBrdfPdf;
+                    }
                 }
             }
+            float envContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
+            if (bounce > 0u) {
+                envContributionScale *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
+            }
+            env *= envContributionScale;
             radiance += env;
             if (bounce > 0u) {
                 components.indirect_light += env;
@@ -489,86 +1129,195 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.first_local_pos = hit.local_pos;
             components.first_albedo = material.color;
             components.first_roughness = material.roughness;
+            components.first_occlusion = material.occlusion;
+            components.first_specular_probability = pbr_specular_sample_probability(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.instance_id = hit.instance_id;
             components.mesh_id = hit.mesh_id;
+        } else if (bounce == 1u) {
+            components.secondary_hit_distance = min(hit.t, 65504.0);
+        }
+
+        if (camera.sunlight_enabled != 0u && debug_params.view != 27u) {
+            float segDist = length(hit.world_pos - prevHitPos);
+            if (bounce > 0u && segDist > 0.1) {
+                vec3 segTrans = atmosphere_segment_transmittance(prevHitPos, prevRayDir, segDist, 8);
+                atmosTransmittance *= segTrans;
+            }
         }
 
         if (bounce == 0u && debug_params.view == 24u) {
             float testPdf;
-            vec3 testDir = sample_cosine_hemisphere(rng, hit.normal, testPdf);
-            RayPayload testHit = trace_surface(hit.world_pos + hit.normal * SHADOW_SELF_HIT_EPSILON, normalize(testDir), 0.001, 10000.0);
+            uint envTestRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_ENVIRONMENT);
+            vec3 testDir = sample_cosine_hemisphere(envTestRng, hit.normal, testPdf);
+            RayPayload testHit = trace_surface(hit.world_pos + hit.normal * shadow_self_hit_epsilon(), normalize(testDir), shadow_self_hit_epsilon(), 10000.0, ray.time);
             components.secondary_env_miss = testHit.hit == 0u ? 1.0 : 0.0;
             return vec3(components.secondary_env_miss);
         }
         if (bounce == 0u && debug_params.view == 26u) {
             float testPdf;
-            vec3 testDir = sample_cosine_hemisphere(rng, hit.normal, testPdf);
-            RayPayload testHit = trace_surface(hit.world_pos + hit.normal * SHADOW_SELF_HIT_EPSILON, normalize(testDir), 0.001, 10000.0);
-            components.secondary_env_radiance = testHit.hit == 0u ? environment_radiance(normalize(testDir)) : vec3(0.0);
+            uint envTestRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_ENVIRONMENT + 2u);
+            vec3 testDir = sample_cosine_hemisphere(envTestRng, hit.normal, testPdf);
+            RayPayload testHit = trace_surface(hit.world_pos + hit.normal * shadow_self_hit_epsilon(), normalize(testDir), shadow_self_hit_epsilon(), 10000.0, ray.time);
+            components.secondary_env_radiance = testHit.hit == 0u ? environment_radiance(normalize(testDir), ATMOSPHERE_RAY_QUALITY_FAST) : vec3(0.0);
             return debug_display_tonemap(components.secondary_env_radiance);
         }
 
-        if (length(material.emissive) > 0.0) {
-            vec3 emit = throughput * material.emissive;
+        vec3 wo = -ray.direction;
+        bool hitEmissiveSurface = has_positive_radiance(material.emissive);
+        vec3 restirGiCandidateRadiance = vec3(0.0);
+        if (hitEmissiveSurface) {
+            vec3 emit = throughput * material.emissive * atmosTransmittance;
             if (previousWasBrdfSample) {
                 float lightPdf = emissive_hit_pdf(hit, material, previousSampleOrigin);
                 if (lightPdf > 0.0) {
                     emit *= power_heuristic(previousBrdfPdf, lightPdf);
                 }
             }
+            emit *= bounce > 0u ? camera.indirect_strength : 1.0;
+            if (bounce > 0u) {
+                emit *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
+            }
             radiance += emit;
             if (bounce > 0u) {
                 components.indirect_light += emit;
+                if (bounce == 1u && previousEventType == PATH_EVENT_BSDF) {
+                    restirGiCandidateRadiance += emit;
+                }
             }
             components.emissive_light += emit;
-            break;
         }
 
-        vec3 wo = -ray.direction;
         vec3 emissiveDirect;
         vec3 envDirect;
         float lightPdf;
+        float rawLightPdf;
+        float effectiveLightPdf;
         float bsdfPdfForLight;
         float misWeight;
         uint directSampleType;
-        vec3 direct = throughput * estimate_direct_lighting(rng, hit, material, wo, emissiveDirect, envDirect, lightPdf, bsdfPdfForLight, misWeight, directSampleType);
+        uint causticTransmissiveHits;
+        uint causticVisiblePaths;
+        uint causticBlockedPaths;
+        vec3 direct = vec3(0.0);
+        emissiveDirect = vec3(0.0);
+        envDirect = vec3(0.0);
+        lightPdf = 0.0;
+        rawLightPdf = 0.0;
+        effectiveLightPdf = 0.0;
+        bsdfPdfForLight = 0.0;
+        misWeight = 0.0;
+        directSampleType = 0u;
+        causticTransmissiveHits = 0u;
+        causticVisiblePaths = 0u;
+        causticBlockedPaths = 0u;
+        if (!hitEmissiveSurface) {
+            uint directRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_LIGHT_SELECT);
+            direct = throughput * estimate_direct_lighting(
+                directRng,
+                hit,
+                material,
+                wo,
+                ray.time,
+                emissiveDirect,
+                envDirect,
+                lightPdf,
+                rawLightPdf,
+                effectiveLightPdf,
+                bsdfPdfForLight,
+                misWeight,
+                directSampleType,
+                causticTransmissiveHits,
+                causticVisiblePaths,
+                causticBlockedPaths);
+            rng ^= directRng;
+        }
+        components.caustic_transmissive_hits += float(causticTransmissiveHits);
+        components.caustic_visible_paths += float(causticVisiblePaths);
+        components.caustic_blocked_paths += float(causticBlockedPaths);
         vec3 shadedDirect = direct;
         if (bounce == 0u && restir_mode() != 0u) {
+            bool historyAvailable = temporal_history_available();
             uint packedFirstVel = compute_surface_velocity(hit.world_pos, hit.local_pos, hit.instance_id, dims);
-            RestirReservoir previousReservoir;
+            RestirReservoir previousReservoir = empty_restir_reservoir();
             bool reprojectionValid = false;
-            if (packedFirstVel != 0u) {
+            float restirMotionConfidence = 1.0;
+            if (historyAvailable && packedFirstVel != 0u) {
                 vec2 firstVel = restir_unpack_velocity_pixels(packedFirstVel);
                 ivec2 reprojected = ivec2(round(vec2(coords) - firstVel));
                 ivec2 clampedReprojected = clamp(reprojected, ivec2(0), dims - ivec2(1));
                 uint reprojectedIndex = uint(clampedReprojected.y) * uint(dims.x) + uint(clampedReprojected.x);
                 previousReservoir = previous_restir_reservoirs[reprojectedIndex];
                 reprojectionValid = length(firstVel) < float(max(dims.x, dims.y)) * 0.5;
-            } else {
+                restirMotionConfidence = 1.0 - clamp(length(firstVel) / 24.0, 0.0, 0.75);
+            } else if (historyAvailable) {
                 previousReservoir = previous_restir_reservoirs[pixelIndex];
+                reprojectionValid = true;
             }
-            bool previousReservoirValid = previousReservoir.metadata.z != 0u &&
-                previousReservoir.sample_value_confidence.a > 0.0 &&
-                previousReservoir.target_pdf_weight_sum_m.z > 0.0 &&
+            bool previousReservoirValid = restir_reservoir_valid(previousReservoir) &&
+                historyAvailable &&
                 reprojectionValid;
             bool useRestir = restir_mode() == 1u || (restir_mode() == 2u && coords.x >= dims.x / 2);
             if (useRestir && previousReservoirValid) {
-                shadedDirect = previousReservoir.sample_value_confidence.rgb;
+                RestirReservoir currentReservoir = make_initial_restir_reservoir(
+                    direct * atmosTransmittance,
+                    lightPdf,
+                    directSampleType,
+                    material.roughness);
+                RestirReservoir mergedReservoir = restir_pairwise_temporal_merge(
+                    currentReservoir,
+                    previousReservoir,
+                    restirMotionConfidence,
+                    32.0);
+                shadedDirect = mergedReservoir.sample_value_confidence.rgb / max(atmosTransmittance, vec3(1.0e-3));
+                shadedDirect = clamp_luminance_preserve_hue(
+                    shadedDirect,
+                    restir_temporal_luminance_limit(direct));
             }
         }
-        radiance += shadedDirect;
+        float bounceContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
+        if (bounce > 0u) {
+            bounceContributionScale *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
+        }
+        vec3 scaledShadedDirect = shadedDirect * atmosTransmittance * bounceContributionScale;
+        scaledShadedDirect = clamp_luminance_preserve_hue(
+            scaledShadedDirect,
+            direct_contribution_luminance_limit(bounce, directSampleType, material.roughness));
+        radiance += scaledShadedDirect;
         if (bounce == 0u) {
-            components.direct_light += shadedDirect;
-            components.restir_initial_direct_light += direct;
+            components.direct_light += scaledShadedDirect;
+            components.restir_initial_direct_light += direct * atmosTransmittance;
             components.first_light_pdf = lightPdf;
             components.first_bsdf_pdf = bsdfPdfForLight;
             components.first_mis_weight = misWeight;
             components.first_direct_sample_type = directSampleType;
+            components.ris_raw_light_pdf = rawLightPdf;
+            components.ris_effective_light_pdf = effectiveLightPdf;
+            components.ris_pdf_ratio = rawLightPdf > 1.0e-6 ? effectiveLightPdf / rawLightPdf : 0.0;
+            if (directSampleType == 3u) {
+                components.sun_mis_weight = misWeight;
+                components.sun_light_pdf = lightPdf;
+                components.sun_previous_bsdf_pdf = bsdfPdfForLight;
+            }
         } else {
-            components.indirect_light += shadedDirect;
+            components.indirect_light += scaledShadedDirect;
         }
-        components.emissive_light += throughput * emissiveDirect;
-        components.environment_light += throughput * envDirect;
+        if (bounce == 1u && previousEventType == PATH_EVENT_BSDF) {
+            restirGiCandidateRadiance += scaledShadedDirect;
+            float candidateTargetPdf = luminance(restirGiCandidateRadiance);
+            if (candidateTargetPdf > 1.0e-6) {
+                components.restir_gi_candidate_valid = 1u;
+                components.restir_gi_candidate_position = hit.world_pos;
+                components.restir_gi_candidate_normal = hit.normal;
+                components.restir_gi_candidate_radiance = restirGiCandidateRadiance;
+                components.restir_gi_receiver_position = first_position;
+                components.restir_gi_candidate_roughness = material.roughness;
+                components.restir_gi_candidate_hit_distance = min(hit.t, 65504.0);
+                components.restir_gi_candidate_target_pdf = candidateTargetPdf;
+                components.restir_gi_candidate_material_id = hit.material_id;
+            }
+        }
+        components.emissive_light += throughput * emissiveDirect * atmosTransmittance * bounceContributionScale;
+        components.environment_light += throughput * envDirect * atmosTransmittance * bounceContributionScale;
 
         if (camera.path_tracing_enabled == 0u) {
             vec3 previewNormal = normalize(hit.geom_normal);
@@ -577,65 +1326,90 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             if (camera.sunlight_enabled != 0u && camera.direct_lighting_enabled != 0u) {
                 vec3 sunDir = analytical_sun_direction();
                 float ndl = max(dot(previewNormal, sunDir), 0.0);
-                previewSun = throughput * material.color * (1.0 / PI) * analytical_sun_center_radiance() * sun_transmittance(hit.world_pos, sunDir) * ndl;
+                previewSun = throughput * material.color * (1.0 / PI) * analytical_sun_center_radiance() * analytical_sun_solid_angle() * sun_transmittance(hit.world_pos, sunDir) * ndl;
             }
-            radiance += previewSun;
-            components.direct_light += previewSun;
-            radiance += previewAmbient;
-            components.indirect_light += previewAmbient;
+            vec3 scaledPreviewSun = previewSun * atmosTransmittance * bounceContributionScale;
+            vec3 scaledPreviewAmbient = previewAmbient * atmosTransmittance * bounceContributionScale;
+            if (bounce == 0u) {
+                scaledPreviewAmbient *= components.first_occlusion;
+            }
+            radiance += scaledPreviewSun;
+            components.direct_light += scaledPreviewSun;
+            radiance += scaledPreviewAmbient;
+            components.indirect_light += scaledPreviewAmbient;
             break;
         }
 
         previousWasBrdfSample = false;
+        previousEventType = PATH_EVENT_NONE;
         previousBrdfPdf = 0.0;
-        if (material.mat_type == 1u) {
-            vec3 reflected = reflect(ray.direction, hit.normal);
-            ray.direction = normalize(reflected + material.roughness * rand_unit_vector(rng));
+        bool continuedPath = false;
+        if (material.mat_type == 1u && material_is_delta(material)) {
+            ray.direction = reflect(ray.direction, hit.normal);
             if (dot(ray.direction, hit.normal) <= 0.0) {
                 break;
             }
-            ray.origin = hit.world_pos + hit.normal * SHADOW_SELF_HIT_EPSILON;
-            throughput *= material.color * camera.indirect_strength;
+            ray.origin = hit.world_pos + hit.normal * shadow_self_hit_epsilon();
+            throughput *= material.color;
+            throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, true);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
-        } else if (material.mat_type == 2u) {
+            previousEventType = PATH_EVENT_DELTA;
+            continuedPath = true;
+        } else if (material.mat_type == 2u && material_is_delta(material)) {
             float refractionRatio = hit.front_face != 0u ? (1.0 / max(material.ior, 1.01)) : max(material.ior, 1.01);
-            vec3 unitDirection = normalize(ray.direction);
-            float cosTheta = min(dot(-unitDirection, hit.normal), 1.0);
+            float cosTheta = min(dot(-ray.direction, hit.normal), 1.0);
             float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
             bool cannotRefract = refractionRatio * sinTheta > 1.0;
-            vec3 scatteredDirection = (cannotRefract || reflectance(cosTheta, refractionRatio) > rand_f32(rng))
-                ? reflect(unitDirection, hit.normal)
-                : refract(unitDirection, hit.normal, refractionRatio);
-            ray.direction = normalize(scatteredDirection);
-            ray.origin = hit.world_pos + (dot(ray.direction, hit.normal) > 0.0 ? hit.normal : -hit.normal) * SHADOW_SELF_HIT_EPSILON;
-            throughput *= material.color * camera.indirect_strength;
+            float dielectricSample = sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_DIELECTRIC);
+            vec3 scatteredDirection = (cannotRefract || reflectance(cosTheta, refractionRatio) > dielectricSample)
+                ? reflect(ray.direction, hit.normal)
+                : refract(ray.direction, hit.normal, refractionRatio);
+            ray.direction = scatteredDirection;
+            ray.origin = hit.world_pos + (dot(ray.direction, hit.normal) > 0.0 ? hit.normal : -hit.normal) * shadow_self_hit_epsilon();
+            throughput *= material.color;
+            throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, true);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
+            previousEventType = PATH_EVENT_DELTA;
+            continuedPath = true;
         } else {
             float bsdfPdf;
-            vec3 wi = sample_brdf(rng, material, wo, hit.normal, bsdfPdf);
+            uint bsdfRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_BSDF);
+            vec3 wi = sample_brdf(bsdfRng, material, wo, hit.normal, hit.tangent, hit.bitangent, bsdfPdf);
+            rng ^= bsdfRng;
             float cosTheta = max(dot(hit.normal, wi), 0.0);
             if (bsdfPdf < 1e-6 || cosTheta <= 0.0) {
                 break;
             }
-            vec3 bsdf = eval_brdf(material, wo, wi, hit.normal);
-            ray.origin = hit.world_pos + hit.normal * SHADOW_SELF_HIT_EPSILON;
-            ray.direction = normalize(wi);
+            vec3 bsdf = eval_brdf(material, wo, wi, hit.normal, hit.tangent, hit.bitangent);
+            ray.origin = hit.world_pos + hit.normal * shadow_self_hit_epsilon();
+            ray.direction = wi;
             previousWasBrdfSample = true;
+            previousEventType = PATH_EVENT_BSDF;
             previousBrdfPdf = bsdfPdf;
             previousSampleOrigin = ray.origin;
-            throughput *= bsdf * cosTheta / max(bsdfPdf, 1e-6) * camera.indirect_strength;
+            throughput *= bsdf * cosTheta / max(bsdfPdf, 1e-6);
+            throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, false);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
             }
+            continuedPath = true;
         }
 
-        if (bounce > 2u && debug_params.view != 27u) {
-            float p = clamp(max(max(throughput.r, throughput.g), throughput.b), 0.05, 0.95);
-            if (rand_f32(rng) > p) {
+        if (hitEmissiveSurface && continuedPath && bounce + 1u < bounceLimit) {
+            components.emissive_continuation = 1.0;
+        }
+
+        prevHitPos = hit.world_pos;
+        prevRayDir = ray.direction;
+
+        uint completedDepth = bounce + 1u;
+        if (completedDepth >= rrStartDepth && completedDepth < bounceLimit && debug_params.view != 27u) {
+            float p = clamp(luminance(throughput), russian_roulette_min_survival(), 0.95);
+            if (sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_RUSSIAN_ROULETTE) > p) {
                 break;
             }
             throughput /= p;
@@ -652,10 +1426,18 @@ vec3 clamp_firefly_sample(vec3 sampleColor, vec3 previousAverage, uint frameCoun
     }
 
     float previousLum = dot(max(previousAverage, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
-    float warmupLimit = mix(96.0, 48.0, clamp(float(frameCount) / 16.0, 0.0, 1.0));
-    float historyLimit = max(48.0, previousLum * 10.0 + 6.0);
+    float clampLimit = firefly_clamp_luminance();
+    float warmupLimit = mix(clampLimit * 2.0, clampLimit, clamp(float(frameCount) / 16.0, 0.0, 1.0));
+    float historyLimit = max(clampLimit, previousLum * 10.0 + 6.0);
     float maxLum = frameCount <= 1u ? warmupLimit : min(warmupLimit, historyLimit);
     return sampleColor * min(1.0, maxLum / sampleLum);
+}
+
+vec3 unsupported_hardware_rt_debug_pattern(uvec2 pixel, uint view) {
+    uint stripe = ((pixel.x / 16u) + (pixel.y / 16u) + view) & 1u;
+    vec3 a = vec3(0.16, 0.04, 0.26);
+    vec3 b = vec3(0.95, 0.45, 0.10);
+    return mix(a, b, float(stripe));
 }
 
 void main() {
@@ -666,23 +1448,83 @@ void main() {
     }
 
     uint pixel_index = pixel.y * size.x + pixel.x;
-    uint rng = pcg_hash(pixel_index + camera.frame_count * 9781u);
-    vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
-    vec2 uv = (vec2(pixel) + jitter) / vec2(size);
-    vec2 ndc = uv * 2.0 - vec2(1.0);
-    float aspect = float(size.x) / max(float(size.y), 1.0);
-    float scale = tan(camera.fov_y * 0.5);
-
-    Ray ray;
-    ray.origin = camera.pos.xyz;
-    ray.direction = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
+    uint requestedSpp = clamp(camera.path_trace_controls.x, 1u, 8u);
+    uint effectiveSpp = camera.path_trace_controls.y != 0u ? 1u : requestedSpp;
+    float invSpp = 1.0 / float(effectiveSpp);
+    uint rng = sample_dimension_seed(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_PATH_SEED);
+    Ray ray = make_camera_ray(pixel, size, ivec2(pixel), 0u);
 
     bool did_hit;
     float hit_depth;
     vec3 hit_normal;
     vec3 hit_position;
     PathComponents components;
-    vec3 sample_color = trace_path(ray, rng, pixel_index, ivec2(pixel), ivec2(size), did_hit, hit_depth, hit_normal, hit_position, components);
+    vec3 sample_color;
+    if (effectiveSpp <= 1u) {
+        sample_color = trace_path(ray, rng, pixel_index, ivec2(pixel), ivec2(size), did_hit, hit_depth, hit_normal, hit_position, components);
+    } else {
+        sample_color = vec3(0.0);
+        PathComponents first_components;
+        bool first_did_hit = false;
+        float first_hit_depth = 1.0e30;
+        vec3 first_hit_normal = vec3(0.0, 1.0, 0.0);
+        vec3 first_hit_position = vec3(0.0);
+        vec3 accumulated_direct = vec3(0.0);
+        vec3 accumulated_indirect = vec3(0.0);
+        vec3 accumulated_emissive = vec3(0.0);
+        vec3 accumulated_environment = vec3(0.0);
+        vec3 accumulated_restir_direct = vec3(0.0);
+        vec3 accumulated_caustic_debug = vec3(0.0);
+
+        for (uint sppIndex = 0u; sppIndex < 8u; ++sppIndex) {
+            if (sppIndex >= effectiveSpp) {
+                break;
+            }
+
+            ivec2 sample_coords = ivec2(pixel) + ivec2(int(sppIndex) * 4099, int(sppIndex) * 9176);
+            uint sample_rng = rng ^ sample_dimension_seed(sample_coords, camera.temporal_frame_index, sppIndex, SAMPLE_DIM_PATH_SEED + 23u);
+            Ray sample_ray = make_camera_ray(pixel, size, sample_coords, sppIndex);
+            PathComponents sample_components;
+            bool sample_did_hit;
+            float sample_hit_depth;
+            vec3 sample_hit_normal;
+            vec3 sample_hit_position;
+            vec3 path_sample = trace_path(sample_ray, sample_rng, pixel_index, sample_coords, ivec2(size), sample_did_hit, sample_hit_depth, sample_hit_normal, sample_hit_position, sample_components);
+            sample_color += path_sample;
+            accumulated_direct += sample_components.direct_light;
+            accumulated_indirect += sample_components.indirect_light;
+            accumulated_emissive += sample_components.emissive_light;
+            accumulated_environment += sample_components.environment_light;
+            accumulated_restir_direct += sample_components.restir_initial_direct_light;
+            accumulated_caustic_debug += vec3(
+                sample_components.caustic_visible_paths,
+                sample_components.caustic_transmissive_hits,
+                sample_components.caustic_blocked_paths);
+
+            if (sppIndex == 0u) {
+                first_components = sample_components;
+                first_did_hit = sample_did_hit;
+                first_hit_depth = sample_hit_depth;
+                first_hit_normal = sample_hit_normal;
+                first_hit_position = sample_hit_position;
+            }
+        }
+
+        sample_color *= invSpp;
+        components = first_components;
+        components.direct_light = accumulated_direct * invSpp;
+        components.indirect_light = accumulated_indirect * invSpp;
+        components.emissive_light = accumulated_emissive * invSpp;
+        components.environment_light = accumulated_environment * invSpp;
+        components.restir_initial_direct_light = accumulated_restir_direct * invSpp;
+        components.caustic_visible_paths = accumulated_caustic_debug.x * invSpp;
+        components.caustic_transmissive_hits = accumulated_caustic_debug.y * invSpp;
+        components.caustic_blocked_paths = accumulated_caustic_debug.z * invSpp;
+        did_hit = first_did_hit;
+        hit_depth = first_hit_depth;
+        hit_normal = first_hit_normal;
+        hit_position = first_hit_position;
+    }
     vec4 previous = (camera.frame_count <= 1u || camera.path_tracing_enabled == 0u) ? vec4(0.0) : accumulation_buffer[pixel_index];
     vec3 previous_average = previous.rgb / max(previous.a, 1.0);
     sample_color = clamp_firefly_sample(sample_color, previous_average, camera.frame_count);
@@ -693,21 +1535,33 @@ void main() {
     float lum = dot(sample_color, vec3(0.2126, 0.7152, 0.0722));
     float avgLum = dot(average, vec3(0.2126, 0.7152, 0.0722));
     variance_buffer[pixel_index] = pack_variance(abs(lum - avgLum));
-    depth_normal_buffer[pixel_index] = pack_depth_normal(hit_depth, hit_normal);
+    depth_normal_buffer[pixel_index] = pack_depth_normal(hit_depth, hit_normal, components.first_roughness);
     world_position_buffer[pixel_index] = did_hit ? pack_world_position(hit_position) : uvec2(0u);
+    float pathSpecularWeight = clamp(components.first_specular_probability, 0.0, 1.0);
+    float pathDiffuseWeight = 1.0 - pathSpecularWeight;
+    float confidence = did_hit
+        ? clamp(1.0 - abs(lum - avgLum) / (max(max(lum, avgLum), 0.0) + 1.0), 0.0, 1.0)
+        : 0.0;
+    PathDataRecord pathData;
+    float emissiveSignal = luminance(components.emissive_light);
+    pathData.direct_diffuse = vec4(components.direct_light * pathDiffuseWeight, emissiveSignal);
+    pathData.direct_specular = vec4(components.direct_light * pathSpecularWeight, did_hit ? min(hit_depth, 65504.0) : 65504.0);
+    pathData.indirect_diffuse = vec4((components.indirect_light + components.environment_light) * pathDiffuseWeight, confidence);
+    pathData.indirect_specular = vec4((components.indirect_light + components.environment_light) * pathSpecularWeight, did_hit ? components.secondary_hit_distance : 65504.0);
+    pathData.albedo_roughness_hit_confidence = vec4(
+        did_hit ? components.first_albedo : vec3(0.0),
+        did_hit ? components.first_roughness : 1.0);
+    path_data_buffer[pixel_index] = pathData;
     uint packedVelocity = did_hit
         ? compute_surface_velocity(hit_position, components.first_local_pos, components.instance_id, ivec2(size))
         : compute_sky_velocity(ray.direction, ivec2(size));
     velocity_buffer[pixel_index] = packedVelocity;
     store_initial_restir_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
+    store_initial_restir_gi_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
 
-    vec2 pick_uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
-    vec2 pick_ndc = pick_uv * 2.0 - vec2(1.0);
-    Ray pick_ray;
-    pick_ray.origin = camera.pos.xyz;
-    pick_ray.direction = normalize(camera.forward.xyz + camera.right.xyz * pick_ndc.x * aspect * scale - camera.up.xyz * pick_ndc.y * scale);
-    RayPayload pick_hit = trace_surface_with_mode(pick_ray.origin, pick_ray.direction, 0.001, 10000.0, 1u);
-    entity_id_buffer[pixel_index] = pick_hit.hit != 0u ? pick_hit.instance_id : 0xffffffffu;
+    entity_id_buffer[pixel_index] = did_hit && components.instance_id != 0xffffffffu
+        ? components.instance_id
+        : 0xffffffffu;
 
     vec3 output_value = average;
     if (debug_params.view == 2u) {
@@ -726,20 +1580,20 @@ void main() {
         output_value = components.environment_light * debug_params.scale;
     } else if (debug_params.view == 11u) {
         // Hardware RT does not expose implementation traversal counters.
-        output_value = vec3(0.0);
+        output_value = unsupported_hardware_rt_debug_pattern(pixel, debug_params.view);
     } else if (debug_params.view == 12u) {
         // Hardware RT does not expose implementation BVH depth.
-        output_value = vec3(0.0);
+        output_value = unsupported_hardware_rt_debug_pattern(pixel, debug_params.view);
     } else if (debug_params.view == 13u) {
         output_value = did_hit && components.instance_id != 0xffffffffu ? id_color(components.instance_id) : vec3(0.0);
     } else if (debug_params.view == 14u) {
         output_value = did_hit && components.mesh_id != 0xffffffffu ? id_color(components.mesh_id) : vec3(0.0);
     } else if (debug_params.view == 15u) {
         // Hardware RT does not expose implementation TLAS traversal counters.
-        output_value = vec3(0.0);
+        output_value = unsupported_hardware_rt_debug_pattern(pixel, debug_params.view);
     } else if (debug_params.view == 16u) {
-        // The software traversal comparison view only applies to the compute backend.
-        output_value = vec3(0.0);
+        // The software traversal comparison view is unavailable in the hardware RT-only renderer.
+        output_value = unsupported_hardware_rt_debug_pattern(pixel, debug_params.view);
     } else if (debug_params.view == 17u) {
         output_value = vec3(clamp(log2(max(components.first_light_pdf, 0.0) + 1.0) / 8.0, 0.0, 1.0));
     } else if (debug_params.view == 18u) {
@@ -749,9 +1603,11 @@ void main() {
     } else if (debug_params.view == 20u) {
         output_value = components.first_direct_sample_type == 1u
             ? vec3(1.0, 0.45, 0.05)
-            : (components.first_direct_sample_type == 2u ? vec3(0.05, 0.45, 1.0) : vec3(0.0));
+            : (components.first_direct_sample_type == 2u ? vec3(0.05, 0.45, 1.0) : (components.first_direct_sample_type == 3u ? vec3(1.0, 0.95, 0.1) : vec3(0.0)));
     } else if (debug_params.view == 21u) {
         output_value = did_hit ? components.first_albedo : vec3(0.0);
+    } else if (debug_params.view == 89u) {
+        output_value = did_hit ? vec3(clamp(components.first_occlusion, 0.0, 1.0)) : vec3(0.0);
     } else if (debug_params.view == 23u) {
         output_value = components.first_bounce_throughput;
     } else if (debug_params.view == 24u) {
@@ -761,24 +1617,106 @@ void main() {
     } else if (debug_params.view == 26u) {
         output_value = debug_display_tonemap(components.secondary_env_radiance);
     } else if (debug_params.view == 29u) {
-        output_value = debug_display_tonemap(atmosphere_sky_radiance(ray.direction) * max(debug_params.scale, 1.0));
+        output_value = debug_display_tonemap(atmosphere_sky_radiance(ray.direction, ATMOSPHERE_RAY_QUALITY_FULL) * max(debug_params.scale, 1.0));
     } else if (debug_params.view == 30u) {
         vec3 transmittance = sample_atmosphere_transmittance_lut(camera.pos.xyz, ray.direction);
         output_value = pow(clamp(transmittance, vec3(0.0), vec3(1.0)), vec3(2.0));
     } else if (debug_params.view == 31u) {
         float viewMu = clamp(normalize(ray.direction).y, -0.15, 1.0);
         vec2 lutUv = vec2(0.8, clamp((viewMu + 0.15) / 1.15, 0.0, 1.0));
-        vec4 aerial = texture(sampler2D(atmosphere_aerial_perspective_lut, atmosphere_sampler), lutUv);
+        vec4 aerial = texture(sampler3D(atmosphere_aerial_perspective_lut, atmosphere_sampler), vec3(lutUv, 0.5));
         output_value = debug_display_tonemap((aerial.rgb + vec3(1.0 - aerial.a) * 0.15) * max(debug_params.scale, 1.0) * 3.0);
     } else if (debug_params.view == 32u) {
         vec3 multiScatter = sample_multi_scatter_lut_debug(ray.direction);
         output_value = debug_display_tonemap(multiScatter * max(debug_params.scale, 1.0) * 8.0);
     } else if (debug_params.view == 35u) {
-        output_value = vec3(clamp(float(restir_reservoirs[pixel_index].metadata.y) / 32.0, 0.0, 1.0));
+        output_value = vec3(clamp(float(restir_age(restir_reservoirs[pixel_index])) / 32.0, 0.0, 1.0));
     } else if (debug_params.view == 36u) {
         output_value = vec3(clamp(restir_reservoirs[pixel_index].sample_value_confidence.a, 0.0, 1.0));
     } else if (debug_params.view == 37u) {
-        output_value = vec3(clamp(restir_reservoirs[pixel_index].target_pdf_weight_sum_m.z, 0.0, 1.0));
+        output_value = vec3(clamp(restir_sample_count(restir_reservoirs[pixel_index]) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 67u) {
+        float previousWeight = clamp(restir_previous_weight(restir_reservoirs[pixel_index]), 0.0, 1.0);
+        output_value = vec3(previousWeight, 1.0 - previousWeight, clamp(restir_reservoirs[pixel_index].sample_value_confidence.a, 0.0, 1.0));
+    } else if (debug_params.view == 68u) {
+        RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
+        RestirGiReservoir previousReservoir = previous_restir_gi_reservoirs[pixel_index];
+        RestirGiReservoir spatialReservoir = restir_gi_spatial_reservoirs[pixel_index];
+        output_value = vec3(
+            restir_gi_reservoir_valid(reservoir) ? 1.0 : 0.0,
+            restir_gi_reservoir_valid(previousReservoir) ? 1.0 : 0.0,
+            restir_gi_reservoir_valid(spatialReservoir) ? 1.0 : 0.0);
+    } else if (debug_params.view == 69u) {
+        RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
+        output_value = vec3(
+            restir_gi_age_normalized(reservoir, 32.0),
+            clamp(restir_gi_sample_count(reservoir) / 16.0, 0.0, 1.0),
+            clamp(restir_gi_target_pdf(reservoir) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 70u || debug_params.view == 71u) {
+        RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
+        output_value = restir_gi_reservoir_valid(reservoir)
+            ? reservoir.radiance_weight_sum.rgb * max(debug_params.scale, 1.0) * 16.0
+            : vec3(0.0);
+    } else if (debug_params.view == 90u) {
+        RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
+        output_value = restir_gi_reservoir_valid(reservoir)
+            ? restir_gi_normal(reservoir) * 0.5 + vec3(0.5)
+            : vec3(0.0);
+    } else if (debug_params.view == 91u) {
+        RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
+        output_value = restir_gi_reservoir_valid(reservoir)
+            ? vec3(temporal_normalized_hit_distance(restir_gi_hit_distance(reservoir)))
+            : vec3(0.0);
+    } else if (debug_params.view == 38u) {
+        output_value = components.emissive_continuation > 0.0 ? vec3(0.05, 0.95, 0.35) : vec3(0.0);
+    } else if (debug_params.view == 39u) {
+        output_value = vec3(clamp(components.sun_mis_weight, 0.0, 1.0));
+    } else if (debug_params.view == 40u) {
+        output_value = vec3(clamp(log2(max(components.sun_light_pdf, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 41u) {
+        output_value = vec3(clamp(log2(max(components.sun_previous_bsdf_pdf, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 42u) {
+        output_value = vec3(clamp(log2(max(components.ris_raw_light_pdf, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 43u) {
+        output_value = vec3(clamp(log2(max(components.ris_effective_light_pdf, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 44u) {
+        output_value = vec3(clamp(log2(max(components.ris_pdf_ratio, 0.0) + 1.0) / 8.0, 0.0, 1.0));
+    } else if (debug_params.view == 45u) {
+        vec2 s = sample_dimension_2d(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_DEBUG);
+        output_value = vec3(s, sample_dimension_1d(ivec2(pixel), camera.temporal_frame_index, 1u, SAMPLE_DIM_DEBUG + 2u));
+    } else if (debug_params.view == 46u) {
+        uint seed = sample_dimension_seed(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_DEBUG);
+        output_value = vec3(
+            sample_uint_to_unit_float(seed),
+            sample_uint_to_unit_float(sample_hash_combine(seed, 17u)),
+            sample_uint_to_unit_float(sample_hash_combine(seed, 31u)));
+    } else if (debug_params.view == 100u) {
+        output_value = vec3(
+            clamp(components.caustic_blocked_paths / 4.0, 0.0, 1.0),
+            clamp(components.caustic_visible_paths / 4.0, 0.0, 1.0),
+            clamp(components.caustic_transmissive_hits / 4.0, 0.0, 1.0));
+    } else if (debug_params.view == 47u) {
+        output_value = path_data_buffer[pixel_index].direct_diffuse.rgb * debug_params.scale;
+    } else if (debug_params.view == 48u) {
+        output_value = path_data_buffer[pixel_index].direct_specular.rgb * debug_params.scale;
+    } else if (debug_params.view == 49u) {
+        output_value = path_data_buffer[pixel_index].indirect_diffuse.rgb * debug_params.scale;
+    } else if (debug_params.view == 50u) {
+        output_value = path_data_buffer[pixel_index].indirect_specular.rgb * debug_params.scale;
+    } else if (debug_params.view == 51u) {
+        output_value = path_data_buffer[pixel_index].albedo_roughness_hit_confidence.rgb;
+    } else if (debug_params.view == 52u) {
+        PathDataRecord pathData = path_data_buffer[pixel_index];
+        output_value = vec3(
+            clamp(pathData.albedo_roughness_hit_confidence.w, 0.0, 1.0),
+            temporal_normalized_hit_distance(pathData.direct_specular.a),
+            temporal_normalized_hit_distance(pathData.indirect_specular.a));
+    } else if (debug_params.view == 54u) {
+        PathDataRecord pathData = path_data_buffer[pixel_index];
+        output_value = vec3(
+            temporal_normalized_hit_distance(pathData.direct_specular.a),
+            temporal_normalized_hit_distance(pathData.indirect_specular.a),
+            clamp(pathData.indirect_diffuse.a, 0.0, 1.0));
     }
     imageStore(output_color, ivec2(pixel), vec4(output_value, 1.0));
 }

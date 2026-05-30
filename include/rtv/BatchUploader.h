@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtv/NonCopyable.h"
+#include "rtv/TextureAsset.h"
 
 #include <Volk/volk.h>
 
@@ -22,6 +23,12 @@ public:
     void begin();
     void enqueueBufferUpload(Buffer& destination, const void* data, VkDeviceSize byteSize, VkDeviceSize dstOffset = 0);
     void enqueueImageUpload(Image& image, const void* data, VkDeviceSize byteSize, VkImageLayout finalLayout);
+    void enqueueImageUpload(
+        Image& image,
+        const void* data,
+        VkDeviceSize byteSize,
+        std::vector<TextureMipLevel> mipData,
+        VkImageLayout finalLayout);
     void submit();
     void reset();
 
@@ -39,6 +46,7 @@ private:
         Image* image = nullptr;
         const void* data = nullptr;
         VkDeviceSize byteSize = 0;
+        std::vector<TextureMipLevel> mipData;
         VkImageLayout finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     };
 

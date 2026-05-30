@@ -1,16 +1,14 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "blue_noise.glsl"
+#include "restir_common.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-struct RestirReservoir {
-    uvec4 metadata;
-    vec4 sample_value_confidence;
-    vec4 target_pdf_weight_sum_m;
-};
-
 layout(set = 0, binding = 0, std430) readonly buffer InputReservoirs { RestirReservoir input_reservoirs[]; };
 layout(set = 0, binding = 1, std430) writeonly buffer OutputReservoirs { RestirReservoir output_reservoirs[]; };
-layout(set = 0, binding = 2, std430) readonly buffer DepthNormalBuffer { uvec2 depth_normal_buffer[]; };
+layout(set = 0, binding = 2, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
 
 layout(set = 0, binding = 3, std140) uniform RestirSpatialParams {
     uint width;
@@ -19,45 +17,95 @@ layout(set = 0, binding = 3, std140) uniform RestirSpatialParams {
     uint enabled;
 } params;
 
-vec2 unpack_unorm2x16(uint packedValue) {
-    return vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
-}
-
-vec2 unpack_snorm2x16(uint packedValue) {
-    return unpack_unorm2x16(packedValue) * 2.0 - vec2(1.0);
-}
-
-vec3 decode_octahedral_normal(uint packedValue) {
-    vec2 f = unpack_snorm2x16(packedValue);
-    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
-    float t = clamp(-n.z, 0.0, 1.0);
-    n.x += n.x >= 0.0 ? -t : t;
-    n.y += n.y >= 0.0 ? -t : t;
-    return normalize(n);
-}
-
-float luminance(vec3 value) {
-    return dot(value, vec3(0.2126, 0.7152, 0.0722));
-}
-
 uint pcg_hash(uint value) {
     uint state = value * 747796405u + 2891336453u;
     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
 }
 
-ivec2 stochastic_offset(uint pixelIndex, uint roundIndex) {
-    uint h = pcg_hash(pixelIndex ^ (roundIndex * 1013904223u));
-    int radius = 1 + int((h >> 4u) & 3u);
-    int sx = ((h & 1u) == 0u) ? -1 : 1;
-    int sy = ((h & 2u) == 0u) ? -1 : 1;
-    return ((h & 4u) == 0u) ? ivec2(sx * radius, sy) : ivec2(sx, sy * radius);
+float halton(uint index, uint base) {
+    float result = 0.0;
+    float invBase = 1.0 / float(base);
+    float factor = invBase;
+    uint i = index;
+    while (i > 0u) {
+        result += float(i % base) * factor;
+        i /= base;
+        factor *= invBase;
+    }
+    return result;
 }
 
-bool reservoir_valid(RestirReservoir reservoir) {
-    return reservoir.metadata.z != 0u &&
-        reservoir.sample_value_confidence.a > 0.0 &&
-        reservoir.target_pdf_weight_sum_m.z > 0.0;
+ivec2 blue_noise_offset(ivec2 coords, uint roundIndex) {
+    vec2 sampleValue = sample_dimension_2d(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL);
+    uint h = sample_dimension_seed(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 2u);
+    float angle = sampleValue.x * 2.0 * 3.14159265;
+    float radius = 0.5 + sampleValue.y * 3.0;
+    float ca = cos(angle);
+    float sa = sin(angle);
+    ivec2 offset = ivec2(int(floor(ca * radius + 0.5)), int(floor(sa * radius + 0.5)));
+    uint jitterX = h & 1u;
+    uint jitterY = (h >> 1u) & 1u;
+    offset.x += jitterX == 0u ? 0 : 1;
+    offset.y += jitterY == 0u ? 0 : 1;
+    return offset;
+}
+
+struct SurfaceReuseData {
+    float depth;
+    vec3 normal;
+    float roughness;
+};
+
+SurfaceReuseData decode_surface_reuse_data(uvec4 packed) {
+    SurfaceReuseData surface;
+    surface.depth = uintBitsToFloat(packed.x);
+    surface.normal = decode_octahedral_normal(packed.y);
+    surface.roughness = clamp(uintBitsToFloat(packed.z), 0.01, 1.0);
+    return surface;
+}
+
+float restir_spatial_surface_compatibility(SurfaceReuseData center, SurfaceReuseData candidate) {
+    float effectiveRoughness = max(center.roughness, candidate.roughness);
+    if (effectiveRoughness < 0.06) {
+        return 0.0;
+    }
+
+    float relativeDepth = abs(candidate.depth - center.depth) / max(abs(center.depth), 1.0e-3);
+    float depthThreshold = mix(0.015, 0.055, effectiveRoughness);
+    float normalThreshold = mix(0.96, 0.84, effectiveRoughness);
+    float normalAgreement = dot(center.normal, candidate.normal);
+    if (relativeDepth > depthThreshold || normalAgreement < normalThreshold) {
+        return 0.0;
+    }
+
+    float depthConfidence = 1.0 - clamp(relativeDepth / max(depthThreshold, 1.0e-4), 0.0, 1.0);
+    float normalConfidence = smoothstep(normalThreshold, 1.0, normalAgreement);
+    return depthConfidence * normalConfidence;
+}
+
+bool restir_spatial_reservoir_compatible(RestirReservoir center, RestirReservoir candidate) {
+    if (!restir_reservoir_valid(candidate) || restir_visibility_state(candidate) != RESTIR_VISIBILITY_VISIBLE) {
+        return false;
+    }
+
+    if (restir_visibility_state(center) == RESTIR_VISIBILITY_INVALID) {
+        return false;
+    }
+
+    if (center.metadata.x != candidate.metadata.x) {
+        return false;
+    }
+
+    if (center.metadata.w != 0u && candidate.metadata.w != 0u && center.metadata.w != candidate.metadata.w) {
+        return false;
+    }
+
+    float pdfRatio = min(restir_source_pdf(center), restir_source_pdf(candidate)) /
+        max(restir_source_pdf(center), restir_source_pdf(candidate));
+    float targetRatio = min(max(restir_target_function(center), 1.0e-5), max(restir_target_function(candidate), 1.0e-5)) /
+        max(max(restir_target_function(center), 1.0e-5), max(restir_target_function(candidate), 1.0e-5));
+    return pdfRatio > 0.20 && targetRatio > 0.05;
 }
 
 void main() {
@@ -68,49 +116,83 @@ void main() {
 
     uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
     RestirReservoir merged = input_reservoirs[pixelIndex];
-    if (params.enabled == 0u || !reservoir_valid(merged)) {
+    if (params.enabled == 0u || !restir_reservoir_valid(merged)) {
         output_reservoirs[pixelIndex] = merged;
         return;
     }
 
-    uvec2 packedCenter = depth_normal_buffer[pixelIndex];
-    float centerDepth = uintBitsToFloat(packedCenter.x);
-    vec3 centerNormal = decode_octahedral_normal(packedCenter.y);
-    float totalWeight = max(luminance(merged.sample_value_confidence.rgb), 0.0) * max(merged.sample_value_confidence.a, 0.05);
+    SurfaceReuseData centerSurface = decode_surface_reuse_data(depth_normal_buffer[pixelIndex]);
+    uint mergedVisibility = restir_visibility_state(merged);
+    float neighborLuminanceSum = 0.0;
+    float maxNeighborLum = 0.0;
+    uint neighborCount = 0u;
+    float totalWeight = max(restir_luminance(merged.sample_value_confidence.rgb), 0.0) *
+        max(merged.sample_value_confidence.a, 0.05);
 
     for (uint roundIndex = 0u; roundIndex < 4u; ++roundIndex) {
-        ivec2 sampleCoords = coords + stochastic_offset(pixelIndex, roundIndex);
+        ivec2 sampleCoords = coords + blue_noise_offset(coords, roundIndex);
         if (sampleCoords.x < 0 || sampleCoords.y < 0 || sampleCoords.x >= int(params.width) || sampleCoords.y >= int(params.height)) {
             continue;
         }
 
         uint sampleIndex = uint(sampleCoords.y) * params.width + uint(sampleCoords.x);
         RestirReservoir candidate = input_reservoirs[sampleIndex];
-        if (!reservoir_valid(candidate)) {
+        if (!restir_spatial_reservoir_compatible(merged, candidate)) {
             continue;
         }
 
-        uvec2 packedCandidate = depth_normal_buffer[sampleIndex];
-        float candidateDepth = uintBitsToFloat(packedCandidate.x);
-        vec3 candidateNormal = decode_octahedral_normal(packedCandidate.y);
-        float relativeDepth = abs(candidateDepth - centerDepth) / max(abs(centerDepth), 1.0e-3);
-        if (relativeDepth > 0.08 || dot(centerNormal, candidateNormal) < 0.82) {
+        SurfaceReuseData candidateSurface = decode_surface_reuse_data(depth_normal_buffer[sampleIndex]);
+        float surfaceCompatibility = restir_spatial_surface_compatibility(centerSurface, candidateSurface);
+        if (surfaceCompatibility <= 0.0) {
             continue;
         }
 
-        float candidateWeight = max(luminance(candidate.sample_value_confidence.rgb), 0.0) * max(candidate.sample_value_confidence.a, 0.05);
+        uint candidateVisibility = restir_visibility_state(candidate);
+        if (candidateVisibility != RESTIR_VISIBILITY_VISIBLE) {
+            continue;
+        }
+
+        float effectiveRoughness = max(centerSurface.roughness, candidateSurface.roughness);
+        float candidateWeight = max(restir_luminance(candidate.sample_value_confidence.rgb), 0.0) *
+            max(candidate.sample_value_confidence.a, 0.05) *
+            surfaceCompatibility;
         float nextTotal = totalWeight + candidateWeight;
         if (nextTotal <= 1.0e-8) {
             continue;
         }
 
-        float mixWeight = clamp(candidateWeight / nextTotal, 0.0, 0.65);
+        float cappedMaxMixWeight = mix(0.35, 0.65, effectiveRoughness);
+        float mixWeight = clamp(candidateWeight / nextTotal, 0.0, cappedMaxMixWeight);
         merged.sample_value_confidence.rgb = mix(merged.sample_value_confidence.rgb, candidate.sample_value_confidence.rgb, mixWeight);
-        merged.sample_value_confidence.a = clamp(max(merged.sample_value_confidence.a, candidate.sample_value_confidence.a) * 0.96, 0.0, 1.0);
-        merged.target_pdf_weight_sum_m.y += candidate.target_pdf_weight_sum_m.y * mixWeight;
-        merged.target_pdf_weight_sum_m.z = min(merged.target_pdf_weight_sum_m.z + candidate.target_pdf_weight_sum_m.z, 64.0);
+        merged.sample_value_confidence.a = clamp(
+            mix(merged.sample_value_confidence.a, candidate.sample_value_confidence.a, mixWeight) * 0.96,
+            0.0,
+            1.0);
+        restir_set_source_pdf_and_previous_weight(
+            merged,
+            mix(restir_source_pdf(merged), restir_source_pdf(candidate), mixWeight),
+            restir_previous_weight(merged));
+        restir_set_sample_count(merged, min(restir_sample_count(merged) + restir_sample_count(candidate) * mixWeight, 64.0));
+        mergedVisibility = mergedVisibility == RESTIR_VISIBILITY_VISIBLE && candidateVisibility == RESTIR_VISIBILITY_VISIBLE
+            ? RESTIR_VISIBILITY_VISIBLE
+            : RESTIR_VISIBILITY_UNKNOWN;
         totalWeight = nextTotal;
+        float candidateLum = restir_luminance(candidate.sample_value_confidence.rgb);
+        neighborLuminanceSum += candidateLum;
+        maxNeighborLum = max(maxNeighborLum, candidateLum);
+        neighborCount += 1u;
     }
 
+    if (neighborCount > 0u) {
+        float neighborAvgLum = neighborLuminanceSum / float(neighborCount);
+        float mergedLum = restir_luminance(merged.sample_value_confidence.rgb);
+        float dataDrivenCap = max(neighborAvgLum * 4.0, maxNeighborLum * 2.0);
+        float lumCap = max(dataDrivenCap, 0.05);
+        if (mergedLum > lumCap) {
+            merged.sample_value_confidence.rgb *= lumCap / max(mergedLum, 1.0e-8);
+        }
+    }
+
+    restir_set_validity_visibility(merged, restir_pack_validity_visibility(restir_reservoir_valid(merged), mergedVisibility));
     output_reservoirs[pixelIndex] = merged;
 }

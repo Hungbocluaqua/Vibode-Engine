@@ -1,0 +1,104 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform RestirTemporalParams {
+    uint width;
+    uint height;
+    uint frame_count;
+    uint enabled;
+    float max_age;
+    float temporal_pad;
+} params;
+
+layout(set = 0, binding = 1, std430) buffer InputReservoirs { RestirReservoir input_reservoirs[]; };
+layout(set = 0, binding = 2, std430) readonly buffer PreviousReservoirs { RestirReservoir previous_reservoirs[]; };
+layout(set = 0, binding = 3, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+layout(set = 0, binding = 4, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
+
+vec2 restir_unpack_velocity_pixels(uint packedVelocity) {
+    int x = int(packedVelocity & 0xffffu);
+    int y = int((packedVelocity >> 16u) & 0xffffu);
+    if (x >= 32768) {
+        x -= 65536;
+    }
+    if (y >= 32768) {
+        y -= 65536;
+    }
+    return vec2(float(x), float(y)) * (64.0 / 32767.0);
+}
+
+vec2 restir_unpack_snorm2x16(uint packedValue) {
+    vec2 uv = vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
+    return uv * 2.0 - vec2(1.0);
+}
+
+vec3 restir_decode_octahedral_normal(uint packedValue) {
+    vec2 f = restir_unpack_snorm2x16(packedValue);
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+float restir_surface_compatibility(uvec4 currentPacked, uvec4 previousPacked) {
+    float currentDepth = uintBitsToFloat(currentPacked.x);
+    float previousDepth = uintBitsToFloat(previousPacked.x);
+    vec3 currentNormal = restir_decode_octahedral_normal(currentPacked.y);
+    vec3 previousNormal = restir_decode_octahedral_normal(previousPacked.y);
+    float currentRoughness = clamp(uintBitsToFloat(currentPacked.z), 0.01, 1.0);
+    float previousRoughness = clamp(uintBitsToFloat(previousPacked.z), 0.01, 1.0);
+    float roughness = max(currentRoughness, previousRoughness);
+    float relativeDepth = abs(currentDepth - previousDepth) / max(abs(currentDepth), 1.0e-3);
+    float depthThreshold = mix(0.02, 0.08, roughness);
+    float normalThreshold = mix(0.96, 0.78, roughness);
+    if (relativeDepth > depthThreshold || dot(currentNormal, previousNormal) < normalThreshold) {
+        return 0.0;
+    }
+    return 1.0;
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    RestirReservoir current = input_reservoirs[pixelIndex];
+
+    if (params.enabled == 0u || !restir_reservoir_valid(current)) {
+        return;
+    }
+
+    uint packedVelocity = velocity_buffer[pixelIndex];
+    vec2 velocityPixels = restir_unpack_velocity_pixels(packedVelocity);
+    vec2 historyPos = vec2(coords) - velocityPixels;
+
+    if (historyPos.x < 0.0 || historyPos.y < 0.0 ||
+        historyPos.x >= float(params.width) || historyPos.y >= float(params.height)) {
+        current.sample_value_confidence.a = 0.35;
+        input_reservoirs[pixelIndex] = current;
+        return;
+    }
+
+    ivec2 historyCoords = ivec2(round(historyPos));
+    uint historyIndex = uint(historyCoords.y) * params.width + uint(historyCoords.x);
+    RestirReservoir previous = previous_reservoirs[historyIndex];
+
+    if (!restir_reservoir_valid(previous) || previous.metadata.y >= uint(params.max_age)) {
+        current.sample_value_confidence.a = 0.35;
+        input_reservoirs[pixelIndex] = current;
+        return;
+    }
+
+    float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
+    float surfaceCompatibility = restir_surface_compatibility(depth_normal_buffer[pixelIndex], depth_normal_buffer[historyIndex]);
+    input_reservoirs[pixelIndex] = surfaceCompatibility > 0.0
+        ? restir_pairwise_temporal_merge(current, previous, motionConfidence * surfaceCompatibility, params.max_age)
+        : current;
+}

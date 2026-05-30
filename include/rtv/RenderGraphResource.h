@@ -71,6 +71,7 @@ struct RenderGraphResource {
     VkBufferUsageFlags bufferUsage = 0;
     VkImage image = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize bufferOffset = 0;
     VkImageSubresourceRange imageRange{};
     bool external = false;
     bool hasInitialAccess = false;

@@ -1,5 +1,7 @@
 #include "rtv/SceneOperations.h"
 
+#include "rtv/SunController.h"
+
 #include <algorithm>
 #include <memory>
 #include <utility>
@@ -135,10 +137,13 @@ bool SceneOperations::reparentEntity(EntityId child, EntityId newParent) {
 bool SceneOperations::setVisibility(EntityId id, bool visible) {
     const SceneDocument before = document_;
     Entity* entity = document_.registry().entity(id);
-    if (entity == nullptr || entity->locked || !entity->meshRenderer.has_value() || entity->meshRenderer->visible == visible) {
+    if (entity == nullptr || entity->locked || entity->visible == visible) {
         return false;
     }
-    entity->meshRenderer->visible = visible;
+    entity->visible = visible;
+    if (entity->meshRenderer.has_value()) {
+        entity->meshRenderer->visible = visible;
+    }
     document_.markDirty(SceneUpdateKind::VisibilityOnly);
     publish({SceneEventType::VisibilityChanged, id, {}, SceneUpdateKind::VisibilityOnly});
     if (undoStack_ != nullptr) {
@@ -181,6 +186,191 @@ bool SceneOperations::setTransform(EntityId id, const Transform& transform) {
     return true;
 }
 
+SceneUpdateKind transformUpdateKind(const SceneDocument& document, const Entity& entity) {
+    const bool hasMesh = entity.meshRenderer.has_value();
+    const bool hasLight = entity.light.has_value();
+    const bool hasSun = entity.sun.has_value();
+    const bool hasActiveCamera = entity.camera.has_value() && document.activeCamera() == entity.id;
+    if (((hasLight || hasSun) && hasMesh) || (hasActiveCamera && hasMesh) || (hasActiveCamera && (hasLight || hasSun))) {
+        return SceneUpdateKind::TopologyChanged;
+    }
+    if (hasActiveCamera) {
+        return SceneUpdateKind::CameraOnly;
+    }
+    if (hasLight || hasSun) {
+        return SceneUpdateKind::LightOnly;
+    }
+    return SceneUpdateKind::TransformOnly;
+}
+
+void SceneOperations::setTransformGizmoDrag(EntityId id, const Transform& oldTransform, const Transform& newTransform) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked) {
+        return;
+    }
+    entity->transform = oldTransform;
+    const SceneDocument before = document_;
+    entity->transform = newTransform;
+    entity->transform.dirty = true;
+    const SceneUpdateKind updateKind = transformUpdateKind(document_, *entity);
+    document_.markDirty(updateKind);
+    publish({SceneEventType::TransformChanged, id, {}, updateKind});
+    if (undoStack_ != nullptr) {
+        const SceneDocument after = document_;
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, after, updateKind, "Move Entity"));
+    }
+}
+
+bool SceneOperations::addLightComponent(EntityId id, Light light) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || entity->light.has_value()) {
+        return false;
+    }
+    const SceneDocument before = document_;
+    document_.registry().addLight(id, light);
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::TopologyChanged, "Add Light Component"));
+    }
+    return true;
+}
+
+bool SceneOperations::addSunComponent(EntityId id, Sun sun) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || entity->sun.has_value()) {
+        return false;
+    }
+    const SceneDocument before = document_;
+    entity->sun = sun;
+    if (glm::dot(entity->transform.position, entity->transform.position) <= 1.0e-6f &&
+        glm::dot(entity->transform.rotationEuler, entity->transform.rotationEuler) <= 1.0e-6f) {
+        entity->transform = SunController::transformFromWorldAngles(
+            document_.registry(),
+            *entity,
+            entity->transform,
+            document_.renderSettings().sunElevation,
+            document_.renderSettings().sunAzimuth);
+    }
+    document_.setPrimarySun(id);
+    for (Entity* other : document_.registry().entities()) {
+        if (other != nullptr && other->id != id) {
+            other->sun.reset();
+        }
+    }
+    document_.markDirty(SceneUpdateKind::LightOnly);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::LightOnly});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::LightOnly, "Add Sun Component"));
+    }
+    return true;
+}
+
+bool SceneOperations::addCameraComponent(EntityId id, Camera camera) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || entity->camera.has_value()) {
+        return false;
+    }
+    const SceneDocument before = document_;
+    document_.registry().addCamera(id, camera);
+    if (camera.active) {
+        document_.setActiveCamera(id);
+    }
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::TopologyChanged, "Add Camera Component"));
+    }
+    return true;
+}
+
+bool SceneOperations::addMeshRendererComponent(EntityId id, MeshRenderer renderer) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || entity->meshRenderer.has_value()) {
+        return false;
+    }
+    const SceneDocument before = document_;
+    document_.registry().addMeshRenderer(id, std::move(renderer));
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::TopologyChanged, "Add Mesh Renderer Component"));
+    }
+    return true;
+}
+
+bool SceneOperations::setLight(EntityId id, const Light& oldLight, const Light& newLight) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->light.has_value()) {
+        return false;
+    }
+    entity->light = oldLight;
+    const SceneDocument before = document_;
+    entity->light = newLight;
+    document_.markDirty(SceneUpdateKind::LightOnly);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::LightOnly});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::LightOnly, "Edit Light"));
+    }
+    return true;
+}
+
+bool SceneOperations::setSun(EntityId id, const Sun& oldSun, const Sun& newSun) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->sun.has_value()) {
+        return false;
+    }
+    entity->sun = oldSun;
+    const SceneDocument before = document_;
+    entity->sun = newSun;
+    document_.setPrimarySun(id);
+    document_.markDirty(SceneUpdateKind::LightOnly);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::LightOnly});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::LightOnly, "Edit Sun"));
+    }
+    return true;
+}
+
+bool SceneOperations::setCamera(EntityId id, const Camera& oldCamera, const Camera& newCamera, EntityId oldActiveCamera, EntityId newActiveCamera) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->camera.has_value()) {
+        return false;
+    }
+    entity->camera = oldCamera;
+    document_.setActiveCamera(oldActiveCamera);
+    const SceneDocument before = document_;
+    entity = document_.registry().entity(id);
+    if (entity == nullptr || !entity->camera.has_value()) {
+        return false;
+    }
+    entity->camera = newCamera;
+    document_.setActiveCamera(newActiveCamera);
+    document_.markDirty(SceneUpdateKind::CameraOnly);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::CameraOnly});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::CameraOnly, "Edit Camera"));
+    }
+    return true;
+}
+
+void SceneOperations::commitSunDrag(SceneDocument before, SceneUpdateKind updateKind) {
+    if (undoStack_ == nullptr) {
+        return;
+    }
+    const SceneDocument after = document_;
+    undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+        document_, std::move(before), after, updateKind, "Rotate Sun"));
+}
+
 EntityId SceneOperations::duplicateEntityRecursive(const Entity& source, EntityId parent) {
     const EntityId copyId = document_.registry().createEntity(source.name.empty() ? "Entity Copy" : source.name + " Copy");
     Entity* copy = document_.registry().entity(copyId);
@@ -189,8 +379,11 @@ EntityId SceneOperations::duplicateEntityRecursive(const Entity& source, EntityI
     }
     copy->transform = source.transform;
     copy->transform.dirty = true;
+    copy->visible = source.visible;
+    copy->locked = source.locked;
     copy->meshRenderer = source.meshRenderer;
     copy->light = source.light;
+    copy->sun = source.sun;
     copy->camera = source.camera;
     if (copy->camera.has_value()) {
         copy->camera->active = false;

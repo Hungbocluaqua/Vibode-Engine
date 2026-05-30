@@ -27,6 +27,15 @@ struct SceneAsset;
 
 class UiOverlay final : private NonCopyable {
 public:
+    struct DescriptorPoolStats {
+        bool present = false;
+        uint32_t maxSets = 0;
+        uint32_t combinedImageSamplerDescriptors = 0;
+        uint32_t sampledImageDescriptors = 0;
+        uint32_t samplerDescriptors = 0;
+        uint32_t viewportDescriptorAllocated = 0;
+    };
+
     UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swapchain& swapchain);
     ~UiOverlay();
 
@@ -43,7 +52,8 @@ public:
         const std::string& sceneLoadingStatus,
         const CameraController* camera,
         float cpuFrameMs,
-        NotificationManager* notifications);
+        NotificationManager* notifications,
+        bool externalMouseCapture = false);
     void record(VkCommandBuffer commandBuffer);
     void onSwapchainRecreated(const Swapchain& swapchain);
 
@@ -55,6 +65,8 @@ public:
     [[nodiscard]] bool rendersPathTracerInViewport() const { return true; }
     [[nodiscard]] VkExtent2D desiredRenderExtent(VkExtent2D fallback) const;
     void invalidateViewportTexture();
+    [[nodiscard]] EditorLayer& editor() { return editor_; }
+    [[nodiscard]] DescriptorPoolStats descriptorPoolStats() const { return descriptorPoolStats_; }
 
 private:
     static void checkVkResult(VkResult result);
@@ -62,7 +74,9 @@ private:
 
     GLFWwindow* window_ = nullptr;
     const VulkanContext& context_;
+    VkFormat colorAttachmentFormat_ = VK_FORMAT_UNDEFINED;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
+    DescriptorPoolStats descriptorPoolStats_{};
     EditorLayer editor_;
     VkImageView viewportImageView_ = VK_NULL_HANDLE;
     VkDescriptorSet viewportTexture_ = VK_NULL_HANDLE;

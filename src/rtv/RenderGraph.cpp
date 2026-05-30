@@ -1,11 +1,133 @@
 #include "rtv/RenderGraph.h"
 
+#include "rtv/ResourceAllocator.h"
+
 #include <algorithm>
 #include <limits>
 #include <queue>
 #include <stdexcept>
 
 namespace rtv {
+
+TransientResourcePool::TransientResourcePool(ResourceAllocator& allocator)
+    : allocator_(&allocator) {}
+
+TransientResourcePool::~TransientResourcePool() {
+    destroyAll();
+}
+
+VkImage TransientResourcePool::acquireOrCreateImage(uint32_t aliasGroup, const RenderGraphResource& desc) {
+    auto it = aliasImages_.find(aliasGroup);
+    if (it != aliasImages_.end()) {
+        return it->second.image;
+    }
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = desc.format;
+    imageInfo.extent = desc.extent;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = desc.usage;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.sharingMode = allocator_->graphicsComputeSharingMode();
+    if (imageInfo.sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        imageInfo.queueFamilyIndexCount = allocator_->graphicsComputeQueueFamilyCount();
+        imageInfo.pQueueFamilyIndices = allocator_->graphicsComputeQueueFamilies();
+    }
+
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    if (vmaCreateImage(allocator_->handle(), &imageInfo, &allocInfo, &image, &allocation, nullptr) == VK_SUCCESS) {
+        const size_t estimatedBytes = desc.extent.width * desc.extent.height * std::max(desc.extent.depth, 1u) * 4u;
+        TransientImageAllocation transient{image, allocation, estimatedBytes};
+        aliasImages_[aliasGroup] = transient;
+        imagePool_.push_back(transient);
+        totalBytesAllocated_ += estimatedBytes;
+        activeBytes_ += estimatedBytes;
+        peakBytes_ = std::max(peakBytes_, activeBytes_);
+    }
+    return image;
+}
+
+VkBuffer TransientResourcePool::acquireOrCreateBuffer(uint32_t aliasGroup, const RenderGraphResource& desc) {
+    auto it = aliasBuffers_.find(aliasGroup);
+    if (it != aliasBuffers_.end()) {
+        return it->second.buffer;
+    }
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = desc.size;
+    bufferInfo.usage = desc.bufferUsage;
+    bufferInfo.sharingMode = allocator_->graphicsComputeSharingMode();
+    if (bufferInfo.sharingMode == VK_SHARING_MODE_CONCURRENT) {
+        bufferInfo.queueFamilyIndexCount = allocator_->graphicsComputeQueueFamilyCount();
+        bufferInfo.pQueueFamilyIndices = allocator_->graphicsComputeQueueFamilies();
+    }
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    if (vmaCreateBuffer(allocator_->handle(), &bufferInfo, &allocInfo, &buffer, &allocation, nullptr) == VK_SUCCESS) {
+        TransientBufferAllocation transient{buffer, allocation, static_cast<size_t>(desc.size)};
+        aliasBuffers_[aliasGroup] = transient;
+        bufferPool_.push_back(transient);
+        activeBytes_ += desc.size;
+        totalBytesAllocated_ += desc.size;
+        peakBytes_ = std::max(peakBytes_, activeBytes_);
+    }
+    return buffer;
+}
+
+void TransientResourcePool::releaseImage(uint32_t aliasGroup) {
+    auto it = aliasImages_.find(aliasGroup);
+    if (it != aliasImages_.end()) {
+        const TransientImageAllocation allocation = it->second;
+        vmaDestroyImage(allocator_->handle(), allocation.image, allocation.allocation);
+        aliasImages_.erase(it);
+        imagePool_.erase(std::remove_if(imagePool_.begin(), imagePool_.end(), [allocation](const TransientImageAllocation& entry) {
+            return entry.image == allocation.image;
+        }), imagePool_.end());
+        activeBytes_ = activeBytes_ > allocation.estimatedBytes ? activeBytes_ - allocation.estimatedBytes : 0;
+    }
+}
+
+void TransientResourcePool::releaseBuffer(uint32_t aliasGroup) {
+    auto it = aliasBuffers_.find(aliasGroup);
+    if (it != aliasBuffers_.end()) {
+        const TransientBufferAllocation allocation = it->second;
+        vmaDestroyBuffer(allocator_->handle(), allocation.buffer, allocation.allocation);
+        aliasBuffers_.erase(it);
+        bufferPool_.erase(std::remove_if(bufferPool_.begin(), bufferPool_.end(), [allocation](const TransientBufferAllocation& entry) {
+            return entry.buffer == allocation.buffer;
+        }), bufferPool_.end());
+        activeBytes_ = activeBytes_ > allocation.bytes ? activeBytes_ - allocation.bytes : 0;
+    }
+}
+
+void TransientResourcePool::beginFrame() {
+    destroyAll();
+    peakBytes_ = 0;
+}
+
+void TransientResourcePool::destroyAll() {
+    for (const TransientImageAllocation& image : imagePool_) {
+        vmaDestroyImage(allocator_->handle(), image.image, image.allocation);
+    }
+    for (const TransientBufferAllocation& buffer : bufferPool_) {
+        vmaDestroyBuffer(allocator_->handle(), buffer.buffer, buffer.allocation);
+    }
+    imagePool_.clear();
+    bufferPool_.clear();
+    aliasImages_.clear();
+    aliasBuffers_.clear();
+    totalBytesAllocated_ = 0;
+    activeBytes_ = 0;
+}
 
 namespace {
 
@@ -15,6 +137,74 @@ bool writesResource(const RenderGraphResourceUse& use) {
 
 bool readsResource(const RenderGraphResourceUse& use) {
     return use.access == PassAccess::Read || use.access == PassAccess::ReadWrite;
+}
+
+VkDeviceSize estimateResourceBytes(const RenderGraphResource& resource) {
+    if (resource.type == RenderGraphResource::Type::Buffer) {
+        return resource.size;
+    }
+    const VkDeviceSize pixelCount = static_cast<VkDeviceSize>(resource.extent.width) *
+        std::max(1u, resource.extent.height) *
+        std::max(1u, resource.extent.depth);
+    VkDeviceSize bytesPerPixel = 4;
+    switch (resource.format) {
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+        bytesPerPixel = 8;
+        break;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_UINT:
+        bytesPerPixel = 16;
+        break;
+    case VK_FORMAT_R32G32_SFLOAT:
+        bytesPerPixel = 8;
+        break;
+    case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        bytesPerPixel = 4;
+        break;
+    case VK_FORMAT_R8_UNORM:
+        bytesPerPixel = 1;
+        break;
+    default:
+        bytesPerPixel = 4;
+        break;
+    }
+    return pixelCount * bytesPerPixel;
+}
+
+bool resourcesAliasCompatible(const RenderGraphResource& a, const RenderGraphResource& b) {
+    if (a.type != b.type) {
+        return false;
+    }
+    if (a.type == RenderGraphResource::Type::Buffer) {
+        return a.size == b.size && a.bufferUsage == b.bufferUsage;
+    }
+    return a.format == b.format &&
+        a.extent.width == b.extent.width &&
+        a.extent.height == b.extent.height &&
+        a.extent.depth == b.extent.depth &&
+        a.usage == b.usage;
+}
+
+bool lifetimeOverlaps(const TransientResourceLifetime& a, const TransientResourceLifetime& b) {
+    if (a.firstUsePass == UINT32_MAX || b.firstUsePass == UINT32_MAX) {
+        return true;
+    }
+    return !(a.lastUsePass < b.firstUsePass || b.lastUsePass < a.firstUsePass);
+}
+
+bool resourcesSharePhysicalHandle(const RenderGraphResource& a, const RenderGraphResource& b) {
+    if (a.type != b.type) {
+        return false;
+    }
+    if (a.type == RenderGraphResource::Type::Buffer) {
+        return a.buffer != VK_NULL_HANDLE && a.buffer == b.buffer;
+    }
+    return a.image != VK_NULL_HANDLE && a.image == b.image;
 }
 
 void beginDebugLabel(VkCommandBuffer commandBuffer, const char* name) {
@@ -35,6 +225,20 @@ void endDebugLabel(VkCommandBuffer commandBuffer) {
     if (vkCmdEndDebugUtilsLabelEXT != nullptr) {
         vkCmdEndDebugUtilsLabelEXT(commandBuffer);
     }
+}
+
+void insertDebugBreadcrumb(VkCommandBuffer commandBuffer, const char* name) {
+    if (vkCmdInsertDebugUtilsLabelEXT == nullptr || name == nullptr || name[0] == '\0') {
+        return;
+    }
+    VkDebugUtilsLabelEXT label{};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = name;
+    label.color[0] = 1.00f;
+    label.color[1] = 0.30f;
+    label.color[2] = 0.30f;
+    label.color[3] = 1.00f;
+    vkCmdInsertDebugUtilsLabelEXT(commandBuffer, &label);
 }
 
 void emitBarrier(VkCommandBuffer commandBuffer, const RenderGraphResource& resource, const RenderGraphBarrier& barrier) {
@@ -78,7 +282,7 @@ void emitBarrier(VkCommandBuffer commandBuffer, const RenderGraphResource& resou
         bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bufferBarrier.buffer = resource.buffer;
-        bufferBarrier.offset = 0;
+        bufferBarrier.offset = resource.bufferOffset;
         bufferBarrier.size = resource.size == 0 ? VK_WHOLE_SIZE : resource.size;
 
         VkDependencyInfo dependency{};
@@ -90,6 +294,13 @@ void emitBarrier(VkCommandBuffer commandBuffer, const RenderGraphResource& resou
 }
 
 } // namespace
+
+RenderGraph::RenderGraph(ResourceAllocator* allocator, bool enableAliasing)
+    : aliasingEnabled_(enableAliasing) {
+    if (allocator != nullptr) {
+        transientPool_ = std::make_unique<TransientResourcePool>(*allocator);
+    }
+}
 
 ResourceAccess resourceAccessFor(ResourceState state, PipelineDomain domain) {
     switch (state) {
@@ -137,26 +348,32 @@ RenderGraphPass& RenderGraphPass::addInputAttachment(RenderGraphResourceId id) {
 RenderGraphPass& RenderGraphPass::addStorageRead(RenderGraphResourceId id, PipelineDomain domain) {
     const ResourceState state = domain == PipelineDomain::Transfer
         ? ResourceState::TransferSource
-        : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderRead : ResourceState::ShaderRead);
+        : (domain == PipelineDomain::RayTracing ? ResourceState::RayTracing : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderRead : ResourceState::ShaderRead));
     return addUse(id, state, PassAccess::Read, domain);
 }
 
 RenderGraphPass& RenderGraphPass::addStorageWrite(RenderGraphResourceId id, PipelineDomain domain) {
     const ResourceState state = domain == PipelineDomain::Transfer
         ? ResourceState::TransferDest
-        : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderStorage : ResourceState::ShaderStorage);
+        : (domain == PipelineDomain::RayTracing ? ResourceState::RayTracing : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderStorage : ResourceState::ShaderStorage));
     return addUse(id, state, PassAccess::Write, domain);
 }
 
 RenderGraphPass& RenderGraphPass::addStorageReadWrite(RenderGraphResourceId id, PipelineDomain domain) {
     const ResourceState state = domain == PipelineDomain::Transfer
         ? ResourceState::TransferDest
-        : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderStorage : ResourceState::ShaderStorage);
+        : (domain == PipelineDomain::RayTracing ? ResourceState::RayTracing : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderStorage : ResourceState::ShaderStorage));
     return addUse(id, state, PassAccess::ReadWrite, domain);
 }
 
 RenderGraphPass& RenderGraphPass::addUniformBuffer(RenderGraphResourceId id, PipelineDomain domain) {
     return addUse(id, ResourceState::UniformBuffer, PassAccess::Read, domain);
+}
+
+RenderGraphPass& RenderGraphPass::setQueueDomain(RenderGraphQueueDomain domain) {
+    queueDomain_ = domain;
+    queueDomainExplicit_ = true;
+    return *this;
 }
 
 RenderGraphPass& RenderGraphPass::setExecuteCallback(ExecuteCallback callback) {
@@ -174,6 +391,25 @@ RenderGraphPass& RenderGraphPass::addUse(RenderGraphResourceId id, ResourceState
         .access = access,
         .domain = domain,
     });
+    if (!queueDomainExplicit_) {
+        switch (domain) {
+        case PipelineDomain::RayTracing:
+            queueDomain_ = RenderGraphQueueDomain::RayTracing;
+            break;
+        case PipelineDomain::Compute:
+            if (queueDomain_ != RenderGraphQueueDomain::RayTracing) {
+                queueDomain_ = RenderGraphQueueDomain::Compute;
+            }
+            break;
+        case PipelineDomain::Transfer:
+            if (queueDomain_ != RenderGraphQueueDomain::RayTracing && queueDomain_ != RenderGraphQueueDomain::Compute) {
+                queueDomain_ = RenderGraphQueueDomain::Transfer;
+            }
+            break;
+        case PipelineDomain::Graphics:
+            break;
+        }
+    }
     return *this;
 }
 
@@ -200,6 +436,16 @@ RenderGraphPass& RenderGraph::addPass(const char* name) {
     passes_.emplace_back(name != nullptr ? name : "");
     compiled_ = false;
     return passes_.back();
+}
+
+bool RenderGraph::removePass(const char* name) {
+    if (name == nullptr) return false;
+    const auto it = std::find_if(passes_.begin(), passes_.end(),
+        [name](const RenderGraphPass& pass) { return pass.name() == name; });
+    if (it == passes_.end()) return false;
+    passes_.erase(it);
+    compiled_ = false;
+    return true;
 }
 
 void RenderGraph::compile() {
@@ -309,6 +555,10 @@ void RenderGraph::compile() {
                         ? resources_[use.resource.index].initialAccess
                         : resourceAccessFor(previous.state, previous.domain),
                     .after = resourceAccessFor(use.state, use.domain),
+                    .beforeQueue = previousUsePass[use.resource.index] == std::numeric_limits<uint32_t>::max()
+                        ? RenderGraphQueueDomain::Graphics
+                        : passes_[previousUsePass[use.resource.index]].queueDomain(),
+                    .afterQueue = passes_[passIndex].queueDomain(),
                 });
             }
             previousUse[use.resource.index] = use;
@@ -328,16 +578,145 @@ void RenderGraph::compile() {
             .afterPass = std::numeric_limits<uint32_t>::max(),
             .before = resourceAccessFor(previous.state, previous.domain),
             .after = resource.finalAccess,
+            .beforeQueue = previousUsePass[resourceIndex] == std::numeric_limits<uint32_t>::max()
+                ? RenderGraphQueueDomain::Graphics
+                : passes_[previousUsePass[resourceIndex]].queueDomain(),
+            .afterQueue = RenderGraphQueueDomain::Graphics,
         });
     }
 
     compiled_ = true;
+
+    resourceLifetimes_.clear();
+    resourceLifetimes_.resize(resources_.size());
+    for (uint32_t i = 0; i < resources_.size(); ++i) {
+        resourceLifetimes_[i].resourceIndex = i;
+        resourceLifetimes_[i].firstUsePass = UINT32_MAX;
+        resourceLifetimes_[i].lastUsePass = UINT32_MAX;
+        resourceLifetimes_[i].firstReadPass = UINT32_MAX;
+        resourceLifetimes_[i].lastReadPass = UINT32_MAX;
+        resourceLifetimes_[i].firstWritePass = UINT32_MAX;
+        resourceLifetimes_[i].lastWritePass = UINT32_MAX;
+        resourceLifetimes_[i].estimatedBytes = estimateResourceBytes(resources_[i]);
+        resourceLifetimes_[i].aliasEligible = !resources_[i].external &&
+            resources_[i].lifetime == RenderGraphResource::Lifetime::Transient;
+    }
+
+    for (uint32_t passIndex : compiledPassOrder_) {
+        for (const RenderGraphResourceUse& use : passes_[passIndex].uses()) {
+            const uint32_t ri = use.resource.index;
+            if (ri < resourceLifetimes_.size()) {
+                TransientResourceLifetime& lifetime = resourceLifetimes_[ri];
+                if (lifetime.firstUsePass == UINT32_MAX) {
+                    lifetime.firstUsePass = passIndex;
+                    lifetime.firstUseQueue = passes_[passIndex].queueDomain();
+                    lifetime.firstAccess = resourceAccessFor(use.state, use.domain);
+                }
+                lifetime.lastUsePass = passIndex;
+                lifetime.lastUseQueue = passes_[passIndex].queueDomain();
+                lifetime.lastAccess = resourceAccessFor(use.state, use.domain);
+                if (readsResource(use)) {
+                    lifetime.firstReadPass = std::min(lifetime.firstReadPass, passIndex);
+                    lifetime.lastReadPass = passIndex;
+                }
+                if (writesResource(use)) {
+                    lifetime.firstWritePass = std::min(lifetime.firstWritePass, passIndex);
+                    lifetime.lastWritePass = passIndex;
+                }
+            }
+        }
+    }
+
+    uint32_t nextAliasGroup = 1;
+    for (uint32_t i = 0; i < resources_.size(); ++i) {
+        if (!resourceLifetimes_[i].aliasEligible) {
+            continue;
+        }
+        if (resourceLifetimes_[i].firstUsePass == UINT32_MAX) {
+            continue;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (!resourceLifetimes_[j].aliasEligible) {
+                continue;
+            }
+            if (resourceLifetimes_[j].firstUsePass == UINT32_MAX) {
+                continue;
+            }
+            if (!resourcesAliasCompatible(resources_[i], resources_[j])) {
+                continue;
+            }
+            if (aliasingEnabled_ && !lifetimeOverlaps(resourceLifetimes_[i], resourceLifetimes_[j]) && resourceLifetimes_[j].aliasGroup != 0) {
+                resourceLifetimes_[i].aliasGroup = resourceLifetimes_[j].aliasGroup;
+                resourceLifetimes_[i].aliased = true;
+                resourceLifetimes_[j].aliased = true;
+                break;
+            }
+        }
+        if (resourceLifetimes_[i].aliasGroup == 0) {
+            resourceLifetimes_[i].aliasGroup = nextAliasGroup++;
+        }
+    }
+
+    for (uint32_t i = 0; i < resources_.size(); ++i) {
+        if (resourceLifetimes_[i].firstUsePass == UINT32_MAX) {
+            continue;
+        }
+        for (uint32_t j = 0; j < i; ++j) {
+            if (resourceLifetimes_[j].firstUsePass == UINT32_MAX) {
+                continue;
+            }
+            if (!resourcesSharePhysicalHandle(resources_[i], resources_[j])) {
+                continue;
+            }
+            if (lifetimeOverlaps(resourceLifetimes_[i], resourceLifetimes_[j])) {
+                continue;
+            }
+            if (resourceLifetimes_[j].aliasGroup == 0) {
+                resourceLifetimes_[j].aliasGroup = nextAliasGroup++;
+            }
+            resourceLifetimes_[i].aliasGroup = resourceLifetimes_[j].aliasGroup;
+            resourceLifetimes_[i].aliased = true;
+            resourceLifetimes_[j].aliased = true;
+            break;
+        }
+    }
 }
 
 void RenderGraph::execute(VkCommandBuffer commandBuffer, uint64_t frameIndex) {
     if (!compiled_) {
         compile();
     }
+
+    if (transientPool_) {
+        for (uint32_t ri = 0; ri < resources_.size(); ++ri) {
+            if (resources_[ri].lifetime != RenderGraphResource::Lifetime::Transient || resources_[ri].external) {
+                continue;
+            }
+            if (ri >= resourceLifetimes_.size() || resourceLifetimes_[ri].firstUsePass == UINT32_MAX) {
+                continue;
+            }
+            const uint32_t aliasGroup = resourceLifetimes_[ri].aliasGroup;
+            if (resources_[ri].type == RenderGraphResource::Type::Texture) {
+                VkImage acquired = transientPool_->acquireOrCreateImage(aliasGroup, resources_[ri]);
+                if (resources_[ri].image == VK_NULL_HANDLE) {
+                    resources_[ri].image = acquired;
+                    resources_[ri].imageRange = {
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .baseMipLevel = 0,
+                        .levelCount = 1,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    };
+                }
+            } else if (resources_[ri].type == RenderGraphResource::Type::Buffer) {
+                VkBuffer acquired = transientPool_->acquireOrCreateBuffer(aliasGroup, resources_[ri]);
+                if (resources_[ri].buffer == VK_NULL_HANDLE) {
+                    resources_[ri].buffer = acquired;
+                }
+            }
+        }
+    }
+
     FrameGraphContext context{
         .frameIndex = frameIndex,
         .graph = this,
@@ -350,6 +729,7 @@ void RenderGraph::execute(VkCommandBuffer commandBuffer, uint64_t frameIndex) {
         }
         const RenderGraphPass::ExecuteCallback& callback = passes_[passIndex].callback();
         if (callback) {
+            insertDebugBreadcrumb(commandBuffer, passes_[passIndex].name().c_str());
             beginDebugLabel(commandBuffer, passes_[passIndex].name().c_str());
             callback(context, commandBuffer);
             endDebugLabel(commandBuffer);
@@ -358,6 +738,73 @@ void RenderGraph::execute(VkCommandBuffer commandBuffer, uint64_t frameIndex) {
     for (const RenderGraphBarrier& barrier : compiledBarriers_) {
         if (barrier.afterPass == std::numeric_limits<uint32_t>::max() && barrier.resource.index < resources_.size()) {
             emitBarrier(commandBuffer, resources_[barrier.resource.index], barrier);
+        }
+    }
+}
+
+void RenderGraph::setAsyncComputeQueue(VkQueue queue, uint32_t familyIndex) {
+    asyncComputeQueue_ = queue;
+    asyncComputeFamily_ = familyIndex;
+}
+
+void RenderGraph::setTimelineSemaphore(VkSemaphore semaphore) {
+    timelineSemaphore_ = semaphore;
+}
+
+uint64_t RenderGraph::nextTimelineValue() {
+    return ++timelineValue_;
+}
+
+void RenderGraph::executeAsync(VkCommandBuffer graphicsCommandBuffer, VkCommandBuffer computeCommandBuffer, uint64_t frameIndex) {
+    if (asyncComputeQueue_ == VK_NULL_HANDLE || computeCommandBuffer == VK_NULL_HANDLE) {
+        execute(graphicsCommandBuffer, frameIndex);
+        return;
+    }
+    if (!compiled_) {
+        compile();
+    }
+
+    if (transientPool_) {
+        for (uint32_t ri = 0; ri < resources_.size(); ++ri) {
+            if (resources_[ri].lifetime != RenderGraphResource::Lifetime::Transient || resources_[ri].external) continue;
+            if (ri >= resourceLifetimes_.size() || resourceLifetimes_[ri].firstUsePass == UINT32_MAX) continue;
+            const uint32_t aliasGroup = resourceLifetimes_[ri].aliasGroup;
+            if (resources_[ri].type == RenderGraphResource::Type::Texture && resources_[ri].image == VK_NULL_HANDLE) {
+                resources_[ri].image = transientPool_->acquireOrCreateImage(aliasGroup, resources_[ri]);
+                resources_[ri].imageRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            } else if (resources_[ri].type == RenderGraphResource::Type::Buffer && resources_[ri].buffer == VK_NULL_HANDLE) {
+                resources_[ri].buffer = transientPool_->acquireOrCreateBuffer(aliasGroup, resources_[ri]);
+            }
+        }
+    }
+
+    FrameGraphContext context{.frameIndex = frameIndex, .graph = this};
+
+    for (uint32_t passIndex : compiledPassOrder_) {
+        const RenderGraphPass& pass = passes_[passIndex];
+        const RenderGraphQueueDomain queueDomain = pass.queueDomain();
+        const bool computeDomain = queueDomain == RenderGraphQueueDomain::Compute ||
+            queueDomain == RenderGraphQueueDomain::SameFamilyCompute;
+        VkCommandBuffer targetCmd = computeDomain ? computeCommandBuffer : graphicsCommandBuffer;
+
+        for (const RenderGraphBarrier& barrier : compiledBarriers_) {
+            if (barrier.afterPass == passIndex && barrier.resource.index < resources_.size()) {
+                emitBarrier(targetCmd, resources_[barrier.resource.index], barrier);
+            }
+        }
+
+        const RenderGraphPass::ExecuteCallback& callback = pass.callback();
+        if (callback) {
+            insertDebugBreadcrumb(targetCmd, pass.name().c_str());
+            beginDebugLabel(targetCmd, pass.name().c_str());
+            callback(context, targetCmd);
+            endDebugLabel(targetCmd);
+        }
+    }
+
+    for (const RenderGraphBarrier& barrier : compiledBarriers_) {
+        if (barrier.afterPass == std::numeric_limits<uint32_t>::max() && barrier.resource.index < resources_.size()) {
+            emitBarrier(graphicsCommandBuffer, resources_[barrier.resource.index], barrier);
         }
     }
 }
@@ -379,6 +826,10 @@ void RenderGraph::reset() {
     passes_.clear();
     compiledPassOrder_.clear();
     compiledBarriers_.clear();
+    resourceLifetimes_.clear();
+    if (transientPool_) {
+        transientPool_->beginFrame();
+    }
     compiled_ = false;
 }
 

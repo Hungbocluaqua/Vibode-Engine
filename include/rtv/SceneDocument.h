@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace rtv {
 
 class SceneDocument {
@@ -26,11 +28,17 @@ public:
     void setRenderSettings(RenderSettings settings);
     void setActiveCamera(EntityId id);
     [[nodiscard]] EntityId activeCamera() const { return activeCamera_; }
+    void setPrimarySun(EntityId id);
+    [[nodiscard]] EntityId primarySun() const;
 
     void setSourceGltfPath(std::optional<std::filesystem::path> path);
     void setSourceHdrPath(std::optional<std::filesystem::path> path);
     [[nodiscard]] const std::optional<std::filesystem::path>& sourceGltfPath() const { return sourceGltfPath_; }
     [[nodiscard]] const std::optional<std::filesystem::path>& sourceHdrPath() const { return sourceHdrPath_; }
+
+    void setBookmarksJson(const nlohmann::json& json);
+    [[nodiscard]] const std::optional<nlohmann::json>& bookmarksJson() const { return bookmarksJson_; }
+    void clearBookmarksJson();
 
     void markDirty(SceneUpdateKind kind);
     void clearDirty();
@@ -51,11 +59,13 @@ private:
     Environment environment_{};
     RenderSettings renderSettings_{};
     EntityId activeCamera_{};
+    EntityId primarySun_{};
     bool dirty_ = true;
     SceneUpdateKind pendingUpdate_ = SceneUpdateKind::TopologyChanged;
     std::string lastChangeReason_ = "SceneChanged";
     std::optional<std::filesystem::path> sourceGltfPath_;
     std::optional<std::filesystem::path> sourceHdrPath_;
+    std::optional<nlohmann::json> bookmarksJson_;
     std::vector<TextureAssetHandle> sceneTextures_;
     std::vector<MaterialAssetHandle> sceneMaterials_;
     std::vector<MeshAssetHandle> sceneMeshes_;
