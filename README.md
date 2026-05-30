@@ -2,13 +2,14 @@
 
 This directory contains the native Vulkan 1.3 / C++20 port of the WebGPU path tracing renderer. Rendering is handled by the Vulkan KHR hardware ray tracing path.
 
-The port is operational: it opens a native window, runs a Vulkan KHR hardware ray tracing path tracer on capable devices, denoises temporally/spatially, presents through compute tone mapping and a fullscreen pass, supports glTF/HDR inputs, exposes an ImGui editor, and includes GPU timing/debug views. It is now an editor-oriented renderer prototype with scene hierarchy, inspector, undo/redo, render settings persistence, and incremental scene-update paths, but it still needs more hardware-RT update/refit, material coverage, render-graph, and editor workflow hardening.
+The port is operational: it opens a native window, runs a Vulkan KHR hardware ray tracing path tracer on capable devices, uses ReSTIR DI/GI, denoises temporally/spatially, resolves TAA, presents through compute tone mapping and a fullscreen pass, supports glTF/HDR inputs, exposes an ImGui editor, and includes structured GPU timing/debug output. It is now an editor-oriented renderer prototype with scene hierarchy, inspector, undo/redo, render settings persistence, incremental scene-update paths, headless diagnostics, RenderGraph dumps, optional RenderDoc capture, opacity micromaps, SER-capability reporting, and opt-in wavefront path tracing probes.
 
 ## Current Real-Time Defaults
 
 - `Balanced` is the default render preset for interactive/game-style use.
 - The real-time path is capped at effective `1 SPP` by default through `Limit to 1 SPP`; higher requested SPP is opt-in for stills, screenshots, references, or high-end budgets.
 - ReSTIR DI and ReSTIR GI are enabled by default in the beauty path.
+- Opacity micromaps and shader execution reordering are requested by default on capable hardware. Unsupported devices clamp those paths off and report the reason in profile JSON.
 - The Balanced preset targets a 16.6 ms GPU frame budget using render scale `0.65`, max bounces `5`, one environment sample, three a-trous iterations, ReSTIR GI spatial/final passes, temporal denoising, and TAA.
 - Motion stability is prioritized over raw per-frame sampling. Use ReSTIR reuse, denoiser history, moment tracking, and TAA before raising SPP.
 
@@ -48,6 +49,8 @@ The port is operational: it opens a native window, runs a Vulkan KHR hardware ra
 - Shader-side base-color, normal, metallic-roughness, and emissive texture sampling
 - Direct/emissive/environment lighting debug views plus PDF/MIS diagnostics
 - ReSTIR DI and ReSTIR GI reservoir reuse with GI spatial/final beauty-path passes, debug views, and profile/render-graph reporting
+- RenderGraph JSON/DOT/lifetime diagnostics for pass/resource/barrier inspection
+- Headless diagnostics with profile JSON, debug-view export, debug packages, memory dumps, frame timelines, resource lifetimes, shader reports, baseline checks, and validation suites
 - GPU timestamp profiling for path tracing, denoising, and fullscreen passes
 - ImGui editor with viewport, scene hierarchy, inspector, asset browser, render settings, debug/profiler, optional material editor, sample count, reset reason, resolution, and pass timings
 - Scene hierarchy selection sync, selected-instance outline, transform gizmo preview/commit, active scene-camera piloting, and undo/redo-backed editor operations
@@ -63,6 +66,10 @@ The port is operational: it opens a native window, runs a Vulkan KHR hardware ra
 - Instance visibility flags for hidden, camera-hidden, and non-shadow-casting objects in ray queries
 - AgX, ACES, PBR Neutral, Reinhard, Reinhard White, and Linear tone mappers
 - Hardware RT debug/profiler stats for BLAS count, instance count, acceleration-structure memory, and SBT size
+- Hardware opacity micromap support for eligible alpha-tested geometry when `VK_EXT_opacity_micromap` is available
+- Shader execution reordering support for opt-in wavefront trace probes when `VK_NV_ray_tracing_invocation_reorder` is available
+- Ray traced motion blur, thin-lens depth of field, homogeneous volumes, and a guarded caustic-visibility probe behind explicit settings/CLI flags
+- Opt-in wavefront queue, trace, shade, shadow, compaction, sorting, validation, debug-view, and final-output paths used for architecture-v2 validation
 
 ## Still In Progress
 
@@ -73,9 +80,11 @@ The port is operational: it opens a native window, runs a Vulkan KHR hardware ra
 - Fully bindless material texture residency
 - Broader glTF material extension support
 - More complete scene instancing and transform update paths
-- Automatic render graph resource-state tracking and barrier validation
+- Fuller RenderGraph execution ownership beyond the current diagnostic/planning path
 - More denoiser/reprojection validation on the hardware RT output
 - Continued editor workflow polish around component creation, camera activation, hierarchy reveal, and inspector edge cases
+- Wavefront final-output parity, full wavefront-owned debug-view coverage, and sorting/SER performance acceptance before wavefront becomes a default renderer path
+- Full MNEE caustics beyond the current guarded caustic-visibility probe
 
 ## Build
 
@@ -211,73 +220,138 @@ Supported debug views include:
 
 Some parse-compatible low-level traversal views remain available for saved settings and CLI compatibility, but the editor filters out placeholder/no-op views from normal cycling.
 
-## Architecture
+## Renderer Architecture Overview
 
-### Application Layer
+The renderer is organized around a few ownership boundaries. `Application` owns runtime mode and editor/headless orchestration. `SceneDocument` and `AssetManager` own editable CPU state. `SceneToGpuSceneBuilder` converts editor state into renderer-facing scene data. `GpuScene` owns shader-visible buffers, textures, light data, environment sampling data, and hardware RT build inputs. `PathTracerRenderer` owns render targets, temporal resources, pipelines, pass recording, debug views, validation hooks, and profiling hooks. `CommandSystem` owns frame submission and presentation synchronization.
 
-`Application` owns the native window, top-level event loop, camera input, fullscreen switching, UI forwarding, and frame execution.
+The high-level data flow is:
 
-### Vulkan Core
+```text
+CLI / editor / headless diagnostics
+    -> Application
+    -> SceneDocument + SceneRegistry + AssetManager
+    -> SceneUpdateRouter / SceneToGpuSceneBuilder
+    -> GpuScene
+    -> PathTracerRenderer
+    -> RenderGraph plan + Vulkan command recording
+    -> KHR hardware ray tracing path trace
+    -> ReSTIR / atmosphere / fog / denoiser / TAA / tone map
+    -> fullscreen presentation or headless artifact export
+```
 
-`VulkanContext` owns instance, debug messenger, surface, physical-device selection, logical device, queues, enabled features, and the VMA allocator.
+### Application And Runtime Modes
 
-`Swapchain` owns swapchain images, views, format, extent, acquisition, presentation, and resize recreation.
+`Application` is the executable runtime shell. It creates the GLFW window in editor mode, initializes Vulkan, owns the camera controller, loads `.rtlevel`, glTF/GLB, and HDR files, applies CLI overrides, processes editor requests, runs async scene loading, and decides whether a request can be applied incrementally or needs a renderer rebuild.
 
-`CommandSystem` owns per-frame command pools, command buffers, fences, and synchronization primitives.
+Interactive mode creates the window, swapchain, ImGui overlay, editor panels, and viewport presentation path. Headless mode uses the same Vulkan device, scene conversion, renderer, shader, and diagnostic paths but skips the desktop window, editor UI, and swapchain presentation. Headless runs are the preferred path for reproducible profiling because warmup frames, fixed seeds, profile windows, debug-view export, RenderGraph dumps, and debug packages are all controlled from the CLI.
 
-### Resource Layer
+`CommandSystem` is the frame-submission boundary. It owns per-frame command pools, command buffers, semaphores, fences, swapchain acquisition, queue submission, and presentation. The renderer records work into command buffers supplied by `CommandSystem`; it does not own window acquire/present state.
 
-`Buffer` owns `VkBuffer` plus `VmaAllocation`. It supports GPU-only buffers, CPU upload buffers, readback buffers, persistently mapped buffers, and descriptor-ready metadata.
+### Vulkan Device And Resource Core
 
-`Image` owns `VkImage`, `VmaAllocation`, and image views. It tracks the current image layout so compute, transfer, sampled, and presentation transitions remain explicit.
+`VulkanContext` owns instance and device setup. It discovers and reports descriptor indexing, memory budget support, hardware ray tracing features, opacity micromap support, shader execution reordering support, ray tracing motion blur support, queue families, timeline semaphore support, and validation/debug messenger state.
 
-`UploadContext` and `BufferUploader` create staging resources, record copy commands, submit upload work, and synchronize completion with fences. The design keeps the upload path compatible with a future transfer queue.
+The resource layer is deliberately explicit:
 
-`ImageBarrier` wraps Synchronization2 barriers and intentionally avoids legacy `vkCmdPipelineBarrier`.
+- `ResourceAllocator` wraps VMA and debug naming.
+- `Buffer` wraps `VkBuffer`, `VmaAllocation`, mapping, flushing, invalidation, descriptor metadata, resizing, and device-address queries.
+- `Image` wraps `VkImage`, `VmaAllocation`, image views, sampled/storage descriptors, layout tracking, and mip-capable texture/render-target usage.
+- `UploadContext`, `BufferUploader`, and `BatchUploader` stage CPU data into GPU buffers and images.
+- Synchronization uses Vulkan Synchronization2 helpers and avoids hidden legacy barriers.
 
-### Descriptor And Pipeline Layer
+This layer keeps memory ownership, descriptor metadata, and barrier transitions visible enough for RenderGraph dumps, validation logs, and memory reports.
 
-`DescriptorLayoutCache` owns reusable `VkDescriptorSetLayout` objects keyed by binding/type/count/stage.
+### Descriptors, Shaders, And Pipelines
 
-`DescriptorAllocator` owns resettable descriptor pools. Frame-local allocators avoid descriptor lifetime hazards while command buffers are in flight.
+Descriptor and pipeline objects are built from small reusable helpers:
 
-`DescriptorWriter` batches descriptor writes for uniform buffers, storage buffers, sampled images, storage images, samplers, and combined image samplers.
+- `DescriptorLayoutCache` caches `VkDescriptorSetLayout` objects.
+- `DescriptorAllocator` provides per-frame descriptor arenas and growth stats.
+- `DescriptorWriter` batches storage/uniform/image/sampler/acceleration-structure writes.
+- `ShaderCompiler` invokes `glslangValidator`, emits SPIR-V, supports shader variants, and feeds shader reports.
+- `ShaderReflection` uses SPIRV-Reflect to derive descriptor layouts and push constants.
+- `PipelineCache`, `ComputePipeline`, `GraphicsPipeline`, and `RayTracingPipeline` own the Vulkan pipeline objects.
 
-`ShaderCompiler` invokes `glslangValidator` and recompiles shaders when sources are newer than generated SPIR-V outputs.
+The renderer uses many compute pipelines for post/temporal work, one fullscreen graphics pipeline for presentation, and KHR ray tracing pipelines for the megakernel and opt-in wavefront trace paths. SER uses a separate wavefront raygen variant compiled with `RTV_SER_ENABLED=1` and is selected only when the device supports `VK_NV_ray_tracing_invocation_reorder` and a wavefront trace path is active.
 
-`ShaderReflection` uses SPIRV-Reflect to extract descriptor bindings and push constants. Reflection metadata is used to create compatible descriptor set layouts and pipeline layouts.
+### Scene And Asset Model
 
-`PipelineCache`, `ComputePipeline`, and `GraphicsPipeline` own Vulkan pipeline state and dynamic-rendering-compatible layouts.
+The CPU scene model separates imported assets from editable entities. `AssetManager` owns textures, materials, and meshes. `GltfLoader` imports glTF/GLB data, caches imported scenes, stores material extension data, and preserves texture/material handles. `SceneDocument` owns the editable scene: entities, transforms, cameras, lights, mesh renderers, environment settings, render settings, source paths, active camera, dirty state, and JSON serialization.
 
-### Renderer Layer
+`SceneUpdateRouter` maps document dirty flags to renderer actions: material update, transform/TLAS update, light update, environment update, camera update, visibility update, renderer settings update, or topology rebuild. This keeps routine editor changes from forcing a full renderer rebuild when an incremental path exists.
 
-The renderer executes this frame flow:
+`SceneToGpuSceneBuilder` turns the document into a renderer-facing `SceneAsset` plus renderer settings and instance-entity mappings. `GpuScene` then uploads shader-visible buffers and image descriptors for vertices, indices, materials, primitives, mesh records, instance records, light records, local mesh/BVH data, hardware RT material IDs, environment CDFs, and material texture tables.
 
-1. Upload changed uniforms and scene/environment data.
-2. Dispatch path tracing through Vulkan KHR hardware RT.
-3. Run ReSTIR DI/GI spatial reuse and ReSTIR GI final contribution when enabled by the active settings/debug path.
-4. Barrier path tracing/ReSTIR outputs for temporal reads.
-5. Update temporal moments, dispatch temporal/a-trous denoising, and copy history resources for the next frame.
-6. Resolve TAA at display extent.
-7. Tone map/present through fullscreen output and render the ImGui overlay.
+### Hardware Ray Tracing Backend
 
-Accumulation resets when camera pose, resize, material, lighting, environment, denoiser/TAA, debug, shader, or scene state changes. Temporal/TAA frame tracking is separate from accumulation sample count so editor preview can keep temporal history while path-tracing accumulation resets.
+The production path is the Vulkan KHR hardware ray tracing backend. `RayTracingScene` builds BLAS objects from imported/fallback triangle geometry and a TLAS from visible scene instances. `RayTracingPipeline` owns the KHR ray tracing pipeline, shader groups, and shader binding table.
 
-### Scene Layer
+The megakernel raygen shader owns the path loop. It traces primary, shadow, and bounce rays with pipeline recursion depth kept at `1`. Hit shaders return compact hit records: primitive/material IDs, UVs, normals, tangent basis, and hit metadata. Raygen performs material decoding, texture sampling, BSDF evaluation, direct lighting, environment lighting, emissive contribution, MIS accounting, ReSTIR candidate generation, denoiser auxiliary writes, and debug-view data writes after a hit is accepted.
 
-The Vulkan scene path is moving from flattened demo data toward scalable GPU scene representation:
+Traversal policy is conservative and material-correct. Opaque geometry can use `VK_GEOMETRY_OPAQUE_BIT_KHR`; alpha-tested and single-sided cases use any-hit paths where needed. Opacity micromaps are requested by default on capable devices and used for eligible alpha-tested geometry; unsupported devices or ineligible scenes fall back to the alpha any-hit path and report the reason in profile JSON.
 
-- Mesh records
-- Primitive records
-- Instance records
-- Material records
-- Light records
-- Local mesh vertex/index buffers
-- Local mesh triangle buffers
-- Hardware RT triangle material ID buffer
-- Instance bounds
+### Main Frame Pipeline
 
-This keeps shader logic independent from hardcoded scene geometry and prepares the hardware RT renderer for larger imported scenes, instancing, streaming, and editor-driven scene updates.
+`PathTracerRenderer` is the central pass recorder. A normal Balanced frame follows this shape:
+
+1. Clamp/adapt settings for memory pressure and adaptive quality.
+2. Update camera, previous-camera, renderer, debug, ReSTIR, atmosphere, and post-process uniforms.
+3. Transition writable HDR, auxiliary, and history resources.
+4. Run KHR hardware ray tracing into the raw HDR output plus path data, variance, depth/normal, world-position, velocity, entity-ID, and ReSTIR reservoir outputs.
+5. Run ReSTIR DI/GI spatial reuse and GI final contribution when enabled.
+6. Run atmosphere/fog integration when the relevant path is active.
+7. Update temporal moments and dispatch the temporal/a-trous denoiser, or copy/bypass when denoising is disabled.
+8. Resolve TAA and update TAA history.
+9. Update/copy denoiser, temporal, world-position, diffuse, and specular histories for the next frame.
+10. Build/reduce auto-exposure histograms when auto exposure is enabled.
+11. Tone map into the presentation image.
+12. Draw selection outline when an entity is selected.
+13. Present through the fullscreen graphics pass and render ImGui in editor mode.
+
+Path tracing accumulation and temporal history are related but not identical. Accumulation resets on camera, resize, scene, material, light, environment, render setting, denoiser/TAA, debug view, and shader changes. Temporal resources track camera cuts, motion, reprojection validity, reactive masks, and history confidence so TAA/denoising can remain stable without pretending the path-tracing sample count is still accumulating.
+
+### ReSTIR, Denoising, TAA, And Atmosphere
+
+ReSTIR DI and ReSTIR GI are part of the default beauty path. DI/GI reservoir buffers are owned by `PathTracerRenderer`, populated from path tracing/shader passes, copied or aged across frames, and consumed by spatial/final compute passes. Debug views and profile JSON expose reservoir age, confidence, M values, GI validity, GI initial/temporal/spatial/final states, and pass timings.
+
+The denoiser is temporal first and spatial second. It reads raw lighting/path data, depth/normal, variance, velocity, world positions, previous camera data, and history images. It performs reprojection, disocclusion checks, luminance/moment validation, reactive masking, and a-trous filtering. TAA runs after denoising and owns its own history so display stability can be tuned separately from path-tracing accumulation.
+
+Atmosphere and sky are split into LUT generation, sampling data, and integration passes. Transmittance, multi-scatter, sky-view, aerial perspective, sky CDF, and fog integration resources are generated through compute passes and then consumed by the path tracer, fog pass, debug views, and profile reports.
+
+### RenderGraph And Diagnostics
+
+The RenderGraph layer currently acts as both a planning model and a diagnostic contract. `PathTracerRenderer` still records most Vulkan commands directly, but it also emits a RenderGraph plan describing pass order, resource reads/writes, queue domains, barrier intent, logical buffer offsets, transient lifetimes, and alias groups.
+
+`--dump-rendergraph` and `--dump-rendergraph-dot` export this plan as JSON and DOT. `--dump-resource-lifetimes`, `--dump-frame-timeline`, `--dump-memory`, `--dump-shader-report`, and `--dump-bindings` expose related diagnostics. The long-term direction is fuller RenderGraph execution ownership, but the current dumps are already used as regression artifacts and should remain machine-readable.
+
+`HeadlessDiagnostics` writes `profile.json`, validation logs, debug-view PNGs, debug packages, baseline comparisons, budget checks, frame sequences, and optional RenderDoc captures. RenderDoc support is optional by design; capture failure is a warning, not a renderer startup failure.
+
+### Editor Integration
+
+The editor is request-driven. Panels build `EditorRequests` instead of mutating every renderer object directly. `Application` applies those requests at safe points before or after command submission depending on whether the change can be incremental or requires resource rebuilds.
+
+Editor state includes scene hierarchy, inspector, asset browser, material editor, render settings, GPU diagnostics, debug/profiler panel, viewport texture descriptors, selection outline, active scene-camera piloting, transform gizmo preview/commit, undo/redo, and scene JSON save/load. Renderer settings are synchronized back to `SceneDocument` so `.rtlevel` files preserve user-visible render settings while hardware-gated options still clamp to the effective renderer state at startup.
+
+### Wavefront Architecture V2 Path
+
+The wavefront renderer is implemented as an opt-in architecture-v2 validation path, not the default game renderer. It allocates queue buffers, generates primary rays, traces queues through KHR RT, shades hits in compute, traces shadow queues, compacts secondary rays, optionally sorts by event/material buckets, validates parity against the megakernel path, and can write wavefront-owned final output through `--wavefront-final-output on`.
+
+Wavefront diagnostics report queue capacity, occupancy, overflow/starvation, compaction counts, secondary trace/shade timings, sorted trace/shade timings, direct-light parity, ReSTIR DI/GI candidate counters, SER timing, and queue memory. The default megakernel smoke keeps wavefront queues disabled, so wavefront memory should be zero unless a wavefront probe or wavefront debug view is explicitly selected.
+
+Current wavefront status is intentionally conservative: queue/shade/shadow/compact/final-output paths exist, but full wavefront ReSTIR/debug-view ownership, sorted-path net performance, and SER performance acceptance remain validation gates before wavefront can be considered a default renderer path.
+
+### Advanced Feature Flags
+
+Several features are implemented but remain opt-in or hardware-gated:
+
+- OMM is requested by default on capable hardware and falls back when unsupported or when no eligible alpha-tested geometry exists.
+- SER is requested by default on capable hardware but only affects active wavefront trace paths.
+- Ray traced motion blur requires `VK_NV_ray_tracing_motion_blur` and `--motion-blur on`.
+- Thin-lens depth of field is enabled by `--dof-aperture-radius > 0`.
+- Homogeneous volumes are enabled by `--volume on` or nonzero volume coefficients.
+- MNEE caustics are currently a guarded caustic-visibility probe, enabled by `--caustics on` or the `caustic-visibility` debug view.
+
+These flags keep the default real-time path focused on predictable 1-SPP ReSTIR/denoise/TAA behavior while still allowing targeted validation of advanced renderer features.
 
 ## Development Direction
 
