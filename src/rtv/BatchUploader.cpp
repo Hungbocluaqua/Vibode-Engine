@@ -7,10 +7,64 @@
 #include "rtv/ResourceAllocator.h"
 #include "rtv/UploadContext.h"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 namespace rtv {
+
+namespace {
+
+std::vector<VkBufferImageCopy> makeMipCopyRegions(
+    const std::vector<TextureMipLevel>& mipData,
+    uint32_t imageMipLevels,
+    VkDeviceSize baseOffset,
+    VkExtent3D baseExtent) {
+    std::vector<VkBufferImageCopy> regions;
+    if (mipData.empty()) {
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = baseOffset;
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = baseExtent;
+        regions.push_back(copy);
+        return regions;
+    }
+
+    regions.reserve(mipData.size());
+    const uint32_t count = std::min<uint32_t>(static_cast<uint32_t>(mipData.size()), imageMipLevels);
+    for (uint32_t mip = 0; mip < count; ++mip) {
+        const TextureMipLevel& level = mipData[mip];
+        if (level.size == 0) {
+            continue;
+        }
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = baseOffset + static_cast<VkDeviceSize>(level.offset);
+        copy.bufferRowLength = 0;
+        copy.bufferImageHeight = 0;
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.mipLevel = mip;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = {
+            std::max(level.width, 1u),
+            std::max(level.height, 1u),
+            1u,
+        };
+        regions.push_back(copy);
+    }
+    if (regions.empty()) {
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = baseOffset;
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageExtent = baseExtent;
+        regions.push_back(copy);
+    }
+    return regions;
+}
+
+} // namespace
 
 BatchUploader::BatchUploader(BufferUploader& uploader)
     : uploader_(uploader) {}
@@ -50,6 +104,15 @@ void BatchUploader::enqueueBufferUpload(Buffer& destination, const void* data, V
 }
 
 void BatchUploader::enqueueImageUpload(Image& image, const void* data, VkDeviceSize byteSize, VkImageLayout finalLayout) {
+    enqueueImageUpload(image, data, byteSize, {}, finalLayout);
+}
+
+void BatchUploader::enqueueImageUpload(
+    Image& image,
+    const void* data,
+    VkDeviceSize byteSize,
+    std::vector<TextureMipLevel> mipData,
+    VkImageLayout finalLayout) {
     if (data == nullptr || byteSize == 0) {
         return;
     }
@@ -58,6 +121,7 @@ void BatchUploader::enqueueImageUpload(Image& image, const void* data, VkDeviceS
     op.image = &image;
     op.byteSize = byteSize;
     op.finalLayout = finalLayout;
+    op.mipData = std::move(mipData);
     op.data = new uint8_t[static_cast<size_t>(byteSize)];
     std::memcpy(const_cast<void*>(op.data), data, static_cast<size_t>(byteSize));
     pendingImages_.push_back(op);
@@ -139,16 +203,22 @@ void BatchUploader::submit() {
         });
         op.image->setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
-        VkBufferImageCopy copy{};
-        copy.bufferOffset = currentOffset;
-        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copy.imageSubresource.layerCount = 1;
-        copy.imageExtent = op.image->extent();
-        vkCmdCopyBufferToImage(cmd, staging.handle(), op.image->handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        const std::vector<VkBufferImageCopy> copies = makeMipCopyRegions(
+            op.mipData,
+            op.image->mipLevels(),
+            currentOffset,
+            op.image->extent());
+        vkCmdCopyBufferToImage(
+            cmd,
+            staging.handle(),
+            op.image->handle(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            static_cast<uint32_t>(copies.size()),
+            copies.data());
 
         currentOffset += op.byteSize;
 
-        if (op.image->mipLevels() > 1) {
+        if (op.image->mipLevels() > 1 && op.mipData.empty()) {
             op.image->generateMipmaps(cmd);
         }
 
@@ -166,6 +236,7 @@ void BatchUploader::submit() {
     }
 
     uploader_.uploadContext().submitAndWait(cmd);
+    uploader_.recordBatchUpload(totalBufferSize);
     reset();
 }
 

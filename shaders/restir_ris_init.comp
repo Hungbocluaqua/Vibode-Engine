@@ -1,0 +1,81 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "blue_noise.glsl"
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform RestirRisParams {
+    uint width;
+    uint height;
+    uint candidate_count;
+    uint enabled;
+} params;
+
+layout(set = 0, binding = 1, std430) readonly buffer LightBuffer {
+    vec4 lights[];
+} light_buffer;
+
+layout(set = 0, binding = 2, std430) readonly buffer LightPdfBuffer {
+    float light_pdfs[];
+} light_pdf_buffer;
+
+layout(set = 0, binding = 3, std430) writeonly buffer OutputReservoirs { RestirReservoir output_reservoirs[]; };
+
+uint rand_hash(uint seed) {
+    uint state = seed * 747796405u + 2891336453u;
+    state = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (state >> 22u) ^ state;
+}
+
+float rand_f32(inout uint seed) {
+    seed = rand_hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+
+    if (params.enabled == 0u) {
+        output_reservoirs[pixelIndex] = empty_restir_reservoir();
+        return;
+    }
+
+    RestirReservoir reservoir = empty_restir_reservoir();
+    float totalWeight = 0.0;
+
+    uint candidateCount = min(params.candidate_count, 32u);
+    for (uint i = 0u; i < candidateCount; ++i) {
+        float r = sample_dimension_1d(coords, 0u, i, SAMPLE_DIM_RESTIR_CANDIDATE);
+        float uniformPdf = 1.0 / float(params.width * params.height);
+        uint lightIndex = uint(floor(r * float(params.width * params.height)));
+        if (lightIndex >= params.width * params.height) {
+            continue;
+        }
+
+        float lightPdf = max(light_pdf_buffer.light_pdfs[lightIndex], 1.0e-6);
+        float targetWeight = 1.0 / max(lightPdf, 1.0e-6);
+
+        totalWeight += targetWeight;
+        reservoir.target_pdf_weight_sum_m.z += 1.0;
+
+        if (sample_dimension_1d(coords, 0u, i, SAMPLE_DIM_RESTIR_CANDIDATE + 1u) * totalWeight < targetWeight) {
+            reservoir.metadata = uvec4(1u, 0u, 1u, lightIndex);
+            reservoir.sample_value_confidence.rgb = light_buffer.lights[lightIndex].rgb;
+            reservoir.target_pdf_weight_sum_m.x = lightPdf;
+        }
+    }
+
+    if (totalWeight > 0.0) {
+        reservoir.sample_value_confidence.a = 1.0;
+        reservoir.target_pdf_weight_sum_m.y = totalWeight;
+    }
+
+    output_reservoirs[pixelIndex] = reservoir;
+}

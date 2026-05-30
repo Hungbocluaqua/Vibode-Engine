@@ -6,8 +6,10 @@ hitAttributeEXT vec2 attribs;
 layout(location = 0) rayPayloadInEXT RayPayload payload;
 
 void main() {
+    record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_INVOCATIONS);
     uint instanceIndex = gl_InstanceCustomIndexEXT;
     if (instanceIndex >= mesh_params.instance_count) {
+        record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
         ignoreIntersectionEXT;
         return;
     }
@@ -16,7 +18,8 @@ void main() {
     uint meshIndex = instance.metadata.x;
     MeshRecord mesh = mesh_records[meshIndex];
     uint firstIndex = mesh.vertex_index_data.z;
-    uint triIndex = firstIndex + gl_PrimitiveID * 3u;
+    uint globalTriangleIndex = geometry_triangle_offset(meshIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
+    uint triIndex = globalTriangleIndex * 3u;
     uint i0 = local_mesh_indices[triIndex + 0u];
     uint i1 = local_mesh_indices[triIndex + 1u];
     uint i2 = local_mesh_indices[triIndex + 2u];
@@ -28,16 +31,18 @@ void main() {
     vec3 p1 = v1.position_uv_x.xyz;
     vec3 p2 = v2.position_uv_x.xyz;
     vec3 localGeomNormal = normalize(cross(p1 - p0, p2 - p0));
-    vec3 worldGeomNormal = normalize(transpose(mat3(instance.inverse_transform)) * localGeomNormal);
+    vec3 worldGeomNormal = normalize(mat3(instance.normal_transform) * localGeomNormal);
     bool frontFace = dot(worldGeomNormal, gl_WorldRayDirectionEXT) < 0.0;
 
-    uint materialIndex = material_for_raw_triangle(firstIndex, gl_PrimitiveID);
+    uint materialIndex = material_for_triangle_index(globalTriangleIndex);
     Material material = decode_material(materialIndex);
     if (!frontFace && material.double_sided == 0u) {
+        record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
         ignoreIntersectionEXT;
         return;
     }
     if (material.alpha_mode == ALPHA_MODE_OPAQUE) {
+        record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_ACCEPTED);
         return;
     }
 
@@ -48,13 +53,18 @@ void main() {
     apply_material_alpha_texture(material, uv);
     if (payload.picking != 0u && material.alpha_mode == ALPHA_MODE_BLEND) {
         if (material.alpha_factor < 0.5) {
+            record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
             ignoreIntersectionEXT;
+        } else {
+            record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_ACCEPTED);
         }
         return;
     }
-    uint alphaSeed = instanceIndex * 73856093u ^ gl_PrimitiveID * 19349663u ^ uint(gl_LaunchIDEXT.x) * 83492791u ^ uint(gl_LaunchIDEXT.y);
+    uint alphaSeed = instanceIndex * 73856093u ^ globalTriangleIndex * 19349663u ^ uint(gl_LaunchIDEXT.x) * 83492791u ^ uint(gl_LaunchIDEXT.y);
     if (!accept_material_alpha(material, alphaSeed)) {
+        record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
         ignoreIntersectionEXT;
         return;
     }
+    record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_ACCEPTED);
 }

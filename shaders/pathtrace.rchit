@@ -6,6 +6,7 @@ hitAttributeEXT vec2 attribs;
 layout(location = 0) rayPayloadInEXT RayPayload payload;
 
 void main() {
+    record_rt_counter(RT_DIAG_CLOSEST_HIT_INVOCATIONS);
     uint instanceIndex = gl_InstanceCustomIndexEXT;
     if (instanceIndex >= mesh_params.instance_count) {
         payload.hit = 1u;
@@ -22,7 +23,8 @@ void main() {
     uint meshIndex = instance.metadata.x;
     MeshRecord mesh = mesh_records[meshIndex];
     uint firstIndex = mesh.vertex_index_data.z;
-    uint triIndex = firstIndex + gl_PrimitiveID * 3u;
+    uint globalTriangleIndex = geometry_triangle_offset(meshIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
+    uint triIndex = globalTriangleIndex * 3u;
     uint i0 = local_mesh_indices[triIndex + 0u];
     uint i1 = local_mesh_indices[triIndex + 1u];
     uint i2 = local_mesh_indices[triIndex + 2u];
@@ -37,8 +39,8 @@ void main() {
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
     vec3 localNormal = normalize(v0.normal_uv_y.xyz * bary.x + v1.normal_uv_y.xyz * bary.y + v2.normal_uv_y.xyz * bary.z);
     vec3 localGeomNormal = normalize(cross(p1 - p0, p2 - p0));
-    vec3 worldNormal = normalize(transpose(mat3(instance.inverse_transform)) * localNormal);
-    vec3 worldGeomNormal = normalize(transpose(mat3(instance.inverse_transform)) * localGeomNormal);
+    vec3 worldNormal = normalize(mat3(instance.normal_transform) * localNormal);
+    vec3 worldGeomNormal = normalize(mat3(instance.normal_transform) * localGeomNormal);
     bool frontFace = dot(worldGeomNormal, gl_WorldRayDirectionEXT) < 0.0;
     if (!frontFace) {
         worldGeomNormal = -worldGeomNormal;
@@ -53,7 +55,11 @@ void main() {
     vec3 worldTangent = normalize(mat3(instance.transform) * localTangent);
     vec3 worldBitangent = normalize(cross(worldNormal, worldTangent) * (tangentSign < 0.0 ? -1.0 : 1.0));
 
-    uint materialIndex = material_for_raw_triangle(firstIndex, gl_PrimitiveID);
+    uint materialIndex = material_for_triangle_index(globalTriangleIndex);
+    Material materialForDiagnostics = decode_material(materialIndex);
+    if (materialForDiagnostics.alpha_mode != ALPHA_MODE_OPAQUE) {
+        record_rt_counter(RT_DIAG_CLOSEST_HIT_ALPHA_MATERIAL);
+    }
 
     vec3 localPos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
     vec3 worldPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
@@ -68,7 +74,7 @@ void main() {
     payload.normal = worldNormal;
     payload.instance_id = instanceIndex;
     payload.mesh_id = meshIndex;
-    payload.primitive_id = gl_PrimitiveID;
+    payload.primitive_id = globalTriangleIndex;
     payload.uv = uv;
     payload.tangent = worldTangent;
     payload.bitangent = worldBitangent;

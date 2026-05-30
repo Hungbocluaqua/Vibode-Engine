@@ -17,6 +17,7 @@
 #include <array>
 #include <algorithm>
 #include <filesystem>
+#include <iostream>
 #include <stdexcept>
 
 namespace rtv {
@@ -30,12 +31,17 @@ struct ImGuiVulkanLoaderData {
 
 PFN_vkVoidFunction imguiVulkanFunctionLoader(const char* functionName, void* userData) {
     const auto* loader = static_cast<const ImGuiVulkanLoaderData*>(userData);
+    if (loader != nullptr && loader->instance != VK_NULL_HANDLE) {
+        if (PFN_vkVoidFunction function = vkGetInstanceProcAddr(loader->instance, functionName)) {
+            return function;
+        }
+    }
     if (loader != nullptr && loader->device != VK_NULL_HANDLE) {
         if (PFN_vkVoidFunction function = vkGetDeviceProcAddr(loader->device, functionName)) {
             return function;
         }
     }
-    return loader != nullptr ? vkGetInstanceProcAddr(loader->instance, functionName) : nullptr;
+    return nullptr;
 }
 
 } // namespace
@@ -65,6 +71,13 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 64},
     }};
+    descriptorPoolStats_ = DescriptorPoolStats{
+        .present = true,
+        .maxSets = 256,
+        .combinedImageSamplerDescriptors = 256,
+        .sampledImageDescriptors = 256,
+        .samplerDescriptors = 64,
+    };
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -76,8 +89,8 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
     VkPipelineRenderingCreateInfo renderingInfo{};
     renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     renderingInfo.colorAttachmentCount = 1;
-    const VkFormat colorFormat = swapchain.format();
-    renderingInfo.pColorAttachmentFormats = &colorFormat;
+    colorAttachmentFormat_ = swapchain.format();
+    renderingInfo.pColorAttachmentFormats = &colorAttachmentFormat_;
 
     ImGui_ImplVulkan_InitInfo initInfo{};
     initInfo.ApiVersion = VK_API_VERSION_1_3;
@@ -101,6 +114,7 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
 
 UiOverlay::~UiOverlay() {
     if (context_.device() != VK_NULL_HANDLE) {
+        std::cerr << "Device idle wait: UiOverlay teardown\n";
         vkDeviceWaitIdle(context_.device());
     }
     invalidateViewportTexture();
@@ -129,28 +143,36 @@ EditorRequests UiOverlay::build(
     const std::optional<std::filesystem::path>& gltfPath,
     const std::optional<std::filesystem::path>& hdrPath,
     const std::vector<EntityId>* instanceEntities,
-    const std::string& sceneLoadingStatus,
-    const CameraController* camera,
-    float cpuFrameMs,
-    NotificationManager* notifications) {
+        const std::string& sceneLoadingStatus,
+        const CameraController* camera,
+        float cpuFrameMs,
+        NotificationManager* notifications,
+        bool externalMouseCapture) {
     EditorRequests requests;
     if (!frameBegun_) {
         return requests;
     }
 
     const VkExtent2D renderExtent = renderer.renderExtent();
-    VkExtent2D targetExtent = editor_.desiredRenderExtent(extent);
+    const VkExtent2D displayExtent = renderer.displayExtent();
+    const VkExtent2D targetExtent = editor_.desiredRenderExtent(extent);
     const float renderScale = renderer.settings().renderResolutionScale;
-    targetExtent.width = std::max(1u, static_cast<uint32_t>(static_cast<float>(targetExtent.width) * renderScale));
-    targetExtent.height = std::max(1u, static_cast<uint32_t>(static_cast<float>(targetExtent.height) * renderScale));
-    const bool outputMatchesViewport = renderExtent.width == targetExtent.width && renderExtent.height == targetExtent.height;
+    VkExtent2D targetRenderExtent = targetExtent;
+    targetRenderExtent.width = std::max(1u, static_cast<uint32_t>(static_cast<float>(targetRenderExtent.width) * renderScale));
+    targetRenderExtent.height = std::max(1u, static_cast<uint32_t>(static_cast<float>(targetRenderExtent.height) * renderScale));
+    const bool outputMatchesViewport =
+        displayExtent.width == targetExtent.width &&
+        displayExtent.height == targetExtent.height &&
+        renderExtent.width == targetRenderExtent.width &&
+        renderExtent.height == targetRenderExtent.height;
 
     const VkDescriptorImageInfo descriptor = outputMatchesViewport ? renderer.viewportImageDescriptor() : VkDescriptorImageInfo{};
     if (descriptor.imageView != VK_NULL_HANDLE && descriptor.imageView != viewportImageView_) {
         invalidateViewportTexture();
         viewportTexture_ = ImGui_ImplVulkan_AddTexture(descriptor.imageView, descriptor.imageLayout);
+        descriptorPoolStats_.viewportDescriptorAllocated = viewportTexture_ != VK_NULL_HANDLE ? 1u : 0u;
         viewportImageView_ = descriptor.imageView;
-        viewportTextureExtent_ = renderExtent;
+        viewportTextureExtent_ = displayExtent;
     }
 
     EditorRuntimeState state{
@@ -163,14 +185,15 @@ EditorRequests UiOverlay::build(
         .instanceEntities = instanceEntities,
         .sceneLoadingStatus = &sceneLoadingStatus,
         .camera = camera,
-        .swapchainExtent = extent,
-        .cpuFrameMs = cpuFrameMs,
-        .viewport = EditorViewportState{
-            .texture = viewportTexture_,
-            .renderExtent = renderExtent,
-            .textureReady = outputMatchesViewport && viewportTexture_ != VK_NULL_HANDLE,
-            .mouseCaptureActive = camera != nullptr && camera->mouseCaptured(),
-        },
+            .swapchainExtent = extent,
+            .cpuFrameMs = cpuFrameMs,
+            .viewport = EditorViewportState{
+                .texture = viewportTexture_,
+                .renderExtent = renderExtent,
+                .displayExtent = displayExtent,
+                .textureReady = outputMatchesViewport && viewportTexture_ != VK_NULL_HANDLE,
+                .mouseCaptureActive = externalMouseCapture || (camera != nullptr && camera->mouseCaptured()),
+            },
     };
     requests = editor_.draw(state);
     if (notifications != nullptr) {
@@ -190,6 +213,7 @@ void UiOverlay::record(VkCommandBuffer commandBuffer) {
 }
 
 void UiOverlay::onSwapchainRecreated(const Swapchain& swapchain) {
+    colorAttachmentFormat_ = swapchain.format();
     ImGui_ImplVulkan_SetMinImageCount(std::max(2u, swapchain.imageCount()));
 }
 
@@ -228,6 +252,7 @@ void UiOverlay::invalidateViewportTexture() {
     viewportTexture_ = VK_NULL_HANDLE;
     viewportImageView_ = VK_NULL_HANDLE;
     viewportTextureExtent_ = {};
+    descriptorPoolStats_.viewportDescriptorAllocated = 0;
 }
 
 void UiOverlay::checkVkResult(VkResult result) {

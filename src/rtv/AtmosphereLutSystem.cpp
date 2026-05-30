@@ -1,9 +1,11 @@
 #include "rtv/AtmosphereLutSystem.h"
 
+#include "rtv/AtmosphereSamplingSystem.h"
 #include "rtv/ComputePipeline.h"
 #include "rtv/DescriptorAllocator.h"
 #include "rtv/DescriptorLayoutCache.h"
 #include "rtv/DescriptorWriter.h"
+#include "rtv/GpuProfiler.h"
 #include "rtv/ImageBarrier.h"
 #include "rtv/PipelineCache.h"
 #include "rtv/ResourceAllocator.h"
@@ -25,8 +27,9 @@ AtmosphereLutSystem::AtmosphereLutSystem(
     const ShaderModule& multiScatterShader,
     const ShaderModule& skyViewShader,
     const ShaderModule& skyReprojectShader,
-    const ShaderModule& aerialPerspectiveShader)
-    : device_(device) {
+    const ShaderModule& aerialPerspectiveShader,
+    const ShaderModule& skyCdfShader)
+    : device_(device), allocator_(allocator) {
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -74,8 +77,9 @@ AtmosphereLutSystem::AtmosphereLutSystem(
         .debugName = "atmosphere previous sky view lut",
     });
     aerialPerspectiveLut_.create(allocator, ImageDesc{
-        .width = 160,
-        .height = 32,
+        .width = 96,
+        .height = 96,
+        .depth = 48,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         .debugName = "atmosphere aerial perspective lut",
@@ -115,6 +119,14 @@ AtmosphereLutSystem::AtmosphereLutSystem(
         std::vector<VkDescriptorSetLayout>{aerialPerspectiveSetLayout_},
         ShaderReflection::mergePushConstants({aerialPerspectiveShader.reflection()}),
         pipelineCache);
+    samplingSystem_ = std::make_unique<AtmosphereSamplingSystem>(
+        device_,
+        allocator_,
+        layoutCache,
+        pipelineCache,
+        skyCdfShader,
+        skyViewLut_,
+        sampler_);
     markDirty(LutNode::Transmittance);
 }
 
@@ -124,16 +136,75 @@ AtmosphereLutSystem::~AtmosphereLutSystem() {
     }
 }
 
-void AtmosphereLutSystem::setSkyParameters(float sunElevation, float skyIntensity) {
-    if (std::abs(sunElevation_ - sunElevation) > 0.0001f || std::abs(skyIntensity_ - skyIntensity) > 0.0001f) {
+void AtmosphereLutSystem::setSkyParameters(float sunElevation, float sunAzimuth, float skyIntensity) {
+    if (std::abs(sunElevation_ - sunElevation) > 0.0001f ||
+        std::abs(sunAzimuth_ - sunAzimuth) > 0.0001f ||
+        std::abs(skyIntensity_ - skyIntensity) > 0.0001f) {
         markDirty(LutNode::Transmittance);
+        previousSkyViewReady_ = false;
     }
     sunElevation_ = sunElevation;
+    sunAzimuth_ = sunAzimuth;
     skyIntensity_ = skyIntensity;
+}
+
+void AtmosphereLutSystem::setSkyDirection(glm::vec3 sunDirection, float skyIntensity) {
+    const float len2 = glm::dot(sunDirection, sunDirection);
+    if (len2 <= 1.0e-6f) {
+        setSkyParameters(0.97f, 0.0f, skyIntensity);
+        return;
+    }
+    sunDirection *= glm::inversesqrt(len2);
+    const float elevation = std::asin(std::clamp(sunDirection.y, -1.0f, 1.0f));
+    const float azimuth = std::atan2(sunDirection.x, sunDirection.z);
+    setSkyParameters(elevation, azimuth, skyIntensity);
+}
+
+void AtmosphereLutSystem::setAtmosphereParams(float rayleighScaleHeight, float mieScaleHeight, float mieAnisotropy, float groundAlbedo) {
+    const auto& p = model_.params();
+    const bool changed =
+        std::abs(p.rayleighScaleHeight - rayleighScaleHeight) > 0.5f ||
+        std::abs(p.mieScaleHeight - mieScaleHeight) > 0.5f ||
+        std::abs(p.miePhaseAnisotropy - mieAnisotropy) > 0.0001f ||
+        std::abs(p.groundAlbedo - groundAlbedo) > 0.0001f;
+    if (!changed) return;
+    AtmosphereParams next = p;
+    next.rayleighScaleHeight = rayleighScaleHeight;
+    next.mieScaleHeight = mieScaleHeight;
+    next.miePhaseAnisotropy = mieAnisotropy;
+    next.groundAlbedo = groundAlbedo;
+    model_.setParams(next);
+    markDirty();
+    previousSkyViewReady_ = false;
+}
+
+void AtmosphereLutSystem::setQuality(AtmosphereQuality quality) {
+    if (quality_ == quality) {
+        return;
+    }
+    quality_ = quality;
+    markDirty();
+    previousSkyViewReady_ = false;
 }
 
 void AtmosphereLutSystem::markDirty() {
     markDirty(LutNode::Transmittance);
+    previousSkyViewReady_ = false;
+    previousCameraPosSet_ = false;
+}
+
+void AtmosphereLutSystem::setCameraPosition(glm::vec3 position) {
+    static constexpr float kCameraMoveRecomputeThreshold = 100.0f;
+    if (!previousCameraPosSet_) {
+        previousCameraPos_ = position;
+        previousCameraPosSet_ = true;
+        return;
+    }
+    float delta = glm::length(position - previousCameraPos_);
+    if (delta > kCameraMoveRecomputeThreshold) {
+        markDirty(LutNode::SkyView);
+    }
+    previousCameraPos_ = position;
 }
 
 void AtmosphereLutSystem::markDirty(LutNode node) {
@@ -173,17 +244,20 @@ void AtmosphereLutSystem::markGenerated(LutNode node) {
     ++stats_.generationCounts[index];
 }
 
-void AtmosphereLutSystem::record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::record(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     std::fill(stats_.generatedThisRecord.begin(), stats_.generatedThisRecord.end(), false);
-    recordTransmittance(commandBuffer, descriptors);
-    recordMultiScatter(commandBuffer, descriptors);
-    recordSkyView(commandBuffer, descriptors);
-    recordAerialPerspective(commandBuffer, descriptors);
+    recordTransmittance(commandBuffer, descriptors, profiler);
+    recordMultiScatter(commandBuffer, descriptors, profiler);
+    recordSkyView(commandBuffer, descriptors, profiler);
+    recordAerialPerspective(commandBuffer, descriptors, profiler);
 }
 
-void AtmosphereLutSystem::recordTransmittance(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordTransmittance(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (!isDirty(LutNode::Transmittance) || transmittancePipeline_ == nullptr || transmittanceLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereTransmittanceStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
@@ -224,11 +298,17 @@ void AtmosphereLutSystem::recordTransmittance(VkCommandBuffer commandBuffer, Des
     clearDirty(LutNode::Transmittance);
     markGenerated(LutNode::Transmittance);
     transmittanceReady_ = true;
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereTransmittanceEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
-void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (!isDirty(LutNode::MultiScatter) || !transmittanceReady_ || multiScatterPipeline_ == nullptr || multiScatterLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereMultiScatterStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
@@ -266,7 +346,7 @@ void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, Desc
         .mieScatteringAnisotropy = atmosphere.mieScatteringAnisotropy,
         .absorptionGroundAlbedo = atmosphere.absorptionGroundAlbedo,
         .scaleHeights = atmosphere.scaleHeights,
-        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, 0.0f, 0.0f),
+        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, sunAzimuth_, 0.0f),
     };
 
     multiScatterPipeline_->bind(commandBuffer);
@@ -289,11 +369,17 @@ void AtmosphereLutSystem::recordMultiScatter(VkCommandBuffer commandBuffer, Desc
     clearDirty(LutNode::MultiScatter);
     markGenerated(LutNode::MultiScatter);
     multiScatterReady_ = true;
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereMultiScatterEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
-void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (!isDirty(LutNode::SkyView) || !transmittanceReady_ || !multiScatterReady_ || skyViewPipeline_ == nullptr || rawSkyViewLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyViewStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
@@ -332,7 +418,7 @@ void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, Descripto
         .mieScatteringAnisotropy = atmosphere.mieScatteringAnisotropy,
         .absorptionGroundAlbedo = atmosphere.absorptionGroundAlbedo,
         .scaleHeights = atmosphere.scaleHeights,
-        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, 0.0f, 0.0f),
+        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, sunAzimuth_, 0.0f),
     };
 
     skyViewPipeline_->bind(commandBuffer);
@@ -352,15 +438,24 @@ void AtmosphereLutSystem::recordSkyView(VkCommandBuffer commandBuffer, Descripto
         .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
     });
     rawSkyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    recordSkyViewReproject(commandBuffer, descriptors);
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyViewEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
+    recordSkyViewReproject(commandBuffer, descriptors, profiler);
+    if (samplingSystem_ != nullptr) {
+        samplingSystem_->record(commandBuffer, descriptors, profiler);
+    }
     clearDirty(LutNode::SkyView);
     markGenerated(LutNode::SkyView);
     skyViewReady_ = true;
 }
 
-void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (skyReprojectPipeline_ == nullptr || skyViewLut_.handle() == VK_NULL_HANDLE || rawSkyViewLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyReprojectStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     if (previousSkyViewReady_) {
@@ -400,7 +495,7 @@ void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, 
     struct SkyReprojectPush {
         uint32_t hasHistory = 0;
         float historyWeight = 0.9f;
-        float maxLuminanceDelta = 0.15f;
+        float varianceGamma = 1.2f;
         uint32_t padding = 0;
     };
     const SkyReprojectPush push{
@@ -459,11 +554,17 @@ void AtmosphereLutSystem::recordSkyViewReproject(VkCommandBuffer commandBuffer, 
         .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
     });
     skyViewLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereSkyReprojectEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
-void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors, GpuProfiler* profiler) {
     if (!isDirty(LutNode::AerialPerspective) || !transmittanceReady_ || !skyViewReady_ || aerialPerspectivePipeline_ == nullptr || aerialPerspectiveLut_.handle() == VK_NULL_HANDLE) {
         return;
+    }
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereAerialPerspectiveStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
 
     barrier::cmdTransitionImage(commandBuffer, {
@@ -502,14 +603,17 @@ void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer,
         .mieScatteringAnisotropy = atmosphere.mieScatteringAnisotropy,
         .absorptionGroundAlbedo = atmosphere.absorptionGroundAlbedo,
         .scaleHeights = atmosphere.scaleHeights,
-        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, 0.0f, 0.0f),
+        .sunElevationIntensity = glm::vec4(sunElevation_, skyIntensity_, sunAzimuth_, 0.0f),
     };
 
     aerialPerspectivePipeline_->bind(commandBuffer);
     vkCmdPushConstants(commandBuffer, aerialPerspectivePipeline_->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, aerialPerspectivePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
-    aerialPerspectivePipeline_->dispatch(commandBuffer, aerialPerspectiveLut_.width(), aerialPerspectiveLut_.height(), 8, 8);
+    const uint32_t groupsX = (aerialPerspectiveLut_.width() + 7) / 8;
+    const uint32_t groupsY = (aerialPerspectiveLut_.height() + 7) / 8;
+    const uint32_t groupsZ = (aerialPerspectiveLut_.extent().depth + 3) / 4;
+    vkCmdDispatch(commandBuffer, groupsX, groupsY, groupsZ);
 
     barrier::cmdTransitionImage(commandBuffer, {
         .image = aerialPerspectiveLut_.handle(),
@@ -524,6 +628,9 @@ void AtmosphereLutSystem::recordAerialPerspective(VkCommandBuffer commandBuffer,
     aerialPerspectiveLut_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     clearDirty(LutNode::AerialPerspective);
     markGenerated(LutNode::AerialPerspective);
+    if (profiler != nullptr) {
+        profiler->write(commandBuffer, GpuProfiler::AtmosphereAerialPerspectiveEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
 }
 
 } // namespace rtv

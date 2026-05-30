@@ -6,9 +6,25 @@
 namespace rtv {
 
 PhysicalCamera::PhysicalCamera(PhysicalCameraSettings settings)
-    : settings_(settings) {}
+    : settings_(settings) {
+    setSettings(settings);
+}
 
 void PhysicalCamera::setSettings(PhysicalCameraSettings settings) {
+    settings.aperture = std::max(settings.aperture, 0.01f);
+    settings.shutterSeconds = std::max(settings.shutterSeconds, 1.0e-6f);
+    settings.iso = std::max(settings.iso, 1.0f);
+    settings.exposureCompensation = std::clamp(settings.exposureCompensation, -10.0f, 10.0f);
+    settings.apertureRadius = std::clamp(
+        std::isfinite(settings.apertureRadius) ? settings.apertureRadius : 0.0f,
+        0.0f,
+        1.0f);
+    settings.focusDistance = std::clamp(
+        std::isfinite(settings.focusDistance) ? settings.focusDistance : 10.0f,
+        0.01f,
+        10000.0f);
+    settings.bladeCount = settings.bladeCount == 0u ? 0u : std::clamp(settings.bladeCount, 3u, 16u);
+    settings.bokehRotation = std::isfinite(settings.bokehRotation) ? settings.bokehRotation : 0.0f;
     settings_ = settings;
 }
 

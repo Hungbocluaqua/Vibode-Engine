@@ -19,15 +19,16 @@ class UiOverlay;
 
 class CommandSystem final : private NonCopyable {
 public:
-    static constexpr uint32_t framesInFlight = 2;
+    static constexpr uint32_t framesInFlight = 3;
 
-    CommandSystem(const VulkanContext& context, Swapchain& swapchain);
+    CommandSystem(const VulkanContext& context, Swapchain& swapchain, bool disableAsyncCompute = false, bool singleQueueFallback = false);
     ~CommandSystem();
 
     void setResourceDemo(ResourceDemo* demo) { resourceDemo_ = demo; }
     void setPipelineDemo(PipelineDemo* demo) { pipelineDemo_ = demo; }
     void setPathTracer(PathTracerRenderer* renderer) { pathTracer_ = renderer; }
     void setUiOverlay(UiOverlay* overlay) { uiOverlay_ = overlay; }
+    void setHeadless(bool headless) { headless_ = headless; }
     void drawFrame(float clearPhase, float deltaSeconds);
     void waitIdle() const;
 
@@ -35,6 +36,9 @@ private:
     struct FrameResources {
         VkCommandPool commandPool = VK_NULL_HANDLE;
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkCommandBuffer postCommandBuffer = VK_NULL_HANDLE;
+        VkCommandPool computeCommandPool = VK_NULL_HANDLE;
+        VkCommandBuffer computeCommandBuffer = VK_NULL_HANDLE;
         VkSemaphore imageAvailable = VK_NULL_HANDLE;
         VkFence inFlight = VK_NULL_HANDLE;
     };
@@ -44,7 +48,12 @@ private:
     void destroyFrameResources();
     void destroyPresentSemaphores();
     void recreateSwapchainResources();
-    void recordClearCommands(VkCommandBuffer commandBuffer, uint32_t imageIndex, float clearPhase) const;
+    void waitForFrameFences() const;
+    [[nodiscard]] bool canRecordAsyncCompute() const;
+    [[nodiscard]] bool recordAsyncComputeCommands(FrameResources& frame) const;
+    void submitFrame(FrameResources& frame, uint32_t imageIndex, bool asyncComputeRecorded) const;
+    void recordWorkCommands(VkCommandBuffer commandBuffer, uint32_t imageIndex, float clearPhase) const;
+    void recordPresentationCommands(VkCommandBuffer commandBuffer, uint32_t imageIndex, float clearPhase) const;
     void transitionImage(
         VkCommandBuffer commandBuffer,
         VkImage image,
@@ -57,12 +66,17 @@ private:
 
     const VulkanContext& context_;
     Swapchain& swapchain_;
+    bool headless_ = false;
+    bool asyncComputeEnabled_ = false;
+    uint32_t headlessImageIndex_ = 0;
     ResourceDemo* resourceDemo_ = nullptr;
     PipelineDemo* pipelineDemo_ = nullptr;
     PathTracerRenderer* pathTracer_ = nullptr;
     UiOverlay* uiOverlay_ = nullptr;
     std::array<FrameResources, framesInFlight> frames_{};
     std::vector<VkSemaphore> imageRenderFinished_;
+    mutable uint64_t asyncTimelineValue_ = 0;
+    mutable uint64_t asyncHistoryCompleteValue_ = 0;
     uint32_t frameIndex_ = 0;
 };
 

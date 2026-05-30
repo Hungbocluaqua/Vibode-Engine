@@ -1,0 +1,71 @@
+{
+  "version": 2,
+  "sourceGltf": "scenes/validation/gltf_extensions_phase42.gltf",
+  "sourceHdr": "",
+  "activeCamera": 1,
+  "environment": {
+    "hdrPath": "",
+    "intensity": 0.4,
+    "rotation": 0.0,
+    "backgroundIntensity": 0.3,
+    "enabled": true
+  },
+  "renderSettings": {
+    "pathTracingEnabled": true,
+    "directLightingEnabled": true,
+    "maxBounces": 3,
+    "environmentDirectSamples": 1,
+    "toneMapper": 3,
+    "exposure": 1.0,
+    "gamma": 2.2,
+    "denoiserEnabled": true,
+    "taaEnabled": true,
+    "debugView": 0,
+    "accumulate": true,
+    "accumulationLimit": 32,
+    "resolutionScale": 1.0
+  },
+  "entities": [
+    {
+      "id": {
+        "stable": 1
+      },
+      "name": "Validation Camera",
+      "transform": {
+        "position": [0.0, 0.4, 3.0],
+        "rotationEuler": [-0.1, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "camera": {
+        "verticalFovRadians": 0.785398,
+        "nearPlane": 0.01,
+        "farPlane": 1000.0,
+        "active": true,
+        "useRenderSettingsExposure": true
+      }
+    },
+    {
+      "id": {
+        "stable": 2
+      },
+      "name": "Extension Material Triangle",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotationEuler": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "meshRenderer": {
+        "mesh": 0,
+        "visible": true,
+        "castShadow": true,
+        "visibleToCamera": true,
+        "materialSlots": [
+          {
+            "name": "phase42_all_supported_extensions",
+            "material": 0
+          }
+        ]
+      }
+    }
+  ]
+}

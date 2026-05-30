@@ -9,27 +9,12 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <string>
 
 namespace rtv {
 
-namespace {
-
-void placeCreatedEntity(const EditorRuntimeState& state, Entity* entity) {
-    if (entity == nullptr || state.camera == nullptr) {
-        return;
-    }
-    glm::vec3 forward = state.camera->direction();
-    if (glm::dot(forward, forward) <= 0.0f) {
-        forward = glm::vec3(0.0f, 0.0f, -1.0f);
-    } else {
-        forward = glm::normalize(forward);
-    }
-    entity->transform.position = state.camera->position() + forward * 2.5f;
-    entity->transform.dirty = true;
-}
-
-} // namespace
+std::array<char, 256> SceneHierarchyPanel::renameBuffer_{};
 
 void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
     if (!ImGui::Begin("Scene Hierarchy")) {
@@ -42,29 +27,18 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
         SceneRegistry& registry = document.registry();
 
         if (ImGui::Button("Create Empty")) {
-            const EntityId id = registry.createEntity("Entity");
-            placeCreatedEntity(state, registry.entity(id));
-            selection.selectEntity(id);
+            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty};
             requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
         }
         ImGui::SameLine();
         if (ImGui::Button("Camera")) {
-            const EntityId id = registry.createEntity("Camera");
-            placeCreatedEntity(state, registry.entity(id));
-            Camera camera;
-            camera.active = true;
-            registry.addCamera(id, camera);
-            document.setActiveCamera(id);
-            selection.selectEntity(id);
-            requests.sceneUpdate = SceneUpdateKind::CameraOnly;
+            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera};
+            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
         }
         ImGui::SameLine();
         if (ImGui::Button("Light")) {
-            const EntityId id = registry.createEntity("Point Light");
-            placeCreatedEntity(state, registry.entity(id));
-            registry.addLight(id, Light{});
-            selection.selectEntity(id);
-            requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
+            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
         }
 
         ImGui::Separator();
@@ -75,6 +49,18 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
             return static_cast<char>(std::tolower(ch));
         });
         ImGui::Separator();
+
+        const EntityId selectedEntity = selection.entityId();
+        if (selectedEntity.valid() && registry.contains(selectedEntity) && selectedEntity != lastSelectionForReveal_) {
+            lastSelectionForReveal_ = selectedEntity;
+            pendingRevealSelection_ = selectedEntity;
+            lastScrolledSelection_ = {};
+        }
+        if (!selectedEntity.valid() || !registry.contains(selectedEntity)) {
+            pendingRevealSelection_ = {};
+            lastSelectionForReveal_ = {};
+        }
+
         for (Entity* entity : registry.entities()) {
             if (entity->parent.valid()) {
                 continue;
@@ -186,15 +172,26 @@ bool SceneHierarchyPanel::entityContainsFilter(const SceneRegistry& registry, co
     return false;
 }
 
+void recurseFlatten(SceneRegistry& registry, const Entity& entity, std::vector<EntityId>& out) {
+    out.push_back(entity.id);
+    for (EntityId childId : entity.children) {
+        const Entity* child = registry.entity(childId);
+        if (child != nullptr) {
+            recurseFlatten(registry, *child, out);
+        }
+    }
+}
+
 void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity, EditorSelection& selection, EditorRequests& requests, const std::string& filter) {
     if (!entityContainsFilter(registry, entity, filter)) {
         return;
     }
     const EntityId selected = selection.entityId();
     const bool containsSelection = entityContainsSelection(registry, entity, selected);
-    if (containsSelection && entity.id != selected) {
-        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
-    }
+    const bool revealPending = pendingRevealSelection_.valid() && containsSelection;
+    const bool forceOpenForReveal =
+        (containsSelection && entity.id != selected) ||
+        (revealPending && entity.id == selected && !entity.children.empty());
 
     std::string label;
     if (entity.meshRenderer.has_value()) {
@@ -203,11 +200,38 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
     if (entity.light.has_value()) {
         label += "[L] ";
     }
+    if (entity.sun.has_value()) {
+        label += "[S] ";
+    }
     if (entity.camera.has_value()) {
         label += "[C] ";
     }
     label += entity.name.empty() ? "Entity" : entity.name;
     label += "##entity" + std::to_string(entity.id.index) + "_" + std::to_string(entity.id.generation);
+
+    if (renameTarget_.has_value() && *renameTarget_ == entity.id) {
+        ImGui::SetKeyboardFocusHere();
+        const size_t len = std::min(entity.name.size(), renameBuffer_.size() - 1);
+        std::memcpy(renameBuffer_.data(), entity.name.c_str(), len);
+        renameBuffer_[len] = '\0';
+        ImGui::PushItemWidth(-1.0f);
+        const bool confirm = ImGui::InputText("##renameInput", renameBuffer_.data(), renameBuffer_.size(),
+            ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+        ImGui::PopItemWidth();
+        const bool loseFocus = ImGui::IsItemDeactivated();
+        if (confirm || loseFocus) {
+            std::string newName(renameBuffer_.data());
+            if (!newName.empty()) {
+                entity.name = newName;
+                requests.sceneUpdate = SceneUpdateKind::TransformOnly;
+            }
+            renameTarget_.reset();
+            renameBuffer_.fill('\0');
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            renameTarget_.reset();
+            renameBuffer_.fill('\0');
+        }
+    }
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
     if (entity.children.empty()) {
@@ -226,8 +250,8 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
         ImGui::SetTooltip("%s", locked ? "Locked" : "Unlocked");
     }
     ImGui::SameLine();
-    if (entity.meshRenderer.has_value()) {
-        bool visible = entity.meshRenderer->visible;
+    {
+        bool visible = entity.visible;
         ImGui::BeginDisabled(entity.locked);
         if (ImGui::Checkbox("##visible", &visible)) {
             requests.setEntityVisibility = EditorEntityBoolChange{.entity = entity.id, .value = visible};
@@ -239,14 +263,69 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
         ImGui::SameLine();
     }
     ImGui::PopID();
+    if (forceOpenForReveal) {
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    }
     const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+    if (!entity.locked) {
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+            ImGui::SetDragDropPayload("ENTITY", &entity.id, sizeof(entity.id));
+            ImGui::Text("Reparent %s", entity.name.empty() ? "Entity" : entity.name.c_str());
+            ImGui::EndDragDropSource();
+        }
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::AcceptDragDropPayload("ENTITY")) {
+                const EntityId sourceId = *static_cast<const EntityId*>(payload->Data);
+                if (sourceId.valid() && sourceId != entity.id) {
+                    EntityId ancestor = entity.id;
+                    bool valid = true;
+                    while (ancestor.valid()) {
+                        if (ancestor == sourceId) { valid = false; break; }
+                        const Entity* anc = registry.entity(ancestor);
+                        ancestor = anc ? anc->parent : EntityId{};
+                    }
+                    if (valid) {
+                        requests.reparentEntity = std::make_pair(sourceId, entity.id);
+                        requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                    }
+                }
+            }
+            if (const auto* payload = ImGui::AcceptDragDropPayload("MATERIAL")) {
+                const uint32_t materialId = *static_cast<const uint32_t*>(payload->Data);
+                if (entity.meshRenderer.has_value() && materialId < UINT32_MAX) {
+                    requests.materialAssignment = EditorMaterialAssignment{
+                        .mesh = entity.meshRenderer->mesh,
+                        .primitiveIndex = UINT32_MAX,
+                        .material = MaterialAssetHandle{materialId},
+                    };
+                    requests.sceneUpdate = SceneUpdateKind::MaterialOnly;
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+    }
     if (!entity.locked && ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-        selection.selectEntity(entity.id);
+        if (ImGui::GetIO().KeyCtrl) {
+            selection.toggleEntity(entity.id);
+        } else if (ImGui::GetIO().KeyShift && selection.lastClickedId().valid()) {
+            std::vector<EntityId> flattened;
+            for (Entity* root : registry.entities()) {
+                if (!root->parent.valid()) {
+                    recurseFlatten(registry, *root, flattened);
+                }
+            }
+            selection.selectRangeFromFlattenedList(flattened, entity.id);
+        } else {
+            selection.selectEntity(entity.id);
+        }
     }
     if (ImGui::BeginPopupContextItem()) {
         if (ImGui::MenuItem("Duplicate")) {
             requests.duplicateEntity = entity.id;
             requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+        }
+        if (ImGui::MenuItem("Rename")) {
+            renameTarget_ = entity.id;
         }
         if (ImGui::MenuItem("Delete")) {
             requests.deleteEntity = entity.id;
@@ -254,42 +333,16 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
         }
         if (ImGui::BeginMenu("Create Child")) {
             if (ImGui::MenuItem("Empty")) {
-                const EntityId parentId = entity.id;
-                const EntityId childId = registry.createEntity("Entity");
-                if (Entity* child = registry.entity(childId)) {
-                    child->parent = parentId;
-                    if (Entity* parent = registry.entity(parentId)) {
-                        parent->children.push_back(childId);
-                    }
-                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
-                    selection.selectEntity(childId);
-                }
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty, .parent = entity.id};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
             }
             if (ImGui::MenuItem("Camera")) {
-                const EntityId parentId = entity.id;
-                const EntityId childId = registry.createEntity("Camera");
-                if (Entity* child = registry.entity(childId)) {
-                    child->parent = parentId;
-                    if (Entity* parent = registry.entity(parentId)) {
-                        parent->children.push_back(childId);
-                    }
-                    child->camera = Camera{};
-                    requests.sceneUpdate = SceneUpdateKind::CameraOnly;
-                    selection.selectEntity(childId);
-                }
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera, .parent = entity.id};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
             }
             if (ImGui::MenuItem("Light")) {
-                const EntityId parentId = entity.id;
-                const EntityId childId = registry.createEntity("Point Light");
-                if (Entity* child = registry.entity(childId)) {
-                    child->parent = parentId;
-                    if (Entity* parent = registry.entity(parentId)) {
-                        parent->children.push_back(childId);
-                    }
-                    child->light = Light{};
-                    requests.sceneUpdate = SceneUpdateKind::LightOnly;
-                    selection.selectEntity(childId);
-                }
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light, .parent = entity.id};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
             }
             ImGui::EndMenu();
         }
@@ -309,9 +362,12 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
         }
         ImGui::EndPopup();
     }
-    if (selected == entity.id && lastScrolledSelection_ != selected) {
+    if (selected == entity.id && (lastScrolledSelection_ != selected || pendingRevealSelection_ == selected)) {
         ImGui::SetScrollHereY(0.25f);
         lastScrolledSelection_ = selected;
+        if (pendingRevealSelection_ == selected) {
+            pendingRevealSelection_ = {};
+        }
     }
     if (open && !entity.children.empty()) {
         for (EntityId childId : entity.children) {

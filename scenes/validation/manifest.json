@@ -2,6 +2,12 @@
   "version": 1,
   "scenes": [
     {
+      "name": "Cornell",
+      "category": "Basic",
+      "path": "cornell.rtlevel",
+      "referenceChecksum": "pending-reference-cornell"
+    },
+    {
       "name": "Transform Stress",
       "category": "AS refit",
       "path": "transform_stress.rtlevel",

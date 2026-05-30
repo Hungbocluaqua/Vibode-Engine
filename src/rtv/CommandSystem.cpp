@@ -11,11 +11,18 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 
 namespace rtv {
 
-CommandSystem::CommandSystem(const VulkanContext& context, Swapchain& swapchain)
-    : context_(context), swapchain_(swapchain) {
+CommandSystem::CommandSystem(const VulkanContext& context, Swapchain& swapchain, bool disableAsyncCompute, bool singleQueueFallback)
+    : context_(context),
+      swapchain_(swapchain),
+      asyncComputeEnabled_(!disableAsyncCompute && !singleQueueFallback &&
+          context.computeQueue() != VK_NULL_HANDLE &&
+          context.hasIndependentComputeQueue() &&
+          context.queueFamilies().compute.has_value() &&
+          context.supportsTimelineSemaphore()) {
     createFrameResources();
     createPresentSemaphores();
     if (uiOverlay_ != nullptr) {
@@ -34,68 +41,66 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     checkVk(vkWaitForFences(context_.device(), 1, &frame.inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
 
     uint32_t imageIndex = 0;
-    VkResult acquireResult = vkAcquireNextImageKHR(
-        context_.device(),
-        swapchain_.handle(),
-        UINT64_MAX,
-        frame.imageAvailable,
-        VK_NULL_HANDLE,
-        &imageIndex);
+    VkResult acquireResult = VK_SUCCESS;
 
-    if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
-        recreateSwapchainResources();
-        return;
+    if (headless_) {
+        imageIndex = headlessImageIndex_;
+        headlessImageIndex_ = (headlessImageIndex_ + 1) % swapchain_.imageCount();
+    } else {
+        acquireResult = vkAcquireNextImageKHR(
+            context_.device(),
+            swapchain_.handle(),
+            UINT64_MAX,
+            frame.imageAvailable,
+            VK_NULL_HANDLE,
+            &imageIndex);
+
+        if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+            recreateSwapchainResources();
+            return;
+        }
+        checkVk(acquireResult, "vkAcquireNextImageKHR");
     }
-    checkVk(acquireResult, "vkAcquireNextImageKHR");
 
     checkVk(vkResetFences(context_.device(), 1, &frame.inFlight), "vkResetFences");
     checkVk(vkResetCommandPool(context_.device(), frame.commandPool, 0), "vkResetCommandPool");
+    if (frame.computeCommandPool != VK_NULL_HANDLE) {
+        checkVk(vkResetCommandPool(context_.device(), frame.computeCommandPool, 0), "vkResetCommandPool(compute)");
+    }
     if (pathTracer_ != nullptr) {
-        VkExtent2D renderExtent = swapchain_.extent();
+        pathTracer_->refreshMemoryPressureQuality();
+        VkExtent2D displayExtent = swapchain_.extent();
         if (uiOverlay_ != nullptr) {
-            renderExtent = uiOverlay_->desiredRenderExtent(renderExtent);
+            displayExtent = uiOverlay_->desiredRenderExtent(displayExtent);
         }
-        const float scale = pathTracer_->settings().renderResolutionScale;
+        const float scale = pathTracer_->effectiveRenderResolutionScale();
+        VkExtent2D renderExtent = displayExtent;
         renderExtent.width = std::max(1u, static_cast<uint32_t>(static_cast<float>(renderExtent.width) * scale));
         renderExtent.height = std::max(1u, static_cast<uint32_t>(static_cast<float>(renderExtent.height) * scale));
         const VkExtent2D currentRenderExtent = pathTracer_->renderExtent();
+        const VkExtent2D currentDisplayExtent = pathTracer_->displayExtent();
         if (uiOverlay_ != nullptr &&
-            currentRenderExtent.width != 0 &&
-            (currentRenderExtent.width != renderExtent.width || currentRenderExtent.height != renderExtent.height)) {
-            checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(editor viewport resize)");
+            (currentRenderExtent.width != 0 || currentDisplayExtent.width != 0) &&
+            (currentRenderExtent.width != renderExtent.width ||
+             currentRenderExtent.height != renderExtent.height ||
+             currentDisplayExtent.width != displayExtent.width ||
+             currentDisplayExtent.height != displayExtent.height)) {
             uiOverlay_->invalidateViewportTexture();
         }
         pathTracer_->setFrameDeltaSeconds(deltaSeconds);
-        pathTracer_->beginFrame(frameIndex_, renderExtent);
+        pathTracer_->beginFrame(frameIndex_, renderExtent, displayExtent);
     } else if (pipelineDemo_ != nullptr) {
         pipelineDemo_->beginFrame(frameIndex_);
     }
-    recordClearCommands(frame.commandBuffer, imageIndex, clearPhase);
+    recordWorkCommands(frame.commandBuffer, imageIndex, clearPhase);
+    const bool asyncComputeRecorded = recordAsyncComputeCommands(frame);
+    recordPresentationCommands(frame.postCommandBuffer, imageIndex, clearPhase);
+    submitFrame(frame, imageIndex, asyncComputeRecorded);
 
-    VkCommandBufferSubmitInfo commandBufferInfo{};
-    commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    commandBufferInfo.commandBuffer = frame.commandBuffer;
-
-    VkSemaphoreSubmitInfo waitInfo{};
-    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    waitInfo.semaphore = frame.imageAvailable;
-    waitInfo.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    VkSemaphoreSubmitInfo signalInfo{};
-    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    signalInfo.semaphore = imageRenderFinished_.at(imageIndex);
-    signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
-
-    VkSubmitInfo2 submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    submitInfo.waitSemaphoreInfoCount = 1;
-    submitInfo.pWaitSemaphoreInfos = &waitInfo;
-    submitInfo.commandBufferInfoCount = 1;
-    submitInfo.pCommandBufferInfos = &commandBufferInfo;
-    submitInfo.signalSemaphoreInfoCount = 1;
-    submitInfo.pSignalSemaphoreInfos = &signalInfo;
-
-    checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &submitInfo, frame.inFlight), "vkQueueSubmit2");
+    if (headless_) {
+        frameIndex_ = (frameIndex_ + 1) % framesInFlight;
+        return;
+    }
 
     VkSwapchainKHR swapchainHandle = swapchain_.handle();
     VkPresentInfoKHR presentInfo{};
@@ -118,7 +123,21 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
 
 void CommandSystem::waitIdle() const {
     if (context_.device() != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(context_.device());
+        std::cerr << "Device idle wait: CommandSystem shutdown/diagnostic drain\n";
+        checkVk(vkDeviceWaitIdle(context_.device()), "vkDeviceWaitIdle(CommandSystem)");
+    }
+}
+
+void CommandSystem::waitForFrameFences() const {
+    std::array<VkFence, framesInFlight> fences{};
+    uint32_t count = 0;
+    for (const FrameResources& frame : frames_) {
+        if (frame.inFlight != VK_NULL_HANDLE) {
+            fences[count++] = frame.inFlight;
+        }
+    }
+    if (count > 0) {
+        checkVk(vkWaitForFences(context_.device(), count, fences.data(), VK_TRUE, UINT64_MAX), "vkWaitForFences(CommandSystem frames)");
     }
 }
 
@@ -136,6 +155,24 @@ void CommandSystem::createFrameResources() {
         allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocateInfo.commandBufferCount = 1;
         checkVk(vkAllocateCommandBuffers(context_.device(), &allocateInfo, &frame.commandBuffer), "vkAllocateCommandBuffers");
+        checkVk(vkAllocateCommandBuffers(context_.device(), &allocateInfo, &frame.postCommandBuffer), "vkAllocateCommandBuffers(post)");
+
+        if (asyncComputeEnabled_) {
+            VkCommandPoolCreateInfo computePoolInfo{};
+            computePoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            computePoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            computePoolInfo.queueFamilyIndex = context_.queueFamilies().compute.value();
+            checkVk(vkCreateCommandPool(context_.device(), &computePoolInfo, nullptr, &frame.computeCommandPool),
+                    "vkCreateCommandPool(compute)");
+
+            VkCommandBufferAllocateInfo computeAllocateInfo{};
+            computeAllocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            computeAllocateInfo.commandPool = frame.computeCommandPool;
+            computeAllocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            computeAllocateInfo.commandBufferCount = 1;
+            checkVk(vkAllocateCommandBuffers(context_.device(), &computeAllocateInfo, &frame.computeCommandBuffer),
+                    "vkAllocateCommandBuffers(compute)");
+        }
 
         VkSemaphoreCreateInfo semaphoreInfo{};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -168,6 +205,9 @@ void CommandSystem::destroyFrameResources() {
         if (frame.commandPool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(context_.device(), frame.commandPool, nullptr);
         }
+        if (frame.computeCommandPool != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(context_.device(), frame.computeCommandPool, nullptr);
+        }
         frame = {};
     }
 }
@@ -182,17 +222,35 @@ void CommandSystem::destroyPresentSemaphores() {
 }
 
 void CommandSystem::recreateSwapchainResources() {
-    waitIdle();
+    if (headless_) {
+        return;
+    }
+    waitForFrameFences();
     destroyPresentSemaphores();
     swapchain_.recreate();
     createPresentSemaphores();
 }
 
-void CommandSystem::recordClearCommands(VkCommandBuffer commandBuffer, uint32_t imageIndex, float clearPhase) const {
+void CommandSystem::recordWorkCommands(VkCommandBuffer commandBuffer, uint32_t, float clearPhase) const {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     checkVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+
+    if (pathTracer_ != nullptr) {
+        pathTracer_->recordPathTrace(commandBuffer, canRecordAsyncCompute());
+    } else if (pipelineDemo_ != nullptr) {
+        pipelineDemo_->recordCompute(commandBuffer, clearPhase);
+    }
+
+    checkVk(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+}
+
+void CommandSystem::recordPresentationCommands(VkCommandBuffer commandBuffer, uint32_t imageIndex, float clearPhase) const {
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    checkVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer(post)");
 
     const VkImage swapchainImage = swapchain_.image(imageIndex);
     transitionImage(
@@ -204,12 +262,6 @@ void CommandSystem::recordClearCommands(VkCommandBuffer commandBuffer, uint32_t 
         VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-
-    if (pathTracer_ != nullptr) {
-        pathTracer_->recordPathTrace(commandBuffer);
-    } else if (pipelineDemo_ != nullptr) {
-        pipelineDemo_->recordCompute(commandBuffer, clearPhase);
-    }
 
     const float pulse = 0.5f + 0.5f * std::sin(clearPhase * 0.7f);
     VkClearValue clearValue{};
@@ -269,24 +321,156 @@ void CommandSystem::recordClearCommands(VkCommandBuffer commandBuffer, uint32_t 
             commandBuffer,
             swapchainImage,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            !headless_ ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_BLIT_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_NONE,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             VK_ACCESS_2_NONE);
     } else {
         transitionImage(
             commandBuffer,
             swapchainImage,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            !headless_ ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_NONE,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             VK_ACCESS_2_NONE);
     }
 
-    checkVk(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+    checkVk(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer(post)");
+}
+
+bool CommandSystem::canRecordAsyncCompute() const {
+    return asyncComputeEnabled_ &&
+        pathTracer_ != nullptr &&
+        context_.computeQueue() != VK_NULL_HANDLE &&
+        context_.hasIndependentComputeQueue() &&
+        context_.timelineSemaphore() != VK_NULL_HANDLE;
+}
+
+bool CommandSystem::recordAsyncComputeCommands(FrameResources& frame) const {
+    if (!canRecordAsyncCompute() || frame.computeCommandBuffer == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    checkVk(vkBeginCommandBuffer(frame.computeCommandBuffer, &beginInfo), "vkBeginCommandBuffer(compute)");
+    const bool recorded = pathTracer_->recordAsyncComputeWork(frame.computeCommandBuffer);
+    checkVk(vkEndCommandBuffer(frame.computeCommandBuffer), "vkEndCommandBuffer(compute)");
+    return recorded;
+}
+
+void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool asyncComputeRecorded) const {
+    VkCommandBufferSubmitInfo workCommand{};
+    workCommand.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    workCommand.commandBuffer = frame.commandBuffer;
+
+    VkCommandBufferSubmitInfo postCommand{};
+    postCommand.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    postCommand.commandBuffer = frame.postCommandBuffer;
+
+    std::array<VkSemaphoreSubmitInfo, 2> graphicsWaits{};
+    uint32_t graphicsWaitCount = 0;
+    if (asyncHistoryCompleteValue_ != 0) {
+        VkSemaphoreSubmitInfo& wait = graphicsWaits[graphicsWaitCount++];
+        wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        wait.semaphore = context_.timelineSemaphore();
+        wait.value = asyncHistoryCompleteValue_;
+        wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    }
+    if (!headless_) {
+        VkSemaphoreSubmitInfo& wait = graphicsWaits[graphicsWaitCount++];
+        wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        wait.semaphore = frame.imageAvailable;
+        wait.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    }
+
+    std::array<VkSemaphoreSubmitInfo, 2> graphicsSignals{};
+    uint32_t graphicsSignalCount = 0;
+    uint64_t graphicsTimelineValue = 0;
+    if (asyncComputeRecorded) {
+        graphicsTimelineValue = ++asyncTimelineValue_;
+        VkSemaphoreSubmitInfo& signal = graphicsSignals[graphicsSignalCount++];
+        signal.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        signal.semaphore = context_.timelineSemaphore();
+        signal.value = graphicsTimelineValue;
+        signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    } else if (!headless_) {
+        VkSemaphoreSubmitInfo& signal = graphicsSignals[graphicsSignalCount++];
+        signal.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        signal.semaphore = imageRenderFinished_.at(imageIndex);
+        signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    }
+
+    std::array<VkCommandBufferSubmitInfo, 2> graphicsCommands{workCommand, postCommand};
+
+    VkSubmitInfo2 graphicsSubmit{};
+    graphicsSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    graphicsSubmit.waitSemaphoreInfoCount = graphicsWaitCount;
+    graphicsSubmit.pWaitSemaphoreInfos = graphicsWaitCount > 0 ? graphicsWaits.data() : nullptr;
+    graphicsSubmit.commandBufferInfoCount = asyncComputeRecorded ? 1u : static_cast<uint32_t>(graphicsCommands.size());
+    graphicsSubmit.pCommandBufferInfos = graphicsCommands.data();
+    graphicsSubmit.signalSemaphoreInfoCount = graphicsSignalCount;
+    graphicsSubmit.pSignalSemaphoreInfos = graphicsSignalCount > 0 ? graphicsSignals.data() : nullptr;
+
+    if (!asyncComputeRecorded) {
+        checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &graphicsSubmit, frame.inFlight), "vkQueueSubmit2(graphics)");
+        return;
+    }
+
+    checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &graphicsSubmit, VK_NULL_HANDLE), "vkQueueSubmit2(graphics async producer)");
+
+    const uint64_t computeTimelineValue = ++asyncTimelineValue_;
+    VkSemaphoreSubmitInfo computeWait{};
+    computeWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    computeWait.semaphore = context_.timelineSemaphore();
+    computeWait.value = graphicsTimelineValue;
+    computeWait.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
+    VkSemaphoreSubmitInfo computeSignal{};
+    computeSignal.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    computeSignal.semaphore = context_.timelineSemaphore();
+    computeSignal.value = computeTimelineValue;
+    computeSignal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkCommandBufferSubmitInfo computeCommand{};
+    computeCommand.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    computeCommand.commandBuffer = frame.computeCommandBuffer;
+
+    VkSubmitInfo2 computeSubmit{};
+    computeSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    computeSubmit.waitSemaphoreInfoCount = 1;
+    computeSubmit.pWaitSemaphoreInfos = &computeWait;
+    computeSubmit.commandBufferInfoCount = 1;
+    computeSubmit.pCommandBufferInfos = &computeCommand;
+    computeSubmit.signalSemaphoreInfoCount = 1;
+    computeSubmit.pSignalSemaphoreInfos = &computeSignal;
+    checkVk(vkQueueSubmit2(context_.computeQueue(), 1, &computeSubmit, VK_NULL_HANDLE), "vkQueueSubmit2(compute)");
+
+    VkSemaphoreSubmitInfo postWait{};
+    postWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    postWait.semaphore = context_.timelineSemaphore();
+    postWait.value = computeTimelineValue;
+    postWait.stageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+
+    VkSemaphoreSubmitInfo postSignal{};
+    postSignal.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    postSignal.semaphore = !headless_ ? imageRenderFinished_.at(imageIndex) : VK_NULL_HANDLE;
+    postSignal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkSubmitInfo2 postSubmit{};
+    postSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    postSubmit.waitSemaphoreInfoCount = 1;
+    postSubmit.pWaitSemaphoreInfos = &postWait;
+    postSubmit.commandBufferInfoCount = 1;
+    postSubmit.pCommandBufferInfos = &postCommand;
+    postSubmit.signalSemaphoreInfoCount = !headless_ ? 1u : 0u;
+    postSubmit.pSignalSemaphoreInfos = !headless_ ? &postSignal : nullptr;
+    checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &postSubmit, frame.inFlight), "vkQueueSubmit2(graphics async post)");
+    asyncHistoryCompleteValue_ = computeTimelineValue;
 }
 
 void CommandSystem::transitionImage(

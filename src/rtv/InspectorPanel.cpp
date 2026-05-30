@@ -42,14 +42,15 @@ void ensureMaterialSlots(MeshRenderer& renderer, const AssetManager* assets) {
 SceneUpdateKind transformUpdateKind(const SceneDocument& document, const Entity& entity) {
     const bool hasMesh = entity.meshRenderer.has_value();
     const bool hasLight = entity.light.has_value();
+    const bool hasSun = entity.sun.has_value();
     const bool hasActiveCamera = entity.camera.has_value() && document.activeCamera() == entity.id;
-    if ((hasLight && hasMesh) || (hasActiveCamera && hasMesh) || (hasActiveCamera && hasLight)) {
+    if (((hasLight || hasSun) && hasMesh) || (hasActiveCamera && hasMesh) || (hasActiveCamera && (hasLight || hasSun))) {
         return SceneUpdateKind::TopologyChanged;
     }
     if (hasActiveCamera) {
         return SceneUpdateKind::CameraOnly;
     }
-    if (hasLight) {
+    if (hasLight || hasSun) {
         return SceneUpdateKind::LightOnly;
     }
     return SceneUpdateKind::TransformOnly;
@@ -70,8 +71,23 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
     }
 
     const EditorSelectionId current = selection.current();
-    if (!current.valid()) {
+    const size_t selCount = selection.selectionCount();
+    if (!current.valid() && selCount == 0) {
         ImGui::TextDisabled("No selection");
+        ImGui::End();
+        return;
+    }
+
+    if (selCount > 1) {
+        ImGui::Text("%zu entities selected", selCount);
+        if (ImGui::Button("Delete Selected")) {
+            for (EntityId id : selection.selectedEntities()) {
+                requests.deleteEntity = id;
+            }
+        }
+        if (ImGui::Button("Clear Selection")) {
+            selection.clear();
+        }
         ImGui::End();
         return;
     }
@@ -150,6 +166,8 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         if (entity->camera.has_value()) {
             ImGui::SeparatorText("Camera");
             Camera& camera = *entity->camera;
+            const Camera oldCamera = camera;
+            const EntityId oldActiveCamera = document.activeCamera();
             bool changed = false;
             float fovDegrees = glm::degrees(camera.verticalFovRadians);
             if (ImGui::SliderFloat("Vertical FOV", &fovDegrees, 20.0f, 120.0f, "%.1f")) {
@@ -161,31 +179,75 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             if (ImGui::Checkbox("Active Camera", &camera.active)) {
                 if (camera.active) {
                     document.setActiveCamera(entity->id);
+                } else if (document.activeCamera() == entity->id) {
+                    document.setActiveCamera({});
                 }
                 changed = true;
             }
             if (changed) {
                 document.markDirty(SceneUpdateKind::CameraOnly);
                 requests.sceneUpdate = SceneUpdateKind::CameraOnly;
+                requests.setCamera = EditorCameraChange{
+                    .entity = entity->id,
+                    .oldCamera = oldCamera,
+                    .newCamera = camera,
+                    .oldActiveCamera = oldActiveCamera,
+                    .newActiveCamera = document.activeCamera(),
+                };
             }
         }
 
         if (entity->light.has_value()) {
             ImGui::SeparatorText("Light");
             Light& light = *entity->light;
+            const Light oldLight = light;
             bool changed = false;
             int lightType = static_cast<int>(light.type);
             if (ImGui::Combo("Type", &lightType, "Directional\0Point\0Area\0")) {
                 light.type = static_cast<LightType>(lightType);
+                if (light.type == LightType::Directional &&
+                    (oldLight.type != LightType::Directional || light.sizeOrRadius > 0.08f || light.sizeOrRadius <= 0.0f)) {
+                    light.sizeOrRadius = 0.00465f;
+                }
                 changed = true;
             }
             changed |= ImGui::Checkbox("Enabled", &light.enabled);
             changed |= ImGui::ColorEdit3("Color", glm::value_ptr(light.color));
             changed |= ImGui::DragFloat("Intensity", &light.intensity, 0.05f, 0.0f, 100000.0f, "%.2f");
-            changed |= ImGui::DragFloat("Size / Radius", &light.sizeOrRadius, 0.02f, 0.0f, 1000.0f, "%.3f");
+            if (light.type == LightType::Directional) {
+                changed |= ImGui::DragFloat("Angular Radius", &light.sizeOrRadius, 0.0001f, 0.0001f, 0.08f, "%.5f rad");
+            } else {
+                changed |= ImGui::DragFloat("Size / Radius", &light.sizeOrRadius, 0.02f, 0.0f, 1000.0f, "%.3f");
+            }
             if (changed) {
                 document.markDirty(SceneUpdateKind::LightOnly);
                 requests.sceneUpdate = SceneUpdateKind::LightOnly;
+                requests.setLight = EditorLightChange{
+                    .entity = entity->id,
+                    .oldLight = oldLight,
+                    .newLight = light,
+                };
+            }
+        }
+
+        if (entity->sun.has_value()) {
+            ImGui::SeparatorText("Primary Sun");
+            Sun& sun = *entity->sun;
+            const Sun oldSun = sun;
+            bool changed = false;
+            changed |= ImGui::Checkbox("Enabled", &sun.enabled);
+            changed |= ImGui::DragFloat("Illuminance", &sun.illuminanceLux, 100.0f, 0.0f, 200000.0f, "%.0f lux");
+            changed |= ImGui::DragFloat("Angular Radius", &sun.angularRadiusRadians, 0.0001f, 0.0001f, 0.08f, "%.5f rad");
+            changed |= ImGui::DragFloat("Color Temperature", &sun.colorTemperatureKelvin, 10.0f, 1000.0f, 40000.0f, "%.0f K");
+            if (changed) {
+                document.setPrimarySun(entity->id);
+                document.markDirty(SceneUpdateKind::LightOnly);
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
+                requests.setSun = EditorSunChange{
+                    .entity = entity->id,
+                    .oldSun = oldSun,
+                    .newSun = sun,
+                };
             }
         }
 
@@ -250,31 +312,78 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 }
                 ImGui::TreePop();
             }
+            if (!renderer.materialSlots.empty() && state.assets != nullptr) {
+                const MaterialAssetHandle materialHandle = renderer.materialSlots.front().resolvedMaterial();
+                if (const MaterialAsset* source = state.assets->material(materialHandle)) {
+                    MaterialAsset edited = *source;
+                    bool materialChanged = false;
+                    ImGui::SeparatorText("Material");
+                    ImGui::Text("Material: %s", edited.name.empty() ? "(unnamed)" : edited.name.c_str());
+                    materialChanged |= ImGui::ColorEdit4("Base Color", glm::value_ptr(edited.baseColorFactor));
+                    materialChanged |= ImGui::SliderFloat("Metallic", &edited.metallicFactor, 0.0f, 1.0f, "%.3f");
+                    materialChanged |= ImGui::SliderFloat("Roughness", &edited.roughnessFactor, 0.0f, 1.0f, "%.3f");
+                    materialChanged |= ImGui::ColorEdit3("Emissive", glm::value_ptr(edited.emissiveFactor));
+                    int alphaMode = static_cast<int>(edited.alphaMode);
+                    if (ImGui::Combo("Alpha Mode", &alphaMode, "Opaque\0Mask\0Blend\0")) {
+                        edited.alphaMode = static_cast<uint32_t>(alphaMode);
+                        materialChanged = true;
+                    }
+                    bool doubleSided = edited.doubleSided != 0;
+                    if (ImGui::Checkbox("Double Sided", &doubleSided)) {
+                        edited.doubleSided = doubleSided ? 1u : 0u;
+                        materialChanged = true;
+                    }
+                    materialChanged |= ImGui::SliderFloat("Alpha Cutoff", &edited.alphaCutoff, 0.0f, 1.0f, "%.3f");
+                    if (materialChanged) {
+                        requests.materialUpdate = EditorMaterialUpdate{.materialId = materialHandle.index, .material = edited};
+                        requests.resetAccumulation = AccumulationResetReason::MaterialChanged;
+                        document.markDirty(SceneUpdateKind::MaterialOnly);
+                        requests.sceneUpdate = SceneUpdateKind::MaterialOnly;
+                    }
+                }
+            }
             if (changed) {
                 document.markDirty(SceneUpdateKind::VisibilityOnly);
                 requests.sceneUpdate = SceneUpdateKind::VisibilityOnly;
             }
         }
 
+        ImGui::SeparatorText("Add Component");
+        if (!entity->light.has_value()) {
+            if (ImGui::Button("Light")) {
+                requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::Light};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+            ImGui::SameLine();
+        }
+        if (!entity->sun.has_value()) {
+            if (ImGui::Button("Primary Sun")) {
+                requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::Sun};
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            }
+            ImGui::SameLine();
+        }
+        if (!entity->camera.has_value()) {
+            if (ImGui::Button("Camera")) {
+                requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::Camera};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+            ImGui::SameLine();
+        }
+        if (!entity->meshRenderer.has_value()) {
+            if (ImGui::Button("Mesh Renderer")) {
+                requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::MeshRenderer};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+        }
+        if (entity->light.has_value() || entity->sun.has_value() || entity->camera.has_value() || entity->meshRenderer.has_value()) {
+            ImGui::TextDisabled("All components attached");
+        }
+
         ImGui::Separator();
         if (ImGui::Button("Duplicate Entity")) {
-            const Entity source = *entity;
-            const EntityId copyId = document.registry().createEntity(source.name.empty() ? "Entity Copy" : source.name + " Copy");
-            if (Entity* copy = document.registry().entity(copyId)) {
-                copy->transform = source.transform;
-                copy->transform.dirty = true;
-                copy->meshRenderer = source.meshRenderer;
-                copy->light = source.light;
-                copy->camera = source.camera;
-                if (copy->camera.has_value()) {
-                    copy->camera->active = false;
-                }
-                document.markDirty(copy->meshRenderer.has_value() ? SceneUpdateKind::TopologyChanged :
-                    (copy->light.has_value() ? SceneUpdateKind::LightOnly :
-                        (copy->camera.has_value() ? SceneUpdateKind::CameraOnly : SceneUpdateKind::TopologyChanged)));
-                requests.sceneUpdate = document.pendingUpdate();
-                selection.selectEntity(copyId);
-            }
+            requests.duplicateEntity = entity->id;
+            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
         }
         ImGui::SameLine();
         if (ImGui::Button("Delete Entity")) {
@@ -284,16 +393,12 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             ImGui::Text("Delete '%s'?", entity->name.empty() ? "Entity" : entity->name.c_str());
             if (ImGui::Button("Yes")) {
                 const EntityId deleted = entity->id;
-                if (document.activeCamera() == deleted) {
-                    document.setActiveCamera({});
-                }
-                if (document.registry().destroyEntity(deleted)) {
-                    selection.clear();
-                    document.markDirty(SceneUpdateKind::TopologyChanged);
-                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
-                }
+                requests.deleteEntity = deleted;
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                selection.clear();
                 ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();
+                ImGui::EndDisabled();
                 ImGui::End();
                 return;
             }

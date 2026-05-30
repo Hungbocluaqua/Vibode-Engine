@@ -1,0 +1,305 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "temporal_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define MOMENT_TILE_RADIUS 1
+#define MOMENT_LOCAL_SIZE_X 16
+#define MOMENT_LOCAL_SIZE_Y 16
+#define MOMENT_SHARED_SIZE_X (MOMENT_LOCAL_SIZE_X + MOMENT_TILE_RADIUS * 2)
+#define MOMENT_SHARED_SIZE_Y (MOMENT_LOCAL_SIZE_Y + MOMENT_TILE_RADIUS * 2)
+#define MOMENT_SHARED_COUNT (MOMENT_SHARED_SIZE_X * MOMENT_SHARED_SIZE_Y)
+
+shared uvec4 shared_dn_tile[MOMENT_SHARED_COUNT];
+
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
+layout(set = 0, binding = 1, rg16f) readonly uniform image2D prev_direct_diffuse_moments;
+layout(set = 0, binding = 2, rg16f) readonly uniform image2D prev_direct_specular_moments;
+layout(set = 0, binding = 3, rg16f) readonly uniform image2D prev_indirect_diffuse_moments;
+layout(set = 0, binding = 4, rg16f) readonly uniform image2D prev_indirect_specular_moments;
+layout(set = 0, binding = 5, rgba16ui) readonly uniform uimage2D prev_history_length;
+layout(set = 0, binding = 6, rg16f) writeonly uniform image2D out_direct_diffuse_moments;
+layout(set = 0, binding = 7, rg16f) writeonly uniform image2D out_direct_specular_moments;
+layout(set = 0, binding = 8, rg16f) writeonly uniform image2D out_indirect_diffuse_moments;
+layout(set = 0, binding = 9, rg16f) writeonly uniform image2D out_indirect_specular_moments;
+layout(set = 0, binding = 10, rgba16ui) writeonly uniform uimage2D out_history_length;
+layout(set = 0, binding = 17, rgba16f) writeonly uniform image2D out_moment_debug;
+
+layout(set = 0, binding = 11, std140) uniform MomentParams {
+    uint reset_history;
+    uint frames_since_reset;
+    uint width;
+    uint height;
+    uint max_history_length;
+    float adaptive_alpha_floor;
+    float adaptive_alpha_ceiling;
+    float variance_scale;
+    float validity_threshold;
+} moment_params;
+
+layout(set = 0, binding = 12, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+layout(set = 0, binding = 13, std430) readonly buffer PrevWorldPosition { uvec2 prev_world_position[]; };
+layout(set = 0, binding = 14, std140) uniform PrevCamera {
+    mat4 view_proj;
+    mat4 inv_view_proj;
+    mat4 prev_view_proj;
+    vec4 current_pos;
+    vec4 prev_pos;
+    vec4 jitter;
+} prev_camera;
+layout(set = 0, binding = 15, std430) readonly buffer InputDepthNormal { uvec4 input_depth_normal[]; };
+layout(set = 0, binding = 16, std430) readonly buffer WorldPosition { uvec2 world_position[]; };
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+bool is_surface_depth(float depth) {
+    return depth < 1.0e9;
+}
+
+vec2 unpack_unorm2x16(uint packedValue) {
+    return vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
+}
+
+vec2 unpack_snorm2x16(uint packedValue) {
+    return unpack_unorm2x16(packedValue) * 2.0 - vec2(1.0);
+}
+
+vec3 decode_octahedral_normal(uint packedValue) {
+    vec2 f = unpack_snorm2x16(packedValue);
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+vec4 decode_depth_normal(uvec4 packedValue) {
+    return vec4(uintBitsToFloat(packedValue.x), decode_octahedral_normal(packedValue.y));
+}
+
+vec3 decode_world_position(uvec2 packedValue, vec3 origin) {
+    if (packedValue.x == 0u && packedValue.y == 0u) {
+        return vec3(0.0, 1.0e10, 0.0);
+    }
+    vec2 xy = unpack_snorm2x16(packedValue.x);
+    float z = unpack_snorm2x16(packedValue.y).x;
+    return origin + vec3(xy.x, xy.y, z) * 8.0;
+}
+
+vec3 reconstruct_current_world_position(ivec2 coords, float depth, ivec2 dims) {
+    if (!is_surface_depth(depth)) {
+        return vec3(0.0, 1.0e10, 0.0);
+    }
+    vec2 uv = (vec2(coords) + vec2(0.5)) / vec2(dims);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 world_far = prev_camera.inv_view_proj * vec4(ndc, 1.0, 1.0);
+    if (abs(world_far.w) <= 1.0e-6) {
+        return decode_world_position(world_position[uint(coords.y) * uint(dims.x) + uint(coords.x)], prev_camera.current_pos.xyz);
+    }
+    vec3 ray_dir = world_far.xyz / world_far.w - prev_camera.current_pos.xyz;
+    if (dot(ray_dir, ray_dir) <= 1.0e-8) {
+        return decode_world_position(world_position[uint(coords.y) * uint(dims.x) + uint(coords.x)], prev_camera.current_pos.xyz);
+    }
+    return prev_camera.current_pos.xyz + normalize(ray_dir) * depth;
+}
+
+vec2 project_world_to_pixels(mat4 viewProj, vec3 worldPos, ivec2 dims) {
+    vec4 clip = viewProj * vec4(worldPos, 1.0);
+    if (clip.w <= 0.0) {
+        return vec2(-1.0);
+    }
+    vec3 ndc = clip.xyz / clip.w;
+    if (ndc.z < 0.0 || ndc.z > 1.0001) {
+        return vec2(-1.0);
+    }
+    return vec2(
+        (ndc.x * 0.5 + 0.5) * float(dims.x) - 0.5,
+        (ndc.y * 0.5 + 0.5) * float(dims.y) - 0.5);
+}
+
+vec2 project_world_to_history(vec3 worldPos, ivec2 dims) {
+    return project_world_to_pixels(prev_camera.prev_view_proj, worldPos, dims);
+}
+
+vec3 bilinear_prev_world(vec2 historyPos, ivec2 dims) {
+    ivec2 base = ivec2(floor(historyPos));
+    vec2 fracValue = fract(historyPos);
+    ivec2 p00 = clamp(base, ivec2(0), dims - ivec2(1));
+    if (fracValue.x <= 1.0e-5 && fracValue.y <= 1.0e-5) {
+        uint i00 = uint(p00.y) * uint(dims.x) + uint(p00.x);
+        return decode_world_position(prev_world_position[i00], prev_camera.prev_pos.xyz);
+    }
+    ivec2 p10 = clamp(base + ivec2(1, 0), ivec2(0), dims - ivec2(1));
+    ivec2 p01 = clamp(base + ivec2(0, 1), ivec2(0), dims - ivec2(1));
+    ivec2 p11 = clamp(base + ivec2(1, 1), ivec2(0), dims - ivec2(1));
+    uint i00 = uint(p00.y) * uint(dims.x) + uint(p00.x);
+    uint i10 = uint(p10.y) * uint(dims.x) + uint(p10.x);
+    uint i01 = uint(p01.y) * uint(dims.x) + uint(p01.x);
+    uint i11 = uint(p11.y) * uint(dims.x) + uint(p11.x);
+    vec3 w00 = decode_world_position(prev_world_position[i00], prev_camera.prev_pos.xyz);
+    vec3 w10 = decode_world_position(prev_world_position[i10], prev_camera.prev_pos.xyz);
+    vec3 w01 = decode_world_position(prev_world_position[i01], prev_camera.prev_pos.xyz);
+    vec3 w11 = decode_world_position(prev_world_position[i11], prev_camera.prev_pos.xyz);
+    return mix(mix(w00, w10, fracValue.x), mix(w01, w11, fracValue.x), fracValue.y);
+}
+
+int moment_shared_index(ivec2 tileCoords) {
+    return tileCoords.y * MOMENT_SHARED_SIZE_X + tileCoords.x;
+}
+
+vec2 welford_update(vec2 prev_moment, uint prev_n, float current_value) {
+    float n = float(prev_n);
+    float delta = current_value - prev_moment.x;
+    float new_mean = prev_moment.x + delta / max(n, 1.0);
+    float new_variance = prev_moment.y + delta * (current_value - new_mean);
+    return vec2(new_mean, new_variance);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(moment_params.width, moment_params.height);
+    ivec2 max_coords = max(dims - ivec2(1), ivec2(0));
+
+    ivec2 workgroup_origin = ivec2(gl_WorkGroupID.xy) * ivec2(MOMENT_LOCAL_SIZE_X, MOMENT_LOCAL_SIZE_Y);
+    uint local_linear = gl_LocalInvocationID.y * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint local_count = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    for (uint i = local_linear; i < uint(MOMENT_SHARED_COUNT); i += local_count) {
+        ivec2 tile_coords = ivec2(int(i) % MOMENT_SHARED_SIZE_X, int(i) / MOMENT_SHARED_SIZE_X);
+        ivec2 sample_coords = clamp(workgroup_origin + tile_coords - ivec2(MOMENT_TILE_RADIUS), ivec2(0), max_coords);
+        uint sample_index = uint(sample_coords.y) * uint(dims.x) + uint(sample_coords.x);
+        shared_dn_tile[i] = input_depth_normal[sample_index];
+    }
+    barrier();
+
+    if (coords.x >= dims.x || coords.y >= dims.y) {
+        return;
+    }
+
+    uint pixel_index = uint(coords.y) * uint(dims.x) + uint(coords.x);
+    vec4 center_dn = decode_depth_normal(shared_dn_tile[moment_shared_index(ivec2(gl_LocalInvocationID.xy) + ivec2(MOMENT_TILE_RADIUS))]);
+    float center_depth = center_dn.r;
+    vec3 center_normal = center_dn.gba;
+
+    PathDataRecord path = path_data_buffer[pixel_index];
+    float cur_dd_lum = luminance(max(path.direct_diffuse.rgb, vec3(0.0)));
+    float cur_ds_lum = luminance(max(path.direct_specular.rgb, vec3(0.0)));
+    float cur_id_lum = luminance(max(path.indirect_diffuse.rgb, vec3(0.0)));
+    float cur_is_lum = luminance(max(path.indirect_specular.rgb, vec3(0.0)));
+
+    bool reset = moment_params.reset_history != 0u;
+    bool sky = !is_surface_depth(center_depth);
+
+    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], 64.0);
+    vec2 velocity_history_pos = temporal_reproject_pixel(coords, velocity_pixels);
+    bool velocity_on_screen = temporal_history_pixel_valid(velocity_history_pos, dims, 0.0);
+
+    vec2 history_pos;
+    if (velocity_on_screen) {
+        history_pos = velocity_history_pos;
+    } else {
+        vec3 wp = reconstruct_current_world_position(coords, center_depth, dims);
+        history_pos = project_world_to_history(wp, dims);
+    }
+
+    bool on_screen = !reset && temporal_history_pixel_valid(history_pos, dims, 0.0);
+
+    float relative_pos_diff = 0.0;
+    float normal_cone_min = 1.0;
+    float max_relative_depth_delta = 0.0;
+
+    if (!sky && is_surface_depth(center_depth)) {
+        vec3 wp = reconstruct_current_world_position(coords, center_depth, dims);
+        vec3 reprojected_wp = bilinear_prev_world(history_pos, dims);
+        float pos_diff = length(wp - reprojected_wp);
+        relative_pos_diff = pos_diff / max(center_depth, 0.25);
+
+        for (int ky = -1; ky <= 1; ++ky) {
+            for (int kx = -1; kx <= 1; ++kx) {
+                ivec2 tile_coords = ivec2(gl_LocalInvocationID.xy) + ivec2(kx + MOMENT_TILE_RADIUS, ky + MOMENT_TILE_RADIUS);
+                int tile_index = moment_shared_index(tile_coords);
+                vec4 sample_dn = decode_depth_normal(shared_dn_tile[tile_index]);
+                float sample_depth = sample_dn.r;
+                vec3 sample_normal = sample_dn.gba;
+
+                if (is_surface_depth(sample_depth)) {
+                    float depth_diff = abs(sample_depth - center_depth) / max(center_depth, 0.01);
+                    max_relative_depth_delta = max(max_relative_depth_delta, depth_diff);
+                    float normal_dot = clamp(dot(sample_normal, center_normal), -1.0, 1.0);
+                    normal_cone_min = min(normal_cone_min, normal_dot);
+                }
+            }
+        }
+    }
+
+    bool border_reject = history_pos.x < 1.0 || history_pos.y < 1.0 ||
+        history_pos.x >= float(dims.x) - 2.0 || history_pos.y >= float(dims.y) - 2.0;
+
+    bool current_surface = is_surface_depth(center_depth);
+    vec3 reprojected_wp = bilinear_prev_world(history_pos, dims);
+    bool previous_sky = reprojected_wp.y > 9.0e9;
+    bool previous_surface = !previous_sky;
+    bool history_kind_valid = sky ? previous_sky : (current_surface && previous_surface);
+
+    float disocclusion_confidence = sky
+        ? (on_screen && history_kind_valid ? 1.0 : 0.0)
+        : temporal_disocclusion_confidence(
+            on_screen,
+            history_kind_valid,
+            relative_pos_diff,
+            normal_cone_min,
+            max_relative_depth_delta);
+
+    bool valid = !reset && !sky && !border_reject &&
+                 history_kind_valid &&
+                 disocclusion_confidence > moment_params.validity_threshold;
+
+    ivec2 hist_p00 = clamp(ivec2(floor(history_pos)), ivec2(0), dims - ivec2(1));
+
+    vec2 prev_dd = valid ? imageLoad(prev_direct_diffuse_moments, hist_p00).rg : vec2(cur_dd_lum, 0.0);
+    vec2 prev_ds = valid ? imageLoad(prev_direct_specular_moments, hist_p00).rg : vec2(cur_ds_lum, 0.0);
+    vec2 prev_id = valid ? imageLoad(prev_indirect_diffuse_moments, hist_p00).rg : vec2(cur_id_lum, 0.0);
+    vec2 prev_is = valid ? imageLoad(prev_indirect_specular_moments, hist_p00).rg : vec2(cur_is_lum, 0.0);
+
+    uvec4 prev_raw = valid ? imageLoad(prev_history_length, hist_p00) : uvec4(0u);
+    uint max_n = moment_params.max_history_length;
+
+    uint n_dd = valid ? min(prev_raw.x + 1u, max_n) : 1u;
+    uint n_ds = valid ? min(prev_raw.y + 1u, max_n) : 1u;
+    uint n_id = valid ? min(prev_raw.z + 1u, max_n) : 1u;
+    uint prev_n_is = prev_raw.w & 0x7FFFu;
+    uint n_is = valid ? min(prev_n_is + 1u, max_n) : 1u;
+
+    vec2 new_dd = welford_update(prev_dd, n_dd - 1u, cur_dd_lum);
+    vec2 new_ds = welford_update(prev_ds, n_ds - 1u, cur_ds_lum);
+    vec2 new_id = welford_update(prev_id, n_id - 1u, cur_id_lum);
+    vec2 new_is = welford_update(prev_is, n_is - 1u, cur_is_lum);
+
+    uint packed_is_validity = (n_is & 0x7FFFu) | (valid ? 0x8000u : 0u);
+
+    float debug_normal_cone = normal_cone_min * 0.5 + 0.5;
+    float debug_depth_delta = clamp(max_relative_depth_delta, 0.0, 1.0);
+    float debug_kind_valid = history_kind_valid ? 1.0 : 0.0;
+    imageStore(out_moment_debug, coords, vec4(
+        disocclusion_confidence,
+        debug_normal_cone,
+        debug_depth_delta,
+        debug_kind_valid));
+
+    imageStore(out_direct_diffuse_moments, coords, vec4(new_dd, 0.0, 0.0));
+    imageStore(out_direct_specular_moments, coords, vec4(new_ds, 0.0, 0.0));
+    imageStore(out_indirect_diffuse_moments, coords, vec4(new_id, 0.0, 0.0));
+    imageStore(out_indirect_specular_moments, coords, vec4(new_is, 0.0, 0.0));
+    imageStore(out_history_length, coords, uvec4(n_dd, n_ds, n_id, packed_is_validity));
+}

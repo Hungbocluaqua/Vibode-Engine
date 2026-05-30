@@ -1,0 +1,154 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer SourceRayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} source_queue;
+
+layout(set = 0, binding = 1, std430) buffer CompactRayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} compact_queue;
+
+layout(set = 0, binding = 2, std430) readonly buffer PixelStateBuffer {
+    WavefrontQueueHeader header;
+    WavefrontPixelState records[];
+} pixel_state;
+
+layout(set = 0, binding = 3, std430) buffer CompactValidationBuffer {
+    uvec4 counters;
+    uvec4 metrics;
+} validation;
+
+layout(set = 0, binding = 4, std430) buffer CompactDispatchBuffer {
+    uvec4 args;
+    uvec4 trace_args;
+} compact_dispatch;
+
+layout(push_constant) uniform PushConstants {
+    uint source_capacity;
+    uint compact_capacity;
+    uint pixel_capacity;
+    uint mode;
+    uint max_path_depth;
+    uint frame_index;
+    uint flags;
+    uint reserved0;
+} pc;
+
+const uint WAVEFRONT_FLAG_TERMINATED = 1u << 8u;
+const uint MODE_CLEAR = 0u;
+const uint MODE_COMPACT = 1u;
+const uint MODE_DISPATCH_ARGS = 2u;
+
+bool ray_is_finite(WavefrontRay ray) {
+    return all(not(isnan(ray.origin_tmin))) &&
+        all(not(isnan(ray.direction_tmax))) &&
+        all(not(isinf(ray.origin_tmin))) &&
+        all(not(isinf(ray.direction_tmax)));
+}
+
+bool live_secondary_ray(WavefrontRay ray) {
+    uint pixel_index = ray.pixel_depth_rng_flags.x;
+    uint depth = ray.pixel_depth_rng_flags.y;
+    uint flags = ray.pixel_depth_rng_flags.w;
+    vec3 direction = ray.direction_tmax.xyz;
+    bool valid_pixel = pixel_index < pc.pixel_capacity && pixel_index < pixel_state.header.counters.y;
+    bool valid_depth = depth > 0u && depth < max(pc.max_path_depth, 1u);
+    bool valid_ray = ray_is_finite(ray) && dot(direction, direction) > 1.0e-12 && ray.direction_tmax.w > ray.origin_tmin.w;
+    return valid_pixel && valid_depth && valid_ray && (flags & WAVEFRONT_FLAG_TERMINATED) == 0u;
+}
+
+uint source_count() {
+    return min(source_queue.header.counters.x, pc.source_capacity);
+}
+
+uint compact_source_start(uint count) {
+    return min(source_queue.header.counters.z, count);
+}
+
+uint compact_scan_count(uint count) {
+    return count - compact_source_start(count);
+}
+
+void clear_compacted_queue() {
+    uint count = source_count();
+    uint scan_count = compact_scan_count(count);
+    compact_queue.header.counters = uvec4(0u, pc.compact_capacity, 0u, 0u);
+    compact_queue.header.metadata = uvec4(pc.max_path_depth, pc.frame_index, source_queue.header.counters.x, pc.flags);
+    validation.counters = uvec4(source_queue.header.counters.x, 0u, 0u, 0u);
+    validation.metrics = uvec4(0u);
+    compact_dispatch.args = uvec4(max((scan_count + 255u) / 256u, 1u), 1u, 1u, 0u);
+    compact_dispatch.trace_args = uvec4(max(scan_count, 1u), 1u, 1u, 0u);
+}
+
+void compact_ray(uint index) {
+    uint count = source_count();
+    uint start = compact_source_start(count);
+    uint scan_count = count - start;
+    if (index == 0u) {
+        validation.counters.x = source_queue.header.counters.x;
+    }
+    if (index >= scan_count) {
+        return;
+    }
+
+    atomicAdd(validation.counters.y, 1u);
+    WavefrontRay ray = source_queue.records[start + index];
+    uint pixel_index = ray.pixel_depth_rng_flags.x;
+    bool invalid_pixel = pixel_index >= pc.pixel_capacity || pixel_index >= pixel_state.header.counters.y;
+    bool live = live_secondary_ray(ray);
+    if (invalid_pixel) {
+        atomicAdd(validation.metrics.z, 1u);
+    }
+    if (!live) {
+        if (ray.pixel_depth_rng_flags.y > 0u && (ray.pixel_depth_rng_flags.w & WAVEFRONT_FLAG_TERMINATED) == 0u) {
+            atomicAdd(validation.metrics.x, 1u);
+        }
+        return;
+    }
+
+    atomicAdd(validation.counters.z, 1u);
+    uint output_index = atomicAdd(compact_queue.header.counters.x, 1u);
+    if (output_index >= pc.compact_capacity) {
+        atomicAdd(validation.metrics.y, 1u);
+        return;
+    }
+
+    compact_queue.records[output_index] = ray;
+    atomicAdd(validation.counters.w, 1u);
+    if (compact_queue.records[output_index].pixel_depth_rng_flags.x != pixel_index) {
+        atomicAdd(validation.metrics.w, 1u);
+    }
+}
+
+void write_compact_dispatch_args() {
+    uint count = min(compact_queue.header.counters.x, pc.compact_capacity);
+    compact_dispatch.args = uvec4(max((count + 255u) / 256u, 1u), 1u, 1u, 0u);
+    compact_dispatch.trace_args = uvec4(max(count, 1u), 1u, 1u, 0u);
+    source_queue.header.counters.z = source_count();
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (pc.mode == MODE_CLEAR) {
+        if (index == 0u) {
+            clear_compacted_queue();
+        }
+        return;
+    }
+    if (pc.mode == MODE_COMPACT) {
+        compact_ray(index);
+        return;
+    }
+    if (pc.mode == MODE_DISPATCH_ARGS) {
+        if (index == 0u) {
+            write_compact_dispatch_args();
+        }
+    }
+}

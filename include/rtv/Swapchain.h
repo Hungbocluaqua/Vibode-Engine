@@ -16,6 +16,7 @@ class VulkanContext;
 class Swapchain final : private NonCopyable {
 public:
     Swapchain(const VulkanContext& context, GLFWwindow* window);
+    Swapchain(const VulkanContext& context, VkExtent2D extent);
     ~Swapchain();
 
     void recreate();
@@ -41,15 +42,19 @@ private:
     [[nodiscard]] VkExtent2D chooseExtent(const VkSurfaceCapabilitiesKHR& capabilities) const;
 
     void create();
+    void createHeadless();
     void createImageViews();
+    void createHeadlessImages();
 
     const VulkanContext& context_;
     GLFWwindow* window_ = nullptr;
+    bool headless_ = false;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat imageFormat_ = VK_FORMAT_UNDEFINED;
     VkExtent2D extent_{};
     std::vector<VkImage> images_;
     std::vector<VkImageView> imageViews_;
+    VkDeviceMemory headlessMemory_[2] = {};
 };
 
 } // namespace rtv

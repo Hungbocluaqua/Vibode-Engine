@@ -19,8 +19,10 @@ EntityId SceneRegistry::createEntity(std::string name) {
     Slot& slot = slots_[index];
     Entity entity;
     entity.id = EntityId{index, slot.generation};
+    entity.uuid = uuidCounter_++;
     entity.name = std::move(name);
     slot.entity = std::move(entity);
+    uuidIndex_.emplace(slot.entity->uuid, slot.entity->id);
     ++liveCount_;
     markDirty(SceneUpdateKind::TopologyChanged);
     return slot.entity->id;
@@ -54,6 +56,7 @@ bool SceneRegistry::destroyEntity(EntityId id) {
         }
     }
 
+    uuidIndex_.erase(removed.uuid);
     slots_[id.index].entity.reset();
     ++slots_[id.index].generation;
     freeList_.push_back(id.index);
@@ -87,6 +90,22 @@ const Entity* SceneRegistry::entity(EntityId id) const {
         return nullptr;
     }
     return slots_[id.index].entity ? &*slots_[id.index].entity : nullptr;
+}
+
+Entity* SceneRegistry::entityByUuid(uint64_t uuid) {
+    const auto it = uuidIndex_.find(uuid);
+    if (it == uuidIndex_.end()) {
+        return nullptr;
+    }
+    return entity(it->second);
+}
+
+const Entity* SceneRegistry::entityByUuid(uint64_t uuid) const {
+    const auto it = uuidIndex_.find(uuid);
+    if (it == uuidIndex_.end()) {
+        return nullptr;
+    }
+    return entity(it->second);
 }
 
 std::vector<Entity*> SceneRegistry::entities() {
@@ -131,6 +150,16 @@ Light& SceneRegistry::addLight(EntityId id, Light light) {
     return *item->light;
 }
 
+Sun& SceneRegistry::addSun(EntityId id, Sun sun) {
+    Entity* item = entity(id);
+    if (item == nullptr) {
+        throw std::runtime_error("Cannot add Sun to missing entity");
+    }
+    item->sun = sun;
+    markDirty(SceneUpdateKind::LightOnly);
+    return *item->sun;
+}
+
 Camera& SceneRegistry::addCamera(EntityId id, Camera camera) {
     Entity* item = entity(id);
     if (item == nullptr) {
@@ -161,6 +190,16 @@ bool SceneRegistry::removeLight(EntityId id) {
     return true;
 }
 
+bool SceneRegistry::removeSun(EntityId id) {
+    Entity* item = entity(id);
+    if (item == nullptr || !item->sun.has_value()) {
+        return false;
+    }
+    item->sun.reset();
+    markDirty(SceneUpdateKind::LightOnly);
+    return true;
+}
+
 bool SceneRegistry::removeCamera(EntityId id) {
     Entity* item = entity(id);
     if (item == nullptr || !item->camera.has_value()) {
@@ -181,6 +220,11 @@ Light* SceneRegistry::light(EntityId id) {
     return item != nullptr && item->light.has_value() ? &*item->light : nullptr;
 }
 
+Sun* SceneRegistry::sun(EntityId id) {
+    Entity* item = entity(id);
+    return item != nullptr && item->sun.has_value() ? &*item->sun : nullptr;
+}
+
 Camera* SceneRegistry::camera(EntityId id) {
     Entity* item = entity(id);
     return item != nullptr && item->camera.has_value() ? &*item->camera : nullptr;
@@ -196,9 +240,36 @@ const Light* SceneRegistry::light(EntityId id) const {
     return item != nullptr && item->light.has_value() ? &*item->light : nullptr;
 }
 
+const Sun* SceneRegistry::sun(EntityId id) const {
+    const Entity* item = entity(id);
+    return item != nullptr && item->sun.has_value() ? &*item->sun : nullptr;
+}
+
 const Camera* SceneRegistry::camera(EntityId id) const {
     const Entity* item = entity(id);
     return item != nullptr && item->camera.has_value() ? &*item->camera : nullptr;
+}
+
+bool SceneRegistry::effectiveVisible(EntityId id) const {
+    const Entity* current = entity(id);
+    if (current == nullptr) {
+        return false;
+    }
+    if (!current->visible) {
+        return false;
+    }
+    EntityId parent = current->parent;
+    while (parent.valid()) {
+        const Entity* parentEntity = entity(parent);
+        if (parentEntity == nullptr) {
+            break;
+        }
+        if (!parentEntity->visible) {
+            return false;
+        }
+        parent = parentEntity->parent;
+    }
+    return true;
 }
 
 void SceneRegistry::markDirty(SceneUpdateKind kind) {
@@ -218,6 +289,12 @@ bool SceneRegistry::validIndex(EntityId id) const {
     return id.valid() &&
         id.index < slots_.size() &&
         slots_[id.index].generation == id.generation;
+}
+
+void SceneRegistry::ensureUuidCounter(uint64_t minUuid) {
+    if (uuidCounter_ <= minUuid) {
+        uuidCounter_ = minUuid + 1;
+    }
 }
 
 SceneUpdateKind SceneRegistry::combine(SceneUpdateKind current, SceneUpdateKind next) {

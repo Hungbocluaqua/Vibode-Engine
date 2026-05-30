@@ -2,6 +2,8 @@
 
 #include "rtv/EditorPanels.h"
 
+#include <optional>
+
 namespace rtv {
 
 class SceneHierarchyPanel {
@@ -15,6 +17,10 @@ private:
     void drawImportedNode(const SceneAsset& scene, uint32_t nodeIndex, EditorSelection& selection);
 
     EntityId lastScrolledSelection_{};
+    EntityId lastSelectionForReveal_{};
+    EntityId pendingRevealSelection_{};
+    std::optional<EntityId> renameTarget_;
+    static std::array<char, 256> renameBuffer_;
 };
 
 } // namespace rtv

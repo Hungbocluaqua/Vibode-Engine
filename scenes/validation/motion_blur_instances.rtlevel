@@ -1,0 +1,101 @@
+{
+  "version": 2,
+  "sourceGltf": "scenes/validation/gltf_extensions_phase42.gltf",
+  "sourceHdr": "",
+  "activeCamera": 1,
+  "primarySun": 4,
+  "environment": {
+    "hdrPath": "",
+    "intensity": 0.45,
+    "rotation": 0.0,
+    "backgroundIntensity": 0.35,
+    "enabled": true
+  },
+  "renderSettings": {
+    "pathTracingEnabled": true,
+    "directLightingEnabled": true,
+    "maxBounces": 3,
+    "environmentDirectSamples": 1,
+    "toneMapper": 3,
+    "exposure": 1.0,
+    "gamma": 2.2,
+    "denoiserEnabled": true,
+    "taaEnabled": true,
+    "debugView": 0,
+    "accumulate": true,
+    "accumulationLimit": 32,
+    "resolutionScale": 1.0,
+    "motionBlurEnabled": true,
+    "motionBlurShutterOpen": 0.0,
+    "motionBlurShutterClose": 1.0
+  },
+  "entities": [
+    {
+      "id": {"stable": 1},
+      "name": "Validation Camera",
+      "transform": {
+        "position": [0.0, 0.35, 3.4],
+        "rotationEuler": [-0.08, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "camera": {
+        "verticalFovRadians": 0.785398,
+        "nearPlane": 0.01,
+        "farPlane": 1000.0,
+        "active": true,
+        "useRenderSettingsExposure": true
+      }
+    },
+    {
+      "id": {"stable": 2},
+      "name": "Motion Blur Moving Triangle",
+      "transform": {
+        "position": [-0.45, 0.0, 0.0],
+        "rotationEuler": [0.0, 0.0, 0.0],
+        "scale": [0.75, 0.75, 0.75]
+      },
+      "meshRenderer": {
+        "mesh": 0,
+        "visible": true,
+        "castShadow": true,
+        "visibleToCamera": true,
+        "materialSlots": [
+          {"name": "phase42_all_supported_extensions", "material": 0}
+        ]
+      }
+    },
+    {
+      "id": {"stable": 3},
+      "name": "Motion Blur Static Triangle",
+      "transform": {
+        "position": [0.55, 0.0, 0.0],
+        "rotationEuler": [0.0, 0.0, 0.0],
+        "scale": [0.75, 0.75, 0.75]
+      },
+      "meshRenderer": {
+        "mesh": 0,
+        "visible": true,
+        "castShadow": true,
+        "visibleToCamera": true,
+        "materialSlots": [
+          {"name": "phase42_all_supported_extensions", "material": 0}
+        ]
+      }
+    },
+    {
+      "id": {"stable": 4},
+      "name": "Validation Key Sun",
+      "transform": {
+        "position": [2.0, 3.0, 2.5],
+        "rotationEuler": [-0.75, 0.65, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "sun": {
+        "enabled": true,
+        "illuminanceLux": 1600000.0,
+        "angularRadiusRadians": 0.00465,
+        "colorTemperatureKelvin": 5778.0
+      }
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 #include "rtv/SceneDocument.h"
 
+#include "rtv/SunController.h"
+
 #include <algorithm>
 #include <charconv>
 #include <fstream>
@@ -17,6 +19,24 @@ namespace {
 
 glm::vec3 translationFromMatrix(const glm::mat4& matrix) {
     return glm::vec3(matrix[3]);
+}
+
+glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity) {
+    const Entity* current = &entity;
+    glm::mat4 result(1.0f);
+    constexpr int maxDepth = 512;
+    for (int depth = 0; depth < maxDepth && current != nullptr; ++depth) {
+        result = current->transform.localMatrix() * result;
+        if (!current->parent.valid()) {
+            break;
+        }
+        const Entity* parent = registry.entity(current->parent);
+        if (parent == nullptr || parent == current) {
+            break;
+        }
+        current = parent;
+    }
+    return result;
 }
 
 glm::vec3 scaleFromMatrix(const glm::mat4& matrix) {
@@ -57,10 +77,6 @@ glm::vec3 vec3FromJson(const nlohmann::json& json, glm::vec3 fallback = glm::vec
     };
 }
 
-uint64_t stableEntityKey(EntityId id) {
-    return (static_cast<uint64_t>(id.generation) << 32u) | id.index;
-}
-
 } // namespace
 
 void SceneDocument::setEnvironment(Environment environment) {
@@ -86,6 +102,19 @@ void SceneDocument::setActiveCamera(EntityId id) {
     markDirty(SceneUpdateKind::CameraOnly);
 }
 
+void SceneDocument::setPrimarySun(EntityId id) {
+    if (primarySun_ == id) {
+        return;
+    }
+    primarySun_ = id;
+    markDirty(SceneUpdateKind::LightOnly);
+}
+
+EntityId SceneDocument::primarySun() const {
+    const Entity* entity = registry_.entity(primarySun_);
+    return entity != nullptr && entity->sun.has_value() ? primarySun_ : EntityId{};
+}
+
 void SceneDocument::setSourceGltfPath(std::optional<std::filesystem::path> path) {
     sourceGltfPath_ = std::move(path);
 }
@@ -107,6 +136,14 @@ void SceneDocument::clearDirty() {
     dirty_ = false;
     pendingUpdate_ = SceneUpdateKind::None;
     registry_.clearDirty();
+}
+
+void SceneDocument::setBookmarksJson(const nlohmann::json& json) {
+    bookmarksJson_ = json;
+}
+
+void SceneDocument::clearBookmarksJson() {
+    bookmarksJson_.reset();
 }
 
 SceneUpdateKind SceneDocument::pendingUpdate() const {
@@ -172,7 +209,9 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
 
     for (uint32_t i = 0; i < scene.lights.size(); ++i) {
         const SceneLightAsset& source = scene.lights[i];
-        EntityId id = registry_.createEntity("Light " + std::to_string(i));
+        EntityId id = source.nodeIndex >= 0 && static_cast<uint32_t>(source.nodeIndex) < nodeEntities.size()
+            ? nodeEntities[static_cast<uint32_t>(source.nodeIndex)]
+            : registry_.createEntity("Light " + std::to_string(i));
         Entity* entity = registry_.entity(id);
         if (entity == nullptr) {
             continue;
@@ -187,6 +226,46 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
         light.sizeOrRadius = source.sizeOrRadius;
         light.enabled = source.enabled;
         entity->light = light;
+    }
+
+    (void)SunController::migrateLegacyDirectionalSun(*this);
+    (void)SunController::repairPrimarySunTransform(*this);
+
+    std::unordered_map<std::string, EntityId> entitiesByName;
+    for (size_t i = 0; i < scene.nodes.size(); ++i) {
+        if (const Entity* e = registry_.entity(nodeEntities[i]); e != nullptr && !e->name.empty()) {
+            entitiesByName[e->name] = nodeEntities[i];
+        }
+    }
+    for (uint32_t i = 0; i < scene.nodes.size(); ++i) {
+        Entity* entity = registry_.entity(nodeEntities[i]);
+        if (entity == nullptr) continue;
+        const std::string& name = entity->name;
+        constexpr size_t targetSuffixLen = 7;
+        if (name.size() > targetSuffixLen && name.compare(name.size() - targetSuffixLen, targetSuffixLen, ".Target") == 0) {
+            std::string baseName = name.substr(0, name.size() - targetSuffixLen);
+            auto it = entitiesByName.find(baseName);
+            if (it != entitiesByName.end()) {
+                Entity* refEntity = registry_.entity(it->second);
+                if (refEntity == nullptr) continue;
+                glm::vec3 forward = glm::normalize(entity->transform.position - refEntity->transform.position);
+                if (refEntity->camera.has_value()) {
+                    glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
+                    glm::vec3 up = glm::cross(forward, right);
+                    glm::mat3 rot;
+                    rot[0] = right;
+                    rot[1] = up;
+                    rot[2] = -forward;
+                    refEntity->transform.rotationEuler = glm::eulerAngles(glm::quat_cast(rot));
+                } else if (refEntity->sun.has_value()) {
+                    float elevation = 0.0f;
+                    float azimuth = 0.0f;
+                    SunController::anglesFromDirection(-forward, elevation, azimuth);
+                    refEntity->transform = SunController::transformFromWorldAngles(
+                        registry_, *refEntity, refEntity->transform, elevation, azimuth);
+                }
+            }
+        }
     }
 
     clearDirty();
@@ -226,7 +305,7 @@ SceneAsset SceneDocument::toSceneAsset() const {
                 }
             }
         }
-        nodeIndexForEntity.emplace((static_cast<uint64_t>(entity->id.generation) << 32u) | entity->id.index, static_cast<uint32_t>(scene.nodes.size()));
+        nodeIndexForEntity.emplace(entity->uuid, static_cast<uint32_t>(scene.nodes.size()));
         scene.nodes.push_back(node);
     }
 
@@ -234,14 +313,16 @@ SceneAsset SceneDocument::toSceneAsset() const {
         const Entity* entity = entities[i];
         SceneNodeAsset& node = scene.nodes[i];
         if (entity->parent.valid()) {
-            const uint64_t key = (static_cast<uint64_t>(entity->parent.generation) << 32u) | entity->parent.index;
+            const Entity* parentEntity = registry_.entity(entity->parent);
+            const uint64_t key = parentEntity != nullptr ? parentEntity->uuid : 0u;
             const auto it = nodeIndexForEntity.find(key);
             if (it != nodeIndexForEntity.end()) {
                 node.parent = static_cast<int32_t>(it->second);
             }
         }
         for (EntityId child : entity->children) {
-            const uint64_t key = (static_cast<uint64_t>(child.generation) << 32u) | child.index;
+            const Entity* childEntity = registry_.entity(child);
+            const uint64_t key = childEntity != nullptr ? childEntity->uuid : 0u;
             const auto it = nodeIndexForEntity.find(key);
             if (it != nodeIndexForEntity.end()) {
                 node.children.push_back(it->second);
@@ -253,7 +334,7 @@ SceneAsset SceneDocument::toSceneAsset() const {
         if (entity->light.has_value()) {
             SceneLightAsset light;
             light.type = static_cast<uint32_t>(entity->light->type);
-            light.transform = entity->transform.localMatrix();
+            light.transform = entityWorldMatrix(registry_, *entity);
             light.color = entity->light->color;
             light.intensity = entity->light->intensity;
             light.sizeOrRadius = entity->light->sizeOrRadius;
@@ -276,10 +357,11 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
     }
 
     nlohmann::json root;
-    root["version"] = 1;
+    root["version"] = 2;
     root["sourceGltf"] = sourceGltfPath_.has_value() ? sourceGltfPath_->string() : "";
     root["sourceHdr"] = sourceHdrPath_.has_value() ? sourceHdrPath_->string() : "";
-    root["activeCamera"] = activeCamera_.valid() ? stableEntityKey(activeCamera_) : 0u;
+    root["activeCamera"] = activeCamera_.valid() ? (registry_.entity(activeCamera_) != nullptr ? registry_.entity(activeCamera_)->uuid : 0u) : 0u;
+    root["primarySun"] = primarySun().valid() ? (registry_.entity(primarySun()) != nullptr ? registry_.entity(primarySun())->uuid : 0u) : 0u;
     root["environment"] = {
         {"hdrPath", environment_.hdrPath.string()},
         {"intensity", environment_.intensity},
@@ -288,6 +370,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"enabled", environment_.enabled},
     };
     root["renderSettings"] = {
+        {"renderPreset", static_cast<uint32_t>(renderSettings_.renderPreset)},
         {"pathTracingEnabled", renderSettings_.pathTracingEnabled},
         {"cameraJitterEnabled", renderSettings_.cameraJitterEnabled},
         {"directLightingEnabled", renderSettings_.directLightingEnabled},
@@ -310,23 +393,59 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"histogramLowPercentile", renderSettings_.histogramLowPercentile},
         {"histogramHighPercentile", renderSettings_.histogramHighPercentile},
         {"histogramTargetPercentile", renderSettings_.histogramTargetPercentile},
-        {"sunlightEnabled", renderSettings_.sunlightEnabled},
-        {"sunIntensity", renderSettings_.sunIntensity},
         {"skyIntensity", renderSettings_.skyIntensity},
-        {"sunElevation", renderSettings_.sunElevation},
-        {"sunAngularRadius", renderSettings_.sunAngularRadius},
         {"indirectStrength", renderSettings_.indirectStrength},
         {"restirMode", static_cast<uint32_t>(renderSettings_.restirMode)},
+        {"restirGiEnabled", renderSettings_.restirGiEnabled},
         {"denoiserEnabled", renderSettings_.denoiserEnabled},
+        {"denoiseWhileMoving", renderSettings_.denoiseWhileMoving},
+        {"samplesPerPixel", renderSettings_.samplesPerPixel},
+        {"limitSamplesPerPixel", renderSettings_.limitSamplesPerPixel},
         {"atrousIterations", renderSettings_.atrousIterations},
         {"denoiserStrength", renderSettings_.denoiserStrength},
+        {"denoiserMaxHistoryLength", renderSettings_.denoiserMaxHistoryLength},
+        {"momentValidityThreshold", renderSettings_.momentValidityThreshold},
         {"taaEnabled", renderSettings_.taaEnabled},
         {"taaFeedback", renderSettings_.taaFeedback},
+        {"taaMotionFeedback", renderSettings_.taaMotionFeedback},
+        {"taaReactiveFeedback", renderSettings_.taaReactiveFeedback},
+        {"taaSharpeningStrength", renderSettings_.taaSharpeningStrength},
         {"debugView", static_cast<uint32_t>(renderSettings_.debugView)},
         {"accumulate", renderSettings_.accumulate},
         {"accumulationLimit", renderSettings_.accumulationLimit},
         {"resolutionScale", renderSettings_.resolutionScale},
-        {"requestedBackend", static_cast<uint32_t>(renderSettings_.requestedBackend)},
+        {"materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy},
+        {"specularAaEnabled", renderSettings_.specularAaEnabled},
+        {"opacityMicromapsEnabled", renderSettings_.opacityMicromapsEnabled},
+        {"shadowRayBias", renderSettings_.shadowRayBias},
+        {"shadowDistanceBias", renderSettings_.shadowDistanceBias},
+        {"fireflyClamp", renderSettings_.fireflyClamp},
+        {"restirGiTemporalMaxAge", renderSettings_.restirGiTemporalMaxAge},
+        {"restirGiSpatialRounds", renderSettings_.restirGiSpatialRounds},
+        {"restirGiSpatialRadius", renderSettings_.restirGiSpatialRadius},
+        {"restirGiDepthThresholdScale", renderSettings_.restirGiDepthThresholdScale},
+        {"restirGiSpatialCompatibilityThreshold", renderSettings_.restirGiSpatialCompatibilityThreshold},
+        {"restirGiHalfResolution", renderSettings_.restirGiHalfResolution},
+        {"restirGiVisibilityRayBudget", renderSettings_.restirGiVisibilityRayBudget},
+        {"adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)},
+        {"adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs},
+        {"usePhysicalCamera", renderSettings_.usePhysicalCamera},
+        {"physicalAperture", renderSettings_.physicalAperture},
+        {"physicalShutterSeconds", renderSettings_.physicalShutterSeconds},
+        {"physicalIso", renderSettings_.physicalIso},
+        {"physicalExposureCompensation", renderSettings_.physicalExposureCompensation},
+        {"dofApertureRadius", renderSettings_.dofApertureRadius},
+        {"dofFocusDistance", renderSettings_.dofFocusDistance},
+        {"dofBladeCount", renderSettings_.dofBladeCount},
+        {"dofBokehRotation", renderSettings_.dofBokehRotation},
+        {"motionBlurEnabled", renderSettings_.motionBlurEnabled},
+        {"motionBlurShutterOpen", renderSettings_.motionBlurShutterOpen},
+        {"motionBlurShutterClose", renderSettings_.motionBlurShutterClose},
+        {"homogeneousVolumeEnabled", renderSettings_.homogeneousVolumeEnabled},
+        {"homogeneousVolumeScattering", renderSettings_.homogeneousVolumeScattering},
+        {"homogeneousVolumeAbsorption", renderSettings_.homogeneousVolumeAbsorption},
+        {"homogeneousVolumeAnisotropy", renderSettings_.homogeneousVolumeAnisotropy},
+        {"mneeCausticsEnabled", renderSettings_.mneeCausticsEnabled},
     };
 
     root["entities"] = nlohmann::json::array();
@@ -334,11 +453,14 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
     for (const Entity* entityPtr : entities) {
         const Entity& entity = *entityPtr;
         nlohmann::json item;
-        item["id"] = {{"index", entity.id.index}, {"generation", entity.id.generation}, {"stable", stableEntityKey(entity.id)}};
-        item["parent"] = entity.parent.valid() ? stableEntityKey(entity.parent) : 0u;
+        item["id"] = {{"index", entity.id.index}, {"generation", entity.id.generation}, {"uuid", entity.uuid}};
+        item["parent"] = entity.parent.valid() ? (registry_.entity(entity.parent) != nullptr ? registry_.entity(entity.parent)->uuid : 0u) : 0u;
         item["children"] = nlohmann::json::array();
         for (EntityId child : entity.children) {
-            item["children"].push_back(stableEntityKey(child));
+            const Entity* childEntity = registry_.entity(child);
+            if (childEntity != nullptr) {
+                item["children"].push_back(childEntity->uuid);
+            }
         }
         item["name"] = entity.name;
         item["locked"] = entity.locked;
@@ -376,6 +498,14 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
                 {"enabled", entity.light->enabled},
             };
         }
+        if (entity.sun.has_value()) {
+            item["sun"] = {
+                {"enabled", entity.sun->enabled},
+                {"illuminanceLux", entity.sun->illuminanceLux},
+                {"angularRadiusRadians", entity.sun->angularRadiusRadians},
+                {"colorTemperatureKelvin", entity.sun->colorTemperatureKelvin},
+            };
+        }
         if (entity.camera.has_value()) {
             item["camera"] = {
                 {"verticalFovRadians", entity.camera->verticalFovRadians},
@@ -386,6 +516,9 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
             };
         }
         root["entities"].push_back(std::move(item));
+    }
+    if (bookmarksJson_.has_value()) {
+        root["bookmarks"] = *bookmarksJson_;
     }
     out << std::setw(2) << root << '\n';
     return true;
@@ -403,6 +536,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     } catch (...) {
         return false;
     }
+
+    renderSettings_ = RenderSettings{};
 
     sourceGltfPath_.reset();
     sourceHdrPath_.reset();
@@ -424,6 +559,9 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     }
     if (root.contains("renderSettings")) {
         const nlohmann::json& render = root["renderSettings"];
+        renderSettings_.renderPreset = render.contains("renderPreset")
+            ? static_cast<RenderPreset>(render.value("renderPreset", static_cast<uint32_t>(renderSettings_.renderPreset)))
+            : RenderPreset::Custom;
         renderSettings_.pathTracingEnabled = render.value("pathTracingEnabled", renderSettings_.pathTracingEnabled);
         renderSettings_.cameraJitterEnabled = render.value("cameraJitterEnabled", renderSettings_.cameraJitterEnabled);
         renderSettings_.directLightingEnabled = render.value("directLightingEnabled", renderSettings_.directLightingEnabled);
@@ -450,27 +588,70 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.sunIntensity = render.value("sunIntensity", renderSettings_.sunIntensity);
         renderSettings_.skyIntensity = render.value("skyIntensity", renderSettings_.skyIntensity);
         renderSettings_.sunElevation = render.value("sunElevation", renderSettings_.sunElevation);
+        renderSettings_.sunAzimuth = render.value("sunAzimuth", renderSettings_.sunAzimuth);
         renderSettings_.sunAngularRadius = render.value("sunAngularRadius", renderSettings_.sunAngularRadius);
         renderSettings_.indirectStrength = render.value("indirectStrength", renderSettings_.indirectStrength);
         renderSettings_.restirMode = static_cast<RestirMode>(render.value("restirMode", static_cast<uint32_t>(renderSettings_.restirMode)));
+        renderSettings_.restirGiEnabled = render.value("restirGiEnabled", renderSettings_.restirGiEnabled);
         renderSettings_.denoiserEnabled = render.value("denoiserEnabled", renderSettings_.denoiserEnabled);
+        renderSettings_.denoiseWhileMoving = render.value("denoiseWhileMoving", renderSettings_.denoiseWhileMoving);
+        renderSettings_.samplesPerPixel = render.value("samplesPerPixel", renderSettings_.samplesPerPixel);
+        renderSettings_.limitSamplesPerPixel = render.value("limitSamplesPerPixel", renderSettings_.limitSamplesPerPixel);
         renderSettings_.atrousIterations = render.value("atrousIterations", renderSettings_.atrousIterations);
         renderSettings_.denoiserStrength = render.value("denoiserStrength", renderSettings_.denoiserStrength);
+        renderSettings_.denoiserMaxHistoryLength = render.value("denoiserMaxHistoryLength", renderSettings_.denoiserMaxHistoryLength);
+        renderSettings_.momentValidityThreshold = render.value("momentValidityThreshold", renderSettings_.momentValidityThreshold);
         renderSettings_.taaEnabled = render.value("taaEnabled", renderSettings_.taaEnabled);
         renderSettings_.taaFeedback = render.value("taaFeedback", renderSettings_.taaFeedback);
+        renderSettings_.taaMotionFeedback = render.value("taaMotionFeedback", renderSettings_.taaMotionFeedback);
+        renderSettings_.taaReactiveFeedback = render.value("taaReactiveFeedback", renderSettings_.taaReactiveFeedback);
+        renderSettings_.taaSharpeningStrength = render.value("taaSharpeningStrength", renderSettings_.taaSharpeningStrength);
         renderSettings_.debugView = static_cast<RendererDebugView>(render.value("debugView", static_cast<uint32_t>(renderSettings_.debugView)));
         renderSettings_.accumulate = render.value("accumulate", renderSettings_.accumulate);
         renderSettings_.accumulationLimit = render.value("accumulationLimit", renderSettings_.accumulationLimit);
         renderSettings_.resolutionScale = render.value("resolutionScale", renderSettings_.resolutionScale);
-        renderSettings_.requestedBackend = static_cast<RendererBackend>(render.value("requestedBackend", static_cast<uint32_t>(renderSettings_.requestedBackend)));
+        renderSettings_.materialTextureAnisotropy = render.value("materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy);
+        renderSettings_.specularAaEnabled = render.value("specularAaEnabled", renderSettings_.specularAaEnabled);
+        renderSettings_.opacityMicromapsEnabled = render.value("opacityMicromapsEnabled", renderSettings_.opacityMicromapsEnabled);
+        renderSettings_.shadowRayBias = render.value("shadowRayBias", renderSettings_.shadowRayBias);
+        renderSettings_.shadowDistanceBias = render.value("shadowDistanceBias", renderSettings_.shadowDistanceBias);
+        renderSettings_.fireflyClamp = render.value("fireflyClamp", renderSettings_.fireflyClamp);
+        renderSettings_.restirGiTemporalMaxAge = render.value("restirGiTemporalMaxAge", renderSettings_.restirGiTemporalMaxAge);
+        renderSettings_.restirGiSpatialRounds = render.value("restirGiSpatialRounds", renderSettings_.restirGiSpatialRounds);
+        renderSettings_.restirGiSpatialRadius = render.value("restirGiSpatialRadius", renderSettings_.restirGiSpatialRadius);
+        renderSettings_.restirGiDepthThresholdScale = render.value("restirGiDepthThresholdScale", renderSettings_.restirGiDepthThresholdScale);
+        renderSettings_.restirGiSpatialCompatibilityThreshold = render.value("restirGiSpatialCompatibilityThreshold", renderSettings_.restirGiSpatialCompatibilityThreshold);
+        renderSettings_.restirGiHalfResolution = render.value("restirGiHalfResolution", renderSettings_.restirGiHalfResolution);
+        renderSettings_.restirGiVisibilityRayBudget = render.value("restirGiVisibilityRayBudget", renderSettings_.restirGiVisibilityRayBudget);
+        renderSettings_.adaptiveQualityMode = static_cast<AdaptiveQualityMode>(render.value("adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)));
+        renderSettings_.adaptiveGpuFrameTargetMs = render.value("adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs);
+        renderSettings_.usePhysicalCamera = render.value("usePhysicalCamera", renderSettings_.usePhysicalCamera);
+        renderSettings_.physicalAperture = render.value("physicalAperture", renderSettings_.physicalAperture);
+        renderSettings_.physicalShutterSeconds = render.value("physicalShutterSeconds", renderSettings_.physicalShutterSeconds);
+        renderSettings_.physicalIso = render.value("physicalIso", renderSettings_.physicalIso);
+        renderSettings_.physicalExposureCompensation = render.value("physicalExposureCompensation", renderSettings_.physicalExposureCompensation);
+        renderSettings_.dofApertureRadius = render.value("dofApertureRadius", renderSettings_.dofApertureRadius);
+        renderSettings_.dofFocusDistance = render.value("dofFocusDistance", renderSettings_.dofFocusDistance);
+        renderSettings_.dofBladeCount = render.value("dofBladeCount", renderSettings_.dofBladeCount);
+        renderSettings_.dofBokehRotation = render.value("dofBokehRotation", renderSettings_.dofBokehRotation);
+        renderSettings_.motionBlurEnabled = render.value("motionBlurEnabled", renderSettings_.motionBlurEnabled);
+        renderSettings_.motionBlurShutterOpen = render.value("motionBlurShutterOpen", renderSettings_.motionBlurShutterOpen);
+        renderSettings_.motionBlurShutterClose = render.value("motionBlurShutterClose", renderSettings_.motionBlurShutterClose);
+        renderSettings_.homogeneousVolumeEnabled = render.value("homogeneousVolumeEnabled", renderSettings_.homogeneousVolumeEnabled);
+        renderSettings_.homogeneousVolumeScattering = render.value("homogeneousVolumeScattering", renderSettings_.homogeneousVolumeScattering);
+        renderSettings_.homogeneousVolumeAbsorption = render.value("homogeneousVolumeAbsorption", renderSettings_.homogeneousVolumeAbsorption);
+        renderSettings_.homogeneousVolumeAnisotropy = render.value("homogeneousVolumeAnisotropy", renderSettings_.homogeneousVolumeAnisotropy);
+        renderSettings_.mneeCausticsEnabled = render.value("mneeCausticsEnabled", renderSettings_.mneeCausticsEnabled);
     }
 
     registry_ = SceneRegistry{};
     sceneMeshes_.clear();
     sceneMaterials_.clear();
     activeCamera_ = {};
+    primarySun_ = {};
 
     std::unordered_map<uint64_t, EntityId> idMap;
+    uint64_t maxUuid = 0;
     std::vector<std::pair<EntityId, uint64_t>> pendingParents;
     for (const nlohmann::json& item : root.value("entities", nlohmann::json::array())) {
         const EntityId id = registry_.createEntity(item.value("name", std::string{"Entity"}));
@@ -478,7 +659,11 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         if (entity == nullptr) {
             continue;
         }
-        const uint64_t stable = item.contains("id") ? item["id"].value("stable", stableEntityKey(id)) : stableEntityKey(id);
+        const uint64_t stable = item.contains("id")
+            ? item["id"].value("uuid", item["id"].value("stable", entity->uuid))
+            : entity->uuid;
+        entity->uuid = stable;
+        maxUuid = std::max(maxUuid, stable);
         idMap.emplace(stable, id);
         pendingParents.push_back({id, item.value("parent", uint64_t{0})});
         entity->locked = item.value("locked", false);
@@ -524,6 +709,15 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             light.enabled = source.value("enabled", true);
             entity->light = light;
         }
+        if (item.contains("sun")) {
+            const nlohmann::json& source = item["sun"];
+            Sun sun;
+            sun.enabled = source.value("enabled", sun.enabled);
+            sun.illuminanceLux = source.value("illuminanceLux", sun.illuminanceLux);
+            sun.angularRadiusRadians = source.value("angularRadiusRadians", sun.angularRadiusRadians);
+            sun.colorTemperatureKelvin = source.value("colorTemperatureKelvin", sun.colorTemperatureKelvin);
+            entity->sun = sun;
+        }
         if (item.contains("camera")) {
             const nlohmann::json& source = item["camera"];
             Camera camera;
@@ -538,6 +732,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             }
         }
     }
+
+    registry_.ensureUuidCounter(maxUuid);
 
     for (const auto& [child, parentStable] : pendingParents) {
         if (parentStable == 0u) {
@@ -567,11 +763,28 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             }
         }
     }
+    const uint64_t primarySunStable = root.value("primarySun", uint64_t{0});
+    if (primarySunStable != 0u) {
+        const auto it = idMap.find(primarySunStable);
+        if (it != idMap.end() && registry_.sun(it->second) != nullptr) {
+            setPrimarySun(it->second);
+        }
+    }
+    if (!primarySun_.valid()) {
+        (void)SunController::migrateLegacyDirectionalSun(*this);
+    }
+    SunController::enforceSinglePrimarySun(*this);
+    (void)SunController::repairPrimarySunTransform(*this);
 
     std::sort(sceneMeshes_.begin(), sceneMeshes_.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index < b.index; });
     sceneMeshes_.erase(std::unique(sceneMeshes_.begin(), sceneMeshes_.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index == b.index; }), sceneMeshes_.end());
     std::sort(sceneMaterials_.begin(), sceneMaterials_.end(), [](MaterialAssetHandle a, MaterialAssetHandle b) { return a.index < b.index; });
     sceneMaterials_.erase(std::unique(sceneMaterials_.begin(), sceneMaterials_.end(), [](MaterialAssetHandle a, MaterialAssetHandle b) { return a.index == b.index; }), sceneMaterials_.end());
+    if (root.contains("bookmarks") && root["bookmarks"].is_array()) {
+        bookmarksJson_ = root["bookmarks"];
+    } else {
+        bookmarksJson_.reset();
+    }
     markDirty(SceneUpdateKind::TopologyChanged);
     return true;
 }

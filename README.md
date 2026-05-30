@@ -1,8 +1,16 @@
 # Ray Tracing Engine Vulkan Port
 
-This directory contains the native Vulkan 1.3 / C++20 port of the WebGPU path tracing renderer. The current development focus is the Vulkan KHR hardware ray tracing backend; the compute path tracer remains available as a legacy fallback/reference path.
+This directory contains the native Vulkan 1.3 / C++20 port of the WebGPU path tracing renderer. Rendering is handled by the Vulkan KHR hardware ray tracing path.
 
-The port is operational: it opens a native window, runs a Vulkan KHR hardware ray tracing path tracer on capable devices, retains the legacy compute BVH path, denoises temporally/spatially, presents through a fullscreen pass, supports glTF/HDR inputs, exposes ImGui controls, and includes GPU timing/debug views. It is not yet a finished replacement for the WebGPU renderer because some material, bindless, render graph, and hardware-RT stabilization work remains.
+The port is operational: it opens a native window, runs a Vulkan KHR hardware ray tracing path tracer on capable devices, denoises temporally/spatially, presents through compute tone mapping and a fullscreen pass, supports glTF/HDR inputs, exposes an ImGui editor, and includes GPU timing/debug views. It is now an editor-oriented renderer prototype with scene hierarchy, inspector, undo/redo, render settings persistence, and incremental scene-update paths, but it still needs more hardware-RT update/refit, material coverage, render-graph, and editor workflow hardening.
+
+## Current Real-Time Defaults
+
+- `Balanced` is the default render preset for interactive/game-style use.
+- The real-time path is capped at effective `1 SPP` by default through `Limit to 1 SPP`; higher requested SPP is opt-in for stills, screenshots, references, or high-end budgets.
+- ReSTIR DI and ReSTIR GI are enabled by default in the beauty path.
+- The Balanced preset targets a 16.6 ms GPU frame budget using render scale `0.65`, max bounces `5`, one environment sample, three a-trous iterations, ReSTIR GI spatial/final passes, temporal denoising, and TAA.
+- Motion stability is prioritized over raw per-frame sampling. Use ReSTIR reuse, denoiser history, moment tracking, and TAA before raising SPP.
 
 ## Implemented
 
@@ -23,36 +31,42 @@ The port is operational: it opens a native window, runs a Vulkan KHR hardware ra
 - GLSL to SPIR-V shader compilation through `glslangValidator`
 - SPIR-V reflection for descriptor bindings, descriptor types, stage visibility, and push constants
 - Pipeline cache, compute pipeline wrapper, graphics pipeline wrapper, ray tracing pipeline wrapper, and dynamic-rendering fullscreen pipeline
-- Legacy compute path tracing pass with progressive accumulation
 - Compact auxiliary buffers for variance, depth/normal, world position, and temporal history
-- Temporal denoiser with reprojection, disocclusion rejection, luminance clipping, reactive masking, and multi-scale a-trous filtering
+- Temporal denoiser with reprojection, disocclusion rejection, luminance clipping, reactive masking, moving-camera preview support, and multi-scale a-trous filtering
+- Temporal anti-aliasing with independent temporal frame tracking, TAA-only camera jitter, depth/world-position validation, and configurable sharpening
+- Render presets (`Low`, `Balanced`, `Ultra`, `Custom`) that tune path tracing, ReSTIR, denoiser, TAA, SPP limiting, and render scale together
+- True per-frame SPP control with a real-time `1 SPP` limiter, editor slider, CLI overrides, and profile JSON reporting
 - Cornell-box scene and optional glTF/GLB import through `--gltf`
+- glTF camera import into editable camera entities
 - Radiance HDR environment loading through `--hdr`
 - Environment row/column CDF generation and shader-side importance sampling
 - Environment direct lighting / next-event estimation at every non-delta bounce, with a configurable per-hit environment sample count
 - Separate lighting controls for procedural sky intensity, loaded HDR environment intensity, and camera-visible background intensity
 - CPU BVH construction with Morton ordering, binned SAH, BVH4-style packed upload data, and rope traversal
 - Scene buffers for materials, primitives, mesh records, instance records, light records, local mesh data, local BVHs, and TLAS nodes
-- TLAS/instance traversal with flattened-BVH fallback and traversal mismatch debug mode
 - glTF texture residency through a fixed sampled texture array
 - Shader-side base-color, normal, metallic-roughness, and emissive texture sampling
 - Direct/emissive/environment lighting debug views plus PDF/MIS diagnostics
+- ReSTIR DI and ReSTIR GI reservoir reuse with GI spatial/final beauty-path passes, debug views, and profile/render-graph reporting
 - GPU timestamp profiling for path tracing, denoising, and fullscreen passes
-- ImGui overlay for renderer settings, HDR path loading, debug view switching, sample count, reset reason, resolution, environment direct sample count, and pass timings
-- WASD/mouse camera controls, pointer release on focus loss, and `F11` borderless fullscreen
+- ImGui editor with viewport, scene hierarchy, inspector, asset browser, render settings, debug/profiler, optional material editor, sample count, reset reason, resolution, and pass timings
+- Scene hierarchy selection sync, selected-instance outline, transform gizmo preview/commit, active scene-camera piloting, and undo/redo-backed editor operations
+- Inspector-backed transform, camera, light, mesh visibility, material assignment, cast-shadow, and visible-to-camera edits
+- WASD/mouse camera controls, `Ctrl+L` sun rotation drag, pointer release on focus loss, and `F11` borderless fullscreen
 - Primary Vulkan hardware ray tracing backend using `VK_KHR_acceleration_structure` and `VK_KHR_ray_tracing_pipeline`
-- Backend selection through `--backend auto`, `--backend compute`, `--backend rt`, and the Render Settings panel
-- BLAS/TLAS construction for fallback and imported glTF triangle meshes
+- BLAS/TLAS construction for fallback Cornell-box and imported glTF triangle meshes
 - Hardware RT path loop with raygen-owned multi-bounce tracing, direct/emissive/environment lighting, shadow rays, MIS/PDF diagnostics, denoiser auxiliary outputs, and alpha-aware any-hit shaders
 - Hardware RT per-triangle material metadata so closest-hit and any-hit shaders use direct material lookup instead of scanning primitive records
 - Hardware RT reduced ray payload: hit shaders return IDs, UVs, normals, and tangent basis; raygen performs material decode/texture evaluation after a hit is accepted
 - Hardware RT optimized any-hit path that samples only alpha data when alpha is relevant and terminates shadow rays immediately for accepted opaque hits
 - Conservative hardware RT opaque traversal fast path using `VK_GEOMETRY_OPAQUE_BIT_KHR` for meshes known to be alpha-free and double-sided
+- Instance visibility flags for hidden, camera-hidden, and non-shadow-casting objects in ray queries
+- AgX, ACES, PBR Neutral, Reinhard, Reinhard White, and Linear tone mappers
 - Hardware RT debug/profiler stats for BLAS count, instance count, acceleration-structure memory, and SBT size
 
 ## Still In Progress
 
-- Hardware RT material, lighting, and traversal stabilization
+- Hardware RT material, lighting, temporal stability, and traversal stabilization
 - Hardware RT acceleration-structure update/refit paths for transform-heavy editing
 - Finer hardware RT geometry splitting so opaque single-sided and alpha-tested primitives can use different traversal/hit-group policies within the same mesh
 - Further rough dielectric/specular sampling and MIS tuning
@@ -61,6 +75,7 @@ The port is operational: it opens a native window, runs a Vulkan KHR hardware ra
 - More complete scene instancing and transform update paths
 - Automatic render graph resource-state tracking and barrier validation
 - More denoiser/reprojection validation on the hardware RT output
+- Continued editor workflow polish around component creation, camera activation, hierarchy reveal, and inspector edge cases
 
 ## Build
 
@@ -97,9 +112,6 @@ Smoke test:
 
 ```powershell
 native\vulkan\build\Debug\rtvulkan.exe --frames 6
-native\vulkan\build\Debug\rtvulkan.exe --frames 6 --backend auto
-native\vulkan\build\Debug\rtvulkan.exe --frames 6 --backend rt
-native\vulkan\build\Debug\rtvulkan.exe --frames 6 --backend compute
 ```
 
 ## Runtime Examples
@@ -107,27 +119,15 @@ native\vulkan\build\Debug\rtvulkan.exe --frames 6 --backend compute
 ```powershell
 native\vulkan\build\Debug\rtvulkan.exe --debug-view direct
 native\vulkan\build\Debug\rtvulkan.exe --debug-view indirect
-native\vulkan\build\Debug\rtvulkan.exe --debug-view mismatch
 native\vulkan\build\Debug\rtvulkan.exe --debug-view mis-weight
 native\vulkan\build\Debug\rtvulkan.exe --gltf path\to\scene.glb
 native\vulkan\build\Debug\rtvulkan.exe --hdr path\to\environment.hdr
 native\vulkan\build\Debug\rtvulkan.exe --gltf path\to\scene.glb --hdr path\to\environment.hdr
-native\vulkan\build\Debug\rtvulkan.exe --backend auto
-native\vulkan\build\Debug\rtvulkan.exe --backend rt
-native\vulkan\build\Debug\rtvulkan.exe --backend compute
 ```
-
-Backend behavior:
-
-- `--backend rt` requires hardware RT and fails with a clear startup error if unavailable.
-- `--backend auto` uses hardware RT when the selected Vulkan device supports the required KHR extensions/features, otherwise compute.
-- `--backend compute` uses the legacy compute BVH renderer. Keep new renderer work on hardware RT unless the change is specifically a legacy/fallback fix.
 
 Hardware RT requires `VK_KHR_acceleration_structure`, `VK_KHR_ray_tracing_pipeline`, `VK_KHR_deferred_host_operations`, `VK_KHR_buffer_device_address`, `VK_KHR_spirv_1_4`, and `VK_KHR_shader_float_controls`.
 In hardware RT mode, raygen owns the path loop and launches primary, bounce, and shadow rays explicitly while keeping pipeline recursion depth at `1`.
 Hardware RT uses a correctness-first material policy: alpha and single-sided material rules are enforced by any-hit where needed. Meshes that are known to be alpha-free and double-sided are marked opaque so Vulkan can skip any-hit traversal for that geometry.
-
-Performance note: the compute backend uses a project-specific packed BVH and may still be faster in some scenes, but it is no longer the optimization target. New traversal, material, lighting, and editor-renderer work should target the hardware RT backend first.
 
 ## Runtime Controls
 
@@ -137,12 +137,13 @@ Performance note: the compute backend uses a project-specific packed BVH and may
 - `Q/E` or `Ctrl/Space` moves vertically.
 - `Shift` increases camera speed.
 - `F11` toggles borderless fullscreen.
+- Hold `Ctrl+L` and drag to rotate the scene Primary Sun. Quick tapping `Ctrl+L` keeps the open-level shortcut behavior.
 - `F1` cycles debug views.
 - `0` returns to beauty view.
 - `R` resets accumulation.
 - `F2` toggles denoising.
 - `F3` toggles denoising while the camera is moving.
-- `F4` toggles sunlight.
+- `F4` toggles the scene Primary Sun.
 - `F5` toggles environment lighting.
 - `F6` toggles direct lighting.
 - `+/-` adjusts exposure.
@@ -151,7 +152,14 @@ Performance note: the compute backend uses a project-specific packed BVH and may
 - `PageUp/PageDown` changes max bounces.
 - `Home/End` changes a-trous denoiser iterations.
 
-The ImGui overlay exposes the same core controls plus HDR path loading, profiler timing, hardware RT AS/SBT stats, sample count, resolution, debug view selection, accumulation reset reason, and the environment lighting controls.
+The ImGui editor exposes the same core controls plus scene hierarchy, inspector editing, asset browsing, render settings, HDR path loading, profiler timing, hardware RT AS/SBT stats, accumulated sample count, requested/effective SPP controls, resolution, debug view selection, accumulation reset reason, TAA sharpening, tone mapper selection, and environment lighting controls.
+
+SPP control behavior:
+
+- `Limit to 1 SPP` is enabled by default for real-time presets. It forces effective path samples per pixel per frame to `1`, even if the requested SPP slider is higher.
+- `Samples Per Pixel` requests `1..8` path samples per pixel per frame when the limiter is disabled.
+- CLI equivalents are `--spp <N>` / `--samples-per-pixel <N>` and `--spp-limit on|off` / `--limit-spp on|off`.
+- Profile JSON records `samples_per_pixel`, `limit_samples_per_pixel`, and `effective_samples_per_pixel` under `settings`.
 
 Environment control behavior:
 
@@ -160,40 +168,48 @@ Environment control behavior:
 - `Background Intensity` scales the camera-visible sky/background, so HDR lighting can be raised without immediately blowing out the visible sky.
 - `Environment Samples` controls direct environment-light samples per surface hit. `1` is the interactive default; higher values reduce sky-light noise at a proportional performance cost.
 - The procedural sky is uploaded through the same environment texture path as HDRs, but it is flagged separately on the GPU so it uses `Sky Intensity` instead of `Environment Intensity`.
+- The scene-owned Primary Sun component is the source of truth for sun direction, illuminance, angular radius, and color temperature. Legacy directional sun lights are migrated on load.
 
 ## Debug Views
 
 Supported debug views include:
 
 - `beauty`
-- `raw`
-- `accumulation`
 - `variance`
-- `normal`
+- `normals`
 - `depth`
-- `world`
-- `reprojection`
+- `roughness`
+- `reprojection-confidence`
 - `denoiser-rejection`
-- `direct`
-- `indirect`
-- `environment`
-- `emissive`
-- `bvh`
-- `instance`
-- `mesh`
-- `tlas`
-- `mismatch`
+- `direct-lighting`
+- `indirect-lighting`
+- `environment-contribution`
+- `emissive-contribution`
+- `instance-id`
+- `mesh-id`
 - `light-pdf`
 - `bsdf-pdf`
 - `mis-weight`
 - `direct-sample-type`
 - `albedo`
-- `clay`
+- `clay-material`
 - `first-bounce-throughput`
 - `secondary-environment-miss`
 - `bounce-count`
 - `secondary-environment-radiance`
 - `white-environment-transport`
+- `motion-vectors`
+- `atmosphere-sky-view`
+- `atmosphere-transmittance`
+- `atmosphere-aerial-perspective`
+- `atmosphere-multi-scatter`
+- `temporal-reactive-mask`
+- `temporal-history-weight`
+- `restir-reservoir-age`
+- `restir-reservoir-confidence`
+- `restir-reservoir-m`
+
+Some parse-compatible low-level traversal views remain available for saved settings and CLI compatibility, but the editor filters out placeholder/no-op views from normal cycling.
 
 ## Architecture
 
@@ -238,14 +254,14 @@ Supported debug views include:
 The renderer executes this frame flow:
 
 1. Upload changed uniforms and scene/environment data.
-2. Dispatch path tracing through the selected backend, normally Vulkan KHR hardware RT.
-3. Barrier path tracing outputs for denoiser reads.
-4. Dispatch temporal/a-trous denoising compute.
-5. Update/copy history resources for the next frame.
-6. Present through a fullscreen dynamic-rendering graphics pass.
-7. Render the ImGui overlay.
+2. Dispatch path tracing through Vulkan KHR hardware RT.
+3. Run ReSTIR DI/GI spatial reuse and ReSTIR GI final contribution when enabled by the active settings/debug path.
+4. Barrier path tracing/ReSTIR outputs for temporal reads.
+5. Update temporal moments, dispatch temporal/a-trous denoising, and copy history resources for the next frame.
+6. Resolve TAA at display extent.
+7. Tone map/present through fullscreen output and render the ImGui overlay.
 
-Accumulation resets when camera, resize, material, environment, denoiser, debug, or scene state changes.
+Accumulation resets when camera pose, resize, material, lighting, environment, denoiser/TAA, debug, shader, or scene state changes. Temporal/TAA frame tracking is separate from accumulation sample count so editor preview can keep temporal history while path-tracing accumulation resets.
 
 ### Scene Layer
 
@@ -257,12 +273,11 @@ The Vulkan scene path is moving from flattened demo data toward scalable GPU sce
 - Material records
 - Light records
 - Local mesh vertex/index buffers
-- Local mesh BVH node/triangle buffers
+- Local mesh triangle buffers
 - Hardware RT triangle material ID buffer
 - Instance bounds
-- TLAS nodes and instance indices
 
-This keeps shader logic independent from hardcoded scene geometry and prepares the hardware RT renderer for larger imported scenes, instancing, streaming, and editor-driven scene updates. The compute backend reuses parts of this data but is treated as legacy support.
+This keeps shader logic independent from hardcoded scene geometry and prepares the hardware RT renderer for larger imported scenes, instancing, streaming, and editor-driven scene updates.
 
 ## Development Direction
 

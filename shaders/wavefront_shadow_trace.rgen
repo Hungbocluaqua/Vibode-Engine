@@ -1,0 +1,80 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "rt_common.glsl"
+#include "wavefront_common.glsl"
+
+layout(set = 0, binding = 33) uniform accelerationStructureEXT topLevelAS;
+layout(location = 0) rayPayloadEXT RayPayload payload;
+layout(location = 1) rayPayloadEXT uint shadow_occluded;
+
+const uint RAY_MASK_SHADOW = 0x02u;
+
+layout(set = 0, binding = 51, std430) buffer ShadowQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontShadowRay records[];
+} shadow_queue;
+
+layout(set = 0, binding = 52, std430) buffer PixelStateBuffer {
+    WavefrontQueueHeader header;
+    WavefrontPixelState records[];
+} pixel_state;
+
+layout(set = 0, binding = 54, std430) buffer ShadowValidationBuffer {
+    uvec4 counters;
+    uvec4 metrics;
+} validation;
+
+void main() {
+    uvec2 pixel = gl_LaunchIDEXT.xy;
+    uvec2 size = gl_LaunchSizeEXT.xy;
+    uint launch_index = pixel.y * size.x + pixel.x;
+    uint shadow_count = shadow_queue.header.counters.x;
+    if (launch_index >= shadow_count || launch_index >= shadow_queue.header.counters.y) {
+        return;
+    }
+
+    WavefrontShadowRay ray = shadow_queue.records[launch_index];
+    uint pixel_index = ray.radiance_pdf_pixel_light.z;
+    atomicAdd(validation.counters.x, 1u);
+
+    shadow_occluded = 1u;
+    record_rt_counter(RT_DIAG_SHADOW_TRACE_RAYS);
+    traceRayEXT(
+        topLevelAS,
+        gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        RAY_MASK_SHADOW,
+        1,
+        0,
+        1,
+        ray.origin_tmin.xyz,
+        ray.origin_tmin.w,
+        ray.direction_tmax.xyz,
+        ray.direction_tmax.w,
+        1);
+
+    if (shadow_occluded != 0u) {
+        atomicAdd(validation.counters.z, 1u);
+        return;
+    }
+
+    atomicAdd(validation.counters.y, 1u);
+    if (pixel_index >= pixel_state.header.counters.y) {
+        return;
+    }
+
+    vec3 contribution = wavefront_unpack_shadow_radiance_pdf(ray.radiance_pdf_pixel_light.xy).rgb;
+    uint light_type = wavefront_shadow_light_type(ray.radiance_pdf_pixel_light.w);
+    if (light_type == 1u) {
+        pixel_state.records[pixel_index].direct_lighting.rgb += contribution;
+    } else if (light_type == 2u) {
+        pixel_state.records[pixel_index].indirect_lighting.rgb += contribution;
+    } else if (light_type == 3u) {
+        pixel_state.records[pixel_index].atmosphere_transmittance.rgb += contribution;
+    } else {
+        pixel_state.records[pixel_index].direct_lighting.rgb += contribution;
+    }
+    pixel_state.records[pixel_index].radiance.rgb += contribution;
+    atomicAdd(validation.counters.w, 1u);
+}

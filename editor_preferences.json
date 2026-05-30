@@ -1,0 +1,15 @@
+{
+  "cameraFastMoveSpeed": 7.5,
+  "cameraMoveSpeed": 2.4000000953674316,
+  "confirmDelete": true,
+  "favoriteFiles": [],
+  "gridVisible": true,
+  "hudScale": 1.0,
+  "recentFiles": [
+    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\san-miguel\\san-miguel.gltf",
+    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\main_sponza\\NewSponza_Main_glTF_003.gltf",
+    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\main_sponza\\NewSponza_Curtains_glTF.gltf",
+    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Sponza\\glTF\\Sponza.gltf"
+  ],
+  "showHud": true
+}

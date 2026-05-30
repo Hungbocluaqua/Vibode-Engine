@@ -1,0 +1,116 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#if RTV_SER_ENABLED
+#extension GL_NV_shader_invocation_reorder : require
+#endif
+
+#include "rt_common.glsl"
+#include "wavefront_common.glsl"
+
+layout(set = 0, binding = 33) uniform accelerationStructureEXT topLevelAS;
+layout(location = 0) rayPayloadEXT RayPayload payload;
+
+const uint RAY_MASK_CAMERA = 0x01u;
+
+const uint SER_RAY_TYPE_PRIMARY = 1u;
+const uint SER_RAY_TYPE_SECONDARY = 2u;
+const uint PATH_EVENT_BSDF = 1u;
+const uint PATH_EVENT_DELTA = 2u;
+const uint PATH_MATERIAL_BUCKET_SHIFT = 16u;
+const uint PATH_MATERIAL_BUCKET_MASK = 15u;
+
+layout(set = 0, binding = 49, std430) buffer RayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} ray_queue;
+
+layout(set = 0, binding = 50, std430) buffer HitQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontHit records[];
+} hit_queue;
+
+void reset_wavefront_payload() {
+    payload.hit = 0u;
+    payload.t = 10000.0;
+    payload.world_pos = vec3(0.0);
+    payload.material_id = 0u;
+    payload.local_pos = vec3(0.0);
+    payload.geom_normal = vec3(0.0, 1.0, 0.0);
+    payload.front_face = 1u;
+    payload.normal = vec3(0.0, 1.0, 0.0);
+    payload.instance_id = 0xffffffffu;
+    payload.mesh_id = 0xffffffffu;
+    payload.primitive_id = 0xffffffffu;
+    payload.picking = 0u;
+    payload.uv = vec2(0.0);
+    payload.tangent = vec3(1.0, 0.0, 0.0);
+    payload.bitangent = vec3(0.0, 0.0, 1.0);
+}
+
+Material material_for_wavefront_hit(inout RayPayload hit, vec3 ray_direction) {
+    Material material = decode_material(hit.material_id);
+    apply_material_textures(material, hit.uv);
+    hit.normal = apply_normal_texture(material, hit.uv, hit.normal, hit.tangent, hit.bitangent, ray_direction);
+    return apply_debug_material_mode(material);
+}
+
+void write_wavefront_hit(uint index, WavefrontRay source_ray, float roughness) {
+    WavefrontHit hit;
+    hit.position_t = vec4(payload.world_pos, payload.t);
+    hit.normal_roughness = vec4(payload.normal, roughness);
+    hit.barycentrics_hit_kind = vec4(payload.uv, float(payload.front_face), float(payload.hit));
+    hit.geom_normal = vec4(payload.geom_normal, 0.0);
+    hit.tangent = vec4(payload.tangent, 0.0);
+    hit.material_instance_primitive = uvec4(
+        payload.material_id,
+        payload.instance_id,
+        payload.mesh_id,
+        payload.primitive_id);
+    hit.pixel_depth_flags = uvec4(
+        source_ray.pixel_depth_rng_flags.x,
+        source_ray.pixel_depth_rng_flags.y,
+        payload.hit,
+        source_ray.pixel_depth_rng_flags.w);
+    hit_queue.records[index] = hit;
+}
+
+void main() {
+    uvec2 pixel = gl_LaunchIDEXT.xy;
+    uvec2 size = gl_LaunchSizeEXT.xy;
+    uint pixel_index = pixel.y * size.x + pixel.x;
+    uint ray_count = ray_queue.header.counters.x;
+    uint hit_capacity = hit_queue.header.counters.y;
+    if (pixel_index >= ray_count || pixel_index >= hit_capacity) {
+        return;
+    }
+
+    WavefrontRay ray = ray_queue.records[pixel_index];
+#if RTV_SER_ENABLED
+    uint path_depth = ray.pixel_depth_rng_flags.y;
+    uint ray_type = path_depth == 0u ? SER_RAY_TYPE_PRIMARY : SER_RAY_TYPE_SECONDARY;
+    uint flags = ray.pixel_depth_rng_flags.w;
+    uint event_bucket = (flags & PATH_EVENT_DELTA) != 0u ? 1u : ((flags & PATH_EVENT_BSDF) != 0u ? 2u : 0u);
+    uint material_bucket = (flags >> PATH_MATERIAL_BUCKET_SHIFT) & PATH_MATERIAL_BUCKET_MASK;
+    uint depth_bucket = min(path_depth, 15u);
+    uint ser_hint = ray_type | (event_bucket << 2u) | (material_bucket << 4u) | (depth_bucket << 8u);
+    reorderThreadNV(ser_hint, 12u);
+#endif
+    reset_wavefront_payload();
+    record_rt_counter(RT_DIAG_SURFACE_TRACE_RAYS);
+    traceRayEXT(
+        topLevelAS,
+        0,
+        RAY_MASK_CAMERA,
+        0,
+        2,
+        0,
+        ray.origin_tmin.xyz,
+        ray.origin_tmin.w,
+        ray.direction_tmax.xyz,
+        ray.direction_tmax.w,
+        0);
+
+    Material material = material_for_wavefront_hit(payload, ray.direction_tmax.xyz);
+    atomicAdd(hit_queue.header.counters.x, 1u);
+    write_wavefront_hit(pixel_index, ray, material.roughness);
+}

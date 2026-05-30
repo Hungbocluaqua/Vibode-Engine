@@ -12,6 +12,8 @@ class ResourceAllocator;
 struct AccelerationStructureDesc {
     VkAccelerationStructureTypeKHR type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
     VkDeviceSize size = 0;
+    VkAccelerationStructureCreateFlagsKHR createFlags = 0;
+    uint32_t motionMaxInstances = 0;
     bool allowUpdate = false;
     const char* debugName = nullptr;
 };

@@ -61,28 +61,59 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     }
 
     const GpuFrameTimings& timings = state.renderer.timings();
-    const float gpuMs =
-        timings.pathTraceMs +
-        timings.denoiserMs +
-        timings.historyCopyMs +
-        timings.taaMs +
-        timings.autoExposureMs +
-        timings.toneMapMs +
-        timings.selectionOutlineMs +
-        timings.fullscreenMs;
+    const float gpuMs = timings.totalMs();
     ImGui::Text("FPS: %.1f", state.cpuFrameMs > 0.0f ? 1000.0f / state.cpuFrameMs : 0.0f);
     ImGui::Text("CPU frame time: %.2f ms", state.cpuFrameMs);
     ImGui::Text("GPU frame time: %.2f ms", gpuMs);
+    ImGui::Text("Atmosphere: %.2f ms", timings.atmosphereMs);
+    ImGui::Text("  Transmittance LUT: %.2f ms", timings.atmosphereTransmittanceMs);
+    ImGui::Text("  Multi-scatter LUT: %.2f ms", timings.atmosphereMultiScatterMs);
+    ImGui::Text("  Sky-view LUT: %.2f ms", timings.atmosphereSkyViewMs);
+    ImGui::Text("  Sky reproject: %.2f ms", timings.atmosphereSkyReprojectMs);
+    ImGui::Text("  Sky CDF: %.2f ms", timings.atmosphereSkyCdfMs);
+    ImGui::Text("  Aerial perspective LUT: %.2f ms", timings.atmosphereAerialPerspectiveMs);
     ImGui::Text("Path trace: %.2f ms", timings.pathTraceMs);
+    ImGui::Text("ReSTIR history clear: %.2f ms", timings.restirHistoryClearMs);
+    ImGui::Text("ReSTIR GI clear: %.2f ms", timings.restirGiClearMs);
+    ImGui::Text("ReSTIR spatial: %.2f ms", timings.restirSpatialMs);
+    ImGui::Text("ReSTIR spatial copy: %.2f ms", timings.restirSpatialCopyMs);
+    ImGui::Text("ReSTIR GI spatial: %.2f ms", timings.restirGiSpatialMs);
+    ImGui::Text("ReSTIR GI final: %.2f ms", timings.restirGiFinalMs);
+    ImGui::Text("Fog integrate: %.2f ms", timings.fogIntegrateMs);
     ImGui::Text("Denoiser: %.2f ms", timings.denoiserMs);
     ImGui::Text("History copy: %.2f ms", timings.historyCopyMs);
+    ImGui::Text("Denoiser bypass copy: %.2f ms", timings.skipDenoiserCopyMs);
     ImGui::Text("TAA: %.2f ms", timings.taaMs);
+    ImGui::Text("TAA history copy: %.2f ms", timings.taaHistoryCopyMs);
     ImGui::Text("Auto exposure: %.2f ms", timings.autoExposureMs);
+    ImGui::Text("  Histogram clear: %.2f ms", timings.autoExposureHistogramClearMs);
+    ImGui::Text("  Histogram: %.2f ms", timings.autoExposureHistogramMs);
+    ImGui::Text("  Reduce: %.2f ms", timings.autoExposureReduceMs);
     ImGui::Text("Tone map: %.2f ms", timings.toneMapMs);
     ImGui::Text("Selection outline: %.2f ms", timings.selectionOutlineMs);
-    ImGui::Text("Presentation: %.2f ms", timings.fullscreenMs);
+    ImGui::Text("Fullscreen presentation: %.2f ms", timings.fullscreenMs);
+    ImGui::Text("Editor presentation: %.2f ms", timings.editorPresentationMs);
     ImGui::Text("Sample count: %u", state.renderer.sampleCount());
     ImGui::Text("Last reset: %s", accumulationResetReasonName(state.renderer.lastAccumulationResetReason()));
+
+    const GpuPipelineStatistics stats = state.renderer.pipelineStats();
+    if (stats.valid) {
+        ImGui::SeparatorText("Pipeline Statistics");
+        const auto fmtCount = [](uint64_t val) {
+            if (val >= 1000000000ull) {
+                ImGui::Text("%.2f G", static_cast<double>(val) / 1.0e9);
+            } else if (val >= 1000000ull) {
+                ImGui::Text("%.2f M", static_cast<double>(val) / 1.0e6);
+            } else if (val >= 1000ull) {
+                ImGui::Text("%.2f K", static_cast<double>(val) / 1.0e3);
+            } else {
+                ImGui::Text("%llu", static_cast<unsigned long long>(val));
+            }
+        };
+        ImGui::Text("Ray invocations: "); ImGui::SameLine(); fmtCount(stats.rayInvocations);
+        ImGui::Text("Triangle hits: "); ImGui::SameLine(); fmtCount(stats.triangleHits);
+        ImGui::Text("AABB hits: "); ImGui::SameLine(); fmtCount(stats.aabbHits);
+    }
 
     const auto& invalidations = state.renderer.validationLog().invalidations();
     if (invalidations.size() >= 2) {
@@ -94,14 +125,6 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     ImGui::SeparatorText("Debug View");
     ImGui::Text("Active: %s", rendererDebugViewName(settings.debugView));
     editorDebugViewCombo("View", settings, changed);
-    const bool computeTraversalView =
-        settings.debugView == RendererDebugView::TraversalSteps ||
-        settings.debugView == RendererDebugView::BvhDepth ||
-        settings.debugView == RendererDebugView::TlasSteps ||
-        settings.debugView == RendererDebugView::TraversalMismatch;
-    if (computeTraversalView && state.renderer.activeBackend() == RendererBackend::HardwareRayTracing) {
-        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "This diagnostic is only available on the Compute backend.");
-    }
     changed |= ImGui::SliderFloat("Debug Scale", &settings.debugScale, 0.05f, 10.0f, "%.2f");
     if (changed) {
         requestSettings(requests, settings);
@@ -122,6 +145,10 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     if (rtStats.active) {
         ImGui::SeparatorText("Hardware RT");
         ImGui::Text("BLAS: %u  Instances: %u", rtStats.blasCount, rtStats.instanceCount);
+        ImGui::Text("RT primitives: opaque %u  alpha %u  blend %u",
+            rtStats.geometry.opaquePrimitiveCount,
+            rtStats.geometry.alphaTestedPrimitiveCount,
+            rtStats.geometry.blendedPrimitiveCount);
         ImGui::Text("AS memory: %.2f MB", static_cast<double>(rtStats.accelerationStructureBytes) / (1024.0 * 1024.0));
         ImGui::Text("Last TLAS refit: %.3f ms", rtStats.lastTlasRefitMs);
         ImGui::Text("SBT: %.2f KB", static_cast<double>(rtStats.sbtBytes) / 1024.0);

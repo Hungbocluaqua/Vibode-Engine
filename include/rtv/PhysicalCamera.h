@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace rtv {
 
 struct PhysicalCameraSettings {
@@ -7,6 +9,10 @@ struct PhysicalCameraSettings {
     float shutterSeconds = 1.0f / 125.0f;
     float iso = 100.0f;
     float exposureCompensation = 0.0f;
+    float apertureRadius = 0.0f;
+    float focusDistance = 10.0f;
+    uint32_t bladeCount = 0;
+    float bokehRotation = 0.0f;
 };
 
 class PhysicalCamera {

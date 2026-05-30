@@ -1,6 +1,11 @@
 #ifndef RTV_ATMOSPHERE_PHASE_GLSL
 #define RTV_ATMOSPHERE_PHASE_GLSL
 
+#define ATMOSPHERE_RAY_QUALITY_FULL    0u
+#define ATMOSPHERE_RAY_QUALITY_REDUCED 1u
+#define ATMOSPHERE_RAY_QUALITY_FAST    2u
+#define ATMOSPHERE_RAY_QUALITY_MINIMAL 3u
+
 const float ATMOSPHERE_PHASE_PI = 3.14159265358979323846;
 const float ATMOSPHERE_PLANET_RADIUS = 6360000.0;
 const float ATMOSPHERE_TOP_RADIUS = 6420000.0;
@@ -31,19 +36,19 @@ vec3 atmosphere_scene_to_planetary(vec3 scenePos) {
 
 bool atmosphere_ray_sphere_intersection(vec3 origin, vec3 dir, float radius, out float tNear, out float tFar) {
     vec3 d = normalize(dir);
-    float a = dot(d, d);
-    float b = 2.0 * dot(origin, d);
-    float c = dot(origin, origin) - radius * radius;
-    float disc = b * b - 4.0 * a * c;
+    double a = double(dot(d, d));
+    double b = 2.0 * double(dot(origin, d));
+    double c = double(dot(origin, origin)) - double(radius) * double(radius);
+    double disc = b * b - 4.0 * a * c;
     if (disc < 0.0) {
         tNear = 0.0;
         tFar = 0.0;
         return false;
     }
-    float root = sqrt(disc);
-    float invDenom = 0.5 / a;
-    tNear = max((-b - root) * invDenom, 0.0);
-    tFar = (-b + root) * invDenom;
+    double root = sqrt(disc);
+    double invDenom = 0.5 / a;
+    tNear = max(float((-b - root) * invDenom), 0.0);
+    tFar = float((-b + root) * invDenom);
     return tFar >= tNear && tFar >= 0.0;
 }
 

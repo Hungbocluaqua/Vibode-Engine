@@ -36,6 +36,7 @@ public:
     Buffer& operator=(Buffer&& other) noexcept;
 
     void create(ResourceAllocator& allocator, const BufferDesc& desc);
+    void aliasFrom(Buffer& source, const BufferDesc& desc, VkDeviceSize offset = 0);
     void destroy();
     void resize(VkDeviceSize newSize);
 
@@ -43,6 +44,8 @@ public:
     [[nodiscard]] VmaAllocation allocation() const { return allocation_; }
     [[nodiscard]] VkDeviceSize size() const { return desc_.size; }
     [[nodiscard]] VkBufferUsageFlags usage() const { return desc_.usage; }
+    [[nodiscard]] VkDeviceSize baseOffset() const { return baseOffset_; }
+    [[nodiscard]] bool ownsAllocation() const { return ownsAllocation_; }
     [[nodiscard]] void* mappedData() const { return mappedData_; }
     [[nodiscard]] bool mapped() const { return mappedData_ != nullptr; }
     [[nodiscard]] VkDescriptorBufferInfo descriptorInfo(VkDeviceSize offset = 0, VkDeviceSize range = VK_WHOLE_SIZE) const;
@@ -61,6 +64,8 @@ private:
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VmaAllocation allocation_ = VK_NULL_HANDLE;
     void* mappedData_ = nullptr;
+    bool ownsAllocation_ = true;
+    VkDeviceSize baseOffset_ = 0;
 };
 
 } // namespace rtv

@@ -1,0 +1,169 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "blue_noise.glsl"
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputReservoirs { RestirGiReservoir input_reservoirs[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer OutputReservoirs { RestirGiReservoir output_reservoirs[]; };
+layout(set = 0, binding = 2, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
+
+layout(set = 0, binding = 3, std140) uniform RestirGiSpatialParams {
+    uint width;
+    uint height;
+    uint frame_count;
+    uint enabled;
+    uint gi_spatial_rounds;
+    uint gi_half_resolution;
+    uint gi_temporal_max_age;
+    uint gi_visibility_ray_budget;
+    float gi_spatial_radius;
+    float gi_depth_threshold_scale;
+    float gi_spatial_compatibility_threshold;
+    float _padding0;
+} params;
+
+struct SurfaceReuseData {
+    float depth;
+    vec3 normal;
+    float roughness;
+};
+
+SurfaceReuseData decode_surface_reuse_data(uvec4 packed) {
+    SurfaceReuseData surface;
+    surface.depth = uintBitsToFloat(packed.x);
+    surface.normal = decode_octahedral_normal(packed.y);
+    surface.roughness = clamp(uintBitsToFloat(packed.z), 0.01, 1.0);
+    return surface;
+}
+
+ivec2 blue_noise_offset(ivec2 coords, uint roundIndex) {
+    vec2 sampleValue = sample_dimension_2d(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 16u);
+    uint h = sample_dimension_seed(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 18u);
+    float angle = sampleValue.x * 6.28318530718;
+    float radius = 0.75 + sampleValue.y * max(params.gi_spatial_radius, 1.0);
+    ivec2 offset = ivec2(int(round(cos(angle) * radius)), int(round(sin(angle) * radius)));
+    offset.x += (h & 1u) == 0u ? 0 : 1;
+    offset.y += ((h >> 1u) & 1u) == 0u ? 0 : 1;
+    return offset;
+}
+
+float receiver_surface_compatibility(SurfaceReuseData center, SurfaceReuseData candidate) {
+    float roughness = max(center.roughness, candidate.roughness);
+    float relativeDepth = abs(candidate.depth - center.depth) / max(abs(center.depth), 1.0e-3);
+    float depthThreshold = mix(0.012, 0.045, roughness) * clamp(params.gi_depth_threshold_scale, 0.5, 2.0);
+    float normalThreshold = mix(0.97, 0.86, roughness);
+    float normalAgreement = dot(center.normal, candidate.normal);
+    if (relativeDepth > depthThreshold || normalAgreement < normalThreshold) {
+        return 0.0;
+    }
+    return (1.0 - clamp(relativeDepth / max(depthThreshold, 1.0e-4), 0.0, 1.0)) *
+        smoothstep(normalThreshold, 1.0, normalAgreement);
+}
+
+float gi_reservoir_compatibility(
+    RestirGiReservoir center,
+    RestirGiReservoir candidate,
+    SurfaceReuseData centerSurface,
+    SurfaceReuseData candidateSurface) {
+    if (!restir_gi_reservoir_valid(candidate) || !restir_gi_visible(candidate)) {
+        return 0.0;
+    }
+    if (restir_gi_material_id(center) != restir_gi_material_id(candidate)) {
+        return 0.0;
+    }
+
+    float surfaceCompatibility = receiver_surface_compatibility(centerSurface, candidateSurface);
+    if (surfaceCompatibility <= 0.0) {
+        return 0.0;
+    }
+
+    float hitDistance = max(restir_gi_hit_distance(center), 0.25);
+    float candidateDistance = max(restir_gi_hit_distance(candidate), 0.25);
+    float distanceRatio = min(hitDistance, candidateDistance) / max(hitDistance, candidateDistance);
+    float selectedNormalAgreement = dot(restir_gi_normal(center), restir_gi_normal(candidate));
+    float selectedNormalConfidence = smoothstep(0.45, 0.92, selectedNormalAgreement);
+
+    float currentTarget = max(restir_gi_target_pdf(center), 1.0e-5);
+    float candidateTarget = max(restir_gi_target_pdf(candidate), 1.0e-5);
+    float targetConfidence = sqrt(min(currentTarget, candidateTarget) / max(currentTarget, candidateTarget));
+
+    return surfaceCompatibility *
+        smoothstep(0.35, 0.90, distanceRatio) *
+        selectedNormalConfidence *
+        targetConfidence;
+}
+
+RestirGiReservoir merge_gi_candidate(RestirGiReservoir merged, RestirGiReservoir candidate, float compatibility) {
+    float mergedWeight = max(restir_gi_target_pdf(merged), 0.0) * restir_gi_sample_count(merged);
+    float candidateWeight = max(restir_gi_target_pdf(candidate), 0.0) *
+        min(restir_gi_sample_count(candidate), 16.0) *
+        compatibility;
+    float totalWeight = max(mergedWeight + candidateWeight, 1.0e-6);
+    float candidateMix = clamp(candidateWeight / totalWeight, 0.0, 0.65);
+
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    merged.hit_position_target_pdf.xyz = mix(merged.hit_position_target_pdf.xyz, candidate.hit_position_target_pdf.xyz, candidateMix);
+    merged.receiver_position_hit_distance.xyz = mix(merged.receiver_position_hit_distance.xyz, candidate.receiver_position_hit_distance.xyz, candidateMix);
+#endif
+    restir_gi_set_normal(merged, normalize(mix(restir_gi_normal(merged), restir_gi_normal(candidate), candidateMix)));
+    float mergedRoughness = mix(restir_gi_roughness(merged), restir_gi_roughness(candidate), candidateMix);
+    merged.radiance_weight_sum.rgb = mix(merged.radiance_weight_sum.rgb, candidate.radiance_weight_sum.rgb, candidateMix);
+    merged.radiance_weight_sum.w = min(merged.radiance_weight_sum.w + candidate.radiance_weight_sum.w * compatibility, 32.0);
+    restir_gi_set_hit_distance_target_pdf(
+        merged,
+        mix(restir_gi_hit_distance(merged), restir_gi_hit_distance(candidate), candidateMix),
+        max(restir_luminance(merged.radiance_weight_sum.rgb), 1.0e-4));
+    restir_gi_set_metadata(
+        merged,
+        uint(clamp(ceil(merged.radiance_weight_sum.w), 1.0, 32.0)),
+        restir_gi_age(merged),
+        RESTIR_GI_FLAG_VALID | RESTIR_GI_FLAG_VISIBLE,
+        mergedRoughness);
+    return merged;
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    ivec2 reservoirCoords = params.gi_half_resolution != 0u
+        ? clamp(ivec2((coords.x / 2) * 2, (coords.y / 2) * 2), ivec2(0), ivec2(int(params.width) - 1, int(params.height) - 1))
+        : coords;
+    uint reservoirIndex = uint(reservoirCoords.y) * params.width + uint(reservoirCoords.x);
+    RestirGiReservoir merged = input_reservoirs[reservoirIndex];
+    if (params.enabled == 0u || !restir_gi_reservoir_valid(merged)) {
+        output_reservoirs[pixelIndex] = merged;
+        return;
+    }
+
+    if (params.gi_half_resolution != 0u && any(notEqual(coords, reservoirCoords))) {
+        output_reservoirs[pixelIndex] = merged;
+        return;
+    }
+
+    SurfaceReuseData centerSurface = decode_surface_reuse_data(depth_normal_buffer[reservoirIndex]);
+    uint roundCount = clamp(params.gi_spatial_rounds, 1u, 8u);
+    float compatibilityThreshold = clamp(params.gi_spatial_compatibility_threshold, 0.0, 0.85);
+    for (uint roundIndex = 0u; roundIndex < roundCount; ++roundIndex) {
+        ivec2 sampleCoords = reservoirCoords + blue_noise_offset(reservoirCoords, roundIndex);
+        if (sampleCoords.x < 0 || sampleCoords.y < 0 || sampleCoords.x >= int(params.width) || sampleCoords.y >= int(params.height)) {
+            continue;
+        }
+
+        uint sampleIndex = uint(sampleCoords.y) * params.width + uint(sampleCoords.x);
+        RestirGiReservoir candidate = input_reservoirs[sampleIndex];
+        SurfaceReuseData candidateSurface = decode_surface_reuse_data(depth_normal_buffer[sampleIndex]);
+        float compatibility = gi_reservoir_compatibility(merged, candidate, centerSurface, candidateSurface);
+        if (compatibility > compatibilityThreshold) {
+            merged = merge_gi_candidate(merged, candidate, compatibility);
+        }
+    }
+
+    output_reservoirs[pixelIndex] = merged;
+}

@@ -1,0 +1,170 @@
+{
+  "activeCamera": 1,
+  "bookmarks": [],
+  "entities": [
+    {
+      "camera": {
+        "active": true,
+        "farPlane": 1000.0,
+        "nearPlane": 0.009999999776482582,
+        "useRenderSettingsExposure": true,
+        "verticalFovRadians": 1.0471975803375244
+      },
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 0,
+        "uuid": 1
+      },
+      "locked": false,
+      "name": "Camera",
+      "parent": 0,
+      "transform": {
+        "position": [
+          0.04011458903551102,
+          -0.039400506764650345,
+          1.9539895057678223
+        ],
+        "rotationEuler": [
+          -0.03749997541308403,
+          -0.012499885633587837,
+          -2.9106102944487233e-11
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 1,
+        "uuid": 2
+      },
+      "locked": false,
+      "name": "Cornell Fallback",
+      "parent": 0,
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotationEuler": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 2,
+        "uuid": 3
+      },
+      "locked": false,
+      "name": "Sun",
+      "parent": 0,
+      "sun": {
+        "angularRadiusRadians": 0.004650000017136335,
+        "colorTemperatureKelvin": 5778.0,
+        "enabled": true,
+        "illuminanceLux": 100000.0
+      },
+      "transform": {
+        "position": [
+          -3.953604164053104e-07,
+          6.599085807800293,
+          -4.522396087646484
+        ],
+        "rotationEuler": [
+          -0.9700000286102295,
+          -3.141592502593994,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    }
+  ],
+  "environment": {
+    "backgroundIntensity": 0.3499999940395355,
+    "enabled": true,
+    "hdrPath": "",
+    "intensity": 1.0,
+    "rotation": 0.0
+  },
+  "primarySun": 3,
+  "renderSettings": {
+    "accumulate": true,
+    "accumulationLimit": 0,
+    "adaptationSpeed": 2.0,
+    "adaptiveGpuFrameTargetMs": 16.600000381469727,
+    "adaptiveQualityMode": 0,
+    "atrousIterations": 4,
+    "autoExposureEnabled": false,
+    "brightness": 0.0,
+    "cameraJitterEnabled": true,
+    "contrast": 1.0,
+    "debugView": 0,
+    "denoiseWhileMoving": true,
+    "denoiserEnabled": true,
+    "denoiserStrength": 1.0,
+    "directLightingEnabled": true,
+    "environmentDirectSamples": 1,
+    "exposure": 2.0,
+    "fireflyClamp": 48.0,
+    "gamma": 2.200000047683716,
+    "histogramHighPercentile": 0.949999988079071,
+    "histogramLowPercentile": 0.05000000074505806,
+    "histogramMaxLogLuminance": 10.0,
+    "histogramMinLogLuminance": -10.0,
+    "histogramTargetPercentile": 0.6000000238418579,
+    "indirectStrength": 1.0,
+    "materialTextureAnisotropy": 8.0,
+    "maxBounces": 8,
+    "maxExposure": 8.0,
+    "minExposure": 0.25,
+    "pathTracingEnabled": true,
+    "physicalAperture": 16.0,
+    "physicalExposureCompensation": 0.0,
+    "physicalIso": 100.0,
+    "physicalShutterSeconds": 0.00800000037997961,
+    "resolutionScale": 1.0,
+    "restirGiDepthThresholdScale": 1.0,
+    "restirGiHalfResolution": false,
+    "restirGiSpatialCompatibilityThreshold": 0.05000000074505806,
+    "restirGiSpatialRadius": 4.25,
+    "restirGiSpatialRounds": 4,
+    "restirGiTemporalMaxAge": 24,
+    "restirGiVisibilityRayBudget": 0,
+    "restirMode": 0,
+    "saturation": 1.0,
+    "shadowDistanceBias": 0.0020000000949949026,
+    "shadowRayBias": 0.0010000000474974513,
+    "skyIntensity": 0.800000011920929,
+    "taaEnabled": true,
+    "taaFeedback": 0.07999999821186066,
+    "taaSharpeningStrength": 0.07999999821186066,
+    "targetLuminance": 0.18000000715255737,
+    "toneMapper": 3,
+    "usePhysicalCamera": false,
+    "whitePoint": 4.0
+  },
+  "sourceGltf": "",
+  "sourceHdr": "",
+  "version": 2
+}

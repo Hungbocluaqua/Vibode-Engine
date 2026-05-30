@@ -1,0 +1,73 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer PixelStateBuffer {
+    WavefrontQueueHeader header;
+    WavefrontPixelState records[];
+} pixel_state;
+
+layout(set = 0, binding = 1, std430) readonly buffer PathDataBuffer {
+    PathDataRecord records[];
+} path_data;
+
+layout(set = 0, binding = 2, std430) buffer ValidationBuffer {
+    uvec4 counters;
+    uvec4 metrics;
+} validation;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    float absolute_epsilon;
+    float relative_epsilon;
+} pc;
+
+float luminance3(vec3 value) {
+    return dot(max(value, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.width || pixel.y >= pc.height) {
+        return;
+    }
+
+    uint pixel_index = pixel.y * pc.width + pixel.x;
+    if (pixel_index >= pixel_state.header.counters.y) {
+        return;
+    }
+
+    WavefrontPixelState state = pixel_state.records[pixel_index];
+    vec3 wavefront_direct = max(
+        state.direct_lighting.rgb +
+        state.indirect_lighting.rgb +
+        state.atmosphere_transmittance.rgb,
+        vec3(0.0));
+    PathDataRecord path = path_data.records[pixel_index];
+    vec3 megakernel_direct = max(path.direct_diffuse.rgb + path.direct_specular.rgb, vec3(0.0));
+    vec3 delta = abs(wavefront_direct - megakernel_direct);
+    float abs_error = max(delta.x, max(delta.y, delta.z));
+    float reference = max(max(max(megakernel_direct.x, megakernel_direct.y), megakernel_direct.z), 1.0e-6);
+    float relative_error = abs_error / reference;
+
+    atomicAdd(validation.metrics.x, 1u);
+    atomicMax(validation.metrics.z, uint(round(clamp(abs_error, 0.0, 4294.0) * 1000000.0)));
+    atomicMax(validation.metrics.w, uint(round(clamp(relative_error, 0.0, 4294.0) * 1000000.0)));
+
+    bool meaningful = luminance3(wavefront_direct) > 1.0e-7 || luminance3(megakernel_direct) > 1.0e-7;
+    if (meaningful && abs_error > pc.absolute_epsilon && relative_error > pc.relative_epsilon) {
+        atomicAdd(validation.metrics.y, 1u);
+    }
+}

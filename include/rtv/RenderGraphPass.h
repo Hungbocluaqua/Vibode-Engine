@@ -25,6 +25,14 @@ struct RenderGraphResourceUse {
     PipelineDomain domain = PipelineDomain::Graphics;
 };
 
+enum class RenderGraphQueueDomain : uint8_t {
+    Graphics,
+    RayTracing,
+    Compute,
+    Transfer,
+    SameFamilyCompute,
+};
+
 class RenderGraphPass {
 public:
     using ExecuteCallback = std::function<void(FrameGraphContext&, VkCommandBuffer)>;
@@ -37,10 +45,12 @@ public:
     RenderGraphPass& addStorageWrite(RenderGraphResourceId id, PipelineDomain domain);
     RenderGraphPass& addStorageReadWrite(RenderGraphResourceId id, PipelineDomain domain);
     RenderGraphPass& addUniformBuffer(RenderGraphResourceId id, PipelineDomain domain);
+    RenderGraphPass& setQueueDomain(RenderGraphQueueDomain domain);
     RenderGraphPass& setExecuteCallback(ExecuteCallback callback);
 
     [[nodiscard]] const std::string& name() const { return name_; }
     [[nodiscard]] const std::vector<RenderGraphResourceUse>& uses() const { return uses_; }
+    [[nodiscard]] RenderGraphQueueDomain queueDomain() const { return queueDomain_; }
     [[nodiscard]] const ExecuteCallback& callback() const { return callback_; }
 
 private:
@@ -48,6 +58,8 @@ private:
 
     std::string name_;
     std::vector<RenderGraphResourceUse> uses_;
+    RenderGraphQueueDomain queueDomain_ = RenderGraphQueueDomain::Graphics;
+    bool queueDomainExplicit_ = false;
     ExecuteCallback callback_;
 };
 

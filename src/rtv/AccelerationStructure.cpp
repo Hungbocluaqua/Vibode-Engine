@@ -61,6 +61,13 @@ void AccelerationStructure::create(VkDevice device, ResourceAllocator& allocator
     createInfo.buffer = buffer_.handle();
     createInfo.size = desc.size;
     createInfo.type = desc.type;
+    createInfo.createFlags = desc.createFlags;
+    VkAccelerationStructureMotionInfoNV motionInfo{};
+    if ((desc.createFlags & VK_ACCELERATION_STRUCTURE_CREATE_MOTION_BIT_NV) != 0u) {
+        motionInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_MOTION_INFO_NV;
+        motionInfo.maxInstances = desc.motionMaxInstances;
+        createInfo.pNext = &motionInfo;
+    }
     checkVk(vkCreateAccelerationStructureKHR(device_, &createInfo, nullptr, &handle_), "vkCreateAccelerationStructureKHR");
 
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};

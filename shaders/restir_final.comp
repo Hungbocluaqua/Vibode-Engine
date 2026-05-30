@@ -1,0 +1,46 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "restir_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform RestirFinalParams {
+    uint width;
+    uint height;
+    uint enabled;
+    float pad;
+} params;
+
+layout(set = 0, binding = 1, std430) readonly buffer InputReservoirs { RestirReservoir input_reservoirs[]; };
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D output_direct_light;
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+
+    if (params.enabled == 0u) {
+        imageStore(output_direct_light, coords, vec4(0.0));
+        return;
+    }
+
+    RestirReservoir reservoir = input_reservoirs[pixelIndex];
+    if (!restir_reservoir_valid(reservoir)) {
+        imageStore(output_direct_light, coords, vec4(0.0));
+        return;
+    }
+
+    uint visibility = restir_visibility_state(reservoir);
+    if (visibility == RESTIR_VISIBILITY_INVALID) {
+        imageStore(output_direct_light, coords, vec4(0.0));
+        return;
+    }
+
+    float visibilityConfidence = visibility == RESTIR_VISIBILITY_VISIBLE ? 1.0 : 0.65;
+    float confidence = clamp(reservoir.sample_value_confidence.a * visibilityConfidence, 0.0, 1.0);
+    imageStore(output_direct_light, coords, vec4(max(reservoir.sample_value_confidence.rgb, vec3(0.0)) * confidence, confidence));
+}

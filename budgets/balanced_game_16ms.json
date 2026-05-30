@@ -1,0 +1,48 @@
+{
+  "gpu_frame_ms_avg": 16.6,
+  "gpu_frame_ms_p95": 16.6,
+  "gpu_frame_ms_p99": 17.0,
+  "gpu_frame_ms_max": 18.0,
+  "validation_error_count": 0,
+  "memory_total_mb": 640,
+  "memory": {
+    "textures_bytes": 100663296,
+    "buffers_bytes": 100663296,
+    "acceleration_structure_bytes": 335544320,
+    "temporal_history_bytes": 41943040,
+    "restir_reservoir_bytes": 167772160
+  },
+  "motion_stability": {
+    "beauty_temporal_variance_score": 1200.0,
+    "uncorrelated_temporal_noise_score": 150.0,
+    "denoiser_residual_noise_score": 250.0,
+    "strongest_temporal_diagnostic_correlation_min": 0.7
+  },
+  "per_pass_gpu_ms": {
+    "path_trace": 14.5,
+    "moment_update": 0.35,
+    "denoiser": 1.5,
+    "history_copy": 0.5,
+    "taa": 0.35,
+    "taa_history_copy": 0.08,
+    "restir_gi_final": 0.5
+  },
+  "per_pass_gpu_ms_p95": {
+    "path_trace": 15.0,
+    "moment_update": 0.45,
+    "denoiser": 1.8,
+    "history_copy": 0.65,
+    "taa": 0.45,
+    "taa_history_copy": 0.10,
+    "restir_gi_final": 0.65
+  },
+  "per_pass_gpu_ms_p99": {
+    "path_trace": 15.5,
+    "moment_update": 0.55,
+    "denoiser": 2.0,
+    "history_copy": 0.75,
+    "taa": 0.55,
+    "taa_history_copy": 0.12,
+    "restir_gi_final": 0.75
+  }
+}

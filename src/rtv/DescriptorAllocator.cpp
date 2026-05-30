@@ -2,7 +2,9 @@
 
 #include "rtv/Check.h"
 
+#include <algorithm>
 #include <array>
+#include <sstream>
 #include <stdexcept>
 
 namespace rtv {
@@ -37,12 +39,18 @@ DescriptorSet DescriptorAllocator::allocate(VkDescriptorSetLayout layout) {
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkResult result = vkAllocateDescriptorSets(device_, &allocateInfo, &set);
     if (result == VK_ERROR_OUT_OF_POOL_MEMORY || result == VK_ERROR_FRAGMENTED_POOL) {
+        ++failedAllocations_;
+        if (result == VK_ERROR_FRAGMENTED_POOL) {
+            ++fragmentedPoolFailures_;
+        }
         currentPool_ = createPool();
         usedPools_.push_back(currentPool_);
         allocateInfo.descriptorPool = currentPool_;
         result = vkAllocateDescriptorSets(device_, &allocateInfo, &set);
     }
     checkVk(result, "vkAllocateDescriptorSets");
+    ++allocatedSets_;
+    peakAllocatedSets_ = std::max(peakAllocatedSets_, allocatedSets_);
     return {set, layout};
 }
 
@@ -53,17 +61,47 @@ void DescriptorAllocator::resetPools() {
     }
     usedPools_.clear();
     currentPool_ = VK_NULL_HANDLE;
+    allocatedSets_ = 0;
+}
+
+DescriptorAllocator::Stats DescriptorAllocator::stats() const {
+    const uint32_t poolCount = static_cast<uint32_t>(usedPools_.size() + freePools_.size());
+    return {
+        .setsPerPool = setsPerPool_,
+        .maxPools = maxPools_,
+        .usedPools = static_cast<uint32_t>(usedPools_.size()),
+        .freePools = static_cast<uint32_t>(freePools_.size()),
+        .poolCount = poolCount,
+        .capacitySets = poolCount * setsPerPool_,
+        .allocatedSets = allocatedSets_,
+        .peakAllocatedSets = peakAllocatedSets_,
+        .failedAllocations = failedAllocations_,
+        .fragmentedPoolFailures = fragmentedPoolFailures_,
+        .poolGrowthCount = poolGrowthCount_,
+    };
 }
 
 VkDescriptorPool DescriptorAllocator::createPool() {
+    const uint32_t poolCount = static_cast<uint32_t>(usedPools_.size() + freePools_.size());
+    if (poolCount >= maxPools_) {
+        std::ostringstream message;
+        message << "Descriptor pool hard cap reached (" << maxPools_
+                << " pools, " << setsPerPool_ << " sets per pool)";
+        throw std::runtime_error(message.str());
+    }
+
+    // One renderer frame typically allocates one bindless ray tracing set plus
+    // a small number of pass-local sets. Keep pool sizes tied to those feature
+    // counts instead of multiplying every set by the bindless array length.
+    constexpr uint32_t kBindlessCombinedImageSamplers = 1024;
     const std::array<VkDescriptorPoolSize, 7> sizes = {{
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, setsPerPool_},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setsPerPool_ * 4},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, setsPerPool_},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, setsPerPool_ * 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setsPerPool_ * 32},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kBindlessCombinedImageSamplers + setsPerPool_ * 16},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, setsPerPool_ * 8},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, setsPerPool_ * 4},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, setsPerPool_},
-        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, setsPerPool_},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, setsPerPool_ * 8},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, setsPerPool_ * 4},
+        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, setsPerPool_ * 2},
     }};
 
     VkDescriptorPoolCreateInfo createInfo{};
@@ -75,6 +113,7 @@ VkDescriptorPool DescriptorAllocator::createPool() {
 
     VkDescriptorPool pool = VK_NULL_HANDLE;
     checkVk(vkCreateDescriptorPool(device_, &createInfo, nullptr, &pool), "vkCreateDescriptorPool");
+    ++poolGrowthCount_;
     return pool;
 }
 

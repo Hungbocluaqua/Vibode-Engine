@@ -7,6 +7,7 @@
 #include "rtv/BufferUploader.h"
 #include "rtv/Check.h"
 #include "rtv/EnvironmentImportanceSampler.h"
+#include "rtv/LightBvh.h"
 #include "rtv/HdrLoader.h"
 #include "rtv/ResourceAllocator.h"
 
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -43,19 +45,44 @@ uint32_t nodeInstanceFlags(const SceneNodeAsset& node) {
     return flags;
 }
 
-constexpr uint32_t maxMaterialTextures = 128;
+constexpr uint32_t maxMaterialTextures = 1024;
+constexpr uint32_t sceneLightTypeDirectional = 0u;
 constexpr uint64_t fastImportedBvhTriangleThreshold = 1'000'000ull;
 constexpr uint32_t materialFlagManualBaseColorSrgb = 1u << 0u;
 constexpr uint32_t materialFlagManualEmissiveSrgb = 1u << 1u;
-constexpr uint32_t materialVec4Stride = 5u;
+constexpr uint32_t materialVec4Stride = 11u;
+constexpr uint32_t materialTypeImportedPbr = 3u;
+constexpr uint32_t materialTypeDielectric = 2u;
+constexpr float materialDeltaRoughnessThreshold = 0.001f;
 
 static_assert(sizeof(GpuMeshRecord) == 64);
 static_assert(sizeof(GpuPrimitiveRecord) == 32);
-static_assert(sizeof(GpuInstanceRecord) == 208);
+static_assert(sizeof(GpuInstanceRecord) == 272);
 static_assert(sizeof(GpuLocalVertex) == 48);
 static_assert(sizeof(GpuInstanceBoundsRecord) == 32);
 static_assert(sizeof(GpuLightRecord) == 80);
 static_assert(sizeof(MeshParamsUniform) == 80);
+
+uint32_t importedMaterialType(const MaterialAsset* material) {
+    if (material != nullptr &&
+        material->hasTransmission != 0u &&
+        material->transmissionFactor > 0.99f &&
+        material->metallicFactor <= 0.0f &&
+        material->roughnessFactor < materialDeltaRoughnessThreshold) {
+        return materialTypeDielectric;
+    }
+    return materialTypeImportedPbr;
+}
+
+uint32_t importedMaterialType(const CachedMaterialData& material) {
+    if (material.hasTransmission != 0u &&
+        material.transmissionFactor > 0.99f &&
+        material.metallicFactor <= 0.0f &&
+        material.roughnessFactor < materialDeltaRoughnessThreshold) {
+        return materialTypeDielectric;
+    }
+    return materialTypeImportedPbr;
+}
 
 bool hasValidGpuCache(const CachedScene& cached, const SceneAsset& scene) {
     if (cached.meshGpuRecords.empty() || cached.meshParams.meshCount == 0) {
@@ -134,7 +161,108 @@ uint32_t cachedMaterialTextureFlag(const CachedScene& cached, int32_t textureInd
     if (textureIndex < 0 || static_cast<size_t>(textureIndex) >= cached.textures.size()) {
         return 0;
     }
-    return cached.textures[static_cast<size_t>(textureIndex)].srgb ? 0u : flag;
+    const CachedTextureData& texture = cached.textures[static_cast<size_t>(textureIndex)];
+    if (texture.linearColorSpace) {
+        return 0;
+    }
+    const VkFormat format = texture.isCompressed
+        ? static_cast<VkFormat>(texture.compressedFormat)
+        : (texture.srgb && texture.format == VK_FORMAT_R8G8B8A8_UNORM
+            ? VK_FORMAT_R8G8B8A8_SRGB
+            : static_cast<VkFormat>(texture.format));
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return 0;
+    default:
+        return flag;
+    }
+}
+
+glm::vec3 nonnegativeRgb(const glm::vec3& value) {
+    return glm::vec3{
+        std::max(value.x, 0.0f),
+        std::max(value.y, 0.0f),
+        std::max(value.z, 0.0f),
+    };
+}
+
+glm::vec3 approximateConductorKFromF0(const glm::vec3& f0) {
+    const glm::vec3 clamped{
+        std::clamp(f0.x, 0.02f, 0.98f),
+        std::clamp(f0.y, 0.02f, 0.98f),
+        std::clamp(f0.z, 0.02f, 0.98f),
+    };
+    return 2.0f * glm::sqrt(clamped / (glm::vec3{1.0f} - clamped));
+}
+
+void appendConductorOptics(
+    std::vector<glm::vec4>& materialData,
+    const MaterialAsset* material,
+    float occlusionTexture = -1.0f,
+    float sheenColorTexture = -1.0f,
+    float sheenRoughnessTexture = -1.0f,
+    float iridescenceTexture = -1.0f,
+    float iridescenceThicknessTexture = -1.0f) {
+    const bool enabled = material != nullptr && material->useConductorOptics != 0u;
+    glm::vec3 eta = enabled ? nonnegativeRgb(material->conductorEta) : glm::vec3{0.0f};
+    glm::vec3 k = enabled ? nonnegativeRgb(material->conductorK) : glm::vec3{0.0f};
+    if (enabled && eta.x + eta.y + eta.z + k.x + k.y + k.z <= 1.0e-4f) {
+        eta = glm::vec3{1.0f};
+        k = approximateConductorKFromF0(glm::vec3{material->baseColorFactor});
+    }
+    materialData.push_back({eta, enabled ? 1.0f : 0.0f});
+    materialData.push_back({k, 0.0f});
+    materialData.push_back({
+        material != nullptr ? material->anisotropyStrength : 0.0f,
+        material != nullptr ? material->anisotropyRotation : 0.0f,
+        occlusionTexture,
+        material != nullptr ? material->occlusionStrength : 1.0f});
+    materialData.push_back({
+        material != nullptr ? material->sheenColorFactor : glm::vec3{0.0f},
+        material != nullptr ? material->sheenRoughnessFactor : 0.0f});
+    materialData.push_back({
+        sheenColorTexture,
+        sheenRoughnessTexture,
+        material != nullptr ? material->iridescenceFactor : 0.0f,
+        material != nullptr ? material->iridescenceIor : 1.3f});
+    materialData.push_back({
+        material != nullptr ? material->iridescenceThicknessMinimum : 100.0f,
+        material != nullptr ? material->iridescenceThicknessMaximum : 400.0f,
+        iridescenceTexture,
+        iridescenceThicknessTexture});
+}
+
+void appendConductorOptics(std::vector<glm::vec4>& materialData, const CachedMaterialData& material) {
+    const bool enabled = material.useConductorOptics != 0u;
+    glm::vec3 eta = enabled ? nonnegativeRgb(material.conductorEta) : glm::vec3{0.0f};
+    glm::vec3 k = enabled ? nonnegativeRgb(material.conductorK) : glm::vec3{0.0f};
+    if (enabled && eta.x + eta.y + eta.z + k.x + k.y + k.z <= 1.0e-4f) {
+        eta = glm::vec3{1.0f};
+        k = approximateConductorKFromF0(glm::vec3{material.baseColorFactor});
+    }
+    materialData.push_back({eta, enabled ? 1.0f : 0.0f});
+    materialData.push_back({k, 0.0f});
+    materialData.push_back({
+        material.anisotropyStrength,
+        material.anisotropyRotation,
+        material.occlusionTextureIndex >= 0 ? static_cast<float>(material.occlusionTextureIndex) : -1.0f,
+        material.occlusionStrength});
+    materialData.push_back({material.sheenColorFactor, material.sheenRoughnessFactor});
+    materialData.push_back({
+        material.sheenColorTextureIndex >= 0 ? static_cast<float>(material.sheenColorTextureIndex) : -1.0f,
+        material.sheenRoughnessTextureIndex >= 0 ? static_cast<float>(material.sheenRoughnessTextureIndex) : -1.0f,
+        material.iridescenceFactor,
+        material.iridescenceIor});
+    materialData.push_back({
+        material.iridescenceThicknessMinimum,
+        material.iridescenceThicknessMaximum,
+        material.iridescenceTextureIndex >= 0 ? static_cast<float>(material.iridescenceTextureIndex) : -1.0f,
+        material.iridescenceThicknessTextureIndex >= 0 ? static_cast<float>(material.iridescenceThicknessTextureIndex) : -1.0f});
 }
 
 std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
@@ -144,9 +272,9 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
         const uint32_t flags =
             cachedMaterialTextureFlag(cached, material.baseColorTextureIndex, materialFlagManualBaseColorSrgb) |
             cachedMaterialTextureFlag(cached, material.emissiveTextureIndex, materialFlagManualEmissiveSrgb);
-        const float type = 3.0f;
+        const float type = static_cast<float>(importedMaterialType(material));
         materialData.push_back({glm::vec3(material.baseColorFactor), material.roughnessFactor});
-        materialData.push_back({1.5f, type, material.metallicFactor, static_cast<float>(flags)});
+        materialData.push_back({material.iorFactor, type, material.metallicFactor, static_cast<float>(flags)});
         materialData.push_back({material.emissiveFactor, material.baseColorFactor.a});
         materialData.push_back({
             material.baseColorTextureIndex >= 0 ? static_cast<float>(material.baseColorTextureIndex) : -1.0f,
@@ -158,6 +286,7 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
             static_cast<float>(material.alphaMode),
             static_cast<float>(material.doubleSided),
             0.0f});
+        appendConductorOptics(materialData, material);
     }
     if (materialData.empty()) {
         materialData.push_back({0.8f, 0.8f, 0.8f, 1.0f});
@@ -165,6 +294,7 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
         materialData.push_back({0.0f, 0.0f, 0.0f, 1.0f});
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 0.0f, 0.0f});
+        appendConductorOptics(materialData, nullptr);
     }
     return materialData;
 }
@@ -190,9 +320,10 @@ struct TextureColorUsage {
     bool emissive = false;
     bool metallicRoughness = false;
     bool normal = false;
+    bool occlusion = false;
 
     [[nodiscard]] bool color() const { return baseColor || emissive; }
-    [[nodiscard]] bool data() const { return metallicRoughness || normal; }
+    [[nodiscard]] bool data() const { return metallicRoughness || normal || occlusion; }
 };
 
 struct MaterialCpu {
@@ -423,6 +554,22 @@ std::vector<TextureColorUsage> classifyTextureUsage(const SceneAsset& scene, con
         if (slot < usage.size()) {
             usage[slot].baseColor = true;
         }
+        slot = slotFor(material->specularColorTexture);
+        if (slot < usage.size()) {
+            usage[slot].baseColor = true;
+        }
+        slot = slotFor(material->sheenColorTexture);
+        if (slot < usage.size()) {
+            usage[slot].baseColor = true;
+        }
+        slot = slotFor(material->iridescenceTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->iridescenceThicknessTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
         slot = slotFor(material->emissiveTexture);
         if (slot < usage.size()) {
             usage[slot].emissive = true;
@@ -431,7 +578,39 @@ std::vector<TextureColorUsage> classifyTextureUsage(const SceneAsset& scene, con
         if (slot < usage.size()) {
             usage[slot].metallicRoughness = true;
         }
+        slot = slotFor(material->clearcoatTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->clearcoatRoughnessTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->transmissionTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->specularTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->sheenRoughnessTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->anisotropyTexture);
+        if (slot < usage.size()) {
+            usage[slot].metallicRoughness = true;
+        }
+        slot = slotFor(material->occlusionTexture);
+        if (slot < usage.size()) {
+            usage[slot].occlusion = true;
+        }
         slot = slotFor(material->normalTexture);
+        if (slot < usage.size()) {
+            usage[slot].normal = true;
+        }
+        slot = slotFor(material->clearcoatNormalTexture);
         if (slot < usage.size()) {
             usage[slot].normal = true;
         }
@@ -443,6 +622,111 @@ bool uploadTextureAsSrgb(const std::vector<TextureColorUsage>& usage, uint32_t s
     return slot < usage.size() && usage[slot].color() && !usage[slot].data();
 }
 
+bool isSrgbTextureFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return true;
+    default:
+        return false;
+    }
+}
+
+VkFormat importedMaterialTextureFormat(const TextureAsset* texture, const std::vector<TextureColorUsage>& usage, uint32_t slot) {
+    if (texture == nullptr || texture->fallback) {
+        return uploadTextureAsSrgb(usage, slot) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    if (texture->isCompressed) {
+        return texture->compressedFormat != VK_FORMAT_UNDEFINED ? texture->compressedFormat : texture->format;
+    }
+    if (texture->format == VK_FORMAT_R8G8B8A8_UNORM && uploadTextureAsSrgb(usage, slot)) {
+        return VK_FORMAT_R8G8B8A8_SRGB;
+    }
+    return texture->format != VK_FORMAT_UNDEFINED ? texture->format : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+VkFormat cachedMaterialTextureFormat(const CachedTextureData* texture) {
+    if (texture == nullptr || texture->fallback) {
+        return texture != nullptr && texture->srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    if (texture->isCompressed) {
+        return texture->compressedFormat != 0u ? static_cast<VkFormat>(texture->compressedFormat) : static_cast<VkFormat>(texture->format);
+    }
+    if (texture->format == VK_FORMAT_R8G8B8A8_UNORM && texture->srgb) {
+        return VK_FORMAT_R8G8B8A8_SRGB;
+    }
+    return texture->format != 0u ? static_cast<VkFormat>(texture->format) : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
+bool importedMaterialTextureNeedsManualSrgb(const TextureAsset* texture, const std::vector<TextureColorUsage>& usage, uint32_t slot) {
+    if (slot >= usage.size() || !usage[slot].color() || usage[slot].data()) {
+        return false;
+    }
+    if (texture != nullptr && texture->linearColorSpace) {
+        return false;
+    }
+    return !isSrgbTextureFormat(importedMaterialTextureFormat(texture, usage, slot));
+}
+
+bool isHighPrecisionTextureFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16B16_UNORM:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16_SFLOAT:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16B16_SFLOAT:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32_SFLOAT:
+    case VK_FORMAT_R32G32_SFLOAT:
+    case VK_FORMAT_R32G32B32_SFLOAT:
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint64_t estimatedTextureBytes(size_t uploadedBytes, uint32_t mipLevels, bool hasExplicitMips) {
+    uint64_t bytes = static_cast<uint64_t>(uploadedBytes);
+    if (!hasExplicitMips && mipLevels > 1) {
+        bytes = (bytes * 4u) / 3u;
+    }
+    return bytes;
+}
+
+void warnHighPrecisionTextureMemory(
+    const char* label,
+    const std::string& name,
+    VkFormat format,
+    uint32_t width,
+    uint32_t height,
+    uint64_t bytes) {
+    constexpr uint64_t oneMiB = 1024ull * 1024ull;
+    if (!isHighPrecisionTextureFormat(format) || bytes < 64ull * oneMiB) {
+        return;
+    }
+    std::cerr << label << " high-precision texture memory warning: "
+              << (name.empty() ? std::string("<unnamed>") : name)
+              << " " << width << "x" << height
+              << " format=" << static_cast<uint32_t>(format)
+              << " estimated=" << (bytes / oneMiB) << " MiB\n";
+}
+
+void warnHighPrecisionTextureBudget(const char* label, uint64_t bytes) {
+    constexpr uint64_t oneMiB = 1024ull * 1024ull;
+    if (bytes < 256ull * oneMiB) {
+        return;
+    }
+    std::cerr << label << " high-precision texture budget warning: estimated "
+              << (bytes / oneMiB) << " MiB across resident material textures\n";
+}
+
 std::vector<uint8_t> fallbackTexturePixels(const std::vector<TextureColorUsage>& usage, uint32_t slot) {
     if (slot < usage.size() && usage[slot].normal) {
         return {128, 128, 255, 255};
@@ -450,31 +734,49 @@ std::vector<uint8_t> fallbackTexturePixels(const std::vector<TextureColorUsage>&
     if (slot < usage.size() && usage[slot].metallicRoughness) {
         return {255, 255, 0, 255};
     }
+    if (slot < usage.size() && usage[slot].occlusion) {
+        return {255, 255, 255, 255};
+    }
     return {255, 255, 255, 255};
 }
 
-void uploadBuffer(ResourceAllocator& allocator, BufferUploader& uploader, std::unique_ptr<Buffer>& buffer, VkBufferUsageFlags usage, const void* data, VkDeviceSize bytes, const char* name) {
+std::unique_ptr<Buffer> uploadBuffer(ResourceAllocator& allocator, BufferUploader& uploader, std::unique_ptr<Buffer>& buffer, VkBufferUsageFlags usage, const void* data, VkDeviceSize bytes, const char* name) {
     if (allocator.supportsDeviceAddress() && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
         usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
+    const VkDeviceSize requiredSize = std::max<VkDeviceSize>(bytes, 4);
+    const VkBufferUsageFlags requiredUsage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (buffer != nullptr && buffer->size() >= requiredSize && (buffer->usage() & requiredUsage) == requiredUsage) {
+        if (bytes > 0) {
+            uploader.uploadToBuffer(*buffer, data, bytes);
+        }
+        return {};
+    }
+    std::unique_ptr<Buffer> replacedBuffer;
+    if (buffer != nullptr && buffer->handle() != VK_NULL_HANDLE) {
+        replacedBuffer = std::move(buffer);
+    }
     buffer = std::make_unique<Buffer>(allocator, BufferDesc{
-        .size = std::max<VkDeviceSize>(bytes, 4),
-        .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .size = requiredSize,
+        .usage = requiredUsage,
         .memory = BufferMemory::GpuOnly,
         .debugName = name,
     });
     if (bytes > 0) {
         uploader.uploadToBuffer(*buffer, data, bytes);
     }
+    return replacedBuffer;
 }
 
 void uploadBufferBatched(BatchUploader& batch, std::unique_ptr<Buffer>& buffer, VkBufferUsageFlags usage, const void* data, VkDeviceSize bytes, const char* name) {
     if (batch.allocator().supportsDeviceAddress() && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
         usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
+    const VkDeviceSize requiredSize = std::max<VkDeviceSize>(bytes, 4);
+    const VkBufferUsageFlags requiredUsage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buffer = std::make_unique<Buffer>(batch.allocator(), BufferDesc{
-        .size = std::max<VkDeviceSize>(bytes, 4),
-        .usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .size = requiredSize,
+        .usage = requiredUsage,
         .memory = BufferMemory::GpuOnly,
         .debugName = name,
     });
@@ -489,8 +791,8 @@ void uploadVectorBatched(BatchUploader& batch, std::unique_ptr<Buffer>& buffer, 
 }
 
 template <typename T>
-void uploadVector(ResourceAllocator& allocator, BufferUploader& uploader, std::unique_ptr<Buffer>& buffer, VkBufferUsageFlags usage, const std::vector<T>& data, const char* name) {
-    uploadBuffer(allocator, uploader, buffer, usage, data.data(), sizeof(T) * data.size(), name);
+std::unique_ptr<Buffer> uploadVector(ResourceAllocator& allocator, BufferUploader& uploader, std::unique_ptr<Buffer>& buffer, VkBufferUsageFlags usage, const std::vector<T>& data, const char* name) {
+    return uploadBuffer(allocator, uploader, buffer, usage, data.data(), sizeof(T) * data.size(), name);
 }
 
 VkFilter toVkFilter(TextureFilter filter) {
@@ -516,12 +818,8 @@ bool sameSampler(const TextureSamplerDesc& a, const TextureSamplerDesc& b) {
         a.wrapT == b.wrapT;
 }
 
-void createMaterialSampler(VkDevice device, VkSampler& sampler, const TextureSamplerDesc& desc) {
-    if (sampler != VK_NULL_HANDLE) {
-        vkDestroySampler(device, sampler, nullptr);
-        sampler = VK_NULL_HANDLE;
-    }
-
+VkSampler createMaterialSampler(ResourceAllocator& allocator, const TextureSamplerDesc& desc, float requestedAnisotropy) {
+    VkDevice device = allocator.device();
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = toVkFilter(desc.magFilter);
@@ -531,12 +829,14 @@ void createMaterialSampler(VkDevice device, VkSampler& sampler, const TextureSam
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     samplerInfo.mipmapMode = desc.minFilter == TextureFilter::Nearest ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR;
     samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
-    checkVk(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler(material textures)");
-}
-
-VkSampler createOwnedMaterialSampler(VkDevice device, const TextureSamplerDesc& desc) {
+    if (allocator.supportsSamplerAnisotropy() &&
+        requestedAnisotropy > 1.0f &&
+        (desc.minFilter != TextureFilter::Nearest || desc.magFilter != TextureFilter::Nearest)) {
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        samplerInfo.maxAnisotropy = std::clamp(requestedAnisotropy, 1.0f, allocator.maxSamplerAnisotropy());
+    }
     VkSampler sampler = VK_NULL_HANDLE;
-    createMaterialSampler(device, sampler, desc);
+    checkVk(vkCreateSampler(device, &samplerInfo, nullptr, &sampler), "vkCreateSampler(material textures)");
     return sampler;
 }
 
@@ -561,10 +861,18 @@ TextureSamplerDesc selectMaterialSampler(const SceneAsset& scene, const AssetMan
     return selected;
 }
 
-GpuPrimitiveRecord makePrimitiveRecord(uint32_t firstIndex, uint32_t indexCount, uint32_t firstVertex, uint32_t materialIndex, uint32_t firstTriangle, uint32_t triangleCount) {
+GpuPrimitiveRecord makePrimitiveRecord(
+    uint32_t firstIndex,
+    uint32_t indexCount,
+    uint32_t firstVertex,
+    uint32_t materialIndex,
+    uint32_t firstTriangle,
+    uint32_t triangleCount,
+    uint32_t alphaClass = kPrimitiveAlphaClassOpaque,
+    bool opaqueTraversalSafe = false) {
     return GpuPrimitiveRecord{
         .indexData = {firstIndex, indexCount, firstVertex, materialIndex},
-        .metadata = {firstTriangle, triangleCount, 0u, 0u},
+        .metadata = {firstTriangle, triangleCount, alphaClass, opaqueTraversalSafe ? 1u : 0u},
     };
 }
 
@@ -594,9 +902,11 @@ GpuInstanceRecord makeInstanceRecord(
     uint32_t primitiveCount,
     uint32_t flags = instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow,
     const glm::mat4* prevTransform = nullptr) {
+    const glm::mat4 inverseTransform = glm::inverse(transform);
     return GpuInstanceRecord{
         .transform = transform,
-        .inverseTransform = glm::inverse(transform),
+        .inverseTransform = inverseTransform,
+        .normalTransform = glm::transpose(inverseTransform),
         .prevTransform = prevTransform != nullptr ? *prevTransform : transform,
         .metadata = {meshIndex, primitiveOffset, primitiveCount, flags},
     };
@@ -645,6 +955,48 @@ float luminance(glm::vec3 value) {
     return glm::dot(value, glm::vec3(0.2126f, 0.7152f, 0.0722f));
 }
 
+glm::vec3 lightRecordCentroid(const GpuLightRecord& record) {
+    const uint32_t type = record.metadata.x;
+    if (type == 0u || type == 1u || type == 3u || type == 4u) {
+        return glm::vec3(record.data1);
+    }
+    return glm::vec3(0.0f);
+}
+
+LightBvhPrimitive makeLightBvhPrimitive(const GpuLightRecord& record, uint32_t lightIndex) {
+    const uint32_t type = record.metadata.x;
+    const float power = std::max(record.data0.x, 0.0f);
+    glm::vec3 center = lightRecordCentroid(record);
+    glm::vec3 boundsMin = center;
+    glm::vec3 boundsMax = center;
+
+    if (type == 0u && glm::all(glm::greaterThanEqual(glm::vec3(record.data3), glm::vec3(record.data2)))) {
+        boundsMin = glm::vec3(record.data2);
+        boundsMax = glm::vec3(record.data3);
+        center = (boundsMin + boundsMax) * 0.5f;
+    } else if (type == 1u || type == 3u) {
+        const float radius = std::max(record.data0.z, 0.001f);
+        boundsMin = center - glm::vec3(radius);
+        boundsMax = center + glm::vec3(radius);
+    } else if (type == 4u) {
+        const float halfSize = std::max(record.data0.z * 0.5f, 0.001f);
+        boundsMin = center - glm::vec3(halfSize);
+        boundsMax = center + glm::vec3(halfSize);
+    } else {
+        const float extent = std::sqrt(std::max(record.data0.w, 0.0f)) * 0.5f;
+        boundsMin = center - glm::vec3(std::max(extent, 0.001f));
+        boundsMax = center + glm::vec3(std::max(extent, 0.001f));
+    }
+
+    return LightBvhPrimitive{
+        .boundsMin = boundsMin,
+        .boundsMax = boundsMax,
+        .centroid = center,
+        .power = power,
+        .lightIndex = lightIndex,
+    };
+}
+
 std::vector<GpuLightRecord> buildLightRecords(
     const std::vector<GpuMeshRecord>& meshRecords,
     const std::vector<GpuInstanceRecord>& instanceRecords,
@@ -684,11 +1036,17 @@ std::vector<GpuLightRecord> buildLightRecords(
             if (area <= 0.0f) {
                 continue;
             }
+            const glm::vec3 boundsMin = glm::min(v0, glm::min(v1, v2));
+            const glm::vec3 boundsMax = glm::max(v0, glm::max(v1, v2));
+            const glm::vec3 centroid = (v0 + v1 + v2) / 3.0f;
             const float weight = area * std::max(luminance(emissive), 0.0001f);
             totalArea += weight;
             lights.push_back(GpuLightRecord{
                 .metadata = {0u, packedIndex, material, instanceIndex},
                 .data0 = {weight, totalArea, 0.0f, area},
+                .data1 = {centroid, 0.0f},
+                .data2 = {boundsMin, 0.0f},
+                .data3 = {boundsMax, 0.0f},
             });
         }
     }
@@ -706,6 +1064,7 @@ std::vector<GpuLightRecord> buildLightRecords(
         lights.push_back(GpuLightRecord{
             .metadata = {1u, sphereIndex, 0u, static_cast<uint32_t>(lights.size())},
             .data0 = {weight, totalArea, sphere.w, area},
+            .data1 = {glm::vec3(sphere), 0.0f},
         });
     }
     return lights;
@@ -722,6 +1081,9 @@ std::vector<GpuLightRecord> buildAuthoredLightRecords(const std::vector<SceneLig
     records.reserve(lights.size());
     for (uint32_t i = 0; i < lights.size(); ++i) {
         const SceneLightAsset& light = lights[i];
+        if (light.type == sceneLightTypeDirectional) {
+            continue;
+        }
         if (!light.enabled || light.intensity <= 0.0f || luminance(light.color) <= 0.0f) {
             continue;
         }
@@ -771,10 +1133,15 @@ GpuScene::GpuScene(
     const SceneAsset* importedScene,
     const AssetManager* assets,
     std::optional<std::filesystem::path> environmentPath,
-    std::optional<std::filesystem::path> sceneCachePath)
+    std::optional<std::filesystem::path> sceneCachePath,
+    uint32_t opacityMicromapSubdivisionLevel)
     : allocator_(allocator),
       environmentPath_(std::move(environmentPath)),
-      sceneCachePath_(std::move(sceneCachePath)) {
+      sceneCachePath_(std::move(sceneCachePath)),
+      opacityMicromapSubdivisionLevel_(opacityMicromapSubdivisionLevel) {
+    materialTextureAnisotropy_ = allocator_.supportsSamplerAnisotropy()
+        ? std::clamp(8.0f, 1.0f, allocator_.maxSamplerAnisotropy())
+        : 1.0f;
     bool usedGpuCache = false;
     if (importedScene != nullptr && assets != nullptr && !importedScene->meshes.empty()) {
         if (sceneCachePath_.has_value() && importedScene->lights.empty()) {
@@ -795,6 +1162,12 @@ GpuScene::GpuScene(
 
 GpuScene::~GpuScene() {
     destroyMaterialTextureSamplers();
+    for (RetiredMaterialSampler retired : retiredMaterialSamplers_) {
+        if (retired.sampler != VK_NULL_HANDLE) {
+            vkDestroySampler(allocator_.device(), retired.sampler, nullptr);
+        }
+    }
+    retiredMaterialSamplers_.clear();
     if (environmentSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(allocator_.device(), environmentSampler_, nullptr);
     }
@@ -810,21 +1183,206 @@ void GpuScene::destroyMaterialTextureSamplers() {
         }
     }
     materialTextureSamplers_.clear();
-    materialSamplerDescriptors_.clear();
+    materialTextureSamplerDescs_.clear();
 }
 
-void GpuScene::rebuildMaterialSamplerDescriptors(uint32_t slotCount) {
-    materialSamplerDescriptors_.clear();
-    slotCount = std::max(slotCount, 1u);
-    materialSamplerDescriptors_.reserve(slotCount);
-    for (uint32_t slot = 0; slot < slotCount; ++slot) {
-        VkSampler sampler = materialSampler_;
-        if (!materialTextureSamplers_.empty()) {
-            const uint32_t samplerIndex = slot < materialTextureSamplers_.size() ? slot : 0u;
-            sampler = materialTextureSamplers_[samplerIndex];
-        }
-        materialSamplerDescriptors_.push_back(VkDescriptorImageInfo{.sampler = sampler});
+void GpuScene::retireMaterialTextureSampler(VkSampler sampler, uint64_t retireFrame) {
+    if (sampler == VK_NULL_HANDLE) {
+        return;
     }
+    retiredMaterialSamplers_.push_back(RetiredMaterialSampler{sampler, retireFrame});
+}
+
+void GpuScene::retireBuffer(std::unique_ptr<Buffer> buffer, uint64_t retireFrame) {
+    if (buffer == nullptr || buffer->handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    retiredBuffers_.push_back(RetiredBuffer{std::move(buffer), retireFrame});
+}
+
+void GpuScene::retireImage(std::unique_ptr<Image> image, uint64_t retireFrame) {
+    if (image == nullptr || image->handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    retiredImages_.push_back(RetiredImage{std::move(image), retireFrame});
+}
+
+void GpuScene::retireEnvironmentResources(uint64_t retireFrame) {
+    retireImage(std::move(environmentImage_), retireFrame);
+    retireBuffer(std::move(envRows_), retireFrame);
+    retireBuffer(std::move(envCols_), retireFrame);
+    retireBuffer(std::move(envParamsBuffer_), retireFrame);
+}
+
+void GpuScene::releaseRetiredMaterialSamplers(uint64_t completedFrame) {
+    auto firstLive = std::remove_if(
+        retiredMaterialSamplers_.begin(),
+        retiredMaterialSamplers_.end(),
+        [&](const RetiredMaterialSampler& retired) {
+            if (retired.retireFrame > completedFrame) {
+                return false;
+            }
+            if (retired.sampler != VK_NULL_HANDLE) {
+                vkDestroySampler(allocator_.device(), retired.sampler, nullptr);
+            }
+            return true;
+        });
+    retiredMaterialSamplers_.erase(firstLive, retiredMaterialSamplers_.end());
+
+    auto firstLiveBuffer = std::remove_if(
+        retiredBuffers_.begin(),
+        retiredBuffers_.end(),
+        [&](const RetiredBuffer& retired) {
+            return retired.retireFrame <= completedFrame;
+        });
+    retiredBuffers_.erase(firstLiveBuffer, retiredBuffers_.end());
+
+    auto firstLiveImage = std::remove_if(
+        retiredImages_.begin(),
+        retiredImages_.end(),
+        [&](const RetiredImage& retired) {
+            return retired.retireFrame <= completedFrame;
+        });
+    retiredImages_.erase(firstLiveImage, retiredImages_.end());
+}
+
+void GpuScene::recreateMaterialTextureSamplers(uint64_t retireFrame) {
+    VkSampler replacement = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
+    retireMaterialTextureSampler(materialSampler_, retireFrame);
+    materialSampler_ = replacement;
+
+    std::vector<VkSampler> replacements;
+    replacements.reserve(materialTextureSamplerDescs_.size());
+    for (const TextureSamplerDesc& desc : materialTextureSamplerDescs_) {
+        replacements.push_back(createMaterialSampler(allocator_, desc, materialTextureAnisotropy_));
+    }
+    for (VkSampler sampler : materialTextureSamplers_) {
+        retireMaterialTextureSampler(sampler, retireFrame);
+    }
+    materialTextureSamplers_ = std::move(replacements);
+}
+
+bool GpuScene::setMaterialTextureAnisotropy(float anisotropy, uint64_t retireFrame) {
+    const float supportedMax = allocator_.supportsSamplerAnisotropy() ? allocator_.maxSamplerAnisotropy() : 1.0f;
+    const float clamped = std::clamp(std::isfinite(anisotropy) ? anisotropy : 1.0f, 1.0f, supportedMax);
+    if (std::abs(clamped - materialTextureAnisotropy_) <= 0.0001f) {
+        return false;
+    }
+
+    materialTextureAnisotropy_ = clamped;
+    if (materialSampler_ != VK_NULL_HANDLE) {
+        recreateMaterialTextureSamplers(retireFrame);
+    }
+    return true;
+}
+
+uint32_t meshPrimitiveAlphaClass(
+    const std::vector<GpuPrimitiveRecord>& primitiveRecords,
+    uint32_t primitiveOffset,
+    uint32_t primitiveCount,
+    uint32_t alphaClass) {
+    for (uint32_t i = 0; i < primitiveCount; ++i) {
+        const uint32_t primitiveIndex = primitiveOffset + i;
+        if (primitiveIndex < primitiveRecords.size() && primitiveRecords[primitiveIndex].metadata.z == alphaClass) {
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+void annotatePrimitiveAlphaClasses(
+    std::vector<GpuPrimitiveRecord>& primitiveRecords,
+    const std::vector<uint32_t>& materialAlphaClasses,
+    const std::vector<bool>* materialOpaqueTraversalSafe = nullptr) {
+    for (GpuPrimitiveRecord& primitive : primitiveRecords) {
+        const uint32_t materialIndex = primitive.indexData.w;
+        primitive.metadata.z = materialIndex < materialAlphaClasses.size()
+            ? materialAlphaClasses[materialIndex]
+            : kPrimitiveAlphaClassOpaque;
+        primitive.metadata.w = materialOpaqueTraversalSafe != nullptr && materialIndex < materialOpaqueTraversalSafe->size() && (*materialOpaqueTraversalSafe)[materialIndex]
+            ? 1u
+            : 0u;
+    }
+}
+
+RayTracingGeometryStats computeRayTracingGeometryStats(
+    const std::vector<GpuMeshRecord>& meshRecords,
+    const std::vector<GpuPrimitiveRecord>& primitiveRecords) {
+    RayTracingGeometryStats stats{};
+    for (const GpuPrimitiveRecord& primitive : primitiveRecords) {
+        const uint32_t triangleCount = primitive.indexData.y / 3u;
+        switch (primitive.metadata.z) {
+        case kPrimitiveAlphaClassAlphaTested:
+            ++stats.alphaTestedPrimitiveCount;
+            stats.alphaTestedTriangleCount += triangleCount;
+            break;
+        case kPrimitiveAlphaClassBlended:
+            ++stats.blendedPrimitiveCount;
+            stats.blendedTriangleCount += triangleCount;
+            break;
+        default:
+            ++stats.opaquePrimitiveCount;
+            stats.opaqueTriangleCount += triangleCount;
+            break;
+        }
+    }
+
+    for (const GpuMeshRecord& mesh : meshRecords) {
+        const uint32_t primitiveOffset = mesh.primitiveData.x;
+        const uint32_t primitiveCount = mesh.primitiveData.y;
+        const bool hasAlphaTested = meshPrimitiveAlphaClass(
+            primitiveRecords,
+            primitiveOffset,
+            primitiveCount,
+            kPrimitiveAlphaClassAlphaTested) != 0u;
+        const bool hasBlended = meshPrimitiveAlphaClass(
+            primitiveRecords,
+            primitiveOffset,
+            primitiveCount,
+            kPrimitiveAlphaClassBlended) != 0u;
+        stats.meshCountWithAlphaTestedGeometry += hasAlphaTested ? 1u : 0u;
+        stats.meshCountWithBlendedGeometry += hasBlended ? 1u : 0u;
+        stats.meshCountWithOnlyOpaqueGeometry += (!hasAlphaTested && !hasBlended) ? 1u : 0u;
+    }
+    return stats;
+}
+
+void logRayTracingGeometryStats(const char* label, const RayTracingGeometryStats& stats) {
+    std::cout << label
+              << " RT geometry: opaque_primitives=" << stats.opaquePrimitiveCount
+              << " alpha_tested_primitives=" << stats.alphaTestedPrimitiveCount
+              << " blended_primitives=" << stats.blendedPrimitiveCount
+              << " opaque_triangles=" << stats.opaqueTriangleCount
+              << " alpha_tested_triangles=" << stats.alphaTestedTriangleCount
+              << " blended_triangles=" << stats.blendedTriangleCount << '\n';
+}
+
+void logOpacityMicromapPreprocessStats(const char* label, const OpacityMicromapPreprocessStats& stats) {
+    std::cout << label
+              << " OMM preprocess: eligible_primitives=" << stats.eligiblePrimitiveCount
+              << " generated_primitives=" << stats.generatedPrimitiveCount
+              << " micro_triangles=" << stats.microTriangleCount
+              << " opaque=" << stats.opaqueCount
+              << " transparent=" << stats.transparentCount
+              << " mixed=" << stats.mixedCount
+              << " unknown=" << stats.unknownCount
+              << " bytes=" << stats.dataBytes
+              << " time_ms=" << stats.preprocessingMs << '\n';
+}
+
+std::vector<VkDescriptorImageInfo> GpuScene::materialCombinedDescriptors() const {
+    const auto& texDescs = materialTextureTable_.descriptors();
+    std::vector<VkDescriptorImageInfo> result;
+    result.reserve(texDescs.size());
+    for (const auto& tex : texDescs) {
+        const size_t index = result.size();
+        VkDescriptorImageInfo combined{};
+        combined.imageView = tex.imageView;
+        combined.imageLayout = tex.imageLayout;
+        combined.sampler = index < materialTextureSamplers_.size() ? materialTextureSamplers_[index] : materialSampler_;
+        result.push_back(combined);
+    }
+    return result;
 }
 
 bool GpuScene::setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity) {
@@ -846,15 +1404,26 @@ bool GpuScene::setEnvironmentControls(bool enabled, float intensity, float rotat
     return true;
 }
 
+bool GpuScene::setSkyCdfDimensions(uint32_t width, uint32_t height) {
+    width = std::max(width, 1u);
+    height = std::max(height, 1u);
+    if (envParams_.skyCdfWidth == width && envParams_.skyCdfHeight == height) {
+        return false;
+    }
+
+    envParams_.skyCdfWidth = width;
+    envParams_.skyCdfHeight = height;
+    uploadEnvironmentParams();
+    return true;
+}
+
 void GpuScene::createDefaultMaterialTexture(BufferUploader& uploader) {
     if (materialSampler_ == VK_NULL_HANDLE) {
-        createMaterialSampler(allocator_.device(), materialSampler_, TextureSamplerDesc{});
+        materialSamplerDesc_ = TextureSamplerDesc{};
+        materialSampler_ = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
     }
 
     if (materialTextureTable_.residentCount() > 0) {
-        if (materialSamplerDescriptors_.empty()) {
-            rebuildMaterialSamplerDescriptors(maxMaterialTextures);
-        }
         return;
     }
     destroyMaterialTextureSamplers();
@@ -871,7 +1440,6 @@ void GpuScene::createDefaultMaterialTexture(BufferUploader& uploader) {
     uploader.uploadToImage2D(*image, white.data(), white.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     images.push_back(std::move(image));
     materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
-    rebuildMaterialSamplerDescriptors(maxMaterialTextures);
 }
 
 void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets) {
@@ -879,7 +1447,8 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
     destroyMaterialTextureSamplers();
     bool mixedSamplers = false;
     const TextureSamplerDesc materialSamplerDesc = selectMaterialSampler(importedScene, assets, mixedSamplers);
-    createMaterialSampler(allocator_.device(), materialSampler_, materialSamplerDesc);
+    materialSamplerDesc_ = materialSamplerDesc;
+    materialSampler_ = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
     if (mixedSamplers) {
         std::cout << "glTF scene uses mixed texture samplers; using the first sampler until per-texture bindless samplers are enabled.\n";
     }
@@ -890,10 +1459,12 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
     struct PendingTexture {
         std::unique_ptr<Image> image;
         std::vector<uint8_t> pixels;
+        std::vector<TextureMipLevel> mipData;
         TextureSamplerDesc sampler;
     };
     std::vector<PendingTexture> pendingTextures;
     pendingTextures.reserve(std::max(1u, textureCount));
+    uint64_t highPrecisionBytes = 0;
 
     for (uint32_t slot = 0; slot < std::max(1u, textureCount); ++slot) {
         const TextureAsset* texture = slot < textureCount ? assets.texture(importedScene.textures[slot]) : nullptr;
@@ -911,13 +1482,30 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
             name = "default material texture";
         }
 
-        const uint32_t mipLevels = std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u));
+        const bool hasUploadedMips = texture != nullptr && !texture->mipData.empty();
+        const uint32_t textureMipLevels = hasUploadedMips
+            ? static_cast<uint32_t>(texture->mipData.size())
+            : (texture != nullptr && texture->isCompressed
+                ? std::max(1u, static_cast<uint32_t>(texture->mipLevels))
+                : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u)));
+        const VkFormat textureFormat = importedMaterialTextureFormat(texture, usage, slot);
+        const uint64_t textureBytes = estimatedTextureBytes(pixels.size(), textureMipLevels, hasUploadedMips);
+        if (isHighPrecisionTextureFormat(textureFormat)) {
+            highPrecisionBytes += textureBytes;
+            warnHighPrecisionTextureMemory(
+                "Material",
+                texture != nullptr ? texture->name : std::string{},
+                textureFormat,
+                width,
+                height,
+                textureBytes);
+        }
 
         auto image = std::make_unique<Image>(allocator_, ImageDesc{
             .width = width,
             .height = height,
-            .mipLevels = mipLevels,
-            .format = uploadTextureAsSrgb(usage, slot) ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
+            .mipLevels = textureMipLevels,
+            .format = textureFormat,
             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             .debugName = name,
         });
@@ -926,26 +1514,29 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
         pendingTextures.push_back({
             std::move(image),
             std::move(pixels),
+            texture != nullptr ? texture->mipData : std::vector<TextureMipLevel>{},
             samplerDesc,
         });
     }
+    warnHighPrecisionTextureBudget("Material", highPrecisionBytes);
 
     BatchUploader batch(uploader);
     batch.begin();
     for (auto& pending : pendingTextures) {
-        batch.enqueueImageUpload(*pending.image, pending.pixels.data(), pending.pixels.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        batch.enqueueImageUpload(*pending.image, pending.pixels.data(), pending.pixels.size(), pending.mipData, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     batch.submit();
 
     std::vector<std::unique_ptr<Image>> images;
     images.reserve(pendingTextures.size());
+    materialTextureSamplerDescs_.reserve(pendingTextures.size());
     for (auto& pending : pendingTextures) {
-        materialTextureSamplers_.push_back(createOwnedMaterialSampler(allocator_.device(), pending.sampler));
+        materialTextureSamplerDescs_.push_back(pending.sampler);
+        materialTextureSamplers_.push_back(createMaterialSampler(allocator_, pending.sampler, materialTextureAnisotropy_));
         images.push_back(std::move(pending.image));
     }
 
     materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
-    rebuildMaterialSamplerDescriptors(maxMaterialTextures);
     std::cout << "Material textures resident: " << materialTextureTable_.residentCount() << " / " << materialTextureTable_.slotCount() << " slots\n";
 }
 
@@ -961,31 +1552,32 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
         materialSamplerDesc.wrapS = static_cast<TextureWrap>(first.wrapS);
         materialSamplerDesc.wrapT = static_cast<TextureWrap>(first.wrapT);
     }
-    createMaterialSampler(allocator_.device(), materialSampler_, materialSamplerDesc);
+    materialSamplerDesc_ = materialSamplerDesc;
+    materialSampler_ = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
 
     const uint32_t textureCount = std::min<uint32_t>(static_cast<uint32_t>(cached.textures.size()), maxMaterialTextures);
 
     struct PendingTexture {
         std::unique_ptr<Image> image;
         std::vector<uint8_t> pixels;
+        std::vector<TextureMipLevel> mipData;
         TextureSamplerDesc sampler;
     };
     std::vector<PendingTexture> pendingTextures;
     pendingTextures.reserve(std::max(1u, textureCount));
+    uint64_t highPrecisionBytes = 0;
 
     for (uint32_t slot = 0; slot < std::max(1u, textureCount); ++slot) {
         const CachedTextureData* texture = slot < textureCount ? &cached.textures[slot] : nullptr;
         std::vector<uint8_t> pixels;
         uint32_t width = 1;
         uint32_t height = 1;
-        bool srgb = false;
         const char* name = "cached material texture";
         TextureSamplerDesc samplerDesc = materialSamplerDesc;
         if (texture != nullptr && !texture->rgba8.empty() && texture->width > 0 && texture->height > 0) {
             pixels = texture->rgba8;
             width = texture->width;
             height = texture->height;
-            srgb = texture->srgb;
             samplerDesc.minFilter = static_cast<TextureFilter>(texture->minFilter);
             samplerDesc.magFilter = static_cast<TextureFilter>(texture->magFilter);
             samplerDesc.wrapS = static_cast<TextureWrap>(texture->wrapS);
@@ -995,43 +1587,65 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
             name = "default cached material texture";
         }
 
-        const uint32_t mipLevels = std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u));
+        const bool textureCompressed = texture != nullptr && texture->isCompressed;
+        const bool hasUploadedMips = texture != nullptr && !texture->mipData.empty();
+        const uint32_t textureMipLevels = hasUploadedMips
+            ? static_cast<uint32_t>(texture->mipData.size())
+            : (textureCompressed
+                ? std::max(1u, static_cast<uint32_t>(texture->mipLevels))
+                : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u)));
+        const VkFormat textureFormat = cachedMaterialTextureFormat(texture);
+        const uint64_t textureBytes = estimatedTextureBytes(pixels.size(), textureMipLevels, hasUploadedMips);
+        if (isHighPrecisionTextureFormat(textureFormat)) {
+            highPrecisionBytes += textureBytes;
+            warnHighPrecisionTextureMemory(
+                "Cached material",
+                texture != nullptr ? texture->name : std::string{},
+                textureFormat,
+                width,
+                height,
+                textureBytes);
+        }
         auto image = std::make_unique<Image>(allocator_, ImageDesc{
             .width = width,
             .height = height,
-            .mipLevels = mipLevels,
-            .format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
+            .mipLevels = textureMipLevels,
+            .format = textureFormat,
             .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             .debugName = name,
         });
         pendingTextures.push_back({
             std::move(image),
             std::move(pixels),
+            texture != nullptr ? texture->mipData : std::vector<TextureMipLevel>{},
             samplerDesc,
         });
     }
+    warnHighPrecisionTextureBudget("Cached material", highPrecisionBytes);
 
     BatchUploader batch(uploader);
     batch.begin();
     for (auto& pending : pendingTextures) {
-        batch.enqueueImageUpload(*pending.image, pending.pixels.data(), pending.pixels.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        batch.enqueueImageUpload(*pending.image, pending.pixels.data(), pending.pixels.size(), pending.mipData, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
     batch.submit();
 
     std::vector<std::unique_ptr<Image>> images;
     images.reserve(pendingTextures.size());
+    materialTextureSamplerDescs_.reserve(pendingTextures.size());
     for (auto& pending : pendingTextures) {
-        materialTextureSamplers_.push_back(createOwnedMaterialSampler(allocator_.device(), pending.sampler));
+        materialTextureSamplerDescs_.push_back(pending.sampler);
+        materialTextureSamplers_.push_back(createMaterialSampler(allocator_, pending.sampler, materialTextureAnisotropy_));
         images.push_back(std::move(pending.image));
     }
 
     materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
-    rebuildMaterialSamplerDescriptors(maxMaterialTextures);
     std::cout << "Cached material textures resident: " << materialTextureTable_.residentCount() << " / " << materialTextureTable_.slotCount() << " slots\n";
 }
 
-void GpuScene::loadEnvironment(BufferUploader& uploader, const std::filesystem::path& path) {
+void GpuScene::loadEnvironment(BufferUploader& uploader, const std::filesystem::path& path, uint64_t retireFrame) {
     environmentPath_ = path;
+    retireEnvironmentResources(retireFrame);
     createEnvironment(uploader);
 }
 
@@ -1041,19 +1655,8 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
     }
 
     const std::vector<TextureColorUsage> textureUsage = classifyTextureUsage(importedScene, assets);
-    auto textureSlotIndexFor = [&](TextureAssetHandle texture) -> uint32_t {
-        if (!texture.valid()) {
-            return UINT32_MAX;
-        }
-        for (uint32_t slot = 0; slot < importedScene.textures.size() && slot < maxMaterialTextures; ++slot) {
-            if (importedScene.textures[slot].index == texture.index) {
-                return slot;
-            }
-        }
-        return UINT32_MAX;
-    };
     auto textureSlotFor = [&](TextureAssetHandle texture) {
-        const uint32_t slot = textureSlotIndexFor(texture);
+        const uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, texture, maxMaterialTextures);
         return slot == UINT32_MAX ? -1.0f : static_cast<float>(slot);
     };
 
@@ -1065,21 +1668,21 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         const glm::vec3 emissive = material != nullptr ? material->emissiveFactor : glm::vec3(0.0f);
         const float roughness = material != nullptr ? material->roughnessFactor : 1.0f;
         const float metallic = material != nullptr ? material->metallicFactor : 0.0f;
-        const uint32_t type = 3u;
+        const uint32_t type = importedMaterialType(material);
         uint32_t flags = 0;
         if (material != nullptr) {
-            uint32_t slot = textureSlotIndexFor(material->baseColorTexture);
-            if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
+            uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
+            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->baseColorTexture), textureUsage, slot)) {
                 flags |= materialFlagManualBaseColorSrgb;
             }
-            slot = textureSlotIndexFor(material->emissiveTexture);
-            if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
+            slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
+            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->emissiveTexture), textureUsage, slot)) {
                 flags |= materialFlagManualEmissiveSrgb;
             }
         }
 
         materialData.push_back({glm::vec3(base), roughness});
-        materialData.push_back({1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
+        materialData.push_back({material != nullptr ? material->iorFactor : 1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
         materialData.push_back({emissive, base.a});
         materialData.push_back({
             material != nullptr ? textureSlotFor(material->baseColorTexture) : -1.0f,
@@ -1091,6 +1694,14 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
             material != nullptr ? static_cast<float>(material->alphaMode) : 0.0f,
             material != nullptr ? static_cast<float>(material->doubleSided) : 0.0f,
             0.0f});
+        appendConductorOptics(
+            materialData,
+            material,
+            material != nullptr ? textureSlotFor(material->occlusionTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->sheenColorTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->sheenRoughnessTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->iridescenceTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->iridescenceThicknessTexture) : -1.0f);
     }
 
     const VkDeviceSize byteSize = sizeof(glm::vec4) * materialData.size();
@@ -1101,18 +1712,18 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
     return true;
 }
 
-bool GpuScene::updateSceneLights(BufferUploader& uploader, const SceneAsset& scene) {
+bool GpuScene::updateSceneLights(BufferUploader& uploader, const SceneAsset& scene, uint64_t retireFrame) {
     if (lightRecords_ == nullptr || meshParamsBuffer_ == nullptr) {
         return false;
     }
 
     float totalWeight = emissiveLightRecords_.empty() ? 0.0f : emissiveLightRecords_.back().data0.y;
     std::vector<GpuLightRecord> records = combineLightRecords(emissiveLightRecords_, scene.lights, totalWeight, totalWeight);
-    uploadLightRecords(uploader, std::move(records), totalWeight);
+    uploadLightRecords(uploader, std::move(records), totalWeight, retireFrame);
     return true;
 }
 
-bool GpuScene::updateInstanceTransforms(BufferUploader& uploader, const SceneAsset& scene, const AssetManager& assets) {
+bool GpuScene::updateInstanceTransforms(BufferUploader& uploader, const SceneAsset& scene, const AssetManager& assets, uint64_t retireFrame) {
     if (instanceRecords_ == nullptr || instanceBounds_ == nullptr || tlasNodes_ == nullptr || tlasInstanceIndices_ == nullptr || meshParams_.meshCount == 0) {
         return false;
     }
@@ -1171,6 +1782,7 @@ bool GpuScene::updateInstanceTransforms(BufferUploader& uploader, const SceneAss
             .instanceIndex = instanceIndex,
             .meshIndex = meshRecordIndex,
             .transform = transform,
+            .previousTransform = prevTransform,
             .flags = flags,
             .visible = (flags & instanceFlagVisible) != 0u,
         });
@@ -1213,10 +1825,10 @@ bool GpuScene::updateInstanceTransforms(BufferUploader& uploader, const SceneAss
         return false;
     }
 
-    uploadVector(allocator_, uploader, instanceRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceRecords, "updated instance records");
-    uploadVector(allocator_, uploader, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "updated instance bounds");
-    uploadVector(allocator_, uploader, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasData, "updated tlas nodes");
-    uploadVector(allocator_, uploader, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasInstanceIndices, "updated tlas instance indices");
+    retireBuffer(uploadVector(allocator_, uploader, instanceRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceRecords, "updated instance records"), retireFrame);
+    retireBuffer(uploadVector(allocator_, uploader, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "updated instance bounds"), retireFrame);
+    retireBuffer(uploadVector(allocator_, uploader, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasData, "updated tlas nodes"), retireFrame);
+    retireBuffer(uploadVector(allocator_, uploader, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasInstanceIndices, "updated tlas instance indices"), retireFrame);
 
     instanceRecordCpu_ = instanceRecords;
     rayTracingInstances_ = std::move(rayTracingInstances);
@@ -1342,7 +1954,9 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
             0u,
             faceMaterials[triangle],
             triangle,
-            1u));
+            1u,
+            kPrimitiveAlphaClassOpaque,
+            faceMaterials[triangle] < materialOpaqueTraversalSafe.size() && materialOpaqueTraversalSafe[faceMaterials[triangle]]));
     }
     const std::vector<GpuMeshRecord> meshRecords = {
         makeMeshRecord(
@@ -1371,19 +1985,35 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         .indexCount = static_cast<uint32_t>(localIndices.size()),
         .primitiveOffset = 0u,
         .primitiveCount = static_cast<uint32_t>(primitiveRecords.size()),
+        .containsAlphaTestedGeometry = false,
+        .containsBlendedGeometry = false,
         .opaqueTraversalSafe = primitivesAreOpaqueTraversalSafe(
             primitiveRecords,
             0u,
             static_cast<uint32_t>(primitiveRecords.size()),
             materialOpaqueTraversalSafe),
-        .updateMode = AccelUpdateMode::RefitTransform,
+        .updateMode = AccelUpdateMode::Static,
     });
     rayTracingInstances_.clear();
     rayTracingInstances_.push_back(RayTracingInstanceBuildInput{
         .instanceIndex = 0u,
         .meshIndex = 0u,
         .transform = glm::mat4{1.0f},
+        .previousTransform = glm::mat4{1.0f},
+        .flags = instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow,
+        .visible = true,
     });
+    const bool fallbackCameraVisible = std::any_of(
+        rayTracingInstances_.begin(),
+        rayTracingInstances_.end(),
+        [](const RayTracingInstanceBuildInput& instance) {
+            return instance.visible &&
+                (instance.flags & instanceFlagVisible) != 0u &&
+                (instance.flags & instanceFlagVisibleToCamera) != 0u;
+        });
+    if (!fallbackCameraVisible) {
+        throw std::runtime_error("Cornell fallback has no camera-visible ray tracing instance");
+    }
     const CpuBounds sceneBounds = boundsFromPositions(vertices);
     const std::vector<GpuInstanceBoundsRecord> instanceBounds = {
         makeInstanceBoundsRecord(sceneBounds, 0u, 0u),
@@ -1401,6 +2031,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         materialData.push_back({m.emissive, 1.0f});
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 1.0f, 0.0f});
+        appendConductorOptics(materialData, nullptr);
         materialEmissive.push_back(m.emissive);
     }
 
@@ -1433,6 +2064,10 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
               << " triangles=" << meshParams_.triangleCount
               << " bvh_nodes=" << meshParams_.bvhNodeCount
               << " materials=" << meshParams_.materialCount << '\n';
+    rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
+    primitiveRecordCpu_ = primitiveRecords;
+    logRayTracingGeometryStats("Cornell scene", rayTracingGeometryStats_);
+    opacityMicromapData_ = {};
 
     {
         BatchUploader batch(uploader);
@@ -1468,6 +2103,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
     });
     meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
     meshParamsBuffer_->flush(sizeof(meshParams_));
+    uploadLightBvh(uploader, lightRecords);
 }
 
 void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets) {
@@ -1480,6 +2116,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     std::vector<glm::vec4> materialData;
     std::vector<glm::vec3> materialEmissive;
     std::vector<bool> materialOpaqueTraversalSafe;
+    std::vector<uint32_t> materialAlphaClasses;
     std::vector<GpuMeshRecord> meshRecords;
     std::vector<GpuPrimitiveRecord> primitiveRecords;
     std::vector<GpuInstanceRecord> instanceRecords;
@@ -1497,19 +2134,8 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         materialHandles.push_back(MaterialAssetHandle{0});
     }
     const std::vector<TextureColorUsage> textureUsage = classifyTextureUsage(importedScene, assets);
-    auto textureSlotIndexFor = [&](TextureAssetHandle texture) -> uint32_t {
-        if (!texture.valid()) {
-            return UINT32_MAX;
-        }
-        for (uint32_t slot = 0; slot < importedScene.textures.size() && slot < maxMaterialTextures; ++slot) {
-            if (importedScene.textures[slot].index == texture.index) {
-                return slot;
-            }
-        }
-        return UINT32_MAX;
-    };
     auto textureSlotFor = [&](TextureAssetHandle texture) {
-        const uint32_t slot = textureSlotIndexFor(texture);
+        const uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, texture, maxMaterialTextures);
         return slot == UINT32_MAX ? -1.0f : static_cast<float>(slot);
     };
 
@@ -1519,24 +2145,29 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         const glm::vec3 emissive = material != nullptr ? material->emissiveFactor : glm::vec3(0.0f);
         const float roughness = material != nullptr ? material->roughnessFactor : 1.0f;
         const float metallic = material != nullptr ? material->metallicFactor : 0.0f;
-        const uint32_t type = 3u;
+        const uint32_t type = importedMaterialType(material);
         const float baseColorTexture = material != nullptr ? textureSlotFor(material->baseColorTexture) : -1.0f;
         const float normalTexture = material != nullptr ? textureSlotFor(material->normalTexture) : -1.0f;
         const float metallicRoughnessTexture = material != nullptr ? textureSlotFor(material->metallicRoughnessTexture) : -1.0f;
         const float emissiveTexture = material != nullptr ? textureSlotFor(material->emissiveTexture) : -1.0f;
+        const float occlusionTexture = material != nullptr ? textureSlotFor(material->occlusionTexture) : -1.0f;
+        const float sheenColorTexture = material != nullptr ? textureSlotFor(material->sheenColorTexture) : -1.0f;
+        const float sheenRoughnessTexture = material != nullptr ? textureSlotFor(material->sheenRoughnessTexture) : -1.0f;
+        const float iridescenceTexture = material != nullptr ? textureSlotFor(material->iridescenceTexture) : -1.0f;
+        const float iridescenceThicknessTexture = material != nullptr ? textureSlotFor(material->iridescenceThicknessTexture) : -1.0f;
         uint32_t flags = 0;
         if (material != nullptr) {
-            uint32_t slot = textureSlotIndexFor(material->baseColorTexture);
-            if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
+            uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
+            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->baseColorTexture), textureUsage, slot)) {
                 flags |= materialFlagManualBaseColorSrgb;
             }
-            slot = textureSlotIndexFor(material->emissiveTexture);
-            if (slot != UINT32_MAX && !uploadTextureAsSrgb(textureUsage, slot)) {
+            slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
+            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->emissiveTexture), textureUsage, slot)) {
                 flags |= materialFlagManualEmissiveSrgb;
             }
         }
         materialData.push_back({glm::vec3(base), roughness});
-        materialData.push_back({1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
+        materialData.push_back({material != nullptr ? material->iorFactor : 1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
         materialData.push_back({emissive, base.a});
         materialData.push_back({baseColorTexture, normalTexture, metallicRoughnessTexture, emissiveTexture});
         materialData.push_back({
@@ -1544,8 +2175,17 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             material != nullptr ? static_cast<float>(material->alphaMode) : 0.0f,
             material != nullptr ? static_cast<float>(material->doubleSided) : 0.0f,
             0.0f});
+        appendConductorOptics(
+            materialData,
+            material,
+            occlusionTexture,
+            sheenColorTexture,
+            sheenRoughnessTexture,
+            iridescenceTexture,
+            iridescenceThicknessTexture);
         materialEmissive.push_back(emissive);
         materialOpaqueTraversalSafe.push_back(material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u);
+        materialAlphaClasses.push_back(primitiveAlphaClassForMaterial(material));
     }
     if (materialData.empty()) {
         materialData.push_back({0.8f, 0.8f, 0.8f, 1.0f});
@@ -1553,8 +2193,10 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         materialData.push_back({0.0f, 0.0f, 0.0f, 1.0f});
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 0.0f, 0.0f});
+        appendConductorOptics(materialData, nullptr);
         materialEmissive.push_back(glm::vec3(0.0f));
         materialOpaqueTraversalSafe.push_back(false);
+        materialAlphaClasses.push_back(kPrimitiveAlphaClassOpaque);
     }
 
     std::unordered_map<uint32_t, uint32_t> materialIndexForAsset;
@@ -1640,6 +2282,9 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             const uint32_t triangleCount = primitive.indexCount / 3u;
             const auto materialIt = materialIndexForAsset.find(primitive.material.index);
             const uint32_t materialIndex = materialIt != materialIndexForAsset.end() ? materialIt->second : 0u;
+            const uint32_t alphaClass = materialIndex < materialAlphaClasses.size()
+                ? materialAlphaClasses[materialIndex]
+                : kPrimitiveAlphaClassOpaque;
             for (uint32_t triangle = 0; triangle < triangleCount; ++triangle) {
                 prep.faceMaterials.push_back(materialIndex);
             }
@@ -1649,7 +2294,9 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
                 prep.firstVertex + primitive.firstVertex,
                 materialIndex,
                 prep.localTriangleCursor,
-                triangleCount));
+                triangleCount,
+                alphaClass,
+                materialIndex < materialOpaqueTraversalSafe.size() && materialOpaqueTraversalSafe[materialIndex]));
             prep.localTriangleCursor += triangleCount;
         }
         localTriangleCursor = prep.localTriangleCursor;
@@ -1704,12 +2351,22 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             .indexCount = static_cast<uint32_t>(prep.mesh->indices.size()),
             .primitiveOffset = prep.primitiveOffset,
             .primitiveCount = static_cast<uint32_t>(prep.mesh->primitives.size()),
+            .containsAlphaTestedGeometry = meshPrimitiveAlphaClass(
+                primitiveRecords,
+                prep.primitiveOffset,
+                static_cast<uint32_t>(prep.mesh->primitives.size()),
+                kPrimitiveAlphaClassAlphaTested) != 0u,
+            .containsBlendedGeometry = meshPrimitiveAlphaClass(
+                primitiveRecords,
+                prep.primitiveOffset,
+                static_cast<uint32_t>(prep.mesh->primitives.size()),
+                kPrimitiveAlphaClassBlended) != 0u,
             .opaqueTraversalSafe = primitivesAreOpaqueTraversalSafe(
                 primitiveRecords,
                 prep.primitiveOffset,
                 static_cast<uint32_t>(prep.mesh->primitives.size()),
                 materialOpaqueTraversalSafe),
-            .updateMode = AccelUpdateMode::RefitTransform,
+            .updateMode = AccelUpdateMode::Static,
         });
         localMeshBounds.push_back(prep.localBounds);
         meshRecordIndexForAsset.emplace(prep.handle.index, meshRecordIndex);
@@ -1730,6 +2387,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             .instanceIndex = instanceIndex,
             .meshIndex = meshRecordIndex,
             .transform = transform,
+            .previousTransform = transform,
             .flags = flags,
             .visible = (flags & instanceFlagVisible) != 0u,
         });
@@ -1799,6 +2457,11 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
               << " local_triangles=" << meshParams_.localTriangleCount
               << " local_bvh_nodes=" << meshParams_.localBvhNodeCount
               << " tlas_nodes=" << meshParams_.tlasNodeCount << '\n';
+    rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
+    primitiveRecordCpu_ = primitiveRecords;
+    logRayTracingGeometryStats("Imported scene", rayTracingGeometryStats_);
+    opacityMicromapData_ = generateOpacityMicromapData(importedScene, assets, opacityMicromapSubdivisionLevel_);
+    logOpacityMicromapPreprocessStats("Imported scene", opacityMicromapData_.stats);
 
     {
         BatchUploader batch(uploader);
@@ -1834,6 +2497,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     });
     meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
     meshParamsBuffer_->flush(sizeof(meshParams_));
+    uploadLightBvh(uploader, lightRecords);
 
     if (sceneCachePath_.has_value() && !importedScene.sourcePath.empty() && importedScene.lights.empty()) {
         CachedScene gpuCached;
@@ -1873,8 +2537,15 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedTex.width = texture->width;
             cachedTex.height = texture->height;
             cachedTex.channels = texture->channels;
+            cachedTex.mipLevels = texture->mipLevels;
             cachedTex.srgb = texture->srgb;
+            cachedTex.fallback = texture->fallback;
+            cachedTex.isCompressed = texture->isCompressed;
+            cachedTex.linearColorSpace = texture->linearColorSpace;
+            cachedTex.format = static_cast<uint32_t>(texture->format);
+            cachedTex.compressedFormat = static_cast<uint32_t>(texture->compressedFormat);
             cachedTex.rgba8 = texture->rgba8;
+            cachedTex.mipData = texture->mipData;
             cachedTex.minFilter = static_cast<uint32_t>(texture->sampler.minFilter);
             cachedTex.magFilter = static_cast<uint32_t>(texture->sampler.magFilter);
             cachedTex.wrapS = static_cast<uint32_t>(texture->sampler.wrapS);
@@ -1899,13 +2570,58 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMat.emissiveFactor = material->emissiveFactor;
             cachedMat.metallicFactor = material->metallicFactor;
             cachedMat.roughnessFactor = material->roughnessFactor;
+            cachedMat.iorFactor = material->iorFactor;
             cachedMat.alphaCutoff = material->alphaCutoff;
             cachedMat.alphaMode = material->alphaMode;
             cachedMat.doubleSided = material->doubleSided;
+            cachedMat.hasIor = material->hasIor;
+            cachedMat.hasClearcoat = material->hasClearcoat;
+            cachedMat.clearcoatFactor = material->clearcoatFactor;
+            cachedMat.clearcoatRoughnessFactor = material->clearcoatRoughnessFactor;
+            cachedMat.hasTransmission = material->hasTransmission;
+            cachedMat.transmissionFactor = material->transmissionFactor;
+            cachedMat.hasSpecular = material->hasSpecular;
+            cachedMat.specularFactor = material->specularFactor;
+            cachedMat.specularColorFactor = material->specularColorFactor;
+            cachedMat.hasSheen = material->hasSheen;
+            cachedMat.sheenColorFactor = material->sheenColorFactor;
+            cachedMat.sheenRoughnessFactor = material->sheenRoughnessFactor;
+            cachedMat.hasIridescence = material->hasIridescence;
+            cachedMat.iridescenceFactor = material->iridescenceFactor;
+            cachedMat.iridescenceIor = material->iridescenceIor;
+            cachedMat.iridescenceThicknessMinimum = material->iridescenceThicknessMinimum;
+            cachedMat.iridescenceThicknessMaximum = material->iridescenceThicknessMaximum;
+            cachedMat.hasEmissiveStrength = material->hasEmissiveStrength;
+            cachedMat.emissiveStrength = material->emissiveStrength;
+            cachedMat.hasAnisotropy = material->hasAnisotropy;
+            cachedMat.anisotropyStrength = material->anisotropyStrength;
+            cachedMat.anisotropyRotation = material->anisotropyRotation;
+            cachedMat.occlusionStrength = material->occlusionStrength;
+            cachedMat.useConductorOptics = material->useConductorOptics;
+            cachedMat.conductorEta = material->conductorEta;
+            cachedMat.conductorK = material->conductorK;
             cachedMat.baseColorTextureIndex = getTextureIndex(material->baseColorTexture);
             cachedMat.normalTextureIndex = getTextureIndex(material->normalTexture);
             cachedMat.metallicRoughnessTextureIndex = getTextureIndex(material->metallicRoughnessTexture);
             cachedMat.emissiveTextureIndex = getTextureIndex(material->emissiveTexture);
+            cachedMat.clearcoatTextureIndex = getTextureIndex(material->clearcoatTexture);
+            cachedMat.clearcoatRoughnessTextureIndex = getTextureIndex(material->clearcoatRoughnessTexture);
+            cachedMat.clearcoatNormalTextureIndex = getTextureIndex(material->clearcoatNormalTexture);
+            cachedMat.transmissionTextureIndex = getTextureIndex(material->transmissionTexture);
+            cachedMat.specularTextureIndex = getTextureIndex(material->specularTexture);
+            cachedMat.specularColorTextureIndex = getTextureIndex(material->specularColorTexture);
+            cachedMat.sheenColorTextureIndex = getTextureIndex(material->sheenColorTexture);
+            cachedMat.sheenRoughnessTextureIndex = getTextureIndex(material->sheenRoughnessTexture);
+            cachedMat.iridescenceTextureIndex = getTextureIndex(material->iridescenceTexture);
+            cachedMat.iridescenceThicknessTextureIndex = getTextureIndex(material->iridescenceThicknessTexture);
+            cachedMat.anisotropyTextureIndex = getTextureIndex(material->anisotropyTexture);
+            cachedMat.occlusionTextureIndex = getTextureIndex(material->occlusionTexture);
+            cachedMat.baseColorTextureTransform = material->baseColorTextureTransform;
+            cachedMat.metallicRoughnessTextureTransform = material->metallicRoughnessTextureTransform;
+            cachedMat.normalTextureTransform = material->normalTextureTransform;
+            cachedMat.emissiveTextureTransform = material->emissiveTextureTransform;
+            cachedMat.occlusionTextureTransform = material->occlusionTextureTransform;
+            cachedMat.shaderCompatibilityMask = material->shaderCompatibilityMask;
             gpuCached.materials.push_back(std::move(cachedMat));
         }
 
@@ -2013,8 +2729,17 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     rayTracingInstances_.clear();
     std::vector<bool> materialOpaqueTraversalSafe;
     materialOpaqueTraversalSafe.reserve(cached.materials.size());
+    std::vector<uint32_t> materialAlphaClasses;
+    materialAlphaClasses.reserve(cached.materials.size());
     for (const CachedMaterialData& material : cached.materials) {
-        materialOpaqueTraversalSafe.push_back(material.alphaMode == 0u && material.doubleSided != 0u);
+        materialOpaqueTraversalSafe.push_back(material.alphaMode == kMaterialAlphaModeOpaque && material.doubleSided != 0u);
+        if (material.alphaMode == kMaterialAlphaModeMask) {
+            materialAlphaClasses.push_back(kPrimitiveAlphaClassAlphaTested);
+        } else if (material.alphaMode == kMaterialAlphaModeBlend) {
+            materialAlphaClasses.push_back(kPrimitiveAlphaClassBlended);
+        } else {
+            materialAlphaClasses.push_back(kPrimitiveAlphaClassOpaque);
+        }
     }
     for (const auto& cachedPrim : cached.primitiveRecords) {
         GpuPrimitiveRecord rec{};
@@ -2022,6 +2747,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         rec.metadata = cachedPrim.metadata;
         primitiveRecords.push_back(rec);
     }
+    annotatePrimitiveAlphaClasses(primitiveRecords, materialAlphaClasses, &materialOpaqueTraversalSafe);
 
     for (const auto& cachedMesh : cached.meshGpuRecords) {
         GpuMeshRecord rec{};
@@ -2042,12 +2768,22 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
             .indexCount = rec.vertexIndexData.w,
             .primitiveOffset = rec.primitiveData.x,
             .primitiveCount = rec.primitiveData.y,
+            .containsAlphaTestedGeometry = meshPrimitiveAlphaClass(
+                primitiveRecords,
+                rec.primitiveData.x,
+                rec.primitiveData.y,
+                kPrimitiveAlphaClassAlphaTested) != 0u,
+            .containsBlendedGeometry = meshPrimitiveAlphaClass(
+                primitiveRecords,
+                rec.primitiveData.x,
+                rec.primitiveData.y,
+                kPrimitiveAlphaClassBlended) != 0u,
             .opaqueTraversalSafe = primitivesAreOpaqueTraversalSafe(
                 primitiveRecords,
                 rec.primitiveData.x,
                 rec.primitiveData.y,
                 materialOpaqueTraversalSafe),
-            .updateMode = AccelUpdateMode::RefitTransform,
+            .updateMode = AccelUpdateMode::Static,
         });
 
         localBvhData.insert(localBvhData.end(), cachedMesh.localBvh.packedNodes.begin(), cachedMesh.localBvh.packedNodes.end());
@@ -2075,6 +2811,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         GpuInstanceRecord rec{};
         rec.transform = cachedInst.transform;
         rec.inverseTransform = cachedInst.inverseTransform;
+        rec.normalTransform = glm::transpose(cachedInst.inverseTransform);
         rec.prevTransform = cachedInst.transform;
         rec.metadata = cachedInst.metadata;
         instanceRecords.push_back(rec);
@@ -2082,6 +2819,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
             .instanceIndex = static_cast<uint32_t>(instanceRecords.size() - 1),
             .meshIndex = rec.metadata.x,
             .transform = rec.transform,
+            .previousTransform = rec.prevTransform,
             .flags = rec.metadata.w,
         });
     }
@@ -2112,6 +2850,11 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     meshParams_.localIndexCount = static_cast<uint32_t>(localIndices.size());
     const std::vector<glm::vec4> materialData = buildCachedMaterialData(cached);
     meshParams_.materialCount = static_cast<uint32_t>(materialData.size() / materialVec4Stride);
+    rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
+    primitiveRecordCpu_ = primitiveRecords;
+    logRayTracingGeometryStats("Cached scene", rayTracingGeometryStats_);
+    opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_);
+    logOpacityMicromapPreprocessStats("Cached scene", opacityMicromapData_.stats);
 
     {
         BatchUploader batch(uploader);
@@ -2154,6 +2897,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     });
     meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
     meshParamsBuffer_->flush(sizeof(meshParams_));
+    uploadLightBvh(uploader, lightRecords);
 }
 
 void GpuScene::createEnvironment(BufferUploader& uploader) {
@@ -2195,7 +2939,9 @@ void GpuScene::createEnvironment(BufferUploader& uploader) {
         .height = environment.height,
         .backgroundIntensity = 0.35f,
         .procedural = useExternalEnvironment ? 0u : 1u,
+        .skyCdfWidth = 256u,
         .invTotalLum = importance.invTotalLuminance,
+        .skyCdfHeight = 144u,
     };
     envParamsBuffer_ = std::make_unique<Buffer>(allocator_, BufferDesc{
         .size = sizeof(EnvParamsUniform),
@@ -2226,20 +2972,20 @@ void GpuScene::uploadEnvironmentParams() {
     }
 }
 
-void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight) {
+void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight, uint64_t retireFrame) {
     if (lightRecords.empty()) {
         lightRecords.push_back(GpuLightRecord{});
         totalWeight = 0.0f;
     }
 
-    uploadBuffer(
+    retireBuffer(uploadBuffer(
         allocator_,
         uploader,
         lightRecords_,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         lightRecords.data(),
         sizeof(GpuLightRecord) * lightRecords.size(),
-        "scene light records");
+        "scene light records"), retireFrame);
 
     meshParams_.lightCount = static_cast<uint32_t>(lightRecords.size());
     meshParams_.emissiveTotalArea = totalWeight;
@@ -2247,6 +2993,48 @@ void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLight
         meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
         meshParamsBuffer_->flush(sizeof(meshParams_));
     }
+    uploadLightBvh(uploader, lightRecords, retireFrame);
+}
+
+void GpuScene::uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords, uint64_t retireFrame) {
+    std::vector<LightBvhPrimitive> lightPrimitives;
+    lightPrimitives.reserve(lightRecords.size());
+    for (uint32_t i = 0; i < static_cast<uint32_t>(lightRecords.size()); ++i) {
+        lightPrimitives.push_back(makeLightBvhPrimitive(lightRecords[i], i));
+    }
+    std::vector<LightBvhNode> bvhNodes = buildLightBvh(lightPrimitives, 1);
+    const LightBvhStats stats = computeLightBvhStats(bvhNodes);
+    if (stats.nodeCount > 0u) {
+        std::cout << "Light BVH: nodes=" << stats.nodeCount
+                  << " leaves=" << stats.leafCount
+                  << " max_depth=" << stats.maxDepth
+                  << " avg_traversal=" << stats.estimatedAverageTraversalSteps
+                  << " power=[" << stats.minLeafPower << ", " << stats.maxLeafPower << "]\n";
+    }
+    std::vector<glm::vec4> packed = packLightBvhNodesForGpu(bvhNodes);
+    if (packed.empty()) {
+        packed.emplace_back(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    retireBuffer(uploadBuffer(
+        allocator_,
+        uploader,
+        lightBvhNodes_,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        packed.data(),
+        sizeof(glm::vec4) * packed.size(),
+        "scene light bvh nodes"), retireFrame);
+}
+
+uint32_t GpuScene::textureSlotIndexFor(const SceneAsset& scene, TextureAssetHandle texture, uint32_t maxSlots) {
+    if (!texture.valid()) {
+        return UINT32_MAX;
+    }
+    for (uint32_t slot = 0; slot < scene.textures.size() && slot < maxSlots; ++slot) {
+        if (scene.textures[slot].index == texture.index) {
+            return slot;
+        }
+    }
+    return UINT32_MAX;
 }
 
 } // namespace rtv

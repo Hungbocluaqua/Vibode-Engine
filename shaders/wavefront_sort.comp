@@ -1,0 +1,187 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SourceRayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} source_queue;
+
+layout(set = 0, binding = 1, std430) buffer SortedRayQueueBuffer {
+    WavefrontQueueHeader header;
+    WavefrontRay records[];
+} sorted_queue;
+
+layout(set = 0, binding = 2, std430) readonly buffer PixelStateBuffer {
+    WavefrontQueueHeader header;
+    WavefrontPixelState records[];
+} pixel_state;
+
+layout(set = 0, binding = 3, std430) buffer SortValidationBuffer {
+    uvec4 counters;
+    uvec4 metrics;
+    uint bucket_counts[WAVEFRONT_SORT_BUCKET_COUNT];
+    uint bucket_offsets[WAVEFRONT_SORT_BUCKET_COUNT];
+} validation;
+
+layout(set = 0, binding = 4, std430) buffer SortDispatchBuffer {
+    uvec4 args;
+    uvec4 trace_args;
+} sort_dispatch;
+
+layout(push_constant) uniform PushConstants {
+    uint source_capacity;
+    uint sort_capacity;
+    uint pixel_capacity;
+    uint mode;
+    uint bucket_count;
+    uint frame_index;
+    uint flags;
+    uint reserved0;
+} pc;
+
+const uint MODE_CLEAR = 0u;
+const uint MODE_COUNT = 1u;
+const uint MODE_PREFIX = 2u;
+const uint MODE_SCATTER = 3u;
+const uint MODE_VERIFY = 4u;
+const uint PATH_EVENT_BSDF = 1u;
+const uint PATH_EVENT_DELTA = 2u;
+const uint PATH_MATERIAL_BUCKET_SHIFT = 16u;
+const uint PATH_MATERIAL_BUCKET_MASK = 15u;
+
+shared uint local_bucket_counts[WAVEFRONT_SORT_BUCKET_COUNT];
+shared uint local_invalid_pixel_count;
+
+uint source_count() {
+    return min(source_queue.header.counters.x, pc.source_capacity);
+}
+
+uint ray_sort_bucket(WavefrontRay ray) {
+    uint pixel_index = ray.pixel_depth_rng_flags.x;
+    if (pixel_index >= pc.pixel_capacity || pixel_index >= pixel_state.header.counters.y) {
+        return pc.bucket_count - 1u;
+    }
+
+    uint material_bucket = (ray.pixel_depth_rng_flags.w >> PATH_MATERIAL_BUCKET_SHIFT) & PATH_MATERIAL_BUCKET_MASK;
+    uint event_bucket = (ray.pixel_depth_rng_flags.w & PATH_EVENT_DELTA) != 0u ? 1u : 0u;
+    return min((event_bucket << 4u) | material_bucket, pc.bucket_count - 1u);
+}
+
+void clear_sort_state() {
+    uint count = source_count();
+    sorted_queue.header.counters = uvec4(0u, pc.sort_capacity, 0u, 0u);
+    sorted_queue.header.metadata = uvec4(source_queue.header.metadata.x, pc.frame_index, source_queue.header.counters.x, pc.flags);
+    validation.counters = uvec4(source_queue.header.counters.x, 0u, 0u, 0u);
+    validation.metrics = uvec4(0u, 0u, 0u, pc.bucket_count);
+    sort_dispatch.args = uvec4(max((count + 255u) / 256u, 1u), 1u, 1u, 0u);
+    sort_dispatch.trace_args = uvec4(max(count, 1u), 1u, 1u, 0u);
+    for (uint bucket = 0u; bucket < WAVEFRONT_SORT_BUCKET_COUNT; ++bucket) {
+        validation.bucket_counts[bucket] = 0u;
+        validation.bucket_offsets[bucket] = 0u;
+    }
+}
+
+void count_bucket(uint index) {
+    uint local_index = gl_LocalInvocationID.x;
+    for (uint bucket = local_index; bucket < WAVEFRONT_SORT_BUCKET_COUNT; bucket += gl_WorkGroupSize.x) {
+        local_bucket_counts[bucket] = 0u;
+    }
+    if (local_index == 0u) {
+        local_invalid_pixel_count = 0u;
+    }
+    barrier();
+
+    uint count = source_count();
+    if (index < count) {
+        WavefrontRay ray = source_queue.records[index];
+        uint pixel_index = ray.pixel_depth_rng_flags.x;
+        if (pixel_index >= pc.pixel_capacity || pixel_index >= pixel_state.header.counters.y) {
+            atomicAdd(local_invalid_pixel_count, 1u);
+        }
+        atomicAdd(local_bucket_counts[ray_sort_bucket(ray)], 1u);
+    }
+    barrier();
+
+    uint bucket_limit = min(pc.bucket_count, WAVEFRONT_SORT_BUCKET_COUNT);
+    for (uint bucket = local_index; bucket < bucket_limit; bucket += gl_WorkGroupSize.x) {
+        uint bucket_count = local_bucket_counts[bucket];
+        if (bucket_count > 0u) {
+            atomicAdd(validation.bucket_counts[bucket], bucket_count);
+        }
+    }
+    if (local_index == 0u && local_invalid_pixel_count > 0u) {
+        atomicAdd(validation.metrics.y, local_invalid_pixel_count);
+    }
+}
+
+void prefix_buckets() {
+    uint running = 0u;
+    uint active_bucket_count = 0u;
+    for (uint bucket = 0u; bucket < pc.bucket_count; ++bucket) {
+        uint count = validation.bucket_counts[bucket];
+        validation.bucket_offsets[bucket] = running;
+        running += count;
+        if (count > 0u) {
+            active_bucket_count += 1u;
+        }
+    }
+    validation.counters.y = running;
+    validation.counters.z = active_bucket_count;
+    sorted_queue.header.counters.x = min(running, pc.sort_capacity);
+    sort_dispatch.trace_args = uvec4(max(sorted_queue.header.counters.x, 1u), 1u, 1u, 0u);
+}
+
+void scatter_ray(uint index) {
+    uint count = source_count();
+    if (index >= count) {
+        return;
+    }
+
+    WavefrontRay ray = source_queue.records[index];
+    uint bucket = ray_sort_bucket(ray);
+    uint output_index = atomicAdd(validation.bucket_offsets[bucket], 1u);
+    if (output_index >= pc.sort_capacity) {
+        atomicAdd(validation.metrics.x, 1u);
+        return;
+    }
+    sorted_queue.records[output_index] = ray;
+}
+
+void verify_sorted_order(uint index) {
+    uint count = min(sorted_queue.header.counters.x, pc.sort_capacity);
+    if (index >= count) {
+        return;
+    }
+    atomicAdd(validation.counters.w, 1u);
+    if (index == 0u) {
+        return;
+    }
+    uint previous_bucket = ray_sort_bucket(sorted_queue.records[index - 1u]);
+    uint current_bucket = ray_sort_bucket(sorted_queue.records[index]);
+    if (current_bucket < previous_bucket) {
+        atomicAdd(validation.metrics.z, 1u);
+    }
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (pc.mode == MODE_CLEAR) {
+        if (index == 0u) {
+            clear_sort_state();
+        }
+    } else if (pc.mode == MODE_COUNT) {
+        count_bucket(index);
+    } else if (pc.mode == MODE_PREFIX) {
+        if (index == 0u) {
+            prefix_buckets();
+        }
+    } else if (pc.mode == MODE_SCATTER) {
+        scatter_ray(index);
+    } else if (pc.mode == MODE_VERIFY) {
+        verify_sorted_order(index);
+    }
+}
