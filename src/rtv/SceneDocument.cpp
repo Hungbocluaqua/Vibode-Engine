@@ -537,6 +537,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         return false;
     }
 
+    renderSettings_ = RenderSettings{};
+
     sourceGltfPath_.reset();
     sourceHdrPath_.reset();
     if (const std::string source = root.value("sourceGltf", std::string{}); !source.empty()) {

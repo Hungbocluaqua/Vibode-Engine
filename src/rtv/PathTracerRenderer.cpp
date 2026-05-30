@@ -3408,11 +3408,13 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                         bounce == 1u ? GpuProfiler::WavefrontSecondaryTraceStart : GpuProfiler::Count,
                         bounce == 1u ? GpuProfiler::WavefrontSecondaryTraceEnd : GpuProfiler::Count);
                 });
-            graph.addPass(("wavefront_final_shade_validation_clear" + suffix).c_str())
-                .addStorageWrite(wavefrontFinalShadeValidation, PipelineDomain::Transfer)
-                .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
-                    vkCmdFillBuffer(cmd, wavefrontSecondaryShadeValidationBuffer_.handle(), 0, wavefrontSecondaryShadeValidationBuffer_.size(), 0u);
-                });
+            if (bounce == 1u) {
+                graph.addPass(("wavefront_final_shade_validation_clear" + suffix).c_str())
+                    .addStorageWrite(wavefrontFinalShadeValidation, PipelineDomain::Transfer)
+                    .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                        vkCmdFillBuffer(cmd, wavefrontSecondaryShadeValidationBuffer_.handle(), 0, wavefrontSecondaryShadeValidationBuffer_.size(), 0u);
+                    });
+            }
             RenderGraphPass& finalSecondaryShadePass = graph.addPass(("wavefront_final_secondary_shade" + suffix).c_str())
                 .addStorageRead(wavefrontCompactedRayQueue, PipelineDomain::Compute)
                 .addStorageRead(wavefrontHitQueue, PipelineDomain::Compute)
@@ -4973,8 +4975,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
                 .addStorageRead(wavefrontCompactedRayQueue, PipelineDomain::RayTracing)
                 .addStorageRead(wavefrontSortDispatch, PipelineDomain::RayTracing)
                 .addStorageWrite(wavefrontHitQueue, PipelineDomain::RayTracing);
-            graph.addPass(("wavefront_final_shade_validation_clear" + suffix).c_str())
-                .addStorageWrite(wavefrontFinalShadeValidation, PipelineDomain::Transfer);
+            if (bounce == 1u) {
+                graph.addPass(("wavefront_final_shade_validation_clear" + suffix).c_str())
+                    .addStorageWrite(wavefrontFinalShadeValidation, PipelineDomain::Transfer);
+            }
             RenderGraphPass& finalSecondaryShadePass = graph.addPass(("wavefront_final_secondary_shade" + suffix).c_str())
                 .addStorageRead(wavefrontCompactedRayQueue, PipelineDomain::Compute)
                 .addStorageRead(wavefrontHitQueue, PipelineDomain::Compute)

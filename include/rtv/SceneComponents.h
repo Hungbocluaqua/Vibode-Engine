@@ -154,7 +154,7 @@ struct RenderSettings {
     float resolutionScale = 0.65f;
     float materialTextureAnisotropy = 4.0f;
     bool specularAaEnabled = true;
-    bool opacityMicromapsEnabled = false;
+    bool opacityMicromapsEnabled = true;
     float shadowRayBias = 0.001f;
     float shadowDistanceBias = 0.002f;
     float fireflyClamp = 8.0f;

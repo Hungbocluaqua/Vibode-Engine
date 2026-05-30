@@ -71,7 +71,7 @@ struct RendererSettings {
     float renderResolutionScale = 0.65f;
     float materialTextureAnisotropy = 4.0f;
     bool specularAaEnabled = true;
-    bool opacityMicromapsEnabled = false;
+    bool opacityMicromapsEnabled = true;
     uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel;
     bool wavefrontQueuesEnabled = false;
     bool wavefrontPrimaryGenerateEnabled = false;
@@ -81,7 +81,7 @@ struct RendererSettings {
     bool wavefrontCompactEnabled = false;
     bool wavefrontSortEnabled = false;
     bool wavefrontFinalOutputEnabled = false;
-    bool shaderExecutionReorderingEnabled = false;
+    bool shaderExecutionReorderingEnabled = true;
     uint32_t accumulationLimit = 0;
     RendererDebugView debugView = RendererDebugView::Beauty;
     float debugScale = 1.0f;

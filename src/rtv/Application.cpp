@@ -940,6 +940,7 @@ void Application::initVulkan() {
         startupSettings.renderPreset = RenderPreset::Custom;
     }
     createPathTracer(&startupSettings);
+    syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
     applyActiveSceneCamera();
     sceneDocument_.clearDirty();
     if (!headless_) {
