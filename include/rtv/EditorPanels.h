@@ -3,6 +3,8 @@
 #include "rtv/EditorSelection.h"
 #include "rtv/MeshAsset.h"
 #include "rtv/PathTracerRenderer.h"
+#include "rtv/Project.h"
+#include "rtv/AssetRegistry.h"
 #include "rtv/SceneDocument.h"
 
 #include <Volk/volk.h>
@@ -28,6 +30,10 @@ struct EditorPanelVisibility {
     bool sceneHierarchy = true;
     bool inspector = true;
     bool assetBrowser = true;
+    bool renderWorldSettings = true;
+    bool timeline = true;
+    bool log = true;
+    bool console = false;
     bool materialEditor = false;
     bool renderSettings = true;
     bool debugProfiler = true;
@@ -57,6 +63,10 @@ struct EditorRuntimeState {
     const AssetManager* assets = nullptr;
     const std::optional<std::filesystem::path>* gltfPath = nullptr;
     const std::optional<std::filesystem::path>* hdrPath = nullptr;
+    const std::optional<std::filesystem::path>* scenePath = nullptr;
+    const ProjectContext* project = nullptr;
+    const AssetRegistry* assetRegistry = nullptr;
+    bool sceneDirty = false;
     const std::vector<EntityId>* instanceEntities = nullptr;
     const std::string* sceneLoadingStatus = nullptr;
     const CameraController* camera = nullptr;
@@ -141,6 +151,16 @@ struct EditorCameraChange {
 struct EditorRequests {
     std::optional<RendererSettings> settings;
     std::optional<AccumulationResetReason> resetAccumulation;
+    bool newScene = false;
+    std::optional<std::filesystem::path> openScene;
+    std::optional<std::filesystem::path> saveScene;
+    std::optional<std::filesystem::path> saveSceneAs;
+    std::optional<std::filesystem::path> importAsset;
+    std::optional<std::filesystem::path> importAndPlace;
+    std::optional<std::filesystem::path> importSceneAsNewScene;
+    std::optional<std::filesystem::path> mergeScene;
+    std::optional<CreateProjectRequest> createProject;
+    std::optional<OpenProjectRequest> openProject;
     std::optional<std::filesystem::path> loadGltf;
     std::optional<std::filesystem::path> loadHdr;
     std::optional<std::filesystem::path> saveSceneJson;
@@ -172,6 +192,9 @@ struct EditorRequests {
     bool toggleDebugView = false;
     bool cycleIntermediateView = false;
     bool ensurePrimarySun = false;
+    bool closeProject = false;
+    bool saveProjectSettings = false;
+    bool showProjectManager = false;
     bool exit = false;
     std::optional<std::string> saveCameraBookmark;
     std::optional<size_t> loadCameraBookmarkIndex;

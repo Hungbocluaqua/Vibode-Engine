@@ -38,6 +38,10 @@
 #include <glm/gtc/constants.hpp>
 #include <glm/gtc/quaternion.hpp>
 
+#if defined(_WIN32)
+#include <Windows.h>
+#endif
+
 namespace rtv {
 
 namespace {
@@ -117,6 +121,10 @@ RendererSettings interactiveSettingsForScene(RendererSettings settings, const Sc
 }
 
 glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity);
+
+std::wstring widenAscii(std::string_view value) {
+    return std::wstring(value.begin(), value.end());
+}
 
 void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings& settings) {
     RenderSettings& render = document.renderSettings();
@@ -895,6 +903,7 @@ void Application::initVulkan() {
     } else if (!loadedSceneDocument) {
         initializeFallbackSceneDocument();
     }
+    sceneUnsavedDirty_ = false;
     sceneDocument_.setSourceHdrPath(hdrPath_);
     rebuildGpuSceneAsset();
     RendererSettings startupSettings{};
@@ -950,6 +959,13 @@ void Application::initVulkan() {
         }
         commandSystem_->setUiOverlay(uiOverlay_.get());
         uiOverlay_->editor().editorPrefs().load(EditorPreferences::defaultPath());
+        EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+        if (!scenePath_.has_value() && !gltfPath_.has_value() && prefs.openLastProject && !prefs.lastOpenedProject.empty() &&
+            std::filesystem::exists(prefs.lastOpenedProject)) {
+            if (openProjectFromFile(prefs.lastOpenedProject, false)) {
+                (void)applyPendingSceneUpdate(true);
+            }
+        }
     }
     commandSystem_->setPathTracer(pathTracer_.get());
 }
@@ -1029,6 +1045,10 @@ void Application::mainLoop(uint32_t maxFrames) {
                 importedScene_ ? &assets_ : nullptr,
                 gltfPath_,
                 hdrPath_,
+                scenePath_,
+                project_ ? &*project_ : nullptr,
+                project_ ? &assetRegistry_ : nullptr,
+                sceneUnsavedDirty_,
                 &gpuInstanceEntities_,
                 sceneLoadingStatus_,
                 &cameraController_,
@@ -1080,6 +1100,10 @@ void Application::onFilesDropped(int count, const char** paths) {
         });
         if (extension != ".hdr") {
             if (extension == ".gltf" || extension == ".glb") {
+                if (!confirmDestructiveSceneAction("importing a scene as a new scene")) {
+                    std::cout << "Dropped scene import cancelled: " << path.string() << '\n';
+                    continue;
+                }
                 requestGltfSceneLoad(path);
             } else {
                 std::cout << "Dropped file ignored: " << path.string() << " (supported: .hdr, .gltf, .glb)\n";
@@ -1129,8 +1153,8 @@ void Application::requestGltfSceneLoad(const std::filesystem::path& path) {
     }
 
     pendingSceneLoadPath_ = path;
-    sceneLoadingStatus_ = "Loading glTF in background: " + path.string();
-    notifications_.notify("Loading glTF scene", NotificationType::Info);
+    sceneLoadingStatus_ = "Importing scene as new scene in background: " + path.string();
+    notifications_.notify("Importing scene as new scene", NotificationType::Info);
     std::cout << sceneLoadingStatus_ << '\n';
     pendingSceneLoad_ = std::async(std::launch::async, [path]() {
         PendingSceneLoadResult result;
@@ -1156,8 +1180,8 @@ void Application::pollAsyncSceneLoad() {
     PendingSceneLoadResult result = pendingSceneLoad_.get();
     pendingSceneLoadPath_.reset();
     if (!result.error.empty()) {
-        sceneLoadingStatus_ = "glTF load failed: " + result.error;
-        notifications_.notify("glTF load failed", NotificationType::Error);
+        sceneLoadingStatus_ = "Import scene failed: " + result.error;
+        notifications_.notify("Import scene failed", NotificationType::Error);
         std::cerr << sceneLoadingStatus_ << '\n';
         return;
     }
@@ -1171,8 +1195,8 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
         return;
     }
     if (!result.error.empty()) {
-        sceneLoadingStatus_ = "glTF load failed: " + result.error;
-        notifications_.notify("glTF load failed", NotificationType::Error);
+        sceneLoadingStatus_ = "Import scene failed: " + result.error;
+        notifications_.notify("Import scene failed", NotificationType::Error);
         std::cerr << sceneLoadingStatus_ << '\n';
         return;
     }
@@ -1209,8 +1233,10 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
         assets_ = std::move(result.assets);
         importedScene_ = std::move(result.scene);
         gltfPath_ = result.path;
+        scenePath_.reset();
         sceneDocument_ = std::move(nextDocument);
         sceneDocument_.clearDirty();
+        sceneUnsavedDirty_ = true;
         undoStack_.clear();
         gpuSceneAsset_ = std::move(build.sceneAsset);
         gpuInstanceEntities_ = std::move(build.instanceEntities);
@@ -1219,22 +1245,258 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
         applyActiveSceneCamera();
         commandSystem_->setPathTracer(pathTracer_.get());
     } catch (const std::exception& error) {
-        sceneLoadingStatus_ = "glTF GPU finalization failed: " + std::string(error.what());
-        notifications_.notify("glTF GPU finalization failed", NotificationType::Error);
+        sceneLoadingStatus_ = "Import scene GPU finalization failed: " + std::string(error.what());
+        notifications_.notify("Import scene GPU finalization failed", NotificationType::Error);
         std::cerr << sceneLoadingStatus_ << '\n';
         return;
     }
 
-    sceneLoadingStatus_ = "Loaded glTF: " + result.path.string();
+    sceneLoadingStatus_ = "Imported scene as new scene: " + result.path.string();
     if (uiOverlay_) {
         uiOverlay_->editor().editorPrefs().addRecentFile(result.path);
     }
-    notifications_.notify("Scene loaded", NotificationType::Success);
-    std::cout << "Reloaded glTF: " << result.path.string()
+    notifications_.notify("Scene imported as new scene", NotificationType::Success);
+    std::cout << "Imported scene as new scene: " << result.path.string()
               << " meshes=" << importedScene_->meshes.size()
               << " materials=" << importedScene_->materials.size()
-              << " textures=" << importedScene_->textures.size()
-              << " nodes=" << importedScene_->nodes.size() << '\n';
+               << " textures=" << importedScene_->textures.size()
+               << " nodes=" << importedScene_->nodes.size() << '\n';
+}
+
+Application::DirtyScenePromptResult Application::promptDirtySceneBefore(std::string_view action) const {
+    if (!sceneUnsavedDirty_) {
+        return DirtyScenePromptResult::Discard;
+    }
+
+    const std::string sceneName = scenePath_.has_value()
+        ? scenePath_->filename().string()
+        : (gltfPath_.has_value() ? gltfPath_->filename().string() : std::string("Untitled Scene"));
+    const std::string message = "Save changes to " + sceneName + " before " + std::string(action) + "?\n\n"
+        "Unsaved changes will be lost if you choose Do Not Save.";
+
+#if defined(_WIN32)
+    const std::wstring wideMessage = widenAscii(message);
+    const int result = MessageBoxW(
+        nullptr,
+        wideMessage.c_str(),
+        L"Unsaved Scene Changes",
+        MB_ICONWARNING | MB_YESNOCANCEL | MB_DEFBUTTON1 | MB_APPLMODAL);
+    if (result == IDYES) {
+        return DirtyScenePromptResult::Save;
+    }
+    if (result == IDNO) {
+        return DirtyScenePromptResult::Discard;
+    }
+#else
+    std::cerr << message << "\nAction cancelled because modal dirty-scene prompts are only implemented on this platform.\n";
+#endif
+    return DirtyScenePromptResult::Cancel;
+}
+
+bool Application::saveCurrentSceneForDirtyPrompt() {
+    std::filesystem::path savePath;
+    if (scenePath_.has_value()) {
+        savePath = *scenePath_;
+    } else if (auto selected = saveSceneJsonFileDialog()) {
+        savePath = *selected;
+    }
+
+    if (savePath.empty()) {
+        notifications_.notify("Scene save cancelled", NotificationType::Warning);
+        return false;
+    }
+
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->editor().cameraBookmarks().serialize(sceneDocument_);
+    }
+    if (!sceneDocument_.saveJson(savePath)) {
+        notifications_.notify("Scene save failed", NotificationType::Error);
+        std::cerr << "Scene save failed: " << savePath.string() << '\n';
+        return false;
+    }
+
+    scenePath_ = savePath;
+    sceneDocument_.clearDirty();
+    sceneUnsavedDirty_ = false;
+    notifications_.notify("Scene saved", NotificationType::Success);
+    std::cout << "Saved scene: " << savePath.string() << '\n';
+    return true;
+}
+
+bool Application::confirmDestructiveSceneAction(std::string_view action) {
+    switch (promptDirtySceneBefore(action)) {
+    case DirtyScenePromptResult::Discard:
+        return true;
+    case DirtyScenePromptResult::Save:
+        return saveCurrentSceneForDirtyPrompt();
+    case DirtyScenePromptResult::Cancel:
+        notifications_.notify("Scene action cancelled", NotificationType::Warning);
+        return false;
+    }
+    return false;
+}
+
+bool Application::writeDefaultProjectScene(const ProjectContext& project, std::string_view templateName) {
+    SceneDocument document;
+    EntityId camera = document.registry().createEntity("Camera");
+    Camera cameraComponent;
+    cameraComponent.active = true;
+    document.registry().addCamera(camera, cameraComponent);
+    document.setActiveCamera(camera);
+
+    EntityId sun = document.registry().createEntity("Sun Light");
+    if (Entity* sunEntity = document.registry().entity(sun)) {
+        sunEntity->sun = Sun{};
+        sunEntity->transform = SunController::transformFromWorldAngles(
+            document.registry(), *sunEntity, sunEntity->transform, 0.85f, glm::pi<float>());
+    }
+    document.setPrimarySun(sun);
+
+    (void)document.registry().createEntity("Environment Light");
+    if (templateName == "Lighting Test Scene") {
+        EntityId light = document.registry().createEntity("Area Light");
+        if (Entity* entity = document.registry().entity(light)) {
+            entity->light = Light{};
+            entity->transform.position = glm::vec3(0.0f, 2.2f, 0.0f);
+        }
+        (void)document.registry().createEntity("Post Process Volume");
+    }
+
+    document.clearDirty();
+    return document.saveJson(project.startupScene);
+}
+
+bool Application::loadProjectStartupScene(const ProjectContext& project) {
+    if (!std::filesystem::exists(project.startupScene)) {
+        initializeFallbackSceneDocument();
+        scenePath_.reset();
+        gltfPath_.reset();
+        importedScene_.reset();
+        assets_.clear();
+        undoStack_.clear();
+        sceneUnsavedDirty_ = false;
+        notifications_.notify("Project startup scene missing", NotificationType::Warning);
+        return true;
+    }
+
+    if (!sceneDocument_.loadJson(project.startupScene)) {
+        notifications_.notify("Project startup scene load failed", NotificationType::Error);
+        return false;
+    }
+
+    scenePath_ = project.startupScene;
+    gltfPath_ = sceneDocument_.sourceGltfPath();
+    hdrPath_ = sceneDocument_.sourceHdrPath();
+    assets_.clear();
+    importedScene_.reset();
+    if (gltfPath_.has_value() && std::filesystem::exists(*gltfPath_)) {
+        try {
+            GltfLoader loader(assets_);
+            importedScene_ = loader.loadWithCache(*gltfPath_);
+        } catch (const std::exception& error) {
+            std::cerr << "Referenced glTF load failed for project startup scene: " << error.what() << '\n';
+        }
+    }
+    (void)SunController::migrateLegacyDirectionalSun(sceneDocument_);
+    (void)SunController::repairPrimarySunTransform(sceneDocument_);
+    undoStack_.clear();
+    sceneUnsavedDirty_ = false;
+    return true;
+}
+
+bool Application::openProjectFromFile(const std::filesystem::path& projectFile, bool promptForDirtyScene) {
+    if (promptForDirtyScene && !confirmDestructiveSceneAction("opening a project")) {
+        return false;
+    }
+
+    ProjectContext project;
+    std::string error;
+    if (!loadProjectFile(projectFile, project, &error)) {
+        notifications_.notify("Project open failed", NotificationType::Error);
+        std::cerr << "Project open failed: " << projectFile.string() << " " << error << '\n';
+        return false;
+    }
+    if (!createProjectFolders(project, true, &error)) {
+        notifications_.notify("Project folder validation failed", NotificationType::Error);
+        std::cerr << "Project folder validation failed: " << error << '\n';
+        return false;
+    }
+    if (!assetRegistry_.load(project.assetRegistryPath, &error)) {
+        notifications_.notify("Asset registry load failed", NotificationType::Error);
+        std::cerr << "Asset registry load failed: " << error << '\n';
+        return false;
+    }
+
+    project_ = project;
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->editor().editorPrefs().addRecentProject(project.projectFile);
+        uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+    }
+
+    if (!loadProjectStartupScene(*project_)) {
+        project_.reset();
+        return false;
+    }
+
+    sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+    notifications_.notify("Project opened", NotificationType::Success);
+    std::cout << "Opened project: " << project.projectFile.string() << '\n';
+    return true;
+}
+
+bool Application::createProjectFromRequest(const CreateProjectRequest& request) {
+    if (request.name.empty()) {
+        notifications_.notify("Project name is required", NotificationType::Error);
+        return false;
+    }
+    if (!confirmDestructiveSceneAction("creating a project")) {
+        return false;
+    }
+
+    const std::filesystem::path projectRoot = request.location / request.name;
+    ProjectContext project = makeProjectContext(request.name, projectRoot, projectRoot / (request.name + ".rtproject"));
+    std::string error;
+    if (!createProjectFolders(project, request.createDefaultContentFolders, &error)) {
+        notifications_.notify("Project folder creation failed", NotificationType::Error);
+        std::cerr << "Project folder creation failed: " << error << '\n';
+        return false;
+    }
+    if (request.createDefaultScene && !writeDefaultProjectScene(project, request.templateName)) {
+        notifications_.notify("Default scene creation failed", NotificationType::Error);
+        return false;
+    }
+    if (!saveProjectFile(project)) {
+        notifications_.notify("Project file save failed", NotificationType::Error);
+        return false;
+    }
+    return openProjectFromFile(project.projectFile, false);
+}
+
+bool Application::closeCurrentProject() {
+    if (!project_.has_value()) {
+        return true;
+    }
+    if (!confirmDestructiveSceneAction("closing the project")) {
+        return false;
+    }
+    if (assetRegistry_.dirty() && !assetRegistry_.save()) {
+        notifications_.notify("Asset registry save failed", NotificationType::Error);
+        return false;
+    }
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+    }
+    project_.reset();
+    assetRegistry_.clear();
+    initializeFallbackSceneDocument();
+    scenePath_.reset();
+    gltfPath_.reset();
+    importedScene_.reset();
+    assets_.clear();
+    undoStack_.clear();
+    sceneUnsavedDirty_ = false;
+    notifications_.notify("Project closed", NotificationType::Info);
+    return true;
 }
 
 void Application::applyEditorRequests(const EditorRequests& requests, bool allowResourceRebuild) {
@@ -1245,18 +1507,22 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     if (!allowResourceRebuild) {
         if (requests.undo) {
             if (undoStack_.undo()) {
+                sceneUnsavedDirty_ = true;
                 notifications_.notify("Undo", NotificationType::Info);
             }
         }
         if (requests.redo) {
             if (undoStack_.redo()) {
+                sceneUnsavedDirty_ = true;
                 notifications_.notify("Redo", NotificationType::Info);
             }
         }
         if (requests.settings.has_value()) {
+            sceneUnsavedDirty_ = true;
             applyRendererSettingsSafely(*requests.settings, false);
         }
         if (requests.previewEntityTransform.has_value()) {
+            sceneUnsavedDirty_ = true;
             if (Entity* entity = sceneDocument_.registry().entity(requests.previewEntityTransform->entity)) {
                 entity->transform = requests.previewEntityTransform->transform;
                 entity->transform.dirty = true;
@@ -1267,6 +1533,11 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         if (requests.toggleDenoiser) {
             RendererSettings settings = pathTracer_->settings();
             settings.denoiserEnabled = !settings.denoiserEnabled;
+            applyRendererSettingsSafely(settings, false);
+        }
+        if (requests.toggleDebugView) {
+            RendererSettings settings = pathTracer_->settings();
+            settings.debugView = nextDebugView(settings.debugView);
             applyRendererSettingsSafely(settings, false);
         }
         if (requests.cycleIntermediateView) {
@@ -1288,6 +1559,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         if (requests.resetCamera) {
             cameraController_.reset(*pathTracer_);
         }
+        if (requests.sceneUpdate.has_value()) {
+            sceneDocument_.markDirty(*requests.sceneUpdate);
+        }
         return;
     }
 
@@ -1297,10 +1571,31 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         applyRendererSettingsSafely(pending, true);
     }
 
+    if (requests.createProject.has_value()) {
+        (void)createProjectFromRequest(*requests.createProject);
+    }
+    if (requests.openProject.has_value()) {
+        (void)openProjectFromFile(requests.openProject->projectFile, true);
+    }
+    if (requests.saveProjectSettings && project_.has_value()) {
+        const bool projectSaved = saveProjectFile(*project_);
+        const bool registrySaved = !assetRegistry_.dirty() || assetRegistry_.save();
+        if (projectSaved && registrySaved) {
+            assetRegistry_.clearDirty();
+            notifications_.notify("Project settings saved", NotificationType::Success);
+        } else {
+            notifications_.notify("Project settings save failed", NotificationType::Error);
+        }
+    }
+    if (requests.closeProject) {
+        (void)closeCurrentProject();
+    }
+
     if (requests.loadHdr.has_value()) {
         try {
             pathTracer_->loadEnvironment(*requests.loadHdr);
             hdrPath_ = *requests.loadHdr;
+            sceneUnsavedDirty_ = true;
             uiOverlay_->editor().editorPrefs().addRecentFile(*requests.loadHdr);
             sceneDocument_.setSourceHdrPath(hdrPath_);
             RendererSettings settings = pathTracer_->settings();
@@ -1312,39 +1607,70 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         }
     }
 
-    if (requests.saveSceneJson.has_value()) {
+    const std::optional<std::filesystem::path>& saveScenePath = requests.saveSceneAs.has_value()
+        ? requests.saveSceneAs
+        : (requests.saveScene.has_value() ? requests.saveScene : requests.saveSceneJson);
+    if (saveScenePath.has_value()) {
         if (uiOverlay_ != nullptr) {
             uiOverlay_->editor().cameraBookmarks().serialize(sceneDocument_);
         }
-        if (sceneDocument_.saveJson(*requests.saveSceneJson)) {
-            std::cout << "Saved scene JSON: " << requests.saveSceneJson->string() << '\n';
+        if (sceneDocument_.saveJson(*saveScenePath)) {
+            scenePath_ = *saveScenePath;
+            sceneDocument_.clearDirty();
+            sceneUnsavedDirty_ = false;
+            std::cout << "Saved scene: " << saveScenePath->string() << '\n';
         } else {
-            std::cerr << "Scene JSON save failed: " << requests.saveSceneJson->string() << '\n';
+            std::cerr << "Scene save failed: " << saveScenePath->string() << '\n';
         }
     }
 
-    if (requests.loadSceneJson.has_value()) {
-        if (sceneDocument_.loadJson(*requests.loadSceneJson)) {
-            if (uiOverlay_ != nullptr) {
-                uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
-            }
-            gltfPath_ = sceneDocument_.sourceGltfPath();
-            hdrPath_ = sceneDocument_.sourceHdrPath();
-            if (gltfPath_.has_value() && std::filesystem::exists(*gltfPath_)) {
-                try {
-                    assets_.clear();
-                    GltfLoader loader(assets_);
-                    importedScene_ = loader.loadWithCache(*gltfPath_);
-                } catch (const std::exception& error) {
-                    std::cerr << "Referenced glTF load failed for level: " << error.what() << '\n';
-                }
-            }
-            (void)SunController::migrateLegacyDirectionalSun(sceneDocument_);
-            (void)SunController::repairPrimarySunTransform(sceneDocument_);
-            undoStack_.clear();
-            std::cout << "Loaded scene JSON: " << requests.loadSceneJson->string() << '\n';
+    const std::optional<std::filesystem::path>& openScenePath = requests.openScene.has_value()
+        ? requests.openScene
+        : requests.loadSceneJson;
+    if (openScenePath.has_value()) {
+        if (!confirmDestructiveSceneAction("opening another scene")) {
+            std::cout << "Open scene cancelled: " << openScenePath->string() << '\n';
         } else {
-            std::cerr << "Scene JSON load failed: " << requests.loadSceneJson->string() << '\n';
+            if (sceneDocument_.loadJson(*openScenePath)) {
+                if (uiOverlay_ != nullptr) {
+                    uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
+                }
+                scenePath_ = *openScenePath;
+                gltfPath_ = sceneDocument_.sourceGltfPath();
+                hdrPath_ = sceneDocument_.sourceHdrPath();
+                if (gltfPath_.has_value() && std::filesystem::exists(*gltfPath_)) {
+                    try {
+                        assets_.clear();
+                        GltfLoader loader(assets_);
+                        importedScene_ = loader.loadWithCache(*gltfPath_);
+                    } catch (const std::exception& error) {
+                        std::cerr << "Referenced glTF load failed for level: " << error.what() << '\n';
+                    }
+                }
+                (void)SunController::migrateLegacyDirectionalSun(sceneDocument_);
+                (void)SunController::repairPrimarySunTransform(sceneDocument_);
+                undoStack_.clear();
+                sceneUnsavedDirty_ = false;
+                std::cout << "Opened scene: " << openScenePath->string() << '\n';
+            } else {
+                std::cerr << "Open scene failed: " << openScenePath->string() << '\n';
+            }
+        }
+    }
+
+    if (requests.newScene) {
+        if (!confirmDestructiveSceneAction("creating a new scene")) {
+            std::cout << "New scene cancelled\n";
+        } else {
+            initializeFallbackSceneDocument();
+            scenePath_.reset();
+            gltfPath_.reset();
+            importedScene_.reset();
+            assets_.clear();
+            undoStack_.clear();
+            sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+            sceneUnsavedDirty_ = true;
+            notifications_.notify("New scene created", NotificationType::Info);
         }
     }
 
@@ -1371,7 +1697,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 pathTracer_->resetAccumulation(AccumulationResetReason::MaterialChanged);
             }
             sceneDocument_.markDirty(SceneUpdateKind::MaterialOnly);
-            sceneDocument_.clearDirty();
+            sceneUnsavedDirty_ = true;
         }
     }
 
@@ -1383,6 +1709,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 mesh->primitives[requests.materialAssignment->primitiveIndex],
                 assets_.material(requests.materialAssignment->material));
             sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+            sceneUnsavedDirty_ = true;
         }
     }
 
@@ -1411,6 +1738,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             break;
         }
         if (created.valid()) {
+            sceneUnsavedDirty_ = true;
             if (Entity* entity = sceneDocument_.registry().entity(created)) {
                 glm::vec3 forward = cameraController_.direction();
                 if (glm::dot(forward, forward) <= 0.0f) {
@@ -1427,27 +1755,33 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
 
     if (requests.ensurePrimarySun) {
         (void)SunController::ensurePrimarySun(sceneDocument_);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.duplicateEntity.has_value()) {
         (void)sceneOps.duplicateEntity(*requests.duplicateEntity);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.deleteEntity.has_value()) {
         (void)sceneOps.deleteEntity(*requests.deleteEntity);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.reparentEntity.has_value()) {
         const auto [child, newParent] = *requests.reparentEntity;
         (void)sceneOps.reparentEntity(child, newParent);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.setEntityVisibility.has_value()) {
         (void)sceneOps.setVisibility(requests.setEntityVisibility->entity, requests.setEntityVisibility->value);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.setEntityLocked.has_value()) {
         (void)sceneOps.setLocked(requests.setEntityLocked->entity, requests.setEntityLocked->value);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.setEntityTransform.has_value()) {
@@ -1455,6 +1789,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             requests.setEntityTransform->entity,
             requests.setEntityTransform->oldTransform,
             requests.setEntityTransform->newTransform);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.addComponent.has_value()) {
@@ -1472,6 +1807,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             (void)sceneOps.addMeshRendererComponent(requests.addComponent->entity, MeshRenderer{});
             break;
         }
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.setLight.has_value()) {
@@ -1479,6 +1815,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             requests.setLight->entity,
             requests.setLight->oldLight,
             requests.setLight->newLight);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.setSun.has_value()) {
@@ -1486,6 +1823,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             requests.setSun->entity,
             requests.setSun->oldSun,
             requests.setSun->newSun);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.setCamera.has_value()) {
@@ -1495,6 +1833,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             requests.setCamera->newCamera,
             requests.setCamera->oldActiveCamera,
             requests.setCamera->newActiveCamera);
+        sceneUnsavedDirty_ = true;
     }
 
     if (requests.focusOnEntity.has_value()) {
@@ -1536,11 +1875,33 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         reloadShadersFromEditor();
     }
 
-    if (requests.loadGltf.has_value()) {
-        requestGltfSceneLoad(*requests.loadGltf);
+    const std::optional<std::filesystem::path>& importScenePath = requests.importSceneAsNewScene.has_value()
+        ? requests.importSceneAsNewScene
+        : requests.loadGltf;
+    if (importScenePath.has_value()) {
+        if (!confirmDestructiveSceneAction("importing a scene as a new scene")) {
+            std::cout << "Import Scene as New Scene cancelled: " << importScenePath->string() << '\n';
+        } else {
+            requestGltfSceneLoad(*importScenePath);
+        }
     }
 
-    if (requests.exit && window_ != nullptr) {
+    if (requests.importAsset.has_value()) {
+        notifications_.notify("Import Asset is not implemented yet", NotificationType::Warning);
+        std::cout << "Import Asset requested (non-mutating skeleton): " << requests.importAsset->string() << '\n';
+    }
+
+    if (requests.importAndPlace.has_value()) {
+        notifications_.notify("Import and Place is not implemented yet", NotificationType::Warning);
+        std::cout << "Import and Place requested: " << requests.importAndPlace->string() << '\n';
+    }
+
+    if (requests.mergeScene.has_value()) {
+        notifications_.notify("Merge Scene is not implemented yet", NotificationType::Warning);
+        std::cout << "Merge Scene requested: " << requests.mergeScene->string() << '\n';
+    }
+
+    if (requests.exit && window_ != nullptr && confirmDestructiveSceneAction("exiting")) {
         glfwSetWindowShouldClose(window_, GLFW_TRUE);
     }
 }

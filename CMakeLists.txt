@@ -56,6 +56,7 @@ add_executable(rtvulkan
     src/main.cpp
     src/rtv/Application.cpp
     src/rtv/AccelerationStructure.cpp
+    src/rtv/AssetRegistry.cpp
     src/rtv/AssetManager.cpp
     src/rtv/AssetBrowserPanel.cpp
     src/rtv/AtmosphereLutSystem.cpp
@@ -110,6 +111,7 @@ add_executable(rtvulkan
     src/rtv/PipelineBuilder.cpp
     src/rtv/PipelineCache.cpp
     src/rtv/PipelineDemo.cpp
+    src/rtv/Project.cpp
     src/rtv/RenderSettingsPanel.cpp
     src/rtv/RenderGraph.cpp
     src/rtv/RenderGraphDump.cpp
@@ -165,7 +167,7 @@ if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
 endif()
 
 if(WIN32)
-    target_link_libraries(rtvulkan PRIVATE Comdlg32)
+    target_link_libraries(rtvulkan PRIVATE Comdlg32 User32)
 endif()
 
 if(MSVC)

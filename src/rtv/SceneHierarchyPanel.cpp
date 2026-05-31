@@ -17,7 +17,7 @@ namespace rtv {
 std::array<char, 256> SceneHierarchyPanel::renameBuffer_{};
 
 void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
-    if (!ImGui::Begin("Scene Hierarchy")) {
+    if (!ImGui::Begin("Hierarchy")) {
         ImGui::End();
         return;
     }

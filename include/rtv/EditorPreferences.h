@@ -15,10 +15,15 @@ struct EditorPreferences {
     bool confirmDelete = true;
     std::vector<std::string> recentFiles;
     std::vector<std::string> favoriteFiles;
+    std::vector<std::string> recentProjects;
+    std::string lastOpenedProject;
+    bool openLastProject = false;
 
     static constexpr size_t maxRecentFiles = 10;
 
     void addRecentFile(const std::filesystem::path& path);
+    void addRecentProject(const std::filesystem::path& path);
+    void removeRecentProject(const std::string& path);
     void addFavorite(const std::filesystem::path& path);
     void removeFavorite(const std::string& path);
     void save(const std::filesystem::path& path) const;
