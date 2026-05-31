@@ -1,11 +1,15 @@
 #include "rtv/Application.h"
 
+#include "rtv/AssetImport.h"
 #include "rtv/CommandSystem.h"
 #include "rtv/BufferUploader.h"
+#include "rtv/EditorCommands.h"
+#include "rtv/EditorLog.h"
 #include "rtv/FileDialog.h"
 #include "rtv/GltfLoader.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/PipelineDemo.h"
+#include "rtv/Prefab.h"
 #include "rtv/ResourceAllocator.h"
 #include "rtv/ResourceDemo.h"
 #include "rtv/SceneOperations.h"
@@ -29,9 +33,11 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include <glm/glm.hpp>
@@ -315,6 +321,288 @@ void applyDocumentMaterialAssignments(const SceneDocument& document, AssetManage
     }
 }
 
+struct ImportedAssetHandleRemap {
+    std::vector<TextureAssetHandle> textures;
+    std::vector<MaterialAssetHandle> materials;
+    std::vector<MeshAssetHandle> meshes;
+};
+
+class AppSceneDocumentSnapshotCommand final : public ICommand {
+public:
+    AppSceneDocumentSnapshotCommand(SceneDocument& document, SceneDocument before, SceneDocument after, SceneUpdateKind updateKind, std::string label)
+        : document_(document), before_(std::move(before)), after_(std::move(after)), updateKind_(updateKind), label_(std::move(label)) {}
+
+    void undo() override { document_ = before_; document_.markDirty(updateKind_); }
+    void redo() override { document_ = after_; document_.markDirty(updateKind_); }
+    [[nodiscard]] const std::string& label() const override { return label_; }
+
+private:
+    SceneDocument& document_;
+    SceneDocument before_;
+    SceneDocument after_;
+    SceneUpdateKind updateKind_ = SceneUpdateKind::TopologyChanged;
+    std::string label_;
+};
+
+class AssetManagerSnapshotCommand final : public ICommand {
+public:
+    AssetManagerSnapshotCommand(AssetManager& assets, SceneDocument& document, AssetManager before, AssetManager after, SceneUpdateKind updateKind, std::string label)
+        : assets_(assets), document_(document), before_(std::move(before)), after_(std::move(after)), updateKind_(updateKind), label_(std::move(label)) {}
+
+    void undo() override { assets_ = before_; document_.markDirty(updateKind_); }
+    void redo() override { assets_ = after_; document_.markDirty(updateKind_); }
+    [[nodiscard]] const std::string& label() const override { return label_; }
+
+private:
+    AssetManager& assets_;
+    SceneDocument& document_;
+    AssetManager before_;
+    AssetManager after_;
+    SceneUpdateKind updateKind_ = SceneUpdateKind::MaterialOnly;
+    std::string label_;
+};
+
+class SceneAndAssetsSnapshotCommand final : public ICommand {
+public:
+    SceneAndAssetsSnapshotCommand(
+        SceneDocument& document,
+        AssetManager& assets,
+        SceneDocument beforeDocument,
+        AssetManager beforeAssets,
+        SceneDocument afterDocument,
+        AssetManager afterAssets,
+        SceneUpdateKind updateKind,
+        std::string label)
+        : document_(document),
+          assets_(assets),
+          beforeDocument_(std::move(beforeDocument)),
+          beforeAssets_(std::move(beforeAssets)),
+          afterDocument_(std::move(afterDocument)),
+          afterAssets_(std::move(afterAssets)),
+          updateKind_(updateKind),
+          label_(std::move(label)) {}
+
+    void undo() override {
+        document_ = beforeDocument_;
+        assets_ = beforeAssets_;
+        document_.markDirty(updateKind_);
+    }
+
+    void redo() override {
+        document_ = afterDocument_;
+        assets_ = afterAssets_;
+        document_.markDirty(updateKind_);
+    }
+
+    [[nodiscard]] const std::string& label() const override { return label_; }
+
+private:
+    SceneDocument& document_;
+    AssetManager& assets_;
+    SceneDocument beforeDocument_;
+    AssetManager beforeAssets_;
+    SceneDocument afterDocument_;
+    AssetManager afterAssets_;
+    SceneUpdateKind updateKind_ = SceneUpdateKind::MaterialOnly;
+    std::string label_;
+};
+
+void ensureMaterialSlotsForRenderer(MeshRenderer& renderer, const AssetManager& assets) {
+    if (!renderer.materialSlots.empty()) {
+        return;
+    }
+    const MeshAsset* mesh = assets.mesh(renderer.mesh);
+    if (mesh == nullptr) {
+        return;
+    }
+    renderer.materialSlots.reserve(mesh->primitives.size());
+    for (size_t i = 0; i < mesh->primitives.size(); ++i) {
+        renderer.materialSlots.push_back(MaterialSlot{
+            .name = "Primitive " + std::to_string(i),
+            .material = mesh->primitives[i].material,
+        });
+    }
+}
+
+TextureAssetHandle remapTextureHandle(const ImportedAssetHandleRemap& remap, TextureAssetHandle handle) {
+    return handle.valid() && handle.index < remap.textures.size() ? remap.textures[handle.index] : TextureAssetHandle{};
+}
+
+MaterialAssetHandle remapMaterialHandle(const ImportedAssetHandleRemap& remap, MaterialAssetHandle handle) {
+    return handle.valid() && handle.index < remap.materials.size() ? remap.materials[handle.index] : MaterialAssetHandle{};
+}
+
+MeshAssetHandle remapMeshHandle(const ImportedAssetHandleRemap& remap, MeshAssetHandle handle) {
+    return handle.valid() && handle.index < remap.meshes.size() ? remap.meshes[handle.index] : MeshAssetHandle{};
+}
+
+void remapMaterialTextures(MaterialAsset& material, const ImportedAssetHandleRemap& remap) {
+    auto remapTexture = [&](TextureAssetHandle& handle) { handle = remapTextureHandle(remap, handle); };
+    remapTexture(material.baseColorTexture);
+    remapTexture(material.normalTexture);
+    remapTexture(material.metallicRoughnessTexture);
+    remapTexture(material.emissiveTexture);
+    remapTexture(material.clearcoatTexture);
+    remapTexture(material.clearcoatRoughnessTexture);
+    remapTexture(material.clearcoatNormalTexture);
+    remapTexture(material.transmissionTexture);
+    remapTexture(material.specularTexture);
+    remapTexture(material.specularColorTexture);
+    remapTexture(material.sheenColorTexture);
+    remapTexture(material.sheenRoughnessTexture);
+    remapTexture(material.iridescenceTexture);
+    remapTexture(material.iridescenceThicknessTexture);
+    remapTexture(material.anisotropyTexture);
+    remapTexture(material.occlusionTexture);
+}
+
+ImportedAssetHandleRemap appendImportedAssets(AssetManager& destination, const AssetManager& source) {
+    ImportedAssetHandleRemap remap;
+    remap.textures.reserve(source.textures().size());
+    remap.materials.reserve(source.materials().size());
+    remap.meshes.reserve(source.meshes().size());
+
+    for (const TextureAsset& texture : source.textures()) {
+        remap.textures.push_back(destination.addTexture(texture));
+    }
+    for (MaterialAsset material : source.materials()) {
+        remapMaterialTextures(material, remap);
+        remap.materials.push_back(destination.addMaterial(std::move(material)));
+    }
+    for (MeshAsset mesh : source.meshes()) {
+        for (MeshPrimitiveAsset& primitive : mesh.primitives) {
+            primitive.material = remapMaterialHandle(remap, primitive.material);
+        }
+        remap.meshes.push_back(destination.addMesh(std::move(mesh)));
+    }
+    return remap;
+}
+
+void remapSceneAssetHandles(SceneAsset& scene, const ImportedAssetHandleRemap& remap) {
+    for (TextureAssetHandle& texture : scene.textures) {
+        texture = remapTextureHandle(remap, texture);
+    }
+    for (MaterialAssetHandle& material : scene.materials) {
+        material = remapMaterialHandle(remap, material);
+    }
+    for (MeshAssetHandle& mesh : scene.meshes) {
+        mesh = remapMeshHandle(remap, mesh);
+    }
+    for (SceneNodeAsset& node : scene.nodes) {
+        node.mesh = remapMeshHandle(remap, node.mesh);
+    }
+}
+
+std::filesystem::path resolveAssetRecordPath(const AssetRecord& record, const std::filesystem::path& root) {
+    std::filesystem::path path = record.importedPath;
+    if (!path.is_absolute()) {
+        path = root / path;
+    }
+    return path;
+}
+
+std::filesystem::path resolveAssetSourcePath(const AssetRecord& record, const std::filesystem::path& root) {
+    std::filesystem::path path = record.sourcePath;
+    if (!path.is_absolute()) {
+        path = root / path;
+    }
+    return path;
+}
+
+std::string importModeForRecord(const AssetRecord& record, const std::filesystem::path& root) {
+    const std::filesystem::path importedPath = resolveAssetRecordPath(record, root);
+    try {
+        std::ifstream file(importedPath);
+        if (file.is_open()) {
+            nlohmann::json json;
+            file >> json;
+            return json.value("mode", std::string("ImportAsset"));
+        }
+    } catch (...) {
+    }
+    return "ImportAsset";
+}
+
+bool appendPrefabRuntimeAssets(
+    const AssetRecord& prefabRecord,
+    const std::filesystem::path& root,
+    AssetManager& destination,
+    PrefabRuntimeBindings& bindings,
+    std::string* error) {
+    const std::filesystem::path sourcePath = resolveAssetSourcePath(prefabRecord, root);
+    if (!std::filesystem::exists(sourcePath)) {
+        if (error != nullptr) {
+            *error = "Prefab source does not exist: " + sourcePath.string();
+        }
+        return false;
+    }
+
+    AssetManager importedAssets;
+    SceneAsset importedScene;
+    try {
+        GltfLoader loader(importedAssets);
+        importedScene = loader.loadWithCache(sourcePath);
+    } catch (const std::exception& ex) {
+        if (error != nullptr) {
+            *error = ex.what();
+        }
+        return false;
+    }
+
+    const ImportedAssetHandleRemap remap = appendImportedAssets(destination, importedAssets);
+    const std::string sourceHash = prefabRecord.sourceHash.empty()
+        ? assetSourceHashForPath(sourcePath)
+        : prefabRecord.sourceHash;
+    AssetImportRequest hashRequest;
+    hashRequest.sourcePath = sourcePath;
+    hashRequest.mode = importModeForRecord(prefabRecord, root);
+    hashRequest.settings = prefabRecord.importSettings;
+    const std::string settingsHash = prefabRecord.importSettingsHash.empty()
+        ? assetImportSettingsHashForRequest(hashRequest)
+        : prefabRecord.importSettingsHash;
+
+    for (size_t i = 0; i < remap.meshes.size(); ++i) {
+        bindings.meshes[importedAssetGuidFor(sourceHash, settingsHash, "Mesh", i)] = remap.meshes[i];
+    }
+    for (size_t i = 0; i < remap.materials.size(); ++i) {
+        bindings.materials[importedAssetGuidFor(sourceHash, settingsHash, "Material", i)] = remap.materials[i];
+    }
+    (void)importedScene;
+    return true;
+}
+
+uint32_t rebindGuidBackedRenderers(SceneDocument& document, const PrefabRuntimeBindings& bindings) {
+    uint32_t rebound = 0;
+    for (Entity* entity : document.registry().entities()) {
+        if (!entity->meshRenderer.has_value()) {
+            continue;
+        }
+        MeshRenderer& renderer = *entity->meshRenderer;
+        if (!renderer.meshGuid.empty()) {
+            const auto meshIt = bindings.meshes.find(renderer.meshGuid);
+            if (meshIt != bindings.meshes.end()) {
+                renderer.mesh = meshIt->second;
+                ++rebound;
+            }
+        }
+        for (MaterialSlot& slot : renderer.materialSlots) {
+            if (!slot.materialGuid.empty()) {
+                const auto materialIt = bindings.materials.find(slot.materialGuid);
+                if (materialIt != bindings.materials.end()) {
+                    slot.material = materialIt->second;
+                }
+            }
+            if (slot.overrideMaterialGuid.has_value() && !slot.overrideMaterialGuid->empty()) {
+                const auto materialIt = bindings.materials.find(*slot.overrideMaterialGuid);
+                if (materialIt != bindings.materials.end()) {
+                    slot.overrideMaterial = materialIt->second;
+                }
+            }
+        }
+    }
+    return rebound;
+}
+
 std::filesystem::path resolveProjectRoot() {
     std::filesystem::path candidate = std::filesystem::current_path();
     while (!candidate.empty()) {
@@ -346,6 +634,46 @@ glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity)
         current = parent;
     }
     return result;
+}
+
+float activeCameraFovRadians(const SceneDocument& document) {
+    if (const Entity* cameraEntity = document.registry().entity(document.activeCamera())) {
+        if (cameraEntity->camera.has_value()) {
+            return cameraEntity->camera->verticalFovRadians;
+        }
+    }
+    return glm::radians(60.0f);
+}
+
+void expandEntityBounds(
+    const SceneRegistry& registry,
+    const AssetManager& assets,
+    const Entity& entity,
+    glm::vec3& minBounds,
+    glm::vec3& maxBounds,
+    bool& hasBounds) {
+    const glm::mat4 world = entityWorldMatrix(registry, entity);
+    if (entity.meshRenderer.has_value()) {
+        if (const MeshAsset* mesh = assets.mesh(entity.meshRenderer->mesh)) {
+            for (const MeshVertex& vertex : mesh->vertices) {
+                const glm::vec3 point = glm::vec3(world * glm::vec4(vertex.position, 1.0f));
+                minBounds = glm::min(minBounds, point);
+                maxBounds = glm::max(maxBounds, point);
+                hasBounds = true;
+            }
+        }
+    }
+    if (!hasBounds) {
+        const glm::vec3 point = glm::vec3(world[3]);
+        minBounds = glm::min(minBounds, point - glm::vec3(0.5f));
+        maxBounds = glm::max(maxBounds, point + glm::vec3(0.5f));
+        hasBounds = true;
+    }
+    for (EntityId childId : entity.children) {
+        if (const Entity* child = registry.entity(childId)) {
+            expandEntityBounds(registry, assets, *child, minBounds, maxBounds, hasBounds);
+        }
+    }
 }
 
 EntityId duplicateEntityRecursive(SceneRegistry& registry, Entity source, EntityId parent) {
@@ -436,9 +764,8 @@ Application::Application(
 }
 
 Application::~Application() {
-    if (pendingSceneLoad_.valid()) {
-        pendingSceneLoad_.wait();
-    }
+    asyncSceneLoader_.requestCancel();
+    asyncSceneLoader_.wait();
     if (commandSystem_) {
         commandSystem_->waitIdle();
     }
@@ -446,6 +773,7 @@ Application::~Application() {
     if (uiOverlay_) {
         uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
     }
+    writeCrashMarker(false);
     commandSystem_.reset();
     uiOverlay_.reset();
     pathTracer_.reset();
@@ -954,8 +1282,9 @@ void Application::initVulkan() {
     sceneDocument_.clearDirty();
     if (!headless_) {
         uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_);
+        notifications_.setLogSink(&uiOverlay_->editor().log());
         if (loadedSceneDocument) {
-            uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
+            deserializeEditorSceneData();
         }
         commandSystem_->setUiOverlay(uiOverlay_.get());
         uiOverlay_->editor().editorPrefs().load(EditorPreferences::defaultPath());
@@ -1013,6 +1342,7 @@ void Application::mainLoop(uint32_t maxFrames) {
         applyValidationObjectMotion(frameCount);
         applyValidationCameraMotion(frameCount);
         notifications_.update(deltaSeconds);
+        updateAutosave(deltaSeconds);
         EditorRequests editorRequests;
         if (pendingOpenLevel_) {
             pendingOpenLevel_ = false;
@@ -1047,11 +1377,14 @@ void Application::mainLoop(uint32_t maxFrames) {
                 hdrPath_,
                 scenePath_,
                 project_ ? &*project_ : nullptr,
-                project_ ? &assetRegistry_ : nullptr,
+                (project_ || !assetRegistry_.state().path.empty()) ? &assetRegistry_ : nullptr,
                 sceneUnsavedDirty_,
                 &gpuInstanceEntities_,
                 sceneLoadingStatus_,
+                asyncSceneLoader_.isRunning(),
+                asyncSceneLoader_.progress(),
                 &cameraController_,
+                &undoStack_,
                 rawDeltaSeconds * 1000.0f,
                 &notifications_,
                 sunDrag_.phase != SunDragPhase::Idle);
@@ -1104,7 +1437,10 @@ void Application::onFilesDropped(int count, const char** paths) {
                     std::cout << "Dropped scene import cancelled: " << path.string() << '\n';
                     continue;
                 }
-                requestGltfSceneLoad(path);
+                SceneLoadRequest request;
+                request.mode = SceneLoadMode::ImportSceneAsNewScene;
+                request.sourcePath = path;
+                (void)requestSceneLoad(std::move(request));
             } else {
                 std::cout << "Dropped file ignored: " << path.string() << " (supported: .hdr, .gltf, .glb)\n";
             }
@@ -1128,101 +1464,258 @@ void Application::onFilesDropped(int count, const char** paths) {
     }
 }
 
-void Application::reloadGltfScene(const std::filesystem::path& path) {
-    PendingSceneLoadResult result;
-    result.path = path;
-    try {
-        GltfLoader loader(result.assets);
-        result.scene = loader.loadWithCache(path);
-    } catch (const std::exception& error) {
-        result.error = error.what();
-    }
-    commitLoadedGltfScene(std::move(result));
-}
-
-void Application::requestGltfSceneLoad(const std::filesystem::path& path) {
-    if (pendingSceneLoad_.valid() &&
-        pendingSceneLoad_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-        sceneLoadingStatus_ = "Scene load already running: " + pendingSceneLoadPath_->string();
-        notifications_.notify("Scene load already running", NotificationType::Warning);
+void Application::serializeEditorSceneData() {
+    if (uiOverlay_ == nullptr) {
         return;
     }
+    uiOverlay_->editor().cameraBookmarks().serialize(sceneDocument_);
+    sceneDocument_.setTimelineJson(uiOverlay_->editor().timeline().serialize());
+}
 
-    if (pendingSceneLoad_.valid()) {
-        (void)pendingSceneLoad_.get();
+void Application::deserializeEditorSceneData() {
+    if (uiOverlay_ == nullptr) {
+        return;
+    }
+    uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
+    if (sceneDocument_.timelineJson().has_value()) {
+        uiOverlay_->editor().timeline().deserialize(*sceneDocument_.timelineJson());
+    } else {
+        uiOverlay_->editor().timeline().clear();
+    }
+}
+
+void Application::writeCrashMarker(bool running) {
+    if (!project_.has_value()) {
+        return;
+    }
+    const std::filesystem::path marker = project_->savedRoot / "editor_session.json";
+    std::error_code ec;
+    std::filesystem::create_directories(marker.parent_path(), ec);
+    if (ec) {
+        return;
+    }
+    if (!running) {
+        std::filesystem::remove(marker, ec);
+        return;
+    }
+    nlohmann::json json;
+    json["running"] = true;
+    json["scene"] = scenePath_.has_value() ? scenePath_->generic_string() : std::string{};
+    json["project"] = project_->projectFile.generic_string();
+    std::ofstream out(marker, std::ios::trunc);
+    if (out.is_open()) {
+        out << json.dump(2);
+    }
+}
+
+bool Application::writeAutosave() {
+    if (!project_.has_value() || !sceneUnsavedDirty_) {
+        return false;
+    }
+    serializeEditorSceneData();
+    const std::filesystem::path autosaveDir = project_->savedRoot / "Autosaves";
+    const std::string sceneName = scenePath_.has_value()
+        ? scenePath_->stem().string()
+        : (gltfPath_.has_value() ? gltfPath_->stem().string() : std::string("Untitled"));
+    const std::filesystem::path autosavePath = autosaveDir / (sceneName + "_autosave.rtlevel");
+    const bool saved = sceneDocument_.saveJson(autosavePath);
+    if (saved) {
+        notifications_.notify("Scene autosaved", NotificationType::Info);
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->editor().log().add(EditorLogCategory::Scene, "Autosaved scene to " + autosavePath.string());
+        }
+    } else {
+        notifications_.notify("Scene autosave failed", NotificationType::Error);
+    }
+    return saved;
+}
+
+void Application::updateAutosave(float deltaSeconds) {
+    if (!project_.has_value() || !project_->autosaveEnabled || !sceneUnsavedDirty_) {
+        autosaveElapsedSeconds_ = 0.0f;
+        return;
+    }
+    autosaveElapsedSeconds_ += std::max(deltaSeconds, 0.0f);
+    const float interval = static_cast<float>(std::max(project_->autosaveIntervalMinutes, 1) * 60);
+    if (autosaveElapsedSeconds_ >= interval) {
+        autosaveElapsedSeconds_ = 0.0f;
+        (void)writeAutosave();
+    }
+}
+
+void Application::reloadGltfScene(const std::filesystem::path& path) {
+    SceneLoadResult result;
+    result.mode = SceneLoadMode::ImportSceneAsNewScene;
+    result.sourcePath = path;
+    try {
+        GltfLoader loader(result.assets);
+        result.importedScene = loader.loadWithCache(path);
+        auto document = std::make_unique<SceneDocument>();
+        document->importSceneAsset(*result.importedScene);
+        document->setSourceGltfPath(path);
+        result.stagedScene = std::move(document);
+        result.success = true;
+    } catch (const std::exception& error) {
+        result.errorMessage = error.what();
+    }
+    (void)applySceneLoadResult(std::move(result));
+}
+
+bool Application::requestSceneLoad(SceneLoadRequest request) {
+    if (asyncSceneLoader_.isRunning()) {
+        sceneLoadingStatus_ = "Scene load already running";
+        if (activeSceneLoadRequest_.has_value()) {
+            sceneLoadingStatus_ += ": " + activeSceneLoadRequest_->sourcePath.string();
+        }
+        notifications_.notify("Scene load already running", NotificationType::Warning);
+        return false;
     }
 
-    pendingSceneLoadPath_ = path;
-    sceneLoadingStatus_ = "Importing scene as new scene in background: " + path.string();
-    notifications_.notify("Importing scene as new scene", NotificationType::Info);
-    std::cout << sceneLoadingStatus_ << '\n';
-    pendingSceneLoad_ = std::async(std::launch::async, [path]() {
-        PendingSceneLoadResult result;
-        result.path = path;
-        try {
-            GltfLoader loader(result.assets);
-            result.scene = loader.loadWithCache(path);
-        } catch (const std::exception& error) {
-            result.error = error.what();
+    if (asyncSceneLoader_.hasCompletedResult()) {
+        SceneLoadResult completed = asyncSceneLoader_.takeCompletedResult();
+        activeSceneLoadRequest_.reset();
+        if (completed.cancelled) {
+            sceneLoadingStatus_ = "Scene load cancelled: " + completed.sourcePath.string();
+            notifications_.notify("Scene load cancelled", NotificationType::Warning);
+        } else if (!completed.success) {
+            sceneLoadingStatus_ = std::string(sceneLoadModeLabel(completed.mode)) + " failed: " + completed.errorMessage;
+            notifications_.notify(std::string(sceneLoadModeLabel(completed.mode)) + " failed", NotificationType::Error);
+        } else {
+            (void)applySceneLoadResult(std::move(completed));
         }
-        return result;
-    });
+    }
+
+    const std::string operation = sceneLoadModeLabel(request.mode);
+    sceneLoadingStatus_ = operation + " queued: " + request.sourcePath.string();
+    notifications_.notify(operation + " queued", NotificationType::Info);
+    std::cout << sceneLoadingStatus_ << '\n';
+    activeSceneLoadRequest_ = request;
+    if (!asyncSceneLoader_.start(std::move(request))) {
+        activeSceneLoadRequest_.reset();
+        sceneLoadingStatus_ = "Scene load already running";
+        notifications_.notify("Scene load already running", NotificationType::Warning);
+        return false;
+    }
+    return true;
 }
 
 void Application::pollAsyncSceneLoad() {
-    if (!pendingSceneLoad_.valid()) {
-        return;
-    }
-    if (pendingSceneLoad_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+    if (!asyncSceneLoader_.hasCompletedResult()) {
+        if (asyncSceneLoader_.isRunning() && activeSceneLoadRequest_.has_value()) {
+            const int progress = static_cast<int>(std::clamp(asyncSceneLoader_.progress(), 0.0f, 1.0f) * 100.0f);
+            sceneLoadingStatus_ = std::string(sceneLoadModeLabel(activeSceneLoadRequest_->mode)) + " " +
+                sceneLoadStatusLabel(asyncSceneLoader_.status()) + " (" + std::to_string(progress) + "%): " +
+                asyncSceneLoader_.stage() + " - " + activeSceneLoadRequest_->sourcePath.string();
+        }
         return;
     }
 
-    PendingSceneLoadResult result = pendingSceneLoad_.get();
-    pendingSceneLoadPath_.reset();
-    if (!result.error.empty()) {
-        sceneLoadingStatus_ = "Import scene failed: " + result.error;
-        notifications_.notify("Import scene failed", NotificationType::Error);
+    SceneLoadResult result = asyncSceneLoader_.takeCompletedResult();
+    activeSceneLoadRequest_.reset();
+    if (result.cancelled) {
+        sceneLoadingStatus_ = "Scene load cancelled: " + result.sourcePath.string();
+        notifications_.notify("Scene load cancelled", NotificationType::Warning);
+        std::cout << sceneLoadingStatus_ << '\n';
+        return;
+    }
+    if (!result.success) {
+        sceneLoadingStatus_ = std::string(sceneLoadModeLabel(result.mode)) + " failed: " + result.errorMessage;
+        notifications_.notify(std::string(sceneLoadModeLabel(result.mode)) + " failed", NotificationType::Error);
         std::cerr << sceneLoadingStatus_ << '\n';
         return;
     }
 
-    sceneLoadingStatus_ = "Finalizing GPU scene: " + result.path.string();
-    commitLoadedGltfScene(std::move(result));
+    sceneLoadingStatus_ = std::string(sceneLoadModeLabel(result.mode)) + " applying: " + result.sourcePath.string();
+    (void)applySceneLoadResult(std::move(result));
 }
 
-void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
-    if (!context_ || !allocator_ || !uploader_ || !swapchain_ || !commandSystem_) {
-        return;
+bool Application::applySceneLoadResult(SceneLoadResult&& result) {
+    switch (result.mode) {
+    case SceneLoadMode::OpenRtLevel:
+    case SceneLoadMode::LoadProjectStartupScene:
+        return applyReplacementSceneResult(std::move(result), false);
+    case SceneLoadMode::ImportSceneAsNewScene:
+        return applyReplacementSceneResult(std::move(result), true);
+    case SceneLoadMode::MergeSceneIntoCurrent:
+        return applyMergeSceneResult(std::move(result));
     }
-    if (!result.error.empty()) {
-        sceneLoadingStatus_ = "Import scene failed: " + result.error;
-        notifications_.notify("Import scene failed", NotificationType::Error);
+    return false;
+}
+
+bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sceneDirtyAfterApply) {
+    if (!context_ || !allocator_ || !uploader_ || !swapchain_ || !commandSystem_) {
+        return false;
+    }
+    if (!result.success || result.stagedScene == nullptr) {
+        sceneLoadingStatus_ = std::string(sceneLoadModeLabel(result.mode)) + " failed: " + result.errorMessage;
+        notifications_.notify(std::string(sceneLoadModeLabel(result.mode)) + " failed", NotificationType::Error);
         std::cerr << sceneLoadingStatus_ << '\n';
-        return;
+        return false;
     }
 
     const RendererSettings previousSettings = pathTracer_ != nullptr ? pathTracer_->settings() : RendererSettings{};
+    const std::optional<std::filesystem::path> nextGltfPath = sceneDirtyAfterApply
+        ? std::optional<std::filesystem::path>{result.sourcePath}
+        : result.stagedScene->sourceGltfPath();
+    const std::optional<std::filesystem::path> nextHdrPath = sceneDirtyAfterApply
+        ? hdrPath_
+        : result.stagedScene->sourceHdrPath();
     bool largeSceneSettingsChanged = false;
-    RendererSettings reloadSettings = interactiveSettingsForScene(previousSettings, result.scene, result.assets, largeSceneSettingsChanged);
+    RendererSettings reloadSettings = sceneDirtyAfterApply
+        ? previousSettings
+        : rendererSettingsFromDocument(*result.stagedScene, previousSettings);
+    if (result.importedScene.has_value()) {
+        reloadSettings = interactiveSettingsForScene(reloadSettings, *result.importedScene, result.assets, largeSceneSettingsChanged);
+    }
 
     try {
-        SceneDocument nextDocument;
-        nextDocument.importSceneAsset(result.scene);
-        nextDocument.setSourceGltfPath(result.path);
-        nextDocument.setSourceHdrPath(hdrPath_);
-        syncDocumentRenderSettings(nextDocument, reloadSettings);
+        SceneDocument nextDocument = std::move(*result.stagedScene);
+        if (sceneDirtyAfterApply) {
+            nextDocument.setSourceHdrPath(hdrPath_);
+            syncDocumentRenderSettings(nextDocument, reloadSettings);
+        }
         (void)SunController::migrateLegacyDirectionalSun(nextDocument);
         (void)SunController::repairPrimarySunTransform(nextDocument);
+        if (!nextDocument.prefabInstances().empty()) {
+            std::filesystem::path registryRoot = project_.has_value() ? project_->projectRoot : result.sourcePath.parent_path();
+            if (!project_.has_value()) {
+                const std::filesystem::path sceneRegistryPath = result.sourcePath.parent_path() / (result.sourcePath.stem().string() + ".assets.json");
+                if (std::filesystem::exists(sceneRegistryPath) && assetRegistry_.state().path != sceneRegistryPath) {
+                    std::string registryError;
+                    if (!assetRegistry_.load(sceneRegistryPath, &registryError)) {
+                        std::cerr << "Scene asset registry load failed: " << registryError << '\n';
+                    }
+                }
+            }
+            PrefabRuntimeBindings prefabBindings;
+            for (const PrefabInstance& instance : nextDocument.prefabInstances()) {
+                const auto recordIt = std::find_if(assetRegistry_.records().begin(), assetRegistry_.records().end(), [&](const AssetRecord& record) {
+                    return record.guid == instance.prefabGuid && record.type == AssetType::Prefab;
+                });
+                if (recordIt == assetRegistry_.records().end()) {
+                    continue;
+                }
+                if (std::string bindError; !appendPrefabRuntimeAssets(*recordIt, registryRoot, result.assets, prefabBindings, &bindError)) {
+                    std::cerr << "Prefab runtime binding failed during scene load: " << bindError << '\n';
+                }
+            }
+            const uint32_t rebound = rebindGuidBackedRenderers(nextDocument, prefabBindings);
+            if (rebound > 0) {
+                nextDocument.markDirty(SceneUpdateKind::TopologyChanged);
+            }
+        }
         reloadSettings = rendererSettingsFromDocument(nextDocument, reloadSettings);
         applyDocumentMaterialAssignments(nextDocument, result.assets);
 
         const SceneGpuBuildResult build = sceneBuilder_.build(nextDocument, &result.assets, reloadSettings);
-        const std::optional<std::filesystem::path> cachePath = SceneCache::cachePathFor(result.path);
+        const std::optional<std::filesystem::path> cachePath = sceneDirtyAfterApply
+            ? SceneCache::cachePathFor(result.sourcePath)
+            : (nextGltfPath.has_value() ? SceneCache::cachePathFor(*nextGltfPath) : std::optional<std::filesystem::path>{});
 
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             build.sceneAsset.meshes.empty() ? nullptr : &build.sceneAsset,
             build.sceneAsset.meshes.empty() ? nullptr : &result.assets,
-            cachePath,
+            result.importedScene.has_value() ? cachePath : std::optional<std::filesystem::path>{},
             &reloadSettings);
 
         if (uiOverlay_) {
@@ -1231,12 +1724,17 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
         cameraController_.releaseMouse(window_);
 
         assets_ = std::move(result.assets);
-        importedScene_ = std::move(result.scene);
-        gltfPath_ = result.path;
-        scenePath_.reset();
+        importedScene_ = std::move(result.importedScene);
+        gltfPath_ = nextGltfPath;
+        hdrPath_ = nextHdrPath;
+        if (sceneDirtyAfterApply) {
+            scenePath_.reset();
+        } else {
+            scenePath_ = result.sourcePath;
+        }
         sceneDocument_ = std::move(nextDocument);
         sceneDocument_.clearDirty();
-        sceneUnsavedDirty_ = true;
+        sceneUnsavedDirty_ = sceneDirtyAfterApply;
         undoStack_.clear();
         gpuSceneAsset_ = std::move(build.sceneAsset);
         gpuInstanceEntities_ = std::move(build.instanceEntities);
@@ -1245,22 +1743,83 @@ void Application::commitLoadedGltfScene(PendingSceneLoadResult&& result) {
         applyActiveSceneCamera();
         commandSystem_->setPathTracer(pathTracer_.get());
     } catch (const std::exception& error) {
-        sceneLoadingStatus_ = "Import scene GPU finalization failed: " + std::string(error.what());
-        notifications_.notify("Import scene GPU finalization failed", NotificationType::Error);
+        sceneLoadingStatus_ = std::string(sceneLoadModeLabel(result.mode)) + " apply failed: " + error.what();
+        notifications_.notify(std::string(sceneLoadModeLabel(result.mode)) + " apply failed", NotificationType::Error);
         std::cerr << sceneLoadingStatus_ << '\n';
-        return;
+        return false;
     }
 
-    sceneLoadingStatus_ = "Imported scene as new scene: " + result.path.string();
     if (uiOverlay_) {
-        uiOverlay_->editor().editorPrefs().addRecentFile(result.path);
+        if (sceneDirtyAfterApply) {
+            uiOverlay_->editor().timeline().clear();
+            sceneDocument_.clearTimelineJson();
+        } else {
+            deserializeEditorSceneData();
+        }
     }
-    notifications_.notify("Scene imported as new scene", NotificationType::Success);
-    std::cout << "Imported scene as new scene: " << result.path.string()
-              << " meshes=" << importedScene_->meshes.size()
-              << " materials=" << importedScene_->materials.size()
-               << " textures=" << importedScene_->textures.size()
-               << " nodes=" << importedScene_->nodes.size() << '\n';
+    sceneLoadingStatus_ = std::string(sceneLoadModeLabel(result.mode)) + " completed: " + result.sourcePath.string();
+    if (uiOverlay_) {
+        uiOverlay_->editor().editorPrefs().addRecentFile(result.sourcePath);
+    }
+    if (!result.warningMessage.empty()) {
+        notifications_.notify(result.warningMessage, NotificationType::Warning);
+        std::cerr << result.warningMessage << '\n';
+    }
+    notifications_.notify(std::string(sceneLoadModeLabel(result.mode)) + " completed", NotificationType::Success);
+    std::cout << sceneLoadingStatus_;
+    if (importedScene_.has_value()) {
+        std::cout << " meshes=" << importedScene_->meshes.size()
+                  << " materials=" << importedScene_->materials.size()
+                  << " textures=" << importedScene_->textures.size()
+                  << " nodes=" << importedScene_->nodes.size();
+    }
+    std::cout << '\n';
+    return true;
+}
+
+bool Application::applyMergeSceneResult(SceneLoadResult&& result) {
+    if (!result.success || !result.importedScene.has_value()) {
+        sceneLoadingStatus_ = "Merge Scene failed: " + result.errorMessage;
+        notifications_.notify("Merge Scene failed", NotificationType::Error);
+        std::cerr << sceneLoadingStatus_ << '\n';
+        return false;
+    }
+    if (result.importedScene->nodes.empty() && result.importedScene->lights.empty()) {
+        sceneLoadingStatus_ = "Merge Scene produced no entities: " + result.sourcePath.string();
+        notifications_.notify("Merge Scene produced no entities", NotificationType::Warning);
+        std::cerr << sceneLoadingStatus_ << '\n';
+        return false;
+    }
+
+    AssetManager previousAssets = assets_;
+    AssetManager nextAssets = assets_;
+    SceneAsset sceneToMerge = *result.importedScene;
+    const ImportedAssetHandleRemap remap = appendImportedAssets(nextAssets, result.assets);
+    remapSceneAssetHandles(sceneToMerge, remap);
+
+    assets_ = std::move(nextAssets);
+    SceneOperations sceneOps(sceneDocument_, &sceneEventBus_);
+    sceneOps.setUndoStack(&undoStack_);
+    const std::string rootName = "Merged " + result.sourcePath.stem().string();
+    const EntityId root = sceneOps.mergeSceneAsset(sceneToMerge, rootName);
+    if (!root.valid()) {
+        assets_ = std::move(previousAssets);
+        sceneLoadingStatus_ = "Merge Scene failed during apply: " + result.sourcePath.string();
+        notifications_.notify("Merge Scene failed", NotificationType::Error);
+        std::cerr << sceneLoadingStatus_ << '\n';
+        return false;
+    }
+
+    importedScene_ = sceneDocument_.toSceneAsset();
+    sceneUnsavedDirty_ = true;
+    const bool rebuilt = applyPendingSceneUpdate(true);
+    sceneLoadingStatus_ = "Merge Scene completed: " + result.sourcePath.string();
+    notifications_.notify(rebuilt ? "Scene merged" : "Scene merged; renderer rebuild pending", NotificationType::Success);
+    std::cout << "Merged scene into current: " << result.sourcePath.string()
+              << " nodes=" << result.importedScene->nodes.size()
+              << " lights=" << result.importedScene->lights.size()
+              << " root=" << root.index << ':' << root.generation << '\n';
+    return true;
 }
 
 Application::DirtyScenePromptResult Application::promptDirtySceneBefore(std::string_view action) const {
@@ -1306,9 +1865,7 @@ bool Application::saveCurrentSceneForDirtyPrompt() {
         return false;
     }
 
-    if (uiOverlay_ != nullptr) {
-        uiOverlay_->editor().cameraBookmarks().serialize(sceneDocument_);
-    }
+    serializeEditorSceneData();
     if (!sceneDocument_.saveJson(savePath)) {
         notifications_.notify("Scene save failed", NotificationType::Error);
         std::cerr << "Scene save failed: " << savePath.string() << '\n';
@@ -1379,29 +1936,11 @@ bool Application::loadProjectStartupScene(const ProjectContext& project) {
         return true;
     }
 
-    if (!sceneDocument_.loadJson(project.startupScene)) {
-        notifications_.notify("Project startup scene load failed", NotificationType::Error);
-        return false;
-    }
-
-    scenePath_ = project.startupScene;
-    gltfPath_ = sceneDocument_.sourceGltfPath();
-    hdrPath_ = sceneDocument_.sourceHdrPath();
-    assets_.clear();
-    importedScene_.reset();
-    if (gltfPath_.has_value() && std::filesystem::exists(*gltfPath_)) {
-        try {
-            GltfLoader loader(assets_);
-            importedScene_ = loader.loadWithCache(*gltfPath_);
-        } catch (const std::exception& error) {
-            std::cerr << "Referenced glTF load failed for project startup scene: " << error.what() << '\n';
-        }
-    }
-    (void)SunController::migrateLegacyDirectionalSun(sceneDocument_);
-    (void)SunController::repairPrimarySunTransform(sceneDocument_);
-    undoStack_.clear();
-    sceneUnsavedDirty_ = false;
-    return true;
+    SceneLoadRequest request;
+    request.mode = SceneLoadMode::LoadProjectStartupScene;
+    request.sourcePath = project.startupScene;
+    request.projectSnapshot = project;
+    return requestSceneLoad(std::move(request));
 }
 
 bool Application::openProjectFromFile(const std::filesystem::path& projectFile, bool promptForDirtyScene) {
@@ -1428,17 +1967,39 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
     }
 
     project_ = project;
+    const std::filesystem::path crashMarker = project.savedRoot / "editor_session.json";
     if (uiOverlay_ != nullptr) {
         uiOverlay_->editor().editorPrefs().addRecentProject(project.projectFile);
         uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+        if (std::filesystem::exists(crashMarker)) {
+            std::filesystem::path recoveredScene = project.startupScene;
+            try {
+                std::ifstream markerIn(crashMarker);
+                nlohmann::json markerJson;
+                markerIn >> markerJson;
+                const std::string scene = markerJson.value("scene", std::string{});
+                if (!scene.empty()) {
+                    recoveredScene = scene;
+                }
+            } catch (...) {
+            }
+            pendingRecoveryAutosavePath_ = project.savedRoot / "Autosaves" / (recoveredScene.stem().string() + "_autosave.rtlevel");
+            uiOverlay_->editor().showRecoveryPrompt(crashMarker, *pendingRecoveryAutosavePath_);
+            uiOverlay_->editor().log().add(EditorLogCategory::Warning, "Previous editor session marker found: " + crashMarker.string());
+            notifications_.notify("Previous editor session marker found", NotificationType::Warning);
+        }
     }
+    writeCrashMarker(true);
 
     if (!loadProjectStartupScene(*project_)) {
+        writeCrashMarker(false);
         project_.reset();
         return false;
     }
 
-    sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+    if (!asyncSceneLoader_.isRunning()) {
+        sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+    }
     notifications_.notify("Project opened", NotificationType::Success);
     std::cout << "Opened project: " << project.projectFile.string() << '\n';
     return true;
@@ -1485,7 +2046,9 @@ bool Application::closeCurrentProject() {
     }
     if (uiOverlay_ != nullptr) {
         uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+        uiOverlay_->editor().timeline().clear();
     }
+    writeCrashMarker(false);
     project_.reset();
     assetRegistry_.clear();
     initializeFallbackSceneDocument();
@@ -1499,9 +2062,250 @@ bool Application::closeCurrentProject() {
     return true;
 }
 
+std::optional<AssetGuid> Application::importAssetNonMutating(const EditorImportAssetRequest& editorRequest) {
+    AssetImportWorkspace workspace;
+    if (project_.has_value()) {
+        workspace.root = project_->projectRoot;
+        workspace.contentRoot = project_->contentRoot;
+        workspace.cacheRoot = project_->cacheRoot;
+        workspace.registryPath = project_->assetRegistryPath;
+    } else {
+        if (!scenePath_.has_value()) {
+            notifications_.notify("Open or create a project before importing assets", NotificationType::Warning);
+            if (uiOverlay_ != nullptr) {
+                uiOverlay_->editor().showProjectManager();
+            }
+            std::cout << "Import Asset deferred until a project or saved scene exists: " << editorRequest.sourcePath.string() << '\n';
+            return std::nullopt;
+        }
+        workspace.compatibilityMode = true;
+        workspace.root = scenePath_->parent_path();
+        if (workspace.root.empty()) {
+            workspace.root = std::filesystem::current_path();
+        }
+        workspace.contentRoot = workspace.root / "Content";
+        workspace.cacheRoot = workspace.root / "Cache";
+        workspace.registryPath = workspace.root / (scenePath_->stem().string() + ".assets.json");
+    }
+
+    if (assetRegistry_.state().path != workspace.registryPath) {
+        std::string error;
+        if (!assetRegistry_.load(workspace.registryPath, &error)) {
+            notifications_.notify("Asset registry load failed", NotificationType::Error);
+            std::cerr << "Asset registry load failed: " << error << '\n';
+            return std::nullopt;
+        }
+    }
+
+    AssetImportRequest request;
+    request.sourcePath = editorRequest.sourcePath;
+    request.destinationFolder = editorRequest.destinationFolder;
+    request.mode = editorRequest.mode;
+    request.settings = editorRequest.settings;
+    StagedAssetImportResult result = stagePlaceholderAssetImport(request, workspace);
+    if (!result.success) {
+        notifications_.notify("Import Asset failed", NotificationType::Error);
+        for (const std::string& error : result.errors) {
+            std::cerr << "Import Asset failed: " << error << '\n';
+        }
+        return std::nullopt;
+    }
+
+    for (AssetRecord& record : result.records) {
+        assetRegistry_.addOrReplaceRecord(std::move(record), AssetRegistryDirtyReason::AssetImported);
+    }
+    if (!assetRegistry_.save(workspace.registryPath)) {
+        notifications_.notify("Asset registry save failed", NotificationType::Error);
+        return std::nullopt;
+    }
+    assetRegistry_.clearDirty();
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->editor().editorPrefs().addRecentFile(editorRequest.sourcePath);
+        uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+    }
+    notifications_.notify("Import Asset staged", NotificationType::Success);
+    std::cout << "Import Asset staged without scene mutation: " << editorRequest.sourcePath.string()
+              << " report=" << result.importReportPath.string() << '\n';
+    return result.record.guid;
+}
+
+bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
+    const AssetRecord* prefabRecord = nullptr;
+    for (const AssetRecord& record : assetRegistry_.records()) {
+        if (record.guid == prefabGuid) {
+            prefabRecord = &record;
+            break;
+        }
+    }
+    if (prefabRecord == nullptr || prefabRecord->type != AssetType::Prefab) {
+        notifications_.notify("Prefab asset not found", NotificationType::Error);
+        return false;
+    }
+
+    std::filesystem::path root = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
+    if (!project_.has_value() && assetRegistry_.state().path.has_parent_path()) {
+        root = assetRegistry_.state().path.parent_path();
+    }
+    std::filesystem::path prefabPath = resolveAssetRecordPath(*prefabRecord, root);
+
+    PrefabAsset prefab;
+    std::string error;
+    if (!loadPrefabAsset(prefabPath, prefab, &error)) {
+        notifications_.notify("Prefab load failed", NotificationType::Error);
+        std::cerr << "Prefab load failed: " << prefabPath.string() << " " << error << '\n';
+        return false;
+    }
+
+    AssetManager nextAssets = assets_;
+    PrefabRuntimeBindings bindings;
+    if (std::string bindError; !appendPrefabRuntimeAssets(*prefabRecord, root, nextAssets, bindings, &bindError)) {
+        notifications_.notify("Prefab runtime binding failed", NotificationType::Error);
+        std::cerr << "Prefab runtime binding failed: " << bindError << '\n';
+        return false;
+    }
+
+    const SceneDocument beforeDocument = sceneDocument_;
+    const AssetManager beforeAssets = assets_;
+    assets_ = std::move(nextAssets);
+
+    SceneOperations ops(sceneDocument_, &sceneEventBus_);
+    PrefabInstance instance = ops.placePrefab(prefab, &bindings);
+    if (!instance.instanceRoot.valid()) {
+        assets_ = beforeAssets;
+        sceneDocument_ = beforeDocument;
+        notifications_.notify("Prefab placement failed", NotificationType::Error);
+        return false;
+    }
+    undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+        sceneDocument_,
+        assets_,
+        beforeDocument,
+        beforeAssets,
+        sceneDocument_,
+        assets_,
+        SceneUpdateKind::TopologyChanged,
+        "Place Prefab Asset"));
+    sceneUnsavedDirty_ = true;
+    (void)applyPendingSceneUpdate(true);
+    notifications_.notify("Prefab placed", NotificationType::Success);
+    std::cout << "Placed prefab asset: " << prefabGuid << " root=" << instance.instanceRoot.index << '\n';
+    return true;
+}
+
+bool Application::reimportAsset(const AssetGuid& assetGuid) {
+    const AssetRecord* sourceRecord = nullptr;
+    for (const AssetRecord& record : assetRegistry_.records()) {
+        if (record.guid == assetGuid) {
+            sourceRecord = &record;
+            break;
+        }
+    }
+    if (sourceRecord == nullptr) {
+        notifications_.notify("Reimport asset not found", NotificationType::Error);
+        return false;
+    }
+    const AssetType originalType = sourceRecord->type;
+
+    std::filesystem::path root = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
+    if (!project_.has_value() && assetRegistry_.state().path.has_parent_path()) {
+        root = assetRegistry_.state().path.parent_path();
+    }
+    AssetImportWorkspace workspace;
+    workspace.root = root;
+    workspace.contentRoot = project_.has_value() ? project_->contentRoot : root / "Content";
+    workspace.cacheRoot = project_.has_value() ? project_->cacheRoot : root / "Cache";
+    workspace.registryPath = project_.has_value() ? project_->assetRegistryPath : assetRegistry_.state().path;
+    workspace.compatibilityMode = !project_.has_value();
+
+    AssetImportRequest request;
+    request.sourcePath = resolveAssetSourcePath(*sourceRecord, root);
+    request.destinationFolder = originalType == AssetType::Prefab ? "Models" : "";
+    request.mode = importModeForRecord(*sourceRecord, root);
+    request.settings = sourceRecord->importSettings;
+    StagedAssetImportResult result = stagePlaceholderAssetImport(request, workspace);
+    if (!result.success) {
+        notifications_.notify("Reimport Asset failed", NotificationType::Error);
+        for (const std::string& error : result.errors) {
+            std::cerr << "Reimport Asset failed: " << error << '\n';
+        }
+        return false;
+    }
+
+    for (AssetRecord& record : result.records) {
+        assetRegistry_.addOrReplaceRecord(std::move(record), AssetRegistryDirtyReason::AssetReimported);
+    }
+    if (!assetRegistry_.save(workspace.registryPath)) {
+        notifications_.notify("Asset registry save failed", NotificationType::Error);
+        return false;
+    }
+    assetRegistry_.clearDirty();
+
+    if (originalType == AssetType::Prefab) {
+        const AssetRecord* refreshedRecord = nullptr;
+        for (const AssetRecord& record : assetRegistry_.records()) {
+            if (record.guid == assetGuid) {
+                refreshedRecord = &record;
+                break;
+            }
+        }
+        if (refreshedRecord != nullptr) {
+            AssetManager nextAssets = assets_;
+            PrefabRuntimeBindings bindings;
+            if (std::string bindError; appendPrefabRuntimeAssets(*refreshedRecord, root, nextAssets, bindings, &bindError)) {
+                const SceneDocument beforeDocument = sceneDocument_;
+                const AssetManager beforeAssets = assets_;
+                assets_ = std::move(nextAssets);
+                const uint32_t rebound = rebindGuidBackedRenderers(sceneDocument_, bindings);
+                if (rebound > 0) {
+                    sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+                    undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+                        sceneDocument_,
+                        assets_,
+                        beforeDocument,
+                        beforeAssets,
+                        sceneDocument_,
+                        assets_,
+                        SceneUpdateKind::TopologyChanged,
+                        "Reimport Asset"));
+                    sceneUnsavedDirty_ = true;
+                    (void)applyPendingSceneUpdate(true);
+                }
+            } else {
+                notifications_.notify("Reimported metadata; runtime refresh failed", NotificationType::Warning);
+                std::cerr << "Reimport runtime refresh failed: " << bindError << '\n';
+            }
+        }
+    }
+
+    notifications_.notify("Asset reimported", NotificationType::Success);
+    std::cout << "Reimported asset: " << assetGuid << " source=" << request.sourcePath.string() << '\n';
+    return true;
+}
+
+bool Application::mergeSceneIntoCurrent(const std::filesystem::path& path, bool allowResourceRebuild) {
+    (void)allowResourceRebuild;
+    SceneLoadResult result;
+    result.mode = SceneLoadMode::MergeSceneIntoCurrent;
+    result.sourcePath = path;
+    try {
+        GltfLoader loader(result.assets);
+        result.importedScene = loader.loadWithCache(path);
+        result.success = true;
+    } catch (const std::exception& error) {
+        result.errorMessage = error.what();
+    }
+    return applyMergeSceneResult(std::move(result));
+}
+
 void Application::applyEditorRequests(const EditorRequests& requests, bool allowResourceRebuild) {
     if (!pathTracer_) {
         return;
+    }
+
+    if (requests.cancelSceneLoad && asyncSceneLoader_.isRunning()) {
+        asyncSceneLoader_.requestCancel();
+        sceneLoadingStatus_ = "Scene load cancellation requested";
+        notifications_.notify("Scene load cancellation requested", NotificationType::Warning);
     }
 
     if (!allowResourceRebuild) {
@@ -1527,6 +2331,13 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 entity->transform = requests.previewEntityTransform->transform;
                 entity->transform.dirty = true;
                 sceneDocument_.markDirty(requests.previewEntityTransform->updateKind);
+            }
+        }
+        for (const EditorTimelineTransformSample& sample : requests.timelinePlaybackTransforms) {
+            if (Entity* entity = sceneDocument_.registry().entity(sample.entity)) {
+                entity->transform = sample.transform;
+                entity->transform.dirty = true;
+                sceneDocument_.markDirty(SceneUpdateKind::TransformOnly);
             }
         }
         (void)applyPendingSceneUpdate(false);
@@ -1562,6 +2373,16 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         if (requests.sceneUpdate.has_value()) {
             sceneDocument_.markDirty(*requests.sceneUpdate);
         }
+        if (requests.timelineChanged.has_value()) {
+            const SceneDocument before = sceneDocument_;
+            sceneDocument_.setTimelineJson(*requests.timelineChanged);
+            SceneDocument after = sceneDocument_;
+            after.markDirty(SceneUpdateKind::None);
+            undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+                sceneDocument_, before, std::move(after), SceneUpdateKind::None, "Edit Timeline"));
+            sceneUnsavedDirty_ = true;
+            notifications_.notify("Timeline updated", NotificationType::Info);
+        }
         return;
     }
 
@@ -1576,6 +2397,33 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     }
     if (requests.openProject.has_value()) {
         (void)openProjectFromFile(requests.openProject->projectFile, true);
+    }
+    if (requests.restoreAutosave) {
+        if (pendingRecoveryAutosavePath_.has_value() && std::filesystem::exists(*pendingRecoveryAutosavePath_)) {
+            SceneLoadRequest request;
+            request.mode = SceneLoadMode::OpenRtLevel;
+            request.sourcePath = *pendingRecoveryAutosavePath_;
+            if (project_.has_value()) {
+                request.projectSnapshot = *project_;
+            }
+            (void)requestSceneLoad(std::move(request));
+            notifications_.notify("Restoring autosave", NotificationType::Info);
+        } else {
+            notifications_.notify("No autosave available to restore", NotificationType::Warning);
+        }
+    }
+    if (requests.discardRecovery) {
+        if (project_.has_value()) {
+            std::error_code ec;
+            std::filesystem::remove(project_->savedRoot / "editor_session.json", ec);
+        }
+        pendingRecoveryAutosavePath_.reset();
+        notifications_.notify("Recovery marker discarded", NotificationType::Info);
+    }
+    if (requests.projectSettingsUpdate.has_value() && project_.has_value()) {
+        project_->autosaveEnabled = requests.projectSettingsUpdate->autosaveEnabled;
+        project_->autosaveIntervalMinutes = std::clamp(requests.projectSettingsUpdate->autosaveIntervalMinutes, 1, 120);
+        notifications_.notify("Project settings updated", NotificationType::Info);
     }
     if (requests.saveProjectSettings && project_.has_value()) {
         const bool projectSaved = saveProjectFile(*project_);
@@ -1611,15 +2459,15 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         ? requests.saveSceneAs
         : (requests.saveScene.has_value() ? requests.saveScene : requests.saveSceneJson);
     if (saveScenePath.has_value()) {
-        if (uiOverlay_ != nullptr) {
-            uiOverlay_->editor().cameraBookmarks().serialize(sceneDocument_);
-        }
+        serializeEditorSceneData();
         if (sceneDocument_.saveJson(*saveScenePath)) {
             scenePath_ = *saveScenePath;
             sceneDocument_.clearDirty();
             sceneUnsavedDirty_ = false;
+            notifications_.notify("Scene saved", NotificationType::Success);
             std::cout << "Saved scene: " << saveScenePath->string() << '\n';
         } else {
+            notifications_.notify("Scene save failed", NotificationType::Error);
             std::cerr << "Scene save failed: " << saveScenePath->string() << '\n';
         }
     }
@@ -1631,30 +2479,13 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         if (!confirmDestructiveSceneAction("opening another scene")) {
             std::cout << "Open scene cancelled: " << openScenePath->string() << '\n';
         } else {
-            if (sceneDocument_.loadJson(*openScenePath)) {
-                if (uiOverlay_ != nullptr) {
-                    uiOverlay_->editor().cameraBookmarks().deserialize(sceneDocument_);
-                }
-                scenePath_ = *openScenePath;
-                gltfPath_ = sceneDocument_.sourceGltfPath();
-                hdrPath_ = sceneDocument_.sourceHdrPath();
-                if (gltfPath_.has_value() && std::filesystem::exists(*gltfPath_)) {
-                    try {
-                        assets_.clear();
-                        GltfLoader loader(assets_);
-                        importedScene_ = loader.loadWithCache(*gltfPath_);
-                    } catch (const std::exception& error) {
-                        std::cerr << "Referenced glTF load failed for level: " << error.what() << '\n';
-                    }
-                }
-                (void)SunController::migrateLegacyDirectionalSun(sceneDocument_);
-                (void)SunController::repairPrimarySunTransform(sceneDocument_);
-                undoStack_.clear();
-                sceneUnsavedDirty_ = false;
-                std::cout << "Opened scene: " << openScenePath->string() << '\n';
-            } else {
-                std::cerr << "Open scene failed: " << openScenePath->string() << '\n';
+            SceneLoadRequest request;
+            request.mode = SceneLoadMode::OpenRtLevel;
+            request.sourcePath = *openScenePath;
+            if (project_.has_value()) {
+                request.projectSnapshot = *project_;
             }
+            (void)requestSceneLoad(std::move(request));
         }
     }
 
@@ -1663,6 +2494,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             std::cout << "New scene cancelled\n";
         } else {
             initializeFallbackSceneDocument();
+            if (uiOverlay_ != nullptr) {
+                uiOverlay_->editor().timeline().clear();
+            }
             scenePath_.reset();
             gltfPath_.reset();
             importedScene_.reset();
@@ -1674,9 +2508,31 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         }
     }
 
+    if (requests.closeScene) {
+        if (!confirmDestructiveSceneAction("closing the scene tab")) {
+            std::cout << "Close scene tab cancelled\n";
+        } else {
+            initializeFallbackSceneDocument();
+            if (uiOverlay_ != nullptr) {
+                uiOverlay_->editor().timeline().clear();
+            }
+            scenePath_.reset();
+            gltfPath_.reset();
+            importedScene_.reset();
+            assets_.clear();
+            undoStack_.clear();
+            sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+            (void)applyPendingSceneUpdate(true);
+            sceneUnsavedDirty_ = false;
+            notifications_.notify("Scene closed", NotificationType::Info);
+        }
+    }
+
     if (requests.materialUpdate.has_value()) {
         MaterialAsset* material = assets_.material(MaterialAssetHandle{requests.materialUpdate->materialId});
         if (material != nullptr) {
+            const SceneDocument beforeDocument = sceneDocument_;
+            const AssetManager beforeAssets = assets_;
             *material = requests.materialUpdate->material;
             for (uint32_t meshIndex = 0; meshIndex < assets_.meshes().size(); ++meshIndex) {
                 MeshAsset* mesh = assets_.mesh(MeshAssetHandle{meshIndex});
@@ -1698,18 +2554,69 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             }
             sceneDocument_.markDirty(SceneUpdateKind::MaterialOnly);
             sceneUnsavedDirty_ = true;
+            undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+                sceneDocument_,
+                assets_,
+                beforeDocument,
+                beforeAssets,
+                sceneDocument_,
+                assets_,
+                SceneUpdateKind::MaterialOnly,
+                "Edit Material"));
         }
     }
 
     if (requests.materialAssignment.has_value()) {
+        const SceneDocument beforeDocument = sceneDocument_;
+        const AssetManager beforeAssets = assets_;
+        bool assigned = false;
+        if (requests.materialAssignment->entity.valid()) {
+            if (Entity* entity = sceneDocument_.registry().entity(requests.materialAssignment->entity);
+                entity != nullptr && entity->meshRenderer.has_value()) {
+                MeshRenderer& renderer = *entity->meshRenderer;
+                ensureMaterialSlotsForRenderer(renderer, assets_);
+                const MaterialAssetHandle material = requests.materialAssignment->material;
+                if (requests.materialAssignment->primitiveIndex == UINT32_MAX) {
+                    for (MaterialSlot& slot : renderer.materialSlots) {
+                        slot.overrideMaterial = material.index == slot.material.index
+                            ? std::optional<MaterialAssetHandle>{}
+                            : std::optional<MaterialAssetHandle>{material};
+                    }
+                    assigned = true;
+                } else if (requests.materialAssignment->primitiveIndex < renderer.materialSlots.size()) {
+                    MaterialSlot& slot = renderer.materialSlots[requests.materialAssignment->primitiveIndex];
+                    slot.overrideMaterial = material.index == slot.material.index
+                        ? std::optional<MaterialAssetHandle>{}
+                        : std::optional<MaterialAssetHandle>{material};
+                    assigned = true;
+                }
+            }
+        }
         MeshAsset* mesh = assets_.mesh(requests.materialAssignment->mesh);
-        if (mesh != nullptr && requests.materialAssignment->primitiveIndex < mesh->primitives.size()) {
-            mesh->primitives[requests.materialAssignment->primitiveIndex].material = requests.materialAssignment->material;
-            updatePrimitiveAlphaClassification(
-                mesh->primitives[requests.materialAssignment->primitiveIndex],
-                assets_.material(requests.materialAssignment->material));
+        if (mesh != nullptr && requests.materialAssignment->primitiveIndex == UINT32_MAX) {
+            for (MeshPrimitiveAsset& primitive : mesh->primitives) {
+                primitive.material = requests.materialAssignment->material;
+                updatePrimitiveAlphaClassification(primitive, assets_.material(requests.materialAssignment->material));
+            }
+            assigned = true;
+        } else if (mesh != nullptr && requests.materialAssignment->primitiveIndex < mesh->primitives.size()) {
+            MeshPrimitiveAsset& primitive = mesh->primitives[requests.materialAssignment->primitiveIndex];
+            primitive.material = requests.materialAssignment->material;
+            updatePrimitiveAlphaClassification(primitive, assets_.material(requests.materialAssignment->material));
+            assigned = true;
+        }
+        if (assigned) {
             sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
             sceneUnsavedDirty_ = true;
+            undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+                sceneDocument_,
+                assets_,
+                beforeDocument,
+                beforeAssets,
+                sceneDocument_,
+                assets_,
+                SceneUpdateKind::TopologyChanged,
+                "Assign Material"));
         }
     }
 
@@ -1717,6 +2624,8 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     sceneOps.setUndoStack(&undoStack_);
     if (requests.createEntity.has_value()) {
         const EditorEntityCreateRequest& create = *requests.createEntity;
+        const SceneDocument beforeDocument = sceneDocument_;
+        sceneOps.setUndoStack(nullptr);
         EntityId created{};
         switch (create.kind) {
         case EditorEntityCreateKind::Empty:
@@ -1736,6 +2645,57 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 (void)sceneOps.addLightComponent(created, Light{});
             }
             break;
+        case EditorEntityCreateKind::SpotLight:
+            created = sceneOps.createEntity("Spot Light", create.parent);
+            if (created.valid()) {
+                Light light;
+                light.type = LightType::Spot;
+                (void)sceneOps.addLightComponent(created, light);
+            }
+            break;
+        case EditorEntityCreateKind::AreaLight:
+            created = sceneOps.createEntity("Area Light", create.parent);
+            if (created.valid()) {
+                Light light;
+                light.type = LightType::Area;
+                light.sizeOrRadius = 1.0f;
+                (void)sceneOps.addLightComponent(created, light);
+            }
+            break;
+        case EditorEntityCreateKind::EnvironmentLight:
+            created = sceneOps.createEntity("Environment Light", create.parent);
+            if (Entity* entity = sceneDocument_.registry().entity(created)) {
+                entity->environmentLight = EnvironmentLight{};
+                sceneDocument_.worldSettings().activeEnvironment = created;
+            }
+            break;
+        case EditorEntityCreateKind::SkyAtmosphere:
+            created = sceneOps.createEntity("Sky Atmosphere", create.parent);
+            if (Entity* entity = sceneDocument_.registry().entity(created)) {
+                entity->skyAtmosphere = SkyAtmosphere{};
+                sceneDocument_.worldSettings().skyAtmosphere = created;
+            }
+            break;
+        case EditorEntityCreateKind::HeightFog:
+            created = sceneOps.createEntity("Height Fog", create.parent);
+            if (Entity* entity = sceneDocument_.registry().entity(created)) {
+                entity->heightFog = HeightFog{};
+                sceneDocument_.worldSettings().heightFog = created;
+            }
+            break;
+        case EditorEntityCreateKind::VolumetricCloud:
+            created = sceneOps.createEntity("Volumetric Cloud", create.parent);
+            if (Entity* entity = sceneDocument_.registry().entity(created)) {
+                entity->volumetricCloud = VolumetricCloud{};
+            }
+            break;
+        case EditorEntityCreateKind::PostProcessVolume:
+            created = sceneOps.createEntity("Post Process Volume", create.parent);
+            if (Entity* entity = sceneDocument_.registry().entity(created)) {
+                entity->postProcessVolume = PostProcessVolume{};
+                sceneDocument_.worldSettings().postProcessVolume = created;
+            }
+            break;
         }
         if (created.valid()) {
             sceneUnsavedDirty_ = true;
@@ -1750,12 +2710,17 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 entity->transform.dirty = true;
                 sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
             }
+            sceneOps.setUndoStack(&undoStack_);
+            sceneOps.pushDocumentSnapshot(beforeDocument, SceneUpdateKind::TopologyChanged, "Create Entity");
+        } else {
+            sceneOps.setUndoStack(&undoStack_);
         }
     }
 
     if (requests.ensurePrimarySun) {
-        (void)SunController::ensurePrimarySun(sceneDocument_);
-        sceneUnsavedDirty_ = true;
+        if (sceneOps.ensurePrimarySun()) {
+            sceneUnsavedDirty_ = true;
+        }
     }
 
     if (requests.duplicateEntity.has_value()) {
@@ -1766,6 +2731,12 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     if (requests.deleteEntity.has_value()) {
         (void)sceneOps.deleteEntity(*requests.deleteEntity);
         sceneUnsavedDirty_ = true;
+    }
+
+    if (requests.renameEntity.has_value()) {
+        if (sceneOps.renameEntity(requests.renameEntity->entity, requests.renameEntity->name)) {
+            sceneUnsavedDirty_ = true;
+        }
     }
 
     if (requests.reparentEntity.has_value()) {
@@ -1792,7 +2763,19 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         sceneUnsavedDirty_ = true;
     }
 
+    if (requests.setMeshRenderer.has_value()) {
+        if (sceneOps.setMeshRenderer(
+                requests.setMeshRenderer->entity,
+                requests.setMeshRenderer->oldRenderer,
+                requests.setMeshRenderer->newRenderer,
+                requests.setMeshRenderer->updateKind)) {
+            sceneUnsavedDirty_ = true;
+        }
+    }
+
     if (requests.addComponent.has_value()) {
+        const SceneDocument beforeDocument = sceneDocument_;
+        bool directComponentAdded = false;
         switch (requests.addComponent->kind) {
         case EditorComponentKind::Light:
             (void)sceneOps.addLightComponent(requests.addComponent->entity, Light{});
@@ -1806,7 +2789,140 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         case EditorComponentKind::MeshRenderer:
             (void)sceneOps.addMeshRendererComponent(requests.addComponent->entity, MeshRenderer{});
             break;
+        case EditorComponentKind::EnvironmentLight:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.addComponent->entity); entity != nullptr && !entity->environmentLight.has_value()) {
+                entity->environmentLight = EnvironmentLight{};
+                sceneDocument_.worldSettings().activeEnvironment = entity->id;
+                sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+                directComponentAdded = true;
+            }
+            break;
+        case EditorComponentKind::SkyAtmosphere:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.addComponent->entity); entity != nullptr && !entity->skyAtmosphere.has_value()) {
+                entity->skyAtmosphere = SkyAtmosphere{};
+                sceneDocument_.worldSettings().skyAtmosphere = entity->id;
+                sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+                directComponentAdded = true;
+            }
+            break;
+        case EditorComponentKind::HeightFog:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.addComponent->entity); entity != nullptr && !entity->heightFog.has_value()) {
+                entity->heightFog = HeightFog{};
+                sceneDocument_.worldSettings().heightFog = entity->id;
+                sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+                directComponentAdded = true;
+            }
+            break;
+        case EditorComponentKind::VolumetricCloud:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.addComponent->entity); entity != nullptr && !entity->volumetricCloud.has_value()) {
+                entity->volumetricCloud = VolumetricCloud{};
+                sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+                directComponentAdded = true;
+            }
+            break;
+        case EditorComponentKind::PostProcessVolume:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.addComponent->entity); entity != nullptr && !entity->postProcessVolume.has_value()) {
+                entity->postProcessVolume = PostProcessVolume{};
+                sceneDocument_.worldSettings().postProcessVolume = entity->id;
+                sceneDocument_.markDirty(SceneUpdateKind::RendererSettingsOnly);
+                directComponentAdded = true;
+            }
+            break;
+        case EditorComponentKind::CameraPostProcess:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.addComponent->entity); entity != nullptr && entity->camera.has_value() && !entity->cameraPostProcess.has_value()) {
+                entity->cameraPostProcess = CameraPostProcess{};
+                sceneDocument_.markDirty(SceneUpdateKind::RendererSettingsOnly);
+                directComponentAdded = true;
+            }
+            break;
         }
+        if (directComponentAdded) {
+            undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+                sceneDocument_, beforeDocument, sceneDocument_, SceneUpdateKind::TopologyChanged, "Add Component"));
+        }
+        sceneUnsavedDirty_ = true;
+    }
+
+    if (requests.removeComponent.has_value()) {
+        const SceneDocument beforeDocument = sceneDocument_;
+        bool removed = false;
+        switch (requests.removeComponent->kind) {
+        case EditorComponentKind::Light:
+            removed = sceneOps.removeLightComponent(requests.removeComponent->entity);
+            break;
+        case EditorComponentKind::Sun:
+            removed = sceneOps.removeSunComponent(requests.removeComponent->entity);
+            break;
+        case EditorComponentKind::Camera:
+            removed = sceneOps.removeCameraComponent(requests.removeComponent->entity);
+            break;
+        case EditorComponentKind::MeshRenderer:
+            removed = sceneOps.removeMeshRendererComponent(requests.removeComponent->entity);
+            break;
+        case EditorComponentKind::EnvironmentLight:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.removeComponent->entity); entity != nullptr && entity->environmentLight.has_value()) {
+                entity->environmentLight.reset();
+                if (sceneDocument_.worldSettings().activeEnvironment == entity->id) sceneDocument_.worldSettings().activeEnvironment = {};
+                sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+                removed = true;
+            }
+            break;
+        case EditorComponentKind::SkyAtmosphere:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.removeComponent->entity); entity != nullptr && entity->skyAtmosphere.has_value()) {
+                entity->skyAtmosphere.reset();
+                if (sceneDocument_.worldSettings().skyAtmosphere == entity->id) sceneDocument_.worldSettings().skyAtmosphere = {};
+                sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+                removed = true;
+            }
+            break;
+        case EditorComponentKind::HeightFog:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.removeComponent->entity); entity != nullptr && entity->heightFog.has_value()) {
+                entity->heightFog.reset();
+                if (sceneDocument_.worldSettings().heightFog == entity->id) sceneDocument_.worldSettings().heightFog = {};
+                sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+                removed = true;
+            }
+            break;
+        case EditorComponentKind::VolumetricCloud:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.removeComponent->entity); entity != nullptr && entity->volumetricCloud.has_value()) {
+                entity->volumetricCloud.reset();
+                sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+                removed = true;
+            }
+            break;
+        case EditorComponentKind::PostProcessVolume:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.removeComponent->entity); entity != nullptr && entity->postProcessVolume.has_value()) {
+                entity->postProcessVolume.reset();
+                if (sceneDocument_.worldSettings().postProcessVolume == entity->id) sceneDocument_.worldSettings().postProcessVolume = {};
+                sceneDocument_.markDirty(SceneUpdateKind::RendererSettingsOnly);
+                removed = true;
+            }
+            break;
+        case EditorComponentKind::CameraPostProcess:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.removeComponent->entity); entity != nullptr && entity->cameraPostProcess.has_value()) {
+                entity->cameraPostProcess.reset();
+                sceneDocument_.markDirty(SceneUpdateKind::RendererSettingsOnly);
+                removed = true;
+            }
+            break;
+        }
+        if (removed) {
+            if (requests.removeComponent->kind >= EditorComponentKind::EnvironmentLight) {
+                undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+                    sceneDocument_, beforeDocument, sceneDocument_, SceneUpdateKind::TopologyChanged, "Remove Component"));
+            }
+            sceneUnsavedDirty_ = true;
+        }
+    }
+
+    if (requests.sceneSnapshot.has_value()) {
+        sceneDocument_.markDirty(requests.sceneSnapshot->updateKind);
+        undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+            sceneDocument_,
+            requests.sceneSnapshot->before,
+            sceneDocument_,
+            requests.sceneSnapshot->updateKind,
+            requests.sceneSnapshot->label.empty() ? "Edit Scene" : requests.sceneSnapshot->label));
         sceneUnsavedDirty_ = true;
     }
 
@@ -1839,11 +2955,23 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     if (requests.focusOnEntity.has_value()) {
         const Entity* entity = sceneDocument_.registry().entity(*requests.focusOnEntity);
         if (entity != nullptr) {
-            const glm::vec3 target = glm::vec3(entityWorldMatrix(sceneDocument_.registry(), *entity)[3]);
-            const glm::vec3 position = cameraController_.position();
-            glm::vec3 direction = target - position;
-            if (glm::dot(direction, direction) > 0.0001f) {
-                cameraController_.setPose(position, glm::normalize(direction), *pathTracer_);
+            glm::vec3 minBounds(std::numeric_limits<float>::max());
+            glm::vec3 maxBounds(-std::numeric_limits<float>::max());
+            bool hasBounds = false;
+            expandEntityBounds(sceneDocument_.registry(), assets_, *entity, minBounds, maxBounds, hasBounds);
+            if (hasBounds) {
+                const glm::vec3 target = (minBounds + maxBounds) * 0.5f;
+                const float radius = std::max(glm::length(maxBounds - minBounds) * 0.5f, 0.35f);
+                glm::vec3 forward = cameraController_.direction();
+                if (glm::dot(forward, forward) <= 0.0001f) {
+                    forward = glm::vec3(0.0f, 0.0f, -1.0f);
+                }
+                forward = glm::normalize(forward);
+                const float fovY = std::max(activeCameraFovRadians(sceneDocument_), glm::radians(5.0f));
+                const float distance = std::max(radius / std::tan(fovY * 0.5f) * 1.35f, radius + 0.5f);
+                const glm::vec3 position = target - forward * distance;
+                cameraController_.setPose(position, forward, *pathTracer_);
+                notifications_.notify("Framed selected entity", NotificationType::Info);
             }
         }
     }
@@ -1882,23 +3010,45 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         if (!confirmDestructiveSceneAction("importing a scene as a new scene")) {
             std::cout << "Import Scene as New Scene cancelled: " << importScenePath->string() << '\n';
         } else {
-            requestGltfSceneLoad(*importScenePath);
+            SceneLoadRequest request;
+            request.mode = SceneLoadMode::ImportSceneAsNewScene;
+            request.sourcePath = *importScenePath;
+            if (project_.has_value()) {
+                request.projectSnapshot = *project_;
+            }
+            (void)requestSceneLoad(std::move(request));
         }
     }
 
     if (requests.importAsset.has_value()) {
-        notifications_.notify("Import Asset is not implemented yet", NotificationType::Warning);
-        std::cout << "Import Asset requested (non-mutating skeleton): " << requests.importAsset->string() << '\n';
+        (void)importAssetNonMutating(*requests.importAsset);
     }
 
     if (requests.importAndPlace.has_value()) {
-        notifications_.notify("Import and Place is not implemented yet", NotificationType::Warning);
-        std::cout << "Import and Place requested: " << requests.importAndPlace->string() << '\n';
+        EditorImportAssetRequest importRequest;
+        importRequest.sourcePath = *requests.importAndPlace;
+        importRequest.mode = "ImportAndPlace";
+        if (std::optional<AssetGuid> guid = importAssetNonMutating(importRequest)) {
+            (void)placePrefabAsset(*guid);
+        }
+    }
+
+    if (requests.reimportAsset.has_value()) {
+        (void)reimportAsset(*requests.reimportAsset);
+    }
+
+    if (requests.placeAsset.has_value()) {
+        (void)placePrefabAsset(*requests.placeAsset);
     }
 
     if (requests.mergeScene.has_value()) {
-        notifications_.notify("Merge Scene is not implemented yet", NotificationType::Warning);
-        std::cout << "Merge Scene requested: " << requests.mergeScene->string() << '\n';
+        SceneLoadRequest request;
+        request.mode = SceneLoadMode::MergeSceneIntoCurrent;
+        request.sourcePath = *requests.mergeScene;
+        if (project_.has_value()) {
+            request.projectSnapshot = *project_;
+        }
+        (void)requestSceneLoad(std::move(request));
     }
 
     if (requests.exit && window_ != nullptr && confirmDestructiveSceneAction("exiting")) {
@@ -2438,6 +3588,12 @@ void Application::processRuntimeControls(float deltaSeconds) {
     const bool ctrlDown =
         glfwGetKey(window_, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
         glfwGetKey(window_, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+    const bool shiftDown =
+        glfwGetKey(window_, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+        glfwGetKey(window_, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+    const bool altDown =
+        glfwGetKey(window_, GLFW_KEY_LEFT_ALT) == GLFW_PRESS ||
+        glfwGetKey(window_, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;
     processSunDragControls(shortcutsBlocked, viewportHovered, viewportInteraction, ctrlDown);
     const bool sunDragCapturing = sunDrag_.phase != SunDragPhase::Idle;
     const bool cameraMoved = cameraController_.update(
@@ -2452,62 +3608,98 @@ void Application::processRuntimeControls(float deltaSeconds) {
 
     RendererSettings settings = pathTracer_->settings();
     bool changed = false;
-    if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_Z)) {
-        if (undoStack_.undo()) {
-            notifications_.notify("Undo", NotificationType::Info);
-            (void)applyPendingSceneUpdate(true);
+    auto commandPressed = [&](EditorCommandId id) {
+        const EditorCommand* command = editorCommand(id);
+        if (shortcutsBlocked || command == nullptr || command->defaultKeybinding.glfwKey < 0) {
+            return false;
         }
-    }
-    if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_Y)) {
-        if (undoStack_.redo()) {
-            notifications_.notify("Redo", NotificationType::Info);
-            (void)applyPendingSceneUpdate(true);
+        const EditorKeybinding& binding = command->defaultKeybinding;
+        if (binding.ctrl != ctrlDown || binding.shift != shiftDown || binding.alt != altDown) {
+            return false;
         }
+        return pressedOnce(binding.glfwKey);
+    };
+
+    if (commandPressed(EditorCommandId::Undo) && undoStack_.undo()) {
+        notifications_.notify("Undo", NotificationType::Info);
+        (void)applyPendingSceneUpdate(true);
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F1)) {
+    if (commandPressed(EditorCommandId::Redo) && undoStack_.redo()) {
+        notifications_.notify("Redo", NotificationType::Info);
+        (void)applyPendingSceneUpdate(true);
+    }
+    if (commandPressed(EditorCommandId::CycleDebugView)) {
         settings.debugView = nextDebugView(settings.debugView);
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_0)) {
+    if (commandPressed(EditorCommandId::SetDebugBeauty)) {
         settings.debugView = RendererDebugView::Beauty;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_1)) {
+    if (commandPressed(EditorCommandId::SetDebugDirectLighting)) {
+        settings.debugView = RendererDebugView::DirectLighting;
+        changed = true;
+    }
+    if (commandPressed(EditorCommandId::SetDebugIndirectLighting)) {
+        settings.debugView = RendererDebugView::IndirectLighting;
+        changed = true;
+    }
+    if (commandPressed(EditorCommandId::SetDebugNormals)) {
+        settings.debugView = RendererDebugView::Normals;
+        changed = true;
+    }
+    if (commandPressed(EditorCommandId::SetDebugDepth)) {
+        settings.debugView = RendererDebugView::Depth;
+        changed = true;
+    }
+    if (commandPressed(EditorCommandId::SetDebugMotionVectors)) {
+        settings.debugView = RendererDebugView::MotionVectors;
+        changed = true;
+    }
+    if (commandPressed(EditorCommandId::SetDebugVariance)) {
+        settings.debugView = RendererDebugView::Variance;
+        changed = true;
+    }
+    if (commandPressed(EditorCommandId::SetDebugAlbedo)) {
+        settings.debugView = RendererDebugView::Albedo;
+        changed = true;
+    }
+    if (commandPressed(EditorCommandId::SetToneMapperLinear)) {
         settings.toneMapper = ToneMapper::Linear;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_2)) {
+    if (commandPressed(EditorCommandId::SetToneMapperReinhard)) {
         settings.toneMapper = ToneMapper::Reinhard;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_3)) {
+    if (commandPressed(EditorCommandId::SetToneMapperAces)) {
         settings.toneMapper = ToneMapper::ACES;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_4)) {
+    if (commandPressed(EditorCommandId::SetToneMapperPbrNeutral)) {
         settings.toneMapper = ToneMapper::PBRNeutral;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_5)) {
+    if (commandPressed(EditorCommandId::SetToneMapperAgx)) {
         settings.toneMapper = ToneMapper::AgX;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_6)) {
+    if (commandPressed(EditorCommandId::ToggleAutoExposure)) {
         settings.autoExposureEnabled = !settings.autoExposureEnabled;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F11)) {
+    if (commandPressed(EditorCommandId::ToggleFullscreen)) {
         toggleBorderlessFullscreen();
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F2)) {
+    if (commandPressed(EditorCommandId::ToggleDenoiser)) {
         settings.denoiserEnabled = !settings.denoiserEnabled;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F3)) {
+    if (commandPressed(EditorCommandId::ToggleMovingDenoiser)) {
         settings.denoiseWhileMoving = !settings.denoiseWhileMoving;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F4)) {
+    if (commandPressed(EditorCommandId::ToggleSun)) {
         const bool hadPrimarySun = SunController::primarySunEntity(sceneDocument_).valid();
         EntityId sunId = SunController::ensurePrimarySun(sceneDocument_);
         if (Entity* sun = sceneDocument_.registry().entity(sunId); sun != nullptr && sun->sun.has_value()) {
@@ -2517,15 +3709,15 @@ void Application::processRuntimeControls(float deltaSeconds) {
             settings = pathTracer_->settings();
         }
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F5)) {
+    if (commandPressed(EditorCommandId::ToggleEnvironment)) {
         settings.environmentEnabled = !settings.environmentEnabled;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F6)) {
+    if (commandPressed(EditorCommandId::ToggleDirectLighting)) {
         settings.directLightingEnabled = !settings.directLightingEnabled;
         changed = true;
     }
-    if (!shortcutsBlocked && pressedOnce(GLFW_KEY_F7)) {
+    if (commandPressed(EditorCommandId::CycleIntermediateView)) {
         constexpr int count = sizeof(intermediateViews) / sizeof(intermediateViews[0]);
         int idx = 0;
         for (int i = 0; i < count; ++i) {
@@ -2534,14 +3726,16 @@ void Application::processRuntimeControls(float deltaSeconds) {
         settings.debugView = intermediateViews[idx];
         changed = true;
     }
-    if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_R)) {
+    if (commandPressed(EditorCommandId::ReloadShaders)) {
         pendingReloadShaders_ = true;
     }
-    if (!shortcutsBlocked && ctrlDown && pressedOnce(GLFW_KEY_S)) {
+    if (commandPressed(EditorCommandId::SaveScene)) {
         pendingSaveLevel_ = true;
     }
-    const bool resetAccumulationPressed = !shortcutsBlocked && !ctrlDown && pressedOnce(GLFW_KEY_R);
-    if (resetAccumulationPressed && !viewportInteraction) {
+    if (commandPressed(EditorCommandId::OpenScene)) {
+        pendingOpenLevel_ = true;
+    }
+    if (commandPressed(EditorCommandId::ResetAccumulation) && !viewportInteraction) {
         pathTracer_->resetAccumulation();
     }
 

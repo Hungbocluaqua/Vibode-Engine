@@ -43,6 +43,10 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.histogramHighPercentile = render.histogramHighPercentile;
     result.rendererSettings.histogramTargetPercentile = render.histogramTargetPercentile;
     result.rendererSettings.skyIntensity = render.skyIntensity;
+    result.rendererSettings.rayleighScaleHeight = render.rayleighScaleHeight;
+    result.rendererSettings.mieScaleHeight = render.mieScaleHeight;
+    result.rendererSettings.mieAnisotropy = render.mieAnisotropy;
+    result.rendererSettings.groundAlbedo = render.groundAlbedo;
     result.rendererSettings.indirectStrength = render.indirectStrength;
     result.rendererSettings.restirMode = render.restirMode;
     result.rendererSettings.restirGiEnabled = render.restirGiEnabled;

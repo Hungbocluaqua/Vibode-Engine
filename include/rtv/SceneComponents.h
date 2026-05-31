@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rtv/EntityId.h"
+#include "rtv/AssetRegistry.h"
 #include "rtv/MeshAsset.h"
 #include "rtv/RendererDebug.h"
 
@@ -44,7 +46,9 @@ struct Transform {
 struct MaterialSlot {
     std::string name;
     MaterialAssetHandle material{};
+    AssetGuid materialGuid;
     std::optional<MaterialAssetHandle> overrideMaterial;
+    std::optional<AssetGuid> overrideMaterialGuid;
     TextureAssetHandle textureReference{};
 
     [[nodiscard]] MaterialAssetHandle resolvedMaterial() const {
@@ -54,6 +58,7 @@ struct MaterialSlot {
 
 struct MeshRenderer {
     MeshAssetHandle mesh{};
+    AssetGuid meshGuid;
     std::vector<MaterialSlot> materialSlots;
     bool visible = true;
     bool castShadow = true;
@@ -65,6 +70,7 @@ enum class LightType : uint32_t {
     Directional,
     Point,
     Area,
+    Spot,
 };
 
 struct Light {
@@ -72,6 +78,8 @@ struct Light {
     glm::vec3 color{1.0f};
     float intensity = 1.0f;
     float sizeOrRadius = 1.0f;
+    float innerConeRadians = 0.35f;
+    float outerConeRadians = 0.70f;
     bool enabled = true;
 };
 
@@ -96,6 +104,63 @@ struct Environment {
     float rotation = 0.0f;
     float backgroundIntensity = 0.35f;
     bool enabled = true;
+};
+
+struct EnvironmentLight {
+    bool enabled = true;
+    float intensity = 1.0f;
+    float backgroundIntensity = 0.35f;
+    float rotation = 0.0f;
+};
+
+struct SkyAtmosphere {
+    bool enabled = true;
+    float rayleighScaleHeight = 8000.0f;
+    float mieScaleHeight = 1200.0f;
+    float mieAnisotropy = 0.8f;
+    float groundAlbedo = 0.3f;
+};
+
+struct HeightFog {
+    bool enabled = false;
+    float density = 0.0f;
+    float heightFalloff = 0.2f;
+    glm::vec3 color{0.65f, 0.72f, 0.85f};
+};
+
+struct VolumetricCloud {
+    bool enabled = false;
+    float density = 0.0f;
+    float coverage = 0.5f;
+};
+
+struct PostProcessVolume {
+    bool enabled = true;
+    bool unbound = true;
+    float priority = 0.0f;
+    float exposureCompensation = 0.0f;
+    float saturation = 1.0f;
+    float contrast = 1.0f;
+};
+
+struct CameraPostProcess {
+    bool enabled = true;
+    bool overrideExposure = false;
+    float exposureCompensation = 0.0f;
+    bool overrideDepthOfField = false;
+    float dofApertureRadius = 0.0f;
+    float dofFocusDistance = 10.0f;
+};
+
+struct WorldSettings {
+    EntityId activeEnvironment{};
+    EntityId primarySun{};
+    EntityId skyAtmosphere{};
+    EntityId heightFog{};
+    EntityId postProcessVolume{};
+    bool atmosphereEnabled = true;
+    bool fogEnabled = false;
+    bool postProcessEnabled = true;
 };
 
 struct RenderSettings {

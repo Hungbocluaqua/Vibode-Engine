@@ -117,12 +117,12 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             name.copy(nameBuffer.data(), std::min(name.size(), nameBuffer.size() - 1u));
         }
         if (ImGui::InputText("Name", nameBuffer.data(), nameBuffer.size(), ImGuiInputTextFlags_EnterReturnsTrue)) {
-            document.registry().renameEntity(entity->id, nameBuffer.data());
-            document.markDirty(SceneUpdateKind::None);
+            requests.renameEntity = EditorEntityRenameRequest{.entity = entity->id, .name = nameBuffer.data()};
         }
 
         ImGui::SeparatorText("Transform");
         bool transformChanged = false;
+        const Transform oldTransform = entity->transform;
         static std::optional<Transform> copiedTransform;
         if (ImGui::SmallButton("Reset Position")) {
             entity->transform.position = glm::vec3(0.0f);
@@ -161,10 +161,18 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             const SceneUpdateKind updateKind = transformUpdateKind(document, *entity);
             document.markDirty(updateKind);
             requests.sceneUpdate = updateKind;
+            requests.setEntityTransform = EditorEntityTransformChange{
+                .entity = entity->id,
+                .oldTransform = oldTransform,
+                .newTransform = entity->transform,
+            };
         }
 
         if (entity->camera.has_value()) {
             ImGui::SeparatorText("Camera");
+            if (ImGui::SmallButton("Remove Camera")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::Camera};
+            }
             Camera& camera = *entity->camera;
             const Camera oldCamera = camera;
             const EntityId oldActiveCamera = document.activeCamera();
@@ -199,11 +207,14 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
 
         if (entity->light.has_value()) {
             ImGui::SeparatorText("Light");
+            if (ImGui::SmallButton("Remove Light")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::Light};
+            }
             Light& light = *entity->light;
             const Light oldLight = light;
             bool changed = false;
             int lightType = static_cast<int>(light.type);
-            if (ImGui::Combo("Type", &lightType, "Directional\0Point\0Area\0")) {
+            if (ImGui::Combo("Type", &lightType, "Directional\0Point\0Area\0Spot\0")) {
                 light.type = static_cast<LightType>(lightType);
                 if (light.type == LightType::Directional &&
                     (oldLight.type != LightType::Directional || light.sizeOrRadius > 0.08f || light.sizeOrRadius <= 0.0f)) {
@@ -216,6 +227,10 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             changed |= ImGui::DragFloat("Intensity", &light.intensity, 0.05f, 0.0f, 100000.0f, "%.2f");
             if (light.type == LightType::Directional) {
                 changed |= ImGui::DragFloat("Angular Radius", &light.sizeOrRadius, 0.0001f, 0.0001f, 0.08f, "%.5f rad");
+            } else if (light.type == LightType::Spot) {
+                changed |= ImGui::DragFloat("Range", &light.sizeOrRadius, 0.02f, 0.0f, 1000.0f, "%.3f");
+                changed |= ImGui::DragFloat("Inner Cone", &light.innerConeRadians, 0.01f, 0.0f, 3.14159f, "%.2f rad");
+                changed |= ImGui::DragFloat("Outer Cone", &light.outerConeRadians, 0.01f, light.innerConeRadians, 3.14159f, "%.2f rad");
             } else {
                 changed |= ImGui::DragFloat("Size / Radius", &light.sizeOrRadius, 0.02f, 0.0f, 1000.0f, "%.3f");
             }
@@ -232,6 +247,9 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
 
         if (entity->sun.has_value()) {
             ImGui::SeparatorText("Primary Sun");
+            if (ImGui::SmallButton("Remove Primary Sun")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::Sun};
+            }
             Sun& sun = *entity->sun;
             const Sun oldSun = sun;
             bool changed = false;
@@ -253,8 +271,12 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
 
         if (entity->meshRenderer.has_value()) {
             ImGui::SeparatorText("Mesh Renderer");
+            if (ImGui::SmallButton("Remove Mesh Renderer")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::MeshRenderer};
+            }
             MeshRenderer& renderer = *entity->meshRenderer;
             ensureMaterialSlots(renderer, state.assets);
+            const MeshRenderer oldRenderer = renderer;
             bool changed = false;
             changed |= ImGui::Checkbox("Visible", &renderer.visible);
             changed |= ImGui::Checkbox("Cast Shadow", &renderer.castShadow);
@@ -289,8 +311,8 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                                     : materials[materialIndex].name + "##" + std::to_string(materialIndex);
                                 const bool selected = material.index == materialIndex;
                                 if (ImGui::Selectable(label.c_str(), selected)) {
-                                    slot.overrideMaterial = candidate.index == slot.material.index ? std::optional<MaterialAssetHandle>{} : std::optional<MaterialAssetHandle>{candidate};
                                     requests.materialAssignment = EditorMaterialAssignment{
+                                        .entity = entity->id,
                                         .mesh = renderer.mesh,
                                         .primitiveIndex = static_cast<uint32_t>(i),
                                         .material = candidate,
@@ -345,6 +367,146 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             if (changed) {
                 document.markDirty(SceneUpdateKind::VisibilityOnly);
                 requests.sceneUpdate = SceneUpdateKind::VisibilityOnly;
+                requests.setMeshRenderer = EditorMeshRendererChange{
+                    .entity = entity->id,
+                    .oldRenderer = oldRenderer,
+                    .newRenderer = renderer,
+                    .updateKind = SceneUpdateKind::VisibilityOnly,
+                };
+            }
+        }
+
+        if (entity->environmentLight.has_value()) {
+            ImGui::SeparatorText("Environment Light");
+            if (ImGui::SmallButton("Remove Environment Light")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::EnvironmentLight};
+            }
+            const SceneDocument before = document;
+            EnvironmentLight& component = *entity->environmentLight;
+            bool changed = false;
+            changed |= ImGui::Checkbox("Environment Enabled", &component.enabled);
+            changed |= ImGui::DragFloat("Environment Intensity", &component.intensity, 0.02f, 0.0f, 1000.0f, "%.3f");
+            changed |= ImGui::DragFloat("Background Intensity", &component.backgroundIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
+            changed |= ImGui::DragFloat("Environment Rotation", &component.rotation, 0.01f, -6.28318f, 6.28318f, "%.3f");
+            if (changed) {
+                document.environment().enabled = component.enabled;
+                document.environment().intensity = component.intensity;
+                document.environment().backgroundIntensity = component.backgroundIntensity;
+                document.environment().rotation = component.rotation;
+                document.worldSettings().activeEnvironment = entity->id;
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::EnvironmentOnly, .label = "Edit Environment Light"};
+            }
+        }
+
+        if (entity->skyAtmosphere.has_value()) {
+            ImGui::SeparatorText("Sky Atmosphere");
+            if (ImGui::SmallButton("Remove Sky Atmosphere")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::SkyAtmosphere};
+            }
+            const SceneDocument before = document;
+            SkyAtmosphere& component = *entity->skyAtmosphere;
+            bool changed = false;
+            changed |= ImGui::Checkbox("Atmosphere Enabled", &component.enabled);
+            changed |= ImGui::DragFloat("Rayleigh Scale Height", &component.rayleighScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
+            changed |= ImGui::DragFloat("Mie Scale Height", &component.mieScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
+            changed |= ImGui::SliderFloat("Mie Anisotropy", &component.mieAnisotropy, 0.0f, 0.99f, "%.3f");
+            changed |= ImGui::SliderFloat("Ground Albedo", &component.groundAlbedo, 0.0f, 1.0f, "%.3f");
+            if (changed) {
+                RenderSettings& render = document.renderSettings();
+                render.rayleighScaleHeight = component.rayleighScaleHeight;
+                render.mieScaleHeight = component.mieScaleHeight;
+                render.mieAnisotropy = component.mieAnisotropy;
+                render.groundAlbedo = component.groundAlbedo;
+                document.worldSettings().skyAtmosphere = entity->id;
+                document.worldSettings().atmosphereEnabled = component.enabled;
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Sky Atmosphere"};
+            }
+        }
+
+        if (entity->heightFog.has_value()) {
+            ImGui::SeparatorText("Height Fog");
+            if (ImGui::SmallButton("Remove Height Fog")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::HeightFog};
+            }
+            const SceneDocument before = document;
+            HeightFog& component = *entity->heightFog;
+            bool changed = false;
+            changed |= ImGui::Checkbox("Fog Enabled", &component.enabled);
+            changed |= ImGui::DragFloat("Density", &component.density, 0.001f, 0.0f, 10.0f, "%.4f");
+            changed |= ImGui::DragFloat("Height Falloff", &component.heightFalloff, 0.01f, 0.0f, 10.0f, "%.3f");
+            changed |= ImGui::ColorEdit3("Fog Color", glm::value_ptr(component.color));
+            if (changed) {
+                document.worldSettings().heightFog = entity->id;
+                document.worldSettings().fogEnabled = component.enabled;
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::EnvironmentOnly, .label = "Edit Height Fog"};
+            }
+        }
+
+        if (entity->volumetricCloud.has_value()) {
+            ImGui::SeparatorText("Volumetric Cloud");
+            if (ImGui::SmallButton("Remove Volumetric Cloud")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::VolumetricCloud};
+            }
+            const SceneDocument before = document;
+            VolumetricCloud& component = *entity->volumetricCloud;
+            bool changed = false;
+            changed |= ImGui::Checkbox("Cloud Enabled", &component.enabled);
+            changed |= ImGui::SliderFloat("Cloud Density", &component.density, 0.0f, 1.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Coverage", &component.coverage, 0.0f, 1.0f, "%.3f");
+            if (changed) {
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::EnvironmentOnly, .label = "Edit Volumetric Cloud"};
+            }
+        }
+
+        if (entity->postProcessVolume.has_value()) {
+            ImGui::SeparatorText("Post Process Volume");
+            if (ImGui::SmallButton("Remove Post Process Volume")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::PostProcessVolume};
+            }
+            const SceneDocument before = document;
+            PostProcessVolume& component = *entity->postProcessVolume;
+            bool changed = false;
+            changed |= ImGui::Checkbox("Post Process Enabled", &component.enabled);
+            changed |= ImGui::Checkbox("Unbound", &component.unbound);
+            changed |= ImGui::DragFloat("Priority", &component.priority, 0.1f, -100.0f, 100.0f, "%.1f");
+            changed |= ImGui::DragFloat("Exposure Compensation", &component.exposureCompensation, 0.02f, -10.0f, 10.0f, "%.2f");
+            changed |= ImGui::SliderFloat("PP Saturation", &component.saturation, 0.0f, 2.0f, "%.3f");
+            changed |= ImGui::SliderFloat("PP Contrast", &component.contrast, 0.0f, 2.0f, "%.3f");
+            if (changed) {
+                RenderSettings& render = document.renderSettings();
+                render.physicalExposureCompensation = component.exposureCompensation;
+                render.saturation = component.saturation;
+                render.contrast = component.contrast;
+                document.worldSettings().postProcessVolume = entity->id;
+                document.worldSettings().postProcessEnabled = component.enabled;
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Post Process Volume"};
+            }
+        }
+
+        if (entity->cameraPostProcess.has_value()) {
+            ImGui::SeparatorText("Camera Post Process");
+            if (ImGui::SmallButton("Remove Camera Post Process")) {
+                requests.removeComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::CameraPostProcess};
+            }
+            const SceneDocument before = document;
+            CameraPostProcess& component = *entity->cameraPostProcess;
+            bool changed = false;
+            changed |= ImGui::Checkbox("Camera PP Enabled", &component.enabled);
+            changed |= ImGui::Checkbox("Override Exposure", &component.overrideExposure);
+            changed |= ImGui::DragFloat("Camera Exposure Compensation", &component.exposureCompensation, 0.02f, -10.0f, 10.0f, "%.2f");
+            changed |= ImGui::Checkbox("Override DOF", &component.overrideDepthOfField);
+            changed |= ImGui::DragFloat("Camera DOF Aperture", &component.dofApertureRadius, 0.01f, 0.0f, 10.0f, "%.3f");
+            changed |= ImGui::DragFloat("Camera Focus Distance", &component.dofFocusDistance, 0.05f, 0.01f, 10000.0f, "%.2f");
+            if (changed) {
+                RenderSettings& render = document.renderSettings();
+                if (component.overrideExposure) {
+                    render.physicalExposureCompensation = component.exposureCompensation;
+                }
+                if (component.overrideDepthOfField) {
+                    render.dofApertureRadius = component.dofApertureRadius;
+                    render.dofFocusDistance = component.dofFocusDistance;
+                }
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Camera Post Process"};
             }
         }
 
@@ -370,13 +532,45 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             }
             ImGui::SameLine();
         }
+        if (entity->camera.has_value() && !entity->cameraPostProcess.has_value()) {
+            if (ImGui::Button("Camera Post Process")) {
+                requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::CameraPostProcess};
+                requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
+            }
+            ImGui::SameLine();
+        }
         if (!entity->meshRenderer.has_value()) {
             if (ImGui::Button("Mesh Renderer")) {
                 requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::MeshRenderer};
                 requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
             }
         }
-        if (entity->light.has_value() || entity->sun.has_value() || entity->camera.has_value() || entity->meshRenderer.has_value()) {
+        if (!entity->environmentLight.has_value() && ImGui::Button("Environment Light")) {
+            requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::EnvironmentLight};
+            requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+        }
+        ImGui::SameLine();
+        if (!entity->skyAtmosphere.has_value() && ImGui::Button("Sky Atmosphere")) {
+            requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::SkyAtmosphere};
+            requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+        }
+        ImGui::SameLine();
+        if (!entity->heightFog.has_value() && ImGui::Button("Height Fog")) {
+            requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::HeightFog};
+            requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+        }
+        if (!entity->volumetricCloud.has_value() && ImGui::Button("Volumetric Cloud")) {
+            requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::VolumetricCloud};
+            requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+        }
+        ImGui::SameLine();
+        if (!entity->postProcessVolume.has_value() && ImGui::Button("Post Process Volume")) {
+            requests.addComponent = EditorComponentRequest{.entity = entity->id, .kind = EditorComponentKind::PostProcessVolume};
+            requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
+        }
+        if (entity->light.has_value() || entity->sun.has_value() || entity->camera.has_value() || entity->meshRenderer.has_value() ||
+            entity->environmentLight.has_value() || entity->skyAtmosphere.has_value() || entity->heightFog.has_value() ||
+            entity->volumetricCloud.has_value() || entity->postProcessVolume.has_value() || entity->cameraPostProcess.has_value()) {
             ImGui::TextDisabled("All components attached");
         }
 

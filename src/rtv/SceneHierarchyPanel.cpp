@@ -40,6 +40,12 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
             requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
             requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
         }
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::AcceptDragDropPayload("PREFAB_ASSET")) {
+                requests.placeAsset = std::string(static_cast<const char*>(payload->Data));
+            }
+            ImGui::EndDragDropTarget();
+        }
 
         ImGui::Separator();
         static std::array<char, 128> filterBuffer{};
@@ -294,6 +300,7 @@ void SceneHierarchyPanel::drawEntityNode(SceneRegistry& registry, Entity& entity
                 const uint32_t materialId = *static_cast<const uint32_t*>(payload->Data);
                 if (entity.meshRenderer.has_value() && materialId < UINT32_MAX) {
                     requests.materialAssignment = EditorMaterialAssignment{
+                        .entity = entity.id,
                         .mesh = entity.meshRenderer->mesh,
                         .primitiveIndex = UINT32_MAX,
                         .material = MaterialAssetHandle{materialId},

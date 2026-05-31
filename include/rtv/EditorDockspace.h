@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rtv/EditorCommands.h"
 #include "rtv/EditorPanels.h"
 
 #include <filesystem>
@@ -17,6 +18,7 @@ public:
 private:
     void buildDefaultLayout();
     void loadLayout();
+    void executeCommand(EditorCommandId id, EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
     void drawMainMenu(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
     void drawHelpWindows();
 

@@ -1,5 +1,7 @@
 #include "rtv/NotificationManager.h"
 
+#include "rtv/EditorLog.h"
+
 #include <imgui.h>
 
 #include <algorithm>
@@ -22,6 +24,22 @@ ImU32 colorForType(NotificationType type) {
 } // namespace
 
 void NotificationManager::notify(std::string message, NotificationType type, float durationSeconds) {
+    if (log_ != nullptr) {
+        EditorLogCategory category = EditorLogCategory::Info;
+        switch (type) {
+        case NotificationType::Warning:
+            category = EditorLogCategory::Warning;
+            break;
+        case NotificationType::Error:
+            category = EditorLogCategory::Error;
+            break;
+        case NotificationType::Success:
+        case NotificationType::Info:
+            category = EditorLogCategory::Info;
+            break;
+        }
+        log_->add(category, message);
+    }
     if (!active_.empty() && active_.back().message == message && active_.back().type == type) {
         active_.back().ageSeconds = 0.0f;
         active_.back().durationSeconds = durationSeconds;

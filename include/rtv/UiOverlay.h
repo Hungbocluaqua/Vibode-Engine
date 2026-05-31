@@ -23,6 +23,7 @@ class AssetManager;
 class CameraController;
 class NotificationManager;
 class SceneDocument;
+class UndoStack;
 struct SceneAsset;
 
 class UiOverlay final : private NonCopyable {
@@ -54,7 +55,10 @@ public:
         bool sceneDirty,
         const std::vector<EntityId>* instanceEntities,
         const std::string& sceneLoadingStatus,
+        bool sceneLoadRunning,
+        float sceneLoadProgress,
         const CameraController* camera,
+        const UndoStack* undoStack,
         float cpuFrameMs,
         NotificationManager* notifications,
         bool externalMouseCapture = false);

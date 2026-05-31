@@ -12,6 +12,10 @@ struct EditorPreferences {
     bool gridVisible = true;
     bool showHud = true;
     float hudScale = 1.0f;
+    float uiScale = 1.0f;
+    int themePreset = 0;
+    int workspacePreset = 0;
+    int layoutVersion = 2;
     bool confirmDelete = true;
     std::vector<std::string> recentFiles;
     std::vector<std::string> favoriteFiles;

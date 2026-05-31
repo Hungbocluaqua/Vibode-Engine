@@ -2,6 +2,7 @@
 
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
+#include "rtv/EditorCommands.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/SceneOperations.h"
 
@@ -379,83 +380,102 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 ImVec2(imagePos.x + avail.x, imagePos.y + avail.y),
                 IM_COL32(18, 20, 23, 255));
         }
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::AcceptDragDropPayload("PREFAB_ASSET")) {
+                requests.placeAsset = std::string(static_cast<const char*>(payload->Data));
+            }
+            ImGui::EndDragDropTarget();
+        }
 
         const RendererSettings& settings = state.renderer.settings();
         const GpuFrameTimings& timings = state.renderer.timings();
-        const VkExtent2D extent = state.viewport.renderExtent;
         bool gizmoHoveredOrUsing = false;
 
         if (focused_ && !state.viewport.mouseCaptureActive && !ImGui::GetIO().WantTextInput) {
-            if (ImGui::IsKeyPressed(ImGuiKey_Q)) {
-                transformGizmoMode_ = -1;
+            auto commandPressed = [](EditorCommandId id) {
+                const EditorCommand* command = editorCommand(id);
+                return command != nullptr && command->defaultKeybinding.imguiKey >= 0 &&
+                    ImGui::IsKeyPressed(static_cast<ImGuiKey>(command->defaultKeybinding.imguiKey));
+            };
+            if (commandPressed(EditorCommandId::ViewportSelect)) { executeCommand(EditorCommandId::ViewportSelect); }
+            if (commandPressed(EditorCommandId::ViewportMove) || ImGui::IsKeyPressed(ImGuiKey_T)) { executeCommand(EditorCommandId::ViewportMove); }
+            if (commandPressed(EditorCommandId::ViewportRotate)) { executeCommand(EditorCommandId::ViewportRotate); }
+            if (commandPressed(EditorCommandId::ViewportScale) || ImGui::IsKeyPressed(ImGuiKey_S)) { executeCommand(EditorCommandId::ViewportScale); }
+            if (commandPressed(EditorCommandId::ViewportToggleLocal)) { executeCommand(EditorCommandId::ViewportToggleLocal); }
+            if (commandPressed(EditorCommandId::ViewportFrameSelected) && selection.entityId().valid()) {
+                requests.focusOnEntity = selection.entityId();
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_W) || ImGui::IsKeyPressed(ImGuiKey_T)) {
-                transformGizmoMode_ = 0;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_E)) {
-                transformGizmoMode_ = 1;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_R) || ImGui::IsKeyPressed(ImGuiKey_S)) {
-                transformGizmoMode_ = 2;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_L)) {
-                localGizmoMode_ = !localGizmoMode_;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_G)) {
-                showGrid_ = !showGrid_;
-            }
+            if (commandPressed(EditorCommandId::ViewportToggleGrid)) { executeCommand(EditorCommandId::ViewportToggleGrid); }
         }
-        const float gpuTotal = timings.totalMs();
-        const ImU32 perfColor = gpuTotal < 16.0f ? IM_COL32(120, 220, 120, 255)
-                              : gpuTotal < 33.0f ? IM_COL32(240, 220, 100, 255)
-                              : IM_COL32(240, 100, 100, 255);
-
-        const int numHudLines = 4;
-        const float hudLineH = 18.0f;
-        const float hudPad = 6.0f;
-        const float hudW = 470.0f;
-        const float hudH = hudPad * 2.0f + hudLineH * static_cast<float>(numHudLines);
-        const float hudX = imagePos.x + std::max(8.0f, avail.x - hudW - 10.0f);
-        const float hudY = imagePos.y + 10.0f;
-
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(ImVec2(hudX, hudY), ImVec2(hudX + hudW, hudY + hudH),
-            IM_COL32(0, 0, 0, 145), 4.0f);
-
-        auto hudText = [&](int line, const char* text, ImU32 color = IM_COL32(200, 200, 200, 255)) {
-            dl->AddText(ImVec2(hudX + hudPad, hudY + hudPad + hudLineH * static_cast<float>(line)),
-                color, text);
+        bool viewportUiHovered = false;
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 2.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.045f, 0.050f, 0.058f, 0.82f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.115f, 0.150f, 0.205f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.160f, 0.225f, 0.330f, 1.00f));
+        ImGui::SetCursorScreenPos(ImVec2(imagePos.x + 7.0f, imagePos.y + 5.0f));
+        ImGui::BeginGroup();
+        auto toolButton = [&](const char* label, EditorCommandId command, bool active) {
+            ImGui::PushStyleColor(ImGuiCol_Text, active ? ImVec4(0.35f, 0.62f, 1.0f, 1.0f) : ImVec4(0.70f, 0.72f, 0.74f, 1.0f));
+            const bool pressed = ImGui::SmallButton(label);
+            ImGui::PopStyleColor();
+            viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s (%s)", editorCommandName(command), editorCommandShortcut(command));
+            }
+            if (pressed) {
+                executeCommand(command);
+            }
+            ImGui::SameLine();
         };
-
-        std::ostringstream perfFmt;
-        perfFmt << std::fixed << std::setprecision(2);
-        perfFmt << "CPU " << state.cpuFrameMs << " ms  GPU " << gpuTotal << " ms  pt "
-                << state.renderer.sampleCount() << "/" << settings.accumulationLimit;
-        hudText(0, perfFmt.str().c_str(), perfColor);
-
-        std::ostringstream modeFmt;
-        modeFmt << rendererDebugViewName(settings.debugView)
-                << "  " << extent.width << "x" << extent.height
-                << " -> " << state.viewport.displayExtent.width << "x" << state.viewport.displayExtent.height
-                << "  scale " << std::fixed << std::setprecision(2) << settings.renderResolutionScale;
-        hudText(1, modeFmt.str().c_str(),
-            settings.debugView == RendererDebugView::Beauty ? IM_COL32(180, 200, 230, 255) : IM_COL32(240, 180, 100, 255));
-
-        if (state.viewport.mouseCaptureActive) {
-            hudText(2, "Moving - accumulation paused", IM_COL32(255, 200, 60, 255));
-        } else {
-            std::ostringstream resetFmt;
-            resetFmt << "Reset: " << accumulationResetReasonName(state.renderer.lastAccumulationResetReason());
-            hudText(2, resetFmt.str().c_str(), IM_COL32(180, 180, 180, 220));
+        toolButton("Q", EditorCommandId::ViewportSelect, transformGizmoMode_ < 0);
+        toolButton("W", EditorCommandId::ViewportMove, transformGizmoMode_ == 0);
+        toolButton("E", EditorCommandId::ViewportRotate, transformGizmoMode_ == 1);
+        toolButton("R", EditorCommandId::ViewportScale, transformGizmoMode_ == 2);
+        toolButton(localGizmoMode_ ? "Local" : "World", EditorCommandId::ViewportToggleLocal, localGizmoMode_);
+        toolButton(snap_.enabled ? "Snap" : "Snap", EditorCommandId::ViewportToggleSnap, snap_.enabled);
+        toolButton(showGrid_ ? "Grid" : "Grid", EditorCommandId::ViewportToggleGrid, showGrid_);
+        toolButton(showAxes_ ? "Axes" : "Axes", EditorCommandId::ViewportToggleAxes, showAxes_);
+        if (selection.entityId().valid()) {
+            if (ImGui::SmallButton("Frame")) { requests.focusOnEntity = selection.entityId(); }
+            viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+            if (ImGui::IsItemHovered()) { ImGui::SetTooltip("%s (%s)", editorCommandName(EditorCommandId::ViewportFrameSelected), editorCommandShortcut(EditorCommandId::ViewportFrameSelected)); }
+            if (snap_.enabled) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(58.0f);
+                if (transformGizmoMode_ == 0) {
+                    ImGui::DragFloat("##snapTranslate", &snap_.translation, 0.01f, 0.001f, 100.0f, "%.2f");
+                } else if (transformGizmoMode_ == 1) {
+                    ImGui::DragFloat("##snapRotate", &snap_.rotation, 1.0f, 0.1f, 180.0f, "%.0f");
+                } else {
+                    ImGui::DragFloat("##snapScale", &snap_.scale, 0.01f, 0.001f, 10.0f, "%.2f");
+                }
+                viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+            }
         }
+        ImGui::EndGroup();
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar(3);
 
-        std::ostringstream statusFmt;
-        if (settings.denoiserEnabled) statusFmt << "Denoiser: ON  ";
-        else statusFmt << "Denoiser: OFF  ";
-        if (settings.taaEnabled) statusFmt << "TAA: ON";
-        else statusFmt << "TAA: OFF";
-        if (state.camera != nullptr) statusFmt << "  Speed " << std::fixed << std::setprecision(1) << state.camera->moveSpeed();
-        hudText(3, statusFmt.str().c_str(), IM_COL32(150, 200, 255, 200));
+        const float gpuTotal = timings.totalMs();
+        std::ostringstream compactStatus;
+        compactStatus << "pt " << state.renderer.sampleCount() << "/" << settings.accumulationLimit
+                      << " " << std::fixed << std::setprecision(3) << gpuTotal;
+        if (state.viewport.mouseCaptureActive) {
+            compactStatus << "  Moving";
+        } else if (settings.debugView != RendererDebugView::Beauty) {
+            compactStatus << "  " << rendererDebugViewName(settings.debugView);
+        }
+        const std::string statusText = compactStatus.str();
+        const char* actionsText = "View Settings    Stats    Draw Debug    1.000";
+        const ImVec2 statusSize = ImGui::CalcTextSize(statusText.c_str());
+        const ImVec2 actionsSize = ImGui::CalcTextSize(actionsText);
+        const float statusRight = imagePos.x + avail.x - 12.0f;
+        const float statusY = imagePos.y + 7.0f;
+        dl->AddText(ImVec2(statusRight - actionsSize.x, statusY), IM_COL32(170, 173, 176, 230), actionsText);
+        dl->AddText(ImVec2(statusRight - actionsSize.x - statusSize.x - 18.0f, statusY), IM_COL32(186, 188, 190, 235), statusText.c_str());
 
         lastSampleCount_ = state.renderer.sampleCount();
 
@@ -469,54 +489,6 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         if (state.sceneDocument != nullptr && selection.entityId().valid()) {
             Entity* entity = state.sceneDocument->registry().entity(selection.entityId());
             if (entity != nullptr && !entity->locked && state.camera != nullptr) {
-                ImGui::SetCursorScreenPos(ImVec2(imagePos.x + 370.0f, imagePos.y + 10.0f));
-                ImGui::BeginGroup();
-                if (ImGui::RadioButton("Q", transformGizmoMode_ < 0)) {
-                    transformGizmoMode_ = -1;
-                }
-                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Select"); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("W", transformGizmoMode_ == 0)) {
-                    transformGizmoMode_ = 0;
-                }
-                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Move"); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("E", transformGizmoMode_ == 1)) {
-                    transformGizmoMode_ = 1;
-                }
-                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Rotate"); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("R", transformGizmoMode_ == 2)) {
-                    transformGizmoMode_ = 2;
-                }
-                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Scale"); }
-                ImGui::SameLine();
-                ImGui::Checkbox("Local", &localGizmoMode_);
-                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Toggle local/world gizmo space"); }
-                ImGui::SameLine();
-                ImGui::Checkbox("Snap", &snap_.enabled);
-                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Toggle transform snapping"); }
-                if (snap_.enabled) {
-                    ImGui::SameLine();
-                    if (transformGizmoMode_ == 0) {
-                        ImGui::SetNextItemWidth(74.0f);
-                        ImGui::DragFloat("##snapTranslate", &snap_.translation, 0.01f, 0.001f, 100.0f, "%.2f");
-                    } else if (transformGizmoMode_ == 1) {
-                        ImGui::SetNextItemWidth(74.0f);
-                        ImGui::DragFloat("##snapRotate", &snap_.rotation, 1.0f, 0.1f, 180.0f, "%.0f");
-                    } else {
-                        ImGui::SetNextItemWidth(74.0f);
-                        ImGui::DragFloat("##snapScale", &snap_.scale, 0.01f, 0.001f, 10.0f, "%.2f");
-                    }
-                }
-                ImGui::SameLine();
-                ImGui::Checkbox("Grid", &showGrid_);
-                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Toggle grid overlay (G)"); }
-                ImGui::SameLine();
-                ImGui::Checkbox("Axes", &showAxes_);
-                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Toggle axes overlay"); }
-                ImGui::EndGroup();
-
                 if (transformGizmoMode_ >= 0) {
                     const glm::mat4 view = editorViewMatrix(*state.camera);
                     const glm::mat4 projection = editorProjectionMatrix(
@@ -609,7 +581,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             }
         }
 
-        if (state.viewport.leftClicked && !gizmoHoveredOrUsing) {
+        if (state.viewport.leftClicked && !gizmoHoveredOrUsing && !viewportUiHovered) {
             state.renderer.requestPickInstanceId(state.viewport.mouseUv);
         }
         selection.setPickPending(state.renderer.pickPending());
@@ -660,6 +632,37 @@ void ViewportPanel::abortGizmoDrag() {
     gizmoDragActive_ = false;
     gizmoDragEntity_ = {};
     gizmoDragOriginal_ = {};
+}
+
+void ViewportPanel::executeCommand(EditorCommandId id) {
+    switch (id) {
+    case EditorCommandId::ViewportSelect:
+        transformGizmoMode_ = -1;
+        break;
+    case EditorCommandId::ViewportMove:
+        transformGizmoMode_ = 0;
+        break;
+    case EditorCommandId::ViewportRotate:
+        transformGizmoMode_ = 1;
+        break;
+    case EditorCommandId::ViewportScale:
+        transformGizmoMode_ = 2;
+        break;
+    case EditorCommandId::ViewportToggleLocal:
+        localGizmoMode_ = !localGizmoMode_;
+        break;
+    case EditorCommandId::ViewportToggleSnap:
+        snap_.enabled = !snap_.enabled;
+        break;
+    case EditorCommandId::ViewportToggleGrid:
+        showGrid_ = !showGrid_;
+        break;
+    case EditorCommandId::ViewportToggleAxes:
+        showAxes_ = !showAxes_;
+        break;
+    default:
+        break;
+    }
 }
 
 void ViewportPanel::updateGizmoState(bool isOver, bool isUsing, int gizmoMode) {

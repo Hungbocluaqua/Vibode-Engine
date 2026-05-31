@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
+#include <random>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -77,6 +79,49 @@ glm::vec3 vec3FromJson(const nlohmann::json& json, glm::vec3 fallback = glm::vec
     };
 }
 
+std::string generateSceneGuid() {
+    std::random_device rd;
+    std::mt19937_64 rng(rd());
+    const uint64_t now = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    const uint64_t a = rng() ^ now;
+    const uint64_t b = rng();
+    std::ostringstream out;
+    out << std::hex << std::setfill('0')
+        << std::setw(8) << static_cast<uint32_t>(a >> 32) << '-'
+        << std::setw(4) << static_cast<uint16_t>(a >> 16) << '-'
+        << std::setw(4) << static_cast<uint16_t>(a) << '-'
+        << std::setw(4) << static_cast<uint16_t>(b >> 48) << '-'
+        << std::setw(12) << (b & 0x0000FFFFFFFFFFFFull);
+    return out.str();
+}
+
+bool needsMigrationBackup(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) {
+        return false;
+    }
+    try {
+        nlohmann::json json;
+        in >> json;
+        if (!json.contains("rtlevel")) {
+            return true;
+        }
+        const nlohmann::json& header = json["rtlevel"];
+        return header.value("formatVersion", 0) < 3;
+    } catch (...) {
+        return true;
+    }
+}
+
+void createMigrationBackupIfNeeded(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec) || !needsMigrationBackup(path)) {
+        return;
+    }
+    const std::filesystem::path backup = path.string() + ".bak";
+    std::filesystem::copy_file(path, backup, std::filesystem::copy_options::overwrite_existing, ec);
+}
+
 } // namespace
 
 void SceneDocument::setEnvironment(Environment environment) {
@@ -87,6 +132,11 @@ void SceneDocument::setEnvironment(Environment environment) {
 void SceneDocument::setRenderSettings(RenderSettings settings) {
     renderSettings_ = settings;
     markDirty(SceneUpdateKind::RendererSettingsOnly);
+}
+
+void SceneDocument::setWorldSettings(WorldSettings settings) {
+    worldSettings_ = settings;
+    markDirty(SceneUpdateKind::EnvironmentOnly);
 }
 
 void SceneDocument::setActiveCamera(EntityId id) {
@@ -107,6 +157,7 @@ void SceneDocument::setPrimarySun(EntityId id) {
         return;
     }
     primarySun_ = id;
+    worldSettings_.primarySun = id;
     markDirty(SceneUpdateKind::LightOnly);
 }
 
@@ -130,11 +181,15 @@ void SceneDocument::markDirty(SceneUpdateKind kind) {
     dirty_ = true;
     pendingUpdate_ = combine(pendingUpdate_, kind);
     lastChangeReason_ = sceneUpdateKindName(kind);
+    if (dirtyReasons_.empty() || dirtyReasons_.back() != lastChangeReason_) {
+        dirtyReasons_.push_back(lastChangeReason_);
+    }
 }
 
 void SceneDocument::clearDirty() {
     dirty_ = false;
     pendingUpdate_ = SceneUpdateKind::None;
+    dirtyReasons_.clear();
     registry_.clearDirty();
 }
 
@@ -146,6 +201,19 @@ void SceneDocument::clearBookmarksJson() {
     bookmarksJson_.reset();
 }
 
+void SceneDocument::setTimelineJson(const nlohmann::json& json) {
+    timelineJson_ = json;
+}
+
+void SceneDocument::clearTimelineJson() {
+    timelineJson_.reset();
+}
+
+void SceneDocument::addPrefabInstance(PrefabInstance instance) {
+    prefabInstances_.push_back(std::move(instance));
+    markDirty(SceneUpdateKind::TopologyChanged);
+}
+
 SceneUpdateKind SceneDocument::pendingUpdate() const {
     return combine(pendingUpdate_, registry_.pendingUpdate());
 }
@@ -153,6 +221,7 @@ SceneUpdateKind SceneDocument::pendingUpdate() const {
 void SceneDocument::importSceneAsset(const SceneAsset& scene) {
     registry_ = SceneRegistry{};
     activeCamera_ = {};
+    prefabInstances_.clear();
     sceneTextures_ = scene.textures;
     sceneMaterials_ = scene.materials;
     sceneMeshes_ = scene.meshes;
@@ -220,7 +289,7 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
         entity->transform.rotationEuler = eulerFromMatrix(source.transform);
         entity->transform.scale = scaleFromMatrix(source.transform);
         Light light;
-        light.type = static_cast<LightType>(std::min(source.type, 2u));
+        light.type = static_cast<LightType>(std::min(source.type, 3u));
         light.color = source.color;
         light.intensity = source.intensity;
         light.sizeOrRadius = source.sizeOrRadius;
@@ -351,13 +420,37 @@ SceneAsset SceneDocument::toSceneAsset() const {
 }
 
 bool SceneDocument::saveJson(const std::filesystem::path& path) const {
-    std::ofstream out(path);
-    if (!out) {
-        return false;
+    createMigrationBackupIfNeeded(path);
+    if (header_.sceneGuid.empty()) {
+        header_.sceneGuid = generateSceneGuid();
     }
+    header_.formatVersion = 3;
+    header_.engineVersion = "0.1";
+    header_.projectRelativePaths = true;
 
     nlohmann::json root;
-    root["version"] = 2;
+    root["version"] = 3;
+    root["rtlevel"] = {
+        {"formatVersion", header_.formatVersion},
+        {"sceneGuid", header_.sceneGuid},
+        {"engineVersion", header_.engineVersion},
+        {"projectRelativePaths", header_.projectRelativePaths},
+        {"legacyVersion", 2},
+    };
+    root["assetReferences"] = {
+        {"source", {
+            {"assetGuid", std::string{}},
+            {"sourceGltf", sourceGltfPath_.has_value() ? sourceGltfPath_->generic_string() : std::string{}},
+        }},
+        {"environment", {
+            {"assetGuid", std::string{}},
+            {"hdrPath", environment_.hdrPath.generic_string()},
+        }},
+        {"meshes", nlohmann::json::array()},
+        {"materials", nlohmann::json::array()},
+        {"textures", nlohmann::json::array()},
+        {"prefabs", nlohmann::json::array()},
+    };
     root["sourceGltf"] = sourceGltfPath_.has_value() ? sourceGltfPath_->string() : "";
     root["sourceHdr"] = sourceHdrPath_.has_value() ? sourceHdrPath_->string() : "";
     root["activeCamera"] = activeCamera_.valid() ? (registry_.entity(activeCamera_) != nullptr ? registry_.entity(activeCamera_)->uuid : 0u) : 0u;
@@ -368,6 +461,20 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"rotation", environment_.rotation},
         {"backgroundIntensity", environment_.backgroundIntensity},
         {"enabled", environment_.enabled},
+    };
+    auto entityUuid = [&](EntityId id) -> uint64_t {
+        const Entity* entity = registry_.entity(id);
+        return entity != nullptr ? entity->uuid : 0u;
+    };
+    root["worldSettings"] = {
+        {"activeEnvironment", entityUuid(worldSettings_.activeEnvironment)},
+        {"primarySun", entityUuid(worldSettings_.primarySun)},
+        {"skyAtmosphere", entityUuid(worldSettings_.skyAtmosphere)},
+        {"heightFog", entityUuid(worldSettings_.heightFog)},
+        {"postProcessVolume", entityUuid(worldSettings_.postProcessVolume)},
+        {"atmosphereEnabled", worldSettings_.atmosphereEnabled},
+        {"fogEnabled", worldSettings_.fogEnabled},
+        {"postProcessEnabled", worldSettings_.postProcessEnabled},
     };
     root["renderSettings"] = {
         {"renderPreset", static_cast<uint32_t>(renderSettings_.renderPreset)},
@@ -472,18 +579,30 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         if (entity.meshRenderer.has_value()) {
             nlohmann::json renderer;
             renderer["mesh"] = entity.meshRenderer->mesh.index;
+            renderer["meshGuid"] = entity.meshRenderer->meshGuid;
             renderer["visible"] = entity.meshRenderer->visible;
             renderer["castShadow"] = entity.meshRenderer->castShadow;
             renderer["visibleToCamera"] = entity.meshRenderer->visibleToCamera;
+            if (!entity.meshRenderer->meshGuid.empty()) {
+                root["assetReferences"]["meshes"].push_back({{"assetGuid", entity.meshRenderer->meshGuid}});
+            }
             renderer["materialSlots"] = nlohmann::json::array();
             for (size_t slotIndex = 0; slotIndex < entity.meshRenderer->materialSlots.size(); ++slotIndex) {
                 const MaterialSlot& slot = entity.meshRenderer->materialSlots[slotIndex];
                 nlohmann::json slotJson = {
                     {"name", slot.name},
                     {"material", slot.material.index},
+                    {"materialGuid", slot.materialGuid},
                 };
+                if (!slot.materialGuid.empty()) {
+                    root["assetReferences"]["materials"].push_back({{"assetGuid", slot.materialGuid}});
+                }
                 if (slot.overrideMaterial.has_value()) {
                     slotJson["overrideMaterial"] = slot.overrideMaterial->index;
+                    slotJson["overrideMaterialGuid"] = slot.overrideMaterialGuid.value_or(std::string{});
+                    if (slot.overrideMaterialGuid.has_value() && !slot.overrideMaterialGuid->empty()) {
+                        root["assetReferences"]["materials"].push_back({{"assetGuid", *slot.overrideMaterialGuid}});
+                    }
                 }
                 renderer["materialSlots"].push_back(std::move(slotJson));
             }
@@ -495,6 +614,8 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
                 {"color", vec3Json(entity.light->color)},
                 {"intensity", entity.light->intensity},
                 {"sizeOrRadius", entity.light->sizeOrRadius},
+                {"innerConeRadians", entity.light->innerConeRadians},
+                {"outerConeRadians", entity.light->outerConeRadians},
                 {"enabled", entity.light->enabled},
             };
         }
@@ -515,13 +636,104 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
                 {"useRenderSettingsExposure", entity.camera->useRenderSettingsExposure},
             };
         }
+        if (entity.environmentLight.has_value()) {
+            item["environmentLight"] = {
+                {"enabled", entity.environmentLight->enabled},
+                {"intensity", entity.environmentLight->intensity},
+                {"backgroundIntensity", entity.environmentLight->backgroundIntensity},
+                {"rotation", entity.environmentLight->rotation},
+            };
+        }
+        if (entity.skyAtmosphere.has_value()) {
+            item["skyAtmosphere"] = {
+                {"enabled", entity.skyAtmosphere->enabled},
+                {"rayleighScaleHeight", entity.skyAtmosphere->rayleighScaleHeight},
+                {"mieScaleHeight", entity.skyAtmosphere->mieScaleHeight},
+                {"mieAnisotropy", entity.skyAtmosphere->mieAnisotropy},
+                {"groundAlbedo", entity.skyAtmosphere->groundAlbedo},
+            };
+        }
+        if (entity.heightFog.has_value()) {
+            item["heightFog"] = {
+                {"enabled", entity.heightFog->enabled},
+                {"density", entity.heightFog->density},
+                {"heightFalloff", entity.heightFog->heightFalloff},
+                {"color", vec3Json(entity.heightFog->color)},
+            };
+        }
+        if (entity.volumetricCloud.has_value()) {
+            item["volumetricCloud"] = {
+                {"enabled", entity.volumetricCloud->enabled},
+                {"density", entity.volumetricCloud->density},
+                {"coverage", entity.volumetricCloud->coverage},
+            };
+        }
+        if (entity.postProcessVolume.has_value()) {
+            item["postProcessVolume"] = {
+                {"enabled", entity.postProcessVolume->enabled},
+                {"unbound", entity.postProcessVolume->unbound},
+                {"priority", entity.postProcessVolume->priority},
+                {"exposureCompensation", entity.postProcessVolume->exposureCompensation},
+                {"saturation", entity.postProcessVolume->saturation},
+                {"contrast", entity.postProcessVolume->contrast},
+            };
+        }
+        if (entity.cameraPostProcess.has_value()) {
+            item["cameraPostProcess"] = {
+                {"enabled", entity.cameraPostProcess->enabled},
+                {"overrideExposure", entity.cameraPostProcess->overrideExposure},
+                {"exposureCompensation", entity.cameraPostProcess->exposureCompensation},
+                {"overrideDepthOfField", entity.cameraPostProcess->overrideDepthOfField},
+                {"dofApertureRadius", entity.cameraPostProcess->dofApertureRadius},
+                {"dofFocusDistance", entity.cameraPostProcess->dofFocusDistance},
+            };
+        }
         root["entities"].push_back(std::move(item));
     }
     if (bookmarksJson_.has_value()) {
         root["bookmarks"] = *bookmarksJson_;
     }
+    if (timelineJson_.has_value()) {
+        root["timeline"] = *timelineJson_;
+    }
+    root["prefabInstances"] = nlohmann::json::array();
+    for (const PrefabInstance& instance : prefabInstances_) {
+        nlohmann::json item;
+        item["prefabGuid"] = instance.prefabGuid;
+        const Entity* rootEntity = registry_.entity(instance.instanceRoot);
+        item["instanceRoot"] = rootEntity != nullptr ? rootEntity->uuid : 0u;
+        item["generatedEntityUuids"] = instance.generatedEntityUuids;
+        item["overrides"] = nlohmann::json::array();
+        for (const PrefabOverride& override : instance.overrides) {
+            item["overrides"].push_back({{"path", override.path}, {"value", override.valueJson}});
+        }
+        root["prefabInstances"].push_back(std::move(item));
+        root["assetReferences"]["prefabs"].push_back({{"assetGuid", instance.prefabGuid}});
+    }
+    root["dirtyReasons"] = dirtyReasons_.empty()
+        ? nlohmann::json::array({lastChangeReason_})
+        : nlohmann::json(dirtyReasons_);
+    std::error_code ec;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+    const std::filesystem::path tempPath = path.string() + ".tmp";
+    std::ofstream out(tempPath, std::ios::trunc);
+    if (!out) {
+        return false;
+    }
     out << std::setw(2) << root << '\n';
-    return true;
+    out.close();
+    if (!out) {
+        return false;
+    }
+    std::filesystem::rename(tempPath, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tempPath, path, ec);
+    }
+    return !ec;
 }
 
 bool SceneDocument::loadJson(const std::filesystem::path& path) {
@@ -538,15 +750,49 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     }
 
     renderSettings_ = RenderSettings{};
+    worldSettings_ = WorldSettings{};
+    header_ = RtLevelHeader{};
+    if (root.contains("rtlevel") && root["rtlevel"].is_object()) {
+        const nlohmann::json& header = root["rtlevel"];
+        header_.formatVersion = header.value("formatVersion", header_.formatVersion);
+        header_.sceneGuid = header.value("sceneGuid", std::string{});
+        header_.engineVersion = header.value("engineVersion", header_.engineVersion);
+        header_.projectRelativePaths = header.value("projectRelativePaths", true);
+    }
+    if (header_.sceneGuid.empty()) {
+        header_.sceneGuid = generateSceneGuid();
+    }
 
     sourceGltfPath_.reset();
     sourceHdrPath_.reset();
+    bookmarksJson_.reset();
+    timelineJson_.reset();
     if (const std::string source = root.value("sourceGltf", std::string{}); !source.empty()) {
         sourceGltfPath_ = source;
     }
     if (const std::string source = root.value("sourceHdr", std::string{}); !source.empty()) {
         sourceHdrPath_ = source;
         environment_.hdrPath = source;
+    }
+    if (root.contains("assetReferences") && root["assetReferences"].is_object()) {
+        const nlohmann::json& refs = root["assetReferences"];
+        if (!sourceGltfPath_.has_value() && refs.contains("source") && refs["source"].is_object()) {
+            const std::string source = refs["source"].value("sourceGltf", std::string{});
+            if (!source.empty()) sourceGltfPath_ = source;
+        }
+        if (refs.contains("environment") && refs["environment"].is_object()) {
+            const std::string hdr = refs["environment"].value("hdrPath", std::string{});
+            if (!hdr.empty()) {
+                sourceHdrPath_ = hdr;
+                environment_.hdrPath = hdr;
+            }
+        }
+    }
+    if (root.contains("bookmarks")) {
+        bookmarksJson_ = root["bookmarks"];
+    }
+    if (root.contains("timeline")) {
+        timelineJson_ = root["timeline"];
     }
 
     if (root.contains("environment")) {
@@ -645,6 +891,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     }
 
     registry_ = SceneRegistry{};
+    prefabInstances_.clear();
     sceneMeshes_.clear();
     sceneMaterials_.clear();
     activeCamera_ = {};
@@ -679,6 +926,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             const nlohmann::json& source = item["meshRenderer"];
             MeshRenderer renderer;
             renderer.mesh = MeshAssetHandle{source.value("mesh", UINT32_MAX)};
+            renderer.meshGuid = source.value("meshGuid", std::string{});
             renderer.visible = source.value("visible", true);
             renderer.castShadow = source.value("castShadow", true);
             renderer.visibleToCamera = source.value("visibleToCamera", true);
@@ -686,8 +934,12 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
                 MaterialSlot slot;
                 slot.name = slotSource.value("name", std::string{});
                 slot.material = MaterialAssetHandle{slotSource.value("material", UINT32_MAX)};
+                slot.materialGuid = slotSource.value("materialGuid", std::string{});
                 if (slotSource.contains("overrideMaterial")) {
                     slot.overrideMaterial = MaterialAssetHandle{slotSource.value("overrideMaterial", UINT32_MAX)};
+                }
+                if (slotSource.contains("overrideMaterialGuid")) {
+                    slot.overrideMaterialGuid = slotSource.value("overrideMaterialGuid", std::string{});
                 }
                 renderer.materialSlots.push_back(slot);
                 if (slot.resolvedMaterial().valid()) {
@@ -706,6 +958,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             light.color = vec3FromJson(source.value("color", nlohmann::json::array()), light.color);
             light.intensity = source.value("intensity", light.intensity);
             light.sizeOrRadius = source.value("sizeOrRadius", light.sizeOrRadius);
+            light.innerConeRadians = source.value("innerConeRadians", light.innerConeRadians);
+            light.outerConeRadians = source.value("outerConeRadians", light.outerConeRadians);
             light.enabled = source.value("enabled", true);
             entity->light = light;
         }
@@ -730,6 +984,64 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             if (camera.active) {
                 activeCamera_ = id;
             }
+        }
+        if (item.contains("environmentLight")) {
+            const nlohmann::json& source = item["environmentLight"];
+            EnvironmentLight component;
+            component.enabled = source.value("enabled", component.enabled);
+            component.intensity = source.value("intensity", component.intensity);
+            component.backgroundIntensity = source.value("backgroundIntensity", component.backgroundIntensity);
+            component.rotation = source.value("rotation", component.rotation);
+            entity->environmentLight = component;
+        }
+        if (item.contains("skyAtmosphere")) {
+            const nlohmann::json& source = item["skyAtmosphere"];
+            SkyAtmosphere component;
+            component.enabled = source.value("enabled", component.enabled);
+            component.rayleighScaleHeight = source.value("rayleighScaleHeight", component.rayleighScaleHeight);
+            component.mieScaleHeight = source.value("mieScaleHeight", component.mieScaleHeight);
+            component.mieAnisotropy = source.value("mieAnisotropy", component.mieAnisotropy);
+            component.groundAlbedo = source.value("groundAlbedo", component.groundAlbedo);
+            entity->skyAtmosphere = component;
+        }
+        if (item.contains("heightFog")) {
+            const nlohmann::json& source = item["heightFog"];
+            HeightFog component;
+            component.enabled = source.value("enabled", component.enabled);
+            component.density = source.value("density", component.density);
+            component.heightFalloff = source.value("heightFalloff", component.heightFalloff);
+            component.color = vec3FromJson(source.value("color", nlohmann::json::array()), component.color);
+            entity->heightFog = component;
+        }
+        if (item.contains("volumetricCloud")) {
+            const nlohmann::json& source = item["volumetricCloud"];
+            VolumetricCloud component;
+            component.enabled = source.value("enabled", component.enabled);
+            component.density = source.value("density", component.density);
+            component.coverage = source.value("coverage", component.coverage);
+            entity->volumetricCloud = component;
+        }
+        if (item.contains("postProcessVolume")) {
+            const nlohmann::json& source = item["postProcessVolume"];
+            PostProcessVolume component;
+            component.enabled = source.value("enabled", component.enabled);
+            component.unbound = source.value("unbound", component.unbound);
+            component.priority = source.value("priority", component.priority);
+            component.exposureCompensation = source.value("exposureCompensation", component.exposureCompensation);
+            component.saturation = source.value("saturation", component.saturation);
+            component.contrast = source.value("contrast", component.contrast);
+            entity->postProcessVolume = component;
+        }
+        if (item.contains("cameraPostProcess")) {
+            const nlohmann::json& source = item["cameraPostProcess"];
+            CameraPostProcess component;
+            component.enabled = source.value("enabled", component.enabled);
+            component.overrideExposure = source.value("overrideExposure", component.overrideExposure);
+            component.exposureCompensation = source.value("exposureCompensation", component.exposureCompensation);
+            component.overrideDepthOfField = source.value("overrideDepthOfField", component.overrideDepthOfField);
+            component.dofApertureRadius = source.value("dofApertureRadius", component.dofApertureRadius);
+            component.dofFocusDistance = source.value("dofFocusDistance", component.dofFocusDistance);
+            entity->cameraPostProcess = component;
         }
     }
 
@@ -773,6 +1085,22 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     if (!primarySun_.valid()) {
         (void)SunController::migrateLegacyDirectionalSun(*this);
     }
+    if (root.contains("worldSettings") && root["worldSettings"].is_object()) {
+        const nlohmann::json& world = root["worldSettings"];
+        auto resolve = [&](const char* key) -> EntityId {
+            const uint64_t uuid = world.value(key, uint64_t{0});
+            const auto it = idMap.find(uuid);
+            return it != idMap.end() ? it->second : EntityId{};
+        };
+        worldSettings_.activeEnvironment = resolve("activeEnvironment");
+        worldSettings_.primarySun = resolve("primarySun");
+        worldSettings_.skyAtmosphere = resolve("skyAtmosphere");
+        worldSettings_.heightFog = resolve("heightFog");
+        worldSettings_.postProcessVolume = resolve("postProcessVolume");
+        worldSettings_.atmosphereEnabled = world.value("atmosphereEnabled", worldSettings_.atmosphereEnabled);
+        worldSettings_.fogEnabled = world.value("fogEnabled", worldSettings_.fogEnabled);
+        worldSettings_.postProcessEnabled = world.value("postProcessEnabled", worldSettings_.postProcessEnabled);
+    }
     SunController::enforceSinglePrimarySun(*this);
     (void)SunController::repairPrimarySunTransform(*this);
 
@@ -784,6 +1112,49 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         bookmarksJson_ = root["bookmarks"];
     } else {
         bookmarksJson_.reset();
+    }
+    if (root.contains("timeline") && root["timeline"].is_object()) {
+        timelineJson_ = root["timeline"];
+    } else {
+        timelineJson_.reset();
+    }
+    dirtyReasons_.clear();
+    if (root.contains("dirtyReasons") && root["dirtyReasons"].is_array()) {
+        for (const nlohmann::json& reason : root["dirtyReasons"]) {
+            if (reason.is_string()) {
+                dirtyReasons_.push_back(reason.get<std::string>());
+            }
+        }
+        if (!dirtyReasons_.empty()) {
+            lastChangeReason_ = dirtyReasons_.back();
+        }
+    }
+    if (root.contains("prefabInstances") && root["prefabInstances"].is_array()) {
+        for (const nlohmann::json& source : root["prefabInstances"]) {
+            PrefabInstance instance;
+            instance.prefabGuid = source.value("prefabGuid", std::string{});
+            const uint64_t rootUuid = source.value("instanceRoot", uint64_t{0});
+            const auto rootIt = idMap.find(rootUuid);
+            if (rootIt != idMap.end()) {
+                instance.instanceRoot = rootIt->second;
+            }
+            if (source.contains("generatedEntityUuids") && source["generatedEntityUuids"].is_array()) {
+                for (const nlohmann::json& uuid : source["generatedEntityUuids"]) {
+                    instance.generatedEntityUuids.push_back(uuid.get<uint64_t>());
+                }
+            }
+            if (source.contains("overrides") && source["overrides"].is_array()) {
+                for (const nlohmann::json& overrideJson : source["overrides"]) {
+                    instance.overrides.push_back(PrefabOverride{
+                        overrideJson.value("path", std::string{}),
+                        overrideJson.value("value", std::string{}),
+                    });
+                }
+            }
+            if (!instance.prefabGuid.empty()) {
+                prefabInstances_.push_back(std::move(instance));
+            }
+        }
     }
     markDirty(SceneUpdateKind::TopologyChanged);
     return true;

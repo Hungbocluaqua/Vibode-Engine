@@ -5,6 +5,8 @@
 
 namespace rtv {
 
+class EditorLog;
+
 enum class NotificationType {
     Info,
     Warning,
@@ -21,12 +23,14 @@ struct Notification {
 
 class NotificationManager {
 public:
+    void setLogSink(EditorLog* log) { log_ = log; }
     void notify(std::string message, NotificationType type = NotificationType::Info, float durationSeconds = 4.0f);
     void update(float deltaSeconds);
     void draw();
 
 private:
     std::deque<Notification> active_;
+    EditorLog* log_ = nullptr;
     int maxVisible_ = 4;
 };
 
