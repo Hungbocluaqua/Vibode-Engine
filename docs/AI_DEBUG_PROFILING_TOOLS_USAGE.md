@@ -850,6 +850,109 @@ This produces the complete set of diagnostic outputs in a single run.
 
 ---
 
+## Editor Level-Editor Tooling
+
+The repository includes PowerShell tools under `scripts/` to support `docs/EDITOR_LEVEL_EDITOR_IMPLEMENTATION_PLAN.md`. These tools complement the renderer diagnostics: they audit editor UI/request state, validate scene/project files, generate fixtures, and provide small regression probes for project, import, prefab, and migration work.
+
+Use these tools before and after editor roadmap steps. Several audits are expected to fail while a planned feature is not implemented yet; use `-FailOn...` switches only after the corresponding milestone has landed.
+
+### Static Editor Audits
+
+```powershell
+.\scripts\editor_plan_audit.ps1 -JsonOut out\editor_tools\plan_audit.json
+.\scripts\imgui_panel_audit.ps1 -JsonOut out\editor_tools\imgui_audit.json
+.\scripts\editor_request_flow_report.ps1 -JsonOut out\editor_tools\request_flow.json
+.\scripts\editor_state_snapshot.ps1 `
+  -Scene scenes\validation\cornell.rtlevel `
+  -JsonOut out\editor_tools\state_snapshot.json
+```
+
+Purpose:
+
+- `editor_plan_audit.ps1` reports whether planned systems exist in code, including `.rtproject`, `ProjectContext`, asset registry, import requests, prefabs, command registry, async scene loading, and autosave/recovery.
+- `imgui_panel_audit.ps1` finds ImGui window/menu/dock labels and flags stale labels such as `Viewport`, `Scene Hierarchy`, `Inspector / Properties`, `Asset Browser`, `Open glTF`, and `Load glTF`.
+- `editor_request_flow_report.ps1` lists `EditorRequests` fields and whether each has UI and `Application` usage.
+- `editor_state_snapshot.ps1` writes a compact JSON summary of current source-level editor capabilities plus optional scene/project metadata.
+
+Recommended use by roadmap step:
+
+- Steps 1-4: run `imgui_panel_audit.ps1` and `editor_request_flow_report.ps1` after every UI/request migration.
+- Steps 6-9: run `editor_plan_audit.ps1` after adding project, registry, and import request symbols.
+- Step 14: run `editor_request_flow_report.ps1` after command-registry routing to catch stale direct request paths.
+
+### Scene, Project, And Registry Validators
+
+```powershell
+.\scripts\rtlevel_schema_validator.ps1 `
+  -Path scenes\validation `
+  -JsonOut out\editor_tools\rtlevel_schema.json
+
+.\scripts\rtlevel_compat_test.ps1 `
+  -Path scenes\validation `
+  -JsonOut out\editor_tools\rtlevel_compat.json
+
+.\scripts\project_fixture_generator.ps1 `
+  -Name ToolingSmoke `
+  -Template PathTracedDefault `
+  -Force `
+  -JsonOut out\editor_tools\fixture.json
+
+.\scripts\asset_registry_validator.ps1 `
+  -RegistryPath out\project_fixtures\ToolingSmoke\Content\AssetRegistry.json `
+  -JsonOut out\editor_tools\asset_registry.json
+```
+
+Purpose:
+
+- `rtlevel_schema_validator.ps1` statically checks `.rtlevel` JSON shape, entity UUID/stable IDs, transform presence, and duplicate IDs.
+- `rtlevel_compat_test.ps1` runs the schema validator and can optionally launch `rtvulkan.exe` for each scene with `-RunHeadless`.
+- `project_fixture_generator.ps1` creates deterministic `.rtproject` fixtures with the expected `Content`, `Scenes`, `Cache`, `Saved`, `Config`, and `Build` layout.
+- `asset_registry_validator.ps1` validates GUID uniqueness, project-relative paths, path normalization, and dependency references in `AssetRegistry.json`.
+
+Use `-FailOnInvalid` once the checked format is part of the active milestone gate.
+
+### Import, Merge, And Migration Probes
+
+```powershell
+.\scripts\scene_entity_count_probe.ps1 `
+  -Before scenes\validation\cornell.rtlevel `
+  -JsonOut out\editor_tools\entity_count.json
+
+.\scripts\import_regression_harness.ps1 `
+  -JsonOut out\editor_tools\import_harness.json
+
+.\scripts\migration_backup_test.ps1 `
+  -Scene scenes\validation\cornell.rtlevel `
+  -JsonOut out\editor_tools\migration_backup.json
+```
+
+Purpose:
+
+- `scene_entity_count_probe.ps1` records or compares entity counts. Use it to verify that `Import Asset` does not mutate the active scene, `Import and Place` adds exactly one prefab hierarchy, and `Merge Scene` appends without removing existing entities.
+- `import_regression_harness.ps1` checks readiness for `Import Asset` and `Import and Place`. It is a static readiness harness until those requests exist; pass `-ExpectImplemented` after the import milestone lands.
+- `migration_backup_test.ps1` creates copied scene and backup fixtures for migration tests and verifies the copies remain valid JSON with the same entity count.
+
+### Editor Diagnostic Smoke
+
+```powershell
+.\scripts\editor_smoke.ps1 `
+  -BuildDebug `
+  -BuildRelease `
+  -OutDir out\editor_smoke
+```
+
+`editor_smoke.ps1` can build Debug/Release and run the canonical Cornell diagnostic smoke, verifying `profile.json`, `rendergraph.json`, debug views, and debug package output. Use it after changes to shared editor request handling, scene loading, renderer synchronization, or diagnostic output paths.
+
+For a faster static-only pass during UI work, run:
+
+```powershell
+.\scripts\imgui_panel_audit.ps1
+.\scripts\editor_request_flow_report.ps1
+.\scripts\rtlevel_schema_validator.ps1 -Path scenes\validation\cornell.rtlevel
+```
+
+---
+
 ## CMake Build Options
 
 ### RenderDoc Integration
