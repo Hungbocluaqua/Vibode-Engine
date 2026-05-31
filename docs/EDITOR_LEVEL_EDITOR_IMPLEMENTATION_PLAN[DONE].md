@@ -12,21 +12,28 @@ Last updated: 2026-05-31
 
 Completed in the current implementation pass:
 
+- Step 2 - Dirty Scene State, Scene Name, And Replacement Prompt.
 - Step 1 - Rename Current glTF Replacement To Import Scene As New Scene.
 - Step 3 - Explicit Scene File Requests.
 - Step 4 - Near-Clone Shell, Menus, Dock Layout, And Theme.
+- Step 5 - Viewport Toolbar, Status Strip, And Shortcuts.
 - Step 6 - Project Manager MVP.
 - Step 7 - Project Asset Registry Skeleton.
+- Step 8 - Content Browser Project Integration.
+- Step 9 - Non-Mutating Import Asset Skeleton.
+- Step 10 - glTF/GLB Import-As-Asset.
+- Step 11 - Prefab Generation, Placement, And Import And Place.
+- Step 12 - GUID-Backed `.rtlevel` Save/Load And Migration.
+- Step 13 - Merge Scene Into Current.
+- Step 14 - Command Registry And Keybinding Registry.
+- Step 15 - Undo/Redo Coverage Expansion.
+- Step 16 - Render World Settings And Lighting/Post-Process Components.
+- Step 17 - General Async Scene Loading.
+- Step 18 - Log, Console, Timeline V1, Autosave, And Recovery.
+- Reference screenshot UI polish slice: compact viewport chrome, denser default dock ratios, top-bar scene/performance readout, and workspace preference controls.
+- Final completion pass: GUID-backed runtime mesh/material binding for prefab instances, Reimport Asset, scene-tab close dirty prompt, persisted dirty reason lists, applied theme preset variants, and workspace preset behavior.
 
-Partially completed in the current implementation pass:
-
-- Step 2 - Dirty Scene State, Scene Name, And Replacement Prompt: editor-origin New Scene, Open Scene, Import Scene as New Scene, dropped glTF, Exit, and Project Close now use Save / Do Not Save / Cancel protection. Scene-tab close remains pending because closable scene tabs are not implemented yet.
-- Step 5 - Viewport Toolbar, Status Strip, And Shortcuts: the viewport is renamed to `Scene`, the HUD is now a compact status strip, and Q/W/E/R/G shortcuts plus compact toolbar controls are present. Frame-selected and F1-F8 debug-view registry work remains pending the command/keybinding milestone.
-
-Not completed yet:
-
-- Project settings details UI, prefab assets, import-as-asset, import-and-place, drag/drop prefab placement, merge scene, and GUID-backed `.rtlevel` migration.
-- Autosave/recovery, full command registry, keybinding registry, persistent Log/Console models, and Timeline keyframe persistence.
+Open items in this plan: none. Future/editor-beyond-plan items, such as multiple scene tabs and advanced runtime packaging, remain outside this plan's V1 acceptance scope.
 
 ## Non-Negotiable Constraints
 
@@ -1333,7 +1340,7 @@ This plan starts from the current editor state, not from a blank slate. Treat th
 - `SceneDocument` owns editable scene data and `.rtlevel` JSON save/load.
 - `SceneRegistry`, `SceneOperations`, and `UndoStack` already support entity create, duplicate, delete, reparent, visibility, lock, transform, camera, light, sun, and mesh-renderer component edits.
 - `EditorRequests` currently routes `loadGltf`, `loadHdr`, `saveSceneJson`, `loadSceneJson`, renderer settings, component edits, layout/editor commands, undo, redo, and shader reload.
-- `Application::requestGltfSceneLoad` already performs async CPU glTF loading, while `commitLoadedGltfScene` applies the completed replacement scene and rebuilds renderer resources on the main thread.
+- `AsyncSceneLoader` stages CPU-side scene load results for `.rtlevel`, glTF/GLB import-as-new-scene, merge-scene, and project-startup scene loads; `Application` applies completed results and renderer rebuilds on the main thread.
 - `EditorDockspace` currently exposes `File`, `Edit`, `View`, and `Render` menus and docks `Viewport`, `Scene Hierarchy`, `Inspector / Properties`, `Asset Browser`, `Render Settings`, and `Debug / Profiler`.
 - `AssetBrowserPanel` is currently a load-oriented panel with glTF/HDR/level fields, favorites, recent files, texture thumbnails, mesh list, material list, and material drag/drop.
 
@@ -1392,7 +1399,7 @@ Implementation tasks:
 
 1. Add `importSceneAsNewScene` to `EditorRequests` while keeping `loadGltf` as an internal compatibility field.
 2. Rename visible UI actions from `Open glTF` / `Load glTF` to `Import Scene as New Scene`.
-3. Route `importSceneAsNewScene` to the existing `requestGltfSceneLoad` path in `Application`.
+3. Route `importSceneAsNewScene` through the generalized async scene loading path in `Application`.
 4. Update status strings, notifications, and logs to say the active scene will be replaced.
 5. Keep recent/favorite file behavior unchanged.
 
@@ -1445,7 +1452,7 @@ Partial completion notes 2026-05-31:
 - Prompt choices are Save, Do Not Save, and Cancel. Save writes the current scene or opens Save Scene As for untitled scenes before continuing; Cancel leaves the active scene and pending async load state unchanged.
 - Added an editor-level unsaved scene flag so the dirty marker and destructive-action prompt are not lost when `SceneDocument::dirty()` is cleared by renderer update routing.
 - Active scene name and dirty marker remain visible in the top menu/title strip.
-- Remaining work: apply the same prompt to scene-tab close after closable scene tabs exist; expand dirty reasons into a persistent reason list.
+- Completion follow-up: the active scene tab close control now routes through the same Save / Do Not Save / Cancel dirty-scene prompt, and `.rtlevel` save/load preserves a dirty reason list for diagnostics.
 
 ### Step 3 - Explicit Scene File Requests - Completed 2026-05-31
 
@@ -1512,10 +1519,12 @@ Completion notes 2026-05-31:
 - Renamed visible panels to `Scene`, `Hierarchy`, `Inspector`, and `Content`.
 - Added `Render World Settings`, `Timeline`, `Log`, and `Console` visibility flags and functional shell panels.
 - Rebuilt the default dock layout around center `Scene`, right-side `Hierarchy` / `Render World Settings` plus `Inspector`, and bottom `Content` / `Timeline` / `Log` tabs.
+- Tuned default dock ratios closer to the latest reference screenshot: wider center viewport, tall right hierarchy/world stack, lower right inspector, and bottom content/timeline/log strip under the viewport.
 - Replaced the main menus with `File`, `Create`, `Engine`, `Window`, `Render`, and `Layout`, while keeping technical render/debug/profiler tools reachable.
 - Applied a denser dark ImGui theme with restrained blue accents and compact spacing.
+- Updated the top bar to show the active scene between separators and a compact `fps: N | Ms: N` readout at the far right.
 
-### Step 5 - Viewport Toolbar, Status Strip, And Shortcuts - Partially Completed 2026-05-31
+### Step 5 - Viewport Toolbar, Status Strip, And Shortcuts - Completed 2026-05-31
 
 Goal: make the viewport usable as the primary level editing surface.
 
@@ -1540,13 +1549,17 @@ Recommended tooling:
 
 Validation gate: picking still selects; gizmo edits commit one undoable transform command; navigation shortcuts still work; status values match renderer state.
 
-Partial completion notes 2026-05-31:
+Completion notes 2026-05-31:
 
 - Renamed the viewport window to `Scene` and preserved renderer image sizing, picking, selected instance ID, accumulation reset state, and ImGuizmo path.
 - Replaced the larger HUD with a compact top-right status strip showing CPU/GPU frame timing, samples, accumulation limit, debug view, render/display resolution, render scale, denoiser/TAA state, reset reason, and camera speed.
-- Added compact toolbar controls for Select, Move, Rotate, Scale, Local/World, Snap, Grid, and Axes using short labels/tooltips.
+- Refined the viewport chrome to match the latest reference: always-visible top-left compact tool strip, no large translucent HUD box, and a small right-aligned status/action text row.
+- Added compact toolbar controls for Select, Move, Rotate, Scale, Local/World, Snap, Grid, Axes, and Frame using short labels/tooltips.
 - Added Q/W/E/R/G shortcut behavior for tool/grid switching while preserving legacy T/R/S/L shortcuts.
-- Remaining work: frame-selected shortcut, F1-F8 debug-view registry, and shared command/keybinding routing remain pending Step 14.
+- Added `Frame` toolbar action and `F` viewport shortcut that route through `focusOnEntity`.
+- `focusOnEntity` now frames the selected hierarchy using entity/child mesh bounds, moves the editor camera to a fitted distance, and preserves the current view direction.
+- Added F1-F8 debug-view shortcuts through the command registry for Beauty, Direct Lighting, Indirect Lighting, Normals, Depth, Motion Vectors, Variance, and Albedo.
+- Moved prior F-key render toggles off default keybindings to avoid collisions with viewport/debug-view shortcuts; the menu commands remain available.
 
 ### Step 6 - Project Manager MVP - Completed 2026-05-31
 
@@ -1585,7 +1598,8 @@ Completion notes 2026-05-31:
 - Recent projects, last opened project, and Open Last Project preference are stored in global editor preferences.
 - Application can create, open, auto-open-last, save settings, and close projects while preserving no-project `.rtlevel` compatibility.
 - Project close is gated by the dirty-scene prompt and returns to no-project fallback scene state.
-- Remaining follow-up: detailed Project Settings sections are still deferred to the project settings/polish work.
+- Project Manager now exposes autosave project settings plus workspace polish preferences for UI scale, theme preset, workspace preset, and layout version.
+- Completion follow-up: theme presets now apply Reference Dark, Classic Dark, and High Contrast variants at runtime, and workspace presets actively switch the default panel visibility set.
 
 ### Step 7 - Project Asset Registry Skeleton - Completed 2026-05-31
 
@@ -1621,7 +1635,7 @@ Completion notes 2026-05-31:
 - `Content` displays project registry path, dirty marker, and registry records without mutating the active scene.
 - Registry validator passes for the generated ToolingSmoke fixture.
 
-### Step 8 - Content Browser Project Integration
+### Step 8 - Content Browser Project Integration - Completed 2026-05-31
 
 Goal: turn `Content` into a project browser instead of a file loader.
 
@@ -1646,7 +1660,15 @@ Recommended tooling:
 
 Validation gate: project-relative content paths display correctly; moving the project folder preserves relative references; external files do not silently become project assets.
 
-### Step 9 - Non-Mutating Import Asset Skeleton
+Completed implementation notes:
+
+- `Content` now roots its browser at `Project/Content/` when a project is open and uses no-project compatibility mode otherwise.
+- No-project mode shows a compatibility warning and routes users to the Project Manager before reusable asset import.
+- Added folder tree navigation, breadcrumbs, back/forward, refresh, search, list/grid toggle, details pane, favorites, and recents inside the `Content` panel.
+- Project file entries support double-click behavior: `.rtlevel` opens a scene, `.gltf/.glb` imports scene as new scene, and `.hdr/.exr` applies the environment.
+- Registry records are shown with type, name, GUID, source/imported paths, dependency/reference counts, missing/stale status, and import status; selecting a record opens details without mutating the active scene.
+
+### Step 9 - Non-Mutating Import Asset Skeleton - Completed 2026-05-31
 
 Goal: prove `Import Asset` does not replace or edit the active scene.
 
@@ -1672,7 +1694,16 @@ Recommended tooling:
 
 Validation gate: with Scene A open, importing model B does not change Scene A entity count; cancelling import leaves scene, registry, and project files unchanged except temp files; `Import Asset` never calls the whole-scene replacement path.
 
-### Step 10 - glTF/GLB Import-As-Asset
+Completed implementation notes:
+
+- Added explicit `EditorImportAssetRequest` plus `reimportAsset` and `placeAsset` request fields; only `importAsset` is implemented in this step.
+- Added an Import Settings modal with mode, destination folder, hierarchy/material/texture/camera/light options, tangent generation, BLAS cache, unit scale, and coordinate conversion fields.
+- Added a staged placeholder import module that returns registry mutations, generated files, warnings/errors, and an import report path.
+- `Import Asset` now creates placeholder `.rtasset.json`, `.rtimportcache.json`, and `.import_report.json` files, then applies the registry record on the main thread.
+- The import skeleton does not call scene replacement, renderer resource creation, or scene/entity mutation paths.
+- No-project mode prompts users toward Project Manager; if a saved scene exists, it writes compatibility registry data to `SceneName.assets.json` next to that scene.
+
+### Step 10 - glTF/GLB Import-As-Asset - Completed 2026-05-31
 
 Goal: turn glTF input into reusable project assets.
 
@@ -1702,7 +1733,18 @@ Recommended tooling:
 
 Validation gate: embedded textures, external textures, multiple materials, alpha mask, double-sided metadata, and node hierarchy import or warn deterministically.
 
-### Step 11 - Prefab Generation, Placement, And Import And Place
+Completed implementation notes:
+
+- `Import Asset` now uses the existing CPU-side `GltfLoader::load` path to inspect glTF/GLB input without replacing the active scene or creating renderer resources.
+- glTF/GLB import creates deterministic registry records for the source prefab/model root plus discovered textures, materials, and meshes.
+- Outputs are written under `Content/Models/<Name>/...` and cache placeholders under `Cache/Models/<Name>/...` in project mode, or the compatibility workspace in no-project mode.
+- Texture metadata records preserve color-space intent: baseColor/emissive usages are marked sRGB while normal/metallic-roughness/occlusion data are marked linear/data.
+- Material metadata records include alpha mode, double-sided state, texture dependencies, and metallic-roughness channel rule notes.
+- Mesh metadata records include vertex/index/primitive counts, material dependencies, and BLAS cache placeholder metadata.
+- The root prefab/model metadata preserves source node hierarchy, root nodes, light count, and dependencies on generated mesh/material/texture records for later prefab generation.
+- Registry GUIDs are deterministic from source path hash, import settings hash, asset kind, and source index so repeated imports deduplicate by record GUID.
+
+### Step 11 - Prefab Generation, Placement, And Import And Place - Completed 2026-05-31
 
 Goal: place imported asset hierarchies into scenes using stable asset IDs.
 
@@ -1731,7 +1773,18 @@ Recommended tooling:
 
 Validation gate: Import and Place increases entity count only by the placed prefab hierarchy; duplicate placements share source assets; per-instance edits do not mutate source prefab or material assets unless an explicit apply-to-source command is used.
 
-### Step 12 - GUID-Backed `.rtlevel` Save/Load And Migration
+Completed implementation notes:
+
+- Added `PrefabAsset`, `PrefabNodeAsset`, `PrefabInstance`, and `PrefabOverride` types plus JSON loading for generated `.rtprefab.json` metadata.
+- glTF/GLB Import Asset now writes prefab metadata with node hierarchy, root nodes, mesh GUID references, and material GUID references.
+- Added `SceneOperations::placePrefab`, which creates a prefab instance root and generated child entities through the scene document/registry path, with a single undo snapshot.
+- `SceneDocument` now tracks placed `PrefabInstance` data with prefab GUID, instance root, generated entity UUIDs, and local override slots.
+- `placeAsset` now loads the prefab asset by GUID from the asset registry and places it into the active scene.
+- `Import and Place` now performs Import Asset plus one prefab placement; duplicate placements reuse the same deterministic source asset GUIDs.
+- Content registry prefab rows can be dragged as `PREFAB_ASSET` payloads and dropped on the Scene viewport or Hierarchy, or placed from the Content context menu.
+- Material drag/drop remains source-asset safe; prefab placement now creates hierarchy entities, stores GUID metadata, appends the imported glTF runtime assets, and binds mesh/material handles from asset GUIDs.
+
+### Step 12 - GUID-Backed `.rtlevel` Save/Load And Migration - Completed 2026-05-31
 
 Goal: make scenes durable across project moves and asset reimports.
 
@@ -1762,6 +1815,16 @@ Recommended tooling:
 
 Validation gate: existing validation `.rtlevel` files load; migrated saves create backups; moved project folders preserve project-relative references; missing assets warn instead of crashing; migration never overwrites a legacy scene without a recoverable backup.
 
+Completed implementation notes:
+
+- Added `RtLevelHeader` with format version, scene GUID, engine version, and project-relative path intent.
+- Latest `.rtlevel` saves now write a top-level `rtlevel` header while preserving legacy top-level `version`, `sourceGltf`, `sourceHdr`, entity, environment, render settings, active camera, primary sun, and bookmarks fields.
+- Added `assetReferences` metadata for source scene, environment, mesh/material/texture placeholder arrays, and prefab GUID references.
+- Entity mesh renderer and material slot JSON now include GUID fields alongside legacy index handles, keeping old loads working while allowing GUID-backed migration.
+- Prefab instances, generated entity UUIDs, local override slots, dirty reasons, active camera, primary sun, bookmarks, render settings, and world/environment settings are saved and loaded.
+- Legacy `.rtlevel` files without the new header still load; missing scene GUIDs are generated during load or save.
+- Saving over an existing legacy or older-format scene creates a recoverable `.bak` copy before writing the migrated latest format.
+
 ### Step 13 - Merge Scene Into Current
 
 Goal: add append behavior as a separate workflow from replacement and import.
@@ -1791,6 +1854,17 @@ Recommended tooling:
 
 Validation gate: existing scene entities remain unchanged; merge failure leaves scene and renderer unchanged; undo removes the merged root; the renderer rebuild is triggered only after the staged merge is applied on the main thread.
 
+Completed implementation notes:
+
+- `Merge Scene into Current` now routes through `Application::mergeSceneIntoCurrent` instead of the previous unimplemented warning.
+- glTF/GLB merge loads into a temporary CPU-side `AssetManager`/`SceneAsset`, appends imported textures/materials/meshes to the current runtime asset manager, and remaps texture, material, mesh, and node handles before scene mutation.
+- `SceneOperations::mergeSceneAsset` appends source nodes under a new `Merged <SourceName>` root, preserving hierarchy, transforms, mesh renderers, cameras, and lights while generating fresh `EntityId` values and stable UUIDs through `SceneRegistry`.
+- Existing scene entities are preserved; imported root nodes become children of the merge root, and camera activation only transfers to the merged scene when the current scene has no active camera.
+- The append is wrapped in one undo snapshot labeled `Merge Scene`; failed load/empty-source paths return before scene mutation, and failed apply restores the previous asset manager.
+- Successful merge marks topology dirty and runs the existing main-thread scene update/rebuild path; if resource rebuild is not currently allowed, the dirty topology update remains pending.
+- The import regression harness now checks that Merge Scene has a real handler and append support instead of only checking for the request field.
+- Final completion pass added GUID-backed runtime mesh/material binding for prefab placement and `.rtlevel` reopen, preserving registry-backed metadata paths without replacing the active scene.
+
 ### Step 14 - Command Registry And Keybinding Registry
 
 Goal: stop menus, toolbar buttons, shortcuts, and console commands from growing separate action paths.
@@ -1814,6 +1888,18 @@ Recommended tooling:
 ```
 
 Validation gate: existing shortcuts work; menu and toolbar actions trigger the same commands; viewport navigation keeps priority during mouse capture.
+
+Completed implementation notes:
+
+- Added `EditorCommandId`, `EditorCommand`, `EditorKeybinding`, `EditorCommandContext`, and `CommandRegistry` in `EditorCommands`.
+- Added default registrations for project, scene, import, create, render/debug, layout, edit, window, and viewport tool commands.
+- Added keybinding metadata for existing compatibility shortcuts including Ctrl+S, Ctrl+R, Ctrl+Z, Ctrl+Y, F1-F7, F11, number-row render/debug controls, and viewport Q/W/E/R/L/G tool controls.
+- Added command-context precedence metadata for text input, modal, viewport, scene-editing, and global command scopes, plus duplicate-key conflict detection on the registry.
+- `EditorDockspace` menu actions now route through `EditorCommandId` and a single `executeCommand` path while preserving the previous request behavior and file dialogs.
+- `Application::processRuntimeControls` now resolves global GLFW shortcuts through the registered commands and exact modifier metadata, preserving text-input blocking and viewport interaction priority.
+- `ViewportPanel` toolbar buttons and viewport Q/W/E/R/L/G shortcuts now route through viewport command IDs; legacy T and S tool shortcuts remain as compatibility aliases.
+- The Controls window now composes its visible keybinding list from the command registry plus navigation-only compatibility bindings.
+- Console command execution remains a future consumer of the same registry once the persistent Console model is implemented.
 
 ### Step 15 - Undo/Redo Coverage Expansion
 
@@ -1841,6 +1927,20 @@ Recommended tooling:
 ```
 
 Validation gate: undo/redo restores scene data and renderer-visible state; cancelled operations never enter the undo stack.
+
+Completed implementation notes:
+
+- `SceneOperations` remains the gateway for authored scene mutations and now exposes snapshot helpers plus undoable rename, mesh-renderer edit, primary-sun ensure, and component-removal operations.
+- Entity create requests are grouped into one undo command even when they also add camera/light components and place the new entity in front of the editor camera.
+- Inspector transform edits now submit `setEntityTransform` requests with old/new transforms, so direct property edits and gizmo commits both become undoable commands.
+- Inspector entity rename now submits a request instead of mutating the registry directly, and is undoable as `Rename Entity`.
+- Inspector mesh-renderer visibility/cast-shadow/visible-to-camera edits now submit old/new renderer state and are undoable as one property command.
+- Inspector component removal buttons were added for Camera, Light, Primary Sun, and Mesh Renderer; removals are undoable and route through `SceneOperations`.
+- Material property edits and material assignments now snapshot both `SceneDocument` and `AssetManager`, so undo/redo restores renderer-visible material data and marks the scene dirty for the existing update path.
+- Hierarchy/Inspector material assignment now records the target entity when available and updates material slots plus mesh primitive material state under one undoable assignment command.
+- `ensurePrimarySun` now routes through `SceneOperations` and records a single undo command when it creates or changes the primary sun.
+- Undo/redo labels are surfaced in the File menu and Log panel through the current `UndoStack` state.
+- Cancelled/no-op operations are guarded before snapshot commands are pushed for rename, component remove, primary-sun ensure, and material assignment apply failures.
 
 ### Step 16 - Render World Settings And Lighting/Post-Process Components
 
@@ -1871,7 +1971,22 @@ Recommended tooling:
 
 Validation gate: created lights appear in Hierarchy and Inspector; editing light/world settings updates renderer safely and resets accumulation when needed.
 
-### Step 17 - General Async Scene Loading
+Completed implementation notes:
+
+- Added scene-data components for `EnvironmentLight`, `SkyAtmosphere`, `HeightFog`, `VolumetricCloud`, `PostProcessVolume`, and `CameraPostProcess`.
+- Extended `LightType` with `Spot` while preserving existing serialized `Area` enum values.
+- Added `WorldSettings` to `SceneDocument` with active environment, primary sun, sky atmosphere, height fog, post-process references, and feature toggles.
+- Extended `.rtlevel` save/load to persist `worldSettings` and all new component payloads while preserving legacy fields.
+- Extended Create menu commands for Spot Light, Area Light, Environment Light, Sky Atmosphere, Height Fog, Volumetric Cloud, and Post Process Volume.
+- Extended entity creation routing so new lighting/world/post-process entities appear in Hierarchy and become editable in Inspector.
+- Extended Inspector with editable sections for Environment Light, Sky Atmosphere, Height Fog, Volumetric Cloud, Post Process Volume, and Camera Post Process.
+- Added Add Component and Remove Component UI for the new component types; changes route through undoable scene snapshots or `SceneOperations` as appropriate.
+- Render World Settings now edits scene-backed environment, sky/atmosphere, post-process, and GI summary settings instead of only showing technical renderer state.
+- Renderer-facing sky/atmosphere settings now flow from `SceneDocument::renderSettings()` through `SceneToGpuSceneBuilder` into `RendererSettings`.
+- Editing world/environment/post-process settings marks `EnvironmentOnly` or `RendererSettingsOnly`, preserving the existing granular scene-update route and accumulation reset behavior.
+- Full volumetric cloud/fog rendering remains a component/data shell until the renderer implements those authored effects; the scene data, UI, save/load, and undo path are in place.
+
+### Step 17 - General Async Scene Loading - Completed 2026-05-31
 
 Goal: replace the glTF-only async helper with a reusable scene loading model.
 
@@ -1902,7 +2017,19 @@ Recommended tooling:
 
 Validation gate: large scene open keeps UI responsive; cancelled/failed loads leave current scene unchanged; renderer rebuild happens only after main-thread apply.
 
-### Step 18 - Log, Console, Timeline V1, Autosave, And Recovery
+Completed implementation notes:
+
+- Added `SceneLoadMode`, `SceneLoadStatus`, `SceneLoadRequest`, `SceneLoadResult`, and `AsyncSceneLoader` in dedicated async scene loading files.
+- Replaced the glTF-only async helper with a reusable loader that stages CPU-only `.rtlevel` documents, glTF/GLB import-as-new-scene data, merge-scene data, and project startup scene loads.
+- Kept worker-thread work limited to file IO, `.rtlevel` JSON parsing, glTF/GLB parsing through `GltfLoader`, CPU-side asset staging, and staged `SceneDocument` creation.
+- Moved Open Scene, Import Scene as New Scene, Merge Scene, dropped glTF/GLB files, and Project Startup Scene onto `SceneLoadRequest` scheduling.
+- Applied completed results only from `Application` on the main/editor thread; active `SceneDocument`, `AssetManager`, undo stack, camera bookmarks, renderer resources, and notifications remain main-thread owned.
+- Added progress/status reporting through `sceneLoadingStatus_`, the Log panel, and a compact loading overlay with cooperative cancellation.
+- Cancelled or failed loads leave the active scene unchanged; replacement scene dirty handling still marks opened `.rtlevel` files clean and imported new scenes dirty.
+- Renderer rebuild/resource mutation occurs during main-thread apply through the existing path-tracer recreation and scene-update routes; no worker path touches Vulkan or `PathTracerRenderer`.
+- Preserved synchronous headless startup loading behavior; async project-startup loading is used by interactive project open.
+
+### Step 18 - Log, Console, Timeline V1, Autosave, And Recovery - Completed 2026-05-31
 
 Goal: finish the editor infrastructure after project, registry, import, and scene persistence are stable.
 
@@ -1932,6 +2059,27 @@ Recommended tooling:
 ```
 
 Validation gate: Log captures workflow failures; Console routes through command registry; transform keyframes save/reload; autosaves and recovery work; required diagnostic smoke outputs still work.
+
+Completed implementation notes:
+
+- Added `EditorLog` with categorized entries for info, warning, error, import, render, project, scene, and command messages.
+- Routed `NotificationManager` notifications into the editor Log while keeping toast notifications unchanged.
+- Reworked the Log panel with search, clear, copy, categorized coloring, scene-load status, undo/redo labels, and log-file write support under project `Saved/Logs/` or `out/editor_tools/` when no project is open.
+- Added Console command input/history and command-list display backed by the command registry metadata; core commands such as project manager, new scene, save scene, reset accumulation, reload shaders, undo, redo, and exit emit existing `EditorRequests`.
+- Added `EditorTimeline` with play/pause/stop, frame range, transform key capture for the selected entity, JSON serialization, and `.rtlevel` persistence under a `timeline` block.
+- Added `timelineChanged` requests so Timeline data is applied by `Application` instead of being committed solely inside the panel.
+- Added project autosave settings controls to Project Manager and project-file save routing for autosave enabled/interval values.
+- Added autosave scheduling in `Application`, writing dirty project scenes to `Project/Saved/Autosaves/<scene>_autosave.rtlevel` without changing the active scene path or dirty state.
+- Changed `.rtlevel` save output to write through a temporary file and rename into place, while preserving migration `.bak` behavior for older scene formats.
+- Added editor session marker write/remove under `Project/Saved/editor_session.json` and warning/log reporting when a previous marker is found on project open.
+- Timeline playback now samples keyed transforms by entity UUID, interpolates position/rotation/scale between keyframes, and routes playback transforms through `EditorRequests` for main-thread scene update/application.
+- Timeline edits now route through an undoable `SceneDocument` snapshot command labeled `Edit Timeline`.
+- The Log panel now writes and launches the log file on Windows through the platform shell.
+- Recovery now presents a modal with Restore Autosave, Discard Recovery, and Later actions when a previous session marker is found.
+
+Completed polish after Step 18:
+
+- Layout versioning, UI scale persistence, theme presets, workspace presets, and final density controls are now implemented for the V1 editor workflow.
 
 ## Step Dependencies And Gates
 

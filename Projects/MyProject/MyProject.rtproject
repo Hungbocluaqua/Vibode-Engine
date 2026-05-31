@@ -1,0 +1,16 @@
+{
+  "assetRegistry": "Content/AssetRegistry.json",
+  "autosaveEnabled": true,
+  "autosaveIntervalMinutes": 5,
+  "cacheRoot": "Cache",
+  "configRoot": "Config",
+  "contentRoot": "Content",
+  "defaultRenderPreset": "Editor",
+  "engineVersion": "0.1",
+  "name": "MyProject",
+  "projectGuid": "37ec634f-f910-0707-0266-f281300a1e5f",
+  "savedRoot": "Saved",
+  "scenesRoot": "Scenes",
+  "startupScene": "Scenes/Main.rtlevel",
+  "version": 1
+}

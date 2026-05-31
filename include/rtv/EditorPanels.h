@@ -9,6 +9,7 @@
 
 #include <Volk/volk.h>
 #include <glm/glm.hpp>
+#include <nlohmann/json.hpp>
 
 #include <array>
 #include <filesystem>
@@ -23,6 +24,9 @@ namespace rtv {
 class AssetManager;
 class CameraController;
 class CameraBookmarkManager;
+class EditorLog;
+class EditorTimeline;
+class UndoStack;
 struct EditorPreferences;
 
 struct EditorPanelVisibility {
@@ -69,7 +73,12 @@ struct EditorRuntimeState {
     bool sceneDirty = false;
     const std::vector<EntityId>* instanceEntities = nullptr;
     const std::string* sceneLoadingStatus = nullptr;
+    bool sceneLoadRunning = false;
+    float sceneLoadProgress = 0.0f;
     const CameraController* camera = nullptr;
+    const UndoStack* undoStack = nullptr;
+    EditorLog* log = nullptr;
+    EditorTimeline* timeline = nullptr;
     EditorPreferences* editorPrefs = nullptr;
     CameraBookmarkManager* cameraBookmarks = nullptr;
     VkExtent2D swapchainExtent{};
@@ -83,6 +92,7 @@ struct EditorMaterialUpdate {
 };
 
 struct EditorMaterialAssignment {
+    EntityId entity{};
     MeshAssetHandle mesh{};
     uint32_t primitiveIndex = UINT32_MAX;
     MaterialAssetHandle material{};
@@ -99,6 +109,11 @@ struct EditorEntityTransformChange {
     Transform newTransform{};
 };
 
+struct EditorEntityRenameRequest {
+    EntityId entity{};
+    std::string name;
+};
+
 struct EditorEntityTransformPreview {
     EntityId entity{};
     Transform transform{};
@@ -109,6 +124,13 @@ enum class EditorEntityCreateKind : uint32_t {
     Empty,
     Camera,
     Light,
+    SpotLight,
+    AreaLight,
+    EnvironmentLight,
+    SkyAtmosphere,
+    HeightFog,
+    VolumetricCloud,
+    PostProcessVolume,
 };
 
 enum class EditorComponentKind : uint32_t {
@@ -116,6 +138,18 @@ enum class EditorComponentKind : uint32_t {
     Sun,
     Camera,
     MeshRenderer,
+    EnvironmentLight,
+    SkyAtmosphere,
+    HeightFog,
+    VolumetricCloud,
+    PostProcessVolume,
+    CameraPostProcess,
+};
+
+struct EditorSceneSnapshotChange {
+    SceneDocument before{};
+    SceneUpdateKind updateKind = SceneUpdateKind::TopologyChanged;
+    std::string label;
 };
 
 struct EditorEntityCreateRequest {
@@ -148,6 +182,25 @@ struct EditorCameraChange {
     EntityId newActiveCamera{};
 };
 
+struct EditorMeshRendererChange {
+    EntityId entity{};
+    MeshRenderer oldRenderer{};
+    MeshRenderer newRenderer{};
+    SceneUpdateKind updateKind = SceneUpdateKind::TopologyChanged;
+};
+
+struct EditorTimelineTransformSample {
+    EntityId entity{};
+    Transform transform{};
+};
+
+struct EditorImportAssetRequest {
+    std::filesystem::path sourcePath;
+    std::filesystem::path destinationFolder;
+    std::string mode = "ImportAsset";
+    AssetImportSettings settings{};
+};
+
 struct EditorRequests {
     std::optional<RendererSettings> settings;
     std::optional<AccumulationResetReason> resetAccumulation;
@@ -155,12 +208,15 @@ struct EditorRequests {
     std::optional<std::filesystem::path> openScene;
     std::optional<std::filesystem::path> saveScene;
     std::optional<std::filesystem::path> saveSceneAs;
-    std::optional<std::filesystem::path> importAsset;
+    std::optional<EditorImportAssetRequest> importAsset;
     std::optional<std::filesystem::path> importAndPlace;
+    std::optional<AssetGuid> reimportAsset;
+    std::optional<AssetGuid> placeAsset;
     std::optional<std::filesystem::path> importSceneAsNewScene;
     std::optional<std::filesystem::path> mergeScene;
     std::optional<CreateProjectRequest> createProject;
     std::optional<OpenProjectRequest> openProject;
+    std::optional<ProjectContext> projectSettingsUpdate;
     std::optional<std::filesystem::path> loadGltf;
     std::optional<std::filesystem::path> loadHdr;
     std::optional<std::filesystem::path> saveSceneJson;
@@ -171,14 +227,20 @@ struct EditorRequests {
     std::optional<float> cameraMoveSpeed;
     std::optional<EntityId> duplicateEntity;
     std::optional<EntityId> deleteEntity;
+    std::optional<EditorEntityRenameRequest> renameEntity;
     std::optional<EditorEntityCreateRequest> createEntity;
     std::optional<EditorComponentRequest> addComponent;
+    std::optional<EditorComponentRequest> removeComponent;
     std::optional<EntityId> focusOnEntity;
     std::optional<std::pair<EntityId, EntityId>> reparentEntity; // child, newParent
     std::optional<EditorEntityBoolChange> setEntityVisibility;
     std::optional<EditorEntityBoolChange> setEntityLocked;
     std::optional<EditorEntityTransformChange> setEntityTransform;
     std::optional<EditorEntityTransformPreview> previewEntityTransform;
+    std::optional<EditorMeshRendererChange> setMeshRenderer;
+    std::optional<EditorSceneSnapshotChange> sceneSnapshot;
+    std::optional<nlohmann::json> timelineChanged;
+    std::vector<EditorTimelineTransformSample> timelinePlaybackTransforms;
     std::optional<EditorLightChange> setLight;
     std::optional<EditorSunChange> setSun;
     std::optional<EditorCameraChange> setCamera;
@@ -193,8 +255,12 @@ struct EditorRequests {
     bool cycleIntermediateView = false;
     bool ensurePrimarySun = false;
     bool closeProject = false;
+    bool closeScene = false;
     bool saveProjectSettings = false;
     bool showProjectManager = false;
+    bool cancelSceneLoad = false;
+    bool restoreAutosave = false;
+    bool discardRecovery = false;
     bool exit = false;
     std::optional<std::string> saveCameraBookmark;
     std::optional<size_t> loadCameraBookmarkIndex;

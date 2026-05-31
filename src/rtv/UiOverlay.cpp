@@ -144,11 +144,14 @@ EditorRequests UiOverlay::build(
     const std::optional<std::filesystem::path>& hdrPath,
     const std::optional<std::filesystem::path>& scenePath,
     const ProjectContext* project,
-    const AssetRegistry* assetRegistry,
-    bool sceneDirty,
-    const std::vector<EntityId>* instanceEntities,
+        const AssetRegistry* assetRegistry,
+        bool sceneDirty,
+        const std::vector<EntityId>* instanceEntities,
         const std::string& sceneLoadingStatus,
+        bool sceneLoadRunning,
+        float sceneLoadProgress,
         const CameraController* camera,
+        const UndoStack* undoStack,
         float cpuFrameMs,
         NotificationManager* notifications,
         bool externalMouseCapture) {
@@ -192,16 +195,19 @@ EditorRequests UiOverlay::build(
         .sceneDirty = sceneDirty,
         .instanceEntities = instanceEntities,
         .sceneLoadingStatus = &sceneLoadingStatus,
+        .sceneLoadRunning = sceneLoadRunning,
+        .sceneLoadProgress = sceneLoadProgress,
         .camera = camera,
-            .swapchainExtent = extent,
-            .cpuFrameMs = cpuFrameMs,
-            .viewport = EditorViewportState{
-                .texture = viewportTexture_,
-                .renderExtent = renderExtent,
-                .displayExtent = displayExtent,
-                .textureReady = outputMatchesViewport && viewportTexture_ != VK_NULL_HANDLE,
-                .mouseCaptureActive = externalMouseCapture || (camera != nullptr && camera->mouseCaptured()),
-            },
+        .undoStack = undoStack,
+        .swapchainExtent = extent,
+        .cpuFrameMs = cpuFrameMs,
+        .viewport = EditorViewportState{
+            .texture = viewportTexture_,
+            .renderExtent = renderExtent,
+            .displayExtent = displayExtent,
+            .textureReady = outputMatchesViewport && viewportTexture_ != VK_NULL_HANDLE,
+            .mouseCaptureActive = externalMouseCapture || (camera != nullptr && camera->mouseCaptured()),
+        },
     };
     requests = editor_.draw(state);
     if (notifications != nullptr) {
@@ -270,41 +276,43 @@ void UiOverlay::checkVkResult(VkResult result) {
 void UiOverlay::applyDarkStyle() {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowPadding = ImVec2(6.0f, 5.0f);
-    style.FramePadding = ImVec2(6.0f, 3.0f);
-    style.ItemSpacing = ImVec2(6.0f, 4.0f);
-    style.ItemInnerSpacing = ImVec2(5.0f, 3.0f);
-    style.ScrollbarSize = 12.0f;
-    style.WindowRounding = 2.0f;
-    style.FrameRounding = 2.0f;
-    style.GrabRounding = 2.0f;
-    style.TabRounding = 2.0f;
+    style.WindowPadding = ImVec2(5.0f, 4.0f);
+    style.FramePadding = ImVec2(5.0f, 2.0f);
+    style.ItemSpacing = ImVec2(5.0f, 3.0f);
+    style.ItemInnerSpacing = ImVec2(4.0f, 2.0f);
+    style.ScrollbarSize = 10.0f;
+    style.WindowRounding = 0.0f;
+    style.FrameRounding = 1.0f;
+    style.GrabRounding = 1.0f;
+    style.TabRounding = 1.0f;
     style.WindowBorderSize = 1.0f;
     style.FrameBorderSize = 0.0f;
     style.WindowMenuButtonPosition = ImGuiDir_Left;
 
     ImVec4* colors = style.Colors;
-    colors[ImGuiCol_WindowBg] = ImVec4(0.030f, 0.035f, 0.043f, 1.0f);
-    colors[ImGuiCol_ChildBg] = ImVec4(0.040f, 0.046f, 0.055f, 1.0f);
-    colors[ImGuiCol_PopupBg] = ImVec4(0.035f, 0.040f, 0.050f, 1.0f);
-    colors[ImGuiCol_Border] = ImVec4(0.180f, 0.200f, 0.235f, 0.70f);
-    colors[ImGuiCol_FrameBg] = ImVec4(0.085f, 0.095f, 0.110f, 1.0f);
-    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.120f, 0.145f, 0.180f, 1.0f);
-    colors[ImGuiCol_FrameBgActive] = ImVec4(0.150f, 0.195f, 0.265f, 1.0f);
-    colors[ImGuiCol_TitleBg] = ImVec4(0.025f, 0.030f, 0.038f, 1.0f);
-    colors[ImGuiCol_TitleBgActive] = ImVec4(0.035f, 0.043f, 0.055f, 1.0f);
-    colors[ImGuiCol_MenuBarBg] = ImVec4(0.025f, 0.030f, 0.038f, 1.0f);
-    colors[ImGuiCol_Tab] = ImVec4(0.055f, 0.064f, 0.078f, 1.0f);
-    colors[ImGuiCol_TabHovered] = ImVec4(0.130f, 0.190f, 0.285f, 1.0f);
-    colors[ImGuiCol_TabActive] = ImVec4(0.090f, 0.135f, 0.210f, 1.0f);
-    colors[ImGuiCol_Header] = ImVec4(0.075f, 0.105f, 0.155f, 1.0f);
-    colors[ImGuiCol_HeaderHovered] = ImVec4(0.105f, 0.155f, 0.230f, 1.0f);
-    colors[ImGuiCol_HeaderActive] = ImVec4(0.125f, 0.185f, 0.285f, 1.0f);
-    colors[ImGuiCol_Button] = ImVec4(0.085f, 0.105f, 0.135f, 1.0f);
-    colors[ImGuiCol_ButtonHovered] = ImVec4(0.120f, 0.165f, 0.230f, 1.0f);
-    colors[ImGuiCol_ButtonActive] = ImVec4(0.145f, 0.205f, 0.310f, 1.0f);
+    colors[ImGuiCol_WindowBg] = ImVec4(0.018f, 0.020f, 0.023f, 1.0f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.026f, 0.028f, 0.031f, 1.0f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.020f, 0.022f, 0.026f, 1.0f);
+    colors[ImGuiCol_Border] = ImVec4(0.115f, 0.120f, 0.130f, 0.85f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.060f, 0.064f, 0.070f, 1.0f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.100f, 0.120f, 0.145f, 1.0f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.125f, 0.155f, 0.200f, 1.0f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.018f, 0.020f, 0.023f, 1.0f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.026f, 0.029f, 0.034f, 1.0f);
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.016f, 0.018f, 0.021f, 1.0f);
+    colors[ImGuiCol_Tab] = ImVec4(0.055f, 0.058f, 0.064f, 1.0f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.100f, 0.125f, 0.165f, 1.0f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.090f, 0.095f, 0.105f, 1.0f);
+    colors[ImGuiCol_Header] = ImVec4(0.080f, 0.085f, 0.092f, 1.0f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.120f, 0.145f, 0.180f, 1.0f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.150f, 0.190f, 0.250f, 1.0f);
+    colors[ImGuiCol_Button] = ImVec4(0.070f, 0.075f, 0.084f, 1.0f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.105f, 0.125f, 0.155f, 1.0f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.135f, 0.170f, 0.230f, 1.0f);
     colors[ImGuiCol_CheckMark] = ImVec4(0.300f, 0.560f, 0.980f, 1.0f);
     colors[ImGuiCol_SliderGrab] = ImVec4(0.260f, 0.500f, 0.900f, 1.0f);
+    colors[ImGuiCol_Separator] = ImVec4(0.105f, 0.110f, 0.120f, 1.0f);
+    colors[ImGuiCol_ResizeGrip] = ImVec4(0.120f, 0.150f, 0.190f, 0.45f);
 }
 
 } // namespace rtv

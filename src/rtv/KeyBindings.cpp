@@ -1,32 +1,37 @@
 #include "rtv/KeyBindings.h"
 
+#include "rtv/EditorCommands.h"
+
 namespace rtv {
 
 const std::vector<KeyBinding>& allKeyBindings() {
-    static const std::vector<KeyBinding> bindings = {
-        {"Viewport.Navigate", "Right Mouse", "Navigation", "Look and move the viewport camera"},
-        {"Viewport.MoveForward", "W", "Navigation", "Move forward while navigating"},
-        {"Viewport.MoveBack", "S", "Navigation", "Move backward while navigating"},
-        {"Viewport.MoveLeft", "A", "Navigation", "Move left while navigating"},
-        {"Viewport.MoveRight", "D", "Navigation", "Move right while navigating"},
-        {"Viewport.MoveDown", "Q / Ctrl", "Navigation", "Move down while navigating"},
-        {"Viewport.MoveUp", "E / Space", "Navigation", "Move up while navigating"},
-        {"Viewport.FastMove", "Shift", "Navigation", "Use fast camera movement"},
-        {"Viewport.RotateSun", "Hold Ctrl+L + Drag", "Navigation", "Rotate the Primary Sun"},
-        {"Viewport.Translate", "T", "Editing", "Use translate gizmo"},
-        {"Viewport.Rotate", "R", "Editing", "Use rotate gizmo or reset accumulation outside text fields"},
-        {"Viewport.Scale", "S", "Editing", "Use scale gizmo"},
-        {"Viewport.LocalSpace", "L", "Editing", "Toggle local/world gizmo space"},
-        {"Render.CycleDebug", "F1", "Render", "Cycle renderer debug view"},
-        {"Render.ToggleDenoiser", "F2", "Render", "Toggle denoiser"},
-        {"Render.ToggleMovingDenoiser", "F3", "Render", "Toggle denoise while moving"},
-        {"Render.ToggleSun", "F4", "Render", "Toggle the Primary Sun"},
-        {"Render.ToggleEnvironment", "F5", "Render", "Toggle environment"},
-        {"Render.ToggleDirect", "F6", "Render", "Toggle direct lighting"},
-        {"Render.CycleIntermediate", "F7", "Render", "Cycle intermediate buffer view (Beauty, Direct, Indirect, Variance, Normals, Depth, Velocity)"},
-        {"Render.ResetAccumulation", "R", "Render", "Reset accumulation outside text fields"},
-        {"Window.Fullscreen", "F11", "Window", "Toggle borderless fullscreen"},
-    };
+    static const std::vector<KeyBinding> bindings = [] {
+        std::vector<KeyBinding> result = {
+            {"Viewport.Navigate", "Right Mouse", "Navigation", "Look and move the viewport camera"},
+            {"Viewport.MoveForward", "W", "Navigation", "Move forward while navigating"},
+            {"Viewport.MoveBack", "S", "Navigation", "Move backward while navigating"},
+            {"Viewport.MoveLeft", "A", "Navigation", "Move left while navigating"},
+            {"Viewport.MoveRight", "D", "Navigation", "Move right while navigating"},
+            {"Viewport.MoveDown", "Q / Ctrl", "Navigation", "Move down while navigating"},
+            {"Viewport.MoveUp", "E / Space", "Navigation", "Move up while navigating"},
+            {"Viewport.FastMove", "Shift", "Navigation", "Use fast camera movement"},
+            {"Viewport.RotateSun", "Hold Ctrl+L + Drag", "Navigation", "Rotate the Primary Sun"},
+            {"Viewport.TranslateLegacy", "T", "Editing", "Use move gizmo compatibility shortcut"},
+            {"Viewport.ScaleLegacy", "S", "Editing", "Use scale gizmo compatibility shortcut"},
+        };
+        for (const EditorCommand& command : defaultEditorCommandRegistry().commands()) {
+            if (command.defaultKeybinding.display.empty()) {
+                continue;
+            }
+            result.push_back(KeyBinding{
+                command.name,
+                command.defaultKeybinding.display,
+                command.category,
+                command.description,
+            });
+        }
+        return result;
+    }();
     return bindings;
 }
 

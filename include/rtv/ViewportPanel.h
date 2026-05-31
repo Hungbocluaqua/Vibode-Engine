@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rtv/EditorCommands.h"
 #include "rtv/EditorPanels.h"
 
 #include <array>
@@ -38,6 +39,7 @@ private:
 
     void commitGizmoDrag(EditorRequests& requests, SceneDocument& document);
     void abortGizmoDrag();
+    void executeCommand(EditorCommandId id);
     void updateGizmoState(bool isOver, bool isUsing, int gizmoMode);
 
     VkExtent2D lastContentExtent_{};

@@ -1,0 +1,227 @@
+{
+  "activeCamera": 1,
+  "assetReferences": {
+    "environment": {
+      "assetGuid": "",
+      "hdrPath": ""
+    },
+    "materials": [],
+    "meshes": [],
+    "prefabs": [],
+    "source": {
+      "assetGuid": "",
+      "sourceGltf": ""
+    },
+    "textures": []
+  },
+  "bookmarks": [],
+  "dirtyReasons": [
+    "CameraOnly"
+  ],
+  "entities": [
+    {
+      "camera": {
+        "active": true,
+        "farPlane": 1000.0,
+        "nearPlane": 0.009999999776482582,
+        "useRenderSettingsExposure": true,
+        "verticalFovRadians": 1.0471975803375244
+      },
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 0,
+        "uuid": 1
+      },
+      "locked": false,
+      "name": "Camera",
+      "parent": 0,
+      "transform": {
+        "position": [
+          -0.7489736080169678,
+          0.6295076012611389,
+          3.7426435947418213
+        ],
+        "rotationEuler": [
+          -0.15749318897724152,
+          -0.12014837563037872,
+          9.380853871476802e-10
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 1,
+        "uuid": 2
+      },
+      "locked": false,
+      "name": "Sun Light",
+      "parent": 0,
+      "sun": {
+        "angularRadiusRadians": 0.004650000017136335,
+        "colorTemperatureKelvin": 5778.0,
+        "enabled": true,
+        "illuminanceLux": 100000.0
+      },
+      "transform": {
+        "position": [
+          -4.615804698460124e-07,
+          6.0102434158325195,
+          -5.279865264892578
+        ],
+        "rotationEuler": [
+          -0.8500000238418579,
+          -3.141592502593994,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 2,
+        "uuid": 3
+      },
+      "locked": false,
+      "name": "Environment Light",
+      "parent": 0,
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          2.1701042652130127
+        ],
+        "rotationEuler": [
+          0.0,
+          -0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    }
+  ],
+  "environment": {
+    "backgroundIntensity": 0.3499999940395355,
+    "enabled": true,
+    "hdrPath": "",
+    "intensity": 1.0,
+    "rotation": 0.0
+  },
+  "prefabInstances": [],
+  "primarySun": 2,
+  "renderSettings": {
+    "accumulate": true,
+    "accumulationLimit": 0,
+    "adaptationSpeed": 2.0,
+    "adaptiveGpuFrameTargetMs": 16.600000381469727,
+    "adaptiveQualityMode": 2,
+    "atrousIterations": 3,
+    "autoExposureEnabled": false,
+    "brightness": 0.0,
+    "cameraJitterEnabled": true,
+    "contrast": 1.0,
+    "debugView": 0,
+    "denoiseWhileMoving": true,
+    "denoiserEnabled": true,
+    "denoiserMaxHistoryLength": 48,
+    "denoiserStrength": 1.0499999523162842,
+    "directLightingEnabled": true,
+    "dofApertureRadius": 0.0,
+    "dofBladeCount": 0,
+    "dofBokehRotation": 0.0,
+    "dofFocusDistance": 10.0,
+    "environmentDirectSamples": 1,
+    "exposure": 2.0,
+    "fireflyClamp": 8.0,
+    "gamma": 2.200000047683716,
+    "histogramHighPercentile": 0.949999988079071,
+    "histogramLowPercentile": 0.05000000074505806,
+    "histogramMaxLogLuminance": 10.0,
+    "histogramMinLogLuminance": -10.0,
+    "histogramTargetPercentile": 0.6000000238418579,
+    "homogeneousVolumeAbsorption": 0.0,
+    "homogeneousVolumeAnisotropy": 0.0,
+    "homogeneousVolumeEnabled": false,
+    "homogeneousVolumeScattering": 0.0,
+    "indirectStrength": 1.0,
+    "limitSamplesPerPixel": true,
+    "materialTextureAnisotropy": 4.0,
+    "maxBounces": 5,
+    "maxExposure": 8.0,
+    "minExposure": 0.25,
+    "mneeCausticsEnabled": false,
+    "momentValidityThreshold": 0.20000000298023224,
+    "motionBlurEnabled": false,
+    "motionBlurShutterClose": 1.0,
+    "motionBlurShutterOpen": 0.0,
+    "opacityMicromapsEnabled": true,
+    "pathTracingEnabled": true,
+    "physicalAperture": 16.0,
+    "physicalExposureCompensation": 0.0,
+    "physicalIso": 100.0,
+    "physicalShutterSeconds": 0.00800000037997961,
+    "renderPreset": 2,
+    "resolutionScale": 0.6499999761581421,
+    "restirGiDepthThresholdScale": 0.8500000238418579,
+    "restirGiEnabled": true,
+    "restirGiHalfResolution": false,
+    "restirGiSpatialCompatibilityThreshold": 0.05999999865889549,
+    "restirGiSpatialRadius": 3.75,
+    "restirGiSpatialRounds": 3,
+    "restirGiTemporalMaxAge": 18,
+    "restirGiVisibilityRayBudget": 0,
+    "restirMode": 1,
+    "samplesPerPixel": 1,
+    "saturation": 1.0,
+    "shadowDistanceBias": 0.0020000000949949026,
+    "shadowRayBias": 0.0010000000474974513,
+    "skyIntensity": 0.800000011920929,
+    "specularAaEnabled": true,
+    "taaEnabled": true,
+    "taaFeedback": 0.05999999865889549,
+    "taaMotionFeedback": 0.8999999761581421,
+    "taaReactiveFeedback": 0.9800000190734863,
+    "taaSharpeningStrength": 0.05000000074505806,
+    "targetLuminance": 0.18000000715255737,
+    "toneMapper": 3,
+    "usePhysicalCamera": false,
+    "whitePoint": 4.0
+  },
+  "rtlevel": {
+    "engineVersion": "0.1",
+    "formatVersion": 3,
+    "legacyVersion": 2,
+    "projectRelativePaths": true,
+    "sceneGuid": "baff448d-a1c2-51bd-f0ba-8fd6aecd4453"
+  },
+  "sourceGltf": "",
+  "sourceHdr": "",
+  "version": 3,
+  "worldSettings": {
+    "activeEnvironment": 0,
+    "atmosphereEnabled": true,
+    "fogEnabled": false,
+    "heightFog": 0,
+    "postProcessEnabled": true,
+    "postProcessVolume": 0,
+    "primarySun": 2,
+    "skyAtmosphere": 0
+  }
+}

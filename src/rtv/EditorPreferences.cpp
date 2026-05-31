@@ -64,6 +64,10 @@ void EditorPreferences::save(const std::filesystem::path& path) const {
     json["gridVisible"] = gridVisible;
     json["showHud"] = showHud;
     json["hudScale"] = hudScale;
+    json["uiScale"] = uiScale;
+    json["themePreset"] = themePreset;
+    json["workspacePreset"] = workspacePreset;
+    json["layoutVersion"] = layoutVersion;
     json["confirmDelete"] = confirmDelete;
     json["recentFiles"] = recentFiles;
     json["favoriteFiles"] = favoriteFiles;
@@ -92,6 +96,10 @@ void EditorPreferences::load(const std::filesystem::path& path) {
         if (json.contains("gridVisible")) gridVisible = json["gridVisible"].get<bool>();
         if (json.contains("showHud")) showHud = json["showHud"].get<bool>();
         if (json.contains("hudScale")) hudScale = json["hudScale"].get<float>();
+        if (json.contains("uiScale")) uiScale = std::clamp(json["uiScale"].get<float>(), 0.75f, 1.75f);
+        if (json.contains("themePreset")) themePreset = json["themePreset"].get<int>();
+        if (json.contains("workspacePreset")) workspacePreset = json["workspacePreset"].get<int>();
+        if (json.contains("layoutVersion")) layoutVersion = json["layoutVersion"].get<int>();
         if (json.contains("confirmDelete")) confirmDelete = json["confirmDelete"].get<bool>();
         if (json.contains("recentFiles")) recentFiles = json["recentFiles"].get<std::vector<std::string>>();
         if (json.contains("favoriteFiles")) favoriteFiles = json["favoriteFiles"].get<std::vector<std::string>>();

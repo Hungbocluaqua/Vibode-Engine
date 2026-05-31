@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtv/NonCopyable.h"
+#include "rtv/AsyncSceneLoader.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
 #include "rtv/AssetManager.h"
@@ -89,12 +90,6 @@ public:
     [[nodiscard]] uint32_t warmupFrameCount() const { return warmupFrameCount_; }
 
 private:
-    struct PendingSceneLoadResult {
-        std::filesystem::path path;
-        AssetManager assets;
-        SceneAsset scene;
-        std::string error;
-    };
     struct RetiredPathTracer {
         std::unique_ptr<PathTracerRenderer> renderer;
         uint64_t releaseFrame = 0;
@@ -131,6 +126,11 @@ private:
     void mainLoop(uint32_t maxFrames);
     void applyValidationCameraMotion(uint32_t frameIndex);
     void applyValidationObjectMotion(uint32_t frameIndex);
+    void updateAutosave(float deltaSeconds);
+    bool writeAutosave();
+    void writeCrashMarker(bool running);
+    void serializeEditorSceneData();
+    void deserializeEditorSceneData();
     void processRuntimeControls(float deltaSeconds);
     void processSunDragControls(bool shortcutsBlocked, bool viewportHovered, bool viewportInteraction, bool ctrlDown);
     void beginSunDragArm(bool dragEligible);
@@ -140,9 +140,11 @@ private:
     void updateWindowTitle(float seconds);
     void toggleBorderlessFullscreen();
     void reloadGltfScene(const std::filesystem::path& path);
-    void requestGltfSceneLoad(const std::filesystem::path& path);
+    bool requestSceneLoad(SceneLoadRequest request);
     void pollAsyncSceneLoad();
-    void commitLoadedGltfScene(PendingSceneLoadResult&& result);
+    bool applySceneLoadResult(SceneLoadResult&& result);
+    bool applyReplacementSceneResult(SceneLoadResult&& result, bool sceneDirtyAfterApply);
+    bool applyMergeSceneResult(SceneLoadResult&& result);
     void applyEditorRequests(const EditorRequests& requests, bool allowResourceRebuild);
     [[nodiscard]] DirtyScenePromptResult promptDirtySceneBefore(std::string_view action) const;
     [[nodiscard]] bool saveCurrentSceneForDirtyPrompt();
@@ -152,6 +154,10 @@ private:
     [[nodiscard]] bool closeCurrentProject();
     [[nodiscard]] bool loadProjectStartupScene(const ProjectContext& project);
     [[nodiscard]] bool writeDefaultProjectScene(const ProjectContext& project, std::string_view templateName);
+    [[nodiscard]] std::optional<AssetGuid> importAssetNonMutating(const EditorImportAssetRequest& request);
+    [[nodiscard]] bool placePrefabAsset(const AssetGuid& prefabGuid);
+    [[nodiscard]] bool reimportAsset(const AssetGuid& assetGuid);
+    [[nodiscard]] bool mergeSceneIntoCurrent(const std::filesystem::path& path, bool allowResourceRebuild);
     bool applyPendingSceneUpdate(bool allowResourceRebuild);
     void applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange);
     void reloadShadersFromEditor();
@@ -208,6 +214,7 @@ private:
     SunDragState sunDrag_{};
     std::array<unsigned char, 512> keyState_{};
     float lastFrameSeconds_ = 0.0f;
+    float autosaveElapsedSeconds_ = 0.0f;
     uint64_t frameSerial_ = 0;
     float lastTitleUpdateSeconds_ = -1.0f;
     bool borderlessFullscreen_ = false;
@@ -235,8 +242,9 @@ private:
     std::unique_ptr<PathTracerRenderer> pathTracer_;
     std::vector<RetiredPathTracer> retiredPathTracers_;
     std::optional<RendererSettings> pendingPostFrameSettings_;
-    std::future<PendingSceneLoadResult> pendingSceneLoad_;
-    std::optional<std::filesystem::path> pendingSceneLoadPath_;
+    AsyncSceneLoader asyncSceneLoader_;
+    std::optional<SceneLoadRequest> activeSceneLoadRequest_;
+    std::optional<std::filesystem::path> pendingRecoveryAutosavePath_;
     std::string sceneLoadingStatus_;
 };
 

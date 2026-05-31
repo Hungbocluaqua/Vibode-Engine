@@ -56,6 +56,8 @@ add_executable(rtvulkan
     src/main.cpp
     src/rtv/Application.cpp
     src/rtv/AccelerationStructure.cpp
+    src/rtv/AsyncSceneLoader.cpp
+    src/rtv/AssetImport.cpp
     src/rtv/AssetRegistry.cpp
     src/rtv/AssetManager.cpp
     src/rtv/AssetBrowserPanel.cpp
@@ -80,10 +82,13 @@ add_executable(rtvulkan
     src/rtv/DiagnosticImageExport.cpp
     src/rtv/DiagnosticTools.cpp
     src/rtv/EditorDockspace.cpp
+    src/rtv/EditorCommands.cpp
     src/rtv/EditorLayer.cpp
+    src/rtv/EditorLog.cpp
     src/rtv/EditorPanels.cpp
     src/rtv/EditorPreferences.cpp
     src/rtv/EditorSelection.cpp
+    src/rtv/EditorTimeline.cpp
     src/rtv/Entity.cpp
     src/rtv/EnvironmentImportanceSampler.cpp
     src/rtv/FileDialog.cpp
@@ -111,6 +116,7 @@ add_executable(rtvulkan
     src/rtv/PipelineBuilder.cpp
     src/rtv/PipelineCache.cpp
     src/rtv/PipelineDemo.cpp
+    src/rtv/Prefab.cpp
     src/rtv/Project.cpp
     src/rtv/RenderSettingsPanel.cpp
     src/rtv/RenderGraph.cpp
@@ -167,7 +173,7 @@ if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
 endif()
 
 if(WIN32)
-    target_link_libraries(rtvulkan PRIVATE Comdlg32 User32)
+    target_link_libraries(rtvulkan PRIVATE Comdlg32 User32 Shell32)
 endif()
 
 if(MSVC)

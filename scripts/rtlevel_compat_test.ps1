@@ -14,7 +14,7 @@ $RepoRoot = Resolve-EditorToolRepoRoot $RepoRoot
 $results = @()
 $schemaJson = if ($JsonOut) { [System.IO.Path]::ChangeExtension($JsonOut, '.schema.json') } else { $null }
 & (Join-Path $PSScriptRoot 'rtlevel_schema_validator.ps1') -RepoRoot $RepoRoot -Path $Path -JsonOut $schemaJson
-$schemaExit = $LASTEXITCODE
+$schemaExit = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
 $results += New-ToolResult -Name 'Schema validation script' -Passed ($schemaExit -eq 0) -Message "exit=$schemaExit"
 
 if ($RunHeadless) {

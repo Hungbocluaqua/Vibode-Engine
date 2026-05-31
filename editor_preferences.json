@@ -5,14 +5,21 @@
   "favoriteFiles": [],
   "gridVisible": true,
   "hudScale": 1.0,
-  "lastOpenedProject": "",
+  "lastOpenedProject": "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Projects\\MyProject\\MyProject.rtproject",
+  "layoutVersion": 2,
   "openLastProject": false,
   "recentFiles": [
     "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\san-miguel\\san-miguel.gltf",
+    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Projects\\MyProject\\Scenes/Main.rtlevel",
     "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\main_sponza\\NewSponza_Main_glTF_003.gltf",
     "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\main_sponza\\NewSponza_Curtains_glTF.gltf",
     "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Sponza\\glTF\\Sponza.gltf"
   ],
-  "recentProjects": [],
-  "showHud": true
+  "recentProjects": [
+    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Projects\\MyProject\\MyProject.rtproject"
+  ],
+  "showHud": true,
+  "themePreset": 0,
+  "uiScale": 1.0,
+  "workspacePreset": 0
 }

@@ -6,9 +6,38 @@
 #include <memory>
 #include <utility>
 
+#include <glm/gtc/quaternion.hpp>
+
 namespace rtv {
 
 namespace {
+
+glm::vec3 translationFromMatrix(const glm::mat4& matrix) {
+    return glm::vec3(matrix[3]);
+}
+
+glm::vec3 scaleFromMatrix(const glm::mat4& matrix) {
+    return {
+        glm::length(glm::vec3(matrix[0])),
+        glm::length(glm::vec3(matrix[1])),
+        glm::length(glm::vec3(matrix[2])),
+    };
+}
+
+glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
+    glm::vec3 scale = scaleFromMatrix(matrix);
+    glm::mat3 rotation{matrix};
+    if (scale.x > 0.0f) {
+        rotation[0] /= scale.x;
+    }
+    if (scale.y > 0.0f) {
+        rotation[1] /= scale.y;
+    }
+    if (scale.z > 0.0f) {
+        rotation[2] /= scale.z;
+    }
+    return glm::eulerAngles(glm::quat_cast(rotation));
+}
 
 class SceneDocumentSnapshotCommand final : public ICommand {
 public:
@@ -48,6 +77,14 @@ private:
 
 SceneOperations::SceneOperations(SceneDocument& document, SceneEventBus* eventBus)
     : document_(document), eventBus_(eventBus) {}
+
+void SceneOperations::pushDocumentSnapshot(SceneDocument before, SceneUpdateKind updateKind, std::string label) {
+    if (undoStack_ == nullptr) {
+        return;
+    }
+    undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+        document_, std::move(before), document_, updateKind, std::move(label)));
+}
 
 EntityId SceneOperations::createEntity(const std::string& name, EntityId parent) {
     const SceneDocument before = document_;
@@ -166,6 +203,21 @@ bool SceneOperations::setLocked(EntityId id, bool locked) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
             document_, before, document_, SceneUpdateKind::None, locked ? "Lock Entity" : "Unlock Entity"));
     }
+    return true;
+}
+
+bool SceneOperations::renameEntity(EntityId id, const std::string& name) {
+    const SceneDocument before = document_;
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || entity->name == name) {
+        return false;
+    }
+    if (!document_.registry().renameEntity(id, name)) {
+        return false;
+    }
+    document_.markDirty(SceneUpdateKind::None);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::None});
+    pushDocumentSnapshot(before, SceneUpdateKind::None, "Rename Entity");
     return true;
 }
 
@@ -302,6 +354,283 @@ bool SceneOperations::addMeshRendererComponent(EntityId id, MeshRenderer rendere
             document_, before, document_, SceneUpdateKind::TopologyChanged, "Add Mesh Renderer Component"));
     }
     return true;
+}
+
+bool SceneOperations::removeLightComponent(EntityId id) {
+    const SceneDocument before = document_;
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->light.has_value()) {
+        return false;
+    }
+    entity->light.reset();
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::TopologyChanged});
+    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, "Remove Light Component");
+    return true;
+}
+
+bool SceneOperations::removeSunComponent(EntityId id) {
+    const SceneDocument before = document_;
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->sun.has_value()) {
+        return false;
+    }
+    entity->sun.reset();
+    if (document_.primarySun() == id) {
+        document_.setPrimarySun({});
+    }
+    document_.markDirty(SceneUpdateKind::LightOnly);
+    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::LightOnly});
+    pushDocumentSnapshot(before, SceneUpdateKind::LightOnly, "Remove Sun Component");
+    return true;
+}
+
+bool SceneOperations::removeCameraComponent(EntityId id) {
+    const SceneDocument before = document_;
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->camera.has_value()) {
+        return false;
+    }
+    entity->camera.reset();
+    if (document_.activeCamera() == id) {
+        document_.setActiveCamera({});
+    }
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::TopologyChanged});
+    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, "Remove Camera Component");
+    return true;
+}
+
+bool SceneOperations::removeMeshRendererComponent(EntityId id) {
+    const SceneDocument before = document_;
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->meshRenderer.has_value()) {
+        return false;
+    }
+    entity->meshRenderer.reset();
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::TopologyChanged});
+    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, "Remove Mesh Renderer Component");
+    return true;
+}
+
+bool SceneOperations::setMeshRenderer(EntityId id, const MeshRenderer& oldRenderer, const MeshRenderer& newRenderer, SceneUpdateKind updateKind) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->meshRenderer.has_value()) {
+        return false;
+    }
+    entity->meshRenderer = oldRenderer;
+    const SceneDocument before = document_;
+    entity = document_.registry().entity(id);
+    if (entity == nullptr || !entity->meshRenderer.has_value()) {
+        return false;
+    }
+    entity->meshRenderer = newRenderer;
+    document_.markDirty(updateKind);
+    publish({SceneEventType::ComponentAdded, id, {}, updateKind});
+    pushDocumentSnapshot(before, updateKind, "Edit Mesh Renderer");
+    return true;
+}
+
+bool SceneOperations::ensurePrimarySun() {
+    const SceneDocument before = document_;
+    const EntityId existing = SunController::primarySunEntity(document_);
+    const EntityId sun = SunController::ensurePrimarySun(document_);
+    if (!sun.valid()) {
+        return false;
+    }
+    const bool createdOrChanged = !existing.valid() || existing != sun;
+    if (createdOrChanged) {
+        pushDocumentSnapshot(before, SceneUpdateKind::LightOnly, existing.valid() ? "Set Primary Sun" : "Create Primary Sun");
+    }
+    return createdOrChanged;
+}
+
+EntityId SceneOperations::mergeSceneAsset(const SceneAsset& scene, const std::string& rootName) {
+    if (scene.nodes.empty() && scene.lights.empty()) {
+        return {};
+    }
+
+    const SceneDocument before = document_;
+    const bool hadActiveCamera = document_.activeCamera().valid();
+    bool assignedMergedCamera = false;
+
+    EntityId importRoot = document_.registry().createEntity(rootName.empty() ? "Merged Scene" : rootName);
+    if (!importRoot.valid()) {
+        return {};
+    }
+
+    std::vector<EntityId> nodeEntities(scene.nodes.size());
+    for (uint32_t i = 0; i < scene.nodes.size(); ++i) {
+        const SceneNodeAsset& node = scene.nodes[i];
+        const EntityId id = document_.registry().createEntity(node.name.empty() ? "Merged Node " + std::to_string(i) : node.name);
+        nodeEntities[i] = id;
+
+        Entity* entity = document_.registry().entity(id);
+        if (entity == nullptr) {
+            continue;
+        }
+        entity->transform.position = translationFromMatrix(node.transform);
+        entity->transform.rotationEuler = eulerFromMatrix(node.transform);
+        entity->transform.scale = scaleFromMatrix(node.transform);
+        entity->transform.dirty = true;
+        entity->visible = node.visible;
+
+        if (node.mesh.valid()) {
+            MeshRenderer renderer;
+            renderer.mesh = node.mesh;
+            renderer.visible = node.visible;
+            renderer.castShadow = node.castShadow;
+            renderer.visibleToCamera = node.visibleToCamera;
+            entity->meshRenderer = renderer;
+        }
+        if (node.hasCamera) {
+            Camera camera;
+            camera.verticalFovRadians = node.cameraYfov;
+            camera.nearPlane = node.cameraNear;
+            camera.farPlane = node.cameraFar;
+            camera.active = !hadActiveCamera && !assignedMergedCamera;
+            entity->camera = camera;
+            if (camera.active) {
+                document_.setActiveCamera(id);
+                assignedMergedCamera = true;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < scene.nodes.size(); ++i) {
+        Entity* entity = document_.registry().entity(nodeEntities[i]);
+        if (entity == nullptr) {
+            continue;
+        }
+        const SceneNodeAsset& node = scene.nodes[i];
+        EntityId parentId = importRoot;
+        if (node.parent >= 0 && static_cast<uint32_t>(node.parent) < nodeEntities.size()) {
+            parentId = nodeEntities[static_cast<uint32_t>(node.parent)];
+        }
+        entity->parent = parentId;
+        if (Entity* parentEntity = document_.registry().entity(parentId)) {
+            parentEntity->children.push_back(entity->id);
+        }
+    }
+
+    for (uint32_t i = 0; i < scene.lights.size(); ++i) {
+        const SceneLightAsset& source = scene.lights[i];
+        EntityId id = source.nodeIndex >= 0 && static_cast<uint32_t>(source.nodeIndex) < nodeEntities.size()
+            ? nodeEntities[static_cast<uint32_t>(source.nodeIndex)]
+            : document_.registry().createEntity("Merged Light " + std::to_string(i));
+        Entity* entity = document_.registry().entity(id);
+        if (entity == nullptr) {
+            continue;
+        }
+        if (source.nodeIndex < 0) {
+            entity->parent = importRoot;
+            if (Entity* rootEntity = document_.registry().entity(importRoot)) {
+                rootEntity->children.push_back(id);
+            }
+        }
+        entity->transform.position = translationFromMatrix(source.transform);
+        entity->transform.rotationEuler = eulerFromMatrix(source.transform);
+        entity->transform.scale = scaleFromMatrix(source.transform);
+
+        Light light;
+        light.type = static_cast<LightType>(std::min(source.type, 3u));
+        light.color = source.color;
+        light.intensity = source.intensity;
+        light.sizeOrRadius = source.sizeOrRadius;
+        light.enabled = source.enabled;
+        entity->light = light;
+    }
+
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::EntityCreated, importRoot, {}, SceneUpdateKind::TopologyChanged});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::TopologyChanged, "Merge Scene"));
+    }
+    return importRoot;
+}
+
+PrefabInstance SceneOperations::placePrefab(
+    const PrefabAsset& prefab,
+    const PrefabRuntimeBindings* bindings,
+    EntityId parent) {
+    PrefabInstance instance;
+    if (prefab.guid.empty()) {
+        return instance;
+    }
+
+    const SceneDocument before = document_;
+    instance.prefabGuid = prefab.guid;
+
+    EntityId root = document_.registry().createEntity(prefab.name.empty() ? "Prefab Instance" : prefab.name);
+    instance.instanceRoot = root;
+    if (Entity* rootEntity = document_.registry().entity(root)) {
+        rootEntity->parent = parent;
+        if (Entity* parentEntity = document_.registry().entity(parent)) {
+            parentEntity->children.push_back(root);
+        }
+        instance.generatedEntityUuids.push_back(rootEntity->uuid);
+    }
+
+    std::vector<EntityId> nodeEntities(prefab.nodes.size());
+    for (uint32_t i = 0; i < prefab.nodes.size(); ++i) {
+        const PrefabNodeAsset& node = prefab.nodes[i];
+        EntityId id = document_.registry().createEntity(node.name.empty() ? "Prefab Node " + std::to_string(i) : node.name);
+        nodeEntities[i] = id;
+        if (Entity* entity = document_.registry().entity(id)) {
+            instance.generatedEntityUuids.push_back(entity->uuid);
+        }
+    }
+
+    for (uint32_t i = 0; i < prefab.nodes.size(); ++i) {
+        Entity* entity = document_.registry().entity(nodeEntities[i]);
+        if (entity == nullptr) {
+            continue;
+        }
+        const PrefabNodeAsset& node = prefab.nodes[i];
+        EntityId parentId = root;
+        if (node.parent >= 0 && static_cast<uint32_t>(node.parent) < nodeEntities.size()) {
+            parentId = nodeEntities[static_cast<uint32_t>(node.parent)];
+        }
+        entity->parent = parentId;
+        if (Entity* parentEntity = document_.registry().entity(parentId)) {
+            parentEntity->children.push_back(entity->id);
+        }
+        if (!node.meshGuid.empty()) {
+            MeshRenderer renderer;
+            renderer.meshGuid = node.meshGuid;
+            if (bindings != nullptr) {
+                const auto meshIt = bindings->meshes.find(node.meshGuid);
+                if (meshIt != bindings->meshes.end()) {
+                    renderer.mesh = meshIt->second;
+                }
+            }
+            renderer.materialSlots.reserve(node.materialGuids.size());
+            for (size_t slotIndex = 0; slotIndex < node.materialGuids.size(); ++slotIndex) {
+                MaterialSlot slot;
+                slot.name = "Primitive " + std::to_string(slotIndex);
+                slot.materialGuid = node.materialGuids[slotIndex];
+                if (bindings != nullptr) {
+                    const auto materialIt = bindings->materials.find(slot.materialGuid);
+                    if (materialIt != bindings->materials.end()) {
+                        slot.material = materialIt->second;
+                    }
+                }
+                renderer.materialSlots.push_back(std::move(slot));
+            }
+            entity->meshRenderer = std::move(renderer);
+        }
+    }
+
+    document_.addPrefabInstance(instance);
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::EntityCreated, root, parent, SceneUpdateKind::TopologyChanged});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::TopologyChanged, "Place Prefab"));
+    }
+    return instance;
 }
 
 bool SceneOperations::setLight(EntityId id, const Light& oldLight, const Light& newLight) {

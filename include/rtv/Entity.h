@@ -23,6 +23,12 @@ struct Entity {
     std::optional<Light> light;
     std::optional<Sun> sun;
     std::optional<Camera> camera;
+    std::optional<EnvironmentLight> environmentLight;
+    std::optional<SkyAtmosphere> skyAtmosphere;
+    std::optional<HeightFog> heightFog;
+    std::optional<VolumetricCloud> volumetricCloud;
+    std::optional<PostProcessVolume> postProcessVolume;
+    std::optional<CameraPostProcess> cameraPostProcess;
 };
 
 } // namespace rtv
