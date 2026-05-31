@@ -17,12 +17,13 @@ $srcPaths = @((Join-Path $RepoRoot 'include'), (Join-Path $RepoRoot 'src'))
 $report = @()
 foreach ($field in $fields) {
     $pattern = "requests\.$field|\.$field\s*=|$field\.has_value\(\)"
-    $hits = & rg -n -S $pattern @srcPaths 2>$null
+    $hits = Get-TextMatches -RepoRoot $RepoRoot -Pattern $pattern -Paths @('include','src')
     $ui = @($hits | Where-Object { $_ -like '*Panel*' -or $_ -like '*Dockspace*' -or $_ -like '*UiOverlay*' -or $_ -like '*EditorLayer*' })
     $app = @($hits | Where-Object { $_ -like '*Application.cpp*' })
     $report += [pscustomobject]@{ field=$field; matchCount=@($hits).Count; uiMatchCount=$ui.Count; applicationMatchCount=$app.Count; hasApplicationHandler=($app.Count -gt 0); matches=@($hits) }
 }
-$unhandled = @($report | Where-Object { -not $_.hasApplicationHandler -and $_.field -notin @('settings') })
+$uiOnlyFields = @('resetLayout', 'saveLayout', 'showProjectManager')
+$unhandled = @($report | Where-Object { -not $_.hasApplicationHandler -and $_.field -notin (@('settings') + $uiOnlyFields) })
 $results = @(
     (New-ToolResult -Name 'EditorRequests fields parsed' -Passed ($fields.Count -gt 0) -Message ("fields={0}" -f $fields.Count) -Details $report),
     (New-ToolResult -Name 'Fields have Application handlers' -Passed ($unhandled.Count -eq 0) -Message ("unhandled={0}" -f ($unhandled.field -join ', ')) -Details $unhandled)

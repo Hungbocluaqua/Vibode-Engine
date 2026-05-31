@@ -342,7 +342,7 @@ void drawAxesIndicator(const EditorRuntimeState& state, const CameraController& 
 
 void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    if (ImGui::Begin("Viewport")) {
+    if (ImGui::Begin("Scene")) {
         focused_ = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         hovered_ = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
         state.viewport.focused = focused_;
@@ -386,13 +386,16 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         bool gizmoHoveredOrUsing = false;
 
         if (focused_ && !state.viewport.mouseCaptureActive && !ImGui::GetIO().WantTextInput) {
-            if (ImGui::IsKeyPressed(ImGuiKey_T)) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Q)) {
+                transformGizmoMode_ = -1;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_W) || ImGui::IsKeyPressed(ImGuiKey_T)) {
                 transformGizmoMode_ = 0;
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_R)) {
+            if (ImGui::IsKeyPressed(ImGuiKey_E)) {
                 transformGizmoMode_ = 1;
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_S)) {
+            if (ImGui::IsKeyPressed(ImGuiKey_R) || ImGui::IsKeyPressed(ImGuiKey_S)) {
                 transformGizmoMode_ = 2;
             }
             if (ImGui::IsKeyPressed(ImGuiKey_L)) {
@@ -407,17 +410,17 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                               : gpuTotal < 33.0f ? IM_COL32(240, 220, 100, 255)
                               : IM_COL32(240, 100, 100, 255);
 
-        const int numHudLines = 6;
-        const float hudLineH = 22.0f;
-        const float hudPad = 8.0f;
-        const float hudW = 360.0f;
+        const int numHudLines = 4;
+        const float hudLineH = 18.0f;
+        const float hudPad = 6.0f;
+        const float hudW = 470.0f;
         const float hudH = hudPad * 2.0f + hudLineH * static_cast<float>(numHudLines);
-        const float hudX = imagePos.x + 12.0f;
-        const float hudY = imagePos.y + 12.0f;
+        const float hudX = imagePos.x + std::max(8.0f, avail.x - hudW - 10.0f);
+        const float hudY = imagePos.y + 10.0f;
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(ImVec2(hudX, hudY), ImVec2(hudX + hudW, hudY + hudH),
-            IM_COL32(0, 0, 0, 160), 6.0f);
+            IM_COL32(0, 0, 0, 145), 4.0f);
 
         auto hudText = [&](int line, const char* text, ImU32 color = IM_COL32(200, 200, 200, 255)) {
             dl->AddText(ImVec2(hudX + hudPad, hudY + hudPad + hudLineH * static_cast<float>(line)),
@@ -426,20 +429,24 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
 
         std::ostringstream perfFmt;
         perfFmt << std::fixed << std::setprecision(2);
-        perfFmt << "GPU: " << gpuTotal << " ms  (trace " << timings.pathTraceMs
-                << "  denoise " << timings.denoiserMs
-                << "  TAA " << timings.taaMs
-                << "  tone " << timings.toneMapMs << ")";
+        perfFmt << "CPU " << state.cpuFrameMs << " ms  GPU " << gpuTotal << " ms  pt "
+                << state.renderer.sampleCount() << "/" << settings.accumulationLimit;
         hudText(0, perfFmt.str().c_str(), perfColor);
 
-        hudText(1, ("Samples: " + std::to_string(state.renderer.sampleCount())).c_str());
+        std::ostringstream modeFmt;
+        modeFmt << rendererDebugViewName(settings.debugView)
+                << "  " << extent.width << "x" << extent.height
+                << " -> " << state.viewport.displayExtent.width << "x" << state.viewport.displayExtent.height
+                << "  scale " << std::fixed << std::setprecision(2) << settings.renderResolutionScale;
+        hudText(1, modeFmt.str().c_str(),
+            settings.debugView == RendererDebugView::Beauty ? IM_COL32(180, 200, 230, 255) : IM_COL32(240, 180, 100, 255));
 
         if (state.viewport.mouseCaptureActive) {
             hudText(2, "Moving - accumulation paused", IM_COL32(255, 200, 60, 255));
         } else {
-            const char* debugViewName = rendererDebugViewName(settings.debugView);
-            hudText(2, debugViewName,
-                settings.debugView == RendererDebugView::Beauty ? IM_COL32(180, 200, 230, 255) : IM_COL32(240, 180, 100, 255));
+            std::ostringstream resetFmt;
+            resetFmt << "Reset: " << accumulationResetReasonName(state.renderer.lastAccumulationResetReason());
+            hudText(2, resetFmt.str().c_str(), IM_COL32(180, 180, 180, 220));
         }
 
         std::ostringstream statusFmt;
@@ -447,36 +454,10 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         else statusFmt << "Denoiser: OFF  ";
         if (settings.taaEnabled) statusFmt << "TAA: ON";
         else statusFmt << "TAA: OFF";
+        if (state.camera != nullptr) statusFmt << "  Speed " << std::fixed << std::setprecision(1) << state.camera->moveSpeed();
         hudText(3, statusFmt.str().c_str(), IM_COL32(150, 200, 255, 200));
 
-        {
-            std::ostringstream resFmt;
-            resFmt << "render " << extent.width << "x" << extent.height
-                   << "  display " << state.viewport.displayExtent.width << "x" << state.viewport.displayExtent.height
-                   << "  scale " << std::fixed << std::setprecision(2) << settings.renderResolutionScale
-                   << "  reset:" << accumulationResetReasonName(state.renderer.lastAccumulationResetReason());
-            hudText(4, resFmt.str().c_str(), IM_COL32(140, 140, 140, 220));
-        }
-
-        const uint32_t accumLimit = settings.accumulationLimit;
-        if (accumLimit > 0u) {
-            std::ostringstream accumFmt;
-            const float accumProgress = static_cast<float>(state.renderer.sampleCount()) / static_cast<float>(accumLimit);
-            accumFmt << "Accumulation: " << static_cast<int>(accumProgress * 100.0f) << "%";
-            hudText(5, accumFmt.str().c_str(), IM_COL32(200, 220, 200, 220));
-        } else {
-            const uint32_t currentSamples = state.renderer.sampleCount();
-            bool flashReset = lastSampleCount_ > 0u && currentSamples <= lastSampleCount_;
-            lastSampleCount_ = currentSamples;
-            if (flashReset) {
-                const char* reason = accumulationResetReasonName(state.renderer.lastAccumulationResetReason());
-                std::ostringstream resetFmt;
-                resetFmt << "Reset: " << reason;
-                hudText(5, resetFmt.str().c_str(), IM_COL32(255, 140, 80, 250));
-            } else {
-                hudText(5, "", IM_COL32(0, 0, 0, 0));
-            }
-        }
+        lastSampleCount_ = state.renderer.sampleCount();
 
         drawSelectionOverlay(state, selection);
 
@@ -490,21 +471,31 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             if (entity != nullptr && !entity->locked && state.camera != nullptr) {
                 ImGui::SetCursorScreenPos(ImVec2(imagePos.x + 370.0f, imagePos.y + 10.0f));
                 ImGui::BeginGroup();
-                if (ImGui::RadioButton("T", transformGizmoMode_ == 0)) {
+                if (ImGui::RadioButton("Q", transformGizmoMode_ < 0)) {
+                    transformGizmoMode_ = -1;
+                }
+                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Select"); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("W", transformGizmoMode_ == 0)) {
                     transformGizmoMode_ = 0;
                 }
+                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Move"); }
                 ImGui::SameLine();
-                if (ImGui::RadioButton("R", transformGizmoMode_ == 1)) {
+                if (ImGui::RadioButton("E", transformGizmoMode_ == 1)) {
                     transformGizmoMode_ = 1;
                 }
+                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Rotate"); }
                 ImGui::SameLine();
-                if (ImGui::RadioButton("S", transformGizmoMode_ == 2)) {
+                if (ImGui::RadioButton("R", transformGizmoMode_ == 2)) {
                     transformGizmoMode_ = 2;
                 }
+                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Scale"); }
                 ImGui::SameLine();
                 ImGui::Checkbox("Local", &localGizmoMode_);
+                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Toggle local/world gizmo space"); }
                 ImGui::SameLine();
                 ImGui::Checkbox("Snap", &snap_.enabled);
+                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Toggle transform snapping"); }
                 if (snap_.enabled) {
                     ImGui::SameLine();
                     if (transformGizmoMode_ == 0) {
@@ -518,85 +509,93 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                         ImGui::DragFloat("##snapScale", &snap_.scale, 0.01f, 0.001f, 10.0f, "%.2f");
                     }
                 }
+                ImGui::SameLine();
+                ImGui::Checkbox("Grid", &showGrid_);
+                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Toggle grid overlay (G)"); }
+                ImGui::SameLine();
+                ImGui::Checkbox("Axes", &showAxes_);
+                if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Toggle axes overlay"); }
                 ImGui::EndGroup();
 
-                const glm::mat4 view = editorViewMatrix(*state.camera);
-                const glm::mat4 projection = editorProjectionMatrix(
-                    activeCameraFov(*state.sceneDocument),
-                    viewportAspect(state));
+                if (transformGizmoMode_ >= 0) {
+                    const glm::mat4 view = editorViewMatrix(*state.camera);
+                    const glm::mat4 projection = editorProjectionMatrix(
+                        activeCameraFov(*state.sceneDocument),
+                        viewportAspect(state));
 
-                glm::mat4 world = entityWorldMatrix(state.sceneDocument->registry(), *entity);
-                const ImGuizmo::OPERATION operation = transformGizmoMode_ == 0
-                    ? ImGuizmo::TRANSLATE
-                    : (transformGizmoMode_ == 1 ? ImGuizmo::ROTATE : ImGuizmo::SCALE);
-                const glm::mat4 previousWorld = world;
-                ImGuizmo::BeginFrame();
-                ImGuizmo::SetOrthographic(false);
-                ImGuizmo::SetDrawlist(dl);
-                ImGuizmo::SetRect(state.viewport.imageOrigin.x, state.viewport.imageOrigin.y, state.viewport.imageSize.x, state.viewport.imageSize.y);
-                float snapValues[3] = {};
-                if (snap_.enabled) {
-                    const float value = transformGizmoMode_ == 0
-                        ? snap_.translation
-                        : (transformGizmoMode_ == 1 ? snap_.rotation : snap_.scale);
-                    snapValues[0] = value;
-                    snapValues[1] = value;
-                    snapValues[2] = value;
-                }
-                const bool manipulated = ImGuizmo::Manipulate(
-                    glm::value_ptr(view),
-                    glm::value_ptr(projection),
-                    operation,
-                    localGizmoMode_ ? ImGuizmo::LOCAL : ImGuizmo::WORLD,
-                    glm::value_ptr(world),
-                    nullptr,
-                    snap_.enabled ? snapValues : nullptr);
-                const bool isOver = ImGuizmo::IsOver();
-                const bool isUsing = ImGuizmo::IsUsing();
-                gizmoHoveredOrUsing = isOver || isUsing;
+                    glm::mat4 world = entityWorldMatrix(state.sceneDocument->registry(), *entity);
+                    const ImGuizmo::OPERATION operation = transformGizmoMode_ == 0
+                        ? ImGuizmo::TRANSLATE
+                        : (transformGizmoMode_ == 1 ? ImGuizmo::ROTATE : ImGuizmo::SCALE);
+                    const glm::mat4 previousWorld = world;
+                    ImGuizmo::BeginFrame();
+                    ImGuizmo::SetOrthographic(false);
+                    ImGuizmo::SetDrawlist(dl);
+                    ImGuizmo::SetRect(state.viewport.imageOrigin.x, state.viewport.imageOrigin.y, state.viewport.imageSize.x, state.viewport.imageSize.y);
+                    float snapValues[3] = {};
+                    if (snap_.enabled) {
+                        const float value = transformGizmoMode_ == 0
+                            ? snap_.translation
+                            : (transformGizmoMode_ == 1 ? snap_.rotation : snap_.scale);
+                        snapValues[0] = value;
+                        snapValues[1] = value;
+                        snapValues[2] = value;
+                    }
+                    const bool manipulated = ImGuizmo::Manipulate(
+                        glm::value_ptr(view),
+                        glm::value_ptr(projection),
+                        operation,
+                        localGizmoMode_ ? ImGuizmo::LOCAL : ImGuizmo::WORLD,
+                        glm::value_ptr(world),
+                        nullptr,
+                        snap_.enabled ? snapValues : nullptr);
+                    const bool isOver = ImGuizmo::IsOver();
+                    const bool isUsing = ImGuizmo::IsUsing();
+                    gizmoHoveredOrUsing = isOver || isUsing;
 
-                if (isUsing && gizmoState_ == GizmoInteractionState::Idle) {
-                    gizmoDragActive_ = true;
-                    gizmoDragEntity_ = entity->id;
-                    gizmoDragOriginal_ = entity->transform;
-                }
+                    if (isUsing && gizmoState_ == GizmoInteractionState::Idle) {
+                        gizmoDragActive_ = true;
+                        gizmoDragEntity_ = entity->id;
+                        gizmoDragOriginal_ = entity->transform;
+                    }
 
-                if (manipulated && world != previousWorld) {
-                    const glm::mat4 local = glm::inverse(parentWorldMatrix(state.sceneDocument->registry(), *entity)) * world;
-                    writeLocalTransformFromMatrix(*entity, local);
-                    const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *entity);
-                    state.sceneDocument->markDirty(updateKind);
-                    requests.sceneUpdate = updateKind;
-                    requests.previewEntityTransform = EditorEntityTransformPreview{
-                        .entity = entity->id,
-                        .transform = entity->transform,
-                        .updateKind = updateKind,
-                    };
-                }
+                    if (manipulated && world != previousWorld) {
+                        const glm::mat4 local = glm::inverse(parentWorldMatrix(state.sceneDocument->registry(), *entity)) * world;
+                        writeLocalTransformFromMatrix(*entity, local);
+                        const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *entity);
+                        state.sceneDocument->markDirty(updateKind);
+                        requests.sceneUpdate = updateKind;
+                        requests.previewEntityTransform = EditorEntityTransformPreview{
+                            .entity = entity->id,
+                            .transform = entity->transform,
+                            .updateKind = updateKind,
+                        };
+                    }
 
-                updateGizmoState(isOver, isUsing, transformGizmoMode_);
+                    updateGizmoState(isOver, isUsing, transformGizmoMode_);
 
-                if (isUsing) {
-                    const char* label = transformGizmoMode_ == 0
-                        ? "Moving selection"
-                        : (transformGizmoMode_ == 1 ? "Rotating selection" : "Scaling selection");
-                    const ImVec2 textSize = ImGui::CalcTextSize(label);
-                    const ImVec2 labelPos(
-                        state.viewport.imageOrigin.x + state.viewport.imageSize.x * 0.5f - textSize.x * 0.5f - 10.0f,
-                        state.viewport.imageOrigin.y + state.viewport.imageSize.y - 52.0f);
-                    dl->AddRectFilled(
-                        labelPos,
-                        ImVec2(labelPos.x + textSize.x + 20.0f, labelPos.y + textSize.y + 12.0f),
-                        IM_COL32(20, 24, 28, 210),
-                        5.0f);
-                    dl->AddText(
-                        ImVec2(labelPos.x + 10.0f, labelPos.y + 6.0f),
-                        IM_COL32(170, 215, 255, 255),
-                        label);
-                }
+                    if (isUsing) {
+                        const char* label = transformGizmoMode_ == 0
+                            ? "Moving selection"
+                            : (transformGizmoMode_ == 1 ? "Rotating selection" : "Scaling selection");
+                        const ImVec2 textSize = ImGui::CalcTextSize(label);
+                        const ImVec2 labelPos(
+                            state.viewport.imageOrigin.x + state.viewport.imageSize.x * 0.5f - textSize.x * 0.5f - 10.0f,
+                            state.viewport.imageOrigin.y + state.viewport.imageSize.y - 52.0f);
+                        dl->AddRectFilled(
+                            labelPos,
+                            ImVec2(labelPos.x + textSize.x + 20.0f, labelPos.y + textSize.y + 12.0f),
+                            IM_COL32(20, 24, 28, 210),
+                            5.0f);
+                        dl->AddText(
+                            ImVec2(labelPos.x + 10.0f, labelPos.y + 6.0f),
+                            IM_COL32(170, 215, 255, 255),
+                            label);
+                    }
 
-                if (!isUsing && gizmoDragActive_) {
-                    commitGizmoDrag(requests, *state.sceneDocument);
+                    if (!isUsing && gizmoDragActive_) {
+                        commitGizmoDrag(requests, *state.sceneDocument);
+                    }
                 }
             }
         }

@@ -104,6 +104,11 @@ private:
         Armed,
         Dragging,
     };
+    enum class DirtyScenePromptResult {
+        Save,
+        Discard,
+        Cancel,
+    };
     struct SunDragState {
         SunDragPhase phase = SunDragPhase::Idle;
         EntityId entity{};
@@ -139,6 +144,14 @@ private:
     void pollAsyncSceneLoad();
     void commitLoadedGltfScene(PendingSceneLoadResult&& result);
     void applyEditorRequests(const EditorRequests& requests, bool allowResourceRebuild);
+    [[nodiscard]] DirtyScenePromptResult promptDirtySceneBefore(std::string_view action) const;
+    [[nodiscard]] bool saveCurrentSceneForDirtyPrompt();
+    [[nodiscard]] bool confirmDestructiveSceneAction(std::string_view action);
+    [[nodiscard]] bool createProjectFromRequest(const CreateProjectRequest& request);
+    [[nodiscard]] bool openProjectFromFile(const std::filesystem::path& projectFile, bool promptForDirtyScene);
+    [[nodiscard]] bool closeCurrentProject();
+    [[nodiscard]] bool loadProjectStartupScene(const ProjectContext& project);
+    [[nodiscard]] bool writeDefaultProjectScene(const ProjectContext& project, std::string_view templateName);
     bool applyPendingSceneUpdate(bool allowResourceRebuild);
     void applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange);
     void reloadShadersFromEditor();
@@ -170,6 +183,9 @@ private:
     std::optional<std::filesystem::path> gltfPath_;
     std::optional<std::filesystem::path> hdrPath_;
     std::optional<std::filesystem::path> scenePath_;
+    bool sceneUnsavedDirty_ = false;
+    std::optional<ProjectContext> project_;
+    AssetRegistry assetRegistry_;
     std::optional<bool> denoiserOverride_;
     std::optional<RestirMode> restirModeOverride_;
     std::optional<RenderPreset> renderPresetOverride_;

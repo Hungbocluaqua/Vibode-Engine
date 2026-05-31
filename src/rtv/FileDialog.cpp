@@ -53,7 +53,7 @@ namespace {
 
 std::optional<std::filesystem::path> openGltfFileDialog() {
 #if defined(_WIN32)
-    return openFileDialog(L"Open glTF Scene", L"glTF scenes (*.gltf;*.glb)\0*.gltf;*.glb\0All files (*.*)\0*.*\0\0");
+    return openFileDialog(L"Import Scene as New Scene", L"glTF scenes (*.gltf;*.glb)\0*.gltf;*.glb\0All files (*.*)\0*.*\0\0");
 #else
     return std::nullopt;
 #endif
@@ -70,6 +70,14 @@ std::optional<std::filesystem::path> openHdrFileDialog() {
 std::optional<std::filesystem::path> openSceneJsonFileDialog() {
 #if defined(_WIN32)
     return openFileDialog(L"Open Level", L"RT Level (*.rtlevel;*.json)\0*.rtlevel;*.json\0All files (*.*)\0*.*\0\0");
+#else
+    return std::nullopt;
+#endif
+}
+
+std::optional<std::filesystem::path> openProjectFileDialog() {
+#if defined(_WIN32)
+    return openFileDialog(L"Open Project", L"RT Project (*.rtproject)\0*.rtproject\0All files (*.*)\0*.*\0\0");
 #else
     return std::nullopt;
 #endif

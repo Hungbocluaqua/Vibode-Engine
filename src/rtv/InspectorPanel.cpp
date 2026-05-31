@@ -65,7 +65,7 @@ void tooltip(const char* text) {
 } // namespace
 
 void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
-    if (!ImGui::Begin("Inspector / Properties")) {
+    if (!ImGui::Begin("Inspector")) {
         ImGui::End();
         return;
     }

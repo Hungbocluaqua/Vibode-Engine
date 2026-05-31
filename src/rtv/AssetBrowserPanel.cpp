@@ -34,15 +34,18 @@ void AssetBrowserPanel::loadFromPath(const std::filesystem::path& path, EditorRe
     for (char& c : ext) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
     if (ext == ".hdr" || ext == ".exr") {
         requests.loadHdr = path;
-        status_ = "Queued HDR load: " + path.string();
+        status_ = "Queued HDRI import/apply: " + path.string();
+    } else if (ext == ".rtlevel") {
+        requests.openScene = path;
+        status_ = "Queued scene open: " + path.string();
     } else {
-        requests.loadGltf = path;
-        status_ = "Queued glTF load: " + path.string();
+        requests.importSceneAsNewScene = path;
+        status_ = "Queued Import Scene as New Scene: " + path.string();
     }
 }
 
 void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
-    if (!ImGui::Begin("Asset Browser")) {
+    if (!ImGui::Begin("Content")) {
         ImGui::End();
         return;
     }
@@ -56,8 +59,33 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         path.copy(hdrPath_.data(), std::min(path.size(), hdrPath_.size() - 1));
     }
 
-    ImGui::SeparatorText("Load Assets");
-    ImGui::TextUnformatted("Scene");
+    ImGui::BeginGroup();
+    if (ImGui::Button("Add/Import")) {
+        if (auto path = openGltfFileDialog()) {
+            setPathBuffer(gltfPath_, *path);
+            requests.importAsset = *path;
+            status_ = "Queued non-mutating Import Asset: " + path->string();
+        }
+    }
+    ImGui::SameLine();
+    static char filter[128]{};
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::InputTextWithHint("##contentFilter", "Search Content", filter, sizeof(filter));
+    ImGui::SameLine();
+    if (ImGui::SmallButton("<")) {}
+    ImGui::SameLine();
+    if (ImGui::SmallButton(">")) {}
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh")) {
+        invalidateThumbnails();
+        status_ = "Content refreshed";
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("/ Content");
+    ImGui::EndGroup();
+
+    ImGui::SeparatorText("Scene Import / Compatibility");
+    ImGui::TextUnformatted("Import Scene as New Scene");
     ImGui::PushItemWidth(-190.0f);
     ImGui::InputTextWithHint("##gltfPath", "C:\\path\\to\\scene.glb", gltfPath_.data(), gltfPath_.size());
     ImGui::PopItemWidth();
@@ -65,16 +93,16 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
     if (ImGui::Button("Browse##gltf")) {
         if (auto path = openGltfFileDialog()) {
             setPathBuffer(gltfPath_, *path);
-            requests.loadGltf = *path;
-            status_ = "Queued glTF load: " + path->string();
+            requests.importSceneAsNewScene = *path;
+            status_ = "Queued Import Scene as New Scene: " + path->string();
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Load glTF")) {
+    if (ImGui::Button("Import Scene as New Scene")) {
         std::filesystem::path path{gltfPath_.data()};
         if (!path.empty()) {
-            requests.loadGltf = path;
-            status_ = "Queued glTF load: " + path.string();
+            requests.importSceneAsNewScene = path;
+            status_ = "Queued Import Scene as New Scene: " + path.string();
         }
     }
 
@@ -91,11 +119,11 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Load HDR")) {
+    if (ImGui::Button("Import HDRI")) {
         std::filesystem::path path{hdrPath_.data()};
         if (!path.empty()) {
             requests.loadHdr = path;
-            status_ = "Queued HDR load: " + path.string();
+            status_ = "Queued HDRI import/apply: " + path.string();
         }
     }
 
@@ -114,13 +142,19 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
     if (ImGui::Button("Browse##sceneJson")) {
         if (auto path = openSceneJsonFileDialog()) {
             setPathBuffer(scenePath_, *path);
-            requests.loadSceneJson = *path;
-            status_ = "Queued scene load: " + path->string();
+            requests.openScene = *path;
+            status_ = "Queued scene open: " + path->string();
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Save Level")) {
+    if (ImGui::Button("Save Scene")) {
         std::filesystem::path path{scenePath_.data()};
+        if (path.empty()) {
+            if (state.scenePath != nullptr && state.scenePath->has_value()) {
+                path = **state.scenePath;
+                setPathBuffer(scenePath_, path);
+            }
+        }
         if (path.empty()) {
             if (auto selected = saveSceneJsonFileDialog()) {
                 path = *selected;
@@ -128,16 +162,16 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
             }
         }
         if (!path.empty()) {
-            requests.saveSceneJson = path;
+            requests.saveScene = path;
             status_ = "Queued scene save: " + path.string();
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Load Level")) {
+    if (ImGui::Button("Open Scene")) {
         std::filesystem::path path{scenePath_.data()};
         if (!path.empty()) {
-            requests.loadSceneJson = path;
-            status_ = "Queued scene load: " + path.string();
+            requests.openScene = path;
+            status_ = "Queued scene open: " + path.string();
         }
     }
 
@@ -206,9 +240,49 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         }
     }
 
-    ImGui::SeparatorText("Loaded");
-    ImGui::Text("glTF: %s", state.gltfPath != nullptr && state.gltfPath->has_value() ? state.gltfPath->value().string().c_str() : "(fallback scene)");
-    ImGui::Text("HDR: %s", state.hdrPath != nullptr && state.hdrPath->has_value() ? state.hdrPath->value().string().c_str() : "(procedural)");
+    ImGui::SeparatorText("Details");
+    if (state.project != nullptr) {
+        ImGui::Text("Project: %s", state.project->name.c_str());
+        ImGui::Text("Content Root: %s", state.project->contentRoot.string().c_str());
+    } else {
+        ImGui::TextDisabled("No project open. Content is in compatibility mode.");
+    }
+    ImGui::Text("Scene: %s", state.scenePath != nullptr && state.scenePath->has_value() ? state.scenePath->value().string().c_str() : "Untitled / not saved");
+    ImGui::Text("Source scene import: %s", state.gltfPath != nullptr && state.gltfPath->has_value() ? state.gltfPath->value().string().c_str() : "(none)");
+    ImGui::Text("HDRI: %s", state.hdrPath != nullptr && state.hdrPath->has_value() ? state.hdrPath->value().string().c_str() : "(procedural)");
+
+    if (state.assetRegistry != nullptr) {
+        const AssetRegistry& registry = *state.assetRegistry;
+        ImGui::SeparatorText("Asset Registry");
+        ImGui::Text("Registry: %s%s",
+            registry.state().path.empty() ? "(none)" : registry.state().path.string().c_str(),
+            registry.dirty() ? " *" : "");
+        const auto& records = registry.records();
+        if (records.empty()) {
+            ImGui::TextDisabled("No registry records yet. Import Asset will populate this in the next milestone.");
+        } else if (ImGui::BeginTable("AssetRegistryRecords", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable)) {
+            ImGui::TableSetupColumn("Type");
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("GUID");
+            ImGui::TableSetupColumn("Source");
+            ImGui::TableSetupColumn("Status");
+            ImGui::TableHeadersRow();
+            for (const AssetRecord& record : records) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(assetTypeName(record.type));
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(record.displayName.empty() ? "(unnamed)" : record.displayName.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(record.guid.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(record.sourcePath.c_str());
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(assetImportStatusName(record.status));
+            }
+            ImGui::EndTable();
+        }
+    }
 
     if (state.importedScene != nullptr) {
         ImGui::Text("Scene nodes: %zu", state.importedScene->nodes.size());

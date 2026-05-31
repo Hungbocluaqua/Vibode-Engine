@@ -79,10 +79,29 @@ function Get-TextMatches {
     param([Parameter(Mandatory=$true)][string]$RepoRoot, [Parameter(Mandatory=$true)][string]$Pattern, [string[]]$Paths = @('include','src'))
     $resolved = @()
     foreach ($path in $Paths) { $resolved += (Join-Path $RepoRoot $path) }
-    $args = @('-n', '-S', $Pattern) + $resolved
-    $output = & rg @args 2>$null
-    if ($LASTEXITCODE -gt 1) { throw "rg failed for pattern '$Pattern'." }
-    return @($output)
+    $rg = Get-Command rg -ErrorAction SilentlyContinue
+    if ($null -ne $rg) {
+        $args = @('-n', '-S', $Pattern) + $resolved
+        $output = & $rg.Source @args 2>$null
+        if ($LASTEXITCODE -gt 1) { throw "rg failed for pattern '$Pattern'." }
+        return @($output)
+    }
+
+    $matches = New-Object System.Collections.Generic.List[string]
+    foreach ($root in $resolved) {
+        if (!(Test-Path -LiteralPath $root)) { continue }
+        $files = Get-ChildItem -LiteralPath $root -Recurse -File -Include *.h,*.hpp,*.cpp,*.cxx,*.cc,*.ps1,*.psm1,*.md -ErrorAction SilentlyContinue
+        foreach ($file in $files) {
+            $lineNumber = 0
+            foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
+                ++$lineNumber
+                if ([regex]::IsMatch($line, $Pattern)) {
+                    $matches.Add(("{0}:{1}:{2}" -f $file.FullName, $lineNumber, $line))
+                }
+            }
+        }
+    }
+    return @($matches)
 }
 
 function Get-EntityCountFromRtLevel {

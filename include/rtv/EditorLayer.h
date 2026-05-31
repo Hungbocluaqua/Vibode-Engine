@@ -14,6 +14,8 @@
 #include "rtv/SceneStatsPanel.h"
 #include "rtv/ViewportPanel.h"
 
+#include <array>
+
 namespace rtv {
 
 class EditorLayer {
@@ -29,6 +31,12 @@ public:
     [[nodiscard]] bool viewportHovered() const;
 
 private:
+    void drawProjectManager(EditorRuntimeState& state, EditorRequests& requests);
+    void drawRenderWorldSettingsPanel(EditorRuntimeState& state, EditorRequests& requests);
+    void drawTimelinePanel();
+    void drawLogPanel(const EditorRuntimeState& state);
+    void drawConsolePanel();
+
     EditorPanelVisibility visibility_{};
     EditorSelection selection_{};
     EditorDockspace dockspace_{};
@@ -43,6 +51,14 @@ private:
     GpuDiagnosticsPanel gpuDiagnosticsPanel_{};
     EditorPreferences editorPrefs_{};
     CameraBookmarkManager cameraBookmarks_{};
+    bool showProjectManager_ = true;
+    bool projectManagerDismissed_ = false;
+    std::array<char, 128> newProjectName_{};
+    std::array<char, 512> newProjectLocation_{};
+    std::array<char, 512> openProjectPath_{};
+    int newProjectTemplate_ = 1;
+    bool createDefaultScene_ = true;
+    bool createDefaultContentFolders_ = true;
 };
 
 } // namespace rtv

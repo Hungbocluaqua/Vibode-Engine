@@ -2,9 +2,31 @@
 
 ## Purpose
 
-This plan turns the current Vulkan renderer editor into a near-clone of the supplied dark Minitech/Unreal-style editor references and expands it into a real persistent level editor. It is written to be implementation-ready and should be read together with `docs/LEVEL_EDITOR_FEATURE_CHECKLIST.md`.
+This plan turns the current Vulkan renderer editor into a near-clone of the supplied dark Minitech/Unreal-style editor references and expands it into a real persistent level editor. It is written to be implementation-ready and should be read together with `docs/LEVEL_EDITOR_FEATURE_CHECKLIST.md` and `docs/EDITOR_REFERENCE_SCREENSHOT_INSPECTION.md`.
 
 The main outcome is an editor that looks like the references, keeps the current renderer/debug tooling intact, and behaves like a level editor rather than a scene-loader UI.
+
+## Implementation Status
+
+Last updated: 2026-05-31
+
+Completed in the current implementation pass:
+
+- Step 1 - Rename Current glTF Replacement To Import Scene As New Scene.
+- Step 3 - Explicit Scene File Requests.
+- Step 4 - Near-Clone Shell, Menus, Dock Layout, And Theme.
+- Step 6 - Project Manager MVP.
+- Step 7 - Project Asset Registry Skeleton.
+
+Partially completed in the current implementation pass:
+
+- Step 2 - Dirty Scene State, Scene Name, And Replacement Prompt: editor-origin New Scene, Open Scene, Import Scene as New Scene, dropped glTF, Exit, and Project Close now use Save / Do Not Save / Cancel protection. Scene-tab close remains pending because closable scene tabs are not implemented yet.
+- Step 5 - Viewport Toolbar, Status Strip, And Shortcuts: the viewport is renamed to `Scene`, the HUD is now a compact status strip, and Q/W/E/R/G shortcuts plus compact toolbar controls are present. Frame-selected and F1-F8 debug-view registry work remains pending the command/keybinding milestone.
+
+Not completed yet:
+
+- Project settings details UI, prefab assets, import-as-asset, import-and-place, drag/drop prefab placement, merge scene, and GUID-backed `.rtlevel` migration.
+- Autosave/recovery, full command registry, keybinding registry, persistent Log/Console models, and Timeline keyframe persistence.
 
 ## Non-Negotiable Constraints
 
@@ -21,10 +43,21 @@ The editor should visually and functionally match the screenshots as closely as 
 
 - Dark docked shell with dense panels, compact tabs, flat surfaces, small radii, blue selected rows, and restrained separators.
 - Top menu bar: `File | Create | Engine | Window | Render | Layout`.
+- Active scene name shown in the top bar between separators, with a dirty marker when the scene has unsaved changes.
+- Compact top-right performance readout with FPS and frame time in milliseconds.
 - Center `Scene` viewport with rendered image, compact toolbar, and compact status readout.
 - Right side: `Hierarchy` and `Render World Settings` tabs above `Inspector`.
 - Bottom: `Content`, `Timeline`, and `Log` tabs.
+- `Content` browser uses a folder tree, file/asset list, and details/preview pane with compact breadcrumb navigation.
+- `Inspector` uses component-specific property layouts for Transform, Light, Sun Light, Camera, camera post-process, mesh/material, and authored world settings.
 - Technical tools remain available but do not dominate the default level-editing workspace.
+
+Reference interpretation rules:
+
+- Use `docs/EDITOR_REFERENCE_SCREENSHOT_INSPECTION.md` as the concrete visual reference for density, panel structure, status placement, Content browser layout, and component inspector groupings.
+- Keep the canonical menu order as `File | Create | Engine | Window | Render | Layout` even though one reference screenshot shows `Render` before `Window`.
+- Treat the screenshots as workflow references, not as a requirement to preserve local absolute paths or Minitech-specific asset names.
+- If hierarchy highlight and Inspector active entity appear to disagree, treat that as a selection-state risk to fix or explicitly model through separate hovered, selected, and active-editable entities.
 
 ## Phase 1 - Project Manager MVP
 
@@ -193,12 +226,15 @@ Store project-relative paths inside `.rtproject`, `.rtlevel`, and `AssetRegistry
 
 - Update the global ImGui style used by the editor: very dark background/panels, compact padding/spacing, small tab/frame rounding, blue accent selection, and subtle borders.
 - Avoid a one-color palette. Keep the UI mostly neutral dark with blue accents and small amber/red/green status colors.
+- Match the reference density: low vertical padding, compact rows, thin separators, icon-first controls, and restrained contrast between panel backgrounds.
 
 ### Dock Layout
 
 - Rebuild the default dock layout: center `Scene`, right top `Hierarchy` and `Render World Settings`, right bottom `Inspector`, bottom `Content`, `Timeline`, and `Log`.
 - Keep `Render Settings`, `Debug / Profiler`, `Scene Stats`, `GPU Diagnostics`, `Material Editor`, and `Console` available from menus.
 - Save/load/reset layout behavior must continue to work.
+- Keep `Content`, `Timeline`, and `Log` as bottom tabs even when Timeline and Log are initially thin shells.
+- The bottom `Content` panel should be tall enough for a three-pane browser and should not collapse into a single file picker layout.
 
 ### Panel Renames
 
@@ -217,6 +253,8 @@ Store project-relative paths inside `.rtproject`, `.rtlevel`, and `AssetRegistry
 - `Window` toggles all panels.
 - `Render` contains reset accumulation, denoiser toggle, debug view controls, view mode, quality preset, and technical render settings access.
 - `Layout` contains save layout, reset layout, workspaces, UI scale shell, and theme shell.
+- Show the active scene title in the top bar beside the menu strip, matching the reference style of `| Untitled Scene |`, `| sponza-intel |`, or the current scene name.
+- Add or preserve a compact window-level FPS/frame-time readout at the far right of the title/menu area.
 
 ## Phase 3 - Viewport UX
 
@@ -224,17 +262,21 @@ Store project-relative paths inside `.rtproject`, `.rtlevel`, and `AssetRegistry
 
 - Rename the viewport window to `Scene`.
 - Preserve existing renderer image sizing, desired render extent, viewport mouse state, picking, selected instance ID, accumulation reset, and ImGuizmo behavior.
+- Keep the viewport primarily image-driven; debug and status overlays must be compact enough not to obscure path-traced content.
 
 ### Toolbar
 
 - Add a compact top-left toolbar inside the viewport with Select, Move, Rotate, Scale, Local/World, Snap, Grid, Axes, View Settings, Stats, and Draw Debug.
 - Use existing transform gizmo mode, local/world mode, snap settings, grid toggle, and axes toggle state.
 - Use short icon-like text labels if no icon font is available. Tooltips must describe each button.
+- Keep light and transform gizmos visible on top of rendered content, including sun/area-light handles when those entities are selected.
 
 ### Status Strip
 
 - Replace the large top-left HUD with a compact top-right status strip showing CPU frame ms, GPU frame ms, samples, accumulation limit, debug/view mode, render/display resolution, render scale, denoiser/TAA state, last accumulation reset reason, and camera speed.
 - Keep warning colors for slow GPU frames and accumulation resets.
+- Preserve a compact path tracing progress string similar to `pt 219/256 27.890` from the references.
+- Keep `View Settings`, `Stats`, and `Draw Debug` as always-visible compact viewport actions.
 
 ### Shortcuts
 
@@ -249,6 +291,8 @@ Store project-relative paths inside `.rtproject`, `.rtlevel`, and `AssetRegistry
 - Preserve existing hierarchy behavior: select, multi-select, range select, reveal selected, rename, duplicate, delete, create child, detach parent, drag-drop reparent, material drop, and focus in viewport.
 - Keep entity visibility and lock as compact icon-like controls with tooltips.
 - Keep parent/child hierarchy editing backed by existing scene operations.
+- Support large imported roots and repeated imported names without losing readability; examples from the references include Sponza roots, Quixel canyon roots, repeated `exterior1` entries, and generated glTF roots.
+- Keep hierarchy selection synchronized with the viewport and Inspector active entity, or explicitly distinguish hover, selection, and active editable entity in UI state.
 
 ### Inspector
 
@@ -256,6 +300,10 @@ Store project-relative paths inside `.rtproject`, `.rtlevel`, and `AssetRegistry
 - Component sections: Transform, Mesh Renderer, Material Slots, Material, Light, Primary Sun, Camera, and Add Component.
 - Preserve current edit requests for transforms, cameras, lights, sun, mesh renderer flags, material assignments, material edits, add component, duplicate, delete, and clear selection.
 - Do not bypass undo-backed scene operations where they already exist.
+- Transform rows should use compact three-column vector fields with reset/revert controls.
+- Light inspector layouts must be component-specific: area lights should expose shape/type, lumen units, IES profile, radius/cone controls, material source, visible-to-camera, and shadow toggles; sun lights should expose sun type, lux units, azimuth/elevation, color temperature, intensity, softness, and shadow bounce controls.
+- Camera inspector should expose physical camera and exposure controls such as near clip, exposure mode, aperture, ISO, shutter speed, film size, focal length, and grouped post-process controls.
+- Camera/post-process controls should use collapsible groups such as DOF, Bloom, Color correction, Vignetting, and Film grain.
 
 ## Phase 5 - Content Browser And Asset Database
 
@@ -265,6 +313,11 @@ Store project-relative paths inside `.rtproject`, `.rtlevel`, and `AssetRegistry
 - Required controls: Add/Import, search, breadcrumb, back, forward, refresh, folder tree, asset list/grid, and details panel.
 - Keep existing favorites and recent files, but present them as Content browser sections.
 - Keep current texture thumbnails where available.
+- Use the reference three-pane layout: left folder tree, middle file/asset list, right details/preview panel.
+- The header should include add/import controls, a compact filter field, navigation buttons, refresh, and breadcrumb path.
+- The details pane should clearly state when no supported file or asset is selected.
+- Browser rows should support folders, `.rtlevel` scene files, glTF/GLB, OBJ/MTL, texture files, HDR/EXR, material records, mesh records, and prefab records as the relevant milestones land.
+- Project-relative paths should be used for project assets, but the breadcrumb interaction should remain similar to the references.
 - Double-click/open behavior:
   - `.rtlevel` opens a scene.
   - `.gltf` and `.glb` use `Import Scene as New Scene` until import mode selection is implemented.
@@ -644,6 +697,8 @@ Properties:
 - visible sun disk
 - shadow softness
 - cloud shadow strength later
+- azimuth/elevation editor-facing controls derived from transform direction
+- optional shadow bounce and volumetric shadow bounce controls when supported by renderer settings
 
 Editor behavior:
 
@@ -653,6 +708,7 @@ Editor behavior:
 - Can be assigned as the scene primary sun.
 - Direction/intensity changes reset accumulation.
 - Sun/atmosphere binding changes rebuild atmosphere lighting when needed.
+- Inspector layout follows the reference Sun Light UI: `Sun` light type, `Illuminance (lux)` units, azimuth, elevation, color temperature, temperature, intensity, exposure multiplier, softness, cast surface shadows, cast volumetric shadows, and bounce controls where implemented.
 
 ### Point Light Component
 
@@ -724,12 +780,19 @@ Properties:
 - visible to camera
 - visible in reflections
 - importance sampling weight
+- material source for emissive/visible fixture representation
+- IES profile slot when the selected shape or renderer path supports it
 
 Renderer behavior:
 
 - Updates light buffer.
 - Rebuilds light sampling table when topology or area-light count changes.
 - Resets accumulation after meaningful light edits.
+
+Editor behavior:
+
+- Inspector layout follows the reference area-light UI: shape/type selector such as `Area Disk`, physical units such as `LuminousPower (lumen)`, IES profile field, color temperature toggle, RGB/color swatch controls, intensity, exposure multiplier, cone/radius controls when applicable, visible-to-camera toggle, material source field, and shadow toggles.
+- Selected area lights show a visible viewport gizmo/handle over the rendered image.
 
 ### Environment Light Component
 
@@ -825,6 +888,13 @@ Required components/data:
 - PostProcessVolumeComponent
 - CameraPostProcessComponent or CameraComponent post-process section
 - GlobalPostProcessSettings as scene-level defaults
+
+Camera inspector reference layout:
+
+- Camera section exposes near clip, exposure mode, aperture size, ISO, shutter speed, film size, and focal length.
+- Camera/post-process settings are grouped into collapsible sections such as DOF, Bloom, Color correction, Vignetting, and Film grain.
+- Motion blur, DOF, Bloom, and Film grain use enable checkboxes before detailed controls.
+- Physical camera controls and post-process controls may initially live on `CameraComponent`, but the ownership must be clear enough to migrate to `CameraPostProcessComponent` without changing saved scene meaning.
 
 ### PostProcessVolumeComponent
 
@@ -1314,7 +1384,7 @@ Recommended tooling:
 
 Validation gate: no behavior changes; baseline is known; pre-existing audit warnings are recorded before implementation starts.
 
-### Step 1 - Rename Current glTF Replacement To Import Scene As New Scene
+### Step 1 - Rename Current glTF Replacement To Import Scene As New Scene - Completed 2026-05-31
 
 Goal: make the existing destructive glTF workflow honest before adding real asset import.
 
@@ -1337,7 +1407,13 @@ Recommended tooling:
 
 Validation gate: glTF still replaces the active scene exactly as before; no asset registry files are created; headless `--gltf` is unchanged; visible stale labels such as `Open glTF` and `Load glTF` are removed or documented as compatibility-only internal labels.
 
-### Step 2 - Dirty Scene State, Scene Name, And Replacement Prompt
+Completion notes 2026-05-31:
+
+- Added `EditorRequests::importSceneAsNewScene` and routed it to the existing async glTF scene replacement path while preserving `loadGltf` as a compatibility alias.
+- Renamed visible UI actions/status strings from generic glTF loading to `Import Scene as New Scene`.
+- Kept headless `--gltf` untouched and did not create asset registry records from this replacement path.
+
+### Step 2 - Dirty Scene State, Scene Name, And Replacement Prompt - Partially Completed 2026-05-31
 
 Goal: prevent accidental scene loss before project/import workflows grow.
 
@@ -1363,7 +1439,15 @@ Recommended tooling:
 
 Validation gate: replacement operations prompt when dirty; Cancel leaves the current scene, selection, undo stack, pending async load, renderer resources, and current request state untouched; Save writes before continuing; Do Not Save continues without writing; the dirty marker clears only after a successful save or clean scene load.
 
-### Step 3 - Explicit Scene File Requests
+Partial completion notes 2026-05-31:
+
+- Added an editor dirty-scene protection flow for destructive editor-origin actions: New Scene, Open Scene, Import Scene as New Scene, dropped glTF/GLB, Exit, and Project Close.
+- Prompt choices are Save, Do Not Save, and Cancel. Save writes the current scene or opens Save Scene As for untitled scenes before continuing; Cancel leaves the active scene and pending async load state unchanged.
+- Added an editor-level unsaved scene flag so the dirty marker and destructive-action prompt are not lost when `SceneDocument::dirty()` is cleared by renderer update routing.
+- Active scene name and dirty marker remain visible in the top menu/title strip.
+- Remaining work: apply the same prompt to scene-tab close after closable scene tabs exist; expand dirty reasons into a persistent reason list.
+
+### Step 3 - Explicit Scene File Requests - Completed 2026-05-31
 
 Goal: separate scene file commands from import commands before adding projects.
 
@@ -1391,7 +1475,14 @@ Recommended tooling:
 
 Validation gate: Open Scene loads `.rtlevel`; Save Scene writes current scene path; Save Scene As updates current scene path; New Scene works after dirty prompt approval; direct no-project `.rtlevel` compatibility remains intact.
 
-### Step 4 - Near-Clone Shell, Menus, Dock Layout, And Theme
+Completion notes 2026-05-31:
+
+- Added explicit request fields for `newScene`, `openScene`, `saveScene`, `saveSceneAs`, `importAsset`, `importAndPlace`, `importSceneAsNewScene`, and `mergeScene`.
+- Routed Open Scene, Save Scene, Save Scene As, and New Scene through `Application` while keeping legacy request aliases during migration.
+- Added non-mutating skeleton notifications for Import Asset, Import and Place, and Merge Scene; these do not modify the active scene yet.
+- New Scene creates the current default editable scene scaffold and is gated by dirty-scene confirmation when needed.
+
+### Step 4 - Near-Clone Shell, Menus, Dock Layout, And Theme - Completed 2026-05-31
 
 Goal: align the editor shell with the target layout without changing scene data behavior.
 
@@ -1416,7 +1507,15 @@ Recommended tooling:
 
 Validation gate: Reset Layout restores target layout; existing renderer/debug/profiler panels remain reachable; viewport render extent still follows panel size; old dock labels are handled by layout version reset rather than leaving duplicate stale panels.
 
-### Step 5 - Viewport Toolbar, Status Strip, And Shortcuts
+Completion notes 2026-05-31:
+
+- Renamed visible panels to `Scene`, `Hierarchy`, `Inspector`, and `Content`.
+- Added `Render World Settings`, `Timeline`, `Log`, and `Console` visibility flags and functional shell panels.
+- Rebuilt the default dock layout around center `Scene`, right-side `Hierarchy` / `Render World Settings` plus `Inspector`, and bottom `Content` / `Timeline` / `Log` tabs.
+- Replaced the main menus with `File`, `Create`, `Engine`, `Window`, `Render`, and `Layout`, while keeping technical render/debug/profiler tools reachable.
+- Applied a denser dark ImGui theme with restrained blue accents and compact spacing.
+
+### Step 5 - Viewport Toolbar, Status Strip, And Shortcuts - Partially Completed 2026-05-31
 
 Goal: make the viewport usable as the primary level editing surface.
 
@@ -1441,7 +1540,15 @@ Recommended tooling:
 
 Validation gate: picking still selects; gizmo edits commit one undoable transform command; navigation shortcuts still work; status values match renderer state.
 
-### Step 6 - Project Manager MVP
+Partial completion notes 2026-05-31:
+
+- Renamed the viewport window to `Scene` and preserved renderer image sizing, picking, selected instance ID, accumulation reset state, and ImGuizmo path.
+- Replaced the larger HUD with a compact top-right status strip showing CPU/GPU frame timing, samples, accumulation limit, debug view, render/display resolution, render scale, denoiser/TAA state, reset reason, and camera speed.
+- Added compact toolbar controls for Select, Move, Rotate, Scale, Local/World, Snap, Grid, and Axes using short labels/tooltips.
+- Added Q/W/E/R/G shortcut behavior for tool/grid switching while preserving legacy T/R/S/L shortcuts.
+- Remaining work: frame-selected shortcut, F1-F8 debug-view registry, and shared command/keybinding routing remain pending Step 14.
+
+### Step 6 - Project Manager MVP - Completed 2026-05-31
 
 Goal: add project roots without breaking standalone `.rtlevel` editing.
 
@@ -1470,7 +1577,17 @@ Recommended tooling:
 
 Validation gate: new project creates the expected folders; opening a project sets all roots; recent projects survive restart; old `.rtlevel` opens without a project; Project Manager failures do not block headless execution.
 
-### Step 7 - Project Asset Registry Skeleton
+Completion notes 2026-05-31:
+
+- Added `ProjectContext`, `CreateProjectRequest`, `OpenProjectRequest`, `.rtproject` load/save, and project GUID generation.
+- New projects create the expected `Content`, `Scenes`, `Cache`, `Saved`, `Config`, `Build`, and initial `Content/AssetRegistry.json` paths.
+- Project Manager UI supports New Project, Open Project, Browse, Recent Projects, Remove from Recent, Open Last Project, and Continue Without Project compatibility mode.
+- Recent projects, last opened project, and Open Last Project preference are stored in global editor preferences.
+- Application can create, open, auto-open-last, save settings, and close projects while preserving no-project `.rtlevel` compatibility.
+- Project close is gated by the dirty-scene prompt and returns to no-project fallback scene state.
+- Remaining follow-up: detailed Project Settings sections are still deferred to the project settings/polish work.
+
+### Step 7 - Project Asset Registry Skeleton - Completed 2026-05-31
 
 Goal: create stable project asset identity before importing reusable assets.
 
@@ -1495,6 +1612,14 @@ Recommended tooling:
 ```
 
 Validation gate: registry survives restart; dirty state changes on record mutation; displaying registry records never mutates active scene; registry paths remain project-relative and normalized.
+
+Completion notes 2026-05-31:
+
+- Added `AssetGuid`, `AssetType`, `AssetRecord`, `AssetImportSettings`, `AssetDependency`, `AssetImportStatus`, registry dirty reasons, and `AssetRegistryState`.
+- Added project-local asset registry JSON load/save at `Project/Content/AssetRegistry.json`, including GUID, type, display name, source path, imported/cache/thumbnail paths, dependencies, references, hashes, timestamp, import settings, status, missing, and stale flags.
+- Project opening loads or creates the registry; project close and explicit project settings save persist dirty registry state.
+- `Content` displays project registry path, dirty marker, and registry records without mutating the active scene.
+- Registry validator passes for the generated ToolingSmoke fixture.
 
 ### Step 8 - Content Browser Project Integration
 
@@ -2282,14 +2407,26 @@ These components must participate in hierarchy display, inspector editing, scene
 
 Formalize selection state around primary entity, selected entity set, hovered entity, active editable entity, selection source, and selection changed event.
 
+Reference-driven selection requirements:
+
+- `Hierarchy`, viewport gizmos, and `Inspector` must normally agree on the active selected entity.
+- If a row is only hovered or focused for keyboard navigation, the UI must make that visually distinct from the selected row.
+- `Inspector` edits the active editable entity, not the last hovered row.
+- Imported scene roots, repeated imported entity names, and glTF-generated roots must still produce stable selection IDs and readable labels.
+- Selection diagnostics should catch mismatches where the hierarchy highlight and Inspector entity name diverge unexpectedly.
+
 ## Acceptance Criteria
 
 ### Visual/UX
 
 - Editor opens directly into the near-clone layout.
 - Menus match `File | Create | Engine | Window | Render | Layout`.
+- Active scene name and dirty marker are visible in the top bar.
+- FPS and frame-time readout remain visible at the top-right.
 - The viewport panel is named `Scene` and has compact toolbar/status UI.
+- Viewport status preserves compact path tracing progress plus `View Settings`, `Stats`, and `Draw Debug` actions.
 - Right and bottom panels match the reference structure.
+- `Content` uses a three-pane folder tree, asset/file list, and details/preview layout with breadcrumb navigation.
 - Existing debug/profiler panels remain accessible.
 
 ### Editing
@@ -2298,6 +2435,7 @@ Formalize selection state around primary entity, selected entity set, hovered en
 - Viewport picking still selects entities.
 - Transform gizmo still edits selected entities.
 - Inspector edits transform, light, sun, camera, mesh renderer, and material values.
+- Hierarchy selected row, viewport selection/gizmo, and Inspector active entity stay synchronized unless the UI explicitly shows hover or active-edit state separately.
 - Undo/redo works for implemented scene operations.
 
 ### Import/Persistence
@@ -2338,6 +2476,9 @@ Formalize selection state around primary entity, selected entity set, hovered en
 - Created lights appear in the Hierarchy and Inspector.
 - Light transform/gizmo affects renderer lighting.
 - Editing light color, intensity, radius, cone, area shape, or shadow state updates the renderer safely and resets accumulation when needed.
+- Sun Light Inspector exposes sun-specific physical controls: lux units, azimuth/elevation, color temperature, intensity, softness, and shadow options.
+- Area Light Inspector exposes area-specific controls: shape/type, lumen units, IES/material source when supported, color controls, radius/cone controls, visible-to-camera, and shadow options.
+- Camera Inspector exposes physical camera controls and grouped post-process controls for DOF, Bloom, Color correction, Vignetting, and Film grain.
 - Create > Environment can create Environment Light, Sky Atmosphere, Height Fog, and Post Process Volume entities.
 - Environment, atmosphere, fog, cloud, and post-process components save and reload in `.rtlevel`.
 - World Settings can assign primary sun, active environment, active atmosphere, and default post-process.
@@ -2437,6 +2578,24 @@ Expected checks:
 - `imgui_panel_audit.ps1` shows the intended panel/menu names and no stale labels for completed rename milestones.
 - `editor_request_flow_report.ps1` shows each completed request has both UI and `Application` usage.
 - `editor_state_snapshot.ps1` captures the expected source-level capabilities for the current milestone.
+
+### Reference Screenshot Match Checks
+
+Run these manual checks after UI shell, viewport, hierarchy, inspector, Content browser, lighting, or camera/post-process work. Use `docs/EDITOR_REFERENCE_SCREENSHOT_INSPECTION.md` as the detailed reference.
+
+- Confirm the default dock layout matches the references: center `Scene`, right `Hierarchy`/`Render World Settings`, lower-right `Inspector`, bottom `Content`/`Timeline`/`Log`.
+- Confirm menu order is the canonical `File | Create | Engine | Window | Render | Layout`.
+- Confirm active scene title and dirty marker are visible in the top bar.
+- Confirm FPS and frame-time readout are visible at the top-right.
+- Confirm viewport status includes compact path tracing progress, `View Settings`, `Stats`, and `Draw Debug`.
+- Confirm transform and light gizmos remain visible over rendered content.
+- Confirm hierarchy rows use dense icons, disclosure arrows, search, blue selection, and visibility toggles.
+- Confirm hierarchy selection, viewport gizmo, and Inspector entity name stay synchronized.
+- Confirm Content uses folder tree, file/asset list, details/preview pane, filter, navigation buttons, refresh, and breadcrumb.
+- Confirm unsupported or empty Content selection reports a clear details-pane message.
+- Confirm `Sun Light` Inspector uses sun-specific controls rather than the generic light layout.
+- Confirm area light Inspector uses area-specific controls rather than the generic light layout.
+- Confirm camera Inspector includes physical camera, exposure, and post-process groups.
 
 ### Scene, Project, And Registry Validation
 
