@@ -115,7 +115,7 @@ EditorGlyphIcon commandGlyph(EditorCommandId id) {
 }
 
 std::string menuLabelWithGlyphPadding(const char* label) {
-    return std::string("     ") + (label != nullptr ? label : "");
+    return editorGlyphLabel(label);
 }
 
 void drawMenuItemGlyph(EditorGlyphIcon glyph, bool enabled) {
@@ -218,25 +218,36 @@ bool drawSceneTabChrome(const std::string& title) {
     const bool closeHovered = ImGui::IsMouseHoveringRect(closeMin, closeMax);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(min, max, ImGui::GetColorU32(editorSceneTabBgColor(hovered)), EditorUiMetric::compactButtonRounding);
-    dl->AddRect(min, max, ImGui::GetColorU32(editorSceneTabBorderColor()), EditorUiMetric::compactButtonRounding);
-    editorDrawIconGlyph(
-        EditorGlyphIcon::SceneFile,
-        ImVec2(min.x + EditorUiMetric::sceneTabIconMinX, min.y + EditorUiMetric::sceneTabIconPaddingY),
-        ImVec2(min.x + EditorUiMetric::sceneTabIconMaxX, max.y - EditorUiMetric::sceneTabIconPaddingY),
-        ImGui::GetColorU32(editorSceneTabIconColor()));
+    const ImU32 separator = ImGui::GetColorU32(editorSceneTabBorderColor());
+    dl->AddLine(ImVec2(min.x + 1.0f, min.y + 5.0f), ImVec2(min.x + 1.0f, max.y - 5.0f), separator, 1.0f);
+    dl->AddLine(ImVec2(max.x - 1.0f, min.y + 5.0f), ImVec2(max.x - 1.0f, max.y - 5.0f), separator, 1.0f);
+    if (hovered) {
+        dl->AddRectFilled(
+            ImVec2(min.x + 4.0f, min.y + 2.0f),
+            ImVec2(max.x - 4.0f, max.y - 2.0f),
+            ImGui::GetColorU32(editorSceneTabBgColor(true)),
+            EditorUiMetric::compactButtonRounding);
+        editorDrawIconGlyph(
+            EditorGlyphIcon::SceneFile,
+            ImVec2(min.x + EditorUiMetric::sceneTabIconMinX, min.y + EditorUiMetric::sceneTabIconPaddingY),
+            ImVec2(min.x + EditorUiMetric::sceneTabIconMaxX, max.y - EditorUiMetric::sceneTabIconPaddingY),
+            ImGui::GetColorU32(editorSceneTabIconColor()));
+    }
+    const float textX = hovered ? min.x + EditorUiMetric::sceneTabIconMaxX + 6.0f : min.x + EditorUiMetric::sceneTabTextX;
     dl->AddText(
-        ImVec2(min.x + EditorUiMetric::sceneTabTextX, min.y + (size.y - textSize.y) * 0.5f),
+        ImVec2(textX, min.y + (size.y - textSize.y) * 0.5f),
         ImGui::GetColorU32(editorSceneTabTextColor()),
         title.c_str());
     if (closeHovered) {
         dl->AddRectFilled(closeMin, closeMax, ImGui::GetColorU32(editorSceneTabCloseHoverColor()), EditorUiMetric::compactButtonRounding);
     }
-    editorDrawIconGlyph(
-        EditorGlyphIcon::Exit,
-        ImVec2(closeMin.x + EditorUiMetric::sceneTabCloseIconPaddingX, closeMin.y + EditorUiMetric::sceneTabCloseIconPaddingY),
-        ImVec2(closeMax.x - EditorUiMetric::sceneTabCloseIconPaddingX, closeMax.y - EditorUiMetric::sceneTabCloseIconPaddingY),
-        ImGui::GetColorU32(editorSceneTabCloseIconColor()));
+    if (hovered || closeHovered) {
+        editorDrawIconGlyph(
+            EditorGlyphIcon::Exit,
+            ImVec2(closeMin.x + EditorUiMetric::sceneTabCloseIconPaddingX, closeMin.y + EditorUiMetric::sceneTabCloseIconPaddingY),
+            ImVec2(closeMax.x - EditorUiMetric::sceneTabCloseIconPaddingX, closeMax.y - EditorUiMetric::sceneTabCloseIconPaddingY),
+            ImGui::GetColorU32(editorSceneTabCloseIconColor()));
+    }
     if (closeHovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         ImGui::SetTooltip("Close scene tab");
     } else if (hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
@@ -245,21 +256,62 @@ bool drawSceneTabChrome(const std::string& title) {
     return clicked && closeHovered;
 }
 
+enum class DockTabCloseTarget {
+    Scene,
+    Hierarchy,
+    RenderSettings,
+    Inspector,
+    MaterialEditor,
+    Content,
+    Timeline,
+    Log,
+};
+
 struct DockTabIconSpec {
     const char* dockId;
     EditorGlyphIcon icon;
+    DockTabCloseTarget closeTarget;
 };
 
 constexpr std::array<DockTabIconSpec, 8> kDockTabIconSpecs{{
-    {"Scene", EditorGlyphIcon::SceneFile},
-    {"Hierarchy", EditorGlyphIcon::Group},
-    {"Render Settings", EditorGlyphIcon::Render},
-    {"Inspector", EditorGlyphIcon::Details},
-    {"Material Editor", EditorGlyphIcon::Material},
-    {"Content", EditorGlyphIcon::Folder},
-    {"Timeline", EditorGlyphIcon::TimelineKey},
-    {"Log", EditorGlyphIcon::Command},
+    {"Scene", EditorGlyphIcon::Sky, DockTabCloseTarget::Scene},
+    {"Hierarchy", EditorGlyphIcon::Hierarchy, DockTabCloseTarget::Hierarchy},
+    {"Render Settings", EditorGlyphIcon::ViewSettings, DockTabCloseTarget::RenderSettings},
+    {"Inspector", EditorGlyphIcon::Details, DockTabCloseTarget::Inspector},
+    {"Material Editor", EditorGlyphIcon::Material, DockTabCloseTarget::MaterialEditor},
+    {"Content", EditorGlyphIcon::Folder, DockTabCloseTarget::Content},
+    {"Timeline", EditorGlyphIcon::Timeline, DockTabCloseTarget::Timeline},
+    {"Log", EditorGlyphIcon::List, DockTabCloseTarget::Log},
 }};
+
+void closeDockTab(const DockTabIconSpec& spec, EditorPanelVisibility& visibility, EditorRequests& requests) {
+    switch (spec.closeTarget) {
+    case DockTabCloseTarget::Scene:
+        requests.closeScene = true;
+        break;
+    case DockTabCloseTarget::Hierarchy:
+        visibility.sceneHierarchy = false;
+        break;
+    case DockTabCloseTarget::RenderSettings:
+        visibility.renderSettings = false;
+        break;
+    case DockTabCloseTarget::Inspector:
+        visibility.inspector = false;
+        break;
+    case DockTabCloseTarget::MaterialEditor:
+        visibility.materialEditor = false;
+        break;
+    case DockTabCloseTarget::Content:
+        visibility.assetBrowser = false;
+        break;
+    case DockTabCloseTarget::Timeline:
+        visibility.timeline = false;
+        break;
+    case DockTabCloseTarget::Log:
+        visibility.log = false;
+        break;
+    }
+}
 
 void drawDockPanelChromeOverlay(const DockTabIconSpec& spec) {
     ImGuiWindow* window = ImGui::FindWindowByID(ImHashStr(spec.dockId));
@@ -293,7 +345,7 @@ void drawDockPanelChromeOverlay(const DockTabIconSpec& spec) {
     }
 }
 
-void drawDockTabIconOverlay(const DockTabIconSpec& spec) {
+void drawDockTabIconOverlay(const DockTabIconSpec& spec, EditorPanelVisibility& visibility, EditorRequests& requests) {
     ImGuiWindow* window = ImGui::FindWindowByID(ImHashStr(spec.dockId));
     if (window == nullptr || window->DockNode == nullptr || window->DockNode->TabBar == nullptr) {
         return;
@@ -334,13 +386,37 @@ void drawDockTabIconOverlay(const DockTabIconSpec& spec) {
         if (!active) {
             tint.w = 0.78f;
         }
+        const float closeSize = std::min(12.0f, std::max(8.0f, tabHeight - 8.0f));
+        const ImVec2 closeMin(tabMax.x - closeSize - 6.0f, tabMin.y + (tabHeight - closeSize) * 0.5f);
+        const ImVec2 closeMax(closeMin.x + closeSize, closeMin.y + closeSize);
+        const bool closeHovered = ImGui::IsMouseHoveringRect(closeMin, closeMax, true);
         drawList->PushClipRect(clipMin, clipMax, true);
-        editorDrawIconGlyph(
+        editorDrawTablerIconGlyph(
+            drawList,
             spec.icon,
             ImVec2(iconX, iconY),
             ImVec2(iconX + iconSize, iconY + iconSize),
             ImGui::GetColorU32(tint));
+        if (closeHovered) {
+            drawList->AddRectFilled(closeMin, closeMax, ImGui::GetColorU32(editorSceneTabCloseHoverColor()), EditorUiMetric::compactButtonRounding);
+        }
+        ImVec4 closeTint = editorSceneTabCloseIconColor();
+        if (!active && !closeHovered) {
+            closeTint.w = 0.55f;
+        }
+        editorDrawTablerIconGlyph(
+            drawList,
+            EditorGlyphIcon::Exit,
+            ImVec2(closeMin.x + 1.0f, closeMin.y + 1.0f),
+            ImVec2(closeMax.x - 1.0f, closeMax.y - 1.0f),
+            ImGui::GetColorU32(closeTint));
         drawList->PopClipRect();
+        if (closeHovered) {
+            ImGui::SetTooltip("Close %s", spec.dockId);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                closeDockTab(spec, visibility, requests);
+            }
+        }
         return;
     }
 }
@@ -354,12 +430,12 @@ void EditorDockspace::begin(EditorRuntimeState& state, EditorPanelVisibility& vi
     ImGui::PushStyleVar(ImGuiStyleVar_TabBorderSize, EditorUiMetric::dockTabBorderSize);
     ImGui::PushStyleVar(ImGuiStyleVar_SeparatorTextBorderSize, EditorUiMetric::dockTabBorderSize);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, EditorUiMetric::dockTabBorderSize);
-    ImGui::PushStyleColor(ImGuiCol_Tab, ImVec4(0.105f, 0.125f, 0.155f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(0.155f, 0.215f, 0.305f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabActive, ImVec4(0.135f, 0.170f, 0.225f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabUnfocused, ImVec4(0.085f, 0.100f, 0.125f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_TabUnfocusedActive, ImVec4(0.115f, 0.140f, 0.180f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_DockingPreview, ImVec4(0.27f, 0.52f, 0.88f, 0.58f));
+    ImGui::PushStyleColor(ImGuiCol_Tab, editorTabColor(false));
+    ImGui::PushStyleColor(ImGuiCol_TabHovered, editorTabColor(false, true));
+    ImGui::PushStyleColor(ImGuiCol_TabActive, editorTabColor(true));
+    ImGui::PushStyleColor(ImGuiCol_TabUnfocused, ImVec4(0.075f, 0.080f, 0.090f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TabUnfocusedActive, ImVec4(0.105f, 0.115f, 0.130f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_DockingPreview, ImVec4(0.18f, 0.36f, 0.62f, 0.52f));
     ImGui::PushStyleColor(ImGuiCol_Separator, editorPanelSplitterColor());
     ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, editorPanelSplitterHoveredColor());
     ImGui::PushStyleColor(ImGuiCol_SeparatorActive, editorPanelActiveAccentColor());
@@ -397,9 +473,9 @@ void EditorDockspace::begin(EditorRuntimeState& state, EditorPanelVisibility& vi
     drawHelpWindows();
 }
 
-void EditorDockspace::end() {
+void EditorDockspace::end(EditorPanelVisibility& visibility, EditorRequests& requests) {
     drawDockPanelChromeOverlays();
-    drawDockTabIconOverlays();
+    drawDockTabIconOverlays(visibility, requests);
     ImGui::End();
     if (dockChromeStylePushed_) {
         ImGui::PopStyleColor(10);
@@ -408,9 +484,9 @@ void EditorDockspace::end() {
     }
 }
 
-void EditorDockspace::drawDockTabIconOverlays() {
+void EditorDockspace::drawDockTabIconOverlays(EditorPanelVisibility& visibility, EditorRequests& requests) {
     for (const DockTabIconSpec& spec : kDockTabIconSpecs) {
-        drawDockTabIconOverlay(spec);
+        drawDockTabIconOverlay(spec, visibility, requests);
     }
 }
 
@@ -897,7 +973,7 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         filteredToggleMenuItem("Content", windowSearch.data(), &visibility.assetBrowser, EditorGlyphIcon::Folder);
         filteredToggleMenuItem("Timeline", windowSearch.data(), &visibility.timeline, EditorGlyphIcon::TimelineKey);
         filteredToggleMenuItem("Log", windowSearch.data(), &visibility.log, EditorGlyphIcon::File);
-        filteredToggleMenuItem("Render Settings", windowSearch.data(), &visibility.renderSettings, EditorGlyphIcon::Render);
+        filteredToggleMenuItem("Render World Settings", windowSearch.data(), &visibility.renderSettings, EditorGlyphIcon::Render);
         filteredToggleMenuItem("Scene", windowSearch.data(), &visibility.viewport, EditorGlyphIcon::SceneFile);
         filteredToggleMenuItem("Material Editor", windowSearch.data(), &visibility.materialEditor, EditorGlyphIcon::Material);
         filteredToggleMenuItem("Console", windowSearch.data(), &visibility.console, EditorGlyphIcon::Command);
@@ -929,8 +1005,8 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         if (filteredCommandMenuItem(EditorCommandId::ToggleDenoiser, prefs, renderSearch.data())) { executeCommand(EditorCommandId::ToggleDenoiser, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CycleDebugView, prefs, renderSearch.data())) { executeCommand(EditorCommandId::CycleDebugView, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CycleIntermediateView, prefs, renderSearch.data())) { executeCommand(EditorCommandId::CycleIntermediateView, state, visibility, requests); }
-        filteredToggleMenuItem("Render Settings", renderSearch.data(), &visibility.renderSettings, EditorGlyphIcon::Render);
-        filteredMenuItem("Quality Preset", renderSearch.data(), nullptr, false, false, "Use the Render Settings panel for preset changes.", EditorGlyphIcon::Render);
+        filteredToggleMenuItem("Render World Settings", renderSearch.data(), &visibility.renderSettings, EditorGlyphIcon::Render);
+        filteredMenuItem("Quality Preset", renderSearch.data(), nullptr, false, false, "Use the Render World Settings panel for preset changes.", EditorGlyphIcon::Render);
         menuSection("DIAGNOSTICS");
         filteredMenuItem("Capture RenderDoc", renderSearch.data(), nullptr, false, false, "RenderDoc capture remains available through the existing runtime capture path; top-menu launch is pending.", EditorGlyphIcon::Render);
         filteredMenuItem("Export Debug Views", renderSearch.data(), nullptr, false, false, "Use headless/debug package export until in-editor export is wired.", EditorGlyphIcon::DrawDebug);

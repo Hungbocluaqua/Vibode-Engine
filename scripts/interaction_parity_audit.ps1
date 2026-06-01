@@ -11,6 +11,7 @@ $editorPanels = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'include\rtv\
 $applicationSource = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src\rtv\Application.cpp')
 $editorSource = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src\rtv\EditorLayer.cpp')
 $viewportSource = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src\rtv\ViewportPanel.cpp')
+$cameraSource = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src\rtv\CameraController.cpp')
 $contentSource = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src\rtv\AssetBrowserPanel.cpp')
 $hierarchySource = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src\rtv\SceneHierarchyPanel.cpp')
 $inspectorSource = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src\rtv\InspectorPanel.cpp')
@@ -33,6 +34,7 @@ $viewportContext = [ordered]@{
     createHere = ($viewportSource -match 'Create Empty Here' -and $viewportSource -match 'Create Camera Here' -and $viewportSource -match 'Create Light Here')
     disabledDropHint = ($viewportSource -match 'Drop prefab here' -and $viewportSource -match 'Drag a prefab from Content')
     usesGlyphRows = ($viewportSource -match 'editorGlyphMenuItem\(EditorGlyphIcon::Frame' -and $viewportSource -match 'editorGlyphMenuItem\(EditorGlyphIcon::Trash')
+    suppressesNavigationHoldMenu = ($viewportSource -match 'rightMouseContextCandidate_' -and $viewportSource -match 'viewportContextTapMaxSeconds' -and $viewportSource -match 'releasedMouseCaptureDurationSeconds' -and $viewportSource -match 'releasedMouseCaptureMoved' -and $viewportSource -match '!releasedNavigationGesture' -and $viewportSource -match 'mouseCaptureMoved' -and $cameraSource -match 'mouseCaptureDurationSeconds_')
 }
 
 $contextMenus = [ordered]@{
@@ -45,7 +47,7 @@ $contextMenus = [ordered]@{
 
 $results = @(
     New-ToolResult -Name 'Asset placement selects new entity' -Passed ($placement.hasPlacementStatus -and $placement.selectsPlacedEntity -and $placement.recordsPlacedPrefabRoot -and $placement.recordsCreatedEntity -and $placement.recordsDuplicatedEntity -and $placement.prefabDragDrop) -Message ("prefab={0}; created={1}; duplicated={2}; select={3}" -f $placement.recordsPlacedPrefabRoot, $placement.recordsCreatedEntity, $placement.recordsDuplicatedEntity, $placement.selectsPlacedEntity) -Details $placement
-    New-ToolResult -Name 'Viewport context menu parity controls' -Passed ($viewportContext.hasViewportContextMenu -and $viewportContext.focusSelected -and $viewportContext.duplicateSelected -and $viewportContext.deleteSelected -and $viewportContext.resetTransform -and $viewportContext.createHere -and $viewportContext.disabledDropHint -and $viewportContext.usesGlyphRows) -Message ("menu={0}; actions={1}/{2}/{3}; create={4}" -f $viewportContext.hasViewportContextMenu, $viewportContext.focusSelected, $viewportContext.duplicateSelected, $viewportContext.deleteSelected, $viewportContext.createHere) -Details $viewportContext
+    New-ToolResult -Name 'Viewport context menu parity controls' -Passed ($viewportContext.hasViewportContextMenu -and $viewportContext.focusSelected -and $viewportContext.duplicateSelected -and $viewportContext.deleteSelected -and $viewportContext.resetTransform -and $viewportContext.createHere -and $viewportContext.disabledDropHint -and $viewportContext.usesGlyphRows -and $viewportContext.suppressesNavigationHoldMenu) -Message ("menu={0}; actions={1}/{2}/{3}; create={4}; suppressHold={5}" -f $viewportContext.hasViewportContextMenu, $viewportContext.focusSelected, $viewportContext.duplicateSelected, $viewportContext.deleteSelected, $viewportContext.createHere, $viewportContext.suppressesNavigationHoldMenu) -Details $viewportContext
     New-ToolResult -Name 'Editor context menu coverage' -Passed ($contextMenus.hierarchyContext -and $contextMenus.hierarchyEmptyContext -and $contextMenus.contentContext -and $contextMenus.inspectorActions -and $contextMenus.componentActions) -Message ("hierarchy={0}; content={1}; inspector={2}; components={3}" -f $contextMenus.hierarchyContext, $contextMenus.contentContext, $contextMenus.inspectorActions, $contextMenus.componentActions) -Details $contextMenus
 )
 

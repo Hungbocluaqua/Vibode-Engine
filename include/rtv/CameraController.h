@@ -21,6 +21,9 @@ public:
     void setMoveSpeed(float speed) { moveSpeed_ = speed; }
 
     [[nodiscard]] bool mouseCaptured() const { return mouseCaptured_; }
+    [[nodiscard]] bool mouseCaptureMoved() const { return mouseCaptureMoved_; }
+    [[nodiscard]] float releasedMouseCaptureDurationSeconds() const { return releasedMouseCaptureDurationSeconds_; }
+    [[nodiscard]] bool releasedMouseCaptureMoved() const { return releasedMouseCaptureMoved_; }
     [[nodiscard]] glm::vec3 position() const { return position_; }
     [[nodiscard]] glm::vec3 direction() const { return forward(); }
     [[nodiscard]] float yawRadians() const { return yawRadians_; }
@@ -38,6 +41,10 @@ private:
     float moveSpeed_ = 2.4f;
     float fastMoveSpeed_ = 7.5f;
     bool mouseCaptured_ = false;
+    float mouseCaptureDurationSeconds_ = 0.0f;
+    float releasedMouseCaptureDurationSeconds_ = -1.0f;
+    bool mouseCaptureMoved_ = false;
+    bool releasedMouseCaptureMoved_ = false;
     bool firstMouseSample_ = true;
     double lastMouseX_ = 0.0;
     double lastMouseY_ = 0.0;

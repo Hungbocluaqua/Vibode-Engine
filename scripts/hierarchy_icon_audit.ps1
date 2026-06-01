@@ -66,7 +66,9 @@ $sourceChecks = [ordered]@{
     hasActiveFilterTint = ($editorSource -match 'editorIconTint\(active\)' -and $editorSource -match 'editorSelectedRowColor\(\)')
     hasGlyphContextMenus = ($editorSource -match 'BeginPopupContextItem' -and $editorSource -match 'editorGlyphMenuItem\(EditorGlyphIcon::Trash' -and $editorSource -match 'editorGlyphMenuItem\(EditorGlyphIcon::Frame')
     hasReferenceRowChrome = ($editorSource -match 'drawHierarchyIndentGuides' -and $editorSource -match 'drawHierarchyRightFade' -and $editorSource -match 'hierarchyIndentSpacing' -and $editorSource -match 'hierarchyRowRightFadeWidth')
-    hasGlyphCreateToolbar = ($editorSource -match 'HierarchyCreateEmpty' -and $editorSource -match 'HierarchyCreateCamera' -and $editorSource -match 'HierarchyCreateLight' -and $editorSource -match 'editorIconTextButton')
+    hasCreateCommandRoutes = ($editorSource -match 'EditorCommandId::CreateEmptyEntity' -and $editorSource -match 'EditorCommandId::CreateCamera' -and $editorSource -match 'EditorCommandId::CreatePointLight')
+    hasGlyphCreateContextMenu = ($editorSource -match 'BeginPopupContextWindow\("HierarchyEmptyContext"' -and ($editorSource -match 'BeginMenu\("Create"\)' -or $editorSource -match 'editorGlyphBeginMenu\(EditorGlyphIcon::Add, "Create"') -and $editorSource -match 'editorGlyphMenuItem\(EditorGlyphIcon::Entity, "Empty Entity"' -and $editorSource -match 'editorGlyphMenuItem\(EditorGlyphIcon::Camera, "Camera"' -and $editorSource -match 'editorGlyphMenuItem\(EditorGlyphIcon::Light, "Point Light"')
+    hasNoVisibleCreateToolbar = -not ($editorSource -match 'HierarchyCreateEmpty|HierarchyCreateCamera|HierarchyCreateLight')
 }
 
 $missingIcons = @($rows | Where-Object { -not $_.hasIcon })
@@ -77,7 +79,7 @@ $results = @(
     New-ToolResult -Name 'Hierarchy type filter toolbar present' -Passed ($sourceChecks.hasTypeFilterToolbar -and $sourceChecks.hasActiveFilterTint) -Message ("toolbar={0}; activeTint={1}" -f $sourceChecks.hasTypeFilterToolbar, $sourceChecks.hasActiveFilterTint) -Details $sourceChecks
     New-ToolResult -Name 'Hierarchy context menu glyph chrome present' -Passed $sourceChecks.hasGlyphContextMenus -Message ("glyphContextMenus={0}" -f $sourceChecks.hasGlyphContextMenus) -Details $sourceChecks
     New-ToolResult -Name 'Hierarchy reference row chrome present' -Passed $sourceChecks.hasReferenceRowChrome -Message ("rowChrome={0}" -f $sourceChecks.hasReferenceRowChrome) -Details $sourceChecks
-    New-ToolResult -Name 'Hierarchy create toolbar glyph chrome present' -Passed $sourceChecks.hasGlyphCreateToolbar -Message ("createToolbar={0}" -f $sourceChecks.hasGlyphCreateToolbar) -Details $sourceChecks
+    New-ToolResult -Name 'Hierarchy create actions available outside header' -Passed ($sourceChecks.hasCreateCommandRoutes -and $sourceChecks.hasGlyphCreateContextMenu -and $sourceChecks.hasNoVisibleCreateToolbar) -Message ("commands={0}; contextMenu={1}; noHeaderCreate={2}" -f $sourceChecks.hasCreateCommandRoutes, $sourceChecks.hasGlyphCreateContextMenu, $sourceChecks.hasNoVisibleCreateToolbar) -Details $sourceChecks
 )
 $passed = Write-ToolResults -Results $results -JsonOut $JsonOut
 if ($FailOnMissing -and -not $passed) { exit 1 }

@@ -42,14 +42,17 @@ $rowStyleChecks = @(
     [pscustomobject]@{ name='hierarchyIconSize'; present=($style -match 'hierarchyIconSize') }
     [pscustomobject]@{ name='hierarchyRowRightFadeWidth'; present=($style -match 'hierarchyRowRightFadeWidth') }
     [pscustomobject]@{ name='contentRowHeight'; present=($style -match 'contentRowHeight') }
+    [pscustomobject]@{ name='contentThreePaneRatios'; present=($style -match 'contentTreePanelRatio' -and $style -match 'contentDetailsPanelRatio' -and $content -match 'EditorUiMetric::contentListMinWidth') }
     [pscustomobject]@{ name='inspectorComponentHeaderHeight'; present=($style -match 'inspectorComponentHeaderHeight') }
     [pscustomobject]@{ name='inspectorComponentHeaderIconSize'; present=($style -match 'inspectorComponentHeaderIconSize') }
     [pscustomobject]@{ name='inspectorComponentActionSize'; present=($style -match 'inspectorComponentActionSize') }
     [pscustomobject]@{ name='viewportOverlayPaddingX'; present=($style -match 'viewportOverlayPaddingX') }
     [pscustomobject]@{ name='viewportOverlayRounding'; present=($style -match 'viewportOverlayRounding') }
     [pscustomobject]@{ name='viewportOverlayColors'; present=($style -match 'editorViewportOverlayBgColor' -and $style -match 'editorViewportOverlayBorderColor') }
+    [pscustomobject]@{ name='iconTextSpacingMetrics'; present=($style -match 'glyphLabelPrefixSpaces' -and $style -match 'iconTextButtonTextOffsetX' -and $style -match 'iconTextReadoutTextGap') }
     [pscustomobject]@{ name='editorSelectedRowColor'; present=($style -match 'editorSelectedRowColor') }
     [pscustomobject]@{ name='editorPushRowSelectionStyle'; present=($style -match 'editorPushRowSelectionStyle') }
+    [pscustomobject]@{ name='editorPreRowBandStyle'; present=($style -match 'editorDrawPreRowBand' -and $style -match 'editorRowBandColor' -and $hierarchy -match 'editorDrawPreRowBand' -and $content -match 'editorDrawPreRowBand') }
     [pscustomobject]@{ name='hierarchyUsesSharedRowStyle'; present=($hierarchy -match 'editorPushRowSelectionStyle') }
     [pscustomobject]@{ name='contentUsesSharedRowStyle'; present=($content -match 'editorPushRowSelectionStyle') }
     [pscustomobject]@{ name='inspectorUsesHeaderMetrics'; present=($inspector -match 'EditorUiMetric::inspectorComponentHeaderHeight' -and $inspector -match 'EditorUiMetric::inspectorComponentHeaderIconSize' -and $inspector -match 'EditorUiMetric::inspectorComponentActionSize') }
@@ -72,8 +75,8 @@ $dockChromeChecks = @(
     [pscustomobject]@{ name='dockPanelChromeOverlay'; present=($dockspace -match 'drawDockPanelChromeOverlays' -and $dockspace -match 'OuterRectClipped' -and $dockspace -match 'dockPanelBorderThickness' -and $dockspace -match 'dockPanelActiveAccentWidth') }
     [pscustomobject]@{ name='dockSplitterColorsUseStyle'; present=($dockspace -match 'editorPanelSplitterColor' -and $dockspace -match 'editorPanelSplitterHoveredColor' -and $dockspace -match 'editorPanelActiveAccentColor') }
     [pscustomobject]@{ name='dockSplitRatiosUseStyle'; present=($dockspace -match 'EditorUiMetric::dockRightPanelRatio' -and $dockspace -match 'EditorUiMetric::dockBottomPanelRatio' -and $dockspace -match 'EditorUiMetric::dockRightInspectorRatio') }
-    [pscustomobject]@{ name='nativeDockTabIconOverlay'; present=($dockspace -match 'drawDockTabIconOverlays' -and $dockspace -match 'FindWindowByID' -and $dockspace -match 'DockNode->TabBar' -and $dockspace -match 'editorDrawIconGlyph') }
-    [pscustomobject]@{ name='knownDockTabIconMappings'; present=($dockspace -match '"Scene", EditorGlyphIcon::SceneFile' -and $dockspace -match '"Hierarchy", EditorGlyphIcon::Group' -and $dockspace -match '"Render Settings", EditorGlyphIcon::Render' -and $dockspace -match '"Content", EditorGlyphIcon::Folder' -and $dockspace -match '"Timeline", EditorGlyphIcon::TimelineKey') }
+    [pscustomobject]@{ name='nativeDockTabIconOverlay'; present=($dockspace -match 'drawDockTabIconOverlays' -and $dockspace -match 'FindWindowByID' -and $dockspace -match 'DockNode->TabBar' -and ($dockspace -match 'editorDrawIconGlyph' -or $dockspace -match 'editorDrawTablerIconGlyph')) }
+    [pscustomobject]@{ name='knownDockTabIconMappings'; present=($dockspace -match '"Scene", EditorGlyphIcon::Sky' -and $dockspace -match '"Hierarchy", EditorGlyphIcon::Hierarchy' -and $dockspace -match '"Render Settings", EditorGlyphIcon::ViewSettings' -and $dockspace -match '"Inspector", EditorGlyphIcon::Details' -and $dockspace -match '"Content", EditorGlyphIcon::Folder' -and $dockspace -match '"Timeline", EditorGlyphIcon::Timeline' -and $dockspace -match '"Log", EditorGlyphIcon::List') }
 )
 
 $disabledStyleChecks = @(
@@ -83,6 +86,7 @@ $disabledStyleChecks = @(
     [pscustomobject]@{ name='disabledRowChrome'; present=($style -match 'editorDrawDisabledRowChrome') }
     [pscustomobject]@{ name='disabledTextPushPop'; present=($style -match 'editorPushDisabledTextStyle' -and $style -match 'editorPopDisabledTextStyle') }
     [pscustomobject]@{ name='glyphMenuDisabledChrome'; present=($style -match 'editorGlyphMenuItem' -and $style -match 'editorDrawDisabledRowChrome\(min, max\)' -and $style -match 'editorDisabledIconTint\(\)') }
+    [pscustomobject]@{ name='glyphSubmenuChrome'; present=($style -match 'editorGlyphBeginMenu' -and $style -match 'BeginMenu\(padded\.c_str\(\), enabled\)' -and $hierarchy -match 'editorGlyphBeginMenu\(EditorGlyphIcon::Add, "Create"' -and $hierarchy -match 'editorGlyphBeginMenu\(EditorGlyphIcon::Add, "Create Child"' -and $inspector -match 'editorGlyphBeginMenu\(EditorGlyphIcon::Add, "Add Component"') }
     [pscustomobject]@{ name='topMenuDisabledChrome'; present=($dockspace -match 'drawMenuItemGlyph' -and $dockspace -match 'editorDrawDisabledRowChrome\(min, max\)' -and $dockspace -match 'editorDisabledIconTint\(\)') }
 )
 

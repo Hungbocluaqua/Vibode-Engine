@@ -350,6 +350,13 @@ void drawViewportOverlayBackdrop(ImDrawList* drawList, ImVec2 min, ImVec2 max) {
     drawList->AddRect(min, max, ImGui::GetColorU32(editorViewportOverlayBorderColor()), EditorUiMetric::viewportOverlayRounding);
 }
 
+void drawViewportTopRail(ImDrawList* drawList, ImVec2 imagePos, ImVec2 avail) {
+    const ImVec2 min(imagePos.x, imagePos.y);
+    const ImVec2 max(imagePos.x + avail.x, imagePos.y + editorIconButtonSize().y + 3.0f);
+    drawList->AddRectFilled(min, max, ImGui::GetColorU32(editorViewportOverlayBgColor()), 0.0f);
+    drawList->AddLine(ImVec2(min.x, max.y), max, ImGui::GetColorU32(editorViewportOverlayBorderColor()), 1.0f);
+}
+
 } // namespace
 
 void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
@@ -399,8 +406,41 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             ImGui::EndDragDropTarget();
         }
 
+        constexpr float viewportContextTapMaxSeconds = 0.18f;
+        constexpr float viewportContextTapMaxDragSq = 16.0f;
+        const ImGuiIO& io = ImGui::GetIO();
         if (viewportContentHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-            ImGui::OpenPopup("ViewportContextMenu");
+            rightMouseContextCandidate_ = true;
+            rightMouseContextSuppressed_ = false;
+            rightMouseContextHoldSeconds_ = 0.0f;
+        }
+        if (rightMouseContextCandidate_ && ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+            rightMouseContextHoldSeconds_ += io.DeltaTime;
+            const ImVec2 rightDrag = ImGui::GetMouseDragDelta(ImGuiMouseButton_Right);
+            const bool rightDragExceeded = (rightDrag.x * rightDrag.x + rightDrag.y * rightDrag.y) >= viewportContextTapMaxDragSq;
+            const bool cameraMovedDuringCapture = state.camera != nullptr && state.camera->mouseCaptureMoved();
+            if (rightMouseContextHoldSeconds_ >= viewportContextTapMaxSeconds || rightDragExceeded || cameraMovedDuringCapture) {
+                rightMouseContextSuppressed_ = true;
+            }
+        }
+        const float releasedNavigationDuration = state.camera != nullptr ? state.camera->releasedMouseCaptureDurationSeconds() : -1.0f;
+        const bool releasedNavigationGesture = rightMouseContextSuppressed_ ||
+            releasedNavigationDuration >= viewportContextTapMaxSeconds ||
+            (state.camera != nullptr && state.camera->releasedMouseCaptureMoved());
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
+            if (rightMouseContextCandidate_ &&
+                viewportContentHovered &&
+                !state.viewport.mouseCaptureActive &&
+                !releasedNavigationGesture) {
+                ImGui::OpenPopup("ViewportContextMenu");
+            }
+            rightMouseContextCandidate_ = false;
+            rightMouseContextSuppressed_ = false;
+            rightMouseContextHoldSeconds_ = 0.0f;
+        } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+            rightMouseContextCandidate_ = false;
+            rightMouseContextSuppressed_ = false;
+            rightMouseContextHoldSeconds_ = 0.0f;
         }
         if (ImGui::BeginPopup("ViewportContextMenu")) {
             Entity* selectedEntity = state.sceneDocument != nullptr ? state.sceneDocument->registry().entity(selection.entityId()) : nullptr;
@@ -485,12 +525,15 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 ImGui::SetTooltip("%s (%s)", editorCommandName(command), shortcut.c_str());
             }
         };
+        dl->ChannelsSplit(2);
+        dl->ChannelsSetCurrent(0);
+        drawViewportTopRail(dl, imagePos, avail);
+        dl->ChannelsSetCurrent(1);
+
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(EditorUiMetric::rowPaddingX, EditorUiMetric::rowPaddingY));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 0.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, EditorUiMetric::compactButtonRounding);
-        ImGui::SetCursorScreenPos(ImVec2(imagePos.x + 7.0f, imagePos.y + 5.0f));
-        dl->ChannelsSplit(2);
-        dl->ChannelsSetCurrent(1);
+        ImGui::SetCursorScreenPos(ImVec2(imagePos.x + 4.0f, imagePos.y + 2.0f));
         ImGui::BeginGroup();
         auto toolButton = [&](EditorGlyphIcon icon, const char* id, EditorCommandId command, bool active) {
             const bool pressed = editorIconButton(id, icon, active);
@@ -531,11 +574,6 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             }
         }
         ImGui::EndGroup();
-        const ImVec2 toolbarMin = ImGui::GetItemRectMin();
-        const ImVec2 toolbarMax = ImGui::GetItemRectMax();
-        dl->ChannelsSetCurrent(0);
-        drawViewportOverlayBackdrop(dl, toolbarMin, toolbarMax);
-        dl->ChannelsMerge();
         ImGui::PopStyleVar(3);
 
         const float gpuTotal = timings.totalMs();
@@ -549,8 +587,8 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         }
         const std::string statusText = compactStatus.str();
         const ImVec2 statusSize = ImGui::CalcTextSize(statusText.c_str());
-        const float statusRight = imagePos.x + avail.x - 12.0f;
-        const float statusY = imagePos.y + 7.0f;
+        const float statusRight = imagePos.x + avail.x - 6.0f;
+        const float statusY = imagePos.y + 4.0f;
 
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, EditorUiMetric::rowPaddingY));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 0.0f));
@@ -566,12 +604,9 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             editorIconTextButtonWidth("Draw Debug") + cameraSpeedWidth + ImGui::GetStyle().ItemSpacing.x * 3.0f;
         const float controlsX = std::max(imagePos.x + 8.0f, statusRight - overlayWidth);
         const float statusX = std::max(imagePos.x + 8.0f, controlsX - statusSize.x - 14.0f);
-        const ImVec2 overlayMin(std::min(statusX, controlsX), imagePos.y + 5.0f);
-        const ImVec2 overlayMax(statusRight, imagePos.y + 5.0f + editorIconButtonSize().y);
-        drawViewportOverlayBackdrop(dl, overlayMin, overlayMax);
         dl->AddText(ImVec2(statusX, statusY), IM_COL32(216, 221, 228, 245), statusText.c_str());
 
-        ImGui::SetCursorScreenPos(ImVec2(controlsX, imagePos.y + 5.0f));
+        ImGui::SetCursorScreenPos(ImVec2(controlsX, imagePos.y + 2.0f));
         ImGui::BeginGroup();
         auto overlayButton = [&](EditorGlyphIcon icon, const char* label, const char* popupName, const char* buttonId, const char* tooltip) {
             const bool open = ImGui::IsPopupOpen(popupName);
@@ -598,6 +633,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         }
         ImGui::EndGroup();
         viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+        dl->ChannelsMerge();
 
         auto beginOverlayPopup = [&](const char* name, float width) {
             ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Appearing);

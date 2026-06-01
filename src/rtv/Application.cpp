@@ -4493,22 +4493,19 @@ void Application::updateWindowTitle(float seconds) {
     }
     lastTitleUpdateSeconds_ = seconds;
 
-    const RendererSettings& settings = pathTracer_->settings();
-    const GpuFrameTimings& timings = pathTracer_->timings();
-    std::ostringstream title;
-    if (sceneDocument_.dirty()) {
-        title << "[Modified] ";
+    std::filesystem::path activeScenePath;
+    if (scenePath_.has_value()) {
+        activeScenePath = *scenePath_;
+    } else if (gltfPath_.has_value()) {
+        activeScenePath = *gltfPath_;
     }
-    title << (gltfPath_.has_value() ? gltfPath_->stem().string() : "Untitled")
-          << " - Vibode Engine"
-          << " | samples " << pathTracer_->sampleCount()
-          << " | " << rendererDebugViewName(settings.debugView)
-          << " | denoise " << (settings.denoiserEnabled ? "on" : "off")
-          << " | sun " << (settings.sunlightEnabled ? "on" : "off")
-          << " | env " << (settings.environmentEnabled ? "on" : "off")
-          << " | GPU "
-          << std::fixed << std::setprecision(2)
-          << timings.totalMs() << " ms";
+
+    std::ostringstream title;
+    title << (activeScenePath.empty() ? "Untitled Scene" : activeScenePath.stem().string());
+    if (sceneDocument_.dirty()) {
+        title << "*";
+    }
+    title << " - Vibode Engine";
     glfwSetWindowTitle(window_, title.str().c_str());
 }
 

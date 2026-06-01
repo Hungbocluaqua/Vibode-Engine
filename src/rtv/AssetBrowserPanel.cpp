@@ -121,6 +121,20 @@ std::string contentKindLabel(const std::filesystem::path& path) {
     return ext.empty() ? "File" : ext.substr(1);
 }
 
+std::string compactPathLabel(const std::filesystem::path& path, const char* fallback) {
+    if (!path.empty()) {
+        const std::filesystem::path name = path.filename();
+        if (!name.empty()) {
+            return name.string();
+        }
+        const std::filesystem::path root = path.root_name();
+        if (!root.empty()) {
+            return root.string();
+        }
+    }
+    return fallback != nullptr ? fallback : "";
+}
+
 bool supportedContentPath(const std::filesystem::path& path) {
     if (std::filesystem::is_directory(path)) return true;
     const std::string ext = lowerString(path.extension().string());
@@ -217,24 +231,24 @@ ImU32 contentIconColor(const std::filesystem::path& path) {
     const EditorGlyphIcon icon = editorGlyphForPath(path);
     switch (icon) {
     case EditorGlyphIcon::Folder:
-        return IM_COL32(220, 180, 88, 255);
+        return IM_COL32(188, 194, 204, 255);
     case EditorGlyphIcon::Texture:
     case EditorGlyphIcon::Environment:
-        return IM_COL32(105, 170, 230, 255);
+        return IM_COL32(184, 196, 211, 255);
     case EditorGlyphIcon::Model:
     case EditorGlyphIcon::SceneFile:
-        return IM_COL32(150, 195, 255, 255);
+        return IM_COL32(188, 199, 216, 255);
     case EditorGlyphIcon::Material:
-        return IM_COL32(210, 160, 225, 255);
+        return IM_COL32(198, 190, 212, 255);
     case EditorGlyphIcon::IesProfile:
-        return IM_COL32(255, 214, 115, 255);
+        return IM_COL32(210, 198, 168, 255);
     case EditorGlyphIcon::VolumeFile:
-        return IM_COL32(130, 210, 190, 255);
+        return IM_COL32(178, 204, 198, 255);
     case EditorGlyphIcon::ShaderFile:
     case EditorGlyphIcon::ConfigFile:
-        return IM_COL32(170, 190, 220, 255);
+        return IM_COL32(178, 188, 204, 255);
     default:
-        return IM_COL32(150, 158, 170, 255);
+        return IM_COL32(158, 166, 178, 255);
     }
 }
 
@@ -526,7 +540,7 @@ bool AssetBrowserPanel::drawGpuSceneTextureThumbnail(const EditorRuntimeState& s
     dl->AddRect(imageMin, imageMax, IM_COL32(255, 255, 255, 42), 1.0f);
     dl->AddRectFilled(ImVec2(min.x + 4.0f, max.y - 15.0f), ImVec2(max.x - 4.0f, max.y - 4.0f), IM_COL32(12, 15, 19, 205), 1.0f);
     dl->AddText(ImVec2(min.x + 8.0f, max.y - 15.0f), IM_COL32(160, 210, 255, 255), "GPU texture");
-    dl->AddRect(min, max, IM_COL32(70, 118, 178, 210), EditorUiMetric::cardRounding);
+    dl->AddRect(min, max, ImGui::GetColorU32(editorActiveRowColor()), EditorUiMetric::cardRounding);
     return true;
 }
 
@@ -549,7 +563,7 @@ bool AssetBrowserPanel::drawStandaloneGpuAssetPreview(const EditorRuntimeState& 
         ? "GPU preview " + std::to_string(width) + "x" + std::to_string(height)
         : std::string("GPU preview");
     dl->AddText(ImVec2(min.x + 8.0f, max.y - 15.0f), IM_COL32(160, 210, 255, 255), badge.c_str());
-    dl->AddRect(min, max, selected ? ImGui::GetColorU32(editorActiveRowColor()) : IM_COL32(70, 118, 178, 210), EditorUiMetric::cardRounding);
+    dl->AddRect(min, max, selected ? ImGui::GetColorU32(editorActiveRowColor()) : IM_COL32(56, 66, 82, 210), EditorUiMetric::cardRounding);
     return true;
 }
 
@@ -1154,7 +1168,8 @@ void AssetBrowserPanel::drawFolderTree(const std::filesystem::path& path, Editor
     }
 
     ImGui::PushID(path.string().c_str());
-    const std::string treeLabel = "     " + (path.filename().empty() ? path.string() : path.filename().string());
+    const std::string treeLabel = editorGlyphLabel(path.filename().empty() ? path.string() : path.filename().string());
+    editorDrawPreRowBand(EditorUiMetric::contentRowHeight);
     editorPushRowSelectionStyle();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, editorRowFramePadding(EditorUiMetric::contentRowHeight));
     const bool open = ImGui::TreeNodeEx(treeLabel.c_str(), flags);
@@ -1259,11 +1274,9 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
         return;
     }
 
-    if (ImGui::BeginTable("ContentPathList", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Name");
-        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableSetupColumn("Path");
-        ImGui::TableHeadersRow();
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ImGui::GetStyle().CellPadding.x, 0.0f));
+    if (ImGui::BeginTable("ContentPathListCompact", 1, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+        ImGui::TableSetupColumn("Asset");
         for (const auto& entry : entries) {
             const std::filesystem::path path = entry.path();
             const bool isDir = entry.is_directory(ec);
@@ -1272,9 +1285,13 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             const ImVec2 nameCursor = ImGui::GetCursorScreenPos();
-            const std::string name = "     " + path.filename().string();
+            const std::string name = editorGlyphLabel(path.filename().string());
             editorPushRowSelectionStyle();
-            if (ImGui::Selectable(name.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+            if (ImGui::Selectable(
+                    name.c_str(),
+                    selected,
+                    ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick,
+                    ImVec2(0.0f, EditorUiMetric::contentRowHeight))) {
                 selectedPath_ = path;
                 selectedRecordGuid_.clear();
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
@@ -1295,14 +1312,11 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
                 drawPathContextMenu(path, isDir, requests);
                 ImGui::EndPopup();
             }
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(contentKindLabel(path).c_str());
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(relativeContentPath(path).c_str());
             ImGui::PopID();
         }
         ImGui::EndTable();
     }
+    ImGui::PopStyleVar();
 }
 
 void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, EditorRequests& requests) {
@@ -1693,88 +1707,21 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         ImGui::SetTooltip("Forward");
     }
-    ImGui::SameLine();
-    const bool canNavigateUp = !currentPath_.empty() && currentPath_ != browserRoot_;
-    ImGui::BeginDisabled(!canNavigateUp);
-    if (editorIconButton("ContentUp", EditorGlyphIcon::Up, false)) {
-        const std::filesystem::path parent = currentPath_.parent_path();
-        if (!parent.empty()) {
-            navigateTo(parent);
-        }
-    }
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip("Up one folder");
-    }
-    ImGui::SameLine();
-    if (editorIconButton("ContentRefresh", EditorGlyphIcon::Refresh, false)) {
-        invalidateThumbnails();
-        status_ = "Content refreshed";
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip("Refresh");
-    }
-    ImGui::SameLine();
-    if (editorIconButton("ContentViewMode", gridView_ ? EditorGlyphIcon::List : EditorGlyphIcon::Grid, gridView_)) {
-        gridView_ = !gridView_;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(gridView_ ? "Show list view" : "Show grid view");
-    }
-    ImGui::SameLine();
-    if (editorIconButton("ContentDetails", EditorGlyphIcon::Details, showDetails_)) {
-        showDetails_ = !showDetails_;
-    }
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip(showDetails_ ? "Hide details" : "Show details");
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("/ %s", currentPath_.empty() ? "Content" : relativeContentPath(currentPath_).c_str());
-    ImGui::EndGroup();
-    drawImportSettingsDialog(requests);
-
-    if (compatibilityMode_ && ImGui::SmallButton("Project Manager")) {
-        requests.showProjectManager = true;
-    }
+    showDetails_ = true;
 
     if (!browserRoot_.empty()) {
-        ImGui::BeginGroup();
-        ImGui::TextDisabled("Mounts");
-        auto mountButton = [&](const char* label, const std::filesystem::path& path) {
-            if (path.empty()) {
-                return;
-            }
-            std::error_code ec;
-            if (!std::filesystem::is_directory(path, ec)) {
-                return;
-            }
-            ImGui::SameLine();
-            ImGui::PushID(label);
-            const bool active = canonicalForCompare(currentPath_) == canonicalForCompare(path);
-            if (active) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.120f, 0.185f, 0.290f, 1.0f));
-            }
-            if (ImGui::SmallButton(label)) {
-                navigateTo(path);
-            }
-            if (active) {
-                ImGui::PopStyleColor();
-            }
-            ImGui::PopID();
-        };
-        mountButton(compatibilityMode_ ? "Workspace" : "Project", browserRoot_);
-        mountButton("Content", contentRoot_);
-        mountButton("Scenes", scenesRoot_);
-        mountButton("Saved", savedRoot_);
-        mountButton("DDC", cacheRoot_);
-        ImGui::EndGroup();
-    }
-
-    if (!browserRoot_.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::PushID("ContentBreadcrumb");
         std::error_code relativeError;
         const std::filesystem::path relative = std::filesystem::relative(currentPath_, browserRoot_, relativeError);
-        if (ImGui::SmallButton(compatibilityMode_ ? "Workspace" : "Project")) {
+        const std::string rootLabel = compatibilityMode_ ? compactPathLabel(browserRoot_, "Workspace") : "Project";
+        if (ImGui::SmallButton(rootLabel.c_str())) {
             navigateTo(browserRoot_);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("%s", browserRoot_.string().c_str());
         }
         std::filesystem::path accum = browserRoot_;
         for (const auto& part : relativeError ? std::filesystem::path{} : relative) {
@@ -1784,13 +1731,19 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
             }
             accum /= part;
             ImGui::SameLine();
-            ImGui::TextDisabled("/");
+            ImGui::TextDisabled(">");
             ImGui::SameLine();
+            ImGui::PushID(partString.c_str());
             if (ImGui::SmallButton(partString.c_str())) {
                 navigateTo(accum);
             }
+            ImGui::PopID();
         }
+        ImGui::PopID();
     }
+    ImGui::EndGroup();
+    drawImportSettingsDialog(requests);
+
     const std::string sceneLoadStatus = state.sceneLoadingStatus != nullptr ? *state.sceneLoadingStatus : std::string{};
     const bool hasSceneLoadStatus = !sceneLoadStatus.empty();
     const bool sceneLoadCompleted = !state.sceneLoadRunning && hasSceneLoadStatus && sceneLoadStatusIsSuccessfulCompletion(sceneLoadStatus);
@@ -1807,10 +1760,24 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         ImGui::TextWrapped("%s", sceneLoadStatus.c_str());
     }
 
-    const float browserHeight = std::max(260.0f, ImGui::GetContentRegionAvail().y);
-    if (ImGui::BeginChild("ContentBrowser", ImVec2(0.0f, browserHeight), true)) {
-        const float detailsWidth = showDetails_ ? EditorUiMetric::detailsWidth : 0.0f;
-        const float treeWidth = EditorUiMetric::sidebarWidth;
+    const float browserHeight = ImGui::GetContentRegionAvail().y;
+    if (browserHeight > ImGui::GetTextLineHeightWithSpacing()) {
+        const float browserWidth = ImGui::GetContentRegionAvail().x;
+        const float sectionSpacing = ImGui::GetStyle().ItemSpacing.x;
+        const float treeWidth = std::clamp(
+            browserWidth * EditorUiMetric::contentTreePanelRatio,
+            EditorUiMetric::contentTreeMinWidth,
+            EditorUiMetric::contentTreeMaxWidth);
+        float detailsWidth = showDetails_
+            ? std::clamp(
+                browserWidth * EditorUiMetric::contentDetailsPanelRatio,
+                EditorUiMetric::contentDetailsMinWidth,
+                EditorUiMetric::contentDetailsMaxWidth)
+            : 0.0f;
+        if (showDetails_) {
+            const float maxDetailsWidth = browserWidth - treeWidth - EditorUiMetric::contentListMinWidth - (sectionSpacing * 2.0f);
+            detailsWidth = std::max(0.0f, std::min(detailsWidth, maxDetailsWidth));
+        }
         ImGui::BeginChild("ContentFolders", ImVec2(treeWidth, 0.0f), true);
         if (!browserRoot_.empty()) {
             drawFolderTree(browserRoot_, requests);
@@ -1859,10 +1826,8 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         }
         ImGui::EndChild();
         ImGui::SameLine();
-        ImGui::BeginChild("ContentItems", ImVec2(-(detailsWidth + (showDetails_ ? ImGui::GetStyle().ItemSpacing.x : 0.0f)), 0.0f), true);
+        ImGui::BeginChild("ContentItems", ImVec2(-(detailsWidth + (showDetails_ ? sectionSpacing : 0.0f)), 0.0f), true);
         drawPathList(state, requests);
-        drawImportOperations();
-        drawRegistryTable(state, requests);
         ImGui::EndChild();
         if (showDetails_) {
             ImGui::SameLine();
@@ -1876,7 +1841,6 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
             ImGui::EndChild();
         }
     }
-    ImGui::EndChild();
 
     ImGui::End();
 }

@@ -365,7 +365,7 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
 
     if (projectManagerGateActive && state.project == nullptr) {
         drawCommandPalette(state, requests);
-        dockspace_.end();
+        dockspace_.end(visibility_, requests);
         return requests;
     }
 
@@ -411,7 +411,7 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     applyCaptureFocusOverride();
     drawCommandPalette(state, requests);
 
-    dockspace_.end();
+    dockspace_.end(visibility_, requests);
     return requests;
 }
 
@@ -434,6 +434,7 @@ void EditorLayer::applyCaptureFocusOverride() {
             captureFocusWindow_ == "Scene" ||
             captureFocusWindow_ == "Hierarchy" ||
             captureFocusWindow_ == "Render Settings" ||
+            captureFocusWindow_ == "Render World Settings" ||
             captureFocusWindow_ == "Inspector" ||
             captureFocusWindow_ == "Material Editor" ||
             captureFocusWindow_ == "Content" ||
@@ -441,6 +442,9 @@ void EditorLayer::applyCaptureFocusOverride() {
             captureFocusWindow_ == "Log";
         if (!supportedWindow) {
             captureFocusWindow_.clear();
+        }
+        if (captureFocusWindow_ == "Render World Settings") {
+            captureFocusWindow_ = "Render Settings";
         }
         captureFocusFramesRemaining_ = captureFocusWindow_.empty() ? 0 : 45;
     }

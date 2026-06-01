@@ -12,6 +12,9 @@ param(
     [int]$SelectHierarchyRow = -1,
     [int]$ClickX = -1,
     [int]$ClickY = -1,
+    [ValidateSet('Left','Right')]
+    [string]$ClickButton = 'Left',
+    [int]$ClickHoldMilliseconds = 40,
     [int]$WindowWidth = 0,
     [int]$WindowHeight = 0,
     [int]$PostSelectDelayMilliseconds = 700,
@@ -46,6 +49,12 @@ public static class EditorWindowCaptureNative {
     public static extern bool SetForegroundWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
     public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
     [DllImport("user32.dll")]
@@ -56,9 +65,26 @@ public static class EditorWindowCaptureNative {
 
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
+    public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+    public const uint MOUSEEVENTF_RIGHTUP = 0x0010;
     public const uint SWP_SHOWWINDOW = 0x0040;
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_NOSIZE = 0x0001;
+    public const int SW_RESTORE = 9;
+
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
 }
 '@
+
+function Show-EditorWindowForCapture {
+    param([IntPtr]$Handle)
+    [void][EditorWindowCaptureNative]::ShowWindow($Handle, [EditorWindowCaptureNative]::SW_RESTORE)
+    [void][EditorWindowCaptureNative]::SetWindowPos($Handle, [EditorWindowCaptureNative]::HWND_TOPMOST, 0, 0, 0, 0, [EditorWindowCaptureNative]::SWP_NOMOVE -bor [EditorWindowCaptureNative]::SWP_NOSIZE -bor [EditorWindowCaptureNative]::SWP_SHOWWINDOW)
+    [void][EditorWindowCaptureNative]::SetWindowPos($Handle, [EditorWindowCaptureNative]::HWND_NOTOPMOST, 0, 0, 0, 0, [EditorWindowCaptureNative]::SWP_NOMOVE -bor [EditorWindowCaptureNative]::SWP_NOSIZE -bor [EditorWindowCaptureNative]::SWP_SHOWWINDOW)
+    [void][EditorWindowCaptureNative]::BringWindowToTop($Handle)
+    [void][EditorWindowCaptureNative]::SetForegroundWindow($Handle)
+}
 
 function Resolve-CapturePath {
     param([string]$Path)
@@ -70,13 +96,17 @@ function Invoke-EditorClick {
     param(
         [IntPtr]$Handle,
         [int]$X,
-        [int]$Y
+        [int]$Y,
+        [string]$Button = 'Left',
+        [int]$HoldMilliseconds = 40
     )
     [void][EditorWindowCaptureNative]::SetForegroundWindow($Handle)
     [void][EditorWindowCaptureNative]::SetCursorPos($X, $Y)
-    [EditorWindowCaptureNative]::mouse_event([EditorWindowCaptureNative]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 40
-    [EditorWindowCaptureNative]::mouse_event([EditorWindowCaptureNative]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+    $down = if ($Button -eq 'Right') { [EditorWindowCaptureNative]::MOUSEEVENTF_RIGHTDOWN } else { [EditorWindowCaptureNative]::MOUSEEVENTF_LEFTDOWN }
+    $up = if ($Button -eq 'Right') { [EditorWindowCaptureNative]::MOUSEEVENTF_RIGHTUP } else { [EditorWindowCaptureNative]::MOUSEEVENTF_LEFTUP }
+    [EditorWindowCaptureNative]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds ([Math]::Max(1, $HoldMilliseconds))
+    [EditorWindowCaptureNative]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero)
 }
 
 function Write-CaptureJsonNoBom {
@@ -221,7 +251,7 @@ try {
         throw "Editor window handle was not available within $WaitSeconds seconds."
     }
 
-    [void][EditorWindowCaptureNative]::SetForegroundWindow($handle)
+    Show-EditorWindowForCapture -Handle $handle
     $initialRect = New-Object EditorWindowCaptureNative+RECT
     if ([EditorWindowCaptureNative]::GetWindowRect($handle, [ref]$initialRect)) {
         $initialWidth = [Math]::Max(640, $initialRect.Right - $initialRect.Left)
@@ -231,6 +261,8 @@ try {
         [void][EditorWindowCaptureNative]::SetWindowPos($handle, [IntPtr]::Zero, 8, 8, $targetWidth, $targetHeight, [EditorWindowCaptureNative]::SWP_SHOWWINDOW)
     }
     Start-Sleep -Seconds $CaptureDelaySeconds
+    Show-EditorWindowForCapture -Handle $handle
+    Start-Sleep -Milliseconds 200
     $process.Refresh()
     if ($process.HasExited) {
         throw "Editor exited before delayed screenshot capture. ExitCode=$($process.ExitCode)"
@@ -252,7 +284,7 @@ try {
         Start-Sleep -Milliseconds $PostSelectDelayMilliseconds
     }
     if ($ClickX -ge 0 -and $ClickY -ge 0) {
-        Invoke-EditorClick -Handle $handle -X ($rect.Left + $ClickX) -Y ($rect.Top + $ClickY)
+        Invoke-EditorClick -Handle $handle -X ($rect.Left + $ClickX) -Y ($rect.Top + $ClickY) -Button $ClickButton -HoldMilliseconds $ClickHoldMilliseconds
         Start-Sleep -Milliseconds $PostSelectDelayMilliseconds
     }
 
@@ -292,6 +324,8 @@ try {
         selectHierarchyRow = $SelectHierarchyRow
         clickX = $ClickX
         clickY = $ClickY
+        clickButton = $ClickButton
+        clickHoldMilliseconds = $ClickHoldMilliseconds
         requestedWindowWidth = $WindowWidth
         requestedWindowHeight = $WindowHeight
         focusWindow = $FocusWindow
