@@ -4,6 +4,7 @@
 #include "rtv/AsyncSceneLoader.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
+#include "rtv/AssetImport.h"
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorPanels.h"
@@ -18,6 +19,7 @@
 #include <memory>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -120,6 +122,22 @@ private:
         bool dragEligible = false;
         bool suppressOpenLevel = false;
     };
+    enum class AsyncAssetImportKind {
+        Import,
+        Reimport,
+    };
+    struct AsyncAssetImportJob {
+        AsyncAssetImportKind kind = AsyncAssetImportKind::Import;
+        AssetImportRequest request{};
+        AssetImportWorkspace workspace{};
+        AssetGuid assetGuid;
+        AssetType originalType = AssetType::Unknown;
+        bool placeAfterImport = false;
+    };
+    struct ActiveAsyncAssetImportJob {
+        AsyncAssetImportJob job{};
+        std::future<StagedAssetImportResult> future;
+    };
 
     void initWindow();
     void initVulkan();
@@ -131,6 +149,8 @@ private:
     void writeCrashMarker(bool running);
     void serializeEditorSceneData();
     void deserializeEditorSceneData();
+    void queueProjectThumbnailCapture();
+    void captureProjectThumbnailIfReady();
     void processRuntimeControls(float deltaSeconds);
     void processSunDragControls(bool shortcutsBlocked, bool viewportHovered, bool viewportInteraction, bool ctrlDown);
     void beginSunDragArm(bool dragEligible);
@@ -154,13 +174,22 @@ private:
     [[nodiscard]] bool closeCurrentProject();
     [[nodiscard]] bool loadProjectStartupScene(const ProjectContext& project);
     [[nodiscard]] bool writeDefaultProjectScene(const ProjectContext& project, std::string_view templateName);
-    [[nodiscard]] std::optional<AssetGuid> importAssetNonMutating(const EditorImportAssetRequest& request);
+    [[nodiscard]] std::optional<AssetImportWorkspace> prepareAssetImportWorkspace(const std::filesystem::path& sourcePath);
+    [[nodiscard]] bool queueAssetImportNonMutating(const EditorImportAssetRequest& request, bool placeAfterImport);
     [[nodiscard]] bool placePrefabAsset(const AssetGuid& prefabGuid);
-    [[nodiscard]] bool reimportAsset(const AssetGuid& assetGuid);
+    [[nodiscard]] bool queueAssetReimport(const AssetGuid& assetGuid);
+    void startNextAssetImportWorker();
+    void pollAssetImportWorker();
+    void waitForAssetImportWorker();
+    [[nodiscard]] bool applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAssetImportResult&& result);
     [[nodiscard]] bool mergeSceneIntoCurrent(const std::filesystem::path& path, bool allowResourceRebuild);
     bool applyPendingSceneUpdate(bool allowResourceRebuild);
     void applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange);
     void reloadShadersFromEditor();
+    void startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot);
+    void updateEditorRenderJob(float deltaSeconds);
+    void writeEditorRenderJobManifest(const char* eventLabel);
+    void cancelEditorRenderJob(const std::filesystem::path& renderOutputRoot);
     void retirePathTracer(std::unique_ptr<PathTracerRenderer> renderer);
     void releaseRetiredPathTracers();
     [[nodiscard]] std::unique_ptr<PathTracerRenderer> makePathTracer(
@@ -173,6 +202,8 @@ private:
     void syncActiveSceneCameraFromController();
     void rebuildGpuSceneAsset();
     void initializeFallbackSceneDocument();
+    void initializeProjectManagerStartupSceneDocument();
+    void initializeRendererFromCurrentScene(const RendererSettings* settingsToRestore = nullptr);
     [[nodiscard]] bool pressedOnce(int key);
 
     GLFWwindow* window_ = nullptr;
@@ -226,6 +257,11 @@ private:
     SceneDocument sceneDocument_;
     SceneEventBus sceneEventBus_;
     NotificationManager notifications_;
+    EditorRenderJobStatus editorRenderJob_{};
+    float editorRenderJobElapsedSeconds_ = 0.0f;
+    uint64_t nextEditorRenderJobSerial_ = 1;
+    EditorPlacementStatus editorPlacement_{};
+    uint64_t nextEditorPlacementSerial_ = 1;
     UndoStack undoStack_;
     SceneToGpuSceneBuilder sceneBuilder_;
     std::optional<SceneAsset> gpuSceneAsset_;
@@ -243,8 +279,13 @@ private:
     std::vector<RetiredPathTracer> retiredPathTracers_;
     std::optional<RendererSettings> pendingPostFrameSettings_;
     AsyncSceneLoader asyncSceneLoader_;
+    std::deque<AsyncAssetImportJob> pendingAssetImportJobs_;
+    std::optional<ActiveAsyncAssetImportJob> activeAssetImportJob_;
     std::optional<SceneLoadRequest> activeSceneLoadRequest_;
     std::optional<std::filesystem::path> pendingRecoveryAutosavePath_;
+    std::optional<std::filesystem::path> pendingProjectThumbnailPath_;
+    uint64_t pendingProjectThumbnailFrame_ = 0;
+    uint32_t pendingProjectThumbnailAttempts_ = 0;
     std::string sceneLoadingStatus_;
 };
 

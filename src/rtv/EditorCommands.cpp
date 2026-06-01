@@ -1,8 +1,14 @@
 #include "rtv/EditorCommands.h"
 
+#include "rtv/EditorPreferences.h"
+
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <utility>
@@ -19,6 +25,10 @@ EditorKeybinding ctrlKey(int glfwKey, int imguiKey, std::string display, EditorC
     return EditorKeybinding{glfwKey, imguiKey, true, false, false, context, std::move(display)};
 }
 
+EditorKeybinding ctrlShiftKey(int glfwKey, int imguiKey, std::string display, EditorCommandContext context = EditorCommandContext::Global) {
+    return EditorKeybinding{glfwKey, imguiKey, true, true, false, context, std::move(display)};
+}
+
 std::string conflictKey(const EditorKeybinding& binding) {
     if (binding.display.empty()) {
         return {};
@@ -30,6 +40,80 @@ std::string conflictKey(const EditorKeybinding& binding) {
     if (binding.alt) out << "Alt+";
     out << binding.display;
     return out.str();
+}
+
+std::string upperString(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
+    return value;
+}
+
+std::optional<std::pair<int, int>> keyCodesForToken(const std::string& token) {
+    if (token.size() == 1) {
+        const char ch = token[0];
+        if (ch >= 'A' && ch <= 'Z') {
+            const int offset = ch - 'A';
+            return std::make_pair(GLFW_KEY_A + offset, ImGuiKey_A + offset);
+        }
+        if (ch >= '0' && ch <= '9') {
+            const int offset = ch - '0';
+            return std::make_pair(GLFW_KEY_0 + offset, ImGuiKey_0 + offset);
+        }
+    }
+    if (token.size() >= 2 && token[0] == 'F') {
+        const int number = std::atoi(token.c_str() + 1);
+        if (number >= 1 && number <= 12) {
+            return std::make_pair(GLFW_KEY_F1 + (number - 1), ImGuiKey_F1 + (number - 1));
+        }
+    }
+    if (token == "SPACE") return std::make_pair(GLFW_KEY_SPACE, ImGuiKey_Space);
+    if (token == "TAB") return std::make_pair(GLFW_KEY_TAB, ImGuiKey_Tab);
+    if (token == "ENTER" || token == "RETURN") return std::make_pair(GLFW_KEY_ENTER, ImGuiKey_Enter);
+    if (token == "ESC" || token == "ESCAPE") return std::make_pair(GLFW_KEY_ESCAPE, ImGuiKey_Escape);
+    if (token == "DELETE" || token == "DEL") return std::make_pair(GLFW_KEY_DELETE, ImGuiKey_Delete);
+    if (token == "BACKSPACE") return std::make_pair(GLFW_KEY_BACKSPACE, ImGuiKey_Backspace);
+    if (token == "LEFT") return std::make_pair(GLFW_KEY_LEFT, ImGuiKey_LeftArrow);
+    if (token == "RIGHT") return std::make_pair(GLFW_KEY_RIGHT, ImGuiKey_RightArrow);
+    if (token == "UP") return std::make_pair(GLFW_KEY_UP, ImGuiKey_UpArrow);
+    if (token == "DOWN") return std::make_pair(GLFW_KEY_DOWN, ImGuiKey_DownArrow);
+    return std::nullopt;
+}
+
+std::optional<EditorKeybinding> parseShortcutDisplay(std::string display, EditorCommandContext context) {
+    display.erase(std::remove_if(display.begin(), display.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }), display.end());
+    if (display.empty()) {
+        return std::nullopt;
+    }
+    EditorKeybinding binding;
+    binding.context = context;
+    binding.display = display;
+    std::stringstream stream(display);
+    std::string token;
+    while (std::getline(stream, token, '+')) {
+        token = upperString(token);
+        if (token == "CTRL" || token == "CONTROL" || token == "CMD") {
+            binding.ctrl = true;
+            continue;
+        }
+        if (token == "SHIFT") {
+            binding.shift = true;
+            continue;
+        }
+        if (token == "ALT" || token == "OPTION") {
+            binding.alt = true;
+            continue;
+        }
+        const std::optional<std::pair<int, int>> codes = keyCodesForToken(token);
+        if (!codes.has_value()) {
+            return std::nullopt;
+        }
+        binding.glfwKey = codes->first;
+        binding.imguiKey = codes->second;
+    }
+    return binding.glfwKey >= 0 || binding.imguiKey >= 0 ? std::optional<EditorKeybinding>{binding} : std::nullopt;
 }
 
 } // namespace
@@ -98,6 +182,7 @@ const CommandRegistry& defaultEditorCommandRegistry() {
         add(EditorCommandId::ReloadShaders, "Reload Shaders", "Engine", "Reload renderer shaders", ctrlKey(GLFW_KEY_R, ImGuiKey_R, "Ctrl+R"));
         add(EditorCommandId::ShowControls, "Controls", "Engine", "Show controls reference");
         add(EditorCommandId::ShowRendererInfo, "Renderer Info", "Engine", "Show renderer information");
+        add(EditorCommandId::CommandPalette, "Command Palette", "Window", "Search and execute editor commands", ctrlShiftKey(GLFW_KEY_P, ImGuiKey_P, "Ctrl+Shift+P"));
 
         add(EditorCommandId::ResetAccumulation, "Reset Accumulation", "Render", "Reset path tracing accumulation", key(GLFW_KEY_R, ImGuiKey_R, "R"));
         add(EditorCommandId::ToggleDenoiser, "Toggle Denoiser", "Render", "Toggle the denoiser");
@@ -121,6 +206,11 @@ const CommandRegistry& defaultEditorCommandRegistry() {
         add(EditorCommandId::SetToneMapperPbrNeutral, "PBR Neutral Tonemapper", "Render", "Switch tonemapper to PBR Neutral", key(GLFW_KEY_4, ImGuiKey_4, "4"));
         add(EditorCommandId::SetToneMapperAgx, "AgX Tonemapper", "Render", "Switch tonemapper to AgX", key(GLFW_KEY_5, ImGuiKey_5, "5"));
         add(EditorCommandId::ToggleAutoExposure, "Toggle Auto Exposure", "Render", "Toggle auto exposure", key(GLFW_KEY_6, ImGuiKey_6, "6"));
+        add(EditorCommandId::RenderCurrentViewport, "Render current viewport", "Render", "Render the current viewport to the render output folder");
+        add(EditorCommandId::RenderImage, "Render image", "Render", "Open the still-image render workflow");
+        add(EditorCommandId::RenderSequence, "Render sequence", "Render", "Render the current timeline range as an image sequence");
+        add(EditorCommandId::StopRender, "Stop render", "Render", "Cancel the active editor render job");
+        add(EditorCommandId::OpenOutputFolder, "Open Output Folder", "Render", "Open the editor render output folder");
 
         add(EditorCommandId::SaveLayout, "Save Layout", "Layout", "Save the current layout");
         add(EditorCommandId::ResetLayout, "Reset Layout", "Layout", "Reset the editor layout");
@@ -151,6 +241,45 @@ const char* editorCommandShortcut(EditorCommandId id) {
     return command != nullptr && !command->defaultKeybinding.display.empty()
         ? command->defaultKeybinding.display.c_str()
         : nullptr;
+}
+
+std::string editorCommandPreferenceKey(const EditorCommand& command) {
+    return command.category + "." + command.name;
+}
+
+std::string editorCommandPreferenceKey(EditorCommandId id) {
+    const EditorCommand* command = editorCommand(id);
+    return command != nullptr ? editorCommandPreferenceKey(*command) : std::string{};
+}
+
+EditorKeybinding editorCommandKeybinding(EditorCommandId id, const EditorPreferences* preferences) {
+    const EditorCommand* command = editorCommand(id);
+    if (command == nullptr) {
+        return {};
+    }
+    if (preferences != nullptr) {
+        const auto it = preferences->commandShortcutOverrides.find(editorCommandPreferenceKey(*command));
+        if (it != preferences->commandShortcutOverrides.end()) {
+            if (std::optional<EditorKeybinding> parsed = parseShortcutDisplay(it->second, command->defaultKeybinding.context)) {
+                return *parsed;
+            }
+        }
+    }
+    return command->defaultKeybinding;
+}
+
+std::string editorCommandShortcutDisplay(EditorCommandId id, const EditorPreferences* preferences) {
+    const EditorCommand* command = editorCommand(id);
+    if (command == nullptr) {
+        return {};
+    }
+    if (preferences != nullptr) {
+        const auto it = preferences->commandShortcutOverrides.find(editorCommandPreferenceKey(*command));
+        if (it != preferences->commandShortcutOverrides.end()) {
+            return it->second;
+        }
+    }
+    return command->defaultKeybinding.display;
 }
 
 const char* editorCommandName(EditorCommandId id) {

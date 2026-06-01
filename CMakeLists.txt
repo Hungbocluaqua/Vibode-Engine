@@ -173,7 +173,7 @@ if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
 endif()
 
 if(WIN32)
-    target_link_libraries(rtvulkan PRIVATE Comdlg32 User32 Shell32)
+    target_link_libraries(rtvulkan PRIVATE Comdlg32 User32 Shell32 Dwmapi)
 endif()
 
 if(MSVC)

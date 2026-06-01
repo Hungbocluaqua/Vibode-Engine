@@ -141,6 +141,12 @@ void CommandSystem::waitForFrameFences() const {
     }
 }
 
+void CommandSystem::waitForPresentQueueIdle() const {
+    if (context_.presentQueue() != VK_NULL_HANDLE) {
+        checkVk(vkQueueWaitIdle(context_.presentQueue()), "vkQueueWaitIdle(present)");
+    }
+}
+
 void CommandSystem::createFrameResources() {
     for (FrameResources& frame : frames_) {
         VkCommandPoolCreateInfo poolInfo{};
@@ -226,9 +232,13 @@ void CommandSystem::recreateSwapchainResources() {
         return;
     }
     waitForFrameFences();
+    waitForPresentQueueIdle();
     destroyPresentSemaphores();
     swapchain_.recreate();
     createPresentSemaphores();
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->onSwapchainRecreated(swapchain_);
+    }
 }
 
 void CommandSystem::recordWorkCommands(VkCommandBuffer commandBuffer, uint32_t, float clearPhase) const {

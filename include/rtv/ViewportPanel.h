@@ -56,6 +56,7 @@ private:
 
     bool showGrid_ = false;
     bool showAxes_ = true;
+    bool showSelectionOverlay_ = true;
 
     uint32_t lastSampleCount_ = 0;
 };

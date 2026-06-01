@@ -24,6 +24,15 @@ ImU32 colorForType(NotificationType type) {
 } // namespace
 
 void NotificationManager::notify(std::string message, NotificationType type, float durationSeconds) {
+    notify(std::move(message), type, NotificationAction::OpenLog, "Open Log", durationSeconds);
+}
+
+void NotificationManager::notify(
+    std::string message,
+    NotificationType type,
+    NotificationAction action,
+    std::string actionLabel,
+    float durationSeconds) {
     if (log_ != nullptr) {
         EditorLogCategory category = EditorLogCategory::Info;
         switch (type) {
@@ -43,12 +52,16 @@ void NotificationManager::notify(std::string message, NotificationType type, flo
     if (!active_.empty() && active_.back().message == message && active_.back().type == type) {
         active_.back().ageSeconds = 0.0f;
         active_.back().durationSeconds = durationSeconds;
+        active_.back().action = action;
+        active_.back().actionLabel = std::move(actionLabel);
         return;
     }
 
     active_.push_back(Notification{
         .message = std::move(message),
         .type = type,
+        .action = action,
+        .actionLabel = std::move(actionLabel),
         .ageSeconds = 0.0f,
         .durationSeconds = std::max(durationSeconds, 0.5f),
     });
@@ -64,6 +77,12 @@ void NotificationManager::update(float deltaSeconds) {
     while (!active_.empty() && active_.front().ageSeconds >= active_.front().durationSeconds) {
         active_.pop_front();
     }
+}
+
+NotificationAction NotificationManager::consumeRequestedAction() {
+    const NotificationAction action = requestedAction_;
+    requestedAction_ = NotificationAction::None;
+    return action;
 }
 
 void NotificationManager::draw() {
@@ -100,6 +119,11 @@ void NotificationManager::draw() {
             ImGui::Dummy(ImVec2(0.0f, 2.0f));
             ImGui::Indent(10.0f);
             ImGui::TextWrapped("%s", notification.message.c_str());
+            if (notification.action != NotificationAction::None && !notification.actionLabel.empty()) {
+                if (ImGui::SmallButton(notification.actionLabel.c_str())) {
+                    requestedAction_ = notification.action;
+                }
+            }
             ImGui::Unindent(10.0f);
             ImGui::Dummy(ImVec2(0.0f, 2.0f));
         }

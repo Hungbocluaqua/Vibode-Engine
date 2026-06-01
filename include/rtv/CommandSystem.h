@@ -49,6 +49,7 @@ private:
     void destroyPresentSemaphores();
     void recreateSwapchainResources();
     void waitForFrameFences() const;
+    void waitForPresentQueueIdle() const;
     [[nodiscard]] bool canRecordAsyncCompute() const;
     [[nodiscard]] bool recordAsyncComputeCommands(FrameResources& frame) const;
     void submitFrame(FrameResources& frame, uint32_t imageIndex, bool asyncComputeRecorded) const;

@@ -11,6 +11,7 @@ class EditorDockspace {
 public:
     void begin(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
     void end();
+    void setProfileFile(const std::filesystem::path& layoutPath);
     void setProfilePath(const std::filesystem::path& scenePath);
     void saveLayout() const;
     void requestResetLayout();
@@ -20,12 +21,15 @@ private:
     void loadLayout();
     void executeCommand(EditorCommandId id, EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
     void drawMainMenu(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
+    void drawDockTabIconOverlays();
+    void drawDockPanelChromeOverlays();
     void drawHelpWindows();
 
     std::filesystem::path profilePath_;
     bool layoutResetRequested_ = true;
     bool showControls_ = false;
     bool showRendererInfo_ = false;
+    bool dockChromeStylePushed_ = false;
 };
 
 } // namespace rtv

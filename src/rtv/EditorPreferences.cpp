@@ -74,6 +74,7 @@ void EditorPreferences::save(const std::filesystem::path& path) const {
     json["recentProjects"] = recentProjects;
     json["lastOpenedProject"] = lastOpenedProject;
     json["openLastProject"] = openLastProject;
+    json["commandShortcutOverrides"] = commandShortcutOverrides;
 
     std::ofstream file(path);
     if (file.is_open()) {
@@ -106,6 +107,7 @@ void EditorPreferences::load(const std::filesystem::path& path) {
         if (json.contains("recentProjects")) recentProjects = json["recentProjects"].get<std::vector<std::string>>();
         if (json.contains("lastOpenedProject")) lastOpenedProject = json["lastOpenedProject"].get<std::string>();
         if (json.contains("openLastProject")) openLastProject = json["openLastProject"].get<bool>();
+        if (json.contains("commandShortcutOverrides")) commandShortcutOverrides = json["commandShortcutOverrides"].get<std::unordered_map<std::string, std::string>>();
     } catch (...) {
         // Corrupt or incompatible file — use defaults
     }

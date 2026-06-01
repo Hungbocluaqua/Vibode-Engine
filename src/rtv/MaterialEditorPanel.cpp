@@ -1,6 +1,7 @@
 #include "rtv/MaterialEditorPanel.h"
 
 #include "rtv/AssetManager.h"
+#include "rtv/EditorUiStyle.h"
 
 #include <glm/gtc/type_ptr.hpp>
 #include <imgui.h>
@@ -99,7 +100,7 @@ uint32_t materialIdForSelection(const EditorRuntimeState& state, const EditorSel
 } // namespace
 
 void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSelection& selection, EditorRequests& requests) {
-    if (!ImGui::Begin("Material Editor")) {
+    if (!ImGui::Begin(EditorDockWindowTitle::MaterialEditor)) {
         ImGui::End();
         return;
     }
