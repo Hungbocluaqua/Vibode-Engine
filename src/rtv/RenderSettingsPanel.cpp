@@ -1,5 +1,6 @@
 #include "rtv/RenderSettingsPanel.h"
 
+#include "rtv/EditorUiStyle.h"
 #include "rtv/SunController.h"
 #include "rtv/VulkanContext.h"
 
@@ -30,7 +31,7 @@ const char* serReorderingHintName(VkRayTracingInvocationReorderModeNV hint) {
 } // namespace
 
 void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& requests) {
-    if (!ImGui::Begin("Render Settings")) {
+    if (!ImGui::Begin(EditorDockWindowTitle::RenderSettings)) {
         ImGui::End();
         return;
     }
@@ -136,6 +137,26 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     uint32_t maxRestirGiRounds = 8;
     uint32_t minRestirGiVisibilityRays = 0;
     uint32_t maxRestirGiVisibilityRays = 4;
+
+    ImGui::SeparatorText("Preview Actions");
+    if (editorIconTextButton("RenderSettingsResetAccumulation", EditorGlyphIcon::Reset, "Reset Accumulation")) {
+        requests.resetAccumulation = AccumulationResetReason::Manual;
+    }
+    tooltip("Clear path tracing accumulation and rebuild the current preview from a fresh sample history.");
+    ImGui::SameLine();
+    if (editorIconTextButton("RenderSettingsCycleDebugView", EditorGlyphIcon::DrawDebug, "Debug View")) {
+        requests.toggleDebugView = true;
+    }
+    tooltip("Cycle the active renderer debug view for the current viewport preview.");
+    if (editorIconTextButton("RenderSettingsCycleIntermediate", EditorGlyphIcon::Stats, "Intermediate")) {
+        requests.cycleIntermediateView = true;
+    }
+    tooltip("Cycle intermediate render targets exposed by the renderer diagnostic path.");
+    ImGui::SameLine();
+    if (editorIconTextButton("RenderSettingsToggleDenoiser", EditorGlyphIcon::Render, "Denoiser", settings.denoiserEnabled)) {
+        requests.toggleDenoiser = true;
+    }
+    tooltip("Toggle denoising without leaving the docked Render Settings workflow.");
 
     ImGui::SeparatorText("Rendering");
     const char* renderPresetItems[] = {"Custom", "Low", "Balanced", "Ultra"};
@@ -431,10 +452,6 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         tooltip("Reduces the maximum distance of finite shadow rays to avoid self hits at the light.");
         changed |= ImGui::SliderFloat("Firefly Clamp", &settings.fireflyClamp, 1.0f, 512.0f, "%.1f");
         tooltip("Luminance clamp for single path samples before accumulation.");
-    }
-
-    if (ImGui::Button("Reset Accumulation")) {
-        requests.resetAccumulation = AccumulationResetReason::Manual;
     }
 
     if (changed) {

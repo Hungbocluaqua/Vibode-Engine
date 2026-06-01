@@ -1,0 +1,242 @@
+{
+  "activeCamera": 1,
+  "assetReferences": {
+    "environment": {
+      "assetGuid": "",
+      "hdrPath": ""
+    },
+    "materials": [],
+    "meshes": [],
+    "prefabs": [],
+    "source": {
+      "assetGuid": "",
+      "sourceGltf": ""
+    },
+    "textures": []
+  },
+  "bookmarks": [],
+  "dirtyReasons": [
+    "CameraOnly"
+  ],
+  "entities": [
+    {
+      "camera": {
+        "active": true,
+        "farPlane": 1000.0,
+        "nearPlane": 0.009999999776482582,
+        "useRenderSettingsExposure": true,
+        "verticalFovRadians": 1.0471975803375244
+      },
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 0,
+        "uuid": 1
+      },
+      "locked": false,
+      "name": "Camera",
+      "parent": 0,
+      "transform": {
+        "position": [
+          0.23189954459667206,
+          1.711503028869629,
+          3.8948867321014404
+        ],
+        "rotationEuler": [
+          -0.28000378608703613,
+          -0.1100001186132431,
+          9.36985489197184e-10
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 1,
+        "uuid": 2
+      },
+      "locked": false,
+      "name": "Cornell Fallback",
+      "parent": 0,
+      "transform": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotationEuler": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "children": [],
+      "id": {
+        "generation": 1,
+        "index": 2,
+        "uuid": 3
+      },
+      "locked": false,
+      "name": "Sun",
+      "parent": 0,
+      "sun": {
+        "angularRadiusRadians": 0.004650000017136335,
+        "castSurfaceShadows": true,
+        "castVolumetricShadows": true,
+        "colorTemperatureKelvin": 5778.0,
+        "enabled": true,
+        "exposureMultiplier": 1.0,
+        "illuminanceLux": 100000.0,
+        "shadowBounces": 1,
+        "useColorTemperature": true,
+        "volumetricShadowBounces": 0
+      },
+      "transform": {
+        "position": [
+          -3.953604164053104e-07,
+          6.599085807800293,
+          -4.522396087646484
+        ],
+        "rotationEuler": [
+          -0.9700000286102295,
+          -3.141592502593994,
+          0.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    }
+  ],
+  "environment": {
+    "backgroundIntensity": 0.3499999940395355,
+    "enabled": true,
+    "hdrPath": "",
+    "intensity": 1.0,
+    "rotation": 0.0
+  },
+  "prefabInstances": [],
+  "primarySun": 3,
+  "renderSettings": {
+    "accumulate": true,
+    "accumulationLimit": 0,
+    "adaptationSpeed": 2.0,
+    "adaptiveGpuFrameTargetMs": 16.600000381469727,
+    "adaptiveQualityMode": 2,
+    "atrousIterations": 3,
+    "autoExposureEnabled": false,
+    "brightness": 0.0,
+    "cameraJitterEnabled": true,
+    "contrast": 1.0,
+    "debugView": 0,
+    "denoiseWhileMoving": true,
+    "denoiserEnabled": true,
+    "denoiserMaxHistoryLength": 48,
+    "denoiserStrength": 1.0499999523162842,
+    "directLightingEnabled": true,
+    "dofApertureRadius": 0.0,
+    "dofBladeCount": 0,
+    "dofBokehRotation": 0.0,
+    "dofFocusDistance": 10.0,
+    "environmentDirectSamples": 1,
+    "exposure": 2.0,
+    "fireflyClamp": 8.0,
+    "gamma": 2.200000047683716,
+    "histogramHighPercentile": 0.949999988079071,
+    "histogramLowPercentile": 0.05000000074505806,
+    "histogramMaxLogLuminance": 10.0,
+    "histogramMinLogLuminance": -10.0,
+    "histogramTargetPercentile": 0.6000000238418579,
+    "homogeneousVolumeAbsorption": 0.0,
+    "homogeneousVolumeAnisotropy": 0.0,
+    "homogeneousVolumeEnabled": false,
+    "homogeneousVolumeScattering": 0.0,
+    "indirectStrength": 1.0,
+    "limitSamplesPerPixel": true,
+    "materialTextureAnisotropy": 4.0,
+    "maxBounces": 5,
+    "maxExposure": 8.0,
+    "minExposure": 0.25,
+    "mneeCausticsEnabled": false,
+    "momentValidityThreshold": 0.20000000298023224,
+    "motionBlurEnabled": false,
+    "motionBlurShutterClose": 1.0,
+    "motionBlurShutterOpen": 0.0,
+    "opacityMicromapsEnabled": true,
+    "pathTracingEnabled": true,
+    "physicalAperture": 16.0,
+    "physicalExposureCompensation": 0.0,
+    "physicalIso": 100.0,
+    "physicalShutterSeconds": 0.00800000037997961,
+    "renderPreset": 2,
+    "resolutionScale": 0.6499999761581421,
+    "restirGiDepthThresholdScale": 0.8500000238418579,
+    "restirGiEnabled": true,
+    "restirGiHalfResolution": false,
+    "restirGiSpatialCompatibilityThreshold": 0.05999999865889549,
+    "restirGiSpatialRadius": 3.75,
+    "restirGiSpatialRounds": 3,
+    "restirGiTemporalMaxAge": 18,
+    "restirGiVisibilityRayBudget": 0,
+    "restirMode": 1,
+    "samplesPerPixel": 1,
+    "saturation": 1.0,
+    "shadowDistanceBias": 0.0020000000949949026,
+    "shadowRayBias": 0.0010000000474974513,
+    "skyIntensity": 0.800000011920929,
+    "specularAaEnabled": true,
+    "taaEnabled": true,
+    "taaFeedback": 0.05999999865889549,
+    "taaMotionFeedback": 0.8999999761581421,
+    "taaReactiveFeedback": 0.9800000190734863,
+    "taaSharpeningStrength": 0.05000000074505806,
+    "targetLuminance": 0.18000000715255737,
+    "toneMapper": 3,
+    "usePhysicalCamera": false,
+    "whitePoint": 4.0
+  },
+  "rtlevel": {
+    "engineVersion": "0.1",
+    "formatVersion": 3,
+    "legacyVersion": 2,
+    "projectRelativePaths": true,
+    "sceneGuid": "fbfc803b-87ff-088f-0d60-090e6c0f00d7"
+  },
+  "sourceGltf": "",
+  "sourceHdr": "",
+  "timeline": {
+    "currentFrame": 0,
+    "endFrame": 120,
+    "frameRate": 30,
+    "playing": false,
+    "startFrame": 0,
+    "transformKeyframes": [],
+    "version": 1
+  },
+  "version": 3,
+  "worldSettings": {
+    "activeEnvironment": 0,
+    "atmosphereEnabled": true,
+    "fogEnabled": false,
+    "heightFog": 0,
+    "postProcessEnabled": true,
+    "postProcessVolume": 0,
+    "primarySun": 3,
+    "skyAtmosphere": 0
+  }
+}

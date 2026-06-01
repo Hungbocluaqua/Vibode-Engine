@@ -22,7 +22,7 @@ foreach ($field in $fields) {
     $app = @($hits | Where-Object { $_ -like '*Application.cpp*' })
     $report += [pscustomobject]@{ field=$field; matchCount=@($hits).Count; uiMatchCount=$ui.Count; applicationMatchCount=$app.Count; hasApplicationHandler=($app.Count -gt 0); matches=@($hits) }
 }
-$uiOnlyFields = @('resetLayout', 'saveLayout', 'showProjectManager')
+$uiOnlyFields = @('resetLayout', 'saveLayout', 'showProjectManager', 'showCommandPalette')
 $unhandled = @($report | Where-Object { -not $_.hasApplicationHandler -and $_.field -notin (@('settings') + $uiOnlyFields) })
 $results = @(
     (New-ToolResult -Name 'EditorRequests fields parsed' -Passed ($fields.Count -gt 0) -Message ("fields={0}" -f $fields.Count) -Details $report),

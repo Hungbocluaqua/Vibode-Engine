@@ -6,6 +6,8 @@
 
 namespace rtv {
 
+struct EditorPreferences;
+
 enum class EditorCommandId : uint32_t {
     ProjectManager,
     CloseProject,
@@ -33,6 +35,7 @@ enum class EditorCommandId : uint32_t {
     ReloadShaders,
     ShowControls,
     ShowRendererInfo,
+    CommandPalette,
     ResetAccumulation,
     ToggleDenoiser,
     ToggleMovingDenoiser,
@@ -55,6 +58,11 @@ enum class EditorCommandId : uint32_t {
     SetToneMapperPbrNeutral,
     SetToneMapperAgx,
     ToggleAutoExposure,
+    RenderCurrentViewport,
+    RenderImage,
+    RenderSequence,
+    StopRender,
+    OpenOutputFolder,
     SaveLayout,
     ResetLayout,
     Undo,
@@ -111,6 +119,10 @@ private:
 [[nodiscard]] const CommandRegistry& defaultEditorCommandRegistry();
 [[nodiscard]] const EditorCommand* editorCommand(EditorCommandId id);
 [[nodiscard]] const char* editorCommandShortcut(EditorCommandId id);
+[[nodiscard]] std::string editorCommandPreferenceKey(const EditorCommand& command);
+[[nodiscard]] std::string editorCommandPreferenceKey(EditorCommandId id);
+[[nodiscard]] EditorKeybinding editorCommandKeybinding(EditorCommandId id, const EditorPreferences* preferences = nullptr);
+[[nodiscard]] std::string editorCommandShortcutDisplay(EditorCommandId id, const EditorPreferences* preferences = nullptr);
 [[nodiscard]] const char* editorCommandName(EditorCommandId id);
 [[nodiscard]] uint32_t editorCommandContextPrecedence(EditorCommandContext context);
 

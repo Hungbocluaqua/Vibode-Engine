@@ -1,22 +1,19 @@
 {
   "cameraFastMoveSpeed": 7.5,
   "cameraMoveSpeed": 2.4000000953674316,
+  "commandShortcutOverrides": {},
   "confirmDelete": true,
   "favoriteFiles": [],
   "gridVisible": true,
   "hudScale": 1.0,
-  "lastOpenedProject": "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Projects\\MyProject\\MyProject.rtproject",
+  "lastOpenedProject": "C:\\Users\\HomePc\\Documents\\Vibode Projects\\MyProject\\MyProject.vproject",
   "layoutVersion": 2,
   "openLastProject": false,
   "recentFiles": [
-    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\san-miguel\\san-miguel.gltf",
-    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Projects\\MyProject\\Scenes/Main.rtlevel",
-    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\main_sponza\\NewSponza_Main_glTF_003.gltf",
-    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\main_sponza\\NewSponza_Curtains_glTF.gltf",
-    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Sponza\\glTF\\Sponza.gltf"
+    "C:\\Users\\HomePc\\Documents\\Vibode Projects\\MyProject\\Scenes/Main.rtlevel"
   ],
   "recentProjects": [
-    "C:\\Users\\HomePc\\ray-tracing-engine\\native\\vulkan\\Projects\\MyProject\\MyProject.rtproject"
+    "C:\\Users\\HomePc\\Documents\\Vibode Projects\\MyProject\\MyProject.vproject"
   ],
   "showHud": true,
   "themePreset": 0,

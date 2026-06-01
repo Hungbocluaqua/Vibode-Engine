@@ -77,17 +77,31 @@ struct Light {
     LightType type = LightType::Point;
     glm::vec3 color{1.0f};
     float intensity = 1.0f;
+    float exposureMultiplier = 1.0f;
     float sizeOrRadius = 1.0f;
     float innerConeRadians = 0.35f;
     float outerConeRadians = 0.70f;
     bool enabled = true;
+    bool useColorTemperature = false;
+    float colorTemperatureKelvin = 5778.0f;
+    bool visibleToCamera = true;
+    bool castSurfaceShadows = true;
+    bool castVolumetricShadows = true;
+    std::string iesProfile;
+    std::string materialSource = "None";
 };
 
 struct Sun {
     bool enabled = true;
     float illuminanceLux = 100000.0f;
+    float exposureMultiplier = 1.0f;
     float angularRadiusRadians = 0.00465f;
+    bool useColorTemperature = true;
     float colorTemperatureKelvin = 5778.0f;
+    bool castSurfaceShadows = true;
+    bool castVolumetricShadows = true;
+    uint32_t shadowBounces = 1;
+    uint32_t volumetricShadowBounces = 0;
 };
 
 struct Camera {
@@ -150,6 +164,15 @@ struct CameraPostProcess {
     bool overrideDepthOfField = false;
     float dofApertureRadius = 0.0f;
     float dofFocusDistance = 10.0f;
+    bool bloomEnabled = false;
+    float bloomIntensity = 0.0f;
+    bool colorCorrectionEnabled = true;
+    float colorCorrectionSaturation = 1.0f;
+    float colorCorrectionContrast = 1.0f;
+    bool vignettingEnabled = false;
+    float vignettingIntensity = 0.0f;
+    bool filmGrainEnabled = false;
+    float filmGrainIntensity = 0.0f;
 };
 
 struct WorldSettings {

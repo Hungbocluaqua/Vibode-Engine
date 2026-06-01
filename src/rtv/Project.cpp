@@ -59,7 +59,7 @@ ProjectContext makeProjectContext(
     project.projectFile = projectFile;
     project.contentRoot = projectRoot / "Content";
     project.scenesRoot = projectRoot / "Scenes";
-    project.cacheRoot = projectRoot / "Cache";
+    project.cacheRoot = projectRoot / "DerivedDataCache";
     project.savedRoot = projectRoot / "Saved";
     project.configRoot = projectRoot / "Config";
     project.buildRoot = projectRoot / "Build";
@@ -148,6 +148,7 @@ bool createProjectFolders(const ProjectContext& project, bool createDefaultConte
         project.cacheRoot / "Shaders",
         project.cacheRoot / "BLAS",
         project.cacheRoot / "Thumbnails",
+        project.projectRoot / "Intermediate",
         project.savedRoot / "Autosaves",
         project.savedRoot / "Logs",
         project.savedRoot / "Backups",

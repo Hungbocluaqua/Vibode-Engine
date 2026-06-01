@@ -13,9 +13,9 @@ $base = if ([System.IO.Path]::IsPathRooted($Location)) { $Location } else { Join
 $projectRoot = Join-Path $base $Name
 if ((Test-Path $projectRoot) -and -not $Force) { throw "Project fixture already exists: $projectRoot. Pass -Force to reuse." }
 New-Item -ItemType Directory -Force $projectRoot | Out-Null
-$folders = @('Content','Content\Models','Content\Materials','Content\Textures','Content\HDRI','Content\Prefabs','Content\VDB','Scenes','Cache','Cache\Meshes','Cache\Textures','Cache\Shaders','Cache\BLAS','Cache\Thumbnails','Saved','Saved\Autosaves','Saved\Logs','Saved\Backups','Config','Build')
+$folders = @('Content','Content\Models','Content\Materials','Content\Textures','Content\HDRI','Content\Prefabs','Content\VDB','Scenes','DerivedDataCache','DerivedDataCache\Meshes','DerivedDataCache\Textures','DerivedDataCache\Shaders','DerivedDataCache\BLAS','DerivedDataCache\Thumbnails','Intermediate','Saved','Saved\Autosaves','Saved\Logs','Saved\Backups','Config','Build')
 foreach ($folder in $folders) { New-Item -ItemType Directory -Force (Join-Path $projectRoot $folder) | Out-Null }
-if ($Template -eq 'BrokenMissingFolders') { Remove-Item -Recurse -Force (Join-Path $projectRoot 'Cache\BLAS') }
+if ($Template -eq 'BrokenMissingFolders') { Remove-Item -Recurse -Force (Join-Path $projectRoot 'DerivedDataCache\BLAS') }
 $project = [ordered]@{
     version = 1
     projectGuid = [guid]::NewGuid().ToString()
@@ -24,7 +24,7 @@ $project = [ordered]@{
     startupScene = 'Scenes/Main.rtlevel'
     contentRoot = 'Content'
     scenesRoot = 'Scenes'
-    cacheRoot = 'Cache'
+    cacheRoot = 'DerivedDataCache'
     savedRoot = 'Saved'
     configRoot = 'Config'
     assetRegistry = 'Content/AssetRegistry.json'
@@ -32,7 +32,7 @@ $project = [ordered]@{
     autosaveEnabled = $true
     autosaveIntervalMinutes = 5
 }
-$project | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $projectRoot "$Name.rtproject") -Encoding UTF8
+$project | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $projectRoot "$Name.vproject") -Encoding UTF8
 @{ version = 1; assets = @() } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $projectRoot 'Content\AssetRegistry.json') -Encoding UTF8
 @{ recentProjects = @(); lastOpenedProject = '' } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $projectRoot 'Config\EditorConfig.json') -Encoding UTF8
 @{} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $projectRoot 'Config\Layout.json') -Encoding UTF8
@@ -46,6 +46,6 @@ if ($Template -ne 'Empty') {
     }
     $scene | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $projectRoot 'Scenes\Main.rtlevel') -Encoding UTF8
 }
-$result = [pscustomobject]@{ projectRoot=$projectRoot; projectFile=(Join-Path $projectRoot "$Name.rtproject"); template=$Template }
+$result = [pscustomobject]@{ projectRoot=$projectRoot; projectFile=(Join-Path $projectRoot "$Name.vproject"); template=$Template }
 if ($JsonOut) { $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $JsonOut -Encoding UTF8 }
 $result

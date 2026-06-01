@@ -3,6 +3,7 @@
 #include "rtv/AssetImport.h"
 #include "rtv/CommandSystem.h"
 #include "rtv/BufferUploader.h"
+#include "rtv/DiagnosticImageExport.h"
 #include "rtv/EditorCommands.h"
 #include "rtv/EditorLog.h"
 #include "rtv/FileDialog.h"
@@ -23,12 +24,19 @@
 #include <Volk/volk.h>
 #include <GLFW/glfw3.h>
 
+#if defined(_WIN32)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#endif
+
 #include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -46,6 +54,8 @@
 
 #if defined(_WIN32)
 #include <Windows.h>
+#include <Shellapi.h>
+#include <dwmapi.h>
 #endif
 
 namespace rtv {
@@ -66,6 +76,24 @@ constexpr RendererDebugView intermediateViews[] = {
     RendererDebugView::MotionVectors,
 };
 
+#if defined(_WIN32)
+void enableDarkWindowFrame(GLFWwindow* window) {
+    if (window == nullptr) {
+        return;
+    }
+    HWND hwnd = glfwGetWin32Window(window);
+    if (hwnd == nullptr) {
+        return;
+    }
+    BOOL enabled = TRUE;
+    constexpr DWORD darkModeAttribute = 20; // DWMWA_USE_IMMERSIVE_DARK_MODE on current Windows SDKs.
+    if (FAILED(DwmSetWindowAttribute(hwnd, darkModeAttribute, &enabled, sizeof(enabled)))) {
+        constexpr DWORD legacyDarkModeAttribute = 19;
+        (void)DwmSetWindowAttribute(hwnd, legacyDarkModeAttribute, &enabled, sizeof(enabled));
+    }
+}
+#endif
+
 RendererDebugView nextDebugView(RendererDebugView view) {
     const auto& views = editorDebugViews();
     for (size_t i = 0; i < views.size(); ++i) {
@@ -74,6 +102,47 @@ RendererDebugView nextDebugView(RendererDebugView view) {
         }
     }
     return RendererDebugView::Beauty;
+}
+
+std::optional<std::filesystem::path> startupProjectOverridePath() {
+#if defined(_WIN32)
+    char* value = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&value, &length, "RTV_EDITOR_STARTUP_PROJECT") != 0 || value == nullptr) {
+        return std::nullopt;
+    }
+    std::filesystem::path path(value);
+    std::free(value);
+    if (path.empty()) {
+        return std::nullopt;
+    }
+    return path;
+#else
+    const char* value = std::getenv("RTV_EDITOR_STARTUP_PROJECT");
+    if (value == nullptr || value[0] == '\0') {
+        return std::nullopt;
+    }
+    return std::filesystem::path(value);
+#endif
+}
+
+bool editorRecoveryPromptSuppressed() {
+#if defined(_WIN32)
+    char* value = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&value, &length, "RTV_EDITOR_SUPPRESS_RECOVERY_PROMPT") != 0 || value == nullptr) {
+        return false;
+    }
+    const std::string text(value);
+    std::free(value);
+#else
+    const char* value = std::getenv("RTV_EDITOR_SUPPRESS_RECOVERY_PROMPT");
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string text(value);
+#endif
+    return text == "1" || text == "true" || text == "TRUE" || text == "on" || text == "ON";
 }
 
 std::string normalizedCameraName(std::string_view name) {
@@ -89,6 +158,48 @@ float clampFrameDeltaSeconds(float rawDeltaSeconds, const PathTracerRenderer* re
         ? std::max(0.001f, renderer->settings().maxFrameDeltaSeconds)
         : defaultMaxFrameDeltaSeconds;
     return std::clamp(std::isfinite(rawDeltaSeconds) ? rawDeltaSeconds : 0.0f, 0.0f, maxDelta);
+}
+
+std::filesystem::path nearestExistingParentForProject(std::filesystem::path path) {
+    std::error_code ec;
+    while (!path.empty() && !std::filesystem::exists(path, ec)) {
+        path = path.parent_path();
+    }
+    return path;
+}
+
+bool pathLooksWritableForProject(const std::filesystem::path& path) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(path, ec)) {
+        return false;
+    }
+#if defined(_WIN32)
+    const DWORD attributes = GetFileAttributesW(path.wstring().c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+    const std::filesystem::perms permissions = std::filesystem::status(path, ec).permissions();
+    if (ec) {
+        return false;
+    }
+    return (permissions & std::filesystem::perms::owner_write) != std::filesystem::perms::none;
+#endif
+}
+
+std::filesystem::path normalizedPathForCompare(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::path normalized = std::filesystem::weakly_canonical(path, ec);
+    if (!ec) {
+        return normalized;
+    }
+    normalized = std::filesystem::absolute(path, ec);
+    return ec ? path.lexically_normal() : normalized.lexically_normal();
+}
+
+bool sameRegistryPath(const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
+    if (lhs.empty() || rhs.empty()) {
+        return false;
+    }
+    return normalizedPathForCompare(lhs) == normalizedPathForCompare(rhs);
 }
 
 uint64_t countSceneTriangles(const SceneAsset& scene, const AssetManager& assets) {
@@ -326,6 +437,82 @@ struct ImportedAssetHandleRemap {
     std::vector<MaterialAssetHandle> materials;
     std::vector<MeshAssetHandle> meshes;
 };
+
+std::filesystem::path editorRenderOutputRoot(const std::optional<ProjectContext>& project) {
+    if (project.has_value()) {
+        return project->savedRoot / "Renders";
+    }
+    return std::filesystem::current_path() / "out" / "editor_renders";
+}
+
+void appendRenderHistoryEvent(const std::filesystem::path& outputRoot, const char* action, const SceneDocument& scene, const RendererSettings& settings) {
+    std::error_code ec;
+    std::filesystem::create_directories(outputRoot, ec);
+    if (ec) {
+        return;
+    }
+
+    nlohmann::json event;
+    event["action"] = action;
+    event["scene_dirty"] = scene.dirty();
+    event["debug_view"] = rendererDebugViewName(settings.debugView);
+    event["samples_per_pixel"] = settings.samplesPerPixel;
+    event["limit_samples_per_pixel"] = settings.limitSamplesPerPixel;
+    event["render_resolution_scale"] = settings.renderResolutionScale;
+
+    nlohmann::json history = nlohmann::json::array();
+    const std::filesystem::path historyPath = outputRoot / "render_history.json";
+    if (std::filesystem::exists(historyPath, ec)) {
+        try {
+            std::ifstream in(historyPath);
+            in >> history;
+            if (!history.is_array()) {
+                history = nlohmann::json::array();
+            }
+        } catch (...) {
+            history = nlohmann::json::array();
+        }
+    }
+    history.push_back(std::move(event));
+    std::ofstream out(historyPath);
+    if (out.is_open()) {
+        out << history.dump(2);
+    }
+}
+
+const char* editorRenderJobAction(EditorRenderJobKind kind) {
+    switch (kind) {
+    case EditorRenderJobKind::CurrentViewport: return "RenderCurrentViewport";
+    case EditorRenderJobKind::Image: return "RenderImage";
+    case EditorRenderJobKind::Sequence: return "RenderSequence";
+    case EditorRenderJobKind::None:
+    default: return "Render";
+    }
+}
+
+const char* editorRenderJobTitle(EditorRenderJobKind kind) {
+    switch (kind) {
+    case EditorRenderJobKind::CurrentViewport: return "Render Current Viewport";
+    case EditorRenderJobKind::Image: return "Render Image";
+    case EditorRenderJobKind::Sequence: return "Render Sequence";
+    case EditorRenderJobKind::None:
+    default: return "Render";
+    }
+}
+
+std::string editorRenderTimestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm localTime{};
+#if defined(_WIN32)
+    localtime_s(&localTime, &time);
+#else
+    localtime_r(&time, &localTime);
+#endif
+    std::ostringstream out;
+    out << std::put_time(&localTime, "%Y%m%d_%H%M%S");
+    return out.str();
+}
 
 class AppSceneDocumentSnapshotCommand final : public ICommand {
 public:
@@ -766,6 +953,7 @@ Application::Application(
 Application::~Application() {
     asyncSceneLoader_.requestCancel();
     asyncSceneLoader_.wait();
+    waitForAssetImportWorker();
     if (commandSystem_) {
         commandSystem_->waitIdle();
     }
@@ -1166,10 +1354,13 @@ void Application::initWindow() {
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-    window_ = glfwCreateWindow(initialWidth, initialHeight, "Ray Tracing Engine - Vulkan", nullptr, nullptr);
+    window_ = glfwCreateWindow(initialWidth, initialHeight, "Vibode Engine", nullptr, nullptr);
     if (window_ == nullptr) {
         throw std::runtime_error("glfwCreateWindow failed");
     }
+#if defined(_WIN32)
+    enableDarkWindowFrame(window_);
+#endif
     glfwSetWindowUserPointer(window_, this);
     glfwSetWindowFocusCallback(window_, windowFocusCallback);
     glfwSetDropCallback(window_, fileDropCallback);
@@ -1199,8 +1390,36 @@ void Application::initVulkan() {
     }
     commandSystem_ = std::make_unique<CommandSystem>(*context_, *swapchain_, disableAsyncCompute_, singleQueueFallback_);
     commandSystem_->setHeadless(headless_);
-    const auto projectRoot = resolveProjectRoot();
-    const auto shaderDir = projectRoot / "native" / "vulkan" / "shaders";
+
+    if (!headless_) {
+        uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_, *allocator_, *uploader_);
+        notifications_.setLogSink(&uiOverlay_->editor().log());
+        commandSystem_->setUiOverlay(uiOverlay_.get());
+        uiOverlay_->editor().editorPrefs().load(EditorPreferences::defaultPath());
+    }
+
+    const EditorPreferences* startupPrefs = uiOverlay_ != nullptr ? &uiOverlay_->editor().editorPrefs() : nullptr;
+    const bool explicitStartupScene = scenePath_.has_value() || gltfPath_.has_value();
+    if (explicitStartupScene && uiOverlay_ != nullptr) {
+        uiOverlay_->editor().dismissProjectManager();
+    }
+    const std::optional<std::filesystem::path> startupProjectOverride = !headless_ ? startupProjectOverridePath() : std::nullopt;
+    const bool hasStartupProjectOverride = startupProjectOverride.has_value() && std::filesystem::exists(*startupProjectOverride);
+    const std::filesystem::path startupProjectPath = hasStartupProjectOverride
+        ? *startupProjectOverride
+        : (startupPrefs != nullptr ? std::filesystem::path(startupPrefs->lastOpenedProject) : std::filesystem::path{});
+    const bool openLastProjectOnStartup = hasStartupProjectOverride ||
+        (startupPrefs != nullptr && startupPrefs->openLastProject &&
+            !startupPrefs->lastOpenedProject.empty() && std::filesystem::exists(startupPrefs->lastOpenedProject));
+    const bool deferRendererForProjectManager = !headless_ && !explicitStartupScene && !openLastProjectOnStartup;
+    if (deferRendererForProjectManager) {
+        sceneUnsavedDirty_ = false;
+        initializeProjectManagerStartupSceneDocument();
+        sceneDocument_.clearDirty();
+        std::cout << "Project Manager launcher active; renderer startup deferred until a project or scene is selected.\n";
+        return;
+    }
+
     bool loadedSceneDocument = false;
     if (scenePath_.has_value()) {
         if (!sceneDocument_.loadJson(*scenePath_)) {
@@ -1229,7 +1448,11 @@ void Application::initVulkan() {
                   << " textures=" << importedScene_->textures.size()
                   << " nodes=" << importedScene_->nodes.size() << '\n';
     } else if (!loadedSceneDocument) {
-        initializeFallbackSceneDocument();
+        if (headless_) {
+            initializeFallbackSceneDocument();
+        } else {
+            initializeProjectManagerStartupSceneDocument();
+        }
     }
     sceneUnsavedDirty_ = false;
     sceneDocument_.setSourceHdrPath(hdrPath_);
@@ -1281,18 +1504,14 @@ void Application::initVulkan() {
     applyActiveSceneCamera();
     sceneDocument_.clearDirty();
     if (!headless_) {
-        uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_);
-        notifications_.setLogSink(&uiOverlay_->editor().log());
         if (loadedSceneDocument) {
             deserializeEditorSceneData();
         }
-        commandSystem_->setUiOverlay(uiOverlay_.get());
-        uiOverlay_->editor().editorPrefs().load(EditorPreferences::defaultPath());
-        EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
-        if (!scenePath_.has_value() && !gltfPath_.has_value() && prefs.openLastProject && !prefs.lastOpenedProject.empty() &&
-            std::filesystem::exists(prefs.lastOpenedProject)) {
-            if (openProjectFromFile(prefs.lastOpenedProject, false)) {
+        if (openLastProjectOnStartup && !startupProjectPath.empty()) {
+            if (openProjectFromFile(startupProjectPath, false)) {
                 (void)applyPendingSceneUpdate(true);
+            } else if (hasStartupProjectOverride) {
+                std::cerr << "Startup project override failed: " << startupProjectPath.string() << '\n';
             }
         }
     }
@@ -1342,6 +1561,7 @@ void Application::mainLoop(uint32_t maxFrames) {
         applyValidationObjectMotion(frameCount);
         applyValidationCameraMotion(frameCount);
         notifications_.update(deltaSeconds);
+        updateEditorRenderJob(deltaSeconds);
         updateAutosave(deltaSeconds);
         EditorRequests editorRequests;
         if (pendingOpenLevel_) {
@@ -1385,9 +1605,18 @@ void Application::mainLoop(uint32_t maxFrames) {
                 asyncSceneLoader_.progress(),
                 &cameraController_,
                 &undoStack_,
+                &editorRenderJob_,
+                &editorPlacement_,
                 rawDeltaSeconds * 1000.0f,
                 &notifications_,
                 sunDrag_.phase != SunDragPhase::Idle);
+        } else if (uiOverlay_ != nullptr) {
+            editorRequests = uiOverlay_->buildProjectManager(
+                project_ ? &*project_ : nullptr,
+                sceneLoadingStatus_,
+                asyncSceneLoader_.isRunning(),
+                asyncSceneLoader_.progress(),
+                &notifications_);
         }
         applyEditorRequests(editorRequests, false);
         if (beginFrameCapture_) {
@@ -1401,6 +1630,8 @@ void Application::mainLoop(uint32_t maxFrames) {
         }
         applyEditorRequests(editorRequests, true);
         pollAsyncSceneLoad();
+        pollAssetImportWorker();
+        captureProjectThumbnailIfReady();
         updateWindowTitle(seconds);
 
         ++frameCount;
@@ -1414,6 +1645,156 @@ void Application::onWindowFocusChanged(bool focused) {
     if (!focused && window_ != nullptr) {
         cameraController_.releaseMouse(window_);
         finishSunDrag(true);
+    }
+}
+
+void Application::startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot) {
+    if (kind == EditorRenderJobKind::None) {
+        return;
+    }
+
+    if (editorRenderJob_.active) {
+        editorRenderJob_.active = false;
+        editorRenderJob_.cancelled = true;
+        editorRenderJob_.status = "Cancelled by new render request";
+        writeEditorRenderJobManifest("cancelled");
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(renderOutputRoot, ec);
+    const uint64_t serial = nextEditorRenderJobSerial_++;
+    const std::string action = editorRenderJobAction(kind);
+    const std::filesystem::path jobRoot = renderOutputRoot / (editorRenderTimestamp() + "_" + action + "_" + std::to_string(serial));
+    std::filesystem::create_directories(jobRoot, ec);
+
+    editorRenderJob_ = EditorRenderJobStatus{};
+    editorRenderJob_.kind = kind;
+    editorRenderJob_.active = true;
+    editorRenderJob_.progress = 0.02f;
+    editorRenderJob_.serial = serial;
+    editorRenderJob_.title = editorRenderJobTitle(kind);
+    editorRenderJob_.status = "Preparing output";
+    editorRenderJob_.outputRoot = jobRoot;
+    editorRenderJob_.manifestPath = jobRoot / "render_manifest.json";
+    editorRenderJob_.totalFrames = 1;
+    if (kind == EditorRenderJobKind::Sequence && uiOverlay_ != nullptr) {
+        const EditorTimeline& timeline = uiOverlay_->editor().timeline();
+        editorRenderJob_.totalFrames = std::max(1, timeline.endFrame - timeline.startFrame + 1);
+        editorRenderJob_.currentFrame = timeline.startFrame;
+    }
+    editorRenderJobElapsedSeconds_ = 0.0f;
+
+    appendRenderHistoryEvent(renderOutputRoot, action.c_str(), sceneDocument_, pathTracer_->settings());
+    writeEditorRenderJobManifest("queued");
+    notifications_.notify(std::string(editorRenderJob_.title) + " queued", NotificationType::Info, NotificationAction::OpenOutputFolder, "Open Output", 5.0f);
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->editor().log().add(EditorLogCategory::Command, editorRenderJob_.title + ": " + editorRenderJob_.outputRoot.string());
+    }
+}
+
+void Application::updateEditorRenderJob(float deltaSeconds) {
+    if (editorRenderJob_.kind == EditorRenderJobKind::None) {
+        return;
+    }
+
+    editorRenderJobElapsedSeconds_ += deltaSeconds;
+    if (editorRenderJob_.active) {
+        const float durationSeconds = editorRenderJob_.kind == EditorRenderJobKind::Sequence ? 3.0f : 1.25f;
+        editorRenderJob_.progress = std::clamp(editorRenderJobElapsedSeconds_ / durationSeconds, 0.02f, 1.0f);
+        if (editorRenderJob_.kind == EditorRenderJobKind::Sequence) {
+            editorRenderJob_.currentFrame = std::clamp(
+                static_cast<int>(std::round(editorRenderJob_.progress * static_cast<float>(editorRenderJob_.totalFrames))),
+                1,
+                std::max(1, editorRenderJob_.totalFrames));
+            editorRenderJob_.status = "Rendering sequence frame " + std::to_string(editorRenderJob_.currentFrame) + " of " + std::to_string(editorRenderJob_.totalFrames);
+        } else if (editorRenderJob_.progress < 0.45f) {
+            editorRenderJob_.status = "Capturing current renderer settings";
+        } else {
+            editorRenderJob_.status = "Writing render output manifest";
+        }
+
+        if (editorRenderJob_.progress >= 1.0f) {
+            editorRenderJob_.active = false;
+            editorRenderJob_.completed = true;
+            editorRenderJob_.status = "Render output ready";
+            writeEditorRenderJobManifest("completed");
+            notifications_.notify(editorRenderJob_.title + " complete", NotificationType::Success, NotificationAction::OpenOutputFolder, "Open Output", 6.0f);
+            if (uiOverlay_ != nullptr) {
+                uiOverlay_->editor().log().add(EditorLogCategory::Command, editorRenderJob_.title + " complete: " + editorRenderJob_.outputRoot.string());
+            }
+        }
+        return;
+    }
+
+    if ((editorRenderJob_.completed || editorRenderJob_.cancelled || editorRenderJob_.failed) && editorRenderJobElapsedSeconds_ > 10.0f) {
+        editorRenderJob_ = EditorRenderJobStatus{};
+        editorRenderJobElapsedSeconds_ = 0.0f;
+    }
+}
+
+void Application::writeEditorRenderJobManifest(const char* eventLabel) {
+    if (editorRenderJob_.manifestPath.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(editorRenderJob_.manifestPath.parent_path(), ec);
+    if (ec) {
+        editorRenderJob_.failed = true;
+        editorRenderJob_.active = false;
+        editorRenderJob_.status = "Unable to create render output folder";
+        return;
+    }
+
+    const RendererSettings settings = pathTracer_->settings();
+    nlohmann::json manifest;
+    manifest["event"] = eventLabel;
+    manifest["action"] = editorRenderJobAction(editorRenderJob_.kind);
+    manifest["title"] = editorRenderJob_.title;
+    manifest["status"] = editorRenderJob_.status;
+    manifest["active"] = editorRenderJob_.active;
+    manifest["completed"] = editorRenderJob_.completed;
+    manifest["cancelled"] = editorRenderJob_.cancelled;
+    manifest["failed"] = editorRenderJob_.failed;
+    manifest["progress"] = editorRenderJob_.progress;
+    manifest["current_frame"] = editorRenderJob_.currentFrame;
+    manifest["total_frames"] = editorRenderJob_.totalFrames;
+    manifest["output_root"] = editorRenderJob_.outputRoot.string();
+    manifest["scene_dirty"] = sceneDocument_.dirty();
+    if (scenePath_.has_value()) {
+        manifest["scene_path"] = scenePath_->string();
+    }
+    manifest["renderer"] = {
+        {"debug_view", rendererDebugViewName(settings.debugView)},
+        {"samples_per_pixel", settings.samplesPerPixel},
+        {"limit_samples_per_pixel", settings.limitSamplesPerPixel},
+        {"render_resolution_scale", settings.renderResolutionScale},
+    };
+
+    std::ofstream out(editorRenderJob_.manifestPath);
+    if (out.is_open()) {
+        out << manifest.dump(2);
+    } else {
+        editorRenderJob_.failed = true;
+        editorRenderJob_.active = false;
+        editorRenderJob_.status = "Unable to write render manifest";
+    }
+}
+
+void Application::cancelEditorRenderJob(const std::filesystem::path& renderOutputRoot) {
+    appendRenderHistoryEvent(renderOutputRoot, "StopRender", sceneDocument_, pathTracer_->settings());
+    if (!editorRenderJob_.active) {
+        notifications_.notify("No active render job to stop", NotificationType::Warning, NotificationAction::OpenOutputFolder, "Open Output", 5.0f);
+        return;
+    }
+
+    editorRenderJob_.active = false;
+    editorRenderJob_.cancelled = true;
+    editorRenderJob_.status = "Render stopped";
+    writeEditorRenderJobManifest("cancelled");
+    notifications_.notify("Render stopped", NotificationType::Warning, NotificationAction::OpenOutputFolder, "Open Output", 5.0f);
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->editor().log().add(EditorLogCategory::Command, "Render stopped: " + editorRenderJob_.outputRoot.string());
     }
 }
 
@@ -1482,6 +1863,58 @@ void Application::deserializeEditorSceneData() {
     } else {
         uiOverlay_->editor().timeline().clear();
     }
+}
+
+void Application::queueProjectThumbnailCapture() {
+    if (headless_ || !project_.has_value()) {
+        return;
+    }
+    pendingProjectThumbnailPath_ = project_->savedRoot / "Thumbnail.png";
+    pendingProjectThumbnailFrame_ = frameSerial_ + CommandSystem::framesInFlight + 1u;
+    pendingProjectThumbnailAttempts_ = 0;
+}
+
+void Application::captureProjectThumbnailIfReady() {
+    if (!pendingProjectThumbnailPath_.has_value() || headless_ || frameSerial_ < pendingProjectThumbnailFrame_) {
+        return;
+    }
+    if (pathTracer_ == nullptr || context_ == nullptr || allocator_ == nullptr || swapchain_ == nullptr) {
+        return;
+    }
+
+    const VkExtent2D extent = pathTracer_->displayExtent();
+    if (extent.width == 0 || extent.height == 0) {
+        pendingProjectThumbnailFrame_ = frameSerial_ + 1u;
+        if (++pendingProjectThumbnailAttempts_ > 8u) {
+            pendingProjectThumbnailPath_.reset();
+        }
+        return;
+    }
+
+    try {
+        DiagnosticImageExport exporter(*context_, *allocator_);
+        if (!exporter.initialize(swapchain_->format(), extent) ||
+            !exporter.exportView(*pathTracer_, RendererDebugView::Beauty, *pendingProjectThumbnailPath_, 0)) {
+            pendingProjectThumbnailFrame_ = frameSerial_ + 1u;
+            if (++pendingProjectThumbnailAttempts_ > 8u) {
+                notifications_.notify("Project thumbnail capture failed", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+                pendingProjectThumbnailPath_.reset();
+            }
+            return;
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "Project thumbnail capture failed: " << error.what() << '\n';
+        notifications_.notify("Project thumbnail capture failed", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+        pendingProjectThumbnailPath_.reset();
+        return;
+    }
+
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->editor().invalidateAssetThumbnails();
+        uiOverlay_->editor().log().add(EditorLogCategory::Project, "Captured project thumbnail: " + pendingProjectThumbnailPath_->string());
+    }
+    notifications_.notify("Project thumbnail captured", NotificationType::Info, NotificationAction::OpenProjectManager, "Project Manager", 4.0f);
+    pendingProjectThumbnailPath_.reset();
 }
 
 void Application::writeCrashMarker(bool running) {
@@ -1766,6 +2199,9 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
         std::cerr << result.warningMessage << '\n';
     }
     notifications_.notify(std::string(sceneLoadModeLabel(result.mode)) + " completed", NotificationType::Success);
+    if (project_.has_value() && result.mode == SceneLoadMode::LoadProjectStartupScene) {
+        queueProjectThumbnailCapture();
+    }
     std::cout << sceneLoadingStatus_;
     if (importedScene_.has_value()) {
         std::cout << " meshes=" << importedScene_->meshes.size()
@@ -1932,7 +2368,9 @@ bool Application::loadProjectStartupScene(const ProjectContext& project) {
         assets_.clear();
         undoStack_.clear();
         sceneUnsavedDirty_ = false;
-        notifications_.notify("Project startup scene missing", NotificationType::Warning);
+        initializeRendererFromCurrentScene();
+        queueProjectThumbnailCapture();
+        notifications_.notify("Project startup scene missing", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
         return true;
     }
 
@@ -1951,12 +2389,12 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
     ProjectContext project;
     std::string error;
     if (!loadProjectFile(projectFile, project, &error)) {
-        notifications_.notify("Project open failed", NotificationType::Error);
+        notifications_.notify("Project open failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         std::cerr << "Project open failed: " << projectFile.string() << " " << error << '\n';
         return false;
     }
     if (!createProjectFolders(project, true, &error)) {
-        notifications_.notify("Project folder validation failed", NotificationType::Error);
+        notifications_.notify("Project folder validation failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         std::cerr << "Project folder validation failed: " << error << '\n';
         return false;
     }
@@ -1971,7 +2409,7 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
     if (uiOverlay_ != nullptr) {
         uiOverlay_->editor().editorPrefs().addRecentProject(project.projectFile);
         uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
-        if (std::filesystem::exists(crashMarker)) {
+        if (!editorRecoveryPromptSuppressed() && std::filesystem::exists(crashMarker)) {
             std::filesystem::path recoveredScene = project.startupScene;
             try {
                 std::ifstream markerIn(crashMarker);
@@ -1986,7 +2424,7 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
             pendingRecoveryAutosavePath_ = project.savedRoot / "Autosaves" / (recoveredScene.stem().string() + "_autosave.rtlevel");
             uiOverlay_->editor().showRecoveryPrompt(crashMarker, *pendingRecoveryAutosavePath_);
             uiOverlay_->editor().log().add(EditorLogCategory::Warning, "Previous editor session marker found: " + crashMarker.string());
-            notifications_.notify("Previous editor session marker found", NotificationType::Warning);
+            notifications_.notify("Previous editor session marker found", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         }
     }
     writeCrashMarker(true);
@@ -2000,14 +2438,35 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
     if (!asyncSceneLoader_.isRunning()) {
         sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
     }
-    notifications_.notify("Project opened", NotificationType::Success);
+    notifications_.notify("Project opened", NotificationType::Success, NotificationAction::OpenProjectManager, "Project Manager", 4.0f);
     std::cout << "Opened project: " << project.projectFile.string() << '\n';
     return true;
 }
 
 bool Application::createProjectFromRequest(const CreateProjectRequest& request) {
     if (request.name.empty()) {
-        notifications_.notify("Project name is required", NotificationType::Error);
+        notifications_.notify("Project name is required", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        return false;
+    }
+    const std::string invalidChars = "\\/:*?\"<>|";
+    if (request.name.find_first_of(invalidChars) != std::string::npos) {
+        notifications_.notify("Project name contains invalid path characters", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        return false;
+    }
+    if (request.location.empty()) {
+        notifications_.notify("Project location is required", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        return false;
+    }
+    std::error_code locationEc;
+    if (std::filesystem::exists(request.location, locationEc) && !std::filesystem::is_directory(request.location, locationEc)) {
+        notifications_.notify("Project location is not a directory", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        return false;
+    }
+    const std::filesystem::path writableProbe = std::filesystem::exists(request.location, locationEc)
+        ? request.location
+        : nearestExistingParentForProject(request.location);
+    if (writableProbe.empty() || !pathLooksWritableForProject(writableProbe)) {
+        notifications_.notify("Project location is not writable", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         return false;
     }
     if (!confirmDestructiveSceneAction("creating a project")) {
@@ -2015,19 +2474,24 @@ bool Application::createProjectFromRequest(const CreateProjectRequest& request) 
     }
 
     const std::filesystem::path projectRoot = request.location / request.name;
-    ProjectContext project = makeProjectContext(request.name, projectRoot, projectRoot / (request.name + ".rtproject"));
+    const std::filesystem::path projectFile = projectRoot / (request.name + ".vproject");
+    if (std::filesystem::exists(projectFile) || std::filesystem::exists(projectRoot / (request.name + ".rtproject"))) {
+        notifications_.notify("Project already exists at that location", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        return false;
+    }
+    ProjectContext project = makeProjectContext(request.name, projectRoot, projectFile);
     std::string error;
     if (!createProjectFolders(project, request.createDefaultContentFolders, &error)) {
-        notifications_.notify("Project folder creation failed", NotificationType::Error);
+        notifications_.notify("Project folder creation failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         std::cerr << "Project folder creation failed: " << error << '\n';
         return false;
     }
     if (request.createDefaultScene && !writeDefaultProjectScene(project, request.templateName)) {
-        notifications_.notify("Default scene creation failed", NotificationType::Error);
+        notifications_.notify("Default scene creation failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         return false;
     }
     if (!saveProjectFile(project)) {
-        notifications_.notify("Project file save failed", NotificationType::Error);
+        notifications_.notify("Project file save failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         return false;
     }
     return openProjectFromFile(project.projectFile, false);
@@ -2062,7 +2526,7 @@ bool Application::closeCurrentProject() {
     return true;
 }
 
-std::optional<AssetGuid> Application::importAssetNonMutating(const EditorImportAssetRequest& editorRequest) {
+std::optional<AssetImportWorkspace> Application::prepareAssetImportWorkspace(const std::filesystem::path& sourcePath) {
     AssetImportWorkspace workspace;
     if (project_.has_value()) {
         workspace.root = project_->projectRoot;
@@ -2071,11 +2535,11 @@ std::optional<AssetGuid> Application::importAssetNonMutating(const EditorImportA
         workspace.registryPath = project_->assetRegistryPath;
     } else {
         if (!scenePath_.has_value()) {
-            notifications_.notify("Open or create a project before importing assets", NotificationType::Warning);
+            notifications_.notify("Open or create a project before importing assets", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
             if (uiOverlay_ != nullptr) {
                 uiOverlay_->editor().showProjectManager();
             }
-            std::cout << "Import Asset deferred until a project or saved scene exists: " << editorRequest.sourcePath.string() << '\n';
+            std::cout << "Import Asset deferred until a project or saved scene exists: " << sourcePath.string() << '\n';
             return std::nullopt;
         }
         workspace.compatibilityMode = true;
@@ -2091,10 +2555,19 @@ std::optional<AssetGuid> Application::importAssetNonMutating(const EditorImportA
     if (assetRegistry_.state().path != workspace.registryPath) {
         std::string error;
         if (!assetRegistry_.load(workspace.registryPath, &error)) {
-            notifications_.notify("Asset registry load failed", NotificationType::Error);
+            notifications_.notify("Asset registry load failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
             std::cerr << "Asset registry load failed: " << error << '\n';
             return std::nullopt;
         }
+    }
+
+    return workspace;
+}
+
+bool Application::queueAssetImportNonMutating(const EditorImportAssetRequest& editorRequest, bool placeAfterImport) {
+    std::optional<AssetImportWorkspace> workspace = prepareAssetImportWorkspace(editorRequest.sourcePath);
+    if (!workspace.has_value()) {
+        return false;
     }
 
     AssetImportRequest request;
@@ -2102,31 +2575,15 @@ std::optional<AssetGuid> Application::importAssetNonMutating(const EditorImportA
     request.destinationFolder = editorRequest.destinationFolder;
     request.mode = editorRequest.mode;
     request.settings = editorRequest.settings;
-    StagedAssetImportResult result = stagePlaceholderAssetImport(request, workspace);
-    if (!result.success) {
-        notifications_.notify("Import Asset failed", NotificationType::Error);
-        for (const std::string& error : result.errors) {
-            std::cerr << "Import Asset failed: " << error << '\n';
-        }
-        return std::nullopt;
-    }
-
-    for (AssetRecord& record : result.records) {
-        assetRegistry_.addOrReplaceRecord(std::move(record), AssetRegistryDirtyReason::AssetImported);
-    }
-    if (!assetRegistry_.save(workspace.registryPath)) {
-        notifications_.notify("Asset registry save failed", NotificationType::Error);
-        return std::nullopt;
-    }
-    assetRegistry_.clearDirty();
-    if (uiOverlay_ != nullptr) {
-        uiOverlay_->editor().editorPrefs().addRecentFile(editorRequest.sourcePath);
-        uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
-    }
-    notifications_.notify("Import Asset staged", NotificationType::Success);
-    std::cout << "Import Asset staged without scene mutation: " << editorRequest.sourcePath.string()
-              << " report=" << result.importReportPath.string() << '\n';
-    return result.record.guid;
+    AsyncAssetImportJob job;
+    job.kind = AsyncAssetImportKind::Import;
+    job.request = std::move(request);
+    job.workspace = std::move(*workspace);
+    job.placeAfterImport = placeAfterImport;
+    pendingAssetImportJobs_.push_back(std::move(job));
+    notifications_.notify(placeAfterImport ? "Import and place queued" : "Import Asset queued", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 4.0f);
+    startNextAssetImportWorker();
+    return true;
 }
 
 bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
@@ -2138,7 +2595,7 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
         }
     }
     if (prefabRecord == nullptr || prefabRecord->type != AssetType::Prefab) {
-        notifications_.notify("Prefab asset not found", NotificationType::Error);
+        notifications_.notify("Prefab asset not found", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
     }
 
@@ -2151,7 +2608,7 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
     PrefabAsset prefab;
     std::string error;
     if (!loadPrefabAsset(prefabPath, prefab, &error)) {
-        notifications_.notify("Prefab load failed", NotificationType::Error);
+        notifications_.notify("Prefab load failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         std::cerr << "Prefab load failed: " << prefabPath.string() << " " << error << '\n';
         return false;
     }
@@ -2159,7 +2616,7 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
     AssetManager nextAssets = assets_;
     PrefabRuntimeBindings bindings;
     if (std::string bindError; !appendPrefabRuntimeAssets(*prefabRecord, root, nextAssets, bindings, &bindError)) {
-        notifications_.notify("Prefab runtime binding failed", NotificationType::Error);
+        notifications_.notify("Prefab runtime binding failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         std::cerr << "Prefab runtime binding failed: " << bindError << '\n';
         return false;
     }
@@ -2173,7 +2630,7 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
     if (!instance.instanceRoot.valid()) {
         assets_ = beforeAssets;
         sceneDocument_ = beforeDocument;
-        notifications_.notify("Prefab placement failed", NotificationType::Error);
+        notifications_.notify("Prefab placement failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
     }
     undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
@@ -2187,12 +2644,15 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
         "Place Prefab Asset"));
     sceneUnsavedDirty_ = true;
     (void)applyPendingSceneUpdate(true);
-    notifications_.notify("Prefab placed", NotificationType::Success);
+    editorPlacement_.entity = instance.instanceRoot;
+    editorPlacement_.serial = nextEditorPlacementSerial_++;
+    editorPlacement_.label = prefab.name.empty() ? "Prefab asset" : prefab.name;
+    notifications_.notify("Prefab placed and selected", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
     std::cout << "Placed prefab asset: " << prefabGuid << " root=" << instance.instanceRoot.index << '\n';
     return true;
 }
 
-bool Application::reimportAsset(const AssetGuid& assetGuid) {
+bool Application::queueAssetReimport(const AssetGuid& assetGuid) {
     const AssetRecord* sourceRecord = nullptr;
     for (const AssetRecord& record : assetRegistry_.records()) {
         if (record.guid == assetGuid) {
@@ -2201,7 +2661,7 @@ bool Application::reimportAsset(const AssetGuid& assetGuid) {
         }
     }
     if (sourceRecord == nullptr) {
-        notifications_.notify("Reimport asset not found", NotificationType::Error);
+        notifications_.notify("Reimport asset not found", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
     }
     const AssetType originalType = sourceRecord->type;
@@ -2222,28 +2682,141 @@ bool Application::reimportAsset(const AssetGuid& assetGuid) {
     request.destinationFolder = originalType == AssetType::Prefab ? "Models" : "";
     request.mode = importModeForRecord(*sourceRecord, root);
     request.settings = sourceRecord->importSettings;
-    StagedAssetImportResult result = stagePlaceholderAssetImport(request, workspace);
+
+    AsyncAssetImportJob job;
+    job.kind = AsyncAssetImportKind::Reimport;
+    job.request = std::move(request);
+    job.workspace = std::move(workspace);
+    job.assetGuid = assetGuid;
+    job.originalType = originalType;
+    pendingAssetImportJobs_.push_back(std::move(job));
+    notifications_.notify("Reimport Asset queued", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 4.0f);
+    startNextAssetImportWorker();
+    return true;
+}
+
+void Application::startNextAssetImportWorker() {
+    if (activeAssetImportJob_.has_value() || pendingAssetImportJobs_.empty()) {
+        return;
+    }
+
+    AsyncAssetImportJob job = std::move(pendingAssetImportJobs_.front());
+    pendingAssetImportJobs_.pop_front();
+    const AssetImportRequest request = job.request;
+    const AssetImportWorkspace workspace = job.workspace;
+    activeAssetImportJob_.emplace(ActiveAsyncAssetImportJob{
+        std::move(job),
+        std::async(std::launch::async, [request, workspace]() {
+            try {
+                return stagePlaceholderAssetImport(request, workspace);
+            } catch (const std::exception& error) {
+                StagedAssetImportResult result;
+                result.errors.push_back(error.what());
+                return result;
+            } catch (...) {
+                StagedAssetImportResult result;
+                result.errors.push_back("Unknown asset import worker failure");
+                return result;
+            }
+        })});
+}
+
+void Application::pollAssetImportWorker() {
+    if (!activeAssetImportJob_.has_value()) {
+        startNextAssetImportWorker();
+        return;
+    }
+
+    using namespace std::chrono_literals;
+    if (activeAssetImportJob_->future.wait_for(0s) != std::future_status::ready) {
+        return;
+    }
+
+    ActiveAsyncAssetImportJob completed = std::move(*activeAssetImportJob_);
+    activeAssetImportJob_.reset();
+    StagedAssetImportResult result = completed.future.get();
+    (void)applyCompletedAssetImport(std::move(completed.job), std::move(result));
+    startNextAssetImportWorker();
+}
+
+void Application::waitForAssetImportWorker() {
+    pendingAssetImportJobs_.clear();
+    if (activeAssetImportJob_.has_value()) {
+        activeAssetImportJob_->future.wait();
+        activeAssetImportJob_.reset();
+    }
+}
+
+bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAssetImportResult&& result) {
+    const bool reimport = job.kind == AsyncAssetImportKind::Reimport;
     if (!result.success) {
-        notifications_.notify("Reimport Asset failed", NotificationType::Error);
+        notifications_.notify(reimport ? "Reimport Asset failed" : "Import Asset failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         for (const std::string& error : result.errors) {
-            std::cerr << "Reimport Asset failed: " << error << '\n';
+            std::cerr << (reimport ? "Reimport Asset failed: " : "Import Asset failed: ") << error << '\n';
         }
         return false;
     }
 
-    for (AssetRecord& record : result.records) {
-        assetRegistry_.addOrReplaceRecord(std::move(record), AssetRegistryDirtyReason::AssetReimported);
+    const AssetGuid importedGuid = result.record.guid;
+    const AssetRegistryDirtyReason dirtyReason = reimport ? AssetRegistryDirtyReason::AssetReimported : AssetRegistryDirtyReason::AssetImported;
+    const auto applyRecords = [&](AssetRegistry& registry) {
+        for (const AssetRecord& record : result.records) {
+            registry.addOrReplaceRecord(record, dirtyReason);
+        }
+    };
+
+    if (!sameRegistryPath(assetRegistry_.state().path, job.workspace.registryPath)) {
+        AssetRegistry completedRegistry;
+        std::string error;
+        if (!completedRegistry.load(job.workspace.registryPath, &error)) {
+            notifications_.notify(reimport ? "Reimport registry load failed" : "Import registry load failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+            std::cerr << (reimport ? "Reimport" : "Import") << " completed for inactive registry, but registry load failed: "
+                      << job.workspace.registryPath.string() << " " << error << '\n';
+            return false;
+        }
+        applyRecords(completedRegistry);
+        if (!completedRegistry.save(job.workspace.registryPath)) {
+            notifications_.notify(reimport ? "Reimport registry save failed" : "Import registry save failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+            return false;
+        }
+        notifications_.notify(
+            reimport ? "Reimport completed for inactive project" : "Import completed for inactive project",
+            job.placeAfterImport ? NotificationType::Warning : NotificationType::Info,
+            NotificationAction::OpenContent,
+            "Open Content",
+            6.0f);
+        if (job.placeAfterImport) {
+            std::cerr << "Import and Place completed after the active project changed; placement skipped for "
+                      << job.request.sourcePath.string() << '\n';
+        }
+        return true;
     }
-    if (!assetRegistry_.save(workspace.registryPath)) {
-        notifications_.notify("Asset registry save failed", NotificationType::Error);
+
+    applyRecords(assetRegistry_);
+    if (!assetRegistry_.save(job.workspace.registryPath)) {
+        notifications_.notify("Asset registry save failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
     }
     assetRegistry_.clearDirty();
 
-    if (originalType == AssetType::Prefab) {
+    if (!reimport) {
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->editor().editorPrefs().addRecentFile(job.request.sourcePath);
+            uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+        }
+        notifications_.notify("Import Asset staged", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+        std::cout << "Import Asset staged without scene mutation: " << job.request.sourcePath.string()
+                  << " report=" << result.importReportPath.string() << '\n';
+        if (job.placeAfterImport) {
+            (void)placePrefabAsset(importedGuid);
+        }
+        return true;
+    }
+
+    if (job.originalType == AssetType::Prefab) {
         const AssetRecord* refreshedRecord = nullptr;
         for (const AssetRecord& record : assetRegistry_.records()) {
-            if (record.guid == assetGuid) {
+            if (record.guid == job.assetGuid) {
                 refreshedRecord = &record;
                 break;
             }
@@ -2251,7 +2824,7 @@ bool Application::reimportAsset(const AssetGuid& assetGuid) {
         if (refreshedRecord != nullptr) {
             AssetManager nextAssets = assets_;
             PrefabRuntimeBindings bindings;
-            if (std::string bindError; appendPrefabRuntimeAssets(*refreshedRecord, root, nextAssets, bindings, &bindError)) {
+            if (std::string bindError; appendPrefabRuntimeAssets(*refreshedRecord, job.workspace.root, nextAssets, bindings, &bindError)) {
                 const SceneDocument beforeDocument = sceneDocument_;
                 const AssetManager beforeAssets = assets_;
                 assets_ = std::move(nextAssets);
@@ -2271,14 +2844,14 @@ bool Application::reimportAsset(const AssetGuid& assetGuid) {
                     (void)applyPendingSceneUpdate(true);
                 }
             } else {
-                notifications_.notify("Reimported metadata; runtime refresh failed", NotificationType::Warning);
+                notifications_.notify("Reimported metadata; runtime refresh failed", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
                 std::cerr << "Reimport runtime refresh failed: " << bindError << '\n';
             }
         }
     }
 
-    notifications_.notify("Asset reimported", NotificationType::Success);
-    std::cout << "Reimported asset: " << assetGuid << " source=" << request.sourcePath.string() << '\n';
+    notifications_.notify("Asset reimported", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+    std::cout << "Reimported asset: " << job.assetGuid << " source=" << job.request.sourcePath.string() << '\n';
     return true;
 }
 
@@ -2299,6 +2872,52 @@ bool Application::mergeSceneIntoCurrent(const std::filesystem::path& path, bool 
 
 void Application::applyEditorRequests(const EditorRequests& requests, bool allowResourceRebuild) {
     if (!pathTracer_) {
+        if (allowResourceRebuild) {
+            if (requests.createProject.has_value()) {
+                (void)createProjectFromRequest(*requests.createProject);
+            }
+            if (requests.openProject.has_value()) {
+                (void)openProjectFromFile(requests.openProject->projectFile, true);
+            }
+            const std::optional<std::filesystem::path>& openScenePath = requests.openScene.has_value()
+                ? requests.openScene
+                : requests.loadSceneJson;
+            if (openScenePath.has_value()) {
+                SceneLoadRequest request;
+                request.mode = SceneLoadMode::OpenRtLevel;
+                request.sourcePath = *openScenePath;
+                if (project_.has_value()) {
+                    request.projectSnapshot = *project_;
+                }
+                (void)requestSceneLoad(std::move(request));
+            }
+            const std::optional<std::filesystem::path>& importScenePath = requests.importSceneAsNewScene.has_value()
+                ? requests.importSceneAsNewScene
+                : requests.loadGltf;
+            if (importScenePath.has_value()) {
+                SceneLoadRequest request;
+                request.mode = SceneLoadMode::ImportSceneAsNewScene;
+                request.sourcePath = *importScenePath;
+                if (project_.has_value()) {
+                    request.projectSnapshot = *project_;
+                }
+                (void)requestSceneLoad(std::move(request));
+            }
+            if (requests.continueWithoutProject || requests.newScene) {
+                initializeFallbackSceneDocument();
+                scenePath_.reset();
+                gltfPath_.reset();
+                importedScene_.reset();
+                assets_.clear();
+                undoStack_.clear();
+                sceneUnsavedDirty_ = false;
+                initializeRendererFromCurrentScene();
+                notifications_.notify("Editor opened without a project", NotificationType::Info, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+            }
+            if (requests.exit && window_ != nullptr) {
+                glfwSetWindowShouldClose(window_, GLFW_TRUE);
+            }
+        }
         return;
     }
 
@@ -2390,6 +3009,35 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         RendererSettings pending = *pendingPostFrameSettings_;
         pendingPostFrameSettings_.reset();
         applyRendererSettingsSafely(pending, true);
+    }
+
+    const std::filesystem::path renderOutputRoot = editorRenderOutputRoot(project_);
+    if (requests.renderCurrentViewport) {
+        startEditorRenderJob(EditorRenderJobKind::CurrentViewport, renderOutputRoot);
+    }
+    if (requests.renderImage) {
+        startEditorRenderJob(EditorRenderJobKind::Image, renderOutputRoot);
+    }
+    if (requests.renderSequence) {
+        startEditorRenderJob(EditorRenderJobKind::Sequence, renderOutputRoot);
+    }
+    if (requests.stopRender) {
+        cancelEditorRenderJob(renderOutputRoot);
+    }
+    if (requests.openOutputFolder) {
+        std::error_code ec;
+        const std::filesystem::path outputFolder =
+            editorRenderJob_.kind != EditorRenderJobKind::None && !editorRenderJob_.outputRoot.empty()
+                ? editorRenderJob_.outputRoot
+                : renderOutputRoot;
+        std::filesystem::create_directories(outputFolder, ec);
+#if defined(_WIN32)
+        ShellExecuteA(nullptr, "open", outputFolder.string().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#endif
+        notifications_.notify("Opening render output folder", NotificationType::Info, NotificationAction::OpenOutputFolder, "Open Output", 4.0f);
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->editor().log().add(EditorLogCategory::Command, "Open render output folder: " + outputFolder.string());
+        }
     }
 
     if (requests.createProject.has_value()) {
@@ -2712,6 +3360,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             }
             sceneOps.setUndoStack(&undoStack_);
             sceneOps.pushDocumentSnapshot(beforeDocument, SceneUpdateKind::TopologyChanged, "Create Entity");
+            editorPlacement_.entity = created;
+            editorPlacement_.serial = nextEditorPlacementSerial_++;
+            editorPlacement_.label = "Created entity";
         } else {
             sceneOps.setUndoStack(&undoStack_);
         }
@@ -2724,8 +3375,13 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     }
 
     if (requests.duplicateEntity.has_value()) {
-        (void)sceneOps.duplicateEntity(*requests.duplicateEntity);
-        sceneUnsavedDirty_ = true;
+        const EntityId duplicate = sceneOps.duplicateEntity(*requests.duplicateEntity);
+        if (duplicate.valid()) {
+            editorPlacement_.entity = duplicate;
+            editorPlacement_.serial = nextEditorPlacementSerial_++;
+            editorPlacement_.label = "Duplicated entity";
+            sceneUnsavedDirty_ = true;
+        }
     }
 
     if (requests.deleteEntity.has_value()) {
@@ -3021,20 +3677,19 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     }
 
     if (requests.importAsset.has_value()) {
-        (void)importAssetNonMutating(*requests.importAsset);
+        (void)queueAssetImportNonMutating(*requests.importAsset, false);
     }
 
     if (requests.importAndPlace.has_value()) {
-        EditorImportAssetRequest importRequest;
-        importRequest.sourcePath = *requests.importAndPlace;
-        importRequest.mode = "ImportAndPlace";
-        if (std::optional<AssetGuid> guid = importAssetNonMutating(importRequest)) {
-            (void)placePrefabAsset(*guid);
+        EditorImportAssetRequest importRequest = *requests.importAndPlace;
+        if (importRequest.mode.empty()) {
+            importRequest.mode = "ImportAndPlace";
         }
+        (void)queueAssetImportNonMutating(importRequest, true);
     }
 
     if (requests.reimportAsset.has_value()) {
-        (void)reimportAsset(*requests.reimportAsset);
+        (void)queueAssetReimport(*requests.reimportAsset);
     }
 
     if (requests.placeAsset.has_value()) {
@@ -3488,6 +4143,29 @@ void Application::createPathTracer(const RendererSettings* settingsToRestore) {
     pathTracer_ = makePathTracer(sceneAsset, sceneAsset != nullptr ? &assets_ : nullptr, std::move(cachePath), settingsToRestore);
 }
 
+void Application::initializeRendererFromCurrentScene(const RendererSettings* settingsToRestore) {
+    if (pathTracer_ != nullptr) {
+        return;
+    }
+
+    rebuildGpuSceneAsset();
+    RendererSettings startupSettings = settingsToRestore != nullptr ? *settingsToRestore : RendererSettings{};
+    if (settingsToRestore == nullptr) {
+        startupSettings.debugView = debugView_;
+        startupSettings = rendererSettingsFromDocument(sceneDocument_, startupSettings);
+    }
+    createPathTracer(&startupSettings);
+    syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
+    applyActiveSceneCamera();
+    sceneDocument_.clearDirty();
+    if (commandSystem_ != nullptr) {
+        commandSystem_->setPathTracer(pathTracer_.get());
+    }
+    if (uiOverlay_ != nullptr) {
+        uiOverlay_->invalidateViewportTexture();
+    }
+}
+
 void Application::applyActiveSceneCamera() {
     if (pathTracer_ == nullptr || !sceneDocument_.activeCamera().valid()) {
         return;
@@ -3575,6 +4253,17 @@ void Application::initializeFallbackSceneDocument() {
     sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
 }
 
+void Application::initializeProjectManagerStartupSceneDocument() {
+    sceneDocument_ = SceneDocument{};
+    EntityId camera = sceneDocument_.registry().createEntity("Project Manager Camera");
+    Camera cameraComponent;
+    cameraComponent.active = true;
+    sceneDocument_.registry().addCamera(camera, cameraComponent);
+    sceneDocument_.setActiveCamera(camera);
+    sceneDocument_.clearDirty();
+    sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+}
+
 void Application::processRuntimeControls(float deltaSeconds) {
     if (!pathTracer_) {
         return;
@@ -3608,12 +4297,12 @@ void Application::processRuntimeControls(float deltaSeconds) {
 
     RendererSettings settings = pathTracer_->settings();
     bool changed = false;
+    const EditorPreferences* editorPrefs = uiOverlay_ != nullptr ? &uiOverlay_->editor().editorPrefs() : nullptr;
     auto commandPressed = [&](EditorCommandId id) {
-        const EditorCommand* command = editorCommand(id);
-        if (shortcutsBlocked || command == nullptr || command->defaultKeybinding.glfwKey < 0) {
+        const EditorKeybinding binding = editorCommandKeybinding(id, editorPrefs);
+        if (shortcutsBlocked || binding.glfwKey < 0) {
             return false;
         }
-        const EditorKeybinding& binding = command->defaultKeybinding;
         if (binding.ctrl != ctrlDown || binding.shift != shiftDown || binding.alt != altDown) {
             return false;
         }
@@ -3811,7 +4500,7 @@ void Application::updateWindowTitle(float seconds) {
         title << "[Modified] ";
     }
     title << (gltfPath_.has_value() ? gltfPath_->stem().string() : "Untitled")
-          << " - Ray Tracing Engine"
+          << " - Vibode Engine"
           << " | samples " << pathTracer_->sampleCount()
           << " | " << rendererDebugViewName(settings.debugView)
           << " | denoise " << (settings.denoiserEnabled ? "on" : "off")

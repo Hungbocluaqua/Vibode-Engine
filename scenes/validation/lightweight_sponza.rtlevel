@@ -1,0 +1,103 @@
+{
+  "version": 2,
+  "sourceGltf": "Sponza/glTF/Sponza.gltf",
+  "sourceHdr": "",
+  "activeCamera": 1,
+  "environment": {
+    "hdrPath": "",
+    "intensity": 0.85,
+    "rotation": 0.0,
+    "backgroundIntensity": 0.45,
+    "enabled": true
+  },
+  "renderSettings": {
+    "renderPreset": 1,
+    "pathTracingEnabled": true,
+    "directLightingEnabled": true,
+    "maxBounces": 4,
+    "environmentDirectSamples": 1,
+    "toneMapper": 3,
+    "exposure": 1.0,
+    "gamma": 2.2,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "brightness": 0.0,
+    "whitePoint": 4.0,
+    "autoExposureEnabled": false,
+    "targetLuminance": 0.18,
+    "minExposure": 0.25,
+    "maxExposure": 8.0,
+    "adaptationSpeed": 2.0,
+    "histogramMinLogLuminance": -10.0,
+    "histogramMaxLogLuminance": 10.0,
+    "histogramLowPercentile": 0.05,
+    "histogramHighPercentile": 0.95,
+    "histogramTargetPercentile": 0.6,
+    "skyIntensity": 0.8,
+    "indirectStrength": 1.0,
+    "denoiserEnabled": true,
+    "atrousIterations": 3,
+    "denoiserStrength": 1.0,
+    "debugView": 0,
+    "accumulate": true,
+    "accumulationLimit": 256,
+    "resolutionScale": 1.0,
+    "requestedBackend": 0
+  },
+  "entities": [
+    {
+      "id": { "index": 0, "generation": 1, "stable": 1 },
+      "parent": 0,
+      "children": [],
+      "name": "Sponza Validation Camera",
+      "transform": {
+        "position": [0.0, 180.0, 5.5],
+        "rotationEuler": [-0.12, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "camera": {
+        "verticalFovRadians": 0.785398,
+        "nearPlane": 0.01,
+        "farPlane": 1000.0,
+        "active": true,
+        "useRenderSettingsExposure": true
+      }
+    },
+    {
+      "id": { "index": 1, "generation": 1, "stable": 2 },
+      "parent": 0,
+      "children": [],
+      "name": "Sponza Mesh",
+      "transform": {
+        "position": [0.0, 0.0, 0.0],
+        "rotationEuler": [0.0, 0.0, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "meshRenderer": {
+        "mesh": 0,
+        "visible": true,
+        "castShadow": true,
+        "visibleToCamera": true,
+        "materialSlots": []
+      }
+    },
+    {
+      "id": { "index": 2, "generation": 1, "stable": 3 },
+      "parent": 0,
+      "children": [],
+      "name": "Sun Light",
+      "transform": {
+        "position": [3.0, 4.0, 2.0],
+        "rotationEuler": [-0.84, 0.98, 0.0],
+        "scale": [1.0, 1.0, 1.0]
+      },
+      "sun": {
+        "enabled": true,
+        "illuminanceLux": 100000.0,
+        "angularRadiusRadians": 0.00465,
+        "colorTemperatureKelvin": 5778.0
+      }
+    }
+  ],
+  "primarySun": 3
+}

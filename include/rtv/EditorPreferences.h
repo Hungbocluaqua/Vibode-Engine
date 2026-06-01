@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rtv {
@@ -22,6 +23,7 @@ struct EditorPreferences {
     std::vector<std::string> recentProjects;
     std::string lastOpenedProject;
     bool openLastProject = false;
+    std::unordered_map<std::string, std::string> commandShortcutOverrides;
 
     static constexpr size_t maxRecentFiles = 10;
 

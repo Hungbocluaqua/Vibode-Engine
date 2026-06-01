@@ -34,13 +34,13 @@ struct EditorPanelVisibility {
     bool sceneHierarchy = true;
     bool inspector = true;
     bool assetBrowser = true;
-    bool renderWorldSettings = true;
+    bool renderWorldSettings = false;
     bool timeline = true;
     bool log = true;
     bool console = false;
     bool materialEditor = false;
     bool renderSettings = true;
-    bool debugProfiler = true;
+    bool debugProfiler = false;
     bool sceneStats = false;
     bool gpuDiagnostics = false;
 };
@@ -60,6 +60,55 @@ struct EditorViewportState {
     bool leftClicked = false;
 };
 
+enum class EditorRenderJobKind : uint32_t {
+    None,
+    CurrentViewport,
+    Image,
+    Sequence,
+};
+
+struct EditorRenderJobStatus {
+    EditorRenderJobKind kind = EditorRenderJobKind::None;
+    bool active = false;
+    bool completed = false;
+    bool cancelled = false;
+    bool failed = false;
+    float progress = 0.0f;
+    int currentFrame = 0;
+    int totalFrames = 0;
+    uint64_t serial = 0;
+    std::string title;
+    std::string status;
+    std::filesystem::path outputRoot;
+    std::filesystem::path manifestPath;
+};
+
+struct EditorPlacementStatus {
+    EntityId entity{};
+    uint64_t serial = 0;
+    std::string label;
+};
+
+struct EditorUiTextureProvider {
+    void* user = nullptr;
+    VkDescriptorSet (*acquire)(void* user, VkImageView imageView, VkImageLayout imageLayout) = nullptr;
+    VkDescriptorSet (*acquireAssetPreview)(void* user, const std::filesystem::path& path, uint32_t* width, uint32_t* height) = nullptr;
+
+    [[nodiscard]] bool valid() const { return user != nullptr && acquire != nullptr; }
+    [[nodiscard]] VkDescriptorSet texture(VkImageView imageView, VkImageLayout imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) const {
+        if (!valid() || imageView == VK_NULL_HANDLE) {
+            return VK_NULL_HANDLE;
+        }
+        return acquire(user, imageView, imageLayout);
+    }
+    [[nodiscard]] VkDescriptorSet assetPreviewTexture(const std::filesystem::path& path, uint32_t* width = nullptr, uint32_t* height = nullptr) const {
+        if (!valid() || acquireAssetPreview == nullptr || path.empty()) {
+            return VK_NULL_HANDLE;
+        }
+        return acquireAssetPreview(user, path, width, height);
+    }
+};
+
 struct EditorRuntimeState {
     PathTracerRenderer& renderer;
     const SceneAsset* importedScene = nullptr;
@@ -75,15 +124,26 @@ struct EditorRuntimeState {
     const std::string* sceneLoadingStatus = nullptr;
     bool sceneLoadRunning = false;
     float sceneLoadProgress = 0.0f;
-    const CameraController* camera = nullptr;
+    CameraController* camera = nullptr;
     const UndoStack* undoStack = nullptr;
     EditorLog* log = nullptr;
     EditorTimeline* timeline = nullptr;
     EditorPreferences* editorPrefs = nullptr;
+    EditorUiTextureProvider uiTextures{};
     CameraBookmarkManager* cameraBookmarks = nullptr;
+    const EditorRenderJobStatus* renderJob = nullptr;
+    const EditorPlacementStatus* placement = nullptr;
     VkExtent2D swapchainExtent{};
     float cpuFrameMs = 0.0f;
     EditorViewportState viewport{};
+};
+
+struct ProjectManagerRuntimeState {
+    const ProjectContext* project = nullptr;
+    const std::string* sceneLoadingStatus = nullptr;
+    bool sceneLoadRunning = false;
+    float sceneLoadProgress = 0.0f;
+    bool standaloneLauncher = false;
 };
 
 struct EditorMaterialUpdate {
@@ -209,7 +269,7 @@ struct EditorRequests {
     std::optional<std::filesystem::path> saveScene;
     std::optional<std::filesystem::path> saveSceneAs;
     std::optional<EditorImportAssetRequest> importAsset;
-    std::optional<std::filesystem::path> importAndPlace;
+    std::optional<EditorImportAssetRequest> importAndPlace;
     std::optional<AssetGuid> reimportAsset;
     std::optional<AssetGuid> placeAsset;
     std::optional<std::filesystem::path> importSceneAsNewScene;
@@ -253,11 +313,18 @@ struct EditorRequests {
     bool toggleDenoiser = false;
     bool toggleDebugView = false;
     bool cycleIntermediateView = false;
+    bool renderCurrentViewport = false;
+    bool renderImage = false;
+    bool renderSequence = false;
+    bool stopRender = false;
+    bool openOutputFolder = false;
     bool ensurePrimarySun = false;
     bool closeProject = false;
     bool closeScene = false;
+    bool continueWithoutProject = false;
     bool saveProjectSettings = false;
     bool showProjectManager = false;
+    bool showCommandPalette = false;
     bool cancelSceneLoad = false;
     bool restoreAutosave = false;
     bool discardRecovery = false;

@@ -613,18 +613,32 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
                 {"type", static_cast<uint32_t>(entity.light->type)},
                 {"color", vec3Json(entity.light->color)},
                 {"intensity", entity.light->intensity},
+                {"exposureMultiplier", entity.light->exposureMultiplier},
                 {"sizeOrRadius", entity.light->sizeOrRadius},
                 {"innerConeRadians", entity.light->innerConeRadians},
                 {"outerConeRadians", entity.light->outerConeRadians},
                 {"enabled", entity.light->enabled},
+                {"useColorTemperature", entity.light->useColorTemperature},
+                {"colorTemperatureKelvin", entity.light->colorTemperatureKelvin},
+                {"visibleToCamera", entity.light->visibleToCamera},
+                {"castSurfaceShadows", entity.light->castSurfaceShadows},
+                {"castVolumetricShadows", entity.light->castVolumetricShadows},
+                {"iesProfile", entity.light->iesProfile},
+                {"materialSource", entity.light->materialSource},
             };
         }
         if (entity.sun.has_value()) {
             item["sun"] = {
                 {"enabled", entity.sun->enabled},
                 {"illuminanceLux", entity.sun->illuminanceLux},
+                {"exposureMultiplier", entity.sun->exposureMultiplier},
                 {"angularRadiusRadians", entity.sun->angularRadiusRadians},
+                {"useColorTemperature", entity.sun->useColorTemperature},
                 {"colorTemperatureKelvin", entity.sun->colorTemperatureKelvin},
+                {"castSurfaceShadows", entity.sun->castSurfaceShadows},
+                {"castVolumetricShadows", entity.sun->castVolumetricShadows},
+                {"shadowBounces", entity.sun->shadowBounces},
+                {"volumetricShadowBounces", entity.sun->volumetricShadowBounces},
             };
         }
         if (entity.camera.has_value()) {
@@ -686,6 +700,15 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
                 {"overrideDepthOfField", entity.cameraPostProcess->overrideDepthOfField},
                 {"dofApertureRadius", entity.cameraPostProcess->dofApertureRadius},
                 {"dofFocusDistance", entity.cameraPostProcess->dofFocusDistance},
+                {"bloomEnabled", entity.cameraPostProcess->bloomEnabled},
+                {"bloomIntensity", entity.cameraPostProcess->bloomIntensity},
+                {"colorCorrectionEnabled", entity.cameraPostProcess->colorCorrectionEnabled},
+                {"colorCorrectionSaturation", entity.cameraPostProcess->colorCorrectionSaturation},
+                {"colorCorrectionContrast", entity.cameraPostProcess->colorCorrectionContrast},
+                {"vignettingEnabled", entity.cameraPostProcess->vignettingEnabled},
+                {"vignettingIntensity", entity.cameraPostProcess->vignettingIntensity},
+                {"filmGrainEnabled", entity.cameraPostProcess->filmGrainEnabled},
+                {"filmGrainIntensity", entity.cameraPostProcess->filmGrainIntensity},
             };
         }
         root["entities"].push_back(std::move(item));
@@ -957,10 +980,18 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             light.type = static_cast<LightType>(source.value("type", static_cast<uint32_t>(LightType::Point)));
             light.color = vec3FromJson(source.value("color", nlohmann::json::array()), light.color);
             light.intensity = source.value("intensity", light.intensity);
+            light.exposureMultiplier = source.value("exposureMultiplier", light.exposureMultiplier);
             light.sizeOrRadius = source.value("sizeOrRadius", light.sizeOrRadius);
             light.innerConeRadians = source.value("innerConeRadians", light.innerConeRadians);
             light.outerConeRadians = source.value("outerConeRadians", light.outerConeRadians);
             light.enabled = source.value("enabled", true);
+            light.useColorTemperature = source.value("useColorTemperature", light.useColorTemperature);
+            light.colorTemperatureKelvin = source.value("colorTemperatureKelvin", light.colorTemperatureKelvin);
+            light.visibleToCamera = source.value("visibleToCamera", light.visibleToCamera);
+            light.castSurfaceShadows = source.value("castSurfaceShadows", light.castSurfaceShadows);
+            light.castVolumetricShadows = source.value("castVolumetricShadows", light.castVolumetricShadows);
+            light.iesProfile = source.value("iesProfile", light.iesProfile);
+            light.materialSource = source.value("materialSource", light.materialSource);
             entity->light = light;
         }
         if (item.contains("sun")) {
@@ -968,8 +999,14 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             Sun sun;
             sun.enabled = source.value("enabled", sun.enabled);
             sun.illuminanceLux = source.value("illuminanceLux", sun.illuminanceLux);
+            sun.exposureMultiplier = source.value("exposureMultiplier", sun.exposureMultiplier);
             sun.angularRadiusRadians = source.value("angularRadiusRadians", sun.angularRadiusRadians);
+            sun.useColorTemperature = source.value("useColorTemperature", sun.useColorTemperature);
             sun.colorTemperatureKelvin = source.value("colorTemperatureKelvin", sun.colorTemperatureKelvin);
+            sun.castSurfaceShadows = source.value("castSurfaceShadows", sun.castSurfaceShadows);
+            sun.castVolumetricShadows = source.value("castVolumetricShadows", sun.castVolumetricShadows);
+            sun.shadowBounces = source.value("shadowBounces", sun.shadowBounces);
+            sun.volumetricShadowBounces = source.value("volumetricShadowBounces", sun.volumetricShadowBounces);
             entity->sun = sun;
         }
         if (item.contains("camera")) {
@@ -1041,6 +1078,15 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             component.overrideDepthOfField = source.value("overrideDepthOfField", component.overrideDepthOfField);
             component.dofApertureRadius = source.value("dofApertureRadius", component.dofApertureRadius);
             component.dofFocusDistance = source.value("dofFocusDistance", component.dofFocusDistance);
+            component.bloomEnabled = source.value("bloomEnabled", component.bloomEnabled);
+            component.bloomIntensity = source.value("bloomIntensity", component.bloomIntensity);
+            component.colorCorrectionEnabled = source.value("colorCorrectionEnabled", component.colorCorrectionEnabled);
+            component.colorCorrectionSaturation = source.value("colorCorrectionSaturation", component.colorCorrectionSaturation);
+            component.colorCorrectionContrast = source.value("colorCorrectionContrast", component.colorCorrectionContrast);
+            component.vignettingEnabled = source.value("vignettingEnabled", component.vignettingEnabled);
+            component.vignettingIntensity = source.value("vignettingIntensity", component.vignettingIntensity);
+            component.filmGrainEnabled = source.value("filmGrainEnabled", component.filmGrainEnabled);
+            component.filmGrainIntensity = source.value("filmGrainIntensity", component.filmGrainIntensity);
             entity->cameraPostProcess = component;
         }
     }

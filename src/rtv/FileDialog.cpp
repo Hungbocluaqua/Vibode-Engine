@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commdlg.h>
+#include <shlobj.h>
 #endif
 
 #include <array>
@@ -77,8 +78,30 @@ std::optional<std::filesystem::path> openSceneJsonFileDialog() {
 
 std::optional<std::filesystem::path> openProjectFileDialog() {
 #if defined(_WIN32)
-    return openFileDialog(L"Open Project", L"RT Project (*.rtproject)\0*.rtproject\0All files (*.*)\0*.*\0\0");
+    return openFileDialog(L"Open Vibode Project", L"Vibode Project (*.vproject)\0*.vproject\0Legacy RT Project (*.rtproject)\0*.rtproject\0All files (*.*)\0*.*\0\0");
 #else
+    return std::nullopt;
+#endif
+}
+
+std::optional<std::filesystem::path> openFolderDialog(const wchar_t* title) {
+#if defined(_WIN32)
+    BROWSEINFOW browse{};
+    browse.lpszTitle = title;
+    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
+    if (item == nullptr) {
+        return std::nullopt;
+    }
+    std::array<wchar_t, MAX_PATH> path{};
+    const BOOL ok = SHGetPathFromIDListW(item, path.data());
+    CoTaskMemFree(item);
+    if (ok == TRUE) {
+        return std::filesystem::path(path.data());
+    }
+    return std::nullopt;
+#else
+    (void)title;
     return std::nullopt;
 #endif
 }

@@ -3,6 +3,7 @@
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorCommands.h"
+#include "rtv/EditorUiStyle.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/SceneOperations.h"
 
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cmath>
 #include <iomanip>
 #include <optional>
@@ -339,11 +341,20 @@ void drawAxesIndicator(const EditorRuntimeState& state, const CameraController& 
     }
 }
 
+void drawViewportOverlayBackdrop(ImDrawList* drawList, ImVec2 min, ImVec2 max) {
+    min.x -= EditorUiMetric::viewportOverlayPaddingX;
+    min.y -= EditorUiMetric::viewportOverlayPaddingY;
+    max.x += EditorUiMetric::viewportOverlayPaddingX;
+    max.y += EditorUiMetric::viewportOverlayPaddingY;
+    drawList->AddRectFilled(min, max, ImGui::GetColorU32(editorViewportOverlayBgColor()), EditorUiMetric::viewportOverlayRounding);
+    drawList->AddRect(min, max, ImGui::GetColorU32(editorViewportOverlayBorderColor()), EditorUiMetric::viewportOverlayRounding);
+}
+
 } // namespace
 
 void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    if (ImGui::Begin("Scene")) {
+    if (ImGui::Begin(EditorDockWindowTitle::Scene)) {
         focused_ = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
         hovered_ = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
         state.viewport.focused = focused_;
@@ -380,6 +391,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 ImVec2(imagePos.x + avail.x, imagePos.y + avail.y),
                 IM_COL32(18, 20, 23, 255));
         }
+        const bool viewportContentHovered = ImGui::IsItemHovered();
         if (ImGui::BeginDragDropTarget()) {
             if (const auto* payload = ImGui::AcceptDragDropPayload("PREFAB_ASSET")) {
                 requests.placeAsset = std::string(static_cast<const char*>(payload->Data));
@@ -387,15 +399,71 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             ImGui::EndDragDropTarget();
         }
 
+        if (viewportContentHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            ImGui::OpenPopup("ViewportContextMenu");
+        }
+        if (ImGui::BeginPopup("ViewportContextMenu")) {
+            Entity* selectedEntity = state.sceneDocument != nullptr ? state.sceneDocument->registry().entity(selection.entityId()) : nullptr;
+            const bool hasSelection = selectedEntity != nullptr;
+            const bool editableSelection = hasSelection && !selectedEntity->locked;
+            if (editorGlyphMenuItem(EditorGlyphIcon::Frame, "Focus Selected", hasSelection)) {
+                requests.focusOnEntity = selection.entityId();
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Duplicate", editableSelection)) {
+                requests.duplicateEntity = selection.entityId();
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Delete", editableSelection)) {
+                requests.deleteEntity = selection.entityId();
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                selection.clear();
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Reset, "Reset Transform", editableSelection)) {
+                Transform reset{};
+                reset.dirty = true;
+                const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *selectedEntity);
+                requests.setEntityTransform = EditorEntityTransformChange{
+                    .entity = selectedEntity->id,
+                    .oldTransform = selectedEntity->transform,
+                    .newTransform = reset,
+                };
+                requests.sceneUpdate = updateKind;
+            }
+            ImGui::Separator();
+            if (editorGlyphMenuItem(EditorGlyphIcon::Entity, "Create Empty Here")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Camera, "Create Camera Here")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Create Light Here")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+            editorGlyphMenuItem(EditorGlyphIcon::Add, "Drop prefab here", false);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Drag a prefab from Content onto the viewport to place it");
+            }
+            ImGui::EndPopup();
+        }
+
         const RendererSettings& settings = state.renderer.settings();
         const GpuFrameTimings& timings = state.renderer.timings();
         bool gizmoHoveredOrUsing = false;
 
         if (focused_ && !state.viewport.mouseCaptureActive && !ImGui::GetIO().WantTextInput) {
-            auto commandPressed = [](EditorCommandId id) {
-                const EditorCommand* command = editorCommand(id);
-                return command != nullptr && command->defaultKeybinding.imguiKey >= 0 &&
-                    ImGui::IsKeyPressed(static_cast<ImGuiKey>(command->defaultKeybinding.imguiKey));
+            auto commandPressed = [&](EditorCommandId id) {
+                const EditorKeybinding binding = editorCommandKeybinding(id, state.editorPrefs);
+                if (binding.imguiKey < 0) {
+                    return false;
+                }
+                const ImGuiIO& io = ImGui::GetIO();
+                if (binding.ctrl != io.KeyCtrl || binding.shift != io.KeyShift || binding.alt != io.KeyAlt) {
+                    return false;
+                }
+                return ImGui::IsKeyPressed(static_cast<ImGuiKey>(binding.imguiKey));
             };
             if (commandPressed(EditorCommandId::ViewportSelect)) { executeCommand(EditorCommandId::ViewportSelect); }
             if (commandPressed(EditorCommandId::ViewportMove) || ImGui::IsKeyPressed(ImGuiKey_T)) { executeCommand(EditorCommandId::ViewportMove); }
@@ -409,39 +477,46 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         }
         ImDrawList* dl = ImGui::GetWindowDrawList();
         bool viewportUiHovered = false;
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.0f, 2.0f));
+        auto commandTooltip = [&](EditorCommandId command) {
+            const std::string shortcut = editorCommandShortcutDisplay(command, state.editorPrefs);
+            if (shortcut.empty()) {
+                ImGui::SetTooltip("%s", editorCommandName(command));
+            } else {
+                ImGui::SetTooltip("%s (%s)", editorCommandName(command), shortcut.c_str());
+            }
+        };
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(EditorUiMetric::rowPaddingX, EditorUiMetric::rowPaddingY));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 0.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 1.0f);
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.045f, 0.050f, 0.058f, 0.82f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.115f, 0.150f, 0.205f, 0.95f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.160f, 0.225f, 0.330f, 1.00f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, EditorUiMetric::compactButtonRounding);
         ImGui::SetCursorScreenPos(ImVec2(imagePos.x + 7.0f, imagePos.y + 5.0f));
+        dl->ChannelsSplit(2);
+        dl->ChannelsSetCurrent(1);
         ImGui::BeginGroup();
-        auto toolButton = [&](const char* label, EditorCommandId command, bool active) {
-            ImGui::PushStyleColor(ImGuiCol_Text, active ? ImVec4(0.35f, 0.62f, 1.0f, 1.0f) : ImVec4(0.70f, 0.72f, 0.74f, 1.0f));
-            const bool pressed = ImGui::SmallButton(label);
-            ImGui::PopStyleColor();
+        auto toolButton = [&](EditorGlyphIcon icon, const char* id, EditorCommandId command, bool active) {
+            const bool pressed = editorIconButton(id, icon, active);
             viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("%s (%s)", editorCommandName(command), editorCommandShortcut(command));
+                commandTooltip(command);
             }
             if (pressed) {
                 executeCommand(command);
             }
             ImGui::SameLine();
         };
-        toolButton("Q", EditorCommandId::ViewportSelect, transformGizmoMode_ < 0);
-        toolButton("W", EditorCommandId::ViewportMove, transformGizmoMode_ == 0);
-        toolButton("E", EditorCommandId::ViewportRotate, transformGizmoMode_ == 1);
-        toolButton("R", EditorCommandId::ViewportScale, transformGizmoMode_ == 2);
-        toolButton(localGizmoMode_ ? "Local" : "World", EditorCommandId::ViewportToggleLocal, localGizmoMode_);
-        toolButton(snap_.enabled ? "Snap" : "Snap", EditorCommandId::ViewportToggleSnap, snap_.enabled);
-        toolButton(showGrid_ ? "Grid" : "Grid", EditorCommandId::ViewportToggleGrid, showGrid_);
-        toolButton(showAxes_ ? "Axes" : "Axes", EditorCommandId::ViewportToggleAxes, showAxes_);
+        toolButton(EditorGlyphIcon::Select, "ViewportSelect", EditorCommandId::ViewportSelect, transformGizmoMode_ < 0);
+        toolButton(EditorGlyphIcon::Move, "ViewportMove", EditorCommandId::ViewportMove, transformGizmoMode_ == 0);
+        toolButton(EditorGlyphIcon::Rotate, "ViewportRotate", EditorCommandId::ViewportRotate, transformGizmoMode_ == 1);
+        toolButton(EditorGlyphIcon::Scale, "ViewportScale", EditorCommandId::ViewportScale, transformGizmoMode_ == 2);
+        toolButton(localGizmoMode_ ? EditorGlyphIcon::LocalSpace : EditorGlyphIcon::WorldSpace, "ViewportSpace", EditorCommandId::ViewportToggleLocal, localGizmoMode_);
+        toolButton(EditorGlyphIcon::Snap, "ViewportSnap", EditorCommandId::ViewportToggleSnap, snap_.enabled);
+        toolButton(EditorGlyphIcon::Grid, "ViewportGrid", EditorCommandId::ViewportToggleGrid, showGrid_);
+        toolButton(EditorGlyphIcon::Axes, "ViewportAxes", EditorCommandId::ViewportToggleAxes, showAxes_);
         if (selection.entityId().valid()) {
-            if (ImGui::SmallButton("Frame")) { requests.focusOnEntity = selection.entityId(); }
+            if (editorIconButton("ViewportFrameSelected", EditorGlyphIcon::Frame, false)) { requests.focusOnEntity = selection.entityId(); }
             viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
-            if (ImGui::IsItemHovered()) { ImGui::SetTooltip("%s (%s)", editorCommandName(EditorCommandId::ViewportFrameSelected), editorCommandShortcut(EditorCommandId::ViewportFrameSelected)); }
+            if (ImGui::IsItemHovered()) {
+                commandTooltip(EditorCommandId::ViewportFrameSelected);
+            }
             if (snap_.enabled) {
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(58.0f);
@@ -456,7 +531,11 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             }
         }
         ImGui::EndGroup();
-        ImGui::PopStyleColor(3);
+        const ImVec2 toolbarMin = ImGui::GetItemRectMin();
+        const ImVec2 toolbarMax = ImGui::GetItemRectMax();
+        dl->ChannelsSetCurrent(0);
+        drawViewportOverlayBackdrop(dl, toolbarMin, toolbarMax);
+        dl->ChannelsMerge();
         ImGui::PopStyleVar(3);
 
         const float gpuTotal = timings.totalMs();
@@ -469,17 +548,179 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             compactStatus << "  " << rendererDebugViewName(settings.debugView);
         }
         const std::string statusText = compactStatus.str();
-        const char* actionsText = "View Settings    Stats    Draw Debug    1.000";
         const ImVec2 statusSize = ImGui::CalcTextSize(statusText.c_str());
-        const ImVec2 actionsSize = ImGui::CalcTextSize(actionsText);
         const float statusRight = imagePos.x + avail.x - 12.0f;
         const float statusY = imagePos.y + 7.0f;
-        dl->AddText(ImVec2(statusRight - actionsSize.x, statusY), IM_COL32(170, 173, 176, 230), actionsText);
-        dl->AddText(ImVec2(statusRight - actionsSize.x - statusSize.x - 18.0f, statusY), IM_COL32(186, 188, 190, 235), statusText.c_str());
+
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, EditorUiMetric::rowPaddingY));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 0.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, EditorUiMetric::compactButtonRounding);
+        std::string cameraSpeedText;
+        if (state.camera != nullptr) {
+            std::ostringstream cameraSpeed;
+            cameraSpeed << std::fixed << std::setprecision(3) << state.camera->moveSpeed();
+            cameraSpeedText = cameraSpeed.str();
+        }
+        const float cameraSpeedWidth = cameraSpeedText.empty() ? 0.0f : editorIconTextButtonWidth(cameraSpeedText.c_str()) + ImGui::GetStyle().ItemSpacing.x;
+        const float overlayWidth = editorIconTextButtonWidth("View Settings") + editorIconTextButtonWidth("Stats") +
+            editorIconTextButtonWidth("Draw Debug") + cameraSpeedWidth + ImGui::GetStyle().ItemSpacing.x * 3.0f;
+        const float controlsX = std::max(imagePos.x + 8.0f, statusRight - overlayWidth);
+        const float statusX = std::max(imagePos.x + 8.0f, controlsX - statusSize.x - 14.0f);
+        const ImVec2 overlayMin(std::min(statusX, controlsX), imagePos.y + 5.0f);
+        const ImVec2 overlayMax(statusRight, imagePos.y + 5.0f + editorIconButtonSize().y);
+        drawViewportOverlayBackdrop(dl, overlayMin, overlayMax);
+        dl->AddText(ImVec2(statusX, statusY), IM_COL32(216, 221, 228, 245), statusText.c_str());
+
+        ImGui::SetCursorScreenPos(ImVec2(controlsX, imagePos.y + 5.0f));
+        ImGui::BeginGroup();
+        auto overlayButton = [&](EditorGlyphIcon icon, const char* label, const char* popupName, const char* buttonId, const char* tooltip) {
+            const bool open = ImGui::IsPopupOpen(popupName);
+            if (editorIconTextButton(buttonId, icon, label, open)) {
+                ImGui::OpenPopup(popupName);
+            }
+            viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", tooltip);
+            }
+        };
+        overlayButton(EditorGlyphIcon::ViewSettings, "View Settings", "ViewportViewSettings", "ViewportViewSettingsButton", "Viewport overlays, transform frame, and preview debug view");
+        ImGui::SameLine();
+        overlayButton(EditorGlyphIcon::Stats, "Stats", "ViewportStats", "ViewportStatsButton", "Frame timing and render statistics");
+        ImGui::SameLine();
+        overlayButton(EditorGlyphIcon::DrawDebug, "Draw Debug", "ViewportDrawDebug", "ViewportDrawDebugButton", "Viewport debug drawing controls");
+        if (!cameraSpeedText.empty()) {
+            ImGui::SameLine();
+            editorIconTextReadout(EditorGlyphIcon::Camera, cameraSpeedText.c_str(), IM_COL32(216, 221, 228, 245));
+            viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Viewport camera navigation speed");
+            }
+        }
+        ImGui::EndGroup();
+        viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+
+        auto beginOverlayPopup = [&](const char* name, float width) {
+            ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Appearing);
+            const bool open = ImGui::BeginPopup(name);
+            if (open) {
+                viewportUiHovered = true;
+                viewportUiHovered = viewportUiHovered || ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+            }
+            return open;
+        };
+
+        if (beginOverlayPopup("ViewportViewSettings", 300.0f)) {
+            RendererSettings popupSettings = settings;
+            bool changed = false;
+            ImGui::SeparatorText("Viewport");
+            ImGui::Checkbox("Grid", &showGrid_);
+            ImGui::Checkbox("Axes", &showAxes_);
+            ImGui::Checkbox("Local transform frame", &localGizmoMode_);
+            ImGui::Checkbox("Snap", &snap_.enabled);
+            if (snap_.enabled) {
+                ImGui::SetNextItemWidth(140.0f);
+                ImGui::DragFloat("Translate", &snap_.translation, 0.01f, 0.001f, 100.0f, "%.2f");
+                ImGui::SetNextItemWidth(140.0f);
+                ImGui::DragFloat("Rotate", &snap_.rotation, 1.0f, 0.1f, 180.0f, "%.0f");
+                ImGui::SetNextItemWidth(140.0f);
+                ImGui::DragFloat("Scale", &snap_.scale, 0.01f, 0.001f, 10.0f, "%.2f");
+            }
+            if (state.camera != nullptr) {
+                ImGui::SeparatorText("Navigation");
+                float cameraSpeed = state.camera->moveSpeed();
+                ImGui::SetNextItemWidth(140.0f);
+                if (ImGui::DragFloat("Camera Speed", &cameraSpeed, 0.05f, 0.05f, 100.0f, "%.3f")) {
+                    state.camera->setMoveSpeed(std::clamp(cameraSpeed, 0.05f, 100.0f));
+                }
+            }
+            ImGui::SeparatorText("Preview");
+            editorDebugViewCombo("Debug View", popupSettings, changed);
+            changed |= ImGui::SliderFloat("Render Scale", &popupSettings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
+            if (changed) {
+                requestSettings(requests, popupSettings);
+            }
+            ImGui::EndPopup();
+        }
+
+        if (beginOverlayPopup("ViewportStats", 320.0f)) {
+            const GpuPipelineStatistics pipelineStats = state.renderer.pipelineStats();
+            ImGui::SeparatorText("Frame");
+            if (ImGui::BeginTable("ViewportStatsFrame", 2, ImGuiTableFlags_SizingStretchProp)) {
+                auto row = [](const char* label, const char* value) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", label);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(value);
+                };
+                char value[64] = {};
+                std::snprintf(value, sizeof(value), "%.3f ms", gpuTotal);
+                row("GPU", value);
+                std::snprintf(value, sizeof(value), "%.3f ms", state.cpuFrameMs);
+                row("CPU", value);
+                std::snprintf(value, sizeof(value), "%u / %u", state.renderer.sampleCount(), settings.accumulationLimit);
+                row("Samples", value);
+                std::snprintf(value, sizeof(value), "%ux%u", state.viewport.renderExtent.width, state.viewport.renderExtent.height);
+                row("Render", value);
+                std::snprintf(value, sizeof(value), "%ux%u", state.viewport.displayExtent.width, state.viewport.displayExtent.height);
+                row("Display", value);
+                row("Debug View", rendererDebugViewName(settings.debugView));
+                ImGui::EndTable();
+            }
+            ImGui::SeparatorText("GPU Passes");
+            if (ImGui::BeginTable("ViewportStatsPasses", 2, ImGuiTableFlags_SizingStretchProp)) {
+                auto timingRow = [](const char* label, float ms) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", label);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.3f ms", ms);
+                };
+                timingRow("Path Trace", timings.pathTraceMs);
+                timingRow("ReSTIR DI", timings.restirSpatialMs);
+                timingRow("ReSTIR GI", timings.restirGiSpatialMs + timings.restirGiFinalMs);
+                timingRow("Denoiser", timings.denoiserMs + timings.momentUpdateMs);
+                timingRow("TAA", timings.taaMs + timings.taaHistoryCopyMs);
+                timingRow("Tone Map", timings.toneMapMs);
+                timingRow("Presentation", timings.editorPresentationMs + timings.fullscreenMs);
+                ImGui::EndTable();
+            }
+            ImGui::SeparatorText("Pipeline");
+            if (pipelineStats.valid) {
+                ImGui::Text("Rays: %llu", static_cast<unsigned long long>(pipelineStats.rayInvocations));
+                ImGui::Text("Triangle hits: %llu", static_cast<unsigned long long>(pipelineStats.triangleHits));
+                ImGui::Text("AABB hits: %llu", static_cast<unsigned long long>(pipelineStats.aabbHits));
+            } else {
+                ImGui::TextDisabled("Pipeline counters unavailable");
+            }
+            ImGui::EndPopup();
+        }
+
+        if (beginOverlayPopup("ViewportDrawDebug", 260.0f)) {
+            ImGui::SeparatorText("Draw Layers");
+            ImGui::Checkbox("Grid", &showGrid_);
+            ImGui::Checkbox("Axes", &showAxes_);
+            ImGui::Checkbox("Selection overlay", &showSelectionOverlay_);
+            ImGui::BeginDisabled();
+            bool meshBounds = false;
+            bool cameraFrustum = false;
+            bool lightInfluence = false;
+            ImGui::Checkbox("Mesh bounds", &meshBounds);
+            ImGui::Checkbox("Camera frustum", &cameraFrustum);
+            ImGui::Checkbox("Light influence", &lightInfluence);
+            ImGui::EndDisabled();
+            ImGui::SeparatorText("Active Debug View");
+            ImGui::TextWrapped("%s", rendererDebugViewName(settings.debugView));
+            ImGui::EndPopup();
+        }
+
+        ImGui::PopStyleVar(3);
 
         lastSampleCount_ = state.renderer.sampleCount();
 
-        drawSelectionOverlay(state, selection);
+        if (showSelectionOverlay_) {
+            drawSelectionOverlay(state, selection);
+        }
 
         if (state.camera != nullptr) {
             if (showAxes_) drawAxesIndicator(state, *state.camera);

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "projectGuid": "5f0e9d2f-c001-4f5f-9f3b-000000000003",
+  "name": "Cinematic Lighting",
+  "engineVersion": "0.1",
+  "startupScene": "../../scenes/validation/closeup_cornell.rtlevel",
+  "contentRoot": "Content",
+  "scenesRoot": "../../scenes/validation",
+  "cacheRoot": "DerivedDataCache",
+  "savedRoot": "Saved",
+  "configRoot": "Config",
+  "assetRegistry": "Content/AssetRegistry.json",
+  "defaultRenderPreset": "Editor",
+  "autosaveEnabled": true,
+  "autosaveIntervalMinutes": 5
+}

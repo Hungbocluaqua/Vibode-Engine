@@ -28,7 +28,7 @@ foreach ($file in $files) {
 }
 $staleLabels = @('Viewport','Scene Hierarchy','Inspector / Properties','Asset Browser','Open glTF','Load glTF')
 $stale = @($items | Where-Object { $staleLabels -contains $_.label -or $_.label -like 'Open glTF*' -or $_.label -like 'Load glTF*' })
-$required = @('Scene','Hierarchy','Inspector','Content','Timeline','Log','Render World Settings')
+$required = @('Scene','Hierarchy','Inspector','Content','Timeline','Log','Render Settings')
 $presentLabels = @($items | ForEach-Object { $_.label } | Select-Object -Unique)
 $missingRequired = @($required | Where-Object { $presentLabels -notcontains $_ })
 $results = @(
