@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -116,6 +117,7 @@ void drawHierarchyRowGlyph(EditorGlyphIcon icon, ImVec2 rowMin, ImVec2 rowMax, b
 
 bool selectableHierarchyGlyph(const char* label, bool selected, EditorGlyphIcon icon, int depth = 0) {
     const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+    editorDrawPreRowBand(EditorUiMetric::hierarchyRowHeight);
     editorPushRowSelectionStyle();
     const bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_None, ImVec2(0.0f, EditorUiMetric::hierarchyRowHeight));
     editorPopRowSelectionStyle();
@@ -129,6 +131,7 @@ bool selectableHierarchyGlyph(const char* label, bool selected, EditorGlyphIcon 
 
 bool treeNodeHierarchyGlyph(const char* label, ImGuiTreeNodeFlags flags, EditorGlyphIcon icon, int depth = 0) {
     const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+    editorDrawPreRowBand(EditorUiMetric::hierarchyRowHeight);
     editorPushRowSelectionStyle();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, editorRowFramePadding(EditorUiMetric::hierarchyRowHeight));
     const bool open = ImGui::TreeNodeEx(label, flags);
@@ -155,7 +158,7 @@ void hierarchyTypeFilterButton(uint32_t& filterMask, uint32_t filterBit, EditorG
         ImGui::GetWindowDrawList()->AddRectFilled(
             min,
             max,
-            active ? ImGui::GetColorU32(editorSelectedRowColor()) : IM_COL32(34, 42, 54, 220),
+            active ? ImGui::GetColorU32(editorSelectedRowColor()) : IM_COL32(30, 34, 41, 220),
             EditorUiMetric::compactButtonRounding);
     }
     editorDrawIconGlyph(
@@ -164,6 +167,32 @@ void hierarchyTypeFilterButton(uint32_t& filterMask, uint32_t filterBit, EditorG
         ImVec2(min.x + 17.0f, min.y + 17.0f),
         ImGui::GetColorU32(editorIconTint(active)));
     hierarchyTooltip(tooltip);
+}
+
+bool hierarchyRowIconButton(const char* id, EditorGlyphIcon icon, bool enabled, bool muted, ImVec2 size) {
+    if (!enabled) {
+        ImGui::BeginDisabled();
+    }
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const bool hovered = enabled && ImGui::IsItemHovered();
+    const bool active = enabled && ImGui::IsItemActive();
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (hovered || active) {
+        dl->AddRectFilled(min, max, IM_COL32(38, 43, 52, active ? 190 : 145), EditorUiMetric::compactButtonRounding);
+        dl->AddRect(min, max, IM_COL32(70, 78, 92, 135), EditorUiMetric::compactButtonRounding);
+    }
+    const ImVec4 tint = muted || !enabled ? editorDisabledIconTint() : ImVec4(0.62f, 0.66f, 0.72f, 0.95f);
+    editorDrawIconGlyph(
+        icon,
+        ImVec2(min.x + 4.0f, min.y + 3.0f),
+        ImVec2(max.x - 4.0f, max.y - 3.0f),
+        ImGui::GetColorU32(tint));
+    if (!enabled) {
+        ImGui::EndDisabled();
+    }
+    return enabled && pressed;
 }
 
 } // namespace
@@ -178,31 +207,7 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
         SceneDocument& document = *state.sceneDocument;
         SceneRegistry& registry = document.registry();
 
-        if (editorIconTextButton("HierarchyCreateEmpty", EditorGlyphIcon::Entity, "Create Empty")) {
-            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty};
-            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
-        }
-        hierarchyTooltip("Create an empty entity at the scene root");
-        ImGui::SameLine();
-        if (editorIconTextButton("HierarchyCreateCamera", EditorGlyphIcon::Camera, "Camera")) {
-            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera};
-            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
-        }
-        hierarchyTooltip("Create a camera entity");
-        ImGui::SameLine();
-        if (editorIconTextButton("HierarchyCreateLight", EditorGlyphIcon::Light, "Light")) {
-            requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
-            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
-        }
-        hierarchyTooltip("Create a point light entity");
-        if (ImGui::BeginDragDropTarget()) {
-            if (const auto* payload = ImGui::AcceptDragDropPayload("PREFAB_ASSET")) {
-                requests.placeAsset = std::string(static_cast<const char*>(payload->Data));
-            }
-            ImGui::EndDragDropTarget();
-        }
-
-        ImGui::Separator();
+        ImGui::BeginGroup();
         hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterMesh, EditorGlyphIcon::Model, "Filter mesh objects");
         ImGui::SameLine();
         hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterCamera, EditorGlyphIcon::Camera, "Filter cameras");
@@ -216,12 +221,21 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
         hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterEffects, EditorGlyphIcon::PostProcess, "Filter post-process and effects actors");
         if (typeFilterMask_ != 0) {
             ImGui::SameLine();
-            if (ImGui::SmallButton("Clear##HierarchyTypeFilters")) {
+            if (editorIconButton("HierarchyClearTypeFilters", EditorGlyphIcon::Exit, false, ImVec2(18.0f, 18.0f))) {
                 typeFilterMask_ = 0;
             }
             hierarchyTooltip("Clear hierarchy type filters");
         }
+        ImGui::EndGroup();
+        if (ImGui::BeginDragDropTarget()) {
+            if (const auto* payload = ImGui::AcceptDragDropPayload("PREFAB_ASSET")) {
+                requests.placeAsset = std::string(static_cast<const char*>(payload->Data));
+            }
+            ImGui::EndDragDropTarget();
+        }
+
         static std::array<char, 128> filterBuffer{};
+        ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::InputTextWithHint("##entityFilter", "Search...", filterBuffer.data(), filterBuffer.size());
         std::string filter = filterBuffer.data();
         std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char ch) {
@@ -248,7 +262,7 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
         }
 
         if (ImGui::BeginPopupContextWindow("HierarchyEmptyContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
-        if (ImGui::BeginMenu("Create")) {
+            if (editorGlyphBeginMenu(EditorGlyphIcon::Add, "Create")) {
                 if (editorGlyphMenuItem(EditorGlyphIcon::Entity, "Empty Entity")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty};
                     requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
@@ -313,14 +327,17 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
         return;
     }
 
-    if (selectableHierarchyGlyph("     Camera##fallbackCamera", selection.is(EditorSelectionKind::Camera), EditorGlyphIcon::Camera)) {
+    const std::string fallbackCameraLabel = editorGlyphLabel("Camera") + "##fallbackCamera";
+    if (selectableHierarchyGlyph(fallbackCameraLabel.c_str(), selection.is(EditorSelectionKind::Camera), EditorGlyphIcon::Camera)) {
         selection.selectCamera();
     }
 
     const MeshParamsUniform& params = state.renderer.scene().meshParams();
-    if (treeNodeHierarchyGlyph("     Lights##fallbackLights", ImGuiTreeNodeFlags_DefaultOpen, EditorGlyphIcon::Light)) {
+    const std::string fallbackLightsLabel = editorGlyphLabel("Lights") + "##fallbackLights";
+    if (treeNodeHierarchyGlyph(fallbackLightsLabel.c_str(), ImGuiTreeNodeFlags_DefaultOpen, EditorGlyphIcon::Light)) {
         for (uint32_t i = 0; i < params.lightCount; ++i) {
-            const std::string label = "     Emissive Light " + std::to_string(i) + "##fallbackLight" + std::to_string(i);
+            std::string label = editorGlyphLabel("Emissive Light " + std::to_string(i));
+            label += "##fallbackLight" + std::to_string(i);
             if (selectableHierarchyGlyph(label.c_str(), selection.is(EditorSelectionKind::Light) && selection.index() == i, EditorGlyphIcon::Light, 1)) {
                 selection.selectLight(i);
             }
@@ -332,37 +349,43 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
     }
 
     if (state.importedScene != nullptr && !state.importedScene->nodes.empty()) {
-        if (treeNodeHierarchyGlyph("     glTF Scene##ImportedSceneRoot", ImGuiTreeNodeFlags_DefaultOpen, EditorGlyphIcon::SceneFile)) {
+        const std::string importedSceneLabel = editorGlyphLabel("glTF Scene") + "##ImportedSceneRoot";
+        if (treeNodeHierarchyGlyph(importedSceneLabel.c_str(), ImGuiTreeNodeFlags_DefaultOpen, EditorGlyphIcon::SceneFile)) {
             for (uint32_t root : state.importedScene->rootNodes) {
                 drawImportedNode(*state.importedScene, root, selection, 1);
             }
             ImGui::TreePop();
         }
-    } else if (treeNodeHierarchyGlyph("     Cornell Fallback##CornellFallbackRoot", ImGuiTreeNodeFlags_DefaultOpen, EditorGlyphIcon::SceneFile)) {
-        static constexpr const char* objects[] = {
-            "Cornell Box",
-            "Left Wall",
-            "Right Wall",
-            "Back Wall",
-            "Floor",
-            "Ceiling",
-            "Area Light",
-        };
-        for (uint32_t i = 0; i < static_cast<uint32_t>(std::size(objects)); ++i) {
-            const bool lightObject = i == 6;
-            const std::string label = std::string("     ") + objects[i] + "##fallbackObject" + std::to_string(i);
-            if (selectableHierarchyGlyph(label.c_str(), selection.is(EditorSelectionKind::Object) && selection.index() == i, lightObject ? EditorGlyphIcon::Light : EditorGlyphIcon::Model, 1)) {
-                selection.selectObject(i);
+    } else {
+        const std::string cornellFallbackLabel = editorGlyphLabel("Cornell Fallback") + "##CornellFallbackRoot";
+        if (treeNodeHierarchyGlyph(cornellFallbackLabel.c_str(), ImGuiTreeNodeFlags_DefaultOpen, EditorGlyphIcon::SceneFile)) {
+            static constexpr const char* objects[] = {
+                "Cornell Box",
+                "Left Wall",
+                "Right Wall",
+                "Back Wall",
+                "Floor",
+                "Ceiling",
+                "Area Light",
+            };
+            for (uint32_t i = 0; i < static_cast<uint32_t>(std::size(objects)); ++i) {
+                const bool lightObject = i == 6;
+                std::string label = editorGlyphLabel(objects[i]);
+                label += "##fallbackObject" + std::to_string(i);
+                if (selectableHierarchyGlyph(label.c_str(), selection.is(EditorSelectionKind::Object) && selection.index() == i, lightObject ? EditorGlyphIcon::Light : EditorGlyphIcon::Model, 1)) {
+                    selection.selectObject(i);
+                }
             }
-        }
-        for (uint32_t i = 0; i < params.sphereCount; ++i) {
-            const std::string label = "     Sphere " + std::to_string(i) + "##fallbackSphere" + std::to_string(i);
-            const uint32_t objectId = 1000u + i;
-            if (selectableHierarchyGlyph(label.c_str(), selection.is(EditorSelectionKind::Object) && selection.index() == objectId, EditorGlyphIcon::Model, 1)) {
-                selection.selectObject(objectId);
+            for (uint32_t i = 0; i < params.sphereCount; ++i) {
+                std::string label = editorGlyphLabel("Sphere " + std::to_string(i));
+                label += "##fallbackSphere" + std::to_string(i);
+                const uint32_t objectId = 1000u + i;
+                if (selectableHierarchyGlyph(label.c_str(), selection.is(EditorSelectionKind::Object) && selection.index() == objectId, EditorGlyphIcon::Model, 1)) {
+                    selection.selectObject(objectId);
+                }
             }
+            ImGui::TreePop();
         }
-        ImGui::TreePop();
     }
 
     ImGui::End();
@@ -429,8 +452,7 @@ void SceneHierarchyPanel::drawEntityNode(
         (containsSelection && entity.id != selected) ||
         (revealPending && entity.id == selected && !entity.children.empty());
 
-    std::string label = "     ";
-    label += entity.name.empty() ? "Entity" : entity.name;
+    std::string label = editorGlyphLabel(entity.name.empty() ? "Entity" : entity.name);
     label += "##entity" + std::to_string(entity.id.index) + "_" + std::to_string(entity.id.generation);
 
     if (renameTarget_.has_value() && *renameTarget_ == entity.id) {
@@ -469,6 +491,7 @@ void SceneHierarchyPanel::drawEntityNode(
         ImGui::SetNextItemOpen(true, ImGuiCond_Always);
     }
     const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+    editorDrawPreRowBand(EditorUiMetric::hierarchyRowHeight);
     if (entity.locked || !entity.visible) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     }
@@ -492,19 +515,22 @@ void SceneHierarchyPanel::drawEntityNode(
         const float eyeWidth = iconButtonSize.x;
         const float gap = 3.0f;
         const float rightEdge = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+        const bool rowHovered = ImGui::IsMouseHoveringRect(rowMin, rowMax, true);
+        const bool rowSelected = selection.entityId() == entity.id;
+        const bool showLockControl = entity.locked || rowHovered || rowSelected;
         const ImVec2 restoreCursor = ImGui::GetCursorScreenPos();
         ImGui::PushID(static_cast<int>(entity.id.index));
-        ImGui::SetCursorScreenPos(ImVec2(rightEdge - lockWidth - eyeWidth - gap, controlY));
-        if (editorIconButton("lock", entity.locked ? EditorGlyphIcon::Lock : EditorGlyphIcon::Unlock, entity.locked, iconButtonSize)) {
-            requests.setEntityLocked = EditorEntityBoolChange{.entity = entity.id, .value = !entity.locked};
+        if (showLockControl) {
+            ImGui::SetCursorScreenPos(ImVec2(rightEdge - lockWidth - eyeWidth - gap, controlY));
+            if (hierarchyRowIconButton("lock", entity.locked ? EditorGlyphIcon::Lock : EditorGlyphIcon::Unlock, true, !entity.locked, iconButtonSize)) {
+                requests.setEntityLocked = EditorEntityBoolChange{.entity = entity.id, .value = !entity.locked};
+            }
+            hierarchyTooltip(entity.locked ? "Locked" : "Unlocked");
         }
-        hierarchyTooltip(entity.locked ? "Locked" : "Unlocked");
-        ImGui::SameLine(0.0f, gap);
-        ImGui::BeginDisabled(entity.locked);
-        if (editorIconButton("visible", entity.visible ? EditorGlyphIcon::EyeVisible : EditorGlyphIcon::EyeHidden, entity.visible, iconButtonSize)) {
+        ImGui::SetCursorScreenPos(ImVec2(rightEdge - eyeWidth, controlY));
+        if (hierarchyRowIconButton("visible", entity.visible ? EditorGlyphIcon::EyeVisible : EditorGlyphIcon::EyeHidden, !entity.locked, !entity.visible, iconButtonSize)) {
             requests.setEntityVisibility = EditorEntityBoolChange{.entity = entity.id, .value = !entity.visible};
         }
-        ImGui::EndDisabled();
         hierarchyTooltip(entity.visible ? "Visible" : "Hidden");
         ImGui::PopID();
         ImGui::SetCursorScreenPos(restoreCursor);
@@ -582,7 +608,7 @@ void SceneHierarchyPanel::drawEntityNode(
             requests.setEntityLocked = EditorEntityBoolChange{.entity = entity.id, .value = !entity.locked};
         }
         ImGui::Separator();
-        if (ImGui::BeginMenu("Create Child")) {
+        if (editorGlyphBeginMenu(EditorGlyphIcon::Add, "Create Child")) {
             if (editorGlyphMenuItem(EditorGlyphIcon::Entity, "Empty")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty, .parent = entity.id};
                 requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
@@ -656,8 +682,8 @@ void SceneHierarchyPanel::drawImportedNode(const SceneAsset& scene, uint32_t nod
         return;
     }
     const SceneNodeAsset& node = scene.nodes[nodeIndex];
-    const std::string label = "     " +
-        (node.name.empty() ? "Node " + std::to_string(nodeIndex) : node.name) + "##node" + std::to_string(nodeIndex);
+    std::string label = editorGlyphLabel(node.name.empty() ? "Node " + std::to_string(nodeIndex) : node.name);
+    label += "##node" + std::to_string(nodeIndex);
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
     if (node.children.empty()) {
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;

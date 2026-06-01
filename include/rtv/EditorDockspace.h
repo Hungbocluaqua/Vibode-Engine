@@ -10,7 +10,7 @@ namespace rtv {
 class EditorDockspace {
 public:
     void begin(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
-    void end();
+    void end(EditorPanelVisibility& visibility, EditorRequests& requests);
     void setProfileFile(const std::filesystem::path& layoutPath);
     void setProfilePath(const std::filesystem::path& scenePath);
     void saveLayout() const;
@@ -21,7 +21,7 @@ private:
     void loadLayout();
     void executeCommand(EditorCommandId id, EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
     void drawMainMenu(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
-    void drawDockTabIconOverlays();
+    void drawDockTabIconOverlays(EditorPanelVisibility& visibility, EditorRequests& requests);
     void drawDockPanelChromeOverlays();
     void drawHelpWindows();
 

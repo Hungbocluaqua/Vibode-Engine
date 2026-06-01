@@ -23,6 +23,8 @@ CameraController::CameraController() = default;
 
 bool CameraController::update(GLFWwindow* window, float deltaSeconds, PathTracerRenderer& renderer, bool allowMouseCapture, bool allowKeyboardMove) {
     deltaSeconds = std::clamp(std::isfinite(deltaSeconds) ? deltaSeconds : 0.0f, 0.0f, maxCameraDeltaSeconds);
+    releasedMouseCaptureDurationSeconds_ = -1.0f;
+    releasedMouseCaptureMoved_ = false;
     if (glfwGetWindowAttrib(window, GLFW_FOCUSED) != GLFW_TRUE) {
         if (mouseCaptured_) {
             releaseMouse(window);
@@ -37,6 +39,8 @@ bool CameraController::update(GLFWwindow* window, float deltaSeconds, PathTracer
 
     const bool rightMouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
     if (mouseCaptured_ && !rightMouseDown) {
+        releasedMouseCaptureDurationSeconds_ = mouseCaptureDurationSeconds_;
+        releasedMouseCaptureMoved_ = mouseCaptureMoved_;
         releaseMouse(window);
     }
     if (allowMouseCapture && rightMouseDown && !escapeDown && !mouseCaptured_) {
@@ -61,6 +65,7 @@ bool CameraController::update(GLFWwindow* window, float deltaSeconds, PathTracer
         if (dx != 0.0 || dy != 0.0) {
             yawRadians_ += static_cast<float>(dx) * mouseSensitivity;
             pitchRadians_ = std::clamp(pitchRadians_ - static_cast<float>(dy) * mouseSensitivity, -pitchLimit, pitchLimit);
+            mouseCaptureMoved_ = true;
             changed = true;
         }
     }
@@ -78,7 +83,12 @@ bool CameraController::update(GLFWwindow* window, float deltaSeconds, PathTracer
     if (glm::dot(move, move) > 0.0f) {
         const float speed = keyDown(window, GLFW_KEY_LEFT_SHIFT) ? fastMoveSpeed_ : moveSpeed_;
         position_ += glm::normalize(move) * speed * deltaSeconds;
+        mouseCaptureMoved_ = true;
         changed = true;
+    }
+
+    if (mouseCaptured_) {
+        mouseCaptureDurationSeconds_ += deltaSeconds;
     }
 
     if (changed) {
@@ -107,6 +117,8 @@ void CameraController::setPose(glm::vec3 position, glm::vec3 forwardDirection, P
 
 void CameraController::captureMouse(GLFWwindow* window) {
     mouseCaptured_ = true;
+    mouseCaptureDurationSeconds_ = 0.0f;
+    mouseCaptureMoved_ = false;
     firstMouseSample_ = true;
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 }

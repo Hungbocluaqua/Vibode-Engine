@@ -214,40 +214,38 @@ void drawInspectorComponentHeader(
     EditorComponentKind kind = EditorComponentKind::Light,
     SceneUpdateKind updateKind = SceneUpdateKind::None,
     EditorRequests* requests = nullptr) {
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0.0f, 2.0f));
     const ImVec2 cursor = ImGui::GetCursorScreenPos();
     const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
     const ImVec2 size(width, EditorUiMetric::inspectorComponentHeaderHeight);
     const ImVec2 min = cursor;
     const ImVec2 max(cursor.x + size.x, cursor.y + size.y);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImU32 bg = enabled ? IM_COL32(19, 24, 32, 242) : IM_COL32(18, 20, 24, 210);
-    const ImU32 border = enabled ? IM_COL32(54, 64, 80, 215) : IM_COL32(44, 48, 56, 170);
-    const ImU32 accent = enabled ? IM_COL32(66, 120, 190, 230) : IM_COL32(84, 90, 100, 170);
-    dl->AddRectFilled(min, max, bg, EditorUiMetric::cardRounding);
-    dl->AddRect(min, max, border, EditorUiMetric::cardRounding);
-    dl->AddRectFilled(ImVec2(min.x, min.y), ImVec2(min.x + 3.0f, max.y), accent, EditorUiMetric::cardRounding, ImDrawFlags_RoundCornersLeft);
+    const ImU32 bg = enabled ? IM_COL32(38, 41, 46, 238) : IM_COL32(25, 27, 31, 214);
+    const ImU32 border = enabled ? IM_COL32(61, 66, 74, 150) : IM_COL32(44, 48, 56, 130);
+    dl->AddRectFilled(min, max, bg, EditorUiMetric::compactButtonRounding);
+    dl->AddRect(min, max, border, EditorUiMetric::compactButtonRounding);
 
     const float iconSize = EditorUiMetric::inspectorComponentHeaderIconSize;
-    const ImVec2 iconMin(min.x + 10.0f, min.y + (size.y - iconSize) * 0.5f);
+    const ImVec2 iconMin(min.x + 8.0f, min.y + (size.y - iconSize) * 0.5f);
     const ImVec4 iconTint = enabled ? editorIconTint(false) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
     editorDrawIconGlyph(icon, iconMin, ImVec2(iconMin.x + iconSize, iconMin.y + iconSize), ImGui::GetColorU32(iconTint));
 
     const ImU32 titleColor = ImGui::GetColorU32(enabled ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     const ImU32 detailColor = ImGui::GetColorU32(ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     const ImVec2 titleSize = ImGui::CalcTextSize(title);
-    const float textX = iconMin.x + iconSize + 9.0f;
-    const float titleY = detail != nullptr ? min.y + 6.0f : min.y + (size.y - titleSize.y) * 0.5f;
+    const float textX = iconMin.x + iconSize + 14.0f;
+    const float titleY = detail != nullptr ? min.y + 4.0f : min.y + (size.y - titleSize.y) * 0.5f;
     dl->AddText(ImVec2(textX, titleY), titleColor, title);
     if (detail != nullptr && detail[0] != '\0') {
-        dl->AddText(ImVec2(textX, min.y + 20.0f), detailColor, detail);
+        dl->AddText(ImVec2(textX, min.y + 17.0f), detailColor, detail);
     }
 
     ImGui::Dummy(size);
     if (popupId != nullptr && requests != nullptr) {
         const ImVec2 after = ImGui::GetCursorScreenPos();
         const float actionSize = EditorUiMetric::inspectorComponentActionSize;
-        ImGui::SetCursorScreenPos(ImVec2(max.x - actionSize - 7.0f, min.y + (size.y - actionSize) * 0.5f));
+        ImGui::SetCursorScreenPos(ImVec2(max.x - actionSize - 5.0f, min.y + (size.y - actionSize) * 0.5f));
         const std::string buttonId = std::string("ComponentActions") + popupId;
         if (inspectorActionButton(buttonId.c_str(), "Component actions")) {
             ImGui::OpenPopup(popupId);
@@ -295,7 +293,7 @@ void drawEntityActionsMenu(Entity& entity, EditorSelection& selection, EditorReq
         requests.setEntityLocked = EditorEntityBoolChange{.entity = entity.id, .value = !entity.locked};
     }
     ImGui::Separator();
-    if (ImGui::BeginMenu("Add Component", !entity.locked)) {
+    if (editorGlyphBeginMenu(EditorGlyphIcon::Add, "Add Component", !entity.locked)) {
         addComponentMenuItem("Light", entity, EditorComponentKind::Light, SceneUpdateKind::TopologyChanged, EditorGlyphIcon::Light, entity.light.has_value(), requests);
         addComponentMenuItem("Primary Sun", entity, EditorComponentKind::Sun, SceneUpdateKind::LightOnly, EditorGlyphIcon::Sun, entity.sun.has_value(), requests);
         addComponentMenuItem("Camera", entity, EditorComponentKind::Camera, SceneUpdateKind::TopologyChanged, EditorGlyphIcon::Camera, entity.camera.has_value(), requests);
@@ -326,8 +324,8 @@ void drawInspectorStateCard(EditorGlyphIcon icon, const char* title, const char*
 
     const ImVec2 iconMin(min.x + 14.0f, min.y + 18.0f);
     editorDrawIconGlyph(icon, iconMin, ImVec2(iconMin.x + 30.0f, iconMin.y + 30.0f), IM_COL32(112, 144, 190, 235));
-    dl->AddText(ImVec2(min.x + 56.0f, min.y + 16.0f), IM_COL32(220, 226, 235, 255), title);
-    dl->AddText(ImVec2(min.x + 56.0f, min.y + 40.0f), IM_COL32(142, 150, 164, 255), detail);
+    dl->AddText(ImVec2(min.x + 62.0f, min.y + 16.0f), IM_COL32(220, 226, 235, 255), title);
+    dl->AddText(ImVec2(min.x + 62.0f, min.y + 40.0f), IM_COL32(142, 150, 164, 255), detail);
     ImGui::Dummy(size);
 }
 
@@ -342,8 +340,8 @@ void drawInspectorLockedBanner() {
     dl->AddRect(min, max, IM_COL32(92, 78, 46, 215), EditorUiMetric::cardRounding);
     const ImVec2 iconMin(min.x + 11.0f, min.y + 11.0f);
     editorDrawIconGlyph(EditorGlyphIcon::Lock, iconMin, ImVec2(iconMin.x + 18.0f, iconMin.y + 18.0f), IM_COL32(214, 178, 98, 235));
-    dl->AddText(ImVec2(min.x + 39.0f, min.y + 6.0f), IM_COL32(224, 218, 204, 255), "Entity locked");
-    dl->AddText(ImVec2(min.x + 39.0f, min.y + 23.0f), IM_COL32(157, 150, 137, 255), "Unlock from the entity actions menu to edit components.");
+    dl->AddText(ImVec2(min.x + 45.0f, min.y + 6.0f), IM_COL32(224, 218, 204, 255), "Entity locked");
+    dl->AddText(ImVec2(min.x + 45.0f, min.y + 23.0f), IM_COL32(157, 150, 137, 255), "Unlock from the entity actions menu to edit components.");
     ImGui::Dummy(size);
     ImGui::Spacing();
 }

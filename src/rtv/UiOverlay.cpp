@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -68,6 +69,51 @@ bool isStandalonePreviewTexturePath(const std::filesystem::path& path) {
     return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" || ext == ".bmp" || ext == ".hdr" ||
         ext == ".gltf" || ext == ".glb" || ext == ".obj" || ext == ".rtlevel" || ext == ".mscene" || ext == ".vproject" ||
         ext == ".mtl" || ext == ".ies" || ext == ".vdb";
+}
+
+std::filesystem::path findEditorTablerIconFont() {
+    std::filesystem::path cursor = std::filesystem::current_path();
+    for (int depth = 0; depth < 8 && !cursor.empty(); ++depth) {
+        const std::filesystem::path local = cursor / "third_party" / "tabler-icons" / "tabler-icons.ttf";
+        if (std::filesystem::exists(local)) {
+            return local;
+        }
+        const std::filesystem::path nested = cursor / "native" / "vulkan" / "third_party" / "tabler-icons" / "tabler-icons.ttf";
+        if (std::filesystem::exists(nested)) {
+            return nested;
+        }
+
+        const std::filesystem::path parent = cursor.parent_path();
+        if (parent == cursor) {
+            break;
+        }
+        cursor = parent;
+    }
+    return {};
+}
+
+std::filesystem::path findEditorUiTextFont() {
+#if defined(_WIN32)
+    char* windir = nullptr;
+    size_t windirLength = 0;
+    if (_dupenv_s(&windir, &windirLength, "WINDIR") == 0 && windir != nullptr) {
+        const std::filesystem::path fonts = std::filesystem::path(windir) / "Fonts";
+        std::free(windir);
+        const std::array<std::filesystem::path, 3> candidates{{
+            fonts / "segoeui.ttf",
+            fonts / "segoeuib.ttf",
+            fonts / "tahoma.ttf",
+        }};
+        for (const std::filesystem::path& candidate : candidates) {
+            if (std::filesystem::exists(candidate)) {
+                return candidate;
+            }
+        }
+    } else if (windir != nullptr) {
+        std::free(windir);
+    }
+#endif
+    return {};
 }
 
 bool isRasterGpuPreviewPath(const std::filesystem::path& path) {
@@ -272,6 +318,7 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.IniFilename = "rtv_editor.ini";
 
+    loadEditorFonts();
     applyDarkStyle();
     ImGui_ImplGlfw_InitForVulkan(window_, true);
     ImGuiVulkanLoaderData loaderData{
@@ -498,7 +545,6 @@ void UiOverlay::record(VkCommandBuffer commandBuffer) {
 
 void UiOverlay::onSwapchainRecreated(const Swapchain& swapchain) {
     colorAttachmentFormat_ = swapchain.format();
-    ImGui_ImplVulkan_SetMinImageCount(std::max(2u, swapchain.imageCount()));
     textureRetireFrameDelay_ = std::max<uint64_t>(CommandSystem::framesInFlight, swapchain.imageCount()) + 1u;
 }
 
@@ -711,6 +757,51 @@ void UiOverlay::invalidateAssetPreviewTextures() {
 
 void UiOverlay::checkVkResult(VkResult result) {
     checkVk(result, "ImGui Vulkan backend");
+}
+
+void UiOverlay::loadEditorFonts() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.Fonts == nullptr) {
+        return;
+    }
+
+    const std::filesystem::path textFontPath = findEditorUiTextFont();
+    if (!textFontPath.empty()) {
+        ImFontConfig textConfig{};
+        textConfig.PixelSnapH = true;
+        textConfig.OversampleH = 2;
+        textConfig.OversampleV = 1;
+        if (ImFont* textFont = io.Fonts->AddFontFromFileTTF(textFontPath.string().c_str(), 14.0f, &textConfig, io.Fonts->GetGlyphRangesDefault())) {
+            io.FontDefault = textFont;
+        }
+    }
+
+    if (io.Fonts->Fonts.empty()) {
+        io.Fonts->AddFontDefault();
+    }
+
+    const std::filesystem::path fontPath = findEditorTablerIconFont();
+    if (fontPath.empty()) {
+        editorSetTablerIconFont(nullptr);
+        std::cerr << "[UiOverlay] Tabler icon font not found; falling back to built-in editor glyphs.\n";
+        return;
+    }
+
+    ImFontConfig iconConfig{};
+    iconConfig.PixelSnapH = true;
+    iconConfig.OversampleH = 1;
+    iconConfig.OversampleV = 1;
+    iconConfig.GlyphMinAdvanceX = 13.0f;
+    iconConfig.GlyphMaxAdvanceX = 18.0f;
+    static constexpr ImWchar tablerRanges[] = {0xEA00, 0xFFFF, 0};
+    ImFont* iconFont = io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 18.0f, &iconConfig, tablerRanges);
+    if (iconFont == nullptr) {
+        editorSetTablerIconFont(nullptr);
+        std::cerr << "[UiOverlay] Failed to load Tabler icon font from " << fontPath.string() << "; falling back to built-in editor glyphs.\n";
+        return;
+    }
+
+    editorSetTablerIconFont(iconFont);
 }
 
 void UiOverlay::applyDarkStyle() {

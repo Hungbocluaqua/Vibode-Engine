@@ -48,6 +48,9 @@ private:
     SnapSettings snap_{};
     bool focused_ = false;
     bool hovered_ = false;
+    bool rightMouseContextCandidate_ = false;
+    bool rightMouseContextSuppressed_ = false;
+    float rightMouseContextHoldSeconds_ = 0.0f;
     GizmoInteractionState gizmoState_ = GizmoInteractionState::Idle;
 
     bool gizmoDragActive_ = false;

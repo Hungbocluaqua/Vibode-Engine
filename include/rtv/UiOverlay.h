@@ -131,6 +131,7 @@ private:
     void releaseRetiredTextures(bool force = false);
     void invalidateEditorTextures();
     void invalidateAssetPreviewTextures();
+    void loadEditorFonts();
     void applyDarkStyle();
 
     GLFWwindow* window_ = nullptr;
