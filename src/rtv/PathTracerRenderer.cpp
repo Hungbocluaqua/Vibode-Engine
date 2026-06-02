@@ -4601,6 +4601,7 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             .addStorageReadWrite(accumulation, PipelineDomain::Compute)
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
             .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
             .addStorageReadWrite(pathData, PipelineDomain::Compute)
             .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                 recordRestirGiFinalPass(cmd);
@@ -4722,6 +4723,7 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 .addStorageReadWrite(accumulation, PipelineDomain::Compute)
                 .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
                 .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+                .addStorageRead(velocity, PipelineDomain::Compute)
                 .addStorageReadWrite(pathData, PipelineDomain::Compute)
                 .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                     recordRestirGiFinalPass(cmd);
@@ -5851,6 +5853,7 @@ void PathTracerRenderer::recordRestirGiFinalPass(VkCommandBuffer commandBuffer) 
         .writeBuffer(5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)))
         .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
         .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumulationBuffer_.descriptorInfo())
+        .writeBuffer(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
         .update(context_.device(), set);
 
     restirGiFinalPipeline_->bind(commandBuffer);
@@ -6230,6 +6233,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageReadWrite(accumulation, PipelineDomain::Compute)
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
             .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
             .addStorageReadWrite(pathData, PipelineDomain::Compute);
     }
     if (useWavefrontFinalOutput) {
@@ -6301,6 +6305,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
                 .addStorageReadWrite(accumulation, PipelineDomain::Compute)
                 .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
                 .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+                .addStorageRead(velocity, PipelineDomain::Compute)
                 .addStorageReadWrite(pathData, PipelineDomain::Compute);
         }
     }

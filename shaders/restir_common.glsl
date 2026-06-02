@@ -344,10 +344,12 @@ float restir_gi_temporal_compatibility(RestirGiReservoir current, RestirGiReserv
     if (!restir_gi_reservoir_valid(previous) || restir_gi_age(previous) >= uint(maxTemporalAge)) {
         return 0.0;
     }
-    if (restir_gi_reservoir_valid(current) && restir_gi_material_id(current) != restir_gi_material_id(previous)) {
+    if (!restir_gi_visible(previous)) {
         return 0.0;
     }
-    if (!restir_gi_visible(previous)) {
+
+    uint currentMaterialId = restir_gi_material_id(current);
+    if (currentMaterialId != 0xffffffffu && currentMaterialId != restir_gi_material_id(previous)) {
         return 0.0;
     }
 
@@ -370,7 +372,8 @@ float restir_gi_temporal_compatibility(RestirGiReservoir current, RestirGiReserv
 
     float currentTarget = max(restir_gi_target_function(current), 1.0e-5);
     float previousTarget = max(restir_gi_target_function(previous), 1.0e-5);
-    float targetConfidence = sqrt(min(currentTarget, previousTarget) / max(currentTarget, previousTarget));
+    float targetFloor = 0.01;
+    float targetConfidence = sqrt((min(currentTarget, previousTarget) + targetFloor) / (max(currentTarget, previousTarget) + targetFloor));
 
     return compatibility *
         hitDistanceConfidence *
@@ -392,6 +395,21 @@ RestirGiReservoir restir_gi_finalize_selected(
         RESTIR_GI_FLAG_VALID | (restir_gi_visible(selected) ? RESTIR_GI_FLAG_VISIBLE : 0u),
         roughness);
     return selected;
+}
+
+RestirGiReservoir restir_gi_finalize_blended(
+    RestirGiReservoir selected,
+    vec3 radiance,
+    float totalMass,
+    float sampleCount,
+    uint age,
+    float roughness) {
+    selected.radiance_weight_sum.rgb = max(radiance, vec3(0.0));
+    restir_gi_set_hit_distance_target_pdf(
+        selected,
+        restir_gi_hit_distance(selected),
+        max(restir_luminance(selected.radiance_weight_sum.rgb), 1.0e-4));
+    return restir_gi_finalize_selected(selected, totalMass, sampleCount, age, roughness);
 }
 
 RestirGiReservoir restir_gi_temporal_resample(
@@ -438,12 +456,20 @@ RestirGiReservoir restir_gi_temporal_resample(
     }
 
     float motionCap = mix(0.85, 0.10, 1.0 - clamp(motionConfidence, 0.0, 1.0));
-    float previousProbability = clamp(previousMass / totalMass, 0.0, motionCap);
-    bool selectPrevious = randomValue < previousProbability;
-    RestirGiReservoir selected = selectPrevious ? previous : current;
+    float historyWeight = clamp(previousMass / totalMass, 0.0, motionCap);
+    RestirGiReservoir selected = current;
+    vec3 blendedRadiance = mix(
+        max(current.radiance_weight_sum.rgb, vec3(0.0)),
+        max(previous.radiance_weight_sum.rgb, vec3(0.0)),
+        historyWeight);
     float combinedSamples = restir_gi_sample_count(current) + restir_gi_sample_count(previous) * compatibility;
-    uint selectedAge = selectPrevious ? min(restir_gi_age(previous) + 1u, uint(maxTemporalAge)) : 0u;
-    return restir_gi_finalize_selected(selected, totalMass, min(combinedSamples, 255.0), selectedAge, restir_gi_roughness(selected));
+    return restir_gi_finalize_blended(
+        selected,
+        blendedRadiance,
+        totalMass,
+        min(combinedSamples, 64.0),
+        0u,
+        restir_gi_roughness(selected));
 }
 
 float restir_target_function(RestirReservoir reservoir) {

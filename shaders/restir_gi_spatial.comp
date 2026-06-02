@@ -51,14 +51,21 @@ SurfaceReuseData decode_surface_reuse_data(uvec4 packed) {
     return surface;
 }
 
+float restir_gi_hash_to_unit(uint value) {
+    return float(value >> 8u) * (1.0 / 16777216.0);
+}
+
 ivec2 blue_noise_offset(ivec2 coords, uint roundIndex) {
-    vec2 sampleValue = sample_dimension_2d(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 16u);
-    uint h = sample_dimension_seed(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 18u);
-    float angle = sampleValue.x * 6.28318530718;
-    float radius = 0.75 + sampleValue.y * max(params.gi_spatial_radius, 1.0);
+    uint seed = blue_noise_hash(
+        uint(coords.x) ^ (roundIndex * 0x9e3779b9u),
+        uint(coords.y) ^ ((roundIndex + 1u) * 0x85ebca6bu));
+    float angle = fract(restir_gi_hash_to_unit(seed) + float(roundIndex) * 0.61803398875) * 6.28318530718;
+    float radius = 1.0 + sqrt(restir_gi_hash_to_unit(blue_noise_hash(seed, roundIndex + 17u))) * max(params.gi_spatial_radius, 1.0);
     ivec2 offset = ivec2(int(round(cos(angle) * radius)), int(round(sin(angle) * radius)));
-    offset.x += (h & 1u) == 0u ? 0 : 1;
-    offset.y += ((h >> 1u) & 1u) == 0u ? 0 : 1;
+    if (offset.x == 0 && offset.y == 0) {
+        const ivec2 fallbackOffsets[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+        offset = fallbackOffsets[roundIndex & 3u];
+    }
     return offset;
 }
 
@@ -73,6 +80,24 @@ vec3 decode_world_position(uvec2 packedValue) {
 
 bool finite_receiver_position(vec3 position) {
     return abs(position.x) < 1.0e8 && abs(position.y) < 1.0e8 && abs(position.z) < 1.0e8;
+}
+
+bool exact_receiver_position_available(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return restir_gi_material_id(reservoir) != 0xffffffffu &&
+        finite_receiver_position(restir_gi_receiver_position(reservoir));
+#else
+    return false;
+#endif
+}
+
+vec3 receiver_position_for_pixel(RestirGiReservoir currentReservoir, uvec2 packedWorldPosition) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    if (exact_receiver_position_available(currentReservoir)) {
+        return restir_gi_receiver_position(currentReservoir);
+    }
+#endif
+    return decode_world_position(packedWorldPosition);
 }
 
 RestirGiReservoir invalidate_gi_candidate(RestirGiReservoir reservoir) {
@@ -218,6 +243,12 @@ float gi_reservoir_compatibility(
     if (!restir_gi_reservoir_valid(candidate) || !restir_gi_visible(candidate)) {
         return 0.0;
     }
+    uint centerMaterialId = restir_gi_material_id(center);
+    uint candidateMaterialId = restir_gi_material_id(candidate);
+    if (centerMaterialId != 0xffffffffu && candidateMaterialId != 0xffffffffu && centerMaterialId != candidateMaterialId) {
+        return 0.0;
+    }
+
     float surfaceCompatibility = receiver_surface_compatibility(centerSurface, candidateSurface);
     if (surfaceCompatibility <= 0.0) {
         return 0.0;
@@ -231,7 +262,13 @@ float gi_reservoir_compatibility(
 
     float currentTarget = max(restir_gi_target_pdf(center), 1.0e-5);
     float candidateTarget = max(restir_gi_target_pdf(candidate), 1.0e-5);
-    float targetConfidence = sqrt(min(currentTarget, candidateTarget) / max(currentTarget, candidateTarget));
+    float minTarget = min(currentTarget, candidateTarget);
+    float maxTarget = max(currentTarget, candidateTarget);
+    float targetRatio = minTarget / maxTarget;
+    if (minTarget < 0.025 && targetRatio < 0.18) {
+        return 0.0;
+    }
+    float targetConfidence = sqrt((minTarget + 0.01) / (maxTarget + 0.01));
 
     return surfaceCompatibility *
         smoothstep(0.35, 0.90, distanceRatio) *
@@ -245,26 +282,27 @@ RestirGiReservoir merge_gi_candidate(
     float compatibility,
     ivec2 coords,
     uint roundIndex,
-    inout float totalMass) {
-    float candidateMass = max(restir_gi_reservoir_mass(candidate), 0.0) * compatibility;
-    float nextMass = totalMass + candidateMass;
-    if (nextMass <= 1.0e-8) {
+    inout float totalWeight) {
+    float candidateWeight = clamp(compatibility, 0.0, 1.0);
+    float nextWeight = totalWeight + candidateWeight;
+    if (nextWeight <= 1.0e-8) {
         return merged;
     }
 
-    float candidateProbability = clamp(candidateMass / nextMass, 0.0, 1.0);
-    float selectSample = sample_dimension_1d(coords, params.frame_count, roundIndex, SAMPLE_DIM_RESTIR_SPATIAL + 21u);
     float mergedSamples = restir_gi_sample_count(merged);
     float candidateSamples = restir_gi_sample_count(candidate);
-    bool selectCandidate = selectSample < candidateProbability;
-    RestirGiReservoir selected = selectCandidate ? candidate : merged;
-    uint selectedAge = selectCandidate ? restir_gi_age(candidate) : restir_gi_age(merged);
+    vec3 blendedRadiance = (
+        max(merged.radiance_weight_sum.rgb, vec3(0.0)) * totalWeight +
+        max(candidate.radiance_weight_sum.rgb, vec3(0.0)) * candidateWeight) / nextWeight;
+    RestirGiReservoir selected = merged;
+    uint selectedAge = restir_gi_age(merged);
     float selectedRoughness = restir_gi_roughness(selected);
-    totalMass = nextMass;
-    return restir_gi_finalize_selected(
+    totalWeight = nextWeight;
+    return restir_gi_finalize_blended(
         selected,
-        totalMass,
-        min(mergedSamples + candidateSamples * compatibility, 255.0),
+        blendedRadiance,
+        totalWeight,
+        min(mergedSamples + candidateSamples * candidateWeight, 64.0),
         selectedAge,
         selectedRoughness);
 }
@@ -280,6 +318,7 @@ void main() {
         ? clamp(ivec2((coords.x / 2) * 2, (coords.y / 2) * 2), ivec2(0), ivec2(int(params.width) - 1, int(params.height) - 1))
         : coords;
     uint reservoirIndex = uint(reservoirCoords.y) * params.width + uint(reservoirCoords.x);
+    RestirGiReservoir centerReservoir = input_reservoirs[pixelIndex];
     RestirGiReservoir merged = input_reservoirs[reservoirIndex];
     if (params.enabled == 0u) {
         output_reservoirs[pixelIndex] = merged;
@@ -287,13 +326,19 @@ void main() {
     }
 
     SurfaceReuseData centerSurface = decode_surface_reuse_data(depth_normal_buffer[pixelIndex]);
-    vec3 receiverPosition = decode_world_position(world_position_buffer[pixelIndex]);
+    vec3 receiverPosition = receiver_position_for_pixel(centerReservoir, world_position_buffer[pixelIndex]);
     uint roundCount = clamp(params.gi_spatial_rounds, 1u, 8u);
     uint visibilityBudget = params.gi_visibility_ray_budget == 0u
         ? roundCount + 1u
         : params.gi_visibility_ray_budget;
     uint visibilityRaysUsed = 0u;
     merged = retarget_gi_candidate(merged, receiverPosition, centerSurface.normal, visibilityBudget, visibilityRaysUsed);
+    float centerGiLum = restir_luminance(max(merged.radiance_weight_sum.rgb, vec3(0.0)));
+    if (centerGiLum < 0.035) {
+        roundCount = min(roundCount, 1u);
+    } else if (centerGiLum < 0.12) {
+        roundCount = min(roundCount, 2u);
+    }
 
     uint maxTemporalAge = max(params.gi_temporal_max_age, 1u);
     vec2 velocityPixels = restir_unpack_velocity_pixels(velocity_buffer[pixelIndex]);
@@ -320,7 +365,7 @@ void main() {
     }
 
     float compatibilityThreshold = clamp(params.gi_spatial_compatibility_threshold, 0.0, 0.85);
-    float totalMass = max(restir_gi_reservoir_mass(merged), 0.0);
+    float totalWeight = 1.0;
     for (uint roundIndex = 0u; roundIndex < roundCount; ++roundIndex) {
         ivec2 sampleCoords = coords + blue_noise_offset(coords, roundIndex);
         if (sampleCoords.x < 0 || sampleCoords.y < 0 || sampleCoords.x >= int(params.width) || sampleCoords.y >= int(params.height)) {
@@ -336,7 +381,7 @@ void main() {
         SurfaceReuseData candidateSurface = decode_surface_reuse_data(depth_normal_buffer[sampleIndex]);
         float compatibility = gi_reservoir_compatibility(merged, candidate, centerSurface, candidateSurface);
         if (compatibility > compatibilityThreshold) {
-            merged = merge_gi_candidate(merged, candidate, compatibility, coords, roundIndex, totalMass);
+            merged = merge_gi_candidate(merged, candidate, compatibility, coords, roundIndex, totalWeight);
         }
     }
 
