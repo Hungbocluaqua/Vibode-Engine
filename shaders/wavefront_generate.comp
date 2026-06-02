@@ -1,6 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
+#define RTV_STBN_TEXTURE_ENABLED 1
 #include "blue_noise.glsl"
 #include "wavefront_common.glsl"
 

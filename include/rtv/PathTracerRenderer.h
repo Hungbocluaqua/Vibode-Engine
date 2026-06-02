@@ -28,6 +28,7 @@ class BufferUploader;
 class ComputePipeline;
 class DescriptorLayoutCache;
 class DescriptorSet;
+class DescriptorWriter;
 class GraphicsPipeline;
 class PipelineCache;
 class RayTracingPipeline;
@@ -767,6 +768,9 @@ private:
     void releaseDlssRayReconstructionFeature();
     [[nodiscard]] bool ensureDlssFeature(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool ensureDlssRayReconstructionFeature(VkCommandBuffer commandBuffer);
+    void createStbnResources(const std::filesystem::path& shaderDirectory);
+    void writeStbnDescriptors(DescriptorWriter& writer) const;
+    [[nodiscard]] float stbnScalarSample(int32_t x, int32_t y, uint32_t frameIndex) const;
     void fallbackBlitPostDenoiseToTemporalOutput(VkCommandBuffer commandBuffer);
     void skipDenoiserPass(VkCommandBuffer commandBuffer);
     void skipDenoiserCopyPass(VkCommandBuffer commandBuffer);
@@ -894,6 +898,7 @@ private:
     Image dlssSpecularRayDirectionImage_;
     Image dlssDiffuseRayDirectionHitDistanceImage_;
     Image dlssSpecularRayDirectionHitDistanceImage_;
+    Image stbnScalarImage_;
     Image presentationImage_;
     Buffer cameraBuffer_;
     Buffer denoiserParamsBuffer_;
@@ -952,6 +957,7 @@ private:
 
     VkSampler fullscreenSampler_ = VK_NULL_HANDLE;
     VkSampler nearestSampler_ = VK_NULL_HANDLE;
+    std::vector<uint8_t> stbnScalarAtlas_;
     std::unique_ptr<DescriptorLayoutCache> layoutCache_;
     std::unique_ptr<PipelineCache> pipelineCache_;
     std::unique_ptr<AtmosphereLutSystem> atmosphereLutSystem_;

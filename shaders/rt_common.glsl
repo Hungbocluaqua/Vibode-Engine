@@ -3,6 +3,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "atmosphere_phase.glsl"
+#define RTV_STBN_TEXTURE_ENABLED 1
 #include "blue_noise.glsl"
 
 #ifndef RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT

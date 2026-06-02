@@ -19,6 +19,7 @@
 #include "rtv/ShaderModule.h"
 #include "rtv/ShaderReflection.h"
 #include "rtv/TemporalSystem.h"
+#include "rtv/TextureLoader.h"
 #include "rtv/VulkanContext.h"
 
 #include <cstdlib>
@@ -30,6 +31,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -69,6 +71,14 @@ constexpr uint32_t kRendererFramesInFlight = 3;
 constexpr VkPipelineStageFlags2 kCrossQueueShaderStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 constexpr uint32_t kRayTracingDiagnosticCounterCount = 14;
 constexpr uint32_t kWavefrontQueueClearValidationValue = 0x57465131u; // WFQ1
+constexpr uint32_t kStbnTileSize = 128;
+constexpr uint32_t kStbnFrameCount = 64;
+constexpr uint32_t kStbnAtlasColumns = 8;
+constexpr uint32_t kStbnAtlasRows = 8;
+constexpr uint32_t kStbnAtlasWidth = kStbnTileSize * kStbnAtlasColumns;
+constexpr uint32_t kStbnAtlasHeight = kStbnTileSize * kStbnAtlasRows;
+constexpr uint32_t kStbnScalarTextureBinding = 55;
+constexpr uint32_t kStbnScalarSamplerBinding = 56;
 
 void bufferMemoryBarrier(
     VkCommandBuffer commandBuffer,
@@ -151,6 +161,136 @@ bool isWavefrontDebugView(RendererDebugView view) {
 
 bool requiresWavefrontShadowTrace(RendererDebugView view) {
     return view == RendererDebugView::WavefrontDirectLighting;
+}
+
+uint32_t stbnHash(uint32_t value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+float stbnHashFloat(int32_t x, int32_t y, int32_t frame) {
+    const uint32_t ux = static_cast<uint32_t>(x) & (kStbnTileSize - 1u);
+    const uint32_t uy = static_cast<uint32_t>(y) & (kStbnTileSize - 1u);
+    const uint32_t uf = static_cast<uint32_t>(frame) & (kStbnFrameCount - 1u);
+    const uint32_t seed = ux * 0x9e3779b9u ^ uy * 0x85ebca6bu ^ uf * 0xc2b2ae35u;
+    return static_cast<float>(stbnHash(seed) >> 8u) * (1.0f / 16777216.0f);
+}
+
+std::vector<uint8_t> buildStbnScalarAtlas() {
+    constexpr uint32_t tilePixels = kStbnTileSize * kStbnTileSize;
+    std::vector<uint8_t> atlas(static_cast<size_t>(kStbnAtlasWidth) * kStbnAtlasHeight, 0u);
+    std::vector<float> scores(tilePixels, 0.0f);
+    std::vector<uint32_t> order(tilePixels, 0u);
+    std::iota(order.begin(), order.end(), 0u);
+
+    for (uint32_t frame = 0; frame < kStbnFrameCount; ++frame) {
+        for (uint32_t y = 0; y < kStbnTileSize; ++y) {
+            for (uint32_t x = 0; x < kStbnTileSize; ++x) {
+                const int32_t ix = static_cast<int32_t>(x);
+                const int32_t iy = static_cast<int32_t>(y);
+                const int32_t iframe = static_cast<int32_t>(frame);
+                const float center = stbnHashFloat(ix, iy, iframe);
+                const float cardinal =
+                    stbnHashFloat(ix - 1, iy, iframe) +
+                    stbnHashFloat(ix + 1, iy, iframe) +
+                    stbnHashFloat(ix, iy - 1, iframe) +
+                    stbnHashFloat(ix, iy + 1, iframe);
+                const float diagonal =
+                    stbnHashFloat(ix - 1, iy - 1, iframe) +
+                    stbnHashFloat(ix + 1, iy - 1, iframe) +
+                    stbnHashFloat(ix - 1, iy + 1, iframe) +
+                    stbnHashFloat(ix + 1, iy + 1, iframe);
+                const float temporal =
+                    stbnHashFloat(ix, iy, iframe - 1) +
+                    stbnHashFloat(ix, iy, iframe + 1);
+                const float spatialAverage = (cardinal * 0.18f + diagonal * 0.07f) / (4.0f * 0.18f + 4.0f * 0.07f);
+                const float temporalAverage = temporal * 0.5f;
+                const uint32_t index = y * kStbnTileSize + x;
+                scores[index] = center + (center - spatialAverage) * 0.72f + (center - temporalAverage) * 0.35f;
+            }
+        }
+
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            if (scores[a] == scores[b]) {
+                return a < b;
+            }
+            return scores[a] < scores[b];
+        });
+
+        const uint32_t tileX = (frame % kStbnAtlasColumns) * kStbnTileSize;
+        const uint32_t tileY = (frame / kStbnAtlasColumns) * kStbnTileSize;
+        for (uint32_t rank = 0; rank < tilePixels; ++rank) {
+            const uint32_t localIndex = order[rank];
+            const uint32_t x = localIndex % kStbnTileSize;
+            const uint32_t y = localIndex / kStbnTileSize;
+            const uint8_t value = static_cast<uint8_t>((rank * 255u + (tilePixels - 1u) / 2u) / (tilePixels - 1u));
+            atlas[(tileY + y) * kStbnAtlasWidth + (tileX + x)] = value;
+        }
+    }
+
+    return atlas;
+}
+
+std::string stbnScalarSliceName(uint32_t frame) {
+    return "stbn_scalar_2Dx1Dx1D_128x128x64x1_" + std::to_string(frame) + ".png";
+}
+
+std::optional<std::vector<uint8_t>> loadNvidiaStbnScalarAtlas(const std::filesystem::path& directory) {
+    const std::filesystem::path firstSlice = directory / stbnScalarSliceName(0u);
+    if (!std::filesystem::exists(firstSlice)) {
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> atlas(static_cast<size_t>(kStbnAtlasWidth) * kStbnAtlasHeight, 0u);
+    for (uint32_t frame = 0; frame < kStbnFrameCount; ++frame) {
+        const std::filesystem::path slicePath = directory / stbnScalarSliceName(frame);
+        TextureData slice = TextureLoader::loadRgba8(slicePath.string());
+        if (slice.width != static_cast<int>(kStbnTileSize) || slice.height != static_cast<int>(kStbnTileSize)) {
+            std::ostringstream message;
+            message << "NVIDIA STBN slice has unexpected dimensions: " << slicePath
+                    << " is " << slice.width << "x" << slice.height
+                    << ", expected " << kStbnTileSize << "x" << kStbnTileSize;
+            throw std::runtime_error(message.str());
+        }
+        const size_t expectedBytes = static_cast<size_t>(kStbnTileSize) * kStbnTileSize * 4u;
+        if (slice.pixels.size() < expectedBytes) {
+            throw std::runtime_error("NVIDIA STBN slice decode returned too few bytes: " + slicePath.string());
+        }
+
+        const uint32_t tileX = (frame % kStbnAtlasColumns) * kStbnTileSize;
+        const uint32_t tileY = (frame / kStbnAtlasColumns) * kStbnTileSize;
+        for (uint32_t y = 0; y < kStbnTileSize; ++y) {
+            for (uint32_t x = 0; x < kStbnTileSize; ++x) {
+                const size_t src = (static_cast<size_t>(y) * kStbnTileSize + x) * 4u;
+                atlas[(tileY + y) * kStbnAtlasWidth + (tileX + x)] = slice.pixels[src];
+            }
+        }
+    }
+    return atlas;
+}
+
+std::vector<std::filesystem::path> stbnAssetDirectories(const std::filesystem::path& shaderDirectory) {
+    std::vector<std::filesystem::path> candidates;
+    auto addCandidate = [&](std::filesystem::path path) {
+        if (path.empty()) {
+            return;
+        }
+        path = std::filesystem::absolute(path);
+        if (std::find(candidates.begin(), candidates.end(), path) == candidates.end()) {
+            candidates.push_back(std::move(path));
+        }
+    };
+
+    if (!shaderDirectory.empty()) {
+        addCandidate(shaderDirectory.parent_path() / "third_party" / "STBN" / "Assets" / "STBN");
+    }
+    addCandidate(std::filesystem::current_path() / "third_party" / "STBN" / "Assets" / "STBN");
+    addCandidate(std::filesystem::current_path() / ".." / "third_party" / "STBN" / "Assets" / "STBN");
+    return candidates;
 }
 
 #if defined(RTV_DLSS_NGX_ENABLED)
@@ -321,6 +461,8 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(51, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(52, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(54, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(kStbnScalarTextureBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, allRt),
+        descriptorBinding(kStbnScalarSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, allRt),
     };
 }
 
@@ -1133,6 +1275,7 @@ PathTracerRenderer::PathTracerRenderer(
     samplerInfo.magFilter = VK_FILTER_NEAREST;
     samplerInfo.minFilter = VK_FILTER_NEAREST;
     checkVk(vkCreateSampler(context_.device(), &samplerInfo, nullptr, &nearestSampler_), "vkCreateSampler(path tracer nearest)");
+    createStbnResources(shaderDirectory);
 
     camera_.pos = {0.0f, 0.0f, 3.9f, 0.0f};
     camera_.forward = {0.0f, 0.0f, -1.0f, 0.0f};
@@ -1163,6 +1306,64 @@ PathTracerRenderer::~PathTracerRenderer() {
     if (fullscreenSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(context_.device(), fullscreenSampler_, nullptr);
     }
+}
+
+void PathTracerRenderer::createStbnResources(const std::filesystem::path& shaderDirectory) {
+    bool loadedNvidiaStbn = false;
+    std::filesystem::path loadedDirectory;
+    for (const std::filesystem::path& directory : stbnAssetDirectories(shaderDirectory)) {
+        try {
+            if (std::optional<std::vector<uint8_t>> atlas = loadNvidiaStbnScalarAtlas(directory)) {
+                stbnScalarAtlas_ = std::move(*atlas);
+                loadedNvidiaStbn = true;
+                loadedDirectory = directory;
+                break;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "NVIDIA STBN load failed from " << directory << ": " << e.what() << '\n';
+        }
+    }
+    if (!loadedNvidiaStbn) {
+        stbnScalarAtlas_ = buildStbnScalarAtlas();
+    }
+    stbnScalarImage_.create(allocator_, ImageDesc{
+        .width = kStbnAtlasWidth,
+        .height = kStbnAtlasHeight,
+        .format = VK_FORMAT_R8_UNORM,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "stbn scalar atlas",
+    });
+    uploader_.uploadToImage2D(
+        stbnScalarImage_,
+        stbnScalarAtlas_.data(),
+        static_cast<VkDeviceSize>(stbnScalarAtlas_.size()),
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    std::cout << "STBN scalar atlas: " << kStbnAtlasWidth << "x" << kStbnAtlasHeight
+              << " (" << kStbnFrameCount << " frames, "
+              << (loadedNvidiaStbn ? "NVIDIA pregenerated" : "generated fallback") << ")";
+    if (loadedNvidiaStbn) {
+        std::cout << " from " << loadedDirectory;
+    }
+    std::cout << '\n';
+}
+
+void PathTracerRenderer::writeStbnDescriptors(DescriptorWriter& writer) const {
+    writer
+        .writeImage(kStbnScalarTextureBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, stbnScalarImage_.sampledDescriptor(VK_NULL_HANDLE))
+        .writeImage(kStbnScalarSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, VkDescriptorImageInfo{.sampler = nearestSampler_});
+}
+
+float PathTracerRenderer::stbnScalarSample(int32_t x, int32_t y, uint32_t frameIndex) const {
+    if (stbnScalarAtlas_.empty()) {
+        return 0.5f;
+    }
+    const uint32_t frame = frameIndex & (kStbnFrameCount - 1u);
+    const uint32_t localX = static_cast<uint32_t>(x) & (kStbnTileSize - 1u);
+    const uint32_t localY = static_cast<uint32_t>(y) & (kStbnTileSize - 1u);
+    const uint32_t tileX = (frame % kStbnAtlasColumns) * kStbnTileSize;
+    const uint32_t tileY = (frame / kStbnAtlasColumns) * kStbnTileSize;
+    const uint32_t atlasIndex = (tileY + localY) * kStbnAtlasWidth + (tileX + localX);
+    return static_cast<float>(stbnScalarAtlas_.at(atlasIndex)) * (1.0f / 255.0f);
 }
 
 bool PathTracerRenderer::shadersNeedReload() {
@@ -2638,15 +2839,7 @@ PathTracerRenderer::WavefrontQueueStats PathTracerRenderer::wavefrontQueueStats(
             return static_cast<float>(value >> 8u) * (1.0f / 16777216.0f);
         };
         auto blueNoise1d = [&](int32_t x, int32_t y, uint32_t frameIndex) {
-            static constexpr float samples[4][4] = {
-                {0.0625f, 0.5625f, 0.3125f, 0.8125f},
-                {0.1875f, 0.6875f, 0.4375f, 0.9375f},
-                {0.8125f, 0.3125f, 0.5625f, 0.0625f},
-                {0.9375f, 0.4375f, 0.6875f, 0.1875f},
-            };
-            const uint32_t ix = static_cast<uint32_t>(x) & 3u;
-            const uint32_t iy = static_cast<uint32_t>(y) & 3u;
-            return fract(samples[iy][ix] + static_cast<float>(frameIndex & 3u) * 0.25f);
+            return stbnScalarSample(x, y, frameIndex);
         };
         auto sampleDimension2d = [&]() {
             constexpr uint32_t dimension = 4u;
@@ -2667,7 +2860,9 @@ PathTracerRenderer::WavefrontQueueStats PathTracerRenderer::wavefrontQueueStats(
             const glm::vec2 stbn(
                 blueNoise1d(px + ox, py + oy, camera_.temporalFrameIndex + dimension),
                 blueNoise1d(px + ox + 7, py + oy + 11, camera_.temporalFrameIndex + dimension + 1u));
-            return glm::vec2(fract(u + scramble.x + stbn.x * (1.0f / 256.0f)), fract(v + scramble.y + stbn.y * (1.0f / 256.0f)));
+            return glm::vec2(
+                fract(u + stbn.x + scramble.x * (1.0f / 65536.0f)),
+                fract(v + stbn.y + scramble.y * (1.0f / 65536.0f)));
         };
         auto concentricDisk = [](glm::vec2 u) {
             const glm::vec2 offset = u * 2.0f - glm::vec2(1.0f);
@@ -4744,11 +4939,13 @@ void PathTracerRenderer::recordWavefrontPrimaryGeneratePass(VkCommandBuffer comm
         " jitter=(" + std::to_string(camera_.jitter.x) + "," + std::to_string(camera_.jitter.y) + ")");
 
     DescriptorSet set = currentFrame_->descriptors().allocate(wavefrontPrimaryGenerateSetLayout_);
-    DescriptorWriter()
+    DescriptorWriter writer;
+    writer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, wavefrontRayQueueBuffer_.descriptorInfo())
-        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, wavefrontPixelStateBuffer_.descriptorInfo())
-        .update(context_.device(), set);
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, wavefrontPixelStateBuffer_.descriptorInfo());
+    writeStbnDescriptors(writer);
+    writer.update(context_.device(), set);
 
     const bool cameraCut = temporalSystem_ ? temporalSystem_->isCameraCut() : temporalFrameIndex_ <= 1u;
     const WavefrontPrimaryGeneratePush push{
@@ -5519,12 +5716,14 @@ void PathTracerRenderer::recordRestirSpatialPass(VkCommandBuffer commandBuffer) 
     validationLog_.recordPass("restir spatial reuse");
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirSpatialStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     DescriptorSet set = currentFrame_->descriptors().allocate(restirSpatialSetLayout_);
-    DescriptorWriter()
+    DescriptorWriter writer;
+    writer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirReservoirBuffer_.descriptorInfo())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirSpatialReservoirBuffer_.descriptorInfo())
         .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
-        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)))
-        .update(context_.device(), set);
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)));
+    writeStbnDescriptors(writer);
+    writer.update(context_.device(), set);
 
     restirSpatialPipeline_->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
@@ -5550,12 +5749,14 @@ void PathTracerRenderer::recordRestirGiSpatialPass(VkCommandBuffer commandBuffer
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiSpatialStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(restirGiSpatialSetLayout_);
-    DescriptorWriter()
+    DescriptorWriter writer;
+    writer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialReservoirBuffer_.descriptorInfo())
         .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
-        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)))
-        .update(context_.device(), set);
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)));
+    writeStbnDescriptors(writer);
+    writer.update(context_.device(), set);
 
     restirGiSpatialPipeline_->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
@@ -6352,6 +6553,7 @@ void PathTracerRenderer::writeRayTracingDescriptors(
         .writeBuffer(46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(47, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
         .writeBuffer(48, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingDiagnosticCountersBuffer_.descriptorInfo());
+    writeStbnDescriptors(writer);
     const Buffer& wavefrontRayQueue = wavefrontRayQueueOverride != nullptr ? *wavefrontRayQueueOverride : wavefrontRayQueueBuffer_;
     if (includeWavefrontQueues &&
         wavefrontRayQueue.handle() != VK_NULL_HANDLE &&
@@ -9740,6 +9942,7 @@ VkDeviceSize PathTracerRenderer::estimatedTextureMemory() const {
     total += texSize(dlssSpecularRayDirectionImage_);
     total += texSize(dlssDiffuseRayDirectionHitDistanceImage_);
     total += texSize(dlssSpecularRayDirectionHitDistanceImage_);
+    total += texSize(stbnScalarImage_);
 #if defined(RTV_NRD_RUNTIME_ENABLED)
     if (nrdRuntime_) {
         total += texSize(nrdRuntime_->motionVectors);

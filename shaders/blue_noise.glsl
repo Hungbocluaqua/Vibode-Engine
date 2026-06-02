@@ -5,6 +5,26 @@
 #define RTV_USE_DIMENSIONED_SAMPLER 1
 #endif
 
+#ifndef RTV_STBN_TEXTURE_ENABLED
+#define RTV_STBN_TEXTURE_ENABLED 0
+#endif
+
+#if RTV_STBN_TEXTURE_ENABLED
+layout(set = 0, binding = 55) uniform texture2D stbn_scalar_texture;
+layout(set = 0, binding = 56) uniform sampler stbn_scalar_sampler;
+
+const int STBN_TILE_SIZE = 128;
+const int STBN_FRAME_COUNT = 64;
+const int STBN_ATLAS_COLUMNS = 8;
+
+float stbn_scalar_sample(ivec2 pixel, uint frameIndex) {
+    uint frame = frameIndex & uint(STBN_FRAME_COUNT - 1);
+    ivec2 tileBase = ivec2(int(frame & 7u), int(frame >> 3u)) * STBN_TILE_SIZE;
+    ivec2 localPixel = ivec2(uint(pixel.x) & uint(STBN_TILE_SIZE - 1), uint(pixel.y) & uint(STBN_TILE_SIZE - 1));
+    return texelFetch(sampler2D(stbn_scalar_texture, stbn_scalar_sampler), tileBase + localPixel, 0).r;
+}
+#endif
+
 uint blue_noise_hash(uint x, uint y) {
     uint h = x * 0xbc9f1d37u + y * 0x9e3779b9u;
     h = h ^ (h >> 16u);
@@ -23,11 +43,15 @@ float blue_noise_samples[4][4] = float[4][4](
 );
 
 float blue_noise_1d(ivec2 pixel, uint frameIndex) {
+#if RTV_STBN_TEXTURE_ENABLED
+    return stbn_scalar_sample(pixel, frameIndex);
+#else
     uint x = uint(pixel.x) & 3u;
     uint y = uint(pixel.y) & 3u;
     float base = blue_noise_samples[y][x];
     float rot = float(frameIndex & 3u) * 0.25;
     return fract(base + rot);
+#endif
 }
 
 vec2 blue_noise_2d(ivec2 pixel, uint frameIndex) {
@@ -98,11 +122,19 @@ float sample_dimension_1d(ivec2 pixel, uint frameIndex, uint bounce, uint dimens
     float lowDiscrepancy = sample_radical_inverse_base2(index ^ (seed & 0xffffu));
     float scramble = sample_uint_to_unit_float(sample_hash_combine(seed, dimension));
     float stbnRotation = blue_noise_1d(pixel + ivec2(int(dimension & 7u), int((dimension >> 3u) & 7u)), frameIndex + bounce + dimension);
+#if RTV_STBN_TEXTURE_ENABLED
+    return fract(lowDiscrepancy + stbnRotation + scramble * (1.0 / 65536.0));
+#else
     return fract(lowDiscrepancy + scramble + stbnRotation * (1.0 / 256.0));
+#endif
 #else
     float hashValue = sample_uint_to_unit_float(seed);
     float stbnRotation = blue_noise_1d(pixel + ivec2(int(dimension & 7u), int((dimension >> 3u) & 7u)), frameIndex + bounce + dimension);
+#if RTV_STBN_TEXTURE_ENABLED
+    return fract(stbnRotation + hashValue * (1.0 / 65536.0));
+#else
     return fract(hashValue + stbnRotation * (1.0 / 256.0));
+#endif
 #endif
 }
 
@@ -116,13 +148,21 @@ vec2 sample_dimension_2d(ivec2 pixel, uint frameIndex, uint bounce, uint dimensi
         sample_uint_to_unit_float(sample_hash_combine(seed, dimension + 1u)),
         sample_uint_to_unit_float(sample_hash_combine(seed, dimension + 2u)));
     vec2 stbnRotation = blue_noise_2d(pixel + ivec2(int(dimension & 7u), int((dimension >> 3u) & 7u)), frameIndex + bounce + dimension);
+#if RTV_STBN_TEXTURE_ENABLED
+    return fract(vec2(u, v) + stbnRotation + scramble * (1.0 / 65536.0));
+#else
     return fract(vec2(u, v) + scramble + stbnRotation * (1.0 / 256.0));
+#endif
 #else
     vec2 hashValue = vec2(
         sample_uint_to_unit_float(seed),
         sample_uint_to_unit_float(sample_hash_combine(seed, dimension + 1u)));
     vec2 stbnRotation = blue_noise_2d(pixel + ivec2(int(dimension & 7u), int((dimension >> 3u) & 7u)), frameIndex + bounce + dimension);
+#if RTV_STBN_TEXTURE_ENABLED
+    return fract(stbnRotation + hashValue * (1.0 / 65536.0));
+#else
     return fract(hashValue + stbnRotation * (1.0 / 256.0));
+#endif
 #endif
 }
 
