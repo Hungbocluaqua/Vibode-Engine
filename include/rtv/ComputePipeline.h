@@ -18,7 +18,8 @@ public:
         const ShaderModule& shader,
         std::vector<VkDescriptorSetLayout> setLayouts,
         std::vector<VkPushConstantRange> pushConstants,
-        PipelineCache& pipelineCache);
+        PipelineCache& pipelineCache,
+        const char* entryPoint = "main");
     ~ComputePipeline();
 
     [[nodiscard]] VkPipeline handle() const { return pipeline_; }

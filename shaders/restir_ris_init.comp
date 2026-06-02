@@ -49,6 +49,8 @@ void main() {
 
     RestirReservoir reservoir = empty_restir_reservoir();
     float totalWeight = 0.0;
+    float selectedPdf = 1.0e-6;
+    uint selectedLightIndex = 0u;
 
     uint candidateCount = min(params.candidate_count, 32u);
     for (uint i = 0u; i < candidateCount; ++i) {
@@ -63,18 +65,29 @@ void main() {
         float targetWeight = 1.0 / max(lightPdf, 1.0e-6);
 
         totalWeight += targetWeight;
-        reservoir.target_pdf_weight_sum_m.z += 1.0;
+        restir_set_sample_count(reservoir, restir_sample_count(reservoir) + 1.0);
 
         if (sample_dimension_1d(coords, 0u, i, SAMPLE_DIM_RESTIR_CANDIDATE + 1u) * totalWeight < targetWeight) {
-            reservoir.metadata = uvec4(1u, 0u, 1u, lightIndex);
+            selectedPdf = lightPdf;
+            selectedLightIndex = lightIndex;
+            float targetLum = restir_luminance(max(light_buffer.lights[lightIndex].rgb, vec3(0.0)));
+            reservoir.metadata = uvec4(
+                targetLum > 1.0e-6 ? 1u : 0u,
+                0u,
+                restir_pack_state(0u, restir_pack_validity_visibility(targetLum > 1.0e-6, RESTIR_VISIBILITY_VISIBLE), 1u),
+                lightIndex);
             reservoir.sample_value_confidence.rgb = light_buffer.lights[lightIndex].rgb;
-            reservoir.target_pdf_weight_sum_m.x = lightPdf;
+            reservoir.sample_radiance_target = vec4(max(light_buffer.lights[lightIndex].rgb, vec3(0.0)), targetLum);
+            reservoir.sample_normal_weight = vec4(0.0, 1.0, 0.0, targetWeight);
+            reservoir.sample_metadata = uvec4(lightIndex, 1u, 0u, 0u);
         }
     }
 
-    if (totalWeight > 0.0) {
+    if (totalWeight > 0.0 && reservoir.sample_radiance_target.w > 1.0e-6) {
         reservoir.sample_value_confidence.a = 1.0;
-        reservoir.target_pdf_weight_sum_m.y = totalWeight;
+        reservoir.sample_normal_weight.w = min(totalWeight, 65504.0);
+        restir_set_source_pdf_and_previous_weight(reservoir, selectedPdf, 0.0);
+        reservoir.sample_metadata.x = selectedLightIndex;
     }
 
     output_reservoirs[pixelIndex] = reservoir;

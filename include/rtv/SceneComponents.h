@@ -224,6 +224,7 @@ struct RenderSettings {
     RestirMode restirMode = RestirMode::RestirOnly;
     bool restirGiEnabled = true;
     bool denoiserEnabled = true;
+    DenoiserBackend denoiserBackend = DenoiserBackend::Engine;
     bool denoiseWhileMoving = true;
     uint32_t samplesPerPixel = 1;
     bool limitSamplesPerPixel = true;
@@ -232,6 +233,10 @@ struct RenderSettings {
     uint32_t denoiserMaxHistoryLength = 48;
     float momentValidityThreshold = 0.20f;
     bool taaEnabled = true;
+    TemporalUpscaler temporalUpscaler = TemporalUpscaler::TaaTsr;
+    bool dlssFrameGenerationEnabled = false;
+    bool dlssRayReconstructionEnabled = false;
+    float dlssSharpeningStrength = 0.0f;
     float taaFeedback = 0.06f;
     float taaMotionFeedback = 0.90f;
     float taaReactiveFeedback = 0.98f;

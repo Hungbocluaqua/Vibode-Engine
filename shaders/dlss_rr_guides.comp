@@ -1,0 +1,237 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "temporal_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
+layout(set = 0, binding = 1, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
+};
+layout(set = 0, binding = 2, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
+
+layout(set = 0, binding = 3, r32f) writeonly uniform image2D output_depth;
+layout(set = 0, binding = 4, rg16f) writeonly uniform image2D output_motion_vectors;
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D output_diffuse_albedo;
+layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D output_specular_albedo;
+layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D output_normals;
+layout(set = 0, binding = 8, r32f) writeonly uniform image2D output_roughness;
+layout(set = 0, binding = 9, r32f) writeonly uniform image2D output_diffuse_hit_distance;
+layout(set = 0, binding = 10, r32f) writeonly uniform image2D output_specular_hit_distance;
+layout(set = 0, binding = 11, std430) readonly buffer PreviousWorldPositionBuffer { uvec2 previous_world_position_buffer[]; };
+
+layout(set = 0, binding = 12, std140) uniform PrevCamera {
+    mat4 view_proj;
+    mat4 inv_view_proj;
+    mat4 prev_view_proj;
+    vec4 current_pos;
+    vec4 prev_pos;
+    vec4 jitter;
+} prev_camera;
+
+layout(set = 0, binding = 13, rgba16f) writeonly uniform image2D output_reflected_albedo;
+layout(set = 0, binding = 14, r32f) writeonly uniform image2D output_disocclusion_mask;
+layout(set = 0, binding = 15, rgba16f) writeonly uniform image2D output_diffuse_ray_direction;
+layout(set = 0, binding = 16, rgba16f) writeonly uniform image2D output_specular_ray_direction;
+layout(set = 0, binding = 17, r32f) writeonly uniform image2D output_diffuse_ray_direction_hit_distance;
+layout(set = 0, binding = 18, r32f) writeonly uniform image2D output_specular_ray_direction_hit_distance;
+
+layout(set = 0, binding = 20, std140) uniform Camera {
+    vec4 pos;
+    vec4 forward;
+    vec4 right;
+    vec4 up;
+    uint frame_count;
+    uint temporal_frame_index;
+    float effective_jitter_scale;
+    uint camera_moving;
+    float sun_intensity;
+    float sky_intensity;
+    float exposure;
+    uint path_tracing_enabled;
+    uint max_bounces;
+    uint sunlight_enabled;
+    uint direct_lighting_enabled;
+    float fov_y;
+    float sun_angular_radius;
+    float indirect_strength;
+    uint environment_direct_samples;
+    uint padding0;
+    vec4 jitter;
+    vec4 atmosphere;
+    vec4 render_controls;
+    vec4 sun_direction_illuminance;
+    vec4 sun_color_angular_radius;
+    uvec4 restir_gi_controls;
+    uvec4 path_trace_controls;
+    vec4 dof_controls;
+    vec4 motion_blur_controls;
+    vec4 volume_controls;
+} camera;
+
+layout(set = 0, binding = 19, std140) uniform TaaParams {
+    uint enabled;
+    uint frame_count;
+    uint width;
+    uint height;
+    float feedback;
+    float velocity_scale;
+    uint reset_history;
+    float sharpen_strength;
+    uint history_valid;
+    uint camera_moving;
+    uint render_width;
+    uint render_height;
+    float motion_feedback;
+    float reactive_feedback;
+} params;
+
+vec2 unpack_snorm2x16(uint packedValue) {
+    vec2 unorm = vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
+    return unorm * 2.0 - vec2(1.0);
+}
+
+vec3 decode_octahedral_normal(uint packedValue) {
+    vec2 f = unpack_snorm2x16(packedValue);
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+float guide_luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 camera_ray_direction(ivec2 coords, ivec2 dims, bool includeJitter) {
+    vec2 jitter = vec2(0.5);
+    if (includeJitter && camera.path_tracing_enabled != 0u) {
+        jitter += camera.jitter.xy;
+    }
+    vec2 uv = (vec2(coords) + jitter) / vec2(max(dims, ivec2(1)));
+    vec2 ndc = uv * 2.0 - vec2(1.0);
+    float aspect = float(dims.x) / max(float(dims.y), 1.0);
+    float scale = tan(camera.fov_y * 0.5);
+    return normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
+}
+
+float path_distance_to_view_depth(ivec2 coords, ivec2 dims, float pathDistance) {
+    vec3 rayDir = camera_ray_direction(coords, dims, true);
+    float forwardCos = max(dot(rayDir, normalize(camera.forward.xyz)), 1.0e-4);
+    return clamp(pathDistance * forwardCos, 0.0, 65504.0);
+}
+
+vec2 unpack_unorm2x16(uint packedValue) {
+    return vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
+}
+
+vec3 decode_world_position(uvec2 packedValue, vec3 origin) {
+    if (packedValue.x == 0u && packedValue.y == 0u) {
+        return vec3(0.0, 1.0e10, 0.0);
+    }
+    vec2 xy = unpack_snorm2x16(packedValue.x);
+    float z = unpack_snorm2x16(packedValue.y).x;
+    return origin + vec3(xy.x, xy.y, z) * 8.0;
+}
+
+float guide_hit_distance(float value, float fallback) {
+    return value > 0.001 && value < 65000.0
+        ? clamp(value, 0.0, 65504.0)
+        : clamp(max(fallback, 0.0), 0.0, 65504.0);
+}
+
+vec3 guide_direction(vec3 value, vec3 fallback) {
+    return dot(value, value) > 1.0e-8 ? normalize(value) : normalize(fallback);
+}
+
+vec3 orient_normal_to_camera(vec3 normal, vec3 cameraRayDirection) {
+    vec3 n = guide_direction(normal, -cameraRayDirection);
+    return dot(n, -cameraRayDirection) >= 0.0 ? n : -n;
+}
+
+float disocclusion_mask(ivec2 coords, ivec2 dims, bool surface, vec2 currentToPreviousPixels) {
+    if (!surface) {
+        return 0.0;
+    }
+    if (params.reset_history != 0u) {
+        return 1.0;
+    }
+    if (temporal_velocity_pixels_are_invalid(currentToPreviousPixels, params.velocity_scale)) {
+        return 1.0;
+    }
+    vec2 historyPos = vec2(coords) - currentToPreviousPixels;
+    if (!temporal_history_pixel_valid(historyPos, dims, 0.0)) {
+        return 1.0;
+    }
+    ivec2 historyCoords = clamp(ivec2(round(historyPos)), ivec2(0), dims - ivec2(1));
+    uint historyIndex = uint(historyCoords.y) * uint(dims.x) + uint(historyCoords.x);
+    if (previous_world_position_buffer[historyIndex].x == 0u && previous_world_position_buffer[historyIndex].y == 0u) {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(int(params.render_width), int(params.render_height));
+    if (coords.x >= dims.x || coords.y >= dims.y || dims.x <= 0 || dims.y <= 0) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * uint(dims.x) + uint(coords.x);
+    uvec4 packedDepthNormal = depth_normal_buffer[pixelIndex];
+    float pathDistance = uintBitsToFloat(packedDepthNormal.x);
+    bool surface = pathDistance < 1.0e9;
+    float linearDepth = surface ? path_distance_to_view_depth(coords, dims, pathDistance) : 65504.0;
+    if (!surface) {
+        linearDepth = 65504.0;
+    }
+
+    PathDataRecord path = path_data_buffer[pixelIndex];
+    vec3 normal = surface ? decode_octahedral_normal(packedDepthNormal.y) : vec3(0.0, 0.0, 1.0);
+    float roughness = surface ? clamp(path.albedo_roughness_hit_confidence.w, 0.001, 1.0) : 1.0;
+    vec3 diffuseAlbedo = surface ? clamp(path.albedo_roughness_hit_confidence.rgb, 0.0, 1.0) : vec3(0.5);
+    vec3 specularAlbedo = surface ? clamp(path.material_specular_albedo.rgb, 0.0, 1.0) : vec3(0.5);
+    float primaryHitDistance = path.direct_specular.a;
+    float diffuseHitDistance = surface ? guide_hit_distance(path.denoiser_hit_distance.x, primaryHitDistance) : 0.0;
+    float specularHitDistance = surface ? guide_hit_distance(path.denoiser_hit_distance.y, primaryHitDistance) : 0.0;
+
+    vec2 currentToPreviousPixels = temporal_unpack_velocity_pixels(velocity_buffer[pixelIndex], params.velocity_scale);
+    vec2 previousMinusCurrentPixels = temporal_velocity_pixels_are_invalid(currentToPreviousPixels, params.velocity_scale)
+        ? vec2(0.0)
+        : -currentToPreviousPixels;
+    vec3 fallbackRayDirection = camera_ray_direction(coords, dims, false);
+    vec3 orientedNormal = orient_normal_to_camera(normal, fallbackRayDirection);
+    vec3 diffuseRayDirection = surface ? orientedNormal : fallbackRayDirection;
+    vec3 specularRayDirection = surface ? guide_direction(reflect(fallbackRayDirection, orientedNormal), fallbackRayDirection) : fallbackRayDirection;
+    float diffuseRayDirectionHitDistance = surface ? diffuseHitDistance : 0.0;
+    float specularRayDirectionHitDistance = surface ? specularHitDistance : 0.0;
+    float disocclusion = disocclusion_mask(coords, dims, surface, currentToPreviousPixels);
+
+    imageStore(output_depth, coords, vec4(linearDepth, 0.0, 0.0, 0.0));
+    imageStore(output_motion_vectors, coords, vec4(previousMinusCurrentPixels, 0.0, 0.0));
+    imageStore(output_diffuse_albedo, coords, vec4(diffuseAlbedo, 1.0));
+    imageStore(output_specular_albedo, coords, vec4(specularAlbedo, 1.0));
+    imageStore(output_normals, coords, vec4(normal, 1.0));
+    imageStore(output_roughness, coords, vec4(roughness, 0.0, 0.0, 0.0));
+    imageStore(output_diffuse_hit_distance, coords, vec4(diffuseHitDistance, 0.0, 0.0, 0.0));
+    imageStore(output_specular_hit_distance, coords, vec4(specularHitDistance, 0.0, 0.0, 0.0));
+    imageStore(output_reflected_albedo, coords, vec4(specularAlbedo, 1.0));
+    imageStore(output_disocclusion_mask, coords, vec4(disocclusion, 0.0, 0.0, 0.0));
+    imageStore(output_diffuse_ray_direction, coords, vec4(diffuseRayDirection, 1.0));
+    imageStore(output_specular_ray_direction, coords, vec4(specularRayDirection, 1.0));
+    imageStore(output_diffuse_ray_direction_hit_distance, coords, vec4(diffuseRayDirectionHitDistance, 0.0, 0.0, 0.0));
+    imageStore(output_specular_ray_direction_hit_distance, coords, vec4(specularRayDirectionHitDistance, 0.0, 0.0, 0.0));
+}

@@ -127,6 +127,11 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> hdrPath;
         std::optional<std::filesystem::path> scenePath;
         std::optional<bool> denoiserOverride;
+        std::optional<rtv::DenoiserBackend> denoiserBackendOverride;
+        std::optional<rtv::TemporalUpscaler> temporalUpscalerOverride;
+        std::optional<bool> dlssFrameGenerationOverride;
+        std::optional<bool> dlssRayReconstructionOverride;
+        std::optional<float> dlssSharpeningOverride;
         std::optional<rtv::RestirMode> restirModeOverride;
         std::optional<rtv::RenderPreset> renderPresetOverride;
         std::optional<bool> restirGiOverride;
@@ -237,6 +242,31 @@ int main(int argc, char** argv) {
             } else if (arg == "--denoiser" && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 denoiserOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--denoiser-backend" || arg == "--denoiser-mode") && i + 1 < argc) {
+                denoiserBackendOverride = rtv::parseDenoiserBackend(argv[++i]);
+            } else if (arg == "--nrd" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                denoiserBackendOverride = (value == "off" || value == "false" || value == "0")
+                    ? rtv::DenoiserBackend::Engine
+                    : rtv::DenoiserBackend::Nrd;
+            } else if ((arg == "--temporal-upscaler" || arg == "--upscaler") && i + 1 < argc) {
+                temporalUpscalerOverride = rtv::parseTemporalUpscaler(argv[++i]);
+            } else if (arg == "--dlss" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                temporalUpscalerOverride = (value == "off" || value == "false" || value == "0")
+                    ? rtv::TemporalUpscaler::TaaTsr
+                    : rtv::TemporalUpscaler::Dlss;
+            } else if ((arg == "--dlss-fg" || arg == "--dlss-frame-generation" || arg == "--frame-generation") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                dlssFrameGenerationOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--dlss-rr" || arg == "--dlss-ray-reconstruction" || arg == "--ray-reconstruction") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                dlssRayReconstructionOverride = !(value == "off" || value == "false" || value == "0");
+                if (*dlssRayReconstructionOverride) {
+                    temporalUpscalerOverride = rtv::TemporalUpscaler::Dlss;
+                }
+            } else if ((arg == "--dlss-sharpening" || arg == "--dlss-sharpness") && i + 1 < argc) {
+                dlssSharpeningOverride = std::stof(argv[++i]);
             } else if (arg == "--restir" && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 if (value == "classic" || value == "off" || value == "nee") {
@@ -550,6 +580,47 @@ int main(int argc, char** argv) {
                 rtv::RendererSettings settings = renderer->settings();
                 settings.fixedSeed = diagConfig.fixedSeed;
                 renderer->applySettings(settings);
+            }
+            if (denoiserBackendOverride.has_value() ||
+                temporalUpscalerOverride.has_value() ||
+                dlssFrameGenerationOverride.has_value() ||
+                dlssRayReconstructionOverride.has_value() ||
+                dlssSharpeningOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (denoiserBackendOverride.has_value()) {
+                    settings.denoiserBackend = *denoiserBackendOverride;
+                }
+                if (temporalUpscalerOverride.has_value()) {
+                    settings.temporalUpscaler = *temporalUpscalerOverride;
+                }
+                if (dlssFrameGenerationOverride.has_value()) {
+                    settings.dlssFrameGenerationEnabled = *dlssFrameGenerationOverride;
+                }
+                if (dlssRayReconstructionOverride.has_value()) {
+                    settings.dlssRayReconstructionEnabled = *dlssRayReconstructionOverride;
+                }
+                if (dlssSharpeningOverride.has_value()) {
+                    settings.dlssSharpeningStrength = std::clamp(*dlssSharpeningOverride, 0.0f, 1.0f);
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+                const auto nvidiaStatus = renderer->nvidiaIntegrationStatus();
+                if (settings.denoiserBackend == rtv::DenoiserBackend::Nrd && !nvidiaStatus.nrdAvailable) {
+                    std::cerr << "Warning: NRD denoiser requested, but unavailable: "
+                              << nvidiaStatus.nrdUnavailableReason << ". Using engine denoiser.\n";
+                }
+                if (settings.temporalUpscaler == rtv::TemporalUpscaler::Dlss && !nvidiaStatus.dlssAvailable) {
+                    std::cerr << "Warning: DLSS requested, but unavailable: "
+                              << nvidiaStatus.dlssUnavailableReason << ". Using TAA/TSR.\n";
+                }
+                if (settings.dlssRayReconstructionEnabled && !nvidiaStatus.dlssRayReconstructionAvailable) {
+                    std::cerr << "Warning: DLSS Ray Reconstruction requested, but unavailable: "
+                              << nvidiaStatus.dlssRayReconstructionUnavailableReason << ".\n";
+                }
+                if (settings.dlssFrameGenerationEnabled && !nvidiaStatus.dlssFrameGenerationAvailable) {
+                    std::cerr << "Warning: DLSS Frame Generation requested, but unavailable: "
+                              << nvidiaStatus.dlssFrameGenerationUnavailableReason << ".\n";
+                }
             }
             if (taaMotionFeedbackOverride.has_value() || taaReactiveFeedbackOverride.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();

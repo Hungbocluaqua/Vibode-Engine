@@ -1,0 +1,96 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "temporal_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
+layout(set = 0, binding = 1, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+layout(set = 0, binding = 2, r32f) writeonly uniform image2D output_depth;
+layout(set = 0, binding = 3, rg16f) writeonly uniform image2D output_motion_vectors;
+
+layout(set = 0, binding = 4, std140) uniform TaaParams {
+    uint enabled;
+    uint frame_count;
+    uint width;
+    uint height;
+    float feedback;
+    float velocity_scale;
+    uint reset_history;
+    float sharpen_strength;
+    uint history_valid;
+    uint camera_moving;
+    uint render_width;
+    uint render_height;
+    float motion_feedback;
+    float reactive_feedback;
+} params;
+
+layout(set = 0, binding = 5, std140) uniform Camera {
+    vec4 pos;
+    vec4 forward;
+    vec4 right;
+    vec4 up;
+    uint frame_count;
+    uint temporal_frame_index;
+    float effective_jitter_scale;
+    uint camera_moving;
+    float sun_intensity;
+    float sky_intensity;
+    float exposure;
+    uint path_tracing_enabled;
+    uint max_bounces;
+    uint sunlight_enabled;
+    uint direct_lighting_enabled;
+    float fov_y;
+    float sun_angular_radius;
+    float indirect_strength;
+    uint environment_direct_samples;
+    uint padding0;
+    vec4 jitter;
+    vec4 atmosphere;
+    vec4 render_controls;
+    vec4 sun_direction_illuminance;
+    vec4 sun_color_angular_radius;
+    uvec4 restir_gi_controls;
+    uvec4 path_trace_controls;
+    vec4 dof_controls;
+    vec4 motion_blur_controls;
+    vec4 volume_controls;
+} camera;
+
+float path_distance_to_view_depth(ivec2 coords, ivec2 dims, float pathDistance) {
+    vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
+    vec2 uv = (vec2(coords) + jitter) / vec2(max(dims, ivec2(1)));
+    vec2 ndc = uv * 2.0 - vec2(1.0);
+    float aspect = float(dims.x) / max(float(dims.y), 1.0);
+    float scale = tan(camera.fov_y * 0.5);
+    vec3 rayDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
+    float forwardCos = max(dot(rayDir, normalize(camera.forward.xyz)), 1.0e-4);
+    return clamp(pathDistance * forwardCos, 0.0, 65504.0);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(int(params.render_width), int(params.render_height));
+    if (coords.x >= dims.x || coords.y >= dims.y || dims.x <= 0 || dims.y <= 0) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * uint(dims.x) + uint(coords.x);
+    uvec4 packedDepthNormal = depth_normal_buffer[pixelIndex];
+    float pathDistance = uintBitsToFloat(packedDepthNormal.x);
+    float linearDepth = pathDistance < 1.0e9 ? path_distance_to_view_depth(coords, dims, pathDistance) : 65504.0;
+    if (!(linearDepth < 1.0e9)) {
+        linearDepth = 65504.0;
+    }
+
+    vec2 currentToPreviousPixels = temporal_unpack_velocity_pixels(velocity_buffer[pixelIndex], params.velocity_scale);
+    vec2 previousMinusCurrentPixels = temporal_velocity_pixels_are_invalid(currentToPreviousPixels, params.velocity_scale)
+        ? vec2(0.0)
+        : -currentToPreviousPixels;
+
+    imageStore(output_depth, coords, vec4(linearDepth, 0.0, 0.0, 0.0));
+    imageStore(output_motion_vectors, coords, vec4(previousMinusCurrentPixels, 0.0, 0.0));
+}

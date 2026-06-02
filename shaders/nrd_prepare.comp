@@ -1,0 +1,177 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "temporal_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
+layout(set = 0, binding = 1, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
+};
+layout(set = 0, binding = 2, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
+
+layout(set = 0, binding = 3, rg16f) writeonly uniform image2D out_motion_vectors;
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D out_normal_roughness;
+layout(set = 0, binding = 5, r32f) writeonly uniform image2D out_view_z;
+layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D out_diff_radiance_hitdist;
+layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D out_spec_radiance_hitdist;
+
+layout(set = 0, binding = 8, std140) uniform TaaParams {
+    uint enabled;
+    uint frame_count;
+    uint width;
+    uint height;
+    float feedback;
+    float velocity_scale;
+    uint reset_history;
+    float sharpen_strength;
+    uint history_valid;
+    uint camera_moving;
+    uint render_width;
+    uint render_height;
+    float motion_feedback;
+    float reactive_feedback;
+} params;
+
+layout(set = 0, binding = 9, std140) uniform Camera {
+    vec4 pos;
+    vec4 forward;
+    vec4 right;
+    vec4 up;
+    uint frame_count;
+    uint temporal_frame_index;
+    float effective_jitter_scale;
+    uint camera_moving;
+    float sun_intensity;
+    float sky_intensity;
+    float exposure;
+    uint path_tracing_enabled;
+    uint max_bounces;
+    uint sunlight_enabled;
+    uint direct_lighting_enabled;
+    float fov_y;
+    float sun_angular_radius;
+    float indirect_strength;
+    uint environment_direct_samples;
+    uint padding0;
+    vec4 jitter;
+    vec4 atmosphere;
+    vec4 render_controls;
+    vec4 sun_direction_illuminance;
+    vec4 sun_color_angular_radius;
+    uvec4 restir_gi_controls;
+    uvec4 path_trace_controls;
+    vec4 dof_controls;
+    vec4 motion_blur_controls;
+    vec4 volume_controls;
+} camera;
+
+vec2 unpack_snorm2x16(uint packedValue) {
+    vec2 unorm = vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
+    return unorm * 2.0 - vec2(1.0);
+}
+
+vec3 decode_octahedral_normal(uint packedValue) {
+    vec2 f = unpack_snorm2x16(packedValue);
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+float nrd_luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 nrd_linear_to_ycocg(vec3 color) {
+    return vec3(
+        dot(color, vec3(0.25, 0.5, 0.25)),
+        dot(color, vec3(0.5, 0.0, -0.5)),
+        dot(color, vec3(-0.25, 0.5, -0.25)));
+}
+
+float nrd_spec_magic_curve(float roughness) {
+    float f = 1.0 - exp2(-200.0 * roughness * roughness);
+    f *= pow(clamp(roughness, 0.0, 1.0), 0.5);
+    return clamp(f, 0.0, 1.0);
+}
+
+float reblur_norm_hit_distance(float hitDistance, float viewZ, float roughness) {
+    float smc = nrd_spec_magic_curve(roughness);
+    float scale = (3.0 + abs(viewZ) * 0.1) * mix(20.0, 1.0, smc);
+    return max(clamp(max(hitDistance, 0.0) / max(scale, 1.0e-4), 0.0, 1.0), 1.0e-6);
+}
+
+float path_distance_to_view_depth(ivec2 coords, ivec2 dims, float pathDistance) {
+    vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
+    vec2 uv = (vec2(coords) + jitter) / vec2(max(dims, ivec2(1)));
+    vec2 ndc = uv * 2.0 - vec2(1.0);
+    float aspect = float(dims.x) / max(float(dims.y), 1.0);
+    float scale = tan(camera.fov_y * 0.5);
+    vec3 rayDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
+    float forwardCos = max(dot(rayDir, normalize(camera.forward.xyz)), 1.0e-4);
+    return clamp(pathDistance * forwardCos, 0.0, 65504.0);
+}
+
+vec4 pack_reblur_radiance_hitdist(vec3 radiance, float normHitDistance) {
+    radiance = clamp(max(radiance, vec3(0.0)), vec3(0.0), vec3(65504.0));
+    return vec4(nrd_linear_to_ycocg(radiance), clamp(normHitDistance, 0.0, 1.0));
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(int(params.render_width), int(params.render_height));
+    if (dims.x <= 0 || dims.y <= 0 || coords.x >= dims.x || coords.y >= dims.y) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * uint(dims.x) + uint(coords.x);
+    uvec4 packedDepthNormal = depth_normal_buffer[pixelIndex];
+    float pathDistance = uintBitsToFloat(packedDepthNormal.x);
+    bool surface = pathDistance < 1.0e9;
+    float viewZ = surface ? path_distance_to_view_depth(coords, dims, pathDistance) : 65504.0;
+    if (!surface) {
+        viewZ = 65504.0;
+    }
+
+    vec3 normal = surface ? decode_octahedral_normal(packedDepthNormal.y) : vec3(0.0, 0.0, 1.0);
+    PathDataRecord path = path_data_buffer[pixelIndex];
+    float roughness = clamp(path.albedo_roughness_hit_confidence.w, 0.001, 1.0);
+
+    vec2 currentToPreviousPixels = temporal_unpack_velocity_pixels(velocity_buffer[pixelIndex], params.velocity_scale);
+    vec2 previousMinusCurrentPixels = temporal_velocity_pixels_are_invalid(currentToPreviousPixels, params.velocity_scale)
+        ? vec2(0.0)
+        : -currentToPreviousPixels;
+
+    vec3 diffRadiance = max(path.direct_diffuse.rgb + path.indirect_diffuse.rgb, vec3(0.0));
+    vec3 specRadiance = max(path.direct_specular.rgb + path.indirect_specular.rgb, vec3(0.0));
+    float primaryHitDistance = path.direct_specular.a;
+    float diffHitDistance = path.denoiser_hit_distance.x;
+    float specHitDistance = path.denoiser_hit_distance.y;
+    diffHitDistance = diffHitDistance > 0.001 && diffHitDistance < 65000.0 ? diffHitDistance : primaryHitDistance;
+    specHitDistance = specHitDistance > 0.001 && specHitDistance < 65000.0 ? specHitDistance : primaryHitDistance;
+    if (!surface) {
+        diffRadiance = vec3(0.0);
+        specRadiance = vec3(0.0);
+        diffHitDistance = 0.0;
+        specHitDistance = 0.0;
+    }
+
+    imageStore(out_motion_vectors, coords, vec4(previousMinusCurrentPixels, 0.0, 0.0));
+    imageStore(out_normal_roughness, coords, vec4(normal, roughness));
+    imageStore(out_view_z, coords, vec4(viewZ, 0.0, 0.0, 0.0));
+    imageStore(out_diff_radiance_hitdist, coords, pack_reblur_radiance_hitdist(diffRadiance, reblur_norm_hit_distance(diffHitDistance, viewZ, 1.0)));
+    imageStore(out_spec_radiance_hitdist, coords, pack_reblur_radiance_hitdist(specRadiance, reblur_norm_hit_distance(specHitDistance, viewZ, roughness)));
+}

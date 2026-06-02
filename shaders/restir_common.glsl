@@ -8,6 +8,10 @@
 struct RestirReservoir {
     uvec4 metadata;
     vec4 sample_value_confidence;
+    vec4 sample_position_distance;
+    vec4 sample_radiance_target;
+    vec4 sample_normal_weight;
+    uvec4 sample_metadata;
 };
 
 struct RestirGiReservoir {
@@ -181,6 +185,10 @@ RestirReservoir empty_restir_reservoir() {
     RestirReservoir reservoir;
     reservoir.metadata = uvec4(0u);
     reservoir.sample_value_confidence = vec4(0.0);
+    reservoir.sample_position_distance = vec4(0.0);
+    reservoir.sample_radiance_target = vec4(0.0);
+    reservoir.sample_normal_weight = vec4(0.0);
+    reservoir.sample_metadata = uvec4(0u);
     restir_set_source_pdf_and_previous_weight(reservoir, 1.0e-6, 0.0);
     return reservoir;
 }
@@ -206,7 +214,8 @@ RestirGiReservoir empty_restir_gi_reservoir() {
 bool restir_reservoir_valid(RestirReservoir reservoir) {
     return restir_validity_bit(restir_validity_visibility_bits(reservoir)) &&
         restir_sample_count_u(reservoir) > 0u &&
-        reservoir.sample_value_confidence.a > 0.0;
+        reservoir.sample_value_confidence.a > 0.0 &&
+        reservoir.sample_radiance_target.w > 0.0;
 }
 
 bool restir_gi_reservoir_valid(RestirGiReservoir reservoir) {
@@ -288,7 +297,11 @@ float restir_luminance(vec3 value) {
 }
 
 float restir_target_function(RestirReservoir reservoir) {
-    return max(restir_luminance(reservoir.sample_value_confidence.rgb), 0.0);
+    return max(reservoir.sample_radiance_target.w, max(restir_luminance(reservoir.sample_value_confidence.rgb), 0.0));
+}
+
+float restir_weight_sum(RestirReservoir reservoir) {
+    return max(reservoir.sample_normal_weight.w, 0.0);
 }
 
 float restir_source_pdf(RestirReservoir reservoir) {
@@ -358,34 +371,21 @@ float restir_pairwise_previous_weight(RestirReservoir current, RestirReservoir p
 
 RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirReservoir previous, float motionConfidence, float maxAge) {
     float previousWeight = restir_pairwise_previous_weight(current, previous, motionConfidence, maxAge);
-    float currentWeight = 1.0 - previousWeight;
-    uint currentVisibility = restir_visibility_state(current);
-    uint previousVisibility = restir_visibility_state(previous);
-    uint mergedVisibility = previousWeight > 0.0
-        ? (currentVisibility == RESTIR_VISIBILITY_VISIBLE && previousVisibility == RESTIR_VISIBILITY_VISIBLE
-            ? RESTIR_VISIBILITY_VISIBLE
-            : RESTIR_VISIBILITY_UNKNOWN)
-        : currentVisibility;
-
-    restir_set_age(current, previousWeight > 0.0 ? min(restir_age(previous) + 1u, 255u) : 0u);
-    restir_set_validity_visibility(current, restir_pack_validity_visibility(
-        restir_reservoir_valid(current),
-        mergedVisibility));
-    current.sample_value_confidence.rgb =
-        current.sample_value_confidence.rgb * currentWeight +
-        previous.sample_value_confidence.rgb * previousWeight;
-    current.sample_value_confidence.a = clamp(
-        (current.sample_value_confidence.a * currentWeight + previous.sample_value_confidence.a * previousWeight) *
-            clamp(motionConfidence, 0.0, 1.0),
-        0.0,
-        1.0);
-    float sourcePdf = restir_source_pdf(current) * currentWeight +
-        restir_source_pdf(previous) * previousWeight;
-    restir_set_source_pdf_and_previous_weight(current, sourcePdf, previousWeight);
-    restir_set_sample_count(current, min(
+    RestirReservoir selected = previousWeight > 0.5 ? previous : current;
+    bool selectedPrevious = previousWeight > 0.5;
+    uint selectedVisibility = restir_visibility_state(selected);
+    restir_set_age(selected, selectedPrevious ? min(restir_age(previous) + 1u, 255u) : 0u);
+    restir_set_validity_visibility(selected, restir_pack_validity_visibility(restir_reservoir_valid(selected), selectedVisibility));
+    selected.sample_value_confidence.a = clamp(selected.sample_value_confidence.a * clamp(motionConfidence, 0.0, 1.0), 0.0, 1.0);
+    selected.sample_normal_weight.w = min(
+        max(restir_weight_sum(current), restir_target_function(current)) +
+            max(restir_weight_sum(previous), restir_target_function(previous)) * previousWeight,
+        65504.0);
+    restir_set_source_pdf_and_previous_weight(selected, restir_source_pdf(selected), previousWeight);
+    restir_set_sample_count(selected, min(
         restir_sample_count(current) + restir_sample_count(previous) * previousWeight,
         64.0));
-    return current;
+    return selected;
 }
 
 #endif

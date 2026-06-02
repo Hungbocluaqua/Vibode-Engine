@@ -55,6 +55,10 @@ struct PathDataRecord {
     vec4 indirect_diffuse;
     vec4 indirect_specular;
     vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
 };
 layout(set = 0, binding = 42, std430) buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 layout(set = 0, binding = 37, std140) uniform PrevCamera {
@@ -68,6 +72,10 @@ layout(set = 0, binding = 37, std140) uniform PrevCamera {
 struct RestirReservoir {
     uvec4 metadata; // x = sample type, y = packed source pdf/previous weight, z = age/validity/M, w = temporal compatibility signature
     vec4 sample_value_confidence; // rgb = selected/direct contribution, a = confidence
+    vec4 sample_position_distance; // xyz = selected world-space light point or direction, w = current distance/tmax
+    vec4 sample_radiance_target; // rgb = emitted radiance/intensity for the selected sample, w = re-evaluated target luminance
+    vec4 sample_normal_weight; // xyz = selected light normal for finite area lights, w = reservoir weight sum
+    uvec4 sample_metadata; // x = light index, y = light kind, z = receiver material id, w = receiver instance id
 };
 layout(set = 0, binding = 38, std430) buffer RestirReservoirBuffer { RestirReservoir restir_reservoirs[]; };
 layout(set = 0, binding = 39, std430) readonly buffer PreviousRestirReservoirBuffer { RestirReservoir previous_restir_reservoirs[]; };
@@ -291,6 +299,9 @@ const uint MATERIAL_CLOSURE_FLAG_CLEARCOAT     = 1u << 4u;
 const uint MATERIAL_CLOSURE_FLAG_SHEEN         = 1u << 5u;
 const uint MATERIAL_CLOSURE_FLAG_THIN_FILM     = 1u << 6u;
 const uint MATERIAL_CLOSURE_FLAG_METAL         = 1u << 7u;
+const float SCREEN_VELOCITY_PACK_SCALE = 512.0;
+const float SCREEN_VELOCITY_SATURATION_THRESHOLD = SCREEN_VELOCITY_PACK_SCALE - 0.5;
+const float SCREEN_VELOCITY_DEBUG_SCALE = 128.0;
 
 struct MaterialClosure {
     uint flags;
@@ -510,7 +521,8 @@ uint restir_visibility_state(RestirReservoir reservoir) {
 bool restir_reservoir_valid(RestirReservoir reservoir) {
     return restir_validity_bit(restir_validity_visibility_bits(reservoir)) &&
         restir_sample_count_u(reservoir) > 0u &&
-        reservoir.sample_value_confidence.a > 0.0;
+        reservoir.sample_value_confidence.a > 0.0 &&
+        reservoir.sample_radiance_target.w > 0.0;
 }
 
 bool restir_gi_reservoir_valid(RestirGiReservoir reservoir) {
@@ -648,7 +660,11 @@ float restir_gi_age_normalized(RestirGiReservoir reservoir, float maxAge) {
 }
 
 float restir_target_function(RestirReservoir reservoir) {
-    return max(restir_luminance(reservoir.sample_value_confidence.rgb), 0.0);
+    return max(reservoir.sample_radiance_target.w, max(restir_luminance(reservoir.sample_value_confidence.rgb), 0.0));
+}
+
+float restir_weight_sum(RestirReservoir reservoir) {
+    return max(reservoir.sample_normal_weight.w, 0.0);
 }
 
 float restir_source_pdf(RestirReservoir reservoir) {
@@ -659,9 +675,11 @@ float restir_sample_count(RestirReservoir reservoir) {
     return float(restir_sample_count_u(reservoir));
 }
 
-uint restir_temporal_signature(uint sampleType, float roughness) {
+uint restir_temporal_signature(uint sampleType, float roughness, uint materialId, uint instanceId) {
     uint roughnessBucket = uint(clamp(floor(clamp(roughness, 0.0, 1.0) * 15.0 + 0.5), 0.0, 15.0));
-    return (sampleType & 0xffu) | (roughnessBucket << 8u);
+    uint surfaceHash = materialId * 747796405u ^ instanceId * 2891336453u;
+    surfaceHash ^= surfaceHash >> 16u;
+    return (sampleType & 0xffu) | (roughnessBucket << 8u) | ((surfaceHash & 0xfffffu) << 12u);
 }
 
 float restir_age_confidence(RestirReservoir reservoir, float maxAge) {
@@ -722,34 +740,21 @@ float restir_pairwise_previous_weight(RestirReservoir current, RestirReservoir p
 
 RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirReservoir previous, float motionConfidence, float maxAge) {
     float previousWeight = restir_pairwise_previous_weight(current, previous, motionConfidence, maxAge);
-    float currentWeight = 1.0 - previousWeight;
-    uint currentVisibility = restir_visibility_state(current);
-    uint previousVisibility = restir_visibility_state(previous);
-    uint mergedVisibility = previousWeight > 0.0
-        ? (currentVisibility == RESTIR_VISIBILITY_VISIBLE && previousVisibility == RESTIR_VISIBILITY_VISIBLE
-            ? RESTIR_VISIBILITY_VISIBLE
-            : RESTIR_VISIBILITY_UNKNOWN)
-        : currentVisibility;
-
-    restir_set_age(current, previousWeight > 0.0 ? min(restir_age(previous) + 1u, 255u) : 0u);
-    restir_set_validity_visibility(current, restir_pack_validity_visibility(
-        restir_reservoir_valid(current),
-        mergedVisibility));
-    current.sample_value_confidence.rgb =
-        current.sample_value_confidence.rgb * currentWeight +
-        previous.sample_value_confidence.rgb * previousWeight;
-    current.sample_value_confidence.a = clamp(
-        (current.sample_value_confidence.a * currentWeight + previous.sample_value_confidence.a * previousWeight) *
-            clamp(motionConfidence, 0.0, 1.0),
-        0.0,
-        1.0);
-    float sourcePdf = restir_source_pdf(current) * currentWeight +
-        restir_source_pdf(previous) * previousWeight;
-    restir_set_source_pdf_and_previous_weight(current, sourcePdf, previousWeight);
-    restir_set_sample_count(current, min(
+    RestirReservoir selected = previousWeight > 0.5 ? previous : current;
+    bool selectedPrevious = previousWeight > 0.5;
+    uint selectedVisibility = restir_visibility_state(selected);
+    restir_set_age(selected, selectedPrevious ? min(restir_age(previous) + 1u, 255u) : 0u);
+    restir_set_validity_visibility(selected, restir_pack_validity_visibility(restir_reservoir_valid(selected), selectedVisibility));
+    selected.sample_value_confidence.a = clamp(selected.sample_value_confidence.a * clamp(motionConfidence, 0.0, 1.0), 0.0, 1.0);
+    selected.sample_normal_weight.w = min(
+        max(restir_weight_sum(current), restir_target_function(current)) +
+            max(restir_weight_sum(previous), restir_target_function(previous)) * previousWeight,
+        65504.0);
+    restir_set_source_pdf_and_previous_weight(selected, restir_source_pdf(selected), previousWeight);
+    restir_set_sample_count(selected, min(
         restir_sample_count(current) + restir_sample_count(previous) * previousWeight,
         64.0));
-    return current;
+    return selected;
 }
 
 uvec2 pack_world_position(vec3 world_pos) {
@@ -757,25 +762,37 @@ uvec2 pack_world_position(vec3 world_pos) {
     return uvec2(pack_snorm2x16(relative.xy), pack_snorm2x16(vec2(relative.z, 0.0)));
 }
 
-vec2 project_unjittered_to_pixels(mat4 viewProj, vec2 jitterPixels, vec3 worldPos, ivec2 dims) {
+bool project_unjittered_to_pixels_checked(mat4 viewProj, vec2 jitterPixels, vec3 worldPos, ivec2 dims, out vec2 pixels) {
     vec4 clip = viewProj * vec4(worldPos, 1.0);
     if (clip.w <= 0.0) {
-        return vec2(-1.0);
+        pixels = vec2(0.0);
+        return false;
     }
     vec2 invDims = 1.0 / vec2(max(dims, ivec2(1)));
     clip.xy -= jitterPixels * 2.0 * invDims * clip.w;
     vec3 ndc = clip.xyz / clip.w;
     if (ndc.z < 0.0 || ndc.z > 1.0001) {
-        return vec2(-1.0);
+        pixels = vec2(0.0);
+        return false;
     }
-    return vec2(
+    pixels = vec2(
         (ndc.x * 0.5 + 0.5) * float(dims.x) - 0.5,
         (ndc.y * 0.5 + 0.5) * float(dims.y) - 0.5);
+    return true;
+}
+
+vec2 project_unjittered_to_pixels(mat4 viewProj, vec2 jitterPixels, vec3 worldPos, ivec2 dims) {
+    vec2 pixels;
+    return project_unjittered_to_pixels_checked(viewProj, jitterPixels, worldPos, dims, pixels) ? pixels : vec2(-1.0);
 }
 
 uint pack_velocity_pixels(vec2 velocityPixels) {
-    ivec2 encoded = ivec2(round(clamp(velocityPixels / 64.0, vec2(-1.0), vec2(1.0)) * 32767.0));
+    ivec2 encoded = ivec2(round(clamp(velocityPixels / SCREEN_VELOCITY_PACK_SCALE, vec2(-1.0), vec2(1.0)) * 32767.0));
     return (uint(encoded.x) & 0xffffu) | ((uint(encoded.y) & 0xffffu) << 16u);
+}
+
+uint pack_invalid_velocity_pixels() {
+    return pack_velocity_pixels(vec2(SCREEN_VELOCITY_PACK_SCALE));
 }
 
 uint compute_surface_velocity(vec3 currentWorldPos, vec3 localPos, uint instanceId, ivec2 dims) {
@@ -785,25 +802,21 @@ uint compute_surface_velocity(vec3 currentWorldPos, vec3 localPos, uint instance
         previousWorldPos = (instance.prev_transform * vec4(localPos, 1.0)).xyz;
     }
 
-    vec2 currentPos = project_unjittered_to_pixels(prev_camera.view_proj, prev_camera.jitter.xy, currentWorldPos, dims);
-    vec2 previousPos = project_unjittered_to_pixels(prev_camera.prev_view_proj, prev_camera.jitter.zw, previousWorldPos, dims);
-    bool valid = currentPos.x >= -0.5 && currentPos.y >= -0.5 &&
-        currentPos.x <= float(dims.x) - 0.5 && currentPos.y <= float(dims.y) - 0.5 &&
-        previousPos.x >= -0.5 && previousPos.y >= -0.5 &&
-        previousPos.x <= float(dims.x) - 0.5 && previousPos.y <= float(dims.y) - 0.5;
-    return valid ? pack_velocity_pixels(currentPos - previousPos) : 0u;
+    vec2 currentPos;
+    vec2 previousPos;
+    bool valid = project_unjittered_to_pixels_checked(prev_camera.view_proj, prev_camera.jitter.xy, currentWorldPos, dims, currentPos) &&
+        project_unjittered_to_pixels_checked(prev_camera.prev_view_proj, prev_camera.jitter.zw, previousWorldPos, dims, previousPos);
+    return valid ? pack_velocity_pixels(currentPos - previousPos) : pack_invalid_velocity_pixels();
 }
 
 uint compute_sky_velocity(vec3 rayDir, ivec2 dims) {
     vec3 currentWorldPos = prev_camera.current_pos.xyz + normalize(rayDir) * 512.0;
     vec3 previousWorldPos = prev_camera.prev_pos.xyz + normalize(rayDir) * 512.0;
-    vec2 currentPos = project_unjittered_to_pixels(prev_camera.view_proj, prev_camera.jitter.xy, currentWorldPos, dims);
-    vec2 previousPos = project_unjittered_to_pixels(prev_camera.prev_view_proj, prev_camera.jitter.zw, previousWorldPos, dims);
-    bool valid = currentPos.x >= -0.5 && currentPos.y >= -0.5 &&
-        currentPos.x <= float(dims.x) - 0.5 && currentPos.y <= float(dims.y) - 0.5 &&
-        previousPos.x >= -0.5 && previousPos.y >= -0.5 &&
-        previousPos.x <= float(dims.x) - 0.5 && previousPos.y <= float(dims.y) - 0.5;
-    return valid ? pack_velocity_pixels(currentPos - previousPos) : 0u;
+    vec2 currentPos;
+    vec2 previousPos;
+    bool valid = project_unjittered_to_pixels_checked(prev_camera.view_proj, prev_camera.jitter.xy, currentWorldPos, dims, currentPos) &&
+        project_unjittered_to_pixels_checked(prev_camera.prev_view_proj, prev_camera.jitter.zw, previousWorldPos, dims, previousPos);
+    return valid ? pack_velocity_pixels(currentPos - previousPos) : pack_invalid_velocity_pixels();
 }
 
 uint pcg_hash(uint inputValue) {
@@ -1583,6 +1596,19 @@ vec3 conductor_fresnel(Material material, float v_dot_h) {
     vec3 t4 = t2 * sin2;
     vec3 rp = rs * (t3 - t4) / max(t3 + t4, vec3(1.0e-6));
     return clamp((rp + rs) * 0.5, vec3(0.0), vec3(1.0));
+}
+
+vec3 pbr_diffuse_reflectance(Material material) {
+    return clamp(material.color * (1.0 - clamp(material.metallic, 0.0, 1.0)), vec3(0.0), vec3(1.0));
+}
+
+vec3 pbr_specular_reflectance(Material material, float n_dot_v) {
+    float cosTheta = clamp(n_dot_v, 0.0, 1.0);
+    if (material.use_conductor_optics != 0u) {
+        return conductor_fresnel(material, cosTheta);
+    }
+    vec3 f0 = pbr_f0(material);
+    return clamp(f0 + (vec3(1.0) - f0) * schlick_fresnel_pow5(1.0 - cosTheta), vec3(0.0), vec3(1.0));
 }
 
 vec3 pbr_average_fresnel(vec3 f0) {

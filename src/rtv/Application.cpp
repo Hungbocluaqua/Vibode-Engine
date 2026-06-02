@@ -273,6 +273,7 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.restirMode = settings.restirMode;
     render.restirGiEnabled = settings.restirGiEnabled;
     render.denoiserEnabled = settings.denoiserEnabled;
+    render.denoiserBackend = settings.denoiserBackend;
     render.denoiseWhileMoving = settings.denoiseWhileMoving;
     render.samplesPerPixel = settings.samplesPerPixel;
     render.limitSamplesPerPixel = settings.limitSamplesPerPixel;
@@ -281,6 +282,10 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.denoiserMaxHistoryLength = settings.denoiserMaxHistoryLength;
     render.momentValidityThreshold = settings.momentValidityThreshold;
     render.taaEnabled = settings.taaEnabled;
+    render.temporalUpscaler = settings.temporalUpscaler;
+    render.dlssFrameGenerationEnabled = settings.dlssFrameGenerationEnabled;
+    render.dlssRayReconstructionEnabled = settings.dlssRayReconstructionEnabled;
+    render.dlssSharpeningStrength = settings.dlssSharpeningStrength;
     render.taaFeedback = settings.taaFeedback;
     render.taaMotionFeedback = settings.taaMotionFeedback;
     render.taaReactiveFeedback = settings.taaReactiveFeedback;
@@ -358,6 +363,7 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.restirMode = render.restirMode;
     settings.restirGiEnabled = render.restirGiEnabled;
     settings.denoiserEnabled = render.denoiserEnabled;
+    settings.denoiserBackend = render.denoiserBackend;
     settings.denoiseWhileMoving = render.denoiseWhileMoving;
     settings.samplesPerPixel = render.samplesPerPixel;
     settings.limitSamplesPerPixel = render.limitSamplesPerPixel;
@@ -366,6 +372,10 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.denoiserMaxHistoryLength = render.denoiserMaxHistoryLength;
     settings.momentValidityThreshold = render.momentValidityThreshold;
     settings.taaEnabled = render.taaEnabled;
+    settings.temporalUpscaler = render.temporalUpscaler;
+    settings.dlssFrameGenerationEnabled = render.dlssFrameGenerationEnabled;
+    settings.dlssRayReconstructionEnabled = render.dlssRayReconstructionEnabled;
+    settings.dlssSharpeningStrength = render.dlssSharpeningStrength;
     settings.taaFeedback = render.taaFeedback;
     settings.taaMotionFeedback = render.taaMotionFeedback;
     settings.taaReactiveFeedback = render.taaReactiveFeedback;

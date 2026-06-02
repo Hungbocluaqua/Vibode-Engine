@@ -52,7 +52,7 @@ struct alignas(16) CameraUniform {
     glm::uvec4 restirGiControls{24u, 0u, 0u, 1u}; // x = temporal max age, y = half-resolution reuse, z = visibility ray budget, w = specular AA enabled
     glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, z = RT counters, w = caustic visibility
     glm::vec4 dofControls{0.0f, 10.0f, 0.0f, 0.0f}; // x = aperture radius, y = focus distance, z = blade count, w = bokeh rotation
-    glm::vec4 motionBlurControls{0.0f, 0.0f, 1.0f, 0.0f}; // x = enabled, y = shutter open, z = shutter close, w = reserved
+    glm::vec4 motionBlurControls{0.0f, 0.0f, 1.0f, 0.0f}; // x = enabled, y = shutter open, z = shutter close, w = external denoiser raw input
     glm::vec4 volumeControls{0.0f, 0.0f, 0.0f, 0.0f}; // x = enabled, y = sigma_s, z = sigma_a, w = anisotropy
 };
 

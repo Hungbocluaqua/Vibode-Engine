@@ -497,10 +497,33 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryPressureQualityReport
     j["denoiser_max_history_length"] = m.denoiserMaxHistoryLength;
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n) {
+    j["nrd_sdk_configured"] = n.nrdSdkConfigured;
+    j["nrd_available"] = n.nrdAvailable;
+    j["nrd_unavailable_reason"] = n.nrdUnavailableReason;
+    j["requested_denoiser_backend"] = n.requestedDenoiserBackend;
+    j["effective_denoiser_backend"] = n.effectiveDenoiserBackend;
+    j["dlss_sdk_configured"] = n.dlssSdkConfigured;
+    j["dlss_available"] = n.dlssAvailable;
+    j["dlss_unavailable_reason"] = n.dlssUnavailableReason;
+    j["dlss_ray_reconstruction_available"] = n.dlssRayReconstructionAvailable;
+    j["dlss_ray_reconstruction_unavailable_reason"] = n.dlssRayReconstructionUnavailableReason;
+    j["requested_dlss_ray_reconstruction"] = n.requestedDlssRayReconstruction;
+    j["effective_dlss_ray_reconstruction"] = n.effectiveDlssRayReconstruction;
+    j["dlss_frame_generation_available"] = n.dlssFrameGenerationAvailable;
+    j["dlss_frame_generation_unavailable_reason"] = n.dlssFrameGenerationUnavailableReason;
+    j["requested_dlss_frame_generation"] = n.requestedDlssFrameGeneration;
+    j["effective_dlss_frame_generation"] = n.effectiveDlssFrameGeneration;
+    j["dlss_sharpening_strength"] = n.dlssSharpeningStrength;
+    j["requested_temporal_upscaler"] = n.requestedTemporalUpscaler;
+    j["effective_temporal_upscaler"] = n.effectiveTemporalUpscaler;
+}
+
 void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["render_preset"] = renderPresetName(s.renderPreset);
     j["path_tracing_enabled"] = s.pathTracingEnabled;
     j["denoiser_enabled"] = s.denoiserEnabled;
+    j["denoiser_backend"] = denoiserBackendName(s.denoiserBackend);
     j["max_bounces"] = s.maxBounces;
     j["atrous_iterations"] = s.atrousIterations;
     j["restir_mode"] = restirModeName(s.restirMode);
@@ -538,6 +561,10 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["limit_samples_per_pixel"] = s.limitSamplesPerPixel;
     j["effective_samples_per_pixel"] = s.limitSamplesPerPixel ? 1u : s.samplesPerPixel;
     j["taa_enabled"] = s.taaEnabled;
+    j["temporal_upscaler"] = temporalUpscalerName(s.temporalUpscaler);
+    j["dlss_frame_generation_enabled"] = s.dlssFrameGenerationEnabled;
+    j["dlss_ray_reconstruction_enabled"] = s.dlssRayReconstructionEnabled;
+    j["dlss_sharpening_strength"] = s.dlssSharpeningStrength;
     j["taa_feedback"] = s.taaFeedback;
     j["taa_motion_feedback"] = s.taaMotionFeedback;
     j["taa_reactive_feedback"] = s.taaReactiveFeedback;
@@ -1467,6 +1494,39 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.validationErrorCount = 0;
 
     profileReport_.settings = renderer->settings();
+    const auto nvidiaStatus = renderer->nvidiaIntegrationStatus();
+    profileReport_.nvidiaIntegrations.nrdSdkConfigured = nvidiaStatus.nrdSdkConfigured;
+    profileReport_.nvidiaIntegrations.nrdAvailable = nvidiaStatus.nrdAvailable;
+    profileReport_.nvidiaIntegrations.nrdUnavailableReason = nvidiaStatus.nrdUnavailableReason;
+    profileReport_.nvidiaIntegrations.requestedDenoiserBackend = denoiserBackendName(profileReport_.settings.denoiserBackend);
+    profileReport_.nvidiaIntegrations.effectiveDenoiserBackend = denoiserBackendName(renderer->effectiveDenoiserBackend());
+    profileReport_.nvidiaIntegrations.dlssSdkConfigured = nvidiaStatus.dlssSdkConfigured;
+    profileReport_.nvidiaIntegrations.dlssAvailable = nvidiaStatus.dlssAvailable;
+    profileReport_.nvidiaIntegrations.dlssUnavailableReason = nvidiaStatus.dlssUnavailableReason;
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionAvailable = nvidiaStatus.dlssRayReconstructionAvailable;
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionUnavailableReason = nvidiaStatus.dlssRayReconstructionUnavailableReason;
+    profileReport_.nvidiaIntegrations.requestedDlssRayReconstruction = profileReport_.settings.dlssRayReconstructionEnabled;
+    profileReport_.nvidiaIntegrations.effectiveDlssRayReconstruction = renderer->dlssRayReconstructionActive();
+    profileReport_.nvidiaIntegrations.dlssFrameGenerationAvailable = nvidiaStatus.dlssFrameGenerationAvailable;
+    profileReport_.nvidiaIntegrations.dlssFrameGenerationUnavailableReason = nvidiaStatus.dlssFrameGenerationUnavailableReason;
+    profileReport_.nvidiaIntegrations.requestedDlssFrameGeneration = profileReport_.settings.dlssFrameGenerationEnabled;
+    profileReport_.nvidiaIntegrations.effectiveDlssFrameGeneration =
+        profileReport_.settings.dlssFrameGenerationEnabled && nvidiaStatus.dlssFrameGenerationAvailable;
+    profileReport_.nvidiaIntegrations.dlssSharpeningStrength = profileReport_.settings.dlssSharpeningStrength;
+    profileReport_.nvidiaIntegrations.requestedTemporalUpscaler = temporalUpscalerName(profileReport_.settings.temporalUpscaler);
+    profileReport_.nvidiaIntegrations.effectiveTemporalUpscaler = temporalUpscalerName(renderer->effectiveTemporalUpscaler());
+    if (profileReport_.settings.denoiserBackend == DenoiserBackend::Nrd && !nvidiaStatus.nrdAvailable) {
+        profileReport_.warnings.push_back("NRD denoiser requested but unavailable: " + nvidiaStatus.nrdUnavailableReason);
+    }
+    if (profileReport_.settings.temporalUpscaler == TemporalUpscaler::Dlss && !nvidiaStatus.dlssAvailable) {
+        profileReport_.warnings.push_back("DLSS requested but unavailable: " + nvidiaStatus.dlssUnavailableReason);
+    }
+    if (profileReport_.settings.dlssRayReconstructionEnabled && !nvidiaStatus.dlssRayReconstructionAvailable) {
+        profileReport_.warnings.push_back("DLSS Ray Reconstruction requested but unavailable: " + nvidiaStatus.dlssRayReconstructionUnavailableReason);
+    }
+    if (profileReport_.settings.dlssFrameGenerationEnabled && !nvidiaStatus.dlssFrameGenerationAvailable) {
+        profileReport_.warnings.push_back("DLSS Frame Generation requested but unavailable: " + nvidiaStatus.dlssFrameGenerationUnavailableReason);
+    }
 
     return profileReport_;
 }
@@ -1520,6 +1580,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["memory"] = profileReport_.memory;
     j["adaptive_quality"] = profileReport_.adaptiveQuality;
     j["memory_pressure_quality"] = profileReport_.memoryPressureQuality;
+    j["nvidia_integrations"] = profileReport_.nvidiaIntegrations;
     j["validation_error_count"] = profileReport_.validationErrorCount;
     j["warnings"] = profileReport_.warnings;
     j["settings"] = profileReport_.settings;

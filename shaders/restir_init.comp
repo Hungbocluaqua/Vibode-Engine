@@ -36,14 +36,24 @@ void main() {
 
     uint sampleType = sample_type_buffer[pixelIndex];
     float lightPdf = light_pdf_buffer[pixelIndex];
-    bool valid = sampleType != 0u && lightPdf > 1.0e-6;
+    bool hasCandidate = sampleType != 0u && lightPdf > 1.0e-6;
 
     RestirReservoir current = empty_restir_reservoir();
-    if (valid) {
-        current.metadata = uvec4(sampleType, 0u, 1u, 0u);
-        current.sample_value_confidence = vec4(max(direct_light_buffer[pixelIndex].rgb, vec3(0.0)), 1.0);
-        current.target_pdf_weight_sum_m = vec4(lightPdf,
-            dot(current.sample_value_confidence.rgb, vec3(0.2126, 0.7152, 0.0722)), 1.0, 0.0);
+    if (hasCandidate) {
+        vec3 sampleValue = max(direct_light_buffer[pixelIndex].rgb, vec3(0.0));
+        float targetLum = restir_luminance(sampleValue);
+        bool valid = targetLum > 1.0e-6;
+        current.metadata = uvec4(
+            valid ? sampleType : 0u,
+            0u,
+            restir_pack_state(0u, restir_pack_validity_visibility(valid, RESTIR_VISIBILITY_VISIBLE), valid ? 1u : 0u),
+            0u);
+        restir_set_source_pdf_and_previous_weight(current, valid ? lightPdf : 1.0e-6, 0.0);
+        current.sample_value_confidence = vec4(sampleValue, valid ? 1.0 : 0.0);
+        current.sample_position_distance = vec4(0.0);
+        current.sample_radiance_target = vec4(sampleValue, valid ? targetLum : 0.0);
+        current.sample_normal_weight = vec4(0.0, 1.0, 0.0, valid ? targetLum / max(lightPdf, 1.0e-6) : 0.0);
+        current.sample_metadata = uvec4(0u);
     }
     output_reservoirs[pixelIndex] = current;
 }

@@ -20,6 +20,10 @@ struct PathDataRecord {
     vec4 indirect_diffuse;
     vec4 indirect_specular;
     vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
 };
 
 layout(set = 0, binding = 0, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
@@ -201,7 +205,7 @@ void main() {
     bool reset = moment_params.reset_history != 0u;
     bool sky = !is_surface_depth(center_depth);
 
-    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], 64.0);
+    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], TEMPORAL_VELOCITY_PACK_SCALE);
     vec2 velocity_history_pos = temporal_reproject_pixel(coords, velocity_pixels);
     bool velocity_on_screen = temporal_history_pixel_valid(velocity_history_pos, dims, 0.0);
 

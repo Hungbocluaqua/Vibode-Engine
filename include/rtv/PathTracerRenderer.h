@@ -139,6 +139,23 @@ public:
     [[nodiscard]] const OpacityMicromapDeviceInfo& opacityMicromapInfo() const;
     [[nodiscard]] const SerDeviceInfo& serInfo() const;
     [[nodiscard]] const RayTracingMotionBlurDeviceInfo& rayTracingMotionBlurInfo() const;
+    struct NvidiaIntegrationStatus {
+        bool nrdSdkConfigured = false;
+        bool nrdAvailable = false;
+        std::string nrdUnavailableReason;
+        bool dlssSdkConfigured = false;
+        bool dlssAvailable = false;
+        std::string dlssUnavailableReason;
+        bool dlssRayReconstructionAvailable = false;
+        std::string dlssRayReconstructionUnavailableReason;
+        bool dlssFrameGenerationAvailable = false;
+        std::string dlssFrameGenerationUnavailableReason;
+    };
+    struct NrdRuntime;
+    [[nodiscard]] NvidiaIntegrationStatus nvidiaIntegrationStatus() const;
+    [[nodiscard]] DenoiserBackend effectiveDenoiserBackend() const;
+    [[nodiscard]] TemporalUpscaler effectiveTemporalUpscaler() const;
+    [[nodiscard]] bool dlssRayReconstructionActive() const;
     void refreshMemoryPressureQuality();
     [[nodiscard]] float effectiveRenderResolutionScale() const;
     [[nodiscard]] bool hardwareRayTracingAvailable() const;
@@ -397,7 +414,7 @@ private:
         uint32_t width = 0; // display width
         uint32_t height = 0; // display height
         float feedback = 0.08f;
-        float velocityScale = 64.0f;
+        float velocityScale = 512.0f;
         uint32_t resetHistory = 1;
         float sharpeningStrength = 0.08f;
         uint32_t historyValid = 0;
@@ -436,10 +453,15 @@ private:
 
     struct RestirReservoirGpu {
         // metadata: sample type/signature plus packed pdf, age, visibility, sample count, and temporal weight.
+        // The remaining fields store a reusable light sample so DI reuse can re-evaluate at the current receiver.
         glm::uvec4 metadata{};
         glm::vec4 sampleValueConfidence{};
+        glm::vec4 samplePositionDistance{};
+        glm::vec4 sampleRadianceTarget{};
+        glm::vec4 sampleNormalWeight{};
+        glm::uvec4 sampleMetadata{};
     };
-    static_assert(sizeof(RestirReservoirGpu) == 32);
+    static_assert(sizeof(RestirReservoirGpu) == 96);
 
     struct RestirGiReservoirGpu {
         glm::vec4 radianceWeightSum{};
@@ -464,6 +486,10 @@ private:
         glm::vec4 indirectDiffuse{};
         glm::vec4 indirectSpecular{};
         glm::vec4 albedoRoughnessHitConfidence{};
+        glm::vec4 materialSpecularAlbedo{};
+        glm::vec4 denoiserHitDistance{};
+        glm::vec4 diffuseRayDirectionHitDistance{};
+        glm::vec4 specularRayDirectionHitDistance{};
     };
 
     struct alignas(16) WavefrontQueueHeaderGpu {
@@ -666,12 +692,22 @@ private:
     void recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy = false);
     void recordDenoiser(VkCommandBuffer commandBuffer);
     void recordDenoiserPass(VkCommandBuffer commandBuffer);
+    void recordNrdDenoiser(VkCommandBuffer commandBuffer);
+    void recordNrdPreparePass(VkCommandBuffer commandBuffer);
+    [[nodiscard]] bool recordNrdDispatches(VkCommandBuffer commandBuffer);
+    void recordNrdResolvePass(VkCommandBuffer commandBuffer);
     void recordMomentUpdate(VkCommandBuffer commandBuffer);
     void recordMomentUpdatePass(VkCommandBuffer commandBuffer);
     void recordTaa(VkCommandBuffer commandBuffer, bool deferHistoryCopy = false);
     void recordTaaPass(VkCommandBuffer commandBuffer);
     void copyTaaHistory(VkCommandBuffer commandBuffer);
     void recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer);
+    void recordDlss(VkCommandBuffer commandBuffer);
+    void recordDlssGuidesPass(VkCommandBuffer commandBuffer);
+    void recordDlssPass(VkCommandBuffer commandBuffer);
+    void recordDlssRayReconstruction(VkCommandBuffer commandBuffer);
+    void recordDlssRayReconstructionGuidesPass(VkCommandBuffer commandBuffer);
+    void recordDlssRayReconstructionPass(VkCommandBuffer commandBuffer);
     void recordAutoExposure(VkCommandBuffer commandBuffer);
     void recordAutoExposureHistogramPass(VkCommandBuffer commandBuffer);
     void recordAutoExposureReducePass(VkCommandBuffer commandBuffer);
@@ -683,6 +719,8 @@ private:
     void updateAdaptiveQuality(const GpuFrameTimings& timings);
     void copyHistoryResources(VkCommandBuffer commandBuffer);
     void copyHistoryResourcesPass(VkCommandBuffer commandBuffer);
+    void copyNrdHistoryResources(VkCommandBuffer commandBuffer);
+    void copyNrdHistoryResourcesPass(VkCommandBuffer commandBuffer);
     void recordWavefrontQueueClearPass(VkCommandBuffer commandBuffer);
     void recordWavefrontPrimaryGeneratePass(VkCommandBuffer commandBuffer);
     void recordWavefrontShadePass(
@@ -703,8 +741,12 @@ private:
     [[nodiscard]] uint32_t wavefrontMaxPathDepth() const;
     [[nodiscard]] uint32_t wavefrontQueueCapacityFor(VkDeviceSize pixelCount) const;
     [[nodiscard]] bool shouldRunDenoiser() const;
+    [[nodiscard]] bool shouldRunNrdDenoiser() const;
     [[nodiscard]] bool isNonDenoiserDebugView() const;
+    [[nodiscard]] bool shouldBypassTemporalUpscalerForDebugView() const;
     [[nodiscard]] bool shouldRunTaa() const;
+    [[nodiscard]] bool shouldRunDlss() const;
+    [[nodiscard]] bool shouldRunDlssRayReconstruction() const;
     [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
     [[nodiscard]] bool shouldRunRestirGiFinal() const;
@@ -716,6 +758,16 @@ private:
     [[nodiscard]] VkDeviceSize restirGiReservoirStride() const;
     [[nodiscard]] const Image& postDenoiseImage() const;
     [[nodiscard]] const Image& hdrPostProcessImage() const;
+    void initializeNrdRuntime();
+    void shutdownNrdRuntime();
+    void createNrdResolutionResources();
+    void initializeDlssRuntime();
+    void shutdownDlssRuntime();
+    void releaseDlssFeature();
+    void releaseDlssRayReconstructionFeature();
+    [[nodiscard]] bool ensureDlssFeature(VkCommandBuffer commandBuffer);
+    [[nodiscard]] bool ensureDlssRayReconstructionFeature(VkCommandBuffer commandBuffer);
+    void fallbackBlitPostDenoiseToTemporalOutput(VkCommandBuffer commandBuffer);
     void skipDenoiserPass(VkCommandBuffer commandBuffer);
     void skipDenoiserCopyPass(VkCommandBuffer commandBuffer);
     void recordHardwarePathTrace(VkCommandBuffer commandBuffer);
@@ -747,7 +799,6 @@ private:
         std::vector<Image> images;
         std::vector<Buffer> buffers;
     };
-
     const VulkanContext& context_;
     ResourceAllocator& allocator_;
     BufferUploader& uploader_;
@@ -789,6 +840,10 @@ private:
     bool rayTracingDiagnosticCountersEnabled_ = false;
     bool rayTracingDiagnosticCountersCleared_ = false;
     glm::mat4 previousViewProj_{1.0f};
+    glm::mat4 nrdViewToClip_{1.0f};
+    glm::mat4 nrdViewToClipPrev_{1.0f};
+    glm::mat4 nrdWorldToView_{1.0f};
+    glm::mat4 nrdWorldToViewPrev_{1.0f};
     glm::vec4 previousCameraPos_{};
     glm::vec2 previousJitter_{0.0f};
     bool denoiserHistoryValid_ = false;
@@ -825,6 +880,20 @@ private:
     Image momentDebugResolvedImage_;
     Image taaImage_;
     Image taaHistoryImage_;
+    Image dlssDepthImage_;
+    Image dlssMotionVectorImage_;
+    Image dlssDiffuseAlbedoImage_;
+    Image dlssSpecularAlbedoImage_;
+    Image dlssNormalImage_;
+    Image dlssRoughnessImage_;
+    Image dlssDiffuseHitDistanceImage_;
+    Image dlssSpecularHitDistanceImage_;
+    Image dlssReflectedAlbedoImage_;
+    Image dlssDisocclusionMaskImage_;
+    Image dlssDiffuseRayDirectionImage_;
+    Image dlssSpecularRayDirectionImage_;
+    Image dlssDiffuseRayDirectionHitDistanceImage_;
+    Image dlssSpecularRayDirectionHitDistanceImage_;
     Image presentationImage_;
     Buffer cameraBuffer_;
     Buffer denoiserParamsBuffer_;
@@ -882,12 +951,17 @@ private:
     Buffer exposureBuffer_;
 
     VkSampler fullscreenSampler_ = VK_NULL_HANDLE;
+    VkSampler nearestSampler_ = VK_NULL_HANDLE;
     std::unique_ptr<DescriptorLayoutCache> layoutCache_;
     std::unique_ptr<PipelineCache> pipelineCache_;
     std::unique_ptr<AtmosphereLutSystem> atmosphereLutSystem_;
     std::unique_ptr<ShaderModule> denoiserShader_;
     std::unique_ptr<ShaderModule> momentUpdateShader_;
     std::unique_ptr<ShaderModule> taaShader_;
+    std::unique_ptr<ShaderModule> dlssGuidesShader_;
+    std::unique_ptr<ShaderModule> dlssRayReconstructionGuidesShader_;
+    std::unique_ptr<ShaderModule> nrdPrepareShader_;
+    std::unique_ptr<ShaderModule> nrdResolveShader_;
     std::unique_ptr<ShaderModule> restirSpatialShader_;
     std::unique_ptr<ShaderModule> restirGiSpatialShader_;
     std::unique_ptr<ShaderModule> restirGiFinalShader_;
@@ -925,6 +999,10 @@ private:
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
     std::unique_ptr<ComputePipeline> momentUpdatePipeline_;
     std::unique_ptr<ComputePipeline> taaPipeline_;
+    std::unique_ptr<ComputePipeline> dlssGuidesPipeline_;
+    std::unique_ptr<ComputePipeline> dlssRayReconstructionGuidesPipeline_;
+    std::unique_ptr<ComputePipeline> nrdPreparePipeline_;
+    std::unique_ptr<ComputePipeline> nrdResolvePipeline_;
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirGiSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirGiFinalPipeline_;
@@ -954,6 +1032,10 @@ private:
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout momentUpdateSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dlssGuidesSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dlssRayReconstructionGuidesSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout nrdPrepareSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout nrdResolveSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirGiSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirGiFinalSetLayout_ = VK_NULL_HANDLE;
@@ -980,6 +1062,27 @@ private:
     std::vector<std::filesystem::path> shaderSources_;
     std::filesystem::path shaderOutputDirectory_;
     uint32_t selectedInstanceId_ = UINT32_MAX;
+    std::unique_ptr<NrdRuntime> nrdRuntime_;
+    bool nrdAvailable_ = false;
+    bool nrdCreationFailed_ = false;
+    std::string nrdUnavailableReason_;
+    bool dlssNgxInitialized_ = false;
+    bool dlssCapabilityAvailable_ = false;
+    bool dlssFeatureCreationFailed_ = false;
+    std::string dlssUnavailableReason_;
+    bool dlssRayReconstructionCapabilityAvailable_ = false;
+    bool dlssRayReconstructionFeatureCreationFailed_ = false;
+    std::string dlssRayReconstructionUnavailableReason_;
+    bool dlssFrameGenerationCapabilityAvailable_ = false;
+    bool dlssFrameGenerationPresentationAvailable_ = false;
+    std::string dlssFrameGenerationUnavailableReason_;
+    void* dlssParameters_ = nullptr;
+    void* dlssHandle_ = nullptr;
+    void* dlssRayReconstructionHandle_ = nullptr;
+    VkExtent2D dlssFeatureRenderExtent_{};
+    VkExtent2D dlssFeatureOutputExtent_{};
+    VkExtent2D dlssRayReconstructionFeatureRenderExtent_{};
+    VkExtent2D dlssRayReconstructionFeatureOutputExtent_{};
 };
 
 } // namespace rtv

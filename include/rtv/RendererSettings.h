@@ -15,8 +15,13 @@ struct RendererSettings {
     bool pathTracingEnabled = true;
     bool cameraJitterEnabled = true;
     bool denoiserEnabled = true;
+    DenoiserBackend denoiserBackend = DenoiserBackend::Engine;
     bool denoiseWhileMoving = true;
     bool taaEnabled = true;
+    TemporalUpscaler temporalUpscaler = TemporalUpscaler::TaaTsr;
+    bool dlssFrameGenerationEnabled = false;
+    bool dlssRayReconstructionEnabled = false;
+    float dlssSharpeningStrength = 0.0f;
     float taaFeedback = 0.06f;
     float taaMotionFeedback = 0.90f;
     float taaReactiveFeedback = 0.98f;
@@ -126,8 +131,13 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
     settings.pathTracingEnabled = true;
     settings.cameraJitterEnabled = true;
     settings.denoiserEnabled = true;
+    settings.denoiserBackend = DenoiserBackend::Engine;
     settings.denoiseWhileMoving = true;
     settings.taaEnabled = true;
+    settings.temporalUpscaler = TemporalUpscaler::TaaTsr;
+    settings.dlssFrameGenerationEnabled = false;
+    settings.dlssRayReconstructionEnabled = false;
+    settings.dlssSharpeningStrength = 0.0f;
     settings.restirMode = RestirMode::RestirOnly;
     settings.restirGiEnabled = true;
 

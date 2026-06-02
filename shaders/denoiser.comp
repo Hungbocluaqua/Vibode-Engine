@@ -36,6 +36,10 @@ struct PathDataRecord {
     vec4 indirect_diffuse;
     vec4 indirect_specular;
     vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
 };
 layout(set = 0, binding = 10, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 layout(set = 0, binding = 11, rgba16f) readonly uniform image2D diffuse_history;
@@ -297,8 +301,8 @@ void main() {
     }
 
     PathDataRecord path_data = path_data_buffer[pixel_index];
-    float center_primary_hit_distance = path_data.direct_specular.a;
-    float center_secondary_hit_distance = path_data.indirect_specular.a;
+    float center_primary_hit_distance = path_data.denoiser_hit_distance.x;
+    float center_secondary_hit_distance = path_data.denoiser_hit_distance.y;
     float center_primary_hit_normalized = temporal_normalized_hit_distance(center_primary_hit_distance);
     float center_secondary_hit_normalized = temporal_normalized_hit_distance(center_secondary_hit_distance);
     float specular_lum = luminance(path_data.direct_specular.rgb + path_data.indirect_specular.rgb);
@@ -311,7 +315,7 @@ void main() {
 
     float center_lum = luminance(center_color);
     float var_factor = sqrt(max(center_var, 0.0));
-    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], 64.0);
+    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], TEMPORAL_VELOCITY_PACK_SCALE);
     float motion_filter_boost = smoothstep(0.75, 12.0, length(velocity_pixels));
     float motion_history_available = params.reset_history == 0u ? motion_filter_boost : 0.0;
     float inv_strength = 1.0 / max(params.strength, 0.001);
@@ -373,8 +377,8 @@ void main() {
                 float sample_depth = sample_dn.r;
                 vec3 sample_normal = sample_dn.gba;
                 float sample_lum = luminance(sample_color);
-                float sample_primary_hit_normalized = temporal_normalized_hit_distance(sample_path_data.direct_specular.a);
-                float sample_secondary_hit_normalized = temporal_normalized_hit_distance(sample_path_data.indirect_specular.a);
+                float sample_primary_hit_normalized = temporal_normalized_hit_distance(sample_path_data.denoiser_hit_distance.x);
+                float sample_secondary_hit_normalized = temporal_normalized_hit_distance(sample_path_data.denoiser_hit_distance.y);
 
                 float kernel_w = atrous_kernel_weight(kx) * atrous_kernel_weight(ky);
                 if (abs(kx) == 2 || abs(ky) == 2) {
@@ -627,8 +631,8 @@ void main() {
     } else if (params.debug_view == 4u) {
         debug_color = vec3(denoiser_rejection, 1.0 - denoiser_rejection, 0.0);
     } else if (params.debug_view == 28u) {
-        vec2 visual_velocity = clamp(velocity_pixels / 32.0, vec2(-1.0), vec2(1.0));
-        debug_color = vec3(visual_velocity * 0.5 + vec2(0.5), clamp(length(velocity_pixels) / 32.0, 0.0, 1.0));
+        vec2 visual_velocity = clamp(velocity_pixels / TEMPORAL_MOTION_VECTOR_DEBUG_SCALE, vec2(-1.0), vec2(1.0));
+        debug_color = vec3(visual_velocity * 0.5 + vec2(0.5), clamp(length(velocity_pixels) / TEMPORAL_MOTION_VECTOR_DEBUG_SCALE, 0.0, 1.0));
     } else if (params.debug_view == 33u) {
         debug_color = vec3(reactive_mask, 1.0 - reactive_mask, 0.0);
     } else if (params.debug_view == 34u) {

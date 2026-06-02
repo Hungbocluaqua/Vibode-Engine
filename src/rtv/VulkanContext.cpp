@@ -33,6 +33,14 @@ const std::vector<const char*> optionalRayTracingDeviceExtensions = {
     VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
 };
 
+#if defined(RTV_DLSS_NGX_ENABLED)
+const std::vector<const char*> optionalDlssDeviceExtensions = {
+    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+    VK_NVX_BINARY_IMPORT_EXTENSION_NAME,
+    VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,
+};
+#endif
+
 constexpr const char* kVkNvInvocationReorderExtension = VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME;
 constexpr const char* kVkNvRayTracingMotionBlurExtension = VK_NV_RAY_TRACING_MOTION_BLUR_EXTENSION_NAME;
 constexpr uint32_t kNvidiaVendorId = 0x10DEu;
@@ -337,6 +345,20 @@ void VulkanContext::createDevice() {
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &supportedFeatures);
     timelineSemaphoreSupported_ = timelineSupport.timelineSemaphore == VK_TRUE;
 
+    VkPhysicalDevice16BitStorageFeatures supported16BitStorage{};
+    supported16BitStorage.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    VkPhysicalDevice8BitStorageFeatures supported8BitStorage{};
+    supported8BitStorage.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+    supported8BitStorage.pNext = &supported16BitStorage;
+    VkPhysicalDeviceFeatures2 storageFeatureQuery{};
+    storageFeatureQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    storageFeatureQuery.pNext = &supported8BitStorage;
+    vkGetPhysicalDeviceFeatures2(physicalDevice_, &storageFeatureQuery);
+    storageBuffer8BitAccess_ = supported8BitStorage.storageBuffer8BitAccess == VK_TRUE;
+    uniformAndStorageBuffer8BitAccess_ = supported8BitStorage.uniformAndStorageBuffer8BitAccess == VK_TRUE;
+    storageBuffer16BitAccess_ = supported16BitStorage.storageBuffer16BitAccess == VK_TRUE;
+    uniformAndStorageBuffer16BitAccess_ = supported16BitStorage.uniformAndStorageBuffer16BitAccess == VK_TRUE;
+
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipeline{};
     rayTracingPipeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
     rayTracingPipeline.rayTracingPipeline = rayTracingInfo_.capabilities.supported ? VK_TRUE : VK_FALSE;
@@ -420,6 +442,24 @@ void VulkanContext::createDevice() {
         featureTail = &rtMaintenance1Features;
     }
 
+    VkPhysicalDevice16BitStorageFeatures storage16BitFeatures{};
+    storage16BitFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    storage16BitFeatures.storageBuffer16BitAccess = storageBuffer16BitAccess_ ? VK_TRUE : VK_FALSE;
+    storage16BitFeatures.uniformAndStorageBuffer16BitAccess = uniformAndStorageBuffer16BitAccess_ ? VK_TRUE : VK_FALSE;
+    if (storageBuffer16BitAccess_ || uniformAndStorageBuffer16BitAccess_) {
+        storage16BitFeatures.pNext = featureTail;
+        featureTail = &storage16BitFeatures;
+    }
+
+    VkPhysicalDevice8BitStorageFeatures storage8BitFeatures{};
+    storage8BitFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+    storage8BitFeatures.storageBuffer8BitAccess = storageBuffer8BitAccess_ ? VK_TRUE : VK_FALSE;
+    storage8BitFeatures.uniformAndStorageBuffer8BitAccess = uniformAndStorageBuffer8BitAccess_ ? VK_TRUE : VK_FALSE;
+    if (storageBuffer8BitAccess_ || uniformAndStorageBuffer8BitAccess_) {
+        storage8BitFeatures.pNext = featureTail;
+        featureTail = &storage8BitFeatures;
+    }
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.features.shaderFloat64 = VK_TRUE;
@@ -454,6 +494,15 @@ void VulkanContext::createDevice() {
     } else if (rayTracingInfo_.capabilities.bufferDeviceAddress) {
         enabledExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     }
+#if defined(RTV_DLSS_NGX_ENABLED)
+    for (const char* extension : optionalDlssDeviceExtensions) {
+        if (deviceSupportsExtension(physicalDevice_, extension) &&
+            std::find(enabledExtensions.begin(), enabledExtensions.end(), extension) == enabledExtensions.end()) {
+            enabledExtensions.push_back(extension);
+            std::cout << "DLSS Vulkan extension enabled: " << extension << '\n';
+        }
+    }
+#endif
     createInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
     createInfo.ppEnabledExtensionNames = enabledExtensions.data();
 

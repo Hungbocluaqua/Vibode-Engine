@@ -111,6 +111,12 @@ public:
     [[nodiscard]] bool supportsSER() const { return serInfo_.supported; }
     [[nodiscard]] bool supportsRayTracingMotionBlur() const { return rayTracingMotionBlurInfo_.supported; }
     [[nodiscard]] bool supportsSamplerAnisotropy() const { return samplerAnisotropy_; }
+    [[nodiscard]] bool supportsNrdShaderStorageFeatures() const {
+        return storageBuffer8BitAccess_ &&
+            uniformAndStorageBuffer8BitAccess_ &&
+            storageBuffer16BitAccess_ &&
+            uniformAndStorageBuffer16BitAccess_;
+    }
     [[nodiscard]] float maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
     [[nodiscard]] bool supportsMemoryBudget() const { return supportsMemoryBudget_; }
 
@@ -155,6 +161,10 @@ private:
     bool timelineSemaphoreSupported_ = false;
     bool samplerAnisotropy_ = false;
     bool supportsMemoryBudget_ = false;
+    bool storageBuffer8BitAccess_ = false;
+    bool uniformAndStorageBuffer8BitAccess_ = false;
+    bool storageBuffer16BitAccess_ = false;
+    bool uniformAndStorageBuffer16BitAccess_ = false;
     float maxSamplerAnisotropy_ = 1.0f;
     QueueFamilyIndices queueFamilies_{};
 };

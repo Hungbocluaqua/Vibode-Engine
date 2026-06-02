@@ -521,6 +521,28 @@ struct ProfileReport {
         uint32_t denoiserMaxHistoryLength = 0;
     } memoryPressureQuality{};
 
+    struct NvidiaIntegrationReport {
+        bool nrdSdkConfigured = false;
+        bool nrdAvailable = false;
+        std::string nrdUnavailableReason;
+        std::string requestedDenoiserBackend = "engine";
+        std::string effectiveDenoiserBackend = "engine";
+        bool dlssSdkConfigured = false;
+        bool dlssAvailable = false;
+        std::string dlssUnavailableReason;
+        bool dlssRayReconstructionAvailable = false;
+        std::string dlssRayReconstructionUnavailableReason;
+        bool requestedDlssRayReconstruction = false;
+        bool effectiveDlssRayReconstruction = false;
+        bool dlssFrameGenerationAvailable = false;
+        std::string dlssFrameGenerationUnavailableReason;
+        bool requestedDlssFrameGeneration = false;
+        bool effectiveDlssFrameGeneration = false;
+        float dlssSharpeningStrength = 0.0f;
+        std::string requestedTemporalUpscaler = "taa-tsr";
+        std::string effectiveTemporalUpscaler = "taa-tsr";
+    } nvidiaIntegrations{};
+
     uint32_t validationErrorCount = 0;
     std::vector<std::string> warnings;
 

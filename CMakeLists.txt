@@ -18,6 +18,8 @@ find_package(Ktx CONFIG REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
 set(RENDERDOC_SDK_DIR "" CACHE PATH "Path to RenderDoc SDK directory")
+set(NRD_SDK_DIR "" CACHE PATH "Path to NVIDIA Real-Time Denoisers SDK/source checkout")
+set(DLSS_SDK_DIR "" CACHE PATH "Path to NVIDIA DLSS/NGX SDK directory")
 
 if(NOT DEFINED ENV{VULKAN_SDK})
     message(FATAL_ERROR "VULKAN_SDK is not set. Install the Vulkan SDK and open a new terminal.")
@@ -170,6 +172,52 @@ target_link_libraries(rtvulkan PRIVATE
 if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
     target_compile_definitions(rtvulkan PRIVATE RTV_HAS_RENDERDOC=1)
     target_include_directories(rtvulkan PRIVATE "${RENDERDOC_SDK_DIR}")
+endif()
+
+if(EXISTS "${NRD_SDK_DIR}/Include/NRD.h" OR EXISTS "${NRD_SDK_DIR}/Include/NRDDescs.h" OR EXISTS "${NRD_SDK_DIR}/Include/NRDIntegration.hpp")
+    target_compile_definitions(rtvulkan PRIVATE RTV_NRD_SDK_CONFIGURED=1)
+    target_include_directories(rtvulkan PRIVATE "${NRD_SDK_DIR}/Include")
+    if(EXISTS "${NRD_SDK_DIR}/Integration/NRDIntegration.hpp")
+        target_include_directories(rtvulkan PRIVATE "${NRD_SDK_DIR}/Integration")
+    endif()
+    if(EXISTS "${NRD_SDK_DIR}/CMakeLists.txt")
+        set(NRD_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
+        set(NRD_NRI OFF CACHE BOOL "" FORCE)
+        set(NRD_EMBEDS_SPIRV_SHADERS ON CACHE BOOL "" FORCE)
+        set(NRD_EMBEDS_DXIL_SHADERS OFF CACHE BOOL "" FORCE)
+        set(NRD_EMBEDS_DXBC_SHADERS OFF CACHE BOOL "" FORCE)
+        set(NRD_SUPPORTS_QUAD_INTRINSICS OFF CACHE BOOL "" FORCE)
+        set(NRD_NORMAL_ENCODING "4" CACHE STRING "" FORCE)
+        set(NRD_ROUGHNESS_ENCODING "1" CACHE STRING "" FORCE)
+        add_subdirectory("${NRD_SDK_DIR}" "${CMAKE_BINARY_DIR}/nrd" EXCLUDE_FROM_ALL)
+        target_link_libraries(rtvulkan PRIVATE NRD)
+        target_compile_definitions(rtvulkan PRIVATE RTV_NRD_RUNTIME_ENABLED=1)
+    endif()
+endif()
+
+if(EXISTS "${DLSS_SDK_DIR}/include/nvsdk_ngx_vk.h" OR EXISTS "${DLSS_SDK_DIR}/include/nvsdk_ngx.h" OR EXISTS "${DLSS_SDK_DIR}/include/nvsdk_ngx_helpers_vk.h")
+    target_compile_definitions(rtvulkan PRIVATE RTV_DLSS_SDK_CONFIGURED=1)
+    target_include_directories(rtvulkan PRIVATE "${DLSS_SDK_DIR}/include")
+    set(DLSS_NGX_LIB_RELEASE "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    set(DLSS_NGX_LIB_DEBUG "${DLSS_SDK_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib")
+    set(DLSS_RUNTIME_DIR "${DLSS_SDK_DIR}/lib/Windows_x86_64/rel")
+    set(DLSS_RUNTIME_DLL "${DLSS_RUNTIME_DIR}/nvngx_dlss.dll")
+    if(WIN32 AND EXISTS "${DLSS_NGX_LIB_RELEASE}" AND EXISTS "${DLSS_NGX_LIB_DEBUG}" AND EXISTS "${DLSS_RUNTIME_DLL}")
+        target_compile_definitions(rtvulkan PRIVATE
+            RTV_DLSS_NGX_ENABLED=1
+            "RTV_DLSS_RUNTIME_DIR=\"${DLSS_RUNTIME_DIR}\"")
+        target_link_libraries(rtvulkan PRIVATE
+            "$<$<CONFIG:Debug>:${DLSS_NGX_LIB_DEBUG}>"
+            "$<$<NOT:$<CONFIG:Debug>>:${DLSS_NGX_LIB_RELEASE}>")
+        foreach(DLSS_RUNTIME_NAME IN ITEMS nvngx_dlss.dll nvngx_dlssd.dll nvngx_dlssg.dll)
+            if(EXISTS "${DLSS_RUNTIME_DIR}/${DLSS_RUNTIME_NAME}")
+                add_custom_command(TARGET rtvulkan POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${DLSS_RUNTIME_DIR}/${DLSS_RUNTIME_NAME}"
+                        "$<TARGET_FILE_DIR:rtvulkan>/${DLSS_RUNTIME_NAME}")
+            endif()
+        endforeach()
+    endif()
 endif()
 
 if(WIN32)

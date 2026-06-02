@@ -11,7 +11,8 @@ ComputePipeline::ComputePipeline(
     const ShaderModule& shader,
     std::vector<VkDescriptorSetLayout> setLayouts,
     std::vector<VkPushConstantRange> pushConstants,
-    PipelineCache& pipelineCache)
+    PipelineCache& pipelineCache,
+    const char* entryPoint)
     : device_(device) {
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -23,7 +24,7 @@ ComputePipeline::ComputePipeline(
 
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    pipelineInfo.stage = shader.stageInfo();
+    pipelineInfo.stage = shader.stageInfo(entryPoint);
     pipelineInfo.layout = layout_;
     checkVk(vkCreateComputePipelines(device_, pipelineCache.handle(), 1, &pipelineInfo, nullptr, &pipeline_), "vkCreateComputePipelines");
 }

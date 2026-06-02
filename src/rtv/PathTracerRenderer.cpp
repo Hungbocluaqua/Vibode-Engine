@@ -25,13 +25,32 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+#include <NRD.h>
+#endif
+
+#if defined(RTV_DLSS_NGX_ENABLED)
+#include <nvsdk_ngx_defs_dlssd.h>
+#include <nvsdk_ngx_defs_dlssg.h>
+#include <nvsdk_ngx_helpers_vk.h>
+#include <nvsdk_ngx_helpers_dlssd_vk.h>
+#include <nvsdk_ngx_helpers_dlssg_vk.h>
+#include <nvsdk_ngx_params_dlssd.h>
+#include <nvsdk_ngx_params_dlssg.h>
+#endif
 
 namespace rtv {
 
@@ -134,6 +153,124 @@ bool requiresWavefrontShadowTrace(RendererDebugView view) {
     return view == RendererDebugView::WavefrontDirectLighting;
 }
 
+#if defined(RTV_DLSS_NGX_ENABLED)
+const char* ngxResultName(NVSDK_NGX_Result result) {
+    switch (result) {
+    case NVSDK_NGX_Result_Success: return "Success";
+    case NVSDK_NGX_Result_Fail: return "Fail";
+    case NVSDK_NGX_Result_FAIL_FeatureNotSupported: return "FeatureNotSupported";
+    case NVSDK_NGX_Result_FAIL_PlatformError: return "PlatformError";
+    case NVSDK_NGX_Result_FAIL_FeatureAlreadyExists: return "FeatureAlreadyExists";
+    case NVSDK_NGX_Result_FAIL_FeatureNotFound: return "FeatureNotFound";
+    case NVSDK_NGX_Result_FAIL_InvalidParameter: return "InvalidParameter";
+    case NVSDK_NGX_Result_FAIL_ScratchBufferTooSmall: return "ScratchBufferTooSmall";
+    case NVSDK_NGX_Result_FAIL_NotInitialized: return "NotInitialized";
+    case NVSDK_NGX_Result_FAIL_UnsupportedInputFormat: return "UnsupportedInputFormat";
+    case NVSDK_NGX_Result_FAIL_RWFlagMissing: return "RWFlagMissing";
+    case NVSDK_NGX_Result_FAIL_MissingInput: return "MissingInput";
+    case NVSDK_NGX_Result_FAIL_UnableToInitializeFeature: return "UnableToInitializeFeature";
+    case NVSDK_NGX_Result_FAIL_OutOfDate: return "OutOfDate";
+    case NVSDK_NGX_Result_FAIL_OutOfGPUMemory: return "OutOfGPUMemory";
+    case NVSDK_NGX_Result_FAIL_UnsupportedFormat: return "UnsupportedFormat";
+    case NVSDK_NGX_Result_FAIL_UnableToWriteToAppDataPath: return "UnableToWriteToAppDataPath";
+    case NVSDK_NGX_Result_FAIL_UnsupportedParameter: return "UnsupportedParameter";
+    case NVSDK_NGX_Result_FAIL_Denied: return "Denied";
+    case NVSDK_NGX_Result_FAIL_NotImplemented: return "NotImplemented";
+    }
+    return "Unknown";
+}
+
+std::string ngxFailureMessage(const char* operation, NVSDK_NGX_Result result) {
+    std::ostringstream out;
+    out << operation << " failed: " << ngxResultName(result) << " (0x" << std::hex << static_cast<uint32_t>(result) << ")";
+    return out.str();
+}
+
+bool queryNgxCapability(
+    NVSDK_NGX_Parameter* parameters,
+    const char* availableParameter,
+    const char* needsUpdatedDriverParameter,
+    const char* minDriverMajorParameter,
+    const char* minDriverMinorParameter,
+    const char* featureName,
+    std::string& unavailableReason) {
+    int available = 0;
+    const NVSDK_NGX_Result result = NVSDK_NGX_Parameter_GetI(parameters, availableParameter, &available);
+    if (!NVSDK_NGX_FAILED(result) && available != 0) {
+        unavailableReason.clear();
+        return true;
+    }
+
+    int needsUpdatedDriver = 0;
+    int minDriverMajor = 0;
+    int minDriverMinor = 0;
+    NVSDK_NGX_Parameter_GetI(parameters, needsUpdatedDriverParameter, &needsUpdatedDriver);
+    NVSDK_NGX_Parameter_GetI(parameters, minDriverMajorParameter, &minDriverMajor);
+    NVSDK_NGX_Parameter_GetI(parameters, minDriverMinorParameter, &minDriverMinor);
+
+    std::ostringstream reason;
+    reason << featureName << " is not available";
+    if (NVSDK_NGX_FAILED(result)) {
+        reason << " (" << ngxFailureMessage("capability query", result) << ")";
+    }
+    if (needsUpdatedDriver != 0) {
+        reason << "; NVIDIA driver update required";
+        if (minDriverMajor > 0) {
+            reason << " (minimum " << minDriverMajor << "." << minDriverMinor << ")";
+        }
+    }
+    unavailableReason = reason.str();
+    return false;
+}
+
+bool ngxMatrixIsFinite(const glm::mat4& matrix) {
+    const float* values = glm::value_ptr(matrix);
+    for (uint32_t i = 0; i < 16u; ++i) {
+        if (!std::isfinite(values[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void copyNgxRowMajorMatrix(std::array<float, 16>& dst, const glm::mat4& src) {
+    for (uint32_t row = 0; row < 4u; ++row) {
+        for (uint32_t col = 0; col < 4u; ++col) {
+            dst[row * 4u + col] = src[col][row];
+        }
+    }
+}
+
+bool makeNgxDlssTemporalMatrices(
+    std::array<float, 16>& invViewProjection,
+    std::array<float, 16>& clipToPrevClip,
+    const glm::mat4& worldToView,
+    const glm::mat4& viewToClip,
+    const glm::mat4& previousWorldToView,
+    const glm::mat4& previousViewToClip) {
+    const glm::mat4 currentClipFromWorld = viewToClip * worldToView;
+    const glm::mat4 previousClipFromWorld = previousViewToClip * previousWorldToView;
+    if (!ngxMatrixIsFinite(currentClipFromWorld) || !ngxMatrixIsFinite(previousClipFromWorld)) {
+        return false;
+    }
+
+    const float determinant = glm::determinant(currentClipFromWorld);
+    if (!std::isfinite(determinant) || std::abs(determinant) <= 1.0e-8f) {
+        return false;
+    }
+
+    const glm::mat4 currentClipToWorld = glm::inverse(currentClipFromWorld);
+    const glm::mat4 currentClipToPreviousClip = previousClipFromWorld * currentClipToWorld;
+    if (!ngxMatrixIsFinite(currentClipToWorld) || !ngxMatrixIsFinite(currentClipToPreviousClip)) {
+        return false;
+    }
+
+    copyNgxRowMajorMatrix(invViewProjection, currentClipToWorld);
+    copyNgxRowMajorMatrix(clipToPrevClip, currentClipToPreviousClip);
+    return true;
+}
+#endif
+
 std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
     constexpr VkShaderStageFlags allRt =
         VK_SHADER_STAGE_RAYGEN_BIT_KHR |
@@ -210,7 +347,217 @@ bool restirGiUncompressedLayoutFromEnvironment() {
 #endif
 }
 
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+const char* nrdResultName(nrd::Result result) {
+    switch (result) {
+    case nrd::Result::SUCCESS: return "SUCCESS";
+    case nrd::Result::FAILURE: return "FAILURE";
+    case nrd::Result::INVALID_ARGUMENT: return "INVALID_ARGUMENT";
+    case nrd::Result::UNSUPPORTED: return "UNSUPPORTED";
+    case nrd::Result::NON_UNIQUE_IDENTIFIER: return "NON_UNIQUE_IDENTIFIER";
+    case nrd::Result::MAX_NUM: return "MAX_NUM";
+    }
+    return "UNKNOWN";
+}
+
+VkFormat nrdFormatToVk(nrd::Format format) {
+    switch (format) {
+    case nrd::Format::R8_UNORM: return VK_FORMAT_R8_UNORM;
+    case nrd::Format::R8_SNORM: return VK_FORMAT_R8_SNORM;
+    case nrd::Format::R8_UINT: return VK_FORMAT_R8_UINT;
+    case nrd::Format::R8_SINT: return VK_FORMAT_R8_SINT;
+    case nrd::Format::RG8_UNORM: return VK_FORMAT_R8G8_UNORM;
+    case nrd::Format::RG8_SNORM: return VK_FORMAT_R8G8_SNORM;
+    case nrd::Format::RG8_UINT: return VK_FORMAT_R8G8_UINT;
+    case nrd::Format::RG8_SINT: return VK_FORMAT_R8G8_SINT;
+    case nrd::Format::RGBA8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
+    case nrd::Format::RGBA8_SNORM: return VK_FORMAT_R8G8B8A8_SNORM;
+    case nrd::Format::RGBA8_UINT: return VK_FORMAT_R8G8B8A8_UINT;
+    case nrd::Format::RGBA8_SINT: return VK_FORMAT_R8G8B8A8_SINT;
+    case nrd::Format::RGBA8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+    case nrd::Format::R16_UNORM: return VK_FORMAT_R16_UNORM;
+    case nrd::Format::R16_SNORM: return VK_FORMAT_R16_SNORM;
+    case nrd::Format::R16_UINT: return VK_FORMAT_R16_UINT;
+    case nrd::Format::R16_SINT: return VK_FORMAT_R16_SINT;
+    case nrd::Format::R16_SFLOAT: return VK_FORMAT_R16_SFLOAT;
+    case nrd::Format::RG16_UNORM: return VK_FORMAT_R16G16_UNORM;
+    case nrd::Format::RG16_SNORM: return VK_FORMAT_R16G16_SNORM;
+    case nrd::Format::RG16_UINT: return VK_FORMAT_R16G16_UINT;
+    case nrd::Format::RG16_SINT: return VK_FORMAT_R16G16_SINT;
+    case nrd::Format::RG16_SFLOAT: return VK_FORMAT_R16G16_SFLOAT;
+    case nrd::Format::RGBA16_UNORM: return VK_FORMAT_R16G16B16A16_UNORM;
+    case nrd::Format::RGBA16_SNORM: return VK_FORMAT_R16G16B16A16_SNORM;
+    case nrd::Format::RGBA16_UINT: return VK_FORMAT_R16G16B16A16_UINT;
+    case nrd::Format::RGBA16_SINT: return VK_FORMAT_R16G16B16A16_SINT;
+    case nrd::Format::RGBA16_SFLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case nrd::Format::R32_UINT: return VK_FORMAT_R32_UINT;
+    case nrd::Format::R32_SINT: return VK_FORMAT_R32_SINT;
+    case nrd::Format::R32_SFLOAT: return VK_FORMAT_R32_SFLOAT;
+    case nrd::Format::RG32_UINT: return VK_FORMAT_R32G32_UINT;
+    case nrd::Format::RG32_SINT: return VK_FORMAT_R32G32_SINT;
+    case nrd::Format::RG32_SFLOAT: return VK_FORMAT_R32G32_SFLOAT;
+    case nrd::Format::RGB32_UINT: return VK_FORMAT_R32G32B32_UINT;
+    case nrd::Format::RGB32_SINT: return VK_FORMAT_R32G32B32_SINT;
+    case nrd::Format::RGB32_SFLOAT: return VK_FORMAT_R32G32B32_SFLOAT;
+    case nrd::Format::RGBA32_UINT: return VK_FORMAT_R32G32B32A32_UINT;
+    case nrd::Format::RGBA32_SINT: return VK_FORMAT_R32G32B32A32_SINT;
+    case nrd::Format::RGBA32_SFLOAT: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case nrd::Format::R10_G10_B10_A2_UNORM: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case nrd::Format::R10_G10_B10_A2_UINT: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    case nrd::Format::R11_G11_B10_UFLOAT: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    case nrd::Format::R9_G9_B9_E5_UFLOAT: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    case nrd::Format::MAX_NUM: break;
+    }
+    return VK_FORMAT_R16G16B16A16_SFLOAT;
+}
+
+VkDeviceSize alignUniformOffset(VkDeviceSize value) {
+    constexpr VkDeviceSize kAlignment = 256;
+    return (value + kAlignment - 1) & ~(kAlignment - 1);
+}
+#endif
+
 } // namespace
+
+struct PathTracerRenderer::NrdRuntime {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    struct PipelineState {
+        std::unique_ptr<ShaderModule> shader;
+        std::unique_ptr<ComputePipeline> pipeline;
+        std::vector<VkDescriptorSetLayout> setLayouts;
+        std::vector<ReflectedBinding> bindings;
+    };
+
+    nrd::Instance* instance = nullptr;
+    const nrd::InstanceDesc* instanceDesc = nullptr;
+    const nrd::LibraryDesc* libraryDesc = nullptr;
+    std::vector<PipelineState> pipelines;
+    std::vector<Image> permanentPoolImages;
+    std::vector<Image> transientPoolImages;
+    std::vector<Buffer> constantBuffers;
+    VkDeviceSize constantStride = 256;
+    VkDeviceSize constantsPerFrameSize = 0;
+    VkExtent2D extent{};
+    Image motionVectors;
+    Image normalRoughness;
+    Image viewZ;
+    Image diffRadianceHitdist;
+    Image specRadianceHitdist;
+    Image outDiffRadianceHitdist;
+    Image outSpecRadianceHitdist;
+    Image fallbackImage;
+    bool resourcesReady = false;
+
+    ~NrdRuntime() {
+        if (instance != nullptr) {
+            nrd::DestroyInstance(*instance);
+            instance = nullptr;
+        }
+    }
+#endif
+};
+
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+namespace {
+
+bool nrdPipelineHasBinding(
+    const PathTracerRenderer::NrdRuntime::PipelineState& pipeline,
+    uint32_t set,
+    uint32_t binding,
+    VkDescriptorType type) {
+    return std::any_of(
+        pipeline.bindings.begin(),
+        pipeline.bindings.end(),
+        [set, binding, type](const ReflectedBinding& reflected) {
+            return reflected.set == set && reflected.binding == binding && reflected.type == type;
+        });
+}
+
+uint32_t nrdPipelineBindingCount(
+    const PathTracerRenderer::NrdRuntime::PipelineState& pipeline,
+    uint32_t set,
+    uint32_t binding,
+    VkDescriptorType type) {
+    const auto it = std::find_if(
+        pipeline.bindings.begin(),
+        pipeline.bindings.end(),
+        [set, binding, type](const ReflectedBinding& reflected) {
+            return reflected.set == set && reflected.binding == binding && reflected.type == type;
+        });
+    return it == pipeline.bindings.end() ? 0u : it->count;
+}
+
+void nrdCopyMatrix(float* dst, const glm::mat4& src) {
+    std::memcpy(dst, glm::value_ptr(src), sizeof(float) * 16u);
+}
+
+Image* nrdImageForResource(PathTracerRenderer::NrdRuntime& runtime, const nrd::ResourceDesc& resource) {
+    switch (resource.type) {
+    case nrd::ResourceType::IN_MV:
+        return &runtime.motionVectors;
+    case nrd::ResourceType::IN_NORMAL_ROUGHNESS:
+        return &runtime.normalRoughness;
+    case nrd::ResourceType::IN_VIEWZ:
+        return &runtime.viewZ;
+    case nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST:
+        return &runtime.diffRadianceHitdist;
+    case nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST:
+        return &runtime.specRadianceHitdist;
+    case nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST:
+        return &runtime.outDiffRadianceHitdist;
+    case nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST:
+        return &runtime.outSpecRadianceHitdist;
+    case nrd::ResourceType::PERMANENT_POOL:
+        if (resource.indexInPool < runtime.permanentPoolImages.size()) {
+            return &runtime.permanentPoolImages[resource.indexInPool];
+        }
+        break;
+    case nrd::ResourceType::TRANSIENT_POOL:
+        if (resource.indexInPool < runtime.transientPoolImages.size()) {
+            return &runtime.transientPoolImages[resource.indexInPool];
+        }
+        break;
+    default:
+        break;
+    }
+    return runtime.fallbackImage.handle() != VK_NULL_HANDLE ? &runtime.fallbackImage : nullptr;
+}
+
+void nrdTransitionImage(
+    VkCommandBuffer commandBuffer,
+    Image& image,
+    bool storage) {
+    const VkImageLayout newLayout = storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const VkAccessFlags2 dstAccess = storage
+        ? (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
+        : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    barrier::cmdTransitionImage(commandBuffer, barrier::ImageTransition{
+        .image = image.handle(),
+        .oldLayout = image.layout(),
+        .newLayout = newLayout,
+        .range = image.fullRange(),
+        .srcStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccess = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccess = dstAccess,
+    });
+    image.setLayout(newLayout);
+}
+
+VkDescriptorImageInfo nrdImageDescriptor(const Image& image, bool storage) {
+    return storage ? image.storageDescriptor() : image.sampledDescriptor(VK_NULL_HANDLE);
+}
+
+uint32_t nrdCurrentFrameSlot(uint32_t temporalFrameIndex, size_t frameCount) {
+    if (frameCount == 0) {
+        return 0;
+    }
+    const uint32_t frame = temporalFrameIndex == 0 ? 0 : temporalFrameIndex - 1u;
+    return frame % static_cast<uint32_t>(frameCount);
+}
+
+} // namespace
+#endif
 
 const char* accumulationResetReasonName(AccumulationResetReason reason) {
     switch (reason) {
@@ -319,6 +666,10 @@ PathTracerRenderer::PathTracerRenderer(
     const auto denoiserSpv = compiler.compileIfNeeded(shaderDirectory / "denoiser.comp", shaderOutputDirectory);
     const auto momentUpdateSpv = compiler.compileIfNeeded(shaderDirectory / "moment_update.comp", shaderOutputDirectory);
     const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
+    const auto dlssGuidesSpv = compiler.compileIfNeeded(shaderDirectory / "dlss_guides.comp", shaderOutputDirectory);
+    const auto dlssRayReconstructionGuidesSpv = compiler.compileIfNeeded(shaderDirectory / "dlss_rr_guides.comp", shaderOutputDirectory);
+    const auto nrdPrepareSpv = compiler.compileIfNeeded(shaderDirectory / "nrd_prepare.comp", shaderOutputDirectory);
+    const auto nrdResolveSpv = compiler.compileIfNeeded(shaderDirectory / "nrd_resolve.comp", shaderOutputDirectory);
     const auto restirSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_spatial.comp", shaderOutputDirectory);
     const auto restirGiSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_spatial.comp", shaderOutputDirectory);
     const auto restirGiFinalSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_final.comp", shaderOutputDirectory);
@@ -347,6 +698,10 @@ PathTracerRenderer::PathTracerRenderer(
     denoiserShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(denoiserSpv), "temporal denoiser compute");
     momentUpdateShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(momentUpdateSpv), "moment update compute");
     taaShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(taaSpv), "taa compute");
+    dlssGuidesShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(dlssGuidesSpv), "dlss guide image compute");
+    dlssRayReconstructionGuidesShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(dlssRayReconstructionGuidesSpv), "dlss ray reconstruction guide image compute");
+    nrdPrepareShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(nrdPrepareSpv), "nrd guide and signal prepare compute");
+    nrdResolveShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(nrdResolveSpv), "nrd resolve compute");
     restirSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirSpatialSpv), "restir spatial compute");
     restirGiSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiSpatialSpv), "restir gi spatial compute");
     restirGiFinalShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiFinalSpv), "restir gi final compute");
@@ -414,6 +769,10 @@ PathTracerRenderer::PathTracerRenderer(
         shaderDirectory / "denoiser.comp",
         shaderDirectory / "moment_update.comp",
         shaderDirectory / "taa.comp",
+        shaderDirectory / "dlss_guides.comp",
+        shaderDirectory / "dlss_rr_guides.comp",
+        shaderDirectory / "nrd_prepare.comp",
+        shaderDirectory / "nrd_resolve.comp",
         shaderDirectory / "restir_spatial.comp",
         shaderDirectory / "restir_gi_spatial.comp",
         shaderDirectory / "restir_gi_final.comp",
@@ -469,6 +828,10 @@ PathTracerRenderer::PathTracerRenderer(
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
     momentUpdateSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({momentUpdateShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
+    dlssGuidesSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({dlssGuidesShader_->reflection()}, 0));
+    dlssRayReconstructionGuidesSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({dlssRayReconstructionGuidesShader_->reflection()}, 0));
+    nrdPrepareSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({nrdPrepareShader_->reflection()}, 0));
+    nrdResolveSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({nrdResolveShader_->reflection()}, 0));
     restirSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirSpatialShader_->reflection()}, 0));
     restirGiSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiSpatialShader_->reflection()}, 0));
     restirGiFinalSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiFinalShader_->reflection()}, 0));
@@ -540,6 +903,30 @@ PathTracerRenderer::PathTracerRenderer(
         *taaShader_,
         std::vector<VkDescriptorSetLayout>{taaSetLayout_},
         ShaderReflection::mergePushConstants({taaShader_->reflection()}),
+        *pipelineCache_);
+    dlssGuidesPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *dlssGuidesShader_,
+        std::vector<VkDescriptorSetLayout>{dlssGuidesSetLayout_},
+        ShaderReflection::mergePushConstants({dlssGuidesShader_->reflection()}),
+        *pipelineCache_);
+    dlssRayReconstructionGuidesPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *dlssRayReconstructionGuidesShader_,
+        std::vector<VkDescriptorSetLayout>{dlssRayReconstructionGuidesSetLayout_},
+        ShaderReflection::mergePushConstants({dlssRayReconstructionGuidesShader_->reflection()}),
+        *pipelineCache_);
+    nrdPreparePipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *nrdPrepareShader_,
+        std::vector<VkDescriptorSetLayout>{nrdPrepareSetLayout_},
+        ShaderReflection::mergePushConstants({nrdPrepareShader_->reflection()}),
+        *pipelineCache_);
+    nrdResolvePipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *nrdResolveShader_,
+        std::vector<VkDescriptorSetLayout>{nrdResolveSetLayout_},
+        ShaderReflection::mergePushConstants({nrdResolveShader_->reflection()}),
         *pipelineCache_);
     restirSpatialPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -743,6 +1130,9 @@ PathTracerRenderer::PathTracerRenderer(
     samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     checkVk(vkCreateSampler(context_.device(), &samplerInfo, nullptr, &fullscreenSampler_), "vkCreateSampler(path tracer fullscreen)");
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    checkVk(vkCreateSampler(context_.device(), &samplerInfo, nullptr, &nearestSampler_), "vkCreateSampler(path tracer nearest)");
 
     camera_.pos = {0.0f, 0.0f, 3.9f, 0.0f};
     camera_.forward = {0.0f, 0.0f, -1.0f, 0.0f};
@@ -757,11 +1147,18 @@ PathTracerRenderer::PathTracerRenderer(
     if (debugView != RendererDebugView::Beauty) {
         std::cout << "Renderer debug view: " << rendererDebugViewName(debugView) << '\n';
     }
+    initializeNrdRuntime();
+    initializeDlssRuntime();
 }
 
 PathTracerRenderer::~PathTracerRenderer() {
+    shutdownNrdRuntime();
+    shutdownDlssRuntime();
     if (pipelineCache_ && !shaderOutputDirectory_.empty()) {
         pipelineCache_->saveToFile(shaderOutputDirectory_ / "pipeline_cache.bin");
+    }
+    if (nearestSampler_ != VK_NULL_HANDLE) {
+        vkDestroySampler(context_.device(), nearestSampler_, nullptr);
     }
     if (fullscreenSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(context_.device(), fullscreenSampler_, nullptr);
@@ -843,6 +1240,16 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
         return;
     }
 
+    if (shouldRunDlssRayReconstruction()) {
+        adaptiveQualityTier_ = 0;
+        adaptiveOverBudgetFrames_ = 0;
+        adaptiveSmoothedGpuMs_ = 0.0f;
+        if (temporalFrameIndex_ == 1u || temporalFrameIndex_ % 120u == 0u) {
+            validationLog_.recordPass("adaptive quality held at full quality for dlss ray reconstruction");
+        }
+        return;
+    }
+
     const float gpuMs = timings.totalMs();
     if (gpuMs > 0.0f) {
         adaptiveSmoothedGpuMs_ = adaptiveSmoothedGpuMs_ <= 0.0f
@@ -909,6 +1316,9 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     next.atrousIterations = std::clamp(next.atrousIterations, 1u, 5u);
     next.environmentDirectSamples = std::clamp(next.environmentDirectSamples, 1u, 8u);
     next.denoiserStrength = std::max(0.05f, next.denoiserStrength);
+    if (static_cast<uint32_t>(next.denoiserBackend) > static_cast<uint32_t>(DenoiserBackend::Nrd)) {
+        next.denoiserBackend = DenoiserBackend::Engine;
+    }
     next.denoiserMaxHistoryLength = std::clamp(next.denoiserMaxHistoryLength, 4u, 256u);
     next.momentValidityThreshold = std::clamp(
         std::isfinite(next.momentValidityThreshold) ? next.momentValidityThreshold : 0.20f,
@@ -927,6 +1337,9 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.taaMotionFeedback,
         0.99f);
     next.taaSharpeningStrength = std::clamp(next.taaSharpeningStrength, 0.0f, 1.0f);
+    if (static_cast<uint32_t>(next.temporalUpscaler) > static_cast<uint32_t>(TemporalUpscaler::Dlss)) {
+        next.temporalUpscaler = TemporalUpscaler::TaaTsr;
+    }
     next.sunIntensity = std::max(0.0f, next.sunIntensity);
     next.sunIlluminanceLux = std::max(0.0f, next.sunIlluminanceLux);
     next.sunColorTemperatureKelvin = std::clamp(next.sunColorTemperatureKelvin, 1000.0f, 40000.0f);
@@ -1110,8 +1523,12 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.pathTracingEnabled != settings_.pathTracingEnabled ||
         next.cameraJitterEnabled != settings_.cameraJitterEnabled ||
         next.denoiserEnabled != settings_.denoiserEnabled ||
+        next.denoiserBackend != settings_.denoiserBackend ||
         next.denoiseWhileMoving != settings_.denoiseWhileMoving ||
         next.taaEnabled != settings_.taaEnabled ||
+        next.temporalUpscaler != settings_.temporalUpscaler ||
+        next.dlssFrameGenerationEnabled != settings_.dlssFrameGenerationEnabled ||
+        next.dlssRayReconstructionEnabled != settings_.dlssRayReconstructionEnabled ||
         next.sunlightEnabled != settings_.sunlightEnabled ||
         next.directLightingEnabled != settings_.directLightingEnabled ||
         next.environmentEnabled != settings_.environmentEnabled ||
@@ -1142,6 +1559,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.taaMotionFeedback - settings_.taaMotionFeedback) > 0.0001f ||
         std::abs(next.taaReactiveFeedback - settings_.taaReactiveFeedback) > 0.0001f ||
         std::abs(next.taaSharpeningStrength - settings_.taaSharpeningStrength) > 0.0001f ||
+        std::abs(next.dlssSharpeningStrength - settings_.dlssSharpeningStrength) > 0.0001f ||
         std::abs(next.denoiserStrength - settings_.denoiserStrength) > 0.0001f ||
         next.denoiserMaxHistoryLength != settings_.denoiserMaxHistoryLength ||
         std::abs(next.momentValidityThreshold - settings_.momentValidityThreshold) > 0.0001f ||
@@ -1247,6 +1665,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.groundAlbedo - settings_.groundAlbedo) > 0.0001f;
     const bool denoiserChanged =
         next.denoiserEnabled != settings_.denoiserEnabled ||
+        next.denoiserBackend != settings_.denoiserBackend ||
         next.denoiseWhileMoving != settings_.denoiseWhileMoving ||
         next.atrousIterations != settings_.atrousIterations ||
         std::abs(next.denoiserStrength - settings_.denoiserStrength) > 0.0001f ||
@@ -1254,10 +1673,13 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.momentValidityThreshold - settings_.momentValidityThreshold) > 0.0001f;
     const bool taaChanged =
         next.taaEnabled != settings_.taaEnabled ||
+        next.temporalUpscaler != settings_.temporalUpscaler ||
+        next.dlssRayReconstructionEnabled != settings_.dlssRayReconstructionEnabled ||
         std::abs(next.taaFeedback - settings_.taaFeedback) > 0.0001f ||
         std::abs(next.taaMotionFeedback - settings_.taaMotionFeedback) > 0.0001f ||
         std::abs(next.taaReactiveFeedback - settings_.taaReactiveFeedback) > 0.0001f ||
-        std::abs(next.taaSharpeningStrength - settings_.taaSharpeningStrength) > 0.0001f;
+        std::abs(next.taaSharpeningStrength - settings_.taaSharpeningStrength) > 0.0001f ||
+        std::abs(next.dlssSharpeningStrength - settings_.dlssSharpeningStrength) > 0.0001f;
     const bool debugChanged =
         next.debugView != settings_.debugView ||
         std::abs(next.debugScale - settings_.debugScale) > 0.0001f;
@@ -1373,6 +1795,407 @@ const SerDeviceInfo& PathTracerRenderer::serInfo() const {
 
 const RayTracingMotionBlurDeviceInfo& PathTracerRenderer::rayTracingMotionBlurInfo() const {
     return context_.rayTracingMotionBlurInfo();
+}
+
+PathTracerRenderer::NvidiaIntegrationStatus PathTracerRenderer::nvidiaIntegrationStatus() const {
+    NvidiaIntegrationStatus status{};
+#if defined(RTV_NRD_SDK_CONFIGURED)
+    status.nrdSdkConfigured = true;
+    status.nrdAvailable = nrdAvailable_ && !nrdCreationFailed_;
+    status.nrdUnavailableReason = status.nrdAvailable
+        ? std::string{}
+        : (nrdUnavailableReason_.empty()
+            ? "NRD SDK headers were found, but the Vulkan NRD runtime is not enabled in this build"
+            : nrdUnavailableReason_);
+#else
+    status.nrdUnavailableReason = "NRD SDK is not configured; set NRD_SDK_DIR when configuring CMake";
+#endif
+#if defined(RTV_DLSS_SDK_CONFIGURED)
+    status.dlssSdkConfigured = true;
+    status.dlssAvailable = dlssCapabilityAvailable_ && !dlssFeatureCreationFailed_;
+    status.dlssUnavailableReason = status.dlssAvailable
+        ? std::string{}
+        : (dlssUnavailableReason_.empty()
+            ? "DLSS SDK headers were found, but the Vulkan NGX/DLSS runtime is not enabled in this build"
+            : dlssUnavailableReason_);
+    status.dlssRayReconstructionAvailable =
+        dlssRayReconstructionCapabilityAvailable_ && !dlssRayReconstructionFeatureCreationFailed_;
+    status.dlssRayReconstructionUnavailableReason = status.dlssRayReconstructionAvailable
+        ? std::string{}
+        : (dlssRayReconstructionUnavailableReason_.empty()
+            ? "DLSS Ray Reconstruction is not available in this NGX runtime"
+            : dlssRayReconstructionUnavailableReason_);
+    status.dlssFrameGenerationAvailable =
+        dlssFrameGenerationCapabilityAvailable_ && dlssFrameGenerationPresentationAvailable_;
+    status.dlssFrameGenerationUnavailableReason = status.dlssFrameGenerationAvailable
+        ? std::string{}
+        : (dlssFrameGenerationUnavailableReason_.empty()
+            ? "DLSS Frame Generation is not available in this NGX runtime"
+            : dlssFrameGenerationUnavailableReason_);
+#else
+    status.dlssUnavailableReason = "DLSS SDK is not configured; set DLSS_SDK_DIR when configuring CMake";
+    status.dlssRayReconstructionUnavailableReason = status.dlssUnavailableReason;
+    status.dlssFrameGenerationUnavailableReason = status.dlssUnavailableReason;
+#endif
+    return status;
+}
+
+DenoiserBackend PathTracerRenderer::effectiveDenoiserBackend() const {
+    if (settings_.debugView != RendererDebugView::Beauty) {
+        return DenoiserBackend::Engine;
+    }
+    if (settings_.denoiserBackend == DenoiserBackend::Nrd && nvidiaIntegrationStatus().nrdAvailable) {
+        return DenoiserBackend::Nrd;
+    }
+    return DenoiserBackend::Engine;
+}
+
+TemporalUpscaler PathTracerRenderer::effectiveTemporalUpscaler() const {
+    if (settings_.temporalUpscaler == TemporalUpscaler::Dlss && nvidiaIntegrationStatus().dlssAvailable) {
+        return TemporalUpscaler::Dlss;
+    }
+    return TemporalUpscaler::TaaTsr;
+}
+
+bool PathTracerRenderer::dlssRayReconstructionActive() const {
+    return shouldRunDlssRayReconstruction();
+}
+
+void PathTracerRenderer::initializeNrdRuntime() {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    nrdUnavailableReason_.clear();
+    nrdCreationFailed_ = false;
+    nrdAvailable_ = false;
+    nrdRuntime_.reset();
+    if (!context_.supportsNrdShaderStorageFeatures()) {
+        nrdUnavailableReason_ = "NRD requires 8-bit and 16-bit uniform/storage buffer access features";
+        nrdCreationFailed_ = true;
+        return;
+    }
+    try {
+        auto runtime = std::make_unique<NrdRuntime>();
+        runtime->libraryDesc = nrd::GetLibraryDesc();
+        if (runtime->libraryDesc == nullptr) {
+            nrdUnavailableReason_ = "NRD library descriptor is unavailable";
+            nrdCreationFailed_ = true;
+            return;
+        }
+        const nrd::DenoiserDesc denoiserDesc{
+            .identifier = 1u,
+            .denoiser = nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR,
+        };
+        nrd::InstanceCreationDesc creationDesc{};
+        creationDesc.denoisers = &denoiserDesc;
+        creationDesc.denoisersNum = 1u;
+        nrd::Result result = nrd::CreateInstance(creationDesc, runtime->instance);
+        if (result != nrd::Result::SUCCESS || runtime->instance == nullptr) {
+            nrdUnavailableReason_ = std::string("nrd::CreateInstance failed: ") + nrdResultName(result);
+            nrdCreationFailed_ = true;
+            return;
+        }
+        runtime->instanceDesc = nrd::GetInstanceDesc(*runtime->instance);
+        if (runtime->instanceDesc == nullptr || runtime->instanceDesc->pipelines == nullptr || runtime->instanceDesc->pipelinesNum == 0u) {
+            nrdUnavailableReason_ = "NRD instance did not expose Vulkan pipelines";
+            nrdCreationFailed_ = true;
+            return;
+        }
+
+        std::map<std::vector<VkDescriptorSetLayoutBinding>, VkDescriptorSetLayout> emptyLayoutCache;
+        (void)emptyLayoutCache;
+        runtime->pipelines.reserve(runtime->instanceDesc->pipelinesNum);
+        VkDescriptorSetLayout emptyLayout = layoutCache_->createLayout({});
+        for (uint32_t pipelineIndex = 0; pipelineIndex < runtime->instanceDesc->pipelinesNum; ++pipelineIndex) {
+            const nrd::PipelineDesc& pipelineDesc = runtime->instanceDesc->pipelines[pipelineIndex];
+            if (pipelineDesc.computeShaderSPIRV.bytecode == nullptr || pipelineDesc.computeShaderSPIRV.size == 0u) {
+                std::ostringstream reason;
+                reason << "NRD pipeline " << pipelineIndex << " has no embedded SPIR-V bytecode";
+                nrdUnavailableReason_ = reason.str();
+                nrdCreationFailed_ = true;
+                nrdRuntime_ = std::move(runtime);
+                shutdownNrdRuntime();
+                return;
+            }
+            if ((pipelineDesc.computeShaderSPIRV.size % sizeof(uint32_t)) != 0u) {
+                std::ostringstream reason;
+                reason << "NRD pipeline " << pipelineIndex << " SPIR-V bytecode size is not 32-bit aligned";
+                nrdUnavailableReason_ = reason.str();
+                nrdCreationFailed_ = true;
+                nrdRuntime_ = std::move(runtime);
+                shutdownNrdRuntime();
+                return;
+            }
+            std::vector<uint32_t> spirv(pipelineDesc.computeShaderSPIRV.size / sizeof(uint32_t));
+            std::memcpy(spirv.data(), pipelineDesc.computeShaderSPIRV.bytecode, pipelineDesc.computeShaderSPIRV.size);
+
+            NrdRuntime::PipelineState state{};
+            state.shader = std::make_unique<ShaderModule>(context_.device(), std::move(spirv), pipelineDesc.shaderIdentifier);
+            state.bindings = state.shader->reflection().bindings;
+            uint32_t maxSet = 0;
+            for (const ReflectedBinding& binding : state.bindings) {
+                maxSet = std::max(maxSet, binding.set);
+            }
+            state.setLayouts.resize(maxSet + 1u, emptyLayout);
+            for (uint32_t set = 0; set <= maxSet; ++set) {
+                auto bindings = ShaderReflection::bindingsForSet({state.shader->reflection()}, set);
+                if (!bindings.empty()) {
+                    state.setLayouts[set] = layoutCache_->createLayout(std::move(bindings));
+                }
+            }
+            state.pipeline = std::make_unique<ComputePipeline>(
+                context_.device(),
+                *state.shader,
+                state.setLayouts,
+                ShaderReflection::mergePushConstants({state.shader->reflection()}),
+                *pipelineCache_,
+                runtime->instanceDesc->shaderEntryPoint);
+            runtime->pipelines.push_back(std::move(state));
+        }
+
+        const VkDeviceSize constantMax = std::max<VkDeviceSize>(runtime->instanceDesc->constantBufferMaxDataSize, 16u);
+        runtime->constantStride = alignUniformOffset(constantMax);
+        runtime->constantsPerFrameSize = runtime->constantStride * std::max(1u, runtime->instanceDesc->descriptorPoolDesc.setsMaxNum);
+        runtime->constantBuffers.resize(kRendererFramesInFlight);
+        for (Buffer& buffer : runtime->constantBuffers) {
+            buffer.create(allocator_, BufferDesc{
+                .size = runtime->constantsPerFrameSize,
+                .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                .memory = BufferMemory::Upload,
+                .persistentMapped = true,
+                .debugName = "nrd constants",
+            });
+        }
+
+        nrdRuntime_ = std::move(runtime);
+        nrdAvailable_ = true;
+        std::cout << "NRD runtime: v"
+                  << static_cast<uint32_t>(nrdRuntime_->libraryDesc->versionMajor) << "."
+                  << static_cast<uint32_t>(nrdRuntime_->libraryDesc->versionMinor) << "."
+                  << static_cast<uint32_t>(nrdRuntime_->libraryDesc->versionBuild)
+                  << " pipelines=" << nrdRuntime_->pipelines.size() << '\n';
+    } catch (const std::exception& e) {
+        nrdUnavailableReason_ = std::string("NRD runtime initialization failed: ") + e.what();
+        nrdCreationFailed_ = true;
+        nrdAvailable_ = false;
+        nrdRuntime_.reset();
+    }
+#elif defined(RTV_NRD_SDK_CONFIGURED)
+    nrdUnavailableReason_ = "NRD SDK headers were found, but NRD static runtime was not linked; check NRD_SDK_DIR";
+#else
+    nrdUnavailableReason_ = "NRD SDK is not configured; set NRD_SDK_DIR when configuring CMake";
+#endif
+}
+
+void PathTracerRenderer::shutdownNrdRuntime() {
+    nrdAvailable_ = false;
+    nrdRuntime_.reset();
+}
+
+void PathTracerRenderer::createNrdResolutionResources() {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    if (!nrdRuntime_ || !nrdAvailable_ || nrdRuntime_->instanceDesc == nullptr) {
+        return;
+    }
+    NrdRuntime& runtime = *nrdRuntime_;
+    runtime.extent = renderExtent_;
+    runtime.resourcesReady = false;
+    auto createImage = [this](Image& image, VkFormat format, const char* name) {
+        image.create(allocator_, ImageDesc{
+            .width = renderExtent_.width,
+            .height = renderExtent_.height,
+            .format = format,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .debugName = name,
+        });
+    };
+    createImage(runtime.motionVectors, VK_FORMAT_R16G16_SFLOAT, "nrd motion vectors");
+    createImage(runtime.normalRoughness, VK_FORMAT_R16G16B16A16_SFLOAT, "nrd normal roughness");
+    createImage(runtime.viewZ, VK_FORMAT_R32_SFLOAT, "nrd view z");
+    createImage(runtime.diffRadianceHitdist, VK_FORMAT_R16G16B16A16_SFLOAT, "nrd input diffuse radiance hitdist");
+    createImage(runtime.specRadianceHitdist, VK_FORMAT_R16G16B16A16_SFLOAT, "nrd input specular radiance hitdist");
+    createImage(runtime.outDiffRadianceHitdist, VK_FORMAT_R16G16B16A16_SFLOAT, "nrd output diffuse radiance hitdist");
+    createImage(runtime.outSpecRadianceHitdist, VK_FORMAT_R16G16B16A16_SFLOAT, "nrd output specular radiance hitdist");
+    createImage(runtime.fallbackImage, VK_FORMAT_R16G16B16A16_SFLOAT, "nrd fallback image");
+
+    auto createPoolImages = [this](const nrd::TextureDesc* descs, uint32_t count, const char* prefix) {
+        std::vector<Image> images;
+        images.resize(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const nrd::TextureDesc& desc = descs[i];
+            const uint32_t downsample = std::max<uint32_t>(desc.downsampleFactor, 1u);
+            const uint32_t width = std::max(1u, (renderExtent_.width + downsample - 1u) / downsample);
+            const uint32_t height = std::max(1u, (renderExtent_.height + downsample - 1u) / downsample);
+            const std::string name = std::string(prefix) + " " + std::to_string(i);
+            images[i].create(allocator_, ImageDesc{
+                .width = width,
+                .height = height,
+                .format = nrdFormatToVk(desc.format),
+                .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                .debugName = name.c_str(),
+            });
+        }
+        return images;
+    };
+    runtime.permanentPoolImages = createPoolImages(runtime.instanceDesc->permanentPool, runtime.instanceDesc->permanentPoolSize, "nrd permanent pool");
+    runtime.transientPoolImages = createPoolImages(runtime.instanceDesc->transientPool, runtime.instanceDesc->transientPoolSize, "nrd transient pool");
+    runtime.resourcesReady = true;
+#else
+    (void)this;
+#endif
+}
+
+void PathTracerRenderer::initializeDlssRuntime() {
+#if defined(RTV_DLSS_NGX_ENABLED)
+    dlssUnavailableReason_.clear();
+    dlssRayReconstructionUnavailableReason_.clear();
+    dlssFrameGenerationUnavailableReason_.clear();
+    dlssFeatureCreationFailed_ = false;
+    dlssRayReconstructionFeatureCreationFailed_ = false;
+    dlssCapabilityAvailable_ = false;
+    dlssRayReconstructionCapabilityAvailable_ = false;
+    dlssFrameGenerationCapabilityAvailable_ = false;
+    dlssFrameGenerationPresentationAvailable_ = false;
+    std::error_code ec;
+    std::filesystem::path appDataPath = shaderOutputDirectory_.empty()
+        ? (std::filesystem::current_path(ec) / "ngx")
+        : (shaderOutputDirectory_ / "ngx");
+    if (ec) {
+        appDataPath = std::filesystem::path("ngx");
+    }
+    std::filesystem::create_directories(appDataPath, ec);
+    if (ec) {
+        dlssUnavailableReason_ = "DLSS NGX app-data directory could not be created: " + ec.message();
+        return;
+    }
+
+    const std::filesystem::path runtimePath = std::filesystem::path(RTV_DLSS_RUNTIME_DIR);
+    const std::wstring runtimePathWide = runtimePath.wstring();
+    const wchar_t* runtimePaths[] = { runtimePathWide.c_str() };
+    NVSDK_NGX_FeatureCommonInfo featureInfo{};
+    featureInfo.PathListInfo.Path = runtimePaths;
+    featureInfo.PathListInfo.Length = 1;
+    featureInfo.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
+    featureInfo.LoggingInfo.DisableOtherLoggingSinks = false;
+
+    const std::wstring appDataWide = appDataPath.wstring();
+    NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_Init_with_ProjectID(
+        "a0f57b54-1daf-4934-90ae-c4035c19df04",
+        NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+        "0.1.0",
+        appDataWide.c_str(),
+        context_.instance(),
+        context_.physicalDevice(),
+        context_.device(),
+        vkGetInstanceProcAddr,
+        vkGetDeviceProcAddr,
+        &featureInfo,
+        NVSDK_NGX_Version_API);
+    if (NVSDK_NGX_FAILED(result)) {
+        dlssUnavailableReason_ = ngxFailureMessage("NVSDK_NGX_VULKAN_Init_with_ProjectID", result);
+        return;
+    }
+
+    dlssNgxInitialized_ = true;
+    NVSDK_NGX_Parameter* parameters = nullptr;
+    result = NVSDK_NGX_VULKAN_GetCapabilityParameters(&parameters);
+    if (NVSDK_NGX_FAILED(result) || parameters == nullptr) {
+        dlssUnavailableReason_ = ngxFailureMessage("NVSDK_NGX_VULKAN_GetCapabilityParameters", result);
+        shutdownDlssRuntime();
+        return;
+    }
+    dlssParameters_ = parameters;
+
+    dlssCapabilityAvailable_ = queryNgxCapability(
+        parameters,
+        NVSDK_NGX_Parameter_SuperSampling_Available,
+        NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver,
+        NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor,
+        NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor,
+        "DLSS Super Resolution",
+        dlssUnavailableReason_);
+    dlssRayReconstructionCapabilityAvailable_ = queryNgxCapability(
+        parameters,
+        NVSDK_NGX_Parameter_SuperSamplingDenoising_Available,
+        NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver,
+        NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor,
+        NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMinor,
+        "DLSS Ray Reconstruction",
+        dlssRayReconstructionUnavailableReason_);
+    dlssFrameGenerationCapabilityAvailable_ = queryNgxCapability(
+        parameters,
+        NVSDK_NGX_Parameter_FrameGeneration_Available,
+        NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver,
+        NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMajor,
+        NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMinor,
+        "DLSS Frame Generation",
+        dlssFrameGenerationUnavailableReason_);
+    if (dlssFrameGenerationCapabilityAvailable_) {
+        dlssFrameGenerationUnavailableReason_ =
+            "DLSS Frame Generation NGX capability is present, but this renderer does not yet insert generated frames into the swapchain presentation loop";
+    }
+    if (!dlssCapabilityAvailable_ && !dlssRayReconstructionCapabilityAvailable_ && !dlssFrameGenerationCapabilityAvailable_) {
+        return;
+    }
+
+    std::cout << "DLSS runtime: NGX initialized from " << runtimePath.string() << '\n';
+#elif defined(RTV_DLSS_SDK_CONFIGURED)
+    dlssUnavailableReason_ = "DLSS SDK headers were found, but NGX link/runtime files were not found; check DLSS_SDK_DIR/lib/Windows_x86_64";
+    dlssRayReconstructionUnavailableReason_ = dlssUnavailableReason_;
+    dlssFrameGenerationUnavailableReason_ = dlssUnavailableReason_;
+#else
+    dlssUnavailableReason_ = "DLSS SDK is not configured; set DLSS_SDK_DIR when configuring CMake";
+    dlssRayReconstructionUnavailableReason_ = dlssUnavailableReason_;
+    dlssFrameGenerationUnavailableReason_ = dlssUnavailableReason_;
+#endif
+}
+
+void PathTracerRenderer::shutdownDlssRuntime() {
+#if defined(RTV_DLSS_NGX_ENABLED)
+    releaseDlssFeature();
+    releaseDlssRayReconstructionFeature();
+    if (dlssParameters_ != nullptr && dlssNgxInitialized_) {
+        NVSDK_NGX_VULKAN_DestroyParameters(reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_));
+        dlssParameters_ = nullptr;
+    }
+    if (dlssNgxInitialized_) {
+        NVSDK_NGX_VULKAN_Shutdown1(context_.device());
+        dlssNgxInitialized_ = false;
+    }
+#else
+    dlssParameters_ = nullptr;
+    dlssHandle_ = nullptr;
+    dlssRayReconstructionHandle_ = nullptr;
+    dlssNgxInitialized_ = false;
+#endif
+    dlssCapabilityAvailable_ = false;
+    dlssRayReconstructionCapabilityAvailable_ = false;
+    dlssFrameGenerationCapabilityAvailable_ = false;
+    dlssFrameGenerationPresentationAvailable_ = false;
+}
+
+void PathTracerRenderer::releaseDlssFeature() {
+#if defined(RTV_DLSS_NGX_ENABLED)
+    if (dlssHandle_ != nullptr) {
+        NVSDK_NGX_VULKAN_ReleaseFeature(reinterpret_cast<NVSDK_NGX_Handle*>(dlssHandle_));
+        dlssHandle_ = nullptr;
+    }
+#else
+    dlssHandle_ = nullptr;
+#endif
+    dlssFeatureRenderExtent_ = {};
+    dlssFeatureOutputExtent_ = {};
+}
+
+void PathTracerRenderer::releaseDlssRayReconstructionFeature() {
+#if defined(RTV_DLSS_NGX_ENABLED)
+    if (dlssRayReconstructionHandle_ != nullptr) {
+        NVSDK_NGX_VULKAN_ReleaseFeature(reinterpret_cast<NVSDK_NGX_Handle*>(dlssRayReconstructionHandle_));
+        dlssRayReconstructionHandle_ = nullptr;
+    }
+#else
+    dlssRayReconstructionHandle_ = nullptr;
+#endif
+    dlssRayReconstructionFeatureRenderExtent_ = {};
+    dlssRayReconstructionFeatureOutputExtent_ = {};
 }
 
 void PathTracerRenderer::setCameraPose(glm::vec3 position, glm::vec3 forward) {
@@ -2122,6 +2945,8 @@ VkDescriptorImageInfo PathTracerRenderer::viewportImageDescriptor() const {
 }
 
 void PathTracerRenderer::retireResolutionResources() {
+    releaseDlssFeature();
+    releaseDlssRayReconstructionFeature();
     RetiredResolutionResources retired{};
     retired.releaseFrame = temporalFrameIndex_ + static_cast<uint32_t>(std::max<size_t>(frames_.size(), 1)) + 1u;
     auto retireImage = [&](Image& image) {
@@ -2156,6 +2981,20 @@ void PathTracerRenderer::retireResolutionResources() {
     retireImage(momentDebugResolvedImage_);
     retireImage(taaImage_);
     retireImage(taaHistoryImage_);
+    retireImage(dlssDepthImage_);
+    retireImage(dlssMotionVectorImage_);
+    retireImage(dlssDiffuseAlbedoImage_);
+    retireImage(dlssSpecularAlbedoImage_);
+    retireImage(dlssNormalImage_);
+    retireImage(dlssRoughnessImage_);
+    retireImage(dlssDiffuseHitDistanceImage_);
+    retireImage(dlssSpecularHitDistanceImage_);
+    retireImage(dlssReflectedAlbedoImage_);
+    retireImage(dlssDisocclusionMaskImage_);
+    retireImage(dlssDiffuseRayDirectionImage_);
+    retireImage(dlssSpecularRayDirectionImage_);
+    retireImage(dlssDiffuseRayDirectionHitDistanceImage_);
+    retireImage(dlssSpecularRayDirectionHitDistanceImage_);
     retireImage(presentationImage_);
 
     retireBuffer(cameraBuffer_);
@@ -2206,6 +3045,25 @@ void PathTracerRenderer::retireResolutionResources() {
     retireBuffer(selectionParamsBuffer_);
     retireBuffer(histogramBuffer_);
     retireBuffer(exposureBuffer_);
+    if (nrdRuntime_) {
+        retireImage(nrdRuntime_->motionVectors);
+        retireImage(nrdRuntime_->normalRoughness);
+        retireImage(nrdRuntime_->viewZ);
+        retireImage(nrdRuntime_->diffRadianceHitdist);
+        retireImage(nrdRuntime_->specRadianceHitdist);
+        retireImage(nrdRuntime_->outDiffRadianceHitdist);
+        retireImage(nrdRuntime_->outSpecRadianceHitdist);
+        retireImage(nrdRuntime_->fallbackImage);
+        for (Image& image : nrdRuntime_->permanentPoolImages) {
+            retireImage(image);
+        }
+        for (Image& image : nrdRuntime_->transientPoolImages) {
+            retireImage(image);
+        }
+        nrdRuntime_->permanentPoolImages.clear();
+        nrdRuntime_->transientPoolImages.clear();
+        nrdRuntime_->resourcesReady = false;
+    }
 
     if (!retired.images.empty() || !retired.buffers.empty()) {
         validationLog_.recordPass("deferred resolution resource retirement release_frame=" + std::to_string(retired.releaseFrame));
@@ -2378,7 +3236,7 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .width = displayExtent.width,
         .height = displayExtent.height,
         .format = VK_FORMAT_R16G16B16A16_SFLOAT,
-        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .debugName = "path tracer taa hdr",
     });
     taaHistoryImage_.create(allocator_, ImageDesc{
@@ -2388,6 +3246,105 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .debugName = "path tracer taa history",
     });
+    dlssDepthImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R32_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss linear depth guide",
+    });
+    dlssMotionVectorImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss motion vector guide",
+    });
+    dlssDiffuseAlbedoImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr diffuse albedo guide",
+    });
+    dlssSpecularAlbedoImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr specular albedo guide",
+    });
+    dlssNormalImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr normal guide",
+    });
+    dlssRoughnessImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R32_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr roughness guide",
+    });
+    dlssDiffuseHitDistanceImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R32_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr diffuse hit distance guide",
+    });
+    dlssSpecularHitDistanceImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R32_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr specular hit distance guide",
+    });
+    dlssReflectedAlbedoImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr reflected albedo guide",
+    });
+    dlssDisocclusionMaskImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R32_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr disocclusion mask guide",
+    });
+    dlssDiffuseRayDirectionImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr diffuse ray direction guide",
+    });
+    dlssSpecularRayDirectionImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr specular ray direction guide",
+    });
+    dlssDiffuseRayDirectionHitDistanceImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R32_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr diffuse ray direction hit distance guide",
+    });
+    dlssSpecularRayDirectionHitDistanceImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R32_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .debugName = "dlss rr specular ray direction hit distance guide",
+    });
+    createNrdResolutionResources();
     presentationImage_.create(allocator_, ImageDesc{
         .width = displayExtent.width,
         .height = displayExtent.height,
@@ -2781,7 +3738,7 @@ void PathTracerRenderer::updateCamera() {
         settings_.motionBlurEnabled && context_.supportsRayTracingMotionBlur() ? 1.0f : 0.0f,
         settings_.motionBlurShutterOpen,
         settings_.motionBlurShutterClose,
-        0.0f);
+        shouldRunDlssRayReconstruction() ? 1.0f : 0.0f);
     camera_.volumeControls = glm::vec4(
         settings_.homogeneousVolumeEnabled ? 1.0f : 0.0f,
         settings_.homogeneousVolumeScattering,
@@ -2797,15 +3754,19 @@ void PathTracerRenderer::updateCamera() {
     camera_.frameCount = frameCount_;
     camera_.temporalFrameIndex = settings_.fixedSeed.has_value() ? *settings_.fixedSeed : temporalFrameIndex_;
 
-    if (cameraChangedThisFrame_) {
+    const bool cameraMovingForTemporal = cameraChangedThisFrame_;
+    const bool suppressJitterForDebugView = settings_.debugView == RendererDebugView::MotionVectors;
+    if (cameraMovingForTemporal) {
         stillFrameCount_ = 0;
     } else {
         stillFrameCount_ = std::min(stillFrameCount_ + 1u, 60u);
     }
     const bool restoreFullJitter = stillFrameCount_ >= 2u;
-    const float effectiveJitterScale = cameraChangedThisFrame_ ? 0.0f : (restoreFullJitter ? 1.0f : 0.0f);
+    const float effectiveJitterScale = (cameraMovingForTemporal || suppressJitterForDebugView)
+        ? 0.0f
+        : (restoreFullJitter ? 1.0f : 0.0f);
     camera_.effectiveJitterScale = effectiveJitterScale;
-    camera_.cameraMoving = cameraChangedThisFrame_ ? 1u : 0u;
+    camera_.cameraMoving = cameraMovingForTemporal ? 1u : 0u;
 
     const float aspect = renderExtent_.height > 0 ? static_cast<float>(renderExtent_.width) / static_cast<float>(renderExtent_.height) : 1.0f;
     const glm::vec3 eye = glm::vec3(camera_.pos);
@@ -2813,7 +3774,13 @@ void PathTracerRenderer::updateCamera() {
     const glm::mat4 view = glm::lookAtRH(eye, center, glm::normalize(glm::vec3(camera_.up)));
     glm::mat4 projection = glm::perspectiveRH_ZO(camera_.fovY, aspect, 0.01f, 1000.0f);
     projection[1][1] *= -1.0f;
-    const bool jitterEnabled = settings_.pathTracingEnabled && settings_.taaEnabled && settings_.cameraJitterEnabled && effectiveJitterScale > 0.0f && renderExtent_.width > 0 && renderExtent_.height > 0;
+    const glm::mat4 nonJitteredProjection = projection;
+    const bool jitterEnabled = settings_.pathTracingEnabled &&
+        settings_.taaEnabled &&
+        settings_.cameraJitterEnabled &&
+        effectiveJitterScale > 0.0f &&
+        renderExtent_.width > 0 &&
+        renderExtent_.height > 0;
     const uint32_t jitterBase = settings_.fixedSeed.has_value() ? *settings_.fixedSeed : temporalFrameIndex_;
     const uint32_t jitterIndex = settings_.fixedSeed.has_value() ? jitterBase : (jitterBase + 1u);
     const glm::vec2 currentJitter = jitterEnabled
@@ -2836,18 +3803,10 @@ void PathTracerRenderer::updateCamera() {
     frameUniforms.write(&prevCamera_, sizeof(prevCamera_), kFramePrevCameraUniformOffset);
     frameUniforms.flush(sizeof(prevCamera_), kFramePrevCameraUniformOffset);
 
-    const bool denoiserDebugView =
-        debugParams_.view <= 4u ||
-        debugParams_.view == static_cast<uint32_t>(RendererDebugView::MotionVectors) ||
-        debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalReactiveMask) ||
-        debugParams_.view == static_cast<uint32_t>(RendererDebugView::TemporalHistoryWeight) ||
-        (debugParams_.view >= static_cast<uint32_t>(RendererDebugView::PathDirectDiffuse) &&
-         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularHistoryWeight)) ||
-        (debugParams_.view >= static_cast<uint32_t>(RendererDebugView::DenoiserDirectDiffuseVariance) &&
-         debugParams_.view <= static_cast<uint32_t>(RendererDebugView::DenoiserSpecularRawVariance));
+    const bool denoiserDebugView = !isNonDenoiserDebugView();
     const bool allowDenoiserForDebugView = denoiserDebugView;
-    const bool stablePreview = shouldRunTaa();
-    const bool allowDenoiserWhileMoving = settings_.denoiseWhileMoving || stablePreview || !cameraChangedThisFrame_;
+    const bool stablePreview = shouldRunTaa() || shouldRunDlss();
+    const bool allowDenoiserWhileMoving = settings_.denoiseWhileMoving || stablePreview || !cameraMovingForTemporal;
     denoiserParams_.enabled = settings_.pathTracingEnabled && settings_.denoiserEnabled && allowDenoiserForDebugView && allowDenoiserWhileMoving && !adaptiveSkipDenoiser_ ? 1u : 0u;
     denoiserParams_.strength = settings_.denoiserStrength;
     denoiserParams_.frameCount = temporalFrameIndex_;
@@ -2866,19 +3825,19 @@ void PathTracerRenderer::updateCamera() {
     frameUniforms.write(&denoiserParams_, sizeof(denoiserParams_), kFrameDenoiserParamsOffset);
     frameUniforms.flush(sizeof(denoiserParams_), kFrameDenoiserParamsOffset);
 
-    taaParams_.enabled = shouldRunTaa() ? 1u : 0u;
+    taaParams_.enabled = (shouldRunTaa() || shouldRunDlss() || shouldRunDlssRayReconstruction()) ? 1u : 0u;
     taaParams_.frameCount = temporalFrameIndex_;
     taaParams_.width = displayExtent_.width;
     taaParams_.height = displayExtent_.height;
-    const float taaFeedback = cameraChangedThisFrame_
+    const float taaFeedback = cameraMovingForTemporal
         ? std::min(settings_.taaFeedback, 0.05f)
         : settings_.taaFeedback;
     taaParams_.feedback = std::clamp(taaFeedback, 0.01f, 0.5f);
-    taaParams_.velocityScale = 64.0f;
+    taaParams_.velocityScale = 512.0f;
     taaParams_.resetHistory = temporalCameraCut ? 1u : 0u;
     taaParams_.sharpeningStrength = settings_.taaSharpeningStrength;
     taaParams_.historyValid = taaHistoryValid_ ? 1u : 0u;
-    taaParams_.cameraMoving = cameraChangedThisFrame_ ? 1u : 0u;
+    taaParams_.cameraMoving = cameraMovingForTemporal ? 1u : 0u;
     taaParams_.renderWidth = renderExtent_.width;
     taaParams_.renderHeight = renderExtent_.height;
     taaParams_.motionFeedback = settings_.taaMotionFeedback;
@@ -2890,7 +3849,7 @@ void PathTracerRenderer::updateCamera() {
             "temporal state temporal=" + std::to_string(temporalFrameIndex_) +
             " accumulation=" + std::to_string(frameCount_) +
             " jitterScale=" + std::to_string(effectiveJitterScale) +
-            " moving=" + std::to_string(cameraChangedThisFrame_ ? 1u : 0u) +
+            " moving=" + std::to_string(cameraMovingForTemporal ? 1u : 0u) +
             " taaHistory=" + std::to_string(taaHistoryValid_ ? 1u : 0u) +
             " taaFeedback=" + std::to_string(taaParams_.feedback));
     }
@@ -2920,6 +3879,10 @@ void PathTracerRenderer::updateCamera() {
     frameUniforms.flush(sizeof(debugParams_), kFrameDebugParamsOffset);
 
     previousViewProj_ = viewProj;
+    nrdViewToClipPrev_ = nrdViewToClip_;
+    nrdWorldToViewPrev_ = nrdWorldToView_;
+    nrdViewToClip_ = nonJitteredProjection;
+    nrdWorldToView_ = view;
     previousCameraPos_ = camera_.pos;
     previousJitter_ = currentJitter;
 }
@@ -2988,7 +3951,16 @@ bool PathTracerRenderer::recordAsyncComputeWork(VkCommandBuffer commandBuffer) {
 }
 
 void PathTracerRenderer::recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy) {
-    if (shouldRunDenoiser()) {
+    const bool runDlssRayReconstruction = shouldRunDlssRayReconstruction();
+    if (runDlssRayReconstruction) {
+        (void)deferHistoryCopy;
+        skipDenoiserPass(commandBuffer);
+        recordDlssRayReconstruction(commandBuffer);
+    } else if (shouldRunNrdDenoiser()) {
+        recordNrdDenoiser(commandBuffer);
+        (void)deferHistoryCopy;
+        copyNrdHistoryResources(commandBuffer);
+    } else if (shouldRunDenoiser()) {
         recordMomentUpdate(commandBuffer);
         recordDenoiser(commandBuffer);
         if (deferHistoryCopy) {
@@ -2999,8 +3971,12 @@ void PathTracerRenderer::recordPostTraceCompute(VkCommandBuffer commandBuffer, b
     } else {
         skipDenoiserPass(commandBuffer);
     }
-    if (shouldRunTaa()) {
-        recordTaa(commandBuffer, deferHistoryCopy);
+    if (!runDlssRayReconstruction) {
+        if (shouldRunDlss()) {
+            recordDlss(commandBuffer);
+        } else if (shouldRunTaa()) {
+            recordTaa(commandBuffer, deferHistoryCopy);
+        }
     }
     if (settings_.autoExposureEnabled) {
         recordAutoExposure(commandBuffer);
@@ -4758,6 +5734,30 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId indirectSpecularResolvedMoments = graph.createTexture(imageResource(indirectSpecularResolvedMomentsImage_, "current indirect specular moments"));
     const RenderGraphResourceId historyLengthResolved = graph.createTexture(imageResource(historyLengthResolvedImage_, "current history length"));
     const RenderGraphResourceId momentDebugResolved = graph.createTexture(imageResource(momentDebugResolvedImage_, "current moment debug"));
+    RenderGraphResourceId nrdMotion{};
+    RenderGraphResourceId nrdNormalRoughness{};
+    RenderGraphResourceId nrdViewZ{};
+    RenderGraphResourceId nrdDiffIn{};
+    RenderGraphResourceId nrdSpecIn{};
+    RenderGraphResourceId nrdDiffOut{};
+    RenderGraphResourceId nrdSpecOut{};
+    std::vector<RenderGraphResourceId> nrdPoolResources;
+    if (shouldRunNrdDenoiser() && nrdRuntime_) {
+        nrdMotion = graph.createTexture(imageResource(nrdRuntime_->motionVectors, "nrd motion vectors"));
+        nrdNormalRoughness = graph.createTexture(imageResource(nrdRuntime_->normalRoughness, "nrd normal roughness"));
+        nrdViewZ = graph.createTexture(imageResource(nrdRuntime_->viewZ, "nrd view z"));
+        nrdDiffIn = graph.createTexture(imageResource(nrdRuntime_->diffRadianceHitdist, "nrd diffuse input"));
+        nrdSpecIn = graph.createTexture(imageResource(nrdRuntime_->specRadianceHitdist, "nrd specular input"));
+        nrdDiffOut = graph.createTexture(imageResource(nrdRuntime_->outDiffRadianceHitdist, "nrd diffuse output"));
+        nrdSpecOut = graph.createTexture(imageResource(nrdRuntime_->outSpecRadianceHitdist, "nrd specular output"));
+        nrdPoolResources.reserve(nrdRuntime_->permanentPoolImages.size() + nrdRuntime_->transientPoolImages.size());
+        for (Image& image : nrdRuntime_->permanentPoolImages) {
+            nrdPoolResources.push_back(graph.createTexture(imageResource(image, "nrd permanent pool")));
+        }
+        for (Image& image : nrdRuntime_->transientPoolImages) {
+            nrdPoolResources.push_back(graph.createTexture(imageResource(image, "nrd transient pool")));
+        }
+    }
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     RenderGraphResourceId wavefrontRestirReservoir{};
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
@@ -5105,7 +6105,48 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     }
 
     RenderGraphResourceId toneInput = raw;
-    if (shouldRunDenoiser()) {
+    if (shouldRunNrdDenoiser()) {
+        graph.addPass("nrd_prepare")
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
+            .addStorageRead(pathData, PipelineDomain::Compute)
+            .addStorageWrite(nrdMotion, PipelineDomain::Compute)
+            .addStorageWrite(nrdNormalRoughness, PipelineDomain::Compute)
+            .addStorageWrite(nrdViewZ, PipelineDomain::Compute)
+            .addStorageWrite(nrdDiffIn, PipelineDomain::Compute)
+            .addStorageWrite(nrdSpecIn, PipelineDomain::Compute);
+        RenderGraphPass& nrdDispatch = graph.addPass("nrd_reblur")
+            .addStorageReadWrite(nrdMotion, PipelineDomain::Compute)
+            .addStorageReadWrite(nrdNormalRoughness, PipelineDomain::Compute)
+            .addStorageReadWrite(nrdViewZ, PipelineDomain::Compute)
+            .addStorageReadWrite(nrdDiffIn, PipelineDomain::Compute)
+            .addStorageReadWrite(nrdSpecIn, PipelineDomain::Compute)
+            .addStorageReadWrite(nrdDiffOut, PipelineDomain::Compute)
+            .addStorageReadWrite(nrdSpecOut, PipelineDomain::Compute);
+        for (RenderGraphResourceId resource : nrdPoolResources) {
+            nrdDispatch.addStorageReadWrite(resource, PipelineDomain::Compute);
+        }
+        graph.addPass("nrd_resolve")
+            .addStorageRead(raw, PipelineDomain::Compute)
+            .addStorageRead(nrdDiffOut, PipelineDomain::Compute)
+            .addStorageRead(nrdSpecOut, PipelineDomain::Compute)
+            .addStorageRead(pathData, PipelineDomain::Compute)
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageWrite(denoised, PipelineDomain::Compute);
+        RenderGraphPass& historyCopyPass = graph.addPass("history_copy")
+            .addStorageRead(denoised, PipelineDomain::Transfer)
+            .addStorageWrite(history, PipelineDomain::Transfer)
+            .addStorageRead(worldPosition, PipelineDomain::Transfer)
+            .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
+            .addStorageRead(restirReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
+        if (useRestirGiReservoirs) {
+            historyCopyPass
+                .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
+                .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+        }
+        toneInput = denoised;
+    } else if (shouldRunDenoiser()) {
         graph.addPass("moment_update")
             .addStorageReadWrite(directDiffuseMoments, PipelineDomain::Compute)
             .addStorageReadWrite(directSpecularMoments, PipelineDomain::Compute)
@@ -5800,6 +6841,298 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
     currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
+void PathTracerRenderer::recordNrdDenoiser(VkCommandBuffer commandBuffer) {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    if (!shouldRunNrdDenoiser()) {
+        skipDenoiserPass(commandBuffer);
+        return;
+    }
+    recordNrdPreparePass(commandBuffer);
+    if (!recordNrdDispatches(commandBuffer)) {
+        nrdAvailable_ = false;
+        nrdCreationFailed_ = true;
+        validationLog_.recordPass("nrd dispatch failed: " + nrdUnavailableReason_);
+        skipDenoiserCopyPass(commandBuffer);
+        return;
+    }
+    recordNrdResolvePass(commandBuffer);
+#else
+    (void)commandBuffer;
+#endif
+}
+
+void PathTracerRenderer::recordNrdPreparePass(VkCommandBuffer commandBuffer) {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    if (!nrdRuntime_ || !nrdRuntime_->resourcesReady) {
+        return;
+    }
+    validationLog_.recordPass("nrd prepare inputs");
+
+    bufferMemoryBarrier(
+        commandBuffer,
+        pathTraceShaderStage(),
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        depthNormalBuffer_.handle(),
+        depthNormalBuffer_.size());
+    bufferMemoryBarrier(
+        commandBuffer,
+        pathTraceShaderStage(),
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        velocityBuffer_.handle(),
+        velocityBuffer_.size());
+    bufferMemoryBarrier(
+        commandBuffer,
+        pathTraceShaderStage(),
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        pathDataBuffer_.handle(),
+        pathDataBuffer_.size());
+
+    NrdRuntime& runtime = *nrdRuntime_;
+    nrdTransitionImage(commandBuffer, runtime.motionVectors, true);
+    nrdTransitionImage(commandBuffer, runtime.normalRoughness, true);
+    nrdTransitionImage(commandBuffer, runtime.viewZ, true);
+    nrdTransitionImage(commandBuffer, runtime.diffRadianceHitdist, true);
+    nrdTransitionImage(commandBuffer, runtime.specRadianceHitdist, true);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(nrdPrepareSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeImage(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.motionVectors.storageDescriptor())
+        .writeImage(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.normalRoughness.storageDescriptor())
+        .writeImage(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.viewZ.storageDescriptor())
+        .writeImage(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.diffRadianceHitdist.storageDescriptor())
+        .writeImage(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.specRadianceHitdist.storageDescriptor())
+        .writeBuffer(8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
+        .writeBuffer(9, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
+        .update(context_.device(), set);
+
+    nrdPreparePipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, nrdPreparePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    nrdPreparePipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+#else
+    (void)commandBuffer;
+#endif
+}
+
+bool PathTracerRenderer::recordNrdDispatches(VkCommandBuffer commandBuffer) {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    if (!nrdRuntime_ || !nrdRuntime_->instance || !nrdRuntime_->instanceDesc || !nrdRuntime_->resourcesReady) {
+        nrdUnavailableReason_ = "NRD runtime resources are not ready";
+        return false;
+    }
+    NrdRuntime& runtime = *nrdRuntime_;
+    validationLog_.recordPass("nrd reblur dispatch");
+    currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+
+    nrd::CommonSettings common{};
+    nrdCopyMatrix(common.viewToClipMatrix, nrdViewToClip_);
+    nrdCopyMatrix(common.viewToClipMatrixPrev, nrdViewToClipPrev_);
+    nrdCopyMatrix(common.worldToViewMatrix, nrdWorldToView_);
+    nrdCopyMatrix(common.worldToViewMatrixPrev, nrdWorldToViewPrev_);
+    common.motionVectorScale[0] = 1.0f / static_cast<float>(std::max(renderExtent_.width, 1u));
+    common.motionVectorScale[1] = 1.0f / static_cast<float>(std::max(renderExtent_.height, 1u));
+    common.motionVectorScale[2] = 0.0f;
+    common.cameraJitter[0] = camera_.jitter.x / static_cast<float>(std::max(renderExtent_.width, 1u));
+    common.cameraJitter[1] = camera_.jitter.y / static_cast<float>(std::max(renderExtent_.height, 1u));
+    common.cameraJitterPrev[0] = camera_.jitter.z / static_cast<float>(std::max(renderExtent_.width, 1u));
+    common.cameraJitterPrev[1] = camera_.jitter.w / static_cast<float>(std::max(renderExtent_.height, 1u));
+    common.resourceSize[0] = static_cast<uint16_t>(std::min(renderExtent_.width, 65535u));
+    common.resourceSize[1] = static_cast<uint16_t>(std::min(renderExtent_.height, 65535u));
+    common.resourceSizePrev[0] = common.resourceSize[0];
+    common.resourceSizePrev[1] = common.resourceSize[1];
+    common.rectSize[0] = common.resourceSize[0];
+    common.rectSize[1] = common.resourceSize[1];
+    common.rectSizePrev[0] = common.resourceSizePrev[0];
+    common.rectSizePrev[1] = common.resourceSizePrev[1];
+    common.timeDeltaBetweenFrames = frameDeltaSeconds_ > 0.0f ? frameDeltaSeconds_ * 1000.0f : 16.6667f;
+    common.denoisingRange = 500000.0f;
+    common.frameIndex = temporalFrameIndex_;
+    common.accumulationMode = denoiserParams_.resetHistory != 0u
+        ? nrd::AccumulationMode::CLEAR_AND_RESTART
+        : nrd::AccumulationMode::CONTINUE;
+    common.isMotionVectorInWorldSpace = false;
+    common.isHistoryConfidenceAvailable = false;
+    common.isDisocclusionThresholdMixAvailable = false;
+
+    nrd::Result result = nrd::SetCommonSettings(*runtime.instance, common);
+    if (result != nrd::Result::SUCCESS) {
+        nrdUnavailableReason_ = std::string("nrd::SetCommonSettings failed: ") + nrdResultName(result);
+        return false;
+    }
+    nrd::ReblurSettings reblur{};
+    reblur.maxAccumulatedFrameNum = std::min(effectiveDenoiserMaxHistoryLength(), nrd::REBLUR_MAX_HISTORY_FRAME_NUM);
+    reblur.maxFastAccumulatedFrameNum = std::min(4u, reblur.maxAccumulatedFrameNum);
+    reblur.maxStabilizedFrameNum = std::min(12u, reblur.maxAccumulatedFrameNum);
+    reblur.historyFixFrameNum = std::min(2u, reblur.maxFastAccumulatedFrameNum > 0u ? reblur.maxFastAccumulatedFrameNum - 1u : 0u);
+    reblur.fastHistoryClampingSigmaScale = 1.5f;
+    reblur.responsiveAccumulationSettings.roughnessThreshold = 0.35f;
+    reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = std::min(1u, reblur.historyFixFrameNum);
+    result = nrd::SetDenoiserSettings(*runtime.instance, 1u, &reblur);
+    if (result != nrd::Result::SUCCESS) {
+        nrdUnavailableReason_ = std::string("nrd::SetDenoiserSettings failed: ") + nrdResultName(result);
+        return false;
+    }
+
+    const nrd::Identifier identifier = 1u;
+    const nrd::DispatchDesc* dispatches = nullptr;
+    uint32_t dispatchCount = 0;
+    result = nrd::GetComputeDispatches(*runtime.instance, &identifier, 1u, dispatches, dispatchCount);
+    if (result != nrd::Result::SUCCESS || dispatches == nullptr || dispatchCount == 0u) {
+        nrdUnavailableReason_ = std::string("nrd::GetComputeDispatches failed: ") + nrdResultName(result);
+        return false;
+    }
+
+    const uint32_t frameSlot = nrdCurrentFrameSlot(temporalFrameIndex_, runtime.constantBuffers.size());
+    Buffer& constants = runtime.constantBuffers[frameSlot];
+    const nrd::SPIRVBindingOffsets offsets = runtime.libraryDesc->spirvBindingOffsets;
+    for (uint32_t dispatchIndex = 0; dispatchIndex < dispatchCount; ++dispatchIndex) {
+        const nrd::DispatchDesc& dispatch = dispatches[dispatchIndex];
+        if (dispatch.pipelineIndex >= runtime.pipelines.size()) {
+            nrdUnavailableReason_ = "NRD dispatch referenced an invalid pipeline index";
+            return false;
+        }
+        const nrd::PipelineDesc& pipelineDesc = runtime.instanceDesc->pipelines[dispatch.pipelineIndex];
+        NrdRuntime::PipelineState& pipeline = runtime.pipelines[dispatch.pipelineIndex];
+        const VkDeviceSize constantOffset = static_cast<VkDeviceSize>(dispatchIndex) * runtime.constantStride;
+        if (dispatch.constantBufferData != nullptr && dispatch.constantBufferDataSize != 0u) {
+            constants.write(dispatch.constantBufferData, dispatch.constantBufferDataSize, constantOffset);
+            constants.flush(dispatch.constantBufferDataSize, constantOffset);
+        }
+
+        std::vector<VkDescriptorSet> descriptorSets(pipeline.setLayouts.size(), VK_NULL_HANDLE);
+        for (size_t setIndex = 0; setIndex < pipeline.setLayouts.size(); ++setIndex) {
+            descriptorSets[setIndex] = currentFrame_->descriptors().allocate(pipeline.setLayouts[setIndex]).handle();
+        }
+
+        DescriptorWriter constantWriter;
+        const uint32_t constantsSet = runtime.instanceDesc->constantBufferAndSamplersSpaceIndex;
+        const uint32_t constantBinding = offsets.constantBufferOffset + runtime.instanceDesc->constantBufferRegisterIndex;
+        if (constantsSet < descriptorSets.size() &&
+            nrdPipelineHasBinding(pipeline, constantsSet, constantBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)) {
+            constantWriter.writeBuffer(
+                constantBinding,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                constants.descriptorInfo(constantOffset, dispatch.constantBufferDataSize));
+        }
+        for (uint32_t samplerIndex = 0; samplerIndex < runtime.instanceDesc->samplersNum; ++samplerIndex) {
+            const uint32_t samplerBinding = offsets.samplerOffset + runtime.instanceDesc->samplersBaseRegisterIndex + samplerIndex;
+            if (constantsSet >= descriptorSets.size() ||
+                !nrdPipelineHasBinding(pipeline, constantsSet, samplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER)) {
+                continue;
+            }
+            const bool nearest = runtime.instanceDesc->samplers[samplerIndex] == nrd::Sampler::NEAREST_CLAMP;
+            constantWriter.writeImage(
+                samplerBinding,
+                VK_DESCRIPTOR_TYPE_SAMPLER,
+                VkDescriptorImageInfo{.sampler = nearest ? nearestSampler_ : fullscreenSampler_});
+        }
+        if (constantsSet < descriptorSets.size()) {
+            constantWriter.update(context_.device(), {descriptorSets[constantsSet], pipeline.setLayouts[constantsSet]});
+        }
+
+        DescriptorWriter resourceWriter;
+        uint32_t resourceOffset = 0;
+        for (uint32_t rangeIndex = 0; rangeIndex < pipelineDesc.resourceRangesNum; ++rangeIndex) {
+            const nrd::ResourceRangeDesc& range = pipelineDesc.resourceRanges[rangeIndex];
+            const bool storage = range.descriptorType == nrd::DescriptorType::STORAGE_TEXTURE;
+            const uint32_t resourcesSet = runtime.instanceDesc->resourcesSpaceIndex;
+            const uint32_t bindingBase = (storage ? offsets.storageTextureAndBufferOffset : offsets.textureOffset) + runtime.instanceDesc->resourcesBaseRegisterIndex;
+            const VkDescriptorType descriptorType = storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            for (uint32_t i = 0; i < range.descriptorsNum; ++i) {
+                const nrd::ResourceDesc& resource = dispatch.resources[resourceOffset + i];
+                Image* image = nrdImageForResource(runtime, resource);
+                if (image == nullptr || image->handle() == VK_NULL_HANDLE) {
+                    nrdUnavailableReason_ = "NRD dispatch referenced an unavailable image resource";
+                    return false;
+                }
+                nrdTransitionImage(commandBuffer, *image, storage);
+                const uint32_t binding = bindingBase + i;
+                if (resourcesSet >= descriptorSets.size() ||
+                    !nrdPipelineHasBinding(pipeline, resourcesSet, binding, descriptorType)) {
+                    continue;
+                }
+                resourceWriter.writeImage(binding, descriptorType, nrdImageDescriptor(*image, storage));
+            }
+            resourceOffset += range.descriptorsNum;
+        }
+        if (runtime.instanceDesc->resourcesSpaceIndex < descriptorSets.size()) {
+            resourceWriter.update(
+                context_.device(),
+                {descriptorSets[runtime.instanceDesc->resourcesSpaceIndex], pipeline.setLayouts[runtime.instanceDesc->resourcesSpaceIndex]});
+        }
+
+        pipeline.pipeline->bind(commandBuffer);
+        vkCmdBindDescriptorSets(
+            commandBuffer,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipeline->layout(),
+            0,
+            static_cast<uint32_t>(descriptorSets.size()),
+            descriptorSets.data(),
+            0,
+            nullptr);
+        vkCmdDispatch(commandBuffer, dispatch.gridWidth, dispatch.gridHeight, 1);
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    return true;
+#else
+    (void)commandBuffer;
+    return false;
+#endif
+}
+
+void PathTracerRenderer::recordNrdResolvePass(VkCommandBuffer commandBuffer) {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    if (!nrdRuntime_ || !nrdRuntime_->resourcesReady) {
+        return;
+    }
+    validationLog_.recordPass("nrd resolve output");
+    NrdRuntime& runtime = *nrdRuntime_;
+    barrier::cmdTransitionImage(commandBuffer, barrier::ImageTransition{
+        .image = rawImage_.handle(),
+        .oldLayout = rawImage_.layout(),
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .range = rawImage_.fullRange(),
+        .srcStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccess = VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccess = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+    });
+    rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    nrdTransitionImage(commandBuffer, runtime.outDiffRadianceHitdist, true);
+    nrdTransitionImage(commandBuffer, runtime.outSpecRadianceHitdist, true);
+    nrdTransitionImage(commandBuffer, denoisedImage_, true);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(nrdResolveSetLayout_);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
+        .writeImage(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.outDiffRadianceHitdist.storageDescriptor())
+        .writeImage(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.outSpecRadianceHitdist.storageDescriptor())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeImage(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, denoisedImage_.storageDescriptor())
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
+        .update(context_.device(), set);
+
+    nrdResolvePipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, nrdResolvePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    nrdResolvePipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    denoisedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+#else
+    (void)commandBuffer;
+#endif
+}
+
 void PathTracerRenderer::recordMomentUpdate(VkCommandBuffer commandBuffer) {
     RenderGraph graph(&allocator_, resourceAliasingEnabled_);
     auto imageResource = [](const Image& image, const char* name) {
@@ -6204,8 +7537,8 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
         .external = true,
         .hasInitialAccess = true,
         .initialAccess = ResourceAccess{
-            .stage = pathTraceShaderStage(),
-            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
         },
         .debugName = "restir reservoir",
     });
@@ -6304,6 +7637,201 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
     momentDebugResolvedImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 }
 
+void PathTracerRenderer::copyNrdHistoryResources(VkCommandBuffer commandBuffer) {
+    RenderGraph graph(&allocator_, resourceAliasingEnabled_);
+    const RenderGraphResourceId denoised = graph.createTexture(RenderGraphResource{
+        .type = RenderGraphResource::Type::Texture,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .format = denoisedImage_.format(),
+        .extent = denoisedImage_.extent(),
+        .image = denoisedImage_.handle(),
+        .imageRange = denoisedImage_.fullRange(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .hasFinalAccess = true,
+        .finalAccess = ResourceAccess{
+            .stage = kCrossQueueShaderStage,
+            .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+        .debugName = "denoised hdr",
+    });
+    const RenderGraphResourceId history = graph.createTexture(RenderGraphResource{
+        .type = RenderGraphResource::Type::Texture,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .format = historyImage_.format(),
+        .extent = historyImage_.extent(),
+        .image = historyImage_.handle(),
+        .imageRange = historyImage_.fullRange(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = historyImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = historyImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .layout = historyImage_.layout(),
+        },
+        .hasFinalAccess = true,
+        .finalAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+        },
+        .debugName = "history hdr",
+    });
+    const RenderGraphResourceId worldPosition = graph.createBuffer(RenderGraphResource{
+        .type = RenderGraphResource::Type::Buffer,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .size = worldPositionBuffer_.size(),
+        .buffer = worldPositionBuffer_.handle(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = pathTraceShaderStage(),
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        },
+        .debugName = "world position",
+    });
+    const RenderGraphResourceId previousWorldPosition = graph.createBuffer(RenderGraphResource{
+        .type = RenderGraphResource::Type::Buffer,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .size = previousWorldPositionBuffer_.size(),
+        .buffer = previousWorldPositionBuffer_.handle(),
+        .external = true,
+        .hasFinalAccess = true,
+        .finalAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        },
+        .debugName = "previous world position",
+    });
+    const RenderGraphResourceId restirReservoir = graph.createBuffer(RenderGraphResource{
+        .type = RenderGraphResource::Type::Buffer,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .size = restirReservoirBuffer_.size(),
+        .buffer = restirReservoirBuffer_.handle(),
+        .external = true,
+        .hasInitialAccess = true,
+        .initialAccess = ResourceAccess{
+            .stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        },
+        .debugName = "restir reservoir",
+    });
+    const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(RenderGraphResource{
+        .type = RenderGraphResource::Type::Buffer,
+        .lifetime = RenderGraphResource::Lifetime::Persistent,
+        .size = previousRestirReservoirBuffer_.size(),
+        .buffer = previousRestirReservoirBuffer_.handle(),
+        .external = true,
+        .hasFinalAccess = true,
+        .finalAccess = ResourceAccess{
+            .stage = pathTraceShaderStage(),
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        },
+        .debugName = "previous restir reservoir",
+    });
+    const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
+    RenderGraphResourceId restirGiSpatialReservoir{};
+    RenderGraphResourceId previousRestirGiReservoir{};
+    if (useRestirGiReservoirs) {
+        restirGiSpatialReservoir = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiSpatialReservoirBuffer_.size(),
+            .buffer = restirGiSpatialReservoirBuffer_.handle(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = ResourceAccess{
+                .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            },
+            .debugName = "restir gi spatial reservoir",
+        });
+        previousRestirGiReservoir = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = previousRestirGiReservoirBuffer_.size(),
+            .buffer = previousRestirGiReservoirBuffer_.handle(),
+            .external = true,
+            .hasFinalAccess = true,
+            .finalAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            },
+            .debugName = "previous restir gi reservoir",
+        });
+    }
+
+    RenderGraphPass& historyCopyPass = graph.addPass("nrd_history_copy")
+        .addStorageRead(denoised, PipelineDomain::Transfer)
+        .addStorageWrite(history, PipelineDomain::Transfer)
+        .addStorageRead(worldPosition, PipelineDomain::Transfer)
+        .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
+        .addStorageRead(restirReservoir, PipelineDomain::Transfer)
+        .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
+    if (useRestirGiReservoirs) {
+        historyCopyPass
+            .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+    }
+    historyCopyPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            copyNrdHistoryResourcesPass(cmd);
+        });
+    graph.compile();
+    graph.execute(commandBuffer, temporalFrameIndex_);
+    denoisedImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    historyImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+}
+
+void PathTracerRenderer::copyNrdHistoryResourcesPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("nrd history copy");
+    currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
+    denoisedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    historyImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    VkImageCopy imageCopy{};
+    imageCopy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    imageCopy.srcSubresource.layerCount = 1;
+    imageCopy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    imageCopy.dstSubresource.layerCount = 1;
+    imageCopy.extent = denoisedImage_.extent();
+    vkCmdCopyImage(
+        commandBuffer,
+        denoisedImage_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        historyImage_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &imageCopy);
+
+    VkBufferCopy worldCopy{};
+    worldCopy.size = worldPositionBuffer_.size();
+    vkCmdCopyBuffer(commandBuffer, worldPositionBuffer_.handle(), previousWorldPositionBuffer_.handle(), 1, &worldCopy);
+
+    VkBufferCopy restirCopy{};
+    restirCopy.size = restirReservoirBuffer_.size();
+    vkCmdCopyBuffer(commandBuffer, restirReservoirBuffer_.handle(), previousRestirReservoirBuffer_.handle(), 1, &restirCopy);
+
+    if (shouldUseRestirGiReservoirs()) {
+        VkBufferCopy restirGiCopy{};
+        restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
+        vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        restirGiHistoryValid_ = true;
+    }
+    if (temporalSystem_) {
+        temporalSystem_->markSlotWritten("denoiser_history");
+        temporalSystem_->markSlotWritten("previous_world_position");
+        temporalSystem_->markSlotWritten("restir_reservoir");
+    }
+    denoiserHistoryValid_ = true;
+    currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
+}
+
 void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("history copy");
     currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
@@ -6396,13 +7924,14 @@ bool PathTracerRenderer::shouldRunDenoiser() const {
     if (settings_.wavefrontFinalOutputEnabled) {
         return false;
     }
+    const bool engineDebugView = denoiserParams_.debugView != 0u;
+    if (effectiveDenoiserBackend() != DenoiserBackend::Engine && !engineDebugView) {
+        return false;
+    }
     if (denoiserParams_.enabled != 0u) {
         return true;
     }
     if (denoiserParams_.debugView >= 1u && denoiserParams_.debugView <= 4u) {
-        return true;
-    }
-    if (denoiserParams_.debugView == static_cast<uint32_t>(RendererDebugView::MotionVectors)) {
         return true;
     }
     if (denoiserParams_.debugView == static_cast<uint32_t>(RendererDebugView::TemporalReactiveMask) ||
@@ -6420,15 +7949,34 @@ bool PathTracerRenderer::shouldRunDenoiser() const {
     return false;
 }
 
+bool PathTracerRenderer::shouldRunNrdDenoiser() const {
+    if (settings_.wavefrontFinalOutputEnabled) {
+        return false;
+    }
+    if (settings_.debugView != RendererDebugView::Beauty) {
+        return false;
+    }
+    if (effectiveDenoiserBackend() != DenoiserBackend::Nrd) {
+        return false;
+    }
+    if (denoiserParams_.enabled == 0u) {
+        return false;
+    }
+    return nrdRuntime_ != nullptr &&
+        nrdAvailable_ &&
+        nrdRuntime_->resourcesReady &&
+        nrdPreparePipeline_ != nullptr &&
+        nrdResolvePipeline_ != nullptr &&
+        nrdPrepareSetLayout_ != VK_NULL_HANDLE &&
+        nrdResolveSetLayout_ != VK_NULL_HANDLE;
+}
+
 bool PathTracerRenderer::isNonDenoiserDebugView() const {
     const uint32_t view = debugParams_.view;
     if (view == 0u) {
         return false;
     }
     if (view <= 4u) {
-        return false;
-    }
-    if (view == static_cast<uint32_t>(RendererDebugView::MotionVectors)) {
         return false;
     }
     if (view == static_cast<uint32_t>(RendererDebugView::TemporalReactiveMask) ||
@@ -6446,15 +7994,68 @@ bool PathTracerRenderer::isNonDenoiserDebugView() const {
     return true;
 }
 
+bool PathTracerRenderer::shouldBypassTemporalUpscalerForDebugView() const {
+    return settings_.debugView != RendererDebugView::Beauty;
+}
+
 bool PathTracerRenderer::shouldRunTaa() const {
     return !settings_.wavefrontFinalOutputEnabled &&
         settings_.pathTracingEnabled &&
         settings_.taaEnabled &&
+        !shouldBypassTemporalUpscalerForDebugView() &&
+        effectiveTemporalUpscaler() == TemporalUpscaler::TaaTsr &&
         taaPipeline_ != nullptr &&
         taaSetLayout_ != VK_NULL_HANDLE &&
         taaImage_.handle() != VK_NULL_HANDLE &&
         taaHistoryImage_.handle() != VK_NULL_HANDLE &&
         velocityBuffer_.handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldRunDlss() const {
+    return !settings_.wavefrontFinalOutputEnabled &&
+        settings_.pathTracingEnabled &&
+        settings_.taaEnabled &&
+        !shouldBypassTemporalUpscalerForDebugView() &&
+        !shouldRunDlssRayReconstruction() &&
+        effectiveTemporalUpscaler() == TemporalUpscaler::Dlss &&
+        dlssGuidesPipeline_ != nullptr &&
+        dlssGuidesSetLayout_ != VK_NULL_HANDLE &&
+        taaImage_.handle() != VK_NULL_HANDLE &&
+        dlssDepthImage_.handle() != VK_NULL_HANDLE &&
+        dlssMotionVectorImage_.handle() != VK_NULL_HANDLE &&
+        depthNormalBuffer_.handle() != VK_NULL_HANDLE &&
+        velocityBuffer_.handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldRunDlssRayReconstruction() const {
+    const auto status = nvidiaIntegrationStatus();
+    return !settings_.wavefrontFinalOutputEnabled &&
+        settings_.pathTracingEnabled &&
+        settings_.taaEnabled &&
+        !shouldBypassTemporalUpscalerForDebugView() &&
+        settings_.dlssRayReconstructionEnabled &&
+        status.dlssRayReconstructionAvailable &&
+        dlssRayReconstructionGuidesPipeline_ != nullptr &&
+        dlssRayReconstructionGuidesSetLayout_ != VK_NULL_HANDLE &&
+        taaImage_.handle() != VK_NULL_HANDLE &&
+        dlssDepthImage_.handle() != VK_NULL_HANDLE &&
+        dlssMotionVectorImage_.handle() != VK_NULL_HANDLE &&
+        dlssDiffuseAlbedoImage_.handle() != VK_NULL_HANDLE &&
+        dlssSpecularAlbedoImage_.handle() != VK_NULL_HANDLE &&
+        dlssNormalImage_.handle() != VK_NULL_HANDLE &&
+        dlssRoughnessImage_.handle() != VK_NULL_HANDLE &&
+        dlssDiffuseHitDistanceImage_.handle() != VK_NULL_HANDLE &&
+        dlssSpecularHitDistanceImage_.handle() != VK_NULL_HANDLE &&
+        dlssReflectedAlbedoImage_.handle() != VK_NULL_HANDLE &&
+        dlssDisocclusionMaskImage_.handle() != VK_NULL_HANDLE &&
+        dlssDiffuseRayDirectionImage_.handle() != VK_NULL_HANDLE &&
+        dlssSpecularRayDirectionImage_.handle() != VK_NULL_HANDLE &&
+        dlssDiffuseRayDirectionHitDistanceImage_.handle() != VK_NULL_HANDLE &&
+        dlssSpecularRayDirectionHitDistanceImage_.handle() != VK_NULL_HANDLE &&
+        depthNormalBuffer_.handle() != VK_NULL_HANDLE &&
+        velocityBuffer_.handle() != VK_NULL_HANDLE &&
+        previousWorldPositionBuffer_.handle() != VK_NULL_HANDLE &&
+        pathDataBuffer_.handle() != VK_NULL_HANDLE;
 }
 
 bool PathTracerRenderer::shouldRunRestirSpatial() const {
@@ -6576,7 +8177,765 @@ const Image& PathTracerRenderer::postDenoiseImage() const {
 }
 
 const Image& PathTracerRenderer::hdrPostProcessImage() const {
-    return shouldRunTaa() ? taaImage_ : postDenoiseImage();
+    return (shouldRunTaa() || shouldRunDlss() || shouldRunDlssRayReconstruction()) ? taaImage_ : postDenoiseImage();
+}
+
+bool PathTracerRenderer::ensureDlssFeature(VkCommandBuffer commandBuffer) {
+#if defined(RTV_DLSS_NGX_ENABLED)
+    if (!dlssNgxInitialized_ || !dlssCapabilityAvailable_ || dlssParameters_ == nullptr || dlssFeatureCreationFailed_) {
+        return false;
+    }
+    if (dlssHandle_ != nullptr &&
+        dlssFeatureRenderExtent_.width == renderExtent_.width &&
+        dlssFeatureRenderExtent_.height == renderExtent_.height &&
+        dlssFeatureOutputExtent_.width == displayExtent_.width &&
+        dlssFeatureOutputExtent_.height == displayExtent_.height) {
+        return true;
+    }
+
+    releaseDlssFeature();
+    NVSDK_NGX_DLSS_Create_Params createParams{};
+    createParams.Feature.InWidth = renderExtent_.width;
+    createParams.Feature.InHeight = renderExtent_.height;
+    createParams.Feature.InTargetWidth = displayExtent_.width;
+    createParams.Feature.InTargetHeight = displayExtent_.height;
+    createParams.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_Balanced;
+    createParams.InFeatureCreateFlags =
+        NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
+        NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+        NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+
+    NVSDK_NGX_Handle* handle = nullptr;
+    NVSDK_NGX_Result result = NGX_VULKAN_CREATE_DLSS_EXT1(
+        context_.device(),
+        commandBuffer,
+        1u,
+        1u,
+        &handle,
+        reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_),
+        &createParams);
+    if (NVSDK_NGX_FAILED(result) || handle == nullptr) {
+        dlssUnavailableReason_ = ngxFailureMessage("NGX_VULKAN_CREATE_DLSS_EXT1", result);
+        dlssFeatureCreationFailed_ = true;
+        validationLog_.recordPass("dlss unavailable: " + dlssUnavailableReason_);
+        return false;
+    }
+
+    dlssHandle_ = handle;
+    dlssFeatureRenderExtent_ = renderExtent_;
+    dlssFeatureOutputExtent_ = displayExtent_;
+    validationLog_.recordPass(
+        "dlss feature created render=" + std::to_string(renderExtent_.width) + "x" + std::to_string(renderExtent_.height) +
+        " output=" + std::to_string(displayExtent_.width) + "x" + std::to_string(displayExtent_.height));
+    return true;
+#else
+    (void)commandBuffer;
+    return false;
+#endif
+}
+
+bool PathTracerRenderer::ensureDlssRayReconstructionFeature(VkCommandBuffer commandBuffer) {
+#if defined(RTV_DLSS_NGX_ENABLED)
+    if (!dlssNgxInitialized_ ||
+        !dlssRayReconstructionCapabilityAvailable_ ||
+        dlssParameters_ == nullptr ||
+        dlssRayReconstructionFeatureCreationFailed_) {
+        return false;
+    }
+    if (dlssRayReconstructionHandle_ != nullptr &&
+        dlssRayReconstructionFeatureRenderExtent_.width == renderExtent_.width &&
+        dlssRayReconstructionFeatureRenderExtent_.height == renderExtent_.height &&
+        dlssRayReconstructionFeatureOutputExtent_.width == displayExtent_.width &&
+        dlssRayReconstructionFeatureOutputExtent_.height == displayExtent_.height) {
+        return true;
+    }
+
+    releaseDlssRayReconstructionFeature();
+    NVSDK_NGX_DLSSD_Create_Params createParams{};
+    createParams.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+    createParams.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Unpacked;
+    createParams.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_Linear;
+    createParams.InWidth = renderExtent_.width;
+    createParams.InHeight = renderExtent_.height;
+    createParams.InTargetWidth = displayExtent_.width;
+    createParams.InTargetHeight = displayExtent_.height;
+    createParams.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_Balanced;
+    createParams.InFeatureCreateFlags =
+        NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
+        NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+        NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    createParams.InEnableOutputSubrects = false;
+
+    auto* parameters = reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_);
+    NVSDK_NGX_Parameter_SetUI(
+        parameters,
+        NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
+        NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
+
+    NVSDK_NGX_Handle* handle = nullptr;
+    NVSDK_NGX_Result result = NGX_VULKAN_CREATE_DLSSD_EXT1(
+        context_.device(),
+        commandBuffer,
+        1u,
+        1u,
+        &handle,
+        parameters,
+        &createParams);
+    if (NVSDK_NGX_FAILED(result) || handle == nullptr) {
+        dlssRayReconstructionUnavailableReason_ = ngxFailureMessage("NGX_VULKAN_CREATE_DLSSD_EXT1", result);
+        dlssRayReconstructionFeatureCreationFailed_ = true;
+        validationLog_.recordPass("dlss ray reconstruction unavailable: " + dlssRayReconstructionUnavailableReason_);
+        return false;
+    }
+
+    dlssRayReconstructionHandle_ = handle;
+    dlssRayReconstructionFeatureRenderExtent_ = renderExtent_;
+    dlssRayReconstructionFeatureOutputExtent_ = displayExtent_;
+    validationLog_.recordPass(
+        "dlss ray reconstruction feature created render=" + std::to_string(renderExtent_.width) + "x" + std::to_string(renderExtent_.height) +
+        " output=" + std::to_string(displayExtent_.width) + "x" + std::to_string(displayExtent_.height));
+    return true;
+#else
+    (void)commandBuffer;
+    return false;
+#endif
+}
+
+void PathTracerRenderer::fallbackBlitPostDenoiseToTemporalOutput(VkCommandBuffer commandBuffer) {
+    const Image& inputImage = postDenoiseImage();
+    barrier::cmdTransitionImage(commandBuffer, barrier::ImageTransition{
+        .image = inputImage.handle(),
+        .oldLayout = inputImage.layout(),
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .range = inputImage.fullRange(),
+        .srcStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccess = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .dstAccess = VK_ACCESS_2_TRANSFER_READ_BIT,
+    });
+    inputImage.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    barrier::cmdTransitionImage(commandBuffer, barrier::ImageTransition{
+        .image = taaImage_.handle(),
+        .oldLayout = taaImage_.layout(),
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .range = taaImage_.fullRange(),
+        .srcStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccess = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .dstAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+    });
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+    VkImageBlit blit{};
+    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.layerCount = 1;
+    blit.srcOffsets[1] = {
+        static_cast<int32_t>(inputImage.extent().width),
+        static_cast<int32_t>(inputImage.extent().height),
+        1,
+    };
+    blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.dstSubresource.layerCount = 1;
+    blit.dstOffsets[1] = {
+        static_cast<int32_t>(taaImage_.extent().width),
+        static_cast<int32_t>(taaImage_.extent().height),
+        1,
+    };
+    vkCmdBlitImage(
+        commandBuffer,
+        inputImage.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        taaImage_.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &blit,
+        VK_FILTER_LINEAR);
+
+    barrier::cmdTransitionImage(commandBuffer, barrier::ImageTransition{
+        .image = inputImage.handle(),
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .range = inputImage.fullRange(),
+        .srcStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccess = VK_ACCESS_2_TRANSFER_READ_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+    });
+    inputImage.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    barrier::cmdTransitionImage(commandBuffer, barrier::ImageTransition{
+        .image = taaImage_.handle(),
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .range = taaImage_.fullRange(),
+        .srcStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccess = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    });
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+}
+
+void PathTracerRenderer::recordDlss(VkCommandBuffer commandBuffer) {
+    RenderGraph graph(&allocator_, resourceAliasingEnabled_);
+    auto imageResource = [](const Image& image, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Texture,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .format = image.format(),
+            .extent = image.extent(),
+            .image = image.handle(),
+            .imageRange = image.fullRange(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+    auto bufferResource = [](const Buffer& buffer, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = buffer.size(),
+            .buffer = buffer.handle(),
+            .bufferOffset = buffer.baseOffset(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+
+    const Image& inputImage = postDenoiseImage();
+    const RenderGraphResourceId input = graph.createTexture(imageResource(inputImage, "dlss input hdr"));
+    const RenderGraphResourceId output = graph.createTexture(imageResource(taaImage_, "dlss output hdr"));
+    const RenderGraphResourceId depthGuide = graph.createTexture(imageResource(dlssDepthImage_, "dlss depth guide"));
+    const RenderGraphResourceId motionGuide = graph.createTexture(imageResource(dlssMotionVectorImage_, "dlss motion guide"));
+    const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "depth normal"));
+    const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
+
+    graph.resources()[input.index].hasInitialAccess = true;
+    graph.resources()[input.index].initialAccess = ResourceAccess{
+        .stage = inputImage.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
+        .access = inputImage.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+            ? VK_ACCESS_2_NONE
+            : (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT),
+        .layout = inputImage.layout(),
+    };
+    graph.resources()[output.index].hasInitialAccess = true;
+    graph.resources()[output.index].initialAccess = ResourceAccess{
+        .stage = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
+        .access = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .layout = taaImage_.layout(),
+    };
+    graph.resources()[output.index].hasFinalAccess = true;
+    graph.resources()[output.index].finalAccess = ResourceAccess{
+        .stage = kCrossQueueShaderStage,
+        .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    auto setGuideInitialAccess = [&](RenderGraphResourceId id, const Image& image) {
+        graph.resources()[id.index].hasInitialAccess = true;
+        graph.resources()[id.index].initialAccess = ResourceAccess{
+            .stage = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+                ? VK_ACCESS_2_NONE
+                : (VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+            .layout = image.layout(),
+        };
+    };
+    setGuideInitialAccess(depthGuide, dlssDepthImage_);
+    setGuideInitialAccess(motionGuide, dlssMotionVectorImage_);
+    graph.resources()[depthNormal.index].hasInitialAccess = true;
+    graph.resources()[depthNormal.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[velocity.index].hasInitialAccess = true;
+    graph.resources()[velocity.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+
+    graph.addPass("dlss_guides")
+        .addStorageRead(depthNormal, PipelineDomain::Compute)
+        .addStorageRead(velocity, PipelineDomain::Compute)
+        .addStorageWrite(depthGuide, PipelineDomain::Compute)
+        .addStorageWrite(motionGuide, PipelineDomain::Compute)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordDlssGuidesPass(cmd);
+        });
+    graph.addPass("dlss_upscale")
+        .addStorageRead(input, PipelineDomain::Compute)
+        .addStorageRead(depthGuide, PipelineDomain::Compute)
+        .addStorageRead(motionGuide, PipelineDomain::Compute)
+        .addStorageWrite(output, PipelineDomain::Compute)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordDlssPass(cmd);
+        });
+    graph.compile();
+    graph.execute(commandBuffer, temporalFrameIndex_);
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void PathTracerRenderer::recordDlssGuidesPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("dlss guide generation");
+    dlssDepthImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssMotionVectorImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(dlssGuidesSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
+        .writeImage(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssDepthImage_.storageDescriptor())
+        .writeImage(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssMotionVectorImage_.storageDescriptor())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
+        .update(context_.device(), set);
+
+    dlssGuidesPipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, dlssGuidesPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    dlssGuidesPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+}
+
+void PathTracerRenderer::recordDlssPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("dlss upscale");
+    currentProfiler_->write(commandBuffer, GpuProfiler::TaaStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    const Image& inputImage = postDenoiseImage();
+    inputImage.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssDepthImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssMotionVectorImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    if (!ensureDlssFeature(commandBuffer)) {
+        fallbackBlitPostDenoiseToTemporalOutput(commandBuffer);
+        currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+        return;
+    }
+
+#if defined(RTV_DLSS_NGX_ENABLED)
+    NVSDK_NGX_Resource_VK colorResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        inputImage.view(),
+        inputImage.handle(),
+        inputImage.fullRange(),
+        inputImage.format(),
+        inputImage.width(),
+        inputImage.height(),
+        false);
+    NVSDK_NGX_Resource_VK outputResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        taaImage_.view(),
+        taaImage_.handle(),
+        taaImage_.fullRange(),
+        taaImage_.format(),
+        taaImage_.width(),
+        taaImage_.height(),
+        true);
+    NVSDK_NGX_Resource_VK depthResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        dlssDepthImage_.view(),
+        dlssDepthImage_.handle(),
+        dlssDepthImage_.fullRange(),
+        dlssDepthImage_.format(),
+        dlssDepthImage_.width(),
+        dlssDepthImage_.height(),
+        false);
+    NVSDK_NGX_Resource_VK motionResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        dlssMotionVectorImage_.view(),
+        dlssMotionVectorImage_.handle(),
+        dlssMotionVectorImage_.fullRange(),
+        dlssMotionVectorImage_.format(),
+        dlssMotionVectorImage_.width(),
+        dlssMotionVectorImage_.height(),
+        false);
+
+    NVSDK_NGX_VK_DLSS_Eval_Params evalParams{};
+    evalParams.Feature.pInColor = &colorResource;
+    evalParams.Feature.pInOutput = &outputResource;
+    evalParams.Feature.InSharpness = std::clamp(settings_.dlssSharpeningStrength, 0.0f, 1.0f);
+    evalParams.pInDepth = &depthResource;
+    evalParams.pInMotionVectors = &motionResource;
+    // NGX wants the projection-matrix jitter. camera_.jitter stores the ray sample offset,
+    // and this renderer applies the opposite sign in projection[2][0/1].
+    evalParams.InJitterOffsetX = -camera_.jitter.x;
+    evalParams.InJitterOffsetY = -camera_.jitter.y;
+    evalParams.InRenderSubrectDimensions = NVSDK_NGX_Dimensions{renderExtent_.width, renderExtent_.height};
+    evalParams.InReset = taaParams_.resetHistory != 0u ? 1 : 0;
+    evalParams.InMVScaleX = 1.0f;
+    evalParams.InMVScaleY = 1.0f;
+    evalParams.InPreExposure = 1.0f;
+    evalParams.InExposureScale = 1.0f;
+    evalParams.InFrameTimeDeltaInMsec = frameDeltaSeconds_ > 0.0f ? frameDeltaSeconds_ * 1000.0f : 16.6667f;
+
+    std::array<float, 16> invViewProjectionMatrix{};
+    std::array<float, 16> clipToPrevClipMatrix{};
+    auto* parameters = reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_);
+    if (makeNgxDlssTemporalMatrices(
+            invViewProjectionMatrix,
+            clipToPrevClipMatrix,
+            nrdWorldToView_,
+            nrdViewToClip_,
+            nrdWorldToViewPrev_,
+            nrdViewToClipPrev_)) {
+        NVSDK_NGX_Parameter_SetVoidPointer(
+            parameters,
+            NVSDK_NGX_Parameter_DLSS_INV_VIEW_PROJECTION_MATRIX,
+            invViewProjectionMatrix.data());
+        NVSDK_NGX_Parameter_SetVoidPointer(
+            parameters,
+            NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX,
+            clipToPrevClipMatrix.data());
+    } else {
+        NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSS_INV_VIEW_PROJECTION_MATRIX, nullptr);
+        NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX, nullptr);
+        validationLog_.recordPass("dlss temporal matrices skipped: invalid camera transform");
+    }
+
+    NVSDK_NGX_Result result = NGX_VULKAN_EVALUATE_DLSS_EXT(
+        commandBuffer,
+        reinterpret_cast<NVSDK_NGX_Handle*>(dlssHandle_),
+        parameters,
+        &evalParams);
+    if (NVSDK_NGX_FAILED(result)) {
+        dlssUnavailableReason_ = ngxFailureMessage("NGX_VULKAN_EVALUATE_DLSS_EXT", result);
+        dlssFeatureCreationFailed_ = true;
+        validationLog_.recordPass("dlss evaluation failed: " + dlssUnavailableReason_);
+        releaseDlssFeature();
+        fallbackBlitPostDenoiseToTemporalOutput(commandBuffer);
+        currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+        return;
+    }
+#endif
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordDlssRayReconstruction(VkCommandBuffer commandBuffer) {
+    RenderGraph graph(&allocator_, resourceAliasingEnabled_);
+    auto imageResource = [](const Image& image, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Texture,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .format = image.format(),
+            .extent = image.extent(),
+            .image = image.handle(),
+            .imageRange = image.fullRange(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+    auto bufferResource = [](const Buffer& buffer, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = buffer.size(),
+            .buffer = buffer.handle(),
+            .bufferOffset = buffer.baseOffset(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+
+    const RenderGraphResourceId input = graph.createTexture(imageResource(rawImage_, "dlss rr input raw hdr"));
+    const RenderGraphResourceId output = graph.createTexture(imageResource(taaImage_, "dlss rr output hdr"));
+    const RenderGraphResourceId depthGuide = graph.createTexture(imageResource(dlssDepthImage_, "dlss rr depth guide"));
+    const RenderGraphResourceId motionGuide = graph.createTexture(imageResource(dlssMotionVectorImage_, "dlss rr motion guide"));
+    const RenderGraphResourceId diffuseAlbedo = graph.createTexture(imageResource(dlssDiffuseAlbedoImage_, "dlss rr diffuse albedo"));
+    const RenderGraphResourceId specularAlbedo = graph.createTexture(imageResource(dlssSpecularAlbedoImage_, "dlss rr specular albedo"));
+    const RenderGraphResourceId normalGuide = graph.createTexture(imageResource(dlssNormalImage_, "dlss rr normal"));
+    const RenderGraphResourceId roughnessGuide = graph.createTexture(imageResource(dlssRoughnessImage_, "dlss rr roughness"));
+    const RenderGraphResourceId diffuseHit = graph.createTexture(imageResource(dlssDiffuseHitDistanceImage_, "dlss rr diffuse hit distance"));
+    const RenderGraphResourceId specularHit = graph.createTexture(imageResource(dlssSpecularHitDistanceImage_, "dlss rr specular hit distance"));
+    const RenderGraphResourceId reflectedAlbedo = graph.createTexture(imageResource(dlssReflectedAlbedoImage_, "dlss rr reflected albedo"));
+    const RenderGraphResourceId disocclusionMask = graph.createTexture(imageResource(dlssDisocclusionMaskImage_, "dlss rr disocclusion mask"));
+    const RenderGraphResourceId diffuseRayDirection = graph.createTexture(imageResource(dlssDiffuseRayDirectionImage_, "dlss rr diffuse ray direction"));
+    const RenderGraphResourceId specularRayDirection = graph.createTexture(imageResource(dlssSpecularRayDirectionImage_, "dlss rr specular ray direction"));
+    const RenderGraphResourceId diffuseRayDirectionHit = graph.createTexture(imageResource(dlssDiffuseRayDirectionHitDistanceImage_, "dlss rr diffuse ray direction hit distance"));
+    const RenderGraphResourceId specularRayDirectionHit = graph.createTexture(imageResource(dlssSpecularRayDirectionHitDistanceImage_, "dlss rr specular ray direction hit distance"));
+    const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "depth normal"));
+    const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
+    const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data channels"));
+    const RenderGraphResourceId previousWorldPosition = graph.createBuffer(bufferResource(previousWorldPositionBuffer_, "previous world position"));
+
+    graph.resources()[input.index].hasInitialAccess = true;
+    graph.resources()[input.index].initialAccess = ResourceAccess{
+        .stage = rawImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
+        .access = rawImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+            ? VK_ACCESS_2_NONE
+            : (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT),
+        .layout = rawImage_.layout(),
+    };
+    graph.resources()[output.index].hasInitialAccess = true;
+    graph.resources()[output.index].initialAccess = ResourceAccess{
+        .stage = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
+        .access = taaImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .layout = taaImage_.layout(),
+    };
+    graph.resources()[output.index].hasFinalAccess = true;
+    graph.resources()[output.index].finalAccess = ResourceAccess{
+        .stage = kCrossQueueShaderStage,
+        .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    auto setGuideInitialAccess = [&](RenderGraphResourceId id, const Image& image) {
+        graph.resources()[id.index].hasInitialAccess = true;
+        graph.resources()[id.index].initialAccess = ResourceAccess{
+            .stage = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+                ? VK_ACCESS_2_NONE
+                : (VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+            .layout = image.layout(),
+        };
+    };
+    setGuideInitialAccess(depthGuide, dlssDepthImage_);
+    setGuideInitialAccess(motionGuide, dlssMotionVectorImage_);
+    setGuideInitialAccess(diffuseAlbedo, dlssDiffuseAlbedoImage_);
+    setGuideInitialAccess(specularAlbedo, dlssSpecularAlbedoImage_);
+    setGuideInitialAccess(normalGuide, dlssNormalImage_);
+    setGuideInitialAccess(roughnessGuide, dlssRoughnessImage_);
+    setGuideInitialAccess(diffuseHit, dlssDiffuseHitDistanceImage_);
+    setGuideInitialAccess(specularHit, dlssSpecularHitDistanceImage_);
+    setGuideInitialAccess(reflectedAlbedo, dlssReflectedAlbedoImage_);
+    setGuideInitialAccess(disocclusionMask, dlssDisocclusionMaskImage_);
+    setGuideInitialAccess(diffuseRayDirection, dlssDiffuseRayDirectionImage_);
+    setGuideInitialAccess(specularRayDirection, dlssSpecularRayDirectionImage_);
+    setGuideInitialAccess(diffuseRayDirectionHit, dlssDiffuseRayDirectionHitDistanceImage_);
+    setGuideInitialAccess(specularRayDirectionHit, dlssSpecularRayDirectionHitDistanceImage_);
+    graph.resources()[depthNormal.index].hasInitialAccess = true;
+    graph.resources()[depthNormal.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[velocity.index].hasInitialAccess = true;
+    graph.resources()[velocity.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[pathData.index].hasInitialAccess = true;
+    graph.resources()[pathData.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[previousWorldPosition.index].hasInitialAccess = true;
+    graph.resources()[previousWorldPosition.index].initialAccess = ResourceAccess{
+        .stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+    };
+
+    graph.addPass("dlss_rr_guides")
+        .addStorageRead(depthNormal, PipelineDomain::Compute)
+        .addStorageRead(velocity, PipelineDomain::Compute)
+        .addStorageRead(pathData, PipelineDomain::Compute)
+        .addStorageRead(previousWorldPosition, PipelineDomain::Compute)
+        .addStorageWrite(depthGuide, PipelineDomain::Compute)
+        .addStorageWrite(motionGuide, PipelineDomain::Compute)
+        .addStorageWrite(diffuseAlbedo, PipelineDomain::Compute)
+        .addStorageWrite(specularAlbedo, PipelineDomain::Compute)
+        .addStorageWrite(normalGuide, PipelineDomain::Compute)
+        .addStorageWrite(roughnessGuide, PipelineDomain::Compute)
+        .addStorageWrite(diffuseHit, PipelineDomain::Compute)
+        .addStorageWrite(specularHit, PipelineDomain::Compute)
+        .addStorageWrite(reflectedAlbedo, PipelineDomain::Compute)
+        .addStorageWrite(disocclusionMask, PipelineDomain::Compute)
+        .addStorageWrite(diffuseRayDirection, PipelineDomain::Compute)
+        .addStorageWrite(specularRayDirection, PipelineDomain::Compute)
+        .addStorageWrite(diffuseRayDirectionHit, PipelineDomain::Compute)
+        .addStorageWrite(specularRayDirectionHit, PipelineDomain::Compute)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordDlssRayReconstructionGuidesPass(cmd);
+        });
+    graph.addPass("dlss_ray_reconstruction")
+        .addStorageRead(input, PipelineDomain::Compute)
+        .addStorageRead(depthGuide, PipelineDomain::Compute)
+        .addStorageRead(motionGuide, PipelineDomain::Compute)
+        .addStorageRead(diffuseAlbedo, PipelineDomain::Compute)
+        .addStorageRead(specularAlbedo, PipelineDomain::Compute)
+        .addStorageRead(normalGuide, PipelineDomain::Compute)
+        .addStorageRead(roughnessGuide, PipelineDomain::Compute)
+        .addStorageRead(diffuseHit, PipelineDomain::Compute)
+        .addStorageRead(specularHit, PipelineDomain::Compute)
+        .addStorageRead(reflectedAlbedo, PipelineDomain::Compute)
+        .addStorageRead(disocclusionMask, PipelineDomain::Compute)
+        .addStorageRead(diffuseRayDirection, PipelineDomain::Compute)
+        .addStorageRead(specularRayDirection, PipelineDomain::Compute)
+        .addStorageRead(diffuseRayDirectionHit, PipelineDomain::Compute)
+        .addStorageRead(specularRayDirectionHit, PipelineDomain::Compute)
+        .addStorageWrite(output, PipelineDomain::Compute)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordDlssRayReconstructionPass(cmd);
+        });
+    graph.compile();
+    graph.execute(commandBuffer, temporalFrameIndex_);
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+}
+
+void PathTracerRenderer::recordDlssRayReconstructionGuidesPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("dlss ray reconstruction guide generation");
+    dlssDepthImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssMotionVectorImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssDiffuseAlbedoImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssSpecularAlbedoImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssNormalImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssRoughnessImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssDiffuseHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssSpecularHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssReflectedAlbedoImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssDisocclusionMaskImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssDiffuseRayDirectionImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssSpecularRayDirectionImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssDiffuseRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    dlssSpecularRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(dlssRayReconstructionGuidesSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeImage(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssDepthImage_.storageDescriptor())
+        .writeImage(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssMotionVectorImage_.storageDescriptor())
+        .writeImage(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssDiffuseAlbedoImage_.storageDescriptor())
+        .writeImage(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssSpecularAlbedoImage_.storageDescriptor())
+        .writeImage(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssNormalImage_.storageDescriptor())
+        .writeImage(8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssRoughnessImage_.storageDescriptor())
+        .writeImage(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssDiffuseHitDistanceImage_.storageDescriptor())
+        .writeImage(10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssSpecularHitDistanceImage_.storageDescriptor())
+        .writeBuffer(11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousWorldPositionBuffer_.descriptorInfo())
+        .writeBuffer(12, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFramePrevCameraUniformOffset, sizeof(PrevCameraUniform)))
+        .writeImage(13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssReflectedAlbedoImage_.storageDescriptor())
+        .writeImage(14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssDisocclusionMaskImage_.storageDescriptor())
+        .writeImage(15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssDiffuseRayDirectionImage_.storageDescriptor())
+        .writeImage(16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssSpecularRayDirectionImage_.storageDescriptor())
+        .writeImage(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssDiffuseRayDirectionHitDistanceImage_.storageDescriptor())
+        .writeImage(18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssSpecularRayDirectionHitDistanceImage_.storageDescriptor())
+        .writeBuffer(19, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
+        .writeBuffer(20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
+        .update(context_.device(), set);
+
+    dlssRayReconstructionGuidesPipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, dlssRayReconstructionGuidesPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    dlssRayReconstructionGuidesPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+}
+
+void PathTracerRenderer::recordDlssRayReconstructionPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("dlss ray reconstruction");
+    currentProfiler_->write(commandBuffer, GpuProfiler::TaaStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    rawImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssDepthImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssMotionVectorImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssDiffuseAlbedoImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssSpecularAlbedoImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssNormalImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssRoughnessImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssDiffuseHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssSpecularHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssReflectedAlbedoImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssDisocclusionMaskImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssDiffuseRayDirectionImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssSpecularRayDirectionImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssDiffuseRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    dlssSpecularRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    if (!ensureDlssRayReconstructionFeature(commandBuffer)) {
+        fallbackBlitPostDenoiseToTemporalOutput(commandBuffer);
+        currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+        return;
+    }
+
+#if defined(RTV_DLSS_NGX_ENABLED)
+    auto makeResource = [](const Image& image, bool writable) {
+        return NVSDK_NGX_Create_ImageView_Resource_VK(
+            image.view(),
+            image.handle(),
+            image.fullRange(),
+            image.format(),
+            image.width(),
+            image.height(),
+            writable);
+    };
+    NVSDK_NGX_Resource_VK colorResource = makeResource(rawImage_, false);
+    NVSDK_NGX_Resource_VK outputResource = makeResource(taaImage_, true);
+    NVSDK_NGX_Resource_VK depthResource = makeResource(dlssDepthImage_, false);
+    NVSDK_NGX_Resource_VK motionResource = makeResource(dlssMotionVectorImage_, false);
+    NVSDK_NGX_Resource_VK diffuseAlbedoResource = makeResource(dlssDiffuseAlbedoImage_, false);
+    NVSDK_NGX_Resource_VK specularAlbedoResource = makeResource(dlssSpecularAlbedoImage_, false);
+    NVSDK_NGX_Resource_VK normalResource = makeResource(dlssNormalImage_, false);
+    NVSDK_NGX_Resource_VK roughnessResource = makeResource(dlssRoughnessImage_, false);
+    NVSDK_NGX_Resource_VK diffuseHitDistanceResource = makeResource(dlssDiffuseHitDistanceImage_, false);
+    NVSDK_NGX_Resource_VK specularHitDistanceResource = makeResource(dlssSpecularHitDistanceImage_, false);
+    NVSDK_NGX_Resource_VK reflectedAlbedoResource = makeResource(dlssReflectedAlbedoImage_, false);
+    NVSDK_NGX_Resource_VK disocclusionMaskResource = makeResource(dlssDisocclusionMaskImage_, false);
+    NVSDK_NGX_Resource_VK diffuseRayDirectionResource = makeResource(dlssDiffuseRayDirectionImage_, false);
+    NVSDK_NGX_Resource_VK specularRayDirectionResource = makeResource(dlssSpecularRayDirectionImage_, false);
+    NVSDK_NGX_Resource_VK diffuseRayDirectionHitDistanceResource = makeResource(dlssDiffuseRayDirectionHitDistanceImage_, false);
+    NVSDK_NGX_Resource_VK specularRayDirectionHitDistanceResource = makeResource(dlssSpecularRayDirectionHitDistanceImage_, false);
+
+    std::array<float, 16> worldToViewMatrix{};
+    std::array<float, 16> viewToClipMatrix{};
+    copyNgxRowMajorMatrix(worldToViewMatrix, nrdWorldToView_);
+    copyNgxRowMajorMatrix(viewToClipMatrix, nrdViewToClip_);
+
+    auto ngxToneMapper = [](ToneMapper toneMapper) {
+        switch (toneMapper) {
+        case ToneMapper::Reinhard:
+        case ToneMapper::ReinhardWhite:
+            return NVSDK_NGX_TONEMAPPER_REINHARD;
+        case ToneMapper::ACES:
+            return NVSDK_NGX_TONEMAPPER_ACES;
+        case ToneMapper::Linear:
+        case ToneMapper::PBRNeutral:
+        case ToneMapper::AgX:
+            return NVSDK_NGX_TONEMAPPER_STRING;
+        }
+        return NVSDK_NGX_TONEMAPPER_ACES;
+    };
+
+    NVSDK_NGX_VK_DLSSD_Eval_Params evalParams{};
+    evalParams.pInDiffuseAlbedo = &diffuseAlbedoResource;
+    evalParams.pInSpecularAlbedo = &specularAlbedoResource;
+    evalParams.pInNormals = &normalResource;
+    evalParams.pInRoughness = &roughnessResource;
+    evalParams.pInDiffuseHitDistance = &diffuseHitDistanceResource;
+    evalParams.pInSpecularHitDistance = &specularHitDistanceResource;
+    evalParams.pInReflectedAlbedo = &reflectedAlbedoResource;
+    evalParams.pInDisocclusionMask = &disocclusionMaskResource;
+    evalParams.pInDiffuseRayDirection = &diffuseRayDirectionResource;
+    evalParams.pInSpecularRayDirection = &specularRayDirectionResource;
+    evalParams.pInDiffuseRayDirectionHitDistance = &diffuseRayDirectionHitDistanceResource;
+    evalParams.pInSpecularRayDirectionHitDistance = &specularRayDirectionHitDistanceResource;
+    evalParams.pInWorldToViewMatrix = worldToViewMatrix.data();
+    evalParams.pInViewToClipMatrix = viewToClipMatrix.data();
+    evalParams.pInColor = &colorResource;
+    evalParams.pInOutput = &outputResource;
+    evalParams.pInDepth = &depthResource;
+    evalParams.pInMotionVectors = &motionResource;
+    // NGX wants the projection-matrix jitter. camera_.jitter stores the ray sample offset,
+    // and this renderer applies the opposite sign in projection[2][0/1].
+    evalParams.InJitterOffsetX = -camera_.jitter.x;
+    evalParams.InJitterOffsetY = -camera_.jitter.y;
+    evalParams.InRenderSubrectDimensions = NVSDK_NGX_Dimensions{renderExtent_.width, renderExtent_.height};
+    evalParams.InReset = taaParams_.resetHistory != 0u ? 1 : 0;
+    evalParams.InMVScaleX = 1.0f;
+    evalParams.InMVScaleY = 1.0f;
+    evalParams.InPreExposure = 1.0f;
+    evalParams.InExposureScale = 1.0f;
+    evalParams.InToneMapperType = ngxToneMapper(settings_.toneMapper);
+    evalParams.InFrameTimeDeltaInMsec = frameDeltaSeconds_ > 0.0f ? frameDeltaSeconds_ * 1000.0f : 16.6667f;
+
+    NVSDK_NGX_Result result = NGX_VULKAN_EVALUATE_DLSSD_EXT(
+        commandBuffer,
+        reinterpret_cast<NVSDK_NGX_Handle*>(dlssRayReconstructionHandle_),
+        reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_),
+        &evalParams);
+    if (NVSDK_NGX_FAILED(result)) {
+        dlssRayReconstructionUnavailableReason_ = ngxFailureMessage("NGX_VULKAN_EVALUATE_DLSSD_EXT", result);
+        dlssRayReconstructionFeatureCreationFailed_ = true;
+        validationLog_.recordPass("dlss ray reconstruction evaluation failed: " + dlssRayReconstructionUnavailableReason_);
+        releaseDlssRayReconstructionFeature();
+        fallbackBlitPostDenoiseToTemporalOutput(commandBuffer);
+        currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+        return;
+    }
+#endif
+    taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordTaa(VkCommandBuffer commandBuffer, bool deferHistoryCopy) {
@@ -7144,8 +9503,8 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
         .external = true,
         .hasInitialAccess = true,
         .initialAccess = ResourceAccess{
-            .stage = pathTraceShaderStage(),
-            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
         },
         .debugName = "restir reservoir",
     });
@@ -7286,17 +9645,65 @@ void PathTracerRenderer::recordEditorPresentationEnd(VkCommandBuffer commandBuff
 
 VkDeviceSize PathTracerRenderer::estimatedTextureMemory() const {
     VkDeviceSize total = 0;
-    auto texSize = [](const Image& img) {
-        if (img.handle() == VK_NULL_HANDLE) return VkDeviceSize(0);
-        uint32_t bpp = 4;
-        switch (img.format()) {
-        case VK_FORMAT_R16G16_SFLOAT: bpp = 4; break;
-        case VK_FORMAT_R16G16B16A16_SFLOAT: bpp = 8; break;
-        case VK_FORMAT_R16G16B16A16_UINT: bpp = 8; break;
-        case VK_FORMAT_R32G32B32A32_SFLOAT: bpp = 16; break;
-        default: break;
+    auto formatBytesPerPixel = [](VkFormat format) -> uint32_t {
+        switch (format) {
+        case VK_FORMAT_R8_UNORM:
+        case VK_FORMAT_R8_SNORM:
+        case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8_SINT:
+            return 1;
+        case VK_FORMAT_R16_UNORM:
+        case VK_FORMAT_R16_SNORM:
+        case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16_SFLOAT:
+        case VK_FORMAT_R8G8_UNORM:
+        case VK_FORMAT_R8G8_SNORM:
+        case VK_FORMAT_R8G8_UINT:
+        case VK_FORMAT_R8G8_SINT:
+            return 2;
+        case VK_FORMAT_R32_UINT:
+        case VK_FORMAT_R32_SINT:
+        case VK_FORMAT_R32_SFLOAT:
+        case VK_FORMAT_R16G16_UNORM:
+        case VK_FORMAT_R16G16_SNORM:
+        case VK_FORMAT_R16G16_UINT:
+        case VK_FORMAT_R16G16_SINT:
+        case VK_FORMAT_R16G16_SFLOAT:
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SNORM:
+        case VK_FORMAT_R8G8B8A8_UINT:
+        case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+            return 4;
+        case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32_SFLOAT:
+        case VK_FORMAT_R16G16B16A16_UNORM:
+        case VK_FORMAT_R16G16B16A16_SNORM:
+        case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R16G16B16A16_SFLOAT:
+            return 8;
+        case VK_FORMAT_R32G32B32_UINT:
+        case VK_FORMAT_R32G32B32_SINT:
+        case VK_FORMAT_R32G32B32_SFLOAT:
+            return 12;
+        case VK_FORMAT_R32G32B32A32_UINT:
+        case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_R32G32B32A32_SFLOAT:
+            return 16;
+        default:
+            return 4;
         }
-        return VkDeviceSize(img.width()) * img.height() * bpp;
+    };
+    auto texSize = [&](const Image& img) {
+        if (img.handle() == VK_NULL_HANDLE) return VkDeviceSize(0);
+        return VkDeviceSize(img.width()) * img.height() * formatBytesPerPixel(img.format());
     };
     total += texSize(rawImage_);
     total += texSize(denoisedImage_);
@@ -7319,6 +9726,38 @@ VkDeviceSize PathTracerRenderer::estimatedTextureMemory() const {
     total += texSize(momentDebugResolvedImage_);
     total += texSize(taaImage_);
     total += texSize(taaHistoryImage_);
+    total += texSize(dlssDepthImage_);
+    total += texSize(dlssMotionVectorImage_);
+    total += texSize(dlssDiffuseAlbedoImage_);
+    total += texSize(dlssSpecularAlbedoImage_);
+    total += texSize(dlssNormalImage_);
+    total += texSize(dlssRoughnessImage_);
+    total += texSize(dlssDiffuseHitDistanceImage_);
+    total += texSize(dlssSpecularHitDistanceImage_);
+    total += texSize(dlssReflectedAlbedoImage_);
+    total += texSize(dlssDisocclusionMaskImage_);
+    total += texSize(dlssDiffuseRayDirectionImage_);
+    total += texSize(dlssSpecularRayDirectionImage_);
+    total += texSize(dlssDiffuseRayDirectionHitDistanceImage_);
+    total += texSize(dlssSpecularRayDirectionHitDistanceImage_);
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    if (nrdRuntime_) {
+        total += texSize(nrdRuntime_->motionVectors);
+        total += texSize(nrdRuntime_->normalRoughness);
+        total += texSize(nrdRuntime_->viewZ);
+        total += texSize(nrdRuntime_->diffRadianceHitdist);
+        total += texSize(nrdRuntime_->specRadianceHitdist);
+        total += texSize(nrdRuntime_->outDiffRadianceHitdist);
+        total += texSize(nrdRuntime_->outSpecRadianceHitdist);
+        total += texSize(nrdRuntime_->fallbackImage);
+        for (const Image& image : nrdRuntime_->permanentPoolImages) {
+            total += texSize(image);
+        }
+        for (const Image& image : nrdRuntime_->transientPoolImages) {
+            total += texSize(image);
+        }
+    }
+#endif
     total += texSize(presentationImage_);
     return total;
 }
@@ -7356,6 +9795,13 @@ VkDeviceSize PathTracerRenderer::estimatedBufferMemory() const {
     total += wavefrontSortValidationReadbackBuffer_.size();
     total += wavefrontShadowTraceValidationBuffer_.size();
     total += wavefrontShadowTraceValidationReadbackBuffer_.size();
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    if (nrdRuntime_) {
+        for (const Buffer& buffer : nrdRuntime_->constantBuffers) {
+            total += buffer.size();
+        }
+    }
+#endif
     return total;
 }
 

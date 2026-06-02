@@ -69,6 +69,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.restirMode = render.restirMode;
         settings.restirGiEnabled = render.restirGiEnabled;
         settings.denoiserEnabled = render.denoiserEnabled;
+        settings.denoiserBackend = render.denoiserBackend;
         settings.denoiseWhileMoving = render.denoiseWhileMoving;
         settings.samplesPerPixel = render.samplesPerPixel;
         settings.limitSamplesPerPixel = render.limitSamplesPerPixel;
@@ -77,6 +78,10 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.denoiserMaxHistoryLength = render.denoiserMaxHistoryLength;
         settings.momentValidityThreshold = render.momentValidityThreshold;
         settings.taaEnabled = render.taaEnabled;
+        settings.temporalUpscaler = render.temporalUpscaler;
+        settings.dlssFrameGenerationEnabled = render.dlssFrameGenerationEnabled;
+        settings.dlssRayReconstructionEnabled = render.dlssRayReconstructionEnabled;
+        settings.dlssSharpeningStrength = render.dlssSharpeningStrength;
         settings.taaFeedback = render.taaFeedback;
         settings.taaMotionFeedback = render.taaMotionFeedback;
         settings.taaReactiveFeedback = render.taaReactiveFeedback;
@@ -137,6 +142,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     uint32_t maxRestirGiRounds = 8;
     uint32_t minRestirGiVisibilityRays = 0;
     uint32_t maxRestirGiVisibilityRays = 4;
+    const PathTracerRenderer::NvidiaIntegrationStatus nvidiaStatus = state.renderer.nvidiaIntegrationStatus();
 
     ImGui::SeparatorText("Preview Actions");
     if (editorIconTextButton("RenderSettingsResetAccumulation", EditorGlyphIcon::Reset, "Reset Accumulation")) {
@@ -244,6 +250,52 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.renderResolutionScale = presetScales[tsrPreset];
         changed = true;
     }
+    const char* temporalItems[] = {"TAA / TSR", "DLSS"};
+    int temporalIndex = static_cast<int>(settings.temporalUpscaler);
+    if (temporalIndex < 0 || temporalIndex > 1) {
+        temporalIndex = 0;
+    }
+    if (ImGui::Combo("Temporal Upscaler", &temporalIndex, temporalItems, 2)) {
+        settings.temporalUpscaler = static_cast<TemporalUpscaler>(temporalIndex);
+        if (settings.temporalUpscaler != TemporalUpscaler::Dlss) {
+            settings.dlssRayReconstructionEnabled = false;
+            settings.dlssFrameGenerationEnabled = false;
+        }
+        changed = true;
+    }
+    tooltip(settings.temporalUpscaler == TemporalUpscaler::Dlss && !nvidiaStatus.dlssAvailable
+        ? nvidiaStatus.dlssUnavailableReason.c_str()
+        : "Selects the post-denoise temporal resolve/upscale backend.");
+    changed |= ImGui::SliderFloat("DLSS Sharpening", &settings.dlssSharpeningStrength, 0.0f, 1.0f, "%.2f");
+    tooltip(nvidiaStatus.dlssAvailable
+        ? "Sharpening amount passed to DLSS Super Resolution."
+        : nvidiaStatus.dlssUnavailableReason.c_str());
+    bool rrEnabled = settings.dlssRayReconstructionEnabled;
+    ImGui::BeginDisabled(!nvidiaStatus.dlssRayReconstructionAvailable);
+    if (ImGui::Checkbox("DLSS Ray Reconstruction", &rrEnabled)) {
+        settings.dlssRayReconstructionEnabled = rrEnabled;
+        if (rrEnabled) {
+            settings.temporalUpscaler = TemporalUpscaler::Dlss;
+        }
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    tooltip(nvidiaStatus.dlssRayReconstructionAvailable
+        ? "Uses DLSS Ray Reconstruction as the temporal denoiser/upscaler."
+        : nvidiaStatus.dlssRayReconstructionUnavailableReason.c_str());
+    bool fgEnabled = settings.dlssFrameGenerationEnabled;
+    ImGui::BeginDisabled(!nvidiaStatus.dlssFrameGenerationAvailable);
+    if (ImGui::Checkbox("DLSS Frame Generation", &fgEnabled)) {
+        settings.dlssFrameGenerationEnabled = fgEnabled;
+        if (fgEnabled) {
+            settings.temporalUpscaler = TemporalUpscaler::Dlss;
+        }
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    tooltip(nvidiaStatus.dlssFrameGenerationAvailable
+        ? "Enables DLSS Frame Generation when the presentation path supports generated frames."
+        : nvidiaStatus.dlssFrameGenerationUnavailableReason.c_str());
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
     changed |= ImGui::SliderFloat("Material Anisotropy", &settings.materialTextureAnisotropy, 1.0f, 16.0f, "%.1fx");
     tooltip("Anisotropic filtering level for material textures. Unsupported devices clamp to 1x.");
@@ -422,6 +474,18 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
 
     if (ImGui::CollapsingHeader("Denoiser / TAA", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= ImGui::Checkbox("Denoiser", &settings.denoiserEnabled);
+        const char* denoiserBackendItems[] = {"Engine", "NRD"};
+        int denoiserBackendIndex = static_cast<int>(settings.denoiserBackend);
+        if (denoiserBackendIndex < 0 || denoiserBackendIndex > 1) {
+            denoiserBackendIndex = 0;
+        }
+        if (ImGui::Combo("Denoiser Backend", &denoiserBackendIndex, denoiserBackendItems, 2)) {
+            settings.denoiserBackend = static_cast<DenoiserBackend>(denoiserBackendIndex);
+            changed = true;
+        }
+        tooltip(settings.denoiserBackend == DenoiserBackend::Nrd && !nvidiaStatus.nrdAvailable
+            ? nvidiaStatus.nrdUnavailableReason.c_str()
+            : "Selects the active denoiser backend.");
         changed |= ImGui::Checkbox("Denoise While Moving", &settings.denoiseWhileMoving);
         changed |= ImGui::SliderScalar("A-trous Iterations", ImGuiDataType_U32, &settings.atrousIterations, &minAtrous, &maxAtrous);
         tooltip("Denoiser iterations. More is smoother and slower.");
@@ -500,6 +564,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.restirMode = settings.restirMode;
             render.restirGiEnabled = settings.restirGiEnabled;
             render.denoiserEnabled = settings.denoiserEnabled;
+            render.denoiserBackend = settings.denoiserBackend;
             render.denoiseWhileMoving = settings.denoiseWhileMoving;
             render.samplesPerPixel = settings.samplesPerPixel;
             render.limitSamplesPerPixel = settings.limitSamplesPerPixel;
@@ -508,6 +573,10 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.denoiserMaxHistoryLength = settings.denoiserMaxHistoryLength;
             render.momentValidityThreshold = settings.momentValidityThreshold;
             render.taaEnabled = settings.taaEnabled;
+            render.temporalUpscaler = settings.temporalUpscaler;
+            render.dlssFrameGenerationEnabled = settings.dlssFrameGenerationEnabled;
+            render.dlssRayReconstructionEnabled = settings.dlssRayReconstructionEnabled;
+            render.dlssSharpeningStrength = settings.dlssSharpeningStrength;
             render.taaFeedback = settings.taaFeedback;
             render.taaMotionFeedback = settings.taaMotionFeedback;
             render.taaReactiveFeedback = settings.taaReactiveFeedback;

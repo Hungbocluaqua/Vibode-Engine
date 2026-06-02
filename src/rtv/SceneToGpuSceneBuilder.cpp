@@ -51,6 +51,7 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.restirMode = render.restirMode;
     result.rendererSettings.restirGiEnabled = render.restirGiEnabled;
     result.rendererSettings.denoiserEnabled = render.denoiserEnabled;
+    result.rendererSettings.denoiserBackend = render.denoiserBackend;
     result.rendererSettings.denoiseWhileMoving = render.denoiseWhileMoving;
     result.rendererSettings.samplesPerPixel = render.samplesPerPixel;
     result.rendererSettings.limitSamplesPerPixel = render.limitSamplesPerPixel;
@@ -59,6 +60,10 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.denoiserMaxHistoryLength = render.denoiserMaxHistoryLength;
     result.rendererSettings.momentValidityThreshold = render.momentValidityThreshold;
     result.rendererSettings.taaEnabled = render.taaEnabled;
+    result.rendererSettings.temporalUpscaler = render.temporalUpscaler;
+    result.rendererSettings.dlssFrameGenerationEnabled = render.dlssFrameGenerationEnabled;
+    result.rendererSettings.dlssRayReconstructionEnabled = render.dlssRayReconstructionEnabled;
+    result.rendererSettings.dlssSharpeningStrength = render.dlssSharpeningStrength;
     result.rendererSettings.taaFeedback = render.taaFeedback;
     result.rendererSettings.taaMotionFeedback = render.taaMotionFeedback;
     result.rendererSettings.taaReactiveFeedback = render.taaReactiveFeedback;

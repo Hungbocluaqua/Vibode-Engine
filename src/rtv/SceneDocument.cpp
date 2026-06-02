@@ -505,6 +505,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"restirMode", static_cast<uint32_t>(renderSettings_.restirMode)},
         {"restirGiEnabled", renderSettings_.restirGiEnabled},
         {"denoiserEnabled", renderSettings_.denoiserEnabled},
+        {"denoiserBackend", static_cast<uint32_t>(renderSettings_.denoiserBackend)},
         {"denoiseWhileMoving", renderSettings_.denoiseWhileMoving},
         {"samplesPerPixel", renderSettings_.samplesPerPixel},
         {"limitSamplesPerPixel", renderSettings_.limitSamplesPerPixel},
@@ -513,6 +514,10 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"denoiserMaxHistoryLength", renderSettings_.denoiserMaxHistoryLength},
         {"momentValidityThreshold", renderSettings_.momentValidityThreshold},
         {"taaEnabled", renderSettings_.taaEnabled},
+        {"temporalUpscaler", static_cast<uint32_t>(renderSettings_.temporalUpscaler)},
+        {"dlssFrameGenerationEnabled", renderSettings_.dlssFrameGenerationEnabled},
+        {"dlssRayReconstructionEnabled", renderSettings_.dlssRayReconstructionEnabled},
+        {"dlssSharpeningStrength", renderSettings_.dlssSharpeningStrength},
         {"taaFeedback", renderSettings_.taaFeedback},
         {"taaMotionFeedback", renderSettings_.taaMotionFeedback},
         {"taaReactiveFeedback", renderSettings_.taaReactiveFeedback},
@@ -863,6 +868,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.restirMode = static_cast<RestirMode>(render.value("restirMode", static_cast<uint32_t>(renderSettings_.restirMode)));
         renderSettings_.restirGiEnabled = render.value("restirGiEnabled", renderSettings_.restirGiEnabled);
         renderSettings_.denoiserEnabled = render.value("denoiserEnabled", renderSettings_.denoiserEnabled);
+        renderSettings_.denoiserBackend = static_cast<DenoiserBackend>(render.value("denoiserBackend", static_cast<uint32_t>(renderSettings_.denoiserBackend)));
         renderSettings_.denoiseWhileMoving = render.value("denoiseWhileMoving", renderSettings_.denoiseWhileMoving);
         renderSettings_.samplesPerPixel = render.value("samplesPerPixel", renderSettings_.samplesPerPixel);
         renderSettings_.limitSamplesPerPixel = render.value("limitSamplesPerPixel", renderSettings_.limitSamplesPerPixel);
@@ -871,6 +877,10 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.denoiserMaxHistoryLength = render.value("denoiserMaxHistoryLength", renderSettings_.denoiserMaxHistoryLength);
         renderSettings_.momentValidityThreshold = render.value("momentValidityThreshold", renderSettings_.momentValidityThreshold);
         renderSettings_.taaEnabled = render.value("taaEnabled", renderSettings_.taaEnabled);
+        renderSettings_.temporalUpscaler = static_cast<TemporalUpscaler>(render.value("temporalUpscaler", static_cast<uint32_t>(renderSettings_.temporalUpscaler)));
+        renderSettings_.dlssFrameGenerationEnabled = render.value("dlssFrameGenerationEnabled", renderSettings_.dlssFrameGenerationEnabled);
+        renderSettings_.dlssRayReconstructionEnabled = render.value("dlssRayReconstructionEnabled", renderSettings_.dlssRayReconstructionEnabled);
+        renderSettings_.dlssSharpeningStrength = render.value("dlssSharpeningStrength", renderSettings_.dlssSharpeningStrength);
         renderSettings_.taaFeedback = render.value("taaFeedback", renderSettings_.taaFeedback);
         renderSettings_.taaMotionFeedback = render.value("taaMotionFeedback", renderSettings_.taaMotionFeedback);
         renderSettings_.taaReactiveFeedback = render.value("taaReactiveFeedback", renderSettings_.taaReactiveFeedback);

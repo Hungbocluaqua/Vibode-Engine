@@ -60,6 +60,34 @@ RenderPreset parseRenderPreset(std::string_view value) {
     return RenderPreset::Custom;
 }
 
+const char* denoiserBackendName(DenoiserBackend backend) {
+    switch (backend) {
+    case DenoiserBackend::Engine: return "engine";
+    case DenoiserBackend::Nrd: return "nrd";
+    }
+    return "engine";
+}
+
+DenoiserBackend parseDenoiserBackend(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "nrd" || key == "nvidia" || key == "nvidianrd") { return DenoiserBackend::Nrd; }
+    return DenoiserBackend::Engine;
+}
+
+const char* temporalUpscalerName(TemporalUpscaler upscaler) {
+    switch (upscaler) {
+    case TemporalUpscaler::TaaTsr: return "taa-tsr";
+    case TemporalUpscaler::Dlss: return "dlss";
+    }
+    return "taa-tsr";
+}
+
+TemporalUpscaler parseTemporalUpscaler(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "dlss" || key == "ngx" || key == "nvidiadlss") { return TemporalUpscaler::Dlss; }
+    return TemporalUpscaler::TaaTsr;
+}
+
 RendererDebugView parseRendererDebugView(std::string_view value) {
     const std::string key = normalized(value);
     if (key == "variance") { return RendererDebugView::Variance; }

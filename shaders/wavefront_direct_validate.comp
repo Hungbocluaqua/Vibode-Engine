@@ -11,6 +11,10 @@ struct PathDataRecord {
     vec4 indirect_diffuse;
     vec4 indirect_specular;
     vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
 };
 
 layout(set = 0, binding = 0, std430) readonly buffer PixelStateBuffer {

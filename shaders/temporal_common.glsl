@@ -1,3 +1,6 @@
+const float TEMPORAL_VELOCITY_PACK_SCALE = 512.0;
+const float TEMPORAL_MOTION_VECTOR_DEBUG_SCALE = 128.0;
+
 vec2 temporal_unpack_unorm2x16(uint packedValue) {
     return vec2(float(packedValue & 0xffffu), float((packedValue >> 16u) & 0xffffu)) / 65535.0;
 }
@@ -16,6 +19,11 @@ vec2 temporal_unpack_velocity_pixels(uint packedVelocity, float velocityScale) {
         y -= 65536;
     }
     return vec2(float(x), float(y)) * (velocityScale / 32767.0);
+}
+
+bool temporal_velocity_pixels_are_invalid(vec2 velocityPixels, float velocityScale) {
+    float sentinel = max(velocityScale, 1.0);
+    return any(greaterThanEqual(abs(velocityPixels), vec2(sentinel * 0.999)));
 }
 
 vec2 temporal_reproject_pixel(ivec2 coords, vec2 velocityPixels) {

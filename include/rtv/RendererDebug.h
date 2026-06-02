@@ -136,6 +136,16 @@ enum class RenderPreset : uint32_t {
     Ultra = 3,
 };
 
+enum class DenoiserBackend : uint32_t {
+    Engine = 0,
+    Nrd = 1,
+};
+
+enum class TemporalUpscaler : uint32_t {
+    TaaTsr = 0,
+    Dlss = 1,
+};
+
 struct RendererDebugParams {
     uint32_t view = static_cast<uint32_t>(RendererDebugView::Beauty);
     uint32_t flags = 0;
@@ -149,6 +159,10 @@ inline constexpr uint32_t rendererDebugFlagRayTracingCounters = 1u << 0u;
 [[nodiscard]] const char* restirModeName(RestirMode mode);
 [[nodiscard]] const char* renderPresetName(RenderPreset preset);
 [[nodiscard]] RenderPreset parseRenderPreset(std::string_view value);
+[[nodiscard]] const char* denoiserBackendName(DenoiserBackend backend);
+[[nodiscard]] DenoiserBackend parseDenoiserBackend(std::string_view value);
+[[nodiscard]] const char* temporalUpscalerName(TemporalUpscaler upscaler);
+[[nodiscard]] TemporalUpscaler parseTemporalUpscaler(std::string_view value);
 [[nodiscard]] RendererDebugView parseRendererDebugView(std::string_view value);
 [[nodiscard]] const char* rendererDebugViewName(RendererDebugView view);
 

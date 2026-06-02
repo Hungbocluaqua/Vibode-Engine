@@ -99,7 +99,11 @@ void write_primary_gbuffer_miss(uint pixel_index, vec3 ray_dir, vec3 radiance) {
     path_data.direct_specular = vec4(0.0, 0.0, 0.0, 65504.0);
     path_data.indirect_diffuse = vec4(max(radiance, vec3(0.0)), 0.0);
     path_data.indirect_specular = vec4(0.0, 0.0, 0.0, 65504.0);
-    path_data.albedo_roughness_hit_confidence = vec4(0.0, 0.0, 0.0, 1.0);
+    path_data.albedo_roughness_hit_confidence = vec4(0.5, 0.5, 0.5, 1.0);
+    path_data.material_specular_albedo = vec4(0.5, 0.5, 0.5, 0.0);
+    path_data.denoiser_hit_distance = vec4(0.0, 0.0, 65504.0, 0.0);
+    path_data.diffuse_ray_direction_hit_distance = vec4(normalize(ray_dir), 0.0);
+    path_data.specular_ray_direction_hit_distance = vec4(normalize(ray_dir), 0.0);
     path_data_buffer[pixel_index] = path_data;
 }
 
@@ -118,7 +122,12 @@ void write_primary_gbuffer_hit(uint pixel_index, WavefrontHit hit, Material mate
     path_data.direct_specular = vec4(0.0, 0.0, 0.0, min(depth, 65504.0));
     path_data.indirect_diffuse = vec4(max(radiance, vec3(0.0)) * diffuse_weight, 1.0);
     path_data.indirect_specular = vec4(max(radiance, vec3(0.0)) * specular_weight, 65504.0);
-    path_data.albedo_roughness_hit_confidence = vec4(material.color, material.roughness);
+    path_data.albedo_roughness_hit_confidence = vec4(pbr_diffuse_reflectance(material), material.roughness);
+    path_data.material_specular_albedo = vec4(pbr_specular_reflectance(material, 1.0), 1.0);
+    path_data.denoiser_hit_distance = vec4(depth, 65504.0, depth, 1.0);
+    vec3 camera_ray_dir = normalize(hit_pos - camera.pos.xyz);
+    path_data.diffuse_ray_direction_hit_distance = vec4(camera_ray_dir, depth);
+    path_data.specular_ray_direction_hit_distance = vec4(camera_ray_dir, 65504.0);
     path_data_buffer[pixel_index] = path_data;
 }
 
@@ -143,25 +152,35 @@ RestirReservoir wavefront_empty_restir_reservoir() {
     RestirReservoir reservoir;
     reservoir.metadata = uvec4(0u);
     reservoir.sample_value_confidence = vec4(0.0);
+    reservoir.sample_position_distance = vec4(0.0);
+    reservoir.sample_radiance_target = vec4(0.0);
+    reservoir.sample_normal_weight = vec4(0.0);
+    reservoir.sample_metadata = uvec4(0u);
     restir_set_source_pdf_and_previous_weight(reservoir, 1.0e-6, 0.0);
     return reservoir;
 }
 
-RestirReservoir wavefront_make_initial_restir_reservoir(vec3 direct_light, float light_pdf, uint sample_type, float roughness) {
-    bool valid = sample_type != 0u && light_pdf > 1.0e-6;
-    vec3 sample_value = valid ? max(direct_light, vec3(0.0)) : vec3(0.0);
+RestirReservoir wavefront_make_initial_restir_reservoir(vec3 direct_light, float light_pdf, uint sample_type, float roughness, uint material_id, uint instance_id) {
+    bool has_candidate = sample_type != 0u && light_pdf > 1.0e-6;
+    vec3 sample_value = has_candidate ? max(direct_light, vec3(0.0)) : vec3(0.0);
     sample_value = clamp_luminance_preserve_hue(
         sample_value,
         wavefront_direct_contribution_luminance_limit(sample_type, roughness));
+    float target_lum = luminance(sample_value);
+    bool valid = has_candidate && target_lum > 1.0e-6;
 
     RestirReservoir current;
     current.metadata = uvec4(
-        sample_type,
+        valid ? sample_type : 0u,
         0u,
         restir_pack_state(0u, restir_pack_validity_visibility(valid, RESTIR_VISIBILITY_VISIBLE), valid ? 1u : 0u),
-        valid ? restir_temporal_signature(sample_type, roughness) : 0u);
+        restir_temporal_signature(max(sample_type, 1u), roughness, material_id, instance_id));
     restir_set_source_pdf_and_previous_weight(current, valid ? light_pdf : 1.0e-6, 0.0);
     current.sample_value_confidence = vec4(sample_value, valid ? 1.0 : 0.0);
+    current.sample_position_distance = vec4(0.0, 1.0, 0.0, 0.0);
+    current.sample_radiance_target = vec4(sample_value, valid ? target_lum : 0.0);
+    current.sample_normal_weight = vec4(0.0, 1.0, 0.0, valid ? target_lum / max(light_pdf, 1.0e-6) : 0.0);
+    current.sample_metadata = uvec4(0u, valid ? sample_type : 0u, material_id, instance_id);
     return current;
 }
 
@@ -405,6 +424,8 @@ void enqueue_first_bounce_direct_lighting(
     vec3 normal,
     vec3 wo,
     Material material,
+    uint material_id,
+    uint instance_id,
     vec3 tangent,
     vec3 bitangent,
     vec3 throughput,
@@ -464,7 +485,7 @@ void enqueue_first_bounce_direct_lighting(
         vec3 contribution = throughput * selected_bsdf * selected_emission * cos_surface * weight / max(effective_light_pdf, 1.0e-6);
         if (luminance(contribution) > 0.0) {
             if (!restir_candidate_valid) {
-                restir_candidate = wavefront_make_initial_restir_reservoir(contribution, effective_light_pdf, 1u, material.roughness);
+                restir_candidate = wavefront_make_initial_restir_reservoir(contribution, effective_light_pdf, 1u, material.roughness, material_id, instance_id);
                 restir_candidate_valid = restir_reservoir_valid(restir_candidate);
             }
             enqueue_shadow_ray(pixel_index, wavefront_shadow_origin(hit_pos, normal, selected_wi), selected_wi, contribution, effective_light_pdf, max(selected_distance - shadow_distance_bias(), 0.0), 1u, flags);
@@ -483,10 +504,6 @@ void enqueue_first_bounce_direct_lighting(
             float weight = power_heuristic(env_pdf, bsdf_pdf);
             vec3 contribution = throughput * bsdf * env_radiance * cos_surface * weight / max(env_pdf, 1.0e-6) / float(env_sample_count);
             if (luminance(contribution) > 0.0) {
-                if (!restir_candidate_valid) {
-                    restir_candidate = wavefront_make_initial_restir_reservoir(contribution, env_pdf, 2u, material.roughness);
-                    restir_candidate_valid = restir_reservoir_valid(restir_candidate);
-                }
                 enqueue_shadow_ray(pixel_index, wavefront_shadow_origin(hit_pos, normal, env_dir), env_dir, contribution, env_pdf, 10000.0, 2u, flags);
             }
         }
@@ -503,10 +520,6 @@ void enqueue_first_bounce_direct_lighting(
             float weight = power_heuristic(sun_pdf, bsdf_pdf);
             vec3 contribution = throughput * bsdf * sun_radiance * sun_transmittance(hit_pos, sun_wi) * ndl * weight / max(sun_pdf, 1.0e-6);
             if (luminance(contribution) > 0.0) {
-                if (!restir_candidate_valid) {
-                    restir_candidate = wavefront_make_initial_restir_reservoir(contribution, sun_pdf, 3u, material.roughness);
-                    restir_candidate_valid = restir_reservoir_valid(restir_candidate);
-                }
                 enqueue_shadow_ray(pixel_index, wavefront_shadow_origin(hit_pos, normal, sun_wi), sun_wi, contribution, sun_pdf, 10000.0, 3u, flags);
             }
         }
@@ -633,6 +646,8 @@ void main() {
             lighting_normal,
             wo,
             material,
+            hit.material_instance_primitive.x,
+            hit.material_instance_primitive.y,
             tangent,
             bitangent,
             throughput,
