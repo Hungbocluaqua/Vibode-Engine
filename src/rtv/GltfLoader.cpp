@@ -973,7 +973,10 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
     const std::filesystem::path cachePath = SceneCache::cachePathFor(path);
 
     if (useCache_ && SceneCache::isCacheValid(path, cachePath)) {
+        const auto cacheReadStart = std::chrono::high_resolution_clock::now();
         auto cached = SceneCache::load(cachePath);
+        const auto cacheReadEnd = std::chrono::high_resolution_clock::now();
+        const double cacheReadMs = std::chrono::duration<double, std::milli>(cacheReadEnd - cacheReadStart).count();
         if (cached.has_value()) {
             uint64_t actualGltfMtime = SceneCache::fileMtime(path);
             if (cached->sourceMtime != actualGltfMtime) {
@@ -992,7 +995,7 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
             }
 
             if (cached.has_value()) {
-                const auto start = std::chrono::high_resolution_clock::now();
+                const auto rebuildStart = std::chrono::high_resolution_clock::now();
 
                 SceneAsset scene;
                 scene.name = cached->name;
@@ -1130,24 +1133,47 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                 }
                 scene.rootNodes = cached->rootNodes;
 
-                const auto end = std::chrono::high_resolution_clock::now();
-                const double loadMs = std::chrono::duration<double, std::milli>(end - start).count();
-                std::cout << "Scene cache hit: loaded in " << loadMs << " ms (name: " << cached->name << ")\n";
+                const auto rebuildEnd = std::chrono::high_resolution_clock::now();
+                const double rebuildMs = std::chrono::duration<double, std::milli>(rebuildEnd - rebuildStart).count();
+                std::cout << "Scene cache hit: read_ms=" << cacheReadMs
+                          << " rebuild_assets_ms=" << rebuildMs
+                          << " name=" << cached->name << "\n";
                 return scene;
             }
         }
     }
 
-    const auto start = std::chrono::high_resolution_clock::now();
+    const auto totalStart = std::chrono::high_resolution_clock::now();
+    const auto parseStart = std::chrono::high_resolution_clock::now();
     SceneAsset scene = load(path);
-    const auto end = std::chrono::high_resolution_clock::now();
-    const double loadMs = std::chrono::duration<double, std::milli>(end - start).count();
+    const auto parseEnd = std::chrono::high_resolution_clock::now();
+    const double parseMs = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
 
+    if (!cacheWritesEnabled_) {
+        const auto totalEnd = std::chrono::high_resolution_clock::now();
+        const double totalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+        std::cout << "glTF loaded (cache write skipped): parse_ms=" << parseMs
+                  << " total_ms=" << totalMs << "\n";
+        return scene;
+    }
+
+    const auto cacheBuildStart = std::chrono::high_resolution_clock::now();
     CachedScene cached = buildCachedScene(path, scene);
-    if (SceneCache::save(cachePath, cached)) {
+    const auto cacheBuildEnd = std::chrono::high_resolution_clock::now();
+    const double cacheBuildMs = std::chrono::duration<double, std::milli>(cacheBuildEnd - cacheBuildStart).count();
+    const auto cacheSaveStart = std::chrono::high_resolution_clock::now();
+    const bool cacheSaved = SceneCache::save(cachePath, cached);
+    const auto cacheSaveEnd = std::chrono::high_resolution_clock::now();
+    const double cacheSaveMs = std::chrono::duration<double, std::milli>(cacheSaveEnd - cacheSaveStart).count();
+    if (cacheSaved) {
         std::cout << "Scene cache created: " << cachePath.string() << "\n";
     }
-    std::cout << "glTF loaded (uncached): " << loadMs << " ms\n";
+    const auto totalEnd = std::chrono::high_resolution_clock::now();
+    const double totalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+    std::cout << "glTF loaded (uncached): parse_ms=" << parseMs
+              << " cache_build_ms=" << cacheBuildMs
+              << " cache_save_ms=" << cacheSaveMs
+              << " total_ms=" << totalMs << "\n";
     return scene;
 }
 

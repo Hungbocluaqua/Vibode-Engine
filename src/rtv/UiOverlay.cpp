@@ -586,6 +586,11 @@ void UiOverlay::invalidateViewportTexture() {
     descriptorPoolStats_.viewportDescriptorAllocated = 0;
 }
 
+void UiOverlay::invalidateRendererTextures() {
+    invalidateViewportTexture();
+    invalidateEditorTextures();
+}
+
 VkDescriptorSet UiOverlay::acquireEditorTextureCallback(void* user, VkImageView imageView, VkImageLayout imageLayout) {
     auto* overlay = static_cast<UiOverlay*>(user);
     return overlay != nullptr ? overlay->acquireEditorTexture(imageView, imageLayout) : VK_NULL_HANDLE;

@@ -78,13 +78,21 @@ struct MeshOpacityMicromapBuild {
     Buffer indexBuffer;
     Buffer triangleArrayBuffer;
     Buffer dataBuffer;
+    VkDeviceSize triangleArrayBufferOffset = 0;
+    VkDeviceSize dataBufferOffset = 0;
     VkMicromapBuildSizesInfoEXT sizes{};
     VkMicromapEXT micromap = VK_NULL_HANDLE;
 };
 
+constexpr VkDeviceSize kOpacityMicromapBuildInputAlignment = 256;
 constexpr uint32_t kOpacity4StateTransparent = 0u;
 constexpr uint32_t kOpacity4StateOpaque = 1u;
 constexpr uint32_t kOpacity4StateUnknownOpaque = 3u;
+
+VkDeviceSize alignedDeviceAddressOffset(const Buffer& buffer, VkDeviceSize alignment) {
+    const VkDeviceAddress address = buffer.deviceAddress();
+    return Buffer::alignUp(address, alignment) - address;
+}
 
 uint32_t microTriangleCountForSubdivision(uint32_t subdivisionLevel) {
     if (subdivisionLevel >= 16u) {
@@ -166,7 +174,17 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
             opacityMicromapBuilds[meshBuildIndex].enabled &&
             opacityMicromapBuilds[meshBuildIndex].micromap != VK_NULL_HANDLE;
 
-        if (!primitiveRecords.empty() && mesh.primitiveOffset < primitiveRecords.size()) {
+        if (mesh.indexCount >= 3u && (!meshHasOmm || !mesh.containsBlendedGeometry)) {
+            const uint32_t fallbackAlphaClass = mesh.containsBlendedGeometry ? kPrimitiveAlphaClassBlended :
+                (mesh.containsAlphaTestedGeometry ? kPrimitiveAlphaClassAlphaTested : kPrimitiveAlphaClassOpaque);
+            plan.ranges.push_back(BlasGeometryRange{
+                .firstIndex = mesh.firstIndex,
+                .indexCount = mesh.indexCount,
+                .alphaClass = fallbackAlphaClass,
+                .opaqueTraversalSafe = mesh.opaqueTraversalSafe && fallbackAlphaClass == kPrimitiveAlphaClassOpaque,
+                .useOpacityMicromap = meshHasOmm && !mesh.containsBlendedGeometry,
+            });
+        } else if (!primitiveRecords.empty() && mesh.primitiveOffset < primitiveRecords.size()) {
             const uint32_t primitiveEnd = std::min<uint32_t>(
                 mesh.primitiveOffset + mesh.primitiveCount,
                 static_cast<uint32_t>(primitiveRecords.size()));
@@ -387,27 +405,29 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
         if (!build.triangleArray.empty()) {
             const VkDeviceSize triangleBytes = sizeof(VkMicromapTriangleEXT) * build.triangleArray.size();
             build.triangleArrayBuffer.create(allocator, BufferDesc{
-                .size = std::max<VkDeviceSize>(triangleBytes, 4),
+                .size = std::max<VkDeviceSize>(triangleBytes + kOpacityMicromapBuildInputAlignment - 1, 4),
                 .usage = VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                 .memory = BufferMemory::Upload,
                 .persistentMapped = true,
                 .debugName = "opacity micromap triangle array",
             });
-            build.triangleArrayBuffer.write(build.triangleArray.data(), triangleBytes);
-            build.triangleArrayBuffer.flush(triangleBytes);
-            stats.buildInputBytes += triangleBytes;
+            build.triangleArrayBufferOffset = alignedDeviceAddressOffset(build.triangleArrayBuffer, kOpacityMicromapBuildInputAlignment);
+            build.triangleArrayBuffer.write(build.triangleArray.data(), triangleBytes, build.triangleArrayBufferOffset);
+            build.triangleArrayBuffer.flush(triangleBytes, build.triangleArrayBufferOffset);
+            stats.buildInputBytes += build.triangleArrayBufferOffset + triangleBytes;
 
             const VkDeviceSize dataBytes = build.packedData.size();
             build.dataBuffer.create(allocator, BufferDesc{
-                .size = std::max<VkDeviceSize>(dataBytes, 4),
+                .size = std::max<VkDeviceSize>(dataBytes + kOpacityMicromapBuildInputAlignment - 1, 4),
                 .usage = VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                 .memory = BufferMemory::Upload,
                 .persistentMapped = true,
                 .debugName = "opacity micromap packed data",
             });
-            build.dataBuffer.write(build.packedData.data(), dataBytes);
-            build.dataBuffer.flush(dataBytes);
-            stats.buildInputBytes += dataBytes;
+            build.dataBufferOffset = alignedDeviceAddressOffset(build.dataBuffer, kOpacityMicromapBuildInputAlignment);
+            build.dataBuffer.write(build.packedData.data(), dataBytes, build.dataBufferOffset);
+            build.dataBuffer.flush(dataBytes, build.dataBufferOffset);
+            stats.buildInputBytes += build.dataBufferOffset + dataBytes;
 
             VkMicromapBuildInfoEXT buildInfo{};
             buildInfo.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_INFO_EXT;
@@ -415,8 +435,8 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
             buildInfo.mode = VK_BUILD_MICROMAP_MODE_BUILD_EXT;
             buildInfo.usageCountsCount = 1;
             buildInfo.pUsageCounts = &build.usage;
-            buildInfo.data.deviceAddress = build.dataBuffer.deviceAddress();
-            buildInfo.triangleArray.deviceAddress = build.triangleArrayBuffer.deviceAddress();
+            buildInfo.data.deviceAddress = build.dataBuffer.deviceAddress() + build.dataBufferOffset;
+            buildInfo.triangleArray.deviceAddress = build.triangleArrayBuffer.deviceAddress() + build.triangleArrayBufferOffset;
             buildInfo.triangleArrayStride = sizeof(VkMicromapTriangleEXT);
 
             build.sizes.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT;
@@ -871,9 +891,9 @@ void RayTracingScene::build(
             micromapBuildInfo.dstMicromap = opacityBuild.micromap;
             micromapBuildInfo.usageCountsCount = 1;
             micromapBuildInfo.pUsageCounts = &opacityBuild.usage;
-            micromapBuildInfo.data.deviceAddress = opacityBuild.dataBuffer.deviceAddress();
+            micromapBuildInfo.data.deviceAddress = opacityBuild.dataBuffer.deviceAddress() + opacityBuild.dataBufferOffset;
             micromapBuildInfo.scratchData.deviceAddress = scratchAddress;
-            micromapBuildInfo.triangleArray.deviceAddress = opacityBuild.triangleArrayBuffer.deviceAddress();
+            micromapBuildInfo.triangleArray.deviceAddress = opacityBuild.triangleArrayBuffer.deviceAddress() + opacityBuild.triangleArrayBufferOffset;
             micromapBuildInfo.triangleArrayStride = sizeof(VkMicromapTriangleEXT);
             vkCmdBuildMicromapsEXT(cmd, 1, &micromapBuildInfo);
             recordedOpacityMicromapBuilds = true;

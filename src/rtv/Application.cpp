@@ -212,27 +212,129 @@ uint64_t countSceneTriangles(const SceneAsset& scene, const AssetManager& assets
     return triangles;
 }
 
-RendererSettings interactiveSettingsForScene(RendererSettings settings, const SceneAsset& scene, const AssetManager& assets, bool& changed) {
+RendererSettings interactiveSettingsForScene(RendererSettings settings, const SceneAsset& scene, const AssetManager& assets, bool importSafeRuntime, bool& changed) {
     changed = false;
     const uint64_t triangleCount = countSceneTriangles(scene, assets);
-    if (triangleCount < largeSceneTriangleThreshold) {
-        return settings;
+    bool runtimeSettingsChanged = false;
+    bool largeSceneSettingsChanged = false;
+
+    auto setBool = [&](bool& field, bool value, bool& localChanged) {
+        if (field != value) {
+            field = value;
+            changed = true;
+            localChanged = true;
+        }
+    };
+    auto setUint = [&](uint32_t& field, uint32_t value, bool& localChanged) {
+        if (field != value) {
+            field = value;
+            changed = true;
+            localChanged = true;
+        }
+    };
+    auto capUint = [&](uint32_t& field, uint32_t maxValue, bool& localChanged) {
+        const uint32_t value = std::min(field, maxValue);
+        if (field != value) {
+            field = value;
+            changed = true;
+            localChanged = true;
+        }
+    };
+    auto capFloat = [&](float& field, float maxValue, bool& localChanged) {
+        const float value = std::min(field, maxValue);
+        if (std::abs(field - value) > 0.0001f) {
+            field = value;
+            changed = true;
+            localChanged = true;
+        }
+    };
+    auto setDenoiserBackend = [&](DenoiserBackend value, bool& localChanged) {
+        if (settings.denoiserBackend != value) {
+            settings.denoiserBackend = value;
+            changed = true;
+            localChanged = true;
+        }
+    };
+    auto setTemporalUpscaler = [&](TemporalUpscaler value, bool& localChanged) {
+        if (settings.temporalUpscaler != value) {
+            settings.temporalUpscaler = value;
+            changed = true;
+            localChanged = true;
+        }
+    };
+    auto setAdaptiveQualityMode = [&](AdaptiveQualityMode value, bool& localChanged) {
+        if (settings.adaptiveQualityMode != value) {
+            settings.adaptiveQualityMode = value;
+            changed = true;
+            localChanged = true;
+        }
+    };
+    auto setCustomPresetIfNeeded = [&](bool& localChanged) {
+        if (settings.renderPreset != RenderPreset::Custom) {
+            settings.renderPreset = RenderPreset::Custom;
+            changed = true;
+            localChanged = true;
+        }
+    };
+
+    if (importSafeRuntime) {
+        setBool(settings.denoiserEnabled, true, runtimeSettingsChanged);
+        setDenoiserBackend(DenoiserBackend::Engine, runtimeSettingsChanged);
+        setBool(settings.denoiseWhileMoving, true, runtimeSettingsChanged);
+        setBool(settings.taaEnabled, true, runtimeSettingsChanged);
+        setTemporalUpscaler(TemporalUpscaler::TaaTsr, runtimeSettingsChanged);
+        setBool(settings.dlssFrameGenerationEnabled, false, runtimeSettingsChanged);
+        setBool(settings.dlssRayReconstructionEnabled, false, runtimeSettingsChanged);
+        if (runtimeSettingsChanged) {
+            setCustomPresetIfNeeded(runtimeSettingsChanged);
+            std::cout << "glTF import runtime settings: using engine denoiser and TAA/TSR; "
+                      << "DLSS/NRD disabled for initial scene load. Enable them after the scene is loaded if needed.\n";
+        }
     }
 
-    const uint32_t cappedBounces = std::min(settings.maxBounces, 4u);
-    const float cappedScale = std::min(settings.renderResolutionScale, 0.5f);
-    changed = cappedBounces != settings.maxBounces ||
-        std::abs(cappedScale - settings.renderResolutionScale) > 0.0001f ||
-        !settings.denoiserEnabled;
-    settings.maxBounces = cappedBounces;
-    settings.renderResolutionScale = cappedScale;
-    settings.denoiserEnabled = true;
-    settings.renderPreset = RenderPreset::Custom;
-    if (changed) {
+    if (triangleCount >= largeSceneTriangleThreshold) {
+        capUint(settings.maxBounces, 2u, largeSceneSettingsChanged);
+        setUint(settings.samplesPerPixel, 1u, largeSceneSettingsChanged);
+        setBool(settings.limitSamplesPerPixel, true, largeSceneSettingsChanged);
+        setUint(settings.environmentDirectSamples, 1u, largeSceneSettingsChanged);
+        capUint(settings.atrousIterations, 2u, largeSceneSettingsChanged);
+        capUint(settings.denoiserMaxHistoryLength, 32u, largeSceneSettingsChanged);
+        capFloat(settings.renderResolutionScale, 0.35f, largeSceneSettingsChanged);
+        capFloat(settings.materialTextureAnisotropy, 2.0f, largeSceneSettingsChanged);
+        capFloat(settings.fireflyClamp, 7.0f, largeSceneSettingsChanged);
+        setBool(settings.denoiserEnabled, true, largeSceneSettingsChanged);
+        setDenoiserBackend(DenoiserBackend::Engine, largeSceneSettingsChanged);
+        setBool(settings.denoiseWhileMoving, true, largeSceneSettingsChanged);
+        setBool(settings.taaEnabled, true, largeSceneSettingsChanged);
+        setTemporalUpscaler(TemporalUpscaler::TaaTsr, largeSceneSettingsChanged);
+        setBool(settings.dlssFrameGenerationEnabled, false, largeSceneSettingsChanged);
+        setBool(settings.dlssRayReconstructionEnabled, false, largeSceneSettingsChanged);
+        setBool(settings.restirGiEnabled, false, largeSceneSettingsChanged);
+        setBool(settings.restirGiHalfResolution, true, largeSceneSettingsChanged);
+        setUint(settings.restirGiSpatialRounds, 1u, largeSceneSettingsChanged);
+        capFloat(settings.restirGiSpatialRadius, 3.0f, largeSceneSettingsChanged);
+        setUint(settings.restirGiVisibilityRayBudget, 1u, largeSceneSettingsChanged);
+        setBool(settings.opacityMicromapsEnabled, false, largeSceneSettingsChanged);
+        setUint(settings.opacityMicromapSubdivisionLevel, 0u, largeSceneSettingsChanged);
+        setBool(settings.shaderExecutionReorderingEnabled, false, largeSceneSettingsChanged);
+        setBool(settings.motionBlurEnabled, false, largeSceneSettingsChanged);
+        setBool(settings.homogeneousVolumeEnabled, false, largeSceneSettingsChanged);
+        setBool(settings.mneeCausticsEnabled, false, largeSceneSettingsChanged);
+        setAdaptiveQualityMode(AdaptiveQualityMode::Aggressive, largeSceneSettingsChanged);
+        if (largeSceneSettingsChanged) {
+            setCustomPresetIfNeeded(largeSceneSettingsChanged);
+        }
+    }
+
+    if (largeSceneSettingsChanged) {
         std::cout << "Large glTF scene detected (" << triangleCount
-                  << " triangles); using interactive defaults: bounces="
+                  << " triangles); using import-safe interactive defaults: bounces="
                   << settings.maxBounces << " resolution_scale="
-                  << settings.renderResolutionScale << ". Raise these in Render Settings for final-quality renders.\n";
+                  << settings.renderResolutionScale
+                  << " restir_gi=" << (settings.restirGiEnabled ? "on" : "off")
+                  << " dlss=" << (settings.temporalUpscaler == TemporalUpscaler::Dlss ? "on" : "off")
+                  << " omm=" << (settings.opacityMicromapsEnabled ? "on" : "off")
+                  << ". Raise quality in Render Settings after the scene is loaded.\n";
     }
     return settings;
 }
@@ -1477,7 +1579,8 @@ void Application::initVulkan() {
     }
     bool largeSceneSettingsChanged = false;
     if (importedScene_.has_value()) {
-        startupSettings = interactiveSettingsForScene(startupSettings, *importedScene_, assets_, largeSceneSettingsChanged);
+        const bool importSafeRuntime = !headless_ && gltfPath_.has_value() && !scenePath_.has_value();
+        startupSettings = interactiveSettingsForScene(startupSettings, *importedScene_, assets_, importSafeRuntime, largeSceneSettingsChanged);
         if (largeSceneSettingsChanged) {
             syncDocumentRenderSettings(sceneDocument_, startupSettings);
         }
@@ -1992,6 +2095,7 @@ void Application::reloadGltfScene(const std::filesystem::path& path) {
     result.sourcePath = path;
     try {
         GltfLoader loader(result.assets);
+        loader.setCacheWritesEnabled(false);
         result.importedScene = loader.loadWithCache(path);
         auto document = std::make_unique<SceneDocument>();
         document->importSceneAsset(*result.importedScene);
@@ -2096,6 +2200,15 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
         return false;
     }
 
+    const auto applyStart = std::chrono::steady_clock::now();
+    auto elapsedMs = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+    double prepareDocumentMs = 0.0;
+    double sceneBuildMs = 0.0;
+    double rendererCreateMs = 0.0;
+    double stateSwapMs = 0.0;
+
     const RendererSettings previousSettings = pathTracer_ != nullptr ? pathTracer_->settings() : RendererSettings{};
     const std::optional<std::filesystem::path> nextGltfPath = sceneDirtyAfterApply
         ? std::optional<std::filesystem::path>{result.sourcePath}
@@ -2103,15 +2216,12 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
     const std::optional<std::filesystem::path> nextHdrPath = sceneDirtyAfterApply
         ? hdrPath_
         : result.stagedScene->sourceHdrPath();
-    bool largeSceneSettingsChanged = false;
     RendererSettings reloadSettings = sceneDirtyAfterApply
         ? previousSettings
         : rendererSettingsFromDocument(*result.stagedScene, previousSettings);
-    if (result.importedScene.has_value()) {
-        reloadSettings = interactiveSettingsForScene(reloadSettings, *result.importedScene, result.assets, largeSceneSettingsChanged);
-    }
 
     try {
+        const auto prepareDocumentStart = std::chrono::steady_clock::now();
         SceneDocument nextDocument = std::move(*result.stagedScene);
         if (sceneDirtyAfterApply) {
             nextDocument.setSourceHdrPath(hdrPath_);
@@ -2148,23 +2258,48 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
             }
         }
         reloadSettings = rendererSettingsFromDocument(nextDocument, reloadSettings);
+        if (result.importedScene.has_value()) {
+            bool finalInteractiveSettingsChanged = false;
+            const bool importSafeRuntime = sceneDirtyAfterApply && !headless_ && result.mode == SceneLoadMode::ImportSceneAsNewScene;
+            reloadSettings = interactiveSettingsForScene(reloadSettings, *result.importedScene, result.assets, importSafeRuntime, finalInteractiveSettingsChanged);
+            if (finalInteractiveSettingsChanged && sceneDirtyAfterApply) {
+                syncDocumentRenderSettings(nextDocument, reloadSettings);
+            }
+        }
         applyDocumentMaterialAssignments(nextDocument, result.assets);
+        prepareDocumentMs = elapsedMs(prepareDocumentStart);
 
+        std::cout << sceneLoadModeLabel(result.mode) << " apply stage: scene_builder path="
+                  << result.sourcePath.string() << '\n' << std::flush;
+        const auto sceneBuildStart = std::chrono::steady_clock::now();
         const SceneGpuBuildResult build = sceneBuilder_.build(nextDocument, &result.assets, reloadSettings);
+        sceneBuildMs = elapsedMs(sceneBuildStart);
         const std::optional<std::filesystem::path> cachePath = sceneDirtyAfterApply
             ? SceneCache::cachePathFor(result.sourcePath)
             : (nextGltfPath.has_value() ? SceneCache::cachePathFor(*nextGltfPath) : std::optional<std::filesystem::path>{});
 
+        std::cout << sceneLoadModeLabel(result.mode) << " apply stage: renderer_create meshes="
+                  << build.sceneAsset.meshes.size()
+                  << " materials=" << build.sceneAsset.materials.size()
+                  << " textures=" << build.sceneAsset.textures.size()
+                  << " path=" << result.sourcePath.string() << '\n' << std::flush;
+        const auto rendererCreateStart = std::chrono::steady_clock::now();
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             build.sceneAsset.meshes.empty() ? nullptr : &build.sceneAsset,
             build.sceneAsset.meshes.empty() ? nullptr : &result.assets,
             result.importedScene.has_value() ? cachePath : std::optional<std::filesystem::path>{},
             &reloadSettings);
+        rendererCreateMs = elapsedMs(rendererCreateStart);
 
+        const auto stateSwapStart = std::chrono::steady_clock::now();
         if (uiOverlay_) {
-            uiOverlay_->invalidateViewportTexture();
+            uiOverlay_->invalidateRendererTextures();
+            uiOverlay_->editor().invalidateAssetThumbnails();
+            uiOverlay_->editor().clearSelection();
         }
         cameraController_.releaseMouse(window_);
+        pendingPostFrameSettings_.reset();
+        editorPlacement_ = {};
 
         assets_ = std::move(result.assets);
         importedScene_ = std::move(result.importedScene);
@@ -2185,10 +2320,19 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
         pathTracer_ = std::move(nextPathTracer);
         applyActiveSceneCamera();
         commandSystem_->setPathTracer(pathTracer_.get());
+        stateSwapMs = elapsedMs(stateSwapStart);
     } catch (const std::exception& error) {
         sceneLoadingStatus_ = std::string(sceneLoadModeLabel(result.mode)) + " apply failed: " + error.what();
         notifications_.notify(std::string(sceneLoadModeLabel(result.mode)) + " apply failed", NotificationType::Error);
         std::cerr << sceneLoadingStatus_ << '\n';
+        std::cerr << sceneLoadModeLabel(result.mode)
+                  << " apply failed after_ms=" << elapsedMs(applyStart)
+                  << " prepare_ms=" << prepareDocumentMs
+                  << " scene_build_ms=" << sceneBuildMs
+                  << " renderer_create_ms=" << rendererCreateMs
+                  << " state_swap_ms=" << stateSwapMs
+                  << " worker_total_ms=" << result.workerTotalMs
+                  << " path=" << result.sourcePath.string() << '\n';
         return false;
     }
 
@@ -2212,6 +2356,16 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
     if (project_.has_value() && result.mode == SceneLoadMode::LoadProjectStartupScene) {
         queueProjectThumbnailCapture();
     }
+    const double applyTotalMs = elapsedMs(applyStart);
+    std::cout << sceneLoadModeLabel(result.mode)
+              << " apply timings: total_ms=" << applyTotalMs
+              << " prepare_ms=" << prepareDocumentMs
+              << " scene_build_ms=" << sceneBuildMs
+              << " renderer_create_ms=" << rendererCreateMs
+              << " state_swap_ms=" << stateSwapMs
+              << " worker_total_ms=" << result.workerTotalMs
+              << " worker_gltf_cache_ms=" << result.workerGltfLoadMs
+              << " path=" << result.sourcePath.string() << '\n';
     std::cout << sceneLoadingStatus_;
     if (importedScene_.has_value()) {
         std::cout << " meshes=" << importedScene_->meshes.size()
@@ -2872,6 +3026,7 @@ bool Application::mergeSceneIntoCurrent(const std::filesystem::path& path, bool 
     result.sourcePath = path;
     try {
         GltfLoader loader(result.assets);
+        loader.setCacheWritesEnabled(false);
         result.importedScene = loader.loadWithCache(path);
         result.success = true;
     } catch (const std::exception& error) {
@@ -3966,7 +4121,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         SceneGpuBuildResult& sceneBuild = ensureBuild();
         const RendererSettings previousSettings = pathTracer_->settings();
         if (uiOverlay_) {
-            uiOverlay_->invalidateViewportTexture();
+            uiOverlay_->invalidateRendererTextures();
         }
         gpuSceneAsset_ = sceneBuild.sceneAsset;
         gpuInstanceEntities_ = sceneBuild.instanceEntities;
@@ -4083,7 +4238,7 @@ void Application::reloadShadersFromEditor() {
         gltfPath_.has_value() ? SceneCache::cachePathFor(*gltfPath_) : std::optional<std::filesystem::path>{},
         &previousSettings);
     if (uiOverlay_) {
-        uiOverlay_->invalidateViewportTexture();
+        uiOverlay_->invalidateRendererTextures();
         uiOverlay_->editor().invalidateAssetThumbnails();
     }
     retirePathTracer(std::move(pathTracer_));

@@ -14,6 +14,8 @@ class GltfLoader {
 public:
     explicit GltfLoader(AssetManager& assets);
 
+    void setCacheWritesEnabled(bool enabled) { cacheWritesEnabled_ = enabled; }
+
     [[nodiscard]] SceneAsset load(const std::filesystem::path& path);
     [[nodiscard]] SceneAsset loadWithCache(const std::filesystem::path& path);
 
@@ -22,6 +24,7 @@ private:
 
     AssetManager& assets_;
     bool useCache_ = true;
+    bool cacheWritesEnabled_ = true;
 };
 
 } // namespace rtv

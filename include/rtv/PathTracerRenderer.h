@@ -142,13 +142,17 @@ public:
     [[nodiscard]] const RayTracingMotionBlurDeviceInfo& rayTracingMotionBlurInfo() const;
     struct NvidiaIntegrationStatus {
         bool nrdSdkConfigured = false;
+        bool nrdRequestable = false;
         bool nrdAvailable = false;
         std::string nrdUnavailableReason;
         bool dlssSdkConfigured = false;
+        bool dlssRequestable = false;
         bool dlssAvailable = false;
         std::string dlssUnavailableReason;
+        bool dlssRayReconstructionRequestable = false;
         bool dlssRayReconstructionAvailable = false;
         std::string dlssRayReconstructionUnavailableReason;
+        bool dlssFrameGenerationRequestable = false;
         bool dlssFrameGenerationAvailable = false;
         std::string dlssFrameGenerationUnavailableReason;
     };
@@ -743,10 +747,12 @@ private:
     [[nodiscard]] uint32_t wavefrontMaxPathDepth() const;
     [[nodiscard]] uint32_t wavefrontQueueCapacityFor(VkDeviceSize pixelCount) const;
     [[nodiscard]] bool shouldRunDenoiser() const;
+    [[nodiscard]] bool nrdRequested() const;
     [[nodiscard]] bool shouldRunNrdDenoiser() const;
     [[nodiscard]] bool isNonDenoiserDebugView() const;
     [[nodiscard]] bool shouldBypassTemporalUpscalerForDebugView() const;
     [[nodiscard]] bool shouldRunTaa() const;
+    [[nodiscard]] bool dlssRequested() const;
     [[nodiscard]] bool shouldRunDlss() const;
     [[nodiscard]] bool shouldRunDlssRayReconstruction() const;
     [[nodiscard]] bool shouldRunRestirSpatial() const;

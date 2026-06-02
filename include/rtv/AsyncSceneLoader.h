@@ -50,6 +50,10 @@ struct SceneLoadResult {
     bool cancelled = false;
     std::string errorMessage;
     std::string warningMessage;
+    double workerTotalMs = 0.0;
+    double workerSceneParseMs = 0.0;
+    double workerGltfLoadMs = 0.0;
+    double workerDocumentBuildMs = 0.0;
     std::unique_ptr<SceneDocument> stagedScene;
     AssetManager assets;
     std::optional<SceneAsset> importedScene;

@@ -1290,8 +1290,12 @@ PathTracerRenderer::PathTracerRenderer(
     if (debugView != RendererDebugView::Beauty) {
         std::cout << "Renderer debug view: " << rendererDebugViewName(debugView) << '\n';
     }
-    initializeNrdRuntime();
-    initializeDlssRuntime();
+    if (nrdRequested()) {
+        initializeNrdRuntime();
+    }
+    if (dlssRequested()) {
+        initializeDlssRuntime();
+    }
 }
 
 PathTracerRenderer::~PathTracerRenderer() {
@@ -1928,8 +1932,21 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     const bool materialTextureFilteringChanged =
         std::abs(next.materialTextureAnisotropy - settings_.materialTextureAnisotropy) > 0.0001f;
     const bool motionBlurStructureChanged = next.motionBlurEnabled != settings_.motionBlurEnabled;
+    const bool nrdRequestedAfter = next.denoiserBackend == DenoiserBackend::Nrd;
+    const bool dlssRequestedAfter = next.temporalUpscaler == TemporalUpscaler::Dlss ||
+        next.dlssRayReconstructionEnabled ||
+        next.dlssFrameGenerationEnabled;
 
     settings_ = next;
+    if (nrdRequestedAfter && !nrdAvailable_) {
+        initializeNrdRuntime();
+        if (nrdAvailable_ && nrdRuntime_ != nullptr && renderExtent_.width > 0u && renderExtent_.height > 0u) {
+            createNrdResolutionResources();
+        }
+    }
+    if (dlssRequestedAfter && !dlssNgxInitialized_) {
+        initializeDlssRuntime();
+    }
     if (motionBlurStructureChanged && rayTracingScene_ != nullptr) {
         rayTracingScene_ = std::make_unique<RayTracingScene>(
             context_,
@@ -2002,36 +2019,74 @@ PathTracerRenderer::NvidiaIntegrationStatus PathTracerRenderer::nvidiaIntegratio
     NvidiaIntegrationStatus status{};
 #if defined(RTV_NRD_SDK_CONFIGURED)
     status.nrdSdkConfigured = true;
+    const bool nrdStorageSupported = context_.supportsNrdShaderStorageFeatures();
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+    status.nrdRequestable = nrdStorageSupported && !nrdCreationFailed_;
+#endif
     status.nrdAvailable = nrdAvailable_ && !nrdCreationFailed_;
     status.nrdUnavailableReason = status.nrdAvailable
         ? std::string{}
-        : (nrdUnavailableReason_.empty()
+        : (!nrdStorageSupported
+            ? "NRD requires 8-bit and 16-bit uniform/storage buffer access features"
+            : (nrdUnavailableReason_.empty()
+#if defined(RTV_NRD_RUNTIME_ENABLED)
+            ? (nrdRequested()
+                ? "NRD runtime is not available"
+                : "NRD runtime will initialize when the NRD denoiser is selected")
+#else
             ? "NRD SDK headers were found, but the Vulkan NRD runtime is not enabled in this build"
-            : nrdUnavailableReason_);
+#endif
+            : nrdUnavailableReason_));
 #else
     status.nrdUnavailableReason = "NRD SDK is not configured; set NRD_SDK_DIR when configuring CMake";
 #endif
 #if defined(RTV_DLSS_SDK_CONFIGURED)
     status.dlssSdkConfigured = true;
     status.dlssAvailable = dlssCapabilityAvailable_ && !dlssFeatureCreationFailed_;
+#if defined(RTV_DLSS_NGX_ENABLED)
+    status.dlssRequestable = status.dlssAvailable || (!dlssNgxInitialized_ && dlssUnavailableReason_.empty());
+#endif
     status.dlssUnavailableReason = status.dlssAvailable
         ? std::string{}
         : (dlssUnavailableReason_.empty()
+#if defined(RTV_DLSS_NGX_ENABLED)
+            ? (dlssRequested()
+                ? "DLSS NGX runtime is not available"
+                : "DLSS NGX runtime will initialize when DLSS is selected")
+#else
             ? "DLSS SDK headers were found, but the Vulkan NGX/DLSS runtime is not enabled in this build"
+#endif
             : dlssUnavailableReason_);
     status.dlssRayReconstructionAvailable =
         dlssRayReconstructionCapabilityAvailable_ && !dlssRayReconstructionFeatureCreationFailed_;
+#if defined(RTV_DLSS_NGX_ENABLED)
+    status.dlssRayReconstructionRequestable = status.dlssRayReconstructionAvailable ||
+        (!dlssNgxInitialized_ && dlssRayReconstructionUnavailableReason_.empty());
+#endif
     status.dlssRayReconstructionUnavailableReason = status.dlssRayReconstructionAvailable
         ? std::string{}
         : (dlssRayReconstructionUnavailableReason_.empty()
+#if defined(RTV_DLSS_NGX_ENABLED)
+            ? (dlssRequested()
+                ? "DLSS Ray Reconstruction is not available in this NGX runtime"
+                : "DLSS NGX runtime will initialize when DLSS is selected")
+#else
             ? "DLSS Ray Reconstruction is not available in this NGX runtime"
+#endif
             : dlssRayReconstructionUnavailableReason_);
     status.dlssFrameGenerationAvailable =
         dlssFrameGenerationCapabilityAvailable_ && dlssFrameGenerationPresentationAvailable_;
+    status.dlssFrameGenerationRequestable = status.dlssFrameGenerationAvailable;
     status.dlssFrameGenerationUnavailableReason = status.dlssFrameGenerationAvailable
         ? std::string{}
         : (dlssFrameGenerationUnavailableReason_.empty()
+#if defined(RTV_DLSS_NGX_ENABLED)
+            ? (dlssRequested()
+                ? "DLSS Frame Generation is not available in this NGX runtime"
+                : "DLSS NGX runtime will initialize when DLSS is selected")
+#else
             ? "DLSS Frame Generation is not available in this NGX runtime"
+#endif
             : dlssFrameGenerationUnavailableReason_);
 #else
     status.dlssUnavailableReason = "DLSS SDK is not configured; set DLSS_SDK_DIR when configuring CMake";
@@ -8174,6 +8229,10 @@ bool PathTracerRenderer::shouldRunDenoiser() const {
     return false;
 }
 
+bool PathTracerRenderer::nrdRequested() const {
+    return settings_.denoiserBackend == DenoiserBackend::Nrd;
+}
+
 bool PathTracerRenderer::shouldRunNrdDenoiser() const {
     if (settings_.wavefrontFinalOutputEnabled) {
         return false;
@@ -8234,6 +8293,12 @@ bool PathTracerRenderer::shouldRunTaa() const {
         taaImage_.handle() != VK_NULL_HANDLE &&
         taaHistoryImage_.handle() != VK_NULL_HANDLE &&
         velocityBuffer_.handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::dlssRequested() const {
+    return settings_.temporalUpscaler == TemporalUpscaler::Dlss ||
+        settings_.dlssRayReconstructionEnabled ||
+        settings_.dlssFrameGenerationEnabled;
 }
 
 bool PathTracerRenderer::shouldRunDlss() const {

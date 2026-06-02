@@ -34,6 +34,7 @@ public:
     void handleNotificationAction(NotificationAction action, EditorRequests& requests);
     void showRecoveryPrompt(std::filesystem::path markerPath, std::filesystem::path autosavePath);
     void invalidateAssetThumbnails() { assetBrowserPanel_.invalidateThumbnails(); }
+    void clearSelection() { selection_.clear(); }
 
     [[nodiscard]] EditorPreferences& editorPrefs() { return editorPrefs_; }
     [[nodiscard]] CameraBookmarkManager& cameraBookmarks() { return cameraBookmarks_; }

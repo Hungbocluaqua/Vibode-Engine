@@ -143,6 +143,10 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     uint32_t minRestirGiVisibilityRays = 0;
     uint32_t maxRestirGiVisibilityRays = 4;
     const PathTracerRenderer::NvidiaIntegrationStatus nvidiaStatus = state.renderer.nvidiaIntegrationStatus();
+    const bool nrdCanRequest = nvidiaStatus.nrdRequestable || nvidiaStatus.nrdAvailable;
+    const bool dlssCanRequest = nvidiaStatus.dlssRequestable || nvidiaStatus.dlssAvailable;
+    const bool dlssRayReconstructionCanRequest = nvidiaStatus.dlssRayReconstructionRequestable || nvidiaStatus.dlssRayReconstructionAvailable;
+    const bool dlssFrameGenerationCanRequest = nvidiaStatus.dlssFrameGenerationRequestable || nvidiaStatus.dlssFrameGenerationAvailable;
 
     ImGui::SeparatorText("Preview Actions");
     if (editorIconTextButton("RenderSettingsResetAccumulation", EditorGlyphIcon::Reset, "Reset Accumulation")) {
@@ -258,23 +262,32 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     if (temporalIndex < 0 || temporalIndex > 1) {
         temporalIndex = 0;
     }
-    if (ImGui::Combo("Temporal Upscaler", &temporalIndex, temporalItems, 2)) {
-        settings.temporalUpscaler = static_cast<TemporalUpscaler>(temporalIndex);
-        if (settings.temporalUpscaler != TemporalUpscaler::Dlss) {
+    if (ImGui::BeginCombo("Temporal Upscaler", temporalItems[temporalIndex])) {
+        if (ImGui::Selectable("TAA / TSR", settings.temporalUpscaler == TemporalUpscaler::TaaTsr)) {
+            settings.temporalUpscaler = TemporalUpscaler::TaaTsr;
             settings.dlssRayReconstructionEnabled = false;
             settings.dlssFrameGenerationEnabled = false;
+            changed = true;
         }
-        changed = true;
+        ImGui::BeginDisabled(!dlssCanRequest);
+        if (ImGui::Selectable("DLSS", settings.temporalUpscaler == TemporalUpscaler::Dlss)) {
+            settings.temporalUpscaler = TemporalUpscaler::Dlss;
+            changed = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::EndCombo();
     }
-    tooltip(settings.temporalUpscaler == TemporalUpscaler::Dlss && !nvidiaStatus.dlssAvailable
+    tooltip(settings.temporalUpscaler == TemporalUpscaler::Dlss && !dlssCanRequest
         ? nvidiaStatus.dlssUnavailableReason.c_str()
         : "Selects the post-denoise temporal resolve/upscale backend.");
+    ImGui::BeginDisabled(!dlssCanRequest);
     changed |= ImGui::SliderFloat("DLSS Sharpening", &settings.dlssSharpeningStrength, 0.0f, 1.0f, "%.2f");
-    tooltip(nvidiaStatus.dlssAvailable
+    ImGui::EndDisabled();
+    tooltip(dlssCanRequest
         ? "Sharpening amount passed to DLSS Super Resolution."
         : nvidiaStatus.dlssUnavailableReason.c_str());
     bool rrEnabled = settings.dlssRayReconstructionEnabled;
-    ImGui::BeginDisabled(!nvidiaStatus.dlssRayReconstructionAvailable);
+    ImGui::BeginDisabled(!dlssRayReconstructionCanRequest);
     if (ImGui::Checkbox("DLSS Ray Reconstruction", &rrEnabled)) {
         settings.dlssRayReconstructionEnabled = rrEnabled;
         if (rrEnabled) {
@@ -283,11 +296,11 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed = true;
     }
     ImGui::EndDisabled();
-    tooltip(nvidiaStatus.dlssRayReconstructionAvailable
+    tooltip(dlssRayReconstructionCanRequest
         ? "Uses DLSS Ray Reconstruction as the temporal denoiser/upscaler."
         : nvidiaStatus.dlssRayReconstructionUnavailableReason.c_str());
     bool fgEnabled = settings.dlssFrameGenerationEnabled;
-    ImGui::BeginDisabled(!nvidiaStatus.dlssFrameGenerationAvailable);
+    ImGui::BeginDisabled(!dlssFrameGenerationCanRequest);
     if (ImGui::Checkbox("DLSS Frame Generation", &fgEnabled)) {
         settings.dlssFrameGenerationEnabled = fgEnabled;
         if (fgEnabled) {
@@ -296,7 +309,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed = true;
     }
     ImGui::EndDisabled();
-    tooltip(nvidiaStatus.dlssFrameGenerationAvailable
+    tooltip(dlssFrameGenerationCanRequest
         ? "Enables DLSS Frame Generation when the presentation path supports generated frames."
         : nvidiaStatus.dlssFrameGenerationUnavailableReason.c_str());
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
@@ -482,11 +495,20 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         if (denoiserBackendIndex < 0 || denoiserBackendIndex > 1) {
             denoiserBackendIndex = 0;
         }
-        if (ImGui::Combo("Denoiser Backend", &denoiserBackendIndex, denoiserBackendItems, 2)) {
-            settings.denoiserBackend = static_cast<DenoiserBackend>(denoiserBackendIndex);
-            changed = true;
+        if (ImGui::BeginCombo("Denoiser Backend", denoiserBackendItems[denoiserBackendIndex])) {
+            if (ImGui::Selectable("Engine", settings.denoiserBackend == DenoiserBackend::Engine)) {
+                settings.denoiserBackend = DenoiserBackend::Engine;
+                changed = true;
+            }
+            ImGui::BeginDisabled(!nrdCanRequest);
+            if (ImGui::Selectable("NRD", settings.denoiserBackend == DenoiserBackend::Nrd)) {
+                settings.denoiserBackend = DenoiserBackend::Nrd;
+                changed = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::EndCombo();
         }
-        tooltip(settings.denoiserBackend == DenoiserBackend::Nrd && !nvidiaStatus.nrdAvailable
+        tooltip(settings.denoiserBackend == DenoiserBackend::Nrd && !nrdCanRequest
             ? nvidiaStatus.nrdUnavailableReason.c_str()
             : "Selects the active denoiser backend.");
         changed |= ImGui::Checkbox("Denoise While Moving", &settings.denoiseWhileMoving);

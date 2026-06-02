@@ -85,6 +85,7 @@ public:
     [[nodiscard]] bool rendersPathTracerInViewport() const { return true; }
     [[nodiscard]] VkExtent2D desiredRenderExtent(VkExtent2D fallback) const;
     void invalidateViewportTexture();
+    void invalidateRendererTextures();
     [[nodiscard]] EditorLayer& editor() { return editor_; }
     [[nodiscard]] DescriptorPoolStats descriptorPoolStats() const { return descriptorPoolStats_; }
 

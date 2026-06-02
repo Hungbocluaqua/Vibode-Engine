@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <exception>
+#include <iostream>
 #include <utility>
 
 namespace rtv {
@@ -20,6 +21,11 @@ SceneLoadResult makeCancelledResult(const SceneLoadRequest& request) {
     result.cancelled = true;
     result.errorMessage = "Scene load cancelled";
     return result;
+}
+
+template <typename ClockTime>
+double elapsedMilliseconds(ClockTime start, ClockTime end = std::chrono::steady_clock::now()) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 } // namespace
@@ -142,6 +148,7 @@ void AsyncSceneLoader::setStage(std::string stage, float progress, SceneLoadStat
 }
 
 SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shared_ptr<std::atomic_bool>& cancelFlag) {
+    const auto loadStart = std::chrono::steady_clock::now();
     SceneLoadResult result;
     result.mode = request.mode;
     result.sourcePath = request.sourcePath;
@@ -157,10 +164,12 @@ SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shar
         case SceneLoadMode::LoadProjectStartupScene: {
             setStage("Parsing scene", 0.20f, SceneLoadStatus::Loading);
             auto document = std::make_unique<SceneDocument>();
+            const auto parseStart = std::chrono::steady_clock::now();
             if (!document->loadJson(request.sourcePath)) {
                 result.errorMessage = "Scene JSON load failed";
                 return result;
             }
+            result.workerSceneParseMs = elapsedMilliseconds(parseStart);
             if (cancelled(cancelFlag)) {
                 return makeCancelledResult(request);
             }
@@ -170,7 +179,9 @@ SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shar
                 try {
                     setStage("Loading referenced glTF", 0.60f, SceneLoadStatus::Loading);
                     GltfLoader loader(result.assets);
+                    const auto gltfStart = std::chrono::steady_clock::now();
                     result.importedScene = loader.loadWithCache(*document->sourceGltfPath());
+                    result.workerGltfLoadMs = elapsedMilliseconds(gltfStart);
                 } catch (const std::exception& error) {
                     result.warningMessage = "Referenced glTF load failed: " + std::string(error.what());
                 }
@@ -180,30 +191,40 @@ SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shar
             }
 
             setStage("Building CPU scene", 0.85f, SceneLoadStatus::Loading);
+            const auto documentStart = std::chrono::steady_clock::now();
             result.stagedScene = std::move(document);
+            result.workerDocumentBuildMs = elapsedMilliseconds(documentStart);
             result.success = true;
             break;
         }
         case SceneLoadMode::ImportSceneAsNewScene: {
             setStage("Parsing glTF", 0.25f, SceneLoadStatus::Loading);
             GltfLoader loader(result.assets);
+            loader.setCacheWritesEnabled(false);
+            const auto gltfStart = std::chrono::steady_clock::now();
             result.importedScene = loader.loadWithCache(request.sourcePath);
+            result.workerGltfLoadMs = elapsedMilliseconds(gltfStart);
             if (cancelled(cancelFlag)) {
                 return makeCancelledResult(request);
             }
 
             setStage("Building CPU scene", 0.80f, SceneLoadStatus::Loading);
+            const auto documentStart = std::chrono::steady_clock::now();
             auto document = std::make_unique<SceneDocument>();
             document->importSceneAsset(*result.importedScene);
             document->setSourceGltfPath(request.sourcePath);
             result.stagedScene = std::move(document);
+            result.workerDocumentBuildMs = elapsedMilliseconds(documentStart);
             result.success = true;
             break;
         }
         case SceneLoadMode::MergeSceneIntoCurrent: {
             setStage("Parsing glTF", 0.25f, SceneLoadStatus::Loading);
             GltfLoader loader(result.assets);
+            loader.setCacheWritesEnabled(false);
+            const auto gltfStart = std::chrono::steady_clock::now();
             result.importedScene = loader.loadWithCache(request.sourcePath);
+            result.workerGltfLoadMs = elapsedMilliseconds(gltfStart);
             if (cancelled(cancelFlag)) {
                 return makeCancelledResult(request);
             }
@@ -221,6 +242,14 @@ SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shar
         result.success = false;
         result.errorMessage = error.what();
     }
+
+    result.workerTotalMs = elapsedMilliseconds(loadStart);
+    std::cout << sceneLoadModeLabel(result.mode)
+              << " worker timings: total_ms=" << result.workerTotalMs
+              << " scene_parse_ms=" << result.workerSceneParseMs
+              << " gltf_cache_ms=" << result.workerGltfLoadMs
+              << " document_ms=" << result.workerDocumentBuildMs
+              << " path=" << result.sourcePath.string() << '\n';
 
     return result;
 }
