@@ -7,7 +7,7 @@
 #include "blue_noise.glsl"
 
 #ifndef RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-#define RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT 0
+#define RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT 1
 #endif
 
 layout(set = 0, binding = 0, std430) buffer AccumulationBuffer { vec4 accumulation_buffer[]; };
@@ -411,7 +411,8 @@ uint pack_unorm2x16(vec2 v) {
 }
 
 uint pack_snorm2x16(vec2 v) {
-    return pack_unorm2x16(v * 0.5 + vec2(0.5));
+    ivec2 quantized = ivec2(round(clamp(v, vec2(-1.0), vec2(1.0)) * 32767.0));
+    return (uint(quantized.x) & 0xffffu) | ((uint(quantized.y) & 0xffffu) << 16u);
 }
 
 uint encode_octahedral_normal(vec3 n) {
@@ -596,6 +597,38 @@ vec3 restir_gi_normal(RestirGiReservoir reservoir) {
 #endif
 }
 
+bool restir_gi_has_positions(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return restir_gi_reservoir_valid(reservoir) &&
+        dot(reservoir.hit_position_target_pdf.xyz - reservoir.receiver_position_hit_distance.xyz,
+            reservoir.hit_position_target_pdf.xyz - reservoir.receiver_position_hit_distance.xyz) > 1.0e-8;
+#else
+    return false;
+#endif
+}
+
+vec3 restir_gi_hit_position(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.hit_position_target_pdf.xyz;
+#else
+    return vec3(0.0);
+#endif
+}
+
+vec3 restir_gi_receiver_position(RestirGiReservoir reservoir) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    return reservoir.receiver_position_hit_distance.xyz;
+#else
+    return vec3(0.0);
+#endif
+}
+
+void restir_gi_set_receiver_position(inout RestirGiReservoir reservoir, vec3 receiverPosition) {
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.receiver_position_hit_distance.xyz = receiverPosition;
+#endif
+}
+
 uint restir_gi_pack_metadata(uint sampleCount, uint age, uint flags, float roughness) {
     uint sampleBits = min(sampleCount, 255u);
     uint ageBits = min(age, 255u);
@@ -627,7 +660,7 @@ void restir_gi_set_material_id(inout RestirGiReservoir reservoir, uint materialI
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.metadata.w = materialId;
 #else
-    reservoir.metadata.z = min(materialId, 255u);
+    reservoir.metadata.z = materialId;
 #endif
 }
 
@@ -654,6 +687,22 @@ void restir_gi_set_hit_distance_target_pdf(inout RestirGiReservoir reservoir, fl
 #else
     reservoir.metadata.w = packHalf2x16(vec2(clamp(hitDistance, 0.0, 65504.0), clamp(targetPdf, 1.0e-4, 65504.0)));
 #endif
+}
+
+RestirGiReservoir empty_restir_gi_reservoir() {
+    RestirGiReservoir reservoir;
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.hit_position_target_pdf = vec4(0.0);
+    reservoir.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
+#endif
+    reservoir.radiance_weight_sum = vec4(0.0);
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+    reservoir.receiver_position_hit_distance = vec4(0.0);
+    reservoir.metadata = uvec4(0u);
+#else
+    reservoir.metadata = uvec4(restir_gi_pack_metadata(0u, 0u, 0u, 1.0), encode_octahedral_normal(vec3(0.0, 1.0, 0.0)), 0u, 0u);
+#endif
+    return reservoir;
 }
 
 float restir_gi_age_normalized(RestirGiReservoir reservoir, float maxAge) {

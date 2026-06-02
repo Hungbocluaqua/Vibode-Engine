@@ -52,6 +52,17 @@ vec3 unpack_reblur_radiance(vec4 packedValue) {
     return nrd_ycocg_to_linear(packedValue.xyz);
 }
 
+vec3 nrd_diffuse_material_factor(PathDataRecord path) {
+    return max(path.albedo_roughness_hit_confidence.rgb, vec3(0.02));
+}
+
+vec3 nrd_specular_material_factor(PathDataRecord path) {
+    float roughness = clamp(path.albedo_roughness_hit_confidence.w, 0.001, 1.0);
+    vec3 specular = max(path.material_specular_albedo.rgb, vec3(0.0));
+    specular *= mix(0.10, 1.0, roughness);
+    return max(specular, vec3(0.02));
+}
+
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dims = ivec2(int(params.render_width), int(params.render_height));
@@ -77,8 +88,8 @@ void main() {
     vec3 residualLimit = max(raw * 0.45, vec3(0.02));
     float residualWeight = params.camera_moving != 0u ? 0.25 : 0.40;
     vec3 denoised =
-        unpack_reblur_radiance(imageLoad(nrd_diff_radiance_hitdist, coords)) +
-        unpack_reblur_radiance(imageLoad(nrd_spec_radiance_hitdist, coords)) +
+        unpack_reblur_radiance(imageLoad(nrd_diff_radiance_hitdist, coords)) * nrd_diffuse_material_factor(path) +
+        unpack_reblur_radiance(imageLoad(nrd_spec_radiance_hitdist, coords)) * nrd_specular_material_factor(path) +
         min(residual, residualLimit) * residualWeight;
     imageStore(out_denoised_hdr, coords, vec4(max(denoised, vec3(0.0)), 1.0));
 }

@@ -438,7 +438,8 @@ private:
         float giSpatialRadius = 4.25f;
         float giDepthThresholdScale = 1.0f;
         float giSpatialCompatibilityThreshold = 0.0f;
-        float padding0 = 0.0f;
+        float rawOutputIsCurrentSample = 0.0f;
+        glm::vec4 cameraPosition{};
     };
 
     struct FogParams {

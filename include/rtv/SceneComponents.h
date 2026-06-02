@@ -257,7 +257,7 @@ struct RenderSettings {
     float restirGiDepthThresholdScale = 0.85f;
     float restirGiSpatialCompatibilityThreshold = 0.06f;
     bool restirGiHalfResolution = false;
-    uint32_t restirGiVisibilityRayBudget = 0;
+    uint32_t restirGiVisibilityRayBudget = 2;
     AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Balanced;
     float adaptiveGpuFrameTargetMs = 16.6f;
 

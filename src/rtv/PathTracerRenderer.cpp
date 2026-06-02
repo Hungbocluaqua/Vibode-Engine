@@ -480,12 +480,12 @@ bool restirGiUncompressedLayoutFromEnvironment() {
     char* value = nullptr;
     size_t length = 0;
     _dupenv_s(&value, &length, "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT");
-    const bool enabled = value != nullptr && value[0] != '\0' && value[0] != '0';
+    const bool enabled = value == nullptr || value[0] == '\0' || value[0] != '0';
     std::free(value);
     return enabled;
 #else
     const char* value = std::getenv("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT");
-    return value != nullptr && value[0] != '\0' && value[0] != '0';
+    return value == nullptr || value[0] == '\0' || value[0] != '0';
 #endif
 }
 
@@ -3916,7 +3916,7 @@ void PathTracerRenderer::updateCamera() {
     camera_.sunColorAngularRadius = glm::vec4(settings_.sunColor, settings_.sunAngularRadius);
     camera_.restirGiControls = glm::uvec4(
         settings_.restirGiTemporalMaxAge,
-        effectiveRestirGiHalfResolution() ? 1u : 0u,
+        (effectiveRestirGiHalfResolution() ? 1u : 0u) | (settings_.restirGiEnabled ? 2u : 0u),
         settings_.restirGiVisibilityRayBudget,
         settings_.specularAaEnabled ? 1u : 0u);
     camera_.pathTraceControls = glm::uvec4(
@@ -4060,6 +4060,8 @@ void PathTracerRenderer::updateCamera() {
     restirSpatialParams_.giSpatialRadius = settings_.restirGiSpatialRadius;
     restirSpatialParams_.giDepthThresholdScale = settings_.restirGiDepthThresholdScale;
     restirSpatialParams_.giSpatialCompatibilityThreshold = settings_.restirGiSpatialCompatibilityThreshold;
+    restirSpatialParams_.rawOutputIsCurrentSample = shouldRunDlssRayReconstruction() ? 1.0f : 0.0f;
+    restirSpatialParams_.cameraPosition = camera_.pos;
     frameUniforms.write(&restirSpatialParams_, sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
     frameUniforms.flush(sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
 
@@ -4529,7 +4531,10 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     if (useRestirGiReservoirs && !useWavefrontFinalOutput) {
         graph.addPass("restir_gi_spatial")
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
             .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageRead(worldPosition, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
             .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Compute)
             .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                 recordRestirGiSpatialPass(cmd);
@@ -4538,9 +4543,10 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     if (shouldRunRestirGiFinal()) {
         graph.addPass("restir_gi_final")
             .addStorageReadWrite(raw, PipelineDomain::Compute)
+            .addStorageReadWrite(accumulation, PipelineDomain::Compute)
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
-            .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
             .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+            .addStorageReadWrite(pathData, PipelineDomain::Compute)
             .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                 recordRestirGiFinalPass(cmd);
             });
@@ -4630,7 +4636,10 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
         if (useRestirGiReservoirs) {
             graph.addPass("wavefront_final_restir_gi_spatial")
                 .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+                .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
                 .addStorageRead(depthNormal, PipelineDomain::Compute)
+                .addStorageRead(worldPosition, PipelineDomain::Compute)
+                .addStorageRead(velocity, PipelineDomain::Compute)
                 .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Compute)
                 .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                     recordRestirGiSpatialPass(cmd);
@@ -4655,9 +4664,10 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             finalWritePass.addStorageRead(restirGiReservoir, PipelineDomain::Compute);
             graph.addPass("wavefront_final_restir_gi_final")
                 .addStorageReadWrite(raw, PipelineDomain::Compute)
+                .addStorageReadWrite(accumulation, PipelineDomain::Compute)
                 .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
-                .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
                 .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+                .addStorageReadWrite(pathData, PipelineDomain::Compute)
                 .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                     recordRestirGiFinalPass(cmd);
                 });
@@ -5754,7 +5764,11 @@ void PathTracerRenderer::recordRestirGiSpatialPass(VkCommandBuffer commandBuffer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialReservoirBuffer_.descriptorInfo())
         .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
-        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)));
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)))
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirGiReservoirBuffer_.descriptorInfo())
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, worldPositionBuffer_.descriptorInfo())
+        .writeAccelerationStructure(33, rayTracingScene_->tlas());
     writeStbnDescriptors(writer);
     writer.update(context_.device(), set);
 
@@ -5777,10 +5791,11 @@ void PathTracerRenderer::recordRestirGiFinalPass(VkCommandBuffer commandBuffer) 
     DescriptorWriter()
         .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
-        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirGiReservoirBuffer_.descriptorInfo())
         .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialReservoirBuffer_.descriptorInfo())
         .writeBuffer(4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameDebugParamsOffset, sizeof(RendererDebugParams)))
         .writeBuffer(5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirSpatialParamsOffset, sizeof(RestirSpatialParams)))
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumulationBuffer_.descriptorInfo())
         .update(context_.device(), set);
 
     restirGiFinalPipeline_->bind(commandBuffer);
@@ -6148,15 +6163,19 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     if (useRestirGiReservoirs && !useWavefrontFinalOutput) {
         graph.addPass("restir_gi_spatial")
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
             .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageRead(worldPosition, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
             .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Compute);
     }
     if (shouldRunRestirGiFinal()) {
         graph.addPass("restir_gi_final")
             .addStorageReadWrite(raw, PipelineDomain::Compute)
+            .addStorageReadWrite(accumulation, PipelineDomain::Compute)
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
-            .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
-            .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute);
+            .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+            .addStorageReadWrite(pathData, PipelineDomain::Compute);
     }
     if (useWavefrontFinalOutput) {
         const RenderGraphResourceId wavefrontFinalCompactValidation = graph.createBuffer(bufferResource(wavefrontCompactValidationBuffer_, "wavefront final compact validation"));
@@ -6202,7 +6221,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         if (useRestirGiReservoirs) {
             graph.addPass("wavefront_final_restir_gi_spatial")
                 .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+                .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
                 .addStorageRead(depthNormal, PipelineDomain::Compute)
+                .addStorageRead(worldPosition, PipelineDomain::Compute)
+                .addStorageRead(velocity, PipelineDomain::Compute)
                 .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Compute);
         }
         RenderGraphPass& finalWritePass = graph.addPass("wavefront_final_write")
@@ -6221,9 +6243,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             finalWritePass.addStorageRead(restirGiReservoir, PipelineDomain::Compute);
             graph.addPass("wavefront_final_restir_gi_final")
                 .addStorageReadWrite(raw, PipelineDomain::Compute)
+                .addStorageReadWrite(accumulation, PipelineDomain::Compute)
                 .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
-                .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
-                .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute);
+                .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
+                .addStorageReadWrite(pathData, PipelineDomain::Compute);
         }
     }
     if (useWavefrontSecondaryShade) {

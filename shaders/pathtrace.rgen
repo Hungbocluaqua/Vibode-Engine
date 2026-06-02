@@ -216,6 +216,16 @@ uint restir_mode() {
     return uint(clamp(camera.atmosphere.y, 0.0, 2.0));
 }
 
+bool restir_gi_enabled() {
+    return (camera.restir_gi_controls.y & 2u) != 0u;
+}
+
+bool restir_gi_debug_view() {
+    return (debug_params.view >= 68u && debug_params.view <= 73u) ||
+        debug_params.view == 90u ||
+        debug_params.view == 91u;
+}
+
 bool temporal_history_available() {
     return camera.atmosphere.z > 0.5;
 }
@@ -326,12 +336,22 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
     restir_reservoirs[pixelIndex] = current;
 }
 
+float restir_gi_target_function(RestirGiReservoir reservoir);
+
 float restir_gi_temporal_compatibility(RestirGiReservoir current, RestirGiReservoir previous, float motionConfidence) {
     uint maxTemporalAge = max(camera.restir_gi_controls.x, 1u);
-    if (!restir_gi_reservoir_valid(current) || !restir_gi_reservoir_valid(previous) || restir_gi_age(previous) >= maxTemporalAge) {
+    if (!restir_gi_reservoir_valid(previous) || restir_gi_age(previous) >= maxTemporalAge) {
         return 0.0;
     }
-    if (!restir_gi_visible(previous) || restir_gi_material_id(current) != restir_gi_material_id(previous)) {
+    if (!restir_gi_visible(previous)) {
+        return 0.0;
+    }
+
+    float ageConfidence = 1.0 - clamp(float(restir_gi_age(previous)) / float(maxTemporalAge), 0.0, 1.0);
+    if (!restir_gi_reservoir_valid(current)) {
+        return clamp(motionConfidence, 0.0, 1.0) * ageConfidence;
+    }
+    if (restir_gi_material_id(current) != restir_gi_material_id(previous)) {
         return 0.0;
     }
 
@@ -346,69 +366,99 @@ float restir_gi_temporal_compatibility(RestirGiReservoir current, RestirGiReserv
         max(restir_gi_hit_distance(current), 0.25);
     float hitDistanceConfidence = 1.0 - smoothstep(0.20, 0.85, hitDistanceDelta);
 
-    float currentTarget = max(restir_gi_target_pdf(current), 1.0e-5);
-    float previousTarget = max(restir_gi_target_pdf(previous), 1.0e-5);
+    float currentTarget = max(restir_gi_target_function(current), 1.0e-5);
+    float previousTarget = max(restir_gi_target_function(previous), 1.0e-5);
     float targetConfidence = sqrt(min(currentTarget, previousTarget) / max(currentTarget, previousTarget));
-    float ageConfidence = 1.0 - clamp(float(restir_gi_age(previous)) / float(maxTemporalAge), 0.0, 1.0);
 
-        return clamp(motionConfidence, 0.0, 1.0) *
+    return clamp(motionConfidence, 0.0, 1.0) *
         hitDistanceConfidence *
         smoothstep(normalThreshold, 1.0, normalAgreement) *
         targetConfidence *
         ageConfidence;
 }
 
-RestirGiReservoir restir_gi_temporal_merge(RestirGiReservoir current, RestirGiReservoir previous, float motionConfidence) {
-    float compatibility = restir_gi_temporal_compatibility(current, previous, motionConfidence);
-    if (compatibility <= 0.0) {
-        restir_gi_set_metadata(current, restir_gi_sample_count_u(current), 0u, restir_gi_flags(current), restir_gi_roughness(current));
+float restir_gi_target_function(RestirGiReservoir reservoir) {
+    return max(restir_gi_target_pdf(reservoir), luminance(max(reservoir.radiance_weight_sum.rgb, vec3(0.0))));
+}
+
+float restir_gi_reservoir_mass(RestirGiReservoir reservoir) {
+    if (!restir_gi_reservoir_valid(reservoir)) {
+        return 0.0;
+    }
+    return max(restir_gi_target_function(reservoir), 0.0) *
+        max(restir_gi_sample_count(reservoir), max(reservoir.radiance_weight_sum.w, 1.0));
+}
+
+RestirGiReservoir restir_gi_finalize_selected(
+    RestirGiReservoir selected,
+    float totalMass,
+    float sampleCount,
+    uint age,
+    float roughness) {
+    selected.radiance_weight_sum.w = min(max(totalMass, 1.0), 65504.0);
+    restir_gi_set_metadata(
+        selected,
+        uint(clamp(ceil(sampleCount), 1.0, 255.0)),
+        min(age, 255u),
+        RESTIR_GI_FLAG_VALID | (restir_gi_visible(selected) ? RESTIR_GI_FLAG_VISIBLE : 0u),
+        roughness);
+    return selected;
+}
+
+RestirGiReservoir restir_gi_temporal_merge(RestirGiReservoir current, RestirGiReservoir previous, float motionConfidence, inout uint rng) {
+    bool currentValid = restir_gi_reservoir_valid(current);
+    bool previousValid = restir_gi_reservoir_valid(previous);
+    if (!currentValid && !previousValid) {
+        return current;
+    }
+    if (!previousValid) {
+        if (currentValid) {
+            restir_gi_set_metadata(current, restir_gi_sample_count_u(current), 0u, restir_gi_flags(current), restir_gi_roughness(current));
+        }
         return current;
     }
 
-    float currentMass = max(restir_gi_target_pdf(current), 0.0);
-    float previousMass = max(restir_gi_target_pdf(previous), 0.0) *
-        min(restir_gi_sample_count(previous), max(float(camera.restir_gi_controls.x), 1.0)) *
-        compatibility;
-    float previousWeight = previousMass / max(currentMass + previousMass, 1.0e-6);
-    previousWeight = clamp(previousWeight, 0.0, mix(0.85, 0.20, 1.0 - clamp(motionConfidence, 0.0, 1.0)));
+    float compatibility = restir_gi_temporal_compatibility(current, previous, motionConfidence);
+    if (compatibility <= 0.0) {
+        if (currentValid) {
+            restir_gi_set_metadata(current, restir_gi_sample_count_u(current), 0u, restir_gi_flags(current), restir_gi_roughness(current));
+        }
+        return current;
+    }
+    if (!currentValid) {
+        previous.radiance_weight_sum.w = min(max(restir_gi_reservoir_mass(previous) * compatibility, 1.0), 65504.0);
+        restir_gi_set_metadata(
+            previous,
+            restir_gi_sample_count_u(previous),
+            min(restir_gi_age(previous) + 1u, min(camera.restir_gi_controls.x, 255u)),
+            restir_gi_flags(previous),
+            restir_gi_roughness(previous));
+        return previous;
+    }
 
-    current.radiance_weight_sum.rgb = mix(current.radiance_weight_sum.rgb, previous.radiance_weight_sum.rgb, previousWeight);
-    current.radiance_weight_sum.w = min(1.0 + previous.radiance_weight_sum.w * previousWeight, max(float(camera.restir_gi_controls.x), 1.0));
-    restir_gi_set_hit_distance_target_pdf(
-        current,
-        restir_gi_hit_distance(current),
-        max(luminance(current.radiance_weight_sum.rgb), 1.0e-4));
-    restir_gi_set_metadata(
-        current,
-        uint(clamp(ceil(current.radiance_weight_sum.w), 1.0, 32.0)),
-        min(restir_gi_age(previous) + 1u, min(camera.restir_gi_controls.x, 255u)),
-        RESTIR_GI_FLAG_VALID | (restir_gi_visible(current) && restir_gi_visible(previous) ? RESTIR_GI_FLAG_VISIBLE : 0u),
-        restir_gi_roughness(current));
-    return current;
+    float currentMass = max(restir_gi_reservoir_mass(current), 0.0);
+    float previousMass = max(restir_gi_reservoir_mass(previous), 0.0) * compatibility;
+    float totalMass = currentMass + previousMass;
+    if (totalMass <= 1.0e-8) {
+        return current;
+    }
+
+    float motionCap = mix(0.85, 0.10, 1.0 - clamp(motionConfidence, 0.0, 1.0));
+    float previousProbability = clamp(previousMass / totalMass, 0.0, motionCap);
+    bool selectPrevious = rand_f32(rng) < previousProbability;
+    RestirGiReservoir selected = selectPrevious ? previous : current;
+    float combinedSamples = restir_gi_sample_count(current) + restir_gi_sample_count(previous) * compatibility;
+    uint selectedAge = selectPrevious ? min(restir_gi_age(previous) + 1u, min(camera.restir_gi_controls.x, 255u)) : 0u;
+    return restir_gi_finalize_selected(selected, totalMass, min(combinedSamples, 255.0), selectedAge, restir_gi_roughness(selected));
 }
 
 void store_initial_restir_gi_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, uint packedVelocity, PathComponents components) {
-    bool restirGiDebugView = (debug_params.view >= 68u && debug_params.view <= 73u) ||
-        debug_params.view == 90u ||
-        debug_params.view == 91u;
-    if (!restirGiDebugView) {
+    bool restirGiDebugView = restir_gi_debug_view();
+    if (!restir_gi_enabled() && !restirGiDebugView) {
         return;
     }
 
-    RestirGiReservoir reservoir;
-#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    reservoir.hit_position_target_pdf = vec4(0.0);
-    reservoir.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
-#endif
-    reservoir.radiance_weight_sum = vec4(0.0);
-#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    reservoir.receiver_position_hit_distance = vec4(0.0);
-#endif
-#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    reservoir.metadata = uvec4(0u);
-#else
-    reservoir.metadata = uvec4(restir_gi_pack_metadata(0u, 0u, 0u, 1.0), encode_octahedral_normal(vec3(0.0, 1.0, 0.0)), 0u, 0u);
-#endif
+    RestirGiReservoir reservoir = empty_restir_gi_reservoir();
 
     if (components.restir_gi_candidate_valid != 0u) {
         vec3 radiance = max(components.restir_gi_candidate_radiance, vec3(0.0));
@@ -429,18 +479,21 @@ void store_initial_restir_gi_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims
         restir_gi_set_material_id(reservoir, components.restir_gi_candidate_material_id);
     }
 
-    if (debug_params.view != 62u && restir_gi_reservoir_valid(reservoir) && temporal_history_available()) {
+    if (restirGiDebugView && debug_params.view != 70u && restir_gi_reservoir_valid(reservoir) && temporal_history_available()) {
         vec2 velocityPixels = restir_unpack_velocity_pixels(packedVelocity);
+        bool velocityNotSaturated = max(abs(velocityPixels.x), abs(velocityPixels.y)) < SCREEN_VELOCITY_SATURATION_THRESHOLD;
         vec2 historyPos = vec2(coords) - velocityPixels;
         bool historyOnscreen =
             historyPos.x >= 0.0 && historyPos.y >= 0.0 &&
-            historyPos.x < float(dims.x) && historyPos.y < float(dims.y);
+            historyPos.x < float(dims.x) && historyPos.y < float(dims.y) &&
+            velocityNotSaturated;
         if (historyOnscreen) {
             ivec2 historyCoords = clamp(ivec2(round(historyPos)), ivec2(0), dims - ivec2(1));
             uint historyIndex = uint(historyCoords.y) * uint(dims.x) + uint(historyCoords.x);
             RestirGiReservoir previous = previous_restir_gi_reservoirs[historyIndex];
             float motionConfidence = 1.0 - clamp(length(velocityPixels) / 24.0, 0.0, 0.75);
-            reservoir = restir_gi_temporal_merge(reservoir, previous, motionConfidence);
+            uint mergeRng = sample_dimension_seed(coords, camera.temporal_frame_index, 0u, SAMPLE_DIM_RESTIR_SPATIAL + 31u);
+            reservoir = restir_gi_temporal_merge(reservoir, previous, motionConfidence, mergeRng);
         }
     }
 
@@ -1656,10 +1709,10 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 components.restir_gi_candidate_normal = hit.normal;
                 components.restir_gi_candidate_radiance = restirGiCandidateRadiance;
                 components.restir_gi_receiver_position = first_position;
-                components.restir_gi_candidate_roughness = material.roughness;
+                components.restir_gi_candidate_roughness = components.first_roughness;
                 components.restir_gi_candidate_hit_distance = min(hit.t, 65504.0);
                 components.restir_gi_candidate_target_pdf = candidateTargetPdf;
-                components.restir_gi_candidate_material_id = hit.material_id;
+                components.restir_gi_candidate_material_id = components.first_material_id;
             }
         }
         components.emissive_light += throughput * emissiveDirect * atmosTransmittance * bounceContributionScale;

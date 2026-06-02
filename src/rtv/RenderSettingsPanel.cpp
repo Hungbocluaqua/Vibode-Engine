@@ -214,6 +214,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 settings.restirGiDepthThresholdScale = 0.85f;
                 settings.restirGiSpatialCompatibilityThreshold = 0.10f;
                 settings.restirGiHalfResolution = false;
+                settings.restirGiVisibilityRayBudget = 0;
             } else if (preset == 2) {
                 settings.restirGiTemporalMaxAge = 24;
                 settings.restirGiSpatialRounds = 4;
@@ -221,6 +222,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 settings.restirGiDepthThresholdScale = 1.0f;
                 settings.restirGiSpatialCompatibilityThreshold = 0.05f;
                 settings.restirGiHalfResolution = false;
+                settings.restirGiVisibilityRayBudget = 2;
             } else {
                 settings.restirGiTemporalMaxAge = 16;
                 settings.restirGiSpatialRounds = 2;
@@ -228,6 +230,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 settings.restirGiDepthThresholdScale = 1.15f;
                 settings.restirGiSpatialCompatibilityThreshold = 0.0f;
                 settings.restirGiHalfResolution = true;
+                settings.restirGiVisibilityRayBudget = 1;
             }
             changed = true;
         }
@@ -240,7 +243,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed |= ImGui::SliderFloat("GI Depth Threshold Scale", &settings.restirGiDepthThresholdScale, 0.5f, 2.0f, "%.2f");
         changed |= ImGui::SliderFloat("GI Compatibility Cutoff", &settings.restirGiSpatialCompatibilityThreshold, 0.0f, 0.85f, "%.2f");
         changed |= ImGui::SliderScalar("GI Visibility Rays", ImGuiDataType_U32, &settings.restirGiVisibilityRayBudget, &minRestirGiVisibilityRays, &maxRestirGiVisibilityRays);
-        tooltip("Reserved budget for the future ray-query visibility validation pass; current GI spatial reuse remains conservative.");
+        tooltip("Ray-query visibility budget per pixel for temporal/spatial GI reuse. Zero validates all configured GI reuse candidates.");
     }
     const char* tsrPresetItems[] = {"Native", "Quality", "Balanced", "Performance"};
     int tsrPreset = settings.renderResolutionScale >= 0.99f ? 0 :

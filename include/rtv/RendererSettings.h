@@ -101,7 +101,7 @@ struct RendererSettings {
     float restirGiDepthThresholdScale = 0.85f;
     float restirGiSpatialCompatibilityThreshold = 0.06f;
     bool restirGiHalfResolution = false;
-    uint32_t restirGiVisibilityRayBudget = 0;
+    uint32_t restirGiVisibilityRayBudget = 2;
     AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Balanced;
     float adaptiveGpuFrameTargetMs = 16.6f;
 
@@ -165,6 +165,7 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
         settings.restirGiDepthThresholdScale = 0.95f;
         settings.restirGiSpatialCompatibilityThreshold = 0.08f;
         settings.restirGiHalfResolution = true;
+        settings.restirGiVisibilityRayBudget = 1;
         settings.adaptiveQualityMode = AdaptiveQualityMode::Balanced;
         break;
     case RenderPreset::Balanced:
@@ -190,6 +191,7 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
         settings.restirGiDepthThresholdScale = 0.85f;
         settings.restirGiSpatialCompatibilityThreshold = 0.06f;
         settings.restirGiHalfResolution = false;
+        settings.restirGiVisibilityRayBudget = 2;
         settings.adaptiveQualityMode = AdaptiveQualityMode::Balanced;
         break;
     case RenderPreset::Ultra:
@@ -215,6 +217,7 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
         settings.restirGiDepthThresholdScale = 0.85f;
         settings.restirGiSpatialCompatibilityThreshold = 0.05f;
         settings.restirGiHalfResolution = false;
+        settings.restirGiVisibilityRayBudget = 4;
         settings.adaptiveQualityMode = AdaptiveQualityMode::Off;
         break;
     case RenderPreset::Custom:

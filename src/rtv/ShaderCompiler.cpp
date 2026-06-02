@@ -130,7 +130,7 @@ bool ShaderCompiler::needsCompileWithSignature(
 std::string ShaderCompiler::compileSignature(const std::vector<std::pair<std::string, std::string>>& extraDefines) const {
     std::string signature = "RTV_USE_DIMENSIONED_SAMPLER=" + environmentValueOrDefault("RTV_USE_DIMENSIONED_SAMPLER", "1") +
         "\nRTV_DENOISER_SHARED_TILE=" + environmentValueOrDefault("RTV_DENOISER_SHARED_TILE", "1") +
-        "\nRTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=" + environmentValueOrDefault("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0") + "\n";
+        "\nRTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=" + environmentValueOrDefault("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1") + "\n";
     for (const auto& [name, value] : extraDefines) {
         signature += name + "=" + value + "\n";
     }
@@ -145,7 +145,7 @@ std::string ShaderCompiler::compileDefineArgs(const std::vector<std::pair<std::s
 
     std::string args = defineArg("RTV_USE_DIMENSIONED_SAMPLER", "1") +
         defineArg("RTV_DENOISER_SHARED_TILE", "1") +
-        defineArg("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0");
+        defineArg("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1");
     for (const auto& [name, value] : extraDefines) {
         args += "-D" + name + "=" + value + " ";
     }

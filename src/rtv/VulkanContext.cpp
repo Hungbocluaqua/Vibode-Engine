@@ -29,6 +29,7 @@ const std::vector<const char*> optionalRayTracingDeviceExtensions = {
     VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME,
     VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
     VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+    VK_KHR_RAY_QUERY_EXTENSION_NAME,
     VK_KHR_SPIRV_1_4_EXTENSION_NAME,
     VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
 };
@@ -368,6 +369,10 @@ void VulkanContext::createDevice() {
     accelerationStructure.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
     accelerationStructure.accelerationStructure = rayTracingInfo_.capabilities.supported ? VK_TRUE : VK_FALSE;
 
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQuery{};
+    rayQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rayQuery.rayQuery = rayTracingInfo_.capabilities.supported ? VK_TRUE : VK_FALSE;
+
     VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddress{};
     bufferDeviceAddress.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
     bufferDeviceAddress.bufferDeviceAddress = rayTracingInfo_.capabilities.bufferDeviceAddress ? VK_TRUE : VK_FALSE;
@@ -376,7 +381,8 @@ void VulkanContext::createDevice() {
     if (rayTracingInfo_.capabilities.supported) {
         rayTracingPipeline.pNext = featureTail;
         accelerationStructure.pNext = &rayTracingPipeline;
-        bufferDeviceAddress.pNext = &accelerationStructure;
+        rayQuery.pNext = &accelerationStructure;
+        bufferDeviceAddress.pNext = &rayQuery;
         featureTail = &bufferDeviceAddress;
     } else if (rayTracingInfo_.capabilities.bufferDeviceAddress) {
         bufferDeviceAddress.pNext = featureTail;
@@ -686,12 +692,16 @@ RayTracingDeviceInfo VulkanContext::queryRayTracingDeviceInfo(VkPhysicalDevice p
     info.capabilities.deferredHostOperations = hasExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     info.capabilities.spirv14 = hasExtension(VK_KHR_SPIRV_1_4_EXTENSION_NAME);
     info.capabilities.shaderFloatControls = hasExtension(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+    info.capabilities.rayQuery = hasExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtFeatures{};
     rtFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
+    rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rayQueryFeatures.pNext = &rtFeatures;
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
     asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-    asFeatures.pNext = &rtFeatures;
+    asFeatures.pNext = &rayQueryFeatures;
     VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeatures{};
     bdaFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
     bdaFeatures.pNext = &asFeatures;
@@ -709,6 +719,9 @@ RayTracingDeviceInfo VulkanContext::queryRayTracingDeviceInfo(VkPhysicalDevice p
     if (rtFeatures.rayTracingPipeline != VK_TRUE) {
         info.capabilities.rayTracingPipeline = false;
     }
+    if (rayQueryFeatures.rayQuery != VK_TRUE) {
+        info.capabilities.rayQuery = false;
+    }
     info.capabilities.traceRaysIndirect = rtFeatures.rayTracingPipelineTraceRaysIndirect == VK_TRUE;
 
     auto require = [&](bool availableFeature, const char* name) {
@@ -720,6 +733,7 @@ RayTracingDeviceInfo VulkanContext::queryRayTracingDeviceInfo(VkPhysicalDevice p
     require(info.capabilities.rayTracingPipeline, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
     require(info.capabilities.bufferDeviceAddress, "bufferDeviceAddress feature/extension");
     require(info.capabilities.deferredHostOperations, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    require(info.capabilities.rayQuery, VK_KHR_RAY_QUERY_EXTENSION_NAME);
     require(info.capabilities.spirv14, VK_KHR_SPIRV_1_4_EXTENSION_NAME);
     require(info.capabilities.shaderFloatControls, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     info.capabilities.supported = info.capabilities.missing.empty();

@@ -38,6 +38,7 @@ struct RayTracingCapabilities {
     bool deferredHostOperations = false;
     bool spirv14 = false;
     bool shaderFloatControls = false;
+    bool rayQuery = false;
     bool traceRaysIndirect = false;
     bool supported = false;
     std::vector<std::string> missing;

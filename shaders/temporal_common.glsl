@@ -6,7 +6,14 @@ vec2 temporal_unpack_unorm2x16(uint packedValue) {
 }
 
 vec2 temporal_unpack_snorm2x16(uint packedValue) {
-    return temporal_unpack_unorm2x16(packedValue) * 2.0 - vec2(1.0);
+    ivec2 quantized = ivec2(int(packedValue & 0xffffu), int((packedValue >> 16u) & 0xffffu));
+    if (quantized.x >= 32768) {
+        quantized.x -= 65536;
+    }
+    if (quantized.y >= 32768) {
+        quantized.y -= 65536;
+    }
+    return clamp(vec2(quantized) / 32767.0, vec2(-1.0), vec2(1.0));
 }
 
 vec2 temporal_unpack_velocity_pixels(uint packedVelocity, float velocityScale) {

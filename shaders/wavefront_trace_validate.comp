@@ -57,7 +57,8 @@ uint pack_unorm2x16(vec2 v) {
 }
 
 uint pack_snorm2x16(vec2 v) {
-    return pack_unorm2x16(v * 0.5 + vec2(0.5));
+    ivec2 quantized = ivec2(round(clamp(v, vec2(-1.0), vec2(1.0)) * 32767.0));
+    return (uint(quantized.x) & 0xffffu) | ((uint(quantized.y) & 0xffffu) << 16u);
 }
 
 uint encode_octahedral_normal(vec3 n) {

@@ -228,6 +228,7 @@ RestirGiReservoir wavefront_make_restir_gi_candidate(
     WavefrontHit hit,
     Material material,
     vec3 receiver_position,
+    uint receiver_material_id,
     vec3 normal,
     RestirReservoir direct_candidate) {
     RestirGiReservoir reservoir = wavefront_empty_restir_gi_reservoir();
@@ -250,7 +251,7 @@ RestirGiReservoir wavefront_make_restir_gi_candidate(
         0u,
         RESTIR_GI_FLAG_VALID | RESTIR_GI_FLAG_VISIBLE,
         clamp(material.roughness, 0.0, 1.0));
-    restir_gi_set_material_id(reservoir, hit.material_instance_primitive.x);
+    restir_gi_set_material_id(reservoir, receiver_material_id);
     return reservoir;
 }
 
@@ -625,6 +626,7 @@ void main() {
     vec3 throughput = state.throughput.rgb;
     RestirReservoir restir_candidate = wavefront_empty_restir_reservoir();
     bool restir_candidate_valid = false;
+    uint receiver_material_id = state.material_instance_primitive.x;
     state.material_instance_primitive = hit.material_instance_primitive;
     atomicAdd(validation.metrics.z, 1u);
 
@@ -685,6 +687,7 @@ void main() {
             hit,
             material,
             source_ray.origin_tmin.xyz,
+            receiver_material_id,
             normal,
             restir_candidate);
         restir_gi_reservoirs[pixel_index] = gi_reservoir;
