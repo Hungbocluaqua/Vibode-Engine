@@ -102,6 +102,7 @@ struct RendererSettings {
     float restirGiSpatialCompatibilityThreshold = 0.06f;
     bool restirGiHalfResolution = false;
     uint32_t restirGiVisibilityRayBudget = 2;
+    bool restirGiFinalStabilizationEnabled = true;
     AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Balanced;
     float adaptiveGpuFrameTargetMs = 16.6f;
 
@@ -140,6 +141,7 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
     settings.dlssSharpeningStrength = 0.0f;
     settings.restirMode = RestirMode::RestirOnly;
     settings.restirGiEnabled = true;
+    settings.restirGiFinalStabilizationEnabled = true;
 
     switch (preset) {
     case RenderPreset::Low:

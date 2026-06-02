@@ -469,6 +469,7 @@ const uint RESTIR_VISIBILITY_VISIBLE = 1u;
 const uint RESTIR_VISIBILITY_INVALID = 2u;
 const uint RESTIR_GI_FLAG_VALID = 1u << 0u;
 const uint RESTIR_GI_FLAG_VISIBLE = 1u << 1u;
+const float WORLD_POSITION_PACK_RANGE = 64.0;
 
 uint restir_pack_validity_visibility(bool valid, uint visibility) {
     return valid ? (1u | ((visibility & 3u) << 1u)) : 0u;
@@ -808,7 +809,7 @@ RestirReservoir restir_pairwise_temporal_merge(RestirReservoir current, RestirRe
 }
 
 uvec2 pack_world_position(vec3 world_pos) {
-    vec3 relative = clamp((world_pos - camera.pos.xyz) / 8.0, vec3(-1.0), vec3(1.0));
+    vec3 relative = clamp((world_pos - camera.pos.xyz) / WORLD_POSITION_PACK_RANGE, vec3(-1.0), vec3(1.0));
     return uvec2(pack_snorm2x16(relative.xy), pack_snorm2x16(vec2(relative.z, 0.0)));
 }
 

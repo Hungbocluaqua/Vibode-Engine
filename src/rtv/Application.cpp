@@ -407,6 +407,7 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.restirGiSpatialCompatibilityThreshold = settings.restirGiSpatialCompatibilityThreshold;
     render.restirGiHalfResolution = settings.restirGiHalfResolution;
     render.restirGiVisibilityRayBudget = settings.restirGiVisibilityRayBudget;
+    render.restirGiFinalStabilizationEnabled = settings.restirGiFinalStabilizationEnabled;
     render.adaptiveQualityMode = settings.adaptiveQualityMode;
     render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
     render.usePhysicalCamera = settings.usePhysicalCamera;
@@ -497,6 +498,7 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.restirGiSpatialCompatibilityThreshold = render.restirGiSpatialCompatibilityThreshold;
     settings.restirGiHalfResolution = render.restirGiHalfResolution;
     settings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
+    settings.restirGiFinalStabilizationEnabled = render.restirGiFinalStabilizationEnabled;
     settings.adaptiveQualityMode = render.adaptiveQualityMode;
     settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
     settings.usePhysicalCamera = render.usePhysicalCamera;

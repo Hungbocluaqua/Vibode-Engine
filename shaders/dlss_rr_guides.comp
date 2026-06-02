@@ -80,6 +80,8 @@ layout(set = 0, binding = 20, std140) uniform Camera {
     vec4 volume_controls;
 } camera;
 
+const float WORLD_POSITION_PACK_RANGE = 64.0;
+
 layout(set = 0, binding = 19, std140) uniform TaaParams {
     uint enabled;
     uint frame_count;
@@ -149,7 +151,7 @@ vec3 decode_world_position(uvec2 packedValue, vec3 origin) {
     }
     vec2 xy = unpack_snorm2x16(packedValue.x);
     float z = unpack_snorm2x16(packedValue.y).x;
-    return origin + vec3(xy.x, xy.y, z) * 8.0;
+    return origin + vec3(xy.x, xy.y, z) * WORLD_POSITION_PACK_RANGE;
 }
 
 float guide_hit_distance(float value, float fallback) {

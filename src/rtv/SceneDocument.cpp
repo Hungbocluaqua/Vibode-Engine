@@ -539,6 +539,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"restirGiSpatialCompatibilityThreshold", renderSettings_.restirGiSpatialCompatibilityThreshold},
         {"restirGiHalfResolution", renderSettings_.restirGiHalfResolution},
         {"restirGiVisibilityRayBudget", renderSettings_.restirGiVisibilityRayBudget},
+        {"restirGiFinalStabilizationEnabled", renderSettings_.restirGiFinalStabilizationEnabled},
         {"adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)},
         {"adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs},
         {"usePhysicalCamera", renderSettings_.usePhysicalCamera},
@@ -902,6 +903,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.restirGiSpatialCompatibilityThreshold = render.value("restirGiSpatialCompatibilityThreshold", renderSettings_.restirGiSpatialCompatibilityThreshold);
         renderSettings_.restirGiHalfResolution = render.value("restirGiHalfResolution", renderSettings_.restirGiHalfResolution);
         renderSettings_.restirGiVisibilityRayBudget = render.value("restirGiVisibilityRayBudget", renderSettings_.restirGiVisibilityRayBudget);
+        renderSettings_.restirGiFinalStabilizationEnabled = render.value("restirGiFinalStabilizationEnabled", renderSettings_.restirGiFinalStabilizationEnabled);
         renderSettings_.adaptiveQualityMode = static_cast<AdaptiveQualityMode>(render.value("adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)));
         renderSettings_.adaptiveGpuFrameTargetMs = render.value("adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs);
         renderSettings_.usePhysicalCamera = render.value("usePhysicalCamera", renderSettings_.usePhysicalCamera);

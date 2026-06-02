@@ -698,7 +698,7 @@ private:
     void recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy = false);
     void recordDenoiser(VkCommandBuffer commandBuffer);
     void recordDenoiserPass(VkCommandBuffer commandBuffer);
-    void recordNrdDenoiser(VkCommandBuffer commandBuffer);
+    [[nodiscard]] bool recordNrdDenoiser(VkCommandBuffer commandBuffer);
     void recordNrdPreparePass(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool recordNrdDispatches(VkCommandBuffer commandBuffer);
     void recordNrdResolvePass(VkCommandBuffer commandBuffer);

@@ -71,6 +71,13 @@ float path_distance_to_view_depth(ivec2 coords, ivec2 dims, float pathDistance) 
     return clamp(pathDistance * forwardCos, 0.0, 65504.0);
 }
 
+float hardware_depth_from_view_depth(float viewDepth) {
+    const float nearPlane = 0.01;
+    const float farPlane = 1000.0;
+    float d = clamp(viewDepth, nearPlane, farPlane);
+    return clamp(farPlane * (d - nearPlane) / (d * (farPlane - nearPlane)), 0.0, 1.0);
+}
+
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dims = ivec2(int(params.render_width), int(params.render_height));
@@ -81,9 +88,12 @@ void main() {
     uint pixelIndex = uint(coords.y) * uint(dims.x) + uint(coords.x);
     uvec4 packedDepthNormal = depth_normal_buffer[pixelIndex];
     float pathDistance = uintBitsToFloat(packedDepthNormal.x);
-    float linearDepth = pathDistance < 1.0e9 ? path_distance_to_view_depth(coords, dims, pathDistance) : 65504.0;
-    if (!(linearDepth < 1.0e9)) {
-        linearDepth = 65504.0;
+    float hardwareDepth = 1.0;
+    if (pathDistance < 1.0e9) {
+        float linearDepth = path_distance_to_view_depth(coords, dims, pathDistance);
+        if (linearDepth < 1.0e9) {
+            hardwareDepth = hardware_depth_from_view_depth(linearDepth);
+        }
     }
 
     vec2 currentToPreviousPixels = temporal_unpack_velocity_pixels(velocity_buffer[pixelIndex], params.velocity_scale);
@@ -91,6 +101,6 @@ void main() {
         ? vec2(0.0)
         : -currentToPreviousPixels;
 
-    imageStore(output_depth, coords, vec4(linearDepth, 0.0, 0.0, 0.0));
+    imageStore(output_depth, coords, vec4(hardwareDepth, 0.0, 0.0, 0.0));
     imageStore(output_motion_vectors, coords, vec4(previousMinusCurrentPixels, 0.0, 0.0));
 }

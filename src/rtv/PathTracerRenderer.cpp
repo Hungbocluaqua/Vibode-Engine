@@ -326,6 +326,92 @@ std::string ngxFailureMessage(const char* operation, NVSDK_NGX_Result result) {
     return out.str();
 }
 
+NVSDK_NGX_PerfQuality_Value selectDlssPerfQuality(VkExtent2D renderExtent, VkExtent2D outputExtent) {
+    if (renderExtent.width == 0u || renderExtent.height == 0u || outputExtent.width == 0u || outputExtent.height == 0u) {
+        return NVSDK_NGX_PerfQuality_Value_Balanced;
+    }
+    const float scaleX = static_cast<float>(renderExtent.width) / static_cast<float>(outputExtent.width);
+    const float scaleY = static_cast<float>(renderExtent.height) / static_cast<float>(outputExtent.height);
+    const float scale = std::min(scaleX, scaleY);
+    if (scale >= 0.98f) {
+        return NVSDK_NGX_PerfQuality_Value_DLAA;
+    }
+    if (scale >= 0.67f) {
+        return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    }
+    if (scale >= 0.58f) {
+        return NVSDK_NGX_PerfQuality_Value_Balanced;
+    }
+    if (scale >= 0.45f) {
+        return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+    }
+    return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+}
+
+const char* dlssPerfQualityName(NVSDK_NGX_PerfQuality_Value value) {
+    switch (value) {
+    case NVSDK_NGX_PerfQuality_Value_MaxPerf: return "performance";
+    case NVSDK_NGX_PerfQuality_Value_Balanced: return "balanced";
+    case NVSDK_NGX_PerfQuality_Value_MaxQuality: return "quality";
+    case NVSDK_NGX_PerfQuality_Value_UltraPerformance: return "ultra-performance";
+    case NVSDK_NGX_PerfQuality_Value_UltraQuality: return "ultra-quality";
+    case NVSDK_NGX_PerfQuality_Value_DLAA: return "dlaa";
+    }
+    return "unknown";
+}
+
+std::string ngxOptimalSettingsSummary(
+    NVSDK_NGX_Parameter* parameters,
+    const char* callbackParameter,
+    VkExtent2D outputExtent,
+    NVSDK_NGX_PerfQuality_Value perfQuality,
+    const char* featureName) {
+    if (parameters == nullptr) {
+        return {};
+    }
+
+    void* callback = nullptr;
+    NVSDK_NGX_Result result = NVSDK_NGX_Parameter_GetVoidPointer(parameters, callbackParameter, &callback);
+    if (NVSDK_NGX_FAILED(result)) {
+        return std::string(" optimal=") + featureName + " unavailable: " + ngxResultName(result);
+    }
+    if (callback == nullptr) {
+        return std::string(" optimal=") + featureName + " unavailable: missing callback";
+    }
+
+    NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_Width, outputExtent.width);
+    NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_Height, outputExtent.height);
+    NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_PerfQualityValue, perfQuality);
+    NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_RTXValue, 0);
+
+    using OptimalSettingsCallback = NVSDK_NGX_Result(NVSDK_CONV*)(NVSDK_NGX_Parameter*);
+    result = reinterpret_cast<OptimalSettingsCallback>(callback)(parameters);
+    if (NVSDK_NGX_FAILED(result)) {
+        return std::string(" optimal=") + featureName + " failed: " + ngxResultName(result);
+    }
+
+    unsigned int optimalWidth = outputExtent.width;
+    unsigned int optimalHeight = outputExtent.height;
+    unsigned int maxWidth = outputExtent.width;
+    unsigned int maxHeight = outputExtent.height;
+    unsigned int minWidth = outputExtent.width;
+    unsigned int minHeight = outputExtent.height;
+    float sharpness = 0.0f;
+    NVSDK_NGX_Parameter_GetUI(parameters, NVSDK_NGX_Parameter_OutWidth, &optimalWidth);
+    NVSDK_NGX_Parameter_GetUI(parameters, NVSDK_NGX_Parameter_OutHeight, &optimalHeight);
+    NVSDK_NGX_Parameter_GetUI(parameters, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width, &maxWidth);
+    NVSDK_NGX_Parameter_GetUI(parameters, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height, &maxHeight);
+    NVSDK_NGX_Parameter_GetUI(parameters, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, &minWidth);
+    NVSDK_NGX_Parameter_GetUI(parameters, NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, &minHeight);
+    NVSDK_NGX_Parameter_GetF(parameters, NVSDK_NGX_Parameter_Sharpness, &sharpness);
+
+    std::ostringstream out;
+    out << " optimal=" << optimalWidth << 'x' << optimalHeight
+        << " range=" << minWidth << 'x' << minHeight << ".." << maxWidth << 'x' << maxHeight
+        << " sdkSharpness=" << sharpness;
+    return out.str();
+}
+
 bool queryNgxCapability(
     NVSDK_NGX_Parameter* parameters,
     const char* availableParameter,
@@ -363,16 +449,6 @@ bool queryNgxCapability(
     return false;
 }
 
-bool ngxMatrixIsFinite(const glm::mat4& matrix) {
-    const float* values = glm::value_ptr(matrix);
-    for (uint32_t i = 0; i < 16u; ++i) {
-        if (!std::isfinite(values[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
 void copyNgxRowMajorMatrix(std::array<float, 16>& dst, const glm::mat4& src) {
     for (uint32_t row = 0; row < 4u; ++row) {
         for (uint32_t col = 0; col < 4u; ++col) {
@@ -381,34 +457,6 @@ void copyNgxRowMajorMatrix(std::array<float, 16>& dst, const glm::mat4& src) {
     }
 }
 
-bool makeNgxDlssTemporalMatrices(
-    std::array<float, 16>& invViewProjection,
-    std::array<float, 16>& clipToPrevClip,
-    const glm::mat4& worldToView,
-    const glm::mat4& viewToClip,
-    const glm::mat4& previousWorldToView,
-    const glm::mat4& previousViewToClip) {
-    const glm::mat4 currentClipFromWorld = viewToClip * worldToView;
-    const glm::mat4 previousClipFromWorld = previousViewToClip * previousWorldToView;
-    if (!ngxMatrixIsFinite(currentClipFromWorld) || !ngxMatrixIsFinite(previousClipFromWorld)) {
-        return false;
-    }
-
-    const float determinant = glm::determinant(currentClipFromWorld);
-    if (!std::isfinite(determinant) || std::abs(determinant) <= 1.0e-8f) {
-        return false;
-    }
-
-    const glm::mat4 currentClipToWorld = glm::inverse(currentClipFromWorld);
-    const glm::mat4 currentClipToPreviousClip = previousClipFromWorld * currentClipToWorld;
-    if (!ngxMatrixIsFinite(currentClipToWorld) || !ngxMatrixIsFinite(currentClipToPreviousClip)) {
-        return false;
-    }
-
-    copyNgxRowMajorMatrix(invViewProjection, currentClipToWorld);
-    copyNgxRowMajorMatrix(clipToPrevClip, currentClipToPreviousClip);
-    return true;
-}
 #endif
 
 std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
@@ -1830,6 +1878,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.restirGiSpatialCompatibilityThreshold - settings_.restirGiSpatialCompatibilityThreshold) > 0.0001f ||
         next.restirGiHalfResolution != settings_.restirGiHalfResolution ||
         next.restirGiVisibilityRayBudget != settings_.restirGiVisibilityRayBudget ||
+        next.restirGiFinalStabilizationEnabled != settings_.restirGiFinalStabilizationEnabled ||
         next.adaptiveQualityMode != settings_.adaptiveQualityMode ||
         std::abs(next.adaptiveGpuFrameTargetMs - settings_.adaptiveGpuFrameTargetMs) > 0.0001f ||
         next.wavefrontQueuesEnabled != settings_.wavefrontQueuesEnabled ||
@@ -1926,7 +1975,8 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.restirGiDepthThresholdScale - settings_.restirGiDepthThresholdScale) > 0.0001f ||
         std::abs(next.restirGiSpatialCompatibilityThreshold - settings_.restirGiSpatialCompatibilityThreshold) > 0.0001f ||
         next.restirGiHalfResolution != settings_.restirGiHalfResolution ||
-        next.restirGiVisibilityRayBudget != settings_.restirGiVisibilityRayBudget;
+        next.restirGiVisibilityRayBudget != settings_.restirGiVisibilityRayBudget ||
+        next.restirGiFinalStabilizationEnabled != settings_.restirGiFinalStabilizationEnabled;
     const bool renderResolutionChanged =
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f;
     const bool materialTextureFilteringChanged =
@@ -3501,7 +3551,7 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .height = renderExtent.height,
         .format = VK_FORMAT_R32_SFLOAT,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        .debugName = "dlss linear depth guide",
+        .debugName = "dlss depth guide",
     });
     dlssMotionVectorImage_.create(allocator_, ImageDesc{
         .width = renderExtent.width,
@@ -4011,8 +4061,14 @@ void PathTracerRenderer::updateCamera() {
     } else {
         stillFrameCount_ = std::min(stillFrameCount_ + 1u, 60u);
     }
-    const bool restoreFullJitter = stillFrameCount_ >= 2u;
-    const float effectiveJitterScale = (cameraMovingForTemporal || suppressJitterForDebugView)
+    const bool dlssTemporalRequested = settings_.temporalUpscaler == TemporalUpscaler::Dlss ||
+        settings_.dlssRayReconstructionEnabled;
+    const bool preserveMovingJitterForDlss = dlssTemporalRequested &&
+        settings_.pathTracingEnabled &&
+        settings_.taaEnabled &&
+        !shouldBypassTemporalUpscalerForDebugView();
+    const bool restoreFullJitter = preserveMovingJitterForDlss || stillFrameCount_ >= 2u;
+    const float effectiveJitterScale = ((cameraMovingForTemporal && !preserveMovingJitterForDlss) || suppressJitterForDebugView)
         ? 0.0f
         : (restoreFullJitter ? 1.0f : 0.0f);
     camera_.effectiveJitterScale = effectiveJitterScale;
@@ -4085,7 +4141,7 @@ void PathTracerRenderer::updateCamera() {
     taaParams_.feedback = std::clamp(taaFeedback, 0.01f, 0.5f);
     taaParams_.velocityScale = 512.0f;
     taaParams_.resetHistory = temporalCameraCut ? 1u : 0u;
-    taaParams_.sharpeningStrength = settings_.taaSharpeningStrength;
+    taaParams_.sharpeningStrength = dlssTemporalRequested ? 0.0f : settings_.taaSharpeningStrength;
     taaParams_.historyValid = taaHistoryValid_ ? 1u : 0u;
     taaParams_.cameraMoving = cameraMovingForTemporal ? 1u : 0u;
     taaParams_.renderWidth = renderExtent_.width;
@@ -4107,7 +4163,9 @@ void PathTracerRenderer::updateCamera() {
     restirSpatialParams_.width = renderExtent_.width;
     restirSpatialParams_.height = renderExtent_.height;
     restirSpatialParams_.frameCount = temporalFrameIndex_;
-    restirSpatialParams_.enabled = (shouldRunRestirSpatial() || shouldUseRestirGiReservoirs()) ? 1u : 0u;
+    const uint32_t restirReuseEnabled = (shouldRunRestirSpatial() || shouldUseRestirGiReservoirs()) ? 1u : 0u;
+    restirSpatialParams_.enabled = restirReuseEnabled |
+        ((shouldUseRestirGiReservoirs() && settings_.restirGiFinalStabilizationEnabled) ? 2u : 0u);
     restirSpatialParams_.giSpatialRounds = settings_.restirGiSpatialRounds;
     restirSpatialParams_.giHalfResolution = effectiveRestirGiHalfResolution() ? 1u : 0u;
     restirSpatialParams_.giTemporalMaxAge = settings_.restirGiTemporalMaxAge;
@@ -4209,9 +4267,10 @@ void PathTracerRenderer::recordPostTraceCompute(VkCommandBuffer commandBuffer, b
         skipDenoiserPass(commandBuffer);
         recordDlssRayReconstruction(commandBuffer);
     } else if (shouldRunNrdDenoiser()) {
-        recordNrdDenoiser(commandBuffer);
         (void)deferHistoryCopy;
-        copyNrdHistoryResources(commandBuffer);
+        if (recordNrdDenoiser(commandBuffer)) {
+            copyNrdHistoryResources(commandBuffer);
+        }
     } else if (shouldRunDenoiser()) {
         recordMomentUpdate(commandBuffer);
         recordDenoiser(commandBuffer);
@@ -7126,11 +7185,11 @@ void PathTracerRenderer::recordDenoiserPass(VkCommandBuffer commandBuffer) {
     currentProfiler_->write(commandBuffer, GpuProfiler::DenoiserEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
-void PathTracerRenderer::recordNrdDenoiser(VkCommandBuffer commandBuffer) {
+bool PathTracerRenderer::recordNrdDenoiser(VkCommandBuffer commandBuffer) {
 #if defined(RTV_NRD_RUNTIME_ENABLED)
     if (!shouldRunNrdDenoiser()) {
         skipDenoiserPass(commandBuffer);
-        return;
+        return false;
     }
     recordNrdPreparePass(commandBuffer);
     if (!recordNrdDispatches(commandBuffer)) {
@@ -7138,11 +7197,13 @@ void PathTracerRenderer::recordNrdDenoiser(VkCommandBuffer commandBuffer) {
         nrdCreationFailed_ = true;
         validationLog_.recordPass("nrd dispatch failed: " + nrdUnavailableReason_);
         skipDenoiserCopyPass(commandBuffer);
-        return;
+        return false;
     }
     recordNrdResolvePass(commandBuffer);
+    return true;
 #else
     (void)commandBuffer;
+    return false;
 #endif
 }
 
@@ -8489,12 +8550,20 @@ bool PathTracerRenderer::ensureDlssFeature(VkCommandBuffer commandBuffer) {
     }
 
     releaseDlssFeature();
+    auto* parameters = reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_);
+    const NVSDK_NGX_PerfQuality_Value perfQuality = selectDlssPerfQuality(renderExtent_, displayExtent_);
+    const std::string optimalSummary = ngxOptimalSettingsSummary(
+        parameters,
+        NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback,
+        displayExtent_,
+        perfQuality,
+        "dlss");
     NVSDK_NGX_DLSS_Create_Params createParams{};
     createParams.Feature.InWidth = renderExtent_.width;
     createParams.Feature.InHeight = renderExtent_.height;
     createParams.Feature.InTargetWidth = displayExtent_.width;
     createParams.Feature.InTargetHeight = displayExtent_.height;
-    createParams.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_Balanced;
+    createParams.Feature.InPerfQualityValue = perfQuality;
     createParams.InFeatureCreateFlags =
         NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
         NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
@@ -8507,7 +8576,7 @@ bool PathTracerRenderer::ensureDlssFeature(VkCommandBuffer commandBuffer) {
         1u,
         1u,
         &handle,
-        reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_),
+        parameters,
         &createParams);
     if (NVSDK_NGX_FAILED(result) || handle == nullptr) {
         dlssUnavailableReason_ = ngxFailureMessage("NGX_VULKAN_CREATE_DLSS_EXT1", result);
@@ -8521,7 +8590,9 @@ bool PathTracerRenderer::ensureDlssFeature(VkCommandBuffer commandBuffer) {
     dlssFeatureOutputExtent_ = displayExtent_;
     validationLog_.recordPass(
         "dlss feature created render=" + std::to_string(renderExtent_.width) + "x" + std::to_string(renderExtent_.height) +
-        " output=" + std::to_string(displayExtent_.width) + "x" + std::to_string(displayExtent_.height));
+        " output=" + std::to_string(displayExtent_.width) + "x" + std::to_string(displayExtent_.height) +
+        " quality=" + dlssPerfQualityName(perfQuality) +
+        " depth=hardware" + optimalSummary);
     return true;
 #else
     (void)commandBuffer;
@@ -8546,6 +8617,14 @@ bool PathTracerRenderer::ensureDlssRayReconstructionFeature(VkCommandBuffer comm
     }
 
     releaseDlssRayReconstructionFeature();
+    auto* parameters = reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_);
+    const NVSDK_NGX_PerfQuality_Value perfQuality = selectDlssPerfQuality(renderExtent_, displayExtent_);
+    const std::string optimalSummary = ngxOptimalSettingsSummary(
+        parameters,
+        NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback,
+        displayExtent_,
+        perfQuality,
+        "dlss-rr");
     NVSDK_NGX_DLSSD_Create_Params createParams{};
     createParams.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
     createParams.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Unpacked;
@@ -8554,14 +8633,13 @@ bool PathTracerRenderer::ensureDlssRayReconstructionFeature(VkCommandBuffer comm
     createParams.InHeight = renderExtent_.height;
     createParams.InTargetWidth = displayExtent_.width;
     createParams.InTargetHeight = displayExtent_.height;
-    createParams.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_Balanced;
+    createParams.InPerfQualityValue = perfQuality;
     createParams.InFeatureCreateFlags =
         NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
         NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
         NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     createParams.InEnableOutputSubrects = false;
 
-    auto* parameters = reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_);
     NVSDK_NGX_Parameter_SetUI(
         parameters,
         NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
@@ -8588,7 +8666,9 @@ bool PathTracerRenderer::ensureDlssRayReconstructionFeature(VkCommandBuffer comm
     dlssRayReconstructionFeatureOutputExtent_ = displayExtent_;
     validationLog_.recordPass(
         "dlss ray reconstruction feature created render=" + std::to_string(renderExtent_.width) + "x" + std::to_string(renderExtent_.height) +
-        " output=" + std::to_string(displayExtent_.width) + "x" + std::to_string(displayExtent_.height));
+        " output=" + std::to_string(displayExtent_.width) + "x" + std::to_string(displayExtent_.height) +
+        " quality=" + dlssPerfQualityName(perfQuality) +
+        " depth=linear" + optimalSummary);
     return true;
 #else
     (void)commandBuffer;
@@ -8858,29 +8938,9 @@ void PathTracerRenderer::recordDlssPass(VkCommandBuffer commandBuffer) {
     evalParams.InExposureScale = 1.0f;
     evalParams.InFrameTimeDeltaInMsec = frameDeltaSeconds_ > 0.0f ? frameDeltaSeconds_ * 1000.0f : 16.6667f;
 
-    std::array<float, 16> invViewProjectionMatrix{};
-    std::array<float, 16> clipToPrevClipMatrix{};
     auto* parameters = reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_);
-    if (makeNgxDlssTemporalMatrices(
-            invViewProjectionMatrix,
-            clipToPrevClipMatrix,
-            nrdWorldToView_,
-            nrdViewToClip_,
-            nrdWorldToViewPrev_,
-            nrdViewToClipPrev_)) {
-        NVSDK_NGX_Parameter_SetVoidPointer(
-            parameters,
-            NVSDK_NGX_Parameter_DLSS_INV_VIEW_PROJECTION_MATRIX,
-            invViewProjectionMatrix.data());
-        NVSDK_NGX_Parameter_SetVoidPointer(
-            parameters,
-            NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX,
-            clipToPrevClipMatrix.data());
-    } else {
-        NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSS_INV_VIEW_PROJECTION_MATRIX, nullptr);
-        NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX, nullptr);
-        validationLog_.recordPass("dlss temporal matrices skipped: invalid camera transform");
-    }
+    NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSS_INV_VIEW_PROJECTION_MATRIX, nullptr);
+    NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX, nullptr);
 
     NVSDK_NGX_Result result = NGX_VULKAN_EVALUATE_DLSS_EXT(
         commandBuffer,

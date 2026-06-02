@@ -135,6 +135,7 @@ int main(int argc, char** argv) {
         std::optional<rtv::RestirMode> restirModeOverride;
         std::optional<rtv::RenderPreset> renderPresetOverride;
         std::optional<bool> restirGiOverride;
+        std::optional<bool> restirGiFinalStabilizationOverride;
         std::optional<bool> opacityMicromapOverride;
         std::optional<uint32_t> opacityMicromapSubdivisionOverride;
         std::optional<bool> wavefrontQueuesOverride;
@@ -283,6 +284,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--restir-gi" && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 restirGiOverride = !(value == "off" || value == "false" || value == "0");
+            } else if ((arg == "--restir-gi-final-stabilization" || arg == "--restir-gi-stabilization") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirGiFinalStabilizationOverride = !(value == "off" || value == "false" || value == "0");
             } else if ((arg == "--opacity-micromaps" || arg == "--omm") && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 opacityMicromapOverride = !(value == "off" || value == "false" || value == "0");
@@ -579,6 +583,12 @@ int main(int argc, char** argv) {
             if (diagConfig.fixedSeed.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();
                 settings.fixedSeed = diagConfig.fixedSeed;
+                renderer->applySettings(settings);
+            }
+            if (restirGiFinalStabilizationOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                settings.restirGiFinalStabilizationEnabled = *restirGiFinalStabilizationOverride;
+                settings.renderPreset = rtv::RenderPreset::Custom;
                 renderer->applySettings(settings);
             }
             if (denoiserBackendOverride.has_value() ||

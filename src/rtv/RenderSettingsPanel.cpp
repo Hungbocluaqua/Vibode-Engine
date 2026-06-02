@@ -102,6 +102,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.restirGiSpatialCompatibilityThreshold = render.restirGiSpatialCompatibilityThreshold;
         settings.restirGiHalfResolution = render.restirGiHalfResolution;
         settings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
+        settings.restirGiFinalStabilizationEnabled = render.restirGiFinalStabilizationEnabled;
         settings.adaptiveQualityMode = render.adaptiveQualityMode;
         settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
         settings.usePhysicalCamera = render.usePhysicalCamera;
@@ -219,6 +220,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 settings.restirGiSpatialCompatibilityThreshold = 0.10f;
                 settings.restirGiHalfResolution = false;
                 settings.restirGiVisibilityRayBudget = 0;
+                settings.restirGiFinalStabilizationEnabled = false;
             } else if (preset == 2) {
                 settings.restirGiTemporalMaxAge = 24;
                 settings.restirGiSpatialRounds = 4;
@@ -227,6 +229,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 settings.restirGiSpatialCompatibilityThreshold = 0.05f;
                 settings.restirGiHalfResolution = false;
                 settings.restirGiVisibilityRayBudget = 2;
+                settings.restirGiFinalStabilizationEnabled = true;
             } else {
                 settings.restirGiTemporalMaxAge = 16;
                 settings.restirGiSpatialRounds = 2;
@@ -235,10 +238,13 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 settings.restirGiSpatialCompatibilityThreshold = 0.0f;
                 settings.restirGiHalfResolution = true;
                 settings.restirGiVisibilityRayBudget = 1;
+                settings.restirGiFinalStabilizationEnabled = true;
             }
             changed = true;
         }
         tooltip("Applies ReSTIR GI reservoir reuse presets. Custom values remain editable below.");
+        changed |= ImGui::Checkbox("GI Final Stabilization", &settings.restirGiFinalStabilizationEnabled);
+        tooltip("Applies confidence, motion, history, and luminance clamps to the final ReSTIR GI contribution. Disable for raw reservoir A/B checks.");
         changed |= ImGui::Checkbox("GI Half Resolution Reuse", &settings.restirGiHalfResolution);
         tooltip("Uses one spatial GI reservoir per 2x2 pixel group for the GI debug/final path.");
         changed |= ImGui::SliderScalar("GI Temporal Max Age", ImGuiDataType_U32, &settings.restirGiTemporalMaxAge, &minRestirGiAge, &maxRestirGiAge);
@@ -622,6 +628,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.restirGiSpatialCompatibilityThreshold = settings.restirGiSpatialCompatibilityThreshold;
             render.restirGiHalfResolution = settings.restirGiHalfResolution;
             render.restirGiVisibilityRayBudget = settings.restirGiVisibilityRayBudget;
+            render.restirGiFinalStabilizationEnabled = settings.restirGiFinalStabilizationEnabled;
             render.adaptiveQualityMode = settings.adaptiveQualityMode;
             render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
             render.usePhysicalCamera = settings.usePhysicalCamera;

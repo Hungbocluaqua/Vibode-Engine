@@ -79,6 +79,7 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.restirGiSpatialCompatibilityThreshold = render.restirGiSpatialCompatibilityThreshold;
     result.rendererSettings.restirGiHalfResolution = render.restirGiHalfResolution;
     result.rendererSettings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
+    result.rendererSettings.restirGiFinalStabilizationEnabled = render.restirGiFinalStabilizationEnabled;
     result.rendererSettings.adaptiveQualityMode = render.adaptiveQualityMode;
     result.rendererSettings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
     result.rendererSettings.materialTextureAnisotropy = render.materialTextureAnisotropy;

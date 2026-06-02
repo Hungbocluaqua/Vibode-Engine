@@ -456,19 +456,21 @@ RestirGiReservoir restir_gi_temporal_resample(
     }
 
     float motionCap = mix(0.85, 0.10, 1.0 - clamp(motionConfidence, 0.0, 1.0));
-    float historyWeight = clamp(previousMass / totalMass, 0.0, motionCap);
-    RestirGiReservoir selected = current;
+    float previousProbability = clamp(previousMass / totalMass, 0.0, motionCap);
+    bool selectPrevious = randomValue < previousProbability;
+    RestirGiReservoir selected = selectPrevious ? previous : current;
     vec3 blendedRadiance = mix(
         max(current.radiance_weight_sum.rgb, vec3(0.0)),
         max(previous.radiance_weight_sum.rgb, vec3(0.0)),
-        historyWeight);
+        previousProbability);
     float combinedSamples = restir_gi_sample_count(current) + restir_gi_sample_count(previous) * compatibility;
+    uint selectedAge = selectPrevious ? min(restir_gi_age(previous) + 1u, uint(maxTemporalAge)) : 0u;
     return restir_gi_finalize_blended(
         selected,
         blendedRadiance,
         totalMass,
-        min(combinedSamples, 64.0),
-        0u,
+        min(combinedSamples, 255.0),
+        selectedAge,
         restir_gi_roughness(selected));
 }
 

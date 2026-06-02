@@ -593,6 +593,7 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["restir_gi_spatial_compatibility_threshold"] = s.restirGiSpatialCompatibilityThreshold;
     j["restir_gi_half_resolution"] = s.restirGiHalfResolution;
     j["restir_gi_visibility_ray_budget"] = s.restirGiVisibilityRayBudget;
+    j["restir_gi_final_stabilization_enabled"] = s.restirGiFinalStabilizationEnabled;
     j["adaptive_quality_mode"] = s.adaptiveQualityMode == AdaptiveQualityMode::Off ? "off"
         : s.adaptiveQualityMode == AdaptiveQualityMode::Conservative ? "conservative"
         : s.adaptiveQualityMode == AdaptiveQualityMode::Balanced ? "balanced" : "aggressive";
