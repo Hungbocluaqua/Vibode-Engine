@@ -105,7 +105,8 @@ void drawHierarchyRightFade(ImVec2 rowMin, ImVec2 rowMax) {
 }
 
 void drawHierarchyRowGlyph(EditorGlyphIcon icon, ImVec2 rowMin, ImVec2 rowMax, bool muted = false) {
-    const float iconSize = EditorUiMetric::hierarchyIconSize;
+    const float rowHeight = rowMax.y - rowMin.y;
+    const float iconSize = editorIconSizeForRow(rowHeight, EditorUiMetric::hierarchyIconSize);
     const float iconX = rowMin.x + ImGui::GetTreeNodeToLabelSpacing() + 2.0f;
     const float iconY = rowMin.y + std::max(0.0f, (rowMax.y - rowMin.y - iconSize) * 0.5f);
     editorDrawIconGlyph(
@@ -119,7 +120,9 @@ bool selectableHierarchyGlyph(const char* label, bool selected, EditorGlyphIcon 
     const ImVec2 rowStart = ImGui::GetCursorScreenPos();
     editorDrawPreRowBand(EditorUiMetric::hierarchyRowHeight);
     editorPushRowSelectionStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
     const bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_None, ImVec2(0.0f, EditorUiMetric::hierarchyRowHeight));
+    ImGui::PopStyleVar();
     editorPopRowSelectionStyle();
     const ImVec2 rowMin = ImGui::GetItemRectMin();
     const ImVec2 rowMax = ImGui::GetItemRectMax();
@@ -184,10 +187,14 @@ bool hierarchyRowIconButton(const char* id, EditorGlyphIcon icon, bool enabled, 
         dl->AddRect(min, max, IM_COL32(70, 78, 92, 135), EditorUiMetric::compactButtonRounding);
     }
     const ImVec4 tint = muted || !enabled ? editorDisabledIconTint() : ImVec4(0.62f, 0.66f, 0.72f, 0.95f);
+    constexpr float glyphSize = 13.0f;
+    const ImVec2 glyphMin(
+        min.x + std::max(0.0f, (size.x - glyphSize) * 0.5f),
+        min.y + std::max(0.0f, (size.y - glyphSize) * 0.5f));
     editorDrawIconGlyph(
         icon,
-        ImVec2(min.x + 4.0f, min.y + 3.0f),
-        ImVec2(max.x - 4.0f, max.y - 3.0f),
+        glyphMin,
+        ImVec2(glyphMin.x + glyphSize, glyphMin.y + glyphSize),
         ImGui::GetColorU32(tint));
     if (!enabled) {
         ImGui::EndDisabled();
@@ -509,7 +516,7 @@ void SceneHierarchyPanel::drawEntityNode(
     drawHierarchyRightFade(rowMin, rowMax);
     drawHierarchyRowGlyph(editorGlyphForEntity(entity), rowMin, rowMax, entity.locked || !entity.visible);
     auto drawRowControls = [&] {
-        const ImVec2 iconButtonSize = editorIconButtonSize();
+        const ImVec2 iconButtonSize(20.0f, 20.0f);
         const float controlY = rowMin.y + std::max(0.0f, (rowMax.y - rowMin.y - iconButtonSize.y) * 0.5f);
         const float lockWidth = iconButtonSize.x;
         const float eyeWidth = iconButtonSize.x;

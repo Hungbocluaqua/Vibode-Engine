@@ -125,7 +125,7 @@ void drawMenuItemGlyph(EditorGlyphIcon glyph, bool enabled) {
     const ImVec2 min = ImGui::GetItemRectMin();
     const ImVec2 max = ImGui::GetItemRectMax();
     const float rowHeight = max.y - min.y;
-    const float iconSize = rowHeight > 0.0f ? std::min(16.0f, rowHeight - 4.0f) : 14.0f;
+    const float iconSize = editorIconSizeForRow(rowHeight);
     const float y = min.y + (rowHeight - iconSize) * 0.5f;
     if (!enabled) {
         editorDrawDisabledRowChrome(min, max);
@@ -324,7 +324,10 @@ void drawDockPanelChromeOverlay(const DockTabIconSpec& spec) {
         return;
     }
 
-    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+    ImDrawList* drawList = window->DrawList;
+    if (drawList == nullptr) {
+        return;
+    }
     const ImU32 border = ImGui::GetColorU32(editorPanelBorderColor());
     drawList->AddRect(
         rect.Min,
@@ -380,7 +383,10 @@ void drawDockTabIconOverlay(const DockTabIconSpec& spec, EditorPanelVisibility& 
             return;
         }
 
-        ImDrawList* drawList = ImGui::GetForegroundDrawList();
+        ImDrawList* drawList = window->DrawList;
+        if (drawList == nullptr) {
+            return;
+        }
         const bool active = tab.ID == tabBar->SelectedTabId || tab.ID == tabBar->VisibleTabId;
         ImVec4 tint = editorIconTint(active);
         if (!active) {
@@ -389,7 +395,9 @@ void drawDockTabIconOverlay(const DockTabIconSpec& spec, EditorPanelVisibility& 
         const float closeSize = std::min(12.0f, std::max(8.0f, tabHeight - 8.0f));
         const ImVec2 closeMin(tabMax.x - closeSize - 6.0f, tabMin.y + (tabHeight - closeSize) * 0.5f);
         const ImVec2 closeMax(closeMin.x + closeSize, closeMin.y + closeSize);
-        const bool closeHovered = ImGui::IsMouseHoveringRect(closeMin, closeMax, true);
+        const ImGuiContext* context = ImGui::GetCurrentContext();
+        const bool popupOpen = context != nullptr && context->OpenPopupStack.Size > 0;
+        const bool closeHovered = !popupOpen && ImGui::IsMouseHoveringRect(closeMin, closeMax, true);
         drawList->PushClipRect(clipMin, clipMax, true);
         editorDrawTablerIconGlyph(
             drawList,

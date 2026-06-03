@@ -813,9 +813,9 @@ void UiOverlay::applyDarkStyle() {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowPadding = ImVec2(5.0f, 4.0f);
-    style.FramePadding = ImVec2(5.0f, 2.0f);
-    style.ItemSpacing = ImVec2(5.0f, 3.0f);
-    style.ItemInnerSpacing = ImVec2(4.0f, 2.0f);
+    style.FramePadding = ImVec2(5.0f, 3.0f);
+    style.ItemSpacing = ImVec2(5.0f, 4.0f);
+    style.ItemInnerSpacing = ImVec2(4.0f, 3.0f);
     style.ScrollbarSize = 10.0f;
     style.WindowRounding = 0.0f;
     style.FrameRounding = 1.0f;

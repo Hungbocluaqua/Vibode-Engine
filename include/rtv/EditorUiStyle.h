@@ -41,7 +41,7 @@ inline constexpr float contentDetailsMinWidth = 260.0f;
 inline constexpr float contentDetailsMaxWidth = 420.0f;
 inline constexpr float contentListMinWidth = 220.0f;
 inline constexpr float progressColumnWidth = 128.0f;
-inline constexpr float hierarchyRowHeight = 22.0f;
+inline constexpr float hierarchyRowHeight = 30.0f;
 inline constexpr float hierarchyIndentSpacing = 18.0f;
 inline constexpr float hierarchyIconSize = 16.0f;
 inline constexpr float hierarchyRowRightFadeWidth = 58.0f;
@@ -73,9 +73,9 @@ inline constexpr float timelineKeyDeleteButtonWidth = 22.0f;
 inline constexpr float timelineKeyDeleteButtonHeight = 20.0f;
 inline constexpr float inspectorRowHeight = 24.0f;
 inline constexpr float inspectorLabelWidth = 132.0f;
-inline constexpr float inspectorComponentHeaderHeight = 30.0f;
-inline constexpr float inspectorComponentHeaderIconSize = 16.0f;
-inline constexpr float inspectorComponentActionSize = 20.0f;
+inline constexpr float inspectorComponentHeaderHeight = 38.0f;
+inline constexpr float inspectorComponentHeaderIconSize = 18.0f;
+inline constexpr float inspectorComponentActionSize = 22.0f;
 inline constexpr float viewportOverlayPaddingX = 5.0f;
 inline constexpr float viewportOverlayPaddingY = 2.0f;
 inline constexpr float viewportOverlayRounding = 2.0f;
@@ -451,6 +451,13 @@ inline ImVec2 editorRowFramePadding(float targetHeight) {
     return ImVec2(style.FramePadding.x, std::max(style.FramePadding.y, (targetHeight - ImGui::GetTextLineHeight()) * 0.5f));
 }
 
+inline float editorIconSizeForRow(float rowHeight, float maxIconSize = 16.0f) {
+    if (rowHeight <= 0.0f) {
+        return std::min(14.0f, maxIconSize);
+    }
+    return std::clamp(rowHeight - 4.0f, 12.0f, maxIconSize);
+}
+
 inline uint32_t editorTablerIconCodepoint(EditorGlyphIcon icon) {
     switch (icon) {
     case EditorGlyphIcon::Select: return 0xF265;       // pointer
@@ -569,8 +576,10 @@ inline bool editorDrawTablerIconGlyph(ImDrawList* drawList, EditorGlyphIcon icon
     const ImVec2 textSize = font->CalcTextSizeA(fontSize, std::numeric_limits<float>::max(), 0.0f, glyph, glyph + glyphLength);
     const ImVec2 pos(
         min.x + (w - textSize.x) * 0.5f,
-        min.y + (h - textSize.y) * 0.5f - iconSize * 0.02f);
-    drawList->AddText(font, fontSize, pos, color, glyph, glyph + glyphLength);
+        min.y + (h - textSize.y) * 0.5f);
+    const float clipPad = std::max(1.0f, iconSize * 0.12f);
+    const ImVec4 clipRect(min.x - clipPad, min.y - clipPad, max.x + clipPad, max.y + clipPad);
+    drawList->AddText(font, fontSize, pos, color, glyph, glyph + glyphLength, 0.0f, &clipRect);
     return true;
 }
 
@@ -952,7 +961,7 @@ inline void editorDrawIconGlyph(EditorGlyphIcon icon, ImVec2 min, ImVec2 max, Im
 }
 
 inline ImVec2 editorIconButtonSize() {
-    return ImVec2(22.0f, 20.0f);
+    return ImVec2(24.0f, 22.0f);
 }
 
 inline float editorIconTextButtonWidth(const char* label) {
@@ -1011,7 +1020,7 @@ inline bool editorGlyphMenuItem(EditorGlyphIcon icon, const char* label, bool en
         const ImVec2 min = ImGui::GetItemRectMin();
         const ImVec2 max = ImGui::GetItemRectMax();
         const float rowHeight = max.y - min.y;
-        const float iconSize = rowHeight > 0.0f ? std::min(16.0f, rowHeight - 4.0f) : 14.0f;
+        const float iconSize = editorIconSizeForRow(rowHeight);
         const float y = min.y + (rowHeight - iconSize) * 0.5f;
         if (!enabled) {
             editorDrawDisabledRowChrome(min, max);
@@ -1034,7 +1043,7 @@ inline bool editorGlyphBeginMenu(EditorGlyphIcon icon, const char* label, bool e
         const ImVec2 min = ImGui::GetItemRectMin();
         const ImVec2 max = ImGui::GetItemRectMax();
         const float rowHeight = max.y - min.y;
-        const float iconSize = rowHeight > 0.0f ? std::min(16.0f, rowHeight - 4.0f) : 14.0f;
+        const float iconSize = editorIconSizeForRow(rowHeight);
         const float y = min.y + (rowHeight - iconSize) * 0.5f;
         if (!enabled && drawList != nullptr) {
             const ImU32 accent = ImGui::GetColorU32(editorDisabledRowAccentColor());

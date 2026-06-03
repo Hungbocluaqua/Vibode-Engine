@@ -74,7 +74,11 @@ bool resetFieldButton(const char* id, const char* tooltipText = "Reset to defaul
 }
 
 bool inspectorActionButton(const char* id, const char* tooltipText) {
-    const bool clicked = editorIconButton(id, EditorGlyphIcon::More, false, ImVec2(22.0f, 20.0f));
+    const bool clicked = editorIconButton(
+        id,
+        EditorGlyphIcon::More,
+        false,
+        ImVec2(EditorUiMetric::inspectorComponentActionSize, EditorUiMetric::inspectorComponentActionSize));
     tooltip(tooltipText);
     return clicked;
 }
@@ -235,10 +239,21 @@ void drawInspectorComponentHeader(
     const ImU32 detailColor = ImGui::GetColorU32(ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     const ImVec2 titleSize = ImGui::CalcTextSize(title);
     const float textX = iconMin.x + iconSize + 14.0f;
-    const float titleY = detail != nullptr ? min.y + 4.0f : min.y + (size.y - titleSize.y) * 0.5f;
-    dl->AddText(ImVec2(textX, titleY), titleColor, title);
-    if (detail != nullptr && detail[0] != '\0') {
-        dl->AddText(ImVec2(textX, min.y + 17.0f), detailColor, detail);
+    const bool hasDetail = detail != nullptr && detail[0] != '\0';
+    const float lineHeight = ImGui::GetTextLineHeight();
+    const float detailGap = hasDetail ? 2.0f : 0.0f;
+    const float textBlockHeight = hasDetail ? (lineHeight * 2.0f + detailGap) : titleSize.y;
+    const float textY = min.y + std::max(0.0f, (size.y - textBlockHeight) * 0.5f);
+    const float reservedActionWidth = (popupId != nullptr && requests != nullptr) ? (EditorUiMetric::inspectorComponentActionSize + 12.0f) : 0.0f;
+    const ImVec2 textClipMin(textX, min.y + 3.0f);
+    const ImVec2 textClipMax(max.x - reservedActionWidth, max.y - 3.0f);
+    if (textClipMax.x > textClipMin.x && textClipMax.y > textClipMin.y) {
+        dl->PushClipRect(textClipMin, textClipMax, true);
+        dl->AddText(ImVec2(textX, textY), titleColor, title);
+        if (hasDetail) {
+            dl->AddText(ImVec2(textX, textY + lineHeight + detailGap), detailColor, detail);
+        }
+        dl->PopClipRect();
     }
 
     ImGui::Dummy(size);
