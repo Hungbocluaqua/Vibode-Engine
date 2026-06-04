@@ -97,6 +97,10 @@ EditorGlyphIcon commandGlyph(EditorCommandId id) {
     case EditorCommandId::SaveScene:
     case EditorCommandId::SaveSceneAs:
         return EditorGlyphIcon::SceneFile;
+    case EditorCommandId::SaveMaterial:
+        return EditorGlyphIcon::Material;
+    case EditorCommandId::OpenProjectDirectory:
+    case EditorCommandId::OpenLogFolder:
     case EditorCommandId::OpenAsset:
         return EditorGlyphIcon::Folder;
     case EditorCommandId::ImportAsset:
@@ -227,7 +231,8 @@ bool filteredMenuItem(
     bool selected = false,
     bool enabled = true,
     const char* disabledReason = nullptr,
-    EditorGlyphIcon glyph = EditorGlyphIcon::File) {
+    EditorGlyphIcon glyph = EditorGlyphIcon::File,
+    const char* description = nullptr) {
     if (!menuFilterMatches(filter, label)) {
         return false;
     }
@@ -235,8 +240,21 @@ bool filteredMenuItem(
     const bool clicked = ImGui::MenuItem(decorated.c_str(), shortcut, selected, enabled);
     drawMenuItemGlyph(glyph, enabled);
     const char* reason = !enabled && disabledReason == nullptr ? "Not available in current context" : disabledReason;
-    menuItemTooltip(label, enabled ? nullptr : reason);
+    menuItemTooltip(description != nullptr ? description : label, enabled ? nullptr : reason);
     return clicked;
+}
+
+bool filteredPlaceholderMenuItem(const char* label, const char* filter, EditorGlyphIcon glyph = EditorGlyphIcon::File) {
+    const EditorCommandPlaceholder* placeholder = editorCommandPlaceholder(label);
+    return filteredMenuItem(
+        label,
+        filter,
+        nullptr,
+        false,
+        false,
+        placeholder != nullptr ? placeholder->disabledReason.c_str() : "Not available in this build.",
+        glyph,
+        placeholder != nullptr ? placeholder->description.c_str() : label);
 }
 
 void filteredToggleMenuItem(const char* label, const char* filter, bool* value, EditorGlyphIcon glyph = EditorGlyphIcon::Window) {
@@ -668,6 +686,9 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
     case EditorCommandId::OpenProjectDirectory:
         requests.openProjectDirectory = true;
         break;
+    case EditorCommandId::OpenLogFolder:
+        requests.openLogFolder = true;
+        break;
     case EditorCommandId::OpenAsset:
         visibility.assetBrowser = true;
         requests.openSelectedAsset = true;
@@ -967,13 +988,13 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         menuSection("OPEN");
         if (filteredCommandMenuItem(EditorCommandId::NewScene, prefs, fileSearch.data())) { executeCommand(EditorCommandId::NewScene, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::OpenScene, prefs, fileSearch.data())) { executeCommand(EditorCommandId::OpenScene, state, visibility, requests); }
-        filteredMenuItem("Favorite Scenes", fileSearch.data(), nullptr, false, false, "Favorite scene storage is not implemented yet.", EditorGlyphIcon::SceneFile);
+        filteredPlaceholderMenuItem("Favorite Scenes", fileSearch.data(), EditorGlyphIcon::SceneFile);
         if (filteredCommandMenuItem(EditorCommandId::OpenAsset, prefs, fileSearch.data())) { executeCommand(EditorCommandId::OpenAsset, state, visibility, requests); }
         menuSection("SAVE");
         if (filteredCommandMenuItem(EditorCommandId::SaveScene, prefs, fileSearch.data())) { executeCommand(EditorCommandId::SaveScene, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::SaveSceneAs, prefs, fileSearch.data())) { executeCommand(EditorCommandId::SaveSceneAs, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::SaveAll, prefs, fileSearch.data())) { executeCommand(EditorCommandId::SaveAll, state, visibility, requests); }
-        filteredMenuItem("Choose Files to Save...", fileSearch.data(), nullptr, false, false, "Selective save is not available in this build.", EditorGlyphIcon::Save);
+        filteredPlaceholderMenuItem("Choose Files to Save...", fileSearch.data(), EditorGlyphIcon::Save);
         if (filteredMenuItem("Close Scene", fileSearch.data(), nullptr, false, state.scenePath != nullptr && state.scenePath->has_value(), "No saved scene is currently open.", EditorGlyphIcon::SceneFile)) {
             requests.closeScene = true;
         }
@@ -1008,17 +1029,17 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         if (filteredCommandMenuItem(EditorCommandId::ImportSceneAsNewScene, prefs, fileSearch.data())) { executeCommand(EditorCommandId::ImportSceneAsNewScene, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::MergeScene, prefs, fileSearch.data())) { executeCommand(EditorCommandId::MergeScene, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::ImportHdri, prefs, fileSearch.data())) { executeCommand(EditorCommandId::ImportHdri, state, visibility, requests); }
-        filteredMenuItem("Import Texture", fileSearch.data(), nullptr, false, false, "Texture asset import is routed through the Content browser import pipeline.", EditorGlyphIcon::Texture);
-        filteredMenuItem("Import IES Profile", fileSearch.data(), nullptr, false, false, "IES profile import storage is not implemented yet.", EditorGlyphIcon::IesProfile);
-        filteredMenuItem("Export All...", fileSearch.data(), nullptr, false, false, "Scene export is not implemented yet.", EditorGlyphIcon::SceneFile);
-        filteredMenuItem("Export Selected...", fileSearch.data(), nullptr, false, false, "Select an entity or asset after scene export support is implemented.", EditorGlyphIcon::Entity);
+        filteredPlaceholderMenuItem("Import Texture", fileSearch.data(), EditorGlyphIcon::Texture);
+        filteredPlaceholderMenuItem("Import IES Profile", fileSearch.data(), EditorGlyphIcon::IesProfile);
+        filteredPlaceholderMenuItem("Export All...", fileSearch.data(), EditorGlyphIcon::SceneFile);
+        filteredPlaceholderMenuItem("Export Selected...", fileSearch.data(), EditorGlyphIcon::Entity);
         menuSection("PROJECT");
         if (filteredCommandMenuItem(EditorCommandId::ProjectManager, prefs, fileSearch.data())) { executeCommand(EditorCommandId::ProjectManager, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CloseProject, prefs, fileSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::CloseProject, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::ProjectSettings, prefs, fileSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::ProjectSettings, state, visibility, requests); }
-        filteredMenuItem("Zip Project", fileSearch.data(), nullptr, false, false, "Project packaging is not wired to the editor shell yet.", EditorGlyphIcon::ProjectFile);
+        filteredPlaceholderMenuItem("Zip Project", fileSearch.data(), EditorGlyphIcon::ProjectFile);
         if (filteredCommandMenuItem(EditorCommandId::OpenProjectDirectory, prefs, fileSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::OpenProjectDirectory, state, visibility, requests); }
-        filteredMenuItem("Recent Projects", fileSearch.data(), nullptr, false, false, "Recent projects are shown in the Project Manager.", EditorGlyphIcon::ProjectFile);
+        filteredPlaceholderMenuItem("Recent Projects", fileSearch.data(), EditorGlyphIcon::ProjectFile);
         menuSection("APPLICATION");
         if (filteredCommandMenuItem(EditorCommandId::Exit, prefs, fileSearch.data())) { executeCommand(EditorCommandId::Exit, state, visibility, requests); }
         ImGui::EndMenu();
@@ -1028,25 +1049,25 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         drawMenuSearch("##CreateMenuSearch", createSearch);
         menuSection("ENTITY");
         if (filteredCommandMenuItem(EditorCommandId::CreateEmptyEntity, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreateEmptyEntity, state, visibility, requests); }
-        if (filteredMenuItem("Folder / Group", createSearch.data(), nullptr, false, false, "Scene folder/group authoring is not available in this build.", EditorGlyphIcon::Group)) {}
+        if (filteredPlaceholderMenuItem("Folder / Group", createSearch.data(), EditorGlyphIcon::Group)) {}
         menuSection("3D OBJECT");
-        if (filteredMenuItem("Cube", createSearch.data(), nullptr, false, false, "Primitive mesh creation is not available in this build.", EditorGlyphIcon::Model)) {}
-        if (filteredMenuItem("Sphere", createSearch.data(), nullptr, false, false, "Primitive mesh creation is not available in this build.", EditorGlyphIcon::Model)) {}
-        if (filteredMenuItem("Plane", createSearch.data(), nullptr, false, false, "Primitive mesh creation is not available in this build.", EditorGlyphIcon::Model)) {}
-        if (filteredMenuItem("Cylinder", createSearch.data(), nullptr, false, false, "Primitive mesh creation is not available in this build.", EditorGlyphIcon::Model)) {}
-        if (filteredMenuItem("Cone", createSearch.data(), nullptr, false, false, "Primitive mesh creation is not available in this build.", EditorGlyphIcon::Model)) {}
-        if (filteredMenuItem("Mesh From Asset", createSearch.data(), nullptr, false, false, "Select a mesh or prefab in Content and place it from the asset actions.", EditorGlyphIcon::Model)) {}
+        if (filteredPlaceholderMenuItem("Cube", createSearch.data(), EditorGlyphIcon::Model)) {}
+        if (filteredPlaceholderMenuItem("Sphere", createSearch.data(), EditorGlyphIcon::Model)) {}
+        if (filteredPlaceholderMenuItem("Plane", createSearch.data(), EditorGlyphIcon::Model)) {}
+        if (filteredPlaceholderMenuItem("Cylinder", createSearch.data(), EditorGlyphIcon::Model)) {}
+        if (filteredPlaceholderMenuItem("Cone", createSearch.data(), EditorGlyphIcon::Model)) {}
+        if (filteredPlaceholderMenuItem("Mesh From Asset", createSearch.data(), EditorGlyphIcon::Model)) {}
         menuSection("LIGHT");
         if (filteredCommandMenuItem(EditorCommandId::CreatePrimarySun, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreatePrimarySun, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CreatePointLight, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreatePointLight, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CreateSpotLight, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreateSpotLight, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CreateAreaLight, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreateAreaLight, state, visibility, requests); }
-        if (filteredMenuItem("Disk Area Light", createSearch.data(), nullptr, false, false, "Disk area light shape is not available in this build.", EditorGlyphIcon::Light)) {}
-        if (filteredMenuItem("Sphere Light", createSearch.data(), nullptr, false, false, "Sphere light shape is not available in this build.", EditorGlyphIcon::Light)) {}
-        if (filteredMenuItem("Emissive Mesh Light", createSearch.data(), nullptr, false, false, "Emissive mesh light authoring is not available in this build.", EditorGlyphIcon::Light)) {}
+        if (filteredPlaceholderMenuItem("Disk Area Light", createSearch.data(), EditorGlyphIcon::Light)) {}
+        if (filteredPlaceholderMenuItem("Sphere Light", createSearch.data(), EditorGlyphIcon::Light)) {}
+        if (filteredPlaceholderMenuItem("Emissive Mesh Light", createSearch.data(), EditorGlyphIcon::Light)) {}
         menuSection("CAMERA");
         if (filteredCommandMenuItem(EditorCommandId::CreateCamera, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreateCamera, state, visibility, requests); }
-        if (filteredMenuItem("Cine Camera", createSearch.data(), nullptr, false, false, "Cinematic camera actor storage is not available in this build.", EditorGlyphIcon::Camera)) {}
+        if (filteredPlaceholderMenuItem("Cine Camera", createSearch.data(), EditorGlyphIcon::Camera)) {}
         menuSection("ENVIRONMENT");
         if (filteredCommandMenuItem(EditorCommandId::CreateEnvironmentLight, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreateEnvironmentLight, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CreateSkyAtmosphere, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreateSkyAtmosphere, state, visibility, requests); }
@@ -1054,9 +1075,9 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         if (filteredCommandMenuItem(EditorCommandId::CreateVolumetricCloud, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreateVolumetricCloud, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CreatePostProcessVolume, prefs, createSearch.data())) { executeCommand(EditorCommandId::CreatePostProcessVolume, state, visibility, requests); }
         menuSection("ASSET");
-        if (filteredMenuItem("Material", createSearch.data(), nullptr, false, false, "Material asset creation is not available from this menu yet.", EditorGlyphIcon::Material)) {}
-        if (filteredMenuItem("Material Instance", createSearch.data(), nullptr, false, false, "Material instance asset creation is not available from this menu yet.", EditorGlyphIcon::Material)) {}
-        if (filteredMenuItem("Prefab From Selection", createSearch.data(), nullptr, false, false, "Prefab authoring is not available in this build.", EditorGlyphIcon::Group)) {}
+        if (filteredPlaceholderMenuItem("Material", createSearch.data(), EditorGlyphIcon::Material)) {}
+        if (filteredPlaceholderMenuItem("Material Instance", createSearch.data(), EditorGlyphIcon::Material)) {}
+        if (filteredPlaceholderMenuItem("Prefab From Selection", createSearch.data(), EditorGlyphIcon::Group)) {}
         ImGui::EndMenu();
     }
 
@@ -1064,21 +1085,21 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         drawMenuSearch("##EngineMenuSearch", engineSearch);
         menuSection("SETTINGS");
         if (filteredCommandMenuItem(EditorCommandId::ProjectSettings, prefs, engineSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::ProjectSettings, state, visibility, requests); }
-        filteredMenuItem("Editor Preferences...", engineSearch.data(), nullptr, false, false, "Editor preferences are edited from the Project Manager preferences view.", EditorGlyphIcon::ConfigFile);
-        filteredMenuItem("Engine Settings...", engineSearch.data(), nullptr, false, false, "Engine settings are not exposed as an editor panel yet.", EditorGlyphIcon::ConfigFile);
+        filteredPlaceholderMenuItem("Editor Preferences...", engineSearch.data(), EditorGlyphIcon::ConfigFile);
+        filteredPlaceholderMenuItem("Engine Settings...", engineSearch.data(), EditorGlyphIcon::ConfigFile);
         menuSection("ASSET REGISTRY");
-        filteredMenuItem("Rebuild Asset Registry", engineSearch.data(), nullptr, false, false, "Asset registry rebuild is not wired to the top menu yet.", EditorGlyphIcon::Refresh);
-        filteredMenuItem("Validate Asset References", engineSearch.data(), nullptr, false, false, "Use the asset registry validator script from the command line for now.", EditorGlyphIcon::Command);
+        filteredPlaceholderMenuItem("Rebuild Asset Registry", engineSearch.data(), EditorGlyphIcon::Refresh);
+        filteredPlaceholderMenuItem("Validate Asset References", engineSearch.data(), EditorGlyphIcon::Command);
         menuSection("CACHE");
-        filteredMenuItem("Clear Derived Data Cache...", engineSearch.data(), nullptr, false, false, "Derived data cache clearing is not wired to the editor shell yet.", EditorGlyphIcon::Trash);
-        filteredMenuItem("Open Cache Directory", engineSearch.data(), nullptr, false, false, "Cache directory reveal is not wired to this menu yet.", EditorGlyphIcon::Folder);
+        filteredPlaceholderMenuItem("Clear Derived Data Cache...", engineSearch.data(), EditorGlyphIcon::Trash);
+        filteredPlaceholderMenuItem("Open Cache Directory", engineSearch.data(), EditorGlyphIcon::Folder);
         menuSection("VALIDATION");
-        filteredMenuItem("Run Validation Suite", engineSearch.data(), nullptr, false, false, "Use the validation scripts from the command line; in-editor launch is pending.", EditorGlyphIcon::Command);
-        filteredMenuItem("Run Current Scene Checks", engineSearch.data(), nullptr, false, false, "Current-scene validation is not wired to the editor shell yet.", EditorGlyphIcon::SceneFile);
+        filteredPlaceholderMenuItem("Run Validation Suite", engineSearch.data(), EditorGlyphIcon::Command);
+        filteredPlaceholderMenuItem("Run Current Scene Checks", engineSearch.data(), EditorGlyphIcon::SceneFile);
         menuSection("DIAGNOSTICS");
-        filteredMenuItem("Open Log Folder", engineSearch.data(), nullptr, false, false, "The editor log directory command is not wired yet.", EditorGlyphIcon::Folder);
-        filteredMenuItem("Open Debug Package Folder", engineSearch.data(), nullptr, false, false, "Debug package folder reveal is available from generated debug-package notifications.", EditorGlyphIcon::Folder);
-        filteredMenuItem("Copy System Info", engineSearch.data(), nullptr, false, false, "System info clipboard export is not wired to the editor shell yet.", EditorGlyphIcon::Command);
+        if (filteredCommandMenuItem(EditorCommandId::OpenLogFolder, prefs, engineSearch.data())) { executeCommand(EditorCommandId::OpenLogFolder, state, visibility, requests); }
+        filteredPlaceholderMenuItem("Open Debug Package Folder", engineSearch.data(), EditorGlyphIcon::Folder);
+        filteredPlaceholderMenuItem("Copy System Info", engineSearch.data(), EditorGlyphIcon::Command);
         if (filteredCommandMenuItem(EditorCommandId::CommandPalette, prefs, engineSearch.data())) { executeCommand(EditorCommandId::CommandPalette, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::ShowControls, prefs, engineSearch.data())) { executeCommand(EditorCommandId::ShowControls, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::ShowRendererInfo, prefs, engineSearch.data())) { executeCommand(EditorCommandId::ShowRendererInfo, state, visibility, requests); }
@@ -1104,11 +1125,11 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         filteredToggleMenuItem("Debug / Profiler", windowSearch.data(), &visibility.debugProfiler, EditorGlyphIcon::Stats);
         filteredToggleMenuItem("Scene Stats", windowSearch.data(), &visibility.sceneStats, EditorGlyphIcon::Stats);
         filteredToggleMenuItem("GPU Diagnostics", windowSearch.data(), &visibility.gpuDiagnostics, EditorGlyphIcon::Stats);
-        filteredMenuItem("Floating Render Controls", windowSearch.data(), nullptr, false, false, "Floating render controls are not implemented yet; use the Render menu and viewport strip.", EditorGlyphIcon::Render);
+        filteredPlaceholderMenuItem("Floating Render Controls", windowSearch.data(), EditorGlyphIcon::Render);
         menuSection("LAYOUT");
         if (filteredCommandMenuItem(EditorCommandId::SaveLayout, prefs, windowSearch.data())) { executeCommand(EditorCommandId::SaveLayout, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::ResetLayout, prefs, windowSearch.data())) { executeCommand(EditorCommandId::ResetLayout, state, visibility, requests); }
-        filteredMenuItem("Load Layout...", windowSearch.data(), nullptr, false, false, "Named layout loading is not implemented yet.", EditorGlyphIcon::Layout);
+        filteredPlaceholderMenuItem("Load Layout...", windowSearch.data(), EditorGlyphIcon::Layout);
         ImGui::EndMenu();
     }
 
@@ -1118,24 +1139,24 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         if (filteredCommandMenuItem(EditorCommandId::RenderCurrentViewport, prefs, renderSearch.data())) { executeCommand(EditorCommandId::RenderCurrentViewport, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::RenderImage, prefs, renderSearch.data())) { executeCommand(EditorCommandId::RenderImage, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::RenderSequence, prefs, renderSearch.data())) { executeCommand(EditorCommandId::RenderSequence, state, visibility, requests); }
-        filteredMenuItem("Pause / Resume Render", renderSearch.data(), nullptr, false, false, "Pause/resume render jobs are not available in this build.", EditorGlyphIcon::Pause);
+        filteredPlaceholderMenuItem("Pause / Resume Render", renderSearch.data(), EditorGlyphIcon::Pause);
         if (filteredCommandMenuItem(EditorCommandId::StopRender, prefs, renderSearch.data())) { executeCommand(EditorCommandId::StopRender, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::OpenOutputFolder, prefs, renderSearch.data())) { executeCommand(EditorCommandId::OpenOutputFolder, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::Screenshot, prefs, renderSearch.data())) { executeCommand(EditorCommandId::Screenshot, state, visibility, requests); }
-        filteredMenuItem("High Resolution Render", renderSearch.data(), nullptr, false, false, "High-resolution tiled rendering is not available in this build.", EditorGlyphIcon::Render);
+        filteredPlaceholderMenuItem("High Resolution Render", renderSearch.data(), EditorGlyphIcon::Render);
         menuSection("PREVIEW");
         if (filteredCommandMenuItem(EditorCommandId::ResetAccumulation, prefs, renderSearch.data())) { executeCommand(EditorCommandId::ResetAccumulation, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::ToggleDenoiser, prefs, renderSearch.data())) { executeCommand(EditorCommandId::ToggleDenoiser, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CycleDebugView, prefs, renderSearch.data())) { executeCommand(EditorCommandId::CycleDebugView, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CycleIntermediateView, prefs, renderSearch.data())) { executeCommand(EditorCommandId::CycleIntermediateView, state, visibility, requests); }
         filteredToggleMenuItem("Render World Settings", renderSearch.data(), &visibility.renderSettings, EditorGlyphIcon::Render);
-        filteredMenuItem("Quality Preset", renderSearch.data(), nullptr, false, false, "Use the Render World Settings panel for preset changes.", EditorGlyphIcon::Render);
+        filteredPlaceholderMenuItem("Quality Preset", renderSearch.data(), EditorGlyphIcon::Render);
         menuSection("DIAGNOSTICS");
-        filteredMenuItem("Capture RenderDoc", renderSearch.data(), nullptr, false, false, "RenderDoc capture remains available through the existing runtime capture path; top-menu launch is pending.", EditorGlyphIcon::Render);
-        filteredMenuItem("Export Debug Views", renderSearch.data(), nullptr, false, false, "Use headless/debug package export until in-editor export is wired.", EditorGlyphIcon::DrawDebug);
-        filteredMenuItem("Export Debug Package", renderSearch.data(), nullptr, false, false, "Use the debug package command-line export until in-editor export is wired.", EditorGlyphIcon::Folder);
-        filteredMenuItem("Dump RenderGraph", renderSearch.data(), nullptr, false, false, "RenderGraph dump is available through headless diagnostics for now.", EditorGlyphIcon::ConfigFile);
-        filteredMenuItem("Profile Current Scene", renderSearch.data(), nullptr, false, false, "Profiling export is available through headless diagnostics for now.", EditorGlyphIcon::Stats);
+        filteredPlaceholderMenuItem("Capture RenderDoc", renderSearch.data(), EditorGlyphIcon::Render);
+        filteredPlaceholderMenuItem("Export Debug Views", renderSearch.data(), EditorGlyphIcon::DrawDebug);
+        filteredPlaceholderMenuItem("Export Debug Package", renderSearch.data(), EditorGlyphIcon::Folder);
+        filteredPlaceholderMenuItem("Dump RenderGraph", renderSearch.data(), EditorGlyphIcon::ConfigFile);
+        filteredPlaceholderMenuItem("Profile Current Scene", renderSearch.data(), EditorGlyphIcon::Stats);
         menuSection("DEBUG VIEWS");
         if (filteredCommandMenuItem(EditorCommandId::SetDebugBeauty, prefs, renderSearch.data())) { executeCommand(EditorCommandId::SetDebugBeauty, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::SetDebugDirectLighting, prefs, renderSearch.data())) { executeCommand(EditorCommandId::SetDebugDirectLighting, state, visibility, requests); }
@@ -1145,7 +1166,7 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         if (filteredCommandMenuItem(EditorCommandId::SetDebugMotionVectors, prefs, renderSearch.data())) { executeCommand(EditorCommandId::SetDebugMotionVectors, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::SetDebugVariance, prefs, renderSearch.data())) { executeCommand(EditorCommandId::SetDebugVariance, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::SetDebugAlbedo, prefs, renderSearch.data())) { executeCommand(EditorCommandId::SetDebugAlbedo, state, visibility, requests); }
-        filteredMenuItem("View Mode", renderSearch.data(), nullptr, false, false, "Viewport view-mode switching is exposed through Draw Debug for now.", EditorGlyphIcon::DrawDebug);
+        filteredPlaceholderMenuItem("View Mode", renderSearch.data(), EditorGlyphIcon::DrawDebug);
         ImGui::EndMenu();
     }
 
@@ -1160,10 +1181,10 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         menuSection("LAYOUT FILES");
         if (filteredCommandMenuItem(EditorCommandId::SaveLayout, prefs, layoutSearch.data())) { executeCommand(EditorCommandId::SaveLayout, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::ResetLayout, prefs, layoutSearch.data())) { executeCommand(EditorCommandId::ResetLayout, state, visibility, requests); }
-        filteredMenuItem("Manage Layouts...", layoutSearch.data(), nullptr, false, false, "Named layout management is not implemented yet.", EditorGlyphIcon::Layout);
+        filteredPlaceholderMenuItem("Manage Layouts...", layoutSearch.data(), EditorGlyphIcon::Layout);
         menuSection("APPEARANCE");
-        filteredMenuItem("UI Scale", layoutSearch.data(), nullptr, false, false, "UI scale is edited from Project Manager preferences.", EditorGlyphIcon::Layout);
-        filteredMenuItem("Theme", layoutSearch.data(), nullptr, false, false, "Theme is edited from Project Manager preferences.", EditorGlyphIcon::Layout);
+        filteredPlaceholderMenuItem("UI Scale", layoutSearch.data(), EditorGlyphIcon::Layout);
+        filteredPlaceholderMenuItem("Theme", layoutSearch.data(), EditorGlyphIcon::Layout);
         ImGui::EndMenu();
     }
 

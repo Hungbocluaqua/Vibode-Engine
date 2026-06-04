@@ -23,6 +23,7 @@ struct EditorPreferences {
     int themePreset = 0;
     int workspacePreset = 0;
     int layoutVersion = 2;
+    int renderSequenceFramesPerTimelineFrame = 1;
     bool confirmDelete = true;
     std::vector<std::string> recentFiles;
     std::vector<std::string> favoriteFiles;

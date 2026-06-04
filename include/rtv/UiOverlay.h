@@ -56,6 +56,8 @@ public:
         const std::optional<std::filesystem::path>& scenePath,
         const ProjectContext* project,
         const AssetRegistry* assetRegistry,
+        const std::unordered_map<AssetGuid, MaterialAsset>* dirtyMaterialAssets,
+        const std::unordered_map<AssetGuid, std::filesystem::path>* materialAssetAutosavePaths,
         bool sceneDirty,
         bool projectSettingsDirty,
         const std::vector<EntityId>* instanceEntities,
@@ -73,6 +75,7 @@ public:
     [[nodiscard]] EditorRequests buildProjectManager(
         const ProjectContext* project,
         const AssetRegistry* assetRegistry,
+        const std::optional<std::filesystem::path>& scenePath,
         bool sceneDirty,
         bool projectSettingsDirty,
         const std::string& sceneLoadingStatus,

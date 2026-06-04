@@ -20,6 +20,7 @@
 #include <array>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,7 +34,12 @@ public:
     void showProjectManager() { showProjectManager_ = true; projectManagerDismissed_ = false; }
     void dismissProjectManager() { showProjectManager_ = false; projectManagerDismissed_ = true; }
     void handleNotificationAction(NotificationAction action, EditorRequests& requests);
-    void showRecoveryPrompt(std::filesystem::path markerPath, std::filesystem::path autosavePath, std::filesystem::path projectAutosavePath = {});
+    void showRecoveryPrompt(
+        std::filesystem::path markerPath,
+        std::filesystem::path autosavePath,
+        std::filesystem::path projectAutosavePath = {},
+        std::filesystem::path assetRegistryAutosavePath = {},
+        std::vector<std::pair<std::string, std::filesystem::path>> materialAssetAutosavePaths = {});
     void invalidateAssetThumbnails() { assetBrowserPanel_.invalidateThumbnails(); }
     void clearSelection() { selection_.clear(); }
 
@@ -85,6 +91,8 @@ private:
     float timelineDragStartMouseX_ = 0.0f;
     std::vector<std::pair<uint64_t, int>> timelineDragStartFrames_{};
     std::vector<std::string> consoleHistory_{};
+    std::string lastConsoleCommandFailureReason_{};
+    std::unordered_map<std::string, std::string> projectSourceControlStatusCache_{};
     struct EditorJobHistoryEntry {
         uint64_t id = 0;
         uint64_t serial = 0;
@@ -145,6 +153,8 @@ private:
     std::filesystem::path recoveryMarkerPath_;
     std::filesystem::path recoveryAutosavePath_;
     std::filesystem::path recoveryProjectAutosavePath_;
+    std::filesystem::path recoveryAssetRegistryAutosavePath_;
+    std::vector<std::pair<std::string, std::filesystem::path>> recoveryMaterialAssetAutosavePaths_;
     bool showProjectManager_ = true;
     bool projectManagerDismissed_ = false;
     int projectManagerSection_ = 0;

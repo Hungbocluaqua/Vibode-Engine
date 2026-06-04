@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct GLFWwindow;
@@ -174,6 +175,8 @@ struct EditorRuntimeState {
     const std::optional<std::filesystem::path>* scenePath = nullptr;
     const ProjectContext* project = nullptr;
     const AssetRegistry* assetRegistry = nullptr;
+    const std::unordered_map<AssetGuid, MaterialAsset>* dirtyMaterialAssets = nullptr;
+    const std::unordered_map<AssetGuid, std::filesystem::path>* materialAssetAutosavePaths = nullptr;
     bool sceneDirty = false;
     bool projectSettingsDirty = false;
     const std::vector<EntityId>* instanceEntities = nullptr;
@@ -198,6 +201,7 @@ struct EditorRuntimeState {
 struct ProjectManagerRuntimeState {
     const ProjectContext* project = nullptr;
     const AssetRegistry* assetRegistry = nullptr;
+    const std::optional<std::filesystem::path>* scenePath = nullptr;
     const std::string* sceneLoadingStatus = nullptr;
     bool sceneLoadRunning = false;
     float sceneLoadProgress = 0.0f;
@@ -394,6 +398,7 @@ struct EditorRequests {
     bool undo = false;
     bool redo = false;
     bool saveAll = false;
+    std::optional<AssetGuid> saveMaterialAsset;
     bool resetLayout = false;
     bool saveLayout = false;
     bool toggleDenoiser = false;
@@ -404,6 +409,7 @@ struct EditorRequests {
     bool renderImage = false;
     bool renderSequence = false;
     bool openProjectDirectory = false;
+    bool openLogFolder = false;
     bool openSelectedAsset = false;
     bool stopRender = false;
     bool openOutputFolder = false;

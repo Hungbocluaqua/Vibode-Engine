@@ -594,6 +594,230 @@ std::filesystem::path editorProjectAutosavePath(const ProjectContext& project) {
     return project.savedRoot / "Autosaves" / (name + "_project_autosave.vproject");
 }
 
+std::filesystem::path editorAssetRegistryAutosavePath(const ProjectContext& project) {
+    const std::string name = project.name.empty() ? std::string("Project") : project.name;
+    return project.savedRoot / "Autosaves" / (name + "_asset_registry_autosave.json");
+}
+
+std::string safeAutosaveStem(std::string value) {
+    if (value.empty()) {
+        value = "material";
+    }
+    for (char& c : value) {
+        const unsigned char ch = static_cast<unsigned char>(c);
+        if (!std::isalnum(ch) && c != '_' && c != '-') {
+            c = '_';
+        }
+    }
+    return value;
+}
+
+std::filesystem::path editorMaterialAssetAutosavePath(const ProjectContext& project, const AssetRecord& record) {
+    const std::string label = safeAutosaveStem(record.displayName.empty() ? record.guid : record.displayName);
+    const std::string guidSuffix = record.guid.size() > 12u ? record.guid.substr(0, 12u) : record.guid;
+    return project.savedRoot / "Autosaves" / (label + "_" + safeAutosaveStem(guidSuffix) + "_material_autosave.rtmaterial.json");
+}
+
+std::string editorTimestampString() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &time);
+#else
+    localtime_r(&time, &tm);
+#endif
+    std::ostringstream stream;
+    stream << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S");
+    return stream.str();
+}
+
+nlohmann::json jsonVec3(glm::vec3 value) {
+    return nlohmann::json::array({value.x, value.y, value.z});
+}
+
+nlohmann::json jsonVec4(glm::vec4 value) {
+    return nlohmann::json::array({value.x, value.y, value.z, value.w});
+}
+
+const char* materialAlphaModeName(uint32_t alphaMode) {
+    switch (alphaMode) {
+    case kMaterialAlphaModeMask: return "Mask";
+    case kMaterialAlphaModeBlend: return "Blend";
+    case kMaterialAlphaModeOpaque:
+    default:
+        return "Opaque";
+    }
+}
+
+nlohmann::json textureHandleJson(TextureAssetHandle handle) {
+    return handle.valid() ? nlohmann::json(handle.index) : nlohmann::json(nullptr);
+}
+
+nlohmann::json materialEditorOverrideJson(const MaterialAsset& material) {
+    return {
+        {"schema", "TransparentMaterialEditorOverrideV1"},
+        {"name", material.name},
+        {"baseColorFactor", jsonVec4(material.baseColorFactor)},
+        {"metallicFactor", material.metallicFactor},
+        {"roughnessFactor", material.roughnessFactor},
+        {"emissiveFactor", jsonVec3(material.emissiveFactor)},
+        {"emissiveStrength", material.emissiveStrength},
+        {"alphaMode", materialAlphaModeName(material.alphaMode)},
+        {"alphaCutoff", material.alphaCutoff},
+        {"doubleSided", material.doubleSided != 0u},
+        {"conductorOptics", {
+            {"enabled", material.useConductorOptics != 0u},
+            {"eta", jsonVec3(material.conductorEta)},
+            {"k", jsonVec3(material.conductorK)},
+        }},
+        {"textures", {
+            {"baseColor", textureHandleJson(material.baseColorTexture)},
+            {"normal", textureHandleJson(material.normalTexture)},
+            {"metallicRoughness", textureHandleJson(material.metallicRoughnessTexture)},
+            {"emissive", textureHandleJson(material.emissiveTexture)},
+            {"occlusion", textureHandleJson(material.occlusionTexture)},
+        }},
+    };
+}
+
+float jsonArrayFloat(const nlohmann::json& value, size_t index, float fallback) {
+    return value.is_array() && index < value.size() && value[index].is_number()
+        ? value[index].get<float>()
+        : fallback;
+}
+
+uint32_t materialAlphaModeFromName(std::string name) {
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (name == "mask") return kMaterialAlphaModeMask;
+    if (name == "blend") return kMaterialAlphaModeBlend;
+    return kMaterialAlphaModeOpaque;
+}
+
+TextureAssetHandle textureHandleFromJson(const nlohmann::json& value) {
+    if (!value.is_number_unsigned()) {
+        return {};
+    }
+    return TextureAssetHandle{value.get<uint32_t>()};
+}
+
+std::optional<MaterialAsset> materialAssetFromEditorOverrideJson(const nlohmann::json& root) {
+    const nlohmann::json* source = nullptr;
+    if (root.contains("editorMaterialOverride") && root["editorMaterialOverride"].is_object()) {
+        source = &root["editorMaterialOverride"];
+    } else if (root.contains("pbr") && root["pbr"].is_object() && root["pbr"].value("schema", std::string{}) == "TransparentMaterialEditorOverrideV1") {
+        source = &root["pbr"];
+    }
+    if (source == nullptr) {
+        return std::nullopt;
+    }
+
+    MaterialAsset material;
+    material.name = source->value("name", root.value("displayName", std::string{}));
+    if (source->contains("baseColorFactor")) {
+        const nlohmann::json& color = (*source)["baseColorFactor"];
+        material.baseColorFactor = glm::vec4(
+            jsonArrayFloat(color, 0, material.baseColorFactor.x),
+            jsonArrayFloat(color, 1, material.baseColorFactor.y),
+            jsonArrayFloat(color, 2, material.baseColorFactor.z),
+            jsonArrayFloat(color, 3, material.baseColorFactor.w));
+    }
+    material.metallicFactor = source->value("metallicFactor", material.metallicFactor);
+    material.roughnessFactor = source->value("roughnessFactor", material.roughnessFactor);
+    if (source->contains("emissiveFactor")) {
+        const nlohmann::json& emissive = (*source)["emissiveFactor"];
+        material.emissiveFactor = glm::vec3(
+            jsonArrayFloat(emissive, 0, material.emissiveFactor.x),
+            jsonArrayFloat(emissive, 1, material.emissiveFactor.y),
+            jsonArrayFloat(emissive, 2, material.emissiveFactor.z));
+    }
+    material.emissiveStrength = source->value("emissiveStrength", material.emissiveStrength);
+    material.alphaMode = materialAlphaModeFromName(source->value("alphaMode", std::string("Opaque")));
+    material.alphaCutoff = source->value("alphaCutoff", material.alphaCutoff);
+    material.doubleSided = source->value("doubleSided", false) ? 1u : 0u;
+    if (source->contains("conductorOptics") && (*source)["conductorOptics"].is_object()) {
+        const nlohmann::json& conductor = (*source)["conductorOptics"];
+        material.useConductorOptics = conductor.value("enabled", false) ? 1u : 0u;
+        if (conductor.contains("eta")) {
+            const nlohmann::json& eta = conductor["eta"];
+            material.conductorEta = glm::vec3(jsonArrayFloat(eta, 0, 0.0f), jsonArrayFloat(eta, 1, 0.0f), jsonArrayFloat(eta, 2, 0.0f));
+        }
+        if (conductor.contains("k")) {
+            const nlohmann::json& k = conductor["k"];
+            material.conductorK = glm::vec3(jsonArrayFloat(k, 0, 0.0f), jsonArrayFloat(k, 1, 0.0f), jsonArrayFloat(k, 2, 0.0f));
+        }
+    }
+    if (source->contains("textures") && (*source)["textures"].is_object()) {
+        const nlohmann::json& textures = (*source)["textures"];
+        material.baseColorTexture = textureHandleFromJson(textures.value("baseColor", nlohmann::json{}));
+        material.normalTexture = textureHandleFromJson(textures.value("normal", nlohmann::json{}));
+        material.metallicRoughnessTexture = textureHandleFromJson(textures.value("metallicRoughness", nlohmann::json{}));
+        material.emissiveTexture = textureHandleFromJson(textures.value("emissive", nlohmann::json{}));
+        material.occlusionTexture = textureHandleFromJson(textures.value("occlusion", nlohmann::json{}));
+    }
+    return material;
+}
+
+bool applyEditorMaterialOverrideJson(MaterialAsset& material, const nlohmann::json& root) {
+    std::optional<MaterialAsset> edited = materialAssetFromEditorOverrideJson(root);
+    if (!edited.has_value()) {
+        return false;
+    }
+    if (!edited->name.empty()) {
+        material.name = edited->name;
+    }
+    material.baseColorFactor = edited->baseColorFactor;
+    material.emissiveFactor = edited->emissiveFactor;
+    material.metallicFactor = edited->metallicFactor;
+    material.roughnessFactor = edited->roughnessFactor;
+    material.emissiveStrength = edited->emissiveStrength;
+    material.alphaCutoff = edited->alphaCutoff;
+    material.alphaMode = edited->alphaMode;
+    material.doubleSided = edited->doubleSided;
+    material.useConductorOptics = edited->useConductorOptics;
+    material.conductorEta = edited->conductorEta;
+    material.conductorK = edited->conductorK;
+    return true;
+}
+
+bool applyMaterialMetadataOverrideForGuid(
+    const AssetRegistry* registry,
+    const std::filesystem::path& root,
+    const AssetGuid& guid,
+    MaterialAsset& material) {
+    if (registry == nullptr || guid.empty()) {
+        return false;
+    }
+    const auto recordIt = std::find_if(registry->records().begin(), registry->records().end(), [&](const AssetRecord& record) {
+        return record.guid == guid && record.type == AssetType::Material;
+    });
+    if (recordIt == registry->records().end() || recordIt->importedPath.empty()) {
+        return false;
+    }
+
+    std::filesystem::path metadataPath = recordIt->importedPath;
+    if (!metadataPath.is_absolute()) {
+        metadataPath = root / metadataPath;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(metadataPath, ec)) {
+        return false;
+    }
+    try {
+        std::ifstream file(metadataPath);
+        nlohmann::json json;
+        file >> json;
+        const AssetGuid metadataGuid = json.value("guid", guid);
+        if (!metadataGuid.empty() && metadataGuid != guid) {
+            return false;
+        }
+        return applyEditorMaterialOverrideJson(material, json);
+    } catch (const std::exception& error) {
+        std::cerr << "Material metadata override load failed: " << metadataPath.string() << " " << error.what() << '\n';
+        return false;
+    }
+}
+
 bool openDirectoryInShell(const std::filesystem::path& directory) {
     if (directory.empty()) {
         return false;
@@ -887,6 +1111,7 @@ bool appendCachedPrefabRuntimeAssets(
     const std::filesystem::path& root,
     const std::filesystem::path& sourcePath,
     const std::filesystem::path& explicitCachePath,
+    const AssetRegistry* registry,
     AssetManager& destination,
     PrefabRuntimeBindings& bindings,
     std::string* error) {
@@ -935,9 +1160,21 @@ bool appendCachedPrefabRuntimeAssets(
         return textures[static_cast<size_t>(index)];
     };
 
+    const std::string sourceHash = prefabRecord.sourceHash.empty()
+        ? assetSourceHashForPath(sourcePath)
+        : prefabRecord.sourceHash;
+    AssetImportRequest hashRequest;
+    hashRequest.sourcePath = sourcePath;
+    hashRequest.mode = importModeForRecord(prefabRecord, root);
+    hashRequest.settings = prefabRecord.importSettings;
+    const std::string settingsHash = prefabRecord.importSettingsHash.empty()
+        ? assetImportSettingsHashForRequest(hashRequest)
+        : prefabRecord.importSettingsHash;
+
     std::vector<MaterialAssetHandle> materials;
     materials.reserve(cached->materials.size());
-    for (const CachedMaterialData& cachedMat : cached->materials) {
+    for (size_t materialIndex = 0; materialIndex < cached->materials.size(); ++materialIndex) {
+        const CachedMaterialData& cachedMat = cached->materials[materialIndex];
         MaterialAsset material;
         material.name = cachedMat.name;
         material.baseColorFactor = cachedMat.baseColorFactor;
@@ -996,6 +1233,11 @@ bool appendCachedPrefabRuntimeAssets(
         material.emissiveTextureTransform = cachedMat.emissiveTextureTransform;
         material.occlusionTextureTransform = cachedMat.occlusionTextureTransform;
         material.shaderCompatibilityMask = cachedMat.shaderCompatibilityMask;
+        (void)applyMaterialMetadataOverrideForGuid(
+            registry,
+            root,
+            importedAssetGuidFor(sourceHash, settingsHash, "Material", materialIndex),
+            material);
         materials.push_back(destination.addMaterial(std::move(material)));
     }
 
@@ -1022,17 +1264,6 @@ bool appendCachedPrefabRuntimeAssets(
         }
         meshes.push_back(destination.addMesh(std::move(mesh)));
     }
-
-    const std::string sourceHash = prefabRecord.sourceHash.empty()
-        ? assetSourceHashForPath(sourcePath)
-        : prefabRecord.sourceHash;
-    AssetImportRequest hashRequest;
-    hashRequest.sourcePath = sourcePath;
-    hashRequest.mode = importModeForRecord(prefabRecord, root);
-    hashRequest.settings = prefabRecord.importSettings;
-    const std::string settingsHash = prefabRecord.importSettingsHash.empty()
-        ? assetImportSettingsHashForRequest(hashRequest)
-        : prefabRecord.importSettingsHash;
 
     for (size_t i = 0; i < meshes.size(); ++i) {
         bindings.meshes[importedAssetGuidFor(sourceHash, settingsHash, "Mesh", i)] = meshes[i];
@@ -1106,11 +1337,12 @@ bool appendPrefabRuntimeAssets(
     const AssetRecord& prefabRecord,
     const PrefabAsset& prefab,
     const std::filesystem::path& root,
+    const AssetRegistry* registry,
     AssetManager& destination,
     PrefabRuntimeBindings& bindings,
     std::string* error) {
     const std::filesystem::path sourcePath = resolveAssetSourcePath(prefabRecord, root);
-    if (appendCachedPrefabRuntimeAssets(prefabRecord, root, sourcePath, prefab.runtimeCachePath, destination, bindings, error)) {
+    if (appendCachedPrefabRuntimeAssets(prefabRecord, root, sourcePath, prefab.runtimeCachePath, registry, destination, bindings, error)) {
         return true;
     }
     if (!std::filesystem::exists(sourcePath)) {
@@ -1148,7 +1380,21 @@ bool appendPrefabRuntimeAssets(
         bindings.meshes[importedAssetGuidFor(sourceHash, settingsHash, "Mesh", i)] = remap.meshes[i];
     }
     for (size_t i = 0; i < remap.materials.size(); ++i) {
+        if (MaterialAsset* material = destination.material(remap.materials[i])) {
+            (void)applyMaterialMetadataOverrideForGuid(
+                registry,
+                root,
+                importedAssetGuidFor(sourceHash, settingsHash, "Material", i),
+                *material);
+        }
         bindings.materials[importedAssetGuidFor(sourceHash, settingsHash, "Material", i)] = remap.materials[i];
+    }
+    for (MeshAssetHandle meshHandle : remap.meshes) {
+        if (MeshAsset* mesh = destination.mesh(meshHandle)) {
+            for (MeshPrimitiveAsset& primitive : mesh->primitives) {
+                updatePrimitiveAlphaClassification(primitive, destination.material(primitive.material));
+            }
+        }
     }
     (void)importedScene;
     return true;
@@ -2068,6 +2314,8 @@ void Application::mainLoop(uint32_t maxFrames) {
                 scenePath_,
                 project_ ? &*project_ : nullptr,
                 (project_ || !assetRegistry_.state().path.empty()) ? &assetRegistry_ : nullptr,
+                &dirtyMaterialAssets_,
+                &materialAssetAutosavePaths_,
                 sceneUnsavedDirty_ || sceneDocument_.dirty(),
                 projectSettingsDirty_,
                 &gpuInstanceEntities_,
@@ -2086,6 +2334,7 @@ void Application::mainLoop(uint32_t maxFrames) {
             editorRequests = uiOverlay_->buildProjectManager(
                 project_ ? &*project_ : nullptr,
                 (project_ || !assetRegistry_.state().path.empty()) ? &assetRegistry_ : nullptr,
+                scenePath_,
                 sceneUnsavedDirty_ || sceneDocument_.dirty(),
                 projectSettingsDirty_,
                 sceneLoadingStatus_,
@@ -2173,6 +2422,9 @@ void Application::startEditorRenderJob(EditorRenderJobKind kind, const std::file
     editorRenderJobFramePrepared_ = false;
     editorRenderJobOutputFiles_.clear();
     editorRenderJobSceneSnapshot_.reset();
+    editorRenderJobSequenceFramesPerTimelineFrame_ = 1;
+    editorRenderJobSequenceOutputFramesWritten_ = 0;
+    editorRenderJobSequenceAccumulationFrame_ = 0;
     editorRenderJob_.currentFrame = 0;
     editorRenderJob_.totalFrames = 1;
     if (kind == EditorRenderJobKind::Image) {
@@ -2184,11 +2436,16 @@ void Application::startEditorRenderJob(EditorRenderJobKind kind, const std::file
         const EditorTimeline& timeline = uiOverlay_->editor().timeline();
         editorRenderJobSequenceStartFrame_ = timeline.startFrame;
         editorRenderJobSequenceEndFrame_ = timeline.endFrame;
-        editorRenderJob_.totalFrames = std::max(1, editorRenderJobSequenceEndFrame_ - editorRenderJobSequenceStartFrame_ + 1);
+        editorRenderJobSequenceFramesPerTimelineFrame_ = static_cast<uint32_t>(std::clamp(
+            uiOverlay_->editor().editorPrefs().renderSequenceFramesPerTimelineFrame,
+            1,
+            512));
+        const int timelineFrameCount = std::max(1, editorRenderJobSequenceEndFrame_ - editorRenderJobSequenceStartFrame_ + 1);
+        editorRenderJob_.totalFrames = timelineFrameCount * static_cast<int>(editorRenderJobSequenceFramesPerTimelineFrame_);
         editorRenderJobTimelineWasPlaying_ = timeline.playing;
         editorRenderJobPreviousTimelineFrame_ = timeline.currentFrame;
         editorRenderJobSceneSnapshot_ = sceneDocument_;
-        editorRenderJob_.status = "Rendering sequence frame 1 of " + std::to_string(editorRenderJob_.totalFrames);
+        editorRenderJob_.status = "Rendering sequence frame 1 of " + std::to_string(timelineFrameCount);
     }
     editorRenderJobElapsedSeconds_ = 0.0f;
 
@@ -2245,25 +2502,27 @@ void Application::prepareEditorRenderJobFrame() {
 
     EditorTimeline& timeline = uiOverlay_->editor().timeline();
     timeline.playing = false;
-    const int timelineFrame = editorRenderJobSequenceStartFrame_ + static_cast<int>(editorRenderJobFramesRendered_);
+    const int timelineFrame = editorRenderJobSequenceStartFrame_ + static_cast<int>(editorRenderJobSequenceOutputFramesWritten_);
     timeline.currentFrame = std::clamp(timelineFrame, editorRenderJobSequenceStartFrame_, editorRenderJobSequenceEndFrame_);
 
     bool changed = false;
-    for (uint64_t uuid : timeline.animatedEntityUuids()) {
-        Transform sampled;
-        if (!timeline.sampleTransform(uuid, timeline.currentFrame, sampled)) {
-            continue;
-        }
-        for (const Entity* existing : sceneDocument_.registry().entities()) {
-            if (existing == nullptr || existing->uuid != uuid) {
+    if (editorRenderJobSequenceAccumulationFrame_ == 0u) {
+        for (uint64_t uuid : timeline.animatedEntityUuids()) {
+            Transform sampled;
+            if (!timeline.sampleTransform(uuid, timeline.currentFrame, sampled)) {
                 continue;
             }
-            if (Entity* entity = sceneDocument_.registry().entity(existing->id)) {
-                entity->transform = sampled;
-                entity->transform.dirty = true;
-                changed = true;
+            for (const Entity* existing : sceneDocument_.registry().entities()) {
+                if (existing == nullptr || existing->uuid != uuid) {
+                    continue;
+                }
+                if (Entity* entity = sceneDocument_.registry().entity(existing->id)) {
+                    entity->transform = sampled;
+                    entity->transform.dirty = true;
+                    changed = true;
+                }
+                break;
             }
-            break;
         }
     }
     if (changed) {
@@ -2278,10 +2537,15 @@ void Application::prepareEditorRenderJobFrame() {
             return;
         }
     }
-    pathTracer_->resetAccumulation(AccumulationResetReason::Manual);
-    const int sequenceFrameNumber = static_cast<int>(editorRenderJobFramesRendered_) + 1;
+    if (editorRenderJobSequenceAccumulationFrame_ == 0u) {
+        pathTracer_->resetAccumulation(AccumulationResetReason::Manual);
+    }
+    const int sequenceFrameNumber = static_cast<int>(editorRenderJobSequenceOutputFramesWritten_) + 1;
+    const int sequenceFrameCount = std::max(1, editorRenderJobSequenceEndFrame_ - editorRenderJobSequenceStartFrame_ + 1);
+    const uint32_t accumulationFrame = editorRenderJobSequenceAccumulationFrame_ + 1u;
     editorRenderJob_.status = "Rendering timeline frame " + std::to_string(timeline.currentFrame) +
-        " (" + std::to_string(sequenceFrameNumber) + " of " + std::to_string(editorRenderJob_.totalFrames) + ")";
+        " (" + std::to_string(sequenceFrameNumber) + " of " + std::to_string(sequenceFrameCount) +
+        ", frame " + std::to_string(accumulationFrame) + " of " + std::to_string(editorRenderJobSequenceFramesPerTimelineFrame_) + ")";
     editorRenderJobFramePrepared_ = true;
 }
 
@@ -2297,12 +2561,16 @@ void Application::updateEditorRenderJob(float deltaSeconds) {
         }
 
         bool frameExported = true;
+        bool sequenceFrameReadyForExport = false;
         if (editorRenderJob_.kind == EditorRenderJobKind::Sequence) {
-            const uint32_t outputIndex = editorRenderJobFramesRendered_ + 1u;
-            const std::filesystem::path outputPath = editorSequenceFramePath(editorRenderJob_.outputRoot, outputIndex);
-            frameExported = exportEditorRenderJobImage(outputPath);
-            if (frameExported) {
-                editorRenderJobOutputFiles_.push_back(outputPath);
+            sequenceFrameReadyForExport = editorRenderJobSequenceAccumulationFrame_ + 1u >= editorRenderJobSequenceFramesPerTimelineFrame_;
+            if (sequenceFrameReadyForExport) {
+                const uint32_t outputIndex = editorRenderJobSequenceOutputFramesWritten_ + 1u;
+                const std::filesystem::path outputPath = editorSequenceFramePath(editorRenderJob_.outputRoot, outputIndex);
+                frameExported = exportEditorRenderJobImage(outputPath);
+                if (frameExported) {
+                    editorRenderJobOutputFiles_.push_back(outputPath);
+                }
             }
         }
 
@@ -2317,13 +2585,23 @@ void Application::updateEditorRenderJob(float deltaSeconds) {
         }
 
         ++editorRenderJobFramesRendered_;
+        if (editorRenderJob_.kind == EditorRenderJobKind::Sequence) {
+            ++editorRenderJobSequenceAccumulationFrame_;
+            if (sequenceFrameReadyForExport) {
+                ++editorRenderJobSequenceOutputFramesWritten_;
+                editorRenderJobSequenceAccumulationFrame_ = 0u;
+            }
+        }
         editorRenderJob_.currentFrame = static_cast<int>(editorRenderJobFramesRendered_);
         editorRenderJob_.progress = std::clamp(
             static_cast<float>(editorRenderJobFramesRendered_) / static_cast<float>(std::max(1, editorRenderJob_.totalFrames)),
             0.02f,
             1.0f);
 
-        const bool finished = editorRenderJobFramesRendered_ >= static_cast<uint32_t>(std::max(1, editorRenderJob_.totalFrames));
+        const int sequenceFrameCount = std::max(1, editorRenderJobSequenceEndFrame_ - editorRenderJobSequenceStartFrame_ + 1);
+        const bool finished = editorRenderJob_.kind == EditorRenderJobKind::Sequence
+            ? editorRenderJobSequenceOutputFramesWritten_ >= static_cast<uint32_t>(sequenceFrameCount)
+            : editorRenderJobFramesRendered_ >= static_cast<uint32_t>(std::max(1, editorRenderJob_.totalFrames));
         if (!finished) {
             editorRenderJobFramePrepared_ = false;
             writeEditorRenderJobManifest("progress");
@@ -2363,6 +2641,9 @@ void Application::updateEditorRenderJob(float deltaSeconds) {
         editorRenderJobElapsedSeconds_ = 0.0f;
         editorRenderJobFramesRendered_ = 0;
         editorRenderJobFramePrepared_ = false;
+        editorRenderJobSequenceFramesPerTimelineFrame_ = 1;
+        editorRenderJobSequenceOutputFramesWritten_ = 0;
+        editorRenderJobSequenceAccumulationFrame_ = 0;
         editorRenderJobOutputFiles_.clear();
         editorRenderJobSceneSnapshot_.reset();
     }
@@ -2434,6 +2715,16 @@ void Application::writeEditorRenderJobManifest(const char* eventLabel) {
     manifest["current_frame"] = editorRenderJob_.currentFrame;
     manifest["total_frames"] = editorRenderJob_.totalFrames;
     manifest["rendered_frames"] = editorRenderJobFramesRendered_;
+    if (editorRenderJob_.kind == EditorRenderJobKind::Sequence) {
+        manifest["sequence"] = {
+            {"timeline_start_frame", editorRenderJobSequenceStartFrame_},
+            {"timeline_end_frame", editorRenderJobSequenceEndFrame_},
+            {"timeline_frame_count", std::max(1, editorRenderJobSequenceEndFrame_ - editorRenderJobSequenceStartFrame_ + 1)},
+            {"frames_per_timeline_frame", editorRenderJobSequenceFramesPerTimelineFrame_},
+            {"output_frames_written", editorRenderJobSequenceOutputFramesWritten_},
+            {"current_accumulation_frame", editorRenderJobSequenceAccumulationFrame_},
+        };
+    }
     manifest["output_root"] = editorRenderJob_.outputRoot.string();
     manifest["output_files"] = nlohmann::json::array();
     for (const std::filesystem::path& outputFile : editorRenderJobOutputFiles_) {
@@ -2633,6 +2924,14 @@ void Application::writeCrashMarker(bool running) {
     json["project"] = project_->projectFile.generic_string();
     json["sceneAutosave"] = editorSceneAutosavePath(*project_, scenePath_, gltfPath_).generic_string();
     json["projectAutosave"] = editorProjectAutosavePath(*project_).generic_string();
+    json["assetRegistryAutosave"] = editorAssetRegistryAutosavePath(*project_).generic_string();
+    json["materialAssetAutosaves"] = nlohmann::json::array();
+    for (const auto& [guid, path] : materialAssetAutosavePaths_) {
+        json["materialAssetAutosaves"].push_back({
+            {"guid", guid},
+            {"path", path.generic_string()},
+        });
+    }
     std::ofstream out(marker, std::ios::trunc);
     if (out.is_open()) {
         out << json.dump(2);
@@ -2640,7 +2939,7 @@ void Application::writeCrashMarker(bool running) {
 }
 
 bool Application::writeAutosave() {
-    if (!project_.has_value() || (!sceneUnsavedDirty_ && !projectSettingsDirty_)) {
+    if (!project_.has_value() || (!sceneUnsavedDirty_ && !projectSettingsDirty_ && !assetRegistry_.dirty() && dirtyMaterialAssets_.empty())) {
         return false;
     }
     const std::filesystem::path autosaveDir = project_->savedRoot / "Autosaves";
@@ -2677,6 +2976,24 @@ bool Application::writeAutosave() {
             failed = true;
         }
     }
+    if (assetRegistry_.dirty()) {
+        const std::filesystem::path autosavePath = editorAssetRegistryAutosavePath(*project_);
+        if (assetRegistry_.save(autosavePath)) {
+            wroteAny = true;
+            if (uiOverlay_ != nullptr) {
+                uiOverlay_->editor().log().add(EditorLogCategory::Project, "Autosaved asset registry to " + autosavePath.string());
+            }
+        } else {
+            failed = true;
+        }
+    }
+    if (!dirtyMaterialAssets_.empty()) {
+        if (autosaveDirtyMaterialAssets()) {
+            wroteAny = true;
+        } else {
+            failed = true;
+        }
+    }
     if (failed) {
         notifications_.notify("Autosave failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         return false;
@@ -2688,7 +3005,7 @@ bool Application::writeAutosave() {
 }
 
 void Application::updateAutosave(float deltaSeconds) {
-    if (!project_.has_value() || !project_->autosaveEnabled || (!sceneUnsavedDirty_ && !projectSettingsDirty_)) {
+    if (!project_.has_value() || !project_->autosaveEnabled || (!sceneUnsavedDirty_ && !projectSettingsDirty_ && !assetRegistry_.dirty() && dirtyMaterialAssets_.empty())) {
         autosaveElapsedSeconds_ = 0.0f;
         return;
     }
@@ -2895,7 +3212,7 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
                 PrefabAsset prefab;
                 std::string prefabError;
                 (void)loadPrefabAsset(resolveAssetRecordPath(*recordIt, registryRoot), prefab, &prefabError);
-                if (std::string bindError; !appendPrefabRuntimeAssets(*recordIt, prefab, registryRoot, result.assets, prefabBindings, &bindError)) {
+                if (std::string bindError; !appendPrefabRuntimeAssets(*recordIt, prefab, registryRoot, &assetRegistry_, result.assets, prefabBindings, &bindError)) {
                     std::cerr << "Prefab runtime binding failed during scene load: " << bindError << '\n';
                 }
             }
@@ -3078,14 +3395,35 @@ bool Application::applyMergeSceneResult(SceneLoadResult&& result) {
 }
 
 Application::DirtyScenePromptResult Application::promptDirtySceneBefore(std::string_view action) const {
-    if (!sceneUnsavedDirty_) {
+    const bool sceneDirty = sceneUnsavedDirty_ || sceneDocument_.dirty();
+    const bool registryDirty = assetRegistry_.dirty();
+    const bool materialAssetsDirty = !dirtyMaterialAssets_.empty();
+    if (!sceneDirty && !projectSettingsDirty_ && !registryDirty && !materialAssetsDirty) {
         return DirtyScenePromptResult::Discard;
     }
 
     const std::string sceneName = scenePath_.has_value()
         ? scenePath_->filename().string()
         : (gltfPath_.has_value() ? gltfPath_->filename().string() : std::string("Untitled Scene"));
-    const std::string message = "Save changes to " + sceneName + " before " + std::string(action) + "?\n\n"
+    std::vector<std::string> dirtyBuckets;
+    if (sceneDirty) {
+        dirtyBuckets.push_back("Level: " + sceneName);
+    }
+    if (projectSettingsDirty_) {
+        dirtyBuckets.push_back("Project settings");
+    }
+    if (registryDirty) {
+        dirtyBuckets.push_back("Asset registry metadata");
+    }
+    if (materialAssetsDirty) {
+        dirtyBuckets.push_back("Linked material asset metadata: " + std::to_string(dirtyMaterialAssets_.size()));
+    }
+
+    std::string dirtySummary;
+    for (const std::string& bucket : dirtyBuckets) {
+        dirtySummary += "- " + bucket + "\n";
+    }
+    const std::string message = "Save editor changes before " + std::string(action) + "?\n\n" + dirtySummary + "\n"
         "Unsaved changes will be lost if you choose Do Not Save.";
 
 #if defined(_WIN32)
@@ -3135,6 +3473,268 @@ bool Application::saveCurrentSceneForDirtyPrompt() {
     return true;
 }
 
+std::optional<AssetRecord> Application::materialAssetRecordForMaterial(uint32_t materialId) const {
+    if (!importedScene_.has_value() || assetRegistry_.records().empty()) {
+        return std::nullopt;
+    }
+    const auto& sceneMaterials = importedScene_->materials;
+    for (const AssetRecord& record : assetRegistry_.records()) {
+        if (record.type != AssetType::Material || record.sourceHash.empty() || record.importSettingsHash.empty()) {
+            continue;
+        }
+        for (size_t i = 0; i < sceneMaterials.size(); ++i) {
+            const MaterialAssetHandle handle = sceneMaterials[i];
+            if (!handle.valid() || handle.index != materialId) {
+                continue;
+            }
+            if (importedAssetGuidFor(record.sourceHash, record.importSettingsHash, "Material", i) == record.guid) {
+                return record;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<uint32_t> Application::loadedMaterialIndexForRecord(const AssetRecord& record) const {
+    if (!importedScene_.has_value() || record.type != AssetType::Material || record.sourceHash.empty() || record.importSettingsHash.empty()) {
+        return std::nullopt;
+    }
+    const auto& sceneMaterials = importedScene_->materials;
+    for (size_t i = 0; i < sceneMaterials.size(); ++i) {
+        const MaterialAssetHandle handle = sceneMaterials[i];
+        if (handle.valid() && importedAssetGuidFor(record.sourceHash, record.importSettingsHash, "Material", i) == record.guid) {
+            return handle.index;
+        }
+    }
+    return std::nullopt;
+}
+
+bool Application::writeMaterialAssetFile(const AssetRecord& record, const MaterialAsset& material, const std::filesystem::path& path, bool autosave) {
+    if (path.empty()) {
+        return false;
+    }
+    nlohmann::json root = nlohmann::json::object();
+    if (!autosave) {
+        try {
+            std::ifstream existing(path);
+            if (existing.is_open()) {
+                existing >> root;
+            }
+        } catch (...) {
+            root = nlohmann::json::object();
+        }
+    }
+    if (!root.is_object()) {
+        root = nlohmann::json::object();
+    }
+
+    const nlohmann::json materialOverride = materialEditorOverrideJson(material);
+    root["version"] = root.value("version", 1);
+    root["kind"] = autosave ? "MaterialAssetAutosave" : root.value("kind", std::string("EditedMaterialAsset"));
+    root["guid"] = record.guid;
+    root["displayName"] = record.displayName.empty() ? material.name : record.displayName;
+    root["sourcePath"] = record.sourcePath;
+    root["sourceHash"] = record.sourceHash;
+    root["importSettingsHash"] = record.importSettingsHash;
+    root["alphaMode"] = materialAlphaModeName(material.alphaMode);
+    root["doubleSided"] = material.doubleSided != 0u;
+    root["pbr"] = materialOverride;
+    root["editorMaterialOverride"] = materialOverride;
+    root["lastEditedTimestamp"] = editorTimestampString();
+    if (autosave) {
+        root["targetImportedPath"] = record.importedPath;
+        root["autosavePolicy"] = "Restore by reopening the project, reviewing this transparent metadata file, and saving the material asset through Save All after applying the intended values.";
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        return false;
+    }
+    const std::filesystem::path tempPath = path.string() + ".tmp";
+    std::ofstream out(tempPath, std::ios::trunc);
+    if (!out.is_open()) {
+        return false;
+    }
+    out << root.dump(2) << '\n';
+    out.close();
+    if (!out) {
+        return false;
+    }
+    std::filesystem::rename(tempPath, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tempPath, path, ec);
+    }
+    return !ec;
+}
+
+bool Application::saveDirtyMaterialAsset(const AssetGuid& guid, std::string& saved, std::string& failure) {
+    if (guid.empty()) {
+        failure = "Material Asset: no material asset selected";
+        return false;
+    }
+    if (!project_.has_value()) {
+        failure = "Material Assets: no project is open";
+        return false;
+    }
+    const auto dirtyIt = dirtyMaterialAssets_.find(guid);
+    if (dirtyIt == dirtyMaterialAssets_.end()) {
+        failure = "Material Asset: no unsaved edits for " + guid;
+        return false;
+    }
+    auto recordIt = std::find_if(assetRegistry_.records().begin(), assetRegistry_.records().end(), [&](const AssetRecord& record) {
+        return record.guid == guid && record.type == AssetType::Material;
+    });
+    if (recordIt == assetRegistry_.records().end()) {
+        failure = "Material Asset: missing registry record " + guid;
+        return false;
+    }
+
+    const std::filesystem::path materialPath = resolveAssetRecordPath(*recordIt, project_->projectRoot);
+    if (!writeMaterialAssetFile(*recordIt, dirtyIt->second, materialPath, false)) {
+        failure = "Material Asset: " + materialPath.string();
+        return false;
+    }
+
+    AssetRecord updated = *recordIt;
+    updated.importedHash = assetSourceHashForPath(materialPath);
+    updated.lastModifiedTimestamp = editorTimestampString();
+    updated.importedMetadataMissing = false;
+    updated.missing = false;
+    updated.status = AssetImportStatus::Imported;
+    assetRegistry_.addOrReplaceRecord(std::move(updated), AssetRegistryDirtyReason::AssetEdited);
+
+    dirtyMaterialAssets_.erase(guid);
+    materialAssetAutosavePaths_.erase(guid);
+    saved = "Material Asset: " + materialPath.string();
+    return true;
+}
+
+bool Application::saveDirtyMaterialAssets(std::vector<std::string>& saved, std::vector<std::string>& failures) {
+    if (dirtyMaterialAssets_.empty()) {
+        return true;
+    }
+
+    bool allSaved = true;
+    std::vector<AssetGuid> pendingGuids;
+    pendingGuids.reserve(dirtyMaterialAssets_.size());
+    for (const auto& [guid, material] : dirtyMaterialAssets_) {
+        (void)material;
+        pendingGuids.push_back(guid);
+    }
+    for (const AssetGuid& guid : pendingGuids) {
+        std::string savedItem;
+        std::string failureItem;
+        if (saveDirtyMaterialAsset(guid, savedItem, failureItem)) {
+            saved.push_back(std::move(savedItem));
+        } else {
+            failures.push_back(std::move(failureItem));
+            allSaved = false;
+        }
+    }
+    return allSaved;
+}
+
+bool Application::autosaveDirtyMaterialAssets() {
+    if (!project_.has_value() || dirtyMaterialAssets_.empty()) {
+        return false;
+    }
+    bool wroteAny = false;
+    for (const auto& [guid, material] : dirtyMaterialAssets_) {
+        auto recordIt = std::find_if(assetRegistry_.records().begin(), assetRegistry_.records().end(), [&](const AssetRecord& record) {
+            return record.guid == guid && record.type == AssetType::Material;
+        });
+        if (recordIt == assetRegistry_.records().end()) {
+            continue;
+        }
+        const std::filesystem::path autosavePath = editorMaterialAssetAutosavePath(*project_, *recordIt);
+        if (writeMaterialAssetFile(*recordIt, material, autosavePath, true)) {
+            materialAssetAutosavePaths_[guid] = autosavePath;
+            wroteAny = true;
+            if (uiOverlay_ != nullptr) {
+                uiOverlay_->editor().log().add(EditorLogCategory::Project, "Autosaved material asset to " + autosavePath.string());
+            }
+        }
+    }
+    return wroteAny;
+}
+
+bool Application::restoreMaterialAssetAutosaves() {
+    if (!project_.has_value() || pendingRecoveryMaterialAssetAutosaves_.empty()) {
+        return false;
+    }
+
+    bool restoredAny = false;
+    bool runtimeUpdated = false;
+    for (const auto& [pendingGuid, autosavePath] : pendingRecoveryMaterialAssetAutosaves_) {
+        if (autosavePath.empty() || !std::filesystem::exists(autosavePath)) {
+            continue;
+        }
+        try {
+            std::ifstream in(autosavePath);
+            nlohmann::json root;
+            in >> root;
+            const AssetGuid guid = root.value("guid", pendingGuid);
+            if (guid.empty()) {
+                continue;
+            }
+            std::optional<MaterialAsset> restoredMaterial = materialAssetFromEditorOverrideJson(root);
+            if (!restoredMaterial.has_value()) {
+                std::cerr << "Material autosave restore skipped, missing editor override: " << autosavePath.string() << '\n';
+                continue;
+            }
+            auto recordIt = std::find_if(assetRegistry_.records().begin(), assetRegistry_.records().end(), [&](const AssetRecord& record) {
+                return record.guid == guid && record.type == AssetType::Material;
+            });
+            if (recordIt == assetRegistry_.records().end()) {
+                std::cerr << "Material autosave restore skipped, missing registry record: " << guid << '\n';
+                continue;
+            }
+
+            dirtyMaterialAssets_[guid] = *restoredMaterial;
+            materialAssetAutosavePaths_[guid] = autosavePath;
+            assetRegistry_.markDirty(AssetRegistryDirtyReason::AssetAutosaveRestored);
+            restoredAny = true;
+
+            if (std::optional<uint32_t> materialIndex = loadedMaterialIndexForRecord(*recordIt)) {
+                if (MaterialAsset* material = assets_.material(MaterialAssetHandle{*materialIndex})) {
+                    *material = *restoredMaterial;
+                    for (uint32_t meshIndex = 0; meshIndex < assets_.meshes().size(); ++meshIndex) {
+                        MeshAsset* mesh = assets_.mesh(MeshAssetHandle{meshIndex});
+                        if (mesh == nullptr) {
+                            continue;
+                        }
+                        for (MeshPrimitiveAsset& primitive : mesh->primitives) {
+                            if (primitive.material.index == *materialIndex) {
+                                updatePrimitiveAlphaClassification(primitive, material);
+                            }
+                        }
+                    }
+                    runtimeUpdated = true;
+                }
+            }
+            if (uiOverlay_ != nullptr) {
+                uiOverlay_->editor().log().add(EditorLogCategory::Project, "Restored material asset autosave as unsaved metadata: " + autosavePath.string());
+            }
+        } catch (const std::exception& error) {
+            std::cerr << "Material autosave restore failed: " << autosavePath.string() << " " << error.what() << '\n';
+        }
+    }
+
+    if (runtimeUpdated) {
+        bool gpuUpdated = false;
+        if (gpuSceneAsset_.has_value() && pathTracer_ != nullptr) {
+            gpuUpdated = pathTracer_->updateMaterials(*gpuSceneAsset_, assets_);
+        }
+        if (!gpuUpdated && pathTracer_ != nullptr) {
+            pathTracer_->resetAccumulation(AccumulationResetReason::MaterialChanged);
+        }
+    }
+    return restoredAny;
+}
+
 bool Application::saveAllEditorState() {
     std::vector<std::string> failures;
     std::vector<std::string> saved;
@@ -3178,6 +3778,8 @@ bool Application::saveAllEditorState() {
             logFailure("Project: " + project_->projectFile.string());
         }
     }
+
+    (void)saveDirtyMaterialAssets(saved, failures);
 
     if (assetRegistry_.dirty() || !assetRegistry_.state().path.empty()) {
         const std::filesystem::path registryPath = assetRegistry_.state().path;
@@ -3231,7 +3833,7 @@ bool Application::confirmDestructiveSceneAction(std::string_view action) {
     case DirtyScenePromptResult::Discard:
         return true;
     case DirtyScenePromptResult::Save:
-        return saveCurrentSceneForDirtyPrompt();
+        return saveAllEditorState();
     case DirtyScenePromptResult::Cancel:
         notifications_.notify("Scene action cancelled", NotificationType::Warning);
         return false;
@@ -3357,6 +3959,8 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
     if (promptForDirtyScene && !confirmDestructiveSceneAction("opening a project")) {
         return false;
     }
+    dirtyMaterialAssets_.clear();
+    materialAssetAutosavePaths_.clear();
 
     ProjectContext project;
     std::string error;
@@ -3387,6 +3991,8 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
             std::filesystem::path recoveredScene = project.startupScene;
             std::filesystem::path recoveredSceneAutosave;
             std::filesystem::path recoveredProjectAutosave;
+            std::filesystem::path recoveredAssetRegistryAutosave;
+            std::vector<std::pair<AssetGuid, std::filesystem::path>> recoveredMaterialAssetAutosaves;
             try {
                 std::ifstream markerIn(crashMarker);
                 nlohmann::json markerJson;
@@ -3397,11 +4003,27 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
                 }
                 const std::string sceneAutosave = markerJson.value("sceneAutosave", std::string{});
                 const std::string projectAutosave = markerJson.value("projectAutosave", std::string{});
+                const std::string assetRegistryAutosave = markerJson.value("assetRegistryAutosave", std::string{});
                 if (!sceneAutosave.empty()) {
                     recoveredSceneAutosave = sceneAutosave;
                 }
                 if (!projectAutosave.empty()) {
                     recoveredProjectAutosave = projectAutosave;
+                }
+                if (!assetRegistryAutosave.empty()) {
+                    recoveredAssetRegistryAutosave = assetRegistryAutosave;
+                }
+                if (markerJson.contains("materialAssetAutosaves") && markerJson["materialAssetAutosaves"].is_array()) {
+                    for (const nlohmann::json& item : markerJson["materialAssetAutosaves"]) {
+                        if (!item.is_object()) {
+                            continue;
+                        }
+                        const AssetGuid guid = item.value("guid", std::string{});
+                        const std::string path = item.value("path", std::string{});
+                        if (!path.empty()) {
+                            recoveredMaterialAssetAutosaves.emplace_back(guid, std::filesystem::path(path));
+                        }
+                    }
                 }
             } catch (...) {
             }
@@ -3411,7 +4033,16 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
             pendingRecoveryProjectAutosavePath_ = recoveredProjectAutosave.empty()
                 ? editorProjectAutosavePath(project)
                 : recoveredProjectAutosave;
-            uiOverlay_->editor().showRecoveryPrompt(crashMarker, *pendingRecoveryAutosavePath_, *pendingRecoveryProjectAutosavePath_);
+            pendingRecoveryAssetRegistryAutosavePath_ = recoveredAssetRegistryAutosave.empty()
+                ? editorAssetRegistryAutosavePath(project)
+                : recoveredAssetRegistryAutosave;
+            pendingRecoveryMaterialAssetAutosaves_ = std::move(recoveredMaterialAssetAutosaves);
+            uiOverlay_->editor().showRecoveryPrompt(
+                crashMarker,
+                *pendingRecoveryAutosavePath_,
+                *pendingRecoveryProjectAutosavePath_,
+                *pendingRecoveryAssetRegistryAutosavePath_,
+                pendingRecoveryMaterialAssetAutosaves_);
             uiOverlay_->editor().log().add(EditorLogCategory::Warning, "Previous editor session marker found: " + crashMarker.string());
             notifications_.notify("Previous editor session marker found", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
         }
@@ -3424,6 +4055,8 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
         projectSettingsDirty_ = false;
         pendingRecoveryAutosavePath_.reset();
         pendingRecoveryProjectAutosavePath_.reset();
+        pendingRecoveryMaterialAssetAutosaves_.clear();
+        pendingRecoveryAssetRegistryAutosavePath_.reset();
         return false;
     }
 
@@ -3512,6 +4145,10 @@ bool Application::closeCurrentProject() {
     projectSettingsDirty_ = false;
     pendingRecoveryAutosavePath_.reset();
     pendingRecoveryProjectAutosavePath_.reset();
+    pendingRecoveryMaterialAssetAutosaves_.clear();
+    pendingRecoveryAssetRegistryAutosavePath_.reset();
+    dirtyMaterialAssets_.clear();
+    materialAssetAutosavePaths_.clear();
     assetRegistry_.clear();
     initializeFallbackSceneDocument();
     scenePath_.reset();
@@ -3617,7 +4254,7 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
 
     AssetManager nextAssets = assets_;
     PrefabRuntimeBindings bindings;
-    if (std::string bindError; !appendPrefabRuntimeAssets(*prefabRecord, prefab, root, nextAssets, bindings, &bindError)) {
+    if (std::string bindError; !appendPrefabRuntimeAssets(*prefabRecord, prefab, root, &assetRegistry_, nextAssets, bindings, &bindError)) {
         notifications_.notify("Prefab runtime binding failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         std::cerr << "Prefab runtime binding failed: " << bindError << '\n';
         return false;
@@ -4146,7 +4783,7 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
             PrefabAsset prefab;
             std::string prefabError;
             (void)loadPrefabAsset(resolveAssetRecordPath(*refreshedRecord, job.workspace.root), prefab, &prefabError);
-            if (std::string bindError; appendPrefabRuntimeAssets(*refreshedRecord, prefab, job.workspace.root, nextAssets, bindings, &bindError)) {
+            if (std::string bindError; appendPrefabRuntimeAssets(*refreshedRecord, prefab, job.workspace.root, &assetRegistry_, nextAssets, bindings, &bindError)) {
                 const SceneDocument beforeDocument = sceneDocument_;
                 const AssetManager beforeAssets = assets_;
                 assets_ = std::move(nextAssets);
@@ -4416,6 +5053,21 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             uiOverlay_->editor().log().add(EditorLogCategory::Command, "Open folder: " + directoryPath.string());
         }
     }
+    if (requests.openLogFolder) {
+        std::filesystem::path logFolder = project_.has_value()
+            ? project_->savedRoot / "Logs"
+            : std::filesystem::current_path() / "out" / "editor_tools";
+        std::error_code ec;
+        std::filesystem::create_directories(logFolder, ec);
+        if (!ec && openDirectoryInShell(logFolder)) {
+            notifications_.notify("Opening log folder", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 4.0f);
+        } else {
+            notifications_.notify("Log folder could not be opened", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+        }
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->editor().log().add(EditorLogCategory::Command, "Open log folder: " + logFolder.string());
+        }
+    }
     if (requests.openProjectDirectory) {
         if (project_.has_value() && openDirectoryInShell(project_->projectRoot)) {
             notifications_.notify("Opening project directory", NotificationType::Info, NotificationAction::OpenProjectManager, "Project Manager", 4.0f);
@@ -4428,6 +5080,45 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     }
     if (requests.saveAll) {
         (void)saveAllEditorState();
+    } else if (requests.saveMaterialAsset.has_value()) {
+        std::string savedItem;
+        std::string failureItem;
+        std::vector<std::string> savedItems;
+        std::vector<std::string> failures;
+        if (saveDirtyMaterialAsset(*requests.saveMaterialAsset, savedItem, failureItem)) {
+            savedItems.push_back(std::move(savedItem));
+            const std::filesystem::path registryPath = assetRegistry_.state().path;
+            if (assetRegistry_.dirty()) {
+                if (assetRegistry_.save()) {
+                    assetRegistry_.clearDirty();
+                    savedItems.push_back("Asset Registry: " + registryPath.string());
+                } else {
+                    failures.push_back(registryPath.empty()
+                        ? std::string("Asset Registry: no registry path")
+                        : std::string("Asset Registry: ") + registryPath.string());
+                }
+            }
+        } else {
+            failures.push_back(std::move(failureItem));
+        }
+
+        if (uiOverlay_ != nullptr) {
+            EditorLog& log = uiOverlay_->editor().log();
+            for (const std::string& item : savedItems) {
+                log.add(EditorLogCategory::Project, "Save Material saved " + item);
+            }
+            for (const std::string& item : failures) {
+                log.add(EditorLogCategory::Warning, "Save Material failed " + item);
+            }
+        }
+        if (!failures.empty()) {
+            notifications_.notify("Save Material failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+            for (const std::string& item : failures) {
+                std::cerr << "Save Material failed: " << item << '\n';
+            }
+        } else {
+            notifications_.notify("Save Material complete", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+        }
     }
 
     if (requests.createProject.has_value()) {
@@ -4455,6 +5146,26 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 std::cerr << "Project autosave restore failed: " << pendingRecoveryProjectAutosavePath_->string() << " " << error.what() << '\n';
             }
         }
+        if (pendingRecoveryAssetRegistryAutosavePath_.has_value() && std::filesystem::exists(*pendingRecoveryAssetRegistryAutosavePath_) && project_.has_value()) {
+            AssetRegistry restoredRegistry;
+            std::string error;
+            if (restoredRegistry.load(*pendingRecoveryAssetRegistryAutosavePath_, &error)) {
+                assetRegistry_ = std::move(restoredRegistry);
+                assetRegistry_.setPath(project_->assetRegistryPath);
+                (void)assetRegistry_.refreshRecordHealth(project_->projectRoot, false);
+                assetRegistry_.markDirty(AssetRegistryDirtyReason::AssetAutosaveRestored);
+                restored = true;
+                if (uiOverlay_ != nullptr) {
+                    uiOverlay_->editor().log().add(EditorLogCategory::Project, "Restored asset registry autosave: " + pendingRecoveryAssetRegistryAutosavePath_->string());
+                }
+            } else {
+                notifications_.notify("Asset registry autosave restore failed", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+                std::cerr << "Asset registry autosave restore failed: " << pendingRecoveryAssetRegistryAutosavePath_->string() << " " << error << '\n';
+            }
+        }
+        if (restoreMaterialAssetAutosaves()) {
+            restored = true;
+        }
         if (pendingRecoveryAutosavePath_.has_value() && std::filesystem::exists(*pendingRecoveryAutosavePath_)) {
             SceneLoadRequest request;
             request.mode = SceneLoadMode::OpenRtLevel;
@@ -4478,6 +5189,8 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         }
         pendingRecoveryAutosavePath_.reset();
         pendingRecoveryProjectAutosavePath_.reset();
+        pendingRecoveryMaterialAssetAutosaves_.clear();
+        pendingRecoveryAssetRegistryAutosavePath_.reset();
         notifications_.notify("Recovery marker discarded", NotificationType::Info);
     }
     if (requests.projectSettingsUpdate.has_value() && project_.has_value()) {
@@ -4602,6 +5315,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         if (material != nullptr) {
             const SceneDocument beforeDocument = sceneDocument_;
             const AssetManager beforeAssets = assets_;
+            const std::optional<AssetRecord> materialRecord = materialAssetRecordForMaterial(requests.materialUpdate->materialId);
             *material = requests.materialUpdate->material;
             for (uint32_t meshIndex = 0; meshIndex < assets_.meshes().size(); ++meshIndex) {
                 MeshAsset* mesh = assets_.mesh(MeshAssetHandle{meshIndex});
@@ -4621,17 +5335,27 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             if (!gpuUpdated) {
                 pathTracer_->resetAccumulation(AccumulationResetReason::MaterialChanged);
             }
-            sceneDocument_.markDirty(SceneUpdateKind::MaterialOnly);
-            sceneUnsavedDirty_ = true;
-            undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
-                sceneDocument_,
-                assets_,
-                beforeDocument,
-                beforeAssets,
-                sceneDocument_,
-                assets_,
-                SceneUpdateKind::MaterialOnly,
-                "Edit Material"));
+            if (materialRecord.has_value()) {
+                dirtyMaterialAssets_[materialRecord->guid] = *material;
+                if (project_.has_value()) {
+                    materialAssetAutosavePaths_.try_emplace(materialRecord->guid, editorMaterialAssetAutosavePath(*project_, *materialRecord));
+                }
+                assetRegistry_.markDirty(AssetRegistryDirtyReason::AssetEdited);
+            } else {
+                sceneDocument_.markDirty(SceneUpdateKind::MaterialOnly);
+                sceneUnsavedDirty_ = true;
+            }
+            if (!materialRecord.has_value()) {
+                undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+                    sceneDocument_,
+                    assets_,
+                    beforeDocument,
+                    beforeAssets,
+                    sceneDocument_,
+                    assets_,
+                    SceneUpdateKind::MaterialOnly,
+                    "Edit Material"));
+            }
         }
     }
 

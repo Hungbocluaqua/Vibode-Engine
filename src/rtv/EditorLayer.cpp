@@ -1,5 +1,7 @@
 #include "rtv/EditorLayer.h"
 
+#include "rtv/AssetImport.h"
+#include "rtv/AssetManager.h"
 #include "rtv/EditorCommands.h"
 #include "rtv/EditorUiStyle.h"
 #include "rtv/Entity.h"
@@ -12,13 +14,16 @@
 #include <stb_image.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstddef>
 #include <cfloat>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -162,6 +167,108 @@ bool isViewportPanelCommand(EditorCommandId id) {
     }
 }
 
+uint32_t materialIdForCommandSelection(const EditorRuntimeState& state, const EditorSelection& selection) {
+    const EditorSelectionId selected = selection.current();
+    if (selected.kind == EditorSelectionKind::Material) {
+        return selected.index;
+    }
+    if (state.sceneDocument != nullptr && selected.entity.valid()) {
+        const Entity* entity = state.sceneDocument->registry().entity(selected.entity);
+        if (entity == nullptr || !entity->meshRenderer.has_value()) {
+            return UINT32_MAX;
+        }
+        const MeshRenderer& renderer = *entity->meshRenderer;
+        if (!renderer.materialSlots.empty()) {
+            const MaterialAssetHandle material = renderer.materialSlots.front().resolvedMaterial();
+            return material.valid() ? material.index : UINT32_MAX;
+        }
+        if (state.assets != nullptr) {
+            const MeshAsset* mesh = state.assets->mesh(renderer.mesh);
+            if (mesh != nullptr && !mesh->primitives.empty()) {
+                return mesh->primitives.front().material.index;
+            }
+        }
+        return UINT32_MAX;
+    }
+    if (selected.kind != EditorSelectionKind::Object || state.importedScene == nullptr || state.assets == nullptr) {
+        return UINT32_MAX;
+    }
+    if (selected.index >= state.importedScene->nodes.size()) {
+        return UINT32_MAX;
+    }
+    const SceneNodeAsset& node = state.importedScene->nodes[selected.index];
+    const MeshAsset* mesh = state.assets->mesh(node.mesh);
+    if (mesh == nullptr || mesh->primitives.empty()) {
+        return UINT32_MAX;
+    }
+    return mesh->primitives.front().material.index;
+}
+
+const AssetRecord* materialAssetRecordForLoadedMaterialCommand(const EditorRuntimeState& state, uint32_t materialId) {
+    if (state.assetRegistry == nullptr || state.importedScene == nullptr) {
+        return nullptr;
+    }
+    const auto& sceneMaterials = state.importedScene->materials;
+    for (const AssetRecord& record : state.assetRegistry->records()) {
+        if (record.type != AssetType::Material || record.sourceHash.empty() || record.importSettingsHash.empty()) {
+            continue;
+        }
+        for (size_t i = 0; i < sceneMaterials.size(); ++i) {
+            const MaterialAssetHandle handle = sceneMaterials[i];
+            if (!handle.valid() || handle.index != materialId) {
+                continue;
+            }
+            if (importedAssetGuidFor(record.sourceHash, record.importSettingsHash, "Material", i) == record.guid) {
+                return &record;
+            }
+        }
+    }
+    return nullptr;
+}
+
+std::optional<AssetGuid> selectedDirtyMaterialAssetGuid(const EditorRuntimeState& state, const EditorSelection& selection) {
+    if (state.dirtyMaterialAssets == nullptr || state.dirtyMaterialAssets->empty()) {
+        return std::nullopt;
+    }
+    const uint32_t materialId = materialIdForCommandSelection(state, selection);
+    if (materialId == UINT32_MAX) {
+        return std::nullopt;
+    }
+    const AssetRecord* record = materialAssetRecordForLoadedMaterialCommand(state, materialId);
+    if (record == nullptr) {
+        return std::nullopt;
+    }
+    return state.dirtyMaterialAssets->find(record->guid) != state.dirtyMaterialAssets->end()
+        ? std::optional<AssetGuid>{record->guid}
+        : std::nullopt;
+}
+
+std::string commandUnavailableReason(EditorCommandId id, const EditorRuntimeState& state, const EditorSelection& selection) {
+    switch (id) {
+    case EditorCommandId::ProjectSettings:
+        return state.project == nullptr ? "No project is currently open." : std::string{};
+    case EditorCommandId::CloseProject:
+        return state.project == nullptr ? "No project is currently open." : std::string{};
+    case EditorCommandId::OpenProjectDirectory:
+        return state.project == nullptr ? "No project is currently open." : std::string{};
+    case EditorCommandId::SaveMaterial:
+        if (state.project == nullptr) {
+            return "No project is currently open.";
+        }
+        return selectedDirtyMaterialAssetGuid(state, selection).has_value()
+            ? std::string{}
+            : std::string("No dirty linked material asset is selected.");
+    case EditorCommandId::Undo:
+        return state.undoStack == nullptr || !state.undoStack->canUndo() ? "Nothing to undo." : std::string{};
+    case EditorCommandId::Redo:
+        return state.undoStack == nullptr || !state.undoStack->canRedo() ? "Nothing to redo." : std::string{};
+    case EditorCommandId::ViewportFrameSelected:
+        return !selection.entityId().valid() ? "No entity is selected." : std::string{};
+    default:
+        return {};
+    }
+}
+
 std::filesystem::path canonicalForCompare(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
@@ -169,6 +276,142 @@ std::filesystem::path canonicalForCompare(const std::filesystem::path& path) {
         return canonical;
     }
     return std::filesystem::absolute(path, ec);
+}
+
+std::string trimWhitespace(std::string value) {
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), value.end());
+    return value;
+}
+
+std::string normalizeConsoleCommandToken(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return ch == ' ' || ch == '.' || ch == '-' ? '_' : static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+std::string quoteCommandPath(const std::filesystem::path& path) {
+    std::string value = path.string();
+    std::string escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('"');
+    for (char c : value) {
+        if (c == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+std::string readCommandOutput(const std::string& command) {
+    std::string output;
+#ifdef _WIN32
+    FILE* pipe = _popen(command.c_str(), "r");
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+#endif
+    if (pipe == nullptr) {
+        return output;
+    }
+    std::array<char, 256> buffer{};
+    while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        output += buffer.data();
+    }
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    return output;
+}
+
+bool pathIsWithin(const std::filesystem::path& path, const std::filesystem::path& root) {
+    if (path.empty() || root.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(canonicalForCompare(path), canonicalForCompare(root), ec);
+    if (ec) {
+        return false;
+    }
+    for (const auto& part : relative) {
+        if (part == "..") {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<std::filesystem::path> findGitRoot(std::filesystem::path start) {
+    if (start.empty()) {
+        return std::nullopt;
+    }
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(start, ec)) {
+        start = start.parent_path();
+    }
+    start = canonicalForCompare(start);
+    while (!start.empty()) {
+        if (std::filesystem::exists(start / ".git", ec)) {
+            return start;
+        }
+        const std::filesystem::path parent = start.parent_path();
+        if (parent == start || parent.empty()) {
+            break;
+        }
+        start = parent;
+    }
+    return std::nullopt;
+}
+
+std::string gitStatusLabelForPath(const std::filesystem::path& workspaceRoot, const std::filesystem::path& path) {
+    if (path.empty()) {
+        return "Unavailable";
+    }
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        return "Not in Git";
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        return "External";
+    }
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(canonicalForCompare(path), *gitRoot, ec);
+    if (ec) {
+        return "Unavailable";
+    }
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string output = readCommandOutput("git -C " + quoteCommandPath(*gitRoot) + " status --porcelain -- " + quoteCommandPath(relative) + stderrRedirect);
+    if (trimWhitespace(output).empty()) {
+        return "Clean";
+    }
+    const std::string code = output.size() >= 2 ? output.substr(0, 2) : trimWhitespace(output);
+    if (code == "??") return "Untracked";
+    if (code.find('A') != std::string::npos) return "Added";
+    if (code.find('M') != std::string::npos) return "Modified";
+    if (code.find('D') != std::string::npos) return "Deleted";
+    if (code.find('R') != std::string::npos) return "Renamed";
+    if (code.find('C') != std::string::npos) return "Copied";
+    if (code.find('U') != std::string::npos) return "Conflict";
+    return "Changed";
+}
+
+ImVec4 sourceControlStatusColor(const std::string& status) {
+    if (status == "Clean") return ImVec4(0.54f, 0.82f, 0.60f, 1.0f);
+    if (status == "Modified" || status == "Added" || status == "Renamed" || status == "Copied") return ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
+    if (status == "Deleted" || status == "Conflict") return ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
+    if (status == "Untracked") return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
+    return ImVec4(0.65f, 0.70f, 0.78f, 1.0f);
 }
 
 void drawProjectSaveStateRow(const char* label, bool dirty) {
@@ -180,7 +423,29 @@ void drawProjectSaveStateRow(const char* label, bool dirty) {
         dirty ? "Dirty" : "Saved");
 }
 
-void drawProjectSaveState(const ProjectManagerRuntimeState& state) {
+void drawProjectSourceControlRow(
+    const char* label,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    std::unordered_map<std::string, std::string>& cache) {
+    ImGui::TextDisabled("%s", label);
+    ImGui::SameLine(150.0f);
+    if (path.empty()) {
+        ImGui::TextDisabled("Unavailable");
+        return;
+    }
+    const std::string key = canonicalForCompare(path).string();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        it = cache.emplace(key, gitStatusLabelForPath(workspaceRoot, path)).first;
+    }
+    ImGui::TextColored(sourceControlStatusColor(it->second), "%s", it->second.c_str());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("%s", path.string().c_str());
+    }
+}
+
+void drawProjectSaveState(const ProjectManagerRuntimeState& state, std::unordered_map<std::string, std::string>& sourceControlCache) {
     const bool registryAvailable = state.assetRegistry != nullptr && !state.assetRegistry->state().path.empty();
     const bool registryDirty = state.assetRegistry != nullptr && state.assetRegistry->dirty();
     ImGui::SeparatorText("Save State");
@@ -191,6 +456,20 @@ void drawProjectSaveState(const ProjectManagerRuntimeState& state) {
         ImGui::TextWrapped("Registry: %s", state.assetRegistry->state().path.string().c_str());
     } else {
         ImGui::TextDisabled("Registry: not loaded");
+    }
+    if (state.project != nullptr) {
+        const std::filesystem::path workspaceRoot = state.project->projectRoot;
+        const std::filesystem::path levelPath = state.scenePath != nullptr && state.scenePath->has_value()
+            ? **state.scenePath
+            : state.project->startupScene;
+        ImGui::SeparatorText("Source Control");
+        if (ImGui::SmallButton("Refresh Project Source Control")) {
+            sourceControlCache.clear();
+        }
+        drawProjectSourceControlRow("Current Level", workspaceRoot, levelPath, sourceControlCache);
+        drawProjectSourceControlRow("Project File", workspaceRoot, state.project->projectFile, sourceControlCache);
+        drawProjectSourceControlRow("Asset Registry", workspaceRoot, registryAvailable ? state.assetRegistry->state().path : std::filesystem::path{}, sourceControlCache);
+        ImGui::TextDisabled("Read-only Git status for project-owned level, settings, and registry files.");
     }
 }
 
@@ -480,6 +759,7 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
         drawProjectManager(ProjectManagerRuntimeState{
             .project = state.project,
             .assetRegistry = state.assetRegistry,
+            .scenePath = state.scenePath,
             .sceneLoadingStatus = state.sceneLoadingStatus,
             .sceneLoadRunning = state.sceneLoadRunning,
             .sceneLoadProgress = state.sceneLoadProgress,
@@ -639,11 +919,18 @@ void EditorLayer::handleNotificationAction(NotificationAction action, EditorRequ
     }
 }
 
-void EditorLayer::showRecoveryPrompt(std::filesystem::path markerPath, std::filesystem::path autosavePath, std::filesystem::path projectAutosavePath) {
+void EditorLayer::showRecoveryPrompt(
+    std::filesystem::path markerPath,
+    std::filesystem::path autosavePath,
+    std::filesystem::path projectAutosavePath,
+    std::filesystem::path assetRegistryAutosavePath,
+    std::vector<std::pair<std::string, std::filesystem::path>> materialAssetAutosavePaths) {
     recoveryPromptVisible_ = true;
     recoveryMarkerPath_ = std::move(markerPath);
     recoveryAutosavePath_ = std::move(autosavePath);
     recoveryProjectAutosavePath_ = std::move(projectAutosavePath);
+    recoveryAssetRegistryAutosavePath_ = std::move(assetRegistryAutosavePath);
+    recoveryMaterialAssetAutosavePaths_ = std::move(materialAssetAutosavePaths);
 }
 
 void EditorLayer::drawRecoveryPrompt(EditorRequests& requests) {
@@ -656,9 +943,28 @@ void EditorLayer::drawRecoveryPrompt(EditorRequests& requests) {
         if (!recoveryProjectAutosavePath_.empty()) {
             ImGui::TextWrapped("Project autosave: %s", recoveryProjectAutosavePath_.string().c_str());
         }
+        if (!recoveryAssetRegistryAutosavePath_.empty()) {
+            ImGui::TextWrapped("Asset registry autosave: %s", recoveryAssetRegistryAutosavePath_.string().c_str());
+        }
+        if (!recoveryMaterialAssetAutosavePaths_.empty()) {
+            ImGui::TextWrapped("Material asset autosaves: %zu", recoveryMaterialAssetAutosavePaths_.size());
+            const size_t previewCount = std::min<size_t>(recoveryMaterialAssetAutosavePaths_.size(), 3u);
+            for (size_t i = 0; i < previewCount; ++i) {
+                const auto& [guid, path] = recoveryMaterialAssetAutosavePaths_[i];
+                ImGui::TextWrapped("  %s: %s", guid.empty() ? "material" : guid.c_str(), path.string().c_str());
+            }
+            if (recoveryMaterialAssetAutosavePaths_.size() > previewCount) {
+                ImGui::TextDisabled("Additional material autosaves: %zu", recoveryMaterialAssetAutosavePaths_.size() - previewCount);
+            }
+        }
         const bool canRestoreLevel = std::filesystem::exists(recoveryAutosavePath_);
         const bool canRestoreProject = !recoveryProjectAutosavePath_.empty() && std::filesystem::exists(recoveryProjectAutosavePath_);
-        const bool canRestore = canRestoreLevel || canRestoreProject;
+        const bool canRestoreAssetRegistry = !recoveryAssetRegistryAutosavePath_.empty() && std::filesystem::exists(recoveryAssetRegistryAutosavePath_);
+        const bool canRestoreMaterial = std::any_of(
+            recoveryMaterialAssetAutosavePaths_.begin(),
+            recoveryMaterialAssetAutosavePaths_.end(),
+            [](const auto& item) { return !item.second.empty() && std::filesystem::exists(item.second); });
+        const bool canRestore = canRestoreLevel || canRestoreProject || canRestoreAssetRegistry || canRestoreMaterial;
         if (!canRestore) {
             ImGui::BeginDisabled();
         }
@@ -835,7 +1141,7 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         ImGui::TextDisabled("Renderer startup is deferred until a project or scene is selected.");
     }
     if (state.project != nullptr || state.sceneDirty || state.assetRegistry != nullptr) {
-        drawProjectSaveState(state);
+        drawProjectSaveState(state, projectSourceControlStatusCache_);
     }
 
     int startupMode = editorPrefs_.openLastProject ? 1 : 0;
@@ -1465,6 +1771,14 @@ void EditorLayer::drawTimelinePanel(EditorRuntimeState& state, EditorRequests& r
     ImGui::SetNextItemWidth(EditorUiMetric::timelineFrameRateWidth);
     sequenceChanged |= ImGui::DragInt("FPS", &timeline_.frameRate, 1.0f, 1, 240);
     timeline_.frameRate = std::clamp(timeline_.frameRate, 1, 240);
+    ImGui::SameLine();
+    int sequenceFrames = std::clamp(editorPrefs_.renderSequenceFramesPerTimelineFrame, 1, 512);
+    ImGui::SetNextItemWidth(EditorUiMetric::timelineFrameRateWidth);
+    if (ImGui::DragInt("Seq Frames", &sequenceFrames, 1.0f, 1, 512)) {
+        editorPrefs_.renderSequenceFramesPerTimelineFrame = std::clamp(sequenceFrames, 1, 512);
+        editorPrefs_.save(EditorPreferences::defaultPath());
+    }
+    timelineIconTooltip("Rendered frames per timeline frame");
     const int range = std::max(1, timeline_.endFrame - timeline_.startFrame);
     const float durationSeconds = static_cast<float>(range) / static_cast<float>(std::max(1, timeline_.frameRate));
     ImGui::SameLine();
@@ -1923,6 +2237,8 @@ void EditorLayer::drawConsolePanel(EditorRuntimeState& state, EditorRequests& re
         }
         if (executeConsoleCommand(value, state, requests)) {
             log_.add(EditorLogCategory::Command, "Executed console command: " + value);
+        } else if (!lastConsoleCommandFailureReason_.empty()) {
+            log_.add(EditorLogCategory::Warning, "Console command unavailable: " + value + " (" + lastConsoleCommandFailureReason_ + ")");
         } else {
             log_.add(EditorLogCategory::Warning, "Unknown console command: " + value);
         }
@@ -1931,6 +2247,13 @@ void EditorLayer::drawConsolePanel(EditorRuntimeState& state, EditorRequests& re
     ImGui::SeparatorText("Commands");
     for (const EditorCommand& registered : defaultEditorCommandRegistry().commands()) {
         ImGui::Text("%s.%s", registered.category.c_str(), registered.name.c_str());
+    }
+    ImGui::SeparatorText("Unavailable");
+    for (const EditorCommandPlaceholder& placeholder : defaultEditorCommandPlaceholders()) {
+        ImGui::TextDisabled("%s.%s", placeholder.category.c_str(), placeholder.name.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("%s\nDisabled: %s", placeholder.description.c_str(), placeholder.disabledReason.c_str());
+        }
     }
     ImGui::SeparatorText("History");
     for (auto it = consoleHistory_.rbegin(); it != consoleHistory_.rend(); ++it) {
@@ -2496,6 +2819,8 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
             const std::string commandKey = editorCommandPreferenceKey(command);
             const auto overrideIt = editorPrefs_.commandShortcutOverrides.find(commandKey);
             const std::string shortcut = editorCommandShortcutDisplay(command.id, &editorPrefs_);
+            const std::string unavailableReason = commandUnavailableReason(command.id, state, selection_);
+            const bool commandAvailable = unavailableReason.empty();
             if (commandPaletteShortcutEditor_) {
                 ImGui::TextUnformatted((command.category + " / " + command.name).c_str());
                 ImGui::SameLine(std::max(320.0f, ImGui::GetWindowContentRegionMax().x - 250.0f));
@@ -2518,13 +2843,31 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
                     editorPrefs_.save(EditorPreferences::defaultPath());
                 }
             } else {
-                const bool activated = ImGui::Selectable((command.category + " / " + command.name).c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
-                ImGui::SameLine(std::max(360.0f, ImGui::GetWindowContentRegionMax().x - 130.0f));
-                ImGui::TextDisabled("%s", shortcut.empty() ? "" : shortcut.c_str());
-                if (!command.description.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                    ImGui::SetTooltip("%s", command.description.c_str());
+                if (!commandAvailable) {
+                    ImGui::BeginDisabled();
                 }
-                if (activated) {
+                const bool activated = ImGui::Selectable((command.category + " / " + command.name).c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
+                const bool rowHovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_DelayShort);
+                if (!commandAvailable) {
+                    ImGui::EndDisabled();
+                }
+                ImGui::SameLine(std::max(360.0f, ImGui::GetWindowContentRegionMax().x - 130.0f));
+                if (commandAvailable) {
+                    ImGui::TextDisabled("%s", shortcut.empty() ? "" : shortcut.c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.78f, 0.60f, 0.45f, 1.0f), "%s", unavailableReason.c_str());
+                }
+                if (rowHovered) {
+                    if (!commandAvailable) {
+                        ImGui::SetTooltip(
+                            "%s\nDisabled: %s",
+                            command.description.empty() ? "Not available" : command.description.c_str(),
+                            unavailableReason.c_str());
+                    } else if (!command.description.empty()) {
+                        ImGui::SetTooltip("%s", command.description.c_str());
+                    }
+                }
+                if (activated && commandAvailable) {
                     if (executeCommandPaletteCommand(command.id, state, requests)) {
                         log_.add(EditorLogCategory::Command, "Command Palette: " + command.name);
                         commandPaletteOpen_ = false;
@@ -2534,12 +2877,35 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
                         log_.add(EditorLogCategory::Warning, "Command unavailable: " + command.name);
                     }
                 } else {
-                    if (!shortcut.empty() && overrideIt != editorPrefs_.commandShortcutOverrides.end() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                    if (commandAvailable && !shortcut.empty() && overrideIt != editorPrefs_.commandShortcutOverrides.end() && rowHovered) {
                         ImGui::SetTooltip("Custom shortcut display. Runtime rebinding uses the default command contexts until the next input-system pass.");
                     }
                 }
             }
             ImGui::PopID();
+        }
+        if (!commandPaletteShortcutEditor_) {
+            for (const EditorCommandPlaceholder& placeholder : defaultEditorCommandPlaceholders()) {
+                std::string haystack = placeholder.category + " " + placeholder.name + " " + placeholder.description + " " + placeholder.disabledReason;
+                std::transform(haystack.begin(), haystack.end(), haystack.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                if (!filter.empty() && haystack.find(filter) == std::string::npos) {
+                    continue;
+                }
+                ImGui::PushID(placeholder.name.c_str());
+                ImGui::BeginDisabled();
+                ImGui::Selectable((placeholder.category + " / " + placeholder.name).c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
+                const bool rowHovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_DelayShort);
+                ImGui::EndDisabled();
+                ImGui::SameLine(std::max(360.0f, ImGui::GetWindowContentRegionMax().x - 130.0f));
+                ImGui::TextColored(ImVec4(0.78f, 0.60f, 0.45f, 1.0f), "%s", placeholder.disabledReason.c_str());
+                if (rowHovered) {
+                    ImGui::SetTooltip(
+                        "%s\nDisabled: %s",
+                        placeholder.description.empty() ? "Not available" : placeholder.description.c_str(),
+                        placeholder.disabledReason.c_str());
+                }
+                ImGui::PopID();
+            }
         }
     }
     ImGui::EndChild();
@@ -2572,9 +2938,19 @@ bool EditorLayer::executeCommandPaletteCommand(EditorCommandId id, EditorRuntime
     case EditorCommandId::SaveAll:
         requests.saveAll = true;
         return true;
+    case EditorCommandId::SaveMaterial:
+        if (std::optional<AssetGuid> guid = selectedDirtyMaterialAssetGuid(state, selection_)) {
+            requests.saveMaterialAsset = *guid;
+            visibility_.materialEditor = true;
+            return true;
+        }
+        return false;
     case EditorCommandId::OpenProjectDirectory:
         if (state.project != nullptr) { requests.openProjectDirectory = true; return true; }
         return false;
+    case EditorCommandId::OpenLogFolder:
+        requests.openLogFolder = true;
+        return true;
     case EditorCommandId::OpenAsset:
         visibility_.assetBrowser = true;
         requests.openSelectedAsset = true;
@@ -2664,43 +3040,71 @@ bool EditorLayer::executeCommandPaletteCommand(EditorCommandId id, EditorRuntime
 }
 
 bool EditorLayer::executeConsoleCommand(std::string command, EditorRuntimeState& state, EditorRequests& requests) {
-    std::transform(command.begin(), command.end(), command.begin(), [](unsigned char ch) {
-        return ch == ' ' || ch == '.' || ch == '-' ? '_' : static_cast<char>(std::tolower(ch));
-    });
+    lastConsoleCommandFailureReason_.clear();
+    command = normalizeConsoleCommandToken(std::move(command));
     auto matches = [&](EditorCommandId id) {
         const EditorCommand* registered = editorCommand(id);
         if (registered == nullptr) {
             return false;
         }
-        std::string name = registered->category + "_" + registered->name;
-        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
-            return ch == ' ' || ch == '.' || ch == '-' ? '_' : static_cast<char>(std::tolower(ch));
-        });
-        return command == name || command == std::string(editorCommandName(id));
+        const std::string name = normalizeConsoleCommandToken(registered->category + "_" + registered->name);
+        const std::string shortName = normalizeConsoleCommandToken(editorCommandName(id));
+        return command == name || command == shortName;
+    };
+    auto placeholderMatches = [&](const EditorCommandPlaceholder& placeholder) {
+        const std::string name = normalizeConsoleCommandToken(placeholder.category + "_" + placeholder.name);
+        const std::string shortName = normalizeConsoleCommandToken(placeholder.name);
+        return command == name || command == shortName;
+    };
+    auto markUnavailable = [&](EditorCommandId id, const char* fallback) {
+        lastConsoleCommandFailureReason_ = commandUnavailableReason(id, state, selection_);
+        if (lastConsoleCommandFailureReason_.empty()) {
+            lastConsoleCommandFailureReason_ = fallback != nullptr ? fallback : "Command is unavailable in the current context.";
+        }
+        return false;
     };
     if (matches(EditorCommandId::ProjectManager) || command == "project_manager") { requests.showProjectManager = true; return true; }
     if (matches(EditorCommandId::ProjectSettings) || command == "project_settings") {
         if (state.project == nullptr) {
-            return false;
+            return markUnavailable(EditorCommandId::ProjectSettings, "No project is currently open.");
         }
         requests.showProjectSettings = true;
         return true;
     }
-    if (matches(EditorCommandId::CloseProject) || command == "close_project") { requests.closeProject = true; return true; }
+    if (matches(EditorCommandId::CloseProject) || command == "close_project") {
+        if (state.project == nullptr) {
+            return markUnavailable(EditorCommandId::CloseProject, "No project is currently open.");
+        }
+        requests.closeProject = true;
+        return true;
+    }
     if (matches(EditorCommandId::NewScene) || command == "new_scene") { requests.newScene = true; return true; }
     if (matches(EditorCommandId::SaveScene) || command == "save_scene") {
         if (state.scenePath == nullptr || !state.scenePath->has_value()) {
+            lastConsoleCommandFailureReason_ = "No saved scene path is available; use Save Scene As from the File menu.";
             return false;
         }
         requests.saveScene = **state.scenePath;
         return true;
     }
     if (matches(EditorCommandId::SaveAll) || command == "save_all") { requests.saveAll = true; return true; }
+    if (matches(EditorCommandId::SaveMaterial) || command == "save_material") {
+        if (std::optional<AssetGuid> guid = selectedDirtyMaterialAssetGuid(state, selection_)) {
+            requests.saveMaterialAsset = *guid;
+            visibility_.materialEditor = true;
+            return true;
+        }
+        return markUnavailable(EditorCommandId::SaveMaterial, "No dirty linked material asset is selected.");
+    }
     if (matches(EditorCommandId::OpenProjectDirectory) || command == "open_project_directory") {
         if (state.project == nullptr) {
-            return false;
+            return markUnavailable(EditorCommandId::OpenProjectDirectory, "No project is currently open.");
         }
         requests.openProjectDirectory = true;
+        return true;
+    }
+    if (matches(EditorCommandId::OpenLogFolder) || command == "open_log_folder") {
+        requests.openLogFolder = true;
         return true;
     }
     if (matches(EditorCommandId::OpenAsset) || command == "open_asset") {
@@ -2743,8 +3147,20 @@ bool EditorLayer::executeConsoleCommand(std::string command, EditorRuntimeState&
     if (matches(EditorCommandId::OpenOutputFolder) || command == "open_output_folder") { requests.openOutputFolder = true; return true; }
     if (matches(EditorCommandId::SaveLayout) || command == "save_layout") { requests.saveLayout = true; dockspace_.saveLayout(); return true; }
     if (matches(EditorCommandId::ResetLayout) || command == "reset_layout") { requests.resetLayout = true; resetLayout(); return true; }
-    if (matches(EditorCommandId::Undo) || command == "undo") { requests.undo = true; return true; }
-    if (matches(EditorCommandId::Redo) || command == "redo") { requests.redo = true; return true; }
+    if (matches(EditorCommandId::Undo) || command == "undo") {
+        if (state.undoStack == nullptr || !state.undoStack->canUndo()) {
+            return markUnavailable(EditorCommandId::Undo, "Nothing to undo.");
+        }
+        requests.undo = true;
+        return true;
+    }
+    if (matches(EditorCommandId::Redo) || command == "redo") {
+        if (state.undoStack == nullptr || !state.undoStack->canRedo()) {
+            return markUnavailable(EditorCommandId::Redo, "Nothing to redo.");
+        }
+        requests.redo = true;
+        return true;
+    }
     if (matches(EditorCommandId::ToggleFullscreen) || command == "toggle_fullscreen") { requests.toggleFullscreen = true; return true; }
     if (matches(EditorCommandId::ViewportSelect) || command == "viewport_select") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportSelect); return true; }
     if (matches(EditorCommandId::ViewportMove) || command == "viewport_move") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportMove); return true; }
@@ -2756,13 +3172,19 @@ bool EditorLayer::executeConsoleCommand(std::string command, EditorRuntimeState&
     if (matches(EditorCommandId::ViewportToggleAxes) || command == "viewport_toggle_axes") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportToggleAxes); return true; }
     if (matches(EditorCommandId::ViewportFrameSelected) || command == "viewport_frame_selected") {
         if (!selection_.entityId().valid()) {
-            return false;
+            return markUnavailable(EditorCommandId::ViewportFrameSelected, "No entity is selected.");
         }
         visibility_.viewport = true;
         requests.focusOnEntity = selection_.entityId();
         return true;
     }
     if (matches(EditorCommandId::Exit) || command == "exit") { requests.exit = true; return true; }
+    for (const EditorCommandPlaceholder& placeholder : defaultEditorCommandPlaceholders()) {
+        if (placeholderMatches(placeholder)) {
+            lastConsoleCommandFailureReason_ = placeholder.disabledReason;
+            return false;
+        }
+    }
     return false;
 }
 

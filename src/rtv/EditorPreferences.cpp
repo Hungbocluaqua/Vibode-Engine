@@ -182,6 +182,7 @@ bool EditorPreferences::save(const std::filesystem::path& path) const {
     json["themePreset"] = themePreset;
     json["workspacePreset"] = workspacePreset;
     json["layoutVersion"] = layoutVersion;
+    json["renderSequenceFramesPerTimelineFrame"] = std::clamp(renderSequenceFramesPerTimelineFrame, 1, 512);
     json["confirmDelete"] = confirmDelete;
     json["recentFiles"] = recentFiles;
     json["favoriteFiles"] = favoriteFiles;
@@ -241,6 +242,7 @@ void EditorPreferences::load(const std::filesystem::path& path) {
         if (json.contains("themePreset")) themePreset = json["themePreset"].get<int>();
         if (json.contains("workspacePreset")) workspacePreset = json["workspacePreset"].get<int>();
         if (json.contains("layoutVersion")) layoutVersion = json["layoutVersion"].get<int>();
+        if (json.contains("renderSequenceFramesPerTimelineFrame")) renderSequenceFramesPerTimelineFrame = std::clamp(json["renderSequenceFramesPerTimelineFrame"].get<int>(), 1, 512);
         if (json.contains("confirmDelete")) confirmDelete = json["confirmDelete"].get<bool>();
         if (json.contains("recentFiles")) recentFiles = json["recentFiles"].get<std::vector<std::string>>();
         if (json.contains("favoriteFiles")) favoriteFiles = json["favoriteFiles"].get<std::vector<std::string>>();

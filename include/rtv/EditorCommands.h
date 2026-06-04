@@ -17,7 +17,9 @@ enum class EditorCommandId : uint32_t {
     SaveScene,
     SaveSceneAs,
     SaveAll,
+    SaveMaterial,
     OpenProjectDirectory,
+    OpenLogFolder,
     OpenAsset,
     ImportAsset,
     ImportAndPlace,
@@ -111,6 +113,13 @@ struct EditorCommand {
     EditorKeybinding defaultKeybinding{};
 };
 
+struct EditorCommandPlaceholder {
+    std::string name;
+    std::string category;
+    std::string description;
+    std::string disabledReason;
+};
+
 class CommandRegistry {
 public:
     void registerCommand(EditorCommand command);
@@ -123,7 +132,9 @@ private:
 };
 
 [[nodiscard]] const CommandRegistry& defaultEditorCommandRegistry();
+[[nodiscard]] const std::vector<EditorCommandPlaceholder>& defaultEditorCommandPlaceholders();
 [[nodiscard]] const EditorCommand* editorCommand(EditorCommandId id);
+[[nodiscard]] const EditorCommandPlaceholder* editorCommandPlaceholder(const std::string& name);
 [[nodiscard]] const char* editorCommandShortcut(EditorCommandId id);
 [[nodiscard]] std::string editorCommandPreferenceKey(const EditorCommand& command);
 [[nodiscard]] std::string editorCommandPreferenceKey(EditorCommandId id);

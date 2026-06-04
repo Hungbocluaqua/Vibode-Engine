@@ -1,6 +1,7 @@
 #include "rtv/MaterialEditorPanel.h"
 
 #include "rtv/AssetManager.h"
+#include "rtv/AssetImport.h"
 #include "rtv/EditorUiStyle.h"
 
 #include <glm/gtc/type_ptr.hpp>
@@ -97,6 +98,28 @@ uint32_t materialIdForSelection(const EditorRuntimeState& state, const EditorSel
     return mesh->primitives.front().material.index;
 }
 
+const AssetRecord* materialAssetRecordForLoadedMaterial(const EditorRuntimeState& state, uint32_t materialId) {
+    if (state.assetRegistry == nullptr || state.importedScene == nullptr) {
+        return nullptr;
+    }
+    const auto& sceneMaterials = state.importedScene->materials;
+    for (const AssetRecord& record : state.assetRegistry->records()) {
+        if (record.type != AssetType::Material || record.sourceHash.empty() || record.importSettingsHash.empty()) {
+            continue;
+        }
+        for (size_t i = 0; i < sceneMaterials.size(); ++i) {
+            const MaterialAssetHandle handle = sceneMaterials[i];
+            if (!handle.valid() || handle.index != materialId) {
+                continue;
+            }
+            if (importedAssetGuidFor(record.sourceHash, record.importSettingsHash, "Material", i) == record.guid) {
+                return &record;
+            }
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
 void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSelection& selection, EditorRequests& requests) {
@@ -139,7 +162,12 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
         return;
     }
 
-    MaterialAsset edited = *source;
+    const AssetRecord* materialRecord = materialAssetRecordForLoadedMaterial(state, materialId);
+    const auto dirtyMaterialIt = materialRecord != nullptr && state.dirtyMaterialAssets != nullptr
+        ? state.dirtyMaterialAssets->find(materialRecord->guid)
+        : std::unordered_map<AssetGuid, MaterialAsset>::const_iterator{};
+    const bool materialAssetDirty = materialRecord != nullptr && state.dirtyMaterialAssets != nullptr && dirtyMaterialIt != state.dirtyMaterialAssets->end();
+    MaterialAsset edited = materialAssetDirty ? dirtyMaterialIt->second : *source;
     bool changed = false;
     ImGui::Text("Material ID: %u", materialId);
     ImGui::Text("Name: %s", edited.name.empty() ? "(unnamed)" : edited.name.c_str());
@@ -156,7 +184,30 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     } else {
         ImGui::TextDisabled("Asset Registry: unavailable");
     }
-    ImGui::TextDisabled("Material edits are persisted by Save Level or Save All.");
+    if (materialRecord != nullptr) {
+        if (materialAssetDirty) {
+            ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Material Asset: Unsaved metadata");
+            if (state.materialAssetAutosavePaths != nullptr) {
+                const auto autosaveIt = state.materialAssetAutosavePaths->find(materialRecord->guid);
+                if (autosaveIt != state.materialAssetAutosavePaths->end()) {
+                    ImGui::TextWrapped("Autosave: %s", autosaveIt->second.string().c_str());
+                }
+            }
+            if (ImGui::SmallButton("Save Material##MaterialAssetSave")) {
+                requests.saveMaterialAsset = materialRecord->guid;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Save All##MaterialAssetSaveAll")) {
+                requests.saveAll = true;
+            }
+        } else {
+            ImGui::TextColored(ImVec4(0.54f, 0.82f, 0.60f, 1.0f), "Material Asset: Saved metadata");
+        }
+        ImGui::TextWrapped("Asset: %s", materialRecord->displayName.empty() ? materialRecord->guid.c_str() : materialRecord->displayName.c_str());
+    } else {
+        ImGui::TextDisabled("Material Asset: not linked to a loaded registry material.");
+    }
+    ImGui::TextDisabled("Save Material writes linked material metadata; level save keeps scene state.");
     {
         ImGui::Button("Drag Material to Entity");
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
@@ -219,10 +270,6 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     if (changed) {
         requests.materialUpdate = EditorMaterialUpdate{.materialId = materialId, .material = edited};
         requests.resetAccumulation = AccumulationResetReason::MaterialChanged;
-        if (state.sceneDocument != nullptr) {
-            state.sceneDocument->markDirty(SceneUpdateKind::MaterialOnly);
-            requests.sceneUpdate = SceneUpdateKind::MaterialOnly;
-        }
     }
 
     ImGui::End();

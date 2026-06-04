@@ -432,6 +432,8 @@ EditorRequests UiOverlay::build(
     const std::optional<std::filesystem::path>& scenePath,
         const ProjectContext* project,
         const AssetRegistry* assetRegistry,
+        const std::unordered_map<AssetGuid, MaterialAsset>* dirtyMaterialAssets,
+        const std::unordered_map<AssetGuid, std::filesystem::path>* materialAssetAutosavePaths,
         bool sceneDirty,
         bool projectSettingsDirty,
         const std::vector<EntityId>* instanceEntities,
@@ -483,6 +485,8 @@ EditorRequests UiOverlay::build(
         .scenePath = &scenePath,
         .project = project,
         .assetRegistry = assetRegistry,
+        .dirtyMaterialAssets = dirtyMaterialAssets,
+        .materialAssetAutosavePaths = materialAssetAutosavePaths,
         .sceneDirty = sceneDirty,
         .projectSettingsDirty = projectSettingsDirty,
         .instanceEntities = instanceEntities,
@@ -518,6 +522,7 @@ EditorRequests UiOverlay::build(
 EditorRequests UiOverlay::buildProjectManager(
     const ProjectContext* project,
     const AssetRegistry* assetRegistry,
+    const std::optional<std::filesystem::path>& scenePath,
     bool sceneDirty,
     bool projectSettingsDirty,
     const std::string& sceneLoadingStatus,
@@ -532,6 +537,7 @@ EditorRequests UiOverlay::buildProjectManager(
     requests = editor_.drawProjectManagerLauncher(ProjectManagerRuntimeState{
         .project = project,
         .assetRegistry = assetRegistry,
+        .scenePath = &scenePath,
         .sceneLoadingStatus = &sceneLoadingStatus,
         .sceneLoadRunning = sceneLoadRunning,
         .sceneLoadProgress = sceneLoadProgress,

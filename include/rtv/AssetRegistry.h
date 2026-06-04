@@ -32,8 +32,10 @@ enum class AssetRegistryDirtyReason {
     AssetDeleted,
     AssetRenamed,
     AssetMoved,
+    AssetEdited,
     AssetDependencyChanged,
     AssetTagsChanged,
+    AssetAutosaveRestored,
 };
 
 struct AssetImportSettings {

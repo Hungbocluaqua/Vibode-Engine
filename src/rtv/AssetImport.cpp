@@ -49,6 +49,47 @@ std::string genericRelativeOrValue(const std::filesystem::path& path, const std:
     return ec ? path.generic_string() : relative.generic_string();
 }
 
+std::string projectRelativePathOrEmpty(const std::filesystem::path& path, const std::filesystem::path& root) {
+    if (path.empty() || root.empty()) {
+        return {};
+    }
+    std::error_code ec;
+    const std::filesystem::path absolute = path.is_absolute() ? path : root / path;
+    const std::filesystem::path relative = std::filesystem::relative(absolute, root, ec);
+    if (ec || relative.empty()) {
+        return {};
+    }
+    for (const auto& part : relative) {
+        if (part == "..") {
+            return {};
+        }
+    }
+    return relative.generic_string();
+}
+
+nlohmann::json thumbnailMetadataJson(
+    std::string kind,
+    const std::string& path,
+    const std::string& sourceHash,
+    const std::string& importSettingsHash,
+    const std::string& payloadHash = {}) {
+    return {
+        {"schema", "TransparentAssetThumbnailV1"},
+        {"kind", std::move(kind)},
+        {"path", path},
+        {"available", !path.empty()},
+        {"generated", false},
+        {"sourceHash", sourceHash},
+        {"importSettingsHash", importSettingsHash},
+        {"payloadHash", payloadHash},
+        {"invalidation", {
+            {"sourceHash", sourceHash},
+            {"importSettingsHash", importSettingsHash},
+            {"payloadHash", payloadHash},
+        }},
+    };
+}
+
 std::string timestampString() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(now).count());
@@ -1470,6 +1511,8 @@ StagedAssetImportResult stagePlaceholderAssetImport(
     nlohmann::json mtlMetadata = nlohmann::json::object();
     nlohmann::json importerCapabilities = nlohmann::json::object();
     nlohmann::json textureRoleMetadata = nlohmann::json::object();
+    nlohmann::json thumbnailMetadata = nlohmann::json::object();
+    std::string rootThumbnailPath;
 
     std::vector<AssetRecord> records;
     std::vector<AssetGuid> rootDependencies;
@@ -1485,6 +1528,8 @@ StagedAssetImportResult stagePlaceholderAssetImport(
             result.workerInspectMs = elapsedMilliseconds(inspectStart);
             const bool sceneCacheExists = std::filesystem::exists(sceneCachePath);
             const std::string sceneCacheHash = fileHashString(sceneCachePath);
+            rootThumbnailPath = projectRelativePathOrEmpty(effectiveSourcePath, workspace.root);
+            thumbnailMetadata = thumbnailMetadataJson("GeneratedSourcePreview", rootThumbnailPath, sourceHash, importSettingsHash, sceneCacheHash);
             if (sceneCacheExists && !sceneCacheWasValidBefore) {
                 result.generatedFiles.push_back(sceneCachePath);
             }
@@ -1499,6 +1544,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
             collisionLodMetadata = gltfCollisionLodMetadata(effectiveSourcePath, result.warnings);
             placeholder["skeletalAnimationMetadata"] = skeletalAnimationMetadata;
             placeholder["collisionLodMetadata"] = collisionLodMetadata;
+            placeholder["thumbnail"] = thumbnailMetadata;
             runtimePayload = {
                 {"kind", "SceneCache"},
                 {"cachePath", genericRelativeOrValue(sceneCachePath, workspace.root)},
@@ -1546,8 +1592,10 @@ StagedAssetImportResult stagePlaceholderAssetImport(
             placeholder["sourceHierarchy"] = nodes;
 
             std::vector<AssetGuid> textureGuids;
+            std::vector<std::string> textureThumbnailPaths;
             const auto& textures = importedAssets.textures();
             textureGuids.reserve(textures.size());
+            textureThumbnailPaths.reserve(textures.size());
             for (size_t i = 0; i < textures.size(); ++i) {
                 const TextureAsset& texture = textures[i];
                 const AssetGuid textureGuid = importedAssetGuidFor(sourceHash, importSettingsHash, "Texture", i);
@@ -1559,7 +1607,10 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 std::filesystem::create_directories(texturePath.parent_path(), ec);
                 std::filesystem::create_directories(textureCache.parent_path(), ec);
                 const std::string textureSourcePath = texture.sourcePath.empty() ? effectiveSourceString : texture.sourcePath.generic_string();
+                const std::string textureThumbnailPath = projectRelativePathOrEmpty(texture.sourcePath, workspace.root);
+                textureThumbnailPaths.push_back(textureThumbnailPath);
                 const nlohmann::json texturePayload = sceneCacheSlicePayload("Texture", i, textureGuid);
+                const nlohmann::json textureThumbnail = thumbnailMetadataJson("SourceTexturePreview", textureThumbnailPath, sourceHash, importSettingsHash, sceneCacheHash);
                 cookedPayloads.push_back(texturePayload);
                 (void)writeJson(texturePath, {
                     {"version", 1},
@@ -1572,6 +1623,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                     {"sourceHash", sourceHash},
                     {"importSettingsHash", importSettingsHash},
                     {"runtimePayload", texturePayload},
+                    {"thumbnail", textureThumbnail},
                     {"width", texture.width},
                     {"height", texture.height},
                     {"channels", texture.channels},
@@ -1591,6 +1643,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 record.sourcePath = textureSourcePath;
                 record.importedPath = genericRelativeOrValue(texturePath, workspace.root);
                 record.cachePath = texturePayload.value("cachePath", genericRelativeOrValue(textureCache, workspace.root));
+                record.thumbnailPath = textureThumbnailPath;
                 record.sourceHash = sourceHash;
                 record.importSettingsHash = importSettingsHash;
                 record.lastModifiedTimestamp = timestampString();
@@ -1617,6 +1670,12 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                         textureDependencies.push_back({{"guid", textureGuids[handle.index]}, {"role", role}, {"colorSpace", colorSpace}});
                     }
                 };
+                auto thumbnailForTexture = [&](TextureAssetHandle handle) -> std::string {
+                    if (handle.valid() && handle.index < textureThumbnailPaths.size()) {
+                        return textureThumbnailPaths[handle.index];
+                    }
+                    return {};
+                };
                 addTextureDependency(material.baseColorTexture, "baseColor", "sRGB");
                 addTextureDependency(material.emissiveTexture, "emissive", "sRGB");
                 addTextureDependency(material.normalTexture, "normal", "Linear");
@@ -1633,8 +1692,13 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 addTextureDependency(material.iridescenceTexture, "iridescence", "Linear");
                 addTextureDependency(material.iridescenceThicknessTexture, "iridescenceThickness", "Linear");
                 addTextureDependency(material.anisotropyTexture, "anisotropy", "Linear");
+                std::string materialThumbnailPath = thumbnailForTexture(material.baseColorTexture);
+                if (materialThumbnailPath.empty()) materialThumbnailPath = thumbnailForTexture(material.emissiveTexture);
+                if (materialThumbnailPath.empty()) materialThumbnailPath = thumbnailForTexture(material.normalTexture);
+                if (materialThumbnailPath.empty()) materialThumbnailPath = thumbnailForTexture(material.metallicRoughnessTexture);
                 const nlohmann::json pbrMetadata = materialPbrMetadataJson(material);
                 const nlohmann::json materialPayload = sceneCacheSlicePayload("Material", i, materialGuid);
+                const nlohmann::json materialThumbnail = thumbnailMetadataJson("MaterialTexturePreview", materialThumbnailPath, sourceHash, importSettingsHash, sceneCacheHash);
                 cookedPayloads.push_back(materialPayload);
                 (void)writeJson(materialPath, {
                     {"version", 1},
@@ -1646,6 +1710,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                     {"sourceHash", sourceHash},
                     {"importSettingsHash", importSettingsHash},
                     {"runtimePayload", materialPayload},
+                    {"thumbnail", materialThumbnail},
                     {"alphaMode", materialAlphaModeLabel(material.alphaMode)},
                     {"doubleSided", material.doubleSided != 0},
                     {"pbr", pbrMetadata},
@@ -1659,6 +1724,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 record.sourcePath = effectiveSourceString;
                 record.importedPath = genericRelativeOrValue(materialPath, workspace.root);
                 record.cachePath = materialPayload.value("cachePath", std::string{});
+                record.thumbnailPath = materialThumbnailPath;
                 for (const auto& dep : textureDependencies) {
                     record.dependencies.push_back(AssetDependency{dep.value("guid", std::string{}), dep.value("role", std::string{})});
                 }
@@ -1720,6 +1786,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 record.sourcePath = effectiveSourceString;
                 record.importedPath = genericRelativeOrValue(meshPath, workspace.root);
                 record.cachePath = meshPayload.value("cachePath", genericRelativeOrValue(meshCache, workspace.root));
+                record.thumbnailPath = rootThumbnailPath;
                 for (const auto& dep : primitiveMaterials) {
                     record.dependencies.push_back(AssetDependency{dep.get<std::string>(), "material"});
                 }
@@ -1768,6 +1835,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
 
             cache["runtimePayload"] = runtimePayload;
             cache["cookedPayloads"] = cookedPayloads;
+            cache["thumbnail"] = thumbnailMetadata;
             cache["textureCount"] = textures.size();
             cache["materialCount"] = materials.size();
             cache["meshCount"] = meshes.size();
@@ -1787,6 +1855,8 @@ StagedAssetImportResult stagePlaceholderAssetImport(
         setProgress(0.45f, "Inspecting OBJ source");
         objMetadata = inspectObjSource(effectiveSourcePath, result.warnings);
         result.workerInspectMs = elapsedMilliseconds(inspectStart);
+        rootThumbnailPath = projectRelativePathOrEmpty(effectiveSourcePath, workspace.root);
+        thumbnailMetadata = thumbnailMetadataJson("GeneratedSourcePreview", rootThumbnailPath, sourceHash, importSettingsHash);
 
         result.warnings.push_back("OBJ import currently preserves inspectable mesh/material-library metadata only; native OBJ geometry cooking and placement remain pending.");
         runtimePayload = {
@@ -1803,6 +1873,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
         };
         cookedPayloads.push_back(runtimePayload);
         placeholder["runtimePayload"] = runtimePayload;
+        placeholder["thumbnail"] = thumbnailMetadata;
         placeholder["objMetadata"] = objMetadata;
         collisionLodMetadata = objMetadata.value("collisionLodMetadata", nlohmann::json::object());
         placeholder["collisionLodMetadata"] = collisionLodMetadata;
@@ -1811,6 +1882,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
         placeholder["originalSourceBytes"] = fileSizeOrZero(originalSourcePath);
         cache["runtimePayload"] = runtimePayload;
         cache["cookedPayloads"] = cookedPayloads;
+        cache["thumbnail"] = thumbnailMetadata;
         cache["objMetadata"] = objMetadata;
         cache["collisionLodMetadata"] = collisionLodMetadata;
     } else if (sourceIsMtl) {
@@ -1818,6 +1890,8 @@ StagedAssetImportResult stagePlaceholderAssetImport(
         setProgress(0.45f, "Inspecting MTL source");
         mtlMetadata = inspectMtlSource(effectiveSourcePath, result.warnings);
         result.workerInspectMs = elapsedMilliseconds(inspectStart);
+        rootThumbnailPath = projectRelativePathOrEmpty(effectiveSourcePath, workspace.root);
+        thumbnailMetadata = thumbnailMetadataJson("GeneratedMaterialSourcePreview", rootThumbnailPath, sourceHash, importSettingsHash);
 
         result.warnings.push_back("MTL import currently preserves inspectable material metadata only; native material asset cooking and texture binding remain pending.");
         runtimePayload = {
@@ -1834,12 +1908,14 @@ StagedAssetImportResult stagePlaceholderAssetImport(
         };
         cookedPayloads.push_back(runtimePayload);
         placeholder["runtimePayload"] = runtimePayload;
+        placeholder["thumbnail"] = thumbnailMetadata;
         placeholder["mtlMetadata"] = mtlMetadata;
         placeholder["sourceExtension"] = sourceExtension;
         placeholder["sourceBytes"] = fileSizeOrZero(effectiveSourcePath);
         placeholder["originalSourceBytes"] = fileSizeOrZero(originalSourcePath);
         cache["runtimePayload"] = runtimePayload;
         cache["cookedPayloads"] = cookedPayloads;
+        cache["thumbnail"] = thumbnailMetadata;
         cache["mtlMetadata"] = mtlMetadata;
     } else if (sourceIsStandaloneTexture) {
         const auto inspectStart = std::chrono::steady_clock::now();
@@ -1855,6 +1931,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
             return result;
         }
         result.generatedFiles.push_back(payloadPath);
+        rootThumbnailPath = projectRelativePathOrEmpty(payloadPath, workspace.root);
 
         bool inspected = false;
         TextureData textureData;
@@ -1880,9 +1957,16 @@ StagedAssetImportResult stagePlaceholderAssetImport(
             {"validForSource", true},
             {"textureRole", textureRoleMetadata},
         };
+        thumbnailMetadata = thumbnailMetadataJson(
+            type == AssetType::HDRI ? "LooseHDRIPayloadPreview" : "LooseTexturePayloadPreview",
+            rootThumbnailPath,
+            sourceHash,
+            importSettingsHash,
+            runtimePayload.value("payloadHash", std::string{}));
         cookedPayloads.push_back(runtimePayload);
 
         placeholder["runtimePayload"] = runtimePayload;
+        placeholder["thumbnail"] = thumbnailMetadata;
         placeholder["textureRole"] = textureRoleMetadata;
         placeholder["sourceExtension"] = lowerString(effectiveSourcePath.extension().string());
         placeholder["sourceBytes"] = fileSizeOrZero(effectiveSourcePath);
@@ -1902,6 +1986,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
 
         cache["runtimePayload"] = runtimePayload;
         cache["cookedPayloads"] = cookedPayloads;
+        cache["thumbnail"] = thumbnailMetadata;
         cache["textureRole"] = textureRoleMetadata;
         cache["sourceExtension"] = placeholder["sourceExtension"];
         cache["inspected"] = inspected;
@@ -1981,6 +2066,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
         }},
         {"runtimePayload", runtimePayload.is_null() ? nlohmann::json::object() : runtimePayload},
         {"cookedPayloads", cookedPayloads},
+        {"thumbnail", thumbnailMetadata.is_null() ? nlohmann::json::object() : thumbnailMetadata},
         {"importerCapabilities", importerCapabilities.is_null() ? nlohmann::json::object() : importerCapabilities},
         {"textureRole", textureRoleMetadata.is_null() ? nlohmann::json::object() : textureRoleMetadata},
         {"objMetadata", objMetadata.is_null() ? nlohmann::json::object() : objMetadata},
@@ -2029,6 +2115,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
     record.cachePath = runtimePayload.is_object()
         ? runtimePayload.value("cachePath", genericRelativeOrValue(cachePath, workspace.root))
         : genericRelativeOrValue(cachePath, workspace.root);
+    record.thumbnailPath = rootThumbnailPath;
     record.sourceHash = sourceHash;
     record.importSettingsHash = importSettingsHash;
     record.lastModifiedTimestamp = timestampString();

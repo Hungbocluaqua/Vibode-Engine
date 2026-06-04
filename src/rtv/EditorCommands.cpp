@@ -162,7 +162,9 @@ const CommandRegistry& defaultEditorCommandRegistry() {
         add(EditorCommandId::SaveScene, "Save Scene", "Scene", "Save the current scene", ctrlKey(GLFW_KEY_S, ImGuiKey_S, "Ctrl+S"));
         add(EditorCommandId::SaveSceneAs, "Save Scene As", "Scene", "Save the current scene to a new path");
         add(EditorCommandId::SaveAll, "Save All", "Project", "Save the current level, project metadata, asset registry, and editor preferences", ctrlShiftKey(GLFW_KEY_S, ImGuiKey_S, "Ctrl+Shift+S"));
+        add(EditorCommandId::SaveMaterial, "Save Material", "Asset", "Save the selected dirty linked material asset metadata");
         add(EditorCommandId::OpenProjectDirectory, "Open Current Project Directory", "Project", "Reveal the current project root folder");
+        add(EditorCommandId::OpenLogFolder, "Open Log Folder", "Engine", "Reveal the editor log output folder");
         add(EditorCommandId::OpenAsset, "Open Asset", "Asset", "Open or reveal the selected asset in the Content Browser");
         add(EditorCommandId::ImportAsset, "Import Asset", "Import", "Import reusable assets without mutating the scene");
         add(EditorCommandId::ImportAndPlace, "Import and Place", "Import", "Import assets and place the generated prefab");
@@ -238,8 +240,73 @@ const CommandRegistry& defaultEditorCommandRegistry() {
     return registry;
 }
 
+const std::vector<EditorCommandPlaceholder>& defaultEditorCommandPlaceholders() {
+    static const std::vector<EditorCommandPlaceholder> placeholders = {
+        {"Favorite Scenes", "File", "Open or manage saved favorite scenes.", "Favorite scene storage is not implemented yet."},
+        {"Choose Files to Save...", "File", "Choose specific dirty files to save.", "Selective save is not available in this build."},
+        {"Import Texture", "File", "Import a standalone texture asset.", "Texture asset import is routed through the Content browser import pipeline."},
+        {"Import IES Profile", "File", "Import an IES light profile asset.", "IES profile import storage is not implemented yet."},
+        {"Export All...", "File", "Export the current scene.", "Scene export is not implemented yet."},
+        {"Export Selected...", "File", "Export the selected entity or asset.", "Select an entity or asset after scene export support is implemented."},
+        {"Zip Project", "File", "Create a distributable project archive.", "Project packaging is not wired to the editor shell yet."},
+        {"Recent Projects", "File", "Open a recently used project.", "Recent projects are shown in the Project Manager."},
+
+        {"Folder / Group", "Create", "Create a scene organization folder or group.", "Scene folder/group authoring is not available in this build."},
+        {"Cube", "Create", "Create a cube primitive mesh actor.", "Primitive mesh creation is not available in this build."},
+        {"Sphere", "Create", "Create a sphere primitive mesh actor.", "Primitive mesh creation is not available in this build."},
+        {"Plane", "Create", "Create a plane primitive mesh actor.", "Primitive mesh creation is not available in this build."},
+        {"Cylinder", "Create", "Create a cylinder primitive mesh actor.", "Primitive mesh creation is not available in this build."},
+        {"Cone", "Create", "Create a cone primitive mesh actor.", "Primitive mesh creation is not available in this build."},
+        {"Mesh From Asset", "Create", "Place a mesh or prefab asset into the current scene.", "Select a mesh or prefab in Content and place it from the asset actions."},
+        {"Disk Area Light", "Create", "Create a disk-shaped area light.", "Disk area light shape is not available in this build."},
+        {"Sphere Light", "Create", "Create a spherical light source.", "Sphere light shape is not available in this build."},
+        {"Emissive Mesh Light", "Create", "Create a mesh-backed emissive light.", "Emissive mesh light authoring is not available in this build."},
+        {"Cine Camera", "Create", "Create a cinematic camera actor.", "Cinematic camera actor storage is not available in this build."},
+        {"Material", "Create", "Create a standalone material asset.", "Material asset creation is not available from this menu yet."},
+        {"Material Instance", "Create", "Create a material instance asset.", "Material instance asset creation is not available from this menu yet."},
+        {"Prefab From Selection", "Create", "Create a prefab from the current selection.", "Prefab authoring is not available in this build."},
+
+        {"Editor Preferences...", "Engine", "Open editor preference settings.", "Editor preferences are edited from the Project Manager preferences view."},
+        {"Engine Settings...", "Engine", "Open engine settings.", "Engine settings are not exposed as an editor panel yet."},
+        {"Rebuild Asset Registry", "Engine", "Rebuild the loaded project asset registry.", "Asset registry rebuild is not wired to the top menu yet."},
+        {"Validate Asset References", "Engine", "Validate asset reference metadata.", "Use the asset registry validator script from the command line for now."},
+        {"Clear Derived Data Cache...", "Engine", "Clear generated derived-data cache files.", "Derived data cache clearing is not wired to the editor shell yet."},
+        {"Open Cache Directory", "Engine", "Reveal the current project cache directory.", "Cache directory reveal is not wired to this menu yet."},
+        {"Run Validation Suite", "Engine", "Run the renderer validation suite from the editor.", "Use the validation scripts from the command line; in-editor launch is pending."},
+        {"Run Current Scene Checks", "Engine", "Run validation checks for the current scene.", "Current-scene validation is not wired to the editor shell yet."},
+        {"Open Debug Package Folder", "Engine", "Reveal generated debug package output.", "Debug package folder reveal is available from generated debug-package notifications."},
+        {"Copy System Info", "Engine", "Copy renderer and platform information to the clipboard.", "System info clipboard export is not wired to the editor shell yet."},
+
+        {"Floating Render Controls", "Window", "Show floating render controls.", "Floating render controls are not implemented yet; use the Render menu and viewport strip."},
+        {"Load Layout...", "Window", "Load a saved editor layout.", "Named layout loading is not implemented yet."},
+
+        {"Pause / Resume Render", "Render", "Pause or resume the active editor render job.", "Pause/resume render jobs are not available in this build."},
+        {"High Resolution Render", "Render", "Render a high-resolution tiled output.", "High-resolution tiled rendering is not available in this build."},
+        {"Quality Preset", "Render", "Change the active render quality preset.", "Use the Render World Settings panel for preset changes."},
+        {"Capture RenderDoc", "Render", "Capture the current frame with RenderDoc.", "RenderDoc capture remains available through the existing runtime capture path; top-menu launch is pending."},
+        {"Export Debug Views", "Render", "Export renderer debug view images.", "Use headless/debug package export until in-editor export is wired."},
+        {"Export Debug Package", "Render", "Export a self-contained renderer debug package.", "Use the debug package command-line export until in-editor export is wired."},
+        {"Dump RenderGraph", "Render", "Write the current RenderGraph structure to disk.", "RenderGraph dump is available through headless diagnostics for now."},
+        {"Profile Current Scene", "Render", "Profile the current scene and export timing data.", "Profiling export is available through headless diagnostics for now."},
+        {"View Mode", "Render", "Switch the viewport view mode.", "Viewport view-mode switching is exposed through Draw Debug for now."},
+
+        {"Manage Layouts...", "Layout", "Manage named editor layouts.", "Named layout management is not implemented yet."},
+        {"UI Scale", "Layout", "Change editor UI scale.", "UI scale is edited from Project Manager preferences."},
+        {"Theme", "Layout", "Change the editor theme.", "Theme is edited from Project Manager preferences."},
+    };
+    return placeholders;
+}
+
 const EditorCommand* editorCommand(EditorCommandId id) {
     return defaultEditorCommandRegistry().find(id);
+}
+
+const EditorCommandPlaceholder* editorCommandPlaceholder(const std::string& name) {
+    const std::vector<EditorCommandPlaceholder>& placeholders = defaultEditorCommandPlaceholders();
+    const auto it = std::find_if(placeholders.begin(), placeholders.end(), [&](const EditorCommandPlaceholder& placeholder) {
+        return placeholder.name == name;
+    });
+    return it != placeholders.end() ? &*it : nullptr;
 }
 
 const char* editorCommandShortcut(EditorCommandId id) {

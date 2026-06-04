@@ -27,6 +27,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 struct GLFWwindow;
@@ -178,6 +179,13 @@ private:
     [[nodiscard]] DirtyScenePromptResult promptDirtySceneBefore(std::string_view action) const;
     [[nodiscard]] bool saveCurrentSceneForDirtyPrompt();
     [[nodiscard]] bool saveAllEditorState();
+    [[nodiscard]] std::optional<AssetRecord> materialAssetRecordForMaterial(uint32_t materialId) const;
+    [[nodiscard]] std::optional<uint32_t> loadedMaterialIndexForRecord(const AssetRecord& record) const;
+    [[nodiscard]] bool writeMaterialAssetFile(const AssetRecord& record, const MaterialAsset& material, const std::filesystem::path& path, bool autosave);
+    [[nodiscard]] bool saveDirtyMaterialAsset(const AssetGuid& guid, std::string& saved, std::string& failure);
+    [[nodiscard]] bool saveDirtyMaterialAssets(std::vector<std::string>& saved, std::vector<std::string>& failures);
+    [[nodiscard]] bool autosaveDirtyMaterialAssets();
+    [[nodiscard]] bool restoreMaterialAssetAutosaves();
     [[nodiscard]] bool confirmDestructiveSceneAction(std::string_view action);
     [[nodiscard]] bool createProjectFromRequest(const CreateProjectRequest& request);
     [[nodiscard]] bool openProjectFromFile(const std::filesystem::path& projectFile, bool promptForDirtyScene);
@@ -286,6 +294,9 @@ private:
     bool editorRenderJobFramePrepared_ = false;
     int editorRenderJobSequenceStartFrame_ = 0;
     int editorRenderJobSequenceEndFrame_ = 0;
+    uint32_t editorRenderJobSequenceFramesPerTimelineFrame_ = 1;
+    uint32_t editorRenderJobSequenceOutputFramesWritten_ = 0;
+    uint32_t editorRenderJobSequenceAccumulationFrame_ = 0;
     bool editorRenderJobTimelineWasPlaying_ = false;
     int editorRenderJobPreviousTimelineFrame_ = 0;
     std::optional<SceneDocument> editorRenderJobSceneSnapshot_;
@@ -322,6 +333,10 @@ private:
     uint64_t pendingProjectThumbnailFrame_ = 0;
     uint32_t pendingProjectThumbnailAttempts_ = 0;
     std::string sceneLoadingStatus_;
+    std::unordered_map<AssetGuid, MaterialAsset> dirtyMaterialAssets_;
+    std::unordered_map<AssetGuid, std::filesystem::path> materialAssetAutosavePaths_;
+    std::vector<std::pair<AssetGuid, std::filesystem::path>> pendingRecoveryMaterialAssetAutosaves_;
+    std::optional<std::filesystem::path> pendingRecoveryAssetRegistryAutosavePath_;
 };
 
 } // namespace rtv

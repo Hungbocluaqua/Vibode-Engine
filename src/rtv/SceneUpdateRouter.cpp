@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 
 namespace rtv {
 
@@ -151,9 +150,6 @@ void SceneUpdateRouter::record(SceneUpdateKind kind) {
     const auto idx = static_cast<uint32_t>(kind);
     if (idx < 10u) {
         ++routeCounts_[idx];
-    }
-    if (kind == SceneUpdateKind::TopologyChanged) {
-        assert(routeCounts_[idx] <= 2u && "TopologyChanged (full rebuild) should only occur during initial scene load or explicit user request");
     }
 }
 

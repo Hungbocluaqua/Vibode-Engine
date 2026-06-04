@@ -33,11 +33,14 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <functional>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -106,6 +109,101 @@ std::string readCommandOutput(const std::string& command) {
     pclose(pipe);
 #endif
     return output;
+}
+
+struct GitStatusSnapshot {
+    bool loaded = false;
+    std::unordered_map<std::string, std::string> exactStatusByPath;
+    std::vector<std::pair<std::string, std::string>> statusEntries;
+};
+
+std::unordered_map<std::string, GitStatusSnapshot>& gitStatusSnapshots() {
+    static std::unordered_map<std::string, GitStatusSnapshot> snapshots;
+    return snapshots;
+}
+
+void clearGitStatusSnapshots() {
+    gitStatusSnapshots().clear();
+}
+
+std::string normalizeGitStatusPath(std::string value) {
+    value = trimString(std::move(value));
+    std::replace(value.begin(), value.end(), '\\', '/');
+    while (!value.empty() && value.front() == '/') {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && value.back() == '/') {
+        value.pop_back();
+    }
+    return lowerString(std::move(value));
+}
+
+std::string sourceControlStatusFromPorcelainCode(std::string code) {
+    code = trimString(std::move(code));
+    if (code == "??") return "Untracked";
+    if (code.find('U') != std::string::npos) return "Conflict";
+    if (code.find('D') != std::string::npos) return "Deleted";
+    if (code.find('A') != std::string::npos) return "Added";
+    if (code.find('M') != std::string::npos) return "Modified";
+    if (code.find('R') != std::string::npos) return "Renamed";
+    if (code.find('C') != std::string::npos) return "Copied";
+    return code.empty() ? "Clean" : "Changed";
+}
+
+const GitStatusSnapshot& gitStatusSnapshotForRoot(const std::filesystem::path& gitRoot) {
+    const std::string rootKey = canonicalForCompare(gitRoot).string();
+    GitStatusSnapshot& snapshot = gitStatusSnapshots()[rootKey];
+    if (snapshot.loaded) {
+        return snapshot;
+    }
+    snapshot.loaded = true;
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string command = "git -C " + quoteCommandPath(gitRoot) + " status --porcelain=v1 --untracked-files=all" + stderrRedirect;
+    const std::string output = readCommandOutput(command);
+    std::stringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (line.size() < 4) {
+            continue;
+        }
+        const std::string status = sourceControlStatusFromPorcelainCode(line.substr(0, 2));
+        std::string path = line.substr(3);
+        const size_t renameSeparator = path.find(" -> ");
+        if (renameSeparator != std::string::npos) {
+            path = path.substr(renameSeparator + 4);
+        }
+        const std::string relativeKey = normalizeGitStatusPath(std::move(path));
+        if (relativeKey.empty()) {
+            continue;
+        }
+        snapshot.exactStatusByPath.emplace(relativeKey, status);
+        snapshot.statusEntries.emplace_back(relativeKey, status);
+    }
+    return snapshot;
+}
+
+std::string lookupGitStatusSnapshot(const GitStatusSnapshot& snapshot, const std::filesystem::path& relativePath) {
+    const std::string relativeKey = normalizeGitStatusPath(relativePath.generic_string());
+    if (relativeKey.empty()) {
+        return "Unavailable";
+    }
+    const auto exactIt = snapshot.exactStatusByPath.find(relativeKey);
+    if (exactIt != snapshot.exactStatusByPath.end()) {
+        return exactIt->second;
+    }
+
+    const std::string relativePrefix = relativeKey + "/";
+    for (const auto& [entryPath, status] : snapshot.statusEntries) {
+        if (entryPath.rfind(relativePrefix, 0) == 0 || relativeKey.rfind(entryPath + "/", 0) == 0) {
+            return status;
+        }
+    }
+    return "Clean";
 }
 
 void setPreferenceSaveStatus(bool saved, std::string& status, std::string successMessage, std::string failureDetail) {
@@ -418,25 +516,7 @@ std::string gitStatusLabelForPath(const std::filesystem::path& workspaceRoot, co
     if (ec) {
         return "Unavailable";
     }
-#ifdef _WIN32
-    constexpr const char* stderrRedirect = " 2>NUL";
-#else
-    constexpr const char* stderrRedirect = " 2>/dev/null";
-#endif
-    const std::string command = "git -C " + quoteCommandPath(*gitRoot) + " status --porcelain -- " + quoteCommandPath(relative) + stderrRedirect;
-    const std::string output = readCommandOutput(command);
-    if (trimString(output).empty()) {
-        return "Clean";
-    }
-    const std::string code = output.size() >= 2 ? output.substr(0, 2) : trimString(output);
-    if (code == "??") return "Untracked";
-    if (code.find('A') != std::string::npos) return "Added";
-    if (code.find('M') != std::string::npos) return "Modified";
-    if (code.find('D') != std::string::npos) return "Deleted";
-    if (code.find('R') != std::string::npos) return "Renamed";
-    if (code.find('C') != std::string::npos) return "Copied";
-    if (code.find('U') != std::string::npos) return "Conflict";
-    return "Changed";
+    return lookupGitStatusSnapshot(gitStatusSnapshotForRoot(*gitRoot), relative);
 }
 
 float assetImportProgress(const AssetRecord& record) {
@@ -543,6 +623,40 @@ ImU32 contentIconColor(const std::filesystem::path& path) {
     }
 }
 
+EditorGlyphIcon editorGlyphForAssetType(AssetType type) {
+    switch (type) {
+    case AssetType::Mesh: return EditorGlyphIcon::Model;
+    case AssetType::Material: return EditorGlyphIcon::Material;
+    case AssetType::Texture: return EditorGlyphIcon::Texture;
+    case AssetType::HDRI: return EditorGlyphIcon::Environment;
+    case AssetType::Scene: return EditorGlyphIcon::SceneFile;
+    case AssetType::Prefab: return EditorGlyphIcon::Model;
+    case AssetType::Unknown:
+    default: return EditorGlyphIcon::File;
+    }
+}
+
+ImU32 assetTypeIconColor(AssetType type) {
+    switch (type) {
+    case AssetType::Mesh:
+    case AssetType::Prefab:
+    case AssetType::Scene:
+        return IM_COL32(188, 199, 216, 255);
+    case AssetType::Material:
+        return IM_COL32(198, 190, 212, 255);
+    case AssetType::Texture:
+    case AssetType::HDRI:
+        return IM_COL32(184, 196, 211, 255);
+    case AssetType::Unknown:
+    default:
+        return IM_COL32(158, 166, 178, 255);
+    }
+}
+
+void drawAssetTypeGlyph(AssetType type, ImVec2 min, ImVec2 max) {
+    editorDrawIconGlyph(editorGlyphForAssetType(type), min, max, assetTypeIconColor(type));
+}
+
 void drawContentGlyph(const std::filesystem::path& path, ImVec2 min, ImVec2 max) {
     editorDrawIconGlyph(editorGlyphForPath(path), min, max, contentIconColor(path));
 }
@@ -575,6 +689,31 @@ std::filesystem::path resolveAssetRecordPath(const EditorRuntimeState& state, co
         return state.assetRegistry->state().path.parent_path() / path;
     }
     return path;
+}
+
+std::filesystem::path firstResolvedExistingRecordPath(const EditorRuntimeState& state, std::initializer_list<std::string> values) {
+    std::filesystem::path firstResolved;
+    for (const std::string& value : values) {
+        const std::filesystem::path resolved = resolveAssetRecordPath(state, value);
+        if (resolved.empty()) {
+            continue;
+        }
+        if (firstResolved.empty()) {
+            firstResolved = resolved;
+        }
+        std::error_code ec;
+        if (std::filesystem::exists(resolved, ec)) {
+            return resolved;
+        }
+    }
+    return firstResolved;
+}
+
+std::filesystem::path recordPreviewPath(const EditorRuntimeState& state, const AssetRecord& record) {
+    if (record.type == AssetType::Texture || record.type == AssetType::HDRI) {
+        return firstResolvedExistingRecordPath(state, {record.thumbnailPath, record.cachePath, record.sourcePath, record.importedPath});
+    }
+    return firstResolvedExistingRecordPath(state, {record.thumbnailPath, record.sourcePath, record.importedPath, record.cachePath});
 }
 
 std::string fileSizeLabel(const std::filesystem::path& path) {
@@ -830,10 +969,143 @@ std::filesystem::path selectedAssetBrokenPlaceholderReportPath(const EditorRunti
     return path;
 }
 
+std::filesystem::path selectedAssetOverwriteRiskReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_overwrite_risk_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+struct AssetOverwriteRisk {
+    std::string label;
+    std::filesystem::path path;
+    std::string status;
+};
+
+std::filesystem::path sourceControlDiffReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const std::filesystem::path& path) {
+    std::filesystem::path reportPath = assetValidationReportPath(state, browserRoot);
+    const std::string name = path.filename().empty() ? std::string("path") : path.filename().string();
+    const std::string key = canonicalForCompare(path).string();
+    reportPath.replace_filename("source_control_diff_" + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".patch");
+    return reportPath;
+}
+
+bool sourceControlDiffReportAvailable(const std::string& status) {
+    return status == "Modified" || status == "Added" || status == "Deleted" || status == "Renamed" || status == "Copied" ||
+        status == "Conflict" || status == "Changed" || status == "Untracked";
+}
+
+bool sourceControlOverwriteRiskStatus(const std::string& status) {
+    return sourceControlDiffReportAvailable(status);
+}
+
+std::vector<AssetOverwriteRisk> collectAssetOverwriteRisks(
+    const EditorRuntimeState& state,
+    const AssetRecord& record,
+    const std::function<std::string(const std::filesystem::path&)>& statusForPath) {
+    std::vector<AssetOverwriteRisk> risks;
+    std::unordered_set<std::string> seen;
+    auto addPath = [&](std::string label, const std::string& value) {
+        const std::filesystem::path path = resolveAssetRecordPath(state, value);
+        if (path.empty()) {
+            return;
+        }
+        const std::string key = canonicalForCompare(path).string();
+        if (!seen.insert(key).second) {
+            return;
+        }
+        const std::string status = statusForPath(path);
+        if (sourceControlOverwriteRiskStatus(status)) {
+            risks.push_back(AssetOverwriteRisk{std::move(label), path, status});
+        }
+    };
+
+    addPath("Imported metadata", record.importedPath);
+    addPath("Cooked/runtime payload", record.cachePath);
+    addPath("Thumbnail", record.thumbnailPath);
+    return risks;
+}
+
+ImVec4 sourceControlStatusTextColor(const std::string& status) {
+    if (status == "Clean") return ImVec4(0.54f, 0.82f, 0.60f, 1.0f);
+    if (status == "Modified" || status == "Added" || status == "Renamed" || status == "Copied") return ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
+    if (status == "Deleted" || status == "Conflict") return ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
+    if (status == "Untracked") return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
+    return ImVec4(0.65f, 0.70f, 0.78f, 1.0f);
+}
+
+bool writeSourceControlDiffReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (path.empty()) {
+        outError = "No source-control path selected.";
+        return false;
+    }
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        outError = "Path is not inside a Git repository.";
+        return false;
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        outError = "Path is outside the resolved Git repository.";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(canonicalForCompare(path), *gitRoot, ec);
+    if (ec) {
+        outError = "Could not resolve repository-relative path: " + ec.message();
+        return false;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string rootArg = quoteCommandPath(*gitRoot);
+    const std::string pathArg = quoteCommandPath(relative);
+    const std::string statusText = readCommandOutput("git -C " + rootArg + " status --short -- " + pathArg + stderrRedirect);
+    const std::string unstagedDiff = readCommandOutput("git -C " + rootArg + " diff -- " + pathArg + stderrRedirect);
+    const std::string stagedDiff = readCommandOutput("git -C " + rootArg + " diff --cached -- " + pathArg + stderrRedirect);
+
+    outPath = sourceControlDiffReportPath(state, browserRoot, path);
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create source-control report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write source-control diff report: " + outPath.string();
+        return false;
+    }
+
+    file << "# Source Control Diff Report\n";
+    file << "Repository: " << gitRoot->generic_string() << "\n";
+    file << "Path: " << relative.generic_string() << "\n";
+    file << "Status:\n" << (trimString(statusText).empty() ? std::string("  Clean\n") : statusText) << "\n";
+    file << "## Unstaged Diff\n";
+    file << (unstagedDiff.empty() ? std::string("(none)\n") : unstagedDiff);
+    file << "\n## Staged Diff\n";
+    file << (stagedDiff.empty() ? std::string("(none)\n") : stagedDiff);
+    if (unstagedDiff.empty() && stagedDiff.empty() && trimString(statusText).rfind("??", 0) == 0) {
+        file << "\n## Note\nUntracked files have no Git diff until they are added to the index.\n";
+    }
+    return true;
+}
+
 nlohmann::json assetRecordSummaryJson(const EditorRuntimeState& state, const AssetRecord& record) {
     const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
     const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
     const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
+    const std::filesystem::path thumbnailPath = resolveAssetRecordPath(state, record.thumbnailPath);
     return {
         {"guid", record.guid},
         {"displayName", record.displayName},
@@ -842,10 +1114,12 @@ nlohmann::json assetRecordSummaryJson(const EditorRuntimeState& state, const Ass
         {"sourcePath", record.sourcePath},
         {"importedPath", record.importedPath},
         {"cachePath", record.cachePath},
+        {"thumbnailPath", record.thumbnailPath},
         {"tags", record.tags},
         {"resolvedSourcePath", sourcePath.empty() ? std::string{} : sourcePath.generic_string()},
         {"resolvedImportedPath", importedPath.empty() ? std::string{} : importedPath.generic_string()},
         {"resolvedCachePath", cachePath.empty() ? std::string{} : cachePath.generic_string()},
+        {"resolvedThumbnailPath", thumbnailPath.empty() ? std::string{} : thumbnailPath.generic_string()},
         {"sourceMissing", record.sourceMissing},
         {"importedMetadataMissing", record.importedMetadataMissing},
         {"cookedPayloadMissing", record.cookedPayloadMissing},
@@ -853,6 +1127,52 @@ nlohmann::json assetRecordSummaryJson(const EditorRuntimeState& state, const Ass
         {"stale", record.stale},
         {"missing", record.missing},
     };
+}
+
+bool writeAssetOverwriteRiskReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetRecord& record,
+    const std::vector<AssetOverwriteRisk>& risks,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedAssetOverwriteRiskReportPath(state, browserRoot, record.guid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create overwrite-risk report folder: " + ec.message();
+        return false;
+    }
+
+    nlohmann::json riskArray = nlohmann::json::array();
+    for (const AssetOverwriteRisk& risk : risks) {
+        riskArray.push_back({
+            {"label", risk.label},
+            {"path", risk.path.empty() ? std::string{} : risk.path.generic_string()},
+            {"sourceControlStatus", risk.status},
+            {"recommendedAction", "Review the diff or commit/stash the external change before reimporting or rebuilding payloads."},
+        });
+    }
+
+    const nlohmann::json report = {
+        {"schema", "TransparentAssetOverwriteRiskReportV1"},
+        {"asset", assetRecordSummaryJson(state, record)},
+        {"riskCount", risks.size()},
+        {"overwriteRisks", riskArray},
+        {"policy", {
+            {"warning", "Reimport and Rebuild Payload may overwrite generated asset metadata, cooked payloads, or thumbnails that have external source-control changes."},
+            {"affectedActions", {"Reimport", "Rebuild Payload"}},
+            {"reloadPolicy", "This report does not reload changed files. Refresh/reimport remains an explicit user action."},
+        }},
+    };
+
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write overwrite-risk report: " + outPath.string();
+        return false;
+    }
+    file << report.dump(2);
+    return true;
 }
 
 const AssetRecord* findAssetRecordByGuid(const AssetRegistry& registry, const AssetGuid& guid) {
@@ -1084,6 +1404,7 @@ nlohmann::json buildAssetValidationReport(const EditorRuntimeState& state, const
     nlohmann::json savedProjectReferenceParseErrors = nlohmann::json::array();
     nlohmann::json savedProjectReferenceScanRoots = nlohmann::json::array();
     nlohmann::json requiresReimport = nlohmann::json::array();
+    nlohmann::json missingThumbnails = nlohmann::json::array();
     nlohmann::json reverseAssetReferences = nlohmann::json::array();
     nlohmann::json currentSceneReferences = nlohmann::json::array();
     size_t copiedSourceAssetCount = 0;
@@ -1138,15 +1459,18 @@ nlohmann::json buildAssetValidationReport(const EditorRuntimeState& state, const
                     {"sourcePath", record.sourcePath},
                     {"importedPath", record.importedPath},
                     {"cachePath", record.cachePath},
+                    {"thumbnailPath", record.thumbnailPath},
                     {"tags", record.tags},
                 };
             }
             const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
             const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
             const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
+            const std::filesystem::path thumbnailPath = resolveAssetRecordPath(state, record.thumbnailPath);
             const bool sourceMissing = !record.sourcePath.empty() && !regularFileExists(sourcePath);
             const bool importedMissing = !record.importedPath.empty() && !regularFileExists(importedPath);
             const bool cookedMissing = !record.cachePath.empty() && !regularFileExists(cachePath);
+            const bool thumbnailMissing = !record.thumbnailPath.empty() && !regularFileExists(thumbnailPath);
 
             if (sourceMissing || record.sourceMissing) {
                 appendValidationIssue(missingSources, "warning", "MissingSource", record, "Raw import source is missing.", record.sourcePath);
@@ -1156,6 +1480,9 @@ nlohmann::json buildAssetValidationReport(const EditorRuntimeState& state, const
             }
             if (cookedMissing || record.cookedPayloadMissing) {
                 appendValidationIssue(missingCookedPayloads, "error", "MissingCookedPayload", record, "Cooked/runtime payload is missing.", record.cachePath);
+            }
+            if (thumbnailMissing) {
+                appendValidationIssue(missingThumbnails, "warning", "MissingThumbnail", record, "Thumbnail preview path is missing; Content Browser will use a type fallback icon.", record.thumbnailPath);
             }
             for (const AssetDependency& dependency : record.dependencies) {
                 if (!dependency.guid.empty() && registryGuids.find(dependency.guid) == registryGuids.end()) {
@@ -1273,6 +1600,7 @@ nlohmann::json buildAssetValidationReport(const EditorRuntimeState& state, const
         &missingSources,
         &missingImportedMetadata,
         &missingCookedPayloads,
+        &missingThumbnails,
         &missingDependencies,
         &staleAssets,
         &unsupportedImportSettings,
@@ -1295,6 +1623,7 @@ nlohmann::json buildAssetValidationReport(const EditorRuntimeState& state, const
         {"missingSources", missingSources},
         {"missingImportedMetadata", missingImportedMetadata},
         {"missingCookedPayloads", missingCookedPayloads},
+        {"missingThumbnails", missingThumbnails},
         {"missingDependencies", missingDependencies},
         {"staleAssets", staleAssets},
         {"unsupportedImportSettings", unsupportedImportSettings},
@@ -2476,6 +2805,7 @@ void AssetBrowserPanel::syncBrowserRoot(const EditorRuntimeState& state) {
         backStack_.clear();
         forwardStack_.clear();
         sourceControlStatusCache_.clear();
+        clearGitStatusSnapshots();
     } else if (currentPath_.empty()) {
         currentPath_ = root;
     }
@@ -3060,13 +3390,56 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
     if (!canBulkTag) {
         ImGui::EndDisabled();
     }
-    if (ImGui::BeginTable("AssetRegistryRecords", 12, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX)) {
+    const std::filesystem::path sourceControlRoot = state.project != nullptr ? state.project->projectRoot : browserRoot_;
+    auto cachedSourceControlStatus = [&](const std::filesystem::path& path) {
+        if (path.empty()) {
+            return std::string("Unavailable");
+        }
+        const std::string key = canonicalForCompare(path).string();
+        auto it = sourceControlStatusCache_.find(key);
+        if (it != sourceControlStatusCache_.end()) {
+            return it->second;
+        }
+        const std::string status = gitStatusLabelForPath(sourceControlRoot, path);
+        sourceControlStatusCache_[key] = status;
+        return status;
+    };
+    auto summarizeRecordSourceControl = [&](const AssetRecord& record) {
+        struct Candidate {
+            const char* label = "";
+            std::filesystem::path path;
+        };
+        const std::array<Candidate, 3> candidates = {{
+            {"Src", resolveAssetRecordPath(state, record.sourcePath)},
+            {"Meta", resolveAssetRecordPath(state, record.importedPath)},
+            {"Payload", resolveAssetRecordPath(state, record.cachePath)},
+        }};
+        std::string fallback;
+        for (const Candidate& candidate : candidates) {
+            if (candidate.path.empty()) {
+                continue;
+            }
+            const std::string status = cachedSourceControlStatus(candidate.path);
+            if (sourceControlDiffReportAvailable(status)) {
+                return std::string(candidate.label) + ": " + status;
+            }
+            if (fallback.empty()) {
+                fallback = status;
+            }
+        }
+        return fallback.empty() ? std::string("Unavailable") : fallback;
+    };
+    auto overwriteRisksForRecord = [&](const AssetRecord& record) {
+        return collectAssetOverwriteRisks(state, record, cachedSourceControlStatus);
+    };
+    if (ImGui::BeginTable("AssetRegistryRecords", 13, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX)) {
         ImGui::TableSetupColumn("Fav", ImGuiTableColumnFlags_WidthFixed, 38.0f);
         ImGui::TableSetupColumn("Type");
         ImGui::TableSetupColumn("Name");
         ImGui::TableSetupColumn("GUID");
         ImGui::TableSetupColumn("Source");
         ImGui::TableSetupColumn("Imported");
+        ImGui::TableSetupColumn("Git", ImGuiTableColumnFlags_WidthFixed, 118.0f);
         ImGui::TableSetupColumn("Tags");
         ImGui::TableSetupColumn("Deps");
         ImGui::TableSetupColumn("Refs");
@@ -3087,6 +3460,11 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                 ImGui::SetTooltip("Favorite asset");
             }
             ImGui::TableSetColumnIndex(1);
+            const ImVec2 typeCursor = ImGui::GetCursorScreenPos();
+            const float typeIconY = typeCursor.y + std::max(0.0f, (EditorUiMetric::contentRowHeight - 16.0f) * 0.5f);
+            drawAssetTypeGlyph(record.type, ImVec2(typeCursor.x, typeIconY), ImVec2(typeCursor.x + 16.0f, typeIconY + 16.0f));
+            ImGui::Dummy(ImVec2(20.0f, EditorUiMetric::contentRowHeight));
+            ImGui::SameLine(0.0f, 2.0f);
             ImGui::TextUnformatted(assetTypeName(record.type));
             ImGui::TableSetColumnIndex(2);
             const char* name = record.displayName.empty() ? "(unnamed)" : record.displayName.c_str();
@@ -3125,10 +3503,23 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                 }
                 const std::filesystem::path resolvedSourcePath = resolveAssetRecordPath(state, record.sourcePath);
                 const bool canReimport = !record.sourcePath.empty() && std::filesystem::exists(resolvedSourcePath);
+                const std::vector<AssetOverwriteRisk> overwriteRisks = overwriteRisksForRecord(record);
+                if (!overwriteRisks.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Reimport overwrite warning");
+                    for (const AssetOverwriteRisk& risk : overwriteRisks) {
+                        ImGui::BulletText("%s: %s", risk.label.c_str(), risk.status.c_str());
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                            ImGui::SetTooltip("%s", risk.path.string().c_str());
+                        }
+                    }
+                }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Reimport", canReimport)) {
                     requests.reimportAsset = record.guid;
                     recordImportOperation("Reimport Asset", resolvedSourcePath, {}, "Reimport", record.guid);
-                    status_ = "Queued reimport: " + record.displayName;
+                    status_ = overwriteRisks.empty()
+                        ? "Queued reimport: " + record.displayName
+                        : "Queued reimport after overwrite warning: " + record.displayName;
                 }
                 ImGui::EndPopup();
             }
@@ -3139,16 +3530,22 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
             ImGui::TableSetColumnIndex(5);
             ImGui::TextUnformatted(record.importedPath.c_str());
             ImGui::TableSetColumnIndex(6);
-            ImGui::TextUnformatted(joinTagList(record.tags).c_str());
+            const std::string scmStatus = summarizeRecordSourceControl(record);
+            ImGui::TextColored(sourceControlStatusTextColor(scmStatus.find(':') == std::string::npos ? scmStatus : trimString(scmStatus.substr(scmStatus.find(':') + 1))), "%s", scmStatus.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("First changed Git status among source, metadata, and payload paths");
+            }
             ImGui::TableSetColumnIndex(7);
-            ImGui::Text("%zu", record.dependencies.size());
+            ImGui::TextUnformatted(joinTagList(record.tags).c_str());
             ImGui::TableSetColumnIndex(8);
-            ImGui::Text("%zu", record.references.size());
+            ImGui::Text("%zu", record.dependencies.size());
             ImGui::TableSetColumnIndex(9);
-            ImGui::Text("%s%s", record.missing ? "missing" : "ok", record.stale ? " / stale" : "");
+            ImGui::Text("%zu", record.references.size());
             ImGui::TableSetColumnIndex(10);
-            ImGui::TextUnformatted(assetImportStatusName(record.status));
+            ImGui::Text("%s%s", record.missing ? "missing" : "ok", record.stale ? " / stale" : "");
             ImGui::TableSetColumnIndex(11);
+            ImGui::TextUnformatted(assetImportStatusName(record.status));
+            ImGui::TableSetColumnIndex(12);
             ImGui::ProgressBar(assetImportProgress(record), ImVec2(-FLT_MIN, 0.0f), assetImportProgressLabel(record));
             ImGui::PopID();
         }
@@ -3178,25 +3575,56 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
         sourceControlStatusCache_[key] = status;
         return status;
     };
-    auto sourceControlColor = [](const std::string& status) {
-        if (status == "Clean") return ImVec4(0.54f, 0.82f, 0.60f, 1.0f);
-        if (status == "Modified" || status == "Added" || status == "Renamed" || status == "Copied") return ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
-        if (status == "Deleted" || status == "Conflict") return ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
-        if (status == "Untracked") return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
-        return ImVec4(0.65f, 0.70f, 0.78f, 1.0f);
-    };
     auto drawSourceControlStatus = [&](const char* label, const std::filesystem::path& path) {
         if (path.empty()) {
             return;
         }
         const std::string status = sourceControlStatus(path);
-        ImGui::TextColored(sourceControlColor(status), "%s Source Control: %s", label, status.c_str());
+        ImGui::TextColored(sourceControlStatusTextColor(status), "%s Source Control: %s", label, status.c_str());
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
             ImGui::SetTooltip("%s", path.string().c_str());
         }
     };
+    auto drawSourceControlActions = [&](const char* id, const std::filesystem::path& path) {
+        if (path.empty()) {
+            return;
+        }
+        const std::string status = sourceControlStatus(path);
+        const bool canOpenExternal = regularFileExists(path);
+        const bool canDiff = sourceControlDiffReportAvailable(status);
+        ImGui::PushID(id);
+        if (!canOpenExternal) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("OpenExternal", EditorGlyphIcon::File, "Open External", "Open this file with the OS-associated external tool")) {
+            requests.openFilePath = path;
+            status_ = "Opening file: " + path.string();
+        }
+        if (!canOpenExternal) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (!canDiff) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("GitDiff", EditorGlyphIcon::Details, "Git Diff", "Write and open a Git diff report for this path")) {
+            std::filesystem::path reportPath;
+            std::string error;
+            if (writeSourceControlDiffReport(state, browserRoot_, sourceControlRoot, path, reportPath, error)) {
+                requests.openFilePath = reportPath;
+                status_ = "Source-control diff report: " + reportPath.string();
+            } else {
+                status_ = "Source-control diff failed: " + error;
+            }
+        }
+        if (!canDiff) {
+            ImGui::EndDisabled();
+        }
+        ImGui::PopID();
+    };
     if (ImGui::SmallButton("Refresh Source Control")) {
         sourceControlStatusCache_.clear();
+        clearGitStatusSnapshots();
         status_ = "Source control status refreshed";
     }
     if (!selectedPath_.empty()) {
@@ -3233,6 +3661,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
         ImGui::SeparatorText("Selected Asset State");
         ImGui::Text("Origin: %s", selectedPathOriginLabel(state, selectedPath_));
         drawSourceControlStatus("Selected", selectedPath_);
+        drawSourceControlActions("SelectedPathSourceControlActions", selectedPath_);
         if (state.assetRegistry != nullptr && state.assetRegistry->dirty()) {
             ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Registry Metadata: Unsaved changes");
         } else if (state.assetRegistry != nullptr) {
@@ -3312,35 +3741,32 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             if (record.guid != selectedRecordGuid_) {
                 continue;
             }
-            std::filesystem::path recordThumbnail = resolveAssetRecordPath(state, record.thumbnailPath);
-            if (recordThumbnail.empty() && (record.type == AssetType::Texture || record.type == AssetType::HDRI)) {
-                recordThumbnail = resolveAssetRecordPath(state, record.importedPath.empty() ? record.sourcePath : record.importedPath);
-            }
-            std::filesystem::path recordPreviewSource = recordThumbnail;
-            if (recordPreviewSource.empty()) {
-                recordPreviewSource = resolveAssetRecordPath(state, record.importedPath.empty() ? record.sourcePath : record.importedPath);
-            }
-            if (!recordPreviewSource.empty()) {
-                const ImVec2 previewPos = ImGui::GetCursorScreenPos();
-                const float previewWidth = std::min(ImGui::GetContentRegionAvail().x, EditorUiMetric::assetPreviewMaxWidth);
-                const ImVec2 previewSize(previewWidth, EditorUiMetric::assetPreviewHeight);
-                ImGui::InvisibleButton("AssetRecordPreview", previewSize);
-                ImDrawList* drawList = ImGui::GetWindowDrawList();
-                drawList->AddRectFilled(previewPos, ImVec2(previewPos.x + previewSize.x, previewPos.y + previewSize.y), IM_COL32(20, 23, 27, 255), 4.0f);
-                drawList->AddRect(previewPos, ImVec2(previewPos.x + previewSize.x, previewPos.y + previewSize.y), IM_COL32(55, 62, 72, 255), 4.0f);
-                const ImVec2 previewMax(previewPos.x + previewSize.x, previewPos.y + previewSize.y);
-                if (!drawGpuSceneTextureThumbnail(state, recordPreviewSource, previewPos, previewMax) &&
-                    !drawStandaloneGpuAssetPreview(state, recordPreviewSource, previewPos, previewMax, false) &&
-                    !drawRasterThumbnail(recordPreviewSource, previewPos, previewMax, false) &&
-                    !drawGeneratedSourcePreview(recordPreviewSource, previewPos, previewMax)) {
-                    const ImVec2 previewIconSize(34.0f, 34.0f);
-                    editorDrawIconGlyph(
-                        record.type == AssetType::HDRI ? EditorGlyphIcon::Environment : EditorGlyphIcon::Texture,
-                        ImVec2(previewPos.x + previewSize.x * 0.5f - previewIconSize.x * 0.5f, previewPos.y + 32.0f),
-                        ImVec2(previewPos.x + previewSize.x * 0.5f + previewIconSize.x * 0.5f, previewPos.y + 32.0f + previewIconSize.y),
-                        IM_COL32(105, 170, 230, 255));
-                    drawList->AddText(ImVec2(previewPos.x + 10.0f, previewPos.y + previewSize.y - 22.0f), IM_COL32(130, 137, 148, 255), "Thumbnail unavailable");
-                }
+            const std::filesystem::path recordPreviewSource = recordPreviewPath(state, record);
+            const ImVec2 previewPos = ImGui::GetCursorScreenPos();
+            const float previewWidth = std::min(ImGui::GetContentRegionAvail().x, EditorUiMetric::assetPreviewMaxWidth);
+            const ImVec2 previewSize(previewWidth, EditorUiMetric::assetPreviewHeight);
+            ImGui::InvisibleButton("AssetRecordPreview", previewSize);
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            drawList->AddRectFilled(previewPos, ImVec2(previewPos.x + previewSize.x, previewPos.y + previewSize.y), IM_COL32(20, 23, 27, 255), 4.0f);
+            drawList->AddRect(previewPos, ImVec2(previewPos.x + previewSize.x, previewPos.y + previewSize.y), IM_COL32(55, 62, 72, 255), 4.0f);
+            const ImVec2 previewMax(previewPos.x + previewSize.x, previewPos.y + previewSize.y);
+            const bool previewDrawn = !recordPreviewSource.empty() &&
+                (drawGpuSceneTextureThumbnail(state, recordPreviewSource, previewPos, previewMax) ||
+                    drawStandaloneGpuAssetPreview(state, recordPreviewSource, previewPos, previewMax, false) ||
+                    drawRasterThumbnail(recordPreviewSource, previewPos, previewMax, false) ||
+                    drawGeneratedSourcePreview(recordPreviewSource, previewPos, previewMax));
+            if (!previewDrawn) {
+                const ImVec2 previewIconSize(34.0f, 34.0f);
+                drawAssetTypeGlyph(
+                    record.type,
+                    ImVec2(previewPos.x + previewSize.x * 0.5f - previewIconSize.x * 0.5f, previewPos.y + 28.0f),
+                    ImVec2(previewPos.x + previewSize.x * 0.5f + previewIconSize.x * 0.5f, previewPos.y + 28.0f + previewIconSize.y));
+                const std::string previewKind = std::string(assetTypeName(record.type)) + " preview unavailable";
+                const ImVec2 kindSize = ImGui::CalcTextSize(previewKind.c_str());
+                drawList->AddText(
+                    ImVec2(previewPos.x + previewSize.x * 0.5f - kindSize.x * 0.5f, previewPos.y + 64.0f),
+                    IM_COL32(130, 137, 148, 255),
+                    previewKind.c_str());
             }
             ImGui::Text("Asset: %s", record.displayName.empty() ? "(unnamed)" : record.displayName.c_str());
             ImGui::Text("GUID: %s", record.guid.c_str());
@@ -3405,13 +3831,24 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                     status_ = "Asset broken-placeholder report failed: " + error;
                 }
             }
-            ImGui::TextWrapped("Thumbnail: %s", record.thumbnailPath.empty() ? "(none)" : record.thumbnailPath.c_str());
+            ImGui::TextWrapped("Thumbnail: %s", record.thumbnailPath.empty() ? "(fallback icon)" : record.thumbnailPath.c_str());
+            const std::filesystem::path resolvedThumbnailPath = resolveAssetRecordPath(state, record.thumbnailPath);
+            if (!record.thumbnailPath.empty() && !regularFileExists(resolvedThumbnailPath)) {
+                ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Thumbnail state: missing; using fallback preview");
+            } else if (!record.thumbnailPath.empty()) {
+                ImGui::TextColored(ImVec4(0.54f, 0.82f, 0.60f, 1.0f), "Thumbnail state: available");
+            } else {
+                ImGui::TextDisabled("Thumbnail state: no generated thumbnail metadata yet");
+            }
             ImGui::TextWrapped("Source: %s", record.sourcePath.c_str());
             drawSourceControlStatus("Source", resolveAssetRecordPath(state, record.sourcePath));
+            drawSourceControlActions("RecordSourceSourceControlActions", resolveAssetRecordPath(state, record.sourcePath));
             ImGui::TextWrapped("Imported: %s", record.importedPath.c_str());
             drawSourceControlStatus("Metadata", resolveAssetRecordPath(state, record.importedPath));
+            drawSourceControlActions("RecordMetadataSourceControlActions", resolveAssetRecordPath(state, record.importedPath));
             ImGui::TextWrapped("Cache: %s", record.cachePath.c_str());
             drawSourceControlStatus("Payload", resolveAssetRecordPath(state, record.cachePath));
+            drawSourceControlActions("RecordPayloadSourceControlActions", resolveAssetRecordPath(state, record.cachePath));
             if (assetTagsBufferGuid_ != record.guid) {
                 setTextBuffer(assetTagsBuffer_, joinTagList(record.tags));
                 assetTagsBufferGuid_ = record.guid;
@@ -3473,6 +3910,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             const std::filesystem::path resolvedSourceForReveal = resolveAssetRecordPath(state, record.sourcePath);
             const std::filesystem::path resolvedImportedForReveal = resolveAssetRecordPath(state, record.importedPath);
             const std::filesystem::path resolvedCacheForReveal = resolveAssetRecordPath(state, record.cachePath);
+            const std::vector<AssetOverwriteRisk> overwriteRisks = collectAssetOverwriteRisks(state, record, sourceControlStatus);
             auto drawRevealAction = [&](const char* id, const char* label, const char* tooltip, const std::filesystem::path& path) {
                 const bool canReveal = !path.empty() && std::filesystem::exists(path);
                 if (!canReveal) {
@@ -3521,6 +3959,26 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                 (!record.importedPath.empty() && !std::filesystem::exists(resolvedImportedForReveal)) ||
                 (!record.cachePath.empty() && !std::filesystem::exists(resolvedCacheForReveal))) {
                 ImGui::TextDisabled("Missing paths can be repaired by restoring files or reimporting when the source is available.");
+            }
+            if (!overwriteRisks.empty()) {
+                ImGui::SeparatorText("Source Control Overwrite Warning");
+                ImGui::TextWrapped("Reimport or Rebuild Payload may overwrite generated asset files that have external source-control changes. Review the changed files before continuing.");
+                for (const AssetOverwriteRisk& risk : overwriteRisks) {
+                    ImGui::TextColored(sourceControlStatusTextColor(risk.status), "%s: %s", risk.label.c_str(), risk.status.c_str());
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("%s", risk.path.string().c_str());
+                    }
+                }
+                if (contentActionButton("OverwriteRiskReport", EditorGlyphIcon::Details, "Review Overwrite Risk", "Write and open a report of generated files that may be overwritten by reimport/rebuild")) {
+                    std::filesystem::path reportPath;
+                    std::string error;
+                    if (writeAssetOverwriteRiskReport(state, browserRoot_, record, overwriteRisks, reportPath, error)) {
+                        requests.openFilePath = reportPath;
+                        status_ = "Asset overwrite-risk report: " + reportPath.string();
+                    } else {
+                        status_ = "Asset overwrite-risk report failed: " + error;
+                    }
+                }
             }
             if (contentActionButton("ValidateSelectedAsset", EditorGlyphIcon::Details, "Validate Asset", "Write a validation report for this asset and open it")) {
                 std::filesystem::path reportPath;
@@ -3811,7 +4269,9 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             if (contentActionButton("RebuildPayload", EditorGlyphIcon::Refresh, "Rebuild Payload", "Queue a reimport to regenerate the missing cooked/runtime payload")) {
                 requests.reimportAsset = record.guid;
                 recordImportOperation("Rebuild Payload", resolvedSourcePath, {}, "Reimport", record.guid);
-                status_ = "Queued payload rebuild: " + record.displayName;
+                status_ = overwriteRisks.empty()
+                    ? "Queued payload rebuild: " + record.displayName
+                    : "Queued payload rebuild after overwrite warning: " + record.displayName;
             }
             if (!canRebuildPayload) {
                 ImGui::EndDisabled();
@@ -3827,7 +4287,9 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             if (contentActionButton("ReimportRecord", EditorGlyphIcon::Refresh, "Reimport", "Queue this asset for reimport")) {
                 requests.reimportAsset = record.guid;
                 recordImportOperation("Reimport Asset", resolvedSourcePath, {}, "Reimport", record.guid);
-                status_ = "Queued reimport: " + record.displayName;
+                status_ = overwriteRisks.empty()
+                    ? "Queued reimport: " + record.displayName
+                    : "Queued reimport after overwrite warning: " + record.displayName;
             }
             if (!canReimport) {
                 ImGui::EndDisabled();
