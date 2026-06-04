@@ -54,6 +54,14 @@ volk.vcxproj*
 *~
 .vscode/
 
+# Editor/runtime-local state
+/editor_preferences.json
+/rtv_editor.ini
+/rtv_editor/
+
+# Local documentation and research notes
+/docs/
+
 # CodeGraph runtime state
 .codegraph/
 

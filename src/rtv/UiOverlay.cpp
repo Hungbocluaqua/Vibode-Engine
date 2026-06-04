@@ -445,6 +445,7 @@ EditorRequests UiOverlay::build(
         const EditorRenderJobStatus* renderJob,
         const EditorPlacementStatus* placement,
         const EditorJobCenterState* jobCenter,
+        const std::vector<std::filesystem::path>* pendingDroppedFiles,
         float cpuFrameMs,
         NotificationManager* notifications,
         bool externalMouseCapture) {
@@ -499,6 +500,7 @@ EditorRequests UiOverlay::build(
         .renderJob = renderJob,
         .placement = placement,
         .jobCenter = jobCenter,
+        .pendingDroppedFiles = pendingDroppedFiles,
         .swapchainExtent = extent,
         .cpuFrameMs = cpuFrameMs,
         .viewport = EditorViewportState{

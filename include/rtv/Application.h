@@ -194,13 +194,20 @@ private:
     [[nodiscard]] bool writeDefaultProjectScene(const ProjectContext& project, std::string_view templateName);
     [[nodiscard]] std::optional<AssetImportWorkspace> prepareAssetImportWorkspace(const std::filesystem::path& sourcePath);
     [[nodiscard]] bool queueAssetImportNonMutating(const EditorImportAssetRequest& request, bool placeAfterImport);
-    [[nodiscard]] bool placePrefabAsset(const AssetGuid& prefabGuid);
+    [[nodiscard]] bool placePrefabAsset(const AssetGuid& prefabGuid, const std::optional<Transform>& placementTransform = std::nullopt);
+    [[nodiscard]] std::optional<uint32_t> loadedMeshIndexForRecord(const AssetRecord& record) const;
+    [[nodiscard]] bool placeMeshAsset(const EditorMeshAssetPlacement& request);
+    [[nodiscard]] bool assignMaterialAssetToEntity(const EditorMaterialAssetAssignment& request);
+    [[nodiscard]] bool assignEnvironmentPath(const std::filesystem::path& environmentPath, bool allowResourceRebuild, std::string_view undoLabel, std::string_view notificationLabel);
+    [[nodiscard]] bool assignEnvironmentAsset(const AssetGuid& environmentGuid, bool allowResourceRebuild);
     [[nodiscard]] bool relinkAssetSource(const EditorAssetRelinkSourceRequest& request);
     [[nodiscard]] bool replaceAssetReferences(const EditorReplaceAssetReferencesRequest& request, bool allowResourceRebuild);
     [[nodiscard]] bool updateAssetTags(const EditorAssetTagsRequest& request);
     [[nodiscard]] bool bulkAddAssetTag(const EditorBulkAssetTagRequest& request);
     [[nodiscard]] bool bulkRemoveAssetTag(const EditorBulkAssetTagRequest& request);
     [[nodiscard]] bool queueAssetReimport(const AssetGuid& assetGuid);
+    void queueMergeScenes(std::vector<std::filesystem::path> paths);
+    void startNextPendingMergeScene();
     void startNextAssetImportWorker();
     void pollAssetImportWorker();
     void waitForAssetImportWorker();
@@ -288,6 +295,7 @@ private:
     SceneEventBus sceneEventBus_;
     NotificationManager notifications_;
     EditorRenderJobStatus editorRenderJob_{};
+    std::vector<std::filesystem::path> pendingDroppedFiles_;
     float editorRenderJobElapsedSeconds_ = 0.0f;
     uint64_t nextEditorRenderJobSerial_ = 1;
     uint32_t editorRenderJobFramesRendered_ = 0;
@@ -324,6 +332,7 @@ private:
     std::vector<RetiredPathTracer> retiredPathTracers_;
     std::optional<RendererSettings> pendingPostFrameSettings_;
     AsyncSceneLoader asyncSceneLoader_;
+    std::deque<std::filesystem::path> pendingMergeScenes_;
     std::deque<AsyncAssetImportJob> pendingAssetImportJobs_;
     std::optional<ActiveAsyncAssetImportJob> activeAssetImportJob_;
     std::optional<SceneLoadRequest> activeSceneLoadRequest_;

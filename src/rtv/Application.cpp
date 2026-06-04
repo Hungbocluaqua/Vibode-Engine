@@ -1284,6 +1284,20 @@ bool appendCachedPrefabRuntimeAssets(
 
 std::filesystem::path resolveAssetRecordPath(const AssetRecord& record, const std::filesystem::path& root) {
     std::filesystem::path path = record.importedPath;
+    if (path.empty()) {
+        return path;
+    }
+    if (!path.is_absolute()) {
+        path = root / path;
+    }
+    return path;
+}
+
+std::filesystem::path resolveAssetCachePath(const AssetRecord& record, const std::filesystem::path& root) {
+    std::filesystem::path path = record.cachePath;
+    if (path.empty()) {
+        return path;
+    }
     if (!path.is_absolute()) {
         path = root / path;
     }
@@ -1292,6 +1306,9 @@ std::filesystem::path resolveAssetRecordPath(const AssetRecord& record, const st
 
 std::filesystem::path resolveAssetSourcePath(const AssetRecord& record, const std::filesystem::path& root) {
     std::filesystem::path path = record.sourcePath;
+    if (path.empty()) {
+        return path;
+    }
     if (!path.is_absolute()) {
         path = root / path;
     }
@@ -2234,6 +2251,7 @@ void Application::mainLoop(uint32_t maxFrames) {
         jobCenter.sceneLoadProgress = asyncSceneLoader_.progress();
         jobCenter.sceneLoadStatus = sceneLoadingStatus_;
         jobCenter.sceneLoadStage = asyncSceneLoader_.stage();
+        jobCenter.queuedSceneMerges = pendingMergeScenes_.size();
         if (activeSceneLoadRequest_.has_value()) {
             jobCenter.sceneLoadJobSerial = activeSceneLoadRequest_->serial;
             jobCenter.sceneLoadTitle = sceneLoadModeLabel(activeSceneLoadRequest_->mode);
@@ -2327,6 +2345,7 @@ void Application::mainLoop(uint32_t maxFrames) {
                 &editorRenderJob_,
                 &editorPlacement_,
                 &jobCenter,
+                &pendingDroppedFiles_,
                 rawDeltaSeconds * 1000.0f,
                 &notifications_,
                 sunDrag_.phase != SunDragPhase::Idle);
@@ -2787,49 +2806,9 @@ void Application::onFilesDropped(int count, const char** paths) {
         if (paths[i] == nullptr) {
             continue;
         }
-        std::filesystem::path path{paths[i]};
-        std::string extension = path.extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
-            return static_cast<char>(std::tolower(ch));
-        });
-        if (extension != ".hdr") {
-            if (extension == ".gltf" || extension == ".glb") {
-                if (!confirmDestructiveSceneAction("importing a scene as a new scene")) {
-                    std::cout << "Dropped scene import cancelled: " << path.string() << '\n';
-                    continue;
-                }
-                SceneLoadRequest request;
-                request.mode = SceneLoadMode::ImportSceneAsNewScene;
-                request.sourcePath = path;
-                (void)requestSceneLoad(std::move(request));
-            } else {
-                std::cout << "Dropped file ignored: " << path.string() << " (supported: .hdr, .gltf, .glb)\n";
-            }
-            continue;
-        }
-
-        try {
-            pathTracer_->loadEnvironment(path);
-            hdrPath_ = path;
-            sceneDocument_.setSourceHdrPath(hdrPath_);
-            if (Entity* environment = sceneDocument_.registry().entity(sceneDocument_.worldSettings().activeEnvironment);
-                environment != nullptr && environment->environmentLight.has_value()) {
-                environment->environmentLight->hdrPath = path;
-                environment->environmentLight->enabled = true;
-            }
-            applySceneWorldComponentsToDocumentSettings(sceneDocument_);
-            sceneDocument_.markDirty(SceneUpdateKind::RendererSettingsOnly);
-            RendererSettings settings = pathTracer_->settings();
-            settings.environmentEnabled = true;
-            applySceneWorldComponentsToRendererSettings(sceneDocument_, settings);
-            applyRendererSettingsSafely(settings, true);
-            notifications_.notify("HDR environment loaded", NotificationType::Success);
-            std::cout << "Loaded dropped HDR environment: " << path.string() << '\n';
-        } catch (const std::exception& error) {
-            notifications_.notify("HDR environment load failed", NotificationType::Error);
-            std::cerr << "Dropped HDR load failed: " << error.what() << '\n';
-        }
+        pendingDroppedFiles_.push_back(std::filesystem::path{paths[i]});
     }
+    notifications_.notify("File drop queued", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
 }
 
 void Application::serializeEditorSceneData() {
@@ -3119,6 +3098,7 @@ void Application::pollAsyncSceneLoad() {
         recordCompletedSceneLoadJob(result, false, true, sceneLoadingStatus_);
         notifications_.notify("Scene load cancelled", NotificationType::Warning);
         std::cout << sceneLoadingStatus_ << '\n';
+        startNextPendingMergeScene();
         return;
     }
     if (!result.success) {
@@ -3126,11 +3106,44 @@ void Application::pollAsyncSceneLoad() {
         recordCompletedSceneLoadJob(result, false, false, sceneLoadingStatus_, result.errorMessage, result.warningMessage);
         notifications_.notify(std::string(sceneLoadModeLabel(result.mode)) + " failed", NotificationType::Error);
         std::cerr << sceneLoadingStatus_ << '\n';
+        startNextPendingMergeScene();
         return;
     }
 
     sceneLoadingStatus_ = std::string(sceneLoadModeLabel(result.mode)) + " applying: " + result.sourcePath.string();
     (void)applySceneLoadResult(std::move(result));
+    startNextPendingMergeScene();
+}
+
+void Application::queueMergeScenes(std::vector<std::filesystem::path> paths) {
+    for (std::filesystem::path& path : paths) {
+        if (!path.empty()) {
+            pendingMergeScenes_.push_back(std::move(path));
+        }
+    }
+    if (pendingMergeScenes_.empty()) {
+        return;
+    }
+    notifications_.notify("Merge levels queued", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 4.0f);
+    startNextPendingMergeScene();
+}
+
+void Application::startNextPendingMergeScene() {
+    if (asyncSceneLoader_.isRunning() || pendingMergeScenes_.empty()) {
+        return;
+    }
+    SceneLoadRequest request;
+    request.mode = SceneLoadMode::MergeSceneIntoCurrent;
+    request.sourcePath = std::move(pendingMergeScenes_.front());
+    pendingMergeScenes_.pop_front();
+    if (project_.has_value()) {
+        request.projectSnapshot = *project_;
+    }
+    if (!requestSceneLoad(std::move(request))) {
+        if (!pendingMergeScenes_.empty()) {
+            notifications_.notify("Some queued level merges are still pending", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+        }
+    }
 }
 
 bool Application::applySceneLoadResult(SceneLoadResult&& result) {
@@ -3496,14 +3509,54 @@ std::optional<AssetRecord> Application::materialAssetRecordForMaterial(uint32_t 
 }
 
 std::optional<uint32_t> Application::loadedMaterialIndexForRecord(const AssetRecord& record) const {
-    if (!importedScene_.has_value() || record.type != AssetType::Material || record.sourceHash.empty() || record.importSettingsHash.empty()) {
+    if (record.type != AssetType::Material) {
         return std::nullopt;
     }
-    const auto& sceneMaterials = importedScene_->materials;
-    for (size_t i = 0; i < sceneMaterials.size(); ++i) {
-        const MaterialAssetHandle handle = sceneMaterials[i];
-        if (handle.valid() && importedAssetGuidFor(record.sourceHash, record.importSettingsHash, "Material", i) == record.guid) {
-            return handle.index;
+    if (importedScene_.has_value() && !record.sourceHash.empty() && !record.importSettingsHash.empty()) {
+        const auto& sceneMaterials = importedScene_->materials;
+        for (size_t i = 0; i < sceneMaterials.size(); ++i) {
+            const MaterialAssetHandle handle = sceneMaterials[i];
+            if (handle.valid() && importedAssetGuidFor(record.sourceHash, record.importSettingsHash, "Material", i) == record.guid) {
+                return handle.index;
+            }
+        }
+    }
+    for (const Entity* entity : sceneDocument_.registry().entities()) {
+        if (entity == nullptr || !entity->meshRenderer.has_value()) {
+            continue;
+        }
+        for (const MaterialSlot& slot : entity->meshRenderer->materialSlots) {
+            if (slot.materialGuid == record.guid && slot.material.valid()) {
+                return slot.material.index;
+            }
+            if (slot.overrideMaterialGuid.has_value() && *slot.overrideMaterialGuid == record.guid && slot.overrideMaterial.has_value()) {
+                return slot.overrideMaterial->index;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<uint32_t> Application::loadedMeshIndexForRecord(const AssetRecord& record) const {
+    if (record.type != AssetType::Mesh) {
+        return std::nullopt;
+    }
+    if (importedScene_.has_value() && !record.sourceHash.empty() && !record.importSettingsHash.empty()) {
+        const auto& sceneMeshes = importedScene_->meshes;
+        for (size_t i = 0; i < sceneMeshes.size(); ++i) {
+            const MeshAssetHandle handle = sceneMeshes[i];
+            if (handle.valid() && importedAssetGuidFor(record.sourceHash, record.importSettingsHash, "Mesh", i) == record.guid) {
+                return handle.index;
+            }
+        }
+    }
+    for (const Entity* entity : sceneDocument_.registry().entities()) {
+        if (entity == nullptr || !entity->meshRenderer.has_value()) {
+            continue;
+        }
+        const MeshRenderer& renderer = *entity->meshRenderer;
+        if (renderer.meshGuid == record.guid && renderer.mesh.valid()) {
+            return renderer.mesh.index;
         }
     }
     return std::nullopt;
@@ -4225,7 +4278,7 @@ bool Application::queueAssetImportNonMutating(const EditorImportAssetRequest& ed
     return true;
 }
 
-bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
+bool Application::placePrefabAsset(const AssetGuid& prefabGuid, const std::optional<Transform>& placementTransform) {
     const AssetRecord* prefabRecord = nullptr;
     for (const AssetRecord& record : assetRegistry_.records()) {
         if (record.guid == prefabGuid) {
@@ -4272,6 +4325,12 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
         notifications_.notify("Prefab placement failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
     }
+    if (placementTransform.has_value()) {
+        if (Entity* rootEntity = sceneDocument_.registry().entity(instance.instanceRoot)) {
+            rootEntity->transform = *placementTransform;
+            rootEntity->defaultTransform = *placementTransform;
+        }
+    }
     undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
         sceneDocument_,
         assets_,
@@ -4289,6 +4348,258 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid) {
     notifications_.notify("Prefab placed and selected", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
     std::cout << "Placed prefab asset: " << prefabGuid << " root=" << instance.instanceRoot.index << '\n';
     return true;
+}
+
+bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
+    const AssetRecord* meshRecord = nullptr;
+    for (const AssetRecord& record : assetRegistry_.records()) {
+        if (record.guid == request.meshGuid) {
+            meshRecord = &record;
+            break;
+        }
+    }
+    if (meshRecord == nullptr || meshRecord->type != AssetType::Mesh) {
+        notifications_.notify("Mesh asset not found", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+    const std::optional<uint32_t> meshIndex = loadedMeshIndexForRecord(*meshRecord);
+    if (!meshIndex.has_value()) {
+        notifications_.notify("Mesh is not loaded in the current scene", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+    const MeshAssetHandle meshHandle{*meshIndex};
+    if (assets_.mesh(meshHandle) == nullptr) {
+        notifications_.notify("Mesh runtime data is unavailable", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+
+    auto makeRenderer = [&]() {
+        MeshRenderer renderer;
+        renderer.mesh = meshHandle;
+        renderer.meshGuid = request.meshGuid;
+        ensureMaterialSlotsForRenderer(renderer, assets_);
+        for (MaterialSlot& slot : renderer.materialSlots) {
+            if (!slot.material.valid()) {
+                continue;
+            }
+            if (std::optional<AssetRecord> materialRecord = materialAssetRecordForMaterial(slot.material.index)) {
+                slot.materialGuid = materialRecord->guid;
+            }
+        }
+        return renderer;
+    };
+
+    const SceneDocument beforeDocument = sceneDocument_;
+    if (request.replaceEntity.valid()) {
+        Entity* target = sceneDocument_.registry().entity(request.replaceEntity);
+        if (target == nullptr || !target->meshRenderer.has_value()) {
+            notifications_.notify("Mesh replacement target is unavailable", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+            return false;
+        }
+        target->meshRenderer = makeRenderer();
+        sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+        sceneUnsavedDirty_ = true;
+        undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+            sceneDocument_,
+            beforeDocument,
+            sceneDocument_,
+            SceneUpdateKind::TopologyChanged,
+            "Replace Mesh Asset"));
+        editorPlacement_.entity = request.replaceEntity;
+        editorPlacement_.serial = nextEditorPlacementSerial_++;
+        editorPlacement_.label = target->name.empty() ? (meshRecord->displayName.empty() ? "Mesh Asset" : meshRecord->displayName) : target->name;
+        notifications_.notify("Mesh asset replaced", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+        return true;
+    }
+
+    SceneOperations ops(sceneDocument_, &sceneEventBus_);
+    ops.setUndoStack(nullptr);
+    const std::string entityName = meshRecord->displayName.empty() ? "Mesh Asset" : meshRecord->displayName;
+    const EntityId created = ops.createEntity(entityName, {}, SceneUpdateKind::TopologyChanged);
+    Entity* entity = sceneDocument_.registry().entity(created);
+    if (entity == nullptr) {
+        sceneDocument_ = beforeDocument;
+        notifications_.notify("Mesh placement failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+
+    entity->meshRenderer = makeRenderer();
+    if (request.placementTransform.has_value()) {
+        entity->transform = *request.placementTransform;
+    }
+    entity->defaultTransform = entity->transform;
+    sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+    sceneUnsavedDirty_ = true;
+    undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+        sceneDocument_,
+        beforeDocument,
+        sceneDocument_,
+        SceneUpdateKind::TopologyChanged,
+        "Place Mesh Asset"));
+    editorPlacement_.entity = created;
+    editorPlacement_.serial = nextEditorPlacementSerial_++;
+    editorPlacement_.label = entityName;
+    notifications_.notify("Mesh asset placed and selected", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+    return true;
+}
+
+bool Application::assignMaterialAssetToEntity(const EditorMaterialAssetAssignment& request) {
+    const AssetRecord* materialRecord = nullptr;
+    for (const AssetRecord& record : assetRegistry_.records()) {
+        if (record.guid == request.materialGuid) {
+            materialRecord = &record;
+            break;
+        }
+    }
+    if (materialRecord == nullptr || materialRecord->type != AssetType::Material) {
+        notifications_.notify("Material asset not found", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+    const std::optional<uint32_t> materialIndex = loadedMaterialIndexForRecord(*materialRecord);
+    if (!materialIndex.has_value()) {
+        notifications_.notify("Material is not loaded in the current scene", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+    Entity* entity = sceneDocument_.registry().entity(request.entity);
+    if (entity == nullptr || !entity->meshRenderer.has_value()) {
+        notifications_.notify("Drop material on a selected mesh entity", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+        return false;
+    }
+
+    const SceneDocument beforeDocument = sceneDocument_;
+    const AssetManager beforeAssets = assets_;
+    MeshRenderer& renderer = *entity->meshRenderer;
+    ensureMaterialSlotsForRenderer(renderer, assets_);
+    MeshAsset* mesh = assets_.mesh(renderer.mesh);
+    if (mesh == nullptr) {
+        notifications_.notify("Material target mesh is unavailable", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+        return false;
+    }
+    const MaterialAssetHandle material{*materialIndex};
+    bool assigned = false;
+    auto assignSlot = [&](MaterialSlot& slot, uint32_t slotIndex) {
+        if (material.index == slot.material.index || slot.materialGuid == request.materialGuid) {
+            slot.overrideMaterial.reset();
+            slot.overrideMaterialGuid.reset();
+        } else {
+            slot.overrideMaterial = material;
+            slot.overrideMaterialGuid = request.materialGuid;
+        }
+        if (slotIndex < mesh->primitives.size()) {
+            MeshPrimitiveAsset& primitive = mesh->primitives[slotIndex];
+            primitive.material = slot.resolvedMaterial();
+            updatePrimitiveAlphaClassification(primitive, assets_.material(primitive.material));
+        }
+        assigned = true;
+    };
+    if (request.primitiveIndex == UINT32_MAX) {
+        for (uint32_t i = 0; i < renderer.materialSlots.size(); ++i) {
+            assignSlot(renderer.materialSlots[i], i);
+        }
+    } else if (request.primitiveIndex < renderer.materialSlots.size()) {
+        assignSlot(renderer.materialSlots[request.primitiveIndex], request.primitiveIndex);
+    }
+
+    if (!assigned) {
+        notifications_.notify("Material slot is unavailable", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+        return false;
+    }
+
+    sceneDocument_.markDirty(SceneUpdateKind::MaterialOnly);
+    sceneUnsavedDirty_ = true;
+    undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+        sceneDocument_,
+        assets_,
+        beforeDocument,
+        beforeAssets,
+        sceneDocument_,
+        assets_,
+        SceneUpdateKind::MaterialOnly,
+        "Assign Material Asset"));
+    notifications_.notify("Material assigned to mesh", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 4.0f);
+    return true;
+}
+
+bool Application::assignEnvironmentPath(
+    const std::filesystem::path& environmentPath,
+    bool allowResourceRebuild,
+    std::string_view undoLabel,
+    std::string_view notificationLabel) {
+    std::error_code environmentPathError;
+    if (environmentPath.empty() || !std::filesystem::is_regular_file(environmentPath, environmentPathError)) {
+        notifications_.notify("Environment file is missing", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+
+    const SceneDocument beforeDocument = sceneDocument_;
+    EntityId environmentId = sceneDocument_.worldSettings().activeEnvironment;
+    Entity* environment = sceneDocument_.registry().entity(environmentId);
+    if (environment == nullptr) {
+        SceneOperations ops(sceneDocument_, &sceneEventBus_);
+        ops.setUndoStack(nullptr);
+        environmentId = ops.createEntity("Environment Light", {}, SceneUpdateKind::EnvironmentOnly);
+        environment = sceneDocument_.registry().entity(environmentId);
+    }
+    if (environment == nullptr) {
+        sceneDocument_ = beforeDocument;
+        notifications_.notify("Environment entity creation failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+    if (!environment->environmentLight.has_value()) {
+        environment->environmentLight = EnvironmentLight{};
+    }
+    environment->environmentLight->hdrPath = environmentPath;
+    environment->environmentLight->enabled = true;
+    sceneDocument_.worldSettings().activeEnvironment = environmentId;
+    sceneDocument_.setSourceHdrPath(environmentPath);
+    applySceneWorldComponentsToDocumentSettings(sceneDocument_);
+    sceneDocument_.markDirty(SceneUpdateKind::EnvironmentOnly);
+    sceneUnsavedDirty_ = true;
+
+    undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+        sceneDocument_,
+        beforeDocument,
+        sceneDocument_,
+        SceneUpdateKind::EnvironmentOnly,
+        std::string(undoLabel)));
+    (void)applyPendingSceneUpdate(allowResourceRebuild);
+    notifications_.notify(std::string(notificationLabel), NotificationType::Success, NotificationAction::OpenContent, "Open Content", 4.0f);
+    return true;
+}
+
+bool Application::assignEnvironmentAsset(const AssetGuid& environmentGuid, bool allowResourceRebuild) {
+    const AssetRecord* environmentRecord = nullptr;
+    for (const AssetRecord& record : assetRegistry_.records()) {
+        if (record.guid == environmentGuid) {
+            environmentRecord = &record;
+            break;
+        }
+    }
+    if (environmentRecord == nullptr || environmentRecord->type != AssetType::HDRI) {
+        notifications_.notify("Environment asset not found", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+
+    std::filesystem::path root = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
+    if (!project_.has_value() && assetRegistry_.state().path.has_parent_path()) {
+        root = assetRegistry_.state().path.parent_path();
+    }
+    auto existingPath = [](const std::filesystem::path& path) {
+        std::error_code ec;
+        return !path.empty() && std::filesystem::is_regular_file(path, ec);
+    };
+    std::filesystem::path environmentPath = resolveAssetSourcePath(*environmentRecord, root);
+    if (!existingPath(environmentPath)) {
+        environmentPath = resolveAssetCachePath(*environmentRecord, root);
+    }
+    if (!existingPath(environmentPath)) {
+        environmentPath = resolveAssetRecordPath(*environmentRecord, root);
+    }
+    if (!existingPath(environmentPath)) {
+        notifications_.notify("Environment source or payload is missing", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+    return assignEnvironmentPath(environmentPath, allowResourceRebuild, "Assign Environment Asset", "Environment asset assigned");
 }
 
 bool Application::relinkAssetSource(const EditorAssetRelinkSourceRequest& request) {
@@ -5053,6 +5364,17 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             uiOverlay_->editor().log().add(EditorLogCategory::Command, "Open folder: " + directoryPath.string());
         }
     }
+    if (requests.dismissAllDroppedFiles) {
+        pendingDroppedFiles_.clear();
+    } else if (requests.dismissDroppedFile.has_value()) {
+        const std::filesystem::path dismissed = *requests.dismissDroppedFile;
+        pendingDroppedFiles_.erase(
+            std::remove_if(
+                pendingDroppedFiles_.begin(),
+                pendingDroppedFiles_.end(),
+                [&](const std::filesystem::path& path) { return path == dismissed; }),
+            pendingDroppedFiles_.end());
+    }
     if (requests.openLogFolder) {
         std::filesystem::path logFolder = project_.has_value()
             ? project_->savedRoot / "Logs"
@@ -5220,20 +5542,13 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     }
 
     if (requests.loadHdr.has_value()) {
-        try {
-            pathTracer_->loadEnvironment(*requests.loadHdr);
-            hdrPath_ = *requests.loadHdr;
-            sceneUnsavedDirty_ = true;
-            EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
-            prefs.addRecentFile(*requests.loadHdr);
-            prefs.save(EditorPreferences::defaultPath());
-            sceneDocument_.setSourceHdrPath(hdrPath_);
-            RendererSettings settings = pathTracer_->settings();
-            settings.environmentEnabled = true;
-            applyRendererSettingsSafely(settings, true);
-            std::cout << "Loaded HDR from editor: " << requests.loadHdr->string() << '\n';
-        } catch (const std::exception& error) {
-            std::cerr << "Editor HDR load failed: " << error.what() << '\n';
+        if (assignEnvironmentPath(*requests.loadHdr, allowResourceRebuild, "Assign Environment", "Environment assigned")) {
+            if (uiOverlay_ != nullptr) {
+                EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+                prefs.addRecentFile(*requests.loadHdr);
+                prefs.save(EditorPreferences::defaultPath());
+            }
+            std::cout << "Assigned HDR environment from editor: " << requests.loadHdr->string() << '\n';
         }
     }
 
@@ -5399,7 +5714,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             assigned = true;
         }
         if (assigned) {
-            sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+            sceneDocument_.markDirty(SceneUpdateKind::MaterialOnly);
             sceneUnsavedDirty_ = true;
             undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
                 sceneDocument_,
@@ -5408,9 +5723,21 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 beforeAssets,
                 sceneDocument_,
                 assets_,
-                SceneUpdateKind::TopologyChanged,
+                SceneUpdateKind::MaterialOnly,
                 "Assign Material"));
         }
+    }
+
+    if (requests.materialAssetAssignment.has_value()) {
+        (void)assignMaterialAssetToEntity(*requests.materialAssetAssignment);
+    }
+
+    if (requests.meshAssetPlacement.has_value()) {
+        (void)placeMeshAsset(*requests.meshAssetPlacement);
+    }
+
+    if (requests.environmentAssetAssignment.has_value()) {
+        (void)assignEnvironmentAsset(*requests.environmentAssetAssignment, allowResourceRebuild);
     }
 
     SceneOperations sceneOps(sceneDocument_, &sceneEventBus_);
@@ -5859,8 +6186,19 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         }
     }
 
+    for (const EditorImportAssetRequest& importRequest : requests.importAssets) {
+        (void)queueAssetImportNonMutating(importRequest, false);
+    }
+
     if (requests.importAsset.has_value()) {
         (void)queueAssetImportNonMutating(*requests.importAsset, false);
+    }
+
+    for (EditorImportAssetRequest importRequest : requests.importAndPlaceAssets) {
+        if (importRequest.mode.empty()) {
+            importRequest.mode = "ImportAndPlace";
+        }
+        (void)queueAssetImportNonMutating(importRequest, true);
     }
 
     if (requests.importAndPlace.has_value()) {
@@ -5896,7 +6234,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     }
 
     if (requests.placeAsset.has_value()) {
-        (void)placePrefabAsset(*requests.placeAsset);
+        (void)placePrefabAsset(*requests.placeAsset, requests.placeAssetTransform);
     }
 
     if (requests.mergeScene.has_value()) {
@@ -5907,6 +6245,10 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             request.projectSnapshot = *project_;
         }
         (void)requestSceneLoad(std::move(request));
+    }
+
+    if (!requests.mergeScenes.empty()) {
+        queueMergeScenes(requests.mergeScenes);
     }
 
     if (requests.exit && window_ != nullptr && confirmDestructiveSceneAction("exiting")) {
@@ -6208,11 +6550,34 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::UpdateMaterials)) {
         syncBuiltScene();
         if (!pathTracer_->updateMaterials(*gpuSceneAsset_, assets_)) {
-            pathTracer_->resetAccumulation(route.resetReason);
+            if (!allowResourceRebuild) {
+                return false;
+            }
+            rebuildRenderer();
+            return completeAfterRebuild();
         }
     }
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::UpdateEnvironment)) {
         syncBuiltScene();
+        std::filesystem::path environmentPath = sceneDocument_.environment().hdrPath;
+        if (environmentPath.empty() && sceneDocument_.sourceHdrPath().has_value()) {
+            environmentPath = *sceneDocument_.sourceHdrPath();
+        }
+        if (!environmentPath.empty() && !environmentPath.is_absolute()) {
+            environmentPath = project_.has_value() ? project_->projectRoot / environmentPath : std::filesystem::current_path() / environmentPath;
+        }
+        std::error_code environmentPathError;
+        if (!environmentPath.empty() &&
+            std::filesystem::is_regular_file(environmentPath, environmentPathError) &&
+            (!hdrPath_.has_value() || *hdrPath_ != environmentPath)) {
+            try {
+                pathTracer_->loadEnvironment(environmentPath);
+                hdrPath_ = environmentPath;
+            } catch (const std::exception& error) {
+                std::cerr << "Environment update load failed: " << environmentPath.string() << " " << error.what() << '\n';
+            }
+        }
+        applyRendererSettingsSafely(rendererSettingsFromDocument(sceneDocument_, pathTracer_->settings()), allowResourceRebuild);
         if (route.resetsAccumulation) {
             pathTracer_->resetAccumulation(route.resetReason);
         }

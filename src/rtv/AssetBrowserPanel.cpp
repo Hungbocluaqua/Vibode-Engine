@@ -661,6 +661,21 @@ void drawContentGlyph(const std::filesystem::path& path, ImVec2 min, ImVec2 max)
     editorDrawIconGlyph(editorGlyphForPath(path), min, max, contentIconColor(path));
 }
 
+void setPathDragDropPayload(const char* payloadType, const std::filesystem::path& path, const char* labelPrefix) {
+    const std::string payload = path.string();
+    ImGui::SetDragDropPayload(payloadType, payload.c_str(), payload.size() + 1);
+    ImGui::Text("%s %s", labelPrefix, path.filename().string().c_str());
+}
+
+bool drawLevelPathDragDropSource(const std::filesystem::path& path) {
+    if (!isSceneAssetPath(path) || !ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+        return false;
+    }
+    setPathDragDropPayload("LEVEL_PATH", path, "Level");
+    ImGui::EndDragDropSource();
+    return true;
+}
+
 bool contentActionButton(const char* id, EditorGlyphIcon icon, const char* label, const char* tooltip) {
     const bool clicked = editorIconTextButton(id, icon, label);
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort) && tooltip != nullptr && tooltip[0] != '\0') {
@@ -3018,6 +3033,7 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
                 selectedPath_ = path;
                 selectedRecordGuid_.clear();
             }
+            (void)drawLevelPathDragDropSource(path);
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                 if (entry.is_directory(ec)) {
                     navigateTo(path);
@@ -3068,6 +3084,7 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
                 }
             }
             editorPopRowSelectionStyle();
+            (void)drawLevelPathDragDropSource(path);
             const ImVec2 itemMax = ImGui::GetItemRectMax();
             const float iconY = nameCursor.y + std::max(0.0f, (itemMax.y - nameCursor.y - 16.0f) * 0.5f);
             drawContentGlyph(path, ImVec2(nameCursor.x + 2.0f, iconY), ImVec2(nameCursor.x + 18.0f, iconY + 16.0f));
@@ -3474,11 +3491,29 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                 selectedPath_.clear();
             }
             editorPopRowSelectionStyle();
-            if (record.type == AssetType::Prefab && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
-                std::array<char, 128> guidPayload{};
-                record.guid.copy(guidPayload.data(), std::min(record.guid.size(), guidPayload.size() - 1));
-                ImGui::SetDragDropPayload("PREFAB_ASSET", guidPayload.data(), guidPayload.size());
-                ImGui::Text("Prefab %s", name);
+            if ((record.type == AssetType::Prefab || record.type == AssetType::Mesh || record.type == AssetType::Material || record.type == AssetType::HDRI || record.type == AssetType::Scene) &&
+                ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                if (record.type == AssetType::Scene) {
+                    const std::filesystem::path levelPath = firstResolvedExistingRecordPath(state, {record.sourcePath, record.importedPath, record.cachePath});
+                    if (!levelPath.empty()) {
+                        setPathDragDropPayload("LEVEL_PATH", levelPath, "Level");
+                    } else {
+                        ImGui::TextDisabled("Level path unavailable");
+                    }
+                } else {
+                    std::array<char, 128> guidPayload{};
+                    record.guid.copy(guidPayload.data(), std::min(record.guid.size(), guidPayload.size() - 1));
+                    const char* payloadType = "ENVIRONMENT_ASSET";
+                    if (record.type == AssetType::Prefab) {
+                        payloadType = "PREFAB_ASSET";
+                    } else if (record.type == AssetType::Mesh) {
+                        payloadType = "MESH_ASSET";
+                    } else if (record.type == AssetType::Material) {
+                        payloadType = "MATERIAL_ASSET";
+                    }
+                    ImGui::SetDragDropPayload(payloadType, guidPayload.data(), guidPayload.size());
+                    ImGui::Text("%s %s", assetTypeName(record.type), name);
+                }
                 ImGui::EndDragDropSource();
             }
             if (ImGui::BeginPopupContextItem()) {

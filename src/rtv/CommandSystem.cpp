@@ -391,7 +391,7 @@ void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool
         wait.value = asyncHistoryCompleteValue_;
         wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     }
-    if (!headless_) {
+    if (!headless_ && !asyncComputeRecorded) {
         VkSemaphoreSubmitInfo& wait = graphicsWaits[graphicsWaitCount++];
         wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
         wait.semaphore = frame.imageAvailable;
@@ -460,11 +460,19 @@ void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool
     computeSubmit.pSignalSemaphoreInfos = &computeSignal;
     checkVk(vkQueueSubmit2(context_.computeQueue(), 1, &computeSubmit, VK_NULL_HANDLE), "vkQueueSubmit2(compute)");
 
-    VkSemaphoreSubmitInfo postWait{};
-    postWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    postWait.semaphore = context_.timelineSemaphore();
-    postWait.value = computeTimelineValue;
-    postWait.stageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    std::array<VkSemaphoreSubmitInfo, 2> postWaits{};
+    uint32_t postWaitCount = 0;
+    VkSemaphoreSubmitInfo& computeCompleteWait = postWaits[postWaitCount++];
+    computeCompleteWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    computeCompleteWait.semaphore = context_.timelineSemaphore();
+    computeCompleteWait.value = computeTimelineValue;
+    computeCompleteWait.stageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    if (!headless_) {
+        VkSemaphoreSubmitInfo& imageAvailableWait = postWaits[postWaitCount++];
+        imageAvailableWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+        imageAvailableWait.semaphore = frame.imageAvailable;
+        imageAvailableWait.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    }
 
     VkSemaphoreSubmitInfo postSignal{};
     postSignal.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -473,8 +481,8 @@ void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool
 
     VkSubmitInfo2 postSubmit{};
     postSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-    postSubmit.waitSemaphoreInfoCount = 1;
-    postSubmit.pWaitSemaphoreInfos = &postWait;
+    postSubmit.waitSemaphoreInfoCount = postWaitCount;
+    postSubmit.pWaitSemaphoreInfos = postWaits.data();
     postSubmit.commandBufferInfoCount = 1;
     postSubmit.pCommandBufferInfos = &postCommand;
     postSubmit.signalSemaphoreInfoCount = !headless_ ? 1u : 0u;

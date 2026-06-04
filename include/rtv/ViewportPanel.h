@@ -6,6 +6,8 @@
 #include <glm/mat4x4.hpp>
 
 #include <array>
+#include <filesystem>
+#include <string>
 
 namespace rtv {
 
@@ -53,6 +55,12 @@ private:
     bool rightMouseContextCandidate_ = false;
     bool rightMouseContextSuppressed_ = false;
     float rightMouseContextHoldSeconds_ = 0.0f;
+    bool levelDropPopupOpen_ = false;
+    std::filesystem::path pendingLevelDropPath_;
+    std::string pendingLevelDropLabel_;
+    bool materialDropPopupOpen_ = false;
+    AssetGuid pendingMaterialDropGuid_;
+    EntityId pendingMaterialDropEntity_{};
     GizmoInteractionState gizmoState_ = GizmoInteractionState::Idle;
 
     bool gizmoDragActive_ = false;

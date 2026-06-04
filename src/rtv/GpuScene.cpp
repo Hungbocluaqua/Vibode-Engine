@@ -1807,7 +1807,47 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
     if (byteSize == 0 || byteSize > materials_->size()) {
         return false;
     }
+
+    std::unordered_map<uint32_t, uint32_t> materialIndexForAsset;
+    materialIndexForAsset.reserve(importedScene.materials.size());
+    for (uint32_t i = 0; i < importedScene.materials.size(); ++i) {
+        materialIndexForAsset.emplace(importedScene.materials[i].index, i);
+    }
+
+    uint32_t primitiveCursor = 0;
+    for (MeshAssetHandle meshHandle : importedScene.meshes) {
+        const MeshAsset* mesh = assets.mesh(meshHandle);
+        if (mesh == nullptr) {
+            return false;
+        }
+        for (const MeshPrimitiveAsset& primitive : mesh->primitives) {
+            if (primitiveCursor >= primitiveRecordCpu_.size()) {
+                return false;
+            }
+            const auto materialIt = materialIndexForAsset.find(primitive.material.index);
+            const uint32_t materialIndex = materialIt != materialIndexForAsset.end() ? materialIt->second : 0u;
+            const MaterialAsset* material = assets.material(primitive.material);
+            const uint32_t alphaClass = primitiveAlphaClassForMaterial(material);
+            const bool opaqueTraversalSafe = material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u;
+            const GpuPrimitiveRecord& current = primitiveRecordCpu_[primitiveCursor];
+            if (current.indexData.w != materialIndex ||
+                current.metadata.z != alphaClass ||
+                current.metadata.w != (opaqueTraversalSafe ? 1u : 0u)) {
+                return false;
+            }
+            ++primitiveCursor;
+        }
+    }
+    if (primitiveCursor != primitiveRecordCpu_.size()) {
+        return false;
+    }
+
     uploader.uploadToBuffer(*materials_, materialData.data(), byteSize);
+    meshParams_.materialCount = static_cast<uint32_t>(materialData.size() / materialVec4Stride);
+    if (meshParamsBuffer_ != nullptr) {
+        meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
+        meshParamsBuffer_->flush(sizeof(meshParams_));
+    }
 
     materialEmissiveCpu_ = extractMaterialEmissive(materialData);
     float emissiveTotalWeight = 0.0f;

@@ -99,6 +99,7 @@ struct EditorJobCenterState {
     std::string sceneLoadTitle;
     std::filesystem::path sceneLoadSourcePath;
     std::string sceneLoadStage;
+    size_t queuedSceneMerges = 0;
     uint64_t completedSceneLoadSerial = 0;
     bool completedSceneLoadSuccess = false;
     bool completedSceneLoadCancelled = false;
@@ -193,6 +194,7 @@ struct EditorRuntimeState {
     const EditorRenderJobStatus* renderJob = nullptr;
     const EditorPlacementStatus* placement = nullptr;
     const EditorJobCenterState* jobCenter = nullptr;
+    const std::vector<std::filesystem::path>* pendingDroppedFiles = nullptr;
     VkExtent2D swapchainExtent{};
     float cpuFrameMs = 0.0f;
     EditorViewportState viewport{};
@@ -220,6 +222,18 @@ struct EditorMaterialAssignment {
     MeshAssetHandle mesh{};
     uint32_t primitiveIndex = UINT32_MAX;
     MaterialAssetHandle material{};
+};
+
+struct EditorMaterialAssetAssignment {
+    AssetGuid materialGuid;
+    EntityId entity{};
+    uint32_t primitiveIndex = UINT32_MAX;
+};
+
+struct EditorMeshAssetPlacement {
+    AssetGuid meshGuid;
+    std::optional<Transform> placementTransform;
+    EntityId replaceEntity{};
 };
 
 struct EditorEntityBoolChange {
@@ -353,7 +367,9 @@ struct EditorRequests {
     std::optional<std::filesystem::path> saveScene;
     std::optional<std::filesystem::path> saveSceneAs;
     std::optional<EditorImportAssetRequest> importAsset;
+    std::vector<EditorImportAssetRequest> importAssets;
     std::optional<EditorImportAssetRequest> importAndPlace;
+    std::vector<EditorImportAssetRequest> importAndPlaceAssets;
     std::optional<AssetGuid> reimportAsset;
     std::optional<EditorAssetRelinkSourceRequest> relinkAssetSource;
     std::optional<EditorReplaceAssetReferencesRequest> replaceAssetReferences;
@@ -361,8 +377,10 @@ struct EditorRequests {
     std::optional<EditorBulkAssetTagRequest> bulkAddAssetTag;
     std::optional<EditorBulkAssetTagRequest> bulkRemoveAssetTag;
     std::optional<AssetGuid> placeAsset;
+    std::optional<Transform> placeAssetTransform;
     std::optional<std::filesystem::path> importSceneAsNewScene;
     std::optional<std::filesystem::path> mergeScene;
+    std::vector<std::filesystem::path> mergeScenes;
     std::optional<CreateProjectRequest> createProject;
     std::optional<OpenProjectRequest> openProject;
     std::optional<ProjectContext> projectSettingsUpdate;
@@ -372,6 +390,11 @@ struct EditorRequests {
     std::optional<std::filesystem::path> loadSceneJson;
     std::optional<EditorMaterialUpdate> materialUpdate;
     std::optional<EditorMaterialAssignment> materialAssignment;
+    std::optional<EditorMaterialAssetAssignment> materialAssetAssignment;
+    std::optional<EditorMeshAssetPlacement> meshAssetPlacement;
+    std::optional<AssetGuid> environmentAssetAssignment;
+    std::optional<std::filesystem::path> dismissDroppedFile;
+    bool dismissAllDroppedFiles = false;
     std::optional<SceneUpdateKind> sceneUpdate;
     std::optional<float> cameraMoveSpeed;
     std::optional<EntityId> duplicateEntity;
@@ -424,6 +447,7 @@ struct EditorRequests {
     bool saveProjectSettings = false;
     bool showProjectManager = false;
     bool showProjectSettings = false;
+    bool showInspector = false;
     bool showMaterialEditor = false;
     bool closeMaterialEditor = false;
     bool showControls = false;

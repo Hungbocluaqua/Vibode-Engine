@@ -836,8 +836,8 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                                         .primitiveIndex = static_cast<uint32_t>(i),
                                         .material = candidate,
                                     };
-                                    document.markDirty(SceneUpdateKind::TopologyChanged);
-                                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                                    document.markDirty(SceneUpdateKind::MaterialOnly);
+                                    requests.sceneUpdate = SceneUpdateKind::MaterialOnly;
                                 }
                                 if (selected) {
                                     ImGui::SetItemDefaultFocus();

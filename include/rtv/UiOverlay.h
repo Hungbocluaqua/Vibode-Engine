@@ -69,6 +69,7 @@ public:
         const EditorRenderJobStatus* renderJob,
         const EditorPlacementStatus* placement,
         const EditorJobCenterState* jobCenter,
+        const std::vector<std::filesystem::path>* pendingDroppedFiles,
         float cpuFrameMs,
         NotificationManager* notifications,
         bool externalMouseCapture = false);

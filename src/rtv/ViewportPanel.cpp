@@ -11,6 +11,7 @@
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
 #include <imgui.h>
@@ -22,6 +23,7 @@
 #include <cstdio>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -30,6 +32,226 @@
 namespace rtv {
 
 namespace {
+
+std::string payloadString(const ImGuiPayload& payload) {
+    if (payload.Data == nullptr || payload.DataSize <= 0) {
+        return {};
+    }
+    std::string value(static_cast<const char*>(payload.Data), static_cast<size_t>(payload.DataSize));
+    while (!value.empty() && value.back() == '\0') {
+        value.pop_back();
+    }
+    return value;
+}
+
+const AssetRecord* assetRecordForGuid(const AssetRegistry* registry, const AssetGuid& guid) {
+    if (registry == nullptr || guid.empty()) {
+        return nullptr;
+    }
+    for (const AssetRecord& record : registry->records()) {
+        if (record.guid == guid) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+std::string assetLabelForGuid(const EditorRuntimeState& state, const AssetGuid& guid) {
+    if (const AssetRecord* record = assetRecordForGuid(state.assetRegistry, guid)) {
+        if (!record->displayName.empty()) {
+            return record->displayName;
+        }
+    }
+    return guid.empty() ? std::string{"Asset"} : guid;
+}
+
+struct ViewportDropPreview {
+    bool active = false;
+    bool placement = false;
+    std::string title;
+    std::string detail;
+};
+
+struct ViewportSceneRayHit {
+    glm::vec3 position{};
+    glm::vec3 normal{0.0f, 1.0f, 0.0f};
+    EntityId entity{};
+    uint32_t primitiveIndex = UINT32_MAX;
+};
+
+float activeCameraFov(const SceneDocument& document);
+glm::mat4 editorViewMatrix(const CameraController& camera);
+glm::mat4 editorProjectionMatrix(float fovY, float aspect);
+float viewportAspect(const EditorRuntimeState& state);
+std::optional<ImVec2> projectViewToScreen(
+    const EditorRuntimeState& state,
+    const glm::mat4& projection,
+    glm::vec3 viewPoint,
+    float nearPlane);
+bool screenPointInsideViewport(const EditorRuntimeState& state, ImVec2 point, float padding);
+std::optional<ViewportSceneRayHit> viewportSceneRaycastUnderCursor(const EditorRuntimeState& state);
+std::optional<Transform> viewportDropPlacementTransform(
+    const EditorRuntimeState& state,
+    bool snapEnabled,
+    float translationSnap,
+    bool forceGrid,
+    bool surfaceAlign);
+
+ViewportDropPreview viewportDropPreviewFromPayload(const EditorRuntimeState& state, const ImGuiPayload& payload) {
+    const std::string value = payloadString(payload);
+    ViewportDropPreview preview;
+    if (payload.IsDataType("PREFAB_ASSET")) {
+        preview.active = !value.empty();
+        preview.placement = true;
+        preview.title = "Place Prefab";
+        preview.detail = assetLabelForGuid(state, value);
+    } else if (payload.IsDataType("MESH_ASSET")) {
+        preview.active = !value.empty();
+        preview.placement = true;
+        preview.title = ImGui::GetIO().KeyShift ? "Replace Mesh" : "Place Mesh";
+        preview.detail = assetLabelForGuid(state, value);
+    } else if (payload.IsDataType("MATERIAL_ASSET")) {
+        preview.active = !value.empty();
+        preview.title = "Assign Material";
+        preview.detail = assetLabelForGuid(state, value);
+    } else if (payload.IsDataType("ENVIRONMENT_ASSET")) {
+        preview.active = !value.empty();
+        preview.title = "Assign Environment";
+        preview.detail = assetLabelForGuid(state, value);
+    } else if (payload.IsDataType("LEVEL_PATH")) {
+        const std::filesystem::path path(value);
+        preview.active = !value.empty();
+        preview.title = "Level Action";
+        preview.detail = path.filename().empty() ? value : path.filename().string();
+    }
+    return preview;
+}
+
+std::optional<ImVec2> projectWorldToScreen(
+    const EditorRuntimeState& state,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    const glm::vec3& worldPoint) {
+    constexpr float nearPlane = 0.01f;
+    return projectViewToScreen(state, projection, glm::vec3(view * glm::vec4(worldPoint, 1.0f)), nearPlane);
+}
+
+void drawViewportDropPlacementFootprint(
+    const EditorRuntimeState& state,
+    const Transform& transform,
+    bool forceGrid,
+    bool surfaceAlign) {
+    if (state.camera == nullptr || state.sceneDocument == nullptr) {
+        return;
+    }
+
+    const glm::mat4 view = editorViewMatrix(*state.camera);
+    const glm::mat4 projection = editorProjectionMatrix(activeCameraFov(*state.sceneDocument), viewportAspect(state));
+    const glm::mat4 world = transform.localMatrix();
+    constexpr float halfExtent = 0.55f;
+    const std::array<glm::vec3, 4> localCorners = {
+        glm::vec3{-halfExtent, 0.0f, -halfExtent},
+        glm::vec3{ halfExtent, 0.0f, -halfExtent},
+        glm::vec3{ halfExtent, 0.0f,  halfExtent},
+        glm::vec3{-halfExtent, 0.0f,  halfExtent},
+    };
+
+    std::array<ImVec2, 4> screenCorners{};
+    for (size_t i = 0; i < localCorners.size(); ++i) {
+        const glm::vec3 worldCorner = glm::vec3(world * glm::vec4(localCorners[i], 1.0f));
+        const std::optional<ImVec2> screen = projectWorldToScreen(state, view, projection, worldCorner);
+        if (!screen.has_value() || !screenPointInsideViewport(state, *screen, 40.0f)) {
+            return;
+        }
+        screenCorners[i] = *screen;
+    }
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImU32 footprintColor = forceGrid
+        ? IM_COL32(115, 175, 255, 210)
+        : (surfaceAlign ? IM_COL32(125, 225, 155, 220) : IM_COL32(110, 205, 190, 220));
+    for (size_t i = 0; i < screenCorners.size(); ++i) {
+        drawList->AddLine(screenCorners[i], screenCorners[(i + 1) % screenCorners.size()], footprintColor, 2.0f);
+    }
+    drawList->AddLine(screenCorners[0], screenCorners[2], IM_COL32(110, 205, 190, 90), 1.0f);
+    drawList->AddLine(screenCorners[1], screenCorners[3], IM_COL32(110, 205, 190, 90), 1.0f);
+
+    if (const std::optional<ImVec2> center = projectWorldToScreen(state, view, projection, transform.position)) {
+        drawList->AddCircleFilled(*center, 3.0f, footprintColor, 16);
+    }
+
+    if (!forceGrid) {
+        const std::optional<ViewportSceneRayHit> hit = viewportSceneRaycastUnderCursor(state);
+        if (hit.has_value()) {
+            const glm::vec3 normalEnd = hit->position + hit->normal * 0.65f;
+            const std::optional<ImVec2> start = projectWorldToScreen(state, view, projection, hit->position);
+            const std::optional<ImVec2> end = projectWorldToScreen(state, view, projection, normalEnd);
+            if (start.has_value() && end.has_value()) {
+                drawList->AddLine(*start, *end, IM_COL32(135, 235, 165, 230), 2.0f);
+                drawList->AddCircleFilled(*end, 3.5f, IM_COL32(135, 235, 165, 230), 16);
+            }
+        }
+    }
+}
+
+void drawViewportDropPreview(const EditorRuntimeState& state, bool snapEnabled, float translationSnap) {
+    const ImGuiPayload* payload = ImGui::GetDragDropPayload();
+    if (payload == nullptr) {
+        return;
+    }
+    const ViewportDropPreview preview = viewportDropPreviewFromPayload(state, *payload);
+    if (!preview.active) {
+        return;
+    }
+
+    std::ostringstream label;
+    label << preview.title;
+    if (!preview.detail.empty()) {
+        label << "  " << preview.detail;
+    }
+    bool forceGrid = false;
+    bool surfaceAlign = false;
+    if (preview.placement) {
+        forceGrid = ImGui::GetIO().KeyCtrl;
+        surfaceAlign = ImGui::GetIO().KeyAlt && !forceGrid;
+        if (forceGrid) {
+            label << "  Grid";
+        } else if (surfaceAlign) {
+            label << "  Align";
+        }
+        label << (snapEnabled ? "  Snap " : "  Free");
+        if (snapEnabled) {
+            label << std::fixed << std::setprecision(2) << translationSnap;
+        }
+    }
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 cursor(state.viewport.mousePosition.x, state.viewport.mousePosition.y);
+    constexpr float markerSize = 11.0f;
+    const ImU32 markerColor = IM_COL32(110, 205, 190, 255);
+    drawList->AddCircle(cursor, markerSize, markerColor, 24, 2.0f);
+    drawList->AddLine(ImVec2(cursor.x - markerSize - 4.0f, cursor.y), ImVec2(cursor.x + markerSize + 4.0f, cursor.y), markerColor, 2.0f);
+    drawList->AddLine(ImVec2(cursor.x, cursor.y - markerSize - 4.0f), ImVec2(cursor.x, cursor.y + markerSize + 4.0f), markerColor, 2.0f);
+
+    if (preview.placement) {
+        if (const std::optional<Transform> transform = viewportDropPlacementTransform(state, snapEnabled, translationSnap, forceGrid, surfaceAlign)) {
+            drawViewportDropPlacementFootprint(state, *transform, forceGrid, surfaceAlign);
+        }
+    }
+
+    const std::string text = label.str();
+    const ImVec2 textSize = ImGui::CalcTextSize(text.c_str());
+    ImVec2 textMin(cursor.x + 16.0f, cursor.y + 14.0f);
+    const float maxX = state.viewport.imageOrigin.x + state.viewport.imageSize.x - textSize.x - 18.0f;
+    const float maxY = state.viewport.imageOrigin.y + state.viewport.imageSize.y - textSize.y - 14.0f;
+    textMin.x = std::clamp(textMin.x, state.viewport.imageOrigin.x + 8.0f, std::max(state.viewport.imageOrigin.x + 8.0f, maxX));
+    textMin.y = std::clamp(textMin.y, state.viewport.imageOrigin.y + 8.0f, std::max(state.viewport.imageOrigin.y + 8.0f, maxY));
+    const ImVec2 rectMin(textMin.x - 8.0f, textMin.y - 5.0f);
+    const ImVec2 rectMax(textMin.x + textSize.x + 8.0f, textMin.y + textSize.y + 5.0f);
+    drawList->AddRectFilled(rectMin, rectMax, IM_COL32(12, 16, 21, 230), 4.0f);
+    drawList->AddRect(rectMin, rectMax, IM_COL32(75, 95, 110, 220), 4.0f);
+    drawList->AddText(textMin, IM_COL32(232, 238, 244, 255), text.c_str());
+}
 
 glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity) {
     if (!entity.parent.valid()) {
@@ -206,6 +428,220 @@ bool screenPointInsideViewport(const EditorRuntimeState& state, ImVec2 point, fl
         point.y >= state.viewport.imageOrigin.y - padding &&
         point.x <= state.viewport.imageOrigin.x + state.viewport.imageSize.x + padding &&
         point.y <= state.viewport.imageOrigin.y + state.viewport.imageSize.y + padding;
+}
+
+bool rayTriangleIntersection(
+    const glm::vec3& origin,
+    const glm::vec3& direction,
+    const glm::vec3& a,
+    const glm::vec3& b,
+    const glm::vec3& c,
+    float& t) {
+    constexpr float epsilon = 0.000001f;
+    const glm::vec3 edge1 = b - a;
+    const glm::vec3 edge2 = c - a;
+    const glm::vec3 p = glm::cross(direction, edge2);
+    const float det = glm::dot(edge1, p);
+    if (std::abs(det) <= epsilon) {
+        return false;
+    }
+    const float invDet = 1.0f / det;
+    const glm::vec3 s = origin - a;
+    const float u = invDet * glm::dot(s, p);
+    if (u < 0.0f || u > 1.0f) {
+        return false;
+    }
+    const glm::vec3 q = glm::cross(s, edge1);
+    const float v = invDet * glm::dot(direction, q);
+    if (v < 0.0f || u + v > 1.0f) {
+        return false;
+    }
+    t = invDet * glm::dot(edge2, q);
+    return t > epsilon && std::isfinite(t);
+}
+
+glm::vec3 triangleNormalFacingRay(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c, const glm::vec3& rayDir) {
+    glm::vec3 normal = glm::cross(b - a, c - a);
+    const float len2 = glm::dot(normal, normal);
+    if (len2 <= 0.0000000001f || !std::isfinite(len2)) {
+        return {0.0f, 1.0f, 0.0f};
+    }
+    normal /= std::sqrt(len2);
+    return glm::dot(normal, rayDir) > 0.0f ? -normal : normal;
+}
+
+glm::vec3 rotationEulerAligningUpToNormal(glm::vec3 normal) {
+    const float len2 = glm::dot(normal, normal);
+    if (len2 <= 0.0000000001f || !std::isfinite(len2)) {
+        return glm::vec3(0.0f);
+    }
+    normal /= std::sqrt(len2);
+
+    constexpr float pi = 3.14159265358979323846f;
+    const glm::vec3 up{0.0f, 1.0f, 0.0f};
+    const float c = std::clamp(glm::dot(up, normal), -1.0f, 1.0f);
+    if (c > 0.9999f) {
+        return glm::vec3(0.0f);
+    }
+    if (c < -0.9999f) {
+        return glm::eulerAngles(glm::angleAxis(pi, glm::vec3{1.0f, 0.0f, 0.0f}));
+    }
+    const glm::vec3 axis = glm::normalize(glm::cross(up, normal));
+    return glm::eulerAngles(glm::normalize(glm::angleAxis(std::acos(c), axis)));
+}
+
+std::optional<ViewportSceneRayHit> viewportSceneRaycast(
+    const EditorRuntimeState& state,
+    const glm::vec3& origin,
+    const glm::vec3& rayDir) {
+    if (state.sceneDocument == nullptr || state.assets == nullptr) {
+        return std::nullopt;
+    }
+
+    float nearestT = std::numeric_limits<float>::max();
+    ViewportSceneRayHit nearestHit{};
+    const SceneRegistry& registry = state.sceneDocument->registry();
+    for (const Entity* entity : registry.entities()) {
+        if (entity == nullptr || !entity->visible || !entity->meshRenderer.has_value()) {
+            continue;
+        }
+        const MeshRenderer& renderer = *entity->meshRenderer;
+        if (!renderer.visible || !renderer.visibleToCamera || !renderer.mesh.valid()) {
+            continue;
+        }
+        const MeshAsset* mesh = state.assets->mesh(renderer.mesh);
+        if (mesh == nullptr || mesh->vertices.empty() || mesh->primitives.empty()) {
+            continue;
+        }
+
+        const glm::mat4 world = entityWorldMatrix(registry, *entity);
+        for (uint32_t primitiveIndex = 0; primitiveIndex < mesh->primitives.size(); ++primitiveIndex) {
+            const MeshPrimitiveAsset& primitive = mesh->primitives[primitiveIndex];
+            const uint32_t indexEnd = primitive.firstIndex + primitive.indexCount;
+            if (primitive.indexCount >= 3u && indexEnd <= mesh->indices.size()) {
+                for (uint32_t i = primitive.firstIndex; i + 2u < indexEnd; i += 3u) {
+                    const uint32_t i0 = mesh->indices[i];
+                    const uint32_t i1 = mesh->indices[i + 1u];
+                    const uint32_t i2 = mesh->indices[i + 2u];
+                    if (i0 >= mesh->vertices.size() || i1 >= mesh->vertices.size() || i2 >= mesh->vertices.size()) {
+                        continue;
+                    }
+                    const glm::vec3 a = glm::vec3(world * glm::vec4(mesh->vertices[i0].position, 1.0f));
+                    const glm::vec3 b = glm::vec3(world * glm::vec4(mesh->vertices[i1].position, 1.0f));
+                    const glm::vec3 c = glm::vec3(world * glm::vec4(mesh->vertices[i2].position, 1.0f));
+                    float t = 0.0f;
+                    if (rayTriangleIntersection(origin, rayDir, a, b, c, t) && t < nearestT) {
+                        nearestT = t;
+                        nearestHit.position = origin + rayDir * t;
+                        nearestHit.normal = triangleNormalFacingRay(a, b, c, rayDir);
+                        nearestHit.entity = entity->id;
+                        nearestHit.primitiveIndex = primitiveIndex;
+                    }
+                }
+            } else if (primitive.vertexCount >= 3u && primitive.firstVertex + primitive.vertexCount <= mesh->vertices.size()) {
+                const uint32_t vertexEnd = primitive.firstVertex + primitive.vertexCount;
+                for (uint32_t i = primitive.firstVertex; i + 2u < vertexEnd; i += 3u) {
+                    const glm::vec3 a = glm::vec3(world * glm::vec4(mesh->vertices[i].position, 1.0f));
+                    const glm::vec3 b = glm::vec3(world * glm::vec4(mesh->vertices[i + 1u].position, 1.0f));
+                    const glm::vec3 c = glm::vec3(world * glm::vec4(mesh->vertices[i + 2u].position, 1.0f));
+                    float t = 0.0f;
+                    if (rayTriangleIntersection(origin, rayDir, a, b, c, t) && t < nearestT) {
+                        nearestT = t;
+                        nearestHit.position = origin + rayDir * t;
+                        nearestHit.normal = triangleNormalFacingRay(a, b, c, rayDir);
+                        nearestHit.entity = entity->id;
+                        nearestHit.primitiveIndex = primitiveIndex;
+                    }
+                }
+            }
+        }
+    }
+
+    return nearestHit.entity.valid() ? std::optional<ViewportSceneRayHit>(nearestHit) : std::nullopt;
+}
+
+bool viewportRayFromMouse(const EditorRuntimeState& state, glm::vec3& origin, glm::vec3& rayDir) {
+    if (state.camera == nullptr || state.viewport.imageSize.x <= 0.0f || state.viewport.imageSize.y <= 0.0f) {
+        return false;
+    }
+
+    glm::vec3 forward{};
+    glm::vec3 right{};
+    glm::vec3 up{};
+    if (!cameraBasis(*state.camera, forward, right, up)) {
+        return false;
+    }
+
+    const float fovY = state.sceneDocument != nullptr ? activeCameraFov(*state.sceneDocument) : glm::radians(60.0f);
+    const float tanHalfFov = std::tan(fovY * 0.5f);
+    const float ndcX = state.viewport.mouseUv.x * 2.0f - 1.0f;
+    const float ndcY = 1.0f - state.viewport.mouseUv.y * 2.0f;
+    rayDir = glm::normalize(forward + right * (ndcX * tanHalfFov * viewportAspect(state)) + up * (ndcY * tanHalfFov));
+    origin = state.camera->position();
+    return std::isfinite(rayDir.x) && std::isfinite(rayDir.y) && std::isfinite(rayDir.z);
+}
+
+std::optional<ViewportSceneRayHit> viewportSceneRaycastUnderCursor(const EditorRuntimeState& state) {
+    glm::vec3 origin{};
+    glm::vec3 rayDir{};
+    if (!viewportRayFromMouse(state, origin, rayDir)) {
+        return std::nullopt;
+    }
+    return viewportSceneRaycast(state, origin, rayDir);
+}
+
+float snappedPlacementCoordinate(float value, float step) {
+    if (!std::isfinite(value) || !std::isfinite(step) || step <= 0.0001f) {
+        return value;
+    }
+    return std::round(value / step) * step;
+}
+
+std::optional<Transform> viewportDropPlacementTransform(
+    const EditorRuntimeState& state,
+    bool snapEnabled,
+    float translationSnap,
+    bool forceGrid,
+    bool surfaceAlign) {
+    glm::vec3 origin{};
+    glm::vec3 rayDir{};
+    if (!viewportRayFromMouse(state, origin, rayDir)) {
+        return std::nullopt;
+    }
+
+    glm::vec3 position = origin + rayDir * 5.0f;
+    glm::vec3 rotationEuler{0.0f};
+    bool usedSceneHit = false;
+    if (!forceGrid) {
+        if (const std::optional<ViewportSceneRayHit> sceneHit = viewportSceneRaycast(state, origin, rayDir)) {
+            position = sceneHit->position;
+            if (surfaceAlign) {
+                rotationEuler = rotationEulerAligningUpToNormal(sceneHit->normal);
+            }
+            usedSceneHit = true;
+        }
+    }
+    if (forceGrid || !usedSceneHit) {
+        if (std::abs(rayDir.y) > 0.0001f) {
+            const float t = -origin.y / rayDir.y;
+            if (t > 0.0f && std::isfinite(t)) {
+                position = origin + rayDir * t;
+            }
+            position.y = 0.0f;
+        }
+    }
+    if (snapEnabled) {
+        position.x = snappedPlacementCoordinate(position.x, translationSnap);
+        position.y = snappedPlacementCoordinate(position.y, translationSnap);
+        position.z = snappedPlacementCoordinate(position.z, translationSnap);
+    }
+
+    Transform transform;
+    transform.position = position;
+    transform.rotationEuler = rotationEuler;
+    transform.scale = glm::vec3(1.0f);
+    transform.dirty = true;
+    return transform;
 }
 
 void drawActorIcon(ImDrawList* drawList, EditorGlyphIcon icon, ImVec2 center, ImU32 color, bool selected) {
@@ -612,11 +1048,146 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 IM_COL32(18, 20, 23, 255));
         }
         const bool viewportContentHovered = ImGui::IsItemHovered();
+        if (viewportContentHovered) {
+            drawViewportDropPreview(state, snap_.enabled, snap_.translation);
+        }
         if (ImGui::BeginDragDropTarget()) {
+            const bool forceGridDrop = ImGui::GetIO().KeyCtrl;
+            const bool surfaceAlignDrop = ImGui::GetIO().KeyAlt && !forceGridDrop;
             if (const auto* payload = ImGui::AcceptDragDropPayload("PREFAB_ASSET")) {
                 requests.placeAsset = std::string(static_cast<const char*>(payload->Data));
+                requests.placeAssetTransform = viewportDropPlacementTransform(state, snap_.enabled, snap_.translation, forceGridDrop, surfaceAlignDrop);
+            }
+            if (const auto* payload = ImGui::AcceptDragDropPayload("MESH_ASSET")) {
+                EntityId replaceEntity{};
+                if (ImGui::GetIO().KeyShift) {
+                    if (const std::optional<ViewportSceneRayHit> hit = viewportSceneRaycastUnderCursor(state)) {
+                        replaceEntity = hit->entity;
+                    } else if (state.sceneDocument != nullptr) {
+                        if (const Entity* selectedEntity = state.sceneDocument->registry().entity(selection.entityId());
+                            selectedEntity != nullptr && selectedEntity->meshRenderer.has_value()) {
+                            replaceEntity = selectedEntity->id;
+                        }
+                    }
+                }
+                requests.meshAssetPlacement = EditorMeshAssetPlacement{
+                    .meshGuid = std::string(static_cast<const char*>(payload->Data)),
+                    .placementTransform = viewportDropPlacementTransform(state, snap_.enabled, snap_.translation, forceGridDrop, surfaceAlignDrop),
+                    .replaceEntity = replaceEntity,
+                };
+            }
+            if (const auto* payload = ImGui::AcceptDragDropPayload("MATERIAL_ASSET")) {
+                const AssetGuid materialGuid = payloadString(*payload);
+                if (!materialGuid.empty()) {
+                    if (const std::optional<ViewportSceneRayHit> hit = viewportSceneRaycastUnderCursor(state)) {
+                        requests.materialAssetAssignment = EditorMaterialAssetAssignment{
+                            .materialGuid = materialGuid,
+                            .entity = hit->entity,
+                            .primitiveIndex = hit->primitiveIndex,
+                        };
+                        selection.selectEntity(hit->entity);
+                        selection.setLastClickedId(hit->entity);
+                    } else {
+                        pendingMaterialDropGuid_ = materialGuid;
+                        pendingMaterialDropEntity_ = selection.entityId();
+                        materialDropPopupOpen_ = true;
+                    }
+                }
+            }
+            if (const auto* payload = ImGui::AcceptDragDropPayload("ENVIRONMENT_ASSET")) {
+                requests.environmentAssetAssignment = std::string(static_cast<const char*>(payload->Data));
+            }
+            if (const auto* payload = ImGui::AcceptDragDropPayload("LEVEL_PATH")) {
+                pendingLevelDropPath_ = std::filesystem::path(payloadString(*payload));
+                pendingLevelDropLabel_ = pendingLevelDropPath_.filename().string();
+                levelDropPopupOpen_ = !pendingLevelDropPath_.empty();
             }
             ImGui::EndDragDropTarget();
+        }
+
+        if (levelDropPopupOpen_) {
+            ImGui::OpenPopup("LevelDropActionPopup");
+            levelDropPopupOpen_ = false;
+        }
+        if (ImGui::BeginPopupModal("LevelDropActionPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("%s", pendingLevelDropLabel_.empty() ? "Level" : pendingLevelDropLabel_.c_str());
+            ImGui::TextDisabled("%s", pendingLevelDropPath_.string().c_str());
+            ImGui::Spacing();
+            if (editorGlyphMenuItem(EditorGlyphIcon::SceneFile, "Open Level", !pendingLevelDropPath_.empty())) {
+                requests.openScene = pendingLevelDropPath_;
+                pendingLevelDropPath_.clear();
+                pendingLevelDropLabel_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Merge Into Current Level", !pendingLevelDropPath_.empty())) {
+                requests.mergeScene = pendingLevelDropPath_;
+                pendingLevelDropPath_.clear();
+                pendingLevelDropLabel_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            editorGlyphMenuItem(EditorGlyphIcon::Group, "Add As Sublevel", false);
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Level instances and sublevels are not implemented yet");
+            }
+            ImGui::Separator();
+            if (editorGlyphMenuItem(EditorGlyphIcon::Exit, "Cancel")) {
+                pendingLevelDropPath_.clear();
+                pendingLevelDropLabel_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (materialDropPopupOpen_) {
+            ImGui::OpenPopup("MaterialDropActionPopup");
+            materialDropPopupOpen_ = false;
+        }
+        if (ImGui::BeginPopupModal("MaterialDropActionPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            Entity* targetEntity = state.sceneDocument != nullptr ? state.sceneDocument->registry().entity(pendingMaterialDropEntity_) : nullptr;
+            const bool hasMeshTarget = targetEntity != nullptr && targetEntity->meshRenderer.has_value();
+            ImGui::Text("Material asset");
+            ImGui::TextDisabled("%s", pendingMaterialDropGuid_.empty() ? "(none)" : pendingMaterialDropGuid_.c_str());
+            if (!hasMeshTarget) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("Select a mesh entity before assigning a dropped material.");
+            }
+            ImGui::Spacing();
+            if (editorGlyphMenuItem(EditorGlyphIcon::Material, "Assign to Slot 0", hasMeshTarget)) {
+                requests.materialAssetAssignment = EditorMaterialAssetAssignment{
+                    .materialGuid = pendingMaterialDropGuid_,
+                    .entity = pendingMaterialDropEntity_,
+                    .primitiveIndex = 0u,
+                };
+                pendingMaterialDropGuid_.clear();
+                pendingMaterialDropEntity_ = {};
+                ImGui::CloseCurrentPopup();
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Material, "Assign to All Slots", hasMeshTarget)) {
+                requests.materialAssetAssignment = EditorMaterialAssetAssignment{
+                    .materialGuid = pendingMaterialDropGuid_,
+                    .entity = pendingMaterialDropEntity_,
+                    .primitiveIndex = UINT32_MAX,
+                };
+                pendingMaterialDropGuid_.clear();
+                pendingMaterialDropEntity_ = {};
+                ImGui::CloseCurrentPopup();
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Details, "Open Material Slots", hasMeshTarget)) {
+                selection.selectEntity(pendingMaterialDropEntity_);
+                selection.setLastClickedId(pendingMaterialDropEntity_);
+                requests.showInspector = true;
+                requests.focusOnEntity = pendingMaterialDropEntity_;
+                pendingMaterialDropGuid_.clear();
+                pendingMaterialDropEntity_ = {};
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            if (editorGlyphMenuItem(EditorGlyphIcon::Exit, "Cancel")) {
+                pendingMaterialDropGuid_.clear();
+                pendingMaterialDropEntity_ = {};
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
 
         constexpr float viewportContextTapMaxSeconds = 0.18f;
@@ -695,9 +1266,9 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
                 requests.sceneUpdate = SceneUpdateKind::LightOnly;
             }
-            editorGlyphMenuItem(EditorGlyphIcon::Add, "Drop prefab here", false);
+            editorGlyphMenuItem(EditorGlyphIcon::Add, "Drop Content asset here", false);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                ImGui::SetTooltip("Drag a prefab from Content onto the viewport to place it");
+                ImGui::SetTooltip("Drag a prefab, mesh, material, HDRI, or level asset from Content onto the viewport");
             }
             ImGui::EndPopup();
         }

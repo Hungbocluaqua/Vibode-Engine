@@ -56,6 +56,326 @@ std::filesystem::path defaultVibodeProjectRoot() {
     return std::filesystem::current_path() / "Vibode Projects";
 }
 
+std::string lowerExtension(const std::filesystem::path& path) {
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return ext;
+}
+
+bool isDroppedModelSource(const std::filesystem::path& path) {
+    const std::string ext = lowerExtension(path);
+    return ext == ".gltf" || ext == ".glb" || ext == ".obj";
+}
+
+bool isDroppedTextureSource(const std::filesystem::path& path) {
+    const std::string ext = lowerExtension(path);
+    return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2";
+}
+
+bool isDroppedCompressedTextureSource(const std::filesystem::path& path) {
+    const std::string ext = lowerExtension(path);
+    return ext == ".dds" || ext == ".ktx" || ext == ".ktx2";
+}
+
+bool isDroppedBasisTextureSource(const std::filesystem::path& path) {
+    return lowerExtension(path) == ".basis";
+}
+
+bool isDroppedFbxSource(const std::filesystem::path& path) {
+    return lowerExtension(path) == ".fbx";
+}
+
+bool isDroppedUsdSource(const std::filesystem::path& path) {
+    const std::string ext = lowerExtension(path);
+    return ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz";
+}
+
+bool isDroppedEnvironmentSource(const std::filesystem::path& path) {
+    const std::string ext = lowerExtension(path);
+    return ext == ".hdr" || ext == ".exr";
+}
+
+bool isDroppedLevelSource(const std::filesystem::path& path) {
+    return lowerExtension(path) == ".rtlevel";
+}
+
+bool isDroppedAssetImportSource(const std::filesystem::path& path) {
+    return isDroppedModelSource(path) || isDroppedEnvironmentSource(path) || isDroppedTextureSource(path) || isDroppedCompressedTextureSource(path);
+}
+
+std::filesystem::path importDestinationForDroppedFile(const EditorRuntimeState& state) {
+    return state.project != nullptr ? state.project->contentRoot : std::filesystem::path{};
+}
+
+struct DroppedFileQueueSummary {
+    size_t models = 0;
+    size_t textures = 0;
+    size_t compressedTextures = 0;
+    size_t environments = 0;
+    size_t levels = 0;
+    size_t policyDisabled = 0;
+    size_t unsupported = 0;
+};
+
+DroppedFileQueueSummary summarizeDroppedFileQueue(const std::vector<std::filesystem::path>& paths) {
+    DroppedFileQueueSummary summary;
+    for (const std::filesystem::path& path : paths) {
+        if (isDroppedModelSource(path)) {
+            ++summary.models;
+        } else if (isDroppedCompressedTextureSource(path)) {
+            ++summary.compressedTextures;
+        } else if (isDroppedTextureSource(path)) {
+            ++summary.textures;
+        } else if (isDroppedEnvironmentSource(path)) {
+            ++summary.environments;
+        } else if (isDroppedLevelSource(path)) {
+            ++summary.levels;
+        } else if (isDroppedFbxSource(path) || isDroppedUsdSource(path) || isDroppedBasisTextureSource(path)) {
+            ++summary.policyDisabled;
+        } else {
+            ++summary.unsupported;
+        }
+    }
+    return summary;
+}
+
+void appendDroppedFileQueueSummaryPart(std::string& text, size_t count, const char* singular, const char* plural) {
+    if (count == 0) {
+        return;
+    }
+    text += text.empty() ? "Queue: " : ", ";
+    text += std::to_string(count);
+    text += ' ';
+    text += count == 1 ? singular : plural;
+}
+
+std::string droppedFileQueueSummaryText(const std::vector<std::filesystem::path>& paths) {
+    const DroppedFileQueueSummary summary = summarizeDroppedFileQueue(paths);
+    std::string text;
+    appendDroppedFileQueueSummaryPart(text, summary.models, "model", "models");
+    appendDroppedFileQueueSummaryPart(text, summary.textures, "texture", "textures");
+    appendDroppedFileQueueSummaryPart(text, summary.compressedTextures, "compressed texture", "compressed textures");
+    appendDroppedFileQueueSummaryPart(text, summary.environments, "environment", "environments");
+    appendDroppedFileQueueSummaryPart(text, summary.levels, "level", "levels");
+    appendDroppedFileQueueSummaryPart(text, summary.policyDisabled, "disabled", "disabled");
+    appendDroppedFileQueueSummaryPart(text, summary.unsupported, "unsupported", "unsupported");
+    return text;
+}
+
+const char* droppedFileQueueCategoryLabel(const std::filesystem::path& path) {
+    if (isDroppedModelSource(path)) {
+        return "model";
+    }
+    if (isDroppedCompressedTextureSource(path)) {
+        return "compressed texture";
+    }
+    if (isDroppedTextureSource(path)) {
+        return "texture";
+    }
+    if (isDroppedEnvironmentSource(path)) {
+        return "environment";
+    }
+    if (isDroppedLevelSource(path)) {
+        return "level";
+    }
+    if (isDroppedFbxSource(path)) {
+        return "disabled FBX";
+    }
+    if (isDroppedUsdSource(path)) {
+        return "disabled USD";
+    }
+    if (isDroppedBasisTextureSource(path)) {
+        return "disabled Basis";
+    }
+    return "unsupported";
+}
+
+void drawDroppedFileQueueDetails(const std::vector<std::filesystem::path>& paths) {
+    if (paths.size() <= 1 || !ImGui::TreeNodeEx("Queued Files", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    constexpr size_t maxVisibleQueuedFiles = 10;
+    const size_t visibleCount = std::min(paths.size(), maxVisibleQueuedFiles);
+    for (size_t i = 0; i < visibleCount; ++i) {
+        const std::filesystem::path& path = paths[i];
+        ImGui::TextDisabled(
+            "%zu. %s - %s",
+            i + 1,
+            path.filename().string().c_str(),
+            droppedFileQueueCategoryLabel(path));
+    }
+    if (paths.size() > visibleCount) {
+        ImGui::TextDisabled("... %zu more", paths.size() - visibleCount);
+    }
+    ImGui::TreePop();
+}
+
+void disabledDroppedFileAction(EditorGlyphIcon icon, const char* label, const char* reason) {
+    editorGlyphMenuItem(icon, label, false);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("%s", reason);
+    }
+}
+
+void drawDroppedFileActionPopup(const EditorRuntimeState& state, EditorRequests& requests) {
+    if (state.pendingDroppedFiles == nullptr || state.pendingDroppedFiles->empty()) {
+        return;
+    }
+    const size_t droppedFileCount = state.pendingDroppedFiles->size();
+    const std::filesystem::path droppedPath = state.pendingDroppedFiles->front();
+    if (droppedPath.empty()) {
+        requests.dismissDroppedFile = droppedPath;
+        return;
+    }
+
+    ImGui::OpenPopup("DroppedFileActionPopup");
+    if (!ImGui::BeginPopupModal("DroppedFileActionPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::Text("%s", droppedPath.filename().string().c_str());
+    ImGui::TextDisabled("%s", droppedPath.string().c_str());
+    if (droppedFileCount > 1) {
+        ImGui::TextDisabled("Dropped file 1 of %zu", droppedFileCount);
+        const std::string queueSummary = droppedFileQueueSummaryText(*state.pendingDroppedFiles);
+        if (!queueSummary.empty()) {
+            ImGui::TextDisabled("%s", queueSummary.c_str());
+        }
+        drawDroppedFileQueueDetails(*state.pendingDroppedFiles);
+    }
+    ImGui::Spacing();
+
+    auto consume = [&]() {
+        requests.dismissDroppedFile = droppedPath;
+        ImGui::CloseCurrentPopup();
+    };
+
+    std::vector<EditorImportAssetRequest> batchImportRequests;
+    std::vector<EditorImportAssetRequest> batchImportAndPlaceRequests;
+    std::vector<std::filesystem::path> batchLevelMergeRequests;
+    if (droppedFileCount > 1) {
+        batchImportRequests.reserve(droppedFileCount);
+        batchImportAndPlaceRequests.reserve(droppedFileCount);
+        batchLevelMergeRequests.reserve(droppedFileCount);
+        for (const std::filesystem::path& path : *state.pendingDroppedFiles) {
+            if (isDroppedAssetImportSource(path)) {
+                batchImportRequests.push_back(EditorImportAssetRequest{.sourcePath = path, .destinationFolder = importDestinationForDroppedFile(state)});
+            }
+            if (isDroppedModelSource(path)) {
+                batchImportAndPlaceRequests.push_back(EditorImportAssetRequest{.sourcePath = path, .destinationFolder = importDestinationForDroppedFile(state), .mode = "ImportAndPlace"});
+            }
+            if (isDroppedLevelSource(path)) {
+                batchLevelMergeRequests.push_back(path);
+            }
+        }
+        if (batchImportRequests.size() > 1) {
+            if (editorGlyphMenuItem(EditorGlyphIcon::Import, ("Import All Asset Sources (" + std::to_string(batchImportRequests.size()) + ")").c_str())) {
+                requests.importAssets = std::move(batchImportRequests);
+                requests.dismissAllDroppedFiles = true;
+                ImGui::CloseCurrentPopup();
+            }
+            if (batchImportAndPlaceRequests.size() > 1) {
+                if (editorGlyphMenuItem(EditorGlyphIcon::Add, ("Import and Place All Models (" + std::to_string(batchImportAndPlaceRequests.size()) + ")").c_str())) {
+                    requests.importAndPlaceAssets = std::move(batchImportAndPlaceRequests);
+                    requests.dismissAllDroppedFiles = true;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::Separator();
+        }
+        if (batchLevelMergeRequests.size() > 1) {
+            if (editorGlyphMenuItem(EditorGlyphIcon::Group, ("Merge All Levels (" + std::to_string(batchLevelMergeRequests.size()) + ")").c_str())) {
+                requests.mergeScenes = std::move(batchLevelMergeRequests);
+                requests.dismissAllDroppedFiles = true;
+                ImGui::CloseCurrentPopup();
+            }
+            disabledDroppedFileAction(EditorGlyphIcon::SceneFile, "Open All Levels", "Opening multiple levels at once is ambiguous; use Merge All Levels or open one level at a time.");
+            ImGui::Separator();
+        }
+    }
+
+    if (isDroppedModelSource(droppedPath)) {
+        if (editorGlyphMenuItem(EditorGlyphIcon::Import, "Import Asset")) {
+            requests.importAsset = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state)};
+            consume();
+        }
+        if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Import and Place")) {
+            requests.importAndPlace = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state), .mode = "ImportAndPlace"};
+            consume();
+        }
+        if (editorGlyphMenuItem(EditorGlyphIcon::SceneFile, "Import Scene as New Level")) {
+            requests.importSceneAsNewScene = droppedPath;
+            consume();
+        }
+        if (editorGlyphMenuItem(EditorGlyphIcon::Group, "Merge Source Scene")) {
+            requests.mergeScene = droppedPath;
+            consume();
+        }
+    } else if (isDroppedEnvironmentSource(droppedPath)) {
+        if (editorGlyphMenuItem(EditorGlyphIcon::Environment, "Assign Environment")) {
+            requests.loadHdr = droppedPath;
+            consume();
+        }
+        if (editorGlyphMenuItem(EditorGlyphIcon::Import, "Import Asset")) {
+            requests.importAsset = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state)};
+            consume();
+        }
+    } else if (isDroppedCompressedTextureSource(droppedPath)) {
+        ImGui::TextDisabled("Compressed texture source");
+        ImGui::TextDisabled("Imports as a texture asset only; scene placement is not applicable.");
+        if (editorGlyphMenuItem(EditorGlyphIcon::Import, "Import Texture Asset")) {
+            requests.importAsset = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state)};
+            consume();
+        }
+        disabledDroppedFileAction(EditorGlyphIcon::Add, "Import and Place", "Texture assets are imported into Content and assigned from material/editor workflows.");
+    } else if (isDroppedBasisTextureSource(droppedPath)) {
+        ImGui::TextDisabled("Basis texture import is not implemented in this build.");
+        disabledDroppedFileAction(EditorGlyphIcon::Import, "Import Texture Asset", "Use KTX2/BasisU texture containers until raw .basis import is implemented.");
+        disabledDroppedFileAction(EditorGlyphIcon::Add, "Import and Place", "Texture assets are assigned through material/editor workflows after import.");
+    } else if (isDroppedTextureSource(droppedPath)) {
+        if (editorGlyphMenuItem(EditorGlyphIcon::Import, "Import Asset")) {
+            requests.importAsset = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state)};
+            consume();
+        }
+    } else if (isDroppedLevelSource(droppedPath)) {
+        if (editorGlyphMenuItem(EditorGlyphIcon::SceneFile, "Open Level")) {
+            requests.openScene = droppedPath;
+            consume();
+        }
+        if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Merge Into Current Level")) {
+            requests.mergeScene = droppedPath;
+            consume();
+        }
+        editorGlyphMenuItem(EditorGlyphIcon::Group, "Add As Sublevel", false);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Level instances and sublevels are not implemented yet");
+        }
+    } else if (isDroppedFbxSource(droppedPath)) {
+        ImGui::TextDisabled("FBX import is not implemented in this build.");
+        disabledDroppedFileAction(EditorGlyphIcon::Import, "Import Asset", "FBX mesh/material/skeleton import is tracked as future asset-pipeline work.");
+        disabledDroppedFileAction(EditorGlyphIcon::Add, "Import and Place", "FBX cannot be placed until FBX import and runtime mesh cooking are implemented.");
+    } else if (isDroppedUsdSource(droppedPath)) {
+        ImGui::TextDisabled("USD/USDZ import is not implemented in this build.");
+        disabledDroppedFileAction(EditorGlyphIcon::Import, "Import Asset", "USD stage import is tracked as future asset-pipeline work.");
+        disabledDroppedFileAction(EditorGlyphIcon::Add, "Import and Place", "USD files cannot be placed until USD import and runtime payload cooking are implemented.");
+    } else {
+        ImGui::TextDisabled("Unsupported dropped file type");
+    }
+
+    ImGui::Separator();
+    if (editorGlyphMenuItem(EditorGlyphIcon::Exit, "Cancel")) {
+        consume();
+    }
+    if (droppedFileCount > 1 && editorGlyphMenuItem(EditorGlyphIcon::Trash, "Cancel All Dropped Files")) {
+        requests.dismissAllDroppedFiles = true;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 bool hasInvalidWindowsPathCharacter(const std::string& value) {
     return value.find_first_of("<>:\"/\\|?*") != std::string::npos;
 }
@@ -754,6 +1074,9 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     if (requests.showCommandPalette) {
         commandPaletteOpen_ = true;
     }
+    if (requests.showInspector) {
+        visibility_.inspector = true;
+    }
     const bool projectManagerGateActive = showProjectManager_ || (state.project == nullptr && !projectManagerDismissed_);
     if (projectManagerGateActive) {
         drawProjectManager(ProjectManagerRuntimeState{
@@ -777,6 +1100,7 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
 
     if (projectManagerGateActive && state.project == nullptr) {
         drawCommandPalette(state, requests);
+        drawDroppedFileActionPopup(state, requests);
         dockspace_.end(visibility_, requests);
         return requests;
     }
@@ -836,6 +1160,7 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     }
     applyCaptureFocusOverride();
     drawCommandPalette(state, requests);
+    drawDroppedFileActionPopup(state, requests);
 
     dockspace_.end(visibility_, requests);
     return requests;
@@ -2296,9 +2621,13 @@ void EditorLayer::updateJobCenterHistory(const EditorRuntimeState& state) {
     const EditorJobCenterState* jobs = state.jobCenter;
     const bool sceneLoadRunning = (jobs != nullptr && jobs->sceneLoadRunning) || state.sceneLoadRunning;
     const float sceneProgress = jobs != nullptr ? jobs->sceneLoadProgress : state.sceneLoadProgress;
-    const std::string sceneStatus = jobs != nullptr && !jobs->sceneLoadStatus.empty()
+    const size_t queuedSceneMerges = jobs != nullptr ? jobs->queuedSceneMerges : 0u;
+    std::string sceneStatus = jobs != nullptr && !jobs->sceneLoadStatus.empty()
         ? jobs->sceneLoadStatus
         : (state.sceneLoadingStatus != nullptr ? *state.sceneLoadingStatus : std::string{});
+    if (sceneLoadRunning && queuedSceneMerges > 0u) {
+        sceneStatus += " (" + std::to_string(queuedSceneMerges) + " merges queued)";
+    }
     auto finishActiveSceneLoadHistory = [&]() {
         const std::string finalStatus = sceneStatus.empty()
             ? (lastSceneLoadHistoryStatus_.empty() ? std::string("Scene load completed") : lastSceneLoadHistoryStatus_)
@@ -2690,11 +3019,15 @@ void EditorLayer::drawJobCenterPanel(const EditorRuntimeState& state, EditorRequ
     if ((jobs != nullptr && jobs->sceneLoadRunning) || state.sceneLoadRunning) {
         hasJob = true;
         const float progress = jobs != nullptr ? jobs->sceneLoadProgress : state.sceneLoadProgress;
+        const size_t queuedSceneMerges = jobs != nullptr ? jobs->queuedSceneMerges : 0u;
         const std::string status = jobs != nullptr && !jobs->sceneLoadStatus.empty()
             ? jobs->sceneLoadStatus
             : (state.sceneLoadingStatus != nullptr ? *state.sceneLoadingStatus : std::string("Loading scene"));
         ImGui::SeparatorText("Scene Loading");
         ImGui::TextUnformatted(status.c_str());
+        if (queuedSceneMerges > 0u) {
+            ImGui::TextDisabled("Queued level merges: %llu", static_cast<unsigned long long>(queuedSceneMerges));
+        }
         ImGui::ProgressBar(std::clamp(progress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
         if (ImGui::SmallButton("Cancel Scene Load")) {
             requests.cancelSceneLoad = true;
