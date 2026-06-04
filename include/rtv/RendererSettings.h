@@ -67,6 +67,10 @@ struct RendererSettings {
     float mieScaleHeight = 1200.0f;
     float mieAnisotropy = 0.8f;
     float groundAlbedo = 0.3f;
+    bool heightFogEnabled = false;
+    float heightFogDensity = 0.0f;
+    float heightFogHeightFalloff = 5.0f;
+    glm::vec3 heightFogColor{0.65f, 0.72f, 0.85f};
     float indirectStrength = 1.0f;
     RestirMode restirMode = RestirMode::RestirOnly;
     bool restirGiEnabled = true;

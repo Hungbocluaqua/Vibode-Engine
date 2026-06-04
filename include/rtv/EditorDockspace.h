@@ -15,6 +15,8 @@ public:
     void setProfilePath(const std::filesystem::path& scenePath);
     void saveLayout() const;
     void requestResetLayout();
+    void showControlsWindow() { showControls_ = true; }
+    void showRendererInfoWindow() { showRendererInfo_ = true; }
 
 private:
     void buildDefaultLayout();

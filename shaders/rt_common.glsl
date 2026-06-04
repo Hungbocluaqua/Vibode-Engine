@@ -116,8 +116,8 @@ layout(set = 0, binding = 11, std140) uniform MeshParams {
     uint local_triangle_count;
     uint tlas_node_count;
     uint tlas_instance_index_count;
-    uint _padding2;
-    uint _padding3;
+    uint authored_light_offset;
+    uint authored_light_count;
     uint _padding4;
 } mesh_params;
 
@@ -1501,13 +1501,13 @@ float power_heuristic(float pdf_a, float pdf_b) {
 uint decode_light_bvh_node_info(float packed, out uint childCount, out uint childOrLightOffset, out uint lightCount) {
     uint bits = floatBitsToUint(packed);
     if ((bits & 0x80000000u) != 0u) {
-        lightCount = (bits >> 16u) & 0x3fffu;
-        childOrLightOffset = bits & 0x7fffu;
+        lightCount = 1u;
+        childOrLightOffset = bits & 0x7fffffffu;
         childCount = 0u;
         return 1u;
     }
-    childCount = bits & 0xffffu;
-    childOrLightOffset = (bits >> 16u) & 0xffffu;
+    childCount = bits != 0u ? 2u : 0u;
+    childOrLightOffset = bits & 0x7fffffffu;
     lightCount = 0u;
     return 0u;
 }
@@ -1537,21 +1537,77 @@ bool sample_light_bvh(inout uint rng, out uint lightIndex) {
             }
             return true;
         }
-        if (childCount == 0u || childOrLightOffset >= 65535u) {
+        uint maxNodeCount = max(mesh_params.light_count * 2u, 1u);
+        if (childCount == 0u || childOrLightOffset + childCount > maxNodeCount) {
             return false;
         }
         float r = rand_f32(rng) * totalPower;
         float cumulativePower = 0.0;
+        uint nextNodeIndex = childOrLightOffset + childCount - 1u;
         for (uint ci = 0u; ci < childCount; ++ci) {
             float childPower = light_bvh_nodes[(childOrLightOffset + ci) * 2u].w;
             cumulativePower += childPower;
             if (r <= cumulativePower) {
-                nodeIndex = childOrLightOffset + ci;
+                nextNodeIndex = childOrLightOffset + ci;
                 break;
             }
         }
+        nodeIndex = nextNodeIndex;
     }
     return false;
+}
+
+bool light_record_is_authored(uint type) {
+    return type >= 2u && type <= 5u;
+}
+
+bool light_record_is_emissive(uint type) {
+    return type == 0u || type == 1u;
+}
+
+float authored_light_sample_probability() {
+    if (mesh_params.authored_light_count == 0u || mesh_params.light_count == 0u) {
+        return 0.0;
+    }
+    return mesh_params.light_count > mesh_params.authored_light_count ? 0.5 : 1.0;
+}
+
+float light_bvh_sample_probability() {
+    if (mesh_params.light_count == 0u || mesh_params.emissive_total_area <= 1.0e-8) {
+        return 0.0;
+    }
+    return 1.0 - authored_light_sample_probability();
+}
+
+bool sample_authored_light(inout uint rng, out uint lightIndex) {
+    if (mesh_params.authored_light_count == 0u || mesh_params.authored_light_offset >= mesh_params.light_count) {
+        return false;
+    }
+    uint localIndex = min(uint(rand_f32(rng) * float(mesh_params.authored_light_count)), mesh_params.authored_light_count - 1u);
+    lightIndex = mesh_params.authored_light_offset + localIndex;
+    return lightIndex < mesh_params.light_count && light_record_is_authored(light_records[lightIndex].metadata.x);
+}
+
+float light_record_selection_pdf(uint lightIndex) {
+    if (lightIndex >= mesh_params.light_count || mesh_params.emissive_total_area <= 1.0e-8) {
+        return 0.0;
+    }
+    LightRecord light = light_records[lightIndex];
+    float pdf = light_bvh_sample_probability() * max(light.data0.x, 0.0) / max(mesh_params.emissive_total_area, 1.0e-6);
+    if (light_record_is_authored(light.metadata.x) && mesh_params.authored_light_count > 0u) {
+        pdf += authored_light_sample_probability() / float(mesh_params.authored_light_count);
+    }
+    return pdf;
+}
+
+bool sample_scene_light(inout uint rng, out uint lightIndex) {
+    float authoredProbability = authored_light_sample_probability();
+    if (authoredProbability > 0.0 && rand_f32(rng) < authoredProbability) {
+        if (sample_authored_light(rng, lightIndex)) {
+            return true;
+        }
+    }
+    return sample_light_bvh(rng, lightIndex);
 }
 
 float reflectance(float cosine, float ref_idx) {

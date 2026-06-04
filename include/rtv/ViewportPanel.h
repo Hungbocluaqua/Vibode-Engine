@@ -3,6 +3,8 @@
 #include "rtv/EditorCommands.h"
 #include "rtv/EditorPanels.h"
 
+#include <glm/mat4x4.hpp>
+
 #include <array>
 
 namespace rtv {
@@ -23,6 +25,7 @@ public:
     [[nodiscard]] bool interactionActive() const { return focused_ || hovered_; }
     [[nodiscard]] bool hovered() const { return hovered_; }
     [[nodiscard]] GizmoInteractionState gizmoState() const { return gizmoState_; }
+    void executeCommand(EditorCommandId id);
 
     void setShowGrid(bool show) { showGrid_ = show; }
     void setShowAxes(bool show) { showAxes_ = show; }
@@ -39,7 +42,6 @@ private:
 
     void commitGizmoDrag(EditorRequests& requests, SceneDocument& document);
     void abortGizmoDrag();
-    void executeCommand(EditorCommandId id);
     void updateGizmoState(bool isOver, bool isUsing, int gizmoMode);
 
     VkExtent2D lastContentExtent_{};
@@ -54,12 +56,16 @@ private:
     GizmoInteractionState gizmoState_ = GizmoInteractionState::Idle;
 
     bool gizmoDragActive_ = false;
+    bool gizmoDragModified_ = false;
     EntityId gizmoDragEntity_{};
     Transform gizmoDragOriginal_{};
+    glm::mat4 gizmoDragParentWorld_{1.0f};
+    glm::mat4 gizmoDragOriginalWorld_{1.0f};
 
     bool showGrid_ = false;
     bool showAxes_ = true;
     bool showSelectionOverlay_ = true;
+    bool showActorIcons_ = true;
 
     uint32_t lastSampleCount_ = 0;
 };

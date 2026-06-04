@@ -1,5 +1,6 @@
 #include "rtv/AssetBrowserPanel.h"
 
+#include "rtv/AssetImport.h"
 #include "rtv/AssetManager.h"
 #include "rtv/EditorPreferences.h"
 #include "rtv/EditorUiStyle.h"
@@ -37,6 +38,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace rtv {
@@ -54,6 +56,8 @@ void setPathBuffer(std::array<char, N>& buffer, const std::filesystem::path& pat
     setTextBuffer(buffer, path.string());
 }
 
+std::filesystem::path canonicalForCompare(const std::filesystem::path& path);
+
 std::string lowerString(std::string value) {
     for (char& c : value) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -61,9 +65,183 @@ std::string lowerString(std::string value) {
     return value;
 }
 
+std::string trimString(std::string value) {
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), value.end());
+    return value;
+}
+
+std::string quoteCommandPath(const std::filesystem::path& path) {
+    std::string value = path.string();
+    std::string escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back('"');
+    for (char c : value) {
+        if (c == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    escaped.push_back('"');
+    return escaped;
+}
+
+std::string readCommandOutput(const std::string& command) {
+    std::string output;
+#ifdef _WIN32
+    FILE* pipe = _popen(command.c_str(), "r");
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+#endif
+    if (pipe == nullptr) {
+        return output;
+    }
+    std::array<char, 256> buffer{};
+    while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        output += buffer.data();
+    }
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    return output;
+}
+
+void setPreferenceSaveStatus(bool saved, std::string& status, std::string successMessage, std::string failureDetail) {
+    status = saved ? std::move(successMessage) : "Preference save failed: " + std::move(failureDetail);
+}
+
+std::vector<std::string> parseTagList(const std::string& value) {
+    std::vector<std::string> tags;
+    std::stringstream stream(value);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        item = trimString(std::move(item));
+        if (!item.empty()) {
+            tags.push_back(std::move(item));
+        }
+    }
+    std::sort(tags.begin(), tags.end());
+    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+    return tags;
+}
+
+std::string joinTagList(const std::vector<std::string>& tags) {
+    std::ostringstream out;
+    for (size_t i = 0; i < tags.size(); ++i) {
+        if (i > 0) {
+            out << ", ";
+        }
+        out << tags[i];
+    }
+    return out.str();
+}
+
+bool recordHasTagMatch(const AssetRecord& record, const std::string& filter) {
+    const std::string lowerFilter = lowerString(trimString(filter));
+    if (lowerFilter.empty()) {
+        return true;
+    }
+    for (const std::string& tag : record.tags) {
+        if (lowerString(tag).find(lowerFilter) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<std::string> collectRegistryTags(const AssetRegistry* registry) {
+    std::vector<std::string> tags;
+    if (registry == nullptr) {
+        return tags;
+    }
+    for (const AssetRecord& record : registry->records()) {
+        for (const std::string& tag : record.tags) {
+            const std::string trimmed = trimString(tag);
+            if (!trimmed.empty()) {
+                tags.push_back(trimmed);
+            }
+        }
+    }
+    std::sort(tags.begin(), tags.end());
+    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+    return tags;
+}
+
+std::vector<std::string> mergedTagSuggestions(std::vector<std::string> tags, const EditorPreferences* prefs) {
+    if (prefs != nullptr) {
+        tags.insert(tags.end(), prefs->assetTagPresets.begin(), prefs->assetTagPresets.end());
+    }
+    for (std::string& tag : tags) {
+        tag = trimString(std::move(tag));
+    }
+    tags.erase(std::remove_if(tags.begin(), tags.end(), [](const std::string& tag) { return tag.empty(); }), tags.end());
+    std::sort(tags.begin(), tags.end());
+    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+    return tags;
+}
+
+bool tagListContains(const std::vector<std::string>& tags, const std::string& tag) {
+    const std::string target = lowerString(trimString(tag));
+    if (target.empty()) {
+        return false;
+    }
+    return std::any_of(tags.begin(), tags.end(), [&](const std::string& value) {
+        return lowerString(trimString(value)) == target;
+    });
+}
+
+bool collectionContainsAsset(const EditorAssetCollection& collection, const AssetGuid& guid) {
+    return std::find(collection.assetGuids.begin(), collection.assetGuids.end(), guid) != collection.assetGuids.end();
+}
+
+bool assetGuidListContains(const std::vector<std::string>& guids, const AssetGuid& guid) {
+    return !guid.empty() && std::find(guids.begin(), guids.end(), guid) != guids.end();
+}
+
+bool preferencePathListContains(const std::vector<std::string>& paths, const std::filesystem::path& path) {
+    if (path.empty()) {
+        return false;
+    }
+    const std::filesystem::path target = canonicalForCompare(path);
+    return std::any_of(paths.begin(), paths.end(), [&](const std::string& value) {
+        return !value.empty() && canonicalForCompare(std::filesystem::path(value)) == target;
+    });
+}
+
+std::string matchingPreferencePathValue(const std::vector<std::string>& paths, const std::filesystem::path& path) {
+    if (path.empty()) {
+        return {};
+    }
+    const std::filesystem::path target = canonicalForCompare(path);
+    for (const std::string& value : paths) {
+        if (!value.empty() && canonicalForCompare(std::filesystem::path(value)) == target) {
+            return value;
+        }
+    }
+    return {};
+}
+
+const EditorAssetCollection* selectedCollection(const EditorPreferences* prefs, int filterIndex) {
+    if (prefs == nullptr || filterIndex <= 0) {
+        return nullptr;
+    }
+    const size_t collectionIndex = static_cast<size_t>(filterIndex - 1);
+    if (collectionIndex >= prefs->assetCollections.size()) {
+        return nullptr;
+    }
+    return &prefs->assetCollections[collectionIndex];
+}
+
 bool isModelAssetPath(const std::filesystem::path& path) {
     const std::string ext = lowerString(path.extension().string());
     return ext == ".gltf" || ext == ".glb" || ext == ".obj";
+}
+
+bool isPlaceablePrefabSourcePath(const std::filesystem::path& path) {
+    const std::string ext = lowerString(path.extension().string());
+    return ext == ".gltf" || ext == ".glb";
 }
 
 bool isTextureAssetPath(const std::filesystem::path& path) {
@@ -73,6 +251,10 @@ bool isTextureAssetPath(const std::filesystem::path& path) {
 bool isEnvironmentAssetPath(const std::filesystem::path& path) {
     const std::string ext = lowerString(path.extension().string());
     return ext == ".hdr" || ext == ".exr";
+}
+
+bool isImportableSourceAssetPath(const std::filesystem::path& path) {
+    return isModelAssetPath(path) || lowerString(path.extension().string()) == ".mtl" || isTextureAssetPath(path) || isEnvironmentAssetPath(path);
 }
 
 bool isRasterThumbnailPath(const std::filesystem::path& path) {
@@ -195,6 +377,68 @@ bool pathIsWithin(const std::filesystem::path& path, const std::filesystem::path
     return true;
 }
 
+std::optional<std::filesystem::path> findGitRoot(std::filesystem::path start) {
+    if (start.empty()) {
+        return std::nullopt;
+    }
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(start, ec)) {
+        start = start.parent_path();
+    }
+    start = canonicalForCompare(start);
+    while (!start.empty()) {
+        if (std::filesystem::exists(start / ".git", ec)) {
+            return start;
+        }
+        const std::filesystem::path parent = start.parent_path();
+        if (parent == start || parent.empty()) {
+            break;
+        }
+        start = parent;
+    }
+    return std::nullopt;
+}
+
+std::string gitStatusLabelForPath(const std::filesystem::path& workspaceRoot, const std::filesystem::path& path) {
+    if (path.empty()) {
+        return "Unavailable";
+    }
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        return "Not in Git";
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        return "External";
+    }
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(canonicalForCompare(path), *gitRoot, ec);
+    if (ec) {
+        return "Unavailable";
+    }
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string command = "git -C " + quoteCommandPath(*gitRoot) + " status --porcelain -- " + quoteCommandPath(relative) + stderrRedirect;
+    const std::string output = readCommandOutput(command);
+    if (trimString(output).empty()) {
+        return "Clean";
+    }
+    const std::string code = output.size() >= 2 ? output.substr(0, 2) : trimString(output);
+    if (code == "??") return "Untracked";
+    if (code.find('A') != std::string::npos) return "Added";
+    if (code.find('M') != std::string::npos) return "Modified";
+    if (code.find('D') != std::string::npos) return "Deleted";
+    if (code.find('R') != std::string::npos) return "Renamed";
+    if (code.find('C') != std::string::npos) return "Copied";
+    if (code.find('U') != std::string::npos) return "Conflict";
+    return "Changed";
+}
+
 float assetImportProgress(const AssetRecord& record) {
     if (record.status == AssetImportStatus::Imported && !record.missing && !record.stale) {
         return 1.0f;
@@ -213,18 +457,65 @@ float assetImportProgress(const AssetRecord& record) {
 
 const char* assetImportProgressLabel(const AssetRecord& record) {
     if (record.status == AssetImportStatus::Imported && !record.missing && !record.stale) {
-        return "Ready";
+        return record.sourceMissing ? "Ready from cooked payload" : "Ready";
     }
     if (record.status == AssetImportStatus::Stale || record.stale) {
         return "Needs reimport";
     }
     if (record.status == AssetImportStatus::Missing || record.missing) {
-        return "Source missing";
+        if (record.cookedPayloadMissing) return "Cooked payload missing";
+        if (record.importedMetadataMissing) return "Metadata missing";
+        if (record.dependenciesMissing) return "Dependency missing";
+        return "Broken reference";
     }
     if (record.status == AssetImportStatus::Failed) {
         return "Failed";
     }
     return "Pending metadata";
+}
+
+const char* selectedAssetStateLabel(const AssetRecord& record) {
+    if (record.status == AssetImportStatus::Failed) {
+        return "Failed";
+    }
+    if (record.status == AssetImportStatus::Missing || record.missing) {
+        if (record.cookedPayloadMissing) return "Cooked payload missing";
+        if (record.importedMetadataMissing) return "Metadata missing";
+        if (record.dependenciesMissing) return "Dependency missing";
+        return "Broken reference";
+    }
+    if (record.status == AssetImportStatus::Stale || record.stale) {
+        return "Stale / needs reimport";
+    }
+    if (record.status == AssetImportStatus::Imported) {
+        return record.sourceMissing ? "Ready from cooked payload" : "Ready";
+    }
+    return "Pending metadata";
+}
+
+ImVec4 selectedAssetStateColor(const AssetRecord& record) {
+    if (record.status == AssetImportStatus::Failed || record.status == AssetImportStatus::Missing || record.missing) {
+        return ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
+    }
+    if (record.status == AssetImportStatus::Stale || record.stale) {
+        return ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
+    }
+    if (record.status == AssetImportStatus::Imported) {
+        return ImVec4(0.54f, 0.82f, 0.60f, 1.0f);
+    }
+    return ImVec4(0.65f, 0.70f, 0.78f, 1.0f);
+}
+
+const char* selectedPathOriginLabel(const EditorRuntimeState& state, const std::filesystem::path& path) {
+    if (state.project != nullptr) {
+        if (pathIsWithin(path, state.project->contentRoot)) {
+            return "Project content";
+        }
+        if (pathIsWithin(path, state.project->projectRoot / "SourceAssets")) {
+            return "Project source asset";
+        }
+    }
+    return "External or workspace file";
 }
 
 ImU32 contentIconColor(const std::filesystem::path& path) {
@@ -407,11 +698,1153 @@ bool isGeneratedPreviewDiskCacheCandidate(const std::filesystem::path& path) {
         isIesAssetPath(path) || isVolumeAssetPath(path) || std::filesystem::is_directory(path, ec);
 }
 
+std::optional<uint32_t> loadedMaterialIndexForRecord(const EditorRuntimeState& state, const AssetRecord& record) {
+    if (state.importedScene == nullptr || record.type != AssetType::Material || record.sourceHash.empty() || record.importSettingsHash.empty()) {
+        return std::nullopt;
+    }
+    const auto& materials = state.importedScene->materials;
+    for (size_t i = 0; i < materials.size(); ++i) {
+        if (importedAssetGuidFor(record.sourceHash, record.importSettingsHash, "Material", i) == record.guid && materials[i].valid()) {
+            return materials[i].index;
+        }
+    }
+    return std::nullopt;
+}
+
+struct AssetUsageSummary {
+    size_t registryReferences = 0;
+    size_t sceneReferences = 0;
+
+    [[nodiscard]] bool referenced() const {
+        return registryReferences > 0 || sceneReferences > 0;
+    }
+};
+
+AssetUsageSummary assetUsageSummaryForRecord(const EditorRuntimeState& state, const AssetRecord& record) {
+    AssetUsageSummary summary;
+    if (state.assetRegistry != nullptr) {
+        for (const AssetRecord& candidate : state.assetRegistry->records()) {
+            if (candidate.guid == record.guid) {
+                continue;
+            }
+            for (const AssetDependency& dependency : candidate.dependencies) {
+                if (dependency.guid == record.guid) {
+                    ++summary.registryReferences;
+                }
+            }
+            for (const AssetGuid& reference : candidate.references) {
+                if (reference == record.guid) {
+                    ++summary.registryReferences;
+                }
+            }
+        }
+    }
+    if (state.sceneDocument != nullptr) {
+        for (const Entity* entity : state.sceneDocument->registry().entities()) {
+            if (entity == nullptr || !entity->meshRenderer.has_value()) {
+                continue;
+            }
+            const MeshRenderer& renderer = *entity->meshRenderer;
+            if (renderer.meshGuid == record.guid) {
+                ++summary.sceneReferences;
+            }
+            for (const MaterialSlot& slot : renderer.materialSlots) {
+                if (slot.materialGuid == record.guid) {
+                    ++summary.sceneReferences;
+                }
+                if (slot.overrideMaterialGuid.has_value() && *slot.overrideMaterialGuid == record.guid) {
+                    ++summary.sceneReferences;
+                }
+            }
+        }
+        for (const PrefabInstance& instance : state.sceneDocument->prefabInstances()) {
+            if (instance.prefabGuid == record.guid) {
+                ++summary.sceneReferences;
+            }
+        }
+    }
+    return summary;
+}
+
+bool regularFileExists(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    return std::filesystem::is_regular_file(path, ec);
+}
+
+std::filesystem::path assetValidationReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
+    if (state.project != nullptr && !state.project->savedRoot.empty()) {
+        return state.project->savedRoot / "Reports" / "asset_validation_report.json";
+    }
+    if (state.assetRegistry != nullptr && !state.assetRegistry->state().path.empty()) {
+        return state.assetRegistry->state().path.parent_path() / "Reports" / "asset_validation_report.json";
+    }
+    return browserRoot / "Saved" / "Reports" / "asset_validation_report.json";
+}
+
+std::string safeReportName(std::string value) {
+    if (value.empty()) {
+        return "asset";
+    }
+    for (char& c : value) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' || std::isspace(static_cast<unsigned char>(c))) {
+            c = '_';
+        }
+    }
+    return value;
+}
+
+std::filesystem::path selectedAssetValidationReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_validation_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedAssetRelationshipReportPath(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetGuid& guid,
+    const char* relationshipKind) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename(std::string("asset_") + relationshipKind + "_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedAssetDeleteReadinessReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_delete_readiness_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedAssetProjectReferenceReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_project_references_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedAssetBrokenPlaceholderReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_broken_placeholder_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+nlohmann::json assetRecordSummaryJson(const EditorRuntimeState& state, const AssetRecord& record) {
+    const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
+    const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
+    const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
+    return {
+        {"guid", record.guid},
+        {"displayName", record.displayName},
+        {"assetType", assetTypeName(record.type)},
+        {"status", assetImportStatusName(record.status)},
+        {"sourcePath", record.sourcePath},
+        {"importedPath", record.importedPath},
+        {"cachePath", record.cachePath},
+        {"tags", record.tags},
+        {"resolvedSourcePath", sourcePath.empty() ? std::string{} : sourcePath.generic_string()},
+        {"resolvedImportedPath", importedPath.empty() ? std::string{} : importedPath.generic_string()},
+        {"resolvedCachePath", cachePath.empty() ? std::string{} : cachePath.generic_string()},
+        {"sourceMissing", record.sourceMissing},
+        {"importedMetadataMissing", record.importedMetadataMissing},
+        {"cookedPayloadMissing", record.cookedPayloadMissing},
+        {"dependenciesMissing", record.dependenciesMissing},
+        {"stale", record.stale},
+        {"missing", record.missing},
+    };
+}
+
+const AssetRecord* findAssetRecordByGuid(const AssetRegistry& registry, const AssetGuid& guid) {
+    for (const AssetRecord& record : registry.records()) {
+        if (record.guid == guid) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+void appendValidationIssue(
+    nlohmann::json& array,
+    const char* severity,
+    const char* kind,
+    const AssetRecord& record,
+    std::string detail,
+    std::string path = {}) {
+    array.push_back({
+        {"severity", severity},
+        {"kind", kind},
+        {"guid", record.guid},
+        {"displayName", record.displayName},
+        {"assetType", assetTypeName(record.type)},
+        {"detail", std::move(detail)},
+        {"path", std::move(path)},
+    });
+}
+
+void appendComponentReferenceIssue(
+    nlohmann::json& array,
+    const Entity& entity,
+    const char* component,
+    const char* field,
+    const AssetGuid& guid) {
+    array.push_back({
+        {"severity", "error"},
+        {"kind", "InvalidComponentReference"},
+        {"entity", entity.name},
+        {"entityUuid", entity.uuid},
+        {"component", component},
+        {"field", field},
+        {"guid", guid},
+        {"detail", "Component references an asset GUID that is not present in the asset registry."},
+    });
+}
+
+bool supportedCoordinateConversion(std::string_view value) {
+    return value == "None" || value == "glTF Y-Up to Engine" || value == "Z-Up to Engine";
+}
+
+bool projectReferenceScanFileCandidate(const std::filesystem::path& path) {
+    const std::string filename = lowerString(path.filename().string());
+    const std::string ext = lowerString(path.extension().string());
+    if (ext == ".rtlevel" || ext == ".mscene" || ext == ".vproject") {
+        return true;
+    }
+    auto endsWith = [&](const char* suffix) {
+        const std::string value(suffix);
+        return filename.size() >= value.size() && filename.compare(filename.size() - value.size(), value.size(), value) == 0;
+    };
+    return endsWith(".rtprefab.json") ||
+        endsWith(".rtmesh.json") ||
+        endsWith(".rtmaterial.json") ||
+        endsWith(".rttexture.json") ||
+        endsWith(".rthdri.json");
+}
+
+void appendUniqueScanRoot(std::vector<std::filesystem::path>& roots, const std::filesystem::path& root) {
+    if (root.empty()) {
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) {
+        return;
+    }
+    const std::filesystem::path canonical = canonicalForCompare(root);
+    for (const std::filesystem::path& existing : roots) {
+        if (canonicalForCompare(existing) == canonical) {
+            return;
+        }
+    }
+    roots.push_back(canonical);
+}
+
+std::string jsonPathChild(std::string parent, const std::string& child) {
+    if (parent.empty()) {
+        parent = "$";
+    }
+    return parent + "/" + child;
+}
+
+void appendGuidOccurrences(const nlohmann::json& value, const AssetGuid& targetGuid, const std::string& jsonPath, nlohmann::json& occurrences) {
+    if (value.is_string()) {
+        if (value.get<std::string>() == targetGuid) {
+            occurrences.push_back({{"jsonPath", jsonPath.empty() ? "$" : jsonPath}});
+        }
+        return;
+    }
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            appendGuidOccurrences(it.value(), targetGuid, jsonPathChild(jsonPath, it.key()), occurrences);
+        }
+        return;
+    }
+    if (value.is_array()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            appendGuidOccurrences(value[i], targetGuid, jsonPathChild(jsonPath, std::to_string(i)), occurrences);
+        }
+    }
+}
+
+void collectProjectReferenceScanFiles(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    nlohmann::json& checkedRoots,
+    std::vector<std::filesystem::path>& files) {
+    std::vector<std::filesystem::path> roots;
+    if (state.project != nullptr) {
+        appendUniqueScanRoot(roots, state.project->contentRoot);
+        appendUniqueScanRoot(roots, state.project->scenesRoot);
+    } else {
+        appendUniqueScanRoot(roots, browserRoot);
+    }
+
+    for (const std::filesystem::path& root : roots) {
+        checkedRoots.push_back(root.generic_string());
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (ec) {
+                break;
+            }
+            std::error_code entryError;
+            if (entry.is_regular_file(entryError) && projectReferenceScanFileCandidate(entry.path())) {
+                files.push_back(canonicalForCompare(entry.path()));
+            }
+        }
+    }
+    if (state.project != nullptr && !state.project->projectFile.empty()) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(state.project->projectFile, ec) && projectReferenceScanFileCandidate(state.project->projectFile)) {
+            files.push_back(canonicalForCompare(state.project->projectFile));
+        }
+    }
+    std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+}
+
+void appendInvalidSavedGuidReferences(
+    const nlohmann::json& value,
+    const std::unordered_set<AssetGuid>& registryGuids,
+    const std::filesystem::path& filePath,
+    const std::string& jsonPath,
+    std::string objectKey,
+    nlohmann::json& invalidReferences) {
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            appendInvalidSavedGuidReferences(it.value(), registryGuids, filePath, jsonPathChild(jsonPath, it.key()), it.key(), invalidReferences);
+        }
+        return;
+    }
+    if (value.is_array()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            appendInvalidSavedGuidReferences(value[i], registryGuids, filePath, jsonPathChild(jsonPath, std::to_string(i)), objectKey, invalidReferences);
+        }
+        return;
+    }
+    if (!value.is_string()) {
+        return;
+    }
+
+    const std::string keyLower = lowerString(std::move(objectKey));
+    if (keyLower.find("guid") == std::string::npos) {
+        return;
+    }
+    const std::string guid = value.get<std::string>();
+    if (guid.empty() || registryGuids.find(guid) != registryGuids.end()) {
+        return;
+    }
+    invalidReferences.push_back({
+        {"severity", "error"},
+        {"kind", "InvalidSavedProjectReference"},
+        {"file", filePath.generic_string()},
+        {"jsonPath", jsonPath.empty() ? "$" : jsonPath},
+        {"field", keyLower},
+        {"guid", guid},
+        {"detail", "Saved project metadata contains a GUID field whose value is not present in the loaded asset registry."},
+    });
+}
+
+nlohmann::json sourceControlPolicyReportJson(size_t copiedSourceAssetCount) {
+    return {
+        {"schema", "TransparentAssetMetadataV1"},
+        {"commitImportedMetadata", true},
+        {"commitCopiedSourceAssets", copiedSourceAssetCount > 0},
+        {"copiedSourceAssetCount", copiedSourceAssetCount},
+        {"commitCookedPayloads", false},
+        {"commitThumbnails", false},
+        {"regenerateCookedPayloadsWhenMissing", true},
+        {"policy", "Commit deterministic Content metadata and copied SourceAssets when import settings internalize source files. Treat Cache payloads and thumbnails as generated unless a project-specific source-control policy says otherwise."},
+    };
+}
+
+size_t countValidationSeverity(const std::vector<const nlohmann::json*>& arrays, std::string_view severity) {
+    size_t count = 0;
+    for (const nlohmann::json* array : arrays) {
+        if (array == nullptr || !array->is_array()) {
+            continue;
+        }
+        for (const nlohmann::json& item : *array) {
+            if (item.is_object() && item.value("severity", std::string{}) == severity) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+nlohmann::json buildAssetValidationReport(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& targetGuid = {}) {
+    const bool scopedToAsset = !targetGuid.empty();
+    nlohmann::json missingSources = nlohmann::json::array();
+    nlohmann::json missingImportedMetadata = nlohmann::json::array();
+    nlohmann::json missingCookedPayloads = nlohmann::json::array();
+    nlohmann::json missingDependencies = nlohmann::json::array();
+    nlohmann::json staleAssets = nlohmann::json::array();
+    nlohmann::json unsupportedImportSettings = nlohmann::json::array();
+    nlohmann::json invalidComponentReferences = nlohmann::json::array();
+    nlohmann::json invalidSavedProjectReferences = nlohmann::json::array();
+    nlohmann::json savedProjectReferenceParseErrors = nlohmann::json::array();
+    nlohmann::json savedProjectReferenceScanRoots = nlohmann::json::array();
+    nlohmann::json requiresReimport = nlohmann::json::array();
+    nlohmann::json reverseAssetReferences = nlohmann::json::array();
+    nlohmann::json currentSceneReferences = nlohmann::json::array();
+    size_t copiedSourceAssetCount = 0;
+    size_t validatedAssetCount = 0;
+    nlohmann::json selectedAsset = nlohmann::json::object();
+
+    std::unordered_set<AssetGuid> registryGuids;
+    if (state.assetRegistry != nullptr) {
+        registryGuids.reserve(state.assetRegistry->records().size());
+        for (const AssetRecord& record : state.assetRegistry->records()) {
+            if (!record.guid.empty()) {
+                registryGuids.insert(record.guid);
+            }
+        }
+
+        for (const AssetRecord& record : state.assetRegistry->records()) {
+            if (record.importSettings.copySourceIntoProject) {
+                ++copiedSourceAssetCount;
+            }
+            if (scopedToAsset && record.guid != targetGuid) {
+                for (const AssetDependency& dependency : record.dependencies) {
+                    if (dependency.guid == targetGuid) {
+                        reverseAssetReferences.push_back({
+                            {"ownerGuid", record.guid},
+                            {"ownerDisplayName", record.displayName},
+                            {"ownerAssetType", assetTypeName(record.type)},
+                            {"role", dependency.kind.empty() ? "dependency" : dependency.kind},
+                            {"source", "Dependency"},
+                        });
+                    }
+                }
+                for (const AssetGuid& reference : record.references) {
+                    if (reference == targetGuid) {
+                        reverseAssetReferences.push_back({
+                            {"ownerGuid", record.guid},
+                            {"ownerDisplayName", record.displayName},
+                            {"ownerAssetType", assetTypeName(record.type)},
+                            {"role", "reference"},
+                            {"source", "Reference"},
+                        });
+                    }
+                }
+                continue;
+            }
+            ++validatedAssetCount;
+            if (scopedToAsset) {
+                selectedAsset = {
+                    {"guid", record.guid},
+                    {"displayName", record.displayName},
+                    {"assetType", assetTypeName(record.type)},
+                    {"status", assetImportStatusName(record.status)},
+                    {"sourcePath", record.sourcePath},
+                    {"importedPath", record.importedPath},
+                    {"cachePath", record.cachePath},
+                    {"tags", record.tags},
+                };
+            }
+            const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
+            const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
+            const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
+            const bool sourceMissing = !record.sourcePath.empty() && !regularFileExists(sourcePath);
+            const bool importedMissing = !record.importedPath.empty() && !regularFileExists(importedPath);
+            const bool cookedMissing = !record.cachePath.empty() && !regularFileExists(cachePath);
+
+            if (sourceMissing || record.sourceMissing) {
+                appendValidationIssue(missingSources, "warning", "MissingSource", record, "Raw import source is missing.", record.sourcePath);
+            }
+            if (importedMissing || record.importedMetadataMissing) {
+                appendValidationIssue(missingImportedMetadata, "error", "MissingImportedMetadata", record, "Imported asset metadata file is missing.", record.importedPath);
+            }
+            if (cookedMissing || record.cookedPayloadMissing) {
+                appendValidationIssue(missingCookedPayloads, "error", "MissingCookedPayload", record, "Cooked/runtime payload is missing.", record.cachePath);
+            }
+            for (const AssetDependency& dependency : record.dependencies) {
+                if (!dependency.guid.empty() && registryGuids.find(dependency.guid) == registryGuids.end()) {
+                    missingDependencies.push_back({
+                        {"severity", "error"},
+                        {"kind", "MissingDependencyGuid"},
+                        {"ownerGuid", record.guid},
+                        {"ownerDisplayName", record.displayName},
+                        {"ownerAssetType", assetTypeName(record.type)},
+                        {"dependencyGuid", dependency.guid},
+                        {"dependencyKind", dependency.kind},
+                        {"detail", "Dependency GUID is not present in the asset registry."},
+                    });
+                }
+            }
+            if (record.stale || record.status == AssetImportStatus::Stale) {
+                appendValidationIssue(staleAssets, "warning", "StaleAsset", record, "Source is newer than imported metadata or cooked payload.");
+            }
+            if (record.status == AssetImportStatus::Failed || record.stale || importedMissing || cookedMissing) {
+                appendValidationIssue(requiresReimport, record.status == AssetImportStatus::Failed ? "error" : "warning", "RequiresReimport", record, "Asset should be reimported or repaired before cooking/packaging.");
+            }
+            if (record.importSettings.unitScale <= 0.0f) {
+                appendValidationIssue(unsupportedImportSettings, "error", "InvalidUnitScale", record, "Import unit scale must be greater than zero.");
+            }
+            if (!supportedCoordinateConversion(record.importSettings.coordinateConversion)) {
+                appendValidationIssue(unsupportedImportSettings, "warning", "UnsupportedCoordinateConversion", record, "Import coordinate conversion is not recognized: " + record.importSettings.coordinateConversion);
+            }
+        }
+    }
+
+    if (state.sceneDocument != nullptr) {
+        for (const Entity* entity : state.sceneDocument->registry().entities()) {
+            if (entity == nullptr || !entity->meshRenderer.has_value()) {
+                continue;
+            }
+            const MeshRenderer& renderer = *entity->meshRenderer;
+            if (scopedToAsset && renderer.meshGuid == targetGuid) {
+                currentSceneReferences.push_back({
+                    {"entity", entity->name},
+                    {"entityUuid", entity->uuid},
+                    {"component", "MeshRenderer"},
+                    {"field", "meshGuid"},
+                    {"guid", renderer.meshGuid},
+                });
+            } else if (!scopedToAsset && !renderer.meshGuid.empty() && registryGuids.find(renderer.meshGuid) == registryGuids.end()) {
+                appendComponentReferenceIssue(invalidComponentReferences, *entity, "MeshRenderer", "meshGuid", renderer.meshGuid);
+            }
+            for (const MaterialSlot& slot : renderer.materialSlots) {
+                if (scopedToAsset && slot.materialGuid == targetGuid) {
+                    currentSceneReferences.push_back({
+                        {"entity", entity->name},
+                        {"entityUuid", entity->uuid},
+                        {"component", "MeshRenderer"},
+                        {"field", "materialGuid"},
+                        {"guid", slot.materialGuid},
+                    });
+                } else if (!scopedToAsset && !slot.materialGuid.empty() && registryGuids.find(slot.materialGuid) == registryGuids.end()) {
+                    appendComponentReferenceIssue(invalidComponentReferences, *entity, "MeshRenderer", "materialGuid", slot.materialGuid);
+                }
+                if (scopedToAsset && slot.overrideMaterialGuid.has_value() && *slot.overrideMaterialGuid == targetGuid) {
+                    currentSceneReferences.push_back({
+                        {"entity", entity->name},
+                        {"entityUuid", entity->uuid},
+                        {"component", "MeshRenderer"},
+                        {"field", "overrideMaterialGuid"},
+                        {"guid", *slot.overrideMaterialGuid},
+                    });
+                } else if (!scopedToAsset && slot.overrideMaterialGuid.has_value() && !slot.overrideMaterialGuid->empty() && registryGuids.find(*slot.overrideMaterialGuid) == registryGuids.end()) {
+                    appendComponentReferenceIssue(invalidComponentReferences, *entity, "MeshRenderer", "overrideMaterialGuid", *slot.overrideMaterialGuid);
+                }
+            }
+        }
+        for (const PrefabInstance& instance : state.sceneDocument->prefabInstances()) {
+            if (scopedToAsset && instance.prefabGuid == targetGuid) {
+                currentSceneReferences.push_back({
+                    {"entity", "Prefab Instance"},
+                    {"entityUuid", instance.instanceRoot.index},
+                    {"component", "PrefabInstance"},
+                    {"field", "prefabGuid"},
+                    {"guid", instance.prefabGuid},
+                });
+            } else if (!scopedToAsset && !instance.prefabGuid.empty() && registryGuids.find(instance.prefabGuid) == registryGuids.end()) {
+                invalidComponentReferences.push_back({
+                    {"severity", "error"},
+                    {"kind", "InvalidPrefabInstanceReference"},
+                    {"prefabGuid", instance.prefabGuid},
+                    {"instanceRoot", instance.instanceRoot.index},
+                    {"detail", "Prefab instance references an asset GUID that is not present in the asset registry."},
+                });
+            }
+        }
+    }
+
+    size_t savedProjectReferenceScannedFileCount = 0;
+    if (!scopedToAsset) {
+        std::vector<std::filesystem::path> files;
+        collectProjectReferenceScanFiles(state, browserRoot, savedProjectReferenceScanRoots, files);
+        savedProjectReferenceScannedFileCount = files.size();
+        for (const std::filesystem::path& path : files) {
+            std::optional<nlohmann::json> json = readJsonFile(path);
+            if (!json.has_value()) {
+                savedProjectReferenceParseErrors.push_back({
+                    {"severity", "warning"},
+                    {"kind", "SavedProjectReferenceParseError"},
+                    {"file", path.generic_string()},
+                    {"detail", "File matched the project reference validation set but could not be parsed as JSON."},
+                });
+                continue;
+            }
+            appendInvalidSavedGuidReferences(*json, registryGuids, path, "$", {}, invalidSavedProjectReferences);
+        }
+    }
+
+    const std::vector<const nlohmann::json*> issueArrays = {
+        &missingSources,
+        &missingImportedMetadata,
+        &missingCookedPayloads,
+        &missingDependencies,
+        &staleAssets,
+        &unsupportedImportSettings,
+        &invalidComponentReferences,
+        &invalidSavedProjectReferences,
+        &savedProjectReferenceParseErrors,
+        &requiresReimport,
+    };
+    const size_t errorCount = countValidationSeverity(issueArrays, "error");
+    const size_t warningCount = countValidationSeverity(issueArrays, "warning");
+    return {
+        {"version", 1},
+        {"kind", scopedToAsset ? "SelectedAssetValidationReport" : "AssetValidationReport"},
+        {"targetGuid", targetGuid},
+        {"selectedAsset", selectedAsset},
+        {"assetCount", scopedToAsset ? validatedAssetCount : state.assetRegistry != nullptr ? state.assetRegistry->records().size() : 0},
+        {"errorCount", errorCount},
+        {"warningCount", warningCount},
+        {"sourceControlPolicy", sourceControlPolicyReportJson(copiedSourceAssetCount)},
+        {"missingSources", missingSources},
+        {"missingImportedMetadata", missingImportedMetadata},
+        {"missingCookedPayloads", missingCookedPayloads},
+        {"missingDependencies", missingDependencies},
+        {"staleAssets", staleAssets},
+        {"unsupportedImportSettings", unsupportedImportSettings},
+        {"invalidComponentReferences", invalidComponentReferences},
+        {"invalidSavedProjectReferences", invalidSavedProjectReferences},
+        {"savedProjectReferenceParseErrors", savedProjectReferenceParseErrors},
+        {"savedProjectReferenceScanRoots", savedProjectReferenceScanRoots},
+        {"savedProjectReferenceScannedFileCount", savedProjectReferenceScannedFileCount},
+        {"requiresReimport", requiresReimport},
+        {"reverseAssetReferences", reverseAssetReferences},
+        {"currentSceneReferences", currentSceneReferences},
+    };
+}
+
+nlohmann::json buildAssetDependencyReport(const EditorRuntimeState& state, const AssetGuid& targetGuid) {
+    nlohmann::json dependencies = nlohmann::json::array();
+    nlohmann::json storedReferences = nlohmann::json::array();
+    nlohmann::json selectedAsset = nlohmann::json::object();
+    if (state.assetRegistry == nullptr) {
+        return {
+            {"version", 1},
+            {"kind", "SelectedAssetDependencyReport"},
+            {"targetGuid", targetGuid},
+            {"selectedAsset", selectedAsset},
+            {"dependencies", dependencies},
+            {"storedReferences", storedReferences},
+        };
+    }
+
+    const AssetRecord* target = findAssetRecordByGuid(*state.assetRegistry, targetGuid);
+    if (target != nullptr) {
+        selectedAsset = assetRecordSummaryJson(state, *target);
+        for (const AssetDependency& dependency : target->dependencies) {
+            const AssetRecord* linked = findAssetRecordByGuid(*state.assetRegistry, dependency.guid);
+            dependencies.push_back({
+                {"guid", dependency.guid},
+                {"role", dependency.kind.empty() ? "dependency" : dependency.kind},
+                {"found", linked != nullptr},
+                {"asset", linked != nullptr ? assetRecordSummaryJson(state, *linked) : nlohmann::json::object()},
+            });
+        }
+        for (const AssetGuid& reference : target->references) {
+            const AssetRecord* linked = findAssetRecordByGuid(*state.assetRegistry, reference);
+            storedReferences.push_back({
+                {"guid", reference},
+                {"role", "reference"},
+                {"found", linked != nullptr},
+                {"asset", linked != nullptr ? assetRecordSummaryJson(state, *linked) : nlohmann::json::object()},
+            });
+        }
+    }
+
+    return {
+        {"version", 1},
+        {"kind", "SelectedAssetDependencyReport"},
+        {"targetGuid", targetGuid},
+        {"selectedAsset", selectedAsset},
+        {"dependencyCount", dependencies.size()},
+        {"storedReferenceCount", storedReferences.size()},
+        {"dependencies", dependencies},
+        {"storedReferences", storedReferences},
+    };
+}
+
+nlohmann::json buildAssetReferenceReport(const EditorRuntimeState& state, const AssetGuid& targetGuid) {
+    nlohmann::json registryReferences = nlohmann::json::array();
+    nlohmann::json currentSceneReferences = nlohmann::json::array();
+    nlohmann::json selectedAsset = nlohmann::json::object();
+    if (state.assetRegistry != nullptr) {
+        const AssetRecord* target = findAssetRecordByGuid(*state.assetRegistry, targetGuid);
+        if (target != nullptr) {
+            selectedAsset = assetRecordSummaryJson(state, *target);
+        }
+        for (const AssetRecord& owner : state.assetRegistry->records()) {
+            if (owner.guid == targetGuid) {
+                continue;
+            }
+            for (const AssetDependency& dependency : owner.dependencies) {
+                if (dependency.guid == targetGuid) {
+                    registryReferences.push_back({
+                        {"source", "Dependency"},
+                        {"role", dependency.kind.empty() ? "dependency" : dependency.kind},
+                        {"owner", assetRecordSummaryJson(state, owner)},
+                    });
+                }
+            }
+            for (const AssetGuid& reference : owner.references) {
+                if (reference == targetGuid) {
+                    registryReferences.push_back({
+                        {"source", "Reference"},
+                        {"role", "reference"},
+                        {"owner", assetRecordSummaryJson(state, owner)},
+                    });
+                }
+            }
+        }
+    }
+
+    if (state.sceneDocument != nullptr) {
+        for (const Entity* entity : state.sceneDocument->registry().entities()) {
+            if (entity == nullptr || !entity->meshRenderer.has_value()) {
+                continue;
+            }
+            const MeshRenderer& renderer = *entity->meshRenderer;
+            auto appendSceneReference = [&](const char* field) {
+                currentSceneReferences.push_back({
+                    {"entity", entity->name},
+                    {"entityUuid", entity->uuid},
+                    {"component", "MeshRenderer"},
+                    {"field", field},
+                });
+            };
+            if (renderer.meshGuid == targetGuid) {
+                appendSceneReference("meshGuid");
+            }
+            for (const MaterialSlot& slot : renderer.materialSlots) {
+                if (slot.materialGuid == targetGuid) {
+                    appendSceneReference("materialGuid");
+                }
+                if (slot.overrideMaterialGuid.has_value() && *slot.overrideMaterialGuid == targetGuid) {
+                    appendSceneReference("overrideMaterialGuid");
+                }
+            }
+        }
+        for (const PrefabInstance& instance : state.sceneDocument->prefabInstances()) {
+            if (instance.prefabGuid == targetGuid) {
+                currentSceneReferences.push_back({
+                    {"entity", "Prefab Instance"},
+                    {"entityUuid", instance.instanceRoot.index},
+                    {"component", "PrefabInstance"},
+                    {"field", "prefabGuid"},
+                });
+            }
+        }
+    }
+
+    return {
+        {"version", 1},
+        {"kind", "SelectedAssetReferenceReport"},
+        {"targetGuid", targetGuid},
+        {"selectedAsset", selectedAsset},
+        {"registryReferenceCount", registryReferences.size()},
+        {"currentSceneReferenceCount", currentSceneReferences.size()},
+        {"registryReferences", registryReferences},
+        {"currentSceneReferences", currentSceneReferences},
+    };
+}
+
+nlohmann::json buildAssetProjectReferenceScanReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetGuid& targetGuid,
+    const std::unordered_set<std::string>& excludedFileKeys = {});
+
+nlohmann::json buildAssetDeleteReadinessReport(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& targetGuid) {
+    nlohmann::json referenceReport = buildAssetReferenceReport(state, targetGuid);
+    std::unordered_set<std::string> excludedReferenceFiles;
+    if (state.assetRegistry != nullptr) {
+        if (const AssetRecord* target = findAssetRecordByGuid(*state.assetRegistry, targetGuid)) {
+            const std::filesystem::path targetMetadataPath = resolveAssetRecordPath(state, target->importedPath);
+            if (!targetMetadataPath.empty()) {
+                excludedReferenceFiles.insert(canonicalForCompare(targetMetadataPath).string());
+            }
+        }
+    }
+    nlohmann::json projectReferenceScan = buildAssetProjectReferenceScanReport(state, browserRoot, targetGuid, excludedReferenceFiles);
+    const size_t registryReferenceCount = referenceReport.value("registryReferenceCount", 0u);
+    const size_t currentSceneReferenceCount = referenceReport.value("currentSceneReferenceCount", 0u);
+    const size_t savedProjectReferenceCount = projectReferenceScan.value("referenceOccurrenceCount", 0u);
+    const size_t savedProjectReferencingFileCount = projectReferenceScan.value("referencingFileCount", 0u);
+    const size_t savedProjectParseErrorCount = projectReferenceScan.value("parseErrorCount", 0u);
+    const bool blockedByCheckedData = registryReferenceCount > 0 || currentSceneReferenceCount > 0 || savedProjectReferenceCount > 0 || savedProjectParseErrorCount > 0;
+    nlohmann::json blockers = nlohmann::json::array();
+
+    if (registryReferenceCount > 0) {
+        blockers.push_back({
+            {"scope", "LoadedAssetRegistry"},
+            {"severity", "warning"},
+            {"count", registryReferenceCount},
+            {"detail", "Loaded registry records still depend on or reference this asset GUID."},
+        });
+    }
+    if (currentSceneReferenceCount > 0) {
+        blockers.push_back({
+            {"scope", "CurrentScene"},
+            {"severity", "warning"},
+            {"count", currentSceneReferenceCount},
+            {"detail", "The current scene still contains component or prefab references to this asset GUID."},
+        });
+    }
+    if (savedProjectReferenceCount > 0) {
+        blockers.push_back({
+            {"scope", "SavedProjectMetadata"},
+            {"severity", "warning"},
+            {"count", savedProjectReferenceCount},
+            {"fileCount", savedProjectReferencingFileCount},
+            {"detail", "Saved project metadata files contain this asset GUID."},
+        });
+    }
+    if (savedProjectParseErrorCount > 0) {
+        blockers.push_back({
+            {"scope", "SavedProjectMetadata"},
+            {"severity", "warning"},
+            {"count", savedProjectParseErrorCount},
+            {"detail", "One or more saved project metadata files could not be parsed, so saved-file readiness is not fully verified."},
+        });
+    }
+
+    return {
+        {"version", 1},
+        {"kind", "SelectedAssetDeleteReadinessReport"},
+        {"targetGuid", targetGuid},
+        {"selectedAsset", referenceReport.value("selectedAsset", nlohmann::json::object())},
+        {"deleteReadyForLoadedData", registryReferenceCount == 0 && currentSceneReferenceCount == 0},
+        {"deleteReadyForSavedProjectFiles", savedProjectReferenceCount == 0 && savedProjectParseErrorCount == 0},
+        {"deleteReadyForCheckedScopes", !blockedByCheckedData},
+        {"registryReferenceCount", registryReferenceCount},
+        {"currentSceneReferenceCount", currentSceneReferenceCount},
+        {"savedProjectReferenceCount", savedProjectReferenceCount},
+        {"savedProjectReferencingFileCount", savedProjectReferencingFileCount},
+        {"savedProjectReferenceParseErrorCount", savedProjectParseErrorCount},
+        {"blockers", blockers},
+        {"registryReferences", referenceReport.value("registryReferences", nlohmann::json::array())},
+        {"currentSceneReferences", referenceReport.value("currentSceneReferences", nlohmann::json::array())},
+        {"savedProjectReferenceScan", projectReferenceScan},
+        {"checkedScopes", nlohmann::json::array({"LoadedAssetRegistry", "CurrentScene", "SavedProjectMetadata"})},
+        {"uncheckedScopes", nlohmann::json::array({"GeneratedCachePayloadInternals", "ExternalProjectFiles", "OpaquePackages"})},
+        {"recommendation", blockedByCheckedData
+            ? "Replace or remove loaded-registry, current-scene, and saved-project metadata references, and resolve saved metadata parse errors, before deleting this asset."
+            : "No references were found in the loaded registry, current scene, or saved project metadata scan. Destructive deletion still remains disabled until cross-file rewrite and package/cache validation workflows are implemented."},
+        {"destructiveActionEnabled", false},
+        {"limitation", "This report checks loaded data plus saved project JSON metadata. It does not rewrite references or inspect generated cache payload internals, external project files, or opaque packages."},
+    };
+}
+
+nlohmann::json buildAssetProjectReferenceScanReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetGuid& targetGuid,
+    const std::unordered_set<std::string>& excludedFileKeys) {
+    nlohmann::json selectedAsset = nlohmann::json::object();
+    if (state.assetRegistry != nullptr) {
+        if (const AssetRecord* target = findAssetRecordByGuid(*state.assetRegistry, targetGuid)) {
+            selectedAsset = assetRecordSummaryJson(state, *target);
+        }
+    }
+
+    nlohmann::json checkedRoots = nlohmann::json::array();
+    std::vector<std::filesystem::path> files;
+    collectProjectReferenceScanFiles(state, browserRoot, checkedRoots, files);
+
+    nlohmann::json scannedFiles = nlohmann::json::array();
+    nlohmann::json filesWithReferences = nlohmann::json::array();
+    nlohmann::json excludedFilesWithReferences = nlohmann::json::array();
+    nlohmann::json parseErrors = nlohmann::json::array();
+    size_t occurrenceCount = 0;
+    size_t excludedOccurrenceCount = 0;
+    for (const std::filesystem::path& path : files) {
+        scannedFiles.push_back(path.generic_string());
+        std::optional<nlohmann::json> json = readJsonFile(path);
+        if (!json.has_value()) {
+            parseErrors.push_back({
+                {"path", path.generic_string()},
+                {"detail", "File matched the project reference scan set but could not be parsed as JSON."},
+            });
+            continue;
+        }
+        nlohmann::json occurrences = nlohmann::json::array();
+        appendGuidOccurrences(*json, targetGuid, "$", occurrences);
+        if (!occurrences.empty()) {
+            const std::string fileKey = canonicalForCompare(path).string();
+            if (excludedFileKeys.find(fileKey) != excludedFileKeys.end()) {
+                excludedOccurrenceCount += occurrences.size();
+                excludedFilesWithReferences.push_back({
+                    {"path", path.generic_string()},
+                    {"referenceCount", occurrences.size()},
+                    {"occurrences", occurrences},
+                    {"reason", "SelectedAssetMetadata"},
+                });
+                continue;
+            }
+            occurrenceCount += occurrences.size();
+            filesWithReferences.push_back({
+                {"path", path.generic_string()},
+                {"referenceCount", occurrences.size()},
+                {"occurrences", occurrences},
+            });
+        }
+    }
+
+    return {
+        {"version", 1},
+        {"kind", "SelectedAssetProjectReferenceScanReport"},
+        {"targetGuid", targetGuid},
+        {"selectedAsset", selectedAsset},
+        {"checkedRoots", checkedRoots},
+        {"scannedFileCount", scannedFiles.size()},
+        {"referencingFileCount", filesWithReferences.size()},
+        {"referenceOccurrenceCount", occurrenceCount},
+        {"excludedReferenceOccurrenceCount", excludedOccurrenceCount},
+        {"excludedFilesWithReferences", excludedFilesWithReferences},
+        {"scannedFiles", scannedFiles},
+        {"filesWithReferences", filesWithReferences},
+        {"parseErrorCount", parseErrors.size()},
+        {"parseErrors", parseErrors},
+        {"checkedFileTypes", nlohmann::json::array({".rtlevel", ".mscene", ".vproject", ".rtprefab.json", ".rtmesh.json", ".rtmaterial.json", ".rttexture.json", ".rthdri.json"})},
+        {"limitation", "This is a saved-file JSON scan for project content and scene roots. It does not rewrite references or inspect generated cache payload internals."},
+    };
+}
+
+nlohmann::json buildAssetBrokenPlaceholderReport(const EditorRuntimeState& state, const AssetRecord& record) {
+    const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
+    const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
+    const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
+    const bool sourceMissing = !record.sourcePath.empty() && !regularFileExists(sourcePath);
+    const bool importedMissing = !record.importedPath.empty() && !regularFileExists(importedPath);
+    const bool payloadMissing = !record.cachePath.empty() && !regularFileExists(cachePath);
+    const bool broken = record.missing || record.status == AssetImportStatus::Missing || record.sourceMissing || record.importedMetadataMissing || record.cookedPayloadMissing || record.dependenciesMissing || sourceMissing || importedMissing || payloadMissing;
+
+    nlohmann::json missingReasons = nlohmann::json::array();
+    auto appendReason = [&](const char* kind, const char* severity, const char* detail, const std::string& storedPath, const std::filesystem::path& resolvedPath) {
+        missingReasons.push_back({
+            {"kind", kind},
+            {"severity", severity},
+            {"detail", detail},
+            {"path", storedPath},
+            {"resolvedPath", resolvedPath.empty() ? std::string{} : resolvedPath.generic_string()},
+        });
+    };
+    if (record.sourceMissing || sourceMissing) {
+        appendReason("MissingSource", "warning", "Raw source is unavailable. Existing imported metadata and cooked payload may still be usable.", record.sourcePath, sourcePath);
+    }
+    if (record.importedMetadataMissing || importedMissing) {
+        appendReason("MissingImportedMetadata", "error", "Imported transparent asset metadata is missing.", record.importedPath, importedPath);
+    }
+    if (record.cookedPayloadMissing || payloadMissing) {
+        appendReason("MissingCookedPayload", "error", "Cooked/runtime payload is missing.", record.cachePath, cachePath);
+    }
+    if (record.dependenciesMissing) {
+        appendReason("MissingDependencyRecord", "error", "One or more dependency GUID records are missing from the loaded asset registry.", {}, {});
+    }
+    if (record.missing || record.status == AssetImportStatus::Missing) {
+        appendReason("MissingRegistryAsset", "error", "Registry status marks this asset as missing or broken.", {}, {});
+    }
+
+    nlohmann::json availableActions = nlohmann::json::array();
+    availableActions.push_back({
+        {"action", "RevealMetadata"},
+        {"available", !importedPath.empty() && regularFileExists(importedPath)},
+        {"detail", "Reveal imported metadata when it exists."},
+    });
+    availableActions.push_back({
+        {"action", "RevealPayload"},
+        {"available", !cachePath.empty() && regularFileExists(cachePath)},
+        {"detail", "Reveal cooked/runtime payload when it exists."},
+    });
+    availableActions.push_back({
+        {"action", "RelinkSource"},
+        {"available", true},
+        {"detail", "Choose a replacement raw source path for this registry record."},
+    });
+    availableActions.push_back({
+        {"action", "RebuildPayload"},
+        {"available", !record.sourcePath.empty() && regularFileExists(sourcePath)},
+        {"detail", "Queue reimport to regenerate missing metadata or cooked/runtime payloads when source is available."},
+    });
+
+    return {
+        {"version", 1},
+        {"kind", "SelectedAssetBrokenPlaceholderReport"},
+        {"targetGuid", record.guid},
+        {"selectedAsset", assetRecordSummaryJson(state, record)},
+        {"placeholderRequired", broken},
+        {"placeholderKind", broken ? "BrokenAsset" : "None"},
+        {"missingReasons", missingReasons},
+        {"availableActions", availableActions},
+        {"placementPolicy", broken
+            ? "Placement should show a broken asset placeholder or block placement until metadata/payload references are repaired."
+            : "No broken placeholder is required for the currently loaded registry health state."},
+        {"limitation", "This report describes loaded registry health and filesystem availability for the selected record. It does not create a runtime placeholder mesh or repair files automatically."},
+    };
+}
+
+bool writeAssetRelationshipReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetGuid& targetGuid,
+    bool referencesReport,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (state.assetRegistry == nullptr) {
+        outError = "Asset registry is unavailable.";
+        return false;
+    }
+    outPath = selectedAssetRelationshipReportPath(state, browserRoot, targetGuid, referencesReport ? "references" : "dependencies");
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write asset relationship report: " + outPath.string();
+        return false;
+    }
+    file << (referencesReport ? buildAssetReferenceReport(state, targetGuid) : buildAssetDependencyReport(state, targetGuid)).dump(2);
+    return true;
+}
+
+bool writeAssetDeleteReadinessReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetGuid& targetGuid,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (state.assetRegistry == nullptr) {
+        outError = "Asset registry is unavailable.";
+        return false;
+    }
+    outPath = selectedAssetDeleteReadinessReportPath(state, browserRoot, targetGuid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write asset delete-readiness report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetDeleteReadinessReport(state, browserRoot, targetGuid).dump(2);
+    return true;
+}
+
+bool writeAssetProjectReferenceScanReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetGuid& targetGuid,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedAssetProjectReferenceReportPath(state, browserRoot, targetGuid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write asset project reference scan report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetProjectReferenceScanReport(state, browserRoot, targetGuid).dump(2);
+    return true;
+}
+
+bool writeAssetBrokenPlaceholderReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetRecord& record,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedAssetBrokenPlaceholderReportPath(state, browserRoot, record.guid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write asset broken-placeholder report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetBrokenPlaceholderReport(state, record).dump(2);
+    return true;
+}
+
+bool writeAssetValidationReport(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, std::filesystem::path& outPath, std::string& outError, const AssetGuid& targetGuid = {}) {
+    if (state.assetRegistry == nullptr) {
+        outError = "Asset registry is unavailable.";
+        return false;
+    }
+    outPath = targetGuid.empty() ? assetValidationReportPath(state, browserRoot) : selectedAssetValidationReportPath(state, browserRoot, targetGuid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write asset validation report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetValidationReport(state, browserRoot, targetGuid).dump(2);
+    return true;
+}
+
 } // namespace
 
 void AssetBrowserPanel::invalidateThumbnails() {
     thumbnailCache_.clear();
     sourcePreviewCache_.clear();
+}
+
+bool AssetBrowserPanel::openSelectedAsset(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
+    showDetails_ = true;
+    if (!selectedRecordGuid_.empty() && state.assetRegistry != nullptr) {
+        for (const AssetRecord& record : state.assetRegistry->records()) {
+            if (record.guid != selectedRecordGuid_) {
+                continue;
+            }
+            if (record.type == AssetType::Material) {
+                if (std::optional<uint32_t> materialIndex = loadedMaterialIndexForRecord(state, record)) {
+                    selection.selectMaterial(*materialIndex);
+                    requests.showMaterialEditor = true;
+                    status_ = "Opened material: " + (record.displayName.empty() ? record.guid : record.displayName);
+                } else {
+                    requests.showMaterialEditor = true;
+                    status_ = "Opened Material Editor; selected material is not loaded in the current scene.";
+                }
+                return true;
+            }
+            if (record.type == AssetType::Prefab || record.type == AssetType::Mesh || record.type == AssetType::Scene) {
+                status_ = "Opened asset details: " + (record.displayName.empty() ? record.guid : record.displayName);
+                return true;
+            }
+            status_ = "Opened asset details: " + (record.displayName.empty() ? record.guid : record.displayName);
+            return true;
+        }
+        status_ = "Selected asset record is no longer available.";
+        return false;
+    }
+    if (!selectedPath_.empty()) {
+        if (std::filesystem::is_directory(selectedPath_)) {
+            navigateTo(selectedPath_);
+            status_ = "Opened folder: " + selectedPath_.filename().string();
+        } else if (isMaterialAssetPath(selectedPath_)) {
+            requests.showMaterialEditor = true;
+            status_ = "Opened Material Editor for selected material file.";
+        } else {
+            status_ = "Opened asset details: " + selectedPath_.filename().string();
+        }
+        return true;
+    }
+    status_ = "Select an asset in Content before using Open Asset.";
+    return false;
 }
 
 AssetBrowserPanel::CpuThumbnail& AssetBrowserPanel::thumbnailForPath(const std::filesystem::path& path) {
@@ -1042,6 +2475,7 @@ void AssetBrowserPanel::syncBrowserRoot(const EditorRuntimeState& state) {
         selectedRecordGuid_.clear();
         backStack_.clear();
         forwardStack_.clear();
+        sourceControlStatusCache_.clear();
     } else if (currentPath_.empty()) {
         currentPath_ = root;
     }
@@ -1098,7 +2532,7 @@ void AssetBrowserPanel::drawPathContextMenu(const std::filesystem::path& path, b
         }
         editorGlyphMenuItem(EditorGlyphIcon::Add, "New Folder", false);
         if (editorGlyphMenuItem(EditorGlyphIcon::Import, "Import Here...", !compatibilityMode_)) {
-            if (auto source = openGltfFileDialog()) {
+            if (auto source = openImportAssetFileDialog()) {
                 prepareImportDialog(*source, path, 0);
             }
         }
@@ -1123,14 +2557,15 @@ void AssetBrowserPanel::drawPathContextMenu(const std::filesystem::path& path, b
     }
 
     const bool canOpen = canOpenOrApplyPath(path);
-    const bool canImport = !compatibilityMode_ && isModelAssetPath(path);
+    const bool canImport = !compatibilityMode_ && isImportableSourceAssetPath(path);
+    const bool canImportAndPlace = !compatibilityMode_ && isPlaceablePrefabSourcePath(path);
     if (editorGlyphMenuItem(editorGlyphForPath(path), "Open / Apply", canOpen)) {
         loadFromPath(path, requests);
     }
     if (editorGlyphMenuItem(EditorGlyphIcon::Import, "Import Asset...", canImport)) {
         prepareImportDialog(path, currentPath_, 0);
     }
-    if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Import and Place...", canImport)) {
+    if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Import and Place...", canImportAndPlace)) {
         prepareImportDialog(path, currentPath_, 1);
     }
     editorGlyphMenuItem(EditorGlyphIcon::Details, "Preview", false);
@@ -1333,12 +2768,306 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         ImGui::TextDisabled("No registry records yet. Import Asset will populate this in the next milestone.");
         return;
     }
-    if (ImGui::BeginTable("AssetRegistryRecords", 10, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX)) {
+    const std::vector<std::string> registryTags = collectRegistryTags(state.assetRegistry);
+    const std::vector<std::string> tagSuggestions = mergedTagSuggestions(registryTags, state.editorPrefs);
+
+    constexpr const char* typeFilters[] = {"All Types", "Mesh", "Material", "Texture", "HDRI", "Scene", "Prefab", "Unknown"};
+    constexpr const char* statusFilters[] = {"All Status", "Imported", "Missing", "Stale", "Failed", "Unknown"};
+    constexpr const char* healthFilters[] = {
+        "All Health",
+        "Healthy",
+        "Any Issue",
+        "Source Missing",
+        "Metadata Missing",
+        "Payload Missing",
+        "Dependency Missing",
+        "Has Dependencies",
+        "Has References",
+        "Used By Loaded Data",
+    };
+    constexpr const char* favoriteFilters[] = {"All Assets", "Favorite Assets"};
+    registryTypeFilter_ = std::clamp(registryTypeFilter_, 0, static_cast<int>(std::size(typeFilters)) - 1);
+    registryStatusFilter_ = std::clamp(registryStatusFilter_, 0, static_cast<int>(std::size(statusFilters)) - 1);
+    registryHealthFilter_ = std::clamp(registryHealthFilter_, 0, static_cast<int>(std::size(healthFilters)) - 1);
+    registryFavoriteFilter_ = std::clamp(registryFavoriteFilter_, 0, static_cast<int>(std::size(favoriteFilters)) - 1);
+    const int collectionFilterMax = state.editorPrefs != nullptr ? static_cast<int>(state.editorPrefs->assetCollections.size()) : 0;
+    registryCollectionFilter_ = std::clamp(registryCollectionFilter_, 0, collectionFilterMax);
+
+    ImGui::PushID("RegistryFilters");
+    ImGui::SetNextItemWidth(126.0f);
+    ImGui::Combo("##type", &registryTypeFilter_, typeFilters, static_cast<int>(std::size(typeFilters)));
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Filter registry records by asset type");
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(126.0f);
+    ImGui::Combo("##status", &registryStatusFilter_, statusFilters, static_cast<int>(std::size(statusFilters)));
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Filter registry records by import status");
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(164.0f);
+    ImGui::Combo("##health", &registryHealthFilter_, healthFilters, static_cast<int>(std::size(healthFilters)));
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Filter registry records by health, dependencies, or loaded usage");
+    }
+    if (state.editorPrefs != nullptr) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(132.0f);
+        ImGui::Combo("##favorites", &registryFavoriteFilter_, favoriteFilters, static_cast<int>(std::size(favoriteFilters)));
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Filter registry records to favorite assets");
+        }
+    }
+    if (state.editorPrefs != nullptr && !state.editorPrefs->assetCollections.empty()) {
+        ImGui::SameLine();
+        const char* collectionLabel = "All Collections";
+        if (const EditorAssetCollection* collection = selectedCollection(state.editorPrefs, registryCollectionFilter_)) {
+            collectionLabel = collection->name.c_str();
+        }
+        if (ImGui::BeginCombo("##collectionFilter", collectionLabel)) {
+            if (ImGui::Selectable("All Collections", registryCollectionFilter_ == 0)) {
+                registryCollectionFilter_ = 0;
+            }
+            for (size_t i = 0; i < state.editorPrefs->assetCollections.size(); ++i) {
+                const int index = static_cast<int>(i + 1);
+                const EditorAssetCollection& collection = state.editorPrefs->assetCollections[i];
+                if (ImGui::Selectable(collection.name.c_str(), registryCollectionFilter_ == index)) {
+                    registryCollectionFilter_ = index;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Filter registry records by saved asset collection");
+        }
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(132.0f);
+    ImGui::InputTextWithHint("##tag", "Tag filter", registryTagFilter_.data(), registryTagFilter_.size());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Filter registry records by asset tag");
+    }
+    if (!tagSuggestions.empty()) {
+        ImGui::SameLine();
+        if (ImGui::BeginCombo("##tagPresetFilter", "Tags")) {
+            for (const std::string& tag : tagSuggestions) {
+                const bool selected = lowerString(trimString(registryTagFilter_.data())) == lowerString(tag);
+                if (ImGui::Selectable(tag.c_str(), selected)) {
+                    setTextBuffer(registryTagFilter_, tag);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Use an existing asset tag as the filter");
+        }
+    }
+    const bool filtersActive = registryTypeFilter_ != 0 || registryStatusFilter_ != 0 || registryHealthFilter_ != 0 || registryCollectionFilter_ != 0 || registryFavoriteFilter_ != 0 || registryTagFilter_[0] != '\0' || search_[0] != '\0';
+    if (filtersActive) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear Filters")) {
+            registryTypeFilter_ = 0;
+            registryStatusFilter_ = 0;
+            registryHealthFilter_ = 0;
+            registryCollectionFilter_ = 0;
+            registryFavoriteFilter_ = 0;
+            std::fill(registryTagFilter_.begin(), registryTagFilter_.end(), '\0');
+            std::fill(search_.begin(), search_.end(), '\0');
+        }
+    }
+    ImGui::PopID();
+
+    auto typeMatches = [&](AssetType type) {
+        switch (registryTypeFilter_) {
+        case 1: return type == AssetType::Mesh;
+        case 2: return type == AssetType::Material;
+        case 3: return type == AssetType::Texture;
+        case 4: return type == AssetType::HDRI;
+        case 5: return type == AssetType::Scene;
+        case 6: return type == AssetType::Prefab;
+        case 7: return type == AssetType::Unknown;
+        default: return true;
+        }
+    };
+    auto statusMatches = [&](AssetImportStatus status) {
+        switch (registryStatusFilter_) {
+        case 1: return status == AssetImportStatus::Imported;
+        case 2: return status == AssetImportStatus::Missing;
+        case 3: return status == AssetImportStatus::Stale;
+        case 4: return status == AssetImportStatus::Failed;
+        case 5: return status == AssetImportStatus::Unknown;
+        default: return true;
+        }
+    };
+    auto searchMatches = [&](const AssetRecord& record) {
+        const std::string filter = lowerString(search_.data());
+        if (filter.empty()) {
+            return true;
+        }
+        return lowerString(record.displayName).find(filter) != std::string::npos ||
+            lowerString(record.guid).find(filter) != std::string::npos ||
+            lowerString(record.sourcePath).find(filter) != std::string::npos ||
+            lowerString(record.importedPath).find(filter) != std::string::npos ||
+            lowerString(record.cachePath).find(filter) != std::string::npos ||
+            lowerString(joinTagList(record.tags)).find(filter) != std::string::npos;
+    };
+    auto healthMatches = [&](const AssetRecord& record) {
+        const AssetUsageSummary usage = registryHealthFilter_ == 9 ? assetUsageSummaryForRecord(state, record) : AssetUsageSummary{};
+        switch (registryHealthFilter_) {
+        case 1: return !record.missing && !record.stale && record.status == AssetImportStatus::Imported;
+        case 2: return record.missing || record.stale || record.sourceMissing || record.importedMetadataMissing || record.cookedPayloadMissing || record.dependenciesMissing || record.status == AssetImportStatus::Missing || record.status == AssetImportStatus::Stale || record.status == AssetImportStatus::Failed;
+        case 3: return record.sourceMissing;
+        case 4: return record.importedMetadataMissing;
+        case 5: return record.cookedPayloadMissing;
+        case 6: return record.dependenciesMissing;
+        case 7: return !record.dependencies.empty();
+        case 8: return !record.references.empty();
+        case 9: return usage.referenced();
+        default: return true;
+        }
+    };
+    auto recordMatchesFilters = [&](const AssetRecord& record) {
+        const EditorAssetCollection* collection = selectedCollection(state.editorPrefs, registryCollectionFilter_);
+        const bool collectionMatches = collection == nullptr || collectionContainsAsset(*collection, record.guid);
+        const bool favoriteMatches = registryFavoriteFilter_ == 0 || (state.editorPrefs != nullptr && assetGuidListContains(state.editorPrefs->favoriteAssetGuids, record.guid));
+        return typeMatches(record.type) && statusMatches(record.status) && healthMatches(record) && collectionMatches && favoriteMatches && recordHasTagMatch(record, registryTagFilter_.data()) && searchMatches(record);
+    };
+
+    std::vector<AssetGuid> visibleRecordGuids;
+    visibleRecordGuids.reserve(records.size());
+    for (const AssetRecord& record : records) {
+        if (recordMatchesFilters(record)) {
+            visibleRecordGuids.push_back(record.guid);
+        }
+    }
+    const size_t visibleRecordCount = visibleRecordGuids.size();
+    ImGui::TextDisabled("Showing %zu of %zu registry records", visibleRecordCount, records.size());
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::InputTextWithHint("##collectionName", "Collection", collectionNameBuffer_.data(), collectionNameBuffer_.size());
+    if (state.editorPrefs != nullptr && !state.editorPrefs->assetCollections.empty()) {
+        ImGui::SameLine();
+        if (ImGui::BeginCombo("##collectionPicker", "Collections")) {
+            for (const EditorAssetCollection& collection : state.editorPrefs->assetCollections) {
+                if (ImGui::Selectable(collection.name.c_str(), false)) {
+                    setTextBuffer(collectionNameBuffer_, collection.name);
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    const std::string collectionName = trimString(collectionNameBuffer_.data());
+    const bool canEditCollection = state.editorPrefs != nullptr && !collectionName.empty();
+    auto savePrefsStatus = [&](std::string successMessage, std::string failureDetail) {
+        if (state.editorPrefs == nullptr) {
+            return;
+        }
+        setPreferenceSaveStatus(state.editorPrefs->save(EditorPreferences::defaultPath()), status_, std::move(successMessage), std::move(failureDetail));
+    };
+    ImGui::SameLine();
+    if (!canEditCollection || visibleRecordGuids.empty()) {
+        ImGui::BeginDisabled();
+    }
+    if (contentActionButton("AddVisibleToCollection", EditorGlyphIcon::Add, "Add Visible", "Add currently visible registry records to this collection")) {
+        state.editorPrefs->addAssetsToCollection(collectionName, visibleRecordGuids);
+        savePrefsStatus("Added visible assets to collection: " + collectionName, "add visible assets to collection " + collectionName);
+    }
+    if (!canEditCollection || visibleRecordGuids.empty()) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    if (!canEditCollection || visibleRecordGuids.empty()) {
+        ImGui::BeginDisabled();
+    }
+    if (contentActionButton("RemoveVisibleFromCollection", EditorGlyphIcon::Trash, "Remove Visible", "Remove currently visible registry records from this collection")) {
+        state.editorPrefs->removeAssetsFromCollection(collectionName, visibleRecordGuids);
+        savePrefsStatus("Removed visible assets from collection: " + collectionName, "remove visible assets from collection " + collectionName);
+    }
+    if (!canEditCollection || visibleRecordGuids.empty()) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    if (!canEditCollection) {
+        ImGui::BeginDisabled();
+    }
+    if (contentActionButton("DeleteCollection", EditorGlyphIcon::Trash, "Delete Collection", "Delete this saved asset collection")) {
+        const bool deletingActiveCollection = [&] {
+            const EditorAssetCollection* selected = selectedCollection(state.editorPrefs, registryCollectionFilter_);
+            return selected != nullptr && selected->name == collectionName;
+        }();
+        state.editorPrefs->removeAssetCollection(collectionName);
+        if (deletingActiveCollection) {
+            registryCollectionFilter_ = 0;
+        }
+        savePrefsStatus("Deleted collection: " + collectionName, "delete collection " + collectionName);
+    }
+    if (!canEditCollection) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(132.0f);
+    ImGui::InputTextWithHint("##bulkTag", "Bulk add tag", bulkTagBuffer_.data(), bulkTagBuffer_.size());
+    if (!tagSuggestions.empty()) {
+        ImGui::SameLine();
+        if (ImGui::BeginCombo("##bulkTagPreset", "Tags")) {
+            for (const std::string& tag : tagSuggestions) {
+                if (ImGui::Selectable(tag.c_str(), false)) {
+                    setTextBuffer(bulkTagBuffer_, tag);
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    const std::string bulkTag = trimString(bulkTagBuffer_.data());
+    const bool bulkTagSaved = state.editorPrefs != nullptr && tagListContains(state.editorPrefs->assetTagPresets, bulkTag);
+    ImGui::SameLine();
+    if (state.editorPrefs == nullptr || bulkTag.empty() || bulkTagSaved) {
+        ImGui::BeginDisabled();
+    }
+    if (contentActionButton("SaveBulkTagPreset", EditorGlyphIcon::Add, "Save Preset", "Save this tag as an editor preset")) {
+        state.editorPrefs->addAssetTagPreset(bulkTag);
+        savePrefsStatus("Saved tag preset: " + bulkTag, "save tag preset " + bulkTag);
+    }
+    if (state.editorPrefs == nullptr || bulkTag.empty() || bulkTagSaved) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    if (state.editorPrefs == nullptr || bulkTag.empty() || !bulkTagSaved) {
+        ImGui::BeginDisabled();
+    }
+    if (contentActionButton("RemoveBulkTagPreset", EditorGlyphIcon::Trash, "Remove Preset", "Remove this tag from editor presets")) {
+        state.editorPrefs->removeAssetTagPreset(bulkTag);
+        savePrefsStatus("Removed tag preset: " + bulkTag, "remove tag preset " + bulkTag);
+    }
+    if (state.editorPrefs == nullptr || bulkTag.empty() || !bulkTagSaved) {
+        ImGui::EndDisabled();
+    }
+    const bool canBulkTag = !bulkTag.empty() && !visibleRecordGuids.empty();
+    ImGui::SameLine();
+    if (!canBulkTag) {
+        ImGui::BeginDisabled();
+    }
+    if (contentActionButton("BulkAddTagVisible", EditorGlyphIcon::Add, "Tag Visible", "Add this tag to all currently visible registry records")) {
+        requests.bulkAddAssetTag = EditorBulkAssetTagRequest{visibleRecordGuids, bulkTag};
+        status_ = "Queued bulk tag: " + bulkTag;
+    }
+    ImGui::SameLine();
+    if (contentActionButton("BulkRemoveTagVisible", EditorGlyphIcon::Trash, "Untag Visible", "Remove this tag from all currently visible registry records")) {
+        requests.bulkRemoveAssetTag = EditorBulkAssetTagRequest{visibleRecordGuids, bulkTag};
+        status_ = "Queued bulk untag: " + bulkTag;
+    }
+    if (!canBulkTag) {
+        ImGui::EndDisabled();
+    }
+    if (ImGui::BeginTable("AssetRegistryRecords", 12, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX)) {
+        ImGui::TableSetupColumn("Fav", ImGuiTableColumnFlags_WidthFixed, 38.0f);
         ImGui::TableSetupColumn("Type");
         ImGui::TableSetupColumn("Name");
         ImGui::TableSetupColumn("GUID");
         ImGui::TableSetupColumn("Source");
         ImGui::TableSetupColumn("Imported");
+        ImGui::TableSetupColumn("Tags");
         ImGui::TableSetupColumn("Deps");
         ImGui::TableSetupColumn("Refs");
         ImGui::TableSetupColumn("Missing/Stale");
@@ -1346,11 +3075,20 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, EditorUiMetric::progressColumnWidth);
         ImGui::TableHeadersRow();
         for (const AssetRecord& record : records) {
+            if (!recordMatchesFilters(record)) {
+                continue;
+            }
             ImGui::PushID(record.guid.c_str());
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(assetTypeName(record.type));
+            const bool favoriteAsset = state.editorPrefs != nullptr && assetGuidListContains(state.editorPrefs->favoriteAssetGuids, record.guid);
+            ImGui::TextUnformatted(favoriteAsset ? "*" : "");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort) && favoriteAsset) {
+                ImGui::SetTooltip("Favorite asset");
+            }
             ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(assetTypeName(record.type));
+            ImGui::TableSetColumnIndex(2);
             const char* name = record.displayName.empty() ? "(unnamed)" : record.displayName.c_str();
             editorPushRowSelectionStyle();
             if (ImGui::Selectable(name, selectedRecordGuid_ == record.guid, ImGuiSelectableFlags_SpanAllColumns, ImVec2(0.0f, EditorUiMetric::contentRowHeight))) {
@@ -1366,32 +3104,51 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                 ImGui::EndDragDropSource();
             }
             if (ImGui::BeginPopupContextItem()) {
+                if (state.editorPrefs != nullptr) {
+                    if (favoriteAsset) {
+                        if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Remove Asset Favorite")) {
+                            state.editorPrefs->removeFavoriteAsset(record.guid);
+                            savePrefsStatus(
+                                "Removed asset favorite: " + (record.displayName.empty() ? record.guid : record.displayName),
+                                "remove asset favorite " + record.guid);
+                        }
+                    } else if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Add Asset Favorite")) {
+                        state.editorPrefs->addFavoriteAsset(record.guid);
+                        savePrefsStatus(
+                            "Added asset favorite: " + (record.displayName.empty() ? record.guid : record.displayName),
+                            "add asset favorite " + record.guid);
+                    }
+                    ImGui::Separator();
+                }
                 if (record.type == AssetType::Prefab && editorGlyphMenuItem(EditorGlyphIcon::Add, "Place Prefab")) {
                     requests.placeAsset = record.guid;
                 }
-                const bool canReimport = !record.sourcePath.empty() && std::filesystem::exists(record.sourcePath);
+                const std::filesystem::path resolvedSourcePath = resolveAssetRecordPath(state, record.sourcePath);
+                const bool canReimport = !record.sourcePath.empty() && std::filesystem::exists(resolvedSourcePath);
                 if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Reimport", canReimport)) {
                     requests.reimportAsset = record.guid;
-                    recordImportOperation("Reimport Asset", resolveAssetRecordPath(state, record.sourcePath), {}, "Reimport", record.guid);
+                    recordImportOperation("Reimport Asset", resolvedSourcePath, {}, "Reimport", record.guid);
                     status_ = "Queued reimport: " + record.displayName;
                 }
                 ImGui::EndPopup();
             }
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(record.guid.c_str());
             ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted(record.sourcePath.c_str());
+            ImGui::TextUnformatted(record.guid.c_str());
             ImGui::TableSetColumnIndex(4);
-            ImGui::TextUnformatted(record.importedPath.c_str());
+            ImGui::TextUnformatted(record.sourcePath.c_str());
             ImGui::TableSetColumnIndex(5);
-            ImGui::Text("%zu", record.dependencies.size());
+            ImGui::TextUnformatted(record.importedPath.c_str());
             ImGui::TableSetColumnIndex(6);
-            ImGui::Text("%zu", record.references.size());
+            ImGui::TextUnformatted(joinTagList(record.tags).c_str());
             ImGui::TableSetColumnIndex(7);
-            ImGui::Text("%s%s", record.missing ? "missing" : "ok", record.stale ? " / stale" : "");
+            ImGui::Text("%zu", record.dependencies.size());
             ImGui::TableSetColumnIndex(8);
-            ImGui::TextUnformatted(assetImportStatusName(record.status));
+            ImGui::Text("%zu", record.references.size());
             ImGui::TableSetColumnIndex(9);
+            ImGui::Text("%s%s", record.missing ? "missing" : "ok", record.stale ? " / stale" : "");
+            ImGui::TableSetColumnIndex(10);
+            ImGui::TextUnformatted(assetImportStatusName(record.status));
+            ImGui::TableSetColumnIndex(11);
             ImGui::ProgressBar(assetImportProgress(record), ImVec2(-FLT_MIN, 0.0f), assetImportProgressLabel(record));
             ImGui::PopID();
         }
@@ -1401,6 +3158,47 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
 
 void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorRequests& requests) {
     ImGui::SeparatorText("Details");
+    const std::filesystem::path sourceControlRoot = state.project != nullptr ? state.project->projectRoot : browserRoot_;
+    auto savePrefsStatus = [&](std::string successMessage, std::string failureDetail) {
+        if (state.editorPrefs == nullptr) {
+            return;
+        }
+        setPreferenceSaveStatus(state.editorPrefs->save(EditorPreferences::defaultPath()), status_, std::move(successMessage), std::move(failureDetail));
+    };
+    auto sourceControlStatus = [&](const std::filesystem::path& path) {
+        if (path.empty()) {
+            return std::string("Unavailable");
+        }
+        const std::string key = canonicalForCompare(path).string();
+        auto it = sourceControlStatusCache_.find(key);
+        if (it != sourceControlStatusCache_.end()) {
+            return it->second;
+        }
+        const std::string status = gitStatusLabelForPath(sourceControlRoot, path);
+        sourceControlStatusCache_[key] = status;
+        return status;
+    };
+    auto sourceControlColor = [](const std::string& status) {
+        if (status == "Clean") return ImVec4(0.54f, 0.82f, 0.60f, 1.0f);
+        if (status == "Modified" || status == "Added" || status == "Renamed" || status == "Copied") return ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
+        if (status == "Deleted" || status == "Conflict") return ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
+        if (status == "Untracked") return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
+        return ImVec4(0.65f, 0.70f, 0.78f, 1.0f);
+    };
+    auto drawSourceControlStatus = [&](const char* label, const std::filesystem::path& path) {
+        if (path.empty()) {
+            return;
+        }
+        const std::string status = sourceControlStatus(path);
+        ImGui::TextColored(sourceControlColor(status), "%s Source Control: %s", label, status.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("%s", path.string().c_str());
+        }
+    };
+    if (ImGui::SmallButton("Refresh Source Control")) {
+        sourceControlStatusCache_.clear();
+        status_ = "Source control status refreshed";
+    }
     if (!selectedPath_.empty()) {
         const ImVec2 previewPos = ImGui::GetCursorScreenPos();
         const float previewWidth = std::min(ImGui::GetContentRegionAvail().x, EditorUiMetric::assetPreviewMaxWidth);
@@ -1432,6 +3230,17 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
         ImGui::Text("Selected: %s", selectedPath_.filename().string().c_str());
         ImGui::Text("Kind: %s", contentKindLabel(selectedPath_).c_str());
         ImGui::TextWrapped("Path: %s", relativeContentPath(selectedPath_).c_str());
+        ImGui::SeparatorText("Selected Asset State");
+        ImGui::Text("Origin: %s", selectedPathOriginLabel(state, selectedPath_));
+        drawSourceControlStatus("Selected", selectedPath_);
+        if (state.assetRegistry != nullptr && state.assetRegistry->dirty()) {
+            ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Registry Metadata: Unsaved changes");
+        } else if (state.assetRegistry != nullptr) {
+            ImGui::TextColored(ImVec4(0.54f, 0.82f, 0.60f, 1.0f), "Registry Metadata: Saved");
+        } else {
+            ImGui::TextDisabled("Registry Metadata: unavailable");
+        }
+        ImGui::TextDisabled("Imported asset state is exposed through registry records.");
         const bool isDirectory = std::filesystem::is_directory(selectedPath_);
         if (isDirectory) {
             if (contentActionButton("OpenFolder", EditorGlyphIcon::Folder, "Open Folder", "Open this folder in Content")) {
@@ -1461,18 +3270,25 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                 ImGui::EndDisabled();
             }
             ImGui::SameLine();
-            const bool canImport = !compatibilityMode_ && isModelAssetPath(selectedPath_);
+            const bool canImport = !compatibilityMode_ && isImportableSourceAssetPath(selectedPath_);
+            const bool canImportAndPlace = !compatibilityMode_ && isPlaceablePrefabSourcePath(selectedPath_);
             if (!canImport) {
                 ImGui::BeginDisabled();
             }
-            if (contentActionButton("ImportAsset", EditorGlyphIcon::Import, "Import Asset", "Import this model into the project asset registry")) {
+            if (contentActionButton("ImportAsset", EditorGlyphIcon::Import, "Import Asset", "Import this source asset into the project asset registry")) {
                 prepareImportDialog(selectedPath_, currentPath_, 0);
             }
+            if (!canImport) {
+                ImGui::EndDisabled();
+            }
             ImGui::SameLine();
+            if (!canImportAndPlace) {
+                ImGui::BeginDisabled();
+            }
             if (contentActionButton("PlaceAsset", EditorGlyphIcon::Add, "Place", "Import and place this model in the current scene")) {
                 prepareImportDialog(selectedPath_, currentPath_, 1);
             }
-            if (!canImport) {
+            if (!canImportAndPlace) {
                 ImGui::EndDisabled();
             }
         }
@@ -1529,21 +3345,488 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             ImGui::Text("Asset: %s", record.displayName.empty() ? "(unnamed)" : record.displayName.c_str());
             ImGui::Text("GUID: %s", record.guid.c_str());
             ImGui::Text("Type: %s", assetTypeName(record.type));
+            ImGui::SeparatorText("Selected Asset State");
+            ImGui::TextColored(selectedAssetStateColor(record), "Asset State: %s", selectedAssetStateLabel(record));
+            if (state.assetRegistry->dirty()) {
+                ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Registry Metadata: Unsaved changes");
+            } else {
+                ImGui::TextColored(ImVec4(0.54f, 0.82f, 0.60f, 1.0f), "Registry Metadata: Saved");
+            }
+            if (state.editorPrefs != nullptr) {
+                const bool favoriteAsset = assetGuidListContains(state.editorPrefs->favoriteAssetGuids, record.guid);
+                if (favoriteAsset) {
+                    if (contentActionButton("RemoveAssetFavorite", EditorGlyphIcon::Trash, "Remove Favorite", "Remove this asset GUID from editor favorites")) {
+                        state.editorPrefs->removeFavoriteAsset(record.guid);
+                        savePrefsStatus(
+                            "Removed asset favorite: " + (record.displayName.empty() ? record.guid : record.displayName),
+                            "remove asset favorite " + record.guid);
+                    }
+                } else if (contentActionButton("AddAssetFavorite", EditorGlyphIcon::Add, "Add Favorite", "Save this asset GUID as an editor favorite")) {
+                    state.editorPrefs->addFavoriteAsset(record.guid);
+                    savePrefsStatus(
+                        "Added asset favorite: " + (record.displayName.empty() ? record.guid : record.displayName),
+                        "add asset favorite " + record.guid);
+                }
+            }
+            if (record.stale || record.status == AssetImportStatus::Stale) {
+                ImGui::TextWrapped("The selected asset has stale import metadata; reimport updates its cooked payload and registry record.");
+            } else if (record.missing || record.status == AssetImportStatus::Missing) {
+                ImGui::TextWrapped("The selected asset has broken registry references. Reimport or repair missing metadata, cooked payload, or dependency records before placing it.");
+            } else if (record.status == AssetImportStatus::Failed) {
+                ImGui::TextWrapped("The selected asset import failed; reimport or inspect the source path before placing it.");
+            } else if (record.sourceMissing) {
+                ImGui::TextWrapped("The raw source path is missing, but imported metadata and cooked payload references are still available.");
+            }
+            if (record.sourceMissing) {
+                ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Source file missing");
+            }
+            if (record.importedMetadataMissing) {
+                ImGui::TextColored(ImVec4(0.95f, 0.36f, 0.32f, 1.0f), "Imported metadata missing");
+            }
+            if (record.cookedPayloadMissing) {
+                ImGui::TextColored(ImVec4(0.95f, 0.36f, 0.32f, 1.0f), "Cooked payload missing");
+            }
+            if (record.dependenciesMissing) {
+                ImGui::TextColored(ImVec4(0.95f, 0.36f, 0.32f, 1.0f), "Dependency record missing");
+            }
+            const bool brokenPlaceholderRequired = record.missing || record.status == AssetImportStatus::Missing || record.sourceMissing || record.importedMetadataMissing || record.cookedPayloadMissing || record.dependenciesMissing;
+            if (brokenPlaceholderRequired) {
+                ImGui::TextWrapped("Broken placeholder state: placement and packaging should treat this record as broken until missing metadata, payload, source, or dependency records are repaired.");
+            } else {
+                ImGui::TextDisabled("Broken placeholder state: not required for the loaded registry health state.");
+            }
+            if (contentActionButton("BrokenPlaceholderReport", EditorGlyphIcon::Details, "Broken Placeholder", "Write and open a broken-asset placeholder readiness report")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetBrokenPlaceholderReport(state, browserRoot_, record, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset broken-placeholder report: " + reportPath.string();
+                } else {
+                    status_ = "Asset broken-placeholder report failed: " + error;
+                }
+            }
             ImGui::TextWrapped("Thumbnail: %s", record.thumbnailPath.empty() ? "(none)" : record.thumbnailPath.c_str());
             ImGui::TextWrapped("Source: %s", record.sourcePath.c_str());
+            drawSourceControlStatus("Source", resolveAssetRecordPath(state, record.sourcePath));
             ImGui::TextWrapped("Imported: %s", record.importedPath.c_str());
+            drawSourceControlStatus("Metadata", resolveAssetRecordPath(state, record.importedPath));
             ImGui::TextWrapped("Cache: %s", record.cachePath.c_str());
+            drawSourceControlStatus("Payload", resolveAssetRecordPath(state, record.cachePath));
+            if (assetTagsBufferGuid_ != record.guid) {
+                setTextBuffer(assetTagsBuffer_, joinTagList(record.tags));
+                assetTagsBufferGuid_ = record.guid;
+            }
+            ImGui::SeparatorText("Tags");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputTextWithHint("##assetTags", "comma-separated tags", assetTagsBuffer_.data(), assetTagsBuffer_.size());
+            const std::vector<std::string> editedTags = parseTagList(assetTagsBuffer_.data());
+            const bool tagsChanged = editedTags != parseTagList(joinTagList(record.tags));
+            if (!tagsChanged) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("ApplyTags", EditorGlyphIcon::Refresh, "Apply Tags", "Update this asset's registry tags")) {
+                requests.updateAssetTags = EditorAssetTagsRequest{record.guid, editedTags};
+                status_ = "Queued asset tag update: " + record.displayName;
+            }
+            if (!tagsChanged) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (record.tags.empty()) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("ClearTags", EditorGlyphIcon::Trash, "Clear Tags", "Remove all tags from this asset")) {
+                std::fill(assetTagsBuffer_.begin(), assetTagsBuffer_.end(), '\0');
+                requests.updateAssetTags = EditorAssetTagsRequest{record.guid, {}};
+                status_ = "Queued asset tag clear: " + record.displayName;
+            }
+            if (record.tags.empty()) {
+                ImGui::EndDisabled();
+            }
+            const std::vector<std::string> registryTags = mergedTagSuggestions(collectRegistryTags(state.assetRegistry), state.editorPrefs);
+            bool hasSuggestedTags = false;
+            for (const std::string& tag : registryTags) {
+                if (!tagListContains(record.tags, tag)) {
+                    hasSuggestedTags = true;
+                    break;
+                }
+            }
+            if (hasSuggestedTags) {
+                ImGui::TextDisabled("Existing tags");
+                for (const std::string& tag : registryTags) {
+                    if (tagListContains(record.tags, tag)) {
+                        continue;
+                    }
+                    ImGui::PushID(tag.c_str());
+                    if (contentActionButton("AddExistingTag", EditorGlyphIcon::Add, tag.c_str(), "Add this existing registry tag to the selected asset")) {
+                        std::vector<std::string> updatedTags = record.tags;
+                        updatedTags.push_back(tag);
+                        requests.updateAssetTags = EditorAssetTagsRequest{record.guid, updatedTags};
+                        setTextBuffer(assetTagsBuffer_, joinTagList(parseTagList(joinTagList(updatedTags))));
+                        status_ = "Queued asset tag add: " + tag;
+                    }
+                    ImGui::PopID();
+                    ImGui::SameLine();
+                }
+                ImGui::NewLine();
+            }
+            const std::filesystem::path resolvedSourceForReveal = resolveAssetRecordPath(state, record.sourcePath);
+            const std::filesystem::path resolvedImportedForReveal = resolveAssetRecordPath(state, record.importedPath);
+            const std::filesystem::path resolvedCacheForReveal = resolveAssetRecordPath(state, record.cachePath);
+            auto drawRevealAction = [&](const char* id, const char* label, const char* tooltip, const std::filesystem::path& path) {
+                const bool canReveal = !path.empty() && std::filesystem::exists(path);
+                if (!canReveal) {
+                    ImGui::BeginDisabled();
+                }
+                if (contentActionButton(id, EditorGlyphIcon::Folder, label, tooltip)) {
+                    revealPathInFileBrowser(path);
+                    status_ = std::string("Revealed: ") + path.string();
+                }
+                if (!canReveal) {
+                    ImGui::EndDisabled();
+                }
+            };
+            ImGui::PushID("RecordRepairActions");
+            if (contentActionButton("CopyGuid", EditorGlyphIcon::Command, "Copy GUID", "Copy this asset GUID to the clipboard")) {
+                ImGui::SetClipboardText(record.guid.c_str());
+                status_ = "Copied asset GUID: " + record.guid;
+            }
+            if (!record.sourcePath.empty()) {
+                ImGui::SameLine();
+                if (contentActionButton("CopySource", EditorGlyphIcon::Command, "Copy Source", "Copy the resolved source path to the clipboard")) {
+                    copyPathToClipboard(resolvedSourceForReveal.empty() ? std::filesystem::path(record.sourcePath) : resolvedSourceForReveal);
+                    status_ = "Copied source path: " + record.sourcePath;
+                }
+                ImGui::SameLine();
+                drawRevealAction("RevealSource", "Reveal Source", "Reveal the source asset in Explorer", resolvedSourceForReveal);
+            }
+            if (!compatibilityMode_) {
+                ImGui::SameLine();
+                if (contentActionButton("RelinkSource", EditorGlyphIcon::Refresh, "Relink Source", "Choose a replacement raw source path for this asset record")) {
+                    if (auto source = openImportAssetFileDialog()) {
+                        requests.relinkAssetSource = EditorAssetRelinkSourceRequest{record.guid, *source};
+                        status_ = "Queued source relink: " + record.displayName;
+                    }
+                }
+            }
+            if (!record.importedPath.empty()) {
+                ImGui::SameLine();
+                drawRevealAction("RevealImported", "Reveal Metadata", "Reveal the imported metadata file in Explorer", resolvedImportedForReveal);
+            }
+            if (!record.cachePath.empty()) {
+                ImGui::SameLine();
+                drawRevealAction("RevealCache", "Reveal Payload", "Reveal the cooked/runtime payload in Explorer", resolvedCacheForReveal);
+            }
+            if ((!record.sourcePath.empty() && !std::filesystem::exists(resolvedSourceForReveal)) ||
+                (!record.importedPath.empty() && !std::filesystem::exists(resolvedImportedForReveal)) ||
+                (!record.cachePath.empty() && !std::filesystem::exists(resolvedCacheForReveal))) {
+                ImGui::TextDisabled("Missing paths can be repaired by restoring files or reimporting when the source is available.");
+            }
+            if (contentActionButton("ValidateSelectedAsset", EditorGlyphIcon::Details, "Validate Asset", "Write a validation report for this asset and open it")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetValidationReport(state, browserRoot_, reportPath, error, record.guid)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset validation report: " + reportPath.string();
+                } else {
+                    status_ = "Asset validation failed: " + error;
+                }
+            }
+            ImGui::SameLine();
+            if (contentActionButton("ShowDependencies", EditorGlyphIcon::Details, "Show Dependencies", "Write and open a report of assets this record depends on")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetRelationshipReport(state, browserRoot_, record.guid, false, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset dependency report: " + reportPath.string();
+                } else {
+                    status_ = "Asset dependency report failed: " + error;
+                }
+            }
+            ImGui::SameLine();
+            if (contentActionButton("ShowReferences", EditorGlyphIcon::Details, "Show References", "Write and open a report of assets and scene components that reference this record")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetRelationshipReport(state, browserRoot_, record.guid, true, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset reference report: " + reportPath.string();
+                } else {
+                    status_ = "Asset reference report failed: " + error;
+                }
+            }
+            const AssetUsageSummary usageSummary = assetUsageSummaryForRecord(state, record);
+            ImGui::SeparatorText("Move / Delete Guard");
+            if (usageSummary.referenced()) {
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.68f, 0.28f, 1.0f),
+                    "Referenced by %zu registry link%s and %zu current-scene use%s",
+                    usageSummary.registryReferences,
+                    usageSummary.registryReferences == 1 ? "" : "s",
+                    usageSummary.sceneReferences,
+                    usageSummary.sceneReferences == 1 ? "" : "s");
+                ImGui::TextWrapped("Inspect references or replace them before moving or deleting this asset. This live warning covers the loaded registry and current scene; Delete Readiness also runs the saved project metadata scan.");
+            } else {
+                ImGui::TextDisabled("No loaded registry or current-scene references found for this asset.");
+            }
+            if (contentActionButton("DeleteReadinessReport", EditorGlyphIcon::Details, "Delete Readiness", "Write and open a loaded-registry/current-scene/saved-project delete-readiness report")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetDeleteReadinessReport(state, browserRoot_, record.guid, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset delete-readiness report: " + reportPath.string();
+                } else {
+                    status_ = "Asset delete-readiness report failed: " + error;
+                }
+            }
+            ImGui::SameLine();
+            if (contentActionButton("ProjectReferenceScan", EditorGlyphIcon::Details, "Project References", "Scan saved project content and scene metadata for this asset GUID")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetProjectReferenceScanReport(state, browserRoot_, record.guid, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset project reference scan report: " + reportPath.string();
+                } else {
+                    status_ = "Asset project reference scan failed: " + error;
+                }
+            }
+            ImGui::SeparatorText("Reference Repair");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputTextWithHint("##replaceReferenceGuid", "Replacement asset GUID", replaceReferenceGuid_.data(), replaceReferenceGuid_.size());
+            const AssetRecord* replacementRecord = nullptr;
+            const std::string replacementGuid = replaceReferenceGuid_.data();
+            if (!replacementGuid.empty()) {
+                for (const AssetRecord& candidate : state.assetRegistry->records()) {
+                    if (candidate.guid == replacementGuid) {
+                        replacementRecord = &candidate;
+                        break;
+                    }
+                }
+            }
+            const bool canReplaceReferences = replacementRecord != nullptr && replacementRecord->guid != record.guid && replacementRecord->type == record.type;
+            if (!canReplaceReferences) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("ReplaceReferences", EditorGlyphIcon::Refresh, "Replace References", "Replace current-scene and registry references to this asset with the replacement GUID")) {
+                requests.replaceAssetReferences = EditorReplaceAssetReferencesRequest{record.guid, replacementRecord->guid};
+                status_ = "Queued reference replacement: " + record.guid + " -> " + replacementRecord->guid;
+            }
+            if (!canReplaceReferences) {
+                ImGui::EndDisabled();
+            }
+            if (!replacementGuid.empty() && replacementRecord == nullptr) {
+                ImGui::TextDisabled("Replacement GUID is not in the loaded asset registry.");
+            } else if (replacementRecord != nullptr && replacementRecord->type != record.type) {
+                ImGui::TextDisabled("Replacement asset type must match the selected asset type.");
+            } else if (replacementRecord != nullptr && replacementRecord->guid == record.guid) {
+                ImGui::TextDisabled("Replacement GUID must be different from the selected asset.");
+            }
+            ImGui::PopID();
             ImGui::Text("Dependencies: %zu", record.dependencies.size());
             ImGui::Text("References: %zu", record.references.size());
-            ImGui::Text("Status: %s%s%s", assetImportStatusName(record.status), record.missing ? " missing" : "", record.stale ? " stale" : "");
+            auto findRecordByGuid = [&](const AssetGuid& guid) -> const AssetRecord* {
+                for (const AssetRecord& candidate : state.assetRegistry->records()) {
+                    if (candidate.guid == guid) {
+                        return &candidate;
+                    }
+                }
+                return nullptr;
+            };
+            auto drawLinkedAssetTable = [&](const char* label, const std::vector<AssetDependency>* dependencies, const std::vector<AssetGuid>* references) {
+                const size_t count = dependencies != nullptr ? dependencies->size() : references != nullptr ? references->size() : 0;
+                if (count == 0) {
+                    return;
+                }
+                ImGui::SeparatorText(label);
+                const std::string tableId = std::string(label) + "Table";
+                if (ImGui::BeginTable(tableId.c_str(), 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+                    ImGui::TableSetupColumn("Role", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                    ImGui::TableSetupColumn("Asset");
+                    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 82.0f);
+                    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+                    ImGui::TableHeadersRow();
+                    for (size_t index = 0; index < count; ++index) {
+                        const AssetGuid guid = dependencies != nullptr ? (*dependencies)[index].guid : (*references)[index];
+                        const std::string role = dependencies != nullptr ? (*dependencies)[index].kind : "reference";
+                        const AssetRecord* linked = findRecordByGuid(guid);
+                        const std::string rowId = std::string(label) + "_" + std::to_string(index);
+                        ImGui::PushID(rowId.c_str());
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(role.empty() ? "asset" : role.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        const std::string display = linked != nullptr && !linked->displayName.empty() ? linked->displayName : guid;
+                        if (linked != nullptr) {
+                            if (ImGui::Selectable(display.c_str())) {
+                                selectedRecordGuid_ = linked->guid;
+                                selectedPath_.clear();
+                                status_ = "Selected linked asset: " + display;
+                            }
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                                ImGui::SetTooltip("%s", linked->guid.c_str());
+                            }
+                        } else {
+                            ImGui::TextColored(ImVec4(0.95f, 0.36f, 0.32f, 1.0f), "%s", guid.c_str());
+                        }
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextUnformatted(linked != nullptr ? assetTypeName(linked->type) : "Missing");
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(linked != nullptr ? assetImportStatusName(linked->status) : "Broken");
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+            };
+            drawLinkedAssetTable("Dependencies", &record.dependencies, nullptr);
+            drawLinkedAssetTable("References", nullptr, &record.references);
+            auto drawReverseRegistryReferences = [&] {
+                struct ReverseReferenceRow {
+                    const AssetRecord* owner = nullptr;
+                    std::string role;
+                    std::string source;
+                };
+                std::vector<ReverseReferenceRow> rows;
+                for (const AssetRecord& candidate : state.assetRegistry->records()) {
+                    if (candidate.guid == record.guid) {
+                        continue;
+                    }
+                    for (const AssetDependency& dependency : candidate.dependencies) {
+                        if (dependency.guid == record.guid) {
+                            rows.push_back(ReverseReferenceRow{&candidate, dependency.kind.empty() ? "dependency" : dependency.kind, "Dependency"});
+                        }
+                    }
+                    for (const AssetGuid& reference : candidate.references) {
+                        if (reference == record.guid) {
+                            rows.push_back(ReverseReferenceRow{&candidate, "reference", "Reference"});
+                        }
+                    }
+                }
+                if (rows.empty()) {
+                    return;
+                }
+                ImGui::SeparatorText("Used By Assets");
+                if (ImGui::BeginTable("ReverseAssetReferencesTable", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+                    ImGui::TableSetupColumn("Role", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                    ImGui::TableSetupColumn("Asset");
+                    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 82.0f);
+                    ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+                    ImGui::TableHeadersRow();
+                    for (size_t index = 0; index < rows.size(); ++index) {
+                        const ReverseReferenceRow& row = rows[index];
+                        if (row.owner == nullptr) {
+                            continue;
+                        }
+                        ImGui::PushID(static_cast<int>(index));
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(row.role.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        const std::string display = row.owner->displayName.empty() ? row.owner->guid : row.owner->displayName;
+                        if (ImGui::Selectable(display.c_str())) {
+                            selectedRecordGuid_ = row.owner->guid;
+                            selectedPath_.clear();
+                            status_ = "Selected referring asset: " + display;
+                        }
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                            ImGui::SetTooltip("%s", row.owner->guid.c_str());
+                        }
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextUnformatted(assetTypeName(row.owner->type));
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(row.source.c_str());
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+            };
+            auto drawSceneReferences = [&] {
+                if (state.sceneDocument == nullptr) {
+                    return;
+                }
+                struct SceneReferenceRow {
+                    std::string entityName;
+                    uint64_t entityUuid = 0;
+                    std::string component;
+                    std::string field;
+                };
+                std::vector<SceneReferenceRow> rows;
+                for (const Entity* entity : state.sceneDocument->registry().entities()) {
+                    if (entity == nullptr || !entity->meshRenderer.has_value()) {
+                        continue;
+                    }
+                    const MeshRenderer& renderer = *entity->meshRenderer;
+                    if (renderer.meshGuid == record.guid) {
+                        rows.push_back(SceneReferenceRow{entity->name, entity->uuid, "MeshRenderer", "meshGuid"});
+                    }
+                    for (const MaterialSlot& slot : renderer.materialSlots) {
+                        if (slot.materialGuid == record.guid) {
+                            rows.push_back(SceneReferenceRow{entity->name, entity->uuid, "MeshRenderer", "materialGuid"});
+                        }
+                        if (slot.overrideMaterialGuid.has_value() && *slot.overrideMaterialGuid == record.guid) {
+                            rows.push_back(SceneReferenceRow{entity->name, entity->uuid, "MeshRenderer", "overrideMaterialGuid"});
+                        }
+                    }
+                }
+                for (const PrefabInstance& instance : state.sceneDocument->prefabInstances()) {
+                    if (instance.prefabGuid == record.guid) {
+                        rows.push_back(SceneReferenceRow{"Prefab Instance", instance.instanceRoot.index, "PrefabInstance", "prefabGuid"});
+                    }
+                }
+                if (rows.empty()) {
+                    return;
+                }
+                ImGui::SeparatorText("Used By Current Scene");
+                if (ImGui::BeginTable("SceneAssetReferencesTable", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+                    ImGui::TableSetupColumn("Entity");
+                    ImGui::TableSetupColumn("UUID", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                    ImGui::TableSetupColumn("Component", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+                    ImGui::TableSetupColumn("Field", ImGuiTableColumnFlags_WidthFixed, 132.0f);
+                    ImGui::TableHeadersRow();
+                    for (size_t index = 0; index < rows.size(); ++index) {
+                        const SceneReferenceRow& row = rows[index];
+                        ImGui::PushID(static_cast<int>(index));
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(row.entityName.empty() ? "(unnamed)" : row.entityName.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%llu", static_cast<unsigned long long>(row.entityUuid));
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextUnformatted(row.component.c_str());
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(row.field.c_str());
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+            };
+            drawReverseRegistryReferences();
+            drawSceneReferences();
+            ImGui::Text("Status: %s%s%s%s", assetImportStatusName(record.status), record.missing ? " missing" : "", record.stale ? " stale" : "", record.sourceMissing ? " source-missing" : "");
             ImGui::ProgressBar(assetImportProgress(record), ImVec2(-FLT_MIN, 0.0f), assetImportProgressLabel(record));
-            const bool canReimport = !record.sourcePath.empty() && std::filesystem::exists(record.sourcePath);
+            const std::filesystem::path resolvedSourcePath = resolveAssetRecordPath(state, record.sourcePath);
+            const bool canReimport = !record.sourcePath.empty() && !record.sourceMissing && std::filesystem::exists(resolvedSourcePath);
+            const bool canRebuildPayload = canReimport && record.cookedPayloadMissing;
+            if (!canRebuildPayload) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("RebuildPayload", EditorGlyphIcon::Refresh, "Rebuild Payload", "Queue a reimport to regenerate the missing cooked/runtime payload")) {
+                requests.reimportAsset = record.guid;
+                recordImportOperation("Rebuild Payload", resolvedSourcePath, {}, "Reimport", record.guid);
+                status_ = "Queued payload rebuild: " + record.displayName;
+            }
+            if (!canRebuildPayload) {
+                ImGui::EndDisabled();
+                if (record.cookedPayloadMissing && !canReimport) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("Source unavailable");
+                }
+            }
+            ImGui::SameLine();
             if (!canReimport) {
                 ImGui::BeginDisabled();
             }
             if (contentActionButton("ReimportRecord", EditorGlyphIcon::Refresh, "Reimport", "Queue this asset for reimport")) {
                 requests.reimportAsset = record.guid;
-                recordImportOperation("Reimport Asset", resolveAssetRecordPath(state, record.sourcePath), {}, "Reimport", record.guid);
+                recordImportOperation("Reimport Asset", resolvedSourcePath, {}, "Reimport", record.guid);
                 status_ = "Queued reimport: " + record.displayName;
             }
             if (!canReimport) {
@@ -1586,6 +3869,8 @@ void AssetBrowserPanel::drawImportSettingsDialog(EditorRequests& requests) {
     ImGui::Combo("Mode", &importMode_, modes, IM_ARRAYSIZE(modes));
     ImGui::InputText("Source", importSourcePath_.data(), importSourcePath_.size(), ImGuiInputTextFlags_ReadOnly);
     ImGui::InputTextWithHint("Destination Folder", "Models", importDestinationFolder_.data(), importDestinationFolder_.size());
+    ImGui::SeparatorText("Source");
+    ImGui::Checkbox("Copy source into project", &importSettings_.copySourceIntoProject);
     ImGui::SeparatorText("Hierarchy");
     ImGui::Checkbox("Preserve hierarchy", &importSettings_.preserveHierarchy);
     ImGui::Checkbox("Import materials", &importSettings_.importMaterials);
@@ -1654,7 +3939,7 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         ImGui::Separator();
         const bool canImportAssets = !compatibilityMode_;
         if (ImGui::MenuItem("Import Asset...", nullptr, false, canImportAssets)) {
-            if (auto path = openGltfFileDialog()) {
+            if (auto path = openImportAssetFileDialog()) {
                 prepareImportDialog(*path, {}, 0);
             }
         }
@@ -1663,11 +3948,14 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
                 prepareImportDialog(*path, {}, 1);
             }
         }
-        ImGui::MenuItem("Import Texture...", nullptr, false, false);
-        if (ImGui::MenuItem("Import HDRI...")) {
+        if (ImGui::MenuItem("Import Texture...", nullptr, false, canImportAssets)) {
+            if (auto path = openTextureFileDialog()) {
+                prepareImportDialog(*path, {}, 0);
+            }
+        }
+        if (ImGui::MenuItem("Import HDRI...", nullptr, false, canImportAssets)) {
             if (auto path = openHdrFileDialog()) {
-                requests.loadHdr = *path;
-                status_ = "Queued HDRI import/apply: " + path->string();
+                prepareImportDialog(*path, {}, 0);
             }
         }
         ImGui::MenuItem("Import IES Profile...", nullptr, false, false);
@@ -1679,6 +3967,24 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
             }
         }
         ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+    const bool canValidateProject = state.assetRegistry != nullptr;
+    if (!canValidateProject) {
+        ImGui::BeginDisabled();
+    }
+    if (contentActionButton("ValidateProject", EditorGlyphIcon::Details, "Validate Project", "Write a project asset validation report and open it")) {
+        std::filesystem::path reportPath;
+        std::string error;
+        if (writeAssetValidationReport(state, browserRoot_, reportPath, error)) {
+            requests.openFilePath = reportPath;
+            status_ = "Project validation report: " + reportPath.string();
+        } else {
+            status_ = "Project validation failed: " + error;
+        }
+    }
+    if (!canValidateProject) {
+        ImGui::EndDisabled();
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(220.0f);
@@ -1784,42 +4090,129 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         }
         if (state.editorPrefs != nullptr) {
             auto& prefs = *state.editorPrefs;
-            if (!prefs.favoriteFiles.empty() && ImGui::TreeNodeEx("Favorites", ImGuiTreeNodeFlags_DefaultOpen)) {
-                for (size_t i = 0; i < prefs.favoriteFiles.size(); ++i) {
-                    const std::filesystem::path favPath(prefs.favoriteFiles[i]);
-                    ImGui::PushID(static_cast<int>(i));
-                    if (ImGui::Selectable(favPath.filename().string().c_str(), false, ImGuiSelectableFlags_AllowDoubleClick)) {
-                        selectedPath_ = favPath;
-                        selectedRecordGuid_.clear();
-                        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                            loadFromPath(favPath, requests);
+            auto savePrefsStatus = [&](std::string successMessage, std::string failureDetail) {
+                setPreferenceSaveStatus(prefs.save(EditorPreferences::defaultPath()), status_, std::move(successMessage), std::move(failureDetail));
+            };
+            auto drawStoredPathEntry = [&](const char* listName, size_t index, const std::filesystem::path& path, bool favoriteRow) {
+                std::error_code ec;
+                const bool exists = std::filesystem::exists(path, ec);
+                const bool directory = exists && std::filesystem::is_directory(path, ec);
+                const bool selected = !selectedPath_.empty() && canonicalForCompare(selectedPath_) == canonicalForCompare(path);
+                const std::string filename = path.filename().empty() ? path.string() : path.filename().string();
+                const std::string label = editorGlyphLabel((exists ? filename : filename + " (missing)").c_str());
+                ImGui::PushID(listName);
+                ImGui::PushID(static_cast<int>(index));
+                if (!exists) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+                }
+                if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowDoubleClick)) {
+                    selectedPath_ = path;
+                    selectedRecordGuid_.clear();
+                    if (exists && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        if (directory) {
+                            navigateTo(path);
+                        } else {
+                            loadFromPath(path, requests);
                         }
                     }
-                    if (ImGui::BeginPopupContextItem()) {
-                        if (ImGui::MenuItem("Load")) {
-                            loadFromPath(favPath, requests);
+                }
+                if (!exists) {
+                    ImGui::PopStyleColor();
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                    ImGui::SetTooltip("%s", path.string().c_str());
+                }
+                if (ImGui::BeginPopupContextItem("StoredPathContext")) {
+                    if (directory) {
+                        if (editorGlyphMenuItem(EditorGlyphIcon::Folder, "Open Folder", exists)) {
+                            navigateTo(path);
                         }
-                        if (ImGui::MenuItem("Remove from Favorites")) {
-                            requests.removeFavorite = prefs.favoriteFiles[i];
+                    } else if (editorGlyphMenuItem(editorGlyphForPath(path), "Open / Apply", exists && canOpenOrApplyPath(path))) {
+                        loadFromPath(path, requests);
+                    }
+                    if (!favoriteRow && editorGlyphMenuItem(EditorGlyphIcon::Add, "Add to Favorites", exists && !preferencePathListContains(prefs.favoriteFiles, path))) {
+                        prefs.addFavorite(path);
+                        savePrefsStatus("Added favorite: " + path.string(), "add favorite " + path.string());
+                    }
+                    if (editorGlyphMenuItem(EditorGlyphIcon::Command, "Copy Path")) {
+                        copyPathToClipboard(path);
+                        status_ = "Copied path: " + path.string();
+                    }
+                    if (editorGlyphMenuItem(EditorGlyphIcon::Folder, "Show in Explorer", exists)) {
+                        revealPathInFileBrowser(path);
+                    }
+                    if (favoriteRow && editorGlyphMenuItem(EditorGlyphIcon::Trash, "Remove from Favorites")) {
+                        prefs.removeFavorite(path.string());
+                        savePrefsStatus("Removed favorite: " + path.string(), "remove favorite " + path.string());
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::PopID();
+                ImGui::PopID();
+            };
+            if (state.assetRegistry != nullptr && !prefs.favoriteAssetGuids.empty() && ImGui::TreeNodeEx("Favorite Assets", ImGuiTreeNodeFlags_DefaultOpen)) {
+                std::string assetFavoriteToRemove;
+                for (size_t i = 0; i < prefs.favoriteAssetGuids.size(); ++i) {
+                    const AssetGuid& guid = prefs.favoriteAssetGuids[i];
+                    const AssetRecord* record = findAssetRecordByGuid(*state.assetRegistry, guid);
+                    const bool missingRecord = record == nullptr;
+                    const std::string displayName = missingRecord
+                        ? guid + " (missing)"
+                        : (record->displayName.empty() ? record->guid : record->displayName);
+                    const std::string label = editorGlyphLabel(displayName);
+                    ImGui::PushID("FavoriteAsset");
+                    ImGui::PushID(static_cast<int>(i));
+                    if (missingRecord) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetColorU32(ImGuiCol_TextDisabled));
+                    }
+                    if (ImGui::Selectable(label.c_str(), selectedRecordGuid_ == guid)) {
+                        selectedRecordGuid_ = guid;
+                        selectedPath_.clear();
+                    }
+                    if (missingRecord) {
+                        ImGui::PopStyleColor();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("%s", guid.c_str());
+                    }
+                    if (ImGui::BeginPopupContextItem("FavoriteAssetContext")) {
+                        if (editorGlyphMenuItem(EditorGlyphIcon::Details, "Open Details", !missingRecord)) {
+                            selectedRecordGuid_ = guid;
+                            selectedPath_.clear();
+                        }
+                        if (!missingRecord && record->type == AssetType::Prefab && editorGlyphMenuItem(EditorGlyphIcon::Add, "Place Prefab")) {
+                            requests.placeAsset = guid;
+                        }
+                        if (editorGlyphMenuItem(EditorGlyphIcon::Details, "Filter Registry To Favorites")) {
+                            registryFavoriteFilter_ = 1;
+                        }
+                        if (editorGlyphMenuItem(EditorGlyphIcon::Command, "Copy GUID")) {
+                            ImGui::SetClipboardText(guid.c_str());
+                            status_ = "Copied asset GUID: " + guid;
+                        }
+                        if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Remove Asset Favorite")) {
+                            assetFavoriteToRemove = guid;
                         }
                         ImGui::EndPopup();
                     }
                     ImGui::PopID();
+                    ImGui::PopID();
+                }
+                if (!assetFavoriteToRemove.empty()) {
+                    prefs.removeFavoriteAsset(assetFavoriteToRemove);
+                    savePrefsStatus("Removed asset favorite: " + assetFavoriteToRemove, "remove asset favorite " + assetFavoriteToRemove);
+                }
+                ImGui::TreePop();
+            }
+            if (!prefs.favoriteFiles.empty() && ImGui::TreeNodeEx("Favorites", ImGuiTreeNodeFlags_DefaultOpen)) {
+                for (size_t i = 0; i < prefs.favoriteFiles.size(); ++i) {
+                    drawStoredPathEntry("Favorite", i, std::filesystem::path(prefs.favoriteFiles[i]), true);
                 }
                 ImGui::TreePop();
             }
             if (!prefs.recentFiles.empty() && ImGui::TreeNodeEx("Recent", ImGuiTreeNodeFlags_DefaultOpen)) {
                 for (size_t i = 0; i < prefs.recentFiles.size(); ++i) {
-                    const std::filesystem::path recPath(prefs.recentFiles[i]);
-                    ImGui::PushID(static_cast<int>(i + 1000));
-                    if (ImGui::Selectable(recPath.filename().string().c_str(), false, ImGuiSelectableFlags_AllowDoubleClick)) {
-                        selectedPath_ = recPath;
-                        selectedRecordGuid_.clear();
-                        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                            loadFromPath(recPath, requests);
-                        }
-                    }
-                    ImGui::PopID();
+                    drawStoredPathEntry("Recent", i, std::filesystem::path(prefs.recentFiles[i]), false);
                 }
                 ImGui::TreePop();
             }
@@ -1828,14 +4221,31 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         ImGui::SameLine();
         ImGui::BeginChild("ContentItems", ImVec2(-(detailsWidth + (showDetails_ ? sectionSpacing : 0.0f)), 0.0f), true);
         drawPathList(state, requests);
+        drawRegistryTable(state, requests);
+        drawImportOperations();
         ImGui::EndChild();
         if (showDetails_) {
             ImGui::SameLine();
             ImGui::BeginChild("ContentDetails", ImVec2(detailsWidth, 0.0f), true);
             drawDetails(state, requests);
             if (state.editorPrefs != nullptr && !selectedPath_.empty()) {
-                if (ImGui::SmallButton("Add Selected to Favorites")) {
+                const std::string storedFavorite = matchingPreferencePathValue(state.editorPrefs->favoriteFiles, selectedPath_);
+                if (!storedFavorite.empty()) {
+                    if (ImGui::SmallButton("Remove Selected Favorite")) {
+                        state.editorPrefs->removeFavorite(storedFavorite);
+                        setPreferenceSaveStatus(
+                            state.editorPrefs->save(EditorPreferences::defaultPath()),
+                            status_,
+                            "Removed favorite: " + selectedPath_.string(),
+                            "remove favorite " + selectedPath_.string());
+                    }
+                } else if (ImGui::SmallButton("Add Selected to Favorites")) {
                     state.editorPrefs->addFavorite(selectedPath_);
+                    setPreferenceSaveStatus(
+                        state.editorPrefs->save(EditorPreferences::defaultPath()),
+                        status_,
+                        "Added favorite: " + selectedPath_.string(),
+                        "add favorite " + selectedPath_.string());
                 }
             }
             ImGui::EndChild();

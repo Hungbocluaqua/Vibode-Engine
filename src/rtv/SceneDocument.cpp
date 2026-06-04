@@ -1,5 +1,6 @@
 #include "rtv/SceneDocument.h"
 
+#include "rtv/SceneRenderSettingsSync.h"
 #include "rtv/SunController.h"
 
 #include <algorithm>
@@ -68,6 +69,14 @@ nlohmann::json vec3Json(glm::vec3 value) {
     return nlohmann::json::array({value.x, value.y, value.z});
 }
 
+nlohmann::json transformJson(const Transform& transform) {
+    return {
+        {"position", vec3Json(transform.position)},
+        {"rotationEuler", vec3Json(transform.rotationEuler)},
+        {"scale", vec3Json(transform.scale)},
+    };
+}
+
 glm::vec3 vec3FromJson(const nlohmann::json& json, glm::vec3 fallback = glm::vec3{0.0f}) {
     if (!json.is_array() || json.size() < 3) {
         return fallback;
@@ -77,6 +86,17 @@ glm::vec3 vec3FromJson(const nlohmann::json& json, glm::vec3 fallback = glm::vec
         json[1].get<float>(),
         json[2].get<float>(),
     };
+}
+
+Transform transformFromJson(const nlohmann::json& json, Transform fallback = {}) {
+    if (!json.is_object()) {
+        return fallback;
+    }
+    Transform transform = fallback;
+    transform.position = vec3FromJson(json.value("position", nlohmann::json::array()), transform.position);
+    transform.rotationEuler = vec3FromJson(json.value("rotationEuler", nlohmann::json::array()), transform.rotationEuler);
+    transform.scale = vec3FromJson(json.value("scale", nlohmann::json::array()), transform.scale);
+    return transform;
 }
 
 std::string generateSceneGuid() {
@@ -178,9 +198,13 @@ void SceneDocument::setSourceHdrPath(std::optional<std::filesystem::path> path) 
 }
 
 void SceneDocument::markDirty(SceneUpdateKind kind) {
+    markDirty(sceneUpdateKindMask(kind));
+}
+
+void SceneDocument::markDirty(SceneUpdateMask mask) {
     dirty_ = true;
-    pendingUpdate_ = combine(pendingUpdate_, kind);
-    lastChangeReason_ = sceneUpdateKindName(kind);
+    pendingUpdateMask_ |= mask;
+    lastChangeReason_ = sceneUpdateMaskName(mask);
     if (dirtyReasons_.empty() || dirtyReasons_.back() != lastChangeReason_) {
         dirtyReasons_.push_back(lastChangeReason_);
     }
@@ -188,7 +212,7 @@ void SceneDocument::markDirty(SceneUpdateKind kind) {
 
 void SceneDocument::clearDirty() {
     dirty_ = false;
-    pendingUpdate_ = SceneUpdateKind::None;
+    pendingUpdateMask_ = SceneUpdateMaskNone;
     dirtyReasons_.clear();
     registry_.clearDirty();
 }
@@ -214,8 +238,50 @@ void SceneDocument::addPrefabInstance(PrefabInstance instance) {
     markDirty(SceneUpdateKind::TopologyChanged);
 }
 
+size_t SceneDocument::replaceAssetGuidReferences(const AssetGuid& oldGuid, const AssetGuid& newGuid) {
+    if (oldGuid.empty() || newGuid.empty() || oldGuid == newGuid) {
+        return 0;
+    }
+
+    size_t replacements = 0;
+    for (Entity* entity : registry_.entities()) {
+        if (entity == nullptr || !entity->meshRenderer.has_value()) {
+            continue;
+        }
+        MeshRenderer& renderer = *entity->meshRenderer;
+        if (renderer.meshGuid == oldGuid) {
+            renderer.meshGuid = newGuid;
+            ++replacements;
+        }
+        for (MaterialSlot& slot : renderer.materialSlots) {
+            if (slot.materialGuid == oldGuid) {
+                slot.materialGuid = newGuid;
+                ++replacements;
+            }
+            if (slot.overrideMaterialGuid.has_value() && *slot.overrideMaterialGuid == oldGuid) {
+                slot.overrideMaterialGuid = newGuid;
+                ++replacements;
+            }
+        }
+    }
+    for (PrefabInstance& instance : prefabInstances_) {
+        if (instance.prefabGuid == oldGuid) {
+            instance.prefabGuid = newGuid;
+            ++replacements;
+        }
+    }
+    if (replacements > 0) {
+        markDirty(SceneUpdateKind::TopologyChanged);
+    }
+    return replacements;
+}
+
 SceneUpdateKind SceneDocument::pendingUpdate() const {
-    return combine(pendingUpdate_, registry_.pendingUpdate());
+    return sceneUpdateKindFromMask(pendingUpdateMask());
+}
+
+SceneUpdateMask SceneDocument::pendingUpdateMask() const {
+    return pendingUpdateMask_ | registry_.pendingUpdateMask();
 }
 
 void SceneDocument::importSceneAsset(const SceneAsset& scene) {
@@ -239,6 +305,7 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
         entity->transform.rotationEuler = eulerFromMatrix(node.transform);
         entity->transform.scale = scaleFromMatrix(node.transform);
         entity->transform.dirty = true;
+        entity->defaultTransform = entity->transform;
 
         if (node.mesh.valid()) {
             MeshRenderer renderer;
@@ -285,14 +352,19 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
         if (entity == nullptr) {
             continue;
         }
-        entity->transform.position = translationFromMatrix(source.transform);
-        entity->transform.rotationEuler = eulerFromMatrix(source.transform);
-        entity->transform.scale = scaleFromMatrix(source.transform);
+        if (source.nodeIndex < 0) {
+            entity->transform.position = translationFromMatrix(source.transform);
+            entity->transform.rotationEuler = eulerFromMatrix(source.transform);
+            entity->transform.scale = scaleFromMatrix(source.transform);
+            entity->defaultTransform = entity->transform;
+        }
         Light light;
         light.type = static_cast<LightType>(std::min(source.type, 3u));
         light.color = source.color;
         light.intensity = source.intensity;
         light.sizeOrRadius = source.sizeOrRadius;
+        light.innerConeRadians = source.innerConeRadians;
+        light.outerConeRadians = source.outerConeRadians;
         light.enabled = source.enabled;
         entity->light = light;
     }
@@ -326,14 +398,22 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
                     rot[1] = up;
                     rot[2] = -forward;
                     refEntity->transform.rotationEuler = glm::eulerAngles(glm::quat_cast(rot));
+                    refEntity->defaultTransform = refEntity->transform;
                 } else if (refEntity->sun.has_value()) {
                     float elevation = 0.0f;
                     float azimuth = 0.0f;
                     SunController::anglesFromDirection(-forward, elevation, azimuth);
                     refEntity->transform = SunController::transformFromWorldAngles(
                         registry_, *refEntity, refEntity->transform, elevation, azimuth);
+                    refEntity->defaultTransform = refEntity->transform;
                 }
             }
+        }
+    }
+
+    for (Entity* entity : registry_.entities()) {
+        if (entity != nullptr) {
+            entity->defaultTransform = entity->transform;
         }
     }
 
@@ -407,7 +487,10 @@ SceneAsset SceneDocument::toSceneAsset() const {
             light.color = entity->light->color;
             light.intensity = entity->light->intensity;
             light.sizeOrRadius = entity->light->sizeOrRadius;
+            light.innerConeRadians = entity->light->innerConeRadians;
+            light.outerConeRadians = entity->light->outerConeRadians;
             light.enabled = entity->light->enabled;
+            light.nodeIndex = static_cast<int32_t>(i);
             scene.lights.push_back(light);
         }
     }
@@ -577,11 +660,8 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         }
         item["name"] = entity.name;
         item["locked"] = entity.locked;
-        item["transform"] = {
-            {"position", vec3Json(entity.transform.position)},
-            {"rotationEuler", vec3Json(entity.transform.rotationEuler)},
-            {"scale", vec3Json(entity.transform.scale)},
-        };
+        item["transform"] = transformJson(entity.transform);
+        item["defaultTransform"] = transformJson(entity.defaultTransform);
         if (entity.meshRenderer.has_value()) {
             nlohmann::json renderer;
             renderer["mesh"] = entity.meshRenderer->mesh.index;
@@ -658,6 +738,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         }
         if (entity.environmentLight.has_value()) {
             item["environmentLight"] = {
+                {"hdrPath", entity.environmentLight->hdrPath.generic_string()},
                 {"enabled", entity.environmentLight->enabled},
                 {"intensity", entity.environmentLight->intensity},
                 {"backgroundIntensity", entity.environmentLight->backgroundIntensity},
@@ -667,6 +748,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         if (entity.skyAtmosphere.has_value()) {
             item["skyAtmosphere"] = {
                 {"enabled", entity.skyAtmosphere->enabled},
+                {"skyIntensity", entity.skyAtmosphere->skyIntensity},
                 {"rayleighScaleHeight", entity.skyAtmosphere->rayleighScaleHeight},
                 {"mieScaleHeight", entity.skyAtmosphere->mieScaleHeight},
                 {"mieAnisotropy", entity.skyAtmosphere->mieAnisotropy},
@@ -950,12 +1032,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         pendingParents.push_back({id, item.value("parent", uint64_t{0})});
         entity->locked = item.value("locked", false);
 
-        if (item.contains("transform")) {
-            const nlohmann::json& transform = item["transform"];
-            entity->transform.position = vec3FromJson(transform.value("position", nlohmann::json::array()), entity->transform.position);
-            entity->transform.rotationEuler = vec3FromJson(transform.value("rotationEuler", nlohmann::json::array()), entity->transform.rotationEuler);
-            entity->transform.scale = vec3FromJson(transform.value("scale", nlohmann::json::array()), entity->transform.scale);
-        }
+        entity->transform = transformFromJson(item.value("transform", nlohmann::json::object()), entity->transform);
+        entity->defaultTransform = transformFromJson(item.value("defaultTransform", nlohmann::json::object()), entity->transform);
 
         if (item.contains("meshRenderer")) {
             const nlohmann::json& source = item["meshRenderer"];
@@ -1037,6 +1115,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         if (item.contains("environmentLight")) {
             const nlohmann::json& source = item["environmentLight"];
             EnvironmentLight component;
+            component.hdrPath = source.value("hdrPath", component.hdrPath.generic_string());
             component.enabled = source.value("enabled", component.enabled);
             component.intensity = source.value("intensity", component.intensity);
             component.backgroundIntensity = source.value("backgroundIntensity", component.backgroundIntensity);
@@ -1047,6 +1126,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             const nlohmann::json& source = item["skyAtmosphere"];
             SkyAtmosphere component;
             component.enabled = source.value("enabled", component.enabled);
+            component.skyIntensity = source.value("skyIntensity", component.skyIntensity);
             component.rayleighScaleHeight = source.value("rayleighScaleHeight", component.rayleighScaleHeight);
             component.mieScaleHeight = source.value("mieScaleHeight", component.mieScaleHeight);
             component.mieAnisotropy = source.value("mieAnisotropy", component.mieAnisotropy);
@@ -1161,6 +1241,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     }
     SunController::enforceSinglePrimarySun(*this);
     (void)SunController::repairPrimarySunTransform(*this);
+    applySceneWorldComponentsToDocumentSettings(*this);
 
     std::sort(sceneMeshes_.begin(), sceneMeshes_.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index < b.index; });
     sceneMeshes_.erase(std::unique(sceneMeshes_.begin(), sceneMeshes_.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index == b.index; }), sceneMeshes_.end());
@@ -1216,28 +1297,6 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     }
     markDirty(SceneUpdateKind::TopologyChanged);
     return true;
-}
-
-SceneUpdateKind SceneDocument::combine(SceneUpdateKind current, SceneUpdateKind next) {
-    if (next == SceneUpdateKind::None) {
-        return current;
-    }
-    if (current == SceneUpdateKind::None) {
-        return next;
-    }
-    if (current == next) {
-        return current;
-    }
-    if (current == SceneUpdateKind::RendererSettingsOnly) {
-        return next;
-    }
-    if (next == SceneUpdateKind::RendererSettingsOnly) {
-        return current;
-    }
-    if (current == SceneUpdateKind::TopologyChanged || next == SceneUpdateKind::TopologyChanged) {
-        return SceneUpdateKind::TopologyChanged;
-    }
-    return SceneUpdateKind::TopologyChanged;
 }
 
 } // namespace rtv

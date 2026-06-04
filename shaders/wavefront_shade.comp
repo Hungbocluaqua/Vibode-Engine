@@ -307,7 +307,7 @@ bool sample_wavefront_emissive_light(inout uint rng, vec3 hit_pos, out vec3 wi, 
     }
 
     uint light_index;
-    if (!sample_light_bvh(rng, light_index)) {
+    if (!sample_scene_light(rng, light_index)) {
         wi = vec3(0.0, 1.0, 0.0);
         emission = vec3(0.0);
         pdf_solid_angle = 0.0;
@@ -316,10 +316,11 @@ bool sample_wavefront_emissive_light(inout uint rng, vec3 hit_pos, out vec3 wi, 
     }
 
     LightRecord selected = light_records[light_index];
+    float selected_pdf = light_record_selection_pdf(light_index);
     if (selected.metadata.x == 2u) {
         wi = normalize(selected.data1.xyz);
         emission = selected.data2.xyz;
-        pdf_solid_angle = selected.data0.x / max(total_weight, 1.0e-6);
+        pdf_solid_angle = selected_pdf;
         distance_to_light = 10000.0;
         return has_positive_radiance(emission) && pdf_solid_angle > 0.0;
     }
@@ -330,8 +331,28 @@ bool sample_wavefront_emissive_light(inout uint rng, vec3 hit_pos, out vec3 wi, 
         distance_to_light = sqrt(max(dist_sq, 1.0e-8));
         wi = to_light / distance_to_light;
         emission = selected.data2.xyz / max(dist_sq, 1.0e-4);
-        pdf_solid_angle = selected.data0.x / max(total_weight, 1.0e-6);
+        pdf_solid_angle = selected_pdf;
         return has_positive_radiance(emission) && pdf_solid_angle > 0.0;
+    }
+    if (selected.metadata.x == 5u) {
+        vec3 sample_pos = selected.data1.xyz;
+        vec3 to_light = sample_pos - hit_pos;
+        float dist_sq = dot(to_light, to_light);
+        distance_to_light = sqrt(max(dist_sq, 1.0e-8));
+        wi = to_light / distance_to_light;
+
+        vec3 spot_direction = normalize(vec3(selected.data1.w, selected.data2.w, selected.data3.x));
+        float inner_cone = clamp(selected.data3.y, 0.0, PI);
+        float outer_cone = clamp(max(selected.data3.z, inner_cone), 0.0, PI);
+        float cos_inner = cos(inner_cone);
+        float cos_outer = cos(outer_cone);
+        float cos_theta = dot(-wi, spot_direction);
+        float cone_weight = clamp((cos_theta - cos_outer) / max(cos_inner - cos_outer, 1.0e-4), 0.0, 1.0);
+        cone_weight *= cone_weight;
+
+        emission = selected.data2.xyz * cone_weight / max(dist_sq, 1.0e-4);
+        pdf_solid_angle = selected_pdf;
+        return cone_weight > 0.0 && has_positive_radiance(emission) && pdf_solid_angle > 0.0;
     }
     if (selected.metadata.x == 4u) {
         vec3 center = selected.data1.xyz;
@@ -346,7 +367,7 @@ bool sample_wavefront_emissive_light(inout uint rng, vec3 hit_pos, out vec3 wi, 
         wi = to_light / distance_to_light;
         float cos_light = max(dot(-wi, light_normal), 0.0);
         emission = selected.data2.xyz;
-        float selection_pdf = selected.data0.x / max(total_weight, 1.0e-6);
+        float selection_pdf = selected_pdf;
         float area = max(selected.data0.w, 1.0e-6);
         pdf_solid_angle = cos_light > 1.0e-6 ? selection_pdf * dist_sq / (cos_light * area) : 0.0;
         return has_positive_radiance(emission) && pdf_solid_angle > 0.0;
@@ -387,7 +408,7 @@ bool sample_wavefront_emissive_light(inout uint rng, vec3 hit_pos, out vec3 wi, 
     distance_to_light = sqrt(max(dist_sq, 1.0e-8));
     wi = to_light / distance_to_light;
     float cos_light = max(dot(-wi, light_normal), 0.0);
-    float selection_pdf = selected.data0.x / max(total_weight, 1.0e-6);
+    float selection_pdf = selected_pdf;
     float area = max(selected.data0.w, 1.0e-6);
     pdf_solid_angle = cos_light > 1.0e-6 ? selection_pdf * dist_sq / (cos_light * area) : 0.0;
     return has_positive_radiance(emission) && pdf_solid_angle > 0.0;

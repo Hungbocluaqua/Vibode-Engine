@@ -272,39 +272,39 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
             if (editorGlyphBeginMenu(EditorGlyphIcon::Add, "Create")) {
                 if (editorGlyphMenuItem(EditorGlyphIcon::Entity, "Empty Entity")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty};
-                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                    requests.sceneUpdate = SceneUpdateKind::None;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Camera, "Camera")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera};
-                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                    requests.sceneUpdate = SceneUpdateKind::CameraOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Point Light")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
-                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                    requests.sceneUpdate = SceneUpdateKind::LightOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Spot Light")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::SpotLight};
-                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                    requests.sceneUpdate = SceneUpdateKind::LightOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Area Light")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::AreaLight};
-                    requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                    requests.sceneUpdate = SceneUpdateKind::LightOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Environment, "Environment Light")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::EnvironmentLight};
-                    requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+                    requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Sky, "Sky Atmosphere")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::SkyAtmosphere};
-                    requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+                    requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Fog, "Height Fog")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::HeightFog};
-                    requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+                    requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Cloud, "Volumetric Cloud")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::VolumetricCloud};
-                    requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+                    requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::PostProcess, "Post Process Volume")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::PostProcessVolume};
@@ -638,11 +638,11 @@ void SceneHierarchyPanel::drawEntityNode(
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::Sky, "Sky Atmosphere")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::SkyAtmosphere, .parent = entity.id};
-                requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+                requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::Fog, "Height Fog")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::HeightFog, .parent = entity.id};
-                requests.sceneUpdate = SceneUpdateKind::EnvironmentOnly;
+                requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::PostProcess, "Post Process Volume")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::PostProcessVolume, .parent = entity.id};

@@ -14,7 +14,10 @@ public:
     void setUndoStack(UndoStack* undoStack) { undoStack_ = undoStack; }
     void pushDocumentSnapshot(SceneDocument before, SceneUpdateKind updateKind, std::string label);
 
-    [[nodiscard]] EntityId createEntity(const std::string& name, EntityId parent = {});
+    [[nodiscard]] EntityId createEntity(
+        const std::string& name,
+        EntityId parent = {},
+        SceneUpdateKind updateKind = SceneUpdateKind::TopologyChanged);
     [[nodiscard]] EntityId duplicateEntity(EntityId id);
     bool deleteEntity(EntityId id);
     bool reparentEntity(EntityId child, EntityId newParent);

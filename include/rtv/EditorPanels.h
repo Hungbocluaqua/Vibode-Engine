@@ -43,6 +43,7 @@ struct EditorPanelVisibility {
     bool debugProfiler = false;
     bool sceneStats = false;
     bool gpuDiagnostics = false;
+    bool jobCenter = false;
 };
 
 struct EditorViewportState {
@@ -89,6 +90,60 @@ struct EditorPlacementStatus {
     std::string label;
 };
 
+struct EditorJobCenterState {
+    uint64_t sceneLoadJobSerial = 0;
+    bool sceneLoadRunning = false;
+    float sceneLoadProgress = 0.0f;
+    std::string sceneLoadStatus;
+    std::string sceneLoadTitle;
+    std::filesystem::path sceneLoadSourcePath;
+    std::string sceneLoadStage;
+    uint64_t completedSceneLoadSerial = 0;
+    bool completedSceneLoadSuccess = false;
+    bool completedSceneLoadCancelled = false;
+    std::string completedSceneLoadTitle;
+    std::string completedSceneLoadStatus;
+    std::filesystem::path completedSceneLoadSourcePath;
+    std::string completedSceneLoadError;
+    std::string completedSceneLoadWarning;
+    double completedSceneLoadWorkerTotalMs = 0.0;
+    double completedSceneLoadWorkerSceneParseMs = 0.0;
+    double completedSceneLoadWorkerGltfLoadMs = 0.0;
+    double completedSceneLoadWorkerDocumentBuildMs = 0.0;
+    uint64_t assetImportJobSerial = 0;
+    bool assetImportRunning = false;
+    float assetImportProgress = 0.0f;
+    std::string assetImportTitle;
+    std::string assetImportStatus;
+    bool assetImportCanRetry = false;
+    bool assetImportPlaceAfterImport = false;
+    std::filesystem::path assetImportSourcePath;
+    std::filesystem::path assetImportDestinationFolder;
+    std::string assetImportMode;
+    AssetImportSettings assetImportSettings{};
+    AssetGuid assetReimportGuid;
+    uint64_t completedAssetImportSerial = 0;
+    bool completedAssetImportSuccess = false;
+    std::string completedAssetImportTitle;
+    std::string completedAssetImportStatus;
+    std::filesystem::path completedAssetImportSourcePath;
+    std::filesystem::path completedAssetImportReportPath;
+    std::vector<std::string> completedAssetImportErrors;
+    std::vector<std::string> completedAssetImportWarnings;
+    bool completedAssetImportCanRetry = false;
+    bool completedAssetImportPlaceAfterImport = false;
+    std::filesystem::path completedAssetImportDestinationFolder;
+    std::string completedAssetImportMode;
+    AssetImportSettings completedAssetImportSettings{};
+    AssetGuid completedAssetReimportGuid;
+    double completedAssetImportWorkerTotalMs = 0.0;
+    double completedAssetImportWorkerValidateMs = 0.0;
+    double completedAssetImportWorkerDirectoryMs = 0.0;
+    double completedAssetImportWorkerInspectMs = 0.0;
+    double completedAssetImportWorkerWriteMs = 0.0;
+    size_t queuedAssetImports = 0;
+};
+
 struct EditorUiTextureProvider {
     void* user = nullptr;
     VkDescriptorSet (*acquire)(void* user, VkImageView imageView, VkImageLayout imageLayout) = nullptr;
@@ -120,6 +175,7 @@ struct EditorRuntimeState {
     const ProjectContext* project = nullptr;
     const AssetRegistry* assetRegistry = nullptr;
     bool sceneDirty = false;
+    bool projectSettingsDirty = false;
     const std::vector<EntityId>* instanceEntities = nullptr;
     const std::string* sceneLoadingStatus = nullptr;
     bool sceneLoadRunning = false;
@@ -133,6 +189,7 @@ struct EditorRuntimeState {
     CameraBookmarkManager* cameraBookmarks = nullptr;
     const EditorRenderJobStatus* renderJob = nullptr;
     const EditorPlacementStatus* placement = nullptr;
+    const EditorJobCenterState* jobCenter = nullptr;
     VkExtent2D swapchainExtent{};
     float cpuFrameMs = 0.0f;
     EditorViewportState viewport{};
@@ -140,9 +197,12 @@ struct EditorRuntimeState {
 
 struct ProjectManagerRuntimeState {
     const ProjectContext* project = nullptr;
+    const AssetRegistry* assetRegistry = nullptr;
     const std::string* sceneLoadingStatus = nullptr;
     bool sceneLoadRunning = false;
     float sceneLoadProgress = 0.0f;
+    bool sceneDirty = false;
+    bool projectSettingsDirty = false;
     bool standaloneLauncher = false;
 };
 
@@ -261,6 +321,26 @@ struct EditorImportAssetRequest {
     AssetImportSettings settings{};
 };
 
+struct EditorAssetRelinkSourceRequest {
+    AssetGuid guid;
+    std::filesystem::path sourcePath;
+};
+
+struct EditorReplaceAssetReferencesRequest {
+    AssetGuid oldGuid;
+    AssetGuid newGuid;
+};
+
+struct EditorAssetTagsRequest {
+    AssetGuid guid;
+    std::vector<std::string> tags;
+};
+
+struct EditorBulkAssetTagRequest {
+    std::vector<AssetGuid> guids;
+    std::string tag;
+};
+
 struct EditorRequests {
     std::optional<RendererSettings> settings;
     std::optional<AccumulationResetReason> resetAccumulation;
@@ -271,6 +351,11 @@ struct EditorRequests {
     std::optional<EditorImportAssetRequest> importAsset;
     std::optional<EditorImportAssetRequest> importAndPlace;
     std::optional<AssetGuid> reimportAsset;
+    std::optional<EditorAssetRelinkSourceRequest> relinkAssetSource;
+    std::optional<EditorReplaceAssetReferencesRequest> replaceAssetReferences;
+    std::optional<EditorAssetTagsRequest> updateAssetTags;
+    std::optional<EditorBulkAssetTagRequest> bulkAddAssetTag;
+    std::optional<EditorBulkAssetTagRequest> bulkRemoveAssetTag;
     std::optional<AssetGuid> placeAsset;
     std::optional<std::filesystem::path> importSceneAsNewScene;
     std::optional<std::filesystem::path> mergeScene;
@@ -308,22 +393,35 @@ struct EditorRequests {
     bool reloadShaders = false;
     bool undo = false;
     bool redo = false;
+    bool saveAll = false;
     bool resetLayout = false;
     bool saveLayout = false;
     bool toggleDenoiser = false;
+    bool togglePrimarySun = false;
     bool toggleDebugView = false;
     bool cycleIntermediateView = false;
     bool renderCurrentViewport = false;
     bool renderImage = false;
     bool renderSequence = false;
+    bool openProjectDirectory = false;
+    bool openSelectedAsset = false;
     bool stopRender = false;
     bool openOutputFolder = false;
+    std::optional<std::filesystem::path> openOutputFolderPath;
+    std::optional<std::filesystem::path> openDirectoryPath;
+    std::optional<std::filesystem::path> openFilePath;
+    bool toggleFullscreen = false;
     bool ensurePrimarySun = false;
     bool closeProject = false;
     bool closeScene = false;
     bool continueWithoutProject = false;
     bool saveProjectSettings = false;
     bool showProjectManager = false;
+    bool showProjectSettings = false;
+    bool showMaterialEditor = false;
+    bool closeMaterialEditor = false;
+    bool showControls = false;
+    bool showRendererInfo = false;
     bool showCommandPalette = false;
     bool cancelSceneLoad = false;
     bool restoreAutosave = false;

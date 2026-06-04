@@ -14,6 +14,7 @@ struct Entity {
     uint64_t uuid = 0;
     std::string name;
     Transform transform{};
+    Transform defaultTransform{};
     EntityId parent{};
     std::vector<EntityId> children;
     bool visible = true;

@@ -121,6 +121,18 @@ struct CachedNodeData {
     std::vector<uint32_t> children;
 };
 
+struct CachedSceneLightData {
+    uint32_t type = 1;
+    glm::mat4 transform{1.0f};
+    glm::vec3 color{1.0f};
+    float intensity = 1.0f;
+    float sizeOrRadius = 1.0f;
+    float innerConeRadians = 0.35f;
+    float outerConeRadians = 0.70f;
+    uint32_t enabled = 1;
+    int32_t nodeIndex = -1;
+};
+
 struct CachedBvhData {
     std::vector<glm::vec4> packedNodes;
     std::vector<glm::vec4> triangleData;
@@ -192,6 +204,7 @@ struct CachedScene {
     std::vector<CachedMaterialData> materials;
     std::vector<CachedMeshData> meshes;
     std::vector<CachedNodeData> nodes;
+    std::vector<CachedSceneLightData> sceneLights;
     std::vector<uint32_t> rootNodes;
     uint64_t sourceMtime = 0;
     uint64_t sourceBinMtime = 0;

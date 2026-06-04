@@ -19,6 +19,7 @@
 
 #include <array>
 #include <filesystem>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -32,7 +33,7 @@ public:
     void showProjectManager() { showProjectManager_ = true; projectManagerDismissed_ = false; }
     void dismissProjectManager() { showProjectManager_ = false; projectManagerDismissed_ = true; }
     void handleNotificationAction(NotificationAction action, EditorRequests& requests);
-    void showRecoveryPrompt(std::filesystem::path markerPath, std::filesystem::path autosavePath);
+    void showRecoveryPrompt(std::filesystem::path markerPath, std::filesystem::path autosavePath, std::filesystem::path projectAutosavePath = {});
     void invalidateAssetThumbnails() { assetBrowserPanel_.invalidateThumbnails(); }
     void clearSelection() { selection_.clear(); }
 
@@ -53,6 +54,9 @@ private:
     void drawTimelinePanel(EditorRuntimeState& state, EditorRequests& requests);
     void drawLogPanel(const EditorRuntimeState& state, EditorRequests& requests);
     void drawConsolePanel(EditorRuntimeState& state, EditorRequests& requests);
+    void updateJobCenterHistory(const EditorRuntimeState& state);
+    void drawJobCenterPanel(const EditorRuntimeState& state, EditorRequests& requests);
+    void drawJobHistoryEntry(size_t index, EditorRequests& requests);
     void drawCommandPalette(EditorRuntimeState& state, EditorRequests& requests);
     void applyCaptureFocusOverride();
     bool executeCommandPaletteCommand(EditorCommandId id, EditorRuntimeState& state, EditorRequests& requests);
@@ -81,6 +85,53 @@ private:
     float timelineDragStartMouseX_ = 0.0f;
     std::vector<std::pair<uint64_t, int>> timelineDragStartFrames_{};
     std::vector<std::string> consoleHistory_{};
+    struct EditorJobHistoryEntry {
+        uint64_t id = 0;
+        uint64_t serial = 0;
+        std::string key;
+        std::string title;
+        std::string kind;
+        std::string status;
+        float progress = 0.0f;
+        bool active = false;
+        bool completed = false;
+        bool failed = false;
+        bool cancelled = false;
+        bool hidden = false;
+        std::filesystem::path sourcePath;
+        std::filesystem::path outputRoot;
+        std::filesystem::path manifestPath;
+        std::filesystem::path reportPath;
+        std::vector<std::string> errors;
+        std::vector<std::string> warnings;
+        double workerTotalMs = 0.0;
+        double workerSceneParseMs = 0.0;
+        double workerGltfLoadMs = 0.0;
+        double workerDocumentBuildMs = 0.0;
+        double importValidateMs = 0.0;
+        double importDirectoryMs = 0.0;
+        double importInspectMs = 0.0;
+        double importWriteMs = 0.0;
+        bool hasAssetImportRetry = false;
+        bool assetImportPlaceAfterImport = false;
+        EditorImportAssetRequest assetImportRetry{};
+        AssetGuid assetReimportGuid;
+    };
+    std::vector<EditorJobHistoryEntry> jobHistory_{};
+    uint64_t nextJobHistoryId_ = 1;
+    bool observedSceneLoadRunningForHistory_ = false;
+    uint64_t activeSceneLoadHistorySerial_ = 0;
+    uint64_t observedSceneLoadResultSerial_ = 0;
+    bool observedAssetImportRunningForHistory_ = false;
+    uint64_t activeAssetImportHistorySerial_ = 0;
+    uint64_t observedAssetImportResultSerial_ = 0;
+    std::string activeSceneLoadHistoryKey_{};
+    std::string activeAssetImportHistoryKey_{};
+    std::string lastSceneLoadHistoryStatus_{};
+    std::string lastAssetImportHistoryTitle_{};
+    std::string lastAssetImportHistoryStatus_{};
+    float lastSceneLoadHistoryProgress_ = 0.0f;
+    float lastAssetImportHistoryProgress_ = 0.0f;
     bool commandPaletteOpen_ = false;
     std::array<char, 128> commandPaletteSearch_{};
     bool commandPaletteShortcutEditor_ = false;
@@ -93,6 +144,7 @@ private:
     uint64_t observedPlacementSerial_ = 0;
     std::filesystem::path recoveryMarkerPath_;
     std::filesystem::path recoveryAutosavePath_;
+    std::filesystem::path recoveryProjectAutosavePath_;
     bool showProjectManager_ = true;
     bool projectManagerDismissed_ = false;
     int projectManagerSection_ = 0;

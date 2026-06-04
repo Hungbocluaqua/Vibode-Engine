@@ -3,11 +3,13 @@
 #include "rtv/Project.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 
@@ -17,6 +19,7 @@ namespace {
 
 nlohmann::json importSettingsJson(const AssetImportSettings& settings) {
     return {
+        {"copySourceIntoProject", settings.copySourceIntoProject},
         {"preserveHierarchy", settings.preserveHierarchy},
         {"importMaterials", settings.importMaterials},
         {"importTextures", settings.importTextures},
@@ -34,6 +37,7 @@ AssetImportSettings importSettingsFromJson(const nlohmann::json& json) {
     if (!json.is_object()) {
         return settings;
     }
+    settings.copySourceIntoProject = json.value("copySourceIntoProject", settings.copySourceIntoProject);
     settings.preserveHierarchy = json.value("preserveHierarchy", settings.preserveHierarchy);
     settings.importMaterials = json.value("importMaterials", settings.importMaterials);
     settings.importTextures = json.value("importTextures", settings.importTextures);
@@ -44,6 +48,56 @@ AssetImportSettings importSettingsFromJson(const nlohmann::json& json) {
     settings.unitScale = json.value("unitScale", settings.unitScale);
     settings.coordinateConversion = json.value("coordinateConversion", settings.coordinateConversion);
     return settings;
+}
+
+std::filesystem::path resolveRecordPath(const std::filesystem::path& root, const std::string& path) {
+    if (path.empty()) {
+        return {};
+    }
+    std::filesystem::path resolved = path;
+    if (!resolved.is_absolute()) {
+        resolved = root / resolved;
+    }
+    return resolved;
+}
+
+bool regularFileExists(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    return std::filesystem::is_regular_file(path, ec);
+}
+
+uint64_t writeStamp(const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto value = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return 0;
+    }
+    return static_cast<uint64_t>(value.time_since_epoch().count());
+}
+
+bool assetRecordSaveLess(const AssetRecord& lhs, const AssetRecord& rhs) {
+    if (lhs.guid != rhs.guid) return lhs.guid < rhs.guid;
+    if (lhs.importedPath != rhs.importedPath) return lhs.importedPath < rhs.importedPath;
+    return lhs.displayName < rhs.displayName;
+}
+
+bool assetDependencySaveLess(const AssetDependency& lhs, const AssetDependency& rhs) {
+    if (lhs.kind != rhs.kind) return lhs.kind < rhs.kind;
+    return lhs.guid < rhs.guid;
+}
+
+std::vector<std::string> normalizedTags(std::vector<std::string> tags) {
+    for (std::string& tag : tags) {
+        tag.erase(tag.begin(), std::find_if(tag.begin(), tag.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        tag.erase(std::find_if(tag.rbegin(), tag.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), tag.end());
+    }
+    tags.erase(std::remove_if(tags.begin(), tags.end(), [](const std::string& tag) { return tag.empty(); }), tags.end());
+    std::sort(tags.begin(), tags.end());
+    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+    return tags;
 }
 
 } // namespace
@@ -143,8 +197,20 @@ bool AssetRegistry::load(const std::filesystem::path& path, std::string* error) 
                 record.importedHash = item.value("importedHash", std::string{});
                 record.importSettingsHash = item.value("importSettingsHash", std::string{});
                 record.lastModifiedTimestamp = item.value("lastModifiedTimestamp", std::string{});
+                if (item.contains("tags") && item["tags"].is_array()) {
+                    for (const nlohmann::json& tag : item["tags"]) {
+                        if (tag.is_string()) {
+                            record.tags.push_back(tag.get<std::string>());
+                        }
+                    }
+                    record.tags = normalizedTags(std::move(record.tags));
+                }
                 record.missing = item.value("missing", false);
                 record.stale = item.value("stale", false);
+                record.sourceMissing = item.value("sourceMissing", false);
+                record.importedMetadataMissing = item.value("importedMetadataMissing", false);
+                record.cookedPayloadMissing = item.value("cookedPayloadMissing", false);
+                record.dependenciesMissing = item.value("dependenciesMissing", false);
                 record.status = assetImportStatusFromName(item.value("status", std::string("Unknown")));
                 if (item.contains("importSettings")) {
                     record.importSettings = importSettingsFromJson(item["importSettings"]);
@@ -186,12 +252,20 @@ bool AssetRegistry::save(const std::filesystem::path& path) const {
         return false;
     }
 
+    std::vector<AssetRecord> sortedRecords = records_;
+    std::sort(sortedRecords.begin(), sortedRecords.end(), assetRecordSaveLess);
+
     nlohmann::json recordsJson = nlohmann::json::array();
-    for (const AssetRecord& record : records_) {
+    for (const AssetRecord& record : sortedRecords) {
+        std::vector<AssetDependency> sortedDependencies = record.dependencies;
+        std::sort(sortedDependencies.begin(), sortedDependencies.end(), assetDependencySaveLess);
         nlohmann::json dependencies = nlohmann::json::array();
-        for (const AssetDependency& dependency : record.dependencies) {
+        for (const AssetDependency& dependency : sortedDependencies) {
             dependencies.push_back({{"guid", dependency.guid}, {"kind", dependency.kind}});
         }
+        std::vector<AssetGuid> sortedReferences = record.references;
+        std::sort(sortedReferences.begin(), sortedReferences.end());
+        std::vector<std::string> sortedTags = normalizedTags(record.tags);
         recordsJson.push_back({
             {"guid", record.guid},
             {"type", assetTypeName(record.type)},
@@ -201,15 +275,20 @@ bool AssetRegistry::save(const std::filesystem::path& path) const {
             {"cachePath", record.cachePath},
             {"thumbnailPath", record.thumbnailPath},
             {"dependencies", dependencies},
-            {"references", record.references},
+            {"references", sortedReferences},
             {"sourceHash", record.sourceHash},
             {"importedHash", record.importedHash},
             {"importSettingsHash", record.importSettingsHash},
             {"lastModifiedTimestamp", record.lastModifiedTimestamp},
+            {"tags", sortedTags},
             {"importSettings", importSettingsJson(record.importSettings)},
             {"status", assetImportStatusName(record.status)},
             {"missing", record.missing},
             {"stale", record.stale},
+            {"sourceMissing", record.sourceMissing},
+            {"importedMetadataMissing", record.importedMetadataMissing},
+            {"cookedPayloadMissing", record.cookedPayloadMissing},
+            {"dependenciesMissing", record.dependenciesMissing},
         });
     }
 
@@ -248,6 +327,78 @@ void AssetRegistry::addOrReplaceRecord(AssetRecord record, AssetRegistryDirtyRea
         records_.push_back(std::move(record));
     }
     markDirty(reason);
+}
+
+bool AssetRegistry::refreshRecordHealth(const std::filesystem::path& root, bool markDirtyOnChange) {
+    std::unordered_set<AssetGuid> guids;
+    guids.reserve(records_.size());
+    for (const AssetRecord& record : records_) {
+        if (!record.guid.empty()) {
+            guids.insert(record.guid);
+        }
+    }
+
+    bool changed = false;
+    for (AssetRecord& record : records_) {
+        const bool previousMissing = record.missing;
+        const bool previousStale = record.stale;
+        const bool previousSourceMissing = record.sourceMissing;
+        const bool previousImportedMissing = record.importedMetadataMissing;
+        const bool previousCookedMissing = record.cookedPayloadMissing;
+        const bool previousDependenciesMissing = record.dependenciesMissing;
+        const AssetImportStatus previousStatus = record.status;
+
+        const std::filesystem::path sourcePath = resolveRecordPath(root, record.sourcePath);
+        const std::filesystem::path importedPath = resolveRecordPath(root, record.importedPath);
+        const std::filesystem::path cachePath = resolveRecordPath(root, record.cachePath);
+        const bool hasSourcePath = !record.sourcePath.empty();
+        const bool hasImportedPath = !record.importedPath.empty();
+        const bool hasCachePath = !record.cachePath.empty();
+        const bool sourceExists = hasSourcePath && regularFileExists(sourcePath);
+        const bool importedExists = !hasImportedPath || regularFileExists(importedPath);
+        const bool cacheExists = !hasCachePath || regularFileExists(cachePath);
+
+        bool dependenciesExist = true;
+        for (const AssetDependency& dependency : record.dependencies) {
+            if (!dependency.guid.empty() && guids.find(dependency.guid) == guids.end()) {
+                dependenciesExist = false;
+                break;
+            }
+        }
+
+        record.sourceMissing = hasSourcePath && !sourceExists;
+        record.importedMetadataMissing = hasImportedPath && !importedExists;
+        record.cookedPayloadMissing = hasCachePath && !cacheExists;
+        record.dependenciesMissing = !dependenciesExist;
+        record.missing = record.importedMetadataMissing || record.cookedPayloadMissing || record.dependenciesMissing;
+
+        uint64_t sourceStamp = sourceExists ? writeStamp(sourcePath) : 0;
+        uint64_t importedStamp = importedExists && hasImportedPath ? writeStamp(importedPath) : 0;
+        uint64_t cacheStamp = cacheExists && hasCachePath ? writeStamp(cachePath) : 0;
+        const bool importedStale = sourceStamp != 0 && importedStamp != 0 && sourceStamp > importedStamp;
+        const bool cacheStale = sourceStamp != 0 && cacheStamp != 0 && sourceStamp > cacheStamp;
+        record.stale = !record.missing && (importedStale || cacheStale);
+
+        if (record.status != AssetImportStatus::Failed) {
+            record.status = record.missing ? AssetImportStatus::Missing
+                : record.stale ? AssetImportStatus::Stale
+                : AssetImportStatus::Imported;
+        }
+
+        changed = changed
+            || previousMissing != record.missing
+            || previousStale != record.stale
+            || previousSourceMissing != record.sourceMissing
+            || previousImportedMissing != record.importedMetadataMissing
+            || previousCookedMissing != record.cookedPayloadMissing
+            || previousDependenciesMissing != record.dependenciesMissing
+            || previousStatus != record.status;
+    }
+
+    if (changed && markDirtyOnChange) {
+        markDirty(AssetRegistryDirtyReason::AssetDependencyChanged);
+    }
+    return changed;
 }
 
 } // namespace rtv

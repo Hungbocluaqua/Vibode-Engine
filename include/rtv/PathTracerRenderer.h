@@ -450,11 +450,12 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         uint32_t debugView = 0;
-        uint32_t enabled = 1;
-        float density = 0.000035f;
-        float heightFalloff = 1200.0f;
+        uint32_t enabled = 0;
+        float density = 0.0f;
+        float heightFalloff = 5.0f;
         float maxDistance = 10000.0f;
         float padding = 0.0f;
+        glm::vec4 color{0.65f, 0.72f, 0.85f, 0.0f};
     };
 
     struct RestirReservoirGpu {

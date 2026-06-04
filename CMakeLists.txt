@@ -134,6 +134,7 @@ add_executable(rtvulkan
     src/rtv/SceneEventBus.cpp
     src/rtv/SceneHierarchyPanel.cpp
     src/rtv/SceneOperations.cpp
+    src/rtv/SceneRenderSettingsSync.cpp
     src/rtv/SceneStatsPanel.cpp
     src/rtv/SceneRegistry.cpp
     src/rtv/SceneToGpuSceneBuilder.cpp

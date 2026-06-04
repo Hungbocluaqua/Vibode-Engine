@@ -55,12 +55,15 @@ public:
     void clearTimelineJson();
     void addPrefabInstance(PrefabInstance instance);
     [[nodiscard]] const std::vector<PrefabInstance>& prefabInstances() const { return prefabInstances_; }
+    [[nodiscard]] size_t replaceAssetGuidReferences(const AssetGuid& oldGuid, const AssetGuid& newGuid);
     [[nodiscard]] const RtLevelHeader& rtLevelHeader() const { return header_; }
 
     void markDirty(SceneUpdateKind kind);
+    void markDirty(SceneUpdateMask mask);
     void clearDirty();
     [[nodiscard]] bool dirty() const { return dirty_ || registry_.dirty(); }
     [[nodiscard]] SceneUpdateKind pendingUpdate() const;
+    [[nodiscard]] SceneUpdateMask pendingUpdateMask() const;
     [[nodiscard]] const std::string& lastChangeReason() const { return lastChangeReason_; }
     [[nodiscard]] const std::vector<std::string>& dirtyReasons() const { return dirtyReasons_; }
 
@@ -71,8 +74,6 @@ public:
     bool loadJson(const std::filesystem::path& path);
 
 private:
-    static SceneUpdateKind combine(SceneUpdateKind current, SceneUpdateKind next);
-
     mutable RtLevelHeader header_{};
     SceneRegistry registry_;
     Environment environment_{};
@@ -81,7 +82,7 @@ private:
     EntityId activeCamera_{};
     EntityId primarySun_{};
     bool dirty_ = true;
-    SceneUpdateKind pendingUpdate_ = SceneUpdateKind::TopologyChanged;
+    SceneUpdateMask pendingUpdateMask_ = SceneUpdateMaskTopology;
     std::string lastChangeReason_ = "SceneChanged";
     std::vector<std::string> dirtyReasons_;
     std::optional<std::filesystem::path> sourceGltfPath_;

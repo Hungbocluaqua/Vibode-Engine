@@ -12,8 +12,8 @@ namespace rtv {
 
 class SceneRegistry {
 public:
-    [[nodiscard]] EntityId createEntity(std::string name = "Entity");
-    bool destroyEntity(EntityId id);
+    [[nodiscard]] EntityId createEntity(std::string name = "Entity", SceneUpdateKind updateKind = SceneUpdateKind::TopologyChanged);
+    bool destroyEntity(EntityId id, SceneUpdateKind updateKind = SceneUpdateKind::TopologyChanged);
     bool renameEntity(EntityId id, std::string name);
 
     [[nodiscard]] Entity* entity(EntityId id);
@@ -47,8 +47,9 @@ public:
 
     void markDirty(SceneUpdateKind kind);
     void clearDirty();
-    [[nodiscard]] bool dirty() const { return pendingUpdate_ != SceneUpdateKind::None; }
-    [[nodiscard]] SceneUpdateKind pendingUpdate() const { return pendingUpdate_; }
+    [[nodiscard]] bool dirty() const { return pendingUpdateMask_ != SceneUpdateMaskNone; }
+    [[nodiscard]] SceneUpdateKind pendingUpdate() const { return sceneUpdateKindFromMask(pendingUpdateMask_); }
+    [[nodiscard]] SceneUpdateMask pendingUpdateMask() const { return pendingUpdateMask_; }
     [[nodiscard]] size_t liveCount() const { return liveCount_; }
 
     void ensureUuidCounter(uint64_t minUuid);
@@ -60,14 +61,12 @@ private:
     };
 
     [[nodiscard]] bool validIndex(EntityId id) const;
-    static SceneUpdateKind combine(SceneUpdateKind current, SceneUpdateKind next);
-
     std::vector<Slot> slots_;
     std::vector<uint32_t> freeList_;
     std::unordered_map<uint64_t, EntityId> uuidIndex_;
     size_t liveCount_ = 0;
     uint64_t uuidCounter_ = 1;
-    SceneUpdateKind pendingUpdate_ = SceneUpdateKind::None;
+    SceneUpdateMask pendingUpdateMask_ = SceneUpdateMaskNone;
 };
 
 } // namespace rtv

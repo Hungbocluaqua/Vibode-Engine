@@ -39,28 +39,84 @@ glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
     return glm::eulerAngles(glm::quat_cast(rotation));
 }
 
+SceneUpdateMask entityRemovalUpdateMask(const SceneDocument& document, const Entity& entity) {
+    if (entity.meshRenderer.has_value()) {
+        return SceneUpdateMaskTopology;
+    }
+    SceneUpdateMask mask = SceneUpdateMaskNone;
+    if (entity.light.has_value() || entity.sun.has_value()) {
+        mask |= SceneUpdateMaskLight;
+    }
+    if (entity.camera.has_value()) {
+        mask |= SceneUpdateMaskCamera;
+    }
+    if (entity.environmentLight.has_value() || entity.skyAtmosphere.has_value() ||
+        entity.heightFog.has_value() || entity.volumetricCloud.has_value()) {
+        mask |= SceneUpdateMaskRendererSettings;
+    }
+    if (entity.postProcessVolume.has_value() || entity.cameraPostProcess.has_value()) {
+        mask |= SceneUpdateMaskRendererSettings;
+    }
+    for (EntityId childId : entity.children) {
+        if (const Entity* child = document.registry().entity(childId)) {
+            mask |= entityRemovalUpdateMask(document, *child);
+        }
+    }
+    return mask;
+}
+
+SceneUpdateKind transformUpdateKind(const SceneDocument& document, const Entity& entity) {
+    const bool hasMesh = entity.meshRenderer.has_value();
+    const bool hasLight = entity.light.has_value();
+    const bool hasSun = entity.sun.has_value();
+    const bool hasActiveCamera = entity.camera.has_value() && document.activeCamera() == entity.id;
+    if (((hasLight || hasSun) && hasMesh) || (hasActiveCamera && hasMesh) || (hasActiveCamera && (hasLight || hasSun))) {
+        return SceneUpdateKind::TopologyChanged;
+    }
+    if (hasActiveCamera) {
+        return SceneUpdateKind::CameraOnly;
+    }
+    if (hasLight || hasSun) {
+        return SceneUpdateKind::LightOnly;
+    }
+    return SceneUpdateKind::TransformOnly;
+}
+
 class SceneDocumentSnapshotCommand final : public ICommand {
 public:
     SceneDocumentSnapshotCommand(
         SceneDocument& document,
         SceneDocument before,
         SceneDocument after,
-        SceneUpdateKind updateKind,
+        SceneUpdateMask updateMask,
         std::string label)
         : document_(document),
           before_(std::move(before)),
           after_(std::move(after)),
-          updateKind_(updateKind),
+          updateMask_(updateMask),
           label_(std::move(label)) {}
+
+    SceneDocumentSnapshotCommand(
+        SceneDocument& document,
+        SceneDocument before,
+        SceneDocument after,
+        SceneUpdateKind updateKind,
+        std::string label)
+        : SceneDocumentSnapshotCommand(
+            document,
+            std::move(before),
+            std::move(after),
+            sceneUpdateKindMask(updateKind),
+            std::move(label)) {}
 
     void undo() override {
         document_ = before_;
-        document_.markDirty(updateKind_);
+        document_.markDirty(updateMask_);
     }
 
     void redo() override {
         document_ = after_;
-        document_.markDirty(updateKind_);
+        document_.markDirty(updateMask_);
     }
 
     [[nodiscard]] const std::string& label() const override { return label_; }
@@ -69,7 +125,7 @@ private:
     SceneDocument& document_;
     SceneDocument before_;
     SceneDocument after_;
-    SceneUpdateKind updateKind_ = SceneUpdateKind::TopologyChanged;
+    SceneUpdateMask updateMask_ = SceneUpdateMaskTopology;
     std::string label_;
 };
 
@@ -86,20 +142,20 @@ void SceneOperations::pushDocumentSnapshot(SceneDocument before, SceneUpdateKind
         document_, std::move(before), document_, updateKind, std::move(label)));
 }
 
-EntityId SceneOperations::createEntity(const std::string& name, EntityId parent) {
+EntityId SceneOperations::createEntity(const std::string& name, EntityId parent, SceneUpdateKind updateKind) {
     const SceneDocument before = document_;
-    EntityId id = document_.registry().createEntity(name);
+    EntityId id = document_.registry().createEntity(name, updateKind);
     if (Entity* entity = document_.registry().entity(id)) {
         entity->parent = parent;
         if (Entity* parentEntity = document_.registry().entity(parent)) {
             parentEntity->children.push_back(id);
         }
     }
-    document_.markDirty(SceneUpdateKind::TopologyChanged);
-    publish({SceneEventType::EntityCreated, id, parent, SceneUpdateKind::TopologyChanged});
+    document_.markDirty(updateKind);
+    publish({SceneEventType::EntityCreated, id, parent, updateKind});
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
-            document_, before, document_, SceneUpdateKind::TopologyChanged, "Create Entity"));
+            document_, before, document_, updateKind, "Create Entity"));
     }
     return id;
 }
@@ -122,17 +178,26 @@ EntityId SceneOperations::duplicateEntity(EntityId id) {
 
 bool SceneOperations::deleteEntity(EntityId id) {
     const SceneDocument before = document_;
+    const Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr) {
+        return false;
+    }
+    const SceneUpdateMask updateMask = entityRemovalUpdateMask(document_, *entity);
+    const SceneUpdateKind updateKind = sceneUpdateKindFromMask(updateMask);
     if (document_.activeCamera() == id) {
         document_.setActiveCamera({});
     }
-    if (!document_.registry().destroyEntity(id)) {
+    if (document_.primarySun() == id) {
+        document_.setPrimarySun({});
+    }
+    if (!document_.registry().destroyEntity(id, updateKind)) {
         return false;
     }
-    document_.markDirty(SceneUpdateKind::TopologyChanged);
-    publish({SceneEventType::EntityDeleted, id, {}, SceneUpdateKind::TopologyChanged});
+    document_.markDirty(updateMask);
+    publish({SceneEventType::EntityDeleted, id, {}, updateKind});
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
-            document_, before, document_, SceneUpdateKind::TopologyChanged, "Delete Entity"));
+            document_, before, document_, updateMask, "Delete Entity"));
     }
     return true;
 }
@@ -229,30 +294,14 @@ bool SceneOperations::setTransform(EntityId id, const Transform& transform) {
     }
     entity->transform = transform;
     entity->transform.dirty = true;
-    document_.markDirty(SceneUpdateKind::TransformOnly);
-    publish({SceneEventType::TransformChanged, id, {}, SceneUpdateKind::TransformOnly});
+    const SceneUpdateKind updateKind = transformUpdateKind(document_, *entity);
+    document_.markDirty(updateKind);
+    publish({SceneEventType::TransformChanged, id, {}, updateKind});
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
-            document_, before, document_, SceneUpdateKind::TransformOnly, "Set Transform"));
+            document_, before, document_, updateKind, "Set Transform"));
     }
     return true;
-}
-
-SceneUpdateKind transformUpdateKind(const SceneDocument& document, const Entity& entity) {
-    const bool hasMesh = entity.meshRenderer.has_value();
-    const bool hasLight = entity.light.has_value();
-    const bool hasSun = entity.sun.has_value();
-    const bool hasActiveCamera = entity.camera.has_value() && document.activeCamera() == entity.id;
-    if (((hasLight || hasSun) && hasMesh) || (hasActiveCamera && hasMesh) || (hasActiveCamera && (hasLight || hasSun))) {
-        return SceneUpdateKind::TopologyChanged;
-    }
-    if (hasActiveCamera) {
-        return SceneUpdateKind::CameraOnly;
-    }
-    if (hasLight || hasSun) {
-        return SceneUpdateKind::LightOnly;
-    }
-    return SceneUpdateKind::TransformOnly;
 }
 
 void SceneOperations::setTransformGizmoDrag(EntityId id, const Transform& oldTransform, const Transform& newTransform) {
@@ -281,11 +330,11 @@ bool SceneOperations::addLightComponent(EntityId id, Light light) {
     }
     const SceneDocument before = document_;
     document_.registry().addLight(id, light);
-    document_.markDirty(SceneUpdateKind::TopologyChanged);
-    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    document_.markDirty(SceneUpdateKind::LightOnly);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::LightOnly});
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
-            document_, before, document_, SceneUpdateKind::TopologyChanged, "Add Light Component"));
+            document_, before, document_, SceneUpdateKind::LightOnly, "Add Light Component"));
     }
     return true;
 }
@@ -305,6 +354,7 @@ bool SceneOperations::addSunComponent(EntityId id, Sun sun) {
             entity->transform,
             document_.renderSettings().sunElevation,
             document_.renderSettings().sunAzimuth);
+        entity->defaultTransform = entity->transform;
     }
     document_.setPrimarySun(id);
     for (Entity* other : document_.registry().entities()) {
@@ -331,11 +381,11 @@ bool SceneOperations::addCameraComponent(EntityId id, Camera camera) {
     if (camera.active) {
         document_.setActiveCamera(id);
     }
-    document_.markDirty(SceneUpdateKind::TopologyChanged);
-    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    document_.markDirty(SceneUpdateKind::CameraOnly);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::CameraOnly});
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
-            document_, before, document_, SceneUpdateKind::TopologyChanged, "Add Camera Component"));
+            document_, before, document_, SceneUpdateKind::CameraOnly, "Add Camera Component"));
     }
     return true;
 }
@@ -363,9 +413,9 @@ bool SceneOperations::removeLightComponent(EntityId id) {
         return false;
     }
     entity->light.reset();
-    document_.markDirty(SceneUpdateKind::TopologyChanged);
-    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::TopologyChanged});
-    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, "Remove Light Component");
+    document_.markDirty(SceneUpdateKind::LightOnly);
+    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::LightOnly});
+    pushDocumentSnapshot(before, SceneUpdateKind::LightOnly, "Remove Light Component");
     return true;
 }
 
@@ -395,9 +445,9 @@ bool SceneOperations::removeCameraComponent(EntityId id) {
     if (document_.activeCamera() == id) {
         document_.setActiveCamera({});
     }
-    document_.markDirty(SceneUpdateKind::TopologyChanged);
-    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::TopologyChanged});
-    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, "Remove Camera Component");
+    document_.markDirty(SceneUpdateKind::CameraOnly);
+    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::CameraOnly});
+    pushDocumentSnapshot(before, SceneUpdateKind::CameraOnly, "Remove Camera Component");
     return true;
 }
 
@@ -474,6 +524,7 @@ EntityId SceneOperations::mergeSceneAsset(const SceneAsset& scene, const std::st
         entity->transform.rotationEuler = eulerFromMatrix(node.transform);
         entity->transform.scale = scaleFromMatrix(node.transform);
         entity->transform.dirty = true;
+        entity->defaultTransform = entity->transform;
         entity->visible = node.visible;
 
         if (node.mesh.valid()) {
@@ -529,15 +580,20 @@ EntityId SceneOperations::mergeSceneAsset(const SceneAsset& scene, const std::st
                 rootEntity->children.push_back(id);
             }
         }
-        entity->transform.position = translationFromMatrix(source.transform);
-        entity->transform.rotationEuler = eulerFromMatrix(source.transform);
-        entity->transform.scale = scaleFromMatrix(source.transform);
+        if (source.nodeIndex < 0) {
+            entity->transform.position = translationFromMatrix(source.transform);
+            entity->transform.rotationEuler = eulerFromMatrix(source.transform);
+            entity->transform.scale = scaleFromMatrix(source.transform);
+            entity->defaultTransform = entity->transform;
+        }
 
         Light light;
         light.type = static_cast<LightType>(std::min(source.type, 3u));
         light.color = source.color;
         light.intensity = source.intensity;
         light.sizeOrRadius = source.sizeOrRadius;
+        light.innerConeRadians = source.innerConeRadians;
+        light.outerConeRadians = source.outerConeRadians;
         light.enabled = source.enabled;
         entity->light = light;
     }
@@ -570,6 +626,7 @@ PrefabInstance SceneOperations::placePrefab(
         if (Entity* parentEntity = document_.registry().entity(parent)) {
             parentEntity->children.push_back(root);
         }
+        rootEntity->defaultTransform = rootEntity->transform;
         instance.generatedEntityUuids.push_back(rootEntity->uuid);
     }
 
@@ -579,6 +636,7 @@ PrefabInstance SceneOperations::placePrefab(
         EntityId id = document_.registry().createEntity(node.name.empty() ? "Prefab Node " + std::to_string(i) : node.name);
         nodeEntities[i] = id;
         if (Entity* entity = document_.registry().entity(id)) {
+            entity->defaultTransform = entity->transform;
             instance.generatedEntityUuids.push_back(entity->uuid);
         }
     }
@@ -708,6 +766,7 @@ EntityId SceneOperations::duplicateEntityRecursive(const Entity& source, EntityI
     }
     copy->transform = source.transform;
     copy->transform.dirty = true;
+    copy->defaultTransform = copy->transform;
     copy->visible = source.visible;
     copy->locked = source.locked;
     copy->meshRenderer = source.meshRenderer;

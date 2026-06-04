@@ -17,6 +17,7 @@ bool cancelled(const std::shared_ptr<std::atomic_bool>& cancelFlag) {
 SceneLoadResult makeCancelledResult(const SceneLoadRequest& request) {
     SceneLoadResult result;
     result.mode = request.mode;
+    result.serial = request.serial;
     result.sourcePath = request.sourcePath;
     result.cancelled = true;
     result.errorMessage = "Scene load cancelled";

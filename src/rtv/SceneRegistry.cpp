@@ -6,7 +6,7 @@
 
 namespace rtv {
 
-EntityId SceneRegistry::createEntity(std::string name) {
+EntityId SceneRegistry::createEntity(std::string name, SceneUpdateKind updateKind) {
     uint32_t index = 0;
     if (!freeList_.empty()) {
         index = freeList_.back();
@@ -24,11 +24,11 @@ EntityId SceneRegistry::createEntity(std::string name) {
     slot.entity = std::move(entity);
     uuidIndex_.emplace(slot.entity->uuid, slot.entity->id);
     ++liveCount_;
-    markDirty(SceneUpdateKind::TopologyChanged);
+    markDirty(updateKind);
     return slot.entity->id;
 }
 
-bool SceneRegistry::destroyEntity(EntityId id) {
+bool SceneRegistry::destroyEntity(EntityId id, SceneUpdateKind updateKind) {
     if (!validIndex(id) || !slots_[id.index].entity.has_value()) {
         return false;
     }
@@ -61,7 +61,7 @@ bool SceneRegistry::destroyEntity(EntityId id) {
     ++slots_[id.index].generation;
     freeList_.push_back(id.index);
     --liveCount_;
-    markDirty(SceneUpdateKind::TopologyChanged);
+    markDirty(updateKind);
     return true;
 }
 
@@ -273,11 +273,11 @@ bool SceneRegistry::effectiveVisible(EntityId id) const {
 }
 
 void SceneRegistry::markDirty(SceneUpdateKind kind) {
-    pendingUpdate_ = combine(pendingUpdate_, kind);
+    pendingUpdateMask_ |= sceneUpdateKindMask(kind);
 }
 
 void SceneRegistry::clearDirty() {
-    pendingUpdate_ = SceneUpdateKind::None;
+    pendingUpdateMask_ = SceneUpdateMaskNone;
     for (Slot& slot : slots_) {
         if (slot.entity.has_value()) {
             slot.entity->transform.markClean();
@@ -295,28 +295,6 @@ void SceneRegistry::ensureUuidCounter(uint64_t minUuid) {
     if (uuidCounter_ <= minUuid) {
         uuidCounter_ = minUuid + 1;
     }
-}
-
-SceneUpdateKind SceneRegistry::combine(SceneUpdateKind current, SceneUpdateKind next) {
-    if (next == SceneUpdateKind::None) {
-        return current;
-    }
-    if (current == SceneUpdateKind::None) {
-        return next;
-    }
-    if (current == next) {
-        return current;
-    }
-    if (current == SceneUpdateKind::RendererSettingsOnly) {
-        return next;
-    }
-    if (next == SceneUpdateKind::RendererSettingsOnly) {
-        return current;
-    }
-    if (current == SceneUpdateKind::TopologyChanged || next == SceneUpdateKind::TopologyChanged) {
-        return SceneUpdateKind::TopologyChanged;
-    }
-    return SceneUpdateKind::TopologyChanged;
 }
 
 } // namespace rtv

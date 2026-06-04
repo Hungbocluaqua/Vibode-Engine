@@ -42,6 +42,7 @@ layout(set = 0, binding = 3, std140) uniform FogParams {
     float height_falloff;
     float max_distance;
     float _padding0;
+    vec4 color;
 } params;
 
 layout(set = 1, binding = 1) uniform texture2D atmosphere_sky_view_lut;
@@ -137,8 +138,9 @@ void main() {
         fogAmount *= 1.0 - horizonVisibility;
     }
 
-    vec3 sky = surfaceHit ? sample_sky(rayDir) : horizon_fog_sky(rayDir);
-    vec3 inscatter = max(aerial.rgb, sky * fogAmount * (surfaceHit ? 0.18 : 0.36));
+    vec3 fogTint = max(params.color.rgb, vec3(0.0));
+    vec3 sky = (surfaceHit ? sample_sky(rayDir) : horizon_fog_sky(rayDir)) * fogTint;
+    vec3 inscatter = max(aerial.rgb * fogTint, sky * fogAmount * (surfaceHit ? 0.18 : 0.36));
     vec3 fogged = baseColor * (1.0 - fogAmount) + inscatter;
     imageStore(color_image, coords, vec4(max(fogged, vec3(0.0)), color.a));
 }

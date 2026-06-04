@@ -23,6 +23,21 @@ bool loadPrefabAsset(const std::filesystem::path& path, PrefabAsset& outPrefab, 
         outPrefab.guid = prefab->value("guid", json.value("guid", std::string{}));
         outPrefab.name = prefab->value("name", json.value("displayName", path.stem().string()));
         outPrefab.sourcePath = prefab->value("sourcePath", json.value("sourcePath", std::string{}));
+        const nlohmann::json* runtimePayload = nullptr;
+        if (prefab->contains("runtimePayload") && (*prefab)["runtimePayload"].is_object()) {
+            runtimePayload = &(*prefab)["runtimePayload"];
+        } else if (json.contains("runtimePayload") && json["runtimePayload"].is_object()) {
+            runtimePayload = &json["runtimePayload"];
+        }
+        if (runtimePayload != nullptr) {
+            outPrefab.runtimePayloadKind = runtimePayload->value("kind", std::string{});
+            outPrefab.runtimeCachePath = runtimePayload->value(
+                "cachePath",
+                runtimePayload->value("sceneCachePath", runtimePayload->value("path", std::string{})));
+            outPrefab.runtimePayloadHash = runtimePayload->value("payloadHash", runtimePayload->value("hash", std::string{}));
+            outPrefab.runtimeSourceHash = runtimePayload->value("sourceHash", std::string{});
+            outPrefab.runtimeImportSettingsHash = runtimePayload->value("importSettingsHash", std::string{});
+        }
         if (prefab->contains("rootNodes") && (*prefab)["rootNodes"].is_array()) {
             for (const nlohmann::json& root : (*prefab)["rootNodes"]) {
                 outPrefab.rootNodes.push_back(root.get<uint32_t>());

@@ -32,6 +32,49 @@ std::string activeSceneTitle(const EditorRuntimeState& state) {
     return title;
 }
 
+bool assetRegistryDirty(const EditorRuntimeState& state) {
+    return state.assetRegistry != nullptr && state.assetRegistry->dirty();
+}
+
+std::string editorSaveStateLabel(const EditorRuntimeState& state) {
+    const bool registryDirty = assetRegistryDirty(state);
+    if (!state.sceneDirty && !state.projectSettingsDirty && !registryDirty) {
+        return "Saved";
+    }
+    std::string label = "Dirty: ";
+    bool any = false;
+    const auto append = [&](const char* value) {
+        if (any) {
+            label += ", ";
+        }
+        label += value;
+        any = true;
+    };
+    if (state.sceneDirty) {
+        append("Level");
+    }
+    if (state.projectSettingsDirty) {
+        append("Project");
+    }
+    if (registryDirty) {
+        append("Registry");
+    }
+    return label;
+}
+
+void drawEditorSaveStateLabel(const EditorRuntimeState& state, const std::string& label) {
+    const bool dirty = state.sceneDirty || state.projectSettingsDirty || assetRegistryDirty(state);
+    const ImVec4 color = dirty ? ImVec4(0.95f, 0.70f, 0.25f, 1.0f) : ImVec4(0.55f, 0.75f, 0.58f, 1.0f);
+    ImGui::TextColored(color, "%s", label.c_str());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Level: %s\nProject Settings: %s\nAsset Registry: %s",
+            state.sceneDirty ? "dirty" : "saved",
+            state.projectSettingsDirty ? "dirty" : "saved",
+            assetRegistryDirty(state) ? "dirty" : "saved");
+    }
+}
+
 void menuItemTooltip(const char* description, const char* disabledReason = nullptr) {
     if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         return;
@@ -47,12 +90,15 @@ EditorGlyphIcon commandGlyph(EditorCommandId id) {
     switch (id) {
     case EditorCommandId::ProjectManager:
     case EditorCommandId::CloseProject:
+    case EditorCommandId::ProjectSettings:
         return EditorGlyphIcon::ProjectFile;
     case EditorCommandId::NewScene:
     case EditorCommandId::OpenScene:
     case EditorCommandId::SaveScene:
     case EditorCommandId::SaveSceneAs:
         return EditorGlyphIcon::SceneFile;
+    case EditorCommandId::OpenAsset:
+        return EditorGlyphIcon::Folder;
     case EditorCommandId::ImportAsset:
     case EditorCommandId::ImportAndPlace:
     case EditorCommandId::ImportSceneAsNewScene:
@@ -99,6 +145,7 @@ EditorGlyphIcon commandGlyph(EditorCommandId id) {
     case EditorCommandId::CommandPalette:
     case EditorCommandId::ShowControls:
     case EditorCommandId::ShowRendererInfo:
+    case EditorCommandId::JobCenter:
         return EditorGlyphIcon::Command;
     case EditorCommandId::SaveLayout:
     case EditorCommandId::ResetLayout:
@@ -261,7 +308,6 @@ enum class DockTabCloseTarget {
     Hierarchy,
     RenderSettings,
     Inspector,
-    MaterialEditor,
     Content,
     Timeline,
     Log,
@@ -273,12 +319,11 @@ struct DockTabIconSpec {
     DockTabCloseTarget closeTarget;
 };
 
-constexpr std::array<DockTabIconSpec, 8> kDockTabIconSpecs{{
+constexpr std::array<DockTabIconSpec, 7> kDockTabIconSpecs{{
     {"Scene", EditorGlyphIcon::Sky, DockTabCloseTarget::Scene},
     {"Hierarchy", EditorGlyphIcon::Hierarchy, DockTabCloseTarget::Hierarchy},
     {"Render Settings", EditorGlyphIcon::ViewSettings, DockTabCloseTarget::RenderSettings},
     {"Inspector", EditorGlyphIcon::Details, DockTabCloseTarget::Inspector},
-    {"Material Editor", EditorGlyphIcon::Material, DockTabCloseTarget::MaterialEditor},
     {"Content", EditorGlyphIcon::Folder, DockTabCloseTarget::Content},
     {"Timeline", EditorGlyphIcon::Timeline, DockTabCloseTarget::Timeline},
     {"Log", EditorGlyphIcon::List, DockTabCloseTarget::Log},
@@ -297,9 +342,6 @@ void closeDockTab(const DockTabIconSpec& spec, EditorPanelVisibility& visibility
         break;
     case DockTabCloseTarget::Inspector:
         visibility.inspector = false;
-        break;
-    case DockTabCloseTarget::MaterialEditor:
-        visibility.materialEditor = false;
         break;
     case DockTabCloseTarget::Content:
         visibility.assetBrowser = false;
@@ -478,6 +520,14 @@ void EditorDockspace::begin(EditorRuntimeState& state, EditorPanelVisibility& vi
         layoutResetRequested_ = false;
         requests.resetLayout = false;
     }
+    if (requests.showControls) {
+        showControls_ = true;
+        requests.showControls = false;
+    }
+    if (requests.showRendererInfo) {
+        showRendererInfo_ = true;
+        requests.showRendererInfo = false;
+    }
     drawHelpWindows();
 }
 
@@ -565,7 +615,6 @@ void EditorDockspace::buildDefaultLayout() {
     ImGui::DockBuilderDockWindow("Hierarchy", right);
     ImGui::DockBuilderDockWindow("Render Settings", right);
     ImGui::DockBuilderDockWindow("Inspector", rightBottom);
-    ImGui::DockBuilderDockWindow("Material Editor", rightBottom);
     ImGui::DockBuilderDockWindow("Content", bottom);
     ImGui::DockBuilderDockWindow("Timeline", bottom);
     ImGui::DockBuilderDockWindow("Log", bottom);
@@ -576,6 +625,9 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
     switch (id) {
     case EditorCommandId::ProjectManager:
         requests.showProjectManager = true;
+        break;
+    case EditorCommandId::ProjectSettings:
+        requests.showProjectSettings = true;
         break;
     case EditorCommandId::CloseProject:
         requests.closeProject = true;
@@ -608,6 +660,17 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
             setProfilePath(*path);
             saveLayout();
         }
+        break;
+    case EditorCommandId::SaveAll:
+        requests.saveAll = true;
+        saveLayout();
+        break;
+    case EditorCommandId::OpenProjectDirectory:
+        requests.openProjectDirectory = true;
+        break;
+    case EditorCommandId::OpenAsset:
+        visibility.assetBrowser = true;
+        requests.openSelectedAsset = true;
         break;
     case EditorCommandId::ImportAsset:
         visibility.assetBrowser = true;
@@ -688,6 +751,9 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
     case EditorCommandId::ShowRendererInfo:
         showRendererInfo_ = true;
         break;
+    case EditorCommandId::JobCenter:
+        visibility.jobCenter = true;
+        break;
     case EditorCommandId::CommandPalette:
         requests.showCommandPalette = true;
         break;
@@ -697,6 +763,27 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
     case EditorCommandId::ToggleDenoiser:
         requests.toggleDenoiser = true;
         break;
+    case EditorCommandId::ToggleMovingDenoiser: {
+        RendererSettings settings = state.renderer.settings();
+        settings.denoiseWhileMoving = !settings.denoiseWhileMoving;
+        requestSettings(requests, settings);
+        break;
+    }
+    case EditorCommandId::ToggleSun:
+        requests.togglePrimarySun = true;
+        break;
+    case EditorCommandId::ToggleEnvironment: {
+        RendererSettings settings = state.renderer.settings();
+        settings.environmentEnabled = !settings.environmentEnabled;
+        requestSettings(requests, settings);
+        break;
+    }
+    case EditorCommandId::ToggleDirectLighting: {
+        RendererSettings settings = state.renderer.settings();
+        settings.directLightingEnabled = !settings.directLightingEnabled;
+        requestSettings(requests, settings);
+        break;
+    }
     case EditorCommandId::CycleDebugView:
         requests.toggleDebugView = true;
         break;
@@ -711,6 +798,9 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
         break;
     case EditorCommandId::RenderSequence:
         requests.renderSequence = true;
+        break;
+    case EditorCommandId::Screenshot:
+        requests.renderCurrentViewport = true;
         break;
     case EditorCommandId::StopRender:
         requests.stopRender = true;
@@ -741,6 +831,29 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
         requestSettings(requests, settings);
         break;
     }
+    case EditorCommandId::SetToneMapperLinear:
+    case EditorCommandId::SetToneMapperReinhard:
+    case EditorCommandId::SetToneMapperAces:
+    case EditorCommandId::SetToneMapperPbrNeutral:
+    case EditorCommandId::SetToneMapperAgx: {
+        RendererSettings settings = state.renderer.settings();
+        switch (id) {
+        case EditorCommandId::SetToneMapperLinear: settings.toneMapper = ToneMapper::Linear; break;
+        case EditorCommandId::SetToneMapperReinhard: settings.toneMapper = ToneMapper::Reinhard; break;
+        case EditorCommandId::SetToneMapperAces: settings.toneMapper = ToneMapper::ACES; break;
+        case EditorCommandId::SetToneMapperPbrNeutral: settings.toneMapper = ToneMapper::PBRNeutral; break;
+        case EditorCommandId::SetToneMapperAgx: settings.toneMapper = ToneMapper::AgX; break;
+        default: break;
+        }
+        requestSettings(requests, settings);
+        break;
+    }
+    case EditorCommandId::ToggleAutoExposure: {
+        RendererSettings settings = state.renderer.settings();
+        settings.autoExposureEnabled = !settings.autoExposureEnabled;
+        requestSettings(requests, settings);
+        break;
+    }
     case EditorCommandId::SaveLayout:
         requests.saveLayout = true;
         saveLayout();
@@ -754,6 +867,9 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
         break;
     case EditorCommandId::Redo:
         requests.redo = true;
+        break;
+    case EditorCommandId::ToggleFullscreen:
+        requests.toggleFullscreen = true;
         break;
     default:
         break;
@@ -852,13 +968,11 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         if (filteredCommandMenuItem(EditorCommandId::NewScene, prefs, fileSearch.data())) { executeCommand(EditorCommandId::NewScene, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::OpenScene, prefs, fileSearch.data())) { executeCommand(EditorCommandId::OpenScene, state, visibility, requests); }
         filteredMenuItem("Favorite Scenes", fileSearch.data(), nullptr, false, false, "Favorite scene storage is not implemented yet.", EditorGlyphIcon::SceneFile);
-        if (filteredMenuItem("Open Asset...", fileSearch.data(), nullptr, false, true, nullptr, EditorGlyphIcon::Folder)) {
-            visibility.assetBrowser = true;
-        }
+        if (filteredCommandMenuItem(EditorCommandId::OpenAsset, prefs, fileSearch.data())) { executeCommand(EditorCommandId::OpenAsset, state, visibility, requests); }
         menuSection("SAVE");
         if (filteredCommandMenuItem(EditorCommandId::SaveScene, prefs, fileSearch.data())) { executeCommand(EditorCommandId::SaveScene, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::SaveSceneAs, prefs, fileSearch.data())) { executeCommand(EditorCommandId::SaveSceneAs, state, visibility, requests); }
-        filteredMenuItem("Save All", fileSearch.data(), nullptr, false, false, "Multi-document save is not available in this build.", EditorGlyphIcon::Save);
+        if (filteredCommandMenuItem(EditorCommandId::SaveAll, prefs, fileSearch.data())) { executeCommand(EditorCommandId::SaveAll, state, visibility, requests); }
         filteredMenuItem("Choose Files to Save...", fileSearch.data(), nullptr, false, false, "Selective save is not available in this build.", EditorGlyphIcon::Save);
         if (filteredMenuItem("Close Scene", fileSearch.data(), nullptr, false, state.scenePath != nullptr && state.scenePath->has_value(), "No saved scene is currently open.", EditorGlyphIcon::SceneFile)) {
             requests.closeScene = true;
@@ -901,9 +1015,9 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         menuSection("PROJECT");
         if (filteredCommandMenuItem(EditorCommandId::ProjectManager, prefs, fileSearch.data())) { executeCommand(EditorCommandId::ProjectManager, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::CloseProject, prefs, fileSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::CloseProject, state, visibility, requests); }
-        filteredMenuItem("Project Settings", fileSearch.data(), nullptr, false, false, "Project settings are edited from the Project Manager in this build.", EditorGlyphIcon::ProjectFile);
+        if (filteredCommandMenuItem(EditorCommandId::ProjectSettings, prefs, fileSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::ProjectSettings, state, visibility, requests); }
         filteredMenuItem("Zip Project", fileSearch.data(), nullptr, false, false, "Project packaging is not wired to the editor shell yet.", EditorGlyphIcon::ProjectFile);
-        filteredMenuItem("Open Current Project Directory", fileSearch.data(), nullptr, false, false, "Project directory reveal is not wired to this menu yet.", EditorGlyphIcon::Folder);
+        if (filteredCommandMenuItem(EditorCommandId::OpenProjectDirectory, prefs, fileSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::OpenProjectDirectory, state, visibility, requests); }
         filteredMenuItem("Recent Projects", fileSearch.data(), nullptr, false, false, "Recent projects are shown in the Project Manager.", EditorGlyphIcon::ProjectFile);
         menuSection("APPLICATION");
         if (filteredCommandMenuItem(EditorCommandId::Exit, prefs, fileSearch.data())) { executeCommand(EditorCommandId::Exit, state, visibility, requests); }
@@ -949,7 +1063,7 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
     if (ImGui::BeginMenu("Engine")) {
         drawMenuSearch("##EngineMenuSearch", engineSearch);
         menuSection("SETTINGS");
-        filteredMenuItem("Project Settings...", engineSearch.data(), nullptr, false, false, "Project settings are edited from the Project Manager in this build.", EditorGlyphIcon::ProjectFile);
+        if (filteredCommandMenuItem(EditorCommandId::ProjectSettings, prefs, engineSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::ProjectSettings, state, visibility, requests); }
         filteredMenuItem("Editor Preferences...", engineSearch.data(), nullptr, false, false, "Editor preferences are edited from the Project Manager preferences view.", EditorGlyphIcon::ConfigFile);
         filteredMenuItem("Engine Settings...", engineSearch.data(), nullptr, false, false, "Engine settings are not exposed as an editor panel yet.", EditorGlyphIcon::ConfigFile);
         menuSection("ASSET REGISTRY");
@@ -985,6 +1099,7 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         filteredToggleMenuItem("Scene", windowSearch.data(), &visibility.viewport, EditorGlyphIcon::SceneFile);
         filteredToggleMenuItem("Material Editor", windowSearch.data(), &visibility.materialEditor, EditorGlyphIcon::Material);
         filteredToggleMenuItem("Console", windowSearch.data(), &visibility.console, EditorGlyphIcon::Command);
+        if (filteredCommandMenuItem(EditorCommandId::JobCenter, prefs, windowSearch.data())) { executeCommand(EditorCommandId::JobCenter, state, visibility, requests); }
         menuSection("DEBUG / ADVANCED");
         filteredToggleMenuItem("Debug / Profiler", windowSearch.data(), &visibility.debugProfiler, EditorGlyphIcon::Stats);
         filteredToggleMenuItem("Scene Stats", windowSearch.data(), &visibility.sceneStats, EditorGlyphIcon::Stats);
@@ -1006,7 +1121,7 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         filteredMenuItem("Pause / Resume Render", renderSearch.data(), nullptr, false, false, "Pause/resume render jobs are not available in this build.", EditorGlyphIcon::Pause);
         if (filteredCommandMenuItem(EditorCommandId::StopRender, prefs, renderSearch.data())) { executeCommand(EditorCommandId::StopRender, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::OpenOutputFolder, prefs, renderSearch.data())) { executeCommand(EditorCommandId::OpenOutputFolder, state, visibility, requests); }
-        filteredMenuItem("Screenshot", renderSearch.data(), nullptr, false, false, "Viewport screenshot capture is not wired to this menu yet.", EditorGlyphIcon::Camera);
+        if (filteredCommandMenuItem(EditorCommandId::Screenshot, prefs, renderSearch.data())) { executeCommand(EditorCommandId::Screenshot, state, visibility, requests); }
         filteredMenuItem("High Resolution Render", renderSearch.data(), nullptr, false, false, "High-resolution tiled rendering is not available in this build.", EditorGlyphIcon::Render);
         menuSection("PREVIEW");
         if (filteredCommandMenuItem(EditorCommandId::ResetAccumulation, prefs, renderSearch.data())) { executeCommand(EditorCommandId::ResetAccumulation, state, visibility, requests); }
@@ -1056,15 +1171,19 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
     if (drawSceneTabChrome(activeSceneTitle(state))) {
         requests.closeScene = true;
     }
+    const std::string saveState = editorSaveStateLabel(state);
+    const float saveStateWidth = ImGui::CalcTextSize(saveState.c_str()).x;
     const float fps = state.cpuFrameMs > 0.0f ? 1000.0f / state.cpuFrameMs : 0.0f;
     const char* fmt = fps > 0.0f ? "fps: %.0f | Ms: %.0f" : "fps: -- | Ms: %.0f";
-    const float rightWidth = 122.0f;
+    const float rightWidth = 122.0f + saveStateWidth + ImGui::GetStyle().ItemSpacing.x;
     const float availX = ImGui::GetContentRegionAvail().x;
     if (availX > rightWidth) {
         ImGui::SameLine(ImGui::GetCursorPosX() + availX - rightWidth);
     } else {
         ImGui::SameLine();
     }
+    drawEditorSaveStateLabel(state, saveState);
+    ImGui::SameLine();
     ImGui::TextDisabled(fmt, fps, state.cpuFrameMs);
 
     ImGui::EndMainMenuBar();

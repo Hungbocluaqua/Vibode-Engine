@@ -2,7 +2,9 @@
 
 #include "rtv/EditorCommands.h"
 #include "rtv/EditorUiStyle.h"
+#include "rtv/Entity.h"
 #include "rtv/FileDialog.h"
+#include "rtv/SceneRenderSettingsSync.h"
 #include "rtv/UndoStack.h"
 
 #include <imgui.h>
@@ -16,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -77,6 +80,88 @@ bool pathLooksWritable(const std::filesystem::path& path) {
 #endif
 }
 
+bool requestRendererCommand(EditorCommandId id, const EditorRuntimeState& state, EditorRequests& requests) {
+    RendererSettings settings = state.renderer.settings();
+    bool changed = true;
+    switch (id) {
+    case EditorCommandId::SetDebugBeauty:
+        settings.debugView = RendererDebugView::Beauty;
+        break;
+    case EditorCommandId::SetDebugDirectLighting:
+        settings.debugView = RendererDebugView::DirectLighting;
+        break;
+    case EditorCommandId::SetDebugIndirectLighting:
+        settings.debugView = RendererDebugView::IndirectLighting;
+        break;
+    case EditorCommandId::SetDebugNormals:
+        settings.debugView = RendererDebugView::Normals;
+        break;
+    case EditorCommandId::SetDebugDepth:
+        settings.debugView = RendererDebugView::Depth;
+        break;
+    case EditorCommandId::SetDebugMotionVectors:
+        settings.debugView = RendererDebugView::MotionVectors;
+        break;
+    case EditorCommandId::SetDebugVariance:
+        settings.debugView = RendererDebugView::Variance;
+        break;
+    case EditorCommandId::SetDebugAlbedo:
+        settings.debugView = RendererDebugView::Albedo;
+        break;
+    case EditorCommandId::ToggleMovingDenoiser:
+        settings.denoiseWhileMoving = !settings.denoiseWhileMoving;
+        break;
+    case EditorCommandId::ToggleEnvironment:
+        settings.environmentEnabled = !settings.environmentEnabled;
+        break;
+    case EditorCommandId::ToggleDirectLighting:
+        settings.directLightingEnabled = !settings.directLightingEnabled;
+        break;
+    case EditorCommandId::SetToneMapperLinear:
+        settings.toneMapper = ToneMapper::Linear;
+        break;
+    case EditorCommandId::SetToneMapperReinhard:
+        settings.toneMapper = ToneMapper::Reinhard;
+        break;
+    case EditorCommandId::SetToneMapperAces:
+        settings.toneMapper = ToneMapper::ACES;
+        break;
+    case EditorCommandId::SetToneMapperPbrNeutral:
+        settings.toneMapper = ToneMapper::PBRNeutral;
+        break;
+    case EditorCommandId::SetToneMapperAgx:
+        settings.toneMapper = ToneMapper::AgX;
+        break;
+    case EditorCommandId::ToggleAutoExposure:
+        settings.autoExposureEnabled = !settings.autoExposureEnabled;
+        break;
+    default:
+        changed = false;
+        break;
+    }
+    if (!changed) {
+        return false;
+    }
+    requestSettings(requests, settings);
+    return true;
+}
+
+bool isViewportPanelCommand(EditorCommandId id) {
+    switch (id) {
+    case EditorCommandId::ViewportSelect:
+    case EditorCommandId::ViewportMove:
+    case EditorCommandId::ViewportRotate:
+    case EditorCommandId::ViewportScale:
+    case EditorCommandId::ViewportToggleLocal:
+    case EditorCommandId::ViewportToggleSnap:
+    case EditorCommandId::ViewportToggleGrid:
+    case EditorCommandId::ViewportToggleAxes:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::filesystem::path canonicalForCompare(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
@@ -84,6 +169,29 @@ std::filesystem::path canonicalForCompare(const std::filesystem::path& path) {
         return canonical;
     }
     return std::filesystem::absolute(path, ec);
+}
+
+void drawProjectSaveStateRow(const char* label, bool dirty) {
+    ImGui::TextDisabled("%s", label);
+    ImGui::SameLine(150.0f);
+    ImGui::TextColored(
+        dirty ? ImVec4(0.95f, 0.70f, 0.25f, 1.0f) : ImVec4(0.55f, 0.75f, 0.58f, 1.0f),
+        "%s",
+        dirty ? "Dirty" : "Saved");
+}
+
+void drawProjectSaveState(const ProjectManagerRuntimeState& state) {
+    const bool registryAvailable = state.assetRegistry != nullptr && !state.assetRegistry->state().path.empty();
+    const bool registryDirty = state.assetRegistry != nullptr && state.assetRegistry->dirty();
+    ImGui::SeparatorText("Save State");
+    drawProjectSaveStateRow("Current Level", state.sceneDirty);
+    drawProjectSaveStateRow("Project Settings", state.projectSettingsDirty);
+    drawProjectSaveStateRow("Asset Registry", registryDirty);
+    if (registryAvailable) {
+        ImGui::TextWrapped("Registry: %s", state.assetRegistry->state().path.string().c_str());
+    } else {
+        ImGui::TextDisabled("Registry: not loaded");
+    }
 }
 
 std::string projectCreationValidationMessage(
@@ -131,6 +239,24 @@ std::string lowercase(std::string value) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
     return value;
+}
+
+bool statusContainsAny(std::string status, std::initializer_list<const char*> needles) {
+    status = lowercase(std::move(status));
+    for (const char* needle : needles) {
+        if (status.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool statusLooksFailed(const std::string& status) {
+    return statusContainsAny(status, {"failed", "failure", "error"});
+}
+
+bool statusLooksCancelled(const std::string& status) {
+    return statusContainsAny(status, {"cancelled", "canceled", "stopped"});
 }
 
 struct ProjectCardThumbnail {
@@ -334,25 +460,31 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
             log_.add(EditorLogCategory::Scene, state.placement->label.empty() ? "Placed asset selected" : state.placement->label + " selected");
         }
     }
+    updateJobCenterHistory(state);
     dockspace_.begin(state, visibility_, requests);
 
     if (requests.showProjectManager) {
         showProjectManager_ = true;
         projectManagerDismissed_ = false;
     }
+    if (requests.showProjectSettings) {
+        showProjectManager_ = true;
+        projectManagerDismissed_ = false;
+        projectManagerSection_ = 2;
+    }
     if (requests.showCommandPalette) {
         commandPaletteOpen_ = true;
-    }
-    if (state.project != nullptr) {
-        showProjectManager_ = false;
     }
     const bool projectManagerGateActive = showProjectManager_ || (state.project == nullptr && !projectManagerDismissed_);
     if (projectManagerGateActive) {
         drawProjectManager(ProjectManagerRuntimeState{
             .project = state.project,
+            .assetRegistry = state.assetRegistry,
             .sceneLoadingStatus = state.sceneLoadingStatus,
             .sceneLoadRunning = state.sceneLoadRunning,
             .sceneLoadProgress = state.sceneLoadProgress,
+            .sceneDirty = state.sceneDirty,
+            .projectSettingsDirty = state.projectSettingsDirty,
         }, requests);
     }
     if (recoveryPromptVisible_) {
@@ -381,11 +513,22 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     if (visibility_.inspector) {
         inspectorPanel_.draw(state, selection_, requests);
     }
+    if (requests.openSelectedAsset) {
+        visibility_.assetBrowser = true;
+        assetBrowserPanel_.openSelectedAsset(state, selection_, requests);
+        requests.openSelectedAsset = false;
+    }
+    if (requests.showMaterialEditor) {
+        visibility_.materialEditor = true;
+    }
     if (visibility_.assetBrowser) {
         assetBrowserPanel_.draw(state, selection_, requests);
     }
     if (visibility_.materialEditor) {
         materialEditorPanel_.draw(state, selection_, requests);
+        if (requests.closeMaterialEditor) {
+            visibility_.materialEditor = false;
+        }
     }
     if (visibility_.renderSettings) {
         renderSettingsPanel_.draw(state, requests);
@@ -398,6 +541,9 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     }
     if (visibility_.gpuDiagnostics) {
         gpuDiagnosticsPanel_.draw(state);
+    }
+    if (visibility_.jobCenter) {
+        drawJobCenterPanel(state, requests);
     }
     if (visibility_.timeline) {
         drawTimelinePanel(state, requests);
@@ -439,7 +585,8 @@ void EditorLayer::applyCaptureFocusOverride() {
             captureFocusWindow_ == "Material Editor" ||
             captureFocusWindow_ == "Content" ||
             captureFocusWindow_ == "Timeline" ||
-            captureFocusWindow_ == "Log";
+            captureFocusWindow_ == "Log" ||
+            captureFocusWindow_ == "Job Center";
         if (!supportedWindow) {
             captureFocusWindow_.clear();
         }
@@ -492,10 +639,11 @@ void EditorLayer::handleNotificationAction(NotificationAction action, EditorRequ
     }
 }
 
-void EditorLayer::showRecoveryPrompt(std::filesystem::path markerPath, std::filesystem::path autosavePath) {
+void EditorLayer::showRecoveryPrompt(std::filesystem::path markerPath, std::filesystem::path autosavePath, std::filesystem::path projectAutosavePath) {
     recoveryPromptVisible_ = true;
     recoveryMarkerPath_ = std::move(markerPath);
     recoveryAutosavePath_ = std::move(autosavePath);
+    recoveryProjectAutosavePath_ = std::move(projectAutosavePath);
 }
 
 void EditorLayer::drawRecoveryPrompt(EditorRequests& requests) {
@@ -504,12 +652,17 @@ void EditorLayer::drawRecoveryPrompt(EditorRequests& requests) {
         ImGui::TextWrapped("A previous editor session marker was found. You can restore the latest autosave if it exists, or discard the recovery marker.");
         ImGui::Separator();
         ImGui::TextWrapped("Marker: %s", recoveryMarkerPath_.string().c_str());
-        ImGui::TextWrapped("Autosave: %s", recoveryAutosavePath_.string().c_str());
-        const bool canRestore = std::filesystem::exists(recoveryAutosavePath_);
+        ImGui::TextWrapped("Level autosave: %s", recoveryAutosavePath_.string().c_str());
+        if (!recoveryProjectAutosavePath_.empty()) {
+            ImGui::TextWrapped("Project autosave: %s", recoveryProjectAutosavePath_.string().c_str());
+        }
+        const bool canRestoreLevel = std::filesystem::exists(recoveryAutosavePath_);
+        const bool canRestoreProject = !recoveryProjectAutosavePath_.empty() && std::filesystem::exists(recoveryProjectAutosavePath_);
+        const bool canRestore = canRestoreLevel || canRestoreProject;
         if (!canRestore) {
             ImGui::BeginDisabled();
         }
-        if (ImGui::Button("Restore Autosave", ImVec2(160.0f, 0.0f))) {
+        if (ImGui::Button("Restore Autosaves", ImVec2(160.0f, 0.0f))) {
             requests.restoreAutosave = true;
             recoveryPromptVisible_ = false;
             ImGui::CloseCurrentPopup();
@@ -519,7 +672,7 @@ void EditorLayer::drawRecoveryPrompt(EditorRequests& requests) {
         }
         if (!canRestore) {
             ImGui::SameLine();
-            ImGui::TextDisabled("No autosave found");
+            ImGui::TextDisabled("No autosaves found");
         }
         ImGui::SameLine();
         if (ImGui::Button("Discard Recovery", ImVec2(160.0f, 0.0f))) {
@@ -640,9 +793,18 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         std::memcpy(newProjectLocation_.data(), defaultLocation.data(), std::min(defaultLocation.size(), newProjectLocation_.size() - 1));
     }
 
+    ImGuiWindowClass nativeWindowClass{};
+    nativeWindowClass.ClassId = 0x50524d47u;
+    nativeWindowClass.DockingAllowUnclassed = false;
+    nativeWindowClass.ViewportFlagsOverrideSet = ImGuiViewportFlags_NoAutoMerge;
+    ImGui::SetNextWindowClass(&nativeWindowClass);
+    if (ImGuiViewport* mainViewport = ImGui::GetMainViewport()) {
+        ImGui::SetNextWindowPos(ImVec2(mainViewport->WorkPos.x + 64.0f, mainViewport->WorkPos.y + 48.0f), ImGuiCond_FirstUseEver);
+    }
     ImGui::SetNextWindowSize(ImVec2(920.0f, 620.0f), ImGuiCond_FirstUseEver);
     bool open = showProjectManager_ || state.project == nullptr;
-    if (!ImGui::Begin("Vibode Engine Project Manager", &open)) {
+    constexpr ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoDocking;
+    if (!ImGui::Begin("Vibode Engine Project Manager###Project Manager", &open, windowFlags)) {
         ImGui::End();
         showProjectManager_ = open;
         return;
@@ -671,6 +833,9 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         ImGui::ProgressBar(std::clamp(state.sceneLoadProgress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f), state.sceneLoadingStatus->c_str());
     } else if (state.standaloneLauncher) {
         ImGui::TextDisabled("Renderer startup is deferred until a project or scene is selected.");
+    }
+    if (state.project != nullptr || state.sceneDirty || state.assetRegistry != nullptr) {
+        drawProjectSaveState(state);
     }
 
     int startupMode = editorPrefs_.openLastProject ? 1 : 0;
@@ -818,10 +983,7 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
             ImGui::Text("Current: %s", state.project->name.c_str());
             ImGui::TextWrapped("Root: %s", state.project->projectRoot.string().c_str());
             if (ImGui::Button("Open Current Project Directory")) {
-#if defined(_WIN32)
-                const std::string root = state.project->projectRoot.string();
-                ShellExecuteA(nullptr, "open", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-#endif
+                requests.openProjectDirectory = true;
             }
             ImGui::SameLine();
             if (ImGui::Button("Close Project")) {
@@ -953,21 +1115,21 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
             requests.closeProject = true;
         }
         ImGui::SeparatorText("Project Settings");
-        static bool autosaveEnabled = true;
-        static int autosaveIntervalMinutes = 5;
-        static std::string settingsProjectGuid;
-        if (settingsProjectGuid != state.project->projectGuid) {
-            settingsProjectGuid = state.project->projectGuid;
-            autosaveEnabled = state.project->autosaveEnabled;
-            autosaveIntervalMinutes = state.project->autosaveIntervalMinutes;
-        }
-        ImGui::Checkbox("Autosave Enabled", &autosaveEnabled);
-        ImGui::DragInt("Autosave Interval Minutes", &autosaveIntervalMinutes, 1.0f, 1, 120);
-        if (ImGui::Button("Save Project Settings")) {
+        bool autosaveEnabled = state.project->autosaveEnabled;
+        int autosaveIntervalMinutes = state.project->autosaveIntervalMinutes;
+        bool settingsChanged = false;
+        settingsChanged |= ImGui::Checkbox("Autosave Enabled", &autosaveEnabled);
+        settingsChanged |= ImGui::DragInt("Autosave Interval Minutes", &autosaveIntervalMinutes, 1.0f, 1, 120);
+        if (settingsChanged) {
             ProjectContext next = *state.project;
             next.autosaveEnabled = autosaveEnabled;
             next.autosaveIntervalMinutes = std::clamp(autosaveIntervalMinutes, 1, 120);
             requests.projectSettingsUpdate = next;
+        }
+        if (state.projectSettingsDirty) {
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.25f, 1.0f), "Project settings have unsaved changes.");
+        }
+        if (ImGui::Button("Save Project Settings")) {
             requests.saveProjectSettings = true;
         }
     }
@@ -1111,14 +1273,36 @@ void EditorLayer::drawRenderWorldSettingsPanel(EditorRuntimeState& state, Editor
     if (state.sceneDocument != nullptr) {
         SceneDocument& document = *state.sceneDocument;
         const SceneDocument before = document;
+        EnvironmentLight* environmentLight = nullptr;
+        if (Entity* entity = document.registry().entity(document.worldSettings().activeEnvironment);
+            entity != nullptr && entity->environmentLight.has_value()) {
+            environmentLight = &*entity->environmentLight;
+        }
+        if (environmentLight == nullptr) {
+            for (Entity* entity : document.registry().entities()) {
+                if (entity != nullptr && entity->environmentLight.has_value()) {
+                    environmentLight = &*entity->environmentLight;
+                    document.worldSettings().activeEnvironment = entity->id;
+                    break;
+                }
+            }
+        }
         Environment& environment = document.environment();
         bool environmentChanged = false;
-        environmentChanged |= ImGui::Checkbox("Environment Enabled", &environment.enabled);
-        environmentChanged |= ImGui::DragFloat("Intensity", &environment.intensity, 0.02f, 0.0f, 1000.0f, "%.3f");
-        environmentChanged |= ImGui::DragFloat("Background", &environment.backgroundIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
-        environmentChanged |= ImGui::DragFloat("Rotation", &environment.rotation, 0.01f, -6.28318f, 6.28318f, "%.3f");
+        if (environmentLight != nullptr) {
+            environmentChanged |= ImGui::Checkbox("Environment Enabled", &environmentLight->enabled);
+            environmentChanged |= ImGui::DragFloat("Intensity", &environmentLight->intensity, 0.02f, 0.0f, 1000.0f, "%.3f");
+            environmentChanged |= ImGui::DragFloat("Background", &environmentLight->backgroundIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
+            environmentChanged |= ImGui::DragFloat("Rotation", &environmentLight->rotation, 0.01f, -6.28318f, 6.28318f, "%.3f");
+        } else {
+            environmentChanged |= ImGui::Checkbox("Environment Enabled", &environment.enabled);
+            environmentChanged |= ImGui::DragFloat("Intensity", &environment.intensity, 0.02f, 0.0f, 1000.0f, "%.3f");
+            environmentChanged |= ImGui::DragFloat("Background", &environment.backgroundIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
+            environmentChanged |= ImGui::DragFloat("Rotation", &environment.rotation, 0.01f, -6.28318f, 6.28318f, "%.3f");
+        }
         if (environmentChanged) {
-            requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::EnvironmentOnly, .label = "Edit World Environment"};
+            applySceneWorldComponentsToDocumentSettings(document);
+            requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit World Environment"};
         }
     }
 
@@ -1142,14 +1326,41 @@ void EditorLayer::drawRenderWorldSettingsPanel(EditorRuntimeState& state, Editor
         const SceneDocument before = document;
         WorldSettings& world = document.worldSettings();
         RenderSettings& render = document.renderSettings();
+        SkyAtmosphere* skyAtmosphere = nullptr;
+        if (Entity* entity = document.registry().entity(world.skyAtmosphere);
+            entity != nullptr && entity->skyAtmosphere.has_value()) {
+            skyAtmosphere = &*entity->skyAtmosphere;
+        }
+        if (skyAtmosphere == nullptr) {
+            for (Entity* entity : document.registry().entities()) {
+                if (entity != nullptr && entity->skyAtmosphere.has_value()) {
+                    skyAtmosphere = &*entity->skyAtmosphere;
+                    world.skyAtmosphere = entity->id;
+                    break;
+                }
+            }
+        }
         bool changed = false;
-        changed |= ImGui::Checkbox("Atmosphere Enabled", &world.atmosphereEnabled);
-        changed |= ImGui::DragFloat("Sky Intensity", &render.skyIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
-        changed |= ImGui::DragFloat("Rayleigh Scale", &render.rayleighScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
-        changed |= ImGui::DragFloat("Mie Scale", &render.mieScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
-        changed |= ImGui::SliderFloat("Mie Anisotropy", &render.mieAnisotropy, 0.0f, 0.99f, "%.3f");
-        changed |= ImGui::SliderFloat("Ground Albedo", &render.groundAlbedo, 0.0f, 1.0f, "%.3f");
+        if (skyAtmosphere != nullptr) {
+            changed |= ImGui::Checkbox("Atmosphere Enabled", &skyAtmosphere->enabled);
+            changed |= ImGui::DragFloat("Sky Intensity", &skyAtmosphere->skyIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
+            changed |= ImGui::DragFloat("Rayleigh Scale", &skyAtmosphere->rayleighScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
+            changed |= ImGui::DragFloat("Mie Scale", &skyAtmosphere->mieScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
+            changed |= ImGui::SliderFloat("Mie Anisotropy", &skyAtmosphere->mieAnisotropy, 0.0f, 0.99f, "%.3f");
+            changed |= ImGui::SliderFloat("Ground Albedo", &skyAtmosphere->groundAlbedo, 0.0f, 1.0f, "%.3f");
+        } else {
+            changed |= ImGui::Checkbox("Atmosphere Enabled", &world.atmosphereEnabled);
+            changed |= ImGui::DragFloat("Sky Intensity", &render.skyIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
+            changed |= ImGui::DragFloat("Rayleigh Scale", &render.rayleighScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
+            changed |= ImGui::DragFloat("Mie Scale", &render.mieScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
+            changed |= ImGui::SliderFloat("Mie Anisotropy", &render.mieAnisotropy, 0.0f, 0.99f, "%.3f");
+            changed |= ImGui::SliderFloat("Ground Albedo", &render.groundAlbedo, 0.0f, 1.0f, "%.3f");
+        }
         if (changed) {
+            if (skyAtmosphere != nullptr) {
+                world.atmosphereEnabled = skyAtmosphere->enabled;
+            }
+            applySceneWorldComponentsToDocumentSettings(document);
             requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Sky Settings"};
         }
     }
@@ -1164,13 +1375,38 @@ void EditorLayer::drawRenderWorldSettingsPanel(EditorRuntimeState& state, Editor
         const SceneDocument before = document;
         WorldSettings& world = document.worldSettings();
         RenderSettings& render = document.renderSettings();
+        PostProcessVolume* postProcess = nullptr;
+        if (Entity* entity = document.registry().entity(world.postProcessVolume);
+            entity != nullptr && entity->postProcessVolume.has_value()) {
+            postProcess = &*entity->postProcessVolume;
+        }
+        if (postProcess == nullptr) {
+            for (Entity* entity : document.registry().entities()) {
+                if (entity != nullptr && entity->postProcessVolume.has_value()) {
+                    postProcess = &*entity->postProcessVolume;
+                    world.postProcessVolume = entity->id;
+                    break;
+                }
+            }
+        }
         bool changed = false;
-        changed |= ImGui::Checkbox("Post Process Enabled", &world.postProcessEnabled);
-        changed |= ImGui::DragFloat("Exposure", &render.exposure, 0.02f, -20.0f, 20.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Saturation", &render.saturation, 0.0f, 2.0f, "%.3f");
-        changed |= ImGui::SliderFloat("Contrast", &render.contrast, 0.0f, 2.0f, "%.3f");
+        if (postProcess != nullptr) {
+            changed |= ImGui::Checkbox("Post Process Enabled", &postProcess->enabled);
+            changed |= ImGui::DragFloat("Exposure", &postProcess->exposureCompensation, 0.02f, -20.0f, 20.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Saturation", &postProcess->saturation, 0.0f, 2.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Contrast", &postProcess->contrast, 0.0f, 2.0f, "%.3f");
+        } else {
+            changed |= ImGui::Checkbox("Post Process Enabled", &world.postProcessEnabled);
+            changed |= ImGui::DragFloat("Exposure", &render.exposure, 0.02f, -20.0f, 20.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Saturation", &render.saturation, 0.0f, 2.0f, "%.3f");
+            changed |= ImGui::SliderFloat("Contrast", &render.contrast, 0.0f, 2.0f, "%.3f");
+        }
         changed |= ImGui::DragFloat("Indirect Strength", &render.indirectStrength, 0.02f, 0.0f, 20.0f, "%.3f");
         if (changed) {
+            if (postProcess != nullptr) {
+                world.postProcessEnabled = postProcess->enabled;
+            }
+            applySceneWorldComponentsToDocumentSettings(document);
             requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Post Process Settings"};
         }
     }
@@ -1703,6 +1939,523 @@ void EditorLayer::drawConsolePanel(EditorRuntimeState& state, EditorRequests& re
     ImGui::End();
 }
 
+void EditorLayer::updateJobCenterHistory(const EditorRuntimeState& state) {
+    auto findEntry = [this](const std::string& key) -> EditorJobHistoryEntry* {
+        const auto it = std::find_if(jobHistory_.begin(), jobHistory_.end(), [&](const EditorJobHistoryEntry& entry) {
+            return entry.key == key;
+        });
+        return it != jobHistory_.end() ? &*it : nullptr;
+    };
+
+    auto createEntry = [this](std::string key, std::string kind, std::string title) -> EditorJobHistoryEntry& {
+        EditorJobHistoryEntry entry;
+        entry.id = nextJobHistoryId_++;
+        entry.key = std::move(key);
+        entry.kind = std::move(kind);
+        entry.title = std::move(title);
+        jobHistory_.push_back(std::move(entry));
+        return jobHistory_.back();
+    };
+
+    auto trimHistory = [this]() {
+        constexpr size_t maxHistoryEntries = 32;
+        while (jobHistory_.size() > maxHistoryEntries) {
+            const auto inactiveIt = std::find_if(jobHistory_.begin(), jobHistory_.end(), [](const EditorJobHistoryEntry& entry) {
+                return !entry.active;
+            });
+            if (inactiveIt == jobHistory_.end()) {
+                break;
+            }
+            jobHistory_.erase(inactiveIt);
+        }
+    };
+
+    const EditorJobCenterState* jobs = state.jobCenter;
+    const bool sceneLoadRunning = (jobs != nullptr && jobs->sceneLoadRunning) || state.sceneLoadRunning;
+    const float sceneProgress = jobs != nullptr ? jobs->sceneLoadProgress : state.sceneLoadProgress;
+    const std::string sceneStatus = jobs != nullptr && !jobs->sceneLoadStatus.empty()
+        ? jobs->sceneLoadStatus
+        : (state.sceneLoadingStatus != nullptr ? *state.sceneLoadingStatus : std::string{});
+    auto finishActiveSceneLoadHistory = [&]() {
+        const std::string finalStatus = sceneStatus.empty()
+            ? (lastSceneLoadHistoryStatus_.empty() ? std::string("Scene load completed") : lastSceneLoadHistoryStatus_)
+            : sceneStatus;
+        if (EditorJobHistoryEntry* entry = findEntry(activeSceneLoadHistoryKey_)) {
+            entry->status = finalStatus;
+            entry->progress = statusLooksFailed(finalStatus) || statusLooksCancelled(finalStatus) ? lastSceneLoadHistoryProgress_ : 1.0f;
+            entry->active = false;
+            entry->failed = statusLooksFailed(finalStatus);
+            entry->cancelled = statusLooksCancelled(finalStatus);
+            entry->completed = !entry->failed && !entry->cancelled;
+        }
+        observedSceneLoadRunningForHistory_ = false;
+        activeSceneLoadHistorySerial_ = 0;
+        activeSceneLoadHistoryKey_.clear();
+    };
+    if (sceneLoadRunning) {
+        const uint64_t sceneSerial = jobs != nullptr && jobs->sceneLoadJobSerial != 0 ? jobs->sceneLoadJobSerial : nextJobHistoryId_;
+        const std::string sceneKey = "scene-load-" + std::to_string(sceneSerial);
+        if (observedSceneLoadRunningForHistory_ && activeSceneLoadHistorySerial_ != 0 && activeSceneLoadHistorySerial_ != sceneSerial) {
+            finishActiveSceneLoadHistory();
+        }
+        if (!observedSceneLoadRunningForHistory_ || activeSceneLoadHistoryKey_.empty()) {
+            activeSceneLoadHistoryKey_ = sceneKey;
+            activeSceneLoadHistorySerial_ = sceneSerial;
+            const std::string title = jobs != nullptr && !jobs->sceneLoadTitle.empty() ? jobs->sceneLoadTitle : std::string("Scene Loading");
+            (void)createEntry(activeSceneLoadHistoryKey_, "Scene Load", title);
+        }
+        if (EditorJobHistoryEntry* entry = findEntry(activeSceneLoadHistoryKey_)) {
+            entry->serial = sceneSerial;
+            entry->title = jobs != nullptr && !jobs->sceneLoadTitle.empty() ? jobs->sceneLoadTitle : std::string("Scene Loading");
+            entry->kind = "Scene Load";
+            entry->status = sceneStatus.empty() ? "Loading scene" : sceneStatus;
+            entry->sourcePath = jobs != nullptr ? jobs->sceneLoadSourcePath : std::filesystem::path{};
+            entry->progress = std::clamp(sceneProgress, 0.0f, 1.0f);
+            entry->active = true;
+            entry->completed = false;
+            entry->failed = false;
+            entry->cancelled = false;
+            entry->hidden = false;
+        }
+        observedSceneLoadRunningForHistory_ = true;
+        lastSceneLoadHistoryStatus_ = sceneStatus;
+        lastSceneLoadHistoryProgress_ = std::clamp(sceneProgress, 0.0f, 1.0f);
+    } else if (observedSceneLoadRunningForHistory_) {
+        finishActiveSceneLoadHistory();
+    }
+
+    if (jobs != nullptr && jobs->completedSceneLoadSerial != 0 && jobs->completedSceneLoadSerial != observedSceneLoadResultSerial_) {
+        const std::string sceneKey = "scene-load-" + std::to_string(jobs->completedSceneLoadSerial);
+        EditorJobHistoryEntry* entry = findEntry(sceneKey);
+        if (entry == nullptr) {
+            entry = &createEntry(sceneKey, "Scene Load", jobs->completedSceneLoadTitle.empty() ? "Scene Load" : jobs->completedSceneLoadTitle);
+        }
+        entry->serial = jobs->completedSceneLoadSerial;
+        entry->title = jobs->completedSceneLoadTitle.empty() ? "Scene Load" : jobs->completedSceneLoadTitle;
+        entry->kind = "Scene Load";
+        entry->status = jobs->completedSceneLoadStatus.empty()
+            ? (jobs->completedSceneLoadSuccess ? std::string("Completed") : std::string("Failed"))
+            : jobs->completedSceneLoadStatus;
+        entry->sourcePath = jobs->completedSceneLoadSourcePath;
+        entry->progress = jobs->completedSceneLoadSuccess ? 1.0f : entry->progress;
+        entry->active = false;
+        entry->completed = jobs->completedSceneLoadSuccess;
+        entry->failed = !jobs->completedSceneLoadSuccess && !jobs->completedSceneLoadCancelled;
+        entry->cancelled = jobs->completedSceneLoadCancelled;
+        entry->hidden = false;
+        entry->errors.clear();
+        entry->warnings.clear();
+        if (!jobs->completedSceneLoadError.empty()) {
+            entry->errors.push_back(jobs->completedSceneLoadError);
+        }
+        if (!jobs->completedSceneLoadWarning.empty()) {
+            entry->warnings.push_back(jobs->completedSceneLoadWarning);
+        }
+        entry->workerTotalMs = jobs->completedSceneLoadWorkerTotalMs;
+        entry->workerSceneParseMs = jobs->completedSceneLoadWorkerSceneParseMs;
+        entry->workerGltfLoadMs = jobs->completedSceneLoadWorkerGltfLoadMs;
+        entry->workerDocumentBuildMs = jobs->completedSceneLoadWorkerDocumentBuildMs;
+        observedSceneLoadResultSerial_ = jobs->completedSceneLoadSerial;
+        if (activeSceneLoadHistorySerial_ == jobs->completedSceneLoadSerial) {
+            observedSceneLoadRunningForHistory_ = false;
+            activeSceneLoadHistorySerial_ = 0;
+            activeSceneLoadHistoryKey_.clear();
+        }
+    }
+
+    const bool assetImportRunning = jobs != nullptr && jobs->assetImportRunning;
+    const size_t queuedImports = jobs != nullptr ? jobs->queuedAssetImports : 0u;
+    auto finishActiveAssetImportHistory = [&]() {
+        const std::string finalStatus = statusLooksFailed(lastAssetImportHistoryStatus_)
+            ? lastAssetImportHistoryStatus_
+            : std::string("Completed");
+        if (EditorJobHistoryEntry* entry = findEntry(activeAssetImportHistoryKey_)) {
+            entry->title = lastAssetImportHistoryTitle_.empty() ? "Asset Import" : lastAssetImportHistoryTitle_;
+            entry->status = finalStatus;
+            entry->progress = statusLooksFailed(finalStatus) ? lastAssetImportHistoryProgress_ : 1.0f;
+            entry->active = false;
+            entry->failed = statusLooksFailed(finalStatus);
+            entry->cancelled = statusLooksCancelled(finalStatus);
+            entry->completed = !entry->failed && !entry->cancelled;
+        }
+        observedAssetImportRunningForHistory_ = false;
+        activeAssetImportHistorySerial_ = 0;
+        activeAssetImportHistoryKey_.clear();
+    };
+    if (assetImportRunning) {
+        std::string title = jobs->assetImportTitle.empty() ? "Asset Import" : jobs->assetImportTitle;
+        std::string status = jobs->assetImportStatus.empty() ? "Staging metadata" : jobs->assetImportStatus;
+        if (queuedImports > 0u) {
+            status += " (" + std::to_string(queuedImports) + " queued)";
+        }
+        const uint64_t importSerial = jobs->assetImportJobSerial != 0 ? jobs->assetImportJobSerial : nextJobHistoryId_;
+        const std::string importKey = "asset-import-" + std::to_string(importSerial);
+        if (observedAssetImportRunningForHistory_ && activeAssetImportHistorySerial_ != 0 && activeAssetImportHistorySerial_ != importSerial) {
+            finishActiveAssetImportHistory();
+        }
+        if (!observedAssetImportRunningForHistory_ || activeAssetImportHistoryKey_.empty()) {
+            activeAssetImportHistoryKey_ = importKey;
+            activeAssetImportHistorySerial_ = importSerial;
+            (void)createEntry(activeAssetImportHistoryKey_, "Asset Import", title);
+        }
+        if (EditorJobHistoryEntry* entry = findEntry(activeAssetImportHistoryKey_)) {
+            entry->serial = importSerial;
+            entry->title = title;
+            entry->kind = "Asset Import";
+            entry->status = status;
+            entry->progress = std::clamp(jobs->assetImportProgress, 0.0f, 1.0f);
+            entry->active = true;
+            entry->completed = false;
+            entry->failed = false;
+            entry->cancelled = false;
+            entry->hidden = false;
+            entry->hasAssetImportRetry = jobs->assetImportCanRetry;
+            entry->assetImportPlaceAfterImport = jobs->assetImportPlaceAfterImport;
+            entry->assetImportRetry.sourcePath = jobs->assetImportSourcePath;
+            entry->assetImportRetry.destinationFolder = jobs->assetImportDestinationFolder;
+            entry->assetImportRetry.mode = jobs->assetImportMode;
+            entry->assetImportRetry.settings = jobs->assetImportSettings;
+            entry->assetReimportGuid = jobs->assetReimportGuid;
+        }
+        observedAssetImportRunningForHistory_ = true;
+        lastAssetImportHistoryTitle_ = title;
+        lastAssetImportHistoryStatus_ = status;
+        lastAssetImportHistoryProgress_ = std::clamp(jobs->assetImportProgress, 0.0f, 1.0f);
+    } else if (observedAssetImportRunningForHistory_) {
+        finishActiveAssetImportHistory();
+    }
+
+    if (jobs != nullptr && jobs->completedAssetImportSerial != 0 && jobs->completedAssetImportSerial != observedAssetImportResultSerial_) {
+        const std::string importKey = "asset-import-" + std::to_string(jobs->completedAssetImportSerial);
+        EditorJobHistoryEntry* entry = findEntry(importKey);
+        if (entry == nullptr) {
+            entry = &createEntry(importKey, "Asset Import", jobs->completedAssetImportTitle.empty() ? "Asset Import" : jobs->completedAssetImportTitle);
+        }
+        entry->serial = jobs->completedAssetImportSerial;
+        entry->title = jobs->completedAssetImportTitle.empty() ? "Asset Import" : jobs->completedAssetImportTitle;
+        entry->kind = "Asset Import";
+        entry->status = jobs->completedAssetImportStatus.empty()
+            ? (jobs->completedAssetImportSuccess ? std::string("Completed") : std::string("Failed"))
+            : jobs->completedAssetImportStatus;
+        entry->progress = jobs->completedAssetImportSuccess ? 1.0f : entry->progress;
+        entry->active = false;
+        entry->completed = jobs->completedAssetImportSuccess;
+        entry->failed = !jobs->completedAssetImportSuccess;
+        entry->cancelled = false;
+        entry->hidden = false;
+        entry->reportPath = jobs->completedAssetImportReportPath;
+        entry->errors = jobs->completedAssetImportErrors;
+        entry->warnings = jobs->completedAssetImportWarnings;
+        entry->hasAssetImportRetry = jobs->completedAssetImportCanRetry;
+        entry->assetImportPlaceAfterImport = jobs->completedAssetImportPlaceAfterImport;
+        entry->assetImportRetry.sourcePath = jobs->completedAssetImportSourcePath;
+        entry->assetImportRetry.destinationFolder = jobs->completedAssetImportDestinationFolder;
+        entry->assetImportRetry.mode = jobs->completedAssetImportMode;
+        entry->assetImportRetry.settings = jobs->completedAssetImportSettings;
+        entry->assetReimportGuid = jobs->completedAssetReimportGuid;
+        entry->workerTotalMs = jobs->completedAssetImportWorkerTotalMs;
+        entry->importValidateMs = jobs->completedAssetImportWorkerValidateMs;
+        entry->importDirectoryMs = jobs->completedAssetImportWorkerDirectoryMs;
+        entry->importInspectMs = jobs->completedAssetImportWorkerInspectMs;
+        entry->importWriteMs = jobs->completedAssetImportWorkerWriteMs;
+        observedAssetImportResultSerial_ = jobs->completedAssetImportSerial;
+        if (activeAssetImportHistorySerial_ == jobs->completedAssetImportSerial) {
+            observedAssetImportRunningForHistory_ = false;
+            activeAssetImportHistorySerial_ = 0;
+            activeAssetImportHistoryKey_.clear();
+        }
+    }
+
+    if (state.renderJob != nullptr && state.renderJob->serial != 0) {
+        const EditorRenderJobStatus& job = *state.renderJob;
+        const std::string key = "render-output-" + std::to_string(job.serial);
+        EditorJobHistoryEntry* entry = findEntry(key);
+        if (entry == nullptr) {
+            entry = &createEntry(key, "Render Output", job.title.empty() ? "Render Job" : job.title);
+        }
+        entry->serial = job.serial;
+        entry->title = job.title.empty() ? "Render Job" : job.title;
+        entry->kind = "Render Output";
+        entry->status = job.status.empty() ? "Waiting" : job.status;
+        entry->progress = std::clamp(job.progress, 0.0f, 1.0f);
+        entry->active = job.active;
+        entry->completed = job.completed;
+        entry->failed = job.failed;
+        entry->cancelled = job.cancelled;
+        entry->outputRoot = job.outputRoot;
+        entry->manifestPath = job.manifestPath;
+        entry->errors.clear();
+        entry->warnings.clear();
+        if (job.failed && !entry->status.empty()) {
+            entry->errors.push_back(entry->status);
+        } else if (job.cancelled && !entry->status.empty()) {
+            entry->warnings.push_back(entry->status);
+        }
+        if (job.active) {
+            entry->hidden = false;
+        }
+    }
+
+    trimHistory();
+}
+
+void EditorLayer::drawJobHistoryEntry(size_t index, EditorRequests& requests) {
+    if (index >= jobHistory_.size()) {
+        return;
+    }
+    EditorJobHistoryEntry& entry = jobHistory_[index];
+    if (entry.hidden) {
+        return;
+    }
+
+    const char* stateLabel = "Queued";
+    ImVec4 stateColor(0.75f, 0.78f, 0.84f, 1.0f);
+    if (entry.active) {
+        stateLabel = "Active";
+        stateColor = ImVec4(0.40f, 0.68f, 1.0f, 1.0f);
+    } else if (entry.completed) {
+        stateLabel = "Complete";
+        stateColor = ImVec4(0.42f, 0.82f, 0.52f, 1.0f);
+    } else if (entry.cancelled) {
+        stateLabel = "Stopped";
+        stateColor = ImVec4(0.95f, 0.65f, 0.30f, 1.0f);
+    } else if (entry.failed) {
+        stateLabel = "Failed";
+        stateColor = ImVec4(0.95f, 0.34f, 0.34f, 1.0f);
+    }
+
+    ImGui::PushID(entry.key.c_str());
+    ImGui::TextUnformatted(entry.kind.c_str());
+    ImGui::SameLine();
+    ImGui::TextColored(stateColor, "%s", stateLabel);
+    ImGui::TextWrapped("%s", entry.title.empty() ? entry.kind.c_str() : entry.title.c_str());
+    if (!entry.status.empty()) {
+        ImGui::TextDisabled("%s", entry.status.c_str());
+    }
+    if (!entry.errors.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.34f, 0.34f, 1.0f), "Error: %s", entry.errors.front().c_str());
+        if (entry.errors.size() > 1u) {
+            ImGui::TextDisabled("Additional errors: %llu", static_cast<unsigned long long>(entry.errors.size() - 1u));
+        }
+    }
+    if (!entry.warnings.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f), "Warning: %s", entry.warnings.front().c_str());
+        if (entry.warnings.size() > 1u) {
+            ImGui::TextDisabled("Additional warnings: %llu", static_cast<unsigned long long>(entry.warnings.size() - 1u));
+        }
+    }
+    if (entry.active || entry.progress > 0.0f) {
+        ImGui::ProgressBar(std::clamp(entry.progress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
+    }
+    if (!entry.sourcePath.empty()) {
+        ImGui::TextWrapped("Source: %s", entry.sourcePath.string().c_str());
+    }
+    if (!entry.outputRoot.empty()) {
+        ImGui::TextWrapped("Output: %s", entry.outputRoot.string().c_str());
+    }
+    if (!entry.reportPath.empty()) {
+        ImGui::TextWrapped("Report: %s", entry.reportPath.string().c_str());
+    }
+    if (!entry.manifestPath.empty()) {
+        ImGui::TextWrapped("Manifest: %s", entry.manifestPath.string().c_str());
+    }
+    if (entry.kind == "Asset Import" &&
+        (entry.workerTotalMs > 0.0 || entry.importValidateMs > 0.0 || entry.importDirectoryMs > 0.0 || entry.importInspectMs > 0.0 || entry.importWriteMs > 0.0)) {
+        ImGui::TextDisabled(
+            "Worker: %.1f ms total, %.1f ms validate, %.1f ms dirs, %.1f ms inspect, %.1f ms write",
+            entry.workerTotalMs,
+            entry.importValidateMs,
+            entry.importDirectoryMs,
+            entry.importInspectMs,
+            entry.importWriteMs);
+    } else if (entry.workerTotalMs > 0.0 || entry.workerSceneParseMs > 0.0 || entry.workerGltfLoadMs > 0.0 || entry.workerDocumentBuildMs > 0.0) {
+        ImGui::TextDisabled(
+            "Worker: %.1f ms total, %.1f ms parse, %.1f ms glTF/cache, %.1f ms document",
+            entry.workerTotalMs,
+            entry.workerSceneParseMs,
+            entry.workerGltfLoadMs,
+            entry.workerDocumentBuildMs);
+    }
+
+    bool drewAction = false;
+    if (entry.kind == "Asset Import") {
+        if (ImGui::SmallButton("Open Content")) {
+            visibility_.assetBrowser = true;
+        }
+        drewAction = true;
+        if (!entry.reportPath.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open Report")) {
+                requests.openFilePath = entry.reportPath;
+            }
+        }
+        if (!entry.errors.empty() || !entry.warnings.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reveal Log")) {
+                visibility_.log = true;
+            }
+        }
+        if (entry.hasAssetImportRetry && !entry.assetImportRetry.sourcePath.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Retry")) {
+                EditorImportAssetRequest retry = entry.assetImportRetry;
+                if (retry.mode.empty()) {
+                    retry.mode = entry.assetImportPlaceAfterImport ? "ImportAndPlace" : "ImportAsset";
+                }
+                if (entry.assetImportPlaceAfterImport) {
+                    requests.importAndPlace = std::move(retry);
+                } else {
+                    requests.importAsset = std::move(retry);
+                }
+            }
+        }
+        if (!entry.assetReimportGuid.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reimport")) {
+                requests.reimportAsset = entry.assetReimportGuid;
+            }
+        }
+    } else if (entry.kind == "Scene Load") {
+        if (ImGui::SmallButton("Reveal Log")) {
+            visibility_.log = true;
+        }
+        drewAction = true;
+        if (!entry.sourcePath.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open Source Folder")) {
+                requests.openDirectoryPath = entry.sourcePath.parent_path();
+            }
+        }
+    } else if (entry.kind == "Render Output" && !entry.outputRoot.empty()) {
+        if (ImGui::SmallButton("Open Output")) {
+            requests.openOutputFolderPath = entry.outputRoot;
+        }
+        drewAction = true;
+        if (!entry.manifestPath.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open Manifest")) {
+                requests.openFilePath = entry.manifestPath;
+            }
+        }
+        if (entry.failed || entry.cancelled) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reveal Log")) {
+                visibility_.log = true;
+            }
+        }
+    }
+    if (!entry.active) {
+        if (drewAction) {
+            ImGui::SameLine();
+        }
+        if (ImGui::SmallButton("Hide")) {
+            entry.hidden = true;
+        }
+    }
+    ImGui::Separator();
+    ImGui::PopID();
+}
+
+void EditorLayer::drawJobCenterPanel(const EditorRuntimeState& state, EditorRequests& requests) {
+    if (!ImGui::Begin("Job Center", &visibility_.jobCenter)) {
+        ImGui::End();
+        return;
+    }
+
+    bool hasJob = false;
+    const EditorJobCenterState* jobs = state.jobCenter;
+    if ((jobs != nullptr && jobs->sceneLoadRunning) || state.sceneLoadRunning) {
+        hasJob = true;
+        const float progress = jobs != nullptr ? jobs->sceneLoadProgress : state.sceneLoadProgress;
+        const std::string status = jobs != nullptr && !jobs->sceneLoadStatus.empty()
+            ? jobs->sceneLoadStatus
+            : (state.sceneLoadingStatus != nullptr ? *state.sceneLoadingStatus : std::string("Loading scene"));
+        ImGui::SeparatorText("Scene Loading");
+        ImGui::TextUnformatted(status.c_str());
+        ImGui::ProgressBar(std::clamp(progress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
+        if (ImGui::SmallButton("Cancel Scene Load")) {
+            requests.cancelSceneLoad = true;
+        }
+    }
+
+    const bool assetImportRunning = jobs != nullptr && jobs->assetImportRunning;
+    const size_t queuedImports = jobs != nullptr ? jobs->queuedAssetImports : 0u;
+    if (assetImportRunning || queuedImports > 0u) {
+        hasJob = true;
+        ImGui::SeparatorText("Asset Import");
+        if (assetImportRunning) {
+            ImGui::TextUnformatted(jobs->assetImportTitle.empty() ? "Asset Import" : jobs->assetImportTitle.c_str());
+            ImGui::TextDisabled("%s", jobs->assetImportStatus.empty() ? "Staging metadata" : jobs->assetImportStatus.c_str());
+            ImGui::ProgressBar(std::clamp(jobs->assetImportProgress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
+        }
+        if (queuedImports > 0u) {
+            ImGui::TextDisabled("Queued imports: %llu", static_cast<unsigned long long>(queuedImports));
+        }
+        if (ImGui::SmallButton("Open Content")) {
+            visibility_.assetBrowser = true;
+        }
+    }
+
+    if (state.renderJob != nullptr && state.renderJob->serial != 0) {
+        hasJob = true;
+        const EditorRenderJobStatus& job = *state.renderJob;
+        ImGui::SeparatorText("Render Output");
+        ImGui::TextUnformatted(job.title.empty() ? "Render Job" : job.title.c_str());
+        ImGui::TextDisabled("%s", job.status.empty() ? "Waiting" : job.status.c_str());
+        ImGui::ProgressBar(std::clamp(job.progress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
+        if (job.totalFrames > 0) {
+            ImGui::TextDisabled("Frames: %d / %d", std::clamp(job.currentFrame, 0, job.totalFrames), job.totalFrames);
+        }
+        if (!job.outputRoot.empty()) {
+            ImGui::TextWrapped("Output: %s", job.outputRoot.string().c_str());
+        }
+        if (job.active) {
+            if (ImGui::SmallButton("Stop Render")) {
+                requests.stopRender = true;
+            }
+            ImGui::SameLine();
+        }
+        if (ImGui::SmallButton("Open Output")) {
+            requests.openOutputFolder = true;
+        }
+    }
+
+    if (!hasJob) {
+        ImGui::TextDisabled("No active editor jobs.");
+        ImGui::TextDisabled("Scene loads, asset imports, and render output jobs appear here while running.");
+    }
+
+    ImGui::SeparatorText("Recent Jobs");
+    if (ImGui::SmallButton("Hide Finished")) {
+        for (EditorJobHistoryEntry& entry : jobHistory_) {
+            if (!entry.active) {
+                entry.hidden = true;
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear Hidden")) {
+        jobHistory_.erase(std::remove_if(jobHistory_.begin(), jobHistory_.end(), [](const EditorJobHistoryEntry& entry) {
+            return entry.hidden;
+        }), jobHistory_.end());
+    }
+
+    bool hasVisibleHistory = false;
+    for (size_t offset = 0; offset < jobHistory_.size(); ++offset) {
+        const size_t index = jobHistory_.size() - 1u - offset;
+        if (jobHistory_[index].hidden) {
+            continue;
+        }
+        hasVisibleHistory = true;
+        drawJobHistoryEntry(index, requests);
+    }
+    if (!hasVisibleHistory) {
+        ImGui::TextDisabled("No recent job history.");
+    }
+
+    ImGui::End();
+}
+
 void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& requests) {
     if (!commandPaletteOpen_) {
         return;
@@ -1794,8 +2547,17 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
 }
 
 bool EditorLayer::executeCommandPaletteCommand(EditorCommandId id, EditorRuntimeState& state, EditorRequests& requests) {
+    if (isViewportPanelCommand(id)) {
+        visibility_.viewport = true;
+        viewportPanel_.executeCommand(id);
+        return true;
+    }
     switch (id) {
     case EditorCommandId::ProjectManager: requests.showProjectManager = true; return true;
+    case EditorCommandId::ProjectSettings:
+        if (state.project != nullptr) { requests.showProjectSettings = true; return true; }
+        return false;
+    case EditorCommandId::CloseProject: requests.closeProject = true; return true;
     case EditorCommandId::NewScene: requests.newScene = true; return true;
     case EditorCommandId::OpenScene:
         if (auto path = openSceneJsonFileDialog()) { requests.openScene = *path; return true; }
@@ -1807,6 +2569,16 @@ bool EditorLayer::executeCommandPaletteCommand(EditorCommandId id, EditorRuntime
     case EditorCommandId::SaveSceneAs:
         if (auto path = saveSceneJsonFileDialog()) { requests.saveSceneAs = *path; return true; }
         return false;
+    case EditorCommandId::SaveAll:
+        requests.saveAll = true;
+        return true;
+    case EditorCommandId::OpenProjectDirectory:
+        if (state.project != nullptr) { requests.openProjectDirectory = true; return true; }
+        return false;
+    case EditorCommandId::OpenAsset:
+        visibility_.assetBrowser = true;
+        requests.openSelectedAsset = true;
+        return true;
     case EditorCommandId::ImportAsset:
         if (auto path = openGltfFileDialog()) { requests.importAsset = EditorImportAssetRequest{.sourcePath = *path}; return true; }
         return false;
@@ -1840,19 +2612,50 @@ bool EditorLayer::executeCommandPaletteCommand(EditorCommandId id, EditorRuntime
     case EditorCommandId::CreateVolumetricCloud: requests.createEntity = EditorEntityCreateRequest{EditorEntityCreateKind::VolumetricCloud, {}}; return true;
     case EditorCommandId::CreatePostProcessVolume: requests.createEntity = EditorEntityCreateRequest{EditorEntityCreateKind::PostProcessVolume, {}}; return true;
     case EditorCommandId::ReloadShaders: requests.reloadShaders = true; requests.resetAccumulation = AccumulationResetReason::ShaderReloaded; return true;
+    case EditorCommandId::ShowControls: dockspace_.showControlsWindow(); return true;
+    case EditorCommandId::ShowRendererInfo: dockspace_.showRendererInfoWindow(); return true;
     case EditorCommandId::ResetAccumulation: requests.resetAccumulation = AccumulationResetReason::Manual; return true;
     case EditorCommandId::ToggleDenoiser: requests.toggleDenoiser = true; return true;
+    case EditorCommandId::ToggleMovingDenoiser:
+    case EditorCommandId::ToggleEnvironment:
+    case EditorCommandId::ToggleDirectLighting:
+    case EditorCommandId::SetDebugBeauty:
+    case EditorCommandId::SetDebugDirectLighting:
+    case EditorCommandId::SetDebugIndirectLighting:
+    case EditorCommandId::SetDebugNormals:
+    case EditorCommandId::SetDebugDepth:
+    case EditorCommandId::SetDebugMotionVectors:
+    case EditorCommandId::SetDebugVariance:
+    case EditorCommandId::SetDebugAlbedo:
+    case EditorCommandId::SetToneMapperLinear:
+    case EditorCommandId::SetToneMapperReinhard:
+    case EditorCommandId::SetToneMapperAces:
+    case EditorCommandId::SetToneMapperPbrNeutral:
+    case EditorCommandId::SetToneMapperAgx:
+    case EditorCommandId::ToggleAutoExposure:
+        return requestRendererCommand(id, state, requests);
+    case EditorCommandId::ToggleSun: requests.togglePrimarySun = true; return true;
     case EditorCommandId::CycleDebugView: requests.toggleDebugView = true; return true;
     case EditorCommandId::CycleIntermediateView: requests.cycleIntermediateView = true; return true;
     case EditorCommandId::RenderCurrentViewport: requests.renderCurrentViewport = true; return true;
     case EditorCommandId::RenderImage: requests.renderImage = true; return true;
     case EditorCommandId::RenderSequence: requests.renderSequence = true; return true;
+    case EditorCommandId::Screenshot: requests.renderCurrentViewport = true; return true;
     case EditorCommandId::StopRender: requests.stopRender = true; return true;
     case EditorCommandId::OpenOutputFolder: requests.openOutputFolder = true; return true;
-    case EditorCommandId::SaveLayout: requests.saveLayout = true; return true;
+    case EditorCommandId::JobCenter: visibility_.jobCenter = true; return true;
+    case EditorCommandId::SaveLayout: requests.saveLayout = true; dockspace_.saveLayout(); return true;
     case EditorCommandId::ResetLayout: requests.resetLayout = true; resetLayout(); return true;
     case EditorCommandId::Undo: requests.undo = true; return true;
     case EditorCommandId::Redo: requests.redo = true; return true;
+    case EditorCommandId::ToggleFullscreen: requests.toggleFullscreen = true; return true;
+    case EditorCommandId::ViewportFrameSelected:
+        if (selection_.entityId().valid()) {
+            visibility_.viewport = true;
+            requests.focusOnEntity = selection_.entityId();
+            return true;
+        }
+        return false;
     case EditorCommandId::Exit: requests.exit = true; return true;
     case EditorCommandId::CommandPalette: commandPaletteOpen_ = true; return true;
     default:
@@ -1876,6 +2679,14 @@ bool EditorLayer::executeConsoleCommand(std::string command, EditorRuntimeState&
         return command == name || command == std::string(editorCommandName(id));
     };
     if (matches(EditorCommandId::ProjectManager) || command == "project_manager") { requests.showProjectManager = true; return true; }
+    if (matches(EditorCommandId::ProjectSettings) || command == "project_settings") {
+        if (state.project == nullptr) {
+            return false;
+        }
+        requests.showProjectSettings = true;
+        return true;
+    }
+    if (matches(EditorCommandId::CloseProject) || command == "close_project") { requests.closeProject = true; return true; }
     if (matches(EditorCommandId::NewScene) || command == "new_scene") { requests.newScene = true; return true; }
     if (matches(EditorCommandId::SaveScene) || command == "save_scene") {
         if (state.scenePath == nullptr || !state.scenePath->has_value()) {
@@ -1884,10 +2695,73 @@ bool EditorLayer::executeConsoleCommand(std::string command, EditorRuntimeState&
         requests.saveScene = **state.scenePath;
         return true;
     }
+    if (matches(EditorCommandId::SaveAll) || command == "save_all") { requests.saveAll = true; return true; }
+    if (matches(EditorCommandId::OpenProjectDirectory) || command == "open_project_directory") {
+        if (state.project == nullptr) {
+            return false;
+        }
+        requests.openProjectDirectory = true;
+        return true;
+    }
+    if (matches(EditorCommandId::OpenAsset) || command == "open_asset") {
+        visibility_.assetBrowser = true;
+        requests.openSelectedAsset = true;
+        return true;
+    }
     if (matches(EditorCommandId::ResetAccumulation) || command == "reset_accumulation") { requests.resetAccumulation = AccumulationResetReason::Manual; return true; }
     if (matches(EditorCommandId::ReloadShaders) || command == "reload_shaders") { requests.reloadShaders = true; requests.resetAccumulation = AccumulationResetReason::ShaderReloaded; return true; }
+    if (matches(EditorCommandId::ShowControls) || command == "show_controls") { dockspace_.showControlsWindow(); return true; }
+    if (matches(EditorCommandId::ShowRendererInfo) || command == "show_renderer_info") { dockspace_.showRendererInfoWindow(); return true; }
+    if (matches(EditorCommandId::JobCenter) || command == "job_center") { visibility_.jobCenter = true; return true; }
+    if (matches(EditorCommandId::CommandPalette) || command == "command_palette") { commandPaletteOpen_ = true; return true; }
+    if (matches(EditorCommandId::ToggleDenoiser) || command == "toggle_denoiser") { requests.toggleDenoiser = true; return true; }
+    if (matches(EditorCommandId::ToggleSun) || command == "toggle_sun" || command == "toggle_primary_sun") { requests.togglePrimarySun = true; return true; }
+    if (matches(EditorCommandId::CycleDebugView) || command == "cycle_debug_view") { requests.toggleDebugView = true; return true; }
+    if (matches(EditorCommandId::CycleIntermediateView) || command == "cycle_intermediate_view") { requests.cycleIntermediateView = true; return true; }
+    if (matches(EditorCommandId::ToggleMovingDenoiser) || command == "toggle_moving_denoiser") { return requestRendererCommand(EditorCommandId::ToggleMovingDenoiser, state, requests); }
+    if (matches(EditorCommandId::ToggleEnvironment) || command == "toggle_environment") { return requestRendererCommand(EditorCommandId::ToggleEnvironment, state, requests); }
+    if (matches(EditorCommandId::ToggleDirectLighting) || command == "toggle_direct_lighting") { return requestRendererCommand(EditorCommandId::ToggleDirectLighting, state, requests); }
+    if (matches(EditorCommandId::SetDebugBeauty) || command == "set_debug_beauty") { return requestRendererCommand(EditorCommandId::SetDebugBeauty, state, requests); }
+    if (matches(EditorCommandId::SetDebugDirectLighting) || command == "set_debug_direct_lighting") { return requestRendererCommand(EditorCommandId::SetDebugDirectLighting, state, requests); }
+    if (matches(EditorCommandId::SetDebugIndirectLighting) || command == "set_debug_indirect_lighting") { return requestRendererCommand(EditorCommandId::SetDebugIndirectLighting, state, requests); }
+    if (matches(EditorCommandId::SetDebugNormals) || command == "set_debug_normals") { return requestRendererCommand(EditorCommandId::SetDebugNormals, state, requests); }
+    if (matches(EditorCommandId::SetDebugDepth) || command == "set_debug_depth") { return requestRendererCommand(EditorCommandId::SetDebugDepth, state, requests); }
+    if (matches(EditorCommandId::SetDebugMotionVectors) || command == "set_debug_motion_vectors") { return requestRendererCommand(EditorCommandId::SetDebugMotionVectors, state, requests); }
+    if (matches(EditorCommandId::SetDebugVariance) || command == "set_debug_variance") { return requestRendererCommand(EditorCommandId::SetDebugVariance, state, requests); }
+    if (matches(EditorCommandId::SetDebugAlbedo) || command == "set_debug_albedo") { return requestRendererCommand(EditorCommandId::SetDebugAlbedo, state, requests); }
+    if (matches(EditorCommandId::SetToneMapperLinear) || command == "set_tone_mapper_linear") { return requestRendererCommand(EditorCommandId::SetToneMapperLinear, state, requests); }
+    if (matches(EditorCommandId::SetToneMapperReinhard) || command == "set_tone_mapper_reinhard") { return requestRendererCommand(EditorCommandId::SetToneMapperReinhard, state, requests); }
+    if (matches(EditorCommandId::SetToneMapperAces) || command == "set_tone_mapper_aces") { return requestRendererCommand(EditorCommandId::SetToneMapperAces, state, requests); }
+    if (matches(EditorCommandId::SetToneMapperPbrNeutral) || command == "set_tone_mapper_pbr_neutral") { return requestRendererCommand(EditorCommandId::SetToneMapperPbrNeutral, state, requests); }
+    if (matches(EditorCommandId::SetToneMapperAgx) || command == "set_tone_mapper_agx") { return requestRendererCommand(EditorCommandId::SetToneMapperAgx, state, requests); }
+    if (matches(EditorCommandId::ToggleAutoExposure) || command == "toggle_auto_exposure") { return requestRendererCommand(EditorCommandId::ToggleAutoExposure, state, requests); }
+    if (matches(EditorCommandId::RenderCurrentViewport) || command == "render_current_viewport") { requests.renderCurrentViewport = true; return true; }
+    if (matches(EditorCommandId::RenderImage) || command == "render_image") { requests.renderImage = true; return true; }
+    if (matches(EditorCommandId::RenderSequence) || command == "render_sequence") { requests.renderSequence = true; return true; }
+    if (matches(EditorCommandId::Screenshot) || command == "screenshot") { requests.renderCurrentViewport = true; return true; }
+    if (matches(EditorCommandId::StopRender) || command == "stop_render") { requests.stopRender = true; return true; }
+    if (matches(EditorCommandId::OpenOutputFolder) || command == "open_output_folder") { requests.openOutputFolder = true; return true; }
+    if (matches(EditorCommandId::SaveLayout) || command == "save_layout") { requests.saveLayout = true; dockspace_.saveLayout(); return true; }
+    if (matches(EditorCommandId::ResetLayout) || command == "reset_layout") { requests.resetLayout = true; resetLayout(); return true; }
     if (matches(EditorCommandId::Undo) || command == "undo") { requests.undo = true; return true; }
     if (matches(EditorCommandId::Redo) || command == "redo") { requests.redo = true; return true; }
+    if (matches(EditorCommandId::ToggleFullscreen) || command == "toggle_fullscreen") { requests.toggleFullscreen = true; return true; }
+    if (matches(EditorCommandId::ViewportSelect) || command == "viewport_select") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportSelect); return true; }
+    if (matches(EditorCommandId::ViewportMove) || command == "viewport_move") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportMove); return true; }
+    if (matches(EditorCommandId::ViewportRotate) || command == "viewport_rotate") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportRotate); return true; }
+    if (matches(EditorCommandId::ViewportScale) || command == "viewport_scale") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportScale); return true; }
+    if (matches(EditorCommandId::ViewportToggleLocal) || command == "viewport_toggle_local") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportToggleLocal); return true; }
+    if (matches(EditorCommandId::ViewportToggleSnap) || command == "viewport_toggle_snap") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportToggleSnap); return true; }
+    if (matches(EditorCommandId::ViewportToggleGrid) || command == "viewport_toggle_grid") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportToggleGrid); return true; }
+    if (matches(EditorCommandId::ViewportToggleAxes) || command == "viewport_toggle_axes") { visibility_.viewport = true; viewportPanel_.executeCommand(EditorCommandId::ViewportToggleAxes); return true; }
+    if (matches(EditorCommandId::ViewportFrameSelected) || command == "viewport_frame_selected") {
+        if (!selection_.entityId().valid()) {
+            return false;
+        }
+        visibility_.viewport = true;
+        requests.focusOnEntity = selection_.entityId();
+        return true;
+    }
     if (matches(EditorCommandId::Exit) || command == "exit") { requests.exit = true; return true; }
     return false;
 }

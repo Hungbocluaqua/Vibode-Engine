@@ -86,8 +86,8 @@ struct MeshParamsUniform {
     uint32_t localTriangleCount = 0;
     uint32_t tlasNodeCount = 0;
     uint32_t tlasInstanceIndexCount = 0;
-    uint32_t padding2 = 0;
-    uint32_t padding3 = 0;
+    uint32_t authoredLightOffset = 0;
+    uint32_t authoredLightCount = 0;
     uint32_t padding4 = 0;
 };
 
@@ -249,6 +249,7 @@ public:
     [[nodiscard]] const std::vector<RayTracingInstanceBuildInput>& rayTracingInstances() const { return rayTracingInstances_; }
     [[nodiscard]] const RayTracingGeometryStats& rayTracingGeometryStats() const { return rayTracingGeometryStats_; }
     [[nodiscard]] const std::vector<GpuPrimitiveRecord>& primitiveRecordsCpu() const { return primitiveRecordCpu_; }
+    [[nodiscard]] const std::vector<GpuLightRecord>& lightRecordsCpu() const { return lightRecordCpu_; }
     [[nodiscard]] const OpacityMicromapCpuData& opacityMicromapData() const { return opacityMicromapData_; }
 
     bool setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity);
@@ -278,6 +279,7 @@ private:
     void createCachedMaterialTextures(BufferUploader& uploader, const CachedScene& cached);
     void createEnvironment(BufferUploader& uploader);
     void uploadEnvironmentParams();
+    bool rebuildEmissiveLightRecords(const SceneAsset& scene, float& emissiveTotalWeight);
     void uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight, uint64_t retireFrame = 0);
     void uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords, uint64_t retireFrame = 0);
     void destroyMaterialTextureSamplers();
@@ -337,7 +339,12 @@ private:
     std::vector<RayTracingInstanceBuildInput> rayTracingInstances_;
     RayTracingGeometryStats rayTracingGeometryStats_{};
     std::vector<GpuPrimitiveRecord> primitiveRecordCpu_;
+    std::vector<GpuLightRecord> lightRecordCpu_;
     OpacityMicromapCpuData opacityMicromapData_{};
+    std::vector<GpuMeshRecord> meshRecordCpu_;
+    std::vector<glm::vec4> localTriangleDataCpu_;
+    std::vector<glm::vec3> materialEmissiveCpu_;
+    std::vector<glm::vec4> sphereDataCpu_;
     std::vector<GpuLightRecord> emissiveLightRecords_;
     std::vector<GpuInstanceRecord> instanceRecordCpu_;
 };

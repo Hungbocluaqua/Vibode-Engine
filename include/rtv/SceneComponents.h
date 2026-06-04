@@ -121,6 +121,7 @@ struct Environment {
 };
 
 struct EnvironmentLight {
+    std::filesystem::path hdrPath;
     bool enabled = true;
     float intensity = 1.0f;
     float backgroundIntensity = 0.35f;
@@ -129,6 +130,7 @@ struct EnvironmentLight {
 
 struct SkyAtmosphere {
     bool enabled = true;
+    float skyIntensity = 0.8f;
     float rayleighScaleHeight = 8000.0f;
     float mieScaleHeight = 1200.0f;
     float mieAnisotropy = 0.8f;
@@ -293,6 +295,23 @@ enum class SceneUpdateKind : uint32_t {
     RendererSettingsOnly,
 };
 
+using SceneUpdateMask = uint32_t;
+
+enum SceneUpdateMaskBits : SceneUpdateMask {
+    SceneUpdateMaskNone = 0u,
+    SceneUpdateMaskMaterial = 1u << 0u,
+    SceneUpdateMaskTransform = 1u << 1u,
+    SceneUpdateMaskLight = 1u << 2u,
+    SceneUpdateMaskEnvironment = 1u << 3u,
+    SceneUpdateMaskCamera = 1u << 4u,
+    SceneUpdateMaskVisibility = 1u << 5u,
+    SceneUpdateMaskTopology = 1u << 6u,
+    SceneUpdateMaskRendererSettings = 1u << 7u,
+};
+
 [[nodiscard]] const char* sceneUpdateKindName(SceneUpdateKind kind);
+[[nodiscard]] SceneUpdateMask sceneUpdateKindMask(SceneUpdateKind kind);
+[[nodiscard]] SceneUpdateKind sceneUpdateKindFromMask(SceneUpdateMask mask);
+[[nodiscard]] std::string sceneUpdateMaskName(SceneUpdateMask mask);
 
 } // namespace rtv

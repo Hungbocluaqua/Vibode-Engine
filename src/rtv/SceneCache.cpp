@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 20;
+constexpr uint32_t kCacheVersion = 25;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -340,6 +340,23 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         }
     }
 
+    uint32_t sceneLightCount = static_cast<uint32_t>(scene.sceneLights.size());
+    if (!writeUint32(file, sceneLightCount)) {
+        std::fclose(file);
+        return false;
+    }
+    for (const auto& light : scene.sceneLights) {
+        writeUint32(file, light.type);
+        writeBytes(file, &light.transform, sizeof(light.transform));
+        writeBytes(file, &light.color, sizeof(light.color));
+        writeFloat(file, light.intensity);
+        writeFloat(file, light.sizeOrRadius);
+        writeFloat(file, light.innerConeRadians);
+        writeFloat(file, light.outerConeRadians);
+        writeUint32(file, light.enabled);
+        writeInt32(file, light.nodeIndex);
+    }
+
     uint32_t rootNodeCount = static_cast<uint32_t>(scene.rootNodes.size());
     if (!writeUint32(file, rootNodeCount)) {
         std::fclose(file);
@@ -626,6 +643,25 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (childCount > 0) {
             if (!readBytes(file, node.children.data(), sizeof(uint32_t) * childCount)) { std::fclose(file); return std::nullopt; }
         }
+    }
+
+    uint32_t sceneLightCount = 0;
+    if (!readUint32(file, sceneLightCount)) {
+        std::fclose(file);
+        return std::nullopt;
+    }
+    scene.sceneLights.resize(sceneLightCount);
+    for (uint32_t i = 0; i < sceneLightCount; ++i) {
+        auto& light = scene.sceneLights[i];
+        if (!readUint32(file, light.type)) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &light.transform, sizeof(light.transform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &light.color, sizeof(light.color))) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, light.intensity)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, light.sizeOrRadius)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, light.innerConeRadians)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, light.outerConeRadians)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, light.enabled)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, light.nodeIndex)) { std::fclose(file); return std::nullopt; }
     }
 
     uint32_t rootNodeCount = 0;

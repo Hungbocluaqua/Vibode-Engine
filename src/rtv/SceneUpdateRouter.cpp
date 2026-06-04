@@ -1,6 +1,7 @@
 #include "rtv/SceneUpdateRouter.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 
 namespace rtv {
@@ -31,57 +32,116 @@ const char* sceneUpdateGpuActionName(SceneUpdateGpuAction action) {
     return "Unknown";
 }
 
+SceneUpdateGpuActionMask sceneUpdateGpuActionBit(SceneUpdateGpuAction action) {
+    if (action == SceneUpdateGpuAction::None) {
+        return 0u;
+    }
+    return 1u << static_cast<uint32_t>(action);
+}
+
+bool sceneUpdateRouteHasAction(const SceneUpdateRoute& route, SceneUpdateGpuAction action) {
+    return (route.actionMask & sceneUpdateGpuActionBit(action)) != 0u;
+}
+
+std::string sceneUpdateGpuActionMaskName(SceneUpdateGpuActionMask mask) {
+    if (mask == 0u) {
+        return sceneUpdateGpuActionName(SceneUpdateGpuAction::None);
+    }
+    const std::array<SceneUpdateGpuAction, 8> actions{{
+        SceneUpdateGpuAction::UpdateMaterials,
+        SceneUpdateGpuAction::UpdateTransforms,
+        SceneUpdateGpuAction::UpdateLights,
+        SceneUpdateGpuAction::UpdateEnvironment,
+        SceneUpdateGpuAction::UpdateCamera,
+        SceneUpdateGpuAction::UpdateVisibility,
+        SceneUpdateGpuAction::RebuildTopology,
+        SceneUpdateGpuAction::ApplyRendererSettings,
+    }};
+    std::string result;
+    for (SceneUpdateGpuAction action : actions) {
+        if ((mask & sceneUpdateGpuActionBit(action)) == 0u) {
+            continue;
+        }
+        if (!result.empty()) {
+            result += "+";
+        }
+        result += sceneUpdateGpuActionName(action);
+    }
+    return result.empty() ? sceneUpdateGpuActionName(SceneUpdateGpuAction::None) : result;
+}
+
+namespace {
+
+void addAction(SceneUpdateRoute& route, SceneUpdateGpuAction action) {
+    if (route.action == SceneUpdateGpuAction::None) {
+        route.action = action;
+    }
+    route.actionMask |= sceneUpdateGpuActionBit(action);
+}
+
+void setResetReason(SceneUpdateRoute& route, AccumulationResetReason reason) {
+    if (route.resetReason == AccumulationResetReason::Manual || reason == AccumulationResetReason::SceneChanged) {
+        route.resetReason = reason;
+    }
+}
+
+} // namespace
+
 SceneUpdateRoute SceneUpdateRouter::route(SceneUpdateKind kind) {
+    return route(sceneUpdateKindMask(kind));
+}
+
+SceneUpdateRoute SceneUpdateRouter::route(SceneUpdateMask mask) {
     SceneUpdateRoute route;
-    route.kind = kind;
-    switch (kind) {
-    case SceneUpdateKind::None:
+    route.kind = sceneUpdateKindFromMask(mask);
+    if (mask == SceneUpdateMaskNone) {
         return route;
-    case SceneUpdateKind::MaterialOnly:
-        route.action = SceneUpdateGpuAction::UpdateMaterials;
-        route.resetReason = AccumulationResetReason::MaterialChanged;
-        route.requiresGpuSceneBuild = true;
-        route.resetsAccumulation = true;
-        return route;
-    case SceneUpdateKind::TransformOnly:
-        route.action = SceneUpdateGpuAction::UpdateTransforms;
-        route.resetReason = AccumulationResetReason::SceneChanged;
-        route.requiresGpuSceneBuild = true;
-        route.resetsAccumulation = true;
-        return route;
-    case SceneUpdateKind::LightOnly:
-        route.action = SceneUpdateGpuAction::UpdateLights;
-        route.resetReason = AccumulationResetReason::LightingChanged;
-        route.requiresGpuSceneBuild = true;
-        route.resetsAccumulation = true;
-        return route;
-    case SceneUpdateKind::EnvironmentOnly:
-        route.action = SceneUpdateGpuAction::UpdateEnvironment;
-        route.resetReason = AccumulationResetReason::EnvironmentChanged;
-        route.requiresGpuSceneBuild = true;
-        route.resetsAccumulation = true;
-        return route;
-    case SceneUpdateKind::CameraOnly:
-        route.action = SceneUpdateGpuAction::UpdateCamera;
-        route.resetReason = AccumulationResetReason::CameraMoved;
-        route.resetsAccumulation = true;
-        return route;
-    case SceneUpdateKind::VisibilityOnly:
-        route.action = SceneUpdateGpuAction::UpdateVisibility;
-        route.requiresGpuSceneBuild = true;
-        return route;
-    case SceneUpdateKind::TopologyChanged:
-        route.action = SceneUpdateGpuAction::RebuildTopology;
+    }
+    if ((mask & SceneUpdateMaskTopology) != 0u) {
+        addAction(route, SceneUpdateGpuAction::RebuildTopology);
         route.resetReason = AccumulationResetReason::SceneChanged;
         route.requiresGpuSceneBuild = true;
         route.requiresRendererRebuild = true;
         route.resetsAccumulation = true;
         return route;
-    case SceneUpdateKind::RendererSettingsOnly:
-        route.action = SceneUpdateGpuAction::ApplyRendererSettings;
-        route.resetReason = AccumulationResetReason::RenderSettingsChanged;
+    }
+    if ((mask & SceneUpdateMaskMaterial) != 0u) {
+        addAction(route, SceneUpdateGpuAction::UpdateMaterials);
+        setResetReason(route, AccumulationResetReason::MaterialChanged);
+        route.requiresGpuSceneBuild = true;
         route.resetsAccumulation = true;
-        return route;
+    }
+    if ((mask & SceneUpdateMaskTransform) != 0u) {
+        addAction(route, SceneUpdateGpuAction::UpdateTransforms);
+        setResetReason(route, AccumulationResetReason::SceneChanged);
+        route.requiresGpuSceneBuild = true;
+        route.resetsAccumulation = true;
+    }
+    if ((mask & SceneUpdateMaskLight) != 0u) {
+        addAction(route, SceneUpdateGpuAction::UpdateLights);
+        setResetReason(route, AccumulationResetReason::LightingChanged);
+        route.requiresGpuSceneBuild = true;
+        route.resetsAccumulation = true;
+    }
+    if ((mask & SceneUpdateMaskEnvironment) != 0u) {
+        addAction(route, SceneUpdateGpuAction::UpdateEnvironment);
+        setResetReason(route, AccumulationResetReason::EnvironmentChanged);
+        route.requiresGpuSceneBuild = true;
+        route.resetsAccumulation = true;
+    }
+    if ((mask & SceneUpdateMaskCamera) != 0u) {
+        addAction(route, SceneUpdateGpuAction::UpdateCamera);
+        setResetReason(route, AccumulationResetReason::CameraMoved);
+        route.resetsAccumulation = true;
+    }
+    if ((mask & SceneUpdateMaskVisibility) != 0u) {
+        addAction(route, SceneUpdateGpuAction::UpdateVisibility);
+        route.requiresGpuSceneBuild = true;
+    }
+    if ((mask & SceneUpdateMaskRendererSettings) != 0u) {
+        addAction(route, SceneUpdateGpuAction::ApplyRendererSettings);
+        setResetReason(route, AccumulationResetReason::RenderSettingsChanged);
+        route.resetsAccumulation = true;
     }
     return route;
 }

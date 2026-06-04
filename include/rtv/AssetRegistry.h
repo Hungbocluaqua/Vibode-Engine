@@ -33,9 +33,11 @@ enum class AssetRegistryDirtyReason {
     AssetRenamed,
     AssetMoved,
     AssetDependencyChanged,
+    AssetTagsChanged,
 };
 
 struct AssetImportSettings {
+    bool copySourceIntoProject = false;
     bool preserveHierarchy = true;
     bool importMaterials = true;
     bool importTextures = true;
@@ -66,10 +68,15 @@ struct AssetRecord {
     std::string importedHash;
     std::string importSettingsHash;
     std::string lastModifiedTimestamp;
+    std::vector<std::string> tags;
     AssetImportSettings importSettings;
     AssetImportStatus status = AssetImportStatus::Unknown;
     bool missing = false;
     bool stale = false;
+    bool sourceMissing = false;
+    bool importedMetadataMissing = false;
+    bool cookedPayloadMissing = false;
+    bool dependenciesMissing = false;
 };
 
 struct AssetRegistryState {
@@ -92,6 +99,7 @@ public:
     void markDirty(AssetRegistryDirtyReason reason);
     void clearDirty();
     void addOrReplaceRecord(AssetRecord record, AssetRegistryDirtyReason reason = AssetRegistryDirtyReason::AssetImported);
+    [[nodiscard]] bool refreshRecordHealth(const std::filesystem::path& root, bool markDirtyOnChange = true);
 
 private:
     AssetRegistryState state_{};

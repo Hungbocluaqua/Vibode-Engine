@@ -57,6 +57,7 @@ public:
         const ProjectContext* project,
         const AssetRegistry* assetRegistry,
         bool sceneDirty,
+        bool projectSettingsDirty,
         const std::vector<EntityId>* instanceEntities,
         const std::string& sceneLoadingStatus,
         bool sceneLoadRunning,
@@ -65,16 +66,21 @@ public:
         const UndoStack* undoStack,
         const EditorRenderJobStatus* renderJob,
         const EditorPlacementStatus* placement,
+        const EditorJobCenterState* jobCenter,
         float cpuFrameMs,
         NotificationManager* notifications,
         bool externalMouseCapture = false);
     [[nodiscard]] EditorRequests buildProjectManager(
         const ProjectContext* project,
+        const AssetRegistry* assetRegistry,
+        bool sceneDirty,
+        bool projectSettingsDirty,
         const std::string& sceneLoadingStatus,
         bool sceneLoadRunning,
         float sceneLoadProgress,
         NotificationManager* notifications);
     void record(VkCommandBuffer commandBuffer);
+    void renderPlatformWindows();
     void onSwapchainRecreated(const Swapchain& swapchain);
 
     [[nodiscard]] bool wantsMouse() const;

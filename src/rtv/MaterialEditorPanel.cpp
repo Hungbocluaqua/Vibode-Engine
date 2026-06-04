@@ -100,8 +100,22 @@ uint32_t materialIdForSelection(const EditorRuntimeState& state, const EditorSel
 } // namespace
 
 void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSelection& selection, EditorRequests& requests) {
-    if (!ImGui::Begin(EditorDockWindowTitle::MaterialEditor)) {
+    ImGuiWindowClass nativeWindowClass{};
+    nativeWindowClass.ClassId = 0x4d544544u;
+    nativeWindowClass.DockingAllowUnclassed = false;
+    nativeWindowClass.ViewportFlagsOverrideSet = ImGuiViewportFlags_NoAutoMerge;
+    ImGui::SetNextWindowClass(&nativeWindowClass);
+    if (ImGuiViewport* mainViewport = ImGui::GetMainViewport()) {
+        ImGui::SetNextWindowPos(ImVec2(mainViewport->WorkPos.x + 96.0f, mainViewport->WorkPos.y + 72.0f), ImGuiCond_FirstUseEver);
+    }
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 640.0f), ImGuiCond_FirstUseEver);
+    bool open = true;
+    constexpr ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoDocking;
+    if (!ImGui::Begin(EditorDockWindowTitle::MaterialEditor, &open, windowFlags)) {
         ImGui::End();
+        if (!open) {
+            requests.closeMaterialEditor = true;
+        }
         return;
     }
 
@@ -109,6 +123,9 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     if (state.assets == nullptr || materialId == UINT32_MAX) {
         ImGui::TextDisabled("Select a material or an object with a material.");
         ImGui::End();
+        if (!open) {
+            requests.closeMaterialEditor = true;
+        }
         return;
     }
 
@@ -116,6 +133,9 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     if (source == nullptr) {
         ImGui::TextDisabled("Selected material is unavailable.");
         ImGui::End();
+        if (!open) {
+            requests.closeMaterialEditor = true;
+        }
         return;
     }
 
@@ -123,6 +143,20 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     bool changed = false;
     ImGui::Text("Material ID: %u", materialId);
     ImGui::Text("Name: %s", edited.name.empty() ? "(unnamed)" : edited.name.c_str());
+    ImGui::SeparatorText("Save State");
+    if (state.sceneDirty) {
+        ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Current Level: Unsaved changes");
+    } else {
+        ImGui::TextColored(ImVec4(0.54f, 0.82f, 0.60f, 1.0f), "Current Level: Saved");
+    }
+    if (state.assetRegistry != nullptr && state.assetRegistry->dirty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.28f, 1.0f), "Asset Registry: Unsaved metadata");
+    } else if (state.assetRegistry != nullptr) {
+        ImGui::TextColored(ImVec4(0.54f, 0.82f, 0.60f, 1.0f), "Asset Registry: Saved");
+    } else {
+        ImGui::TextDisabled("Asset Registry: unavailable");
+    }
+    ImGui::TextDisabled("Material edits are persisted by Save Level or Save All.");
     {
         ImGui::Button("Drag Material to Entity");
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
@@ -192,6 +226,9 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     }
 
     ImGui::End();
+    if (!open) {
+        requests.closeMaterialEditor = true;
+    }
 }
 
 } // namespace rtv

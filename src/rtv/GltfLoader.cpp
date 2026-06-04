@@ -6,11 +6,13 @@
 
 #include "rtv/AssetManager.h"
 #include "rtv/SceneCache.h"
+#include "rtv/SceneComponents.h"
 #include "rtv/TextureLoader.h"
 
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <cmath>
@@ -432,6 +434,7 @@ bool loadImageDataPreservingKtx2(
         name == "KHR_materials_iridescence" ||
         name == "KHR_materials_emissive_strength" ||
         name == "KHR_materials_anisotropy" ||
+        name == "KHR_lights_punctual" ||
         name == "KHR_texture_transform";
 }
 
@@ -931,8 +934,36 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         }
     }
 
-    for (size_t i = 0; i < model.lights.size(); ++i) {
-        const tinygltf::Light& srcLight = model.lights[i];
+    std::vector<glm::mat4> nodeWorldTransforms(scene.nodes.size(), glm::mat4{1.0f});
+    std::vector<uint8_t> nodeWorldComputed(scene.nodes.size(), 0u);
+    auto nodeWorldTransform = [&](auto&& self, size_t nodeIndex) -> glm::mat4 {
+        if (nodeIndex >= scene.nodes.size()) {
+            return glm::mat4{1.0f};
+        }
+        if (nodeWorldComputed[nodeIndex] != 0u) {
+            return nodeWorldTransforms[nodeIndex];
+        }
+
+        const SceneNodeAsset& node = scene.nodes[nodeIndex];
+        glm::mat4 world = node.transform;
+        if (node.parent >= 0 && static_cast<size_t>(node.parent) < scene.nodes.size()) {
+            world = self(self, static_cast<size_t>(node.parent)) * node.transform;
+        }
+        nodeWorldTransforms[nodeIndex] = world;
+        nodeWorldComputed[nodeIndex] = 1u;
+        return world;
+    };
+    for (size_t i = 0; i < scene.nodes.size(); ++i) {
+        nodeWorldTransform(nodeWorldTransform, i);
+    }
+
+    for (size_t ni = 0; ni < model.nodes.size(); ++ni) {
+        const tinygltf::Node& sourceNode = model.nodes[ni];
+        if (sourceNode.light < 0 || static_cast<size_t>(sourceNode.light) >= model.lights.size()) {
+            continue;
+        }
+
+        const tinygltf::Light& srcLight = model.lights[static_cast<size_t>(sourceNode.light)];
         SceneLightAsset light;
         light.color = srcLight.color.size() >= 3
             ? glm::vec3(static_cast<float>(srcLight.color[0]),
@@ -940,23 +971,21 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
                          static_cast<float>(srcLight.color[2]))
             : glm::vec3(1.0f);
         light.intensity = static_cast<float>(srcLight.intensity);
-        if (light.intensity <= 0.0f) {
-            light.intensity = srcLight.type == "directional" ? 1.0f : 100.0f;
-        }
-        light.type = srcLight.type == "directional" ? 0u
-                   : srcLight.type == "spot" ? 2u
-                   : 1u;
+        light.type = srcLight.type == "directional" ? static_cast<uint32_t>(LightType::Directional)
+                   : srcLight.type == "spot" ? static_cast<uint32_t>(LightType::Spot)
+                   : static_cast<uint32_t>(LightType::Point);
         light.enabled = true;
         if (srcLight.type == "directional") {
             light.sizeOrRadius = 0.0f;
+        } else if (srcLight.range > 0.0) {
+            light.sizeOrRadius = static_cast<float>(srcLight.range);
         }
-        for (size_t ni = 0; ni < model.nodes.size(); ++ni) {
-            if (model.nodes[ni].light == static_cast<int>(i)) {
-                light.transform = nodeTransform(model.nodes[ni]);
-                light.nodeIndex = static_cast<int32_t>(ni);
-                break;
-            }
+        if (srcLight.type == "spot") {
+            light.innerConeRadians = static_cast<float>(std::max(srcLight.spot.innerConeAngle, 0.0));
+            light.outerConeRadians = static_cast<float>(std::max(srcLight.spot.outerConeAngle, srcLight.spot.innerConeAngle));
         }
+        light.transform = ni < nodeWorldTransforms.size() ? nodeWorldTransforms[ni] : nodeTransform(sourceNode);
+        light.nodeIndex = static_cast<int32_t>(ni);
         scene.lights.push_back(light);
     }
 
@@ -1132,6 +1161,19 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     scene.nodes.push_back(std::move(node));
                 }
                 scene.rootNodes = cached->rootNodes;
+                for (const CachedSceneLightData& cachedLight : cached->sceneLights) {
+                    SceneLightAsset light;
+                    light.type = cachedLight.type;
+                    light.transform = cachedLight.transform;
+                    light.color = cachedLight.color;
+                    light.intensity = cachedLight.intensity;
+                    light.sizeOrRadius = cachedLight.sizeOrRadius;
+                    light.innerConeRadians = cachedLight.innerConeRadians;
+                    light.outerConeRadians = cachedLight.outerConeRadians;
+                    light.enabled = cachedLight.enabled != 0;
+                    light.nodeIndex = cachedLight.nodeIndex;
+                    scene.lights.push_back(light);
+                }
 
                 const auto rebuildEnd = std::chrono::high_resolution_clock::now();
                 const double rebuildMs = std::chrono::duration<double, std::milli>(rebuildEnd - rebuildStart).count();
@@ -1343,6 +1385,20 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedNode.parentIndex = node.parent;
         cachedNode.children = node.children;
         cached.nodes.push_back(std::move(cachedNode));
+    }
+
+    for (const SceneLightAsset& light : scene.lights) {
+        CachedSceneLightData cachedLight;
+        cachedLight.type = light.type;
+        cachedLight.transform = light.transform;
+        cachedLight.color = light.color;
+        cachedLight.intensity = light.intensity;
+        cachedLight.sizeOrRadius = light.sizeOrRadius;
+        cachedLight.innerConeRadians = light.innerConeRadians;
+        cachedLight.outerConeRadians = light.outerConeRadians;
+        cachedLight.enabled = light.enabled ? 1u : 0u;
+        cachedLight.nodeIndex = light.nodeIndex;
+        cached.sceneLights.push_back(std::move(cachedLight));
     }
 
     cached.rootNodes = scene.rootNodes;

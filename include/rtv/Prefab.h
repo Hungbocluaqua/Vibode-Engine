@@ -28,6 +28,11 @@ struct PrefabAsset {
     AssetGuid guid;
     std::string name;
     std::filesystem::path sourcePath;
+    std::string runtimePayloadKind;
+    std::filesystem::path runtimeCachePath;
+    std::string runtimePayloadHash;
+    std::string runtimeSourceHash;
+    std::string runtimeImportSettingsHash;
     std::vector<PrefabNodeAsset> nodes;
     std::vector<uint32_t> rootNodes;
 };

@@ -316,6 +316,8 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    io.ConfigViewportsNoDefaultParent = true;
     io.IniFilename = "rtv_editor.ini";
 
     loadEditorFonts();
@@ -368,6 +370,7 @@ UiOverlay::UiOverlay(GLFWwindow* window, const VulkanContext& context, const Swa
     initInfo.UseDynamicRendering = true;
     initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     initInfo.PipelineInfoMain.PipelineRenderingCreateInfo = renderingInfo;
+    initInfo.PipelineInfoForViewports.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     initInfo.CheckVkResultFn = &UiOverlay::checkVkResult;
     initInfo.MinAllocationSize = 1024 * 1024;
     if (!ImGui_ImplVulkan_Init(&initInfo)) {
@@ -427,9 +430,10 @@ EditorRequests UiOverlay::build(
     const std::optional<std::filesystem::path>& gltfPath,
     const std::optional<std::filesystem::path>& hdrPath,
     const std::optional<std::filesystem::path>& scenePath,
-    const ProjectContext* project,
+        const ProjectContext* project,
         const AssetRegistry* assetRegistry,
         bool sceneDirty,
+        bool projectSettingsDirty,
         const std::vector<EntityId>* instanceEntities,
         const std::string& sceneLoadingStatus,
         bool sceneLoadRunning,
@@ -438,6 +442,7 @@ EditorRequests UiOverlay::build(
         const UndoStack* undoStack,
         const EditorRenderJobStatus* renderJob,
         const EditorPlacementStatus* placement,
+        const EditorJobCenterState* jobCenter,
         float cpuFrameMs,
         NotificationManager* notifications,
         bool externalMouseCapture) {
@@ -479,6 +484,7 @@ EditorRequests UiOverlay::build(
         .project = project,
         .assetRegistry = assetRegistry,
         .sceneDirty = sceneDirty,
+        .projectSettingsDirty = projectSettingsDirty,
         .instanceEntities = instanceEntities,
         .sceneLoadingStatus = &sceneLoadingStatus,
         .sceneLoadRunning = sceneLoadRunning,
@@ -488,6 +494,7 @@ EditorRequests UiOverlay::build(
         .uiTextures = EditorUiTextureProvider{.user = this, .acquire = &UiOverlay::acquireEditorTextureCallback, .acquireAssetPreview = &UiOverlay::acquireEditorAssetPreviewCallback},
         .renderJob = renderJob,
         .placement = placement,
+        .jobCenter = jobCenter,
         .swapchainExtent = extent,
         .cpuFrameMs = cpuFrameMs,
         .viewport = EditorViewportState{
@@ -510,6 +517,9 @@ EditorRequests UiOverlay::build(
 
 EditorRequests UiOverlay::buildProjectManager(
     const ProjectContext* project,
+    const AssetRegistry* assetRegistry,
+    bool sceneDirty,
+    bool projectSettingsDirty,
     const std::string& sceneLoadingStatus,
     bool sceneLoadRunning,
     float sceneLoadProgress,
@@ -521,9 +531,12 @@ EditorRequests UiOverlay::buildProjectManager(
 
     requests = editor_.drawProjectManagerLauncher(ProjectManagerRuntimeState{
         .project = project,
+        .assetRegistry = assetRegistry,
         .sceneLoadingStatus = &sceneLoadingStatus,
         .sceneLoadRunning = sceneLoadRunning,
         .sceneLoadProgress = sceneLoadProgress,
+        .sceneDirty = sceneDirty,
+        .projectSettingsDirty = projectSettingsDirty,
         .standaloneLauncher = true,
     });
     if (notifications != nullptr) {
@@ -541,6 +554,18 @@ void UiOverlay::record(VkCommandBuffer commandBuffer) {
     }
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), commandBuffer);
     frameBegun_ = false;
+}
+
+void UiOverlay::renderPlatformWindows() {
+    if (ImGui::GetCurrentContext() == nullptr) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    if ((io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) == 0) {
+        return;
+    }
+    ImGui::UpdatePlatformWindows();
+    ImGui::RenderPlatformWindowsDefault();
 }
 
 void UiOverlay::onSwapchainRecreated(const Swapchain& swapchain) {

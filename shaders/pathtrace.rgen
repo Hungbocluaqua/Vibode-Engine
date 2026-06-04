@@ -787,7 +787,7 @@ bool sample_emissive_light(
     }
 
     uint lightIndex;
-    if (!sample_light_bvh(rng, lightIndex)) {
+    if (!sample_scene_light(rng, lightIndex)) {
         wi = vec3(0.0, 1.0, 0.0);
         emission = vec3(0.0);
         pdfSolidAngle = 0.0;
@@ -798,13 +798,14 @@ bool sample_emissive_light(
     LightRecord selected = light_records[lightIndex];
     lightIndexOut = lightIndex;
     lightKindOut = selected.metadata.x;
+    float selectedPdf = light_record_selection_pdf(lightIndex);
     if (selected.metadata.x == 2u) {
         wi = normalize(selected.data1.xyz);
         emission = selected.data2.xyz;
         samplePosition = wi;
         sampleRadiance = emission;
         lightNormalOut = -wi;
-        pdfSolidAngle = selected.data0.x / max(totalWeight, 1e-6);
+        pdfSolidAngle = selectedPdf;
         distanceToLight = 10000.0;
         return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
     }
@@ -818,8 +819,31 @@ bool sample_emissive_light(
         sampleRadiance = selected.data2.xyz;
         lightNormalOut = -wi;
         emission = sampleRadiance / max(distSq, 1e-4);
-        pdfSolidAngle = selected.data0.x / max(totalWeight, 1e-6);
+        pdfSolidAngle = selectedPdf;
         return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+    }
+    if (selected.metadata.x == 5u) {
+        vec3 samplePos = selected.data1.xyz;
+        vec3 toLight = samplePos - hitPos;
+        float distSq = dot(toLight, toLight);
+        distanceToLight = sqrt(max(distSq, 1e-8));
+        wi = toLight / distanceToLight;
+
+        vec3 spotDirection = normalize(vec3(selected.data1.w, selected.data2.w, selected.data3.x));
+        float innerCone = clamp(selected.data3.y, 0.0, PI);
+        float outerCone = clamp(max(selected.data3.z, innerCone), 0.0, PI);
+        float cosInner = cos(innerCone);
+        float cosOuter = cos(outerCone);
+        float cosTheta = dot(-wi, spotDirection);
+        float coneWeight = clamp((cosTheta - cosOuter) / max(cosInner - cosOuter, 1.0e-4), 0.0, 1.0);
+        coneWeight *= coneWeight;
+
+        samplePosition = samplePos;
+        sampleRadiance = selected.data2.xyz * coneWeight;
+        lightNormalOut = spotDirection;
+        emission = sampleRadiance / max(distSq, 1e-4);
+        pdfSolidAngle = selectedPdf;
+        return coneWeight > 0.0 && has_positive_radiance(emission) && pdfSolidAngle > 0.0;
     }
     if (selected.metadata.x == 4u) {
         vec3 center = selected.data1.xyz;
@@ -837,7 +861,7 @@ bool sample_emissive_light(
         sampleRadiance = selected.data2.xyz;
         lightNormalOut = lightNormal;
         emission = sampleRadiance;
-        float selectionPdf = selected.data0.x / max(totalWeight, 1e-6);
+        float selectionPdf = selectedPdf;
         float area = max(selected.data0.w, 1e-6);
         pdfSolidAngle = cosLight > 1e-6 ? selectionPdf * distSq / (cosLight * area) : 0.0;
         return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
@@ -881,7 +905,7 @@ bool sample_emissive_light(
     float cosLight = max(dot(-wi, lightNormal), 0.0);
     samplePosition = samplePos;
     lightNormalOut = lightNormal;
-    float selectionPdf = selected.data0.x / max(totalWeight, 1e-6);
+    float selectionPdf = selectedPdf;
     float area = max(selected.data0.w, 1e-6);
     pdfSolidAngle = cosLight > 1e-6 ? selectionPdf * distSq / (cosLight * area) : 0.0;
     return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
@@ -1148,8 +1172,8 @@ float restir_di_light_pdf(uint lightIndex, uint lightKind, vec3 receiverPos, vec
     if (light.metadata.x != lightKind) {
         return 0.0;
     }
-    float selectionPdf = light.data0.x / max(mesh_params.emissive_total_area, 1.0e-6);
-    if (lightKind == 2u || lightKind == 3u) {
+    float selectionPdf = light_record_selection_pdf(lightIndex);
+    if (lightKind == 2u || lightKind == 3u || lightKind == 5u) {
         return selectionPdf;
     }
 
@@ -1194,6 +1218,10 @@ RestirReservoir reevaluate_restir_di_reservoir(
     if (lightIndex >= mesh_params.light_count) {
         return invalidate_restir_di_reservoir(reservoir);
     }
+    LightRecord selectedLight = light_records[lightIndex];
+    if (selectedLight.metadata.x != lightKind) {
+        return invalidate_restir_di_reservoir(reservoir);
+    }
 
     vec3 lightingNormal = normalize(hit.geom_normal);
     vec3 wi;
@@ -1211,6 +1239,17 @@ RestirReservoir reevaluate_restir_di_reservoir(
         if (lightKind == 3u) {
             incidentRadiance /= max(distSq, 1.0e-4);
             lightNormal = -wi;
+        } else if (lightKind == 5u) {
+            vec3 spotDirection = normalize(vec3(selectedLight.data1.w, selectedLight.data2.w, selectedLight.data3.x));
+            float innerCone = clamp(selectedLight.data3.y, 0.0, PI);
+            float outerCone = clamp(max(selectedLight.data3.z, innerCone), 0.0, PI);
+            float cosInner = cos(innerCone);
+            float cosOuter = cos(outerCone);
+            float cosTheta = dot(-wi, spotDirection);
+            float coneWeight = clamp((cosTheta - cosOuter) / max(cosInner - cosOuter, 1.0e-4), 0.0, 1.0);
+            coneWeight *= coneWeight;
+            incidentRadiance = selectedLight.data2.xyz * coneWeight / max(distSq, 1.0e-4);
+            lightNormal = spotDirection;
         }
     }
 

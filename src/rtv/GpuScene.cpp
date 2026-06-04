@@ -47,6 +47,15 @@ uint32_t nodeInstanceFlags(const SceneNodeAsset& node) {
 
 constexpr uint32_t maxMaterialTextures = 1024;
 constexpr uint32_t sceneLightTypeDirectional = 0u;
+constexpr uint32_t sceneLightTypePoint = 1u;
+constexpr uint32_t sceneLightTypeArea = 2u;
+constexpr uint32_t sceneLightTypeSpot = 3u;
+constexpr uint32_t gpuLightTypeEmissiveTriangle = 0u;
+constexpr uint32_t gpuLightTypeEmissiveSphere = 1u;
+constexpr uint32_t gpuLightTypeDirectional = 2u;
+constexpr uint32_t gpuLightTypePoint = 3u;
+constexpr uint32_t gpuLightTypeArea = 4u;
+constexpr uint32_t gpuLightTypeSpot = 5u;
 constexpr uint64_t fastImportedBvhTriangleThreshold = 1'000'000ull;
 constexpr uint32_t materialFlagManualBaseColorSrgb = 1u << 0u;
 constexpr uint32_t materialFlagManualEmissiveSrgb = 1u << 1u;
@@ -957,10 +966,42 @@ float luminance(glm::vec3 value) {
 
 glm::vec3 lightRecordCentroid(const GpuLightRecord& record) {
     const uint32_t type = record.metadata.x;
-    if (type == 0u || type == 1u || type == 3u || type == 4u) {
+    if (type == gpuLightTypeEmissiveTriangle ||
+        type == gpuLightTypeEmissiveSphere ||
+        type == gpuLightTypePoint ||
+        type == gpuLightTypeArea ||
+        type == gpuLightTypeSpot) {
         return glm::vec3(record.data1);
     }
     return glm::vec3(0.0f);
+}
+
+bool isEmissiveGpuLightRecord(const GpuLightRecord& record) {
+    return record.metadata.x == gpuLightTypeEmissiveTriangle ||
+        record.metadata.x == gpuLightTypeEmissiveSphere;
+}
+
+bool isAuthoredGpuLightRecord(const GpuLightRecord& record) {
+    return record.metadata.x == gpuLightTypeDirectional ||
+        record.metadata.x == gpuLightTypePoint ||
+        record.metadata.x == gpuLightTypeArea ||
+        record.metadata.x == gpuLightTypeSpot;
+}
+
+void applyLightRecordMetadataToMeshParams(MeshParamsUniform& params, const std::vector<GpuLightRecord>& records, float totalWeight) {
+    params.lightCount = static_cast<uint32_t>(records.size());
+    params.emissiveTotalArea = totalWeight;
+    params.authoredLightOffset = params.lightCount;
+    params.authoredLightCount = 0u;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(records.size()); ++i) {
+        if (!isAuthoredGpuLightRecord(records[i])) {
+            continue;
+        }
+        if (params.authoredLightCount == 0u) {
+            params.authoredLightOffset = i;
+        }
+        ++params.authoredLightCount;
+    }
 }
 
 LightBvhPrimitive makeLightBvhPrimitive(const GpuLightRecord& record, uint32_t lightIndex) {
@@ -970,15 +1011,15 @@ LightBvhPrimitive makeLightBvhPrimitive(const GpuLightRecord& record, uint32_t l
     glm::vec3 boundsMin = center;
     glm::vec3 boundsMax = center;
 
-    if (type == 0u && glm::all(glm::greaterThanEqual(glm::vec3(record.data3), glm::vec3(record.data2)))) {
+    if (type == gpuLightTypeEmissiveTriangle && glm::all(glm::greaterThanEqual(glm::vec3(record.data3), glm::vec3(record.data2)))) {
         boundsMin = glm::vec3(record.data2);
         boundsMax = glm::vec3(record.data3);
         center = (boundsMin + boundsMax) * 0.5f;
-    } else if (type == 1u || type == 3u) {
+    } else if (type == gpuLightTypeEmissiveSphere || type == gpuLightTypePoint || type == gpuLightTypeSpot) {
         const float radius = std::max(record.data0.z, 0.001f);
         boundsMin = center - glm::vec3(radius);
         boundsMax = center + glm::vec3(radius);
-    } else if (type == 4u) {
+    } else if (type == gpuLightTypeArea) {
         const float halfSize = std::max(record.data0.z * 0.5f, 0.001f);
         boundsMin = center - glm::vec3(halfSize);
         boundsMax = center + glm::vec3(halfSize);
@@ -1042,7 +1083,7 @@ std::vector<GpuLightRecord> buildLightRecords(
             const float weight = area * std::max(luminance(emissive), 0.0001f);
             totalArea += weight;
             lights.push_back(GpuLightRecord{
-                .metadata = {0u, packedIndex, material, instanceIndex},
+                .metadata = {gpuLightTypeEmissiveTriangle, packedIndex, material, instanceIndex},
                 .data0 = {weight, totalArea, 0.0f, area},
                 .data1 = {centroid, 0.0f},
                 .data2 = {boundsMin, 0.0f},
@@ -1062,7 +1103,7 @@ std::vector<GpuLightRecord> buildLightRecords(
         const float weight = area * std::max(luminance(emissive), 0.0001f);
         totalArea += weight;
         lights.push_back(GpuLightRecord{
-            .metadata = {1u, sphereIndex, 0u, static_cast<uint32_t>(lights.size())},
+            .metadata = {gpuLightTypeEmissiveSphere, sphereIndex, 0u, static_cast<uint32_t>(lights.size())},
             .data0 = {weight, totalArea, sphere.w, area},
             .data1 = {glm::vec3(sphere), 0.0f},
         });
@@ -1081,19 +1122,44 @@ std::vector<GpuLightRecord> buildAuthoredLightRecords(const std::vector<SceneLig
     records.reserve(lights.size());
     for (uint32_t i = 0; i < lights.size(); ++i) {
         const SceneLightAsset& light = lights[i];
-        if (light.type == sceneLightTypeDirectional) {
-            continue;
-        }
         if (!light.enabled || light.intensity <= 0.0f || luminance(light.color) <= 0.0f) {
             continue;
         }
 
-        const glm::vec3 radiance = light.color * light.intensity;
-        const float size = std::max(light.sizeOrRadius, 0.0001f);
+        uint32_t type = gpuLightTypePoint;
+        switch (light.type) {
+        case sceneLightTypeDirectional:
+            type = gpuLightTypeDirectional;
+            break;
+        case sceneLightTypePoint:
+            type = gpuLightTypePoint;
+            break;
+        case sceneLightTypeArea:
+            type = gpuLightTypeArea;
+            break;
+        case sceneLightTypeSpot:
+            type = gpuLightTypeSpot;
+            break;
+        default:
+            type = gpuLightTypePoint;
+            break;
+        }
+
+        const float rawSize = light.sizeOrRadius;
+        float size = std::max(rawSize, 0.0001f);
+        if (type == gpuLightTypeDirectional) {
+            size = rawSize > 0.0f ? std::clamp(rawSize, 0.0001f, 0.08f) : 0.00465f;
+        }
+
+        glm::vec3 radiance = light.color * light.intensity;
+        if (type == gpuLightTypeDirectional) {
+            const float solidAngle = std::max(2.0f * 3.14159265358979323846f * (1.0f - std::cos(size)), 1.0e-8f);
+            radiance /= solidAngle;
+        }
+
         float weight = std::max(luminance(radiance), 0.0001f);
-        const uint32_t type = 2u + std::min(light.type, 2u);
-        const float area = type == 4u ? size * size : 0.0f;
-        if (type == 4u) {
+        const float area = type == gpuLightTypeArea ? size * size : 0.0f;
+        if (type == gpuLightTypeArea) {
             weight *= area;
         }
         totalWeight += weight;
@@ -1106,9 +1172,13 @@ std::vector<GpuLightRecord> buildAuthoredLightRecords(const std::vector<SceneLig
         GpuLightRecord record{};
         record.metadata = {type, i, 0u, 0u};
         record.data0 = {weight, totalWeight, size, area};
-        record.data1 = type == 2u ? glm::vec4(toLightDirection, normal.x) : glm::vec4(position, normal.x);
+        record.data1 = type == gpuLightTypeDirectional ? glm::vec4(toLightDirection, normal.x) : glm::vec4(position, normal.x);
         record.data2 = {radiance, normal.y};
-        record.data3 = {normal.z, 0.0f, 0.0f, 0.0f};
+        record.data3 = {
+            normal.z,
+            std::clamp(light.innerConeRadians, 0.0f, 3.14159265358979323846f),
+            std::clamp(light.outerConeRadians, 0.0f, 3.14159265358979323846f),
+            size};
         records.push_back(record);
     }
     return records;
@@ -1123,6 +1193,35 @@ std::vector<GpuLightRecord> combineLightRecords(const std::vector<GpuLightRecord
         totalWeight = runningWeight;
     }
     return records;
+}
+
+std::vector<glm::vec3> extractMaterialEmissive(const std::vector<glm::vec4>& materialData) {
+    std::vector<glm::vec3> emissive;
+    const size_t materialCount = materialData.size() / materialVec4Stride;
+    emissive.reserve(materialCount);
+    for (size_t i = 0; i < materialCount; ++i) {
+        emissive.push_back(glm::vec3(materialData[i * materialVec4Stride + 2u]));
+    }
+    return emissive;
+}
+
+std::vector<SceneLightAsset> cachedSceneLightAssets(const CachedScene& cached) {
+    std::vector<SceneLightAsset> lights;
+    lights.reserve(cached.sceneLights.size());
+    for (const CachedSceneLightData& source : cached.sceneLights) {
+        SceneLightAsset light;
+        light.type = source.type;
+        light.transform = source.transform;
+        light.color = source.color;
+        light.intensity = source.intensity;
+        light.sizeOrRadius = source.sizeOrRadius;
+        light.innerConeRadians = source.innerConeRadians;
+        light.outerConeRadians = source.outerConeRadians;
+        light.enabled = source.enabled != 0u;
+        light.nodeIndex = source.nodeIndex;
+        lights.push_back(light);
+    }
+    return lights;
 }
 
 } // namespace
@@ -1709,7 +1808,35 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         return false;
     }
     uploader.uploadToBuffer(*materials_, materialData.data(), byteSize);
+
+    materialEmissiveCpu_ = extractMaterialEmissive(materialData);
+    float emissiveTotalWeight = 0.0f;
+    if (rebuildEmissiveLightRecords(importedScene, emissiveTotalWeight)) {
+        float lightSelectionWeight = emissiveTotalWeight;
+        std::vector<GpuLightRecord> records = combineLightRecords(
+            emissiveLightRecords_,
+            importedScene.lights,
+            emissiveTotalWeight,
+            lightSelectionWeight);
+        uploadLightRecords(uploader, std::move(records), lightSelectionWeight);
+    }
     return true;
+}
+
+bool GpuScene::rebuildEmissiveLightRecords(const SceneAsset& scene, float& emissiveTotalWeight) {
+    emissiveTotalWeight = 0.0f;
+    if (meshRecordCpu_.empty() || instanceRecordCpu_.empty() || localTriangleDataCpu_.empty()) {
+        emissiveLightRecords_.clear();
+        return false;
+    }
+    emissiveLightRecords_ = buildLightRecords(
+        meshRecordCpu_,
+        instanceRecordCpu_,
+        localTriangleDataCpu_,
+        materialEmissiveCpu_,
+        sphereDataCpu_,
+        emissiveTotalWeight);
+    return !emissiveLightRecords_.empty() || !scene.lights.empty();
 }
 
 bool GpuScene::updateSceneLights(BufferUploader& uploader, const SceneAsset& scene, uint64_t retireFrame) {
@@ -1837,6 +1964,17 @@ bool GpuScene::updateInstanceTransforms(BufferUploader& uploader, const SceneAss
     if (meshParamsBuffer_) {
         meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
         meshParamsBuffer_->flush(sizeof(meshParams_));
+    }
+
+    float emissiveTotalWeight = 0.0f;
+    if (rebuildEmissiveLightRecords(scene, emissiveTotalWeight)) {
+        float lightSelectionWeight = emissiveTotalWeight;
+        std::vector<GpuLightRecord> records = combineLightRecords(
+            emissiveLightRecords_,
+            scene.lights,
+            emissiveTotalWeight,
+            lightSelectionWeight);
+        uploadLightRecords(uploader, std::move(records), lightSelectionWeight, retireFrame);
     }
     return true;
 }
@@ -2040,6 +2178,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
     float emissiveTotalArea = 0.0f;
     emissiveLightRecords_ = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
     const std::vector<GpuLightRecord> lightRecords = emissiveLightRecords_;
+    lightRecordCpu_ = lightRecords;
 
     meshParams_ = {
         .vertexCount = static_cast<uint32_t>(vertices.size()),
@@ -2060,12 +2199,17 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         .tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u),
         .tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size()),
     };
+    applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, emissiveTotalArea);
     std::cout << "Cornell scene: vertices=" << meshParams_.vertexCount
               << " triangles=" << meshParams_.triangleCount
               << " bvh_nodes=" << meshParams_.bvhNodeCount
               << " materials=" << meshParams_.materialCount << '\n';
     rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
     primitiveRecordCpu_ = primitiveRecords;
+    meshRecordCpu_ = meshRecords;
+    localTriangleDataCpu_ = localTriangleData;
+    materialEmissiveCpu_ = materialEmissive;
+    sphereDataCpu_ = sphereData;
     logRayTracingGeometryStats("Cornell scene", rayTracingGeometryStats_);
     opacityMicromapData_ = {};
 
@@ -2433,6 +2577,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     emissiveLightRecords_ = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
     float lightSelectionWeight = emissiveTotalArea;
     const std::vector<GpuLightRecord> lightRecords = combineLightRecords(emissiveLightRecords_, importedScene.lights, emissiveTotalArea, lightSelectionWeight);
+    lightRecordCpu_ = lightRecords;
     meshParams_ = {
         .vertexCount = static_cast<uint32_t>(localVertexData.size()),
         .triangleCount = localTriangleCursor,
@@ -2452,6 +2597,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         .tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u),
         .tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size()),
     };
+    applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     std::cout << "Imported scene GPU data: meshes=" << meshParams_.meshCount
               << " instances=" << meshParams_.instanceCount
               << " local_triangles=" << meshParams_.localTriangleCount
@@ -2459,6 +2605,10 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
               << " tlas_nodes=" << meshParams_.tlasNodeCount << '\n';
     rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
     primitiveRecordCpu_ = primitiveRecords;
+    meshRecordCpu_ = meshRecords;
+    localTriangleDataCpu_ = localTriangleData;
+    materialEmissiveCpu_ = materialEmissive;
+    sphereDataCpu_ = sphereData;
     logRayTracingGeometryStats("Imported scene", rayTracingGeometryStats_);
     opacityMicromapData_ = generateOpacityMicromapData(importedScene, assets, opacityMicromapSubdivisionLevel_);
     logOpacityMicromapPreprocessStats("Imported scene", opacityMicromapData_.stats);
@@ -2831,6 +2981,8 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         instanceBounds.push_back(rec);
     }
 
+    std::vector<GpuLightRecord> cachedLightRecords;
+    cachedLightRecords.reserve(cached.lightRecords.size());
     for (const auto& cachedLight : cached.lightRecords) {
         GpuLightRecord rec{};
         rec.metadata = cachedLight.metadata;
@@ -2838,9 +2990,23 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         rec.data1 = cachedLight.data1;
         rec.data2 = cachedLight.data2;
         rec.data3 = cachedLight.data3;
-        lightRecords.push_back(rec);
+        cachedLightRecords.push_back(rec);
     }
-    emissiveLightRecords_ = lightRecords;
+    emissiveLightRecords_.clear();
+    emissiveLightRecords_.reserve(cachedLightRecords.size());
+    for (const GpuLightRecord& record : cachedLightRecords) {
+        if (isEmissiveGpuLightRecord(record)) {
+            emissiveLightRecords_.push_back(record);
+        }
+    }
+    const float emissiveTotalWeight = emissiveLightRecords_.empty() ? 0.0f : emissiveLightRecords_.back().data0.y;
+    float lightSelectionWeight = emissiveTotalWeight;
+    lightRecords = combineLightRecords(
+        emissiveLightRecords_,
+        cachedSceneLightAssets(cached),
+        emissiveTotalWeight,
+        lightSelectionWeight);
+    lightRecordCpu_ = lightRecords;
 
     const std::vector<uint32_t> rtTriangleMaterialIds =
         buildRtTriangleMaterialIds(primitiveRecords, static_cast<uint32_t>(localIndices.size() / 3u));
@@ -2850,8 +3016,13 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     meshParams_.localIndexCount = static_cast<uint32_t>(localIndices.size());
     const std::vector<glm::vec4> materialData = buildCachedMaterialData(cached);
     meshParams_.materialCount = static_cast<uint32_t>(materialData.size() / materialVec4Stride);
+    applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
     primitiveRecordCpu_ = primitiveRecords;
+    meshRecordCpu_ = meshRecords;
+    localTriangleDataCpu_ = localTriangleData;
+    materialEmissiveCpu_ = extractMaterialEmissive(materialData);
+    sphereDataCpu_.clear();
     logRayTracingGeometryStats("Cached scene", rayTracingGeometryStats_);
     opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_);
     logOpacityMicromapPreprocessStats("Cached scene", opacityMicromapData_.stats);
@@ -2977,6 +3148,7 @@ void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLight
         lightRecords.push_back(GpuLightRecord{});
         totalWeight = 0.0f;
     }
+    lightRecordCpu_ = lightRecords;
 
     retireBuffer(uploadBuffer(
         allocator_,
@@ -2987,8 +3159,7 @@ void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLight
         sizeof(GpuLightRecord) * lightRecords.size(),
         "scene light records"), retireFrame);
 
-    meshParams_.lightCount = static_cast<uint32_t>(lightRecords.size());
-    meshParams_.emissiveTotalArea = totalWeight;
+    applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, totalWeight);
     if (meshParamsBuffer_) {
         meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
         meshParamsBuffer_->flush(sizeof(meshParams_));

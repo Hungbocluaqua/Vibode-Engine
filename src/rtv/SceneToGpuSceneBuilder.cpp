@@ -1,6 +1,7 @@
 #include "rtv/SceneToGpuSceneBuilder.h"
 
 #include "rtv/AssetManager.h"
+#include "rtv/SceneRenderSettingsSync.h"
 #include "rtv/SunController.h"
 
 #include <algorithm>
@@ -108,6 +109,7 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.environmentBackgroundIntensity = environment.backgroundIntensity;
     result.rendererSettings.renderResolutionScale = render.resolutionScale;
     SunController::applyToRendererSettings(document, result.rendererSettings);
+    applySceneWorldComponentsToRendererSettings(document, result.rendererSettings);
 
     const std::vector<const Entity*> entities = document.registry().entities();
     auto appendInstanceEntity = [&](uint32_t nodeIndex) {

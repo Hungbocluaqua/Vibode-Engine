@@ -3,6 +3,8 @@
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorCommands.h"
+#include "rtv/EditorPreferences.h"
+#include "rtv/EditorTransformUtils.h"
 #include "rtv/EditorUiStyle.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/SceneOperations.h"
@@ -45,7 +47,7 @@ glm::mat4 parentWorldMatrix(const SceneRegistry& registry, const Entity& entity)
     return parent != nullptr ? entityWorldMatrix(registry, *parent) : glm::mat4{1.0f};
 }
 
-void writeLocalTransformFromMatrix(Entity& entity, const glm::mat4& matrix) {
+void writeLocalTransformFromMatrix(Entity& entity, const glm::mat4& matrix, std::optional<glm::vec3> linkedScaleReference = std::nullopt) {
     glm::vec3 skew{};
     glm::vec4 perspective{};
     glm::quat orientation{};
@@ -56,7 +58,9 @@ void writeLocalTransformFromMatrix(Entity& entity, const glm::mat4& matrix) {
     }
     entity.transform.position = translation;
     entity.transform.rotationEuler = glm::eulerAngles(glm::normalize(orientation));
-    entity.transform.scale = scale;
+    entity.transform.scale = linkedScaleReference.has_value()
+        ? editorLinkedScaleFromReference(*linkedScaleReference, scale)
+        : scale;
     entity.transform.dirty = true;
 }
 
@@ -155,6 +159,94 @@ std::optional<ImVec2> projectViewToScreen(
     };
 }
 
+bool isNonMeshActor(const Entity& entity) {
+    return entity.camera.has_value() || entity.light.has_value() || entity.sun.has_value() ||
+        entity.environmentLight.has_value() || entity.skyAtmosphere.has_value() || entity.heightFog.has_value() ||
+        entity.volumetricCloud.has_value() || entity.postProcessVolume.has_value() || entity.cameraPostProcess.has_value();
+}
+
+const char* actorOverlayLabel(const Entity& entity) {
+    if (entity.camera.has_value()) return "Camera";
+    if (entity.sun.has_value()) return "Sun";
+    if (entity.light.has_value()) return "Light";
+    if (entity.environmentLight.has_value()) return "Environment";
+    if (entity.skyAtmosphere.has_value()) return "Sky";
+    if (entity.heightFog.has_value()) return "Fog";
+    if (entity.volumetricCloud.has_value()) return "Cloud";
+    if (entity.postProcessVolume.has_value()) return "Post";
+    if (entity.cameraPostProcess.has_value()) return "Camera FX";
+    return "Actor";
+}
+
+ImU32 actorOverlayColor(const Entity& entity, bool selected) {
+    const int alpha = selected ? 255 : 210;
+    if (entity.camera.has_value()) return IM_COL32(105, 180, 255, alpha);
+    if (entity.sun.has_value()) return IM_COL32(255, 213, 92, alpha);
+    if (entity.light.has_value()) return IM_COL32(255, 188, 78, alpha);
+    if (entity.environmentLight.has_value()) return IM_COL32(101, 204, 190, alpha);
+    if (entity.skyAtmosphere.has_value()) return IM_COL32(114, 169, 255, alpha);
+    if (entity.heightFog.has_value()) return IM_COL32(166, 196, 210, alpha);
+    if (entity.volumetricCloud.has_value()) return IM_COL32(190, 205, 225, alpha);
+    if (entity.postProcessVolume.has_value() || entity.cameraPostProcess.has_value()) return IM_COL32(206, 158, 255, alpha);
+    return IM_COL32(185, 195, 210, alpha);
+}
+
+std::optional<ImVec2> entityScreenCenter(
+    const EditorRuntimeState& state,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    const Entity& entity) {
+    constexpr float nearPlane = 0.01f;
+    const glm::mat4 world = entityWorldMatrix(state.sceneDocument->registry(), entity);
+    return projectViewToScreen(state, projection, glm::vec3(view * glm::vec4(glm::vec3(world[3]), 1.0f)), nearPlane);
+}
+
+bool screenPointInsideViewport(const EditorRuntimeState& state, ImVec2 point, float padding = 18.0f) {
+    return point.x >= state.viewport.imageOrigin.x - padding &&
+        point.y >= state.viewport.imageOrigin.y - padding &&
+        point.x <= state.viewport.imageOrigin.x + state.viewport.imageSize.x + padding &&
+        point.y <= state.viewport.imageOrigin.y + state.viewport.imageSize.y + padding;
+}
+
+void drawActorIcon(ImDrawList* drawList, EditorGlyphIcon icon, ImVec2 center, ImU32 color, bool selected) {
+    const float size = selected ? 25.0f : 21.0f;
+    const ImVec2 min(center.x - size * 0.5f, center.y - size * 0.5f);
+    const ImVec2 max(center.x + size * 0.5f, center.y + size * 0.5f);
+    drawList->AddRectFilled(min, max, selected ? IM_COL32(10, 15, 22, 235) : IM_COL32(10, 14, 20, 190), 4.0f);
+    drawList->AddRect(min, max, selected ? color : IM_COL32(75, 88, 105, 180), 4.0f, 0, selected ? 2.0f : 1.0f);
+    editorDrawIconGlyph(icon, ImVec2(min.x + 4.0f, min.y + 4.0f), ImVec2(max.x - 4.0f, max.y - 4.0f), color);
+}
+
+void drawActorIconsOverlay(const EditorRuntimeState& state, const EditorSelection& selection) {
+    if (state.sceneDocument == nullptr || state.camera == nullptr) {
+        return;
+    }
+    const glm::mat4 view = editorViewMatrix(*state.camera);
+    const glm::mat4 projection = editorProjectionMatrix(activeCameraFov(*state.sceneDocument), viewportAspect(state));
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    for (const Entity* entity : state.sceneDocument->registry().entities()) {
+        if (entity == nullptr || !entity->visible || !isNonMeshActor(*entity)) {
+            continue;
+        }
+        const std::optional<ImVec2> center = entityScreenCenter(state, view, projection, *entity);
+        if (!center.has_value() || !screenPointInsideViewport(state, *center)) {
+            continue;
+        }
+        const bool selected = selection.entityId() == entity->id;
+        drawActorIcon(drawList, editorGlyphForEntity(*entity), *center, actorOverlayColor(*entity, selected), selected);
+    }
+}
+
+void drawActorLabel(ImDrawList* drawList, const Entity& entity, ImVec2 center, ImU32 color) {
+    const std::string label = std::string(actorOverlayLabel(entity)) + (entity.name.empty() ? std::string{} : (": " + entity.name));
+    const ImVec2 textSize = ImGui::CalcTextSize(label.c_str());
+    const ImVec2 min(center.x + 16.0f, center.y - textSize.y * 0.5f - 4.0f);
+    const ImVec2 max(min.x + textSize.x + 10.0f, min.y + textSize.y + 8.0f);
+    drawList->AddRectFilled(min, max, IM_COL32(10, 14, 20, 220), 4.0f);
+    drawList->AddRect(min, max, color, 4.0f, 0, 1.0f);
+    drawList->AddText(ImVec2(min.x + 5.0f, min.y + 4.0f), IM_COL32(220, 228, 238, 255), label.c_str());
+}
+
 void drawSelectedLightOverlay(
     const EditorRuntimeState& state,
     const glm::mat4& view,
@@ -216,6 +308,120 @@ void drawSelectedLightOverlay(
     }
 }
 
+void drawSelectedCameraOverlay(
+    const EditorRuntimeState& state,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    const Entity& entity) {
+    if (!entity.camera.has_value()) {
+        return;
+    }
+    constexpr float nearPlane = 0.01f;
+    const glm::mat4 world = entityWorldMatrix(state.sceneDocument->registry(), entity);
+    const glm::vec3 center = glm::vec3(world[3]);
+    const glm::mat3 basis(world);
+    const glm::vec3 forward = glm::normalize(basis * glm::vec3(0.0f, 0.0f, -1.0f));
+    const glm::vec3 right = glm::normalize(basis * glm::vec3(1.0f, 0.0f, 0.0f));
+    const glm::vec3 up = glm::normalize(basis * glm::vec3(0.0f, 1.0f, 0.0f));
+    const float distance = 1.0f;
+    const float halfHeight = std::tan(entity.camera->verticalFovRadians * 0.5f) * distance;
+    const float halfWidth = halfHeight * viewportAspect(state);
+    const glm::vec3 farCenter = center + forward * distance;
+    const std::array<glm::vec3, 4> corners{
+        farCenter + right * halfWidth + up * halfHeight,
+        farCenter - right * halfWidth + up * halfHeight,
+        farCenter - right * halfWidth - up * halfHeight,
+        farCenter + right * halfWidth - up * halfHeight,
+    };
+    const std::optional<ImVec2> screenCenter = projectViewToScreen(state, projection, glm::vec3(view * glm::vec4(center, 1.0f)), nearPlane);
+    if (!screenCenter.has_value()) {
+        return;
+    }
+    std::array<ImVec2, 4> screenCorners{};
+    bool valid = true;
+    for (size_t i = 0; i < corners.size(); ++i) {
+        const std::optional<ImVec2> screen = projectViewToScreen(state, projection, glm::vec3(view * glm::vec4(corners[i], 1.0f)), nearPlane);
+        if (!screen.has_value()) {
+            valid = false;
+            break;
+        }
+        screenCorners[i] = *screen;
+    }
+    if (!valid) {
+        return;
+    }
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImU32 color = actorOverlayColor(entity, true);
+    drawList->AddPolyline(screenCorners.data(), static_cast<int>(screenCorners.size()), color, ImDrawFlags_Closed, 2.0f);
+    for (const ImVec2& corner : screenCorners) {
+        drawList->AddLine(*screenCenter, corner, IM_COL32(105, 180, 255, 150), 1.5f);
+    }
+    drawActorLabel(drawList, entity, *screenCenter, color);
+}
+
+void drawSelectedDirectionalOverlay(
+    const EditorRuntimeState& state,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    const Entity& entity) {
+    if (!entity.sun.has_value()) {
+        return;
+    }
+    constexpr float nearPlane = 0.01f;
+    const glm::mat4 world = entityWorldMatrix(state.sceneDocument->registry(), entity);
+    const glm::vec3 center = glm::vec3(world[3]);
+    const glm::vec3 direction = glm::normalize(glm::mat3(world) * glm::vec3(0.0f, 0.0f, -1.0f));
+    const std::optional<ImVec2> start = projectViewToScreen(state, projection, glm::vec3(view * glm::vec4(center, 1.0f)), nearPlane);
+    const std::optional<ImVec2> end = projectViewToScreen(state, projection, glm::vec3(view * glm::vec4(center + direction * 2.0f, 1.0f)), nearPlane);
+    if (!start.has_value()) {
+        return;
+    }
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImU32 color = actorOverlayColor(entity, true);
+    drawList->AddCircle(*start, 12.0f, color, 28, 2.0f);
+    if (end.has_value()) {
+        drawList->AddLine(*start, *end, color, 2.0f);
+        drawList->AddCircleFilled(*end, 4.0f, color, 16);
+    }
+    drawActorLabel(drawList, entity, *start, color);
+}
+
+void drawSelectedWorldEffectOverlay(
+    const EditorRuntimeState& state,
+    const glm::mat4& view,
+    const glm::mat4& projection,
+    const Entity& entity) {
+    if (!entity.environmentLight.has_value() && !entity.skyAtmosphere.has_value() && !entity.heightFog.has_value() &&
+        !entity.volumetricCloud.has_value() && !entity.postProcessVolume.has_value() && !entity.cameraPostProcess.has_value()) {
+        return;
+    }
+    const std::optional<ImVec2> center = entityScreenCenter(state, view, projection, entity);
+    if (!center.has_value()) {
+        return;
+    }
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImU32 color = actorOverlayColor(entity, true);
+    if (entity.environmentLight.has_value() || entity.skyAtmosphere.has_value()) {
+        drawList->AddCircle(*center, 19.0f, color, 36, 2.0f);
+        drawList->AddCircle(*center, 27.0f, IM_COL32(114, 169, 255, 90), 40, 1.0f);
+    }
+    if (entity.heightFog.has_value()) {
+        for (int i = -1; i <= 1; ++i) {
+            drawList->AddLine(ImVec2(center->x - 28.0f, center->y + static_cast<float>(i) * 7.0f), ImVec2(center->x + 28.0f, center->y + static_cast<float>(i) * 7.0f), color, 1.5f);
+        }
+    }
+    if (entity.volumetricCloud.has_value()) {
+        drawList->AddCircle(ImVec2(center->x - 9.0f, center->y + 2.0f), 11.0f, color, 24, 2.0f);
+        drawList->AddCircle(ImVec2(center->x + 4.0f, center->y - 4.0f), 14.0f, color, 24, 2.0f);
+        drawList->AddCircle(ImVec2(center->x + 17.0f, center->y + 3.0f), 9.0f, color, 24, 2.0f);
+    }
+    if (entity.postProcessVolume.has_value() || entity.cameraPostProcess.has_value()) {
+        drawList->AddRect(ImVec2(center->x - 24.0f, center->y - 18.0f), ImVec2(center->x + 24.0f, center->y + 18.0f), color, 5.0f, 0, 2.0f);
+        drawList->AddRect(ImVec2(center->x - 30.0f, center->y - 24.0f), ImVec2(center->x + 30.0f, center->y + 24.0f), IM_COL32(206, 158, 255, 95), 5.0f, 0, 1.0f);
+    }
+    drawActorLabel(drawList, entity, *center, color);
+}
+
 void drawSelectionOverlay(const EditorRuntimeState& state, const EditorSelection& selection) {
     if (state.sceneDocument == nullptr || state.camera == nullptr || !selection.entityId().valid()) {
         return;
@@ -229,6 +435,13 @@ void drawSelectionOverlay(const EditorRuntimeState& state, const EditorSelection
     if (entity->light.has_value()) {
         drawSelectedLightOverlay(state, view, projection, *entity);
     }
+    if (entity->camera.has_value()) {
+        drawSelectedCameraOverlay(state, view, projection, *entity);
+    }
+    if (entity->sun.has_value()) {
+        drawSelectedDirectionalOverlay(state, view, projection, *entity);
+    }
+    drawSelectedWorldEffectOverlay(state, view, projection, *entity);
 }
 
 void drawGridOverlay(const EditorRuntimeState& state, const CameraController& camera) {
@@ -459,7 +672,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 selection.clear();
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::Reset, "Reset Transform", editableSelection)) {
-                Transform reset{};
+                Transform reset = selectedEntity->defaultTransform;
                 reset.dirty = true;
                 const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *selectedEntity);
                 requests.setEntityTransform = EditorEntityTransformChange{
@@ -472,15 +685,15 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             ImGui::Separator();
             if (editorGlyphMenuItem(EditorGlyphIcon::Entity, "Create Empty Here")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty};
-                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                requests.sceneUpdate = SceneUpdateKind::None;
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::Camera, "Create Camera Here")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera};
-                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                requests.sceneUpdate = SceneUpdateKind::CameraOnly;
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Create Light Here")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
-                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
             }
             editorGlyphMenuItem(EditorGlyphIcon::Add, "Drop prefab here", false);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
@@ -551,6 +764,21 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         toolButton(EditorGlyphIcon::Rotate, "ViewportRotate", EditorCommandId::ViewportRotate, transformGizmoMode_ == 1);
         toolButton(EditorGlyphIcon::Scale, "ViewportScale", EditorCommandId::ViewportScale, transformGizmoMode_ == 2);
         toolButton(localGizmoMode_ ? EditorGlyphIcon::LocalSpace : EditorGlyphIcon::WorldSpace, "ViewportSpace", EditorCommandId::ViewportToggleLocal, localGizmoMode_);
+        if (state.editorPrefs != nullptr && selection.entityId().valid() && transformGizmoMode_ == 2) {
+            const bool linkedScale = state.editorPrefs->linkedScale;
+            const bool pressed = editorIconButton(
+                "ViewportLinkedScale",
+                linkedScale ? EditorGlyphIcon::Lock : EditorGlyphIcon::Unlock,
+                linkedScale);
+            viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Linked Scale");
+            }
+            if (pressed) {
+                state.editorPrefs->linkedScale = !linkedScale;
+            }
+            ImGui::SameLine();
+        }
         toolButton(EditorGlyphIcon::Snap, "ViewportSnap", EditorCommandId::ViewportToggleSnap, snap_.enabled);
         toolButton(EditorGlyphIcon::Grid, "ViewportGrid", EditorCommandId::ViewportToggleGrid, showGrid_);
         toolButton(EditorGlyphIcon::Axes, "ViewportAxes", EditorCommandId::ViewportToggleAxes, showAxes_);
@@ -736,14 +964,11 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             ImGui::SeparatorText("Draw Layers");
             ImGui::Checkbox("Grid", &showGrid_);
             ImGui::Checkbox("Axes", &showAxes_);
+            ImGui::Checkbox("Actor icons", &showActorIcons_);
             ImGui::Checkbox("Selection overlay", &showSelectionOverlay_);
             ImGui::BeginDisabled();
             bool meshBounds = false;
-            bool cameraFrustum = false;
-            bool lightInfluence = false;
             ImGui::Checkbox("Mesh bounds", &meshBounds);
-            ImGui::Checkbox("Camera frustum", &cameraFrustum);
-            ImGui::Checkbox("Light influence", &lightInfluence);
             ImGui::EndDisabled();
             ImGui::SeparatorText("Active Debug View");
             ImGui::TextWrapped("%s", rendererDebugViewName(settings.debugView));
@@ -753,6 +978,10 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         ImGui::PopStyleVar(3);
 
         lastSampleCount_ = state.renderer.sampleCount();
+
+        if (showActorIcons_) {
+            drawActorIconsOverlay(state, selection);
+        }
 
         if (showSelectionOverlay_) {
             drawSelectionOverlay(state, selection);
@@ -802,15 +1031,29 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                     const bool isUsing = ImGuizmo::IsUsing();
                     gizmoHoveredOrUsing = isOver || isUsing;
 
-                    if (isUsing && gizmoState_ == GizmoInteractionState::Idle) {
+                    if (isUsing && (!gizmoDragActive_ || gizmoDragEntity_ != entity->id)) {
                         gizmoDragActive_ = true;
+                        gizmoDragModified_ = false;
                         gizmoDragEntity_ = entity->id;
                         gizmoDragOriginal_ = entity->transform;
+                        gizmoDragParentWorld_ = parentWorldMatrix(state.sceneDocument->registry(), *entity);
+                        gizmoDragOriginalWorld_ = previousWorld;
                     }
 
                     if (manipulated && world != previousWorld) {
-                        const glm::mat4 local = glm::inverse(parentWorldMatrix(state.sceneDocument->registry(), *entity)) * world;
-                        writeLocalTransformFromMatrix(*entity, local);
+                        const glm::mat4 parentWorld = gizmoDragActive_ && gizmoDragEntity_ == entity->id
+                            ? gizmoDragParentWorld_
+                            : parentWorldMatrix(state.sceneDocument->registry(), *entity);
+                        const glm::mat4 local = glm::inverse(parentWorld) * world;
+                        const bool linkedScale = state.editorPrefs != nullptr && state.editorPrefs->linkedScale;
+                        const std::optional<glm::vec3> linkedScaleReference =
+                            operation == ImGuizmo::SCALE && linkedScale && gizmoDragActive_ && gizmoDragEntity_ == entity->id
+                                ? std::optional<glm::vec3>{gizmoDragOriginal_.scale}
+                                : std::nullopt;
+                        writeLocalTransformFromMatrix(*entity, local, linkedScaleReference);
+                        if (gizmoDragActive_ && gizmoDragEntity_ == entity->id) {
+                            gizmoDragModified_ = true;
+                        }
                         const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *entity);
                         state.sceneDocument->markDirty(updateKind);
                         requests.sceneUpdate = updateKind;
@@ -886,7 +1129,7 @@ void ViewportPanel::commitGizmoDrag(EditorRequests& requests, SceneDocument& doc
         return;
     }
     Entity* entity = document.registry().entity(gizmoDragEntity_);
-    if (entity != nullptr) {
+    if (entity != nullptr && gizmoDragModified_) {
         const Transform finalTransform = entity->transform;
         const SceneUpdateKind updateKind = transformUpdateKind(document, *entity);
         document.markDirty(updateKind);
@@ -898,8 +1141,11 @@ void ViewportPanel::commitGizmoDrag(EditorRequests& requests, SceneDocument& doc
         };
     }
     gizmoDragActive_ = false;
+    gizmoDragModified_ = false;
     gizmoDragEntity_ = {};
     gizmoDragOriginal_ = {};
+    gizmoDragParentWorld_ = glm::mat4{1.0f};
+    gizmoDragOriginalWorld_ = glm::mat4{1.0f};
 }
 
 void ViewportPanel::abortGizmoDrag() {
@@ -907,8 +1153,11 @@ void ViewportPanel::abortGizmoDrag() {
         return;
     }
     gizmoDragActive_ = false;
+    gizmoDragModified_ = false;
     gizmoDragEntity_ = {};
     gizmoDragOriginal_ = {};
+    gizmoDragParentWorld_ = glm::mat4{1.0f};
+    gizmoDragOriginalWorld_ = glm::mat4{1.0f};
 }
 
 void ViewportPanel::executeCommand(EditorCommandId id) {

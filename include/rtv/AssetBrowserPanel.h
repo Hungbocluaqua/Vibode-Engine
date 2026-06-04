@@ -20,6 +20,7 @@ class AssetBrowserPanel {
 public:
     void draw(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests);
     void invalidateThumbnails();
+    bool openSelectedAsset(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests);
 
 private:
     struct CpuThumbnail {
@@ -89,6 +90,17 @@ private:
     std::array<char, 512> importSourcePath_{};
     std::array<char, 256> importDestinationFolder_{};
     std::array<char, 128> search_{};
+    std::array<char, 128> replaceReferenceGuid_{};
+    std::array<char, 256> assetTagsBuffer_{};
+    std::array<char, 128> registryTagFilter_{};
+    std::array<char, 128> bulkTagBuffer_{};
+    std::array<char, 128> collectionNameBuffer_{};
+    AssetGuid assetTagsBufferGuid_;
+    int registryTypeFilter_ = 0;
+    int registryStatusFilter_ = 0;
+    int registryHealthFilter_ = 0;
+    int registryCollectionFilter_ = 0;
+    int registryFavoriteFilter_ = 0;
     std::string status_;
     std::filesystem::path browserRoot_;
     std::filesystem::path contentRoot_;
@@ -108,6 +120,7 @@ private:
     AssetImportSettings importSettings_{};
     std::unordered_map<std::string, CpuThumbnail> thumbnailCache_;
     std::unordered_map<std::string, SourcePreview> sourcePreviewCache_;
+    std::unordered_map<std::string, std::string> sourceControlStatusCache_;
     std::vector<ImportOperation> importOperations_;
     uint64_t nextImportOperationId_ = 1;
 };

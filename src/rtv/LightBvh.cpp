@@ -313,14 +313,18 @@ std::vector<glm::vec4> packLightBvhNodesForGpu(const std::vector<LightBvhNode>& 
     for (const LightBvhNode& node : nodes) {
         packed.push_back({node.boundsMin, node.totalPower});
         if (node.lightIndex >= 0) {
+            // Leaves are forced to a single light for explicit primitive builds. Use the
+            // remaining 31 bits for the original light-record index so large imported
+            // emissive scenes do not alias many lights onto the same low index.
             uint32_t leafInfo = (1u << 31u) |
-                (static_cast<uint32_t>(node.lightIndex) & 0x7fffu) |
-                ((node.lightCount & 0x3fffu) << 16u);
+                (static_cast<uint32_t>(node.lightIndex) & 0x7fffffffu);
             float w;
             std::memcpy(&w, &leafInfo, sizeof(float));
             packed.push_back({node.boundsMax, w});
         } else {
-            uint32_t innerInfo = (node.childCount & 0xffffu) | ((node.childOffset & 0xffffu) << 16u);
+            // Inner nodes are binary, so child count is implicit on the GPU. Preserve a
+            // 31-bit child offset instead of truncating large light BVHs to 16 bits.
+            uint32_t innerInfo = node.childOffset & 0x7fffffffu;
             float w;
             std::memcpy(&w, &innerInfo, sizeof(float));
             packed.push_back({node.boundsMax, w});

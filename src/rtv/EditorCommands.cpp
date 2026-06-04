@@ -155,11 +155,15 @@ const CommandRegistry& defaultEditorCommandRegistry() {
         };
 
         add(EditorCommandId::ProjectManager, "Project Manager", "Project", "Open the Project Manager window");
+        add(EditorCommandId::ProjectSettings, "Project Settings", "Project", "Open project settings in the Project Manager");
         add(EditorCommandId::CloseProject, "Close Project", "Project", "Close the current project");
         add(EditorCommandId::NewScene, "New Scene", "Scene", "Create a new scene");
         add(EditorCommandId::OpenScene, "Open Scene", "Scene", "Open an rtlevel scene", ctrlKey(GLFW_KEY_O, ImGuiKey_O, "Ctrl+O"));
         add(EditorCommandId::SaveScene, "Save Scene", "Scene", "Save the current scene", ctrlKey(GLFW_KEY_S, ImGuiKey_S, "Ctrl+S"));
         add(EditorCommandId::SaveSceneAs, "Save Scene As", "Scene", "Save the current scene to a new path");
+        add(EditorCommandId::SaveAll, "Save All", "Project", "Save the current level, project metadata, asset registry, and editor preferences", ctrlShiftKey(GLFW_KEY_S, ImGuiKey_S, "Ctrl+Shift+S"));
+        add(EditorCommandId::OpenProjectDirectory, "Open Current Project Directory", "Project", "Reveal the current project root folder");
+        add(EditorCommandId::OpenAsset, "Open Asset", "Asset", "Open or reveal the selected asset in the Content Browser");
         add(EditorCommandId::ImportAsset, "Import Asset", "Import", "Import reusable assets without mutating the scene");
         add(EditorCommandId::ImportAndPlace, "Import and Place", "Import", "Import assets and place the generated prefab");
         add(EditorCommandId::ImportSceneAsNewScene, "Import Scene as New Scene", "Import", "Replace the current scene with an imported model hierarchy");
@@ -182,6 +186,7 @@ const CommandRegistry& defaultEditorCommandRegistry() {
         add(EditorCommandId::ReloadShaders, "Reload Shaders", "Engine", "Reload renderer shaders", ctrlKey(GLFW_KEY_R, ImGuiKey_R, "Ctrl+R"));
         add(EditorCommandId::ShowControls, "Controls", "Engine", "Show controls reference");
         add(EditorCommandId::ShowRendererInfo, "Renderer Info", "Engine", "Show renderer information");
+        add(EditorCommandId::JobCenter, "Job Center", "Window", "Show running editor jobs and recent job state");
         add(EditorCommandId::CommandPalette, "Command Palette", "Window", "Search and execute editor commands", ctrlShiftKey(GLFW_KEY_P, ImGuiKey_P, "Ctrl+Shift+P"));
 
         add(EditorCommandId::ResetAccumulation, "Reset Accumulation", "Render", "Reset path tracing accumulation", key(GLFW_KEY_R, ImGuiKey_R, "R"));
@@ -209,6 +214,7 @@ const CommandRegistry& defaultEditorCommandRegistry() {
         add(EditorCommandId::RenderCurrentViewport, "Render current viewport", "Render", "Render the current viewport to the render output folder");
         add(EditorCommandId::RenderImage, "Render image", "Render", "Open the still-image render workflow");
         add(EditorCommandId::RenderSequence, "Render sequence", "Render", "Render the current timeline range as an image sequence");
+        add(EditorCommandId::Screenshot, "Screenshot", "Render", "Capture the current viewport to a PNG in the render output folder");
         add(EditorCommandId::StopRender, "Stop render", "Render", "Cancel the active editor render job");
         add(EditorCommandId::OpenOutputFolder, "Open Output Folder", "Render", "Open the editor render output folder");
 

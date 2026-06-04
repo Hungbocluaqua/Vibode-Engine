@@ -174,6 +174,8 @@ struct SceneLightAsset {
     glm::vec3 color{1.0f};
     float intensity = 1.0f;
     float sizeOrRadius = 1.0f;
+    float innerConeRadians = 0.35f;
+    float outerConeRadians = 0.70f;
     bool enabled = true;
     int32_t nodeIndex = -1;
 };

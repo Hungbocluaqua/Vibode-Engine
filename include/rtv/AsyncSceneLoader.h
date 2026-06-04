@@ -5,6 +5,7 @@
 #include "rtv/SceneDocument.h"
 
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <future>
 #include <memory>
@@ -34,6 +35,7 @@ enum class SceneLoadStatus {
 
 struct SceneLoadRequest {
     SceneLoadMode mode = SceneLoadMode::OpenRtLevel;
+    uint64_t serial = 0;
     std::filesystem::path sourcePath;
     std::optional<ProjectContext> projectSnapshot;
     bool preserveHierarchy = true;
@@ -45,6 +47,7 @@ struct SceneLoadRequest {
 
 struct SceneLoadResult {
     SceneLoadMode mode = SceneLoadMode::OpenRtLevel;
+    uint64_t serial = 0;
     std::filesystem::path sourcePath;
     bool success = false;
     bool cancelled = false;

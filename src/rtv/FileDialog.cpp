@@ -60,9 +60,33 @@ std::optional<std::filesystem::path> openGltfFileDialog() {
 #endif
 }
 
+std::optional<std::filesystem::path> openImportAssetFileDialog() {
+#if defined(_WIN32)
+    return openFileDialog(
+        L"Import Asset",
+        L"Importable assets (*.gltf;*.glb;*.obj;*.mtl;*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.dds;*.ktx;*.ktx2;*.hdr;*.exr)\0*.gltf;*.glb;*.obj;*.mtl;*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.dds;*.ktx;*.ktx2;*.hdr;*.exr\0"
+        L"glTF models (*.gltf;*.glb)\0*.gltf;*.glb\0"
+        L"OBJ models (*.obj)\0*.obj\0"
+        L"MTL material libraries (*.mtl)\0*.mtl\0"
+        L"Textures (*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.dds;*.ktx;*.ktx2)\0*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.dds;*.ktx;*.ktx2\0"
+        L"HDR environments (*.hdr;*.exr)\0*.hdr;*.exr\0"
+        L"All files (*.*)\0*.*\0\0");
+#else
+    return std::nullopt;
+#endif
+}
+
+std::optional<std::filesystem::path> openTextureFileDialog() {
+#if defined(_WIN32)
+    return openFileDialog(L"Import Texture", L"Textures (*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.dds;*.ktx;*.ktx2)\0*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.dds;*.ktx;*.ktx2\0All files (*.*)\0*.*\0\0");
+#else
+    return std::nullopt;
+#endif
+}
+
 std::optional<std::filesystem::path> openHdrFileDialog() {
 #if defined(_WIN32)
-    return openFileDialog(L"Open HDR Environment", L"HDR environments (*.hdr)\0*.hdr\0All files (*.*)\0*.*\0\0");
+    return openFileDialog(L"Import HDR Environment", L"HDR environments (*.hdr;*.exr)\0*.hdr;*.exr\0All files (*.*)\0*.*\0\0");
 #else
     return std::nullopt;
 #endif

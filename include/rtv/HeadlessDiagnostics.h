@@ -3,6 +3,7 @@
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -256,6 +257,30 @@ struct ProfileReport {
         uint32_t blasBlendedGeometryCount = 0;
         uint32_t blasOpacityMicromapGeometryCount = 0;
     } rayTracingGeometry{};
+
+    struct SceneLightReport {
+        struct Sample {
+            uint32_t recordIndex = 0;
+            uint32_t type = 0;
+            uint32_t sourceIndex = 0;
+            std::array<float, 3> positionOrDirection{0.0f, 0.0f, 0.0f};
+            float radiusOrSize = 0.0f;
+            float weight = 0.0f;
+        };
+
+        uint32_t recordCount = 0;
+        uint32_t emissiveCount = 0;
+        uint32_t authoredCount = 0;
+        uint32_t directionalCount = 0;
+        uint32_t pointCount = 0;
+        uint32_t areaCount = 0;
+        uint32_t spotCount = 0;
+        uint32_t authoredPositionalCount = 0;
+        uint32_t authoredDistinctPositionCount = 0;
+        bool authoredPositionsCollapsed = false;
+        std::vector<Sample> emissiveSamples;
+        std::vector<Sample> authoredSamples;
+    } sceneLights{};
 
     struct WavefrontQueueReport {
         bool buffersAllocated = false;

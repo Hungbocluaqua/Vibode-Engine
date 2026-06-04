@@ -93,18 +93,22 @@ void NotificationManager::draw() {
 
     const float width = 360.0f;
     const float padding = 12.0f;
-    float y = viewport->WorkPos.y + padding;
+    float bottomY = viewport->WorkPos.y + viewport->WorkSize.y - padding;
     int visible = 0;
-    for (auto it = active_.rbegin(); it != active_.rend() && visible < maxVisible_; ++it, ++visible) {
-        const Notification& notification = *it;
+    for (int index = static_cast<int>(active_.size()) - 1; index >= 0 && visible < maxVisible_; --index, ++visible) {
+        const Notification& notification = active_[static_cast<size_t>(index)];
         const float fadeIn = std::min(notification.ageSeconds / 0.15f, 1.0f);
         const float fadeOut = std::min((notification.durationSeconds - notification.ageSeconds) / 0.35f, 1.0f);
         const float alpha = std::clamp(std::min(fadeIn, fadeOut), 0.0f, 1.0f);
         ImGui::SetNextWindowBgAlpha(0.88f * alpha);
-        ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - width - padding, y), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(
+            ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - padding, bottomY),
+            ImGuiCond_Always,
+            ImVec2(1.0f, 1.0f));
         ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
 
         const std::string id = "##notification_" + std::to_string(visible);
+        bool close = false;
         ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
             ImGuiWindowFlags_AlwaysAutoResize |
             ImGuiWindowFlags_NoSavedSettings |
@@ -118,7 +122,11 @@ void NotificationManager::draw() {
             drawList->AddRectFilled(min, ImVec2(min.x + 4.0f, max.y), colorForType(notification.type));
             ImGui::Dummy(ImVec2(0.0f, 2.0f));
             ImGui::Indent(10.0f);
+            ImGui::BeginGroup();
             ImGui::TextWrapped("%s", notification.message.c_str());
+            ImGui::EndGroup();
+            ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 18.0f);
+            close = ImGui::SmallButton("x");
             if (notification.action != NotificationAction::None && !notification.actionLabel.empty()) {
                 if (ImGui::SmallButton(notification.actionLabel.c_str())) {
                     requestedAction_ = notification.action;
@@ -127,8 +135,11 @@ void NotificationManager::draw() {
             ImGui::Unindent(10.0f);
             ImGui::Dummy(ImVec2(0.0f, 2.0f));
         }
-        y += ImGui::GetWindowHeight() + 8.0f;
+        bottomY -= ImGui::GetWindowHeight() + 8.0f;
         ImGui::End();
+        if (close) {
+            active_.erase(active_.begin() + index);
+        }
     }
 }
 

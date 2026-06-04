@@ -1678,6 +1678,22 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     if (next.homogeneousVolumeScattering + next.homogeneousVolumeAbsorption <= 1.0e-8f) {
         next.homogeneousVolumeEnabled = false;
     }
+    next.heightFogDensity = std::clamp(
+        std::isfinite(next.heightFogDensity) ? next.heightFogDensity : 0.0f,
+        0.0f,
+        1.0f);
+    next.heightFogHeightFalloff = std::clamp(
+        std::isfinite(next.heightFogHeightFalloff) ? next.heightFogHeightFalloff : 5.0f,
+        0.001f,
+        100000.0f);
+    next.heightFogColor = glm::vec3{
+        std::isfinite(next.heightFogColor.r) ? next.heightFogColor.r : 0.65f,
+        std::isfinite(next.heightFogColor.g) ? next.heightFogColor.g : 0.72f,
+        std::isfinite(next.heightFogColor.b) ? next.heightFogColor.b : 0.85f};
+    next.heightFogColor = glm::clamp(next.heightFogColor, glm::vec3{0.0f}, glm::vec3{16.0f});
+    if (next.heightFogDensity <= 1.0e-8f) {
+        next.heightFogEnabled = false;
+    }
     next.indirectStrength = std::max(0.0f, next.indirectStrength);
     next.environmentIntensity = std::max(0.0f, next.environmentIntensity);
     next.environmentBackgroundIntensity = std::max(0.0f, next.environmentBackgroundIntensity);
@@ -1843,6 +1859,10 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.mieScaleHeight - settings_.mieScaleHeight) > 0.5f ||
         std::abs(next.mieAnisotropy - settings_.mieAnisotropy) > 0.0001f ||
         std::abs(next.groundAlbedo - settings_.groundAlbedo) > 0.0001f ||
+        next.heightFogEnabled != settings_.heightFogEnabled ||
+        std::abs(next.heightFogDensity - settings_.heightFogDensity) > 0.000001f ||
+        std::abs(next.heightFogHeightFalloff - settings_.heightFogHeightFalloff) > 0.0001f ||
+        glm::length(next.heightFogColor - settings_.heightFogColor) > 0.0001f ||
         std::abs(next.physicalAperture - settings_.physicalAperture) > 0.0001f ||
         std::abs(next.physicalShutterSeconds - settings_.physicalShutterSeconds) > 0.000001f ||
         std::abs(next.physicalIso - settings_.physicalIso) > 0.0001f ||
@@ -4181,7 +4201,10 @@ void PathTracerRenderer::updateCamera() {
     fogParams_.width = renderExtent_.width;
     fogParams_.height = renderExtent_.height;
     fogParams_.debugView = debugParams_.view;
-    fogParams_.enabled = settings_.pathTracingEnabled ? 1u : 0u;
+    fogParams_.enabled = settings_.pathTracingEnabled && settings_.heightFogEnabled ? 1u : 0u;
+    fogParams_.density = settings_.heightFogDensity;
+    fogParams_.heightFalloff = settings_.heightFogHeightFalloff;
+    fogParams_.color = glm::vec4(settings_.heightFogColor, 0.0f);
     frameUniforms.write(&fogParams_, sizeof(fogParams_), kFrameFogParamsOffset);
     frameUniforms.flush(sizeof(fogParams_), kFrameFogParamsOffset);
 

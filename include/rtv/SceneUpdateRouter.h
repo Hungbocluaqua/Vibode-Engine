@@ -3,6 +3,8 @@
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/SceneComponents.h"
 
+#include <string>
+
 namespace rtv {
 
 enum class SceneUpdateGpuAction : uint8_t {
@@ -17,9 +19,12 @@ enum class SceneUpdateGpuAction : uint8_t {
     ApplyRendererSettings,
 };
 
+using SceneUpdateGpuActionMask = uint32_t;
+
 struct SceneUpdateRoute {
     SceneUpdateKind kind = SceneUpdateKind::None;
     SceneUpdateGpuAction action = SceneUpdateGpuAction::None;
+    SceneUpdateGpuActionMask actionMask = 0u;
     AccumulationResetReason resetReason = AccumulationResetReason::Manual;
     bool requiresGpuSceneBuild = false;
     bool requiresRendererRebuild = false;
@@ -29,6 +34,7 @@ struct SceneUpdateRoute {
 class SceneUpdateRouter {
 public:
     [[nodiscard]] static SceneUpdateRoute route(SceneUpdateKind kind);
+    [[nodiscard]] static SceneUpdateRoute route(SceneUpdateMask mask);
 
     [[nodiscard]] const char* lastUpdateKindName() const { return sceneUpdateKindName(lastKind_); }
     [[nodiscard]] SceneUpdateKind lastUpdateKind() const { return lastKind_; }
@@ -45,5 +51,8 @@ private:
 };
 
 [[nodiscard]] const char* sceneUpdateGpuActionName(SceneUpdateGpuAction action);
+[[nodiscard]] SceneUpdateGpuActionMask sceneUpdateGpuActionBit(SceneUpdateGpuAction action);
+[[nodiscard]] bool sceneUpdateRouteHasAction(const SceneUpdateRoute& route, SceneUpdateGpuAction action);
+[[nodiscard]] std::string sceneUpdateGpuActionMaskName(SceneUpdateGpuActionMask mask);
 
 } // namespace rtv

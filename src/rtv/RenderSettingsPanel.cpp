@@ -1,6 +1,7 @@
 #include "rtv/RenderSettingsPanel.h"
 
 #include "rtv/EditorUiStyle.h"
+#include "rtv/SceneRenderSettingsSync.h"
 #include "rtv/SunController.h"
 #include "rtv/VulkanContext.h"
 
@@ -126,6 +127,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.environmentIntensity = environment.intensity;
         settings.environmentRotation = environment.rotation;
         settings.environmentBackgroundIntensity = environment.backgroundIntensity;
+        applySceneWorldComponentsToRendererSettings(*state.sceneDocument, settings);
     }
     bool changed = false;
     bool presetApplied = false;

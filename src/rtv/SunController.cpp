@@ -90,7 +90,7 @@ EntityId SunController::ensurePrimarySun(SceneDocument& document) {
         (void)repairPrimarySunTransform(document);
         return existing;
     }
-    EntityId sunId = document.registry().createEntity("Sun");
+    EntityId sunId = document.registry().createEntity("Sun", SceneUpdateKind::LightOnly);
     document.registry().clearDirty();
     document.registry().markDirty(SceneUpdateKind::LightOnly);
     if (Entity* sun = document.registry().entity(sunId)) {
@@ -156,6 +156,7 @@ bool SunController::migrateLegacyDirectionalSun(SceneDocument& document) {
             anglesFromWorldTransform(document.registry(), *entity, elevation, azimuth);
             entity->transform = transformFromWorldAngles(document.registry(), *entity, entity->transform, elevation, azimuth);
         }
+        entity->defaultTransform = entity->transform;
         document.setPrimarySun(entity->id);
         document.markDirty(SceneUpdateKind::LightOnly);
         return true;
@@ -184,6 +185,7 @@ bool SunController::repairPrimarySunTransform(SceneDocument& document) {
                 document.renderSettings().sunElevation,
                 document.renderSettings().sunAzimuth);
         }
+        entity->defaultTransform = entity->transform;
         document.markDirty(SceneUpdateKind::LightOnly);
         return true;
     }

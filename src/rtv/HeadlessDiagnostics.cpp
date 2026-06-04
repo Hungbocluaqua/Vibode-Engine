@@ -230,6 +230,30 @@ void to_json(nlohmann::json& j, const ProfileReport::RayTracingGeometryReport& s
     j["blas_opacity_micromap_geometry_count"] = s.blasOpacityMicromapGeometryCount;
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::SceneLightReport::Sample& s) {
+    j["record_index"] = s.recordIndex;
+    j["type"] = s.type;
+    j["source_index"] = s.sourceIndex;
+    j["position_or_direction"] = {s.positionOrDirection[0], s.positionOrDirection[1], s.positionOrDirection[2]};
+    j["radius_or_size"] = s.radiusOrSize;
+    j["weight"] = s.weight;
+}
+
+void to_json(nlohmann::json& j, const ProfileReport::SceneLightReport& s) {
+    j["record_count"] = s.recordCount;
+    j["emissive_count"] = s.emissiveCount;
+    j["authored_count"] = s.authoredCount;
+    j["directional_count"] = s.directionalCount;
+    j["point_count"] = s.pointCount;
+    j["area_count"] = s.areaCount;
+    j["spot_count"] = s.spotCount;
+    j["authored_positional_count"] = s.authoredPositionalCount;
+    j["authored_distinct_position_count"] = s.authoredDistinctPositionCount;
+    j["authored_positions_collapsed"] = s.authoredPositionsCollapsed;
+    j["emissive_samples"] = s.emissiveSamples;
+    j["authored_samples"] = s.authoredSamples;
+}
+
 void to_json(nlohmann::json& j, const ProfileReport::WavefrontQueueReport& s) {
     j["buffers_allocated"] = s.buffersAllocated;
     j["clear_validation_passed"] = s.clearValidationPassed;
@@ -554,6 +578,10 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["homogeneous_volume_scattering"] = s.homogeneousVolumeScattering;
     j["homogeneous_volume_absorption"] = s.homogeneousVolumeAbsorption;
     j["homogeneous_volume_anisotropy"] = s.homogeneousVolumeAnisotropy;
+    j["height_fog_enabled"] = s.heightFogEnabled;
+    j["height_fog_density"] = s.heightFogDensity;
+    j["height_fog_height_falloff"] = s.heightFogHeightFalloff;
+    j["height_fog_color"] = {s.heightFogColor.r, s.heightFogColor.g, s.heightFogColor.b};
     j["mnee_caustics_enabled"] = s.mneeCausticsEnabled;
     j["camera_jitter_enabled"] = s.cameraJitterEnabled;
     j["denoise_while_moving"] = s.denoiseWhileMoving;
@@ -1102,6 +1130,93 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.rayTracingGeometry.blasAlphaTestedGeometryCount = rtStats.blasGeometry.alphaTestedGeometryCount;
     profileReport_.rayTracingGeometry.blasBlendedGeometryCount = rtStats.blasGeometry.blendedGeometryCount;
     profileReport_.rayTracingGeometry.blasOpacityMicromapGeometryCount = rtStats.blasGeometry.opacityMicromapGeometryCount;
+
+    const auto& lightRecords = renderer->scene().lightRecordsCpu();
+    profileReport_.sceneLights.recordCount = static_cast<uint32_t>(lightRecords.size());
+    std::vector<std::array<float, 3>> distinctAuthoredPositions;
+    constexpr float positionEpsilon = 0.001f;
+    constexpr size_t maxAuthoredLightSamples = 32;
+    constexpr size_t maxEmissiveLightSamples = 32;
+    auto samePosition = [](const std::array<float, 3>& a, const std::array<float, 3>& b, float epsilon) {
+        return std::abs(a[0] - b[0]) <= epsilon &&
+            std::abs(a[1] - b[1]) <= epsilon &&
+            std::abs(a[2] - b[2]) <= epsilon;
+    };
+    for (uint32_t i = 0; i < static_cast<uint32_t>(lightRecords.size()); ++i) {
+        const GpuLightRecord& light = lightRecords[i];
+        const uint32_t type = light.metadata.x;
+        const bool active = light.data0.x > 0.0f;
+        const bool authored = type >= 2u && type <= 5u;
+        if (!active && !authored) {
+            continue;
+        }
+
+        switch (type) {
+        case 0u:
+        case 1u:
+            ++profileReport_.sceneLights.emissiveCount;
+            if (profileReport_.sceneLights.emissiveSamples.size() < maxEmissiveLightSamples) {
+                profileReport_.sceneLights.emissiveSamples.push_back(ProfileReport::SceneLightReport::Sample{
+                    .recordIndex = i,
+                    .type = type,
+                    .sourceIndex = light.metadata.y,
+                    .positionOrDirection = {light.data1.x, light.data1.y, light.data1.z},
+                    .radiusOrSize = light.data0.z,
+                    .weight = light.data0.x,
+                });
+            }
+            break;
+        case 2u:
+            ++profileReport_.sceneLights.authoredCount;
+            ++profileReport_.sceneLights.directionalCount;
+            break;
+        case 3u:
+            ++profileReport_.sceneLights.authoredCount;
+            ++profileReport_.sceneLights.pointCount;
+            break;
+        case 4u:
+            ++profileReport_.sceneLights.authoredCount;
+            ++profileReport_.sceneLights.areaCount;
+            break;
+        case 5u:
+            ++profileReport_.sceneLights.authoredCount;
+            ++profileReport_.sceneLights.spotCount;
+            break;
+        default:
+            break;
+        }
+
+        if (type == 3u || type == 4u || type == 5u) {
+            const std::array<float, 3> position{light.data1.x, light.data1.y, light.data1.z};
+            ++profileReport_.sceneLights.authoredPositionalCount;
+            const bool alreadySeen = std::any_of(
+                distinctAuthoredPositions.begin(),
+                distinctAuthoredPositions.end(),
+                [&](const std::array<float, 3>& existing) { return samePosition(existing, position, positionEpsilon); });
+            if (!alreadySeen) {
+                distinctAuthoredPositions.push_back(position);
+            }
+        }
+
+        if (authored && profileReport_.sceneLights.authoredSamples.size() < maxAuthoredLightSamples) {
+            profileReport_.sceneLights.authoredSamples.push_back(ProfileReport::SceneLightReport::Sample{
+                .recordIndex = i,
+                .type = type,
+                .sourceIndex = light.metadata.y,
+                .positionOrDirection = {light.data1.x, light.data1.y, light.data1.z},
+                .radiusOrSize = light.data0.z,
+                .weight = light.data0.x,
+            });
+        }
+    }
+    profileReport_.sceneLights.authoredDistinctPositionCount = static_cast<uint32_t>(distinctAuthoredPositions.size());
+    profileReport_.sceneLights.authoredPositionsCollapsed =
+        profileReport_.sceneLights.authoredPositionalCount > 1u &&
+        profileReport_.sceneLights.authoredDistinctPositionCount <= 1u;
+    if (profileReport_.sceneLights.authoredPositionsCollapsed) {
+        profileReport_.warnings.push_back("multiple authored positional lights collapsed to one uploaded GPU position");
+    }
+
     profileReport_.rayTracingMotionBlur.motionInstancesActive = rtStats.motionInstances.active;
     profileReport_.rayTracingMotionBlur.motionInstanceCount = rtStats.motionInstances.instanceCount;
     profileReport_.rayTracingMotionBlur.movingInstanceCount = rtStats.motionInstances.movingInstanceCount;
@@ -1556,6 +1671,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["ray_tracing_motion_blur"] = profileReport_.rayTracingMotionBlur;
     j["pipeline_statistics"] = profileReport_.pipelineStatistics;
     j["ray_tracing_geometry"] = profileReport_.rayTracingGeometry;
+    j["scene_lights"] = profileReport_.sceneLights;
     j["wavefront_queues"] = profileReport_.wavefrontQueues;
     j["wavefront_validation"] = profileReport_.wavefrontValidation;
     const uint64_t hitCount = profileReport_.pipelineStatistics.triangleHits + profileReport_.pipelineStatistics.aabbHits;

@@ -2,7 +2,10 @@
 
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
+#include "rtv/EditorPreferences.h"
+#include "rtv/EditorTransformUtils.h"
 #include "rtv/EditorUiStyle.h"
+#include "rtv/SceneRenderSettingsSync.h"
 #include "rtv/SunController.h"
 
 #include <glm/gtc/type_ptr.hpp>
@@ -309,14 +312,14 @@ void drawEntityActionsMenu(Entity& entity, EditorSelection& selection, EditorReq
     }
     ImGui::Separator();
     if (editorGlyphBeginMenu(EditorGlyphIcon::Add, "Add Component", !entity.locked)) {
-        addComponentMenuItem("Light", entity, EditorComponentKind::Light, SceneUpdateKind::TopologyChanged, EditorGlyphIcon::Light, entity.light.has_value(), requests);
+        addComponentMenuItem("Light", entity, EditorComponentKind::Light, SceneUpdateKind::LightOnly, EditorGlyphIcon::Light, entity.light.has_value(), requests);
         addComponentMenuItem("Primary Sun", entity, EditorComponentKind::Sun, SceneUpdateKind::LightOnly, EditorGlyphIcon::Sun, entity.sun.has_value(), requests);
-        addComponentMenuItem("Camera", entity, EditorComponentKind::Camera, SceneUpdateKind::TopologyChanged, EditorGlyphIcon::Camera, entity.camera.has_value(), requests);
+        addComponentMenuItem("Camera", entity, EditorComponentKind::Camera, SceneUpdateKind::CameraOnly, EditorGlyphIcon::Camera, entity.camera.has_value(), requests);
         addComponentMenuItem("Mesh Renderer", entity, EditorComponentKind::MeshRenderer, SceneUpdateKind::TopologyChanged, EditorGlyphIcon::Model, entity.meshRenderer.has_value(), requests);
-        addComponentMenuItem("Environment Light", entity, EditorComponentKind::EnvironmentLight, SceneUpdateKind::EnvironmentOnly, EditorGlyphIcon::Environment, entity.environmentLight.has_value(), requests);
-        addComponentMenuItem("Sky Atmosphere", entity, EditorComponentKind::SkyAtmosphere, SceneUpdateKind::EnvironmentOnly, EditorGlyphIcon::Sky, entity.skyAtmosphere.has_value(), requests);
-        addComponentMenuItem("Height Fog", entity, EditorComponentKind::HeightFog, SceneUpdateKind::EnvironmentOnly, EditorGlyphIcon::Fog, entity.heightFog.has_value(), requests);
-        addComponentMenuItem("Volumetric Cloud", entity, EditorComponentKind::VolumetricCloud, SceneUpdateKind::EnvironmentOnly, EditorGlyphIcon::Cloud, entity.volumetricCloud.has_value(), requests);
+        addComponentMenuItem("Environment Light", entity, EditorComponentKind::EnvironmentLight, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::Environment, entity.environmentLight.has_value(), requests);
+        addComponentMenuItem("Sky Atmosphere", entity, EditorComponentKind::SkyAtmosphere, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::Sky, entity.skyAtmosphere.has_value(), requests);
+        addComponentMenuItem("Height Fog", entity, EditorComponentKind::HeightFog, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::Fog, entity.heightFog.has_value(), requests);
+        addComponentMenuItem("Volumetric Cloud", entity, EditorComponentKind::VolumetricCloud, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::Cloud, entity.volumetricCloud.has_value(), requests);
         addComponentMenuItem("Post Process Volume", entity, EditorComponentKind::PostProcessVolume, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::PostProcess, entity.postProcessVolume.has_value(), requests);
         addComponentMenuItem("Camera Post Process", entity, EditorComponentKind::CameraPostProcess, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::PostProcess, !entity.camera.has_value() || entity.cameraPostProcess.has_value(), requests);
         ImGui::EndMenu();
@@ -451,21 +454,23 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         drawInspectorComponentHeader(EditorGlyphIcon::Move, "Transform", "Local position, rotation, and scale", !entityLocked);
         bool transformChanged = false;
         const Transform oldTransform = entity->transform;
+        const Transform& defaultTransform = entity->defaultTransform;
+        bool linkedScale = state.editorPrefs != nullptr && state.editorPrefs->linkedScale;
         static std::optional<Transform> copiedTransform;
         if (editorIconTextButton("InspectorQuickResetPosition", EditorGlyphIcon::Reset, "Position")) {
-            entity->transform.position = glm::vec3(0.0f);
+            entity->transform.position = defaultTransform.position;
             transformChanged = true;
         }
         tooltip("Reset position");
         ImGui::SameLine();
         if (editorIconTextButton("InspectorQuickResetRotation", EditorGlyphIcon::Reset, "Rotation")) {
-            entity->transform.rotationEuler = glm::vec3(0.0f);
+            entity->transform.rotationEuler = defaultTransform.rotationEuler;
             transformChanged = true;
         }
         tooltip("Reset rotation");
         ImGui::SameLine();
         if (editorIconTextButton("InspectorQuickResetScale", EditorGlyphIcon::Reset, "Scale")) {
-            entity->transform.scale = glm::vec3(1.0f);
+            entity->transform.scale = defaultTransform.scale;
             transformChanged = true;
         }
         tooltip("Reset scale");
@@ -481,7 +486,7 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         ImGui::EndDisabled();
         transformChanged |= inspectorDragFloat3Row("Position", glm::value_ptr(entity->transform.position), 0.02f, -10000.0f, 10000.0f, "%.3f");
         if (resetFieldButton("TransformPosition")) {
-            entity->transform.position = glm::vec3(0.0f);
+            entity->transform.position = defaultTransform.position;
             transformChanged = true;
         }
         glm::vec3 rotationDegrees = glm::degrees(entity->transform.rotationEuler);
@@ -491,12 +496,24 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         }
         tooltip("Euler angles in degrees.");
         if (resetFieldButton("TransformRotation")) {
-            entity->transform.rotationEuler = glm::vec3(0.0f);
+            entity->transform.rotationEuler = defaultTransform.rotationEuler;
             transformChanged = true;
         }
-        transformChanged |= inspectorDragFloat3Row("Scale", glm::value_ptr(entity->transform.scale), 0.02f, 0.001f, 1000.0f, "%.3f");
+        if (state.editorPrefs != nullptr) {
+            bool linkedScaleValue = state.editorPrefs->linkedScale;
+            if (inspectorCheckboxRow("Linked Scale", &linkedScaleValue)) {
+                state.editorPrefs->linkedScale = linkedScaleValue;
+                linkedScale = linkedScaleValue;
+            }
+            tooltip("Preserve scale proportions in the Inspector and viewport scale tool.");
+        }
+        glm::vec3 editedScale = entity->transform.scale;
+        if (inspectorDragFloat3Row("Scale", glm::value_ptr(editedScale), 0.02f, 0.001f, 1000.0f, "%.3f")) {
+            entity->transform.scale = linkedScale ? editorLinkedScaleFromReference(oldTransform.scale, editedScale) : editedScale;
+            transformChanged = true;
+        }
         if (resetFieldButton("TransformScale")) {
-            entity->transform.scale = glm::vec3(1.0f);
+            entity->transform.scale = defaultTransform.scale;
             transformChanged = true;
         }
         if (transformChanged) {
@@ -512,7 +529,7 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         }
 
         if (entity->camera.has_value()) {
-            drawInspectorComponentHeader(EditorGlyphIcon::Camera, "Camera", "Lens, exposure, and post-process settings", !entityLocked, "##CameraActions", entity->id, EditorComponentKind::Camera, SceneUpdateKind::TopologyChanged, &requests);
+            drawInspectorComponentHeader(EditorGlyphIcon::Camera, "Camera", "Lens, exposure, and post-process settings", !entityLocked, "##CameraActions", entity->id, EditorComponentKind::Camera, SceneUpdateKind::CameraOnly, &requests);
             Camera& camera = *entity->camera;
             const Camera oldCamera = camera;
             const EntityId oldActiveCamera = document.activeCamera();
@@ -598,7 +615,7 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         }
 
         if (entity->light.has_value()) {
-            drawInspectorComponentHeader(EditorGlyphIcon::Light, "Light", "Area, spot, point, and directional authoring", !entityLocked, "##LightActions", entity->id, EditorComponentKind::Light, SceneUpdateKind::TopologyChanged, &requests);
+            drawInspectorComponentHeader(EditorGlyphIcon::Light, "Light", "Area, spot, point, and directional authoring", !entityLocked, "##LightActions", entity->id, EditorComponentKind::Light, SceneUpdateKind::LightOnly, &requests);
             Light& light = *entity->light;
             const Light oldLight = light;
             bool changed = false;
@@ -839,30 +856,11 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             if (!renderer.materialSlots.empty() && state.assets != nullptr) {
                 const MaterialAssetHandle materialHandle = renderer.materialSlots.front().resolvedMaterial();
                 if (const MaterialAsset* source = state.assets->material(materialHandle)) {
-                    MaterialAsset edited = *source;
-                    bool materialChanged = false;
-                    drawInspectorComponentHeader(EditorGlyphIcon::Material, "Material", "First resolved material slot", !entityLocked);
-                    inspectorReadonlyRow("Material", edited.name.empty() ? "(unnamed)" : edited.name.c_str());
-                    materialChanged |= inspectorColorEdit4Row("Base Color", glm::value_ptr(edited.baseColorFactor));
-                    materialChanged |= inspectorSliderFloatRow("Metallic", &edited.metallicFactor, 0.0f, 1.0f, "%.3f");
-                    materialChanged |= inspectorSliderFloatRow("Roughness", &edited.roughnessFactor, 0.0f, 1.0f, "%.3f");
-                    materialChanged |= inspectorColorEdit3Row("Emissive", glm::value_ptr(edited.emissiveFactor));
-                    int alphaMode = static_cast<int>(edited.alphaMode);
-                    if (inspectorComboRow("Alpha Mode", &alphaMode, "Opaque\0Mask\0Blend\0")) {
-                        edited.alphaMode = static_cast<uint32_t>(alphaMode);
-                        materialChanged = true;
-                    }
-                    bool doubleSided = edited.doubleSided != 0;
-                    if (inspectorCheckboxRow("Double Sided", &doubleSided)) {
-                        edited.doubleSided = doubleSided ? 1u : 0u;
-                        materialChanged = true;
-                    }
-                    materialChanged |= inspectorSliderFloatRow("Alpha Cutoff", &edited.alphaCutoff, 0.0f, 1.0f, "%.3f");
-                    if (materialChanged) {
-                        requests.materialUpdate = EditorMaterialUpdate{.materialId = materialHandle.index, .material = edited};
-                        requests.resetAccumulation = AccumulationResetReason::MaterialChanged;
-                        document.markDirty(SceneUpdateKind::MaterialOnly);
-                        requests.sceneUpdate = SceneUpdateKind::MaterialOnly;
+                    drawInspectorComponentHeader(EditorGlyphIcon::Material, "Material", "First resolved slot; edit in Material Editor", !entityLocked);
+                    inspectorReadonlyRow("Material", source->name.empty() ? "(unnamed)" : source->name.c_str());
+                    inspectorReadonlyRow("Material ID", std::to_string(materialHandle.index));
+                    if (editorIconTextButton("InspectorOpenMaterialEditor", EditorGlyphIcon::Material, "Open Material Editor")) {
+                        requests.showMaterialEditor = true;
                     }
                 }
             }
@@ -879,48 +877,47 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         }
 
         if (entity->environmentLight.has_value()) {
-            drawInspectorComponentHeader(EditorGlyphIcon::Environment, "Environment Light", "IBL intensity, background, and rotation", !entityLocked, "##EnvironmentLightActions", entity->id, EditorComponentKind::EnvironmentLight, SceneUpdateKind::EnvironmentOnly, &requests);
+            drawInspectorComponentHeader(EditorGlyphIcon::Environment, "Environment Light", "IBL intensity, background, and rotation", !entityLocked, "##EnvironmentLightActions", entity->id, EditorComponentKind::EnvironmentLight, SceneUpdateKind::RendererSettingsOnly, &requests);
             const SceneDocument before = document;
             EnvironmentLight& component = *entity->environmentLight;
             bool changed = false;
+            if (component.hdrPath.empty() && !document.environment().hdrPath.empty()) {
+                component.hdrPath = document.environment().hdrPath;
+            }
+            const std::string hdrPathLabel = component.hdrPath.empty() ? "Procedural" : component.hdrPath.generic_string();
+            inspectorReadonlyRow("HDR Path", hdrPathLabel.c_str());
             changed |= inspectorCheckboxRow("Environment Enabled", &component.enabled);
             changed |= inspectorDragFloatRow("Environment Intensity", &component.intensity, 0.02f, 0.0f, 1000.0f, "%.3f");
             changed |= inspectorDragFloatRow("Background Intensity", &component.backgroundIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
             changed |= inspectorDragFloatRow("Environment Rotation", &component.rotation, 0.01f, -6.28318f, 6.28318f, "%.3f");
             if (changed) {
-                document.environment().enabled = component.enabled;
-                document.environment().intensity = component.intensity;
-                document.environment().backgroundIntensity = component.backgroundIntensity;
-                document.environment().rotation = component.rotation;
                 document.worldSettings().activeEnvironment = entity->id;
-                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::EnvironmentOnly, .label = "Edit Environment Light"};
+                applySceneWorldComponentsToDocumentSettings(document);
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Environment Light"};
             }
         }
 
         if (entity->skyAtmosphere.has_value()) {
-            drawInspectorComponentHeader(EditorGlyphIcon::Sky, "Sky Atmosphere", "Rayleigh, Mie, and ground albedo controls", !entityLocked, "##SkyAtmosphereActions", entity->id, EditorComponentKind::SkyAtmosphere, SceneUpdateKind::EnvironmentOnly, &requests);
+            drawInspectorComponentHeader(EditorGlyphIcon::Sky, "Sky Atmosphere", "Rayleigh, Mie, and ground albedo controls", !entityLocked, "##SkyAtmosphereActions", entity->id, EditorComponentKind::SkyAtmosphere, SceneUpdateKind::RendererSettingsOnly, &requests);
             const SceneDocument before = document;
             SkyAtmosphere& component = *entity->skyAtmosphere;
             bool changed = false;
             changed |= inspectorCheckboxRow("Atmosphere Enabled", &component.enabled);
+            changed |= inspectorDragFloatRow("Sky Intensity", &component.skyIntensity, 0.02f, 0.0f, 1000.0f, "%.3f");
             changed |= inspectorDragFloatRow("Rayleigh Scale Height", &component.rayleighScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
             changed |= inspectorDragFloatRow("Mie Scale Height", &component.mieScaleHeight, 10.0f, 100.0f, 50000.0f, "%.0f");
             changed |= inspectorSliderFloatRow("Mie Anisotropy", &component.mieAnisotropy, 0.0f, 0.99f, "%.3f");
             changed |= inspectorSliderFloatRow("Ground Albedo", &component.groundAlbedo, 0.0f, 1.0f, "%.3f");
             if (changed) {
-                RenderSettings& render = document.renderSettings();
-                render.rayleighScaleHeight = component.rayleighScaleHeight;
-                render.mieScaleHeight = component.mieScaleHeight;
-                render.mieAnisotropy = component.mieAnisotropy;
-                render.groundAlbedo = component.groundAlbedo;
                 document.worldSettings().skyAtmosphere = entity->id;
                 document.worldSettings().atmosphereEnabled = component.enabled;
+                applySceneWorldComponentsToDocumentSettings(document);
                 requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Sky Atmosphere"};
             }
         }
 
         if (entity->heightFog.has_value()) {
-            drawInspectorComponentHeader(EditorGlyphIcon::Fog, "Height Fog", "Density, falloff, and fog color", !entityLocked, "##HeightFogActions", entity->id, EditorComponentKind::HeightFog, SceneUpdateKind::EnvironmentOnly, &requests);
+            drawInspectorComponentHeader(EditorGlyphIcon::Fog, "Height Fog", "Density, falloff, and fog color", !entityLocked, "##HeightFogActions", entity->id, EditorComponentKind::HeightFog, SceneUpdateKind::RendererSettingsOnly, &requests);
             const SceneDocument before = document;
             HeightFog& component = *entity->heightFog;
             bool changed = false;
@@ -931,12 +928,13 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             if (changed) {
                 document.worldSettings().heightFog = entity->id;
                 document.worldSettings().fogEnabled = component.enabled;
-                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::EnvironmentOnly, .label = "Edit Height Fog"};
+                applySceneWorldComponentsToDocumentSettings(document);
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Height Fog"};
             }
         }
 
         if (entity->volumetricCloud.has_value()) {
-            drawInspectorComponentHeader(EditorGlyphIcon::Cloud, "Volumetric Cloud", "Coverage and cloud density", !entityLocked, "##VolumetricCloudActions", entity->id, EditorComponentKind::VolumetricCloud, SceneUpdateKind::EnvironmentOnly, &requests);
+            drawInspectorComponentHeader(EditorGlyphIcon::Cloud, "Volumetric Cloud", "Coverage and cloud density", !entityLocked, "##VolumetricCloudActions", entity->id, EditorComponentKind::VolumetricCloud, SceneUpdateKind::RendererSettingsOnly, &requests);
             const SceneDocument before = document;
             VolumetricCloud& component = *entity->volumetricCloud;
             bool changed = false;
@@ -944,7 +942,8 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             changed |= inspectorSliderFloatRow("Cloud Density", &component.density, 0.0f, 1.0f, "%.3f");
             changed |= inspectorSliderFloatRow("Coverage", &component.coverage, 0.0f, 1.0f, "%.3f");
             if (changed) {
-                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::EnvironmentOnly, .label = "Edit Volumetric Cloud"};
+                applySceneWorldComponentsToDocumentSettings(document);
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Volumetric Cloud"};
             }
         }
 
@@ -960,12 +959,9 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             changed |= inspectorSliderFloatRow("PP Saturation", &component.saturation, 0.0f, 2.0f, "%.3f");
             changed |= inspectorSliderFloatRow("PP Contrast", &component.contrast, 0.0f, 2.0f, "%.3f");
             if (changed) {
-                RenderSettings& render = document.renderSettings();
-                render.physicalExposureCompensation = component.exposureCompensation;
-                render.saturation = component.saturation;
-                render.contrast = component.contrast;
                 document.worldSettings().postProcessVolume = entity->id;
                 document.worldSettings().postProcessEnabled = component.enabled;
+                applySceneWorldComponentsToDocumentSettings(document);
                 requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Post Process Volume"};
             }
         }
@@ -1003,18 +999,7 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 ImGui::TreePop();
             }
             if (changed) {
-                RenderSettings& render = document.renderSettings();
-                if (component.overrideExposure) {
-                    render.physicalExposureCompensation = component.exposureCompensation;
-                }
-                if (component.overrideDepthOfField) {
-                    render.dofApertureRadius = component.dofApertureRadius;
-                    render.dofFocusDistance = component.dofFocusDistance;
-                }
-                if (component.colorCorrectionEnabled) {
-                    render.saturation = component.colorCorrectionSaturation;
-                    render.contrast = component.colorCorrectionContrast;
-                }
+                applySceneWorldComponentsToDocumentSettings(document);
                 requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::RendererSettingsOnly, .label = "Edit Camera Post Process"};
             }
         }
@@ -1023,13 +1008,13 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         float addComponentRowUsedWidth = 0.0f;
         const float addComponentRowWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
         if (!entity->light.has_value()) {
-            drawInspectorAddComponentButton("InspectorAddLight", EditorGlyphIcon::Light, "Light", *entity, EditorComponentKind::Light, SceneUpdateKind::TopologyChanged, requests, addComponentRowWidth, addComponentRowUsedWidth);
+                drawInspectorAddComponentButton("InspectorAddLight", EditorGlyphIcon::Light, "Light", *entity, EditorComponentKind::Light, SceneUpdateKind::LightOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (!entity->sun.has_value()) {
             drawInspectorAddComponentButton("InspectorAddSun", EditorGlyphIcon::Sun, "Primary Sun", *entity, EditorComponentKind::Sun, SceneUpdateKind::LightOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (!entity->camera.has_value()) {
-            drawInspectorAddComponentButton("InspectorAddCamera", EditorGlyphIcon::Camera, "Camera", *entity, EditorComponentKind::Camera, SceneUpdateKind::TopologyChanged, requests, addComponentRowWidth, addComponentRowUsedWidth);
+                drawInspectorAddComponentButton("InspectorAddCamera", EditorGlyphIcon::Camera, "Camera", *entity, EditorComponentKind::Camera, SceneUpdateKind::CameraOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (entity->camera.has_value() && !entity->cameraPostProcess.has_value()) {
             drawInspectorAddComponentButton("InspectorAddCameraPostProcess", EditorGlyphIcon::PostProcess, "Camera Post Process", *entity, EditorComponentKind::CameraPostProcess, SceneUpdateKind::RendererSettingsOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
@@ -1038,16 +1023,16 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             drawInspectorAddComponentButton("InspectorAddMeshRenderer", EditorGlyphIcon::Model, "Mesh Renderer", *entity, EditorComponentKind::MeshRenderer, SceneUpdateKind::TopologyChanged, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (!entity->environmentLight.has_value()) {
-            drawInspectorAddComponentButton("InspectorAddEnvironmentLight", EditorGlyphIcon::Environment, "Environment Light", *entity, EditorComponentKind::EnvironmentLight, SceneUpdateKind::EnvironmentOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
+            drawInspectorAddComponentButton("InspectorAddEnvironmentLight", EditorGlyphIcon::Environment, "Environment Light", *entity, EditorComponentKind::EnvironmentLight, SceneUpdateKind::RendererSettingsOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (!entity->skyAtmosphere.has_value()) {
-            drawInspectorAddComponentButton("InspectorAddSkyAtmosphere", EditorGlyphIcon::Sky, "Sky Atmosphere", *entity, EditorComponentKind::SkyAtmosphere, SceneUpdateKind::EnvironmentOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
+            drawInspectorAddComponentButton("InspectorAddSkyAtmosphere", EditorGlyphIcon::Sky, "Sky Atmosphere", *entity, EditorComponentKind::SkyAtmosphere, SceneUpdateKind::RendererSettingsOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (!entity->heightFog.has_value()) {
-            drawInspectorAddComponentButton("InspectorAddHeightFog", EditorGlyphIcon::Fog, "Height Fog", *entity, EditorComponentKind::HeightFog, SceneUpdateKind::EnvironmentOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
+            drawInspectorAddComponentButton("InspectorAddHeightFog", EditorGlyphIcon::Fog, "Height Fog", *entity, EditorComponentKind::HeightFog, SceneUpdateKind::RendererSettingsOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (!entity->volumetricCloud.has_value()) {
-            drawInspectorAddComponentButton("InspectorAddVolumetricCloud", EditorGlyphIcon::Cloud, "Volumetric Cloud", *entity, EditorComponentKind::VolumetricCloud, SceneUpdateKind::EnvironmentOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
+            drawInspectorAddComponentButton("InspectorAddVolumetricCloud", EditorGlyphIcon::Cloud, "Volumetric Cloud", *entity, EditorComponentKind::VolumetricCloud, SceneUpdateKind::RendererSettingsOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (!entity->postProcessVolume.has_value()) {
             drawInspectorAddComponentButton("InspectorAddPostProcessVolume", EditorGlyphIcon::PostProcess, "Post Process Volume", *entity, EditorComponentKind::PostProcessVolume, SceneUpdateKind::RendererSettingsOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
@@ -1148,6 +1133,9 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         }
     } else if (current.kind == EditorSelectionKind::Material) {
         ImGui::Text("Material: %u", current.index);
+        if (editorIconTextButton("InspectorOpenSelectedMaterialEditor", EditorGlyphIcon::Material, "Open Material Editor")) {
+            requests.showMaterialEditor = true;
+        }
     } else if (current.kind == EditorSelectionKind::Asset) {
         ImGui::Text("Asset: %u", current.index);
     } else if (current.kind == EditorSelectionKind::Light) {

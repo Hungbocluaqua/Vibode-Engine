@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -128,14 +129,21 @@ private:
     };
     struct AsyncAssetImportJob {
         AsyncAssetImportKind kind = AsyncAssetImportKind::Import;
+        uint64_t serial = 0;
         AssetImportRequest request{};
         AssetImportWorkspace workspace{};
         AssetGuid assetGuid;
         AssetType originalType = AssetType::Unknown;
         bool placeAfterImport = false;
     };
+    struct AsyncAssetImportProgress {
+        mutable std::mutex mutex;
+        float progress = 0.0f;
+        std::string stage = "Queued";
+    };
     struct ActiveAsyncAssetImportJob {
         AsyncAssetImportJob job{};
+        std::shared_ptr<AsyncAssetImportProgress> progress;
         std::future<StagedAssetImportResult> future;
     };
 
@@ -161,6 +169,7 @@ private:
     void toggleBorderlessFullscreen();
     void reloadGltfScene(const std::filesystem::path& path);
     bool requestSceneLoad(SceneLoadRequest request);
+    void recordCompletedSceneLoadJob(const SceneLoadResult& result, bool success, bool cancelled, const std::string& status, const std::string& error = {}, const std::string& warning = {});
     void pollAsyncSceneLoad();
     bool applySceneLoadResult(SceneLoadResult&& result);
     bool applyReplacementSceneResult(SceneLoadResult&& result, bool sceneDirtyAfterApply);
@@ -168,6 +177,7 @@ private:
     void applyEditorRequests(const EditorRequests& requests, bool allowResourceRebuild);
     [[nodiscard]] DirtyScenePromptResult promptDirtySceneBefore(std::string_view action) const;
     [[nodiscard]] bool saveCurrentSceneForDirtyPrompt();
+    [[nodiscard]] bool saveAllEditorState();
     [[nodiscard]] bool confirmDestructiveSceneAction(std::string_view action);
     [[nodiscard]] bool createProjectFromRequest(const CreateProjectRequest& request);
     [[nodiscard]] bool openProjectFromFile(const std::filesystem::path& projectFile, bool promptForDirtyScene);
@@ -177,6 +187,11 @@ private:
     [[nodiscard]] std::optional<AssetImportWorkspace> prepareAssetImportWorkspace(const std::filesystem::path& sourcePath);
     [[nodiscard]] bool queueAssetImportNonMutating(const EditorImportAssetRequest& request, bool placeAfterImport);
     [[nodiscard]] bool placePrefabAsset(const AssetGuid& prefabGuid);
+    [[nodiscard]] bool relinkAssetSource(const EditorAssetRelinkSourceRequest& request);
+    [[nodiscard]] bool replaceAssetReferences(const EditorReplaceAssetReferencesRequest& request, bool allowResourceRebuild);
+    [[nodiscard]] bool updateAssetTags(const EditorAssetTagsRequest& request);
+    [[nodiscard]] bool bulkAddAssetTag(const EditorBulkAssetTagRequest& request);
+    [[nodiscard]] bool bulkRemoveAssetTag(const EditorBulkAssetTagRequest& request);
     [[nodiscard]] bool queueAssetReimport(const AssetGuid& assetGuid);
     void startNextAssetImportWorker();
     void pollAssetImportWorker();
@@ -187,9 +202,12 @@ private:
     void applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange);
     void reloadShadersFromEditor();
     void startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot);
+    void prepareEditorRenderJobFrame();
     void updateEditorRenderJob(float deltaSeconds);
     void writeEditorRenderJobManifest(const char* eventLabel);
     void cancelEditorRenderJob(const std::filesystem::path& renderOutputRoot);
+    [[nodiscard]] bool exportEditorRenderJobImage(const std::filesystem::path& outputPath);
+    void restoreEditorRenderJobSceneState();
     void retirePathTracer(std::unique_ptr<PathTracerRenderer> renderer);
     void releaseRetiredPathTracers();
     [[nodiscard]] std::unique_ptr<PathTracerRenderer> makePathTracer(
@@ -221,6 +239,7 @@ private:
     std::optional<std::filesystem::path> hdrPath_;
     std::optional<std::filesystem::path> scenePath_;
     bool sceneUnsavedDirty_ = false;
+    bool projectSettingsDirty_ = false;
     std::optional<ProjectContext> project_;
     AssetRegistry assetRegistry_;
     std::optional<bool> denoiserOverride_;
@@ -239,7 +258,10 @@ private:
     bool disableResourceAliasing_ = false;
     bool pendingOpenLevel_ = false;
     bool pendingSaveLevel_ = false;
+    bool pendingSaveAll_ = false;
     bool pendingReloadShaders_ = false;
+    bool pendingUndo_ = false;
+    bool pendingRedo_ = false;
     AssetManager assets_;
     CameraController cameraController_;
     SunDragState sunDrag_{};
@@ -260,8 +282,20 @@ private:
     EditorRenderJobStatus editorRenderJob_{};
     float editorRenderJobElapsedSeconds_ = 0.0f;
     uint64_t nextEditorRenderJobSerial_ = 1;
+    uint32_t editorRenderJobFramesRendered_ = 0;
+    bool editorRenderJobFramePrepared_ = false;
+    int editorRenderJobSequenceStartFrame_ = 0;
+    int editorRenderJobSequenceEndFrame_ = 0;
+    bool editorRenderJobTimelineWasPlaying_ = false;
+    int editorRenderJobPreviousTimelineFrame_ = 0;
+    std::optional<SceneDocument> editorRenderJobSceneSnapshot_;
+    std::vector<std::filesystem::path> editorRenderJobOutputFiles_;
     EditorPlacementStatus editorPlacement_{};
     uint64_t nextEditorPlacementSerial_ = 1;
+    uint64_t nextSceneLoadJobSerial_ = 1;
+    EditorJobCenterState completedSceneLoadJob_{};
+    uint64_t nextAssetImportJobSerial_ = 1;
+    EditorJobCenterState completedAssetImportJob_{};
     UndoStack undoStack_;
     SceneToGpuSceneBuilder sceneBuilder_;
     std::optional<SceneAsset> gpuSceneAsset_;
@@ -283,6 +317,7 @@ private:
     std::optional<ActiveAsyncAssetImportJob> activeAssetImportJob_;
     std::optional<SceneLoadRequest> activeSceneLoadRequest_;
     std::optional<std::filesystem::path> pendingRecoveryAutosavePath_;
+    std::optional<std::filesystem::path> pendingRecoveryProjectAutosavePath_;
     std::optional<std::filesystem::path> pendingProjectThumbnailPath_;
     uint64_t pendingProjectThumbnailFrame_ = 0;
     uint32_t pendingProjectThumbnailAttempts_ = 0;

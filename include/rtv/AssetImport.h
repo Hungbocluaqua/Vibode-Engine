@@ -3,6 +3,7 @@
 #include "rtv/AssetRegistry.h"
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -24,11 +25,17 @@ struct StagedAssetImportResult {
     std::vector<std::string> warnings;
     std::vector<std::string> errors;
     std::filesystem::path importReportPath;
+    double workerTotalMs = 0.0;
+    double workerValidateMs = 0.0;
+    double workerDirectoryMs = 0.0;
+    double workerInspectMs = 0.0;
+    double workerWriteMs = 0.0;
 };
 
 struct AssetImportWorkspace {
     std::filesystem::path root;
     std::filesystem::path contentRoot;
+    std::filesystem::path sourceAssetsRoot;
     std::filesystem::path cacheRoot;
     std::filesystem::path registryPath;
     bool compatibilityMode = false;
@@ -44,6 +51,7 @@ struct AssetImportWorkspace {
     size_t index);
 [[nodiscard]] StagedAssetImportResult stagePlaceholderAssetImport(
     const AssetImportRequest& request,
-    const AssetImportWorkspace& workspace);
+    const AssetImportWorkspace& workspace,
+    std::function<void(float, std::string)> progress = {});
 
 } // namespace rtv
