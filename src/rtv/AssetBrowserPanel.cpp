@@ -2145,6 +2145,15 @@ bool writeAssetValidationReport(const EditorRuntimeState& state, const std::file
 void AssetBrowserPanel::invalidateThumbnails() {
     thumbnailCache_.clear();
     sourcePreviewCache_.clear();
+    invalidateDirectoryCache();
+}
+
+void AssetBrowserPanel::invalidateDirectoryCache() {
+    directoryListingCache_.clear();
+    ++directoryListingGeneration_;
+    if (directoryListingGeneration_ == 0) {
+        directoryListingGeneration_ = 1;
+    }
 }
 
 bool AssetBrowserPanel::openSelectedAsset(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
@@ -2820,6 +2829,7 @@ void AssetBrowserPanel::syncBrowserRoot(const EditorRuntimeState& state) {
         backStack_.clear();
         forwardStack_.clear();
         sourceControlStatusCache_.clear();
+        invalidateDirectoryCache();
         clearGitStatusSnapshots();
     } else if (currentPath_.empty()) {
         currentPath_ = root;
@@ -2850,6 +2860,45 @@ bool AssetBrowserPanel::shouldShowPath(const std::filesystem::path& path) const 
         return true;
     }
     return lowerString(path.filename().string()).find(filter) != std::string::npos;
+}
+
+const AssetBrowserPanel::DirectoryListingCache& AssetBrowserPanel::directoryListingForPath(const std::filesystem::path& path) {
+    const std::string key = canonicalForCompare(path).string();
+    DirectoryListingCache& cache = directoryListingCache_[key];
+    if (cache.generation == directoryListingGeneration_) {
+        return cache;
+    }
+
+    cache = DirectoryListingCache{};
+    cache.generation = directoryListingGeneration_;
+    std::error_code ec;
+    if (path.empty() || !std::filesystem::is_directory(path, ec)) {
+        return cache;
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(path, std::filesystem::directory_options::skip_permission_denied, ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code entryError;
+        const bool isDirectory = entry.is_directory(entryError);
+        if (entryError) {
+            continue;
+        }
+        cache.entries.push_back(PathListEntry{entry.path(), isDirectory});
+        if (isDirectory) {
+            cache.childDirectories.push_back(entry.path());
+        }
+    }
+
+    std::sort(cache.childDirectories.begin(), cache.childDirectories.end());
+    std::sort(cache.entries.begin(), cache.entries.end(), [](const PathListEntry& a, const PathListEntry& b) {
+        if (a.isDirectory != b.isDirectory) {
+            return a.isDirectory > b.isDirectory;
+        }
+        return lowerString(a.path.filename().string()) < lowerString(b.path.filename().string());
+    });
+    return cache;
 }
 
 std::string AssetBrowserPanel::relativeContentPath(const std::filesystem::path& path) const {
@@ -2931,19 +2980,13 @@ void AssetBrowserPanel::drawFolderTree(const std::filesystem::path& path, Editor
     if (!std::filesystem::is_directory(path, ec)) {
         return;
     }
+    const DirectoryListingCache& listing = directoryListingForPath(path);
     const bool selected = canonicalForCompare(path) == canonicalForCompare(currentPath_);
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
     if (selected) {
         flags |= ImGuiTreeNodeFlags_Selected;
     }
-    bool hasChildren = false;
-    for (const auto& entry : std::filesystem::directory_iterator(path, std::filesystem::directory_options::skip_permission_denied, ec)) {
-        if (entry.is_directory(ec)) {
-            hasChildren = true;
-            break;
-        }
-    }
-    if (!hasChildren) {
+    if (listing.childDirectories.empty()) {
         flags |= ImGuiTreeNodeFlags_Leaf;
     }
 
@@ -2970,14 +3013,7 @@ void AssetBrowserPanel::drawFolderTree(const std::filesystem::path& path, Editor
         ImGui::EndPopup();
     }
     if (open) {
-        std::vector<std::filesystem::path> children;
-        for (const auto& entry : std::filesystem::directory_iterator(path, std::filesystem::directory_options::skip_permission_denied, ec)) {
-            if (entry.is_directory(ec)) {
-                children.push_back(entry.path());
-            }
-        }
-        std::sort(children.begin(), children.end());
-        for (const auto& child : children) {
+        for (const auto& child : listing.childDirectories) {
             drawFolderTree(child, requests);
         }
         ImGui::TreePop();
@@ -2986,32 +3022,21 @@ void AssetBrowserPanel::drawFolderTree(const std::filesystem::path& path, Editor
 }
 
 void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequests& requests) {
-    std::error_code ec;
-    std::vector<std::filesystem::directory_entry> entries;
-    if (!currentPath_.empty() && std::filesystem::is_directory(currentPath_, ec)) {
-        for (const auto& entry : std::filesystem::directory_iterator(currentPath_, std::filesystem::directory_options::skip_permission_denied, ec)) {
-            if (shouldShowPath(entry.path())) {
-                entries.push_back(entry);
-            }
+    const DirectoryListingCache& listing = directoryListingForPath(currentPath_);
+    std::vector<const PathListEntry*> entries;
+    entries.reserve(listing.entries.size());
+    for (const PathListEntry& entry : listing.entries) {
+        if (shouldShowPath(entry.path)) {
+            entries.push_back(&entry);
         }
     }
-    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
-        std::error_code errorA;
-        std::error_code errorB;
-        const bool aDir = a.is_directory(errorA);
-        const bool bDir = b.is_directory(errorB);
-        if (aDir != bDir) {
-            return aDir > bDir;
-        }
-        return lowerString(a.path().filename().string()) < lowerString(b.path().filename().string());
-    });
 
     if (gridView_) {
         const float cellWidth = EditorUiMetric::contentGridCellWidth;
         const int columns = std::max(1, static_cast<int>(ImGui::GetContentRegionAvail().x / cellWidth));
         ImGui::Columns(columns, "ContentGrid", false);
-        for (const auto& entry : entries) {
-            const std::filesystem::path path = entry.path();
+        for (const PathListEntry* entry : entries) {
+            const std::filesystem::path path = entry->path;
             const bool selected = selectedPath_ == path;
             ImGui::PushID(path.string().c_str());
             const ImVec2 thumbSize(EditorUiMetric::contentGridThumbWidth, EditorUiMetric::contentGridThumbHeight);
@@ -3035,7 +3060,7 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
             }
             (void)drawLevelPathDragDropSource(path);
             if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                if (entry.is_directory(ec)) {
+                if (entry->isDirectory) {
                     navigateTo(path);
                 } else {
                     loadFromPath(path, requests);
@@ -3044,7 +3069,7 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
             if (ImGui::BeginPopupContextItem("PathContext")) {
                 selectedPath_ = path;
                 selectedRecordGuid_.clear();
-                drawPathContextMenu(path, entry.is_directory(ec), requests);
+                drawPathContextMenu(path, entry->isDirectory, requests);
                 ImGui::EndPopup();
             }
             ImGui::TextWrapped("%s%s", selected ? "> " : "", path.filename().string().c_str());
@@ -3058,9 +3083,13 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ImGui::GetStyle().CellPadding.x, 0.0f));
     if (ImGui::BeginTable("ContentPathListCompact", 1, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
         ImGui::TableSetupColumn("Asset");
-        for (const auto& entry : entries) {
-            const std::filesystem::path path = entry.path();
-            const bool isDir = entry.is_directory(ec);
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(entries.size()), EditorUiMetric::contentRowHeight);
+        while (clipper.Step()) {
+        for (int rowIndex = clipper.DisplayStart; rowIndex < clipper.DisplayEnd; ++rowIndex) {
+            const PathListEntry* entry = entries[static_cast<size_t>(rowIndex)];
+            const std::filesystem::path path = entry->path;
+            const bool isDir = entry->isDirectory;
             const bool selected = selectedPath_ == path;
             ImGui::PushID(path.string().c_str());
             ImGui::TableNextRow();
@@ -3095,6 +3124,7 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
                 ImGui::EndPopup();
             }
             ImGui::PopID();
+        }
         }
         ImGui::EndTable();
     }
@@ -3282,13 +3312,16 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
     };
 
     std::vector<AssetGuid> visibleRecordGuids;
+    std::vector<const AssetRecord*> visibleRecords;
     visibleRecordGuids.reserve(records.size());
+    visibleRecords.reserve(records.size());
     for (const AssetRecord& record : records) {
         if (recordMatchesFilters(record)) {
             visibleRecordGuids.push_back(record.guid);
+            visibleRecords.push_back(&record);
         }
     }
-    const size_t visibleRecordCount = visibleRecordGuids.size();
+    const size_t visibleRecordCount = visibleRecords.size();
     ImGui::TextDisabled("Showing %zu of %zu registry records", visibleRecordCount, records.size());
     ImGui::SameLine();
     ImGui::SetNextItemWidth(140.0f);
@@ -3464,10 +3497,11 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         ImGui::TableSetupColumn("Status");
         ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, EditorUiMetric::progressColumnWidth);
         ImGui::TableHeadersRow();
-        for (const AssetRecord& record : records) {
-            if (!recordMatchesFilters(record)) {
-                continue;
-            }
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(visibleRecords.size()), EditorUiMetric::contentRowHeight);
+        while (clipper.Step()) {
+        for (int rowIndex = clipper.DisplayStart; rowIndex < clipper.DisplayEnd; ++rowIndex) {
+            const AssetRecord& record = *visibleRecords[static_cast<size_t>(rowIndex)];
             ImGui::PushID(record.guid.c_str());
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
@@ -3583,6 +3617,7 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
             ImGui::TableSetColumnIndex(12);
             ImGui::ProgressBar(assetImportProgress(record), ImVec2(-FLT_MIN, 0.0f), assetImportProgressLabel(record));
             ImGui::PopID();
+        }
         }
         ImGui::EndTable();
     }

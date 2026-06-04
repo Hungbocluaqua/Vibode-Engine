@@ -217,19 +217,10 @@ void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, 
 
 } // namespace
 
-TextureData TextureLoader::loadKtx2(std::string_view path) {
-    std::string filepath(path);
-    if (!isKtx2File(filepath)) {
-        throw std::runtime_error(std::string("Not a KTX2 file: ") + filepath);
-    }
-
-    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-    const size_t size = static_cast<size_t>(file.tellg());
-    file.seekg(0);
-    std::vector<uint8_t> raw(size);
-    file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(size));
-    if (!file) {
-        throw std::runtime_error("Failed to read KTX2 file: " + filepath);
+[[nodiscard]] TextureData parseKtx2Data(const std::vector<uint8_t>& raw, std::string_view fallbackPath) {
+    const size_t size = raw.size();
+    if (size < 80 || std::memcmp(raw.data(), ktx2Magic, sizeof(ktx2Magic)) != 0) {
+        throw std::runtime_error("Not a KTX2 byte buffer");
     }
 
     const uint32_t vkFormat      = readU32(raw.data(), 12);
@@ -260,8 +251,11 @@ TextureData TextureLoader::loadKtx2(std::string_view path) {
         try {
             return transcodeBasisKtx2(raw, size);
         } catch (const std::runtime_error& e) {
-            fprintf(stderr, "%s. Falling back to stb_image.\n", e.what());
-            return loadRgba8(path);
+            if (!fallbackPath.empty()) {
+                fprintf(stderr, "%s. Falling back to stb_image.\n", e.what());
+                return TextureLoader::loadRgba8(fallbackPath);
+            }
+            throw;
         }
     }
 
@@ -303,9 +297,37 @@ TextureData TextureLoader::loadKtx2(std::string_view path) {
         return result;
     }
 
-    fprintf(stderr, "KTX2: format is undefined, falling back to stb_image\n");
+    if (!fallbackPath.empty()) {
+        fprintf(stderr, "KTX2: format is undefined, falling back to stb_image\n");
+        return TextureLoader::loadRgba8(fallbackPath);
+    }
+    throw std::runtime_error("KTX2: format is undefined");
+}
 
-    return loadRgba8(path);
+TextureData TextureLoader::loadKtx2(std::string_view path) {
+    std::string filepath(path);
+    if (!isKtx2File(filepath)) {
+        throw std::runtime_error(std::string("Not a KTX2 file: ") + filepath);
+    }
+
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    const size_t size = static_cast<size_t>(file.tellg());
+    file.seekg(0);
+    std::vector<uint8_t> raw(size);
+    file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(size));
+    if (!file) {
+        throw std::runtime_error("Failed to read KTX2 file: " + filepath);
+    }
+
+    return parseKtx2Data(raw, path);
+}
+
+TextureData TextureLoader::loadKtx2(const uint8_t* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        throw std::runtime_error("KTX2: empty byte buffer");
+    }
+    std::vector<uint8_t> raw(data, data + size);
+    return parseKtx2Data(raw, {});
 }
 
 TextureData TextureLoader::load(std::string_view path) {

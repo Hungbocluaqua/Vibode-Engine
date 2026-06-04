@@ -550,23 +550,8 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
 }
 
 void applyDocumentMaterialAssignments(const SceneDocument& document, AssetManager& assets) {
-    for (const Entity* entity : document.registry().entities()) {
-        if (!entity->meshRenderer.has_value()) {
-            continue;
-        }
-        MeshAsset* mesh = assets.mesh(entity->meshRenderer->mesh);
-        if (mesh == nullptr) {
-            continue;
-        }
-        const std::vector<MaterialSlot>& slots = entity->meshRenderer->materialSlots;
-        for (size_t i = 0; i < slots.size() && i < mesh->primitives.size(); ++i) {
-            const MaterialAssetHandle material = slots[i].resolvedMaterial();
-            if (material.valid()) {
-                mesh->primitives[i].material = material;
-                updatePrimitiveAlphaClassification(mesh->primitives[i], assets.material(material));
-            }
-        }
-    }
+    (void)document;
+    (void)assets;
 }
 
 struct ImportedAssetHandleRemap {
@@ -1057,6 +1042,7 @@ void remapMaterialTextures(MaterialAsset& material, const ImportedAssetHandleRem
     remapTexture(material.clearcoatRoughnessTexture);
     remapTexture(material.clearcoatNormalTexture);
     remapTexture(material.transmissionTexture);
+    remapTexture(material.volumeThicknessTexture);
     remapTexture(material.specularTexture);
     remapTexture(material.specularColorTexture);
     remapTexture(material.sheenColorTexture);
@@ -1083,6 +1069,9 @@ ImportedAssetHandleRemap appendImportedAssets(AssetManager& destination, const A
     for (MeshAsset mesh : source.meshes()) {
         for (MeshPrimitiveAsset& primitive : mesh.primitives) {
             primitive.material = remapMaterialHandle(remap, primitive.material);
+            for (auto& variant : primitive.materialVariants) {
+                variant.material = remapMaterialHandle(remap, variant.material);
+            }
         }
         remap.meshes.push_back(destination.addMesh(std::move(mesh)));
     }
@@ -1191,6 +1180,12 @@ bool appendCachedPrefabRuntimeAssets(
         material.clearcoatRoughnessFactor = cachedMat.clearcoatRoughnessFactor;
         material.hasTransmission = cachedMat.hasTransmission;
         material.transmissionFactor = cachedMat.transmissionFactor;
+        material.hasVolume = cachedMat.hasVolume;
+        material.volumeThicknessFactor = cachedMat.volumeThicknessFactor;
+        material.volumeAttenuationDistance = cachedMat.volumeAttenuationDistance;
+        material.volumeAttenuationColor = cachedMat.volumeAttenuationColor;
+        material.hasDispersion = cachedMat.hasDispersion;
+        material.dispersionFactor = cachedMat.dispersionFactor;
         material.hasSpecular = cachedMat.hasSpecular;
         material.specularFactor = cachedMat.specularFactor;
         material.specularColorFactor = cachedMat.specularColorFactor;
@@ -1219,6 +1214,7 @@ bool appendCachedPrefabRuntimeAssets(
         material.clearcoatRoughnessTexture = textureHandleFor(cachedMat.clearcoatRoughnessTextureIndex);
         material.clearcoatNormalTexture = textureHandleFor(cachedMat.clearcoatNormalTextureIndex);
         material.transmissionTexture = textureHandleFor(cachedMat.transmissionTextureIndex);
+        material.volumeThicknessTexture = textureHandleFor(cachedMat.volumeThicknessTextureIndex);
         material.specularTexture = textureHandleFor(cachedMat.specularTextureIndex);
         material.specularColorTexture = textureHandleFor(cachedMat.specularColorTextureIndex);
         material.sheenColorTexture = textureHandleFor(cachedMat.sheenColorTextureIndex);
@@ -1232,6 +1228,18 @@ bool appendCachedPrefabRuntimeAssets(
         material.normalTextureTransform = cachedMat.normalTextureTransform;
         material.emissiveTextureTransform = cachedMat.emissiveTextureTransform;
         material.occlusionTextureTransform = cachedMat.occlusionTextureTransform;
+        material.clearcoatTextureTransform = cachedMat.clearcoatTextureTransform;
+        material.clearcoatRoughnessTextureTransform = cachedMat.clearcoatRoughnessTextureTransform;
+        material.clearcoatNormalTextureTransform = cachedMat.clearcoatNormalTextureTransform;
+        material.transmissionTextureTransform = cachedMat.transmissionTextureTransform;
+        material.volumeThicknessTextureTransform = cachedMat.volumeThicknessTextureTransform;
+        material.specularTextureTransform = cachedMat.specularTextureTransform;
+        material.specularColorTextureTransform = cachedMat.specularColorTextureTransform;
+        material.sheenColorTextureTransform = cachedMat.sheenColorTextureTransform;
+        material.sheenRoughnessTextureTransform = cachedMat.sheenRoughnessTextureTransform;
+        material.iridescenceTextureTransform = cachedMat.iridescenceTextureTransform;
+        material.iridescenceThicknessTextureTransform = cachedMat.iridescenceThicknessTextureTransform;
+        material.anisotropyTextureTransform = cachedMat.anisotropyTextureTransform;
         material.shaderCompatibilityMask = cachedMat.shaderCompatibilityMask;
         (void)applyMaterialMetadataOverrideForGuid(
             registry,
@@ -1258,6 +1266,15 @@ bool appendCachedPrefabRuntimeAssets(
                 primitive.material = materials[static_cast<size_t>(cachedPrim.materialIndex)];
             } else if (!materials.empty()) {
                 primitive.material = materials.front();
+            }
+            for (const auto& cachedVariant : cachedPrim.materialVariants) {
+                if (cachedVariant.materialIndex >= 0 && static_cast<size_t>(cachedVariant.materialIndex) < materials.size()) {
+                    primitive.materialVariants.push_back(MeshPrimitiveAsset::MaterialVariant{
+                        .variantIndex = cachedVariant.variantIndex,
+                        .variantName = cachedVariant.variantName,
+                        .material = materials[static_cast<size_t>(cachedVariant.materialIndex)],
+                    });
+                }
             }
             updatePrimitiveAlphaClassification(primitive, destination.material(primitive.material));
             mesh.primitives.push_back(primitive);
@@ -1955,7 +1972,7 @@ bool Application::applyNamedCamera(std::string_view cameraName) {
         if (glm::dot(forward, forward) <= 1.0e-8f) {
             return false;
         }
-        pathTracer_->setCameraFovY(fovY);
+        pathTracer_->setCameraProjection(0u, fovY, 0.0f, 1.0f, 1.0f, 0.01f, 1000.0f);
         cameraController_.setPose(position, glm::normalize(forward), *pathTracer_);
         std::cout << "Applied camera: " << label << '\n';
         return true;
@@ -1989,7 +2006,14 @@ bool Application::applyNamedCamera(std::string_view cameraName) {
         if (glm::dot(forward, forward) <= 1.0e-8f) {
             forward = glm::vec3{0.0f, 0.0f, -1.0f};
         }
-        pathTracer_->setCameraFovY(entity->camera->verticalFovRadians);
+        pathTracer_->setCameraProjection(
+            entity->camera->projection,
+            entity->camera->verticalFovRadians,
+            entity->camera->aspectRatio,
+            entity->camera->orthographicXmag,
+            entity->camera->orthographicYmag,
+            entity->camera->nearPlane,
+            entity->camera->farPlane);
         cameraController_.setPose(position, glm::normalize(forward), *pathTracer_);
         std::cout << "Applied scene camera: " << entity->name << '\n';
         return true;
@@ -2014,10 +2038,14 @@ void Application::initWindow() {
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    const bool explicitStartupScene = scenePath_.has_value() || gltfPath_.has_value();
+    mainWindowHiddenUntilRenderer_ = !headless_ && !explicitStartupScene;
+    glfwWindowHint(GLFW_VISIBLE, mainWindowHiddenUntilRenderer_ ? GLFW_FALSE : GLFW_TRUE);
     window_ = glfwCreateWindow(initialWidth, initialHeight, "Vibode Engine", nullptr, nullptr);
     if (window_ == nullptr) {
         throw std::runtime_error("glfwCreateWindow failed");
     }
+    glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
 #if defined(_WIN32)
     enableDarkWindowFrame(window_);
 #endif
@@ -2177,6 +2205,7 @@ void Application::initVulkan() {
         }
     }
     commandSystem_->setPathTracer(pathTracer_.get());
+    showMainWindowIfHidden();
 }
 
 void Application::mainLoop(uint32_t maxFrames) {
@@ -3297,6 +3326,7 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
         pathTracer_ = std::move(nextPathTracer);
         applyActiveSceneCamera();
         commandSystem_->setPathTracer(pathTracer_.get());
+        showMainWindowIfHidden();
         stateSwapMs = elapsedMs(stateSwapStart);
     } catch (const std::exception& error) {
         sceneLoadingStatus_ = std::string(sceneLoadModeLabel(result.mode)) + " apply failed: " + error.what();
@@ -4478,17 +4508,13 @@ bool Application::assignMaterialAssetToEntity(const EditorMaterialAssetAssignmen
     const MaterialAssetHandle material{*materialIndex};
     bool assigned = false;
     auto assignSlot = [&](MaterialSlot& slot, uint32_t slotIndex) {
+        (void)slotIndex;
         if (material.index == slot.material.index || slot.materialGuid == request.materialGuid) {
             slot.overrideMaterial.reset();
             slot.overrideMaterialGuid.reset();
         } else {
             slot.overrideMaterial = material;
             slot.overrideMaterialGuid = request.materialGuid;
-        }
-        if (slotIndex < mesh->primitives.size()) {
-            MeshPrimitiveAsset& primitive = mesh->primitives[slotIndex];
-            primitive.material = slot.resolvedMaterial();
-            updatePrimitiveAlphaClassification(primitive, assets_.material(primitive.material));
         }
         assigned = true;
     };
@@ -5700,7 +5726,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 }
             }
         }
-        MeshAsset* mesh = assets_.mesh(requests.materialAssignment->mesh);
+        MeshAsset* mesh = assigned ? nullptr : assets_.mesh(requests.materialAssignment->mesh);
         if (mesh != nullptr && requests.materialAssignment->primitiveIndex == UINT32_MAX) {
             for (MeshPrimitiveAsset& primitive : mesh->primitives) {
                 primitive.material = requests.materialAssignment->material;
@@ -6735,6 +6761,7 @@ void Application::initializeRendererFromCurrentScene(const RendererSettings* set
     if (commandSystem_ != nullptr) {
         commandSystem_->setPathTracer(pathTracer_.get());
     }
+    showMainWindowIfHidden();
     if (uiOverlay_ != nullptr) {
         uiOverlay_->invalidateViewportTexture();
     }
@@ -6756,7 +6783,14 @@ void Application::applyActiveSceneCamera() {
     if (glm::dot(forward, forward) <= 0.0f) {
         forward = glm::vec3(0.0f, 0.0f, -1.0f);
     }
-    pathTracer_->setCameraFovY(cameraEntity->camera->verticalFovRadians);
+    pathTracer_->setCameraProjection(
+        cameraEntity->camera->projection,
+        cameraEntity->camera->verticalFovRadians,
+        cameraEntity->camera->aspectRatio,
+        cameraEntity->camera->orthographicXmag,
+        cameraEntity->camera->orthographicYmag,
+        cameraEntity->camera->nearPlane,
+        cameraEntity->camera->farPlane);
     cameraController_.setPose(position, forward, *pathTracer_);
 }
 
@@ -7088,6 +7122,14 @@ void Application::updateWindowTitle(float seconds) {
     }
     title << " - Vibode Engine";
     glfwSetWindowTitle(window_, title.str().c_str());
+}
+
+void Application::showMainWindowIfHidden() {
+    if (!mainWindowHiddenUntilRenderer_ || window_ == nullptr) {
+        return;
+    }
+    glfwShowWindow(window_);
+    mainWindowHiddenUntilRenderer_ = false;
 }
 
 void Application::toggleBorderlessFullscreen() {

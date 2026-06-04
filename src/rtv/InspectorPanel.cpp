@@ -68,6 +68,27 @@ void tooltip(const char* text) {
     }
 }
 
+std::vector<MeshPrimitiveAsset::MaterialVariant> materialVariantChoices(const MeshAsset* mesh) {
+    std::vector<MeshPrimitiveAsset::MaterialVariant> choices;
+    if (mesh == nullptr) {
+        return choices;
+    }
+    for (const MeshPrimitiveAsset& primitive : mesh->primitives) {
+        for (const auto& variant : primitive.materialVariants) {
+            const auto existing = std::find_if(choices.begin(), choices.end(), [&](const auto& choice) {
+                return choice.variantIndex == variant.variantIndex;
+            });
+            if (existing == choices.end()) {
+                choices.push_back(variant);
+            }
+        }
+    }
+    std::sort(choices.begin(), choices.end(), [](const auto& a, const auto& b) {
+        return a.variantIndex < b.variantIndex;
+    });
+    return choices;
+}
+
 bool resetFieldButton(const char* id, const char* tooltipText = "Reset to default") {
     ImGui::SameLine();
     const std::string buttonId = std::string("InspectorReset") + id;
@@ -535,14 +556,37 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             const EntityId oldActiveCamera = document.activeCamera();
             const SceneDocument beforeRenderSettings = document;
             bool changed = false;
+            int projection = static_cast<int>(camera.projection);
+            if (inspectorComboRow("Projection", &projection, "Perspective\0Orthographic\0")) {
+                camera.projection = projection == 1 ? 1u : 0u;
+                changed = true;
+            }
             float fovDegrees = glm::degrees(camera.verticalFovRadians);
-            if (inspectorSliderFloatRow("Vertical FOV", &fovDegrees, 20.0f, 120.0f, "%.1f")) {
+            if (camera.projection == 0u && inspectorSliderFloatRow("Vertical FOV", &fovDegrees, 20.0f, 120.0f, "%.1f")) {
                 camera.verticalFovRadians = glm::radians(fovDegrees);
                 changed = true;
             }
-            if (resetFieldButton("CameraFov")) {
+            if (camera.projection == 0u && resetFieldButton("CameraFov")) {
                 camera.verticalFovRadians = Camera{}.verticalFovRadians;
                 changed = true;
+            }
+            if (camera.projection == 0u) {
+                changed |= inspectorDragFloatRow("Aspect Ratio", &camera.aspectRatio, 0.01f, 0.0f, 8.0f, "%.3f");
+                if (resetFieldButton("CameraAspect")) {
+                    camera.aspectRatio = Camera{}.aspectRatio;
+                    changed = true;
+                }
+            } else {
+                changed |= inspectorDragFloatRow("Ortho X Magnification", &camera.orthographicXmag, 0.01f, 0.001f, 100000.0f, "%.3f");
+                if (resetFieldButton("CameraOrthoX")) {
+                    camera.orthographicXmag = Camera{}.orthographicXmag;
+                    changed = true;
+                }
+                changed |= inspectorDragFloatRow("Ortho Y Magnification", &camera.orthographicYmag, 0.01f, 0.001f, 100000.0f, "%.3f");
+                if (resetFieldButton("CameraOrthoY")) {
+                    camera.orthographicYmag = Camera{}.orthographicYmag;
+                    changed = true;
+                }
             }
             changed |= inspectorDragFloatRow("Near Plane", &camera.nearPlane, 0.005f, 0.001f, 100.0f, "%.3f");
             if (resetFieldButton("CameraNear")) {
@@ -802,11 +846,61 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             changed |= inspectorCheckboxRow("Visible To Camera", &renderer.visibleToCamera);
             inspectorReadonlyRow("Mesh Asset", std::to_string(renderer.mesh.index));
             inspectorReadonlyRow("Renderer Instance Cache", std::to_string(renderer.rendererInstanceIndex));
+            const MeshAsset* rendererMesh = nullptr;
             if (state.assets != nullptr) {
-                const MeshAsset* mesh = state.assets->mesh(renderer.mesh);
-                if (mesh != nullptr) {
-                    inspectorReadonlyRow("Mesh", mesh->name.empty() ? "(unnamed)" : mesh->name.c_str());
-                    inspectorReadonlyRow("Geometry", std::to_string(mesh->vertices.size()) + " vertices, " + std::to_string(mesh->primitives.size()) + " primitives");
+                rendererMesh = state.assets->mesh(renderer.mesh);
+                if (rendererMesh != nullptr) {
+                    inspectorReadonlyRow("Mesh", rendererMesh->name.empty() ? "(unnamed)" : rendererMesh->name.c_str());
+                    inspectorReadonlyRow("Geometry", std::to_string(rendererMesh->vertices.size()) + " vertices, " + std::to_string(rendererMesh->primitives.size()) + " primitives");
+                }
+            }
+            const std::vector<MeshPrimitiveAsset::MaterialVariant> variantChoices = materialVariantChoices(rendererMesh);
+            if (!variantChoices.empty()) {
+                const std::string activeVariantLabel = renderer.activeMaterialVariantIndex == UINT32_MAX
+                    ? std::string("Default")
+                    : (renderer.activeMaterialVariantName.empty()
+                        ? "Variant " + std::to_string(renderer.activeMaterialVariantIndex)
+                        : renderer.activeMaterialVariantName);
+                if (ImGui::BeginCombo("Material Variant", activeVariantLabel.c_str())) {
+                    const bool defaultSelected = renderer.activeMaterialVariantIndex == UINT32_MAX;
+                    if (ImGui::Selectable("Default", defaultSelected)) {
+                        renderer.activeMaterialVariantIndex = UINT32_MAX;
+                        renderer.activeMaterialVariantName.clear();
+                        document.markDirty(SceneUpdateKind::MaterialOnly);
+                        requests.sceneUpdate = SceneUpdateKind::MaterialOnly;
+                        requests.setMeshRenderer = EditorMeshRendererChange{
+                            .entity = entity->id,
+                            .oldRenderer = oldRenderer,
+                            .newRenderer = renderer,
+                            .updateKind = SceneUpdateKind::MaterialOnly,
+                        };
+                    }
+                    if (defaultSelected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                    for (const auto& variant : variantChoices) {
+                        const std::string fallback = "Variant " + std::to_string(variant.variantIndex);
+                        const std::string label = variant.variantName.empty()
+                            ? fallback
+                            : variant.variantName + "##" + std::to_string(variant.variantIndex);
+                        const bool selected = renderer.activeMaterialVariantIndex == variant.variantIndex;
+                        if (ImGui::Selectable(label.c_str(), selected)) {
+                            renderer.activeMaterialVariantIndex = variant.variantIndex;
+                            renderer.activeMaterialVariantName = variant.variantName.empty() ? fallback : variant.variantName;
+                            document.markDirty(SceneUpdateKind::MaterialOnly);
+                            requests.sceneUpdate = SceneUpdateKind::MaterialOnly;
+                            requests.setMeshRenderer = EditorMeshRendererChange{
+                                .entity = entity->id,
+                                .oldRenderer = oldRenderer,
+                                .newRenderer = renderer,
+                                .updateKind = SceneUpdateKind::MaterialOnly,
+                            };
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
                 }
             }
             if (ImGui::TreeNodeEx("Material Slots", ImGuiTreeNodeFlags_DefaultOpen)) {

@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <optional>
+#include <vector>
 
 namespace rtv {
 
@@ -20,11 +21,12 @@ public:
     [[nodiscard]] SceneAsset loadWithCache(const std::filesystem::path& path);
 
 private:
-    [[nodiscard]] CachedScene buildCachedScene(const std::filesystem::path& path, const SceneAsset& scene);
+    [[nodiscard]] CachedScene buildCachedScene(const std::filesystem::path& path, const SceneAsset& scene, const std::vector<std::filesystem::path>& bufferDependencies);
 
     AssetManager& assets_;
     bool useCache_ = true;
     bool cacheWritesEnabled_ = true;
+    std::vector<std::filesystem::path> lastBufferDependencies_;
 };
 
 } // namespace rtv

@@ -257,7 +257,8 @@ RestirGiReservoir wavefront_make_restir_gi_candidate(
 
 Material material_for_hit(WavefrontHit hit) {
     Material material = decode_material(hit.material_instance_primitive.x);
-    apply_material_textures(material, hit.barycentrics_hit_kind.xy);
+    apply_material_textures(material, hit.barycentrics_hit_kind.xy, hit.uv1.xy);
+    apply_material_vertex_color(material, hit.vertex_color);
     return apply_debug_material_mode(material);
 }
 
@@ -650,6 +651,18 @@ void main() {
     uint receiver_material_id = state.material_instance_primitive.x;
     state.material_instance_primitive = hit.material_instance_primitive;
     atomicAdd(validation.metrics.z, 1u);
+
+    if (material_is_unlit(material)) {
+        vec3 unlit = throughput * material.color;
+        state.radiance.rgb += unlit;
+        if (depth == 0u) {
+            write_primary_gbuffer_hit(pixel_index, hit, material, normal, hit_pos, state.radiance.rgb);
+        }
+        state.rng_depth_flags = uvec4(rng, depth + 1u, flags | WAVEFRONT_FLAG_TERMINATED, pixel_index);
+        pixel_state.records[pixel_index] = state;
+        atomicAdd(validation.counters.w, 1u);
+        return;
+    }
 
     if (has_positive_radiance(material.emissive)) {
         vec3 emissive = throughput * material.emissive;

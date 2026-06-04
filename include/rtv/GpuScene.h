@@ -54,6 +54,8 @@ struct alignas(16) CameraUniform {
     glm::vec4 dofControls{0.0f, 10.0f, 0.0f, 0.0f}; // x = aperture radius, y = focus distance, z = blade count, w = bokeh rotation
     glm::vec4 motionBlurControls{0.0f, 0.0f, 1.0f, 0.0f}; // x = enabled, y = shutter open, z = shutter close, w = external denoiser raw input
     glm::vec4 volumeControls{0.0f, 0.0f, 0.0f, 0.0f}; // x = enabled, y = sigma_s, z = sigma_a, w = anisotropy
+    glm::vec4 projectionControls{0.0f, 0.0f, 1.0f, 1.0f}; // x = projection: 0 perspective, 1 orthographic; y = authored aspect; zw = ortho x/y magnification
+    glm::vec4 clipControls{0.01f, 1000.0f, 0.0f, 0.0f}; // xy = near/far planes
 };
 
 static_assert(offsetof(CameraUniform, jitter) == 128, "CameraUniform::jitter must match std140 layout");
@@ -66,7 +68,9 @@ static_assert(offsetof(CameraUniform, pathTraceControls) == 224, "CameraUniform:
 static_assert(offsetof(CameraUniform, dofControls) == 240, "CameraUniform::dofControls must match std140 layout");
 static_assert(offsetof(CameraUniform, motionBlurControls) == 256, "CameraUniform::motionBlurControls must match std140 layout");
 static_assert(offsetof(CameraUniform, volumeControls) == 272, "CameraUniform::volumeControls must match std140 layout");
-static_assert(sizeof(CameraUniform) == 288, "CameraUniform size must match std140 layout");
+static_assert(offsetof(CameraUniform, projectionControls) == 288, "CameraUniform::projectionControls must match std140 layout");
+static_assert(offsetof(CameraUniform, clipControls) == 304, "CameraUniform::clipControls must match std140 layout");
+static_assert(sizeof(CameraUniform) == 320, "CameraUniform size must match std140 layout");
 
 struct MeshParamsUniform {
     uint32_t vertexCount = 0;
@@ -115,6 +119,8 @@ struct GpuLocalVertex {
     glm::vec4 positionUvX{};
     glm::vec4 normalUvY{};
     glm::vec4 tangent{};
+    glm::vec4 color{1.0f};
+    glm::vec4 texcoord1{};
 };
 
 struct GpuInstanceBoundsRecord {

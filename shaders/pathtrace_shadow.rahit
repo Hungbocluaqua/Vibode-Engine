@@ -52,7 +52,9 @@ void main() {
     vec2 uv = vec2(
         v0.position_uv_x.w * bary.x + v1.position_uv_x.w * bary.y + v2.position_uv_x.w * bary.z,
         v0.normal_uv_y.w * bary.x + v1.normal_uv_y.w * bary.y + v2.normal_uv_y.w * bary.z);
-    apply_material_alpha_texture(material, uv);
+    vec2 uv1 = v0.texcoord1.xy * bary.x + v1.texcoord1.xy * bary.y + v2.texcoord1.xy * bary.z;
+    apply_material_alpha_texture(material, uv, uv1);
+    material.alpha_factor *= clamp((v0.color * bary.x + v1.color * bary.y + v2.color * bary.z).a, 0.0, 1.0);
     uint alphaSeed = instanceIndex * 73856093u ^ globalTriangleIndex * 19349663u ^ uint(gl_LaunchIDEXT.x) * 83492791u ^ uint(gl_LaunchIDEXT.y);
     if (!accept_material_alpha(material, alphaSeed)) {
         record_rt_counter(RT_DIAG_SHADOW_ANY_HIT_IGNORED);

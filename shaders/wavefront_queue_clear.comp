@@ -58,7 +58,7 @@ void main() {
     const bool layout_ok =
         WAVEFRONT_QUEUE_HEADER_STRIDE_BYTES == 32u &&
         WAVEFRONT_RAY_STRIDE_BYTES == 48u &&
-        WAVEFRONT_HIT_STRIDE_BYTES == 112u &&
+        WAVEFRONT_HIT_STRIDE_BYTES == 144u &&
         WAVEFRONT_SHADOW_RAY_STRIDE_BYTES == 48u &&
         WAVEFRONT_PIXEL_STATE_STRIDE_BYTES == 112u;
     if (!layout_ok) {

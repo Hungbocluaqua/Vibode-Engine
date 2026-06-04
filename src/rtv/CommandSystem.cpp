@@ -395,7 +395,7 @@ void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool
         VkSemaphoreSubmitInfo& wait = graphicsWaits[graphicsWaitCount++];
         wait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
         wait.semaphore = frame.imageAvailable;
-        wait.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     }
 
     std::array<VkSemaphoreSubmitInfo, 2> graphicsSignals{};
@@ -471,7 +471,7 @@ void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool
         VkSemaphoreSubmitInfo& imageAvailableWait = postWaits[postWaitCount++];
         imageAvailableWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
         imageAvailableWait.semaphore = frame.imageAvailable;
-        imageAvailableWait.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        imageAvailableWait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     }
 
     VkSemaphoreSubmitInfo postSignal{};

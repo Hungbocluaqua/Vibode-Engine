@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 25;
+constexpr uint32_t kCacheVersion = 34;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -92,14 +92,6 @@ bool SceneCache::isCacheValid(const std::filesystem::path& gltfPath, const std::
     uint64_t cacheMtime = fileMtime(cachePath);
     if (gltfMtime > cacheMtime) {
         return false;
-    }
-
-    std::filesystem::path binPath = gltfPath.parent_path() / (gltfPath.stem().string() + ".bin");
-    if (std::filesystem::exists(binPath)) {
-        uint64_t binMtime = fileMtime(binPath);
-        if (binMtime > cacheMtime) {
-            return false;
-        }
     }
 
     std::FILE* file = nullptr;
@@ -247,6 +239,12 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeFloat(file, mat.clearcoatRoughnessFactor);
         writeUint32(file, mat.hasTransmission);
         writeFloat(file, mat.transmissionFactor);
+        writeUint32(file, mat.hasVolume);
+        writeFloat(file, mat.volumeThicknessFactor);
+        writeFloat(file, mat.volumeAttenuationDistance);
+        writeBytes(file, &mat.volumeAttenuationColor, sizeof(mat.volumeAttenuationColor));
+        writeUint32(file, mat.hasDispersion);
+        writeFloat(file, mat.dispersionFactor);
         writeUint32(file, mat.hasSpecular);
         writeFloat(file, mat.specularFactor);
         writeBytes(file, &mat.specularColorFactor, sizeof(mat.specularColorFactor));
@@ -275,6 +273,7 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeInt32(file, mat.clearcoatRoughnessTextureIndex);
         writeInt32(file, mat.clearcoatNormalTextureIndex);
         writeInt32(file, mat.transmissionTextureIndex);
+        writeInt32(file, mat.volumeThicknessTextureIndex);
         writeInt32(file, mat.specularTextureIndex);
         writeInt32(file, mat.specularColorTextureIndex);
         writeInt32(file, mat.sheenColorTextureIndex);
@@ -288,7 +287,28 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeBytes(file, &mat.normalTextureTransform, sizeof(mat.normalTextureTransform));
         writeBytes(file, &mat.emissiveTextureTransform, sizeof(mat.emissiveTextureTransform));
         writeBytes(file, &mat.occlusionTextureTransform, sizeof(mat.occlusionTextureTransform));
+        writeBytes(file, &mat.clearcoatTextureTransform, sizeof(mat.clearcoatTextureTransform));
+        writeBytes(file, &mat.clearcoatRoughnessTextureTransform, sizeof(mat.clearcoatRoughnessTextureTransform));
+        writeBytes(file, &mat.clearcoatNormalTextureTransform, sizeof(mat.clearcoatNormalTextureTransform));
+        writeBytes(file, &mat.transmissionTextureTransform, sizeof(mat.transmissionTextureTransform));
+        writeBytes(file, &mat.volumeThicknessTextureTransform, sizeof(mat.volumeThicknessTextureTransform));
+        writeBytes(file, &mat.specularTextureTransform, sizeof(mat.specularTextureTransform));
+        writeBytes(file, &mat.specularColorTextureTransform, sizeof(mat.specularColorTextureTransform));
+        writeBytes(file, &mat.sheenColorTextureTransform, sizeof(mat.sheenColorTextureTransform));
+        writeBytes(file, &mat.sheenRoughnessTextureTransform, sizeof(mat.sheenRoughnessTextureTransform));
+        writeBytes(file, &mat.iridescenceTextureTransform, sizeof(mat.iridescenceTextureTransform));
+        writeBytes(file, &mat.iridescenceThicknessTextureTransform, sizeof(mat.iridescenceThicknessTextureTransform));
+        writeBytes(file, &mat.anisotropyTextureTransform, sizeof(mat.anisotropyTextureTransform));
         writeUint32(file, mat.shaderCompatibilityMask);
+    }
+
+    uint32_t materialVariantCount = static_cast<uint32_t>(scene.materialVariants.size());
+    if (!writeUint32(file, materialVariantCount)) {
+        std::fclose(file);
+        return false;
+    }
+    for (const std::string& variantName : scene.materialVariants) {
+        writeString(file, variantName);
     }
 
     uint32_t meshCount = static_cast<uint32_t>(scene.meshes.size());
@@ -316,6 +336,13 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
             writeUint32(file, prim.firstIndex);
             writeUint32(file, prim.indexCount);
             writeInt32(file, prim.materialIndex);
+            uint32_t variantCount = static_cast<uint32_t>(prim.materialVariants.size());
+            writeUint32(file, variantCount);
+            for (const auto& variant : prim.materialVariants) {
+                writeUint32(file, variant.variantIndex);
+                writeString(file, variant.variantName);
+                writeInt32(file, variant.materialIndex);
+            }
         }
     }
 
@@ -329,7 +356,11 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeBytes(file, &node.transform, sizeof(node.transform));
         writeInt32(file, node.meshIndex);
         writeUint32(file, node.hasCamera);
+        writeUint32(file, node.cameraProjection);
         writeFloat(file, node.cameraYfov);
+        writeFloat(file, node.cameraAspectRatio);
+        writeFloat(file, node.cameraOrthoXmag);
+        writeFloat(file, node.cameraOrthoYmag);
         writeFloat(file, node.cameraNear);
         writeFloat(file, node.cameraFar);
         writeInt32(file, node.parentIndex);
@@ -545,6 +576,12 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readFloat(file, mat.clearcoatRoughnessFactor)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.hasTransmission)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.transmissionFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasVolume)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.volumeThicknessFactor)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.volumeAttenuationDistance)) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.volumeAttenuationColor, sizeof(mat.volumeAttenuationColor))) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.hasDispersion)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.dispersionFactor)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.hasSpecular)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.specularFactor)) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.specularColorFactor, sizeof(mat.specularColorFactor))) { std::fclose(file); return std::nullopt; }
@@ -573,6 +610,7 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readInt32(file, mat.clearcoatRoughnessTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.clearcoatNormalTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.transmissionTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.volumeThicknessTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.specularTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.specularColorTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.sheenColorTextureIndex)) { std::fclose(file); return std::nullopt; }
@@ -586,7 +624,29 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readBytes(file, &mat.normalTextureTransform, sizeof(mat.normalTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.emissiveTextureTransform, sizeof(mat.emissiveTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.occlusionTextureTransform, sizeof(mat.occlusionTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.clearcoatTextureTransform, sizeof(mat.clearcoatTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.clearcoatRoughnessTextureTransform, sizeof(mat.clearcoatRoughnessTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.clearcoatNormalTextureTransform, sizeof(mat.clearcoatNormalTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.transmissionTextureTransform, sizeof(mat.transmissionTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.volumeThicknessTextureTransform, sizeof(mat.volumeThicknessTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.specularTextureTransform, sizeof(mat.specularTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.specularColorTextureTransform, sizeof(mat.specularColorTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.sheenColorTextureTransform, sizeof(mat.sheenColorTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.sheenRoughnessTextureTransform, sizeof(mat.sheenRoughnessTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.iridescenceTextureTransform, sizeof(mat.iridescenceTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.iridescenceThicknessTextureTransform, sizeof(mat.iridescenceThicknessTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readBytes(file, &mat.anisotropyTextureTransform, sizeof(mat.anisotropyTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.shaderCompatibilityMask)) { std::fclose(file); return std::nullopt; }
+    }
+
+    uint32_t materialVariantCount = 0;
+    if (!readUint32(file, materialVariantCount)) {
+        std::fclose(file);
+        return std::nullopt;
+    }
+    scene.materialVariants.resize(materialVariantCount);
+    for (std::string& variantName : scene.materialVariants) {
+        if (!readString(file, variantName)) { std::fclose(file); return std::nullopt; }
     }
 
     uint32_t meshCount = 0;
@@ -618,6 +678,14 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
             if (!readUint32(file, prim.firstIndex)) { std::fclose(file); return std::nullopt; }
             if (!readUint32(file, prim.indexCount)) { std::fclose(file); return std::nullopt; }
             if (!readInt32(file, prim.materialIndex)) { std::fclose(file); return std::nullopt; }
+            uint32_t variantCount = 0;
+            if (!readUint32(file, variantCount)) { std::fclose(file); return std::nullopt; }
+            prim.materialVariants.resize(variantCount);
+            for (auto& variant : prim.materialVariants) {
+                if (!readUint32(file, variant.variantIndex)) { std::fclose(file); return std::nullopt; }
+                if (!readString(file, variant.variantName)) { std::fclose(file); return std::nullopt; }
+                if (!readInt32(file, variant.materialIndex)) { std::fclose(file); return std::nullopt; }
+            }
         }
     }
 
@@ -633,7 +701,11 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readBytes(file, &node.transform, sizeof(node.transform))) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, node.meshIndex)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, node.hasCamera)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, node.cameraProjection)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, node.cameraYfov)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, node.cameraAspectRatio)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, node.cameraOrthoXmag)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, node.cameraOrthoYmag)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, node.cameraNear)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, node.cameraFar)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, node.parentIndex)) { std::fclose(file); return std::nullopt; }

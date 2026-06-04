@@ -43,14 +43,17 @@ void reset_wavefront_payload() {
     payload.primitive_id = 0xffffffffu;
     payload.picking = 0u;
     payload.uv = vec2(0.0);
+    payload.uv1 = vec2(0.0);
     payload.tangent = vec3(1.0, 0.0, 0.0);
     payload.bitangent = vec3(0.0, 0.0, 1.0);
+    payload.vertex_color = vec4(1.0);
 }
 
 Material material_for_wavefront_hit(inout RayPayload hit, vec3 ray_direction) {
     Material material = decode_material(hit.material_id);
-    apply_material_textures(material, hit.uv);
-    hit.normal = apply_normal_texture(material, hit.uv, hit.normal, hit.tangent, hit.bitangent, ray_direction);
+    apply_material_textures(material, hit.uv, hit.uv1);
+    apply_material_vertex_color(material, hit.vertex_color);
+    hit.normal = apply_normal_texture(material, hit.uv, hit.uv1, hit.normal, hit.tangent, hit.bitangent, ray_direction);
     return apply_debug_material_mode(material);
 }
 
@@ -61,6 +64,8 @@ void write_wavefront_hit(uint index, WavefrontRay source_ray, float roughness) {
     hit.barycentrics_hit_kind = vec4(payload.uv, float(payload.front_face), float(payload.hit));
     hit.geom_normal = vec4(payload.geom_normal, 0.0);
     hit.tangent = vec4(payload.tangent, 0.0);
+    hit.vertex_color = payload.vertex_color;
+    hit.uv1 = vec4(payload.uv1, 0.0, 0.0);
     hit.material_instance_primitive = uvec4(
         payload.material_id,
         payload.instance_id,

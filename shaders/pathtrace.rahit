@@ -50,7 +50,9 @@ void main() {
     vec2 uv = vec2(
         v0.position_uv_x.w * bary.x + v1.position_uv_x.w * bary.y + v2.position_uv_x.w * bary.z,
         v0.normal_uv_y.w * bary.x + v1.normal_uv_y.w * bary.y + v2.normal_uv_y.w * bary.z);
-    apply_material_alpha_texture(material, uv);
+    vec2 uv1 = v0.texcoord1.xy * bary.x + v1.texcoord1.xy * bary.y + v2.texcoord1.xy * bary.z;
+    apply_material_alpha_texture(material, uv, uv1);
+    material.alpha_factor *= clamp((v0.color * bary.x + v1.color * bary.y + v2.color * bary.z).a, 0.0, 1.0);
     if (payload.picking != 0u && material.alpha_mode == ALPHA_MODE_BLEND) {
         if (material.alpha_factor < 0.5) {
             record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);

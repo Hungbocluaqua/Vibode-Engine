@@ -54,7 +54,7 @@ add_executable(rtvulkan
     "${IMGUI_SOURCE_DIR}/imgui_tables.cpp"
     "${IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
     "${IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp"
-    "${IMGUI_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
+    src/third_party/imgui/imgui_impl_vulkan.cpp
     src/main.cpp
     src/rtv/Application.cpp
     src/rtv/AccelerationStructure.cpp

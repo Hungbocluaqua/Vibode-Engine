@@ -172,12 +172,22 @@ Ray make_camera_ray(uvec2 pixel, uvec2 size, ivec2 sampleCoords, uint sampleInde
     vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
     vec2 uv = (vec2(pixel) + jitter) / vec2(size);
     vec2 ndc = uv * 2.0 - vec2(1.0);
-    float aspect = float(size.x) / max(float(size.y), 1.0);
-    float scale = tan(camera.fov_y * 0.5);
-    vec3 pinholeDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * aspect * scale - camera.up.xyz * ndc.y * scale);
+    float viewportAspect = float(size.x) / max(float(size.y), 1.0);
+    float authoredAspect = camera.projection_controls.y > 0.0 ? camera.projection_controls.y : viewportAspect;
+    bool orthographic = camera.projection_controls.x >= 0.5;
+    vec3 pinholeOrigin = camera.pos.xyz;
+    vec3 pinholeDir = normalize(camera.forward.xyz);
+    if (orthographic) {
+        float xmag = max(camera.projection_controls.z, 1.0e-4);
+        float ymag = max(camera.projection_controls.w, 1.0e-4);
+        pinholeOrigin += camera.right.xyz * ndc.x * xmag * 0.5 - camera.up.xyz * ndc.y * ymag * 0.5;
+    } else {
+        float scale = tan(camera.fov_y * 0.5);
+        pinholeDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * authoredAspect * scale - camera.up.xyz * ndc.y * scale);
+    }
 
     Ray ray;
-    ray.origin = camera.pos.xyz;
+    ray.origin = pinholeOrigin;
     ray.direction = pinholeDir;
     ray.time = sample_camera_time(sampleCoords, sampleIndex);
 
@@ -189,8 +199,8 @@ Ray make_camera_ray(uvec2 pixel, uvec2 size, ivec2 sampleCoords, uint sampleInde
     vec2 lens = concentric_disk_sample(sample_dimension_2d(sampleCoords, camera.temporal_frame_index, sampleIndex, SAMPLE_DIM_CAMERA_LENS));
     lens *= polygon_aperture_radius(lens, camera.dof_controls.z, camera.dof_controls.w) * apertureRadius;
     float forwardProjection = max(dot(pinholeDir, normalize(camera.forward.xyz)), 1.0e-4);
-    vec3 focusPoint = camera.pos.xyz + pinholeDir * (max(camera.dof_controls.y, 0.01) / forwardProjection);
-    vec3 lensOrigin = camera.pos.xyz + camera.right.xyz * lens.x + camera.up.xyz * lens.y;
+    vec3 focusPoint = pinholeOrigin + pinholeDir * (max(camera.dof_controls.y, 0.01) / forwardProjection);
+    vec3 lensOrigin = pinholeOrigin + camera.right.xyz * lens.x + camera.up.xyz * lens.y;
     ray.origin = lensOrigin;
     ray.direction = normalize(focusPoint - lensOrigin);
     return ray;
@@ -547,8 +557,10 @@ void reset_payload() {
     payload.primitive_id = 0xffffffffu;
     payload.picking = 0u;
     payload.uv = vec2(0.0);
+    payload.uv1 = vec2(0.0);
     payload.tangent = vec3(1.0, 0.0, 0.0);
     payload.bitangent = vec3(0.0, 0.0, 1.0);
+    payload.vertex_color = vec4(1.0);
 }
 
 RayPayload trace_surface_with_mode(vec3 origin, vec3 direction, float tMin, float tMax, float rayTime, uint picking) {
@@ -673,8 +685,10 @@ vec3 shadow_origin(RayPayload hit, vec3 wi) {
 
 Material material_for_hit(inout RayPayload hit, vec3 rayDirection) {
     Material material = decode_material(hit.material_id);
-    apply_material_textures(material, hit.uv);
-    hit.normal = apply_normal_texture(material, hit.uv, hit.normal, hit.tangent, hit.bitangent, rayDirection);
+    apply_material_textures(material, hit.uv, hit.uv1);
+    apply_material_vertex_color(material, hit.vertex_color);
+    hit.normal = apply_normal_texture(material, hit.uv, hit.uv1, hit.normal, hit.tangent, hit.bitangent, rayDirection);
+    apply_clearcoat_normal_texture(material, hit.uv, hit.uv1, hit.normal, hit.tangent, hit.bitangent, rayDirection);
     return apply_debug_material_mode(material);
 }
 
@@ -717,7 +731,9 @@ vec3 caustic_shadow_transmittance_stats(
         transmissiveHits += 1u;
         record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_HITS);
 
-        float eta = shadowHit.front_face != 0u ? (1.0 / max(material.ior, 1.01)) : max(material.ior, 1.01);
+        vec3 dispersionIor = material_dispersion_ior(material);
+        vec3 etaRgb = shadowHit.front_face != 0u ? (vec3(1.0) / dispersionIor) : dispersionIor;
+        float eta = etaRgb.g;
         float cosTheta = min(dot(-rayDir, shadowHit.normal), 1.0);
         float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
         if (eta * sinTheta > 1.0) {
@@ -727,8 +743,14 @@ vec3 caustic_shadow_transmittance_stats(
         }
 
         float surfaceT = homogeneous_transmittance_scalar(shadowHit.t);
-        float fresnel = reflectance(cosTheta, eta);
-        throughput *= material.color * surfaceT * (1.0 - fresnel);
+        vec3 fresnel = vec3(
+            reflectance(cosTheta, etaRgb.r),
+            reflectance(cosTheta, etaRgb.g),
+            reflectance(cosTheta, etaRgb.b));
+        vec3 volumeT = shadowHit.front_face == 0u
+            ? material_volume_transmittance(material, shadowHit.t)
+            : vec3(1.0);
+        throughput *= material.color * surfaceT * volumeT * (vec3(1.0) - fresnel);
         remaining = max(remaining - shadowHit.t, 0.0);
         if (remaining <= shadow_distance_bias() || max(max(throughput.r, throughput.g), throughput.b) <= 1.0e-5) {
             record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
@@ -1568,6 +1590,19 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         }
 
         vec3 wo = -ray.direction;
+        if (material_is_unlit(material)) {
+            float unlitContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
+            if (bounce > 0u) {
+                unlitContributionScale *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
+            }
+            vec3 unlit = throughput * material.color * atmosTransmittance * unlitContributionScale;
+            radiance += unlit;
+            if (bounce > 0u) {
+                components.indirect_light += unlit;
+            }
+            components.emissive_light += unlit;
+            break;
+        }
         bool hitEmissiveSurface = has_positive_radiance(material.emissive);
         vec3 restirGiCandidateRadiance = vec3(0.0);
         if (hitEmissiveSurface) {
@@ -1831,17 +1866,26 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             previousEventType = PATH_EVENT_DELTA;
             continuedPath = true;
         } else if (material.mat_type == 2u && material_is_delta(material)) {
-            float refractionRatio = hit.front_face != 0u ? (1.0 / max(material.ior, 1.01)) : max(material.ior, 1.01);
+            float dispersionSample = sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_DIELECTRIC + 1u);
+            uint dispersionChannel = material_dispersion_channel(material, dispersionSample);
+            vec3 dispersionIor = material_dispersion_ior(material);
+            float channelIor = material_channel_value(dispersionIor, dispersionChannel);
+            float refractionRatio = hit.front_face != 0u ? (1.0 / channelIor) : channelIor;
             float cosTheta = min(dot(-ray.direction, hit.normal), 1.0);
             float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
             bool cannotRefract = refractionRatio * sinTheta > 1.0;
             float dielectricSample = sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_DIELECTRIC);
-            vec3 scatteredDirection = (cannotRefract || reflectance(cosTheta, refractionRatio) > dielectricSample)
+            float fresnel = reflectance(cosTheta, refractionRatio);
+            bool reflected = cannotRefract || fresnel > dielectricSample;
+            vec3 scatteredDirection = reflected
                 ? reflect(ray.direction, hit.normal)
                 : refract(ray.direction, hit.normal, refractionRatio);
             ray.direction = scatteredDirection;
             ray.origin = hit.world_pos + (dot(ray.direction, hit.normal) > 0.0 ? hit.normal : -hit.normal) * shadow_self_hit_epsilon();
-            throughput *= material.color;
+            throughput *= material.color * material_dispersion_channel_weight(material, dispersionChannel);
+            if (!reflected && hit.front_face == 0u) {
+                throughput *= material_volume_transmittance(material, hit.t);
+            }
             throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, true);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;

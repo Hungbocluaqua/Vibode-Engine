@@ -167,6 +167,7 @@ private:
     void updateSunDrag(double mouseX, double mouseY);
     void finishSunDrag(bool cancel);
     void updateWindowTitle(float seconds);
+    void showMainWindowIfHidden();
     void toggleBorderlessFullscreen();
     void reloadGltfScene(const std::filesystem::path& path);
     bool requestSceneLoad(SceneLoadRequest request);
@@ -240,6 +241,7 @@ private:
     [[nodiscard]] bool pressedOnce(int key);
 
     GLFWwindow* window_ = nullptr;
+    bool mainWindowHiddenUntilRenderer_ = false;
     bool headless_ = false;
     uint32_t nextDiagnosticFrameIndex_ = 0;
     uint32_t warmupFrameCount_ = 0;

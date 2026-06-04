@@ -50,6 +50,12 @@ struct CachedMaterialData {
     float clearcoatRoughnessFactor = 0.0f;
     uint32_t hasTransmission = 0;
     float transmissionFactor = 0.0f;
+    uint32_t hasVolume = 0;
+    float volumeThicknessFactor = 0.0f;
+    float volumeAttenuationDistance = 0.0f;
+    glm::vec3 volumeAttenuationColor{1.0f};
+    uint32_t hasDispersion = 0;
+    float dispersionFactor = 0.0f;
     uint32_t hasSpecular = 0;
     float specularFactor = 1.0f;
     glm::vec3 specularColorFactor{1.0f};
@@ -78,6 +84,7 @@ struct CachedMaterialData {
     int32_t clearcoatRoughnessTextureIndex = -1;
     int32_t clearcoatNormalTextureIndex = -1;
     int32_t transmissionTextureIndex = -1;
+    int32_t volumeThicknessTextureIndex = -1;
     int32_t specularTextureIndex = -1;
     int32_t specularColorTextureIndex = -1;
     int32_t sheenColorTextureIndex = -1;
@@ -91,15 +98,33 @@ struct CachedMaterialData {
     TextureTransformAsset normalTextureTransform{};
     TextureTransformAsset emissiveTextureTransform{};
     TextureTransformAsset occlusionTextureTransform{};
+    TextureTransformAsset clearcoatTextureTransform{};
+    TextureTransformAsset clearcoatRoughnessTextureTransform{};
+    TextureTransformAsset clearcoatNormalTextureTransform{};
+    TextureTransformAsset transmissionTextureTransform{};
+    TextureTransformAsset volumeThicknessTextureTransform{};
+    TextureTransformAsset specularTextureTransform{};
+    TextureTransformAsset specularColorTextureTransform{};
+    TextureTransformAsset sheenColorTextureTransform{};
+    TextureTransformAsset sheenRoughnessTextureTransform{};
+    TextureTransformAsset iridescenceTextureTransform{};
+    TextureTransformAsset iridescenceThicknessTextureTransform{};
+    TextureTransformAsset anisotropyTextureTransform{};
     uint32_t shaderCompatibilityMask = 1u;
 };
 
 struct CachedPrimitiveData {
+    struct MaterialVariant {
+        uint32_t variantIndex = UINT32_MAX;
+        std::string variantName;
+        int32_t materialIndex = -1;
+    };
     uint32_t firstVertex = 0;
     uint32_t vertexCount = 0;
     uint32_t firstIndex = 0;
     uint32_t indexCount = 0;
     int32_t materialIndex = -1;
+    std::vector<MaterialVariant> materialVariants;
 };
 
 struct CachedMeshData {
@@ -114,7 +139,11 @@ struct CachedNodeData {
     glm::mat4 transform{1.0f};
     int32_t meshIndex = -1;
     uint32_t hasCamera = 0;
+    uint32_t cameraProjection = 0;
     float cameraYfov = 60.0f * 0.017453292519943295f;
+    float cameraAspectRatio = 0.0f;
+    float cameraOrthoXmag = 1.0f;
+    float cameraOrthoYmag = 1.0f;
     float cameraNear = 0.01f;
     float cameraFar = 1000.0f;
     int32_t parentIndex = -1;
@@ -203,6 +232,7 @@ struct CachedScene {
     std::vector<CachedTextureData> textures;
     std::vector<CachedMaterialData> materials;
     std::vector<CachedMeshData> meshes;
+    std::vector<std::string> materialVariants;
     std::vector<CachedNodeData> nodes;
     std::vector<CachedSceneLightData> sceneLights;
     std::vector<uint32_t> rootNodes;

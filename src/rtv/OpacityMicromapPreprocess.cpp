@@ -268,10 +268,11 @@ void accumulateState(OpacityMicromapPrimitiveCpuData& primitive, OpacityMicromap
             continue;
         }
 
+        const bool useUv1 = request.material.baseColorTextureTransform.texCoord == 1u;
         const std::array<glm::vec2, 3> uv = {
-            request.mesh->vertices[i0].texcoord,
-            request.mesh->vertices[i1].texcoord,
-            request.mesh->vertices[i2].texcoord,
+            useUv1 ? request.mesh->vertices[i0].texcoord1 : request.mesh->vertices[i0].texcoord,
+            useUv1 ? request.mesh->vertices[i1].texcoord1 : request.mesh->vertices[i1].texcoord,
+            useUv1 ? request.mesh->vertices[i2].texcoord1 : request.mesh->vertices[i2].texcoord,
         };
 
         auto classifyMicroTriangle = [&](glm::vec3 b0, glm::vec3 b1, glm::vec3 b2) {

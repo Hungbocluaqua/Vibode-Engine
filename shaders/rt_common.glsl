@@ -42,6 +42,8 @@ layout(set = 0, binding = 1, std140) uniform Camera {
     vec4 dof_controls;
     vec4 motion_blur_controls;
     vec4 volume_controls;
+    vec4 projection_controls;
+    vec4 clip_controls;
 } camera;
 
 layout(set = 0, binding = 2, std430) buffer VarianceBuffer { uint variance_buffer[]; };
@@ -195,6 +197,8 @@ struct LocalVertex {
     vec4 position_uv_x;
     vec4 normal_uv_y;
     vec4 tangent;
+    vec4 color;
+    vec4 texcoord1;
 };
 layout(set = 0, binding = 26, std430) readonly buffer LocalMeshVertices {
     LocalVertex local_mesh_vertices[];
@@ -256,6 +260,7 @@ layout(set = 1, binding = 6, std430) readonly buffer SkyCdfCols { float sky_cdf_
 const float SKY_CDF_HALF_RCP_PI_SQ = 0.0506605918210689; // 1/(2*PI*PI)
 
 struct Material {
+    uint material_data_index;
     vec3 color;
     float roughness;
     float ior;
@@ -290,6 +295,25 @@ struct Material {
     int iridescence_thickness_texture;
     float occlusion;
     float normal_variance;
+    float clearcoat_factor;
+    float clearcoat_roughness;
+    int clearcoat_texture;
+    int clearcoat_roughness_texture;
+    int clearcoat_normal_texture;
+    float transmission_factor;
+    int transmission_texture;
+    float specular_factor;
+    vec3 specular_color;
+    int specular_texture;
+    int specular_color_texture;
+    int anisotropy_texture;
+    float volume_thickness_factor;
+    int volume_thickness_texture;
+    vec3 volume_attenuation_color;
+    float volume_attenuation_distance;
+    float dispersion_factor;
+    vec3 clearcoat_normal;
+    float clearcoat_normal_variance;
 };
 
 const uint MATERIAL_CLOSURE_FLAG_DIFFUSE       = 1u << 0u;
@@ -300,6 +324,9 @@ const uint MATERIAL_CLOSURE_FLAG_CLEARCOAT     = 1u << 4u;
 const uint MATERIAL_CLOSURE_FLAG_SHEEN         = 1u << 5u;
 const uint MATERIAL_CLOSURE_FLAG_THIN_FILM     = 1u << 6u;
 const uint MATERIAL_CLOSURE_FLAG_METAL         = 1u << 7u;
+const uint MATERIAL_CLOSURE_FLAG_UNLIT         = 1u << 8u;
+const uint MATERIAL_CLOSURE_FLAG_VOLUME        = 1u << 9u;
+const uint MATERIAL_CLOSURE_FLAG_DISPERSION    = 1u << 10u;
 const float SCREEN_VELOCITY_PACK_SCALE = 512.0;
 const float SCREEN_VELOCITY_SATURATION_THRESHOLD = SCREEN_VELOCITY_PACK_SCALE - 0.5;
 const float SCREEN_VELOCITY_DEBUG_SCALE = 128.0;
@@ -332,6 +359,19 @@ MaterialClosure material_to_closure(Material m) {
         c.flags = MATERIAL_CLOSURE_FLAG_SPECULAR | MATERIAL_CLOSURE_FLAG_TRANSMISSION;
     } else if (m.mat_type == 4u) {
         c.flags = MATERIAL_CLOSURE_FLAG_SPECULAR | MATERIAL_CLOSURE_FLAG_CLEARCOAT;
+    } else if (m.mat_type == 5u) {
+        c.flags = MATERIAL_CLOSURE_FLAG_UNLIT;
+    }
+
+    if ((c.flags & MATERIAL_CLOSURE_FLAG_UNLIT) != 0u) {
+        return c;
+    }
+
+    if (m.transmission_factor > 1.0e-5) {
+        c.flags |= MATERIAL_CLOSURE_FLAG_TRANSMISSION;
+    }
+    if (m.clearcoat_factor > 1.0e-5) {
+        c.flags |= MATERIAL_CLOSURE_FLAG_CLEARCOAT | MATERIAL_CLOSURE_FLAG_SPECULAR;
     }
 
     if (dot(max(m.sheen_color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)) > 1.0e-5) {
@@ -340,8 +380,18 @@ MaterialClosure material_to_closure(Material m) {
     if (m.iridescence_factor > 1.0e-5) {
         c.flags |= MATERIAL_CLOSURE_FLAG_THIN_FILM;
     }
+    if (m.volume_thickness_factor > 1.0e-6 && m.volume_attenuation_distance > 0.0) {
+        c.flags |= MATERIAL_CLOSURE_FLAG_VOLUME;
+    }
+    if (m.dispersion_factor > 1.0e-6) {
+        c.flags |= MATERIAL_CLOSURE_FLAG_DISPERSION;
+    }
 
     return c;
+}
+
+bool material_is_unlit(Material material) {
+    return material.mat_type == 5u;
 }
 
 bool closure_has_flag(MaterialClosure c, uint flag) {
@@ -362,13 +412,35 @@ struct RayPayload {
     uint primitive_id;
     uint picking;
     vec2 uv;
+    vec2 uv1;
     vec3 tangent;
     vec3 bitangent;
+    vec4 vertex_color;
 };
 
 const float PI = 3.14159265358979323846;
 const uint TRI_STRIDE = 12u;
-const uint MATERIAL_STRIDE = 11u;
+const uint MATERIAL_PARAMETER_STRIDE = 17u;
+const uint MATERIAL_TEXTURE_TRANSFORM_COUNT = 17u;
+const uint MATERIAL_TEXTURE_TRANSFORM_BASE = MATERIAL_PARAMETER_STRIDE;
+const uint MATERIAL_STRIDE = MATERIAL_PARAMETER_STRIDE + MATERIAL_TEXTURE_TRANSFORM_COUNT * 2u;
+const uint MATERIAL_TEXTURE_TRANSFORM_BASE_COLOR = 0u;
+const uint MATERIAL_TEXTURE_TRANSFORM_NORMAL = 1u;
+const uint MATERIAL_TEXTURE_TRANSFORM_METALLIC_ROUGHNESS = 2u;
+const uint MATERIAL_TEXTURE_TRANSFORM_EMISSIVE = 3u;
+const uint MATERIAL_TEXTURE_TRANSFORM_OCCLUSION = 4u;
+const uint MATERIAL_TEXTURE_TRANSFORM_SHEEN_COLOR = 5u;
+const uint MATERIAL_TEXTURE_TRANSFORM_SHEEN_ROUGHNESS = 6u;
+const uint MATERIAL_TEXTURE_TRANSFORM_IRIDESCENCE = 7u;
+const uint MATERIAL_TEXTURE_TRANSFORM_IRIDESCENCE_THICKNESS = 8u;
+const uint MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT = 9u;
+const uint MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT_ROUGHNESS = 10u;
+const uint MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT_NORMAL = 11u;
+const uint MATERIAL_TEXTURE_TRANSFORM_TRANSMISSION = 12u;
+const uint MATERIAL_TEXTURE_TRANSFORM_VOLUME_THICKNESS = 13u;
+const uint MATERIAL_TEXTURE_TRANSFORM_SPECULAR = 14u;
+const uint MATERIAL_TEXTURE_TRANSFORM_SPECULAR_COLOR = 15u;
+const uint MATERIAL_TEXTURE_TRANSFORM_ANISOTROPY = 16u;
 const int MATERIAL_TEXTURE_LIMIT = 1024;
 const uint MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB = 1u << 0u;
 const uint MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB = 1u << 1u;
@@ -906,7 +978,14 @@ Material decode_material(uint mat_idx) {
     vec4 d8 = mesh_materials[idx + 8u];
     vec4 d9 = mesh_materials[idx + 9u];
     vec4 d10 = mesh_materials[idx + 10u];
+    vec4 d11 = mesh_materials[idx + 11u];
+    vec4 d12 = mesh_materials[idx + 12u];
+    vec4 d13 = mesh_materials[idx + 13u];
+    vec4 d14 = mesh_materials[idx + 14u];
+    vec4 d15 = mesh_materials[idx + 15u];
+    vec4 d16 = mesh_materials[idx + 16u];
     Material m;
+    m.material_data_index = idx;
     m.color = d0.xyz;
     m.roughness = d0.w;
     m.ior = d1.x;
@@ -941,6 +1020,25 @@ Material decode_material(uint mat_idx) {
     m.iridescence_thickness_texture = int(round(d10.w));
     m.occlusion = 1.0;
     m.normal_variance = 0.0;
+    m.clearcoat_factor = clamp(d11.x, 0.0, 1.0);
+    m.clearcoat_roughness = clamp(d11.y, 0.0, 1.0);
+    m.clearcoat_texture = int(round(d11.z));
+    m.clearcoat_roughness_texture = int(round(d11.w));
+    m.clearcoat_normal_texture = int(round(d12.x));
+    m.transmission_factor = clamp(d12.y, 0.0, 1.0);
+    m.transmission_texture = int(round(d12.z));
+    m.specular_factor = clamp(d12.w, 0.0, 1.0);
+    m.specular_color = max(d13.xyz, vec3(0.0));
+    m.specular_texture = int(round(d13.w));
+    m.specular_color_texture = int(round(d14.x));
+    m.anisotropy_texture = int(round(d14.y));
+    m.volume_thickness_factor = max(d14.z, 0.0);
+    m.volume_thickness_texture = int(round(d14.w));
+    m.volume_attenuation_color = clamp(d15.xyz, vec3(0.0), vec3(1.0));
+    m.volume_attenuation_distance = d15.w;
+    m.dispersion_factor = max(d16.x, 0.0);
+    m.clearcoat_normal = vec3(0.0);
+    m.clearcoat_normal_variance = 0.0;
     return m;
 }
 
@@ -968,11 +1066,40 @@ uint geometry_triangle_offset(uint meshIndex, uint geometryIndex, uint meshFirst
     return rt_geometry_triangle_offsets[range.x + min(geometryIndex, range.y - 1u)];
 }
 
-void apply_material_textures(inout Material material, vec2 uv) {
+vec2 material_texture_uv(Material material, uint slot, vec2 uv0, vec2 uv1) {
+    if (slot >= MATERIAL_TEXTURE_TRANSFORM_COUNT) {
+        return uv0;
+    }
+    uint transformBase = material.material_data_index + MATERIAL_TEXTURE_TRANSFORM_BASE + slot * 2u;
+    vec4 transform1 = mesh_materials[transformBase + 1u];
+    uint texCoord = uint(round(transform1.z));
+    return texCoord == 1u ? uv1 : uv0;
+}
+
+vec2 apply_material_texture_transform(Material material, uint slot, vec2 uv0, vec2 uv1) {
+    vec2 uv = material_texture_uv(material, slot, uv0, uv1);
+    if (slot >= MATERIAL_TEXTURE_TRANSFORM_COUNT) {
+        return uv;
+    }
+    uint transformBase = material.material_data_index + MATERIAL_TEXTURE_TRANSFORM_BASE + slot * 2u;
+    vec4 transform0 = mesh_materials[transformBase + 0u];
+    vec4 transform1 = mesh_materials[transformBase + 1u];
+    if (uint(round(transform1.y)) == 0u) {
+        return uv;
+    }
+    vec2 scaled = uv * transform0.zw;
+    float c = cos(transform1.x);
+    float s = sin(transform1.x);
+    vec2 rotated = vec2(c * scaled.x - s * scaled.y, s * scaled.x + c * scaled.y);
+    return transform0.xy + rotated;
+}
+
+void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
     uint flags = uint(round(material.pad2));
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.base_color_texture;
-        vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], uv);
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_BASE_COLOR, uv0, uv1);
+        vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
         vec3 baseColor = (flags & MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB) != 0u
             ? pow(max(base.rgb, vec3(0.0)), vec3(2.2))
             : base.rgb;
@@ -981,7 +1108,8 @@ void apply_material_textures(inout Material material, vec2 uv) {
     }
     if (material.metallic_roughness_texture >= 0 && material.metallic_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.metallic_roughness_texture;
-        vec4 mr = texture(material_textures[nonuniformEXT(textureIndex)], uv);
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_METALLIC_ROUGHNESS, uv0, uv1);
+        vec4 mr = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
         material.roughness = clamp(material.roughness * mr.g, 0.0, 1.0);
         material.metallic = clamp(material.metallic * mr.b, 0.0, 1.0);
         if (material.mat_type == 0u || material.mat_type == 3u) {
@@ -990,7 +1118,8 @@ void apply_material_textures(inout Material material, vec2 uv) {
     }
     if (material.emissive_texture >= 0 && material.emissive_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.emissive_texture;
-        vec4 emissive = texture(material_textures[nonuniformEXT(textureIndex)], uv);
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_EMISSIVE, uv0, uv1);
+        vec4 emissive = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
         vec3 emissiveColor = (flags & MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB) != 0u
             ? pow(max(emissive.rgb, vec3(0.0)), vec3(2.2))
             : emissive.rgb;
@@ -998,32 +1127,97 @@ void apply_material_textures(inout Material material, vec2 uv) {
     }
     if (material.occlusion_texture >= 0 && material.occlusion_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.occlusion_texture;
-        float ao = texture(material_textures[nonuniformEXT(textureIndex)], uv).r;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_OCCLUSION, uv0, uv1);
+        float ao = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).r;
         material.occlusion = mix(1.0, clamp(ao, 0.0, 1.0), material.occlusion_strength);
     }
     if (material.sheen_color_texture >= 0 && material.sheen_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.sheen_color_texture;
-        material.sheen_color *= texture(material_textures[nonuniformEXT(textureIndex)], uv).rgb;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SHEEN_COLOR, uv0, uv1);
+        material.sheen_color *= texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).rgb;
     }
     if (material.sheen_roughness_texture >= 0 && material.sheen_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.sheen_roughness_texture;
-        material.sheen_roughness = clamp(material.sheen_roughness * texture(material_textures[nonuniformEXT(textureIndex)], uv).a, 0.0, 1.0);
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SHEEN_ROUGHNESS, uv0, uv1);
+        material.sheen_roughness = clamp(material.sheen_roughness * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).a, 0.0, 1.0);
     }
     if (material.iridescence_texture >= 0 && material.iridescence_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.iridescence_texture;
-        material.iridescence_factor = clamp(material.iridescence_factor * texture(material_textures[nonuniformEXT(textureIndex)], uv).r, 0.0, 1.0);
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_IRIDESCENCE, uv0, uv1);
+        material.iridescence_factor = clamp(material.iridescence_factor * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).r, 0.0, 1.0);
     }
     if (material.iridescence_thickness_texture >= 0 && material.iridescence_thickness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.iridescence_thickness_texture;
-        float thicknessMix = texture(material_textures[nonuniformEXT(textureIndex)], uv).g;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_IRIDESCENCE_THICKNESS, uv0, uv1);
+        float thicknessMix = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).g;
         material.iridescence_thickness_min = mix(material.iridescence_thickness_min, material.iridescence_thickness_max, clamp(thicknessMix, 0.0, 1.0));
+    }
+    if (material.clearcoat_texture >= 0 && material.clearcoat_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.clearcoat_texture;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT, uv0, uv1);
+        material.clearcoat_factor = clamp(material.clearcoat_factor * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).r, 0.0, 1.0);
+    }
+    if (material.clearcoat_roughness_texture >= 0 && material.clearcoat_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.clearcoat_roughness_texture;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT_ROUGHNESS, uv0, uv1);
+        material.clearcoat_roughness = clamp(material.clearcoat_roughness * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).g, 0.0, 1.0);
+    }
+    if (material.transmission_texture >= 0 && material.transmission_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.transmission_texture;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_TRANSMISSION, uv0, uv1);
+        material.transmission_factor = clamp(material.transmission_factor * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).r, 0.0, 1.0);
+    }
+    if (material.specular_texture >= 0 && material.specular_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.specular_texture;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SPECULAR, uv0, uv1);
+        material.specular_factor = clamp(material.specular_factor * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).a, 0.0, 1.0);
+    }
+    if (material.specular_color_texture >= 0 && material.specular_color_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.specular_color_texture;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SPECULAR_COLOR, uv0, uv1);
+        material.specular_color *= max(texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).rgb, vec3(0.0));
+    }
+    if (material.anisotropy_texture >= 0 && material.anisotropy_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.anisotropy_texture;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_ANISOTROPY, uv0, uv1);
+        vec3 anisotropySample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).rgb;
+        material.anisotropy_strength = clamp(material.anisotropy_strength * anisotropySample.b, -1.0, 1.0);
+        vec2 direction = anisotropySample.rg * 2.0 - 1.0;
+        if (dot(direction, direction) > 1.0e-6) {
+            material.anisotropy_rotation += atan(direction.y, direction.x);
+        }
+    }
+    if (material.volume_thickness_texture >= 0 && material.volume_thickness_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.volume_thickness_texture;
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_VOLUME_THICKNESS, uv0, uv1);
+        material.volume_thickness_factor *= max(texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).g, 0.0);
     }
 }
 
-void apply_material_alpha_texture(inout Material material, vec2 uv) {
+vec3 material_volume_transmittance(Material material, float distance) {
+    float thickness = max(material.volume_thickness_factor, 0.0);
+    if (thickness <= 1.0e-6) {
+        return vec3(1.0);
+    }
+    float attenuationDistance = material.volume_attenuation_distance;
+    if (attenuationDistance <= 0.0 || attenuationDistance >= 1.0e20) {
+        return vec3(1.0);
+    }
+    vec3 color = clamp(material.volume_attenuation_color, vec3(1.0e-4), vec3(1.0));
+    vec3 attenuationCoefficient = -log(color) / max(attenuationDistance, 1.0e-6);
+    return exp(-attenuationCoefficient * max(distance * thickness, 0.0));
+}
+
+void apply_material_vertex_color(inout Material material, vec4 vertexColor) {
+    material.color *= clamp(vertexColor.rgb, vec3(0.0), vec3(1.0));
+    material.alpha_factor *= clamp(vertexColor.a, 0.0, 1.0);
+}
+
+void apply_material_alpha_texture(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.base_color_texture;
-        vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], uv);
+        vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_BASE_COLOR, uv0, uv1);
+        vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
         material.alpha_factor *= base.a;
     }
 }
@@ -1039,17 +1233,41 @@ bool accept_material_alpha(Material material, uint stableSeed) {
     return true;
 }
 
-vec3 apply_normal_texture(inout Material material, vec2 uv, vec3 normal, vec3 tangent, vec3 bitangent, vec3 rayDirection) {
+vec3 apply_normal_texture(inout Material material, vec2 uv0, vec2 uv1, vec3 normal, vec3 tangent, vec3 bitangent, vec3 rayDirection) {
     if (material.normal_texture < 0 || material.normal_texture >= MATERIAL_TEXTURE_LIMIT) {
         return normal;
     }
     int textureIndex = material.normal_texture;
-    vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], uv).xyz * 2.0 - 1.0;
+    vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_NORMAL, uv0, uv1);
+    vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).xyz * 2.0 - 1.0;
     material.normal_variance = clamp(dot(tangentSample.xy, tangentSample.xy), 0.0, 1.0);
     vec3 t = normalize(tangent - normal * dot(normal, tangent));
     vec3 b = normalize(bitangent - normal * dot(normal, bitangent));
     vec3 mapped = normalize(t * tangentSample.x + b * tangentSample.y + normal * max(tangentSample.z, 0.0));
     return dot(mapped, rayDirection) > 0.0 ? -mapped : mapped;
+}
+
+vec3 apply_clearcoat_normal_texture(inout Material material, vec2 uv0, vec2 uv1, vec3 normal, vec3 tangent, vec3 bitangent, vec3 rayDirection) {
+    material.clearcoat_normal = normal;
+    material.clearcoat_normal_variance = 0.0;
+    if (material.clearcoat_normal_texture < 0 || material.clearcoat_normal_texture >= MATERIAL_TEXTURE_LIMIT) {
+        return normal;
+    }
+    int textureIndex = material.clearcoat_normal_texture;
+    vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT_NORMAL, uv0, uv1);
+    vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).xyz * 2.0 - 1.0;
+    material.clearcoat_normal_variance = clamp(dot(tangentSample.xy, tangentSample.xy), 0.0, 1.0);
+    vec3 t = normalize(tangent - normal * dot(normal, tangent));
+    vec3 b = normalize(bitangent - normal * dot(normal, bitangent));
+    vec3 mapped = normalize(t * tangentSample.x + b * tangentSample.y + normal * max(tangentSample.z, 0.0));
+    material.clearcoat_normal = dot(mapped, rayDirection) > 0.0 ? -mapped : mapped;
+    return material.clearcoat_normal;
+}
+
+vec3 material_clearcoat_normal(Material material, vec3 fallbackNormal) {
+    return dot(material.clearcoat_normal, material.clearcoat_normal) > 1.0e-8
+        ? normalize(material.clearcoat_normal)
+        : fallbackNormal;
 }
 
 bool specular_aa_enabled() {
@@ -1618,6 +1836,30 @@ float reflectance(float cosine, float ref_idx) {
     return r0 + (1.0 - r0) * (t2 * t2 * t);
 }
 
+vec3 material_dispersion_ior(Material material) {
+    float baseIor = max(material.ior, 1.01);
+    float halfSpread = (baseIor - 1.0) * 0.025 * max(material.dispersion_factor, 0.0);
+    return max(vec3(baseIor - halfSpread, baseIor, baseIor + halfSpread), vec3(1.01));
+}
+
+uint material_dispersion_channel(Material material, float sampleValue) {
+    if (material.dispersion_factor <= 1.0e-6) {
+        return 1u;
+    }
+    return min(uint(floor(clamp(sampleValue, 0.0, 0.999999) * 3.0)), 2u);
+}
+
+float material_channel_value(vec3 value, uint channel) {
+    return channel == 0u ? value.r : (channel == 1u ? value.g : value.b);
+}
+
+vec3 material_dispersion_channel_weight(Material material, uint channel) {
+    if (material.dispersion_factor <= 1.0e-6) {
+        return vec3(1.0);
+    }
+    return channel == 0u ? vec3(3.0, 0.0, 0.0) : (channel == 1u ? vec3(0.0, 3.0, 0.0) : vec3(0.0, 0.0, 3.0));
+}
+
 float schlick_fresnel_pow5(float t) {
     float t2 = t * t;
     return t2 * t2 * t;
@@ -1682,7 +1924,8 @@ vec3 pbr_f0(Material material) {
         vec3 k2 = k * k;
         return clamp((etaMinusOne * etaMinusOne + k2) / max(etaPlusOne * etaPlusOne + k2, vec3(1.0e-6)), vec3(0.0), vec3(1.0));
     }
-    return mix(vec3(0.04), material.color, clamp(material.metallic, 0.0, 1.0));
+    vec3 dielectricF0 = clamp(vec3(0.04) * material.specular_factor * material.specular_color, vec3(0.0), vec3(1.0));
+    return mix(dielectricF0, material.color, clamp(material.metallic, 0.0, 1.0));
 }
 
 vec3 conductor_fresnel(Material material, float v_dot_h) {
@@ -1725,7 +1968,8 @@ vec3 pbr_average_fresnel(vec3 f0) {
 vec3 pbr_diffuse_energy(Material material) {
     vec3 f0 = pbr_f0(material);
     return clamp(vec3(1.0) - pbr_average_fresnel(f0), vec3(0.0), vec3(1.0)) *
-        (1.0 - clamp(material.metallic, 0.0, 1.0));
+        (1.0 - clamp(material.metallic, 0.0, 1.0)) *
+        (1.0 - clamp(material.transmission_factor, 0.0, 1.0));
 }
 
 float material_sheen_weight(Material material, float NdotV) {
@@ -1737,7 +1981,7 @@ float material_sheen_weight(Material material, float NdotV) {
     return sheenLum * mix(0.35, 1.0, grazing);
 }
 
-void pbr_lobe_probabilities(Material material, float NdotV, out float diffuseProbability, out float specularProbability, out float sheenProbability) {
+void pbr_lobe_probabilities(Material material, float NdotV, out float diffuseProbability, out float specularProbability, out float sheenProbability, out float clearcoatProbability) {
     vec3 f0 = pbr_f0(material);
     vec3 fresnel = material.use_conductor_optics != 0u
         ? conductor_fresnel(material, NdotV)
@@ -1745,26 +1989,37 @@ void pbr_lobe_probabilities(Material material, float NdotV, out float diffusePro
     float specularWeight = max(luminance(fresnel), 0.0);
     float diffuseWeight = max(luminance(pbr_diffuse_energy(material) * material.color * (1.0 / PI)), 0.0);
     float sheenWeight = material_sheen_weight(material, NdotV);
-    float totalWeight = max(diffuseWeight + specularWeight + sheenWeight, 1.0e-6);
+    float clearcoatWeight = clamp(material.clearcoat_factor, 0.0, 1.0) * 0.25;
+    float totalWeight = max(diffuseWeight + specularWeight + sheenWeight + clearcoatWeight, 1.0e-6);
     diffuseProbability = diffuseWeight / totalWeight;
     specularProbability = specularWeight / totalWeight;
     sheenProbability = sheenWeight / totalWeight;
+    clearcoatProbability = clearcoatWeight / totalWeight;
+    if (clearcoatWeight > 0.0) {
+        clearcoatProbability = clamp(clearcoatProbability, 0.03, 0.25);
+        float remaining = 1.0 - clearcoatProbability;
+        float baseTotal = max(diffuseWeight + specularWeight + sheenWeight, 1.0e-6);
+        diffuseProbability = remaining * diffuseWeight / baseTotal;
+        specularProbability = remaining * specularWeight / baseTotal;
+        sheenProbability = remaining * sheenWeight / baseTotal;
+    }
     if (sheenWeight > 0.0) {
-        sheenProbability = clamp(sheenProbability, 0.05, 0.35);
-        float remaining = 1.0 - sheenProbability;
+        sheenProbability = clamp(sheenProbability, 0.05, 0.35 * (1.0 - clearcoatProbability));
+        float remaining = 1.0 - clearcoatProbability - sheenProbability;
         float baseTotal = max(diffuseWeight + specularWeight, 1.0e-6);
         diffuseProbability = remaining * diffuseWeight / baseTotal;
         specularProbability = remaining * specularWeight / baseTotal;
     }
-    specularProbability = clamp(specularProbability, 0.05, 0.95 - sheenProbability);
-    diffuseProbability = max(1.0 - specularProbability - sheenProbability, 0.0);
+    specularProbability = clamp(specularProbability, 0.05, max(0.05, 0.95 - sheenProbability - clearcoatProbability));
+    diffuseProbability = max(1.0 - specularProbability - sheenProbability - clearcoatProbability, 0.0);
 }
 
 float pbr_specular_sample_probability(Material material, float NdotV) {
     float diffuseProbability;
     float specularProbability;
     float sheenProbability;
-    pbr_lobe_probabilities(material, NdotV, diffuseProbability, specularProbability, sheenProbability);
+    float clearcoatProbability;
+    pbr_lobe_probabilities(material, NdotV, diffuseProbability, specularProbability, sheenProbability, clearcoatProbability);
     return specularProbability;
 }
 
@@ -1812,6 +2067,7 @@ void material_anisotropic_frame(Material material, vec3 n, inout vec3 tangent, i
 void material_anisotropic_alpha(Material material, out float alphaX, out float alphaY);
 float ggx_anisotropic_ndf(float alphaX, float alphaY, vec3 h, vec3 n, vec3 tangent, vec3 bitangent);
 float smith_g1_anisotropic(float alphaX, float alphaY, vec3 v, vec3 n, vec3 tangent, vec3 bitangent);
+vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tangent, vec3 bitangent);
 
 float smith_g1(float roughness, float n_dot_x) {
     float r = ggx_safe_roughness(roughness);
@@ -1981,6 +2237,59 @@ vec3 eval_sheen_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     return material.sheen_color * charlie_ndf(material.sheen_roughness, n_dot_h) * sheen_visibility(n_dot_v, n_dot_l);
 }
 
+vec3 eval_clearcoat_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+    float factor = clamp(material.clearcoat_factor, 0.0, 1.0);
+    if (factor <= 1.0e-5) {
+        return vec3(0.0);
+    }
+    vec3 clearcoatN = material_clearcoat_normal(material, n);
+    float n_dot_v = max(dot(clearcoatN, wo), 0.0);
+    float n_dot_l = max(dot(clearcoatN, wi), 0.0);
+    if (n_dot_v <= 1.0e-6 || n_dot_l <= 1.0e-6) {
+        return vec3(0.0);
+    }
+    vec3 halfVector = wo + wi;
+    if (dot(halfVector, halfVector) < 1.0e-12) {
+        return vec3(0.0);
+    }
+    vec3 h = normalize(halfVector);
+    float n_dot_h = max(dot(clearcoatN, h), 0.0);
+    float v_dot_h = max(dot(wo, h), 0.0);
+    vec3 f = schlick_fresnel(vec3(0.04), v_dot_h);
+    float roughness = clamp(material.clearcoat_roughness, MATERIAL_MIN_GGX_ROUGHNESS, 1.0);
+    float d = ggx_ndf(roughness, n_dot_h);
+    float g = smith_g(roughness, n_dot_v, n_dot_l);
+    return factor * f * d * g / max(4.0 * n_dot_v * n_dot_l, 1.0e-10);
+}
+
+float pdf_clearcoat_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
+    if (material.clearcoat_factor <= 1.0e-5) {
+        return 0.0;
+    }
+    vec3 clearcoatN = material_clearcoat_normal(material, n);
+    float n_dot_v = max(dot(clearcoatN, wo), 0.0);
+    float n_dot_l = max(dot(clearcoatN, wi), 0.0);
+    if (n_dot_v <= 1.0e-6 || n_dot_l <= 1.0e-6) {
+        return 0.0;
+    }
+    vec3 halfVector = wo + wi;
+    if (dot(halfVector, halfVector) < 1.0e-12) {
+        return 0.0;
+    }
+    vec3 h = normalize(halfVector);
+    float n_dot_h = max(dot(clearcoatN, h), 0.0);
+    float v_dot_h = max(dot(wo, h), 1.0e-6);
+    float roughness = clamp(material.clearcoat_roughness, MATERIAL_MIN_GGX_ROUGHNESS, 1.0);
+    return ggx_ndf(roughness, n_dot_h) * n_dot_h / max(4.0 * v_dot_h, 1.0e-6);
+}
+
+vec3 sample_clearcoat_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tangent, vec3 bitangent) {
+    Material clearcoatMaterial = material;
+    clearcoatMaterial.roughness = clamp(material.clearcoat_roughness, MATERIAL_MIN_GGX_ROUGHNESS, 1.0);
+    clearcoatMaterial.anisotropy_strength = 0.0;
+    return sample_ggx_brdf(state, clearcoatMaterial, wo, material_clearcoat_normal(material, n), tangent, bitangent);
+}
+
 float pdf_sheen_brdf(Material material, vec3 wo, vec3 wi, vec3 n) {
     float n_dot_v = max(dot(n, wo), 0.0);
     float n_dot_l = max(dot(n, wi), 0.0);
@@ -2087,10 +2396,12 @@ float pdf_pbr_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, ve
     float diffuseProbability;
     float specularProbability;
     float sheenProbability;
-    pbr_lobe_probabilities(material, NdotV, diffuseProbability, specularProbability, sheenProbability);
+    float clearcoatProbability;
+    pbr_lobe_probabilities(material, NdotV, diffuseProbability, specularProbability, sheenProbability, clearcoatProbability);
     return diffuseProbability * diffuse_pdf(n, wi) +
         specularProbability * pdf_ggx_brdf(material, wo, wi, n, tangent, bitangent) +
-        sheenProbability * pdf_sheen_brdf(material, wo, wi, n);
+        sheenProbability * pdf_sheen_brdf(material, wo, wi, n) +
+        clearcoatProbability * pdf_clearcoat_brdf(material, wo, wi, n);
 }
 
 vec3 sample_ggx_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tangent, vec3 bitangent) {
@@ -2168,6 +2479,9 @@ vec3 eval_brdf(Material material, vec3 wo, vec3 wi, vec3 n, vec3 tangent, vec3 b
     if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_SPECULAR)) {
         result += c.weight * eval_ggx_brdf(material, wo, wi, n, tangent, bitangent);
     }
+    if (closure_has_flag(c, MATERIAL_CLOSURE_FLAG_CLEARCOAT)) {
+        result += c.weight * eval_clearcoat_brdf(material, wo, wi, n);
+    }
     return result;
 }
 
@@ -2194,12 +2508,15 @@ vec3 sample_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tang
         float diffuseProbability;
         float specularProbability;
         float sheenProbability;
-        pbr_lobe_probabilities(material, NdotV_sample, diffuseProbability, specularProbability, sheenProbability);
+        float clearcoatProbability;
+        pbr_lobe_probabilities(material, NdotV_sample, diffuseProbability, specularProbability, sheenProbability, clearcoatProbability);
         vec3 wi;
         float lobeSample = rand_f32(state);
-        if (lobeSample < specularProbability) {
+        if (lobeSample < clearcoatProbability) {
+            wi = sample_clearcoat_brdf(state, material, wo, n, tangent, bitangent);
+        } else if (lobeSample < clearcoatProbability + specularProbability) {
             wi = sample_ggx_brdf(state, material, wo, n, tangent, bitangent);
-        } else if (lobeSample < specularProbability + sheenProbability) {
+        } else if (lobeSample < clearcoatProbability + specularProbability + sheenProbability) {
             wi = sample_sheen_brdf(state, material, wo, n, tangent, bitangent);
         } else {
             float diffusePdf;

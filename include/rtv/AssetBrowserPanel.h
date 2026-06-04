@@ -56,10 +56,23 @@ private:
         std::vector<std::string> lines;
     };
 
+    struct PathListEntry {
+        std::filesystem::path path;
+        bool isDirectory = false;
+    };
+
+    struct DirectoryListingCache {
+        uint64_t generation = 0;
+        std::vector<std::filesystem::path> childDirectories;
+        std::vector<PathListEntry> entries;
+    };
+
     void loadFromPath(const std::filesystem::path& path, EditorRequests& requests);
     void prepareImportDialog(const std::filesystem::path& sourcePath, const std::filesystem::path& destinationFolder, int mode);
     void syncBrowserRoot(const EditorRuntimeState& state);
     void navigateTo(const std::filesystem::path& path, bool addHistory = true);
+    void invalidateDirectoryCache();
+    [[nodiscard]] const DirectoryListingCache& directoryListingForPath(const std::filesystem::path& path);
     void drawFolderTree(const std::filesystem::path& path, EditorRequests& requests);
     void drawPathList(const EditorRuntimeState& state, EditorRequests& requests);
     void drawPathContextMenu(const std::filesystem::path& path, bool isDirectory, EditorRequests& requests);
@@ -121,8 +134,10 @@ private:
     std::unordered_map<std::string, CpuThumbnail> thumbnailCache_;
     std::unordered_map<std::string, SourcePreview> sourcePreviewCache_;
     std::unordered_map<std::string, std::string> sourceControlStatusCache_;
+    std::unordered_map<std::string, DirectoryListingCache> directoryListingCache_;
     std::vector<ImportOperation> importOperations_;
     uint64_t nextImportOperationId_ = 1;
+    uint64_t directoryListingGeneration_ = 1;
 };
 
 } // namespace rtv

@@ -39,6 +39,18 @@ glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
     return glm::eulerAngles(glm::quat_cast(rotation));
 }
 
+Camera cameraFromSceneNode(const SceneNodeAsset& node) {
+    Camera camera;
+    camera.projection = node.cameraProjection;
+    camera.verticalFovRadians = node.cameraYfov;
+    camera.aspectRatio = node.cameraAspectRatio;
+    camera.orthographicXmag = node.cameraOrthoXmag;
+    camera.orthographicYmag = node.cameraOrthoYmag;
+    camera.nearPlane = node.cameraNear;
+    camera.farPlane = node.cameraFar;
+    return camera;
+}
+
 SceneUpdateMask entityRemovalUpdateMask(const SceneDocument& document, const Entity& entity) {
     if (entity.meshRenderer.has_value()) {
         return SceneUpdateMaskTopology;
@@ -536,10 +548,7 @@ EntityId SceneOperations::mergeSceneAsset(const SceneAsset& scene, const std::st
             entity->meshRenderer = renderer;
         }
         if (node.hasCamera) {
-            Camera camera;
-            camera.verticalFovRadians = node.cameraYfov;
-            camera.nearPlane = node.cameraNear;
-            camera.farPlane = node.cameraFar;
+            Camera camera = cameraFromSceneNode(node);
             camera.active = !hadActiveCamera && !assignedMergedCamera;
             entity->camera = camera;
             if (camera.active) {

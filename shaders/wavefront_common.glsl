@@ -3,7 +3,7 @@
 
 #define WAVEFRONT_QUEUE_HEADER_STRIDE_BYTES 32u
 #define WAVEFRONT_RAY_STRIDE_BYTES 48u
-#define WAVEFRONT_HIT_STRIDE_BYTES 112u
+#define WAVEFRONT_HIT_STRIDE_BYTES 144u
 #define WAVEFRONT_SHADOW_RAY_STRIDE_BYTES 48u
 #define WAVEFRONT_PIXEL_STATE_STRIDE_BYTES 112u
 #define WAVEFRONT_SORT_BUCKET_COUNT 32u
@@ -29,6 +29,8 @@ struct WavefrontHit {
     vec4 barycentrics_hit_kind;
     vec4 geom_normal;
     vec4 tangent;
+    vec4 vertex_color;
+    vec4 uv1;
     uvec4 material_instance_primitive;
     uvec4 pixel_depth_flags;
 };

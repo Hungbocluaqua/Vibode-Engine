@@ -253,6 +253,8 @@ nlohmann::json materialPbrMetadataJson(const MaterialAsset& material) {
             {"ior", {"present", material.hasIor != 0u, "ior", material.iorFactor}},
             {"clearcoat", {"present", material.hasClearcoat != 0u, "factor", material.clearcoatFactor, "roughnessFactor", material.clearcoatRoughnessFactor}},
             {"transmission", {"present", material.hasTransmission != 0u, "factor", material.transmissionFactor}},
+            {"volume", {"present", material.hasVolume != 0u, "thicknessFactor", material.volumeThicknessFactor, "attenuationDistance", material.volumeAttenuationDistance, "attenuationColor", vec3ArrayJson(material.volumeAttenuationColor)}},
+            {"dispersion", {"present", material.hasDispersion != 0u, "dispersion", material.dispersionFactor}},
             {"specular", {"present", material.hasSpecular != 0u, "factor", material.specularFactor, "colorFactor", vec3ArrayJson(material.specularColorFactor)}},
             {"sheen", {"present", material.hasSheen != 0u, "colorFactor", vec3ArrayJson(material.sheenColorFactor), "roughnessFactor", material.sheenRoughnessFactor}},
             {"iridescence", {"present", material.hasIridescence != 0u, "factor", material.iridescenceFactor, "ior", material.iridescenceIor, "thicknessMinimum", material.iridescenceThicknessMinimum, "thicknessMaximum", material.iridescenceThicknessMaximum}},
@@ -264,6 +266,18 @@ nlohmann::json materialPbrMetadataJson(const MaterialAsset& material) {
             {"normal", textureTransformJson(material.normalTextureTransform)},
             {"emissive", textureTransformJson(material.emissiveTextureTransform)},
             {"occlusion", textureTransformJson(material.occlusionTextureTransform)},
+            {"clearcoat", textureTransformJson(material.clearcoatTextureTransform)},
+            {"clearcoatRoughness", textureTransformJson(material.clearcoatRoughnessTextureTransform)},
+            {"clearcoatNormal", textureTransformJson(material.clearcoatNormalTextureTransform)},
+            {"transmission", textureTransformJson(material.transmissionTextureTransform)},
+            {"volumeThickness", textureTransformJson(material.volumeThicknessTextureTransform)},
+            {"specular", textureTransformJson(material.specularTextureTransform)},
+            {"specularColor", textureTransformJson(material.specularColorTextureTransform)},
+            {"sheenColor", textureTransformJson(material.sheenColorTextureTransform)},
+            {"sheenRoughness", textureTransformJson(material.sheenRoughnessTextureTransform)},
+            {"iridescence", textureTransformJson(material.iridescenceTextureTransform)},
+            {"iridescenceThickness", textureTransformJson(material.iridescenceThicknessTextureTransform)},
+            {"anisotropy", textureTransformJson(material.anisotropyTextureTransform)},
         }},
     };
 }
@@ -657,12 +671,16 @@ bool supportedGltfExtensionForImportReport(const std::string& name) {
     static const std::unordered_set<std::string> supported = {
         "KHR_materials_clearcoat",
         "KHR_materials_transmission",
+        "KHR_materials_volume",
+        "KHR_materials_dispersion",
         "KHR_materials_ior",
         "KHR_materials_specular",
         "KHR_materials_sheen",
         "KHR_materials_iridescence",
         "KHR_materials_emissive_strength",
         "KHR_materials_anisotropy",
+        "KHR_materials_unlit",
+        "KHR_materials_variants",
         "KHR_lights_punctual",
         "KHR_texture_transform",
     };
@@ -1166,7 +1184,17 @@ nlohmann::json importerCapabilityReport(
         const size_t materialCount = doc.contains("materials") && doc["materials"].is_array() ? doc["materials"].size() : 0;
         const size_t textureCount = doc.contains("textures") && doc["textures"].is_array() ? doc["textures"].size() : 0;
         const size_t cameraCount = doc.contains("cameras") && doc["cameras"].is_array() ? doc["cameras"].size() : 0;
+        size_t materialVariantCount = 0;
+        size_t materialVariantMappingCount = 0;
         size_t lightCount = 0;
+        if (doc.contains("extensions") && doc["extensions"].is_object() &&
+            doc["extensions"].contains("KHR_materials_variants") &&
+            doc["extensions"]["KHR_materials_variants"].is_object()) {
+            const nlohmann::json& variantsExt = doc["extensions"]["KHR_materials_variants"];
+            if (variantsExt.contains("variants") && variantsExt["variants"].is_array()) {
+                materialVariantCount = variantsExt["variants"].size();
+            }
+        }
         if (doc.contains("extensions") && doc["extensions"].is_object()) {
             const nlohmann::json& extensions = doc["extensions"];
             if (extensions.contains("KHR_lights_punctual") && extensions["KHR_lights_punctual"].contains("lights") &&
@@ -1177,12 +1205,31 @@ nlohmann::json importerCapabilityReport(
 
         size_t morphTargetPrimitiveCount = 0;
         size_t morphTargetCount = 0;
+        size_t vertexColorPrimitiveCount = 0;
+        size_t secondUvPrimitiveCount = 0;
         if (doc.contains("meshes") && doc["meshes"].is_array()) {
             for (const nlohmann::json& mesh : doc["meshes"]) {
                 if (!mesh.contains("primitives") || !mesh["primitives"].is_array()) {
                     continue;
                 }
                 for (const nlohmann::json& primitive : mesh["primitives"]) {
+                    if (primitive.contains("attributes") && primitive["attributes"].is_object()) {
+                        const nlohmann::json& attributes = primitive["attributes"];
+                        if (attributes.contains("COLOR_0")) {
+                            ++vertexColorPrimitiveCount;
+                        }
+                        if (attributes.contains("TEXCOORD_1")) {
+                            ++secondUvPrimitiveCount;
+                        }
+                    }
+                    if (primitive.contains("extensions") && primitive["extensions"].is_object() &&
+                        primitive["extensions"].contains("KHR_materials_variants") &&
+                        primitive["extensions"]["KHR_materials_variants"].is_object()) {
+                        const nlohmann::json& variantsExt = primitive["extensions"]["KHR_materials_variants"];
+                        if (variantsExt.contains("mappings") && variantsExt["mappings"].is_array()) {
+                            materialVariantMappingCount += variantsExt["mappings"].size();
+                        }
+                    }
                     if (primitive.contains("targets") && primitive["targets"].is_array() && !primitive["targets"].empty()) {
                         ++morphTargetPrimitiveCount;
                         morphTargetCount += primitive["targets"].size();
@@ -1196,6 +1243,22 @@ nlohmann::json importerCapabilityReport(
         addFeature("textures", settings.importTextures ? "supported" : "disabled_by_import_settings", {{"count", textureCount}});
         addFeature("cameras", settings.importCameras ? "supported" : "disabled_by_import_settings", {{"count", cameraCount}});
         addFeature("punctualLights", settings.importLights ? "supported" : "disabled_by_import_settings", {{"count", lightCount}});
+        if (vertexColorPrimitiveCount > 0) {
+            addFeature("vertexColors", "supported", {{"primitiveCount", vertexColorPrimitiveCount}, {"attribute", "COLOR_0"}});
+        }
+        if (secondUvPrimitiveCount > 0) {
+            addFeature("secondUvSet", "supported", {
+                {"primitiveCount", secondUvPrimitiveCount},
+                {"attribute", "TEXCOORD_1"},
+            });
+        }
+        if (materialVariantCount > 0 || materialVariantMappingCount > 0) {
+            addFeature("materialVariants", "supported", {
+                {"variantCount", materialVariantCount},
+                {"mappingCount", materialVariantMappingCount},
+                {"extension", "KHR_materials_variants"},
+            });
+        }
 
         const size_t skinCount = skeletalAnimationMetadata.value("skinCount", 0u);
         const size_t animationCount = skeletalAnimationMetadata.value("animationCount", 0u);
@@ -1685,6 +1748,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 addTextureDependency(material.clearcoatRoughnessTexture, "clearcoatRoughness", "Linear");
                 addTextureDependency(material.clearcoatNormalTexture, "clearcoatNormal", "Linear");
                 addTextureDependency(material.transmissionTexture, "transmission", "Linear");
+                addTextureDependency(material.volumeThicknessTexture, "volumeThickness", "Linear; thickness=G");
                 addTextureDependency(material.specularTexture, "specular", "Linear");
                 addTextureDependency(material.specularColorTexture, "specularColor", "sRGB");
                 addTextureDependency(material.sheenColorTexture, "sheenColor", "sRGB");
@@ -1751,10 +1815,22 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 std::filesystem::create_directories(meshPath.parent_path(), ec);
                 std::filesystem::create_directories(meshCache.parent_path(), ec);
                 nlohmann::json primitiveMaterials = nlohmann::json::array();
+                nlohmann::json primitiveMaterialVariants = nlohmann::json::array();
                 for (const MeshPrimitiveAsset& primitive : mesh.primitives) {
                     if (primitive.material.valid() && primitive.material.index < materialGuids.size()) {
                         primitiveMaterials.push_back(materialGuids[primitive.material.index]);
                     }
+                    nlohmann::json variants = nlohmann::json::array();
+                    for (const auto& variant : primitive.materialVariants) {
+                        if (variant.material.valid() && variant.material.index < materialGuids.size()) {
+                            variants.push_back({
+                                {"variantIndex", variant.variantIndex},
+                                {"variantName", variant.variantName},
+                                {"materialGuid", materialGuids[variant.material.index]},
+                            });
+                        }
+                    }
+                    primitiveMaterialVariants.push_back(std::move(variants));
                 }
                 const nlohmann::json meshPayload = sceneCacheSlicePayload("Mesh", i, meshGuid);
                 cookedPayloads.push_back(meshPayload);
@@ -1772,6 +1848,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                     {"indexCount", mesh.indices.size()},
                     {"primitiveCount", mesh.primitives.size()},
                     {"materialDependencies", primitiveMaterials},
+                    {"materialVariantDependencies", primitiveMaterialVariants},
                 });
                 (void)writeJson(meshCache, {
                     {"version", 1},
@@ -1790,6 +1867,11 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 for (const auto& dep : primitiveMaterials) {
                     record.dependencies.push_back(AssetDependency{dep.get<std::string>(), "material"});
                 }
+                for (const auto& variants : primitiveMaterialVariants) {
+                    for (const auto& variant : variants) {
+                        record.dependencies.push_back(AssetDependency{variant.value("materialGuid", std::string{}), "material_variant"});
+                    }
+                }
                 record.sourceHash = sourceHash;
                 record.importSettingsHash = importSettingsHash;
                 record.lastModifiedTimestamp = timestampString();
@@ -1803,10 +1885,20 @@ StagedAssetImportResult stagePlaceholderAssetImport(
             for (size_t i = 0; i < scene.nodes.size(); ++i) {
                 const SceneNodeAsset& node = scene.nodes[i];
                 nlohmann::json materialGuidsForNode = nlohmann::json::array();
+                nlohmann::json materialVariantGuidsForNode = nlohmann::json::array();
                 if (node.mesh.valid() && node.mesh.index < meshes.size()) {
                     for (const MeshPrimitiveAsset& primitive : meshes[node.mesh.index].primitives) {
                         if (primitive.material.valid() && primitive.material.index < materialGuids.size()) {
                             materialGuidsForNode.push_back(materialGuids[primitive.material.index]);
+                        }
+                        for (const auto& variant : primitive.materialVariants) {
+                            if (variant.material.valid() && variant.material.index < materialGuids.size()) {
+                                materialVariantGuidsForNode.push_back({
+                                    {"variantIndex", variant.variantIndex},
+                                    {"variantName", variant.variantName},
+                                    {"materialGuid", materialGuids[variant.material.index]},
+                                });
+                            }
                         }
                     }
                 }
@@ -1818,6 +1910,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                     {"mesh", node.mesh.valid() ? static_cast<int>(node.mesh.index) : -1},
                     {"meshGuid", node.mesh.valid() && node.mesh.index < meshGuids.size() ? meshGuids[node.mesh.index] : std::string{}},
                     {"materialGuids", materialGuidsForNode},
+                    {"materialVariantGuids", materialVariantGuidsForNode},
                 });
             }
             placeholder["sourceHierarchy"] = prefabNodes;

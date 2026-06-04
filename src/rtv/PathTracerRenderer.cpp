@@ -2561,6 +2561,51 @@ void PathTracerRenderer::setCameraFovY(float fovY) {
     resetAccumulation(AccumulationResetReason::CameraMoved);
 }
 
+void PathTracerRenderer::setCameraProjection(
+    uint32_t projection,
+    float fovY,
+    float aspectRatio,
+    float orthographicXmag,
+    float orthographicYmag,
+    float nearPlane,
+    float farPlane) {
+    const float clampedFov = std::clamp(std::isfinite(fovY) ? fovY : camera_.fovY, 0.1f, 3.0f);
+    const float clampedAspect = std::isfinite(aspectRatio) && aspectRatio > 0.0f
+        ? std::clamp(aspectRatio, 0.01f, 100.0f)
+        : 0.0f;
+    const float clampedOrthoX = std::clamp(
+        std::isfinite(orthographicXmag) && orthographicXmag > 0.0f ? orthographicXmag : 1.0f,
+        1.0e-4f,
+        1.0e6f);
+    const float clampedOrthoY = std::clamp(
+        std::isfinite(orthographicYmag) && orthographicYmag > 0.0f ? orthographicYmag : 1.0f,
+        1.0e-4f,
+        1.0e6f);
+    float clampedNear = std::clamp(std::isfinite(nearPlane) ? nearPlane : 0.01f, 1.0e-5f, 1.0e6f);
+    float clampedFar = std::clamp(std::isfinite(farPlane) ? farPlane : 1000.0f, clampedNear + 1.0e-4f, 1.0e9f);
+    if (clampedFar <= clampedNear) {
+        clampedFar = clampedNear + 1000.0f;
+    }
+    const glm::vec4 projectionControls{
+        projection == 1u ? 1.0f : 0.0f,
+        clampedAspect,
+        clampedOrthoX,
+        clampedOrthoY,
+    };
+    const glm::vec4 clipControls{clampedNear, clampedFar, 0.0f, 0.0f};
+
+    if (std::abs(camera_.fovY - clampedFov) <= 0.0001f &&
+        glm::length(camera_.projectionControls - projectionControls) <= 0.0001f &&
+        glm::length(camera_.clipControls - clipControls) <= 0.0001f) {
+        return;
+    }
+
+    camera_.fovY = clampedFov;
+    camera_.projectionControls = projectionControls;
+    camera_.clipControls = clipControls;
+    resetAccumulation(AccumulationResetReason::CameraMoved);
+}
+
 void PathTracerRenderer::resetAccumulation(AccumulationResetReason reason) {
     lastResetReason_ = reason;
     ++pickSceneVersion_;
@@ -2927,12 +2972,24 @@ PathTracerRenderer::WavefrontQueueStats PathTracerRenderer::wavefrontQueueStats(
             : glm::vec2(0.5f);
         const glm::vec2 uv = (pixel + jitter) / glm::vec2(static_cast<float>(width), static_cast<float>(height));
         const glm::vec2 ndc = uv * 2.0f - glm::vec2(1.0f);
-        const float aspect = static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f);
-        const float scale = std::tan(camera_.fovY * 0.5f);
-        const glm::vec3 pinholeDir = glm::normalize(
-            glm::vec3(camera_.forward) +
-            glm::vec3(camera_.right) * ndc.x * aspect * scale -
-            glm::vec3(camera_.up) * ndc.y * scale);
+        const glm::vec3 forward = glm::normalize(glm::vec3(camera_.forward));
+        const float viewportAspect = static_cast<float>(width) / std::max(static_cast<float>(height), 1.0f);
+        const float authoredAspect = camera_.projectionControls.y > 0.0f ? camera_.projectionControls.y : viewportAspect;
+        const bool orthographic = camera_.projectionControls.x >= 0.5f;
+        glm::vec3 pinholeOrigin = glm::vec3(camera_.pos);
+        glm::vec3 pinholeDir = forward;
+        if (orthographic) {
+            const float xmag = std::max(camera_.projectionControls.z, 1.0e-4f);
+            const float ymag = std::max(camera_.projectionControls.w, 1.0e-4f);
+            pinholeOrigin += glm::vec3(camera_.right) * ndc.x * xmag * 0.5f -
+                glm::vec3(camera_.up) * ndc.y * ymag * 0.5f;
+        } else {
+            const float scale = std::tan(camera_.fovY * 0.5f);
+            pinholeDir = glm::normalize(
+                forward +
+                glm::vec3(camera_.right) * ndc.x * authoredAspect * scale -
+                glm::vec3(camera_.up) * ndc.y * scale);
+        }
         const float apertureRadius = std::max(camera_.dofControls.x, 0.0f);
         if (apertureRadius <= 1.0e-6f) {
             return pinholeDir;
@@ -3016,10 +3073,9 @@ PathTracerRenderer::WavefrontQueueStats PathTracerRenderer::wavefrontQueueStats(
             lens *= radius;
         }
         lens *= apertureRadius;
-        const glm::vec3 forward = glm::normalize(glm::vec3(camera_.forward));
         const float forwardProjection = std::max(glm::dot(pinholeDir, forward), 1.0e-4f);
-        const glm::vec3 focusPoint = glm::vec3(camera_.pos) + pinholeDir * (std::max(camera_.dofControls.y, 0.01f) / forwardProjection);
-        const glm::vec3 lensOrigin = glm::vec3(camera_.pos) + glm::vec3(camera_.right) * lens.x + glm::vec3(camera_.up) * lens.y;
+        const glm::vec3 focusPoint = pinholeOrigin + pinholeDir * (std::max(camera_.dofControls.y, 0.01f) / forwardProjection);
+        const glm::vec3 lensOrigin = pinholeOrigin + glm::vec3(camera_.right) * lens.x + glm::vec3(camera_.up) * lens.y;
         return glm::normalize(focusPoint - lensOrigin);
     };
     auto directionError = [&](uint32_t sampleSlot) {
@@ -4094,11 +4150,21 @@ void PathTracerRenderer::updateCamera() {
     camera_.effectiveJitterScale = effectiveJitterScale;
     camera_.cameraMoving = cameraMovingForTemporal ? 1u : 0u;
 
-    const float aspect = renderExtent_.height > 0 ? static_cast<float>(renderExtent_.width) / static_cast<float>(renderExtent_.height) : 1.0f;
+    const float viewportAspect = renderExtent_.height > 0 ? static_cast<float>(renderExtent_.width) / static_cast<float>(renderExtent_.height) : 1.0f;
+    const float authoredAspect = camera_.projectionControls.y > 0.0f ? camera_.projectionControls.y : viewportAspect;
     const glm::vec3 eye = glm::vec3(camera_.pos);
     const glm::vec3 center = eye + glm::normalize(glm::vec3(camera_.forward));
     const glm::mat4 view = glm::lookAtRH(eye, center, glm::normalize(glm::vec3(camera_.up)));
-    glm::mat4 projection = glm::perspectiveRH_ZO(camera_.fovY, aspect, 0.01f, 1000.0f);
+    const float nearPlane = std::max(camera_.clipControls.x, 1.0e-5f);
+    const float farPlane = std::max(camera_.clipControls.y, nearPlane + 1.0e-4f);
+    glm::mat4 projection{1.0f};
+    if (camera_.projectionControls.x >= 0.5f) {
+        const float xmag = std::max(camera_.projectionControls.z, 1.0e-4f);
+        const float ymag = std::max(camera_.projectionControls.w, 1.0e-4f);
+        projection = glm::orthoRH_ZO(-xmag * 0.5f, xmag * 0.5f, -ymag * 0.5f, ymag * 0.5f, nearPlane, farPlane);
+    } else {
+        projection = glm::perspectiveRH_ZO(camera_.fovY, authoredAspect, nearPlane, farPlane);
+    }
     projection[1][1] *= -1.0f;
     const glm::mat4 nonJitteredProjection = projection;
     const bool jitterEnabled = settings_.pathTracingEnabled &&

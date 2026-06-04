@@ -22,7 +22,7 @@ struct SceneGpuBuildResult {
 
 class SceneToGpuSceneBuilder {
 public:
-    [[nodiscard]] SceneGpuBuildResult build(const SceneDocument& document, const AssetManager* assets, const RendererSettings& currentSettings) const;
+    [[nodiscard]] SceneGpuBuildResult build(const SceneDocument& document, AssetManager* assets, const RendererSettings& currentSettings) const;
     [[nodiscard]] static AccumulationResetReason accumulationReasonFor(SceneUpdateKind kind);
 };
 

@@ -9,14 +9,104 @@
 
 namespace rtv {
 
+namespace {
+
+[[nodiscard]] MaterialAssetHandle effectivePrimitiveMaterial(
+    const MeshRenderer& renderer,
+    const MeshPrimitiveAsset& primitive,
+    size_t primitiveIndex) {
+    MaterialAssetHandle material = primitive.material;
+    const bool hasSlot = primitiveIndex < renderer.materialSlots.size();
+    const bool hasOverride = hasSlot && renderer.materialSlots[primitiveIndex].overrideMaterial.has_value();
+    if (hasSlot) {
+        material = renderer.materialSlots[primitiveIndex].resolvedMaterial();
+    }
+    if (!hasOverride && renderer.activeMaterialVariantIndex != UINT32_MAX) {
+        const auto variantIt = std::find_if(
+            primitive.materialVariants.begin(),
+            primitive.materialVariants.end(),
+            [&](const MeshPrimitiveAsset::MaterialVariant& variant) {
+                return variant.variantIndex == renderer.activeMaterialVariantIndex;
+            });
+        if (variantIt != primitive.materialVariants.end() && variantIt->material.valid()) {
+            material = variantIt->material;
+        }
+    }
+    return material;
+}
+
+void applyRendererMaterialBindings(
+    SceneGpuBuildResult& result,
+    const std::vector<const Entity*>& entities,
+    AssetManager* assets) {
+    if (assets == nullptr) {
+        return;
+    }
+
+    const size_t count = std::min(result.sceneAsset.nodes.size(), entities.size());
+    for (size_t nodeIndex = 0; nodeIndex < count; ++nodeIndex) {
+        const Entity* entity = entities[nodeIndex];
+        if (entity == nullptr || !entity->meshRenderer.has_value()) {
+            continue;
+        }
+
+        const MeshRenderer& renderer = *entity->meshRenderer;
+        const MeshAsset* sourceMesh = assets->mesh(renderer.mesh);
+        if (sourceMesh == nullptr || sourceMesh->primitives.empty()) {
+            continue;
+        }
+
+        bool needsRuntimeMesh = false;
+        std::vector<MaterialAssetHandle> effectiveMaterials;
+        effectiveMaterials.reserve(sourceMesh->primitives.size());
+        for (size_t primitiveIndex = 0; primitiveIndex < sourceMesh->primitives.size(); ++primitiveIndex) {
+            const MeshPrimitiveAsset& primitive = sourceMesh->primitives[primitiveIndex];
+            const MaterialAssetHandle material = effectivePrimitiveMaterial(renderer, primitive, primitiveIndex);
+            effectiveMaterials.push_back(material);
+            if (material.valid() && material.index != primitive.material.index) {
+                needsRuntimeMesh = true;
+            }
+            if (material.valid()) {
+                result.sceneAsset.materials.push_back(material);
+            }
+        }
+
+        if (!needsRuntimeMesh) {
+            continue;
+        }
+
+        MeshAsset runtimeMesh = *sourceMesh;
+        runtimeMesh.name = sourceMesh->name.empty()
+            ? "runtime material variant mesh"
+            : sourceMesh->name + " (runtime material variant)";
+        for (size_t primitiveIndex = 0; primitiveIndex < runtimeMesh.primitives.size(); ++primitiveIndex) {
+            MeshPrimitiveAsset& primitive = runtimeMesh.primitives[primitiveIndex];
+            const MaterialAssetHandle material = effectiveMaterials[primitiveIndex];
+            if (material.valid()) {
+                primitive.material = material;
+                updatePrimitiveAlphaClassification(primitive, assets->material(material));
+            }
+        }
+
+        const MeshAssetHandle runtimeHandle = assets->addMesh(std::move(runtimeMesh));
+        result.sceneAsset.meshes.push_back(runtimeHandle);
+        result.sceneAsset.nodes[nodeIndex].mesh = runtimeHandle;
+    }
+}
+
+} // namespace
+
 SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     const SceneDocument& document,
-    const AssetManager*,
+    AssetManager* assets,
     const RendererSettings& currentSettings) const {
     SceneGpuBuildResult result;
     result.updateKind = document.pendingUpdate();
     result.sceneAsset = document.toSceneAsset();
     result.rendererSettings = currentSettings;
+
+    const std::vector<const Entity*> entities = document.registry().entities();
+    applyRendererMaterialBindings(result, entities, assets);
 
     const RenderSettings& render = document.renderSettings();
     const Environment& environment = document.environment();
@@ -111,7 +201,6 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     SunController::applyToRendererSettings(document, result.rendererSettings);
     applySceneWorldComponentsToRendererSettings(document, result.rendererSettings);
 
-    const std::vector<const Entity*> entities = document.registry().entities();
     auto appendInstanceEntity = [&](uint32_t nodeIndex) {
         if (nodeIndex < result.sceneAsset.nodes.size() &&
             nodeIndex < entities.size() &&

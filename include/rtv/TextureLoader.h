@@ -37,6 +37,7 @@ class TextureLoader {
 public:
     [[nodiscard]] static TextureData loadRgba8(std::string_view path);
     [[nodiscard]] static TextureData loadKtx2(std::string_view path);
+    [[nodiscard]] static TextureData loadKtx2(const uint8_t* data, size_t size);
     [[nodiscard]] static TextureData load(std::string_view path);
     [[nodiscard]] static Image createTexture2D(
         ResourceAllocator& allocator,

@@ -65,6 +65,18 @@ glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
     return glm::eulerAngles(glm::quat_cast(rotation));
 }
 
+Camera cameraFromSceneNode(const SceneNodeAsset& node) {
+    Camera camera;
+    camera.projection = node.cameraProjection;
+    camera.verticalFovRadians = node.cameraYfov;
+    camera.aspectRatio = node.cameraAspectRatio;
+    camera.orthographicXmag = node.cameraOrthoXmag;
+    camera.orthographicYmag = node.cameraOrthoYmag;
+    camera.nearPlane = node.cameraNear;
+    camera.farPlane = node.cameraFar;
+    return camera;
+}
+
 nlohmann::json vec3Json(glm::vec3 value) {
     return nlohmann::json::array({value.x, value.y, value.z});
 }
@@ -314,10 +326,7 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
             entity->meshRenderer = renderer;
         }
         if (node.hasCamera) {
-            Camera camera;
-            camera.verticalFovRadians = node.cameraYfov;
-            camera.nearPlane = node.cameraNear;
-            camera.farPlane = node.cameraFar;
+            Camera camera = cameraFromSceneNode(node);
             camera.active = !activeCamera_.valid();
             entity->camera = camera;
             if (camera.active) {
@@ -669,6 +678,8 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
             renderer["visible"] = entity.meshRenderer->visible;
             renderer["castShadow"] = entity.meshRenderer->castShadow;
             renderer["visibleToCamera"] = entity.meshRenderer->visibleToCamera;
+            renderer["activeMaterialVariantIndex"] = entity.meshRenderer->activeMaterialVariantIndex;
+            renderer["activeMaterialVariantName"] = entity.meshRenderer->activeMaterialVariantName;
             if (!entity.meshRenderer->meshGuid.empty()) {
                 root["assetReferences"]["meshes"].push_back({{"assetGuid", entity.meshRenderer->meshGuid}});
             }
@@ -729,7 +740,11 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         }
         if (entity.camera.has_value()) {
             item["camera"] = {
+                {"projection", entity.camera->projection},
                 {"verticalFovRadians", entity.camera->verticalFovRadians},
+                {"aspectRatio", entity.camera->aspectRatio},
+                {"orthographicXmag", entity.camera->orthographicXmag},
+                {"orthographicYmag", entity.camera->orthographicYmag},
                 {"nearPlane", entity.camera->nearPlane},
                 {"farPlane", entity.camera->farPlane},
                 {"active", entity.camera->active},
@@ -1043,6 +1058,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             renderer.visible = source.value("visible", true);
             renderer.castShadow = source.value("castShadow", true);
             renderer.visibleToCamera = source.value("visibleToCamera", true);
+            renderer.activeMaterialVariantIndex = source.value("activeMaterialVariantIndex", UINT32_MAX);
+            renderer.activeMaterialVariantName = source.value("activeMaterialVariantName", std::string{});
             for (const nlohmann::json& slotSource : source.value("materialSlots", nlohmann::json::array())) {
                 MaterialSlot slot;
                 slot.name = slotSource.value("name", std::string{});
@@ -1102,7 +1119,11 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         if (item.contains("camera")) {
             const nlohmann::json& source = item["camera"];
             Camera camera;
+            camera.projection = source.value("projection", camera.projection);
             camera.verticalFovRadians = source.value("verticalFovRadians", camera.verticalFovRadians);
+            camera.aspectRatio = source.value("aspectRatio", camera.aspectRatio);
+            camera.orthographicXmag = source.value("orthographicXmag", camera.orthographicXmag);
+            camera.orthographicYmag = source.value("orthographicYmag", camera.orthographicYmag);
             camera.nearPlane = source.value("nearPlane", camera.nearPlane);
             camera.farPlane = source.value("farPlane", camera.farPlane);
             camera.active = source.value("active", false);

@@ -16,6 +16,9 @@ void main() {
         payload.material_id = 0u;
         payload.tangent = vec3(1.0, 0.0, 0.0);
         payload.bitangent = vec3(0.0, 0.0, 1.0);
+        payload.uv = vec2(0.0);
+        payload.uv1 = vec2(0.0);
+        payload.vertex_color = vec4(1.0);
         return;
     }
 
@@ -50,10 +53,12 @@ void main() {
     vec2 uv = vec2(
         v0.position_uv_x.w * bary.x + v1.position_uv_x.w * bary.y + v2.position_uv_x.w * bary.z,
         v0.normal_uv_y.w * bary.x + v1.normal_uv_y.w * bary.y + v2.normal_uv_y.w * bary.z);
+    vec2 uv1 = v0.texcoord1.xy * bary.x + v1.texcoord1.xy * bary.y + v2.texcoord1.xy * bary.z;
     vec3 localTangent = normalize(v0.tangent.xyz * bary.x + v1.tangent.xyz * bary.y + v2.tangent.xyz * bary.z);
     float tangentSign = v0.tangent.w * bary.x + v1.tangent.w * bary.y + v2.tangent.w * bary.z;
     vec3 worldTangent = normalize(mat3(instance.transform) * localTangent);
     vec3 worldBitangent = normalize(cross(worldNormal, worldTangent) * (tangentSign < 0.0 ? -1.0 : 1.0));
+    vec4 vertexColor = clamp(v0.color * bary.x + v1.color * bary.y + v2.color * bary.z, vec4(0.0), vec4(1.0));
 
     uint materialIndex = material_for_triangle_index(globalTriangleIndex);
     Material materialForDiagnostics = decode_material(materialIndex);
@@ -76,6 +81,8 @@ void main() {
     payload.mesh_id = meshIndex;
     payload.primitive_id = globalTriangleIndex;
     payload.uv = uv;
+    payload.uv1 = uv1;
     payload.tangent = worldTangent;
     payload.bitangent = worldBitangent;
+    payload.vertex_color = vertexColor;
 }

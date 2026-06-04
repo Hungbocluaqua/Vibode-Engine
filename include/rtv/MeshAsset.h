@@ -26,6 +26,8 @@ struct MeshVertex {
     glm::vec3 normal{0.0f, 1.0f, 0.0f};
     glm::vec4 tangent{1.0f, 0.0f, 0.0f, 1.0f};
     glm::vec2 texcoord{};
+    glm::vec2 texcoord1{};
+    glm::vec4 color{1.0f};
 };
 
 struct TextureTransformAsset {
@@ -52,6 +54,12 @@ struct MaterialAsset {
     float clearcoatRoughnessFactor = 0.0f;
     uint32_t hasTransmission = 0;
     float transmissionFactor = 0.0f;
+    uint32_t hasVolume = 0;
+    float volumeThicknessFactor = 0.0f;
+    float volumeAttenuationDistance = 0.0f;
+    glm::vec3 volumeAttenuationColor{1.0f};
+    uint32_t hasDispersion = 0;
+    float dispersionFactor = 0.0f;
     uint32_t hasSpecular = 0;
     float specularFactor = 1.0f;
     glm::vec3 specularColorFactor{1.0f};
@@ -80,6 +88,7 @@ struct MaterialAsset {
     TextureAssetHandle clearcoatRoughnessTexture{};
     TextureAssetHandle clearcoatNormalTexture{};
     TextureAssetHandle transmissionTexture{};
+    TextureAssetHandle volumeThicknessTexture{};
     TextureAssetHandle specularTexture{};
     TextureAssetHandle specularColorTexture{};
     TextureAssetHandle sheenColorTexture{};
@@ -93,6 +102,18 @@ struct MaterialAsset {
     TextureTransformAsset normalTextureTransform{};
     TextureTransformAsset emissiveTextureTransform{};
     TextureTransformAsset occlusionTextureTransform{};
+    TextureTransformAsset clearcoatTextureTransform{};
+    TextureTransformAsset clearcoatRoughnessTextureTransform{};
+    TextureTransformAsset clearcoatNormalTextureTransform{};
+    TextureTransformAsset transmissionTextureTransform{};
+    TextureTransformAsset volumeThicknessTextureTransform{};
+    TextureTransformAsset specularTextureTransform{};
+    TextureTransformAsset specularColorTextureTransform{};
+    TextureTransformAsset sheenColorTextureTransform{};
+    TextureTransformAsset sheenRoughnessTextureTransform{};
+    TextureTransformAsset iridescenceTextureTransform{};
+    TextureTransformAsset iridescenceThicknessTextureTransform{};
+    TextureTransformAsset anisotropyTextureTransform{};
     uint32_t shaderCompatibilityMask = 1u;
 };
 
@@ -125,6 +146,9 @@ constexpr uint32_t kMaterialClosureFlagClearcoat    = 1u << 4u;
 constexpr uint32_t kMaterialClosureFlagSheen        = 1u << 5u;
 constexpr uint32_t kMaterialClosureFlagThinFilm     = 1u << 6u;
 constexpr uint32_t kMaterialClosureFlagMetal        = 1u << 7u;
+constexpr uint32_t kMaterialClosureFlagUnlit        = 1u << 8u;
+constexpr uint32_t kMaterialClosureFlagVolume       = 1u << 9u;
+constexpr uint32_t kMaterialClosureFlagDispersion   = 1u << 10u;
 
 struct MeshPrimitiveAsset {
     uint32_t firstIndex = 0;
@@ -132,6 +156,12 @@ struct MeshPrimitiveAsset {
     uint32_t firstVertex = 0;
     uint32_t vertexCount = 0;
     MaterialAssetHandle material{};
+    struct MaterialVariant {
+        uint32_t variantIndex = UINT32_MAX;
+        std::string variantName;
+        MaterialAssetHandle material{};
+    };
+    std::vector<MaterialVariant> materialVariants;
     float alphaCutoff = 0.5f;
     uint32_t alphaMode = kMaterialAlphaModeOpaque;
     bool containsAlphaTestedGeometry = false;
@@ -161,7 +191,11 @@ struct SceneNodeAsset {
     bool castShadow = true;
     bool visibleToCamera = true;
     bool hasCamera = false;
+    uint32_t cameraProjection = 0;
     float cameraYfov = 60.0f * 0.017453292519943295f;
+    float cameraAspectRatio = 0.0f;
+    float cameraOrthoXmag = 1.0f;
+    float cameraOrthoYmag = 1.0f;
     float cameraNear = 0.01f;
     float cameraFar = 1000.0f;
     int32_t parent = -1;
@@ -186,6 +220,7 @@ struct SceneAsset {
     std::vector<TextureAssetHandle> textures;
     std::vector<MaterialAssetHandle> materials;
     std::vector<MeshAssetHandle> meshes;
+    std::vector<std::string> materialVariants;
     std::vector<SceneNodeAsset> nodes;
     std::vector<SceneLightAsset> lights;
     std::vector<uint32_t> rootNodes;

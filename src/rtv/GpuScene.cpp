@@ -59,20 +59,26 @@ constexpr uint32_t gpuLightTypeSpot = 5u;
 constexpr uint64_t fastImportedBvhTriangleThreshold = 1'000'000ull;
 constexpr uint32_t materialFlagManualBaseColorSrgb = 1u << 0u;
 constexpr uint32_t materialFlagManualEmissiveSrgb = 1u << 1u;
-constexpr uint32_t materialVec4Stride = 11u;
+constexpr uint32_t materialParameterVec4Stride = 17u;
+constexpr uint32_t materialTextureTransformCount = 17u;
+constexpr uint32_t materialVec4Stride = materialParameterVec4Stride + materialTextureTransformCount * 2u;
 constexpr uint32_t materialTypeImportedPbr = 3u;
 constexpr uint32_t materialTypeDielectric = 2u;
+constexpr uint32_t materialTypeUnlit = 5u;
 constexpr float materialDeltaRoughnessThreshold = 0.001f;
 
 static_assert(sizeof(GpuMeshRecord) == 64);
 static_assert(sizeof(GpuPrimitiveRecord) == 32);
 static_assert(sizeof(GpuInstanceRecord) == 272);
-static_assert(sizeof(GpuLocalVertex) == 48);
+static_assert(sizeof(GpuLocalVertex) == 80);
 static_assert(sizeof(GpuInstanceBoundsRecord) == 32);
 static_assert(sizeof(GpuLightRecord) == 80);
 static_assert(sizeof(MeshParamsUniform) == 80);
 
 uint32_t importedMaterialType(const MaterialAsset* material) {
+    if (material != nullptr && (material->shaderCompatibilityMask & kMaterialClosureFlagUnlit) != 0u) {
+        return materialTypeUnlit;
+    }
     if (material != nullptr &&
         material->hasTransmission != 0u &&
         material->transmissionFactor > 0.99f &&
@@ -84,6 +90,9 @@ uint32_t importedMaterialType(const MaterialAsset* material) {
 }
 
 uint32_t importedMaterialType(const CachedMaterialData& material) {
+    if ((material.shaderCompatibilityMask & kMaterialClosureFlagUnlit) != 0u) {
+        return materialTypeUnlit;
+    }
     if (material.hasTransmission != 0u &&
         material.transmissionFactor > 0.99f &&
         material.metallicFactor <= 0.0f &&
@@ -246,6 +255,120 @@ void appendConductorOptics(
         iridescenceThicknessTexture});
 }
 
+void appendGltfMaterialExtensionData(
+    std::vector<glm::vec4>& materialData,
+    const MaterialAsset* material,
+    float clearcoatTexture = -1.0f,
+    float clearcoatRoughnessTexture = -1.0f,
+    float clearcoatNormalTexture = -1.0f,
+    float transmissionTexture = -1.0f,
+    float volumeThicknessTexture = -1.0f,
+    float specularTexture = -1.0f,
+    float specularColorTexture = -1.0f,
+    float anisotropyTexture = -1.0f) {
+    materialData.push_back({
+        material != nullptr ? material->clearcoatFactor : 0.0f,
+        material != nullptr ? material->clearcoatRoughnessFactor : 0.0f,
+        clearcoatTexture,
+        clearcoatRoughnessTexture});
+    materialData.push_back({
+        clearcoatNormalTexture,
+        material != nullptr ? material->transmissionFactor : 0.0f,
+        transmissionTexture,
+        material != nullptr ? material->specularFactor : 1.0f});
+    materialData.push_back({
+        material != nullptr ? material->specularColorFactor : glm::vec3{1.0f},
+        specularTexture});
+    materialData.push_back({
+        specularColorTexture,
+        anisotropyTexture,
+        material != nullptr ? material->volumeThicknessFactor : 0.0f,
+        volumeThicknessTexture});
+    materialData.push_back({
+        material != nullptr ? material->volumeAttenuationColor : glm::vec3{1.0f},
+        material != nullptr ? material->volumeAttenuationDistance : 0.0f});
+    materialData.push_back({
+        material != nullptr ? material->dispersionFactor : 0.0f,
+        0.0f,
+        0.0f,
+        0.0f});
+}
+
+void appendGltfMaterialExtensionData(std::vector<glm::vec4>& materialData, const CachedMaterialData& material) {
+    materialData.push_back({
+        material.clearcoatFactor,
+        material.clearcoatRoughnessFactor,
+        material.clearcoatTextureIndex >= 0 ? static_cast<float>(material.clearcoatTextureIndex) : -1.0f,
+        material.clearcoatRoughnessTextureIndex >= 0 ? static_cast<float>(material.clearcoatRoughnessTextureIndex) : -1.0f});
+    materialData.push_back({
+        material.clearcoatNormalTextureIndex >= 0 ? static_cast<float>(material.clearcoatNormalTextureIndex) : -1.0f,
+        material.transmissionFactor,
+        material.transmissionTextureIndex >= 0 ? static_cast<float>(material.transmissionTextureIndex) : -1.0f,
+        material.specularFactor});
+    materialData.push_back({
+        material.specularColorFactor,
+        material.specularTextureIndex >= 0 ? static_cast<float>(material.specularTextureIndex) : -1.0f});
+    materialData.push_back({
+        material.specularColorTextureIndex >= 0 ? static_cast<float>(material.specularColorTextureIndex) : -1.0f,
+        material.anisotropyTextureIndex >= 0 ? static_cast<float>(material.anisotropyTextureIndex) : -1.0f,
+        material.volumeThicknessFactor,
+        material.volumeThicknessTextureIndex >= 0 ? static_cast<float>(material.volumeThicknessTextureIndex) : -1.0f});
+    materialData.push_back({material.volumeAttenuationColor, material.volumeAttenuationDistance});
+    materialData.push_back({material.dispersionFactor, 0.0f, 0.0f, 0.0f});
+}
+
+void appendTextureTransformData(std::vector<glm::vec4>& materialData, const TextureTransformAsset& transform) {
+    materialData.push_back({transform.offset, transform.scale});
+    materialData.push_back({
+        transform.rotation,
+        transform.enabled != 0u ? 1.0f : 0.0f,
+        static_cast<float>(transform.texCoord),
+        0.0f});
+}
+
+void appendMaterialTextureTransforms(std::vector<glm::vec4>& materialData, const MaterialAsset* material) {
+    const TextureTransformAsset identity{};
+    const MaterialAsset fallback{};
+    const MaterialAsset& m = material != nullptr ? *material : fallback;
+    appendTextureTransformData(materialData, material != nullptr ? m.baseColorTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.normalTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.metallicRoughnessTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.emissiveTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.occlusionTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.sheenColorTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.sheenRoughnessTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.iridescenceTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.iridescenceThicknessTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.clearcoatTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.clearcoatRoughnessTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.clearcoatNormalTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.transmissionTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.volumeThicknessTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.specularTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.specularColorTextureTransform : identity);
+    appendTextureTransformData(materialData, material != nullptr ? m.anisotropyTextureTransform : identity);
+}
+
+void appendMaterialTextureTransforms(std::vector<glm::vec4>& materialData, const CachedMaterialData& material) {
+    appendTextureTransformData(materialData, material.baseColorTextureTransform);
+    appendTextureTransformData(materialData, material.normalTextureTransform);
+    appendTextureTransformData(materialData, material.metallicRoughnessTextureTransform);
+    appendTextureTransformData(materialData, material.emissiveTextureTransform);
+    appendTextureTransformData(materialData, material.occlusionTextureTransform);
+    appendTextureTransformData(materialData, material.sheenColorTextureTransform);
+    appendTextureTransformData(materialData, material.sheenRoughnessTextureTransform);
+    appendTextureTransformData(materialData, material.iridescenceTextureTransform);
+    appendTextureTransformData(materialData, material.iridescenceThicknessTextureTransform);
+    appendTextureTransformData(materialData, material.clearcoatTextureTransform);
+    appendTextureTransformData(materialData, material.clearcoatRoughnessTextureTransform);
+    appendTextureTransformData(materialData, material.clearcoatNormalTextureTransform);
+    appendTextureTransformData(materialData, material.transmissionTextureTransform);
+    appendTextureTransformData(materialData, material.volumeThicknessTextureTransform);
+    appendTextureTransformData(materialData, material.specularTextureTransform);
+    appendTextureTransformData(materialData, material.specularColorTextureTransform);
+    appendTextureTransformData(materialData, material.anisotropyTextureTransform);
+}
+
 void appendConductorOptics(std::vector<glm::vec4>& materialData, const CachedMaterialData& material) {
     const bool enabled = material.useConductorOptics != 0u;
     glm::vec3 eta = enabled ? nonnegativeRgb(material.conductorEta) : glm::vec3{0.0f};
@@ -296,6 +419,8 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
             static_cast<float>(material.doubleSided),
             0.0f});
         appendConductorOptics(materialData, material);
+        appendGltfMaterialExtensionData(materialData, material);
+        appendMaterialTextureTransforms(materialData, material);
     }
     if (materialData.empty()) {
         materialData.push_back({0.8f, 0.8f, 0.8f, 1.0f});
@@ -304,6 +429,8 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 0.0f, 0.0f});
         appendConductorOptics(materialData, nullptr);
+        appendGltfMaterialExtensionData(materialData, nullptr);
+        appendMaterialTextureTransforms(materialData, nullptr);
     }
     return materialData;
 }
@@ -441,11 +568,19 @@ GpuInstanceBoundsRecord makeInstanceBoundsRecord(const CpuBounds& bounds, uint32
     };
 }
 
-GpuLocalVertex makeLocalVertex(glm::vec3 position, glm::vec3 normal, glm::vec2 uv = glm::vec2{0.0f}, glm::vec4 tangent = glm::vec4{1.0f, 0.0f, 0.0f, 1.0f}) {
+GpuLocalVertex makeLocalVertex(
+    glm::vec3 position,
+    glm::vec3 normal,
+    glm::vec2 uv = glm::vec2{0.0f},
+    glm::vec4 tangent = glm::vec4{1.0f, 0.0f, 0.0f, 1.0f},
+    glm::vec4 color = glm::vec4{1.0f},
+    glm::vec2 uv1 = glm::vec2{0.0f}) {
     return GpuLocalVertex{
         .positionUvX = {position, uv.x},
         .normalUvY = {normal, uv.y},
         .tangent = tangent,
+        .color = color,
+        .texcoord1 = {uv1, 0.0f, 0.0f},
     };
 }
 
@@ -1801,6 +1936,18 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
             material != nullptr ? textureSlotFor(material->sheenRoughnessTexture) : -1.0f,
             material != nullptr ? textureSlotFor(material->iridescenceTexture) : -1.0f,
             material != nullptr ? textureSlotFor(material->iridescenceThicknessTexture) : -1.0f);
+        appendGltfMaterialExtensionData(
+            materialData,
+            material,
+            material != nullptr ? textureSlotFor(material->clearcoatTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->clearcoatRoughnessTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->clearcoatNormalTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->transmissionTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->volumeThicknessTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->specularTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->specularColorTexture) : -1.0f,
+            material != nullptr ? textureSlotFor(material->anisotropyTexture) : -1.0f);
+        appendMaterialTextureTransforms(materialData, material);
     }
 
     const VkDeviceSize byteSize = sizeof(glm::vec4) * materialData.size();
@@ -2210,6 +2357,8 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 1.0f, 0.0f});
         appendConductorOptics(materialData, nullptr);
+        appendGltfMaterialExtensionData(materialData, nullptr);
+        appendMaterialTextureTransforms(materialData, nullptr);
         materialEmissive.push_back(m.emissive);
     }
 
@@ -2339,6 +2488,14 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         const float sheenRoughnessTexture = material != nullptr ? textureSlotFor(material->sheenRoughnessTexture) : -1.0f;
         const float iridescenceTexture = material != nullptr ? textureSlotFor(material->iridescenceTexture) : -1.0f;
         const float iridescenceThicknessTexture = material != nullptr ? textureSlotFor(material->iridescenceThicknessTexture) : -1.0f;
+        const float clearcoatTexture = material != nullptr ? textureSlotFor(material->clearcoatTexture) : -1.0f;
+        const float clearcoatRoughnessTexture = material != nullptr ? textureSlotFor(material->clearcoatRoughnessTexture) : -1.0f;
+        const float clearcoatNormalTexture = material != nullptr ? textureSlotFor(material->clearcoatNormalTexture) : -1.0f;
+        const float transmissionTexture = material != nullptr ? textureSlotFor(material->transmissionTexture) : -1.0f;
+        const float volumeThicknessTexture = material != nullptr ? textureSlotFor(material->volumeThicknessTexture) : -1.0f;
+        const float specularTexture = material != nullptr ? textureSlotFor(material->specularTexture) : -1.0f;
+        const float specularColorTexture = material != nullptr ? textureSlotFor(material->specularColorTexture) : -1.0f;
+        const float anisotropyTexture = material != nullptr ? textureSlotFor(material->anisotropyTexture) : -1.0f;
         uint32_t flags = 0;
         if (material != nullptr) {
             uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
@@ -2367,6 +2524,18 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             sheenRoughnessTexture,
             iridescenceTexture,
             iridescenceThicknessTexture);
+        appendGltfMaterialExtensionData(
+            materialData,
+            material,
+            clearcoatTexture,
+            clearcoatRoughnessTexture,
+            clearcoatNormalTexture,
+            transmissionTexture,
+            volumeThicknessTexture,
+            specularTexture,
+            specularColorTexture,
+            anisotropyTexture);
+        appendMaterialTextureTransforms(materialData, material);
         materialEmissive.push_back(emissive);
         materialOpaqueTraversalSafe.push_back(material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u);
         materialAlphaClasses.push_back(primitiveAlphaClassForMaterial(material));
@@ -2378,6 +2547,8 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 0.0f, 0.0f});
         appendConductorOptics(materialData, nullptr);
+        appendGltfMaterialExtensionData(materialData, nullptr);
+        appendMaterialTextureTransforms(materialData, nullptr);
         materialEmissive.push_back(glm::vec3(0.0f));
         materialOpaqueTraversalSafe.push_back(false);
         materialAlphaClasses.push_back(kPrimitiveAlphaClassOpaque);
@@ -2450,7 +2621,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             const float tangentLen2 = glm::dot(tangent, tangent);
             tangent = tangentLen2 > 1.0e-10f ? glm::normalize(tangent) : glm::vec3{1.0f, 0.0f, 0.0f};
             const glm::vec4 packedTangent{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f};
-            localVertexData.push_back(makeLocalVertex(vertex.position, normal, vertex.texcoord, packedTangent));
+            localVertexData.push_back(makeLocalVertex(vertex.position, normal, vertex.texcoord, packedTangent, vertex.color, vertex.texcoord1));
             prep.positions.push_back(vertex.position);
             prep.texcoords.push_back(vertex.texcoord);
             prep.normals.push_back(normal);
@@ -2786,6 +2957,12 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMat.hasAnisotropy = material->hasAnisotropy;
             cachedMat.anisotropyStrength = material->anisotropyStrength;
             cachedMat.anisotropyRotation = material->anisotropyRotation;
+            cachedMat.hasVolume = material->hasVolume;
+            cachedMat.volumeThicknessFactor = material->volumeThicknessFactor;
+            cachedMat.volumeAttenuationDistance = material->volumeAttenuationDistance;
+            cachedMat.volumeAttenuationColor = material->volumeAttenuationColor;
+            cachedMat.hasDispersion = material->hasDispersion;
+            cachedMat.dispersionFactor = material->dispersionFactor;
             cachedMat.occlusionStrength = material->occlusionStrength;
             cachedMat.useConductorOptics = material->useConductorOptics;
             cachedMat.conductorEta = material->conductorEta;
@@ -2798,6 +2975,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMat.clearcoatRoughnessTextureIndex = getTextureIndex(material->clearcoatRoughnessTexture);
             cachedMat.clearcoatNormalTextureIndex = getTextureIndex(material->clearcoatNormalTexture);
             cachedMat.transmissionTextureIndex = getTextureIndex(material->transmissionTexture);
+            cachedMat.volumeThicknessTextureIndex = getTextureIndex(material->volumeThicknessTexture);
             cachedMat.specularTextureIndex = getTextureIndex(material->specularTexture);
             cachedMat.specularColorTextureIndex = getTextureIndex(material->specularColorTexture);
             cachedMat.sheenColorTextureIndex = getTextureIndex(material->sheenColorTexture);
@@ -2811,6 +2989,18 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMat.normalTextureTransform = material->normalTextureTransform;
             cachedMat.emissiveTextureTransform = material->emissiveTextureTransform;
             cachedMat.occlusionTextureTransform = material->occlusionTextureTransform;
+            cachedMat.clearcoatTextureTransform = material->clearcoatTextureTransform;
+            cachedMat.clearcoatRoughnessTextureTransform = material->clearcoatRoughnessTextureTransform;
+            cachedMat.clearcoatNormalTextureTransform = material->clearcoatNormalTextureTransform;
+            cachedMat.transmissionTextureTransform = material->transmissionTextureTransform;
+            cachedMat.volumeThicknessTextureTransform = material->volumeThicknessTextureTransform;
+            cachedMat.specularTextureTransform = material->specularTextureTransform;
+            cachedMat.specularColorTextureTransform = material->specularColorTextureTransform;
+            cachedMat.sheenColorTextureTransform = material->sheenColorTextureTransform;
+            cachedMat.sheenRoughnessTextureTransform = material->sheenRoughnessTextureTransform;
+            cachedMat.iridescenceTextureTransform = material->iridescenceTextureTransform;
+            cachedMat.iridescenceThicknessTextureTransform = material->iridescenceThicknessTextureTransform;
+            cachedMat.anisotropyTextureTransform = material->anisotropyTextureTransform;
             cachedMat.shaderCompatibilityMask = material->shaderCompatibilityMask;
             gpuCached.materials.push_back(std::move(cachedMat));
         }
@@ -2828,6 +3018,13 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
                 cachedPrim.firstIndex = prim.firstIndex;
                 cachedPrim.indexCount = prim.indexCount;
                 cachedPrim.materialIndex = getMaterialIndex(prim.material);
+                for (const auto& variant : prim.materialVariants) {
+                    cachedPrim.materialVariants.push_back(CachedPrimitiveData::MaterialVariant{
+                        .variantIndex = variant.variantIndex,
+                        .variantName = variant.variantName,
+                        .materialIndex = getMaterialIndex(variant.material),
+                    });
+                }
                 cachedMesh.primitives.push_back(std::move(cachedPrim));
             }
             gpuCached.meshes.push_back(std::move(cachedMesh));
@@ -2853,10 +3050,19 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedNode.name = node.name;
             cachedNode.transform = node.transform;
             cachedNode.meshIndex = getMeshIndex(node.mesh);
+            cachedNode.hasCamera = node.hasCamera ? 1u : 0u;
+            cachedNode.cameraProjection = node.cameraProjection;
+            cachedNode.cameraYfov = node.cameraYfov;
+            cachedNode.cameraAspectRatio = node.cameraAspectRatio;
+            cachedNode.cameraOrthoXmag = node.cameraOrthoXmag;
+            cachedNode.cameraOrthoYmag = node.cameraOrthoYmag;
+            cachedNode.cameraNear = node.cameraNear;
+            cachedNode.cameraFar = node.cameraFar;
             cachedNode.parentIndex = node.parent;
             cachedNode.children = node.children;
             gpuCached.nodes.push_back(std::move(cachedNode));
         }
+        gpuCached.materialVariants = importedScene.materialVariants;
         gpuCached.rootNodes = importedScene.rootNodes;
 
         for (const auto& prim : primitiveRecords) {
@@ -2989,7 +3195,13 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
             glm::vec3 tangent = glm::vec3(vertex.tangent);
             const float tangentLen2 = glm::dot(tangent, tangent);
             tangent = tangentLen2 > 1.0e-10f ? glm::normalize(tangent) : glm::vec3{1.0f, 0.0f, 0.0f};
-            localVertexData.push_back(makeLocalVertex(vertex.position, normal, vertex.texcoord, glm::vec4{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f}));
+            localVertexData.push_back(makeLocalVertex(
+                vertex.position,
+                normal,
+                vertex.texcoord,
+                glm::vec4{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f},
+                vertex.color,
+                vertex.texcoord1));
         }
         localIndices.reserve(localIndices.size() + mesh.indices.size());
         for (uint32_t index : mesh.indices) {

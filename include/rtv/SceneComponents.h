@@ -60,6 +60,8 @@ struct MeshRenderer {
     MeshAssetHandle mesh{};
     AssetGuid meshGuid;
     std::vector<MaterialSlot> materialSlots;
+    uint32_t activeMaterialVariantIndex = UINT32_MAX;
+    std::string activeMaterialVariantName;
     bool visible = true;
     bool castShadow = true;
     bool visibleToCamera = true;
@@ -105,7 +107,11 @@ struct Sun {
 };
 
 struct Camera {
+    uint32_t projection = 0;
     float verticalFovRadians = 60.0f * 0.017453292519943295f;
+    float aspectRatio = 0.0f;
+    float orthographicXmag = 1.0f;
+    float orthographicYmag = 1.0f;
     float nearPlane = 0.01f;
     float farPlane = 1000.0f;
     bool active = false;

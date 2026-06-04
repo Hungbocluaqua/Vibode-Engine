@@ -21,6 +21,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -28,36 +29,228 @@ namespace rtv {
 
 namespace {
 
-[[nodiscard]] const uint8_t* accessorBytes(const tinygltf::Model& model, const tinygltf::Accessor& accessor) {
+struct AccessorView {
+    const uint8_t* data = nullptr;
+    size_t count = 0;
+    size_t byteStride = 0;
+    size_t elementSize = 0;
+};
+
+[[nodiscard]] bool checkedAdd(size_t a, size_t b, size_t& out) {
+    if (a > std::numeric_limits<size_t>::max() - b) {
+        return false;
+    }
+    out = a + b;
+    return true;
+}
+
+[[nodiscard]] bool checkedMul(size_t a, size_t b, size_t& out) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+[[nodiscard]] const char* accessorTypeName(int type) {
+    switch (type) {
+    case TINYGLTF_TYPE_SCALAR: return "SCALAR";
+    case TINYGLTF_TYPE_VEC2: return "VEC2";
+    case TINYGLTF_TYPE_VEC3: return "VEC3";
+    case TINYGLTF_TYPE_VEC4: return "VEC4";
+    case TINYGLTF_TYPE_MAT2: return "MAT2";
+    case TINYGLTF_TYPE_MAT3: return "MAT3";
+    case TINYGLTF_TYPE_MAT4: return "MAT4";
+    default: return "UNKNOWN";
+    }
+}
+
+[[nodiscard]] const char* componentTypeName(int componentType) {
+    switch (componentType) {
+    case TINYGLTF_COMPONENT_TYPE_BYTE: return "BYTE";
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: return "UNSIGNED_BYTE";
+    case TINYGLTF_COMPONENT_TYPE_SHORT: return "SHORT";
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: return "UNSIGNED_SHORT";
+    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT: return "UNSIGNED_INT";
+    case TINYGLTF_COMPONENT_TYPE_FLOAT: return "FLOAT";
+    default: return "UNKNOWN";
+    }
+}
+
+[[nodiscard]] std::optional<AccessorView> makeAccessorView(
+    const tinygltf::Model& model,
+    int accessorIndex,
+    int expectedType,
+    int expectedComponentType,
+    std::string_view label) {
+    if (accessorIndex < 0 || static_cast<size_t>(accessorIndex) >= model.accessors.size()) {
+        std::cerr << "glTF accessor warning: " << label << " accessor index " << accessorIndex << " is out of range\n";
+        return std::nullopt;
+    }
+
+    const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(accessorIndex)];
+    if (accessor.type != expectedType) {
+        std::cerr << "glTF accessor warning: " << label << " expected type " << accessorTypeName(expectedType)
+                  << " but got " << accessorTypeName(accessor.type) << "; skipping attribute\n";
+        return std::nullopt;
+    }
+    if (accessor.componentType != expectedComponentType) {
+        std::cerr << "glTF accessor warning: " << label << " expected component " << componentTypeName(expectedComponentType)
+                  << " but got " << componentTypeName(accessor.componentType) << "; skipping attribute\n";
+        return std::nullopt;
+    }
+    if (accessor.bufferView < 0 || static_cast<size_t>(accessor.bufferView) >= model.bufferViews.size()) {
+        std::cerr << "glTF accessor warning: " << label << " references invalid bufferView " << accessor.bufferView << "\n";
+        return std::nullopt;
+    }
+
     const tinygltf::BufferView& view = model.bufferViews[static_cast<size_t>(accessor.bufferView)];
+    if (view.buffer < 0 || static_cast<size_t>(view.buffer) >= model.buffers.size()) {
+        std::cerr << "glTF accessor warning: " << label << " references invalid buffer " << view.buffer << "\n";
+        return std::nullopt;
+    }
+
+    const int componentSizeInt = tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(accessor.componentType));
+    const int componentCountInt = tinygltf::GetNumComponentsInType(static_cast<uint32_t>(accessor.type));
+    if (componentSizeInt <= 0 || componentCountInt <= 0) {
+        std::cerr << "glTF accessor warning: " << label << " has unsupported type/component combination\n";
+        return std::nullopt;
+    }
+
+    const size_t componentSize = static_cast<size_t>(componentSizeInt);
+    const size_t componentCount = static_cast<size_t>(componentCountInt);
+    size_t elementSize = 0;
+    if (!checkedMul(componentSize, componentCount, elementSize)) {
+        std::cerr << "glTF accessor warning: " << label << " element size overflow\n";
+        return std::nullopt;
+    }
+
+    const int strideInt = accessor.ByteStride(view);
+    if (strideInt < 0) {
+        std::cerr << "glTF accessor warning: " << label << " has invalid byteStride\n";
+        return std::nullopt;
+    }
+    const size_t byteStride = strideInt > 0 ? static_cast<size_t>(strideInt) : elementSize;
+    if (byteStride < elementSize) {
+        std::cerr << "glTF accessor warning: " << label << " byteStride is smaller than element size\n";
+        return std::nullopt;
+    }
+
+    const size_t accessorByteOffset = static_cast<size_t>(accessor.byteOffset);
+    const size_t viewByteOffset = static_cast<size_t>(view.byteOffset);
+    const size_t viewByteLength = static_cast<size_t>(view.byteLength);
     const tinygltf::Buffer& buffer = model.buffers[static_cast<size_t>(view.buffer)];
-    return buffer.data.data() + view.byteOffset + accessor.byteOffset;
+    const size_t bufferSize = buffer.data.size();
+
+    size_t viewEnd = 0;
+    if (!checkedAdd(viewByteOffset, viewByteLength, viewEnd) || viewEnd > bufferSize) {
+        std::cerr << "glTF accessor warning: " << label << " bufferView range exceeds buffer size\n";
+        return std::nullopt;
+    }
+    if (accessorByteOffset > viewByteLength) {
+        std::cerr << "glTF accessor warning: " << label << " byteOffset exceeds bufferView length\n";
+        return std::nullopt;
+    }
+
+    if (accessor.count > 0) {
+        size_t lastElementOffset = 0;
+        size_t lastElementEnd = 0;
+        if (!checkedMul(static_cast<size_t>(accessor.count - 1), byteStride, lastElementOffset) ||
+            !checkedAdd(accessorByteOffset, lastElementOffset, lastElementOffset) ||
+            !checkedAdd(lastElementOffset, elementSize, lastElementEnd) ||
+            lastElementEnd > viewByteLength) {
+            std::cerr << "glTF accessor warning: " << label << " computed byte range exceeds bufferView length\n";
+            return std::nullopt;
+        }
+    }
+
+    return AccessorView{
+        .data = buffer.data.data() + viewByteOffset + accessorByteOffset,
+        .count = static_cast<size_t>(accessor.count),
+        .byteStride = byteStride,
+        .elementSize = elementSize,
+    };
+}
+
+[[nodiscard]] std::optional<AccessorView> makeIndexAccessorView(const tinygltf::Model& model, int accessorIndex) {
+    if (accessorIndex < 0 || static_cast<size_t>(accessorIndex) >= model.accessors.size()) {
+        std::cerr << "glTF accessor warning: index accessor " << accessorIndex << " is out of range\n";
+        return std::nullopt;
+    }
+    const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(accessorIndex)];
+    if (accessor.type != TINYGLTF_TYPE_SCALAR) {
+        std::cerr << "glTF accessor warning: indices expected SCALAR but got " << accessorTypeName(accessor.type) << "; skipping primitive\n";
+        return std::nullopt;
+    }
+    if (accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE &&
+        accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT &&
+        accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
+        std::cerr << "glTF accessor warning: indices use unsupported component " << componentTypeName(accessor.componentType) << "; skipping primitive\n";
+        return std::nullopt;
+    }
+    return makeAccessorView(model, accessorIndex, TINYGLTF_TYPE_SCALAR, accessor.componentType, "indices");
+}
+
+[[nodiscard]] std::optional<AccessorView> makeColorAccessorView(const tinygltf::Model& model, int accessorIndex) {
+    if (accessorIndex < 0 || static_cast<size_t>(accessorIndex) >= model.accessors.size()) {
+        std::cerr << "glTF accessor warning: COLOR_0 accessor index " << accessorIndex << " is out of range\n";
+        return std::nullopt;
+    }
+    const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(accessorIndex)];
+    if (accessor.type != TINYGLTF_TYPE_VEC3 && accessor.type != TINYGLTF_TYPE_VEC4) {
+        std::cerr << "glTF accessor warning: COLOR_0 expected VEC3 or VEC4 but got " << accessorTypeName(accessor.type) << "; skipping attribute\n";
+        return std::nullopt;
+    }
+    if (accessor.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT &&
+        accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE &&
+        accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+        std::cerr << "glTF accessor warning: COLOR_0 uses unsupported component " << componentTypeName(accessor.componentType) << "; skipping attribute\n";
+        return std::nullopt;
+    }
+    return makeAccessorView(model, accessorIndex, accessor.type, accessor.componentType, "COLOR_0");
 }
 
 template <typename T>
-[[nodiscard]] const T& accessorElement(const tinygltf::Model& model, const tinygltf::Accessor& accessor, size_t index) {
-    const tinygltf::BufferView& view = model.bufferViews[static_cast<size_t>(accessor.bufferView)];
-    const size_t stride = static_cast<size_t>(accessor.ByteStride(view));
-    const size_t byteStride = stride > 0 ? stride : sizeof(T);
-    return *reinterpret_cast<const T*>(accessorBytes(model, accessor) + index * byteStride);
+[[nodiscard]] T readElement(const AccessorView& view, size_t index) {
+    T value{};
+    std::memcpy(&value, view.data + index * view.byteStride, sizeof(T));
+    return value;
 }
 
-[[nodiscard]] uint32_t indexElement(const tinygltf::Model& model, const tinygltf::Accessor& accessor, size_t index) {
-    const tinygltf::BufferView& view = model.bufferViews[static_cast<size_t>(accessor.bufferView)];
-    const size_t stride = static_cast<size_t>(accessor.ByteStride(view));
-    const uint8_t* data = accessorBytes(model, accessor);
-    const size_t byteStride = stride > 0 ? stride : tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(accessor.componentType));
-    const uint8_t* src = data + index * byteStride;
+[[nodiscard]] uint32_t readIndexElement(const tinygltf::Accessor& accessor, const AccessorView& view, size_t index) {
+    const uint8_t* src = view.data + index * view.byteStride;
     if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-        return *reinterpret_cast<const uint16_t*>(src);
+        uint16_t value = 0;
+        std::memcpy(&value, src, sizeof(value));
+        return value;
     }
     if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-        return *reinterpret_cast<const uint32_t*>(src);
+        uint32_t value = 0;
+        std::memcpy(&value, src, sizeof(value));
+        return value;
     }
-    if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-        return *src;
+    return *src;
+}
+
+[[nodiscard]] glm::vec4 readColorElement(const tinygltf::Accessor& accessor, const AccessorView& view, size_t index) {
+    const uint8_t* src = view.data + index * view.byteStride;
+    const int componentCount = tinygltf::GetNumComponentsInType(static_cast<uint32_t>(accessor.type));
+    glm::vec4 color{1.0f};
+    const int count = std::min(componentCount, 4);
+    for (int c = 0; c < count; ++c) {
+        if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+            float value = 1.0f;
+            std::memcpy(&value, src + sizeof(float) * static_cast<size_t>(c), sizeof(value));
+            color[c] = value;
+        } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+            uint16_t value = 0;
+            std::memcpy(&value, src + sizeof(uint16_t) * static_cast<size_t>(c), sizeof(value));
+            color[c] = static_cast<float>(value) / 65535.0f;
+        } else {
+            color[c] = static_cast<float>(src[c]) / 255.0f;
+        }
     }
-    return 0u;
+    return glm::clamp(color, glm::vec4{0.0f}, glm::vec4{1.0f});
 }
 
 [[nodiscard]] glm::mat4 nodeTransform(const tinygltf::Node& node) {
@@ -95,6 +288,23 @@ template <typename T>
         return (gltfPath.parent_path() / image.uri).lexically_normal();
     }
     return gltfPath;
+}
+
+[[nodiscard]] std::vector<std::filesystem::path> gltfBufferDependencies(const tinygltf::Model& model, const std::filesystem::path& gltfPath) {
+    std::vector<std::filesystem::path> dependencies;
+    dependencies.reserve(model.buffers.size());
+    std::unordered_set<std::string> seen;
+    for (const tinygltf::Buffer& buffer : model.buffers) {
+        if (buffer.uri.empty() || isDataUri(buffer.uri)) {
+            continue;
+        }
+        const std::filesystem::path depPath = (gltfPath.parent_path() / buffer.uri).lexically_normal();
+        const std::string key = depPath.string();
+        if (seen.insert(key).second) {
+            dependencies.push_back(depPath);
+        }
+    }
+    return dependencies;
 }
 
 void addDependency(CachedScene& cached, const std::filesystem::path& path, std::unordered_set<std::string>& seen) {
@@ -256,8 +466,8 @@ bool loadImageDataPreservingKtx2(
             ktxPath = texture.sourcePath;
         }
         try {
-            TextureData td = ktxPath.empty()
-                ? TextureLoader::loadKtx2(texture.sourcePath.string())
+            TextureData td = ktxPath.empty() && isKtx2Data(image.image)
+                ? TextureLoader::loadKtx2(image.image.data(), image.image.size())
                 : TextureLoader::loadKtx2(ktxPath.string());
             texture.width = static_cast<uint32_t>(td.width);
             texture.height = static_cast<uint32_t>(td.height);
@@ -430,10 +640,14 @@ bool loadImageDataPreservingKtx2(
         name == "KHR_materials_transmission" ||
         name == "KHR_materials_ior" ||
         name == "KHR_materials_specular" ||
+        name == "KHR_materials_volume" ||
+        name == "KHR_materials_dispersion" ||
         name == "KHR_materials_sheen" ||
         name == "KHR_materials_iridescence" ||
         name == "KHR_materials_emissive_strength" ||
         name == "KHR_materials_anisotropy" ||
+        name == "KHR_materials_unlit" ||
+        name == "KHR_materials_variants" ||
         name == "KHR_lights_punctual" ||
         name == "KHR_texture_transform";
 }
@@ -503,14 +717,9 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         }
         return textureHandle(intMember(*textureInfo, "index", -1));
     };
-    auto textureTransformFromInfo = [&](const auto& textureInfo) {
+    auto textureTransformFromObject = [&](const tinygltf::Value& textureTransform, int texCoordFallback) {
         TextureTransformAsset transform{};
-        const auto extIt = textureInfo.extensions.find("KHR_texture_transform");
-        if (extIt == textureInfo.extensions.end() || !extIt->second.IsObject()) {
-            return transform;
-        }
         transform.enabled = 1u;
-        const tinygltf::Value& textureTransform = extIt->second;
         if (const tinygltf::Value* offset = valueMember(textureTransform, "offset"); offset != nullptr && offset->IsArray()) {
             const auto& array = offset->Get<tinygltf::Value::Array>();
             if (array.size() >= 2 && array[0].IsNumber() && array[1].IsNumber()) {
@@ -524,8 +733,46 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
             }
         }
         transform.rotation = static_cast<float>(numberMember(textureTransform, "rotation", 0.0));
-        transform.texCoord = static_cast<uint32_t>(std::max(intMember(textureTransform, "texCoord", textureInfo.texCoord), 0));
+        transform.texCoord = static_cast<uint32_t>(std::max(intMember(textureTransform, "texCoord", texCoordFallback), 0));
         return transform;
+    };
+    auto textureTransformFromInfo = [&](const auto& textureInfo) {
+        TextureTransformAsset transform{};
+        transform.texCoord = static_cast<uint32_t>(std::max(textureInfo.texCoord, 0));
+        const auto extIt = textureInfo.extensions.find("KHR_texture_transform");
+        if (extIt == textureInfo.extensions.end() || !extIt->second.IsObject()) {
+            return transform;
+        }
+        return textureTransformFromObject(extIt->second, textureInfo.texCoord);
+    };
+    auto textureTransformMember = [&](const tinygltf::Value& object, const char* key) {
+        const tinygltf::Value* textureInfo = valueMember(object, key);
+        if (textureInfo == nullptr || !textureInfo->IsObject()) {
+            return TextureTransformAsset{};
+        }
+        TextureTransformAsset transform{};
+        transform.texCoord = static_cast<uint32_t>(std::max(intMember(*textureInfo, "texCoord", 0), 0));
+        const tinygltf::Value* extensions = valueMember(*textureInfo, "extensions");
+        if (extensions == nullptr || !extensions->IsObject()) {
+            return transform;
+        }
+        const tinygltf::Value* textureTransform = valueMember(*extensions, "KHR_texture_transform");
+        if (textureTransform == nullptr || !textureTransform->IsObject()) {
+            return transform;
+        }
+        return textureTransformFromObject(*textureTransform, intMember(*textureInfo, "texCoord", 0));
+    };
+
+    auto textureInfoHasTransform = [&](const TextureTransformAsset& transform) {
+        return transform.enabled != 0u;
+    };
+
+    auto textureInfoAnyTransform = [&](std::initializer_list<TextureTransformAsset> transforms) {
+        return std::any_of(transforms.begin(), transforms.end(), textureInfoHasTransform);
+    };
+
+    auto assignExtensionTextureTransform = [&](TextureTransformAsset& destination, const tinygltf::Value& object, const char* key) {
+        destination = textureTransformMember(object, key);
     };
 
     MaterialAsset material;
@@ -583,13 +830,33 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         material.clearcoatTexture = textureHandleMember(*ext, "clearcoatTexture");
         material.clearcoatRoughnessTexture = textureHandleMember(*ext, "clearcoatRoughnessTexture");
         material.clearcoatNormalTexture = textureHandleMember(*ext, "clearcoatNormalTexture");
+        assignExtensionTextureTransform(material.clearcoatTextureTransform, *ext, "clearcoatTexture");
+        assignExtensionTextureTransform(material.clearcoatRoughnessTextureTransform, *ext, "clearcoatRoughnessTexture");
+        assignExtensionTextureTransform(material.clearcoatNormalTextureTransform, *ext, "clearcoatNormalTexture");
         material.shaderCompatibilityMask |= kMaterialClosureFlagClearcoat;
     }
     if (const tinygltf::Value* ext = extensionObject("KHR_materials_transmission")) {
         material.hasTransmission = 1u;
         material.transmissionFactor = static_cast<float>(numberMember(*ext, "transmissionFactor", 0.0));
         material.transmissionTexture = textureHandleMember(*ext, "transmissionTexture");
+        assignExtensionTextureTransform(material.transmissionTextureTransform, *ext, "transmissionTexture");
         material.shaderCompatibilityMask |= kMaterialClosureFlagTransmission;
+    }
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_volume")) {
+        material.hasVolume = 1u;
+        material.volumeThicknessFactor = static_cast<float>(numberMember(*ext, "thicknessFactor", 0.0));
+        material.volumeThicknessTexture = textureHandleMember(*ext, "thicknessTexture");
+        material.volumeAttenuationDistance = static_cast<float>(numberMember(*ext, "attenuationDistance", 0.0));
+        material.volumeAttenuationColor = vec3Member(*ext, "attenuationColor", glm::vec3{1.0f});
+        assignExtensionTextureTransform(material.volumeThicknessTextureTransform, *ext, "thicknessTexture");
+        material.shaderCompatibilityMask |= kMaterialClosureFlagVolume;
+    }
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_dispersion")) {
+        material.hasDispersion = 1u;
+        material.dispersionFactor = std::max(0.0f, static_cast<float>(numberMember(*ext, "dispersion", 0.0)));
+        if (material.dispersionFactor > 0.0f) {
+            material.shaderCompatibilityMask |= kMaterialClosureFlagDispersion;
+        }
     }
     if (const tinygltf::Value* ext = extensionObject("KHR_materials_specular")) {
         material.hasSpecular = 1u;
@@ -597,6 +864,8 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         material.specularColorFactor = vec3Member(*ext, "specularColorFactor", glm::vec3{1.0f});
         material.specularTexture = textureHandleMember(*ext, "specularTexture");
         material.specularColorTexture = textureHandleMember(*ext, "specularColorTexture");
+        assignExtensionTextureTransform(material.specularTextureTransform, *ext, "specularTexture");
+        assignExtensionTextureTransform(material.specularColorTextureTransform, *ext, "specularColorTexture");
     }
     if (const tinygltf::Value* ext = extensionObject("KHR_materials_sheen")) {
         material.hasSheen = 1u;
@@ -604,6 +873,8 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         material.sheenRoughnessFactor = static_cast<float>(numberMember(*ext, "sheenRoughnessFactor", 0.0));
         material.sheenColorTexture = textureHandleMember(*ext, "sheenColorTexture");
         material.sheenRoughnessTexture = textureHandleMember(*ext, "sheenRoughnessTexture");
+        assignExtensionTextureTransform(material.sheenColorTextureTransform, *ext, "sheenColorTexture");
+        assignExtensionTextureTransform(material.sheenRoughnessTextureTransform, *ext, "sheenRoughnessTexture");
         material.shaderCompatibilityMask |= kMaterialClosureFlagSheen;
     }
     if (const tinygltf::Value* ext = extensionObject("KHR_materials_iridescence")) {
@@ -614,6 +885,8 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         material.iridescenceThicknessMaximum = static_cast<float>(numberMember(*ext, "iridescenceThicknessMaximum", 400.0));
         material.iridescenceTexture = textureHandleMember(*ext, "iridescenceTexture");
         material.iridescenceThicknessTexture = textureHandleMember(*ext, "iridescenceThicknessTexture");
+        assignExtensionTextureTransform(material.iridescenceTextureTransform, *ext, "iridescenceTexture");
+        assignExtensionTextureTransform(material.iridescenceThicknessTextureTransform, *ext, "iridescenceThicknessTexture");
         material.shaderCompatibilityMask |= kMaterialClosureFlagThinFilm;
     }
     if (const tinygltf::Value* ext = extensionObject("KHR_materials_anisotropy")) {
@@ -621,6 +894,10 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         material.anisotropyStrength = static_cast<float>(numberMember(*ext, "anisotropyStrength", 0.0));
         material.anisotropyRotation = static_cast<float>(numberMember(*ext, "anisotropyRotation", 0.0));
         material.anisotropyTexture = textureHandleMember(*ext, "anisotropyTexture");
+        assignExtensionTextureTransform(material.anisotropyTextureTransform, *ext, "anisotropyTexture");
+    }
+    if (extensionObject("KHR_materials_unlit") != nullptr) {
+        material.shaderCompatibilityMask |= kMaterialClosureFlagUnlit;
     }
     for (const auto& [name, extensionValue] : source.extensions) {
         if (!extensionValue.IsObject()) {
@@ -628,8 +905,10 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
         }
         if (name == "KHR_materials_clearcoat" || name == "KHR_materials_transmission" ||
             name == "KHR_materials_ior" || name == "KHR_materials_specular" ||
+            name == "KHR_materials_volume" || name == "KHR_materials_dispersion" ||
             name == "KHR_materials_sheen" || name == "KHR_materials_emissive_strength" ||
-            name == "KHR_materials_iridescence" || name == "KHR_materials_anisotropy") {
+            name == "KHR_materials_iridescence" || name == "KHR_materials_anisotropy" ||
+            name == "KHR_materials_unlit") {
             continue;
         }
         std::cerr << "glTF material extension warning: material '" << (source.name.empty() ? "(unnamed)" : source.name)
@@ -637,23 +916,43 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
     }
 
     const bool hasTextureTransform =
-        material.baseColorTextureTransform.enabled != 0u ||
-        material.metallicRoughnessTextureTransform.enabled != 0u ||
-        material.normalTextureTransform.enabled != 0u ||
-        material.emissiveTextureTransform.enabled != 0u;
+        textureInfoAnyTransform({
+            material.baseColorTextureTransform,
+            material.metallicRoughnessTextureTransform,
+            material.normalTextureTransform,
+            material.emissiveTextureTransform,
+            material.occlusionTextureTransform,
+            material.clearcoatTextureTransform,
+            material.clearcoatRoughnessTextureTransform,
+            material.clearcoatNormalTextureTransform,
+            material.transmissionTextureTransform,
+            material.volumeThicknessTextureTransform,
+            material.specularTextureTransform,
+            material.specularColorTextureTransform,
+            material.sheenColorTextureTransform,
+            material.sheenRoughnessTextureTransform,
+            material.iridescenceTextureTransform,
+            material.iridescenceThicknessTextureTransform,
+            material.anisotropyTextureTransform,
+        });
     if (material.hasIor != 0u || material.hasClearcoat != 0u || material.hasTransmission != 0u ||
-        material.hasSpecular != 0u || material.hasSheen != 0u || material.hasEmissiveStrength != 0u ||
-        material.hasIridescence != 0u || material.hasAnisotropy != 0u || hasTextureTransform) {
+        material.hasVolume != 0u || material.hasDispersion != 0u || material.hasSpecular != 0u || material.hasSheen != 0u || material.hasEmissiveStrength != 0u ||
+        material.hasIridescence != 0u || material.hasAnisotropy != 0u ||
+        (material.shaderCompatibilityMask & kMaterialClosureFlagUnlit) != 0u || hasTextureTransform) {
         std::cout << "glTF material extensions: material '"
                   << (source.name.empty() ? "(unnamed)" : source.name)
                   << "' ior=" << material.iorFactor
                   << " clearcoat=" << material.clearcoatFactor
                   << " transmission=" << material.transmissionFactor
+                  << " volumeThickness=" << material.volumeThicknessFactor
+                  << " volumeAttenuationDistance=" << material.volumeAttenuationDistance
+                  << " dispersion=" << material.dispersionFactor
                   << " specular=" << material.specularFactor
                   << " sheenRoughness=" << material.sheenRoughnessFactor
                   << " iridescence=" << material.iridescenceFactor
                   << " emissiveStrength=" << material.emissiveStrength
                   << " anisotropy=" << material.anisotropyStrength
+                  << " unlit=" << (((material.shaderCompatibilityMask & kMaterialClosureFlagUnlit) != 0u) ? "yes" : "no")
                   << " textureTransform=" << (hasTextureTransform ? "yes" : "no")
                   << '\n';
     }
@@ -688,6 +987,7 @@ void finalizePrimitiveVertexFrames(
     }
 
     std::vector<glm::vec3> tangentAccum(vertexCount, glm::vec3{0.0f});
+    std::vector<glm::vec3> bitangentAccum(vertexCount, glm::vec3{0.0f});
     if (!hasTangents && hasTexcoords) {
         for (uint32_t i = 0; i + 2 < indexCount; i += 3) {
             const uint32_t i0 = mesh.indices[firstIndex + i + 0];
@@ -708,9 +1008,13 @@ void finalizePrimitiveVertexFrames(
                 continue;
             }
             const glm::vec3 tangent = (e1 * duv2.y - e2 * duv1.y) / det;
+            const glm::vec3 bitangent = (e2 * duv1.x - e1 * duv2.x) / det;
             tangentAccum[i0 - firstVertex] += tangent;
             tangentAccum[i1 - firstVertex] += tangent;
             tangentAccum[i2 - firstVertex] += tangent;
+            bitangentAccum[i0 - firstVertex] += bitangent;
+            bitangentAccum[i1 - firstVertex] += bitangent;
+            bitangentAccum[i2 - firstVertex] += bitangent;
         }
     }
 
@@ -729,7 +1033,9 @@ void finalizePrimitiveVertexFrames(
             } else {
                 tangent /= std::sqrt(tangentLen2);
             }
-            vertex.tangent = glm::vec4{tangent, 1.0f};
+            const glm::vec3 bitangent = hasTexcoords ? bitangentAccum[i] : glm::vec3{0.0f};
+            const float handedness = glm::dot(glm::cross(vertex.normal, tangent), bitangent) < 0.0f ? -1.0f : 1.0f;
+            vertex.tangent = glm::vec4{tangent, handedness};
         }
     }
 }
@@ -756,6 +1062,7 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         throw std::runtime_error("glTF load failed: " + path.string() + " " + error);
     }
     reportGltfExtensionDiagnostics(model);
+    lastBufferDependencies_ = gltfBufferDependencies(model, path);
 
     SceneAsset scene;
     scene.name = path.filename().string();
@@ -787,12 +1094,20 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         markTextureUse(pbr.baseColorTexture.index, colorTextureUse);
         markTextureUse(sourceMaterial.emissiveTexture.index, colorTextureUse);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenColorTexture"), colorTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularColorTexture"), colorTextureUse);
         markTextureUse(pbr.metallicRoughnessTexture.index, dataTextureUse);
         markTextureUse(sourceMaterial.normalTexture.index, dataTextureUse);
         markTextureUse(sourceMaterial.occlusionTexture.index, dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatRoughnessTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatNormalTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_transmission", "transmissionTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_volume", "thicknessTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularTexture"), dataTextureUse);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenRoughnessTexture"), dataTextureUse);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceTexture"), dataTextureUse);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceThicknessTexture"), dataTextureUse);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_anisotropy", "anisotropyTexture"), dataTextureUse);
     }
 
     std::vector<TextureAssetHandle> textureHandles;
@@ -820,6 +1135,27 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
     }
     scene.materials = materialHandles;
 
+    if (const auto variantsExtIt = model.extensions.find("KHR_materials_variants");
+        variantsExtIt != model.extensions.end() && variantsExtIt->second.IsObject()) {
+        const auto& extObject = variantsExtIt->second.Get<tinygltf::Value::Object>();
+        const auto variantsIt = extObject.find("variants");
+        if (variantsIt != extObject.end() && variantsIt->second.IsArray()) {
+            const auto& variants = variantsIt->second.Get<tinygltf::Value::Array>();
+            scene.materialVariants.reserve(variants.size());
+            for (size_t variantIndex = 0; variantIndex < variants.size(); ++variantIndex) {
+                std::string name = "Variant " + std::to_string(variantIndex);
+                if (variants[variantIndex].IsObject()) {
+                    const auto& variantObject = variants[variantIndex].Get<tinygltf::Value::Object>();
+                    const auto nameIt = variantObject.find("name");
+                    if (nameIt != variantObject.end() && nameIt->second.IsString()) {
+                        name = nameIt->second.Get<std::string>();
+                    }
+                }
+                scene.materialVariants.push_back(std::move(name));
+            }
+        }
+    }
+
     std::vector<MeshAssetHandle> meshHandles;
     meshHandles.reserve(model.meshes.size());
     for (const tinygltf::Mesh& sourceMesh : model.meshes) {
@@ -838,51 +1174,120 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
                 continue;
             }
 
-            const tinygltf::Accessor& posAccessor = model.accessors[static_cast<size_t>(positionIt->second)];
-            const size_t vertexCount = posAccessor.count;
+            const auto posView = makeAccessorView(model, positionIt->second, TINYGLTF_TYPE_VEC3, TINYGLTF_COMPONENT_TYPE_FLOAT, "POSITION");
+            if (!posView.has_value()) {
+                continue;
+            }
+            const size_t vertexCount = posView->count;
+            if (vertexCount == 0 || vertexCount > std::numeric_limits<uint32_t>::max()) {
+                std::cerr << "glTF primitive warning: POSITION vertex count is invalid; skipping primitive\n";
+                continue;
+            }
+            if (mesh.vertices.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - vertexCount) {
+                std::cerr << "glTF primitive warning: mesh vertex count would exceed 32-bit index range; skipping primitive\n";
+                continue;
+            }
+
+            std::vector<uint32_t> decodedIndices;
+            if (primitive.indices >= 0) {
+                const auto indexView = makeIndexAccessorView(model, primitive.indices);
+                if (!indexView.has_value()) {
+                    continue;
+                }
+                const tinygltf::Accessor& indexAccessor = model.accessors[static_cast<size_t>(primitive.indices)];
+                decodedIndices.reserve(indexView->count);
+                bool indicesValid = true;
+                for (size_t i = 0; i < indexView->count; ++i) {
+                    const uint32_t index = readIndexElement(indexAccessor, *indexView, i);
+                    if (index >= vertexCount) {
+                        std::cerr << "glTF primitive warning: index " << index << " exceeds vertex count " << vertexCount << "; skipping primitive\n";
+                        indicesValid = false;
+                        break;
+                    }
+                    decodedIndices.push_back(firstVertex + index);
+                }
+                if (!indicesValid) {
+                    continue;
+                }
+            } else {
+                decodedIndices.reserve(vertexCount);
+                for (uint32_t i = 0; i < static_cast<uint32_t>(vertexCount); ++i) {
+                    decodedIndices.push_back(firstVertex + i);
+                }
+            }
+
             mesh.vertices.resize(mesh.vertices.size() + vertexCount);
             for (size_t i = 0; i < vertexCount; ++i) {
-                mesh.vertices[firstVertex + i].position = accessorElement<glm::vec3>(model, posAccessor, i);
+                mesh.vertices[firstVertex + i].position = readElement<glm::vec3>(*posView, i);
             }
 
             const auto normalIt = primitive.attributes.find("NORMAL");
-            const bool hasNormals = normalIt != primitive.attributes.end();
+            bool hasNormals = false;
             if (normalIt != primitive.attributes.end()) {
-                const tinygltf::Accessor& normalAccessor = model.accessors[static_cast<size_t>(normalIt->second)];
-                for (size_t i = 0; i < vertexCount; ++i) {
-                    mesh.vertices[firstVertex + i].normal = accessorElement<glm::vec3>(model, normalAccessor, i);
+                const auto normalView = makeAccessorView(model, normalIt->second, TINYGLTF_TYPE_VEC3, TINYGLTF_COMPONENT_TYPE_FLOAT, "NORMAL");
+                if (normalView.has_value() && normalView->count >= vertexCount) {
+                    hasNormals = true;
+                    for (size_t i = 0; i < vertexCount; ++i) {
+                        mesh.vertices[firstVertex + i].normal = readElement<glm::vec3>(*normalView, i);
+                    }
+                } else {
+                    std::cerr << "glTF accessor warning: NORMAL count is shorter than POSITION count; generating normals\n";
                 }
             }
 
             const auto uvIt = primitive.attributes.find("TEXCOORD_0");
-            const bool hasTexcoords = uvIt != primitive.attributes.end();
+            bool hasTexcoords = false;
             if (uvIt != primitive.attributes.end()) {
-                const tinygltf::Accessor& uvAccessor = model.accessors[static_cast<size_t>(uvIt->second)];
-                for (size_t i = 0; i < vertexCount; ++i) {
-                    mesh.vertices[firstVertex + i].texcoord = accessorElement<glm::vec2>(model, uvAccessor, i);
+                const auto uvView = makeAccessorView(model, uvIt->second, TINYGLTF_TYPE_VEC2, TINYGLTF_COMPONENT_TYPE_FLOAT, "TEXCOORD_0");
+                if (uvView.has_value() && uvView->count >= vertexCount) {
+                    hasTexcoords = true;
+                    for (size_t i = 0; i < vertexCount; ++i) {
+                        mesh.vertices[firstVertex + i].texcoord = readElement<glm::vec2>(*uvView, i);
+                    }
+                } else {
+                    std::cerr << "glTF accessor warning: TEXCOORD_0 count is shorter than POSITION count; using default UVs\n";
+                }
+            }
+
+            const auto uv1It = primitive.attributes.find("TEXCOORD_1");
+            if (uv1It != primitive.attributes.end()) {
+                const auto uv1View = makeAccessorView(model, uv1It->second, TINYGLTF_TYPE_VEC2, TINYGLTF_COMPONENT_TYPE_FLOAT, "TEXCOORD_1");
+                if (uv1View.has_value() && uv1View->count >= vertexCount) {
+                    for (size_t i = 0; i < vertexCount; ++i) {
+                        mesh.vertices[firstVertex + i].texcoord1 = readElement<glm::vec2>(*uv1View, i);
+                    }
+                } else {
+                    std::cerr << "glTF accessor warning: TEXCOORD_1 count is shorter than POSITION count; using default UV1s\n";
                 }
             }
 
             const auto tangentIt = primitive.attributes.find("TANGENT");
-            const bool hasTangents = tangentIt != primitive.attributes.end();
+            bool hasTangents = false;
             if (tangentIt != primitive.attributes.end()) {
-                const tinygltf::Accessor& tangentAccessor = model.accessors[static_cast<size_t>(tangentIt->second)];
-                for (size_t i = 0; i < vertexCount; ++i) {
-                    mesh.vertices[firstVertex + i].tangent = accessorElement<glm::vec4>(model, tangentAccessor, i);
+                const auto tangentView = makeAccessorView(model, tangentIt->second, TINYGLTF_TYPE_VEC4, TINYGLTF_COMPONENT_TYPE_FLOAT, "TANGENT");
+                if (tangentView.has_value() && tangentView->count >= vertexCount) {
+                    hasTangents = true;
+                    for (size_t i = 0; i < vertexCount; ++i) {
+                        mesh.vertices[firstVertex + i].tangent = readElement<glm::vec4>(*tangentView, i);
+                    }
+                } else {
+                    std::cerr << "glTF accessor warning: TANGENT count is shorter than POSITION count; generating tangents\n";
                 }
             }
 
-            if (primitive.indices >= 0) {
-                const tinygltf::Accessor& indexAccessor = model.accessors[static_cast<size_t>(primitive.indices)];
-                for (size_t i = 0; i < indexAccessor.count; ++i) {
-                    const uint32_t index = indexElement(model, indexAccessor, i);
-                    mesh.indices.push_back(firstVertex + index);
-                }
-            } else {
-                for (uint32_t i = 0; i < vertexCount; ++i) {
-                    mesh.indices.push_back(firstVertex + i);
+            const auto colorIt = primitive.attributes.find("COLOR_0");
+            if (colorIt != primitive.attributes.end()) {
+                const auto colorView = makeColorAccessorView(model, colorIt->second);
+                if (colorView.has_value() && colorView->count >= vertexCount) {
+                    const tinygltf::Accessor& colorAccessor = model.accessors[static_cast<size_t>(colorIt->second)];
+                    for (size_t i = 0; i < vertexCount; ++i) {
+                        mesh.vertices[firstVertex + i].color = readColorElement(colorAccessor, *colorView, i);
+                    }
+                } else {
+                    std::cerr << "glTF accessor warning: COLOR_0 count is shorter than POSITION count; using default vertex color\n";
                 }
             }
+            mesh.indices.insert(mesh.indices.end(), decodedIndices.begin(), decodedIndices.end());
 
             MeshPrimitiveAsset prim;
             prim.firstVertex = firstVertex;
@@ -892,6 +1297,48 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
             prim.material = primitive.material >= 0 && static_cast<size_t>(primitive.material) < materialHandles.size()
                 ? materialHandles[static_cast<size_t>(primitive.material)]
                 : materialHandles.front();
+            if (const auto variantsExtIt = primitive.extensions.find("KHR_materials_variants");
+                variantsExtIt != primitive.extensions.end() && variantsExtIt->second.IsObject()) {
+                const auto& extObject = variantsExtIt->second.Get<tinygltf::Value::Object>();
+                const auto mappingsIt = extObject.find("mappings");
+                if (mappingsIt != extObject.end() && mappingsIt->second.IsArray()) {
+                    const auto& mappings = mappingsIt->second.Get<tinygltf::Value::Array>();
+                    for (const tinygltf::Value& mappingValue : mappings) {
+                        if (!mappingValue.IsObject()) {
+                            continue;
+                        }
+                        const auto& mapping = mappingValue.Get<tinygltf::Value::Object>();
+                        const auto materialIt = mapping.find("material");
+                        const auto variantsIt = mapping.find("variants");
+                        if (materialIt == mapping.end() || !materialIt->second.IsInt() ||
+                            variantsIt == mapping.end() || !variantsIt->second.IsArray()) {
+                            continue;
+                        }
+                        const int materialIndex = materialIt->second.Get<int>();
+                        if (materialIndex < 0 || static_cast<size_t>(materialIndex) >= materialHandles.size()) {
+                            continue;
+                        }
+                        const auto& variants = variantsIt->second.Get<tinygltf::Value::Array>();
+                        for (const tinygltf::Value& variantValue : variants) {
+                            if (!variantValue.IsInt()) {
+                                continue;
+                            }
+                            const int variantIndex = variantValue.Get<int>();
+                            if (variantIndex < 0) {
+                                continue;
+                            }
+                            const uint32_t variantIndexU = static_cast<uint32_t>(variantIndex);
+                            prim.materialVariants.push_back(MeshPrimitiveAsset::MaterialVariant{
+                                .variantIndex = variantIndexU,
+                                .variantName = variantIndexU < scene.materialVariants.size()
+                                    ? scene.materialVariants[variantIndexU]
+                                    : "Variant " + std::to_string(variantIndexU),
+                                .material = materialHandles[static_cast<size_t>(materialIndex)],
+                            });
+                        }
+                    }
+                }
+            }
             updatePrimitiveAlphaClassification(prim, assets_.material(prim.material));
             finalizePrimitiveVertexFrames(mesh, firstVertex, prim.vertexCount, firstIndex, prim.indexCount, hasNormals, hasTangents, hasTexcoords);
             mesh.primitives.push_back(prim);
@@ -914,11 +1361,30 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
             const tinygltf::Camera& sourceCamera = model.cameras[static_cast<size_t>(sourceNode.camera)];
             node.hasCamera = true;
             if (sourceCamera.type == "perspective") {
+                node.cameraProjection = 0u;
                 node.cameraYfov = static_cast<float>(sourceCamera.perspective.yfov);
+                node.cameraAspectRatio = sourceCamera.perspective.aspectRatio > 0.0
+                    ? static_cast<float>(sourceCamera.perspective.aspectRatio)
+                    : 0.0f;
                 node.cameraNear = static_cast<float>(sourceCamera.perspective.znear);
                 node.cameraFar = sourceCamera.perspective.zfar > 0.0
                     ? static_cast<float>(sourceCamera.perspective.zfar)
                     : 1000.0f;
+            } else if (sourceCamera.type == "orthographic") {
+                node.cameraProjection = 1u;
+                node.cameraOrthoXmag = sourceCamera.orthographic.xmag > 0.0
+                    ? static_cast<float>(sourceCamera.orthographic.xmag)
+                    : 1.0f;
+                node.cameraOrthoYmag = sourceCamera.orthographic.ymag > 0.0
+                    ? static_cast<float>(sourceCamera.orthographic.ymag)
+                    : 1.0f;
+                node.cameraNear = static_cast<float>(sourceCamera.orthographic.znear);
+                node.cameraFar = sourceCamera.orthographic.zfar > 0.0
+                    ? static_cast<float>(sourceCamera.orthographic.zfar)
+                    : 1000.0f;
+            } else {
+                std::cerr << "glTF camera warning: camera '" << sourceCamera.name
+                          << "' has unsupported type '" << sourceCamera.type << "'; preserving default perspective metadata\n";
             }
         }
         for (int child : sourceNode.children) {
@@ -1010,14 +1476,6 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
             uint64_t actualGltfMtime = SceneCache::fileMtime(path);
             if (cached->sourceMtime != actualGltfMtime) {
                 cached.reset();
-            } else {
-                std::filesystem::path binPath = path.parent_path() / (path.stem().string() + ".bin");
-                if (std::filesystem::exists(binPath)) {
-                    uint64_t actualBinMtime = SceneCache::fileMtime(binPath);
-                    if (cached->sourceBinMtime != actualBinMtime) {
-                        cached.reset();
-                    }
-                }
             }
             if (cached.has_value() && !dependenciesValid(*cached)) {
                 cached.reset();
@@ -1077,6 +1535,12 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.clearcoatRoughnessFactor = cachedMat.clearcoatRoughnessFactor;
                     material.hasTransmission = cachedMat.hasTransmission;
                     material.transmissionFactor = cachedMat.transmissionFactor;
+                    material.hasVolume = cachedMat.hasVolume;
+                    material.volumeThicknessFactor = cachedMat.volumeThicknessFactor;
+                    material.volumeAttenuationDistance = cachedMat.volumeAttenuationDistance;
+                    material.volumeAttenuationColor = cachedMat.volumeAttenuationColor;
+                    material.hasDispersion = cachedMat.hasDispersion;
+                    material.dispersionFactor = cachedMat.dispersionFactor;
                     material.hasSpecular = cachedMat.hasSpecular;
                     material.specularFactor = cachedMat.specularFactor;
                     material.specularColorFactor = cachedMat.specularColorFactor;
@@ -1105,6 +1569,7 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.clearcoatRoughnessTexture = textureHandleFor(cachedMat.clearcoatRoughnessTextureIndex);
                     material.clearcoatNormalTexture = textureHandleFor(cachedMat.clearcoatNormalTextureIndex);
                     material.transmissionTexture = textureHandleFor(cachedMat.transmissionTextureIndex);
+                    material.volumeThicknessTexture = textureHandleFor(cachedMat.volumeThicknessTextureIndex);
                     material.specularTexture = textureHandleFor(cachedMat.specularTextureIndex);
                     material.specularColorTexture = textureHandleFor(cachedMat.specularColorTextureIndex);
                     material.sheenColorTexture = textureHandleFor(cachedMat.sheenColorTextureIndex);
@@ -1118,9 +1583,22 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.normalTextureTransform = cachedMat.normalTextureTransform;
                     material.emissiveTextureTransform = cachedMat.emissiveTextureTransform;
                     material.occlusionTextureTransform = cachedMat.occlusionTextureTransform;
+                    material.clearcoatTextureTransform = cachedMat.clearcoatTextureTransform;
+                    material.clearcoatRoughnessTextureTransform = cachedMat.clearcoatRoughnessTextureTransform;
+                    material.clearcoatNormalTextureTransform = cachedMat.clearcoatNormalTextureTransform;
+                    material.transmissionTextureTransform = cachedMat.transmissionTextureTransform;
+                    material.volumeThicknessTextureTransform = cachedMat.volumeThicknessTextureTransform;
+                    material.specularTextureTransform = cachedMat.specularTextureTransform;
+                    material.specularColorTextureTransform = cachedMat.specularColorTextureTransform;
+                    material.sheenColorTextureTransform = cachedMat.sheenColorTextureTransform;
+                    material.sheenRoughnessTextureTransform = cachedMat.sheenRoughnessTextureTransform;
+                    material.iridescenceTextureTransform = cachedMat.iridescenceTextureTransform;
+                    material.iridescenceThicknessTextureTransform = cachedMat.iridescenceThicknessTextureTransform;
+                    material.anisotropyTextureTransform = cachedMat.anisotropyTextureTransform;
                     material.shaderCompatibilityMask = cachedMat.shaderCompatibilityMask;
                     scene.materials.push_back(assets_.addMaterial(std::move(material)));
                 }
+                scene.materialVariants = cached->materialVariants;
 
                 for (const auto& cachedMesh : cached->meshes) {
                     MeshAsset mesh;
@@ -1138,6 +1616,15 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                         } else if (!scene.materials.empty()) {
                             prim.material = scene.materials.front();
                         }
+                        for (const auto& cachedVariant : cachedPrim.materialVariants) {
+                            if (cachedVariant.materialIndex >= 0 && static_cast<size_t>(cachedVariant.materialIndex) < scene.materials.size()) {
+                                prim.materialVariants.push_back(MeshPrimitiveAsset::MaterialVariant{
+                                    .variantIndex = cachedVariant.variantIndex,
+                                    .variantName = cachedVariant.variantName,
+                                    .material = scene.materials[static_cast<size_t>(cachedVariant.materialIndex)],
+                                });
+                            }
+                        }
                         updatePrimitiveAlphaClassification(prim, assets_.material(prim.material));
                         mesh.primitives.push_back(prim);
                     }
@@ -1152,7 +1639,11 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     node.parent = cachedNode.parentIndex;
                     node.children = cachedNode.children;
                     node.hasCamera = cachedNode.hasCamera != 0;
+                    node.cameraProjection = cachedNode.cameraProjection;
                     node.cameraYfov = cachedNode.cameraYfov;
+                    node.cameraAspectRatio = cachedNode.cameraAspectRatio;
+                    node.cameraOrthoXmag = cachedNode.cameraOrthoXmag;
+                    node.cameraOrthoYmag = cachedNode.cameraOrthoYmag;
                     node.cameraNear = cachedNode.cameraNear;
                     node.cameraFar = cachedNode.cameraFar;
                     if (cachedNode.meshIndex >= 0 && static_cast<size_t>(cachedNode.meshIndex) < scene.meshes.size()) {
@@ -1200,7 +1691,7 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
     }
 
     const auto cacheBuildStart = std::chrono::high_resolution_clock::now();
-    CachedScene cached = buildCachedScene(path, scene);
+    CachedScene cached = buildCachedScene(path, scene, lastBufferDependencies_);
     const auto cacheBuildEnd = std::chrono::high_resolution_clock::now();
     const double cacheBuildMs = std::chrono::duration<double, std::milli>(cacheBuildEnd - cacheBuildStart).count();
     const auto cacheSaveStart = std::chrono::high_resolution_clock::now();
@@ -1219,44 +1710,50 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
     return scene;
 }
 
-CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, const SceneAsset& scene) {
+CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, const SceneAsset& scene, const std::vector<std::filesystem::path>& bufferDependencies) {
     CachedScene cached;
     cached.name = scene.name;
+
+    std::unordered_map<uint32_t, int32_t> textureIndexByHandle;
+    textureIndexByHandle.reserve(scene.textures.size());
+    for (int32_t i = 0; i < static_cast<int32_t>(scene.textures.size()); ++i) {
+        textureIndexByHandle.emplace(scene.textures[static_cast<size_t>(i)].index, i);
+    }
+
+    std::unordered_map<uint32_t, int32_t> materialIndexByHandle;
+    materialIndexByHandle.reserve(scene.materials.size());
+    for (int32_t i = 0; i < static_cast<int32_t>(scene.materials.size()); ++i) {
+        materialIndexByHandle.emplace(scene.materials[static_cast<size_t>(i)].index, i);
+    }
+
+    std::unordered_map<uint32_t, int32_t> meshIndexByHandle;
+    meshIndexByHandle.reserve(scene.meshes.size());
+    for (int32_t i = 0; i < static_cast<int32_t>(scene.meshes.size()); ++i) {
+        meshIndexByHandle.emplace(scene.meshes[static_cast<size_t>(i)].index, i);
+    }
 
     const auto getTextureIndex = [&](TextureAssetHandle handle) -> int32_t {
         if (!handle.valid()) {
             return -1;
         }
-        for (int32_t i = 0; i < static_cast<int32_t>(scene.textures.size()); ++i) {
-            if (scene.textures[static_cast<size_t>(i)].index == handle.index) {
-                return i;
-            }
-        }
-        return -1;
+        const auto it = textureIndexByHandle.find(handle.index);
+        return it != textureIndexByHandle.end() ? it->second : -1;
     };
 
     const auto getMaterialIndex = [&](MaterialAssetHandle handle) -> int32_t {
         if (!handle.valid()) {
             return -1;
         }
-        for (int32_t i = 0; i < static_cast<int32_t>(scene.materials.size()); ++i) {
-            if (scene.materials[static_cast<size_t>(i)].index == handle.index) {
-                return i;
-            }
-        }
-        return -1;
+        const auto it = materialIndexByHandle.find(handle.index);
+        return it != materialIndexByHandle.end() ? it->second : -1;
     };
 
     const auto getMeshIndex = [&](MeshAssetHandle handle) -> int32_t {
         if (!handle.valid()) {
             return -1;
         }
-        for (int32_t i = 0; i < static_cast<int32_t>(scene.meshes.size()); ++i) {
-            if (scene.meshes[static_cast<size_t>(i)].index == handle.index) {
-                return i;
-            }
-        }
-        return -1;
+        const auto it = meshIndexByHandle.find(handle.index);
+        return it != meshIndexByHandle.end() ? it->second : -1;
     };
 
     for (TextureAssetHandle handle : scene.textures) {
@@ -1307,6 +1804,12 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.clearcoatRoughnessFactor = material->clearcoatRoughnessFactor;
         cachedMat.hasTransmission = material->hasTransmission;
         cachedMat.transmissionFactor = material->transmissionFactor;
+        cachedMat.hasVolume = material->hasVolume;
+        cachedMat.volumeThicknessFactor = material->volumeThicknessFactor;
+        cachedMat.volumeAttenuationDistance = material->volumeAttenuationDistance;
+        cachedMat.volumeAttenuationColor = material->volumeAttenuationColor;
+        cachedMat.hasDispersion = material->hasDispersion;
+        cachedMat.dispersionFactor = material->dispersionFactor;
         cachedMat.hasSpecular = material->hasSpecular;
         cachedMat.specularFactor = material->specularFactor;
         cachedMat.specularColorFactor = material->specularColorFactor;
@@ -1335,6 +1838,7 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.clearcoatRoughnessTextureIndex = getTextureIndex(material->clearcoatRoughnessTexture);
         cachedMat.clearcoatNormalTextureIndex = getTextureIndex(material->clearcoatNormalTexture);
         cachedMat.transmissionTextureIndex = getTextureIndex(material->transmissionTexture);
+        cachedMat.volumeThicknessTextureIndex = getTextureIndex(material->volumeThicknessTexture);
         cachedMat.specularTextureIndex = getTextureIndex(material->specularTexture);
         cachedMat.specularColorTextureIndex = getTextureIndex(material->specularColorTexture);
         cachedMat.sheenColorTextureIndex = getTextureIndex(material->sheenColorTexture);
@@ -1348,6 +1852,18 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.normalTextureTransform = material->normalTextureTransform;
         cachedMat.emissiveTextureTransform = material->emissiveTextureTransform;
         cachedMat.occlusionTextureTransform = material->occlusionTextureTransform;
+        cachedMat.clearcoatTextureTransform = material->clearcoatTextureTransform;
+        cachedMat.clearcoatRoughnessTextureTransform = material->clearcoatRoughnessTextureTransform;
+        cachedMat.clearcoatNormalTextureTransform = material->clearcoatNormalTextureTransform;
+        cachedMat.transmissionTextureTransform = material->transmissionTextureTransform;
+        cachedMat.volumeThicknessTextureTransform = material->volumeThicknessTextureTransform;
+        cachedMat.specularTextureTransform = material->specularTextureTransform;
+        cachedMat.specularColorTextureTransform = material->specularColorTextureTransform;
+        cachedMat.sheenColorTextureTransform = material->sheenColorTextureTransform;
+        cachedMat.sheenRoughnessTextureTransform = material->sheenRoughnessTextureTransform;
+        cachedMat.iridescenceTextureTransform = material->iridescenceTextureTransform;
+        cachedMat.iridescenceThicknessTextureTransform = material->iridescenceThicknessTextureTransform;
+        cachedMat.anisotropyTextureTransform = material->anisotropyTextureTransform;
         cachedMat.shaderCompatibilityMask = material->shaderCompatibilityMask;
         cached.materials.push_back(std::move(cachedMat));
     }
@@ -1368,10 +1884,19 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
             cachedPrim.firstIndex = prim.firstIndex;
             cachedPrim.indexCount = prim.indexCount;
             cachedPrim.materialIndex = getMaterialIndex(prim.material);
+            for (const auto& variant : prim.materialVariants) {
+                cachedPrim.materialVariants.push_back(CachedPrimitiveData::MaterialVariant{
+                    .variantIndex = variant.variantIndex,
+                    .variantName = variant.variantName,
+                    .materialIndex = getMaterialIndex(variant.material),
+                });
+            }
             cachedMesh.primitives.push_back(std::move(cachedPrim));
         }
         cached.meshes.push_back(std::move(cachedMesh));
     }
+
+    cached.materialVariants = scene.materialVariants;
 
     for (const SceneNodeAsset& node : scene.nodes) {
         CachedNodeData cachedNode;
@@ -1379,7 +1904,11 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedNode.transform = node.transform;
         cachedNode.meshIndex = getMeshIndex(node.mesh);
         cachedNode.hasCamera = node.hasCamera ? 1u : 0u;
+        cachedNode.cameraProjection = node.cameraProjection;
         cachedNode.cameraYfov = node.cameraYfov;
+        cachedNode.cameraAspectRatio = node.cameraAspectRatio;
+        cachedNode.cameraOrthoXmag = node.cameraOrthoXmag;
+        cachedNode.cameraOrthoYmag = node.cameraOrthoYmag;
         cachedNode.cameraNear = node.cameraNear;
         cachedNode.cameraFar = node.cameraFar;
         cachedNode.parentIndex = node.parent;
@@ -1404,9 +1933,10 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
     cached.rootNodes = scene.rootNodes;
     cached.sourceMtime = SceneCache::fileMtime(path);
 
-    std::filesystem::path binPath = path.parent_path() / (path.stem().string() + ".bin");
-    cached.sourceBinMtime = SceneCache::fileMtime(binPath);
     std::unordered_set<std::string> dependencyPaths;
+    for (const std::filesystem::path& dependency : bufferDependencies) {
+        addDependency(cached, dependency, dependencyPaths);
+    }
     for (TextureAssetHandle handle : scene.textures) {
         const TextureAsset* texture = assets_.texture(handle);
         if (texture == nullptr || texture->sourcePath.empty() || texture->sourcePath == path) {

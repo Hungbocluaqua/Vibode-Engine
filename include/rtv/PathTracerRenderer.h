@@ -124,6 +124,14 @@ public:
     bool applySettings(const RendererSettings& settings);
     void setCameraPose(glm::vec3 position, glm::vec3 forward);
     void setCameraFovY(float fovY);
+    void setCameraProjection(
+        uint32_t projection,
+        float fovY,
+        float aspectRatio,
+        float orthographicXmag,
+        float orthographicYmag,
+        float nearPlane,
+        float farPlane);
     void resetAccumulation(AccumulationResetReason reason = AccumulationResetReason::Manual);
     void loadEnvironment(const std::filesystem::path& path);
     [[nodiscard]] bool shadersNeedReload();
@@ -520,10 +528,12 @@ private:
         glm::vec4 barycentricsHitKind{};
         glm::vec4 geomNormal{};
         glm::vec4 tangent{};
+        glm::vec4 vertexColor{1.0f};
+        glm::vec4 uv1{};
         glm::uvec4 materialInstancePrimitive{};
         glm::uvec4 pixelDepthFlags{};
     };
-    static_assert(sizeof(WavefrontHitGpu) == 112);
+    static_assert(sizeof(WavefrontHitGpu) == 144);
 
     struct alignas(16) WavefrontShadowRayGpu {
         glm::vec4 originTMin{};
