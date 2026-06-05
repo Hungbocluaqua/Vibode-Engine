@@ -1360,6 +1360,10 @@ PathTracerRenderer::~PathTracerRenderer() {
     }
 }
 
+void PathTracerRenderer::releaseExclusiveRuntimeForRendererReplacement() {
+    shutdownDlssRuntime();
+}
+
 void PathTracerRenderer::createStbnResources(const std::filesystem::path& shaderDirectory) {
     bool loadedNvidiaStbn = false;
     std::filesystem::path loadedDirectory;
@@ -1565,7 +1569,7 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
 bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     RendererSettings next = settings;
     next.maxBounces = std::clamp(next.maxBounces, 1u, 16u);
-    next.samplesPerPixel = std::clamp(next.samplesPerPixel, 1u, 8u);
+    next.samplesPerPixel = std::clamp(next.samplesPerPixel, 1u, kMaxSamplesPerPixel);
     next.atrousIterations = std::clamp(next.atrousIterations, 1u, 5u);
     next.environmentDirectSamples = std::clamp(next.environmentDirectSamples, 1u, 8u);
     next.denoiserStrength = std::max(0.05f, next.denoiserStrength);
@@ -2476,13 +2480,15 @@ void PathTracerRenderer::initializeDlssRuntime() {
 
 void PathTracerRenderer::shutdownDlssRuntime() {
 #if defined(RTV_DLSS_NGX_ENABLED)
-    releaseDlssFeature();
-    releaseDlssRayReconstructionFeature();
+    releaseDlssFeature(true);
+    releaseDlssRayReconstructionFeature(true);
     if (dlssParameters_ != nullptr && dlssNgxInitialized_) {
+        std::cerr << "DLSS shutdown: destroy NGX parameters\n";
         NVSDK_NGX_VULKAN_DestroyParameters(reinterpret_cast<NVSDK_NGX_Parameter*>(dlssParameters_));
         dlssParameters_ = nullptr;
     }
     if (dlssNgxInitialized_) {
+        std::cerr << "DLSS shutdown: NGX Shutdown1\n";
         NVSDK_NGX_VULKAN_Shutdown1(context_.device());
         dlssNgxInitialized_ = false;
     }
@@ -2498,26 +2504,36 @@ void PathTracerRenderer::shutdownDlssRuntime() {
     dlssFrameGenerationPresentationAvailable_ = false;
 }
 
-void PathTracerRenderer::releaseDlssFeature() {
+void PathTracerRenderer::releaseDlssFeature(bool waitIdleBeforeRelease) {
 #if defined(RTV_DLSS_NGX_ENABLED)
     if (dlssHandle_ != nullptr) {
+        std::cerr << "DLSS shutdown: release DLSS feature\n";
+        if (waitIdleBeforeRelease) {
+            vkDeviceWaitIdle(context_.device());
+        }
         NVSDK_NGX_VULKAN_ReleaseFeature(reinterpret_cast<NVSDK_NGX_Handle*>(dlssHandle_));
         dlssHandle_ = nullptr;
     }
 #else
+    (void)waitIdleBeforeRelease;
     dlssHandle_ = nullptr;
 #endif
     dlssFeatureRenderExtent_ = {};
     dlssFeatureOutputExtent_ = {};
 }
 
-void PathTracerRenderer::releaseDlssRayReconstructionFeature() {
+void PathTracerRenderer::releaseDlssRayReconstructionFeature(bool waitIdleBeforeRelease) {
 #if defined(RTV_DLSS_NGX_ENABLED)
     if (dlssRayReconstructionHandle_ != nullptr) {
+        std::cerr << "DLSS shutdown: release DLSS Ray Reconstruction feature\n";
+        if (waitIdleBeforeRelease) {
+            vkDeviceWaitIdle(context_.device());
+        }
         NVSDK_NGX_VULKAN_ReleaseFeature(reinterpret_cast<NVSDK_NGX_Handle*>(dlssRayReconstructionHandle_));
         dlssRayReconstructionHandle_ = nullptr;
     }
 #else
+    (void)waitIdleBeforeRelease;
     dlssRayReconstructionHandle_ = nullptr;
 #endif
     dlssRayReconstructionFeatureRenderExtent_ = {};

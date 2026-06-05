@@ -954,6 +954,21 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         visibility.sceneStats = true;
         visibility.gpuDiagnostics = false;
     };
+    const auto applyRuntimeViewerLayout = [&]() {
+        visibility.viewport = true;
+        visibility.sceneHierarchy = false;
+        visibility.inspector = false;
+        visibility.assetBrowser = false;
+        visibility.timeline = false;
+        visibility.log = false;
+        visibility.console = false;
+        visibility.materialEditor = false;
+        visibility.renderSettings = true;
+        visibility.debugProfiler = false;
+        visibility.sceneStats = false;
+        visibility.gpuDiagnostics = false;
+        visibility.renderWorldSettings = false;
+    };
     const auto applyTimelineLayout = [&]() {
         visibility.viewport = true;
         visibility.sceneHierarchy = true;
@@ -1176,6 +1191,7 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         if (filteredMenuItem("Default Editor", layoutSearch.data(), nullptr, false, true, nullptr, EditorGlyphIcon::Layout)) { applyDefaultEditorLayout(); }
         if (filteredMenuItem("Content Editing", layoutSearch.data(), nullptr, false, true, nullptr, EditorGlyphIcon::Folder)) { applyContentLayout(); }
         if (filteredMenuItem("Lighting", layoutSearch.data(), nullptr, false, true, nullptr, EditorGlyphIcon::Light)) { applyLightingLayout(); }
+        if (filteredMenuItem("Runtime Viewer", layoutSearch.data(), nullptr, false, true, nullptr, EditorGlyphIcon::ViewSettings)) { applyRuntimeViewerLayout(); }
         if (filteredMenuItem("Animation / Timeline", layoutSearch.data(), nullptr, false, true, nullptr, EditorGlyphIcon::TimelineKey)) { applyTimelineLayout(); }
         if (filteredMenuItem("Debug / Profiling", layoutSearch.data(), nullptr, false, true, nullptr, EditorGlyphIcon::Stats)) { applyDebugLayout(); }
         menuSection("LAYOUT FILES");

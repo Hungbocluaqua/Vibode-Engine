@@ -190,6 +190,7 @@ private:
     [[nodiscard]] bool confirmDestructiveSceneAction(std::string_view action);
     [[nodiscard]] bool createProjectFromRequest(const CreateProjectRequest& request);
     [[nodiscard]] bool openProjectFromFile(const std::filesystem::path& projectFile, bool promptForDirtyScene);
+    [[nodiscard]] bool deleteProjectFromRequest(const DeleteProjectRequest& request);
     [[nodiscard]] bool closeCurrentProject();
     [[nodiscard]] bool loadProjectStartupScene(const ProjectContext& project);
     [[nodiscard]] bool writeDefaultProjectScene(const ProjectContext& project, std::string_view templateName);
@@ -206,6 +207,7 @@ private:
     [[nodiscard]] bool updateAssetTags(const EditorAssetTagsRequest& request);
     [[nodiscard]] bool bulkAddAssetTag(const EditorBulkAssetTagRequest& request);
     [[nodiscard]] bool bulkRemoveAssetTag(const EditorBulkAssetTagRequest& request);
+    [[nodiscard]] bool deleteAssetsFromRegistry(const EditorDeleteAssetRequest& request);
     [[nodiscard]] bool queueAssetReimport(const AssetGuid& assetGuid);
     void queueMergeScenes(std::vector<std::filesystem::path> paths);
     void startNextPendingMergeScene();
@@ -217,15 +219,17 @@ private:
     bool applyPendingSceneUpdate(bool allowResourceRebuild);
     void applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange);
     void reloadShadersFromEditor();
-    void startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot);
+    void startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot, const EditorRenderRequest* request = nullptr);
     void prepareEditorRenderJobFrame();
     void updateEditorRenderJob(float deltaSeconds);
     void writeEditorRenderJobManifest(const char* eventLabel);
     void cancelEditorRenderJob(const std::filesystem::path& renderOutputRoot);
     [[nodiscard]] bool exportEditorRenderJobImage(const std::filesystem::path& outputPath);
     void restoreEditorRenderJobSceneState();
+    void preparePathTracerForRendererReplacement(const RendererSettings& previousSettings);
     void retirePathTracer(std::unique_ptr<PathTracerRenderer> renderer);
     void releaseRetiredPathTracers();
+    [[nodiscard]] std::optional<std::filesystem::path> currentSceneCachePathForRenderer() const;
     [[nodiscard]] std::unique_ptr<PathTracerRenderer> makePathTracer(
         const SceneAsset* sceneAsset,
         const AssetManager* assets,
@@ -310,6 +314,9 @@ private:
     bool editorRenderJobTimelineWasPlaying_ = false;
     int editorRenderJobPreviousTimelineFrame_ = 0;
     std::optional<SceneDocument> editorRenderJobSceneSnapshot_;
+    std::optional<RendererSettings> editorRenderJobSettingsSnapshot_;
+    std::optional<RendererSettings> editorRenderJobAppliedSettings_;
+    std::optional<EditorRenderRequest> editorRenderJobRequest_;
     std::vector<std::filesystem::path> editorRenderJobOutputFiles_;
     EditorPlacementStatus editorPlacement_{};
     uint64_t nextEditorPlacementSerial_ = 1;

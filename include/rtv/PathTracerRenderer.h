@@ -112,6 +112,7 @@ public:
         bool resourceAliasingEnabled = true,
         const RendererSettings* initialSettings = nullptr);
     ~PathTracerRenderer();
+    void releaseExclusiveRuntimeForRendererReplacement();
 
     void beginFrame(uint32_t frameIndex, VkExtent2D renderExtent, VkExtent2D displayExtent);
     void setFrameDeltaSeconds(float deltaSeconds) { frameDeltaSeconds_ = deltaSeconds; }
@@ -782,8 +783,8 @@ private:
     void createNrdResolutionResources();
     void initializeDlssRuntime();
     void shutdownDlssRuntime();
-    void releaseDlssFeature();
-    void releaseDlssRayReconstructionFeature();
+    void releaseDlssFeature(bool waitIdleBeforeRelease = false);
+    void releaseDlssRayReconstructionFeature(bool waitIdleBeforeRelease = false);
     [[nodiscard]] bool ensureDlssFeature(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool ensureDlssRayReconstructionFeature(VkCommandBuffer commandBuffer);
     void createStbnResources(const std::filesystem::path& shaderDirectory);

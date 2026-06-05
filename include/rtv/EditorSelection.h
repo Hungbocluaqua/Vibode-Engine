@@ -37,6 +37,7 @@ public:
     void selectLight(uint32_t id);
 
     void toggleEntity(EntityId id);
+    void selectEntities(const std::vector<EntityId>& ids);
     void selectRange(EntityId from, EntityId to);
     void selectRangeFromFlattenedList(const std::vector<EntityId>& flattenedEntities, EntityId to);
 
@@ -53,6 +54,7 @@ public:
     [[nodiscard]] uint32_t index() const { return current_.index; }
     [[nodiscard]] EntityId entityId() const { return current_.entity; }
     [[nodiscard]] const std::vector<EntityId>& selectedEntities() const { return multiSelected_; }
+    [[nodiscard]] std::vector<EntityId> selectedEntitiesOr(EntityId fallback) const;
 
 private:
     EditorSelectionId current_{};

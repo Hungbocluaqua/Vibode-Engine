@@ -19,6 +19,7 @@ struct ProjectContext {
     std::filesystem::path assetRegistryPath;
     std::filesystem::path startupScene;
     std::string defaultRenderPreset = "Editor";
+    int preferredWorkspacePreset = -1;
     bool autosaveEnabled = true;
     int autosaveIntervalMinutes = 5;
 };
@@ -33,6 +34,11 @@ struct CreateProjectRequest {
 
 struct OpenProjectRequest {
     std::filesystem::path projectFile;
+};
+
+struct DeleteProjectRequest {
+    std::filesystem::path projectFile;
+    bool deleteFiles = false;
 };
 
 [[nodiscard]] ProjectContext makeProjectContext(

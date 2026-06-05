@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace rtv {
 
@@ -29,15 +30,99 @@ enum HierarchyTypeFilter : uint32_t {
     HierarchyTypeFilterEffects = 1u << 5u,
 };
 
-bool entityNameMatchesFilter(const Entity& entity, const std::string& filter) {
-    if (filter.empty()) {
-        return true;
+struct HierarchyLayerSummary {
+    std::string name;
+    uint32_t count = 0;
+    uint32_t visibleCount = 0;
+    uint32_t lockedCount = 0;
+};
+
+struct HierarchyTagSummary {
+    std::string name;
+    uint32_t count = 0;
+};
+
+struct HierarchyCollectionSummary {
+    std::string name;
+    uint32_t count = 0;
+};
+
+std::string normalizedLayerName(const Entity& entity) {
+    return entity.layer.empty() ? "Default" : entity.layer;
+}
+
+std::vector<HierarchyLayerSummary> collectHierarchyLayers(SceneRegistry& registry) {
+    std::vector<HierarchyLayerSummary> layers;
+    for (Entity* entity : registry.entities()) {
+        const std::string layerName = normalizedLayerName(*entity);
+        auto it = std::find_if(layers.begin(), layers.end(), [&](const HierarchyLayerSummary& layer) {
+            return layer.name == layerName;
+        });
+        if (it == layers.end()) {
+            it = layers.insert(layers.end(), HierarchyLayerSummary{.name = layerName});
+        }
+        ++it->count;
+        if (entity->visible) {
+            ++it->visibleCount;
+        }
+        if (entity->locked) {
+            ++it->lockedCount;
+        }
     }
-    std::string name = entity.name;
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
+    std::sort(layers.begin(), layers.end(), [](const HierarchyLayerSummary& lhs, const HierarchyLayerSummary& rhs) {
+        if (lhs.name == "Default") {
+            return rhs.name != "Default";
+        }
+        if (rhs.name == "Default") {
+            return false;
+        }
+        return lhs.name < rhs.name;
     });
-    return name.find(filter) != std::string::npos;
+    return layers;
+}
+
+std::vector<HierarchyTagSummary> collectHierarchyTags(SceneRegistry& registry) {
+    std::vector<HierarchyTagSummary> tags;
+    for (Entity* entity : registry.entities()) {
+        for (const std::string& tagName : entity->tags) {
+            if (tagName.empty()) {
+                continue;
+            }
+            auto it = std::find_if(tags.begin(), tags.end(), [&](const HierarchyTagSummary& tag) {
+                return tag.name == tagName;
+            });
+            if (it == tags.end()) {
+                it = tags.insert(tags.end(), HierarchyTagSummary{.name = tagName});
+            }
+            ++it->count;
+        }
+    }
+    std::sort(tags.begin(), tags.end(), [](const HierarchyTagSummary& lhs, const HierarchyTagSummary& rhs) {
+        return lhs.name < rhs.name;
+    });
+    return tags;
+}
+
+std::vector<HierarchyCollectionSummary> collectHierarchyCollections(SceneRegistry& registry) {
+    std::vector<HierarchyCollectionSummary> collections;
+    for (Entity* entity : registry.entities()) {
+        for (const std::string& collectionName : entity->collections) {
+            if (collectionName.empty()) {
+                continue;
+            }
+            auto it = std::find_if(collections.begin(), collections.end(), [&](const HierarchyCollectionSummary& collection) {
+                return collection.name == collectionName;
+            });
+            if (it == collections.end()) {
+                it = collections.insert(collections.end(), HierarchyCollectionSummary{.name = collectionName});
+            }
+            ++it->count;
+        }
+    }
+    std::sort(collections.begin(), collections.end(), [](const HierarchyCollectionSummary& lhs, const HierarchyCollectionSummary& rhs) {
+        return lhs.name < rhs.name;
+    });
+    return collections;
 }
 
 bool entityMatchesTypeFilter(const Entity& entity, uint32_t filterMask) {
@@ -64,6 +149,113 @@ bool entityMatchesTypeFilter(const Entity& entity, uint32_t filterMask) {
         entityMask |= HierarchyTypeFilterEffects;
     }
     return (entityMask & filterMask) != 0;
+}
+
+void appendHierarchySearchTerm(std::string& text, const char* term) {
+    if (term == nullptr || term[0] == '\0') {
+        return;
+    }
+    if (!text.empty()) {
+        text.push_back(' ');
+    }
+    text += term;
+}
+
+bool entityTextMatchesFilter(const Entity& entity, const std::string& filter) {
+    if (filter.empty()) {
+        return true;
+    }
+
+    std::string searchable = entity.name;
+    appendHierarchySearchTerm(searchable, entity.layer.c_str());
+    for (const std::string& tag : entity.tags) {
+        appendHierarchySearchTerm(searchable, tag.c_str());
+    }
+    for (const std::string& collection : entity.collections) {
+        appendHierarchySearchTerm(searchable, collection.c_str());
+    }
+    appendHierarchySearchTerm(searchable, entity.visible ? "visible" : "hidden");
+    appendHierarchySearchTerm(searchable, entity.locked ? "locked" : "unlocked");
+    if (entity.meshRenderer.has_value()) {
+        appendHierarchySearchTerm(searchable, "mesh model meshrenderer mesh renderer geometry");
+    }
+    if (entity.camera.has_value()) {
+        appendHierarchySearchTerm(searchable, "camera view projection");
+    }
+    if (entity.light.has_value()) {
+        appendHierarchySearchTerm(searchable, "light point spot area");
+    }
+    if (entity.sun.has_value()) {
+        appendHierarchySearchTerm(searchable, "sun directional light");
+    }
+    if (entity.environmentLight.has_value()) {
+        appendHierarchySearchTerm(searchable, "environment environmentlight environment light world hdr hdri");
+    }
+    if (entity.skyAtmosphere.has_value()) {
+        appendHierarchySearchTerm(searchable, "sky atmosphere skyatmosphere");
+    }
+    if (entity.heightFog.has_value()) {
+        appendHierarchySearchTerm(searchable, "heightfog height fog atmosphere");
+    }
+    if (entity.volumetricCloud.has_value()) {
+        appendHierarchySearchTerm(searchable, "volumetriccloud volumetric cloud atmosphere");
+    }
+    if (entity.postProcessVolume.has_value()) {
+        appendHierarchySearchTerm(searchable, "postprocess post process volume effects");
+    }
+    if (entity.cameraPostProcess.has_value()) {
+        appendHierarchySearchTerm(searchable, "camerapostprocess camera post process effects");
+    }
+
+    std::transform(searchable.begin(), searchable.end(), searchable.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return searchable.find(filter) != std::string::npos;
+}
+
+bool entityMatchesLayerFilter(const Entity& entity, const std::string& layerFilter) {
+    return layerFilter.empty() || normalizedLayerName(entity) == layerFilter;
+}
+
+bool entityMatchesTagFilter(const Entity& entity, const std::string& tagFilter) {
+    return tagFilter.empty() || std::find(entity.tags.begin(), entity.tags.end(), tagFilter) != entity.tags.end();
+}
+
+bool entityMatchesCollectionFilter(const Entity& entity, const std::string& collectionFilter) {
+    return collectionFilter.empty() || std::find(entity.collections.begin(), entity.collections.end(), collectionFilter) != entity.collections.end();
+}
+
+bool entityMatchesHierarchyFilters(
+    const Entity& entity,
+    const std::string& filter,
+    const std::string& layerFilter,
+    const std::string& tagFilter,
+    const std::string& collectionFilter,
+    uint32_t typeFilterMask) {
+    return entityTextMatchesFilter(entity, filter) &&
+        entityMatchesLayerFilter(entity, layerFilter) &&
+        entityMatchesTagFilter(entity, tagFilter) &&
+        entityMatchesCollectionFilter(entity, collectionFilter) &&
+        entityMatchesTypeFilter(entity, typeFilterMask);
+}
+
+std::vector<EntityId> collectFilteredSelectableEntities(
+    SceneRegistry& registry,
+    const std::string& filter,
+    const std::string& layerFilter,
+    const std::string& tagFilter,
+    const std::string& collectionFilter,
+    uint32_t typeFilterMask) {
+    std::vector<EntityId> entities;
+    for (Entity* entity : registry.entities()) {
+        if (entity == nullptr || entity->locked) {
+            continue;
+        }
+        if (entityMatchesHierarchyFilters(*entity, filter, layerFilter, tagFilter, collectionFilter, typeFilterMask)) {
+            entities.push_back(entity->id);
+        }
+    }
+    return entities;
 }
 
 void hierarchyTooltip(const char* text) {
@@ -202,6 +394,151 @@ bool hierarchyRowIconButton(const char* id, EditorGlyphIcon icon, bool enabled, 
     return enabled && pressed;
 }
 
+void applyLayerVisibility(SceneDocument& document, const std::string& layerName, bool visible) {
+    for (Entity* entity : document.registry().entities()) {
+        if (normalizedLayerName(*entity) == layerName) {
+            entity->visible = visible;
+            if (entity->meshRenderer.has_value()) {
+                entity->meshRenderer->visible = visible;
+            }
+        }
+    }
+}
+
+void applyLayerLocked(SceneDocument& document, const std::string& layerName, bool locked) {
+    for (Entity* entity : document.registry().entities()) {
+        if (normalizedLayerName(*entity) == layerName) {
+            entity->locked = locked;
+        }
+    }
+}
+
+void drawHierarchyLayerControls(SceneDocument& document, EditorRequests& requests, std::string& layerFilter) {
+    std::vector<HierarchyLayerSummary> layers = collectHierarchyLayers(document.registry());
+    if (layers.empty()) {
+        layerFilter.clear();
+        return;
+    }
+    if (!layerFilter.empty() && std::none_of(layers.begin(), layers.end(), [&](const HierarchyLayerSummary& layer) {
+            return layer.name == layerFilter;
+        })) {
+        layerFilter.clear();
+    }
+
+    if (!ImGui::TreeNodeEx("Layers", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth)) {
+        return;
+    }
+
+    for (const HierarchyLayerSummary& layer : layers) {
+        ImGui::PushID(layer.name.c_str());
+        const bool allVisible = layer.visibleCount == layer.count;
+        const bool allLocked = layer.lockedCount == layer.count;
+        ImGui::TextUnformatted(layer.name.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%u", layer.count);
+
+        ImGui::SameLine();
+        const bool layerFilterActive = layerFilter == layer.name;
+        if (editorIconButton("LayerFilter", EditorGlyphIcon::List, layerFilterActive, ImVec2(20.0f, 18.0f))) {
+            layerFilter = layerFilterActive ? std::string{} : layer.name;
+        }
+        hierarchyTooltip(layerFilterActive ? "Clear this layer filter" : "Filter hierarchy to this layer");
+
+        ImGui::SameLine();
+        if (editorIconButton("LayerVisibility", allVisible ? EditorGlyphIcon::EyeVisible : EditorGlyphIcon::EyeHidden, allVisible, ImVec2(20.0f, 18.0f))) {
+            const SceneDocument before = document;
+            applyLayerVisibility(document, layer.name, !allVisible);
+            requests.sceneSnapshot = EditorSceneSnapshotChange{
+                .before = before,
+                .updateKind = SceneUpdateKind::VisibilityOnly,
+                .label = allVisible ? "Hide Layer" : "Show Layer",
+            };
+        }
+        hierarchyTooltip(allVisible ? "Hide all entities in this layer" : "Show all entities in this layer");
+
+        ImGui::SameLine();
+        if (editorIconButton("LayerLock", allLocked ? EditorGlyphIcon::Lock : EditorGlyphIcon::Unlock, allLocked, ImVec2(20.0f, 18.0f))) {
+            const SceneDocument before = document;
+            applyLayerLocked(document, layer.name, !allLocked);
+            requests.sceneSnapshot = EditorSceneSnapshotChange{
+                .before = before,
+                .updateKind = SceneUpdateKind::None,
+                .label = allLocked ? "Unlock Layer" : "Lock Layer",
+            };
+        }
+        hierarchyTooltip(allLocked ? "Unlock all entities in this layer" : "Lock all entities in this layer");
+        ImGui::PopID();
+    }
+
+    ImGui::TreePop();
+}
+
+void drawHierarchyTagControls(SceneDocument& document, std::string& tagFilter) {
+    std::vector<HierarchyTagSummary> tags = collectHierarchyTags(document.registry());
+    if (tags.empty()) {
+        tagFilter.clear();
+        return;
+    }
+    if (!tagFilter.empty() && std::none_of(tags.begin(), tags.end(), [&](const HierarchyTagSummary& tag) {
+            return tag.name == tagFilter;
+        })) {
+        tagFilter.clear();
+    }
+
+    if (!ImGui::TreeNodeEx("Tags", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth)) {
+        return;
+    }
+
+    for (const HierarchyTagSummary& tag : tags) {
+        ImGui::PushID(tag.name.c_str());
+        ImGui::TextUnformatted(tag.name.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%u", tag.count);
+        ImGui::SameLine();
+        const bool tagFilterActive = tagFilter == tag.name;
+        if (editorIconButton("TagFilter", EditorGlyphIcon::List, tagFilterActive, ImVec2(20.0f, 18.0f))) {
+            tagFilter = tagFilterActive ? std::string{} : tag.name;
+        }
+        hierarchyTooltip(tagFilterActive ? "Clear this tag filter" : "Filter hierarchy to this tag");
+        ImGui::PopID();
+    }
+
+    ImGui::TreePop();
+}
+
+void drawHierarchyCollectionControls(SceneDocument& document, std::string& collectionFilter) {
+    std::vector<HierarchyCollectionSummary> collections = collectHierarchyCollections(document.registry());
+    if (collections.empty()) {
+        collectionFilter.clear();
+        return;
+    }
+    if (!collectionFilter.empty() && std::none_of(collections.begin(), collections.end(), [&](const HierarchyCollectionSummary& collection) {
+            return collection.name == collectionFilter;
+        })) {
+        collectionFilter.clear();
+    }
+
+    if (!ImGui::TreeNodeEx("Collections", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth)) {
+        return;
+    }
+
+    for (const HierarchyCollectionSummary& collection : collections) {
+        ImGui::PushID(collection.name.c_str());
+        ImGui::TextUnformatted(collection.name.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%u", collection.count);
+        ImGui::SameLine();
+        const bool collectionFilterActive = collectionFilter == collection.name;
+        if (editorIconButton("CollectionFilter", EditorGlyphIcon::Group, collectionFilterActive, ImVec2(20.0f, 18.0f))) {
+            collectionFilter = collectionFilterActive ? std::string{} : collection.name;
+        }
+        hierarchyTooltip(collectionFilterActive ? "Clear this collection filter" : "Filter hierarchy to this collection");
+        ImGui::PopID();
+    }
+
+    ImGui::TreePop();
+}
+
 } // namespace
 
 void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
@@ -248,6 +585,28 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
         std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char ch) {
             return static_cast<char>(std::tolower(ch));
         });
+        drawHierarchyLayerControls(document, requests, layerFilter_);
+        drawHierarchyTagControls(document, tagFilter_);
+        drawHierarchyCollectionControls(document, collectionFilter_);
+        const std::vector<EntityId> filteredSelectable = collectFilteredSelectableEntities(
+            registry,
+            filter,
+            layerFilter_,
+            tagFilter_,
+            collectionFilter_,
+            typeFilterMask_);
+        ImGui::BeginDisabled(filteredSelectable.empty());
+        if (editorIconTextButton("HierarchySelectFiltered", EditorGlyphIcon::Select, "Select Filtered")) {
+            selection.selectEntities(filteredSelectable);
+        }
+        ImGui::EndDisabled();
+        hierarchyTooltip("Select all unlocked entities matching the current hierarchy filters.");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(selection.selectionCount() == 0);
+        if (editorIconTextButton("HierarchyClearSelection", EditorGlyphIcon::Exit, "Clear Selection")) {
+            selection.clear();
+        }
+        ImGui::EndDisabled();
         ImGui::Separator();
 
         const EntityId selectedEntity = selection.entityId();
@@ -265,7 +624,7 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
             if (entity->parent.valid()) {
                 continue;
             }
-            drawEntityNode(registry, *entity, selection, requests, filter, typeFilterMask_, false);
+            drawEntityNode(registry, *entity, selection, requests, filter, layerFilter_, tagFilter_, collectionFilter_, typeFilterMask_, false);
         }
 
         if (ImGui::BeginPopupContextWindow("HierarchyEmptyContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
@@ -280,6 +639,10 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Point Light")) {
                     requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
+                    requests.sceneUpdate = SceneUpdateKind::LightOnly;
+                }
+                if (editorGlyphMenuItem(EditorGlyphIcon::Sun, "Sun")) {
+                    requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Sun};
                     requests.sceneUpdate = SceneUpdateKind::LightOnly;
                 }
                 if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Spot Light")) {
@@ -415,13 +778,13 @@ bool SceneHierarchyPanel::entityContainsSelection(const SceneRegistry& registry,
     return false;
 }
 
-bool SceneHierarchyPanel::entityContainsFilter(const SceneRegistry& registry, const Entity& entity, const std::string& filter, uint32_t typeFilterMask) const {
-    if (entityNameMatchesFilter(entity, filter) && entityMatchesTypeFilter(entity, typeFilterMask)) {
+bool SceneHierarchyPanel::entityContainsFilter(const SceneRegistry& registry, const Entity& entity, const std::string& filter, const std::string& layerFilter, const std::string& tagFilter, const std::string& collectionFilter, uint32_t typeFilterMask) const {
+    if (entityMatchesHierarchyFilters(entity, filter, layerFilter, tagFilter, collectionFilter, typeFilterMask)) {
         return true;
     }
     for (EntityId childId : entity.children) {
         if (const Entity* child = registry.entity(childId)) {
-            if (entityContainsFilter(registry, *child, filter, typeFilterMask)) {
+            if (entityContainsFilter(registry, *child, filter, layerFilter, tagFilter, collectionFilter, typeFilterMask)) {
                 return true;
             }
         }
@@ -445,11 +808,14 @@ void SceneHierarchyPanel::drawEntityNode(
     EditorSelection& selection,
     EditorRequests& requests,
     const std::string& filter,
+    const std::string& layerFilter,
+    const std::string& tagFilter,
+    const std::string& collectionFilter,
     uint32_t typeFilterMask,
     bool ancestorMatchesFilter,
     int depth) {
-    const bool selfMatchesFilter = entityNameMatchesFilter(entity, filter) && entityMatchesTypeFilter(entity, typeFilterMask);
-    if (!ancestorMatchesFilter && !entityContainsFilter(registry, entity, filter, typeFilterMask)) {
+    const bool selfMatchesFilter = entityMatchesHierarchyFilters(entity, filter, layerFilter, tagFilter, collectionFilter, typeFilterMask);
+    if (!ancestorMatchesFilter && !entityContainsFilter(registry, entity, filter, layerFilter, tagFilter, collectionFilter, typeFilterMask)) {
         return;
     }
     const EntityId selected = selection.entityId();
@@ -490,7 +856,8 @@ void SceneHierarchyPanel::drawEntityNode(
     if (entity.children.empty()) {
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     }
-    if (selection.entityId() == entity.id) {
+    const bool entitySelected = selection.isSelected(entity.id);
+    if (entitySelected) {
         flags |= ImGuiTreeNodeFlags_Selected;
     }
 
@@ -515,7 +882,9 @@ void SceneHierarchyPanel::drawEntityNode(
     drawHierarchyIndentGuides(rowStart.x, rowMin, rowMax, depth);
     drawHierarchyRightFade(rowMin, rowMax);
     drawHierarchyRowGlyph(editorGlyphForEntity(entity), rowMin, rowMax, entity.locked || !entity.visible);
-    auto drawRowControls = [&] {
+    const bool rowItemClicked = ImGui::IsItemClicked();
+    const bool rowItemToggledOpen = ImGui::IsItemToggledOpen();
+    auto drawRowControls = [&]() -> bool {
         const ImVec2 iconButtonSize(20.0f, 20.0f);
         const float controlY = rowMin.y + std::max(0.0f, (rowMax.y - rowMin.y - iconButtonSize.y) * 0.5f);
         const float lockWidth = iconButtonSize.x;
@@ -523,24 +892,27 @@ void SceneHierarchyPanel::drawEntityNode(
         const float gap = 3.0f;
         const float rightEdge = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
         const bool rowHovered = ImGui::IsMouseHoveringRect(rowMin, rowMax, true);
-        const bool rowSelected = selection.entityId() == entity.id;
-        const bool showLockControl = entity.locked || rowHovered || rowSelected;
+        const bool showLockControl = entity.locked || rowHovered || entitySelected;
         const ImVec2 restoreCursor = ImGui::GetCursorScreenPos();
+        bool activated = false;
         ImGui::PushID(static_cast<int>(entity.id.index));
         if (showLockControl) {
             ImGui::SetCursorScreenPos(ImVec2(rightEdge - lockWidth - eyeWidth - gap, controlY));
             if (hierarchyRowIconButton("lock", entity.locked ? EditorGlyphIcon::Lock : EditorGlyphIcon::Unlock, true, !entity.locked, iconButtonSize)) {
                 requests.setEntityLocked = EditorEntityBoolChange{.entity = entity.id, .value = !entity.locked};
+                activated = true;
             }
             hierarchyTooltip(entity.locked ? "Locked" : "Unlocked");
         }
         ImGui::SetCursorScreenPos(ImVec2(rightEdge - eyeWidth, controlY));
         if (hierarchyRowIconButton("visible", entity.visible ? EditorGlyphIcon::EyeVisible : EditorGlyphIcon::EyeHidden, !entity.locked, !entity.visible, iconButtonSize)) {
             requests.setEntityVisibility = EditorEntityBoolChange{.entity = entity.id, .value = !entity.visible};
+            activated = true;
         }
         hierarchyTooltip(entity.visible ? "Visible" : "Hidden");
         ImGui::PopID();
         ImGui::SetCursorScreenPos(restoreCursor);
+        return activated;
     };
     if (!entity.locked) {
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
@@ -580,21 +952,6 @@ void SceneHierarchyPanel::drawEntityNode(
             ImGui::EndDragDropTarget();
         }
     }
-    if (!entity.locked && ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-        if (ImGui::GetIO().KeyCtrl) {
-            selection.toggleEntity(entity.id);
-        } else if (ImGui::GetIO().KeyShift && selection.lastClickedId().valid()) {
-            std::vector<EntityId> flattened;
-            for (Entity* root : registry.entities()) {
-                if (!root->parent.valid()) {
-                    recurseFlatten(registry, *root, flattened);
-                }
-            }
-            selection.selectRangeFromFlattenedList(flattened, entity.id);
-        } else {
-            selection.selectEntity(entity.id);
-        }
-    }
     if (ImGui::BeginPopupContextItem()) {
         if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Duplicate", !entity.locked)) {
             requests.duplicateEntity = entity.id;
@@ -604,8 +961,7 @@ void SceneHierarchyPanel::drawEntityNode(
             renameTarget_ = entity.id;
         }
         if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Delete", !entity.locked)) {
-            requests.deleteEntity = entity.id;
-            requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            requests.deleteEntities = selection.selectedEntitiesOr(entity.id);
         }
         ImGui::Separator();
         if (editorGlyphMenuItem(entity.visible ? EditorGlyphIcon::EyeHidden : EditorGlyphIcon::EyeVisible, entity.visible ? "Hide" : "Show")) {
@@ -627,6 +983,10 @@ void SceneHierarchyPanel::drawEntityNode(
             if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Light")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light, .parent = entity.id};
                 requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Sun, "Sun")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Sun, .parent = entity.id};
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Spot Light")) {
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::SpotLight, .parent = entity.id};
@@ -666,6 +1026,22 @@ void SceneHierarchyPanel::drawEntityNode(
         }
         ImGui::EndPopup();
     }
+    const bool rowControlActivated = drawRowControls();
+    if (!rowControlActivated && !entity.locked && rowItemClicked && !rowItemToggledOpen) {
+        if (ImGui::GetIO().KeyCtrl) {
+            selection.toggleEntity(entity.id);
+        } else if (ImGui::GetIO().KeyShift && selection.lastClickedId().valid()) {
+            std::vector<EntityId> flattened;
+            for (Entity* root : registry.entities()) {
+                if (!root->parent.valid()) {
+                    recurseFlatten(registry, *root, flattened);
+                }
+            }
+            selection.selectRangeFromFlattenedList(flattened, entity.id);
+        } else {
+            selection.selectEntity(entity.id);
+        }
+    }
     if (selected == entity.id && (lastScrolledSelection_ != selected || pendingRevealSelection_ == selected)) {
         ImGui::SetScrollHereY(0.25f);
         lastScrolledSelection_ = selected;
@@ -673,11 +1049,10 @@ void SceneHierarchyPanel::drawEntityNode(
             pendingRevealSelection_ = {};
         }
     }
-    drawRowControls();
     if (open && !entity.children.empty()) {
         for (EntityId childId : entity.children) {
             if (Entity* child = registry.entity(childId)) {
-                drawEntityNode(registry, *child, selection, requests, filter, typeFilterMask, ancestorMatchesFilter || selfMatchesFilter, depth + 1);
+                drawEntityNode(registry, *child, selection, requests, filter, layerFilter, tagFilter, collectionFilter, typeFilterMask, ancestorMatchesFilter || selfMatchesFilter, depth + 1);
             }
         }
         ImGui::TreePop();

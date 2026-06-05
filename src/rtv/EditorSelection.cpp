@@ -41,6 +41,22 @@ void EditorSelection::toggleEntity(EntityId id) {
     lastClickedId_ = id;
 }
 
+void EditorSelection::selectEntities(const std::vector<EntityId>& ids) {
+    clear();
+    for (EntityId id : ids) {
+        if (!id.valid() || std::find(multiSelected_.begin(), multiSelected_.end(), id) != multiSelected_.end()) {
+            continue;
+        }
+        multiSelected_.push_back(id);
+    }
+    if (multiSelected_.empty()) {
+        return;
+    }
+    const EntityId first = multiSelected_.front();
+    current_ = EditorSelectionId{.kind = EditorSelectionKind::Object, .index = first.index, .entity = first};
+    lastClickedId_ = first;
+}
+
 void EditorSelection::selectRange(EntityId from, EntityId to) {
     current_ = EditorSelectionId{.kind = EditorSelectionKind::Object, .index = to.index, .entity = to};
     if (!from.valid()) {
@@ -80,6 +96,17 @@ void EditorSelection::selectRangeFromFlattenedList(const std::vector<EntityId>& 
         multiSelected_.push_back(to);
     }
     lastClickedId_ = to;
+}
+
+bool EditorSelection::isSelected(EntityId id) const {
+    return id.valid() && std::find(multiSelected_.begin(), multiSelected_.end(), id) != multiSelected_.end();
+}
+
+std::vector<EntityId> EditorSelection::selectedEntitiesOr(EntityId fallback) const {
+    if (fallback.valid() && isSelected(fallback) && multiSelected_.size() > 1) {
+        return multiSelected_;
+    }
+    return fallback.valid() ? std::vector<EntityId>{fallback} : std::vector<EntityId>{};
 }
 
 void EditorSelection::selectMaterial(uint32_t id) {

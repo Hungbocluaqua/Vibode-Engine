@@ -35,6 +35,8 @@ namespace {
     return material;
 }
 
+void appendSceneMaterial(SceneAsset& scene, const AssetManager* assets, MaterialAssetHandle material);
+
 void applyRendererMaterialBindings(
     SceneGpuBuildResult& result,
     const std::vector<const Entity*>& entities,
@@ -66,9 +68,7 @@ void applyRendererMaterialBindings(
             if (material.valid() && material.index != primitive.material.index) {
                 needsRuntimeMesh = true;
             }
-            if (material.valid()) {
-                result.sceneAsset.materials.push_back(material);
-            }
+            appendSceneMaterial(result.sceneAsset, assets, material);
         }
 
         if (!needsRuntimeMesh) {
@@ -94,6 +94,69 @@ void applyRendererMaterialBindings(
     }
 }
 
+void appendSceneTexture(SceneAsset& scene, const AssetManager* assets, TextureAssetHandle texture) {
+    if (texture.valid() && (assets == nullptr || assets->texture(texture) != nullptr)) {
+        scene.textures.push_back(texture);
+    }
+}
+
+void appendMaterialTextures(SceneAsset& scene, const AssetManager* assets, const MaterialAsset& material) {
+    appendSceneTexture(scene, assets, material.baseColorTexture);
+    appendSceneTexture(scene, assets, material.normalTexture);
+    appendSceneTexture(scene, assets, material.metallicRoughnessTexture);
+    appendSceneTexture(scene, assets, material.emissiveTexture);
+    appendSceneTexture(scene, assets, material.clearcoatTexture);
+    appendSceneTexture(scene, assets, material.clearcoatRoughnessTexture);
+    appendSceneTexture(scene, assets, material.clearcoatNormalTexture);
+    appendSceneTexture(scene, assets, material.transmissionTexture);
+    appendSceneTexture(scene, assets, material.volumeThicknessTexture);
+    appendSceneTexture(scene, assets, material.specularTexture);
+    appendSceneTexture(scene, assets, material.specularColorTexture);
+    appendSceneTexture(scene, assets, material.sheenColorTexture);
+    appendSceneTexture(scene, assets, material.sheenRoughnessTexture);
+    appendSceneTexture(scene, assets, material.iridescenceTexture);
+    appendSceneTexture(scene, assets, material.iridescenceThicknessTexture);
+    appendSceneTexture(scene, assets, material.anisotropyTexture);
+    appendSceneTexture(scene, assets, material.occlusionTexture);
+}
+
+void appendSceneMaterial(SceneAsset& scene, const AssetManager* assets, MaterialAssetHandle material) {
+    if (!material.valid() || (assets != nullptr && assets->material(material) == nullptr)) {
+        return;
+    }
+    scene.materials.push_back(material);
+}
+
+void deduplicateSceneHandles(SceneAsset& scene) {
+    std::sort(scene.textures.begin(), scene.textures.end(), [](TextureAssetHandle a, TextureAssetHandle b) { return a.index < b.index; });
+    scene.textures.erase(
+        std::unique(scene.textures.begin(), scene.textures.end(), [](TextureAssetHandle a, TextureAssetHandle b) { return a.index == b.index; }),
+        scene.textures.end());
+
+    std::sort(scene.materials.begin(), scene.materials.end(), [](MaterialAssetHandle a, MaterialAssetHandle b) { return a.index < b.index; });
+    scene.materials.erase(
+        std::unique(scene.materials.begin(), scene.materials.end(), [](MaterialAssetHandle a, MaterialAssetHandle b) { return a.index == b.index; }),
+        scene.materials.end());
+
+    std::sort(scene.meshes.begin(), scene.meshes.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index < b.index; });
+    scene.meshes.erase(
+        std::unique(scene.meshes.begin(), scene.meshes.end(), [](MeshAssetHandle a, MeshAssetHandle b) { return a.index == b.index; }),
+        scene.meshes.end());
+}
+
+void collectSceneMaterialTextures(SceneAsset& scene, const AssetManager* assets) {
+    if (assets == nullptr) {
+        deduplicateSceneHandles(scene);
+        return;
+    }
+    for (MaterialAssetHandle material : scene.materials) {
+        if (const MaterialAsset* asset = assets->material(material)) {
+            appendMaterialTextures(scene, assets, *asset);
+        }
+    }
+    deduplicateSceneHandles(scene);
+}
+
 } // namespace
 
 SceneGpuBuildResult SceneToGpuSceneBuilder::build(
@@ -107,6 +170,7 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
 
     const std::vector<const Entity*> entities = document.registry().entities();
     applyRendererMaterialBindings(result, entities, assets);
+    collectSceneMaterialTextures(result.sceneAsset, assets);
 
     const RenderSettings& render = document.renderSettings();
     const Environment& environment = document.environment();

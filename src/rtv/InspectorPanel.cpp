@@ -13,11 +13,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cfloat>
 #include <cmath>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace rtv {
 
@@ -26,6 +28,53 @@ namespace {
 void drawMatrixTranslation(const glm::mat4& transform) {
     glm::vec3 translation{transform[3]};
     ImGui::InputFloat3("Position", glm::value_ptr(translation), "%.3f", ImGuiInputTextFlags_ReadOnly);
+}
+
+std::string trimInspectorText(std::string value) {
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), value.end());
+    return value;
+}
+
+std::vector<std::string> parseInspectorTagList(const char* text) {
+    std::vector<std::string> tags;
+    std::string current;
+    for (const char* cursor = text; cursor != nullptr && *cursor != '\0'; ++cursor) {
+        if (*cursor == ',') {
+            std::string tag = trimInspectorText(std::move(current));
+            if (!tag.empty()) {
+                tags.push_back(std::move(tag));
+            }
+            current.clear();
+        } else {
+            current.push_back(*cursor);
+        }
+    }
+    std::string tag = trimInspectorText(std::move(current));
+    if (!tag.empty()) {
+        tags.push_back(std::move(tag));
+    }
+    std::sort(tags.begin(), tags.end());
+    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+    return tags;
+}
+
+std::string joinInspectorTagList(const std::vector<std::string>& tags) {
+    std::string text;
+    for (const std::string& tag : tags) {
+        if (!text.empty()) {
+            text += ", ";
+        }
+        text += tag;
+    }
+    return text;
+}
+
+template <size_t Size>
+void copyInspectorBuffer(std::array<char, Size>& buffer, const std::string& text) {
+    buffer.fill('\0');
+    const size_t count = std::min(text.size(), buffer.size() - 1u);
+    std::copy_n(text.data(), count, buffer.data());
 }
 
 void ensureMaterialSlots(MeshRenderer& renderer, const AssetManager* assets) {
@@ -320,8 +369,7 @@ void drawEntityActionsMenu(Entity& entity, EditorSelection& selection, EditorReq
         requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
     }
     if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Delete Entity", !entity.locked)) {
-        requests.deleteEntity = entity.id;
-        requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+        requests.deleteEntities = selection.selectedEntitiesOr(entity.id);
         selection.clear();
     }
     ImGui::Separator();
@@ -429,9 +477,8 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         const std::string title = std::to_string(selCount) + " entities selected";
         drawInspectorStateCard(EditorGlyphIcon::Group, title.c_str(), "Bulk component editing is not available in this build.");
         if (editorIconTextButton("InspectorDeleteSelected", EditorGlyphIcon::Trash, "Delete Selected")) {
-            for (EntityId id : selection.selectedEntities()) {
-                requests.deleteEntity = id;
-            }
+            requests.deleteEntities = selection.selectedEntities();
+            selection.clear();
         }
         ImGui::SameLine();
         if (editorIconTextButton("InspectorClearSelection", EditorGlyphIcon::Exit, "Clear Selection")) {
@@ -470,6 +517,62 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         }
         if (ImGui::InputText("Name", nameBuffer.data(), nameBuffer.size(), ImGuiInputTextFlags_EnterReturnsTrue)) {
             requests.renameEntity = EditorEntityRenameRequest{.entity = entity->id, .name = nameBuffer.data()};
+        }
+
+        static EntityId organizationEditId{};
+        static std::array<char, 128> layerBuffer{};
+        static std::array<char, 256> tagsBuffer{};
+        static std::array<char, 256> collectionsBuffer{};
+        if (organizationEditId != entity->id) {
+            organizationEditId = entity->id;
+            copyInspectorBuffer(layerBuffer, entity->layer);
+            copyInspectorBuffer(tagsBuffer, joinInspectorTagList(entity->tags));
+            copyInspectorBuffer(collectionsBuffer, joinInspectorTagList(entity->collections));
+        }
+        std::optional<SceneDocument> beforeOrganization;
+        bool organizationChanged = false;
+        auto captureBeforeOrganization = [&]() {
+            if (!beforeOrganization.has_value()) {
+                beforeOrganization = document;
+            }
+        };
+        const bool layerCommitted = ImGui::InputText("Layer", layerBuffer.data(), layerBuffer.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool layerDeactivated = ImGui::IsItemDeactivatedAfterEdit();
+        if (layerCommitted || layerDeactivated) {
+            std::string layer = trimInspectorText(layerBuffer.data());
+            if (layer != entity->layer) {
+                captureBeforeOrganization();
+                entity->layer = std::move(layer);
+                copyInspectorBuffer(layerBuffer, entity->layer);
+                organizationChanged = true;
+            }
+        }
+        const bool tagsCommitted = ImGui::InputTextWithHint("Tags", "comma separated", tagsBuffer.data(), tagsBuffer.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool tagsDeactivated = ImGui::IsItemDeactivatedAfterEdit();
+        if (tagsCommitted || tagsDeactivated) {
+            std::vector<std::string> tags = parseInspectorTagList(tagsBuffer.data());
+            if (tags != entity->tags) {
+                captureBeforeOrganization();
+                entity->tags = std::move(tags);
+                copyInspectorBuffer(tagsBuffer, joinInspectorTagList(entity->tags));
+                organizationChanged = true;
+            }
+        }
+        tooltip("Comma-separated entity tags are saved with the level and searchable in the Hierarchy.");
+        const bool collectionsCommitted = ImGui::InputTextWithHint("Collections", "comma separated", collectionsBuffer.data(), collectionsBuffer.size(), ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool collectionsDeactivated = ImGui::IsItemDeactivatedAfterEdit();
+        if (collectionsCommitted || collectionsDeactivated) {
+            std::vector<std::string> collections = parseInspectorTagList(collectionsBuffer.data());
+            if (collections != entity->collections) {
+                captureBeforeOrganization();
+                entity->collections = std::move(collections);
+                copyInspectorBuffer(collectionsBuffer, joinInspectorTagList(entity->collections));
+                organizationChanged = true;
+            }
+        }
+        tooltip("Comma-separated entity collections are saved with the level and filterable in the Hierarchy.");
+        if (organizationChanged && beforeOrganization.has_value()) {
+            requests.sceneSnapshot = EditorSceneSnapshotChange{.before = *beforeOrganization, .updateKind = SceneUpdateKind::None, .label = "Edit Entity Organization"};
         }
 
         drawInspectorComponentHeader(EditorGlyphIcon::Move, "Transform", "Local position, rotation, and scale", !entityLocked);
@@ -753,12 +856,7 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             drawInspectorComponentHeader(EditorGlyphIcon::Sun, "Primary Sun", "Directional daylight and shadow controls", !entityLocked, "##SunActions", entity->id, EditorComponentKind::Sun, SceneUpdateKind::LightOnly, &requests);
             Sun& sun = *entity->sun;
             const Sun oldSun = sun;
-            const Transform oldSunTransform = entity->transform;
             bool changed = false;
-            bool sunTransformChanged = false;
-            float elevation = 0.0f;
-            float azimuth = 0.0f;
-            SunController::anglesFromWorldTransform(document.registry(), *entity, elevation, azimuth);
             inspectorReadonlyRow("Light Type", "Sun");
             inspectorReadonlyRow("Units", "Illuminance (lux)");
             changed |= inspectorCheckboxRow("Enabled", &sun.enabled);
@@ -766,19 +864,15 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 sun.enabled = Sun{}.enabled;
                 changed = true;
             }
-            if (inspectorDragFloatRow("Azimuth", &azimuth, 0.01f, -6.28318f, 6.28318f, "%.3f rad")) {
-                sunTransformChanged = true;
-            }
+            changed |= inspectorDragFloatRow("Azimuth", &sun.azimuth, 0.01f, -6.28318f, 6.28318f, "%.3f rad");
             if (resetFieldButton("SunAzimuth", "Reset direction angle")) {
-                azimuth = 0.0f;
-                sunTransformChanged = true;
+                sun.azimuth = Sun{}.azimuth;
+                changed = true;
             }
-            if (inspectorDragFloatRow("Elevation", &elevation, 0.01f, -1.5707f, 1.5707f, "%.3f rad")) {
-                sunTransformChanged = true;
-            }
+            changed |= inspectorDragFloatRow("Elevation", &sun.elevation, 0.01f, -1.5707f, 1.5707f, "%.3f rad");
             if (resetFieldButton("SunElevation", "Reset direction angle")) {
-                elevation = 0.0f;
-                sunTransformChanged = true;
+                sun.elevation = Sun{}.elevation;
+                changed = true;
             }
             changed |= inspectorCheckboxRow("Use Color Temperature", &sun.useColorTemperature);
             changed |= inspectorDragFloatRow("Illuminance", &sun.illuminanceLux, 100.0f, 0.0f, 200000.0f, "%.0f lux");
@@ -809,15 +903,6 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 sun.volumetricShadowBounces = static_cast<uint32_t>(std::clamp(volumetricShadowBounces, 0, 16));
                 changed = true;
             }
-            if (sunTransformChanged) {
-                entity->transform = SunController::transformFromWorldAngles(document.registry(), *entity, entity->transform, elevation, azimuth);
-                entity->transform.dirty = true;
-                requests.setEntityTransform = EditorEntityTransformChange{
-                    .entity = entity->id,
-                    .oldTransform = oldSunTransform,
-                    .newTransform = entity->transform,
-                };
-            }
             if (changed) {
                 document.setPrimarySun(entity->id);
                 document.markDirty(SceneUpdateKind::LightOnly);
@@ -827,11 +912,6 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                     .oldSun = oldSun,
                     .newSun = sun,
                 };
-            }
-            if (sunTransformChanged && !changed) {
-                document.setPrimarySun(entity->id);
-                document.markDirty(SceneUpdateKind::LightOnly);
-                requests.sceneUpdate = SceneUpdateKind::LightOnly;
             }
         }
 
@@ -1147,9 +1227,7 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         if (ImGui::BeginPopupModal("Delete##confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::Text("Delete '%s'?", entity->name.empty() ? "Entity" : entity->name.c_str());
             if (ImGui::Button("Yes")) {
-                const EntityId deleted = entity->id;
-                requests.deleteEntity = deleted;
-                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                requests.deleteEntities = selection.selectedEntitiesOr(entity->id);
                 selection.clear();
                 ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();
@@ -1180,6 +1258,10 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             glm::vec3 position = state.camera->position();
             glm::vec3 direction = state.camera->direction();
             float speed = state.camera->moveSpeed();
+            float fastSpeed = state.camera->fastMoveSpeed();
+            float sensitivity = state.camera->mouseSensitivity();
+            bool invertLookX = state.camera->invertLookX();
+            bool invertLookY = state.camera->invertLookY();
             ImGui::InputFloat3("Position", glm::value_ptr(position), "%.3f", ImGuiInputTextFlags_ReadOnly);
             ImGui::InputFloat3("Orientation", glm::value_ptr(direction), "%.3f", ImGuiInputTextFlags_ReadOnly);
             const std::array<std::pair<const char*, float>, 4> presets = {{
@@ -1198,6 +1280,18 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             }
             if (ImGui::SliderFloat("Move Speed", &speed, 0.25f, 20.0f, "%.2f")) {
                 requests.cameraMoveSpeed = speed;
+            }
+            if (ImGui::SliderFloat("Fast Move Speed", &fastSpeed, 0.5f, 100.0f, "%.2f")) {
+                requests.cameraFastMoveSpeed = fastSpeed;
+            }
+            if (ImGui::SliderFloat("Look Sensitivity", &sensitivity, 0.0001f, 0.02f, "%.4f")) {
+                requests.cameraMouseSensitivity = sensitivity;
+            }
+            if (ImGui::Checkbox("Invert Look X", &invertLookX)) {
+                requests.cameraInvertLookX = invertLookX;
+            }
+            if (ImGui::Checkbox("Invert Look Y", &invertLookY)) {
+                requests.cameraInvertLookY = invertLookY;
             }
         }
         if (editorIconTextButton("InspectorResetCameraSelection", EditorGlyphIcon::Reset, "Reset Camera")) {

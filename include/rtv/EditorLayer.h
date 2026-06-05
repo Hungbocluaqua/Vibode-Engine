@@ -33,6 +33,8 @@ public:
     void resetLayout();
     void showProjectManager() { showProjectManager_ = true; projectManagerDismissed_ = false; }
     void dismissProjectManager() { showProjectManager_ = false; projectManagerDismissed_ = true; }
+    void setProjectWorkspacePreset(int preset);
+    void clearProjectWorkspacePreset();
     void handleNotificationAction(NotificationAction action, EditorRequests& requests);
     void showRecoveryPrompt(
         std::filesystem::path markerPath,
@@ -54,7 +56,10 @@ public:
 private:
     void drawProjectManager(const ProjectManagerRuntimeState& state, EditorRequests& requests);
     void drawRecoveryPrompt(EditorRequests& requests);
+    void drawDeleteEntityConfirmation(const EditorRuntimeState& state, EditorRequests& requests);
     void drawSceneLoadingOverlay(const EditorRuntimeState& state, EditorRequests& requests);
+    void openRenderSettingsDialog(EditorRenderJobKind kind, const EditorRuntimeState& state);
+    void drawRenderSettingsDialog(EditorRuntimeState& state, EditorRequests& requests);
     void drawRenderJobModal(const EditorRuntimeState& state, EditorRequests& requests);
     void drawRenderWorldSettingsPanel(EditorRuntimeState& state, EditorRequests& requests);
     void drawTimelinePanel(EditorRuntimeState& state, EditorRequests& requests);
@@ -69,6 +74,7 @@ private:
     bool executeConsoleCommand(std::string command, EditorRuntimeState& state, EditorRequests& requests);
     void applyThemePreset();
     void applyWorkspacePreset();
+    [[nodiscard]] int effectiveWorkspacePreset() const;
 
     EditorPanelVisibility visibility_{};
     EditorSelection selection_{};
@@ -83,6 +89,7 @@ private:
     SceneStatsPanel sceneStatsPanel_{};
     GpuDiagnosticsPanel gpuDiagnosticsPanel_{};
     EditorPreferences editorPrefs_{};
+    int projectWorkspacePreset_ = -1;
     CameraBookmarkManager cameraBookmarks_{};
     EditorLog log_{};
     EditorTimeline timeline_{};
@@ -147,7 +154,25 @@ private:
     std::string captureFocusWindow_{};
     int captureFocusFramesRemaining_ = 0;
     bool recoveryPromptVisible_ = false;
+    bool deleteEntityConfirmOpen_ = false;
+    EntityId pendingDeleteEntity_{};
+    std::vector<EntityId> pendingDeleteEntities_{};
+    std::string pendingDeleteEntityName_{};
     bool renderJobModalOpen_ = false;
+    bool renderSettingsDialogOpen_ = false;
+    EditorRenderJobKind pendingRenderKind_ = EditorRenderJobKind::Image;
+    std::array<char, 512> renderOutputRoot_{};
+    int renderRequestedWidth_ = 1280;
+    int renderRequestedHeight_ = 720;
+    float renderResolutionScale_ = 1.0f;
+    int renderSamplesPerPixel_ = 1;
+    bool renderLimitSamplesPerPixel_ = false;
+    int renderTargetSamplesPerPixel_ = 64;
+    int renderImageAccumulationFrames_ = 64;
+    int renderSequenceStartFrame_ = 0;
+    int renderSequenceEndFrame_ = 0;
+    int renderSequenceFramesPerTimelineFrame_ = 1;
+    bool renderSaveSequenceFramesAsDefault_ = false;
     uint64_t observedRenderJobSerial_ = 0;
     uint64_t observedPlacementSerial_ = 0;
     std::filesystem::path recoveryMarkerPath_;
@@ -158,6 +183,9 @@ private:
     bool showProjectManager_ = true;
     bool projectManagerDismissed_ = false;
     int projectManagerSection_ = 0;
+    bool deleteProjectConfirmOpen_ = false;
+    bool deleteProjectFiles_ = false;
+    std::filesystem::path pendingDeleteProjectFile_{};
     std::array<char, 128> newProjectName_{};
     std::array<char, 512> newProjectLocation_{};
     std::array<char, 512> openProjectPath_{};

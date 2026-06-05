@@ -5,6 +5,7 @@
 #include "rtv/UndoStack.h"
 
 #include <string>
+#include <vector>
 
 namespace rtv {
 
@@ -20,6 +21,7 @@ public:
         SceneUpdateKind updateKind = SceneUpdateKind::TopologyChanged);
     [[nodiscard]] EntityId duplicateEntity(EntityId id);
     bool deleteEntity(EntityId id);
+    bool deleteEntities(const std::vector<EntityId>& ids);
     bool reparentEntity(EntityId child, EntityId newParent);
     bool setVisibility(EntityId id, bool visible);
     bool setLocked(EntityId id, bool locked);

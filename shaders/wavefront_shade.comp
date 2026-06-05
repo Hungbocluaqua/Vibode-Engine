@@ -416,7 +416,7 @@ bool sample_wavefront_emissive_light(inout uint rng, vec3 hit_pos, out vec3 wi, 
 }
 
 bool sample_wavefront_sun_light(inout uint rng, out vec3 wi, out vec3 radiance, out float pdf_solid_angle) {
-    if (camera.sunlight_enabled == 0u) {
+    if (analytical_sun_visibility() <= 0.0) {
         wi = vec3(0.0, 1.0, 0.0);
         radiance = vec3(0.0);
         pdf_solid_angle = 0.0;
@@ -614,7 +614,9 @@ void main() {
     uint depth = sorted_input ? source_ray.pixel_depth_rng_flags.y : state.rng_depth_flags.y;
 
     if (!did_hit) {
-        vec3 env = environment_radiance(ray_dir, ATMOSPHERE_RAY_QUALITY_FULL);
+        vec3 env = depth == 0u
+            ? environment_background_radiance(ray_dir, ATMOSPHERE_RAY_QUALITY_FULL) * env_params.background_intensity
+            : environment_radiance(ray_dir, ATMOSPHERE_RAY_QUALITY_FULL);
         state.radiance.rgb += state.throughput.rgb * env;
         if (depth == 0u) {
             write_primary_gbuffer_miss(pixel_index, ray_dir, state.radiance.rgb);

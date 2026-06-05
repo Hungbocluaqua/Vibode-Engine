@@ -95,6 +95,8 @@ struct Light {
 
 struct Sun {
     bool enabled = true;
+    float elevation = 0.97f;
+    float azimuth = 3.14159265358979323846f;
     float illuminanceLux = 100000.0f;
     float exposureMultiplier = 1.0f;
     float angularRadiusRadians = 0.00465f;
@@ -144,9 +146,9 @@ struct SkyAtmosphere {
 };
 
 struct HeightFog {
-    bool enabled = false;
-    float density = 0.0f;
-    float heightFalloff = 0.2f;
+    bool enabled = true;
+    float density = 0.01f;
+    float heightFalloff = 2.0f;
     glm::vec3 color{0.65f, 0.72f, 0.85f};
 };
 
@@ -189,7 +191,7 @@ struct WorldSettings {
     EntityId skyAtmosphere{};
     EntityId heightFog{};
     EntityId postProcessVolume{};
-    bool atmosphereEnabled = true;
+    bool atmosphereEnabled = false;
     bool fogEnabled = false;
     bool postProcessEnabled = true;
 };

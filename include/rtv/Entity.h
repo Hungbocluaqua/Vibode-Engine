@@ -13,6 +13,9 @@ struct Entity {
     EntityId id{};
     uint64_t uuid = 0;
     std::string name;
+    std::string layer;
+    std::vector<std::string> tags;
+    std::vector<std::string> collections;
     Transform transform{};
     Transform defaultTransform{};
     EntityId parent{};

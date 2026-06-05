@@ -50,7 +50,7 @@ glm::vec3 scaleFromMatrix(const glm::mat4& matrix) {
     };
 }
 
-glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
+glm::mat3 rotationFromMatrix(const glm::mat4& matrix) {
     glm::vec3 scale = scaleFromMatrix(matrix);
     glm::mat3 rotation{matrix};
     if (scale.x > 0.0f) {
@@ -62,7 +62,39 @@ glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
     if (scale.z > 0.0f) {
         rotation[2] /= scale.z;
     }
+    return rotation;
+}
+
+glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
+    const glm::mat3 rotation = rotationFromMatrix(matrix);
     return glm::eulerAngles(glm::quat_cast(rotation));
+}
+
+bool directionValid(glm::vec3 direction) {
+    return glm::dot(direction, direction) > 1.0e-8f;
+}
+
+glm::mat3 cameraLookRotation(glm::vec3 forward) {
+    forward = glm::normalize(forward);
+    const glm::vec3 zAxis = -forward;
+    glm::vec3 xAxis = glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), zAxis);
+    if (!directionValid(xAxis)) {
+        xAxis = glm::cross(glm::vec3(0.0f, 0.0f, 1.0f), zAxis);
+    }
+    xAxis = glm::normalize(xAxis);
+    const glm::vec3 yAxis = glm::normalize(glm::cross(zAxis, xAxis));
+    return glm::mat3(xAxis, yAxis, zAxis);
+}
+
+glm::vec3 localEulerFromWorldRotation(const SceneRegistry& registry, const Entity& entity, const glm::mat3& worldRotation) {
+    glm::mat3 localRotation = worldRotation;
+    if (entity.parent.valid()) {
+        if (const Entity* parent = registry.entity(entity.parent)) {
+            const glm::mat3 parentWorldRotation = rotationFromMatrix(entityWorldMatrix(registry, *parent));
+            localRotation = glm::transpose(parentWorldRotation) * worldRotation;
+        }
+    }
+    return glm::eulerAngles(glm::normalize(glm::quat_cast(localRotation)));
 }
 
 Camera cameraFromSceneNode(const SceneNodeAsset& node) {
@@ -398,23 +430,32 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
             if (it != entitiesByName.end()) {
                 Entity* refEntity = registry_.entity(it->second);
                 if (refEntity == nullptr) continue;
-                glm::vec3 forward = glm::normalize(entity->transform.position - refEntity->transform.position);
+                const glm::mat4 refWorld = entityWorldMatrix(registry_, *refEntity);
+                const glm::mat4 targetWorld = entityWorldMatrix(registry_, *entity);
+                glm::vec3 forward = glm::vec3(targetWorld[3]) - glm::vec3(refWorld[3]);
+                if (!directionValid(forward)) {
+                    continue;
+                }
+                forward = glm::normalize(forward);
                 if (refEntity->camera.has_value()) {
-                    glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
-                    glm::vec3 up = glm::cross(forward, right);
-                    glm::mat3 rot;
-                    rot[0] = right;
-                    rot[1] = up;
-                    rot[2] = -forward;
-                    refEntity->transform.rotationEuler = glm::eulerAngles(glm::quat_cast(rot));
+                    glm::vec3 currentForward = rotationFromMatrix(refWorld) * glm::vec3(0.0f, 0.0f, -1.0f);
+                    if (directionValid(currentForward)) {
+                        currentForward = glm::normalize(currentForward);
+                        if (glm::dot(currentForward, forward) > 0.999f) {
+                            continue;
+                        }
+                    }
+                    refEntity->transform.rotationEuler = localEulerFromWorldRotation(
+                        registry_,
+                        *refEntity,
+                        cameraLookRotation(forward));
                     refEntity->defaultTransform = refEntity->transform;
                 } else if (refEntity->sun.has_value()) {
                     float elevation = 0.0f;
                     float azimuth = 0.0f;
                     SunController::anglesFromDirection(-forward, elevation, azimuth);
-                    refEntity->transform = SunController::transformFromWorldAngles(
-                        registry_, *refEntity, refEntity->transform, elevation, azimuth);
-                    refEntity->defaultTransform = refEntity->transform;
+                    refEntity->sun->elevation = elevation;
+                    refEntity->sun->azimuth = azimuth;
                 }
             }
         }
@@ -668,6 +709,10 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
             }
         }
         item["name"] = entity.name;
+        item["layer"] = entity.layer;
+        item["tags"] = entity.tags;
+        item["collections"] = entity.collections;
+        item["visible"] = entity.visible;
         item["locked"] = entity.locked;
         item["transform"] = transformJson(entity.transform);
         item["defaultTransform"] = transformJson(entity.defaultTransform);
@@ -727,6 +772,8 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         if (entity.sun.has_value()) {
             item["sun"] = {
                 {"enabled", entity.sun->enabled},
+                {"elevation", entity.sun->elevation},
+                {"azimuth", entity.sun->azimuth},
                 {"illuminanceLux", entity.sun->illuminanceLux},
                 {"exposureMultiplier", entity.sun->exposureMultiplier},
                 {"angularRadiusRadians", entity.sun->angularRadiusRadians},
@@ -1045,6 +1092,14 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         maxUuid = std::max(maxUuid, stable);
         idMap.emplace(stable, id);
         pendingParents.push_back({id, item.value("parent", uint64_t{0})});
+        entity->layer = item.value("layer", std::string{});
+        if (item.contains("tags") && item["tags"].is_array()) {
+            entity->tags = item["tags"].get<std::vector<std::string>>();
+        }
+        if (item.contains("collections") && item["collections"].is_array()) {
+            entity->collections = item["collections"].get<std::vector<std::string>>();
+        }
+        entity->visible = item.value("visible", true);
         entity->locked = item.value("locked", false);
 
         entity->transform = transformFromJson(item.value("transform", nlohmann::json::object()), entity->transform);
@@ -1105,6 +1160,9 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             const nlohmann::json& source = item["sun"];
             Sun sun;
             sun.enabled = source.value("enabled", sun.enabled);
+            const bool hasAuthoredAngles = source.contains("elevation") || source.contains("azimuth");
+            sun.elevation = source.value("elevation", sun.elevation);
+            sun.azimuth = source.value("azimuth", sun.azimuth);
             sun.illuminanceLux = source.value("illuminanceLux", sun.illuminanceLux);
             sun.exposureMultiplier = source.value("exposureMultiplier", sun.exposureMultiplier);
             sun.angularRadiusRadians = source.value("angularRadiusRadians", sun.angularRadiusRadians);
@@ -1114,6 +1172,9 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             sun.castVolumetricShadows = source.value("castVolumetricShadows", sun.castVolumetricShadows);
             sun.shadowBounces = source.value("shadowBounces", sun.shadowBounces);
             sun.volumetricShadowBounces = source.value("volumetricShadowBounces", sun.volumetricShadowBounces);
+            if (!hasAuthoredAngles) {
+                SunController::anglesFromWorldTransform(registry_, *entity, sun.elevation, sun.azimuth);
+            }
             entity->sun = sun;
         }
         if (item.contains("camera")) {

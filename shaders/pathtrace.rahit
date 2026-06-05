@@ -54,7 +54,7 @@ void main() {
     apply_material_alpha_texture(material, uv, uv1);
     material.alpha_factor *= clamp((v0.color * bary.x + v1.color * bary.y + v2.color * bary.z).a, 0.0, 1.0);
     if (payload.picking != 0u && material.alpha_mode == ALPHA_MODE_BLEND) {
-        if (material.alpha_factor < 0.5) {
+        if (!accept_material_alpha(material)) {
             record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
             ignoreIntersectionEXT;
         } else {
@@ -62,8 +62,7 @@ void main() {
         }
         return;
     }
-    uint alphaSeed = instanceIndex * 73856093u ^ globalTriangleIndex * 19349663u ^ uint(gl_LaunchIDEXT.x) * 83492791u ^ uint(gl_LaunchIDEXT.y);
-    if (!accept_material_alpha(material, alphaSeed)) {
+    if (!accept_material_alpha(material)) {
         record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
         ignoreIntersectionEXT;
         return;

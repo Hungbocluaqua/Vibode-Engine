@@ -64,6 +64,9 @@ struct AssetRecord {
     std::string importedPath;
     std::string cachePath;
     std::string thumbnailPath;
+    std::string importGroupId;
+    std::string importGroupName;
+    AssetGuid importRootGuid;
     std::vector<AssetDependency> dependencies;
     std::vector<AssetGuid> references;
     std::string sourceHash;
@@ -101,6 +104,7 @@ public:
     void markDirty(AssetRegistryDirtyReason reason);
     void clearDirty();
     void addOrReplaceRecord(AssetRecord record, AssetRegistryDirtyReason reason = AssetRegistryDirtyReason::AssetImported);
+    [[nodiscard]] size_t removeRecords(const std::vector<AssetGuid>& guids, AssetRegistryDirtyReason reason = AssetRegistryDirtyReason::AssetDeleted);
     [[nodiscard]] bool refreshRecordHealth(const std::filesystem::path& root, bool markDirtyOnChange = true);
 
 private:

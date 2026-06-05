@@ -19,6 +19,10 @@ public:
     void reset(PathTracerRenderer& renderer);
     void setPose(glm::vec3 position, glm::vec3 forward, PathTracerRenderer& renderer);
     void setMoveSpeed(float speed) { moveSpeed_ = speed; }
+    void setFastMoveSpeed(float speed) { fastMoveSpeed_ = speed; }
+    void setMouseSensitivity(float sensitivity) { mouseSensitivity_ = sensitivity; }
+    void setInvertLookX(bool invert) { invertLookX_ = invert; }
+    void setInvertLookY(bool invert) { invertLookY_ = invert; }
 
     [[nodiscard]] bool mouseCaptured() const { return mouseCaptured_; }
     [[nodiscard]] bool mouseCaptureMoved() const { return mouseCaptureMoved_; }
@@ -29,6 +33,10 @@ public:
     [[nodiscard]] float yawRadians() const { return yawRadians_; }
     [[nodiscard]] float pitchRadians() const { return pitchRadians_; }
     [[nodiscard]] float moveSpeed() const { return moveSpeed_; }
+    [[nodiscard]] float fastMoveSpeed() const { return fastMoveSpeed_; }
+    [[nodiscard]] float mouseSensitivity() const { return mouseSensitivity_; }
+    [[nodiscard]] bool invertLookX() const { return invertLookX_; }
+    [[nodiscard]] bool invertLookY() const { return invertLookY_; }
 
 private:
     void captureMouse(GLFWwindow* window);
@@ -40,6 +48,9 @@ private:
     float pitchRadians_ = 0.0f;
     float moveSpeed_ = 2.4f;
     float fastMoveSpeed_ = 7.5f;
+    float mouseSensitivity_ = 0.0025f;
+    bool invertLookX_ = false;
+    bool invertLookY_ = false;
     bool mouseCaptured_ = false;
     float mouseCaptureDurationSeconds_ = 0.0f;
     float releasedMouseCaptureDurationSeconds_ = -1.0f;

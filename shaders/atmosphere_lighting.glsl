@@ -10,6 +10,13 @@ vec3 analytical_sun_direction() {
     return normalize(vec3(cosElev * sin(sunAzimuth), sin(elevation), cosElev * cos(sunAzimuth)));
 }
 
+float analytical_sun_visibility() {
+    if (camera.sunlight_enabled == 0u) {
+        return 0.0;
+    }
+    return analytical_sun_direction().y > 0.0 ? 1.0 : 0.0;
+}
+
 float atmosphere_planet_horizon_visibility(vec3 scenePos, vec3 dir, float width) {
     vec3 planetary = atmosphere_scene_to_planetary(scenePos);
     float radius = max(length(planetary), ATMOSPHERE_PLANET_RADIUS + 1.0);
@@ -19,17 +26,17 @@ float atmosphere_planet_horizon_visibility(vec3 scenePos, vec3 dir, float width)
 }
 
 vec3 analytical_sun_center_radiance() {
-    if (camera.sunlight_enabled != 0u) {
-        float sunHeight = smoothstep(-0.08, 0.22, analytical_sun_direction().y);
-        vec3 sunsetTint = vec3(1.0, 0.58, 0.30);
-        vec3 noonTint = vec3(1.0, 0.96, 0.84);
-        return mix(sunsetTint, noonTint, sunHeight) * camera.sun_intensity * 28.0;
+    if (analytical_sun_visibility() <= 0.0) {
+        return vec3(0.0);
     }
-    return vec3(0.0);
+    float sunHeight = smoothstep(-0.08, 0.22, analytical_sun_direction().y);
+    vec3 sunsetTint = vec3(1.0, 0.58, 0.30);
+    vec3 noonTint = vec3(1.0, 0.96, 0.84);
+    return mix(sunsetTint, noonTint, sunHeight) * camera.sun_intensity * 28.0;
 }
 
 vec3 analytical_sun_disk_radiance(vec3 dir) {
-    if (camera.sunlight_enabled == 0u) {
+    if (analytical_sun_visibility() <= 0.0) {
         return vec3(0.0);
     }
     vec3 sunDir = analytical_sun_direction();
@@ -66,8 +73,9 @@ vec3 unreal_sky_grade(vec3 dir, vec3 physicalSky) {
     vec3 viewDir = normalize(dir);
     vec3 sunDir = analytical_sun_direction();
     float viewY = viewDir.y;
+    float activeSun = analytical_sun_visibility();
     float sunUp = clamp(sunDir.y, -0.12, 1.0);
-    float sunVisibility = smoothstep(-0.08, 0.08, sunUp);
+    float sunVisibility = activeSun * smoothstep(-0.08, 0.08, sunUp);
     float lowSun = 1.0 - smoothstep(0.18, 0.82, sunUp);
     float sunset = 1.0 - smoothstep(0.02, 0.34, sunUp);
     float horizonVisibility = atmosphere_planet_horizon_visibility(camera.pos.xyz, viewDir, 0.006);
@@ -99,10 +107,11 @@ vec3 unreal_sky_grade(vec3 dir, vec3 physicalSky) {
 vec3 fast_sky_radiance(vec3 dir) {
     vec3 viewDir = normalize(dir);
     vec3 sunDir = analytical_sun_direction();
+    float activeSun = analytical_sun_visibility();
     float viewUp = clamp(viewDir.y, -0.08, 1.0);
     float sunUp = clamp(sunDir.y, -0.08, 1.0);
     float cosTheta = clamp(dot(viewDir, sunDir), -1.0, 1.0);
-    float sunVisibility = smoothstep(-0.06, 0.08, sunUp);
+    float sunVisibility = activeSun * smoothstep(-0.06, 0.08, sunUp);
     float viewMass = atmosphere_air_mass(viewUp);
     float sunMass = atmosphere_air_mass(sunUp);
     float horizon = pow(1.0 - clamp(viewUp, 0.0, 1.0), 2.0);
@@ -160,6 +169,9 @@ vec3 atmosphere_sky_radiance(vec3 dir, uint quality) {
     vec3 viewDir = normalize(dir);
     if (quality == ATMOSPHERE_RAY_QUALITY_MINIMAL) {
         return vec3(0.0);
+    }
+    if (camera.sunlight_enabled == 0u) {
+        return fast_sky_radiance(viewDir);
     }
     if (quality == ATMOSPHERE_RAY_QUALITY_FAST) {
         return fast_sky_radiance(viewDir);

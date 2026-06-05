@@ -95,6 +95,19 @@ void applyVolumetricCloudPrototype(const VolumetricCloud& component, RendererSet
     settings.homogeneousVolumeAnisotropy = 0.35f;
 }
 
+void clearAbsentWorldEffects(RendererSettings& settings) {
+    settings.environmentEnabled = false;
+    settings.environmentIntensity = 0.0f;
+    settings.environmentBackgroundIntensity = 1.0f;
+    settings.skyIntensity = 0.0f;
+    settings.heightFogEnabled = false;
+    settings.heightFogDensity = 0.0f;
+    settings.homogeneousVolumeEnabled = false;
+    settings.homogeneousVolumeScattering = 0.0f;
+    settings.homogeneousVolumeAbsorption = 0.0f;
+    settings.homogeneousVolumeAnisotropy = 0.0f;
+}
+
 } // namespace
 
 SceneWorldComponentSelection selectSceneWorldComponents(const SceneDocument& document) {
@@ -128,6 +141,7 @@ SceneWorldComponentSelection selectSceneWorldComponents(const SceneDocument& doc
 void applySceneWorldComponentsToRendererSettings(const SceneDocument& document, RendererSettings& settings) {
     const SceneWorldComponentSelection selection = selectSceneWorldComponents(document);
     if (!selection.hasWorldComponents) {
+        clearAbsentWorldEffects(settings);
         return;
     }
 
@@ -139,7 +153,7 @@ void applySceneWorldComponentsToRendererSettings(const SceneDocument& document, 
     } else {
         settings.environmentEnabled = false;
         settings.environmentIntensity = 0.0f;
-        settings.environmentBackgroundIntensity = 0.0f;
+        settings.environmentBackgroundIntensity = 1.0f;
     }
 
     if (selection.skyAtmosphere != nullptr) {
@@ -193,6 +207,7 @@ void applySceneWorldComponentsToRendererSettings(const SceneDocument& document, 
 }
 
 void applySceneWorldComponentsToDocumentSettings(SceneDocument& document) {
+    const SceneWorldComponentSelection selection = selectSceneWorldComponents(document);
     RendererSettings settings;
     settings.environmentEnabled = document.environment().enabled;
     settings.environmentIntensity = document.environment().intensity;
@@ -236,6 +251,10 @@ void applySceneWorldComponentsToDocumentSettings(SceneDocument& document) {
     render.dofFocusDistance = settings.dofFocusDistance;
     render.saturation = settings.saturation;
     render.contrast = settings.contrast;
+
+    WorldSettings& world = document.worldSettings();
+    world.atmosphereEnabled = selection.skyAtmosphere != nullptr && selection.skyAtmosphere->enabled;
+    world.fogEnabled = selection.heightFog != nullptr && selection.heightFog->enabled && selection.heightFog->density > 0.0f;
 }
 
 } // namespace rtv

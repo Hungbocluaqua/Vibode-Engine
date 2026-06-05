@@ -56,6 +56,45 @@ std::filesystem::path defaultVibodeProjectRoot() {
     return std::filesystem::current_path() / "Vibode Projects";
 }
 
+std::filesystem::path defaultRenderOutputRoot(const EditorRuntimeState& state) {
+    if (state.project != nullptr) {
+        return state.project->savedRoot / "Renders";
+    }
+    return std::filesystem::current_path() / "out" / "editor_renders";
+}
+
+uint32_t editorImageAccumulationFrames(const PathTracerRenderer& renderer) {
+    const RendererSettings& settings = renderer.settings();
+    if (settings.accumulationLimit == 0u) {
+        return 64u;
+    }
+    const uint32_t effectiveSpp = std::max(1u, renderer.effectiveSamplesPerPixel());
+    return std::max(1u, (settings.accumulationLimit + effectiveSpp - 1u) / effectiveSpp);
+}
+
+VkExtent2D defaultRenderOutputExtent(const EditorRuntimeState& state) {
+    VkExtent2D extent = state.renderer.displayExtent();
+    if (state.viewport.displayExtent.width > 0u && state.viewport.displayExtent.height > 0u) {
+        extent = state.viewport.displayExtent;
+    }
+    if ((extent.width == 0u || extent.height == 0u) && state.swapchainExtent.width > 0u && state.swapchainExtent.height > 0u) {
+        extent = state.swapchainExtent;
+    }
+    if (extent.width == 0u || extent.height == 0u) {
+        extent = VkExtent2D{1280u, 720u};
+    }
+    return extent;
+}
+
+constexpr int kMaxRenderTargetSamplesPerPixel = 1048576;
+constexpr int kMaxRenderAccumulationFrames = 65536;
+
+int ceilDividePositive(int value, int divisor) {
+    value = std::max(1, value);
+    divisor = std::max(1, divisor);
+    return (value + divisor - 1) / divisor;
+}
+
 std::string lowerExtension(const std::filesystem::path& path) {
     std::string ext = path.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
@@ -163,6 +202,27 @@ std::string droppedFileQueueSummaryText(const std::vector<std::filesystem::path>
     appendDroppedFileQueueSummaryPart(text, summary.policyDisabled, "disabled", "disabled");
     appendDroppedFileQueueSummaryPart(text, summary.unsupported, "unsupported", "unsupported");
     return text;
+}
+
+std::string projectRelativeDisplayPath(const std::filesystem::path& path, const ProjectContext& project) {
+    if (path.empty()) {
+        return "(none)";
+    }
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(path, project.projectRoot, ec);
+    if (!ec && !relative.empty()) {
+        bool escapesProject = false;
+        for (const std::filesystem::path& part : relative) {
+            if (part == "..") {
+                escapesProject = true;
+                break;
+            }
+        }
+        if (!escapesProject) {
+            return relative.generic_string();
+        }
+    }
+    return path.string();
 }
 
 const char* droppedFileQueueCategoryLabel(const std::filesystem::path& path) {
@@ -987,14 +1047,16 @@ bool projectManagerCard(
 EditorGlyphIcon projectTemplateGlyph(int templateIndex) {
     switch (templateIndex) {
     case 1:
-        return EditorGlyphIcon::Light;
+        return EditorGlyphIcon::ViewSettings;
     case 2:
-        return EditorGlyphIcon::Environment;
+        return EditorGlyphIcon::Light;
     case 3:
-        return EditorGlyphIcon::SceneFile;
+        return EditorGlyphIcon::Environment;
     case 4:
-        return EditorGlyphIcon::Stats;
+        return EditorGlyphIcon::SceneFile;
     case 5:
+        return EditorGlyphIcon::Stats;
+    case 6:
         return EditorGlyphIcon::Camera;
     default:
         return EditorGlyphIcon::ProjectFile;
@@ -1018,6 +1080,10 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     state.log = &log_;
     state.timeline = &timeline_;
     ImGui::GetIO().FontGlobalScale = std::clamp(editorPrefs_.uiScale, 0.75f, 1.75f);
+    if (state.sceneDocument != nullptr && selection_.entityId().valid() &&
+        state.sceneDocument->registry().entity(selection_.entityId()) == nullptr) {
+        selection_.clear();
+    }
     ImGuiIO& io = ImGui::GetIO();
     const EditorKeybinding commandPaletteBinding = editorCommandKeybinding(EditorCommandId::CommandPalette, &editorPrefs_);
     if (!io.WantTextInput && commandPaletteBinding.imguiKey >= 0 &&
@@ -1026,6 +1092,9 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
         commandPaletteBinding.alt == io.KeyAlt &&
         ImGui::IsKeyPressed(static_cast<ImGuiKey>(commandPaletteBinding.imguiKey))) {
         commandPaletteOpen_ = true;
+    }
+    if (io.KeyCtrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+        (void)executeCommandPaletteCommand(io.KeyShift ? EditorCommandId::SaveAll : EditorCommandId::SaveScene, state, requests);
     }
     applyThemePreset();
     applyWorkspacePreset();
@@ -1077,6 +1146,7 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     if (requests.showInspector) {
         visibility_.inspector = true;
     }
+    drawRenderSettingsDialog(state, requests);
     const bool projectManagerGateActive = showProjectManager_ || (state.project == nullptr && !projectManagerDismissed_);
     if (projectManagerGateActive) {
         drawProjectManager(ProjectManagerRuntimeState{
@@ -1101,6 +1171,9 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     if (projectManagerGateActive && state.project == nullptr) {
         drawCommandPalette(state, requests);
         drawDroppedFileActionPopup(state, requests);
+        if (requests.renderImage || requests.renderSequence) {
+            drawRenderSettingsDialog(state, requests);
+        }
         dockspace_.end(visibility_, requests);
         return requests;
     }
@@ -1161,6 +1234,24 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     applyCaptureFocusOverride();
     drawCommandPalette(state, requests);
     drawDroppedFileActionPopup(state, requests);
+    drawDeleteEntityConfirmation(state, requests);
+    if (requests.renderImage || requests.renderSequence) {
+        drawRenderSettingsDialog(state, requests);
+    }
+    const bool deleteSelection = [&] {
+        if (requests.deleteEntity.has_value() && selection_.isSelected(*requests.deleteEntity)) {
+            return true;
+        }
+        for (EntityId id : requests.deleteEntities) {
+            if (selection_.isSelected(id)) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    if (deleteSelection) {
+        selection_.clear();
+    }
 
     dockspace_.end(visibility_, requests);
     return requests;
@@ -1320,6 +1411,84 @@ void EditorLayer::drawRecoveryPrompt(EditorRequests& requests) {
     }
 }
 
+void EditorLayer::drawDeleteEntityConfirmation(const EditorRuntimeState& state, EditorRequests& requests) {
+    if (requests.deleteEntity.has_value() && editorPrefs_.confirmDelete) {
+        pendingDeleteEntity_ = *requests.deleteEntity;
+        pendingDeleteEntities_.clear();
+        pendingDeleteEntityName_.clear();
+        if (state.sceneDocument != nullptr) {
+            if (const Entity* entity = state.sceneDocument->registry().entity(pendingDeleteEntity_)) {
+                pendingDeleteEntityName_ = entity->name.empty() ? "Entity" : entity->name;
+            }
+        }
+        requests.deleteEntity.reset();
+        requests.sceneUpdate.reset();
+        deleteEntityConfirmOpen_ = true;
+        ImGui::OpenPopup("Confirm Delete Entity");
+    }
+    if (!requests.deleteEntities.empty() && editorPrefs_.confirmDelete) {
+        if (requests.deleteEntities.size() == 1) {
+            pendingDeleteEntity_ = requests.deleteEntities.front();
+            pendingDeleteEntities_.clear();
+            pendingDeleteEntityName_.clear();
+            if (state.sceneDocument != nullptr) {
+                if (const Entity* entity = state.sceneDocument->registry().entity(pendingDeleteEntity_)) {
+                    pendingDeleteEntityName_ = entity->name.empty() ? "Entity" : entity->name;
+                }
+            }
+        } else {
+            pendingDeleteEntity_ = {};
+            pendingDeleteEntities_ = requests.deleteEntities;
+            pendingDeleteEntityName_ = std::to_string(pendingDeleteEntities_.size()) + " entities";
+        }
+        requests.deleteEntities.clear();
+        requests.sceneUpdate.reset();
+        deleteEntityConfirmOpen_ = true;
+        ImGui::OpenPopup("Confirm Delete Entity");
+    }
+
+    if (!deleteEntityConfirmOpen_) {
+        return;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("Confirm Delete Entity", &deleteEntityConfirmOpen_, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const char* entityName = pendingDeleteEntityName_.empty() ? "selected entity" : pendingDeleteEntityName_.c_str();
+        ImGui::TextWrapped("Delete %s?", entityName);
+        ImGui::Spacing();
+
+        bool confirmDelete = editorPrefs_.confirmDelete;
+        if (ImGui::Checkbox("Confirm entity deletes", &confirmDelete)) {
+            editorPrefs_.confirmDelete = confirmDelete;
+            editorPrefs_.save(EditorPreferences::defaultPath());
+        }
+
+        ImGui::Separator();
+        if (editorIconTextButton("ConfirmDeleteEntity", EditorGlyphIcon::Trash, "Delete")) {
+            if (pendingDeleteEntity_.valid()) {
+                requests.deleteEntity = pendingDeleteEntity_;
+            }
+            if (!pendingDeleteEntities_.empty()) {
+                requests.deleteEntities = pendingDeleteEntities_;
+            }
+            pendingDeleteEntity_ = {};
+            pendingDeleteEntities_.clear();
+            pendingDeleteEntityName_.clear();
+            deleteEntityConfirmOpen_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (editorIconTextButton("CancelDeleteEntity", EditorGlyphIcon::Exit, "Cancel")) {
+            pendingDeleteEntity_ = {};
+            pendingDeleteEntities_.clear();
+            pendingDeleteEntityName_.clear();
+            deleteEntityConfirmOpen_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 void EditorLayer::drawSceneLoadingOverlay(const EditorRuntimeState& state, EditorRequests& requests) {
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 72.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
@@ -1336,6 +1505,160 @@ void EditorLayer::drawSceneLoadingOverlay(const EditorRuntimeState& state, Edito
         }
         if (ImGui::Button("Cancel")) {
             requests.cancelSceneLoad = true;
+        }
+    }
+    ImGui::End();
+}
+
+void EditorLayer::openRenderSettingsDialog(EditorRenderJobKind kind, const EditorRuntimeState& state) {
+    pendingRenderKind_ = kind == EditorRenderJobKind::Sequence ? EditorRenderJobKind::Sequence : EditorRenderJobKind::Image;
+    const VkExtent2D extent = defaultRenderOutputExtent(state);
+    renderRequestedWidth_ = static_cast<int>(std::clamp(extent.width, 1u, 16384u));
+    renderRequestedHeight_ = static_cast<int>(std::clamp(extent.height, 1u, 16384u));
+
+    const RendererSettings settings = state.renderer.settings();
+    renderResolutionScale_ = std::clamp(settings.renderResolutionScale, 0.25f, 1.0f);
+    renderSamplesPerPixel_ = static_cast<int>(std::clamp(settings.samplesPerPixel, 1u, kMaxSamplesPerPixel));
+    renderLimitSamplesPerPixel_ = false;
+    renderImageAccumulationFrames_ = static_cast<int>(std::clamp(editorImageAccumulationFrames(state.renderer), 1u, 4096u));
+
+    if (state.timeline != nullptr) {
+        renderSequenceStartFrame_ = state.timeline->startFrame;
+        renderSequenceEndFrame_ = state.timeline->endFrame;
+    } else {
+        renderSequenceStartFrame_ = 0;
+        renderSequenceEndFrame_ = 0;
+    }
+    if (state.editorPrefs != nullptr) {
+        renderSequenceFramesPerTimelineFrame_ = std::clamp(state.editorPrefs->renderSequenceFramesPerTimelineFrame, 1, 512);
+    } else {
+        renderSequenceFramesPerTimelineFrame_ = 1;
+    }
+    const int effectiveSpp = renderLimitSamplesPerPixel_ ? 1 : std::max(1, renderSamplesPerPixel_);
+    const int defaultFrames = pendingRenderKind_ == EditorRenderJobKind::Sequence
+        ? renderSequenceFramesPerTimelineFrame_
+        : renderImageAccumulationFrames_;
+    renderTargetSamplesPerPixel_ = std::clamp(defaultFrames * effectiveSpp, 1, kMaxRenderTargetSamplesPerPixel);
+    renderSaveSequenceFramesAsDefault_ = false;
+    copyTextToBuffer(renderOutputRoot_, defaultRenderOutputRoot(state).string());
+
+    renderSettingsDialogOpen_ = true;
+}
+
+void EditorLayer::drawRenderSettingsDialog(EditorRuntimeState& state, EditorRequests& requests) {
+    if (requests.renderImage) {
+        requests.renderImage = false;
+        openRenderSettingsDialog(EditorRenderJobKind::Image, state);
+    }
+    if (requests.renderSequence) {
+        requests.renderSequence = false;
+        openRenderSettingsDialog(EditorRenderJobKind::Sequence, state);
+    }
+    if (!renderSettingsDialogOpen_) {
+        return;
+    }
+
+    const bool sequence = pendingRenderKind_ == EditorRenderJobKind::Sequence;
+    const char* windowTitle = sequence ? "Render Sequence" : "Render Image";
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::Begin(windowTitle, &renderSettingsDialogOpen_, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(sequence ? "Sequence Output" : "Image Output");
+        ImGui::Separator();
+
+        ImGui::SetNextItemWidth(420.0f);
+        ImGui::InputText("Output Folder", renderOutputRoot_.data(), renderOutputRoot_.size());
+        ImGui::SameLine();
+        if (editorIconTextButton("RenderSettingsBrowseOutput", EditorGlyphIcon::Folder, "Browse")) {
+            if (auto folder = openFolderDialog(L"Select Render Output Folder")) {
+                copyTextToBuffer(renderOutputRoot_, folder->string());
+            }
+        }
+
+        ImGui::SeparatorText("Output");
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::DragInt("Width", &renderRequestedWidth_, 16.0f, 1, 16384);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::DragInt("Height", &renderRequestedHeight_, 16.0f, 1, 16384);
+        renderRequestedWidth_ = std::clamp(renderRequestedWidth_, 1, 16384);
+        renderRequestedHeight_ = std::clamp(renderRequestedHeight_, 1, 16384);
+
+        ImGui::SliderFloat("Render Scale", &renderResolutionScale_, 0.25f, 1.0f, "%.2f");
+        renderResolutionScale_ = std::clamp(renderResolutionScale_, 0.25f, 1.0f);
+        ImGui::TextDisabled("Internal render: %ux%u", 
+            std::max(1u, static_cast<uint32_t>(static_cast<float>(renderRequestedWidth_) * renderResolutionScale_)),
+            std::max(1u, static_cast<uint32_t>(static_cast<float>(renderRequestedHeight_) * renderResolutionScale_)));
+
+        ImGui::SeparatorText("Sampling");
+        ImGui::SetNextItemWidth(120.0f);
+        ImGui::DragInt("SPP / Frame", &renderSamplesPerPixel_, 1.0f, 1, static_cast<int>(kMaxSamplesPerPixel));
+        renderSamplesPerPixel_ = std::clamp(renderSamplesPerPixel_, 1, static_cast<int>(kMaxSamplesPerPixel));
+        ImGui::SameLine();
+        ImGui::Checkbox("Limit to 1 SPP", &renderLimitSamplesPerPixel_);
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::DragInt("Target SPP", &renderTargetSamplesPerPixel_, 8.0f, 1, kMaxRenderTargetSamplesPerPixel);
+        renderTargetSamplesPerPixel_ = std::clamp(renderTargetSamplesPerPixel_, 1, kMaxRenderTargetSamplesPerPixel);
+        const int effectiveSpp = renderLimitSamplesPerPixel_ ? 1 : std::max(1, renderSamplesPerPixel_);
+        const int derivedFrames = std::clamp(
+            ceilDividePositive(renderTargetSamplesPerPixel_, effectiveSpp),
+            1,
+            kMaxRenderAccumulationFrames);
+        if (sequence) {
+            renderSequenceFramesPerTimelineFrame_ = derivedFrames;
+        } else {
+            renderImageAccumulationFrames_ = derivedFrames;
+        }
+        ImGui::TextDisabled("Effective per-frame SPP: %d | Accumulation frames: %d | Final target: %d SPP",
+            effectiveSpp,
+            derivedFrames,
+            derivedFrames * effectiveSpp);
+
+        if (sequence) {
+            ImGui::SeparatorText("Timeline");
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::DragInt("Start Frame", &renderSequenceStartFrame_, 1.0f, 0, renderSequenceEndFrame_);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::DragInt("End Frame", &renderSequenceEndFrame_, 1.0f, renderSequenceStartFrame_, 100000);
+            if (renderSequenceEndFrame_ < renderSequenceStartFrame_) {
+                renderSequenceEndFrame_ = renderSequenceStartFrame_;
+            }
+            ImGui::TextDisabled("Frames per timeline frame: %d", renderSequenceFramesPerTimelineFrame_);
+            const bool canSaveSequenceFramesDefault = renderSequenceFramesPerTimelineFrame_ <= 512;
+            if (!canSaveSequenceFramesDefault) {
+                renderSaveSequenceFramesAsDefault_ = false;
+                ImGui::BeginDisabled();
+            }
+            ImGui::Checkbox("Save frames per timeline frame as default", &renderSaveSequenceFramesAsDefault_);
+            if (!canSaveSequenceFramesDefault) {
+                ImGui::EndDisabled();
+                ImGui::TextDisabled("Timeline defaults are capped at 512 frames; this render job can still use %d.", renderSequenceFramesPerTimelineFrame_);
+            }
+        }
+
+        ImGui::Separator();
+        const char* renderLabel = sequence ? "Render Sequence" : "Render Image";
+        if (editorIconTextButton("RenderSettingsStart", EditorGlyphIcon::Render, renderLabel)) {
+            EditorRenderRequest request{};
+            request.kind = pendingRenderKind_;
+            request.outputRoot = std::filesystem::path(renderOutputRoot_.data());
+            request.requestedWidth = static_cast<uint32_t>(renderRequestedWidth_);
+            request.requestedHeight = static_cast<uint32_t>(renderRequestedHeight_);
+            request.renderResolutionScale = std::clamp(renderResolutionScale_, 0.25f, 1.0f);
+            request.samplesPerPixel = static_cast<uint32_t>(renderSamplesPerPixel_);
+            request.limitSamplesPerPixel = renderLimitSamplesPerPixel_;
+            request.targetSamplesPerPixel = static_cast<uint32_t>(renderTargetSamplesPerPixel_);
+            request.imageAccumulationFrames = static_cast<uint32_t>(renderImageAccumulationFrames_);
+            request.sequenceStartFrame = renderSequenceStartFrame_;
+            request.sequenceEndFrame = std::max(renderSequenceStartFrame_, renderSequenceEndFrame_);
+            request.sequenceFramesPerTimelineFrame = static_cast<uint32_t>(renderSequenceFramesPerTimelineFrame_);
+            request.saveSequenceFramesAsDefault = renderSaveSequenceFramesAsDefault_;
+            requests.renderRequest = std::move(request);
+            renderSettingsDialogOpen_ = false;
+        }
+        ImGui::SameLine();
+        if (editorIconTextButton("RenderSettingsCancel", EditorGlyphIcon::Exit, "Cancel")) {
+            renderSettingsDialogOpen_ = false;
         }
     }
     ImGui::End();
@@ -1441,16 +1764,18 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         return;
     }
 
-    const char* templates[] = {"Empty", "Basic Lit", "Outdoor / Atmosphere", "Interior", "Path Tracing Validation", "Cinematic"};
+    const char* templates[] = {"Empty", "Runtime Viewer", "Basic Lit", "Outdoor / Atmosphere", "Interior", "Path Tracing Validation", "Cinematic"};
     const char* templateDescriptions[] = {
         "Folders only",
+        "Viewport-first runtime setup",
         "Camera, sun, environment",
         "Sky, fog, atmosphere",
         "Area lighting setup",
         "Deterministic validation scene",
         "Camera and post process"
     };
-    newProjectTemplate_ = std::clamp(newProjectTemplate_, 0, 5);
+    constexpr int templateCount = IM_ARRAYSIZE(templates);
+    newProjectTemplate_ = std::clamp(newProjectTemplate_, 0, templateCount - 1);
 
     ImGui::TextUnformatted("Vibode Engine");
     ImGui::SameLine();
@@ -1531,6 +1856,13 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
                 }
                 if (ImGui::MenuItem("Remove from Recent")) {
                     editorPrefs_.removeRecentProject(project);
+                    editorPrefs_.save(EditorPreferences::defaultPath());
+                }
+                if (ImGui::MenuItem("Delete Project...", nullptr, false, !missing)) {
+                    pendingDeleteProjectFile_ = projectPath;
+                    deleteProjectFiles_ = true;
+                    deleteProjectConfirmOpen_ = true;
+                    ImGui::OpenPopup("Delete Project##ProjectManager");
                 }
                 ImGui::EndPopup();
             }
@@ -1555,7 +1887,7 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         }
     } else if (projectManagerSection_ == 1) {
         ImGui::SeparatorText("Templates");
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < templateCount; ++i) {
             ImGui::PushID(i);
             if (projectManagerCard(templates[i], templateDescriptions[i], newProjectTemplate_ == i, ImVec2(EditorUiMetric::projectTemplateCardWidth, 120.0f), projectTemplateGlyph(i), newProjectTemplate_ == i ? "Selected" : "Template")) {
                 newProjectTemplate_ = i;
@@ -1626,14 +1958,33 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         ImGui::SeparatorText("Recent Projects");
         for (size_t i = 0; i < editorPrefs_.recentProjects.size(); ++i) {
             const std::string& project = editorPrefs_.recentProjects[i];
-            const bool missing = !std::filesystem::exists(project);
+            const std::filesystem::path projectPath(project);
+            const bool missing = !std::filesystem::exists(projectPath);
             ImGui::PushID(static_cast<int>(i + 1000));
-            if (ImGui::Selectable(std::filesystem::path(project).filename().string().c_str(), false, 0, ImVec2(0.0f, 28.0f)) && !missing) {
-                requests.openProject = OpenProjectRequest{project};
+            if (ImGui::Selectable(projectPath.filename().string().c_str(), false, 0, ImVec2(0.0f, 28.0f)) && !missing) {
+                requests.openProject = OpenProjectRequest{projectPath};
             }
             if (missing) {
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.25f, 1.0f), "missing");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove")) {
+                    editorPrefs_.removeRecentProject(project);
+                    editorPrefs_.save(EditorPreferences::defaultPath());
+                }
+            } else {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove")) {
+                    editorPrefs_.removeRecentProject(project);
+                    editorPrefs_.save(EditorPreferences::defaultPath());
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Delete...")) {
+                    pendingDeleteProjectFile_ = projectPath;
+                    deleteProjectFiles_ = true;
+                    deleteProjectConfirmOpen_ = true;
+                    ImGui::OpenPopup("Delete Project##ProjectManager");
+                }
             }
             ImGui::PopID();
         }
@@ -1749,6 +2100,33 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         bool autosaveEnabled = state.project->autosaveEnabled;
         int autosaveIntervalMinutes = state.project->autosaveIntervalMinutes;
         bool settingsChanged = false;
+        ImGui::TextUnformatted("Default Level");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", projectRelativeDisplayPath(state.project->startupScene, *state.project).c_str());
+        const bool startupSceneExists = !state.project->startupScene.empty() && std::filesystem::exists(state.project->startupScene);
+        if (!startupSceneExists) {
+            ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.25f, 1.0f), "Default level file is missing.");
+        }
+        const bool hasCurrentLevel = state.scenePath != nullptr && state.scenePath->has_value() && !state.scenePath->value().empty();
+        if (!hasCurrentLevel) {
+            ImGui::BeginDisabled();
+        }
+        if (editorIconTextButton("UseCurrentLevelAsDefault", EditorGlyphIcon::SceneFile, "Use Current Level")) {
+            ProjectContext next = *state.project;
+            next.startupScene = **state.scenePath;
+            requests.projectSettingsUpdate = next;
+        }
+        if (!hasCurrentLevel) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (editorIconTextButton("BrowseDefaultLevel", EditorGlyphIcon::Folder, "Browse")) {
+            if (auto path = openSceneJsonFileDialog()) {
+                ProjectContext next = *state.project;
+                next.startupScene = *path;
+                requests.projectSettingsUpdate = next;
+            }
+        }
         settingsChanged |= ImGui::Checkbox("Autosave Enabled", &autosaveEnabled);
         settingsChanged |= ImGui::DragInt("Autosave Interval Minutes", &autosaveIntervalMinutes, 1.0f, 1, 120);
         if (settingsChanged) {
@@ -1774,11 +2152,42 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         editorPrefs_.themePreset = themePreset;
         prefsChanged = true;
     }
-    const char* workspaceItems[] = {"Level Editing", "Lighting", "Content"};
-    int workspacePreset = std::clamp(editorPrefs_.workspacePreset, 0, 2);
-    if (ImGui::Combo("Workspace", &workspacePreset, workspaceItems, IM_ARRAYSIZE(workspaceItems))) {
-        editorPrefs_.workspacePreset = workspacePreset;
-        prefsChanged = true;
+    const char* workspaceItems[] = {"Level Editing", "Lighting", "Content", "Runtime Viewer"};
+    if (projectWorkspacePreset_ >= 0) {
+        int workspacePreset = std::clamp(projectWorkspacePreset_, 0, 3);
+        if (ImGui::Combo("Workspace##ProjectOverride", &workspacePreset, workspaceItems, IM_ARRAYSIZE(workspaceItems))) {
+            setProjectWorkspacePreset(workspacePreset);
+            if (state.project != nullptr) {
+                ProjectContext next = *state.project;
+                next.preferredWorkspacePreset = workspacePreset;
+                requests.projectSettingsUpdate = next;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Use Global")) {
+            clearProjectWorkspacePreset();
+            if (state.project != nullptr) {
+                ProjectContext next = *state.project;
+                next.preferredWorkspacePreset = -1;
+                requests.projectSettingsUpdate = next;
+            }
+        }
+        ImGui::TextDisabled("Using this project's preferred workspace. Global default is unchanged.");
+    } else {
+        int workspacePreset = std::clamp(editorPrefs_.workspacePreset, 0, 3);
+        if (ImGui::Combo("Workspace", &workspacePreset, workspaceItems, IM_ARRAYSIZE(workspaceItems))) {
+            editorPrefs_.workspacePreset = workspacePreset;
+            prefsChanged = true;
+        }
+        if (state.project != nullptr) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Use For Project")) {
+                setProjectWorkspacePreset(workspacePreset);
+                ProjectContext next = *state.project;
+                next.preferredWorkspacePreset = workspacePreset;
+                requests.projectSettingsUpdate = next;
+            }
+        }
     }
     prefsChanged |= ImGui::DragInt("Layout Version", &editorPrefs_.layoutVersion, 1.0f, 1, 99);
     if (prefsChanged) {
@@ -1786,6 +2195,31 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         editorPrefs_.save(EditorPreferences::defaultPath());
         applyThemePreset();
         applyWorkspacePreset();
+    }
+
+    if (deleteProjectConfirmOpen_) {
+        ImGui::OpenPopup("Delete Project##ProjectManager");
+    }
+    if (ImGui::BeginPopupModal("Delete Project##ProjectManager", &deleteProjectConfirmOpen_, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("Delete project '%s'?", pendingDeleteProjectFile_.stem().string().c_str());
+        ImGui::TextWrapped("Project file: %s", pendingDeleteProjectFile_.string().c_str());
+        ImGui::Checkbox("Delete project files from disk", &deleteProjectFiles_);
+        ImGui::Separator();
+        if (editorIconTextButton("ConfirmDeleteProject", EditorGlyphIcon::Trash, "Delete")) {
+            requests.deleteProject = DeleteProjectRequest{.projectFile = pendingDeleteProjectFile_, .deleteFiles = deleteProjectFiles_};
+            pendingDeleteProjectFile_.clear();
+            deleteProjectFiles_ = false;
+            deleteProjectConfirmOpen_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (editorIconTextButton("CancelDeleteProject", EditorGlyphIcon::Exit, "Cancel")) {
+            pendingDeleteProjectFile_.clear();
+            deleteProjectFiles_ = false;
+            deleteProjectConfirmOpen_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::End();
@@ -1864,18 +2298,43 @@ void EditorLayer::applyThemePreset() {
     }
 }
 
+void EditorLayer::setProjectWorkspacePreset(int preset) {
+    const int clamped = std::clamp(preset, 0, 3);
+    if (projectWorkspacePreset_ == clamped) {
+        return;
+    }
+    projectWorkspacePreset_ = clamped;
+    appliedWorkspacePreset_ = -1;
+    applyWorkspacePreset();
+}
+
+void EditorLayer::clearProjectWorkspacePreset() {
+    if (projectWorkspacePreset_ < 0) {
+        return;
+    }
+    projectWorkspacePreset_ = -1;
+    appliedWorkspacePreset_ = -1;
+    applyWorkspacePreset();
+}
+
+int EditorLayer::effectiveWorkspacePreset() const {
+    return projectWorkspacePreset_ >= 0
+        ? std::clamp(projectWorkspacePreset_, 0, 3)
+        : std::clamp(editorPrefs_.workspacePreset, 0, 3);
+}
+
 void EditorLayer::applyWorkspacePreset() {
-    const int preset = std::clamp(editorPrefs_.workspacePreset, 0, 2);
+    const int preset = effectiveWorkspacePreset();
     if (appliedWorkspacePreset_ == preset) {
         return;
     }
     appliedWorkspacePreset_ = preset;
     visibility_.viewport = true;
-    visibility_.sceneHierarchy = true;
-    visibility_.inspector = true;
-    visibility_.assetBrowser = true;
-    visibility_.timeline = true;
-    visibility_.log = true;
+    visibility_.sceneHierarchy = preset != 3;
+    visibility_.inspector = preset != 3;
+    visibility_.assetBrowser = preset != 3;
+    visibility_.timeline = preset == 0;
+    visibility_.log = preset != 3;
     visibility_.console = false;
     visibility_.materialEditor = preset == 2;
     visibility_.renderSettings = preset != 2;
@@ -2143,7 +2602,7 @@ void EditorLayer::drawTimelinePanel(EditorRuntimeState& state, EditorRequests& r
     ImGui::SameLine();
     if (editorIconTextButton("TimelineRenderSequence", EditorGlyphIcon::Render, "Render Sequence")) {
         requests.renderSequence = true;
-        log_.add(EditorLogCategory::Command, "Render sequence queued from Timeline");
+        log_.add(EditorLogCategory::Command, "Render sequence settings opened from Timeline");
     }
     timelineIconTooltip("Queue a render sequence using the current timeline range");
     if (sequenceChanged) {

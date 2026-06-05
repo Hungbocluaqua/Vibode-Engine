@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <string_view>
 #include <unordered_set>
 
 #include <nlohmann/json.hpp>
@@ -79,6 +80,12 @@ uint64_t writeStamp(const std::filesystem::path& path) {
 }
 
 bool assetRecordSaveLess(const AssetRecord& lhs, const AssetRecord& rhs) {
+    if (lhs.importGroupName != rhs.importGroupName) return lhs.importGroupName < rhs.importGroupName;
+    if (lhs.importGroupId != rhs.importGroupId) return lhs.importGroupId < rhs.importGroupId;
+    if (lhs.importRootGuid != rhs.importRootGuid) return lhs.importRootGuid < rhs.importRootGuid;
+    if ((lhs.guid == lhs.importRootGuid) != (rhs.guid == rhs.importRootGuid)) return lhs.guid == lhs.importRootGuid;
+    if (lhs.type != rhs.type) return std::string_view(assetTypeName(lhs.type)) < std::string_view(assetTypeName(rhs.type));
+    if (lhs.displayName != rhs.displayName) return lhs.displayName < rhs.displayName;
     if (lhs.guid != rhs.guid) return lhs.guid < rhs.guid;
     if (lhs.importedPath != rhs.importedPath) return lhs.importedPath < rhs.importedPath;
     return lhs.displayName < rhs.displayName;
@@ -193,6 +200,9 @@ bool AssetRegistry::load(const std::filesystem::path& path, std::string* error) 
                 record.importedPath = item.value("importedPath", std::string{});
                 record.cachePath = item.value("cachePath", std::string{});
                 record.thumbnailPath = item.value("thumbnailPath", std::string{});
+                record.importGroupId = item.value("importGroupId", std::string{});
+                record.importGroupName = item.value("importGroupName", std::string{});
+                record.importRootGuid = item.value("importRootGuid", std::string{});
                 record.sourceHash = item.value("sourceHash", std::string{});
                 record.importedHash = item.value("importedHash", std::string{});
                 record.importSettingsHash = item.value("importSettingsHash", std::string{});
@@ -274,6 +284,9 @@ bool AssetRegistry::save(const std::filesystem::path& path) const {
             {"importedPath", record.importedPath},
             {"cachePath", record.cachePath},
             {"thumbnailPath", record.thumbnailPath},
+            {"importGroupId", record.importGroupId},
+            {"importGroupName", record.importGroupName},
+            {"importRootGuid", record.importRootGuid},
             {"dependencies", dependencies},
             {"references", sortedReferences},
             {"sourceHash", record.sourceHash},
@@ -327,6 +340,31 @@ void AssetRegistry::addOrReplaceRecord(AssetRecord record, AssetRegistryDirtyRea
         records_.push_back(std::move(record));
     }
     markDirty(reason);
+}
+
+size_t AssetRegistry::removeRecords(const std::vector<AssetGuid>& guids, AssetRegistryDirtyReason reason) {
+    if (guids.empty()) {
+        return 0;
+    }
+    std::unordered_set<AssetGuid> targets;
+    targets.reserve(guids.size());
+    for (const AssetGuid& guid : guids) {
+        if (!guid.empty()) {
+            targets.insert(guid);
+        }
+    }
+    if (targets.empty()) {
+        return 0;
+    }
+    const size_t before = records_.size();
+    records_.erase(std::remove_if(records_.begin(), records_.end(), [&](const AssetRecord& record) {
+        return targets.find(record.guid) != targets.end();
+    }), records_.end());
+    const size_t removed = before - records_.size();
+    if (removed > 0) {
+        markDirty(reason);
+    }
+    return removed;
 }
 
 bool AssetRegistry::refreshRecordHealth(const std::filesystem::path& root, bool markDirtyOnChange) {

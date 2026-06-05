@@ -19,6 +19,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <glm/gtc/quaternion.hpp>
+
 namespace rtv {
 
 namespace {
@@ -65,6 +67,51 @@ std::string projectRelativePathOrEmpty(const std::filesystem::path& path, const 
         }
     }
     return relative.generic_string();
+}
+
+nlohmann::json vec3Json(glm::vec3 value) {
+    return nlohmann::json::array({value.x, value.y, value.z});
+}
+
+glm::vec3 scaleFromMatrix(const glm::mat4& matrix) {
+    return {
+        glm::length(glm::vec3(matrix[0])),
+        glm::length(glm::vec3(matrix[1])),
+        glm::length(glm::vec3(matrix[2])),
+    };
+}
+
+glm::vec3 eulerFromMatrix(const glm::mat4& matrix) {
+    glm::vec3 scale = scaleFromMatrix(matrix);
+    glm::mat3 rotation{matrix};
+    if (scale.x > 0.0f) {
+        rotation[0] /= scale.x;
+    }
+    if (scale.y > 0.0f) {
+        rotation[1] /= scale.y;
+    }
+    if (scale.z > 0.0f) {
+        rotation[2] /= scale.z;
+    }
+    return glm::eulerAngles(glm::quat_cast(rotation));
+}
+
+nlohmann::json transformJsonFromMatrix(const glm::mat4& matrix) {
+    return {
+        {"position", vec3Json(glm::vec3(matrix[3]))},
+        {"rotationEuler", vec3Json(eulerFromMatrix(matrix))},
+        {"scale", vec3Json(scaleFromMatrix(matrix))},
+    };
+}
+
+nlohmann::json matrixJson(const glm::mat4& matrix) {
+    nlohmann::json result = nlohmann::json::array();
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            result.push_back(matrix[col][row]);
+        }
+    }
+    return result;
 }
 
 nlohmann::json thumbnailMetadataJson(
@@ -321,6 +368,8 @@ nlohmann::json inferTextureRole(const std::filesystem::path& sourcePath, AssetTy
         {"metallic", "Linear", {"metallic", "metalness", "metal", "met"}},
         {"occlusion", "Linear", {"occlusion", "ambientocclusion", "ao", "occ"}},
         {"emissive", "sRGB", {"emissive", "emission", "emit", "glow"}},
+        {"decal", "sRGB", {"decal", "sticker", "decalcolor", "decal_color"}},
+        {"label", "sRGB", {"label", "labels", "logo", "logos", "textlabel", "text_label"}},
         {"opacity", "Linear", {"opacity", "alpha", "transparency", "mask"}},
         {"height", "Linear", {"height", "displacement", "disp", "bump"}},
         {"baseColor", "sRGB", {"basecolor", "base_color", "albedo", "diffuse", "diff", "color", "col", "bc"}},
@@ -699,6 +748,22 @@ std::string mtlTexturePathToken(const std::vector<std::string>& tokens) {
     return {};
 }
 
+bool isMtlTextureMapKey(const std::string& key) {
+    return key.rfind("map_", 0) == 0 || key == "bump" || key == "disp" || key == "decal";
+}
+
+std::string mtlTextureMapRoleLabel(const std::string& key) {
+    if (key == "map_Kd") return "Base color texture";
+    if (key == "map_Ks") return "Specular color texture";
+    if (key == "map_Ns") return "Specular exponent texture";
+    if (key == "map_d") return "Opacity texture";
+    if (key == "map_bump" || key == "bump") return "Normal/bump texture";
+    if (key == "disp") return "Displacement texture";
+    if (key == "decal") return "Stencil/decal texture";
+    if (key.rfind("map_", 0) == 0) return "Texture map";
+    return "Texture reference";
+}
+
 nlohmann::json inspectMtlSource(const std::filesystem::path& sourcePath, std::vector<std::string>& warnings) {
     std::ifstream file(sourcePath);
     if (!file.is_open()) {
@@ -736,14 +801,21 @@ nlohmann::json inspectMtlSource(const std::filesystem::path& sourcePath, std::ve
             currentMaterial["name"] = trimAscii(std::string_view(trimmed).substr(6));
             currentMaterial["properties"] = nlohmann::json::object();
             currentMaterial["textureMaps"] = nlohmann::json::object();
+            currentMaterial["textureMapRoles"] = nlohmann::json::object();
             continue;
         }
         if (currentMaterial.is_null() || !currentMaterial.is_object()) {
-            currentMaterial = {{"name", "DefaultMaterial"}, {"properties", nlohmann::json::object()}, {"textureMaps", nlohmann::json::object()}};
+            currentMaterial = {
+                {"name", "DefaultMaterial"},
+                {"properties", nlohmann::json::object()},
+                {"textureMaps", nlohmann::json::object()},
+                {"textureMapRoles", nlohmann::json::object()},
+            };
         }
-        if (key.rfind("map_", 0) == 0 || key == "bump" || key == "disp" || key == "decal") {
+        if (isMtlTextureMapKey(key)) {
             const std::string texturePath = mtlTexturePathToken(tokens);
             currentMaterial["textureMaps"][key] = trimAscii(std::string_view(trimmed).substr(key.size()));
+            currentMaterial["textureMapRoles"][key] = mtlTextureMapRoleLabel(key);
             if (!texturePath.empty() && uniqueTextureReferences.insert(texturePath).second) {
                 textureReferences.push_back(texturePath);
             }
@@ -1648,7 +1720,17 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                     {"index", i},
                     {"name", node.name.empty() ? ("Node_" + std::to_string(i)) : node.name},
                     {"parent", node.parent},
+                    {"transform", transformJsonFromMatrix(node.transform)},
+                    {"matrix", matrixJson(node.transform)},
                     {"mesh", node.mesh.valid() ? static_cast<int>(node.mesh.index) : -1},
+                    {"hasCamera", node.hasCamera},
+                    {"cameraProjection", node.cameraProjection},
+                    {"cameraYfov", node.cameraYfov},
+                    {"cameraAspectRatio", node.cameraAspectRatio},
+                    {"cameraOrthoXmag", node.cameraOrthoXmag},
+                    {"cameraOrthoYmag", node.cameraOrthoYmag},
+                    {"cameraNear", node.cameraNear},
+                    {"cameraFar", node.cameraFar},
                     {"children", node.children},
                 });
             }
@@ -1670,6 +1752,11 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 std::filesystem::create_directories(texturePath.parent_path(), ec);
                 std::filesystem::create_directories(textureCache.parent_path(), ec);
                 const std::string textureSourcePath = texture.sourcePath.empty() ? effectiveSourceString : texture.sourcePath.generic_string();
+                const std::filesystem::path textureRoleSource =
+                    texture.sourcePath.empty() || texture.sourcePath == effectiveSourcePath
+                        ? std::filesystem::path(texture.name)
+                        : texture.sourcePath;
+                const nlohmann::json textureRole = inferTextureRole(textureRoleSource, AssetType::Texture);
                 const std::string textureThumbnailPath = projectRelativePathOrEmpty(texture.sourcePath, workspace.root);
                 textureThumbnailPaths.push_back(textureThumbnailPath);
                 const nlohmann::json texturePayload = sceneCacheSlicePayload("Texture", i, textureGuid);
@@ -1691,6 +1778,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                     {"height", texture.height},
                     {"channels", texture.channels},
                     {"colorSpace", textureColorSpaceLabel(texture)},
+                    {"textureRole", textureRole},
                     {"rule", texture.srgb ? "baseColor/emissive textures import as sRGB" : "normal/metallicRoughness/occlusion data imports as linear"},
                 });
                 (void)writeJson(textureCache, {
@@ -1906,11 +1994,21 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                     {"index", i},
                     {"name", node.name.empty() ? ("Node_" + std::to_string(i)) : node.name},
                     {"parent", node.parent},
+                    {"transform", transformJsonFromMatrix(node.transform)},
+                    {"matrix", matrixJson(node.transform)},
                     {"children", node.children},
                     {"mesh", node.mesh.valid() ? static_cast<int>(node.mesh.index) : -1},
                     {"meshGuid", node.mesh.valid() && node.mesh.index < meshGuids.size() ? meshGuids[node.mesh.index] : std::string{}},
                     {"materialGuids", materialGuidsForNode},
                     {"materialVariantGuids", materialVariantGuidsForNode},
+                    {"hasCamera", node.hasCamera},
+                    {"cameraProjection", node.cameraProjection},
+                    {"cameraYfov", node.cameraYfov},
+                    {"cameraAspectRatio", node.cameraAspectRatio},
+                    {"cameraOrthoXmag", node.cameraOrthoXmag},
+                    {"cameraOrthoYmag", node.cameraOrthoYmag},
+                    {"cameraNear", node.cameraNear},
+                    {"cameraFar", node.cameraFar},
                 });
             }
             placeholder["sourceHierarchy"] = prefabNodes;
@@ -2110,6 +2208,12 @@ StagedAssetImportResult stagePlaceholderAssetImport(
     const auto writeStart = std::chrono::steady_clock::now();
     setProgress(0.92f, "Writing import report");
     placeholder["dependencies"] = rootDependencies;
+    placeholder["importGroup"] = {
+        {"id", sourceHash + ":" + importSettingsHash},
+        {"name", name},
+        {"rootGuid", guid},
+    };
+    cache["importGroup"] = placeholder["importGroup"];
     nlohmann::json dependencyRecords = nlohmann::json::array();
     for (const AssetGuid& dependency : rootDependencies) {
         dependencyRecords.push_back({{"guid", dependency}, {"kind", "importedChild"}});
@@ -2216,6 +2320,17 @@ StagedAssetImportResult stagePlaceholderAssetImport(
     record.status = AssetImportStatus::Imported;
     for (const AssetGuid& dependency : rootDependencies) {
         record.dependencies.push_back(AssetDependency{dependency, "source"});
+    }
+    const std::string importGroupId = sourceHash + ":" + importSettingsHash;
+    const std::string importGroupName = name;
+    auto stampImportGroup = [&](AssetRecord& assetRecord) {
+        assetRecord.importGroupId = importGroupId;
+        assetRecord.importGroupName = importGroupName;
+        assetRecord.importRootGuid = guid;
+    };
+    stampImportGroup(record);
+    for (AssetRecord& childRecord : records) {
+        stampImportGroup(childRecord);
     }
     result.record = std::move(record);
     result.records = std::move(records);

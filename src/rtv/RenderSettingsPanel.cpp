@@ -136,7 +136,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     uint32_t minEnvSamples = 1;
     uint32_t maxEnvSamples = 8;
     uint32_t minSpp = 1;
-    uint32_t maxSpp = 8;
+    uint32_t maxSpp = kMaxSamplesPerPixel;
     uint32_t minAtrous = 1;
     uint32_t maxAtrous = 5;
     uint32_t minRestirGiAge = 1;
@@ -304,7 +304,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed = true;
     }
     ImGui::EndDisabled();
-    tooltip(dlssRayReconstructionCanRequest
+    tooltip(dlssRayReconstructionCanRequest && nvidiaStatus.dlssRayReconstructionAvailable
         ? "Uses DLSS Ray Reconstruction as the temporal denoiser/upscaler."
         : nvidiaStatus.dlssRayReconstructionUnavailableReason.c_str());
     bool fgEnabled = settings.dlssFrameGenerationEnabled;

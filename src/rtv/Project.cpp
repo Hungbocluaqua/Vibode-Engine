@@ -1,5 +1,6 @@
 #include "rtv/Project.h"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -88,6 +89,9 @@ bool saveProjectFile(const ProjectContext& project) {
     json["configRoot"] = genericPath(relativeOrValue(project.configRoot, project.projectRoot));
     json["assetRegistry"] = genericPath(relativeOrValue(project.assetRegistryPath, project.projectRoot));
     json["defaultRenderPreset"] = project.defaultRenderPreset;
+    if (project.preferredWorkspacePreset >= 0) {
+        json["preferredWorkspacePreset"] = std::clamp(project.preferredWorkspacePreset, 0, 3);
+    }
     json["autosaveEnabled"] = project.autosaveEnabled;
     json["autosaveIntervalMinutes"] = project.autosaveIntervalMinutes;
 
@@ -129,6 +133,10 @@ bool loadProjectFile(const std::filesystem::path& projectFile, ProjectContext& o
         outProject.assetRegistryPath = projectPath(root, json, "assetRegistry", "Content/AssetRegistry.json");
         outProject.startupScene = projectPath(root, json, "startupScene", "Scenes/Main.rtlevel");
         outProject.defaultRenderPreset = json.value("defaultRenderPreset", "Editor");
+        outProject.preferredWorkspacePreset = json.value("preferredWorkspacePreset", -1);
+        if (outProject.preferredWorkspacePreset < 0 || outProject.preferredWorkspacePreset > 3) {
+            outProject.preferredWorkspacePreset = -1;
+        }
         outProject.autosaveEnabled = json.value("autosaveEnabled", true);
         outProject.autosaveIntervalMinutes = json.value("autosaveIntervalMinutes", 5);
         return true;

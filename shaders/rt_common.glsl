@@ -1222,13 +1222,12 @@ void apply_material_alpha_texture(inout Material material, vec2 uv0, vec2 uv1) {
     }
 }
 
-bool accept_material_alpha(Material material, uint stableSeed) {
+bool accept_material_alpha(Material material) {
     if (material.alpha_mode == ALPHA_MODE_MASK) {
         return material.alpha_factor >= material.alpha_cutoff;
     }
     if (material.alpha_mode == ALPHA_MODE_BLEND) {
-        float threshold = float(pcg_hash(stableSeed)) / float(0xffffffffu);
-        return threshold <= clamp(material.alpha_factor, 0.0, 1.0);
+        return material.alpha_factor >= 0.10;
     }
     return true;
 }
@@ -1336,13 +1335,20 @@ vec3 analytical_sun_direction() {
     return normalize(camera.sun_direction_illuminance.xyz);
 }
 
+float analytical_sun_visibility() {
+    if (camera.sunlight_enabled == 0u) {
+        return 0.0;
+    }
+    return analytical_sun_direction().y > 0.0 ? 1.0 : 0.0;
+}
+
 float analytical_sun_solid_angle() {
     float radius = clamp(camera.sun_color_angular_radius.w, 0.0001, 0.08);
     return max(2.0 * PI * (1.0 - cos(radius)), 1.0e-8);
 }
 
 float analytical_sun_pdf(vec3 dir) {
-    if (camera.sunlight_enabled == 0u) {
+    if (analytical_sun_visibility() <= 0.0) {
         return 0.0;
     }
     vec3 sunDir = analytical_sun_direction();
@@ -1359,15 +1365,15 @@ float atmosphere_planet_horizon_visibility(vec3 scenePos, vec3 dir, float width)
 }
 
 vec3 analytical_sun_center_radiance() {
-    if (camera.sunlight_enabled != 0u) {
-        return max(camera.sun_color_angular_radius.rgb, vec3(0.0)) *
-            max(camera.sun_direction_illuminance.w, 0.0) / analytical_sun_solid_angle();
+    if (analytical_sun_visibility() <= 0.0) {
+        return vec3(0.0);
     }
-    return vec3(0.0);
+    return max(camera.sun_color_angular_radius.rgb, vec3(0.0)) *
+        max(camera.sun_direction_illuminance.w, 0.0) / analytical_sun_solid_angle();
 }
 
 vec3 analytical_sun_disk_radiance(vec3 dir) {
-    if (camera.sunlight_enabled == 0u) {
+    if (analytical_sun_visibility() <= 0.0) {
         return vec3(0.0);
     }
     vec3 sunDir = analytical_sun_direction();
@@ -1401,7 +1407,7 @@ vec3 visible_sun_core(vec3 viewDir, vec3 sunDir, float sunVisibility, float sunH
 }
 
 vec3 high_resolution_sun_disk_radiance(vec3 dir) {
-    if (camera.sunlight_enabled == 0u) {
+    if (analytical_sun_visibility() <= 0.0) {
         return vec3(0.0);
     }
     vec3 viewDir = normalize(dir);
@@ -1416,7 +1422,7 @@ vec3 high_resolution_sun_disk_radiance(vec3 dir) {
 }
 
 vec3 environment_sun_disk_radiance(vec3 dir) {
-    if (camera.sunlight_enabled == 0u) {
+    if (analytical_sun_visibility() <= 0.0) {
         return vec3(0.0);
     }
     vec3 viewDir = normalize(dir);
@@ -1445,8 +1451,9 @@ vec3 unreal_sky_grade(vec3 dir, vec3 physicalSky) {
     vec3 viewDir = normalize(dir);
     vec3 sunDir = analytical_sun_direction();
     float viewY = viewDir.y;
+    float activeSun = analytical_sun_visibility();
     float sunUp = clamp(sunDir.y, -0.12, 1.0);
-    float sunVisibility = smoothstep(-0.08, 0.08, sunUp);
+    float sunVisibility = activeSun * smoothstep(-0.08, 0.08, sunUp);
     float lowSun = 1.0 - smoothstep(0.18, 0.82, sunUp);
     float sunset = 1.0 - smoothstep(0.02, 0.34, sunUp);
     float horizonVisibility = atmosphere_planet_horizon_visibility(camera.pos.xyz, viewDir, 0.006);
@@ -1478,10 +1485,11 @@ vec3 unreal_sky_grade(vec3 dir, vec3 physicalSky) {
 vec3 fast_sky_radiance(vec3 dir) {
     vec3 viewDir = normalize(dir);
     vec3 sunDir = analytical_sun_direction();
+    float activeSun = analytical_sun_visibility();
     float viewUp = clamp(viewDir.y, -0.08, 1.0);
     float sunUp = clamp(sunDir.y, -0.08, 1.0);
     float cosTheta = clamp(dot(viewDir, sunDir), -1.0, 1.0);
-    float sunVisibility = smoothstep(-0.06, 0.08, sunUp);
+    float sunVisibility = activeSun * smoothstep(-0.06, 0.08, sunUp);
     float viewMass = atmosphere_air_mass(viewUp);
     float sunMass = atmosphere_air_mass(sunUp);
     float horizon = pow(1.0 - clamp(viewUp, 0.0, 1.0), 2.0);
@@ -1570,6 +1578,9 @@ vec3 atmosphere_sky_radiance(vec3 dir, uint quality) {
     if (quality == ATMOSPHERE_RAY_QUALITY_MINIMAL) {
         return vec3(0.0);
     }
+    if (camera.sunlight_enabled == 0u) {
+        return fast_sky_radiance(viewDir);
+    }
     if (quality == ATMOSPHERE_RAY_QUALITY_FAST) {
         return fast_sky_radiance(viewDir);
     }
@@ -1637,6 +1648,19 @@ vec3 environment_radiance(vec3 dir, uint quality) {
         vec3 sampled = texture(sampler2D(env_map, env_sampler), vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0))).rgb;
         return sampled * env_params.intensity;
     }
+    return vec3(0.0);
+}
+
+vec3 environment_background_radiance(vec3 dir, uint quality) {
+    if (debug_params.view == 27u) {
+        return vec3(DEBUG_WHITE_ENV_RADIANCE);
+    }
+    if (env_params.enabled != 0u && env_params.procedural == 0u) {
+        vec3 localDir = rotate_y(dir, env_params.rotation);
+        vec2 uv = env_uv_from_dir(localDir);
+        vec3 sampled = texture(sampler2D(env_map, env_sampler), vec2(fract(uv.x), clamp(uv.y, 0.0, 1.0))).rgb;
+        return sampled * env_params.intensity;
+    }
     return atmosphere_sky_radiance(dir, quality);
 }
 
@@ -1647,10 +1671,13 @@ vec3 debug_display_tonemap(vec3 color) {
 }
 
 float environment_pdf(vec3 dir) {
+    if (env_params.enabled == 0u) {
+        return 0.0;
+    }
     if (sky_cdf_available()) {
         return sky_cdf_direction_pdf(dir);
     }
-    if (env_params.enabled == 0u || env_params.width == 0u || env_params.height == 0u || env_params.inv_total_lum <= 0.0) {
+    if (env_params.width == 0u || env_params.height == 0u || env_params.inv_total_lum <= 0.0) {
         if (env_params.procedural != 0u) {
             vec3 radiance = atmosphere_sky_radiance(dir, ATMOSPHERE_RAY_QUALITY_FULL);
             float lum = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
@@ -1676,10 +1703,14 @@ float environment_pdf(vec3 dir) {
 
 vec3 sample_environment_direction(inout uint state, out vec3 out_dir, out float out_pdf) {
     out_pdf = 0.0;
+    out_dir = vec3(0.0, 1.0, 0.0);
+    if (env_params.enabled == 0u) {
+        return vec3(0.0);
+    }
     if (sky_cdf_available()) {
         return sample_sky_cdf_direction(state, out_dir, out_pdf);
     }
-    if (env_params.enabled == 0u || env_params.width == 0u || env_params.height == 0u || env_params.inv_total_lum <= 0.0) {
+    if (env_params.width == 0u || env_params.height == 0u || env_params.inv_total_lum <= 0.0) {
         float z = 1.0 - 2.0 * rand_f32(state);
         float phi = 2.0 * PI * rand_f32(state);
         float r = sqrt(max(1.0 - z * z, 0.0));

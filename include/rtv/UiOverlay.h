@@ -94,6 +94,7 @@ public:
     [[nodiscard]] bool viewportHovered() const;
     [[nodiscard]] bool rendersPathTracerInViewport() const { return true; }
     [[nodiscard]] VkExtent2D desiredRenderExtent(VkExtent2D fallback) const;
+    void setRenderExtentOverride(std::optional<VkExtent2D> extent);
     void invalidateViewportTexture();
     void invalidateRendererTextures();
     [[nodiscard]] EditorLayer& editor() { return editor_; }
@@ -161,6 +162,7 @@ private:
     VkImageView viewportImageView_ = VK_NULL_HANDLE;
     VkDescriptorSet viewportTexture_ = VK_NULL_HANDLE;
     VkExtent2D viewportTextureExtent_{};
+    std::optional<VkExtent2D> renderExtentOverride_;
     uint64_t uiFrameSerial_ = 0;
     uint64_t textureRetireFrameDelay_ = 4;
     bool frameBegun_ = false;

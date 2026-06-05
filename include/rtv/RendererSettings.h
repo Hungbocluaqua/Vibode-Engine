@@ -10,6 +10,8 @@
 
 namespace rtv {
 
+inline constexpr uint32_t kMaxSamplesPerPixel = 64u;
+
 struct RendererSettings {
     RenderPreset renderPreset = RenderPreset::Balanced;
     bool pathTracingEnabled = true;

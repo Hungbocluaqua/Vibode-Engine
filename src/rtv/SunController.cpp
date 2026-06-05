@@ -95,7 +95,9 @@ EntityId SunController::ensurePrimarySun(SceneDocument& document) {
     document.registry().markDirty(SceneUpdateKind::LightOnly);
     if (Entity* sun = document.registry().entity(sunId)) {
         sun->sun = Sun{};
-        sun->transform = transformFromWorldAngles(document.registry(), *sun, sun->transform, defaultSunElevation, defaultSunAzimuth);
+        sun->sun->elevation = defaultSunElevation;
+        sun->sun->azimuth = defaultSunAzimuth;
+        sun->defaultTransform = sun->transform;
     }
     document.setPrimarySun(sunId);
     document.markDirty(SceneUpdateKind::LightOnly);
@@ -140,22 +142,18 @@ bool SunController::migrateLegacyDirectionalSun(SceneDocument& document) {
         }
         entity->sun = sunFromLegacy(document.renderSettings(), &*entity->light);
         entity->light.reset();
+        float elevation = document.renderSettings().sunElevation;
+        float azimuth = document.renderSettings().sunAzimuth;
         if (nearlyZero(entity->transform.rotationEuler)) {
             const float positionLen2 = glm::dot(entity->transform.position, entity->transform.position);
-            entity->transform = positionLen2 > 1.0e-4f
-                ? transformFromLocalDirection(entity->transform, entity->transform.position)
-                : transformFromWorldAngles(
-                    document.registry(),
-                    *entity,
-                    entity->transform,
-                    document.renderSettings().sunElevation,
-                    document.renderSettings().sunAzimuth);
+            if (positionLen2 > 1.0e-4f) {
+                anglesFromDirection(entity->transform.position, elevation, azimuth);
+            }
         } else {
-            float elevation = 0.0f;
-            float azimuth = 0.0f;
             anglesFromWorldTransform(document.registry(), *entity, elevation, azimuth);
-            entity->transform = transformFromWorldAngles(document.registry(), *entity, entity->transform, elevation, azimuth);
         }
+        entity->sun->elevation = elevation;
+        entity->sun->azimuth = azimuth;
         entity->defaultTransform = entity->transform;
         document.setPrimarySun(entity->id);
         document.markDirty(SceneUpdateKind::LightOnly);
@@ -172,25 +170,19 @@ bool SunController::repairPrimarySunTransform(SceneDocument& document) {
     if (entity == nullptr || !entity->sun.has_value()) {
         return false;
     }
-
-    if (nearlyZero(entity->transform.rotationEuler)) {
-        const float positionLen2 = glm::dot(entity->transform.position, entity->transform.position);
-        if (positionLen2 > 1.0e-4f) {
-            entity->transform = transformFromLocalDirection(entity->transform, entity->transform.position);
-        } else {
-            entity->transform = transformFromWorldAngles(
-                document.registry(),
-                *entity,
-                entity->transform,
-                document.renderSettings().sunElevation,
-                document.renderSettings().sunAzimuth);
-        }
-        entity->defaultTransform = entity->transform;
-        document.markDirty(SceneUpdateKind::LightOnly);
-        return true;
+    bool changed = false;
+    if (!std::isfinite(entity->sun->elevation)) {
+        entity->sun->elevation = defaultSunElevation;
+        changed = true;
     }
-
-    return false;
+    if (!std::isfinite(entity->sun->azimuth)) {
+        entity->sun->azimuth = defaultSunAzimuth;
+        changed = true;
+    }
+    if (changed) {
+        document.markDirty(SceneUpdateKind::LightOnly);
+    }
+    return changed;
 }
 
 SunDerivedState SunController::derivedState(const SceneDocument& document) {
@@ -198,13 +190,12 @@ SunDerivedState SunController::derivedState(const SceneDocument& document) {
     const EntityId sunId = primarySunEntity(document);
     const Entity* entity = document.registry().entity(sunId);
     if (entity == nullptr || !entity->sun.has_value()) {
-        const RenderSettings& render = document.renderSettings();
-        state.enabled = render.sunlightEnabled;
-        state.illuminanceLux = std::max(render.sunIntensity, 0.0f) * legacyIntensityToLux;
-        state.angularRadiusRadians = safeSunAngularRadius(render.sunAngularRadius);
-        state.direction = directionFromAngles(render.sunElevation, render.sunAzimuth);
-        state.elevation = render.sunElevation;
-        state.azimuth = render.sunAzimuth;
+        state.enabled = false;
+        state.illuminanceLux = 0.0f;
+        state.angularRadiusRadians = defaultSunAngularRadius;
+        state.direction = directionFromAngles(defaultSunElevation, defaultSunAzimuth);
+        state.elevation = defaultSunElevation;
+        state.azimuth = defaultSunAzimuth;
         state.color = colorFromTemperature(state.colorTemperatureKelvin);
         return state;
     }
@@ -214,15 +205,9 @@ SunDerivedState SunController::derivedState(const SceneDocument& document) {
     state.angularRadiusRadians = safeSunAngularRadius(entity->sun->angularRadiusRadians);
     state.colorTemperatureKelvin = std::clamp(entity->sun->colorTemperatureKelvin, 1000.0f, 40000.0f);
     state.color = colorFromTemperature(state.colorTemperatureKelvin);
-    const glm::mat4 world = entityWorldMatrix(document.registry(), *entity);
-    glm::vec3 direction = glm::vec3(world[3]);
-    float len2 = glm::dot(direction, direction);
-    if (len2 <= 1.0e-6f) {
-        direction = -(glm::mat3(world) * glm::vec3(0.0f, 0.0f, -1.0f));
-        len2 = glm::dot(direction, direction);
-    }
-    state.direction = len2 > 1.0e-6f ? direction * glm::inversesqrt(len2) : directionFromAngles(defaultSunElevation, defaultSunAzimuth);
-    anglesFromDirection(state.direction, state.elevation, state.azimuth);
+    state.elevation = std::isfinite(entity->sun->elevation) ? entity->sun->elevation : defaultSunElevation;
+    state.azimuth = std::isfinite(entity->sun->azimuth) ? entity->sun->azimuth : defaultSunAzimuth;
+    state.direction = directionFromAngles(state.elevation, state.azimuth);
     return state;
 }
 
@@ -302,6 +287,8 @@ Sun SunController::sunFromLegacy(const RenderSettings& render, const Light* ligh
     }
     sun.angularRadiusRadians = safeSunAngularRadius(light != nullptr ? light->sizeOrRadius : render.sunAngularRadius);
     sun.colorTemperatureKelvin = 5778.0f;
+    sun.elevation = render.sunElevation;
+    sun.azimuth = render.sunAzimuth;
     return sun;
 }
 

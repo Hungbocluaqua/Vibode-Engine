@@ -1,7 +1,9 @@
 #include "rtv/Application.h"
+#include "rtv/AssetRegistry.h"
 #include "rtv/DiagnosticTools.h"
 #include "rtv/HeadlessDiagnostics.h"
 #include "rtv/PathTracerRenderer.h"
+#include "rtv/Project.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
 #include "rtv/RenderGraphDump.h"
@@ -14,13 +16,17 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #ifdef RTV_HAS_RENDERDOC
 #define WIN32_LEAN_AND_MEAN
@@ -118,6 +124,274 @@ static void initRenderDoc() {
 }
 #endif
 
+namespace {
+
+std::filesystem::path resolveProjectPath(const std::filesystem::path& root, const std::string& value) {
+    if (value.empty()) {
+        return {};
+    }
+    std::filesystem::path path(value);
+    return path.is_absolute() ? path : root / path;
+}
+
+std::string genericPathString(const std::filesystem::path& path) {
+    return path.generic_string();
+}
+
+std::string relativePathString(const std::filesystem::path& path, const std::filesystem::path& root) {
+    if (path.empty()) {
+        return {};
+    }
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(path, root, ec);
+    if (ec) {
+        return genericPathString(path);
+    }
+    for (const auto& part : relative) {
+        if (part == "..") {
+            return genericPathString(path);
+        }
+    }
+    return genericPathString(relative);
+}
+
+std::filesystem::path cookDestinationForPath(
+    const std::filesystem::path& source,
+    const std::filesystem::path& projectRoot,
+    const std::filesystem::path& cookRoot,
+    size_t externalIndex) {
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(source, projectRoot, ec);
+    if (!ec) {
+        bool escapesRoot = false;
+        for (const auto& part : relative) {
+            if (part == "..") {
+                escapesRoot = true;
+                break;
+            }
+        }
+        if (!escapesRoot) {
+            return cookRoot / relative;
+        }
+    }
+    const std::string filename = source.filename().empty() ? std::string("payload") : source.filename().string();
+    return cookRoot / "ExternalPayloads" / (std::to_string(externalIndex) + "_" + filename);
+}
+
+bool copyCookFile(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination,
+    nlohmann::json& copiedFiles,
+    std::vector<std::string>& errors,
+    const std::filesystem::path& projectRoot,
+    const std::filesystem::path& cookRoot,
+    std::string_view role,
+    std::string_view ownerGuid) {
+    if (source.empty()) {
+        return true;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(source, ec)) {
+        errors.push_back(std::string(role) + " missing for " + std::string(ownerGuid) + ": " + source.string());
+        return false;
+    }
+    std::filesystem::create_directories(destination.parent_path(), ec);
+    if (ec) {
+        errors.push_back("Could not create cook directory: " + destination.parent_path().string() + " (" + ec.message() + ")");
+        return false;
+    }
+    std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        errors.push_back("Could not copy " + std::string(role) + " for " + std::string(ownerGuid) + ": " + ec.message());
+        return false;
+    }
+    const uintmax_t bytes = std::filesystem::file_size(destination, ec);
+    copiedFiles.push_back({
+        {"role", role},
+        {"ownerGuid", ownerGuid},
+        {"source", relativePathString(source, projectRoot)},
+        {"output", relativePathString(destination, cookRoot)},
+        {"bytes", ec ? 0ull : static_cast<uint64_t>(bytes)},
+    });
+    return true;
+}
+
+int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem::path outputDir, std::filesystem::path manifestPath) {
+    rtv::ProjectContext project;
+    std::string projectError;
+    if (!rtv::loadProjectFile(projectFile, project, &projectError)) {
+        std::cerr << "Cook failed: could not load project: " << projectError << '\n';
+        return 1;
+    }
+    if (outputDir.empty()) {
+        outputDir = project.buildRoot / "Cooked";
+    }
+    if (manifestPath.empty()) {
+        manifestPath = outputDir / "cook_manifest.json";
+    }
+
+    std::vector<std::string> errors;
+    std::vector<std::string> warnings;
+    rtv::AssetRegistry registry;
+    std::string registryError;
+    if (!registry.load(project.assetRegistryPath, &registryError)) {
+        errors.push_back("Asset registry load failed: " + registryError);
+    } else {
+        (void)registry.refreshRecordHealth(project.projectRoot, false);
+    }
+
+    std::unordered_set<rtv::AssetGuid> registryGuids;
+    for (const rtv::AssetRecord& record : registry.records()) {
+        if (!record.guid.empty()) {
+            registryGuids.insert(record.guid);
+        }
+    }
+
+    nlohmann::json copiedFiles = nlohmann::json::array();
+    nlohmann::json assets = nlohmann::json::array();
+    size_t externalIndex = 0;
+
+    auto copyProjectFile = [&](const std::filesystem::path& source, std::string_view role) {
+        if (source.empty()) {
+            return;
+        }
+        const std::filesystem::path destination = cookDestinationForPath(source, project.projectRoot, outputDir, externalIndex++);
+        (void)copyCookFile(source, destination, copiedFiles, errors, project.projectRoot, outputDir, role, "project");
+    };
+    copyProjectFile(project.projectFile, "project_file");
+    copyProjectFile(project.assetRegistryPath, "asset_registry");
+    if (std::filesystem::exists(project.startupScene)) {
+        copyProjectFile(project.startupScene, "startup_scene");
+    } else {
+        warnings.push_back("Startup scene is missing: " + project.startupScene.string());
+    }
+
+    if (std::filesystem::exists(project.scenesRoot)) {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(project.scenesRoot, ec)) {
+            if (ec) {
+                warnings.push_back("Scene directory scan warning: " + ec.message());
+                break;
+            }
+            if (!entry.is_regular_file(ec) || entry.path().extension() != ".rtlevel") {
+                continue;
+            }
+            if (entry.path() == project.startupScene) {
+                continue;
+            }
+            copyProjectFile(entry.path(), "scene");
+        }
+    }
+
+    for (const rtv::AssetRecord& record : registry.records()) {
+        nlohmann::json asset = {
+            {"guid", record.guid},
+            {"type", rtv::assetTypeName(record.type)},
+            {"displayName", record.displayName},
+            {"status", rtv::assetImportStatusName(record.status)},
+            {"sourceMissing", record.sourceMissing},
+            {"importedMetadataMissing", record.importedMetadataMissing},
+            {"cookedPayloadMissing", record.cookedPayloadMissing},
+            {"dependenciesMissing", record.dependenciesMissing},
+            {"stale", record.stale},
+        };
+
+        const std::filesystem::path sourcePath = resolveProjectPath(project.projectRoot, record.sourcePath);
+        const std::filesystem::path importedPath = resolveProjectPath(project.projectRoot, record.importedPath);
+        const std::filesystem::path cachePath = resolveProjectPath(project.projectRoot, record.cachePath);
+        const std::filesystem::path thumbnailPath = resolveProjectPath(project.projectRoot, record.thumbnailPath);
+
+        if (record.sourceMissing) {
+            warnings.push_back("Source missing but cook can proceed from metadata/payload for " + record.guid + ": " + sourcePath.string());
+        }
+        if (record.stale || record.status == rtv::AssetImportStatus::Stale) {
+            warnings.push_back("Asset is stale and should be reimported before shipping: " + record.guid);
+        }
+        if (record.status == rtv::AssetImportStatus::Failed) {
+            errors.push_back("Asset import previously failed: " + record.guid);
+        }
+        if (record.importedMetadataMissing || record.importedPath.empty()) {
+            errors.push_back("Imported metadata missing for asset: " + record.guid);
+        }
+        if (record.cookedPayloadMissing || record.cachePath.empty()) {
+            errors.push_back("Cooked payload missing for asset: " + record.guid);
+        }
+        for (const rtv::AssetDependency& dependency : record.dependencies) {
+            if (!dependency.guid.empty() && registryGuids.find(dependency.guid) == registryGuids.end()) {
+                errors.push_back("Asset " + record.guid + " references missing dependency " + dependency.guid + " (" + dependency.kind + ")");
+            }
+        }
+
+        if (!record.importedPath.empty()) {
+            const std::filesystem::path destination = cookDestinationForPath(importedPath, project.projectRoot, outputDir, externalIndex++);
+            (void)copyCookFile(importedPath, destination, copiedFiles, errors, project.projectRoot, outputDir, "asset_metadata", record.guid);
+            asset["cookedMetadataOutput"] = relativePathString(destination, outputDir);
+        }
+        if (!record.cachePath.empty()) {
+            const std::filesystem::path destination = cookDestinationForPath(cachePath, project.projectRoot, outputDir, externalIndex++);
+            (void)copyCookFile(cachePath, destination, copiedFiles, errors, project.projectRoot, outputDir, "asset_payload", record.guid);
+            asset["cookedPayloadOutput"] = relativePathString(destination, outputDir);
+        }
+        if (!record.thumbnailPath.empty() && std::filesystem::exists(thumbnailPath)) {
+            const std::filesystem::path destination = cookDestinationForPath(thumbnailPath, project.projectRoot, outputDir, externalIndex++);
+            (void)copyCookFile(thumbnailPath, destination, copiedFiles, errors, project.projectRoot, outputDir, "asset_thumbnail", record.guid);
+            asset["thumbnailOutput"] = relativePathString(destination, outputDir);
+        }
+        assets.push_back(std::move(asset));
+    }
+
+    std::sort(errors.begin(), errors.end());
+    errors.erase(std::unique(errors.begin(), errors.end()), errors.end());
+    std::sort(warnings.begin(), warnings.end());
+    warnings.erase(std::unique(warnings.begin(), warnings.end()), warnings.end());
+
+    nlohmann::json manifest;
+    manifest["schema"] = "TransparentCookManifestV1";
+    manifest["project"] = {
+        {"guid", project.projectGuid},
+        {"name", project.name},
+        {"projectFile", relativePathString(project.projectFile, project.projectRoot)},
+        {"startupScene", relativePathString(project.startupScene, project.projectRoot)},
+        {"assetRegistry", relativePathString(project.assetRegistryPath, project.projectRoot)},
+    };
+    manifest["outputRoot"] = genericPathString(outputDir);
+    manifest["assetCount"] = registry.records().size();
+    manifest["assets"] = std::move(assets);
+    manifest["copiedFiles"] = std::move(copiedFiles);
+    manifest["warnings"] = warnings;
+    manifest["errors"] = errors;
+    manifest["status"] = errors.empty() ? "success" : "failed";
+    manifest["futurePackageCompatibility"] = {
+        {"packageObjectModel", "metadata_and_payload_chunks"},
+        {"opaquePackageExtension", ".rtpkg"},
+        {"transparentLayoutPreserved", true},
+    };
+
+    std::error_code ec;
+    const std::filesystem::path manifestParent = manifestPath.parent_path();
+    if (!manifestParent.empty()) {
+        std::filesystem::create_directories(manifestParent, ec);
+        if (ec) {
+            std::cerr << "Cook failed: could not create manifest directory: " << ec.message() << '\n';
+            return 1;
+        }
+    }
+    std::ofstream manifestFile(manifestPath);
+    if (!manifestFile.is_open()) {
+        std::cerr << "Cook failed: could not write manifest: " << manifestPath.string() << '\n';
+        return 1;
+    }
+    manifestFile << manifest.dump(2);
+
+    std::cout << "Cook manifest: " << manifestPath.string() << '\n';
+    std::cout << "Cook copied " << manifest["copiedFiles"].size() << " files for "
+              << registry.records().size() << " assets; warnings=" << warnings.size()
+              << " errors=" << errors.size() << '\n';
+    return errors.empty() ? 0 : 1;
+}
+
+} // namespace
+
 int main(int argc, char** argv) {
     try {
         uint32_t maxFrames = 0;
@@ -188,6 +462,9 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> crashDumpPackageDir;
         std::optional<std::filesystem::path> checkBudgetPath;
         std::optional<std::filesystem::path> descriptorLifetimeStressPath;
+        std::optional<std::filesystem::path> cookProjectPath;
+        std::filesystem::path cookOutputDir;
+        std::filesystem::path cookManifestPath;
         uint32_t descriptorLifetimeStressCycles = 12;
         uint32_t descriptorLifetimeStressFrames = 2;
         bool validateGpuLabels = false;
@@ -439,6 +716,12 @@ int main(int argc, char** argv) {
                 descriptorLifetimeStressCycles = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
             } else if (arg == "--descriptor-lifetime-stress-frames" && i + 1 < argc) {
                 descriptorLifetimeStressFrames = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
+            } else if (arg == "--cook-project" && i + 1 < argc) {
+                cookProjectPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--cook-output" && i + 1 < argc) {
+                cookOutputDir = std::filesystem::path(argv[++i]);
+            } else if (arg == "--cook-manifest" && i + 1 < argc) {
+                cookManifestPath = std::filesystem::path(argv[++i]);
             } else if (arg == "--shader-hot-reload-report") {
                 shaderHotReloadReport = true;
             } else if (arg == "--disable-pass" && i + 1 < argc) {
@@ -471,6 +754,9 @@ int main(int argc, char** argv) {
                 *compareImageSequenceCurrentPath,
                 compareImageOutputPath,
                 sequenceViewNames);
+        }
+        if (cookProjectPath.has_value()) {
+            return cookProjectCommand(*cookProjectPath, cookOutputDir, cookManifestPath);
         }
 
         for (const std::string& viewName : sequenceViewNames) {

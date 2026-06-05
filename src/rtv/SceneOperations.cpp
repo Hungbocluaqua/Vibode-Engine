@@ -51,11 +51,23 @@ Camera cameraFromSceneNode(const SceneNodeAsset& node) {
     return camera;
 }
 
+Camera cameraFromPrefabNode(const PrefabNodeAsset& node) {
+    Camera camera;
+    camera.projection = node.cameraProjection;
+    camera.verticalFovRadians = node.cameraYfov;
+    camera.aspectRatio = node.cameraAspectRatio;
+    camera.orthographicXmag = node.cameraOrthoXmag;
+    camera.orthographicYmag = node.cameraOrthoYmag;
+    camera.nearPlane = node.cameraNear;
+    camera.farPlane = node.cameraFar;
+    return camera;
+}
+
 SceneUpdateMask entityRemovalUpdateMask(const SceneDocument& document, const Entity& entity) {
-    if (entity.meshRenderer.has_value()) {
-        return SceneUpdateMaskTopology;
-    }
     SceneUpdateMask mask = SceneUpdateMaskNone;
+    if (entity.meshRenderer.has_value()) {
+        mask |= SceneUpdateMaskTopology;
+    }
     if (entity.light.has_value() || entity.sun.has_value()) {
         mask |= SceneUpdateMaskLight;
     }
@@ -74,7 +86,61 @@ SceneUpdateMask entityRemovalUpdateMask(const SceneDocument& document, const Ent
             mask |= entityRemovalUpdateMask(document, *child);
         }
     }
+    if (!entity.children.empty()) {
+        mask |= SceneUpdateMaskTransform;
+    }
     return mask;
+}
+
+void collectEntitySubtreePostOrder(const SceneRegistry& registry, EntityId id, std::vector<EntityId>& out) {
+    if (!id.valid() || std::find(out.begin(), out.end(), id) != out.end()) {
+        return;
+    }
+    const Entity* entity = registry.entity(id);
+    if (entity == nullptr) {
+        return;
+    }
+    const std::vector<EntityId> children = entity->children;
+    for (EntityId child : children) {
+        collectEntitySubtreePostOrder(registry, child, out);
+    }
+    if (std::find(out.begin(), out.end(), id) == out.end()) {
+        out.push_back(id);
+    }
+}
+
+std::vector<EntityId> collectDeleteSetPostOrder(const SceneRegistry& registry, const std::vector<EntityId>& ids) {
+    std::vector<EntityId> result;
+    for (EntityId id : ids) {
+        collectEntitySubtreePostOrder(registry, id, result);
+    }
+    return result;
+}
+
+void clearDeletedEntityReferences(SceneDocument& document, EntityId id) {
+    if (document.activeCamera() == id) {
+        document.setActiveCamera({});
+    }
+    if (document.primarySun() == id) {
+        document.setPrimarySun({});
+    }
+
+    WorldSettings& world = document.worldSettings();
+    if (world.activeEnvironment == id) {
+        world.activeEnvironment = {};
+    }
+    if (world.primarySun == id) {
+        world.primarySun = {};
+    }
+    if (world.skyAtmosphere == id) {
+        world.skyAtmosphere = {};
+    }
+    if (world.heightFog == id) {
+        world.heightFog = {};
+    }
+    if (world.postProcessVolume == id) {
+        world.postProcessVolume = {};
+    }
 }
 
 SceneUpdateKind transformUpdateKind(const SceneDocument& document, const Entity& entity) {
@@ -190,26 +256,78 @@ EntityId SceneOperations::duplicateEntity(EntityId id) {
 
 bool SceneOperations::deleteEntity(EntityId id) {
     const SceneDocument before = document_;
-    const Entity* entity = document_.registry().entity(id);
-    if (entity == nullptr) {
+    const std::vector<EntityId> deletedIds = collectDeleteSetPostOrder(document_.registry(), {id});
+    if (deletedIds.empty()) {
         return false;
     }
-    const SceneUpdateMask updateMask = entityRemovalUpdateMask(document_, *entity);
+
+    SceneUpdateMask updateMask = SceneUpdateMaskNone;
+    for (EntityId deletedId : deletedIds) {
+        if (const Entity* entity = document_.registry().entity(deletedId)) {
+            updateMask |= entityRemovalUpdateMask(document_, *entity);
+        }
+    }
     const SceneUpdateKind updateKind = sceneUpdateKindFromMask(updateMask);
-    if (document_.activeCamera() == id) {
-        document_.setActiveCamera({});
+
+    std::vector<EntityId> actuallyDeleted;
+    actuallyDeleted.reserve(deletedIds.size());
+    for (EntityId deletedId : deletedIds) {
+        clearDeletedEntityReferences(document_, deletedId);
+        if (document_.registry().destroyEntity(deletedId, updateKind)) {
+            actuallyDeleted.push_back(deletedId);
+        }
     }
-    if (document_.primarySun() == id) {
-        document_.setPrimarySun({});
-    }
-    if (!document_.registry().destroyEntity(id, updateKind)) {
+    if (actuallyDeleted.empty()) {
         return false;
     }
     document_.markDirty(updateMask);
-    publish({SceneEventType::EntityDeleted, id, {}, updateKind});
+    for (EntityId deletedId : actuallyDeleted) {
+        publish({SceneEventType::EntityDeleted, deletedId, {}, updateKind});
+    }
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
             document_, before, document_, updateMask, "Delete Entity"));
+    }
+    return true;
+}
+
+bool SceneOperations::deleteEntities(const std::vector<EntityId>& ids) {
+    const std::vector<EntityId> deletedIds = collectDeleteSetPostOrder(document_.registry(), ids);
+    if (deletedIds.empty()) {
+        return false;
+    }
+
+    const SceneDocument before = document_;
+    SceneUpdateMask updateMask = SceneUpdateMaskNone;
+    for (EntityId id : deletedIds) {
+        const Entity* entity = document_.registry().entity(id);
+        if (entity == nullptr) {
+            continue;
+        }
+        updateMask |= entityRemovalUpdateMask(document_, *entity);
+    }
+    const SceneUpdateKind updateKind = sceneUpdateKindFromMask(updateMask);
+
+    std::vector<EntityId> actuallyDeleted;
+    actuallyDeleted.reserve(deletedIds.size());
+    for (EntityId id : deletedIds) {
+        clearDeletedEntityReferences(document_, id);
+        if (document_.registry().destroyEntity(id, updateKind)) {
+            actuallyDeleted.push_back(id);
+        }
+    }
+    if (actuallyDeleted.empty()) {
+        return false;
+    }
+
+    document_.markDirty(updateMask);
+    const SceneUpdateKind finalUpdateKind = sceneUpdateKindFromMask(updateMask);
+    for (EntityId id : actuallyDeleted) {
+        publish({SceneEventType::EntityDeleted, id, {}, finalUpdateKind});
+    }
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, updateMask, "Delete Entities"));
     }
     return true;
 }
@@ -255,14 +373,47 @@ bool SceneOperations::setVisibility(EntityId id, bool visible) {
         return false;
     }
     entity->visible = visible;
+    SceneUpdateKind updateKind = SceneUpdateKind::VisibilityOnly;
     if (entity->meshRenderer.has_value()) {
         entity->meshRenderer->visible = visible;
     }
-    document_.markDirty(SceneUpdateKind::VisibilityOnly);
-    publish({SceneEventType::VisibilityChanged, id, {}, SceneUpdateKind::VisibilityOnly});
+    if (entity->light.has_value()) {
+        entity->light->enabled = visible;
+        updateKind = SceneUpdateKind::LightOnly;
+    }
+    if (entity->sun.has_value()) {
+        entity->sun->enabled = visible;
+        updateKind = SceneUpdateKind::LightOnly;
+    }
+    if (entity->environmentLight.has_value()) {
+        entity->environmentLight->enabled = visible;
+        updateKind = SceneUpdateKind::RendererSettingsOnly;
+    }
+    if (entity->skyAtmosphere.has_value()) {
+        entity->skyAtmosphere->enabled = visible;
+        updateKind = SceneUpdateKind::RendererSettingsOnly;
+    }
+    if (entity->heightFog.has_value()) {
+        entity->heightFog->enabled = visible;
+        updateKind = SceneUpdateKind::RendererSettingsOnly;
+    }
+    if (entity->volumetricCloud.has_value()) {
+        entity->volumetricCloud->enabled = visible;
+        updateKind = SceneUpdateKind::RendererSettingsOnly;
+    }
+    if (entity->postProcessVolume.has_value()) {
+        entity->postProcessVolume->enabled = visible;
+        updateKind = SceneUpdateKind::RendererSettingsOnly;
+    }
+    if (entity->cameraPostProcess.has_value()) {
+        entity->cameraPostProcess->enabled = visible;
+        updateKind = SceneUpdateKind::RendererSettingsOnly;
+    }
+    document_.markDirty(updateKind);
+    publish({SceneEventType::VisibilityChanged, id, {}, updateKind});
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
-            document_, before, document_, SceneUpdateKind::VisibilityOnly, "Set Visibility"));
+            document_, before, document_, updateKind, "Set Visibility"));
     }
     return true;
 }
@@ -358,16 +509,6 @@ bool SceneOperations::addSunComponent(EntityId id, Sun sun) {
     }
     const SceneDocument before = document_;
     entity->sun = sun;
-    if (glm::dot(entity->transform.position, entity->transform.position) <= 1.0e-6f &&
-        glm::dot(entity->transform.rotationEuler, entity->transform.rotationEuler) <= 1.0e-6f) {
-        entity->transform = SunController::transformFromWorldAngles(
-            document_.registry(),
-            *entity,
-            entity->transform,
-            document_.renderSettings().sunElevation,
-            document_.renderSettings().sunAzimuth);
-        entity->defaultTransform = entity->transform;
-    }
     document_.setPrimarySun(id);
     for (Entity* other : document_.registry().entities()) {
         if (other != nullptr && other->id != id) {
@@ -627,6 +768,8 @@ PrefabInstance SceneOperations::placePrefab(
 
     const SceneDocument before = document_;
     instance.prefabGuid = prefab.guid;
+    const bool hadActiveCamera = document_.activeCamera().valid();
+    bool assignedPrefabCamera = false;
 
     EntityId root = document_.registry().createEntity(prefab.name.empty() ? "Prefab Instance" : prefab.name);
     instance.instanceRoot = root;
@@ -645,7 +788,20 @@ PrefabInstance SceneOperations::placePrefab(
         EntityId id = document_.registry().createEntity(node.name.empty() ? "Prefab Node " + std::to_string(i) : node.name);
         nodeEntities[i] = id;
         if (Entity* entity = document_.registry().entity(id)) {
+            entity->transform.position = translationFromMatrix(node.transform);
+            entity->transform.rotationEuler = eulerFromMatrix(node.transform);
+            entity->transform.scale = scaleFromMatrix(node.transform);
+            entity->transform.dirty = true;
             entity->defaultTransform = entity->transform;
+            if (node.hasCamera) {
+                Camera camera = cameraFromPrefabNode(node);
+                camera.active = !hadActiveCamera && !assignedPrefabCamera;
+                entity->camera = camera;
+                if (camera.active) {
+                    document_.setActiveCamera(id);
+                    assignedPrefabCamera = true;
+                }
+            }
             instance.generatedEntityUuids.push_back(entity->uuid);
         }
     }

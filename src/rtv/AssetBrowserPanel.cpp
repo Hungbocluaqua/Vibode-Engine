@@ -373,6 +373,13 @@ bool isMaterialAssetPath(const std::filesystem::path& path) {
     return lowerString(path.extension().string()) == ".mtl";
 }
 
+bool isMtlTextureMapLine(const std::string& lowerLine) {
+    return lowerLine.rfind("map_", 0) == 0 ||
+        lowerLine.rfind("bump ", 0) == 0 ||
+        lowerLine.rfind("disp ", 0) == 0 ||
+        lowerLine.rfind("decal ", 0) == 0;
+}
+
 bool isIesAssetPath(const std::filesystem::path& path) {
     return lowerString(path.extension().string()) == ".ies";
 }
@@ -2528,12 +2535,12 @@ AssetBrowserPanel::SourcePreview& AssetBrowserPanel::sourcePreviewForPath(const 
         size_t textureRefs = 0;
         std::string line;
         while (std::getline(file, line)) {
-            const std::string lower = lowerString(line);
+            const std::string lower = lowerString(trimString(line));
             if (lower.rfind("newmtl ", 0) == 0) ++materials;
-            if (lower.rfind("map_", 0) == 0) ++textureRefs;
+            if (isMtlTextureMapLine(lower)) ++textureRefs;
         }
         preview.lines.push_back(countLabel("Materials", materials));
-        preview.lines.push_back(countLabel("Texture refs", textureRefs));
+        preview.lines.push_back(countLabel("Texture maps", textureRefs));
         preview.lines.push_back("Swatch preview from source metadata");
         return finishPreview();
     }
@@ -3148,6 +3155,192 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
     const std::vector<std::string> registryTags = collectRegistryTags(state.assetRegistry);
     const std::vector<std::string> tagSuggestions = mergedTagSuggestions(registryTags, state.editorPrefs);
 
+    struct RegistryGroupView {
+        std::string id;
+        std::string name;
+        AssetGuid rootGuid;
+        std::vector<AssetGuid> guids;
+    };
+    auto registryGroupIdForRecord = [](const AssetRecord& record) {
+        if (!record.importGroupId.empty()) {
+            return record.importGroupId;
+        }
+        if (!record.sourceHash.empty() && !record.importSettingsHash.empty()) {
+            return record.sourceHash + ":" + record.importSettingsHash;
+        }
+        if (!record.sourcePath.empty()) {
+            return std::string("source:") + lowerString(std::filesystem::path(record.sourcePath).lexically_normal().generic_string());
+        }
+        if (!record.importedPath.empty()) {
+            return std::string("imported:") + lowerString(std::filesystem::path(record.importedPath).parent_path().lexically_normal().generic_string());
+        }
+        return std::string("asset:") + record.guid;
+    };
+    auto registryGroupNameForRecord = [](const AssetRecord& record) {
+        if (!record.importGroupName.empty()) {
+            return record.importGroupName;
+        }
+        if (!record.sourcePath.empty()) {
+            const std::string stem = std::filesystem::path(record.sourcePath).stem().string();
+            if (!stem.empty()) {
+                return stem;
+            }
+        }
+        if (!record.importedPath.empty()) {
+            const std::string parent = std::filesystem::path(record.importedPath).parent_path().filename().string();
+            if (!parent.empty()) {
+                return parent;
+            }
+        }
+        return record.displayName.empty() ? std::string("Ungrouped") : record.displayName;
+    };
+    std::vector<RegistryGroupView> registryGroups;
+    for (const AssetRecord& record : records) {
+        const std::string groupId = registryGroupIdForRecord(record);
+        auto groupIt = std::find_if(registryGroups.begin(), registryGroups.end(), [&](const RegistryGroupView& group) {
+            return group.id == groupId;
+        });
+        if (groupIt == registryGroups.end()) {
+            RegistryGroupView group;
+            group.id = groupId;
+            group.name = registryGroupNameForRecord(record);
+            group.rootGuid = record.importRootGuid.empty() ? record.guid : record.importRootGuid;
+            group.guids.push_back(record.guid);
+            registryGroups.push_back(std::move(group));
+        } else {
+            groupIt->guids.push_back(record.guid);
+            if (groupIt->rootGuid.empty() && !record.importRootGuid.empty()) {
+                groupIt->rootGuid = record.importRootGuid;
+            }
+        }
+    }
+    std::sort(registryGroups.begin(), registryGroups.end(), [](const RegistryGroupView& lhs, const RegistryGroupView& rhs) {
+        if (lowerString(lhs.name) != lowerString(rhs.name)) return lowerString(lhs.name) < lowerString(rhs.name);
+        return lhs.id < rhs.id;
+    });
+    if (!selectedRegistryGroupId_.empty()) {
+        const bool selectedGroupExists = std::any_of(registryGroups.begin(), registryGroups.end(), [&](const RegistryGroupView& group) {
+            return group.id == selectedRegistryGroupId_;
+        });
+        if (!selectedGroupExists) {
+            selectedRegistryGroupId_.clear();
+        }
+    }
+
+    const RegistryGroupView* selectedRegistryGroup = nullptr;
+    for (const RegistryGroupView& group : registryGroups) {
+        if (group.id == selectedRegistryGroupId_) {
+            selectedRegistryGroup = &group;
+            break;
+        }
+    }
+
+    ImGui::SeparatorText("Asset Registry Browser");
+    ImGui::BeginChild("RegistryFolderTree", ImVec2(300.0f, 132.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::TextDisabled("Folders");
+    auto drawRegistryFolderIcon = [](ImGuiTreeNodeFlags flags) {
+        const ImVec2 rowMin = ImGui::GetItemRectMin();
+        const ImVec2 rowMax = ImGui::GetItemRectMax();
+        const float iconX = rowMin.x + ((flags & ImGuiTreeNodeFlags_Leaf) ? ImGui::GetTreeNodeToLabelSpacing() : ImGui::GetTreeNodeToLabelSpacing()) + 2.0f;
+        const float iconY = rowMin.y + std::max(0.0f, (rowMax.y - rowMin.y - 16.0f) * 0.5f);
+        editorDrawIconGlyph(EditorGlyphIcon::Folder, ImVec2(iconX, iconY), ImVec2(iconX + 16.0f, iconY + 16.0f), IM_COL32(185, 202, 224, 255));
+    };
+    auto drawAllImportsRow = [&]() {
+        ImGui::PushID("AllImportsFolder");
+        const std::string label = editorGlyphLabel("All Imports (" + std::to_string(records.size()) + ")");
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (selectedRegistryGroupId_.empty()) {
+            flags |= ImGuiTreeNodeFlags_Selected;
+        }
+        editorDrawPreRowBand(EditorUiMetric::contentRowHeight);
+        editorPushRowSelectionStyle();
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, editorRowFramePadding(EditorUiMetric::contentRowHeight));
+        ImGui::TreeNodeEx(label.c_str(), flags);
+        ImGui::PopStyleVar();
+        editorPopRowSelectionStyle();
+        drawRegistryFolderIcon(flags);
+        if (ImGui::IsItemClicked()) {
+            selectedRegistryGroupId_.clear();
+        }
+        ImGui::PopID();
+    };
+    drawAllImportsRow();
+
+    ImGui::PushID("ImportedAssetsRoot");
+    const std::string rootLabel = editorGlyphLabel("Imported Assets");
+    ImGuiTreeNodeFlags rootFlags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+    editorDrawPreRowBand(EditorUiMetric::contentRowHeight);
+    editorPushRowSelectionStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, editorRowFramePadding(EditorUiMetric::contentRowHeight));
+    const bool rootOpen = ImGui::TreeNodeEx(rootLabel.c_str(), rootFlags);
+    ImGui::PopStyleVar();
+    editorPopRowSelectionStyle();
+    drawRegistryFolderIcon(rootFlags);
+    if (rootOpen) {
+        for (const RegistryGroupView& group : registryGroups) {
+            ImGui::PushID(group.id.c_str());
+            const std::string label = editorGlyphLabel(group.name + " (" + std::to_string(group.guids.size()) + ")");
+            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanAvailWidth;
+            if (selectedRegistryGroupId_ == group.id) {
+                flags |= ImGuiTreeNodeFlags_Selected;
+            }
+            editorDrawPreRowBand(EditorUiMetric::contentRowHeight);
+            editorPushRowSelectionStyle();
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, editorRowFramePadding(EditorUiMetric::contentRowHeight));
+            ImGui::TreeNodeEx(label.c_str(), flags);
+            ImGui::PopStyleVar();
+            editorPopRowSelectionStyle();
+            drawRegistryFolderIcon(flags);
+            if (ImGui::IsItemClicked()) {
+                selectedRegistryGroupId_ = group.id;
+            }
+            if (ImGui::BeginPopupContextItem()) {
+                if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Remove Folder From Registry")) {
+                    requests.deleteAssets = EditorDeleteAssetRequest{group.guids, false};
+                    if (selectedRegistryGroupId_ == group.id) {
+                        selectedRegistryGroupId_.clear();
+                    }
+                    status_ = "Queued registry folder removal: " + group.name;
+                }
+                if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Delete Folder Generated Files")) {
+                    requests.deleteAssets = EditorDeleteAssetRequest{group.guids, true};
+                    if (selectedRegistryGroupId_ == group.id) {
+                        selectedRegistryGroupId_.clear();
+                    }
+                    status_ = "Queued registry folder file delete: " + group.name;
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted(selectedRegistryGroup != nullptr ? selectedRegistryGroup->name.c_str() : "All Imports");
+    ImGui::TextDisabled(
+        selectedRegistryGroup != nullptr ? "%zu assets in selected folder" : "%zu assets across %zu folders",
+        selectedRegistryGroup != nullptr ? selectedRegistryGroup->guids.size() : records.size(),
+        registryGroups.size());
+    if (selectedRegistryGroup != nullptr) {
+        if (contentActionButton("RegistryFolderRemoveSelected", EditorGlyphIcon::Trash, "Remove Folder", "Remove this virtual folder's records from the registry")) {
+            requests.deleteAssets = EditorDeleteAssetRequest{selectedRegistryGroup->guids, false};
+            selectedRegistryGroupId_.clear();
+            status_ = "Queued registry folder removal: " + selectedRegistryGroup->name;
+        }
+        ImGui::SameLine();
+        if (contentActionButton("RegistryFolderDeleteSelectedFiles", EditorGlyphIcon::Trash, "Delete Files", "Remove this virtual folder and delete generated metadata/cache files inside the project")) {
+            requests.deleteAssets = EditorDeleteAssetRequest{selectedRegistryGroup->guids, true};
+            selectedRegistryGroupId_.clear();
+            status_ = "Queued registry folder file delete: " + selectedRegistryGroup->name;
+        }
+    } else {
+        ImGui::TextDisabled("Select a folder to filter the registry table.");
+    }
+    ImGui::EndGroup();
+
     constexpr const char* typeFilters[] = {"All Types", "Mesh", "Material", "Texture", "HDRI", "Scene", "Prefab", "Unknown"};
     constexpr const char* statusFilters[] = {"All Status", "Imported", "Missing", "Stale", "Failed", "Unknown"};
     constexpr const char* healthFilters[] = {
@@ -3240,7 +3433,7 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
             ImGui::SetTooltip("Use an existing asset tag as the filter");
         }
     }
-    const bool filtersActive = registryTypeFilter_ != 0 || registryStatusFilter_ != 0 || registryHealthFilter_ != 0 || registryCollectionFilter_ != 0 || registryFavoriteFilter_ != 0 || registryTagFilter_[0] != '\0' || search_[0] != '\0';
+    const bool filtersActive = registryTypeFilter_ != 0 || registryStatusFilter_ != 0 || registryHealthFilter_ != 0 || registryCollectionFilter_ != 0 || registryFavoriteFilter_ != 0 || !selectedRegistryGroupId_.empty() || registryTagFilter_[0] != '\0' || search_[0] != '\0';
     if (filtersActive) {
         ImGui::SameLine();
         if (ImGui::SmallButton("Clear Filters")) {
@@ -3249,6 +3442,7 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
             registryHealthFilter_ = 0;
             registryCollectionFilter_ = 0;
             registryFavoriteFilter_ = 0;
+            selectedRegistryGroupId_.clear();
             std::fill(registryTagFilter_.begin(), registryTagFilter_.end(), '\0');
             std::fill(search_.begin(), search_.end(), '\0');
         }
@@ -3284,6 +3478,7 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         }
         return lowerString(record.displayName).find(filter) != std::string::npos ||
             lowerString(record.guid).find(filter) != std::string::npos ||
+            lowerString(record.importGroupName).find(filter) != std::string::npos ||
             lowerString(record.sourcePath).find(filter) != std::string::npos ||
             lowerString(record.importedPath).find(filter) != std::string::npos ||
             lowerString(record.cachePath).find(filter) != std::string::npos ||
@@ -3308,7 +3503,8 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         const EditorAssetCollection* collection = selectedCollection(state.editorPrefs, registryCollectionFilter_);
         const bool collectionMatches = collection == nullptr || collectionContainsAsset(*collection, record.guid);
         const bool favoriteMatches = registryFavoriteFilter_ == 0 || (state.editorPrefs != nullptr && assetGuidListContains(state.editorPrefs->favoriteAssetGuids, record.guid));
-        return typeMatches(record.type) && statusMatches(record.status) && healthMatches(record) && collectionMatches && favoriteMatches && recordHasTagMatch(record, registryTagFilter_.data()) && searchMatches(record);
+        const bool groupMatches = selectedRegistryGroupId_.empty() || registryGroupIdForRecord(record) == selectedRegistryGroupId_;
+        return groupMatches && typeMatches(record.type) && statusMatches(record.status) && healthMatches(record) && collectionMatches && favoriteMatches && recordHasTagMatch(record, registryTagFilter_.data()) && searchMatches(record);
     };
 
     std::vector<AssetGuid> visibleRecordGuids;
@@ -3323,122 +3519,147 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
     }
     const size_t visibleRecordCount = visibleRecords.size();
     ImGui::TextDisabled("Showing %zu of %zu registry records", visibleRecordCount, records.size());
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(140.0f);
-    ImGui::InputTextWithHint("##collectionName", "Collection", collectionNameBuffer_.data(), collectionNameBuffer_.size());
-    if (state.editorPrefs != nullptr && !state.editorPrefs->assetCollections.empty()) {
-        ImGui::SameLine();
-        if (ImGui::BeginCombo("##collectionPicker", "Collections")) {
-            for (const EditorAssetCollection& collection : state.editorPrefs->assetCollections) {
-                if (ImGui::Selectable(collection.name.c_str(), false)) {
-                    setTextBuffer(collectionNameBuffer_, collection.name);
-                }
-            }
-            ImGui::EndCombo();
-        }
-    }
-    const std::string collectionName = trimString(collectionNameBuffer_.data());
-    const bool canEditCollection = state.editorPrefs != nullptr && !collectionName.empty();
     auto savePrefsStatus = [&](std::string successMessage, std::string failureDetail) {
         if (state.editorPrefs == nullptr) {
             return;
         }
         setPreferenceSaveStatus(state.editorPrefs->save(EditorPreferences::defaultPath()), status_, std::move(successMessage), std::move(failureDetail));
     };
-    ImGui::SameLine();
-    if (!canEditCollection || visibleRecordGuids.empty()) {
-        ImGui::BeginDisabled();
-    }
-    if (contentActionButton("AddVisibleToCollection", EditorGlyphIcon::Add, "Add Visible", "Add currently visible registry records to this collection")) {
-        state.editorPrefs->addAssetsToCollection(collectionName, visibleRecordGuids);
-        savePrefsStatus("Added visible assets to collection: " + collectionName, "add visible assets to collection " + collectionName);
-    }
-    if (!canEditCollection || visibleRecordGuids.empty()) {
-        ImGui::EndDisabled();
-    }
-    ImGui::SameLine();
-    if (!canEditCollection || visibleRecordGuids.empty()) {
-        ImGui::BeginDisabled();
-    }
-    if (contentActionButton("RemoveVisibleFromCollection", EditorGlyphIcon::Trash, "Remove Visible", "Remove currently visible registry records from this collection")) {
-        state.editorPrefs->removeAssetsFromCollection(collectionName, visibleRecordGuids);
-        savePrefsStatus("Removed visible assets from collection: " + collectionName, "remove visible assets from collection " + collectionName);
-    }
-    if (!canEditCollection || visibleRecordGuids.empty()) {
-        ImGui::EndDisabled();
-    }
-    ImGui::SameLine();
-    if (!canEditCollection) {
-        ImGui::BeginDisabled();
-    }
-    if (contentActionButton("DeleteCollection", EditorGlyphIcon::Trash, "Delete Collection", "Delete this saved asset collection")) {
-        const bool deletingActiveCollection = [&] {
-            const EditorAssetCollection* selected = selectedCollection(state.editorPrefs, registryCollectionFilter_);
-            return selected != nullptr && selected->name == collectionName;
-        }();
-        state.editorPrefs->removeAssetCollection(collectionName);
-        if (deletingActiveCollection) {
-            registryCollectionFilter_ = 0;
-        }
-        savePrefsStatus("Deleted collection: " + collectionName, "delete collection " + collectionName);
-    }
-    if (!canEditCollection) {
-        ImGui::EndDisabled();
-    }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(132.0f);
-    ImGui::InputTextWithHint("##bulkTag", "Bulk add tag", bulkTagBuffer_.data(), bulkTagBuffer_.size());
-    if (!tagSuggestions.empty()) {
-        ImGui::SameLine();
-        if (ImGui::BeginCombo("##bulkTagPreset", "Tags")) {
-            for (const std::string& tag : tagSuggestions) {
-                if (ImGui::Selectable(tag.c_str(), false)) {
-                    setTextBuffer(bulkTagBuffer_, tag);
+    if (ImGui::TreeNodeEx("Registry Bulk Tools")) {
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::InputTextWithHint("##collectionName", "Collection", collectionNameBuffer_.data(), collectionNameBuffer_.size());
+        if (state.editorPrefs != nullptr && !state.editorPrefs->assetCollections.empty()) {
+            ImGui::SameLine();
+            if (ImGui::BeginCombo("##collectionPicker", "Collections")) {
+                for (const EditorAssetCollection& collection : state.editorPrefs->assetCollections) {
+                    if (ImGui::Selectable(collection.name.c_str(), false)) {
+                        setTextBuffer(collectionNameBuffer_, collection.name);
+                    }
                 }
+                ImGui::EndCombo();
             }
-            ImGui::EndCombo();
         }
-    }
-    const std::string bulkTag = trimString(bulkTagBuffer_.data());
-    const bool bulkTagSaved = state.editorPrefs != nullptr && tagListContains(state.editorPrefs->assetTagPresets, bulkTag);
-    ImGui::SameLine();
-    if (state.editorPrefs == nullptr || bulkTag.empty() || bulkTagSaved) {
-        ImGui::BeginDisabled();
-    }
-    if (contentActionButton("SaveBulkTagPreset", EditorGlyphIcon::Add, "Save Preset", "Save this tag as an editor preset")) {
-        state.editorPrefs->addAssetTagPreset(bulkTag);
-        savePrefsStatus("Saved tag preset: " + bulkTag, "save tag preset " + bulkTag);
-    }
-    if (state.editorPrefs == nullptr || bulkTag.empty() || bulkTagSaved) {
-        ImGui::EndDisabled();
-    }
-    ImGui::SameLine();
-    if (state.editorPrefs == nullptr || bulkTag.empty() || !bulkTagSaved) {
-        ImGui::BeginDisabled();
-    }
-    if (contentActionButton("RemoveBulkTagPreset", EditorGlyphIcon::Trash, "Remove Preset", "Remove this tag from editor presets")) {
-        state.editorPrefs->removeAssetTagPreset(bulkTag);
-        savePrefsStatus("Removed tag preset: " + bulkTag, "remove tag preset " + bulkTag);
-    }
-    if (state.editorPrefs == nullptr || bulkTag.empty() || !bulkTagSaved) {
-        ImGui::EndDisabled();
-    }
-    const bool canBulkTag = !bulkTag.empty() && !visibleRecordGuids.empty();
-    ImGui::SameLine();
-    if (!canBulkTag) {
-        ImGui::BeginDisabled();
-    }
-    if (contentActionButton("BulkAddTagVisible", EditorGlyphIcon::Add, "Tag Visible", "Add this tag to all currently visible registry records")) {
-        requests.bulkAddAssetTag = EditorBulkAssetTagRequest{visibleRecordGuids, bulkTag};
-        status_ = "Queued bulk tag: " + bulkTag;
-    }
-    ImGui::SameLine();
-    if (contentActionButton("BulkRemoveTagVisible", EditorGlyphIcon::Trash, "Untag Visible", "Remove this tag from all currently visible registry records")) {
-        requests.bulkRemoveAssetTag = EditorBulkAssetTagRequest{visibleRecordGuids, bulkTag};
-        status_ = "Queued bulk untag: " + bulkTag;
-    }
-    if (!canBulkTag) {
-        ImGui::EndDisabled();
+        const std::string collectionName = trimString(collectionNameBuffer_.data());
+        const bool canEditCollection = state.editorPrefs != nullptr && !collectionName.empty();
+        ImGui::SameLine();
+        if (!canEditCollection || visibleRecordGuids.empty()) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("AddVisibleToCollection", EditorGlyphIcon::Add, "Add Visible", "Add currently visible registry records to this collection")) {
+            state.editorPrefs->addAssetsToCollection(collectionName, visibleRecordGuids);
+            savePrefsStatus("Added visible assets to collection: " + collectionName, "add visible assets to collection " + collectionName);
+        }
+        if (!canEditCollection || visibleRecordGuids.empty()) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (!canEditCollection || visibleRecordGuids.empty()) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("RemoveVisibleFromCollection", EditorGlyphIcon::Trash, "Remove Visible", "Remove currently visible registry records from this collection")) {
+            state.editorPrefs->removeAssetsFromCollection(collectionName, visibleRecordGuids);
+            savePrefsStatus("Removed visible assets from collection: " + collectionName, "remove visible assets from collection " + collectionName);
+        }
+        if (!canEditCollection || visibleRecordGuids.empty()) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (!canEditCollection) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("DeleteCollection", EditorGlyphIcon::Trash, "Delete Collection", "Delete this saved asset collection")) {
+            const bool deletingActiveCollection = [&] {
+                const EditorAssetCollection* selected = selectedCollection(state.editorPrefs, registryCollectionFilter_);
+                return selected != nullptr && selected->name == collectionName;
+            }();
+            state.editorPrefs->removeAssetCollection(collectionName);
+            if (deletingActiveCollection) {
+                registryCollectionFilter_ = 0;
+            }
+            savePrefsStatus("Deleted collection: " + collectionName, "delete collection " + collectionName);
+        }
+        if (!canEditCollection) {
+            ImGui::EndDisabled();
+        }
+
+        ImGui::SetNextItemWidth(132.0f);
+        ImGui::InputTextWithHint("##bulkTag", "Bulk add tag", bulkTagBuffer_.data(), bulkTagBuffer_.size());
+        if (!tagSuggestions.empty()) {
+            ImGui::SameLine();
+            if (ImGui::BeginCombo("##bulkTagPreset", "Tags")) {
+                for (const std::string& tag : tagSuggestions) {
+                    if (ImGui::Selectable(tag.c_str(), false)) {
+                        setTextBuffer(bulkTagBuffer_, tag);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        }
+        const std::string bulkTag = trimString(bulkTagBuffer_.data());
+        const bool bulkTagSaved = state.editorPrefs != nullptr && tagListContains(state.editorPrefs->assetTagPresets, bulkTag);
+        ImGui::SameLine();
+        if (state.editorPrefs == nullptr || bulkTag.empty() || bulkTagSaved) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("SaveBulkTagPreset", EditorGlyphIcon::Add, "Save Preset", "Save this tag as an editor preset")) {
+            state.editorPrefs->addAssetTagPreset(bulkTag);
+            savePrefsStatus("Saved tag preset: " + bulkTag, "save tag preset " + bulkTag);
+        }
+        if (state.editorPrefs == nullptr || bulkTag.empty() || bulkTagSaved) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (state.editorPrefs == nullptr || bulkTag.empty() || !bulkTagSaved) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("RemoveBulkTagPreset", EditorGlyphIcon::Trash, "Remove Preset", "Remove this tag from editor presets")) {
+            state.editorPrefs->removeAssetTagPreset(bulkTag);
+            savePrefsStatus("Removed tag preset: " + bulkTag, "remove tag preset " + bulkTag);
+        }
+        if (state.editorPrefs == nullptr || bulkTag.empty() || !bulkTagSaved) {
+            ImGui::EndDisabled();
+        }
+        const bool canBulkTag = !bulkTag.empty() && !visibleRecordGuids.empty();
+        ImGui::SameLine();
+        if (!canBulkTag) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("BulkAddTagVisible", EditorGlyphIcon::Add, "Tag Visible", "Add this tag to all currently visible registry records")) {
+            requests.bulkAddAssetTag = EditorBulkAssetTagRequest{visibleRecordGuids, bulkTag};
+            status_ = "Queued bulk tag: " + bulkTag;
+        }
+        ImGui::SameLine();
+        if (contentActionButton("BulkRemoveTagVisible", EditorGlyphIcon::Trash, "Untag Visible", "Remove this tag from all currently visible registry records")) {
+            requests.bulkRemoveAssetTag = EditorBulkAssetTagRequest{visibleRecordGuids, bulkTag};
+            status_ = "Queued bulk untag: " + bulkTag;
+        }
+        if (!canBulkTag) {
+            ImGui::EndDisabled();
+        }
+        const bool canDeleteVisible = !visibleRecordGuids.empty();
+        ImGui::Separator();
+        if (!canDeleteVisible) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("DeleteVisibleRegistryRecords", EditorGlyphIcon::Trash, "Remove Visible", "Remove currently visible records from the asset registry")) {
+            requests.deleteAssets = EditorDeleteAssetRequest{visibleRecordGuids, false};
+            if (std::find(visibleRecordGuids.begin(), visibleRecordGuids.end(), selectedRecordGuid_) != visibleRecordGuids.end()) {
+                selectedRecordGuid_.clear();
+            }
+            status_ = "Queued visible registry record removal";
+        }
+        ImGui::SameLine();
+        if (contentActionButton("DeleteVisibleGeneratedFiles", EditorGlyphIcon::Trash, "Delete Visible Files", "Remove visible records and delete their generated metadata/cache files inside the project")) {
+            requests.deleteAssets = EditorDeleteAssetRequest{visibleRecordGuids, true};
+            if (std::find(visibleRecordGuids.begin(), visibleRecordGuids.end(), selectedRecordGuid_) != visibleRecordGuids.end()) {
+                selectedRecordGuid_.clear();
+            }
+            status_ = "Queued visible registry file delete";
+        }
+        if (!canDeleteVisible) {
+            ImGui::EndDisabled();
+        }
+        ImGui::TreePop();
     }
     const std::filesystem::path sourceControlRoot = state.project != nullptr ? state.project->projectRoot : browserRoot_;
     auto cachedSourceControlStatus = [&](const std::filesystem::path& path) {
@@ -3482,7 +3703,8 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
     auto overwriteRisksForRecord = [&](const AssetRecord& record) {
         return collectAssetOverwriteRisks(state, record, cachedSourceControlStatus);
     };
-    if (ImGui::BeginTable("AssetRegistryRecords", 13, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX)) {
+    const ImVec2 registryTableSize(0.0f, std::max(160.0f, ImGui::GetContentRegionAvail().y - 8.0f));
+    if (ImGui::BeginTable("AssetRegistryRecords", 13, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY, registryTableSize)) {
         ImGui::TableSetupColumn("Fav", ImGuiTableColumnFlags_WidthFixed, 38.0f);
         ImGui::TableSetupColumn("Type");
         ImGui::TableSetupColumn("Name");
@@ -3589,6 +3811,21 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                     status_ = overwriteRisks.empty()
                         ? "Queued reimport: " + record.displayName
                         : "Queued reimport after overwrite warning: " + record.displayName;
+                }
+                ImGui::Separator();
+                if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Remove From Registry")) {
+                    requests.deleteAssets = EditorDeleteAssetRequest{{record.guid}, false};
+                    if (selectedRecordGuid_ == record.guid) {
+                        selectedRecordGuid_.clear();
+                    }
+                    status_ = "Queued registry record removal: " + record.displayName;
+                }
+                if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Delete Generated Files")) {
+                    requests.deleteAssets = EditorDeleteAssetRequest{{record.guid}, true};
+                    if (selectedRecordGuid_ == record.guid) {
+                        selectedRecordGuid_.clear();
+                    }
+                    status_ = "Queued generated asset file delete: " + record.displayName;
                 }
                 ImGui::EndPopup();
             }
@@ -4116,6 +4353,18 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                 } else {
                     status_ = "Asset project reference scan failed: " + error;
                 }
+            }
+            ImGui::SameLine();
+            if (contentActionButton("RemoveRegistryRecord", EditorGlyphIcon::Trash, "Remove Registry Item", "Remove this asset record from the registry and leave generated files on disk")) {
+                requests.deleteAssets = EditorDeleteAssetRequest{{record.guid}, false};
+                selectedRecordGuid_.clear();
+                status_ = "Queued registry record removal: " + record.displayName;
+            }
+            ImGui::SameLine();
+            if (contentActionButton("DeleteGeneratedAssetFiles", EditorGlyphIcon::Trash, "Delete Generated Files", "Remove this asset record and delete its generated metadata/cache files inside the project")) {
+                requests.deleteAssets = EditorDeleteAssetRequest{{record.guid}, true};
+                selectedRecordGuid_.clear();
+                status_ = "Queued generated asset file delete: " + record.displayName;
             }
             ImGui::SeparatorText("Reference Repair");
             ImGui::SetNextItemWidth(-FLT_MIN);

@@ -85,6 +85,22 @@ struct EditorRenderJobStatus {
     std::filesystem::path manifestPath;
 };
 
+struct EditorRenderRequest {
+    EditorRenderJobKind kind = EditorRenderJobKind::Image;
+    std::filesystem::path outputRoot;
+    uint32_t requestedWidth = 0;
+    uint32_t requestedHeight = 0;
+    float renderResolutionScale = 1.0f;
+    uint32_t samplesPerPixel = 1;
+    bool limitSamplesPerPixel = false;
+    uint32_t targetSamplesPerPixel = 64;
+    uint32_t imageAccumulationFrames = 64;
+    int sequenceStartFrame = 0;
+    int sequenceEndFrame = 0;
+    uint32_t sequenceFramesPerTimelineFrame = 1;
+    bool saveSequenceFramesAsDefault = false;
+};
+
 struct EditorPlacementStatus {
     EntityId entity{};
     uint64_t serial = 0;
@@ -262,6 +278,7 @@ enum class EditorEntityCreateKind : uint32_t {
     Empty,
     Camera,
     Light,
+    Sun,
     SpotLight,
     AreaLight,
     EnvironmentLight,
@@ -359,6 +376,11 @@ struct EditorBulkAssetTagRequest {
     std::string tag;
 };
 
+struct EditorDeleteAssetRequest {
+    std::vector<AssetGuid> guids;
+    bool deleteGeneratedFiles = false;
+};
+
 struct EditorRequests {
     std::optional<RendererSettings> settings;
     std::optional<AccumulationResetReason> resetAccumulation;
@@ -376,6 +398,7 @@ struct EditorRequests {
     std::optional<EditorAssetTagsRequest> updateAssetTags;
     std::optional<EditorBulkAssetTagRequest> bulkAddAssetTag;
     std::optional<EditorBulkAssetTagRequest> bulkRemoveAssetTag;
+    std::optional<EditorDeleteAssetRequest> deleteAssets;
     std::optional<AssetGuid> placeAsset;
     std::optional<Transform> placeAssetTransform;
     std::optional<std::filesystem::path> importSceneAsNewScene;
@@ -383,6 +406,7 @@ struct EditorRequests {
     std::vector<std::filesystem::path> mergeScenes;
     std::optional<CreateProjectRequest> createProject;
     std::optional<OpenProjectRequest> openProject;
+    std::optional<DeleteProjectRequest> deleteProject;
     std::optional<ProjectContext> projectSettingsUpdate;
     std::optional<std::filesystem::path> loadGltf;
     std::optional<std::filesystem::path> loadHdr;
@@ -397,8 +421,13 @@ struct EditorRequests {
     bool dismissAllDroppedFiles = false;
     std::optional<SceneUpdateKind> sceneUpdate;
     std::optional<float> cameraMoveSpeed;
+    std::optional<float> cameraFastMoveSpeed;
+    std::optional<float> cameraMouseSensitivity;
+    std::optional<bool> cameraInvertLookX;
+    std::optional<bool> cameraInvertLookY;
     std::optional<EntityId> duplicateEntity;
     std::optional<EntityId> deleteEntity;
+    std::vector<EntityId> deleteEntities;
     std::optional<EditorEntityRenameRequest> renameEntity;
     std::optional<EditorEntityCreateRequest> createEntity;
     std::optional<EditorComponentRequest> addComponent;
@@ -431,6 +460,7 @@ struct EditorRequests {
     bool renderCurrentViewport = false;
     bool renderImage = false;
     bool renderSequence = false;
+    std::optional<EditorRenderRequest> renderRequest;
     bool openProjectDirectory = false;
     bool openLogFolder = false;
     bool openSelectedAsset = false;

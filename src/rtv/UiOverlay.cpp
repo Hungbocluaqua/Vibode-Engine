@@ -602,11 +602,24 @@ bool UiOverlay::viewportHovered() const {
 }
 
 VkExtent2D UiOverlay::desiredRenderExtent(VkExtent2D fallback) const {
+    if (renderExtentOverride_.has_value() && renderExtentOverride_->width > 0u && renderExtentOverride_->height > 0u) {
+        return *renderExtentOverride_;
+    }
     VkExtent2D extent = editor_.desiredRenderExtent(fallback);
     if (extent.width == 0 || extent.height == 0) {
         extent = fallback;
     }
     return extent;
+}
+
+void UiOverlay::setRenderExtentOverride(std::optional<VkExtent2D> extent) {
+    const bool changed = renderExtentOverride_.has_value() != extent.has_value() ||
+        (extent.has_value() &&
+            (renderExtentOverride_->width != extent->width || renderExtentOverride_->height != extent->height));
+    renderExtentOverride_ = extent;
+    if (changed) {
+        invalidateViewportTexture();
+    }
 }
 
 void UiOverlay::invalidateViewportTexture() {

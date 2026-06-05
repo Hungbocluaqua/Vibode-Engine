@@ -45,11 +45,14 @@ private:
     void commitGizmoDrag(EditorRequests& requests, SceneDocument& document);
     void abortGizmoDrag();
     void updateGizmoState(bool isOver, bool isUsing, int gizmoMode);
+    void loadViewportPreferences(const EditorPreferences& preferences);
+    void persistViewportPreferences(EditorPreferences& preferences) const;
 
     VkExtent2D lastContentExtent_{};
     int transformGizmoMode_ = 0;
     bool localGizmoMode_ = false;
     SnapSettings snap_{};
+    bool viewportPreferencesLoaded_ = false;
     bool focused_ = false;
     bool hovered_ = false;
     bool rightMouseContextCandidate_ = false;
@@ -61,6 +64,8 @@ private:
     bool materialDropPopupOpen_ = false;
     AssetGuid pendingMaterialDropGuid_;
     EntityId pendingMaterialDropEntity_{};
+    std::string activePlacementPayloadKey_;
+    float placementPreviewYawRadians_ = 0.0f;
     GizmoInteractionState gizmoState_ = GizmoInteractionState::Idle;
 
     bool gizmoDragActive_ = false;
@@ -74,6 +79,8 @@ private:
     bool showAxes_ = true;
     bool showSelectionOverlay_ = true;
     bool showActorIcons_ = true;
+    bool pickMeshEntities_ = true;
+    bool pickActorIcons_ = true;
 
     uint32_t lastSampleCount_ = 0;
 };

@@ -4,7 +4,59 @@
 
 #include <nlohmann/json.hpp>
 
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
+
 namespace rtv {
+
+namespace {
+
+glm::vec3 vec3FromJson(const nlohmann::json& json, glm::vec3 fallback) {
+    if (!json.is_array() || json.size() < 3) {
+        return fallback;
+    }
+    return {
+        json[0].get<float>(),
+        json[1].get<float>(),
+        json[2].get<float>(),
+    };
+}
+
+glm::mat4 matrixFromJsonArray(const nlohmann::json& json, const glm::mat4& fallback) {
+    if (!json.is_array() || json.size() < 16) {
+        return fallback;
+    }
+    glm::mat4 result{1.0f};
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            result[col][row] = json[static_cast<size_t>(col * 4 + row)].get<float>();
+        }
+    }
+    return result;
+}
+
+glm::mat4 matrixFromTransformJson(const nlohmann::json& json, const glm::mat4& fallback) {
+    if (!json.is_object()) {
+        return fallback;
+    }
+    const glm::vec3 position = vec3FromJson(json.value("position", nlohmann::json::array()), glm::vec3{0.0f});
+    const glm::vec3 rotationEuler = vec3FromJson(json.value("rotationEuler", nlohmann::json::array()), glm::vec3{0.0f});
+    const glm::vec3 scale = vec3FromJson(json.value("scale", nlohmann::json::array()), glm::vec3{1.0f});
+    return glm::translate(glm::mat4{1.0f}, position) * glm::mat4_cast(glm::quat(rotationEuler)) * glm::scale(glm::mat4{1.0f}, scale);
+}
+
+glm::mat4 prefabNodeTransformFromJson(const nlohmann::json& json) {
+    glm::mat4 transform{1.0f};
+    if (json.contains("transform")) {
+        transform = matrixFromTransformJson(json["transform"], transform);
+    }
+    if (json.contains("matrix")) {
+        transform = matrixFromJsonArray(json["matrix"], transform);
+    }
+    return transform;
+}
+
+} // namespace
 
 bool loadPrefabAsset(const std::filesystem::path& path, PrefabAsset& outPrefab, std::string* error) {
     std::ifstream file(path);
@@ -49,7 +101,16 @@ bool loadPrefabAsset(const std::filesystem::path& path, PrefabAsset& outPrefab, 
                 PrefabNodeAsset node;
                 node.name = item.value("name", std::string{});
                 node.parent = item.value("parent", -1);
+                node.transform = prefabNodeTransformFromJson(item);
                 node.meshGuid = item.value("meshGuid", std::string{});
+                node.hasCamera = item.value("hasCamera", false);
+                node.cameraProjection = item.value("cameraProjection", node.cameraProjection);
+                node.cameraYfov = item.value("cameraYfov", node.cameraYfov);
+                node.cameraAspectRatio = item.value("cameraAspectRatio", node.cameraAspectRatio);
+                node.cameraOrthoXmag = item.value("cameraOrthoXmag", node.cameraOrthoXmag);
+                node.cameraOrthoYmag = item.value("cameraOrthoYmag", node.cameraOrthoYmag);
+                node.cameraNear = item.value("cameraNear", node.cameraNear);
+                node.cameraFar = item.value("cameraFar", node.cameraFar);
                 if (item.contains("materialGuids") && item["materialGuids"].is_array()) {
                     for (const nlohmann::json& material : item["materialGuids"]) {
                         if (material.is_string()) {

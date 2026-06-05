@@ -32,6 +32,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -47,6 +48,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <glm/glm.hpp>
@@ -84,6 +86,7 @@ SceneUpdateKind createEntityUpdateKind(EditorEntityCreateKind kind) {
     case EditorEntityCreateKind::Camera:
         return SceneUpdateKind::CameraOnly;
     case EditorEntityCreateKind::Light:
+    case EditorEntityCreateKind::Sun:
     case EditorEntityCreateKind::SpotLight:
     case EditorEntityCreateKind::AreaLight:
         return SceneUpdateKind::LightOnly;
@@ -174,6 +177,14 @@ std::string normalizedCameraName(std::string_view name) {
     return result;
 }
 
+std::string lowerPathExtension(const std::filesystem::path& path) {
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return ext;
+}
+
 float clampFrameDeltaSeconds(float rawDeltaSeconds, const PathTracerRenderer* renderer) {
     const float maxDelta = renderer != nullptr
         ? std::max(0.001f, renderer->settings().maxFrameDeltaSeconds)
@@ -214,6 +225,42 @@ std::filesystem::path normalizedPathForCompare(const std::filesystem::path& path
     }
     normalized = std::filesystem::absolute(path, ec);
     return ec ? path.lexically_normal() : normalized.lexically_normal();
+}
+
+bool pathIsInsideDirectory(const std::filesystem::path& child, const std::filesystem::path& directory) {
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(
+        normalizedPathForCompare(child),
+        normalizedPathForCompare(directory),
+        ec);
+    if (ec || relative.empty()) {
+        return false;
+    }
+    for (const std::filesystem::path& part : relative) {
+        if (part == "..") {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool projectRootLooksSafeToDelete(const std::filesystem::path& projectRoot, const std::filesystem::path& projectFile) {
+    if (projectRoot.empty() || projectFile.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(projectRoot, ec)) {
+        return false;
+    }
+    const std::filesystem::path normalizedRoot = normalizedPathForCompare(projectRoot);
+    if (!normalizedRoot.has_filename() || normalizedRoot == normalizedRoot.root_path()) {
+        return false;
+    }
+    const std::filesystem::path extension = projectFile.extension();
+    if (extension != ".vproject" && extension != ".rtproject") {
+        return false;
+    }
+    return pathIsInsideDirectory(projectFile, projectRoot);
 }
 
 bool sameRegistryPath(const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
@@ -547,6 +594,12 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     SunController::applyToRendererSettings(document, settings);
     applySceneWorldComponentsToRendererSettings(document, settings);
     return settings;
+}
+
+bool rendererSettingsRequestDlss(const RendererSettings& settings) {
+    return settings.temporalUpscaler == TemporalUpscaler::Dlss ||
+        settings.dlssRayReconstructionEnabled ||
+        settings.dlssFrameGenerationEnabled;
 }
 
 void applyDocumentMaterialAssignments(const SceneDocument& document, AssetManager& assets) {
@@ -922,6 +975,8 @@ uint32_t editorRenderImageTargetFrames(const PathTracerRenderer& renderer) {
     const uint32_t effectiveSpp = std::max(1u, renderer.effectiveSamplesPerPixel());
     return std::max(1u, (settings.accumulationLimit + effectiveSpp - 1u) / effectiveSpp);
 }
+
+constexpr uint32_t kMaxEditorRenderSequenceFramesPerTimelineFrame = 65536u;
 
 class AppSceneDocumentSnapshotCommand final : public ICommand {
 public:
@@ -1639,9 +1694,13 @@ Application::~Application() {
         uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
     }
     writeCrashMarker(false);
+    if (commandSystem_) {
+        commandSystem_->setPathTracer(nullptr);
+    }
+    retiredPathTracers_.clear();
+    pathTracer_.reset();
     commandSystem_.reset();
     uiOverlay_.reset();
-    pathTracer_.reset();
     pipelineDemo_.reset();
     resourceDemo_.reset();
     swapchain_.reset();
@@ -1865,10 +1924,11 @@ bool Application::runDescriptorLifetimeStress(
                 importedScene_ = loader.loadWithCache(*gltfPath_);
             }
             rebuildGpuSceneAsset();
+            preparePathTracerForRendererReplacement(previousSettings);
             std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
                 gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
                 gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
-                gltfPath_.has_value() ? SceneCache::cachePathFor(*gltfPath_) : std::optional<std::filesystem::path>{},
+                currentSceneCachePathForRenderer(),
                 &previousSettings);
             retirePathTracer(std::move(pathTracer_));
             pathTracer_ = std::move(nextPathTracer);
@@ -2087,6 +2147,13 @@ void Application::initVulkan() {
     }
 
     const EditorPreferences* startupPrefs = uiOverlay_ != nullptr ? &uiOverlay_->editor().editorPrefs() : nullptr;
+    if (startupPrefs != nullptr) {
+        cameraController_.setMoveSpeed(std::clamp(startupPrefs->cameraMoveSpeed, 0.05f, 100.0f));
+        cameraController_.setFastMoveSpeed(std::clamp(startupPrefs->cameraFastMoveSpeed, 0.05f, 250.0f));
+        cameraController_.setMouseSensitivity(std::clamp(startupPrefs->cameraMouseSensitivity, 0.0001f, 0.02f));
+        cameraController_.setInvertLookX(startupPrefs->cameraInvertLookX);
+        cameraController_.setInvertLookY(startupPrefs->cameraInvertLookY);
+    }
     const bool explicitStartupScene = scenePath_.has_value() || gltfPath_.has_value();
     if (explicitStartupScene && uiOverlay_ != nullptr) {
         uiOverlay_->editor().dismissProjectManager();
@@ -2262,8 +2329,10 @@ void Application::mainLoop(uint32_t maxFrames) {
         }
         if (pendingSaveLevel_) {
             pendingSaveLevel_ = false;
-            if (auto path = saveSceneJsonFileDialog()) {
-                editorRequests.saveSceneJson = *path;
+            if (scenePath_.has_value()) {
+                editorRequests.saveScene = *scenePath_;
+            } else if (auto path = saveSceneJsonFileDialog()) {
+                editorRequests.saveSceneAs = *path;
             }
         }
         if (pendingReloadShaders_) {
@@ -2437,7 +2506,7 @@ void Application::onWindowFocusChanged(bool focused) {
     }
 }
 
-void Application::startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot) {
+void Application::startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot, const EditorRenderRequest* request) {
     if (kind == EditorRenderJobKind::None || pathTracer_ == nullptr) {
         return;
     }
@@ -2470,26 +2539,77 @@ void Application::startEditorRenderJob(EditorRenderJobKind kind, const std::file
     editorRenderJobFramePrepared_ = false;
     editorRenderJobOutputFiles_.clear();
     editorRenderJobSceneSnapshot_.reset();
+    editorRenderJobSettingsSnapshot_.reset();
+    editorRenderJobAppliedSettings_.reset();
+    editorRenderJobRequest_.reset();
     editorRenderJobSequenceFramesPerTimelineFrame_ = 1;
     editorRenderJobSequenceOutputFramesWritten_ = 0;
     editorRenderJobSequenceAccumulationFrame_ = 0;
     editorRenderJob_.currentFrame = 0;
     editorRenderJob_.totalFrames = 1;
+
+    auto disableDlssRayReconstructionForOfflineRender = [&](RendererSettings& jobSettings) {
+        if (!jobSettings.dlssRayReconstructionEnabled) {
+            return;
+        }
+        jobSettings.dlssRayReconstructionEnabled = false;
+    };
+
+    if (request != nullptr && kind != EditorRenderJobKind::CurrentViewport) {
+        editorRenderJobRequest_ = *request;
+        editorRenderJobSettingsSnapshot_ = pathTracer_->settings();
+        RendererSettings jobSettings = *editorRenderJobSettingsSnapshot_;
+        jobSettings.renderPreset = RenderPreset::Custom;
+        jobSettings.samplesPerPixel = std::clamp(request->samplesPerPixel, 1u, kMaxSamplesPerPixel);
+        jobSettings.limitSamplesPerPixel = request->limitSamplesPerPixel;
+        jobSettings.renderResolutionScale = std::clamp(request->renderResolutionScale, 0.25f, 1.0f);
+        disableDlssRayReconstructionForOfflineRender(jobSettings);
+        if (kind == EditorRenderJobKind::Image) {
+            const uint32_t effectiveSpp = request->limitSamplesPerPixel ? 1u : jobSettings.samplesPerPixel;
+            jobSettings.accumulationLimit = std::max(1u, request->imageAccumulationFrames) * std::max(1u, effectiveSpp);
+        }
+        (void)pathTracer_->applySettings(jobSettings);
+        editorRenderJobAppliedSettings_ = jobSettings;
+        if (request->requestedWidth > 0u && request->requestedHeight > 0u && uiOverlay_ != nullptr) {
+            uiOverlay_->setRenderExtentOverride(VkExtent2D{request->requestedWidth, request->requestedHeight});
+        }
+    } else if (kind != EditorRenderJobKind::CurrentViewport && pathTracer_->settings().dlssRayReconstructionEnabled) {
+        editorRenderJobSettingsSnapshot_ = pathTracer_->settings();
+        RendererSettings jobSettings = *editorRenderJobSettingsSnapshot_;
+        jobSettings.renderPreset = RenderPreset::Custom;
+        disableDlssRayReconstructionForOfflineRender(jobSettings);
+        (void)pathTracer_->applySettings(jobSettings);
+        editorRenderJobAppliedSettings_ = jobSettings;
+    }
+
     if (kind == EditorRenderJobKind::Image) {
-        editorRenderJob_.totalFrames = static_cast<int>(editorRenderImageTargetFrames(*pathTracer_));
+        editorRenderJob_.totalFrames = request != nullptr
+            ? static_cast<int>(std::max(1u, request->imageAccumulationFrames))
+            : static_cast<int>(editorRenderImageTargetFrames(*pathTracer_));
         editorRenderJob_.status = "Rendering image accumulation";
         pathTracer_->resetAccumulation(AccumulationResetReason::Manual);
     }
     if (kind == EditorRenderJobKind::Sequence && uiOverlay_ != nullptr) {
         const EditorTimeline& timeline = uiOverlay_->editor().timeline();
-        editorRenderJobSequenceStartFrame_ = timeline.startFrame;
-        editorRenderJobSequenceEndFrame_ = timeline.endFrame;
-        editorRenderJobSequenceFramesPerTimelineFrame_ = static_cast<uint32_t>(std::clamp(
-            uiOverlay_->editor().editorPrefs().renderSequenceFramesPerTimelineFrame,
-            1,
-            512));
+        editorRenderJobSequenceStartFrame_ = request != nullptr ? request->sequenceStartFrame : timeline.startFrame;
+        editorRenderJobSequenceEndFrame_ = request != nullptr ? request->sequenceEndFrame : timeline.endFrame;
+        if (editorRenderJobSequenceEndFrame_ < editorRenderJobSequenceStartFrame_) {
+            editorRenderJobSequenceEndFrame_ = editorRenderJobSequenceStartFrame_;
+        }
+        editorRenderJobSequenceFramesPerTimelineFrame_ = request != nullptr
+            ? std::clamp(request->sequenceFramesPerTimelineFrame, 1u, kMaxEditorRenderSequenceFramesPerTimelineFrame)
+            : static_cast<uint32_t>(std::clamp(
+                uiOverlay_->editor().editorPrefs().renderSequenceFramesPerTimelineFrame,
+                1,
+                512));
+        if (request != nullptr && request->saveSequenceFramesAsDefault) {
+            EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+            prefs.renderSequenceFramesPerTimelineFrame = std::clamp(static_cast<int>(editorRenderJobSequenceFramesPerTimelineFrame_), 1, 512);
+            prefs.save(EditorPreferences::defaultPath());
+        }
         const int timelineFrameCount = std::max(1, editorRenderJobSequenceEndFrame_ - editorRenderJobSequenceStartFrame_ + 1);
-        editorRenderJob_.totalFrames = timelineFrameCount * static_cast<int>(editorRenderJobSequenceFramesPerTimelineFrame_);
+        const uint64_t totalFrames = static_cast<uint64_t>(timelineFrameCount) * editorRenderJobSequenceFramesPerTimelineFrame_;
+        editorRenderJob_.totalFrames = static_cast<int>(std::min<uint64_t>(totalFrames, static_cast<uint64_t>(std::numeric_limits<int>::max())));
         editorRenderJobTimelineWasPlaying_ = timeline.playing;
         editorRenderJobPreviousTimelineFrame_ = timeline.currentFrame;
         editorRenderJobSceneSnapshot_ = sceneDocument_;
@@ -2663,6 +2783,7 @@ void Application::updateEditorRenderJob(float deltaSeconds) {
                 editorRenderJob_.active = false;
                 editorRenderJob_.failed = true;
                 editorRenderJob_.status = "Unable to write image.png";
+                restoreEditorRenderJobSceneState();
                 writeEditorRenderJobManifest("failed");
                 notifications_.notify("Render image failed", NotificationType::Error, NotificationAction::OpenOutputFolder, "Open Output", 6.0f);
                 return;
@@ -2694,6 +2815,9 @@ void Application::updateEditorRenderJob(float deltaSeconds) {
         editorRenderJobSequenceAccumulationFrame_ = 0;
         editorRenderJobOutputFiles_.clear();
         editorRenderJobSceneSnapshot_.reset();
+        editorRenderJobSettingsSnapshot_.reset();
+        editorRenderJobAppliedSettings_.reset();
+        editorRenderJobRequest_.reset();
     }
 }
 
@@ -2717,21 +2841,31 @@ bool Application::exportEditorRenderJobImage(const std::filesystem::path& output
 }
 
 void Application::restoreEditorRenderJobSceneState() {
-    if (!editorRenderJobSceneSnapshot_.has_value()) {
-        return;
+    const bool restoredScene = editorRenderJobSceneSnapshot_.has_value();
+    if (restoredScene) {
+        sceneDocument_ = std::move(*editorRenderJobSceneSnapshot_);
+        editorRenderJobSceneSnapshot_.reset();
+        if (uiOverlay_ != nullptr) {
+            EditorTimeline& timeline = uiOverlay_->editor().timeline();
+            timeline.playing = editorRenderJobTimelineWasPlaying_;
+            timeline.currentFrame = editorRenderJobPreviousTimelineFrame_;
+        }
     }
-
-    sceneDocument_ = std::move(*editorRenderJobSceneSnapshot_);
-    editorRenderJobSceneSnapshot_.reset();
     if (uiOverlay_ != nullptr) {
-        EditorTimeline& timeline = uiOverlay_->editor().timeline();
-        timeline.playing = editorRenderJobTimelineWasPlaying_;
-        timeline.currentFrame = editorRenderJobPreviousTimelineFrame_;
+        uiOverlay_->setRenderExtentOverride(std::nullopt);
     }
     if (pathTracer_ != nullptr) {
-        sceneDocument_.markDirty(SceneUpdateKind::TransformOnly);
-        (void)applyPendingSceneUpdate(false);
+        if (editorRenderJobSettingsSnapshot_.has_value()) {
+            (void)pathTracer_->applySettings(*editorRenderJobSettingsSnapshot_);
+            editorRenderJobSettingsSnapshot_.reset();
+        }
+        if (restoredScene) {
+            sceneDocument_.markDirty(SceneUpdateKind::TransformOnly);
+            (void)applyPendingSceneUpdate(false);
+        }
         pathTracer_->resetAccumulation(AccumulationResetReason::Manual);
+    } else {
+        editorRenderJobSettingsSnapshot_.reset();
     }
 }
 
@@ -2749,7 +2883,7 @@ void Application::writeEditorRenderJobManifest(const char* eventLabel) {
         return;
     }
 
-    const RendererSettings settings = pathTracer_->settings();
+    const RendererSettings settings = editorRenderJobAppliedSettings_.value_or(pathTracer_->settings());
     nlohmann::json manifest;
     manifest["event"] = eventLabel;
     manifest["action"] = editorRenderJobAction(editorRenderJob_.kind);
@@ -2789,6 +2923,26 @@ void Application::writeEditorRenderJobManifest(const char* eventLabel) {
         {"width", pathTracer_->displayExtent().width},
         {"height", pathTracer_->displayExtent().height},
     };
+    manifest["render_extent"] = {
+        {"width", pathTracer_->renderExtent().width},
+        {"height", pathTracer_->renderExtent().height},
+    };
+    if (editorRenderJobRequest_.has_value()) {
+        const EditorRenderRequest& request = *editorRenderJobRequest_;
+        manifest["requested"] = {
+            {"output_root", request.outputRoot.string()},
+            {"width", request.requestedWidth},
+            {"height", request.requestedHeight},
+            {"render_resolution_scale", request.renderResolutionScale},
+            {"samples_per_pixel", request.samplesPerPixel},
+            {"limit_samples_per_pixel", request.limitSamplesPerPixel},
+            {"target_samples_per_pixel", request.targetSamplesPerPixel},
+            {"image_accumulation_frames", request.imageAccumulationFrames},
+            {"sequence_start_frame", request.sequenceStartFrame},
+            {"sequence_end_frame", request.sequenceEndFrame},
+            {"sequence_frames_per_timeline_frame", request.sequenceFramesPerTimelineFrame},
+        };
+    }
     manifest["renderer"] = {
         {"debug_view", rendererDebugViewName(settings.debugView)},
         {"samples_per_pixel", settings.samplesPerPixel},
@@ -3283,6 +3437,14 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
         const std::optional<std::filesystem::path> cachePath = sceneDirtyAfterApply
             ? SceneCache::cachePathFor(result.sourcePath)
             : (nextGltfPath.has_value() ? SceneCache::cachePathFor(*nextGltfPath) : std::optional<std::filesystem::path>{});
+        std::optional<std::filesystem::path> rendererCachePath;
+        if (result.importedScene.has_value() && cachePath.has_value() && nextDocument.prefabInstances().empty() &&
+            build.sceneAsset.meshes.size() == result.importedScene->meshes.size() &&
+            build.sceneAsset.materials.size() == result.importedScene->materials.size() &&
+            build.sceneAsset.textures.size() == result.importedScene->textures.size() &&
+            build.sceneAsset.nodes.size() == result.importedScene->nodes.size()) {
+            rendererCachePath = cachePath;
+        }
 
         std::cout << sceneLoadModeLabel(result.mode) << " apply stage: renderer_create meshes="
                   << build.sceneAsset.meshes.size()
@@ -3290,10 +3452,11 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
                   << " textures=" << build.sceneAsset.textures.size()
                   << " path=" << result.sourcePath.string() << '\n' << std::flush;
         const auto rendererCreateStart = std::chrono::steady_clock::now();
+        preparePathTracerForRendererReplacement(pathTracer_ != nullptr ? pathTracer_->settings() : reloadSettings);
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             build.sceneAsset.meshes.empty() ? nullptr : &build.sceneAsset,
             build.sceneAsset.meshes.empty() ? nullptr : &result.assets,
-            result.importedScene.has_value() ? cachePath : std::optional<std::filesystem::path>{},
+            rendererCachePath,
             &reloadSettings);
         rendererCreateMs = elapsedMs(rendererCreateStart);
 
@@ -3944,8 +4107,8 @@ bool Application::writeDefaultProjectScene(const ProjectContext& project, std::s
         EntityId sun = document.registry().createEntity("Sun Light", SceneUpdateKind::LightOnly);
         if (Entity* entity = document.registry().entity(sun)) {
             entity->sun = Sun{};
-            entity->transform = SunController::transformFromWorldAngles(
-                document.registry(), *entity, entity->transform, 0.85f, glm::pi<float>());
+            entity->sun->elevation = 0.85f;
+            entity->sun->azimuth = glm::pi<float>();
             entity->defaultTransform = entity->transform;
         }
         document.setPrimarySun(sun);
@@ -4068,6 +4231,11 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
     projectSettingsDirty_ = false;
     const std::filesystem::path crashMarker = project.savedRoot / "editor_session.json";
     if (uiOverlay_ != nullptr) {
+        if (project.preferredWorkspacePreset >= 0) {
+            uiOverlay_->editor().setProjectWorkspacePreset(project.preferredWorkspacePreset);
+        } else {
+            uiOverlay_->editor().clearProjectWorkspacePreset();
+        }
         uiOverlay_->editor().editorPrefs().addRecentProject(project.projectFile);
         uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
         if (!editorRecoveryPromptSuppressed() && std::filesystem::exists(crashMarker)) {
@@ -4191,6 +4359,9 @@ bool Application::createProjectFromRequest(const CreateProjectRequest& request) 
         return false;
     }
     ProjectContext project = makeProjectContext(request.name, projectRoot, projectFile);
+    if (request.templateName == "Runtime Viewer") {
+        project.preferredWorkspacePreset = 3;
+    }
     std::string error;
     if (!createProjectFolders(project, request.createDefaultContentFolders, &error)) {
         notifications_.notify("Project folder creation failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
@@ -4208,6 +4379,65 @@ bool Application::createProjectFromRequest(const CreateProjectRequest& request) 
     return openProjectFromFile(project.projectFile, false);
 }
 
+bool Application::deleteProjectFromRequest(const DeleteProjectRequest& request) {
+    if (request.projectFile.empty()) {
+        notifications_.notify("No project selected", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+        return false;
+    }
+
+    const std::filesystem::path projectFile = normalizedPathForCompare(request.projectFile);
+    ProjectContext projectToDelete;
+    std::string loadError;
+    if (!loadProjectFile(projectFile, projectToDelete, &loadError)) {
+        projectToDelete.projectFile = projectFile;
+        projectToDelete.projectRoot = projectFile.parent_path();
+        projectToDelete.name = projectFile.stem().string();
+    }
+
+    if (uiOverlay_ != nullptr) {
+        EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+        prefs.removeRecentProject(projectFile.string());
+        prefs.removeRecentProject(request.projectFile.string());
+        if (!prefs.lastOpenedProject.empty() && normalizedPathForCompare(prefs.lastOpenedProject) == projectFile) {
+            prefs.lastOpenedProject.clear();
+        }
+        prefs.save(EditorPreferences::defaultPath());
+    }
+
+    if (!request.deleteFiles) {
+        notifications_.notify("Project removed from recent list", NotificationType::Info, NotificationAction::OpenProjectManager, "Project Manager", 4.0f);
+        return true;
+    }
+
+    if (!projectRootLooksSafeToDelete(projectToDelete.projectRoot, projectFile)) {
+        notifications_.notify("Project delete refused", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        std::cerr << "Project delete refused: unsafe project root for " << projectFile.string()
+                  << " root=" << projectToDelete.projectRoot.string() << '\n';
+        return false;
+    }
+
+    if (project_.has_value()) {
+        const bool deletingCurrentProject = normalizedPathForCompare(project_->projectFile) == projectFile ||
+            normalizedPathForCompare(project_->projectRoot) == normalizedPathForCompare(projectToDelete.projectRoot);
+        if (deletingCurrentProject && !closeCurrentProject()) {
+            notifications_.notify("Project delete cancelled", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    const uintmax_t removed = std::filesystem::remove_all(projectToDelete.projectRoot, ec);
+    if (ec) {
+        notifications_.notify("Project delete failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        std::cerr << "Project delete failed: " << projectToDelete.projectRoot.string() << " " << ec.message() << '\n';
+        return false;
+    }
+
+    notifications_.notify("Project deleted", NotificationType::Success, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+    std::cout << "Deleted project: " << projectToDelete.projectRoot.string() << " files=" << removed << '\n';
+    return true;
+}
+
 bool Application::closeCurrentProject() {
     if (!project_.has_value()) {
         return true;
@@ -4220,6 +4450,7 @@ bool Application::closeCurrentProject() {
         return false;
     }
     if (uiOverlay_ != nullptr) {
+        uiOverlay_->editor().clearProjectWorkspacePreset();
         uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
         uiOverlay_->editor().timeline().clear();
     }
@@ -4392,14 +4623,50 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
         notifications_.notify("Mesh asset not found", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
     }
-    const std::optional<uint32_t> meshIndex = loadedMeshIndexForRecord(*meshRecord);
+
+    const AssetManager beforeAssets = assets_;
+    bool restoredRuntimeAssets = false;
+    std::optional<uint32_t> meshIndex = loadedMeshIndexForRecord(*meshRecord);
     if (!meshIndex.has_value()) {
-        notifications_.notify("Mesh is not loaded in the current scene", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
-        return false;
+        std::filesystem::path root = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
+        if (!project_.has_value() && assetRegistry_.state().path.has_parent_path()) {
+            root = assetRegistry_.state().path.parent_path();
+        }
+
+        AssetManager nextAssets = assets_;
+        PrefabRuntimeBindings bindings;
+        std::string bindError;
+        if (!appendCachedPrefabRuntimeAssets(
+                *meshRecord,
+                root,
+                resolveAssetSourcePath(*meshRecord, root),
+                resolveAssetCachePath(*meshRecord, root),
+                &assetRegistry_,
+                nextAssets,
+                bindings,
+                &bindError)) {
+            notifications_.notify("Mesh cooked payload is unavailable", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+            if (!bindError.empty()) {
+                std::cerr << "Mesh runtime binding failed: " << bindError << '\n';
+            }
+            return false;
+        }
+        const auto restoredMesh = bindings.meshes.find(request.meshGuid);
+        if (restoredMesh == bindings.meshes.end() || !restoredMesh->second.valid()) {
+            notifications_.notify("Mesh cooked payload does not contain this asset", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+            std::cerr << "Mesh runtime binding did not expose GUID: " << request.meshGuid << '\n';
+            return false;
+        }
+        assets_ = std::move(nextAssets);
+        meshIndex = restoredMesh->second.index;
+        restoredRuntimeAssets = true;
     }
     const MeshAssetHandle meshHandle{*meshIndex};
     if (assets_.mesh(meshHandle) == nullptr) {
         notifications_.notify("Mesh runtime data is unavailable", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        if (restoredRuntimeAssets) {
+            assets_ = beforeAssets;
+        }
         return false;
     }
 
@@ -4423,18 +4690,33 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
     if (request.replaceEntity.valid()) {
         Entity* target = sceneDocument_.registry().entity(request.replaceEntity);
         if (target == nullptr || !target->meshRenderer.has_value()) {
+            if (restoredRuntimeAssets) {
+                assets_ = beforeAssets;
+            }
             notifications_.notify("Mesh replacement target is unavailable", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
             return false;
         }
         target->meshRenderer = makeRenderer();
         sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
         sceneUnsavedDirty_ = true;
-        undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
-            sceneDocument_,
-            beforeDocument,
-            sceneDocument_,
-            SceneUpdateKind::TopologyChanged,
-            "Replace Mesh Asset"));
+        if (restoredRuntimeAssets) {
+            undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+                sceneDocument_,
+                assets_,
+                beforeDocument,
+                beforeAssets,
+                sceneDocument_,
+                assets_,
+                SceneUpdateKind::TopologyChanged,
+                "Replace Mesh Asset"));
+        } else {
+            undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+                sceneDocument_,
+                beforeDocument,
+                sceneDocument_,
+                SceneUpdateKind::TopologyChanged,
+                "Replace Mesh Asset"));
+        }
         editorPlacement_.entity = request.replaceEntity;
         editorPlacement_.serial = nextEditorPlacementSerial_++;
         editorPlacement_.label = target->name.empty() ? (meshRecord->displayName.empty() ? "Mesh Asset" : meshRecord->displayName) : target->name;
@@ -4449,6 +4731,9 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
     Entity* entity = sceneDocument_.registry().entity(created);
     if (entity == nullptr) {
         sceneDocument_ = beforeDocument;
+        if (restoredRuntimeAssets) {
+            assets_ = beforeAssets;
+        }
         notifications_.notify("Mesh placement failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
     }
@@ -4460,12 +4745,24 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
     entity->defaultTransform = entity->transform;
     sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
     sceneUnsavedDirty_ = true;
-    undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
-        sceneDocument_,
-        beforeDocument,
-        sceneDocument_,
-        SceneUpdateKind::TopologyChanged,
-        "Place Mesh Asset"));
+    if (restoredRuntimeAssets) {
+        undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+            sceneDocument_,
+            assets_,
+            beforeDocument,
+            beforeAssets,
+            sceneDocument_,
+            assets_,
+            SceneUpdateKind::TopologyChanged,
+            "Place Mesh Asset"));
+    } else {
+        undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+            sceneDocument_,
+            beforeDocument,
+            sceneDocument_,
+            SceneUpdateKind::TopologyChanged,
+            "Place Mesh Asset"));
+    }
     editorPlacement_.entity = created;
     editorPlacement_.serial = nextEditorPlacementSerial_++;
     editorPlacement_.label = entityName;
@@ -4894,6 +5191,151 @@ bool Application::bulkRemoveAssetTag(const EditorBulkAssetTagRequest& request) {
     return true;
 }
 
+bool Application::deleteAssetsFromRegistry(const EditorDeleteAssetRequest& request) {
+    if (request.guids.empty()) {
+        notifications_.notify("Asset delete needs selected assets", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+
+    std::unordered_set<AssetGuid> targetGuids;
+    targetGuids.reserve(request.guids.size());
+    for (const AssetGuid& guid : request.guids) {
+        if (!guid.empty()) {
+            targetGuids.insert(guid);
+        }
+    }
+    if (targetGuids.empty()) {
+        notifications_.notify("Asset delete needs selected assets", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+
+    std::vector<AssetRecord> targetRecords;
+    for (const AssetRecord& record : assetRegistry_.records()) {
+        if (targetGuids.find(record.guid) != targetGuids.end()) {
+            targetRecords.push_back(record);
+        }
+    }
+    if (targetRecords.empty()) {
+        notifications_.notify("Asset delete target missing", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 5.0f);
+        return false;
+    }
+
+    std::filesystem::path root = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
+    if (!project_.has_value() && assetRegistry_.state().path.has_parent_path()) {
+        root = assetRegistry_.state().path.parent_path();
+    }
+
+    size_t deletedFiles = 0;
+    size_t skippedFiles = 0;
+    if (request.deleteGeneratedFiles) {
+        std::vector<std::filesystem::path> candidates;
+        for (const AssetRecord& record : targetRecords) {
+            const std::array<std::string, 2> generatedPaths = {record.importedPath, record.cachePath};
+            for (const std::string& value : generatedPaths) {
+                if (value.empty()) {
+                    continue;
+                }
+                std::filesystem::path path = value;
+                if (!path.is_absolute()) {
+                    path = root / path;
+                }
+                candidates.push_back(normalizedPathForCompare(path));
+            }
+        }
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+        auto remainingRecordUsesPath = [&](const std::filesystem::path& path) {
+            for (const AssetRecord& record : assetRegistry_.records()) {
+                if (targetGuids.find(record.guid) != targetGuids.end()) {
+                    continue;
+                }
+                const std::array<std::string, 2> values = {record.importedPath, record.cachePath};
+                for (const std::string& value : values) {
+                    if (value.empty()) {
+                        continue;
+                    }
+                    std::filesystem::path recordPath = value;
+                    if (!recordPath.is_absolute()) {
+                        recordPath = root / recordPath;
+                    }
+                    if (normalizedPathForCompare(recordPath) == path) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        for (const std::filesystem::path& path : candidates) {
+            if (path.empty() || remainingRecordUsesPath(path) || !pathIsInsideDirectory(path, root)) {
+                ++skippedFiles;
+                continue;
+            }
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(path, ec) && std::filesystem::remove(path, ec) && !ec) {
+                ++deletedFiles;
+            } else if (ec || std::filesystem::exists(path)) {
+                ++skippedFiles;
+            }
+        }
+    }
+
+    const size_t removedRecords = assetRegistry_.removeRecords(request.guids, AssetRegistryDirtyReason::AssetDeleted);
+    if (removedRecords == 0) {
+        notifications_.notify("Asset delete removed no records", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+
+    std::vector<AssetRecord> changedRecords;
+    for (const AssetRecord& sourceRecord : assetRegistry_.records()) {
+        AssetRecord record = sourceRecord;
+        const size_t dependencyCount = record.dependencies.size();
+        const size_t referenceCount = record.references.size();
+        record.dependencies.erase(std::remove_if(record.dependencies.begin(), record.dependencies.end(), [&](const AssetDependency& dependency) {
+            return targetGuids.find(dependency.guid) != targetGuids.end();
+        }), record.dependencies.end());
+        record.references.erase(std::remove_if(record.references.begin(), record.references.end(), [&](const AssetGuid& guid) {
+            return targetGuids.find(guid) != targetGuids.end();
+        }), record.references.end());
+        if (record.dependencies.size() != dependencyCount || record.references.size() != referenceCount) {
+            record.lastModifiedTimestamp = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            changedRecords.push_back(std::move(record));
+        }
+    }
+    for (AssetRecord& record : changedRecords) {
+        assetRegistry_.addOrReplaceRecord(std::move(record), AssetRegistryDirtyReason::AssetDependencyChanged);
+    }
+
+    if (uiOverlay_ != nullptr) {
+        EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+        const std::vector<AssetGuid> removedGuids(targetGuids.begin(), targetGuids.end());
+        for (const AssetGuid& guid : removedGuids) {
+            prefs.removeFavoriteAsset(guid);
+        }
+        std::vector<std::string> collectionNames;
+        collectionNames.reserve(prefs.assetCollections.size());
+        for (const EditorAssetCollection& collection : prefs.assetCollections) {
+            collectionNames.push_back(collection.name);
+        }
+        for (const std::string& collectionName : collectionNames) {
+            prefs.removeAssetsFromCollection(collectionName, removedGuids);
+        }
+        prefs.save(EditorPreferences::defaultPath());
+    }
+
+    const bool saved = assetRegistry_.state().path.empty() ? false : assetRegistry_.save(assetRegistry_.state().path);
+    if (saved) {
+        assetRegistry_.clearDirty();
+    }
+    notifications_.notify(saved ? "Asset registry item deleted" : "Asset deleted; registry save failed", saved ? NotificationType::Success : NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+    std::cout << "Deleted asset registry records: count=" << removedRecords
+              << " files_deleted=" << deletedFiles
+              << " files_skipped=" << skippedFiles
+              << " saved=" << (saved ? "true" : "false") << '\n';
+    return saved;
+}
+
 bool Application::queueAssetReimport(const AssetGuid& assetGuid) {
     const AssetRecord* sourceRecord = nullptr;
     for (const AssetRecord& record : assetRegistry_.records()) {
@@ -5100,7 +5542,11 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
         std::cout << "Import Asset staged without scene mutation: " << job.request.sourcePath.string()
                   << " report=" << result.importReportPath.string() << '\n';
         if (job.placeAfterImport) {
-            (void)placePrefabAsset(importedGuid);
+            if (!placePrefabAsset(importedGuid)) {
+                result.warnings.push_back("Import staged, but prefab placement failed. See editor log for placement error details.");
+                recordCompletedImportJob(false, "Import staged; placement failed", result.warnings);
+                return false;
+            }
         }
         recordCompletedImportJob(true, job.placeAfterImport ? "Import and Place completed" : "Import Asset staged");
         return true;
@@ -5180,6 +5626,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             }
             if (requests.openProject.has_value()) {
                 (void)openProjectFromFile(requests.openProject->projectFile, true);
+            }
+            if (requests.deleteProject.has_value()) {
+                (void)deleteProjectFromRequest(*requests.deleteProject);
             }
             if (requests.openProjectDirectory) {
                 if (project_.has_value() && openDirectoryInShell(project_->projectRoot)) {
@@ -5308,7 +5757,47 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             pathTracer_->resetAccumulation(*requests.resetAccumulation);
         }
         if (requests.cameraMoveSpeed.has_value()) {
-            cameraController_.setMoveSpeed(*requests.cameraMoveSpeed);
+            const float moveSpeed = std::clamp(*requests.cameraMoveSpeed, 0.05f, 100.0f);
+            cameraController_.setMoveSpeed(moveSpeed);
+            if (uiOverlay_ != nullptr) {
+                EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+                prefs.cameraMoveSpeed = moveSpeed;
+                prefs.save(EditorPreferences::defaultPath());
+            }
+        }
+        if (requests.cameraFastMoveSpeed.has_value()) {
+            const float fastMoveSpeed = std::clamp(*requests.cameraFastMoveSpeed, 0.05f, 250.0f);
+            cameraController_.setFastMoveSpeed(fastMoveSpeed);
+            if (uiOverlay_ != nullptr) {
+                EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+                prefs.cameraFastMoveSpeed = fastMoveSpeed;
+                prefs.save(EditorPreferences::defaultPath());
+            }
+        }
+        if (requests.cameraMouseSensitivity.has_value()) {
+            const float mouseSensitivity = std::clamp(*requests.cameraMouseSensitivity, 0.0001f, 0.02f);
+            cameraController_.setMouseSensitivity(mouseSensitivity);
+            if (uiOverlay_ != nullptr) {
+                EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+                prefs.cameraMouseSensitivity = mouseSensitivity;
+                prefs.save(EditorPreferences::defaultPath());
+            }
+        }
+        if (requests.cameraInvertLookX.has_value()) {
+            cameraController_.setInvertLookX(*requests.cameraInvertLookX);
+            if (uiOverlay_ != nullptr) {
+                EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+                prefs.cameraInvertLookX = *requests.cameraInvertLookX;
+                prefs.save(EditorPreferences::defaultPath());
+            }
+        }
+        if (requests.cameraInvertLookY.has_value()) {
+            cameraController_.setInvertLookY(*requests.cameraInvertLookY);
+            if (uiOverlay_ != nullptr) {
+                EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
+                prefs.cameraInvertLookY = *requests.cameraInvertLookY;
+                prefs.save(EditorPreferences::defaultPath());
+            }
         }
         if (requests.resetCamera) {
             cameraController_.reset(*pathTracer_);
@@ -5338,6 +5827,13 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     const std::filesystem::path renderOutputRoot = editorRenderOutputRoot(project_);
     if (requests.renderCurrentViewport) {
         startEditorRenderJob(EditorRenderJobKind::CurrentViewport, renderOutputRoot);
+    }
+    if (requests.renderRequest.has_value()) {
+        EditorRenderRequest request = *requests.renderRequest;
+        if (request.outputRoot.empty()) {
+            request.outputRoot = renderOutputRoot;
+        }
+        startEditorRenderJob(request.kind, request.outputRoot, &request);
     }
     if (requests.renderImage) {
         startEditorRenderJob(EditorRenderJobKind::Image, renderOutputRoot);
@@ -5475,6 +5971,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     if (requests.openProject.has_value()) {
         (void)openProjectFromFile(requests.openProject->projectFile, true);
     }
+    if (requests.deleteProject.has_value()) {
+        (void)deleteProjectFromRequest(*requests.deleteProject);
+    }
     if (requests.restoreAutosave) {
         bool restored = false;
         if (pendingRecoveryProjectAutosavePath_.has_value() && std::filesystem::exists(*pendingRecoveryProjectAutosavePath_) && project_.has_value()) {
@@ -5542,9 +6041,35 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         notifications_.notify("Recovery marker discarded", NotificationType::Info);
     }
     if (requests.projectSettingsUpdate.has_value() && project_.has_value()) {
+        const std::filesystem::path requestedStartupScene = requests.projectSettingsUpdate->startupScene;
+        const bool startupSceneChanged = normalizedPathForCompare(project_->startupScene) != normalizedPathForCompare(requestedStartupScene);
+        bool startupSceneAccepted = true;
+        if (startupSceneChanged) {
+            std::error_code ec;
+            const std::string extension = lowerPathExtension(requestedStartupScene);
+            startupSceneAccepted = !requestedStartupScene.empty() &&
+                extension == ".rtlevel" &&
+                std::filesystem::is_regular_file(requestedStartupScene, ec);
+            if (!startupSceneAccepted) {
+                notifications_.notify("Default level must be an existing .rtlevel", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+            }
+        }
         const bool changed =
+            (startupSceneChanged && startupSceneAccepted) ||
+            project_->preferredWorkspacePreset != requests.projectSettingsUpdate->preferredWorkspacePreset ||
             project_->autosaveEnabled != requests.projectSettingsUpdate->autosaveEnabled ||
             project_->autosaveIntervalMinutes != std::clamp(requests.projectSettingsUpdate->autosaveIntervalMinutes, 1, 120);
+        if (startupSceneChanged && startupSceneAccepted) {
+            project_->startupScene = requestedStartupScene;
+        }
+        project_->preferredWorkspacePreset = requests.projectSettingsUpdate->preferredWorkspacePreset;
+        if (uiOverlay_ != nullptr) {
+            if (project_->preferredWorkspacePreset >= 0) {
+                uiOverlay_->editor().setProjectWorkspacePreset(project_->preferredWorkspacePreset);
+            } else {
+                uiOverlay_->editor().clearProjectWorkspacePreset();
+            }
+        }
         project_->autosaveEnabled = requests.projectSettingsUpdate->autosaveEnabled;
         project_->autosaveIntervalMinutes = std::clamp(requests.projectSettingsUpdate->autosaveIntervalMinutes, 1, 120);
         if (changed) {
@@ -5794,6 +6319,15 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 (void)sceneOps.addLightComponent(created, light);
             }
             break;
+        case EditorEntityCreateKind::Sun:
+            created = sceneOps.createEntity("Sun", create.parent, createUpdateKind);
+            if (created.valid()) {
+                Sun sun;
+                sun.elevation = sceneDocument_.renderSettings().sunElevation;
+                sun.azimuth = sceneDocument_.renderSettings().sunAzimuth;
+                (void)sceneOps.addSunComponent(created, sun);
+            }
+            break;
         case EditorEntityCreateKind::SpotLight:
             created = sceneOps.createEntity("Spot Light", create.parent, createUpdateKind);
             if (created.valid()) {
@@ -5888,9 +6422,37 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         }
     }
 
+    auto clearDeletedEditorEntityState = [&](EntityId id) {
+        if (editorPlacement_.entity == id) {
+            editorPlacement_ = EditorPlacementStatus{};
+        }
+        if (validationObjectMotionEntity_ == id) {
+            validationObjectMotionEntity_ = {};
+            validationObjectMotionBaseTransform_ = {};
+        }
+        if (sunDrag_.entity == id) {
+            if (sunDrag_.phase == SunDragPhase::Dragging && window_ != nullptr) {
+                glfwSetInputMode(window_, GLFW_CURSOR, sunDrag_.previousCursorMode);
+            }
+            sunDrag_ = SunDragState{};
+        }
+    };
+
     if (requests.deleteEntity.has_value()) {
-        (void)sceneOps.deleteEntity(*requests.deleteEntity);
-        sceneUnsavedDirty_ = true;
+        const EntityId deleted = *requests.deleteEntity;
+        if (sceneOps.deleteEntity(deleted)) {
+            clearDeletedEditorEntityState(deleted);
+            sceneUnsavedDirty_ = true;
+        }
+    }
+
+    if (!requests.deleteEntities.empty()) {
+        if (sceneOps.deleteEntities(requests.deleteEntities)) {
+            for (EntityId deleted : requests.deleteEntities) {
+                clearDeletedEditorEntityState(deleted);
+            }
+            sceneUnsavedDirty_ = true;
+        }
     }
 
     if (requests.renameEntity.has_value()) {
@@ -5906,13 +6468,15 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     }
 
     if (requests.setEntityVisibility.has_value()) {
-        (void)sceneOps.setVisibility(requests.setEntityVisibility->entity, requests.setEntityVisibility->value);
-        sceneUnsavedDirty_ = true;
+        if (sceneOps.setVisibility(requests.setEntityVisibility->entity, requests.setEntityVisibility->value)) {
+            sceneUnsavedDirty_ = true;
+        }
     }
 
     if (requests.setEntityLocked.has_value()) {
-        (void)sceneOps.setLocked(requests.setEntityLocked->entity, requests.setEntityLocked->value);
-        sceneUnsavedDirty_ = true;
+        if (sceneOps.setLocked(requests.setEntityLocked->entity, requests.setEntityLocked->value)) {
+            sceneUnsavedDirty_ = true;
+        }
     }
 
     if (requests.setEntityTransform.has_value()) {
@@ -6259,6 +6823,10 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         (void)bulkRemoveAssetTag(*requests.bulkRemoveAssetTag);
     }
 
+    if (requests.deleteAssets.has_value()) {
+        (void)deleteAssetsFromRegistry(*requests.deleteAssets);
+    }
+
     if (requests.placeAsset.has_value()) {
         (void)placePrefabAsset(*requests.placeAsset, requests.placeAssetTransform);
     }
@@ -6369,7 +6937,8 @@ void Application::startSunDrag(double mouseX, double mouseY) {
     }
 
     sunDrag_.originalTransform = sun->transform;
-    SunController::anglesFromWorldTransform(sceneDocument_.registry(), *sun, sunDrag_.elevation, sunDrag_.azimuth);
+    sunDrag_.elevation = sun->sun->elevation;
+    sunDrag_.azimuth = sun->sun->azimuth;
     sunDrag_.lastMouseX = mouseX;
     sunDrag_.lastMouseY = mouseY;
     sunDrag_.previousCursorMode = glfwGetInputMode(window_, GLFW_CURSOR);
@@ -6401,7 +6970,8 @@ void Application::updateSunDrag(double mouseX, double mouseY) {
         sunDrag_.elevation - static_cast<float>(dy) * sensitivity,
         -0.20f,
         1.45f);
-    sun->transform = SunController::transformFromWorldAngles(sceneDocument_.registry(), *sun, sun->transform, sunDrag_.elevation, sunDrag_.azimuth);
+    sun->sun->azimuth = sunDrag_.azimuth;
+    sun->sun->elevation = sunDrag_.elevation;
     sceneDocument_.markDirty(SceneUpdateKind::LightOnly);
     (void)applyPendingSceneUpdate(false);
 }
@@ -6515,6 +7085,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
     std::optional<SceneGpuBuildResult> build;
     auto ensureBuild = [&]() -> SceneGpuBuildResult& {
         if (!build.has_value()) {
+            applySceneWorldComponentsToDocumentSettings(sceneDocument_);
             build = sceneBuilder_.build(sceneDocument_, &assets_, pathTracer_->settings());
         }
         return *build;
@@ -6532,16 +7103,21 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         gpuSceneAsset_ = sceneBuild.sceneAsset;
         gpuInstanceEntities_ = sceneBuild.instanceEntities;
         rebuildGpuSceneAsset();
+        preparePathTracerForRendererReplacement(previousSettings);
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
-            gltfPath_.has_value() ? SceneCache::cachePathFor(*gltfPath_) : std::optional<std::filesystem::path>{},
+            currentSceneCachePathForRenderer(),
             &previousSettings);
         retirePathTracer(std::move(pathTracer_));
         pathTracer_ = std::move(nextPathTracer);
         applyActiveSceneCamera();
         pathTracer_->resetAccumulation(route.resetReason);
         commandSystem_->setPathTracer(pathTracer_.get());
+    };
+
+    auto syncDerivedSceneSettings = [&]() {
+        applySceneWorldComponentsToDocumentSettings(sceneDocument_);
     };
 
     auto syncBuiltScene = [&]() {
@@ -6609,6 +7185,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         }
     }
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::ApplyRendererSettings)) {
+        syncDerivedSceneSettings();
         applyRendererSettingsSafely(rendererSettingsFromDocument(sceneDocument_, pathTracer_->settings()), allowResourceRebuild);
         if (route.resetsAccumulation) {
             pathTracer_->resetAccumulation(route.resetReason);
@@ -6667,10 +7244,11 @@ void Application::reloadShadersFromEditor() {
         return;
     }
     const RendererSettings previousSettings = pathTracer_->settings();
+    preparePathTracerForRendererReplacement(previousSettings);
     std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
         gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
         gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
-        gltfPath_.has_value() ? SceneCache::cachePathFor(*gltfPath_) : std::optional<std::filesystem::path>{},
+        currentSceneCachePathForRenderer(),
         &previousSettings);
     if (uiOverlay_) {
         uiOverlay_->invalidateRendererTextures();
@@ -6683,6 +7261,16 @@ void Application::reloadShadersFromEditor() {
     commandSystem_->setPathTracer(pathTracer_.get());
     notifications_.notify("Shaders reloaded", NotificationType::Success);
     std::cout << "Reloaded shaders from editor.\n";
+}
+
+void Application::preparePathTracerForRendererReplacement(const RendererSettings& previousSettings) {
+    if (pathTracer_ == nullptr || !rendererSettingsRequestDlss(previousSettings)) {
+        return;
+    }
+    if (commandSystem_ != nullptr) {
+        commandSystem_->waitIdle();
+    }
+    pathTracer_->releaseExclusiveRuntimeForRendererReplacement();
 }
 
 void Application::retirePathTracer(std::unique_ptr<PathTracerRenderer> renderer) {
@@ -6704,6 +7292,23 @@ void Application::releaseRetiredPathTracers() {
                 return frameSerial_ >= retired.releaseFrame;
             }),
         retiredPathTracers_.end());
+}
+
+std::optional<std::filesystem::path> Application::currentSceneCachePathForRenderer() const {
+    if (!gltfPath_.has_value() || !gpuSceneAsset_.has_value() || gpuSceneAsset_->meshes.empty()) {
+        return std::nullopt;
+    }
+    if (sceneUnsavedDirty_ || !sceneDocument_.prefabInstances().empty()) {
+        return std::nullopt;
+    }
+    if (!importedScene_.has_value() ||
+        gpuSceneAsset_->meshes.size() != importedScene_->meshes.size() ||
+        gpuSceneAsset_->materials.size() != importedScene_->materials.size() ||
+        gpuSceneAsset_->textures.size() != importedScene_->textures.size() ||
+        gpuSceneAsset_->nodes.size() != importedScene_->nodes.size()) {
+        return std::nullopt;
+    }
+    return SceneCache::cachePathFor(*gltfPath_);
 }
 
 std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
@@ -6735,12 +7340,8 @@ std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
 }
 
 void Application::createPathTracer(const RendererSettings* settingsToRestore) {
-    std::optional<std::filesystem::path> cachePath;
-    if (gltfPath_.has_value()) {
-        cachePath = SceneCache::cachePathFor(*gltfPath_);
-    }
     const SceneAsset* sceneAsset = gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr;
-    pathTracer_ = makePathTracer(sceneAsset, sceneAsset != nullptr ? &assets_ : nullptr, std::move(cachePath), settingsToRestore);
+    pathTracer_ = makePathTracer(sceneAsset, sceneAsset != nullptr ? &assets_ : nullptr, currentSceneCachePathForRenderer(), settingsToRestore);
 }
 
 void Application::initializeRendererFromCurrentScene(const RendererSettings* settingsToRestore) {
@@ -6849,12 +7450,9 @@ void Application::initializeFallbackSceneDocument() {
     EntityId sun = sceneDocument_.registry().createEntity("Sun");
     if (Entity* sunEntity = sceneDocument_.registry().entity(sun)) {
         sunEntity->sun = Sun{};
-        sunEntity->transform = SunController::transformFromWorldAngles(
-            sceneDocument_.registry(),
-            *sunEntity,
-            sunEntity->transform,
-            0.97f,
-            glm::pi<float>());
+        sunEntity->sun->elevation = 0.97f;
+        sunEntity->sun->azimuth = glm::pi<float>();
+        sunEntity->defaultTransform = sunEntity->transform;
     }
     sceneDocument_.setPrimarySun(sun);
     sceneDocument_.clearDirty();

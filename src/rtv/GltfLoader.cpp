@@ -1119,6 +1119,9 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
             texture = textureFromImage(model.images[static_cast<size_t>(sourceTexture.source)], path);
         }
         texture.name = texture.name.empty() ? sourceTexture.name : texture.name;
+        if (texture.name.empty() && !texture.sourcePath.empty() && texture.sourcePath != path) {
+            texture.name = texture.sourcePath.stem().string();
+        }
         texture.srgb = colorTextureUse[textureIndex] && !dataTextureUse[textureIndex] && !texture.linearColorSpace;
         texture.sampler = samplerFromGltf(model, sourceTexture);
         textureHandles.push_back(assets_.addTexture(std::move(texture)));

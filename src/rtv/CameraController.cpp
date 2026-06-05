@@ -10,7 +10,6 @@
 namespace rtv {
 
 namespace {
-constexpr float mouseSensitivity = 0.0025f;
 constexpr float pitchLimit = 1.52f;
 constexpr float maxCameraDeltaSeconds = 1.0f / 30.0f;
 
@@ -63,8 +62,10 @@ bool CameraController::update(GLFWwindow* window, float deltaSeconds, PathTracer
         lastMouseX_ = mouseX;
         lastMouseY_ = mouseY;
         if (dx != 0.0 || dy != 0.0) {
-            yawRadians_ += static_cast<float>(dx) * mouseSensitivity;
-            pitchRadians_ = std::clamp(pitchRadians_ - static_cast<float>(dy) * mouseSensitivity, -pitchLimit, pitchLimit);
+            const float yawSign = invertLookX_ ? -1.0f : 1.0f;
+            const float pitchSign = invertLookY_ ? 1.0f : -1.0f;
+            yawRadians_ += static_cast<float>(dx) * mouseSensitivity_ * yawSign;
+            pitchRadians_ = std::clamp(pitchRadians_ + static_cast<float>(dy) * mouseSensitivity_ * pitchSign, -pitchLimit, pitchLimit);
             mouseCaptureMoved_ = true;
             changed = true;
         }

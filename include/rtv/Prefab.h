@@ -19,8 +19,17 @@ struct PrefabOverride {
 struct PrefabNodeAsset {
     std::string name;
     int parent = -1;
+    glm::mat4 transform{1.0f};
     AssetGuid meshGuid;
     std::vector<AssetGuid> materialGuids;
+    bool hasCamera = false;
+    uint32_t cameraProjection = 0;
+    float cameraYfov = 60.0f * 0.017453292519943295f;
+    float cameraAspectRatio = 0.0f;
+    float cameraOrthoXmag = 1.0f;
+    float cameraOrthoYmag = 1.0f;
+    float cameraNear = 0.01f;
+    float cameraFar = 1000.0f;
     std::vector<uint32_t> children;
 };
 

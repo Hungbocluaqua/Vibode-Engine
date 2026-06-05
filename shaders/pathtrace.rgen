@@ -934,7 +934,7 @@ bool sample_emissive_light(
 }
 
 bool sample_sun_light(inout uint rng, out vec3 wi, out vec3 radiance, out float pdfSolidAngle) {
-    if (camera.sunlight_enabled == 0u) {
+    if (analytical_sun_visibility() <= 0.0) {
         wi = vec3(0.0, 1.0, 0.0);
         radiance = vec3(0.0);
         pdfSolidAngle = 0.0;
@@ -1508,7 +1508,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         }
         if (hit.hit == 0u) {
             const uint envQuality = bounce == 0u ? ATMOSPHERE_RAY_QUALITY_FULL : ATMOSPHERE_RAY_QUALITY_FAST;
-            vec3 sky = environment_radiance(ray.direction, envQuality);
+            vec3 sky = bounce == 0u
+                ? environment_background_radiance(ray.direction, envQuality)
+                : environment_radiance(ray.direction, envQuality);
             vec3 sunDisk = environment_sun_disk_radiance(ray.direction);
             if (bounce == 0u) {
                 sky *= env_params.background_intensity;
@@ -2001,7 +2003,7 @@ void main() {
     }
 
     uint pixel_index = pixel.y * size.x + pixel.x;
-    uint requestedSpp = clamp(camera.path_trace_controls.x, 1u, 8u);
+    uint requestedSpp = clamp(camera.path_trace_controls.x, 1u, 64u);
     uint effectiveSpp = camera.path_trace_controls.y != 0u ? 1u : requestedSpp;
     float invSpp = 1.0 / float(effectiveSpp);
     uint rng = sample_dimension_seed(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_PATH_SEED);
@@ -2029,7 +2031,7 @@ void main() {
         vec3 accumulated_restir_direct = vec3(0.0);
         vec3 accumulated_caustic_debug = vec3(0.0);
 
-        for (uint sppIndex = 0u; sppIndex < 8u; ++sppIndex) {
+        for (uint sppIndex = 0u; sppIndex < 64u; ++sppIndex) {
             if (sppIndex >= effectiveSpp) {
                 break;
             }

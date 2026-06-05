@@ -114,6 +114,7 @@ private:
     int registryHealthFilter_ = 0;
     int registryCollectionFilter_ = 0;
     int registryFavoriteFilter_ = 0;
+    std::string selectedRegistryGroupId_;
     std::string status_;
     std::filesystem::path browserRoot_;
     std::filesystem::path contentRoot_;

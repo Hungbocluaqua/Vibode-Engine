@@ -166,7 +166,7 @@ The ImGui editor exposes the same core controls plus scene hierarchy, inspector 
 SPP control behavior:
 
 - `Limit to 1 SPP` is enabled by default for real-time presets. It forces effective path samples per pixel per frame to `1`, even if the requested SPP slider is higher.
-- `Samples Per Pixel` requests `1..8` path samples per pixel per frame when the limiter is disabled.
+- `Samples Per Pixel` requests `1..64` path samples per pixel per frame when the limiter is disabled.
 - CLI equivalents are `--spp <N>` / `--samples-per-pixel <N>` and `--spp-limit on|off` / `--limit-spp on|off`.
 - Profile JSON records `samples_per_pixel`, `limit_samples_per_pixel`, and `effective_samples_per_pixel` under `settings`.
 
