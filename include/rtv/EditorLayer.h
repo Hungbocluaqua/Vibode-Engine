@@ -117,6 +117,7 @@ private:
         std::filesystem::path outputRoot;
         std::filesystem::path manifestPath;
         std::filesystem::path reportPath;
+        std::filesystem::path logPath;
         std::vector<std::string> errors;
         std::vector<std::string> warnings;
         double workerTotalMs = 0.0;
@@ -140,13 +141,19 @@ private:
     bool observedAssetImportRunningForHistory_ = false;
     uint64_t activeAssetImportHistorySerial_ = 0;
     uint64_t observedAssetImportResultSerial_ = 0;
+    bool observedCookProjectRunningForHistory_ = false;
+    uint64_t activeCookProjectHistorySerial_ = 0;
+    uint64_t observedCookProjectResultSerial_ = 0;
     std::string activeSceneLoadHistoryKey_{};
     std::string activeAssetImportHistoryKey_{};
+    std::string activeCookProjectHistoryKey_{};
     std::string lastSceneLoadHistoryStatus_{};
     std::string lastAssetImportHistoryTitle_{};
     std::string lastAssetImportHistoryStatus_{};
+    std::string lastCookProjectHistoryStatus_{};
     float lastSceneLoadHistoryProgress_ = 0.0f;
     float lastAssetImportHistoryProgress_ = 0.0f;
+    float lastCookProjectHistoryProgress_ = 0.0f;
     bool commandPaletteOpen_ = false;
     std::array<char, 128> commandPaletteSearch_{};
     bool commandPaletteShortcutEditor_ = false;

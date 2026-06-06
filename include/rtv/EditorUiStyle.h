@@ -1090,6 +1090,7 @@ inline EditorGlyphIcon editorGlyphForPath(const std::filesystem::path& path) {
 
 inline EditorGlyphIcon editorGlyphForEntity(const Entity& entity) {
     if (entity.camera.has_value()) return EditorGlyphIcon::Camera;
+    if (entity.animationPlayer.has_value()) return EditorGlyphIcon::Timeline;
     if (entity.sun.has_value()) return EditorGlyphIcon::Sun;
     if (entity.light.has_value()) return EditorGlyphIcon::Light;
     if (entity.environmentLight.has_value()) return EditorGlyphIcon::Environment;

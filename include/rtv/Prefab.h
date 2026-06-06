@@ -19,8 +19,10 @@ struct PrefabOverride {
 struct PrefabNodeAsset {
     std::string name;
     int parent = -1;
+    int32_t sourceNodeIndex = -1;
     glm::mat4 transform{1.0f};
     AssetGuid meshGuid;
+    std::vector<float> morphWeights;
     std::vector<AssetGuid> materialGuids;
     bool hasCamera = false;
     uint32_t cameraProjection = 0;
@@ -30,6 +32,14 @@ struct PrefabNodeAsset {
     float cameraOrthoYmag = 1.0f;
     float cameraNear = 0.01f;
     float cameraFar = 1000.0f;
+    bool hasLight = false;
+    uint32_t lightType = 1;
+    glm::vec3 lightColor{1.0f};
+    float lightIntensity = 1.0f;
+    float lightSizeOrRadius = 1.0f;
+    float lightInnerConeRadians = 0.35f;
+    float lightOuterConeRadians = 0.70f;
+    bool lightEnabled = true;
     std::vector<uint32_t> children;
 };
 

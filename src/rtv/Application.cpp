@@ -79,6 +79,47 @@ constexpr RendererDebugView intermediateViews[] = {
     RendererDebugView::MotionVectors,
 };
 
+std::string quoteShellPath(const std::filesystem::path& path) {
+    std::string value = path.string();
+    std::string quoted;
+    quoted.reserve(value.size() + 2u);
+    quoted.push_back('"');
+    for (char ch : value) {
+        if (ch == '"') {
+            quoted += "\\\"";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted.push_back('"');
+    return quoted;
+}
+
+std::filesystem::path currentExecutablePath() {
+#if defined(_WIN32)
+    std::array<char, MAX_PATH> buffer{};
+    const DWORD size = GetModuleFileNameA(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (size > 0 && size < buffer.size()) {
+        return std::filesystem::path(buffer.data());
+    }
+#endif
+    return std::filesystem::current_path() / "rtvulkan.exe";
+}
+
+bool assetPlacementBlocked(const AssetRecord& record) {
+    return record.missing || record.status == AssetImportStatus::Missing || record.status == AssetImportStatus::Failed ||
+        record.importedMetadataMissing || record.cookedPayloadMissing || record.dependenciesMissing;
+}
+
+const char* assetPlacementBlockReason(const AssetRecord& record) {
+    if (record.status == AssetImportStatus::Failed) return "Asset import failed; repair or reimport before placement.";
+    if (record.importedMetadataMissing) return "Asset metadata is missing; repair or reimport before placement.";
+    if (record.cookedPayloadMissing) return "Asset cooked/runtime payload is missing; rebuild or repair before placement.";
+    if (record.dependenciesMissing) return "Asset dependency records are missing; repair references before placement.";
+    if (record.missing || record.status == AssetImportStatus::Missing) return "Asset is marked missing; repair before placement.";
+    return "Asset is ready for placement.";
+}
+
 SceneUpdateKind createEntityUpdateKind(EditorEntityCreateKind kind) {
     switch (kind) {
     case EditorEntityCreateKind::Empty:
@@ -1311,12 +1352,14 @@ bool appendCachedPrefabRuntimeAssets(
         mesh.name = cachedMesh.name;
         mesh.vertices = cachedMesh.vertices;
         mesh.indices = cachedMesh.indices;
+        mesh.defaultMorphWeights = cachedMesh.defaultMorphWeights;
         for (const CachedPrimitiveData& cachedPrim : cachedMesh.primitives) {
             MeshPrimitiveAsset primitive;
             primitive.firstVertex = cachedPrim.firstVertex;
             primitive.vertexCount = cachedPrim.vertexCount;
             primitive.firstIndex = cachedPrim.firstIndex;
             primitive.indexCount = cachedPrim.indexCount;
+            primitive.morphTargets = cachedPrim.morphTargets;
             if (cachedPrim.materialIndex >= 0 && static_cast<size_t>(cachedPrim.materialIndex) < materials.size()) {
                 primitive.material = materials[static_cast<size_t>(cachedPrim.materialIndex)];
             } else if (!materials.empty()) {
@@ -1744,6 +1787,7 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
         lastFrameSeconds_ = seconds;
         applyValidationObjectMotion(nextDiagnosticFrameIndex_);
         applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
+        updateAnimationPlayers(deltaSeconds);
         if (beginFrameCapture_) {
             beginFrameCapture_(frameCount + 1u);
         }
@@ -1776,6 +1820,7 @@ void Application::renderFrames(uint32_t count) {
         lastFrameSeconds_ = seconds;
         applyValidationObjectMotion(nextDiagnosticFrameIndex_);
         applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
+        updateAnimationPlayers(deltaSeconds);
         if (beginFrameCapture_) {
             beginFrameCapture_(i + 1u);
         }
@@ -1788,6 +1833,285 @@ void Application::renderFrames(uint32_t count) {
         seconds += deltaSeconds;
     }
     commandSystem_->waitIdle();
+}
+
+std::filesystem::path Application::assetResolutionRoot() const {
+    if (project_.has_value()) {
+        return project_->projectRoot;
+    }
+    if (!assetRegistry_.state().path.empty() && assetRegistry_.state().path.has_parent_path()) {
+        return assetRegistry_.state().path.parent_path();
+    }
+    return std::filesystem::current_path();
+}
+
+std::optional<std::filesystem::path> Application::resolveAnimationClipPath(const AnimationPlayer& player) const {
+    const std::filesystem::path root = assetResolutionRoot();
+    if (!player.animationGuid.empty()) {
+        const auto recordIt = std::find_if(assetRegistry_.records().begin(), assetRegistry_.records().end(), [&](const AssetRecord& record) {
+            return record.guid == player.animationGuid && record.type == AssetType::Animation;
+        });
+        if (recordIt != assetRegistry_.records().end()) {
+            const std::filesystem::path path = resolveAssetRecordPath(*recordIt, root);
+            if (!path.empty()) {
+                return path.lexically_normal();
+            }
+        }
+    }
+    if (player.animationPath.empty()) {
+        return std::nullopt;
+    }
+    std::filesystem::path path = player.animationPath;
+    if (!path.is_absolute()) {
+        path = root / path;
+    }
+    return path.lexically_normal();
+}
+
+const AnimationClip* Application::animationClipForPlayer(const AnimationPlayer& player) {
+    const std::optional<std::filesystem::path> clipPath = resolveAnimationClipPath(player);
+    if (!clipPath.has_value() || clipPath->empty()) {
+        return nullptr;
+    }
+    const std::string key = clipPath->string();
+    if (const auto cached = animationClipCache_.find(key); cached != animationClipCache_.end()) {
+        return &cached->second;
+    }
+    if (failedAnimationClipLoads_.find(key) != failedAnimationClipLoads_.end()) {
+        return nullptr;
+    }
+
+    std::vector<std::string> warnings;
+    AnimationClip clip = AnimationClip::loadRtanimJson(*clipPath, &warnings);
+    for (const std::string& warning : warnings) {
+        std::cerr << warning << '\n';
+    }
+    if (!clip.valid()) {
+        failedAnimationClipLoads_.insert(key);
+        std::cerr << "Animation clip load failed or had no decoded tracks: " << key << '\n';
+        return nullptr;
+    }
+    auto [it, inserted] = animationClipCache_.emplace(key, std::move(clip));
+    return inserted ? &it->second : nullptr;
+}
+
+void Application::updateAnimationPlayers(float deltaSeconds) {
+    if (!pathTracer_) {
+        return;
+    }
+    const std::vector<Entity*> entities = sceneDocument_.registry().entities();
+    if (entities.empty()) {
+        return;
+    }
+
+    auto entityKey = [](EntityId id) -> uint64_t {
+        return (static_cast<uint64_t>(id.index) << 32u) | static_cast<uint64_t>(id.generation);
+    };
+    auto collectSubtree = [&](auto&& self, EntityId id, std::unordered_set<uint64_t>& out) -> void {
+        Entity* entity = sceneDocument_.registry().entity(id);
+        if (entity == nullptr) {
+            return;
+        }
+        const uint64_t key = entityKey(id);
+        if (!out.insert(key).second) {
+            return;
+        }
+        for (EntityId child : entity->children) {
+            self(self, child, out);
+        }
+    };
+    auto entityInScope = [&](const Entity* entity, const std::unordered_set<uint64_t>& scope) -> bool {
+        return scope.empty() || (entity != nullptr && scope.find(entityKey(entity->id)) != scope.end());
+    };
+    auto differentVec3 = [](glm::vec3 a, glm::vec3 b) {
+        constexpr float eps = 1.0e-5f;
+        return std::abs(a.x - b.x) > eps || std::abs(a.y - b.y) > eps || std::abs(a.z - b.z) > eps;
+    };
+    auto differentFloatVector = [](const std::vector<float>& a, const std::vector<float>& b) {
+        constexpr float eps = 1.0e-5f;
+        if (a.size() != b.size()) {
+            return true;
+        }
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (std::abs(a[i] - b[i]) > eps) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto pathKey = [](int32_t node, AnimationTrackPath path) -> uint64_t {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(node)) << 32u) | static_cast<uint64_t>(static_cast<uint32_t>(path));
+    };
+    auto rootMotionSample = [&](const AnimationSample& sample, int32_t node) -> const AnimationNodeSample* {
+        const auto it = sample.nodes.find(node);
+        return it != sample.nodes.end() ? &it->second : nullptr;
+    };
+    auto applyRootMotionDelta = [&](Entity& playerEntity, const AnimationClip& clip, const AnimationSample& previousSample, const AnimationSample& currentSample) -> bool {
+        bool changed = false;
+        glm::vec3 translationDelta{0.0f};
+        glm::quat rotationDelta{1.0f, 0.0f, 0.0f, 0.0f};
+        bool hasTranslationDelta = false;
+        bool hasRotationDelta = false;
+        std::unordered_set<int32_t> translationNodes;
+        std::unordered_set<int32_t> rotationNodes;
+        for (const AnimationClip::RootMotionCandidate& candidate : clip.rootMotionCandidates()) {
+            if (candidate.path == AnimationTrackPath::Translation) {
+                translationNodes.insert(candidate.node);
+            } else if (candidate.path == AnimationTrackPath::Rotation) {
+                rotationNodes.insert(candidate.node);
+            }
+        }
+        for (int32_t node : translationNodes) {
+            const AnimationNodeSample* previous = rootMotionSample(previousSample, node);
+            const AnimationNodeSample* current = rootMotionSample(currentSample, node);
+            if (previous != nullptr && current != nullptr && previous->hasTranslation && current->hasTranslation) {
+                translationDelta += current->translation - previous->translation;
+                hasTranslationDelta = true;
+            }
+        }
+        for (int32_t node : rotationNodes) {
+            const AnimationNodeSample* previous = rootMotionSample(previousSample, node);
+            const AnimationNodeSample* current = rootMotionSample(currentSample, node);
+            if (previous != nullptr && current != nullptr && previous->hasRotation && current->hasRotation) {
+                rotationDelta = glm::normalize(current->rotation * glm::inverse(previous->rotation) * rotationDelta);
+                hasRotationDelta = true;
+            }
+        }
+        if (hasTranslationDelta && glm::dot(translationDelta, translationDelta) > 1.0e-10f) {
+            playerEntity.transform.position += playerEntity.transform.rotation() * translationDelta;
+            changed = true;
+        }
+        if (hasRotationDelta) {
+            const glm::quat playerRotation = playerEntity.transform.rotation();
+            const glm::quat nextRotation = glm::normalize(playerRotation * rotationDelta);
+            const glm::vec3 nextEuler = glm::eulerAngles(nextRotation);
+            if (differentVec3(playerEntity.transform.rotationEuler, nextEuler)) {
+                playerEntity.transform.rotationEuler = nextEuler;
+                changed = true;
+            }
+        }
+        if (changed) {
+            playerEntity.transform.dirty = true;
+        }
+        return changed;
+    };
+
+    bool sceneTransformChanged = false;
+    bool sceneTopologyChanged = false;
+    const float clampedDelta = std::max(0.0f, deltaSeconds);
+    for (Entity* playerEntity : entities) {
+        if (playerEntity == nullptr || !playerEntity->animationPlayer.has_value()) {
+            continue;
+        }
+        AnimationPlayer& player = *playerEntity->animationPlayer;
+        if (!player.enabled) {
+            continue;
+        }
+        const AnimationClip* clip = animationClipForPlayer(player);
+        if (clip == nullptr) {
+            continue;
+        }
+
+        const double previousTime = player.currentTimeSeconds;
+        double sampleTime = previousTime;
+        if (player.playing) {
+            sampleTime += static_cast<double>(clampedDelta) * static_cast<double>(player.playbackSpeed);
+        }
+        if (!player.loop && clip->duration() > 0.0) {
+            sampleTime = std::clamp(sampleTime, clip->startTime(), clip->endTime());
+        }
+        const AnimationSample previousSample = clip->sample(previousTime, player.loop);
+        const AnimationSample sample = clip->sample(sampleTime, player.loop);
+        player.currentTimeSeconds = sample.timeSeconds;
+        std::unordered_set<uint64_t> rootMotionChannels;
+        if (player.applyRootMotion && player.playing && clip->rootMotionCandidateCount() > 0) {
+            const AnimationSample rootPreviousSample = previousSample.timeSeconds <= sample.timeSeconds || !player.loop
+                ? previousSample
+                : clip->sample(clip->startTime(), false);
+            if (applyRootMotionDelta(*playerEntity, *clip, rootPreviousSample, sample)) {
+                sceneTransformChanged = true;
+            }
+            for (const AnimationClip::RootMotionCandidate& candidate : clip->rootMotionCandidates()) {
+                rootMotionChannels.insert(pathKey(candidate.node, candidate.path));
+            }
+        }
+
+        std::unordered_set<uint64_t> scope;
+        collectSubtree(collectSubtree, playerEntity->id, scope);
+        std::unordered_map<int32_t, Entity*> entityForSourceNode;
+        for (Entity* entity : entities) {
+            if (entity == nullptr || entity->sourceNodeIndex < 0 || !entityInScope(entity, scope)) {
+                continue;
+            }
+            entityForSourceNode.try_emplace(entity->sourceNodeIndex, entity);
+        }
+
+        std::unordered_set<int32_t> skinDrivenTransformNodes;
+        const std::vector<SceneSkinAsset>& sceneSkins = sceneDocument_.sceneSkins();
+        for (Entity* entity : entities) {
+            if (entity == nullptr || !entity->meshRenderer.has_value() || !entityInScope(entity, scope)) {
+                continue;
+            }
+            const int32_t skinIndex = entity->meshRenderer->skinIndex;
+            if (skinIndex < 0 || static_cast<size_t>(skinIndex) >= sceneSkins.size()) {
+                continue;
+            }
+            if (entity->sourceNodeIndex >= 0) {
+                skinDrivenTransformNodes.insert(entity->sourceNodeIndex);
+            }
+            for (uint32_t jointNode : sceneSkins[static_cast<size_t>(skinIndex)].joints) {
+                if (jointNode <= static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+                    skinDrivenTransformNodes.insert(static_cast<int32_t>(jointNode));
+                }
+            }
+        }
+
+        for (const auto& [nodeIndex, nodeSample] : sample.nodes) {
+            const auto entityIt = entityForSourceNode.find(nodeIndex);
+            if (entityIt == entityForSourceNode.end() || entityIt->second == nullptr) {
+                continue;
+            }
+            Entity& target = *entityIt->second;
+            bool targetChanged = false;
+            if (nodeSample.hasTranslation && rootMotionChannels.find(pathKey(nodeIndex, AnimationTrackPath::Translation)) == rootMotionChannels.end() &&
+                differentVec3(target.transform.position, nodeSample.translation)) {
+                target.transform.position = nodeSample.translation;
+                targetChanged = true;
+            }
+            if (nodeSample.hasRotation && rootMotionChannels.find(pathKey(nodeIndex, AnimationTrackPath::Rotation)) == rootMotionChannels.end()) {
+                const glm::vec3 rotationEuler = glm::eulerAngles(glm::normalize(nodeSample.rotation));
+                if (differentVec3(target.transform.rotationEuler, rotationEuler)) {
+                    target.transform.rotationEuler = rotationEuler;
+                    targetChanged = true;
+                }
+            }
+            if (nodeSample.hasScale && differentVec3(target.transform.scale, nodeSample.scale)) {
+                target.transform.scale = nodeSample.scale;
+                targetChanged = true;
+            }
+            if (targetChanged) {
+                target.transform.dirty = true;
+                if (skinDrivenTransformNodes.find(nodeIndex) != skinDrivenTransformNodes.end()) {
+                    sceneTopologyChanged = true;
+                } else {
+                    sceneTransformChanged = true;
+                }
+            }
+            if (player.applyMorphWeights && nodeSample.hasMorphWeights && target.meshRenderer.has_value() &&
+                differentFloatVector(target.meshRenderer->morphWeights, nodeSample.morphWeights)) {
+                target.meshRenderer->morphWeights = nodeSample.morphWeights;
+                sceneTopologyChanged = true;
+            }
+        }
+    }
+
+    if (sceneTopologyChanged) {
+        sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+        (void)applyPendingSceneUpdate(true);
+    } else if (sceneTransformChanged) {
+        sceneDocument_.markDirty(SceneUpdateKind::TransformOnly);
+        (void)applyPendingSceneUpdate(false);
+    }
 }
 
 bool Application::runDescriptorLifetimeStress(
@@ -2293,6 +2617,7 @@ void Application::mainLoop(uint32_t maxFrames) {
             const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
             lastFrameSeconds_ = seconds;
 
+            updateAnimationPlayers(deltaSeconds);
             commandSystem_->drawFrame(seconds, deltaSeconds);
             ++frameSerial_;
             releaseRetiredPathTracers();
@@ -2418,6 +2743,29 @@ void Application::mainLoop(uint32_t maxFrames) {
                 jobCenter.assetReimportGuid = job.assetGuid;
             }
         }
+        if (activeCookProjectJob_.has_value()) {
+            jobCenter.cookProjectJobSerial = activeCookProjectJob_->serial;
+            jobCenter.cookProjectRunning = true;
+            jobCenter.cookProjectProgress = 0.35f;
+            jobCenter.cookProjectStatus = "Cooking transparent project assets";
+            jobCenter.cookProjectFile = activeCookProjectJob_->projectFile;
+            jobCenter.cookProjectOutputDir = activeCookProjectJob_->outputDir;
+            jobCenter.cookProjectManifestPath = activeCookProjectJob_->manifestPath;
+            jobCenter.cookProjectValidationReportPath = activeCookProjectJob_->validationReportPath;
+            jobCenter.cookProjectLogPath = activeCookProjectJob_->logPath;
+        }
+        if (completedCookProjectJob_.completedCookProjectSerial != 0) {
+            jobCenter.completedCookProjectSerial = completedCookProjectJob_.completedCookProjectSerial;
+            jobCenter.completedCookProjectSuccess = completedCookProjectJob_.completedCookProjectSuccess;
+            jobCenter.completedCookProjectStatus = completedCookProjectJob_.completedCookProjectStatus;
+            jobCenter.completedCookProjectFile = completedCookProjectJob_.completedCookProjectFile;
+            jobCenter.completedCookProjectOutputDir = completedCookProjectJob_.completedCookProjectOutputDir;
+            jobCenter.completedCookProjectManifestPath = completedCookProjectJob_.completedCookProjectManifestPath;
+            jobCenter.completedCookProjectValidationReportPath = completedCookProjectJob_.completedCookProjectValidationReportPath;
+            jobCenter.completedCookProjectLogPath = completedCookProjectJob_.completedCookProjectLogPath;
+            jobCenter.completedCookProjectExitCode = completedCookProjectJob_.completedCookProjectExitCode;
+            jobCenter.completedCookProjectWorkerTotalMs = completedCookProjectJob_.completedCookProjectWorkerTotalMs;
+        }
         if (uiOverlay_ && pathTracer_) {
             editorRequests = uiOverlay_->build(
                 *pathTracer_,
@@ -2454,9 +2802,11 @@ void Application::mainLoop(uint32_t maxFrames) {
                 scenePath_,
                 sceneUnsavedDirty_ || sceneDocument_.dirty(),
                 projectSettingsDirty_,
+                dirtyMaterialAssets_.size(),
                 sceneLoadingStatus_,
                 asyncSceneLoader_.isRunning(),
                 asyncSceneLoader_.progress(),
+                &jobCenter,
                 &notifications_);
         }
         if (pendingUndo_) {
@@ -2472,6 +2822,7 @@ void Application::mainLoop(uint32_t maxFrames) {
             pendingSaveAll_ = false;
         }
         applyEditorRequests(editorRequests, false);
+        updateAnimationPlayers(deltaSeconds);
         prepareEditorRenderJobFrame();
         if (beginFrameCapture_) {
             beginFrameCapture_(frameCount + 1u);
@@ -2489,6 +2840,7 @@ void Application::mainLoop(uint32_t maxFrames) {
         applyEditorRequests(editorRequests, true);
         pollAsyncSceneLoad();
         pollAssetImportWorker();
+        pollCookProjectJob();
         captureProjectThumbnailIfReady();
         updateWindowTitle(seconds);
 
@@ -4551,6 +4903,11 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid, const std::optio
         notifications_.notify("Prefab asset not found", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
     }
+    if (assetPlacementBlocked(*prefabRecord)) {
+        notifications_.notify("Prefab placement blocked", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+        std::cerr << "Prefab placement blocked for asset " << prefabGuid << ": " << assetPlacementBlockReason(*prefabRecord) << '\n';
+        return false;
+    }
 
     std::filesystem::path root = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
     if (!project_.has_value() && assetRegistry_.state().path.has_parent_path()) {
@@ -4621,6 +4978,11 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
     }
     if (meshRecord == nullptr || meshRecord->type != AssetType::Mesh) {
         notifications_.notify("Mesh asset not found", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+        return false;
+    }
+    if (assetPlacementBlocked(*meshRecord)) {
+        notifications_.notify("Mesh placement blocked", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+        std::cerr << "Mesh placement blocked for asset " << request.meshGuid << ": " << assetPlacementBlockReason(*meshRecord) << '\n';
         return false;
     }
 
@@ -5056,6 +5418,47 @@ bool Application::replaceAssetReferences(const EditorReplaceAssetReferencesReque
     return true;
 }
 
+bool Application::renameAssetRecord(const EditorRenameAssetRequest& request) {
+    auto trim = [](std::string value) {
+        value.erase(value.begin(), std::find_if(value.begin(), value.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        value.erase(std::find_if(value.rbegin(), value.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), value.end());
+        return value;
+    };
+
+    if (request.guid.empty()) {
+        notifications_.notify("Asset rename needs a selected asset", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+
+    const std::string displayName = trim(request.displayName);
+    if (displayName.empty()) {
+        notifications_.notify("Asset name cannot be empty", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+
+    const auto recordIt = std::find_if(assetRegistry_.records().begin(), assetRegistry_.records().end(), [&](const AssetRecord& record) {
+        return record.guid == request.guid;
+    });
+    if (recordIt == assetRegistry_.records().end()) {
+        notifications_.notify("Asset rename target missing", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 5.0f);
+        return false;
+    }
+
+    if (trim(recordIt->displayName) == displayName) {
+        notifications_.notify("Asset name unchanged", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 3.0f);
+        return false;
+    }
+
+    AssetRecord record = *recordIt;
+    const std::string oldName = record.displayName.empty() ? record.guid : record.displayName;
+    record.displayName = displayName;
+    record.lastModifiedTimestamp = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    assetRegistry_.addOrReplaceRecord(std::move(record), AssetRegistryDirtyReason::AssetRenamed);
+    notifications_.notify("Asset renamed", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 4.0f);
+    std::cout << "Renamed asset record: " << request.guid << " '" << oldName << "' -> '" << displayName << "'\n";
+    return true;
+}
+
 bool Application::updateAssetTags(const EditorAssetTagsRequest& request) {
     if (request.guid.empty()) {
         notifications_.notify("Asset tags need a selected asset", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 4.0f);
@@ -5188,6 +5591,81 @@ bool Application::bulkRemoveAssetTag(const EditorBulkAssetTagRequest& request) {
     }
     notifications_.notify("Bulk asset tag removed", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 4.0f);
     std::cout << "Bulk asset tag removed: tag=" << tag << " count=" << changedCount << '\n';
+    return true;
+}
+
+bool Application::moveAssetsToFolder(const EditorMoveAssetsToFolderRequest& request) {
+    if (request.guids.empty()) {
+        notifications_.notify("Asset folder move needs visible assets", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+
+    auto trim = [](std::string value) {
+        value.erase(value.begin(), std::find_if(value.begin(), value.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+        value.erase(std::find_if(value.rbegin(), value.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), value.end());
+        return value;
+    };
+    auto normalizeFolder = [&](std::string value) {
+        value = trim(std::move(value));
+        std::replace(value.begin(), value.end(), '\\', '/');
+        while (!value.empty() && value.front() == '/') {
+            value.erase(value.begin());
+        }
+        while (!value.empty() && value.back() == '/') {
+            value.pop_back();
+        }
+        std::string compact;
+        compact.reserve(value.size());
+        bool previousSlash = false;
+        for (char c : value) {
+            if (c == '/') {
+                if (!previousSlash) {
+                    compact.push_back('/');
+                }
+                previousSlash = true;
+                continue;
+            }
+            compact.push_back(c);
+            previousSlash = false;
+        }
+        return trim(std::move(compact));
+    };
+    auto lower = [](std::string value) {
+        for (char& c : value) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return value;
+    };
+
+    const std::string folderName = normalizeFolder(request.folderName);
+    const std::string groupId = folderName.empty() ? std::string{} : std::string("folder:") + lower(folderName);
+    const auto now = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    size_t changedCount = 0;
+    for (const AssetGuid& guid : request.guids) {
+        const auto recordIt = std::find_if(assetRegistry_.records().begin(), assetRegistry_.records().end(), [&](const AssetRecord& record) {
+            return record.guid == guid;
+        });
+        if (recordIt == assetRegistry_.records().end()) {
+            continue;
+        }
+        if (recordIt->importGroupId == groupId && recordIt->importGroupName == folderName) {
+            continue;
+        }
+        AssetRecord record = *recordIt;
+        record.importGroupId = groupId;
+        record.importGroupName = folderName;
+        record.importRootGuid.clear();
+        record.lastModifiedTimestamp = now;
+        assetRegistry_.addOrReplaceRecord(std::move(record), AssetRegistryDirtyReason::AssetMoved);
+        ++changedCount;
+    }
+
+    if (changedCount == 0) {
+        notifications_.notify("Asset folders unchanged", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+    notifications_.notify(folderName.empty() ? "Asset folder metadata cleared" : "Assets moved to folder", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 4.0f);
+    std::cout << "Moved asset records to virtual folder: folder='" << folderName << "' count=" << changedCount << '\n';
     return true;
 }
 
@@ -5334,6 +5812,123 @@ bool Application::deleteAssetsFromRegistry(const EditorDeleteAssetRequest& reque
               << " files_skipped=" << skippedFiles
               << " saved=" << (saved ? "true" : "false") << '\n';
     return saved;
+}
+
+bool Application::startCookProject(const EditorCookProjectRequest& request) {
+    if (!project_.has_value()) {
+        notifications_.notify("Open a project before cooking", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+        return false;
+    }
+    if (activeCookProjectJob_.has_value()) {
+        notifications_.notify("Project cook already running", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 4.0f);
+        return false;
+    }
+
+    const std::filesystem::path projectFile = request.projectFile.empty() ? project_->projectFile : request.projectFile;
+    const std::filesystem::path outputDir = request.outputDir.empty() ? (project_->buildRoot / "Cooked") : request.outputDir;
+    const std::filesystem::path manifestPath = outputDir / "cook_manifest.json";
+    const std::filesystem::path validationReportPath = outputDir / "asset_validation_report.json";
+    const std::filesystem::path logPath = outputDir / "cook_log.txt";
+
+    auto recordBlockedCook = [&](std::string status, int exitCode) {
+        completedCookProjectJob_ = EditorJobCenterState{};
+        completedCookProjectJob_.completedCookProjectSerial = nextCookProjectJobSerial_++;
+        completedCookProjectJob_.completedCookProjectSuccess = false;
+        completedCookProjectJob_.completedCookProjectStatus = std::move(status);
+        completedCookProjectJob_.completedCookProjectFile = projectFile;
+        completedCookProjectJob_.completedCookProjectOutputDir = outputDir;
+        completedCookProjectJob_.completedCookProjectManifestPath = manifestPath;
+        completedCookProjectJob_.completedCookProjectValidationReportPath = validationReportPath;
+        completedCookProjectJob_.completedCookProjectLogPath = logPath;
+        completedCookProjectJob_.completedCookProjectExitCode = exitCode;
+    };
+
+    if (!saveAllEditorState()) {
+        recordBlockedCook("Cook blocked: Save All failed", -1);
+        notifications_.notify("Cook blocked by save failure", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(outputDir, ec);
+    if (ec) {
+        recordBlockedCook("Cook blocked: output folder failed", -2);
+        notifications_.notify("Cook output folder failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+        std::cerr << "Cook output folder creation failed: " << outputDir.string() << " " << ec.message() << '\n';
+        return false;
+    }
+
+    CookProjectResult seed;
+    seed.serial = nextCookProjectJobSerial_++;
+    seed.projectFile = projectFile;
+    seed.outputDir = outputDir;
+    seed.manifestPath = manifestPath;
+    seed.validationReportPath = validationReportPath;
+    seed.logPath = logPath;
+
+    activeCookProjectJob_.emplace(ActiveCookProjectJob{
+        seed.serial,
+        seed.projectFile,
+        seed.outputDir,
+        seed.manifestPath,
+        seed.validationReportPath,
+        seed.logPath,
+        std::async(std::launch::async, [seed]() mutable {
+            const auto start = std::chrono::steady_clock::now();
+            std::error_code logEc;
+            std::filesystem::create_directories(seed.logPath.parent_path(), logEc);
+            const std::filesystem::path exe = currentExecutablePath();
+            const std::string command = quoteShellPath(exe)
+                + " --cook-project " + quoteShellPath(seed.projectFile)
+                + " --cook-output " + quoteShellPath(seed.outputDir)
+                + " --cook-manifest " + quoteShellPath(seed.manifestPath)
+                + " > " + quoteShellPath(seed.logPath) + " 2>&1";
+            seed.exitCode = std::system(command.c_str());
+            seed.workerTotalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            return seed;
+        })});
+
+    completedCookProjectJob_ = EditorJobCenterState{};
+    notifications_.notify("Project cook started", NotificationType::Info, NotificationAction::OpenProjectManager, "Project Manager", 4.0f);
+    std::cout << "Project cook started: " << projectFile.string() << " -> " << outputDir.string() << '\n';
+    return true;
+}
+
+void Application::pollCookProjectJob() {
+    using namespace std::chrono_literals;
+    if (!activeCookProjectJob_.has_value()) {
+        return;
+    }
+    if (activeCookProjectJob_->future.wait_for(0s) != std::future_status::ready) {
+        return;
+    }
+
+    CookProjectResult result = activeCookProjectJob_->future.get();
+    activeCookProjectJob_.reset();
+    const bool success = result.exitCode == 0;
+
+    completedCookProjectJob_ = EditorJobCenterState{};
+    completedCookProjectJob_.completedCookProjectSerial = result.serial;
+    completedCookProjectJob_.completedCookProjectSuccess = success;
+    completedCookProjectJob_.completedCookProjectStatus = success ? "Cook completed" : "Cook failed";
+    completedCookProjectJob_.completedCookProjectFile = result.projectFile;
+    completedCookProjectJob_.completedCookProjectOutputDir = result.outputDir;
+    completedCookProjectJob_.completedCookProjectManifestPath = result.manifestPath;
+    completedCookProjectJob_.completedCookProjectValidationReportPath = result.validationReportPath;
+    completedCookProjectJob_.completedCookProjectLogPath = result.logPath;
+    completedCookProjectJob_.completedCookProjectExitCode = result.exitCode;
+    completedCookProjectJob_.completedCookProjectWorkerTotalMs = result.workerTotalMs;
+
+    if (success) {
+        notifications_.notify("Project cook complete", NotificationType::Success, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+    } else {
+        notifications_.notify("Project cook failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
+    }
+    std::cout << "Project cook " << (success ? "completed" : "failed")
+              << ": exit=" << result.exitCode
+              << " manifest=" << result.manifestPath.string()
+              << " report=" << result.validationReportPath.string()
+              << " log=" << result.logPath.string() << '\n';
 }
 
 bool Application::queueAssetReimport(const AssetGuid& assetGuid) {
@@ -6576,6 +7171,14 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 directComponentAdded = true;
             }
             break;
+        case EditorComponentKind::AnimationPlayer:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.addComponent->entity); entity != nullptr && !entity->animationPlayer.has_value()) {
+                entity->animationPlayer = AnimationPlayer{};
+                sceneDocument_.markDirty(SceneUpdateKind::TransformOnly);
+                directUpdateKind = SceneUpdateKind::TransformOnly;
+                directComponentAdded = true;
+            }
+            break;
         }
         if (directComponentAdded) {
             undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
@@ -6656,6 +7259,14 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 applySceneWorldComponentsToDocumentSettings(sceneDocument_);
                 sceneDocument_.markDirty(SceneUpdateKind::RendererSettingsOnly);
                 directUpdateKind = SceneUpdateKind::RendererSettingsOnly;
+                removed = true;
+            }
+            break;
+        case EditorComponentKind::AnimationPlayer:
+            if (Entity* entity = sceneDocument_.registry().entity(requests.removeComponent->entity); entity != nullptr && entity->animationPlayer.has_value()) {
+                entity->animationPlayer.reset();
+                sceneDocument_.markDirty(SceneUpdateKind::TransformOnly);
+                directUpdateKind = SceneUpdateKind::TransformOnly;
                 removed = true;
             }
             break;
@@ -6815,6 +7426,10 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         (void)updateAssetTags(*requests.updateAssetTags);
     }
 
+    if (requests.renameAsset.has_value()) {
+        (void)renameAssetRecord(*requests.renameAsset);
+    }
+
     if (requests.bulkAddAssetTag.has_value()) {
         (void)bulkAddAssetTag(*requests.bulkAddAssetTag);
     }
@@ -6823,8 +7438,16 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         (void)bulkRemoveAssetTag(*requests.bulkRemoveAssetTag);
     }
 
+    if (requests.moveAssetsToFolder.has_value()) {
+        (void)moveAssetsToFolder(*requests.moveAssetsToFolder);
+    }
+
     if (requests.deleteAssets.has_value()) {
         (void)deleteAssetsFromRegistry(*requests.deleteAssets);
+    }
+
+    if (requests.cookProject.has_value()) {
+        (void)startCookProject(*requests.cookProject);
     }
 
     if (requests.placeAsset.has_value()) {

@@ -101,6 +101,11 @@ struct EditorRenderRequest {
     bool saveSequenceFramesAsDefault = false;
 };
 
+struct EditorCookProjectRequest {
+    std::filesystem::path projectFile;
+    std::filesystem::path outputDir;
+};
+
 struct EditorPlacementStatus {
     EntityId entity{};
     uint64_t serial = 0;
@@ -160,6 +165,25 @@ struct EditorJobCenterState {
     double completedAssetImportWorkerInspectMs = 0.0;
     double completedAssetImportWorkerWriteMs = 0.0;
     size_t queuedAssetImports = 0;
+    uint64_t cookProjectJobSerial = 0;
+    bool cookProjectRunning = false;
+    float cookProjectProgress = 0.0f;
+    std::string cookProjectStatus;
+    std::filesystem::path cookProjectFile;
+    std::filesystem::path cookProjectOutputDir;
+    std::filesystem::path cookProjectManifestPath;
+    std::filesystem::path cookProjectValidationReportPath;
+    std::filesystem::path cookProjectLogPath;
+    uint64_t completedCookProjectSerial = 0;
+    bool completedCookProjectSuccess = false;
+    std::string completedCookProjectStatus;
+    std::filesystem::path completedCookProjectFile;
+    std::filesystem::path completedCookProjectOutputDir;
+    std::filesystem::path completedCookProjectManifestPath;
+    std::filesystem::path completedCookProjectValidationReportPath;
+    std::filesystem::path completedCookProjectLogPath;
+    int completedCookProjectExitCode = 0;
+    double completedCookProjectWorkerTotalMs = 0.0;
 };
 
 struct EditorUiTextureProvider {
@@ -225,6 +249,17 @@ struct ProjectManagerRuntimeState {
     float sceneLoadProgress = 0.0f;
     bool sceneDirty = false;
     bool projectSettingsDirty = false;
+    size_t dirtyMaterialAssetCount = 0;
+    bool cookProjectRunning = false;
+    std::filesystem::path cookProjectOutputDir;
+    uint64_t completedCookProjectSerial = 0;
+    bool completedCookProjectSuccess = false;
+    std::string completedCookProjectStatus;
+    std::filesystem::path completedCookProjectOutputDir;
+    std::filesystem::path completedCookProjectManifestPath;
+    std::filesystem::path completedCookProjectValidationReportPath;
+    std::filesystem::path completedCookProjectLogPath;
+    int completedCookProjectExitCode = 0;
     bool standaloneLauncher = false;
 };
 
@@ -299,6 +334,7 @@ enum class EditorComponentKind : uint32_t {
     VolumetricCloud,
     PostProcessVolume,
     CameraPostProcess,
+    AnimationPlayer,
 };
 
 struct EditorSceneSnapshotChange {
@@ -371,9 +407,19 @@ struct EditorAssetTagsRequest {
     std::vector<std::string> tags;
 };
 
+struct EditorRenameAssetRequest {
+    AssetGuid guid;
+    std::string displayName;
+};
+
 struct EditorBulkAssetTagRequest {
     std::vector<AssetGuid> guids;
     std::string tag;
+};
+
+struct EditorMoveAssetsToFolderRequest {
+    std::vector<AssetGuid> guids;
+    std::string folderName;
 };
 
 struct EditorDeleteAssetRequest {
@@ -396,8 +442,10 @@ struct EditorRequests {
     std::optional<EditorAssetRelinkSourceRequest> relinkAssetSource;
     std::optional<EditorReplaceAssetReferencesRequest> replaceAssetReferences;
     std::optional<EditorAssetTagsRequest> updateAssetTags;
+    std::optional<EditorRenameAssetRequest> renameAsset;
     std::optional<EditorBulkAssetTagRequest> bulkAddAssetTag;
     std::optional<EditorBulkAssetTagRequest> bulkRemoveAssetTag;
+    std::optional<EditorMoveAssetsToFolderRequest> moveAssetsToFolder;
     std::optional<EditorDeleteAssetRequest> deleteAssets;
     std::optional<AssetGuid> placeAsset;
     std::optional<Transform> placeAssetTransform;
@@ -461,6 +509,7 @@ struct EditorRequests {
     bool renderImage = false;
     bool renderSequence = false;
     std::optional<EditorRenderRequest> renderRequest;
+    std::optional<EditorCookProjectRequest> cookProject;
     bool openProjectDirectory = false;
     bool openLogFolder = false;
     bool openSelectedAsset = false;

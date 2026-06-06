@@ -593,6 +593,20 @@ ImVec4 selectedAssetStateColor(const AssetRecord& record) {
     return ImVec4(0.65f, 0.70f, 0.78f, 1.0f);
 }
 
+bool assetPlacementBlocked(const AssetRecord& record) {
+    return record.missing || record.status == AssetImportStatus::Missing || record.status == AssetImportStatus::Failed ||
+        record.importedMetadataMissing || record.cookedPayloadMissing || record.dependenciesMissing;
+}
+
+const char* assetPlacementBlockReason(const AssetRecord& record) {
+    if (record.status == AssetImportStatus::Failed) return "Import failed; repair or reimport before placement.";
+    if (record.importedMetadataMissing) return "Imported metadata is missing; repair or reimport before placement.";
+    if (record.cookedPayloadMissing) return "Cooked/runtime payload is missing; rebuild or repair before placement.";
+    if (record.dependenciesMissing) return "Dependency records are missing; repair references before placement.";
+    if (record.missing || record.status == AssetImportStatus::Missing) return "Asset is marked missing; repair before placement.";
+    return "Asset is ready for placement.";
+}
+
 const char* selectedPathOriginLabel(const EditorRuntimeState& state, const std::filesystem::path& path) {
     if (state.project != nullptr) {
         if (pathIsWithin(path, state.project->contentRoot)) {
@@ -638,6 +652,8 @@ EditorGlyphIcon editorGlyphForAssetType(AssetType type) {
     case AssetType::HDRI: return EditorGlyphIcon::Environment;
     case AssetType::Scene: return EditorGlyphIcon::SceneFile;
     case AssetType::Prefab: return EditorGlyphIcon::Model;
+    case AssetType::Animation: return EditorGlyphIcon::TimelineKey;
+    case AssetType::Skeleton: return EditorGlyphIcon::Model;
     case AssetType::Unknown:
     default: return EditorGlyphIcon::File;
     }
@@ -654,6 +670,9 @@ ImU32 assetTypeIconColor(AssetType type) {
     case AssetType::Texture:
     case AssetType::HDRI:
         return IM_COL32(184, 196, 211, 255);
+    case AssetType::Animation:
+    case AssetType::Skeleton:
+        return IM_COL32(190, 202, 184, 255);
     case AssetType::Unknown:
     default:
         return IM_COL32(158, 166, 178, 255);
@@ -973,6 +992,24 @@ std::filesystem::path selectedAssetRelationshipReportPath(
     return path;
 }
 
+std::filesystem::path assetDependencyGraphReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_dependency_graph.json");
+    return path;
+}
+
+std::filesystem::path assetProjectReferenceIndexReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_project_reference_index.json");
+    return path;
+}
+
+std::filesystem::path assetDuplicateReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_duplicate_report.json");
+    return path;
+}
+
 std::filesystem::path selectedAssetDeleteReadinessReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
     std::filesystem::path path = assetValidationReportPath(state, browserRoot);
     path.replace_filename("asset_delete_readiness_" + safeReportName(guid) + ".json");
@@ -988,6 +1025,12 @@ std::filesystem::path selectedAssetProjectReferenceReportPath(const EditorRuntim
 std::filesystem::path selectedAssetBrokenPlaceholderReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
     std::filesystem::path path = assetValidationReportPath(state, browserRoot);
     path.replace_filename("asset_broken_placeholder_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedAssetPackageInspectionReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_package_inspection_" + safeReportName(guid) + ".json");
     return path;
 }
 
@@ -1011,9 +1054,21 @@ std::filesystem::path sourceControlDiffReportPath(const EditorRuntimeState& stat
     return reportPath;
 }
 
+std::filesystem::path sourceControlStatusReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const std::filesystem::path& path) {
+    std::filesystem::path reportPath = assetValidationReportPath(state, browserRoot);
+    const std::string name = path.filename().empty() ? std::string("path") : path.filename().string();
+    const std::string key = canonicalForCompare(path).string();
+    reportPath.replace_filename("source_control_status_" + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
+    return reportPath;
+}
+
 bool sourceControlDiffReportAvailable(const std::string& status) {
     return status == "Modified" || status == "Added" || status == "Deleted" || status == "Renamed" || status == "Copied" ||
         status == "Conflict" || status == "Changed" || status == "Untracked";
+}
+
+bool sourceControlStatusReportAvailable(const std::string& status) {
+    return status != "Unavailable" && status != "Not in Git" && status != "External";
 }
 
 bool sourceControlOverwriteRiskStatus(const std::string& status) {
@@ -1120,6 +1175,85 @@ bool writeSourceControlDiffReport(
     if (unstagedDiff.empty() && stagedDiff.empty() && trimString(statusText).rfind("??", 0) == 0) {
         file << "\n## Note\nUntracked files have no Git diff until they are added to the index.\n";
     }
+    return true;
+}
+
+bool writeSourceControlStatusReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    const std::string& statusLabel,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (path.empty()) {
+        outError = "No source-control path selected.";
+        return false;
+    }
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        outError = "Path is not inside a Git repository.";
+        return false;
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        outError = "Path is outside the resolved Git repository.";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path canonicalPath = canonicalForCompare(path);
+    const std::filesystem::path relative = std::filesystem::relative(canonicalPath, *gitRoot, ec);
+    if (ec) {
+        outError = "Could not resolve repository-relative path: " + ec.message();
+        return false;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string rootArg = quoteCommandPath(*gitRoot);
+    const std::string pathArg = quoteCommandPath(relative);
+    const std::string focusedStatus = readCommandOutput("git -C " + rootArg + " status --short -- " + pathArg + stderrRedirect);
+    const std::string repositoryStatus = readCommandOutput("git -C " + rootArg + " status --short --branch" + stderrRedirect);
+
+    outPath = sourceControlStatusReportPath(state, browserRoot, path);
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create source-control report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write source-control status report: " + outPath.string();
+        return false;
+    }
+
+    const bool exists = std::filesystem::exists(canonicalPath, ec);
+    const bool isDirectory = exists && std::filesystem::is_directory(canonicalPath, ec);
+    const nlohmann::json report = {
+        {"schema", "ContentBrowserSourceControlStatusReportV1"},
+        {"provider", "git"},
+        {"readOnly", true},
+        {"repositoryRoot", gitRoot->generic_string()},
+        {"path", canonicalPath.generic_string()},
+        {"repositoryRelativePath", relative.generic_string()},
+        {"pathExists", exists},
+        {"pathIsDirectory", isDirectory},
+        {"statusLabel", statusLabel},
+        {"focusedStatus", trimString(focusedStatus).empty() ? std::string("Clean") : focusedStatus},
+        {"repositoryStatus", trimString(repositoryStatus).empty() ? std::string("Clean") : repositoryStatus},
+        {"policy", {
+            {"description", "This report is a read-only source-control snapshot for review before asset or level workflow actions."},
+            {"performedActions", nlohmann::json::array()},
+            {"unsupportedActions", {"revert", "checkout", "lock", "submit", "perforce-provider-actions"}}
+        }}
+    };
+    file << report.dump(2);
     return true;
 }
 
@@ -1244,6 +1378,18 @@ void appendComponentReferenceIssue(
 
 bool supportedCoordinateConversion(std::string_view value) {
     return value == "None" || value == "glTF Y-Up to Engine" || value == "Z-Up to Engine";
+}
+
+bool supportedMaterialImportMode(std::string_view value) {
+    return value == "ImportMaterials" || value == "MetadataOnly" || value == "SkipMaterials";
+}
+
+bool supportedTextureImportMode(std::string_view value) {
+    return value == "ImportTextures" || value == "MetadataOnly" || value == "SkipTextures";
+}
+
+bool supportedTextureCompression(std::string_view value) {
+    return value == "PreserveSource";
 }
 
 bool projectReferenceScanFileCandidate(const std::filesystem::path& path) {
@@ -1383,6 +1529,61 @@ void appendInvalidSavedGuidReferences(
         {"guid", guid},
         {"detail", "Saved project metadata contains a GUID field whose value is not present in the loaded asset registry."},
     });
+}
+
+void appendProjectReferenceIndexEntries(
+    const EditorRuntimeState& state,
+    const nlohmann::json& value,
+    const std::unordered_set<AssetGuid>& registryGuids,
+    const std::filesystem::path& filePath,
+    const std::string& jsonPath,
+    std::string objectKey,
+    nlohmann::json& references,
+    nlohmann::json& unknownGuidFields) {
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            appendProjectReferenceIndexEntries(state, it.value(), registryGuids, filePath, jsonPathChild(jsonPath, it.key()), it.key(), references, unknownGuidFields);
+        }
+        return;
+    }
+    if (value.is_array()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            appendProjectReferenceIndexEntries(state, value[i], registryGuids, filePath, jsonPathChild(jsonPath, std::to_string(i)), objectKey, references, unknownGuidFields);
+        }
+        return;
+    }
+    if (!value.is_string()) {
+        return;
+    }
+
+    const std::string keyLower = lowerString(std::move(objectKey));
+    if (keyLower.find("guid") == std::string::npos) {
+        return;
+    }
+    const AssetGuid guid = value.get<std::string>();
+    if (guid.empty()) {
+        return;
+    }
+    const AssetRecord* asset = state.assetRegistry != nullptr ? findAssetRecordByGuid(*state.assetRegistry, guid) : nullptr;
+    if (registryGuids.find(guid) != registryGuids.end()) {
+        references.push_back({
+            {"file", filePath.generic_string()},
+            {"jsonPath", jsonPath.empty() ? "$" : jsonPath},
+            {"field", keyLower},
+            {"guid", guid},
+            {"asset", asset != nullptr ? assetRecordSummaryJson(state, *asset) : nlohmann::json::object()},
+        });
+    } else {
+        unknownGuidFields.push_back({
+            {"severity", "warning"},
+            {"kind", "UnknownSavedGuidField"},
+            {"file", filePath.generic_string()},
+            {"jsonPath", jsonPath.empty() ? "$" : jsonPath},
+            {"field", keyLower},
+            {"guid", guid},
+            {"detail", "Saved project metadata contains a GUID field whose value is not present in the loaded asset registry."},
+        });
+    }
 }
 
 nlohmann::json sourceControlPolicyReportJson(size_t copiedSourceAssetCount) {
@@ -1531,6 +1732,15 @@ nlohmann::json buildAssetValidationReport(const EditorRuntimeState& state, const
             }
             if (!supportedCoordinateConversion(record.importSettings.coordinateConversion)) {
                 appendValidationIssue(unsupportedImportSettings, "warning", "UnsupportedCoordinateConversion", record, "Import coordinate conversion is not recognized: " + record.importSettings.coordinateConversion);
+            }
+            if (!supportedMaterialImportMode(record.importSettings.materialImportMode)) {
+                appendValidationIssue(unsupportedImportSettings, "warning", "UnsupportedMaterialImportMode", record, "Material import mode is not recognized: " + record.importSettings.materialImportMode);
+            }
+            if (!supportedTextureImportMode(record.importSettings.textureImportMode)) {
+                appendValidationIssue(unsupportedImportSettings, "warning", "UnsupportedTextureImportMode", record, "Texture import mode is not recognized: " + record.importSettings.textureImportMode);
+            }
+            if (!supportedTextureCompression(record.importSettings.textureCompression)) {
+                appendValidationIssue(unsupportedImportSettings, "warning", "UnsupportedTextureCompression", record, "Texture compression/transcode mode is not available in this pipeline stage: " + record.importSettings.textureCompression);
             }
         }
     }
@@ -1794,6 +2004,318 @@ nlohmann::json buildAssetReferenceReport(const EditorRuntimeState& state, const 
     };
 }
 
+nlohmann::json buildAssetDependencyGraphReport(const EditorRuntimeState& state) {
+    nlohmann::json nodes = nlohmann::json::array();
+    nlohmann::json edges = nlohmann::json::array();
+    nlohmann::json missingTargets = nlohmann::json::array();
+    nlohmann::json currentSceneUsages = nlohmann::json::array();
+    if (state.assetRegistry == nullptr) {
+        return {
+            {"version", 1},
+            {"kind", "AssetDependencyGraphReport"},
+            {"assetCount", 0},
+            {"edgeCount", 0},
+            {"missingTargetCount", 0},
+            {"currentSceneUsageCount", 0},
+            {"nodes", nodes},
+            {"edges", edges},
+            {"missingTargets", missingTargets},
+            {"currentSceneUsages", currentSceneUsages},
+        };
+    }
+
+    std::unordered_set<AssetGuid> registryGuids;
+    std::unordered_map<AssetGuid, size_t> incomingRegistryEdgeCount;
+    std::unordered_map<AssetGuid, size_t> currentSceneUsageCount;
+    registryGuids.reserve(state.assetRegistry->records().size());
+    for (const AssetRecord& record : state.assetRegistry->records()) {
+        if (!record.guid.empty()) {
+            registryGuids.insert(record.guid);
+            incomingRegistryEdgeCount.emplace(record.guid, 0);
+            currentSceneUsageCount.emplace(record.guid, 0);
+        }
+    }
+
+    auto appendEdge = [&](const AssetRecord& owner, const AssetGuid& targetGuid, const char* relation, const std::string& role) {
+        const bool targetFound = !targetGuid.empty() && registryGuids.find(targetGuid) != registryGuids.end();
+        edges.push_back({
+            {"sourceGuid", owner.guid},
+            {"sourceDisplayName", owner.displayName},
+            {"targetGuid", targetGuid},
+            {"relation", relation},
+            {"role", role.empty() ? relation : role},
+            {"targetFound", targetFound},
+        });
+        if (targetFound) {
+            ++incomingRegistryEdgeCount[targetGuid];
+        } else {
+            missingTargets.push_back({
+                {"sourceGuid", owner.guid},
+                {"sourceDisplayName", owner.displayName},
+                {"targetGuid", targetGuid},
+                {"relation", relation},
+                {"role", role.empty() ? relation : role},
+            });
+        }
+    };
+
+    for (const AssetRecord& record : state.assetRegistry->records()) {
+        for (const AssetDependency& dependency : record.dependencies) {
+            appendEdge(record, dependency.guid, "dependency", dependency.kind);
+        }
+        for (const AssetGuid& reference : record.references) {
+            appendEdge(record, reference, "reference", "reference");
+        }
+    }
+
+    auto appendSceneUsage = [&](const AssetGuid& guid, const Entity* entity, const char* component, const char* field) {
+        if (guid.empty()) {
+            return;
+        }
+        const AssetRecord* asset = findAssetRecordByGuid(*state.assetRegistry, guid);
+        currentSceneUsages.push_back({
+            {"guid", guid},
+            {"assetFound", asset != nullptr},
+            {"asset", asset != nullptr ? assetRecordSummaryJson(state, *asset) : nlohmann::json::object()},
+            {"entity", entity != nullptr ? entity->name : std::string{}},
+            {"entityUuid", entity != nullptr ? nlohmann::json(entity->uuid) : nlohmann::json(nullptr)},
+            {"component", component},
+            {"field", field},
+        });
+        if (asset != nullptr) {
+            ++currentSceneUsageCount[guid];
+        }
+    };
+
+    if (state.sceneDocument != nullptr) {
+        for (const Entity* entity : state.sceneDocument->registry().entities()) {
+            if (entity == nullptr || !entity->meshRenderer.has_value()) {
+                continue;
+            }
+            const MeshRenderer& renderer = *entity->meshRenderer;
+            appendSceneUsage(renderer.meshGuid, entity, "MeshRenderer", "meshGuid");
+            for (const MaterialSlot& slot : renderer.materialSlots) {
+                appendSceneUsage(slot.materialGuid, entity, "MeshRenderer", "materialGuid");
+                if (slot.overrideMaterialGuid.has_value()) {
+                    appendSceneUsage(*slot.overrideMaterialGuid, entity, "MeshRenderer", "overrideMaterialGuid");
+                }
+            }
+        }
+        for (const PrefabInstance& instance : state.sceneDocument->prefabInstances()) {
+            if (instance.prefabGuid.empty()) {
+                continue;
+            }
+            const AssetRecord* asset = findAssetRecordByGuid(*state.assetRegistry, instance.prefabGuid);
+            currentSceneUsages.push_back({
+                {"guid", instance.prefabGuid},
+                {"assetFound", asset != nullptr},
+                {"asset", asset != nullptr ? assetRecordSummaryJson(state, *asset) : nlohmann::json::object()},
+                {"entity", "Prefab Instance"},
+                {"entityUuid", instance.instanceRoot.index},
+                {"component", "PrefabInstance"},
+                {"field", "prefabGuid"},
+            });
+            if (asset != nullptr) {
+                ++currentSceneUsageCount[instance.prefabGuid];
+            }
+        }
+    }
+
+    for (const AssetRecord& record : state.assetRegistry->records()) {
+        nlohmann::json node = assetRecordSummaryJson(state, record);
+        node["outgoingDependencyCount"] = record.dependencies.size();
+        node["storedReferenceCount"] = record.references.size();
+        node["incomingRegistryEdgeCount"] = incomingRegistryEdgeCount[record.guid];
+        node["currentSceneUsageCount"] = currentSceneUsageCount[record.guid];
+        nodes.push_back(std::move(node));
+    }
+
+    return {
+        {"version", 1},
+        {"kind", "AssetDependencyGraphReport"},
+        {"registryPath", state.assetRegistry->state().path.empty() ? std::string{} : state.assetRegistry->state().path.generic_string()},
+        {"assetCount", nodes.size()},
+        {"edgeCount", edges.size()},
+        {"missingTargetCount", missingTargets.size()},
+        {"currentSceneUsageCount", currentSceneUsages.size()},
+        {"nodes", nodes},
+        {"edges", edges},
+        {"missingTargets", missingTargets},
+        {"currentSceneUsages", currentSceneUsages},
+        {"checkedScopes", nlohmann::json::array({"LoadedAssetRegistry", "CurrentScene"})},
+        {"limitation", "This graph uses the loaded asset registry plus current scene references. It does not rewrite references or scan saved project files; use Delete Readiness or Validate Project for saved metadata scans."},
+    };
+}
+
+nlohmann::json buildAssetProjectReferenceIndexReport(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
+    nlohmann::json checkedRoots = nlohmann::json::array();
+    nlohmann::json scannedFiles = nlohmann::json::array();
+    nlohmann::json references = nlohmann::json::array();
+    nlohmann::json unknownGuidFields = nlohmann::json::array();
+    nlohmann::json parseErrors = nlohmann::json::array();
+    nlohmann::json assets = nlohmann::json::array();
+    std::unordered_set<AssetGuid> registryGuids;
+    std::unordered_map<AssetGuid, size_t> savedReferenceCounts;
+
+    if (state.assetRegistry != nullptr) {
+        registryGuids.reserve(state.assetRegistry->records().size());
+        for (const AssetRecord& record : state.assetRegistry->records()) {
+            if (!record.guid.empty()) {
+                registryGuids.insert(record.guid);
+                savedReferenceCounts.emplace(record.guid, 0);
+            }
+        }
+    }
+
+    std::vector<std::filesystem::path> files;
+    collectProjectReferenceScanFiles(state, browserRoot, checkedRoots, files);
+    for (const std::filesystem::path& path : files) {
+        scannedFiles.push_back(path.generic_string());
+        std::optional<nlohmann::json> json = readJsonFile(path);
+        if (!json.has_value()) {
+            parseErrors.push_back({
+                {"severity", "warning"},
+                {"kind", "SavedProjectReferenceParseError"},
+                {"file", path.generic_string()},
+                {"detail", "File matched the project reference index set but could not be parsed as JSON."},
+            });
+            continue;
+        }
+        const size_t before = references.size();
+        appendProjectReferenceIndexEntries(state, *json, registryGuids, path, "$", {}, references, unknownGuidFields);
+        for (size_t i = before; i < references.size(); ++i) {
+            const AssetGuid guid = references[i].value("guid", std::string{});
+            if (!guid.empty()) {
+                ++savedReferenceCounts[guid];
+            }
+        }
+    }
+
+    if (state.assetRegistry != nullptr) {
+        for (const AssetRecord& record : state.assetRegistry->records()) {
+            nlohmann::json asset = assetRecordSummaryJson(state, record);
+            asset["savedProjectReferenceCount"] = savedReferenceCounts[record.guid];
+            assets.push_back(std::move(asset));
+        }
+    }
+
+    return {
+        {"version", 1},
+        {"kind", "AssetProjectReferenceIndexReport"},
+        {"registryPath", state.assetRegistry != nullptr && !state.assetRegistry->state().path.empty() ? state.assetRegistry->state().path.generic_string() : std::string{}},
+        {"assetCount", assets.size()},
+        {"checkedRoots", checkedRoots},
+        {"scannedFileCount", scannedFiles.size()},
+        {"registeredReferenceCount", references.size()},
+        {"unknownGuidFieldCount", unknownGuidFields.size()},
+        {"parseErrorCount", parseErrors.size()},
+        {"assets", assets},
+        {"references", references},
+        {"unknownGuidFields", unknownGuidFields},
+        {"parseErrors", parseErrors},
+        {"scannedFiles", scannedFiles},
+        {"checkedFileTypes", nlohmann::json::array({".rtlevel", ".mscene", ".vproject", ".rtprefab.json", ".rtmesh.json", ".rtmaterial.json", ".rttexture.json", ".rthdri.json"})},
+        {"limitation", "This is an on-demand saved-file JSON index for project content and scene roots. It is not a persistent index and does not rewrite references or inspect generated cache payload internals."},
+    };
+}
+
+void appendDuplicateAssetGroups(
+    const EditorRuntimeState& state,
+    const std::unordered_map<std::string, std::vector<const AssetRecord*>>& groupsByKey,
+    const char* reason,
+    const char* confidence,
+    nlohmann::json& duplicateGroups) {
+    std::vector<std::pair<std::string, std::vector<const AssetRecord*>>> groups;
+    groups.reserve(groupsByKey.size());
+    for (const auto& [key, records] : groupsByKey) {
+        if (records.size() > 1) {
+            groups.push_back({key, records});
+        }
+    }
+    std::sort(groups.begin(), groups.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.second.size() != rhs.second.size()) return lhs.second.size() > rhs.second.size();
+        return lhs.first < rhs.first;
+    });
+    for (const auto& [key, records] : groups) {
+        nlohmann::json recordArray = nlohmann::json::array();
+        for (const AssetRecord* record : records) {
+            if (record != nullptr) {
+                recordArray.push_back(assetRecordSummaryJson(state, *record));
+            }
+        }
+        duplicateGroups.push_back({
+            {"reason", reason},
+            {"confidence", confidence},
+            {"key", key},
+            {"recordCount", recordArray.size()},
+            {"records", recordArray},
+        });
+    }
+}
+
+nlohmann::json buildAssetDuplicateReport(const EditorRuntimeState& state) {
+    nlohmann::json duplicateGroups = nlohmann::json::array();
+    if (state.assetRegistry == nullptr) {
+        return {
+            {"version", 1},
+            {"kind", "AssetDuplicateReport"},
+            {"assetCount", 0},
+            {"duplicateGroupCount", 0},
+            {"duplicateGroups", duplicateGroups},
+        };
+    }
+
+    std::unordered_map<std::string, std::vector<const AssetRecord*>> byImportIdentity;
+    std::unordered_map<std::string, std::vector<const AssetRecord*>> bySourceHash;
+    std::unordered_map<std::string, std::vector<const AssetRecord*>> bySourcePath;
+    std::unordered_map<std::string, std::vector<const AssetRecord*>> byImportedPath;
+    std::unordered_map<std::string, std::vector<const AssetRecord*>> byCachePath;
+    std::unordered_map<std::string, std::vector<const AssetRecord*>> byDisplayName;
+
+    auto appendPathGroup = [&](std::unordered_map<std::string, std::vector<const AssetRecord*>>& groups, const std::string& value, const AssetRecord& record) {
+        const std::filesystem::path path = resolveAssetRecordPath(state, value);
+        if (path.empty()) {
+            return;
+        }
+        groups[lowerString(canonicalForCompare(path).generic_string())].push_back(&record);
+    };
+
+    for (const AssetRecord& record : state.assetRegistry->records()) {
+        const std::string typeName = assetTypeName(record.type);
+        if (!record.sourceHash.empty()) {
+            bySourceHash[typeName + ":" + record.sourceHash].push_back(&record);
+        }
+        if (!record.sourceHash.empty() && !record.importSettingsHash.empty()) {
+            byImportIdentity[typeName + ":" + record.sourceHash + ":" + record.importSettingsHash].push_back(&record);
+        }
+        appendPathGroup(bySourcePath, record.sourcePath, record);
+        appendPathGroup(byImportedPath, record.importedPath, record);
+        appendPathGroup(byCachePath, record.cachePath, record);
+        const std::string displayName = lowerString(trimString(record.displayName));
+        if (!displayName.empty()) {
+            byDisplayName[typeName + ":" + displayName].push_back(&record);
+        }
+    }
+
+    appendDuplicateAssetGroups(state, byImportIdentity, "SameSourceAndImportSettingsHash", "high", duplicateGroups);
+    appendDuplicateAssetGroups(state, bySourceHash, "SameSourceHash", "medium", duplicateGroups);
+    appendDuplicateAssetGroups(state, bySourcePath, "SameResolvedSourcePath", "medium", duplicateGroups);
+    appendDuplicateAssetGroups(state, byImportedPath, "SameResolvedImportedMetadataPath", "high", duplicateGroups);
+    appendDuplicateAssetGroups(state, byCachePath, "SameResolvedCookedPayloadPath", "high", duplicateGroups);
+    appendDuplicateAssetGroups(state, byDisplayName, "SameTypeAndDisplayName", "low", duplicateGroups);
+
+    return {
+        {"version", 1},
+        {"kind", "AssetDuplicateReport"},
+        {"registryPath", state.assetRegistry->state().path.empty() ? std::string{} : state.assetRegistry->state().path.generic_string()},
+        {"assetCount", state.assetRegistry->records().size()},
+        {"duplicateGroupCount", duplicateGroups.size()},
+        {"duplicateGroups", duplicateGroups},
+        {"checkedSignals", nlohmann::json::array({"sourceHash+importSettingsHash+type", "sourceHash+type", "resolved source path", "resolved imported metadata path", "resolved cooked payload path", "type+displayName"})},
+        {"limitation", "This report is non-destructive duplicate visibility for the loaded registry. It does not merge assets, delete files, rewrite references, or inspect saved project/package references."},
+    };
+}
+
 nlohmann::json buildAssetProjectReferenceScanReport(
     const EditorRuntimeState& state,
     const std::filesystem::path& browserRoot,
@@ -2029,6 +2551,115 @@ nlohmann::json buildAssetBrokenPlaceholderReport(const EditorRuntimeState& state
     };
 }
 
+nlohmann::json pathInspectionJson(const std::filesystem::path& path, const char* role) {
+    nlohmann::json info = {
+        {"role", role},
+        {"path", path.empty() ? std::string{} : path.generic_string()},
+        {"exists", false},
+        {"isRegularFile", false},
+        {"isDirectory", false},
+        {"sizeBytes", 0},
+        {"writeStamp", 0},
+    };
+    if (path.empty()) {
+        return info;
+    }
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec);
+    info["exists"] = exists && !ec;
+    if (!exists || ec) {
+        if (ec) {
+            info["error"] = ec.message();
+        }
+        return info;
+    }
+    const bool regular = std::filesystem::is_regular_file(path, ec);
+    info["isRegularFile"] = regular && !ec;
+    const bool directory = std::filesystem::is_directory(path, ec);
+    info["isDirectory"] = directory && !ec;
+    if (regular) {
+        info["sizeBytes"] = static_cast<uint64_t>(pathSizeForCache(path));
+        info["writeStamp"] = pathWriteStamp(path);
+    }
+    return info;
+}
+
+nlohmann::json metadataFileInspectionJson(const std::filesystem::path& path, const char* role) {
+    nlohmann::json info = pathInspectionJson(path, role);
+    if (!info.value("isRegularFile", false)) {
+        return info;
+    }
+    std::optional<nlohmann::json> json = readJsonFile(path);
+    if (!json.has_value()) {
+        info["parseStatus"] = "unreadable_or_invalid_json";
+        return info;
+    }
+    info["parseStatus"] = "ok";
+    info["topLevelType"] = json->is_object() ? "object" : json->is_array() ? "array" : json->is_string() ? "string" : json->is_number() ? "number" : json->is_boolean() ? "boolean" : "null";
+    if (json->is_object()) {
+        nlohmann::json keys = nlohmann::json::array();
+        for (auto it = json->begin(); it != json->end(); ++it) {
+            keys.push_back(it.key());
+        }
+        info["topLevelKeys"] = keys;
+        if (json->contains("schema")) info["schema"] = (*json)["schema"];
+        if (json->contains("kind")) info["kind"] = (*json)["kind"];
+        if (json->contains("version")) info["version"] = (*json)["version"];
+        if (json->contains("runtimePayload")) info["runtimePayload"] = (*json)["runtimePayload"];
+        if (json->contains("payloads")) info["payloadCount"] = jsonArraySize(*json, "payloads");
+        if (json->contains("dependencies")) info["dependencyCount"] = jsonArraySize(*json, "dependencies");
+        if (json->contains("references")) info["referenceCount"] = jsonArraySize(*json, "references");
+        if (json->contains("assets")) info["assetCount"] = jsonArraySize(*json, "assets");
+    }
+    return info;
+}
+
+nlohmann::json buildAssetPackageInspectionReport(const EditorRuntimeState& state, const AssetRecord& record) {
+    const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
+    const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
+    const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
+    const std::filesystem::path thumbnailPath = resolveAssetRecordPath(state, record.thumbnailPath);
+
+    nlohmann::json files = nlohmann::json::array();
+    files.push_back(pathInspectionJson(sourcePath, "source"));
+    files.push_back(metadataFileInspectionJson(importedPath, "importedMetadata"));
+    files.push_back(pathInspectionJson(cachePath, "cookedOrRuntimePayload"));
+    files.push_back(pathInspectionJson(thumbnailPath, "thumbnail"));
+
+    nlohmann::json payloadPolicy = {
+        {"sourcePath", record.sourcePath},
+        {"importedMetadataPath", record.importedPath},
+        {"cachePath", record.cachePath},
+        {"thumbnailPath", record.thumbnailPath},
+        {"sourceHash", record.sourceHash},
+        {"importedHash", record.importedHash},
+        {"importSettingsHash", record.importSettingsHash},
+        {"importGroupId", record.importGroupId},
+        {"importGroupName", record.importGroupName},
+        {"importRootGuid", record.importRootGuid},
+    };
+
+    return {
+        {"version", 1},
+        {"kind", "SelectedAssetPackageInspectionReport"},
+        {"targetGuid", record.guid},
+        {"asset", assetRecordSummaryJson(state, record)},
+        {"payloadPolicy", payloadPolicy},
+        {"files", files},
+        {"registryHealth", {
+            {"missing", record.missing},
+            {"stale", record.stale},
+            {"sourceMissing", record.sourceMissing},
+            {"importedMetadataMissing", record.importedMetadataMissing},
+            {"cookedPayloadMissing", record.cookedPayloadMissing},
+            {"dependenciesMissing", record.dependenciesMissing},
+        }},
+        {"checkedScopes", nlohmann::json::array({"LoadedAssetRegistry", "ResolvedSourcePath", "ImportedMetadataJson", "CookedRuntimePayloadPath", "ThumbnailPath"})},
+        {"uncheckedScopes", nlohmann::json::array({"OpaqueRtpkgObjects", "GeneratedCachePayloadInternals", "ExternalProjectFiles", "BinaryPayloadDeepInspection"})},
+        {"limitation", "This report inspects selected transparent asset metadata and filesystem payload facts only. It does not parse binary cache payload internals, rewrite references, repair missing files, or inspect future opaque packages."},
+    };
+}
+
 bool writeAssetRelationshipReport(
     const EditorRuntimeState& state,
     const std::filesystem::path& browserRoot,
@@ -2053,6 +2684,81 @@ bool writeAssetRelationshipReport(
         return false;
     }
     file << (referencesReport ? buildAssetReferenceReport(state, targetGuid) : buildAssetDependencyReport(state, targetGuid)).dump(2);
+    return true;
+}
+
+bool writeAssetDependencyGraphReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (state.assetRegistry == nullptr) {
+        outError = "Asset registry is unavailable.";
+        return false;
+    }
+    outPath = assetDependencyGraphReportPath(state, browserRoot);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create dependency graph report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write dependency graph report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetDependencyGraphReport(state).dump(2);
+    return true;
+}
+
+bool writeAssetProjectReferenceIndexReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (state.assetRegistry == nullptr) {
+        outError = "Asset registry is unavailable.";
+        return false;
+    }
+    outPath = assetProjectReferenceIndexReportPath(state, browserRoot);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create project reference index folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write project reference index: " + outPath.string();
+        return false;
+    }
+    file << buildAssetProjectReferenceIndexReport(state, browserRoot).dump(2);
+    return true;
+}
+
+bool writeAssetDuplicateReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (state.assetRegistry == nullptr) {
+        outError = "Asset registry is unavailable.";
+        return false;
+    }
+    outPath = assetDuplicateReportPath(state, browserRoot);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create duplicate report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write duplicate report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetDuplicateReport(state).dump(2);
     return true;
 }
 
@@ -2123,6 +2829,28 @@ bool writeAssetBrokenPlaceholderReport(
         return false;
     }
     file << buildAssetBrokenPlaceholderReport(state, record).dump(2);
+    return true;
+}
+
+bool writeAssetPackageInspectionReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetRecord& record,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedAssetPackageInspectionReportPath(state, browserRoot, record.guid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create package inspection report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath);
+    if (!file.is_open()) {
+        outError = "Could not write package inspection report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetPackageInspectionReport(state, record).dump(2);
     return true;
 }
 
@@ -3341,7 +4069,7 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
     }
     ImGui::EndGroup();
 
-    constexpr const char* typeFilters[] = {"All Types", "Mesh", "Material", "Texture", "HDRI", "Scene", "Prefab", "Unknown"};
+    constexpr const char* typeFilters[] = {"All Types", "Mesh", "Material", "Texture", "HDRI", "Scene", "Prefab", "Animation", "Skeleton", "Unknown"};
     constexpr const char* statusFilters[] = {"All Status", "Imported", "Missing", "Stale", "Failed", "Unknown"};
     constexpr const char* healthFilters[] = {
         "All Health",
@@ -3457,7 +4185,9 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         case 4: return type == AssetType::HDRI;
         case 5: return type == AssetType::Scene;
         case 6: return type == AssetType::Prefab;
-        case 7: return type == AssetType::Unknown;
+        case 7: return type == AssetType::Animation;
+        case 8: return type == AssetType::Skeleton;
+        case 9: return type == AssetType::Unknown;
         default: return true;
         }
     };
@@ -3526,6 +4256,69 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         setPreferenceSaveStatus(state.editorPrefs->save(EditorPreferences::defaultPath()), status_, std::move(successMessage), std::move(failureDetail));
     };
     if (ImGui::TreeNodeEx("Registry Bulk Tools")) {
+        if (contentActionButton("AssetDependencyGraphReport", EditorGlyphIcon::Details, "Dependency Graph", "Write and open a loaded-registry dependency/reference graph report")) {
+            std::filesystem::path reportPath;
+            std::string error;
+            if (writeAssetDependencyGraphReport(state, browserRoot_, reportPath, error)) {
+                requests.openFilePath = reportPath;
+                status_ = "Asset dependency graph report: " + reportPath.string();
+            } else {
+                status_ = "Asset dependency graph report failed: " + error;
+            }
+        }
+        ImGui::SameLine();
+        if (contentActionButton("AssetProjectReferenceIndexReport", EditorGlyphIcon::Details, "Project References", "Write and open a saved-project asset reference index report")) {
+            std::filesystem::path reportPath;
+            std::string error;
+            if (writeAssetProjectReferenceIndexReport(state, browserRoot_, reportPath, error)) {
+                requests.openFilePath = reportPath;
+                status_ = "Asset project-reference index: " + reportPath.string();
+            } else {
+                status_ = "Asset project-reference index failed: " + error;
+            }
+        }
+        ImGui::SameLine();
+        if (contentActionButton("AssetDuplicateReport", EditorGlyphIcon::Details, "Duplicate Scan", "Write and open a non-destructive duplicate asset report")) {
+            std::filesystem::path reportPath;
+            std::string error;
+            if (writeAssetDuplicateReport(state, browserRoot_, reportPath, error)) {
+                requests.openFilePath = reportPath;
+                status_ = "Asset duplicate report: " + reportPath.string();
+            } else {
+                status_ = "Asset duplicate report failed: " + error;
+            }
+        }
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::InputTextWithHint("##virtualFolder", "Virtual folder", virtualFolderBuffer_.data(), virtualFolderBuffer_.size());
+        const std::string virtualFolder = trimString(virtualFolderBuffer_.data());
+        const bool canMoveVisibleToFolder = !virtualFolder.empty() && !visibleRecordGuids.empty();
+        ImGui::SameLine();
+        if (!canMoveVisibleToFolder) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("MoveVisibleToVirtualFolder", EditorGlyphIcon::Folder, "Move Visible", "Move currently visible registry records into this virtual folder without moving files")) {
+            requests.moveAssetsToFolder = EditorMoveAssetsToFolderRequest{visibleRecordGuids, virtualFolder};
+            selectedRegistryGroupId_ = std::string("folder:") + lowerString(virtualFolder);
+            status_ = "Queued virtual folder move: " + virtualFolder;
+        }
+        if (!canMoveVisibleToFolder) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (visibleRecordGuids.empty()) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("ClearVisibleVirtualFolder", EditorGlyphIcon::Trash, "Clear Folder", "Clear custom virtual-folder metadata for currently visible registry records")) {
+            requests.moveAssetsToFolder = EditorMoveAssetsToFolderRequest{visibleRecordGuids, {}};
+            selectedRegistryGroupId_.clear();
+            status_ = "Queued virtual folder metadata clear";
+        }
+        if (visibleRecordGuids.empty()) {
+            ImGui::EndDisabled();
+        }
+        ImGui::TextDisabled("Virtual folder moves update registry metadata only; generated files and GUID references are preserved.");
+        ImGui::Separator();
         ImGui::SetNextItemWidth(140.0f);
         ImGui::InputTextWithHint("##collectionName", "Collection", collectionNameBuffer_.data(), collectionNameBuffer_.size());
         if (state.editorPrefs != nullptr && !state.editorPrefs->assetCollections.empty()) {
@@ -3789,8 +4582,14 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                     }
                     ImGui::Separator();
                 }
-                if (record.type == AssetType::Prefab && editorGlyphMenuItem(EditorGlyphIcon::Add, "Place Prefab")) {
+                const bool canPlacePrefab = record.type == AssetType::Prefab && !assetPlacementBlocked(record);
+                if (record.type == AssetType::Prefab && editorGlyphMenuItem(EditorGlyphIcon::Add, "Place Prefab", canPlacePrefab)) {
                     requests.placeAsset = record.guid;
+                }
+                if (record.type == AssetType::Prefab && !canPlacePrefab) {
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("%s", assetPlacementBlockReason(record));
+                    }
                 }
                 const std::filesystem::path resolvedSourcePath = resolveAssetRecordPath(state, record.sourcePath);
                 const bool canReimport = !record.sourcePath.empty() && std::filesystem::exists(resolvedSourcePath);
@@ -3898,6 +4697,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
         }
         const std::string status = sourceControlStatus(path);
         const bool canOpenExternal = regularFileExists(path);
+        const bool canStatusReport = sourceControlStatusReportAvailable(status);
         const bool canDiff = sourceControlDiffReportAvailable(status);
         ImGui::PushID(id);
         if (!canOpenExternal) {
@@ -3908,6 +4708,23 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             status_ = "Opening file: " + path.string();
         }
         if (!canOpenExternal) {
+            ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (!canStatusReport) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("GitStatus", EditorGlyphIcon::Details, "Git Status", "Write and open a read-only Git status report for this path")) {
+            std::filesystem::path reportPath;
+            std::string error;
+            if (writeSourceControlStatusReport(state, browserRoot_, sourceControlRoot, path, status, reportPath, error)) {
+                requests.openFilePath = reportPath;
+                status_ = "Source-control status report: " + reportPath.string();
+            } else {
+                status_ = "Source-control status report failed: " + error;
+            }
+        }
+        if (!canStatusReport) {
             ImGui::EndDisabled();
         }
         ImGui::SameLine();
@@ -4101,6 +4918,31 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                         "add asset favorite " + record.guid);
                 }
             }
+            if (assetRenameBufferGuid_ != record.guid) {
+                setTextBuffer(assetRenameBuffer_, record.displayName.empty() ? record.guid : record.displayName);
+                assetRenameBufferGuid_ = record.guid;
+            }
+            ImGui::SeparatorText("Asset Name");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputTextWithHint("##assetDisplayName", "Display name", assetRenameBuffer_.data(), assetRenameBuffer_.size());
+            const std::string editedAssetName = trimString(assetRenameBuffer_.data());
+            const std::string currentAssetName = trimString(record.displayName.empty() ? record.guid : record.displayName);
+            const bool canRenameAsset = !editedAssetName.empty() && editedAssetName != currentAssetName;
+            if (!canRenameAsset) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("RenameAssetRecord", EditorGlyphIcon::Refresh, "Rename Asset", "Update this asset's registry display name without changing its GUID or generated file paths")) {
+                requests.renameAsset = EditorRenameAssetRequest{record.guid, editedAssetName};
+                status_ = "Queued asset rename: " + currentAssetName + " -> " + editedAssetName;
+            }
+            if (!canRenameAsset) {
+                ImGui::EndDisabled();
+            }
+            if (editedAssetName.empty()) {
+                ImGui::TextDisabled("Asset display name cannot be empty.");
+            } else {
+                ImGui::TextDisabled("Rename updates registry metadata only; GUIDs, references, and generated file paths are preserved.");
+            }
             if (record.stale || record.status == AssetImportStatus::Stale) {
                 ImGui::TextWrapped("The selected asset has stale import metadata; reimport updates its cooked payload and registry record.");
             } else if (record.missing || record.status == AssetImportStatus::Missing) {
@@ -4136,6 +4978,17 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                     status_ = "Asset broken-placeholder report: " + reportPath.string();
                 } else {
                     status_ = "Asset broken-placeholder report failed: " + error;
+                }
+            }
+            ImGui::SameLine();
+            if (contentActionButton("PackageInspectionReport", EditorGlyphIcon::Details, "Inspect Package", "Write and open a transparent metadata/cache inspection report for this asset")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetPackageInspectionReport(state, browserRoot_, record, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset package inspection report: " + reportPath.string();
+                } else {
+                    status_ = "Asset package inspection report failed: " + error;
                 }
             }
             ImGui::TextWrapped("Thumbnail: %s", record.thumbnailPath.empty() ? "(fallback icon)" : record.thumbnailPath.c_str());
@@ -4261,6 +5114,25 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             if (!record.cachePath.empty()) {
                 ImGui::SameLine();
                 drawRevealAction("RevealCache", "Reveal Payload", "Reveal the cooked/runtime payload in Explorer", resolvedCacheForReveal);
+            }
+            const bool canRepairByReimport = !record.sourcePath.empty() && !record.sourceMissing && std::filesystem::exists(resolvedSourceForReveal);
+            const bool repairNeeded = record.stale || record.missing || record.importedMetadataMissing || record.cookedPayloadMissing || record.dependenciesMissing || record.status == AssetImportStatus::Missing || record.status == AssetImportStatus::Stale || record.status == AssetImportStatus::Failed;
+            ImGui::SameLine();
+            if (!canRepairByReimport || !repairNeeded) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("RepairAsset", EditorGlyphIcon::Refresh, "Repair Asset", "Queue reimport to repair stale, failed, missing-metadata, or missing-payload asset state")) {
+                requests.reimportAsset = record.guid;
+                recordImportOperation("Repair Asset", resolvedSourceForReveal, {}, "Reimport", record.guid);
+                status_ = "Queued asset repair: " + (record.displayName.empty() ? record.guid : record.displayName);
+            }
+            if (!canRepairByReimport || !repairNeeded) {
+                ImGui::EndDisabled();
+            }
+            if (repairNeeded && !canRepairByReimport) {
+                ImGui::TextDisabled("Repair Asset requires an available source path; restore or relink the source first.");
+            } else if (!repairNeeded) {
+                ImGui::TextDisabled("Repair Asset: no stale, failed, or missing metadata/payload state is currently reported.");
             }
             if ((!record.sourcePath.empty() && !std::filesystem::exists(resolvedSourceForReveal)) ||
                 (!record.importedPath.empty() && !std::filesystem::exists(resolvedImportedForReveal)) ||
@@ -4617,8 +5489,16 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             }
             if (record.type == AssetType::Prefab) {
                 ImGui::SameLine();
+                const bool canPlacePrefab = !assetPlacementBlocked(record);
+                if (!canPlacePrefab) {
+                    ImGui::BeginDisabled();
+                }
                 if (contentActionButton("PlacePrefab", EditorGlyphIcon::Add, "Place Prefab", "Place this prefab in the current scene")) {
                     requests.placeAsset = record.guid;
+                }
+                if (!canPlacePrefab) {
+                    ImGui::EndDisabled();
+                    ImGui::TextDisabled("Placement blocked: %s", assetPlacementBlockReason(record));
                 }
             }
             break;
@@ -4652,18 +5532,47 @@ void AssetBrowserPanel::drawImportSettingsDialog(EditorRequests& requests) {
     ImGui::InputTextWithHint("Destination Folder", "Models", importDestinationFolder_.data(), importDestinationFolder_.size());
     ImGui::SeparatorText("Source");
     ImGui::Checkbox("Copy source into project", &importSettings_.copySourceIntoProject);
+    ImGui::SeparatorText("Asset Output");
+    importSettings_.generatePrefabAsset = true;
+    ImGui::BeginDisabled(true);
+    ImGui::Checkbox("Generate prefab/model asset", &importSettings_.generatePrefabAsset);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Current glTF/GLB imports use a prefab/model root asset as the durable registry entry.");
+    }
     ImGui::SeparatorText("Hierarchy");
     ImGui::Checkbox("Preserve hierarchy", &importSettings_.preserveHierarchy);
-    ImGui::Checkbox("Import materials", &importSettings_.importMaterials);
-    ImGui::Checkbox("Import textures", &importSettings_.importTextures);
+    const char* materialModes[] = {"Import materials", "Metadata only", "Skip materials"};
+    const char* materialModeValues[] = {"ImportMaterials", "MetadataOnly", "SkipMaterials"};
+    int materialMode = importSettings_.materialImportMode == "SkipMaterials" ? 2 : importSettings_.materialImportMode == "MetadataOnly" ? 1 : 0;
+    if (ImGui::Combo("Material mode", &materialMode, materialModes, IM_ARRAYSIZE(materialModes))) {
+        importSettings_.materialImportMode = materialModeValues[materialMode];
+    }
+    importSettings_.importMaterials = importSettings_.materialImportMode != "SkipMaterials";
+    const char* textureModes[] = {"Import textures", "Metadata only", "Skip textures"};
+    const char* textureModeValues[] = {"ImportTextures", "MetadataOnly", "SkipTextures"};
+    int textureMode = importSettings_.textureImportMode == "SkipTextures" ? 2 : importSettings_.textureImportMode == "MetadataOnly" ? 1 : 0;
+    if (ImGui::Combo("Texture mode", &textureMode, textureModes, IM_ARRAYSIZE(textureModes))) {
+        importSettings_.textureImportMode = textureModeValues[textureMode];
+    }
+    importSettings_.importTextures = importSettings_.textureImportMode != "SkipTextures";
+    const char* textureCompressionModes[] = {"Preserve source payload"};
+    int textureCompressionMode = 0;
+    if (ImGui::Combo("Texture compression", &textureCompressionMode, textureCompressionModes, IM_ARRAYSIZE(textureCompressionModes))) {
+        importSettings_.textureCompression = "PreserveSource";
+    }
     ImGui::Checkbox("Import cameras", &importSettings_.importCameras);
     ImGui::Checkbox("Import lights", &importSettings_.importLights);
     ImGui::SeparatorText("Geometry / Cache");
     ImGui::Checkbox("Generate tangents", &importSettings_.generateTangents);
     ImGui::Checkbox("Build BLAS cache", &importSettings_.buildBlasCache);
+    ImGui::Checkbox("Build cooked payloads now", &importSettings_.buildCookedPayloadsNow);
+    ImGui::Checkbox("Generate thumbnails", &importSettings_.generateThumbnails);
     ImGui::InputFloat("Unit scale", &importSettings_.unitScale, 0.1f, 1.0f, "%.3f");
-    static int coordinateMode = 0;
     const char* coordinateModes[] = {"None", "glTF Y-Up to Engine", "Z-Up to Engine"};
+    int coordinateMode = importSettings_.coordinateConversion == "glTF Y-Up to Engine" ? 1
+        : importSettings_.coordinateConversion == "Z-Up to Engine" ? 2
+        : 0;
     if (ImGui::Combo("Coordinate conversion", &coordinateMode, coordinateModes, IM_ARRAYSIZE(coordinateModes))) {
         importSettings_.coordinateConversion = coordinateModes[coordinateMode];
     }
@@ -4961,8 +5870,14 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
                             selectedRecordGuid_ = guid;
                             selectedPath_.clear();
                         }
-                        if (!missingRecord && record->type == AssetType::Prefab && editorGlyphMenuItem(EditorGlyphIcon::Add, "Place Prefab")) {
+                        const bool canPlaceFavoritePrefab = !missingRecord && record->type == AssetType::Prefab && !assetPlacementBlocked(*record);
+                        if (!missingRecord && record->type == AssetType::Prefab && editorGlyphMenuItem(EditorGlyphIcon::Add, "Place Prefab", canPlaceFavoritePrefab)) {
                             requests.placeAsset = guid;
+                        }
+                        if (!missingRecord && record->type == AssetType::Prefab && !canPlaceFavoritePrefab) {
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                                ImGui::SetTooltip("%s", assetPlacementBlockReason(*record));
+                            }
                         }
                         if (editorGlyphMenuItem(EditorGlyphIcon::Details, "Filter Registry To Favorites")) {
                             registryFavoriteFilter_ = 1;

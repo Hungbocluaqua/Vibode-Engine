@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 35;
+constexpr uint32_t kCacheVersion = 42;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -59,6 +59,74 @@ bool writeFloat(std::FILE* file, float value) {
 
 bool writeBytes(std::FILE* file, const void* buffer, size_t count) {
     return std::fwrite(buffer, 1, count, file) == count;
+}
+
+bool writeVec3Vector(std::FILE* file, const std::vector<glm::vec3>& values) {
+    const uint32_t count = static_cast<uint32_t>(values.size());
+    if (!writeUint32(file, count)) {
+        return false;
+    }
+    return count == 0 || writeBytes(file, values.data(), sizeof(glm::vec3) * count);
+}
+
+bool readVec3Vector(std::FILE* file, std::vector<glm::vec3>& values) {
+    uint32_t count = 0;
+    if (!readUint32(file, count)) {
+        return false;
+    }
+    values.resize(count);
+    return count == 0 || readBytes(file, values.data(), sizeof(glm::vec3) * count);
+}
+
+bool writeFloatVector(std::FILE* file, const std::vector<float>& values) {
+    const uint32_t count = static_cast<uint32_t>(values.size());
+    if (!writeUint32(file, count)) {
+        return false;
+    }
+    return count == 0 || writeBytes(file, values.data(), sizeof(float) * count);
+}
+
+bool readFloatVector(std::FILE* file, std::vector<float>& values) {
+    uint32_t count = 0;
+    if (!readUint32(file, count)) {
+        return false;
+    }
+    values.resize(count);
+    return count == 0 || readBytes(file, values.data(), sizeof(float) * count);
+}
+
+bool writeUint32Vector(std::FILE* file, const std::vector<uint32_t>& values) {
+    const uint32_t count = static_cast<uint32_t>(values.size());
+    if (!writeUint32(file, count)) {
+        return false;
+    }
+    return count == 0 || writeBytes(file, values.data(), sizeof(uint32_t) * count);
+}
+
+bool readUint32Vector(std::FILE* file, std::vector<uint32_t>& values) {
+    uint32_t count = 0;
+    if (!readUint32(file, count)) {
+        return false;
+    }
+    values.resize(count);
+    return count == 0 || readBytes(file, values.data(), sizeof(uint32_t) * count);
+}
+
+bool writeMat4Vector(std::FILE* file, const std::vector<glm::mat4>& values) {
+    const uint32_t count = static_cast<uint32_t>(values.size());
+    if (!writeUint32(file, count)) {
+        return false;
+    }
+    return count == 0 || writeBytes(file, values.data(), sizeof(glm::mat4) * count);
+}
+
+bool readMat4Vector(std::FILE* file, std::vector<glm::mat4>& values) {
+    uint32_t count = 0;
+    if (!readUint32(file, count)) {
+        return false;
+    }
+    values.resize(count);
+    return count == 0 || readBytes(file, values.data(), sizeof(glm::mat4) * count);
 }
 
 } // namespace
@@ -324,6 +392,10 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeUint32(file, vertexCount);
         writeUint32(file, indexCount);
         writeUint32(file, primitiveCount);
+        if (!writeFloatVector(file, mesh.defaultMorphWeights)) {
+            std::fclose(file);
+            return false;
+        }
         if (vertexCount > 0) {
             writeBytes(file, mesh.vertices.data(), sizeof(MeshVertex) * vertexCount);
         }
@@ -336,6 +408,17 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
             writeUint32(file, prim.firstIndex);
             writeUint32(file, prim.indexCount);
             writeInt32(file, prim.materialIndex);
+            uint32_t morphTargetCount = static_cast<uint32_t>(prim.morphTargets.size());
+            writeUint32(file, morphTargetCount);
+            for (const auto& target : prim.morphTargets) {
+                writeString(file, target.name);
+                if (!writeVec3Vector(file, target.positionDeltas) ||
+                    !writeVec3Vector(file, target.normalDeltas) ||
+                    !writeVec3Vector(file, target.tangentDeltas)) {
+                    std::fclose(file);
+                    return false;
+                }
+            }
             uint32_t variantCount = static_cast<uint32_t>(prim.materialVariants.size());
             writeUint32(file, variantCount);
             for (const auto& variant : prim.materialVariants) {
@@ -355,6 +438,11 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeString(file, node.name);
         writeBytes(file, &node.transform, sizeof(node.transform));
         writeInt32(file, node.meshIndex);
+        if (!writeFloatVector(file, node.morphWeights)) {
+            std::fclose(file);
+            return false;
+        }
+        writeInt32(file, node.skinIndex);
         writeUint32(file, node.hasCamera);
         writeUint32(file, node.cameraProjection);
         writeFloat(file, node.cameraYfov);
@@ -368,6 +456,20 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeUint32(file, childCount);
         if (childCount > 0) {
             writeBytes(file, node.children.data(), sizeof(uint32_t) * childCount);
+        }
+    }
+
+    uint32_t skinCount = static_cast<uint32_t>(scene.skins.size());
+    if (!writeUint32(file, skinCount)) {
+        std::fclose(file);
+        return false;
+    }
+    for (const auto& skin : scene.skins) {
+        writeString(file, skin.name);
+        writeInt32(file, skin.skeletonRoot);
+        if (!writeUint32Vector(file, skin.joints) || !writeMat4Vector(file, skin.inverseBindMatrices)) {
+            std::fclose(file);
+            return false;
         }
     }
 
@@ -662,6 +764,7 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readUint32(file, vertexCount)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, indexCount)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, primitiveCount)) { std::fclose(file); return std::nullopt; }
+        if (!readFloatVector(file, mesh.defaultMorphWeights)) { std::fclose(file); return std::nullopt; }
         mesh.vertices.resize(vertexCount);
         if (vertexCount > 0) {
             if (!readBytes(file, mesh.vertices.data(), sizeof(MeshVertex) * vertexCount)) { std::fclose(file); return std::nullopt; }
@@ -678,6 +781,15 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
             if (!readUint32(file, prim.firstIndex)) { std::fclose(file); return std::nullopt; }
             if (!readUint32(file, prim.indexCount)) { std::fclose(file); return std::nullopt; }
             if (!readInt32(file, prim.materialIndex)) { std::fclose(file); return std::nullopt; }
+            uint32_t morphTargetCount = 0;
+            if (!readUint32(file, morphTargetCount)) { std::fclose(file); return std::nullopt; }
+            prim.morphTargets.resize(morphTargetCount);
+            for (auto& target : prim.morphTargets) {
+                if (!readString(file, target.name)) { std::fclose(file); return std::nullopt; }
+                if (!readVec3Vector(file, target.positionDeltas)) { std::fclose(file); return std::nullopt; }
+                if (!readVec3Vector(file, target.normalDeltas)) { std::fclose(file); return std::nullopt; }
+                if (!readVec3Vector(file, target.tangentDeltas)) { std::fclose(file); return std::nullopt; }
+            }
             uint32_t variantCount = 0;
             if (!readUint32(file, variantCount)) { std::fclose(file); return std::nullopt; }
             prim.materialVariants.resize(variantCount);
@@ -700,6 +812,8 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readString(file, node.name)) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &node.transform, sizeof(node.transform))) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, node.meshIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readFloatVector(file, node.morphWeights)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, node.skinIndex)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, node.hasCamera)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, node.cameraProjection)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, node.cameraYfov)) { std::fclose(file); return std::nullopt; }
@@ -715,6 +829,19 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (childCount > 0) {
             if (!readBytes(file, node.children.data(), sizeof(uint32_t) * childCount)) { std::fclose(file); return std::nullopt; }
         }
+    }
+
+    uint32_t skinCount = 0;
+    if (!readUint32(file, skinCount)) {
+        std::fclose(file);
+        return std::nullopt;
+    }
+    scene.skins.resize(skinCount);
+    for (auto& skin : scene.skins) {
+        if (!readString(file, skin.name)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, skin.skeletonRoot)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32Vector(file, skin.joints)) { std::fclose(file); return std::nullopt; }
+        if (!readMat4Vector(file, skin.inverseBindMatrices)) { std::fclose(file); return std::nullopt; }
     }
 
     uint32_t sceneLightCount = 0;

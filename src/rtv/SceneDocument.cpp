@@ -113,6 +113,43 @@ nlohmann::json vec3Json(glm::vec3 value) {
     return nlohmann::json::array({value.x, value.y, value.z});
 }
 
+nlohmann::json matrixJson(const glm::mat4& matrix) {
+    nlohmann::json values = nlohmann::json::array();
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            values.push_back(matrix[col][row]);
+        }
+    }
+    return values;
+}
+
+glm::mat4 matrixFromJson(const nlohmann::json& json, const glm::mat4& fallback = glm::mat4{1.0f}) {
+    if (!json.is_array() || json.size() < 16) {
+        return fallback;
+    }
+    glm::mat4 result{1.0f};
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            result[col][row] = json[static_cast<size_t>(col * 4 + row)].get<float>();
+        }
+    }
+    return result;
+}
+
+std::vector<float> floatVectorFromJson(const nlohmann::json& value) {
+    std::vector<float> result;
+    if (!value.is_array()) {
+        return result;
+    }
+    result.reserve(value.size());
+    for (const nlohmann::json& item : value) {
+        if (item.is_number()) {
+            result.push_back(item.get<float>());
+        }
+    }
+    return result;
+}
+
 nlohmann::json transformJson(const Transform& transform) {
     return {
         {"position", vec3Json(transform.position)},
@@ -289,23 +326,29 @@ size_t SceneDocument::replaceAssetGuidReferences(const AssetGuid& oldGuid, const
 
     size_t replacements = 0;
     for (Entity* entity : registry_.entities()) {
-        if (entity == nullptr || !entity->meshRenderer.has_value()) {
+        if (entity == nullptr) {
             continue;
         }
-        MeshRenderer& renderer = *entity->meshRenderer;
-        if (renderer.meshGuid == oldGuid) {
-            renderer.meshGuid = newGuid;
-            ++replacements;
+        if (entity->meshRenderer.has_value()) {
+            MeshRenderer& renderer = *entity->meshRenderer;
+            if (renderer.meshGuid == oldGuid) {
+                renderer.meshGuid = newGuid;
+                ++replacements;
+            }
+            for (MaterialSlot& slot : renderer.materialSlots) {
+                if (slot.materialGuid == oldGuid) {
+                    slot.materialGuid = newGuid;
+                    ++replacements;
+                }
+                if (slot.overrideMaterialGuid.has_value() && *slot.overrideMaterialGuid == oldGuid) {
+                    slot.overrideMaterialGuid = newGuid;
+                    ++replacements;
+                }
+            }
         }
-        for (MaterialSlot& slot : renderer.materialSlots) {
-            if (slot.materialGuid == oldGuid) {
-                slot.materialGuid = newGuid;
-                ++replacements;
-            }
-            if (slot.overrideMaterialGuid.has_value() && *slot.overrideMaterialGuid == oldGuid) {
-                slot.overrideMaterialGuid = newGuid;
-                ++replacements;
-            }
+        if (entity->animationPlayer.has_value() && entity->animationPlayer->animationGuid == oldGuid) {
+            entity->animationPlayer->animationGuid = newGuid;
+            ++replacements;
         }
     }
     for (PrefabInstance& instance : prefabInstances_) {
@@ -335,6 +378,7 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
     sceneTextures_ = scene.textures;
     sceneMaterials_ = scene.materials;
     sceneMeshes_ = scene.meshes;
+    sceneSkins_ = scene.skins;
 
     std::vector<EntityId> nodeEntities(scene.nodes.size());
     for (uint32_t i = 0; i < scene.nodes.size(); ++i) {
@@ -350,10 +394,13 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
         entity->transform.scale = scaleFromMatrix(node.transform);
         entity->transform.dirty = true;
         entity->defaultTransform = entity->transform;
+        entity->sourceNodeIndex = static_cast<int32_t>(i);
 
         if (node.mesh.valid()) {
             MeshRenderer renderer;
             renderer.mesh = node.mesh;
+            renderer.morphWeights = node.morphWeights;
+            renderer.skinIndex = node.skinIndex;
             renderer.materialSlots.clear();
             entity->meshRenderer = renderer;
         }
@@ -471,6 +518,15 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
     markDirty(SceneUpdateKind::TopologyChanged);
 }
 
+int32_t SceneDocument::appendSceneSkins(const std::vector<SceneSkinAsset>& skins) {
+    if (skins.empty()) {
+        return static_cast<int32_t>(sceneSkins_.size());
+    }
+    const int32_t offset = static_cast<int32_t>(sceneSkins_.size());
+    sceneSkins_.insert(sceneSkins_.end(), skins.begin(), skins.end());
+    return offset;
+}
+
 SceneAsset SceneDocument::toSceneAsset() const {
     SceneAsset scene;
     scene.name = sourceGltfPath_.has_value() ? sourceGltfPath_->filename().string() : "SceneDocument";
@@ -480,6 +536,7 @@ SceneAsset SceneDocument::toSceneAsset() const {
     scene.textures = sceneTextures_;
     scene.materials = sceneMaterials_;
     scene.meshes = sceneMeshes_;
+    scene.skins = sceneSkins_;
 
     std::vector<const Entity*> entities = registry_.entities();
     std::unordered_map<uint64_t, uint32_t> nodeIndexForEntity;
@@ -491,6 +548,8 @@ SceneAsset SceneDocument::toSceneAsset() const {
         node.transform = entity->transform.localMatrix();
         if (entity->meshRenderer.has_value()) {
             node.mesh = entity->meshRenderer->mesh;
+            node.morphWeights = entity->meshRenderer->morphWeights;
+            node.skinIndex = entity->meshRenderer->skinIndex;
             node.visible = entity->meshRenderer->visible;
             node.castShadow = entity->meshRenderer->castShadow;
             node.visibleToCamera = entity->meshRenderer->visibleToCamera;
@@ -582,6 +641,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"meshes", nlohmann::json::array()},
         {"materials", nlohmann::json::array()},
         {"textures", nlohmann::json::array()},
+        {"animations", nlohmann::json::array()},
         {"prefabs", nlohmann::json::array()},
     };
     root["sourceGltf"] = sourceGltfPath_.has_value() ? sourceGltfPath_->string() : "";
@@ -694,6 +754,26 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"mneeCausticsEnabled", renderSettings_.mneeCausticsEnabled},
     };
 
+    root["skins"] = nlohmann::json::array();
+    for (size_t skinIndex = 0; skinIndex < sceneSkins_.size(); ++skinIndex) {
+        const SceneSkinAsset& skin = sceneSkins_[skinIndex];
+        nlohmann::json joints = nlohmann::json::array();
+        for (uint32_t joint : skin.joints) {
+            joints.push_back(joint);
+        }
+        nlohmann::json inverseBindMatrices = nlohmann::json::array();
+        for (const glm::mat4& matrix : skin.inverseBindMatrices) {
+            inverseBindMatrices.push_back(matrixJson(matrix));
+        }
+        root["skins"].push_back({
+            {"index", skinIndex},
+            {"name", skin.name},
+            {"skeletonRoot", skin.skeletonRoot},
+            {"joints", joints},
+            {"inverseBindMatrices", inverseBindMatrices},
+        });
+    }
+
     root["entities"] = nlohmann::json::array();
     const std::vector<const Entity*> entities = registry_.entities();
     for (const Entity* entityPtr : entities) {
@@ -714,6 +794,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         item["collections"] = entity.collections;
         item["visible"] = entity.visible;
         item["locked"] = entity.locked;
+        item["sourceNodeIndex"] = entity.sourceNodeIndex;
         item["transform"] = transformJson(entity.transform);
         item["defaultTransform"] = transformJson(entity.defaultTransform);
         if (entity.meshRenderer.has_value()) {
@@ -723,6 +804,10 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
             renderer["visible"] = entity.meshRenderer->visible;
             renderer["castShadow"] = entity.meshRenderer->castShadow;
             renderer["visibleToCamera"] = entity.meshRenderer->visibleToCamera;
+            if (!entity.meshRenderer->morphWeights.empty()) {
+                renderer["morphWeights"] = entity.meshRenderer->morphWeights;
+            }
+            renderer["skinIndex"] = entity.meshRenderer->skinIndex;
             renderer["activeMaterialVariantIndex"] = entity.meshRenderer->activeMaterialVariantIndex;
             renderer["activeMaterialVariantName"] = entity.meshRenderer->activeMaterialVariantName;
             if (!entity.meshRenderer->meshGuid.empty()) {
@@ -749,6 +834,23 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
                 renderer["materialSlots"].push_back(std::move(slotJson));
             }
             item["meshRenderer"] = std::move(renderer);
+        }
+        if (entity.animationPlayer.has_value()) {
+            item["animationPlayer"] = {
+                {"animationGuid", entity.animationPlayer->animationGuid},
+                {"animationPath", entity.animationPlayer->animationPath.generic_string()},
+                {"enabled", entity.animationPlayer->enabled},
+                {"playOnStart", entity.animationPlayer->playOnStart},
+                {"playing", entity.animationPlayer->playing},
+                {"loop", entity.animationPlayer->loop},
+                {"applyRootMotion", entity.animationPlayer->applyRootMotion},
+                {"applyMorphWeights", entity.animationPlayer->applyMorphWeights},
+                {"playbackSpeed", entity.animationPlayer->playbackSpeed},
+                {"currentTimeSeconds", entity.animationPlayer->currentTimeSeconds},
+            };
+            if (!entity.animationPlayer->animationGuid.empty()) {
+                root["assetReferences"]["animations"].push_back({{"assetGuid", entity.animationPlayer->animationGuid}});
+            }
         }
         if (entity.light.has_value()) {
             item["light"] = {
@@ -1073,8 +1175,36 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     prefabInstances_.clear();
     sceneMeshes_.clear();
     sceneMaterials_.clear();
+    sceneSkins_.clear();
     activeCamera_ = {};
     primarySun_ = {};
+
+    if (root.contains("skins") && root["skins"].is_array()) {
+        for (const nlohmann::json& item : root["skins"]) {
+            if (!item.is_object()) {
+                continue;
+            }
+            SceneSkinAsset skin;
+            skin.name = item.value("name", std::string{});
+            skin.skeletonRoot = item.value("skeletonRoot", -1);
+            if (item.contains("joints") && item["joints"].is_array()) {
+                for (const nlohmann::json& joint : item["joints"]) {
+                    if (joint.is_number_unsigned() || joint.is_number_integer()) {
+                        const int value = joint.get<int>();
+                        if (value >= 0) {
+                            skin.joints.push_back(static_cast<uint32_t>(value));
+                        }
+                    }
+                }
+            }
+            if (item.contains("inverseBindMatrices") && item["inverseBindMatrices"].is_array()) {
+                for (const nlohmann::json& matrix : item["inverseBindMatrices"]) {
+                    skin.inverseBindMatrices.push_back(matrixFromJson(matrix));
+                }
+            }
+            sceneSkins_.push_back(std::move(skin));
+        }
+    }
 
     std::unordered_map<uint64_t, EntityId> idMap;
     uint64_t maxUuid = 0;
@@ -1101,6 +1231,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         }
         entity->visible = item.value("visible", true);
         entity->locked = item.value("locked", false);
+        entity->sourceNodeIndex = item.value("sourceNodeIndex", -1);
 
         entity->transform = transformFromJson(item.value("transform", nlohmann::json::object()), entity->transform);
         entity->defaultTransform = transformFromJson(item.value("defaultTransform", nlohmann::json::object()), entity->transform);
@@ -1113,6 +1244,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             renderer.visible = source.value("visible", true);
             renderer.castShadow = source.value("castShadow", true);
             renderer.visibleToCamera = source.value("visibleToCamera", true);
+            renderer.morphWeights = floatVectorFromJson(source.value("morphWeights", nlohmann::json::array()));
+            renderer.skinIndex = source.value("skinIndex", -1);
             renderer.activeMaterialVariantIndex = source.value("activeMaterialVariantIndex", UINT32_MAX);
             renderer.activeMaterialVariantName = source.value("activeMaterialVariantName", std::string{});
             for (const nlohmann::json& slotSource : source.value("materialSlots", nlohmann::json::array())) {
@@ -1135,6 +1268,21 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
                 sceneMeshes_.push_back(renderer.mesh);
             }
             entity->meshRenderer = std::move(renderer);
+        }
+        if (item.contains("animationPlayer")) {
+            const nlohmann::json& source = item["animationPlayer"];
+            AnimationPlayer player;
+            player.animationGuid = source.value("animationGuid", std::string{});
+            player.animationPath = source.value("animationPath", std::string{});
+            player.enabled = source.value("enabled", player.enabled);
+            player.playOnStart = source.value("playOnStart", player.playOnStart);
+            player.playing = source.value("playing", player.playOnStart);
+            player.loop = source.value("loop", player.loop);
+            player.applyRootMotion = source.value("applyRootMotion", player.applyRootMotion);
+            player.applyMorphWeights = source.value("applyMorphWeights", player.applyMorphWeights);
+            player.playbackSpeed = source.value("playbackSpeed", player.playbackSpeed);
+            player.currentTimeSeconds = source.value("currentTimeSeconds", player.currentTimeSeconds);
+            entity->animationPlayer = std::move(player);
         }
         if (item.contains("light")) {
             const nlohmann::json& source = item["light"];

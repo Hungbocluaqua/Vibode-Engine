@@ -104,10 +104,13 @@ private:
     std::array<char, 256> importDestinationFolder_{};
     std::array<char, 128> search_{};
     std::array<char, 128> replaceReferenceGuid_{};
+    std::array<char, 256> assetRenameBuffer_{};
     std::array<char, 256> assetTagsBuffer_{};
     std::array<char, 128> registryTagFilter_{};
     std::array<char, 128> bulkTagBuffer_{};
     std::array<char, 128> collectionNameBuffer_{};
+    std::array<char, 128> virtualFolderBuffer_{};
+    AssetGuid assetRenameBufferGuid_;
     AssetGuid assetTagsBufferGuid_;
     int registryTypeFilter_ = 0;
     int registryStatusFilter_ = 0;

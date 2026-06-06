@@ -16,6 +16,8 @@ enum class AssetType {
     HDRI,
     Scene,
     Prefab,
+    Animation,
+    Skeleton,
 };
 
 enum class AssetImportStatus {
@@ -47,8 +49,14 @@ struct AssetImportSettings {
     bool importLights = true;
     bool generateTangents = true;
     bool buildBlasCache = true;
+    bool generatePrefabAsset = true;
+    bool buildCookedPayloadsNow = true;
+    bool generateThumbnails = true;
     float unitScale = 1.0f;
     std::string coordinateConversion = "None";
+    std::string materialImportMode = "ImportMaterials";
+    std::string textureImportMode = "ImportTextures";
+    std::string textureCompression = "PreserveSource";
 };
 
 struct AssetDependency {

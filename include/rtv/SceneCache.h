@@ -124,6 +124,7 @@ struct CachedPrimitiveData {
     uint32_t firstIndex = 0;
     uint32_t indexCount = 0;
     int32_t materialIndex = -1;
+    std::vector<MeshPrimitiveAsset::MorphTarget> morphTargets;
     std::vector<MaterialVariant> materialVariants;
 };
 
@@ -132,12 +133,15 @@ struct CachedMeshData {
     std::vector<MeshVertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<CachedPrimitiveData> primitives;
+    std::vector<float> defaultMorphWeights;
 };
 
 struct CachedNodeData {
     std::string name;
     glm::mat4 transform{1.0f};
     int32_t meshIndex = -1;
+    std::vector<float> morphWeights;
+    int32_t skinIndex = -1;
     uint32_t hasCamera = 0;
     uint32_t cameraProjection = 0;
     float cameraYfov = 60.0f * 0.017453292519943295f;
@@ -148,6 +152,13 @@ struct CachedNodeData {
     float cameraFar = 1000.0f;
     int32_t parentIndex = -1;
     std::vector<uint32_t> children;
+};
+
+struct CachedSkinData {
+    std::string name;
+    int32_t skeletonRoot = -1;
+    std::vector<uint32_t> joints;
+    std::vector<glm::mat4> inverseBindMatrices;
 };
 
 struct CachedSceneLightData {
@@ -234,6 +245,7 @@ struct CachedScene {
     std::vector<CachedMeshData> meshes;
     std::vector<std::string> materialVariants;
     std::vector<CachedNodeData> nodes;
+    std::vector<CachedSkinData> skins;
     std::vector<CachedSceneLightData> sceneLights;
     std::vector<uint32_t> rootNodes;
     uint64_t sourceMtime = 0;

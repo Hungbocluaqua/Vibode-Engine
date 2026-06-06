@@ -28,8 +28,14 @@ nlohmann::json importSettingsJson(const AssetImportSettings& settings) {
         {"importLights", settings.importLights},
         {"generateTangents", settings.generateTangents},
         {"buildBlasCache", settings.buildBlasCache},
+        {"generatePrefabAsset", settings.generatePrefabAsset},
+        {"buildCookedPayloadsNow", settings.buildCookedPayloadsNow},
+        {"generateThumbnails", settings.generateThumbnails},
         {"unitScale", settings.unitScale},
         {"coordinateConversion", settings.coordinateConversion},
+        {"materialImportMode", settings.materialImportMode},
+        {"textureImportMode", settings.textureImportMode},
+        {"textureCompression", settings.textureCompression},
     };
 }
 
@@ -46,8 +52,14 @@ AssetImportSettings importSettingsFromJson(const nlohmann::json& json) {
     settings.importLights = json.value("importLights", settings.importLights);
     settings.generateTangents = json.value("generateTangents", settings.generateTangents);
     settings.buildBlasCache = json.value("buildBlasCache", settings.buildBlasCache);
+    settings.generatePrefabAsset = json.value("generatePrefabAsset", settings.generatePrefabAsset);
+    settings.buildCookedPayloadsNow = json.value("buildCookedPayloadsNow", settings.buildCookedPayloadsNow);
+    settings.generateThumbnails = json.value("generateThumbnails", settings.generateThumbnails);
     settings.unitScale = json.value("unitScale", settings.unitScale);
     settings.coordinateConversion = json.value("coordinateConversion", settings.coordinateConversion);
+    settings.materialImportMode = json.value("materialImportMode", settings.materialImportMode);
+    settings.textureImportMode = json.value("textureImportMode", settings.textureImportMode);
+    settings.textureCompression = json.value("textureCompression", settings.textureCompression);
     return settings;
 }
 
@@ -117,6 +129,8 @@ const char* assetTypeName(AssetType type) {
     case AssetType::HDRI: return "HDRI";
     case AssetType::Scene: return "Scene";
     case AssetType::Prefab: return "Prefab";
+    case AssetType::Animation: return "Animation";
+    case AssetType::Skeleton: return "Skeleton";
     case AssetType::Unknown: default: return "Unknown";
     }
 }
@@ -128,6 +142,8 @@ AssetType assetTypeFromName(const std::string& name) {
     if (name == "HDRI") return AssetType::HDRI;
     if (name == "Scene") return AssetType::Scene;
     if (name == "Prefab") return AssetType::Prefab;
+    if (name == "Animation") return AssetType::Animation;
+    if (name == "Skeleton") return AssetType::Skeleton;
     return AssetType::Unknown;
 }
 

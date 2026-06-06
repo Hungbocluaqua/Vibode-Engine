@@ -56,6 +56,7 @@ add_executable(rtvulkan
     "${IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp"
     src/third_party/imgui/imgui_impl_vulkan.cpp
     src/main.cpp
+    src/rtv/AnimationClip.cpp
     src/rtv/Application.cpp
     src/rtv/AccelerationStructure.cpp
     src/rtv/AsyncSceneLoader.cpp

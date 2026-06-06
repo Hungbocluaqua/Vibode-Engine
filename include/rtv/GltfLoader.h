@@ -21,12 +21,12 @@ public:
     [[nodiscard]] SceneAsset loadWithCache(const std::filesystem::path& path);
 
 private:
-    [[nodiscard]] CachedScene buildCachedScene(const std::filesystem::path& path, const SceneAsset& scene, const std::vector<std::filesystem::path>& bufferDependencies);
+    [[nodiscard]] CachedScene buildCachedScene(const std::filesystem::path& path, const SceneAsset& scene, const std::vector<std::filesystem::path>& externalDependencies);
 
     AssetManager& assets_;
     bool useCache_ = true;
     bool cacheWritesEnabled_ = true;
-    std::vector<std::filesystem::path> lastBufferDependencies_;
+    std::vector<std::filesystem::path> lastExternalDependencies_;
 };
 
 } // namespace rtv

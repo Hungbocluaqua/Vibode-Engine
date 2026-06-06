@@ -832,6 +832,11 @@ void drawProjectSaveState(const ProjectManagerRuntimeState& state, std::unordere
     drawProjectSaveStateRow("Current Level", state.sceneDirty);
     drawProjectSaveStateRow("Project Settings", state.projectSettingsDirty);
     drawProjectSaveStateRow("Asset Registry", registryDirty);
+    drawProjectSaveStateRow("Linked Materials", state.dirtyMaterialAssetCount > 0u);
+    if (state.dirtyMaterialAssetCount > 0u) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%llu dirty", static_cast<unsigned long long>(state.dirtyMaterialAssetCount));
+    }
     if (registryAvailable) {
         ImGui::TextWrapped("Registry: %s", state.assetRegistry->state().path.string().c_str());
     } else {
@@ -1158,6 +1163,17 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
             .sceneLoadProgress = state.sceneLoadProgress,
             .sceneDirty = state.sceneDirty,
             .projectSettingsDirty = state.projectSettingsDirty,
+            .dirtyMaterialAssetCount = state.dirtyMaterialAssets != nullptr ? state.dirtyMaterialAssets->size() : 0u,
+            .cookProjectRunning = state.jobCenter != nullptr && state.jobCenter->cookProjectRunning,
+            .cookProjectOutputDir = state.jobCenter != nullptr ? state.jobCenter->cookProjectOutputDir : std::filesystem::path{},
+            .completedCookProjectSerial = state.jobCenter != nullptr ? state.jobCenter->completedCookProjectSerial : 0,
+            .completedCookProjectSuccess = state.jobCenter != nullptr && state.jobCenter->completedCookProjectSuccess,
+            .completedCookProjectStatus = state.jobCenter != nullptr ? state.jobCenter->completedCookProjectStatus : std::string{},
+            .completedCookProjectOutputDir = state.jobCenter != nullptr ? state.jobCenter->completedCookProjectOutputDir : std::filesystem::path{},
+            .completedCookProjectManifestPath = state.jobCenter != nullptr ? state.jobCenter->completedCookProjectManifestPath : std::filesystem::path{},
+            .completedCookProjectValidationReportPath = state.jobCenter != nullptr ? state.jobCenter->completedCookProjectValidationReportPath : std::filesystem::path{},
+            .completedCookProjectLogPath = state.jobCenter != nullptr ? state.jobCenter->completedCookProjectLogPath : std::filesystem::path{},
+            .completedCookProjectExitCode = state.jobCenter != nullptr ? state.jobCenter->completedCookProjectExitCode : 0,
         }, requests);
     }
     if (recoveryPromptVisible_) {
@@ -2141,6 +2157,119 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         if (ImGui::Button("Save Project Settings")) {
             requests.saveProjectSettings = true;
         }
+
+        ImGui::SeparatorText("Build / Cook");
+        const std::filesystem::path cookOutputDir = state.project->buildRoot / "Cooked";
+        ImGui::TextWrapped("Transparent cook output: %s", cookOutputDir.string().c_str());
+        const bool registryDirty = state.assetRegistry != nullptr && state.assetRegistry->dirty();
+        std::vector<std::string> cookPreflightItems;
+        if (state.sceneDirty) {
+            cookPreflightItems.push_back("Level");
+        }
+        if (state.projectSettingsDirty) {
+            cookPreflightItems.push_back("Project Settings");
+        }
+        if (registryDirty) {
+            cookPreflightItems.push_back("Asset Registry");
+        }
+        if (state.dirtyMaterialAssetCount > 0u) {
+            cookPreflightItems.push_back("Linked Materials (" + std::to_string(state.dirtyMaterialAssetCount) + ")");
+        }
+        std::string cookDisabledReason;
+        if (state.cookProjectRunning) {
+            cookDisabledReason = "active cook running";
+        } else if (state.project->projectFile.empty()) {
+            cookDisabledReason = "project file unavailable";
+        }
+        if (cookPreflightItems.empty()) {
+            ImGui::TextColored(ImVec4(0.55f, 0.75f, 0.58f, 1.0f), "Cook preflight: saved");
+        } else {
+            std::string pendingSave;
+            for (size_t i = 0; i < cookPreflightItems.size(); ++i) {
+                if (i > 0) {
+                    pendingSave += ", ";
+                }
+                pendingSave += cookPreflightItems[i];
+            }
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.25f, 1.0f), "Cook preflight: pending save - %s", pendingSave.c_str());
+        }
+        if (!cookDisabledReason.empty()) {
+            ImGui::TextDisabled("Cook disabled: %s", cookDisabledReason.c_str());
+        }
+        const bool canCookProject = cookDisabledReason.empty();
+        if (!canCookProject) {
+            ImGui::BeginDisabled();
+        }
+        if (editorIconTextButton("CookProjectTransparent", EditorGlyphIcon::Refresh, "Cook Project")) {
+            requests.cookProject = EditorCookProjectRequest{state.project->projectFile, cookOutputDir};
+            visibility_.jobCenter = true;
+        }
+        if (!canCookProject) {
+            ImGui::EndDisabled();
+        }
+        if (state.cookProjectRunning) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("Cook running");
+        }
+        ImGui::SameLine();
+        const bool canOpenCookOutput = std::filesystem::exists(cookOutputDir);
+        if (!canOpenCookOutput) {
+            ImGui::BeginDisabled();
+        }
+        if (editorIconTextButton("OpenCookOutput", EditorGlyphIcon::Folder, "Open Cook Output")) {
+            requests.openDirectoryPath = cookOutputDir;
+        }
+        if (!canOpenCookOutput) {
+            ImGui::EndDisabled();
+        }
+        if (state.completedCookProjectSerial != 0) {
+            const std::string lastStatus = state.completedCookProjectStatus.empty()
+                ? (state.completedCookProjectSuccess ? std::string("Cook completed") : std::string("Cook failed"))
+                : state.completedCookProjectStatus;
+            ImGui::TextColored(
+                state.completedCookProjectSuccess ? ImVec4(0.55f, 0.75f, 0.58f, 1.0f) : ImVec4(0.95f, 0.36f, 0.32f, 1.0f),
+                "Last cook: %s",
+                lastStatus.c_str());
+            if (!state.completedCookProjectSuccess && state.completedCookProjectExitCode != 0) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("Exit: %d", state.completedCookProjectExitCode);
+            }
+            bool drewLastCookAction = false;
+            auto drawLastCookFileButton = [&](const char* label, const std::filesystem::path& path) {
+                if (drewLastCookAction) {
+                    ImGui::SameLine();
+                }
+                const bool canOpen = !path.empty() && std::filesystem::exists(path);
+                if (!canOpen) {
+                    ImGui::BeginDisabled();
+                }
+                if (ImGui::SmallButton(label)) {
+                    requests.openFilePath = path;
+                }
+                if (!canOpen) {
+                    ImGui::EndDisabled();
+                }
+                drewLastCookAction = true;
+            };
+            const std::filesystem::path lastOutputDir = state.completedCookProjectOutputDir.empty()
+                ? cookOutputDir
+                : state.completedCookProjectOutputDir;
+            const bool canOpenLastOutput = !lastOutputDir.empty() && std::filesystem::exists(lastOutputDir);
+            if (!canOpenLastOutput) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::SmallButton("Open Last Output")) {
+                requests.openDirectoryPath = lastOutputDir;
+            }
+            if (!canOpenLastOutput) {
+                ImGui::EndDisabled();
+            }
+            drewLastCookAction = true;
+            drawLastCookFileButton("Open Manifest", state.completedCookProjectManifestPath);
+            drawLastCookFileButton("Open Report", state.completedCookProjectValidationReportPath);
+            drawLastCookFileButton("Open Log", state.completedCookProjectLogPath);
+        }
+        ImGui::TextDisabled("Cook writes cook_manifest.json, asset_validation_report.json, and cook_log.txt without creating opaque packages yet.");
     }
 
     ImGui::SeparatorText("Workspace");
@@ -3277,6 +3406,99 @@ void EditorLayer::updateJobCenterHistory(const EditorRuntimeState& state) {
         }
     }
 
+    const bool cookProjectRunning = jobs != nullptr && jobs->cookProjectRunning;
+    auto finishActiveCookProjectHistory = [&]() {
+        const std::string finalStatus = statusLooksFailed(lastCookProjectHistoryStatus_)
+            ? lastCookProjectHistoryStatus_
+            : std::string("Cook completed");
+        if (EditorJobHistoryEntry* entry = findEntry(activeCookProjectHistoryKey_)) {
+            entry->status = finalStatus;
+            entry->progress = statusLooksFailed(finalStatus) ? lastCookProjectHistoryProgress_ : 1.0f;
+            entry->active = false;
+            entry->failed = statusLooksFailed(finalStatus);
+            entry->cancelled = statusLooksCancelled(finalStatus);
+            entry->completed = !entry->failed && !entry->cancelled;
+        }
+        observedCookProjectRunningForHistory_ = false;
+        activeCookProjectHistorySerial_ = 0;
+        activeCookProjectHistoryKey_.clear();
+    };
+    if (cookProjectRunning) {
+        const uint64_t cookSerial = jobs->cookProjectJobSerial != 0 ? jobs->cookProjectJobSerial : nextJobHistoryId_;
+        const std::string cookKey = "cook-project-" + std::to_string(cookSerial);
+        if (observedCookProjectRunningForHistory_ && activeCookProjectHistorySerial_ != 0 && activeCookProjectHistorySerial_ != cookSerial) {
+            finishActiveCookProjectHistory();
+        }
+        if (!observedCookProjectRunningForHistory_ || activeCookProjectHistoryKey_.empty()) {
+            activeCookProjectHistoryKey_ = cookKey;
+            activeCookProjectHistorySerial_ = cookSerial;
+            (void)createEntry(activeCookProjectHistoryKey_, "Project Cook", "Cook Project");
+        }
+        if (EditorJobHistoryEntry* entry = findEntry(activeCookProjectHistoryKey_)) {
+            entry->serial = cookSerial;
+            entry->title = "Cook Project";
+            entry->kind = "Project Cook";
+            entry->status = jobs->cookProjectStatus.empty() ? "Cooking transparent project assets" : jobs->cookProjectStatus;
+            entry->sourcePath = jobs->cookProjectFile;
+            entry->outputRoot = jobs->cookProjectOutputDir;
+            entry->manifestPath = jobs->cookProjectManifestPath;
+            entry->reportPath = jobs->cookProjectValidationReportPath;
+            entry->logPath = jobs->cookProjectLogPath;
+            entry->progress = std::clamp(jobs->cookProjectProgress, 0.0f, 1.0f);
+            entry->active = true;
+            entry->completed = false;
+            entry->failed = false;
+            entry->cancelled = false;
+            entry->hidden = false;
+        }
+        observedCookProjectRunningForHistory_ = true;
+        lastCookProjectHistoryStatus_ = jobs->cookProjectStatus;
+        lastCookProjectHistoryProgress_ = std::clamp(jobs->cookProjectProgress, 0.0f, 1.0f);
+    } else if (observedCookProjectRunningForHistory_) {
+        finishActiveCookProjectHistory();
+    }
+
+    if (jobs != nullptr && jobs->completedCookProjectSerial != 0 && jobs->completedCookProjectSerial != observedCookProjectResultSerial_) {
+        const std::string cookKey = "cook-project-" + std::to_string(jobs->completedCookProjectSerial);
+        EditorJobHistoryEntry* entry = findEntry(cookKey);
+        if (entry == nullptr) {
+            entry = &createEntry(cookKey, "Project Cook", "Cook Project");
+        }
+        entry->serial = jobs->completedCookProjectSerial;
+        entry->title = "Cook Project";
+        entry->kind = "Project Cook";
+        entry->status = jobs->completedCookProjectStatus.empty()
+            ? (jobs->completedCookProjectSuccess ? std::string("Cook completed") : std::string("Cook failed"))
+            : jobs->completedCookProjectStatus;
+        entry->sourcePath = jobs->completedCookProjectFile;
+        entry->outputRoot = jobs->completedCookProjectOutputDir;
+        entry->manifestPath = jobs->completedCookProjectManifestPath;
+        entry->reportPath = jobs->completedCookProjectValidationReportPath;
+        entry->logPath = jobs->completedCookProjectLogPath;
+        entry->progress = jobs->completedCookProjectSuccess ? 1.0f : entry->progress;
+        entry->active = false;
+        entry->completed = jobs->completedCookProjectSuccess;
+        entry->failed = !jobs->completedCookProjectSuccess;
+        entry->cancelled = false;
+        entry->hidden = false;
+        entry->workerTotalMs = jobs->completedCookProjectWorkerTotalMs;
+        entry->errors.clear();
+        entry->warnings.clear();
+        if (!jobs->completedCookProjectSuccess) {
+            if (jobs->completedCookProjectExitCode < 0 && !entry->status.empty()) {
+                entry->errors.push_back(entry->status);
+            } else {
+                entry->errors.push_back("Cook exit code " + std::to_string(jobs->completedCookProjectExitCode));
+            }
+        }
+        observedCookProjectResultSerial_ = jobs->completedCookProjectSerial;
+        if (activeCookProjectHistorySerial_ == jobs->completedCookProjectSerial) {
+            observedCookProjectRunningForHistory_ = false;
+            activeCookProjectHistorySerial_ = 0;
+            activeCookProjectHistoryKey_.clear();
+        }
+    }
+
     if (state.renderJob != nullptr && state.renderJob->serial != 0) {
         const EditorRenderJobStatus& job = *state.renderJob;
         const std::string key = "render-output-" + std::to_string(job.serial);
@@ -3370,6 +3592,9 @@ void EditorLayer::drawJobHistoryEntry(size_t index, EditorRequests& requests) {
     if (!entry.manifestPath.empty()) {
         ImGui::TextWrapped("Manifest: %s", entry.manifestPath.string().c_str());
     }
+    if (!entry.logPath.empty()) {
+        ImGui::TextWrapped("Log: %s", entry.logPath.string().c_str());
+    }
     if (entry.kind == "Asset Import" &&
         (entry.workerTotalMs > 0.0 || entry.importValidateMs > 0.0 || entry.importDirectoryMs > 0.0 || entry.importInspectMs > 0.0 || entry.importWriteMs > 0.0)) {
         ImGui::TextDisabled(
@@ -3454,6 +3679,32 @@ void EditorLayer::drawJobHistoryEntry(size_t index, EditorRequests& requests) {
                 visibility_.log = true;
             }
         }
+    } else if (entry.kind == "Project Cook") {
+        if (!entry.outputRoot.empty() && ImGui::SmallButton("Open Output")) {
+            requests.openDirectoryPath = entry.outputRoot;
+            drewAction = true;
+        }
+        if (!entry.manifestPath.empty()) {
+            if (drewAction) ImGui::SameLine();
+            if (ImGui::SmallButton("Open Manifest")) {
+                requests.openFilePath = entry.manifestPath;
+            }
+            drewAction = true;
+        }
+        if (!entry.reportPath.empty()) {
+            if (drewAction) ImGui::SameLine();
+            if (ImGui::SmallButton("Open Report")) {
+                requests.openFilePath = entry.reportPath;
+            }
+            drewAction = true;
+        }
+        if (!entry.logPath.empty()) {
+            if (drewAction) ImGui::SameLine();
+            if (ImGui::SmallButton("Open Log")) {
+                requests.openFilePath = entry.logPath;
+            }
+            drewAction = true;
+        }
     }
     if (!entry.active) {
         if (drewAction) {
@@ -3508,6 +3759,20 @@ void EditorLayer::drawJobCenterPanel(const EditorRuntimeState& state, EditorRequ
         }
         if (ImGui::SmallButton("Open Content")) {
             visibility_.assetBrowser = true;
+        }
+    }
+
+    if (jobs != nullptr && jobs->cookProjectRunning) {
+        hasJob = true;
+        ImGui::SeparatorText("Project Cook");
+        ImGui::TextUnformatted("Cook Project");
+        ImGui::TextDisabled("%s", jobs->cookProjectStatus.empty() ? "Cooking transparent project assets" : jobs->cookProjectStatus.c_str());
+        ImGui::ProgressBar(std::clamp(jobs->cookProjectProgress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
+        if (!jobs->cookProjectOutputDir.empty()) {
+            ImGui::TextWrapped("Output: %s", jobs->cookProjectOutputDir.string().c_str());
+        }
+        if (ImGui::SmallButton("Open Output")) {
+            requests.openDirectoryPath = jobs->cookProjectOutputDir;
         }
     }
 

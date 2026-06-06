@@ -22,8 +22,10 @@ struct Entity {
     std::vector<EntityId> children;
     bool visible = true;
     bool locked = false;
+    int32_t sourceNodeIndex = -1;
 
     std::optional<MeshRenderer> meshRenderer;
+    std::optional<AnimationPlayer> animationPlayer;
     std::optional<Light> light;
     std::optional<Sun> sun;
     std::optional<Camera> camera;

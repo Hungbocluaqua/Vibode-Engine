@@ -81,6 +81,9 @@ SceneUpdateMask entityRemovalUpdateMask(const SceneDocument& document, const Ent
     if (entity.postProcessVolume.has_value() || entity.cameraPostProcess.has_value()) {
         mask |= SceneUpdateMaskRendererSettings;
     }
+    if (entity.animationPlayer.has_value()) {
+        mask |= SceneUpdateMaskTransform;
+    }
     for (EntityId childId : entity.children) {
         if (const Entity* child = document.registry().entity(childId)) {
             mask |= entityRemovalUpdateMask(document, *child);
@@ -664,6 +667,7 @@ EntityId SceneOperations::mergeSceneAsset(const SceneAsset& scene, const std::st
     }
 
     std::vector<EntityId> nodeEntities(scene.nodes.size());
+    const int32_t skinOffset = document_.appendSceneSkins(scene.skins);
     for (uint32_t i = 0; i < scene.nodes.size(); ++i) {
         const SceneNodeAsset& node = scene.nodes[i];
         const EntityId id = document_.registry().createEntity(node.name.empty() ? "Merged Node " + std::to_string(i) : node.name);
@@ -678,11 +682,14 @@ EntityId SceneOperations::mergeSceneAsset(const SceneAsset& scene, const std::st
         entity->transform.scale = scaleFromMatrix(node.transform);
         entity->transform.dirty = true;
         entity->defaultTransform = entity->transform;
+        entity->sourceNodeIndex = static_cast<int32_t>(i);
         entity->visible = node.visible;
 
         if (node.mesh.valid()) {
             MeshRenderer renderer;
             renderer.mesh = node.mesh;
+            renderer.morphWeights = node.morphWeights;
+            renderer.skinIndex = node.skinIndex >= 0 ? skinOffset + node.skinIndex : -1;
             renderer.visible = node.visible;
             renderer.castShadow = node.castShadow;
             renderer.visibleToCamera = node.visibleToCamera;
@@ -793,6 +800,7 @@ PrefabInstance SceneOperations::placePrefab(
             entity->transform.scale = scaleFromMatrix(node.transform);
             entity->transform.dirty = true;
             entity->defaultTransform = entity->transform;
+            entity->sourceNodeIndex = node.sourceNodeIndex >= 0 ? node.sourceNodeIndex : static_cast<int32_t>(i);
             if (node.hasCamera) {
                 Camera camera = cameraFromPrefabNode(node);
                 camera.active = !hadActiveCamera && !assignedPrefabCamera;
@@ -801,6 +809,17 @@ PrefabInstance SceneOperations::placePrefab(
                     document_.setActiveCamera(id);
                     assignedPrefabCamera = true;
                 }
+            }
+            if (node.hasLight) {
+                Light light;
+                light.type = static_cast<LightType>(std::min(node.lightType, 3u));
+                light.color = node.lightColor;
+                light.intensity = node.lightIntensity;
+                light.sizeOrRadius = node.lightSizeOrRadius;
+                light.innerConeRadians = node.lightInnerConeRadians;
+                light.outerConeRadians = node.lightOuterConeRadians;
+                light.enabled = node.lightEnabled;
+                entity->light = light;
             }
             instance.generatedEntityUuids.push_back(entity->uuid);
         }
@@ -823,6 +842,7 @@ PrefabInstance SceneOperations::placePrefab(
         if (!node.meshGuid.empty()) {
             MeshRenderer renderer;
             renderer.meshGuid = node.meshGuid;
+            renderer.morphWeights = node.morphWeights;
             if (bindings != nullptr) {
                 const auto meshIt = bindings->meshes.find(node.meshGuid);
                 if (meshIt != bindings->meshes.end()) {

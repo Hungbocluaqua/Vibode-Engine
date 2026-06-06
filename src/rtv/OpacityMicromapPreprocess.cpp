@@ -538,6 +538,7 @@ OpacityMicromapCpuData generateOpacityMicromapData(const CachedScene& cached, ui
         mesh.name = cachedMesh.name;
         mesh.vertices = cachedMesh.vertices;
         mesh.indices = cachedMesh.indices;
+        mesh.defaultMorphWeights = cachedMesh.defaultMorphWeights;
         mesh.primitives.reserve(cachedMesh.primitives.size());
         for (const CachedPrimitiveData& cachedPrimitive : cachedMesh.primitives) {
             MeshPrimitiveAsset primitive;
@@ -545,6 +546,7 @@ OpacityMicromapCpuData generateOpacityMicromapData(const CachedScene& cached, ui
             primitive.vertexCount = cachedPrimitive.vertexCount;
             primitive.firstIndex = cachedPrimitive.firstIndex;
             primitive.indexCount = cachedPrimitive.indexCount;
+            primitive.morphTargets = cachedPrimitive.morphTargets;
             if (cachedPrimitive.materialIndex >= 0 && static_cast<size_t>(cachedPrimitive.materialIndex) < scene.materials.size()) {
                 primitive.material = scene.materials[static_cast<size_t>(cachedPrimitive.materialIndex)];
             }

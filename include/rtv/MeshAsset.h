@@ -4,8 +4,10 @@
 
 #include <glm/glm.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,8 @@ struct MeshVertex {
     glm::vec2 texcoord{};
     glm::vec2 texcoord1{};
     glm::vec4 color{1.0f};
+    glm::uvec4 joints{0u};
+    glm::vec4 weights{0.0f};
 };
 
 struct TextureTransformAsset {
@@ -156,11 +160,18 @@ struct MeshPrimitiveAsset {
     uint32_t firstVertex = 0;
     uint32_t vertexCount = 0;
     MaterialAssetHandle material{};
+    struct MorphTarget {
+        std::string name;
+        std::vector<glm::vec3> positionDeltas;
+        std::vector<glm::vec3> normalDeltas;
+        std::vector<glm::vec3> tangentDeltas;
+    };
     struct MaterialVariant {
         uint32_t variantIndex = UINT32_MAX;
         std::string variantName;
         MaterialAssetHandle material{};
     };
+    std::vector<MorphTarget> morphTargets;
     std::vector<MaterialVariant> materialVariants;
     float alphaCutoff = 0.5f;
     uint32_t alphaMode = kMaterialAlphaModeOpaque;
@@ -181,12 +192,92 @@ struct MeshAsset {
     std::vector<MeshVertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<MeshPrimitiveAsset> primitives;
+    std::vector<float> defaultMorphWeights;
 };
+
+[[nodiscard]] inline bool hasActiveMorphTargetWeights(const MeshAsset& mesh, const std::vector<float>& weights) {
+    if (weights.empty()) {
+        return false;
+    }
+    for (const MeshPrimitiveAsset& primitive : mesh.primitives) {
+        const size_t targetCount = std::min(primitive.morphTargets.size(), weights.size());
+        for (size_t targetIndex = 0; targetIndex < targetCount; ++targetIndex) {
+            const MeshPrimitiveAsset::MorphTarget& target = primitive.morphTargets[targetIndex];
+            if (std::abs(weights[targetIndex]) > 1.0e-6f &&
+                (!target.positionDeltas.empty() || !target.normalDeltas.empty() || !target.tangentDeltas.empty())) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+inline void applyMorphTargetWeights(MeshAsset& mesh, const std::vector<float>& weights) {
+    if (!hasActiveMorphTargetWeights(mesh, weights)) {
+        return;
+    }
+
+    std::vector<uint8_t> touchedNormals(mesh.vertices.size(), 0u);
+    std::vector<uint8_t> touchedTangents(mesh.vertices.size(), 0u);
+    for (const MeshPrimitiveAsset& primitive : mesh.primitives) {
+        const size_t targetCount = std::min(primitive.morphTargets.size(), weights.size());
+        for (size_t targetIndex = 0; targetIndex < targetCount; ++targetIndex) {
+            const float weight = weights[targetIndex];
+            if (std::abs(weight) <= 1.0e-6f) {
+                continue;
+            }
+            const MeshPrimitiveAsset::MorphTarget& target = primitive.morphTargets[targetIndex];
+            const size_t vertexCount = static_cast<size_t>(primitive.vertexCount);
+            const size_t positionCount = std::min(vertexCount, target.positionDeltas.size());
+            for (size_t i = 0; i < positionCount; ++i) {
+                const size_t vertexIndex = static_cast<size_t>(primitive.firstVertex) + i;
+                if (vertexIndex < mesh.vertices.size()) {
+                    mesh.vertices[vertexIndex].position += target.positionDeltas[i] * weight;
+                }
+            }
+            const size_t normalCount = std::min(vertexCount, target.normalDeltas.size());
+            for (size_t i = 0; i < normalCount; ++i) {
+                const size_t vertexIndex = static_cast<size_t>(primitive.firstVertex) + i;
+                if (vertexIndex < mesh.vertices.size()) {
+                    mesh.vertices[vertexIndex].normal += target.normalDeltas[i] * weight;
+                    touchedNormals[vertexIndex] = 1u;
+                }
+            }
+            const size_t tangentCount = std::min(vertexCount, target.tangentDeltas.size());
+            for (size_t i = 0; i < tangentCount; ++i) {
+                const size_t vertexIndex = static_cast<size_t>(primitive.firstVertex) + i;
+                if (vertexIndex < mesh.vertices.size()) {
+                    mesh.vertices[vertexIndex].tangent.x += target.tangentDeltas[i].x * weight;
+                    mesh.vertices[vertexIndex].tangent.y += target.tangentDeltas[i].y * weight;
+                    mesh.vertices[vertexIndex].tangent.z += target.tangentDeltas[i].z * weight;
+                    touchedTangents[vertexIndex] = 1u;
+                }
+            }
+        }
+    }
+
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        MeshVertex& vertex = mesh.vertices[i];
+        if (touchedNormals[i] != 0u) {
+            const float len2 = glm::dot(vertex.normal, vertex.normal);
+            vertex.normal = len2 > 1.0e-10f ? vertex.normal / std::sqrt(len2) : glm::vec3{0.0f, 1.0f, 0.0f};
+        }
+        if (touchedTangents[i] != 0u) {
+            glm::vec3 tangent = glm::vec3(vertex.tangent);
+            tangent -= vertex.normal * glm::dot(vertex.normal, tangent);
+            const float len2 = glm::dot(tangent, tangent);
+            tangent = len2 > 1.0e-10f ? tangent / std::sqrt(len2) : glm::vec3{1.0f, 0.0f, 0.0f};
+            vertex.tangent = glm::vec4{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f};
+        }
+    }
+}
 
 struct SceneNodeAsset {
     std::string name;
     glm::mat4 transform{1.0f};
     MeshAssetHandle mesh{};
+    std::vector<float> morphWeights;
+    int32_t skinIndex = -1;
     bool visible = true;
     bool castShadow = true;
     bool visibleToCamera = true;
@@ -200,6 +291,13 @@ struct SceneNodeAsset {
     float cameraFar = 1000.0f;
     int32_t parent = -1;
     std::vector<uint32_t> children;
+};
+
+struct SceneSkinAsset {
+    std::string name;
+    int32_t skeletonRoot = -1;
+    std::vector<uint32_t> joints;
+    std::vector<glm::mat4> inverseBindMatrices;
 };
 
 struct SceneLightAsset {
@@ -222,6 +320,7 @@ struct SceneAsset {
     std::vector<MeshAssetHandle> meshes;
     std::vector<std::string> materialVariants;
     std::vector<SceneNodeAsset> nodes;
+    std::vector<SceneSkinAsset> skins;
     std::vector<SceneLightAsset> lights;
     std::vector<uint32_t> rootNodes;
 };

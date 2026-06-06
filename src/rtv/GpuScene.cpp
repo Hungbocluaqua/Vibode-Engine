@@ -2589,6 +2589,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         std::vector<glm::vec3> normals;
         std::vector<glm::vec4> tangents;
         std::vector<uint32_t> faceMaterials;
+        std::vector<MeshVertex> morphedVertices;
     };
 
     std::vector<MeshPrep> meshPrep;
@@ -2614,7 +2615,15 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         prep.tangents.reserve(mesh->vertices.size());
         localVertexData.reserve(localVertexData.size() + mesh->vertices.size());
 
-        for (const MeshVertex& vertex : mesh->vertices) {
+        const std::vector<MeshVertex>* sourceVertices = &mesh->vertices;
+        if (hasActiveMorphTargetWeights(*mesh, mesh->defaultMorphWeights)) {
+            MeshAsset morphedMesh = *mesh;
+            applyMorphTargetWeights(morphedMesh, mesh->defaultMorphWeights);
+            prep.morphedVertices = std::move(morphedMesh.vertices);
+            sourceVertices = &prep.morphedVertices;
+        }
+
+        for (const MeshVertex& vertex : *sourceVertices) {
             const float normalLen2 = glm::dot(vertex.normal, vertex.normal);
             const glm::vec3 normal = normalLen2 > 1.0e-10f ? glm::normalize(vertex.normal) : glm::vec3{0.0f, 1.0f, 0.0f};
             glm::vec3 tangent = glm::vec3(vertex.tangent);
@@ -3011,6 +3020,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMesh.name = prep.mesh->name;
             cachedMesh.vertices = prep.mesh->vertices;
             cachedMesh.indices = prep.mesh->indices;
+            cachedMesh.defaultMorphWeights = prep.mesh->defaultMorphWeights;
             for (const MeshPrimitiveAsset& prim : prep.mesh->primitives) {
                 CachedPrimitiveData cachedPrim;
                 cachedPrim.firstVertex = prim.firstVertex;
@@ -3018,6 +3028,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
                 cachedPrim.firstIndex = prim.firstIndex;
                 cachedPrim.indexCount = prim.indexCount;
                 cachedPrim.materialIndex = getMaterialIndex(prim.material);
+                cachedPrim.morphTargets = prim.morphTargets;
                 for (const auto& variant : prim.materialVariants) {
                     cachedPrim.materialVariants.push_back(CachedPrimitiveData::MaterialVariant{
                         .variantIndex = variant.variantIndex,
@@ -3050,6 +3061,8 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedNode.name = node.name;
             cachedNode.transform = node.transform;
             cachedNode.meshIndex = getMeshIndex(node.mesh);
+            cachedNode.morphWeights = node.morphWeights;
+            cachedNode.skinIndex = node.skinIndex;
             cachedNode.hasCamera = node.hasCamera ? 1u : 0u;
             cachedNode.cameraProjection = node.cameraProjection;
             cachedNode.cameraYfov = node.cameraYfov;
@@ -3061,6 +3074,15 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedNode.parentIndex = node.parent;
             cachedNode.children = node.children;
             gpuCached.nodes.push_back(std::move(cachedNode));
+        }
+        gpuCached.skins.reserve(importedScene.skins.size());
+        for (const SceneSkinAsset& skin : importedScene.skins) {
+            gpuCached.skins.push_back(CachedSkinData{
+                .name = skin.name,
+                .skeletonRoot = skin.skeletonRoot,
+                .joints = skin.joints,
+                .inverseBindMatrices = skin.inverseBindMatrices,
+            });
         }
         gpuCached.materialVariants = importedScene.materialVariants;
         gpuCached.rootNodes = importedScene.rootNodes;
@@ -3188,8 +3210,24 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
 
     for (const CachedMeshData& mesh : cached.meshes) {
         const uint32_t vertexBase = static_cast<uint32_t>(localVertexData.size());
-        localVertexData.reserve(localVertexData.size() + mesh.vertices.size());
-        for (const MeshVertex& vertex : mesh.vertices) {
+        std::vector<MeshVertex> vertices = mesh.vertices;
+        if (!mesh.defaultMorphWeights.empty()) {
+            MeshAsset morphMesh;
+            morphMesh.vertices = vertices;
+            morphMesh.defaultMorphWeights = mesh.defaultMorphWeights;
+            morphMesh.primitives.reserve(mesh.primitives.size());
+            for (const CachedPrimitiveData& cachedPrimitive : mesh.primitives) {
+                MeshPrimitiveAsset primitive;
+                primitive.firstVertex = cachedPrimitive.firstVertex;
+                primitive.vertexCount = cachedPrimitive.vertexCount;
+                primitive.morphTargets = cachedPrimitive.morphTargets;
+                morphMesh.primitives.push_back(std::move(primitive));
+            }
+            applyMorphTargetWeights(morphMesh, mesh.defaultMorphWeights);
+            vertices = std::move(morphMesh.vertices);
+        }
+        localVertexData.reserve(localVertexData.size() + vertices.size());
+        for (const MeshVertex& vertex : vertices) {
             const float normalLen2 = glm::dot(vertex.normal, vertex.normal);
             const glm::vec3 normal = normalLen2 > 1.0e-10f ? glm::normalize(vertex.normal) : glm::vec3{0.0f, 1.0f, 0.0f};
             glm::vec3 tangent = glm::vec3(vertex.tangent);

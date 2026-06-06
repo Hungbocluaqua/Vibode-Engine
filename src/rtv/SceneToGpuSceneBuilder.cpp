@@ -37,6 +37,105 @@ namespace {
 
 void appendSceneMaterial(SceneAsset& scene, const AssetManager* assets, MaterialAssetHandle material);
 
+[[nodiscard]] std::vector<float> effectiveMorphWeights(const MeshRenderer& renderer, const MeshAsset& mesh) {
+    return !renderer.morphWeights.empty() ? renderer.morphWeights : mesh.defaultMorphWeights;
+}
+
+[[nodiscard]] bool hasActiveSkinningPayload(const MeshAsset& mesh) {
+    for (const MeshVertex& vertex : mesh.vertices) {
+        const bool hasJoints = vertex.joints.x != 0u || vertex.joints.y != 0u || vertex.joints.z != 0u || vertex.joints.w != 0u;
+        const bool hasWeights = vertex.weights.x > 0.0f || vertex.weights.y > 0.0f || vertex.weights.z > 0.0f || vertex.weights.w > 0.0f;
+        if (hasJoints && hasWeights) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::vector<glm::mat4> sceneNodeWorldTransforms(const SceneAsset& scene) {
+    std::vector<glm::mat4> world(scene.nodes.size(), glm::mat4{1.0f});
+    std::vector<uint8_t> computed(scene.nodes.size(), 0u);
+    auto compute = [&](auto&& self, size_t nodeIndex) -> glm::mat4 {
+        if (nodeIndex >= scene.nodes.size()) {
+            return glm::mat4{1.0f};
+        }
+        if (computed[nodeIndex] != 0u) {
+            return world[nodeIndex];
+        }
+        const SceneNodeAsset& node = scene.nodes[nodeIndex];
+        glm::mat4 result = node.transform;
+        if (node.parent >= 0 && static_cast<size_t>(node.parent) < scene.nodes.size()) {
+            result = self(self, static_cast<size_t>(node.parent)) * node.transform;
+        }
+        world[nodeIndex] = result;
+        computed[nodeIndex] = 1u;
+        return result;
+    };
+    for (size_t i = 0; i < scene.nodes.size(); ++i) {
+        compute(compute, i);
+    }
+    return world;
+}
+
+void applySkinningPayload(
+    MeshAsset& mesh,
+    const SceneSkinAsset& skin,
+    const glm::mat4& meshWorld,
+    const std::vector<glm::mat4>& nodeWorldTransforms) {
+    if (!hasActiveSkinningPayload(mesh) || skin.joints.empty()) {
+        return;
+    }
+
+    const glm::mat4 inverseMeshWorld = glm::inverse(meshWorld);
+    std::vector<glm::mat4> jointMatrices(skin.joints.size(), glm::mat4{1.0f});
+    for (size_t jointIndex = 0; jointIndex < skin.joints.size(); ++jointIndex) {
+        const uint32_t nodeIndex = skin.joints[jointIndex];
+        const glm::mat4 jointWorld = nodeIndex < nodeWorldTransforms.size()
+            ? nodeWorldTransforms[nodeIndex]
+            : glm::mat4{1.0f};
+        const glm::mat4 inverseBind = jointIndex < skin.inverseBindMatrices.size()
+            ? skin.inverseBindMatrices[jointIndex]
+            : glm::mat4{1.0f};
+        jointMatrices[jointIndex] = inverseMeshWorld * jointWorld * inverseBind;
+    }
+
+    const std::vector<MeshVertex> sourceVertices = mesh.vertices;
+    for (size_t vertexIndex = 0; vertexIndex < sourceVertices.size(); ++vertexIndex) {
+        const MeshVertex& source = sourceVertices[vertexIndex];
+        glm::vec3 position{0.0f};
+        glm::vec3 normal{0.0f};
+        glm::vec3 tangent{0.0f};
+        float totalWeight = 0.0f;
+
+        for (int influence = 0; influence < 4; ++influence) {
+            const float weight = source.weights[influence];
+            const uint32_t jointIndex = source.joints[influence];
+            if (weight <= 0.0f || jointIndex >= jointMatrices.size()) {
+                continue;
+            }
+            const glm::mat4& skinMatrix = jointMatrices[jointIndex];
+            position += glm::vec3(skinMatrix * glm::vec4(source.position, 1.0f)) * weight;
+            normal += glm::mat3(skinMatrix) * source.normal * weight;
+            tangent += glm::mat3(skinMatrix) * glm::vec3(source.tangent) * weight;
+            totalWeight += weight;
+        }
+
+        if (totalWeight <= 1.0e-6f) {
+            continue;
+        }
+        MeshVertex& target = mesh.vertices[vertexIndex];
+        target.position = position;
+        const float normalLen2 = glm::dot(normal, normal);
+        target.normal = normalLen2 > 1.0e-10f ? normal / std::sqrt(normalLen2) : source.normal;
+        tangent -= target.normal * glm::dot(target.normal, tangent);
+        const float tangentLen2 = glm::dot(tangent, tangent);
+        target.tangent = glm::vec4{
+            tangentLen2 > 1.0e-10f ? tangent / std::sqrt(tangentLen2) : glm::vec3(source.tangent),
+            source.tangent.w < 0.0f ? -1.0f : 1.0f,
+        };
+    }
+}
+
 void applyRendererMaterialBindings(
     SceneGpuBuildResult& result,
     const std::vector<const Entity*>& entities,
@@ -46,6 +145,7 @@ void applyRendererMaterialBindings(
     }
 
     const size_t count = std::min(result.sceneAsset.nodes.size(), entities.size());
+    const std::vector<glm::mat4> nodeWorldTransforms = sceneNodeWorldTransforms(result.sceneAsset);
     for (size_t nodeIndex = 0; nodeIndex < count; ++nodeIndex) {
         const Entity* entity = entities[nodeIndex];
         if (entity == nullptr || !entity->meshRenderer.has_value()) {
@@ -59,6 +159,14 @@ void applyRendererMaterialBindings(
         }
 
         bool needsRuntimeMesh = false;
+        const std::vector<float> morphWeights = effectiveMorphWeights(renderer, *sourceMesh);
+        const bool needsMorphRuntimeMesh = hasActiveMorphTargetWeights(*sourceMesh, morphWeights);
+        const int32_t skinIndex = result.sceneAsset.nodes[nodeIndex].skinIndex;
+        const bool needsSkinRuntimeMesh = skinIndex >= 0 &&
+            static_cast<size_t>(skinIndex) < result.sceneAsset.skins.size() &&
+            hasActiveSkinningPayload(*sourceMesh);
+        needsRuntimeMesh = needsMorphRuntimeMesh;
+        needsRuntimeMesh = needsRuntimeMesh || needsSkinRuntimeMesh;
         std::vector<MaterialAssetHandle> effectiveMaterials;
         effectiveMaterials.reserve(sourceMesh->primitives.size());
         for (size_t primitiveIndex = 0; primitiveIndex < sourceMesh->primitives.size(); ++primitiveIndex) {
@@ -77,8 +185,8 @@ void applyRendererMaterialBindings(
 
         MeshAsset runtimeMesh = *sourceMesh;
         runtimeMesh.name = sourceMesh->name.empty()
-            ? "runtime material variant mesh"
-            : sourceMesh->name + " (runtime material variant)";
+            ? "runtime mesh"
+            : sourceMesh->name + " (runtime mesh)";
         for (size_t primitiveIndex = 0; primitiveIndex < runtimeMesh.primitives.size(); ++primitiveIndex) {
             MeshPrimitiveAsset& primitive = runtimeMesh.primitives[primitiveIndex];
             const MaterialAssetHandle material = effectiveMaterials[primitiveIndex];
@@ -87,10 +195,21 @@ void applyRendererMaterialBindings(
                 updatePrimitiveAlphaClassification(primitive, assets->material(material));
             }
         }
+        if (needsMorphRuntimeMesh) {
+            applyMorphTargetWeights(runtimeMesh, morphWeights);
+        }
+        if (needsSkinRuntimeMesh) {
+            applySkinningPayload(
+                runtimeMesh,
+                result.sceneAsset.skins[static_cast<size_t>(skinIndex)],
+                nodeWorldTransforms[nodeIndex],
+                nodeWorldTransforms);
+        }
 
         const MeshAssetHandle runtimeHandle = assets->addMesh(std::move(runtimeMesh));
         result.sceneAsset.meshes.push_back(runtimeHandle);
         result.sceneAsset.nodes[nodeIndex].mesh = runtimeHandle;
+        result.sceneAsset.nodes[nodeIndex].skinIndex = -1;
     }
 }
 

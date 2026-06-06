@@ -79,9 +79,11 @@ public:
         const std::optional<std::filesystem::path>& scenePath,
         bool sceneDirty,
         bool projectSettingsDirty,
+        size_t dirtyMaterialAssetCount,
         const std::string& sceneLoadingStatus,
         bool sceneLoadRunning,
         float sceneLoadProgress,
+        const EditorJobCenterState* jobCenter,
         NotificationManager* notifications);
     void record(VkCommandBuffer commandBuffer);
     void renderPlatformWindows();

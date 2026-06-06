@@ -155,6 +155,154 @@ std::string relativePathString(const std::filesystem::path& path, const std::fil
     return genericPathString(relative);
 }
 
+std::string lowerAscii(std::string value) {
+    for (char& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+std::filesystem::path canonicalForCookCompare(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
+    return ec ? path.lexically_normal() : canonical.lexically_normal();
+}
+
+bool cookReferenceScanFileCandidate(const std::filesystem::path& path) {
+    const std::string filename = lowerAscii(path.filename().string());
+    const std::string ext = lowerAscii(path.extension().string());
+    if (ext == ".rtlevel" || ext == ".mscene" || ext == ".vproject" || ext == ".rtproject") {
+        return true;
+    }
+    auto endsWith = [&](const char* suffix) {
+        const std::string value(suffix);
+        return filename.size() >= value.size() && filename.compare(filename.size() - value.size(), value.size(), value) == 0;
+    };
+    return endsWith(".rtprefab.json") ||
+        endsWith(".rtmesh.json") ||
+        endsWith(".rtmaterial.json") ||
+        endsWith(".rttexture.json") ||
+        endsWith(".rthdri.json") ||
+        endsWith(".rtanim.json") ||
+        endsWith(".rtskeleton.json");
+}
+
+void appendCookScanRoot(std::vector<std::filesystem::path>& roots, const std::filesystem::path& root) {
+    if (root.empty()) {
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) {
+        return;
+    }
+    const std::filesystem::path canonical = canonicalForCookCompare(root);
+    for (const std::filesystem::path& existing : roots) {
+        if (canonicalForCookCompare(existing) == canonical) {
+            return;
+        }
+    }
+    roots.push_back(canonical);
+}
+
+std::string cookJsonPathChild(std::string parent, const std::string& child) {
+    if (parent.empty()) {
+        parent = "$";
+    }
+    return parent + "/" + child;
+}
+
+std::optional<nlohmann::json> readCookJsonFile(const std::filesystem::path& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return std::nullopt;
+    }
+    try {
+        nlohmann::json json;
+        file >> json;
+        return json;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+void collectCookProjectReferenceScanFiles(
+    const rtv::ProjectContext& project,
+    nlohmann::json& checkedRoots,
+    std::vector<std::filesystem::path>& files) {
+    std::vector<std::filesystem::path> roots;
+    appendCookScanRoot(roots, project.contentRoot);
+    appendCookScanRoot(roots, project.scenesRoot);
+
+    for (const std::filesystem::path& root : roots) {
+        checkedRoots.push_back(root.generic_string());
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (ec) {
+                break;
+            }
+            std::error_code entryError;
+            if (entry.is_regular_file(entryError) && cookReferenceScanFileCandidate(entry.path())) {
+                files.push_back(canonicalForCookCompare(entry.path()));
+            }
+        }
+    }
+    if (!project.projectFile.empty()) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(project.projectFile, ec) && cookReferenceScanFileCandidate(project.projectFile)) {
+            files.push_back(canonicalForCookCompare(project.projectFile));
+        }
+    }
+    std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+}
+
+bool cookGuidFieldCanReferenceAsset(std::string_view lowerKey) {
+    return lowerKey.find("guid") != std::string_view::npos &&
+        lowerKey != "projectguid" &&
+        lowerKey != "sceneguid";
+}
+
+void appendInvalidCookSavedGuidReferences(
+    const nlohmann::json& value,
+    const std::unordered_set<rtv::AssetGuid>& registryGuids,
+    const std::filesystem::path& filePath,
+    const std::string& jsonPath,
+    std::string objectKey,
+    nlohmann::json& invalidReferences) {
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            appendInvalidCookSavedGuidReferences(it.value(), registryGuids, filePath, cookJsonPathChild(jsonPath, it.key()), it.key(), invalidReferences);
+        }
+        return;
+    }
+    if (value.is_array()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            appendInvalidCookSavedGuidReferences(value[i], registryGuids, filePath, cookJsonPathChild(jsonPath, std::to_string(i)), objectKey, invalidReferences);
+        }
+        return;
+    }
+    if (!value.is_string()) {
+        return;
+    }
+    const std::string keyLower = lowerAscii(std::move(objectKey));
+    if (!cookGuidFieldCanReferenceAsset(keyLower)) {
+        return;
+    }
+    const std::string guid = value.get<std::string>();
+    if (guid.empty() || registryGuids.find(guid) != registryGuids.end()) {
+        return;
+    }
+    invalidReferences.push_back({
+        {"severity", "error"},
+        {"kind", "InvalidSavedProjectReference"},
+        {"file", filePath.generic_string()},
+        {"jsonPath", jsonPath.empty() ? "$" : jsonPath},
+        {"field", keyLower},
+        {"guid", guid},
+        {"detail", "Saved project metadata contains an asset GUID field whose value is not present in the loaded asset registry."},
+    });
+}
+
 std::filesystem::path cookDestinationForPath(
     const std::filesystem::path& source,
     const std::filesystem::path& projectRoot,
@@ -216,6 +364,58 @@ bool copyCookFile(
     return true;
 }
 
+void appendCookValidationIssue(
+    nlohmann::json& array,
+    std::string_view severity,
+    std::string_view kind,
+    const rtv::AssetRecord& record,
+    std::string detail,
+    const std::filesystem::path& path = {}) {
+    nlohmann::json issue = {
+        {"severity", severity},
+        {"kind", kind},
+        {"ownerGuid", record.guid},
+        {"ownerDisplayName", record.displayName},
+        {"ownerAssetType", rtv::assetTypeName(record.type)},
+        {"detail", std::move(detail)},
+    };
+    if (!path.empty()) {
+        issue["path"] = path.generic_string();
+    }
+    array.push_back(std::move(issue));
+}
+
+size_t countCookValidationSeverity(const std::vector<const nlohmann::json*>& arrays, std::string_view severity) {
+    size_t count = 0;
+    for (const nlohmann::json* array : arrays) {
+        if (array == nullptr || !array->is_array()) {
+            continue;
+        }
+        for (const nlohmann::json& item : *array) {
+            if (item.is_object() && item.value("severity", std::string{}) == severity) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+bool supportedCookCoordinateConversion(std::string_view value) {
+    return value == "None" || value == "glTF Y-Up to Engine" || value == "Z-Up to Engine";
+}
+
+bool supportedCookMaterialImportMode(std::string_view value) {
+    return value == "ImportMaterials" || value == "MetadataOnly" || value == "SkipMaterials";
+}
+
+bool supportedCookTextureImportMode(std::string_view value) {
+    return value == "ImportTextures" || value == "MetadataOnly" || value == "SkipTextures";
+}
+
+bool supportedCookTextureCompression(std::string_view value) {
+    return value == "PreserveSource";
+}
+
 int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem::path outputDir, std::filesystem::path manifestPath) {
     rtv::ProjectContext project;
     std::string projectError;
@@ -249,6 +449,18 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
 
     nlohmann::json copiedFiles = nlohmann::json::array();
     nlohmann::json assets = nlohmann::json::array();
+    nlohmann::json missingSources = nlohmann::json::array();
+    nlohmann::json missingImportedMetadata = nlohmann::json::array();
+    nlohmann::json missingCookedPayloads = nlohmann::json::array();
+    nlohmann::json missingDependencies = nlohmann::json::array();
+    nlohmann::json staleAssets = nlohmann::json::array();
+    nlohmann::json failedAssets = nlohmann::json::array();
+    nlohmann::json unsupportedImportSettings = nlohmann::json::array();
+    nlohmann::json requiresReimport = nlohmann::json::array();
+    nlohmann::json projectWarnings = nlohmann::json::array();
+    nlohmann::json invalidSavedProjectReferences = nlohmann::json::array();
+    nlohmann::json savedProjectReferenceParseErrors = nlohmann::json::array();
+    nlohmann::json savedProjectReferenceScanRoots = nlohmann::json::array();
     size_t externalIndex = 0;
 
     auto copyProjectFile = [&](const std::filesystem::path& source, std::string_view role) {
@@ -264,6 +476,12 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
         copyProjectFile(project.startupScene, "startup_scene");
     } else {
         warnings.push_back("Startup scene is missing: " + project.startupScene.string());
+        projectWarnings.push_back({
+            {"severity", "warning"},
+            {"kind", "MissingStartupScene"},
+            {"path", project.startupScene.generic_string()},
+            {"detail", "Project startup scene is missing."},
+        });
     }
 
     if (std::filesystem::exists(project.scenesRoot)) {
@@ -303,23 +521,58 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
 
         if (record.sourceMissing) {
             warnings.push_back("Source missing but cook can proceed from metadata/payload for " + record.guid + ": " + sourcePath.string());
+            appendCookValidationIssue(missingSources, "warning", "MissingSource", record, "Raw import source is missing, but transparent cook can proceed when metadata and cooked payloads exist.", record.sourcePath);
         }
         if (record.stale || record.status == rtv::AssetImportStatus::Stale) {
             warnings.push_back("Asset is stale and should be reimported before shipping: " + record.guid);
+            appendCookValidationIssue(staleAssets, "warning", "StaleAsset", record, "Source is newer than imported metadata or cooked payload; reimport before shipping.");
+            appendCookValidationIssue(requiresReimport, "warning", "RequiresReimport", record, "Asset is stale and should be reimported before cooking or packaging.");
         }
         if (record.status == rtv::AssetImportStatus::Failed) {
             errors.push_back("Asset import previously failed: " + record.guid);
+            appendCookValidationIssue(failedAssets, "error", "FailedImport", record, "Asset import previously failed.");
+            appendCookValidationIssue(requiresReimport, "error", "RequiresReimport", record, "Asset import failed and must be repaired or reimported before cooking or packaging.");
         }
         if (record.importedMetadataMissing || record.importedPath.empty()) {
             errors.push_back("Imported metadata missing for asset: " + record.guid);
+            appendCookValidationIssue(missingImportedMetadata, "error", "MissingImportedMetadata", record, "Imported asset metadata is missing.", record.importedPath);
+            appendCookValidationIssue(requiresReimport, "error", "RequiresReimport", record, "Imported metadata is missing and must be regenerated before cooking or packaging.");
         }
         if (record.cookedPayloadMissing || record.cachePath.empty()) {
             errors.push_back("Cooked payload missing for asset: " + record.guid);
+            appendCookValidationIssue(missingCookedPayloads, "error", "MissingCookedPayload", record, "Cooked/runtime payload is missing.", record.cachePath);
+            appendCookValidationIssue(requiresReimport, "error", "RequiresReimport", record, "Cooked/runtime payload is missing and must be regenerated before cooking or packaging.");
         }
         for (const rtv::AssetDependency& dependency : record.dependencies) {
             if (!dependency.guid.empty() && registryGuids.find(dependency.guid) == registryGuids.end()) {
                 errors.push_back("Asset " + record.guid + " references missing dependency " + dependency.guid + " (" + dependency.kind + ")");
+                missingDependencies.push_back({
+                    {"severity", "error"},
+                    {"kind", "MissingDependencyGuid"},
+                    {"ownerGuid", record.guid},
+                    {"ownerDisplayName", record.displayName},
+                    {"ownerAssetType", rtv::assetTypeName(record.type)},
+                    {"dependencyGuid", dependency.guid},
+                    {"dependencyKind", dependency.kind},
+                    {"detail", "Dependency GUID is not present in the asset registry."},
+                });
             }
+        }
+        if (record.importSettings.unitScale <= 0.0f) {
+            errors.push_back("Invalid import unit scale for asset: " + record.guid);
+            appendCookValidationIssue(unsupportedImportSettings, "error", "InvalidUnitScale", record, "Import unit scale must be greater than zero.");
+        }
+        if (!supportedCookCoordinateConversion(record.importSettings.coordinateConversion)) {
+            appendCookValidationIssue(unsupportedImportSettings, "warning", "UnsupportedCoordinateConversion", record, "Import coordinate conversion is not recognized: " + record.importSettings.coordinateConversion);
+        }
+        if (!supportedCookMaterialImportMode(record.importSettings.materialImportMode)) {
+            appendCookValidationIssue(unsupportedImportSettings, "warning", "UnsupportedMaterialImportMode", record, "Material import mode is not recognized: " + record.importSettings.materialImportMode);
+        }
+        if (!supportedCookTextureImportMode(record.importSettings.textureImportMode)) {
+            appendCookValidationIssue(unsupportedImportSettings, "warning", "UnsupportedTextureImportMode", record, "Texture import mode is not recognized: " + record.importSettings.textureImportMode);
+        }
+        if (!supportedCookTextureCompression(record.importSettings.textureCompression)) {
+            appendCookValidationIssue(unsupportedImportSettings, "warning", "UnsupportedTextureCompression", record, "Texture compression/transcode mode is not available in this pipeline stage: " + record.importSettings.textureCompression);
         }
 
         if (!record.importedPath.empty()) {
@@ -340,10 +593,95 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
         assets.push_back(std::move(asset));
     }
 
+    std::vector<std::filesystem::path> referenceScanFiles;
+    collectCookProjectReferenceScanFiles(project, savedProjectReferenceScanRoots, referenceScanFiles);
+    for (const std::filesystem::path& path : referenceScanFiles) {
+        std::optional<nlohmann::json> json = readCookJsonFile(path);
+        if (!json.has_value()) {
+            savedProjectReferenceParseErrors.push_back({
+                {"severity", "warning"},
+                {"kind", "SavedProjectReferenceParseError"},
+                {"file", path.generic_string()},
+                {"detail", "File matched the project reference validation set but could not be parsed as JSON."},
+            });
+            continue;
+        }
+        appendInvalidCookSavedGuidReferences(*json, registryGuids, path, "$", {}, invalidSavedProjectReferences);
+    }
+    if (!invalidSavedProjectReferences.empty()) {
+        errors.push_back("Saved project metadata contains asset GUID references missing from the asset registry.");
+    }
+    if (!savedProjectReferenceParseErrors.empty()) {
+        warnings.push_back("Some saved project metadata files could not be parsed during cook reference validation.");
+    }
+
     std::sort(errors.begin(), errors.end());
     errors.erase(std::unique(errors.begin(), errors.end()), errors.end());
     std::sort(warnings.begin(), warnings.end());
     warnings.erase(std::unique(warnings.begin(), warnings.end()), warnings.end());
+
+    const std::vector<const nlohmann::json*> validationIssueArrays = {
+        &missingSources,
+        &missingImportedMetadata,
+        &missingCookedPayloads,
+        &missingDependencies,
+        &staleAssets,
+        &failedAssets,
+        &unsupportedImportSettings,
+        &invalidSavedProjectReferences,
+        &savedProjectReferenceParseErrors,
+        &requiresReimport,
+        &projectWarnings,
+    };
+    const size_t validationErrorCount = countCookValidationSeverity(validationIssueArrays, "error");
+    const size_t validationWarningCount = countCookValidationSeverity(validationIssueArrays, "warning");
+    const std::filesystem::path validationReportPath = outputDir / "asset_validation_report.json";
+    nlohmann::json validationReport = {
+        {"version", 1},
+        {"kind", "CookAssetValidationReport"},
+        {"project", {
+            {"guid", project.projectGuid},
+            {"name", project.name},
+            {"projectFile", relativePathString(project.projectFile, project.projectRoot)},
+            {"startupScene", relativePathString(project.startupScene, project.projectRoot)},
+            {"assetRegistry", relativePathString(project.assetRegistryPath, project.projectRoot)},
+        }},
+        {"assetCount", registry.records().size()},
+        {"errorCount", errors.size()},
+        {"warningCount", warnings.size()},
+        {"validationErrorCount", validationErrorCount},
+        {"validationWarningCount", validationWarningCount},
+        {"missingSources", missingSources},
+        {"missingImportedMetadata", missingImportedMetadata},
+        {"missingCookedPayloads", missingCookedPayloads},
+        {"missingDependencies", missingDependencies},
+        {"staleAssets", staleAssets},
+        {"failedAssets", failedAssets},
+        {"unsupportedImportSettings", unsupportedImportSettings},
+        {"invalidSavedProjectReferences", invalidSavedProjectReferences},
+        {"savedProjectReferenceParseErrors", savedProjectReferenceParseErrors},
+        {"savedProjectReferenceScanRoots", savedProjectReferenceScanRoots},
+        {"savedProjectReferenceScannedFileCount", referenceScanFiles.size()},
+        {"requiresReimport", requiresReimport},
+        {"projectWarnings", projectWarnings},
+        {"cookErrors", errors},
+        {"cookWarnings", warnings},
+        {"status", errors.empty() ? "pass" : "fail"},
+        {"policy", "This report is generated by --cook-project before package emission. Missing raw sources are warnings when imported metadata and cooked payloads are available; missing metadata, missing cooked payloads, failed imports, and missing dependency GUIDs block the transparent cook."},
+    };
+
+    std::error_code validationEc;
+    std::filesystem::create_directories(validationReportPath.parent_path(), validationEc);
+    if (validationEc) {
+        std::cerr << "Cook failed: could not create validation report directory: " << validationEc.message() << '\n';
+        return 1;
+    }
+    std::ofstream validationFile(validationReportPath);
+    if (!validationFile.is_open()) {
+        std::cerr << "Cook failed: could not write validation report: " << validationReportPath.string() << '\n';
+        return 1;
+    }
+    validationFile << validationReport.dump(2);
 
     nlohmann::json manifest;
     manifest["schema"] = "TransparentCookManifestV1";
@@ -360,6 +698,9 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     manifest["copiedFiles"] = std::move(copiedFiles);
     manifest["warnings"] = warnings;
     manifest["errors"] = errors;
+    manifest["validationReport"] = relativePathString(validationReportPath, outputDir);
+    manifest["validationErrorCount"] = validationErrorCount;
+    manifest["validationWarningCount"] = validationWarningCount;
     manifest["status"] = errors.empty() ? "success" : "failed";
     manifest["futurePackageCompatibility"] = {
         {"packageObjectModel", "metadata_and_payload_chunks"},
@@ -383,6 +724,7 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     }
     manifestFile << manifest.dump(2);
 
+    std::cout << "Cook validation report: " << validationReportPath.string() << '\n';
     std::cout << "Cook manifest: " << manifestPath.string() << '\n';
     std::cout << "Cook copied " << manifest["copiedFiles"].size() << " files for "
               << registry.records().size() << " assets; warnings=" << warnings.size()

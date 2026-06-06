@@ -56,6 +56,20 @@ glm::mat4 prefabNodeTransformFromJson(const nlohmann::json& json) {
     return transform;
 }
 
+std::vector<float> floatVectorFromJson(const nlohmann::json& json) {
+    std::vector<float> values;
+    if (!json.is_array()) {
+        return values;
+    }
+    values.reserve(json.size());
+    for (const nlohmann::json& item : json) {
+        if (item.is_number()) {
+            values.push_back(item.get<float>());
+        }
+    }
+    return values;
+}
+
 } // namespace
 
 bool loadPrefabAsset(const std::filesystem::path& path, PrefabAsset& outPrefab, std::string* error) {
@@ -101,8 +115,10 @@ bool loadPrefabAsset(const std::filesystem::path& path, PrefabAsset& outPrefab, 
                 PrefabNodeAsset node;
                 node.name = item.value("name", std::string{});
                 node.parent = item.value("parent", -1);
+                node.sourceNodeIndex = item.value("sourceNodeIndex", -1);
                 node.transform = prefabNodeTransformFromJson(item);
                 node.meshGuid = item.value("meshGuid", std::string{});
+                node.morphWeights = floatVectorFromJson(item.value("morphWeights", nlohmann::json::array()));
                 node.hasCamera = item.value("hasCamera", false);
                 node.cameraProjection = item.value("cameraProjection", node.cameraProjection);
                 node.cameraYfov = item.value("cameraYfov", node.cameraYfov);
@@ -111,6 +127,14 @@ bool loadPrefabAsset(const std::filesystem::path& path, PrefabAsset& outPrefab, 
                 node.cameraOrthoYmag = item.value("cameraOrthoYmag", node.cameraOrthoYmag);
                 node.cameraNear = item.value("cameraNear", node.cameraNear);
                 node.cameraFar = item.value("cameraFar", node.cameraFar);
+                node.hasLight = item.value("hasLight", false);
+                node.lightType = item.value("lightType", node.lightType);
+                node.lightColor = vec3FromJson(item.value("lightColor", nlohmann::json::array()), node.lightColor);
+                node.lightIntensity = item.value("lightIntensity", node.lightIntensity);
+                node.lightSizeOrRadius = item.value("lightSizeOrRadius", node.lightSizeOrRadius);
+                node.lightInnerConeRadians = item.value("lightInnerConeRadians", node.lightInnerConeRadians);
+                node.lightOuterConeRadians = item.value("lightOuterConeRadians", node.lightOuterConeRadians);
+                node.lightEnabled = item.value("lightEnabled", node.lightEnabled);
                 if (item.contains("materialGuids") && item["materialGuids"].is_array()) {
                     for (const nlohmann::json& material : item["materialGuids"]) {
                         if (material.is_string()) {

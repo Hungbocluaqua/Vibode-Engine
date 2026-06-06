@@ -138,6 +138,38 @@ std::vector<MeshPrimitiveAsset::MaterialVariant> materialVariantChoices(const Me
     return choices;
 }
 
+size_t meshMorphTargetCount(const MeshAsset* mesh) {
+    if (mesh == nullptr) {
+        return 0;
+    }
+    size_t count = mesh->defaultMorphWeights.size();
+    for (const MeshPrimitiveAsset& primitive : mesh->primitives) {
+        count = std::max(count, primitive.morphTargets.size());
+    }
+    return count;
+}
+
+std::string meshMorphTargetName(const MeshAsset& mesh, size_t targetIndex) {
+    for (const MeshPrimitiveAsset& primitive : mesh.primitives) {
+        if (targetIndex < primitive.morphTargets.size()) {
+            const std::string& name = primitive.morphTargets[targetIndex].name;
+            if (!name.empty()) {
+                return name;
+            }
+        }
+    }
+    return "Target " + std::to_string(targetIndex);
+}
+
+std::vector<float> defaultMorphWeightsForMesh(const MeshAsset& mesh, size_t targetCount) {
+    std::vector<float> weights(targetCount, 0.0f);
+    const size_t copyCount = std::min(targetCount, mesh.defaultMorphWeights.size());
+    for (size_t i = 0; i < copyCount; ++i) {
+        weights[i] = mesh.defaultMorphWeights[i];
+    }
+    return weights;
+}
+
 bool resetFieldButton(const char* id, const char* tooltipText = "Reset to default") {
     ImGui::SameLine();
     const std::string buttonId = std::string("InspectorReset") + id;
@@ -230,6 +262,16 @@ bool inspectorColorEdit3Row(const char* label, float* values) {
     const bool changed = ImGui::ColorEdit3("##Value", values);
     endInspectorPropertyRow();
     return changed;
+}
+
+bool inspectorInputTextRow(const char* label, char* value, size_t valueSize) {
+    if (!beginInspectorPropertyRow(label)) {
+        return false;
+    }
+    const bool changed = ImGui::InputText("##Value", value, valueSize, ImGuiInputTextFlags_EnterReturnsTrue);
+    const bool deactivated = ImGui::IsItemDeactivatedAfterEdit();
+    endInspectorPropertyRow();
+    return changed || deactivated;
 }
 
 bool inspectorColorEdit4Row(const char* label, float* values) {
@@ -385,6 +427,7 @@ void drawEntityActionsMenu(Entity& entity, EditorSelection& selection, EditorReq
         addComponentMenuItem("Primary Sun", entity, EditorComponentKind::Sun, SceneUpdateKind::LightOnly, EditorGlyphIcon::Sun, entity.sun.has_value(), requests);
         addComponentMenuItem("Camera", entity, EditorComponentKind::Camera, SceneUpdateKind::CameraOnly, EditorGlyphIcon::Camera, entity.camera.has_value(), requests);
         addComponentMenuItem("Mesh Renderer", entity, EditorComponentKind::MeshRenderer, SceneUpdateKind::TopologyChanged, EditorGlyphIcon::Model, entity.meshRenderer.has_value(), requests);
+        addComponentMenuItem("Animation Player", entity, EditorComponentKind::AnimationPlayer, SceneUpdateKind::TransformOnly, EditorGlyphIcon::Timeline, entity.animationPlayer.has_value(), requests);
         addComponentMenuItem("Environment Light", entity, EditorComponentKind::EnvironmentLight, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::Environment, entity.environmentLight.has_value(), requests);
         addComponentMenuItem("Sky Atmosphere", entity, EditorComponentKind::SkyAtmosphere, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::Sky, entity.skyAtmosphere.has_value(), requests);
         addComponentMenuItem("Height Fog", entity, EditorComponentKind::HeightFog, SceneUpdateKind::RendererSettingsOnly, EditorGlyphIcon::Fog, entity.heightFog.has_value(), requests);
@@ -920,10 +963,11 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             MeshRenderer& renderer = *entity->meshRenderer;
             ensureMaterialSlots(renderer, state.assets);
             const MeshRenderer oldRenderer = renderer;
-            bool changed = false;
-            changed |= inspectorCheckboxRow("Visible", &renderer.visible);
-            changed |= inspectorCheckboxRow("Cast Shadow", &renderer.castShadow);
-            changed |= inspectorCheckboxRow("Visible To Camera", &renderer.visibleToCamera);
+            bool visibilityChanged = false;
+            bool deformationChanged = false;
+            visibilityChanged |= inspectorCheckboxRow("Visible", &renderer.visible);
+            visibilityChanged |= inspectorCheckboxRow("Cast Shadow", &renderer.castShadow);
+            visibilityChanged |= inspectorCheckboxRow("Visible To Camera", &renderer.visibleToCamera);
             inspectorReadonlyRow("Mesh Asset", std::to_string(renderer.mesh.index));
             inspectorReadonlyRow("Renderer Instance Cache", std::to_string(renderer.rendererInstanceIndex));
             const MeshAsset* rendererMesh = nullptr;
@@ -932,6 +976,37 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 if (rendererMesh != nullptr) {
                     inspectorReadonlyRow("Mesh", rendererMesh->name.empty() ? "(unnamed)" : rendererMesh->name.c_str());
                     inspectorReadonlyRow("Geometry", std::to_string(rendererMesh->vertices.size()) + " vertices, " + std::to_string(rendererMesh->primitives.size()) + " primitives");
+                }
+            }
+            const size_t morphTargetCount = meshMorphTargetCount(rendererMesh);
+            if (rendererMesh != nullptr && morphTargetCount > 0) {
+                if (renderer.morphWeights.size() < morphTargetCount) {
+                    const std::vector<float> defaults = defaultMorphWeightsForMesh(*rendererMesh, morphTargetCount);
+                    const size_t oldSize = renderer.morphWeights.size();
+                    renderer.morphWeights.resize(morphTargetCount, 0.0f);
+                    for (size_t i = oldSize; i < morphTargetCount; ++i) {
+                        renderer.morphWeights[i] = defaults[i];
+                    }
+                } else if (renderer.morphWeights.size() > morphTargetCount) {
+                    renderer.morphWeights.resize(morphTargetCount);
+                }
+                if (ImGui::TreeNodeEx("Blend Shapes", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    const std::vector<float> defaults = defaultMorphWeightsForMesh(*rendererMesh, morphTargetCount);
+                    if (editorIconTextButton("InspectorResetMorphWeights", EditorGlyphIcon::Refresh, "Reset Weights")) {
+                        renderer.morphWeights = defaults;
+                        deformationChanged = true;
+                    }
+                    for (size_t targetIndex = 0; targetIndex < morphTargetCount; ++targetIndex) {
+                        ImGui::PushID(static_cast<int>(targetIndex));
+                        const std::string label = meshMorphTargetName(*rendererMesh, targetIndex);
+                        float weight = renderer.morphWeights[targetIndex];
+                        if (inspectorSliderFloatRow(label.c_str(), &weight, -1.0f, 1.0f, "%.3f")) {
+                            renderer.morphWeights[targetIndex] = std::clamp(weight, -1.0f, 1.0f);
+                            deformationChanged = true;
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::TreePop();
                 }
             }
             const std::vector<MeshPrimitiveAsset::MaterialVariant> variantChoices = materialVariantChoices(rendererMesh);
@@ -1038,7 +1113,16 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                     }
                 }
             }
-            if (changed) {
+            if (deformationChanged) {
+                document.markDirty(SceneUpdateKind::TopologyChanged);
+                requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
+                requests.setMeshRenderer = EditorMeshRendererChange{
+                    .entity = entity->id,
+                    .oldRenderer = oldRenderer,
+                    .newRenderer = renderer,
+                    .updateKind = SceneUpdateKind::TopologyChanged,
+                };
+            } else if (visibilityChanged) {
                 document.markDirty(SceneUpdateKind::VisibilityOnly);
                 requests.sceneUpdate = SceneUpdateKind::VisibilityOnly;
                 requests.setMeshRenderer = EditorMeshRendererChange{
@@ -1047,6 +1131,90 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                     .newRenderer = renderer,
                     .updateKind = SceneUpdateKind::VisibilityOnly,
                 };
+            }
+        }
+
+        if (entity->animationPlayer.has_value()) {
+            drawInspectorComponentHeader(EditorGlyphIcon::Timeline, "Animation Player", "Clip playback and decoded track sampling", !entityLocked, "##AnimationPlayerActions", entity->id, EditorComponentKind::AnimationPlayer, SceneUpdateKind::TransformOnly, &requests);
+            const SceneDocument before = document;
+            AnimationPlayer& player = *entity->animationPlayer;
+            bool changed = false;
+
+            static EntityId animationEditId{};
+            static std::array<char, 128> animationGuidBuffer{};
+            static std::array<char, 260> animationPathBuffer{};
+            if (animationEditId != entity->id) {
+                animationEditId = entity->id;
+                copyInspectorBuffer(animationGuidBuffer, player.animationGuid);
+                copyInspectorBuffer(animationPathBuffer, player.animationPath.generic_string());
+            }
+            if (inspectorInputTextRow("Animation GUID", animationGuidBuffer.data(), animationGuidBuffer.size())) {
+                const std::string value = trimInspectorText(animationGuidBuffer.data());
+                if (value != player.animationGuid) {
+                    player.animationGuid = value;
+                    copyInspectorBuffer(animationGuidBuffer, player.animationGuid);
+                    changed = true;
+                }
+            }
+            if (inspectorInputTextRow("Animation Path", animationPathBuffer.data(), animationPathBuffer.size())) {
+                const std::string value = trimInspectorText(animationPathBuffer.data());
+                if (value != player.animationPath.generic_string()) {
+                    player.animationPath = value;
+                    copyInspectorBuffer(animationPathBuffer, player.animationPath.generic_string());
+                    changed = true;
+                }
+            }
+            if (beginInspectorPropertyRow("Preview")) {
+                if (editorIconButton("AnimationPlayerPreviewPlay", EditorGlyphIcon::Play, player.enabled && player.playing)) {
+                    if (!player.enabled || !player.playing) {
+                        player.enabled = true;
+                        player.playing = true;
+                        changed = true;
+                    }
+                }
+                tooltip("Play animation preview");
+                ImGui::SameLine();
+                if (editorIconButton("AnimationPlayerPreviewPause", EditorGlyphIcon::Pause, player.enabled && !player.playing)) {
+                    if (player.playing) {
+                        player.playing = false;
+                        changed = true;
+                    }
+                }
+                tooltip("Pause animation preview");
+                ImGui::SameLine();
+                if (editorIconButton("AnimationPlayerPreviewStop", EditorGlyphIcon::Stop, false)) {
+                    if (player.playing || player.currentTimeSeconds != 0.0) {
+                        player.playing = false;
+                        player.currentTimeSeconds = 0.0;
+                        changed = true;
+                    }
+                }
+                tooltip("Stop animation preview and return to the first key");
+                ImGui::SameLine();
+                if (editorIconButton("AnimationPlayerPreviewResetTime", EditorGlyphIcon::Reset, false)) {
+                    if (player.currentTimeSeconds != 0.0) {
+                        player.currentTimeSeconds = 0.0;
+                        changed = true;
+                    }
+                }
+                tooltip("Reset preview time");
+                endInspectorPropertyRow();
+            }
+            changed |= inspectorCheckboxRow("Enabled", &player.enabled);
+            changed |= inspectorCheckboxRow("Play On Start", &player.playOnStart);
+            changed |= inspectorCheckboxRow("Playing", &player.playing);
+            changed |= inspectorCheckboxRow("Loop", &player.loop);
+            changed |= inspectorCheckboxRow("Apply Root Motion", &player.applyRootMotion);
+            changed |= inspectorCheckboxRow("Apply Morph Weights", &player.applyMorphWeights);
+            changed |= inspectorDragFloatRow("Playback Speed", &player.playbackSpeed, 0.01f, -8.0f, 8.0f, "%.3f");
+            float currentTime = static_cast<float>(player.currentTimeSeconds);
+            if (inspectorDragFloatRow("Current Time", &currentTime, 0.01f, 0.0f, 100000.0f, "%.3f s")) {
+                player.currentTimeSeconds = std::max(0.0f, currentTime);
+                changed = true;
+            }
+            if (changed) {
+                document.markDirty(SceneUpdateKind::TransformOnly);
+                requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::TransformOnly, .label = "Edit Animation Player"};
             }
         }
 
@@ -1195,6 +1363,9 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         }
         if (!entity->meshRenderer.has_value()) {
             drawInspectorAddComponentButton("InspectorAddMeshRenderer", EditorGlyphIcon::Model, "Mesh Renderer", *entity, EditorComponentKind::MeshRenderer, SceneUpdateKind::TopologyChanged, requests, addComponentRowWidth, addComponentRowUsedWidth);
+        }
+        if (!entity->animationPlayer.has_value()) {
+            drawInspectorAddComponentButton("InspectorAddAnimationPlayer", EditorGlyphIcon::Timeline, "Animation Player", *entity, EditorComponentKind::AnimationPlayer, SceneUpdateKind::TransformOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);
         }
         if (!entity->environmentLight.has_value()) {
             drawInspectorAddComponentButton("InspectorAddEnvironmentLight", EditorGlyphIcon::Environment, "Environment Light", *entity, EditorComponentKind::EnvironmentLight, SceneUpdateKind::RendererSettingsOnly, requests, addComponentRowWidth, addComponentRowUsedWidth);

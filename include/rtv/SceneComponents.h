@@ -60,12 +60,27 @@ struct MeshRenderer {
     MeshAssetHandle mesh{};
     AssetGuid meshGuid;
     std::vector<MaterialSlot> materialSlots;
+    std::vector<float> morphWeights;
+    int32_t skinIndex = -1;
     uint32_t activeMaterialVariantIndex = UINT32_MAX;
     std::string activeMaterialVariantName;
     bool visible = true;
     bool castShadow = true;
     bool visibleToCamera = true;
     uint32_t rendererInstanceIndex = UINT32_MAX;
+};
+
+struct AnimationPlayer {
+    AssetGuid animationGuid;
+    std::filesystem::path animationPath;
+    bool enabled = true;
+    bool playOnStart = true;
+    bool playing = true;
+    bool loop = true;
+    bool applyRootMotion = false;
+    bool applyMorphWeights = true;
+    float playbackSpeed = 1.0f;
+    double currentTimeSeconds = 0.0;
 };
 
 enum class LightType : uint32_t {

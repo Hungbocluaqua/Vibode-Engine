@@ -6,6 +6,7 @@
 #include "rtv/RendererSettings.h"
 #include "rtv/AssetImport.h"
 #include "rtv/AssetManager.h"
+#include "rtv/AnimationClip.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorPanels.h"
 #include "rtv/GpuProfiler.h"
@@ -148,6 +149,27 @@ private:
         std::future<StagedAssetImportResult> future;
     };
 
+    struct CookProjectResult {
+        uint64_t serial = 0;
+        std::filesystem::path projectFile;
+        std::filesystem::path outputDir;
+        std::filesystem::path manifestPath;
+        std::filesystem::path validationReportPath;
+        std::filesystem::path logPath;
+        int exitCode = -1;
+        double workerTotalMs = 0.0;
+    };
+
+    struct ActiveCookProjectJob {
+        uint64_t serial = 0;
+        std::filesystem::path projectFile;
+        std::filesystem::path outputDir;
+        std::filesystem::path manifestPath;
+        std::filesystem::path validationReportPath;
+        std::filesystem::path logPath;
+        std::future<CookProjectResult> future;
+    };
+
     void initWindow();
     void initVulkan();
     void mainLoop(uint32_t maxFrames);
@@ -161,6 +183,10 @@ private:
     void queueProjectThumbnailCapture();
     void captureProjectThumbnailIfReady();
     void processRuntimeControls(float deltaSeconds);
+    void updateAnimationPlayers(float deltaSeconds);
+    [[nodiscard]] std::filesystem::path assetResolutionRoot() const;
+    [[nodiscard]] std::optional<std::filesystem::path> resolveAnimationClipPath(const AnimationPlayer& player) const;
+    [[nodiscard]] const AnimationClip* animationClipForPlayer(const AnimationPlayer& player);
     void processSunDragControls(bool shortcutsBlocked, bool viewportHovered, bool viewportInteraction, bool ctrlDown);
     void beginSunDragArm(bool dragEligible);
     void startSunDrag(double mouseX, double mouseY);
@@ -204,10 +230,14 @@ private:
     [[nodiscard]] bool assignEnvironmentAsset(const AssetGuid& environmentGuid, bool allowResourceRebuild);
     [[nodiscard]] bool relinkAssetSource(const EditorAssetRelinkSourceRequest& request);
     [[nodiscard]] bool replaceAssetReferences(const EditorReplaceAssetReferencesRequest& request, bool allowResourceRebuild);
+    [[nodiscard]] bool renameAssetRecord(const EditorRenameAssetRequest& request);
     [[nodiscard]] bool updateAssetTags(const EditorAssetTagsRequest& request);
     [[nodiscard]] bool bulkAddAssetTag(const EditorBulkAssetTagRequest& request);
     [[nodiscard]] bool bulkRemoveAssetTag(const EditorBulkAssetTagRequest& request);
+    [[nodiscard]] bool moveAssetsToFolder(const EditorMoveAssetsToFolderRequest& request);
     [[nodiscard]] bool deleteAssetsFromRegistry(const EditorDeleteAssetRequest& request);
+    [[nodiscard]] bool startCookProject(const EditorCookProjectRequest& request);
+    void pollCookProjectJob();
     [[nodiscard]] bool queueAssetReimport(const AssetGuid& assetGuid);
     void queueMergeScenes(std::vector<std::filesystem::path> paths);
     void startNextPendingMergeScene();
@@ -284,6 +314,8 @@ private:
     bool pendingUndo_ = false;
     bool pendingRedo_ = false;
     AssetManager assets_;
+    std::unordered_map<std::string, AnimationClip> animationClipCache_;
+    std::unordered_set<std::string> failedAnimationClipLoads_;
     CameraController cameraController_;
     SunDragState sunDrag_{};
     std::array<unsigned char, 512> keyState_{};
@@ -324,6 +356,8 @@ private:
     EditorJobCenterState completedSceneLoadJob_{};
     uint64_t nextAssetImportJobSerial_ = 1;
     EditorJobCenterState completedAssetImportJob_{};
+    uint64_t nextCookProjectJobSerial_ = 1;
+    EditorJobCenterState completedCookProjectJob_{};
     UndoStack undoStack_;
     SceneToGpuSceneBuilder sceneBuilder_;
     std::optional<SceneAsset> gpuSceneAsset_;
@@ -344,6 +378,7 @@ private:
     std::deque<std::filesystem::path> pendingMergeScenes_;
     std::deque<AsyncAssetImportJob> pendingAssetImportJobs_;
     std::optional<ActiveAsyncAssetImportJob> activeAssetImportJob_;
+    std::optional<ActiveCookProjectJob> activeCookProjectJob_;
     std::optional<SceneLoadRequest> activeSceneLoadRequest_;
     std::optional<std::filesystem::path> pendingRecoveryAutosavePath_;
     std::optional<std::filesystem::path> pendingRecoveryProjectAutosavePath_;

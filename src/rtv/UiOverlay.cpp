@@ -527,9 +527,11 @@ EditorRequests UiOverlay::buildProjectManager(
     const std::optional<std::filesystem::path>& scenePath,
     bool sceneDirty,
     bool projectSettingsDirty,
+    size_t dirtyMaterialAssetCount,
     const std::string& sceneLoadingStatus,
     bool sceneLoadRunning,
     float sceneLoadProgress,
+    const EditorJobCenterState* jobCenter,
     NotificationManager* notifications) {
     EditorRequests requests;
     if (!frameBegun_) {
@@ -545,6 +547,17 @@ EditorRequests UiOverlay::buildProjectManager(
         .sceneLoadProgress = sceneLoadProgress,
         .sceneDirty = sceneDirty,
         .projectSettingsDirty = projectSettingsDirty,
+        .dirtyMaterialAssetCount = dirtyMaterialAssetCount,
+        .cookProjectRunning = jobCenter != nullptr && jobCenter->cookProjectRunning,
+        .cookProjectOutputDir = jobCenter != nullptr ? jobCenter->cookProjectOutputDir : std::filesystem::path{},
+        .completedCookProjectSerial = jobCenter != nullptr ? jobCenter->completedCookProjectSerial : 0,
+        .completedCookProjectSuccess = jobCenter != nullptr && jobCenter->completedCookProjectSuccess,
+        .completedCookProjectStatus = jobCenter != nullptr ? jobCenter->completedCookProjectStatus : std::string{},
+        .completedCookProjectOutputDir = jobCenter != nullptr ? jobCenter->completedCookProjectOutputDir : std::filesystem::path{},
+        .completedCookProjectManifestPath = jobCenter != nullptr ? jobCenter->completedCookProjectManifestPath : std::filesystem::path{},
+        .completedCookProjectValidationReportPath = jobCenter != nullptr ? jobCenter->completedCookProjectValidationReportPath : std::filesystem::path{},
+        .completedCookProjectLogPath = jobCenter != nullptr ? jobCenter->completedCookProjectLogPath : std::filesystem::path{},
+        .completedCookProjectExitCode = jobCenter != nullptr ? jobCenter->completedCookProjectExitCode : 0,
         .standaloneLauncher = true,
     });
     if (notifications != nullptr) {

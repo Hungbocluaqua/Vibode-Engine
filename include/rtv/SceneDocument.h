@@ -68,6 +68,8 @@ public:
     [[nodiscard]] const std::vector<std::string>& dirtyReasons() const { return dirtyReasons_; }
 
     void importSceneAsset(const SceneAsset& scene);
+    [[nodiscard]] int32_t appendSceneSkins(const std::vector<SceneSkinAsset>& skins);
+    [[nodiscard]] const std::vector<SceneSkinAsset>& sceneSkins() const { return sceneSkins_; }
     [[nodiscard]] SceneAsset toSceneAsset() const;
 
     bool saveJson(const std::filesystem::path& path) const;
@@ -93,6 +95,7 @@ private:
     std::vector<TextureAssetHandle> sceneTextures_;
     std::vector<MaterialAssetHandle> sceneMaterials_;
     std::vector<MeshAssetHandle> sceneMeshes_;
+    std::vector<SceneSkinAsset> sceneSkins_;
 };
 
 } // namespace rtv
