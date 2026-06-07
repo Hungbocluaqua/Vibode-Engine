@@ -11,10 +11,13 @@
 
 #include <imgui.h>
 
+#include <nlohmann/json.hpp>
+
 #include <stb_image.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cstddef>
 #include <cfloat>
@@ -91,6 +94,22 @@ VkExtent2D defaultRenderOutputExtent(const EditorRuntimeState& state) {
 
 constexpr int kMaxRenderTargetSamplesPerPixel = 1048576;
 constexpr int kMaxRenderAccumulationFrames = 65536;
+
+struct RenderOutputPreset {
+    const char* name;
+    int width;
+    int height;
+    float renderScale;
+    int samplesPerPixel;
+    bool limitSamplesPerPixel;
+    int targetSamplesPerPixel;
+};
+
+constexpr RenderOutputPreset kRenderOutputPresets[] = {
+    {"Draft 720p", 1280, 720, 0.50f, 1, true, 16},
+    {"Preview 1080p", 1920, 1080, 0.75f, 1, true, 64},
+    {"Final 4K", 3840, 2160, 1.00f, 1, true, 256},
+};
 
 int ceilDividePositive(int value, int divisor) {
     value = std::max(1, value);
@@ -692,10 +711,103 @@ std::string quoteCommandPath(const std::filesystem::path& path) {
 std::string readCommandOutput(const std::string& command) {
     std::string output;
 #ifdef _WIN32
-    FILE* pipe = _popen(command.c_str(), "r");
+    SECURITY_ATTRIBUTES securityAttributes{};
+    securityAttributes.nLength = sizeof(securityAttributes);
+    securityAttributes.bInheritHandle = TRUE;
+
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &securityAttributes, 0)) {
+        return output;
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    startupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startupInfo.wShowWindow = SW_HIDE;
+    startupInfo.hStdOutput = writePipe;
+    startupInfo.hStdError = writePipe;
+    startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION processInfo{};
+    HANDLE jobHandle = CreateJobObjectA(nullptr, nullptr);
+    if (jobHandle != nullptr) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo{};
+        jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(jobHandle, JobObjectExtendedLimitInformation, &jobInfo, sizeof(jobInfo))) {
+            CloseHandle(jobHandle);
+            jobHandle = nullptr;
+        }
+    }
+    std::string commandLine = "cmd.exe /C " + command;
+    const DWORD creationFlags = CREATE_NO_WINDOW | (jobHandle != nullptr ? CREATE_SUSPENDED : 0u);
+    if (!CreateProcessA(nullptr, commandLine.data(), nullptr, nullptr, TRUE, creationFlags, nullptr, nullptr, &startupInfo, &processInfo)) {
+        if (jobHandle != nullptr) {
+            CloseHandle(jobHandle);
+        }
+        CloseHandle(readPipe);
+        CloseHandle(writePipe);
+        return output;
+    }
+    if (jobHandle != nullptr) {
+        if (!AssignProcessToJobObject(jobHandle, processInfo.hProcess)) {
+            CloseHandle(jobHandle);
+            jobHandle = nullptr;
+        }
+        ResumeThread(processInfo.hThread);
+    }
+    CloseHandle(writePipe);
+
+    constexpr DWORD kProbeTimeoutMs = 1500;
+    constexpr size_t kMaxOutputBytes = 64u * 1024u;
+    const auto started = std::chrono::steady_clock::now();
+    std::array<char, 512> buffer{};
+    bool running = true;
+    while (running) {
+        DWORD available = 0;
+        if (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+            DWORD bytesRead = 0;
+            const DWORD bytesToRead = static_cast<DWORD>(std::min<size_t>(buffer.size() - 1u, available));
+            if (ReadFile(readPipe, buffer.data(), bytesToRead, &bytesRead, nullptr) && bytesRead > 0) {
+                output.append(buffer.data(), bytesRead);
+                if (output.size() >= kMaxOutputBytes) {
+                    output.resize(kMaxOutputBytes);
+                    TerminateProcess(processInfo.hProcess, 1);
+                    break;
+                }
+            }
+        }
+        const DWORD waitResult = WaitForSingleObject(processInfo.hProcess, 10);
+        running = waitResult == WAIT_TIMEOUT;
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+        if (running && elapsedMs > kProbeTimeoutMs) {
+            TerminateProcess(processInfo.hProcess, 1);
+            break;
+        }
+    }
+    while (output.size() < kMaxOutputBytes) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) || available == 0) {
+            break;
+        }
+        DWORD bytesRead = 0;
+        const DWORD bytesToRead = static_cast<DWORD>(std::min<size_t>(buffer.size() - 1u, available));
+        if (!ReadFile(readPipe, buffer.data(), bytesToRead, &bytesRead, nullptr) || bytesRead == 0) {
+            break;
+        }
+        output.append(buffer.data(), std::min<size_t>(bytesRead, kMaxOutputBytes - output.size()));
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    if (jobHandle != nullptr) {
+        CloseHandle(jobHandle);
+    }
+    CloseHandle(readPipe);
+    return output;
 #else
-    FILE* pipe = popen(command.c_str(), "r");
-#endif
+    const std::string boundedCommand = "timeout 2s " + command;
+    FILE* pipe = popen(boundedCommand.c_str(), "r");
     if (pipe == nullptr) {
         return output;
     }
@@ -703,9 +815,6 @@ std::string readCommandOutput(const std::string& command) {
     while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
         output += buffer.data();
     }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
     pclose(pipe);
 #endif
     return output;
@@ -825,6 +934,258 @@ std::filesystem::path projectSourceControlReportPath(
     return project.savedRoot / "Reports" / fileName;
 }
 
+std::filesystem::path projectRuntimeSystemsReadinessReportPath(const ProjectContext& project) {
+    const std::filesystem::path root = project.savedRoot.empty() ? project.projectRoot / "Saved" : project.savedRoot;
+    return root / "Reports" / "project_runtime_systems_readiness.json";
+}
+
+nlohmann::json buildProjectRuntimeSystemsReadinessReport(const ProjectManagerRuntimeState& state) {
+    const ProjectContext* project = state.project;
+    const std::string scenePath = state.scenePath != nullptr && state.scenePath->has_value()
+        ? state.scenePath->value().generic_string()
+        : std::string{};
+    const bool registryAvailable = state.assetRegistry != nullptr && !state.assetRegistry->state().path.empty();
+    const bool registryDirty = state.assetRegistry != nullptr && state.assetRegistry->dirty();
+
+    return {
+        {"schema", "ProjectRuntimeSystemsReadinessV1"},
+        {"project", {
+            {"name", project != nullptr ? project->name : std::string{}},
+            {"projectFile", project != nullptr ? project->projectFile.generic_string() : std::string{}},
+            {"projectRoot", project != nullptr ? project->projectRoot.generic_string() : std::string{}},
+            {"currentScenePath", scenePath},
+            {"startupScene", project != nullptr ? project->startupScene.generic_string() : std::string{}},
+            {"sceneDirty", state.sceneDirty},
+            {"projectSettingsDirty", state.projectSettingsDirty},
+            {"assetRegistryAvailable", registryAvailable},
+            {"assetRegistryDirty", registryDirty},
+            {"dirtyMaterialAssetCount", state.dirtyMaterialAssetCount},
+        }},
+        {"currentEditorRuntimeSupport", {
+            {"componentBackedWorldAndPostSettingsImplemented", true},
+            {"timelineTransformTracksImplemented", true},
+            {"editorRenderJobsImplemented", true},
+            {"projectAutosaveRecoveryImplemented", true},
+            {"commandAndEditorShortcutRoutingImplemented", true},
+            {"assetImportAndPlaceWorkflowImplemented", true},
+        }},
+        {"runtimeGameSystemReadiness", {
+            {"playInEditorImplemented", false},
+            {"simulateModeImplemented", false},
+            {"runtimeEditorStateSeparationImplemented", false},
+            {"gameplayScriptingImplemented", false},
+            {"runtimeInputMappingRebindingImplemented", false},
+            {"saveGameRuntimePersistenceImplemented", false},
+            {"productionRuntimeComponentLifecycleImplemented", false},
+            {"physicsImplemented", false},
+            {"collisionImplemented", false},
+            {"characterControllerImplemented", false},
+            {"terrainImplemented", false},
+            {"foliageImplemented", false},
+            {"runtimeInstancingSystemImplemented", false},
+            {"audioImplemented", false},
+            {"inGameUiImplemented", false},
+            {"vfxImplemented", false},
+            {"navigationImplemented", false},
+            {"aiImplemented", false},
+        }},
+        {"recommendedNextMilestones", nlohmann::json::array({
+            "Define Play-In-Editor world duplication and renderer handoff contract.",
+            "Split editor-only selection/gizmo/camera state from runtime gameplay state.",
+            "Add runtime input action maps before binding gameplay controllers.",
+            "Choose physics/collision backend and serialize component/cook/runtime behavior.",
+            "Add system-specific diagnostics and GUI automation for each runtime system as it lands."
+        })},
+        {"policy", {
+            {"description", "This report is a read-only project-level readiness inventory for runtime game-editor systems."},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"unsupportedActions", nlohmann::json::array({
+                "play-in-editor",
+                "simulate-mode",
+                "gameplay-scripting",
+                "runtime-input-rebinding",
+                "save-game-runtime-persistence",
+                "physics-collision-character-controller",
+                "terrain-foliage-instancing",
+                "audio-in-game-ui-vfx-navigation-ai"
+            })},
+        }},
+    };
+}
+
+bool writeProjectRuntimeSystemsReadinessReport(
+    const ProjectManagerRuntimeState& state,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (state.project == nullptr) {
+        outError = "Project context is unavailable.";
+        return false;
+    }
+    outPath = projectRuntimeSystemsReadinessReportPath(*state.project);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create runtime systems readiness report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write runtime systems readiness report: " + outPath.string();
+        return false;
+    }
+    file << buildProjectRuntimeSystemsReadinessReport(state).dump(2);
+    return true;
+}
+
+std::filesystem::path renderCinematicReadinessReportPath(const EditorRuntimeState& state) {
+    std::filesystem::path root;
+    if (state.project != nullptr) {
+        root = state.project->savedRoot.empty() ? state.project->projectRoot / "Saved" : state.project->savedRoot;
+    } else {
+        root = std::filesystem::current_path() / "out" / "editor_reports";
+    }
+    return root / "Reports" / "render_cinematic_readiness.json";
+}
+
+nlohmann::json buildRenderCinematicReadinessReport(
+    const EditorRuntimeState& state,
+    EditorRenderJobKind requestedKind,
+    const std::string& selectedOutputPresetName) {
+    const RendererSettings settings = state.renderer.settings();
+    const VkExtent2D displayExtent = defaultRenderOutputExtent(state);
+    const VkExtent2D renderExtent = state.renderer.renderExtent();
+    const bool sequenceRequested = requestedKind == EditorRenderJobKind::Sequence;
+
+    nlohmann::json presets = nlohmann::json::array();
+    for (const RenderOutputPreset& preset : kRenderOutputPresets) {
+        presets.push_back({
+            {"name", preset.name},
+            {"width", preset.width},
+            {"height", preset.height},
+            {"renderScale", preset.renderScale},
+            {"samplesPerPixel", preset.samplesPerPixel},
+            {"limitSamplesPerPixel", preset.limitSamplesPerPixel},
+            {"targetSamplesPerPixel", preset.targetSamplesPerPixel},
+        });
+    }
+
+    nlohmann::json timeline = {
+        {"available", state.timeline != nullptr},
+        {"sequenceRequested", sequenceRequested},
+    };
+    if (state.timeline != nullptr) {
+        timeline["startFrame"] = state.timeline->startFrame;
+        timeline["endFrame"] = state.timeline->endFrame;
+        timeline["currentFrame"] = state.timeline->currentFrame;
+        timeline["frameRate"] = state.timeline->frameRate;
+        timeline["transformKeyCount"] = state.timeline->keyframes().size();
+    }
+
+    return {
+        {"schema", "RenderCinematicReadinessV1"},
+        {"project", {
+            {"name", state.project != nullptr ? state.project->name : std::string{}},
+            {"projectFile", state.project != nullptr ? state.project->projectFile.generic_string() : std::string{}},
+            {"savedRoot", state.project != nullptr ? state.project->savedRoot.generic_string() : std::string{}},
+            {"currentScenePath", state.scenePath != nullptr && state.scenePath->has_value() ? state.scenePath->value().generic_string() : std::string{}},
+            {"sceneDirty", state.sceneDirty},
+        }},
+        {"currentRendererState", {
+            {"renderPreset", renderPresetName(settings.renderPreset)},
+            {"pathTracingEnabled", settings.pathTracingEnabled},
+            {"restirGiEnabled", settings.restirGiEnabled},
+            {"denoiserEnabled", settings.denoiserEnabled},
+            {"denoiserBackend", denoiserBackendName(settings.denoiserBackend)},
+            {"taaEnabled", settings.taaEnabled},
+            {"temporalUpscaler", temporalUpscalerName(settings.temporalUpscaler)},
+            {"debugView", rendererDebugViewName(settings.debugView)},
+            {"samplesPerPixel", settings.samplesPerPixel},
+            {"limitSamplesPerPixel", settings.limitSamplesPerPixel},
+            {"accumulationLimit", settings.accumulationLimit},
+            {"renderResolutionScale", settings.renderResolutionScale},
+            {"displayExtent", {{"width", displayExtent.width}, {"height", displayExtent.height}}},
+            {"renderExtent", {{"width", renderExtent.width}, {"height", renderExtent.height}}},
+            {"physicalCameraControlsPresent", settings.usePhysicalCamera},
+            {"depthOfFieldControlsPresent", settings.dofApertureRadius > 0.0f || settings.dofFocusDistance > 0.0f},
+            {"motionBlurControlsPresent", settings.motionBlurEnabled},
+            {"homogeneousVolumeControlsPresent", settings.homogeneousVolumeEnabled},
+        }},
+        {"currentEditorRenderOutputSupport", {
+            {"renderCurrentViewportImplemented", true},
+            {"renderImageImplemented", true},
+            {"renderSequenceImplemented", true},
+            {"renderManifestImplemented", true},
+            {"openOutputFolderImplemented", true},
+            {"stopRenderJobImplemented", true},
+            {"timelineTransformSequenceRenderingImplemented", state.timeline != nullptr},
+            {"draftPreviewFinalOutputPresetsImplemented", true},
+            {"selectedOutputPreset", selectedOutputPresetName},
+            {"availableOutputPresets", presets},
+            {"timeline", timeline},
+        }},
+        {"cinematicExtensionReadiness", {
+            {"dedicatedVolumetricCloudRendererImplemented", false},
+            {"bloomRuntimeImplemented", false},
+            {"vignetteRuntimeImplemented", false},
+            {"filmGrainRuntimeImplemented", false},
+            {"decalsImplemented", false},
+            {"lodSystemImplemented", false},
+            {"visibilityCullingToolsImplemented", false},
+            {"reflectionProbeWorkflowImplemented", false},
+            {"lightProbeWorkflowImplemented", false},
+            {"cameraRailsImplemented", false},
+            {"shotTracksImplemented", false},
+            {"renderQueuePresetLibraryImplemented", false},
+            {"renderQueueBatchPresetsImplemented", false},
+            {"highResolutionTiledOutputImplemented", false},
+        }},
+        {"recommendedNextMilestones", nlohmann::json::array({
+            "Define cinematic camera rail and shot-track scene data before adding UI editors.",
+            "Choose probe asset formats and bake/runtime update policy before adding probe placement tools.",
+            "Add high-resolution/tiled output as a render job type with manifest coverage and image stitching validation.",
+            "Implement unsupported post effects as renderer features before exposing production controls.",
+            "Add GUI automation for render queue setup, sequence output, and cinematic report generation."
+        })},
+        {"policy", {
+            {"description", "This report is a read-only render/cinematic readiness inventory."},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"unsupportedActions", nlohmann::json::array({
+                "dedicated-volumetric-cloud-renderer",
+                "bloom-vignette-film-grain-runtime-post-effects",
+                "decals-lod-visibility-culling-tools",
+                "reflection-light-probe-workflows",
+                "camera-rails-shot-tracks",
+                "render-queue-batch-presets",
+                "high-resolution-tiled-output"
+            })},
+        }},
+    };
+}
+
+bool writeRenderCinematicReadinessReport(
+    const EditorRuntimeState& state,
+    EditorRenderJobKind requestedKind,
+    const std::string& selectedOutputPresetName,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = renderCinematicReadinessReportPath(state);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create render/cinematic readiness report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write render/cinematic readiness report: " + outPath.string();
+        return false;
+    }
+    file << buildRenderCinematicReadinessReport(state, requestedKind, selectedOutputPresetName).dump(2);
+    return true;
+}
+
 bool sourceControlDiffReportAvailable(const std::string& status) {
     return status == "Modified" || status == "Added" || status == "Deleted" || status == "Renamed" || status == "Copied" ||
         status == "Conflict" || status == "Changed" || status == "Untracked";
@@ -832,6 +1193,20 @@ bool sourceControlDiffReportAvailable(const std::string& status) {
 
 bool sourceControlStatusReportAvailable(const std::string& status) {
     return status != "Unavailable" && status != "Not in Git" && status != "External";
+}
+
+std::string currentSourceControlUserName() {
+#if defined(_WIN32)
+    std::array<char, 256> buffer{};
+    DWORD size = static_cast<DWORD>(buffer.size());
+    if (GetUserNameA(buffer.data(), &size) != 0 && size > 0) {
+        return std::string(buffer.data());
+    }
+    return {};
+#else
+    const char* user = std::getenv("USER");
+    return user != nullptr ? std::string(user) : std::string{};
+#endif
 }
 
 bool writeProjectSourceControlStatusReport(
@@ -954,6 +1329,219 @@ bool writeProjectSourceControlDiffReport(
     return true;
 }
 
+bool writeProjectSourceControlActionPlanReport(
+    const ProjectContext& project,
+    const char* label,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    const std::string& action,
+    const std::string& status,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        outError = "Path is not inside a Git repository.";
+        return false;
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        outError = "Path is outside the resolved Git repository.";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path canonicalPath = canonicalForCompare(path);
+    const std::filesystem::path relative = std::filesystem::relative(canonicalPath, *gitRoot, ec);
+    if (ec) {
+        outError = "Could not resolve repository-relative path: " + ec.message();
+        return false;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string rootArg = quoteCommandPath(*gitRoot);
+    const std::string pathArg = quoteCommandPath(relative);
+    const std::string focusedStatus = readCommandOutput("git -C " + rootArg + " status --short --ignored -- " + pathArg + stderrRedirect);
+    const std::string branchStatus = readCommandOutput("git -C " + rootArg + " status --short --branch" + stderrRedirect);
+
+    nlohmann::json plannedCommands = nlohmann::json::array();
+    nlohmann::json blockers = nlohmann::json::array();
+    nlohmann::json warnings = nlohmann::json::array();
+    std::string normalizedAction = action;
+    std::transform(normalizedAction.begin(), normalizedAction.end(), normalizedAction.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (normalizedAction == "revert") {
+        plannedCommands.push_back({{"description", "Restore tracked project file contents from HEAD."}, {"command", "git -C " + rootArg + " checkout -- " + pathArg}});
+        plannedCommands.push_back({{"description", "If the project path is untracked, remove it after separate user confirmation."}, {"command", "git -C " + rootArg + " clean -f -- " + pathArg}, {"requiresUntrackedPath", true}});
+        warnings.push_back("Revert is destructive. This Project Manager action writes a dry-run plan only and does not execute checkout or clean.");
+    } else if (normalizedAction == "checkout") {
+        plannedCommands.push_back({{"description", "Restore the selected tracked project path from HEAD."}, {"command", "git -C " + rootArg + " checkout -- " + pathArg}});
+        warnings.push_back("Checkout mutation is not executed by the Project Manager in this slice; review the plan before running commands externally.");
+    } else if (normalizedAction == "lock") {
+        blockers.push_back("Git has no native asset lock provider in this Project Manager integration.");
+        plannedCommands.push_back({{"description", "Future Perforce provider lock/edit command placeholder."}, {"command", "p4 edit " + pathArg}, {"provider", "perforce"}, {"available", false}});
+    } else if (normalizedAction == "submit") {
+        plannedCommands.push_back({{"description", "Stage the selected project path."}, {"command", "git -C " + rootArg + " add -- " + pathArg}});
+        plannedCommands.push_back({{"description", "Commit staged project changes after user review."}, {"command", "git -C " + rootArg + " commit"}});
+        plannedCommands.push_back({{"description", "Optional push after commit and policy review."}, {"command", "git -C " + rootArg + " push"}, {"optional", true}});
+        warnings.push_back("Submit is represented as a Git stage/commit/push plan only. The Project Manager does not execute provider mutations in this slice.");
+    } else {
+        blockers.push_back("Unsupported source-control action plan type: " + action);
+    }
+
+    outPath = projectSourceControlReportPath(project, label, path, ("_action_plan_" + normalizedAction + ".json").c_str());
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create project source-control action plan folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write project source-control action plan: " + outPath.string();
+        return false;
+    }
+
+    const nlohmann::json report = {
+        {"schema", "ProjectManagerSourceControlActionPlanV1"},
+        {"provider", "git"},
+        {"label", label},
+        {"action", normalizedAction},
+        {"dryRun", true},
+        {"mutationExecuted", false},
+        {"repositoryRoot", gitRoot->generic_string()},
+        {"path", canonicalPath.generic_string()},
+        {"repositoryRelativePath", relative.generic_string()},
+        {"statusLabel", status},
+        {"focusedStatus", trimWhitespace(focusedStatus).empty() ? std::string("Clean") : focusedStatus},
+        {"repositoryBranchStatus", trimWhitespace(branchStatus).empty() ? std::string("Clean") : branchStatus},
+        {"plannedCommands", plannedCommands},
+        {"blockers", blockers},
+        {"warnings", warnings},
+        {"policy", {
+            {"description", "This report is a dry-run Project Manager source-control action plan. It records intended commands and provider gaps without mutating the repository."},
+            {"requiresUserConfirmationOutsideEditor", true},
+            {"performedActions", nlohmann::json::array()},
+            {"unsupportedActions", nlohmann::json::array({"editor-executed-revert", "editor-executed-checkout", "provider-lock", "provider-submit", "perforce-provider-actions"})}
+        }},
+    };
+    file << report.dump(2);
+    return true;
+}
+
+bool writeProjectSourceControlProviderReadinessReport(
+    const ProjectContext& project,
+    const char* label,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    const std::string& status,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        outError = "Path is not inside a Git repository.";
+        return false;
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        outError = "Path is outside the resolved Git repository.";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path canonicalPath = canonicalForCompare(path);
+    const std::filesystem::path relative = std::filesystem::relative(canonicalPath, *gitRoot, ec);
+    if (ec) {
+        outError = "Could not resolve repository-relative path: " + ec.message();
+        return false;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string rootArg = quoteCommandPath(*gitRoot);
+    const std::string pathArg = quoteCommandPath(relative);
+    const std::string focusedStatus = readCommandOutput("git -C " + rootArg + " status --short --ignored -- " + pathArg + stderrRedirect);
+    const std::string branchStatus = readCommandOutput("git -C " + rootArg + " status --short --branch" + stderrRedirect);
+    const std::string gitLfsLocks = readCommandOutput("git -C " + rootArg + " lfs locks --path " + pathArg + stderrRedirect);
+    const std::string p4Info = readCommandOutput("p4 info" + std::string(stderrRedirect));
+    const std::string p4Opened = readCommandOutput("p4 opened " + pathArg + std::string(stderrRedirect));
+    const bool p4Detected = !trimWhitespace(p4Info).empty();
+    const bool lfsLockInfoAvailable = !trimWhitespace(gitLfsLocks).empty();
+
+    outPath = projectSourceControlReportPath(project, label, path, "_provider_readiness.json");
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create project source-control provider readiness folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write project source-control provider readiness report: " + outPath.string();
+        return false;
+    }
+
+    const nlohmann::json report = {
+        {"schema", "ProjectManagerSourceControlProviderReadinessV1"},
+        {"provider", "git"},
+        {"label", label},
+        {"repositoryRoot", gitRoot->generic_string()},
+        {"path", canonicalPath.generic_string()},
+        {"repositoryRelativePath", relative.generic_string()},
+        {"statusLabel", status},
+        {"focusedStatus", trimWhitespace(focusedStatus).empty() ? std::string("Clean") : focusedStatus},
+        {"repositoryBranchStatus", trimWhitespace(branchStatus).empty() ? std::string("Clean") : branchStatus},
+        {"currentUser", currentSourceControlUserName()},
+        {"gitProvider", {
+            {"available", true},
+            {"supportsDiffStatus", true},
+            {"supportsEditorMutations", false},
+            {"supportsNativeLocks", false},
+            {"lfsLockQueryAttempted", true},
+            {"lfsLockInfoAvailable", lfsLockInfoAvailable},
+            {"lfsLocksRaw", trimWhitespace(gitLfsLocks)},
+        }},
+        {"perforceProvider", {
+            {"detected", p4Detected},
+            {"providerImplemented", false},
+            {"supportsCheckoutLockSubmitWhenImplemented", true},
+            {"infoRaw", trimWhitespace(p4Info)},
+            {"openedRaw", trimWhitespace(p4Opened)},
+            {"plannedCommands", nlohmann::json::array({
+                nlohmann::json{{"action", "checkout"}, {"command", "p4 edit " + pathArg}, {"available", false}},
+                nlohmann::json{{"action", "lock"}, {"command", "p4 lock " + pathArg}, {"available", false}},
+                nlohmann::json{{"action", "submit"}, {"command", "p4 submit " + pathArg}, {"available", false}},
+                nlohmann::json{{"action", "revert"}, {"command", "p4 revert " + pathArg}, {"available", false}}
+            })},
+        }},
+        {"lockOwnership", {
+            {"assetLockProviderImplemented", false},
+            {"ownershipStateKnown", p4Detected || lfsLockInfoAvailable},
+            {"currentOwner", "unknown"},
+            {"currentLockState", (p4Detected || lfsLockInfoAvailable) ? "provider-output-needs-parser" : "unknown-no-provider-lock-state"},
+            {"conflictHandlingImplemented", false},
+            {"safeExternalReloadPromptImplemented", false},
+        }},
+        {"policy", {
+            {"description", "This report inspects Project Manager source-control provider readiness without mutating the repository."},
+            {"dryRun", true},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"supportedNow", nlohmann::json::array({"git-status", "git-diff", "git-action-plan", "provider-readiness-report"})},
+            {"unsupportedActions", nlohmann::json::array({"editor-executed-revert", "editor-executed-checkout", "provider-lock", "provider-submit", "perforce-provider-mutations", "asset-lock-ownership-enforcement", "provider-conflict-resolution", "automatic-external-change-reload-prompt"})},
+        }},
+    };
+    file << report.dump(2);
+    return true;
+}
+
 void drawProjectSaveStateRow(const char* label, bool dirty) {
     ImGui::TextDisabled("%s", label);
     ImGui::SameLine(150.0f);
@@ -1025,6 +1613,50 @@ void drawProjectSourceControlRow(
     if (!canDiff) {
         ImGui::EndDisabled();
     }
+    ImGui::SameLine();
+    if (!canStatus) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::SmallButton((std::string("Plan") + idSuffix).c_str())) {
+        ImGui::OpenPopup((std::string("ProjectSourceControlPlanPopup") + idSuffix).c_str());
+    }
+    if (!canStatus) {
+        ImGui::EndDisabled();
+    }
+    if (ImGui::BeginPopup((std::string("ProjectSourceControlPlanPopup") + idSuffix).c_str())) {
+        auto planItem = [&](const char* menuLabel, const char* action) {
+            if (ImGui::MenuItem(menuLabel)) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeProjectSourceControlActionPlanReport(project, label, workspaceRoot, path, action, it->second, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                } else {
+                    std::cerr << "Project source-control " << action << " action plan failed: " << error << '\n';
+                }
+            }
+        };
+        planItem("Plan Revert", "revert");
+        planItem("Plan Checkout", "checkout");
+        planItem("Plan Lock", "lock");
+        planItem("Plan Submit", "submit");
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+    if (!canStatus) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::SmallButton((std::string("Provider") + idSuffix).c_str())) {
+        std::filesystem::path reportPath;
+        std::string error;
+        if (writeProjectSourceControlProviderReadinessReport(project, label, workspaceRoot, path, it->second, reportPath, error)) {
+            requests.openFilePath = reportPath;
+        } else {
+            std::cerr << "Project source-control provider readiness report failed: " << error << '\n';
+        }
+    }
+    if (!canStatus) {
+        ImGui::EndDisabled();
+    }
 }
 
 void drawProjectSaveState(const ProjectManagerRuntimeState& state, std::unordered_map<std::string, std::string>& sourceControlCache, EditorRequests& requests) {
@@ -1045,6 +1677,20 @@ void drawProjectSaveState(const ProjectManagerRuntimeState& state, std::unordere
         ImGui::TextDisabled("Registry: not loaded");
     }
     if (state.project != nullptr) {
+        ImGui::SeparatorText("Runtime Systems");
+        if (ImGui::SmallButton("Runtime Systems Readiness")) {
+            std::filesystem::path reportPath;
+            std::string error;
+            if (writeProjectRuntimeSystemsReadinessReport(state, reportPath, error)) {
+                requests.openFilePath = reportPath;
+            } else {
+                std::cerr << "Project runtime systems readiness report failed: " << error << '\n';
+            }
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Write and open Play-In-Editor, scripting, physics, input, audio, UI, VFX, navigation, and AI readiness without changing the project");
+        }
+
         const std::filesystem::path workspaceRoot = state.project->projectRoot;
         const std::filesystem::path levelPath = state.scenePath != nullptr && state.scenePath->has_value()
             ? **state.scenePath
@@ -1768,6 +2414,7 @@ void EditorLayer::openRenderSettingsDialog(EditorRenderJobKind kind, const Edito
         : renderImageAccumulationFrames_;
     renderTargetSamplesPerPixel_ = std::clamp(defaultFrames * effectiveSpp, 1, kMaxRenderTargetSamplesPerPixel);
     renderSaveSequenceFramesAsDefault_ = false;
+    renderOutputPresetName_ = "Current View";
     copyTextToBuffer(renderOutputRoot_, defaultRenderOutputRoot(state).string());
 
     renderSettingsDialogOpen_ = true;
@@ -1803,6 +2450,36 @@ void EditorLayer::drawRenderSettingsDialog(EditorRuntimeState& state, EditorRequ
         }
 
         ImGui::SeparatorText("Output");
+        ImGui::SeparatorText("Render Presets");
+        for (const RenderOutputPreset& preset : kRenderOutputPresets) {
+            if (editorIconTextButton((std::string("RenderPreset") + preset.name).c_str(), EditorGlyphIcon::Render, preset.name)) {
+                renderOutputPresetName_ = preset.name;
+                renderRequestedWidth_ = preset.width;
+                renderRequestedHeight_ = preset.height;
+                renderResolutionScale_ = preset.renderScale;
+                renderSamplesPerPixel_ = preset.samplesPerPixel;
+                renderLimitSamplesPerPixel_ = preset.limitSamplesPerPixel;
+                renderTargetSamplesPerPixel_ = preset.targetSamplesPerPixel;
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s: %dx%d, %.2f scale, target %d SPP", preset.name, preset.width, preset.height, preset.renderScale, preset.targetSamplesPerPixel);
+            }
+            ImGui::SameLine();
+        }
+        ImGui::TextDisabled("Preset: %s", renderOutputPresetName_.c_str());
+        if (editorIconTextButton("RenderCinematicReadinessButton", EditorGlyphIcon::Stats, "Cinematic Readiness")) {
+            std::filesystem::path reportPath;
+            std::string error;
+            if (writeRenderCinematicReadinessReport(state, pendingRenderKind_, renderOutputPresetName_, reportPath, error)) {
+                requests.openFilePath = reportPath;
+            } else {
+                std::cerr << "Render/cinematic readiness report failed: " << error << '\n';
+            }
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Write and open a read-only report for render output, cinematic, probe, post-effect, and tiled-output readiness");
+        }
+
         ImGui::SetNextItemWidth(120.0f);
         ImGui::DragInt("Width", &renderRequestedWidth_, 16.0f, 1, 16384);
         ImGui::SameLine();
@@ -1870,6 +2547,7 @@ void EditorLayer::drawRenderSettingsDialog(EditorRuntimeState& state, EditorRequ
             EditorRenderRequest request{};
             request.kind = pendingRenderKind_;
             request.outputRoot = std::filesystem::path(renderOutputRoot_.data());
+            request.outputPresetName = renderOutputPresetName_;
             request.requestedWidth = static_cast<uint32_t>(renderRequestedWidth_);
             request.requestedHeight = static_cast<uint32_t>(renderRequestedHeight_);
             request.renderResolutionScale = std::clamp(renderResolutionScale_, 0.25f, 1.0f);
@@ -3582,6 +4260,7 @@ void EditorLayer::updateJobCenterHistory(const EditorRuntimeState& state) {
             entry->title = title;
             entry->kind = "Asset Import";
             entry->status = status;
+            entry->sourcePath = jobs->assetImportSourcePath;
             entry->progress = std::clamp(jobs->assetImportProgress, 0.0f, 1.0f);
             entry->active = true;
             entry->completed = false;
@@ -3595,6 +4274,12 @@ void EditorLayer::updateJobCenterHistory(const EditorRuntimeState& state) {
             entry->assetImportRetry.mode = jobs->assetImportMode;
             entry->assetImportRetry.settings = jobs->assetImportSettings;
             entry->assetReimportGuid = jobs->assetReimportGuid;
+            entry->workerTotalMs = jobs->assetImportWorkerElapsedMs;
+            entry->importStageElapsedMs = jobs->assetImportStageElapsedMs;
+            entry->importValidateMs = 0.0;
+            entry->importDirectoryMs = 0.0;
+            entry->importInspectMs = 0.0;
+            entry->importWriteMs = 0.0;
         }
         observedAssetImportRunningForHistory_ = true;
         lastAssetImportHistoryTitle_ = title;
@@ -3684,6 +4369,9 @@ void EditorLayer::updateJobCenterHistory(const EditorRuntimeState& state) {
             entry->reportPath = jobs->cookProjectValidationReportPath;
             entry->logPath = jobs->cookProjectLogPath;
             entry->progress = std::clamp(jobs->cookProjectProgress, 0.0f, 1.0f);
+            entry->cookManifestStatus = jobs->cookProjectManifestStatus;
+            entry->cookPlannedFileCount = jobs->cookProjectPlannedFileCount;
+            entry->cookCopiedFileCount = jobs->cookProjectCopiedFileCount;
             entry->active = true;
             entry->completed = false;
             entry->failed = false;
@@ -3834,7 +4522,20 @@ void EditorLayer::drawJobHistoryEntry(size_t index, EditorRequests& requests) {
     if (!entry.logPath.empty()) {
         ImGui::TextWrapped("Log: %s", entry.logPath.string().c_str());
     }
-    if (entry.kind == "Asset Import" &&
+    if (entry.kind == "Project Cook" && entry.active && entry.cookPlannedFileCount > 0u) {
+        const std::string status = entry.cookManifestStatus.empty() ? std::string("copying") : entry.cookManifestStatus;
+        ImGui::TextDisabled(
+            "Cook manifest: %s, %llu/%llu files copied",
+            status.c_str(),
+            static_cast<unsigned long long>(entry.cookCopiedFileCount),
+            static_cast<unsigned long long>(entry.cookPlannedFileCount));
+    }
+    if (entry.kind == "Asset Import" && entry.active && (entry.workerTotalMs > 0.0 || entry.importStageElapsedMs > 0.0)) {
+        ImGui::TextDisabled(
+            "Worker: %.1f ms elapsed, %.1f ms in current stage",
+            entry.workerTotalMs,
+            entry.importStageElapsedMs);
+    } else if (entry.kind == "Asset Import" &&
         (entry.workerTotalMs > 0.0 || entry.importValidateMs > 0.0 || entry.importDirectoryMs > 0.0 || entry.importInspectMs > 0.0 || entry.importWriteMs > 0.0)) {
         ImGui::TextDisabled(
             "Worker: %.1f ms total, %.1f ms validate, %.1f ms dirs, %.1f ms inspect, %.1f ms write",

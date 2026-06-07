@@ -4,6 +4,7 @@
 #include "rtv/AssetImport.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorCommands.h"
+#include "rtv/EditorLog.h"
 #include "rtv/EditorPreferences.h"
 #include "rtv/EditorTransformUtils.h"
 #include "rtv/EditorUiStyle.h"
@@ -19,11 +20,14 @@
 #include <imgui.h>
 #include <ImGuizmo.h>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -93,6 +97,109 @@ std::filesystem::path resolvedAssetRecordPath(const EditorRuntimeState& state, c
         return state.assetRegistry->state().path.parent_path() / path;
     }
     return path;
+}
+
+std::filesystem::path viewportAdvancedToolsReadinessReportPath(const EditorRuntimeState& state) {
+    if (state.project != nullptr && !state.project->savedRoot.empty()) {
+        return state.project->savedRoot / "Reports" / "viewport_advanced_tools_readiness.json";
+    }
+    if (state.scenePath != nullptr && state.scenePath->has_value() && !state.scenePath->value().empty()) {
+        return state.scenePath->value().parent_path() / "Saved" / "Reports" / "viewport_advanced_tools_readiness.json";
+    }
+    return std::filesystem::current_path() / "Saved" / "Reports" / "viewport_advanced_tools_readiness.json";
+}
+
+nlohmann::json buildViewportAdvancedToolsReadinessReport(
+    const EditorRuntimeState& state,
+    bool snapEnabled,
+    float translationSnap,
+    float rotationSnap,
+    float scaleSnap,
+    bool localGizmoMode,
+    bool showGrid) {
+    const std::string projectName = state.project != nullptr ? state.project->name : std::string{};
+    const std::string scenePath = state.scenePath != nullptr && state.scenePath->has_value()
+        ? state.scenePath->value().generic_string()
+        : std::string{};
+
+    return {
+        {"schema", "ViewportAdvancedToolsReadinessV1"},
+        {"project", {
+            {"name", projectName},
+            {"scenePath", scenePath},
+            {"sceneDirty", state.sceneDirty},
+            {"projectSettingsDirty", state.projectSettingsDirty},
+        }},
+        {"currentViewportState", {
+            {"showGrid", showGrid},
+            {"localGizmoMode", localGizmoMode},
+            {"snapEnabled", snapEnabled},
+            {"translationSnap", translationSnap},
+            {"rotationSnapDegrees", rotationSnap},
+            {"scaleSnap", scaleSnap},
+        }},
+        {"currentSupport", {
+            {"singleSelectionImplemented", true},
+            {"gizmoMoveRotateScaleImplemented", true},
+            {"localWorldTransformFrameImplemented", true},
+            {"translationRotationScaleSnapImplemented", true},
+            {"raycastGridPlacementImplemented", true},
+            {"surfaceAlignDropPreviewImplemented", true},
+            {"duplicateNextPlacementBrushImplemented", true},
+            {"multiPlaceBrushImplemented", true},
+        }},
+        {"advancedWorkflowReadiness", {
+            {"multiSelectGroupTransformImplemented", false},
+            {"customPivotOriginImplemented", false},
+            {"surfaceSnappingWorkflowImplemented", false},
+            {"alignDistributeImplemented", false},
+            {"scatterPlacementPaletteImplemented", false},
+            {"levelInstancesSublevelsImplemented", false},
+        }},
+        {"notes", {
+            {"surfaceAlignScope", "Current surface alignment is limited to viewport drop/placement preview and placement transforms; it is not a full persistent surface-snapping workflow."},
+            {"brushScope", "Duplicate-next and multi-place brushes exist for prefab/Mesh placement, but scatter palettes and broader placement workflows remain future work."},
+        }},
+        {"policy", {
+            {"description", "This report is a read-only readiness inventory for advanced viewport/editor tooling."},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"unsupportedActions", nlohmann::json::array({
+                "multi-select-group-transform",
+                "custom-pivot-origin",
+                "full-surface-snapping-workflow",
+                "align-distribute-tools",
+                "scatter-placement-palette",
+                "level-instances-sublevels"
+            })},
+        }},
+    };
+}
+
+bool writeViewportAdvancedToolsReadinessReport(
+    const EditorRuntimeState& state,
+    bool snapEnabled,
+    float translationSnap,
+    float rotationSnap,
+    float scaleSnap,
+    bool localGizmoMode,
+    bool showGrid,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = viewportAdvancedToolsReadinessReportPath(state);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create viewport advanced tools readiness report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write viewport advanced tools readiness report: " + outPath.string();
+        return false;
+    }
+    file << buildViewportAdvancedToolsReadinessReport(state, snapEnabled, translationSnap, rotationSnap, scaleSnap, localGizmoMode, showGrid).dump(2);
+    return true;
 }
 
 struct ViewportDropPreview {
@@ -2152,6 +2259,28 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 if (savePrefs) {
                     state.editorPrefs->save(state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath);
                 }
+            }
+            ImGui::SeparatorText("Advanced Tools");
+            if (editorIconTextButton("ViewportAdvancedToolsReadinessReport", EditorGlyphIcon::Details, "Advanced Tools Readiness")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeViewportAdvancedToolsReadinessReport(
+                        state,
+                        snap_.enabled,
+                        snap_.translation,
+                        snap_.rotation,
+                        snap_.scale,
+                        localGizmoMode_,
+                        showGrid_,
+                        reportPath,
+                        error)) {
+                    requests.openFilePath = reportPath;
+                } else if (state.log != nullptr) {
+                    state.log->add(EditorLogCategory::Warning, error);
+                }
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("Write and open advanced viewport tool readiness without changing the scene");
             }
             if (state.camera != nullptr) {
                 ImGui::SeparatorText("Navigation");

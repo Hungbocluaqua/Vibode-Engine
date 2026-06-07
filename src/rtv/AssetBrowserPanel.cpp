@@ -27,12 +27,14 @@
 
 #include <filesystem>
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <fstream>
 #include <iomanip>
@@ -92,10 +94,103 @@ std::string quoteCommandPath(const std::filesystem::path& path) {
 std::string readCommandOutput(const std::string& command) {
     std::string output;
 #ifdef _WIN32
-    FILE* pipe = _popen(command.c_str(), "r");
+    SECURITY_ATTRIBUTES securityAttributes{};
+    securityAttributes.nLength = sizeof(securityAttributes);
+    securityAttributes.bInheritHandle = TRUE;
+
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &securityAttributes, 0)) {
+        return output;
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    startupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startupInfo.wShowWindow = SW_HIDE;
+    startupInfo.hStdOutput = writePipe;
+    startupInfo.hStdError = writePipe;
+    startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION processInfo{};
+    HANDLE jobHandle = CreateJobObjectA(nullptr, nullptr);
+    if (jobHandle != nullptr) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo{};
+        jobInfo.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(jobHandle, JobObjectExtendedLimitInformation, &jobInfo, sizeof(jobInfo))) {
+            CloseHandle(jobHandle);
+            jobHandle = nullptr;
+        }
+    }
+    std::string commandLine = "cmd.exe /C " + command;
+    const DWORD creationFlags = CREATE_NO_WINDOW | (jobHandle != nullptr ? CREATE_SUSPENDED : 0u);
+    if (!CreateProcessA(nullptr, commandLine.data(), nullptr, nullptr, TRUE, creationFlags, nullptr, nullptr, &startupInfo, &processInfo)) {
+        if (jobHandle != nullptr) {
+            CloseHandle(jobHandle);
+        }
+        CloseHandle(readPipe);
+        CloseHandle(writePipe);
+        return output;
+    }
+    if (jobHandle != nullptr) {
+        if (!AssignProcessToJobObject(jobHandle, processInfo.hProcess)) {
+            CloseHandle(jobHandle);
+            jobHandle = nullptr;
+        }
+        ResumeThread(processInfo.hThread);
+    }
+    CloseHandle(writePipe);
+
+    constexpr DWORD kProbeTimeoutMs = 1500;
+    constexpr size_t kMaxOutputBytes = 64u * 1024u;
+    const auto started = std::chrono::steady_clock::now();
+    std::array<char, 512> buffer{};
+    bool running = true;
+    while (running) {
+        DWORD available = 0;
+        if (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0) {
+            DWORD bytesRead = 0;
+            const DWORD bytesToRead = static_cast<DWORD>(std::min<size_t>(buffer.size() - 1u, available));
+            if (ReadFile(readPipe, buffer.data(), bytesToRead, &bytesRead, nullptr) && bytesRead > 0) {
+                output.append(buffer.data(), bytesRead);
+                if (output.size() >= kMaxOutputBytes) {
+                    output.resize(kMaxOutputBytes);
+                    TerminateProcess(processInfo.hProcess, 1);
+                    break;
+                }
+            }
+        }
+        const DWORD waitResult = WaitForSingleObject(processInfo.hProcess, 10);
+        running = waitResult == WAIT_TIMEOUT;
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+        if (running && elapsedMs > kProbeTimeoutMs) {
+            TerminateProcess(processInfo.hProcess, 1);
+            break;
+        }
+    }
+    while (output.size() < kMaxOutputBytes) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) || available == 0) {
+            break;
+        }
+        DWORD bytesRead = 0;
+        const DWORD bytesToRead = static_cast<DWORD>(std::min<size_t>(buffer.size() - 1u, available));
+        if (!ReadFile(readPipe, buffer.data(), bytesToRead, &bytesRead, nullptr) || bytesRead == 0) {
+            break;
+        }
+        output.append(buffer.data(), std::min<size_t>(bytesRead, kMaxOutputBytes - output.size()));
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    if (jobHandle != nullptr) {
+        CloseHandle(jobHandle);
+    }
+    CloseHandle(readPipe);
+    return output;
 #else
-    FILE* pipe = popen(command.c_str(), "r");
-#endif
+    const std::string boundedCommand = "timeout 2s " + command;
+    FILE* pipe = popen(boundedCommand.c_str(), "r");
     if (pipe == nullptr) {
         return output;
     }
@@ -103,12 +198,23 @@ std::string readCommandOutput(const std::string& command) {
     while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
         output += buffer.data();
     }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
     pclose(pipe);
 #endif
     return output;
+}
+
+std::string currentSourceControlUserName() {
+#ifdef _WIN32
+    std::array<char, 256> buffer{};
+    DWORD size = static_cast<DWORD>(buffer.size());
+    if (GetUserNameA(buffer.data(), &size) != 0 && size > 0) {
+        return std::string(buffer.data());
+    }
+    return {};
+#else
+    const char* user = std::getenv("USER");
+    return user != nullptr ? std::string(user) : std::string{};
+#endif
 }
 
 struct GitStatusSnapshot {
@@ -999,10 +1105,32 @@ std::filesystem::path assetDependencyGraphReportPath(const EditorRuntimeState& s
     return path;
 }
 
+std::filesystem::path assetDependencyGraphDotPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
+    std::filesystem::path path = assetDependencyGraphReportPath(state, browserRoot);
+    path.replace_extension(".dot");
+    return path;
+}
+
+std::filesystem::path assetDependencyGraphHtmlPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
+    std::filesystem::path path = assetDependencyGraphReportPath(state, browserRoot);
+    path.replace_extension(".html");
+    return path;
+}
+
 std::filesystem::path assetProjectReferenceIndexReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
     std::filesystem::path path = assetValidationReportPath(state, browserRoot);
     path.replace_filename("asset_project_reference_index.json");
     return path;
+}
+
+std::filesystem::path assetProjectReferenceIndexPersistentPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
+    if (state.project != nullptr && !state.project->savedRoot.empty()) {
+        return state.project->savedRoot / "AssetReferenceIndex.json";
+    }
+    if (state.assetRegistry != nullptr && !state.assetRegistry->state().path.empty()) {
+        return state.assetRegistry->state().path.parent_path() / "Saved" / "AssetReferenceIndex.json";
+    }
+    return browserRoot / "Saved" / "AssetReferenceIndex.json";
 }
 
 std::filesystem::path assetDuplicateReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
@@ -1035,9 +1163,27 @@ std::filesystem::path selectedAssetPackageInspectionReportPath(const EditorRunti
     return path;
 }
 
+std::filesystem::path selectedAssetThumbnailReadinessReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_thumbnail_readiness_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedAssetImporterReadinessReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_importer_readiness_" + safeReportName(guid) + ".json");
+    return path;
+}
+
 std::filesystem::path selectedAssetOverwriteRiskReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
     std::filesystem::path path = assetValidationReportPath(state, browserRoot);
     path.replace_filename("asset_overwrite_risk_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedAssetExternalReloadReadinessReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    path.replace_filename("asset_external_reload_readiness_" + safeReportName(guid) + ".json");
     return path;
 }
 
@@ -1045,6 +1191,15 @@ struct AssetOverwriteRisk {
     std::string label;
     std::filesystem::path path;
     std::string status;
+};
+
+struct AssetSourceControlSummary {
+    std::string label;
+    std::string primaryStatus;
+    std::string tooltip;
+    bool hasSourceChange = false;
+    bool hasGeneratedOverwriteRisk = false;
+    std::vector<AssetOverwriteRisk> generatedRisks;
 };
 
 std::filesystem::path sourceControlDiffReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const std::filesystem::path& path) {
@@ -1060,6 +1215,22 @@ std::filesystem::path sourceControlStatusReportPath(const EditorRuntimeState& st
     const std::string name = path.filename().empty() ? std::string("path") : path.filename().string();
     const std::string key = canonicalForCompare(path).string();
     reportPath.replace_filename("source_control_status_" + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
+    return reportPath;
+}
+
+std::filesystem::path sourceControlActionPlanReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const std::filesystem::path& path, const std::string& action) {
+    std::filesystem::path reportPath = assetValidationReportPath(state, browserRoot);
+    const std::string name = path.filename().empty() ? std::string("path") : path.filename().string();
+    const std::string key = canonicalForCompare(path).string() + ":" + action;
+    reportPath.replace_filename("source_control_action_plan_" + safeReportName(action) + "_" + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
+    return reportPath;
+}
+
+std::filesystem::path sourceControlProviderReadinessReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const std::filesystem::path& path) {
+    std::filesystem::path reportPath = assetValidationReportPath(state, browserRoot);
+    const std::string name = path.filename().empty() ? std::string("path") : path.filename().string();
+    const std::string key = canonicalForCompare(path).string() + ":provider-readiness";
+    reportPath.replace_filename("source_control_provider_readiness_" + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
     return reportPath;
 }
 
@@ -1101,6 +1272,64 @@ std::vector<AssetOverwriteRisk> collectAssetOverwriteRisks(
     addPath("Cooked/runtime payload", record.cachePath);
     addPath("Thumbnail", record.thumbnailPath);
     return risks;
+}
+
+AssetSourceControlSummary summarizeAssetSourceControlState(
+    const EditorRuntimeState& state,
+    const AssetRecord& record,
+    const std::function<std::string(const std::filesystem::path&)>& statusForPath) {
+    AssetSourceControlSummary summary;
+    summary.primaryStatus = "Unavailable";
+    summary.generatedRisks = collectAssetOverwriteRisks(state, record, statusForPath);
+    summary.hasGeneratedOverwriteRisk = !summary.generatedRisks.empty();
+
+    std::string fallbackStatus;
+    auto statusForRecordPath = [&](const std::string& value) {
+        const std::filesystem::path path = resolveAssetRecordPath(state, value);
+        if (path.empty()) {
+            return std::string{};
+        }
+        return statusForPath(path);
+    };
+
+    const std::string sourceStatus = statusForRecordPath(record.sourcePath);
+    if (!sourceStatus.empty()) {
+        fallbackStatus = sourceStatus;
+        summary.hasSourceChange = sourceControlDiffReportAvailable(sourceStatus);
+    }
+    if (fallbackStatus.empty()) {
+        for (const std::string* value : {&record.importedPath, &record.cachePath, &record.thumbnailPath}) {
+            const std::string status = statusForRecordPath(*value);
+            if (!status.empty()) {
+                fallbackStatus = status;
+                break;
+            }
+        }
+    }
+
+    if (summary.hasGeneratedOverwriteRisk) {
+        summary.primaryStatus = summary.generatedRisks.front().status;
+        summary.label = summary.generatedRisks.size() == 1
+            ? std::string("Generated: ") + summary.generatedRisks.front().status
+            : std::string("Generated: ") + std::to_string(summary.generatedRisks.size()) + " changed";
+        summary.tooltip = "Generated asset files have Git changes that reimport, rebuild, or delete workflows may overwrite.";
+        for (const AssetOverwriteRisk& risk : summary.generatedRisks) {
+            summary.tooltip += "\n" + risk.label + ": " + risk.status + "\n" + risk.path.string();
+        }
+        return summary;
+    }
+
+    if (summary.hasSourceChange) {
+        summary.primaryStatus = sourceStatus;
+        summary.label = "Src: " + sourceStatus;
+        summary.tooltip = "Raw source file has Git changes; generated asset files do not currently report overwrite-risk changes.";
+        return summary;
+    }
+
+    summary.primaryStatus = fallbackStatus.empty() ? std::string("Unavailable") : fallbackStatus;
+    summary.label = summary.primaryStatus;
+    summary.tooltip = "Git status summary for the raw source and generated metadata/payload/thumbnail paths.";
+    return summary;
 }
 
 ImVec4 sourceControlStatusTextColor(const std::string& status) {
@@ -1259,6 +1488,250 @@ bool writeSourceControlStatusReport(
     return true;
 }
 
+bool writeSourceControlActionPlanReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    const std::string& action,
+    const std::string& statusLabel,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (path.empty()) {
+        outError = "No source-control path selected.";
+        return false;
+    }
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        outError = "Path is not inside a Git repository.";
+        return false;
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        outError = "Path is outside the resolved Git repository.";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path canonicalPath = canonicalForCompare(path);
+    const std::filesystem::path relative = std::filesystem::relative(canonicalPath, *gitRoot, ec);
+    if (ec) {
+        outError = "Could not resolve repository-relative path: " + ec.message();
+        return false;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string rootArg = quoteCommandPath(*gitRoot);
+    const std::string pathArg = quoteCommandPath(relative);
+    const std::string focusedStatus = readCommandOutput("git -C " + rootArg + " status --short --ignored -- " + pathArg + stderrRedirect);
+    const std::string repositoryBranch = readCommandOutput("git -C " + rootArg + " status --short --branch" + stderrRedirect);
+
+    nlohmann::json plannedCommands = nlohmann::json::array();
+    nlohmann::json blockers = nlohmann::json::array();
+    nlohmann::json warnings = nlohmann::json::array();
+    const std::string normalizedAction = lowerString(action);
+    if (normalizedAction == "revert") {
+        plannedCommands.push_back({
+            {"description", "Restore tracked file contents from HEAD."},
+            {"command", "git -C " + rootArg + " checkout -- " + pathArg},
+        });
+        plannedCommands.push_back({
+            {"description", "If the path is untracked, remove it after separate user confirmation."},
+            {"command", "git -C " + rootArg + " clean -f -- " + pathArg},
+            {"requiresUntrackedPath", true},
+        });
+        warnings.push_back("Revert is destructive. This editor action writes a dry-run plan only and does not execute checkout or clean.");
+    } else if (normalizedAction == "checkout") {
+        plannedCommands.push_back({
+            {"description", "Restore the selected tracked path from HEAD."},
+            {"command", "git -C " + rootArg + " checkout -- " + pathArg},
+        });
+        warnings.push_back("Checkout mutation is not executed by the editor in this slice; review the plan before running commands externally.");
+    } else if (normalizedAction == "lock") {
+        blockers.push_back("Git has no native asset lock provider in this editor integration.");
+        plannedCommands.push_back({
+            {"description", "Future Perforce provider lock command placeholder."},
+            {"command", "p4 edit " + pathArg},
+            {"provider", "perforce"},
+            {"available", false},
+        });
+    } else if (normalizedAction == "submit") {
+        plannedCommands.push_back({
+            {"description", "Stage the selected path."},
+            {"command", "git -C " + rootArg + " add -- " + pathArg},
+        });
+        plannedCommands.push_back({
+            {"description", "Commit staged changes after user review."},
+            {"command", "git -C " + rootArg + " commit"},
+        });
+        plannedCommands.push_back({
+            {"description", "Optional push after commit and policy review."},
+            {"command", "git -C " + rootArg + " push"},
+            {"optional", true},
+        });
+        warnings.push_back("Submit is represented as a Git stage/commit/push plan only. The editor does not execute provider mutations in this slice.");
+    } else {
+        blockers.push_back("Unsupported source-control action plan type: " + action);
+    }
+
+    outPath = sourceControlActionPlanReportPath(state, browserRoot, path, normalizedAction.empty() ? action : normalizedAction);
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create source-control action plan folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write source-control action plan: " + outPath.string();
+        return false;
+    }
+
+    const nlohmann::json report = {
+        {"schema", "ContentBrowserSourceControlActionPlanV1"},
+        {"provider", "git"},
+        {"action", normalizedAction},
+        {"dryRun", true},
+        {"mutationExecuted", false},
+        {"repositoryRoot", gitRoot->generic_string()},
+        {"path", canonicalPath.generic_string()},
+        {"repositoryRelativePath", relative.generic_string()},
+        {"statusLabel", statusLabel},
+        {"focusedStatus", trimString(focusedStatus).empty() ? std::string("Clean") : focusedStatus},
+        {"repositoryBranchStatus", trimString(repositoryBranch).empty() ? std::string("Clean") : repositoryBranch},
+        {"plannedCommands", plannedCommands},
+        {"blockers", blockers},
+        {"warnings", warnings},
+        {"policy", {
+            {"description", "This report is a dry-run source-control action plan. It records intended commands and provider gaps without mutating the repository."},
+            {"requiresUserConfirmationOutsideEditor", true},
+            {"performedActions", nlohmann::json::array()},
+            {"unsupportedActions", {"editor-executed-revert", "editor-executed-checkout", "provider-lock", "provider-submit", "perforce-provider-actions"}}
+        }},
+    };
+    file << report.dump(2);
+    return true;
+}
+
+bool writeSourceControlProviderReadinessReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    const std::string& statusLabel,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (path.empty()) {
+        outError = "No source-control path selected.";
+        return false;
+    }
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        outError = "Path is not inside a Git repository.";
+        return false;
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        outError = "Path is outside the resolved Git repository.";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path canonicalPath = canonicalForCompare(path);
+    const std::filesystem::path relative = std::filesystem::relative(canonicalPath, *gitRoot, ec);
+    if (ec) {
+        outError = "Could not resolve repository-relative path: " + ec.message();
+        return false;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string rootArg = quoteCommandPath(*gitRoot);
+    const std::string pathArg = quoteCommandPath(relative);
+    const std::string focusedStatus = readCommandOutput("git -C " + rootArg + " status --short --ignored -- " + pathArg + stderrRedirect);
+    const std::string branchStatus = readCommandOutput("git -C " + rootArg + " status --short --branch" + stderrRedirect);
+    const std::string gitLfsLocks = readCommandOutput("git -C " + rootArg + " lfs locks --path " + pathArg + stderrRedirect);
+    const std::string p4Info = readCommandOutput("p4 info" + std::string(stderrRedirect));
+    const std::string p4Opened = readCommandOutput("p4 opened " + pathArg + std::string(stderrRedirect));
+    const bool p4Detected = !trimString(p4Info).empty();
+    const bool lfsLockInfoAvailable = !trimString(gitLfsLocks).empty();
+    const std::string currentUser = currentSourceControlUserName();
+
+    outPath = sourceControlProviderReadinessReportPath(state, browserRoot, path);
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create source-control provider readiness folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write source-control provider readiness report: " + outPath.string();
+        return false;
+    }
+
+    const nlohmann::json report = {
+        {"schema", "ContentBrowserSourceControlProviderReadinessV1"},
+        {"provider", "git"},
+        {"repositoryRoot", gitRoot->generic_string()},
+        {"path", canonicalPath.generic_string()},
+        {"repositoryRelativePath", relative.generic_string()},
+        {"statusLabel", statusLabel},
+        {"focusedStatus", trimString(focusedStatus).empty() ? std::string("Clean") : focusedStatus},
+        {"repositoryBranchStatus", trimString(branchStatus).empty() ? std::string("Clean") : branchStatus},
+        {"currentUser", currentUser},
+        {"gitProvider", {
+            {"available", true},
+            {"supportsDiffStatus", true},
+            {"supportsEditorMutations", false},
+            {"supportsNativeLocks", false},
+            {"lfsLockQueryAttempted", true},
+            {"lfsLockInfoAvailable", lfsLockInfoAvailable},
+            {"lfsLocksRaw", trimString(gitLfsLocks)},
+        }},
+        {"perforceProvider", {
+            {"detected", p4Detected},
+            {"providerImplemented", false},
+            {"supportsCheckoutLockSubmitWhenImplemented", true},
+            {"infoRaw", trimString(p4Info)},
+            {"openedRaw", trimString(p4Opened)},
+            {"plannedCommands", nlohmann::json::array({
+                nlohmann::json{{"action", "checkout"}, {"command", "p4 edit " + pathArg}, {"available", false}},
+                nlohmann::json{{"action", "lock"}, {"command", "p4 lock " + pathArg}, {"available", false}},
+                nlohmann::json{{"action", "submit"}, {"command", "p4 submit " + pathArg}, {"available", false}},
+                nlohmann::json{{"action", "revert"}, {"command", "p4 revert " + pathArg}, {"available", false}}
+            })},
+        }},
+        {"lockOwnership", {
+            {"assetLockProviderImplemented", false},
+            {"ownershipStateKnown", p4Detected || lfsLockInfoAvailable},
+            {"currentOwner", "unknown"},
+            {"currentLockState", (p4Detected || lfsLockInfoAvailable) ? "provider-output-needs-parser" : "unknown-no-provider-lock-state"},
+            {"conflictHandlingImplemented", false},
+            {"safeExternalReloadPromptImplemented", false},
+        }},
+        {"policy", {
+            {"description", "This report inspects source-control provider readiness, lock/ownership visibility, and remaining provider gaps without mutating the repository."},
+            {"dryRun", true},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"supportedNow", nlohmann::json::array({"git-status", "git-diff", "git-action-plan", "provider-readiness-report"})},
+            {"unsupportedActions", nlohmann::json::array({"editor-executed-revert", "editor-executed-checkout", "provider-lock", "provider-submit", "perforce-provider-mutations", "asset-lock-ownership-enforcement", "provider-conflict-resolution", "automatic-external-change-reload-prompt"})},
+        }},
+    };
+    file << report.dump(2);
+    return true;
+}
+
 nlohmann::json assetRecordSummaryJson(const EditorRuntimeState& state, const AssetRecord& record) {
     const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
     const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
@@ -1327,6 +1800,90 @@ bool writeAssetOverwriteRiskReport(
     std::ofstream file(outPath, std::ios::trunc);
     if (!file.is_open()) {
         outError = "Could not write overwrite-risk report: " + outPath.string();
+        return false;
+    }
+    file << report.dump(2);
+    return true;
+}
+
+bool writeAssetExternalReloadReadinessReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetRecord& record,
+    const std::function<std::string(const std::filesystem::path&)>& statusForPath,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedAssetExternalReloadReadinessReportPath(state, browserRoot, record.guid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create external reload readiness report folder: " + ec.message();
+        return false;
+    }
+
+    nlohmann::json fileStates = nlohmann::json::array();
+    size_t changedPathCount = 0;
+    size_t generatedChangedPathCount = 0;
+    auto appendPathState = [&](const char* role, const std::string& storedPath, bool generated, const char* recommendedAction) {
+        const std::filesystem::path resolvedPath = resolveAssetRecordPath(state, storedPath);
+        if (resolvedPath.empty()) {
+            return;
+        }
+        const std::string status = statusForPath(resolvedPath);
+        const bool sourceControlChanged = sourceControlDiffReportAvailable(status);
+        if (sourceControlChanged) {
+            ++changedPathCount;
+            if (generated) {
+                ++generatedChangedPathCount;
+            }
+        }
+        fileStates.push_back({
+            {"role", role},
+            {"storedPath", storedPath},
+            {"resolvedPath", resolvedPath.generic_string()},
+            {"generatedAssetFile", generated},
+            {"exists", std::filesystem::exists(resolvedPath, ec)},
+            {"sourceControlStatus", status},
+            {"sourceControlChanged", sourceControlChanged},
+            {"recommendedAction", recommendedAction},
+        });
+    };
+    appendPathState("Source", record.sourcePath, false, "Review source changes, then use Repair Asset or Reimport to regenerate metadata and cooked payloads explicitly.");
+    appendPathState("ImportedMetadata", record.importedPath, true, "Review the generated metadata diff before reimporting; automatic metadata hot-reload is not performed.");
+    appendPathState("CookedRuntimePayload", record.cachePath, true, "Review payload ownership/status before Rebuild Payload or Repair Asset; automatic runtime payload reload is not performed.");
+    appendPathState("Thumbnail", record.thumbnailPath, true, "Thumbnail changes can be refreshed by reimport/regeneration; fallback previews remain safe until then.");
+
+    const nlohmann::json report = {
+        {"schema", "TransparentAssetExternalReloadReadinessV1"},
+        {"asset", assetRecordSummaryJson(state, record)},
+        {"sceneDirty", state.sceneDirty},
+        {"projectSettingsDirty", state.projectSettingsDirty},
+        {"changedPathCount", changedPathCount},
+        {"generatedChangedPathCount", generatedChangedPathCount},
+        {"fileStates", fileStates},
+        {"promptReadiness", {
+            {"shouldPrompt", changedPathCount > 0},
+            {"sourceChanged", std::any_of(fileStates.begin(), fileStates.end(), [](const nlohmann::json& item) {
+                return item.value("role", std::string{}) == "Source" && item.value("sourceControlChanged", false);
+            })},
+            {"generatedFilesChanged", generatedChangedPathCount > 0},
+            {"recommendedPrompt", changedPathCount > 0
+                ? "External source-control changes are present. Review diffs before explicit reimport, repair, rebuild, or thumbnail regeneration."
+                : "No source-control-changed asset paths were detected for this selected asset."}
+        }},
+        {"policy", {
+            {"description", "This report is a safe external-change reload readiness review for the selected asset."},
+            {"automaticReloadPromptImplemented", false},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"supportedFollowUpActions", {"Git Diff", "Git Status", "Repair Asset", "Reimport", "Rebuild Payload", "Reveal Source", "Reveal Metadata", "Reveal Payload"}},
+            {"unsupportedActions", {"automatic-source-reload", "automatic-generated-metadata-reload", "automatic-runtime-payload-reload", "provider-level-conflict-resolution"}}
+        }},
+    };
+
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write external reload readiness report: " + outPath.string();
         return false;
     }
     file << report.dump(2);
@@ -1872,9 +2429,103 @@ nlohmann::json buildAssetValidationReport(const EditorRuntimeState& state, const
     };
 }
 
+nlohmann::json expectedDependencyAssetTypes(const std::string& role) {
+    const std::string lowerRole = lowerString(role);
+    nlohmann::json types = nlohmann::json::array();
+    auto addType = [&](AssetType type) {
+        types.push_back(assetTypeName(type));
+    };
+    if (lowerRole.find("material") != std::string::npos) {
+        addType(AssetType::Material);
+    } else if (lowerRole.find("texture") != std::string::npos || lowerRole.find("image") != std::string::npos || lowerRole.find("hdr") != std::string::npos || lowerRole.find("environment") != std::string::npos) {
+        addType(AssetType::Texture);
+        addType(AssetType::HDRI);
+    } else if (lowerRole.find("mesh") != std::string::npos) {
+        addType(AssetType::Mesh);
+    } else if (lowerRole.find("prefab") != std::string::npos || lowerRole.find("model") != std::string::npos) {
+        addType(AssetType::Prefab);
+    } else if (lowerRole.find("anim") != std::string::npos) {
+        addType(AssetType::Animation);
+    } else if (lowerRole.find("skeleton") != std::string::npos || lowerRole.find("skin") != std::string::npos) {
+        addType(AssetType::Skeleton);
+    }
+    return types;
+}
+
+bool dependencyRoleMatchesType(const std::string& role, AssetType type) {
+    const nlohmann::json expectedTypes = expectedDependencyAssetTypes(role);
+    if (expectedTypes.empty()) {
+        return true;
+    }
+    const std::string typeName = assetTypeName(type);
+    for (const nlohmann::json& expected : expectedTypes) {
+        if (expected.is_string() && expected.get<std::string>() == typeName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+nlohmann::json dependencyRepairCandidatesJson(
+    const EditorRuntimeState& state,
+    const AssetRecord& owner,
+    const AssetDependency& dependency) {
+    nlohmann::json candidates = nlohmann::json::array();
+    if (state.assetRegistry == nullptr) {
+        return candidates;
+    }
+
+    std::vector<std::pair<int, const AssetRecord*>> scored;
+    for (const AssetRecord& candidate : state.assetRegistry->records()) {
+        if (candidate.guid.empty() || candidate.guid == owner.guid || candidate.guid == dependency.guid) {
+            continue;
+        }
+        if (!dependencyRoleMatchesType(dependency.kind, candidate.type)) {
+            continue;
+        }
+        int score = 0;
+        if (!owner.importGroupId.empty() && candidate.importGroupId == owner.importGroupId) {
+            score += 4;
+        }
+        if (!owner.importRootGuid.empty() && candidate.importRootGuid == owner.importRootGuid) {
+            score += 3;
+        }
+        if (!owner.importGroupName.empty() && candidate.importGroupName == owner.importGroupName) {
+            score += 2;
+        }
+        if (score == 0 && !expectedDependencyAssetTypes(dependency.kind).empty()) {
+            score = 1;
+        }
+        if (score > 0) {
+            scored.push_back({score, &candidate});
+        }
+    }
+    std::sort(scored.begin(), scored.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.first != rhs.first) return lhs.first > rhs.first;
+        const std::string lhsName = lhs.second != nullptr ? lhs.second->displayName : std::string{};
+        const std::string rhsName = rhs.second != nullptr ? rhs.second->displayName : std::string{};
+        return lhsName < rhsName;
+    });
+
+    const size_t maxCandidates = std::min<size_t>(scored.size(), 16u);
+    for (size_t i = 0; i < maxCandidates; ++i) {
+        const AssetRecord* candidate = scored[i].second;
+        if (candidate == nullptr) {
+            continue;
+        }
+        candidates.push_back({
+            {"score", scored[i].first},
+            {"asset", assetRecordSummaryJson(state, *candidate)},
+            {"reason", "Role-compatible asset in the loaded registry, prioritized by shared import group/root metadata."},
+        });
+    }
+    return candidates;
+}
+
 nlohmann::json buildAssetDependencyReport(const EditorRuntimeState& state, const AssetGuid& targetGuid) {
     nlohmann::json dependencies = nlohmann::json::array();
     nlohmann::json storedReferences = nlohmann::json::array();
+    nlohmann::json missingDependencyRepairPlan = nlohmann::json::array();
     nlohmann::json selectedAsset = nlohmann::json::object();
     if (state.assetRegistry == nullptr) {
         return {
@@ -1892,12 +2543,28 @@ nlohmann::json buildAssetDependencyReport(const EditorRuntimeState& state, const
         selectedAsset = assetRecordSummaryJson(state, *target);
         for (const AssetDependency& dependency : target->dependencies) {
             const AssetRecord* linked = findAssetRecordByGuid(*state.assetRegistry, dependency.guid);
-            dependencies.push_back({
+            nlohmann::json repairCandidates = linked == nullptr ? dependencyRepairCandidatesJson(state, *target, dependency) : nlohmann::json::array();
+            nlohmann::json dependencyEntry = {
                 {"guid", dependency.guid},
                 {"role", dependency.kind.empty() ? "dependency" : dependency.kind},
+                {"expectedAssetTypes", expectedDependencyAssetTypes(dependency.kind)},
                 {"found", linked != nullptr},
                 {"asset", linked != nullptr ? assetRecordSummaryJson(state, *linked) : nlohmann::json::object()},
-            });
+                {"repairCandidateCount", repairCandidates.size()},
+                {"unambiguousRepairCandidate", linked == nullptr && repairCandidates.size() == 1u},
+                {"repairCandidates", repairCandidates},
+            };
+            if (linked == nullptr) {
+                missingDependencyRepairPlan.push_back({
+                    {"missingGuid", dependency.guid},
+                    {"role", dependency.kind.empty() ? "dependency" : dependency.kind},
+                    {"expectedAssetTypes", expectedDependencyAssetTypes(dependency.kind)},
+                    {"candidateCount", repairCandidates.size()},
+                    {"unambiguousRepairCandidate", repairCandidates.size() == 1u},
+                    {"candidates", repairCandidates},
+                });
+            }
+            dependencies.push_back(std::move(dependencyEntry));
         }
         for (const AssetGuid& reference : target->references) {
             const AssetRecord* linked = findAssetRecordByGuid(*state.assetRegistry, reference);
@@ -1910,6 +2577,13 @@ nlohmann::json buildAssetDependencyReport(const EditorRuntimeState& state, const
         }
     }
 
+    size_t unambiguousMissingDependencyRepairCount = 0;
+    for (const nlohmann::json& item : missingDependencyRepairPlan) {
+        if (item.value("unambiguousRepairCandidate", false)) {
+            ++unambiguousMissingDependencyRepairCount;
+        }
+    }
+
     return {
         {"version", 1},
         {"kind", "SelectedAssetDependencyReport"},
@@ -1917,8 +2591,12 @@ nlohmann::json buildAssetDependencyReport(const EditorRuntimeState& state, const
         {"selectedAsset", selectedAsset},
         {"dependencyCount", dependencies.size()},
         {"storedReferenceCount", storedReferences.size()},
+        {"missingDependencyCount", missingDependencyRepairPlan.size()},
+        {"unambiguousMissingDependencyRepairCount", unambiguousMissingDependencyRepairCount},
         {"dependencies", dependencies},
         {"storedReferences", storedReferences},
+        {"missingDependencyRepairPlan", missingDependencyRepairPlan},
+        {"repairPolicy", "This report is non-destructive. Missing dependencies can be repaired safely only when a replacement candidate is unambiguous and the user explicitly rewrites references or reimports the source asset."},
     };
 }
 
@@ -2149,6 +2827,219 @@ nlohmann::json buildAssetDependencyGraphReport(const EditorRuntimeState& state) 
     };
 }
 
+std::string dotEscape(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char c : value) {
+        switch (c) {
+        case '\\': escaped += "\\\\"; break;
+        case '"': escaped += "\\\""; break;
+        case '\n': escaped += "\\n"; break;
+        case '\r': break;
+        case '\t': escaped.push_back(' '); break;
+        default: escaped.push_back(c); break;
+        }
+    }
+    return escaped;
+}
+
+std::string dotString(const std::string& value) {
+    return std::string("\"") + dotEscape(value) + "\"";
+}
+
+std::string buildAssetDependencyGraphDot(const nlohmann::json& graph) {
+    std::ostringstream dot;
+    std::unordered_set<std::string> emittedMissingTargets;
+
+    auto emitMissingTarget = [&](const std::string& guid) {
+        const std::string key = guid.empty() ? std::string("<empty>") : guid;
+        if (!emittedMissingTargets.insert(key).second) {
+            return;
+        }
+        dot << "  " << dotString("missing:" + key)
+            << " [label=" << dotString(std::string("Missing Asset\n") + key)
+            << ", shape=octagon, color=\"#c44\", fontcolor=\"#8a1f1f\", fillcolor=\"#ffe8e8\", style=\"filled\"];\n";
+    };
+
+    dot << "digraph AssetDependencyGraph {\n";
+    dot << "  graph [rankdir=LR, labelloc=\"t\", label="
+        << dotString("Asset Dependency Graph\nassets=" + std::to_string(graph.value("assetCount", 0u))
+            + " edges=" + std::to_string(graph.value("edgeCount", 0u))
+            + " currentSceneUsages=" + std::to_string(graph.value("currentSceneUsageCount", 0u)))
+        << "];\n";
+    dot << "  node [shape=box, fontname=\"Consolas\", fontsize=10, style=\"rounded,filled\", fillcolor=\"#f8fbff\", color=\"#7a8aa0\"];\n";
+    dot << "  edge [fontname=\"Consolas\", fontsize=9, color=\"#546a7b\"];\n\n";
+
+    if (graph.contains("nodes") && graph["nodes"].is_array()) {
+        dot << "  subgraph cluster_assets {\n";
+        dot << "    label=\"Loaded Asset Registry\";\n";
+        for (const nlohmann::json& node : graph["nodes"]) {
+            const std::string guid = node.value("guid", std::string{});
+            if (guid.empty()) {
+                continue;
+            }
+            std::string name = node.value("displayName", std::string{});
+            if (name.empty()) {
+                name = guid;
+            }
+            const std::string type = node.value("assetType", std::string("Asset"));
+            const bool missing = node.value("missing", false) || node.value("dependenciesMissing", false);
+            dot << "    " << dotString("asset:" + guid)
+                << " [label=" << dotString(name + "\n" + type + "\n" + guid)
+                << ", tooltip=" << dotString(guid)
+                << ", fillcolor=" << dotString(missing ? "#fff0df" : "#f8fbff")
+                << "];\n";
+        }
+        dot << "  }\n\n";
+    }
+
+    if (graph.contains("edges") && graph["edges"].is_array()) {
+        for (const nlohmann::json& edge : graph["edges"]) {
+            const std::string sourceGuid = edge.value("sourceGuid", std::string{});
+            const std::string targetGuid = edge.value("targetGuid", std::string{});
+            if (sourceGuid.empty()) {
+                continue;
+            }
+            const bool targetFound = edge.value("targetFound", false) && !targetGuid.empty();
+            if (!targetFound) {
+                emitMissingTarget(targetGuid);
+            }
+            const std::string relation = edge.value("relation", std::string("reference"));
+            const std::string role = edge.value("role", relation);
+            dot << "  " << dotString("asset:" + sourceGuid)
+                << " -> " << dotString(targetFound ? "asset:" + targetGuid : "missing:" + (targetGuid.empty() ? std::string("<empty>") : targetGuid))
+                << " [label=" << dotString(role)
+                << ", style=" << dotString(targetFound ? (relation == "dependency" ? "solid" : "dashed") : "dashed")
+                << ", color=" << dotString(targetFound ? (relation == "dependency" ? "#336699" : "#777777") : "#c44")
+                << "];\n";
+        }
+        dot << "\n";
+    }
+
+    if (graph.contains("currentSceneUsages") && graph["currentSceneUsages"].is_array()) {
+        dot << "  subgraph cluster_current_scene {\n";
+        dot << "    label=\"Current Scene Usages\";\n";
+        size_t index = 0;
+        for (const nlohmann::json& usage : graph["currentSceneUsages"]) {
+            const std::string guid = usage.value("guid", std::string{});
+            const std::string sceneNodeId = "scene:" + std::to_string(index++);
+            const std::string entity = usage.value("entity", std::string("Scene"));
+            const std::string component = usage.value("component", std::string("Component"));
+            const std::string field = usage.value("field", std::string("guid"));
+            const bool assetFound = usage.value("assetFound", false) && !guid.empty();
+            if (!assetFound) {
+                emitMissingTarget(guid);
+            }
+            dot << "    " << dotString(sceneNodeId)
+                << " [label=" << dotString(entity + "\n" + component + "." + field)
+                << ", shape=note, fillcolor=\"#eef8ee\", color=\"#6a9a6a\"];\n";
+            dot << "    " << dotString(sceneNodeId)
+                << " -> " << dotString(assetFound ? "asset:" + guid : "missing:" + (guid.empty() ? std::string("<empty>") : guid))
+                << " [label=\"uses\", style=\"dotted\", color=\"#4f8a4f\"];\n";
+        }
+        dot << "  }\n";
+    }
+
+    dot << "}\n";
+    return dot.str();
+}
+
+std::string htmlEscape(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char c : value) {
+        switch (c) {
+        case '&': escaped += "&amp;"; break;
+        case '<': escaped += "&lt;"; break;
+        case '>': escaped += "&gt;"; break;
+        case '"': escaped += "&quot;"; break;
+        case '\'': escaped += "&#39;"; break;
+        default: escaped.push_back(c); break;
+        }
+    }
+    return escaped;
+}
+
+std::string buildAssetDependencyGraphHtml(const nlohmann::json& graph) {
+    std::ostringstream html;
+    html << "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n";
+    html << "<title>Asset Dependency Graph</title>\n";
+    html << "<style>"
+            "body{margin:0;font:13px Segoe UI,Arial,sans-serif;background:#111820;color:#dce5ef;}"
+            "header{display:flex;gap:12px;align-items:center;padding:10px 14px;background:#1b2633;border-bottom:1px solid #314052;}"
+            "header h1{font-size:16px;margin:0 12px 0 0;font-weight:600;}"
+            "input,select{background:#0f151d;color:#dce5ef;border:1px solid #405267;border-radius:3px;padding:5px 7px;}"
+            "button{background:#25364a;color:#e6edf6;border:1px solid #47617b;border-radius:3px;padding:5px 8px;cursor:pointer;}"
+            "#wrap{display:grid;grid-template-columns:minmax(0,1fr) 330px;height:calc(100vh - 47px);}"
+            "#graph{position:relative;overflow:auto;background:#f4f7fb;}svg{min-width:1200px;min-height:720px;}"
+            ".node rect{fill:#ffffff;stroke:#60758d;stroke-width:1.2px;rx:4px}.node.missing rect{fill:#ffe8e8;stroke:#ba4545}.node.scene rect{fill:#e9f7ea;stroke:#5f985f}.node.selected rect{stroke:#1f78d1;stroke-width:3px}"
+            ".edge{stroke:#5f7287;stroke-width:1.4px;fill:none}.edge.reference{stroke-dasharray:5 4}.edge.missing{stroke:#c44;stroke-dasharray:6 4}.edge.scene{stroke:#3f8d4a;stroke-dasharray:2 4}.edge.hidden,.node.hidden{display:none}"
+            ".label{font-size:11px;fill:#17212c;pointer-events:none}.meta{font-size:10px;fill:#536171;pointer-events:none}.edgeLabel{font-size:10px;fill:#26384c;background:#fff}"
+            "aside{overflow:auto;background:#121b25;border-left:1px solid #314052;padding:12px;}pre{white-space:pre-wrap;word-break:break-word;background:#0b1118;padding:8px;border:1px solid #263647;border-radius:3px;}"
+            ".stat{color:#9db1c8}.warn{color:#ffb36b}"
+            "</style>\n</head>\n<body>\n";
+    html << "<header><h1>Asset Dependency Graph</h1>"
+            "<span class=\"stat\" id=\"stats\"></span>"
+            "<input id=\"filter\" placeholder=\"Filter name, GUID, type, role\" size=\"36\">"
+            "<select id=\"edgeMode\"><option value=\"all\">All edges</option><option value=\"dependency\">Dependencies</option><option value=\"reference\">References</option><option value=\"missing\">Missing only</option><option value=\"scene\">Scene usages</option></select>"
+            "<button id=\"reset\">Reset</button></header>\n";
+    html << "<div id=\"wrap\"><main id=\"graph\"><svg id=\"svg\" viewBox=\"0 0 1200 720\"></svg></main><aside><h2>Selection</h2><div id=\"details\" class=\"stat\">Select a node or edge.</div><h2>Policy</h2><p>This is an interactive HTML sidecar generated from the loaded asset registry and current scene usage graph.</p><p class=\"warn\">It does not mutate references, watch files continuously, or inspect package/cache internals.</p></aside></div>\n";
+    html << "<script id=\"graph-data\" type=\"application/json\">" << htmlEscape(graph.dump()) << "</script>\n";
+    html << R"SCRIPT(<script>
+const graph = JSON.parse(document.getElementById('graph-data').textContent);
+const svg = document.getElementById('svg');
+const details = document.getElementById('details');
+const filter = document.getElementById('filter');
+const edgeMode = document.getElementById('edgeMode');
+const stats = document.getElementById('stats');
+const nodeById = new Map();
+const edges = [];
+function el(name, attrs = {}) { const e = document.createElementNS('http://www.w3.org/2000/svg', name); for (const [k,v] of Object.entries(attrs)) e.setAttribute(k, v); return e; }
+function textValue(v) { return (v ?? '').toString(); }
+function assetLabel(asset) { return textValue(asset.displayName || asset.guid || '(asset)'); }
+function show(obj) { details.innerHTML = '<pre>' + JSON.stringify(obj, null, 2).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])) + '</pre>'; }
+function addNode(id, label, meta, kind, payload, x, y) {
+  const g = el('g', {class:'node ' + kind, transform:`translate(${x},${y})`, 'data-search':`${label} ${meta} ${id}`.toLowerCase()});
+  g.appendChild(el('rect', {width:170, height:54}));
+  const t = el('text', {x:8, y:20, class:'label'}); t.textContent = label.slice(0, 26); g.appendChild(t);
+  const m = el('text', {x:8, y:39, class:'meta'}); m.textContent = meta.slice(0, 30); g.appendChild(m);
+  g.addEventListener('click', () => { document.querySelectorAll('.node.selected').forEach(n => n.classList.remove('selected')); g.classList.add('selected'); show(payload); });
+  svg.appendChild(g); nodeById.set(id, {id, label, meta, kind, payload, x, y, element:g}); return nodeById.get(id);
+}
+function addEdge(sourceId, targetId, relation, role, payload) {
+  const s = nodeById.get(sourceId); const t = nodeById.get(targetId); if (!s || !t) return;
+  const sx = s.x + 170, sy = s.y + 27, tx = t.x, ty = t.y + 27;
+  const path = el('path', {class:`edge ${relation}`, d:`M ${sx} ${sy} C ${sx+60} ${sy}, ${tx-60} ${ty}, ${tx} ${ty}`, 'data-search':`${relation} ${role} ${s.label} ${t.label}`.toLowerCase()});
+  path.addEventListener('click', () => show(payload)); svg.insertBefore(path, svg.firstChild);
+  const mid = el('text', {x:(sx+tx)/2 - 20, y:(sy+ty)/2 - 4, class:'edgeLabel'}); mid.textContent = role; svg.appendChild(mid);
+  edges.push({sourceId, targetId, relation, role, payload, element:path, label:mid});
+}
+function build() {
+  svg.innerHTML = ''; nodeById.clear(); edges.length = 0;
+  const nodes = graph.nodes || []; const cols = Math.max(1, Math.ceil(Math.sqrt(Math.max(1, nodes.length))));
+  nodes.forEach((n, i) => addNode('asset:' + n.guid, assetLabel(n), `${n.assetType || 'Asset'}  in:${n.incomingRegistryEdgeCount || 0} out:${n.outgoingDependencyCount || 0}`, n.missing || n.dependenciesMissing ? 'missing' : 'asset', n, 40 + (i % cols) * 230, 40 + Math.floor(i / cols) * 95));
+  const missing = new Set();
+  (graph.edges || []).forEach(e => { if (!e.targetFound) missing.add(e.targetGuid || '<empty>'); });
+  (graph.currentSceneUsages || []).forEach(u => { if (!u.assetFound) missing.add(u.guid || '<empty>'); });
+  let rowBase = Math.ceil(nodes.length / cols) * 95 + 80; let missIndex = 0;
+  missing.forEach(guid => addNode('missing:' + guid, 'Missing Asset', guid, 'missing', {missingGuid:guid}, 40 + (missIndex++ % cols) * 230, rowBase + Math.floor((missIndex - 1) / cols) * 95));
+  (graph.currentSceneUsages || []).forEach((u, i) => addNode('scene:' + i, u.entity || 'Scene usage', `${u.component || 'Component'}.${u.field || 'guid'}`, 'scene', u, 40 + (i % cols) * 230, rowBase + 120 + Math.floor(i / cols) * 95));
+  (graph.edges || []).forEach(e => addEdge('asset:' + e.sourceGuid, e.targetFound ? 'asset:' + e.targetGuid : 'missing:' + (e.targetGuid || '<empty>'), e.targetFound ? e.relation : 'missing', e.role || e.relation, e));
+  (graph.currentSceneUsages || []).forEach((u, i) => addEdge('scene:' + i, u.assetFound ? 'asset:' + u.guid : 'missing:' + (u.guid || '<empty>'), 'scene', 'uses', u));
+  stats.textContent = `assets=${graph.assetCount || 0} edges=${graph.edgeCount || 0} missing=${graph.missingTargetCount || 0} scene=${graph.currentSceneUsageCount || 0}`;
+}
+function applyFilters() {
+  const q = filter.value.toLowerCase(); const mode = edgeMode.value;
+  nodeById.forEach(n => n.element.classList.toggle('hidden', q && !n.element.dataset.search.includes(q)));
+  edges.forEach(e => { const modeHide = mode !== 'all' && e.relation !== mode; const textHide = q && !e.element.dataset.search.includes(q) && !(nodeById.get(e.sourceId)?.element.dataset.search.includes(q)) && !(nodeById.get(e.targetId)?.element.dataset.search.includes(q)); e.element.classList.toggle('hidden', modeHide || textHide); e.label.classList.toggle('hidden', modeHide || textHide); });
+}
+filter.addEventListener('input', applyFilters); edgeMode.addEventListener('change', applyFilters); document.getElementById('reset').addEventListener('click', () => { filter.value=''; edgeMode.value='all'; applyFilters(); });
+build();
+</script>)SCRIPT";
+    html << "\n</body>\n</html>\n";
+    return html.str();
+}
+
 nlohmann::json buildAssetProjectReferenceIndexReport(const EditorRuntimeState& state, const std::filesystem::path& browserRoot) {
     nlohmann::json checkedRoots = nlohmann::json::array();
     nlohmann::json scannedFiles = nlohmann::json::array();
@@ -2217,7 +3108,8 @@ nlohmann::json buildAssetProjectReferenceIndexReport(const EditorRuntimeState& s
         {"parseErrors", parseErrors},
         {"scannedFiles", scannedFiles},
         {"checkedFileTypes", nlohmann::json::array({".rtlevel", ".mscene", ".vproject", ".rtprefab.json", ".rtmesh.json", ".rtmaterial.json", ".rttexture.json", ".rthdri.json"})},
-        {"limitation", "This is an on-demand saved-file JSON index for project content and scene roots. It is not a persistent index and does not rewrite references or inspect generated cache payload internals."},
+        {"persistence", "The latest generated index is also written to Saved/AssetReferenceIndex.json when the Project References action runs."},
+        {"limitation", "This is a regenerated-on-demand saved-file JSON index for project content and scene roots. It is persisted as the latest index artifact, but it is not continuously updated in the background and does not rewrite references or inspect generated cache payload internals."},
     };
 }
 
@@ -2616,6 +3508,191 @@ nlohmann::json metadataFileInspectionJson(const std::filesystem::path& path, con
     return info;
 }
 
+std::string nativeRuntimeExtensionForAssetType(AssetType type) {
+    switch (type) {
+    case AssetType::Mesh: return ".rtmesh";
+    case AssetType::Material: return ".rtmaterial";
+    case AssetType::Texture:
+    case AssetType::HDRI: return ".rttexture";
+    case AssetType::Prefab: return ".rtprefab";
+    case AssetType::Scene: return ".rtlevel";
+    case AssetType::Animation: return ".rtanim";
+    case AssetType::Skeleton: return ".rtskeleton";
+    case AssetType::Unknown: break;
+    }
+    return {};
+}
+
+nlohmann::json nativeArtifactCandidateJson(
+    const AssetRecord& record,
+    const std::filesystem::path& importedPath,
+    const std::filesystem::path& cachePath) {
+    const std::string nativeExtension = nativeRuntimeExtensionForAssetType(record.type);
+    nlohmann::json candidates = nlohmann::json::array();
+    auto appendCandidate = [&](std::filesystem::path path, const char* basis) {
+        if (path.empty() || nativeExtension.empty()) {
+            return;
+        }
+        path.replace_extension(nativeExtension);
+        candidates.push_back(pathInspectionJson(path, basis));
+    };
+    appendCandidate(importedPath, "nativeStandaloneFromImportedMetadata");
+    appendCandidate(cachePath, "nativeStandaloneFromCookedPayload");
+
+    return {
+        {"assetType", assetTypeName(record.type)},
+        {"expectedStandaloneExtension", nativeExtension},
+        {"nativeStandaloneRuntimeFormats", nlohmann::json::array({".rtmesh", ".rtmaterial", ".rttexture"})},
+        {"candidateCount", candidates.size()},
+        {"candidates", candidates},
+        {"status", nativeExtension.empty() ? "unsupported-asset-type" : "not-emitted-by-current-transparent-pipeline"},
+        {"policy", "Current imports use transparent JSON metadata plus cooked/cache payload paths. Native standalone runtime files are expected future artifacts and are reported here for debug readiness only."},
+    };
+}
+
+nlohmann::json opaquePackageCandidateJson(const std::filesystem::path& importedPath, const std::filesystem::path& cachePath) {
+    nlohmann::json candidates = nlohmann::json::array();
+    auto appendCandidate = [&](std::filesystem::path path, const char* basis) {
+        if (path.empty()) {
+            return;
+        }
+        path.replace_extension(".rtpkg");
+        candidates.push_back(pathInspectionJson(path, basis));
+    };
+    appendCandidate(importedPath, "packageFromImportedMetadata");
+    appendCandidate(cachePath, "packageFromCookedPayload");
+
+    return {
+        {"expectedExtension", ".rtpkg"},
+        {"candidateCount", candidates.size()},
+        {"candidates", candidates},
+        {"status", "not-emitted-by-current-transparent-pipeline"},
+        {"policy", "Opaque package emission/loading, migration/versioning, and binary package debug inspection remain future production package-system work."},
+    };
+}
+
+nlohmann::json packageVersioningReadinessJson(const AssetRecord& record) {
+    return {
+        {"schema", "RtpkgVersioningReadinessV1"},
+        {"assetGuid", record.guid},
+        {"assetType", assetTypeName(record.type)},
+        {"expectedPackageExtension", ".rtpkg"},
+        {"currentTransparentMetadataVersion", 1},
+        {"plannedPackageHeader", {
+            {"magic", "RTPKG"},
+            {"endianness", "little"},
+            {"headerVersion", 1},
+            {"packageGuid", record.guid},
+            {"assetType", assetTypeName(record.type)},
+            {"contentVersion", 1},
+            {"dependencyTableOffset", "planned"},
+            {"objectTableOffset", "planned"},
+            {"chunkTableOffset", "planned"},
+            {"debugDirectoryOffset", "planned"},
+        }},
+        {"plannedObjectTables", nlohmann::json::array({
+            "AssetSummary",
+            "DependencyTable",
+            "PayloadChunkTable",
+            "ImportSettingsSnapshot",
+            "SourceControlPolicy",
+            "DebugDirectory"
+        })},
+        {"migrationPolicy", {
+            {"migrationTableImplemented", false},
+            {"minimumReadableVersion", 1},
+            {"currentWriterVersion", 1},
+            {"migrationStrategy", "Future package loader should migrate package header/object/chunk table versions before binding runtime payloads."},
+            {"backupPolicy", "Future package migration should write side-by-side backups before in-place package rewrites."},
+        }},
+        {"debugInspectionPolicy", {
+            {"binaryInspectorImplemented", false},
+            {"plannedInspectionFields", nlohmann::json::array({"header", "assetSummary", "dependencies", "objectTable", "chunkTable", "payloadHashes", "sourceControlPolicy", "migrationHistory"})},
+            {"currentInspectionFallback", "Use transparent JSON metadata, package candidate paths, and filesystem payload facts from this report."},
+        }},
+        {"implementationStatus", {
+            {"packageEmissionImplemented", false},
+            {"packageLoadingImplemented", false},
+            {"packageMigrationImplemented", false},
+            {"binaryDebugInspectionImplemented", false},
+        }},
+    };
+}
+
+nlohmann::json textureCookedBindingPolicyJson(
+    const AssetRecord& record,
+    const std::filesystem::path& sourcePath,
+    const std::filesystem::path& importedPath,
+    const std::filesystem::path& cachePath) {
+    const bool textureLike = record.type == AssetType::Texture || record.type == AssetType::HDRI;
+    const std::string sourceExtension = lowerString(sourcePath.extension().string());
+    std::string sourceContainer = "not-applicable";
+    std::string colorSpace = "not-applicable";
+    std::string runtimeBindingStatus = textureLike ? "loose-cache-payload-bound-by-registry-guid" : "not-a-texture-asset";
+    if (textureLike) {
+        if (record.type == AssetType::HDRI || sourceExtension == ".hdr" || sourceExtension == ".exr") {
+            sourceContainer = "hdr-environment";
+            colorSpace = "linear-hdr";
+        } else if (sourceExtension == ".dds" || sourceExtension == ".ktx" || sourceExtension == ".ktx2") {
+            sourceContainer = "compressed-container";
+            colorSpace = "source-defined";
+        } else if (sourceExtension == ".basis") {
+            sourceContainer = "basis-standalone-unsupported";
+            colorSpace = "source-defined";
+            runtimeBindingStatus = "unsupported-source-container";
+        } else {
+            sourceContainer = "decoded-ldr-image";
+            colorSpace = "role-dependent-srgb-or-linear";
+        }
+    }
+
+    std::filesystem::path nativeTextureCandidate = importedPath;
+    if (nativeTextureCandidate.empty()) {
+        nativeTextureCandidate = cachePath;
+    }
+    if (!nativeTextureCandidate.empty()) {
+        nativeTextureCandidate.replace_extension(".rttexture");
+    }
+
+    return {
+        {"appliesToTextureLikeAsset", textureLike},
+        {"assetGuid", record.guid},
+        {"assetType", assetTypeName(record.type)},
+        {"sourceExtension", sourceExtension},
+        {"sourceContainer", sourceContainer},
+        {"intendedColorSpace", colorSpace},
+        {"importSettings", {
+            {"textureImportMode", record.importSettings.textureImportMode},
+            {"textureCompression", record.importSettings.textureCompression},
+        }},
+        {"currentRuntimeBinding", {
+            {"status", runtimeBindingStatus},
+            {"bindingKey", "AssetRecord.guid"},
+            {"metadataPath", importedPath.empty() ? std::string{} : importedPath.generic_string()},
+            {"looseCookedPayloadPath", cachePath.empty() ? std::string{} : cachePath.generic_string()},
+            {"nativeTextureCandidatePath", nativeTextureCandidate.empty() ? std::string{} : nativeTextureCandidate.generic_string()},
+            {"payloadExists", !cachePath.empty() && regularFileExists(cachePath)},
+        }},
+        {"compressionTranscodingPolicy", {
+            {"requestedPolicy", record.importSettings.textureCompression.empty() ? std::string("PreserveSource") : record.importSettings.textureCompression},
+            {"effectiveCookPolicy", textureLike ? "preserve-source-or-decoded-loose-payload" : "not-applicable"},
+            {"platformTranscodeImplemented", false},
+            {"nativeCookedTextureEmissionImplemented", false},
+            {"basisStandaloneImportImplemented", false},
+            {"ktx2RuntimeTranscodeNote", "Runtime KTX2/BasisU texture loading may transcode for renderer upload, but the editor asset cook does not yet emit platform-specific native .rttexture payloads."},
+            {"supportedSourceContainers", nlohmann::json::array({"png", "jpg", "jpeg", "tga", "bmp", "hdr", "exr", "dds", "ktx", "ktx2"})},
+            {"unsupportedSourceContainers", nlohmann::json::array({"basis"})},
+        }},
+        {"remainingWork", nlohmann::json::array({
+            "Native .rttexture emission/loading",
+            "Texture/HDR GUID binding through native cooked payloads",
+            "Platform compression/transcoding policy",
+            "Basis standalone source import",
+            "Material/environment rebinding to native texture payloads"
+        })},
+    };
+}
+
 nlohmann::json buildAssetPackageInspectionReport(const EditorRuntimeState& state, const AssetRecord& record) {
     const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
     const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
@@ -2647,6 +3724,10 @@ nlohmann::json buildAssetPackageInspectionReport(const EditorRuntimeState& state
         {"targetGuid", record.guid},
         {"asset", assetRecordSummaryJson(state, record)},
         {"payloadPolicy", payloadPolicy},
+        {"nativeRuntimeArtifactReadiness", nativeArtifactCandidateJson(record, importedPath, cachePath)},
+        {"opaquePackageReadiness", opaquePackageCandidateJson(importedPath, cachePath)},
+        {"packageVersioningReadiness", packageVersioningReadinessJson(record)},
+        {"textureCookedBindingPolicy", textureCookedBindingPolicyJson(record, sourcePath, importedPath, cachePath)},
         {"files", files},
         {"registryHealth", {
             {"missing", record.missing},
@@ -2656,9 +3737,179 @@ nlohmann::json buildAssetPackageInspectionReport(const EditorRuntimeState& state
             {"cookedPayloadMissing", record.cookedPayloadMissing},
             {"dependenciesMissing", record.dependenciesMissing},
         }},
-        {"checkedScopes", nlohmann::json::array({"LoadedAssetRegistry", "ResolvedSourcePath", "ImportedMetadataJson", "CookedRuntimePayloadPath", "ThumbnailPath"})},
-        {"uncheckedScopes", nlohmann::json::array({"OpaqueRtpkgObjects", "GeneratedCachePayloadInternals", "ExternalProjectFiles", "BinaryPayloadDeepInspection"})},
-        {"limitation", "This report inspects selected transparent asset metadata and filesystem payload facts only. It does not parse binary cache payload internals, rewrite references, repair missing files, or inspect future opaque packages."},
+        {"checkedScopes", nlohmann::json::array({"LoadedAssetRegistry", "ResolvedSourcePath", "ImportedMetadataJson", "CookedRuntimePayloadPath", "ThumbnailPath", "NativeStandaloneArtifactCandidates", "OpaquePackageCandidates", "PackageVersioningReadiness", "TextureCookedBindingPolicy"})},
+        {"uncheckedScopes", nlohmann::json::array({"OpaqueRtpkgObjects", "GeneratedCachePayloadInternals", "ExternalProjectFiles", "BinaryPayloadDeepInspection", "PackageMigrationTables", "PlatformTextureTranscodeOutputs"})},
+        {"limitation", "This report inspects selected transparent asset metadata and filesystem payload facts plus expected native/package candidate paths, package versioning/debug-readiness policy, and texture/HDR cooked-binding policy. It does not emit native runtime files, transcode platform texture payloads, parse binary cache payload internals, rewrite references, repair missing files, load .rtpkg packages, migrate packages, or inspect package internals."},
+    };
+}
+
+nlohmann::json buildAssetThumbnailReadinessReport(const EditorRuntimeState& state, const AssetRecord& record) {
+    const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
+    const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
+    const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
+    const std::filesystem::path thumbnailPath = resolveAssetRecordPath(state, record.thumbnailPath);
+    const bool thumbnailMetadataPresent = !record.thumbnailPath.empty();
+    const bool thumbnailExists = !thumbnailPath.empty() && regularFileExists(thumbnailPath);
+    const bool rasterSourcePreview = !sourcePath.empty() && regularFileExists(sourcePath) && isRasterThumbnailPath(sourcePath);
+    const bool metadataPreviewCandidate = !sourcePath.empty() && regularFileExists(sourcePath) && isGeneratedPreviewDiskCacheCandidate(sourcePath);
+    std::string currentPreviewMode = "fallback-icon";
+    if (thumbnailExists) {
+        currentPreviewMode = "metadata-thumbnail-path";
+    } else if (rasterSourcePreview) {
+        currentPreviewMode = "raster-source-preview";
+    } else if (metadataPreviewCandidate) {
+        currentPreviewMode = "generated-source-preview";
+    }
+
+    return {
+        {"schema", "SelectedAssetThumbnailReadinessV1"},
+        {"asset", assetRecordSummaryJson(state, record)},
+        {"thumbnail", {
+            {"storedThumbnailPath", record.thumbnailPath},
+            {"resolvedThumbnailPath", thumbnailPath.empty() ? std::string{} : thumbnailPath.generic_string()},
+            {"metadataPresent", thumbnailMetadataPresent},
+            {"fileExists", thumbnailExists},
+            {"currentPreviewMode", currentPreviewMode},
+            {"fallbackPreviewAvailable", true},
+            {"missingThumbnailIsBlocking", false},
+        }},
+        {"previewInputs", {
+            {"source", pathInspectionJson(sourcePath, "source")},
+            {"importedMetadata", metadataFileInspectionJson(importedPath, "importedMetadata")},
+            {"cookedRuntimePayload", pathInspectionJson(cachePath, "cookedOrRuntimePayload")},
+            {"thumbnail", pathInspectionJson(thumbnailPath, "thumbnail")},
+            {"rasterSourcePreviewSupported", rasterSourcePreview},
+            {"generatedSourcePreviewSupported", metadataPreviewCandidate},
+        }},
+        {"asyncRenderedThumbnailPlan", {
+            {"schema", "AsyncRenderedThumbnailPlanV1"},
+            {"plannedJobTypes", nlohmann::json::array({"TextureThumbnail", "MaterialThumbnail", "PrefabModelThumbnail", "EnvironmentThumbnail", "LevelThumbnail"})},
+            {"plannedStages", nlohmann::json::array({"collect-preview-inputs", "load-runtime-preview-assets", "render-offscreen-preview", "write-thumbnail-asset", "update-registry-thumbnail-path", "refresh-content-browser-preview-cache"})},
+            {"jobCenterProgressImplemented", false},
+            {"cancellationImplemented", false},
+            {"asyncRenderedThumbnailGenerationImplemented", false},
+            {"currentFallback", "Content Browser uses existing thumbnailPath metadata, raster/source previews, generated source previews, or a type-correct fallback icon."},
+        }},
+        {"currentProgress", {
+            {"jobQueued", false},
+            {"jobRunning", false},
+            {"stage", "not-started"},
+            {"progress", 0.0},
+            {"cancelAvailable", false},
+        }},
+        {"policy", {
+            {"description", "This report exposes selected-asset thumbnail readiness and current fallback behavior without claiming that async rendered thumbnail jobs are implemented."},
+            {"safeToUseFallbackPreview", true},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"unsupportedActions", nlohmann::json::array({"async-rendered-thumbnail-generation", "thumbnail-job-cancellation", "job-center-thumbnail-progress", "material-prefab-environment-level-offscreen-thumbnail-rendering"})},
+        }},
+    };
+}
+
+nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state, const AssetRecord& record) {
+    const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
+    const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
+    const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
+    const std::string fallbackExtension = std::filesystem::path(record.sourcePath).extension().string();
+    const std::string sourceExtension = lowerString(sourcePath.extension().string().empty() ? fallbackExtension : sourcePath.extension().string());
+
+    std::string sourceClass = "unknown-or-generated";
+    bool currentImportSupported = false;
+    bool currentPlaceAfterImportSupported = false;
+    if (sourceExtension == ".gltf" || sourceExtension == ".glb") {
+        sourceClass = "gltf-model";
+        currentImportSupported = true;
+        currentPlaceAfterImportSupported = true;
+    } else if (sourceExtension == ".obj") {
+        sourceClass = "obj-model-partial";
+        currentImportSupported = true;
+    } else if (sourceExtension == ".mtl") {
+        sourceClass = "mtl-material-source-partial";
+        currentImportSupported = true;
+    } else if (sourceExtension == ".fbx") {
+        sourceClass = "fbx-model-unsupported";
+    } else if (sourceExtension == ".usd" || sourceExtension == ".usda" || sourceExtension == ".usdc" || sourceExtension == ".usdz") {
+        sourceClass = "usd-scene-unsupported";
+    } else if (sourceExtension == ".basis") {
+        sourceClass = "basis-texture-unsupported";
+    } else if (sourceExtension == ".dds" || sourceExtension == ".ktx" || sourceExtension == ".ktx2") {
+        sourceClass = "compressed-texture-container-policy-only";
+        currentImportSupported = true;
+    } else if (sourceExtension == ".png" || sourceExtension == ".jpg" || sourceExtension == ".jpeg" || sourceExtension == ".tga" || sourceExtension == ".bmp" || sourceExtension == ".hdr" || sourceExtension == ".exr") {
+        sourceClass = "texture-or-environment";
+        currentImportSupported = true;
+    }
+
+    auto productionFormatRow = [](const char* format, const char* sourceType, bool importSupported, bool runtimeCookingComplete, bool materialBindingComplete, bool viewportPlacementComplete, const char* note) {
+        return nlohmann::json{
+            {"format", format},
+            {"sourceType", sourceType},
+            {"importSupportedNow", importSupported},
+            {"runtimeCookingComplete", runtimeCookingComplete},
+            {"materialCreationComplete", materialBindingComplete},
+            {"textureBindingComplete", materialBindingComplete},
+            {"viewportPlacementComplete", viewportPlacementComplete},
+            {"note", note},
+        };
+    };
+
+    nlohmann::json productionMatrix = nlohmann::json::array({
+        productionFormatRow("glTF/GLB", "model-scene", true, true, true, true, "Current production baseline for source import, prefab metadata, cooked payload reuse, and import-and-place."),
+        productionFormatRow("OBJ/MTL", "model-material", true, false, false, false, "OBJ/MTL source discovery and preview/import routing exist, but full runtime cooking, material creation, texture binding, and viewport placement are not production-complete."),
+        productionFormatRow("FBX", "model-animation", false, false, false, false, "Full FBX importer remains future work."),
+        productionFormatRow("USD/USDZ", "scene-package", false, false, false, false, "USD/USDZ importer remains future work."),
+        productionFormatRow("Basis", "compressed-texture", false, false, false, false, "Standalone Basis source import and platform transcode policy remain future work."),
+        productionFormatRow("DDS/KTX/KTX2", "compressed-texture", true, false, false, false, "Container recognition exists through texture paths/policy reports, but native platform cook outputs are not emitted."),
+    });
+
+    return {
+        {"schema", "SelectedAssetImporterReadinessV1"},
+        {"asset", assetRecordSummaryJson(state, record)},
+        {"sourceFormat", {
+            {"extension", sourceExtension},
+            {"class", sourceClass},
+            {"currentImportSupported", currentImportSupported},
+            {"currentPlaceAfterImportSupported", currentPlaceAfterImportSupported},
+            {"sourceFile", pathInspectionJson(sourcePath, "source")},
+        }},
+        {"currentTransparentPipeline", {
+            {"importedMetadata", metadataFileInspectionJson(importedPath, "importedMetadata")},
+            {"cookedRuntimePayload", pathInspectionJson(cachePath, "cookedOrRuntimePayload")},
+            {"registryGuidBinding", !record.guid.empty()},
+            {"hasImportedMetadataPath", !record.importedPath.empty()},
+            {"hasCookedPayloadPath", !record.cachePath.empty()},
+            {"placementBlocked", assetPlacementBlocked(record)},
+            {"placementBlockReason", assetPlacementBlockReason(record)},
+        }},
+        {"productionImportMatrix", productionMatrix},
+        {"objMtlProductionReadiness", {
+            {"schema", "ObjMtlRuntimeCookingReadinessV1"},
+            {"sourceDiscoveryImplemented", currentImportSupported && (sourceExtension == ".obj" || sourceExtension == ".mtl")},
+            {"runtimeMeshCookingImplemented", false},
+            {"mtlMaterialCreationImplemented", false},
+            {"mtlTextureBindingImplemented", false},
+            {"viewportPlacementImplemented", false},
+            {"diagnosticsImplemented", false},
+            {"remainingStages", nlohmann::json::array({"parse-obj-geometry", "parse-mtl-materials", "resolve-texture-map-paths", "cook-runtime-mesh-payload", "create-material-assets", "bind-texture-assets-by-guid", "place-prefab-or-mesh-in-viewport", "write-import-diagnostics"})},
+        }},
+        {"compressedTexturePolicy", {
+            {"basisStandaloneImportImplemented", false},
+            {"rawCompressedTexturePolicyImplemented", false},
+            {"platformTranscodeImplemented", false},
+            {"nativeRtTextureEmissionImplemented", false},
+            {"policyReportAvailableInPackageInspection", true},
+            {"supportedRecognitionOnly", nlohmann::json::array({"dds", "ktx", "ktx2"})},
+            {"unsupportedStandaloneSources", nlohmann::json::array({"basis"})},
+        }},
+        {"unsupportedProductionImporters", nlohmann::json::array({"full-fbx-importer", "usd-usdz-importer", "basis-standalone-import", "full-obj-mtl-runtime-cooking", "obj-mtl-material-creation", "obj-mtl-texture-guid-binding", "obj-mtl-viewport-placement", "non-gltf-production-import-parity"})},
+        {"policy", {
+            {"description", "This report exposes selected-asset importer coverage and production import gaps without mutating the registry or claiming unsupported importers are implemented."},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"supportedNow", nlohmann::json::array({"gltf-glb-import-and-place", "transparent-registry-metadata-inspection", "selected-asset-importer-readiness-report"})},
+            {"unsupportedActions", nlohmann::json::array({"fbx-import", "usd-usdz-import", "basis-import", "full-obj-mtl-runtime-cooking", "obj-mtl-material-texture-binding", "obj-mtl-viewport-placement"})},
+        }},
     };
 }
 
@@ -2699,18 +3950,43 @@ bool writeAssetDependencyGraphReport(
         return false;
     }
     outPath = assetDependencyGraphReportPath(state, browserRoot);
+    const std::filesystem::path dotPath = assetDependencyGraphDotPath(state, browserRoot);
+    const std::filesystem::path htmlPath = assetDependencyGraphHtmlPath(state, browserRoot);
     std::error_code ec;
     std::filesystem::create_directories(outPath.parent_path(), ec);
     if (ec) {
         outError = "Could not create dependency graph report folder: " + ec.message();
         return false;
     }
+    nlohmann::json graph = buildAssetDependencyGraphReport(state);
+    graph["dotPath"] = dotPath.generic_string();
+    graph["htmlPath"] = htmlPath.generic_string();
+    graph["visualization"] = {
+        {"formats", nlohmann::json::array({"json", "graphviz-dot", "interactive-html"})},
+        {"dotPath", dotPath.generic_string()},
+        {"htmlPath", htmlPath.generic_string()},
+        {"description", "JSON, Graphviz DOT, and self-contained interactive HTML sidecars for loaded-registry dependency/reference graph review."},
+        {"interactiveHtmlFeatures", nlohmann::json::array({"search", "edge-filter", "clickable-node-details", "clickable-edge-details", "missing-target-highlighting", "current-scene-usage-nodes"})},
+        {"limitation", "This is an inspectable sidecar visualization, not a native in-editor graph panel, continuously refreshed project reference graph, or package/cache-internal graph."},
+    };
     std::ofstream file(outPath);
     if (!file.is_open()) {
         outError = "Could not write dependency graph report: " + outPath.string();
         return false;
     }
-    file << buildAssetDependencyGraphReport(state).dump(2);
+    file << graph.dump(2);
+    std::ofstream dotFile(dotPath);
+    if (!dotFile.is_open()) {
+        outError = "Could not write dependency graph DOT report: " + dotPath.string();
+        return false;
+    }
+    dotFile << buildAssetDependencyGraphDot(graph);
+    std::ofstream htmlFile(htmlPath);
+    if (!htmlFile.is_open()) {
+        outError = "Could not write dependency graph HTML report: " + htmlPath.string();
+        return false;
+    }
+    htmlFile << buildAssetDependencyGraphHtml(graph);
     return true;
 }
 
@@ -2730,12 +4006,29 @@ bool writeAssetProjectReferenceIndexReport(
         outError = "Could not create project reference index folder: " + ec.message();
         return false;
     }
+    nlohmann::json index = buildAssetProjectReferenceIndexReport(state, browserRoot);
+    const std::filesystem::path persistentPath = assetProjectReferenceIndexPersistentPath(state, browserRoot);
+    index["persistentIndexPath"] = persistentPath.generic_string();
+    index["reportPath"] = outPath.generic_string();
+
     std::ofstream file(outPath);
     if (!file.is_open()) {
         outError = "Could not write project reference index: " + outPath.string();
         return false;
     }
-    file << buildAssetProjectReferenceIndexReport(state, browserRoot).dump(2);
+    file << index.dump(2);
+
+    std::filesystem::create_directories(persistentPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create persistent project reference index folder: " + ec.message();
+        return false;
+    }
+    std::ofstream persistentFile(persistentPath);
+    if (!persistentFile.is_open()) {
+        outError = "Could not write persistent project reference index: " + persistentPath.string();
+        return false;
+    }
+    persistentFile << index.dump(2);
     return true;
 }
 
@@ -2856,6 +4149,50 @@ bool writeAssetPackageInspectionReport(
     return true;
 }
 
+bool writeAssetThumbnailReadinessReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetRecord& record,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedAssetThumbnailReadinessReportPath(state, browserRoot, record.guid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create thumbnail readiness report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write thumbnail readiness report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetThumbnailReadinessReport(state, record).dump(2);
+    return true;
+}
+
+bool writeAssetImporterReadinessReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const AssetRecord& record,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedAssetImporterReadinessReportPath(state, browserRoot, record.guid);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create importer readiness report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write importer readiness report: " + outPath.string();
+        return false;
+    }
+    file << buildAssetImporterReadinessReport(state, record).dump(2);
+    return true;
+}
+
 bool writeAssetValidationReport(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, std::filesystem::path& outPath, std::string& outError, const AssetGuid& targetGuid = {}) {
     if (state.assetRegistry == nullptr) {
         outError = "Asset registry is unavailable.";
@@ -2878,6 +4215,224 @@ bool writeAssetValidationReport(const EditorRuntimeState& state, const std::file
 }
 
 } // namespace
+
+void AssetBrowserPanel::drawDependencyGraphPreview(const EditorRuntimeState& state) {
+    if (state.assetRegistry == nullptr) {
+        ImGui::TextDisabled("Dependency graph preview requires a loaded asset registry.");
+        return;
+    }
+
+    const nlohmann::json graph = buildAssetDependencyGraphReport(state);
+    ImGui::SeparatorText("Dependency Graph Preview");
+    ImGui::TextDisabled(
+        "Loaded registry graph: assets=%llu edges=%llu missing=%llu scene=%llu",
+        static_cast<unsigned long long>(graph.value("assetCount", 0u)),
+        static_cast<unsigned long long>(graph.value("edgeCount", 0u)),
+        static_cast<unsigned long long>(graph.value("missingTargetCount", 0u)),
+        static_cast<unsigned long long>(graph.value("currentSceneUsageCount", 0u)));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Inspectable in-editor; not a background project-wide index.");
+    ImGui::SetNextItemWidth(260.0f);
+    ImGui::InputTextWithHint("##DependencyGraphPreviewFilter", "Filter graph name, GUID, type, role", dependencyGraphFilter_.data(), dependencyGraphFilter_.size());
+    const std::string filter = lowerString(trimString(dependencyGraphFilter_.data()));
+    auto matches = [&](std::initializer_list<std::string> values) {
+        if (filter.empty()) {
+            return true;
+        }
+        for (std::string value : values) {
+            if (lowerString(std::move(value)).find(filter) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (ImGui::BeginTabBar("DependencyGraphPreviewTabs")) {
+        if (ImGui::BeginTabItem("Assets")) {
+            if (ImGui::BeginTable("DependencyGraphPreviewAssetNodes", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2(0.0f, 220.0f))) {
+                ImGui::TableSetupColumn("Name");
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 86.0f);
+                ImGui::TableSetupColumn("Outgoing", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                ImGui::TableSetupColumn("Incoming", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                ImGui::TableSetupColumn("Scene", ImGuiTableColumnFlags_WidthFixed, 58.0f);
+                ImGui::TableSetupColumn("GUID");
+                ImGui::TableHeadersRow();
+                for (const nlohmann::json& node : graph.value("nodes", nlohmann::json::array())) {
+                    const std::string guid = node.value("guid", std::string{});
+                    const std::string name = node.value("displayName", guid);
+                    const std::string type = node.value("assetType", std::string("Asset"));
+                    if (!matches({name, type, guid})) {
+                        continue;
+                    }
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(name.empty() ? guid.c_str() : name.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(type.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%llu", static_cast<unsigned long long>(node.value("outgoingDependencyCount", 0u) + node.value("storedReferenceCount", 0u)));
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("%llu", static_cast<unsigned long long>(node.value("incomingRegistryEdgeCount", 0u)));
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%llu", static_cast<unsigned long long>(node.value("currentSceneUsageCount", 0u)));
+                    ImGui::TableSetColumnIndex(5);
+                    ImGui::TextUnformatted(guid.c_str());
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Edges")) {
+            if (ImGui::BeginTable("DependencyGraphPreviewEdges", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2(0.0f, 220.0f))) {
+                ImGui::TableSetupColumn("Source");
+                ImGui::TableSetupColumn("Relation", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+                ImGui::TableSetupColumn("Role");
+                ImGui::TableSetupColumn("Target");
+                ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                ImGui::TableHeadersRow();
+                for (const nlohmann::json& edge : graph.value("edges", nlohmann::json::array())) {
+                    const std::string sourceName = edge.value("sourceDisplayName", std::string{});
+                    const std::string sourceGuid = edge.value("sourceGuid", std::string{});
+                    const std::string targetGuid = edge.value("targetGuid", std::string{});
+                    const std::string relation = edge.value("relation", std::string{});
+                    const std::string role = edge.value("role", relation);
+                    if (!matches({sourceName, sourceGuid, targetGuid, relation, role})) {
+                        continue;
+                    }
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(sourceName.empty() ? sourceGuid.c_str() : sourceName.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(relation.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(role.c_str());
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::TextUnformatted(targetGuid.c_str());
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::TextColored(edge.value("targetFound", false) ? ImVec4(0.54f, 0.82f, 0.60f, 1.0f) : ImVec4(0.95f, 0.36f, 0.32f, 1.0f), "%s", edge.value("targetFound", false) ? "Found" : "Missing");
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Missing")) {
+            if (ImGui::BeginTable("DependencyGraphPreviewMissing", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2(0.0f, 180.0f))) {
+                ImGui::TableSetupColumn("Owner");
+                ImGui::TableSetupColumn("Relation", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+                ImGui::TableSetupColumn("Role");
+                ImGui::TableSetupColumn("Missing GUID");
+                ImGui::TableHeadersRow();
+                for (const nlohmann::json& missing : graph.value("missingTargets", nlohmann::json::array())) {
+                    const std::string sourceName = missing.value("sourceDisplayName", std::string{});
+                    const std::string sourceGuid = missing.value("sourceGuid", std::string{});
+                    const std::string targetGuid = missing.value("targetGuid", std::string{});
+                    const std::string relation = missing.value("relation", std::string{});
+                    const std::string role = missing.value("role", relation);
+                    if (!matches({sourceName, sourceGuid, targetGuid, relation, role})) {
+                        continue;
+                    }
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(sourceName.empty() ? sourceGuid.c_str() : sourceName.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(relation.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(role.c_str());
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::TextColored(ImVec4(0.95f, 0.36f, 0.32f, 1.0f), "%s", targetGuid.c_str());
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Scene Uses")) {
+            if (ImGui::BeginTable("DependencyGraphPreviewSceneUses", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2(0.0f, 180.0f))) {
+                ImGui::TableSetupColumn("Entity");
+                ImGui::TableSetupColumn("Component");
+                ImGui::TableSetupColumn("Field");
+                ImGui::TableSetupColumn("GUID");
+                ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                ImGui::TableHeadersRow();
+                for (const nlohmann::json& usage : graph.value("currentSceneUsages", nlohmann::json::array())) {
+                    const std::string entity = usage.value("entity", std::string{});
+                    const std::string component = usage.value("component", std::string{});
+                    const std::string field = usage.value("field", std::string{});
+                    const std::string guid = usage.value("guid", std::string{});
+                    if (!matches({entity, component, field, guid})) {
+                        continue;
+                    }
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(entity.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(component.c_str());
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(field.c_str());
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::TextUnformatted(guid.c_str());
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::TextColored(usage.value("assetFound", false) ? ImVec4(0.54f, 0.82f, 0.60f, 1.0f) : ImVec4(0.95f, 0.36f, 0.32f, 1.0f), "%s", usage.value("assetFound", false) ? "Found" : "Missing");
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
+void AssetBrowserPanel::drawExternalChangeConfirmPrompt(EditorRequests& requests) {
+    if (externalChangePromptOpen_) {
+        ImGui::OpenPopup("Confirm External Changes");
+        externalChangePromptOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Confirm External Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::TextWrapped("Generated asset files for this asset have external source-control changes. Confirm before running %s because the existing reimport path may overwrite generated metadata, payload, or thumbnail files.", pendingExternalChangeAction_.c_str());
+    ImGui::SeparatorText("Asset");
+    ImGui::Text("%s", pendingExternalChangeDisplayName_.empty() ? pendingExternalChangeGuid_.c_str() : pendingExternalChangeDisplayName_.c_str());
+    ImGui::TextDisabled("GUID: %s", pendingExternalChangeGuid_.c_str());
+    if (!pendingExternalChangeSourcePath_.empty()) {
+        ImGui::TextWrapped("Source: %s", pendingExternalChangeSourcePath_.string().c_str());
+    }
+    ImGui::SeparatorText("Changed Generated Files");
+    if (pendingExternalChangeRiskLines_.empty()) {
+        ImGui::TextDisabled("No changed generated files are currently listed.");
+    } else {
+        for (const std::string& line : pendingExternalChangeRiskLines_) {
+            ImGui::BulletText("%s", line.c_str());
+        }
+    }
+    ImGui::Separator();
+    ImGui::TextWrapped("This prompt does not reload files automatically or resolve provider conflicts. Use Git Diff, Git Status, Reload Readiness, or Review Overwrite Risk before confirming if you need more context.");
+
+    const std::string confirmLabel = std::string("Confirm ") + pendingExternalChangeAction_;
+    if (ImGui::Button(confirmLabel.c_str(), ImVec2(170.0f, 0.0f))) {
+        requests.reimportAsset = pendingExternalChangeGuid_;
+        const std::string operation = pendingExternalChangeAction_.empty() ? std::string("Reimport Asset") : pendingExternalChangeAction_;
+        recordImportOperation(operation, pendingExternalChangeSourcePath_, {}, "Reimport", pendingExternalChangeGuid_);
+        status_ = "Queued " + operation + " after external-change confirmation: " + (pendingExternalChangeDisplayName_.empty() ? pendingExternalChangeGuid_ : pendingExternalChangeDisplayName_);
+        pendingExternalChangeGuid_.clear();
+        pendingExternalChangeAction_.clear();
+        pendingExternalChangeDisplayName_.clear();
+        pendingExternalChangeSourcePath_.clear();
+        pendingExternalChangeRiskLines_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+        status_ = "External-change prompt canceled";
+        pendingExternalChangeGuid_.clear();
+        pendingExternalChangeAction_.clear();
+        pendingExternalChangeDisplayName_.clear();
+        pendingExternalChangeSourcePath_.clear();
+        pendingExternalChangeRiskLines_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
 
 void AssetBrowserPanel::invalidateThumbnails() {
     thumbnailCache_.clear();
@@ -4264,7 +5819,9 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
             std::string error;
             if (writeAssetDependencyGraphReport(state, browserRoot_, reportPath, error)) {
                 requests.openFilePath = reportPath;
-                status_ = "Asset dependency graph report: " + reportPath.string();
+                status_ = "Asset dependency graph report: " + reportPath.string()
+                    + " (DOT: " + assetDependencyGraphDotPath(state, browserRoot_).string()
+                    + "; HTML: " + assetDependencyGraphHtmlPath(state, browserRoot_).string() + ")";
             } else {
                 status_ = "Asset dependency graph report failed: " + error;
             }
@@ -4291,6 +5848,7 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                 status_ = "Asset duplicate report failed: " + error;
             }
         }
+        drawDependencyGraphPreview(state);
         ImGui::Separator();
         ImGui::SetNextItemWidth(160.0f);
         ImGui::InputTextWithHint("##virtualFolder", "Virtual folder", virtualFolderBuffer_.data(), virtualFolderBuffer_.size());
@@ -4472,29 +6030,7 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         return status;
     };
     auto summarizeRecordSourceControl = [&](const AssetRecord& record) {
-        struct Candidate {
-            const char* label = "";
-            std::filesystem::path path;
-        };
-        const std::array<Candidate, 3> candidates = {{
-            {"Src", resolveAssetRecordPath(state, record.sourcePath)},
-            {"Meta", resolveAssetRecordPath(state, record.importedPath)},
-            {"Payload", resolveAssetRecordPath(state, record.cachePath)},
-        }};
-        std::string fallback;
-        for (const Candidate& candidate : candidates) {
-            if (candidate.path.empty()) {
-                continue;
-            }
-            const std::string status = cachedSourceControlStatus(candidate.path);
-            if (sourceControlDiffReportAvailable(status)) {
-                return std::string(candidate.label) + ": " + status;
-            }
-            if (fallback.empty()) {
-                fallback = status;
-            }
-        }
-        return fallback.empty() ? std::string("Unavailable") : fallback;
+        return summarizeAssetSourceControlState(state, record, cachedSourceControlStatus);
     };
     auto overwriteRisksForRecord = [&](const AssetRecord& record) {
         return collectAssetOverwriteRisks(state, record, cachedSourceControlStatus);
@@ -4649,10 +6185,10 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
             ImGui::TableSetColumnIndex(5);
             ImGui::TextUnformatted(record.importedPath.c_str());
             ImGui::TableSetColumnIndex(6);
-            const std::string scmStatus = summarizeRecordSourceControl(record);
-            ImGui::TextColored(sourceControlStatusTextColor(scmStatus.find(':') == std::string::npos ? scmStatus : trimString(scmStatus.substr(scmStatus.find(':') + 1))), "%s", scmStatus.c_str());
+            const AssetSourceControlSummary scmSummary = summarizeRecordSourceControl(record);
+            ImGui::TextColored(sourceControlStatusTextColor(scmSummary.primaryStatus), "%s", scmSummary.label.c_str());
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                ImGui::SetTooltip("First changed Git status among source, metadata, and payload paths");
+                ImGui::SetTooltip("%s", scmSummary.tooltip.c_str());
             }
             ImGui::TableSetColumnIndex(7);
             ImGui::TextUnformatted(joinTagList(record.tags).c_str());
@@ -4759,6 +6295,46 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
         if (!canDiff) {
             ImGui::EndDisabled();
         }
+        ImGui::SameLine();
+        if (!canStatusReport) {
+            ImGui::BeginDisabled();
+        }
+        if (contentActionButton("ProviderReadiness", EditorGlyphIcon::Details, "Provider Readiness", "Write a Git/Perforce provider readiness and asset lock/ownership report for this path")) {
+            std::filesystem::path reportPath;
+            std::string error;
+            if (writeSourceControlProviderReadinessReport(state, browserRoot_, sourceControlRoot, path, status, reportPath, error)) {
+                requests.openFilePath = reportPath;
+                status_ = "Source-control provider readiness report: " + reportPath.string();
+            } else {
+                status_ = "Source-control provider readiness failed: " + error;
+            }
+        }
+        if (!canStatusReport) {
+            ImGui::EndDisabled();
+        }
+        auto drawActionPlanButton = [&](const char* buttonId, const char* label, const char* action, const char* tooltip) {
+            ImGui::SameLine();
+            if (!canStatusReport) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton(buttonId, EditorGlyphIcon::Details, label, tooltip)) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeSourceControlActionPlanReport(state, browserRoot_, sourceControlRoot, path, action, status, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = std::string("Source-control ") + action + " plan: " + reportPath.string();
+                } else {
+                    status_ = std::string("Source-control ") + action + " plan failed: " + error;
+                }
+            }
+            if (!canStatusReport) {
+                ImGui::EndDisabled();
+            }
+        };
+        drawActionPlanButton("PlanRevert", "Plan Revert", "revert", "Write a dry-run Git revert/clean action plan for this path; no mutation is executed");
+        drawActionPlanButton("PlanCheckout", "Plan Checkout", "checkout", "Write a dry-run Git checkout action plan for this path; no mutation is executed");
+        drawActionPlanButton("PlanLock", "Plan Lock", "lock", "Write a provider lock action plan and current Git/Perforce limitation report");
+        drawActionPlanButton("PlanSubmit", "Plan Submit", "submit", "Write a dry-run Git stage/commit/push action plan for this path; no mutation is executed");
         ImGui::PopID();
     };
     if (ImGui::SmallButton("Refresh Source Control")) {
@@ -4917,6 +6493,17 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             } else {
                 ImGui::TextColored(ImVec4(0.54f, 0.82f, 0.60f, 1.0f), "Registry Metadata: Saved");
             }
+            const AssetSourceControlSummary selectedSourceControlSummary = summarizeAssetSourceControlState(state, record, sourceControlStatus);
+            ImGui::TextColored(
+                sourceControlStatusTextColor(selectedSourceControlSummary.primaryStatus),
+                "Source Control Risk: %s",
+                selectedSourceControlSummary.label.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", selectedSourceControlSummary.tooltip.c_str());
+            }
+            if (selectedSourceControlSummary.hasGeneratedOverwriteRisk) {
+                ImGui::TextWrapped("Generated asset files have external Git changes. Review the overwrite-risk report before reimporting, rebuilding, or deleting generated files.");
+            }
             if (state.editorPrefs != nullptr) {
                 const bool favoriteAsset = assetGuidListContains(state.editorPrefs->favoriteAssetGuids, record.guid);
                 if (favoriteAsset) {
@@ -5015,6 +6602,27 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             } else {
                 ImGui::TextDisabled("Thumbnail state: no generated thumbnail metadata yet");
             }
+            if (contentActionButton("ThumbnailReadinessReport", EditorGlyphIcon::Details, "Thumbnail Readiness", "Write and open thumbnail fallback/progress readiness for this asset")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetThumbnailReadinessReport(state, browserRoot_, record, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset thumbnail readiness report: " + reportPath.string();
+                } else {
+                    status_ = "Asset thumbnail readiness failed: " + error;
+                }
+            }
+            ImGui::SameLine();
+            if (contentActionButton("ImporterReadinessReport", EditorGlyphIcon::Details, "Importer Readiness", "Write and open source-format import pipeline readiness for this asset")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetImporterReadinessReport(state, browserRoot_, record, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset importer readiness report: " + reportPath.string();
+                } else {
+                    status_ = "Asset importer readiness failed: " + error;
+                }
+            }
             ImGui::TextWrapped("Source: %s", record.sourcePath.c_str());
             drawSourceControlStatus("Source", resolveAssetRecordPath(state, record.sourcePath));
             drawSourceControlActions("RecordSourceSourceControlActions", resolveAssetRecordPath(state, record.sourcePath));
@@ -5085,7 +6693,25 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             const std::filesystem::path resolvedSourceForReveal = resolveAssetRecordPath(state, record.sourcePath);
             const std::filesystem::path resolvedImportedForReveal = resolveAssetRecordPath(state, record.importedPath);
             const std::filesystem::path resolvedCacheForReveal = resolveAssetRecordPath(state, record.cachePath);
-            const std::vector<AssetOverwriteRisk> overwriteRisks = collectAssetOverwriteRisks(state, record, sourceControlStatus);
+            const std::vector<AssetOverwriteRisk>& overwriteRisks = selectedSourceControlSummary.generatedRisks;
+            auto queueReimportWithExternalChangePrompt = [&](const char* actionLabel, const std::filesystem::path& sourcePath) {
+                if (overwriteRisks.empty()) {
+                    requests.reimportAsset = record.guid;
+                    recordImportOperation(actionLabel, sourcePath, {}, "Reimport", record.guid);
+                    status_ = std::string("Queued ") + actionLabel + ": " + (record.displayName.empty() ? record.guid : record.displayName);
+                    return;
+                }
+                pendingExternalChangeGuid_ = record.guid;
+                pendingExternalChangeAction_ = actionLabel;
+                pendingExternalChangeDisplayName_ = record.displayName.empty() ? record.guid : record.displayName;
+                pendingExternalChangeSourcePath_ = sourcePath;
+                pendingExternalChangeRiskLines_.clear();
+                for (const AssetOverwriteRisk& risk : overwriteRisks) {
+                    pendingExternalChangeRiskLines_.push_back(risk.label + ": " + risk.status + " - " + risk.path.string());
+                }
+                externalChangePromptOpen_ = true;
+                status_ = std::string("External-change confirmation required for ") + actionLabel + ": " + pendingExternalChangeDisplayName_;
+            };
             auto drawRevealAction = [&](const char* id, const char* label, const char* tooltip, const std::filesystem::path& path) {
                 const bool canReveal = !path.empty() && std::filesystem::exists(path);
                 if (!canReveal) {
@@ -5137,9 +6763,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                 ImGui::BeginDisabled();
             }
             if (contentActionButton("RepairAsset", EditorGlyphIcon::Refresh, "Repair Asset", "Queue reimport to repair stale, failed, missing-metadata, or missing-payload asset state")) {
-                requests.reimportAsset = record.guid;
-                recordImportOperation("Repair Asset", resolvedSourceForReveal, {}, "Reimport", record.guid);
-                status_ = "Queued asset repair: " + (record.displayName.empty() ? record.guid : record.displayName);
+                queueReimportWithExternalChangePrompt("Repair Asset", resolvedSourceForReveal);
             }
             if (!canRepairByReimport || !repairNeeded) {
                 ImGui::EndDisabled();
@@ -5172,6 +6796,16 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                     } else {
                         status_ = "Asset overwrite-risk report failed: " + error;
                     }
+                }
+            }
+            if (contentActionButton("ExternalReloadReadinessReport", EditorGlyphIcon::Details, "Reload Readiness", "Write and open a safe external-change reload readiness report for this asset")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeAssetExternalReloadReadinessReport(state, browserRoot_, record, sourceControlStatus, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Asset external reload readiness report: " + reportPath.string();
+                } else {
+                    status_ = "Asset external reload readiness failed: " + error;
                 }
             }
             if (contentActionButton("ValidateSelectedAsset", EditorGlyphIcon::Details, "Validate Asset", "Write a validation report for this asset and open it")) {
@@ -5270,9 +6904,14 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             if (!canReplaceReferences) {
                 ImGui::BeginDisabled();
             }
-            if (contentActionButton("ReplaceReferences", EditorGlyphIcon::Refresh, "Replace References", "Replace current-scene and registry references to this asset with the replacement GUID")) {
-                requests.replaceAssetReferences = EditorReplaceAssetReferencesRequest{record.guid, replacementRecord->guid};
+            if (contentActionButton("ReplaceReferences", EditorGlyphIcon::Refresh, "Replace References", "Replace current-scene and loaded-registry references to this asset with the replacement GUID")) {
+                requests.replaceAssetReferences = EditorReplaceAssetReferencesRequest{record.guid, replacementRecord->guid, false};
                 status_ = "Queued reference replacement: " + record.guid + " -> " + replacementRecord->guid;
+            }
+            ImGui::SameLine();
+            if (contentActionButton("ReplaceProjectReferences", EditorGlyphIcon::Refresh, "Replace Project References", "Replace loaded references and saved project JSON metadata references; writes backups and a report")) {
+                requests.replaceAssetReferences = EditorReplaceAssetReferencesRequest{record.guid, replacementRecord->guid, true};
+                status_ = "Queued project-wide reference replacement: " + record.guid + " -> " + replacementRecord->guid;
             }
             if (!canReplaceReferences) {
                 ImGui::EndDisabled();
@@ -5295,6 +6934,18 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                 }
                 return nullptr;
             };
+            size_t missingDependencyCount = 0;
+            size_t unambiguousMissingDependencyRepairCount = 0;
+            for (const AssetDependency& dependency : record.dependencies) {
+                if (dependency.guid.empty() || findRecordByGuid(dependency.guid) != nullptr) {
+                    continue;
+                }
+                ++missingDependencyCount;
+                const nlohmann::json repairCandidates = dependencyRepairCandidatesJson(state, record, dependency);
+                if (repairCandidates.size() == 1u) {
+                    ++unambiguousMissingDependencyRepairCount;
+                }
+            }
             auto drawLinkedAssetTable = [&](const char* label, const std::vector<AssetDependency>* dependencies, const std::vector<AssetGuid>* references) {
                 const size_t count = dependencies != nullptr ? dependencies->size() : references != nullptr ? references->size() : 0;
                 if (count == 0) {
@@ -5342,6 +6993,25 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             };
             drawLinkedAssetTable("Dependencies", &record.dependencies, nullptr);
             drawLinkedAssetTable("References", nullptr, &record.references);
+            if (missingDependencyCount > 0) {
+                ImGui::SeparatorText("Dependency Repair");
+                ImGui::TextColored(
+                    unambiguousMissingDependencyRepairCount > 0 ? ImVec4(0.95f, 0.68f, 0.28f, 1.0f) : ImVec4(0.95f, 0.36f, 0.32f, 1.0f),
+                    "Missing dependencies: %zu; unambiguous repair candidates: %zu",
+                    missingDependencyCount,
+                    unambiguousMissingDependencyRepairCount);
+                ImGui::TextWrapped("This action rewrites only this loaded registry record's missing dependency GUIDs when the candidate report finds exactly one replacement. Saved project files, source files, and package/cache internals are not rewritten.");
+                if (unambiguousMissingDependencyRepairCount == 0) {
+                    ImGui::BeginDisabled();
+                }
+                if (contentActionButton("RepairUnambiguousDependencies", EditorGlyphIcon::Refresh, "Repair Unambiguous Dependencies", "Rewrite this record's missing dependency GUIDs only when each repaired dependency has exactly one candidate")) {
+                    requests.repairMissingAssetDependencies = EditorRepairMissingAssetDependenciesRequest{record.guid, true};
+                    status_ = "Queued missing dependency repair: " + (record.displayName.empty() ? record.guid : record.displayName);
+                }
+                if (unambiguousMissingDependencyRepairCount == 0) {
+                    ImGui::EndDisabled();
+                }
+            }
             auto drawReverseRegistryReferences = [&] {
                 struct ReverseReferenceRow {
                     const AssetRecord* owner = nullptr;
@@ -5473,11 +7143,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                 ImGui::BeginDisabled();
             }
             if (contentActionButton("RebuildPayload", EditorGlyphIcon::Refresh, "Rebuild Payload", "Queue a reimport to regenerate the missing cooked/runtime payload")) {
-                requests.reimportAsset = record.guid;
-                recordImportOperation("Rebuild Payload", resolvedSourcePath, {}, "Reimport", record.guid);
-                status_ = overwriteRisks.empty()
-                    ? "Queued payload rebuild: " + record.displayName
-                    : "Queued payload rebuild after overwrite warning: " + record.displayName;
+                queueReimportWithExternalChangePrompt("Rebuild Payload", resolvedSourcePath);
             }
             if (!canRebuildPayload) {
                 ImGui::EndDisabled();
@@ -5491,11 +7157,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                 ImGui::BeginDisabled();
             }
             if (contentActionButton("ReimportRecord", EditorGlyphIcon::Refresh, "Reimport", "Queue this asset for reimport")) {
-                requests.reimportAsset = record.guid;
-                recordImportOperation("Reimport Asset", resolvedSourcePath, {}, "Reimport", record.guid);
-                status_ = overwriteRisks.empty()
-                    ? "Queued reimport: " + record.displayName
-                    : "Queued reimport after overwrite warning: " + record.displayName;
+                queueReimportWithExternalChangePrompt("Reimport Asset", resolvedSourcePath);
             }
             if (!canReimport) {
                 ImGui::EndDisabled();
@@ -5529,6 +7191,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
         }
         ImGui::Text("Current Folder: %s", currentPath_.empty() ? "(none)" : relativeContentPath(currentPath_).c_str());
     }
+    drawExternalChangeConfirmPrompt(requests);
 }
 
 void AssetBrowserPanel::drawImportSettingsDialog(EditorRequests& requests) {

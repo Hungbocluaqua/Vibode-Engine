@@ -133,6 +133,10 @@ private:
         double importDirectoryMs = 0.0;
         double importInspectMs = 0.0;
         double importWriteMs = 0.0;
+        double importStageElapsedMs = 0.0;
+        std::string cookManifestStatus;
+        size_t cookPlannedFileCount = 0;
+        size_t cookCopiedFileCount = 0;
         bool hasAssetImportRetry = false;
         bool assetImportPlaceAfterImport = false;
         EditorImportAssetRequest assetImportRetry{};
@@ -174,6 +178,7 @@ private:
     bool renderSettingsDialogOpen_ = false;
     EditorRenderJobKind pendingRenderKind_ = EditorRenderJobKind::Image;
     std::array<char, 512> renderOutputRoot_{};
+    std::string renderOutputPresetName_ = "Current View";
     int renderRequestedWidth_ = 1280;
     int renderRequestedHeight_ = 720;
     float renderResolutionScale_ = 1.0f;

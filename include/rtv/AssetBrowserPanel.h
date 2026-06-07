@@ -77,7 +77,9 @@ private:
     void drawPathList(const EditorRuntimeState& state, EditorRequests& requests);
     void drawPathContextMenu(const std::filesystem::path& path, bool isDirectory, EditorRequests& requests);
     void drawRegistryTable(const EditorRuntimeState& state, EditorRequests& requests);
+    void drawDependencyGraphPreview(const EditorRuntimeState& state);
     void drawDetails(const EditorRuntimeState& state, EditorRequests& requests);
+    void drawExternalChangeConfirmPrompt(EditorRequests& requests);
     void drawImportSettingsDialog(EditorRequests& requests);
     void recordImportOperation(
         const std::string& label,
@@ -110,6 +112,7 @@ private:
     std::array<char, 128> bulkTagBuffer_{};
     std::array<char, 128> collectionNameBuffer_{};
     std::array<char, 128> virtualFolderBuffer_{};
+    std::array<char, 128> dependencyGraphFilter_{};
     AssetGuid assetRenameBufferGuid_;
     AssetGuid assetTagsBufferGuid_;
     int registryTypeFilter_ = 0;
@@ -118,6 +121,12 @@ private:
     int registryCollectionFilter_ = 0;
     int registryFavoriteFilter_ = 0;
     std::string selectedRegistryGroupId_;
+    bool externalChangePromptOpen_ = false;
+    AssetGuid pendingExternalChangeGuid_;
+    std::string pendingExternalChangeAction_;
+    std::string pendingExternalChangeDisplayName_;
+    std::filesystem::path pendingExternalChangeSourcePath_;
+    std::vector<std::string> pendingExternalChangeRiskLines_;
     std::string status_;
     std::filesystem::path browserRoot_;
     std::filesystem::path contentRoot_;

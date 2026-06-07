@@ -2,6 +2,7 @@
 
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
+#include "rtv/EditorLog.h"
 #include "rtv/EditorPreferences.h"
 #include "rtv/EditorTransformUtils.h"
 #include "rtv/EditorUiStyle.h"
@@ -16,6 +17,7 @@
 #include <cctype>
 #include <cfloat>
 #include <cmath>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <utility>
@@ -168,6 +170,139 @@ std::vector<float> defaultMorphWeightsForMesh(const MeshAsset& mesh, size_t targ
         weights[i] = mesh.defaultMorphWeights[i];
     }
     return weights;
+}
+
+std::string safeInspectorReportName(std::string value) {
+    if (value.empty()) {
+        value = "entity";
+    }
+    for (char& c : value) {
+        const unsigned char ch = static_cast<unsigned char>(c);
+        if (!std::isalnum(ch) && c != '_' && c != '-') {
+            c = '_';
+        }
+    }
+    return value;
+}
+
+std::filesystem::path inspectorAnimationReadinessReportPath(const EditorRuntimeState& state, const Entity& entity) {
+    std::filesystem::path root;
+    if (state.project != nullptr && !state.project->savedRoot.empty()) {
+        root = state.project->savedRoot;
+    } else if (state.scenePath != nullptr && state.scenePath->has_value() && !state.scenePath->value().empty()) {
+        root = state.scenePath->value().parent_path() / "Saved";
+    } else {
+        root = std::filesystem::current_path() / "Saved";
+    }
+    return root / "Reports" / ("animation_production_readiness_" + safeInspectorReportName(entity.name) + "_" + std::to_string(entity.uuid) + ".json");
+}
+
+nlohmann::json buildInspectorAnimationProductionReadinessReport(
+    const EditorRuntimeState& state,
+    const Entity& entity,
+    const AnimationPlayer& player,
+    const MeshRenderer* renderer,
+    const MeshAsset* mesh) {
+    const size_t morphTargetCount = meshMorphTargetCount(mesh);
+    const bool rendererUsesSkin = renderer != nullptr && renderer->skinIndex >= 0;
+    bool sceneSkinPayloadAvailable = false;
+    if (rendererUsesSkin && state.sceneDocument != nullptr) {
+        const std::vector<SceneSkinAsset>& skins = state.sceneDocument->sceneSkins();
+        const size_t skinIndex = static_cast<size_t>(renderer->skinIndex);
+        sceneSkinPayloadAvailable = skinIndex < skins.size() && !skins[skinIndex].joints.empty() && !skins[skinIndex].inverseBindMatrices.empty();
+    }
+    return {
+        {"schema", "AnimationProductionReadinessV1"},
+        {"entity", {
+            {"name", entity.name},
+            {"uuid", entity.uuid},
+            {"hasMeshRenderer", renderer != nullptr},
+            {"hasAnimationPlayer", true},
+        }},
+        {"animationPlayer", {
+            {"animationGuid", player.animationGuid},
+            {"animationPath", player.animationPath.generic_string()},
+            {"enabled", player.enabled},
+            {"playOnStart", player.playOnStart},
+            {"playing", player.playing},
+            {"loop", player.loop},
+            {"applyRootMotion", player.applyRootMotion},
+            {"applyMorphWeights", player.applyMorphWeights},
+            {"playbackSpeed", player.playbackSpeed},
+            {"currentTimeSeconds", player.currentTimeSeconds},
+        }},
+        {"currentSupport", {
+            {"inspectorPreviewControlsImplemented", true},
+            {"decodedTrackSamplingImplemented", true},
+            {"rootMotionMetadataImplemented", true},
+            {"cpuMorphWeightApplicationImplemented", true},
+            {"cpuSkinningIntoRuntimeMeshImplemented", true},
+            {"transformOnlyPreviewRouteImplemented", true},
+        }},
+        {"selectedMesh", {
+            {"available", mesh != nullptr},
+            {"name", mesh != nullptr ? mesh->name : std::string{}},
+            {"vertexCount", mesh != nullptr ? mesh->vertices.size() : 0u},
+            {"primitiveCount", mesh != nullptr ? mesh->primitives.size() : 0u},
+            {"morphTargetCount", morphTargetCount},
+            {"rendererMorphWeightCount", renderer != nullptr ? renderer->morphWeights.size() : 0u},
+            {"skinIndex", renderer != nullptr ? renderer->skinIndex : -1},
+            {"sceneSkinPayloadAvailable", sceneSkinPayloadAvailable},
+            {"rendererUsesSkin", rendererUsesSkin},
+        }},
+        {"productionReadiness", {
+            {"nativeRtSkeletalMeshImplemented", false},
+            {"nativeRtSkeletonImplemented", false},
+            {"nativeRtAnimImplemented", false},
+            {"nativeRtAnimControllerImplemented", false},
+            {"gpuSkinningImplemented", false},
+            {"skinnedMotionVectorsImplemented", false},
+            {"skinnedTaaDlssIntegrationImplemented", false},
+            {"animatedBlasTlasUpdateStrategyImplemented", false},
+            {"animationControllerEditorImplemented", false},
+            {"stateMachineEditorImplemented", false},
+            {"fullAnimationPreviewWorkflowImplemented", false},
+        }},
+        {"policy", {
+            {"description", "This report is a read-only selected-entity readiness inventory for skeletal and animation production support."},
+            {"mutationExecuted", false},
+            {"performedActions", nlohmann::json::array()},
+            {"unsupportedActions", nlohmann::json::array({
+                "native-rtskeletalmesh-emission",
+                "native-rtskeleton-emission",
+                "native-rtanim-emission",
+                "native-rtanimcontroller-emission",
+                "gpu-skinning",
+                "skinned-motion-vectors-taa-dlss",
+                "animated-blas-tlas-update-strategy",
+                "animation-controller-state-machine-editor"
+            })},
+        }},
+    };
+}
+
+bool writeInspectorAnimationProductionReadinessReport(
+    const EditorRuntimeState& state,
+    const Entity& entity,
+    const AnimationPlayer& player,
+    const MeshRenderer* renderer,
+    const MeshAsset* mesh,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = inspectorAnimationReadinessReportPath(state, entity);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create animation readiness report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write animation readiness report: " + outPath.string();
+        return false;
+    }
+    file << buildInspectorAnimationProductionReadinessReport(state, entity, player, renderer, mesh).dump(2);
+    return true;
 }
 
 bool resetFieldButton(const char* id, const char* tooltipText = "Reset to default") {
@@ -1216,6 +1351,21 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 player.currentTimeSeconds = std::max(0.0f, currentTime);
                 changed = true;
             }
+            const MeshRenderer* animationRenderer = entity->meshRenderer.has_value() ? &*entity->meshRenderer : nullptr;
+            const MeshAsset* animationMesh = nullptr;
+            if (animationRenderer != nullptr && state.assets != nullptr) {
+                animationMesh = state.assets->mesh(animationRenderer->mesh);
+            }
+            if (editorIconTextButton("AnimationProductionReadinessReport", EditorGlyphIcon::Details, "Animation Readiness")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeInspectorAnimationProductionReadinessReport(state, *entity, player, animationRenderer, animationMesh, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                } else if (state.log != nullptr) {
+                    state.log->add(EditorLogCategory::Warning, error);
+                }
+            }
+            tooltip("Write and open skeletal/animation production readiness for this selected entity");
             if (changed) {
                 document.markDirty(SceneUpdateKind::TransformOnly);
                 requests.sceneSnapshot = EditorSceneSnapshotChange{.before = before, .updateKind = SceneUpdateKind::TransformOnly, .label = "Edit Animation Player"};

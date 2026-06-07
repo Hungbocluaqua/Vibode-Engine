@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -142,6 +143,8 @@ private:
         mutable std::mutex mutex;
         float progress = 0.0f;
         std::string stage = "Queued";
+        std::chrono::steady_clock::time_point workerStartedAt{};
+        std::chrono::steady_clock::time_point stageStartedAt{};
     };
     struct ActiveAsyncAssetImportJob {
         AsyncAssetImportJob job{};
@@ -234,6 +237,7 @@ private:
     [[nodiscard]] bool assignEnvironmentAsset(const AssetGuid& environmentGuid, bool allowResourceRebuild);
     [[nodiscard]] bool relinkAssetSource(const EditorAssetRelinkSourceRequest& request);
     [[nodiscard]] bool replaceAssetReferences(const EditorReplaceAssetReferencesRequest& request, bool allowResourceRebuild);
+    [[nodiscard]] bool repairMissingAssetDependencies(const EditorRepairMissingAssetDependenciesRequest& request);
     [[nodiscard]] bool renameAssetRecord(const EditorRenameAssetRequest& request);
     [[nodiscard]] bool updateAssetTags(const EditorAssetTagsRequest& request);
     [[nodiscard]] bool bulkAddAssetTag(const EditorBulkAssetTagRequest& request);

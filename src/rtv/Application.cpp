@@ -107,6 +107,91 @@ std::filesystem::path currentExecutablePath() {
     return std::filesystem::current_path() / "rtvulkan.exe";
 }
 
+std::string lowercaseAscii(std::string value) {
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
+const AssetRecord* findAssetRecordByGuid(const AssetRegistry& registry, const AssetGuid& guid) {
+    for (const AssetRecord& record : registry.records()) {
+        if (record.guid == guid) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<AssetType> expectedDependencyAssetTypesForRepair(const std::string& role) {
+    const std::string lowerRole = lowercaseAscii(role);
+    if (lowerRole.find("material") != std::string::npos) {
+        return {AssetType::Material};
+    }
+    if (lowerRole.find("texture") != std::string::npos ||
+        lowerRole.find("image") != std::string::npos ||
+        lowerRole.find("hdr") != std::string::npos ||
+        lowerRole.find("environment") != std::string::npos) {
+        return {AssetType::Texture, AssetType::HDRI};
+    }
+    if (lowerRole.find("mesh") != std::string::npos) {
+        return {AssetType::Mesh};
+    }
+    if (lowerRole.find("prefab") != std::string::npos || lowerRole.find("model") != std::string::npos) {
+        return {AssetType::Prefab};
+    }
+    if (lowerRole.find("anim") != std::string::npos) {
+        return {AssetType::Animation};
+    }
+    if (lowerRole.find("skeleton") != std::string::npos || lowerRole.find("skin") != std::string::npos) {
+        return {AssetType::Skeleton};
+    }
+    return {};
+}
+
+bool dependencyRoleMatchesRepairAssetType(const std::string& role, AssetType type) {
+    const std::vector<AssetType> expectedTypes = expectedDependencyAssetTypesForRepair(role);
+    return expectedTypes.empty() || std::find(expectedTypes.begin(), expectedTypes.end(), type) != expectedTypes.end();
+}
+
+std::vector<std::pair<int, const AssetRecord*>> rankedMissingDependencyRepairCandidates(
+    const AssetRegistry& registry,
+    const AssetRecord& owner,
+    const AssetDependency& dependency) {
+    std::vector<std::pair<int, const AssetRecord*>> scored;
+    for (const AssetRecord& candidate : registry.records()) {
+        if (candidate.guid.empty() || candidate.guid == owner.guid || candidate.guid == dependency.guid) {
+            continue;
+        }
+        if (!dependencyRoleMatchesRepairAssetType(dependency.kind, candidate.type)) {
+            continue;
+        }
+        int score = 0;
+        if (!owner.importGroupId.empty() && candidate.importGroupId == owner.importGroupId) {
+            score += 4;
+        }
+        if (!owner.importRootGuid.empty() && candidate.importRootGuid == owner.importRootGuid) {
+            score += 3;
+        }
+        if (!owner.importGroupName.empty() && candidate.importGroupName == owner.importGroupName) {
+            score += 2;
+        }
+        if (score == 0 && !expectedDependencyAssetTypesForRepair(dependency.kind).empty()) {
+            score = 1;
+        }
+        if (score > 0) {
+            scored.push_back({score, &candidate});
+        }
+    }
+    std::sort(scored.begin(), scored.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.first != rhs.first) return lhs.first > rhs.first;
+        const std::string lhsName = lhs.second != nullptr ? lhs.second->displayName : std::string{};
+        const std::string rhsName = rhs.second != nullptr ? rhs.second->displayName : std::string{};
+        return lhsName < rhsName;
+    });
+    return scored;
+}
+
 #if defined(_WIN32)
 std::wstring quoteWindowsArg(std::wstring_view value) {
     std::wstring result;
@@ -360,6 +445,45 @@ void ensureCookFailureArtifacts(
     }
 }
 
+struct CookManifestProgress {
+    bool available = false;
+    std::string status;
+    size_t plannedFileCount = 0;
+    size_t copiedFileCount = 0;
+};
+
+CookManifestProgress readCookManifestProgress(const std::filesystem::path& manifestPath) {
+    CookManifestProgress progress;
+    if (manifestPath.empty()) {
+        return progress;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(manifestPath, ec)) {
+        return progress;
+    }
+
+    std::ifstream file(manifestPath);
+    if (!file.is_open()) {
+        return progress;
+    }
+    nlohmann::json manifest;
+    try {
+        file >> manifest;
+    } catch (...) {
+        return progress;
+    }
+
+    progress.available = true;
+    progress.status = manifest.value("status", std::string{});
+    if (manifest.contains("plannedFiles") && manifest["plannedFiles"].is_array()) {
+        progress.plannedFileCount = manifest["plannedFiles"].size();
+    }
+    if (manifest.contains("copiedFiles") && manifest["copiedFiles"].is_array()) {
+        progress.copiedFileCount = manifest["copiedFiles"].size();
+    }
+    return progress;
+}
+
 bool assetPlacementBlocked(const AssetRecord& record) {
     return record.missing || record.status == AssetImportStatus::Missing || record.status == AssetImportStatus::Failed ||
         record.importedMetadataMissing || record.cookedPayloadMissing || record.dependenciesMissing;
@@ -537,6 +661,439 @@ bool pathIsInsideDirectory(const std::filesystem::path& child, const std::filesy
         }
     }
     return true;
+}
+
+std::string lowerAscii(std::string value) {
+    for (char& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+bool projectReferenceRewriteFileCandidate(const std::filesystem::path& path) {
+    const std::string filename = lowerAscii(path.filename().string());
+    const std::string ext = lowerAscii(path.extension().string());
+    if (ext == ".rtlevel" || ext == ".mscene" || ext == ".vproject") {
+        return true;
+    }
+    auto endsWith = [&](const char* suffix) {
+        const std::string value(suffix);
+        return filename.size() >= value.size() && filename.compare(filename.size() - value.size(), value.size(), value) == 0;
+    };
+    return endsWith(".rtprefab.json") ||
+        endsWith(".rtmesh.json") ||
+        endsWith(".rtmaterial.json") ||
+        endsWith(".rttexture.json") ||
+        endsWith(".rthdri.json") ||
+        endsWith(".rtanim.json") ||
+        endsWith(".rtskeleton.json");
+}
+
+void appendUniqueExistingDirectory(std::vector<std::filesystem::path>& roots, const std::filesystem::path& root) {
+    if (root.empty()) {
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) {
+        return;
+    }
+    const std::filesystem::path normalized = normalizedPathForCompare(root);
+    for (const std::filesystem::path& existing : roots) {
+        if (normalizedPathForCompare(existing) == normalized) {
+            return;
+        }
+    }
+    roots.push_back(normalized);
+}
+
+std::vector<std::filesystem::path> collectProjectReferenceRewriteFiles(const ProjectContext& project, nlohmann::json& checkedRoots) {
+    std::vector<std::filesystem::path> roots;
+    appendUniqueExistingDirectory(roots, project.contentRoot);
+    appendUniqueExistingDirectory(roots, project.scenesRoot);
+
+    std::vector<std::filesystem::path> files;
+    for (const std::filesystem::path& root : roots) {
+        checkedRoots.push_back(root.generic_string());
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (ec) {
+                break;
+            }
+            std::error_code entryError;
+            if (entry.is_regular_file(entryError) && projectReferenceRewriteFileCandidate(entry.path())) {
+                files.push_back(normalizedPathForCompare(entry.path()));
+            }
+        }
+    }
+    if (!project.projectFile.empty()) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(project.projectFile, ec) && projectReferenceRewriteFileCandidate(project.projectFile)) {
+            files.push_back(normalizedPathForCompare(project.projectFile));
+        }
+    }
+    std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
+    return files;
+}
+
+std::string jsonPathChild(std::string parent, const std::string& child) {
+    if (parent.empty()) {
+        parent = "$";
+    }
+    return parent + "/" + child;
+}
+
+bool jsonPathContainsSegment(const std::string& jsonPath, std::string_view segment) {
+    const std::string path = lowerAscii(jsonPath);
+    const std::string needle = "/" + std::string(segment) + "/";
+    return path.find(needle) != std::string::npos;
+}
+
+bool isSavedProjectAssetReferenceField(const std::string& jsonPath, const std::string& key) {
+    const std::string lowerKey = lowerAscii(key);
+    if (lowerKey == "meshguid" ||
+        lowerKey == "materialguid" ||
+        lowerKey == "overridematerialguid" ||
+        lowerKey == "animationguid" ||
+        lowerKey == "prefabguid" ||
+        lowerKey == "materialguids") {
+        return true;
+    }
+    if (lowerKey == "assetguid") {
+        return jsonPathContainsSegment(jsonPath, "assetreferences") || jsonPathContainsSegment(jsonPath, "dependencies");
+    }
+    if (lowerKey == "guid") {
+        return jsonPathContainsSegment(jsonPath, "dependencies");
+    }
+    if (lowerKey == "references") {
+        return true;
+    }
+    return false;
+}
+
+bool replaceGuidReferenceOccurrences(
+    nlohmann::json& value,
+    const AssetGuid& oldGuid,
+    const AssetGuid& newGuid,
+    const std::string& jsonPath,
+    const std::string& key,
+    nlohmann::json& occurrences) {
+    bool changed = false;
+    if (value.is_string()) {
+        if (value.get<std::string>() == oldGuid && isSavedProjectAssetReferenceField(jsonPath, key)) {
+            value = newGuid;
+            occurrences.push_back({{"jsonPath", jsonPath.empty() ? "$" : jsonPath}, {"field", key}});
+            return true;
+        }
+        return false;
+    }
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            changed = replaceGuidReferenceOccurrences(it.value(), oldGuid, newGuid, jsonPathChild(jsonPath, it.key()), it.key(), occurrences) || changed;
+        }
+        return changed;
+    }
+    if (value.is_array()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            changed = replaceGuidReferenceOccurrences(value[i], oldGuid, newGuid, jsonPathChild(jsonPath, std::to_string(i)), key, occurrences) || changed;
+        }
+    }
+    return changed;
+}
+
+std::filesystem::path uniqueReferenceRewriteBackupPath(const std::filesystem::path& path) {
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    for (uint32_t attempt = 0; attempt < 1000; ++attempt) {
+        std::filesystem::path candidate = path.string() + ".before_replace_refs." + std::to_string(stamp);
+        if (attempt > 0) {
+            candidate = candidate.string() + "." + std::to_string(attempt);
+        }
+        candidate = candidate.string() + ".bak";
+        std::error_code ec;
+        if (!std::filesystem::exists(candidate, ec)) {
+            return candidate;
+        }
+    }
+    return path.string() + ".before_replace_refs." + std::to_string(stamp) + ".fallback.bak";
+}
+
+std::string safeReportName(std::string value) {
+    if (value.empty()) {
+        return "asset";
+    }
+    for (char& c : value) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' || std::isspace(static_cast<unsigned char>(c))) {
+            c = '_';
+        }
+    }
+    return value;
+}
+
+struct ProjectReferenceRewriteResult {
+    size_t scannedFileCount = 0;
+    size_t changedFileCount = 0;
+    size_t occurrenceCount = 0;
+    bool refreshedReferenceIndex = false;
+    nlohmann::json checkedRoots = nlohmann::json::array();
+    nlohmann::json changedFiles = nlohmann::json::array();
+    nlohmann::json skippedFiles = nlohmann::json::array();
+    nlohmann::json parseErrors = nlohmann::json::array();
+    nlohmann::json writeErrors = nlohmann::json::array();
+    std::filesystem::path reportPath;
+    std::filesystem::path refreshedReferenceIndexPath;
+    std::string refreshedReferenceIndexError;
+};
+
+void appendPersistentReferenceIndexEntries(
+    const nlohmann::json& value,
+    const std::unordered_set<AssetGuid>& registryGuids,
+    const std::filesystem::path& filePath,
+    const std::string& jsonPath,
+    const std::string& key,
+    nlohmann::json& references,
+    nlohmann::json& unknownGuidFields) {
+    if (value.is_object()) {
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            appendPersistentReferenceIndexEntries(it.value(), registryGuids, filePath, jsonPathChild(jsonPath, it.key()), it.key(), references, unknownGuidFields);
+        }
+        return;
+    }
+    if (value.is_array()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            appendPersistentReferenceIndexEntries(value[i], registryGuids, filePath, jsonPathChild(jsonPath, std::to_string(i)), key, references, unknownGuidFields);
+        }
+        return;
+    }
+    if (!value.is_string()) {
+        return;
+    }
+
+    const std::string guid = value.get<std::string>();
+    if (guid.empty() || !isSavedProjectAssetReferenceField(jsonPath, key)) {
+        return;
+    }
+    if (registryGuids.find(guid) != registryGuids.end()) {
+        references.push_back({
+            {"file", filePath.generic_string()},
+            {"jsonPath", jsonPath.empty() ? "$" : jsonPath},
+            {"key", key},
+            {"guid", guid},
+        });
+    } else {
+        unknownGuidFields.push_back({
+            {"file", filePath.generic_string()},
+            {"jsonPath", jsonPath.empty() ? "$" : jsonPath},
+            {"key", key},
+            {"guid", guid},
+        });
+    }
+}
+
+bool refreshPersistentAssetReferenceIndex(
+    const ProjectContext& project,
+    const AssetRegistry& registry,
+    std::filesystem::path& outPath,
+    std::string& outError,
+    std::string generatedBy = "ReplaceProjectReferences",
+    std::string persistenceReason = "This index was refreshed after Replace Project References rewrote saved project metadata.") {
+    outPath = project.savedRoot / "AssetReferenceIndex.json";
+    std::unordered_set<AssetGuid> registryGuids;
+    std::unordered_map<AssetGuid, size_t> savedReferenceCounts;
+    registryGuids.reserve(registry.records().size());
+    for (const AssetRecord& record : registry.records()) {
+        if (!record.guid.empty()) {
+            registryGuids.insert(record.guid);
+            savedReferenceCounts.emplace(record.guid, 0u);
+        }
+    }
+
+    nlohmann::json checkedRoots = nlohmann::json::array();
+    nlohmann::json scannedFiles = nlohmann::json::array();
+    nlohmann::json references = nlohmann::json::array();
+    nlohmann::json unknownGuidFields = nlohmann::json::array();
+    nlohmann::json parseErrors = nlohmann::json::array();
+    const std::vector<std::filesystem::path> files = collectProjectReferenceRewriteFiles(project, checkedRoots);
+    for (const std::filesystem::path& path : files) {
+        scannedFiles.push_back(path.generic_string());
+        std::ifstream input(path);
+        if (!input.is_open()) {
+            parseErrors.push_back({
+                {"file", path.generic_string()},
+                {"detail", "Could not open JSON metadata file while refreshing the persistent reference index."},
+            });
+            continue;
+        }
+        nlohmann::json json;
+        try {
+            input >> json;
+        } catch (const std::exception& error) {
+            parseErrors.push_back({
+                {"file", path.generic_string()},
+                {"detail", error.what()},
+            });
+            continue;
+        }
+        const size_t before = references.size();
+        appendPersistentReferenceIndexEntries(json, registryGuids, path, "$", {}, references, unknownGuidFields);
+        for (size_t i = before; i < references.size(); ++i) {
+            const AssetGuid guid = references[i].value("guid", std::string{});
+            if (!guid.empty()) {
+                ++savedReferenceCounts[guid];
+            }
+        }
+    }
+
+    nlohmann::json assets = nlohmann::json::array();
+    for (const AssetRecord& record : registry.records()) {
+        assets.push_back({
+            {"guid", record.guid},
+            {"displayName", record.displayName},
+            {"assetType", assetTypeName(record.type)},
+            {"savedProjectReferenceCount", savedReferenceCounts[record.guid]},
+        });
+    }
+
+    const nlohmann::json index = {
+        {"version", 1},
+        {"kind", "AssetProjectReferenceIndexReport"},
+        {"generatedBy", generatedBy},
+        {"registryPath", registry.state().path.empty() ? std::string{} : registry.state().path.generic_string()},
+        {"persistentIndexPath", outPath.generic_string()},
+        {"assetCount", assets.size()},
+        {"checkedRoots", checkedRoots},
+        {"scannedFileCount", scannedFiles.size()},
+        {"registeredReferenceCount", references.size()},
+        {"unknownGuidFieldCount", unknownGuidFields.size()},
+        {"parseErrorCount", parseErrors.size()},
+        {"assets", assets},
+        {"references", references},
+        {"unknownGuidFields", unknownGuidFields},
+        {"parseErrors", parseErrors},
+        {"scannedFiles", scannedFiles},
+        {"checkedFileTypes", nlohmann::json::array({".rtlevel", ".mscene", ".vproject", ".rtprefab.json", ".rtmesh.json", ".rtmaterial.json", ".rttexture.json", ".rthdri.json", ".rtanim.json", ".rtskeleton.json"})},
+        {"persistence", persistenceReason},
+        {"limitation", "This is a saved-file JSON index refresh triggered by explicit editor persistence workflows. It is not a continuously maintained background index/watcher and does not inspect generated cache payload internals or opaque packages."},
+    };
+
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create persistent reference index folder: " + ec.message();
+        return false;
+    }
+    std::ofstream output(outPath, std::ios::trunc);
+    if (!output.is_open()) {
+        outError = "Could not write persistent reference index: " + outPath.string();
+        return false;
+    }
+    output << index.dump(2);
+    return true;
+}
+
+ProjectReferenceRewriteResult rewriteSavedProjectAssetReferences(
+    const ProjectContext& project,
+    const AssetRegistry& registry,
+    const AssetGuid& oldGuid,
+    const AssetGuid& newGuid,
+    const std::optional<std::filesystem::path>& currentScenePath,
+    bool currentSceneDirty) {
+    ProjectReferenceRewriteResult result;
+    const std::vector<std::filesystem::path> files = collectProjectReferenceRewriteFiles(project, result.checkedRoots);
+    result.scannedFileCount = files.size();
+    const std::filesystem::path currentSceneKey = currentScenePath.has_value() ? normalizedPathForCompare(*currentScenePath) : std::filesystem::path{};
+
+    for (const std::filesystem::path& path : files) {
+        if (currentSceneDirty && !currentSceneKey.empty() && normalizedPathForCompare(path) == currentSceneKey) {
+            result.skippedFiles.push_back({
+                {"path", path.generic_string()},
+                {"reason", "CurrentSceneHasUnsavedChanges"},
+            });
+            continue;
+        }
+        std::ifstream input(path);
+        if (!input.is_open()) {
+            result.parseErrors.push_back({
+                {"path", path.generic_string()},
+                {"detail", "Could not open JSON metadata file for reference rewrite."},
+            });
+            continue;
+        }
+        nlohmann::json json;
+        try {
+            input >> json;
+        } catch (const std::exception& error) {
+            result.parseErrors.push_back({
+                {"path", path.generic_string()},
+                {"detail", error.what()},
+            });
+            continue;
+        }
+
+        nlohmann::json occurrences = nlohmann::json::array();
+        if (!replaceGuidReferenceOccurrences(json, oldGuid, newGuid, "$", {}, occurrences)) {
+            continue;
+        }
+
+        std::error_code ec;
+        const std::filesystem::path backupPath = uniqueReferenceRewriteBackupPath(path);
+        std::filesystem::copy_file(path, backupPath, std::filesystem::copy_options::none, ec);
+        if (ec) {
+            result.writeErrors.push_back({
+                {"path", path.generic_string()},
+                {"detail", "Could not write backup before reference rewrite: " + ec.message()},
+            });
+            continue;
+        }
+        std::ofstream output(path, std::ios::trunc);
+        if (!output.is_open()) {
+            result.writeErrors.push_back({
+                {"path", path.generic_string()},
+                {"backupPath", backupPath.generic_string()},
+                {"detail", "Could not open metadata file for writing after backup."},
+            });
+            continue;
+        }
+        output << json.dump(2);
+        ++result.changedFileCount;
+        result.occurrenceCount += occurrences.size();
+        result.changedFiles.push_back({
+            {"path", path.generic_string()},
+            {"backupPath", backupPath.generic_string()},
+            {"referenceCount", occurrences.size()},
+            {"occurrences", occurrences},
+        });
+    }
+
+    result.refreshedReferenceIndex = refreshPersistentAssetReferenceIndex(project, registry, result.refreshedReferenceIndexPath, result.refreshedReferenceIndexError);
+    result.reportPath = project.savedRoot / "Reports" / ("asset_reference_rewrite_" + safeReportName(oldGuid) + "_to_" + safeReportName(newGuid) + ".json");
+    std::error_code ec;
+    std::filesystem::create_directories(result.reportPath.parent_path(), ec);
+    if (!ec) {
+        std::ofstream report(result.reportPath, std::ios::trunc);
+        if (report.is_open()) {
+            const nlohmann::json reportJson = {
+                {"version", 1},
+                {"kind", "AssetReferenceRewriteReport"},
+                {"oldGuid", oldGuid},
+                {"newGuid", newGuid},
+                {"checkedRoots", result.checkedRoots},
+                {"scannedFileCount", result.scannedFileCount},
+                {"changedFileCount", result.changedFileCount},
+                {"referenceOccurrenceCount", result.occurrenceCount},
+                {"changedFiles", result.changedFiles},
+                {"skippedFiles", result.skippedFiles},
+                {"parseErrors", result.parseErrors},
+                {"writeErrors", result.writeErrors},
+                {"refreshedReferenceIndex", result.refreshedReferenceIndex},
+                {"refreshedReferenceIndexPath", result.refreshedReferenceIndexPath.empty() ? std::string{} : result.refreshedReferenceIndexPath.generic_string()},
+                {"refreshedReferenceIndexError", result.refreshedReferenceIndexError},
+                {"backupPolicy", "Each changed metadata file is copied to a unique <file>.before_replace_refs.<timestamp>[.<n>].bak before rewriting; existing backups are not overwritten."},
+                {"rewritePolicy", "Only known asset-reference fields are rewritten, including scene/prefab component GUID fields, assetReferences entries, AssetRegistry dependencies, and AssetRegistry references. Identity/provenance fields such as guid, runtimePayload.assetGuid, and importRootGuid are preserved."},
+            };
+            report << reportJson.dump(2);
+        }
+    }
+    return result;
 }
 
 bool projectRootLooksSafeToDelete(const std::filesystem::path& projectRoot, const std::filesystem::path& projectFile) {
@@ -2948,10 +3505,19 @@ void Application::mainLoop(uint32_t maxFrames) {
             const bool reimport = job.kind == AsyncAssetImportKind::Reimport;
             float importProgress = 0.05f;
             std::string importStage = "Queued";
+            double importWorkerElapsedMs = 0.0;
+            double importStageElapsedMs = 0.0;
             if (activeAssetImportJob_->progress != nullptr) {
                 std::lock_guard<std::mutex> lock(activeAssetImportJob_->progress->mutex);
                 importProgress = activeAssetImportJob_->progress->progress;
                 importStage = activeAssetImportJob_->progress->stage;
+                const auto progressNow = std::chrono::steady_clock::now();
+                if (activeAssetImportJob_->progress->workerStartedAt.time_since_epoch().count() != 0) {
+                    importWorkerElapsedMs = std::chrono::duration<double, std::milli>(progressNow - activeAssetImportJob_->progress->workerStartedAt).count();
+                }
+                if (activeAssetImportJob_->progress->stageStartedAt.time_since_epoch().count() != 0) {
+                    importStageElapsedMs = std::chrono::duration<double, std::milli>(progressNow - activeAssetImportJob_->progress->stageStartedAt).count();
+                }
             }
             jobCenter.assetImportJobSerial = job.serial;
             jobCenter.assetImportRunning = true;
@@ -2966,20 +3532,40 @@ void Application::mainLoop(uint32_t maxFrames) {
             jobCenter.assetImportDestinationFolder = job.request.destinationFolder;
             jobCenter.assetImportMode = job.request.mode;
             jobCenter.assetImportSettings = job.request.settings;
+            jobCenter.assetImportWorkerElapsedMs = importWorkerElapsedMs;
+            jobCenter.assetImportStageElapsedMs = importStageElapsedMs;
             if (reimport) {
                 jobCenter.assetReimportGuid = job.assetGuid;
             }
         }
         if (activeCookProjectJob_.has_value()) {
+            const CookManifestProgress manifestProgress = readCookManifestProgress(activeCookProjectJob_->manifestPath);
+            float cookProgress = 0.35f;
+            std::string cookStatus = "Cooking transparent project assets";
+            if (manifestProgress.available) {
+                if (manifestProgress.plannedFileCount > 0) {
+                    const float copyRatio = static_cast<float>(manifestProgress.copiedFileCount) / static_cast<float>(manifestProgress.plannedFileCount);
+                    cookProgress = 0.10f + 0.85f * std::clamp(copyRatio, 0.0f, 1.0f);
+                }
+                if (!manifestProgress.status.empty()) {
+                    cookStatus = "Cook " + manifestProgress.status;
+                }
+                if (manifestProgress.plannedFileCount > 0) {
+                    cookStatus += ": " + std::to_string(manifestProgress.copiedFileCount) + "/" + std::to_string(manifestProgress.plannedFileCount) + " files";
+                }
+            }
             jobCenter.cookProjectJobSerial = activeCookProjectJob_->serial;
             jobCenter.cookProjectRunning = true;
-            jobCenter.cookProjectProgress = 0.35f;
-            jobCenter.cookProjectStatus = "Cooking transparent project assets";
+            jobCenter.cookProjectProgress = cookProgress;
+            jobCenter.cookProjectStatus = cookStatus;
             jobCenter.cookProjectFile = activeCookProjectJob_->projectFile;
             jobCenter.cookProjectOutputDir = activeCookProjectJob_->outputDir;
             jobCenter.cookProjectManifestPath = activeCookProjectJob_->manifestPath;
             jobCenter.cookProjectValidationReportPath = activeCookProjectJob_->validationReportPath;
             jobCenter.cookProjectLogPath = activeCookProjectJob_->logPath;
+            jobCenter.cookProjectManifestStatus = manifestProgress.status;
+            jobCenter.cookProjectPlannedFileCount = manifestProgress.plannedFileCount;
+            jobCenter.cookProjectCopiedFileCount = manifestProgress.copiedFileCount;
         }
         if (completedCookProjectJob_.completedCookProjectSerial != 0) {
             jobCenter.completedCookProjectSerial = completedCookProjectJob_.completedCookProjectSerial;
@@ -3510,6 +4096,7 @@ void Application::writeEditorRenderJobManifest(const char* eventLabel) {
         const EditorRenderRequest& request = *editorRenderJobRequest_;
         manifest["requested"] = {
             {"output_root", request.outputRoot.string()},
+            {"output_preset", request.outputPresetName},
             {"width", request.requestedWidth},
             {"height", request.requestedHeight},
             {"render_resolution_scale", request.renderResolutionScale},
@@ -4642,6 +5229,23 @@ bool Application::saveAllEditorState() {
         }
     }
 
+    if (failures.empty() && project_.has_value() && !assetRegistry_.state().path.empty()) {
+        std::filesystem::path referenceIndexPath;
+        std::string referenceIndexError;
+        if (refreshPersistentAssetReferenceIndex(
+                *project_,
+                assetRegistry_,
+                referenceIndexPath,
+                referenceIndexError,
+                "SaveAll",
+                "This index was refreshed after Save All completed scene, project, material, and asset registry persistence.")) {
+            logSaved("Asset Reference Index: " + referenceIndexPath.string());
+            std::cout << "Persistent project reference index refreshed after Save All: " << referenceIndexPath.string() << '\n';
+        } else {
+            logFailure("Asset Reference Index: " + referenceIndexError);
+        }
+    }
+
     if (uiOverlay_ != nullptr) {
         EditorLog& log = uiOverlay_->editor().log();
         for (const std::string& item : saved) {
@@ -5707,14 +6311,120 @@ bool Application::replaceAssetReferences(const EditorReplaceAssetReferencesReque
         assetRegistry_.addOrReplaceRecord(std::move(record), AssetRegistryDirtyReason::AssetDependencyChanged);
     }
 
-    const size_t totalReplacements = sceneReplacementCount + registryReplacementCount;
+    bool registrySaved = false;
+    if (request.includeSavedProjectFiles && registryReplacementCount > 0 && !assetRegistry_.state().path.empty()) {
+        registrySaved = assetRegistry_.save(assetRegistry_.state().path);
+        if (registrySaved) {
+            assetRegistry_.clearDirty();
+        } else {
+            notifications_.notify("Asset registry reference rewrite save failed", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+        }
+    }
+
+    ProjectReferenceRewriteResult savedRewrite;
+    bool savedRewriteAttempted = false;
+    if (request.includeSavedProjectFiles) {
+        if (!project_.has_value()) {
+            notifications_.notify("Open a project before rewriting saved references", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+        } else {
+            savedRewriteAttempted = true;
+            savedRewrite = rewriteSavedProjectAssetReferences(*project_, assetRegistry_, request.oldGuid, request.newGuid, scenePath_, sceneUnsavedDirty_);
+            if (!savedRewrite.reportPath.empty()) {
+                std::cout << "Saved project reference rewrite report: " << savedRewrite.reportPath.string() << '\n';
+            }
+            if (savedRewrite.refreshedReferenceIndex) {
+                std::cout << "Persistent project reference index refreshed: " << savedRewrite.refreshedReferenceIndexPath.string() << '\n';
+            } else if (!savedRewrite.refreshedReferenceIndexError.empty()) {
+                std::cerr << "Persistent project reference index refresh failed: " << savedRewrite.refreshedReferenceIndexError << '\n';
+            }
+            if (savedRewrite.writeErrors.size() > 0 || savedRewrite.parseErrors.size() > 0 || !savedRewrite.refreshedReferenceIndex) {
+                notifications_.notify("Saved reference rewrite completed with warnings", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+            }
+        }
+    }
+
+    const size_t totalReplacements = sceneReplacementCount + registryReplacementCount + savedRewrite.occurrenceCount;
     if (totalReplacements == 0) {
         notifications_.notify("No references found", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 4.0f);
         return false;
     }
-    notifications_.notify("Asset references replaced", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+    notifications_.notify(request.includeSavedProjectFiles ? "Project asset references replaced" : "Asset references replaced", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
     std::cout << "Replaced asset references: old=" << request.oldGuid << " new=" << request.newGuid
-              << " scene=" << sceneReplacementCount << " registry=" << registryReplacementCount << '\n';
+              << " scene=" << sceneReplacementCount
+              << " registry=" << registryReplacementCount
+              << " registry_saved=" << (registrySaved ? "true" : "false")
+              << " saved_files=" << (savedRewriteAttempted ? savedRewrite.changedFileCount : 0u)
+              << " saved_occurrences=" << (savedRewriteAttempted ? savedRewrite.occurrenceCount : 0u)
+              << " refreshed_index=" << (savedRewriteAttempted && savedRewrite.refreshedReferenceIndex ? "true" : "false")
+              << '\n';
+    return true;
+}
+
+bool Application::repairMissingAssetDependencies(const EditorRepairMissingAssetDependenciesRequest& request) {
+    if (request.ownerGuid.empty()) {
+        notifications_.notify("Dependency repair needs a selected asset", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+
+    const AssetRecord* ownerRecord = findAssetRecordByGuid(assetRegistry_, request.ownerGuid);
+    if (ownerRecord == nullptr) {
+        notifications_.notify("Dependency repair target missing", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 5.0f);
+        return false;
+    }
+
+    AssetRecord repaired = *ownerRecord;
+    size_t repairedCount = 0;
+    size_t ambiguousCount = 0;
+    size_t missingCount = 0;
+    for (AssetDependency& dependency : repaired.dependencies) {
+        if (dependency.guid.empty() || findAssetRecordByGuid(assetRegistry_, dependency.guid) != nullptr) {
+            continue;
+        }
+        ++missingCount;
+        const std::vector<std::pair<int, const AssetRecord*>> candidates = rankedMissingDependencyRepairCandidates(assetRegistry_, repaired, dependency);
+        if (candidates.size() != 1 || candidates.front().second == nullptr) {
+            ++ambiguousCount;
+            continue;
+        }
+        const AssetGuid oldGuid = dependency.guid;
+        dependency.guid = candidates.front().second->guid;
+        ++repairedCount;
+        std::cout << "Repaired missing asset dependency: owner=" << request.ownerGuid
+                  << " role=" << dependency.kind
+                  << " old=" << oldGuid
+                  << " new=" << dependency.guid << '\n';
+    }
+
+    if (missingCount == 0) {
+        notifications_.notify("No missing dependencies found", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 4.0f);
+        return false;
+    }
+    if (repairedCount == 0) {
+        notifications_.notify(ambiguousCount > 0 ? "Missing dependencies are ambiguous" : "No dependency repair candidates found", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+        return false;
+    }
+
+    repaired.lastModifiedTimestamp = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    assetRegistry_.addOrReplaceRecord(std::move(repaired), AssetRegistryDirtyReason::AssetDependencyChanged);
+    const std::filesystem::path registryRoot = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
+    (void)assetRegistry_.refreshRecordHealth(registryRoot, true);
+
+    bool registrySaved = false;
+    if (request.saveRegistry && !assetRegistry_.state().path.empty()) {
+        registrySaved = assetRegistry_.save(assetRegistry_.state().path);
+        if (registrySaved) {
+            assetRegistry_.clearDirty();
+        } else {
+            notifications_.notify("Dependency repair registry save failed", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
+        }
+    }
+
+    notifications_.notify("Missing dependencies repaired", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+    std::cout << "Repaired missing dependencies: owner=" << request.ownerGuid
+              << " repaired=" << repairedCount
+              << " missing=" << missingCount
+              << " ambiguous=" << ambiguousCount
+              << " registry_saved=" << (registrySaved ? "true" : "false") << '\n';
     return true;
 }
 
@@ -6298,6 +7008,8 @@ void Application::startNextAssetImportWorker() {
     auto progress = std::make_shared<AsyncAssetImportProgress>();
     progress->progress = 0.02f;
     progress->stage = "Queued";
+    progress->workerStartedAt = std::chrono::steady_clock::now();
+    progress->stageStartedAt = progress->workerStartedAt;
     activeAssetImportJob_.emplace(ActiveAsyncAssetImportJob{
         std::move(job),
         progress,
@@ -6308,6 +7020,9 @@ void Application::startNextAssetImportWorker() {
                 }
                 std::lock_guard<std::mutex> lock(progress->mutex);
                 progress->progress = std::clamp(value, 0.0f, 1.0f);
+                if (progress->stage != stage) {
+                    progress->stageStartedAt = std::chrono::steady_clock::now();
+                }
                 progress->stage = std::move(stage);
             };
             try {
@@ -7740,6 +8455,10 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
 
     if (requests.replaceAssetReferences.has_value()) {
         (void)replaceAssetReferences(*requests.replaceAssetReferences, allowResourceRebuild);
+    }
+
+    if (requests.repairMissingAssetDependencies.has_value()) {
+        (void)repairMissingAssetDependencies(*requests.repairMissingAssetDependencies);
     }
 
     if (requests.updateAssetTags.has_value()) {

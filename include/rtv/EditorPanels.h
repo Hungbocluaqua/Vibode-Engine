@@ -88,6 +88,7 @@ struct EditorRenderJobStatus {
 struct EditorRenderRequest {
     EditorRenderJobKind kind = EditorRenderJobKind::Image;
     std::filesystem::path outputRoot;
+    std::string outputPresetName;
     uint32_t requestedWidth = 0;
     uint32_t requestedHeight = 0;
     float renderResolutionScale = 1.0f;
@@ -145,6 +146,8 @@ struct EditorJobCenterState {
     std::string assetImportMode;
     AssetImportSettings assetImportSettings{};
     AssetGuid assetReimportGuid;
+    double assetImportWorkerElapsedMs = 0.0;
+    double assetImportStageElapsedMs = 0.0;
     uint64_t completedAssetImportSerial = 0;
     bool completedAssetImportSuccess = false;
     std::string completedAssetImportTitle;
@@ -174,6 +177,9 @@ struct EditorJobCenterState {
     std::filesystem::path cookProjectManifestPath;
     std::filesystem::path cookProjectValidationReportPath;
     std::filesystem::path cookProjectLogPath;
+    std::string cookProjectManifestStatus;
+    size_t cookProjectPlannedFileCount = 0;
+    size_t cookProjectCopiedFileCount = 0;
     uint64_t completedCookProjectSerial = 0;
     bool completedCookProjectSuccess = false;
     std::string completedCookProjectStatus;
@@ -401,6 +407,12 @@ struct EditorAssetRelinkSourceRequest {
 struct EditorReplaceAssetReferencesRequest {
     AssetGuid oldGuid;
     AssetGuid newGuid;
+    bool includeSavedProjectFiles = false;
+};
+
+struct EditorRepairMissingAssetDependenciesRequest {
+    AssetGuid ownerGuid;
+    bool saveRegistry = true;
 };
 
 struct EditorAssetTagsRequest {
@@ -442,6 +454,7 @@ struct EditorRequests {
     std::optional<AssetGuid> reimportAsset;
     std::optional<EditorAssetRelinkSourceRequest> relinkAssetSource;
     std::optional<EditorReplaceAssetReferencesRequest> replaceAssetReferences;
+    std::optional<EditorRepairMissingAssetDependenciesRequest> repairMissingAssetDependencies;
     std::optional<EditorAssetTagsRequest> updateAssetTags;
     std::optional<EditorRenameAssetRequest> renameAsset;
     std::optional<EditorBulkAssetTagRequest> bulkAddAssetTag;
