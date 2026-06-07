@@ -116,6 +116,18 @@ std::optional<EditorKeybinding> parseShortcutDisplay(std::string display, Editor
     return binding.glfwKey >= 0 || binding.imguiKey >= 0 ? std::optional<EditorKeybinding>{binding} : std::nullopt;
 }
 
+EditorKeybinding effectiveCommandKeybinding(const EditorCommand& command, const EditorPreferences* preferences) {
+    if (preferences != nullptr) {
+        const auto it = preferences->commandShortcutOverrides.find(editorCommandPreferenceKey(command));
+        if (it != preferences->commandShortcutOverrides.end()) {
+            if (std::optional<EditorKeybinding> parsed = parseShortcutDisplay(it->second, command.defaultKeybinding.context)) {
+                return *parsed;
+            }
+        }
+    }
+    return command.defaultKeybinding;
+}
+
 } // namespace
 
 void CommandRegistry::registerCommand(EditorCommand command) {
@@ -131,17 +143,18 @@ const EditorCommand* CommandRegistry::find(EditorCommandId id) const {
     return nullptr;
 }
 
-std::vector<std::string> CommandRegistry::detectConflicts() const {
+std::vector<std::string> CommandRegistry::detectConflicts(const EditorPreferences* preferences) const {
     std::vector<std::string> conflicts;
     std::unordered_map<std::string, std::string> firstCommand;
     for (const EditorCommand& command : commands_) {
-        const std::string key = conflictKey(command.defaultKeybinding);
+        const EditorKeybinding binding = effectiveCommandKeybinding(command, preferences);
+        const std::string key = conflictKey(binding);
         if (key.empty()) {
             continue;
         }
         const auto [it, inserted] = firstCommand.emplace(key, command.name);
         if (!inserted) {
-            conflicts.push_back(it->second + " conflicts with " + command.name + " on " + command.defaultKeybinding.display);
+            conflicts.push_back(it->second + " conflicts with " + command.name + " on " + binding.display);
         }
     }
     return conflicts;
@@ -330,15 +343,7 @@ EditorKeybinding editorCommandKeybinding(EditorCommandId id, const EditorPrefere
     if (command == nullptr) {
         return {};
     }
-    if (preferences != nullptr) {
-        const auto it = preferences->commandShortcutOverrides.find(editorCommandPreferenceKey(*command));
-        if (it != preferences->commandShortcutOverrides.end()) {
-            if (std::optional<EditorKeybinding> parsed = parseShortcutDisplay(it->second, command->defaultKeybinding.context)) {
-                return *parsed;
-            }
-        }
-    }
-    return command->defaultKeybinding;
+    return effectiveCommandKeybinding(*command, preferences);
 }
 
 std::string editorCommandShortcutDisplay(EditorCommandId id, const EditorPreferences* preferences) {

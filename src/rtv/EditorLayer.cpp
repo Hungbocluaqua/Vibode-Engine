@@ -21,8 +21,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <filesystem>
+#include <functional>
 #include <initializer_list>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -771,11 +774,12 @@ std::string gitStatusLabelForPath(const std::filesystem::path& workspaceRoot, co
 #else
     constexpr const char* stderrRedirect = " 2>/dev/null";
 #endif
-    const std::string output = readCommandOutput("git -C " + quoteCommandPath(*gitRoot) + " status --porcelain -- " + quoteCommandPath(relative) + stderrRedirect);
+    const std::string output = readCommandOutput("git -C " + quoteCommandPath(*gitRoot) + " status --porcelain --ignored -- " + quoteCommandPath(relative) + stderrRedirect);
     if (trimWhitespace(output).empty()) {
         return "Clean";
     }
     const std::string code = output.size() >= 2 ? output.substr(0, 2) : trimWhitespace(output);
+    if (code == "!!") return "Ignored";
     if (code == "??") return "Untracked";
     if (code.find('A') != std::string::npos) return "Added";
     if (code.find('M') != std::string::npos) return "Modified";
@@ -791,7 +795,163 @@ ImVec4 sourceControlStatusColor(const std::string& status) {
     if (status == "Modified" || status == "Added" || status == "Renamed" || status == "Copied") return ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
     if (status == "Deleted" || status == "Conflict") return ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
     if (status == "Untracked") return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
+    if (status == "Ignored") return ImVec4(0.48f, 0.52f, 0.58f, 1.0f);
     return ImVec4(0.65f, 0.70f, 0.78f, 1.0f);
+}
+
+std::string safeProjectReportName(std::string value) {
+    if (value.empty()) {
+        value = "path";
+    }
+    for (char& c : value) {
+        const unsigned char ch = static_cast<unsigned char>(c);
+        if (!std::isalnum(ch) && c != '_' && c != '-') {
+            c = '_';
+        }
+    }
+    return value;
+}
+
+std::filesystem::path projectSourceControlReportPath(
+    const ProjectContext& project,
+    const char* label,
+    const std::filesystem::path& path,
+    const char* suffix) {
+    const std::string pathKey = canonicalForCompare(path).string();
+    const size_t hash = std::hash<std::string>{}(pathKey);
+    const std::string fileName = std::string("project_source_control_") + safeProjectReportName(label) + "_" +
+        safeProjectReportName(path.filename().empty() ? std::string("path") : path.filename().string()) + "_" +
+        std::to_string(static_cast<unsigned long long>(hash)) + suffix;
+    return project.savedRoot / "Reports" / fileName;
+}
+
+bool sourceControlDiffReportAvailable(const std::string& status) {
+    return status == "Modified" || status == "Added" || status == "Deleted" || status == "Renamed" || status == "Copied" ||
+        status == "Conflict" || status == "Changed" || status == "Untracked";
+}
+
+bool sourceControlStatusReportAvailable(const std::string& status) {
+    return status != "Unavailable" && status != "Not in Git" && status != "External";
+}
+
+bool writeProjectSourceControlStatusReport(
+    const ProjectContext& project,
+    const char* label,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    const std::string& status,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        outError = "Path is not inside a Git repository.";
+        return false;
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        outError = "Path is outside the resolved Git repository.";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(canonicalForCompare(path), *gitRoot, ec);
+    if (ec) {
+        outError = "Could not resolve repository-relative path: " + ec.message();
+        return false;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string focusedStatus = readCommandOutput("git -C " + quoteCommandPath(*gitRoot) + " status --short --ignored -- " + quoteCommandPath(relative) + stderrRedirect);
+    const std::string repositoryStatus = readCommandOutput("git -C " + quoteCommandPath(*gitRoot) + " status --short --ignored --branch" + stderrRedirect);
+
+    outPath = projectSourceControlReportPath(project, label, path, "_status.txt");
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create source-control report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write source-control status report: " + outPath.string();
+        return false;
+    }
+    file << "Project Source Control Status Report\n";
+    file << "Label: " << label << "\n";
+    file << "Repository: " << gitRoot->generic_string() << "\n";
+    file << "Path: " << relative.generic_string() << "\n";
+    file << "Status Label: " << status << "\n\n";
+    file << "Focused Status:\n" << (trimWhitespace(focusedStatus).empty() ? std::string("Clean\n") : focusedStatus) << "\n";
+    file << "Repository Status:\n" << (trimWhitespace(repositoryStatus).empty() ? std::string("Clean\n") : repositoryStatus) << "\n";
+    file << "\nPolicy: read-only report; no revert, checkout, lock, or submit action was performed.\n";
+    return true;
+}
+
+bool writeProjectSourceControlDiffReport(
+    const ProjectContext& project,
+    const char* label,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& path,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value()) {
+        outError = "Path is not inside a Git repository.";
+        return false;
+    }
+    if (!pathIsWithin(path, *gitRoot)) {
+        outError = "Path is outside the resolved Git repository.";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(canonicalForCompare(path), *gitRoot, ec);
+    if (ec) {
+        outError = "Could not resolve repository-relative path: " + ec.message();
+        return false;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string rootArg = quoteCommandPath(*gitRoot);
+    const std::string pathArg = quoteCommandPath(relative);
+    const std::string statusText = readCommandOutput("git -C " + rootArg + " status --short -- " + pathArg + stderrRedirect);
+    const std::string unstagedDiff = readCommandOutput("git -C " + rootArg + " diff -- " + pathArg + stderrRedirect);
+    const std::string stagedDiff = readCommandOutput("git -C " + rootArg + " diff --cached -- " + pathArg + stderrRedirect);
+
+    outPath = projectSourceControlReportPath(project, label, path, "_diff.patch");
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create source-control report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write source-control diff report: " + outPath.string();
+        return false;
+    }
+    file << "# Project Source Control Diff Report\n";
+    file << "Label: " << label << "\n";
+    file << "Repository: " << gitRoot->generic_string() << "\n";
+    file << "Path: " << relative.generic_string() << "\n";
+    file << "Status:\n" << (trimWhitespace(statusText).empty() ? std::string("  Clean\n") : statusText) << "\n";
+    file << "## Unstaged Diff\n" << (unstagedDiff.empty() ? std::string("(none)\n") : unstagedDiff);
+    file << "\n## Staged Diff\n" << (stagedDiff.empty() ? std::string("(none)\n") : stagedDiff);
+    if (unstagedDiff.empty() && stagedDiff.empty() && trimWhitespace(statusText).rfind("??", 0) == 0) {
+        file << "\n## Note\nUntracked files have no Git diff until they are added to the index.\n";
+    }
+    return true;
 }
 
 void drawProjectSaveStateRow(const char* label, bool dirty) {
@@ -805,9 +965,11 @@ void drawProjectSaveStateRow(const char* label, bool dirty) {
 
 void drawProjectSourceControlRow(
     const char* label,
+    const ProjectContext& project,
     const std::filesystem::path& workspaceRoot,
     const std::filesystem::path& path,
-    std::unordered_map<std::string, std::string>& cache) {
+    std::unordered_map<std::string, std::string>& cache,
+    EditorRequests& requests) {
     ImGui::TextDisabled("%s", label);
     ImGui::SameLine(150.0f);
     if (path.empty()) {
@@ -823,9 +985,49 @@ void drawProjectSourceControlRow(
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         ImGui::SetTooltip("%s", path.string().c_str());
     }
+
+    const std::string idSuffix = std::string("##ProjectSourceControl") + safeProjectReportName(label);
+    ImGui::SameLine();
+    if (ImGui::SmallButton((std::string("Open") + idSuffix).c_str())) {
+        requests.openFilePath = path;
+    }
+    ImGui::SameLine();
+    const bool canStatus = sourceControlStatusReportAvailable(it->second);
+    if (!canStatus) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::SmallButton((std::string("Status") + idSuffix).c_str())) {
+        std::filesystem::path reportPath;
+        std::string error;
+        if (writeProjectSourceControlStatusReport(project, label, workspaceRoot, path, it->second, reportPath, error)) {
+            requests.openFilePath = reportPath;
+        } else {
+            std::cerr << "Project source-control status report failed: " << error << '\n';
+        }
+    }
+    if (!canStatus) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    const bool canDiff = sourceControlDiffReportAvailable(it->second);
+    if (!canDiff) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::SmallButton((std::string("Diff") + idSuffix).c_str())) {
+        std::filesystem::path reportPath;
+        std::string error;
+        if (writeProjectSourceControlDiffReport(project, label, workspaceRoot, path, reportPath, error)) {
+            requests.openFilePath = reportPath;
+        } else {
+            std::cerr << "Project source-control diff report failed: " << error << '\n';
+        }
+    }
+    if (!canDiff) {
+        ImGui::EndDisabled();
+    }
 }
 
-void drawProjectSaveState(const ProjectManagerRuntimeState& state, std::unordered_map<std::string, std::string>& sourceControlCache) {
+void drawProjectSaveState(const ProjectManagerRuntimeState& state, std::unordered_map<std::string, std::string>& sourceControlCache, EditorRequests& requests) {
     const bool registryAvailable = state.assetRegistry != nullptr && !state.assetRegistry->state().path.empty();
     const bool registryDirty = state.assetRegistry != nullptr && state.assetRegistry->dirty();
     ImGui::SeparatorText("Save State");
@@ -851,10 +1053,10 @@ void drawProjectSaveState(const ProjectManagerRuntimeState& state, std::unordere
         if (ImGui::SmallButton("Refresh Project Source Control")) {
             sourceControlCache.clear();
         }
-        drawProjectSourceControlRow("Current Level", workspaceRoot, levelPath, sourceControlCache);
-        drawProjectSourceControlRow("Project File", workspaceRoot, state.project->projectFile, sourceControlCache);
-        drawProjectSourceControlRow("Asset Registry", workspaceRoot, registryAvailable ? state.assetRegistry->state().path : std::filesystem::path{}, sourceControlCache);
-        ImGui::TextDisabled("Read-only Git status for project-owned level, settings, and registry files.");
+        drawProjectSourceControlRow("Current Level", *state.project, workspaceRoot, levelPath, sourceControlCache, requests);
+        drawProjectSourceControlRow("Project File", *state.project, workspaceRoot, state.project->projectFile, sourceControlCache, requests);
+        drawProjectSourceControlRow("Asset Registry", *state.project, workspaceRoot, registryAvailable ? state.assetRegistry->state().path : std::filesystem::path{}, sourceControlCache, requests);
+        ImGui::TextDisabled("Read-only Git actions for project-owned level, settings, and registry files.");
     }
 }
 
@@ -1080,6 +1282,7 @@ void queueSampleProjectOpen(const std::filesystem::path& path, bool importAsScen
 
 EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
     EditorRequests requests;
+    setEditorPreferencesPath(state.editorPreferencesPath);
     state.editorPrefs = &editorPrefs_;
     state.cameraBookmarks = &cameraBookmarks_;
     state.log = &log_;
@@ -1090,16 +1293,22 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
         selection_.clear();
     }
     ImGuiIO& io = ImGui::GetIO();
-    const EditorKeybinding commandPaletteBinding = editorCommandKeybinding(EditorCommandId::CommandPalette, &editorPrefs_);
-    if (!io.WantTextInput && commandPaletteBinding.imguiKey >= 0 &&
-        commandPaletteBinding.ctrl == io.KeyCtrl &&
-        commandPaletteBinding.shift == io.KeyShift &&
-        commandPaletteBinding.alt == io.KeyAlt &&
-        ImGui::IsKeyPressed(static_cast<ImGuiKey>(commandPaletteBinding.imguiKey))) {
+    auto commandBindingPressed = [&](EditorCommandId id) {
+        const EditorKeybinding binding = editorCommandKeybinding(id, &editorPrefs_);
+        return !io.WantTextInput &&
+            binding.imguiKey >= 0 &&
+            binding.ctrl == io.KeyCtrl &&
+            binding.shift == io.KeyShift &&
+            binding.alt == io.KeyAlt &&
+            ImGui::IsKeyPressed(static_cast<ImGuiKey>(binding.imguiKey), false);
+    };
+    if (commandBindingPressed(EditorCommandId::CommandPalette)) {
         commandPaletteOpen_ = true;
     }
-    if (io.KeyCtrl && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-        (void)executeCommandPaletteCommand(io.KeyShift ? EditorCommandId::SaveAll : EditorCommandId::SaveScene, state, requests);
+    if (commandBindingPressed(EditorCommandId::SaveAll)) {
+        (void)executeCommandPaletteCommand(EditorCommandId::SaveAll, state, requests);
+    } else if (commandBindingPressed(EditorCommandId::SaveScene)) {
+        (void)executeCommandPaletteCommand(EditorCommandId::SaveScene, state, requests);
     }
     applyThemePreset();
     applyWorkspacePreset();
@@ -1316,6 +1525,9 @@ void EditorLayer::applyCaptureFocusOverride() {
 
 EditorRequests EditorLayer::drawProjectManagerLauncher(ProjectManagerRuntimeState state) {
     EditorRequests requests;
+    setEditorPreferencesPath(state.project != nullptr && !state.project->editorPreferencesPath.empty()
+        ? state.project->editorPreferencesPath
+        : EditorPreferences::defaultPath());
     ImGui::GetIO().FontGlobalScale = std::clamp(editorPrefs_.uiScale, 0.75f, 1.75f);
     applyThemePreset();
     drawProjectManager(state, requests);
@@ -1476,7 +1688,7 @@ void EditorLayer::drawDeleteEntityConfirmation(const EditorRuntimeState& state, 
         bool confirmDelete = editorPrefs_.confirmDelete;
         if (ImGui::Checkbox("Confirm entity deletes", &confirmDelete)) {
             editorPrefs_.confirmDelete = confirmDelete;
-            editorPrefs_.save(EditorPreferences::defaultPath());
+            saveEditorPreferences();
         }
 
         ImGui::Separator();
@@ -1807,14 +2019,14 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         ImGui::TextDisabled("Renderer startup is deferred until a project or scene is selected.");
     }
     if (state.project != nullptr || state.sceneDirty || state.assetRegistry != nullptr) {
-        drawProjectSaveState(state, projectSourceControlStatusCache_);
+        drawProjectSaveState(state, projectSourceControlStatusCache_, requests);
     }
 
     int startupMode = editorPrefs_.openLastProject ? 1 : 0;
     ImGui::SetNextItemWidth(220.0f);
     if (ImGui::Combo("Load on Startup", &startupMode, "Show Project Manager\0Open Last Project\0")) {
         editorPrefs_.openLastProject = startupMode == 1;
-        editorPrefs_.save(EditorPreferences::defaultPath());
+        saveGlobalLauncherPreferences();
     }
     if (state.project == nullptr) {
         ImGui::Spacing();
@@ -1872,7 +2084,7 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
                 }
                 if (ImGui::MenuItem("Remove from Recent")) {
                     editorPrefs_.removeRecentProject(project);
-                    editorPrefs_.save(EditorPreferences::defaultPath());
+                    saveGlobalLauncherPreferences();
                 }
                 if (ImGui::MenuItem("Delete Project...", nullptr, false, !missing)) {
                     pendingDeleteProjectFile_ = projectPath;
@@ -1986,13 +2198,13 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Remove")) {
                     editorPrefs_.removeRecentProject(project);
-                    editorPrefs_.save(EditorPreferences::defaultPath());
+                    saveGlobalLauncherPreferences();
                 }
             } else {
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Remove")) {
                     editorPrefs_.removeRecentProject(project);
-                    editorPrefs_.save(EditorPreferences::defaultPath());
+                    saveGlobalLauncherPreferences();
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Delete...")) {
@@ -2321,7 +2533,7 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
     prefsChanged |= ImGui::DragInt("Layout Version", &editorPrefs_.layoutVersion, 1.0f, 1, 99);
     if (prefsChanged) {
         editorPrefs_.uiScale = std::clamp(editorPrefs_.uiScale, 0.75f, 1.75f);
-        editorPrefs_.save(EditorPreferences::defaultPath());
+        saveEditorPreferences();
         applyThemePreset();
         applyWorkspacePreset();
     }
@@ -2425,6 +2637,33 @@ void EditorLayer::applyThemePreset() {
             colors[ImGuiCol_ResizeGrip] = editorResizeGripColor();
         }
     }
+}
+
+void EditorLayer::setEditorPreferencesPath(std::filesystem::path path) {
+    if (path.empty()) {
+        path = EditorPreferences::defaultPath();
+    }
+    editorPreferencesPath_ = std::move(path);
+}
+
+bool EditorLayer::saveEditorPreferences() {
+    const std::filesystem::path path = editorPreferencesPath_.empty()
+        ? EditorPreferences::defaultPath()
+        : editorPreferencesPath_;
+    return editorPrefs_.save(path);
+}
+
+bool EditorLayer::saveGlobalLauncherPreferences() {
+    EditorPreferences globalPrefs;
+    globalPrefs.load(EditorPreferences::defaultPath());
+    globalPrefs.recentProjects = editorPrefs_.recentProjects;
+    globalPrefs.lastOpenedProject = editorPrefs_.lastOpenedProject;
+    globalPrefs.openLastProject = editorPrefs_.openLastProject;
+    return globalPrefs.save(EditorPreferences::defaultPath());
+}
+
+void EditorLayer::reloadViewportPreferences() {
+    viewportPanel_.reloadViewportPreferences(editorPrefs_);
 }
 
 void EditorLayer::setProjectWorkspacePreset(int preset) {
@@ -2689,7 +2928,7 @@ void EditorLayer::drawTimelinePanel(EditorRuntimeState& state, EditorRequests& r
     ImGui::SetNextItemWidth(EditorUiMetric::timelineFrameRateWidth);
     if (ImGui::DragInt("Seq Frames", &sequenceFrames, 1.0f, 1, 512)) {
         editorPrefs_.renderSequenceFramesPerTimelineFrame = std::clamp(sequenceFrames, 1, 512);
-        editorPrefs_.save(EditorPreferences::defaultPath());
+        saveEditorPreferences();
     }
     timelineIconTooltip("Rendered frames per timeline frame");
     const int range = std::max(1, timeline_.endFrame - timeline_.startFrame);
@@ -3854,7 +4093,7 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
         return value;
     }();
 
-    if (const auto conflicts = defaultEditorCommandRegistry().detectConflicts(); !conflicts.empty()) {
+    if (const auto conflicts = defaultEditorCommandRegistry().detectConflicts(&editorPrefs_); !conflicts.empty()) {
         ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.25f, 1.0f), "Shortcut conflicts: %zu", conflicts.size());
     }
 
@@ -3862,7 +4101,7 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
         commandPaletteShortcutEditor_ = !commandPaletteShortcutEditor_;
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("Overrides are saved to editor preferences and displayed in the palette.");
+    ImGui::TextDisabled("Overrides are saved to editor preferences and drive runtime shortcuts.");
 
     ImGui::Separator();
     if (ImGui::BeginChild("CommandPaletteResults", ImVec2(0.0f, 0.0f), true)) {
@@ -3874,7 +4113,6 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
             }
             ImGui::PushID(static_cast<int>(command.id));
             const std::string commandKey = editorCommandPreferenceKey(command);
-            const auto overrideIt = editorPrefs_.commandShortcutOverrides.find(commandKey);
             const std::string shortcut = editorCommandShortcutDisplay(command.id, &editorPrefs_);
             const std::string unavailableReason = commandUnavailableReason(command.id, state, selection_);
             const bool commandAvailable = unavailableReason.empty();
@@ -3891,13 +4129,13 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
                     } else {
                         editorPrefs_.commandShortcutOverrides[commandKey] = next;
                     }
-                    editorPrefs_.save(EditorPreferences::defaultPath());
+                    saveEditorPreferences();
                     log_.add(EditorLogCategory::Command, "Updated shortcut display for " + command.name);
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Reset")) {
                     editorPrefs_.commandShortcutOverrides.erase(commandKey);
-                    editorPrefs_.save(EditorPreferences::defaultPath());
+                    saveEditorPreferences();
                 }
             } else {
                 if (!commandAvailable) {
@@ -3932,10 +4170,6 @@ void EditorLayer::drawCommandPalette(EditorRuntimeState& state, EditorRequests& 
                         ImGui::CloseCurrentPopup();
                     } else {
                         log_.add(EditorLogCategory::Warning, "Command unavailable: " + command.name);
-                    }
-                } else {
-                    if (commandAvailable && !shortcut.empty() && overrideIt != editorPrefs_.commandShortcutOverrides.end() && rowHovered) {
-                        ImGui::SetTooltip("Custom shortcut display. Runtime rebinding uses the default command contexts until the next input-system pass.");
                     }
                 }
             }

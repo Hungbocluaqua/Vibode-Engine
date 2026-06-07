@@ -22,10 +22,18 @@ void RendererValidationLog::recordAccumulationInvalidation(std::string reason, u
     }
 }
 
-void RendererValidationLog::recordSceneUpdateRoute(std::string kind, std::string action) {
+void RendererValidationLog::recordSceneUpdateRoute(std::string kind, std::string action, double cpuMs) {
     for (SceneUpdateRouteEvent& route : sceneUpdateRoutes_) {
         if (route.kind == kind && route.action == action) {
             ++route.count;
+            route.totalCpuMs += cpuMs;
+            route.lastCpuMs = cpuMs;
+            if (route.minCpuMs <= 0.0 || cpuMs < route.minCpuMs) {
+                route.minCpuMs = cpuMs;
+            }
+            if (cpuMs > route.maxCpuMs) {
+                route.maxCpuMs = cpuMs;
+            }
             return;
         }
     }
@@ -33,6 +41,10 @@ void RendererValidationLog::recordSceneUpdateRoute(std::string kind, std::string
         .kind = std::move(kind),
         .action = std::move(action),
         .count = 1,
+        .totalCpuMs = cpuMs,
+        .lastCpuMs = cpuMs,
+        .minCpuMs = cpuMs,
+        .maxCpuMs = cpuMs,
     });
 }
 

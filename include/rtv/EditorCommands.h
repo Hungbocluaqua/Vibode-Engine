@@ -125,7 +125,7 @@ public:
     void registerCommand(EditorCommand command);
     [[nodiscard]] const EditorCommand* find(EditorCommandId id) const;
     [[nodiscard]] const std::vector<EditorCommand>& commands() const { return commands_; }
-    [[nodiscard]] std::vector<std::string> detectConflicts() const;
+    [[nodiscard]] std::vector<std::string> detectConflicts(const EditorPreferences* preferences = nullptr) const;
 
 private:
     std::vector<EditorCommand> commands_;

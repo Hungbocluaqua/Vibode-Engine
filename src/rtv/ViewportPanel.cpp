@@ -7,6 +7,7 @@
 #include "rtv/EditorPreferences.h"
 #include "rtv/EditorTransformUtils.h"
 #include "rtv/EditorUiStyle.h"
+#include "rtv/Prefab.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/SceneOperations.h"
 
@@ -75,6 +76,23 @@ std::string assetLabelForGuid(const EditorRuntimeState& state, const AssetGuid& 
         }
     }
     return guid.empty() ? std::string{"Asset"} : guid;
+}
+
+std::filesystem::path resolvedAssetRecordPath(const EditorRuntimeState& state, const std::string& value) {
+    if (value.empty()) {
+        return {};
+    }
+    std::filesystem::path path(value);
+    if (path.is_absolute()) {
+        return path;
+    }
+    if (state.project != nullptr) {
+        return state.project->projectRoot / path;
+    }
+    if (state.assetRegistry != nullptr && !state.assetRegistry->state().path.empty()) {
+        return state.assetRegistry->state().path.parent_path() / path;
+    }
+    return path;
 }
 
 struct ViewportDropPreview {
@@ -174,12 +192,121 @@ std::optional<ViewportPlacementBounds> meshPlacementBounds(const AssetManager* a
     return bounds;
 }
 
+void includeTransformedBoundsCorners(ViewportPlacementBounds& outBounds, const ViewportPlacementBounds& localBounds, const glm::mat4& transform, bool& hasPoint) {
+    const std::array<glm::vec3, 8> corners = {
+        glm::vec3{localBounds.min.x, localBounds.min.y, localBounds.min.z},
+        glm::vec3{localBounds.max.x, localBounds.min.y, localBounds.min.z},
+        glm::vec3{localBounds.min.x, localBounds.max.y, localBounds.min.z},
+        glm::vec3{localBounds.max.x, localBounds.max.y, localBounds.min.z},
+        glm::vec3{localBounds.min.x, localBounds.min.y, localBounds.max.z},
+        glm::vec3{localBounds.max.x, localBounds.min.y, localBounds.max.z},
+        glm::vec3{localBounds.min.x, localBounds.max.y, localBounds.max.z},
+        glm::vec3{localBounds.max.x, localBounds.max.y, localBounds.max.z},
+    };
+    for (const glm::vec3& corner : corners) {
+        const glm::vec3 world = glm::vec3(transform * glm::vec4(corner, 1.0f));
+        if (!std::isfinite(world.x) || !std::isfinite(world.y) || !std::isfinite(world.z)) {
+            continue;
+        }
+        if (!hasPoint) {
+            outBounds.min = world;
+            outBounds.max = world;
+            hasPoint = true;
+        } else {
+            outBounds.min = glm::min(outBounds.min, world);
+            outBounds.max = glm::max(outBounds.max, world);
+        }
+    }
+}
+
+std::optional<glm::mat4> prefabNodeWorldTransform(const PrefabAsset& prefab, uint32_t nodeIndex, std::vector<std::optional<glm::mat4>>& cache) {
+    if (nodeIndex >= prefab.nodes.size()) {
+        return std::nullopt;
+    }
+    if (cache[nodeIndex].has_value()) {
+        return cache[nodeIndex];
+    }
+    const PrefabNodeAsset& node = prefab.nodes[nodeIndex];
+    glm::mat4 parent{1.0f};
+    if (node.parent >= 0) {
+        const uint32_t parentIndex = static_cast<uint32_t>(node.parent);
+        if (parentIndex >= prefab.nodes.size() || parentIndex == nodeIndex) {
+            return std::nullopt;
+        }
+        const std::optional<glm::mat4> parentTransform = prefabNodeWorldTransform(prefab, parentIndex, cache);
+        if (!parentTransform.has_value()) {
+            return std::nullopt;
+        }
+        parent = *parentTransform;
+    }
+    cache[nodeIndex] = parent * node.transform;
+    return cache[nodeIndex];
+}
+
+std::optional<ViewportPlacementBounds> prefabPlacementBoundsForGuid(const EditorRuntimeState& state, const AssetGuid& guid) {
+    const AssetRecord* record = assetRecordForGuid(state.assetRegistry, guid);
+    if (record == nullptr || record->type != AssetType::Prefab || record->importedPath.empty()) {
+        return std::nullopt;
+    }
+
+    PrefabAsset prefab;
+    std::string error;
+    if (!loadPrefabAsset(resolvedAssetRecordPath(state, record->importedPath), prefab, &error) || prefab.nodes.empty()) {
+        return std::nullopt;
+    }
+
+    ViewportPlacementBounds bounds;
+    bool hasPoint = false;
+    std::vector<std::optional<glm::mat4>> worldTransforms(prefab.nodes.size());
+    for (uint32_t i = 0; i < prefab.nodes.size(); ++i) {
+        const PrefabNodeAsset& node = prefab.nodes[i];
+        if (node.meshGuid.empty()) {
+            continue;
+        }
+        const std::optional<MeshAssetHandle> handle = loadedMeshHandleForGuid(state, node.meshGuid);
+        if (!handle.has_value()) {
+            continue;
+        }
+        const std::optional<ViewportPlacementBounds> meshBounds = meshPlacementBounds(state.assets, *handle);
+        if (!meshBounds.has_value()) {
+            continue;
+        }
+        const std::optional<glm::mat4> nodeWorld = prefabNodeWorldTransform(prefab, i, worldTransforms);
+        if (!nodeWorld.has_value()) {
+            continue;
+        }
+        includeTransformedBoundsCorners(bounds, *meshBounds, *nodeWorld, hasPoint);
+    }
+    return hasPoint ? std::optional<ViewportPlacementBounds>{bounds} : std::nullopt;
+}
+
 std::optional<ViewportPlacementBounds> meshPlacementBoundsForPayload(const EditorRuntimeState& state, const ImGuiPayload& payload) {
     if (!payload.IsDataType("MESH_ASSET")) {
         return std::nullopt;
     }
     if (const std::optional<MeshAssetHandle> handle = loadedMeshHandleForGuid(state, payloadString(payload))) {
         return meshPlacementBounds(state.assets, *handle);
+    }
+    return std::nullopt;
+}
+
+std::optional<ViewportPlacementBounds> footprintBoundsForPlacementPayload(const EditorRuntimeState& state, const ImGuiPayload& payload) {
+    if (payload.IsDataType("MESH_ASSET")) {
+        return meshPlacementBoundsForPayload(state, payload);
+    }
+    if (payload.IsDataType("PREFAB_ASSET")) {
+        return prefabPlacementBoundsForGuid(state, payloadString(payload));
+    }
+    return std::nullopt;
+}
+
+std::optional<ViewportPlacementBounds> footprintBoundsForPlacementBrush(const EditorRuntimeState& state, const ViewportPlacementBrushState& brush) {
+    if (brush.kind == ViewportPlacementBrushKind::Mesh) {
+        if (const std::optional<MeshAssetHandle> handle = loadedMeshHandleForGuid(state, brush.guid)) {
+            return meshPlacementBounds(state.assets, *handle);
+        }
+    } else if (brush.kind == ViewportPlacementBrushKind::Prefab) {
+        return prefabPlacementBoundsForGuid(state, brush.guid);
     }
     return std::nullopt;
 }
@@ -238,6 +365,27 @@ bool viewportDropSurfaceAlignActive(const EditorRuntimeState& state, bool forceG
 
 bool viewportDropWheelRotationEnabled(const EditorRuntimeState& state) {
     return state.editorPrefs == nullptr || state.editorPrefs->viewportDropMouseWheelRotationEnabled;
+}
+
+bool viewportDropDuplicatePlacementActive(const EditorRuntimeState& state) {
+    const ImGuiIO& io = ImGui::GetIO();
+    return (!io.WantTextInput && ImGui::IsKeyDown(ImGuiKey_D)) ||
+        (state.editorPrefs != nullptr && state.editorPrefs->viewportDropDuplicatePlacementByDefault);
+}
+
+bool viewportDropMultiPlaceActive(const EditorRuntimeState& state) {
+    const ImGuiIO& io = ImGui::GetIO();
+    return (!io.WantTextInput && ImGui::IsKeyDown(ImGuiKey_M)) ||
+        (state.editorPrefs != nullptr && state.editorPrefs->viewportDropMultiPlaceByDefault);
+}
+
+const char* placementBrushKindName(ViewportPlacementBrushKind kind) {
+    switch (kind) {
+    case ViewportPlacementBrushKind::Prefab: return "Prefab";
+    case ViewportPlacementBrushKind::Mesh: return "Mesh";
+    case ViewportPlacementBrushKind::None: break;
+    }
+    return "Asset";
 }
 
 ViewportDropMarkerStyle viewportDropMarkerStyle(
@@ -446,9 +594,12 @@ void drawViewportDropPreview(const EditorRuntimeState& state, const EditorSelect
     drawList->AddLine(ImVec2(cursor.x, cursor.y - markerSize - 4.0f), ImVec2(cursor.x, cursor.y + markerSize + 4.0f), markerColor, 2.0f);
 
     if (preview.placement) {
-        const std::optional<ViewportPlacementBounds> bounds = meshPlacementBoundsForPayload(state, *payload);
-        if (const std::optional<Transform> transform = viewportDropPlacementTransform(state, snapEnabled, translationSnap, forceGrid, surfaceAlign, yawRadians, bounds)) {
-            const ViewportPlacementFootprint footprint = footprintFromBounds(bounds);
+        const std::optional<ViewportPlacementBounds> footprintBounds = footprintBoundsForPlacementPayload(state, *payload);
+        const std::optional<ViewportPlacementBounds> placementBounds = payload->IsDataType("MESH_ASSET")
+            ? footprintBounds
+            : std::nullopt;
+        if (const std::optional<Transform> transform = viewportDropPlacementTransform(state, snapEnabled, translationSnap, forceGrid, surfaceAlign, yawRadians, placementBounds)) {
+            const ViewportPlacementFootprint footprint = footprintFromBounds(footprintBounds);
             drawViewportDropPlacementFootprint(state, *transform, forceGrid, surfaceAlign, footprint);
         }
     }
@@ -465,6 +616,69 @@ void drawViewportDropPreview(const EditorRuntimeState& state, const EditorSelect
     drawList->AddRectFilled(rectMin, rectMax, IM_COL32(12, 16, 21, 230), 4.0f);
     drawList->AddRect(rectMin, rectMax, IM_COL32(75, 95, 110, 220), 4.0f);
     drawList->AddText(textMin, markerStyle.textColor, text.c_str());
+}
+
+void drawViewportPlacementBrushPreview(
+    const EditorRuntimeState& state,
+    const ViewportPlacementBrushState& brush,
+    bool snapEnabled,
+    float translationSnap) {
+    if (!brush.active()) {
+        return;
+    }
+
+    const bool forceGrid = viewportDropForceGridActive(state);
+    const bool surfaceAlign = viewportDropSurfaceAlignActive(state, forceGrid);
+    const std::optional<ViewportPlacementBounds> footprintBounds = footprintBoundsForPlacementBrush(state, brush);
+    const std::optional<ViewportPlacementBounds> placementBounds = brush.kind == ViewportPlacementBrushKind::Mesh
+        ? footprintBounds
+        : std::nullopt;
+
+    std::ostringstream label;
+    label << "Place " << placementBrushKindName(brush.kind) << "  " << assetLabelForGuid(state, brush.guid);
+    if (brush.multiPlace) {
+        label << "  Multi";
+    } else {
+        label << "  Duplicate";
+    }
+    if (forceGrid) {
+        label << "  Grid";
+    } else if (surfaceAlign) {
+        label << "  Align";
+    }
+    label << (snapEnabled ? "  Snap " : "  Free");
+    if (snapEnabled) {
+        label << std::fixed << std::setprecision(2) << translationSnap;
+    }
+    if (std::abs(brush.yawRadians) > 0.0001f) {
+        label << "  Rot " << std::fixed << std::setprecision(0) << glm::degrees(brush.yawRadians);
+    }
+
+    const ImVec2 cursor(state.viewport.mousePosition.x, state.viewport.mousePosition.y);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    constexpr float markerSize = 11.0f;
+    const ImU32 markerColor = brush.multiPlace ? IM_COL32(135, 205, 255, 255) : IM_COL32(185, 215, 115, 255);
+    drawList->AddCircle(cursor, markerSize, markerColor, 24, 2.0f);
+    drawList->AddLine(ImVec2(cursor.x - markerSize - 4.0f, cursor.y), ImVec2(cursor.x + markerSize + 4.0f, cursor.y), markerColor, 2.0f);
+    drawList->AddLine(ImVec2(cursor.x, cursor.y - markerSize - 4.0f), ImVec2(cursor.x, cursor.y + markerSize + 4.0f), markerColor, 2.0f);
+
+    if (const std::optional<Transform> transform = viewportDropPlacementTransform(state, snapEnabled, translationSnap, forceGrid, surfaceAlign, brush.yawRadians, placementBounds)) {
+        const ViewportPlacementFootprint footprint = footprintFromBounds(footprintBounds);
+        drawViewportDropPlacementFootprint(state, *transform, forceGrid, surfaceAlign, footprint);
+    }
+
+    const std::string text = label.str();
+    const ImVec2 textSize = ImGui::CalcTextSize(text.c_str());
+    ImVec2 textMin(cursor.x + 16.0f, cursor.y + 14.0f);
+    const float maxX = state.viewport.imageOrigin.x + state.viewport.imageSize.x - textSize.x - 18.0f;
+    const float maxY = state.viewport.imageOrigin.y + state.viewport.imageSize.y - textSize.y - 14.0f;
+    textMin.x = std::clamp(textMin.x, state.viewport.imageOrigin.x + 8.0f, std::max(state.viewport.imageOrigin.x + 8.0f, maxX));
+    textMin.y = std::clamp(textMin.y, state.viewport.imageOrigin.y + 8.0f, std::max(state.viewport.imageOrigin.y + 8.0f, maxY));
+    const ImVec2 rectMin(textMin.x - 8.0f, textMin.y - 5.0f);
+    const ImVec2 rectMax(textMin.x + textSize.x + 8.0f, textMin.y + textSize.y + 5.0f);
+    drawList->AddRectFilled(rectMin, rectMax, IM_COL32(12, 16, 21, 230), 4.0f);
+    drawList->AddRect(rectMin, rectMax, IM_COL32(75, 95, 110, 220), 4.0f);
+    drawList->AddText(textMin, IM_COL32(232, 238, 244, 255), text.c_str());
 }
 
 glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity) {
@@ -1322,7 +1536,7 @@ void drawViewportTopRail(ImDrawList* drawList, ImVec2 imagePos, ImVec2 avail) {
 
 void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests) {
     if (state.editorPrefs != nullptr && !viewportPreferencesLoaded_) {
-        loadViewportPreferences(*state.editorPrefs);
+        reloadViewportPreferences(*state.editorPrefs);
     }
     const SnapSettings snapAtFrameStart = snap_;
     const bool showGridAtFrameStart = showGrid_;
@@ -1374,9 +1588,12 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         const std::string placementKey = activePayload != nullptr ? placementPayloadKey(*activePayload) : std::string{};
         if (placementKey.empty()) {
             activePlacementPayloadKey_.clear();
-            placementPreviewYawRadians_ = 0.0f;
+            if (!placementBrush_.active()) {
+                placementPreviewYawRadians_ = 0.0f;
+            }
         } else if (placementKey != activePlacementPayloadKey_) {
             activePlacementPayloadKey_ = placementKey;
+            placementBrush_ = {};
             placementPreviewYawRadians_ = 0.0f;
         } else if (!viewportDropWheelRotationEnabled(state)) {
             placementPreviewYawRadians_ = 0.0f;
@@ -1385,17 +1602,54 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             placementPreviewYawRadians_ = wrappedPlacementYaw(
                 placementPreviewYawRadians_ + glm::radians(stepDegrees) * ImGui::GetIO().MouseWheel);
         }
-        if (viewportContentHovered) {
-            drawViewportDropPreview(state, selection, snap_.enabled, snap_.translation, placementPreviewYawRadians_);
+        if (placementBrush_.active() && placementKey.empty()) {
+            if (!viewportDropWheelRotationEnabled(state)) {
+                placementPreviewYawRadians_ = 0.0f;
+            } else if (viewportContentHovered && std::abs(ImGui::GetIO().MouseWheel) > 0.0f) {
+                const float stepDegrees = snap_.enabled ? std::max(1.0f, snap_.rotation) : 5.0f;
+                placementPreviewYawRadians_ = wrappedPlacementYaw(
+                    placementPreviewYawRadians_ + glm::radians(stepDegrees) * ImGui::GetIO().MouseWheel);
+            }
+            placementBrush_.yawRadians = placementPreviewYawRadians_;
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                placementBrush_ = {};
+                placementPreviewYawRadians_ = 0.0f;
+            }
         }
+        if (viewportContentHovered) {
+            if (activePayload != nullptr) {
+                drawViewportDropPreview(state, selection, snap_.enabled, snap_.translation, placementPreviewYawRadians_);
+            } else if (placementBrush_.active()) {
+                drawViewportPlacementBrushPreview(state, placementBrush_, snap_.enabled, snap_.translation);
+            }
+        }
+        bool placementBrushClicked = false;
+        bool placementBrushCancelledClick = false;
+        auto armPlacementBrush = [&](ViewportPlacementBrushKind kind, AssetGuid guid) {
+            const bool multiPlace = viewportDropMultiPlaceActive(state);
+            const bool duplicatePlacement = viewportDropDuplicatePlacementActive(state);
+            if (guid.empty() || (!multiPlace && !duplicatePlacement)) {
+                return;
+            }
+            placementBrush_ = ViewportPlacementBrushState{
+                .kind = kind,
+                .guid = std::move(guid),
+                .yawRadians = placementPreviewYawRadians_,
+                .remainingPlacements = duplicatePlacement && !multiPlace ? 1 : 0,
+                .multiPlace = multiPlace,
+            };
+        };
         if (ImGui::BeginDragDropTarget()) {
             const bool forceGridDrop = viewportDropForceGridActive(state);
             const bool surfaceAlignDrop = viewportDropSurfaceAlignActive(state, forceGridDrop);
             if (const auto* payload = ImGui::AcceptDragDropPayload("PREFAB_ASSET")) {
-                requests.placeAsset = std::string(static_cast<const char*>(payload->Data));
+                const AssetGuid guid = payloadString(*payload);
+                requests.placeAsset = guid;
                 requests.placeAssetTransform = viewportDropPlacementTransform(state, snap_.enabled, snap_.translation, forceGridDrop, surfaceAlignDrop, placementPreviewYawRadians_);
+                armPlacementBrush(ViewportPlacementBrushKind::Prefab, guid);
             }
             if (const auto* payload = ImGui::AcceptDragDropPayload("MESH_ASSET")) {
+                const AssetGuid guid = payloadString(*payload);
                 const std::optional<ViewportPlacementBounds> bounds = meshPlacementBoundsForPayload(state, *payload);
                 EntityId replaceEntity{};
                 if (ImGui::GetIO().KeyShift) {
@@ -1409,10 +1663,13 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                     }
                 }
                 requests.meshAssetPlacement = EditorMeshAssetPlacement{
-                    .meshGuid = std::string(static_cast<const char*>(payload->Data)),
+                    .meshGuid = guid,
                     .placementTransform = viewportDropPlacementTransform(state, snap_.enabled, snap_.translation, forceGridDrop, surfaceAlignDrop, placementPreviewYawRadians_, bounds),
                     .replaceEntity = replaceEntity,
                 };
+                if (!replaceEntity.valid()) {
+                    armPlacementBrush(ViewportPlacementBrushKind::Mesh, guid);
+                }
             }
             if (const auto* payload = ImGui::AcceptDragDropPayload("MATERIAL_ASSET")) {
                 const AssetGuid materialGuid = payloadString(*payload);
@@ -1441,6 +1698,54 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 levelDropPopupOpen_ = !pendingLevelDropPath_.empty();
             }
             ImGui::EndDragDropTarget();
+        }
+
+        if (placementBrush_.active() && placementKey.empty() && viewportContentHovered) {
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                placementBrush_ = {};
+                placementPreviewYawRadians_ = 0.0f;
+                rightMouseContextCandidate_ = false;
+                rightMouseContextSuppressed_ = true;
+                placementBrushCancelledClick = true;
+            } else if (state.viewport.leftClicked && !state.viewport.mouseCaptureActive && !ImGui::GetIO().WantTextInput) {
+                const bool forceGridDrop = viewportDropForceGridActive(state);
+                const bool surfaceAlignDrop = viewportDropSurfaceAlignActive(state, forceGridDrop);
+                if (placementBrush_.kind == ViewportPlacementBrushKind::Prefab) {
+                    requests.placeAsset = placementBrush_.guid;
+                    requests.placeAssetTransform = viewportDropPlacementTransform(
+                        state,
+                        snap_.enabled,
+                        snap_.translation,
+                        forceGridDrop,
+                        surfaceAlignDrop,
+                        placementBrush_.yawRadians);
+                    placementBrushClicked = true;
+                } else if (placementBrush_.kind == ViewportPlacementBrushKind::Mesh) {
+                    std::optional<ViewportPlacementBounds> bounds;
+                    if (const std::optional<MeshAssetHandle> handle = loadedMeshHandleForGuid(state, placementBrush_.guid)) {
+                        bounds = meshPlacementBounds(state.assets, *handle);
+                    }
+                    requests.meshAssetPlacement = EditorMeshAssetPlacement{
+                        .meshGuid = placementBrush_.guid,
+                        .placementTransform = viewportDropPlacementTransform(
+                            state,
+                            snap_.enabled,
+                            snap_.translation,
+                            forceGridDrop,
+                            surfaceAlignDrop,
+                            placementBrush_.yawRadians,
+                            bounds),
+                    };
+                    placementBrushClicked = true;
+                }
+                if (placementBrushClicked && !placementBrush_.multiPlace) {
+                    --placementBrush_.remainingPlacements;
+                    if (placementBrush_.remainingPlacements <= 0) {
+                        placementBrush_ = {};
+                        placementPreviewYawRadians_ = 0.0f;
+                    }
+                }
+            }
         }
 
         if (levelDropPopupOpen_) {
@@ -1531,7 +1836,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         constexpr float viewportContextTapMaxSeconds = 0.18f;
         constexpr float viewportContextTapMaxDragSq = 16.0f;
         const ImGuiIO& io = ImGui::GetIO();
-        if (viewportContentHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        if (viewportContentHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !placementBrushCancelledClick) {
             rightMouseContextCandidate_ = true;
             rightMouseContextSuppressed_ = false;
             rightMouseContextHoldSeconds_ = 0.0f;
@@ -1576,7 +1881,12 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 requests.sceneUpdate = SceneUpdateKind::TopologyChanged;
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::Trash, "Delete", editableSelection)) {
-                requests.deleteEntities = selection.selectedEntitiesOr(selection.entityId());
+                const std::vector<EntityId> selectedEntities = selection.selectedEntitiesOr(selection.entityId());
+                if (selectedEntities.size() == 1) {
+                    requests.deleteEntity = selectedEntities.front();
+                } else {
+                    requests.deleteEntities = selectedEntities;
+                }
                 selection.clear();
             }
             if (editorGlyphMenuItem(EditorGlyphIcon::Reset, "Reset Transform", editableSelection)) {
@@ -1603,9 +1913,9 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
                 requests.sceneUpdate = SceneUpdateKind::LightOnly;
             }
-            editorGlyphMenuItem(EditorGlyphIcon::Add, "Drop Content asset here", false);
+            editorGlyphMenuItem(EditorGlyphIcon::Add, "Drop prefab here", false);
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                ImGui::SetTooltip("Drag a prefab, mesh, material, HDRI, or level asset from Content onto the viewport");
+                ImGui::SetTooltip("Drag a prefab from Content, or drag a mesh, material, HDRI, or level asset onto the viewport");
             }
             ImGui::EndPopup();
         }
@@ -1807,7 +2117,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                     saveViewportPrefs = true;
                 }
                 if (saveViewportPrefs) {
-                    state.editorPrefs->save(EditorPreferences::defaultPath());
+                    state.editorPrefs->save(state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath);
                 }
             }
             ImGui::Checkbox("Grid", &showGrid_);
@@ -1836,9 +2146,11 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 bool savePrefs = false;
                 savePrefs |= ImGui::Checkbox("Force grid by default", &state.editorPrefs->viewportDropForceGridByDefault);
                 savePrefs |= ImGui::Checkbox("Surface align by default", &state.editorPrefs->viewportDropSurfaceAlignByDefault);
+                savePrefs |= ImGui::Checkbox("Duplicate next by default", &state.editorPrefs->viewportDropDuplicatePlacementByDefault);
+                savePrefs |= ImGui::Checkbox("Multi-place by default", &state.editorPrefs->viewportDropMultiPlaceByDefault);
                 savePrefs |= ImGui::Checkbox("Wheel rotation", &state.editorPrefs->viewportDropMouseWheelRotationEnabled);
                 if (savePrefs) {
-                    state.editorPrefs->save(EditorPreferences::defaultPath());
+                    state.editorPrefs->save(state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath);
                 }
             }
             if (state.camera != nullptr) {
@@ -2082,7 +2394,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             }
         }
 
-        if (state.viewport.leftClicked && !gizmoHoveredOrUsing && !viewportUiHovered) {
+        if (state.viewport.leftClicked && !placementBrushClicked && !gizmoHoveredOrUsing && !viewportUiHovered) {
             if (showActorIcons_ && pickActorIcons_) {
                 if (const std::optional<EntityId> pickedActor = actorIconUnderCursor(state)) {
                     selection.selectEntity(*pickedActor);
@@ -2113,7 +2425,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         localGizmoAtFrameStart != localGizmoMode_ ||
         pickMeshEntitiesAtFrameStart != pickMeshEntities_ ||
         pickActorIconsAtFrameStart != pickActorIcons_)) {
-        persistViewportPreferences(*state.editorPrefs);
+        persistViewportPreferences(*state.editorPrefs, state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath);
     }
     ImGui::End();
     ImGui::PopStyleVar();
@@ -2162,7 +2474,7 @@ void ViewportPanel::abortGizmoDrag() {
     gizmoDragOriginalWorld_ = glm::mat4{1.0f};
 }
 
-void ViewportPanel::loadViewportPreferences(const EditorPreferences& preferences) {
+void ViewportPanel::reloadViewportPreferences(const EditorPreferences& preferences) {
     showGrid_ = preferences.gridVisible;
     showAxes_ = preferences.viewportAxesVisible;
     localGizmoMode_ = preferences.viewportLocalTransformFrame;
@@ -2175,7 +2487,7 @@ void ViewportPanel::loadViewportPreferences(const EditorPreferences& preferences
     viewportPreferencesLoaded_ = true;
 }
 
-void ViewportPanel::persistViewportPreferences(EditorPreferences& preferences) const {
+void ViewportPanel::persistViewportPreferences(EditorPreferences& preferences, const std::filesystem::path& path) const {
     preferences.gridVisible = showGrid_;
     preferences.viewportAxesVisible = showAxes_;
     preferences.viewportLocalTransformFrame = localGizmoMode_;
@@ -2185,7 +2497,7 @@ void ViewportPanel::persistViewportPreferences(EditorPreferences& preferences) c
     preferences.viewportScaleSnap = std::clamp(snap_.scale, 0.001f, 10.0f);
     preferences.viewportPickMeshEntities = pickMeshEntities_;
     preferences.viewportPickActorIcons = pickActorIcons_;
-    preferences.save(EditorPreferences::defaultPath());
+    preferences.save(path.empty() ? EditorPreferences::defaultPath() : path);
 }
 
 void ViewportPanel::executeCommand(EditorCommandId id) {

@@ -1108,6 +1108,10 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                     drawInspectorComponentHeader(EditorGlyphIcon::Material, "Material", "First resolved slot; edit in Material Editor", !entityLocked);
                     inspectorReadonlyRow("Material", source->name.empty() ? "(unnamed)" : source->name.c_str());
                     inspectorReadonlyRow("Material ID", std::to_string(materialHandle.index));
+                    int alphaMode = static_cast<int>(std::clamp(source->alphaMode, kMaterialAlphaModeOpaque, kMaterialAlphaModeBlend));
+                    ImGui::BeginDisabled();
+                    (void)inspectorComboRow("Alpha Mode", &alphaMode, "Opaque\0Mask\0Blend\0");
+                    ImGui::EndDisabled();
                     if (editorIconTextButton("InspectorOpenMaterialEditor", EditorGlyphIcon::Material, "Open Material Editor")) {
                         requests.showMaterialEditor = true;
                     }

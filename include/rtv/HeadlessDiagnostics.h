@@ -568,6 +568,18 @@ struct ProfileReport {
         std::string effectiveTemporalUpscaler = "taa-tsr";
     } nvidiaIntegrations{};
 
+    struct SceneUpdateRouteReport {
+        std::string kind;
+        std::string action;
+        uint64_t count = 0;
+        double totalCpuMs = 0.0;
+        double lastCpuMs = 0.0;
+        double averageCpuMs = 0.0;
+        double minCpuMs = 0.0;
+        double maxCpuMs = 0.0;
+    };
+    std::vector<SceneUpdateRouteReport> sceneUpdateRoutes;
+
     uint32_t validationErrorCount = 0;
     std::vector<std::string> warnings;
 

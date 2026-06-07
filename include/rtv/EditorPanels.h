@@ -229,6 +229,7 @@ struct EditorRuntimeState {
     EditorLog* log = nullptr;
     EditorTimeline* timeline = nullptr;
     EditorPreferences* editorPrefs = nullptr;
+    std::filesystem::path editorPreferencesPath;
     EditorUiTextureProvider uiTextures{};
     CameraBookmarkManager* cameraBookmarks = nullptr;
     const EditorRenderJobStatus* renderJob = nullptr;

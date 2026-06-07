@@ -195,6 +195,8 @@ bool EditorPreferences::save(const std::filesystem::path& path) const {
     json["confirmDelete"] = confirmDelete;
     json["viewportDropForceGridByDefault"] = viewportDropForceGridByDefault;
     json["viewportDropSurfaceAlignByDefault"] = viewportDropSurfaceAlignByDefault;
+    json["viewportDropDuplicatePlacementByDefault"] = viewportDropDuplicatePlacementByDefault;
+    json["viewportDropMultiPlaceByDefault"] = viewportDropMultiPlaceByDefault;
     json["viewportDropMouseWheelRotationEnabled"] = viewportDropMouseWheelRotationEnabled;
     json["viewportPickMeshEntities"] = viewportPickMeshEntities;
     json["viewportPickActorIcons"] = viewportPickActorIcons;
@@ -269,6 +271,8 @@ void EditorPreferences::load(const std::filesystem::path& path) {
         if (json.contains("confirmDelete")) confirmDelete = json["confirmDelete"].get<bool>();
         if (json.contains("viewportDropForceGridByDefault")) viewportDropForceGridByDefault = json["viewportDropForceGridByDefault"].get<bool>();
         if (json.contains("viewportDropSurfaceAlignByDefault")) viewportDropSurfaceAlignByDefault = json["viewportDropSurfaceAlignByDefault"].get<bool>();
+        if (json.contains("viewportDropDuplicatePlacementByDefault")) viewportDropDuplicatePlacementByDefault = json["viewportDropDuplicatePlacementByDefault"].get<bool>();
+        if (json.contains("viewportDropMultiPlaceByDefault")) viewportDropMultiPlaceByDefault = json["viewportDropMultiPlaceByDefault"].get<bool>();
         if (json.contains("viewportDropMouseWheelRotationEnabled")) viewportDropMouseWheelRotationEnabled = json["viewportDropMouseWheelRotationEnabled"].get<bool>();
         if (json.contains("viewportPickMeshEntities")) viewportPickMeshEntities = json["viewportPickMeshEntities"].get<bool>();
         if (json.contains("viewportPickActorIcons")) viewportPickActorIcons = json["viewportPickActorIcons"].get<bool>();

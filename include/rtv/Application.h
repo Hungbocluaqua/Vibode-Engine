@@ -156,6 +156,7 @@ private:
         std::filesystem::path manifestPath;
         std::filesystem::path validationReportPath;
         std::filesystem::path logPath;
+        std::string commandLine;
         int exitCode = -1;
         double workerTotalMs = 0.0;
     };
@@ -218,6 +219,9 @@ private:
     [[nodiscard]] bool openProjectFromFile(const std::filesystem::path& projectFile, bool promptForDirtyScene);
     [[nodiscard]] bool deleteProjectFromRequest(const DeleteProjectRequest& request);
     [[nodiscard]] bool closeCurrentProject();
+    [[nodiscard]] std::filesystem::path activeEditorPreferencesPath() const;
+    void reloadEditorPreferencesForActiveProject();
+    [[nodiscard]] bool saveActiveEditorPreferences();
     [[nodiscard]] bool loadProjectStartupScene(const ProjectContext& project);
     [[nodiscard]] bool writeDefaultProjectScene(const ProjectContext& project, std::string_view templateName);
     [[nodiscard]] std::optional<AssetImportWorkspace> prepareAssetImportWorkspace(const std::filesystem::path& sourcePath);
@@ -380,6 +384,7 @@ private:
     std::optional<ActiveAsyncAssetImportJob> activeAssetImportJob_;
     std::optional<ActiveCookProjectJob> activeCookProjectJob_;
     std::optional<SceneLoadRequest> activeSceneLoadRequest_;
+    std::optional<std::filesystem::path> pendingRecoveryScenePath_;
     std::optional<std::filesystem::path> pendingRecoveryAutosavePath_;
     std::optional<std::filesystem::path> pendingRecoveryProjectAutosavePath_;
     std::optional<std::filesystem::path> pendingProjectThumbnailPath_;

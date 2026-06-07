@@ -65,6 +65,7 @@ ProjectContext makeProjectContext(
     project.configRoot = projectRoot / "Config";
     project.buildRoot = projectRoot / "Build";
     project.assetRegistryPath = project.contentRoot / "AssetRegistry.json";
+    project.editorPreferencesPath = project.configRoot / "EditorPreferences.json";
     project.startupScene = project.scenesRoot / "Main.rtlevel";
     return project;
 }
@@ -88,6 +89,7 @@ bool saveProjectFile(const ProjectContext& project) {
     json["savedRoot"] = genericPath(relativeOrValue(project.savedRoot, project.projectRoot));
     json["configRoot"] = genericPath(relativeOrValue(project.configRoot, project.projectRoot));
     json["assetRegistry"] = genericPath(relativeOrValue(project.assetRegistryPath, project.projectRoot));
+    json["editorPreferences"] = genericPath(relativeOrValue(project.editorPreferencesPath, project.projectRoot));
     json["defaultRenderPreset"] = project.defaultRenderPreset;
     if (project.preferredWorkspacePreset >= 0) {
         json["preferredWorkspacePreset"] = std::clamp(project.preferredWorkspacePreset, 0, 3);
@@ -131,6 +133,7 @@ bool loadProjectFile(const std::filesystem::path& projectFile, ProjectContext& o
         outProject.configRoot = projectPath(root, json, "configRoot", "Config");
         outProject.buildRoot = root / "Build";
         outProject.assetRegistryPath = projectPath(root, json, "assetRegistry", "Content/AssetRegistry.json");
+        outProject.editorPreferencesPath = projectPath(root, json, "editorPreferences", "Config/EditorPreferences.json");
         outProject.startupScene = projectPath(root, json, "startupScene", "Scenes/Main.rtlevel");
         outProject.defaultRenderPreset = json.value("defaultRenderPreset", "Editor");
         outProject.preferredWorkspacePreset = json.value("preferredWorkspacePreset", -1);

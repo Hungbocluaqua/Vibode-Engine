@@ -120,6 +120,51 @@ std::vector<EntityId> collectDeleteSetPostOrder(const SceneRegistry& registry, c
     return result;
 }
 
+SceneUpdateMask applyEntityVisibility(Entity& entity, bool visible) {
+    SceneUpdateMask mask = SceneUpdateMaskNone;
+    if (entity.visible != visible) {
+        entity.visible = visible;
+        mask |= SceneUpdateMaskVisibility;
+    }
+    if (entity.meshRenderer.has_value() && entity.meshRenderer->visible != visible) {
+        entity.meshRenderer->visible = visible;
+        mask |= SceneUpdateMaskVisibility;
+    }
+    if (entity.light.has_value() && entity.light->enabled != visible) {
+        entity.light->enabled = visible;
+        mask |= SceneUpdateMaskLight;
+    }
+    if (entity.sun.has_value() && entity.sun->enabled != visible) {
+        entity.sun->enabled = visible;
+        mask |= SceneUpdateMaskLight;
+    }
+    if (entity.environmentLight.has_value() && entity.environmentLight->enabled != visible) {
+        entity.environmentLight->enabled = visible;
+        mask |= SceneUpdateMaskRendererSettings;
+    }
+    if (entity.skyAtmosphere.has_value() && entity.skyAtmosphere->enabled != visible) {
+        entity.skyAtmosphere->enabled = visible;
+        mask |= SceneUpdateMaskRendererSettings;
+    }
+    if (entity.heightFog.has_value() && entity.heightFog->enabled != visible) {
+        entity.heightFog->enabled = visible;
+        mask |= SceneUpdateMaskRendererSettings;
+    }
+    if (entity.volumetricCloud.has_value() && entity.volumetricCloud->enabled != visible) {
+        entity.volumetricCloud->enabled = visible;
+        mask |= SceneUpdateMaskRendererSettings;
+    }
+    if (entity.postProcessVolume.has_value() && entity.postProcessVolume->enabled != visible) {
+        entity.postProcessVolume->enabled = visible;
+        mask |= SceneUpdateMaskRendererSettings;
+    }
+    if (entity.cameraPostProcess.has_value() && entity.cameraPostProcess->enabled != visible) {
+        entity.cameraPostProcess->enabled = visible;
+        mask |= SceneUpdateMaskRendererSettings;
+    }
+    return mask;
+}
+
 void clearDeletedEntityReferences(SceneDocument& document, EntityId id) {
     if (document.activeCamera() == id) {
         document.setActiveCamera({});
@@ -371,68 +416,72 @@ bool SceneOperations::reparentEntity(EntityId child, EntityId newParent) {
 
 bool SceneOperations::setVisibility(EntityId id, bool visible) {
     const SceneDocument before = document_;
-    Entity* entity = document_.registry().entity(id);
-    if (entity == nullptr || entity->locked || entity->visible == visible) {
+    const Entity* root = document_.registry().entity(id);
+    if (root == nullptr) {
         return false;
     }
-    entity->visible = visible;
-    SceneUpdateKind updateKind = SceneUpdateKind::VisibilityOnly;
-    if (entity->meshRenderer.has_value()) {
-        entity->meshRenderer->visible = visible;
+
+    std::vector<EntityId> subtree;
+    collectEntitySubtreePostOrder(document_.registry(), id, subtree);
+    SceneUpdateMask updateMask = SceneUpdateMaskNone;
+    std::vector<EntityId> changed;
+    changed.reserve(subtree.size());
+    for (EntityId entityId : subtree) {
+        Entity* entity = document_.registry().entity(entityId);
+        if (entity == nullptr) {
+            continue;
+        }
+        const SceneUpdateMask entityMask = applyEntityVisibility(*entity, visible);
+        if (entityMask != SceneUpdateMaskNone) {
+            updateMask |= entityMask;
+            changed.push_back(entityId);
+        }
     }
-    if (entity->light.has_value()) {
-        entity->light->enabled = visible;
-        updateKind = SceneUpdateKind::LightOnly;
+    if (changed.empty()) {
+        return false;
     }
-    if (entity->sun.has_value()) {
-        entity->sun->enabled = visible;
-        updateKind = SceneUpdateKind::LightOnly;
+
+    const SceneUpdateKind updateKind = sceneUpdateKindFromMask(updateMask);
+    document_.markDirty(updateMask);
+    for (EntityId entityId : changed) {
+        publish({SceneEventType::VisibilityChanged, entityId, {}, updateKind});
     }
-    if (entity->environmentLight.has_value()) {
-        entity->environmentLight->enabled = visible;
-        updateKind = SceneUpdateKind::RendererSettingsOnly;
-    }
-    if (entity->skyAtmosphere.has_value()) {
-        entity->skyAtmosphere->enabled = visible;
-        updateKind = SceneUpdateKind::RendererSettingsOnly;
-    }
-    if (entity->heightFog.has_value()) {
-        entity->heightFog->enabled = visible;
-        updateKind = SceneUpdateKind::RendererSettingsOnly;
-    }
-    if (entity->volumetricCloud.has_value()) {
-        entity->volumetricCloud->enabled = visible;
-        updateKind = SceneUpdateKind::RendererSettingsOnly;
-    }
-    if (entity->postProcessVolume.has_value()) {
-        entity->postProcessVolume->enabled = visible;
-        updateKind = SceneUpdateKind::RendererSettingsOnly;
-    }
-    if (entity->cameraPostProcess.has_value()) {
-        entity->cameraPostProcess->enabled = visible;
-        updateKind = SceneUpdateKind::RendererSettingsOnly;
-    }
-    document_.markDirty(updateKind);
-    publish({SceneEventType::VisibilityChanged, id, {}, updateKind});
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
-            document_, before, document_, updateKind, "Set Visibility"));
+            document_, before, document_, updateMask, visible ? "Show Entity Subtree" : "Hide Entity Subtree"));
     }
     return true;
 }
 
 bool SceneOperations::setLocked(EntityId id, bool locked) {
     const SceneDocument before = document_;
-    Entity* entity = document_.registry().entity(id);
-    if (entity == nullptr || entity->locked == locked) {
+    if (document_.registry().entity(id) == nullptr) {
         return false;
     }
-    entity->locked = locked;
+
+    std::vector<EntityId> subtree;
+    collectEntitySubtreePostOrder(document_.registry(), id, subtree);
+    std::vector<EntityId> changed;
+    changed.reserve(subtree.size());
+    for (EntityId entityId : subtree) {
+        Entity* entity = document_.registry().entity(entityId);
+        if (entity == nullptr || entity->locked == locked) {
+            continue;
+        }
+        entity->locked = locked;
+        changed.push_back(entityId);
+    }
+    if (changed.empty()) {
+        return false;
+    }
+
     document_.markDirty(SceneUpdateKind::None);
-    publish({SceneEventType::LockChanged, id, {}, SceneUpdateKind::None});
+    for (EntityId entityId : changed) {
+        publish({SceneEventType::LockChanged, entityId, {}, SceneUpdateKind::None});
+    }
     if (undoStack_ != nullptr) {
         undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
-            document_, before, document_, SceneUpdateKind::None, locked ? "Lock Entity" : "Unlock Entity"));
+            document_, before, document_, SceneUpdateKind::None, locked ? "Lock Entity Subtree" : "Unlock Entity Subtree"));
     }
     return true;
 }

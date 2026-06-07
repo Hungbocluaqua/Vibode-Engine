@@ -17,6 +17,7 @@ struct ProjectContext {
     std::filesystem::path configRoot;
     std::filesystem::path buildRoot;
     std::filesystem::path assetRegistryPath;
+    std::filesystem::path editorPreferencesPath;
     std::filesystem::path startupScene;
     std::string defaultRenderPreset = "Editor";
     int preferredWorkspacePreset = -1;

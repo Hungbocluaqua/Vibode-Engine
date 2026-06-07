@@ -37,7 +37,9 @@ struct SceneLoadRequest {
     SceneLoadMode mode = SceneLoadMode::OpenRtLevel;
     uint64_t serial = 0;
     std::filesystem::path sourcePath;
+    std::filesystem::path restoredScenePath;
     std::optional<ProjectContext> projectSnapshot;
+    bool restoreAsUnsaved = false;
     bool preserveHierarchy = true;
     bool importMaterials = true;
     bool importTextures = true;
@@ -49,6 +51,8 @@ struct SceneLoadResult {
     SceneLoadMode mode = SceneLoadMode::OpenRtLevel;
     uint64_t serial = 0;
     std::filesystem::path sourcePath;
+    std::filesystem::path restoredScenePath;
+    bool restoreAsUnsaved = false;
     bool success = false;
     bool cancelled = false;
     std::string errorMessage;

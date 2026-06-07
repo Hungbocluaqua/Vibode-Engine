@@ -17,6 +17,10 @@ struct SceneUpdateRouteEvent {
     std::string kind;
     std::string action;
     uint64_t count = 0;
+    double totalCpuMs = 0.0;
+    double lastCpuMs = 0.0;
+    double minCpuMs = 0.0;
+    double maxCpuMs = 0.0;
 };
 
 struct ResourceStateEvent {
@@ -36,7 +40,7 @@ public:
     void recordBarrier(std::string label, VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess);
     void recordResourceState(ResourceStateEvent event);
     void recordAccumulationInvalidation(std::string reason, uint64_t frame);
-    void recordSceneUpdateRoute(std::string kind, std::string action);
+    void recordSceneUpdateRoute(std::string kind, std::string action, double cpuMs);
     void beginFrame(uint64_t frame);
     void recordPass(std::string label);
 

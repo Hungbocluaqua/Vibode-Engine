@@ -195,11 +195,16 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     }
     if (ImGui::TreeNode("Scene update routes")) {
         for (const SceneUpdateRouteEvent& route : validation.sceneUpdateRoutes()) {
+            const double avgCpuMs = route.count > 0 ? route.totalCpuMs / static_cast<double>(route.count) : 0.0;
             ImGui::BulletText(
-                "%s -> %s: %llu",
+                "%s -> %s: %llu, cpu last/avg/min/max %.3f / %.3f / %.3f / %.3f ms",
                 route.kind.c_str(),
                 route.action.c_str(),
-                static_cast<unsigned long long>(route.count));
+                static_cast<unsigned long long>(route.count),
+                route.lastCpuMs,
+                avgCpuMs,
+                route.minCpuMs,
+                route.maxCpuMs);
         }
         ImGui::TreePop();
     }

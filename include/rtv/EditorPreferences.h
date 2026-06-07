@@ -36,6 +36,8 @@ struct EditorPreferences {
     bool confirmDelete = true;
     bool viewportDropForceGridByDefault = false;
     bool viewportDropSurfaceAlignByDefault = false;
+    bool viewportDropDuplicatePlacementByDefault = false;
+    bool viewportDropMultiPlaceByDefault = false;
     bool viewportDropMouseWheelRotationEnabled = true;
     bool viewportPickMeshEntities = true;
     bool viewportPickActorIcons = true;

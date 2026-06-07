@@ -35,6 +35,10 @@ public:
     void dismissProjectManager() { showProjectManager_ = false; projectManagerDismissed_ = true; }
     void setProjectWorkspacePreset(int preset);
     void clearProjectWorkspacePreset();
+    void setEditorPreferencesPath(std::filesystem::path path);
+    bool saveEditorPreferences();
+    bool saveGlobalLauncherPreferences();
+    void reloadViewportPreferences();
     void handleNotificationAction(NotificationAction action, EditorRequests& requests);
     void showRecoveryPrompt(
         std::filesystem::path markerPath,
@@ -89,6 +93,7 @@ private:
     SceneStatsPanel sceneStatsPanel_{};
     GpuDiagnosticsPanel gpuDiagnosticsPanel_{};
     EditorPreferences editorPrefs_{};
+    std::filesystem::path editorPreferencesPath_{};
     int projectWorkspacePreset_ = -1;
     CameraBookmarkManager cameraBookmarks_{};
     EditorLog log_{};

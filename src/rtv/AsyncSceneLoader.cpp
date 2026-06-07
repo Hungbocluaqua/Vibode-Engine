@@ -19,6 +19,8 @@ SceneLoadResult makeCancelledResult(const SceneLoadRequest& request) {
     result.mode = request.mode;
     result.serial = request.serial;
     result.sourcePath = request.sourcePath;
+    result.restoredScenePath = request.restoredScenePath;
+    result.restoreAsUnsaved = request.restoreAsUnsaved;
     result.cancelled = true;
     result.errorMessage = "Scene load cancelled";
     return result;
@@ -153,6 +155,8 @@ SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shar
     SceneLoadResult result;
     result.mode = request.mode;
     result.sourcePath = request.sourcePath;
+    result.restoredScenePath = request.restoredScenePath;
+    result.restoreAsUnsaved = request.restoreAsUnsaved;
 
     try {
         setStage("Reading file", 0.05f, SceneLoadStatus::Loading);

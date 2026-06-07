@@ -23,6 +23,7 @@
 #include <string_view>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -166,6 +167,14 @@ std::filesystem::path canonicalForCookCompare(const std::filesystem::path& path)
     std::error_code ec;
     std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
     return ec ? path.lexically_normal() : canonical.lexically_normal();
+}
+
+std::string cookCopySourceKey(const std::filesystem::path& path) {
+    std::string key = canonicalForCookCompare(path).generic_string();
+#ifdef _WIN32
+    key = lowerAscii(std::move(key));
+#endif
+    return key;
 }
 
 bool cookReferenceScanFileCandidate(const std::filesystem::path& path) {
@@ -364,6 +373,36 @@ bool copyCookFile(
     return true;
 }
 
+struct CookFileCopyPlan {
+    std::filesystem::path source;
+    std::filesystem::path destination;
+    std::string role;
+    std::string ownerGuid;
+};
+
+bool writeJsonFile(const std::filesystem::path& path, const nlohmann::json& json, std::string* error) {
+    std::error_code ec;
+    const std::filesystem::path parent = path.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            if (error != nullptr) {
+                *error = "could not create directory: " + parent.string() + " (" + ec.message() + ")";
+            }
+            return false;
+        }
+    }
+    std::ofstream file(path);
+    if (!file.is_open()) {
+        if (error != nullptr) {
+            *error = "could not write file: " + path.string();
+        }
+        return false;
+    }
+    file << json.dump(2);
+    return true;
+}
+
 void appendCookValidationIssue(
     nlohmann::json& array,
     std::string_view severity,
@@ -420,6 +459,50 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     rtv::ProjectContext project;
     std::string projectError;
     if (!rtv::loadProjectFile(projectFile, project, &projectError)) {
+        if (outputDir.empty()) {
+            outputDir = projectFile.parent_path() / "Build" / "Cooked";
+        }
+        if (manifestPath.empty()) {
+            manifestPath = outputDir / "cook_manifest.json";
+        }
+        const std::filesystem::path validationReportPath = outputDir / "asset_validation_report.json";
+        const std::vector<std::string> errors = {"Project load failed: " + projectError};
+        const nlohmann::json validationReport = {
+            {"version", 1},
+            {"kind", "CookAssetValidationReport"},
+            {"project", {{"projectFile", genericPathString(projectFile)}}},
+            {"assetCount", 0},
+            {"errorCount", errors.size()},
+            {"warningCount", 0},
+            {"validationErrorCount", 1},
+            {"validationWarningCount", 0},
+            {"cookErrors", errors},
+            {"cookWarnings", nlohmann::json::array()},
+            {"status", "failed"},
+            {"policy", "Project file could not be loaded, so cook validation stopped before asset scanning."},
+        };
+        const nlohmann::json manifest = {
+            {"schema", "TransparentCookManifestV1"},
+            {"project", {{"projectFile", genericPathString(projectFile)}}},
+            {"outputRoot", genericPathString(outputDir)},
+            {"assetCount", 0},
+            {"assets", nlohmann::json::array()},
+            {"plannedFiles", nlohmann::json::array()},
+            {"copiedFiles", nlohmann::json::array()},
+            {"warnings", nlohmann::json::array()},
+            {"errors", errors},
+            {"validationReport", relativePathString(validationReportPath, outputDir)},
+            {"validationErrorCount", 1},
+            {"validationWarningCount", 0},
+            {"status", "failed"},
+        };
+        std::string writeError;
+        if (!writeJsonFile(validationReportPath, validationReport, &writeError)) {
+            std::cerr << "Cook failed: could not write validation report: " << writeError << '\n';
+        }
+        if (!writeJsonFile(manifestPath, manifest, &writeError)) {
+            std::cerr << "Cook failed: could not write manifest: " << writeError << '\n';
+        }
         std::cerr << "Cook failed: could not load project: " << projectError << '\n';
         return 1;
     }
@@ -448,6 +531,8 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     }
 
     nlohmann::json copiedFiles = nlohmann::json::array();
+    std::vector<CookFileCopyPlan> copyPlans;
+    std::unordered_map<std::string, std::filesystem::path> plannedDestinationBySource;
     nlohmann::json assets = nlohmann::json::array();
     nlohmann::json missingSources = nlohmann::json::array();
     nlohmann::json missingImportedMetadata = nlohmann::json::array();
@@ -463,12 +548,27 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     nlohmann::json savedProjectReferenceScanRoots = nlohmann::json::array();
     size_t externalIndex = 0;
 
-    auto copyProjectFile = [&](const std::filesystem::path& source, std::string_view role) {
+    auto planCookFile = [&](const std::filesystem::path& source, std::string_view role, std::string_view ownerGuid) -> std::optional<std::filesystem::path> {
         if (source.empty()) {
-            return;
+            return std::nullopt;
+        }
+        const std::string sourceKey = cookCopySourceKey(source);
+        const auto existing = plannedDestinationBySource.find(sourceKey);
+        if (existing != plannedDestinationBySource.end()) {
+            return existing->second;
         }
         const std::filesystem::path destination = cookDestinationForPath(source, project.projectRoot, outputDir, externalIndex++);
-        (void)copyCookFile(source, destination, copiedFiles, errors, project.projectRoot, outputDir, role, "project");
+        copyPlans.push_back(CookFileCopyPlan{
+            source,
+            destination,
+            std::string(role),
+            std::string(ownerGuid),
+        });
+        plannedDestinationBySource.emplace(sourceKey, destination);
+        return destination;
+    };
+    auto copyProjectFile = [&](const std::filesystem::path& source, std::string_view role) {
+        (void)planCookFile(source, role, "project");
     };
     copyProjectFile(project.projectFile, "project_file");
     copyProjectFile(project.assetRegistryPath, "asset_registry");
@@ -576,19 +676,19 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
         }
 
         if (!record.importedPath.empty()) {
-            const std::filesystem::path destination = cookDestinationForPath(importedPath, project.projectRoot, outputDir, externalIndex++);
-            (void)copyCookFile(importedPath, destination, copiedFiles, errors, project.projectRoot, outputDir, "asset_metadata", record.guid);
-            asset["cookedMetadataOutput"] = relativePathString(destination, outputDir);
+            if (std::optional<std::filesystem::path> destination = planCookFile(importedPath, "asset_metadata", record.guid)) {
+                asset["cookedMetadataOutput"] = relativePathString(*destination, outputDir);
+            }
         }
         if (!record.cachePath.empty()) {
-            const std::filesystem::path destination = cookDestinationForPath(cachePath, project.projectRoot, outputDir, externalIndex++);
-            (void)copyCookFile(cachePath, destination, copiedFiles, errors, project.projectRoot, outputDir, "asset_payload", record.guid);
-            asset["cookedPayloadOutput"] = relativePathString(destination, outputDir);
+            if (std::optional<std::filesystem::path> destination = planCookFile(cachePath, "asset_payload", record.guid)) {
+                asset["cookedPayloadOutput"] = relativePathString(*destination, outputDir);
+            }
         }
         if (!record.thumbnailPath.empty() && std::filesystem::exists(thumbnailPath)) {
-            const std::filesystem::path destination = cookDestinationForPath(thumbnailPath, project.projectRoot, outputDir, externalIndex++);
-            (void)copyCookFile(thumbnailPath, destination, copiedFiles, errors, project.projectRoot, outputDir, "asset_thumbnail", record.guid);
-            asset["thumbnailOutput"] = relativePathString(destination, outputDir);
+            if (std::optional<std::filesystem::path> destination = planCookFile(thumbnailPath, "asset_thumbnail", record.guid)) {
+                asset["thumbnailOutput"] = relativePathString(*destination, outputDir);
+            }
         }
         assets.push_back(std::move(asset));
     }
@@ -636,100 +736,133 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     const size_t validationErrorCount = countCookValidationSeverity(validationIssueArrays, "error");
     const size_t validationWarningCount = countCookValidationSeverity(validationIssueArrays, "warning");
     const std::filesystem::path validationReportPath = outputDir / "asset_validation_report.json";
-    nlohmann::json validationReport = {
-        {"version", 1},
-        {"kind", "CookAssetValidationReport"},
-        {"project", {
+    auto plannedFilesJson = [&]() {
+        nlohmann::json planned = nlohmann::json::array();
+        for (const CookFileCopyPlan& plan : copyPlans) {
+            planned.push_back({
+                {"role", plan.role},
+                {"ownerGuid", plan.ownerGuid},
+                {"source", relativePathString(plan.source, project.projectRoot)},
+                {"output", relativePathString(plan.destination, outputDir)},
+            });
+        }
+        return planned;
+    };
+    auto makeValidationReport = [&](std::string_view status) {
+        return nlohmann::json{
+            {"version", 1},
+            {"kind", "CookAssetValidationReport"},
+            {"project", {
+                {"guid", project.projectGuid},
+                {"name", project.name},
+                {"projectFile", relativePathString(project.projectFile, project.projectRoot)},
+                {"startupScene", relativePathString(project.startupScene, project.projectRoot)},
+                {"assetRegistry", relativePathString(project.assetRegistryPath, project.projectRoot)},
+            }},
+            {"assetCount", registry.records().size()},
+            {"errorCount", errors.size()},
+            {"warningCount", warnings.size()},
+            {"validationErrorCount", validationErrorCount},
+            {"validationWarningCount", validationWarningCount},
+            {"copyPlanCount", copyPlans.size()},
+            {"copiedFileCount", copiedFiles.size()},
+            {"missingSources", missingSources},
+            {"missingImportedMetadata", missingImportedMetadata},
+            {"missingCookedPayloads", missingCookedPayloads},
+            {"missingDependencies", missingDependencies},
+            {"staleAssets", staleAssets},
+            {"failedAssets", failedAssets},
+            {"unsupportedImportSettings", unsupportedImportSettings},
+            {"invalidSavedProjectReferences", invalidSavedProjectReferences},
+            {"savedProjectReferenceParseErrors", savedProjectReferenceParseErrors},
+            {"savedProjectReferenceScanRoots", savedProjectReferenceScanRoots},
+            {"savedProjectReferenceScannedFileCount", referenceScanFiles.size()},
+            {"requiresReimport", requiresReimport},
+            {"projectWarnings", projectWarnings},
+            {"cookErrors", errors},
+            {"cookWarnings", warnings},
+            {"status", status},
+            {"policy", "This report is generated by --cook-project before package emission. Missing raw sources are warnings when imported metadata and cooked payloads are available; missing metadata, missing cooked payloads, failed imports, and missing dependency GUIDs block the transparent cook."},
+        };
+    };
+    auto makeManifest = [&](std::string_view status) {
+        nlohmann::json manifest;
+        manifest["schema"] = "TransparentCookManifestV1";
+        manifest["project"] = {
             {"guid", project.projectGuid},
             {"name", project.name},
             {"projectFile", relativePathString(project.projectFile, project.projectRoot)},
             {"startupScene", relativePathString(project.startupScene, project.projectRoot)},
             {"assetRegistry", relativePathString(project.assetRegistryPath, project.projectRoot)},
-        }},
-        {"assetCount", registry.records().size()},
-        {"errorCount", errors.size()},
-        {"warningCount", warnings.size()},
-        {"validationErrorCount", validationErrorCount},
-        {"validationWarningCount", validationWarningCount},
-        {"missingSources", missingSources},
-        {"missingImportedMetadata", missingImportedMetadata},
-        {"missingCookedPayloads", missingCookedPayloads},
-        {"missingDependencies", missingDependencies},
-        {"staleAssets", staleAssets},
-        {"failedAssets", failedAssets},
-        {"unsupportedImportSettings", unsupportedImportSettings},
-        {"invalidSavedProjectReferences", invalidSavedProjectReferences},
-        {"savedProjectReferenceParseErrors", savedProjectReferenceParseErrors},
-        {"savedProjectReferenceScanRoots", savedProjectReferenceScanRoots},
-        {"savedProjectReferenceScannedFileCount", referenceScanFiles.size()},
-        {"requiresReimport", requiresReimport},
-        {"projectWarnings", projectWarnings},
-        {"cookErrors", errors},
-        {"cookWarnings", warnings},
-        {"status", errors.empty() ? "pass" : "fail"},
-        {"policy", "This report is generated by --cook-project before package emission. Missing raw sources are warnings when imported metadata and cooked payloads are available; missing metadata, missing cooked payloads, failed imports, and missing dependency GUIDs block the transparent cook."},
+        };
+        manifest["outputRoot"] = genericPathString(outputDir);
+        manifest["assetCount"] = registry.records().size();
+        manifest["assets"] = assets;
+        manifest["plannedFiles"] = plannedFilesJson();
+        manifest["copiedFiles"] = copiedFiles;
+        manifest["warnings"] = warnings;
+        manifest["errors"] = errors;
+        manifest["validationReport"] = relativePathString(validationReportPath, outputDir);
+        manifest["validationErrorCount"] = validationErrorCount;
+        manifest["validationWarningCount"] = validationWarningCount;
+        manifest["status"] = status;
+        manifest["futurePackageCompatibility"] = {
+            {"packageObjectModel", "metadata_and_payload_chunks"},
+            {"opaquePackageExtension", ".rtpkg"},
+            {"transparentLayoutPreserved", true},
+        };
+        return manifest;
     };
-
-    std::error_code validationEc;
-    std::filesystem::create_directories(validationReportPath.parent_path(), validationEc);
-    if (validationEc) {
-        std::cerr << "Cook failed: could not create validation report directory: " << validationEc.message() << '\n';
-        return 1;
-    }
-    std::ofstream validationFile(validationReportPath);
-    if (!validationFile.is_open()) {
-        std::cerr << "Cook failed: could not write validation report: " << validationReportPath.string() << '\n';
-        return 1;
-    }
-    validationFile << validationReport.dump(2);
-
-    nlohmann::json manifest;
-    manifest["schema"] = "TransparentCookManifestV1";
-    manifest["project"] = {
-        {"guid", project.projectGuid},
-        {"name", project.name},
-        {"projectFile", relativePathString(project.projectFile, project.projectRoot)},
-        {"startupScene", relativePathString(project.startupScene, project.projectRoot)},
-        {"assetRegistry", relativePathString(project.assetRegistryPath, project.projectRoot)},
-    };
-    manifest["outputRoot"] = genericPathString(outputDir);
-    manifest["assetCount"] = registry.records().size();
-    manifest["assets"] = std::move(assets);
-    manifest["copiedFiles"] = std::move(copiedFiles);
-    manifest["warnings"] = warnings;
-    manifest["errors"] = errors;
-    manifest["validationReport"] = relativePathString(validationReportPath, outputDir);
-    manifest["validationErrorCount"] = validationErrorCount;
-    manifest["validationWarningCount"] = validationWarningCount;
-    manifest["status"] = errors.empty() ? "success" : "failed";
-    manifest["futurePackageCompatibility"] = {
-        {"packageObjectModel", "metadata_and_payload_chunks"},
-        {"opaquePackageExtension", ".rtpkg"},
-        {"transparentLayoutPreserved", true},
-    };
-
-    std::error_code ec;
-    const std::filesystem::path manifestParent = manifestPath.parent_path();
-    if (!manifestParent.empty()) {
-        std::filesystem::create_directories(manifestParent, ec);
-        if (ec) {
-            std::cerr << "Cook failed: could not create manifest directory: " << ec.message() << '\n';
-            return 1;
+    auto writeCookArtifacts = [&](std::string_view status) {
+        std::string writeError;
+        if (!writeJsonFile(validationReportPath, makeValidationReport(status == std::string_view("success") ? "pass" : status), &writeError)) {
+            std::cerr << "Cook failed: could not write validation report: " << writeError << '\n';
+            return false;
         }
-    }
-    std::ofstream manifestFile(manifestPath);
-    if (!manifestFile.is_open()) {
-        std::cerr << "Cook failed: could not write manifest: " << manifestPath.string() << '\n';
+        if (!writeJsonFile(manifestPath, makeManifest(status), &writeError)) {
+            std::cerr << "Cook failed: could not write manifest: " << writeError << '\n';
+            return false;
+        }
+        return true;
+    };
+
+    if (!writeCookArtifacts(errors.empty() ? "copying" : "failed")) {
         return 1;
     }
-    manifestFile << manifest.dump(2);
+    if (!errors.empty()) {
+        std::cout << "Cook validation report: " << validationReportPath.string() << '\n';
+        std::cout << "Cook manifest: " << manifestPath.string() << '\n';
+        std::cout << "Cook validation failed before payload copy; warnings=" << warnings.size()
+                  << " errors=" << errors.size() << '\n';
+        return 1;
+    }
+
+    for (const CookFileCopyPlan& plan : copyPlans) {
+        (void)copyCookFile(
+            plan.source,
+            plan.destination,
+            copiedFiles,
+            errors,
+            project.projectRoot,
+            outputDir,
+            plan.role,
+            plan.ownerGuid);
+    }
+
+    std::sort(errors.begin(), errors.end());
+    errors.erase(std::unique(errors.begin(), errors.end()), errors.end());
+
+    const bool success = errors.empty();
+    if (!writeCookArtifacts(success ? "success" : "failed")) {
+        return 1;
+    }
 
     std::cout << "Cook validation report: " << validationReportPath.string() << '\n';
     std::cout << "Cook manifest: " << manifestPath.string() << '\n';
-    std::cout << "Cook copied " << manifest["copiedFiles"].size() << " files for "
+    std::cout << "Cook copied " << copiedFiles.size() << " files for "
               << registry.records().size() << " assets; warnings=" << warnings.size()
               << " errors=" << errors.size() << '\n';
-    return errors.empty() ? 0 : 1;
+    return success ? 0 : 1;
 }
 
 } // namespace

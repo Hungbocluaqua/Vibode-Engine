@@ -140,6 +140,7 @@ std::string normalizeGitStatusPath(std::string value) {
 
 std::string sourceControlStatusFromPorcelainCode(std::string code) {
     code = trimString(std::move(code));
+    if (code == "!!") return "Ignored";
     if (code == "??") return "Untracked";
     if (code.find('U') != std::string::npos) return "Conflict";
     if (code.find('D') != std::string::npos) return "Deleted";
@@ -163,7 +164,7 @@ const GitStatusSnapshot& gitStatusSnapshotForRoot(const std::filesystem::path& g
 #else
     constexpr const char* stderrRedirect = " 2>/dev/null";
 #endif
-    const std::string command = "git -C " + quoteCommandPath(gitRoot) + " status --porcelain=v1 --untracked-files=all" + stderrRedirect;
+    const std::string command = "git -C " + quoteCommandPath(gitRoot) + " status --porcelain=v1 --ignored --untracked-files=all" + stderrRedirect;
     const std::string output = readCommandOutput(command);
     std::stringstream lines(output);
     std::string line;
@@ -1107,6 +1108,7 @@ ImVec4 sourceControlStatusTextColor(const std::string& status) {
     if (status == "Modified" || status == "Added" || status == "Renamed" || status == "Copied") return ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
     if (status == "Deleted" || status == "Conflict") return ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
     if (status == "Untracked") return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
+    if (status == "Ignored") return ImVec4(0.48f, 0.52f, 0.58f, 1.0f);
     return ImVec4(0.65f, 0.70f, 0.78f, 1.0f);
 }
 
@@ -1218,8 +1220,8 @@ bool writeSourceControlStatusReport(
 #endif
     const std::string rootArg = quoteCommandPath(*gitRoot);
     const std::string pathArg = quoteCommandPath(relative);
-    const std::string focusedStatus = readCommandOutput("git -C " + rootArg + " status --short -- " + pathArg + stderrRedirect);
-    const std::string repositoryStatus = readCommandOutput("git -C " + rootArg + " status --short --branch" + stderrRedirect);
+    const std::string focusedStatus = readCommandOutput("git -C " + rootArg + " status --short --ignored -- " + pathArg + stderrRedirect);
+    const std::string repositoryStatus = readCommandOutput("git -C " + rootArg + " status --short --ignored --branch" + stderrRedirect);
 
     outPath = sourceControlStatusReportPath(state, browserRoot, path);
     std::filesystem::create_directories(outPath.parent_path(), ec);
@@ -4253,7 +4255,8 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         if (state.editorPrefs == nullptr) {
             return;
         }
-        setPreferenceSaveStatus(state.editorPrefs->save(EditorPreferences::defaultPath()), status_, std::move(successMessage), std::move(failureDetail));
+        const std::filesystem::path prefsPath = state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath;
+        setPreferenceSaveStatus(state.editorPrefs->save(prefsPath), status_, std::move(successMessage), std::move(failureDetail));
     };
     if (ImGui::TreeNodeEx("Registry Bulk Tools")) {
         if (contentActionButton("AssetDependencyGraphReport", EditorGlyphIcon::Details, "Dependency Graph", "Write and open a loaded-registry dependency/reference graph report")) {
@@ -4552,16 +4555,27 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                 } else {
                     std::array<char, 128> guidPayload{};
                     record.guid.copy(guidPayload.data(), std::min(record.guid.size(), guidPayload.size() - 1));
-                    const char* payloadType = "ENVIRONMENT_ASSET";
                     if (record.type == AssetType::Prefab) {
-                        payloadType = "PREFAB_ASSET";
+                        if (assetPlacementBlocked(record)) {
+                            ImGui::TextDisabled("Placement blocked: %s", assetPlacementBlockReason(record));
+                        } else {
+                            ImGui::SetDragDropPayload("PREFAB_ASSET", guidPayload.data(), guidPayload.size());
+                            ImGui::Text("%s %s", assetTypeName(record.type), name);
+                        }
                     } else if (record.type == AssetType::Mesh) {
-                        payloadType = "MESH_ASSET";
+                        if (assetPlacementBlocked(record)) {
+                            ImGui::TextDisabled("Placement blocked: %s", assetPlacementBlockReason(record));
+                        } else {
+                            ImGui::SetDragDropPayload("MESH_ASSET", guidPayload.data(), guidPayload.size());
+                            ImGui::Text("%s %s", assetTypeName(record.type), name);
+                        }
                     } else if (record.type == AssetType::Material) {
-                        payloadType = "MATERIAL_ASSET";
+                        ImGui::SetDragDropPayload("MATERIAL_ASSET", guidPayload.data(), guidPayload.size());
+                        ImGui::Text("%s %s", assetTypeName(record.type), name);
+                    } else {
+                        ImGui::SetDragDropPayload("ENVIRONMENT_ASSET", guidPayload.data(), guidPayload.size());
+                        ImGui::Text("%s %s", assetTypeName(record.type), name);
                     }
-                    ImGui::SetDragDropPayload(payloadType, guidPayload.data(), guidPayload.size());
-                    ImGui::Text("%s %s", assetTypeName(record.type), name);
                 }
                 ImGui::EndDragDropSource();
             }
@@ -4666,7 +4680,8 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
         if (state.editorPrefs == nullptr) {
             return;
         }
-        setPreferenceSaveStatus(state.editorPrefs->save(EditorPreferences::defaultPath()), status_, std::move(successMessage), std::move(failureDetail));
+        const std::filesystem::path prefsPath = state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath;
+        setPreferenceSaveStatus(state.editorPrefs->save(prefsPath), status_, std::move(successMessage), std::move(failureDetail));
     };
     auto sourceControlStatus = [&](const std::filesystem::path& path) {
         if (path.empty()) {
@@ -5781,7 +5796,8 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         if (state.editorPrefs != nullptr) {
             auto& prefs = *state.editorPrefs;
             auto savePrefsStatus = [&](std::string successMessage, std::string failureDetail) {
-                setPreferenceSaveStatus(prefs.save(EditorPreferences::defaultPath()), status_, std::move(successMessage), std::move(failureDetail));
+                const std::filesystem::path prefsPath = state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath;
+                setPreferenceSaveStatus(prefs.save(prefsPath), status_, std::move(successMessage), std::move(failureDetail));
             };
             auto drawStoredPathEntry = [&](const char* listName, size_t index, const std::filesystem::path& path, bool favoriteRow) {
                 std::error_code ec;
@@ -5929,16 +5945,18 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
                 if (!storedFavorite.empty()) {
                     if (ImGui::SmallButton("Remove Selected Favorite")) {
                         state.editorPrefs->removeFavorite(storedFavorite);
+                        const std::filesystem::path prefsPath = state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath;
                         setPreferenceSaveStatus(
-                            state.editorPrefs->save(EditorPreferences::defaultPath()),
+                            state.editorPrefs->save(prefsPath),
                             status_,
                             "Removed favorite: " + selectedPath_.string(),
                             "remove favorite " + selectedPath_.string());
                     }
                 } else if (ImGui::SmallButton("Add Selected to Favorites")) {
                     state.editorPrefs->addFavorite(selectedPath_);
+                    const std::filesystem::path prefsPath = state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath;
                     setPreferenceSaveStatus(
-                        state.editorPrefs->save(EditorPreferences::defaultPath()),
+                        state.editorPrefs->save(prefsPath),
                         status_,
                         "Added favorite: " + selectedPath_.string(),
                         "add favorite " + selectedPath_.string());

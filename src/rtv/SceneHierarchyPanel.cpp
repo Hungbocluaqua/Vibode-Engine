@@ -905,7 +905,7 @@ void SceneHierarchyPanel::drawEntityNode(
             hierarchyTooltip(entity.locked ? "Locked" : "Unlocked");
         }
         ImGui::SetCursorScreenPos(ImVec2(rightEdge - eyeWidth, controlY));
-        if (hierarchyRowIconButton("visible", entity.visible ? EditorGlyphIcon::EyeVisible : EditorGlyphIcon::EyeHidden, !entity.locked, !entity.visible, iconButtonSize)) {
+        if (hierarchyRowIconButton("visible", entity.visible ? EditorGlyphIcon::EyeVisible : EditorGlyphIcon::EyeHidden, true, !entity.visible, iconButtonSize)) {
             requests.setEntityVisibility = EditorEntityBoolChange{.entity = entity.id, .value = !entity.visible};
             activated = true;
         }

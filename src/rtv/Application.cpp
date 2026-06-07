@@ -50,6 +50,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
@@ -104,6 +105,259 @@ std::filesystem::path currentExecutablePath() {
     }
 #endif
     return std::filesystem::current_path() / "rtvulkan.exe";
+}
+
+#if defined(_WIN32)
+std::wstring quoteWindowsArg(std::wstring_view value) {
+    std::wstring result;
+    result.push_back(L'"');
+    size_t backslashes = 0;
+    for (wchar_t ch : value) {
+        if (ch == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (ch == L'"') {
+            result.append(backslashes * 2 + 1, L'\\');
+            result.push_back(ch);
+            backslashes = 0;
+            continue;
+        }
+        result.append(backslashes, L'\\');
+        backslashes = 0;
+        result.push_back(ch);
+    }
+    result.append(backslashes * 2, L'\\');
+    result.push_back(L'"');
+    return result;
+}
+
+std::string narrowWindowsCommandLine(std::wstring_view value) {
+    if (value.empty()) {
+        return {};
+    }
+    const int required = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+    if (required <= 0) {
+        return {};
+    }
+    std::string result(static_cast<size_t>(required), '\0');
+    (void)WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), required, nullptr, nullptr);
+    return result;
+}
+
+std::wstring cookProcessCommandLineWide(
+    const std::filesystem::path& exe,
+    const std::filesystem::path& projectFile,
+    const std::filesystem::path& outputDir,
+    const std::filesystem::path& manifestPath) {
+    return quoteWindowsArg(exe.wstring()) +
+        L" --cook-project " + quoteWindowsArg(projectFile.wstring()) +
+        L" --cook-output " + quoteWindowsArg(outputDir.wstring()) +
+        L" --cook-manifest " + quoteWindowsArg(manifestPath.wstring());
+}
+
+int runCookProjectProcess(
+    const std::filesystem::path& exe,
+    const std::filesystem::path& projectFile,
+    const std::filesystem::path& outputDir,
+    const std::filesystem::path& manifestPath,
+    const std::filesystem::path& logPath,
+    std::string* commandLineOut) {
+    const std::wstring commandLine = cookProcessCommandLineWide(exe, projectFile, outputDir, manifestPath);
+    if (commandLineOut != nullptr) {
+        *commandLineOut = narrowWindowsCommandLine(commandLine);
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(logPath.parent_path(), ec);
+    HANDLE logHandle = CreateFileW(
+        logPath.wstring().c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (logHandle == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = logHandle;
+    startup.hStdError = logHandle;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION process{};
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+    const std::wstring applicationName = exe.wstring();
+    const BOOL created = CreateProcessW(
+        applicationName.c_str(),
+        mutableCommand.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &startup,
+        &process);
+    if (!created) {
+        const DWORD error = GetLastError();
+        DWORD written = 0;
+        const std::string message = "CreateProcessW failed for cook worker. GetLastError=" + std::to_string(error) + "\r\n";
+        (void)WriteFile(logHandle, message.data(), static_cast<DWORD>(message.size()), &written, nullptr);
+        CloseHandle(logHandle);
+        return -1;
+    }
+
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    (void)GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    CloseHandle(logHandle);
+    return static_cast<int>(exitCode);
+}
+#else
+std::string cookProcessCommandLine(
+    const std::filesystem::path& exe,
+    const std::filesystem::path& projectFile,
+    const std::filesystem::path& outputDir,
+    const std::filesystem::path& manifestPath,
+    const std::filesystem::path& logPath) {
+    return quoteShellPath(exe) +
+        " --cook-project " + quoteShellPath(projectFile) +
+        " --cook-output " + quoteShellPath(outputDir) +
+        " --cook-manifest " + quoteShellPath(manifestPath) +
+        " > " + quoteShellPath(logPath) + " 2>&1";
+}
+
+int runCookProjectProcess(
+    const std::filesystem::path& exe,
+    const std::filesystem::path& projectFile,
+    const std::filesystem::path& outputDir,
+    const std::filesystem::path& manifestPath,
+    const std::filesystem::path& logPath,
+    std::string* commandLineOut) {
+    std::error_code logEc;
+    std::filesystem::create_directories(logPath.parent_path(), logEc);
+    const std::string command = cookProcessCommandLine(exe, projectFile, outputDir, manifestPath, logPath);
+    if (commandLineOut != nullptr) {
+        *commandLineOut = command;
+    }
+    return std::system(command.c_str());
+}
+#endif
+
+std::string cookArtifactPathString(const std::filesystem::path& path) {
+    return path.empty() ? std::string{} : path.generic_string();
+}
+
+bool writeCookJsonArtifact(const std::filesystem::path& path, const nlohmann::json& json, std::string* error = nullptr) {
+    if (path.empty()) {
+        if (error != nullptr) {
+            *error = "path is empty";
+        }
+        return false;
+    }
+    std::error_code ec;
+    const std::filesystem::path parent = path.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            if (error != nullptr) {
+                *error = "could not create directory " + parent.string() + ": " + ec.message();
+            }
+            return false;
+        }
+    }
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        if (error != nullptr) {
+            *error = "could not open " + path.string();
+        }
+        return false;
+    }
+    out << json.dump(2);
+    return true;
+}
+
+void ensureCookFailureArtifacts(
+    const std::filesystem::path& projectFile,
+    const std::filesystem::path& outputDir,
+    const std::filesystem::path& manifestPath,
+    const std::filesystem::path& validationReportPath,
+    const std::filesystem::path& logPath,
+    int exitCode,
+    const std::string& status,
+    const std::string& commandLine = {}) {
+    std::error_code ec;
+    if (!outputDir.empty()) {
+        std::filesystem::create_directories(outputDir, ec);
+    }
+
+    const std::string detail = status.empty() ? "Cook failed before writing artifacts." : status;
+    const nlohmann::json errors = nlohmann::json::array({detail});
+
+    if (!validationReportPath.empty() && !std::filesystem::exists(validationReportPath)) {
+        const nlohmann::json report = {
+            {"version", 1},
+            {"kind", "CookAssetValidationReport"},
+            {"project", {{"projectFile", cookArtifactPathString(projectFile)}}},
+            {"assetCount", 0},
+            {"errorCount", 1},
+            {"warningCount", 0},
+            {"validationErrorCount", 1},
+            {"validationWarningCount", 0},
+            {"cookErrors", errors},
+            {"cookWarnings", nlohmann::json::array()},
+            {"status", "failed"},
+            {"policy", "This fallback report was written by the editor because the cook worker exited before producing its normal artifacts."},
+        };
+        std::string writeError;
+        if (!writeCookJsonArtifact(validationReportPath, report, &writeError)) {
+            std::cerr << "Cook fallback report write failed: " << writeError << '\n';
+        }
+    }
+
+    if (!manifestPath.empty() && !std::filesystem::exists(manifestPath)) {
+        const nlohmann::json manifest = {
+            {"schema", "TransparentCookManifestV1"},
+            {"project", {{"projectFile", cookArtifactPathString(projectFile)}}},
+            {"outputRoot", cookArtifactPathString(outputDir)},
+            {"assetCount", 0},
+            {"assets", nlohmann::json::array()},
+            {"plannedFiles", nlohmann::json::array()},
+            {"copiedFiles", nlohmann::json::array()},
+            {"warnings", nlohmann::json::array()},
+            {"errors", errors},
+            {"validationReport", validationReportPath.empty() ? std::string{} : validationReportPath.filename().generic_string()},
+            {"validationErrorCount", 1},
+            {"validationWarningCount", 0},
+            {"status", "failed"},
+        };
+        std::string writeError;
+        if (!writeCookJsonArtifact(manifestPath, manifest, &writeError)) {
+            std::cerr << "Cook fallback manifest write failed: " << writeError << '\n';
+        }
+    }
+
+    if (!logPath.empty() && !std::filesystem::exists(logPath)) {
+        std::error_code logEc;
+        std::filesystem::create_directories(logPath.parent_path(), logEc);
+        std::ofstream log(logPath, std::ios::trunc);
+        if (log.is_open()) {
+            log << detail << '\n'
+                << "Exit code: " << exitCode << '\n'
+                << "Project: " << projectFile.string() << '\n'
+                << "Output: " << outputDir.string() << '\n';
+            if (!commandLine.empty()) {
+                log << "Command: " << commandLine << '\n';
+            }
+        }
+    }
 }
 
 bool assetPlacementBlocked(const AssetRecord& record) {
@@ -641,6 +895,21 @@ bool rendererSettingsRequestDlss(const RendererSettings& settings) {
     return settings.temporalUpscaler == TemporalUpscaler::Dlss ||
         settings.dlssRayReconstructionEnabled ||
         settings.dlssFrameGenerationEnabled;
+}
+
+bool disableDlssForRendererReplacement(RendererSettings& settings) {
+    if (!rendererSettingsRequestDlss(settings)) {
+        return false;
+    }
+    settings.taaEnabled = true;
+    settings.temporalUpscaler = TemporalUpscaler::TaaTsr;
+    settings.dlssRayReconstructionEnabled = false;
+    settings.dlssFrameGenerationEnabled = false;
+    settings.denoiserEnabled = true;
+    settings.denoiserBackend = DenoiserBackend::Engine;
+    settings.denoiseWhileMoving = true;
+    settings.renderPreset = RenderPreset::Custom;
+    return true;
 }
 
 void applyDocumentMaterialAssignments(const SceneDocument& document, AssetManager& assets) {
@@ -1477,59 +1746,16 @@ bool appendPrefabRuntimeAssets(
     if (appendCachedPrefabRuntimeAssets(prefabRecord, root, sourcePath, prefab.runtimeCachePath, registry, destination, bindings, error)) {
         return true;
     }
-    if (!std::filesystem::exists(sourcePath)) {
-        if (error != nullptr) {
-            *error = "Prefab source does not exist: " + sourcePath.string();
-        }
-        return false;
-    }
-
-    AssetManager importedAssets;
-    SceneAsset importedScene;
-    try {
-        GltfLoader loader(importedAssets);
-        importedScene = loader.loadWithCache(sourcePath);
-    } catch (const std::exception& ex) {
-        if (error != nullptr) {
-            *error = ex.what();
-        }
-        return false;
-    }
-
-    const ImportedAssetHandleRemap remap = appendImportedAssets(destination, importedAssets);
-    const std::string sourceHash = prefabRecord.sourceHash.empty()
-        ? assetSourceHashForPath(sourcePath)
-        : prefabRecord.sourceHash;
-    AssetImportRequest hashRequest;
-    hashRequest.sourcePath = sourcePath;
-    hashRequest.mode = importModeForRecord(prefabRecord, root);
-    hashRequest.settings = prefabRecord.importSettings;
-    const std::string settingsHash = prefabRecord.importSettingsHash.empty()
-        ? assetImportSettingsHashForRequest(hashRequest)
-        : prefabRecord.importSettingsHash;
-
-    for (size_t i = 0; i < remap.meshes.size(); ++i) {
-        bindings.meshes[importedAssetGuidFor(sourceHash, settingsHash, "Mesh", i)] = remap.meshes[i];
-    }
-    for (size_t i = 0; i < remap.materials.size(); ++i) {
-        if (MaterialAsset* material = destination.material(remap.materials[i])) {
-            (void)applyMaterialMetadataOverrideForGuid(
-                registry,
-                root,
-                importedAssetGuidFor(sourceHash, settingsHash, "Material", i),
-                *material);
-        }
-        bindings.materials[importedAssetGuidFor(sourceHash, settingsHash, "Material", i)] = remap.materials[i];
-    }
-    for (MeshAssetHandle meshHandle : remap.meshes) {
-        if (MeshAsset* mesh = destination.mesh(meshHandle)) {
-            for (MeshPrimitiveAsset& primitive : mesh->primitives) {
-                updatePrimitiveAlphaClassification(primitive, destination.material(primitive.material));
-            }
+    if (error != nullptr) {
+        const std::filesystem::path cachePath = prefab.runtimeCachePath.empty()
+            ? resolveAssetCachePath(prefabRecord, root)
+            : (prefab.runtimeCachePath.is_absolute() ? prefab.runtimeCachePath : root / prefab.runtimeCachePath);
+        *error = "Prefab cooked payload is unavailable or stale; reimport the asset to rebuild cache";
+        if (!cachePath.empty()) {
+            *error += ": " + cachePath.string();
         }
     }
-    (void)importedScene;
-    return true;
+    return false;
 }
 
 uint32_t rebindGuidBackedRenderers(SceneDocument& document, const PrefabRuntimeBindings& bindings) {
@@ -1734,7 +1960,7 @@ Application::~Application() {
     }
 
     if (uiOverlay_) {
-        uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+        (void)saveActiveEditorPreferences();
     }
     writeCrashMarker(false);
     if (commandSystem_) {
@@ -2468,6 +2694,7 @@ void Application::initVulkan() {
         notifications_.setLogSink(&uiOverlay_->editor().log());
         commandSystem_->setUiOverlay(uiOverlay_.get());
         uiOverlay_->editor().editorPrefs().load(EditorPreferences::defaultPath());
+        uiOverlay_->editor().setEditorPreferencesPath(EditorPreferences::defaultPath());
     }
 
     const EditorPreferences* startupPrefs = uiOverlay_ != nullptr ? &uiOverlay_->editor().editorPrefs() : nullptr;
@@ -2957,7 +3184,7 @@ void Application::startEditorRenderJob(EditorRenderJobKind kind, const std::file
         if (request != nullptr && request->saveSequenceFramesAsDefault) {
             EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
             prefs.renderSequenceFramesPerTimelineFrame = std::clamp(static_cast<int>(editorRenderJobSequenceFramesPerTimelineFrame_), 1, 512);
-            prefs.save(EditorPreferences::defaultPath());
+            (void)saveActiveEditorPreferences();
         }
         const int timelineFrameCount = std::max(1, editorRenderJobSequenceEndFrame_ - editorRenderJobSequenceStartFrame_ + 1);
         const uint64_t totalFrames = static_cast<uint64_t>(timelineFrameCount) * editorRenderJobSequenceFramesPerTimelineFrame_;
@@ -3453,7 +3680,8 @@ void Application::writeCrashMarker(bool running) {
 }
 
 bool Application::writeAutosave() {
-    if (!project_.has_value() || (!sceneUnsavedDirty_ && !projectSettingsDirty_ && !assetRegistry_.dirty() && dirtyMaterialAssets_.empty())) {
+    const bool sceneDirty = sceneUnsavedDirty_ || sceneDocument_.dirty();
+    if (!project_.has_value() || (!sceneDirty && !projectSettingsDirty_ && !assetRegistry_.dirty() && dirtyMaterialAssets_.empty())) {
         return false;
     }
     const std::filesystem::path autosaveDir = project_->savedRoot / "Autosaves";
@@ -3466,7 +3694,7 @@ bool Application::writeAutosave() {
 
     bool wroteAny = false;
     bool failed = false;
-    if (sceneUnsavedDirty_) {
+    if (sceneDirty) {
         serializeEditorSceneData();
         const std::filesystem::path autosavePath = editorSceneAutosavePath(*project_, scenePath_, gltfPath_);
         if (sceneDocument_.saveJson(autosavePath)) {
@@ -3519,7 +3747,8 @@ bool Application::writeAutosave() {
 }
 
 void Application::updateAutosave(float deltaSeconds) {
-    if (!project_.has_value() || !project_->autosaveEnabled || (!sceneUnsavedDirty_ && !projectSettingsDirty_ && !assetRegistry_.dirty() && dirtyMaterialAssets_.empty())) {
+    const bool sceneDirty = sceneUnsavedDirty_ || sceneDocument_.dirty();
+    if (!project_.has_value() || !project_->autosaveEnabled || (!sceneDirty && !projectSettingsDirty_ && !assetRegistry_.dirty() && dirtyMaterialAssets_.empty())) {
         autosaveElapsedSeconds_ = 0.0f;
         return;
     }
@@ -3716,6 +3945,8 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
     double rendererCreateMs = 0.0;
     double stateSwapMs = 0.0;
 
+    const bool restoreAutosaveAsUnsaved = result.restoreAsUnsaved && result.mode == SceneLoadMode::OpenRtLevel;
+    const bool markSceneDirtyAfterApply = sceneDirtyAfterApply || restoreAutosaveAsUnsaved;
     const RendererSettings previousSettings = pathTracer_ != nullptr ? pathTracer_->settings() : RendererSettings{};
     const std::optional<std::filesystem::path> nextGltfPath = sceneDirtyAfterApply
         ? std::optional<std::filesystem::path>{result.sourcePath}
@@ -3804,12 +4035,19 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
                   << " textures=" << build.sceneAsset.textures.size()
                   << " path=" << result.sourcePath.string() << '\n' << std::flush;
         const auto rendererCreateStart = std::chrono::steady_clock::now();
-        preparePathTracerForRendererReplacement(pathTracer_ != nullptr ? pathTracer_->settings() : reloadSettings);
+        RendererSettings replacementSettings = build.rendererSettings;
+        if (disableDlssForRendererReplacement(replacementSettings)) {
+            syncDocumentRenderSettings(nextDocument, replacementSettings);
+            const std::string message = "DLSS disabled for scene rebuild; re-enable it after the scene is loaded.";
+            std::cerr << message << '\n';
+            notifications_.notify(message, NotificationType::Warning, NotificationAction::OpenRenderSettings, "Render Settings", 6.0f);
+        }
+        preparePathTracerForRendererReplacement(pathTracer_ != nullptr ? pathTracer_->settings() : replacementSettings);
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             build.sceneAsset.meshes.empty() ? nullptr : &build.sceneAsset,
             build.sceneAsset.meshes.empty() ? nullptr : &result.assets,
             rendererCachePath,
-            &reloadSettings);
+            &replacementSettings);
         rendererCreateMs = elapsedMs(rendererCreateStart);
 
         const auto stateSwapStart = std::chrono::steady_clock::now();
@@ -3828,12 +4066,16 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
         hdrPath_ = nextHdrPath;
         if (sceneDirtyAfterApply) {
             scenePath_.reset();
+        } else if (restoreAutosaveAsUnsaved && !result.restoredScenePath.empty()) {
+            scenePath_ = result.restoredScenePath;
+        } else if (restoreAutosaveAsUnsaved) {
+            scenePath_.reset();
         } else {
             scenePath_ = result.sourcePath;
         }
         sceneDocument_ = std::move(nextDocument);
         sceneDocument_.clearDirty();
-        sceneUnsavedDirty_ = sceneDirtyAfterApply;
+        sceneUnsavedDirty_ = markSceneDirtyAfterApply;
         undoStack_.clear();
         gpuSceneAsset_ = std::move(build.sceneAsset);
         gpuInstanceEntities_ = std::move(build.instanceEntities);
@@ -3872,7 +4114,7 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
     if (uiOverlay_) {
         EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
         prefs.addRecentFile(result.sourcePath);
-        prefs.save(EditorPreferences::defaultPath());
+        (void)saveActiveEditorPreferences();
     }
     if (!result.warningMessage.empty()) {
         notifications_.notify(result.warningMessage, NotificationType::Warning);
@@ -4392,8 +4634,8 @@ bool Application::saveAllEditorState() {
     }
 
     if (uiOverlay_ != nullptr) {
-        const std::filesystem::path prefsPath = EditorPreferences::defaultPath();
-        if (uiOverlay_->editor().editorPrefs().save(prefsPath)) {
+        const std::filesystem::path prefsPath = activeEditorPreferencesPath();
+        if (saveActiveEditorPreferences()) {
             logSaved("Editor Preferences: " + prefsPath.string());
         } else {
             logFailure("Editor Preferences: " + prefsPath.string());
@@ -4583,13 +4825,16 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
     projectSettingsDirty_ = false;
     const std::filesystem::path crashMarker = project.savedRoot / "editor_session.json";
     if (uiOverlay_ != nullptr) {
+        EditorPreferences globalPrefs;
+        globalPrefs.load(EditorPreferences::defaultPath());
+        globalPrefs.addRecentProject(project.projectFile);
+        globalPrefs.save(EditorPreferences::defaultPath());
+        reloadEditorPreferencesForActiveProject();
         if (project.preferredWorkspacePreset >= 0) {
             uiOverlay_->editor().setProjectWorkspacePreset(project.preferredWorkspacePreset);
         } else {
             uiOverlay_->editor().clearProjectWorkspacePreset();
         }
-        uiOverlay_->editor().editorPrefs().addRecentProject(project.projectFile);
-        uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
         if (!editorRecoveryPromptSuppressed() && std::filesystem::exists(crashMarker)) {
             std::filesystem::path recoveredScene = project.startupScene;
             std::filesystem::path recoveredSceneAutosave;
@@ -4633,6 +4878,9 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
             pendingRecoveryAutosavePath_ = recoveredSceneAutosave.empty()
                 ? editorSceneAutosavePath(project, recoveredScene, std::nullopt)
                 : recoveredSceneAutosave;
+            pendingRecoveryScenePath_ = recoveredScene.empty()
+                ? std::optional<std::filesystem::path>{}
+                : std::optional<std::filesystem::path>{recoveredScene};
             pendingRecoveryProjectAutosavePath_ = recoveredProjectAutosave.empty()
                 ? editorProjectAutosavePath(project)
                 : recoveredProjectAutosave;
@@ -4656,6 +4904,7 @@ bool Application::openProjectFromFile(const std::filesystem::path& projectFile, 
         writeCrashMarker(false);
         project_.reset();
         projectSettingsDirty_ = false;
+        pendingRecoveryScenePath_.reset();
         pendingRecoveryAutosavePath_.reset();
         pendingRecoveryProjectAutosavePath_.reset();
         pendingRecoveryMaterialAssetAutosaves_.clear();
@@ -4753,7 +5002,14 @@ bool Application::deleteProjectFromRequest(const DeleteProjectRequest& request) 
         if (!prefs.lastOpenedProject.empty() && normalizedPathForCompare(prefs.lastOpenedProject) == projectFile) {
             prefs.lastOpenedProject.clear();
         }
-        prefs.save(EditorPreferences::defaultPath());
+        EditorPreferences globalPrefs;
+        globalPrefs.load(EditorPreferences::defaultPath());
+        globalPrefs.removeRecentProject(projectFile.string());
+        globalPrefs.removeRecentProject(request.projectFile.string());
+        if (!globalPrefs.lastOpenedProject.empty() && normalizedPathForCompare(globalPrefs.lastOpenedProject) == projectFile) {
+            globalPrefs.lastOpenedProject.clear();
+        }
+        globalPrefs.save(EditorPreferences::defaultPath());
     }
 
     if (!request.deleteFiles) {
@@ -4790,6 +5046,46 @@ bool Application::deleteProjectFromRequest(const DeleteProjectRequest& request) 
     return true;
 }
 
+std::filesystem::path Application::activeEditorPreferencesPath() const {
+    if (project_.has_value() && !project_->editorPreferencesPath.empty()) {
+        return project_->editorPreferencesPath;
+    }
+    return EditorPreferences::defaultPath();
+}
+
+void Application::reloadEditorPreferencesForActiveProject() {
+    if (uiOverlay_ == nullptr) {
+        return;
+    }
+    EditorLayer& editor = uiOverlay_->editor();
+    EditorPreferences& prefs = editor.editorPrefs();
+    prefs = EditorPreferences{};
+    EditorPreferences globalPrefs;
+    globalPrefs.load(EditorPreferences::defaultPath());
+    prefs = globalPrefs;
+    if (project_.has_value() && !project_->editorPreferencesPath.empty() && std::filesystem::exists(project_->editorPreferencesPath)) {
+        prefs.load(project_->editorPreferencesPath);
+    }
+    prefs.recentProjects = globalPrefs.recentProjects;
+    prefs.lastOpenedProject = globalPrefs.lastOpenedProject;
+    prefs.openLastProject = globalPrefs.openLastProject;
+    editor.setEditorPreferencesPath(activeEditorPreferencesPath());
+    editor.reloadViewportPreferences();
+    cameraController_.setMoveSpeed(std::clamp(prefs.cameraMoveSpeed, 0.05f, 100.0f));
+    cameraController_.setFastMoveSpeed(std::clamp(prefs.cameraFastMoveSpeed, 0.05f, 250.0f));
+    cameraController_.setMouseSensitivity(std::clamp(prefs.cameraMouseSensitivity, 0.0001f, 0.02f));
+    cameraController_.setInvertLookX(prefs.cameraInvertLookX);
+    cameraController_.setInvertLookY(prefs.cameraInvertLookY);
+}
+
+bool Application::saveActiveEditorPreferences() {
+    if (uiOverlay_ == nullptr) {
+        return false;
+    }
+    uiOverlay_->editor().setEditorPreferencesPath(activeEditorPreferencesPath());
+    return uiOverlay_->editor().saveEditorPreferences();
+}
+
 bool Application::closeCurrentProject() {
     if (!project_.has_value()) {
         return true;
@@ -4803,12 +5099,13 @@ bool Application::closeCurrentProject() {
     }
     if (uiOverlay_ != nullptr) {
         uiOverlay_->editor().clearProjectWorkspacePreset();
-        uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+        (void)saveActiveEditorPreferences();
         uiOverlay_->editor().timeline().clear();
     }
     writeCrashMarker(false);
     project_.reset();
     projectSettingsDirty_ = false;
+    pendingRecoveryScenePath_.reset();
     pendingRecoveryAutosavePath_.reset();
     pendingRecoveryProjectAutosavePath_.reset();
     pendingRecoveryMaterialAssetAutosaves_.clear();
@@ -4816,6 +5113,7 @@ bool Application::closeCurrentProject() {
     dirtyMaterialAssets_.clear();
     materialAssetAutosavePaths_.clear();
     assetRegistry_.clear();
+    reloadEditorPreferencesForActiveProject();
     initializeFallbackSceneDocument();
     scenePath_.reset();
     gltfPath_.reset();
@@ -5079,6 +5377,7 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
                 SceneUpdateKind::TopologyChanged,
                 "Replace Mesh Asset"));
         }
+        (void)applyPendingSceneUpdate(true);
         editorPlacement_.entity = request.replaceEntity;
         editorPlacement_.serial = nextEditorPlacementSerial_++;
         editorPlacement_.label = target->name.empty() ? (meshRecord->displayName.empty() ? "Mesh Asset" : meshRecord->displayName) : target->name;
@@ -5125,6 +5424,7 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
             SceneUpdateKind::TopologyChanged,
             "Place Mesh Asset"));
     }
+    (void)applyPendingSceneUpdate(true);
     editorPlacement_.entity = created;
     editorPlacement_.serial = nextEditorPlacementSerial_++;
     editorPlacement_.label = entityName;
@@ -5799,7 +6099,7 @@ bool Application::deleteAssetsFromRegistry(const EditorDeleteAssetRequest& reque
         for (const std::string& collectionName : collectionNames) {
             prefs.removeAssetsFromCollection(collectionName, removedGuids);
         }
-        prefs.save(EditorPreferences::defaultPath());
+        (void)saveActiveEditorPreferences();
     }
 
     const bool saved = assetRegistry_.state().path.empty() ? false : assetRegistry_.save(assetRegistry_.state().path);
@@ -5831,6 +6131,7 @@ bool Application::startCookProject(const EditorCookProjectRequest& request) {
     const std::filesystem::path logPath = outputDir / "cook_log.txt";
 
     auto recordBlockedCook = [&](std::string status, int exitCode) {
+        const std::string failureStatus = status;
         completedCookProjectJob_ = EditorJobCenterState{};
         completedCookProjectJob_.completedCookProjectSerial = nextCookProjectJobSerial_++;
         completedCookProjectJob_.completedCookProjectSuccess = false;
@@ -5841,6 +6142,7 @@ bool Application::startCookProject(const EditorCookProjectRequest& request) {
         completedCookProjectJob_.completedCookProjectValidationReportPath = validationReportPath;
         completedCookProjectJob_.completedCookProjectLogPath = logPath;
         completedCookProjectJob_.completedCookProjectExitCode = exitCode;
+        ensureCookFailureArtifacts(projectFile, outputDir, manifestPath, validationReportPath, logPath, exitCode, failureStatus);
     };
 
     if (!saveAllEditorState()) {
@@ -5875,15 +6177,14 @@ bool Application::startCookProject(const EditorCookProjectRequest& request) {
         seed.logPath,
         std::async(std::launch::async, [seed]() mutable {
             const auto start = std::chrono::steady_clock::now();
-            std::error_code logEc;
-            std::filesystem::create_directories(seed.logPath.parent_path(), logEc);
             const std::filesystem::path exe = currentExecutablePath();
-            const std::string command = quoteShellPath(exe)
-                + " --cook-project " + quoteShellPath(seed.projectFile)
-                + " --cook-output " + quoteShellPath(seed.outputDir)
-                + " --cook-manifest " + quoteShellPath(seed.manifestPath)
-                + " > " + quoteShellPath(seed.logPath) + " 2>&1";
-            seed.exitCode = std::system(command.c_str());
+            seed.exitCode = runCookProjectProcess(
+                exe,
+                seed.projectFile,
+                seed.outputDir,
+                seed.manifestPath,
+                seed.logPath,
+                &seed.commandLine);
             seed.workerTotalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             return seed;
         })});
@@ -5922,6 +6223,15 @@ void Application::pollCookProjectJob() {
     if (success) {
         notifications_.notify("Project cook complete", NotificationType::Success, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
     } else {
+        ensureCookFailureArtifacts(
+            result.projectFile,
+            result.outputDir,
+            result.manifestPath,
+            result.validationReportPath,
+            result.logPath,
+            result.exitCode,
+            completedCookProjectJob_.completedCookProjectStatus,
+            result.commandLine);
         notifications_.notify("Project cook failed", NotificationType::Error, NotificationAction::OpenProjectManager, "Project Manager", 6.0f);
     }
     std::cout << "Project cook " << (success ? "completed" : "failed")
@@ -6131,7 +6441,7 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
     if (!reimport) {
         if (uiOverlay_ != nullptr) {
             uiOverlay_->editor().editorPrefs().addRecentFile(job.request.sourcePath);
-            uiOverlay_->editor().editorPrefs().save(EditorPreferences::defaultPath());
+            (void)saveActiveEditorPreferences();
         }
         notifications_.notify("Import Asset staged", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
         std::cout << "Import Asset staged without scene mutation: " << job.request.sourcePath.string()
@@ -6357,7 +6667,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             if (uiOverlay_ != nullptr) {
                 EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
                 prefs.cameraMoveSpeed = moveSpeed;
-                prefs.save(EditorPreferences::defaultPath());
+                (void)saveActiveEditorPreferences();
             }
         }
         if (requests.cameraFastMoveSpeed.has_value()) {
@@ -6366,7 +6676,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             if (uiOverlay_ != nullptr) {
                 EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
                 prefs.cameraFastMoveSpeed = fastMoveSpeed;
-                prefs.save(EditorPreferences::defaultPath());
+                (void)saveActiveEditorPreferences();
             }
         }
         if (requests.cameraMouseSensitivity.has_value()) {
@@ -6375,7 +6685,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             if (uiOverlay_ != nullptr) {
                 EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
                 prefs.cameraMouseSensitivity = mouseSensitivity;
-                prefs.save(EditorPreferences::defaultPath());
+                (void)saveActiveEditorPreferences();
             }
         }
         if (requests.cameraInvertLookX.has_value()) {
@@ -6383,7 +6693,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             if (uiOverlay_ != nullptr) {
                 EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
                 prefs.cameraInvertLookX = *requests.cameraInvertLookX;
-                prefs.save(EditorPreferences::defaultPath());
+                (void)saveActiveEditorPreferences();
             }
         }
         if (requests.cameraInvertLookY.has_value()) {
@@ -6391,7 +6701,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             if (uiOverlay_ != nullptr) {
                 EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
                 prefs.cameraInvertLookY = *requests.cameraInvertLookY;
-                prefs.save(EditorPreferences::defaultPath());
+                (void)saveActiveEditorPreferences();
             }
         }
         if (requests.resetCamera) {
@@ -6612,6 +6922,10 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             SceneLoadRequest request;
             request.mode = SceneLoadMode::OpenRtLevel;
             request.sourcePath = *pendingRecoveryAutosavePath_;
+            request.restoreAsUnsaved = true;
+            if (pendingRecoveryScenePath_.has_value()) {
+                request.restoredScenePath = *pendingRecoveryScenePath_;
+            }
             if (project_.has_value()) {
                 request.projectSnapshot = *project_;
             }
@@ -6623,12 +6937,18 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         } else {
             notifications_.notify("No autosaves available to restore", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
         }
+        pendingRecoveryScenePath_.reset();
+        pendingRecoveryAutosavePath_.reset();
+        pendingRecoveryProjectAutosavePath_.reset();
+        pendingRecoveryMaterialAssetAutosaves_.clear();
+        pendingRecoveryAssetRegistryAutosavePath_.reset();
     }
     if (requests.discardRecovery) {
         if (project_.has_value()) {
             std::error_code ec;
             std::filesystem::remove(project_->savedRoot / "editor_session.json", ec);
         }
+        pendingRecoveryScenePath_.reset();
         pendingRecoveryAutosavePath_.reset();
         pendingRecoveryProjectAutosavePath_.reset();
         pendingRecoveryMaterialAssetAutosaves_.clear();
@@ -6692,7 +7012,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
             if (uiOverlay_ != nullptr) {
                 EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
                 prefs.addRecentFile(*requests.loadHdr);
-                prefs.save(EditorPreferences::defaultPath());
+                (void)saveActiveEditorPreferences();
             }
             std::cout << "Assigned HDR environment from editor: " << requests.loadHdr->string() << '\n';
         }
@@ -7361,7 +7681,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
     if (requests.removeFavorite.has_value()) {
         EditorPreferences& prefs = uiOverlay_->editor().editorPrefs();
         prefs.removeFavorite(*requests.removeFavorite);
-        prefs.save(EditorPreferences::defaultPath());
+        (void)saveActiveEditorPreferences();
     }
 
     (void)applyPendingSceneUpdate(allowResourceRebuild);
@@ -7691,18 +8011,30 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         return false;
     }
 
+    const auto applyStart = std::chrono::steady_clock::now();
     const SceneUpdateMask pendingMask = sceneDocument_.pendingUpdateMask();
     SceneUpdateRoute route = SceneUpdateRouter::route(pendingMask);
-    pathTracer_->validationLog().recordSceneUpdateRoute(
-        sceneUpdateMaskName(pendingMask),
-        sceneUpdateGpuActionMaskName(route.actionMask));
+    const std::string routeKindName = sceneUpdateMaskName(pendingMask);
+    const std::string routeActionName = sceneUpdateGpuActionMaskName(route.actionMask);
+    auto recordRouteAndReturn = [&](bool result, std::string_view suffix = {}) {
+        const auto applyEnd = std::chrono::steady_clock::now();
+        const double cpuMs = std::chrono::duration<double, std::milli>(applyEnd - applyStart).count();
+        std::string actionName = routeActionName;
+        if (!suffix.empty()) {
+            actionName += suffix;
+        }
+        if (pathTracer_ != nullptr) {
+            pathTracer_->validationLog().recordSceneUpdateRoute(routeKindName, std::move(actionName), cpuMs);
+        }
+        return result;
+    };
     if (route.actionMask == 0u) {
         sceneDocument_.clearDirty();
-        return true;
+        return recordRouteAndReturn(true);
     }
     if (!allowResourceRebuild &&
         route.requiresRendererRebuild) {
-        return false;
+        return recordRouteAndReturn(false, "+Deferred");
     }
 
     std::optional<SceneGpuBuildResult> build;
@@ -7713,13 +8045,20 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         }
         return *build;
     };
-    if (route.requiresGpuSceneBuild) {
+    if (route.requiresGpuSceneBuild && !route.requiresRendererRebuild) {
         applyRendererSettingsSafely(ensureBuild().rendererSettings, allowResourceRebuild);
     }
 
     auto rebuildRenderer = [&]() {
         SceneGpuBuildResult& sceneBuild = ensureBuild();
         const RendererSettings previousSettings = pathTracer_->settings();
+        RendererSettings replacementSettings = sceneBuild.rendererSettings;
+        if (disableDlssForRendererReplacement(replacementSettings)) {
+            syncDocumentRenderSettings(sceneDocument_, replacementSettings);
+            const std::string message = "DLSS disabled for topology rebuild; re-enable it after placement completes.";
+            std::cerr << message << '\n';
+            notifications_.notify(message, NotificationType::Warning, NotificationAction::OpenRenderSettings, "Render Settings", 6.0f);
+        }
         if (uiOverlay_) {
             uiOverlay_->invalidateRendererTextures();
         }
@@ -7731,7 +8070,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
             currentSceneCachePathForRenderer(),
-            &previousSettings);
+            &replacementSettings);
         retirePathTracer(std::move(pathTracer_));
         pathTracer_ = std::move(nextPathTracer);
         applyActiveSceneCamera();
@@ -7756,10 +8095,10 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
 
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::RebuildTopology)) {
         if (!allowResourceRebuild) {
-            return false;
+            return recordRouteAndReturn(false, "+Deferred");
         }
         rebuildRenderer();
-        return completeAfterRebuild();
+        return recordRouteAndReturn(completeAfterRebuild());
     }
 
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::UpdateCamera)) {
@@ -7776,10 +8115,10 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         syncBuiltScene();
         if (!pathTracer_->updateMaterials(*gpuSceneAsset_, assets_)) {
             if (!allowResourceRebuild) {
-                return false;
+                return recordRouteAndReturn(false, "+Deferred");
             }
             rebuildRenderer();
-            return completeAfterRebuild();
+            return recordRouteAndReturn(completeAfterRebuild(), "+FallbackRebuild");
         }
     }
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::UpdateEnvironment)) {
@@ -7818,25 +8157,25 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         syncBuiltScene();
         if (!pathTracer_->updateSceneVisibility(*gpuSceneAsset_, assets_)) {
             if (!allowResourceRebuild) {
-                return false;
+                return recordRouteAndReturn(false, "+Deferred");
             }
             rebuildRenderer();
-            return completeAfterRebuild();
+            return recordRouteAndReturn(completeAfterRebuild(), "+FallbackRebuild");
         }
     }
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::UpdateTransforms)) {
         syncBuiltScene();
         if (!pathTracer_->updateSceneTransforms(*gpuSceneAsset_, assets_)) {
             if (!allowResourceRebuild) {
-                return false;
+                return recordRouteAndReturn(false, "+Deferred");
             }
             rebuildRenderer();
-            return completeAfterRebuild();
+            return recordRouteAndReturn(completeAfterRebuild(), "+FallbackRebuild");
         }
     }
 
     sceneDocument_.clearDirty();
-    return true;
+    return recordRouteAndReturn(true);
 }
 
 void Application::applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange) {

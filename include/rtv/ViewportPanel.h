@@ -19,6 +19,22 @@ enum class GizmoInteractionState : uint8_t {
     DraggingScale,
 };
 
+enum class ViewportPlacementBrushKind : uint8_t {
+    None,
+    Prefab,
+    Mesh,
+};
+
+struct ViewportPlacementBrushState {
+    ViewportPlacementBrushKind kind = ViewportPlacementBrushKind::None;
+    AssetGuid guid;
+    float yawRadians = 0.0f;
+    int remainingPlacements = 0;
+    bool multiPlace = false;
+
+    [[nodiscard]] bool active() const { return kind != ViewportPlacementBrushKind::None && !guid.empty(); }
+};
+
 class ViewportPanel {
 public:
     void draw(EditorRuntimeState& state, EditorSelection& selection, EditorRequests& requests);
@@ -33,6 +49,7 @@ public:
     void setShowAxes(bool show) { showAxes_ = show; }
     [[nodiscard]] bool showGrid() const { return showGrid_; }
     [[nodiscard]] bool showAxes() const { return showAxes_; }
+    void reloadViewportPreferences(const EditorPreferences& preferences);
 
 private:
     struct SnapSettings {
@@ -45,8 +62,7 @@ private:
     void commitGizmoDrag(EditorRequests& requests, SceneDocument& document);
     void abortGizmoDrag();
     void updateGizmoState(bool isOver, bool isUsing, int gizmoMode);
-    void loadViewportPreferences(const EditorPreferences& preferences);
-    void persistViewportPreferences(EditorPreferences& preferences) const;
+    void persistViewportPreferences(EditorPreferences& preferences, const std::filesystem::path& path) const;
 
     VkExtent2D lastContentExtent_{};
     int transformGizmoMode_ = 0;
@@ -66,6 +82,7 @@ private:
     EntityId pendingMaterialDropEntity_{};
     std::string activePlacementPayloadKey_;
     float placementPreviewYawRadians_ = 0.0f;
+    ViewportPlacementBrushState placementBrush_{};
     GizmoInteractionState gizmoState_ = GizmoInteractionState::Idle;
 
     bool gizmoDragActive_ = false;

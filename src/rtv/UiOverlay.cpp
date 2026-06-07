@@ -496,6 +496,7 @@ EditorRequests UiOverlay::build(
         .sceneLoadProgress = sceneLoadProgress,
         .camera = camera,
         .undoStack = undoStack,
+        .editorPreferencesPath = project != nullptr && !project->editorPreferencesPath.empty() ? project->editorPreferencesPath : EditorPreferences::defaultPath(),
         .uiTextures = EditorUiTextureProvider{.user = this, .acquire = &UiOverlay::acquireEditorTextureCallback, .acquireAssetPreview = &UiOverlay::acquireEditorAssetPreviewCallback},
         .renderJob = renderJob,
         .placement = placement,

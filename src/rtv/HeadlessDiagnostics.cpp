@@ -190,6 +190,19 @@ void to_json(nlohmann::json& j, const ProfileReport::RayTracingMotionBlurReport&
     j["disabled_reason"] = m.disabledReason;
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::SceneUpdateRouteReport& r) {
+    j = nlohmann::json{
+        {"kind", r.kind},
+        {"action", r.action},
+        {"count", r.count},
+        {"total_cpu_ms", r.totalCpuMs},
+        {"last_cpu_ms", r.lastCpuMs},
+        {"avg_cpu_ms", r.averageCpuMs},
+        {"min_cpu_ms", r.minCpuMs},
+        {"max_cpu_ms", r.maxCpuMs},
+    };
+}
+
 void to_json(nlohmann::json& j, const ProfileReport::PipelineStatistics& s) {
     j["ray_invocations"] = s.rayInvocations;
     j["triangle_hits"] = s.triangleHits;
@@ -919,7 +932,16 @@ void writeValidationLog(const RendererValidationLog& log, const std::filesystem:
     file << "\n--- Accumulation Invalidations (" << log.invalidations().size() << ") ---\n";
     for (const auto& ev : log.invalidations()) { file << "  frame=" << ev.frame << " reason=" << ev.reason << "\n"; }
     file << "\n--- Scene Update Routes (" << log.sceneUpdateRoutes().size() << ") ---\n";
-    for (const auto& ev : log.sceneUpdateRoutes()) { file << "  " << ev.kind << ": " << ev.action << " (count=" << ev.count << ")\n"; }
+    for (const auto& ev : log.sceneUpdateRoutes()) {
+        const double avgCpuMs = ev.count > 0 ? ev.totalCpuMs / static_cast<double>(ev.count) : 0.0;
+        file << "  " << ev.kind << ": " << ev.action
+             << " (count=" << ev.count
+             << ", cpu_ms last=" << ev.lastCpuMs
+             << " avg=" << avgCpuMs
+             << " min=" << ev.minCpuMs
+             << " max=" << ev.maxCpuMs
+             << ")\n";
+    }
     file << "\n--- Resource States (" << log.resourceStateEvents().size() << ") ---\n";
     for (const auto& ev : log.resourceStateEvents()) {
         file << "  " << ev.resource << " " << ev.beforePass << " -> " << ev.afterPass
@@ -1607,6 +1629,19 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memoryPressureQuality.restirGiHalfResolution = memoryPressureState.restirGiHalfResolution;
     profileReport_.memoryPressureQuality.denoiserMaxHistoryLength = memoryPressureState.denoiserMaxHistoryLength;
 
+    profileReport_.sceneUpdateRoutes.clear();
+    for (const SceneUpdateRouteEvent& route : renderer->validationLog().sceneUpdateRoutes()) {
+        ProfileReport::SceneUpdateRouteReport report;
+        report.kind = route.kind;
+        report.action = route.action;
+        report.count = route.count;
+        report.totalCpuMs = route.totalCpuMs;
+        report.lastCpuMs = route.lastCpuMs;
+        report.averageCpuMs = route.count > 0 ? route.totalCpuMs / static_cast<double>(route.count) : 0.0;
+        report.minCpuMs = route.minCpuMs;
+        report.maxCpuMs = route.maxCpuMs;
+        profileReport_.sceneUpdateRoutes.push_back(std::move(report));
+    }
     profileReport_.validationErrorCount = 0;
 
     profileReport_.settings = renderer->settings();
@@ -1698,6 +1733,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["adaptive_quality"] = profileReport_.adaptiveQuality;
     j["memory_pressure_quality"] = profileReport_.memoryPressureQuality;
     j["nvidia_integrations"] = profileReport_.nvidiaIntegrations;
+    j["scene_update_routes"] = profileReport_.sceneUpdateRoutes;
     j["validation_error_count"] = profileReport_.validationErrorCount;
     j["warnings"] = profileReport_.warnings;
     j["settings"] = profileReport_.settings;
