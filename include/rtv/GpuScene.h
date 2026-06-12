@@ -160,6 +160,7 @@ enum class AccelUpdateMode : uint32_t {
 
 struct RayTracingMeshBuildInput {
     uint32_t meshIndex = 0;
+    uint32_t sourceMeshHandleIndex = 0xffffffffu;
     uint32_t firstVertex = 0;
     uint32_t vertexCount = 0;
     uint32_t firstIndex = 0;
@@ -255,6 +256,7 @@ public:
     [[nodiscard]] const std::vector<RayTracingInstanceBuildInput>& rayTracingInstances() const { return rayTracingInstances_; }
     [[nodiscard]] const RayTracingGeometryStats& rayTracingGeometryStats() const { return rayTracingGeometryStats_; }
     [[nodiscard]] const std::vector<GpuPrimitiveRecord>& primitiveRecordsCpu() const { return primitiveRecordCpu_; }
+    [[nodiscard]] const std::vector<GpuLocalVertex>& localVerticesCpu() const { return localVertexCpu_; }
     [[nodiscard]] const std::vector<GpuLightRecord>& lightRecordsCpu() const { return lightRecordCpu_; }
     [[nodiscard]] const OpacityMicromapCpuData& opacityMicromapData() const { return opacityMicromapData_; }
 
@@ -279,7 +281,7 @@ private:
 
     void createCornellBox(BufferUploader& uploader);
     void createImportedScene(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
-    void createImportedSceneFromCache(BufferUploader& uploader, const CachedScene& cached);
+    void createImportedSceneFromCache(BufferUploader& uploader, const CachedScene& cached, const std::vector<SceneLightAsset>& activeSceneLights);
     void createDefaultMaterialTexture(BufferUploader& uploader);
     void createImportedMaterialTextures(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
     void createCachedMaterialTextures(BufferUploader& uploader, const CachedScene& cached);
@@ -345,6 +347,7 @@ private:
     std::vector<RayTracingInstanceBuildInput> rayTracingInstances_;
     RayTracingGeometryStats rayTracingGeometryStats_{};
     std::vector<GpuPrimitiveRecord> primitiveRecordCpu_;
+    std::vector<GpuLocalVertex> localVertexCpu_;
     std::vector<GpuLightRecord> lightRecordCpu_;
     OpacityMicromapCpuData opacityMicromapData_{};
     std::vector<GpuMeshRecord> meshRecordCpu_;

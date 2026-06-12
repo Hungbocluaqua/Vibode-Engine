@@ -9,6 +9,7 @@
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
 #include "rtv/RayTracingScene.h"
+#include "rtv/StreamlineRuntime.h"
 
 #include <Volk/volk.h>
 #include <glm/glm.hpp>
@@ -54,6 +55,8 @@ struct RayTracingRendererStats {
     VkDeviceSize accelerationStructureBytes = 0;
     VkDeviceSize sbtBytes = 0;
     float lastTlasRefitMs = 0.0f;
+    uint32_t dynamicBlasUpdateCount = 0;
+    float lastDynamicBlasUpdateRecordMs = 0.0f;
     RayTracingGeometryStats geometry{};
     RayTracingBlasGeometryStats blasGeometry{};
     RayTracingMotionInstanceStats motionInstances{};
@@ -97,6 +100,82 @@ enum class AccumulationResetReason : uint32_t {
 
 class PathTracerRenderer {
 public:
+    struct alignas(16) GpuSkinningSourceVertex {
+        glm::vec4 positionUvX{};
+        glm::vec4 normalUvY{};
+        glm::vec4 tangent{};
+        glm::vec4 color{1.0f};
+        glm::vec4 texcoord1{};
+        glm::uvec4 joints{};
+        glm::vec4 weights{};
+    };
+
+    struct GpuSkinningDispatchRecord {
+        uint32_t meshHandleIndex = 0xffffffffu;
+        uint32_t vertexCount = 0;
+        uint32_t jointMatrixOffset = 0;
+        uint32_t sourceVertexOffset = 0;
+        uint32_t currentVertexOffset = 0;
+        uint32_t previousVertexOffset = 0;
+        uint32_t morphDeltaOffset = 0;
+        uint32_t morphDeltaCount = 0;
+        float morphWeight = 0.0f;
+        bool morphBeforeSkinning = false;
+    };
+
+    struct GpuSkinningResourcePlan {
+        uint32_t candidateInstanceCount = 0;
+        uint32_t dispatchRecordCount = 0;
+        uint32_t jointMatrixCount = 0;
+        uint64_t jointUploadBytes = 0;
+        uint64_t previousJointUploadBytes = 0;
+        uint64_t sourceVertexUploadBytes = 0;
+        uint64_t morphDeltaUploadBytes = 0;
+        uint64_t currentVertexBufferBytes = 0;
+        uint64_t previousVertexBufferBytes = 0;
+        std::vector<GpuSkinningDispatchRecord> dispatchRecords;
+        std::vector<glm::mat4> jointMatrices;
+        std::vector<glm::mat4> previousJointMatrices;
+        std::vector<GpuSkinningSourceVertex> sourceVertices;
+        std::vector<GpuLocalVertex> morphDeltas;
+        bool cpuFallbackActive = false;
+        bool rendererBuffersAllocated = false;
+        bool sourceVertexBufferUploaded = false;
+        bool morphDeltaBufferUploaded = false;
+        bool jointBufferUploaded = false;
+        bool previousJointBufferUploaded = false;
+        bool jointPayloadRefreshUploaded = false;
+        bool jointPayloadRefreshStaged = false;
+        bool jointPayloadRefreshCopyPending = false;
+        bool jointPayloadRefreshCopyRecorded = false;
+        uint32_t jointPayloadRefreshCount = 0;
+        uint32_t jointPayloadRefreshCopyRecordCount = 0;
+        uint64_t jointPayloadRefreshBytes = 0;
+        uint64_t jointPayloadRefreshStagedBytes = 0;
+        uint64_t jointPayloadRefreshCopyBytes = 0;
+        bool computePipelineCreated = false;
+        bool descriptorsBound = false;
+        bool computeDispatchEnabled = false;
+        uint32_t computeDispatchRecordCount = 0;
+        uint32_t computeMorphDispatchRecordCount = 0;
+        bool outputReadbackBufferAllocated = false;
+        bool outputReadbackCopyRecorded = false;
+        bool outputReadbackValidationPassed = false;
+        uint32_t outputReadbackVertexCount = 0;
+        float outputReadbackMaxPositionError = 0.0f;
+        bool initialComputeDispatchSubmitted = false;
+        bool rayTracingGeometryInputEnabled = false;
+        uint32_t rayTracingGeometryInputMeshCount = 0;
+        uint32_t rayTracingGeometryInputGeometryCount = 0;
+        bool rayTracingDescriptorInputEnabled = false;
+        bool rayTracingDescriptorInputMixedSceneEnabled = false;
+        uint32_t rayTracingDescriptorInputMeshCount = 0;
+        uint32_t rayTracingDescriptorInputBindingCount = 0;
+        bool skinnedMotionVectorsEnabled = false;
+        bool skinnedMotionVectorsPreviousVertexInputEnabled = false;
+        bool skinnedMotionVectorsDescriptorBound = false;
+    };
+
     PathTracerRenderer(
         const VulkanContext& context,
         ResourceAllocator& allocator,
@@ -110,6 +189,7 @@ public:
         std::optional<std::filesystem::path> environmentPath = std::nullopt,
         std::optional<std::filesystem::path> sceneCachePath = std::nullopt,
         bool resourceAliasingEnabled = true,
+        GpuSkinningResourcePlan gpuSkinningResourcePlan = {},
         const RendererSettings* initialSettings = nullptr);
     ~PathTracerRenderer();
     void releaseExclusiveRuntimeForRendererReplacement();
@@ -119,6 +199,12 @@ public:
     void recordPathTrace(VkCommandBuffer commandBuffer, bool deferPostTraceCompute = false);
     [[nodiscard]] bool recordAsyncComputeWork(VkCommandBuffer commandBuffer);
     void recordFullscreen(VkCommandBuffer commandBuffer, VkExtent2D swapchainExtent);
+    void markStreamlineReflexSimulationStart();
+    void markStreamlineReflexSimulationEnd();
+    void markStreamlineReflexRenderSubmitStart();
+    void markStreamlineReflexRenderSubmitEnd();
+    void markStreamlineReflexPresentStart();
+    void markStreamlineReflexPresentEnd();
     void recordEditorPresentationStart(VkCommandBuffer commandBuffer);
     void recordEditorPresentationEnd(VkCommandBuffer commandBuffer);
 
@@ -140,15 +226,49 @@ public:
     bool updateSceneLights(const SceneAsset& scene);
     bool updateSceneTransforms(const SceneAsset& scene, const AssetManager& assets);
     bool updateSceneVisibility(const SceneAsset& scene, const AssetManager& assets);
+    bool updateGpuSkinningJointPayloads(
+        const std::vector<glm::mat4>& jointMatrices,
+        const std::vector<glm::mat4>& previousJointMatrices);
     void setSelectedInstanceId(std::optional<uint32_t> instanceId);
     void requestPickInstanceId(glm::vec2 viewportUv);
     [[nodiscard]] std::optional<uint32_t> consumePickedInstanceId();
     [[nodiscard]] bool pickPending() const;
 
     [[nodiscard]] const RendererSettings& settings() const { return settings_; }
+    [[nodiscard]] const GpuSkinningResourcePlan& gpuSkinningResourcePlan() const { return gpuSkinningResourcePlan_; }
+    void updateGpuSkinningOutputReadbackValidation();
     [[nodiscard]] const OpacityMicromapDeviceInfo& opacityMicromapInfo() const;
     [[nodiscard]] const SerDeviceInfo& serInfo() const;
     [[nodiscard]] const RayTracingMotionBlurDeviceInfo& rayTracingMotionBlurInfo() const;
+    struct StreamlineTagSummary {
+        uint32_t expected = 0;
+        uint32_t tagged = 0;
+        uint32_t failed = 0;
+        uint32_t missingFrameToken = 0;
+        uint32_t missingImage = 0;
+        uint32_t invalidLayout = 0;
+        uint32_t invalidFormat = 0;
+        uint32_t invalidExtent = 0;
+        uint32_t emptyRole = 0;
+        uint32_t runtimeRejected = 0;
+        uint64_t frameIndex = 0;
+        bool attempted = false;
+    };
+    struct StreamlineEvaluationSummary {
+        uint32_t attempted = 0;
+        uint32_t succeeded = 0;
+        uint32_t failed = 0;
+        uint32_t skippedUnsupported = 0;
+        uint32_t skippedMissingTags = 0;
+        uint64_t frameIndex = 0;
+    };
+    struct StreamlineReflexMarkerSummary {
+        uint32_t attempted = 0;
+        uint32_t succeeded = 0;
+        uint32_t failed = 0;
+        uint32_t skippedUnavailable = 0;
+        uint64_t frameIndex = 0;
+    };
     struct NvidiaIntegrationStatus {
         bool nrdSdkConfigured = false;
         bool nrdRequestable = false;
@@ -164,6 +284,23 @@ public:
         bool dlssFrameGenerationRequestable = false;
         bool dlssFrameGenerationAvailable = false;
         std::string dlssFrameGenerationUnavailableReason;
+        bool streamlineSdkConfigured = false;
+        bool streamlineRuntimeConfigured = false;
+        bool streamlineInitialized = false;
+        bool streamlineVulkanInfoSet = false;
+        std::string streamlineRuntimeDirectory;
+        std::string streamlineUnavailableReason;
+        StreamlineFeatureStatus streamlineDlss;
+        StreamlineFeatureStatus streamlineDlssRayReconstruction;
+        StreamlineFeatureStatus streamlineDlssFrameGeneration;
+        StreamlineFeatureStatus streamlineReflex;
+        StreamlineFeatureStatus streamlineNis;
+        StreamlineFeatureStatus streamlineNrd;
+        StreamlineTagSummary streamlineDlssTags;
+        StreamlineTagSummary streamlineDlssRayReconstructionTags;
+        StreamlineEvaluationSummary streamlineDlssEvaluation;
+        StreamlineEvaluationSummary streamlineDlssRayReconstructionEvaluation;
+        StreamlineReflexMarkerSummary streamlineReflexMarkers;
     };
     struct NrdRuntime;
     [[nodiscard]] NvidiaIntegrationStatus nvidiaIntegrationStatus() const;
@@ -693,11 +830,26 @@ private:
     };
     static_assert(sizeof(WavefrontDirectLightingValidationPush) == 16);
 
+    struct GpuSkinningPush {
+        uint32_t vertexCount = 0;
+        uint32_t jointOffset = 0;
+        uint32_t morphDeltaOffset = 0;
+        uint32_t morphDeltaCount = 0;
+        float morphWeight = 0.0f;
+        uint32_t outputOffset = 0;
+        uint32_t previousOutputOffset = 0;
+        uint32_t sourceVertexOffset = 0;
+        uint32_t flags = 0;
+    };
+    static_assert(sizeof(GpuSkinningPush) == 36);
+
     void createResolutionResources(VkExtent2D renderExtent, VkExtent2D displayExtent);
     void retireResolutionResources();
     void releaseRetiredResolutionResources();
     void updateCamera();
     void recordPathTraceGraph(VkCommandBuffer commandBuffer);
+    [[nodiscard]] RayTracingSceneBuildOptions makeRayTracingSceneBuildOptions() const;
+    [[nodiscard]] bool recordGpuSkinningPass(VkCommandBuffer commandBuffer);
     void bindWavefrontFrameResources();
     void recordPathTracePass(VkCommandBuffer commandBuffer);
     void recordRestirSpatial(VkCommandBuffer commandBuffer);
@@ -783,11 +935,34 @@ private:
     void createNrdResolutionResources();
     void initializeDlssRuntime();
     void shutdownDlssRuntime();
+    void initializeStreamlineRuntime();
+    void shutdownStreamlineRuntime();
+    [[nodiscard]] bool streamlineRequested() const;
+    bool tagStreamlineImageResource(
+        StreamlineFeature feature,
+        const char* role,
+        const Image& image,
+        VkCommandBuffer commandBuffer,
+        const char* producerPass,
+        StreamlineTagSummary* summary = nullptr);
+    bool evaluateStreamlineFeatureForCurrentFrame(
+        StreamlineFeature feature,
+        VkCommandBuffer commandBuffer,
+        const StreamlineTagSummary& tags,
+        StreamlineEvaluationSummary& evaluation,
+        const char* passName);
+    bool markStreamlineReflexLatencyBoundary(StreamlineReflexMarker marker, const char* label);
+    void recordStreamlineEvaluationCommandStateBoundary(VkCommandBuffer commandBuffer, const char* passName);
+    [[nodiscard]] bool streamlineFeatureSupported(StreamlineFeature feature) const;
     void releaseDlssFeature(bool waitIdleBeforeRelease = false);
     void releaseDlssRayReconstructionFeature(bool waitIdleBeforeRelease = false);
     [[nodiscard]] bool ensureDlssFeature(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool ensureDlssRayReconstructionFeature(VkCommandBuffer commandBuffer);
     void createStbnResources(const std::filesystem::path& shaderDirectory);
+    void createGpuSkinningResources();
+    void createGpuSkinningRayTracingBindings();
+    [[nodiscard]] bool recordGpuSkinningDispatch(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors);
+    void dispatchInitialGpuSkinningForAccelerationStructures();
     void writeStbnDescriptors(DescriptorWriter& writer) const;
     [[nodiscard]] float stbnScalarSample(int32_t x, int32_t y, uint32_t frameIndex) const;
     void fallbackBlitPostDenoiseToTemporalOutput(VkCommandBuffer commandBuffer);
@@ -826,6 +1001,7 @@ private:
     ResourceAllocator& allocator_;
     BufferUploader& uploader_;
     GpuScene scene_;
+    GpuSkinningResourcePlan gpuSkinningResourcePlan_{};
 
     VkExtent2D renderExtent_{};
     VkExtent2D displayExtent_{};
@@ -933,6 +1109,17 @@ private:
     Buffer pathDataBuffer_;
     Buffer rayTracingDiagnosticCountersBuffer_;
     Buffer rayTracingDiagnosticCountersReadbackBuffer_;
+    Buffer gpuSkinningSourceVertexBuffer_;
+    Buffer gpuSkinningMorphDeltaBuffer_;
+    Buffer gpuSkinningJointMatrixBuffer_;
+    Buffer gpuSkinningPreviousJointMatrixBuffer_;
+    Buffer gpuSkinningJointMatrixUploadBuffer_;
+    Buffer gpuSkinningPreviousJointMatrixUploadBuffer_;
+    Buffer gpuSkinningDummyMorphDeltaBuffer_;
+    Buffer gpuSkinningCurrentVertexBuffer_;
+    Buffer gpuSkinningPreviousVertexBuffer_;
+    Buffer gpuSkinningRayTracingBindingBuffer_;
+    Buffer gpuSkinningOutputReadbackBuffer_;
     Buffer wavefrontRayQueueBuffer_;
     Buffer wavefrontCompactedRayQueueBuffer_;
     Buffer wavefrontSortedRayQueueBuffer_;
@@ -983,6 +1170,7 @@ private:
     std::unique_ptr<ShaderModule> denoiserShader_;
     std::unique_ptr<ShaderModule> momentUpdateShader_;
     std::unique_ptr<ShaderModule> taaShader_;
+    std::unique_ptr<ShaderModule> gpuSkinningShader_;
     std::unique_ptr<ShaderModule> dlssGuidesShader_;
     std::unique_ptr<ShaderModule> dlssRayReconstructionGuidesShader_;
     std::unique_ptr<ShaderModule> nrdPrepareShader_;
@@ -1024,6 +1212,7 @@ private:
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
     std::unique_ptr<ComputePipeline> momentUpdatePipeline_;
     std::unique_ptr<ComputePipeline> taaPipeline_;
+    std::unique_ptr<ComputePipeline> gpuSkinningPipeline_;
     std::unique_ptr<ComputePipeline> dlssGuidesPipeline_;
     std::unique_ptr<ComputePipeline> dlssRayReconstructionGuidesPipeline_;
     std::unique_ptr<ComputePipeline> nrdPreparePipeline_;
@@ -1057,6 +1246,7 @@ private:
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout momentUpdateSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout gpuSkinningSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dlssGuidesSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dlssRayReconstructionGuidesSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout nrdPrepareSetLayout_ = VK_NULL_HANDLE;
@@ -1108,6 +1298,14 @@ private:
     VkExtent2D dlssFeatureOutputExtent_{};
     VkExtent2D dlssRayReconstructionFeatureRenderExtent_{};
     VkExtent2D dlssRayReconstructionFeatureOutputExtent_{};
+    StreamlineRuntime streamlineRuntime_;
+    bool streamlineInitializationAttempted_ = false;
+    bool streamlineFrameActive_ = false;
+    StreamlineTagSummary streamlineDlssTags_{};
+    StreamlineTagSummary streamlineDlssRayReconstructionTags_{};
+    StreamlineEvaluationSummary streamlineDlssEvaluation_{};
+    StreamlineEvaluationSummary streamlineDlssRayReconstructionEvaluation_{};
+    StreamlineReflexMarkerSummary streamlineReflexMarkers_{};
 };
 
 } // namespace rtv

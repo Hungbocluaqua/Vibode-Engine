@@ -9,11 +9,13 @@
 #include <ktxvulkan.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -25,6 +27,13 @@ constexpr uint8_t ktx2Magic[12] = {
     0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
 };
 
+constexpr uint32_t fourCc(char a, char b, char c, char d) {
+    return static_cast<uint32_t>(static_cast<unsigned char>(a)) |
+        (static_cast<uint32_t>(static_cast<unsigned char>(b)) << 8u) |
+        (static_cast<uint32_t>(static_cast<unsigned char>(c)) << 16u) |
+        (static_cast<uint32_t>(static_cast<unsigned char>(d)) << 24u);
+}
+
 [[nodiscard]] bool isKtx2File(std::string_view path) {
     std::ifstream file(std::string(path), std::ios::binary);
     if (!file) {
@@ -35,13 +44,57 @@ constexpr uint8_t ktx2Magic[12] = {
     return file.gcount() == sizeof(header) && std::memcmp(header, ktx2Magic, sizeof(ktx2Magic)) == 0;
 }
 
+[[nodiscard]] bool isDdsFile(std::string_view path) {
+    std::ifstream file(std::string(path), std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    uint8_t header[4] = {};
+    file.read(reinterpret_cast<char*>(header), sizeof(header));
+    return file.gcount() == sizeof(header) && std::memcmp(header, "DDS ", sizeof(header)) == 0;
+}
+
+[[nodiscard]] bool isKtx2Buffer(const uint8_t* data, size_t size) {
+    return data != nullptr && size >= sizeof(ktx2Magic) && std::memcmp(data, ktx2Magic, sizeof(ktx2Magic)) == 0;
+}
+
+[[nodiscard]] bool isDdsBuffer(const uint8_t* data, size_t size) {
+    return data != nullptr && size >= 4u && std::memcmp(data, "DDS ", 4u) == 0;
+}
+
+[[nodiscard]] std::string lowerAscii(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (const char c : value) {
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return out;
+}
+
+[[nodiscard]] bool endsWith(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
+}
+
 } // namespace
 
 CompressedTextureKind detectCompressedTextureKind(std::string_view path) {
+    const std::string lower = lowerAscii(path);
+    if (endsWith(lower, ".basis")) {
+        return CompressedTextureKind::BasisStandalone;
+    }
     if (isKtx2File(path)) {
         return CompressedTextureKind::Ktx2;
     }
     return CompressedTextureKind::Unknown;
+}
+
+std::string_view compressedTextureKindName(CompressedTextureKind kind) {
+    switch (kind) {
+    case CompressedTextureKind::Ktx2: return "ktx2";
+    case CompressedTextureKind::BasisStandalone: return "basis-standalone";
+    case CompressedTextureKind::Unknown:
+    default: return "unknown";
+    }
 }
 
 TextureData TextureLoader::loadRgba8(std::string_view path) {
@@ -100,14 +153,93 @@ TextureData TextureLoader::loadRgba8(std::string_view path) {
     return result;
 }
 
+TextureData TextureLoader::loadRgba8(const uint8_t* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        throw std::runtime_error("stb_image memory load failed: empty byte buffer");
+    }
+    if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("stb_image memory load failed: byte buffer is too large");
+    }
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    const int byteCount = static_cast<int>(size);
+
+    if (stbi_is_hdr_from_memory(data, byteCount)) {
+        float* loaded = stbi_loadf_from_memory(data, byteCount, &width, &height, &channels, STBI_rgb_alpha);
+        if (loaded == nullptr) {
+            throw std::runtime_error("stbi_loadf_from_memory failed");
+        }
+
+        TextureData result;
+        result.width = width;
+        result.height = height;
+        result.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        result.linearColorSpace = true;
+        const size_t byteSize = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
+        result.pixels.resize(byteSize);
+        std::memcpy(result.pixels.data(), loaded, byteSize);
+        stbi_image_free(loaded);
+        return result;
+    }
+
+    if (stbi_is_16_bit_from_memory(data, byteCount)) {
+        stbi_us* loaded = stbi_load_16_from_memory(data, byteCount, &width, &height, &channels, STBI_rgb_alpha);
+        if (loaded == nullptr) {
+            throw std::runtime_error("stbi_load_16_from_memory failed");
+        }
+
+        TextureData result;
+        result.width = width;
+        result.height = height;
+        result.format = VK_FORMAT_R16G16B16A16_UNORM;
+        const size_t byteSize = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(stbi_us);
+        result.pixels.resize(byteSize);
+        std::memcpy(result.pixels.data(), loaded, byteSize);
+        stbi_image_free(loaded);
+        return result;
+    }
+
+    unsigned char* loaded = stbi_load_from_memory(data, byteCount, &width, &height, &channels, STBI_rgb_alpha);
+    if (loaded == nullptr) {
+        throw std::runtime_error("stbi_load_from_memory failed");
+    }
+
+    TextureData result;
+    result.width = width;
+    result.height = height;
+    result.format = VK_FORMAT_R8G8B8A8_UNORM;
+    result.pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u);
+    std::memcpy(result.pixels.data(), loaded, result.pixels.size());
+    stbi_image_free(loaded);
+    return result;
+}
+
 namespace {
 
 [[nodiscard]] uint32_t readU32(const uint8_t* ptr, size_t offset) {
     return *reinterpret_cast<const uint32_t*>(ptr + offset);
 }
 
+[[nodiscard]] uint32_t blockCompressedMipBytes(uint32_t width, uint32_t height, uint32_t blockBytes) {
+    const uint32_t blocksWide = std::max(1u, (width + 3u) / 4u);
+    const uint32_t blocksHigh = std::max(1u, (height + 3u) / 4u);
+    return blocksWide * blocksHigh * blockBytes;
+}
+
 [[nodiscard]] uint64_t readU64(const uint8_t* ptr, size_t offset) {
     return *reinterpret_cast<const uint64_t*>(ptr + offset);
+}
+
+[[nodiscard]] std::string ktx2SupercompressionName(uint32_t scheme) {
+    switch (scheme) {
+    case 0: return "none";
+    case 1: return "basis-lz";
+    case 2: return "zstd";
+    case 3: return "zlib";
+    default: return "scheme-" + std::to_string(scheme);
+    }
 }
 
 [[nodiscard]] bool isBcFormat(uint32_t vkFormat) {
@@ -146,7 +278,39 @@ void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, 
     });
 }
 
-[[nodiscard]] TextureData transcodeBasisKtx2(const std::vector<uint8_t>& raw, size_t size) {
+[[nodiscard]] ktx_transcode_fmt_e ktxTargetForNativeSelection(const NativeTextureFormatSelection& selection) {
+    switch (selection.selectedFormat) {
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+        return KTX_TTF_BC7_RGBA;
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+        return KTX_TTF_BC5_RG;
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+        return KTX_TTF_BC4_R;
+    default:
+        return KTX_TTF_RGBA32;
+    }
+}
+
+[[nodiscard]] bool ktx2NeedsBasisTranscode(const uint8_t* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        return false;
+    }
+    ktxTexture2* texture = nullptr;
+    const KTX_error_code result = ktxTexture2_CreateFromMemory(
+        data,
+        size,
+        KTX_TEXTURE_CREATE_NO_FLAGS,
+        &texture);
+    if (result != KTX_SUCCESS || texture == nullptr) {
+        return false;
+    }
+    const bool needsTranscode = ktxTexture2_NeedsTranscoding(texture) == KTX_TRUE;
+    ktxTexture2_Destroy(texture);
+    return needsTranscode;
+}
+
+[[nodiscard]] TextureData transcodeBasisKtx2(const std::vector<uint8_t>& raw, size_t size, ktx_transcode_fmt_e preferredTargetFormat, bool allowLegacyBc3Fallback) {
     ktxTexture2* texture = nullptr;
     KTX_error_code result = ktxTexture2_CreateFromMemory(
         raw.data(), size,
@@ -157,9 +321,9 @@ void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, 
         throw std::runtime_error("KTX2: failed to parse Basis Universal texture");
     }
 
-    ktx_transcode_fmt_e targetFormat = KTX_TTF_BC7_RGBA;
+    ktx_transcode_fmt_e targetFormat = preferredTargetFormat;
     result = ktxTexture2_TranscodeBasis(texture, targetFormat, 0);
-    if (result != KTX_SUCCESS) {
+    if (result != KTX_SUCCESS && allowLegacyBc3Fallback) {
         targetFormat = KTX_TTF_BC3_RGBA;
         result = ktxTexture2_TranscodeBasis(texture, targetFormat, 0);
     }
@@ -184,6 +348,9 @@ void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, 
     tex.isCompressed = (targetFormat != KTX_TTF_RGBA32);
     tex.format = outFormat;
     tex.compressedFormat = outFormat;
+    tex.sourceContainerKind = "ktx2";
+    tex.nativePayloadSource = "ktx2-basisu-transcode-output";
+    tex.sourceContainerTranscoded = true;
 
     ktx_uint8_t* imageData = ktxTexture_GetData(reinterpret_cast<ktxTexture*>(texture));
     if (imageData == nullptr) {
@@ -215,9 +382,141 @@ void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, 
     return tex;
 }
 
+[[nodiscard]] TextureData transcodeBasisKtx2(const std::vector<uint8_t>& raw, size_t size) {
+    return transcodeBasisKtx2(raw, size, KTX_TTF_BC7_RGBA, true);
+}
+
 } // namespace
 
-[[nodiscard]] TextureData parseKtx2Data(const std::vector<uint8_t>& raw, std::string_view fallbackPath) {
+[[nodiscard]] TextureData parseDdsData(const std::vector<uint8_t>& raw, NativeTextureColorSpace colorSpace) {
+    if (raw.size() < 128u || std::memcmp(raw.data(), "DDS ", 4u) != 0) {
+        throw std::runtime_error("Not a DDS byte buffer");
+    }
+    if (readU32(raw.data(), 4) != 124u || readU32(raw.data(), 76) != 32u) {
+        throw std::runtime_error("DDS: unsupported header layout");
+    }
+
+    const uint32_t height = readU32(raw.data(), 12);
+    const uint32_t width = readU32(raw.data(), 16);
+    const uint32_t mipCount = std::max(readU32(raw.data(), 28), 1u);
+    const uint32_t pfFlags = readU32(raw.data(), 80);
+    const uint32_t ddsFourCc = readU32(raw.data(), 84);
+    if ((pfFlags & 0x4u) == 0u) {
+        throw std::runtime_error("DDS: only FourCC block-compressed payloads are supported");
+    }
+
+    uint32_t dataOffset = 128u;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t blockBytes = 0;
+    switch (ddsFourCc) {
+    case fourCc('D', 'X', 'T', '1'):
+        format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        blockBytes = 8u;
+        break;
+    case fourCc('D', 'X', 'T', '5'):
+        format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+        blockBytes = 16u;
+        break;
+    case fourCc('A', 'T', 'I', '2'):
+    case fourCc('B', 'C', '5', 'U'):
+        format = VK_FORMAT_BC5_UNORM_BLOCK;
+        blockBytes = 16u;
+        break;
+    case fourCc('D', 'X', '1', '0'): {
+        if (raw.size() < 148u) {
+            throw std::runtime_error("DDS: truncated DX10 header");
+        }
+        const uint32_t dxgiFormat = readU32(raw.data(), 128);
+        dataOffset = 148u;
+        switch (dxgiFormat) {
+        case 71u: format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; blockBytes = 8u; break;
+        case 72u: format = VK_FORMAT_BC1_RGBA_SRGB_BLOCK; blockBytes = 8u; break;
+        case 77u: format = VK_FORMAT_BC3_UNORM_BLOCK; blockBytes = 16u; break;
+        case 78u: format = VK_FORMAT_BC3_SRGB_BLOCK; blockBytes = 16u; break;
+        case 83u: format = VK_FORMAT_BC5_UNORM_BLOCK; blockBytes = 16u; break;
+        case 98u: format = VK_FORMAT_BC7_UNORM_BLOCK; blockBytes = 16u; break;
+        case 99u: format = VK_FORMAT_BC7_SRGB_BLOCK; blockBytes = 16u; break;
+        default: break;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    if (format == VK_FORMAT_UNDEFINED || blockBytes == 0u) {
+        throw std::runtime_error("DDS: unsupported FourCC block-compressed format");
+    }
+
+    TextureData result;
+    result.width = static_cast<int>(width);
+    result.height = static_cast<int>(height);
+    result.mipLevels = static_cast<int>(mipCount);
+    result.isCompressed = true;
+    result.format = format;
+    result.compressedFormat = format;
+    result.sourceContainerKind = "dds";
+    result.nativePayloadSource = "dds-preserved-native-payload";
+    result.sourceContainerPreserved = true;
+
+    size_t srcOffset = dataOffset;
+    for (uint32_t mip = 0; mip < mipCount; ++mip) {
+        const uint32_t mipWidth = mipExtent(width, mip);
+        const uint32_t mipHeight = mipExtent(height, mip);
+        const uint32_t mipBytes = blockCompressedMipBytes(mipWidth, mipHeight, blockBytes);
+        if (srcOffset > raw.size() || mipBytes > raw.size() - srcOffset) {
+            throw std::runtime_error("DDS: mip payload exceeds file bounds");
+        }
+        appendTextureMip(result, raw.data(), srcOffset, mipBytes, mipWidth, mipHeight, raw.size());
+        srcOffset += mipBytes;
+    }
+    result.mipLevels = std::max<int>(1, static_cast<int>(result.mipData.size()));
+    return result;
+}
+
+Ktx2ContainerInfo inspectKtx2Container(const uint8_t* data, size_t size) {
+    Ktx2ContainerInfo info;
+    if (data == nullptr || size < 80 || std::memcmp(data, ktx2Magic, sizeof(ktx2Magic)) != 0) {
+        return info;
+    }
+    info.valid = true;
+    info.vkFormat = readU32(data, 12);
+    info.width = readU32(data, 20);
+    info.height = readU32(data, 24);
+    info.levelCount = std::max(readU32(data, 40), 1u);
+    info.supercompressionScheme = readU32(data, 44);
+    const bool basisTranscodable = ktx2NeedsBasisTranscode(data, size);
+    info.basisUniversalSupercompressed = info.supercompressionScheme == 1u || basisTranscodable;
+    info.requiresTranscode = info.supercompressionScheme != 0u || info.vkFormat == VK_FORMAT_UNDEFINED;
+    info.preserveNativePayload = info.supercompressionScheme == 0u && info.vkFormat != VK_FORMAT_UNDEFINED;
+    info.supercompressionName = ktx2SupercompressionName(info.supercompressionScheme);
+    if (info.preserveNativePayload) {
+        info.policy = "preserve-native-ktx2-payload";
+    } else if (info.basisUniversalSupercompressed) {
+        info.policy = "transcode-basisu-supercompressed-ktx2";
+    } else if (info.supercompressionScheme != 0u) {
+        info.policy = "transcode-supercompressed-ktx2";
+    } else {
+        info.policy = "transcode-undefined-format-ktx2";
+    }
+    return info;
+}
+
+Ktx2ContainerInfo inspectKtx2Container(std::string_view path) {
+    std::ifstream file(std::string(path), std::ios::binary | std::ios::ate);
+    if (!file) {
+        return {};
+    }
+    const size_t size = static_cast<size_t>(file.tellg());
+    file.seekg(0);
+    std::vector<uint8_t> raw(size);
+    file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(size));
+    if (!file) {
+        return {};
+    }
+    return inspectKtx2Container(raw.data(), raw.size());
+}
+
+[[nodiscard]] TextureData parseKtx2Data(const std::vector<uint8_t>& raw, std::string_view fallbackPath, ktx_transcode_fmt_e preferredTargetFormat = KTX_TTF_BC7_RGBA, bool allowLegacyBc3Fallback = true) {
     const size_t size = raw.size();
     if (size < 80 || std::memcmp(raw.data(), ktx2Magic, sizeof(ktx2Magic)) != 0) {
         throw std::runtime_error("Not a KTX2 byte buffer");
@@ -247,9 +546,10 @@ void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, 
     static_cast<void>(sgdOffset);
     static_cast<void>(sgdLength);
 
-    if (supercompression != 0) {
+    const bool basisTranscodable = ktx2NeedsBasisTranscode(raw.data(), size);
+    if (supercompression != 0 || basisTranscodable) {
         try {
-            return transcodeBasisKtx2(raw, size);
+            return transcodeBasisKtx2(raw, size, preferredTargetFormat, allowLegacyBc3Fallback);
         } catch (const std::runtime_error& e) {
             if (!fallbackPath.empty()) {
                 fprintf(stderr, "%s. Falling back to stb_image.\n", e.what());
@@ -275,6 +575,9 @@ void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, 
         result.isCompressed = isBcFormat(vkFormat);
         result.format = static_cast<VkFormat>(vkFormat);
         result.compressedFormat = result.isCompressed ? static_cast<VkFormat>(vkFormat) : VK_FORMAT_UNDEFINED;
+        result.sourceContainerKind = "ktx2";
+        result.nativePayloadSource = "ktx2-preserved-native-payload";
+        result.sourceContainerPreserved = true;
         result.linearColorSpace = vkFormat == VK_FORMAT_R16G16B16A16_SFLOAT ||
                                   vkFormat == VK_FORMAT_R32G32B32A32_SFLOAT ||
                                   vkFormat == VK_FORMAT_R16G16B16_SFLOAT ||
@@ -330,11 +633,96 @@ TextureData TextureLoader::loadKtx2(const uint8_t* data, size_t size) {
     return parseKtx2Data(raw, {});
 }
 
+TextureData TextureLoader::loadKtx2(std::string_view path, const NativeTextureFormatSupport& formatSupport, NativeTextureRole role, NativeTextureColorSpace colorSpace) {
+    std::string filepath(path);
+    if (!isKtx2File(filepath)) {
+        throw std::runtime_error(std::string("Not a KTX2 file: ") + filepath);
+    }
+
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    const size_t size = static_cast<size_t>(file.tellg());
+    file.seekg(0);
+    std::vector<uint8_t> raw(size);
+    file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(size));
+    if (!file) {
+        throw std::runtime_error("Failed to read KTX2 file: " + filepath);
+    }
+
+    const NativeTextureFormatSelection selection = selectNativeTextureFormat(role, colorSpace, formatSupport);
+    return parseKtx2Data(raw, path, ktxTargetForNativeSelection(selection), false);
+}
+
+TextureData TextureLoader::loadKtx2(const uint8_t* data, size_t size, const NativeTextureFormatSupport& formatSupport, NativeTextureRole role, NativeTextureColorSpace colorSpace) {
+    if (data == nullptr || size == 0) {
+        throw std::runtime_error("KTX2: empty byte buffer");
+    }
+    std::vector<uint8_t> raw(data, data + size);
+    const NativeTextureFormatSelection selection = selectNativeTextureFormat(role, colorSpace, formatSupport);
+    return parseKtx2Data(raw, {}, ktxTargetForNativeSelection(selection), false);
+}
+
+TextureData loadDdsFile(std::string_view path, NativeTextureColorSpace colorSpace) {
+    std::string filepath(path);
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        throw std::runtime_error("Failed to open DDS file: " + filepath);
+    }
+    const size_t size = static_cast<size_t>(file.tellg());
+    file.seekg(0);
+    std::vector<uint8_t> raw(size);
+    file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(size));
+    if (!file) {
+        throw std::runtime_error("Failed to read DDS file: " + filepath);
+    }
+    return parseDdsData(raw, colorSpace);
+}
+
+TextureData loadDdsMemory(const uint8_t* data, size_t size, NativeTextureColorSpace colorSpace) {
+    if (data == nullptr || size == 0) {
+        throw std::runtime_error("DDS: empty byte buffer");
+    }
+    std::vector<uint8_t> raw(data, data + size);
+    return parseDdsData(raw, colorSpace);
+}
+
 TextureData TextureLoader::load(std::string_view path) {
     if (isKtx2File(std::string(path))) {
         return loadKtx2(path);
     }
+    if (isDdsFile(path)) {
+        return loadDdsFile(path, NativeTextureColorSpace::SourceDefined);
+    }
     return loadRgba8(path);
+}
+
+TextureData TextureLoader::load(const uint8_t* data, size_t size) {
+    if (isKtx2Buffer(data, size)) {
+        return loadKtx2(data, size);
+    }
+    if (isDdsBuffer(data, size)) {
+        return loadDdsMemory(data, size, NativeTextureColorSpace::SourceDefined);
+    }
+    return loadRgba8(data, size);
+}
+
+TextureData TextureLoader::load(std::string_view path, const NativeTextureFormatSupport& formatSupport, NativeTextureRole role, NativeTextureColorSpace colorSpace) {
+    if (isKtx2File(std::string(path))) {
+        return loadKtx2(path, formatSupport, role, colorSpace);
+    }
+    if (isDdsFile(path)) {
+        return loadDdsFile(path, colorSpace);
+    }
+    return loadRgba8(path);
+}
+
+TextureData TextureLoader::load(const uint8_t* data, size_t size, const NativeTextureFormatSupport& formatSupport, NativeTextureRole role, NativeTextureColorSpace colorSpace) {
+    if (isKtx2Buffer(data, size)) {
+        return loadKtx2(data, size, formatSupport, role, colorSpace);
+    }
+    if (isDdsBuffer(data, size)) {
+        return loadDdsMemory(data, size, colorSpace);
+    }
+    return loadRgba8(data, size);
 }
 
 VkFormat TextureLoader::compressedFormatFor(VkFormat baseFormat, bool srgb) {

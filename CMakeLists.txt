@@ -17,9 +17,53 @@ find_package(unofficial-spirv-reflect CONFIG REQUIRED)
 find_package(Ktx CONFIG REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
+option(RTV_ENABLE_TINYOBJ_IMPORTER "Enable OBJ/MTL runtime importer through tinyobjloader when available" OFF)
+find_path(TINYOBJLOADER_INCLUDE_DIRS "tiny_obj_loader.h"
+    HINTS
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyobjloader"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyobjloader/include")
+set(RTV_TINYOBJ_IMPORTER_AVAILABLE OFF)
+if(TINYOBJLOADER_INCLUDE_DIRS)
+    set(RTV_TINYOBJ_IMPORTER_AVAILABLE ON)
+endif()
+if(RTV_ENABLE_TINYOBJ_IMPORTER AND NOT RTV_TINYOBJ_IMPORTER_AVAILABLE)
+    message(FATAL_ERROR "RTV_ENABLE_TINYOBJ_IMPORTER is ON, but tiny_obj_loader.h was not found. Install tinyobjloader through vcpkg or set TINYOBJLOADER_INCLUDE_DIRS.")
+endif()
+
+option(RTV_ENABLE_ASSIMP_IMPORTER "Enable FBX importer dependency gate through Assimp when available" OFF)
+find_package(assimp CONFIG QUIET)
+set(RTV_ASSIMP_IMPORTER_AVAILABLE OFF)
+if(TARGET assimp::assimp)
+    set(RTV_ASSIMP_IMPORTER_AVAILABLE ON)
+endif()
+if(RTV_ENABLE_ASSIMP_IMPORTER AND NOT RTV_ASSIMP_IMPORTER_AVAILABLE)
+    message(FATAL_ERROR "RTV_ENABLE_ASSIMP_IMPORTER is ON, but Assimp was not found. Install assimp through vcpkg or configure CMAKE_PREFIX_PATH/assimp_DIR.")
+endif()
+
+option(RTV_ENABLE_OPENUSD_IMPORTER "Enable USD/USDZ importer dependency gate through OpenUSD when available" OFF)
+find_package(pxr CONFIG QUIET)
+find_path(OPENUSD_INCLUDE_DIR "pxr/usd/usd/stage.h")
+find_library(OPENUSD_USD_LIBRARY NAMES usd_usd usd USD)
+set(RTV_OPENUSD_IMPORTER_AVAILABLE OFF)
+set(RTV_OPENUSD_IMPORTER_TARGETS "")
+if(TARGET usd)
+    set(RTV_OPENUSD_IMPORTER_AVAILABLE ON)
+    set(RTV_OPENUSD_IMPORTER_TARGETS usd usdGeom usdShade usdLux)
+elseif(OPENUSD_INCLUDE_DIR AND OPENUSD_USD_LIBRARY)
+    set(RTV_OPENUSD_IMPORTER_AVAILABLE ON)
+    set(RTV_OPENUSD_IMPORTER_TARGETS ${OPENUSD_USD_LIBRARY})
+endif()
+if(RTV_ENABLE_OPENUSD_IMPORTER AND NOT RTV_OPENUSD_IMPORTER_AVAILABLE)
+    message(FATAL_ERROR "RTV_ENABLE_OPENUSD_IMPORTER is ON, but OpenUSD headers/libraries were not found. Install OpenUSD through vcpkg or configure CMAKE_PREFIX_PATH/OPENUSD_INCLUDE_DIR/OPENUSD_USD_LIBRARY.")
+endif()
+
 set(RENDERDOC_SDK_DIR "" CACHE PATH "Path to RenderDoc SDK directory")
 set(NRD_SDK_DIR "" CACHE PATH "Path to NVIDIA Real-Time Denoisers SDK/source checkout")
 set(DLSS_SDK_DIR "" CACHE PATH "Path to NVIDIA DLSS/NGX SDK directory")
+set(STREAMLINE_SDK_DIR "" CACHE PATH "Path to NVIDIA Streamline SDK/release directory")
+if(STREAMLINE_SDK_DIR STREQUAL "" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Streamline/include/sl.h")
+    set(STREAMLINE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Streamline" CACHE PATH "Path to NVIDIA Streamline SDK/release directory" FORCE)
+endif()
 
 if(NOT DEFINED ENV{VULKAN_SDK})
     message(FATAL_ERROR "VULKAN_SDK is not set. Install the Vulkan SDK and open a new terminal.")
@@ -57,6 +101,7 @@ add_executable(rtvulkan
     src/third_party/imgui/imgui_impl_vulkan.cpp
     src/main.cpp
     src/rtv/AnimationClip.cpp
+    src/rtv/AnimationController.cpp
     src/rtv/Application.cpp
     src/rtv/AccelerationStructure.cpp
     src/rtv/AsyncSceneLoader.cpp
@@ -95,11 +140,13 @@ add_executable(rtvulkan
     src/rtv/Entity.cpp
     src/rtv/EnvironmentImportanceSampler.cpp
     src/rtv/FileDialog.cpp
+    src/rtv/FrameWorkScheduler.cpp
     src/rtv/FrameResources.cpp
     src/rtv/GltfLoader.cpp
     src/rtv/GpuDiagnosticsPanel.cpp
     src/rtv/GpuProfiler.cpp
     src/rtv/GpuScene.cpp
+    src/rtv/GpuUploadTicket.cpp
     src/rtv/GpuValidation.cpp
     src/rtv/GraphicsPipeline.cpp
     src/rtv/HdrLoader.cpp
@@ -109,8 +156,15 @@ add_executable(rtvulkan
     src/rtv/InspectorPanel.cpp
     src/rtv/KeyBindings.cpp
     src/rtv/LightBvh.cpp
+    src/rtv/MainThreadApplyTicket.cpp
     src/rtv/MaterialEditorPanel.cpp
     src/rtv/MortonCodes.cpp
+    src/rtv/NativeAssetMigration.cpp
+    src/rtv/NativeAssetRuntimeLoader.cpp
+    src/rtv/NativeAssetStore.cpp
+    src/rtv/NativeBinaryIO.cpp
+    src/rtv/NativeAssetCooker.cpp
+    src/rtv/NativeTextureFormatPolicy.cpp
     src/rtv/NotificationManager.cpp
     src/rtv/OpacityMicromapPreprocess.cpp
     src/rtv/ParallelBvhBuilder.cpp
@@ -125,6 +179,8 @@ add_executable(rtvulkan
     src/rtv/RenderGraph.cpp
     src/rtv/RenderGraphDump.cpp
     src/rtv/RendererDebug.cpp
+    src/rtv/RtpkgIO.cpp
+    src/rtv/RuntimeSkeleton.cpp
     src/rtv/RayTracingPipeline.cpp
     src/rtv/RayTracingScene.cpp
     src/rtv/ResourceAllocator.cpp
@@ -135,6 +191,7 @@ add_executable(rtvulkan
     src/rtv/SceneEventBus.cpp
     src/rtv/SceneHierarchyPanel.cpp
     src/rtv/SceneOperations.cpp
+    src/rtv/ScatterPalette.cpp
     src/rtv/SceneRenderSettingsSync.cpp
     src/rtv/SceneStatsPanel.cpp
     src/rtv/SceneRegistry.cpp
@@ -146,9 +203,11 @@ add_executable(rtvulkan
     src/rtv/ShaderCompiler.cpp
     src/rtv/ShaderModule.cpp
     src/rtv/ShaderReflection.cpp
+    src/rtv/StreamlineRuntime.cpp
     src/rtv/Swapchain.cpp
     src/rtv/TextureLoader.cpp
     src/rtv/TemporalSystem.cpp
+    src/rtv/TopologyRebuildTicket.cpp
     src/rtv/UiOverlay.cpp
     src/rtv/UndoStack.cpp
     src/rtv/UploadContext.cpp
@@ -159,7 +218,44 @@ add_executable(rtvulkan
 )
 
 target_include_directories(rtvulkan PRIVATE include ${Stb_INCLUDE_DIR} ${TINYGLTF_INCLUDE_DIRS} "${IMGUI_SOURCE_DIR}" "${IMGUI_SOURCE_DIR}/backends")
-target_compile_definitions(rtvulkan PRIVATE GLFW_INCLUDE_NONE VK_NO_PROTOTYPES NOMINMAX IMGUI_IMPL_VULKAN_USE_VOLK IMGUI_IMPL_VULKAN_VOLK_FILENAME=<Volk/volk.h>)
+if(RTV_TINYOBJ_IMPORTER_AVAILABLE)
+    target_include_directories(rtvulkan PRIVATE ${TINYOBJLOADER_INCLUDE_DIRS})
+endif()
+if(RTV_ASSIMP_IMPORTER_AVAILABLE)
+    target_link_libraries(rtvulkan PRIVATE assimp::assimp)
+endif()
+if(RTV_ENABLE_OPENUSD_IMPORTER AND RTV_OPENUSD_IMPORTER_AVAILABLE)
+    if(OPENUSD_INCLUDE_DIR)
+        target_include_directories(rtvulkan PRIVATE ${OPENUSD_INCLUDE_DIR})
+    endif()
+    target_link_libraries(rtvulkan PRIVATE ${RTV_OPENUSD_IMPORTER_TARGETS})
+    if(pxr_DIR)
+        get_filename_component(RTV_OPENUSD_PREFIX "${pxr_DIR}/../.." ABSOLUTE)
+        set(RTV_OPENUSD_SCHEMA_DIR "${RTV_OPENUSD_PREFIX}/bin/usd")
+        set(RTV_OPENUSD_PLUGIN_DIR "${RTV_OPENUSD_PREFIX}/plugin/usd")
+        if(EXISTS "${RTV_OPENUSD_SCHEMA_DIR}")
+            add_custom_command(TARGET rtvulkan POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory "${RTV_OPENUSD_SCHEMA_DIR}" "$<TARGET_FILE_DIR:rtvulkan>/usd"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${RTV_OPENUSD_PLUGIN_DIR}/plugInfo.json" "$<TARGET_FILE_DIR:rtvulkan>/usd/plugInfo.json")
+        endif()
+        if(EXISTS "${RTV_OPENUSD_PLUGIN_DIR}")
+            add_custom_command(TARGET rtvulkan POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory "${RTV_OPENUSD_PLUGIN_DIR}" "$<TARGET_FILE_DIR:rtvulkan>/../plugin/usd")
+        endif()
+    endif()
+endif()
+target_compile_definitions(rtvulkan PRIVATE
+    GLFW_INCLUDE_NONE
+    VK_NO_PROTOTYPES
+    NOMINMAX
+    IMGUI_IMPL_VULKAN_USE_VOLK
+    IMGUI_IMPL_VULKAN_VOLK_FILENAME=<Volk/volk.h>
+    RTV_ENABLE_TINYOBJ_IMPORTER=$<BOOL:${RTV_ENABLE_TINYOBJ_IMPORTER}>
+    RTV_TINYOBJ_IMPORTER_AVAILABLE=$<BOOL:${RTV_TINYOBJ_IMPORTER_AVAILABLE}>
+    RTV_ENABLE_ASSIMP_IMPORTER=$<BOOL:${RTV_ENABLE_ASSIMP_IMPORTER}>
+    RTV_ASSIMP_IMPORTER_AVAILABLE=$<BOOL:${RTV_ASSIMP_IMPORTER_AVAILABLE}>
+    RTV_ENABLE_OPENUSD_IMPORTER=$<BOOL:${RTV_ENABLE_OPENUSD_IMPORTER}>
+    RTV_OPENUSD_IMPORTER_AVAILABLE=$<BOOL:${RTV_OPENUSD_IMPORTER_AVAILABLE}>)
 target_link_libraries(rtvulkan PRIVATE
     volk
     glfw
@@ -221,6 +317,133 @@ if(EXISTS "${DLSS_SDK_DIR}/include/nvsdk_ngx_vk.h" OR EXISTS "${DLSS_SDK_DIR}/in
         endforeach()
     endif()
 endif()
+
+set(RTV_STREAMLINE_INCLUDE_DIR "")
+set(RTV_STREAMLINE_RUNTIME_DIR "")
+set(RTV_STREAMLINE_RUNTIME_DLL "")
+set(RTV_STREAMLINE_IMPORT_LIB "")
+set(RTV_STREAMLINE_FEATURE_DLLS "")
+set(RTV_STREAMLINE_MISSING_OPTIONAL_PLUGINS "")
+set(RTV_STREAMLINE_HAS_DLSS OFF)
+set(RTV_STREAMLINE_HAS_DLSS_RR OFF)
+set(RTV_STREAMLINE_HAS_DLSS_FG OFF)
+set(RTV_STREAMLINE_HAS_REFLEX OFF)
+set(RTV_STREAMLINE_HAS_NIS OFF)
+set(RTV_STREAMLINE_HAS_NRD OFF)
+if(NOT STREAMLINE_SDK_DIR STREQUAL "")
+    foreach(CANDIDATE IN ITEMS
+        "${STREAMLINE_SDK_DIR}/include"
+        "${STREAMLINE_SDK_DIR}/inc")
+        if(EXISTS "${CANDIDATE}/sl.h" AND EXISTS "${CANDIDATE}/sl_consts.h")
+            set(RTV_STREAMLINE_INCLUDE_DIR "${CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+
+    foreach(CANDIDATE IN ITEMS
+        "${STREAMLINE_SDK_DIR}/bin/x64"
+        "${STREAMLINE_SDK_DIR}/bin"
+        "${STREAMLINE_SDK_DIR}/lib/x64"
+        "${STREAMLINE_SDK_DIR}/lib/Windows_x86_64")
+        if(EXISTS "${CANDIDATE}/sl.interposer.dll")
+            set(RTV_STREAMLINE_RUNTIME_DIR "${CANDIDATE}")
+            set(RTV_STREAMLINE_RUNTIME_DLL "${CANDIDATE}/sl.interposer.dll")
+            break()
+        endif()
+    endforeach()
+
+    foreach(CANDIDATE IN ITEMS
+        "${STREAMLINE_SDK_DIR}/lib/x64/sl.interposer.lib"
+        "${STREAMLINE_SDK_DIR}/lib/Windows_x86_64/sl.interposer.lib"
+        "${STREAMLINE_SDK_DIR}/bin/x64/sl.interposer.lib")
+        if(EXISTS "${CANDIDATE}")
+            set(RTV_STREAMLINE_IMPORT_LIB "${CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+
+    foreach(PLUGIN IN ITEMS sl.dlss.dll sl.dlss_d.dll sl.dlss_g.dll sl.reflex.dll sl.nis.dll sl.nrd.dll sl.common.dll)
+        if(NOT RTV_STREAMLINE_RUNTIME_DIR STREQUAL "" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/${PLUGIN}")
+            list(APPEND RTV_STREAMLINE_FEATURE_DLLS "${RTV_STREAMLINE_RUNTIME_DIR}/${PLUGIN}")
+        else()
+            list(APPEND RTV_STREAMLINE_MISSING_OPTIONAL_PLUGINS "${PLUGIN}")
+        endif()
+    endforeach()
+
+    set(RTV_STREAMLINE_HAS_DLSS OFF)
+    set(RTV_STREAMLINE_HAS_DLSS_RR OFF)
+    set(RTV_STREAMLINE_HAS_DLSS_FG OFF)
+    set(RTV_STREAMLINE_HAS_REFLEX OFF)
+    set(RTV_STREAMLINE_HAS_NIS OFF)
+    set(RTV_STREAMLINE_HAS_NRD OFF)
+    if(NOT RTV_STREAMLINE_INCLUDE_DIR STREQUAL "" AND NOT RTV_STREAMLINE_RUNTIME_DIR STREQUAL "")
+        if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_dlss.h" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.dlss.dll")
+            set(RTV_STREAMLINE_HAS_DLSS ON)
+        endif()
+        if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_dlss_d.h" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.dlss_d.dll")
+            set(RTV_STREAMLINE_HAS_DLSS_RR ON)
+        endif()
+        if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_dlss_g.h" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.dlss_g.dll")
+            set(RTV_STREAMLINE_HAS_DLSS_FG ON)
+        endif()
+        if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_reflex.h" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.reflex.dll")
+            set(RTV_STREAMLINE_HAS_REFLEX ON)
+        endif()
+        if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_nis.h" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.nis.dll")
+            set(RTV_STREAMLINE_HAS_NIS ON)
+        endif()
+        if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_nrd.h" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.nrd.dll")
+            set(RTV_STREAMLINE_HAS_NRD ON)
+        endif()
+    endif()
+
+    if(NOT RTV_STREAMLINE_INCLUDE_DIR STREQUAL "")
+        target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_SDK_CONFIGURED=1)
+        target_include_directories(rtvulkan PRIVATE "${RTV_STREAMLINE_INCLUDE_DIR}")
+        if(RTV_STREAMLINE_HAS_DLSS)
+            target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_HAS_DLSS=1)
+        endif()
+        if(RTV_STREAMLINE_HAS_DLSS_RR)
+            target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_HAS_DLSS_RR=1)
+        endif()
+        if(RTV_STREAMLINE_HAS_DLSS_FG)
+            target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_HAS_DLSS_FG=1)
+        endif()
+        if(RTV_STREAMLINE_HAS_REFLEX)
+            target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_HAS_REFLEX=1)
+        endif()
+        if(RTV_STREAMLINE_HAS_NIS)
+            target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_HAS_NIS=1)
+        endif()
+        if(RTV_STREAMLINE_HAS_NRD)
+            target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_HAS_NRD=1)
+        endif()
+    endif()
+
+    if(NOT RTV_STREAMLINE_RUNTIME_DLL STREQUAL "")
+        target_compile_definitions(rtvulkan PRIVATE
+            RTV_STREAMLINE_RUNTIME_ENABLED=1
+            "RTV_STREAMLINE_RUNTIME_DIR=\"${RTV_STREAMLINE_RUNTIME_DIR}\"")
+        add_custom_command(TARGET rtvulkan POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${RTV_STREAMLINE_RUNTIME_DLL}"
+                "$<TARGET_FILE_DIR:rtvulkan>/sl.interposer.dll")
+        foreach(PLUGIN_DLL IN LISTS RTV_STREAMLINE_FEATURE_DLLS)
+            get_filename_component(PLUGIN_NAME "${PLUGIN_DLL}" NAME)
+            add_custom_command(TARGET rtvulkan POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${PLUGIN_DLL}"
+                    "$<TARGET_FILE_DIR:rtvulkan>/${PLUGIN_NAME}")
+        endforeach()
+    endif()
+endif()
+
+message(STATUS "Streamline SDK include dir: ${RTV_STREAMLINE_INCLUDE_DIR}")
+message(STATUS "Streamline runtime dll: ${RTV_STREAMLINE_RUNTIME_DLL}")
+message(STATUS "Streamline import lib: ${RTV_STREAMLINE_IMPORT_LIB}")
+message(STATUS "Streamline feature dlls: ${RTV_STREAMLINE_FEATURE_DLLS}")
+message(STATUS "Streamline feature flags: DLSS=${RTV_STREAMLINE_HAS_DLSS}; DLSS_RR=${RTV_STREAMLINE_HAS_DLSS_RR}; DLSS_FG=${RTV_STREAMLINE_HAS_DLSS_FG}; Reflex=${RTV_STREAMLINE_HAS_REFLEX}; NIS=${RTV_STREAMLINE_HAS_NIS}; NRD=${RTV_STREAMLINE_HAS_NRD}")
+message(STATUS "Streamline missing optional plugins: ${RTV_STREAMLINE_MISSING_OPTIONAL_PLUGINS}")
 
 if(WIN32)
     target_link_libraries(rtvulkan PRIVATE Comdlg32 User32 Shell32 Dwmapi)

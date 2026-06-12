@@ -117,6 +117,15 @@ void Image::resize(uint32_t width, uint32_t height) {
     create(allocator, next);
 }
 
+VkDeviceMemory Image::deviceMemory() const {
+    if (allocator_ == nullptr || allocation_ == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+    VmaAllocationInfo allocationInfo{};
+    vmaGetAllocationInfo(allocator_->handle(), allocation_, &allocationInfo);
+    return allocationInfo.deviceMemory;
+}
+
 VkImageSubresourceRange Image::fullRange() const {
     VkImageSubresourceRange range{};
     range.aspectMask = desc_.aspect;

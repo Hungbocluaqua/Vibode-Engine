@@ -23,6 +23,7 @@ struct RendererSettings {
     TemporalUpscaler temporalUpscaler = TemporalUpscaler::TaaTsr;
     bool dlssFrameGenerationEnabled = false;
     bool dlssRayReconstructionEnabled = false;
+    bool streamlineReflexEnabled = false;
     float dlssSharpeningStrength = 0.0f;
     float taaFeedback = 0.06f;
     float taaMotionFeedback = 0.90f;
@@ -144,6 +145,7 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
     settings.temporalUpscaler = TemporalUpscaler::TaaTsr;
     settings.dlssFrameGenerationEnabled = false;
     settings.dlssRayReconstructionEnabled = false;
+    settings.streamlineReflexEnabled = false;
     settings.dlssSharpeningStrength = 0.0f;
     settings.restirMode = RestirMode::RestirOnly;
     settings.restirGiEnabled = true;

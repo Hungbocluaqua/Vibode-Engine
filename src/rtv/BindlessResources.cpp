@@ -44,6 +44,7 @@ BindlessTextureTable& BindlessTextureTable::operator=(BindlessTextureTable&& oth
     if (this != &other) {
         images_ = std::move(other.images_);
         descriptors_ = std::move(other.descriptors_);
+        registrations_ = std::move(other.registrations_);
         slotCount_ = other.slotCount_;
         allocator_ = std::move(other.allocator_);
         other.slotCount_ = 0;
@@ -56,11 +57,19 @@ void BindlessTextureTable::setImages(std::vector<std::unique_ptr<Image>> images,
     slotCount_ = std::max(slotCount, 1u);
     rebuildAllocator();
     rebuildDescriptors();
+    if (registrations_.size() > slotCount_) {
+        registrations_.resize(slotCount_);
+    }
+}
+
+void BindlessTextureTable::setRegistrationInfo(std::vector<BindlessTextureRegistrationInfo> registrations) {
+    registrations_ = std::move(registrations);
 }
 
 void BindlessTextureTable::clear() {
     images_.clear();
     descriptors_.clear();
+    registrations_.clear();
     slotCount_ = 0;
     allocator_.clear();
 }

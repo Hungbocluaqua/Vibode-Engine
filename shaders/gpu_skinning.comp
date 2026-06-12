@@ -1,0 +1,130 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+struct SkinningVertex {
+    vec4 position_uv_x;
+    vec4 normal_uv_y;
+    vec4 tangent;
+    vec4 color;
+    vec4 texcoord1;
+    uvec4 joints;
+    vec4 weights;
+};
+
+struct SkinnedVertex {
+    vec4 position_uv_x;
+    vec4 normal_uv_y;
+    vec4 tangent;
+    vec4 color;
+    vec4 texcoord1;
+};
+
+layout(push_constant) uniform SkinningParams {
+    uint vertex_count;
+    uint joint_offset;
+    uint morph_delta_offset;
+    uint morph_delta_count;
+    float morph_weight;
+    uint output_offset;
+    uint previous_output_offset;
+    uint source_vertex_offset;
+    uint flags;
+} params;
+
+layout(set = 0, binding = 0, std430) readonly buffer SourceVertices {
+    SkinningVertex source_vertices[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer CurrentJointMatrices {
+    mat4 current_joint_matrices[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer PreviousJointMatrices {
+    mat4 previous_joint_matrices[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer MorphDeltas {
+    SkinnedVertex morph_deltas[];
+};
+
+layout(set = 0, binding = 4, std430) writeonly buffer CurrentOutputVertices {
+    SkinnedVertex current_output_vertices[];
+};
+
+layout(set = 0, binding = 5, std430) writeonly buffer PreviousOutputVertices {
+    SkinnedVertex previous_output_vertices[];
+};
+
+vec3 safe_normalize(vec3 value, vec3 fallback) {
+    float len2 = dot(value, value);
+    return len2 > 1.0e-10 ? value * inversesqrt(len2) : fallback;
+}
+
+SkinnedVertex apply_morph(uint vertex_index, SkinningVertex source) {
+    SkinnedVertex result;
+    result.position_uv_x = source.position_uv_x;
+    result.normal_uv_y = source.normal_uv_y;
+    result.tangent = source.tangent;
+    result.color = source.color;
+    result.texcoord1 = source.texcoord1;
+
+    if (params.morph_delta_count == 0u || params.morph_weight == 0.0) {
+        return result;
+    }
+
+    uint morph_index = params.morph_delta_offset + vertex_index;
+    SkinnedVertex delta = morph_deltas[morph_index];
+    result.position_uv_x.xyz += delta.position_uv_x.xyz * params.morph_weight;
+    result.normal_uv_y.xyz += delta.normal_uv_y.xyz * params.morph_weight;
+    result.tangent.xyz += delta.tangent.xyz * params.morph_weight;
+    return result;
+}
+
+SkinnedVertex skin_vertex(SkinningVertex source, SkinnedVertex morphed, bool previous) {
+    vec3 position = vec3(0.0);
+    vec3 normal = vec3(0.0);
+    vec3 tangent = vec3(0.0);
+    float total_weight = 0.0;
+
+    for (uint influence = 0u; influence < 4u; ++influence) {
+        float weight = source.weights[influence];
+        uint joint_index = source.joints[influence];
+        if (weight <= 0.0) {
+            continue;
+        }
+        mat4 skin_matrix = previous
+            ? previous_joint_matrices[params.joint_offset + joint_index]
+            : current_joint_matrices[params.joint_offset + joint_index];
+        mat3 normal_matrix = mat3(skin_matrix);
+        position += (skin_matrix * vec4(morphed.position_uv_x.xyz, 1.0)).xyz * weight;
+        normal += normal_matrix * morphed.normal_uv_y.xyz * weight;
+        tangent += normal_matrix * morphed.tangent.xyz * weight;
+        total_weight += weight;
+    }
+
+    SkinnedVertex result = morphed;
+    if (total_weight > 1.0e-6) {
+        result.position_uv_x.xyz = position;
+        result.normal_uv_y.xyz = safe_normalize(normal, morphed.normal_uv_y.xyz);
+        tangent -= result.normal_uv_y.xyz * dot(result.normal_uv_y.xyz, tangent);
+        result.tangent.xyz = safe_normalize(tangent, morphed.tangent.xyz);
+        result.tangent.w = morphed.tangent.w < 0.0 ? -1.0 : 1.0;
+    }
+    return result;
+}
+
+void main() {
+    uint vertex_index = gl_GlobalInvocationID.x;
+    if (vertex_index >= params.vertex_count) {
+        return;
+    }
+
+    SkinningVertex source = source_vertices[params.source_vertex_offset + vertex_index];
+    SkinnedVertex morphed = apply_morph(vertex_index, source);
+    current_output_vertices[params.output_offset + vertex_index] = skin_vertex(source, morphed, false);
+
+    if ((params.flags & 1u) != 0u) {
+        previous_output_vertices[params.previous_output_offset + vertex_index] = skin_vertex(source, morphed, true);
+    }
+}

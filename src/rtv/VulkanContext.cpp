@@ -5,6 +5,10 @@
 #include <Volk/volk.h>
 #include <GLFW/glfw3.h>
 
+#if defined(RTV_STREAMLINE_SDK_CONFIGURED)
+#include <sl_helpers_vk.h>
+#endif
+
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -54,6 +58,38 @@ const char* serReorderingHintName(VkRayTracingInvocationReorderModeNV hint) {
     }
 }
 
+void appendUniqueExtension(std::vector<const char*>& extensions, const char* extension) {
+    if (extension == nullptr || extension[0] == '\0') {
+        return;
+    }
+    if (std::find(extensions.begin(), extensions.end(), extension) == extensions.end()) {
+        extensions.push_back(extension);
+    }
+}
+
+std::vector<VkExtensionProperties> availableInstanceExtensions() {
+    uint32_t count = 0;
+    checkVk(vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr), "vkEnumerateInstanceExtensionProperties(count)");
+    std::vector<VkExtensionProperties> available(count);
+    checkVk(vkEnumerateInstanceExtensionProperties(nullptr, &count, available.data()), "vkEnumerateInstanceExtensionProperties");
+    return available;
+}
+
+bool extensionAvailable(const std::vector<VkExtensionProperties>& available, const char* extensionName) {
+    return std::any_of(available.begin(), available.end(), [&](const VkExtensionProperties& extension) {
+        return std::strcmp(extension.extensionName, extensionName) == 0;
+    });
+}
+
+std::vector<const char*> cStringView(const std::vector<std::string>& values) {
+    std::vector<const char*> result;
+    result.reserve(values.size());
+    for (const std::string& value : values) {
+        result.push_back(value.c_str());
+    }
+    return result;
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT,
@@ -84,6 +120,7 @@ VkDebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo() {
 VulkanContext::VulkanContext(GLFWwindow* window) {
     headless_ = false;
     checkVk(volkInitialize(), "volkInitialize");
+    streamlineVulkanRequirements_ = StreamlineRuntime::collectVulkanRequirements();
     createInstance(window);
     volkLoadInstance(instance_);
     createDebugMessenger();
@@ -159,6 +196,7 @@ VulkanContext::VulkanContext(bool headless) {
 std::unique_ptr<VulkanContext> VulkanContext::createHeadless() {
     auto context = std::unique_ptr<VulkanContext>(new VulkanContext(true));
     checkVk(volkInitialize(), "volkInitialize");
+    context->streamlineVulkanRequirements_ = StreamlineRuntime::collectVulkanRequirements();
     context->createInstance(nullptr);
     volkLoadInstance(context->instance_);
     context->createDebugMessenger();
@@ -310,6 +348,14 @@ void VulkanContext::pickPhysicalDevice() {
 
 void VulkanContext::createDevice() {
     std::map<uint32_t, uint32_t> queueCounts;
+    uint32_t queueCountForFamily = 0;
+    auto availableQueuesForFamily = [&](uint32_t family) {
+        uint32_t queueFamilyCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_, &queueFamilyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> families(queueFamilyCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_, &queueFamilyCount, families.data());
+        return family < families.size() ? families[family].queueCount : 0u;
+    };
     auto requireQueue = [&](uint32_t family, uint32_t queueIndex) {
         queueCounts[family] = std::max(queueCounts[family], queueIndex + 1u);
     };
@@ -317,6 +363,18 @@ void VulkanContext::createDevice() {
     requireQueue(queueFamilies_.present.value(), 0);
     if (queueFamilies_.compute.has_value()) {
         requireQueue(queueFamilies_.compute.value(), queueFamilies_.computeQueueIndex);
+    }
+    if (streamlineVulkanRequirements_.initialized) {
+        if (streamlineVulkanRequirements_.graphicsQueuesRequired > 0u) {
+            queueCountForFamily = availableQueuesForFamily(queueFamilies_.graphics.value());
+            const uint32_t requestedIndex = std::min(streamlineVulkanRequirements_.graphicsQueuesRequired - 1u, queueCountForFamily > 0u ? queueCountForFamily - 1u : 0u);
+            requireQueue(queueFamilies_.graphics.value(), requestedIndex);
+        }
+        if (streamlineVulkanRequirements_.computeQueuesRequired > 0u && queueFamilies_.compute.has_value()) {
+            queueCountForFamily = availableQueuesForFamily(queueFamilies_.compute.value());
+            const uint32_t requestedIndex = std::min(streamlineVulkanRequirements_.computeQueuesRequired - 1u, queueCountForFamily > 0u ? queueCountForFamily - 1u : 0u);
+            requireQueue(queueFamilies_.compute.value(), requestedIndex);
+        }
     }
 
     std::vector<VkDeviceQueueCreateInfo> queueInfos;
@@ -337,6 +395,22 @@ void VulkanContext::createDevice() {
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
+
+#if defined(RTV_STREAMLINE_SDK_CONFIGURED)
+    if (streamlineVulkanRequirements_.initialized && !streamlineVulkanRequirements_.features13.empty()) {
+        std::vector<const char*> featureNames = cStringView(streamlineVulkanRequirements_.features13);
+        features13 = sl::getVkPhysicalDeviceVulkan13Features(static_cast<uint32_t>(featureNames.size()), featureNames.data());
+        features13.dynamicRendering = VK_TRUE;
+        features13.synchronization2 = VK_TRUE;
+    }
+    VkPhysicalDeviceVulkan12Features streamlineFeatures12{};
+    bool enableStreamlineFeatures12 = false;
+    if (streamlineVulkanRequirements_.initialized && !streamlineVulkanRequirements_.features12.empty()) {
+        std::vector<const char*> featureNames = cStringView(streamlineVulkanRequirements_.features12);
+        streamlineFeatures12 = sl::getVkPhysicalDeviceVulkan12Features(static_cast<uint32_t>(featureNames.size()), featureNames.data());
+        enableStreamlineFeatures12 = true;
+    }
+#endif
 
     VkPhysicalDeviceTimelineSemaphoreFeatures timelineSupport{};
     timelineSupport.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
@@ -466,6 +540,13 @@ void VulkanContext::createDevice() {
         featureTail = &storage8BitFeatures;
     }
 
+#if defined(RTV_STREAMLINE_SDK_CONFIGURED)
+    if (enableStreamlineFeatures12) {
+        streamlineFeatures12.pNext = featureTail;
+        featureTail = &streamlineFeatures12;
+    }
+#endif
+
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.features.shaderFloat64 = VK_TRUE;
@@ -509,6 +590,16 @@ void VulkanContext::createDevice() {
         }
     }
 #endif
+    if (streamlineVulkanRequirements_.initialized) {
+        for (const std::string& extension : streamlineVulkanRequirements_.deviceExtensions) {
+            if (deviceSupportsExtension(physicalDevice_, extension.c_str())) {
+                appendUniqueExtension(enabledExtensions, extension.c_str());
+                std::cout << "Streamline Vulkan device extension enabled: " << extension << '\n';
+            } else {
+                std::cout << "Streamline Vulkan device extension unavailable: " << extension << '\n';
+            }
+        }
+    }
     createInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
     createInfo.ppEnabledExtensionNames = enabledExtensions.data();
 
@@ -555,9 +646,20 @@ bool VulkanContext::validationAvailable() const {
 std::vector<const char*> VulkanContext::requiredInstanceExtensions(GLFWwindow* window) const {
     (void)window;
     std::vector<const char*> extensions;
+    const std::vector<VkExtensionProperties> availableExtensions = availableInstanceExtensions();
     if (headless_) {
         if (validationRequested()) {
             extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
+        if (streamlineVulkanRequirements_.initialized) {
+            for (const std::string& extension : streamlineVulkanRequirements_.instanceExtensions) {
+                if (extensionAvailable(availableExtensions, extension.c_str())) {
+                    appendUniqueExtension(extensions, extension.c_str());
+                    std::cout << "Streamline Vulkan instance extension enabled: " << extension << '\n';
+                } else {
+                    std::cout << "Streamline Vulkan instance extension unavailable: " << extension << '\n';
+                }
+            }
         }
         return extensions;
     }
@@ -571,6 +673,16 @@ std::vector<const char*> VulkanContext::requiredInstanceExtensions(GLFWwindow* w
     extensions.assign(glfwExtensions, glfwExtensions + glfwExtensionCount);
     if (validationRequested()) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+    if (streamlineVulkanRequirements_.initialized) {
+        for (const std::string& extension : streamlineVulkanRequirements_.instanceExtensions) {
+            if (extensionAvailable(availableExtensions, extension.c_str())) {
+                appendUniqueExtension(extensions, extension.c_str());
+                std::cout << "Streamline Vulkan instance extension enabled: " << extension << '\n';
+            } else {
+                std::cout << "Streamline Vulkan instance extension unavailable: " << extension << '\n';
+            }
+        }
     }
     return extensions;
 }

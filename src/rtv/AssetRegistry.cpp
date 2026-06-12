@@ -131,6 +131,8 @@ const char* assetTypeName(AssetType type) {
     case AssetType::Prefab: return "Prefab";
     case AssetType::Animation: return "Animation";
     case AssetType::Skeleton: return "Skeleton";
+    case AssetType::SkeletalMesh: return "SkeletalMesh";
+    case AssetType::AnimationController: return "AnimationController";
     case AssetType::Unknown: default: return "Unknown";
     }
 }
@@ -144,6 +146,8 @@ AssetType assetTypeFromName(const std::string& name) {
     if (name == "Prefab") return AssetType::Prefab;
     if (name == "Animation") return AssetType::Animation;
     if (name == "Skeleton") return AssetType::Skeleton;
+    if (name == "SkeletalMesh") return AssetType::SkeletalMesh;
+    if (name == "AnimationController") return AssetType::AnimationController;
     return AssetType::Unknown;
 }
 

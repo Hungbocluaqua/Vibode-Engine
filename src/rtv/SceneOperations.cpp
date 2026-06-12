@@ -1,8 +1,10 @@
 #include "rtv/SceneOperations.h"
 
+#include "rtv/EditorPanels.h"
 #include "rtv/SunController.h"
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <utility>
 
@@ -83,6 +85,9 @@ SceneUpdateMask entityRemovalUpdateMask(const SceneDocument& document, const Ent
     }
     if (entity.animationPlayer.has_value()) {
         mask |= SceneUpdateMaskTransform;
+    }
+    if (entity.levelInstance.has_value()) {
+        mask |= SceneUpdateMaskTopology;
     }
     for (EntityId childId : entity.children) {
         if (const Entity* child = document.registry().entity(childId)) {
@@ -206,6 +211,52 @@ SceneUpdateKind transformUpdateKind(const SceneDocument& document, const Entity&
         return SceneUpdateKind::LightOnly;
     }
     return SceneUpdateKind::TransformOnly;
+}
+
+int alignDistributeAxisIndex(EditorAlignDistributeAxis axis) {
+    switch (axis) {
+    case EditorAlignDistributeAxis::X: return 0;
+    case EditorAlignDistributeAxis::Y: return 1;
+    case EditorAlignDistributeAxis::Z: return 2;
+    }
+    return 0;
+}
+
+const char* alignDistributeUndoLabel(EditorAlignDistributeMode mode) {
+    return mode == EditorAlignDistributeMode::DistributeSpacing ? "Distribute Entities" : "Align Entities";
+}
+
+glm::mat4 sceneOperationEntityWorldMatrix(const SceneRegistry& registry, const Entity& entity) {
+    if (!entity.parent.valid()) {
+        return entity.transform.localMatrix();
+    }
+    const Entity* parent = registry.entity(entity.parent);
+    if (parent == nullptr) {
+        return entity.transform.localMatrix();
+    }
+    return sceneOperationEntityWorldMatrix(registry, *parent) * entity.transform.localMatrix();
+}
+
+glm::mat4 sceneOperationParentWorldMatrix(const SceneRegistry& registry, const Entity& entity) {
+    const Entity* parent = registry.entity(entity.parent);
+    return parent != nullptr ? sceneOperationEntityWorldMatrix(registry, *parent) : glm::mat4{1.0f};
+}
+
+bool finiteBounds(const glm::vec3& minBounds, const glm::vec3& maxBounds) {
+    return std::isfinite(minBounds.x) && std::isfinite(minBounds.y) && std::isfinite(minBounds.z) &&
+        std::isfinite(maxBounds.x) && std::isfinite(maxBounds.y) && std::isfinite(maxBounds.z) &&
+        minBounds.x <= maxBounds.x && minBounds.y <= maxBounds.y && minBounds.z <= maxBounds.z;
+}
+
+void applyWorldAxisDelta(SceneRegistry& registry, Entity& entity, int component, float delta) {
+    if (delta == 0.0f) {
+        return;
+    }
+    glm::vec3 worldDelta{0.0f};
+    worldDelta[component] = delta;
+    const glm::mat4 parentWorld = sceneOperationParentWorldMatrix(registry, entity);
+    const glm::vec3 localDelta = glm::vec3(glm::inverse(parentWorld) * glm::vec4(worldDelta, 0.0f));
+    entity.transform.position += localDelta;
 }
 
 class SceneDocumentSnapshotCommand final : public ICommand {
@@ -538,6 +589,189 @@ void SceneOperations::setTransformGizmoDrag(EntityId id, const Transform& oldTra
     }
 }
 
+bool SceneOperations::setTransformGizmoDragBatch(const std::vector<EditorEntityTransformChange>& changes) {
+    if (changes.empty()) {
+        return false;
+    }
+
+    struct EditableChange {
+        EntityId id{};
+        Transform oldTransform{};
+        Transform newTransform{};
+    };
+
+    std::vector<EditableChange> editable;
+    editable.reserve(changes.size());
+    for (const EditorEntityTransformChange& change : changes) {
+        if (!change.entity.valid() ||
+            std::find_if(editable.begin(), editable.end(), [&](const EditableChange& item) { return item.id == change.entity; }) != editable.end()) {
+            continue;
+        }
+        Entity* entity = document_.registry().entity(change.entity);
+        if (entity == nullptr || entity->locked) {
+            continue;
+        }
+        editable.push_back({change.entity, change.oldTransform, change.newTransform});
+    }
+    if (editable.empty()) {
+        return false;
+    }
+
+    for (const EditableChange& change : editable) {
+        if (Entity* entity = document_.registry().entity(change.id)) {
+            entity->transform = change.oldTransform;
+        }
+    }
+    const SceneDocument before = document_;
+
+    SceneUpdateMask updateMask = SceneUpdateMaskNone;
+    std::vector<EntityId> changed;
+    changed.reserve(editable.size());
+    for (const EditableChange& change : editable) {
+        Entity* entity = document_.registry().entity(change.id);
+        if (entity == nullptr || entity->locked) {
+            continue;
+        }
+        entity->transform = change.newTransform;
+        entity->transform.dirty = true;
+        updateMask |= sceneUpdateKindMask(transformUpdateKind(document_, *entity));
+        changed.push_back(entity->id);
+    }
+
+    if (changed.empty() || updateMask == SceneUpdateMaskNone) {
+        return false;
+    }
+
+    document_.markDirty(updateMask);
+    for (EntityId id : changed) {
+        publish({SceneEventType::TransformChanged, id, {}, sceneUpdateKindFromMask(updateMask)});
+    }
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, updateMask, "Transform Entities"));
+    }
+    return true;
+}
+
+bool SceneOperations::alignDistributeEntities(
+    const std::vector<EntityId>& ids,
+    const std::vector<EditorAlignDistributeEntityBounds>& bounds,
+    EditorAlignDistributeAxis axis,
+    EditorAlignDistributeMode mode) {
+    struct EditableEntity {
+        EntityId id{};
+        Entity* entity = nullptr;
+        glm::vec3 minBounds{0.0f};
+        glm::vec3 maxBounds{0.0f};
+    };
+
+    std::vector<EditableEntity> editable;
+    editable.reserve(ids.size());
+    for (EntityId id : ids) {
+        if (!id.valid() || std::find_if(editable.begin(), editable.end(), [&](const EditableEntity& item) { return item.id == id; }) != editable.end()) {
+            continue;
+        }
+        Entity* entity = document_.registry().entity(id);
+        if (entity == nullptr || entity->locked) {
+            continue;
+        }
+        const auto boundsIt = std::find_if(bounds.begin(), bounds.end(), [&](const EditorAlignDistributeEntityBounds& item) {
+            return item.available && item.entity == id && finiteBounds(item.min, item.max);
+        });
+        if (boundsIt != bounds.end()) {
+            editable.push_back({id, entity, boundsIt->min, boundsIt->max});
+        } else {
+            const glm::vec3 worldPosition = translationFromMatrix(sceneOperationEntityWorldMatrix(document_.registry(), *entity));
+            editable.push_back({id, entity, worldPosition, worldPosition});
+        }
+    }
+
+    if (editable.size() < 2 || (mode == EditorAlignDistributeMode::DistributeSpacing && editable.size() < 3)) {
+        return false;
+    }
+
+    const int component = alignDistributeAxisIndex(axis);
+    SceneUpdateMask updateMask = SceneUpdateMaskNone;
+    std::vector<EntityId> changed;
+    changed.reserve(editable.size());
+    const SceneDocument before = document_;
+
+    auto recordChanged = [&](Entity& entity) {
+        entity.transform.dirty = true;
+        updateMask |= sceneUpdateKindMask(transformUpdateKind(document_, entity));
+        changed.push_back(entity.id);
+    };
+
+    if (mode == EditorAlignDistributeMode::DistributeSpacing) {
+        std::sort(editable.begin(), editable.end(), [&](const EditableEntity& a, const EditableEntity& b) {
+            const float aCenter = (a.minBounds[component] + a.maxBounds[component]) * 0.5f;
+            const float bCenter = (b.minBounds[component] + b.maxBounds[component]) * 0.5f;
+            return aCenter < bCenter;
+        });
+
+        const float firstMin = editable.front().minBounds[component];
+        const float lastMax = editable.back().maxBounds[component];
+        float totalWidth = 0.0f;
+        for (const EditableEntity& item : editable) {
+            totalWidth += item.maxBounds[component] - item.minBounds[component];
+        }
+        const float gap = (lastMax - firstMin - totalWidth) / static_cast<float>(editable.size() - 1u);
+        float nextMin = editable.front().maxBounds[component] + gap;
+        for (size_t i = 1; i + 1 < editable.size(); ++i) {
+            Entity& entity = *editable[i].entity;
+            const float delta = nextMin - editable[i].minBounds[component];
+            if (delta != 0.0f) {
+                applyWorldAxisDelta(document_.registry(), entity, component, delta);
+                recordChanged(entity);
+            }
+            nextMin += editable[i].maxBounds[component] - editable[i].minBounds[component] + gap;
+        }
+    } else {
+        float minPosition = editable.front().minBounds[component];
+        float maxPosition = editable.front().maxBounds[component];
+        for (const EditableEntity& item : editable) {
+            minPosition = std::min(minPosition, item.minBounds[component]);
+            maxPosition = std::max(maxPosition, item.maxBounds[component]);
+        }
+
+        float target = minPosition;
+        if (mode == EditorAlignDistributeMode::AlignCenter) {
+            target = (minPosition + maxPosition) * 0.5f;
+        } else if (mode == EditorAlignDistributeMode::AlignMax) {
+            target = maxPosition;
+        }
+
+        for (const EditableEntity& item : editable) {
+            Entity& entity = *item.entity;
+            float current = item.minBounds[component];
+            if (mode == EditorAlignDistributeMode::AlignCenter) {
+                current = (item.minBounds[component] + item.maxBounds[component]) * 0.5f;
+            } else if (mode == EditorAlignDistributeMode::AlignMax) {
+                current = item.maxBounds[component];
+            }
+            const float delta = target - current;
+            if (delta != 0.0f) {
+                applyWorldAxisDelta(document_.registry(), entity, component, delta);
+                recordChanged(entity);
+            }
+        }
+    }
+
+    if (changed.empty() || updateMask == SceneUpdateMaskNone) {
+        return false;
+    }
+
+    document_.markDirty(updateMask);
+    for (EntityId id : changed) {
+        publish({SceneEventType::TransformChanged, id, {}, sceneUpdateKindFromMask(updateMask)});
+    }
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, updateMask, alignDistributeUndoLabel(mode)));
+    }
+    return true;
+}
+
 bool SceneOperations::addLightComponent(EntityId id, Light light) {
     Entity* entity = document_.registry().entity(id);
     if (entity == nullptr || entity->locked || entity->light.has_value()) {
@@ -611,6 +845,22 @@ bool SceneOperations::addMeshRendererComponent(EntityId id, MeshRenderer rendere
     return true;
 }
 
+bool SceneOperations::addLevelInstanceComponent(EntityId id, LevelInstance instance) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || entity->levelInstance.has_value()) {
+        return false;
+    }
+    const SceneDocument before = document_;
+    entity->levelInstance = std::move(instance);
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::TopologyChanged, "Add Level Instance Component"));
+    }
+    return true;
+}
+
 bool SceneOperations::removeLightComponent(EntityId id) {
     const SceneDocument before = document_;
     Entity* entity = document_.registry().entity(id);
@@ -669,6 +919,19 @@ bool SceneOperations::removeMeshRendererComponent(EntityId id) {
     return true;
 }
 
+bool SceneOperations::removeLevelInstanceComponent(EntityId id) {
+    const SceneDocument before = document_;
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->levelInstance.has_value()) {
+        return false;
+    }
+    entity->levelInstance.reset();
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::TopologyChanged});
+    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, "Remove Level Instance Component");
+    return true;
+}
+
 bool SceneOperations::setMeshRenderer(EntityId id, const MeshRenderer& oldRenderer, const MeshRenderer& newRenderer, SceneUpdateKind updateKind) {
     Entity* entity = document_.registry().entity(id);
     if (entity == nullptr || entity->locked || !entity->meshRenderer.has_value()) {
@@ -684,6 +947,69 @@ bool SceneOperations::setMeshRenderer(EntityId id, const MeshRenderer& oldRender
     document_.markDirty(updateKind);
     publish({SceneEventType::ComponentAdded, id, {}, updateKind});
     pushDocumentSnapshot(before, updateKind, "Edit Mesh Renderer");
+    return true;
+}
+
+bool SceneOperations::setLevelInstance(EntityId id, const LevelInstance& oldInstance, const LevelInstance& newInstance) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->levelInstance.has_value()) {
+        return false;
+    }
+    entity->levelInstance = oldInstance;
+    const SceneDocument before = document_;
+    entity = document_.registry().entity(id);
+    if (entity == nullptr || !entity->levelInstance.has_value()) {
+        return false;
+    }
+    entity->levelInstance = newInstance;
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, "Edit Level Instance");
+    return true;
+}
+
+bool SceneOperations::setLevelInstanceLoaded(EntityId id, bool loaded) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->levelInstance.has_value() || entity->levelInstance->loaded == loaded) {
+        return false;
+    }
+    const SceneDocument before = document_;
+    entity->levelInstance->loaded = loaded;
+    entity->visible = loaded && entity->levelInstance->visible;
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, loaded ? "Load Level Instance" : "Unload Level Instance");
+    return true;
+}
+
+bool SceneOperations::setLevelInstanceEditable(EntityId id, bool editable) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->levelInstance.has_value() || entity->levelInstance->editable == editable) {
+        return false;
+    }
+    const SceneDocument before = document_;
+    entity->levelInstance->editable = editable;
+    if (editable) {
+        entity->levelInstance->sourceDirty = true;
+    }
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentAdded, id, {}, SceneUpdateKind::TopologyChanged});
+    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, editable ? "Edit Level Instance In Place" : "Stop Editing Level Instance");
+    return true;
+}
+
+bool SceneOperations::breakLevelInstanceLink(EntityId id) {
+    Entity* entity = document_.registry().entity(id);
+    if (entity == nullptr || entity->locked || !entity->levelInstance.has_value()) {
+        return false;
+    }
+    const SceneDocument before = document_;
+    const AssetGuid sceneGuid = entity->levelInstance->sceneGuid;
+    entity->levelInstance.reset();
+    (void)document_.removeSublevel(sceneGuid);
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::ComponentRemoved, id, {}, SceneUpdateKind::TopologyChanged});
+    pushDocumentSnapshot(before, SceneUpdateKind::TopologyChanged, "Break Level Instance Link");
     return true;
 }
 
@@ -811,6 +1137,45 @@ EntityId SceneOperations::mergeSceneAsset(const SceneAsset& scene, const std::st
             document_, before, document_, SceneUpdateKind::TopologyChanged, "Merge Scene"));
     }
     return importRoot;
+}
+
+EntityId SceneOperations::mergeLevelInstanceAsset(
+    const SceneAsset& scene,
+    SceneSublevelRecord sublevel,
+    const std::string& rootName) {
+    const SceneDocument before = document_;
+    UndoStack* previousUndoStack = undoStack_;
+    undoStack_ = nullptr;
+    EntityId root = mergeSceneAsset(scene, rootName.empty() ? "Level Instance" : rootName);
+    undoStack_ = previousUndoStack;
+    Entity* rootEntity = document_.registry().entity(root);
+    if (rootEntity == nullptr) {
+        document_ = before;
+        return {};
+    }
+
+    rootEntity->transform = sublevel.transform;
+    rootEntity->defaultTransform = rootEntity->transform;
+    rootEntity->visible = sublevel.visible;
+    LevelInstance instance;
+    instance.sceneGuid = sublevel.sceneGuid;
+    instance.scenePath = sublevel.scenePath;
+    instance.visible = sublevel.visible;
+    instance.loaded = sublevel.loaded;
+    instance.editable = sublevel.editable;
+    instance.sourceRevision = sublevel.sourceRevision;
+    instance.sourceHash = sublevel.sourceHash;
+    instance.overridesDirty = sublevel.overridesDirty;
+    instance.sourceDirty = sublevel.sourceDirty;
+    rootEntity->levelInstance = std::move(instance);
+    document_.addSublevel(std::move(sublevel));
+    document_.markDirty(SceneUpdateKind::TopologyChanged);
+    publish({SceneEventType::EntityCreated, root, {}, SceneUpdateKind::TopologyChanged});
+    if (undoStack_ != nullptr) {
+        undoStack_->pushCommand(std::make_unique<SceneDocumentSnapshotCommand>(
+            document_, before, document_, SceneUpdateKind::TopologyChanged, "Create Level Instance"));
+    }
+    return root;
 }
 
 PrefabInstance SceneOperations::placePrefab(
@@ -1004,6 +1369,8 @@ EntityId SceneOperations::duplicateEntityRecursive(const Entity& source, EntityI
     copy->visible = source.visible;
     copy->locked = source.locked;
     copy->meshRenderer = source.meshRenderer;
+    copy->animationPlayer = source.animationPlayer;
+    copy->levelInstance = source.levelInstance;
     copy->light = source.light;
     copy->sun = source.sun;
     copy->camera = source.camera;

@@ -78,6 +78,7 @@ const char* temporalUpscalerName(TemporalUpscaler upscaler) {
     switch (upscaler) {
     case TemporalUpscaler::TaaTsr: return "taa-tsr";
     case TemporalUpscaler::Dlss: return "dlss";
+    case TemporalUpscaler::Nis: return "nis";
     }
     return "taa-tsr";
 }
@@ -85,6 +86,9 @@ const char* temporalUpscalerName(TemporalUpscaler upscaler) {
 TemporalUpscaler parseTemporalUpscaler(std::string_view value) {
     const std::string key = normalized(value);
     if (key == "dlss" || key == "ngx" || key == "nvidiadlss") { return TemporalUpscaler::Dlss; }
+    if (key == "nis" || key == "nvidiaimage" || key == "nvidiaimagescaling" || key == "nvidiascaling") {
+        return TemporalUpscaler::Nis;
+    }
     return TemporalUpscaler::TaaTsr;
 }
 
@@ -166,6 +170,9 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     }
     if (key == "motion" || key == "motionvectors" || key == "velocity" || key == "velocitybuffer") {
         return RendererDebugView::MotionVectors;
+    }
+    if (key == "skinnedmotion" || key == "skinnedmotionvectors" || key == "skinnedvelocity" || key == "skinnedvelocitybuffer") {
+        return RendererDebugView::SkinnedMotionVectors;
     }
     if (key == "atmospheresky" || key == "atmosphereskyview" || key == "skyviewlut") {
         return RendererDebugView::AtmosphereSkyView;
@@ -321,6 +328,7 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::SecondaryEnvironmentRadiance: return "secondary-environment-radiance";
     case RendererDebugView::WhiteEnvironmentTransport: return "white-environment-transport";
     case RendererDebugView::MotionVectors: return "motion-vectors";
+    case RendererDebugView::SkinnedMotionVectors: return "skinned-motion-vectors";
     case RendererDebugView::AtmosphereSkyView: return "atmosphere-sky-view";
     case RendererDebugView::AtmosphereTransmittance: return "atmosphere-transmittance";
     case RendererDebugView::AtmosphereAerialPerspective: return "atmosphere-aerial-perspective";

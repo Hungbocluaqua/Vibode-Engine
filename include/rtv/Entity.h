@@ -18,6 +18,8 @@ struct Entity {
     std::vector<std::string> collections;
     Transform transform{};
     Transform defaultTransform{};
+    Transform previousAnimationTransform{};
+    bool previousAnimationTransformValid = false;
     EntityId parent{};
     std::vector<EntityId> children;
     bool visible = true;
@@ -26,6 +28,7 @@ struct Entity {
 
     std::optional<MeshRenderer> meshRenderer;
     std::optional<AnimationPlayer> animationPlayer;
+    std::optional<LevelInstance> levelInstance;
     std::optional<Light> light;
     std::optional<Sun> sun;
     std::optional<Camera> camera;

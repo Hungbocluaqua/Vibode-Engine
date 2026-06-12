@@ -1,17 +1,32 @@
 #include "rtv/Application.h"
+#include "rtv/AnimationController.h"
+#include "rtv/AssetImport.h"
 #include "rtv/AssetRegistry.h"
 #include "rtv/DiagnosticTools.h"
 #include "rtv/HeadlessDiagnostics.h"
+#include "rtv/NativeAssetMigration.h"
+#include "rtv/NativeAssetCooker.h"
+#include "rtv/NativeAssetRuntimeLoader.h"
+#include "rtv/NativeAssetStore.h"
+#include "rtv/NativeBinaryIO.h"
+#include "rtv/NativeTextureFormatPolicy.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/Project.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
 #include "rtv/RenderGraphDump.h"
 #include "rtv/RenderGraph.h"
+#include "rtv/RtpkgIO.h"
+#include "rtv/RuntimeSkeleton.h"
+#include "rtv/TextureLoader.h"
 #include "rtv/GpuProfiler.h"
+#include "rtv/GpuUploadTicket.h"
+#include "rtv/MainThreadApplyTicket.h"
+#include "rtv/TopologyRebuildTicket.h"
 
 #include <exception>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <cstdint>
@@ -28,6 +43,8 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include <ktx.h>
 
 #ifdef RTV_HAS_RENDERDOC
 #define WIN32_LEAN_AND_MEAN
@@ -163,6 +180,31 @@ std::string lowerAscii(std::string value) {
     return value;
 }
 
+rtv::NativeAssetKind parseNativeAssetKindName(std::string value) {
+    value = lowerAscii(std::move(value));
+    if (value == "mesh" || value == "rtmesh") return rtv::NativeAssetKind::Mesh;
+    if (value == "material" || value == "rtmaterial") return rtv::NativeAssetKind::Material;
+    if (value == "texture" || value == "rttexture") return rtv::NativeAssetKind::Texture;
+    if (value == "skeleton" || value == "rtskeleton") return rtv::NativeAssetKind::Skeleton;
+    if (value == "animation" || value == "rtanim") return rtv::NativeAssetKind::Animation;
+    if (value == "animation-controller" || value == "animcontroller" || value == "rtanimcontroller") return rtv::NativeAssetKind::AnimationController;
+    if (value == "skeletal-mesh" || value == "rtskeletalmesh") return rtv::NativeAssetKind::SkeletalMesh;
+    throw std::runtime_error("Unknown native asset kind: " + value);
+}
+
+uint32_t parseNativeFixtureTextureFormat(std::string value) {
+    value = lowerAscii(std::move(value));
+    if (value == "rgba8_srgb" || value == "r8g8b8a8_srgb") return static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_SRGB);
+    if (value == "rgba8_unorm" || value == "r8g8b8a8_unorm") return static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM);
+    if (value == "rgba32f" || value == "rgba32_sfloat" || value == "r32g32b32a32_sfloat") return static_cast<uint32_t>(VK_FORMAT_R32G32B32A32_SFLOAT);
+    if (value == "rgba16f" || value == "rgba16_sfloat" || value == "r16g16b16a16_sfloat") return static_cast<uint32_t>(VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (value == "bc7_srgb" || value == "bc7_srgb_block") return static_cast<uint32_t>(VK_FORMAT_BC7_SRGB_BLOCK);
+    if (value == "bc7_unorm" || value == "bc7_unorm_block") return static_cast<uint32_t>(VK_FORMAT_BC7_UNORM_BLOCK);
+    if (value == "bc5_unorm" || value == "bc5_unorm_block") return static_cast<uint32_t>(VK_FORMAT_BC5_UNORM_BLOCK);
+    if (value == "bc4_unorm" || value == "bc4_unorm_block") return static_cast<uint32_t>(VK_FORMAT_BC4_UNORM_BLOCK);
+    return static_cast<uint32_t>(std::stoul(value));
+}
+
 std::filesystem::path canonicalForCookCompare(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
@@ -232,6 +274,82 @@ std::optional<nlohmann::json> readCookJsonFile(const std::filesystem::path& path
     } catch (...) {
         return std::nullopt;
     }
+}
+
+bool readBinaryFileForCook(const std::filesystem::path& path, std::vector<std::byte>& bytes) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return false;
+    }
+    const std::streamoff size = file.tellg();
+    if (size < 0) {
+        return false;
+    }
+    bytes.resize(static_cast<size_t>(size));
+    file.seekg(0, std::ios::beg);
+    if (!bytes.empty()) {
+        file.read(reinterpret_cast<char*>(bytes.data()), size);
+    }
+    return file.good() || size == 0;
+}
+
+std::filesystem::path resolveCookSceneReferencePath(
+    const std::filesystem::path& sceneFile,
+    const std::filesystem::path& projectRoot,
+    const std::string& value) {
+    if (value.empty()) {
+        return {};
+    }
+    std::filesystem::path path(value);
+    if (path.is_absolute()) {
+        return path;
+    }
+    const std::filesystem::path sceneRelative = sceneFile.parent_path() / path;
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(sceneRelative, ec)) {
+        return sceneRelative;
+    }
+    return projectRoot / path;
+}
+
+void appendCookSceneSublevelReference(
+    const nlohmann::json& value,
+    const std::filesystem::path& sceneFile,
+    const std::filesystem::path& projectRoot,
+    nlohmann::json& references) {
+    if (!value.is_object()) {
+        return;
+    }
+    const std::string scenePath = value.value("scenePath", std::string{});
+    if (scenePath.empty()) {
+        return;
+    }
+    const std::filesystem::path resolved = resolveCookSceneReferencePath(sceneFile, projectRoot, scenePath);
+    references.push_back({
+        {"sceneGuid", value.value("sceneGuid", std::string{})},
+        {"scenePath", scenePath},
+        {"resolvedPath", resolved.generic_string()},
+    });
+}
+
+nlohmann::json collectCookSceneSublevelReferences(
+    const nlohmann::json& sceneJson,
+    const std::filesystem::path& sceneFile,
+    const std::filesystem::path& projectRoot) {
+    nlohmann::json references = nlohmann::json::array();
+    if (sceneJson.contains("sublevels") && sceneJson["sublevels"].is_array()) {
+        for (const nlohmann::json& item : sceneJson["sublevels"]) {
+            appendCookSceneSublevelReference(item, sceneFile, projectRoot, references);
+        }
+    }
+    if (sceneJson.contains("entities") && sceneJson["entities"].is_array()) {
+        for (const nlohmann::json& entity : sceneJson["entities"]) {
+            if (entity.is_object() && entity.contains("levelInstance")) {
+                appendCookSceneSublevelReference(entity["levelInstance"], sceneFile, projectRoot, references);
+            }
+        }
+    }
+    return references;
 }
 
 void collectCookProjectReferenceScanFiles(
@@ -380,6 +498,139 @@ struct CookFileCopyPlan {
     std::string ownerGuid;
 };
 
+struct GpuUploadTicketSimulationArgs {
+    bool enabled = false;
+    uint64_t totalBytes = 160ull * 1024ull * 1024ull;
+    uint64_t chunkBytes = 32ull * 1024ull * 1024ull;
+    uint64_t frameByteLimit = 64ull * 1024ull * 1024ull;
+    bool cancelBeforeSubmit = false;
+    bool cancelAfterSubmit = false;
+};
+
+struct MainThreadApplySimulationArgs {
+    bool enabled = false;
+    uint32_t operationCount = 120;
+    double operationCostMs = 0.25;
+    double frameBudgetMs = 2.0;
+    uint32_t cancelAfterFrame = 0;
+};
+
+struct TopologyRebuildSimulationArgs {
+    bool enabled = false;
+    double stageCostMs = 1.0;
+    double frameBudgetMs = 3.0;
+    uint32_t newerEditFrame = 2;
+};
+
+struct NativeTextureFormatPolicySimulationArgs {
+    bool enabled = false;
+};
+
+bool parseGpuUploadTicketSimulationArg(std::string_view arg, int argc, char** argv, int& index, GpuUploadTicketSimulationArgs& args) {
+    if (arg == "--simulate-gpu-upload-ticket") {
+        args.enabled = true;
+        return true;
+    }
+    if (arg == "--upload-total-bytes" && index + 1 < argc) {
+        args.totalBytes = static_cast<uint64_t>(std::stoull(argv[++index]));
+        return true;
+    }
+    if (arg == "--upload-chunk-bytes" && index + 1 < argc) {
+        args.chunkBytes = static_cast<uint64_t>(std::stoull(argv[++index]));
+        return true;
+    }
+    if (arg == "--upload-frame-byte-limit" && index + 1 < argc) {
+        args.frameByteLimit = static_cast<uint64_t>(std::stoull(argv[++index]));
+        return true;
+    }
+    if (arg == "--upload-cancel-before-submit") {
+        args.cancelBeforeSubmit = true;
+        return true;
+    }
+    if (arg == "--upload-cancel-after-submit") {
+        args.cancelAfterSubmit = true;
+        return true;
+    }
+    return false;
+}
+
+bool parseMainThreadApplySimulationArg(std::string_view arg, int argc, char** argv, int& index, MainThreadApplySimulationArgs& args) {
+    if (arg == "--simulate-main-thread-apply") {
+        args.enabled = true;
+        return true;
+    }
+    if (arg == "--apply-operation-count" && index + 1 < argc) {
+        args.operationCount = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--apply-operation-cost-ms" && index + 1 < argc) {
+        args.operationCostMs = std::stod(argv[++index]);
+        return true;
+    }
+    if (arg == "--apply-frame-budget-ms" && index + 1 < argc) {
+        args.frameBudgetMs = std::stod(argv[++index]);
+        return true;
+    }
+    if (arg == "--apply-cancel-after-frame" && index + 1 < argc) {
+        args.cancelAfterFrame = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    return false;
+}
+
+bool parseTopologyRebuildSimulationArg(std::string_view arg, int argc, char** argv, int& index, TopologyRebuildSimulationArgs& args) {
+    if (arg == "--simulate-topology-rebuild") {
+        args.enabled = true;
+        return true;
+    }
+    if (arg == "--topology-stage-cost-ms" && index + 1 < argc) {
+        args.stageCostMs = std::stod(argv[++index]);
+        return true;
+    }
+    if (arg == "--topology-frame-budget-ms" && index + 1 < argc) {
+        args.frameBudgetMs = std::stod(argv[++index]);
+        return true;
+    }
+    if (arg == "--topology-newer-edit-frame" && index + 1 < argc) {
+        args.newerEditFrame = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    return false;
+}
+
+bool parseNativeTextureFormatPolicySimulationArg(std::string_view arg, int, char**, int&, NativeTextureFormatPolicySimulationArgs& args) {
+    if (arg == "--simulate-native-texture-format-policy") {
+        args.enabled = true;
+        return true;
+    }
+    return false;
+}
+
+bool parseNativePackageAnimationSelectionArg(
+    std::string_view arg,
+    int argc,
+    char** argv,
+    int& index,
+    rtv::NativePackageAnimationSelection& selection) {
+    if (arg == "--native-package-controller-guid" && index + 1 < argc) {
+        selection.controllerGuid = argv[++index];
+        return true;
+    }
+    if (arg == "--native-package-controller-path" && index + 1 < argc) {
+        selection.controllerPath = std::filesystem::path(argv[++index]);
+        return true;
+    }
+    if (arg == "--native-package-animation-entity" && index + 1 < argc) {
+        selection.entityName = argv[++index];
+        return true;
+    }
+    if (arg == "--native-package-animation-entity-uuid" && index + 1 < argc) {
+        selection.entityUuid = static_cast<uint64_t>(std::stoull(argv[++index]));
+        return true;
+    }
+    return false;
+}
+
 bool writeJsonFile(const std::filesystem::path& path, const nlohmann::json& json, std::string* error) {
     std::error_code ec;
     const std::filesystem::path parent = path.parent_path();
@@ -401,6 +652,682 @@ bool writeJsonFile(const std::filesystem::path& path, const nlohmann::json& json
     }
     file << json.dump(2);
     return true;
+}
+
+nlohmann::json nativeTextureFormatSupportJson(const rtv::NativeTextureFormatSupport& support) {
+    return {
+        {"platformName", support.platformName},
+        {"queriedFromVulkan", support.queriedFromVulkan},
+        {"bc1SrgbSampled", support.bc1SrgbSampled},
+        {"bc1UnormSampled", support.bc1UnormSampled},
+        {"bc3SrgbSampled", support.bc3SrgbSampled},
+        {"bc3UnormSampled", support.bc3UnormSampled},
+        {"bc7SrgbSampled", support.bc7SrgbSampled},
+        {"bc7UnormSampled", support.bc7UnormSampled},
+        {"bc5UnormSampled", support.bc5UnormSampled},
+        {"bc4UnormSampled", support.bc4UnormSampled},
+        {"rgba8SrgbSampled", support.rgba8SrgbSampled},
+        {"rgba8UnormSampled", support.rgba8UnormSampled},
+        {"rgba16fSampled", support.rgba16fSampled},
+    };
+}
+
+rtv::NativeTextureFormatSupport nativeTextureFormatSupportFromJson(const nlohmann::json& json) {
+    rtv::NativeTextureFormatSupport support = rtv::nativeTextureOfflineFallbackFormatSupport();
+    if (!json.is_object()) {
+        return support;
+    }
+    support.platformName = json.value("platformName", support.platformName);
+    support.queriedFromVulkan = json.value("queriedFromVulkan", support.queriedFromVulkan);
+    support.bc1SrgbSampled = json.value("bc1SrgbSampled", support.bc1SrgbSampled);
+    support.bc1UnormSampled = json.value("bc1UnormSampled", support.bc1UnormSampled);
+    support.bc3SrgbSampled = json.value("bc3SrgbSampled", support.bc3SrgbSampled);
+    support.bc3UnormSampled = json.value("bc3UnormSampled", support.bc3UnormSampled);
+    support.bc7SrgbSampled = json.value("bc7SrgbSampled", support.bc7SrgbSampled);
+    support.bc7UnormSampled = json.value("bc7UnormSampled", support.bc7UnormSampled);
+    support.bc5UnormSampled = json.value("bc5UnormSampled", support.bc5UnormSampled);
+    support.bc4UnormSampled = json.value("bc4UnormSampled", support.bc4UnormSampled);
+    support.rgba8SrgbSampled = json.value("rgba8SrgbSampled", support.rgba8SrgbSampled);
+    support.rgba8UnormSampled = json.value("rgba8UnormSampled", support.rgba8UnormSampled);
+    support.rgba16fSampled = json.value("rgba16fSampled", support.rgba16fSampled);
+    return support;
+}
+
+std::vector<rtv::NativeTextureFormatSupport> nativeTextureFormatSupportListFromJson(const nlohmann::json& json) {
+    std::vector<rtv::NativeTextureFormatSupport> profiles;
+    auto appendProfile = [&](const nlohmann::json& item) {
+        rtv::NativeTextureFormatSupport support = nativeTextureFormatSupportFromJson(item);
+        if (support.platformName.empty()) {
+            support.platformName = "package-texture-target-" + std::to_string(profiles.size());
+        }
+        profiles.push_back(std::move(support));
+    };
+
+    if (json.is_array()) {
+        for (const nlohmann::json& item : json) {
+            appendProfile(item);
+        }
+    } else if (json.is_object() && json.contains("targetSets") && json["targetSets"].is_array()) {
+        for (const nlohmann::json& item : json["targetSets"]) {
+            appendProfile(item);
+        }
+    } else if (json.is_object() && json.contains("profiles") && json["profiles"].is_array()) {
+        for (const nlohmann::json& item : json["profiles"]) {
+            appendProfile(item);
+        }
+    } else if (json.is_object()) {
+        appendProfile(json);
+    }
+    return profiles;
+}
+
+nlohmann::json nativeTextureFormatSupportListJson(const std::vector<rtv::NativeTextureFormatSupport>& profiles) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const rtv::NativeTextureFormatSupport& support : profiles) {
+        out.push_back(nativeTextureFormatSupportJson(support));
+    }
+    return out;
+}
+
+nlohmann::json nativeTextureFormatSelectionJson(const rtv::NativeTextureFormatSelection& selection) {
+    nlohmann::json candidates = nlohmann::json::array();
+    for (const VkFormat candidate : selection.candidates) {
+        candidates.push_back(rtv::nativeTextureFormatName(candidate));
+    }
+    return {
+        {"role", rtv::nativeTextureRoleName(selection.role)},
+        {"colorSpace", rtv::nativeTextureColorSpaceName(selection.colorSpace)},
+        {"selectedFormat", rtv::nativeTextureFormatName(selection.selectedFormat)},
+        {"selectedFormatValue", static_cast<uint32_t>(selection.selectedFormat)},
+        {"supported", selection.supported},
+        {"fallbackUsed", selection.fallbackUsed},
+        {"blockCompressed", selection.blockCompressed},
+        {"compressionFamily", selection.compressionFamily},
+        {"reason", selection.reason},
+        {"fallbackReason", selection.fallbackReason},
+        {"candidates", candidates},
+    };
+}
+
+nlohmann::json nativeTextureFormatPolicyProfileJson(std::string_view name, const rtv::NativeTextureFormatSupport& support) {
+    struct RoleCase {
+        rtv::NativeTextureRole role;
+        rtv::NativeTextureColorSpace colorSpace;
+    };
+    const RoleCase cases[] = {
+        {rtv::NativeTextureRole::BaseColor, rtv::NativeTextureColorSpace::Srgb},
+        {rtv::NativeTextureRole::Emissive, rtv::NativeTextureColorSpace::Srgb},
+        {rtv::NativeTextureRole::Normal, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::MetallicRoughness, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::Metallic, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::Roughness, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::Occlusion, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::Opacity, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::Height, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::EnvironmentHdr, rtv::NativeTextureColorSpace::HdrLinear},
+        {rtv::NativeTextureRole::Data, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::Unknown, rtv::NativeTextureColorSpace::Srgb},
+    };
+    nlohmann::json selections = nlohmann::json::array();
+    for (const RoleCase& roleCase : cases) {
+        selections.push_back(nativeTextureFormatSelectionJson(rtv::selectNativeTextureFormat(roleCase.role, roleCase.colorSpace, support)));
+    }
+    return {
+        {"name", std::string(name)},
+        {"support", nativeTextureFormatSupportJson(support)},
+        {"selections", selections},
+    };
+}
+
+int simulateNativeTextureFormatPolicyCommand(const std::filesystem::path& jsonOut) {
+    const nlohmann::json summary = {
+        {"schema", "NativeTextureFormatPolicySimulationV1"},
+        {"ok", true},
+        {"profiles", nlohmann::json::array({
+            nativeTextureFormatPolicyProfileJson("all-bc-supported", rtv::nativeTextureAllBcFormatSupportForAudit()),
+            nativeTextureFormatPolicyProfileJson("rgba-fallback-only", rtv::nativeTextureOfflineFallbackFormatSupport()),
+        })},
+        {"open", nlohmann::json::array({
+            "broader production package texture coverage remains open beyond decoded RGBA8/HDR sidecars and initial source-backed KTX2/BasisU project-cook sidecars",
+            "direct renderer native-store texture upload remains open"
+        })},
+    };
+    if (!jsonOut.empty()) {
+        std::string writeError;
+        if (!writeJsonFile(jsonOut, summary, &writeError)) {
+            std::cerr << "Could not write native texture format policy JSON: " << writeError << '\n';
+            return 1;
+        }
+    } else {
+        std::cout << summary.dump(2) << '\n';
+    }
+    return 0;
+}
+
+int emitBasisuKtx2FixtureCommand(const std::filesystem::path& outputPath, const std::filesystem::path& jsonOut) {
+    if (outputPath.empty()) {
+        return 1;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path parent = outputPath.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            return 1;
+        }
+    }
+
+    constexpr uint32_t kWidth = 4;
+    constexpr uint32_t kHeight = 4;
+    std::array<uint8_t, kWidth * kHeight * 4u> pixels{};
+    for (uint32_t y = 0; y < kHeight; ++y) {
+        for (uint32_t x = 0; x < kWidth; ++x) {
+            const size_t offset = static_cast<size_t>((y * kWidth + x) * 4u);
+            pixels[offset + 0] = static_cast<uint8_t>(32u + x * 45u);
+            pixels[offset + 1] = static_cast<uint8_t>(48u + y * 41u);
+            pixels[offset + 2] = static_cast<uint8_t>(96u + (x + y) * 17u);
+            pixels[offset + 3] = 255u;
+        }
+    }
+
+    ktxTextureCreateInfo createInfo{};
+    createInfo.vkFormat = VK_FORMAT_R8G8B8A8_SRGB;
+    createInfo.baseWidth = kWidth;
+    createInfo.baseHeight = kHeight;
+    createInfo.baseDepth = 1;
+    createInfo.numDimensions = 2;
+    createInfo.numLevels = 1;
+    createInfo.numLayers = 1;
+    createInfo.numFaces = 1;
+    createInfo.isArray = KTX_FALSE;
+    createInfo.generateMipmaps = KTX_FALSE;
+
+    ktxTexture2* texture = nullptr;
+    KTX_error_code result = ktxTexture2_Create(&createInfo, KTX_TEXTURE_CREATE_ALLOC_STORAGE, &texture);
+    if (result != KTX_SUCCESS || texture == nullptr) {
+        return 1;
+    }
+
+    auto destroyTexture = [&texture]() {
+        if (texture != nullptr) {
+            ktxTexture_Destroy(ktxTexture(texture));
+            texture = nullptr;
+        }
+    };
+
+    result = ktxTexture_SetImageFromMemory(ktxTexture(texture), 0, 0, 0, pixels.data(), static_cast<ktx_size_t>(pixels.size()));
+    if (result != KTX_SUCCESS) {
+        destroyTexture();
+        return 1;
+    }
+
+    ktxBasisParams basisParams{};
+    basisParams.structSize = sizeof(basisParams);
+    basisParams.uastc = KTX_TRUE;
+    basisParams.threadCount = 1;
+    basisParams.uastcFlags = KTX_PACK_UASTC_LEVEL_FASTEST;
+    basisParams.uastcRDONoMultithreading = KTX_TRUE;
+    result = ktxTexture2_CompressBasisEx(texture, &basisParams);
+    if (result != KTX_SUCCESS) {
+        destroyTexture();
+        return 1;
+    }
+
+    result = ktxTexture_WriteToNamedFile(ktxTexture(texture), outputPath.string().c_str());
+    destroyTexture();
+    if (result != KTX_SUCCESS) {
+        return 1;
+    }
+
+    const nlohmann::json summary = {
+        {"schema", "BasisuKtx2FixtureV1"},
+        {"ok", true},
+        {"path", outputPath.generic_string()},
+        {"width", kWidth},
+        {"height", kHeight},
+        {"sourceVkFormat", "R8G8B8A8_SRGB"},
+        {"supercompression", "BasisU/UASTC"},
+    };
+    if (!jsonOut.empty()) {
+        std::string writeError;
+        if (!writeJsonFile(jsonOut, summary, &writeError)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+nlohmann::json gpuUploadChunkSnapshotJson(const rtv::GpuUploadChunkSnapshot& chunk) {
+    return {
+        {"index", chunk.index},
+        {"offset", chunk.offset},
+        {"bytes", chunk.bytes},
+        {"timelineValue", chunk.timelineValue},
+        {"state", rtv::gpuUploadChunkStateName(chunk.state)},
+        {"stagingRetained", chunk.stagingRetained},
+    };
+}
+
+nlohmann::json gpuUploadTicketSnapshotJson(const rtv::GpuUploadTicketSnapshot& ticket) {
+    nlohmann::json chunks = nlohmann::json::array();
+    for (const rtv::GpuUploadChunkSnapshot& chunk : ticket.chunks) {
+        chunks.push_back(gpuUploadChunkSnapshotJson(chunk));
+    }
+    return {
+        {"id", ticket.id},
+        {"kind", rtv::gpuUploadResourceKindName(ticket.kind)},
+        {"state", rtv::gpuUploadTicketStateName(ticket.state)},
+        {"label", ticket.label},
+        {"totalBytes", ticket.totalBytes},
+        {"submittedBytes", ticket.submittedBytes},
+        {"completedBytes", ticket.completedBytes},
+        {"retainedStagingBytes", ticket.retainedStagingBytes},
+        {"chunkCount", ticket.chunkCount},
+        {"pendingChunks", ticket.pendingChunks},
+        {"submittedChunks", ticket.submittedChunks},
+        {"completedChunks", ticket.completedChunks},
+        {"cancellationRequested", ticket.cancellationRequested},
+        {"canCancel", ticket.canCancel},
+        {"canRetire", ticket.canRetire},
+        {"chunks", chunks},
+    };
+}
+
+nlohmann::json gpuUploadSnapshotsJson(const std::vector<rtv::GpuUploadTicketSnapshot>& snapshots) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const rtv::GpuUploadTicketSnapshot& snapshot : snapshots) {
+        out.push_back(gpuUploadTicketSnapshotJson(snapshot));
+    }
+    return out;
+}
+
+bool gpuUploadTicketsCompleteOrCancelled(const std::vector<rtv::GpuUploadTicketSnapshot>& snapshots) {
+    return std::all_of(snapshots.begin(), snapshots.end(), [](const rtv::GpuUploadTicketSnapshot& ticket) {
+        return ticket.state == rtv::GpuUploadTicketState::Complete || ticket.state == rtv::GpuUploadTicketState::Cancelled;
+    });
+}
+
+nlohmann::json mainThreadApplyOperationSnapshotJson(const rtv::MainThreadApplyOperationSnapshot& operation) {
+    return {
+        {"index", operation.index},
+        {"kind", rtv::mainThreadApplyOperationKindName(operation.kind)},
+        {"state", rtv::mainThreadApplyOperationStateName(operation.state)},
+        {"entity", operation.entity},
+        {"estimatedCostMs", operation.estimatedCostMs},
+        {"label", operation.label},
+    };
+}
+
+nlohmann::json mainThreadApplyTicketSnapshotJson(const rtv::MainThreadApplyTicketSnapshot& ticket) {
+    nlohmann::json operations = nlohmann::json::array();
+    for (const rtv::MainThreadApplyOperationSnapshot& operation : ticket.operations) {
+        operations.push_back(mainThreadApplyOperationSnapshotJson(operation));
+    }
+    return {
+        {"id", ticket.id},
+        {"state", rtv::mainThreadApplyTicketStateName(ticket.state)},
+        {"label", ticket.label},
+        {"operationCount", ticket.operationCount},
+        {"pendingOperations", ticket.pendingOperations},
+        {"appliedOperations", ticket.appliedOperations},
+        {"cancelledOperations", ticket.cancelledOperations},
+        {"progress", ticket.progress},
+        {"undoSnapshotOpen", ticket.undoSnapshotOpen},
+        {"undoSnapshotCommitted", ticket.undoSnapshotCommitted},
+        {"cancellationRequested", ticket.cancellationRequested},
+        {"canCancel", ticket.canCancel},
+        {"lockedEntities", ticket.lockedEntities},
+        {"operations", operations},
+    };
+}
+
+nlohmann::json mainThreadApplySnapshotsJson(const std::vector<rtv::MainThreadApplyTicketSnapshot>& snapshots) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const rtv::MainThreadApplyTicketSnapshot& snapshot : snapshots) {
+        out.push_back(mainThreadApplyTicketSnapshotJson(snapshot));
+    }
+    return out;
+}
+
+std::vector<rtv::MainThreadApplyOperationDesc> makeMainThreadApplySimulationOperations(uint32_t operationCount, double operationCostMs) {
+    std::vector<rtv::MainThreadApplyOperationDesc> operations;
+    operations.reserve(operationCount);
+    constexpr rtv::MainThreadApplyOperationKind kinds[] = {
+        rtv::MainThreadApplyOperationKind::EntityCreation,
+        rtv::MainThreadApplyOperationKind::EntityDeletion,
+        rtv::MainThreadApplyOperationKind::EntityStateUpdate,
+        rtv::MainThreadApplyOperationKind::ComponentCreation,
+        rtv::MainThreadApplyOperationKind::TransformUpdate,
+        rtv::MainThreadApplyOperationKind::MaterialBinding,
+        rtv::MainThreadApplyOperationKind::MeshBinding,
+        rtv::MainThreadApplyOperationKind::DependencyRestore,
+        rtv::MainThreadApplyOperationKind::SelectionHandoff,
+    };
+    constexpr size_t kindCount = sizeof(kinds) / sizeof(kinds[0]);
+    for (uint32_t i = 0; i < operationCount; ++i) {
+        operations.push_back({
+            .kind = kinds[i % kindCount],
+            .entity = 1000ull + static_cast<uint64_t>(i / kindCount),
+            .estimatedCostMs = operationCostMs,
+            .label = "apply operation " + std::to_string(i),
+        });
+    }
+    return operations;
+}
+
+int simulateMainThreadApplyCommand(
+    const std::filesystem::path& jsonOut,
+    uint32_t operationCount,
+    double operationCostMs,
+    double frameBudgetMs,
+    uint32_t cancelAfterFrame) {
+    rtv::MainThreadApplyTicketQueue queue;
+    const uint64_t ticketId = queue.create(
+        "simulated prefab apply",
+        makeMainThreadApplySimulationOperations(operationCount, operationCostMs));
+    const bool conflictRejected = queue.create(
+        "conflicting destructive edit",
+        std::vector<rtv::MainThreadApplyOperationDesc>{{
+            .kind = rtv::MainThreadApplyOperationKind::TransformUpdate,
+            .entity = 1000,
+            .estimatedCostMs = operationCostMs,
+            .label = "conflicting transform edit",
+        }}) == 0;
+
+    nlohmann::json frames = nlohmann::json::array();
+    const rtv::MainThreadApplyFrameBudget budget{.maxApplyMs = frameBudgetMs};
+    for (uint32_t frame = 1; frame <= 256; ++frame) {
+        const rtv::MainThreadApplyStepResult step = queue.applyFrame(budget);
+        frames.push_back({
+            {"frame", frame},
+            {"phase", "apply"},
+            {"appliedOperations", step.appliedOperations},
+            {"consumedMs", step.consumedMs},
+            {"budgetExhausted", step.budgetExhausted},
+            {"tickets", mainThreadApplySnapshotsJson(queue.snapshots(false))},
+        });
+        if (cancelAfterFrame != 0 && frame == cancelAfterFrame) {
+            const bool cancelled = queue.requestCancel(ticketId);
+            frames.push_back({
+                {"frame", frame},
+                {"phase", "cancel"},
+                {"cancelled", cancelled},
+                {"tickets", mainThreadApplySnapshotsJson(queue.snapshots(false))},
+            });
+            break;
+        }
+        const std::vector<rtv::MainThreadApplyTicketSnapshot> snapshots = queue.snapshots(false);
+        const bool allDone = std::all_of(snapshots.begin(), snapshots.end(), [](const rtv::MainThreadApplyTicketSnapshot& snapshot) {
+            return snapshot.state == rtv::MainThreadApplyTicketState::Complete || snapshot.state == rtv::MainThreadApplyTicketState::Cancelled;
+        });
+        if (allDone) {
+            break;
+        }
+    }
+
+    const std::vector<rtv::MainThreadApplyTicketSnapshot> finalSnapshots = queue.snapshots(true);
+    const nlohmann::json summary = {
+        {"schema", "MainThreadApplySimulationV1"},
+        {"ok", true},
+        {"operationCount", operationCount},
+        {"operationCostMs", operationCostMs},
+        {"frameBudgetMs", frameBudgetMs},
+        {"cancelAfterFrame", cancelAfterFrame},
+        {"conflictRejected", conflictRejected},
+        {"frameCount", frames.size()},
+        {"frames", frames},
+        {"finalTickets", mainThreadApplySnapshotsJson(finalSnapshots)},
+    };
+
+    if (!jsonOut.empty()) {
+        std::string writeError;
+        if (!writeJsonFile(jsonOut, summary, &writeError)) {
+            std::cerr << "Could not write main-thread apply simulation JSON: " << writeError << '\n';
+            return 1;
+        }
+    } else {
+        std::cout << summary.dump(2) << '\n';
+    }
+    return 0;
+}
+
+nlohmann::json topologyRebuildStageSnapshotJson(const rtv::TopologyRebuildStageSnapshot& stage) {
+    return {
+        {"index", stage.index},
+        {"stage", rtv::topologyRebuildStageName(stage.stage)},
+        {"state", rtv::topologyRebuildStageStateName(stage.state)},
+        {"estimatedCostMs", stage.estimatedCostMs},
+        {"label", stage.label},
+    };
+}
+
+nlohmann::json topologyRebuildTicketSnapshotJson(const rtv::TopologyRebuildTicketSnapshot& ticket) {
+    nlohmann::json stages = nlohmann::json::array();
+    for (const rtv::TopologyRebuildStageSnapshot& stage : ticket.stages) {
+        stages.push_back(topologyRebuildStageSnapshotJson(stage));
+    }
+    return {
+        {"id", ticket.id},
+        {"generation", ticket.generation},
+        {"state", rtv::topologyRebuildTicketStateName(ticket.state)},
+        {"label", ticket.label},
+        {"stageCount", ticket.stageCount},
+        {"pendingStages", ticket.pendingStages},
+        {"completedStages", ticket.completedStages},
+        {"cancelledStages", ticket.cancelledStages},
+        {"progress", ticket.progress},
+        {"previousRendererVisible", ticket.previousRendererVisible},
+        {"finalRendererSwapped", ticket.finalRendererSwapped},
+        {"oldRendererRetained", ticket.oldRendererRetained},
+        {"oldRendererRetired", ticket.oldRendererRetired},
+        {"retirementTimelineValue", ticket.retirementTimelineValue},
+        {"cancellationRequested", ticket.cancellationRequested},
+        {"staleGeneration", ticket.staleGeneration},
+        {"stages", stages},
+    };
+}
+
+nlohmann::json topologyRebuildSnapshotsJson(const std::vector<rtv::TopologyRebuildTicketSnapshot>& snapshots) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const rtv::TopologyRebuildTicketSnapshot& snapshot : snapshots) {
+        out.push_back(topologyRebuildTicketSnapshotJson(snapshot));
+    }
+    return out;
+}
+
+std::vector<rtv::TopologyRebuildStageDesc> makeTopologyRebuildSimulationStages(double stageCostMs) {
+    constexpr rtv::TopologyRebuildStage stages[] = {
+        rtv::TopologyRebuildStage::CpuSceneExtraction,
+        rtv::TopologyRebuildStage::GpuSceneBufferBuild,
+        rtv::TopologyRebuildStage::BufferUploads,
+        rtv::TopologyRebuildStage::TextureUploads,
+        rtv::TopologyRebuildStage::BlasBuildBatch,
+        rtv::TopologyRebuildStage::BlasBuildBatch,
+        rtv::TopologyRebuildStage::BlasBuildBatch,
+        rtv::TopologyRebuildStage::TlasBuildOrRefit,
+        rtv::TopologyRebuildStage::RendererDescriptorUpdate,
+        rtv::TopologyRebuildStage::FinalRendererSwap,
+        rtv::TopologyRebuildStage::RetireOldRenderer,
+    };
+    std::vector<rtv::TopologyRebuildStageDesc> out;
+    out.reserve(sizeof(stages) / sizeof(stages[0]));
+    for (size_t i = 0; i < sizeof(stages) / sizeof(stages[0]); ++i) {
+        out.push_back({
+            .stage = stages[i],
+            .estimatedCostMs = stageCostMs,
+            .label = std::string(rtv::topologyRebuildStageName(stages[i])) + " " + std::to_string(i),
+        });
+    }
+    return out;
+}
+
+int simulateTopologyRebuildCommand(
+    const std::filesystem::path& jsonOut,
+    double stageCostMs,
+    double frameBudgetMs,
+    uint32_t newerEditFrame) {
+    rtv::TopologyRebuildTicketQueue queue;
+    (void)queue.create("topology rebuild generation 1", makeTopologyRebuildSimulationStages(stageCostMs));
+    const rtv::TopologyRebuildFrameBudget budget{.maxCpuMs = frameBudgetMs};
+    nlohmann::json frames = nlohmann::json::array();
+    bool newerEditCreated = false;
+    bool fenceCompleted = false;
+
+    for (uint32_t frame = 1; frame <= 64; ++frame) {
+        if (!newerEditCreated && newerEditFrame != 0 && frame == newerEditFrame) {
+            (void)queue.create("topology rebuild generation 2", makeTopologyRebuildSimulationStages(stageCostMs));
+            newerEditCreated = true;
+            frames.push_back({
+                {"frame", frame},
+                {"phase", "newer-topology-edit"},
+                {"tickets", topologyRebuildSnapshotsJson(queue.snapshots(false))},
+            });
+        }
+
+        const rtv::TopologyRebuildStepResult step = queue.stepFrame(budget);
+        frames.push_back({
+            {"frame", frame},
+            {"phase", "build"},
+            {"completedStages", step.completedStages},
+            {"consumedMs", step.consumedMs},
+            {"budgetExhausted", step.budgetExhausted},
+            {"tickets", topologyRebuildSnapshotsJson(queue.snapshots(false))},
+        });
+
+        const std::vector<rtv::TopologyRebuildTicketSnapshot> snapshots = queue.snapshots(false);
+        const bool waitingForRetirement = std::any_of(snapshots.begin(), snapshots.end(), [](const rtv::TopologyRebuildTicketSnapshot& ticket) {
+            return ticket.state == rtv::TopologyRebuildTicketState::WaitingForRetirementFence;
+        });
+        if (waitingForRetirement && !fenceCompleted) {
+            frames.push_back({
+                {"frame", frame},
+                {"phase", "before-retirement-fence"},
+                {"tickets", topologyRebuildSnapshotsJson(queue.snapshots(false))},
+            });
+            (void)queue.completeRetirementFence(queue.nextTimelineValue() - 1u);
+            fenceCompleted = true;
+            frames.push_back({
+                {"frame", frame},
+                {"phase", "after-retirement-fence"},
+                {"tickets", topologyRebuildSnapshotsJson(queue.snapshots(false))},
+            });
+        }
+
+        const std::vector<rtv::TopologyRebuildTicketSnapshot> current = queue.snapshots(false);
+        const bool allTerminal = std::all_of(current.begin(), current.end(), [](const rtv::TopologyRebuildTicketSnapshot& ticket) {
+            return ticket.state == rtv::TopologyRebuildTicketState::Complete || ticket.state == rtv::TopologyRebuildTicketState::Cancelled;
+        });
+        if (allTerminal && newerEditCreated) {
+            break;
+        }
+    }
+
+    const nlohmann::json summary = {
+        {"schema", "TopologyRebuildSimulationV1"},
+        {"ok", true},
+        {"stageCostMs", stageCostMs},
+        {"frameBudgetMs", frameBudgetMs},
+        {"newerEditFrame", newerEditFrame},
+        {"latestGeneration", queue.latestGeneration()},
+        {"frameCount", frames.size()},
+        {"frames", frames},
+        {"finalTickets", topologyRebuildSnapshotsJson(queue.snapshots(true))},
+    };
+
+    if (!jsonOut.empty()) {
+        std::string writeError;
+        if (!writeJsonFile(jsonOut, summary, &writeError)) {
+            std::cerr << "Could not write topology rebuild simulation JSON: " << writeError << '\n';
+            return 1;
+        }
+    } else {
+        std::cout << summary.dump(2) << '\n';
+    }
+    return 0;
+}
+
+int simulateGpuUploadTicketCommand(
+    const std::filesystem::path& jsonOut,
+    uint64_t totalBytes,
+    uint64_t chunkBytes,
+    uint64_t frameByteLimit,
+    bool cancelBeforeSubmit,
+    bool cancelAfterSubmit) {
+    rtv::GpuUploadTicketQueue queue;
+    const uint64_t ticketId = queue.create({
+        .kind = rtv::GpuUploadResourceKind::Image,
+        .label = "simulated large texture upload",
+        .totalBytes = totalBytes,
+        .chunkBytes = chunkBytes,
+    });
+    const rtv::GpuUploadFrameBudget budget{.maxBytes = frameByteLimit};
+
+    nlohmann::json frames = nlohmann::json::array();
+    auto appendFrame = [&](uint32_t frameIndex, const char* phase, const rtv::GpuUploadSubmitResult& submit) {
+        frames.push_back({
+            {"frame", frameIndex},
+            {"phase", phase},
+            {"submittedBytes", submit.submittedBytes},
+            {"submittedChunks", submit.submittedChunks},
+            {"budgetExhausted", submit.budgetExhausted},
+            {"tickets", gpuUploadSnapshotsJson(queue.snapshots(true))},
+        });
+    };
+
+    if (cancelBeforeSubmit) {
+        (void)queue.requestCancel(ticketId, "cancel before submit");
+        const rtv::GpuUploadSubmitResult submit = queue.submitFrame(budget);
+        appendFrame(0, "cancel-before-submit", submit);
+    } else if (cancelAfterSubmit) {
+        const rtv::GpuUploadSubmitResult submit = queue.submitFrame(budget);
+        appendFrame(1, "submit-before-cancel", submit);
+        (void)queue.requestCancel(ticketId, "cancel after submit");
+        appendFrame(1, "cancel-after-submit-before-fence", {});
+        (void)queue.completeTimeline(queue.nextTimelineValue() - 1u);
+        appendFrame(2, "cancel-after-submit-after-fence", {});
+    } else {
+        uint64_t previousFrameTimeline = 0;
+        for (uint32_t frame = 1; frame <= 64; ++frame) {
+            if (previousFrameTimeline != 0) {
+                (void)queue.completeTimeline(previousFrameTimeline);
+            }
+            const rtv::GpuUploadSubmitResult submit = queue.submitFrame(budget);
+            appendFrame(frame, "submit", submit);
+            previousFrameTimeline = queue.nextTimelineValue() - 1u;
+            const std::vector<rtv::GpuUploadTicketSnapshot> snapshots = queue.snapshots(false);
+            if (gpuUploadTicketsCompleteOrCancelled(snapshots)) {
+                break;
+            }
+        }
+        (void)queue.completeTimeline(queue.nextTimelineValue() - 1u);
+        appendFrame(static_cast<uint32_t>(frames.size() + 1u), "final-fence-complete", {});
+    }
+
+    const std::vector<rtv::GpuUploadTicketSnapshot> finalSnapshots = queue.snapshots(true);
+    const nlohmann::json summary = {
+        {"schema", "GpuUploadTicketSimulationV1"},
+        {"ok", true},
+        {"totalBytes", totalBytes},
+        {"chunkBytes", chunkBytes},
+        {"frameByteLimit", frameByteLimit},
+        {"cancelBeforeSubmit", cancelBeforeSubmit},
+        {"cancelAfterSubmit", cancelAfterSubmit},
+        {"frameCount", frames.size()},
+        {"frames", frames},
+        {"finalTickets", gpuUploadSnapshotsJson(finalSnapshots)},
+    };
+
+    if (!jsonOut.empty()) {
+        std::string writeError;
+        if (!writeJsonFile(jsonOut, summary, &writeError)) {
+            std::cerr << "Could not write upload-ticket simulation JSON: " << writeError << '\n';
+            return 1;
+        }
+    } else {
+        std::cout << summary.dump(2) << '\n';
+    }
+    return 0;
 }
 
 void appendCookValidationIssue(
@@ -455,7 +1382,372 @@ bool supportedCookTextureCompression(std::string_view value) {
     return value == "PreserveSource";
 }
 
-int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem::path outputDir, std::filesystem::path manifestPath) {
+bool cookPackageNativePayloadCandidate(const std::filesystem::path& path) {
+    const rtv::NativeAssetKind kind = rtv::nativeAssetKindFromExtension(path);
+    return kind != rtv::NativeAssetKind::Unknown && kind != rtv::NativeAssetKind::Package;
+}
+
+struct CookGeneratedTexturePackageVariant {
+    std::filesystem::path sourcePath;
+    std::filesystem::path outputPath;
+    std::string packagePath;
+    std::string sourceKind = "native_payload";
+    std::string guid;
+    std::string targetSet;
+    std::string role;
+    std::string sourceFormat;
+    std::string emittedFormat;
+    std::string status = "skipped";
+    std::string reason;
+    uint64_t bytes = 0;
+    bool generated = false;
+};
+
+nlohmann::json cookGeneratedTexturePackageVariantJson(
+    const CookGeneratedTexturePackageVariant& variant,
+    const std::filesystem::path& cookRoot) {
+    return {
+        {"source", relativePathString(variant.sourcePath, cookRoot)},
+        {"output", relativePathString(variant.outputPath, cookRoot)},
+        {"packagePath", variant.packagePath},
+        {"sourceKind", variant.sourceKind},
+        {"guid", variant.guid},
+        {"targetSet", variant.targetSet},
+        {"role", variant.role},
+        {"sourceFormat", variant.sourceFormat},
+        {"emittedFormat", variant.emittedFormat},
+        {"status", variant.status},
+        {"reason", variant.reason},
+        {"bytes", variant.bytes},
+        {"generated", variant.generated},
+    };
+}
+
+std::string cookTextureVariantSuffix(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+        return ".bc7";
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+        return ".bc5";
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+        return ".bc4";
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+        return ".rgba16f";
+    default:
+        return {};
+    }
+}
+
+struct CookTextureSourceMetadata {
+    std::filesystem::path sourcePath;
+    std::string displayName;
+};
+
+rtv::NativeTextureColorSpace cookTextureColorSpaceForLoadedTexture(const rtv::NativeRuntimeLoadedAsset& loaded) {
+    switch (loaded.textureRole) {
+    case rtv::NativeTextureRole::BaseColor:
+    case rtv::NativeTextureRole::Emissive:
+        return rtv::NativeTextureColorSpace::Srgb;
+    case rtv::NativeTextureRole::EnvironmentHdr:
+        return rtv::NativeTextureColorSpace::HdrLinear;
+    case rtv::NativeTextureRole::Normal:
+    case rtv::NativeTextureRole::MetallicRoughness:
+    case rtv::NativeTextureRole::Metallic:
+    case rtv::NativeTextureRole::Roughness:
+    case rtv::NativeTextureRole::Occlusion:
+    case rtv::NativeTextureRole::Opacity:
+    case rtv::NativeTextureRole::Height:
+    case rtv::NativeTextureRole::Data:
+        return rtv::NativeTextureColorSpace::Linear;
+    case rtv::NativeTextureRole::Unknown:
+    default:
+        return loaded.texture.srgb ? rtv::NativeTextureColorSpace::Srgb : rtv::NativeTextureColorSpace::Linear;
+    }
+}
+
+rtv::TextureAsset cookTextureAssetFromData(
+    const rtv::TextureData& data,
+    const std::filesystem::path& sourcePath,
+    std::string displayName,
+    rtv::NativeTextureColorSpace colorSpace) {
+    rtv::TextureAsset texture;
+    texture.name = std::move(displayName);
+    texture.sourcePath = sourcePath;
+    texture.width = static_cast<uint32_t>(std::max(1, data.width));
+    texture.height = static_cast<uint32_t>(std::max(1, data.height));
+    texture.channels = 4;
+    texture.mipLevels = std::max(1, data.mipLevels);
+    texture.srgb = colorSpace == rtv::NativeTextureColorSpace::Srgb && !data.linearColorSpace;
+    texture.linearColorSpace = colorSpace == rtv::NativeTextureColorSpace::HdrLinear || data.linearColorSpace;
+    texture.isCompressed = data.isCompressed;
+    texture.format = data.format;
+    texture.compressedFormat = data.compressedFormat != VK_FORMAT_UNDEFINED
+        ? data.compressedFormat
+        : (data.isCompressed ? data.format : VK_FORMAT_UNDEFINED);
+    texture.sourceContainerKind = data.sourceContainerKind;
+    texture.nativePayloadSource = data.nativePayloadSource;
+    texture.sourceContainerPreserved = data.sourceContainerPreserved;
+    texture.sourceContainerTranscoded = data.sourceContainerTranscoded;
+    texture.rgba8 = data.pixels;
+    texture.mipData = data.mipData;
+    return texture;
+}
+
+CookGeneratedTexturePackageVariant cookGeneratedTexturePackageVariant(
+    const std::filesystem::path& sourcePath,
+    const std::filesystem::path& cookRoot,
+    const rtv::NativeTextureFormatSupport& targetSet,
+    std::unordered_set<std::string>& emittedVariantKeys) {
+    CookGeneratedTexturePackageVariant variant;
+    variant.sourcePath = sourcePath;
+    variant.targetSet = targetSet.platformName;
+
+    rtv::NativeAssetRuntimeLoader loader;
+    rtv::NativeRuntimeLoadOptions loadOptions;
+    loadOptions.rejectUnsupportedTextureFormats = false;
+    loadOptions.textureFormatSupport = targetSet;
+    const rtv::NativeRuntimeLoadedAsset loaded = loader.loadStandalone(sourcePath, loadOptions);
+    if (!loaded.errors.empty() || loaded.kind != rtv::NativeAssetKind::Texture) {
+        variant.status = "skipped_invalid_texture";
+        variant.reason = loaded.errors.empty() ? "Native payload is not a texture." : loaded.errors.front().message;
+        return variant;
+    }
+
+    variant.guid = loaded.guid;
+    variant.sourceFormat = rtv::nativeTextureFormatName(loaded.texturePayloadFormat);
+    const bool decodedRgbaSource = loaded.texturePayloadFormat == VK_FORMAT_R8G8B8A8_SRGB || loaded.texturePayloadFormat == VK_FORMAT_R8G8B8A8_UNORM;
+    const bool decodedHdrSource = loaded.texturePayloadFormat == VK_FORMAT_R32G32B32A32_SFLOAT || loaded.texturePayloadFormat == VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (loaded.texture.isCompressed || (!decodedRgbaSource && !decodedHdrSource)) {
+        variant.status = "skipped_not_decoded_rgba_or_hdr";
+        variant.reason = "Only decoded RGBA8 or HDR native texture payloads are eligible for automatic package sidecar emission.";
+        return variant;
+    }
+    if (loaded.texture.rgba8.empty() || loaded.texture.width == 0 || loaded.texture.height == 0) {
+        variant.status = "skipped_empty_payload";
+        variant.reason = "Texture payload has no decoded RGBA data.";
+        return variant;
+    }
+    if (loaded.guid.empty()) {
+        variant.status = "skipped_missing_guid";
+        variant.reason = "Texture payload has no native asset GUID.";
+        return variant;
+    }
+
+    const rtv::NativeTextureColorSpace colorSpace = loaded.texture.srgb ? rtv::NativeTextureColorSpace::Srgb : rtv::NativeTextureColorSpace::Linear;
+    const rtv::NativeTextureFormatSelection formatSelection = rtv::selectNativeTextureFormat(loaded.textureRole, colorSpace, targetSet);
+    const std::string variantSuffix = cookTextureVariantSuffix(formatSelection.selectedFormat);
+    variant.role = rtv::nativeTextureRoleName(loaded.textureRole);
+    variant.emittedFormat = rtv::nativeTextureFormatName(formatSelection.selectedFormat);
+    if (variantSuffix.empty() || (!formatSelection.blockCompressed && formatSelection.selectedFormat != VK_FORMAT_R16G16B16A16_SFLOAT)) {
+        variant.status = "skipped_no_package_target";
+        variant.reason = "Texture role does not select a supported BC4/BC5/BC7/RGBA16F package sidecar target.";
+        return variant;
+    }
+    const std::string emittedVariantKey = loaded.guid + "|" + rtv::nativeTextureFormatName(formatSelection.selectedFormat);
+    if (emittedVariantKeys.find(emittedVariantKey) != emittedVariantKeys.end()) {
+        variant.status = "skipped_duplicate_target_format";
+        variant.reason = "Another package texture target set already emitted the same GUID and payload format.";
+        return variant;
+    }
+
+    const std::filesystem::path sourceRelative = std::filesystem::path(relativePathString(sourcePath, cookRoot));
+    const std::filesystem::path variantRelative = std::filesystem::path("NativePackageVariants") /
+        sourceRelative.parent_path() /
+        (sourcePath.stem().string() + variantSuffix + sourcePath.extension().string());
+    variant.outputPath = cookRoot / variantRelative;
+    variant.packagePath = variantRelative.generic_string();
+
+    std::vector<std::byte> sourceBytes;
+    if (!readBinaryFileForCook(sourcePath, sourceBytes)) {
+        variant.status = "failed_read_source";
+        variant.reason = "Could not read copied native texture payload for variant source hashing.";
+        return variant;
+    }
+
+    rtv::NativeAssetCookInput input;
+    input.guid = loaded.guid;
+    input.outputPath = variant.outputPath;
+    input.sourcePath = sourcePath;
+    input.displayName = sourcePath.stem().string() + variantSuffix + "_package_variant";
+    input.sourceHash = rtv::nativeHashHex(rtv::nativeHashBytes(sourceBytes));
+    input.importSettingsHash = rtv::nativeHashHex(rtv::nativeHashText(
+        "rtpkg-auto-texture-sidecar-v4|" + variant.targetSet + "|" + variant.role + "|" + rtv::nativeTextureFormatName(formatSelection.selectedFormat) + "|" + variant.sourceFormat));
+
+    const rtv::NativeAssetCooker cooker(targetSet);
+    const rtv::NativeAssetCookResult result = cooker.cookTexture(input, loaded.texture, variant.role);
+    variant.emittedFormat = result.emittedVkFormat;
+    if (!result.success) {
+        variant.status = "failed_cook";
+        variant.reason = result.errors.empty() ? "Native texture package sidecar cook failed." : result.errors.front();
+        return variant;
+    }
+    if (result.emittedVkFormat != rtv::nativeTextureFormatName(formatSelection.selectedFormat)) {
+        variant.status = "skipped_no_selected_output";
+        variant.reason = "Automatic sidecar cook did not realize the selected package texture payload.";
+        return variant;
+    }
+
+    std::error_code ec;
+    const uintmax_t fileBytes = std::filesystem::file_size(variant.outputPath, ec);
+    variant.bytes = ec ? 0ull : static_cast<uint64_t>(fileBytes);
+    variant.generated = true;
+    variant.status = "generated";
+    variant.reason = "Decoded texture was cooked into a same-GUID package texture sidecar.";
+    emittedVariantKeys.insert(emittedVariantKey);
+    return variant;
+}
+
+CookGeneratedTexturePackageVariant cookGeneratedKtx2TexturePackageVariant(
+    const std::filesystem::path& nativeTexturePath,
+    const CookTextureSourceMetadata& sourceMetadata,
+    const std::filesystem::path& cookRoot,
+    const rtv::NativeTextureFormatSupport& targetSet,
+    std::unordered_set<std::string>& emittedVariantKeys) {
+    CookGeneratedTexturePackageVariant variant;
+    variant.sourcePath = sourceMetadata.sourcePath;
+    variant.sourceKind = "ktx2_source";
+    variant.targetSet = targetSet.platformName;
+
+    if (sourceMetadata.sourcePath.empty() || rtv::detectCompressedTextureKind(sourceMetadata.sourcePath.string()) != rtv::CompressedTextureKind::Ktx2) {
+        variant.status = "skipped_not_ktx2_source";
+        variant.reason = "Texture asset source is not a KTX2 container.";
+        return variant;
+    }
+
+    rtv::NativeAssetRuntimeLoader loader;
+    rtv::NativeRuntimeLoadOptions loadOptions;
+    loadOptions.rejectUnsupportedTextureFormats = false;
+    loadOptions.textureFormatSupport = targetSet;
+    const rtv::NativeRuntimeLoadedAsset loaded = loader.loadStandalone(nativeTexturePath, loadOptions);
+    if (!loaded.errors.empty() || loaded.kind != rtv::NativeAssetKind::Texture) {
+        variant.status = "skipped_invalid_texture";
+        variant.reason = loaded.errors.empty() ? "Native payload is not a texture." : loaded.errors.front().message;
+        return variant;
+    }
+
+    variant.guid = loaded.guid;
+    variant.role = rtv::nativeTextureRoleName(loaded.textureRole);
+    variant.sourceFormat = rtv::nativeTextureFormatName(loaded.texturePayloadFormat);
+    if (loaded.guid.empty()) {
+        variant.status = "skipped_missing_guid";
+        variant.reason = "Texture payload has no native asset GUID.";
+        return variant;
+    }
+
+    const rtv::NativeTextureColorSpace colorSpace = cookTextureColorSpaceForLoadedTexture(loaded);
+    const rtv::NativeTextureFormatSelection formatSelection = rtv::selectNativeTextureFormat(loaded.textureRole, colorSpace, targetSet);
+    const std::string variantSuffix = cookTextureVariantSuffix(formatSelection.selectedFormat);
+    variant.emittedFormat = rtv::nativeTextureFormatName(formatSelection.selectedFormat);
+    if (variantSuffix.empty() || (!formatSelection.blockCompressed && formatSelection.selectedFormat != VK_FORMAT_R16G16B16A16_SFLOAT)) {
+        variant.status = "skipped_no_package_target";
+        variant.reason = "Texture role does not select a supported BC4/BC5/BC7/RGBA16F package sidecar target.";
+        return variant;
+    }
+    const std::string emittedVariantKey = loaded.guid + "|" + rtv::nativeTextureFormatName(formatSelection.selectedFormat);
+    if (emittedVariantKeys.find(emittedVariantKey) != emittedVariantKeys.end()) {
+        variant.status = "skipped_duplicate_target_format";
+        variant.reason = "Another package texture target set already emitted the same GUID and payload format.";
+        return variant;
+    }
+
+    rtv::TextureData textureData;
+    try {
+        textureData = rtv::TextureLoader::loadKtx2(
+            sourceMetadata.sourcePath.string(),
+            targetSet,
+            loaded.textureRole,
+            colorSpace);
+    } catch (const std::exception& error) {
+        variant.status = "failed_source_transcode";
+        variant.reason = std::string("KTX2 source load/transcode failed: ") + error.what();
+        return variant;
+    }
+    if (textureData.pixels.empty() || textureData.width <= 0 || textureData.height <= 0) {
+        variant.status = "skipped_empty_payload";
+        variant.reason = "KTX2 source produced no texture payload for the target set.";
+        return variant;
+    }
+    if ((formatSelection.selectedFormat == VK_FORMAT_BC7_SRGB_BLOCK || formatSelection.selectedFormat == VK_FORMAT_BC7_UNORM_BLOCK) &&
+        (textureData.format == VK_FORMAT_BC7_SRGB_BLOCK || textureData.format == VK_FORMAT_BC7_UNORM_BLOCK)) {
+        textureData.format = formatSelection.selectedFormat;
+        textureData.compressedFormat = formatSelection.selectedFormat;
+    }
+
+    const std::filesystem::path nativeRelative = std::filesystem::path(relativePathString(nativeTexturePath, cookRoot));
+    const std::filesystem::path variantRelative = std::filesystem::path("NativePackageVariants") /
+        nativeRelative.parent_path() /
+        (nativeTexturePath.stem().string() + variantSuffix + nativeTexturePath.extension().string());
+    variant.outputPath = cookRoot / variantRelative;
+    variant.packagePath = variantRelative.generic_string();
+
+    std::vector<std::byte> sourceBytes;
+    if (!readBinaryFileForCook(sourceMetadata.sourcePath, sourceBytes)) {
+        variant.status = "failed_read_source";
+        variant.reason = "Could not read KTX2 source payload for variant source hashing.";
+        return variant;
+    }
+
+    rtv::NativeAssetCookInput input;
+    input.guid = loaded.guid;
+    input.outputPath = variant.outputPath;
+    input.sourcePath = sourceMetadata.sourcePath;
+    input.displayName = (sourceMetadata.displayName.empty() ? nativeTexturePath.stem().string() : sourceMetadata.displayName) + variantSuffix + "_package_ktx2_variant";
+    input.sourceHash = rtv::nativeHashHex(rtv::nativeHashBytes(sourceBytes));
+    input.importSettingsHash = rtv::nativeHashHex(rtv::nativeHashText(
+        "rtpkg-auto-ktx2-texture-sidecar-v1|" + variant.targetSet + "|" + variant.role + "|" + rtv::nativeTextureFormatName(formatSelection.selectedFormat) + "|" + rtv::nativeTextureFormatName(textureData.format)));
+
+    rtv::TextureAsset texture = cookTextureAssetFromData(textureData, sourceMetadata.sourcePath, sourceMetadata.displayName, colorSpace);
+    const rtv::NativeAssetCooker cooker(targetSet);
+    const rtv::NativeAssetCookResult result = cooker.cookTexture(input, texture, variant.role);
+    variant.emittedFormat = result.emittedVkFormat;
+    if (!result.success) {
+        variant.status = "failed_cook";
+        variant.reason = result.errors.empty() ? "KTX2 native texture package sidecar cook failed." : result.errors.front();
+        return variant;
+    }
+    if (result.emittedVkFormat != rtv::nativeTextureFormatName(formatSelection.selectedFormat)) {
+        variant.status = "skipped_no_selected_output";
+        variant.reason = "KTX2 sidecar cook did not realize the selected package texture payload.";
+        return variant;
+    }
+
+    std::error_code ec;
+    const uintmax_t fileBytes = std::filesystem::file_size(variant.outputPath, ec);
+    variant.bytes = ec ? 0ull : static_cast<uint64_t>(fileBytes);
+    variant.generated = true;
+    variant.status = "generated";
+    variant.reason = "KTX2 source was cooked into a same-GUID package texture sidecar for the target set.";
+    emittedVariantKeys.insert(emittedVariantKey);
+    return variant;
+}
+
+std::string cookPackageBaseName(const rtv::ProjectContext& project) {
+    std::string name = project.name.empty() ? project.projectFile.stem().string() : project.name;
+    for (char& ch : name) {
+        const unsigned char value = static_cast<unsigned char>(ch);
+        if (!std::isalnum(value) && ch != '_' && ch != '-') {
+            ch = '_';
+        }
+    }
+    return name.empty() ? std::string("Project") : name;
+}
+
+std::vector<rtv::NativeTextureFormatSupport> activeNativePackageTextureTargetSets(
+    const std::vector<rtv::NativeTextureFormatSupport>& requestedTargetSets) {
+    if (!requestedTargetSets.empty()) {
+        return requestedTargetSets;
+    }
+    return {rtv::nativeTextureAllBcFormatSupportForAudit()};
+}
+
+int cookProjectCommand(
+    const std::filesystem::path& projectFile,
+    std::filesystem::path outputDir,
+    std::filesystem::path manifestPath,
+    const rtv::NativeTextureFormatSupport& textureFormatSupport,
+    const std::vector<rtv::NativeTextureFormatSupport>& requestedPackageTextureTargetSets) {
+    const std::vector<rtv::NativeTextureFormatSupport> packageTextureTargetSets = activeNativePackageTextureTargetSets(requestedPackageTextureTargetSets);
     rtv::ProjectContext project;
     std::string projectError;
     if (!rtv::loadProjectFile(projectFile, project, &projectError)) {
@@ -478,6 +1770,8 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
             {"validationWarningCount", 0},
             {"cookErrors", errors},
             {"cookWarnings", nlohmann::json::array()},
+            {"nativeTextureFormatSupport", nativeTextureFormatSupportJson(textureFormatSupport)},
+            {"nativePackageTextureTargetSets", nativeTextureFormatSupportListJson(packageTextureTargetSets)},
             {"status", "failed"},
             {"policy", "Project file could not be loaded, so cook validation stopped before asset scanning."},
         };
@@ -494,6 +1788,8 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
             {"validationReport", relativePathString(validationReportPath, outputDir)},
             {"validationErrorCount", 1},
             {"validationWarningCount", 0},
+            {"nativeTextureFormatSupport", nativeTextureFormatSupportJson(textureFormatSupport)},
+            {"nativePackageTextureTargetSets", nativeTextureFormatSupportListJson(packageTextureTargetSets)},
             {"status", "failed"},
         };
         std::string writeError;
@@ -533,6 +1829,7 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     nlohmann::json copiedFiles = nlohmann::json::array();
     std::vector<CookFileCopyPlan> copyPlans;
     std::unordered_map<std::string, std::filesystem::path> plannedDestinationBySource;
+    std::unordered_map<std::string, CookTextureSourceMetadata> textureSourceMetadataByPayloadDestination;
     nlohmann::json assets = nlohmann::json::array();
     nlohmann::json missingSources = nlohmann::json::array();
     nlohmann::json missingImportedMetadata = nlohmann::json::array();
@@ -543,6 +1840,7 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     nlohmann::json unsupportedImportSettings = nlohmann::json::array();
     nlohmann::json requiresReimport = nlohmann::json::array();
     nlohmann::json projectWarnings = nlohmann::json::array();
+    nlohmann::json sublevelSceneReferences = nlohmann::json::array();
     nlohmann::json invalidSavedProjectReferences = nlohmann::json::array();
     nlohmann::json savedProjectReferenceParseErrors = nlohmann::json::array();
     nlohmann::json savedProjectReferenceScanRoots = nlohmann::json::array();
@@ -570,10 +1868,17 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     auto copyProjectFile = [&](const std::filesystem::path& source, std::string_view role) {
         (void)planCookFile(source, role, "project");
     };
+    std::vector<std::filesystem::path> sceneReferenceQueue;
+    auto queueSceneReference = [&](const std::filesystem::path& path) {
+        if (!path.empty()) {
+            sceneReferenceQueue.push_back(canonicalForCookCompare(path));
+        }
+    };
     copyProjectFile(project.projectFile, "project_file");
     copyProjectFile(project.assetRegistryPath, "asset_registry");
     if (std::filesystem::exists(project.startupScene)) {
         copyProjectFile(project.startupScene, "startup_scene");
+        queueSceneReference(project.startupScene);
     } else {
         warnings.push_back("Startup scene is missing: " + project.startupScene.string());
         projectWarnings.push_back({
@@ -598,6 +1903,45 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
                 continue;
             }
             copyProjectFile(entry.path(), "scene");
+            queueSceneReference(entry.path());
+        }
+    }
+
+    std::unordered_set<std::string> scannedSublevelScenes;
+    for (size_t sceneIndex = 0; sceneIndex < sceneReferenceQueue.size(); ++sceneIndex) {
+        const std::filesystem::path sceneFile = sceneReferenceQueue[sceneIndex];
+        const std::string sceneKey = cookCopySourceKey(sceneFile);
+        if (!scannedSublevelScenes.insert(sceneKey).second) {
+            continue;
+        }
+        const std::optional<nlohmann::json> sceneJson = readCookJsonFile(sceneFile);
+        if (!sceneJson.has_value()) {
+            continue;
+        }
+        nlohmann::json references = collectCookSceneSublevelReferences(*sceneJson, sceneFile, project.projectRoot);
+        for (nlohmann::json& reference : references) {
+            const std::filesystem::path referencedPath = reference.value("resolvedPath", std::string{});
+            std::error_code ec;
+            if (referencedPath.empty() || !std::filesystem::is_regular_file(referencedPath, ec)) {
+                errors.push_back("Referenced sublevel scene is missing: " + referencedPath.string());
+                projectWarnings.push_back({
+                    {"severity", "error"},
+                    {"kind", "MissingReferencedSublevel"},
+                    {"ownerScene", relativePathString(sceneFile, project.projectRoot)},
+                    {"sceneGuid", reference.value("sceneGuid", std::string{})},
+                    {"scenePath", reference.value("scenePath", std::string{})},
+                    {"resolvedPath", referencedPath.generic_string()},
+                    {"detail", "A saved level instance or sublevel entry references a scene that is not available for cook."},
+                });
+                sublevelSceneReferences.push_back(reference);
+                continue;
+            }
+            if (std::optional<std::filesystem::path> destination = planCookFile(referencedPath, "sublevel_scene", reference.value("sceneGuid", std::string{}))) {
+                reference["ownerScene"] = relativePathString(sceneFile, project.projectRoot);
+                reference["output"] = relativePathString(*destination, outputDir);
+            }
+            sublevelSceneReferences.push_back(reference);
+            queueSceneReference(referencedPath);
         }
     }
 
@@ -683,6 +2027,12 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
         if (!record.cachePath.empty()) {
             if (std::optional<std::filesystem::path> destination = planCookFile(cachePath, "asset_payload", record.guid)) {
                 asset["cookedPayloadOutput"] = relativePathString(*destination, outputDir);
+                if (record.type == rtv::AssetType::Texture || record.type == rtv::AssetType::HDRI) {
+                    textureSourceMetadataByPayloadDestination[cookCopySourceKey(*destination)] = CookTextureSourceMetadata{
+                        sourcePath,
+                        record.displayName,
+                    };
+                }
             }
         }
         if (!record.thumbnailPath.empty() && std::filesystem::exists(thumbnailPath)) {
@@ -736,6 +2086,22 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     const size_t validationErrorCount = countCookValidationSeverity(validationIssueArrays, "error");
     const size_t validationWarningCount = countCookValidationSeverity(validationIssueArrays, "warning");
     const std::filesystem::path validationReportPath = outputDir / "asset_validation_report.json";
+    const std::filesystem::path packagePath = outputDir / (cookPackageBaseName(project) + ".rtpkg");
+    const std::filesystem::path packageInspectionPath = outputDir / (cookPackageBaseName(project) + ".rtpkg.inspection.json");
+    std::string packageStatus = "pending";
+    std::string packageError;
+    size_t packageInputCount = 0;
+    uint64_t packageBytes = 0;
+    nlohmann::json nativeTexturePackageVariants = nlohmann::json::array();
+    auto nativeTexturePackageVariantGeneratedCount = [&]() {
+        size_t count = 0;
+        for (const nlohmann::json& item : nativeTexturePackageVariants) {
+            if (item.is_object() && item.value("generated", false)) {
+                ++count;
+            }
+        }
+        return count;
+    };
     auto plannedFilesJson = [&]() {
         nlohmann::json planned = nlohmann::json::array();
         for (const CookFileCopyPlan& plan : copyPlans) {
@@ -777,11 +2143,25 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
             {"savedProjectReferenceParseErrors", savedProjectReferenceParseErrors},
             {"savedProjectReferenceScanRoots", savedProjectReferenceScanRoots},
             {"savedProjectReferenceScannedFileCount", referenceScanFiles.size()},
+            {"sublevelSceneReferences", sublevelSceneReferences},
             {"requiresReimport", requiresReimport},
             {"projectWarnings", projectWarnings},
             {"cookErrors", errors},
             {"cookWarnings", warnings},
             {"status", status},
+            {"package", {
+                {"path", relativePathString(packagePath, outputDir)},
+                {"inspection", relativePathString(packageInspectionPath, outputDir)},
+                {"status", packageStatus},
+                {"inputCount", packageInputCount},
+                {"bytes", packageBytes},
+                {"error", packageError},
+                {"nativeTextureVariantCount", nativeTexturePackageVariants.size()},
+                {"nativeTextureVariantGeneratedCount", nativeTexturePackageVariantGeneratedCount()},
+                {"nativeTextureVariants", nativeTexturePackageVariants},
+            }},
+            {"nativeTextureFormatSupport", nativeTextureFormatSupportJson(textureFormatSupport)},
+            {"nativePackageTextureTargetSets", nativeTextureFormatSupportListJson(packageTextureTargetSets)},
             {"policy", "This report is generated by --cook-project before package emission. Missing raw sources are warnings when imported metadata and cooked payloads are available; missing metadata, missing cooked payloads, failed imports, and missing dependency GUIDs block the transparent cook."},
         };
     };
@@ -800,16 +2180,31 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
         manifest["assets"] = assets;
         manifest["plannedFiles"] = plannedFilesJson();
         manifest["copiedFiles"] = copiedFiles;
+        manifest["sublevelSceneReferences"] = sublevelSceneReferences;
         manifest["warnings"] = warnings;
         manifest["errors"] = errors;
         manifest["validationReport"] = relativePathString(validationReportPath, outputDir);
         manifest["validationErrorCount"] = validationErrorCount;
         manifest["validationWarningCount"] = validationWarningCount;
+        manifest["nativePackage"] = {
+            {"path", relativePathString(packagePath, outputDir)},
+            {"inspection", relativePathString(packageInspectionPath, outputDir)},
+            {"status", packageStatus},
+            {"inputCount", packageInputCount},
+            {"bytes", packageBytes},
+            {"error", packageError},
+            {"nativeTextureVariantCount", nativeTexturePackageVariants.size()},
+            {"nativeTextureVariantGeneratedCount", nativeTexturePackageVariantGeneratedCount()},
+            {"nativeTextureVariants", nativeTexturePackageVariants},
+        };
+        manifest["nativeTextureFormatSupport"] = nativeTextureFormatSupportJson(textureFormatSupport);
+        manifest["nativePackageTextureTargetSets"] = nativeTextureFormatSupportListJson(packageTextureTargetSets);
         manifest["status"] = status;
         manifest["futurePackageCompatibility"] = {
             {"packageObjectModel", "metadata_and_payload_chunks"},
             {"opaquePackageExtension", ".rtpkg"},
             {"transparentLayoutPreserved", true},
+            {"nativePackageEmission", true},
         };
         return manifest;
     };
@@ -826,6 +2221,10 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
         return true;
     };
 
+    if (!errors.empty()) {
+        packageStatus = "failed_validation";
+        packageError = "Cook validation failed before native package emission.";
+    }
     if (!writeCookArtifacts(errors.empty() ? "copying" : "failed")) {
         return 1;
     }
@@ -852,17 +2251,281 @@ int cookProjectCommand(const std::filesystem::path& projectFile, std::filesystem
     std::sort(errors.begin(), errors.end());
     errors.erase(std::unique(errors.begin(), errors.end()), errors.end());
 
+    std::vector<rtv::RtpkgAssetInput> packageInputs;
+    if (errors.empty()) {
+        packageStatus = "collecting_inputs";
+        std::unordered_set<std::string> emittedTextureVariantKeys;
+        for (const CookFileCopyPlan& plan : copyPlans) {
+            if (plan.role != "asset_payload" || !cookPackageNativePayloadCandidate(plan.destination)) {
+                continue;
+            }
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(plan.destination, ec)) {
+                continue;
+            }
+            rtv::RtpkgAssetInput input;
+            input.path = plan.destination;
+            input.packagePath = relativePathString(plan.destination, outputDir);
+            packageInputs.push_back(std::move(input));
+
+            if (rtv::nativeAssetKindFromExtension(plan.destination) == rtv::NativeAssetKind::Texture) {
+                const auto textureSourceIt = textureSourceMetadataByPayloadDestination.find(cookCopySourceKey(plan.destination));
+                const bool hasKtx2Source = textureSourceIt != textureSourceMetadataByPayloadDestination.end() &&
+                    !textureSourceIt->second.sourcePath.empty() &&
+                    rtv::detectCompressedTextureKind(textureSourceIt->second.sourcePath.string()) == rtv::CompressedTextureKind::Ktx2;
+                for (const rtv::NativeTextureFormatSupport& targetSet : packageTextureTargetSets) {
+                    const CookGeneratedTexturePackageVariant variant = hasKtx2Source
+                        ? cookGeneratedKtx2TexturePackageVariant(plan.destination, textureSourceIt->second, outputDir, targetSet, emittedTextureVariantKeys)
+                        : cookGeneratedTexturePackageVariant(plan.destination, outputDir, targetSet, emittedTextureVariantKeys);
+                    nativeTexturePackageVariants.push_back(cookGeneratedTexturePackageVariantJson(variant, outputDir));
+                    if (variant.generated) {
+                        rtv::RtpkgAssetInput variantInput;
+                        variantInput.path = variant.outputPath;
+                        variantInput.packagePath = variant.packagePath;
+                        packageInputs.push_back(std::move(variantInput));
+                    } else if (variant.status.rfind("failed", 0) == 0) {
+                        warnings.push_back("Native texture package variant generation skipped for " + plan.destination.string() + ": " + variant.reason);
+                    }
+                }
+            }
+        }
+        std::sort(packageInputs.begin(), packageInputs.end(), [](const rtv::RtpkgAssetInput& a, const rtv::RtpkgAssetInput& b) {
+            return a.packagePath < b.packagePath;
+        });
+        packageInputCount = packageInputs.size();
+        if (packageInputs.empty()) {
+            packageStatus = "skipped_no_native_inputs";
+            packageError = "Cook copied no standalone native payloads eligible for .rtpkg emission.";
+            warnings.push_back(packageError);
+        } else {
+            packageStatus = "writing";
+            rtv::RtpkgWriteDesc packageDesc;
+            packageDesc.debugName = project.name.empty() ? project.projectFile.stem().string() : project.name;
+            packageDesc.root = outputDir;
+            packageDesc.assets = packageInputs;
+            rtv::NativeBinaryError packageWriteError;
+            rtv::RtpkgWriter packageWriter;
+            if (!packageWriter.write(packagePath, packageDesc, &packageWriteError)) {
+                packageStatus = "failed";
+                packageError = packageWriteError.message.empty() ? std::string("Native package writer failed.") : packageWriteError.message;
+                errors.push_back("Native package emission failed: " + packageError);
+            } else {
+                std::error_code ec;
+                const uintmax_t bytes = std::filesystem::file_size(packagePath, ec);
+                packageBytes = ec ? 0ull : static_cast<uint64_t>(bytes);
+                rtv::RtpkgReader packageReader;
+                const rtv::RtpkgInspection packageInspection = packageReader.inspect(packagePath, true);
+                const nlohmann::json packageInspectionJson = rtv::rtpkgInspectionToJson(packageInspection, packagePath);
+                std::string writeError;
+                if (!writeJsonFile(packageInspectionPath, packageInspectionJson, &writeError)) {
+                    packageStatus = "failed_inspection_write";
+                    packageError = writeError;
+                    errors.push_back("Native package inspection report write failed: " + packageError);
+                } else if (!packageInspection.native.ok) {
+                    packageStatus = "failed_inspection";
+                    packageError = packageInspection.native.errors.empty() ? std::string("Native package inspection failed.") : packageInspection.native.errors.front().message;
+                    errors.push_back("Native package inspection failed: " + packageError);
+                } else {
+                    packageStatus = "success";
+                    packageError.clear();
+                }
+            }
+        }
+    }
+
     const bool success = errors.empty();
+    if (!success && packageStatus == "pending") {
+        packageStatus = "failed";
+    }
     if (!writeCookArtifacts(success ? "success" : "failed")) {
         return 1;
     }
 
     std::cout << "Cook validation report: " << validationReportPath.string() << '\n';
     std::cout << "Cook manifest: " << manifestPath.string() << '\n';
+    if (packageStatus == "success") {
+        std::cout << "Cook native package: " << packagePath.string() << " (" << packageInputCount << " assets)\n";
+        std::cout << "Cook native package inspection: " << packageInspectionPath.string() << '\n';
+    } else {
+        std::cout << "Cook native package status: " << packageStatus << " " << packageError << '\n';
+    }
     std::cout << "Cook copied " << copiedFiles.size() << " files for "
               << registry.records().size() << " assets; warnings=" << warnings.size()
               << " errors=" << errors.size() << '\n';
     return success ? 0 : 1;
+}
+
+int stageImportCommand(
+    const std::filesystem::path& sourcePath,
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& jsonOut,
+    const rtv::NativeTextureFormatSupport& textureFormatSupport) {
+    const std::filesystem::path root = workspaceRoot.empty()
+        ? (std::filesystem::current_path() / "out" / "stage_import_workspace")
+        : workspaceRoot;
+    rtv::AssetImportWorkspace workspace;
+    workspace.root = root;
+    workspace.contentRoot = root / "Content";
+    workspace.sourceAssetsRoot = root / "SourceAssets";
+    workspace.cacheRoot = root / "Cache";
+    workspace.registryPath = root / "Content" / "AssetRegistry.json";
+    workspace.nativeTextureFormatSupport = textureFormatSupport;
+
+    std::error_code ec;
+    std::filesystem::create_directories(workspace.contentRoot, ec);
+    std::filesystem::create_directories(workspace.sourceAssetsRoot, ec);
+    std::filesystem::create_directories(workspace.cacheRoot, ec);
+    if (ec) {
+        std::cerr << "Could not create staged import workspace: " << ec.message() << '\n';
+        return 1;
+    }
+
+    rtv::AssetImportRequest request;
+    request.sourcePath = sourcePath;
+    request.destinationFolder = "Models";
+    request.mode = "ImportAsset";
+    request.settings.copySourceIntoProject = false;
+    request.settings.buildCookedPayloadsNow = true;
+    request.settings.generateThumbnails = false;
+    const rtv::StagedAssetImportResult result = rtv::stagePlaceholderAssetImport(request, workspace);
+
+    nlohmann::json records = nlohmann::json::array();
+    for (const rtv::AssetRecord& record : result.records) {
+        records.push_back({
+            {"guid", record.guid},
+            {"type", rtv::assetTypeName(record.type)},
+            {"displayName", record.displayName},
+            {"importedPath", record.importedPath},
+            {"cachePath", record.cachePath},
+            {"dependencyCount", record.dependencies.size()},
+        });
+    }
+    nlohmann::json generated = nlohmann::json::array();
+    for (const std::filesystem::path& path : result.generatedFiles) {
+        generated.push_back(path.generic_string());
+    }
+    const nlohmann::json summary = {
+        {"success", result.success},
+        {"workspaceRoot", root.generic_string()},
+        {"sourcePath", sourcePath.generic_string()},
+        {"nativeTextureFormatSupport", nativeTextureFormatSupportJson(textureFormatSupport)},
+        {"recordCount", result.records.size()},
+        {"generatedFileCount", result.generatedFiles.size()},
+        {"generatedFiles", generated},
+        {"records", records},
+        {"importReportPath", result.importReportPath.generic_string()},
+        {"warnings", result.warnings},
+        {"errors", result.errors},
+    };
+    if (!jsonOut.empty()) {
+        std::filesystem::create_directories(jsonOut.parent_path(), ec);
+        std::ofstream file(jsonOut);
+        if (!file.is_open()) {
+            std::cerr << "Could not write staged import JSON: " << jsonOut << '\n';
+            return 1;
+        }
+        file << summary.dump(2);
+    } else {
+        std::cout << summary.dump(2) << '\n';
+    }
+    return result.success ? 0 : 1;
+}
+
+int cookAnimationControllerCommand(
+    const std::filesystem::path& sourcePath,
+    std::filesystem::path outputPath,
+    const std::filesystem::path& jsonOut) {
+    if (sourcePath.empty()) {
+        std::cerr << "--cook-animation-controller requires a transparent .rtanimcontroller.json source path\n";
+        return 1;
+    }
+    if (outputPath.empty()) {
+        outputPath = sourcePath;
+        const std::string filename = outputPath.filename().string();
+        if (filename.ends_with(".json")) {
+            outputPath.replace_filename(filename.substr(0, filename.size() - 5u));
+        } else {
+            outputPath.replace_extension(".rtanimcontroller");
+        }
+    }
+
+    std::vector<std::string> warnings;
+    const rtv::AnimationController controller = rtv::AnimationController::loadJson(sourcePath, &warnings);
+    if (!controller.valid()) {
+        std::cerr << "Animation controller cook failed: source did not parse into a valid controller: " << sourcePath << '\n';
+        const nlohmann::json report = {
+            {"schema", "AnimationControllerCookReportV1"},
+            {"success", false},
+            {"sourcePath", genericPathString(sourcePath)},
+            {"outputPath", genericPathString(outputPath)},
+            {"warnings", warnings},
+            {"errors", nlohmann::json::array({"source controller is invalid"})},
+        };
+        if (!jsonOut.empty()) {
+            std::string writeError;
+            (void)writeJsonFile(jsonOut, report, &writeError);
+        }
+        return 1;
+    }
+
+    std::vector<std::byte> sourceBytes;
+    if (!readBinaryFileForCook(sourcePath, sourceBytes)) {
+        std::cerr << "Animation controller cook failed: could not read source bytes: " << sourcePath << '\n';
+        return 1;
+    }
+
+    const std::string sourceHash = rtv::nativeHashHex(rtv::nativeHashBytes(sourceBytes));
+    const std::string settingsHash = rtv::nativeHashHex(rtv::nativeHashText("rtanimcontroller-compact-cook-v1"));
+    rtv::NativeAssetCookInput input;
+    input.guid = sourceHash.substr(0, 8) + "-" + sourceHash.substr(8, 4) + "-" + sourceHash.substr(12, 4) + "-" + sourceHash.substr(16, 4) + "-" + sourceHash.substr(20, 12);
+    input.outputPath = outputPath;
+    input.sourcePath = sourcePath;
+    input.displayName = controller.name().empty() ? sourcePath.stem().string() : controller.name();
+    input.sourceHash = sourceHash;
+    input.importSettingsHash = settingsHash;
+
+    const rtv::NativeAssetCooker cooker;
+    rtv::NativeAssetCookResult result = cooker.cookAnimationController(input, controller);
+    for (const std::string& warning : warnings) {
+        result.warnings.push_back(warning);
+    }
+
+    nlohmann::json nativeInspection = nullptr;
+    if (result.success) {
+        rtv::NativeAssetReader reader;
+        nativeInspection = rtv::nativeAssetInspectionToJson(reader.inspect(result.path, true), result.path);
+    }
+    const nlohmann::json report = {
+        {"schema", "AnimationControllerCookReportV1"},
+        {"success", result.success},
+        {"sourcePath", genericPathString(sourcePath)},
+        {"outputPath", genericPathString(result.path)},
+        {"assetGuid", input.guid},
+        {"sourceHash", sourceHash},
+        {"importSettingsHash", settingsHash},
+        {"payloadHash", result.payloadHash},
+        {"payloadBytes", result.payloadBytes},
+        {"parameterCount", controller.parameters().size()},
+        {"stateCount", controller.states().size()},
+        {"layerCount", controller.layers().size()},
+        {"avatarMaskCount", controller.avatarMasks().size()},
+        {"warnings", result.warnings},
+        {"errors", result.errors},
+        {"nativeInspection", nativeInspection},
+    };
+    if (!jsonOut.empty()) {
+        std::string writeError;
+        if (!writeJsonFile(jsonOut, report, &writeError)) {
+            std::cerr << "Animation controller cook failed: could not write report: " << writeError << '\n';
+            return 1;
+        }
+    }
+    if (!result.success) {
+        std::cerr << "Animation controller cook failed: " << (result.errors.empty() ? std::string("unknown error") : result.errors.front()) << '\n';
+        return 1;
+    }
+    std::cout << "Cooked animation controller: " << result.path.string() << '\n';
+    return 0;
 }
 
 } // namespace
@@ -880,6 +2543,7 @@ int main(int argc, char** argv) {
         std::optional<rtv::TemporalUpscaler> temporalUpscalerOverride;
         std::optional<bool> dlssFrameGenerationOverride;
         std::optional<bool> dlssRayReconstructionOverride;
+        std::optional<bool> streamlineReflexOverride;
         std::optional<float> dlssSharpeningOverride;
         std::optional<rtv::RestirMode> restirModeOverride;
         std::optional<rtv::RenderPreset> renderPresetOverride;
@@ -937,9 +2601,55 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> crashDumpPackageDir;
         std::optional<std::filesystem::path> checkBudgetPath;
         std::optional<std::filesystem::path> descriptorLifetimeStressPath;
+        std::optional<std::filesystem::path> nativePackageScenePath;
+        rtv::NativePackageAnimationSelection nativePackageAnimationSelection;
         std::optional<std::filesystem::path> cookProjectPath;
+        std::optional<std::filesystem::path> cookAnimationControllerPath;
+        std::optional<std::filesystem::path> exportAnimationControllerPath;
+        std::optional<std::filesystem::path> mutateAnimationControllerPath;
+        std::filesystem::path controllerMutationJsonPath;
+        std::filesystem::path controllerOutputPath;
+        bool controllerMutationDryRun = false;
+        bool controllerForceOverwrite = false;
+        std::filesystem::path nativeOutputPath;
+        std::optional<std::filesystem::path> stageImportPath;
+        std::filesystem::path stageImportWorkspaceRoot;
+        std::filesystem::path stageImportJsonPath;
+        std::optional<std::filesystem::path> inspectNativeAssetPath;
+        std::optional<std::filesystem::path> inspectAnimationControllerPath;
+        std::optional<std::filesystem::path> inspectRuntimeSkeletonPath;
+        std::optional<std::filesystem::path> inspectionJsonPath;
+        std::optional<std::filesystem::path> emitNativeFixturePath;
+        std::optional<std::filesystem::path> emitBasisuKtx2FixturePath;
+        rtv::NativeAssetKind emitNativeFixtureKind = rtv::NativeAssetKind::Unknown;
+        std::string emitNativeFixtureGuid;
+        std::string emitNativeFixtureMaterialTextureGuid;
+        std::string emitNativeFixtureTextureRole;
+        uint32_t emitNativeFixtureTextureFormat = 0;
+        std::optional<std::filesystem::path> migrateNativeAssetPath;
+        std::optional<std::filesystem::path> migratePackagePath;
+        std::filesystem::path migrationReportPath;
+        bool migrationDryRun = false;
+        bool inspectNativeStore = false;
+        std::vector<std::filesystem::path> nativeStorePackages;
+        std::vector<std::filesystem::path> nativeStoreRoots;
+        std::vector<std::string> nativeStoreQueries;
+        std::vector<std::string> nativeStoreRetains;
+        std::vector<std::string> nativeStoreReleases;
+        std::vector<std::filesystem::path> nativeStoreUnmountPackages;
+        std::optional<std::filesystem::path> loadNativeRuntimeAssetsPath;
+        std::optional<std::filesystem::path> writeRtpkgPath;
+        std::optional<std::filesystem::path> inspectRtpkgPath;
+        std::filesystem::path rtpkgRoot;
+        std::vector<std::filesystem::path> rtpkgInputs;
         std::filesystem::path cookOutputDir;
         std::filesystem::path cookManifestPath;
+        rtv::NativeTextureFormatSupport nativeTextureFormatSupport = rtv::nativeTextureOfflineFallbackFormatSupport();
+        std::vector<rtv::NativeTextureFormatSupport> nativePackageTextureTargetSets;
+        GpuUploadTicketSimulationArgs gpuUploadSimulation;
+        MainThreadApplySimulationArgs mainThreadApplySimulation;
+        TopologyRebuildSimulationArgs topologyRebuildSimulation;
+        NativeTextureFormatPolicySimulationArgs nativeTextureFormatPolicySimulation;
         uint32_t descriptorLifetimeStressCycles = 12;
         uint32_t descriptorLifetimeStressFrames = 2;
         bool validateGpuLabels = false;
@@ -970,6 +2680,68 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
 
+            if (arg == "--mutate-animation-controller" && i + 1 < argc) {
+                mutateAnimationControllerPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--controller-mutation-json" && i + 1 < argc) {
+                controllerMutationJsonPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--controller-dry-run" || arg == "--controller-mutation-dry-run") {
+                controllerMutationDryRun = true;
+                continue;
+            }
+            if (arg == "--controller-force-overwrite") {
+                controllerForceOverwrite = true;
+                continue;
+            }
+            if (arg == "--native-fixture-guid" && i + 1 < argc) {
+                emitNativeFixtureGuid = argv[++i];
+                continue;
+            }
+            if (arg == "--native-fixture-texture-format" && i + 1 < argc) {
+                emitNativeFixtureTextureFormat = parseNativeFixtureTextureFormat(argv[++i]);
+                continue;
+            }
+            if (arg == "--native-fixture-texture-role" && i + 1 < argc) {
+                emitNativeFixtureTextureRole = argv[++i];
+                continue;
+            }
+            if (arg == "--native-fixture-material-texture-guid" && i + 1 < argc) {
+                emitNativeFixtureMaterialTextureGuid = argv[++i];
+                continue;
+            }
+            if (arg == "--native-package-texture-target-set-json" && i + 1 < argc) {
+                try {
+                    nativePackageTextureTargetSets = nativeTextureFormatSupportListFromJson(nlohmann::json::parse(argv[++i]));
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(std::string("Invalid --native-package-texture-target-set-json payload: ") + error.what());
+                }
+                continue;
+            }
+
+            if (parseGpuUploadTicketSimulationArg(arg, argc, argv, i, gpuUploadSimulation)) {
+                continue;
+            }
+            if (parseMainThreadApplySimulationArg(arg, argc, argv, i, mainThreadApplySimulation)) {
+                continue;
+            }
+            if (parseTopologyRebuildSimulationArg(arg, argc, argv, i, topologyRebuildSimulation)) {
+                continue;
+            }
+            if (parseNativeTextureFormatPolicySimulationArg(arg, argc, argv, i, nativeTextureFormatPolicySimulation)) {
+                continue;
+            }
+            if (parseNativePackageAnimationSelectionArg(arg, argc, argv, i, nativePackageAnimationSelection)) {
+                continue;
+            }
+            if ((arg == "--reflex" || arg == "--streamline-reflex") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                streamlineReflexOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
+
             if (arg == "--frames" && i + 1 < argc) {
                 maxFrames = static_cast<uint32_t>(std::stoul(argv[++i]));
             } else if (arg == "--compare-profile" && i + 2 < argc) {
@@ -992,6 +2764,8 @@ int main(int argc, char** argv) {
                 hdrPath = std::filesystem::path(argv[++i]);
             } else if ((arg == "--scene" || arg == "--rtlevel") && i + 1 < argc) {
                 scenePath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--native-package-scene" && i + 1 < argc) {
+                nativePackageScenePath = std::filesystem::path(argv[++i]);
             } else if (arg == "--denoiser" && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 denoiserOverride = !(value == "off" || value == "false" || value == "0");
@@ -1197,6 +2971,75 @@ int main(int argc, char** argv) {
                 cookOutputDir = std::filesystem::path(argv[++i]);
             } else if (arg == "--cook-manifest" && i + 1 < argc) {
                 cookManifestPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--cook-animation-controller" && i + 1 < argc) {
+                cookAnimationControllerPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--export-animation-controller" && i + 1 < argc) {
+                exportAnimationControllerPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--controller-output" && i + 1 < argc) {
+                controllerOutputPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--native-output" && i + 1 < argc) {
+                nativeOutputPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--native-texture-format-support-json" && i + 1 < argc) {
+                try {
+                    nativeTextureFormatSupport = nativeTextureFormatSupportFromJson(nlohmann::json::parse(argv[++i]));
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(std::string("Invalid --native-texture-format-support-json payload: ") + error.what());
+                }
+            } else if (arg == "--stage-import" && i + 1 < argc) {
+                stageImportPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--stage-import-workspace" && i + 1 < argc) {
+                stageImportWorkspaceRoot = std::filesystem::path(argv[++i]);
+            } else if (arg == "--stage-import-json" && i + 1 < argc) {
+                stageImportJsonPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--inspect-native-asset" && i + 1 < argc) {
+                inspectNativeAssetPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--inspect-animation-controller" && i + 1 < argc) {
+                inspectAnimationControllerPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--inspect-runtime-skeleton" && i + 1 < argc) {
+                inspectRuntimeSkeletonPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--inspection-json" && i + 1 < argc) {
+                inspectionJsonPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--emit-native-fixture" && i + 1 < argc) {
+                emitNativeFixturePath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--emit-basisu-ktx2-fixture" && i + 1 < argc) {
+                emitBasisuKtx2FixturePath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--migrate-native-asset" && i + 1 < argc) {
+                migrateNativeAssetPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--migrate-package" && i + 1 < argc) {
+                migratePackagePath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--migration-report" && i + 1 < argc) {
+                migrationReportPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--dry-run") {
+                migrationDryRun = true;
+            } else if (arg == "--inspect-native-store") {
+                inspectNativeStore = true;
+            } else if (arg.rfind("--native-store-", 0) == 0 && i + 1 < argc) {
+                const std::string value(argv[++i]);
+                if (arg == "--native-store-package") {
+                    nativeStorePackages.push_back(std::filesystem::path(value));
+                } else if (arg == "--native-store-root") {
+                    nativeStoreRoots.push_back(std::filesystem::path(value));
+                } else if (arg == "--native-store-query") {
+                    nativeStoreQueries.push_back(value);
+                } else if (arg == "--native-store-retain") {
+                    nativeStoreRetains.push_back(value);
+                } else if (arg == "--native-store-release") {
+                    nativeStoreReleases.push_back(value);
+                } else if (arg == "--native-store-unmount-package") {
+                    nativeStoreUnmountPackages.push_back(std::filesystem::path(value));
+                }
+            } else if (arg == "--load-native-runtime-assets" && i + 1 < argc) {
+                loadNativeRuntimeAssetsPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--write-rtpkg" && i + 1 < argc) {
+                writeRtpkgPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--package-input" && i + 1 < argc) {
+                rtpkgInputs.push_back(std::filesystem::path(argv[++i]));
+            } else if (arg == "--package-root" && i + 1 < argc) {
+                rtpkgRoot = std::filesystem::path(argv[++i]);
+            } else if (arg == "--inspect-package" && i + 1 < argc) {
+                inspectRtpkgPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--native-asset-kind" && i + 1 < argc) {
+                emitNativeFixtureKind = parseNativeAssetKindName(argv[++i]);
             } else if (arg == "--shader-hot-reload-report") {
                 shaderHotReloadReport = true;
             } else if (arg == "--disable-pass" && i + 1 < argc) {
@@ -1230,8 +3073,96 @@ int main(int argc, char** argv) {
                 compareImageOutputPath,
                 sequenceViewNames);
         }
+        if (gpuUploadSimulation.enabled) {
+            if (gpuUploadSimulation.cancelBeforeSubmit && gpuUploadSimulation.cancelAfterSubmit) {
+                throw std::runtime_error("--upload-cancel-before-submit and --upload-cancel-after-submit are mutually exclusive");
+            }
+            return simulateGpuUploadTicketCommand(
+                inspectionJsonPath.value_or(std::filesystem::path{}),
+                gpuUploadSimulation.totalBytes,
+                gpuUploadSimulation.chunkBytes,
+                gpuUploadSimulation.frameByteLimit,
+                gpuUploadSimulation.cancelBeforeSubmit,
+                gpuUploadSimulation.cancelAfterSubmit);
+        }
+        if (mainThreadApplySimulation.enabled) {
+            return simulateMainThreadApplyCommand(
+                inspectionJsonPath.value_or(std::filesystem::path{}),
+                mainThreadApplySimulation.operationCount,
+                mainThreadApplySimulation.operationCostMs,
+                mainThreadApplySimulation.frameBudgetMs,
+                mainThreadApplySimulation.cancelAfterFrame);
+        }
+        if (topologyRebuildSimulation.enabled) {
+            return simulateTopologyRebuildCommand(
+                inspectionJsonPath.value_or(std::filesystem::path{}),
+                topologyRebuildSimulation.stageCostMs,
+                topologyRebuildSimulation.frameBudgetMs,
+                topologyRebuildSimulation.newerEditFrame);
+        }
+        if (nativeTextureFormatPolicySimulation.enabled) {
+            return simulateNativeTextureFormatPolicyCommand(inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (emitBasisuKtx2FixturePath.has_value()) {
+            return emitBasisuKtx2FixtureCommand(*emitBasisuKtx2FixturePath, inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
         if (cookProjectPath.has_value()) {
-            return cookProjectCommand(*cookProjectPath, cookOutputDir, cookManifestPath);
+            return cookProjectCommand(*cookProjectPath, cookOutputDir, cookManifestPath, nativeTextureFormatSupport, nativePackageTextureTargetSets);
+        }
+        if (cookAnimationControllerPath.has_value()) {
+            return cookAnimationControllerCommand(*cookAnimationControllerPath, nativeOutputPath, inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (exportAnimationControllerPath.has_value()) {
+            return rtv::exportAnimationControllerCommand(*exportAnimationControllerPath, controllerOutputPath, inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (mutateAnimationControllerPath.has_value()) {
+            return rtv::mutateAnimationControllerCommand(
+                *mutateAnimationControllerPath,
+                controllerMutationJsonPath,
+                controllerOutputPath,
+                inspectionJsonPath.value_or(std::filesystem::path{}),
+                controllerMutationDryRun,
+                controllerForceOverwrite);
+        }
+        if (stageImportPath.has_value()) {
+            return stageImportCommand(*stageImportPath, stageImportWorkspaceRoot, stageImportJsonPath, nativeTextureFormatSupport);
+        }
+        if (emitNativeFixturePath.has_value()) {
+            return rtv::emitNativeAssetFixtureCommand(*emitNativeFixturePath, emitNativeFixtureKind, emitNativeFixtureGuid, emitNativeFixtureTextureFormat, emitNativeFixtureMaterialTextureGuid, emitNativeFixtureTextureRole);
+        }
+        if (inspectNativeAssetPath.has_value()) {
+            return rtv::inspectNativeAssetCommand(*inspectNativeAssetPath, inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (inspectAnimationControllerPath.has_value()) {
+            return rtv::inspectAnimationControllerCommand(*inspectAnimationControllerPath, inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (inspectRuntimeSkeletonPath.has_value()) {
+            return rtv::inspectRuntimeSkeletonCommand(*inspectRuntimeSkeletonPath, inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (migrateNativeAssetPath.has_value()) {
+            return rtv::migrateNativeAssetCommand(*migrateNativeAssetPath, migrationReportPath, migrationDryRun);
+        }
+        if (migratePackagePath.has_value()) {
+            return rtv::migratePackageCommand(*migratePackagePath, migrationReportPath, migrationDryRun);
+        }
+        if (inspectNativeStore) {
+            return rtv::inspectNativeAssetStoreCommand(
+                nativeStorePackages,
+                nativeStoreRoots,
+                nativeStoreQueries,
+                nativeStoreRetains,
+                nativeStoreReleases,
+                nativeStoreUnmountPackages,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (loadNativeRuntimeAssetsPath.has_value()) {
+            return rtv::loadNativeRuntimeAssetsCommand(*loadNativeRuntimeAssetsPath, inspectionJsonPath.value_or(std::filesystem::path{}), nativeTextureFormatSupport);
+        }
+        if (writeRtpkgPath.has_value()) {
+            return rtv::writeRtpkgCommand(*writeRtpkgPath, rtpkgInputs, rtpkgRoot);
+        }
+        if (inspectRtpkgPath.has_value()) {
+            return rtv::inspectRtpkgCommand(*inspectRtpkgPath, inspectionJsonPath.value_or(std::filesystem::path{}));
         }
 
         for (const std::string& viewName : sequenceViewNames) {
@@ -1275,7 +3206,14 @@ int main(int argc, char** argv) {
         if (needsProfile) {
             diagConfig.profile = true;
         }
-        const std::filesystem::path diagnosticSourcePath = scenePath.value_or(gltfPath.value_or("scene"));
+        std::filesystem::path diagnosticSourcePath = "scene";
+        if (scenePath.has_value()) {
+            diagnosticSourcePath = *scenePath;
+        } else if (gltfPath.has_value()) {
+            diagnosticSourcePath = *gltfPath;
+        } else if (nativePackageScenePath.has_value()) {
+            diagnosticSourcePath = *nativePackageScenePath;
+        }
         const std::filesystem::path artifactBase =
             rtv::defaultDiagnosticArtifactDir(diagnosticSourcePath, "current");
         if (needsProfile && !diagConfig.profileJsonPath.has_value()) {
@@ -1300,8 +3238,18 @@ int main(int argc, char** argv) {
             diagConfig.fixedSeed = *frameIndex;
         }
 
-        if (diagConfig.headless && !scenePath.has_value() && !gltfPath.has_value()) {
-            throw std::runtime_error("--headless requires --scene <path> or --gltf <path>");
+        if (nativePackageScenePath.has_value() && (scenePath.has_value() || gltfPath.has_value())) {
+            throw std::runtime_error("--native-package-scene is mutually exclusive with --scene and --gltf");
+        }
+        const bool nativePackageAnimationSelectionRequested = !nativePackageAnimationSelection.controllerGuid.empty() ||
+            !nativePackageAnimationSelection.controllerPath.empty() ||
+            !nativePackageAnimationSelection.entityName.empty() ||
+            nativePackageAnimationSelection.entityUuid != 0;
+        if (nativePackageAnimationSelectionRequested && !nativePackageScenePath.has_value()) {
+            throw std::runtime_error("Native package animation selection flags require --native-package-scene <path>");
+        }
+        if (diagConfig.headless && !scenePath.has_value() && !gltfPath.has_value() && !nativePackageScenePath.has_value()) {
+            throw std::runtime_error("--headless requires --scene <path>, --gltf <path>, or --native-package-scene <path>");
         }
         if (diagConfig.saveFrameSequenceDir.has_value() && !diagConfig.headless) {
             throw std::runtime_error("--save-frame-sequence requires --headless");
@@ -1323,7 +3271,8 @@ int main(int argc, char** argv) {
         }
 #endif
 
-        rtv::Application app(debugView, gltfPath, hdrPath, scenePath,
+        rtv::Application app(debugView, gltfPath, hdrPath, scenePath, nativePackageScenePath,
+            nativePackageAnimationSelection,
             denoiserOverride, restirModeOverride, renderPresetOverride, restirGiOverride,
             opacityMicromapOverride,
             opacityMicromapSubdivisionOverride,
@@ -1356,6 +3305,7 @@ int main(int argc, char** argv) {
                 temporalUpscalerOverride.has_value() ||
                 dlssFrameGenerationOverride.has_value() ||
                 dlssRayReconstructionOverride.has_value() ||
+                streamlineReflexOverride.has_value() ||
                 dlssSharpeningOverride.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();
                 if (denoiserBackendOverride.has_value()) {
@@ -1369,6 +3319,9 @@ int main(int argc, char** argv) {
                 }
                 if (dlssRayReconstructionOverride.has_value()) {
                     settings.dlssRayReconstructionEnabled = *dlssRayReconstructionOverride;
+                }
+                if (streamlineReflexOverride.has_value()) {
+                    settings.streamlineReflexEnabled = *streamlineReflexOverride;
                 }
                 if (dlssSharpeningOverride.has_value()) {
                     settings.dlssSharpeningStrength = std::clamp(*dlssSharpeningOverride, 0.0f, 1.0f);
@@ -1387,6 +3340,10 @@ int main(int argc, char** argv) {
                 if (settings.dlssRayReconstructionEnabled && !nvidiaStatus.dlssRayReconstructionAvailable) {
                     std::cerr << "Warning: DLSS Ray Reconstruction requested, but unavailable: "
                               << nvidiaStatus.dlssRayReconstructionUnavailableReason << ".\n";
+                }
+                if (settings.streamlineReflexEnabled && !nvidiaStatus.streamlineReflex.requestable) {
+                    std::cerr << "Warning: Streamline Reflex requested, but unavailable: "
+                              << nvidiaStatus.streamlineReflex.unavailableReason << ".\n";
                 }
                 if (settings.dlssFrameGenerationEnabled && !nvidiaStatus.dlssFrameGenerationAvailable) {
                     std::cerr << "Warning: DLSS Frame Generation requested, but unavailable: "

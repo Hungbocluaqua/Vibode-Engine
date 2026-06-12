@@ -39,6 +39,7 @@ struct GpuFrameTimings {
     float selectionOutlineMs = 0.0f;
     float fullscreenMs = 0.0f;
     float editorPresentationMs = 0.0f;
+    float dynamicBlasUpdateMs = 0.0f;
     float wavefrontTraceMs = 0.0f;
     float wavefrontSecondaryTraceMs = 0.0f;
     float wavefrontSortedTraceMs = 0.0f;
@@ -74,6 +75,7 @@ struct GpuFrameTimings {
             selectionOutlineMs +
             fullscreenMs +
             editorPresentationMs +
+            dynamicBlasUpdateMs +
             wavefrontTraceMs +
             wavefrontSecondaryTraceMs +
             wavefrontSortedTraceMs +
@@ -173,7 +175,9 @@ public:
         WavefrontSecondaryTraceEnd = 74,
         WavefrontSortedTraceStart = 75,
         WavefrontSortedTraceEnd = 76,
-        Count = 77,
+        DynamicBlasUpdateStart = 77,
+        DynamicBlasUpdateEnd = 78,
+        Count = 79,
     };
 
     GpuProfiler() = default;

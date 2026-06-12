@@ -16,6 +16,7 @@ void main() {
     payload.mesh_id = 0xffffffffu;
     payload.primitive_id = 0xffffffffu;
     payload.picking = 0u;
+    payload.barycentrics = vec3(1.0, 0.0, 0.0);
     payload.uv = vec2(0.0);
     payload.uv1 = vec2(0.0);
     payload.tangent = vec3(1.0, 0.0, 0.0);

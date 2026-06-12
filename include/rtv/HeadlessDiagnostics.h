@@ -2,6 +2,9 @@
 
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
+#include "rtv/GpuUploadTicket.h"
+#include "rtv/MainThreadApplyTicket.h"
+#include "rtv/TopologyRebuildTicket.h"
 
 #include <array>
 #include <cstdint>
@@ -102,6 +105,7 @@ struct ProfileReport {
         float selectionOutline = 0.0f;
         float fullscreen = 0.0f;
         float editorPresentation = 0.0f;
+        float dynamicBlasUpdate = 0.0f;
         float wavefrontTrace = 0.0f;
         float wavefrontSecondaryTrace = 0.0f;
         float wavefrontSortedTrace = 0.0f;
@@ -257,6 +261,101 @@ struct ProfileReport {
         uint32_t blasBlendedGeometryCount = 0;
         uint32_t blasOpacityMicromapGeometryCount = 0;
     } rayTracingGeometry{};
+
+    struct AnimatedGeometryReport {
+        uint32_t meshInstanceCount = 0;
+        uint32_t staticMeshInstanceCount = 0;
+        uint32_t transformOnlyCandidateInstanceCount = 0;
+        uint32_t deformingInstanceCount = 0;
+        uint32_t morphDeformingInstanceCount = 0;
+        uint32_t skinnedDeformingInstanceCount = 0;
+        uint32_t combinedMorphSkinnedInstanceCount = 0;
+        uint32_t runtimeMeshInstanceCount = 0;
+        uint32_t materialOverrideRuntimeMeshInstanceCount = 0;
+        uint32_t missingMeshInstanceCount = 0;
+        uint32_t totalPrimitiveCount = 0;
+        uint32_t totalTriangleCount = 0;
+        uint32_t gpuSkinningCandidateInstanceCount = 0;
+        uint32_t gpuSkinningMorphPreSkinInstanceCount = 0;
+        uint32_t gpuSkinningJointMatrixCount = 0;
+        uint64_t gpuSkinningJointUploadBytes = 0;
+        uint64_t gpuSkinningPreviousJointUploadBytes = 0;
+        uint64_t gpuSkinningSourceVertexUploadBytes = 0;
+        uint64_t gpuSkinningMorphDeltaUploadBytes = 0;
+        uint32_t gpuSkinningCurrentVertexCount = 0;
+        uint32_t gpuSkinningPreviousVertexCount = 0;
+        uint64_t gpuSkinningCurrentVertexBufferBytes = 0;
+        uint64_t gpuSkinningPreviousVertexBufferBytes = 0;
+        uint32_t gpuSkinningCpuFallbackInstanceCount = 0;
+        uint32_t gpuSkinningDispatchRecordCount = 0;
+        bool gpuSkinningRendererPlanActive = false;
+        uint64_t gpuSkinningRendererJointUploadBytes = 0;
+        uint64_t gpuSkinningRendererPreviousJointUploadBytes = 0;
+        uint64_t gpuSkinningRendererSourceVertexUploadBytes = 0;
+        uint64_t gpuSkinningRendererMorphDeltaUploadBytes = 0;
+        uint64_t gpuSkinningRendererCurrentVertexBufferBytes = 0;
+        uint64_t gpuSkinningRendererPreviousVertexBufferBytes = 0;
+        bool gpuSkinningRendererBuffersAllocated = false;
+        bool gpuSkinningRendererSourceVertexBufferUploaded = false;
+        bool gpuSkinningRendererMorphDeltaBufferUploaded = false;
+        bool gpuSkinningRendererJointBufferUploaded = false;
+        bool gpuSkinningRendererPreviousJointBufferUploaded = false;
+        bool gpuSkinningRendererJointPayloadRefreshUploaded = false;
+        bool gpuSkinningRendererJointPayloadRefreshStaged = false;
+        bool gpuSkinningRendererJointPayloadRefreshCopyRecorded = false;
+        uint32_t gpuSkinningRendererJointPayloadRefreshCount = 0;
+        uint32_t gpuSkinningRendererJointPayloadRefreshCopyRecordCount = 0;
+        uint64_t gpuSkinningRendererJointPayloadRefreshBytes = 0;
+        uint64_t gpuSkinningRendererJointPayloadRefreshStagedBytes = 0;
+        uint64_t gpuSkinningRendererJointPayloadRefreshCopyBytes = 0;
+        bool gpuSkinningRendererComputePipelineCreated = false;
+        bool gpuSkinningRendererDescriptorsBound = false;
+        bool gpuSkinningRendererComputeDispatchEnabled = false;
+        uint32_t gpuSkinningRendererComputeDispatchRecordCount = 0;
+        uint32_t gpuSkinningRendererComputeMorphDispatchRecordCount = 0;
+        bool gpuSkinningRendererOutputReadbackBufferAllocated = false;
+        bool gpuSkinningRendererOutputReadbackCopyRecorded = false;
+        bool gpuSkinningRendererOutputReadbackValidationPassed = false;
+        uint32_t gpuSkinningRendererOutputReadbackVertexCount = 0;
+        float gpuSkinningRendererOutputReadbackMaxPositionError = 0.0f;
+        bool gpuSkinningRendererInitialComputeDispatchSubmitted = false;
+        bool gpuSkinningRayTracingGeometryInputEnabled = false;
+        uint32_t gpuSkinningRayTracingGeometryInputMeshCount = 0;
+        uint32_t gpuSkinningRayTracingGeometryInputGeometryCount = 0;
+        bool gpuSkinningRayTracingDescriptorInputEnabled = false;
+        bool gpuSkinningRayTracingDescriptorInputMixedSceneEnabled = false;
+        uint32_t gpuSkinningRayTracingDescriptorInputMeshCount = 0;
+        uint32_t gpuSkinningRayTracingDescriptorInputBindingCount = 0;
+        bool gpuSkinningSkinnedMotionVectorsEnabled = false;
+        bool gpuSkinningSkinnedMotionVectorsPreviousVertexInputEnabled = false;
+        bool gpuSkinningSkinnedMotionVectorsDescriptorBound = false;
+        uint32_t rayTracingBlasCount = 0;
+        uint32_t rayTracingInstanceCount = 0;
+        uint32_t tlasRefitCount = 0;
+        float lastTlasRefitMs = 0.0f;
+        uint32_t dynamicBlasUpdateCount = 0;
+        float dynamicBlasUpdateRecordMs = 0.0f;
+        float dynamicBlasUpdateMs = 0.0f;
+        bool dynamicBlasUpdateSupported = false;
+        uint32_t dynamicBlasUnsupportedInstanceCount = 0;
+        uint32_t dynamicBlasCpuFallbackInstanceCount = 0;
+        std::string dynamicBlasFallbackPolicy = "not_reported";
+        std::vector<std::string> dynamicBlasFallbackWarnings;
+        float dynamicBlasBudgetMs = 0.0f;
+        bool dynamicBlasBudgetExceeded = false;
+        uint32_t dynamicBlasOverBudgetFrameCount = 0;
+        std::string dynamicBlasBudgetPolicy = "not_reported";
+        std::string transformOnlyPolicy;
+        std::string deformingPolicy;
+        std::string morphPolicy;
+        std::string skinningPolicy;
+        std::string gpuSkinningDataPolicy;
+        std::string gpuSkinningJointUploadPolicy;
+        std::string gpuSkinningBufferPolicy;
+        std::string gpuSkinningComputeShader;
+        std::string tlasRefitPolicy = "not_recorded";
+        std::string dynamicBlasTimingPolicy = "not_implemented";
+    } animatedGeometry{};
 
     struct SceneLightReport {
         struct Sample {
@@ -547,9 +646,52 @@ struct ProfileReport {
     } memoryPressureQuality{};
 
     struct NvidiaIntegrationReport {
+        struct StreamlineFeatureReport {
+            bool requestable = false;
+            bool supported = false;
+            std::string unavailableReason;
+            std::string requirements;
+        };
+
+        struct StreamlineTagReport {
+            uint32_t expected = 0;
+            uint32_t tagged = 0;
+            uint32_t failed = 0;
+            uint32_t missingFrameToken = 0;
+            uint32_t missingImage = 0;
+            uint32_t invalidLayout = 0;
+            uint32_t invalidFormat = 0;
+            uint32_t invalidExtent = 0;
+            uint32_t emptyRole = 0;
+            uint32_t runtimeRejected = 0;
+            uint64_t frameIndex = 0;
+            bool attempted = false;
+        };
+
+        struct StreamlineEvaluationReport {
+            uint32_t attempted = 0;
+            uint32_t succeeded = 0;
+            uint32_t failed = 0;
+            uint32_t skippedUnsupported = 0;
+            uint32_t skippedMissingTags = 0;
+            uint64_t frameIndex = 0;
+        };
+
+        struct StreamlineReflexMarkerReport {
+            uint32_t attempted = 0;
+            uint32_t succeeded = 0;
+            uint32_t failed = 0;
+            uint32_t skippedUnavailable = 0;
+            uint64_t frameIndex = 0;
+        };
+
         bool nrdSdkConfigured = false;
+        bool nrdRequestable = false;
         bool nrdAvailable = false;
         std::string nrdUnavailableReason;
+        std::string nrdBackendPolicy = "disabled";
+        std::string nrdBackendPolicyReason;
+        bool nrdBackendsMutuallyExclusive = true;
         std::string requestedDenoiserBackend = "engine";
         std::string effectiveDenoiserBackend = "engine";
         bool dlssSdkConfigured = false;
@@ -566,6 +708,25 @@ struct ProfileReport {
         float dlssSharpeningStrength = 0.0f;
         std::string requestedTemporalUpscaler = "taa-tsr";
         std::string effectiveTemporalUpscaler = "taa-tsr";
+        bool streamlineSdkConfigured = false;
+        bool streamlineRuntimeConfigured = false;
+        bool streamlineInitialized = false;
+        bool streamlineVulkanInfoSet = false;
+        std::string streamlineRuntimeDirectory;
+        std::string streamlineUnavailableReason;
+        bool requestedStreamlineReflex = false;
+        bool effectiveStreamlineReflex = false;
+        StreamlineFeatureReport streamlineDlss;
+        StreamlineFeatureReport streamlineDlssRayReconstruction;
+        StreamlineFeatureReport streamlineDlssFrameGeneration;
+        StreamlineFeatureReport streamlineReflex;
+        StreamlineFeatureReport streamlineNis;
+        StreamlineFeatureReport streamlineNrd;
+        StreamlineTagReport streamlineDlssTags;
+        StreamlineTagReport streamlineDlssRayReconstructionTags;
+        StreamlineEvaluationReport streamlineDlssEvaluation;
+        StreamlineEvaluationReport streamlineDlssRayReconstructionEvaluation;
+        StreamlineReflexMarkerReport streamlineReflexMarkers;
     } nvidiaIntegrations{};
 
     struct SceneUpdateRouteReport {
@@ -579,6 +740,30 @@ struct ProfileReport {
         double maxCpuMs = 0.0;
     };
     std::vector<SceneUpdateRouteReport> sceneUpdateRoutes;
+
+    struct SchedulerQueueReport {
+        std::string queue;
+        std::string job;
+        std::string status;
+        uint64_t generation = 0;
+        uint64_t count = 0;
+        double totalCpuMs = 0.0;
+        double lastCpuMs = 0.0;
+        double averageCpuMs = 0.0;
+        double minCpuMs = 0.0;
+        double maxCpuMs = 0.0;
+        uint64_t frameBudgetViolationCount = 0;
+        uint64_t submittedBytes = 0;
+        uint64_t completedBytes = 0;
+    };
+    std::vector<SchedulerQueueReport> schedulerQueues;
+
+    std::vector<GpuUploadTicketSnapshot> gpuUploadTickets;
+    uint64_t gpuUploadNextTimelineValue = 0;
+    std::vector<MainThreadApplyTicketSnapshot> mainThreadApplyTickets;
+    std::vector<TopologyRebuildTicketSnapshot> topologyRebuildTickets;
+    uint64_t topologyRebuildLatestGeneration = 0;
+    uint64_t topologyRebuildNextTimelineValue = 0;
 
     uint32_t validationErrorCount = 0;
     std::vector<std::string> warnings;

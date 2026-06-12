@@ -87,6 +87,18 @@ uint wavefront_restir_mode() {
     return uint(clamp(camera.atmosphere.y, 0.0, 2.0));
 }
 
+uint wavefront_direct_light_ris_candidate_count() {
+    uint count = wavefront_restir_mode() != 0u ? 4u : 1u;
+    if (mesh_params.light_count > 65536u) {
+        count = max(count, 12u);
+    } else if (mesh_params.light_count > 16384u) {
+        count = max(count, 8u);
+    } else if (mesh_params.light_count > 4096u) {
+        count = max(count, 6u);
+    }
+    return count;
+}
+
 void write_primary_gbuffer_miss(uint pixel_index, vec3 ray_dir, vec3 radiance) {
     depth_normal_buffer[pixel_index] = pack_depth_normal(65504.0, vec3(0.0, 0.0, 1.0), 1.0);
     world_position_buffer[pixel_index] = uvec2(0u);
@@ -286,9 +298,10 @@ vec3 geometric_normal_for_hit(WavefrontHit hit, vec3 ray_dir) {
     }
 
     InstanceRecord instance = instance_records[instance_index];
-    LocalVertex v0 = local_mesh_vertices[i0];
-    LocalVertex v1 = local_mesh_vertices[i1];
-    LocalVertex v2 = local_mesh_vertices[i2];
+    uint mesh_index = instance.metadata.x;
+    LocalVertex v0 = ray_tracing_local_vertex(mesh_index, i0);
+    LocalVertex v1 = ray_tracing_local_vertex(mesh_index, i1);
+    LocalVertex v2 = ray_tracing_local_vertex(mesh_index, i2);
     vec3 local_geom = normalize(cross(v1.position_uv_x.xyz - v0.position_uv_x.xyz, v2.position_uv_x.xyz - v0.position_uv_x.xyz));
     vec3 world_geom = normalize(mat3(instance.normal_transform) * local_geom);
     if (dot(world_geom, ray_dir) >= 0.0) {
@@ -400,8 +413,13 @@ bool sample_wavefront_emissive_light(inout uint rng, vec3 hit_pos, out vec3 wi, 
     float r1 = rand_f32(rng);
     float r2 = rand_f32(rng);
     float sr1 = sqrt(r1);
-    vec3 sample_pos = v0 * (1.0 - sr1) + v1 * (sr1 * (1.0 - r2)) + v2 * (sr1 * r2);
+    vec3 bary = vec3(1.0 - sr1, sr1 * (1.0 - r2), sr1 * r2);
+    vec3 sample_pos = v0 * bary.x + v1 * bary.y + v2 * bary.z;
     vec3 light_normal = normalize(mat3(instance.normal_transform) * td3.xyz);
+    vec4 uv01 = local_triangle_data[ti + 4u];
+    vec4 uv2 = local_triangle_data[ti + 5u];
+    vec2 sample_uv = uv01.xy * bary.x + uv01.zw * bary.y + uv2.xy * bary.z;
+    apply_material_textures(material, sample_uv, sample_uv);
     emission = material.emissive;
 
     vec3 to_light = sample_pos - hit_pos;
@@ -460,7 +478,7 @@ void enqueue_first_bounce_direct_lighting(
     }
 
     uint direct_rng = sample_dimension_seed(pixel, camera.temporal_frame_index, depth, SAMPLE_DIM_LIGHT_SELECT);
-    uint ris_candidate_count = wavefront_restir_mode() != 0u ? 4u : 1u;
+    uint ris_candidate_count = wavefront_direct_light_ris_candidate_count();
     vec3 selected_wi = vec3(0.0, 1.0, 0.0);
     vec3 selected_emission = vec3(0.0);
     vec3 selected_bsdf = vec3(0.0);
@@ -747,6 +765,34 @@ void main() {
                 state.throughput = vec4(next_throughput, 1.0);
                 continued = true;
             }
+        } else if (material.mat_type == 2u && material_is_delta(material)) {
+            float dispersion_sample = sample_dimension_1d(ivec2(source_pixel), camera.temporal_frame_index, depth, SAMPLE_DIM_DIELECTRIC + 1u);
+            uint dispersion_channel = material_dispersion_channel(material, dispersion_sample);
+            vec3 dispersion_ior = material_dispersion_ior(material);
+            float channel_ior = material_channel_value(dispersion_ior, dispersion_channel);
+            bool front_face = hit.barycentrics_hit_kind.z > 0.5;
+            float refraction_ratio = front_face ? (1.0 / channel_ior) : channel_ior;
+            float cos_theta = min(dot(-ray_dir, normal), 1.0);
+            float sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+            bool cannot_refract = refraction_ratio * sin_theta > 1.0;
+            float dielectric_sample = sample_dimension_1d(ivec2(source_pixel), camera.temporal_frame_index, depth, SAMPLE_DIM_DIELECTRIC);
+            float fresnel = reflectance(cos_theta, refraction_ratio);
+            bool reflected = cannot_refract || fresnel > dielectric_sample;
+            vec3 scattered_direction = reflected
+                ? reflect(ray_dir, normal)
+                : refract(ray_dir, normal, refraction_ratio);
+            vec3 next_throughput = throughput * material.color * material_dispersion_channel_weight(material, dispersion_channel);
+            if (!reflected) {
+                next_throughput *= max(material.transmission_factor, 0.0);
+            }
+            if (!reflected && !front_face) {
+                next_throughput *= material_volume_transmittance(material, hit.position_t.w);
+            }
+            next_throughput = clamp_path_throughput(next_throughput, next_depth, material.roughness, true);
+            vec3 next_origin = hit_pos + (dot(scattered_direction, normal) > 0.0 ? normal : -normal) * shadow_self_hit_epsilon();
+            enqueue_secondary_ray(pixel_index, next_origin, scattered_direction, next_throughput, 1.0, rng, next_depth, flags | PATH_EVENT_DELTA | material_bucket_flags);
+            state.throughput = vec4(next_throughput, 1.0);
+            continued = true;
         } else if (!material_is_delta(material)) {
             float bsdf_pdf = 0.0;
             uint bsdf_rng = sample_dimension_seed(ivec2(source_pixel), camera.temporal_frame_index, depth, SAMPLE_DIM_BSDF);

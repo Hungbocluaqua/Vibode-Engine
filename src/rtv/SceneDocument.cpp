@@ -180,6 +180,106 @@ Transform transformFromJson(const nlohmann::json& json, Transform fallback = {})
     return transform;
 }
 
+const char* editorPivotModeName(EditorPivotMode mode) {
+    switch (mode) {
+    case EditorPivotMode::Active: return "Active";
+    case EditorPivotMode::SelectionCenter: return "SelectionCenter";
+    case EditorPivotMode::BoundsCenter: return "BoundsCenter";
+    case EditorPivotMode::Custom: return "Custom";
+    }
+    return "Active";
+}
+
+EditorPivotMode editorPivotModeFromString(const std::string& value) {
+    if (value == "SelectionCenter") return EditorPivotMode::SelectionCenter;
+    if (value == "BoundsCenter") return EditorPivotMode::BoundsCenter;
+    if (value == "Custom") return EditorPivotMode::Custom;
+    return EditorPivotMode::Active;
+}
+
+nlohmann::json editorPivotJson(const EditorPivotSettings& pivot) {
+    return {
+        {"mode", editorPivotModeName(pivot.mode)},
+        {"customPosition", vec3Json(pivot.customPosition)},
+        {"customRotationEuler", vec3Json(pivot.customRotationEuler)},
+    };
+}
+
+EditorPivotSettings editorPivotFromJson(const nlohmann::json& json) {
+    EditorPivotSettings pivot;
+    if (!json.is_object()) {
+        return pivot;
+    }
+    pivot.mode = editorPivotModeFromString(json.value("mode", std::string{"Active"}));
+    pivot.customPosition = vec3FromJson(json.value("customPosition", nlohmann::json::array()), pivot.customPosition);
+    pivot.customRotationEuler = vec3FromJson(json.value("customRotationEuler", nlohmann::json::array()), pivot.customRotationEuler);
+    return pivot;
+}
+
+nlohmann::json levelInstanceJson(const LevelInstance& instance) {
+    return {
+        {"sceneGuid", instance.sceneGuid},
+        {"scenePath", instance.scenePath.generic_string()},
+        {"visible", instance.visible},
+        {"loaded", instance.loaded},
+        {"editable", instance.editable},
+        {"sourceRevision", instance.sourceRevision},
+        {"sourceHash", instance.sourceHash},
+        {"overridesDirty", instance.overridesDirty},
+        {"sourceDirty", instance.sourceDirty},
+    };
+}
+
+LevelInstance levelInstanceFromJson(const nlohmann::json& json) {
+    LevelInstance instance;
+    if (!json.is_object()) {
+        return instance;
+    }
+    instance.sceneGuid = json.value("sceneGuid", std::string{});
+    instance.scenePath = json.value("scenePath", std::string{});
+    instance.visible = json.value("visible", instance.visible);
+    instance.loaded = json.value("loaded", instance.loaded);
+    instance.editable = json.value("editable", instance.editable);
+    instance.sourceRevision = json.value("sourceRevision", std::string{});
+    instance.sourceHash = json.value("sourceHash", std::string{});
+    instance.overridesDirty = json.value("overridesDirty", instance.overridesDirty);
+    instance.sourceDirty = json.value("sourceDirty", instance.sourceDirty);
+    return instance;
+}
+
+nlohmann::json sublevelJson(const SceneSublevelRecord& sublevel) {
+    return {
+        {"sceneGuid", sublevel.sceneGuid},
+        {"scenePath", sublevel.scenePath.generic_string()},
+        {"transform", transformJson(sublevel.transform)},
+        {"visible", sublevel.visible},
+        {"loaded", sublevel.loaded},
+        {"editable", sublevel.editable},
+        {"sourceRevision", sublevel.sourceRevision},
+        {"sourceHash", sublevel.sourceHash},
+        {"overridesDirty", sublevel.overridesDirty},
+        {"sourceDirty", sublevel.sourceDirty},
+    };
+}
+
+SceneSublevelRecord sublevelFromJson(const nlohmann::json& json) {
+    SceneSublevelRecord sublevel;
+    if (!json.is_object()) {
+        return sublevel;
+    }
+    sublevel.sceneGuid = json.value("sceneGuid", std::string{});
+    sublevel.scenePath = json.value("scenePath", std::string{});
+    sublevel.transform = transformFromJson(json.value("transform", nlohmann::json::object()), sublevel.transform);
+    sublevel.visible = json.value("visible", sublevel.visible);
+    sublevel.loaded = json.value("loaded", sublevel.loaded);
+    sublevel.editable = json.value("editable", sublevel.editable);
+    sublevel.sourceRevision = json.value("sourceRevision", std::string{});
+    sublevel.sourceHash = json.value("sourceHash", std::string{});
+    sublevel.overridesDirty = json.value("overridesDirty", sublevel.overridesDirty);
+    sublevel.sourceDirty = json.value("sourceDirty", sublevel.sourceDirty);
+    return sublevel;
+}
+
 std::string generateSceneGuid() {
     std::random_device rd;
     std::mt19937_64 rng(rd());
@@ -314,6 +414,59 @@ void SceneDocument::clearTimelineJson() {
     timelineJson_.reset();
 }
 
+void SceneDocument::setEditorPivot(EditorPivotSettings pivot) {
+    editorPivot_ = pivot;
+}
+
+void SceneDocument::setSublevels(std::vector<SceneSublevelRecord> sublevels) {
+    sublevels_ = std::move(sublevels);
+    markDirty(SceneUpdateKind::TopologyChanged);
+}
+
+void SceneDocument::addSublevel(SceneSublevelRecord sublevel) {
+    auto existing = std::find_if(sublevels_.begin(), sublevels_.end(), [&](const SceneSublevelRecord& item) {
+        if (!sublevel.sceneGuid.empty() && item.sceneGuid == sublevel.sceneGuid) {
+            return true;
+        }
+        return !sublevel.scenePath.empty() && item.scenePath == sublevel.scenePath;
+    });
+    if (existing != sublevels_.end()) {
+        *existing = std::move(sublevel);
+    } else {
+        sublevels_.push_back(std::move(sublevel));
+    }
+    markDirty(SceneUpdateKind::TopologyChanged);
+}
+
+bool SceneDocument::removeSublevel(const AssetGuid& sceneGuid) {
+    if (sceneGuid.empty()) {
+        return false;
+    }
+    const auto oldSize = sublevels_.size();
+    sublevels_.erase(std::remove_if(sublevels_.begin(), sublevels_.end(), [&](const SceneSublevelRecord& item) {
+        return item.sceneGuid == sceneGuid;
+    }), sublevels_.end());
+    if (sublevels_.size() == oldSize) {
+        return false;
+    }
+    markDirty(SceneUpdateKind::TopologyChanged);
+    return true;
+}
+
+bool SceneDocument::hasSublevelDirtyState() const {
+    const bool sublevelRecordDirty = std::any_of(sublevels_.begin(), sublevels_.end(), [](const SceneSublevelRecord& item) {
+        return item.overridesDirty || item.sourceDirty;
+    });
+    if (sublevelRecordDirty) {
+        return true;
+    }
+    const std::vector<const Entity*> entities = registry_.entities();
+    return std::any_of(entities.begin(), entities.end(), [](const Entity* entity) {
+        return entity != nullptr && entity->levelInstance.has_value() &&
+            (entity->levelInstance->overridesDirty || entity->levelInstance->sourceDirty);
+    });
+}
+
 void SceneDocument::addPrefabInstance(PrefabInstance instance) {
     prefabInstances_.push_back(std::move(instance));
     markDirty(SceneUpdateKind::TopologyChanged);
@@ -346,8 +499,24 @@ size_t SceneDocument::replaceAssetGuidReferences(const AssetGuid& oldGuid, const
                 }
             }
         }
-        if (entity->animationPlayer.has_value() && entity->animationPlayer->animationGuid == oldGuid) {
-            entity->animationPlayer->animationGuid = newGuid;
+        if (entity->animationPlayer.has_value()) {
+            if (entity->animationPlayer->animationGuid == oldGuid) {
+                entity->animationPlayer->animationGuid = newGuid;
+                ++replacements;
+            }
+            if (entity->animationPlayer->controllerGuid == oldGuid) {
+                entity->animationPlayer->controllerGuid = newGuid;
+                ++replacements;
+            }
+        }
+        if (entity->levelInstance.has_value() && entity->levelInstance->sceneGuid == oldGuid) {
+            entity->levelInstance->sceneGuid = newGuid;
+            ++replacements;
+        }
+    }
+    for (SceneSublevelRecord& sublevel : sublevels_) {
+        if (sublevel.sceneGuid == oldGuid) {
+            sublevel.sceneGuid = newGuid;
             ++replacements;
         }
     }
@@ -374,6 +543,7 @@ SceneUpdateMask SceneDocument::pendingUpdateMask() const {
 void SceneDocument::importSceneAsset(const SceneAsset& scene) {
     registry_ = SceneRegistry{};
     activeCamera_ = {};
+    sublevels_.clear();
     prefabInstances_.clear();
     sceneTextures_ = scene.textures;
     sceneMaterials_ = scene.materials;
@@ -394,7 +564,7 @@ void SceneDocument::importSceneAsset(const SceneAsset& scene) {
         entity->transform.scale = scaleFromMatrix(node.transform);
         entity->transform.dirty = true;
         entity->defaultTransform = entity->transform;
-        entity->sourceNodeIndex = static_cast<int32_t>(i);
+        entity->sourceNodeIndex = node.sourceNodeIndex >= 0 ? node.sourceNodeIndex : static_cast<int32_t>(i);
 
         if (node.mesh.valid()) {
             MeshRenderer renderer;
@@ -546,6 +716,10 @@ SceneAsset SceneDocument::toSceneAsset() const {
         SceneNodeAsset node;
         node.name = entity->name;
         node.transform = entity->transform.localMatrix();
+        node.previousTransform = entity->previousAnimationTransformValid
+            ? entity->previousAnimationTransform.localMatrix()
+            : node.transform;
+        node.previousTransformValid = entity->previousAnimationTransformValid;
         if (entity->meshRenderer.has_value()) {
             node.mesh = entity->meshRenderer->mesh;
             node.morphWeights = entity->meshRenderer->morphWeights;
@@ -642,6 +816,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"materials", nlohmann::json::array()},
         {"textures", nlohmann::json::array()},
         {"animations", nlohmann::json::array()},
+        {"sublevels", nlohmann::json::array()},
         {"prefabs", nlohmann::json::array()},
     };
     root["sourceGltf"] = sourceGltfPath_.has_value() ? sourceGltfPath_->string() : "";
@@ -710,6 +885,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"temporalUpscaler", static_cast<uint32_t>(renderSettings_.temporalUpscaler)},
         {"dlssFrameGenerationEnabled", renderSettings_.dlssFrameGenerationEnabled},
         {"dlssRayReconstructionEnabled", renderSettings_.dlssRayReconstructionEnabled},
+        {"streamlineReflexEnabled", renderSettings_.streamlineReflexEnabled},
         {"dlssSharpeningStrength", renderSettings_.dlssSharpeningStrength},
         {"taaFeedback", renderSettings_.taaFeedback},
         {"taaMotionFeedback", renderSettings_.taaMotionFeedback},
@@ -774,6 +950,17 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         });
     }
 
+    root["sublevels"] = nlohmann::json::array();
+    for (const SceneSublevelRecord& sublevel : sublevels_) {
+        root["sublevels"].push_back(sublevelJson(sublevel));
+        if (!sublevel.sceneGuid.empty()) {
+            root["assetReferences"]["sublevels"].push_back({
+                {"assetGuid", sublevel.sceneGuid},
+                {"scenePath", sublevel.scenePath.generic_string()},
+            });
+        }
+    }
+
     root["entities"] = nlohmann::json::array();
     const std::vector<const Entity*> entities = registry_.entities();
     for (const Entity* entityPtr : entities) {
@@ -836,9 +1023,24 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
             item["meshRenderer"] = std::move(renderer);
         }
         if (entity.animationPlayer.has_value()) {
+            nlohmann::json controllerParameters = nlohmann::json::array();
+            for (const AnimationControllerParameterOverride& parameter : entity.animationPlayer->controllerParameters) {
+                controllerParameters.push_back({
+                    {"name", parameter.name},
+                    {"type", parameter.type},
+                    {"boolValue", parameter.boolValue},
+                    {"intValue", parameter.intValue},
+                    {"floatValue", parameter.floatValue},
+                    {"triggerValue", parameter.triggerValue},
+                });
+            }
             item["animationPlayer"] = {
                 {"animationGuid", entity.animationPlayer->animationGuid},
                 {"animationPath", entity.animationPlayer->animationPath.generic_string()},
+                {"controllerGuid", entity.animationPlayer->controllerGuid},
+                {"controllerPath", entity.animationPlayer->controllerPath.generic_string()},
+                {"controllerState", entity.animationPlayer->controllerState},
+                {"controllerParameters", controllerParameters},
                 {"enabled", entity.animationPlayer->enabled},
                 {"playOnStart", entity.animationPlayer->playOnStart},
                 {"playing", entity.animationPlayer->playing},
@@ -850,6 +1052,18 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
             };
             if (!entity.animationPlayer->animationGuid.empty()) {
                 root["assetReferences"]["animations"].push_back({{"assetGuid", entity.animationPlayer->animationGuid}});
+            }
+            if (!entity.animationPlayer->controllerGuid.empty()) {
+                root["assetReferences"]["animations"].push_back({{"assetGuid", entity.animationPlayer->controllerGuid}});
+            }
+        }
+        if (entity.levelInstance.has_value()) {
+            item["levelInstance"] = levelInstanceJson(*entity.levelInstance);
+            if (!entity.levelInstance->sceneGuid.empty()) {
+                root["assetReferences"]["sublevels"].push_back({
+                    {"assetGuid", entity.levelInstance->sceneGuid},
+                    {"scenePath", entity.levelInstance->scenePath.generic_string()},
+                });
             }
         }
         if (entity.light.has_value()) {
@@ -971,6 +1185,9 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
     if (timelineJson_.has_value()) {
         root["timeline"] = *timelineJson_;
     }
+    root["editorMetadata"] = {
+        {"pivot", editorPivotJson(editorPivot_)},
+    };
     root["prefabInstances"] = nlohmann::json::array();
     for (const PrefabInstance& instance : prefabInstances_) {
         nlohmann::json item;
@@ -1042,6 +1259,8 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     sourceHdrPath_.reset();
     bookmarksJson_.reset();
     timelineJson_.reset();
+    editorPivot_ = EditorPivotSettings{};
+    sublevels_.clear();
     if (const std::string source = root.value("sourceGltf", std::string{}); !source.empty()) {
         sourceGltfPath_ = source;
     }
@@ -1068,6 +1287,12 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     }
     if (root.contains("timeline")) {
         timelineJson_ = root["timeline"];
+    }
+    if (root.contains("editorMetadata") && root["editorMetadata"].is_object()) {
+        const nlohmann::json& editorMetadata = root["editorMetadata"];
+        if (editorMetadata.contains("pivot")) {
+            editorPivot_ = editorPivotFromJson(editorMetadata["pivot"]);
+        }
     }
 
     if (root.contains("environment")) {
@@ -1127,6 +1352,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.temporalUpscaler = static_cast<TemporalUpscaler>(render.value("temporalUpscaler", static_cast<uint32_t>(renderSettings_.temporalUpscaler)));
         renderSettings_.dlssFrameGenerationEnabled = render.value("dlssFrameGenerationEnabled", renderSettings_.dlssFrameGenerationEnabled);
         renderSettings_.dlssRayReconstructionEnabled = render.value("dlssRayReconstructionEnabled", renderSettings_.dlssRayReconstructionEnabled);
+        renderSettings_.streamlineReflexEnabled = render.value("streamlineReflexEnabled", renderSettings_.streamlineReflexEnabled);
         renderSettings_.dlssSharpeningStrength = render.value("dlssSharpeningStrength", renderSettings_.dlssSharpeningStrength);
         renderSettings_.taaFeedback = render.value("taaFeedback", renderSettings_.taaFeedback);
         renderSettings_.taaMotionFeedback = render.value("taaMotionFeedback", renderSettings_.taaMotionFeedback);
@@ -1172,6 +1398,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
     }
 
     registry_ = SceneRegistry{};
+    sublevels_.clear();
     prefabInstances_.clear();
     sceneMeshes_.clear();
     sceneMaterials_.clear();
@@ -1203,6 +1430,15 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
                 }
             }
             sceneSkins_.push_back(std::move(skin));
+        }
+    }
+
+    if (root.contains("sublevels") && root["sublevels"].is_array()) {
+        for (const nlohmann::json& item : root["sublevels"]) {
+            SceneSublevelRecord sublevel = sublevelFromJson(item);
+            if (!sublevel.sceneGuid.empty() || !sublevel.scenePath.empty()) {
+                sublevels_.push_back(std::move(sublevel));
+            }
         }
     }
 
@@ -1274,6 +1510,26 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             AnimationPlayer player;
             player.animationGuid = source.value("animationGuid", std::string{});
             player.animationPath = source.value("animationPath", std::string{});
+            player.controllerGuid = source.value("controllerGuid", std::string{});
+            player.controllerPath = source.value("controllerPath", std::string{});
+            player.controllerState = source.value("controllerState", std::string{});
+            if (source.contains("controllerParameters") && source["controllerParameters"].is_array()) {
+                for (const nlohmann::json& parameterJson : source["controllerParameters"]) {
+                    if (!parameterJson.is_object()) {
+                        continue;
+                    }
+                    AnimationControllerParameterOverride parameter;
+                    parameter.name = parameterJson.value("name", std::string{});
+                    parameter.type = parameterJson.value("type", std::string{});
+                    parameter.boolValue = parameterJson.value("boolValue", false);
+                    parameter.intValue = parameterJson.value("intValue", 0);
+                    parameter.floatValue = parameterJson.value("floatValue", 0.0f);
+                    parameter.triggerValue = parameterJson.value("triggerValue", false);
+                    if (!parameter.name.empty() && !parameter.type.empty()) {
+                        player.controllerParameters.push_back(std::move(parameter));
+                    }
+                }
+            }
             player.enabled = source.value("enabled", player.enabled);
             player.playOnStart = source.value("playOnStart", player.playOnStart);
             player.playing = source.value("playing", player.playOnStart);
@@ -1283,6 +1539,12 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             player.playbackSpeed = source.value("playbackSpeed", player.playbackSpeed);
             player.currentTimeSeconds = source.value("currentTimeSeconds", player.currentTimeSeconds);
             entity->animationPlayer = std::move(player);
+        }
+        if (item.contains("levelInstance")) {
+            LevelInstance instance = levelInstanceFromJson(item["levelInstance"]);
+            if (!instance.sceneGuid.empty() || !instance.scenePath.empty()) {
+                entity->levelInstance = std::move(instance);
+            }
         }
         if (item.contains("light")) {
             const nlohmann::json& source = item["light"];
@@ -1486,6 +1748,11 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         timelineJson_ = root["timeline"];
     } else {
         timelineJson_.reset();
+    }
+    if (root.contains("editorMetadata") && root["editorMetadata"].is_object() && root["editorMetadata"].contains("pivot")) {
+        editorPivot_ = editorPivotFromJson(root["editorMetadata"]["pivot"]);
+    } else {
+        editorPivot_ = EditorPivotSettings{};
     }
     dirtyReasons_.clear();
     if (root.contains("dirtyReasons") && root["dirtyReasons"].is_array()) {

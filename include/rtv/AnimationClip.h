@@ -4,6 +4,7 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <cstdint>
+#include <cstddef>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
@@ -57,8 +58,17 @@ public:
         std::vector<std::vector<float>> outTangents;
     };
 
+    struct Event {
+        double timeSeconds = 0.0;
+        std::string name;
+        std::string payloadJson;
+    };
+
     [[nodiscard]] static AnimationClip fromRtanimJson(const nlohmann::json& root, std::vector<std::string>* warnings = nullptr);
     [[nodiscard]] static AnimationClip loadRtanimJson(const std::filesystem::path& path, std::vector<std::string>* warnings = nullptr);
+    [[nodiscard]] static AnimationClip loadRtanimNativeBytes(const std::filesystem::path& pathHint, const std::vector<std::byte>& bytes, std::vector<std::string>* warnings = nullptr);
+    [[nodiscard]] static AnimationClip loadRtanimNative(const std::filesystem::path& path, std::vector<std::string>* warnings = nullptr);
+    [[nodiscard]] static AnimationClip loadRtanim(const std::filesystem::path& path, std::vector<std::string>* warnings = nullptr);
 
     [[nodiscard]] bool valid() const { return !tracks_.empty(); }
     [[nodiscard]] const std::string& name() const { return name_; }
@@ -69,6 +79,7 @@ public:
     [[nodiscard]] size_t rootMotionCandidateCount() const { return rootMotionCandidateCount_; }
     [[nodiscard]] const std::vector<Track>& tracks() const { return tracks_; }
     [[nodiscard]] const std::vector<RootMotionCandidate>& rootMotionCandidates() const { return rootMotionCandidates_; }
+    [[nodiscard]] const std::vector<Event>& events() const { return events_; }
 
     [[nodiscard]] AnimationSample sample(double timeSeconds, bool loop = true) const;
 
@@ -80,6 +91,7 @@ private:
     size_t rootMotionCandidateCount_ = 0;
     std::vector<Track> tracks_;
     std::vector<RootMotionCandidate> rootMotionCandidates_;
+    std::vector<Event> events_;
 };
 
 } // namespace rtv

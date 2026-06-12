@@ -100,6 +100,7 @@ enum class RendererDebugView : uint32_t {
     WavefrontDirectLighting = 98,
     WavefrontRestirGi = 99,
     CausticVisibility = 100,
+    SkinnedMotionVectors = 101,
     DenoiserDirectDiffuseVariance = 74,
     DenoiserDirectSpecularVariance = 75,
     DenoiserIndirectDiffuseVariance = 76,
@@ -144,6 +145,7 @@ enum class DenoiserBackend : uint32_t {
 enum class TemporalUpscaler : uint32_t {
     TaaTsr = 0,
     Dlss = 1,
+    Nis = 2,
 };
 
 struct RendererDebugParams {

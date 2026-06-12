@@ -38,6 +38,8 @@ public:
     void resize(uint32_t width, uint32_t height);
 
     [[nodiscard]] VkImage handle() const { return image_; }
+    [[nodiscard]] VmaAllocation allocation() const { return allocation_; }
+    [[nodiscard]] VkDeviceMemory deviceMemory() const;
     [[nodiscard]] VkImageView view() const { return view_; }
     [[nodiscard]] VkFormat format() const { return desc_.format; }
     [[nodiscard]] VkExtent3D extent() const { return {desc_.width, desc_.height, desc_.depth}; }

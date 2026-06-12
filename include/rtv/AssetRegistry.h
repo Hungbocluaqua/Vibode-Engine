@@ -18,6 +18,8 @@ enum class AssetType {
     Prefab,
     Animation,
     Skeleton,
+    SkeletalMesh,
+    AnimationController,
 };
 
 enum class AssetImportStatus {

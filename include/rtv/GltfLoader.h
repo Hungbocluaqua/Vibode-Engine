@@ -1,10 +1,12 @@
 #pragma once
 
 #include "rtv/MeshAsset.h"
+#include "rtv/NativeTextureFormatPolicy.h"
 #include "rtv/SceneCache.h"
 
 #include <filesystem>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace rtv {
@@ -16,6 +18,7 @@ public:
     explicit GltfLoader(AssetManager& assets);
 
     void setCacheWritesEnabled(bool enabled) { cacheWritesEnabled_ = enabled; }
+    void setNativeTextureFormatSupport(NativeTextureFormatSupport support) { nativeTextureFormatSupport_ = std::move(support); }
 
     [[nodiscard]] SceneAsset load(const std::filesystem::path& path);
     [[nodiscard]] SceneAsset loadWithCache(const std::filesystem::path& path);
@@ -26,6 +29,7 @@ private:
     AssetManager& assets_;
     bool useCache_ = true;
     bool cacheWritesEnabled_ = true;
+    NativeTextureFormatSupport nativeTextureFormatSupport_ = nativeTextureOfflineFallbackFormatSupport();
     std::vector<std::filesystem::path> lastExternalDependencies_;
 };
 

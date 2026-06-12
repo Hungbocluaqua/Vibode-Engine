@@ -70,9 +70,22 @@ struct MeshRenderer {
     uint32_t rendererInstanceIndex = UINT32_MAX;
 };
 
+struct AnimationControllerParameterOverride {
+    std::string name;
+    std::string type;
+    bool boolValue = false;
+    int intValue = 0;
+    float floatValue = 0.0f;
+    bool triggerValue = false;
+};
+
 struct AnimationPlayer {
     AssetGuid animationGuid;
     std::filesystem::path animationPath;
+    AssetGuid controllerGuid;
+    std::filesystem::path controllerPath;
+    std::string controllerState;
+    std::vector<AnimationControllerParameterOverride> controllerParameters;
     bool enabled = true;
     bool playOnStart = true;
     bool playing = true;
@@ -81,6 +94,20 @@ struct AnimationPlayer {
     bool applyMorphWeights = true;
     float playbackSpeed = 1.0f;
     double currentTimeSeconds = 0.0;
+    double previousTimeSeconds = 0.0;
+    bool previousSampleValid = false;
+};
+
+struct LevelInstance {
+    AssetGuid sceneGuid;
+    std::filesystem::path scenePath;
+    bool visible = true;
+    bool loaded = false;
+    bool editable = false;
+    std::string sourceRevision;
+    std::string sourceHash;
+    bool overridesDirty = false;
+    bool sourceDirty = false;
 };
 
 enum class LightType : uint32_t {
@@ -261,6 +288,7 @@ struct RenderSettings {
     TemporalUpscaler temporalUpscaler = TemporalUpscaler::TaaTsr;
     bool dlssFrameGenerationEnabled = false;
     bool dlssRayReconstructionEnabled = false;
+    bool streamlineReflexEnabled = false;
     float dlssSharpeningStrength = 0.0f;
     float taaFeedback = 0.06f;
     float taaMotionFeedback = 0.90f;

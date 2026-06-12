@@ -1,17 +1,23 @@
 #pragma once
 
 #include "rtv/EditorSelection.h"
+#include "rtv/EditorPreferences.h"
+#include "rtv/FrameWorkScheduler.h"
+#include "rtv/GpuUploadTicket.h"
+#include "rtv/MainThreadApplyTicket.h"
 #include "rtv/MeshAsset.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/Project.h"
 #include "rtv/AssetRegistry.h"
 #include "rtv/SceneDocument.h"
+#include "rtv/TopologyRebuildTicket.h"
 
 #include <Volk/volk.h>
 #include <glm/glm.hpp>
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -102,15 +108,40 @@ struct EditorRenderRequest {
     bool saveSequenceFramesAsDefault = false;
 };
 
+enum class EditorNativeTextureTargetSetProfile : uint32_t {
+    ActiveAndAllBc,
+    ActiveOnly,
+    AllBcAudit,
+    ActiveAllBcAndRgbaFallback,
+    Custom,
+    CustomLibrary,
+};
+
 struct EditorCookProjectRequest {
     std::filesystem::path projectFile;
     std::filesystem::path outputDir;
+    bool emitNativeTextureTargetSets = false;
+    EditorNativeTextureTargetSetProfile nativeTextureTargetSetProfile = EditorNativeTextureTargetSetProfile::ActiveAndAllBc;
+    EditorNativeTextureTargetSetCustomProfile customNativeTextureTargetSet{};
+    std::vector<EditorNativeTextureTargetSetLibraryProfile> customNativeTextureTargetSetLibrary;
 };
 
 struct EditorPlacementStatus {
     EntityId entity{};
     uint64_t serial = 0;
     std::string label;
+};
+
+struct EditorMountedNativePackageWatchSnapshot {
+    std::filesystem::path packagePath;
+    std::filesystem::path detectionReportPath;
+    uint64_t generation = 0;
+    int64_t lastWriteTimeTicks = 0;
+    int64_t detectedWriteTimeTicks = 0;
+    uint32_t textureCount = 0;
+    uint32_t materialCount = 0;
+    uint32_t meshCount = 0;
+    bool changeDetected = false;
 };
 
 struct EditorJobCenterState {
@@ -168,6 +199,19 @@ struct EditorJobCenterState {
     double completedAssetImportWorkerInspectMs = 0.0;
     double completedAssetImportWorkerWriteMs = 0.0;
     size_t queuedAssetImports = 0;
+    FrameWorkSchedulerSnapshot frameWorkScheduler{};
+    bool frameWorkSchedulerAvailable = false;
+    std::vector<GpuUploadTicketSnapshot> gpuUploadTickets;
+    uint64_t gpuUploadNextTimelineValue = 0;
+    bool gpuUploadTicketsAvailable = false;
+    std::vector<MainThreadApplyTicketSnapshot> mainThreadApplyTickets;
+    bool mainThreadApplyTicketsAvailable = false;
+    std::vector<TopologyRebuildTicketSnapshot> topologyRebuildTickets;
+    uint64_t topologyRebuildLatestGeneration = 0;
+    uint64_t topologyRebuildNextTimelineValue = 0;
+    bool topologyRebuildTicketsAvailable = false;
+    std::vector<EditorMountedNativePackageWatchSnapshot> mountedNativePackageWatches;
+    bool mountedNativePackageWatchesAvailable = false;
     uint64_t cookProjectJobSerial = 0;
     bool cookProjectRunning = false;
     float cookProjectProgress = 0.0f;
@@ -190,6 +234,33 @@ struct EditorJobCenterState {
     std::filesystem::path completedCookProjectLogPath;
     int completedCookProjectExitCode = 0;
     double completedCookProjectWorkerTotalMs = 0.0;
+    uint64_t nativeFileMigrationJobSerial = 0;
+    bool nativeFileMigrationRunning = false;
+    float nativeFileMigrationProgress = 0.0f;
+    bool nativeFileMigrationPackage = false;
+    bool nativeFileMigrationDryRun = false;
+    std::string nativeFileMigrationTitle;
+    std::string nativeFileMigrationStatus;
+    std::filesystem::path nativeFileMigrationSourcePath;
+    std::filesystem::path nativeFileMigrationReportPath;
+    double nativeFileMigrationWorkerElapsedMs = 0.0;
+    size_t queuedNativeFileMigrations = 0;
+    uint64_t completedNativeFileMigrationSerial = 0;
+    bool completedNativeFileMigrationSuccess = false;
+    bool completedNativeFileMigrationPackage = false;
+    bool completedNativeFileMigrationDryRun = false;
+    bool completedNativeFileMigrationMutationAttempted = false;
+    bool completedNativeFileMigrationMutated = false;
+    bool completedNativeFileMigrationRequired = false;
+    bool completedNativeFileMigrationAvailable = false;
+    std::string completedNativeFileMigrationTitle;
+    std::string completedNativeFileMigrationStatus;
+    std::filesystem::path completedNativeFileMigrationSourcePath;
+    std::filesystem::path completedNativeFileMigrationReportPath;
+    std::filesystem::path completedNativeFileMigrationBackupPath;
+    std::vector<std::string> completedNativeFileMigrationErrors;
+    std::vector<std::string> completedNativeFileMigrationWarnings;
+    double completedNativeFileMigrationWorkerTotalMs = 0.0;
 };
 
 struct EditorUiTextureProvider {
@@ -292,6 +363,19 @@ struct EditorMeshAssetPlacement {
     AssetGuid meshGuid;
     std::optional<Transform> placementTransform;
     EntityId replaceEntity{};
+    EntityId attachEntity{};
+};
+
+struct EditorMeshScatterInstancePlacement {
+    AssetGuid meshGuid;
+    AssetGuid materialGuid;
+    Transform transform{};
+};
+
+struct EditorMeshScatterPlacement {
+    std::vector<EditorMeshScatterInstancePlacement> instances;
+    uint32_t seed = 1;
+    std::string label;
 };
 
 struct EditorEntityBoolChange {
@@ -305,6 +389,33 @@ struct EditorEntityTransformChange {
     Transform newTransform{};
 };
 
+enum class EditorAlignDistributeAxis : uint32_t {
+    X,
+    Y,
+    Z,
+};
+
+enum class EditorAlignDistributeMode : uint32_t {
+    AlignMin,
+    AlignCenter,
+    AlignMax,
+    DistributeSpacing,
+};
+
+struct EditorAlignDistributeEntityBounds {
+    EntityId entity{};
+    glm::vec3 min{0.0f};
+    glm::vec3 max{0.0f};
+    bool available = false;
+};
+
+struct EditorAlignDistributeRequest {
+    std::vector<EntityId> entities;
+    std::vector<EditorAlignDistributeEntityBounds> bounds;
+    EditorAlignDistributeAxis axis = EditorAlignDistributeAxis::X;
+    EditorAlignDistributeMode mode = EditorAlignDistributeMode::AlignCenter;
+};
+
 struct EditorEntityRenameRequest {
     EntityId entity{};
     std::string name;
@@ -314,6 +425,14 @@ struct EditorEntityTransformPreview {
     EntityId entity{};
     Transform transform{};
     SceneUpdateKind updateKind = SceneUpdateKind::TransformOnly;
+};
+
+struct EditorEntityTransformBatchChange {
+    std::vector<EditorEntityTransformChange> changes;
+};
+
+struct EditorEntityTransformBatchPreview {
+    std::vector<EditorEntityTransformPreview> previews;
 };
 
 enum class EditorEntityCreateKind : uint32_t {
@@ -440,6 +559,45 @@ struct EditorDeleteAssetRequest {
     bool deleteGeneratedFiles = false;
 };
 
+struct EditorNativePackageMountRequest {
+    std::filesystem::path packagePath;
+};
+
+struct EditorNativePackageUnloadRequest {
+    std::filesystem::path packagePath;
+};
+
+struct EditorNativePackageRefreshRequest {
+    std::filesystem::path packagePath;
+};
+
+struct EditorNativeFileMigrationJobRequest {
+    uint64_t serial = 0;
+    bool package = false;
+    bool dryRun = false;
+    std::filesystem::path sourcePath;
+    std::filesystem::path reportPath;
+};
+
+struct EditorNativeFileMigrationJobResult {
+    uint64_t serial = 0;
+    bool package = false;
+    bool dryRun = false;
+    bool success = false;
+    bool mutationAttempted = false;
+    bool mutated = false;
+    bool migrationRequired = false;
+    bool migrationAvailable = false;
+    std::filesystem::path sourcePath;
+    std::filesystem::path reportPath;
+    std::filesystem::path backupPath;
+    std::string title;
+    std::string status;
+    std::vector<std::string> errors;
+    std::vector<std::string> warnings;
+    double elapsedMs = 0.0;
+};
+
 struct EditorRequests {
     std::optional<RendererSettings> settings;
     std::optional<AccumulationResetReason> resetAccumulation;
@@ -461,6 +619,12 @@ struct EditorRequests {
     std::optional<EditorBulkAssetTagRequest> bulkRemoveAssetTag;
     std::optional<EditorMoveAssetsToFolderRequest> moveAssetsToFolder;
     std::optional<EditorDeleteAssetRequest> deleteAssets;
+    std::optional<EditorNativePackageMountRequest> mountNativePackage;
+    std::optional<EditorNativePackageUnloadRequest> unloadNativePackage;
+    std::optional<EditorNativePackageRefreshRequest> refreshNativePackage;
+    std::optional<EditorNativeFileMigrationJobRequest> nativeFileMigrationJobRequest;
+    std::vector<EditorNativeFileMigrationJobRequest> nativeFileMigrationJobRequests;
+    std::optional<EditorNativeFileMigrationJobResult> nativeFileMigrationJobResult;
     std::optional<AssetGuid> placeAsset;
     std::optional<Transform> placeAssetTransform;
     std::optional<std::filesystem::path> importSceneAsNewScene;
@@ -478,6 +642,7 @@ struct EditorRequests {
     std::optional<EditorMaterialAssignment> materialAssignment;
     std::optional<EditorMaterialAssetAssignment> materialAssetAssignment;
     std::optional<EditorMeshAssetPlacement> meshAssetPlacement;
+    std::optional<EditorMeshScatterPlacement> meshScatterPlacement;
     std::optional<AssetGuid> environmentAssetAssignment;
     std::optional<std::filesystem::path> dismissDroppedFile;
     bool dismissAllDroppedFiles = false;
@@ -499,7 +664,10 @@ struct EditorRequests {
     std::optional<EditorEntityBoolChange> setEntityVisibility;
     std::optional<EditorEntityBoolChange> setEntityLocked;
     std::optional<EditorEntityTransformChange> setEntityTransform;
+    std::optional<EditorEntityTransformBatchChange> setEntityTransforms;
+    std::optional<EditorAlignDistributeRequest> alignDistributeEntities;
     std::optional<EditorEntityTransformPreview> previewEntityTransform;
+    std::optional<EditorEntityTransformBatchPreview> previewEntityTransforms;
     std::optional<EditorMeshRendererChange> setMeshRenderer;
     std::optional<EditorSceneSnapshotChange> sceneSnapshot;
     std::optional<nlohmann::json> timelineChanged;
@@ -556,9 +724,11 @@ struct EditorRequests {
     std::optional<std::string> removeFavorite;
 };
 
-[[nodiscard]] const std::array<RendererDebugView, 95>& editorDebugViews();
+[[nodiscard]] const std::array<RendererDebugView, 96>& editorDebugViews();
 [[nodiscard]] int editorDebugViewIndex(RendererDebugView view);
 void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& changed);
 void requestSettings(EditorRequests& requests, const RendererSettings& settings);
 
 } // namespace rtv
+
+

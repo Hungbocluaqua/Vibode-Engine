@@ -42,8 +42,25 @@ struct TextureTransformAsset {
     uint32_t texCoord = 0;
 };
 
+constexpr uint32_t kMaterialAlphaModeOpaque = 0u;
+constexpr uint32_t kMaterialAlphaModeMask = 1u;
+constexpr uint32_t kMaterialAlphaModeBlend = 2u;
+
+constexpr uint32_t kMaterialWorkflowMetallicRoughness = 0u;
+constexpr uint32_t kMaterialWorkflowPackedOcclusionRoughnessMetalness = 1u;
+constexpr uint32_t kMaterialWorkflowSpecularGlossiness = 2u;
+
+constexpr uint32_t kMaterialNormalMapOpenGL = 0u;
+constexpr uint32_t kMaterialNormalMapDirectX = 1u;
+
+constexpr uint32_t kMaterialSpecularTextureAlphaNone = 0u;
+constexpr uint32_t kMaterialSpecularTextureAlphaGlossiness = 1u;
+
 struct MaterialAsset {
     std::string name;
+    std::string nativeGuid;
+    std::string nativeSource;
+    std::filesystem::path nativePath;
     glm::vec4 baseColorFactor{1.0f};
     glm::vec3 emissiveFactor{0.0f};
     float metallicFactor = 0.0f;
@@ -101,6 +118,9 @@ struct MaterialAsset {
     TextureAssetHandle iridescenceThicknessTexture{};
     TextureAssetHandle anisotropyTexture{};
     TextureAssetHandle occlusionTexture{};
+    TextureAssetHandle opacityTexture{};
+    TextureAssetHandle heightTexture{};
+    float heightScale = 0.025f;
     TextureTransformAsset baseColorTextureTransform{};
     TextureTransformAsset metallicRoughnessTextureTransform{};
     TextureTransformAsset normalTextureTransform{};
@@ -118,12 +138,11 @@ struct MaterialAsset {
     TextureTransformAsset iridescenceTextureTransform{};
     TextureTransformAsset iridescenceThicknessTextureTransform{};
     TextureTransformAsset anisotropyTextureTransform{};
+    uint32_t materialWorkflow = kMaterialWorkflowMetallicRoughness;
+    uint32_t normalMapConvention = kMaterialNormalMapOpenGL;
+    uint32_t specularTextureAlphaMode = kMaterialSpecularTextureAlphaNone;
     uint32_t shaderCompatibilityMask = 1u;
 };
-
-constexpr uint32_t kMaterialAlphaModeOpaque = 0u;
-constexpr uint32_t kMaterialAlphaModeMask = 1u;
-constexpr uint32_t kMaterialAlphaModeBlend = 2u;
 
 constexpr uint32_t kPrimitiveAlphaClassOpaque = 0u;
 constexpr uint32_t kPrimitiveAlphaClassAlphaTested = 1u;
@@ -189,10 +208,15 @@ inline void updatePrimitiveAlphaClassification(MeshPrimitiveAsset& primitive, co
 
 struct MeshAsset {
     std::string name;
+    std::string nativeGuid;
+    std::string nativeSource;
+    std::filesystem::path nativePath;
     std::vector<MeshVertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<MeshPrimitiveAsset> primitives;
     std::vector<float> defaultMorphWeights;
+    std::vector<glm::vec4> cachedLocalBvhNodes;
+    std::vector<glm::vec4> cachedLocalBvhTriangles;
 };
 
 [[nodiscard]] inline bool hasActiveMorphTargetWeights(const MeshAsset& mesh, const std::vector<float>& weights) {
@@ -274,7 +298,10 @@ inline void applyMorphTargetWeights(MeshAsset& mesh, const std::vector<float>& w
 
 struct SceneNodeAsset {
     std::string name;
+    int32_t sourceNodeIndex = -1;
     glm::mat4 transform{1.0f};
+    glm::mat4 previousTransform{1.0f};
+    bool previousTransformValid = false;
     MeshAssetHandle mesh{};
     std::vector<float> morphWeights;
     int32_t skinIndex = -1;

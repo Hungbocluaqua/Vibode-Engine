@@ -177,6 +177,7 @@ void GpuProfiler::collectCompletedFrame() {
     timings_.selectionOutlineMs = smooth(timings_.selectionOutlineMs, elapsedMs(SelectionOutlineStart, SelectionOutlineEnd));
     timings_.fullscreenMs = smooth(timings_.fullscreenMs, elapsedMs(FullscreenStart, FullscreenEnd));
     timings_.editorPresentationMs = smooth(timings_.editorPresentationMs, elapsedMs(EditorPresentationStart, EditorPresentationEnd));
+    timings_.dynamicBlasUpdateMs = smooth(timings_.dynamicBlasUpdateMs, elapsedMs(DynamicBlasUpdateStart, DynamicBlasUpdateEnd));
     timings_.wavefrontTraceMs = smooth(timings_.wavefrontTraceMs, elapsedMs(WavefrontTraceStart, WavefrontTraceEnd));
     timings_.wavefrontSecondaryTraceMs = smooth(timings_.wavefrontSecondaryTraceMs, elapsedMs(WavefrontSecondaryTraceStart, WavefrontSecondaryTraceEnd));
     timings_.wavefrontSortedTraceMs = smooth(timings_.wavefrontSortedTraceMs, elapsedMs(WavefrontSortedTraceStart, WavefrontSortedTraceEnd));
@@ -188,6 +189,7 @@ void GpuProfiler::collectCompletedFrame() {
     timings_.wavefrontSortMs = smooth(timings_.wavefrontSortMs, elapsedMs(WavefrontSortStart, WavefrontSortEnd));
     timings_.queueWaitMs = smooth(timings_.queueWaitMs, elapsedMs(AsyncProducerEnd, AsyncComputeStart));
     timings_.rayTracingLaneMs = timings_.pathTraceMs +
+        timings_.dynamicBlasUpdateMs +
         timings_.wavefrontTraceMs +
         timings_.wavefrontSecondaryTraceMs +
         timings_.wavefrontSortedTraceMs +

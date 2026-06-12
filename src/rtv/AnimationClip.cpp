@@ -1,15 +1,43 @@
 #include "rtv/AnimationClip.h"
 
+#include "rtv/NativeBinaryIO.h"
+
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
 namespace rtv {
 
 namespace {
+
+constexpr uint32_t kRtanimMetadataJsonChunk = 100u;
+
+bool readFileBytes(const std::filesystem::path& path, std::vector<std::byte>& bytes) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return false;
+    }
+    const std::streamoff size = file.tellg();
+    if (size < 0) {
+        return false;
+    }
+    bytes.resize(static_cast<size_t>(size));
+    file.seekg(0, std::ios::beg);
+    if (!bytes.empty()) {
+        file.read(reinterpret_cast<char*>(bytes.data()), size);
+    }
+    return file.good() || size == 0;
+}
+
+bool chunkRangeInside(const NativeChunkRecord& chunk, size_t fileSize) {
+    return chunk.offset <= fileSize && chunk.size <= fileSize - chunk.offset;
+}
 
 AnimationTrackPath trackPathFromString(const std::string& path) {
     if (path == "translation") return AnimationTrackPath::Translation;
@@ -235,6 +263,28 @@ AnimationClip AnimationClip::fromRtanimJson(const nlohmann::json& root, std::vec
         clip.rootMotionCandidateCount_ = clip.rootMotionCandidates_.size();
     }
 
+    if (animation->contains("events") && (*animation)["events"].is_array()) {
+        for (const nlohmann::json& item : (*animation)["events"]) {
+            if (!item.is_object()) {
+                continue;
+            }
+            AnimationClip::Event event;
+            event.timeSeconds = item.value("timeSeconds", item.value("time", 0.0));
+            event.name = item.value("name", std::string{});
+            if (item.contains("payload")) {
+                event.payloadJson = item["payload"].dump();
+            }
+            if (event.name.empty()) {
+                addWarning(warnings, "Animation clip skipped an event without a name.");
+                continue;
+            }
+            clip.events_.push_back(std::move(event));
+        }
+        std::sort(clip.events_.begin(), clip.events_.end(), [](const AnimationClip::Event& a, const AnimationClip::Event& b) {
+            return a.timeSeconds < b.timeSeconds;
+        });
+    }
+
     if (!animation->contains("channels") || !(*animation)["channels"].is_array()) {
         addWarning(warnings, "Animation clip load skipped: animation payload has no decoded channels.");
         return clip;
@@ -295,6 +345,59 @@ AnimationClip AnimationClip::loadRtanimJson(const std::filesystem::path& path, s
         addWarning(warnings, std::string("Animation clip load failed: ") + ex.what());
     }
     return {};
+}
+
+AnimationClip AnimationClip::loadRtanimNativeBytes(const std::filesystem::path& pathHint, const std::vector<std::byte>& bytes, std::vector<std::string>* warnings) {
+    NativeAssetReader reader;
+    const NativeAssetInspection inspection = reader.inspectBytes(pathHint, bytes, true);
+    if (!inspection.ok) {
+        if (!inspection.errors.empty()) {
+            addWarning(warnings, "Animation clip native load failed: " + inspection.errors.front().message);
+        } else {
+            addWarning(warnings, "Animation clip native load failed: invalid native asset " + pathHint.string());
+        }
+        return {};
+    }
+    if (static_cast<NativeAssetKind>(inspection.header.assetKind) != NativeAssetKind::Animation) {
+        addWarning(warnings, "Animation clip native load failed: asset is not .rtanim " + pathHint.string());
+        return {};
+    }
+
+    const auto chunkIt = std::find_if(inspection.chunks.begin(), inspection.chunks.end(), [](const NativeChunkRecord& chunk) {
+        return chunk.type == kRtanimMetadataJsonChunk;
+    });
+    if (chunkIt == inspection.chunks.end() || !chunkRangeInside(*chunkIt, bytes.size())) {
+        addWarning(warnings, "Animation clip native load failed: missing metadata JSON chunk in " + pathHint.string());
+        return {};
+    }
+
+    std::string metadata;
+    metadata.resize(static_cast<size_t>(chunkIt->size));
+    if (!metadata.empty()) {
+        std::memcpy(metadata.data(), bytes.data() + chunkIt->offset, metadata.size());
+    }
+    try {
+        return fromRtanimJson(nlohmann::json::parse(metadata), warnings);
+    } catch (const std::exception& ex) {
+        addWarning(warnings, std::string("Animation clip native load failed: ") + ex.what());
+    }
+    return {};
+}
+
+AnimationClip AnimationClip::loadRtanimNative(const std::filesystem::path& path, std::vector<std::string>* warnings) {
+    std::vector<std::byte> bytes;
+    if (!readFileBytes(path, bytes)) {
+        addWarning(warnings, "Animation clip load failed: could not open native " + path.string());
+        return {};
+    }
+    return loadRtanimNativeBytes(path, bytes, warnings);
+}
+
+AnimationClip AnimationClip::loadRtanim(const std::filesystem::path& path, std::vector<std::string>* warnings) {
+    if (nativeAssetKindFromExtension(path) == NativeAssetKind::Animation) {
+        return loadRtanimNative(path, warnings);
+    }
+    return loadRtanimJson(path, warnings);
 }
 
 AnimationSample AnimationClip::sample(double timeSeconds, bool loop) const {

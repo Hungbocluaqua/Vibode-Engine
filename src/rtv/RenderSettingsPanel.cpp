@@ -82,6 +82,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.temporalUpscaler = render.temporalUpscaler;
         settings.dlssFrameGenerationEnabled = render.dlssFrameGenerationEnabled;
         settings.dlssRayReconstructionEnabled = render.dlssRayReconstructionEnabled;
+        settings.streamlineReflexEnabled = render.streamlineReflexEnabled;
         settings.dlssSharpeningStrength = render.dlssSharpeningStrength;
         settings.taaFeedback = render.taaFeedback;
         settings.taaMotionFeedback = render.taaMotionFeedback;
@@ -150,6 +151,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     const bool dlssCanRequest = nvidiaStatus.dlssRequestable || nvidiaStatus.dlssAvailable;
     const bool dlssRayReconstructionCanRequest = nvidiaStatus.dlssRayReconstructionRequestable || nvidiaStatus.dlssRayReconstructionAvailable;
     const bool dlssFrameGenerationCanRequest = nvidiaStatus.dlssFrameGenerationRequestable || nvidiaStatus.dlssFrameGenerationAvailable;
+    const bool reflexCanRequest = nvidiaStatus.streamlineReflex.requestable || nvidiaStatus.streamlineReflex.supported;
 
     ImGui::SeparatorText("Preview Actions");
     if (editorIconTextButton("RenderSettingsResetAccumulation", EditorGlyphIcon::Reset, "Reset Accumulation")) {
@@ -265,9 +267,9 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.renderResolutionScale = presetScales[tsrPreset];
         changed = true;
     }
-    const char* temporalItems[] = {"TAA / TSR", "DLSS"};
+    const char* temporalItems[] = {"TAA / TSR", "DLSS", "NIS"};
     int temporalIndex = static_cast<int>(settings.temporalUpscaler);
-    if (temporalIndex < 0 || temporalIndex > 1) {
+    if (temporalIndex < 0 || temporalIndex > 2) {
         temporalIndex = 0;
     }
     if (ImGui::BeginCombo("Temporal Upscaler", temporalItems[temporalIndex])) {
@@ -283,11 +285,19 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             changed = true;
         }
         ImGui::EndDisabled();
+        if (ImGui::Selectable("NIS", settings.temporalUpscaler == TemporalUpscaler::Nis)) {
+            settings.temporalUpscaler = TemporalUpscaler::Nis;
+            settings.dlssRayReconstructionEnabled = false;
+            settings.dlssFrameGenerationEnabled = false;
+            changed = true;
+        }
         ImGui::EndCombo();
     }
     tooltip(settings.temporalUpscaler == TemporalUpscaler::Dlss && !dlssCanRequest
         ? nvidiaStatus.dlssUnavailableReason.c_str()
-        : "Selects the post-denoise temporal resolve/upscale backend.");
+        : (settings.temporalUpscaler == TemporalUpscaler::Nis
+            ? nvidiaStatus.streamlineNis.unavailableReason.c_str()
+            : "Selects the post-denoise temporal resolve/upscale backend."));
     ImGui::BeginDisabled(!dlssCanRequest);
     changed |= ImGui::SliderFloat("DLSS Sharpening", &settings.dlssSharpeningStrength, 0.0f, 1.0f, "%.2f");
     ImGui::EndDisabled();
@@ -320,6 +330,16 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     tooltip(dlssFrameGenerationCanRequest
         ? "Enables DLSS Frame Generation when the presentation path supports generated frames."
         : nvidiaStatus.dlssFrameGenerationUnavailableReason.c_str());
+    bool reflexEnabled = settings.streamlineReflexEnabled;
+    ImGui::BeginDisabled(!reflexCanRequest);
+    if (ImGui::Checkbox("Streamline Reflex", &reflexEnabled)) {
+        settings.streamlineReflexEnabled = reflexEnabled;
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    tooltip(reflexCanRequest
+        ? "Emits Streamline Reflex/PCL latency markers at simulation, render-submit, and present boundaries."
+        : nvidiaStatus.streamlineReflex.unavailableReason.c_str());
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
     changed |= ImGui::SliderFloat("Material Anisotropy", &settings.materialTextureAnisotropy, 1.0f, 16.0f, "%.1fx");
     tooltip("Anisotropic filtering level for material textures. Unsupported devices clamp to 1x.");
@@ -609,6 +629,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.temporalUpscaler = settings.temporalUpscaler;
             render.dlssFrameGenerationEnabled = settings.dlssFrameGenerationEnabled;
             render.dlssRayReconstructionEnabled = settings.dlssRayReconstructionEnabled;
+            render.streamlineReflexEnabled = settings.streamlineReflexEnabled;
             render.dlssSharpeningStrength = settings.dlssSharpeningStrength;
             render.taaFeedback = settings.taaFeedback;
             render.taaMotionFeedback = settings.taaMotionFeedback;

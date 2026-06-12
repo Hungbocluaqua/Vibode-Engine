@@ -21,6 +21,20 @@ struct SceneUpdateRouteEvent {
     double lastCpuMs = 0.0;
     double minCpuMs = 0.0;
     double maxCpuMs = 0.0;
+    uint64_t frameBudgetViolationCount = 0;
+};
+
+struct SchedulerQueueEvent {
+    std::string queue;
+    std::string job;
+    std::string status;
+    uint64_t generation = 0;
+    uint64_t count = 0;
+    double totalCpuMs = 0.0;
+    double lastCpuMs = 0.0;
+    double minCpuMs = 0.0;
+    double maxCpuMs = 0.0;
+    uint64_t frameBudgetViolationCount = 0;
 };
 
 struct ResourceStateEvent {
@@ -41,12 +55,14 @@ public:
     void recordResourceState(ResourceStateEvent event);
     void recordAccumulationInvalidation(std::string reason, uint64_t frame);
     void recordSceneUpdateRoute(std::string kind, std::string action, double cpuMs);
+    void recordSchedulerQueueEvent(std::string queue, std::string job, std::string status, uint64_t generation, double cpuMs);
     void beginFrame(uint64_t frame);
     void recordPass(std::string label);
 
     [[nodiscard]] const std::vector<std::string>& barrierEvents() const { return barrierEvents_; }
     [[nodiscard]] const std::vector<AccumulationInvalidationEvent>& invalidations() const { return invalidations_; }
     [[nodiscard]] const std::vector<SceneUpdateRouteEvent>& sceneUpdateRoutes() const { return sceneUpdateRoutes_; }
+    [[nodiscard]] const std::vector<SchedulerQueueEvent>& schedulerQueueEvents() const { return schedulerQueueEvents_; }
     [[nodiscard]] const std::vector<std::string>& passEvents() const { return passEvents_; }
     [[nodiscard]] const std::vector<ResourceStateEvent>& resourceStateEvents() const { return resourceStateEvents_; }
 
@@ -54,6 +70,7 @@ private:
     std::vector<std::string> barrierEvents_;
     std::vector<AccumulationInvalidationEvent> invalidations_;
     std::vector<SceneUpdateRouteEvent> sceneUpdateRoutes_;
+    std::vector<SchedulerQueueEvent> schedulerQueueEvents_;
     std::vector<std::string> passEvents_;
     std::vector<ResourceStateEvent> resourceStateEvents_;
     uint64_t currentFrame_ = 0;

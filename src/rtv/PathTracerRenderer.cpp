@@ -20,6 +20,7 @@
 #include "rtv/ShaderReflection.h"
 #include "rtv/TemporalSystem.h"
 #include "rtv/TextureLoader.h"
+#include "rtv/UploadContext.h"
 #include "rtv/VulkanContext.h"
 
 #include <cstdlib>
@@ -79,6 +80,7 @@ constexpr uint32_t kStbnAtlasWidth = kStbnTileSize * kStbnAtlasColumns;
 constexpr uint32_t kStbnAtlasHeight = kStbnTileSize * kStbnAtlasRows;
 constexpr uint32_t kStbnScalarTextureBinding = 55;
 constexpr uint32_t kStbnScalarSamplerBinding = 56;
+constexpr uint32_t kGpuSkinningReadbackMaxVertices = 256;
 
 void bufferMemoryBarrier(
     VkCommandBuffer commandBuffer,
@@ -117,6 +119,38 @@ float halton(uint32_t index, uint32_t base) {
         fraction /= static_cast<float>(base);
     }
     return result;
+}
+
+std::array<float, 16> rowMajorMatrixArray(const glm::mat4& matrix) {
+    std::array<float, 16> result{};
+    for (uint32_t row = 0; row < 4; ++row) {
+        for (uint32_t column = 0; column < 4; ++column) {
+            result[row * 4u + column] = matrix[column][row];
+        }
+    }
+    return result;
+}
+
+StreamlineDlssQualityMode selectStreamlineDlssQualityMode(VkExtent2D renderExtent, VkExtent2D outputExtent) {
+    if (renderExtent.width == 0u || renderExtent.height == 0u || outputExtent.width == 0u || outputExtent.height == 0u) {
+        return StreamlineDlssQualityMode::Balanced;
+    }
+    const float scaleX = static_cast<float>(renderExtent.width) / static_cast<float>(outputExtent.width);
+    const float scaleY = static_cast<float>(renderExtent.height) / static_cast<float>(outputExtent.height);
+    const float scale = std::min(scaleX, scaleY);
+    if (scale >= 0.98f) {
+        return StreamlineDlssQualityMode::Dlaa;
+    }
+    if (scale >= 0.67f) {
+        return StreamlineDlssQualityMode::Quality;
+    }
+    if (scale >= 0.58f) {
+        return StreamlineDlssQualityMode::Balanced;
+    }
+    if (scale >= 0.45f) {
+        return StreamlineDlssQualityMode::Performance;
+    }
+    return StreamlineDlssQualityMode::UltraPerformance;
 }
 
 std::filesystem::path glslangPath() {
@@ -487,7 +521,10 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
+        descriptorBinding(28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
+        descriptorBinding(29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
+        descriptorBinding(31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(33, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
@@ -780,6 +817,7 @@ PathTracerRenderer::PathTracerRenderer(
     std::optional<std::filesystem::path> environmentPath,
     std::optional<std::filesystem::path> sceneCachePath,
     bool resourceAliasingEnabled,
+    GpuSkinningResourcePlan gpuSkinningResourcePlan,
     const RendererSettings* initialSettings)
     : context_(context),
       allocator_(allocator),
@@ -794,6 +832,7 @@ PathTracerRenderer::PathTracerRenderer(
           initialSettings != nullptr
               ? initialSettings->opacityMicromapSubdivisionLevel
               : kDefaultOpacityMicromapSubdivisionLevel),
+      gpuSkinningResourcePlan_(std::move(gpuSkinningResourcePlan)),
       resourceAliasingEnabled_(resourceAliasingEnabled) {
     temporalSystem_ = std::make_unique<TemporalSystem>();
     if (!context_.supportsHardwareRayTracing()) {
@@ -856,6 +895,7 @@ PathTracerRenderer::PathTracerRenderer(
     const auto denoiserSpv = compiler.compileIfNeeded(shaderDirectory / "denoiser.comp", shaderOutputDirectory);
     const auto momentUpdateSpv = compiler.compileIfNeeded(shaderDirectory / "moment_update.comp", shaderOutputDirectory);
     const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
+    const auto gpuSkinningSpv = compiler.compileIfNeeded(shaderDirectory / "gpu_skinning.comp", shaderOutputDirectory);
     const auto dlssGuidesSpv = compiler.compileIfNeeded(shaderDirectory / "dlss_guides.comp", shaderOutputDirectory);
     const auto dlssRayReconstructionGuidesSpv = compiler.compileIfNeeded(shaderDirectory / "dlss_rr_guides.comp", shaderOutputDirectory);
     const auto nrdPrepareSpv = compiler.compileIfNeeded(shaderDirectory / "nrd_prepare.comp", shaderOutputDirectory);
@@ -888,6 +928,7 @@ PathTracerRenderer::PathTracerRenderer(
     denoiserShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(denoiserSpv), "temporal denoiser compute");
     momentUpdateShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(momentUpdateSpv), "moment update compute");
     taaShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(taaSpv), "taa compute");
+    gpuSkinningShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(gpuSkinningSpv), "gpu skinning compute");
     dlssGuidesShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(dlssGuidesSpv), "dlss guide image compute");
     dlssRayReconstructionGuidesShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(dlssRayReconstructionGuidesSpv), "dlss ray reconstruction guide image compute");
     nrdPrepareShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(nrdPrepareSpv), "nrd guide and signal prepare compute");
@@ -1018,6 +1059,7 @@ PathTracerRenderer::PathTracerRenderer(
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
     momentUpdateSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({momentUpdateShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
+    gpuSkinningSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({gpuSkinningShader_->reflection()}, 0));
     dlssGuidesSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({dlssGuidesShader_->reflection()}, 0));
     dlssRayReconstructionGuidesSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({dlssRayReconstructionGuidesShader_->reflection()}, 0));
     nrdPrepareSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({nrdPrepareShader_->reflection()}, 0));
@@ -1094,6 +1136,13 @@ PathTracerRenderer::PathTracerRenderer(
         std::vector<VkDescriptorSetLayout>{taaSetLayout_},
         ShaderReflection::mergePushConstants({taaShader_->reflection()}),
         *pipelineCache_);
+    gpuSkinningPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *gpuSkinningShader_,
+        std::vector<VkDescriptorSetLayout>{gpuSkinningSetLayout_},
+        ShaderReflection::mergePushConstants({gpuSkinningShader_->reflection()}),
+        *pipelineCache_);
+    gpuSkinningResourcePlan_.computePipelineCreated = gpuSkinningPipeline_ != nullptr;
     dlssGuidesPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *dlssGuidesShader_,
@@ -1225,15 +1274,26 @@ PathTracerRenderer::PathTracerRenderer(
             fullscreenFragmentShader_->reflection(),
         }),
         *pipelineCache_);
+    createGpuSkinningResources();
+    createGpuSkinningRayTracingBindings();
+    dispatchInitialGpuSkinningForAccelerationStructures();
+
     if (true) {
+        RayTracingSceneBuildOptions rayTracingBuildOptions = makeRayTracingSceneBuildOptions();
         rayTracingScene_ = std::make_unique<RayTracingScene>(
             context_,
             allocator_,
             uploader_,
             scene_,
-            RayTracingSceneBuildOptions{
-                .opacityMicromapsEnabled = settings_.opacityMicromapsEnabled,
-                .motionBlurEnabled = settings_.motionBlurEnabled});
+            std::move(rayTracingBuildOptions));
+        const RayTracingBlasGeometryStats& blasGeometryStats = rayTracingScene_->blasGeometryStats();
+        gpuSkinningResourcePlan_.rayTracingGeometryInputMeshCount = blasGeometryStats.gpuSkinnedMeshCount;
+        gpuSkinningResourcePlan_.rayTracingGeometryInputGeometryCount = blasGeometryStats.gpuSkinnedGeometryCount;
+        gpuSkinningResourcePlan_.rayTracingGeometryInputEnabled = blasGeometryStats.gpuSkinnedGeometryCount > 0;
+        gpuSkinningResourcePlan_.rayTracingDescriptorInputEnabled =
+            gpuSkinningResourcePlan_.rayTracingDescriptorInputMeshCount > 0u &&
+            gpuSkinningRayTracingBindingBuffer_.handle() != VK_NULL_HANDLE &&
+            gpuSkinningCurrentVertexBuffer_.handle() != VK_NULL_HANDLE;
         rayTracingPipeline_ = std::make_unique<RayTracingPipeline>(
             context_.device(),
             context_.rayTracingInfo().rayTracingPipelineProperties,
@@ -1341,6 +1401,9 @@ PathTracerRenderer::PathTracerRenderer(
     if (nrdRequested()) {
         initializeNrdRuntime();
     }
+    if (streamlineRequested()) {
+        initializeStreamlineRuntime();
+    }
     if (dlssRequested()) {
         initializeDlssRuntime();
     }
@@ -1348,6 +1411,7 @@ PathTracerRenderer::PathTracerRenderer(
 
 PathTracerRenderer::~PathTracerRenderer() {
     shutdownNrdRuntime();
+    shutdownStreamlineRuntime();
     shutdownDlssRuntime();
     if (pipelineCache_ && !shaderOutputDirectory_.empty()) {
         pipelineCache_->saveToFile(shaderOutputDirectory_ / "pipeline_cache.bin");
@@ -1361,7 +1425,241 @@ PathTracerRenderer::~PathTracerRenderer() {
 }
 
 void PathTracerRenderer::releaseExclusiveRuntimeForRendererReplacement() {
+    shutdownStreamlineRuntime();
     shutdownDlssRuntime();
+}
+
+void PathTracerRenderer::createGpuSkinningResources() {
+    gpuSkinningResourcePlan_.rendererBuffersAllocated = false;
+    gpuSkinningResourcePlan_.sourceVertexBufferUploaded = false;
+    gpuSkinningResourcePlan_.morphDeltaBufferUploaded = false;
+    gpuSkinningResourcePlan_.jointBufferUploaded = false;
+    gpuSkinningResourcePlan_.previousJointBufferUploaded = false;
+    gpuSkinningResourcePlan_.jointPayloadRefreshUploaded = false;
+    gpuSkinningResourcePlan_.jointPayloadRefreshStaged = false;
+    gpuSkinningResourcePlan_.jointPayloadRefreshCopyPending = false;
+    gpuSkinningResourcePlan_.jointPayloadRefreshCopyRecorded = false;
+    gpuSkinningResourcePlan_.jointPayloadRefreshCopyRecordCount = 0;
+    gpuSkinningResourcePlan_.jointPayloadRefreshStagedBytes = 0;
+    gpuSkinningResourcePlan_.jointPayloadRefreshCopyBytes = 0;
+    gpuSkinningResourcePlan_.computeDispatchEnabled = false;
+    gpuSkinningResourcePlan_.outputReadbackBufferAllocated = false;
+    gpuSkinningResourcePlan_.outputReadbackCopyRecorded = false;
+    gpuSkinningResourcePlan_.outputReadbackValidationPassed = false;
+    gpuSkinningResourcePlan_.outputReadbackVertexCount = 0;
+    gpuSkinningResourcePlan_.outputReadbackMaxPositionError = 0.0f;
+    gpuSkinningResourcePlan_.initialComputeDispatchSubmitted = false;
+    gpuSkinningResourcePlan_.rayTracingGeometryInputEnabled = false;
+    gpuSkinningResourcePlan_.rayTracingGeometryInputMeshCount = 0;
+    gpuSkinningResourcePlan_.rayTracingGeometryInputGeometryCount = 0;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputEnabled = false;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputMixedSceneEnabled = false;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputMeshCount = 0;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputBindingCount = 0;
+    gpuSkinningResourcePlan_.skinnedMotionVectorsEnabled = false;
+    gpuSkinningResourcePlan_.skinnedMotionVectorsPreviousVertexInputEnabled = false;
+    gpuSkinningResourcePlan_.skinnedMotionVectorsDescriptorBound = false;
+
+    const bool hasDispatchPlan = gpuSkinningResourcePlan_.dispatchRecordCount > 0;
+    const bool hasMorphDispatchRecords = std::any_of(
+        gpuSkinningResourcePlan_.dispatchRecords.begin(),
+        gpuSkinningResourcePlan_.dispatchRecords.end(),
+        [](const GpuSkinningDispatchRecord& record) { return record.morphBeforeSkinning; });
+    const bool hasRequiredBytes = gpuSkinningResourcePlan_.jointUploadBytes > 0 &&
+        gpuSkinningResourcePlan_.previousJointUploadBytes > 0 &&
+        gpuSkinningResourcePlan_.sourceVertexUploadBytes > 0 &&
+        gpuSkinningResourcePlan_.currentVertexBufferBytes > 0 &&
+        gpuSkinningResourcePlan_.previousVertexBufferBytes > 0 &&
+        (!hasMorphDispatchRecords || gpuSkinningResourcePlan_.morphDeltaUploadBytes > 0);
+    if (!hasDispatchPlan || !hasRequiredBytes) {
+        return;
+    }
+
+    gpuSkinningSourceVertexBuffer_.create(allocator_, BufferDesc{
+        .size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.sourceVertexUploadBytes),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "gpu skinning source vertices",
+    });
+    gpuSkinningJointMatrixBuffer_.create(allocator_, BufferDesc{
+        .size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointUploadBytes),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "gpu skinning joint matrices",
+    });
+    gpuSkinningPreviousJointMatrixBuffer_.create(allocator_, BufferDesc{
+        .size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointUploadBytes),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "gpu skinning previous joint matrices",
+    });
+    gpuSkinningJointMatrixUploadBuffer_.create(allocator_, BufferDesc{
+        .size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointUploadBytes),
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory = BufferMemory::Upload,
+        .persistentMapped = true,
+        .debugName = "gpu skinning joint matrix refresh upload",
+    });
+    gpuSkinningPreviousJointMatrixUploadBuffer_.create(allocator_, BufferDesc{
+        .size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointUploadBytes),
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory = BufferMemory::Upload,
+        .persistentMapped = true,
+        .debugName = "gpu skinning previous joint matrix refresh upload",
+    });
+    gpuSkinningDummyMorphDeltaBuffer_.create(allocator_, BufferDesc{
+        .size = sizeof(GpuLocalVertex),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "gpu skinning dummy morph deltas",
+    });
+    if (gpuSkinningResourcePlan_.morphDeltaUploadBytes > 0) {
+        gpuSkinningMorphDeltaBuffer_.create(allocator_, BufferDesc{
+            .size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.morphDeltaUploadBytes),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "gpu skinning morph deltas",
+        });
+    }
+
+    const VkBufferUsageFlags skinnedVertexUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    gpuSkinningCurrentVertexBuffer_.create(allocator_, BufferDesc{
+        .size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.currentVertexBufferBytes),
+        .usage = skinnedVertexUsage,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "gpu skinning current vertices",
+    });
+    gpuSkinningPreviousVertexBuffer_.create(allocator_, BufferDesc{
+        .size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousVertexBufferBytes),
+        .usage = skinnedVertexUsage,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "gpu skinning previous vertices",
+    });
+    const VkDeviceSize readbackBytes = std::min<VkDeviceSize>(
+        static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.currentVertexBufferBytes),
+        static_cast<VkDeviceSize>(kGpuSkinningReadbackMaxVertices) * sizeof(GpuLocalVertex));
+    if (readbackBytes > 0) {
+        gpuSkinningOutputReadbackBuffer_.create(allocator_, BufferDesc{
+            .size = readbackBytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::Readback,
+            .persistentMapped = true,
+            .debugName = "gpu skinning output readback",
+        });
+    }
+
+    gpuSkinningResourcePlan_.rendererBuffersAllocated =
+        gpuSkinningSourceVertexBuffer_.handle() != VK_NULL_HANDLE &&
+        gpuSkinningJointMatrixBuffer_.handle() != VK_NULL_HANDLE &&
+        gpuSkinningPreviousJointMatrixBuffer_.handle() != VK_NULL_HANDLE &&
+        gpuSkinningJointMatrixUploadBuffer_.handle() != VK_NULL_HANDLE &&
+        gpuSkinningPreviousJointMatrixUploadBuffer_.handle() != VK_NULL_HANDLE &&
+        gpuSkinningDummyMorphDeltaBuffer_.handle() != VK_NULL_HANDLE &&
+        (!hasMorphDispatchRecords || gpuSkinningMorphDeltaBuffer_.handle() != VK_NULL_HANDLE) &&
+        gpuSkinningCurrentVertexBuffer_.handle() != VK_NULL_HANDLE &&
+        gpuSkinningPreviousVertexBuffer_.handle() != VK_NULL_HANDLE;
+    gpuSkinningResourcePlan_.outputReadbackBufferAllocated = gpuSkinningOutputReadbackBuffer_.handle() != VK_NULL_HANDLE;
+    const VkDeviceSize sourcePayloadBytes = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.sourceVertices.size() * sizeof(GpuSkinningSourceVertex));
+    if (gpuSkinningResourcePlan_.rendererBuffersAllocated &&
+        sourcePayloadBytes >= gpuSkinningResourcePlan_.sourceVertexUploadBytes &&
+        gpuSkinningResourcePlan_.sourceVertexUploadBytes > 0) {
+        uploader_.uploadToBuffer(
+            gpuSkinningSourceVertexBuffer_,
+            gpuSkinningResourcePlan_.sourceVertices.data(),
+            static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.sourceVertexUploadBytes));
+        gpuSkinningResourcePlan_.sourceVertexBufferUploaded = true;
+    }
+    const VkDeviceSize morphDeltaPayloadBytes = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.morphDeltas.size() * sizeof(GpuLocalVertex));
+    if (gpuSkinningResourcePlan_.rendererBuffersAllocated &&
+        gpuSkinningMorphDeltaBuffer_.handle() != VK_NULL_HANDLE &&
+        morphDeltaPayloadBytes >= gpuSkinningResourcePlan_.morphDeltaUploadBytes &&
+        gpuSkinningResourcePlan_.morphDeltaUploadBytes > 0) {
+        uploader_.uploadToBuffer(
+            gpuSkinningMorphDeltaBuffer_,
+            gpuSkinningResourcePlan_.morphDeltas.data(),
+            static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.morphDeltaUploadBytes));
+        gpuSkinningResourcePlan_.morphDeltaBufferUploaded = true;
+    }
+    const VkDeviceSize jointPayloadBytes = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointMatrices.size() * sizeof(glm::mat4));
+    if (gpuSkinningResourcePlan_.rendererBuffersAllocated &&
+        jointPayloadBytes >= gpuSkinningResourcePlan_.jointUploadBytes &&
+        gpuSkinningResourcePlan_.jointUploadBytes > 0) {
+        uploader_.uploadToBuffer(
+            gpuSkinningJointMatrixBuffer_,
+            gpuSkinningResourcePlan_.jointMatrices.data(),
+            static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointUploadBytes));
+        gpuSkinningResourcePlan_.jointBufferUploaded = true;
+    }
+    const VkDeviceSize previousJointPayloadBytes = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointMatrices.size() * sizeof(glm::mat4));
+    if (gpuSkinningResourcePlan_.rendererBuffersAllocated &&
+        previousJointPayloadBytes >= gpuSkinningResourcePlan_.previousJointUploadBytes &&
+        gpuSkinningResourcePlan_.previousJointUploadBytes > 0) {
+        uploader_.uploadToBuffer(
+            gpuSkinningPreviousJointMatrixBuffer_,
+            gpuSkinningResourcePlan_.previousJointMatrices.data(),
+            static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointUploadBytes));
+        gpuSkinningResourcePlan_.previousJointBufferUploaded = true;
+    }
+}
+
+void PathTracerRenderer::createGpuSkinningRayTracingBindings() {
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputEnabled = false;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputMixedSceneEnabled = false;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputMeshCount = 0;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputBindingCount = 0;
+    gpuSkinningResourcePlan_.skinnedMotionVectorsEnabled = false;
+    gpuSkinningResourcePlan_.skinnedMotionVectorsPreviousVertexInputEnabled = false;
+    gpuSkinningResourcePlan_.skinnedMotionVectorsDescriptorBound = false;
+
+    const uint32_t meshCount = std::max(scene_.meshParams().meshCount, 1u);
+    std::vector<glm::uvec4> bindings(meshCount, glm::uvec4(0u));
+    uint32_t activeBindingCount = 0;
+
+    if (gpuSkinningCurrentVertexBuffer_.handle() != VK_NULL_HANDLE) {
+        for (const RayTracingMeshBuildInput& mesh : scene_.rayTracingMeshes()) {
+            if (mesh.meshIndex >= bindings.size() || mesh.sourceMeshHandleIndex == 0xffffffffu) {
+                continue;
+            }
+            for (const GpuSkinningDispatchRecord& record : gpuSkinningResourcePlan_.dispatchRecords) {
+                const bool morphRecordReady = !record.morphBeforeSkinning || gpuSkinningResourcePlan_.morphDeltaBufferUploaded;
+                if (!morphRecordReady || record.vertexCount == 0u) {
+                    continue;
+                }
+                if (record.meshHandleIndex == mesh.sourceMeshHandleIndex &&
+                    record.currentVertexOffset == mesh.firstVertex &&
+                    record.vertexCount >= mesh.vertexCount) {
+                    bindings[mesh.meshIndex] = glm::uvec4(record.currentVertexOffset, record.vertexCount, 1u, 0u);
+                    ++activeBindingCount;
+                    break;
+                }
+            }
+        }
+    }
+
+    gpuSkinningRayTracingBindingBuffer_.create(allocator_, BufferDesc{
+        .size = static_cast<VkDeviceSize>(bindings.size() * sizeof(glm::uvec4)),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .memory = BufferMemory::Upload,
+        .persistentMapped = true,
+        .debugName = "gpu skinning ray tracing binding table",
+    });
+    gpuSkinningRayTracingBindingBuffer_.write(bindings.data(), gpuSkinningRayTracingBindingBuffer_.size());
+    gpuSkinningRayTracingBindingBuffer_.flush(gpuSkinningRayTracingBindingBuffer_.size());
+
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputEnabled = activeBindingCount > 0u;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputMeshCount = activeBindingCount;
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputBindingCount = static_cast<uint32_t>(bindings.size());
+    gpuSkinningResourcePlan_.rayTracingDescriptorInputMixedSceneEnabled =
+        activeBindingCount > 0u && activeBindingCount < scene_.rayTracingMeshes().size();
+    gpuSkinningResourcePlan_.skinnedMotionVectorsPreviousVertexInputEnabled =
+        activeBindingCount > 0u && gpuSkinningPreviousVertexBuffer_.handle() != VK_NULL_HANDLE;
+    gpuSkinningResourcePlan_.skinnedMotionVectorsEnabled =
+        gpuSkinningResourcePlan_.rayTracingDescriptorInputEnabled &&
+        gpuSkinningResourcePlan_.skinnedMotionVectorsPreviousVertexInputEnabled;
 }
 
 void PathTracerRenderer::createStbnResources(const std::filesystem::path& shaderDirectory) {
@@ -1480,6 +1778,17 @@ void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D renderExtent
     if (temporalSystem_) {
         temporalSystem_->beginFrame(temporalFrameIndex_);
     }
+    streamlineFrameActive_ = false;
+    streamlineReflexMarkers_ = StreamlineReflexMarkerSummary{};
+    streamlineReflexMarkers_.frameIndex = temporalFrameIndex_;
+    if (streamlineRuntime_.featureStatus().initialized) {
+        StreamlineFrameDesc streamlineFrame{};
+        streamlineFrame.frameIndex = temporalFrameIndex_;
+        streamlineFrame.viewportId = 0u;
+        streamlineFrame.renderExtent = renderExtent_;
+        streamlineFrame.outputExtent = displayExtent_;
+        streamlineFrameActive_ = streamlineRuntime_.beginFrame(streamlineFrame);
+    }
     updateCamera();
 }
 
@@ -1594,7 +1903,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.taaMotionFeedback,
         0.99f);
     next.taaSharpeningStrength = std::clamp(next.taaSharpeningStrength, 0.0f, 1.0f);
-    if (static_cast<uint32_t>(next.temporalUpscaler) > static_cast<uint32_t>(TemporalUpscaler::Dlss)) {
+    if (static_cast<uint32_t>(next.temporalUpscaler) > static_cast<uint32_t>(TemporalUpscaler::Nis)) {
         next.temporalUpscaler = TemporalUpscaler::TaaTsr;
     }
     next.sunIntensity = std::max(0.0f, next.sunIntensity);
@@ -1802,6 +2111,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.temporalUpscaler != settings_.temporalUpscaler ||
         next.dlssFrameGenerationEnabled != settings_.dlssFrameGenerationEnabled ||
         next.dlssRayReconstructionEnabled != settings_.dlssRayReconstructionEnabled ||
+        next.streamlineReflexEnabled != settings_.streamlineReflexEnabled ||
         next.sunlightEnabled != settings_.sunlightEnabled ||
         next.directLightingEnabled != settings_.directLightingEnabled ||
         next.environmentEnabled != settings_.environmentEnabled ||
@@ -2018,6 +2328,9 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
             createNrdResolutionResources();
         }
     }
+    if (dlssRequestedAfter && !streamlineRuntime_.featureStatus().initialized) {
+        initializeStreamlineRuntime();
+    }
     if (dlssRequestedAfter && !dlssNgxInitialized_) {
         initializeDlssRuntime();
     }
@@ -2091,6 +2404,45 @@ const RayTracingMotionBlurDeviceInfo& PathTracerRenderer::rayTracingMotionBlurIn
 
 PathTracerRenderer::NvidiaIntegrationStatus PathTracerRenderer::nvidiaIntegrationStatus() const {
     NvidiaIntegrationStatus status{};
+    const StreamlineStatus compileTimeStreamlineStatus = StreamlineRuntime::compileTimeStatus();
+    const StreamlineStatus runtimeStreamlineStatus = streamlineRuntime_.featureStatus();
+    const StreamlineStatus& streamlineStatus = streamlineInitializationAttempted_
+        ? runtimeStreamlineStatus
+        : compileTimeStreamlineStatus;
+    status.streamlineSdkConfigured = streamlineStatus.sdkConfigured;
+    status.streamlineRuntimeConfigured = streamlineStatus.runtimeConfigured;
+    status.streamlineInitialized = streamlineStatus.initialized;
+    status.streamlineVulkanInfoSet = streamlineStatus.vulkanInfoSet;
+    status.streamlineRuntimeDirectory = streamlineStatus.runtimeDirectory;
+    status.streamlineUnavailableReason = streamlineStatus.unavailableReason;
+    status.streamlineDlss = streamlineStatus.dlss;
+    status.streamlineDlssRayReconstruction = streamlineStatus.dlssRayReconstruction;
+    status.streamlineDlssFrameGeneration = streamlineStatus.dlssFrameGeneration;
+    status.streamlineReflex = streamlineStatus.reflex;
+    status.streamlineNis = streamlineStatus.nis;
+    status.streamlineNrd = streamlineStatus.nrd;
+    if (status.streamlineReflex.requestable || status.streamlineReflex.supported) {
+        status.streamlineReflex.requestable = streamlineReflexMarkers_.succeeded > 0u;
+        if (!status.streamlineReflex.requestable) {
+            status.streamlineReflex.unavailableReason =
+                "Streamline Reflex latency markers are wired at simulation, render-submit, and present boundaries, but no runtime marker has succeeded yet";
+        }
+    }
+    if (status.streamlineNis.requestable || status.streamlineNis.supported) {
+        status.streamlineNis.requestable = false;
+        status.streamlineNis.unavailableReason =
+            "Streamline NIS runtime evaluation is not wired; renderer routes NIS requests through the built-in temporal/spatial upscaler path";
+    }
+    if (status.streamlineNrd.requestable || status.streamlineNrd.supported) {
+        status.streamlineNrd.requestable = false;
+        status.streamlineNrd.unavailableReason =
+            "Streamline NRD runtime capability is status-only; direct NRD remains the mutually exclusive production denoiser path";
+    }
+    status.streamlineDlssTags = streamlineDlssTags_;
+    status.streamlineDlssRayReconstructionTags = streamlineDlssRayReconstructionTags_;
+    status.streamlineDlssEvaluation = streamlineDlssEvaluation_;
+    status.streamlineDlssRayReconstructionEvaluation = streamlineDlssRayReconstructionEvaluation_;
+    status.streamlineReflexMarkers = streamlineReflexMarkers_;
 #if defined(RTV_NRD_SDK_CONFIGURED)
     status.nrdSdkConfigured = true;
     const bool nrdStorageSupported = context_.supportsNrdShaderStorageFeatures();
@@ -2181,8 +2533,13 @@ DenoiserBackend PathTracerRenderer::effectiveDenoiserBackend() const {
 }
 
 TemporalUpscaler PathTracerRenderer::effectiveTemporalUpscaler() const {
-    if (settings_.temporalUpscaler == TemporalUpscaler::Dlss && nvidiaIntegrationStatus().dlssAvailable) {
+    const auto status = nvidiaIntegrationStatus();
+    if (settings_.temporalUpscaler == TemporalUpscaler::Dlss &&
+        (status.dlssAvailable || status.streamlineDlss.supported)) {
         return TemporalUpscaler::Dlss;
+    }
+    if (settings_.temporalUpscaler == TemporalUpscaler::Nis) {
+        return TemporalUpscaler::Nis;
     }
     return TemporalUpscaler::TaaTsr;
 }
@@ -2371,6 +2728,231 @@ void PathTracerRenderer::createNrdResolutionResources() {
 #else
     (void)this;
 #endif
+}
+
+void PathTracerRenderer::initializeStreamlineRuntime() {
+    streamlineInitializationAttempted_ = true;
+    StreamlineInitDesc initDesc{};
+    initDesc.allowInterposer = false;
+    initDesc.enableOtaUpdates = false;
+    initDesc.enableLogging = true;
+    if (!streamlineRuntime_.initialize(initDesc)) {
+        return;
+    }
+
+    const QueueFamilyIndices& queueFamilies = context_.queueFamilies();
+    const uint32_t graphicsFamily = queueFamilies.graphics.value_or(0u);
+    const uint32_t computeFamily = queueFamilies.compute.value_or(graphicsFamily);
+    StreamlineVulkanInfo vulkanInfo{};
+    vulkanInfo.instance = context_.instance();
+    vulkanInfo.physicalDevice = context_.physicalDevice();
+    vulkanInfo.device = context_.device();
+    vulkanInfo.graphicsQueueFamily = graphicsFamily;
+    vulkanInfo.graphicsQueueIndex = 0u;
+    vulkanInfo.computeQueueFamily = computeFamily;
+    vulkanInfo.computeQueueIndex = queueFamilies.computeQueueIndex;
+    vulkanInfo.graphicsQueue = context_.graphicsQueue();
+    vulkanInfo.computeQueue = context_.computeQueue() != VK_NULL_HANDLE
+        ? context_.computeQueue()
+        : context_.graphicsQueue();
+    (void)streamlineRuntime_.setVulkanInfo(vulkanInfo);
+}
+
+void PathTracerRenderer::shutdownStreamlineRuntime() {
+    streamlineFrameActive_ = false;
+    streamlineRuntime_.releaseResourcesForRenderer();
+    streamlineRuntime_.shutdown();
+}
+
+bool PathTracerRenderer::tagStreamlineImageResource(
+    StreamlineFeature feature,
+    const char* role,
+    const Image& image,
+    VkCommandBuffer commandBuffer,
+    const char* producerPass,
+    StreamlineTagSummary* summary) {
+    if (summary != nullptr) {
+        summary->attempted = true;
+        summary->frameIndex = temporalFrameIndex_;
+        ++summary->expected;
+    }
+
+    bool valid = true;
+    if (!streamlineFrameActive_) {
+        valid = false;
+        if (summary != nullptr) {
+            ++summary->missingFrameToken;
+        }
+    }
+    if (role == nullptr || role[0] == '\0') {
+        valid = false;
+        if (summary != nullptr) {
+            ++summary->emptyRole;
+        }
+    }
+    if (image.handle() == VK_NULL_HANDLE) {
+        valid = false;
+        if (summary != nullptr) {
+            ++summary->missingImage;
+        }
+    }
+    if (image.layout() == VK_IMAGE_LAYOUT_UNDEFINED) {
+        valid = false;
+        if (summary != nullptr) {
+            ++summary->invalidLayout;
+        }
+    }
+    if (image.format() == VK_FORMAT_UNDEFINED) {
+        valid = false;
+        if (summary != nullptr) {
+            ++summary->invalidFormat;
+        }
+    }
+    if (image.width() == 0u || image.height() == 0u) {
+        valid = false;
+        if (summary != nullptr) {
+            ++summary->invalidExtent;
+        }
+    }
+    if (!valid) {
+        if (summary != nullptr) {
+            ++summary->failed;
+        }
+        return false;
+    }
+
+    StreamlineResourceTagDesc tag{};
+    tag.feature = feature;
+    tag.role = role;
+    tag.image = image.handle();
+    tag.memory = image.deviceMemory();
+    tag.imageView = image.view();
+    tag.layout = image.layout();
+    tag.format = image.format();
+    tag.extent = VkExtent2D{image.width(), image.height()};
+    tag.commandBuffer = commandBuffer;
+    tag.producerPass = producerPass != nullptr ? std::string(producerPass) : std::string{};
+    if (streamlineRuntime_.tagResourceForFrame(tag)) {
+        if (summary != nullptr) {
+            ++summary->tagged;
+        }
+        return true;
+    }
+    if (summary != nullptr) {
+        ++summary->failed;
+        ++summary->runtimeRejected;
+    }
+    return false;
+}
+
+bool PathTracerRenderer::streamlineFeatureSupported(StreamlineFeature feature) const {
+    const StreamlineStatus& status = streamlineRuntime_.featureStatus();
+    switch (feature) {
+    case StreamlineFeature::Dlss:
+        return status.dlss.supported;
+    case StreamlineFeature::DlssRayReconstruction:
+        return status.dlssRayReconstruction.supported;
+    case StreamlineFeature::DlssFrameGeneration:
+        return status.dlssFrameGeneration.supported;
+    case StreamlineFeature::Reflex:
+        return status.reflex.supported;
+    case StreamlineFeature::Nis:
+        return status.nis.supported;
+    case StreamlineFeature::Nrd:
+        return status.nrd.supported;
+    }
+    return false;
+}
+
+bool PathTracerRenderer::evaluateStreamlineFeatureForCurrentFrame(
+    StreamlineFeature feature,
+    VkCommandBuffer commandBuffer,
+    const StreamlineTagSummary& tags,
+    StreamlineEvaluationSummary& evaluation,
+    const char* passName) {
+    evaluation.frameIndex = temporalFrameIndex_;
+    if (!streamlineFrameActive_ || !streamlineFeatureSupported(feature)) {
+        ++evaluation.skippedUnsupported;
+        return false;
+    }
+    if (!tags.attempted || tags.expected == 0u || tags.failed != 0u || tags.tagged != tags.expected) {
+        ++evaluation.skippedMissingTags;
+        return false;
+    }
+
+    ++evaluation.attempted;
+    if (streamlineRuntime_.evaluateFeature(feature, commandBuffer)) {
+        ++evaluation.succeeded;
+        recordStreamlineEvaluationCommandStateBoundary(commandBuffer, passName);
+        validationLog_.recordPass(std::string(passName != nullptr ? passName : "streamline") + " streamline evaluate succeeded");
+        return true;
+    }
+
+    ++evaluation.failed;
+    validationLog_.recordPass(std::string(passName != nullptr ? passName : "streamline") + " streamline evaluate failed: " + streamlineRuntime_.featureStatus().unavailableReason);
+    return false;
+}
+
+bool PathTracerRenderer::markStreamlineReflexLatencyBoundary(StreamlineReflexMarker marker, const char* label) {
+    streamlineReflexMarkers_.frameIndex = temporalFrameIndex_;
+    if (!settings_.streamlineReflexEnabled || !streamlineFrameActive_ || !streamlineFeatureSupported(StreamlineFeature::Reflex)) {
+        ++streamlineReflexMarkers_.skippedUnavailable;
+        return false;
+    }
+
+    ++streamlineReflexMarkers_.attempted;
+    if (streamlineRuntime_.setReflexMarker(marker)) {
+        ++streamlineReflexMarkers_.succeeded;
+        validationLog_.recordPass(std::string("streamline reflex marker: ") + (label != nullptr ? label : "unknown"));
+        return true;
+    }
+
+    ++streamlineReflexMarkers_.failed;
+    validationLog_.recordPass(std::string("streamline reflex marker failed: ") + (label != nullptr ? label : "unknown") + " reason=" + streamlineRuntime_.featureStatus().unavailableReason);
+    return false;
+}
+
+void PathTracerRenderer::markStreamlineReflexSimulationStart() {
+    (void)markStreamlineReflexLatencyBoundary(StreamlineReflexMarker::SimulationStart, "simulation_start");
+}
+
+void PathTracerRenderer::markStreamlineReflexSimulationEnd() {
+    (void)markStreamlineReflexLatencyBoundary(StreamlineReflexMarker::SimulationEnd, "simulation_end");
+}
+
+void PathTracerRenderer::markStreamlineReflexRenderSubmitStart() {
+    (void)markStreamlineReflexLatencyBoundary(StreamlineReflexMarker::RenderSubmitStart, "render_submit_start");
+}
+
+void PathTracerRenderer::markStreamlineReflexRenderSubmitEnd() {
+    (void)markStreamlineReflexLatencyBoundary(StreamlineReflexMarker::RenderSubmitEnd, "render_submit_end");
+}
+
+void PathTracerRenderer::markStreamlineReflexPresentStart() {
+    (void)markStreamlineReflexLatencyBoundary(StreamlineReflexMarker::PresentStart, "present_start");
+}
+
+void PathTracerRenderer::markStreamlineReflexPresentEnd() {
+    (void)markStreamlineReflexLatencyBoundary(StreamlineReflexMarker::PresentEnd, "present_end");
+}
+
+void PathTracerRenderer::recordStreamlineEvaluationCommandStateBoundary(VkCommandBuffer commandBuffer, const char* passName) {
+    VkMemoryBarrier2 memoryBarrier{};
+    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    memoryBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    memoryBarrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    memoryBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1u;
+    dependency.pMemoryBarriers = &memoryBarrier;
+    vkCmdPipelineBarrier2(commandBuffer, &dependency);
+
+    validationLog_.recordPass(
+        std::string(passName != nullptr ? passName : "streamline") +
+        " streamline command state boundary: later passes rebind pipeline, descriptors, and push constants");
 }
 
 void PathTracerRenderer::initializeDlssRuntime() {
@@ -2724,6 +3306,58 @@ bool PathTracerRenderer::updateSceneTransforms(const SceneAsset& scene, const As
     return true;
 }
 
+bool PathTracerRenderer::updateGpuSkinningJointPayloads(
+    const std::vector<glm::mat4>& jointMatrices,
+    const std::vector<glm::mat4>& previousJointMatrices) {
+    gpuSkinningResourcePlan_.jointPayloadRefreshUploaded = false;
+    gpuSkinningResourcePlan_.jointPayloadRefreshStaged = false;
+    gpuSkinningResourcePlan_.jointPayloadRefreshCopyPending = false;
+    if (!gpuSkinningResourcePlan_.rendererBuffersAllocated ||
+        gpuSkinningJointMatrixBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningPreviousJointMatrixBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningJointMatrixUploadBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningPreviousJointMatrixUploadBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningJointMatrixUploadBuffer_.mappedData() == nullptr ||
+        gpuSkinningPreviousJointMatrixUploadBuffer_.mappedData() == nullptr ||
+        gpuSkinningResourcePlan_.jointUploadBytes == 0 ||
+        gpuSkinningResourcePlan_.previousJointUploadBytes == 0) {
+        return false;
+    }
+
+    const VkDeviceSize jointPayloadBytes = static_cast<VkDeviceSize>(jointMatrices.size() * sizeof(glm::mat4));
+    const VkDeviceSize previousJointPayloadBytes = static_cast<VkDeviceSize>(previousJointMatrices.size() * sizeof(glm::mat4));
+    if (jointPayloadBytes < gpuSkinningResourcePlan_.jointUploadBytes ||
+        previousJointPayloadBytes < gpuSkinningResourcePlan_.previousJointUploadBytes ||
+        gpuSkinningResourcePlan_.jointUploadBytes > gpuSkinningJointMatrixBuffer_.size() ||
+        gpuSkinningResourcePlan_.previousJointUploadBytes > gpuSkinningPreviousJointMatrixBuffer_.size() ||
+        gpuSkinningResourcePlan_.jointUploadBytes > gpuSkinningJointMatrixUploadBuffer_.size() ||
+        gpuSkinningResourcePlan_.previousJointUploadBytes > gpuSkinningPreviousJointMatrixUploadBuffer_.size()) {
+        return false;
+    }
+
+    gpuSkinningJointMatrixUploadBuffer_.write(
+        jointMatrices.data(),
+        static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointUploadBytes));
+    gpuSkinningJointMatrixUploadBuffer_.flush(static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointUploadBytes));
+    gpuSkinningPreviousJointMatrixUploadBuffer_.write(
+        previousJointMatrices.data(),
+        static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointUploadBytes));
+    gpuSkinningPreviousJointMatrixUploadBuffer_.flush(static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointUploadBytes));
+
+    gpuSkinningResourcePlan_.jointMatrices = jointMatrices;
+    gpuSkinningResourcePlan_.previousJointMatrices = previousJointMatrices;
+    gpuSkinningResourcePlan_.jointBufferUploaded = true;
+    gpuSkinningResourcePlan_.previousJointBufferUploaded = true;
+    gpuSkinningResourcePlan_.jointPayloadRefreshUploaded = true;
+    gpuSkinningResourcePlan_.jointPayloadRefreshStaged = true;
+    gpuSkinningResourcePlan_.jointPayloadRefreshCopyPending = true;
+    ++gpuSkinningResourcePlan_.jointPayloadRefreshCount;
+    const uint64_t refreshBytes = gpuSkinningResourcePlan_.jointUploadBytes + gpuSkinningResourcePlan_.previousJointUploadBytes;
+    gpuSkinningResourcePlan_.jointPayloadRefreshBytes += refreshBytes;
+    gpuSkinningResourcePlan_.jointPayloadRefreshStagedBytes += refreshBytes;
+    return true;
+}
+
 bool PathTracerRenderer::updateSceneVisibility(const SceneAsset& scene, const AssetManager& assets) {
     const uint64_t retireFrame = temporalFrameIndex_ + static_cast<uint32_t>(std::max<size_t>(frames_.size(), 1)) + 1u;
     const bool updated = scene_.updateInstanceTransforms(uploader_, scene, assets, retireFrame);
@@ -2843,6 +3477,8 @@ RayTracingRendererStats PathTracerRenderer::rayTracingStats() const {
     stats.instanceCount = rayTracingScene_->instanceCount();
     stats.accelerationStructureBytes = rayTracingScene_->accelerationStructureBytes();
     stats.lastTlasRefitMs = rayTracingScene_->lastTlasRefitMs();
+    stats.dynamicBlasUpdateCount = rayTracingScene_->dynamicBlasUpdateCount();
+    stats.lastDynamicBlasUpdateRecordMs = rayTracingScene_->lastDynamicBlasUpdateRecordMs();
     stats.sbtBytes = rayTracingPipeline_->sbtBytes();
     stats.geometry = scene_.rayTracingGeometryStats();
     stats.blasGeometry = rayTracingScene_->blasGeometryStats();
@@ -3438,6 +4074,7 @@ void PathTracerRenderer::retireResolutionResources() {
     retireBuffer(histogramBuffer_);
     retireBuffer(exposureBuffer_);
     if (nrdRuntime_) {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
         retireImage(nrdRuntime_->motionVectors);
         retireImage(nrdRuntime_->normalRoughness);
         retireImage(nrdRuntime_->viewZ);
@@ -3455,6 +4092,7 @@ void PathTracerRenderer::retireResolutionResources() {
         nrdRuntime_->permanentPoolImages.clear();
         nrdRuntime_->transientPoolImages.clear();
         nrdRuntime_->resourcesReady = false;
+#endif
     }
 
     if (!retired.images.empty() || !retired.buffers.empty()) {
@@ -4293,6 +4931,42 @@ void PathTracerRenderer::updateCamera() {
     frameUniforms.write(&debugParams_, sizeof(debugParams_), kFrameDebugParamsOffset);
     frameUniforms.flush(sizeof(debugParams_), kFrameDebugParamsOffset);
 
+    if (streamlineFrameActive_) {
+        const glm::mat4 currentNonJitteredViewProj = nonJitteredProjection * view;
+        const glm::mat4 previousNonJitteredViewProj = (temporalFrameIndex_ > 1u && !temporalCameraCut)
+            ? (nrdViewToClip_ * nrdWorldToView_)
+            : currentNonJitteredViewProj;
+        StreamlineConstantsDesc constants{};
+        constants.renderExtent = renderExtent_;
+        constants.outputExtent = displayExtent_;
+        constants.cameraViewToClip = rowMajorMatrixArray(nonJitteredProjection);
+        constants.clipToCameraView = rowMajorMatrixArray(glm::inverse(nonJitteredProjection));
+        constants.clipToPrevClip = rowMajorMatrixArray(previousNonJitteredViewProj * glm::inverse(currentNonJitteredViewProj));
+        constants.prevClipToClip = rowMajorMatrixArray(currentNonJitteredViewProj * glm::inverse(previousNonJitteredViewProj));
+        constants.jitterX = currentJitter.x;
+        constants.jitterY = currentJitter.y;
+        constants.motionVectorScaleX = 1.0f;
+        constants.motionVectorScaleY = 1.0f;
+        constants.cameraPosition = {eye.x, eye.y, eye.z};
+        const glm::vec3 cameraUp = glm::normalize(glm::vec3(camera_.up));
+        const glm::vec3 cameraRight = glm::normalize(glm::vec3(camera_.right));
+        const glm::vec3 cameraForward = glm::normalize(glm::vec3(camera_.forward));
+        constants.cameraUp = {cameraUp.x, cameraUp.y, cameraUp.z};
+        constants.cameraRight = {cameraRight.x, cameraRight.y, cameraRight.z};
+        constants.cameraForward = {cameraForward.x, cameraForward.y, cameraForward.z};
+        constants.cameraNear = nearPlane;
+        constants.cameraFar = farPlane;
+        constants.cameraFovRadians = std::max(camera_.fovY, 1.0e-4f);
+        constants.cameraAspectRatio = std::max(authoredAspect, 1.0e-4f);
+        constants.reset = temporalCameraCut || !taaHistoryValid_ || !denoiserHistoryValid_;
+        constants.hdr = true;
+        constants.depthInverted = false;
+        constants.cameraMotionIncluded = true;
+        constants.motionVectors3D = false;
+        constants.matricesValid = true;
+        (void)streamlineRuntime_.setConstants(constants);
+    }
+
     previousViewProj_ = viewProj;
     nrdViewToClipPrev_ = nrdViewToClip_;
     nrdWorldToViewPrev_ = nrdWorldToView_;
@@ -4322,6 +4996,20 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer, bool def
         }
         currentProfiler_->write(commandBuffer, GpuProfiler::AtmosphereEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     }
+    const bool gpuSkinningDispatched = recordGpuSkinningPass(commandBuffer);
+    if (gpuSkinningDispatched && rayTracingScene_ != nullptr) {
+        RayTracingSceneBuildOptions rayTracingBuildOptions = makeRayTracingSceneBuildOptions();
+        currentProfiler_->write(commandBuffer, GpuProfiler::DynamicBlasUpdateStart, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+        if (rayTracingScene_->recordDynamicBlasUpdates(
+                commandBuffer,
+                context_,
+                allocator_,
+                scene_,
+                rayTracingBuildOptions)) {
+            validationLog_.recordPass("dynamic BLAS update recorded for GPU-skinned meshes");
+        }
+        currentProfiler_->write(commandBuffer, GpuProfiler::DynamicBlasUpdateEnd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+    }
     recordPathTraceGraph(commandBuffer);
     currentProfiler_->markStatsSubmitted();
     recordRestirSpatial(commandBuffer);
@@ -4336,6 +5024,10 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer, bool def
     cameraChangedThisFrame_ = false;
     if (temporalSystem_) {
         temporalSystem_->endFrame();
+    }
+    if (streamlineFrameActive_) {
+        streamlineRuntime_.endFrame();
+        streamlineFrameActive_ = false;
     }
     currentProfiler_->markSubmitted();
 }
@@ -4363,6 +5055,344 @@ bool PathTracerRenderer::recordAsyncComputeWork(VkCommandBuffer commandBuffer) {
     }
     currentProfiler_->write(commandBuffer, GpuProfiler::AsyncComputeEnd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     return true;
+}
+
+RayTracingSceneBuildOptions PathTracerRenderer::makeRayTracingSceneBuildOptions() const {
+    RayTracingSceneBuildOptions rayTracingBuildOptions{
+        .opacityMicromapsEnabled = settings_.opacityMicromapsEnabled,
+        .motionBlurEnabled = settings_.motionBlurEnabled,
+    };
+    if (gpuSkinningResourcePlan_.initialComputeDispatchSubmitted &&
+        gpuSkinningCurrentVertexBuffer_.handle() != VK_NULL_HANDLE) {
+        rayTracingBuildOptions.gpuSkinnedVertexBuffer = &gpuSkinningCurrentVertexBuffer_;
+        rayTracingBuildOptions.gpuSkinnedVertexBindings.reserve(gpuSkinningResourcePlan_.dispatchRecords.size());
+        for (const GpuSkinningDispatchRecord& record : gpuSkinningResourcePlan_.dispatchRecords) {
+            const bool morphRecordReady = !record.morphBeforeSkinning || gpuSkinningResourcePlan_.morphDeltaBufferUploaded;
+            if (record.vertexCount == 0u || !morphRecordReady || record.meshHandleIndex == 0xffffffffu) {
+                continue;
+            }
+            rayTracingBuildOptions.gpuSkinnedVertexBindings.push_back(RayTracingSceneBuildOptions::GpuSkinnedVertexBinding{
+                .meshHandleIndex = record.meshHandleIndex,
+                .currentVertexOffset = record.currentVertexOffset,
+                .vertexCount = record.vertexCount,
+            });
+        }
+    }
+    return rayTracingBuildOptions;
+}
+
+bool PathTracerRenderer::recordGpuSkinningPass(VkCommandBuffer commandBuffer) {
+    return recordGpuSkinningDispatch(commandBuffer, currentFrame_->descriptors());
+}
+
+bool PathTracerRenderer::recordGpuSkinningDispatch(VkCommandBuffer commandBuffer, DescriptorAllocator& descriptors) {
+    gpuSkinningResourcePlan_.descriptorsBound = false;
+    gpuSkinningResourcePlan_.computeDispatchEnabled = false;
+    gpuSkinningResourcePlan_.computeDispatchRecordCount = 0;
+    gpuSkinningResourcePlan_.computeMorphDispatchRecordCount = 0;
+    gpuSkinningResourcePlan_.jointPayloadRefreshCopyRecorded = false;
+    gpuSkinningResourcePlan_.outputReadbackCopyRecorded = false;
+    gpuSkinningResourcePlan_.outputReadbackValidationPassed = false;
+    gpuSkinningResourcePlan_.outputReadbackVertexCount = 0;
+    gpuSkinningResourcePlan_.outputReadbackMaxPositionError = 0.0f;
+    if (gpuSkinningPipeline_ == nullptr || gpuSkinningSetLayout_ == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (!gpuSkinningResourcePlan_.rendererBuffersAllocated ||
+        !gpuSkinningResourcePlan_.sourceVertexBufferUploaded ||
+        !gpuSkinningResourcePlan_.jointBufferUploaded ||
+        !gpuSkinningResourcePlan_.previousJointBufferUploaded ||
+        gpuSkinningResourcePlan_.dispatchRecords.empty()) {
+        return false;
+    }
+    if (gpuSkinningSourceVertexBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningJointMatrixBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningPreviousJointMatrixBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningDummyMorphDeltaBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningCurrentVertexBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningPreviousVertexBuffer_.handle() == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (gpuSkinningResourcePlan_.jointPayloadRefreshCopyPending &&
+        (gpuSkinningJointMatrixUploadBuffer_.handle() == VK_NULL_HANDLE ||
+         gpuSkinningPreviousJointMatrixUploadBuffer_.handle() == VK_NULL_HANDLE)) {
+        return false;
+    }
+
+    if (gpuSkinningResourcePlan_.jointPayloadRefreshCopyPending) {
+        bufferMemoryBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_2_HOST_BIT,
+            VK_ACCESS_2_HOST_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT,
+            gpuSkinningJointMatrixUploadBuffer_.handle(),
+            static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointUploadBytes));
+        bufferMemoryBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_2_HOST_BIT,
+            VK_ACCESS_2_HOST_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT,
+            gpuSkinningPreviousJointMatrixUploadBuffer_.handle(),
+            static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointUploadBytes));
+        VkBufferCopy jointCopy{};
+        jointCopy.size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointUploadBytes);
+        vkCmdCopyBuffer(
+            commandBuffer,
+            gpuSkinningJointMatrixUploadBuffer_.handle(),
+            gpuSkinningJointMatrixBuffer_.handle(),
+            1,
+            &jointCopy);
+        VkBufferCopy previousJointCopy{};
+        previousJointCopy.size = static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointUploadBytes);
+        vkCmdCopyBuffer(
+            commandBuffer,
+            gpuSkinningPreviousJointMatrixUploadBuffer_.handle(),
+            gpuSkinningPreviousJointMatrixBuffer_.handle(),
+            1,
+            &previousJointCopy);
+        bufferMemoryBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            gpuSkinningJointMatrixBuffer_.handle(),
+            static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.jointUploadBytes));
+        bufferMemoryBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            gpuSkinningPreviousJointMatrixBuffer_.handle(),
+            static_cast<VkDeviceSize>(gpuSkinningResourcePlan_.previousJointUploadBytes));
+        gpuSkinningResourcePlan_.jointPayloadRefreshCopyRecorded = true;
+        ++gpuSkinningResourcePlan_.jointPayloadRefreshCopyRecordCount;
+        gpuSkinningResourcePlan_.jointPayloadRefreshCopyBytes +=
+            gpuSkinningResourcePlan_.jointUploadBytes + gpuSkinningResourcePlan_.previousJointUploadBytes;
+        gpuSkinningResourcePlan_.jointPayloadRefreshCopyPending = false;
+        validationLog_.recordPass("gpu skinning joint payload refresh copy recorded");
+    }
+    const bool useMorphDeltaBuffer = gpuSkinningResourcePlan_.morphDeltaBufferUploaded &&
+        gpuSkinningMorphDeltaBuffer_.handle() != VK_NULL_HANDLE;
+    const Buffer& morphDeltaBuffer = useMorphDeltaBuffer
+        ? gpuSkinningMorphDeltaBuffer_
+        : gpuSkinningDummyMorphDeltaBuffer_;
+
+    DescriptorSet set = descriptors.allocate(gpuSkinningSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gpuSkinningSourceVertexBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gpuSkinningJointMatrixBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gpuSkinningPreviousJointMatrixBuffer_.descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, morphDeltaBuffer.descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gpuSkinningCurrentVertexBuffer_.descriptorInfo())
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gpuSkinningPreviousVertexBuffer_.descriptorInfo())
+        .update(context_.device(), set);
+    gpuSkinningResourcePlan_.descriptorsBound = true;
+
+    gpuSkinningPipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(
+        commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        gpuSkinningPipeline_->layout(),
+        0,
+        1,
+        &descriptorSet,
+        0,
+        nullptr);
+
+    uint32_t dispatched = 0;
+    uint32_t morphDispatched = 0;
+    for (const GpuSkinningDispatchRecord& record : gpuSkinningResourcePlan_.dispatchRecords) {
+        if (record.vertexCount == 0u) {
+            continue;
+        }
+        if (record.morphBeforeSkinning && !useMorphDeltaBuffer) {
+            continue;
+        }
+        const GpuSkinningPush push{
+            .vertexCount = record.vertexCount,
+            .jointOffset = record.jointMatrixOffset,
+            .morphDeltaOffset = record.morphBeforeSkinning ? record.morphDeltaOffset : 0u,
+            .morphDeltaCount = record.morphBeforeSkinning ? record.morphDeltaCount : 0u,
+            .morphWeight = record.morphBeforeSkinning ? record.morphWeight : 0.0f,
+            .outputOffset = record.currentVertexOffset,
+            .previousOutputOffset = record.previousVertexOffset,
+            .sourceVertexOffset = record.sourceVertexOffset,
+            .flags = 1u,
+        };
+        vkCmdPushConstants(
+            commandBuffer,
+            gpuSkinningPipeline_->layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            sizeof(push),
+            &push);
+        vkCmdDispatch(commandBuffer, (record.vertexCount + 127u) / 128u, 1u, 1u);
+        ++dispatched;
+        if (record.morphBeforeSkinning) {
+            ++morphDispatched;
+        }
+    }
+    if (dispatched == 0u) {
+        return false;
+    }
+
+    gpuSkinningResourcePlan_.computeDispatchEnabled = true;
+    gpuSkinningResourcePlan_.computeDispatchRecordCount = dispatched;
+    gpuSkinningResourcePlan_.computeMorphDispatchRecordCount = morphDispatched;
+    validationLog_.recordPass("gpu skinning compute dispatch records=" + std::to_string(dispatched));
+    if (gpuSkinningOutputReadbackBuffer_.handle() != VK_NULL_HANDLE && gpuSkinningOutputReadbackBuffer_.size() > 0) {
+        bufferMemoryBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT,
+            gpuSkinningCurrentVertexBuffer_.handle(),
+            gpuSkinningOutputReadbackBuffer_.size());
+        VkBufferCopy copy{};
+        copy.size = gpuSkinningOutputReadbackBuffer_.size();
+        vkCmdCopyBuffer(
+            commandBuffer,
+            gpuSkinningCurrentVertexBuffer_.handle(),
+            gpuSkinningOutputReadbackBuffer_.handle(),
+            1,
+            &copy);
+        bufferMemoryBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_HOST_BIT,
+            VK_ACCESS_2_HOST_READ_BIT,
+            gpuSkinningOutputReadbackBuffer_.handle(),
+            gpuSkinningOutputReadbackBuffer_.size());
+        bufferMemoryBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            gpuSkinningCurrentVertexBuffer_.handle(),
+            gpuSkinningCurrentVertexBuffer_.size());
+        gpuSkinningResourcePlan_.outputReadbackCopyRecorded = true;
+    } else {
+        bufferMemoryBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            gpuSkinningCurrentVertexBuffer_.handle(),
+            gpuSkinningCurrentVertexBuffer_.size());
+    }
+    bufferMemoryBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        gpuSkinningPreviousVertexBuffer_.handle(),
+        gpuSkinningPreviousVertexBuffer_.size());
+    return true;
+}
+
+void PathTracerRenderer::dispatchInitialGpuSkinningForAccelerationStructures() {
+    if (gpuSkinningPipeline_ == nullptr ||
+        gpuSkinningSetLayout_ == VK_NULL_HANDLE ||
+        !gpuSkinningResourcePlan_.rendererBuffersAllocated ||
+        !gpuSkinningResourcePlan_.sourceVertexBufferUploaded ||
+        !gpuSkinningResourcePlan_.jointBufferUploaded ||
+        gpuSkinningResourcePlan_.dispatchRecords.empty()) {
+        return;
+    }
+
+    DescriptorAllocator descriptors(context_.device(), 4);
+    VkCommandBuffer commandBuffer = uploader_.uploadContext().begin();
+    if (recordGpuSkinningDispatch(commandBuffer, descriptors)) {
+        uploader_.uploadContext().submitAndWait(commandBuffer);
+        gpuSkinningResourcePlan_.initialComputeDispatchSubmitted = true;
+    } else {
+        uploader_.uploadContext().submitAndWait(commandBuffer);
+    }
+}
+
+void PathTracerRenderer::updateGpuSkinningOutputReadbackValidation() {
+    gpuSkinningResourcePlan_.outputReadbackValidationPassed = false;
+    gpuSkinningResourcePlan_.outputReadbackVertexCount = 0;
+    gpuSkinningResourcePlan_.outputReadbackMaxPositionError = 0.0f;
+    if (!gpuSkinningResourcePlan_.outputReadbackCopyRecorded ||
+        gpuSkinningOutputReadbackBuffer_.handle() == VK_NULL_HANDLE ||
+        gpuSkinningOutputReadbackBuffer_.mappedData() == nullptr ||
+        gpuSkinningOutputReadbackBuffer_.size() < sizeof(GpuLocalVertex)) {
+        return;
+    }
+
+    gpuSkinningOutputReadbackBuffer_.invalidate(gpuSkinningOutputReadbackBuffer_.size());
+    const auto* vertices = static_cast<const GpuLocalVertex*>(gpuSkinningOutputReadbackBuffer_.mappedData());
+    const uint32_t copiedVertexCount = static_cast<uint32_t>(gpuSkinningOutputReadbackBuffer_.size() / sizeof(GpuLocalVertex));
+    float maxError = 0.0f;
+    uint32_t checkedVertices = 0;
+    bool allFinite = true;
+
+    for (const GpuSkinningDispatchRecord& record : gpuSkinningResourcePlan_.dispatchRecords) {
+        if (record.vertexCount == 0u) {
+            continue;
+        }
+        for (uint32_t vertexIndex = 0; vertexIndex < record.vertexCount; ++vertexIndex) {
+            const uint32_t outputIndex = record.currentVertexOffset + vertexIndex;
+            if (outputIndex >= copiedVertexCount) {
+                continue;
+            }
+            const uint32_t sourceIndex = record.sourceVertexOffset + vertexIndex;
+            if (sourceIndex >= gpuSkinningResourcePlan_.sourceVertices.size()) {
+                allFinite = false;
+                continue;
+            }
+
+            const GpuSkinningSourceVertex& source = gpuSkinningResourcePlan_.sourceVertices[sourceIndex];
+            glm::vec3 morphedPosition = glm::vec3(source.positionUvX);
+            if (record.morphBeforeSkinning && record.morphDeltaCount > 0u && record.morphWeight != 0.0f) {
+                const uint32_t morphDeltaIndex = record.morphDeltaOffset + vertexIndex;
+                if (morphDeltaIndex < gpuSkinningResourcePlan_.morphDeltas.size()) {
+                    morphedPosition += glm::vec3(gpuSkinningResourcePlan_.morphDeltas[morphDeltaIndex].positionUvX) * record.morphWeight;
+                } else {
+                    allFinite = false;
+                }
+            }
+            glm::vec3 expected{0.0f};
+            float totalWeight = 0.0f;
+            for (uint32_t influence = 0; influence < 4; ++influence) {
+                const float weight = source.weights[influence];
+                if (weight <= 0.0f) {
+                    continue;
+                }
+                const uint32_t jointIndex = record.jointMatrixOffset + source.joints[influence];
+                if (jointIndex >= gpuSkinningResourcePlan_.jointMatrices.size()) {
+                    allFinite = false;
+                    continue;
+                }
+                expected += glm::vec3(gpuSkinningResourcePlan_.jointMatrices[jointIndex] * glm::vec4(morphedPosition, 1.0f)) * weight;
+                totalWeight += weight;
+            }
+            if (totalWeight <= 1.0e-6f) {
+                expected = morphedPosition;
+            }
+
+            const glm::vec3 actual = glm::vec3(vertices[outputIndex].positionUvX);
+            allFinite = allFinite &&
+                std::isfinite(actual.x) && std::isfinite(actual.y) && std::isfinite(actual.z);
+            maxError = std::max(maxError, glm::length(actual - expected));
+            ++checkedVertices;
+        }
+    }
+
+    gpuSkinningResourcePlan_.outputReadbackVertexCount = checkedVertices;
+    gpuSkinningResourcePlan_.outputReadbackMaxPositionError = maxError;
+    gpuSkinningResourcePlan_.outputReadbackValidationPassed = checkedVertices > 0u && allFinite && maxError <= 1.0e-4f;
 }
 
 void PathTracerRenderer::recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy) {
@@ -6181,6 +7211,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     RenderGraphResourceId nrdSpecOut{};
     std::vector<RenderGraphResourceId> nrdPoolResources;
     if (shouldRunNrdDenoiser() && nrdRuntime_) {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
         nrdMotion = graph.createTexture(imageResource(nrdRuntime_->motionVectors, "nrd motion vectors"));
         nrdNormalRoughness = graph.createTexture(imageResource(nrdRuntime_->normalRoughness, "nrd normal roughness"));
         nrdViewZ = graph.createTexture(imageResource(nrdRuntime_->viewZ, "nrd view z"));
@@ -6195,6 +7226,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         for (Image& image : nrdRuntime_->transientPoolImages) {
             nrdPoolResources.push_back(graph.createTexture(imageResource(image, "nrd transient pool")));
         }
+#endif
     }
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     RenderGraphResourceId wavefrontRestirReservoir{};
@@ -6761,6 +7793,15 @@ void PathTracerRenderer::writeRayTracingDescriptors(
     bool includeWavefrontQueues,
     const Buffer* wavefrontRayQueueOverride) {
     DescriptorWriter writer;
+    const Buffer& rayTracingGpuSkinnedVertices = gpuSkinningCurrentVertexBuffer_.handle() != VK_NULL_HANDLE
+        ? gpuSkinningCurrentVertexBuffer_
+        : scene_.localVertices();
+    const Buffer& rayTracingPreviousGpuSkinnedVertices = gpuSkinningPreviousVertexBuffer_.handle() != VK_NULL_HANDLE
+        ? gpuSkinningPreviousVertexBuffer_
+        : scene_.localVertices();
+    gpuSkinningResourcePlan_.skinnedMotionVectorsDescriptorBound =
+        gpuSkinningResourcePlan_.skinnedMotionVectorsEnabled &&
+        gpuSkinningPreviousVertexBuffer_.handle() != VK_NULL_HANDLE;
     writer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumulationBuffer_.descriptorInfo())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
@@ -6784,7 +7825,10 @@ void PathTracerRenderer::writeRayTracingDescriptors(
         .writeBuffer(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
         .writeBuffer(26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
         .writeBuffer(27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
+        .writeBuffer(28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gpuSkinningRayTracingBindingBuffer_.descriptorInfo())
+        .writeBuffer(29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingGpuSkinnedVertices.descriptorInfo())
         .writeBuffer(30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localTriangles().descriptorInfo())
+        .writeBuffer(31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingPreviousGpuSkinnedVertices.descriptorInfo())
         .writeAccelerationStructure(33, rayTracingScene_->tlas())
         .writeBuffer(34, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.rtTriangleMaterialIds().descriptorInfo())
         .writeBuffer(35, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, entityIdBuffer_.descriptorInfo())
@@ -8405,6 +9449,7 @@ bool PathTracerRenderer::nrdRequested() const {
 }
 
 bool PathTracerRenderer::shouldRunNrdDenoiser() const {
+#if defined(RTV_NRD_RUNTIME_ENABLED)
     if (settings_.wavefrontFinalOutputEnabled) {
         return false;
     }
@@ -8424,6 +9469,9 @@ bool PathTracerRenderer::shouldRunNrdDenoiser() const {
         nrdResolvePipeline_ != nullptr &&
         nrdPrepareSetLayout_ != VK_NULL_HANDLE &&
         nrdResolveSetLayout_ != VK_NULL_HANDLE;
+#else
+    return false;
+#endif
 }
 
 bool PathTracerRenderer::isNonDenoiserDebugView() const {
@@ -8458,7 +9506,8 @@ bool PathTracerRenderer::shouldRunTaa() const {
         settings_.pathTracingEnabled &&
         settings_.taaEnabled &&
         !shouldBypassTemporalUpscalerForDebugView() &&
-        effectiveTemporalUpscaler() == TemporalUpscaler::TaaTsr &&
+        (effectiveTemporalUpscaler() == TemporalUpscaler::TaaTsr ||
+            effectiveTemporalUpscaler() == TemporalUpscaler::Nis) &&
         taaPipeline_ != nullptr &&
         taaSetLayout_ != VK_NULL_HANDLE &&
         taaImage_.handle() != VK_NULL_HANDLE &&
@@ -8470,6 +9519,10 @@ bool PathTracerRenderer::dlssRequested() const {
     return settings_.temporalUpscaler == TemporalUpscaler::Dlss ||
         settings_.dlssRayReconstructionEnabled ||
         settings_.dlssFrameGenerationEnabled;
+}
+
+bool PathTracerRenderer::streamlineRequested() const {
+    return dlssRequested() || settings_.streamlineReflexEnabled;
 }
 
 bool PathTracerRenderer::shouldRunDlss() const {
@@ -8495,7 +9548,7 @@ bool PathTracerRenderer::shouldRunDlssRayReconstruction() const {
         settings_.taaEnabled &&
         !shouldBypassTemporalUpscalerForDebugView() &&
         settings_.dlssRayReconstructionEnabled &&
-        status.dlssRayReconstructionAvailable &&
+        (status.dlssRayReconstructionAvailable || status.streamlineDlssRayReconstruction.supported) &&
         dlssRayReconstructionGuidesPipeline_ != nullptr &&
         dlssRayReconstructionGuidesSetLayout_ != VK_NULL_HANDLE &&
         taaImage_.handle() != VK_NULL_HANDLE &&
@@ -8985,6 +10038,47 @@ void PathTracerRenderer::recordDlssPass(VkCommandBuffer commandBuffer) {
     dlssMotionVectorImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
+    if (streamlineFrameActive_) {
+        streamlineDlssTags_ = StreamlineTagSummary{};
+        streamlineDlssEvaluation_ = StreamlineEvaluationSummary{};
+        auto tag = [&](const char* role, const Image& image, const char* producerPass) {
+            (void)tagStreamlineImageResource(StreamlineFeature::Dlss, role, image, commandBuffer, producerPass, &streamlineDlssTags_);
+        };
+        tag("scaling-input-color", inputImage, "temporal_denoiser");
+        tag("scaling-output-color", taaImage_, "dlss_upscale");
+        tag("depth", dlssDepthImage_, "dlss_guides");
+        tag("motion-vectors", dlssMotionVectorImage_, "dlss_guides");
+        validationLog_.recordPass(
+            "streamline dlss resource tags expected=" + std::to_string(streamlineDlssTags_.expected) +
+            " tagged=" + std::to_string(streamlineDlssTags_.tagged) +
+            " failed=" + std::to_string(streamlineDlssTags_.failed) +
+            " invalidLayout=" + std::to_string(streamlineDlssTags_.invalidLayout) +
+            " invalidFormat=" + std::to_string(streamlineDlssTags_.invalidFormat) +
+            " invalidExtent=" + std::to_string(streamlineDlssTags_.invalidExtent) +
+            " missingImage=" + std::to_string(streamlineDlssTags_.missingImage) +
+            " runtimeRejected=" + std::to_string(streamlineDlssTags_.runtimeRejected));
+        StreamlineDlssOptionsDesc options{};
+        const VkExtent2D outputExtent{taaImage_.width(), taaImage_.height()};
+        options.outputExtent = outputExtent;
+        options.qualityMode = selectStreamlineDlssQualityMode(renderExtent_, outputExtent);
+        options.sharpness = std::clamp(settings_.dlssSharpeningStrength, 0.0f, 1.0f);
+        options.hdr = true;
+        if (!streamlineRuntime_.setDlssOptions(options)) {
+            streamlineDlssEvaluation_.frameIndex = temporalFrameIndex_;
+            ++streamlineDlssEvaluation_.failed;
+            validationLog_.recordPass("dlss streamline options failed: " + streamlineRuntime_.featureStatus().unavailableReason);
+        } else if (evaluateStreamlineFeatureForCurrentFrame(
+                StreamlineFeature::Dlss,
+                commandBuffer,
+                streamlineDlssTags_,
+                streamlineDlssEvaluation_,
+                "dlss")) {
+            taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+            currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+            return;
+        }
+    }
+
     if (!ensureDlssFeature(commandBuffer)) {
         fallbackBlitPostDenoiseToTemporalOutput(commandBuffer);
         currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
@@ -9292,6 +10386,63 @@ void PathTracerRenderer::recordDlssRayReconstructionPass(VkCommandBuffer command
     dlssDiffuseRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     dlssSpecularRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    if (streamlineFrameActive_) {
+        streamlineDlssRayReconstructionTags_ = StreamlineTagSummary{};
+        streamlineDlssRayReconstructionEvaluation_ = StreamlineEvaluationSummary{};
+        auto tag = [&](const char* role, const Image& image, const char* producerPass) {
+            (void)tagStreamlineImageResource(StreamlineFeature::DlssRayReconstruction, role, image, commandBuffer, producerPass, &streamlineDlssRayReconstructionTags_);
+        };
+        tag("scaling-input-color", rawImage_, "path_trace_rt");
+        tag("scaling-output-color", taaImage_, "dlss_ray_reconstruction");
+        tag("depth", dlssDepthImage_, "dlss_rr_guides");
+        tag("motion-vectors", dlssMotionVectorImage_, "dlss_rr_guides");
+        tag("albedo", dlssDiffuseAlbedoImage_, "dlss_rr_guides");
+        tag("specular-albedo", dlssSpecularAlbedoImage_, "dlss_rr_guides");
+        tag("normals", dlssNormalImage_, "dlss_rr_guides");
+        tag("roughness", dlssRoughnessImage_, "dlss_rr_guides");
+        tag("diffuse-hit-distance", dlssDiffuseHitDistanceImage_, "dlss_rr_guides");
+        tag("specular-hit-distance", dlssSpecularHitDistanceImage_, "dlss_rr_guides");
+        tag("reflected-albedo", dlssReflectedAlbedoImage_, "dlss_rr_guides");
+        tag("disocclusion-mask", dlssDisocclusionMaskImage_, "dlss_rr_guides");
+        tag("diffuse-ray-direction", dlssDiffuseRayDirectionImage_, "dlss_rr_guides");
+        tag("specular-ray-direction", dlssSpecularRayDirectionImage_, "dlss_rr_guides");
+        tag("diffuse-ray-direction-hit-distance", dlssDiffuseRayDirectionHitDistanceImage_, "dlss_rr_guides");
+        tag("specular-ray-direction-hit-distance", dlssSpecularRayDirectionHitDistanceImage_, "dlss_rr_guides");
+        validationLog_.recordPass(
+            "streamline dlss rr resource tags expected=" + std::to_string(streamlineDlssRayReconstructionTags_.expected) +
+            " tagged=" + std::to_string(streamlineDlssRayReconstructionTags_.tagged) +
+            " failed=" + std::to_string(streamlineDlssRayReconstructionTags_.failed) +
+            " invalidLayout=" + std::to_string(streamlineDlssRayReconstructionTags_.invalidLayout) +
+            " invalidFormat=" + std::to_string(streamlineDlssRayReconstructionTags_.invalidFormat) +
+            " invalidExtent=" + std::to_string(streamlineDlssRayReconstructionTags_.invalidExtent) +
+            " missingImage=" + std::to_string(streamlineDlssRayReconstructionTags_.missingImage) +
+            " runtimeRejected=" + std::to_string(streamlineDlssRayReconstructionTags_.runtimeRejected));
+        StreamlineDlssRayReconstructionOptionsDesc options{};
+        const VkExtent2D outputExtent{taaImage_.width(), taaImage_.height()};
+        options.outputExtent = outputExtent;
+        options.qualityMode = selectStreamlineDlssQualityMode(renderExtent_, outputExtent);
+        options.sharpness = std::clamp(settings_.dlssSharpeningStrength, 0.0f, 1.0f);
+        options.hdr = true;
+        options.normalRoughnessPacked = false;
+        options.worldToCameraView = rowMajorMatrixArray(nrdWorldToView_);
+        options.cameraViewToWorld = rowMajorMatrixArray(glm::inverse(nrdWorldToView_));
+        options.matricesValid = true;
+        if (!streamlineRuntime_.setDlssRayReconstructionOptions(options)) {
+            streamlineDlssRayReconstructionEvaluation_.frameIndex = temporalFrameIndex_;
+            ++streamlineDlssRayReconstructionEvaluation_.failed;
+            validationLog_.recordPass("dlss ray reconstruction streamline options failed: " + streamlineRuntime_.featureStatus().unavailableReason);
+        } else if (evaluateStreamlineFeatureForCurrentFrame(
+                StreamlineFeature::DlssRayReconstruction,
+                commandBuffer,
+                streamlineDlssRayReconstructionTags_,
+                streamlineDlssRayReconstructionEvaluation_,
+                "dlss ray reconstruction")) {
+            taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+            currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+            return;
+        }
+    }
 
     if (!ensureDlssRayReconstructionFeature(commandBuffer)) {
         fallbackBlitPostDenoiseToTemporalOutput(commandBuffer);

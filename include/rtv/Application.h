@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "rtv/NonCopyable.h"
 #include "rtv/AsyncSceneLoader.h"
@@ -7,6 +7,7 @@
 #include "rtv/AssetImport.h"
 #include "rtv/AssetManager.h"
 #include "rtv/AnimationClip.h"
+#include "rtv/AnimationController.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorPanels.h"
 #include "rtv/GpuProfiler.h"
@@ -17,9 +18,12 @@
 #include "rtv/UndoStack.h"
 #include "rtv/HeadlessDiagnostics.h"
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <memory>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -30,6 +34,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct GLFWwindow;
@@ -43,9 +48,18 @@ class ResourceDemo;
 class PipelineDemo;
 class PathTracerRenderer;
 class Swapchain;
+struct NativeRuntimeLoadReport;
 class UiOverlay;
 class UploadContext;
 class VulkanContext;
+struct NativeRuntimeLoadReport;
+
+struct NativePackageAnimationSelection {
+    std::string controllerGuid;
+    std::filesystem::path controllerPath;
+    std::string entityName;
+    uint64_t entityUuid = 0;
+};
 
 class Application final : private NonCopyable {
 public:
@@ -54,6 +68,8 @@ public:
         std::optional<std::filesystem::path> gltfPath = std::nullopt,
         std::optional<std::filesystem::path> hdrPath = std::nullopt,
         std::optional<std::filesystem::path> scenePath = std::nullopt,
+        std::optional<std::filesystem::path> nativePackageScenePath = std::nullopt,
+        NativePackageAnimationSelection nativePackageAnimationSelection = {},
         std::optional<bool> denoiserOverride = std::nullopt,
         std::optional<RestirMode> restirModeOverride = std::nullopt,
         std::optional<RenderPreset> renderPresetOverride = std::nullopt,
@@ -94,11 +110,46 @@ public:
     [[nodiscard]] const std::vector<float>& gpuFrameTimings() const { return gpuFrameTimings_; }
     [[nodiscard]] const std::vector<GpuFrameTimings>& perFrameGpuTimings() const { return perFrameGpuTimings_; }
     [[nodiscard]] uint32_t warmupFrameCount() const { return warmupFrameCount_; }
+    [[nodiscard]] std::vector<GpuUploadTicketSnapshot> editorGpuUploadTicketSnapshots(bool includeChunks = false) const;
+    [[nodiscard]] uint64_t editorGpuUploadNextTimelineValue() const;
+    [[nodiscard]] std::vector<MainThreadApplyTicketSnapshot> editorMainThreadApplyTicketSnapshots(bool includeOperations = false) const;
+    [[nodiscard]] std::vector<TopologyRebuildTicketSnapshot> editorTopologyRebuildTicketSnapshots(bool includeStages = false) const;
+    [[nodiscard]] uint64_t editorTopologyRebuildLatestGeneration() const { return editorTopologyRebuildTickets_.latestGeneration(); }
+    [[nodiscard]] uint64_t editorTopologyRebuildNextTimelineValue() const { return editorTopologyRebuildTickets_.nextTimelineValue(); }
+    [[nodiscard]] FrameWorkSchedulerSnapshot frameWorkSchedulerSnapshot() const { return frameWorkScheduler_.snapshot(); }
+    [[nodiscard]] const AnimatedGeometryStats& latestAnimatedGeometryStats() const { return latestAnimatedGeometryStats_; }
+    [[nodiscard]] const std::vector<GpuSkinningInstancePlan>& latestGpuSkinningPlan() const { return latestGpuSkinningPlan_; }
+    [[nodiscard]] const std::vector<glm::mat4>& latestGpuSkinningJointMatrices() const { return latestGpuSkinningJointMatrices_; }
+    [[nodiscard]] const std::vector<glm::mat4>& latestGpuSkinningPreviousJointMatrices() const { return latestGpuSkinningPreviousJointMatrices_; }
+    [[nodiscard]] const std::vector<PathTracerRenderer::GpuSkinningSourceVertex>& latestGpuSkinningSourceVertices() const { return latestGpuSkinningSourceVertices_; }
+    [[nodiscard]] const std::vector<GpuLocalVertex>& latestGpuSkinningMorphDeltas() const { return latestGpuSkinningMorphDeltas_; }
 
 private:
+    struct UsdRuntimeScenePlacementResult {
+        size_t cameraCount = 0;
+        size_t lightCount = 0;
+        size_t hierarchyEntityCount = 0;
+    };
+
+    struct UsdRuntimeMeshHierarchyPlacementResult {
+        size_t meshCount = 0;
+        size_t transformCount = 0;
+        size_t hierarchyEntityCount = 0;
+    };
+
     struct RetiredPathTracer {
         std::unique_ptr<PathTracerRenderer> renderer;
         uint64_t releaseFrame = 0;
+    };
+    struct MountedNativePackageWatch {
+        std::filesystem::path packagePath;
+        std::filesystem::file_time_type lastWriteTime{};
+        uint32_t textureCount = 0;
+        uint32_t materialCount = 0;
+        uint32_t meshCount = 0;
+        uint64_t generation = 0;
+        bool changeDetected = false;
+        std::filesystem::file_time_type detectedWriteTime{};
     };
     enum class SunDragPhase {
         Idle,
@@ -152,6 +203,116 @@ private:
         std::future<StagedAssetImportResult> future;
     };
 
+    enum class LiveMainThreadApplyOperationKind : uint8_t {
+        ImportAsset,
+        ImportAndPlaceAsset,
+        MergeScene,
+        PlacePrefabAsset,
+        PlaceMeshAsset,
+        PlaceMeshScatterAssets,
+        CreateEntity,
+        DuplicateEntity,
+        DeleteEntity,
+        DeleteEntities,
+        RenameEntity,
+        ReparentEntity,
+        SetEntityVisibility,
+        SetEntityLocked,
+        SetEntityTransform,
+        SetEntityTransforms,
+        SetMeshRenderer,
+        AddComponent,
+        RemoveComponent,
+        SetLight,
+        SetSun,
+        SetCamera,
+        UpdateMaterial,
+        AssignMaterial,
+        AssignMaterialAsset,
+        AlignDistributeEntities,
+        AssignEnvironmentPath,
+        AssignEnvironmentAsset,
+        ApplySceneSnapshot,
+        EnsurePrimarySun,
+        TogglePrimarySun,
+        UpdateAssetTags,
+        RenameAsset,
+        BulkAddAssetTag,
+        BulkRemoveAssetTag,
+        MoveAssetsToFolder,
+        DeleteAssets,
+        ReimportAsset,
+        RelinkAssetSource,
+        ReplaceAssetReferences,
+        RepairMissingAssetDependencies,
+        MountNativePackage,
+        UnloadNativePackage,
+        RefreshNativePackage,
+        UpdateTimeline,
+        UpdateProjectSettings,
+        MarkSceneUpdate,
+        ApplyRendererSettings,
+        ToggleDenoiser,
+        ToggleDebugView,
+        CycleIntermediateView,
+        RestoreRecoveryAutosaves,
+        DiscardRecovery,
+    };
+
+    struct LiveMainThreadApplyOperation {
+        LiveMainThreadApplyOperationKind kind = LiveMainThreadApplyOperationKind::ImportAsset;
+        EditorImportAssetRequest importRequest{};
+        std::filesystem::path scenePath;
+        AssetGuid prefabGuid;
+        std::optional<Transform> prefabPlacementTransform;
+        EditorMeshAssetPlacement meshPlacement{};
+        EditorMeshScatterPlacement meshScatterPlacement{};
+        EditorEntityCreateRequest entityCreateRequest{};
+        EntityId duplicateEntity{};
+        EntityId deleteEntity{};
+        std::vector<EntityId> deleteEntities;
+        EditorEntityRenameRequest renameEntity{};
+        std::pair<EntityId, EntityId> reparentEntity{};
+        EditorEntityBoolChange entityBoolChange{};
+        EditorEntityTransformChange entityTransform{};
+        EditorEntityTransformBatchChange entityTransforms{};
+        EditorMeshRendererChange meshRendererChange{};
+        EditorComponentRequest componentRequest{};
+        EditorLightChange lightChange{};
+        EditorSunChange sunChange{};
+        EditorCameraChange cameraChange{};
+        EditorMaterialUpdate materialUpdate{};
+        EditorMaterialAssignment materialAssignment{};
+        EditorMaterialAssetAssignment materialAssetAssignment{};
+        EditorAlignDistributeRequest alignDistributeRequest{};
+        std::filesystem::path environmentPath;
+        AssetGuid environmentGuid;
+        EditorSceneSnapshotChange sceneSnapshotChange{};
+        EditorAssetTagsRequest assetTagsRequest{};
+        EditorRenameAssetRequest renameAssetRequest{};
+        EditorBulkAssetTagRequest bulkAssetTagRequest{};
+        EditorMoveAssetsToFolderRequest moveAssetsRequest{};
+        EditorDeleteAssetRequest deleteAssetsRequest{};
+        AssetGuid assetGuid;
+        EditorAssetRelinkSourceRequest relinkAssetSourceRequest{};
+        EditorReplaceAssetReferencesRequest replaceAssetReferencesRequest{};
+        EditorRepairMissingAssetDependenciesRequest repairMissingDependenciesRequest{};
+        EditorNativePackageMountRequest mountNativePackageRequest{};
+        EditorNativePackageUnloadRequest unloadNativePackageRequest{};
+        EditorNativePackageRefreshRequest refreshNativePackageRequest{};
+        nlohmann::json timelineJson;
+        ProjectContext projectSettingsUpdate{};
+        SceneUpdateKind sceneUpdateKind = SceneUpdateKind::None;
+        RendererSettings rendererSettings{};
+        bool executed = false;
+    };
+
+    struct LiveMainThreadApplyBatch {
+        uint64_t ticketId = 0;
+        std::string label;
+        std::vector<LiveMainThreadApplyOperation> operations;
+    };
+
     struct CookProjectResult {
         uint64_t serial = 0;
         std::filesystem::path projectFile;
@@ -159,6 +320,12 @@ private:
         std::filesystem::path manifestPath;
         std::filesystem::path validationReportPath;
         std::filesystem::path logPath;
+        NativeTextureFormatSupport nativeTextureFormatSupport;
+        bool emitNativeTextureTargetSets = false;
+        EditorNativeTextureTargetSetProfile nativeTextureTargetSetProfile = EditorNativeTextureTargetSetProfile::ActiveAndAllBc;
+        EditorNativeTextureTargetSetCustomProfile customNativeTextureTargetSet{};
+        std::vector<EditorNativeTextureTargetSetLibraryProfile> customNativeTextureTargetSetLibrary;
+        std::string packageTextureTargetSetJson;
         std::string commandLine;
         int exitCode = -1;
         double workerTotalMs = 0.0;
@@ -171,7 +338,25 @@ private:
         std::filesystem::path manifestPath;
         std::filesystem::path validationReportPath;
         std::filesystem::path logPath;
+        bool emitNativeTextureTargetSets = false;
+        EditorNativeTextureTargetSetProfile nativeTextureTargetSetProfile = EditorNativeTextureTargetSetProfile::ActiveAndAllBc;
+        EditorNativeTextureTargetSetCustomProfile customNativeTextureTargetSet{};
+        std::vector<EditorNativeTextureTargetSetLibraryProfile> customNativeTextureTargetSetLibrary;
         std::future<CookProjectResult> future;
+    };
+
+    struct NativeFileMigrationWorkerProgress {
+        mutable std::mutex mutex;
+        float progress = 0.0f;
+        std::string stage = "Queued";
+        std::chrono::steady_clock::time_point workerStartedAt{};
+        std::chrono::steady_clock::time_point stageStartedAt{};
+    };
+
+    struct ActiveNativeFileMigrationJob {
+        EditorNativeFileMigrationJobRequest request{};
+        std::shared_ptr<NativeFileMigrationWorkerProgress> progress;
+        std::future<EditorNativeFileMigrationJobResult> future;
     };
 
     void initWindow();
@@ -187,10 +372,20 @@ private:
     void queueProjectThumbnailCapture();
     void captureProjectThumbnailIfReady();
     void processRuntimeControls(float deltaSeconds);
+    void updateFrameWorkAccelerationStructureBudgetFeedback(const GpuFrameTimings& timings);
     void updateAnimationPlayers(float deltaSeconds);
+    [[nodiscard]] bool attachNativePackageAnimationPlayer(const NativeRuntimeLoadReport& loadReport);
     [[nodiscard]] std::filesystem::path assetResolutionRoot() const;
     [[nodiscard]] std::optional<std::filesystem::path> resolveAnimationClipPath(const AnimationPlayer& player) const;
+    [[nodiscard]] std::optional<std::filesystem::path> resolveAnimationControllerPath(const AnimationPlayer& player) const;
     [[nodiscard]] const AnimationClip* animationClipForPlayer(const AnimationPlayer& player);
+    [[nodiscard]] const AnimationController* animationControllerForPlayer(const AnimationPlayer& player);
+    [[nodiscard]] const AnimationClip* controllerClipForPlayer(
+        AnimationPlayer& player,
+        const AnimationController& controller,
+        std::vector<AnimationController::Event>* routedEvents = nullptr,
+        const AnimationClip** blendToClip = nullptr,
+        float* blendAlpha = nullptr);
     void processSunDragControls(bool shortcutsBlocked, bool viewportHovered, bool viewportInteraction, bool ctrlDown);
     void beginSunDragArm(bool dragEligible);
     void startSunDrag(double mouseX, double mouseY);
@@ -226,13 +421,60 @@ private:
     void reloadEditorPreferencesForActiveProject();
     [[nodiscard]] bool saveActiveEditorPreferences();
     [[nodiscard]] bool loadProjectStartupScene(const ProjectContext& project);
+    [[nodiscard]] bool mountProjectStartupNativePackage(AssetManager& assets);
+    [[nodiscard]] bool mountNativePackageFromEditor(const std::filesystem::path& packagePath);
+    [[nodiscard]] bool unloadNativePackageFromEditor(const std::filesystem::path& packagePath);
+    [[nodiscard]] bool refreshNativePackageFromEditor(const std::filesystem::path& packagePath);
+    void rememberMountedNativePackage(const std::filesystem::path& packagePath, const NativeRuntimeLoadReport& loadReport);
+    void forgetMountedNativePackage(const std::filesystem::path& packagePath);
+    void pollMountedNativePackageChanges(const EditorRequests& requests);
     [[nodiscard]] bool writeDefaultProjectScene(const ProjectContext& project, std::string_view templateName);
     [[nodiscard]] std::optional<AssetImportWorkspace> prepareAssetImportWorkspace(const std::filesystem::path& sourcePath);
     [[nodiscard]] bool queueAssetImportNonMutating(const EditorImportAssetRequest& request, bool placeAfterImport);
     [[nodiscard]] bool placePrefabAsset(const AssetGuid& prefabGuid, const std::optional<Transform>& placementTransform = std::nullopt);
     [[nodiscard]] std::optional<uint32_t> loadedMeshIndexForRecord(const AssetRecord& record) const;
     [[nodiscard]] bool placeMeshAsset(const EditorMeshAssetPlacement& request);
+    [[nodiscard]] std::optional<UsdRuntimeMeshHierarchyPlacementResult> placeUsdRuntimeMeshHierarchy(
+        const AssetRecord& sceneRecord,
+        const std::filesystem::path& root,
+        const std::vector<EditorMeshAssetPlacement>& meshPlacements);
+    [[nodiscard]] std::optional<UsdRuntimeScenePlacementResult> placeUsdRuntimeSceneEntities(const AssetRecord& sceneRecord, const std::filesystem::path& root);
+    [[nodiscard]] bool placeMeshScatterAssets(const EditorMeshScatterPlacement& request);
+    [[nodiscard]] bool createEntityFromEditor(const EditorEntityCreateRequest& request);
+    [[nodiscard]] bool duplicateEntityFromEditor(EntityId entity);
+    [[nodiscard]] bool deleteEntityFromEditor(EntityId entity);
+    [[nodiscard]] bool deleteEntitiesFromEditor(const std::vector<EntityId>& entities);
+    [[nodiscard]] bool renameEntityFromEditor(const EditorEntityRenameRequest& request);
+    [[nodiscard]] bool reparentEntityFromEditor(EntityId child, EntityId newParent);
+    [[nodiscard]] bool setEntityVisibilityFromEditor(const EditorEntityBoolChange& request);
+    [[nodiscard]] bool setEntityLockedFromEditor(const EditorEntityBoolChange& request);
+    [[nodiscard]] bool setEntityTransformFromEditor(const EditorEntityTransformChange& request);
+    [[nodiscard]] bool setEntityTransformsFromEditor(const EditorEntityTransformBatchChange& request);
+    [[nodiscard]] bool setMeshRendererFromEditor(const EditorMeshRendererChange& request);
+    [[nodiscard]] bool addComponentFromEditor(const EditorComponentRequest& request);
+    [[nodiscard]] bool removeComponentFromEditor(const EditorComponentRequest& request);
+    [[nodiscard]] bool setLightFromEditor(const EditorLightChange& request);
+    [[nodiscard]] bool setSunFromEditor(const EditorSunChange& request);
+    [[nodiscard]] bool setCameraFromEditor(const EditorCameraChange& request);
+    void clearDeletedEditorEntityState(EntityId entity);
+    [[nodiscard]] bool alignDistributeEntitiesFromEditor(const EditorAlignDistributeRequest& request);
+    [[nodiscard]] bool updateMaterialFromEditor(const EditorMaterialUpdate& request);
+    [[nodiscard]] bool assignMaterialFromEditor(const EditorMaterialAssignment& request);
     [[nodiscard]] bool assignMaterialAssetToEntity(const EditorMaterialAssetAssignment& request);
+    [[nodiscard]] bool assignEnvironmentPathFromEditor(const std::filesystem::path& environmentPath, bool allowResourceRebuild);
+    [[nodiscard]] bool assignEnvironmentAssetFromEditor(const AssetGuid& environmentGuid, bool allowResourceRebuild);
+    [[nodiscard]] bool applySceneSnapshotFromEditor(const EditorSceneSnapshotChange& request);
+    [[nodiscard]] bool ensurePrimarySunFromEditor();
+    [[nodiscard]] bool togglePrimarySunFromEditor(bool allowResourceRebuild);
+    [[nodiscard]] bool updateTimelineFromEditor(const nlohmann::json& timelineJson);
+    [[nodiscard]] bool updateProjectSettingsFromEditor(const ProjectContext& updatedProject);
+    [[nodiscard]] bool markSceneUpdateFromEditor(SceneUpdateKind updateKind, bool allowResourceRebuild);
+    [[nodiscard]] bool applyRendererSettingsFromEditor(const RendererSettings& settings, bool allowRenderResolutionChange);
+    [[nodiscard]] bool toggleDenoiserFromEditor(bool allowRenderResolutionChange);
+    [[nodiscard]] bool toggleDebugViewFromEditor(bool allowRenderResolutionChange);
+    [[nodiscard]] bool cycleIntermediateViewFromEditor(bool allowRenderResolutionChange);
+    [[nodiscard]] bool restoreRecoveryAutosavesFromEditor();
+    [[nodiscard]] bool discardRecoveryFromEditor();
     [[nodiscard]] bool assignEnvironmentPath(const std::filesystem::path& environmentPath, bool allowResourceRebuild, std::string_view undoLabel, std::string_view notificationLabel);
     [[nodiscard]] bool assignEnvironmentAsset(const AssetGuid& environmentGuid, bool allowResourceRebuild);
     [[nodiscard]] bool relinkAssetSource(const EditorAssetRelinkSourceRequest& request);
@@ -246,8 +488,14 @@ private:
     [[nodiscard]] bool deleteAssetsFromRegistry(const EditorDeleteAssetRequest& request);
     [[nodiscard]] bool startCookProject(const EditorCookProjectRequest& request);
     void pollCookProjectJob();
+    [[nodiscard]] bool startNativeFileMigrationJob(EditorNativeFileMigrationJobRequest request);
+    void startNextNativeFileMigrationWorker();
+    void pollNativeFileMigrationJob();
+    void recordCompletedNativeFileMigrationJob(const EditorNativeFileMigrationJobResult& result);
     [[nodiscard]] bool queueAssetReimport(const AssetGuid& assetGuid);
     void queueMergeScenes(std::vector<std::filesystem::path> paths);
+    [[nodiscard]] bool queueLiveMainThreadApplyBatch(std::string label, std::vector<LiveMainThreadApplyOperation> operations);
+    void executeLiveMainThreadApplyOperations(const MainThreadApplyStepResult& applyResult);
     void startNextPendingMergeScene();
     void startNextAssetImportWorker();
     void pollAssetImportWorker();
@@ -257,6 +505,8 @@ private:
     bool applyPendingSceneUpdate(bool allowResourceRebuild);
     void applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange);
     void reloadShadersFromEditor();
+    void initializeEditorTicketProbeQueues();
+    void stepEditorTicketProbeQueues();
     void startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot, const EditorRenderRequest* request = nullptr);
     void prepareEditorRenderJobFrame();
     void updateEditorRenderJob(float deltaSeconds);
@@ -277,6 +527,7 @@ private:
     void applyActiveSceneCamera();
     void syncActiveSceneCameraFromController();
     void rebuildGpuSceneAsset();
+    [[nodiscard]] bool rebuildRendererAfterNativePackageUnload(bool affectedActiveRenderer, nlohmann::json& report);
     void initializeFallbackSceneDocument();
     void initializeProjectManagerStartupSceneDocument();
     void initializeRendererFromCurrentScene(const RendererSettings* settingsToRestore = nullptr);
@@ -297,6 +548,10 @@ private:
     std::optional<std::filesystem::path> gltfPath_;
     std::optional<std::filesystem::path> hdrPath_;
     std::optional<std::filesystem::path> scenePath_;
+    std::optional<std::filesystem::path> nativePackageScenePath_;
+    NativePackageAnimationSelection nativePackageAnimationSelection_{};
+    std::vector<MountedNativePackageWatch> mountedNativePackages_;
+    uint64_t nativePackageWatchGeneration_ = 1;
     bool sceneUnsavedDirty_ = false;
     bool projectSettingsDirty_ = false;
     std::optional<ProjectContext> project_;
@@ -323,13 +578,17 @@ private:
     bool pendingRedo_ = false;
     AssetManager assets_;
     std::unordered_map<std::string, AnimationClip> animationClipCache_;
+    std::unordered_map<std::string, AnimationController> animationControllerCache_;
+    std::unordered_map<AssetGuid, std::filesystem::path> nativeRuntimeAnimationPathsByGuid_;
     std::unordered_set<std::string> failedAnimationClipLoads_;
+    std::unordered_set<std::string> failedAnimationControllerLoads_;
     CameraController cameraController_;
     SunDragState sunDrag_{};
     std::array<unsigned char, 512> keyState_{};
     float lastFrameSeconds_ = 0.0f;
     float autosaveElapsedSeconds_ = 0.0f;
     uint64_t frameSerial_ = 0;
+    uint64_t topologyRouteGeneration_ = 0;
     float lastTitleUpdateSeconds_ = -1.0f;
     bool borderlessFullscreen_ = false;
     int windowedX_ = 100;
@@ -366,10 +625,29 @@ private:
     EditorJobCenterState completedAssetImportJob_{};
     uint64_t nextCookProjectJobSerial_ = 1;
     EditorJobCenterState completedCookProjectJob_{};
+    uint64_t nextNativeFileMigrationJobSerial_ = 1;
+    EditorJobCenterState completedNativeFileMigrationJob_{};
+    std::optional<ActiveNativeFileMigrationJob> activeNativeFileMigrationJob_{};
+    std::deque<EditorNativeFileMigrationJobRequest> pendingNativeFileMigrationJobs_;
+    uint64_t frameWorkProbeJobId_ = 0;
+    bool frameWorkProbeCompletionPending_ = false;
+    uint64_t editorGpuUploadCompletedTimeline_ = 0;
+    uint64_t editorTopologyRebuildCompletedTimeline_ = 0;
     UndoStack undoStack_;
     SceneToGpuSceneBuilder sceneBuilder_;
+    FrameWorkScheduler frameWorkScheduler_;
+    GpuUploadTicketQueue editorGpuUploadTickets_;
+    MainThreadApplyTicketQueue editorMainThreadApplyTickets_;
+    TopologyRebuildTicketQueue editorTopologyRebuildTickets_;
+    std::deque<LiveMainThreadApplyBatch> liveMainThreadApplyBatches_;
     std::optional<SceneAsset> gpuSceneAsset_;
     std::vector<EntityId> gpuInstanceEntities_;
+    AnimatedGeometryStats latestAnimatedGeometryStats_{};
+    std::vector<GpuSkinningInstancePlan> latestGpuSkinningPlan_;
+    std::vector<glm::mat4> latestGpuSkinningJointMatrices_;
+    std::vector<glm::mat4> latestGpuSkinningPreviousJointMatrices_;
+    std::vector<PathTracerRenderer::GpuSkinningSourceVertex> latestGpuSkinningSourceVertices_;
+    std::vector<GpuLocalVertex> latestGpuSkinningMorphDeltas_;
     std::unique_ptr<VulkanContext> context_;
     std::unique_ptr<ResourceAllocator> allocator_;
     std::unique_ptr<UploadContext> uploadContext_;
@@ -402,3 +680,6 @@ private:
 };
 
 } // namespace rtv
+
+
+

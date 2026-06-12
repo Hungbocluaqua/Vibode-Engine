@@ -16,9 +16,12 @@
 #include <chrono>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <nlohmann/json.hpp>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -698,6 +701,33 @@ void addDependency(CachedScene& cached, const std::filesystem::path& path, std::
     return lower.ends_with(".ktx2");
 }
 
+[[nodiscard]] bool isDdsBytes(const unsigned char* bytes, int size) {
+    return bytes != nullptr && size >= 4 && std::memcmp(bytes, "DDS ", 4u) == 0;
+}
+
+[[nodiscard]] bool isDdsPath(const std::string& uri) {
+    if (uri.empty()) return false;
+    std::string lower = uri;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return lower.ends_with(".dds");
+}
+
+[[nodiscard]] uint32_t readDdsU32(const unsigned char* bytes, size_t offset) {
+    uint32_t value = 0;
+    std::memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+[[nodiscard]] std::pair<int, int> readDdsDimensions(const unsigned char* bytes, int size) {
+    if (!isDdsBytes(bytes, size) || size < 128) {
+        return {1, 1};
+    }
+    return {
+        static_cast<int>(std::max(readDdsU32(bytes, 16), 1u)),
+        static_cast<int>(std::max(readDdsU32(bytes, 12), 1u)),
+    };
+}
+
 [[nodiscard]] bool isHdrBytes(const unsigned char* bytes, int size) {
     constexpr char radianceMagic[] = "#?RADIANCE";
     constexpr char rgbeMagic[] = "#?RGBE";
@@ -745,9 +775,11 @@ bool loadImageDataPreservingKtx2(
     void* userData) {
     const bool ktx2 = image != nullptr &&
         (image->mimeType == "image/ktx2" || isKtx2Path(image->uri) || isKtx2Bytes(bytes, size));
+    const bool dds = image != nullptr &&
+        (image->mimeType == "image/vnd-ms.dds" || isDdsPath(image->uri) || isDdsBytes(bytes, size));
     const bool hdr = image != nullptr &&
         (image->mimeType == "image/vnd.radiance" || image->mimeType == "image/hdr" || isHdrPath(image->uri) || isHdrBytes(bytes, size));
-    if (!ktx2 && !hdr) {
+    if (!ktx2 && !dds && !hdr) {
         return tinygltf::LoadImageData(image, imageIndex, error, warning, reqWidth, reqHeight, bytes, size, userData);
     }
 
@@ -755,6 +787,10 @@ bool loadImageDataPreservingKtx2(
     if (ktx2) {
         image->width = isKtx2Bytes(bytes, size) ? static_cast<int>(readKtx2U32(bytes, 20)) : 1;
         image->height = isKtx2Bytes(bytes, size) ? static_cast<int>(readKtx2U32(bytes, 24)) : 1;
+    } else if (dds) {
+        const auto [width, height] = readDdsDimensions(bytes, size);
+        image->width = width;
+        image->height = height;
     } else {
         const auto [width, height] = readRadianceDimensions(bytes, size);
         image->width = width;
@@ -766,13 +802,30 @@ bool loadImageDataPreservingKtx2(
     return true;
 }
 
-[[nodiscard]] TextureAsset textureFromImage(const tinygltf::Image& image, const std::filesystem::path& gltfPath) {
+[[nodiscard]] NativeTextureColorSpace gltfNativeTextureColorSpace(NativeTextureRole role) {
+    switch (role) {
+    case NativeTextureRole::BaseColor:
+    case NativeTextureRole::Emissive:
+        return NativeTextureColorSpace::Srgb;
+    case NativeTextureRole::EnvironmentHdr:
+        return NativeTextureColorSpace::HdrLinear;
+    default:
+        return NativeTextureColorSpace::Linear;
+    }
+}
+
+[[nodiscard]] TextureAsset textureFromImage(
+    const tinygltf::Image& image,
+    const std::filesystem::path& gltfPath,
+    const NativeTextureFormatSupport& nativeTextureFormatSupport,
+    NativeTextureRole nativeTextureRole) {
     TextureAsset texture;
     texture.name = image.name;
     texture.sourcePath = textureSourcePath(image, gltfPath);
     texture.width = static_cast<uint32_t>(std::max(image.width, 1));
     texture.height = static_cast<uint32_t>(std::max(image.height, 1));
     texture.channels = 4;
+    const NativeTextureColorSpace nativeTextureColorSpace = gltfNativeTextureColorSpace(nativeTextureRole);
 
     if (isKtx2Path(image.uri) || isKtx2Data(image.image)) {
         std::filesystem::path ktxPath;
@@ -781,8 +834,8 @@ bool loadImageDataPreservingKtx2(
         }
         try {
             TextureData td = ktxPath.empty() && isKtx2Data(image.image)
-                ? TextureLoader::loadKtx2(image.image.data(), image.image.size())
-                : TextureLoader::loadKtx2(ktxPath.string());
+                ? TextureLoader::loadKtx2(image.image.data(), image.image.size(), nativeTextureFormatSupport, nativeTextureRole, nativeTextureColorSpace)
+                : TextureLoader::loadKtx2(ktxPath.string(), nativeTextureFormatSupport, nativeTextureRole, nativeTextureColorSpace);
             texture.width = static_cast<uint32_t>(td.width);
             texture.height = static_cast<uint32_t>(td.height);
             texture.channels = 4;
@@ -791,6 +844,10 @@ bool loadImageDataPreservingKtx2(
             texture.linearColorSpace = td.linearColorSpace;
             texture.format = td.format;
             texture.compressedFormat = td.compressedFormat;
+            texture.sourceContainerKind = std::move(td.sourceContainerKind);
+            texture.nativePayloadSource = std::move(td.nativePayloadSource);
+            texture.sourceContainerPreserved = td.sourceContainerPreserved;
+            texture.sourceContainerTranscoded = td.sourceContainerTranscoded;
             texture.rgba8 = std::move(td.pixels);
             texture.mipData = std::move(td.mipData);
             texture.fallback = false;
@@ -803,7 +860,7 @@ bool loadImageDataPreservingKtx2(
     const bool externalImage = !texture.sourcePath.empty() && texture.sourcePath != gltfPath && std::filesystem::exists(texture.sourcePath);
     if (externalImage) {
         try {
-            TextureData td = TextureLoader::load(texture.sourcePath.string());
+            TextureData td = TextureLoader::load(texture.sourcePath.string(), nativeTextureFormatSupport, nativeTextureRole, nativeTextureColorSpace);
             texture.width = static_cast<uint32_t>(td.width);
             texture.height = static_cast<uint32_t>(td.height);
             texture.channels = 4;
@@ -812,6 +869,10 @@ bool loadImageDataPreservingKtx2(
             texture.linearColorSpace = td.linearColorSpace;
             texture.format = td.format;
             texture.compressedFormat = td.compressedFormat;
+            texture.sourceContainerKind = std::move(td.sourceContainerKind);
+            texture.nativePayloadSource = std::move(td.nativePayloadSource);
+            texture.sourceContainerPreserved = td.sourceContainerPreserved;
+            texture.sourceContainerTranscoded = td.sourceContainerTranscoded;
             texture.rgba8 = std::move(td.pixels);
             texture.mipData = std::move(td.mipData);
             texture.fallback = false;
@@ -953,8 +1014,11 @@ bool loadImageDataPreservingKtx2(
     const tinygltf::Texture& texture,
     size_t imageCount,
     size_t textureIndex) {
-    const auto extIt = texture.extensions.find("KHR_texture_basisu");
-    if (extIt != texture.extensions.end() && extIt->second.IsObject()) {
+    auto extensionSource = [&](const char* extensionName) -> std::optional<int> {
+        const auto extIt = texture.extensions.find(extensionName);
+        if (extIt == texture.extensions.end() || !extIt->second.IsObject()) {
+            return std::nullopt;
+        }
         const auto& extObject = extIt->second.Get<tinygltf::Value::Object>();
         const auto sourceIt = extObject.find("source");
         if (sourceIt != extObject.end() && sourceIt->second.IsInt()) {
@@ -963,12 +1027,20 @@ bool loadImageDataPreservingKtx2(
                 return source;
             }
             std::cerr << "glTF texture warning: texture " << textureIndex
-                      << " has KHR_texture_basisu source " << source
+                      << " has " << extensionName << " source " << source
                       << " outside the image array; using core source fallback\n";
         } else {
             std::cerr << "glTF texture warning: texture " << textureIndex
-                      << " has KHR_texture_basisu without an integer source; using core source fallback\n";
+                      << " has " << extensionName << " without an integer source; using core source fallback\n";
         }
+        return std::nullopt;
+    };
+
+    if (const std::optional<int> source = extensionSource("KHR_texture_basisu")) {
+        return *source;
+    }
+    if (const std::optional<int> source = extensionSource("MSFT_texture_dds")) {
+        return *source;
     }
     return texture.source;
 }
@@ -978,6 +1050,7 @@ bool loadImageDataPreservingKtx2(
         name == "KHR_materials_transmission" ||
         name == "KHR_materials_ior" ||
         name == "KHR_materials_specular" ||
+        name == "KHR_materials_pbrSpecularGlossiness" ||
         name == "KHR_materials_volume" ||
         name == "KHR_materials_dispersion" ||
         name == "KHR_materials_sheen" ||
@@ -988,6 +1061,7 @@ bool loadImageDataPreservingKtx2(
         name == "KHR_materials_variants" ||
         name == "KHR_mesh_quantization" ||
         name == "KHR_texture_basisu" ||
+        name == "MSFT_texture_dds" ||
         name == "KHR_lights_punctual" ||
         name == "KHR_texture_transform";
 }
@@ -1024,6 +1098,125 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
             std::cerr << "glTF extension warning: unsupported extension '" << name << "'\n";
         }
     }
+}
+
+struct PunctualLightJsonFallback {
+    std::vector<tinygltf::Light> lights;
+    std::vector<int> nodeLightIndices;
+};
+
+[[nodiscard]] bool hasGltfExtensionUsed(const tinygltf::Model& model, std::string_view name) {
+    return std::find(model.extensionsUsed.begin(), model.extensionsUsed.end(), name) != model.extensionsUsed.end() ||
+        std::find(model.extensionsRequired.begin(), model.extensionsRequired.end(), name) != model.extensionsRequired.end();
+}
+
+[[nodiscard]] bool isGltfJsonPath(const std::filesystem::path& path) {
+    std::string extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+    return extension == ".gltf";
+}
+
+[[nodiscard]] std::optional<nlohmann::json> readGltfJsonDocument(const std::filesystem::path& path) {
+    if (!isGltfJsonPath(path)) {
+        return std::nullopt;
+    }
+    std::ifstream in(path);
+    if (!in) {
+        return std::nullopt;
+    }
+    try {
+        nlohmann::json doc;
+        in >> doc;
+        return doc;
+    } catch (const std::exception& e) {
+        std::cerr << "glTF light warning: failed to parse JSON light fallback for "
+                  << path.string() << ": " << e.what() << "\n";
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] const nlohmann::json* jsonObjectMember(const nlohmann::json& object, const char* key) {
+    if (!object.is_object()) {
+        return nullptr;
+    }
+    const auto it = object.find(key);
+    return it != object.end() ? &*it : nullptr;
+}
+
+[[nodiscard]] double jsonNumberMember(const nlohmann::json& object, const char* key, double fallback) {
+    const nlohmann::json* value = jsonObjectMember(object, key);
+    return value != nullptr && value->is_number() ? value->get<double>() : fallback;
+}
+
+[[nodiscard]] std::string jsonStringMember(const nlohmann::json& object, const char* key, std::string fallback = {}) {
+    const nlohmann::json* value = jsonObjectMember(object, key);
+    return value != nullptr && value->is_string() ? value->get<std::string>() : fallback;
+}
+
+[[nodiscard]] std::vector<double> jsonVec3Member(const nlohmann::json& object, const char* key, std::vector<double> fallback) {
+    const nlohmann::json* value = jsonObjectMember(object, key);
+    if (value == nullptr || !value->is_array() || value->size() < 3) {
+        return fallback;
+    }
+    std::vector<double> result(3, 1.0);
+    for (size_t i = 0; i < 3; ++i) {
+        if (!(*value)[i].is_number()) {
+            return fallback;
+        }
+        result[i] = (*value)[i].get<double>();
+    }
+    return result;
+}
+
+[[nodiscard]] PunctualLightJsonFallback punctualLightFallbackFromGltfJson(
+    const std::filesystem::path& path,
+    size_t nodeCount) {
+    PunctualLightJsonFallback fallback;
+    fallback.nodeLightIndices.assign(nodeCount, -1);
+
+    const std::optional<nlohmann::json> doc = readGltfJsonDocument(path);
+    if (!doc.has_value() || !doc->is_object()) {
+        return fallback;
+    }
+
+    const nlohmann::json* extensions = jsonObjectMember(*doc, "extensions");
+    const nlohmann::json* punctual = extensions != nullptr ? jsonObjectMember(*extensions, "KHR_lights_punctual") : nullptr;
+    const nlohmann::json* lights = punctual != nullptr ? jsonObjectMember(*punctual, "lights") : nullptr;
+    if (lights != nullptr && lights->is_array()) {
+        fallback.lights.reserve(lights->size());
+        for (const nlohmann::json& item : *lights) {
+            if (!item.is_object()) {
+                continue;
+            }
+            tinygltf::Light light;
+            light.name = jsonStringMember(item, "name");
+            light.type = jsonStringMember(item, "type", "point");
+            light.color = jsonVec3Member(item, "color", {1.0, 1.0, 1.0});
+            light.intensity = jsonNumberMember(item, "intensity", 1.0);
+            light.range = jsonNumberMember(item, "range", 0.0);
+            if (const nlohmann::json* spot = jsonObjectMember(item, "spot")) {
+                light.spot.innerConeAngle = jsonNumberMember(*spot, "innerConeAngle", light.spot.innerConeAngle);
+                light.spot.outerConeAngle = jsonNumberMember(*spot, "outerConeAngle", light.spot.outerConeAngle);
+            }
+            fallback.lights.push_back(std::move(light));
+        }
+    }
+
+    const nlohmann::json* nodes = jsonObjectMember(*doc, "nodes");
+    if (nodes != nullptr && nodes->is_array()) {
+        const size_t count = std::min(nodeCount, nodes->size());
+        for (size_t i = 0; i < count; ++i) {
+            const nlohmann::json& node = (*nodes)[i];
+            const nlohmann::json* nodeExtensions = jsonObjectMember(node, "extensions");
+            const nlohmann::json* nodePunctual = nodeExtensions != nullptr ? jsonObjectMember(*nodeExtensions, "KHR_lights_punctual") : nullptr;
+            const nlohmann::json* light = nodePunctual != nullptr ? jsonObjectMember(*nodePunctual, "light") : nullptr;
+            if (light != nullptr && light->is_number_integer()) {
+                fallback.nodeLightIndices[i] = light->get<int>();
+            }
+        }
+    }
+
+    return fallback;
 }
 
 [[nodiscard]] MaterialAsset materialFromGltf(const tinygltf::Material& source, const std::vector<TextureAssetHandle>& textures) {
@@ -1069,6 +1262,22 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
             static_cast<float>(array[0].GetNumberAsDouble()),
             static_cast<float>(array[1].GetNumberAsDouble()),
             static_cast<float>(array[2].GetNumberAsDouble()),
+        };
+    };
+    auto vec4Member = [&](const tinygltf::Value& object, const char* key, glm::vec4 fallback) {
+        const tinygltf::Value* value = valueMember(object, key);
+        if (value == nullptr || !value->IsArray()) {
+            return fallback;
+        }
+        const auto& array = value->Get<tinygltf::Value::Array>();
+        if (array.size() < 4 || !array[0].IsNumber() || !array[1].IsNumber() || !array[2].IsNumber() || !array[3].IsNumber()) {
+            return fallback;
+        }
+        return glm::vec4{
+            static_cast<float>(array[0].GetNumberAsDouble()),
+            static_cast<float>(array[1].GetNumberAsDouble()),
+            static_cast<float>(array[2].GetNumberAsDouble()),
+            static_cast<float>(array[3].GetNumberAsDouble()),
         };
     };
     auto textureHandleMember = [&](const tinygltf::Value& object, const char* key) {
@@ -1175,6 +1384,21 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
     material.emissiveTextureTransform = textureTransformFromInfo(source.emissiveTexture);
     material.occlusionTextureTransform = textureTransformFromInfo(source.occlusionTexture);
 
+    if (const tinygltf::Value* ext = extensionObject("KHR_materials_pbrSpecularGlossiness")) {
+        const float glossinessFactor = static_cast<float>(std::clamp(numberMember(*ext, "glossinessFactor", 1.0), 0.0, 1.0));
+        material.materialWorkflow = kMaterialWorkflowSpecularGlossiness;
+        material.baseColorFactor = vec4Member(*ext, "diffuseFactor", glm::vec4{1.0f});
+        material.baseColorTexture = textureHandleMember(*ext, "diffuseTexture");
+        assignExtensionTextureTransform(material.baseColorTextureTransform, *ext, "diffuseTexture");
+        material.metallicFactor = 0.0f;
+        material.roughnessFactor = std::clamp(1.0f - glossinessFactor, 0.0f, 1.0f);
+        material.hasSpecular = 1u;
+        material.specularFactor = 1.0f;
+        material.specularColorFactor = vec3Member(*ext, "specularFactor", glm::vec3{1.0f});
+        material.specularTexture = textureHandleMember(*ext, "specularGlossinessTexture");
+        assignExtensionTextureTransform(material.specularTextureTransform, *ext, "specularGlossinessTexture");
+        material.specularTextureAlphaMode = kMaterialSpecularTextureAlphaGlossiness;
+    }
     if (const tinygltf::Value* ext = extensionObject("KHR_materials_ior")) {
         material.hasIor = 1u;
         material.iorFactor = static_cast<float>(numberMember(*ext, "ior", 1.5));
@@ -1269,7 +1493,7 @@ void reportGltfExtensionDiagnostics(const tinygltf::Model& model) {
             name == "KHR_materials_volume" || name == "KHR_materials_dispersion" ||
             name == "KHR_materials_sheen" || name == "KHR_materials_emissive_strength" ||
             name == "KHR_materials_iridescence" || name == "KHR_materials_anisotropy" ||
-            name == "KHR_materials_unlit") {
+            name == "KHR_materials_unlit" || name == "KHR_materials_pbrSpecularGlossiness") {
             continue;
         }
         std::cerr << "glTF material extension warning: material '" << (source.name.empty() ? "(unnamed)" : source.name)
@@ -1436,6 +1660,7 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
 
     std::vector<bool> colorTextureUse(model.textures.size(), false);
     std::vector<bool> dataTextureUse(model.textures.size(), false);
+    std::vector<NativeTextureRole> nativeTextureRoles(model.textures.size(), NativeTextureRole::Unknown);
     auto extensionTextureIndex = [](const tinygltf::Material& material, const char* extensionName, const char* textureName) -> int {
         const auto extIt = material.extensions.find(extensionName);
         if (extIt == material.extensions.end() || !extIt->second.IsObject()) {
@@ -1455,25 +1680,68 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
             use[static_cast<size_t>(textureIndex)] = true;
         }
     };
+    auto rolePriority = [](NativeTextureRole role) -> int {
+        switch (role) {
+        case NativeTextureRole::Normal: return 6;
+        case NativeTextureRole::BaseColor: return 5;
+        case NativeTextureRole::Emissive: return 5;
+        case NativeTextureRole::MetallicRoughness: return 4;
+        case NativeTextureRole::Occlusion: return 3;
+        case NativeTextureRole::Opacity: return 3;
+        case NativeTextureRole::Data: return 2;
+        case NativeTextureRole::Unknown: return 0;
+        default: return 1;
+        }
+    };
+    auto markTextureRole = [&](int textureIndex, NativeTextureRole role) {
+        if (textureIndex < 0 || static_cast<size_t>(textureIndex) >= nativeTextureRoles.size()) {
+            return;
+        }
+        NativeTextureRole& current = nativeTextureRoles[static_cast<size_t>(textureIndex)];
+        if (rolePriority(role) > rolePriority(current)) {
+            current = role;
+        }
+    };
     for (const tinygltf::Material& sourceMaterial : model.materials) {
         const auto& pbr = sourceMaterial.pbrMetallicRoughness;
         markTextureUse(pbr.baseColorTexture.index, colorTextureUse);
+        markTextureRole(pbr.baseColorTexture.index, NativeTextureRole::BaseColor);
         markTextureUse(sourceMaterial.emissiveTexture.index, colorTextureUse);
+        markTextureRole(sourceMaterial.emissiveTexture.index, NativeTextureRole::Emissive);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_pbrSpecularGlossiness", "diffuseTexture"), colorTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_pbrSpecularGlossiness", "diffuseTexture"), NativeTextureRole::BaseColor);
+        markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_pbrSpecularGlossiness", "specularGlossinessTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_pbrSpecularGlossiness", "specularGlossinessTexture"), NativeTextureRole::Data);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenColorTexture"), colorTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenColorTexture"), NativeTextureRole::BaseColor);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularColorTexture"), colorTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularColorTexture"), NativeTextureRole::BaseColor);
         markTextureUse(pbr.metallicRoughnessTexture.index, dataTextureUse);
+        markTextureRole(pbr.metallicRoughnessTexture.index, NativeTextureRole::MetallicRoughness);
         markTextureUse(sourceMaterial.normalTexture.index, dataTextureUse);
+        markTextureRole(sourceMaterial.normalTexture.index, NativeTextureRole::Normal);
         markTextureUse(sourceMaterial.occlusionTexture.index, dataTextureUse);
+        markTextureRole(sourceMaterial.occlusionTexture.index, NativeTextureRole::Occlusion);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatTexture"), NativeTextureRole::Data);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatRoughnessTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatRoughnessTexture"), NativeTextureRole::Roughness);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatNormalTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatNormalTexture"), NativeTextureRole::Normal);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_transmission", "transmissionTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_transmission", "transmissionTexture"), NativeTextureRole::Opacity);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_volume", "thicknessTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_volume", "thicknessTexture"), NativeTextureRole::Data);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularTexture"), NativeTextureRole::Data);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenRoughnessTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenRoughnessTexture"), NativeTextureRole::Roughness);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceTexture"), NativeTextureRole::Data);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceThicknessTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceThicknessTexture"), NativeTextureRole::Data);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_anisotropy", "anisotropyTexture"), dataTextureUse);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_anisotropy", "anisotropyTexture"), NativeTextureRole::Data);
     }
 
     std::vector<TextureAssetHandle> textureHandles;
@@ -1483,7 +1751,11 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         TextureAsset texture;
         const int sourceImageIndex = textureImageSourceIndexFromGltf(sourceTexture, model.images.size(), textureIndex);
         if (sourceImageIndex >= 0 && static_cast<size_t>(sourceImageIndex) < model.images.size()) {
-            texture = textureFromImage(model.images[static_cast<size_t>(sourceImageIndex)], path);
+            texture = textureFromImage(
+                model.images[static_cast<size_t>(sourceImageIndex)],
+                path,
+                nativeTextureFormatSupport_,
+                nativeTextureRoles[textureIndex]);
         }
         texture.name = texture.name.empty() ? sourceTexture.name : texture.name;
         if (texture.name.empty() && !texture.sourcePath.empty() && texture.sourcePath != path) {
@@ -1890,13 +2162,38 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         nodeWorldTransform(nodeWorldTransform, i);
     }
 
+    const bool usesPunctualLights = hasGltfExtensionUsed(model, "KHR_lights_punctual");
+    const PunctualLightJsonFallback punctualLightJsonFallback = usesPunctualLights
+        ? punctualLightFallbackFromGltfJson(path, model.nodes.size())
+        : PunctualLightJsonFallback{};
+    const std::vector<tinygltf::Light>& punctualLights = !model.lights.empty()
+        ? model.lights
+        : punctualLightJsonFallback.lights;
+
+    auto nodePunctualLightIndex = [&](const tinygltf::Node& node, size_t nodeIndex) -> int {
+        if (node.light >= 0) {
+            return node.light;
+        }
+        const auto extIt = node.extensions.find("KHR_lights_punctual");
+        if (extIt != node.extensions.end() && extIt->second.IsObject()) {
+            const auto& object = extIt->second.Get<tinygltf::Value::Object>();
+            const auto lightIt = object.find("light");
+            if (lightIt != object.end() && lightIt->second.IsInt()) {
+                return lightIt->second.Get<int>();
+            }
+        }
+        return nodeIndex < punctualLightJsonFallback.nodeLightIndices.size()
+            ? punctualLightJsonFallback.nodeLightIndices[nodeIndex]
+            : -1;
+    };
     for (size_t ni = 0; ni < model.nodes.size(); ++ni) {
         const tinygltf::Node& sourceNode = model.nodes[ni];
-        if (sourceNode.light < 0 || static_cast<size_t>(sourceNode.light) >= model.lights.size()) {
+        const int lightIndex = nodePunctualLightIndex(sourceNode, ni);
+        if (lightIndex < 0 || static_cast<size_t>(lightIndex) >= punctualLights.size()) {
             continue;
         }
 
-        const tinygltf::Light& srcLight = model.lights[static_cast<size_t>(sourceNode.light)];
+        const tinygltf::Light& srcLight = punctualLights[static_cast<size_t>(lightIndex)];
         SceneLightAsset light;
         light.color = srcLight.color.size() >= 3
             ? glm::vec3(static_cast<float>(srcLight.color[0]),
@@ -1920,6 +2217,22 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         light.transform = ni < nodeWorldTransforms.size() ? nodeWorldTransforms[ni] : nodeTransform(sourceNode);
         light.nodeIndex = static_cast<int32_t>(ni);
         scene.lights.push_back(light);
+    }
+    if (usesPunctualLights && scene.lights.empty()) {
+        const size_t jsonNodeLightRefCount = std::count_if(
+            punctualLightJsonFallback.nodeLightIndices.begin(),
+            punctualLightJsonFallback.nodeLightIndices.end(),
+            [](int lightIndex) { return lightIndex >= 0; });
+        const size_t tinyNodeLightRefCount = std::count_if(
+            model.nodes.begin(),
+            model.nodes.end(),
+            [](const tinygltf::Node& node) { return node.light >= 0; });
+        std::cerr << "glTF light warning: KHR_lights_punctual was declared but no scene lights were created"
+                  << " tiny_lights=" << model.lights.size()
+                  << " tiny_node_refs=" << tinyNodeLightRefCount
+                  << " json_lights=" << punctualLightJsonFallback.lights.size()
+                  << " json_node_refs=" << jsonNodeLightRefCount
+                  << " nodes=" << model.nodes.size() << "\n";
     }
 
     const int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : 0;
@@ -2045,6 +2358,9 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.iridescenceThicknessTexture = textureHandleFor(cachedMat.iridescenceThicknessTextureIndex);
                     material.anisotropyTexture = textureHandleFor(cachedMat.anisotropyTextureIndex);
                     material.occlusionTexture = textureHandleFor(cachedMat.occlusionTextureIndex);
+                    material.opacityTexture = textureHandleFor(cachedMat.opacityTextureIndex);
+                    material.heightTexture = textureHandleFor(cachedMat.heightTextureIndex);
+                    material.heightScale = cachedMat.heightScale;
                     material.baseColorTextureTransform = cachedMat.baseColorTextureTransform;
                     material.metallicRoughnessTextureTransform = cachedMat.metallicRoughnessTextureTransform;
                     material.normalTextureTransform = cachedMat.normalTextureTransform;
@@ -2062,6 +2378,9 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.iridescenceTextureTransform = cachedMat.iridescenceTextureTransform;
                     material.iridescenceThicknessTextureTransform = cachedMat.iridescenceThicknessTextureTransform;
                     material.anisotropyTextureTransform = cachedMat.anisotropyTextureTransform;
+                    material.materialWorkflow = cachedMat.materialWorkflow;
+                    material.normalMapConvention = cachedMat.normalMapConvention;
+                    material.specularTextureAlphaMode = cachedMat.specularTextureAlphaMode;
                     material.shaderCompatibilityMask = cachedMat.shaderCompatibilityMask;
                     scene.materials.push_back(assets_.addMaterial(std::move(material)));
                 }
@@ -2327,6 +2646,9 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.iridescenceThicknessTextureIndex = getTextureIndex(material->iridescenceThicknessTexture);
         cachedMat.anisotropyTextureIndex = getTextureIndex(material->anisotropyTexture);
         cachedMat.occlusionTextureIndex = getTextureIndex(material->occlusionTexture);
+        cachedMat.opacityTextureIndex = getTextureIndex(material->opacityTexture);
+        cachedMat.heightTextureIndex = getTextureIndex(material->heightTexture);
+        cachedMat.heightScale = material->heightScale;
         cachedMat.baseColorTextureTransform = material->baseColorTextureTransform;
         cachedMat.metallicRoughnessTextureTransform = material->metallicRoughnessTextureTransform;
         cachedMat.normalTextureTransform = material->normalTextureTransform;
@@ -2344,6 +2666,9 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.iridescenceTextureTransform = material->iridescenceTextureTransform;
         cachedMat.iridescenceThicknessTextureTransform = material->iridescenceThicknessTextureTransform;
         cachedMat.anisotropyTextureTransform = material->anisotropyTextureTransform;
+        cachedMat.materialWorkflow = material->materialWorkflow;
+        cachedMat.normalMapConvention = material->normalMapConvention;
+        cachedMat.specularTextureAlphaMode = material->specularTextureAlphaMode;
         cachedMat.shaderCompatibilityMask = material->shaderCompatibilityMask;
         cached.materials.push_back(std::move(cachedMat));
     }

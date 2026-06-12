@@ -241,14 +241,17 @@ void accumulateState(OpacityMicromapPrimitiveCpuData& primitive, OpacityMicromap
     generated.primitive.stateCount = generated.primitive.triangleCount * microTrianglesPerTriangle;
     generated.states.reserve(generated.primitive.stateCount);
 
-    const bool readableTexture = request.material.baseColorTextureIndex >= 0 && alphaTextureReadable(request.texture);
-    if (request.material.baseColorTextureIndex >= 0) {
+    const bool hasAlphaTexture = request.material.baseColorTextureIndex >= 0;
+    const bool readableTexture = hasAlphaTexture && alphaTextureReadable(request.texture);
+    if (hasAlphaTexture) {
         ++stats.alphaTexturePrimitiveCount;
         if (!readableTexture) {
             std::ostringstream warning;
             warning << "Alpha texture for mesh " << request.meshIndex << " primitive " << request.primitiveIndex
-                    << " is not CPU-readable; marking OMM micro-triangles unknown";
+                    << " is not CPU-readable; skipping OMM so alpha any-hit can sample the texture";
             stats.warnings.push_back(warning.str());
+            generated.primitive.stateCount = 0;
+            return generated;
         }
     } else {
         ++stats.constantAlphaPrimitiveCount;
@@ -420,6 +423,9 @@ template <typename RequestBuilder>
             it = cache.emplace(key, std::move(generated)).first;
         } else {
             ++data.stats.cacheHitCount;
+        }
+        if (it->second.primitive.stateCount == 0 || it->second.states.empty()) {
+            continue;
         }
         appendGeneratedPrimitive(data, it->second);
         data.stats.totalTriangleCount += it->second.primitive.triangleCount;

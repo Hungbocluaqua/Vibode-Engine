@@ -1,12 +1,14 @@
 #pragma once
 
 #include "rtv/Image.h"
+#include "rtv/GpuUploadTicket.h"
 #include "rtv/TextureAsset.h"
 
 #include <Volk/volk.h>
 
 #include <cstddef>
 #include <span>
+#include <vector>
 
 namespace rtv {
 
@@ -45,14 +47,18 @@ public:
     [[nodiscard]] ResourceAllocator& allocator() { return allocator_; }
     [[nodiscard]] UploadContext& uploadContext() { return uploadContext_; }
     [[nodiscard]] const Stats& stats() const { return stats_; }
+    [[nodiscard]] std::vector<GpuUploadTicketSnapshot> uploadTicketSnapshots(bool includeChunks = false) const;
+    [[nodiscard]] uint64_t uploadTicketNextTimelineValue() const { return uploadTickets_.nextTimelineValue(); }
     void recordBatchUpload(VkDeviceSize byteSize);
 
 private:
     void recordUpload(VkDeviceSize byteSize);
+    void recordUploadTicket(GpuUploadResourceKind kind, VkDeviceSize byteSize, const char* label);
 
     ResourceAllocator& allocator_;
     UploadContext& uploadContext_;
     Stats stats_{};
+    GpuUploadTicketQueue uploadTickets_;
 };
 
 } // namespace rtv

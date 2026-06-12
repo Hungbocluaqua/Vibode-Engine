@@ -54,6 +54,13 @@ struct TextureAsset {
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkFormat compressedFormat = VK_FORMAT_UNDEFINED;
     TextureSamplerDesc sampler{};
+    std::string nativeGuid;
+    std::string nativeSource;
+    std::filesystem::path nativePath;
+    std::string sourceContainerKind;
+    std::string nativePayloadSource;
+    bool sourceContainerPreserved = false;
+    bool sourceContainerTranscoded = false;
     std::vector<uint8_t> rgba8;
     std::vector<TextureMipLevel> mipData;
 };

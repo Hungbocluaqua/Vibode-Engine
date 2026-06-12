@@ -16,6 +16,7 @@ void main() {
         payload.material_id = 0u;
         payload.tangent = vec3(1.0, 0.0, 0.0);
         payload.bitangent = vec3(0.0, 0.0, 1.0);
+        payload.barycentrics = vec3(1.0, 0.0, 0.0);
         payload.uv = vec2(0.0);
         payload.uv1 = vec2(0.0);
         payload.vertex_color = vec4(1.0);
@@ -32,9 +33,9 @@ void main() {
     uint i1 = local_mesh_indices[triIndex + 1u];
     uint i2 = local_mesh_indices[triIndex + 2u];
 
-    LocalVertex v0 = local_mesh_vertices[i0];
-    LocalVertex v1 = local_mesh_vertices[i1];
-    LocalVertex v2 = local_mesh_vertices[i2];
+    LocalVertex v0 = ray_tracing_local_vertex(meshIndex, i0);
+    LocalVertex v1 = ray_tracing_local_vertex(meshIndex, i1);
+    LocalVertex v2 = ray_tracing_local_vertex(meshIndex, i2);
     vec3 p0 = v0.position_uv_x.xyz;
     vec3 p1 = v1.position_uv_x.xyz;
     vec3 p2 = v2.position_uv_x.xyz;
@@ -80,6 +81,7 @@ void main() {
     payload.instance_id = instanceIndex;
     payload.mesh_id = meshIndex;
     payload.primitive_id = globalTriangleIndex;
+    payload.barycentrics = bary;
     payload.uv = uv;
     payload.uv1 = uv1;
     payload.tangent = worldTangent;

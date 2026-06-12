@@ -58,6 +58,18 @@ AssetLoadStats AssetManager::stats() const {
     };
 }
 
+void AssetManager::truncateTo(const AssetLoadStats& stats) {
+    if (textures_.size() > stats.textureCount) {
+        textures_.resize(stats.textureCount);
+    }
+    if (materials_.size() > stats.materialCount) {
+        materials_.resize(stats.materialCount);
+    }
+    if (meshes_.size() > stats.meshCount) {
+        meshes_.resize(stats.meshCount);
+    }
+}
+
 void AssetManager::clear() {
     textures_.clear();
     materials_.clear();

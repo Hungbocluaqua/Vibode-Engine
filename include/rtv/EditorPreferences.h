@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -10,6 +11,28 @@ namespace rtv {
 struct EditorAssetCollection {
     std::string name;
     std::vector<std::string> assetGuids;
+};
+
+struct EditorNativeTextureTargetSetLibraryProfile {
+    std::string name = "editor-custom-target-set";
+    bool bc7SrgbSampled = true;
+    bool bc7UnormSampled = true;
+    bool bc5UnormSampled = true;
+    bool bc4UnormSampled = true;
+    bool rgba8SrgbSampled = true;
+    bool rgba8UnormSampled = true;
+    bool rgba16fSampled = true;
+};
+
+struct EditorNativeTextureTargetSetCustomProfile {
+    std::string platformName = "editor-custom-target-set";
+    bool bc7SrgbSampled = true;
+    bool bc7UnormSampled = true;
+    bool bc5UnormSampled = true;
+    bool bc4UnormSampled = true;
+    bool rgba8SrgbSampled = true;
+    bool rgba8UnormSampled = true;
+    bool rgba16fSampled = true;
 };
 
 struct EditorPreferences {
@@ -30,6 +53,17 @@ struct EditorPreferences {
     int themePreset = 0;
     int workspacePreset = 0;
     int layoutVersion = 2;
+    bool cookEmitNativeTextureTargetSets = false;
+    int cookNativeTextureTargetSetProfile = 0;
+    std::string cookNativeTextureTargetSetName = "editor-custom-target-set";
+    bool cookNativeTextureTargetSetBc7Srgb = true;
+    bool cookNativeTextureTargetSetBc7Unorm = true;
+    bool cookNativeTextureTargetSetBc5 = true;
+    bool cookNativeTextureTargetSetBc4 = true;
+    bool cookNativeTextureTargetSetRgba8Srgb = true;
+    bool cookNativeTextureTargetSetRgba8Unorm = true;
+    bool cookNativeTextureTargetSetRgba16f = true;
+    std::vector<EditorNativeTextureTargetSetLibraryProfile> cookNativeTextureTargetSetLibrary;
     bool viewportAxesVisible = true;
     bool viewportLocalTransformFrame = false;
     int renderSequenceFramesPerTimelineFrame = 1;
@@ -41,6 +75,25 @@ struct EditorPreferences {
     bool viewportDropMouseWheelRotationEnabled = true;
     bool viewportPickMeshEntities = true;
     bool viewportPickActorIcons = true;
+    bool viewportSurfaceSnappingEnabled = false;
+    bool viewportSurfaceSnapAlignToNormal = true;
+    bool viewportSurfaceSnapPreserveYaw = true;
+    float viewportSurfaceSnapOffset = 0.0f;
+    bool viewportSurfaceSnapBoundsBottom = true;
+    int viewportSurfaceSnapAxisConstraint = 0;
+    bool viewportScatterPaletteByDefault = false;
+    float viewportScatterPaletteDensity = 1.0f;
+    float viewportScatterPaletteSlopeMinDegrees = 0.0f;
+    float viewportScatterPaletteSlopeMaxDegrees = 60.0f;
+    float viewportScatterPaletteHeightMin = -10000.0f;
+    float viewportScatterPaletteHeightMax = 10000.0f;
+    float viewportScatterPaletteScaleMin = 1.0f;
+    float viewportScatterPaletteScaleMax = 1.0f;
+    float viewportScatterPaletteYawRandomDegrees = 180.0f;
+    uint32_t viewportScatterPaletteSeed = 1;
+    float viewportScatterPaletteSpacing = 1.0f;
+    float viewportScatterPaletteCollisionRadius = 0.25f;
+    bool viewportScatterPaletteSurfaceAlignment = true;
     std::vector<std::string> recentFiles;
     std::vector<std::string> favoriteFiles;
     std::vector<std::string> recentProjects;

@@ -5,7 +5,9 @@
 #include <Volk/volk.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace rtv {
@@ -43,6 +45,16 @@ struct BindlessMaterialReference {
     uint32_t emissiveTexture = UINT32_MAX;
 };
 
+struct BindlessTextureRegistrationInfo {
+    uint32_t slot = UINT32_MAX;
+    std::string guid;
+    std::string nativeSource;
+    std::filesystem::path nativePath;
+    bool resident = false;
+    bool fallback = false;
+    bool missing = false;
+};
+
 class BindlessTextureTable {
 public:
     BindlessTextureTable() = default;
@@ -54,6 +66,7 @@ public:
     BindlessTextureTable& operator=(BindlessTextureTable&&) noexcept;
 
     void setImages(std::vector<std::unique_ptr<Image>> images, uint32_t slotCount);
+    void setRegistrationInfo(std::vector<BindlessTextureRegistrationInfo> registrations);
     void clear();
 
     [[nodiscard]] const std::vector<VkDescriptorImageInfo>& descriptors() const { return descriptors_; }
@@ -64,6 +77,7 @@ public:
     [[nodiscard]] const FreeListAllocator<uint32_t>& allocator() const { return allocator_; }
     [[nodiscard]] float fragmentation() const { return allocator_.fragmentationRatio(); }
     [[nodiscard]] uint32_t allocatedCount() const { return allocator_.allocatedCount(); }
+    [[nodiscard]] const std::vector<BindlessTextureRegistrationInfo>& registrations() const { return registrations_; }
 
 private:
     void rebuildDescriptors();
@@ -71,6 +85,7 @@ private:
 
     std::vector<std::unique_ptr<Image>> images_;
     std::vector<VkDescriptorImageInfo> descriptors_;
+    std::vector<BindlessTextureRegistrationInfo> registrations_;
     uint32_t slotCount_ = 0;
     FreeListAllocator<uint32_t> allocator_{0};
 };

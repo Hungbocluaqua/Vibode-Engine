@@ -58,6 +58,7 @@ struct PathComponents {
     vec3 specular_ray_direction;
     vec3 secondary_ray_direction;
     vec3 first_local_pos;
+    vec3 first_barycentrics;
     uint first_material_id;
     uint restir_gi_candidate_valid;
     vec3 restir_gi_candidate_position;
@@ -71,6 +72,7 @@ struct PathComponents {
     uint bounce_count;
     uint instance_id;
     uint mesh_id;
+    uint primitive_id;
 };
 
 struct Ray {
@@ -234,6 +236,18 @@ bool restir_gi_debug_view() {
     return (debug_params.view >= 68u && debug_params.view <= 73u) ||
         debug_params.view == 90u ||
         debug_params.view == 91u;
+}
+
+uint direct_light_ris_candidate_count() {
+    uint count = restir_mode() != 0u ? 4u : 1u;
+    if (mesh_params.light_count > 65536u) {
+        count = max(count, 12u);
+    } else if (mesh_params.light_count > 16384u) {
+        count = max(count, 8u);
+    } else if (mesh_params.light_count > 4096u) {
+        count = max(count, 6u);
+    }
+    return count;
 }
 
 bool temporal_history_available() {
@@ -556,6 +570,7 @@ void reset_payload() {
     payload.mesh_id = 0xffffffffu;
     payload.primitive_id = 0xffffffffu;
     payload.picking = 0u;
+    payload.barycentrics = vec3(1.0, 0.0, 0.0);
     payload.uv = vec2(0.0);
     payload.uv1 = vec2(0.0);
     payload.tangent = vec3(1.0, 0.0, 0.0);
@@ -685,6 +700,7 @@ vec3 shadow_origin(RayPayload hit, vec3 wi) {
 
 Material material_for_hit(inout RayPayload hit, vec3 rayDirection) {
     Material material = decode_material(hit.material_id);
+    hit.uv = apply_material_height_parallax(material, hit.uv, hit.uv1, hit.normal, hit.tangent, hit.bitangent, rayDirection);
     apply_material_textures(material, hit.uv, hit.uv1);
     apply_material_vertex_color(material, hit.vertex_color);
     hit.normal = apply_normal_texture(material, hit.uv, hit.uv1, hit.normal, hit.tangent, hit.bitangent, rayDirection);
@@ -915,8 +931,13 @@ bool sample_emissive_light(
     float r1 = rand_f32(rng);
     float r2 = rand_f32(rng);
     float sr1 = sqrt(r1);
-    vec3 samplePos = v0 * (1.0 - sr1) + v1 * (sr1 * (1.0 - r2)) + v2 * (sr1 * r2);
+    vec3 bary = vec3(1.0 - sr1, sr1 * (1.0 - r2), sr1 * r2);
+    vec3 samplePos = v0 * bary.x + v1 * bary.y + v2 * bary.z;
     vec3 lightNormal = normalize(mat3(instance.normal_transform) * td3.xyz);
+    vec4 uv01 = local_triangle_data[ti + 4u];
+    vec4 uv2 = local_triangle_data[ti + 5u];
+    vec2 sampleUv = uv01.xy * bary.x + uv01.zw * bary.y + uv2.xy * bary.z;
+    apply_material_textures(material, sampleUv, sampleUv);
     sampleRadiance = material.emissive;
     emission = sampleRadiance;
 
@@ -1018,7 +1039,7 @@ vec3 estimate_direct_lighting(
     }
 
     vec3 lightingNormal = normalize(hit.geom_normal);
-    uint risCandidateCount = restir_mode() != 0u ? 4u : 1u;
+    uint risCandidateCount = direct_light_ris_candidate_count();
     vec3 selectedWi = vec3(0.0, 1.0, 0.0);
     vec3 selectedEmission = vec3(0.0);
     vec3 selectedBsdf = vec3(0.0);
@@ -1451,6 +1472,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.specular_ray_direction = normalize(ray.direction);
     components.secondary_ray_direction = normalize(ray.direction);
     components.first_local_pos = vec3(0.0);
+    components.first_barycentrics = vec3(1.0, 0.0, 0.0);
     components.first_material_id = 0xffffffffu;
     components.restir_gi_candidate_valid = 0u;
     components.restir_gi_candidate_position = vec3(0.0);
@@ -1464,6 +1486,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.bounce_count = 0u;
     components.instance_id = 0xffffffffu;
     components.mesh_id = 0xffffffffu;
+    components.primitive_id = 0xffffffffu;
 
     bool previousWasBrdfSample = false;
     uint previousEventType = PATH_EVENT_NONE;
@@ -1552,6 +1575,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             first_position = hit.world_pos;
             components.restir_gi_receiver_position = hit.world_pos;
             components.first_local_pos = hit.local_pos;
+            components.first_barycentrics = hit.barycentrics;
             components.first_albedo = pbr_diffuse_reflectance(material);
             components.first_specular_albedo = pbr_specular_reflectance(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.first_roughness = material.roughness;
@@ -1561,6 +1585,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.restir_gi_candidate_material_id = hit.material_id;
             components.instance_id = hit.instance_id;
             components.mesh_id = hit.mesh_id;
+            components.primitive_id = hit.primitive_id;
         } else if (bounce == 1u) {
             components.secondary_hit_distance = min(hit.t, 65504.0);
             components.secondary_ray_direction = normalize(prevRayDir);
@@ -1702,7 +1727,14 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         vec3 nonRestirDirect = max(direct - restirDirect, vec3(0.0));
         if (bounce == 0u && restir_mode() != 0u) {
             bool historyAvailable = temporal_history_available();
-            uint packedFirstVel = compute_surface_velocity(hit.world_pos, hit.local_pos, hit.instance_id, dims);
+            uint packedFirstVel = compute_surface_velocity(
+                hit.world_pos,
+                hit.local_pos,
+                hit.instance_id,
+                hit.mesh_id,
+                hit.primitive_id,
+                hit.barycentrics,
+                dims);
             RestirReservoir previousReservoir = empty_restir_reservoir();
             bool reprojectionValid = false;
             float restirMotionConfidence = 1.0;
@@ -1885,6 +1917,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             ray.direction = scatteredDirection;
             ray.origin = hit.world_pos + (dot(ray.direction, hit.normal) > 0.0 ? hit.normal : -hit.normal) * shadow_self_hit_epsilon();
             throughput *= material.color * material_dispersion_channel_weight(material, dispersionChannel);
+            if (!reflected) {
+                throughput *= max(material.transmission_factor, 0.0);
+            }
             if (!reflected && hit.front_face == 0u) {
                 throughput *= material_volume_transmittance(material, hit.t);
             }
@@ -2163,7 +2198,14 @@ void main() {
         components.specular_hit_distance);
     path_data_buffer[pixel_index] = pathData;
     uint packedVelocity = did_hit
-        ? compute_surface_velocity(hit_position, components.first_local_pos, components.instance_id, ivec2(size))
+        ? compute_surface_velocity(
+            hit_position,
+            components.first_local_pos,
+            components.instance_id,
+            components.mesh_id,
+            components.primitive_id,
+            components.first_barycentrics,
+            ivec2(size))
         : compute_sky_velocity(ray.direction, ivec2(size));
     velocity_buffer[pixel_index] = packedVelocity;
     store_initial_restir_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
@@ -2234,6 +2276,17 @@ void main() {
         output_value = vec3(
             visualVelocity * 0.5 + vec2(0.5),
             clamp(length(velocityPixels) / SCREEN_VELOCITY_DEBUG_SCALE, 0.0, 1.0));
+    } else if (debug_params.view == 101u) {
+        bool skinnedHit = did_hit && ray_tracing_mesh_has_gpu_skinning(components.mesh_id);
+        if (skinnedHit) {
+            vec2 velocityPixels = restir_unpack_velocity_pixels(packedVelocity);
+            vec2 visualVelocity = clamp(velocityPixels / SCREEN_VELOCITY_DEBUG_SCALE, vec2(-1.0), vec2(1.0));
+            output_value = vec3(
+                visualVelocity * 0.5 + vec2(0.5),
+                clamp(length(velocityPixels) / SCREEN_VELOCITY_DEBUG_SCALE, 0.0, 1.0));
+        } else {
+            output_value = vec3(0.0);
+        }
     } else if (debug_params.view == 29u) {
         output_value = debug_display_tonemap(atmosphere_sky_radiance(ray.direction, ATMOSPHERE_RAY_QUALITY_FULL) * max(debug_params.scale, 1.0));
     } else if (debug_params.view == 30u) {

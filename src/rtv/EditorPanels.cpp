@@ -37,8 +37,8 @@ void debugViewTooltip(RendererDebugView view) {
 
 } // namespace
 
-const std::array<RendererDebugView, 95>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 95> views = {
+const std::array<RendererDebugView, 96>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 96> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -95,6 +95,7 @@ const std::array<RendererDebugView, 95>& editorDebugViews() {
         RendererDebugView::SecondaryEnvironmentRadiance,
         RendererDebugView::WhiteEnvironmentTransport,
         RendererDebugView::MotionVectors,
+        RendererDebugView::SkinnedMotionVectors,
         RendererDebugView::AtmosphereSkyView,
         RendererDebugView::AtmosphereTransmittance,
         RendererDebugView::AtmosphereAerialPerspective,
@@ -169,6 +170,7 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::Depth);
         selectable(RendererDebugView::Normals);
         selectable(RendererDebugView::MotionVectors);
+        selectable(RendererDebugView::SkinnedMotionVectors);
         selectable(RendererDebugView::Variance);
         selectable(RendererDebugView::ReprojectionConfidence);
         selectable(RendererDebugView::DenoiserRejection);

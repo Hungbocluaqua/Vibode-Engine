@@ -94,6 +94,40 @@ VkDeviceSize alignedDeviceAddressOffset(const Buffer& buffer, VkDeviceSize align
     return Buffer::alignUp(address, alignment) - address;
 }
 
+const RayTracingSceneBuildOptions::GpuSkinnedVertexBinding* gpuSkinnedBindingForMesh(
+    const RayTracingMeshBuildInput& mesh,
+    const RayTracingSceneBuildOptions& options) {
+    if (options.gpuSkinnedVertexBuffer == nullptr ||
+        options.gpuSkinnedVertexBuffer->handle() == VK_NULL_HANDLE ||
+        mesh.sourceMeshHandleIndex == 0xffffffffu) {
+        return nullptr;
+    }
+    for (const RayTracingSceneBuildOptions::GpuSkinnedVertexBinding& binding : options.gpuSkinnedVertexBindings) {
+        if (binding.meshHandleIndex == mesh.sourceMeshHandleIndex &&
+            binding.currentVertexOffset == mesh.firstVertex &&
+            binding.vertexCount >= mesh.vertexCount) {
+            return &binding;
+        }
+    }
+    return nullptr;
+}
+
+bool meshAllowsDynamicBlasUpdate(
+    const RayTracingMeshBuildInput& mesh,
+    const RayTracingSceneBuildOptions& options) {
+    return mesh.updateMode == AccelUpdateMode::RefitDeform || gpuSkinnedBindingForMesh(mesh, options) != nullptr;
+}
+
+VkDeviceAddress rayTracingVertexAddressForMesh(
+    const GpuScene& scene,
+    const RayTracingMeshBuildInput& mesh,
+    const RayTracingSceneBuildOptions& options) {
+    if (gpuSkinnedBindingForMesh(mesh, options) != nullptr) {
+        return options.gpuSkinnedVertexBuffer->deviceAddress();
+    }
+    return scene.localVertices().deviceAddress();
+}
+
 uint32_t microTriangleCountForSubdivision(uint32_t subdivisionLevel) {
     if (subdivisionLevel >= 16u) {
         return 0u;
@@ -488,6 +522,24 @@ void accelerationBuildBarrier(VkCommandBuffer cmd) {
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
+void dynamicBlasInputBarrier(VkCommandBuffer cmd, const Buffer& vertexBuffer) {
+    VkBufferMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    barrier.buffer = vertexBuffer.handle();
+    barrier.offset = 0;
+    barrier.size = vertexBuffer.size();
+
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
 std::vector<VkAccelerationStructureInstanceKHR> buildVkInstances(
     const GpuScene& scene,
     const std::vector<AccelerationStructure>& blases) {
@@ -660,6 +712,9 @@ void RayTracingScene::build(
     blases_.resize(scene.rayTracingMeshes().size());
     destroyOpacityMicromaps();
     accelerationStructureBytes_ = 0;
+    dynamicBlasUpdateScratchSize_ = 0;
+    dynamicBlasUpdateCount_ = 0;
+    lastDynamicBlasUpdateRecordMs_ = 0.0f;
     opacityMicromapStats_ = {};
     motionBlurActive_ = options.motionBlurEnabled && context.supportsRayTracingMotionBlur();
     motionInstanceStats_ = {};
@@ -701,6 +756,7 @@ void RayTracingScene::build(
         }
     }
 
+    const auto& rtMeshes = scene.rayTracingMeshes();
     std::vector<uint32_t> geometryTriangleOffsets;
     std::vector<MeshGeometryRangeGpu> meshGeometryRanges;
     std::vector<MeshBlasGeometryPlan> blasGeometryPlans = buildBlasGeometryPlans(
@@ -710,6 +766,12 @@ void RayTracingScene::build(
         geometryTriangleOffsets,
         meshGeometryRanges,
         blasGeometryStats_);
+    for (uint32_t meshBuildIndex = 0; meshBuildIndex < rtMeshes.size() && meshBuildIndex < blasGeometryPlans.size(); ++meshBuildIndex) {
+        if (gpuSkinnedBindingForMesh(rtMeshes[meshBuildIndex], options) != nullptr) {
+            ++blasGeometryStats_.gpuSkinnedMeshCount;
+            blasGeometryStats_.gpuSkinnedGeometryCount += static_cast<uint32_t>(blasGeometryPlans[meshBuildIndex].ranges.size());
+        }
+    }
     geometryTriangleOffsetsBuffer_.create(allocator, BufferDesc{
         .size = sizeof(uint32_t) * geometryTriangleOffsets.size(),
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -738,9 +800,8 @@ void RayTracingScene::build(
     meshGeometryRangesBuffer_.flush(sizeof(MeshGeometryRangeGpu) * meshGeometryRanges.size());
 
     std::vector<BlasBuildSizes> blasBuildSizes;
-    blasBuildSizes.reserve(scene.rayTracingMeshes().size());
+    blasBuildSizes.reserve(rtMeshes.size());
     VkDeviceSize maxBuildScratchSize = opacityMicromapStats_.active ? opacityMicromapStats_.buildScratchBytes : 0;
-    const auto& rtMeshes = scene.rayTracingMeshes();
     for (uint32_t meshBuildIndex = 0; meshBuildIndex < rtMeshes.size(); ++meshBuildIndex) {
         const RayTracingMeshBuildInput& mesh = rtMeshes[meshBuildIndex];
         if (mesh.meshIndex >= blases_.size() || mesh.vertexCount == 0 || mesh.indexCount < 3) {
@@ -766,7 +827,7 @@ void RayTracingScene::build(
             VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
             triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
             triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-            triangles.vertexData.deviceAddress = scene.localVertices().deviceAddress();
+            triangles.vertexData.deviceAddress = rayTracingVertexAddressForMesh(scene, mesh, options);
             triangles.vertexStride = sizeof(GpuLocalVertex);
             triangles.maxVertex = mesh.firstVertex + mesh.vertexCount - 1u;
             triangles.indexType = VK_INDEX_TYPE_UINT32;
@@ -807,7 +868,7 @@ void RayTracingScene::build(
         if (std::any_of(plan.ranges.begin(), plan.ranges.end(), [](const BlasGeometryRange& range) { return range.useOpacityMicromap; })) {
             buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_EXT;
         }
-        if (mesh.updateMode == AccelUpdateMode::RefitDeform) {
+        if (meshAllowsDynamicBlasUpdate(mesh, options)) {
             buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
         }
         buildInfo.geometryCount = static_cast<uint32_t>(geometries.size());
@@ -823,6 +884,9 @@ void RayTracingScene::build(
             &sizes);
 
         maxBuildScratchSize = std::max(maxBuildScratchSize, sizes.buildScratchSize);
+        if (meshAllowsDynamicBlasUpdate(mesh, options)) {
+            dynamicBlasUpdateScratchSize_ = std::max(dynamicBlasUpdateScratchSize_, sizes.updateScratchSize);
+        }
         blasBuildSizes.push_back(BlasBuildSizes{
             .meshBuildIndex = meshBuildIndex,
             .primitiveCounts = primitiveCounts,
@@ -919,7 +983,7 @@ void RayTracingScene::build(
             VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
             triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
             triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-            triangles.vertexData.deviceAddress = scene.localVertices().deviceAddress();
+            triangles.vertexData.deviceAddress = rayTracingVertexAddressForMesh(scene, mesh, options);
             triangles.vertexStride = sizeof(GpuLocalVertex);
             triangles.maxVertex = mesh.firstVertex + mesh.vertexCount - 1u;
             triangles.indexType = VK_INDEX_TYPE_UINT32;
@@ -966,7 +1030,7 @@ void RayTracingScene::build(
         if (std::any_of(plan.ranges.begin(), plan.ranges.end(), [](const BlasGeometryRange& range) { return range.useOpacityMicromap; })) {
             buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_EXT;
         }
-        const bool allowBlasUpdate = mesh.updateMode == AccelUpdateMode::RefitDeform;
+        const bool allowBlasUpdate = meshAllowsDynamicBlasUpdate(mesh, options);
         if (allowBlasUpdate) {
             buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
         }
@@ -1083,6 +1147,129 @@ void RayTracingScene::build(
         }
     }
     std::cout << '\n';
+}
+
+bool RayTracingScene::recordDynamicBlasUpdates(
+    VkCommandBuffer commandBuffer,
+    const VulkanContext& context,
+    ResourceAllocator& allocator,
+    const GpuScene& scene,
+    const RayTracingSceneBuildOptions& options) {
+    if (!context.supportsHardwareRayTracing() ||
+        commandBuffer == VK_NULL_HANDLE ||
+        options.gpuSkinnedVertexBuffer == nullptr ||
+        options.gpuSkinnedVertexBuffer->handle() == VK_NULL_HANDLE ||
+        dynamicBlasUpdateScratchSize_ == 0 ||
+        blases_.empty()) {
+        return false;
+    }
+
+    const auto& rtMeshes = scene.rayTracingMeshes();
+    if (rtMeshes.empty()) {
+        return false;
+    }
+
+    std::vector<uint32_t> geometryTriangleOffsets;
+    std::vector<MeshGeometryRangeGpu> meshGeometryRanges;
+    RayTracingBlasGeometryStats ignoredStats{};
+    const std::vector<MeshOpacityMicromapBuild> noOpacityMicromapBuilds;
+    const OpacityMicromapBuildStats noOpacityMicromapStats{};
+    const std::vector<MeshBlasGeometryPlan> blasGeometryPlans = buildBlasGeometryPlans(
+        scene,
+        noOpacityMicromapBuilds,
+        noOpacityMicromapStats,
+        geometryTriangleOffsets,
+        meshGeometryRanges,
+        ignoredStats);
+
+    const auto& asProps = context.rayTracingInfo().accelerationStructureProperties;
+    const VkDeviceSize scratchAlignment = asProps.minAccelerationStructureScratchOffsetAlignment;
+    const VkDeviceSize scratchSize = std::max<VkDeviceSize>(dynamicBlasUpdateScratchSize_, 4) + scratchAlignment;
+    if (dynamicBlasUpdateScratch_.handle() == VK_NULL_HANDLE || dynamicBlasUpdateScratch_.size() < scratchSize) {
+        dynamicBlasUpdateScratch_ = createScratch(allocator, scratchSize, "ray tracing dynamic BLAS update scratch");
+    }
+    const VkDeviceAddress scratchAddress = Buffer::alignUp(dynamicBlasUpdateScratch_.deviceAddress(), scratchAlignment);
+
+    dynamicBlasInputBarrier(commandBuffer, *options.gpuSkinnedVertexBuffer);
+
+    uint32_t recordedUpdateCount = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t meshBuildIndex = 0; meshBuildIndex < rtMeshes.size() && meshBuildIndex < blasGeometryPlans.size(); ++meshBuildIndex) {
+        const RayTracingMeshBuildInput& mesh = rtMeshes[meshBuildIndex];
+        if (mesh.meshIndex >= blases_.size() ||
+            blases_[mesh.meshIndex].handle() == VK_NULL_HANDLE ||
+            !blases_[mesh.meshIndex].allowUpdate() ||
+            gpuSkinnedBindingForMesh(mesh, options) == nullptr) {
+            continue;
+        }
+
+        const MeshBlasGeometryPlan& plan = blasGeometryPlans[meshBuildIndex];
+        if (plan.ranges.empty()) {
+            continue;
+        }
+
+        std::vector<VkAccelerationStructureGeometryTrianglesDataKHR> triangleDatas;
+        std::vector<VkAccelerationStructureGeometryKHR> geometries;
+        std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
+        triangleDatas.reserve(plan.ranges.size());
+        geometries.reserve(plan.ranges.size());
+        ranges.reserve(plan.ranges.size());
+
+        for (const BlasGeometryRange& geometryRange : plan.ranges) {
+            VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
+            triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            triangles.vertexData.deviceAddress = rayTracingVertexAddressForMesh(scene, mesh, options);
+            triangles.vertexStride = sizeof(GpuLocalVertex);
+            triangles.maxVertex = mesh.firstVertex + mesh.vertexCount - 1u;
+            triangles.indexType = VK_INDEX_TYPE_UINT32;
+            triangles.indexData.deviceAddress = scene.localIndices().deviceAddress() + sizeof(uint32_t) * geometryRange.firstIndex;
+            triangleDatas.push_back(triangles);
+
+            VkAccelerationStructureGeometryKHR geometry{};
+            geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+            geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+            geometry.flags = geometryRange.opaqueTraversalSafe ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+            geometry.geometry.triangles = triangleDatas.back();
+            geometries.push_back(geometry);
+
+            VkAccelerationStructureBuildRangeInfoKHR range{};
+            range.primitiveCount = geometryRange.indexCount / 3u;
+            range.primitiveOffset = 0;
+            range.firstVertex = 0;
+            range.transformOffset = 0;
+            ranges.push_back(range);
+        }
+
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+        buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+            VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+        buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+        buildInfo.srcAccelerationStructure = blases_[mesh.meshIndex].handle();
+        buildInfo.dstAccelerationStructure = blases_[mesh.meshIndex].handle();
+        buildInfo.geometryCount = static_cast<uint32_t>(geometries.size());
+        buildInfo.pGeometries = geometries.data();
+        buildInfo.scratchData.deviceAddress = scratchAddress;
+
+        std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> rangePtrs;
+        rangePtrs.reserve(ranges.size());
+        for (const VkAccelerationStructureBuildRangeInfoKHR& range : ranges) {
+            rangePtrs.push_back(&range);
+        }
+        vkCmdBuildAccelerationStructuresKHR(commandBuffer, 1, &buildInfo, rangePtrs.data());
+        accelerationBuildBarrier(commandBuffer);
+        ++recordedUpdateCount;
+    }
+
+    if (recordedUpdateCount == 0u) {
+        return false;
+    }
+    const auto end = std::chrono::steady_clock::now();
+    lastDynamicBlasUpdateRecordMs_ = std::chrono::duration<float, std::milli>(end - start).count();
+    dynamicBlasUpdateCount_ += recordedUpdateCount;
+    return true;
 }
 
 bool RayTracingScene::refitTransforms(

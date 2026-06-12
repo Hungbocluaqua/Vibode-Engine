@@ -43,16 +43,232 @@ void appendSceneMaterial(SceneAsset& scene, const AssetManager* assets, Material
 
 [[nodiscard]] bool hasActiveSkinningPayload(const MeshAsset& mesh) {
     for (const MeshVertex& vertex : mesh.vertices) {
-        const bool hasJoints = vertex.joints.x != 0u || vertex.joints.y != 0u || vertex.joints.z != 0u || vertex.joints.w != 0u;
         const bool hasWeights = vertex.weights.x > 0.0f || vertex.weights.y > 0.0f || vertex.weights.z > 0.0f || vertex.weights.w > 0.0f;
-        if (hasJoints && hasWeights) {
+        if (hasWeights) {
             return true;
         }
     }
     return false;
 }
 
-[[nodiscard]] std::vector<glm::mat4> sceneNodeWorldTransforms(const SceneAsset& scene) {
+[[nodiscard]] uint32_t meshTriangleCount(const MeshAsset& mesh) {
+    uint64_t triangles = 0;
+    for (const MeshPrimitiveAsset& primitive : mesh.primitives) {
+        triangles += static_cast<uint64_t>(primitive.indexCount / 3u);
+    }
+    return triangles > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(triangles);
+}
+
+[[nodiscard]] PathTracerRenderer::GpuSkinningSourceVertex makeGpuSkinningSourceVertex(const MeshVertex& vertex) {
+    return PathTracerRenderer::GpuSkinningSourceVertex{
+        .positionUvX = {vertex.position, vertex.texcoord.x},
+        .normalUvY = {vertex.normal, vertex.texcoord.y},
+        .tangent = vertex.tangent,
+        .color = vertex.color,
+        .texcoord1 = {vertex.texcoord1, 0.0f, 0.0f},
+        .joints = vertex.joints,
+        .weights = vertex.weights,
+    };
+}
+
+[[nodiscard]] GpuLocalVertex makeGpuSkinningMorphDelta(glm::vec3 position, glm::vec3 normal, glm::vec3 tangent) {
+    return GpuLocalVertex{
+        .positionUvX = {position, 0.0f},
+        .normalUvY = {normal, 0.0f},
+        .tangent = {tangent, 0.0f},
+        .color = glm::vec4{0.0f},
+        .texcoord1 = glm::vec4{0.0f},
+    };
+}
+
+void appendGpuSkinningMorphDeltas(
+    const MeshAsset& mesh,
+    const std::vector<float>& morphWeights,
+    std::vector<GpuLocalVertex>& morphDeltaPayload,
+    GpuSkinningInstancePlan& plan,
+    AnimatedGeometryStats& stats) {
+    if (!plan.morphBeforeSkinning || plan.vertexCount == 0u || !hasActiveMorphTargetWeights(mesh, morphWeights)) {
+        return;
+    }
+
+    const uint64_t morphDeltaOffset = static_cast<uint64_t>(morphDeltaPayload.size());
+    plan.morphDeltaOffset = morphDeltaOffset > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(morphDeltaOffset);
+    plan.morphDeltaCount = plan.vertexCount;
+    plan.morphWeight = 1.0f;
+
+    std::vector<glm::vec3> positionDeltas(plan.vertexCount, glm::vec3{0.0f});
+    std::vector<glm::vec3> normalDeltas(plan.vertexCount, glm::vec3{0.0f});
+    std::vector<glm::vec3> tangentDeltas(plan.vertexCount, glm::vec3{0.0f});
+
+    for (const MeshPrimitiveAsset& primitive : mesh.primitives) {
+        const size_t targetCount = std::min(primitive.morphTargets.size(), morphWeights.size());
+        for (size_t targetIndex = 0; targetIndex < targetCount; ++targetIndex) {
+            const float weight = morphWeights[targetIndex];
+            if (std::abs(weight) <= 1.0e-6f) {
+                continue;
+            }
+            const MeshPrimitiveAsset::MorphTarget& target = primitive.morphTargets[targetIndex];
+            const size_t primitiveVertexCount = static_cast<size_t>(primitive.vertexCount);
+            const size_t positionCount = std::min(primitiveVertexCount, target.positionDeltas.size());
+            for (size_t i = 0; i < positionCount; ++i) {
+                const size_t vertexIndex = static_cast<size_t>(primitive.firstVertex) + i;
+                if (vertexIndex < positionDeltas.size()) {
+                    positionDeltas[vertexIndex] += target.positionDeltas[i] * weight;
+                }
+            }
+            const size_t normalCount = std::min(primitiveVertexCount, target.normalDeltas.size());
+            for (size_t i = 0; i < normalCount; ++i) {
+                const size_t vertexIndex = static_cast<size_t>(primitive.firstVertex) + i;
+                if (vertexIndex < normalDeltas.size()) {
+                    normalDeltas[vertexIndex] += target.normalDeltas[i] * weight;
+                }
+            }
+            const size_t tangentCount = std::min(primitiveVertexCount, target.tangentDeltas.size());
+            for (size_t i = 0; i < tangentCount; ++i) {
+                const size_t vertexIndex = static_cast<size_t>(primitive.firstVertex) + i;
+                if (vertexIndex < tangentDeltas.size()) {
+                    tangentDeltas[vertexIndex] += target.tangentDeltas[i] * weight;
+                }
+            }
+        }
+    }
+
+    morphDeltaPayload.reserve(morphDeltaPayload.size() + static_cast<size_t>(plan.vertexCount));
+    for (uint32_t vertexIndex = 0; vertexIndex < plan.vertexCount; ++vertexIndex) {
+        morphDeltaPayload.push_back(makeGpuSkinningMorphDelta(
+            positionDeltas[vertexIndex],
+            normalDeltas[vertexIndex],
+            tangentDeltas[vertexIndex]));
+    }
+    const uint64_t morphDeltaBytes = static_cast<uint64_t>(plan.vertexCount) * static_cast<uint64_t>(sizeof(GpuLocalVertex));
+    const uint64_t remaining = UINT64_MAX - stats.gpuSkinningMorphDeltaUploadBytes;
+    stats.gpuSkinningMorphDeltaUploadBytes = morphDeltaBytes > remaining
+        ? UINT64_MAX
+        : stats.gpuSkinningMorphDeltaUploadBytes + morphDeltaBytes;
+}
+
+void addSaturated(uint32_t& value, uint32_t increment) {
+    const uint64_t sum = static_cast<uint64_t>(value) + static_cast<uint64_t>(increment);
+    value = sum > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(sum);
+}
+
+void addSaturated(uint64_t& value, uint64_t increment) {
+    const uint64_t remaining = UINT64_MAX - value;
+    value = increment > remaining ? UINT64_MAX : value + increment;
+}
+
+GpuSkinningInstancePlan recordGpuSkinningPlan(
+    AnimatedGeometryStats& stats,
+    const MeshAsset& mesh,
+    const SceneSkinAsset& skin,
+    const glm::mat4& meshWorld,
+    const glm::mat4& previousMeshWorld,
+    const std::vector<glm::mat4>& nodeWorldTransforms,
+    const std::vector<glm::mat4>& previousNodeWorldTransforms,
+    std::vector<glm::mat4>& jointMatrixPayload,
+    std::vector<glm::mat4>& previousJointMatrixPayload,
+    std::vector<PathTracerRenderer::GpuSkinningSourceVertex>& sourceVertexPayload,
+    std::vector<GpuLocalVertex>& morphDeltaPayload,
+    const std::vector<float>& morphWeights,
+    uint32_t nodeIndex,
+    MeshAssetHandle meshHandle,
+    int32_t skinIndex,
+    bool morphBeforeSkinning) {
+    constexpr uint64_t kSkinnedVertexStrideBytes = sizeof(GpuLocalVertex);
+    const uint32_t vertexCount = mesh.vertices.size() > UINT32_MAX
+        ? UINT32_MAX
+        : static_cast<uint32_t>(mesh.vertices.size());
+    GpuSkinningInstancePlan plan;
+    plan.nodeIndex = nodeIndex;
+    plan.meshHandleIndex = meshHandle.index;
+    plan.skinIndex = skinIndex;
+    const uint64_t jointPayloadOffset = static_cast<uint64_t>(jointMatrixPayload.size());
+    plan.jointMatrixOffset = jointPayloadOffset > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(jointPayloadOffset);
+    plan.jointMatrixCount = skin.joints.size() > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(skin.joints.size());
+    plan.jointUploadByteOffset = jointPayloadOffset * static_cast<uint64_t>(sizeof(glm::mat4));
+    plan.jointUploadBytes = static_cast<uint64_t>(plan.jointMatrixCount) * static_cast<uint64_t>(sizeof(glm::mat4));
+    const uint64_t sourceVertexOffset = static_cast<uint64_t>(sourceVertexPayload.size());
+    plan.sourceVertexOffset = sourceVertexOffset > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(sourceVertexOffset);
+    plan.currentVertexOffset = stats.gpuSkinningCurrentVertexCount;
+    plan.previousVertexOffset = stats.gpuSkinningPreviousVertexCount;
+    plan.vertexCount = vertexCount;
+    plan.morphBeforeSkinning = morphBeforeSkinning;
+    plan.cpuFallbackActive = true;
+
+    ++stats.gpuSkinningCandidateInstanceCount;
+    ++stats.gpuSkinningCpuFallbackInstanceCount;
+    ++stats.gpuSkinningDispatchRecordCount;
+    if (morphBeforeSkinning) {
+        ++stats.gpuSkinningMorphPreSkinInstanceCount;
+    }
+    const glm::mat4 inverseMeshWorld = glm::inverse(meshWorld);
+    const glm::mat4 inversePreviousMeshWorld = glm::inverse(previousMeshWorld);
+    for (size_t jointIndex = 0; jointIndex < skin.joints.size(); ++jointIndex) {
+        const uint32_t jointNodeIndex = skin.joints[jointIndex];
+        const glm::mat4 jointWorld = jointNodeIndex < nodeWorldTransforms.size()
+            ? nodeWorldTransforms[jointNodeIndex]
+            : glm::mat4{1.0f};
+        const glm::mat4 previousJointWorld = jointNodeIndex < previousNodeWorldTransforms.size()
+            ? previousNodeWorldTransforms[jointNodeIndex]
+            : jointWorld;
+        const glm::mat4 inverseBind = jointIndex < skin.inverseBindMatrices.size()
+            ? skin.inverseBindMatrices[jointIndex]
+            : glm::mat4{1.0f};
+        jointMatrixPayload.push_back(inverseMeshWorld * jointWorld * inverseBind);
+        previousJointMatrixPayload.push_back(inversePreviousMeshWorld * previousJointWorld * inverseBind);
+    }
+    for (const MeshVertex& vertex : mesh.vertices) {
+        sourceVertexPayload.push_back(makeGpuSkinningSourceVertex(vertex));
+    }
+    appendGpuSkinningMorphDeltas(mesh, morphWeights, morphDeltaPayload, plan, stats);
+    addSaturated(stats.gpuSkinningJointMatrixCount, static_cast<uint32_t>(skin.joints.size()));
+    addSaturated(stats.gpuSkinningJointUploadBytes, plan.jointUploadBytes);
+    addSaturated(stats.gpuSkinningPreviousJointUploadBytes, plan.jointUploadBytes);
+    addSaturated(stats.gpuSkinningSourceVertexUploadBytes, static_cast<uint64_t>(vertexCount) * static_cast<uint64_t>(sizeof(PathTracerRenderer::GpuSkinningSourceVertex)));
+    addSaturated(stats.gpuSkinningCurrentVertexCount, vertexCount);
+    addSaturated(stats.gpuSkinningPreviousVertexCount, vertexCount);
+    addSaturated(stats.gpuSkinningCurrentVertexBufferBytes, static_cast<uint64_t>(vertexCount) * kSkinnedVertexStrideBytes);
+    addSaturated(stats.gpuSkinningPreviousVertexBufferBytes, static_cast<uint64_t>(vertexCount) * kSkinnedVertexStrideBytes);
+    return plan;
+}
+
+void recordAnimatedGeometryClassification(
+    AnimatedGeometryStats& stats,
+    const MeshAsset& mesh,
+    SceneUpdateKind updateKind,
+    bool needsMorphRuntimeMesh,
+    bool needsSkinRuntimeMesh,
+    bool needsRuntimeMesh,
+    bool materialOverrideRuntimeMesh) {
+    ++stats.meshInstanceCount;
+    addSaturated(stats.totalPrimitiveCount, static_cast<uint32_t>(mesh.primitives.size()));
+    addSaturated(stats.totalTriangleCount, meshTriangleCount(mesh));
+
+    if (needsMorphRuntimeMesh) {
+        ++stats.morphDeformingInstanceCount;
+    }
+    if (needsSkinRuntimeMesh) {
+        ++stats.skinnedDeformingInstanceCount;
+    }
+    if (needsMorphRuntimeMesh && needsSkinRuntimeMesh) {
+        ++stats.combinedMorphSkinnedInstanceCount;
+    }
+    if (needsMorphRuntimeMesh || needsSkinRuntimeMesh) {
+        ++stats.deformingInstanceCount;
+    } else if (updateKind == SceneUpdateKind::TransformOnly) {
+        ++stats.transformOnlyCandidateInstanceCount;
+    } else {
+        ++stats.staticMeshInstanceCount;
+    }
+    if (needsRuntimeMesh) {
+        ++stats.runtimeMeshInstanceCount;
+    }
+    if (materialOverrideRuntimeMesh) {
+        ++stats.materialOverrideRuntimeMeshInstanceCount;
+    }
+}
+
+[[nodiscard]] std::vector<glm::mat4> sceneNodeWorldTransforms(const SceneAsset& scene, bool previous = false) {
     std::vector<glm::mat4> world(scene.nodes.size(), glm::mat4{1.0f});
     std::vector<uint8_t> computed(scene.nodes.size(), 0u);
     auto compute = [&](auto&& self, size_t nodeIndex) -> glm::mat4 {
@@ -63,9 +279,9 @@ void appendSceneMaterial(SceneAsset& scene, const AssetManager* assets, Material
             return world[nodeIndex];
         }
         const SceneNodeAsset& node = scene.nodes[nodeIndex];
-        glm::mat4 result = node.transform;
+        glm::mat4 result = previous && node.previousTransformValid ? node.previousTransform : node.transform;
         if (node.parent >= 0 && static_cast<size_t>(node.parent) < scene.nodes.size()) {
-            result = self(self, static_cast<size_t>(node.parent)) * node.transform;
+            result = self(self, static_cast<size_t>(node.parent)) * result;
         }
         world[nodeIndex] = result;
         computed[nodeIndex] = 1u;
@@ -145,7 +361,9 @@ void applyRendererMaterialBindings(
     }
 
     const size_t count = std::min(result.sceneAsset.nodes.size(), entities.size());
+    std::vector<uint8_t> classifiedNodes(result.sceneAsset.nodes.size(), 0u);
     const std::vector<glm::mat4> nodeWorldTransforms = sceneNodeWorldTransforms(result.sceneAsset);
+    const std::vector<glm::mat4> previousNodeWorldTransforms = sceneNodeWorldTransforms(result.sceneAsset, true);
     for (size_t nodeIndex = 0; nodeIndex < count; ++nodeIndex) {
         const Entity* entity = entities[nodeIndex];
         if (entity == nullptr || !entity->meshRenderer.has_value()) {
@@ -155,8 +373,11 @@ void applyRendererMaterialBindings(
         const MeshRenderer& renderer = *entity->meshRenderer;
         const MeshAsset* sourceMesh = assets->mesh(renderer.mesh);
         if (sourceMesh == nullptr || sourceMesh->primitives.empty()) {
+            ++result.animatedGeometry.missingMeshInstanceCount;
+            classifiedNodes[nodeIndex] = 1u;
             continue;
         }
+        classifiedNodes[nodeIndex] = 1u;
 
         bool needsRuntimeMesh = false;
         const std::vector<float> morphWeights = effectiveMorphWeights(renderer, *sourceMesh);
@@ -165,8 +386,28 @@ void applyRendererMaterialBindings(
         const bool needsSkinRuntimeMesh = skinIndex >= 0 &&
             static_cast<size_t>(skinIndex) < result.sceneAsset.skins.size() &&
             hasActiveSkinningPayload(*sourceMesh);
+        if (needsSkinRuntimeMesh) {
+            result.gpuSkinningPlan.push_back(recordGpuSkinningPlan(
+                result.animatedGeometry,
+                *sourceMesh,
+                result.sceneAsset.skins[static_cast<size_t>(skinIndex)],
+                nodeWorldTransforms[nodeIndex],
+                previousNodeWorldTransforms[nodeIndex],
+                nodeWorldTransforms,
+                previousNodeWorldTransforms,
+                result.gpuSkinningJointMatrices,
+                result.gpuSkinningPreviousJointMatrices,
+                result.gpuSkinningSourceVertices,
+                result.gpuSkinningMorphDeltas,
+                morphWeights,
+                static_cast<uint32_t>(nodeIndex),
+                renderer.mesh,
+                skinIndex,
+                needsMorphRuntimeMesh));
+        }
         needsRuntimeMesh = needsMorphRuntimeMesh;
         needsRuntimeMesh = needsRuntimeMesh || needsSkinRuntimeMesh;
+        bool materialOverrideRuntimeMesh = false;
         std::vector<MaterialAssetHandle> effectiveMaterials;
         effectiveMaterials.reserve(sourceMesh->primitives.size());
         for (size_t primitiveIndex = 0; primitiveIndex < sourceMesh->primitives.size(); ++primitiveIndex) {
@@ -175,9 +416,18 @@ void applyRendererMaterialBindings(
             effectiveMaterials.push_back(material);
             if (material.valid() && material.index != primitive.material.index) {
                 needsRuntimeMesh = true;
+                materialOverrideRuntimeMesh = true;
             }
             appendSceneMaterial(result.sceneAsset, assets, material);
         }
+        recordAnimatedGeometryClassification(
+            result.animatedGeometry,
+            *sourceMesh,
+            result.updateKind,
+            needsMorphRuntimeMesh,
+            needsSkinRuntimeMesh,
+            needsRuntimeMesh,
+            materialOverrideRuntimeMesh);
 
         if (!needsRuntimeMesh) {
             continue;
@@ -211,6 +461,72 @@ void applyRendererMaterialBindings(
         result.sceneAsset.nodes[nodeIndex].mesh = runtimeHandle;
         result.sceneAsset.nodes[nodeIndex].skinIndex = -1;
     }
+
+    for (size_t nodeIndex = 0; nodeIndex < result.sceneAsset.nodes.size(); ++nodeIndex) {
+        if (classifiedNodes[nodeIndex] != 0u) {
+            continue;
+        }
+        const SceneNodeAsset& node = result.sceneAsset.nodes[nodeIndex];
+        if (!node.mesh.valid()) {
+            continue;
+        }
+        const MeshAsset* sourceMesh = assets->mesh(node.mesh);
+        if (sourceMesh == nullptr || sourceMesh->primitives.empty()) {
+            ++result.animatedGeometry.missingMeshInstanceCount;
+            continue;
+        }
+        const std::vector<float> morphWeights = !node.morphWeights.empty() ? node.morphWeights : sourceMesh->defaultMorphWeights;
+        const bool needsMorphRuntimeMesh = hasActiveMorphTargetWeights(*sourceMesh, morphWeights);
+        const bool needsSkinRuntimeMesh = node.skinIndex >= 0 &&
+            static_cast<size_t>(node.skinIndex) < result.sceneAsset.skins.size() &&
+            hasActiveSkinningPayload(*sourceMesh);
+        if (needsSkinRuntimeMesh) {
+            result.gpuSkinningPlan.push_back(recordGpuSkinningPlan(
+                result.animatedGeometry,
+                *sourceMesh,
+                result.sceneAsset.skins[static_cast<size_t>(node.skinIndex)],
+                nodeWorldTransforms[nodeIndex],
+                previousNodeWorldTransforms[nodeIndex],
+                nodeWorldTransforms,
+                previousNodeWorldTransforms,
+                result.gpuSkinningJointMatrices,
+                result.gpuSkinningPreviousJointMatrices,
+                result.gpuSkinningSourceVertices,
+                result.gpuSkinningMorphDeltas,
+                morphWeights,
+                static_cast<uint32_t>(nodeIndex),
+                node.mesh,
+                node.skinIndex,
+                needsMorphRuntimeMesh));
+        }
+        recordAnimatedGeometryClassification(
+            result.animatedGeometry,
+            *sourceMesh,
+            result.updateKind,
+            needsMorphRuntimeMesh,
+            needsSkinRuntimeMesh,
+            needsMorphRuntimeMesh || needsSkinRuntimeMesh,
+            false);
+    }
+
+    if (result.animatedGeometry.meshInstanceCount == 0 && !result.sceneAsset.meshes.empty()) {
+        for (MeshAssetHandle meshHandle : result.sceneAsset.meshes) {
+            const MeshAsset* sourceMesh = assets->mesh(meshHandle);
+            if (sourceMesh == nullptr || sourceMesh->primitives.empty()) {
+                ++result.animatedGeometry.missingMeshInstanceCount;
+                continue;
+            }
+            const bool needsMorphRuntimeMesh = hasActiveMorphTargetWeights(*sourceMesh, sourceMesh->defaultMorphWeights);
+            recordAnimatedGeometryClassification(
+                result.animatedGeometry,
+                *sourceMesh,
+                result.updateKind,
+                needsMorphRuntimeMesh,
+                false,
+                needsMorphRuntimeMesh,
+                false);
+        }
+    }
 }
 
 void appendSceneTexture(SceneAsset& scene, const AssetManager* assets, TextureAssetHandle texture) {
@@ -237,6 +553,8 @@ void appendMaterialTextures(SceneAsset& scene, const AssetManager* assets, const
     appendSceneTexture(scene, assets, material.iridescenceThicknessTexture);
     appendSceneTexture(scene, assets, material.anisotropyTexture);
     appendSceneTexture(scene, assets, material.occlusionTexture);
+    appendSceneTexture(scene, assets, material.opacityTexture);
+    appendSceneTexture(scene, assets, material.heightTexture);
 }
 
 void appendSceneMaterial(SceneAsset& scene, const AssetManager* assets, MaterialAssetHandle material) {
@@ -337,6 +655,7 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.temporalUpscaler = render.temporalUpscaler;
     result.rendererSettings.dlssFrameGenerationEnabled = render.dlssFrameGenerationEnabled;
     result.rendererSettings.dlssRayReconstructionEnabled = render.dlssRayReconstructionEnabled;
+    result.rendererSettings.streamlineReflexEnabled = render.streamlineReflexEnabled;
     result.rendererSettings.dlssSharpeningStrength = render.dlssSharpeningStrength;
     result.rendererSettings.taaFeedback = render.taaFeedback;
     result.rendererSettings.taaMotionFeedback = render.taaMotionFeedback;

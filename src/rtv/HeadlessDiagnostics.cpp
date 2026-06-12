@@ -73,6 +73,7 @@ void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
     j["selection_outline"] = p.selectionOutline;
     j["fullscreen"] = p.fullscreen;
     j["editor_presentation"] = p.editorPresentation;
+    j["dynamic_blas_update"] = p.dynamicBlasUpdate;
     j["wavefront_trace"] = p.wavefrontTrace;
     j["wavefront_secondary_trace"] = p.wavefrontSecondaryTrace;
     j["wavefront_sorted_trace"] = p.wavefrontSortedTrace;
@@ -203,6 +204,231 @@ void to_json(nlohmann::json& j, const ProfileReport::SceneUpdateRouteReport& r) 
     };
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::SchedulerQueueReport& r) {
+    j = nlohmann::json{
+        {"queue", r.queue},
+        {"job", r.job},
+        {"status", r.status},
+        {"generation", r.generation},
+        {"count", r.count},
+        {"total_cpu_ms", r.totalCpuMs},
+        {"last_cpu_ms", r.lastCpuMs},
+        {"avg_cpu_ms", r.averageCpuMs},
+        {"min_cpu_ms", r.minCpuMs},
+        {"max_cpu_ms", r.maxCpuMs},
+        {"frame_budget_violation_count", r.frameBudgetViolationCount},
+        {"submitted_bytes", r.submittedBytes},
+        {"completed_bytes", r.completedBytes},
+    };
+}
+
+void to_json(nlohmann::json& j, const GpuUploadChunkSnapshot& c) {
+    j = nlohmann::json{
+        {"index", c.index},
+        {"offset", c.offset},
+        {"bytes", c.bytes},
+        {"timeline_value", c.timelineValue},
+        {"state", gpuUploadChunkStateName(c.state)},
+        {"staging_retained", c.stagingRetained},
+    };
+}
+
+void to_json(nlohmann::json& j, const GpuUploadTicketSnapshot& t) {
+    j = nlohmann::json{
+        {"id", t.id},
+        {"kind", gpuUploadResourceKindName(t.kind)},
+        {"state", gpuUploadTicketStateName(t.state)},
+        {"label", t.label},
+        {"total_bytes", t.totalBytes},
+        {"submitted_bytes", t.submittedBytes},
+        {"completed_bytes", t.completedBytes},
+        {"retained_staging_bytes", t.retainedStagingBytes},
+        {"chunk_count", t.chunkCount},
+        {"pending_chunks", t.pendingChunks},
+        {"submitted_chunks", t.submittedChunks},
+        {"completed_chunks", t.completedChunks},
+        {"cancellation_requested", t.cancellationRequested},
+        {"can_cancel", t.canCancel},
+        {"can_retire", t.canRetire},
+        {"chunks", t.chunks},
+    };
+}
+
+void to_json(nlohmann::json& j, const MainThreadApplyOperationSnapshot& o) {
+    j = nlohmann::json{
+        {"index", o.index},
+        {"kind", mainThreadApplyOperationKindName(o.kind)},
+        {"state", mainThreadApplyOperationStateName(o.state)},
+        {"entity", o.entity},
+        {"estimated_cost_ms", o.estimatedCostMs},
+        {"label", o.label},
+    };
+}
+
+void to_json(nlohmann::json& j, const MainThreadApplyTicketSnapshot& t) {
+    j = nlohmann::json{
+        {"id", t.id},
+        {"state", mainThreadApplyTicketStateName(t.state)},
+        {"label", t.label},
+        {"operation_count", t.operationCount},
+        {"pending_operations", t.pendingOperations},
+        {"applied_operations", t.appliedOperations},
+        {"cancelled_operations", t.cancelledOperations},
+        {"progress", t.progress},
+        {"undo_snapshot_open", t.undoSnapshotOpen},
+        {"undo_snapshot_committed", t.undoSnapshotCommitted},
+        {"cancellation_requested", t.cancellationRequested},
+        {"can_cancel", t.canCancel},
+        {"locked_entities", t.lockedEntities},
+        {"operations", t.operations},
+    };
+}
+
+void to_json(nlohmann::json& j, const TopologyRebuildStageSnapshot& s) {
+    j = nlohmann::json{
+        {"index", s.index},
+        {"stage", topologyRebuildStageName(s.stage)},
+        {"state", topologyRebuildStageStateName(s.state)},
+        {"estimated_cost_ms", s.estimatedCostMs},
+        {"label", s.label},
+    };
+}
+
+void to_json(nlohmann::json& j, const TopologyRebuildTicketSnapshot& t) {
+    j = nlohmann::json{
+        {"id", t.id},
+        {"generation", t.generation},
+        {"state", topologyRebuildTicketStateName(t.state)},
+        {"label", t.label},
+        {"stage_count", t.stageCount},
+        {"pending_stages", t.pendingStages},
+        {"completed_stages", t.completedStages},
+        {"cancelled_stages", t.cancelledStages},
+        {"progress", t.progress},
+        {"previous_renderer_visible", t.previousRendererVisible},
+        {"final_renderer_swapped", t.finalRendererSwapped},
+        {"old_renderer_retained", t.oldRendererRetained},
+        {"old_renderer_retired", t.oldRendererRetired},
+        {"retirement_timeline_value", t.retirementTimelineValue},
+        {"cancellation_requested", t.cancellationRequested},
+        {"stale_generation", t.staleGeneration},
+        {"stages", t.stages},
+    };
+}
+
+void appendCompletedUploaderSchedulerReport(ProfileReport& report) {
+    uint64_t submittedBytes = 0;
+    uint64_t completedBytes = 0;
+    uint64_t completedTicketCount = 0;
+    for (const GpuUploadTicketSnapshot& ticket : report.gpuUploadTickets) {
+        if (ticket.state != GpuUploadTicketState::Complete || ticket.label.rfind("Vulkan ", 0) != 0) {
+            continue;
+        }
+        submittedBytes += ticket.submittedBytes;
+        completedBytes += ticket.completedBytes;
+        ++completedTicketCount;
+    }
+    if (completedTicketCount == 0) {
+        return;
+    }
+
+    ProfileReport::SchedulerQueueReport schedulerReport;
+    schedulerReport.queue = "GpuUploadSubmit";
+    schedulerReport.job = "BufferUploader";
+    schedulerReport.status = "completed_sync";
+    schedulerReport.count = completedTicketCount;
+    schedulerReport.submittedBytes = submittedBytes;
+    schedulerReport.completedBytes = completedBytes;
+    report.schedulerQueues.push_back(std::move(schedulerReport));
+}
+
+void appendCompletedMainThreadApplySchedulerReport(ProfileReport& report) {
+    uint64_t completedOperationCount = 0;
+    double totalCpuMs = 0.0;
+    double minCpuMs = 0.0;
+    double maxCpuMs = 0.0;
+    for (const MainThreadApplyTicketSnapshot& ticket : report.mainThreadApplyTickets) {
+        if (ticket.state != MainThreadApplyTicketState::Complete) {
+            continue;
+        }
+        for (const MainThreadApplyOperationSnapshot& operation : ticket.operations) {
+            if (operation.state != MainThreadApplyOperationState::Applied) {
+                continue;
+            }
+            const double costMs = std::max(0.0, operation.estimatedCostMs);
+            if (completedOperationCount == 0) {
+                minCpuMs = costMs;
+                maxCpuMs = costMs;
+            } else {
+                minCpuMs = std::min(minCpuMs, costMs);
+                maxCpuMs = std::max(maxCpuMs, costMs);
+            }
+            totalCpuMs += costMs;
+            ++completedOperationCount;
+        }
+    }
+    if (completedOperationCount == 0) {
+        return;
+    }
+
+    ProfileReport::SchedulerQueueReport schedulerReport;
+    schedulerReport.queue = "MainThreadApply";
+    schedulerReport.job = "MainThreadApplyTicket";
+    schedulerReport.status = "completed_operations";
+    schedulerReport.count = completedOperationCount;
+    schedulerReport.totalCpuMs = totalCpuMs;
+    schedulerReport.lastCpuMs = maxCpuMs;
+    schedulerReport.averageCpuMs = totalCpuMs / static_cast<double>(completedOperationCount);
+    schedulerReport.minCpuMs = minCpuMs;
+    schedulerReport.maxCpuMs = maxCpuMs;
+    report.schedulerQueues.push_back(std::move(schedulerReport));
+}
+
+void appendCompletedTopologySchedulerReport(ProfileReport& report) {
+    uint64_t completedStageCount = 0;
+    double totalCpuMs = 0.0;
+    double minCpuMs = 0.0;
+    double maxCpuMs = 0.0;
+    uint64_t latestGeneration = 0;
+    for (const TopologyRebuildTicketSnapshot& ticket : report.topologyRebuildTickets) {
+        if (ticket.state != TopologyRebuildTicketState::Complete) {
+            continue;
+        }
+        latestGeneration = std::max(latestGeneration, ticket.generation);
+        for (const TopologyRebuildStageSnapshot& stage : ticket.stages) {
+            if (stage.state != TopologyRebuildStageState::Complete) {
+                continue;
+            }
+            const double costMs = std::max(0.0, stage.estimatedCostMs);
+            if (completedStageCount == 0) {
+                minCpuMs = costMs;
+                maxCpuMs = costMs;
+            } else {
+                minCpuMs = std::min(minCpuMs, costMs);
+                maxCpuMs = std::max(maxCpuMs, costMs);
+            }
+            totalCpuMs += costMs;
+            ++completedStageCount;
+        }
+    }
+    if (completedStageCount == 0) {
+        return;
+    }
+
+    ProfileReport::SchedulerQueueReport schedulerReport;
+    schedulerReport.queue = "GpuSceneBuild";
+    schedulerReport.job = "TopologyRebuildTicket";
+    schedulerReport.status = "completed_stages";
+    schedulerReport.generation = latestGeneration;
+    schedulerReport.count = completedStageCount;
+    schedulerReport.totalCpuMs = totalCpuMs;
+    schedulerReport.lastCpuMs = maxCpuMs;
+    schedulerReport.averageCpuMs = totalCpuMs / static_cast<double>(completedStageCount);
+    schedulerReport.minCpuMs = minCpuMs;
+    schedulerReport.maxCpuMs = maxCpuMs;
+    report.schedulerQueues.push_back(std::move(schedulerReport));
+}
+
 void to_json(nlohmann::json& j, const ProfileReport::PipelineStatistics& s) {
     j["ray_invocations"] = s.rayInvocations;
     j["triangle_hits"] = s.triangleHits;
@@ -241,6 +467,101 @@ void to_json(nlohmann::json& j, const ProfileReport::RayTracingGeometryReport& s
     j["blas_alpha_tested_geometry_count"] = s.blasAlphaTestedGeometryCount;
     j["blas_blended_geometry_count"] = s.blasBlendedGeometryCount;
     j["blas_opacity_micromap_geometry_count"] = s.blasOpacityMicromapGeometryCount;
+}
+
+void to_json(nlohmann::json& j, const ProfileReport::AnimatedGeometryReport& s) {
+    j["mesh_instance_count"] = s.meshInstanceCount;
+    j["static_mesh_instance_count"] = s.staticMeshInstanceCount;
+    j["transform_only_candidate_instance_count"] = s.transformOnlyCandidateInstanceCount;
+    j["deforming_instance_count"] = s.deformingInstanceCount;
+    j["morph_deforming_instance_count"] = s.morphDeformingInstanceCount;
+    j["skinned_deforming_instance_count"] = s.skinnedDeformingInstanceCount;
+    j["combined_morph_skinned_instance_count"] = s.combinedMorphSkinnedInstanceCount;
+    j["runtime_mesh_instance_count"] = s.runtimeMeshInstanceCount;
+    j["material_override_runtime_mesh_instance_count"] = s.materialOverrideRuntimeMeshInstanceCount;
+    j["missing_mesh_instance_count"] = s.missingMeshInstanceCount;
+    j["total_primitive_count"] = s.totalPrimitiveCount;
+    j["total_triangle_count"] = s.totalTriangleCount;
+    j["gpu_skinning_candidate_instance_count"] = s.gpuSkinningCandidateInstanceCount;
+    j["gpu_skinning_morph_pre_skin_instance_count"] = s.gpuSkinningMorphPreSkinInstanceCount;
+    j["gpu_skinning_joint_matrix_count"] = s.gpuSkinningJointMatrixCount;
+    j["gpu_skinning_joint_upload_bytes"] = s.gpuSkinningJointUploadBytes;
+    j["gpu_skinning_previous_joint_upload_bytes"] = s.gpuSkinningPreviousJointUploadBytes;
+    j["gpu_skinning_source_vertex_upload_bytes"] = s.gpuSkinningSourceVertexUploadBytes;
+    j["gpu_skinning_morph_delta_upload_bytes"] = s.gpuSkinningMorphDeltaUploadBytes;
+    j["gpu_skinning_current_vertex_count"] = s.gpuSkinningCurrentVertexCount;
+    j["gpu_skinning_previous_vertex_count"] = s.gpuSkinningPreviousVertexCount;
+    j["gpu_skinning_current_vertex_buffer_bytes"] = s.gpuSkinningCurrentVertexBufferBytes;
+    j["gpu_skinning_previous_vertex_buffer_bytes"] = s.gpuSkinningPreviousVertexBufferBytes;
+    j["gpu_skinning_cpu_fallback_instance_count"] = s.gpuSkinningCpuFallbackInstanceCount;
+    j["gpu_skinning_dispatch_record_count"] = s.gpuSkinningDispatchRecordCount;
+    j["gpu_skinning_renderer_plan_active"] = s.gpuSkinningRendererPlanActive;
+    j["gpu_skinning_renderer_joint_upload_bytes"] = s.gpuSkinningRendererJointUploadBytes;
+    j["gpu_skinning_renderer_previous_joint_upload_bytes"] = s.gpuSkinningRendererPreviousJointUploadBytes;
+    j["gpu_skinning_renderer_source_vertex_upload_bytes"] = s.gpuSkinningRendererSourceVertexUploadBytes;
+    j["gpu_skinning_renderer_morph_delta_upload_bytes"] = s.gpuSkinningRendererMorphDeltaUploadBytes;
+    j["gpu_skinning_renderer_current_vertex_buffer_bytes"] = s.gpuSkinningRendererCurrentVertexBufferBytes;
+    j["gpu_skinning_renderer_previous_vertex_buffer_bytes"] = s.gpuSkinningRendererPreviousVertexBufferBytes;
+    j["gpu_skinning_renderer_buffers_allocated"] = s.gpuSkinningRendererBuffersAllocated;
+    j["gpu_skinning_renderer_source_vertex_buffer_uploaded"] = s.gpuSkinningRendererSourceVertexBufferUploaded;
+    j["gpu_skinning_renderer_morph_delta_buffer_uploaded"] = s.gpuSkinningRendererMorphDeltaBufferUploaded;
+    j["gpu_skinning_renderer_joint_buffer_uploaded"] = s.gpuSkinningRendererJointBufferUploaded;
+    j["gpu_skinning_renderer_previous_joint_buffer_uploaded"] = s.gpuSkinningRendererPreviousJointBufferUploaded;
+    j["gpu_skinning_renderer_joint_payload_refresh_uploaded"] = s.gpuSkinningRendererJointPayloadRefreshUploaded;
+    j["gpu_skinning_renderer_joint_payload_refresh_staged"] = s.gpuSkinningRendererJointPayloadRefreshStaged;
+    j["gpu_skinning_renderer_joint_payload_refresh_copy_recorded"] = s.gpuSkinningRendererJointPayloadRefreshCopyRecorded;
+    j["gpu_skinning_renderer_joint_payload_refresh_count"] = s.gpuSkinningRendererJointPayloadRefreshCount;
+    j["gpu_skinning_renderer_joint_payload_refresh_copy_record_count"] = s.gpuSkinningRendererJointPayloadRefreshCopyRecordCount;
+    j["gpu_skinning_renderer_joint_payload_refresh_bytes"] = s.gpuSkinningRendererJointPayloadRefreshBytes;
+    j["gpu_skinning_renderer_joint_payload_refresh_staged_bytes"] = s.gpuSkinningRendererJointPayloadRefreshStagedBytes;
+    j["gpu_skinning_renderer_joint_payload_refresh_copy_bytes"] = s.gpuSkinningRendererJointPayloadRefreshCopyBytes;
+    j["gpu_skinning_renderer_compute_pipeline_created"] = s.gpuSkinningRendererComputePipelineCreated;
+    j["gpu_skinning_renderer_descriptors_bound"] = s.gpuSkinningRendererDescriptorsBound;
+    j["gpu_skinning_renderer_compute_dispatch_enabled"] = s.gpuSkinningRendererComputeDispatchEnabled;
+    j["gpu_skinning_renderer_compute_dispatch_record_count"] = s.gpuSkinningRendererComputeDispatchRecordCount;
+    j["gpu_skinning_renderer_compute_morph_dispatch_record_count"] = s.gpuSkinningRendererComputeMorphDispatchRecordCount;
+    j["gpu_skinning_renderer_output_readback_buffer_allocated"] = s.gpuSkinningRendererOutputReadbackBufferAllocated;
+    j["gpu_skinning_renderer_output_readback_copy_recorded"] = s.gpuSkinningRendererOutputReadbackCopyRecorded;
+    j["gpu_skinning_renderer_output_readback_validation_passed"] = s.gpuSkinningRendererOutputReadbackValidationPassed;
+    j["gpu_skinning_renderer_output_readback_vertex_count"] = s.gpuSkinningRendererOutputReadbackVertexCount;
+    j["gpu_skinning_renderer_output_readback_max_position_error"] = s.gpuSkinningRendererOutputReadbackMaxPositionError;
+    j["gpu_skinning_renderer_initial_compute_dispatch_submitted"] = s.gpuSkinningRendererInitialComputeDispatchSubmitted;
+    j["gpu_skinning_ray_tracing_geometry_input_enabled"] = s.gpuSkinningRayTracingGeometryInputEnabled;
+    j["gpu_skinning_ray_tracing_geometry_input_mesh_count"] = s.gpuSkinningRayTracingGeometryInputMeshCount;
+    j["gpu_skinning_ray_tracing_geometry_input_geometry_count"] = s.gpuSkinningRayTracingGeometryInputGeometryCount;
+    j["gpu_skinning_ray_tracing_descriptor_input_enabled"] = s.gpuSkinningRayTracingDescriptorInputEnabled;
+    j["gpu_skinning_ray_tracing_descriptor_input_mixed_scene_enabled"] = s.gpuSkinningRayTracingDescriptorInputMixedSceneEnabled;
+    j["gpu_skinning_ray_tracing_descriptor_input_mesh_count"] = s.gpuSkinningRayTracingDescriptorInputMeshCount;
+    j["gpu_skinning_ray_tracing_descriptor_input_binding_count"] = s.gpuSkinningRayTracingDescriptorInputBindingCount;
+    j["gpu_skinning_skinned_motion_vectors_enabled"] = s.gpuSkinningSkinnedMotionVectorsEnabled;
+    j["gpu_skinning_skinned_motion_vectors_previous_vertex_input_enabled"] = s.gpuSkinningSkinnedMotionVectorsPreviousVertexInputEnabled;
+    j["gpu_skinning_skinned_motion_vectors_descriptor_bound"] = s.gpuSkinningSkinnedMotionVectorsDescriptorBound;
+    j["ray_tracing_blas_count"] = s.rayTracingBlasCount;
+    j["ray_tracing_instance_count"] = s.rayTracingInstanceCount;
+    j["tlas_refit_count"] = s.tlasRefitCount;
+    j["last_tlas_refit_ms"] = s.lastTlasRefitMs;
+    j["dynamic_blas_update_count"] = s.dynamicBlasUpdateCount;
+    j["dynamic_blas_update_record_ms"] = s.dynamicBlasUpdateRecordMs;
+    j["dynamic_blas_update_ms"] = s.dynamicBlasUpdateMs;
+    j["dynamic_blas_update_supported"] = s.dynamicBlasUpdateSupported;
+    j["dynamic_blas_unsupported_instance_count"] = s.dynamicBlasUnsupportedInstanceCount;
+    j["dynamic_blas_cpu_fallback_instance_count"] = s.dynamicBlasCpuFallbackInstanceCount;
+    j["dynamic_blas_fallback_policy"] = s.dynamicBlasFallbackPolicy;
+    j["dynamic_blas_fallback_warnings"] = s.dynamicBlasFallbackWarnings;
+    j["dynamic_blas_budget_ms"] = s.dynamicBlasBudgetMs;
+    j["dynamic_blas_budget_exceeded"] = s.dynamicBlasBudgetExceeded;
+    j["dynamic_blas_over_budget_frame_count"] = s.dynamicBlasOverBudgetFrameCount;
+    j["dynamic_blas_budget_policy"] = s.dynamicBlasBudgetPolicy;
+    j["transform_only_policy"] = s.transformOnlyPolicy;
+    j["deforming_policy"] = s.deformingPolicy;
+    j["morph_policy"] = s.morphPolicy;
+    j["skinning_policy"] = s.skinningPolicy;
+    j["gpu_skinning_data_policy"] = s.gpuSkinningDataPolicy;
+    j["gpu_skinning_joint_upload_policy"] = s.gpuSkinningJointUploadPolicy;
+    j["gpu_skinning_buffer_policy"] = s.gpuSkinningBufferPolicy;
+    j["gpu_skinning_compute_shader"] = s.gpuSkinningComputeShader;
+    j["tlas_refit_policy"] = s.tlasRefitPolicy;
+    j["dynamic_blas_timing_policy"] = s.dynamicBlasTimingPolicy;
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::SceneLightReport::Sample& s) {
@@ -534,10 +855,53 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryPressureQualityReport
     j["denoiser_max_history_length"] = m.denoiserMaxHistoryLength;
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::StreamlineFeatureReport& f) {
+    j["requestable"] = f.requestable;
+    j["supported"] = f.supported;
+    j["unavailable_reason"] = f.unavailableReason;
+    j["requirements"] = f.requirements;
+}
+
+void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::StreamlineTagReport& t) {
+    j["expected"] = t.expected;
+    j["tagged"] = t.tagged;
+    j["failed"] = t.failed;
+    j["missing_frame_token"] = t.missingFrameToken;
+    j["missing_image"] = t.missingImage;
+    j["invalid_layout"] = t.invalidLayout;
+    j["invalid_format"] = t.invalidFormat;
+    j["invalid_extent"] = t.invalidExtent;
+    j["empty_role"] = t.emptyRole;
+    j["runtime_rejected"] = t.runtimeRejected;
+    j["frame_index"] = t.frameIndex;
+    j["attempted"] = t.attempted;
+}
+
+void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::StreamlineEvaluationReport& e) {
+    j["attempted"] = e.attempted;
+    j["succeeded"] = e.succeeded;
+    j["failed"] = e.failed;
+    j["skipped_unsupported"] = e.skippedUnsupported;
+    j["skipped_missing_tags"] = e.skippedMissingTags;
+    j["frame_index"] = e.frameIndex;
+}
+
+void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::StreamlineReflexMarkerReport& m) {
+    j["attempted"] = m.attempted;
+    j["succeeded"] = m.succeeded;
+    j["failed"] = m.failed;
+    j["skipped_unavailable"] = m.skippedUnavailable;
+    j["frame_index"] = m.frameIndex;
+}
+
 void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n) {
     j["nrd_sdk_configured"] = n.nrdSdkConfigured;
+    j["nrd_requestable"] = n.nrdRequestable;
     j["nrd_available"] = n.nrdAvailable;
     j["nrd_unavailable_reason"] = n.nrdUnavailableReason;
+    j["nrd_backend_policy"] = n.nrdBackendPolicy;
+    j["nrd_backend_policy_reason"] = n.nrdBackendPolicyReason;
+    j["nrd_backends_mutually_exclusive"] = n.nrdBackendsMutuallyExclusive;
     j["requested_denoiser_backend"] = n.requestedDenoiserBackend;
     j["effective_denoiser_backend"] = n.effectiveDenoiserBackend;
     j["dlss_sdk_configured"] = n.dlssSdkConfigured;
@@ -554,6 +918,25 @@ void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n)
     j["dlss_sharpening_strength"] = n.dlssSharpeningStrength;
     j["requested_temporal_upscaler"] = n.requestedTemporalUpscaler;
     j["effective_temporal_upscaler"] = n.effectiveTemporalUpscaler;
+    j["streamline_sdk_configured"] = n.streamlineSdkConfigured;
+    j["streamline_runtime_configured"] = n.streamlineRuntimeConfigured;
+    j["streamline_initialized"] = n.streamlineInitialized;
+    j["streamline_vulkan_info_set"] = n.streamlineVulkanInfoSet;
+    j["streamline_runtime_directory"] = n.streamlineRuntimeDirectory;
+    j["streamline_unavailable_reason"] = n.streamlineUnavailableReason;
+    j["requested_streamline_reflex"] = n.requestedStreamlineReflex;
+    j["effective_streamline_reflex"] = n.effectiveStreamlineReflex;
+    j["streamline_dlss"] = n.streamlineDlss;
+    j["streamline_dlss_ray_reconstruction"] = n.streamlineDlssRayReconstruction;
+    j["streamline_dlss_frame_generation"] = n.streamlineDlssFrameGeneration;
+    j["streamline_reflex"] = n.streamlineReflex;
+    j["streamline_nis"] = n.streamlineNis;
+    j["streamline_nrd"] = n.streamlineNrd;
+    j["streamline_dlss_tags"] = n.streamlineDlssTags;
+    j["streamline_dlss_ray_reconstruction_tags"] = n.streamlineDlssRayReconstructionTags;
+    j["streamline_dlss_evaluation"] = n.streamlineDlssEvaluation;
+    j["streamline_dlss_ray_reconstruction_evaluation"] = n.streamlineDlssRayReconstructionEvaluation;
+    j["streamline_reflex_markers"] = n.streamlineReflexMarkers;
 }
 
 void to_json(nlohmann::json& j, const RendererSettings& s) {
@@ -605,6 +988,7 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["temporal_upscaler"] = temporalUpscalerName(s.temporalUpscaler);
     j["dlss_frame_generation_enabled"] = s.dlssFrameGenerationEnabled;
     j["dlss_ray_reconstruction_enabled"] = s.dlssRayReconstructionEnabled;
+    j["streamline_reflex_enabled"] = s.streamlineReflexEnabled;
     j["dlss_sharpening_strength"] = s.dlssSharpeningStrength;
     j["taa_feedback"] = s.taaFeedback;
     j["taa_motion_feedback"] = s.taaMotionFeedback;
@@ -752,6 +1136,7 @@ GpuFrameTimings percentileGpuTimings(
     result.selectionOutlineMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::selectionOutlineMs, percentile);
     result.fullscreenMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::fullscreenMs, percentile);
     result.editorPresentationMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::editorPresentationMs, percentile);
+    result.dynamicBlasUpdateMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::dynamicBlasUpdateMs, percentile);
     result.wavefrontTraceMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::wavefrontTraceMs, percentile);
     result.wavefrontSecondaryTraceMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::wavefrontSecondaryTraceMs, percentile);
     result.wavefrontSortedTraceMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::wavefrontSortedTraceMs, percentile);
@@ -804,6 +1189,7 @@ void assignPerPassGpuMs(ProfileReport::PerPassGpuMs& out, const GpuFrameTimings&
     out.selectionOutline = timings.selectionOutlineMs;
     out.fullscreen = timings.fullscreenMs;
     out.editorPresentation = timings.editorPresentationMs;
+    out.dynamicBlasUpdate = timings.dynamicBlasUpdateMs;
     out.wavefrontTrace = timings.wavefrontTraceMs;
     out.wavefrontSecondaryTrace = timings.wavefrontSecondaryTraceMs;
     out.wavefrontSortedTrace = timings.wavefrontSortedTraceMs;
@@ -860,6 +1246,7 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
         result.selectionOutlineMs += values[i].selectionOutlineMs;
         result.fullscreenMs += values[i].fullscreenMs;
         result.editorPresentationMs += values[i].editorPresentationMs;
+        result.dynamicBlasUpdateMs += values[i].dynamicBlasUpdateMs;
         result.wavefrontTraceMs += values[i].wavefrontTraceMs;
         result.wavefrontSecondaryTraceMs += values[i].wavefrontSecondaryTraceMs;
         result.wavefrontSortedTraceMs += values[i].wavefrontSortedTraceMs;
@@ -905,6 +1292,7 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
     result.selectionOutlineMs *= invCount;
     result.fullscreenMs *= invCount;
     result.editorPresentationMs *= invCount;
+    result.dynamicBlasUpdateMs *= invCount;
     result.wavefrontTraceMs *= invCount;
     result.wavefrontSecondaryTraceMs *= invCount;
     result.wavefrontSortedTraceMs *= invCount;
@@ -919,6 +1307,28 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
     result.computeLaneMs *= invCount;
     result.queueWaitMs *= invCount;
     return result;
+}
+
+uint32_t countDynamicBlasOverBudgetFrames(
+    const std::vector<GpuFrameTimings>& values,
+    uint32_t warmupFrames,
+    float budgetMs) {
+    if (values.empty() || budgetMs <= 0.0f) {
+        return 0;
+    }
+
+    size_t startIdx = std::min(static_cast<size_t>(warmupFrames), values.size());
+    if (startIdx >= values.size()) {
+        startIdx = 0;
+    }
+
+    uint32_t count = 0;
+    for (size_t i = startIdx; i < values.size(); ++i) {
+        if (values[i].dynamicBlasUpdateMs > budgetMs) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 void writeValidationLog(const RendererValidationLog& log, const std::filesystem::path& path) {
@@ -1018,6 +1428,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.gpuFrameMs = computeMinMaxAvg(gpuTimingsVec, warmup);
 
     const auto timings = averageGpuTimings(app.perFrameGpuTimings(), warmup);
+    const auto frameWorkScheduler = app.frameWorkSchedulerSnapshot();
     assignPerPassGpuMs(profileReport_.perPassGpuMs, timings);
     assignQueueLaneMs(profileReport_.queueLaneMs, timings);
     assignPerPassGpuMs(profileReport_.perPassGpuMsP95, percentileGpuTimings(app.perFrameGpuTimings(), warmup, 0.95f));
@@ -1152,6 +1563,207 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.rayTracingGeometry.blasAlphaTestedGeometryCount = rtStats.blasGeometry.alphaTestedGeometryCount;
     profileReport_.rayTracingGeometry.blasBlendedGeometryCount = rtStats.blasGeometry.blendedGeometryCount;
     profileReport_.rayTracingGeometry.blasOpacityMicromapGeometryCount = rtStats.blasGeometry.opacityMicromapGeometryCount;
+
+    const AnimatedGeometryStats& animatedGeometry = app.latestAnimatedGeometryStats();
+    profileReport_.animatedGeometry.meshInstanceCount = animatedGeometry.meshInstanceCount;
+    profileReport_.animatedGeometry.staticMeshInstanceCount = animatedGeometry.staticMeshInstanceCount;
+    profileReport_.animatedGeometry.transformOnlyCandidateInstanceCount = animatedGeometry.transformOnlyCandidateInstanceCount;
+    profileReport_.animatedGeometry.deformingInstanceCount = animatedGeometry.deformingInstanceCount;
+    profileReport_.animatedGeometry.morphDeformingInstanceCount = animatedGeometry.morphDeformingInstanceCount;
+    profileReport_.animatedGeometry.skinnedDeformingInstanceCount = animatedGeometry.skinnedDeformingInstanceCount;
+    profileReport_.animatedGeometry.combinedMorphSkinnedInstanceCount = animatedGeometry.combinedMorphSkinnedInstanceCount;
+    profileReport_.animatedGeometry.runtimeMeshInstanceCount = animatedGeometry.runtimeMeshInstanceCount;
+    profileReport_.animatedGeometry.materialOverrideRuntimeMeshInstanceCount = animatedGeometry.materialOverrideRuntimeMeshInstanceCount;
+    profileReport_.animatedGeometry.missingMeshInstanceCount = animatedGeometry.missingMeshInstanceCount;
+    profileReport_.animatedGeometry.totalPrimitiveCount = animatedGeometry.totalPrimitiveCount;
+    profileReport_.animatedGeometry.totalTriangleCount = animatedGeometry.totalTriangleCount;
+    profileReport_.animatedGeometry.gpuSkinningCandidateInstanceCount = animatedGeometry.gpuSkinningCandidateInstanceCount;
+    profileReport_.animatedGeometry.gpuSkinningMorphPreSkinInstanceCount = animatedGeometry.gpuSkinningMorphPreSkinInstanceCount;
+    profileReport_.animatedGeometry.gpuSkinningJointMatrixCount = std::max(
+        animatedGeometry.gpuSkinningJointMatrixCount,
+        app.latestGpuSkinningJointMatrices().size() > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(app.latestGpuSkinningJointMatrices().size()));
+    profileReport_.animatedGeometry.gpuSkinningJointUploadBytes = std::max(
+        animatedGeometry.gpuSkinningJointUploadBytes,
+        static_cast<uint64_t>(app.latestGpuSkinningJointMatrices().size()) * static_cast<uint64_t>(sizeof(glm::mat4)));
+    profileReport_.animatedGeometry.gpuSkinningPreviousJointUploadBytes = std::max(
+        animatedGeometry.gpuSkinningPreviousJointUploadBytes,
+        static_cast<uint64_t>(app.latestGpuSkinningPreviousJointMatrices().size()) * static_cast<uint64_t>(sizeof(glm::mat4)));
+    profileReport_.animatedGeometry.gpuSkinningSourceVertexUploadBytes = std::max(
+        animatedGeometry.gpuSkinningSourceVertexUploadBytes,
+        static_cast<uint64_t>(app.latestGpuSkinningSourceVertices().size()) * static_cast<uint64_t>(sizeof(PathTracerRenderer::GpuSkinningSourceVertex)));
+    profileReport_.animatedGeometry.gpuSkinningMorphDeltaUploadBytes = std::max(
+        animatedGeometry.gpuSkinningMorphDeltaUploadBytes,
+        static_cast<uint64_t>(app.latestGpuSkinningMorphDeltas().size()) * static_cast<uint64_t>(sizeof(GpuLocalVertex)));
+    profileReport_.animatedGeometry.gpuSkinningCurrentVertexCount = animatedGeometry.gpuSkinningCurrentVertexCount;
+    profileReport_.animatedGeometry.gpuSkinningPreviousVertexCount = animatedGeometry.gpuSkinningPreviousVertexCount;
+    profileReport_.animatedGeometry.gpuSkinningCurrentVertexBufferBytes = animatedGeometry.gpuSkinningCurrentVertexBufferBytes;
+    profileReport_.animatedGeometry.gpuSkinningPreviousVertexBufferBytes = animatedGeometry.gpuSkinningPreviousVertexBufferBytes;
+    profileReport_.animatedGeometry.gpuSkinningCpuFallbackInstanceCount = animatedGeometry.gpuSkinningCpuFallbackInstanceCount;
+    profileReport_.animatedGeometry.gpuSkinningDispatchRecordCount = std::max(
+        animatedGeometry.gpuSkinningDispatchRecordCount,
+        app.latestGpuSkinningPlan().size() > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(app.latestGpuSkinningPlan().size()));
+    renderer->updateGpuSkinningOutputReadbackValidation();
+    const PathTracerRenderer::GpuSkinningResourcePlan& rendererSkinningPlan = renderer->gpuSkinningResourcePlan();
+    profileReport_.animatedGeometry.gpuSkinningRendererPlanActive = rendererSkinningPlan.candidateInstanceCount > 0 || rendererSkinningPlan.dispatchRecordCount > 0;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointUploadBytes = rendererSkinningPlan.jointUploadBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererPreviousJointUploadBytes = rendererSkinningPlan.previousJointUploadBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererSourceVertexUploadBytes = rendererSkinningPlan.sourceVertexUploadBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererMorphDeltaUploadBytes = rendererSkinningPlan.morphDeltaUploadBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererCurrentVertexBufferBytes = rendererSkinningPlan.currentVertexBufferBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererPreviousVertexBufferBytes = rendererSkinningPlan.previousVertexBufferBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererBuffersAllocated = rendererSkinningPlan.rendererBuffersAllocated;
+    profileReport_.animatedGeometry.gpuSkinningRendererSourceVertexBufferUploaded = rendererSkinningPlan.sourceVertexBufferUploaded;
+    profileReport_.animatedGeometry.gpuSkinningRendererMorphDeltaBufferUploaded = rendererSkinningPlan.morphDeltaBufferUploaded;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointBufferUploaded = rendererSkinningPlan.jointBufferUploaded;
+    profileReport_.animatedGeometry.gpuSkinningRendererPreviousJointBufferUploaded = rendererSkinningPlan.previousJointBufferUploaded;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointPayloadRefreshUploaded = rendererSkinningPlan.jointPayloadRefreshUploaded;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointPayloadRefreshStaged = rendererSkinningPlan.jointPayloadRefreshStaged;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointPayloadRefreshCopyRecorded = rendererSkinningPlan.jointPayloadRefreshCopyRecorded;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointPayloadRefreshCount = rendererSkinningPlan.jointPayloadRefreshCount;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointPayloadRefreshCopyRecordCount = rendererSkinningPlan.jointPayloadRefreshCopyRecordCount;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointPayloadRefreshBytes = rendererSkinningPlan.jointPayloadRefreshBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointPayloadRefreshStagedBytes = rendererSkinningPlan.jointPayloadRefreshStagedBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererJointPayloadRefreshCopyBytes = rendererSkinningPlan.jointPayloadRefreshCopyBytes;
+    profileReport_.animatedGeometry.gpuSkinningRendererComputePipelineCreated = rendererSkinningPlan.computePipelineCreated;
+    profileReport_.animatedGeometry.gpuSkinningRendererDescriptorsBound = rendererSkinningPlan.descriptorsBound;
+    profileReport_.animatedGeometry.gpuSkinningRendererComputeDispatchEnabled = rendererSkinningPlan.computeDispatchEnabled;
+    profileReport_.animatedGeometry.gpuSkinningRendererComputeDispatchRecordCount = rendererSkinningPlan.computeDispatchRecordCount;
+    profileReport_.animatedGeometry.gpuSkinningRendererComputeMorphDispatchRecordCount = rendererSkinningPlan.computeMorphDispatchRecordCount;
+    profileReport_.animatedGeometry.gpuSkinningRendererOutputReadbackBufferAllocated = rendererSkinningPlan.outputReadbackBufferAllocated;
+    profileReport_.animatedGeometry.gpuSkinningRendererOutputReadbackCopyRecorded = rendererSkinningPlan.outputReadbackCopyRecorded;
+    profileReport_.animatedGeometry.gpuSkinningRendererOutputReadbackValidationPassed = rendererSkinningPlan.outputReadbackValidationPassed;
+    profileReport_.animatedGeometry.gpuSkinningRendererOutputReadbackVertexCount = rendererSkinningPlan.outputReadbackVertexCount;
+    profileReport_.animatedGeometry.gpuSkinningRendererOutputReadbackMaxPositionError = rendererSkinningPlan.outputReadbackMaxPositionError;
+    profileReport_.animatedGeometry.gpuSkinningRendererInitialComputeDispatchSubmitted = rendererSkinningPlan.initialComputeDispatchSubmitted;
+    profileReport_.animatedGeometry.gpuSkinningRayTracingGeometryInputEnabled = rendererSkinningPlan.rayTracingGeometryInputEnabled;
+    profileReport_.animatedGeometry.gpuSkinningRayTracingGeometryInputMeshCount = rendererSkinningPlan.rayTracingGeometryInputMeshCount;
+    profileReport_.animatedGeometry.gpuSkinningRayTracingGeometryInputGeometryCount = rendererSkinningPlan.rayTracingGeometryInputGeometryCount;
+    profileReport_.animatedGeometry.gpuSkinningRayTracingDescriptorInputEnabled = rendererSkinningPlan.rayTracingDescriptorInputEnabled;
+    profileReport_.animatedGeometry.gpuSkinningRayTracingDescriptorInputMixedSceneEnabled = rendererSkinningPlan.rayTracingDescriptorInputMixedSceneEnabled;
+    profileReport_.animatedGeometry.gpuSkinningRayTracingDescriptorInputMeshCount = rendererSkinningPlan.rayTracingDescriptorInputMeshCount;
+    profileReport_.animatedGeometry.gpuSkinningRayTracingDescriptorInputBindingCount = rendererSkinningPlan.rayTracingDescriptorInputBindingCount;
+    profileReport_.animatedGeometry.gpuSkinningSkinnedMotionVectorsEnabled = rendererSkinningPlan.skinnedMotionVectorsEnabled;
+    profileReport_.animatedGeometry.gpuSkinningSkinnedMotionVectorsPreviousVertexInputEnabled = rendererSkinningPlan.skinnedMotionVectorsPreviousVertexInputEnabled;
+    profileReport_.animatedGeometry.gpuSkinningSkinnedMotionVectorsDescriptorBound = rendererSkinningPlan.skinnedMotionVectorsDescriptorBound;
+    profileReport_.animatedGeometry.transformOnlyPolicy = animatedGeometry.transformOnlyPolicy;
+    profileReport_.animatedGeometry.deformingPolicy = animatedGeometry.deformingPolicy;
+    profileReport_.animatedGeometry.morphPolicy = animatedGeometry.morphPolicy;
+    profileReport_.animatedGeometry.skinningPolicy = animatedGeometry.skinningPolicy;
+    profileReport_.animatedGeometry.gpuSkinningDataPolicy = animatedGeometry.gpuSkinningDataPolicy;
+    profileReport_.animatedGeometry.gpuSkinningJointUploadPolicy = animatedGeometry.gpuSkinningJointUploadPolicy;
+    profileReport_.animatedGeometry.gpuSkinningBufferPolicy = animatedGeometry.gpuSkinningBufferPolicy;
+    if (rendererSkinningPlan.sourceVertexBufferUploaded && rendererSkinningPlan.jointBufferUploaded) {
+        profileReport_.animatedGeometry.gpuSkinningDataPolicy = "renderer_source_joint_payload_ready_cpu_runtime_mesh_fallback";
+        profileReport_.animatedGeometry.gpuSkinningJointUploadPolicy = "initial_renderer_joint_upload_done_budgeted_per_frame_required";
+    }
+    if (rendererSkinningPlan.jointPayloadRefreshCopyRecordCount > 0) {
+        profileReport_.animatedGeometry.gpuSkinningJointUploadPolicy = "renderer_joint_payload_refresh_copy_recorded_budgeted_path_required";
+    } else if (rendererSkinningPlan.jointPayloadRefreshCount > 0) {
+        profileReport_.animatedGeometry.gpuSkinningJointUploadPolicy = "renderer_joint_payload_refresh_staged_copy_pending";
+    }
+    if (rendererSkinningPlan.rendererBuffersAllocated) {
+        profileReport_.animatedGeometry.gpuSkinningBufferPolicy = "renderer_source_joint_current_previous_buffers_allocated";
+    }
+    profileReport_.animatedGeometry.gpuSkinningComputeShader = animatedGeometry.gpuSkinningComputeShader;
+    profileReport_.animatedGeometry.rayTracingBlasCount = rtStats.blasCount;
+    profileReport_.animatedGeometry.rayTracingInstanceCount = rtStats.instanceCount;
+    profileReport_.animatedGeometry.tlasRefitCount = rtStats.motionInstances.tlasRefitCount;
+    profileReport_.animatedGeometry.lastTlasRefitMs = rtStats.lastTlasRefitMs;
+    profileReport_.animatedGeometry.dynamicBlasUpdateCount = rtStats.dynamicBlasUpdateCount;
+    profileReport_.animatedGeometry.dynamicBlasUpdateRecordMs = rtStats.lastDynamicBlasUpdateRecordMs;
+    profileReport_.animatedGeometry.dynamicBlasUpdateMs = timings.dynamicBlasUpdateMs;
+    const uint32_t dynamicBlasCandidateCount = profileReport_.animatedGeometry.gpuSkinningCandidateInstanceCount;
+    const uint32_t dynamicBlasCompatibleCount = profileReport_.animatedGeometry.gpuSkinningRayTracingGeometryInputMeshCount;
+    profileReport_.animatedGeometry.dynamicBlasUpdateSupported =
+        rtStats.active && dynamicBlasCompatibleCount > 0u && rtStats.dynamicBlasUpdateCount > 0u;
+    profileReport_.animatedGeometry.dynamicBlasUnsupportedInstanceCount =
+        dynamicBlasCandidateCount > dynamicBlasCompatibleCount
+            ? dynamicBlasCandidateCount - dynamicBlasCompatibleCount
+            : 0u;
+    profileReport_.animatedGeometry.dynamicBlasCpuFallbackInstanceCount =
+        profileReport_.animatedGeometry.gpuSkinningCpuFallbackInstanceCount;
+    profileReport_.animatedGeometry.dynamicBlasFallbackWarnings.clear();
+    if (dynamicBlasCandidateCount > 0u && !rtStats.active) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackWarnings.push_back(
+            "Hardware ray tracing is unavailable, so GPU-skinned dynamic BLAS updates cannot run; CPU/runtime mesh fallback is required.");
+    }
+    if (profileReport_.animatedGeometry.dynamicBlasUnsupportedInstanceCount > 0u) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackWarnings.push_back(
+            std::to_string(profileReport_.animatedGeometry.dynamicBlasUnsupportedInstanceCount) +
+            " GPU-skinned candidate instance(s) lack compatible ray-tracing GPU-skinned vertex input; CPU/runtime mesh fallback remains required.");
+    }
+    if (dynamicBlasCompatibleCount > 0u && rtStats.dynamicBlasUpdateCount == 0u) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackWarnings.push_back(
+            "Compatible GPU-skinned ray-tracing input exists, but no dynamic BLAS update was recorded in this profile window.");
+    }
+    if (profileReport_.animatedGeometry.dynamicBlasCpuFallbackInstanceCount > 0u) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackWarnings.push_back(
+            std::to_string(profileReport_.animatedGeometry.dynamicBlasCpuFallbackInstanceCount) +
+            " GPU-skinned instance(s) still retain CPU runtime mesh fallback for preview or compatibility.");
+    }
+    if (dynamicBlasCandidateCount == 0u) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackPolicy = "no_gpu_skinned_dynamic_blas_candidates";
+    } else if (!rtStats.active) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackPolicy = "hardware_ray_tracing_unavailable_cpu_runtime_mesh_fallback";
+    } else if (profileReport_.animatedGeometry.dynamicBlasUpdateSupported &&
+        profileReport_.animatedGeometry.dynamicBlasUnsupportedInstanceCount == 0u &&
+        profileReport_.animatedGeometry.dynamicBlasCpuFallbackInstanceCount == 0u) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackPolicy = "all_gpu_skinned_candidates_dynamic_blas_updated";
+    } else if (profileReport_.animatedGeometry.dynamicBlasUpdateSupported &&
+        profileReport_.animatedGeometry.dynamicBlasUnsupportedInstanceCount == 0u) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackPolicy = "compatible_dynamic_blas_updates_recorded_cpu_runtime_mesh_fallback_retained";
+    } else if (profileReport_.animatedGeometry.dynamicBlasUpdateSupported) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackPolicy = "partial_dynamic_blas_updates_recorded_unsupported_candidates_fallback";
+    } else if (dynamicBlasCompatibleCount > 0u) {
+        profileReport_.animatedGeometry.dynamicBlasFallbackPolicy = "dynamic_blas_update_pending_or_not_recorded_cpu_runtime_mesh_fallback";
+    } else {
+        profileReport_.animatedGeometry.dynamicBlasFallbackPolicy = "no_dynamic_blas_compatible_rt_input_cpu_runtime_mesh_fallback";
+    }
+    profileReport_.animatedGeometry.dynamicBlasBudgetMs = static_cast<float>(frameWorkScheduler.budgets.accelerationStructureBuildMs);
+    profileReport_.animatedGeometry.dynamicBlasOverBudgetFrameCount = countDynamicBlasOverBudgetFrames(
+        app.perFrameGpuTimings(),
+        warmup,
+        profileReport_.animatedGeometry.dynamicBlasBudgetMs);
+    profileReport_.animatedGeometry.dynamicBlasBudgetExceeded =
+        profileReport_.animatedGeometry.dynamicBlasBudgetMs > 0.0f &&
+        profileReport_.animatedGeometry.dynamicBlasUpdateMs > profileReport_.animatedGeometry.dynamicBlasBudgetMs;
+    if (rtStats.dynamicBlasUpdateCount > 0u) {
+        profileReport_.animatedGeometry.dynamicBlasBudgetPolicy =
+            profileReport_.animatedGeometry.dynamicBlasBudgetExceeded || profileReport_.animatedGeometry.dynamicBlasOverBudgetFrameCount > 0u
+                ? "gpu_skinned_dynamic_blas_required_updates_recorded_over_budget_reported"
+                : "gpu_skinned_dynamic_blas_required_updates_recorded_within_budget";
+    } else {
+        profileReport_.animatedGeometry.dynamicBlasBudgetPolicy = "no_dynamic_blas_updates_recorded";
+    }
+    if (rtStats.dynamicBlasUpdateCount > 0u) {
+        profileReport_.animatedGeometry.tlasRefitPolicy = rtStats.motionInstances.tlasRefitCount > 0u
+            ? "transform_only_tlas_refit_recorded"
+            : "no_transform_only_tlas_refit_recorded";
+        profileReport_.animatedGeometry.dynamicBlasTimingPolicy = timings.dynamicBlasUpdateMs > 0.0f
+            ? "gpu_skinned_dynamic_blas_update_gpu_timing_recorded"
+            : "gpu_skinned_dynamic_blas_update_recorded_gpu_timing_pending";
+    } else if (rtStats.motionInstances.tlasRefitCount > 0u) {
+        profileReport_.animatedGeometry.tlasRefitPolicy = "transform_only_tlas_refit_recorded";
+        profileReport_.animatedGeometry.dynamicBlasTimingPolicy = "tlas_refit_timing_recorded_dynamic_blas_update_not_implemented";
+    } else if (animatedGeometry.transformOnlyCandidateInstanceCount > 0u) {
+        profileReport_.animatedGeometry.tlasRefitPolicy = "transform_only_tlas_refit_available_not_recorded";
+        profileReport_.animatedGeometry.dynamicBlasTimingPolicy = "dynamic_blas_update_not_implemented";
+    } else {
+        profileReport_.animatedGeometry.tlasRefitPolicy = "no_transform_only_tlas_refit_recorded";
+        profileReport_.animatedGeometry.dynamicBlasTimingPolicy = "dynamic_blas_update_not_implemented";
+    }
+    if (profileReport_.animatedGeometry.meshInstanceCount == 0 && rtStats.instanceCount > 0) {
+        profileReport_.animatedGeometry.meshInstanceCount = rtStats.instanceCount;
+        profileReport_.animatedGeometry.staticMeshInstanceCount = rtStats.instanceCount;
+        profileReport_.animatedGeometry.totalPrimitiveCount =
+            rtStats.geometry.opaquePrimitiveCount +
+            rtStats.geometry.alphaTestedPrimitiveCount +
+            rtStats.geometry.blendedPrimitiveCount;
+        profileReport_.animatedGeometry.totalTriangleCount =
+            rtStats.geometry.opaqueTriangleCount +
+            rtStats.geometry.alphaTestedTriangleCount +
+            rtStats.geometry.blendedTriangleCount;
+    }
 
     const auto& lightRecords = renderer->scene().lightRecordsCpu();
     profileReport_.sceneLights.recordCount = static_cast<uint32_t>(lightRecords.size());
@@ -1642,15 +2254,54 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
         report.maxCpuMs = route.maxCpuMs;
         profileReport_.sceneUpdateRoutes.push_back(std::move(report));
     }
+    profileReport_.schedulerQueues.clear();
+    for (const SchedulerQueueEvent& event : renderer->validationLog().schedulerQueueEvents()) {
+        ProfileReport::SchedulerQueueReport report;
+        report.queue = event.queue;
+        report.job = event.job;
+        report.status = event.status;
+        report.generation = event.generation;
+        report.count = event.count;
+        report.totalCpuMs = event.totalCpuMs;
+        report.lastCpuMs = event.lastCpuMs;
+        report.averageCpuMs = event.count > 0 ? event.totalCpuMs / static_cast<double>(event.count) : 0.0;
+        report.minCpuMs = event.minCpuMs;
+        report.maxCpuMs = event.maxCpuMs;
+        report.frameBudgetViolationCount = event.frameBudgetViolationCount;
+        profileReport_.schedulerQueues.push_back(std::move(report));
+    }
+    profileReport_.gpuUploadTickets = app.editorGpuUploadTicketSnapshots(true);
+    profileReport_.gpuUploadNextTimelineValue = app.editorGpuUploadNextTimelineValue();
+    profileReport_.mainThreadApplyTickets = app.editorMainThreadApplyTicketSnapshots(true);
+    profileReport_.topologyRebuildTickets = app.editorTopologyRebuildTicketSnapshots(true);
+    profileReport_.topologyRebuildLatestGeneration = app.editorTopologyRebuildLatestGeneration();
+    profileReport_.topologyRebuildNextTimelineValue = app.editorTopologyRebuildNextTimelineValue();
+    appendCompletedUploaderSchedulerReport(profileReport_);
+    appendCompletedMainThreadApplySchedulerReport(profileReport_);
+    appendCompletedTopologySchedulerReport(profileReport_);
     profileReport_.validationErrorCount = 0;
 
     profileReport_.settings = renderer->settings();
     const auto nvidiaStatus = renderer->nvidiaIntegrationStatus();
     profileReport_.nvidiaIntegrations.nrdSdkConfigured = nvidiaStatus.nrdSdkConfigured;
+    profileReport_.nvidiaIntegrations.nrdRequestable = nvidiaStatus.nrdRequestable;
     profileReport_.nvidiaIntegrations.nrdAvailable = nvidiaStatus.nrdAvailable;
     profileReport_.nvidiaIntegrations.nrdUnavailableReason = nvidiaStatus.nrdUnavailableReason;
     profileReport_.nvidiaIntegrations.requestedDenoiserBackend = denoiserBackendName(profileReport_.settings.denoiserBackend);
     profileReport_.nvidiaIntegrations.effectiveDenoiserBackend = denoiserBackendName(renderer->effectiveDenoiserBackend());
+    if (profileReport_.settings.denoiserBackend != DenoiserBackend::Nrd) {
+        profileReport_.nvidiaIntegrations.nrdBackendPolicy = "disabled";
+        profileReport_.nvidiaIntegrations.nrdBackendPolicyReason = "Engine denoiser selected";
+    } else if (renderer->effectiveDenoiserBackend() == DenoiserBackend::Nrd) {
+        profileReport_.nvidiaIntegrations.nrdBackendPolicy = "direct_nrd";
+        profileReport_.nvidiaIntegrations.nrdBackendPolicyReason =
+            "Direct NRD runtime selected; Streamline NRD is not used in this frame";
+    } else {
+        profileReport_.nvidiaIntegrations.nrdBackendPolicy = "engine_fallback";
+        profileReport_.nvidiaIntegrations.nrdBackendPolicyReason = nvidiaStatus.nrdUnavailableReason;
+    }
+    profileReport_.nvidiaIntegrations.nrdBackendsMutuallyExclusive =
+        renderer->effectiveDenoiserBackend() != DenoiserBackend::Nrd || !nvidiaStatus.streamlineNrd.requestable;
     profileReport_.nvidiaIntegrations.dlssSdkConfigured = nvidiaStatus.dlssSdkConfigured;
     profileReport_.nvidiaIntegrations.dlssAvailable = nvidiaStatus.dlssAvailable;
     profileReport_.nvidiaIntegrations.dlssUnavailableReason = nvidiaStatus.dlssUnavailableReason;
@@ -1666,11 +2317,78 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.nvidiaIntegrations.dlssSharpeningStrength = profileReport_.settings.dlssSharpeningStrength;
     profileReport_.nvidiaIntegrations.requestedTemporalUpscaler = temporalUpscalerName(profileReport_.settings.temporalUpscaler);
     profileReport_.nvidiaIntegrations.effectiveTemporalUpscaler = temporalUpscalerName(renderer->effectiveTemporalUpscaler());
+    profileReport_.nvidiaIntegrations.streamlineSdkConfigured = nvidiaStatus.streamlineSdkConfigured;
+    profileReport_.nvidiaIntegrations.streamlineRuntimeConfigured = nvidiaStatus.streamlineRuntimeConfigured;
+    profileReport_.nvidiaIntegrations.streamlineInitialized = nvidiaStatus.streamlineInitialized;
+    profileReport_.nvidiaIntegrations.streamlineVulkanInfoSet = nvidiaStatus.streamlineVulkanInfoSet;
+    profileReport_.nvidiaIntegrations.streamlineRuntimeDirectory = nvidiaStatus.streamlineRuntimeDirectory;
+    profileReport_.nvidiaIntegrations.streamlineUnavailableReason = nvidiaStatus.streamlineUnavailableReason;
+    profileReport_.nvidiaIntegrations.requestedStreamlineReflex = profileReport_.settings.streamlineReflexEnabled;
+    profileReport_.nvidiaIntegrations.effectiveStreamlineReflex =
+        profileReport_.settings.streamlineReflexEnabled && nvidiaStatus.streamlineReflex.requestable;
+    auto copyStreamlineFeature = [](const StreamlineFeatureStatus& source) {
+        ProfileReport::NvidiaIntegrationReport::StreamlineFeatureReport report;
+        report.requestable = source.requestable;
+        report.supported = source.supported;
+        report.unavailableReason = source.unavailableReason;
+        report.requirements = source.requirements;
+        return report;
+    };
+    auto copyStreamlineTags = [](const PathTracerRenderer::StreamlineTagSummary& source) {
+        ProfileReport::NvidiaIntegrationReport::StreamlineTagReport report;
+        report.expected = source.expected;
+        report.tagged = source.tagged;
+        report.failed = source.failed;
+        report.missingFrameToken = source.missingFrameToken;
+        report.missingImage = source.missingImage;
+        report.invalidLayout = source.invalidLayout;
+        report.invalidFormat = source.invalidFormat;
+        report.invalidExtent = source.invalidExtent;
+        report.emptyRole = source.emptyRole;
+        report.runtimeRejected = source.runtimeRejected;
+        report.frameIndex = source.frameIndex;
+        report.attempted = source.attempted;
+        return report;
+    };
+    auto copyStreamlineEvaluation = [](const PathTracerRenderer::StreamlineEvaluationSummary& source) {
+        ProfileReport::NvidiaIntegrationReport::StreamlineEvaluationReport report;
+        report.attempted = source.attempted;
+        report.succeeded = source.succeeded;
+        report.failed = source.failed;
+        report.skippedUnsupported = source.skippedUnsupported;
+        report.skippedMissingTags = source.skippedMissingTags;
+        report.frameIndex = source.frameIndex;
+        return report;
+    };
+    auto copyStreamlineReflexMarkers = [](const PathTracerRenderer::StreamlineReflexMarkerSummary& source) {
+        ProfileReport::NvidiaIntegrationReport::StreamlineReflexMarkerReport report;
+        report.attempted = source.attempted;
+        report.succeeded = source.succeeded;
+        report.failed = source.failed;
+        report.skippedUnavailable = source.skippedUnavailable;
+        report.frameIndex = source.frameIndex;
+        return report;
+    };
+    profileReport_.nvidiaIntegrations.streamlineDlss = copyStreamlineFeature(nvidiaStatus.streamlineDlss);
+    profileReport_.nvidiaIntegrations.streamlineDlssRayReconstruction = copyStreamlineFeature(nvidiaStatus.streamlineDlssRayReconstruction);
+    profileReport_.nvidiaIntegrations.streamlineDlssFrameGeneration = copyStreamlineFeature(nvidiaStatus.streamlineDlssFrameGeneration);
+    profileReport_.nvidiaIntegrations.streamlineReflex = copyStreamlineFeature(nvidiaStatus.streamlineReflex);
+    profileReport_.nvidiaIntegrations.streamlineNis = copyStreamlineFeature(nvidiaStatus.streamlineNis);
+    profileReport_.nvidiaIntegrations.streamlineNrd = copyStreamlineFeature(nvidiaStatus.streamlineNrd);
+    profileReport_.nvidiaIntegrations.streamlineDlssTags = copyStreamlineTags(nvidiaStatus.streamlineDlssTags);
+    profileReport_.nvidiaIntegrations.streamlineDlssRayReconstructionTags = copyStreamlineTags(nvidiaStatus.streamlineDlssRayReconstructionTags);
+    profileReport_.nvidiaIntegrations.streamlineDlssEvaluation = copyStreamlineEvaluation(nvidiaStatus.streamlineDlssEvaluation);
+    profileReport_.nvidiaIntegrations.streamlineDlssRayReconstructionEvaluation = copyStreamlineEvaluation(nvidiaStatus.streamlineDlssRayReconstructionEvaluation);
+    profileReport_.nvidiaIntegrations.streamlineReflexMarkers = copyStreamlineReflexMarkers(nvidiaStatus.streamlineReflexMarkers);
     if (profileReport_.settings.denoiserBackend == DenoiserBackend::Nrd && !nvidiaStatus.nrdAvailable) {
         profileReport_.warnings.push_back("NRD denoiser requested but unavailable: " + nvidiaStatus.nrdUnavailableReason);
     }
     if (profileReport_.settings.temporalUpscaler == TemporalUpscaler::Dlss && !nvidiaStatus.dlssAvailable) {
         profileReport_.warnings.push_back("DLSS requested but unavailable: " + nvidiaStatus.dlssUnavailableReason);
+    }
+    if (profileReport_.settings.temporalUpscaler == TemporalUpscaler::Nis &&
+        renderer->effectiveTemporalUpscaler() != TemporalUpscaler::Nis) {
+        profileReport_.warnings.push_back("NIS requested but unavailable: " + nvidiaStatus.streamlineNis.unavailableReason);
     }
     if (profileReport_.settings.dlssRayReconstructionEnabled && !nvidiaStatus.dlssRayReconstructionAvailable) {
         profileReport_.warnings.push_back("DLSS Ray Reconstruction requested but unavailable: " + nvidiaStatus.dlssRayReconstructionUnavailableReason);
@@ -1706,6 +2424,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["ray_tracing_motion_blur"] = profileReport_.rayTracingMotionBlur;
     j["pipeline_statistics"] = profileReport_.pipelineStatistics;
     j["ray_tracing_geometry"] = profileReport_.rayTracingGeometry;
+    j["animated_geometry"] = profileReport_.animatedGeometry;
     j["scene_lights"] = profileReport_.sceneLights;
     j["wavefront_queues"] = profileReport_.wavefrontQueues;
     j["wavefront_validation"] = profileReport_.wavefrontValidation;
@@ -1734,6 +2453,23 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["memory_pressure_quality"] = profileReport_.memoryPressureQuality;
     j["nvidia_integrations"] = profileReport_.nvidiaIntegrations;
     j["scene_update_routes"] = profileReport_.sceneUpdateRoutes;
+    j["scheduler_queues"] = profileReport_.schedulerQueues;
+    j["job_tickets"] = {
+        {"schema", "JobTicketsDiagnosticsV1"},
+        {"execution_policy", "diagnostic ticket snapshots; live Vulkan upload/topology ownership remains reported by scheduler/resource-readiness fields"},
+        {"gpu_upload", {
+            {"next_timeline_value", profileReport_.gpuUploadNextTimelineValue},
+            {"tickets", profileReport_.gpuUploadTickets},
+        }},
+        {"main_thread_apply", {
+            {"tickets", profileReport_.mainThreadApplyTickets},
+        }},
+        {"topology_rebuild", {
+            {"latest_generation", profileReport_.topologyRebuildLatestGeneration},
+            {"next_timeline_value", profileReport_.topologyRebuildNextTimelineValue},
+            {"tickets", profileReport_.topologyRebuildTickets},
+        }},
+    };
     j["validation_error_count"] = profileReport_.validationErrorCount;
     j["warnings"] = profileReport_.warnings;
     j["settings"] = profileReport_.settings;
@@ -2018,6 +2754,8 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
                 std::nullopt,
                 std::nullopt,
                 scene.path,
+                std::nullopt,
+                {},
                 std::nullopt,
                 std::nullopt,
                 std::nullopt,

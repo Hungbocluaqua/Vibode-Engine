@@ -6,6 +6,7 @@
 #include "rtv/SceneComponents.h"
 #include "rtv/SceneRegistry.h"
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -20,6 +21,32 @@ struct RtLevelHeader {
     std::string sceneGuid;
     std::string engineVersion = "0.1";
     bool projectRelativePaths = true;
+};
+
+enum class EditorPivotMode : uint32_t {
+    Active,
+    SelectionCenter,
+    BoundsCenter,
+    Custom,
+};
+
+struct EditorPivotSettings {
+    EditorPivotMode mode = EditorPivotMode::Active;
+    glm::vec3 customPosition{0.0f};
+    glm::vec3 customRotationEuler{0.0f};
+};
+
+struct SceneSublevelRecord {
+    AssetGuid sceneGuid;
+    std::filesystem::path scenePath;
+    Transform transform{};
+    bool visible = true;
+    bool loaded = true;
+    bool editable = false;
+    std::string sourceRevision;
+    std::string sourceHash;
+    bool overridesDirty = false;
+    bool sourceDirty = false;
 };
 
 class SceneDocument {
@@ -53,6 +80,12 @@ public:
     void setTimelineJson(const nlohmann::json& json);
     [[nodiscard]] const std::optional<nlohmann::json>& timelineJson() const { return timelineJson_; }
     void clearTimelineJson();
+    void setEditorPivot(EditorPivotSettings pivot);
+    [[nodiscard]] const EditorPivotSettings& editorPivot() const { return editorPivot_; }
+    void setSublevels(std::vector<SceneSublevelRecord> sublevels);
+    void addSublevel(SceneSublevelRecord sublevel);
+    bool removeSublevel(const AssetGuid& sceneGuid);
+    [[nodiscard]] const std::vector<SceneSublevelRecord>& sublevels() const { return sublevels_; }
     void addPrefabInstance(PrefabInstance instance);
     [[nodiscard]] const std::vector<PrefabInstance>& prefabInstances() const { return prefabInstances_; }
     [[nodiscard]] size_t replaceAssetGuidReferences(const AssetGuid& oldGuid, const AssetGuid& newGuid);
@@ -66,6 +99,7 @@ public:
     [[nodiscard]] SceneUpdateMask pendingUpdateMask() const;
     [[nodiscard]] const std::string& lastChangeReason() const { return lastChangeReason_; }
     [[nodiscard]] const std::vector<std::string>& dirtyReasons() const { return dirtyReasons_; }
+    [[nodiscard]] bool hasSublevelDirtyState() const;
 
     void importSceneAsset(const SceneAsset& scene);
     [[nodiscard]] int32_t appendSceneSkins(const std::vector<SceneSkinAsset>& skins);
@@ -91,6 +125,8 @@ private:
     std::optional<std::filesystem::path> sourceHdrPath_;
     std::optional<nlohmann::json> bookmarksJson_;
     std::optional<nlohmann::json> timelineJson_;
+    EditorPivotSettings editorPivot_{};
+    std::vector<SceneSublevelRecord> sublevels_;
     std::vector<PrefabInstance> prefabInstances_;
     std::vector<TextureAssetHandle> sceneTextures_;
     std::vector<MaterialAssetHandle> sceneMaterials_;

@@ -1,5 +1,6 @@
 #include "rtv/InspectorPanel.h"
 
+#include "rtv/AnimationController.h"
 #include "rtv/AssetManager.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorLog.h"
@@ -197,6 +198,226 @@ std::filesystem::path inspectorAnimationReadinessReportPath(const EditorRuntimeS
     return root / "Reports" / ("animation_production_readiness_" + safeInspectorReportName(entity.name) + "_" + std::to_string(entity.uuid) + ".json");
 }
 
+std::filesystem::path resolveInspectorRelativePath(const EditorRuntimeState& state, const std::filesystem::path& path) {
+    if (path.empty() || path.is_absolute()) {
+        return path;
+    }
+    if (state.project != nullptr && !state.project->projectRoot.empty()) {
+        return state.project->projectRoot / path;
+    }
+    if (state.scenePath != nullptr && state.scenePath->has_value() && !state.scenePath->value().empty()) {
+        return state.scenePath->value().parent_path() / path;
+    }
+    return std::filesystem::current_path() / path;
+}
+
+const AssetRecord* inspectorAssetRecordByGuid(const EditorRuntimeState& state, const AssetGuid& guid) {
+    if (guid.empty() || state.assetRegistry == nullptr) {
+        return nullptr;
+    }
+    for (const AssetRecord& record : state.assetRegistry->records()) {
+        if (record.guid == guid) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<std::filesystem::path> inspectorControllerPathCandidates(const EditorRuntimeState& state, const AnimationPlayer& player) {
+    std::vector<std::filesystem::path> candidates;
+    auto addCandidate = [&](const std::filesystem::path& path) {
+        if (path.empty()) {
+            return;
+        }
+        const std::filesystem::path resolved = resolveInspectorRelativePath(state, path);
+        const auto exists = std::find(candidates.begin(), candidates.end(), resolved);
+        if (exists == candidates.end()) {
+            candidates.push_back(resolved);
+        }
+    };
+
+    addCandidate(player.controllerPath);
+    if (const AssetRecord* record = inspectorAssetRecordByGuid(state, player.controllerGuid)) {
+        addCandidate(record->importedPath);
+        addCandidate(record->cachePath);
+        addCandidate(record->sourcePath);
+    }
+    if (!player.controllerPath.empty() && state.project != nullptr && !state.project->contentRoot.empty() && !player.controllerPath.is_absolute()) {
+        const std::filesystem::path contentCandidate = state.project->contentRoot / player.controllerPath;
+        if (std::find(candidates.begin(), candidates.end(), contentCandidate) == candidates.end()) {
+            candidates.push_back(contentCandidate);
+        }
+    }
+    return candidates;
+}
+
+struct InspectorAnimationControllerGraphPreview {
+    bool requested = false;
+    bool loaded = false;
+    std::filesystem::path resolvedPath;
+    std::vector<std::filesystem::path> candidates;
+    std::vector<std::string> warnings;
+    std::string error;
+    AnimationController controller;
+};
+
+void inspectorReadonlyRow(const char* label, const char* value);
+void inspectorReadonlyRow(const char* label, const std::string& value);
+
+InspectorAnimationControllerGraphPreview loadInspectorAnimationControllerGraphPreview(const EditorRuntimeState& state, const AnimationPlayer& player) {
+    InspectorAnimationControllerGraphPreview preview;
+    preview.requested = !player.controllerGuid.empty() || !player.controllerPath.empty();
+    preview.candidates = inspectorControllerPathCandidates(state, player);
+    if (!preview.requested) {
+        preview.error = "No animation controller is referenced by the selected Animation Player.";
+        return preview;
+    }
+    if (preview.candidates.empty()) {
+        preview.error = "Animation controller reference could not be resolved to a candidate path.";
+        return preview;
+    }
+
+    std::filesystem::path fallback = preview.candidates.front();
+    for (const std::filesystem::path& candidate : preview.candidates) {
+        std::error_code ec;
+        if (!std::filesystem::exists(candidate, ec)) {
+            continue;
+        }
+        preview.resolvedPath = candidate;
+        preview.controller = AnimationController::load(candidate, &preview.warnings);
+        preview.loaded = preview.controller.valid();
+        if (!preview.loaded) {
+            preview.error = "Animation controller could not be parsed or has no valid initial state.";
+        }
+        return preview;
+    }
+
+    preview.resolvedPath = std::move(fallback);
+    preview.error = "Animation controller file was not found.";
+    return preview;
+}
+
+size_t inspectorAnimationControllerTransitionCount(const AnimationController& controller) {
+    size_t count = 0;
+    for (const AnimationController::State& state : controller.states()) {
+        count += state.transitions.size();
+    }
+    return count;
+}
+
+nlohmann::json buildInspectorAnimationControllerGraphPreviewJson(
+    const AnimationPlayer& player,
+    const InspectorAnimationControllerGraphPreview& preview) {
+    nlohmann::json candidatePaths = nlohmann::json::array();
+    for (const std::filesystem::path& candidate : preview.candidates) {
+        candidatePaths.push_back(candidate.generic_string());
+    }
+
+    nlohmann::json report = {
+        {"requested", preview.requested},
+        {"loaded", preview.loaded},
+        {"resolvedPath", preview.resolvedPath.generic_string()},
+        {"candidatePaths", candidatePaths},
+        {"activeState", player.controllerState},
+        {"warnings", preview.warnings},
+        {"error", preview.error},
+    };
+    if (!preview.loaded) {
+        return report;
+    }
+
+    const AnimationController& controller = preview.controller;
+    nlohmann::json parameters = nlohmann::json::array();
+    for (const AnimationController::Parameter& parameter : controller.parameters()) {
+        parameters.push_back({
+            {"name", parameter.name},
+            {"type", animationControllerParameterTypeName(parameter.type)},
+        });
+    }
+
+    nlohmann::json states = nlohmann::json::array();
+    for (const AnimationController::State& state : controller.states()) {
+        nlohmann::json transitions = nlohmann::json::array();
+        for (const AnimationController::Transition& transition : state.transitions) {
+            transitions.push_back({
+                {"to", transition.to},
+                {"exitTimeSeconds", transition.exitTimeSeconds},
+                {"conditionCount", transition.conditions.size()},
+                {"eventCount", transition.events.size()},
+            });
+        }
+        nlohmann::json blendTree;
+        if (state.hasBlendTree) {
+            nlohmann::json children = nlohmann::json::array();
+            for (const AnimationController::BlendTreeChild& child : state.blendTree.children) {
+                children.push_back({
+                    {"name", child.name},
+                    {"clipGuid", child.clipGuid},
+                    {"clipPath", child.clipPath.generic_string()},
+                    {"threshold", child.threshold},
+                });
+            }
+            blendTree = {
+                {"type", state.blendTree.type},
+                {"parameter", state.blendTree.parameter},
+                {"children", children},
+            };
+        } else {
+            blendTree = nullptr;
+        }
+        states.push_back({
+            {"name", state.name},
+            {"active", !player.controllerState.empty() && state.name == player.controllerState},
+            {"default", state.defaultState},
+            {"clipGuid", state.clipGuid},
+            {"clipPath", state.clipPath.generic_string()},
+            {"speed", state.speed},
+            {"loop", state.loop},
+            {"eventCount", state.events.size()},
+            {"transitions", transitions},
+            {"blendTree", blendTree},
+        });
+    }
+
+    nlohmann::json layers = nlohmann::json::array();
+    for (const AnimationController::Layer& layer : controller.layers()) {
+        layers.push_back({
+            {"name", layer.name},
+            {"clipGuid", layer.clipGuid},
+            {"clipPath", layer.clipPath.generic_string()},
+            {"weight", layer.weight},
+            {"additive", layer.additive},
+            {"mask", layer.mask},
+        });
+    }
+
+    nlohmann::json masks = nlohmann::json::array();
+    for (const AnimationController::AvatarMask& mask : controller.avatarMasks()) {
+        masks.push_back({
+            {"name", mask.name},
+            {"includedJointCount", mask.includedJoints.size()},
+            {"excludedJointCount", mask.excludedJoints.size()},
+            {"includedJoints", mask.includedJoints},
+            {"excludedJoints", mask.excludedJoints},
+        });
+    }
+
+    report["controller"] = {
+        {"name", controller.name()},
+        {"initialState", controller.initialState()},
+        {"parameterCount", controller.parameters().size()},
+        {"stateCount", controller.states().size()},
+        {"transitionCount", inspectorAnimationControllerTransitionCount(controller)},
+        {"layerCount", controller.layers().size()},
+        {"avatarMaskCount", controller.avatarMasks().size()},
+        {"parameters", parameters},
+        {"states", states},
+        {"layers", layers},
+        {"avatarMasks", masks},
+    };
+    return report;
+}
+
 nlohmann::json buildInspectorAnimationProductionReadinessReport(
     const EditorRuntimeState& state,
     const Entity& entity,
@@ -211,6 +432,7 @@ nlohmann::json buildInspectorAnimationProductionReadinessReport(
         const size_t skinIndex = static_cast<size_t>(renderer->skinIndex);
         sceneSkinPayloadAvailable = skinIndex < skins.size() && !skins[skinIndex].joints.empty() && !skins[skinIndex].inverseBindMatrices.empty();
     }
+    const InspectorAnimationControllerGraphPreview controllerPreview = loadInspectorAnimationControllerGraphPreview(state, player);
     return {
         {"schema", "AnimationProductionReadinessV1"},
         {"entity", {
@@ -222,6 +444,10 @@ nlohmann::json buildInspectorAnimationProductionReadinessReport(
         {"animationPlayer", {
             {"animationGuid", player.animationGuid},
             {"animationPath", player.animationPath.generic_string()},
+            {"controllerGuid", player.controllerGuid},
+            {"controllerPath", player.controllerPath.generic_string()},
+            {"controllerState", player.controllerState},
+            {"controllerParameterOverrideCount", player.controllerParameters.size()},
             {"enabled", player.enabled},
             {"playOnStart", player.playOnStart},
             {"playing", player.playing},
@@ -230,6 +456,8 @@ nlohmann::json buildInspectorAnimationProductionReadinessReport(
             {"applyMorphWeights", player.applyMorphWeights},
             {"playbackSpeed", player.playbackSpeed},
             {"currentTimeSeconds", player.currentTimeSeconds},
+            {"previousTimeSeconds", player.previousTimeSeconds},
+            {"previousSampleValid", player.previousSampleValid},
         }},
         {"currentSupport", {
             {"inspectorPreviewControlsImplemented", true},
@@ -238,7 +466,20 @@ nlohmann::json buildInspectorAnimationProductionReadinessReport(
             {"cpuMorphWeightApplicationImplemented", true},
             {"cpuSkinningIntoRuntimeMeshImplemented", true},
             {"transformOnlyPreviewRouteImplemented", true},
+            {"previousAnimationSampleStateImplemented", true},
+            {"animationControllerEventRoutingImplemented", true},
+            {"animationControllerBlendTreeLayerMaskMetadataImplemented", true},
+            {"animationControllerOneDimensionalBlendSamplingImplemented", true},
+            {"animationControllerLayeredMaskedPoseApplicationImplemented", true},
+            {"animationControllerInspectorGraphPreviewImplemented", true},
+            {"animationControllerGraphSaveEmissionImplemented", true},
+            {"animationControllerGraphMutationCliImplemented", true},
+            {"animationControllerInspectorReimportWorkflowImplemented", true},
+            {"nativeRtSkeletalMeshBindingDecodeImplemented", true},
+            {"gpuSkinningPlanDiagnosticsImplemented", true},
+            {"gpuSkinningComputeShaderSourceImplemented", true},
         }},
+        {"animationControllerGraphPreview", buildInspectorAnimationControllerGraphPreviewJson(player, controllerPreview)},
         {"selectedMesh", {
             {"available", mesh != nullptr},
             {"name", mesh != nullptr ? mesh->name : std::string{}},
@@ -252,13 +493,15 @@ nlohmann::json buildInspectorAnimationProductionReadinessReport(
         }},
         {"productionReadiness", {
             {"nativeRtSkeletalMeshImplemented", false},
-            {"nativeRtSkeletonImplemented", false},
-            {"nativeRtAnimImplemented", false},
+            {"nativeRtSkeletonImplemented", true},
+            {"nativeRtAnimImplemented", true},
             {"nativeRtAnimControllerImplemented", false},
-            {"gpuSkinningImplemented", false},
-            {"skinnedMotionVectorsImplemented", false},
-            {"skinnedTaaDlssIntegrationImplemented", false},
-            {"animatedBlasTlasUpdateStrategyImplemented", false},
+            {"gpuSkinningImplemented", true},
+            {"gpuSkinningScope", "guarded-renderer-compute-dispatch-readback-and-compatible-rt-input"},
+            {"skinnedMotionVectorsImplemented", true},
+            {"skinnedTaaDlssIntegrationImplemented", true},
+            {"animatedBlasTlasUpdateStrategyImplemented", true},
+            {"animatedBlasTlasUpdateStrategyScope", "transform-tlas-refit-and-gpu-skinned-dynamic-blas-diagnostics"},
             {"animationControllerEditorImplemented", false},
             {"stateMachineEditorImplemented", false},
             {"fullAnimationPreviewWorkflowImplemented", false},
@@ -269,16 +512,99 @@ nlohmann::json buildInspectorAnimationProductionReadinessReport(
             {"performedActions", nlohmann::json::array()},
             {"unsupportedActions", nlohmann::json::array({
                 "native-rtskeletalmesh-emission",
-                "native-rtskeleton-emission",
-                "native-rtanim-emission",
                 "native-rtanimcontroller-emission",
-                "gpu-skinning",
-                "skinned-motion-vectors-taa-dlss",
-                "animated-blas-tlas-update-strategy",
-                "animation-controller-state-machine-editor"
+                "production-gpuscene-skeletal-integration",
+                "arbitrary-skeletal-package-coverage",
+                "cpu-skinning-demotion",
+                "frame-budgeted-animated-as-scheduling",
+                "unsupported-device-dynamic-blas-smoke",
+                "animation-controller-state-machine-editor",
+                "animation-controller-editor-graph-authoring-workflow",
+                "animation-controller-source-control-checkout-workflow"
             })},
         }},
     };
+}
+
+void drawInspectorAnimationControllerGraphPreview(const AnimationPlayer& player, const InspectorAnimationControllerGraphPreview& preview) {
+    if (!ImGui::TreeNodeEx("Controller Graph", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    if (!preview.requested) {
+        ImGui::TextDisabled("No controller reference");
+        ImGui::TreePop();
+        return;
+    }
+    if (!preview.loaded) {
+        ImGui::TextDisabled("Controller unavailable");
+        if (!preview.resolvedPath.empty()) {
+            ImGui::TextDisabled("%s", preview.resolvedPath.generic_string().c_str());
+        }
+        if (!preview.error.empty()) {
+            ImGui::TextWrapped("%s", preview.error.c_str());
+        }
+        ImGui::TreePop();
+        return;
+    }
+
+    const AnimationController& controller = preview.controller;
+    const std::string summary = std::to_string(controller.states().size()) + " states, " +
+        std::to_string(inspectorAnimationControllerTransitionCount(controller)) + " transitions, " +
+        std::to_string(controller.parameters().size()) + " parameters";
+    inspectorReadonlyRow("Controller", controller.name().empty() ? "Unnamed" : controller.name().c_str());
+    inspectorReadonlyRow("Graph Summary", summary.c_str());
+    inspectorReadonlyRow("Initial State", controller.initialState().c_str());
+    if (!preview.resolvedPath.empty()) {
+        inspectorReadonlyRow("Resolved Path", preview.resolvedPath.generic_string().c_str());
+    }
+
+    if (ImGui::TreeNodeEx("States", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (const AnimationController::State& state : controller.states()) {
+            const bool active = !player.controllerState.empty() && state.name == player.controllerState;
+            const std::string label = state.name + (active ? "  [active]" : state.defaultState ? "  [default]" : "");
+            if (ImGui::TreeNodeEx(label.c_str(), active ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+                inspectorReadonlyRow("Clip GUID", state.clipGuid.c_str());
+                inspectorReadonlyRow("Clip Path", state.clipPath.generic_string().c_str());
+                const std::string playback = std::string(state.loop ? "loop" : "once") + ", speed " + std::to_string(state.speed);
+                inspectorReadonlyRow("Playback", playback.c_str());
+                if (state.hasBlendTree) {
+                    const std::string blendSummary = state.blendTree.type + " / " + state.blendTree.parameter + " / " + std::to_string(state.blendTree.children.size()) + " children";
+                    inspectorReadonlyRow("Blend Tree", blendSummary.c_str());
+                    for (const AnimationController::BlendTreeChild& child : state.blendTree.children) {
+                        const std::string childSummary = child.name + " @ " + std::to_string(child.threshold) + " -> " + child.clipPath.generic_string();
+                        ImGui::BulletText("%s", childSummary.c_str());
+                    }
+                }
+                for (const AnimationController::Transition& transition : state.transitions) {
+                    const std::string transitionSummary = state.name + " -> " + transition.to +
+                        " (conditions " + std::to_string(transition.conditions.size()) +
+                        ", events " + std::to_string(transition.events.size()) + ")";
+                    ImGui::BulletText("%s", transitionSummary.c_str());
+                }
+                ImGui::TreePop();
+            }
+        }
+        ImGui::TreePop();
+    }
+
+    if (!controller.layers().empty() && ImGui::TreeNodeEx("Layers", 0)) {
+        for (const AnimationController::Layer& layer : controller.layers()) {
+            const std::string layerSummary = layer.name + " weight " + std::to_string(layer.weight) +
+                (layer.additive ? " additive" : " override") + (layer.mask.empty() ? "" : " mask " + layer.mask);
+            ImGui::BulletText("%s", layerSummary.c_str());
+        }
+        ImGui::TreePop();
+    }
+
+    if (!controller.avatarMasks().empty() && ImGui::TreeNodeEx("Avatar Masks", 0)) {
+        for (const AnimationController::AvatarMask& mask : controller.avatarMasks()) {
+            const std::string maskSummary = mask.name + " includes " + std::to_string(mask.includedJoints.size()) +
+                ", excludes " + std::to_string(mask.excludedJoints.size());
+            ImGui::BulletText("%s", maskSummary.c_str());
+        }
+        ImGui::TreePop();
+    }
+    ImGui::TreePop();
 }
 
 bool writeInspectorAnimationProductionReadinessReport(
@@ -1282,10 +1608,20 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             static EntityId animationEditId{};
             static std::array<char, 128> animationGuidBuffer{};
             static std::array<char, 260> animationPathBuffer{};
+            static std::array<char, 128> controllerGuidBuffer{};
+            static std::array<char, 260> controllerPathBuffer{};
+            static std::array<char, 128> controllerStateBuffer{};
+            static std::array<char, 96> controllerParameterNameBuffer{};
+            static int controllerParameterTypeIndex = 0;
             if (animationEditId != entity->id) {
                 animationEditId = entity->id;
                 copyInspectorBuffer(animationGuidBuffer, player.animationGuid);
                 copyInspectorBuffer(animationPathBuffer, player.animationPath.generic_string());
+                copyInspectorBuffer(controllerGuidBuffer, player.controllerGuid);
+                copyInspectorBuffer(controllerPathBuffer, player.controllerPath.generic_string());
+                copyInspectorBuffer(controllerStateBuffer, player.controllerState);
+                controllerParameterNameBuffer.fill('\0');
+                controllerParameterTypeIndex = 0;
             }
             if (inspectorInputTextRow("Animation GUID", animationGuidBuffer.data(), animationGuidBuffer.size())) {
                 const std::string value = trimInspectorText(animationGuidBuffer.data());
@@ -1300,6 +1636,30 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 if (value != player.animationPath.generic_string()) {
                     player.animationPath = value;
                     copyInspectorBuffer(animationPathBuffer, player.animationPath.generic_string());
+                    changed = true;
+                }
+            }
+            if (inspectorInputTextRow("Controller GUID", controllerGuidBuffer.data(), controllerGuidBuffer.size())) {
+                const std::string value = trimInspectorText(controllerGuidBuffer.data());
+                if (value != player.controllerGuid) {
+                    player.controllerGuid = value;
+                    copyInspectorBuffer(controllerGuidBuffer, player.controllerGuid);
+                    changed = true;
+                }
+            }
+            if (inspectorInputTextRow("Controller Path", controllerPathBuffer.data(), controllerPathBuffer.size())) {
+                const std::string value = trimInspectorText(controllerPathBuffer.data());
+                if (value != player.controllerPath.generic_string()) {
+                    player.controllerPath = value;
+                    copyInspectorBuffer(controllerPathBuffer, player.controllerPath.generic_string());
+                    changed = true;
+                }
+            }
+            if (inspectorInputTextRow("Controller State", controllerStateBuffer.data(), controllerStateBuffer.size())) {
+                const std::string value = trimInspectorText(controllerStateBuffer.data());
+                if (value != player.controllerState) {
+                    player.controllerState = value;
+                    copyInspectorBuffer(controllerStateBuffer, player.controllerState);
                     changed = true;
                 }
             }
@@ -1325,6 +1685,8 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                     if (player.playing || player.currentTimeSeconds != 0.0) {
                         player.playing = false;
                         player.currentTimeSeconds = 0.0;
+                        player.previousTimeSeconds = 0.0;
+                        player.previousSampleValid = false;
                         changed = true;
                     }
                 }
@@ -1333,6 +1695,8 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
                 if (editorIconButton("AnimationPlayerPreviewResetTime", EditorGlyphIcon::Reset, false)) {
                     if (player.currentTimeSeconds != 0.0) {
                         player.currentTimeSeconds = 0.0;
+                        player.previousTimeSeconds = 0.0;
+                        player.previousSampleValid = false;
                         changed = true;
                     }
                 }
@@ -1349,12 +1713,91 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             float currentTime = static_cast<float>(player.currentTimeSeconds);
             if (inspectorDragFloatRow("Current Time", &currentTime, 0.01f, 0.0f, 100000.0f, "%.3f s")) {
                 player.currentTimeSeconds = std::max(0.0f, currentTime);
+                player.previousTimeSeconds = player.currentTimeSeconds;
+                player.previousSampleValid = false;
                 changed = true;
+            }
+            if (beginInspectorPropertyRow("Add Parameter")) {
+                ImGui::SetNextItemWidth(120.0f);
+                ImGui::InputText("##AnimationControllerParameterName", controllerParameterNameBuffer.data(), controllerParameterNameBuffer.size());
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(92.0f);
+                ImGui::Combo("##AnimationControllerParameterType", &controllerParameterTypeIndex, "Bool\0Int\0Float\0Trigger\0");
+                ImGui::SameLine();
+                if (editorIconButton("AnimationControllerParameterAdd", EditorGlyphIcon::Add, false)) {
+                    const std::string name = trimInspectorText(controllerParameterNameBuffer.data());
+                    if (!name.empty()) {
+                        AnimationControllerParameterOverride parameter;
+                        parameter.name = name;
+                        static constexpr const char* typeNames[] = {"bool", "int", "float", "trigger"};
+                        parameter.type = typeNames[std::clamp(controllerParameterTypeIndex, 0, 3)];
+                        player.controllerParameters.push_back(std::move(parameter));
+                        controllerParameterNameBuffer.fill('\0');
+                        changed = true;
+                    }
+                }
+                tooltip("Add a controller parameter override");
+                endInspectorPropertyRow();
+            }
+            for (size_t parameterIndex = 0; parameterIndex < player.controllerParameters.size();) {
+                AnimationControllerParameterOverride& parameter = player.controllerParameters[parameterIndex];
+                const std::string label = parameter.name.empty() ? ("Parameter " + std::to_string(parameterIndex)) : parameter.name;
+                bool removeParameter = false;
+                if (beginInspectorPropertyRow(label.c_str())) {
+                    ImGui::PushID(static_cast<int>(parameterIndex));
+                    if (parameter.type == "bool") {
+                        changed |= ImGui::Checkbox("##ControllerBool", &parameter.boolValue);
+                    } else if (parameter.type == "int") {
+                        changed |= ImGui::DragInt("##ControllerInt", &parameter.intValue, 1.0f, -100000, 100000);
+                    } else if (parameter.type == "float") {
+                        changed |= ImGui::DragFloat("##ControllerFloat", &parameter.floatValue, 0.01f, -100000.0f, 100000.0f, "%.3f");
+                    } else if (parameter.type == "trigger") {
+                        changed |= ImGui::Checkbox("##ControllerTrigger", &parameter.triggerValue);
+                    } else {
+                        ImGui::TextDisabled("%s", parameter.type.empty() ? "unknown" : parameter.type.c_str());
+                    }
+                    ImGui::SameLine();
+                    if (editorIconButton("RemoveControllerParameter", EditorGlyphIcon::Trash, false)) {
+                        removeParameter = true;
+                    }
+                    tooltip("Remove controller parameter override");
+                    ImGui::PopID();
+                    endInspectorPropertyRow();
+                }
+                if (removeParameter) {
+                    player.controllerParameters.erase(player.controllerParameters.begin() + static_cast<std::ptrdiff_t>(parameterIndex));
+                    changed = true;
+                } else {
+                    ++parameterIndex;
+                }
             }
             const MeshRenderer* animationRenderer = entity->meshRenderer.has_value() ? &*entity->meshRenderer : nullptr;
             const MeshAsset* animationMesh = nullptr;
             if (animationRenderer != nullptr && state.assets != nullptr) {
                 animationMesh = state.assets->mesh(animationRenderer->mesh);
+            }
+            const InspectorAnimationControllerGraphPreview controllerGraphPreview = loadInspectorAnimationControllerGraphPreview(state, player);
+            drawInspectorAnimationControllerGraphPreview(player, controllerGraphPreview);
+            if (const AssetRecord* controllerRecord = inspectorAssetRecordByGuid(state, player.controllerGuid)) {
+                const std::filesystem::path controllerSourcePath = resolveInspectorRelativePath(state, controllerRecord->sourcePath);
+                std::error_code sourceEc;
+                const bool controllerSourceAvailable = !controllerRecord->sourcePath.empty() && std::filesystem::exists(controllerSourcePath, sourceEc);
+                if (!controllerSourceAvailable) {
+                    ImGui::BeginDisabled();
+                }
+                if (editorIconTextButton("AnimationControllerOpenSource", EditorGlyphIcon::File, "Open Controller Source")) {
+                    requests.openFilePath = controllerSourcePath;
+                }
+                tooltip("Open the source controller asset referenced by this Animation Player");
+                ImGui::SameLine();
+                if (editorIconTextButton("AnimationControllerReimport", EditorGlyphIcon::Refresh, "Reimport Controller")) {
+                    requests.reimportAsset = controllerRecord->guid;
+                }
+                tooltip("Queue the referenced controller asset for reimport through the existing asset pipeline");
+                if (!controllerSourceAvailable) {
+                    ImGui::EndDisabled();
+                    ImGui::TextDisabled("Controller source unavailable");
+                }
             }
             if (editorIconTextButton("AnimationProductionReadinessReport", EditorGlyphIcon::Details, "Animation Readiness")) {
                 std::filesystem::path reportPath;

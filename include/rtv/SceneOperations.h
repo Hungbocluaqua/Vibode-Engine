@@ -4,10 +4,16 @@
 #include "rtv/SceneEventBus.h"
 #include "rtv/UndoStack.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace rtv {
+
+enum class EditorAlignDistributeAxis : uint32_t;
+enum class EditorAlignDistributeMode : uint32_t;
+struct EditorAlignDistributeEntityBounds;
+struct EditorEntityTransformChange;
 
 class SceneOperations {
 public:
@@ -28,17 +34,33 @@ public:
     bool renameEntity(EntityId id, const std::string& name);
     bool setTransform(EntityId id, const Transform& transform);
     void setTransformGizmoDrag(EntityId id, const Transform& oldTransform, const Transform& newTransform);
+    bool setTransformGizmoDragBatch(const std::vector<EditorEntityTransformChange>& changes);
+    bool alignDistributeEntities(
+        const std::vector<EntityId>& ids,
+        const std::vector<EditorAlignDistributeEntityBounds>& bounds,
+        EditorAlignDistributeAxis axis,
+        EditorAlignDistributeMode mode);
     bool addLightComponent(EntityId id, Light light = {});
     bool addSunComponent(EntityId id, Sun sun = {});
     bool addCameraComponent(EntityId id, Camera camera = {});
     bool addMeshRendererComponent(EntityId id, MeshRenderer renderer = {});
+    bool addLevelInstanceComponent(EntityId id, LevelInstance instance = {});
     bool removeLightComponent(EntityId id);
     bool removeSunComponent(EntityId id);
     bool removeCameraComponent(EntityId id);
     bool removeMeshRendererComponent(EntityId id);
+    bool removeLevelInstanceComponent(EntityId id);
     bool setMeshRenderer(EntityId id, const MeshRenderer& oldRenderer, const MeshRenderer& newRenderer, SceneUpdateKind updateKind);
+    bool setLevelInstance(EntityId id, const LevelInstance& oldInstance, const LevelInstance& newInstance);
+    bool setLevelInstanceLoaded(EntityId id, bool loaded);
+    bool setLevelInstanceEditable(EntityId id, bool editable);
+    bool breakLevelInstanceLink(EntityId id);
     bool ensurePrimarySun();
     [[nodiscard]] EntityId mergeSceneAsset(const SceneAsset& scene, const std::string& rootName = "Merged Scene");
+    [[nodiscard]] EntityId mergeLevelInstanceAsset(
+        const SceneAsset& scene,
+        SceneSublevelRecord sublevel,
+        const std::string& rootName = "Level Instance");
     [[nodiscard]] PrefabInstance placePrefab(
         const PrefabAsset& prefab,
         const PrefabRuntimeBindings* bindings = nullptr,

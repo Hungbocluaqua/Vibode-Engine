@@ -37,6 +37,7 @@ public:
     [[nodiscard]] const std::vector<TextureAsset>& textures() const { return textures_; }
     [[nodiscard]] const std::vector<MaterialAsset>& materials() const { return materials_; }
     [[nodiscard]] const std::vector<MeshAsset>& meshes() const { return meshes_; }
+    void truncateTo(const AssetLoadStats& stats);
     void clear();
 
 private:

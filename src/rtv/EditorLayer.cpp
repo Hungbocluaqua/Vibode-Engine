@@ -6,6 +6,7 @@
 #include "rtv/EditorUiStyle.h"
 #include "rtv/Entity.h"
 #include "rtv/FileDialog.h"
+#include "rtv/RtpkgIO.h"
 #include "rtv/SceneRenderSettingsSync.h"
 #include "rtv/UndoStack.h"
 
@@ -24,11 +25,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -42,6 +45,108 @@
 namespace rtv {
 
 namespace {
+
+nlohmann::json nativeTextureTargetSetLibraryProfileJson(const EditorNativeTextureTargetSetLibraryProfile& profile) {
+    return {
+        {"name", profile.name},
+        {"bc7SrgbSampled", profile.bc7SrgbSampled},
+        {"bc7UnormSampled", profile.bc7UnormSampled},
+        {"bc5UnormSampled", profile.bc5UnormSampled},
+        {"bc4UnormSampled", profile.bc4UnormSampled},
+        {"rgba8SrgbSampled", profile.rgba8SrgbSampled},
+        {"rgba8UnormSampled", profile.rgba8UnormSampled},
+        {"rgba16fSampled", profile.rgba16fSampled},
+    };
+}
+
+nlohmann::json nativeTextureTargetSetLibraryJson(const std::vector<EditorNativeTextureTargetSetLibraryProfile>& profiles) {
+    nlohmann::json json = nlohmann::json::array();
+    for (const EditorNativeTextureTargetSetLibraryProfile& profile : profiles) {
+        json.push_back(nativeTextureTargetSetLibraryProfileJson(profile));
+    }
+    return json;
+}
+
+bool writeNativeTextureTargetSetLibraryFile(
+    const std::filesystem::path& path,
+    const std::vector<EditorNativeTextureTargetSetLibraryProfile>& profiles,
+    std::string& error) {
+    if (path.empty()) {
+        error = "Output path is empty.";
+        return false;
+    }
+    std::error_code ec;
+    const std::filesystem::path parent = path.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            error = "Could not create folder: " + ec.message();
+            return false;
+        }
+    }
+    std::ofstream file(path, std::ios::trunc);
+    if (!file.is_open()) {
+        error = "Could not open output file: " + path.string();
+        return false;
+    }
+    const nlohmann::json json = {
+        {"schema", "NativeTextureTargetSetLibraryV1"},
+        {"profiles", nativeTextureTargetSetLibraryJson(profiles)},
+    };
+    file << json.dump(2);
+    if (!file.good()) {
+        error = "Could not write target-set library JSON.";
+        return false;
+    }
+    return true;
+}
+
+bool importNativeTextureTargetSetLibraryFile(
+    const std::filesystem::path& path,
+    std::vector<EditorNativeTextureTargetSetLibraryProfile>& outProfiles,
+    std::string& error) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        error = "Could not open import file: " + path.string();
+        return false;
+    }
+    nlohmann::json json;
+    try {
+        file >> json;
+    } catch (const std::exception& ex) {
+        error = std::string("Could not parse target-set library JSON: ") + ex.what();
+        return false;
+    }
+
+    const nlohmann::json* profilesJson = nullptr;
+    if (json.contains("profiles") && json["profiles"].is_array()) {
+        profilesJson = &json["profiles"];
+    } else if (json.is_array()) {
+        profilesJson = &json;
+    }
+    if (profilesJson == nullptr) {
+        error = "Target-set library JSON must contain a profiles array.";
+        return false;
+    }
+
+    outProfiles.clear();
+    for (const nlohmann::json& item : *profilesJson) {
+        if (!item.is_object()) {
+            continue;
+        }
+        EditorNativeTextureTargetSetLibraryProfile profile;
+        profile.name = item.value("name", std::string{});
+        profile.bc7SrgbSampled = item.value("bc7SrgbSampled", profile.bc7SrgbSampled);
+        profile.bc7UnormSampled = item.value("bc7UnormSampled", profile.bc7UnormSampled);
+        profile.bc5UnormSampled = item.value("bc5UnormSampled", profile.bc5UnormSampled);
+        profile.bc4UnormSampled = item.value("bc4UnormSampled", profile.bc4UnormSampled);
+        profile.rgba8SrgbSampled = item.value("rgba8SrgbSampled", profile.rgba8SrgbSampled);
+        profile.rgba8UnormSampled = item.value("rgba8UnormSampled", profile.rgba8UnormSampled);
+        profile.rgba16fSampled = item.value("rgba16fSampled", profile.rgba16fSampled);
+        outProfiles.push_back(std::move(profile));
+    }
+    return true;
+}
 
 template <size_t N>
 void copyTextToBuffer(std::array<char, N>& buffer, const std::string& value) {
@@ -117,6 +222,195 @@ int ceilDividePositive(int value, int divisor) {
     return (value + divisor - 1) / divisor;
 }
 
+float byteProgress(uint64_t complete, uint64_t total) {
+    if (total == 0) {
+        return 1.0f;
+    }
+    return std::clamp(static_cast<float>(static_cast<double>(complete) / static_cast<double>(total)), 0.0f, 1.0f);
+}
+
+double bytesToMiB(uint64_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+void drawGpuUploadTicketTable(const std::vector<GpuUploadTicketSnapshot>& tickets) {
+    if (tickets.empty()) {
+        ImGui::TextDisabled("No upload ticket snapshots.");
+        return;
+    }
+    if (ImGui::BeginTable("GpuUploadTicketSnapshots", 7, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 52.0f);
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Submitted", ImGuiTableColumnFlags_WidthFixed, 88.0f);
+        ImGui::TableSetupColumn("Retained", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (const GpuUploadTicketSnapshot& ticket : tickets) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(ticket.id));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(gpuUploadResourceKindName(ticket.kind));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(gpuUploadTicketStateName(ticket.state));
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(ticket.id));
+            ImGui::ProgressBar(byteProgress(ticket.completedBytes, ticket.totalBytes), ImVec2(-1.0f, 0.0f));
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f / %.1f MB", bytesToMiB(ticket.submittedBytes), bytesToMiB(ticket.totalBytes));
+            ImGui::TableNextColumn();
+            ImGui::Text("%.1f MB", bytesToMiB(ticket.retainedStagingBytes));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ticket.label.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
+void drawMainThreadApplyTicketTable(const std::vector<MainThreadApplyTicketSnapshot>& tickets) {
+    if (tickets.empty()) {
+        ImGui::TextDisabled("No main-thread apply ticket snapshots.");
+        return;
+    }
+    if (ImGui::BeginTable("MainThreadApplyTicketSnapshots", 7, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 52.0f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 96.0f);
+        ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Applied", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        ImGui::TableSetupColumn("Locks", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+        ImGui::TableSetupColumn("Undo", ImGuiTableColumnFlags_WidthFixed, 96.0f);
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (const MainThreadApplyTicketSnapshot& ticket : tickets) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(ticket.id));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(mainThreadApplyTicketStateName(ticket.state));
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(ticket.id));
+            ImGui::ProgressBar(std::clamp(ticket.progress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu / %llu", static_cast<unsigned long long>(ticket.appliedOperations), static_cast<unsigned long long>(ticket.operationCount));
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(ticket.lockedEntities.size()));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ticket.undoSnapshotCommitted ? "committed" : (ticket.undoSnapshotOpen ? "open" : "pending"));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ticket.label.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
+void drawTopologyRebuildTicketTable(const std::vector<TopologyRebuildTicketSnapshot>& tickets) {
+    if (tickets.empty()) {
+        ImGui::TextDisabled("No topology rebuild ticket snapshots.");
+        return;
+    }
+    if (ImGui::BeginTable("TopologyRebuildTicketSnapshots", 8, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 52.0f);
+        ImGui::TableSetupColumn("Gen", ImGuiTableColumnFlags_WidthFixed, 52.0f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+        ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Stages", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        ImGui::TableSetupColumn("Swapped", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        ImGui::TableSetupColumn("Retired", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (const TopologyRebuildTicketSnapshot& ticket : tickets) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(ticket.id));
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(ticket.generation));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(topologyRebuildTicketStateName(ticket.state));
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(ticket.id));
+            ImGui::ProgressBar(std::clamp(ticket.progress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
+            ImGui::PopID();
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu / %llu", static_cast<unsigned long long>(ticket.completedStages), static_cast<unsigned long long>(ticket.stageCount));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ticket.finalRendererSwapped ? "yes" : "no");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ticket.oldRendererRetired ? "yes" : (ticket.oldRendererRetained ? "waiting" : "no"));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ticket.label.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
+void drawMountedNativePackageWatchTable(
+    const std::vector<EditorMountedNativePackageWatchSnapshot>& watches,
+    EditorRequests& requests) {
+    if (watches.empty()) {
+        ImGui::TextDisabled("No mounted native packages are being watched.");
+        return;
+    }
+    if (ImGui::BeginTable("MountedNativePackageWatchSnapshots", 6, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Package", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Gen", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+        ImGui::TableSetupColumn("Assets", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Report", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 176.0f);
+        ImGui::TableHeadersRow();
+        for (const EditorMountedNativePackageWatchSnapshot& watch : watches) {
+            ImGui::TableNextRow();
+            ImGui::PushID(watch.packagePath.string().c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextWrapped("%s", watch.packagePath.string().c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%llu", static_cast<unsigned long long>(watch.generation));
+            ImGui::TableNextColumn();
+            ImGui::Text(
+                "T%u M%u Mesh%u",
+                watch.textureCount,
+                watch.materialCount,
+                watch.meshCount);
+            ImGui::TableNextColumn();
+            if (watch.changeDetected) {
+                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.25f, 1.0f), "Changed");
+            } else {
+                ImGui::TextUnformatted("Current");
+            }
+            ImGui::TableNextColumn();
+            if (!watch.detectionReportPath.empty()) {
+                ImGui::TextWrapped("%s", watch.detectionReportPath.string().c_str());
+            } else {
+                ImGui::TextDisabled("No change report");
+            }
+            ImGui::TableNextColumn();
+            bool drewAction = false;
+            if (watch.changeDetected) {
+                if (ImGui::SmallButton("Refresh Package")) {
+                    EditorNativePackageRefreshRequest refresh;
+                    refresh.packagePath = watch.packagePath;
+                    requests.refreshNativePackage = std::move(refresh);
+                }
+                drewAction = true;
+            }
+            if (!watch.detectionReportPath.empty()) {
+                if (drewAction) {
+                    ImGui::SameLine();
+                }
+                if (ImGui::SmallButton("Open Report")) {
+                    requests.openFilePath = watch.detectionReportPath;
+                }
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
 std::string lowerExtension(const std::filesystem::path& path) {
     std::string ext = path.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
@@ -127,7 +421,14 @@ std::string lowerExtension(const std::filesystem::path& path) {
 
 bool isDroppedModelSource(const std::filesystem::path& path) {
     const std::string ext = lowerExtension(path);
-    return ext == ".gltf" || ext == ".glb" || ext == ".obj";
+    if (ext == ".gltf" || ext == ".glb" || ext == ".obj") {
+        return true;
+    }
+#if RTV_ENABLE_ASSIMP_IMPORTER && RTV_ASSIMP_IMPORTER_AVAILABLE
+    return ext == ".fbx";
+#else
+    return false;
+#endif
 }
 
 bool isDroppedTextureSource(const std::filesystem::path& path) {
@@ -164,7 +465,14 @@ bool isDroppedLevelSource(const std::filesystem::path& path) {
 }
 
 bool isDroppedAssetImportSource(const std::filesystem::path& path) {
-    return isDroppedModelSource(path) || isDroppedEnvironmentSource(path) || isDroppedTextureSource(path) || isDroppedCompressedTextureSource(path);
+    if (isDroppedModelSource(path) || isDroppedEnvironmentSource(path) || isDroppedTextureSource(path) || isDroppedCompressedTextureSource(path)) {
+        return true;
+    }
+#if RTV_ENABLE_OPENUSD_IMPORTER && RTV_OPENUSD_IMPORTER_AVAILABLE
+    return isDroppedUsdSource(path);
+#else
+    return false;
+#endif
 }
 
 std::filesystem::path importDestinationForDroppedFile(const EditorRuntimeState& state) {
@@ -431,18 +739,31 @@ void drawDroppedFileActionPopup(const EditorRuntimeState& state, EditorRequests&
             requests.mergeScene = droppedPath;
             consume();
         }
-        editorGlyphMenuItem(EditorGlyphIcon::Group, "Add As Sublevel", false);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-            ImGui::SetTooltip("Level instances and sublevels are not implemented yet");
+        if (editorGlyphMenuItem(EditorGlyphIcon::Group, "Add As Sublevel")) {
+            requests.mergeScene = droppedPath;
+            consume();
         }
     } else if (isDroppedFbxSource(droppedPath)) {
         ImGui::TextDisabled("FBX import is not implemented in this build.");
         disabledDroppedFileAction(EditorGlyphIcon::Import, "Import Asset", "FBX mesh/material/skeleton import is tracked as future asset-pipeline work.");
         disabledDroppedFileAction(EditorGlyphIcon::Add, "Import and Place", "FBX cannot be placed until FBX import and runtime mesh cooking are implemented.");
     } else if (isDroppedUsdSource(droppedPath)) {
+#if RTV_ENABLE_OPENUSD_IMPORTER && RTV_OPENUSD_IMPORTER_AVAILABLE
+        ImGui::TextDisabled("USD/USDZ metadata, native mesh/material cook, shader factors, shader texture bindings, USDZ packaged texture cook, cooked-mesh hierarchy placement, and camera/light hierarchy placement are available; runtime parity is not complete in this build.");
+        if (editorGlyphMenuItem(EditorGlyphIcon::Import, "Import Asset")) {
+            requests.importAsset = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state)};
+            consume();
+        }
+        if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Import and Place")) {
+            requests.importAndPlace = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state), .mode = "ImportAndPlace"};
+            consume();
+        }
+        ImGui::TextDisabled("Import and Place adds cooked USD meshes plus USD cameras/lights into authored hierarchy entities. Full USD runtime/package parity remains future work.");
+#else
         ImGui::TextDisabled("USD/USDZ import is not implemented in this build.");
-        disabledDroppedFileAction(EditorGlyphIcon::Import, "Import Asset", "USD stage import is tracked as future asset-pipeline work.");
+        disabledDroppedFileAction(EditorGlyphIcon::Import, "Import Asset", "Enable RTV_ENABLE_OPENUSD_IMPORTER with OpenUSD installed before USD stage import work can run.");
         disabledDroppedFileAction(EditorGlyphIcon::Add, "Import and Place", "USD files cannot be placed until USD import and runtime payload cooking are implemented.");
+#endif
     } else {
         ImGui::TextDisabled("Unsupported dropped file type");
     }
@@ -939,6 +1260,131 @@ std::filesystem::path projectRuntimeSystemsReadinessReportPath(const ProjectCont
     return root / "Reports" / "project_runtime_systems_readiness.json";
 }
 
+std::string projectCookPackageBaseName(const ProjectContext& project) {
+    std::string name = project.name.empty() ? project.projectFile.stem().string() : project.name;
+    for (char& ch : name) {
+        const unsigned char value = static_cast<unsigned char>(ch);
+        if (!std::isalnum(value) && ch != '_' && ch != '-') {
+            ch = '_';
+        }
+    }
+    return name.empty() ? std::string("Project") : name;
+}
+
+std::filesystem::path projectPackageReportPath(const ProjectContext& project) {
+    const std::filesystem::path root = project.savedRoot.empty() ? project.projectRoot / "Saved" : project.savedRoot;
+    return root / "Reports" / "project_native_package_readiness.json";
+}
+
+std::filesystem::path projectCookPackagePath(const ProjectContext& project, const std::filesystem::path& outputDir) {
+    return outputDir / (projectCookPackageBaseName(project) + ".rtpkg");
+}
+
+std::filesystem::path projectCookPackageInspectionPath(const ProjectContext& project, const std::filesystem::path& outputDir) {
+    return outputDir / (projectCookPackageBaseName(project) + ".rtpkg.inspection.json");
+}
+
+bool pathExists(const std::filesystem::path& path) {
+    std::error_code ec;
+    return !path.empty() && std::filesystem::exists(path, ec);
+}
+
+nlohmann::json buildProjectNativePackageReadinessReport(const ProjectManagerRuntimeState& state) {
+    const ProjectContext* project = state.project;
+    const std::filesystem::path outputDir = !state.completedCookProjectOutputDir.empty()
+        ? state.completedCookProjectOutputDir
+        : (project != nullptr ? project->buildRoot / "Cooked" : std::filesystem::path{});
+    const std::filesystem::path packagePath = project != nullptr ? projectCookPackagePath(*project, outputDir) : std::filesystem::path{};
+    const std::filesystem::path packageInspectionPath = project != nullptr ? projectCookPackageInspectionPath(*project, outputDir) : std::filesystem::path{};
+    const bool packageExists = pathExists(packagePath);
+    const bool packageInspectionExists = pathExists(packageInspectionPath);
+    const bool manifestExists = pathExists(state.completedCookProjectManifestPath);
+    const bool validationReportExists = pathExists(state.completedCookProjectValidationReportPath);
+    const bool logExists = pathExists(state.completedCookProjectLogPath);
+
+    nlohmann::json packageInspection = nlohmann::json::object();
+    if (packageExists) {
+        RtpkgReader reader;
+        packageInspection = rtpkgInspectionToJson(reader.inspect(packagePath, true), packagePath);
+    }
+
+    const nlohmann::json packageSummary = packageInspection.value("package", nlohmann::json::object());
+    const bool packageReadable = packageExists && packageInspection.value("ok", false);
+    return {
+        {"schema", "ProjectNativePackageReadinessV1"},
+        {"inspectionSource", "ProjectManager"},
+        {"project", {
+            {"name", project != nullptr ? project->name : std::string{}},
+            {"projectFile", project != nullptr ? project->projectFile.generic_string() : std::string{}},
+            {"buildRoot", project != nullptr ? project->buildRoot.generic_string() : std::string{}},
+            {"cookOutputDir", outputDir.generic_string()},
+        }},
+        {"lastCook", {
+            {"serial", state.completedCookProjectSerial},
+            {"success", state.completedCookProjectSuccess},
+            {"status", state.completedCookProjectStatus},
+            {"exitCode", state.completedCookProjectExitCode},
+            {"manifestPath", state.completedCookProjectManifestPath.generic_string()},
+            {"validationReportPath", state.completedCookProjectValidationReportPath.generic_string()},
+            {"logPath", state.completedCookProjectLogPath.generic_string()},
+            {"manifestExists", manifestExists},
+            {"validationReportExists", validationReportExists},
+            {"logExists", logExists},
+        }},
+        {"nativePackage", {
+            {"expectedPackagePath", packagePath.generic_string()},
+            {"expectedInspectionPath", packageInspectionPath.generic_string()},
+            {"packageExists", packageExists},
+            {"packageInspectionExists", packageInspectionExists},
+            {"packageReadable", packageReadable},
+            {"packageObjectCount", packageSummary.value("asset_count", 0)},
+            {"packageDependencyCount", packageSummary.value("dependency_table_count", 0)},
+            {"objectTableValid", packageSummary.value("object_table_valid", false)},
+            {"chunkTableValid", packageSummary.value("chunk_table_valid", false)},
+            {"packageInspection", packageInspection},
+        }},
+        {"currentEditorSupport", {
+            {"projectCookPackageEmissionImplemented", true},
+            {"projectManagerOpenPackageArtifactImplemented", true},
+            {"projectManagerInspectPackageArtifactImplemented", true},
+            {"automaticStartupPackageMountingImplemented", false},
+            {"rendererResourcePlacementFromPackageImplemented", false},
+            {"mutatingPackageActionsImplemented", false},
+        }},
+        {"followUpActions", nlohmann::json::array({"Open Package", "Open Package Inspection", "Inspect Package", "Mount Package", "Migrate Package", "Rebuild Package"})},
+        {"policy", {
+            {"description", "This Project Manager report is read-only and checks deterministic cook package artifacts plus the .rtpkg object/chunk/dependency inspection state."},
+            {"mutationExecuted", false},
+            {"mutatingActionsAvailable", false},
+            {"remainingMutatingWork", nlohmann::json::array({"project-manager-mount-package", "project-manager-migrate-package", "project-manager-migrate-native-asset", "project-manager-rebuild-package"})},
+        }},
+    };
+}
+
+bool writeProjectNativePackageReadinessReport(
+    const ProjectManagerRuntimeState& state,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    if (state.project == nullptr) {
+        outError = "Project context is unavailable.";
+        return false;
+    }
+    outPath = projectPackageReportPath(*state.project);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create project package report folder: " + ec.message();
+        return false;
+    }
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write project package report: " + outPath.string();
+        return false;
+    }
+    file << buildProjectNativePackageReadinessReport(state).dump(2);
+    return true;
+}
+
 nlohmann::json buildProjectRuntimeSystemsReadinessReport(const ProjectManagerRuntimeState& state) {
     const ProjectContext* project = state.project;
     const std::string scenePath = state.scenePath != nullptr && state.scenePath->has_value()
@@ -988,6 +1434,23 @@ nlohmann::json buildProjectRuntimeSystemsReadinessReport(const ProjectManagerRun
             {"vfxImplemented", false},
             {"navigationImplemented", false},
             {"aiImplemented", false},
+        }},
+        {"openProductionScope", {
+            {"currentReportScope", "read-only-project-inventory"},
+            {"runtimeWorldModes", nlohmann::json::array({"play-in-editor", "simulate-mode"})},
+            {"runtimeEditorStateSeparationRequired", true},
+            {"gameplayAuthoringSystems", nlohmann::json::array({
+                "gameplay-scripting",
+                "runtime-input-rebinding",
+                "save-game-runtime-persistence",
+                "production-runtime-component-lifecycle"
+            })},
+            {"runtimeSimulationSystems", nlohmann::json::array({
+                "physics-collision-character-controller",
+                "terrain-foliage-instancing",
+                "audio-in-game-ui-vfx-navigation-ai"
+            })},
+            {"requiresDedicatedRuntimeSmoke", true},
         }},
         {"recommendedNextMilestones", nlohmann::json::array({
             "Define Play-In-Editor world duplication and renderer handoff contract.",
@@ -1139,6 +1602,21 @@ nlohmann::json buildRenderCinematicReadinessReport(
             {"renderQueuePresetLibraryImplemented", false},
             {"renderQueueBatchPresetsImplemented", false},
             {"highResolutionTiledOutputImplemented", false},
+        }},
+        {"openProductionScope", {
+            {"currentReportScope", "read-only-render-cinematic-inventory"},
+            {"rendererFeatureGaps", nlohmann::json::array({
+                "dedicated-volumetric-cloud-renderer",
+                "bloom-vignette-film-grain-runtime-post-effects",
+                "decals-lod-visibility-culling-tools",
+                "reflection-light-probe-workflows"
+            })},
+            {"cinematicWorkflowGaps", nlohmann::json::array({
+                "camera-rails-shot-tracks",
+                "render-queue-batch-presets",
+                "high-resolution-tiled-output"
+            })},
+            {"requiresSequenceAndTiledOutputSmoke", true},
         }},
         {"recommendedNextMilestones", nlohmann::json::array({
             "Define cinematic camera rail and shot-track scene data before adding UI editors.",
@@ -1421,6 +1899,26 @@ bool writeProjectSourceControlActionPlanReport(
         {"plannedCommands", plannedCommands},
         {"blockers", blockers},
         {"warnings", warnings},
+        {"openProductionScope", {
+            {"currentReportScope", "project-manager-source-control-action-plan"},
+            {"implementedScope", nlohmann::json::array({
+                "dry-run-git-revert-plan",
+                "dry-run-git-checkout-plan",
+                "dry-run-git-submit-plan",
+                "provider-gap-reporting",
+                "external-user-confirmation-policy"
+            })},
+            {"openProviderScope", nlohmann::json::array({
+                "editor-executed-revert-checkout-submit",
+                "provider-lock-ownership-enforcement",
+                "perforce-provider-actions",
+                "provider-conflict-resolution"
+            })},
+            {"dryRunOnly", true},
+            {"editorExecutedMutationsImplemented", false},
+            {"providerBackedMutationsImplemented", false},
+            {"perforceProviderActionsImplemented", false},
+        }},
         {"policy", {
             {"description", "This report is a dry-run Project Manager source-control action plan. It records intended commands and provider gaps without mutating the repository."},
             {"requiresUserConfirmationOutsideEditor", true},
@@ -1527,7 +2025,32 @@ bool writeProjectSourceControlProviderReadinessReport(
             {"currentOwner", "unknown"},
             {"currentLockState", (p4Detected || lfsLockInfoAvailable) ? "provider-output-needs-parser" : "unknown-no-provider-lock-state"},
             {"conflictHandlingImplemented", false},
-            {"safeExternalReloadPromptImplemented", false},
+            {"safeExternalReloadPromptImplemented", true},
+            {"safeExternalReloadPromptScope", "selected-action-confirmation-prompts"},
+            {"selectedActionExternalChangePromptImplemented", true},
+            {"selectedActionExternalChangePromptScope", "reimport-repair-rebuild-confirmation-prompts"},
+            {"automaticExternalChangeReloadPromptImplemented", false},
+        }},
+        {"openProductionScope", {
+            {"currentReportScope", "project-manager-source-control-provider-readiness"},
+            {"implementedScope", nlohmann::json::array({
+                "git-status",
+                "git-diff",
+                "git-action-plan",
+                "provider-readiness-report",
+                "selected-action-external-change-confirmation-prompts"
+            })},
+            {"openProviderScope", nlohmann::json::array({
+                "editor-executed-revert-checkout-submit",
+                "provider-lock-ownership-enforcement",
+                "perforce-provider-mutations",
+                "provider-conflict-resolution",
+                "automatic-external-change-reload-prompt"
+            })},
+            {"providerBackedMutationsImplemented", false},
+            {"perforceProviderMutationsImplemented", false},
+            {"assetLockOwnershipEnforcementImplemented", false},
+            {"automaticExternalChangeReloadPromptImplemented", false},
         }},
         {"policy", {
             {"description", "This report inspects Project Manager source-control provider readiness without mutating the repository."},
@@ -3051,6 +3574,202 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
         ImGui::SeparatorText("Build / Cook");
         const std::filesystem::path cookOutputDir = state.project->buildRoot / "Cooked";
         ImGui::TextWrapped("Transparent cook output: %s", cookOutputDir.string().c_str());
+        if (!cookNativeTextureTargetSetNameBufferInitialized_) {
+            if (editorPrefs_.cookNativeTextureTargetSetName.empty()) {
+                editorPrefs_.cookNativeTextureTargetSetName = "editor-custom-target-set";
+            }
+            copyTextToBuffer(cookNativeTextureTargetSetNameBuffer_, editorPrefs_.cookNativeTextureTargetSetName);
+            cookNativeTextureTargetSetNameBufferInitialized_ = true;
+        }
+        ImGui::Checkbox("Emit native texture package target sets", &editorPrefs_.cookEmitNativeTextureTargetSets);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Passes selected native texture target profiles to package cook for multi-target texture sidecar emission diagnostics.");
+        }
+        bool cookTargetPrefsChanged = false;
+        if (!editorPrefs_.cookEmitNativeTextureTargetSets) {
+            ImGui::BeginDisabled();
+        }
+        const char* targetSetProfiles[] = {
+            "Active Vulkan + All-BC",
+            "Active Vulkan Only",
+            "All-BC Audit Only",
+            "Active + All-BC + RGBA Fallback",
+            "Custom",
+            "Custom Library",
+        };
+        int nativeTextureTargetSetProfile = std::clamp(editorPrefs_.cookNativeTextureTargetSetProfile, 0, 5);
+        if (ImGui::Combo("Native texture target profile", &nativeTextureTargetSetProfile, targetSetProfiles, IM_ARRAYSIZE(targetSetProfiles))) {
+            editorPrefs_.cookNativeTextureTargetSetProfile = std::clamp(nativeTextureTargetSetProfile, 0, 5);
+            cookTargetPrefsChanged = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Controls which target-set support profiles are passed to --native-package-texture-target-set-json for editor-initiated package cooks.");
+        }
+        const bool editingCustomTargetSet =
+            nativeTextureTargetSetProfile == static_cast<int>(EditorNativeTextureTargetSetProfile::Custom) ||
+            nativeTextureTargetSetProfile == static_cast<int>(EditorNativeTextureTargetSetProfile::CustomLibrary);
+        auto currentCustomTargetSetLibraryProfile = [&]() {
+            EditorNativeTextureTargetSetLibraryProfile profile;
+            profile.name = cookNativeTextureTargetSetNameBuffer_.data();
+            if (profile.name.empty()) {
+                profile.name = "editor-custom-target-set";
+            }
+            profile.bc7SrgbSampled = editorPrefs_.cookNativeTextureTargetSetBc7Srgb;
+            profile.bc7UnormSampled = editorPrefs_.cookNativeTextureTargetSetBc7Unorm;
+            profile.bc5UnormSampled = editorPrefs_.cookNativeTextureTargetSetBc5;
+            profile.bc4UnormSampled = editorPrefs_.cookNativeTextureTargetSetBc4;
+            profile.rgba8SrgbSampled = editorPrefs_.cookNativeTextureTargetSetRgba8Srgb;
+            profile.rgba8UnormSampled = editorPrefs_.cookNativeTextureTargetSetRgba8Unorm;
+            profile.rgba16fSampled = editorPrefs_.cookNativeTextureTargetSetRgba16f;
+            return profile;
+        };
+        auto loadCustomTargetSetLibraryProfile = [&](const EditorNativeTextureTargetSetLibraryProfile& profile) {
+            editorPrefs_.cookNativeTextureTargetSetName = profile.name.empty() ? std::string("editor-custom-target-set") : profile.name;
+            copyTextToBuffer(cookNativeTextureTargetSetNameBuffer_, editorPrefs_.cookNativeTextureTargetSetName);
+            editorPrefs_.cookNativeTextureTargetSetBc7Srgb = profile.bc7SrgbSampled;
+            editorPrefs_.cookNativeTextureTargetSetBc7Unorm = profile.bc7UnormSampled;
+            editorPrefs_.cookNativeTextureTargetSetBc5 = profile.bc5UnormSampled;
+            editorPrefs_.cookNativeTextureTargetSetBc4 = profile.bc4UnormSampled;
+            editorPrefs_.cookNativeTextureTargetSetRgba8Srgb = profile.rgba8SrgbSampled;
+            editorPrefs_.cookNativeTextureTargetSetRgba8Unorm = profile.rgba8UnormSampled;
+            editorPrefs_.cookNativeTextureTargetSetRgba16f = profile.rgba16fSampled;
+        };
+        if (editingCustomTargetSet) {
+            if (ImGui::InputText("Custom target name", cookNativeTextureTargetSetNameBuffer_.data(), cookNativeTextureTargetSetNameBuffer_.size())) {
+                editorPrefs_.cookNativeTextureTargetSetName = cookNativeTextureTargetSetNameBuffer_.data();
+                cookTargetPrefsChanged = true;
+            }
+            cookTargetPrefsChanged |= ImGui::Checkbox("Custom BC7 sRGB", &editorPrefs_.cookNativeTextureTargetSetBc7Srgb);
+            ImGui::SameLine();
+            cookTargetPrefsChanged |= ImGui::Checkbox("Custom BC7 UNORM", &editorPrefs_.cookNativeTextureTargetSetBc7Unorm);
+            cookTargetPrefsChanged |= ImGui::Checkbox("Custom BC5", &editorPrefs_.cookNativeTextureTargetSetBc5);
+            ImGui::SameLine();
+            cookTargetPrefsChanged |= ImGui::Checkbox("Custom BC4", &editorPrefs_.cookNativeTextureTargetSetBc4);
+            cookTargetPrefsChanged |= ImGui::Checkbox("Custom RGBA8 sRGB", &editorPrefs_.cookNativeTextureTargetSetRgba8Srgb);
+            ImGui::SameLine();
+            cookTargetPrefsChanged |= ImGui::Checkbox("Custom RGBA8 UNORM", &editorPrefs_.cookNativeTextureTargetSetRgba8Unorm);
+            cookTargetPrefsChanged |= ImGui::Checkbox("Custom RGBA16F", &editorPrefs_.cookNativeTextureTargetSetRgba16f);
+            ImGui::SeparatorText("Saved Custom Target Sets");
+            if (editorPrefs_.cookNativeTextureTargetSetLibrary.empty()) {
+                ImGui::TextDisabled("No saved custom target sets.");
+            } else {
+                cookNativeTextureTargetSetLibrarySelection_ = std::clamp(
+                    cookNativeTextureTargetSetLibrarySelection_,
+                    0,
+                    static_cast<int>(editorPrefs_.cookNativeTextureTargetSetLibrary.size()) - 1);
+                const std::string selectedName = editorPrefs_.cookNativeTextureTargetSetLibrary[static_cast<size_t>(cookNativeTextureTargetSetLibrarySelection_)].name;
+                if (ImGui::BeginCombo("Saved target set", selectedName.c_str())) {
+                    for (size_t i = 0; i < editorPrefs_.cookNativeTextureTargetSetLibrary.size(); ++i) {
+                        const bool selected = static_cast<int>(i) == cookNativeTextureTargetSetLibrarySelection_;
+                        if (ImGui::Selectable(editorPrefs_.cookNativeTextureTargetSetLibrary[i].name.c_str(), selected)) {
+                            cookNativeTextureTargetSetLibrarySelection_ = static_cast<int>(i);
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+            if (ImGui::SmallButton("Save Target Set")) {
+                EditorNativeTextureTargetSetLibraryProfile profile = currentCustomTargetSetLibraryProfile();
+                auto existing = std::find_if(
+                    editorPrefs_.cookNativeTextureTargetSetLibrary.begin(),
+                    editorPrefs_.cookNativeTextureTargetSetLibrary.end(),
+                    [&](const EditorNativeTextureTargetSetLibraryProfile& candidate) { return candidate.name == profile.name; });
+                if (existing == editorPrefs_.cookNativeTextureTargetSetLibrary.end()) {
+                    editorPrefs_.cookNativeTextureTargetSetLibrary.push_back(std::move(profile));
+                    cookNativeTextureTargetSetLibrarySelection_ = static_cast<int>(editorPrefs_.cookNativeTextureTargetSetLibrary.size()) - 1;
+                } else {
+                    *existing = std::move(profile);
+                    cookNativeTextureTargetSetLibrarySelection_ = static_cast<int>(std::distance(editorPrefs_.cookNativeTextureTargetSetLibrary.begin(), existing));
+                }
+                saveEditorPreferences();
+            }
+            if (!editorPrefs_.cookNativeTextureTargetSetLibrary.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Load Target Set")) {
+                    const int selected = std::clamp(
+                        cookNativeTextureTargetSetLibrarySelection_,
+                        0,
+                        static_cast<int>(editorPrefs_.cookNativeTextureTargetSetLibrary.size()) - 1);
+                    loadCustomTargetSetLibraryProfile(editorPrefs_.cookNativeTextureTargetSetLibrary[static_cast<size_t>(selected)]);
+                    cookNativeTextureTargetSetLibrarySelection_ = selected;
+                    saveEditorPreferences();
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove Target Set")) {
+                    const int selected = std::clamp(
+                        cookNativeTextureTargetSetLibrarySelection_,
+                        0,
+                        static_cast<int>(editorPrefs_.cookNativeTextureTargetSetLibrary.size()) - 1);
+                    editorPrefs_.cookNativeTextureTargetSetLibrary.erase(editorPrefs_.cookNativeTextureTargetSetLibrary.begin() + selected);
+                    cookNativeTextureTargetSetLibrarySelection_ = editorPrefs_.cookNativeTextureTargetSetLibrary.empty()
+                        ? -1
+                        : std::min(selected, static_cast<int>(editorPrefs_.cookNativeTextureTargetSetLibrary.size()) - 1);
+                    saveEditorPreferences();
+                }
+            }
+            if (!editorPrefs_.cookNativeTextureTargetSetLibrary.empty()) {
+                if (ImGui::SmallButton("Export Target Sets")) {
+                    if (const auto path = saveNativeTextureTargetSetLibraryDialog()) {
+                        std::string error;
+                        if (writeNativeTextureTargetSetLibraryFile(*path, editorPrefs_.cookNativeTextureTargetSetLibrary, error)) {
+                            requests.openFilePath = *path;
+                            log_.add(EditorLogCategory::Project, "Exported native texture target-set library: " + path->string());
+                        } else {
+                            log_.add(EditorLogCategory::Warning, "Target-set library export failed: " + error);
+                        }
+                    }
+                }
+                ImGui::SameLine();
+            }
+            if (ImGui::SmallButton("Import Target Sets")) {
+                if (const auto path = openNativeTextureTargetSetLibraryDialog()) {
+                    std::vector<EditorNativeTextureTargetSetLibraryProfile> importedProfiles;
+                    std::string error;
+                    if (importNativeTextureTargetSetLibraryFile(*path, importedProfiles, error)) {
+                        size_t importedCount = 0;
+                        for (EditorNativeTextureTargetSetLibraryProfile& profile : importedProfiles) {
+                            if (profile.name.empty()) {
+                                continue;
+                            }
+                            auto existing = std::find_if(
+                                editorPrefs_.cookNativeTextureTargetSetLibrary.begin(),
+                                editorPrefs_.cookNativeTextureTargetSetLibrary.end(),
+                                [&](const EditorNativeTextureTargetSetLibraryProfile& candidate) { return candidate.name == profile.name; });
+                            if (existing == editorPrefs_.cookNativeTextureTargetSetLibrary.end()) {
+                                editorPrefs_.cookNativeTextureTargetSetLibrary.push_back(std::move(profile));
+                            } else {
+                                *existing = std::move(profile);
+                            }
+                            ++importedCount;
+                        }
+                        if (!editorPrefs_.cookNativeTextureTargetSetLibrary.empty()) {
+                            cookNativeTextureTargetSetLibrarySelection_ = std::clamp(
+                                cookNativeTextureTargetSetLibrarySelection_,
+                                0,
+                                static_cast<int>(editorPrefs_.cookNativeTextureTargetSetLibrary.size()) - 1);
+                        }
+                        saveEditorPreferences();
+                        log_.add(EditorLogCategory::Project,
+                            "Imported native texture target-set library: " + path->string() +
+                            " profiles=" + std::to_string(importedCount));
+                    } else {
+                        log_.add(EditorLogCategory::Warning, "Target-set library import failed: " + error);
+                    }
+                }
+            }
+            if (nativeTextureTargetSetProfile == static_cast<int>(EditorNativeTextureTargetSetProfile::CustomLibrary)) {
+                ImGui::TextDisabled("Custom Library cooks every saved custom target set. If empty, the current custom target set is used.");
+            }
+        }
+        if (cookTargetPrefsChanged) {
+            saveEditorPreferences();
+        }
+        if (!editorPrefs_.cookEmitNativeTextureTargetSets) {
+            ImGui::EndDisabled();
+        }
         const bool registryDirty = state.assetRegistry != nullptr && state.assetRegistry->dirty();
         std::vector<std::string> cookPreflightItems;
         if (state.sceneDirty) {
@@ -3091,7 +3810,20 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
             ImGui::BeginDisabled();
         }
         if (editorIconTextButton("CookProjectTransparent", EditorGlyphIcon::Refresh, "Cook Project")) {
-            requests.cookProject = EditorCookProjectRequest{state.project->projectFile, cookOutputDir};
+            EditorCookProjectRequest cookRequest{state.project->projectFile, cookOutputDir, editorPrefs_.cookEmitNativeTextureTargetSets};
+            cookRequest.nativeTextureTargetSetProfile = static_cast<EditorNativeTextureTargetSetProfile>(
+                std::clamp(editorPrefs_.cookNativeTextureTargetSetProfile, 0, 5));
+            editorPrefs_.cookNativeTextureTargetSetName = cookNativeTextureTargetSetNameBuffer_.data();
+            cookRequest.customNativeTextureTargetSet.platformName = editorPrefs_.cookNativeTextureTargetSetName;
+            cookRequest.customNativeTextureTargetSet.bc7SrgbSampled = editorPrefs_.cookNativeTextureTargetSetBc7Srgb;
+            cookRequest.customNativeTextureTargetSet.bc7UnormSampled = editorPrefs_.cookNativeTextureTargetSetBc7Unorm;
+            cookRequest.customNativeTextureTargetSet.bc5UnormSampled = editorPrefs_.cookNativeTextureTargetSetBc5;
+            cookRequest.customNativeTextureTargetSet.bc4UnormSampled = editorPrefs_.cookNativeTextureTargetSetBc4;
+            cookRequest.customNativeTextureTargetSet.rgba8SrgbSampled = editorPrefs_.cookNativeTextureTargetSetRgba8Srgb;
+            cookRequest.customNativeTextureTargetSet.rgba8UnormSampled = editorPrefs_.cookNativeTextureTargetSetRgba8Unorm;
+            cookRequest.customNativeTextureTargetSet.rgba16fSampled = editorPrefs_.cookNativeTextureTargetSetRgba16f;
+            cookRequest.customNativeTextureTargetSetLibrary = editorPrefs_.cookNativeTextureTargetSetLibrary;
+            requests.cookProject = std::move(cookRequest);
             visibility_.jobCenter = true;
         }
         if (!canCookProject) {
@@ -3144,6 +3876,8 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
             const std::filesystem::path lastOutputDir = state.completedCookProjectOutputDir.empty()
                 ? cookOutputDir
                 : state.completedCookProjectOutputDir;
+            const std::filesystem::path lastPackagePath = projectCookPackagePath(*state.project, lastOutputDir);
+            const std::filesystem::path lastPackageInspectionPath = projectCookPackageInspectionPath(*state.project, lastOutputDir);
             const bool canOpenLastOutput = !lastOutputDir.empty() && std::filesystem::exists(lastOutputDir);
             if (!canOpenLastOutput) {
                 ImGui::BeginDisabled();
@@ -3158,8 +3892,21 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
             drawLastCookFileButton("Open Manifest", state.completedCookProjectManifestPath);
             drawLastCookFileButton("Open Report", state.completedCookProjectValidationReportPath);
             drawLastCookFileButton("Open Log", state.completedCookProjectLogPath);
+            drawLastCookFileButton("Open Package", lastPackagePath);
+            drawLastCookFileButton("Open Package Inspection", lastPackageInspectionPath);
+            if (drewLastCookAction) {
+                ImGui::SameLine();
+            }
+            if (ImGui::SmallButton("Inspect Package")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeProjectNativePackageReadinessReport(state, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                }
+            }
+            drewLastCookAction = true;
         }
-        ImGui::TextDisabled("Cook writes cook_manifest.json, asset_validation_report.json, and cook_log.txt without creating opaque packages yet.");
+        ImGui::TextDisabled("Cook writes cook_manifest.json, asset_validation_report.json, cook_log.txt, and a native .rtpkg package plus inspection JSON when native payloads are available.");
     }
 
     ImGui::SeparatorText("Workspace");
@@ -3322,9 +4069,13 @@ void EditorLayer::setEditorPreferencesPath(std::filesystem::path path) {
         path = EditorPreferences::defaultPath();
     }
     editorPreferencesPath_ = std::move(path);
+    cookNativeTextureTargetSetNameBufferInitialized_ = false;
 }
 
 bool EditorLayer::saveEditorPreferences() {
+    if (cookNativeTextureTargetSetNameBufferInitialized_) {
+        editorPrefs_.cookNativeTextureTargetSetName = cookNativeTextureTargetSetNameBuffer_.data();
+    }
     const std::filesystem::path path = editorPreferencesPath_.empty()
         ? EditorPreferences::defaultPath()
         : editorPreferencesPath_;
@@ -4426,6 +5177,103 @@ void EditorLayer::updateJobCenterHistory(const EditorRuntimeState& state) {
         }
     }
 
+    const bool nativeFileMigrationRunning = jobs != nullptr && jobs->nativeFileMigrationRunning;
+    auto finishActiveNativeFileMigrationHistory = [&]() {
+        const std::string finalStatus = statusLooksFailed(lastNativeFileMigrationHistoryStatus_)
+            ? lastNativeFileMigrationHistoryStatus_
+            : std::string("Migration completed");
+        if (EditorJobHistoryEntry* entry = findEntry(activeNativeFileMigrationHistoryKey_)) {
+            entry->status = finalStatus;
+            entry->progress = statusLooksFailed(finalStatus) ? lastNativeFileMigrationHistoryProgress_ : 1.0f;
+            entry->active = false;
+            entry->failed = statusLooksFailed(finalStatus);
+            entry->cancelled = statusLooksCancelled(finalStatus);
+            entry->completed = !entry->failed && !entry->cancelled;
+        }
+        observedNativeFileMigrationRunningForHistory_ = false;
+        activeNativeFileMigrationHistorySerial_ = 0;
+        activeNativeFileMigrationHistoryKey_.clear();
+    };
+    if (nativeFileMigrationRunning) {
+        const uint64_t migrationSerial = jobs->nativeFileMigrationJobSerial != 0 ? jobs->nativeFileMigrationJobSerial : nextJobHistoryId_;
+        const std::string migrationKey = "native-file-migration-" + std::to_string(migrationSerial);
+        if (observedNativeFileMigrationRunningForHistory_ && activeNativeFileMigrationHistorySerial_ != 0 && activeNativeFileMigrationHistorySerial_ != migrationSerial) {
+            finishActiveNativeFileMigrationHistory();
+        }
+        if (!observedNativeFileMigrationRunningForHistory_ || activeNativeFileMigrationHistoryKey_.empty()) {
+            activeNativeFileMigrationHistoryKey_ = migrationKey;
+            activeNativeFileMigrationHistorySerial_ = migrationSerial;
+            (void)createEntry(activeNativeFileMigrationHistoryKey_, "Native Migration", jobs->nativeFileMigrationTitle.empty() ? "Native File Migration" : jobs->nativeFileMigrationTitle);
+        }
+        if (EditorJobHistoryEntry* entry = findEntry(activeNativeFileMigrationHistoryKey_)) {
+            entry->serial = migrationSerial;
+            entry->title = jobs->nativeFileMigrationTitle.empty() ? "Native File Migration" : jobs->nativeFileMigrationTitle;
+            entry->kind = "Native Migration";
+            entry->status = jobs->nativeFileMigrationStatus.empty() ? "Migrating native file" : jobs->nativeFileMigrationStatus;
+            entry->sourcePath = jobs->nativeFileMigrationSourcePath;
+            entry->reportPath = jobs->nativeFileMigrationReportPath;
+            entry->progress = std::clamp(jobs->nativeFileMigrationProgress, 0.0f, 1.0f);
+            entry->active = true;
+            entry->completed = false;
+            entry->failed = false;
+            entry->cancelled = false;
+            entry->hidden = false;
+            entry->workerTotalMs = jobs->nativeFileMigrationWorkerElapsedMs;
+            if (jobs->nativeFileMigrationDryRun) {
+                entry->warnings = {"Dry-run progress; original file has not been mutated."};
+            }
+        }
+        observedNativeFileMigrationRunningForHistory_ = true;
+        lastNativeFileMigrationHistoryStatus_ = jobs->nativeFileMigrationStatus;
+        lastNativeFileMigrationHistoryProgress_ = std::clamp(jobs->nativeFileMigrationProgress, 0.0f, 1.0f);
+    } else if (observedNativeFileMigrationRunningForHistory_) {
+        finishActiveNativeFileMigrationHistory();
+    }
+
+    if (jobs != nullptr && jobs->completedNativeFileMigrationSerial != 0 &&
+        jobs->completedNativeFileMigrationSerial != observedNativeFileMigrationResultSerial_) {
+        const std::string migrationKey = "native-file-migration-" + std::to_string(jobs->completedNativeFileMigrationSerial);
+        EditorJobHistoryEntry* entry = findEntry(migrationKey);
+        if (entry == nullptr) {
+            entry = &createEntry(
+                migrationKey,
+                "Native Migration",
+                jobs->completedNativeFileMigrationTitle.empty() ? "Native File Migration" : jobs->completedNativeFileMigrationTitle);
+        }
+        entry->serial = jobs->completedNativeFileMigrationSerial;
+        entry->title = jobs->completedNativeFileMigrationTitle.empty() ? "Native File Migration" : jobs->completedNativeFileMigrationTitle;
+        entry->kind = "Native Migration";
+        entry->status = jobs->completedNativeFileMigrationStatus.empty()
+            ? (jobs->completedNativeFileMigrationSuccess ? std::string("Migration completed") : std::string("Migration failed"))
+            : jobs->completedNativeFileMigrationStatus;
+        entry->sourcePath = jobs->completedNativeFileMigrationSourcePath;
+        entry->reportPath = jobs->completedNativeFileMigrationReportPath;
+        entry->backupPath = jobs->completedNativeFileMigrationBackupPath;
+        entry->progress = jobs->completedNativeFileMigrationSuccess ? 1.0f : 0.0f;
+        entry->active = false;
+        entry->completed = jobs->completedNativeFileMigrationSuccess;
+        entry->failed = !jobs->completedNativeFileMigrationSuccess;
+        entry->cancelled = false;
+        entry->hidden = false;
+        entry->errors = jobs->completedNativeFileMigrationErrors;
+        entry->warnings = jobs->completedNativeFileMigrationWarnings;
+        if (jobs->completedNativeFileMigrationDryRun) {
+            entry->warnings.push_back("Dry run only; original file was not mutated.");
+        } else if (jobs->completedNativeFileMigrationMutationAttempted && !jobs->completedNativeFileMigrationMutated) {
+            entry->warnings.push_back("Migration attempted but no file replacement was required.");
+        }
+        if (jobs->completedNativeFileMigrationRequired && !jobs->completedNativeFileMigrationAvailable) {
+            entry->warnings.push_back("Migration is required but no migration path is available.");
+        }
+        entry->workerTotalMs = jobs->completedNativeFileMigrationWorkerTotalMs;
+        observedNativeFileMigrationResultSerial_ = jobs->completedNativeFileMigrationSerial;
+        if (activeNativeFileMigrationHistorySerial_ == jobs->completedNativeFileMigrationSerial) {
+            observedNativeFileMigrationRunningForHistory_ = false;
+            activeNativeFileMigrationHistorySerial_ = 0;
+            activeNativeFileMigrationHistoryKey_.clear();
+        }
+    }
+
     if (state.renderJob != nullptr && state.renderJob->serial != 0) {
         const EditorRenderJobStatus& job = *state.renderJob;
         const std::string key = "render-output-" + std::to_string(job.serial);
@@ -4522,6 +5370,9 @@ void EditorLayer::drawJobHistoryEntry(size_t index, EditorRequests& requests) {
     if (!entry.logPath.empty()) {
         ImGui::TextWrapped("Log: %s", entry.logPath.string().c_str());
     }
+    if (!entry.backupPath.empty()) {
+        ImGui::TextWrapped("Backup: %s", entry.backupPath.string().c_str());
+    }
     if (entry.kind == "Project Cook" && entry.active && entry.cookPlannedFileCount > 0u) {
         const std::string status = entry.cookManifestStatus.empty() ? std::string("copying") : entry.cookManifestStatus;
         ImGui::TextDisabled(
@@ -4544,6 +5395,8 @@ void EditorLayer::drawJobHistoryEntry(size_t index, EditorRequests& requests) {
             entry.importDirectoryMs,
             entry.importInspectMs,
             entry.importWriteMs);
+    } else if (entry.kind == "Native Migration" && entry.workerTotalMs > 0.0) {
+        ImGui::TextDisabled("Worker: %.1f ms total", entry.workerTotalMs);
     } else if (entry.workerTotalMs > 0.0 || entry.workerSceneParseMs > 0.0 || entry.workerGltfLoadMs > 0.0 || entry.workerDocumentBuildMs > 0.0) {
         ImGui::TextDisabled(
             "Worker: %.1f ms total, %.1f ms parse, %.1f ms glTF/cache, %.1f ms document",
@@ -4645,6 +5498,25 @@ void EditorLayer::drawJobHistoryEntry(size_t index, EditorRequests& requests) {
             }
             drewAction = true;
         }
+    } else if (entry.kind == "Native Migration") {
+        if (!entry.sourcePath.empty() && ImGui::SmallButton("Open Source Folder")) {
+            requests.openDirectoryPath = entry.sourcePath.parent_path();
+            drewAction = true;
+        }
+        if (!entry.reportPath.empty()) {
+            if (drewAction) ImGui::SameLine();
+            if (ImGui::SmallButton("Open Report")) {
+                requests.openFilePath = entry.reportPath;
+            }
+            drewAction = true;
+        }
+        if (!entry.backupPath.empty()) {
+            if (drewAction) ImGui::SameLine();
+            if (ImGui::SmallButton("Open Backup")) {
+                requests.openFilePath = entry.backupPath;
+            }
+            drewAction = true;
+        }
     }
     if (!entry.active) {
         if (drewAction) {
@@ -4738,6 +5610,90 @@ void EditorLayer::drawJobCenterPanel(const EditorRuntimeState& state, EditorRequ
         if (ImGui::SmallButton("Open Output")) {
             requests.openOutputFolder = true;
         }
+    }
+
+    if (jobs != nullptr && jobs->frameWorkSchedulerAvailable) {
+        bool schedulerHasActiveJobs = false;
+        for (const FrameWorkQueueSnapshot& queue : jobs->frameWorkScheduler.queues) {
+            schedulerHasActiveJobs = schedulerHasActiveJobs || queue.queued > 0u || queue.running > 0u || queue.waitingForFence > 0u;
+        }
+        hasJob = hasJob || schedulerHasActiveJobs;
+        ImGui::SeparatorText("Frame Work Scheduler");
+        ImGui::TextDisabled(
+            "Budgets: apply %.1f ms, upload %.1f ms / %.1f MB, AS %.1f ms",
+            jobs->frameWorkScheduler.budgets.mainThreadApplyMs,
+            jobs->frameWorkScheduler.budgets.uploadSubmitMs,
+            static_cast<double>(jobs->frameWorkScheduler.budgets.uploadBytes) / (1024.0 * 1024.0),
+            jobs->frameWorkScheduler.budgets.accelerationStructureBuildMs);
+        if (ImGui::BeginTable("FrameWorkSchedulerQueues", 5, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Queue");
+            ImGui::TableSetupColumn("Queued", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+            ImGui::TableSetupColumn("Running", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+            ImGui::TableSetupColumn("Fence", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+            ImGui::TableSetupColumn("Done", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+            ImGui::TableHeadersRow();
+            for (const FrameWorkQueueSnapshot& queue : jobs->frameWorkScheduler.queues) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(queue.name.c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", static_cast<unsigned long long>(queue.queued));
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", static_cast<unsigned long long>(queue.running));
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", static_cast<unsigned long long>(queue.waitingForFence));
+                ImGui::TableNextColumn();
+                ImGui::Text("%llu", static_cast<unsigned long long>(queue.complete));
+            }
+            ImGui::EndTable();
+        }
+        if (schedulerHasActiveJobs) {
+            for (const FrameWorkQueueSnapshot& queue : jobs->frameWorkScheduler.queues) {
+                for (const FrameWorkJobSnapshot& active : queue.activeJobs) {
+                    ImGui::TextWrapped("%s: %s", queue.name.c_str(), active.title.empty() ? active.statusText.c_str() : active.title.c_str());
+                    if (!active.statusText.empty()) {
+                        ImGui::TextDisabled("%s", active.statusText.c_str());
+                    }
+                    ImGui::ProgressBar(std::clamp(active.progress, 0.0f, 1.0f), ImVec2(-1.0f, 0.0f));
+                }
+            }
+        } else {
+            ImGui::TextDisabled("No active scheduler jobs.");
+        }
+        if (!jobs->frameWorkScheduler.recentJobs.empty()) {
+            const FrameWorkJobSnapshot& recent = jobs->frameWorkScheduler.recentJobs.back();
+            ImGui::TextDisabled("Last scheduler job: %s (%s)", recent.title.c_str(), frameWorkJobStatusName(recent.status));
+        }
+    }
+
+    if (jobs != nullptr && jobs->gpuUploadTicketsAvailable) {
+        hasJob = hasJob || !jobs->gpuUploadTickets.empty();
+        ImGui::SeparatorText("GPU Upload Tickets");
+        ImGui::TextDisabled("Next timeline value: %llu", static_cast<unsigned long long>(jobs->gpuUploadNextTimelineValue));
+        drawGpuUploadTicketTable(jobs->gpuUploadTickets);
+    }
+
+    if (jobs != nullptr && jobs->mainThreadApplyTicketsAvailable) {
+        hasJob = hasJob || !jobs->mainThreadApplyTickets.empty();
+        ImGui::SeparatorText("Main Thread Apply Tickets");
+        drawMainThreadApplyTicketTable(jobs->mainThreadApplyTickets);
+    }
+
+    if (jobs != nullptr && jobs->topologyRebuildTicketsAvailable) {
+        hasJob = hasJob || !jobs->topologyRebuildTickets.empty();
+        ImGui::SeparatorText("Topology Rebuild Tickets");
+        ImGui::TextDisabled(
+            "Latest generation: %llu, next retirement timeline: %llu",
+            static_cast<unsigned long long>(jobs->topologyRebuildLatestGeneration),
+            static_cast<unsigned long long>(jobs->topologyRebuildNextTimelineValue));
+        drawTopologyRebuildTicketTable(jobs->topologyRebuildTickets);
+    }
+
+    if (jobs != nullptr && jobs->mountedNativePackageWatchesAvailable) {
+        hasJob = hasJob || !jobs->mountedNativePackageWatches.empty();
+        ImGui::SeparatorText("Mounted Native Packages");
+        ImGui::TextDisabled("Timestamp polling detects changed .rtpkg files; refresh remains an explicit confirmed action.");
+        drawMountedNativePackageWatchTable(jobs->mountedNativePackageWatches, requests);
     }
 
     if (!hasJob) {

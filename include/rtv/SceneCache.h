@@ -93,6 +93,9 @@ struct CachedMaterialData {
     int32_t iridescenceThicknessTextureIndex = -1;
     int32_t anisotropyTextureIndex = -1;
     int32_t occlusionTextureIndex = -1;
+    int32_t opacityTextureIndex = -1;
+    int32_t heightTextureIndex = -1;
+    float heightScale = 0.025f;
     TextureTransformAsset baseColorTextureTransform{};
     TextureTransformAsset metallicRoughnessTextureTransform{};
     TextureTransformAsset normalTextureTransform{};
@@ -110,6 +113,9 @@ struct CachedMaterialData {
     TextureTransformAsset iridescenceTextureTransform{};
     TextureTransformAsset iridescenceThicknessTextureTransform{};
     TextureTransformAsset anisotropyTextureTransform{};
+    uint32_t materialWorkflow = kMaterialWorkflowMetallicRoughness;
+    uint32_t normalMapConvention = kMaterialNormalMapOpenGL;
+    uint32_t specularTextureAlphaMode = kMaterialSpecularTextureAlphaNone;
     uint32_t shaderCompatibilityMask = 1u;
 };
 

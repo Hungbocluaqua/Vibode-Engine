@@ -105,6 +105,9 @@ private:
     std::vector<std::string> consoleHistory_{};
     std::string lastConsoleCommandFailureReason_{};
     std::unordered_map<std::string, std::string> projectSourceControlStatusCache_{};
+    std::array<char, 64> cookNativeTextureTargetSetNameBuffer_{};
+    bool cookNativeTextureTargetSetNameBufferInitialized_ = false;
+    int cookNativeTextureTargetSetLibrarySelection_ = -1;
     struct EditorJobHistoryEntry {
         uint64_t id = 0;
         uint64_t serial = 0;
@@ -123,6 +126,7 @@ private:
         std::filesystem::path manifestPath;
         std::filesystem::path reportPath;
         std::filesystem::path logPath;
+        std::filesystem::path backupPath;
         std::vector<std::string> errors;
         std::vector<std::string> warnings;
         double workerTotalMs = 0.0;
@@ -153,16 +157,22 @@ private:
     bool observedCookProjectRunningForHistory_ = false;
     uint64_t activeCookProjectHistorySerial_ = 0;
     uint64_t observedCookProjectResultSerial_ = 0;
+    bool observedNativeFileMigrationRunningForHistory_ = false;
+    uint64_t activeNativeFileMigrationHistorySerial_ = 0;
+    uint64_t observedNativeFileMigrationResultSerial_ = 0;
     std::string activeSceneLoadHistoryKey_{};
     std::string activeAssetImportHistoryKey_{};
     std::string activeCookProjectHistoryKey_{};
+    std::string activeNativeFileMigrationHistoryKey_{};
     std::string lastSceneLoadHistoryStatus_{};
     std::string lastAssetImportHistoryTitle_{};
     std::string lastAssetImportHistoryStatus_{};
     std::string lastCookProjectHistoryStatus_{};
+    std::string lastNativeFileMigrationHistoryStatus_{};
     float lastSceneLoadHistoryProgress_ = 0.0f;
     float lastAssetImportHistoryProgress_ = 0.0f;
     float lastCookProjectHistoryProgress_ = 0.0f;
+    float lastNativeFileMigrationHistoryProgress_ = 0.0f;
     bool commandPaletteOpen_ = false;
     std::array<char, 128> commandPaletteSearch_{};
     bool commandPaletteShortcutEditor_ = false;

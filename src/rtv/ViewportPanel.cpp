@@ -11,6 +11,7 @@
 #include "rtv/Prefab.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/SceneOperations.h"
+#include "rtv/ScatterPalette.h"
 
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtc/matrix_transform.hpp>
@@ -34,6 +35,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace rtv {
 
@@ -149,29 +151,27 @@ nlohmann::json buildViewportAdvancedToolsReadinessReport(
             {"multiPlaceBrushImplemented", true},
         }},
         {"advancedWorkflowReadiness", {
-            {"multiSelectGroupTransformImplemented", false},
-            {"customPivotOriginImplemented", false},
-            {"surfaceSnappingWorkflowImplemented", false},
-            {"alignDistributeImplemented", false},
-            {"scatterPlacementPaletteImplemented", false},
-            {"levelInstancesSublevelsImplemented", false},
+            {"multiSelectGroupTransformImplemented", true},
+            {"customPivotOriginImplemented", true},
+            {"surfaceSnappingWorkflowImplemented", true},
+            {"alignDistributeImplemented", true},
+            {"scatterPlacementPaletteImplemented", true},
+            {"levelInstancesSublevelsImplemented", true},
         }},
         {"notes", {
-            {"surfaceAlignScope", "Current surface alignment is limited to viewport drop/placement preview and placement transforms; it is not a full persistent surface-snapping workflow."},
-            {"brushScope", "Duplicate-next and multi-place brushes exist for prefab/Mesh placement, but scatter palettes and broader placement workflows remain future work."},
+            {"surfaceSnappingScope", "Viewport placement and translate gizmo moves share the CPU scene-query path, snap to loaded mesh triangles, fall back to the grid, and support normal alignment, yaw preservation, offset, bounds-bottom snapping, and axis constraints."},
+            {"brushScope", "Duplicate-next and multi-place brushes exist for prefab/Mesh placement; mesh scatter palette placement expands the active mesh brush into deterministic CPU scene-query placements and commits one undo snapshot."},
+            {"scatterPaletteScope", "Transparent .rtscatterpalette.json metadata is supported for mesh/prefab/material GUID entries and runtime viewport scatter currently places mesh entries as one batch operation."},
+            {"multiSelectGroupTransformScope", "Viewport move/rotate/scale gizmos apply preview transforms to unlocked multi-selected entities and commit one undo snapshot for the group."},
+            {"customPivotScope", "Viewport pivots support active entity, selection center, bounds center, and persisted custom transforms stored in rtlevel editor metadata."},
+            {"alignDistributeScope", "Align/distribute tools use world bounds when mesh geometry is available and fall back to world transform positions otherwise."},
+            {"levelInstanceScope", "Rtlevel drops can become visible level-instance roots with scene GUID/path metadata, loaded/editable/dirty state, cycle rejection, undoable load/unload/edit/break-link operations, and cook-manifest sublevel scene inclusion."},
         }},
         {"policy", {
             {"description", "This report is a read-only readiness inventory for advanced viewport/editor tooling."},
             {"mutationExecuted", false},
             {"performedActions", nlohmann::json::array()},
-            {"unsupportedActions", nlohmann::json::array({
-                "multi-select-group-transform",
-                "custom-pivot-origin",
-                "full-surface-snapping-workflow",
-                "align-distribute-tools",
-                "scatter-placement-palette",
-                "level-instances-sublevels"
-            })},
+            {"unsupportedActions", nlohmann::json::array()},
         }},
     };
 }
@@ -233,6 +233,12 @@ std::optional<ImVec2> projectViewToScreen(
     float nearPlane);
 bool screenPointInsideViewport(const EditorRuntimeState& state, ImVec2 point, float padding);
 std::optional<ViewportSceneRayHit> viewportSceneRaycastUnderCursor(const EditorRuntimeState& state);
+std::optional<ViewportSceneRayHit> viewportSceneRaycast(
+    const EditorRuntimeState& state,
+    const glm::vec3& origin,
+    const glm::vec3& rayDir,
+    const std::vector<EntityId>& excludedEntities = {});
+glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity);
 std::optional<Transform> viewportDropPlacementTransform(
     const EditorRuntimeState& state,
     bool snapEnabled,
@@ -241,6 +247,18 @@ std::optional<Transform> viewportDropPlacementTransform(
     bool surfaceAlign,
     float yawRadians = 0.0f,
     std::optional<ViewportPlacementBounds> bounds = std::nullopt);
+bool viewportScatterPaletteActive(const EditorRuntimeState& state);
+ScatterPaletteSettings scatterPaletteSettingsFromPreferences(const EditorPreferences* preferences);
+std::vector<EditorMeshScatterInstancePlacement> buildScatterMeshPlacements(
+    const EditorRuntimeState& state,
+    const AssetGuid& meshGuid,
+    float yawRadians,
+    const ScatterPaletteSettings& settings,
+    std::optional<ViewportPlacementBounds> meshBounds,
+    size_t maxInstances = 0);
+void drawScatterMeshPlacementPreview(
+    const EditorRuntimeState& state,
+    const std::vector<EditorMeshScatterInstancePlacement>& instances);
 
 std::optional<MeshAssetHandle> loadedMeshHandleForGuid(const EditorRuntimeState& state, const AssetGuid& guid) {
     if (state.assets == nullptr || guid.empty()) {
@@ -324,6 +342,31 @@ void includeTransformedBoundsCorners(ViewportPlacementBounds& outBounds, const V
             outBounds.max = glm::max(outBounds.max, world);
         }
     }
+}
+
+EditorAlignDistributeEntityBounds alignDistributeBoundsForEntity(const EditorRuntimeState& state, const Entity& entity) {
+    EditorAlignDistributeEntityBounds result;
+    result.entity = entity.id;
+    if (state.assets == nullptr || !entity.meshRenderer.has_value()) {
+        return result;
+    }
+    const std::optional<ViewportPlacementBounds> localBounds = meshPlacementBounds(state.assets, entity.meshRenderer->mesh);
+    if (!localBounds.has_value()) {
+        return result;
+    }
+    ViewportPlacementBounds worldBounds;
+    bool hasPoint = false;
+    const glm::mat4 world = state.sceneDocument != nullptr
+        ? entityWorldMatrix(state.sceneDocument->registry(), entity)
+        : entity.transform.localMatrix();
+    includeTransformedBoundsCorners(worldBounds, *localBounds, world, hasPoint);
+    if (!hasPoint) {
+        return result;
+    }
+    result.min = worldBounds.min;
+    result.max = worldBounds.max;
+    result.available = true;
+    return result;
 }
 
 std::optional<glm::mat4> prefabNodeWorldTransform(const PrefabAsset& prefab, uint32_t nodeIndex, std::vector<std::optional<glm::mat4>>& cache) {
@@ -740,9 +783,10 @@ void drawViewportPlacementBrushPreview(
     const std::optional<ViewportPlacementBounds> placementBounds = brush.kind == ViewportPlacementBrushKind::Mesh
         ? footprintBounds
         : std::nullopt;
+    const bool scatterActive = brush.kind == ViewportPlacementBrushKind::Mesh && viewportScatterPaletteActive(state);
 
     std::ostringstream label;
-    label << "Place " << placementBrushKindName(brush.kind) << "  " << assetLabelForGuid(state, brush.guid);
+    label << (scatterActive ? "Scatter " : "Place ") << placementBrushKindName(brush.kind) << "  " << assetLabelForGuid(state, brush.guid);
     if (brush.multiPlace) {
         label << "  Multi";
     } else {
@@ -760,16 +804,29 @@ void drawViewportPlacementBrushPreview(
     if (std::abs(brush.yawRadians) > 0.0001f) {
         label << "  Rot " << std::fixed << std::setprecision(0) << glm::degrees(brush.yawRadians);
     }
+    std::vector<EditorMeshScatterInstancePlacement> scatterPreview;
+    if (scatterActive) {
+        scatterPreview = buildScatterMeshPlacements(
+            state,
+            brush.guid,
+            brush.yawRadians,
+            scatterPaletteSettingsFromPreferences(state.editorPrefs),
+            footprintBounds,
+            24u);
+        label << "  Count " << scatterPreview.size();
+    }
 
     const ImVec2 cursor(state.viewport.mousePosition.x, state.viewport.mousePosition.y);
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     constexpr float markerSize = 11.0f;
-    const ImU32 markerColor = brush.multiPlace ? IM_COL32(135, 205, 255, 255) : IM_COL32(185, 215, 115, 255);
+    const ImU32 markerColor = scatterActive ? IM_COL32(145, 220, 120, 255) : (brush.multiPlace ? IM_COL32(135, 205, 255, 255) : IM_COL32(185, 215, 115, 255));
     drawList->AddCircle(cursor, markerSize, markerColor, 24, 2.0f);
     drawList->AddLine(ImVec2(cursor.x - markerSize - 4.0f, cursor.y), ImVec2(cursor.x + markerSize + 4.0f, cursor.y), markerColor, 2.0f);
     drawList->AddLine(ImVec2(cursor.x, cursor.y - markerSize - 4.0f), ImVec2(cursor.x, cursor.y + markerSize + 4.0f), markerColor, 2.0f);
 
-    if (const std::optional<Transform> transform = viewportDropPlacementTransform(state, snapEnabled, translationSnap, forceGrid, surfaceAlign, brush.yawRadians, placementBounds)) {
+    if (scatterActive) {
+        drawScatterMeshPlacementPreview(state, scatterPreview);
+    } else if (const std::optional<Transform> transform = viewportDropPlacementTransform(state, snapEnabled, translationSnap, forceGrid, surfaceAlign, brush.yawRadians, placementBounds)) {
         const ViewportPlacementFootprint footprint = footprintFromBounds(footprintBounds);
         drawViewportDropPlacementFootprint(state, *transform, forceGrid, surfaceAlign, footprint);
     }
@@ -802,6 +859,115 @@ glm::mat4 entityWorldMatrix(const SceneRegistry& registry, const Entity& entity)
 glm::mat4 parentWorldMatrix(const SceneRegistry& registry, const Entity& entity) {
     const Entity* parent = registry.entity(entity.parent);
     return parent != nullptr ? entityWorldMatrix(registry, *parent) : glm::mat4{1.0f};
+}
+
+std::vector<EntityId> editableTransformSelection(const EditorRuntimeState& state, const EditorSelection& selection) {
+    std::vector<EntityId> ids = selection.selectedEntitiesOr(selection.entityId());
+    ids.erase(
+        std::remove_if(
+            ids.begin(),
+            ids.end(),
+            [&](EntityId id) {
+                const Entity* entity = state.sceneDocument != nullptr ? state.sceneDocument->registry().entity(id) : nullptr;
+                return entity == nullptr || entity->locked;
+            }),
+        ids.end());
+    return ids;
+}
+
+glm::vec3 selectionPositionCenter(const SceneRegistry& registry, const Entity& activeEntity, const std::vector<EntityId>& ids) {
+    glm::vec3 center{0.0f};
+    size_t count = 0;
+    for (EntityId id : ids) {
+        if (const Entity* entity = registry.entity(id)) {
+            center += glm::vec3(entityWorldMatrix(registry, *entity)[3]);
+            ++count;
+        }
+    }
+    if (count > 0) {
+        center /= static_cast<float>(count);
+    } else {
+        center = glm::vec3(entityWorldMatrix(registry, activeEntity)[3]);
+    }
+    return center;
+}
+
+std::optional<glm::vec3> selectionBoundsCenter(const EditorRuntimeState& state, const std::vector<EntityId>& ids) {
+    if (state.sceneDocument == nullptr) {
+        return std::nullopt;
+    }
+
+    glm::vec3 minBounds{0.0f};
+    glm::vec3 maxBounds{0.0f};
+    bool hasBounds = false;
+    for (EntityId id : ids) {
+        const Entity* entity = state.sceneDocument->registry().entity(id);
+        if (entity == nullptr) {
+            continue;
+        }
+        const EditorAlignDistributeEntityBounds bounds = alignDistributeBoundsForEntity(state, *entity);
+        if (!bounds.available) {
+            continue;
+        }
+        if (!hasBounds) {
+            minBounds = bounds.min;
+            maxBounds = bounds.max;
+            hasBounds = true;
+        } else {
+            minBounds = glm::min(minBounds, bounds.min);
+            maxBounds = glm::max(maxBounds, bounds.max);
+        }
+    }
+    if (!hasBounds) {
+        return std::nullopt;
+    }
+    return (minBounds + maxBounds) * 0.5f;
+}
+
+glm::mat4 activeEntityOrientationMatrix(const SceneRegistry& registry, const Entity& activeEntity, glm::vec3 position) {
+    glm::vec3 scale{1.0f};
+    glm::quat orientation{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::vec3 translation{};
+    glm::vec3 skew{};
+    glm::vec4 perspective{};
+    glm::mat4 result = glm::translate(glm::mat4{1.0f}, position);
+    if (glm::decompose(entityWorldMatrix(registry, activeEntity), scale, orientation, translation, skew, perspective)) {
+        result *= glm::mat4_cast(orientation);
+    }
+    return result;
+}
+
+glm::mat4 customPivotMatrix(const EditorPivotSettings& pivot) {
+    const glm::mat4 translation = glm::translate(glm::mat4{1.0f}, pivot.customPosition);
+    const glm::mat4 rotation = glm::mat4_cast(glm::quat(pivot.customRotationEuler));
+    return translation * rotation;
+}
+
+const char* editorPivotModeLabel(EditorPivotMode mode) {
+    switch (mode) {
+    case EditorPivotMode::Active: return "Active";
+    case EditorPivotMode::SelectionCenter: return "Selection";
+    case EditorPivotMode::BoundsCenter: return "Bounds";
+    case EditorPivotMode::Custom: return "Custom";
+    }
+    return "Active";
+}
+
+glm::mat4 pivotWorldMatrixForSelection(const EditorRuntimeState& state, const Entity& activeEntity, const std::vector<EntityId>& ids) {
+    const SceneRegistry& registry = state.sceneDocument->registry();
+    const EditorPivotSettings& pivot = state.sceneDocument->editorPivot();
+    if (pivot.mode == EditorPivotMode::Custom) {
+        return customPivotMatrix(pivot);
+    }
+    if (pivot.mode == EditorPivotMode::BoundsCenter) {
+        const glm::vec3 center = selectionBoundsCenter(state, ids).value_or(selectionPositionCenter(registry, activeEntity, ids));
+        return activeEntityOrientationMatrix(registry, activeEntity, center);
+    }
+    if (pivot.mode == EditorPivotMode::SelectionCenter) {
+        return activeEntityOrientationMatrix(registry, activeEntity, selectionPositionCenter(registry, activeEntity, ids));
+    }
+
+    return entityWorldMatrix(registry, activeEntity);
 }
 
 void writeLocalTransformFromMatrix(Entity& entity, const glm::mat4& matrix, std::optional<glm::vec3> linkedScaleReference = std::nullopt) {
@@ -1028,7 +1194,8 @@ glm::vec3 rotationEulerAligningUpToNormal(glm::vec3 normal) {
 std::optional<ViewportSceneRayHit> viewportSceneRaycast(
     const EditorRuntimeState& state,
     const glm::vec3& origin,
-    const glm::vec3& rayDir) {
+    const glm::vec3& rayDir,
+    const std::vector<EntityId>& excludedEntities) {
     if (state.sceneDocument == nullptr || state.assets == nullptr) {
         return std::nullopt;
     }
@@ -1038,6 +1205,9 @@ std::optional<ViewportSceneRayHit> viewportSceneRaycast(
     const SceneRegistry& registry = state.sceneDocument->registry();
     for (const Entity* entity : registry.entities()) {
         if (entity == nullptr || !entity->visible || !entity->meshRenderer.has_value()) {
+            continue;
+        }
+        if (std::find(excludedEntities.begin(), excludedEntities.end(), entity->id) != excludedEntities.end()) {
             continue;
         }
         const MeshRenderer& renderer = *entity->meshRenderer;
@@ -1152,6 +1322,230 @@ glm::vec3 normalizedPlacementNormal(glm::vec3 normal) {
     return normal / std::sqrt(len2);
 }
 
+struct EditorSurfaceSnapSettings {
+    bool enabled = false;
+    bool alignToNormal = true;
+    bool preserveYaw = true;
+    float offset = 0.0f;
+    bool snapBoundsBottom = true;
+    int axisConstraint = 0;
+};
+
+struct EditorSceneQueryHit {
+    glm::vec3 position{};
+    glm::vec3 normal{0.0f, 1.0f, 0.0f};
+    bool usedSceneSurface = false;
+    bool usedGridFallback = false;
+};
+
+struct EditorSceneQuery {
+    const EditorRuntimeState& state;
+    std::vector<EntityId> excludedEntities;
+
+    std::optional<EditorSceneQueryHit> surfaceOrGridUnderCursor(bool forceGrid, bool allowSurface) const {
+        glm::vec3 origin{};
+        glm::vec3 rayDir{};
+        if (!viewportRayFromMouse(state, origin, rayDir)) {
+            return std::nullopt;
+        }
+
+        if (!forceGrid && allowSurface) {
+            if (const std::optional<ViewportSceneRayHit> sceneHit = viewportSceneRaycast(state, origin, rayDir, excludedEntities)) {
+                return EditorSceneQueryHit{
+                    .position = sceneHit->position,
+                    .normal = normalizedPlacementNormal(sceneHit->normal),
+                    .usedSceneSurface = true,
+                    .usedGridFallback = false,
+                };
+            }
+        }
+
+        glm::vec3 position = origin + rayDir * 5.0f;
+        if (std::abs(rayDir.y) > 0.0001f) {
+            const float t = -origin.y / rayDir.y;
+            if (t > 0.0f && std::isfinite(t)) {
+                position = origin + rayDir * t;
+            }
+            position.y = 0.0f;
+        }
+        return EditorSceneQueryHit{
+            .position = position,
+            .normal = glm::vec3{0.0f, 1.0f, 0.0f},
+            .usedSceneSurface = false,
+            .usedGridFallback = true,
+        };
+    }
+};
+
+EditorSurfaceSnapSettings surfaceSnapSettingsFromPreferences(const EditorPreferences* preferences) {
+    EditorSurfaceSnapSettings settings;
+    if (preferences == nullptr) {
+        return settings;
+    }
+    settings.enabled = preferences->viewportSurfaceSnappingEnabled;
+    settings.alignToNormal = preferences->viewportSurfaceSnapAlignToNormal;
+    settings.preserveYaw = preferences->viewportSurfaceSnapPreserveYaw;
+    settings.offset = std::clamp(preferences->viewportSurfaceSnapOffset, -100.0f, 100.0f);
+    settings.snapBoundsBottom = preferences->viewportSurfaceSnapBoundsBottom;
+    settings.axisConstraint = std::clamp(preferences->viewportSurfaceSnapAxisConstraint, 0, 3);
+    return settings;
+}
+
+const char* surfaceSnapAxisConstraintLabel(int axisConstraint) {
+    switch (axisConstraint) {
+    case 1: return "X";
+    case 2: return "Y";
+    case 3: return "Z";
+    default: return "None";
+    }
+}
+
+glm::vec3 constrainedSurfaceSnapPosition(glm::vec3 currentPosition, glm::vec3 snappedPosition, int axisConstraint) {
+    switch (axisConstraint) {
+    case 1:
+        return {snappedPosition.x, currentPosition.y, currentPosition.z};
+    case 2:
+        return {currentPosition.x, snappedPosition.y, currentPosition.z};
+    case 3:
+        return {currentPosition.x, currentPosition.y, snappedPosition.z};
+    default:
+        return snappedPosition;
+    }
+}
+
+glm::quat surfaceSnapRotation(glm::quat currentRotation, glm::vec3 normal, const EditorSurfaceSnapSettings& settings) {
+    if (!settings.alignToNormal) {
+        return glm::normalize(currentRotation);
+    }
+    glm::quat aligned = glm::quat(rotationEulerAligningUpToNormal(normalizedPlacementNormal(normal)));
+    if (settings.preserveYaw) {
+        const float yaw = glm::eulerAngles(glm::normalize(currentRotation)).y;
+        aligned = aligned * glm::angleAxis(yaw, glm::vec3{0.0f, 1.0f, 0.0f});
+    }
+    return glm::normalize(aligned);
+}
+
+void includeEntityBoundsForWorldMatrix(
+    const EditorRuntimeState& state,
+    const Entity& entity,
+    const glm::mat4& world,
+    ViewportPlacementBounds& outBounds,
+    bool& hasPoint) {
+    if (state.assets != nullptr && entity.meshRenderer.has_value()) {
+        const std::optional<ViewportPlacementBounds> localBounds = meshPlacementBounds(state.assets, entity.meshRenderer->mesh);
+        if (localBounds.has_value()) {
+            includeTransformedBoundsCorners(outBounds, *localBounds, world, hasPoint);
+            return;
+        }
+    }
+    const glm::vec3 position = glm::vec3(world[3]);
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
+        return;
+    }
+    if (!hasPoint) {
+        outBounds.min = position;
+        outBounds.max = position;
+        hasPoint = true;
+    } else {
+        outBounds.min = glm::min(outBounds.min, position);
+        outBounds.max = glm::max(outBounds.max, position);
+    }
+}
+
+std::optional<ViewportPlacementBounds> currentGizmoSelectionBounds(
+    const EditorRuntimeState& state,
+    const Entity& activeEntity,
+    const glm::mat4& currentWorld,
+    const glm::mat4& originalGroupWorld,
+    const std::vector<ViewportPanel::GroupGizmoOriginal>& originals) {
+    if (state.sceneDocument == nullptr) {
+        return std::nullopt;
+    }
+
+    ViewportPlacementBounds bounds;
+    bool hasPoint = false;
+    if (!originals.empty()) {
+        const glm::mat4 delta = currentWorld * glm::inverse(originalGroupWorld);
+        for (const ViewportPanel::GroupGizmoOriginal& original : originals) {
+            if (const Entity* entity = state.sceneDocument->registry().entity(original.entity)) {
+                includeEntityBoundsForWorldMatrix(state, *entity, delta * original.world, bounds, hasPoint);
+            }
+        }
+    } else {
+        includeEntityBoundsForWorldMatrix(state, activeEntity, currentWorld, bounds, hasPoint);
+    }
+    return hasPoint ? std::optional<ViewportPlacementBounds>{bounds} : std::nullopt;
+}
+
+glm::vec3 boundsBottomSurfaceSnapPivot(
+    glm::vec3 currentPivot,
+    glm::vec3 snappedSurfacePoint,
+    glm::vec3 normal,
+    const ViewportPlacementBounds& bounds) {
+    normal = normalizedPlacementNormal(normal);
+    const std::array<glm::vec3, 8> corners = {
+        glm::vec3{bounds.min.x, bounds.min.y, bounds.min.z},
+        glm::vec3{bounds.max.x, bounds.min.y, bounds.min.z},
+        glm::vec3{bounds.min.x, bounds.max.y, bounds.min.z},
+        glm::vec3{bounds.max.x, bounds.max.y, bounds.min.z},
+        glm::vec3{bounds.min.x, bounds.min.y, bounds.max.z},
+        glm::vec3{bounds.max.x, bounds.min.y, bounds.max.z},
+        glm::vec3{bounds.min.x, bounds.max.y, bounds.max.z},
+        glm::vec3{bounds.max.x, bounds.max.y, bounds.max.z},
+    };
+    float minProjection = std::numeric_limits<float>::max();
+    for (const glm::vec3& corner : corners) {
+        const float projection = glm::dot(corner, normal);
+        if (std::isfinite(projection)) {
+            minProjection = std::min(minProjection, projection);
+        }
+    }
+    if (!std::isfinite(minProjection)) {
+        return snappedSurfacePoint;
+    }
+    const float pivotAboveSupport = glm::dot(currentPivot, normal) - minProjection;
+    return snappedSurfacePoint + normal * pivotAboveSupport;
+}
+
+std::optional<glm::mat4> surfaceSnappedGizmoWorldMatrix(
+    const EditorRuntimeState& state,
+    const Entity& activeEntity,
+    const glm::mat4& currentWorld,
+    const glm::mat4& originalGroupWorld,
+    const std::vector<ViewportPanel::GroupGizmoOriginal>& originals,
+    const std::vector<EntityId>& excludedEntities,
+    const EditorSurfaceSnapSettings& settings) {
+    if (!settings.enabled) {
+        return std::nullopt;
+    }
+    const std::optional<EditorSceneQueryHit> hit = EditorSceneQuery{state, excludedEntities}.surfaceOrGridUnderCursor(false, true);
+    if (!hit.has_value()) {
+        return std::nullopt;
+    }
+
+    glm::vec3 skew{};
+    glm::vec4 perspective{};
+    glm::quat currentRotation{};
+    glm::vec3 currentPosition{};
+    glm::vec3 currentScale{1.0f};
+    if (!glm::decompose(currentWorld, currentScale, currentRotation, currentPosition, skew, perspective)) {
+        return std::nullopt;
+    }
+
+    glm::vec3 snappedPosition = hit->position + normalizedPlacementNormal(hit->normal) * settings.offset;
+    if (settings.snapBoundsBottom) {
+        if (const std::optional<ViewportPlacementBounds> bounds = currentGizmoSelectionBounds(state, activeEntity, currentWorld, originalGroupWorld, originals)) {
+            snappedPosition = boundsBottomSurfaceSnapPivot(currentPosition, snappedPosition, hit->normal, *bounds);
+        }
+    }
+    snappedPosition = constrainedSurfaceSnapPosition(currentPosition, snappedPosition, settings.axisConstraint);
+
+    const glm::quat snappedRotation = surfaceSnapRotation(currentRotation, hit->normal, settings);
+    return glm::translate(glm::mat4{1.0f}, snappedPosition) *
+        glm::mat4_cast(snappedRotation) *
+        glm::scale(glm::mat4{1.0f}, currentScale);
+}
+
 glm::vec3 placementBoundsSupportOffset(
     const ViewportPlacementBounds& bounds,
     const glm::vec3& rotationEuler,
@@ -1182,6 +1576,186 @@ glm::vec3 placementBoundsSupportOffset(
     return placementNormal * -minProjection;
 }
 
+bool viewportScatterPaletteActive(const EditorRuntimeState& state) {
+    return state.editorPrefs != nullptr && state.editorPrefs->viewportScatterPaletteByDefault;
+}
+
+ScatterPaletteSettings scatterPaletteSettingsFromPreferences(const EditorPreferences* preferences) {
+    ScatterPaletteSettings settings;
+    if (preferences == nullptr) {
+        return settings;
+    }
+    settings.density = std::clamp(preferences->viewportScatterPaletteDensity, 0.0f, 10000.0f);
+    settings.slopeMinDegrees = std::clamp(preferences->viewportScatterPaletteSlopeMinDegrees, 0.0f, 180.0f);
+    settings.slopeMaxDegrees = std::clamp(preferences->viewportScatterPaletteSlopeMaxDegrees, 0.0f, 180.0f);
+    if (settings.slopeMaxDegrees < settings.slopeMinDegrees) {
+        std::swap(settings.slopeMinDegrees, settings.slopeMaxDegrees);
+    }
+    settings.heightMin = preferences->viewportScatterPaletteHeightMin;
+    settings.heightMax = preferences->viewportScatterPaletteHeightMax;
+    if (settings.heightMax < settings.heightMin) {
+        std::swap(settings.heightMin, settings.heightMax);
+    }
+    settings.scaleMin = std::clamp(preferences->viewportScatterPaletteScaleMin, 0.001f, 1000.0f);
+    settings.scaleMax = std::clamp(preferences->viewportScatterPaletteScaleMax, 0.001f, 1000.0f);
+    if (settings.scaleMax < settings.scaleMin) {
+        std::swap(settings.scaleMin, settings.scaleMax);
+    }
+    settings.yawRandomDegrees = std::clamp(preferences->viewportScatterPaletteYawRandomDegrees, 0.0f, 360.0f);
+    settings.seed = preferences->viewportScatterPaletteSeed;
+    settings.spacing = std::clamp(preferences->viewportScatterPaletteSpacing, 0.001f, 10000.0f);
+    settings.collisionRadius = std::clamp(preferences->viewportScatterPaletteCollisionRadius, 0.0f, 10000.0f);
+    settings.surfaceAlignment = preferences->viewportScatterPaletteSurfaceAlignment;
+    return settings;
+}
+
+uint32_t scatterNextRandom(uint32_t& state) {
+    state += 0x9e3779b9u;
+    uint32_t value = state;
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+float scatterRandom01(uint32_t& state) {
+    return static_cast<float>(scatterNextRandom(state) >> 8u) * (1.0f / 16777216.0f);
+}
+
+uint32_t scatterSurfaceSeed(uint32_t seed, const EditorSceneQueryHit& hit) {
+    const glm::ivec3 quantized = glm::ivec3(glm::floor(hit.position * 1000.0f));
+    uint32_t state = seed ^ 0xa511e9b3u;
+    state ^= static_cast<uint32_t>(quantized.x) * 0x85ebca6bu;
+    state ^= static_cast<uint32_t>(quantized.y) * 0xc2b2ae35u;
+    state ^= static_cast<uint32_t>(quantized.z) * 0x27d4eb2fu;
+    return state;
+}
+
+void scatterSurfaceBasis(glm::vec3 normal, glm::vec3& tangent, glm::vec3& bitangent) {
+    normal = normalizedPlacementNormal(normal);
+    const glm::vec3 reference = std::abs(normal.y) < 0.95f ? glm::vec3{0.0f, 1.0f, 0.0f} : glm::vec3{1.0f, 0.0f, 0.0f};
+    tangent = glm::normalize(glm::cross(reference, normal));
+    bitangent = glm::normalize(glm::cross(normal, tangent));
+}
+
+bool scatterCandidatePassesFilters(const ScatterPaletteSettings& settings, const glm::vec3& position, glm::vec3 normal) {
+    normal = normalizedPlacementNormal(normal);
+    const float slopeDegrees = glm::degrees(std::acos(std::clamp(glm::dot(normal, glm::vec3{0.0f, 1.0f, 0.0f}), -1.0f, 1.0f)));
+    return slopeDegrees >= settings.slopeMinDegrees &&
+        slopeDegrees <= settings.slopeMaxDegrees &&
+        position.y >= settings.heightMin &&
+        position.y <= settings.heightMax;
+}
+
+std::vector<EditorMeshScatterInstancePlacement> buildScatterMeshPlacements(
+    const EditorRuntimeState& state,
+    const AssetGuid& meshGuid,
+    float yawRadians,
+    const ScatterPaletteSettings& settings,
+    std::optional<ViewportPlacementBounds> meshBounds,
+    size_t maxInstances) {
+    if (meshGuid.empty()) {
+        return {};
+    }
+    const std::optional<EditorSceneQueryHit> anchor = EditorSceneQuery{state, {}}.surfaceOrGridUnderCursor(false, true);
+    if (!anchor.has_value() || !scatterCandidatePassesFilters(settings, anchor->position, anchor->normal)) {
+        return {};
+    }
+
+    const size_t targetCount = std::max<size_t>(1u, std::min<size_t>(96u, static_cast<size_t>(std::round(std::max(0.1f, settings.density) * 8.0f))));
+    const size_t requestedCount = maxInstances > 0 ? std::min(targetCount, maxInstances) : targetCount;
+    const float scatterRadius = std::max(settings.spacing, settings.collisionRadius * 2.0f) * std::sqrt(static_cast<float>(targetCount)) * 0.5f;
+    const float minDistance = settings.collisionRadius * 2.0f;
+    glm::vec3 tangent{};
+    glm::vec3 bitangent{};
+    scatterSurfaceBasis(anchor->normal, tangent, bitangent);
+
+    uint32_t rng = scatterSurfaceSeed(settings.seed, *anchor);
+    std::vector<glm::vec3> acceptedPositions;
+    std::vector<EditorMeshScatterInstancePlacement> instances;
+    acceptedPositions.reserve(requestedCount);
+    instances.reserve(requestedCount);
+    constexpr float twoPi = 6.28318530717958647692f;
+    const size_t attemptLimit = std::max<size_t>(requestedCount * 8u, requestedCount + 4u);
+    for (size_t attempt = 0; attempt < attemptLimit && instances.size() < requestedCount; ++attempt) {
+        const float angle = scatterRandom01(rng) * twoPi;
+        const float radius = std::sqrt(scatterRandom01(rng)) * scatterRadius;
+        const glm::vec3 candidate = anchor->position + tangent * (std::cos(angle) * radius) + bitangent * (std::sin(angle) * radius);
+        glm::vec3 position = candidate;
+        glm::vec3 normal = anchor->normal;
+        if (settings.surfaceAlignment && anchor->usedSceneSurface) {
+            const glm::vec3 rayOrigin = candidate + normalizedPlacementNormal(anchor->normal) * 500.0f;
+            const glm::vec3 rayDir = -normalizedPlacementNormal(anchor->normal);
+            if (const std::optional<ViewportSceneRayHit> hit = viewportSceneRaycast(state, rayOrigin, rayDir)) {
+                position = hit->position;
+                normal = hit->normal;
+            }
+        }
+        if (!scatterCandidatePassesFilters(settings, position, normal)) {
+            continue;
+        }
+        bool collides = false;
+        if (minDistance > 0.0f) {
+            for (const glm::vec3& existing : acceptedPositions) {
+                if (glm::length(existing - position) < minDistance) {
+                    collides = true;
+                    break;
+                }
+            }
+        }
+        if (collides) {
+            continue;
+        }
+
+        const float randomYaw = glm::radians((scatterRandom01(rng) * 2.0f - 1.0f) * settings.yawRandomDegrees);
+        const float randomScale = settings.scaleMin + (settings.scaleMax - settings.scaleMin) * scatterRandom01(rng);
+        glm::quat rotation = settings.surfaceAlignment
+            ? glm::angleAxis(yawRadians + randomYaw, normalizedPlacementNormal(normal)) * glm::quat(rotationEulerAligningUpToNormal(normal))
+            : glm::angleAxis(yawRadians + randomYaw, glm::vec3{0.0f, 1.0f, 0.0f});
+        const glm::vec3 rotationEuler = glm::eulerAngles(glm::normalize(rotation));
+        if (meshBounds.has_value()) {
+            ViewportPlacementBounds scaledBounds = *meshBounds;
+            scaledBounds.min *= randomScale;
+            scaledBounds.max *= randomScale;
+            position += placementBoundsSupportOffset(scaledBounds, rotationEuler, normal);
+        }
+
+        Transform transform;
+        transform.position = position;
+        transform.rotationEuler = rotationEuler;
+        transform.scale = glm::vec3(randomScale);
+        transform.dirty = true;
+        instances.push_back(EditorMeshScatterInstancePlacement{
+            .meshGuid = meshGuid,
+            .materialGuid = {},
+            .transform = transform,
+        });
+        acceptedPositions.push_back(position);
+    }
+    return instances;
+}
+
+void drawScatterMeshPlacementPreview(
+    const EditorRuntimeState& state,
+    const std::vector<EditorMeshScatterInstancePlacement>& instances) {
+    if (state.camera == nullptr || state.sceneDocument == nullptr || instances.empty()) {
+        return;
+    }
+    const glm::mat4 view = editorViewMatrix(*state.camera);
+    const glm::mat4 projection = editorProjectionMatrix(activeCameraFov(*state.sceneDocument), viewportAspect(state));
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    for (const EditorMeshScatterInstancePlacement& instance : instances) {
+        const std::optional<ImVec2> center = projectWorldToScreen(state, view, projection, instance.transform.position);
+        if (!center.has_value() || !screenPointInsideViewport(state, *center, 40.0f)) {
+            continue;
+        }
+        drawList->AddCircle(*center, 5.5f, IM_COL32(145, 220, 120, 230), 18, 1.5f);
+        drawList->AddCircleFilled(*center, 2.0f, IM_COL32(145, 220, 120, 230), 12);
+    }
+}
+
 std::optional<Transform> viewportDropPlacementTransform(
     const EditorRuntimeState& state,
     bool snapEnabled,
@@ -1190,35 +1764,16 @@ std::optional<Transform> viewportDropPlacementTransform(
     bool surfaceAlign,
     float yawRadians,
     std::optional<ViewportPlacementBounds> bounds) {
-    glm::vec3 origin{};
-    glm::vec3 rayDir{};
-    if (!viewportRayFromMouse(state, origin, rayDir)) {
+    const std::optional<EditorSceneQueryHit> queryHit = EditorSceneQuery{state, {}}.surfaceOrGridUnderCursor(forceGrid, true);
+    if (!queryHit.has_value()) {
         return std::nullopt;
     }
 
-    glm::vec3 position = origin + rayDir * 5.0f;
+    glm::vec3 position = queryHit->position;
     glm::vec3 rotationEuler{0.0f};
-    glm::vec3 placementNormal{0.0f, 1.0f, 0.0f};
-    bool usedSceneHit = false;
-    if (!forceGrid) {
-        if (const std::optional<ViewportSceneRayHit> sceneHit = viewportSceneRaycast(state, origin, rayDir)) {
-            position = sceneHit->position;
-            placementNormal = normalizedPlacementNormal(sceneHit->normal);
-            if (surfaceAlign) {
-                rotationEuler = rotationEulerAligningUpToNormal(placementNormal);
-            }
-            usedSceneHit = true;
-        }
-    }
-    if (forceGrid || !usedSceneHit) {
-        if (std::abs(rayDir.y) > 0.0001f) {
-            const float t = -origin.y / rayDir.y;
-            if (t > 0.0f && std::isfinite(t)) {
-                position = origin + rayDir * t;
-            }
-            position.y = 0.0f;
-        }
-        placementNormal = {0.0f, 1.0f, 0.0f};
+    const glm::vec3 placementNormal = normalizedPlacementNormal(queryHit->normal);
+    if (surfaceAlign && queryHit->usedSceneSurface) {
+        rotationEuler = rotationEulerAligningUpToNormal(placementNormal);
     }
     if (snapEnabled) {
         position.x = snappedPlacementCoordinate(position.x, translationSnap);
@@ -1746,6 +2301,26 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 .multiPlace = multiPlace,
             };
         };
+        auto requestScatterMeshPlacement = [&](const AssetGuid& guid, float yawRadians, std::optional<ViewportPlacementBounds> bounds) {
+            if (!viewportScatterPaletteActive(state)) {
+                return false;
+            }
+            std::vector<EditorMeshScatterInstancePlacement> instances = buildScatterMeshPlacements(
+                state,
+                guid,
+                yawRadians,
+                scatterPaletteSettingsFromPreferences(state.editorPrefs),
+                bounds);
+            if (instances.empty()) {
+                return false;
+            }
+            requests.meshScatterPlacement = EditorMeshScatterPlacement{
+                .instances = std::move(instances),
+                .seed = state.editorPrefs != nullptr ? state.editorPrefs->viewportScatterPaletteSeed : 1u,
+                .label = "Scatter Mesh Palette",
+            };
+            return true;
+        };
         if (ImGui::BeginDragDropTarget()) {
             const bool forceGridDrop = viewportDropForceGridActive(state);
             const bool surfaceAlignDrop = viewportDropSurfaceAlignActive(state, forceGridDrop);
@@ -1769,11 +2344,15 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                         }
                     }
                 }
-                requests.meshAssetPlacement = EditorMeshAssetPlacement{
-                    .meshGuid = guid,
-                    .placementTransform = viewportDropPlacementTransform(state, snap_.enabled, snap_.translation, forceGridDrop, surfaceAlignDrop, placementPreviewYawRadians_, bounds),
-                    .replaceEntity = replaceEntity,
-                };
+                if (!replaceEntity.valid() && requestScatterMeshPlacement(guid, placementPreviewYawRadians_, bounds)) {
+                    // Scatter placement is routed as one undoable batch request.
+                } else {
+                    requests.meshAssetPlacement = EditorMeshAssetPlacement{
+                        .meshGuid = guid,
+                        .placementTransform = viewportDropPlacementTransform(state, snap_.enabled, snap_.translation, forceGridDrop, surfaceAlignDrop, placementPreviewYawRadians_, bounds),
+                        .replaceEntity = replaceEntity,
+                    };
+                }
                 if (!replaceEntity.valid()) {
                     armPlacementBrush(ViewportPlacementBrushKind::Mesh, guid);
                 }
@@ -1832,18 +2411,22 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                     if (const std::optional<MeshAssetHandle> handle = loadedMeshHandleForGuid(state, placementBrush_.guid)) {
                         bounds = meshPlacementBounds(state.assets, *handle);
                     }
-                    requests.meshAssetPlacement = EditorMeshAssetPlacement{
-                        .meshGuid = placementBrush_.guid,
-                        .placementTransform = viewportDropPlacementTransform(
-                            state,
-                            snap_.enabled,
-                            snap_.translation,
-                            forceGridDrop,
-                            surfaceAlignDrop,
-                            placementBrush_.yawRadians,
-                            bounds),
-                    };
-                    placementBrushClicked = true;
+                    if (requestScatterMeshPlacement(placementBrush_.guid, placementBrush_.yawRadians, bounds)) {
+                        placementBrushClicked = true;
+                    } else if (!viewportScatterPaletteActive(state)) {
+                        requests.meshAssetPlacement = EditorMeshAssetPlacement{
+                            .meshGuid = placementBrush_.guid,
+                            .placementTransform = viewportDropPlacementTransform(
+                                state,
+                                snap_.enabled,
+                                snap_.translation,
+                                forceGridDrop,
+                                surfaceAlignDrop,
+                                placementBrush_.yawRadians,
+                                bounds),
+                        };
+                        placementBrushClicked = true;
+                    }
                 }
                 if (placementBrushClicked && !placementBrush_.multiPlace) {
                     --placementBrush_.remainingPlacements;
@@ -1875,9 +2458,11 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 pendingLevelDropLabel_.clear();
                 ImGui::CloseCurrentPopup();
             }
-            editorGlyphMenuItem(EditorGlyphIcon::Group, "Add As Sublevel", false);
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-                ImGui::SetTooltip("Level instances and sublevels are not implemented yet");
+            if (editorGlyphMenuItem(EditorGlyphIcon::Group, "Add As Sublevel", !pendingLevelDropPath_.empty())) {
+                requests.mergeScene = pendingLevelDropPath_;
+                pendingLevelDropPath_.clear();
+                pendingLevelDropLabel_.clear();
+                ImGui::CloseCurrentPopup();
             }
             ImGui::Separator();
             if (editorGlyphMenuItem(EditorGlyphIcon::Exit, "Cancel")) {
@@ -2259,8 +2844,251 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 if (savePrefs) {
                     state.editorPrefs->save(state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath);
                 }
+
+                ImGui::SeparatorText("Surface Snapping");
+                bool saveSurfaceSnapPrefs = false;
+                saveSurfaceSnapPrefs |= ImGui::Checkbox("Enable surface snap", &state.editorPrefs->viewportSurfaceSnappingEnabled);
+                saveSurfaceSnapPrefs |= ImGui::Checkbox("Align to normal", &state.editorPrefs->viewportSurfaceSnapAlignToNormal);
+                saveSurfaceSnapPrefs |= ImGui::Checkbox("Preserve yaw", &state.editorPrefs->viewportSurfaceSnapPreserveYaw);
+                saveSurfaceSnapPrefs |= ImGui::Checkbox("Snap bounds bottom", &state.editorPrefs->viewportSurfaceSnapBoundsBottom);
+                ImGui::SetNextItemWidth(140.0f);
+                saveSurfaceSnapPrefs |= ImGui::DragFloat(
+                    "Surface offset",
+                    &state.editorPrefs->viewportSurfaceSnapOffset,
+                    0.01f,
+                    -100.0f,
+                    100.0f,
+                    "%.3f");
+                ImGui::SetNextItemWidth(140.0f);
+                if (ImGui::BeginCombo("Axis constraint", surfaceSnapAxisConstraintLabel(state.editorPrefs->viewportSurfaceSnapAxisConstraint))) {
+                    for (int axis = 0; axis <= 3; ++axis) {
+                        const bool selected = state.editorPrefs->viewportSurfaceSnapAxisConstraint == axis;
+                        if (ImGui::Selectable(surfaceSnapAxisConstraintLabel(axis), selected)) {
+                            state.editorPrefs->viewportSurfaceSnapAxisConstraint = axis;
+                            saveSurfaceSnapPrefs = true;
+                        }
+                        if (selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (saveSurfaceSnapPrefs) {
+                    state.editorPrefs->viewportSurfaceSnapOffset = std::clamp(state.editorPrefs->viewportSurfaceSnapOffset, -100.0f, 100.0f);
+                    state.editorPrefs->viewportSurfaceSnapAxisConstraint = std::clamp(state.editorPrefs->viewportSurfaceSnapAxisConstraint, 0, 3);
+                    state.editorPrefs->save(state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath);
+                }
+
+                ImGui::SeparatorText("Scatter Palettes");
+                bool saveScatterPrefs = false;
+                saveScatterPrefs |= ImGui::Checkbox("Scatter mesh placement", &state.editorPrefs->viewportScatterPaletteByDefault);
+                saveScatterPrefs |= ImGui::Checkbox("Scatter surface align", &state.editorPrefs->viewportScatterPaletteSurfaceAlignment);
+                ImGui::SetNextItemWidth(140.0f);
+                saveScatterPrefs |= ImGui::DragFloat("Scatter density", &state.editorPrefs->viewportScatterPaletteDensity, 0.05f, 0.0f, 10000.0f, "%.2f");
+                ImGui::SetNextItemWidth(140.0f);
+                saveScatterPrefs |= ImGui::DragFloat("Scatter spacing", &state.editorPrefs->viewportScatterPaletteSpacing, 0.05f, 0.001f, 10000.0f, "%.3f");
+                ImGui::SetNextItemWidth(140.0f);
+                saveScatterPrefs |= ImGui::DragFloat("Collision radius", &state.editorPrefs->viewportScatterPaletteCollisionRadius, 0.01f, 0.0f, 10000.0f, "%.3f");
+                ImGui::SetNextItemWidth(140.0f);
+                saveScatterPrefs |= ImGui::DragFloatRange2("Slope range", &state.editorPrefs->viewportScatterPaletteSlopeMinDegrees, &state.editorPrefs->viewportScatterPaletteSlopeMaxDegrees, 0.5f, 0.0f, 180.0f, "%.1f");
+                ImGui::SetNextItemWidth(140.0f);
+                saveScatterPrefs |= ImGui::DragFloatRange2("Height range", &state.editorPrefs->viewportScatterPaletteHeightMin, &state.editorPrefs->viewportScatterPaletteHeightMax, 0.5f, -10000.0f, 10000.0f, "%.1f");
+                ImGui::SetNextItemWidth(140.0f);
+                saveScatterPrefs |= ImGui::DragFloatRange2("Scale range", &state.editorPrefs->viewportScatterPaletteScaleMin, &state.editorPrefs->viewportScatterPaletteScaleMax, 0.01f, 0.001f, 1000.0f, "%.2f");
+                ImGui::SetNextItemWidth(140.0f);
+                saveScatterPrefs |= ImGui::DragFloat("Yaw random", &state.editorPrefs->viewportScatterPaletteYawRandomDegrees, 1.0f, 0.0f, 360.0f, "%.0f");
+                int scatterSeed = static_cast<int>(std::min<uint32_t>(state.editorPrefs->viewportScatterPaletteSeed, static_cast<uint32_t>(std::numeric_limits<int>::max())));
+                ImGui::SetNextItemWidth(140.0f);
+                if (ImGui::DragInt("Scatter seed", &scatterSeed, 1.0f, 0, std::numeric_limits<int>::max())) {
+                    state.editorPrefs->viewportScatterPaletteSeed = static_cast<uint32_t>(std::max(0, scatterSeed));
+                    saveScatterPrefs = true;
+                }
+                if (saveScatterPrefs) {
+                    state.editorPrefs->viewportScatterPaletteDensity = std::clamp(state.editorPrefs->viewportScatterPaletteDensity, 0.0f, 10000.0f);
+                    state.editorPrefs->viewportScatterPaletteSlopeMinDegrees = std::clamp(state.editorPrefs->viewportScatterPaletteSlopeMinDegrees, 0.0f, 180.0f);
+                    state.editorPrefs->viewportScatterPaletteSlopeMaxDegrees = std::clamp(state.editorPrefs->viewportScatterPaletteSlopeMaxDegrees, 0.0f, 180.0f);
+                    if (state.editorPrefs->viewportScatterPaletteSlopeMaxDegrees < state.editorPrefs->viewportScatterPaletteSlopeMinDegrees) {
+                        std::swap(state.editorPrefs->viewportScatterPaletteSlopeMinDegrees, state.editorPrefs->viewportScatterPaletteSlopeMaxDegrees);
+                    }
+                    if (state.editorPrefs->viewportScatterPaletteHeightMax < state.editorPrefs->viewportScatterPaletteHeightMin) {
+                        std::swap(state.editorPrefs->viewportScatterPaletteHeightMin, state.editorPrefs->viewportScatterPaletteHeightMax);
+                    }
+                    state.editorPrefs->viewportScatterPaletteScaleMin = std::clamp(state.editorPrefs->viewportScatterPaletteScaleMin, 0.001f, 1000.0f);
+                    state.editorPrefs->viewportScatterPaletteScaleMax = std::clamp(state.editorPrefs->viewportScatterPaletteScaleMax, 0.001f, 1000.0f);
+                    if (state.editorPrefs->viewportScatterPaletteScaleMax < state.editorPrefs->viewportScatterPaletteScaleMin) {
+                        std::swap(state.editorPrefs->viewportScatterPaletteScaleMin, state.editorPrefs->viewportScatterPaletteScaleMax);
+                    }
+                    state.editorPrefs->viewportScatterPaletteYawRandomDegrees = std::clamp(state.editorPrefs->viewportScatterPaletteYawRandomDegrees, 0.0f, 360.0f);
+                    state.editorPrefs->viewportScatterPaletteSpacing = std::clamp(state.editorPrefs->viewportScatterPaletteSpacing, 0.001f, 10000.0f);
+                    state.editorPrefs->viewportScatterPaletteCollisionRadius = std::clamp(state.editorPrefs->viewportScatterPaletteCollisionRadius, 0.0f, 10000.0f);
+                    state.editorPrefs->save(state.editorPreferencesPath.empty() ? EditorPreferences::defaultPath() : state.editorPreferencesPath);
+                }
             }
             ImGui::SeparatorText("Advanced Tools");
+            std::vector<EntityId> pivotSelection = editableTransformSelection(state, selection);
+            auto setEditorPivot = [&](EditorPivotSettings nextPivot, const char* label) {
+                if (state.sceneDocument == nullptr) {
+                    return;
+                }
+                const SceneDocument before = *state.sceneDocument;
+                state.sceneDocument->setEditorPivot(nextPivot);
+                requests.sceneSnapshot = EditorSceneSnapshotChange{
+                    .before = before,
+                    .updateKind = SceneUpdateKind::None,
+                    .label = label,
+                };
+            };
+            auto setPivotMode = [&](EditorPivotMode mode) {
+                if (state.sceneDocument == nullptr) {
+                    return;
+                }
+                EditorPivotSettings pivot = state.sceneDocument->editorPivot();
+                pivot.mode = mode;
+                setEditorPivot(pivot, "Set Pivot Mode");
+            };
+            if (state.sceneDocument != nullptr) {
+                const EditorPivotSettings currentPivot = state.sceneDocument->editorPivot();
+                ImGui::TextUnformatted("Pivot");
+                ImGui::SameLine(58.0f);
+                if (editorIconTextButton("PivotActive", EditorGlyphIcon::Frame, editorPivotModeLabel(EditorPivotMode::Active), currentPivot.mode == EditorPivotMode::Active)) {
+                    setPivotMode(EditorPivotMode::Active);
+                }
+                ImGui::SameLine();
+                ImGui::BeginDisabled(pivotSelection.empty());
+                if (editorIconTextButton("PivotSelectionCenter", EditorGlyphIcon::Group, editorPivotModeLabel(EditorPivotMode::SelectionCenter), currentPivot.mode == EditorPivotMode::SelectionCenter)) {
+                    setPivotMode(EditorPivotMode::SelectionCenter);
+                }
+                ImGui::SameLine();
+                if (editorIconTextButton("PivotBoundsCenter", EditorGlyphIcon::Layout, editorPivotModeLabel(EditorPivotMode::BoundsCenter), currentPivot.mode == EditorPivotMode::BoundsCenter)) {
+                    setPivotMode(EditorPivotMode::BoundsCenter);
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (editorIconTextButton("PivotCustom", EditorGlyphIcon::Move, editorPivotModeLabel(EditorPivotMode::Custom), currentPivot.mode == EditorPivotMode::Custom)) {
+                    setPivotMode(EditorPivotMode::Custom);
+                }
+
+                ImGui::BeginDisabled(pivotSelection.empty());
+                if (editorIconTextButton("PivotCustomFromSelection", EditorGlyphIcon::Group, "From Sel")) {
+                    EditorPivotSettings pivot = currentPivot;
+                    pivot.mode = EditorPivotMode::Custom;
+                    pivot.customPosition = selectionPositionCenter(state.sceneDocument->registry(), *state.sceneDocument->registry().entity(pivotSelection.front()), pivotSelection);
+                    setEditorPivot(pivot, "Set Custom Pivot From Selection");
+                }
+                ImGui::SameLine();
+                if (editorIconTextButton("PivotCustomFromBounds", EditorGlyphIcon::Layout, "From Bnd")) {
+                    EditorPivotSettings pivot = currentPivot;
+                    pivot.mode = EditorPivotMode::Custom;
+                    const Entity* active = state.sceneDocument->registry().entity(pivotSelection.front());
+                    if (active != nullptr) {
+                        pivot.customPosition = selectionBoundsCenter(state, pivotSelection).value_or(selectionPositionCenter(state.sceneDocument->registry(), *active, pivotSelection));
+                        setEditorPivot(pivot, "Set Custom Pivot From Bounds");
+                    }
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (editorIconTextButton("PivotCustomFromHit", EditorGlyphIcon::Select, "From Hit")) {
+                    if (const std::optional<Transform> hit = viewportDropPlacementTransform(state, snap_.enabled, snap_.translation, false, true)) {
+                        EditorPivotSettings pivot = currentPivot;
+                        pivot.mode = EditorPivotMode::Custom;
+                        pivot.customPosition = hit->position;
+                        pivot.customRotationEuler = hit->rotationEuler;
+                        setEditorPivot(pivot, "Set Custom Pivot From Hit");
+                    } else if (const std::optional<Transform> grid = viewportDropPlacementTransform(state, snap_.enabled, snap_.translation, true, false)) {
+                        EditorPivotSettings pivot = currentPivot;
+                        pivot.mode = EditorPivotMode::Custom;
+                        pivot.customPosition = grid->position;
+                        pivot.customRotationEuler = grid->rotationEuler;
+                        setEditorPivot(pivot, "Set Custom Pivot From Hit");
+                    }
+                }
+                ImGui::SameLine();
+                if (editorIconTextButton("PivotCustomWorldOrigin", EditorGlyphIcon::Reset, "Origin")) {
+                    EditorPivotSettings pivot = currentPivot;
+                    pivot.mode = EditorPivotMode::Custom;
+                    pivot.customPosition = glm::vec3{0.0f};
+                    pivot.customRotationEuler = glm::vec3{0.0f};
+                    setEditorPivot(pivot, "Set Custom Pivot To Origin");
+                }
+                glm::vec3 typedPosition = currentPivot.customPosition;
+                glm::vec3 typedRotationDegrees = glm::degrees(currentPivot.customRotationEuler);
+                ImGui::SetNextItemWidth(240.0f);
+                if (ImGui::InputFloat3("Pivot Pos", glm::value_ptr(typedPosition), "%.3f", ImGuiInputTextFlags_EnterReturnsTrue)) {
+                    EditorPivotSettings pivot = currentPivot;
+                    pivot.mode = EditorPivotMode::Custom;
+                    pivot.customPosition = typedPosition;
+                    setEditorPivot(pivot, "Set Custom Pivot Position");
+                }
+                ImGui::SetNextItemWidth(240.0f);
+                if (ImGui::InputFloat3("Pivot Rot", glm::value_ptr(typedRotationDegrees), "%.1f", ImGuiInputTextFlags_EnterReturnsTrue)) {
+                    EditorPivotSettings pivot = currentPivot;
+                    pivot.mode = EditorPivotMode::Custom;
+                    pivot.customRotationEuler = glm::radians(typedRotationDegrees);
+                    setEditorPivot(pivot, "Set Custom Pivot Rotation");
+                }
+            }
+            std::vector<EntityId> alignSelection = selection.selectedEntitiesOr(selection.entityId());
+            alignSelection.erase(
+                std::remove_if(
+                    alignSelection.begin(),
+                    alignSelection.end(),
+                    [&](EntityId id) {
+                        const Entity* entity = state.sceneDocument != nullptr ? state.sceneDocument->registry().entity(id) : nullptr;
+                        return entity == nullptr || entity->locked;
+                    }),
+                alignSelection.end());
+            const bool canAlignDistribute = alignSelection.size() >= 2;
+            const bool canDistribute = alignSelection.size() >= 3;
+            std::vector<EditorAlignDistributeEntityBounds> alignBounds;
+            alignBounds.reserve(alignSelection.size());
+            for (EntityId id : alignSelection) {
+                if (const Entity* entity = state.sceneDocument != nullptr ? state.sceneDocument->registry().entity(id) : nullptr) {
+                    alignBounds.push_back(alignDistributeBoundsForEntity(state, *entity));
+                }
+            }
+            auto requestAlignDistribute = [&](EditorAlignDistributeAxis axis, EditorAlignDistributeMode mode) {
+                requests.alignDistributeEntities = EditorAlignDistributeRequest{
+                    .entities = alignSelection,
+                    .bounds = alignBounds,
+                    .axis = axis,
+                    .mode = mode,
+                };
+            };
+            auto drawAlignDistributeAxis = [&](const char* label, EditorAlignDistributeAxis axis) {
+                ImGui::TextUnformatted(label);
+                ImGui::SameLine(28.0f);
+                ImGui::BeginDisabled(!canAlignDistribute);
+                const std::string minId = std::string("Align") + label + "Min";
+                if (editorIconTextButton(minId.c_str(), EditorGlyphIcon::Move, "Min")) {
+                    requestAlignDistribute(axis, EditorAlignDistributeMode::AlignMin);
+                }
+                ImGui::SameLine();
+                const std::string midId = std::string("Align") + label + "Center";
+                if (editorIconTextButton(midId.c_str(), EditorGlyphIcon::Move, "Mid")) {
+                    requestAlignDistribute(axis, EditorAlignDistributeMode::AlignCenter);
+                }
+                ImGui::SameLine();
+                const std::string maxId = std::string("Align") + label + "Max";
+                if (editorIconTextButton(maxId.c_str(), EditorGlyphIcon::Move, "Max")) {
+                    requestAlignDistribute(axis, EditorAlignDistributeMode::AlignMax);
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!canDistribute);
+                const std::string spaceId = std::string("Distribute") + label + "Spacing";
+                if (editorIconTextButton(spaceId.c_str(), EditorGlyphIcon::Move, "Space")) {
+                    requestAlignDistribute(axis, EditorAlignDistributeMode::DistributeSpacing);
+                }
+                ImGui::EndDisabled();
+            };
+            drawAlignDistributeAxis("X", EditorAlignDistributeAxis::X);
+            drawAlignDistributeAxis("Y", EditorAlignDistributeAxis::Y);
+            drawAlignDistributeAxis("Z", EditorAlignDistributeAxis::Z);
+            if (!canAlignDistribute) {
+                ImGui::TextDisabled("Select at least two unlocked entities.");
+            } else if (!canDistribute) {
+                ImGui::TextDisabled("Spacing distribution requires three unlocked entities.");
+            }
             if (editorIconTextButton("ViewportAdvancedToolsReadinessReport", EditorGlyphIcon::Details, "Advanced Tools Readiness")) {
                 std::filesystem::path reportPath;
                 std::string error;
@@ -2414,16 +3242,24 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             if (showGrid_) drawGridOverlay(state, *state.camera);
         }
 
-        if (state.sceneDocument != nullptr && selection.entityId().valid()) {
+        if (state.sceneDocument != nullptr && state.camera != nullptr && selection.entityId().valid()) {
+            std::vector<EntityId> transformSelection = editableTransformSelection(state, selection);
             Entity* entity = state.sceneDocument->registry().entity(selection.entityId());
-            if (entity != nullptr && !entity->locked && state.camera != nullptr) {
+            if ((entity == nullptr || entity->locked) && !transformSelection.empty()) {
+                entity = state.sceneDocument->registry().entity(transformSelection.front());
+            }
+            if (entity != nullptr && !entity->locked) {
                 if (transformGizmoMode_ >= 0) {
                     const glm::mat4 view = editorViewMatrix(*state.camera);
                     const glm::mat4 projection = editorProjectionMatrix(
                         activeCameraFov(*state.sceneDocument),
                         viewportAspect(state));
 
-                    glm::mat4 world = entityWorldMatrix(state.sceneDocument->registry(), *entity);
+                    const bool nonActivePivot = state.sceneDocument->editorPivot().mode != EditorPivotMode::Active;
+                    const bool groupTransform = transformSelection.size() > 1 || nonActivePivot;
+                    glm::mat4 world = groupTransform
+                        ? pivotWorldMatrixForSelection(state, *entity, transformSelection)
+                        : entityWorldMatrix(state.sceneDocument->registry(), *entity);
                     const ImGuizmo::OPERATION operation = transformGizmoMode_ == 0
                         ? ImGuizmo::TRANSLATE
                         : (transformGizmoMode_ == 1 ? ImGuizmo::ROTATE : ImGuizmo::SCALE);
@@ -2453,37 +3289,100 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                     const bool isUsing = ImGuizmo::IsUsing();
                     gizmoHoveredOrUsing = isOver || isUsing;
 
-                    if (isUsing && (!gizmoDragActive_ || gizmoDragEntity_ != entity->id)) {
+                    if (isUsing && groupTransform && (!gizmoDragActive_ || groupGizmoDragOriginals_.empty())) {
+                        gizmoDragActive_ = true;
+                        gizmoDragModified_ = false;
+                        gizmoDragEntity_ = entity->id;
+                        gizmoDragOriginal_ = entity->transform;
+                        gizmoDragParentWorld_ = parentWorldMatrix(state.sceneDocument->registry(), *entity);
+                        gizmoDragOriginalWorld_ = entityWorldMatrix(state.sceneDocument->registry(), *entity);
+                        groupGizmoDragOriginalWorld_ = previousWorld;
+                        groupGizmoDragOriginals_.clear();
+                        groupGizmoDragOriginals_.reserve(transformSelection.size());
+                        for (EntityId id : transformSelection) {
+                            if (Entity* selected = state.sceneDocument->registry().entity(id); selected != nullptr && !selected->locked) {
+                                groupGizmoDragOriginals_.push_back(GroupGizmoOriginal{
+                                    .entity = id,
+                                    .transform = selected->transform,
+                                    .parentWorld = parentWorldMatrix(state.sceneDocument->registry(), *selected),
+                                    .world = entityWorldMatrix(state.sceneDocument->registry(), *selected),
+                                });
+                            }
+                        }
+                    } else if (isUsing && !groupTransform && (!gizmoDragActive_ || gizmoDragEntity_ != entity->id || !groupGizmoDragOriginals_.empty())) {
                         gizmoDragActive_ = true;
                         gizmoDragModified_ = false;
                         gizmoDragEntity_ = entity->id;
                         gizmoDragOriginal_ = entity->transform;
                         gizmoDragParentWorld_ = parentWorldMatrix(state.sceneDocument->registry(), *entity);
                         gizmoDragOriginalWorld_ = previousWorld;
+                        groupGizmoDragOriginals_.clear();
+                    }
+
+                    if (manipulated && operation == ImGuizmo::TRANSLATE) {
+                        const EditorSurfaceSnapSettings surfaceSnap = surfaceSnapSettingsFromPreferences(state.editorPrefs);
+                        if (const std::optional<glm::mat4> snappedWorld = surfaceSnappedGizmoWorldMatrix(
+                                state,
+                                *entity,
+                                world,
+                                groupGizmoDragOriginalWorld_,
+                                groupGizmoDragOriginals_,
+                                transformSelection,
+                                surfaceSnap)) {
+                            world = *snappedWorld;
+                        }
                     }
 
                     if (manipulated && world != previousWorld) {
-                        const glm::mat4 parentWorld = gizmoDragActive_ && gizmoDragEntity_ == entity->id
-                            ? gizmoDragParentWorld_
-                            : parentWorldMatrix(state.sceneDocument->registry(), *entity);
-                        const glm::mat4 local = glm::inverse(parentWorld) * world;
                         const bool linkedScale = state.editorPrefs != nullptr && state.editorPrefs->linkedScale;
-                        const std::optional<glm::vec3> linkedScaleReference =
-                            operation == ImGuizmo::SCALE && linkedScale && gizmoDragActive_ && gizmoDragEntity_ == entity->id
-                                ? std::optional<glm::vec3>{gizmoDragOriginal_.scale}
-                                : std::nullopt;
-                        writeLocalTransformFromMatrix(*entity, local, linkedScaleReference);
-                        if (gizmoDragActive_ && gizmoDragEntity_ == entity->id) {
-                            gizmoDragModified_ = true;
+                        if (groupTransform && !groupGizmoDragOriginals_.empty()) {
+                            const glm::mat4 delta = world * glm::inverse(groupGizmoDragOriginalWorld_);
+                            EditorEntityTransformBatchPreview batchPreview;
+                            for (const GroupGizmoOriginal& original : groupGizmoDragOriginals_) {
+                                Entity* selected = state.sceneDocument->registry().entity(original.entity);
+                                if (selected == nullptr || selected->locked) {
+                                    continue;
+                                }
+                                const glm::mat4 local = glm::inverse(original.parentWorld) * delta * original.world;
+                                const std::optional<glm::vec3> linkedScaleReference = operation == ImGuizmo::SCALE && linkedScale
+                                    ? std::optional<glm::vec3>{original.transform.scale}
+                                    : std::nullopt;
+                                writeLocalTransformFromMatrix(*selected, local, linkedScaleReference);
+                                const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *selected);
+                                state.sceneDocument->markDirty(updateKind);
+                                requests.sceneUpdate = updateKind;
+                                batchPreview.previews.push_back(EditorEntityTransformPreview{
+                                    .entity = selected->id,
+                                    .transform = selected->transform,
+                                    .updateKind = updateKind,
+                                });
+                            }
+                            if (!batchPreview.previews.empty()) {
+                                requests.previewEntityTransforms = std::move(batchPreview);
+                                gizmoDragModified_ = true;
+                            }
+                        } else {
+                            const glm::mat4 parentWorld = gizmoDragActive_ && gizmoDragEntity_ == entity->id
+                                ? gizmoDragParentWorld_
+                                : parentWorldMatrix(state.sceneDocument->registry(), *entity);
+                            const glm::mat4 local = glm::inverse(parentWorld) * world;
+                            const std::optional<glm::vec3> linkedScaleReference =
+                                operation == ImGuizmo::SCALE && linkedScale && gizmoDragActive_ && gizmoDragEntity_ == entity->id
+                                    ? std::optional<glm::vec3>{gizmoDragOriginal_.scale}
+                                    : std::nullopt;
+                            writeLocalTransformFromMatrix(*entity, local, linkedScaleReference);
+                            if (gizmoDragActive_ && gizmoDragEntity_ == entity->id) {
+                                gizmoDragModified_ = true;
+                            }
+                            const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *entity);
+                            state.sceneDocument->markDirty(updateKind);
+                            requests.sceneUpdate = updateKind;
+                            requests.previewEntityTransform = EditorEntityTransformPreview{
+                                .entity = entity->id,
+                                .transform = entity->transform,
+                                .updateKind = updateKind,
+                            };
                         }
-                        const SceneUpdateKind updateKind = transformUpdateKind(*state.sceneDocument, *entity);
-                        state.sceneDocument->markDirty(updateKind);
-                        requests.sceneUpdate = updateKind;
-                        requests.previewEntityTransform = EditorEntityTransformPreview{
-                            .entity = entity->id,
-                            .transform = entity->transform,
-                            .updateKind = updateKind,
-                        };
                     }
 
                     updateGizmoState(isOver, isUsing, transformGizmoMode_);
@@ -2571,8 +3470,27 @@ void ViewportPanel::commitGizmoDrag(EditorRequests& requests, SceneDocument& doc
     if (!gizmoDragActive_) {
         return;
     }
-    Entity* entity = document.registry().entity(gizmoDragEntity_);
-    if (entity != nullptr && gizmoDragModified_) {
+    if (!groupGizmoDragOriginals_.empty() && gizmoDragModified_) {
+        EditorEntityTransformBatchChange batch;
+        SceneUpdateMask updateMask = SceneUpdateMaskNone;
+        for (const GroupGizmoOriginal& original : groupGizmoDragOriginals_) {
+            Entity* entity = document.registry().entity(original.entity);
+            if (entity == nullptr || entity->locked) {
+                continue;
+            }
+            updateMask |= sceneUpdateKindMask(transformUpdateKind(document, *entity));
+            batch.changes.push_back(EditorEntityTransformChange{
+                .entity = original.entity,
+                .oldTransform = original.transform,
+                .newTransform = entity->transform,
+            });
+        }
+        if (!batch.changes.empty()) {
+            document.markDirty(updateMask);
+            requests.sceneUpdate = sceneUpdateKindFromMask(updateMask);
+            requests.setEntityTransforms = std::move(batch);
+        }
+    } else if (Entity* entity = document.registry().entity(gizmoDragEntity_); entity != nullptr && gizmoDragModified_) {
         const Transform finalTransform = entity->transform;
         const SceneUpdateKind updateKind = transformUpdateKind(document, *entity);
         document.markDirty(updateKind);
@@ -2589,6 +3507,8 @@ void ViewportPanel::commitGizmoDrag(EditorRequests& requests, SceneDocument& doc
     gizmoDragOriginal_ = {};
     gizmoDragParentWorld_ = glm::mat4{1.0f};
     gizmoDragOriginalWorld_ = glm::mat4{1.0f};
+    groupGizmoDragOriginals_.clear();
+    groupGizmoDragOriginalWorld_ = glm::mat4{1.0f};
 }
 
 void ViewportPanel::abortGizmoDrag() {
@@ -2601,6 +3521,8 @@ void ViewportPanel::abortGizmoDrag() {
     gizmoDragOriginal_ = {};
     gizmoDragParentWorld_ = glm::mat4{1.0f};
     gizmoDragOriginalWorld_ = glm::mat4{1.0f};
+    groupGizmoDragOriginals_.clear();
+    groupGizmoDragOriginalWorld_ = glm::mat4{1.0f};
 }
 
 void ViewportPanel::reloadViewportPreferences(const EditorPreferences& preferences) {

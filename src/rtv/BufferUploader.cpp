@@ -51,10 +51,39 @@ void BufferUploader::recordUpload(VkDeviceSize byteSize) {
     ++stats_.uploadCount;
 }
 
+std::vector<GpuUploadTicketSnapshot> BufferUploader::uploadTicketSnapshots(bool includeChunks) const {
+    return uploadTickets_.snapshots(includeChunks);
+}
+
+void BufferUploader::recordUploadTicket(GpuUploadResourceKind kind, VkDeviceSize byteSize, const char* label) {
+    if (byteSize == 0) {
+        return;
+    }
+    const uint64_t bytes = static_cast<uint64_t>(byteSize);
+    const uint64_t ticketId = uploadTickets_.create(GpuUploadTicketDesc{
+        .kind = kind,
+        .label = label != nullptr ? label : "Vulkan upload",
+        .totalBytes = bytes,
+        .chunkBytes = bytes,
+    });
+    if (ticketId == 0) {
+        return;
+    }
+    (void)uploadTickets_.submitFrame(GpuUploadFrameBudget{
+        .maxBytes = bytes,
+        .maxSubmissions = 1,
+    });
+    const uint64_t submittedTimeline = uploadTickets_.nextTimelineValue() > 0 ? uploadTickets_.nextTimelineValue() - 1ull : 0ull;
+    if (submittedTimeline != 0) {
+        (void)uploadTickets_.completeTimeline(submittedTimeline);
+    }
+}
+
 void BufferUploader::recordBatchUpload(VkDeviceSize byteSize) {
     if (byteSize == 0) {
         return;
     }
+    recordUploadTicket(GpuUploadResourceKind::Buffer, byteSize, "Vulkan batch upload");
     recordUpload(byteSize);
     ++stats_.batchUploadCount;
 }
@@ -96,6 +125,7 @@ void BufferUploader::uploadToBuffer(Buffer& destination, const void* data, VkDev
         .dstAccess = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
     });
     uploadContext_.submitAndWait(cmd);
+    recordUploadTicket(GpuUploadResourceKind::Buffer, byteSize, "Vulkan buffer upload");
     recordUpload(byteSize);
     ++stats_.bufferUploadCount;
 }
@@ -170,6 +200,7 @@ void BufferUploader::uploadToImage2D(
     image.setLayout(finalLayout);
 
     uploadContext_.submitAndWait(cmd);
+    recordUploadTicket(GpuUploadResourceKind::Image, byteSize, "Vulkan image upload");
     recordUpload(byteSize);
     ++stats_.imageUploadCount;
 }

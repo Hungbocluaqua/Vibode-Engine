@@ -89,13 +89,21 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
         }
         pathTracer_->setFrameDeltaSeconds(deltaSeconds);
         pathTracer_->beginFrame(frameIndex_, renderExtent, displayExtent);
+        pathTracer_->markStreamlineReflexSimulationStart();
+        pathTracer_->markStreamlineReflexSimulationEnd();
     } else if (pipelineDemo_ != nullptr) {
         pipelineDemo_->beginFrame(frameIndex_);
     }
     recordWorkCommands(frame.commandBuffer, imageIndex, clearPhase);
     const bool asyncComputeRecorded = recordAsyncComputeCommands(frame);
     recordPresentationCommands(frame.postCommandBuffer, imageIndex, clearPhase);
+    if (pathTracer_ != nullptr) {
+        pathTracer_->markStreamlineReflexRenderSubmitStart();
+    }
     submitFrame(frame, imageIndex, asyncComputeRecorded);
+    if (pathTracer_ != nullptr) {
+        pathTracer_->markStreamlineReflexRenderSubmitEnd();
+    }
 
     if (headless_) {
         frameIndex_ = (frameIndex_ + 1) % framesInFlight;
@@ -111,7 +119,13 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     presentInfo.pSwapchains = &swapchainHandle;
     presentInfo.pImageIndices = &imageIndex;
 
+    if (pathTracer_ != nullptr) {
+        pathTracer_->markStreamlineReflexPresentStart();
+    }
     VkResult presentResult = vkQueuePresentKHR(context_.presentQueue(), &presentInfo);
+    if (pathTracer_ != nullptr) {
+        pathTracer_->markStreamlineReflexPresentEnd();
+    }
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
         recreateSwapchainResources();
     } else {

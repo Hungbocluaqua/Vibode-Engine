@@ -206,6 +206,15 @@ layout(set = 0, binding = 26, std430) readonly buffer LocalMeshVertices {
 layout(set = 0, binding = 27, std430) readonly buffer LocalMeshIndices {
     uint local_mesh_indices[];
 };
+layout(set = 0, binding = 28, std430) readonly buffer GpuSkinningRtMeshBindings {
+    uvec4 gpu_skinning_rt_mesh_bindings[];
+};
+layout(set = 0, binding = 29, std430) readonly buffer GpuSkinningRtVertices {
+    LocalVertex gpu_skinning_rt_vertices[];
+};
+layout(set = 0, binding = 31, std430) readonly buffer GpuSkinningRtPreviousVertices {
+    LocalVertex gpu_skinning_rt_previous_vertices[];
+};
 layout(set = 0, binding = 34, std430) readonly buffer RtTriangleMaterialIds {
     uint rt_triangle_material_ids[];
 };
@@ -312,6 +321,9 @@ struct Material {
     vec3 volume_attenuation_color;
     float volume_attenuation_distance;
     float dispersion_factor;
+    int opacity_texture;
+    int height_texture;
+    float height_scale;
     vec3 clearcoat_normal;
     float clearcoat_normal_variance;
 };
@@ -411,6 +423,7 @@ struct RayPayload {
     uint mesh_id;
     uint primitive_id;
     uint picking;
+    vec3 barycentrics;
     vec2 uv;
     vec2 uv1;
     vec3 tangent;
@@ -420,7 +433,7 @@ struct RayPayload {
 
 const float PI = 3.14159265358979323846;
 const uint TRI_STRIDE = 12u;
-const uint MATERIAL_PARAMETER_STRIDE = 17u;
+const uint MATERIAL_PARAMETER_STRIDE = 18u;
 const uint MATERIAL_TEXTURE_TRANSFORM_COUNT = 17u;
 const uint MATERIAL_TEXTURE_TRANSFORM_BASE = MATERIAL_PARAMETER_STRIDE;
 const uint MATERIAL_STRIDE = MATERIAL_PARAMETER_STRIDE + MATERIAL_TEXTURE_TRANSFORM_COUNT * 2u;
@@ -444,6 +457,9 @@ const uint MATERIAL_TEXTURE_TRANSFORM_ANISOTROPY = 16u;
 const int MATERIAL_TEXTURE_LIMIT = 1024;
 const uint MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB = 1u << 0u;
 const uint MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB = 1u << 1u;
+const uint MATERIAL_FLAG_NORMAL_MAP_DIRECTX = 1u << 2u;
+const uint MATERIAL_FLAG_SPECULAR_GLOSSINESS_WORKFLOW = 1u << 3u;
+const uint MATERIAL_FLAG_SPECULAR_ALPHA_GLOSSINESS = 1u << 4u;
 const uint ALPHA_MODE_OPAQUE = 0u;
 const uint ALPHA_MODE_MASK = 1u;
 const uint ALPHA_MODE_BLEND = 2u;
@@ -918,18 +934,63 @@ uint pack_invalid_velocity_pixels() {
     return pack_velocity_pixels(vec2(SCREEN_VELOCITY_PACK_SCALE));
 }
 
-uint compute_surface_velocity(vec3 currentWorldPos, vec3 localPos, uint instanceId, ivec2 dims) {
-    vec3 previousWorldPos = currentWorldPos;
-    if (instanceId < mesh_params.instance_count) {
-        InstanceRecord instance = instance_records[instanceId];
-        previousWorldPos = (instance.prev_transform * vec4(localPos, 1.0)).xyz;
-    }
-
+uint compute_surface_velocity_from_previous_world(vec3 currentWorldPos, vec3 previousWorldPos, ivec2 dims) {
     vec2 currentPos;
     vec2 previousPos;
     bool valid = project_unjittered_to_pixels_checked(prev_camera.view_proj, prev_camera.jitter.xy, currentWorldPos, dims, currentPos) &&
         project_unjittered_to_pixels_checked(prev_camera.prev_view_proj, prev_camera.jitter.zw, previousWorldPos, dims, previousPos);
     return valid ? pack_velocity_pixels(currentPos - previousPos) : pack_invalid_velocity_pixels();
+}
+
+vec3 previous_skinned_local_position(uint meshIndex, uint primitiveIndex, vec3 barycentrics, vec3 fallbackLocalPos) {
+    if (meshIndex >= mesh_params.mesh_count) {
+        return fallbackLocalPos;
+    }
+
+    uvec4 binding = gpu_skinning_rt_mesh_bindings[meshIndex];
+    if (binding.z == 0u) {
+        return fallbackLocalPos;
+    }
+
+    uint triangleCount = mesh_params.local_index_count / 3u;
+    if (primitiveIndex >= triangleCount) {
+        return fallbackLocalPos;
+    }
+
+    uint triIndex = primitiveIndex * 3u;
+    uint i0 = local_mesh_indices[triIndex + 0u];
+    uint i1 = local_mesh_indices[triIndex + 1u];
+    uint i2 = local_mesh_indices[triIndex + 2u];
+    bool inSkinnedRange = i0 >= binding.x && (i0 - binding.x) < binding.y &&
+        i1 >= binding.x && (i1 - binding.x) < binding.y &&
+        i2 >= binding.x && (i2 - binding.x) < binding.y;
+    if (!inSkinnedRange) {
+        return fallbackLocalPos;
+    }
+
+    LocalVertex v0 = gpu_skinning_rt_previous_vertices[i0];
+    LocalVertex v1 = gpu_skinning_rt_previous_vertices[i1];
+    LocalVertex v2 = gpu_skinning_rt_previous_vertices[i2];
+    return v0.position_uv_x.xyz * barycentrics.x +
+        v1.position_uv_x.xyz * barycentrics.y +
+        v2.position_uv_x.xyz * barycentrics.z;
+}
+
+uint compute_surface_velocity(
+    vec3 currentWorldPos,
+    vec3 localPos,
+    uint instanceId,
+    uint meshId,
+    uint primitiveId,
+    vec3 barycentrics,
+    ivec2 dims) {
+    vec3 previousWorldPos = currentWorldPos;
+    if (instanceId < mesh_params.instance_count) {
+        InstanceRecord instance = instance_records[instanceId];
+        vec3 previousLocalPos = previous_skinned_local_position(meshId, primitiveId, barycentrics, localPos);
+        previousWorldPos = (instance.prev_transform * vec4(previousLocalPos, 1.0)).xyz;
+    }
+    return compute_surface_velocity_from_previous_world(currentWorldPos, previousWorldPos, dims);
 }
 
 uint compute_sky_velocity(vec3 rayDir, ivec2 dims) {
@@ -984,6 +1045,7 @@ Material decode_material(uint mat_idx) {
     vec4 d14 = mesh_materials[idx + 14u];
     vec4 d15 = mesh_materials[idx + 15u];
     vec4 d16 = mesh_materials[idx + 16u];
+    vec4 d17 = mesh_materials[idx + 17u];
     Material m;
     m.material_data_index = idx;
     m.color = d0.xyz;
@@ -1037,6 +1099,9 @@ Material decode_material(uint mat_idx) {
     m.volume_attenuation_color = clamp(d15.xyz, vec3(0.0), vec3(1.0));
     m.volume_attenuation_distance = d15.w;
     m.dispersion_factor = max(d16.x, 0.0);
+    m.opacity_texture = int(round(d17.x));
+    m.height_texture = int(round(d17.y));
+    m.height_scale = d17.z;
     m.clearcoat_normal = vec3(0.0);
     m.clearcoat_normal_variance = 0.0;
     return m;
@@ -1066,6 +1131,20 @@ uint geometry_triangle_offset(uint meshIndex, uint geometryIndex, uint meshFirst
     return rt_geometry_triangle_offsets[range.x + min(geometryIndex, range.y - 1u)];
 }
 
+LocalVertex ray_tracing_local_vertex(uint meshIndex, uint vertexIndex) {
+    if (meshIndex < mesh_params.mesh_count) {
+        uvec4 binding = gpu_skinning_rt_mesh_bindings[meshIndex];
+        if (binding.z != 0u && vertexIndex >= binding.x && (vertexIndex - binding.x) < binding.y) {
+            return gpu_skinning_rt_vertices[vertexIndex];
+        }
+    }
+    return local_mesh_vertices[vertexIndex];
+}
+
+bool ray_tracing_mesh_has_gpu_skinning(uint meshIndex) {
+    return meshIndex < mesh_params.mesh_count && gpu_skinning_rt_mesh_bindings[meshIndex].z != 0u;
+}
+
 vec2 material_texture_uv(Material material, uint slot, vec2 uv0, vec2 uv1) {
     if (slot >= MATERIAL_TEXTURE_TRANSFORM_COUNT) {
         return uv0;
@@ -1092,6 +1171,20 @@ vec2 apply_material_texture_transform(Material material, uint slot, vec2 uv0, ve
     float s = sin(transform1.x);
     vec2 rotated = vec2(c * scaled.x - s * scaled.y, s * scaled.x + c * scaled.y);
     return transform0.xy + rotated;
+}
+
+vec2 apply_material_height_parallax(Material material, vec2 uv0, vec2 uv1, vec3 normal, vec3 tangent, vec3 bitangent, vec3 rayDirection) {
+    if (material.height_texture < 0 || material.height_texture >= MATERIAL_TEXTURE_LIMIT) {
+        return uv0;
+    }
+    vec3 n = normalize(normal);
+    vec3 t = normalize(tangent);
+    vec3 b = normalize(bitangent);
+    vec3 viewDir = normalize(-rayDirection);
+    vec3 viewTs = vec3(dot(viewDir, t), dot(viewDir, b), max(dot(viewDir, n), 0.08));
+    float height = texture(material_textures[nonuniformEXT(material.height_texture)], uv0).r;
+    float centeredHeight = clamp(height, 0.0, 1.0) - 0.5;
+    return uv0 + (viewTs.xy / viewTs.z) * centeredHeight * clamp(material.height_scale, 0.0, 0.25);
 }
 
 void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
@@ -1170,7 +1263,16 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.specular_texture >= 0 && material.specular_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.specular_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SPECULAR, uv0, uv1);
-        material.specular_factor = clamp(material.specular_factor * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).a, 0.0, 1.0);
+        vec4 specularSample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
+        if ((flags & MATERIAL_FLAG_SPECULAR_ALPHA_GLOSSINESS) != 0u) {
+            float glossinessFactor = clamp(1.0 - material.roughness, 0.0, 1.0);
+            material.roughness = clamp(1.0 - glossinessFactor * specularSample.a, 0.0, 1.0);
+        } else {
+            material.specular_factor = clamp(material.specular_factor * specularSample.a, 0.0, 1.0);
+        }
+        if ((flags & MATERIAL_FLAG_SPECULAR_GLOSSINESS_WORKFLOW) != 0u) {
+            material.specular_color *= max(specularSample.rgb, vec3(0.0));
+        }
     }
     if (material.specular_color_texture >= 0 && material.specular_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.specular_color_texture;
@@ -1191,6 +1293,11 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
         int textureIndex = material.volume_thickness_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_VOLUME_THICKNESS, uv0, uv1);
         material.volume_thickness_factor *= max(texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).g, 0.0);
+    }
+    if (material.opacity_texture >= 0 && material.opacity_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.opacity_texture;
+        float opacity = texture(material_textures[nonuniformEXT(textureIndex)], uv0).r;
+        material.alpha_factor *= clamp(opacity, 0.0, 1.0);
     }
 }
 
@@ -1220,6 +1327,11 @@ void apply_material_alpha_texture(inout Material material, vec2 uv0, vec2 uv1) {
         vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
         material.alpha_factor *= base.a;
     }
+    if (material.opacity_texture >= 0 && material.opacity_texture < MATERIAL_TEXTURE_LIMIT) {
+        int textureIndex = material.opacity_texture;
+        float opacity = texture(material_textures[nonuniformEXT(textureIndex)], uv0).r;
+        material.alpha_factor *= clamp(opacity, 0.0, 1.0);
+    }
 }
 
 bool accept_material_alpha(Material material) {
@@ -1239,6 +1351,13 @@ vec3 apply_normal_texture(inout Material material, vec2 uv0, vec2 uv1, vec3 norm
     int textureIndex = material.normal_texture;
     vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_NORMAL, uv0, uv1);
     vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).xyz * 2.0 - 1.0;
+    uint flags = uint(round(material.pad2));
+    if ((flags & MATERIAL_FLAG_NORMAL_MAP_DIRECTX) != 0u) {
+        tangentSample.y = -tangentSample.y;
+    }
+    if (tangentSample.z < 0.0) {
+        tangentSample.z = sqrt(max(1.0 - dot(tangentSample.xy, tangentSample.xy), 0.0));
+    }
     material.normal_variance = clamp(dot(tangentSample.xy, tangentSample.xy), 0.0, 1.0);
     vec3 t = normalize(tangent - normal * dot(normal, tangent));
     vec3 b = normalize(bitangent - normal * dot(normal, bitangent));
@@ -1255,6 +1374,13 @@ vec3 apply_clearcoat_normal_texture(inout Material material, vec2 uv0, vec2 uv1,
     int textureIndex = material.clearcoat_normal_texture;
     vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT_NORMAL, uv0, uv1);
     vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).xyz * 2.0 - 1.0;
+    uint flags = uint(round(material.pad2));
+    if ((flags & MATERIAL_FLAG_NORMAL_MAP_DIRECTX) != 0u) {
+        tangentSample.y = -tangentSample.y;
+    }
+    if (tangentSample.z < 0.0) {
+        tangentSample.z = sqrt(max(1.0 - dot(tangentSample.xy, tangentSample.xy), 0.0));
+    }
     material.clearcoat_normal_variance = clamp(dot(tangentSample.xy, tangentSample.xy), 0.0, 1.0);
     vec3 t = normalize(tangent - normal * dot(normal, tangent));
     vec3 b = normalize(bitangent - normal * dot(normal, bitangent));
@@ -1955,7 +2081,10 @@ vec3 pbr_f0(Material material) {
         vec3 k2 = k * k;
         return clamp((etaMinusOne * etaMinusOne + k2) / max(etaPlusOne * etaPlusOne + k2, vec3(1.0e-6)), vec3(0.0), vec3(1.0));
     }
-    vec3 dielectricF0 = clamp(vec3(0.04) * material.specular_factor * material.specular_color, vec3(0.0), vec3(1.0));
+    uint flags = uint(round(material.pad2));
+    vec3 dielectricF0 = (flags & MATERIAL_FLAG_SPECULAR_GLOSSINESS_WORKFLOW) != 0u
+        ? clamp(material.specular_factor * material.specular_color, vec3(0.0), vec3(1.0))
+        : clamp(vec3(0.04) * material.specular_factor * material.specular_color, vec3(0.0), vec3(1.0));
     return mix(dielectricF0, material.color, clamp(material.metallic, 0.0, 1.0));
 }
 

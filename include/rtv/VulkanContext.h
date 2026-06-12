@@ -2,6 +2,7 @@
 
 #include "rtv/NonCopyable.h"
 #include "rtv/BindlessResources.h"
+#include "rtv/StreamlineRuntime.h"
 
 #include <Volk/volk.h>
 
@@ -118,6 +119,7 @@ public:
             storageBuffer16BitAccess_ &&
             uniformAndStorageBuffer16BitAccess_;
     }
+    [[nodiscard]] const StreamlineVulkanRequirements& streamlineVulkanRequirements() const { return streamlineVulkanRequirements_; }
     [[nodiscard]] float maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
     [[nodiscard]] bool supportsMemoryBudget() const { return supportsMemoryBudget_; }
 
@@ -154,6 +156,7 @@ private:
     OpacityMicromapDeviceInfo opacityMicromapInfo_{};
     SerDeviceInfo serInfo_{};
     RayTracingMotionBlurDeviceInfo rayTracingMotionBlurInfo_{};
+    StreamlineVulkanRequirements streamlineVulkanRequirements_{};
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     VkQueue presentQueue_ = VK_NULL_HANDLE;

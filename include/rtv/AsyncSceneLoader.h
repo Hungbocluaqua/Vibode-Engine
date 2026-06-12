@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtv/AssetManager.h"
+#include "rtv/NativeTextureFormatPolicy.h"
 #include "rtv/Project.h"
 #include "rtv/SceneDocument.h"
 
@@ -45,6 +46,7 @@ struct SceneLoadRequest {
     bool importTextures = true;
     bool importLights = true;
     bool importCameras = true;
+    NativeTextureFormatSupport nativeTextureFormatSupport = nativeTextureOfflineFallbackFormatSupport();
 };
 
 struct SceneLoadResult {

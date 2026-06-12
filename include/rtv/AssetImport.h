@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtv/AssetRegistry.h"
+#include "rtv/NativeTextureFormatPolicy.h"
 
 #include <filesystem>
 #include <functional>
@@ -38,6 +39,7 @@ struct AssetImportWorkspace {
     std::filesystem::path sourceAssetsRoot;
     std::filesystem::path cacheRoot;
     std::filesystem::path registryPath;
+    NativeTextureFormatSupport nativeTextureFormatSupport = nativeTextureOfflineFallbackFormatSupport();
     bool compatibilityMode = false;
 };
 

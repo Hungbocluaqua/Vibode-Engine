@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 42;
+constexpr uint32_t kCacheVersion = 51;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -350,6 +350,9 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeInt32(file, mat.iridescenceThicknessTextureIndex);
         writeInt32(file, mat.anisotropyTextureIndex);
         writeInt32(file, mat.occlusionTextureIndex);
+        writeInt32(file, mat.opacityTextureIndex);
+        writeInt32(file, mat.heightTextureIndex);
+        writeFloat(file, mat.heightScale);
         writeBytes(file, &mat.baseColorTextureTransform, sizeof(mat.baseColorTextureTransform));
         writeBytes(file, &mat.metallicRoughnessTextureTransform, sizeof(mat.metallicRoughnessTextureTransform));
         writeBytes(file, &mat.normalTextureTransform, sizeof(mat.normalTextureTransform));
@@ -367,6 +370,9 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeBytes(file, &mat.iridescenceTextureTransform, sizeof(mat.iridescenceTextureTransform));
         writeBytes(file, &mat.iridescenceThicknessTextureTransform, sizeof(mat.iridescenceThicknessTextureTransform));
         writeBytes(file, &mat.anisotropyTextureTransform, sizeof(mat.anisotropyTextureTransform));
+        writeUint32(file, mat.materialWorkflow);
+        writeUint32(file, mat.normalMapConvention);
+        writeUint32(file, mat.specularTextureAlphaMode);
         writeUint32(file, mat.shaderCompatibilityMask);
     }
 
@@ -721,6 +727,9 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readInt32(file, mat.iridescenceThicknessTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.anisotropyTextureIndex)) { std::fclose(file); return std::nullopt; }
         if (!readInt32(file, mat.occlusionTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.opacityTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.heightTextureIndex)) { std::fclose(file); return std::nullopt; }
+        if (!readFloat(file, mat.heightScale)) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.baseColorTextureTransform, sizeof(mat.baseColorTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.metallicRoughnessTextureTransform, sizeof(mat.metallicRoughnessTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.normalTextureTransform, sizeof(mat.normalTextureTransform))) { std::fclose(file); return std::nullopt; }
@@ -738,6 +747,9 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readBytes(file, &mat.iridescenceTextureTransform, sizeof(mat.iridescenceTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.iridescenceThicknessTextureTransform, sizeof(mat.iridescenceThicknessTextureTransform))) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.anisotropyTextureTransform, sizeof(mat.anisotropyTextureTransform))) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.materialWorkflow)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.normalMapConvention)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, mat.specularTextureAlphaMode)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.shaderCompatibilityMask)) { std::fclose(file); return std::nullopt; }
     }
 

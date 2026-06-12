@@ -225,6 +225,7 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::ReprojectionConfidence,
         RendererDebugView::Depth,
         RendererDebugView::MotionVectors,
+        RendererDebugView::SkinnedMotionVectors,
         RendererDebugView::Roughness,
         RendererDebugView::DirectLighting,
         RendererDebugView::IndirectLighting,

@@ -47,6 +47,21 @@ void normalizeCollections(std::vector<EditorAssetCollection>& collections) {
     }), collections.end());
 }
 
+void normalizeNativeTextureTargetSetLibrary(std::vector<EditorNativeTextureTargetSetLibraryProfile>& profiles) {
+    for (EditorNativeTextureTargetSetLibraryProfile& profile : profiles) {
+        profile.name = trimPreferenceTag(std::move(profile.name));
+    }
+    profiles.erase(std::remove_if(profiles.begin(), profiles.end(), [](const EditorNativeTextureTargetSetLibraryProfile& profile) {
+        return profile.name.empty();
+    }), profiles.end());
+    std::sort(profiles.begin(), profiles.end(), [](const EditorNativeTextureTargetSetLibraryProfile& lhs, const EditorNativeTextureTargetSetLibraryProfile& rhs) {
+        return lhs.name < rhs.name;
+    });
+    profiles.erase(std::unique(profiles.begin(), profiles.end(), [](const EditorNativeTextureTargetSetLibraryProfile& lhs, const EditorNativeTextureTargetSetLibraryProfile& rhs) {
+        return lhs.name == rhs.name;
+    }), profiles.end());
+}
+
 } // namespace
 
 void EditorPreferences::addRecentFile(const std::filesystem::path& path) {
@@ -189,6 +204,31 @@ bool EditorPreferences::save(const std::filesystem::path& path) const {
     json["themePreset"] = themePreset;
     json["workspacePreset"] = workspacePreset;
     json["layoutVersion"] = layoutVersion;
+    json["cookEmitNativeTextureTargetSets"] = cookEmitNativeTextureTargetSets;
+    json["cookNativeTextureTargetSetProfile"] = std::clamp(cookNativeTextureTargetSetProfile, 0, 5);
+    json["cookNativeTextureTargetSetName"] = cookNativeTextureTargetSetName;
+    json["cookNativeTextureTargetSetBc7Srgb"] = cookNativeTextureTargetSetBc7Srgb;
+    json["cookNativeTextureTargetSetBc7Unorm"] = cookNativeTextureTargetSetBc7Unorm;
+    json["cookNativeTextureTargetSetBc5"] = cookNativeTextureTargetSetBc5;
+    json["cookNativeTextureTargetSetBc4"] = cookNativeTextureTargetSetBc4;
+    json["cookNativeTextureTargetSetRgba8Srgb"] = cookNativeTextureTargetSetRgba8Srgb;
+    json["cookNativeTextureTargetSetRgba8Unorm"] = cookNativeTextureTargetSetRgba8Unorm;
+    json["cookNativeTextureTargetSetRgba16f"] = cookNativeTextureTargetSetRgba16f;
+    std::vector<EditorNativeTextureTargetSetLibraryProfile> sortedTargetSetLibrary = cookNativeTextureTargetSetLibrary;
+    normalizeNativeTextureTargetSetLibrary(sortedTargetSetLibrary);
+    json["cookNativeTextureTargetSetLibrary"] = nlohmann::json::array();
+    for (const EditorNativeTextureTargetSetLibraryProfile& profile : sortedTargetSetLibrary) {
+        json["cookNativeTextureTargetSetLibrary"].push_back({
+            {"name", profile.name},
+            {"bc7SrgbSampled", profile.bc7SrgbSampled},
+            {"bc7UnormSampled", profile.bc7UnormSampled},
+            {"bc5UnormSampled", profile.bc5UnormSampled},
+            {"bc4UnormSampled", profile.bc4UnormSampled},
+            {"rgba8SrgbSampled", profile.rgba8SrgbSampled},
+            {"rgba8UnormSampled", profile.rgba8UnormSampled},
+            {"rgba16fSampled", profile.rgba16fSampled},
+        });
+    }
     json["viewportAxesVisible"] = viewportAxesVisible;
     json["viewportLocalTransformFrame"] = viewportLocalTransformFrame;
     json["renderSequenceFramesPerTimelineFrame"] = std::clamp(renderSequenceFramesPerTimelineFrame, 1, 512);
@@ -200,6 +240,25 @@ bool EditorPreferences::save(const std::filesystem::path& path) const {
     json["viewportDropMouseWheelRotationEnabled"] = viewportDropMouseWheelRotationEnabled;
     json["viewportPickMeshEntities"] = viewportPickMeshEntities;
     json["viewportPickActorIcons"] = viewportPickActorIcons;
+    json["viewportSurfaceSnappingEnabled"] = viewportSurfaceSnappingEnabled;
+    json["viewportSurfaceSnapAlignToNormal"] = viewportSurfaceSnapAlignToNormal;
+    json["viewportSurfaceSnapPreserveYaw"] = viewportSurfaceSnapPreserveYaw;
+    json["viewportSurfaceSnapOffset"] = std::clamp(viewportSurfaceSnapOffset, -100.0f, 100.0f);
+    json["viewportSurfaceSnapBoundsBottom"] = viewportSurfaceSnapBoundsBottom;
+    json["viewportSurfaceSnapAxisConstraint"] = std::clamp(viewportSurfaceSnapAxisConstraint, 0, 3);
+    json["viewportScatterPaletteByDefault"] = viewportScatterPaletteByDefault;
+    json["viewportScatterPaletteDensity"] = std::clamp(viewportScatterPaletteDensity, 0.0f, 10000.0f);
+    json["viewportScatterPaletteSlopeMinDegrees"] = std::clamp(viewportScatterPaletteSlopeMinDegrees, 0.0f, 180.0f);
+    json["viewportScatterPaletteSlopeMaxDegrees"] = std::clamp(viewportScatterPaletteSlopeMaxDegrees, 0.0f, 180.0f);
+    json["viewportScatterPaletteHeightMin"] = viewportScatterPaletteHeightMin;
+    json["viewportScatterPaletteHeightMax"] = viewportScatterPaletteHeightMax;
+    json["viewportScatterPaletteScaleMin"] = std::clamp(viewportScatterPaletteScaleMin, 0.001f, 1000.0f);
+    json["viewportScatterPaletteScaleMax"] = std::clamp(viewportScatterPaletteScaleMax, 0.001f, 1000.0f);
+    json["viewportScatterPaletteYawRandomDegrees"] = std::clamp(viewportScatterPaletteYawRandomDegrees, 0.0f, 360.0f);
+    json["viewportScatterPaletteSeed"] = viewportScatterPaletteSeed;
+    json["viewportScatterPaletteSpacing"] = std::clamp(viewportScatterPaletteSpacing, 0.001f, 10000.0f);
+    json["viewportScatterPaletteCollisionRadius"] = std::clamp(viewportScatterPaletteCollisionRadius, 0.0f, 10000.0f);
+    json["viewportScatterPaletteSurfaceAlignment"] = viewportScatterPaletteSurfaceAlignment;
     json["recentFiles"] = recentFiles;
     json["favoriteFiles"] = favoriteFiles;
     json["recentProjects"] = recentProjects;
@@ -265,6 +324,35 @@ void EditorPreferences::load(const std::filesystem::path& path) {
         if (json.contains("themePreset")) themePreset = json["themePreset"].get<int>();
         if (json.contains("workspacePreset")) workspacePreset = json["workspacePreset"].get<int>();
         if (json.contains("layoutVersion")) layoutVersion = json["layoutVersion"].get<int>();
+        if (json.contains("cookEmitNativeTextureTargetSets")) cookEmitNativeTextureTargetSets = json["cookEmitNativeTextureTargetSets"].get<bool>();
+        if (json.contains("cookNativeTextureTargetSetProfile")) cookNativeTextureTargetSetProfile = std::clamp(json["cookNativeTextureTargetSetProfile"].get<int>(), 0, 5);
+        if (json.contains("cookNativeTextureTargetSetName")) cookNativeTextureTargetSetName = json["cookNativeTextureTargetSetName"].get<std::string>();
+        if (json.contains("cookNativeTextureTargetSetBc7Srgb")) cookNativeTextureTargetSetBc7Srgb = json["cookNativeTextureTargetSetBc7Srgb"].get<bool>();
+        if (json.contains("cookNativeTextureTargetSetBc7Unorm")) cookNativeTextureTargetSetBc7Unorm = json["cookNativeTextureTargetSetBc7Unorm"].get<bool>();
+        if (json.contains("cookNativeTextureTargetSetBc5")) cookNativeTextureTargetSetBc5 = json["cookNativeTextureTargetSetBc5"].get<bool>();
+        if (json.contains("cookNativeTextureTargetSetBc4")) cookNativeTextureTargetSetBc4 = json["cookNativeTextureTargetSetBc4"].get<bool>();
+        if (json.contains("cookNativeTextureTargetSetRgba8Srgb")) cookNativeTextureTargetSetRgba8Srgb = json["cookNativeTextureTargetSetRgba8Srgb"].get<bool>();
+        if (json.contains("cookNativeTextureTargetSetRgba8Unorm")) cookNativeTextureTargetSetRgba8Unorm = json["cookNativeTextureTargetSetRgba8Unorm"].get<bool>();
+        if (json.contains("cookNativeTextureTargetSetRgba16f")) cookNativeTextureTargetSetRgba16f = json["cookNativeTextureTargetSetRgba16f"].get<bool>();
+        if (json.contains("cookNativeTextureTargetSetLibrary") && json["cookNativeTextureTargetSetLibrary"].is_array()) {
+            cookNativeTextureTargetSetLibrary.clear();
+            for (const nlohmann::json& item : json["cookNativeTextureTargetSetLibrary"]) {
+                if (!item.is_object()) {
+                    continue;
+                }
+                EditorNativeTextureTargetSetLibraryProfile profile;
+                profile.name = item.value("name", std::string{});
+                profile.bc7SrgbSampled = item.value("bc7SrgbSampled", profile.bc7SrgbSampled);
+                profile.bc7UnormSampled = item.value("bc7UnormSampled", profile.bc7UnormSampled);
+                profile.bc5UnormSampled = item.value("bc5UnormSampled", profile.bc5UnormSampled);
+                profile.bc4UnormSampled = item.value("bc4UnormSampled", profile.bc4UnormSampled);
+                profile.rgba8SrgbSampled = item.value("rgba8SrgbSampled", profile.rgba8SrgbSampled);
+                profile.rgba8UnormSampled = item.value("rgba8UnormSampled", profile.rgba8UnormSampled);
+                profile.rgba16fSampled = item.value("rgba16fSampled", profile.rgba16fSampled);
+                cookNativeTextureTargetSetLibrary.push_back(std::move(profile));
+            }
+            normalizeNativeTextureTargetSetLibrary(cookNativeTextureTargetSetLibrary);
+        }
         if (json.contains("viewportAxesVisible")) viewportAxesVisible = json["viewportAxesVisible"].get<bool>();
         if (json.contains("viewportLocalTransformFrame")) viewportLocalTransformFrame = json["viewportLocalTransformFrame"].get<bool>();
         if (json.contains("renderSequenceFramesPerTimelineFrame")) renderSequenceFramesPerTimelineFrame = std::clamp(json["renderSequenceFramesPerTimelineFrame"].get<int>(), 1, 512);
@@ -276,6 +364,28 @@ void EditorPreferences::load(const std::filesystem::path& path) {
         if (json.contains("viewportDropMouseWheelRotationEnabled")) viewportDropMouseWheelRotationEnabled = json["viewportDropMouseWheelRotationEnabled"].get<bool>();
         if (json.contains("viewportPickMeshEntities")) viewportPickMeshEntities = json["viewportPickMeshEntities"].get<bool>();
         if (json.contains("viewportPickActorIcons")) viewportPickActorIcons = json["viewportPickActorIcons"].get<bool>();
+        if (json.contains("viewportSurfaceSnappingEnabled")) viewportSurfaceSnappingEnabled = json["viewportSurfaceSnappingEnabled"].get<bool>();
+        if (json.contains("viewportSurfaceSnapAlignToNormal")) viewportSurfaceSnapAlignToNormal = json["viewportSurfaceSnapAlignToNormal"].get<bool>();
+        if (json.contains("viewportSurfaceSnapPreserveYaw")) viewportSurfaceSnapPreserveYaw = json["viewportSurfaceSnapPreserveYaw"].get<bool>();
+        if (json.contains("viewportSurfaceSnapOffset")) viewportSurfaceSnapOffset = std::clamp(json["viewportSurfaceSnapOffset"].get<float>(), -100.0f, 100.0f);
+        if (json.contains("viewportSurfaceSnapBoundsBottom")) viewportSurfaceSnapBoundsBottom = json["viewportSurfaceSnapBoundsBottom"].get<bool>();
+        if (json.contains("viewportSurfaceSnapAxisConstraint")) viewportSurfaceSnapAxisConstraint = std::clamp(json["viewportSurfaceSnapAxisConstraint"].get<int>(), 0, 3);
+        if (json.contains("viewportScatterPaletteByDefault")) viewportScatterPaletteByDefault = json["viewportScatterPaletteByDefault"].get<bool>();
+        if (json.contains("viewportScatterPaletteDensity")) viewportScatterPaletteDensity = std::clamp(json["viewportScatterPaletteDensity"].get<float>(), 0.0f, 10000.0f);
+        if (json.contains("viewportScatterPaletteSlopeMinDegrees")) viewportScatterPaletteSlopeMinDegrees = std::clamp(json["viewportScatterPaletteSlopeMinDegrees"].get<float>(), 0.0f, 180.0f);
+        if (json.contains("viewportScatterPaletteSlopeMaxDegrees")) viewportScatterPaletteSlopeMaxDegrees = std::clamp(json["viewportScatterPaletteSlopeMaxDegrees"].get<float>(), 0.0f, 180.0f);
+        if (json.contains("viewportScatterPaletteHeightMin")) viewportScatterPaletteHeightMin = json["viewportScatterPaletteHeightMin"].get<float>();
+        if (json.contains("viewportScatterPaletteHeightMax")) viewportScatterPaletteHeightMax = json["viewportScatterPaletteHeightMax"].get<float>();
+        if (json.contains("viewportScatterPaletteScaleMin")) viewportScatterPaletteScaleMin = std::clamp(json["viewportScatterPaletteScaleMin"].get<float>(), 0.001f, 1000.0f);
+        if (json.contains("viewportScatterPaletteScaleMax")) viewportScatterPaletteScaleMax = std::clamp(json["viewportScatterPaletteScaleMax"].get<float>(), 0.001f, 1000.0f);
+        if (json.contains("viewportScatterPaletteYawRandomDegrees")) viewportScatterPaletteYawRandomDegrees = std::clamp(json["viewportScatterPaletteYawRandomDegrees"].get<float>(), 0.0f, 360.0f);
+        if (json.contains("viewportScatterPaletteSeed")) viewportScatterPaletteSeed = json["viewportScatterPaletteSeed"].get<uint32_t>();
+        if (json.contains("viewportScatterPaletteSpacing")) viewportScatterPaletteSpacing = std::clamp(json["viewportScatterPaletteSpacing"].get<float>(), 0.001f, 10000.0f);
+        if (json.contains("viewportScatterPaletteCollisionRadius")) viewportScatterPaletteCollisionRadius = std::clamp(json["viewportScatterPaletteCollisionRadius"].get<float>(), 0.0f, 10000.0f);
+        if (json.contains("viewportScatterPaletteSurfaceAlignment")) viewportScatterPaletteSurfaceAlignment = json["viewportScatterPaletteSurfaceAlignment"].get<bool>();
+        if (viewportScatterPaletteSlopeMaxDegrees < viewportScatterPaletteSlopeMinDegrees) std::swap(viewportScatterPaletteSlopeMinDegrees, viewportScatterPaletteSlopeMaxDegrees);
+        if (viewportScatterPaletteHeightMax < viewportScatterPaletteHeightMin) std::swap(viewportScatterPaletteHeightMin, viewportScatterPaletteHeightMax);
+        if (viewportScatterPaletteScaleMax < viewportScatterPaletteScaleMin) std::swap(viewportScatterPaletteScaleMin, viewportScatterPaletteScaleMax);
         if (json.contains("recentFiles")) recentFiles = json["recentFiles"].get<std::vector<std::string>>();
         if (json.contains("favoriteFiles")) favoriteFiles = json["favoriteFiles"].get<std::vector<std::string>>();
         if (json.contains("recentProjects")) recentProjects = json["recentProjects"].get<std::vector<std::string>>();

@@ -2,7 +2,9 @@
 
 #include "rtv/GltfLoader.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <exception>
 #include <iostream>
 #include <utility>
@@ -29,6 +31,12 @@ SceneLoadResult makeCancelledResult(const SceneLoadRequest& request) {
 template <typename ClockTime>
 double elapsedMilliseconds(ClockTime start, ClockTime end = std::chrono::steady_clock::now()) {
     return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+std::string lowerExtension(const std::filesystem::path& path) {
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return ext;
 }
 
 } // namespace
@@ -184,6 +192,7 @@ SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shar
                 try {
                     setStage("Loading referenced glTF", 0.60f, SceneLoadStatus::Loading);
                     GltfLoader loader(result.assets);
+                    loader.setNativeTextureFormatSupport(request.nativeTextureFormatSupport);
                     const auto gltfStart = std::chrono::steady_clock::now();
                     result.importedScene = loader.loadWithCache(*document->sourceGltfPath());
                     result.workerGltfLoadMs = elapsedMilliseconds(gltfStart);
@@ -206,6 +215,7 @@ SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shar
             setStage("Parsing glTF", 0.25f, SceneLoadStatus::Loading);
             GltfLoader loader(result.assets);
             loader.setCacheWritesEnabled(false);
+            loader.setNativeTextureFormatSupport(request.nativeTextureFormatSupport);
             const auto gltfStart = std::chrono::steady_clock::now();
             result.importedScene = loader.loadWithCache(request.sourcePath);
             result.workerGltfLoadMs = elapsedMilliseconds(gltfStart);
@@ -224,12 +234,35 @@ SceneLoadResult AsyncSceneLoader::load(SceneLoadRequest request, const std::shar
             break;
         }
         case SceneLoadMode::MergeSceneIntoCurrent: {
-            setStage("Parsing glTF", 0.25f, SceneLoadStatus::Loading);
-            GltfLoader loader(result.assets);
-            loader.setCacheWritesEnabled(false);
-            const auto gltfStart = std::chrono::steady_clock::now();
-            result.importedScene = loader.loadWithCache(request.sourcePath);
-            result.workerGltfLoadMs = elapsedMilliseconds(gltfStart);
+            const std::string ext = lowerExtension(request.sourcePath);
+            if (ext == ".rtlevel" || ext == ".mscene") {
+                setStage("Parsing sublevel", 0.20f, SceneLoadStatus::Loading);
+                auto document = std::make_unique<SceneDocument>();
+                const auto parseStart = std::chrono::steady_clock::now();
+                if (!document->loadJson(request.sourcePath)) {
+                    result.errorMessage = "Scene JSON load failed";
+                    return result;
+                }
+                result.workerSceneParseMs = elapsedMilliseconds(parseStart);
+                if (document->sourceGltfPath().has_value() && std::filesystem::exists(*document->sourceGltfPath())) {
+                    setStage("Loading sublevel source glTF", 0.55f, SceneLoadStatus::Loading);
+                    GltfLoader loader(result.assets);
+                    loader.setNativeTextureFormatSupport(request.nativeTextureFormatSupport);
+                    const auto gltfStart = std::chrono::steady_clock::now();
+                    (void)loader.loadWithCache(*document->sourceGltfPath());
+                    result.workerGltfLoadMs = elapsedMilliseconds(gltfStart);
+                }
+                result.importedScene = document->toSceneAsset();
+                result.stagedScene = std::move(document);
+            } else {
+                setStage("Parsing glTF", 0.25f, SceneLoadStatus::Loading);
+                GltfLoader loader(result.assets);
+                loader.setCacheWritesEnabled(false);
+                loader.setNativeTextureFormatSupport(request.nativeTextureFormatSupport);
+                const auto gltfStart = std::chrono::steady_clock::now();
+                result.importedScene = loader.loadWithCache(request.sourcePath);
+                result.workerGltfLoadMs = elapsedMilliseconds(gltfStart);
+            }
             if (cancelled(cancelFlag)) {
                 return makeCancelledResult(request);
             }

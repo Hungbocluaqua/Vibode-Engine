@@ -19,6 +19,13 @@ class VulkanContext;
 struct RayTracingSceneBuildOptions {
     bool opacityMicromapsEnabled = false;
     bool motionBlurEnabled = false;
+    struct GpuSkinnedVertexBinding {
+        uint32_t meshHandleIndex = 0xffffffffu;
+        uint32_t currentVertexOffset = 0;
+        uint32_t vertexCount = 0;
+    };
+    const Buffer* gpuSkinnedVertexBuffer = nullptr;
+    std::vector<GpuSkinnedVertexBinding> gpuSkinnedVertexBindings;
 };
 
 struct OpacityMicromapBuildStats {
@@ -43,6 +50,8 @@ struct RayTracingBlasGeometryStats {
     uint32_t alphaTestedGeometryCount = 0;
     uint32_t blendedGeometryCount = 0;
     uint32_t opacityMicromapGeometryCount = 0;
+    uint32_t gpuSkinnedMeshCount = 0;
+    uint32_t gpuSkinnedGeometryCount = 0;
 };
 
 struct RayTracingMotionInstanceStats {
@@ -74,7 +83,15 @@ public:
     [[nodiscard]] const Buffer& geometryTriangleOffsetsBuffer() const { return geometryTriangleOffsetsBuffer_; }
     [[nodiscard]] const Buffer& meshGeometryRangesBuffer() const { return meshGeometryRangesBuffer_; }
     [[nodiscard]] float lastTlasRefitMs() const { return lastTlasRefitMs_; }
+    [[nodiscard]] uint32_t dynamicBlasUpdateCount() const { return dynamicBlasUpdateCount_; }
+    [[nodiscard]] float lastDynamicBlasUpdateRecordMs() const { return lastDynamicBlasUpdateRecordMs_; }
     [[nodiscard]] bool motionBlurActive() const { return motionBlurActive_; }
+    [[nodiscard]] bool recordDynamicBlasUpdates(
+        VkCommandBuffer commandBuffer,
+        const VulkanContext& context,
+        ResourceAllocator& allocator,
+        const GpuScene& scene,
+        const RayTracingSceneBuildOptions& options);
     [[nodiscard]] bool refitTransforms(
         const VulkanContext& context,
         ResourceAllocator& allocator,
@@ -94,6 +111,7 @@ private:
     AccelerationStructure tlas_;
     Buffer instanceBuffer_;
     Buffer tlasRefitScratch_;
+    Buffer dynamicBlasUpdateScratch_;
     Buffer geometryTriangleOffsetsBuffer_;
     Buffer meshGeometryRangesBuffer_;
     std::vector<VkMicromapEXT> opacityMicromaps_;
@@ -102,11 +120,14 @@ private:
     uint32_t instanceCount_ = 0;
     VkDeviceSize accelerationStructureBytes_ = 0;
     VkDeviceSize tlasUpdateScratchSize_ = 0;
+    VkDeviceSize dynamicBlasUpdateScratchSize_ = 0;
     bool motionBlurActive_ = false;
     OpacityMicromapBuildStats opacityMicromapStats_{};
     RayTracingBlasGeometryStats blasGeometryStats_{};
     RayTracingMotionInstanceStats motionInstanceStats_{};
     float lastTlasRefitMs_ = 0.0f;
+    uint32_t dynamicBlasUpdateCount_ = 0;
+    float lastDynamicBlasUpdateRecordMs_ = 0.0f;
 };
 
 } // namespace rtv

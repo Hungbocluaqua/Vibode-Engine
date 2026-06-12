@@ -4,6 +4,7 @@
 #include "rtv/SceneComponents.h"
 
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace rtv {
@@ -19,6 +20,7 @@ enum class SceneEventType : uint8_t {
     MaterialChanged,
     ComponentAdded,
     ComponentRemoved,
+    AnimationEventFired,
     SelectionChanged,
     SceneLoaded,
     SceneCleared,
@@ -29,6 +31,9 @@ struct SceneEvent {
     EntityId entity{};
     EntityId relatedEntity{};
     SceneUpdateKind updateKind = SceneUpdateKind::None;
+    std::string animationEventName;
+    std::string animationEventPayloadJson;
+    double animationEventTimeSeconds = 0.0;
 };
 
 class SceneEventBus {

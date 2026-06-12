@@ -6,6 +6,10 @@
 #include "rtv/EditorUiStyle.h"
 #include "rtv/FileDialog.h"
 #include "rtv/GpuScene.h"
+#include "rtv/NativeAssetRuntimeLoader.h"
+#include "rtv/NativeAssetMigration.h"
+#include "rtv/NativeAssetStore.h"
+#include "rtv/RtpkgIO.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
@@ -441,12 +445,26 @@ const EditorAssetCollection* selectedCollection(const EditorPreferences* prefs, 
 
 bool isModelAssetPath(const std::filesystem::path& path) {
     const std::string ext = lowerString(path.extension().string());
-    return ext == ".gltf" || ext == ".glb" || ext == ".obj";
+    if (ext == ".gltf" || ext == ".glb" || ext == ".obj") {
+        return true;
+    }
+#if RTV_ENABLE_ASSIMP_IMPORTER && RTV_ASSIMP_IMPORTER_AVAILABLE
+    return ext == ".fbx";
+#else
+    return false;
+#endif
 }
 
 bool isPlaceablePrefabSourcePath(const std::filesystem::path& path) {
     const std::string ext = lowerString(path.extension().string());
-    return ext == ".gltf" || ext == ".glb";
+    if (ext == ".gltf" || ext == ".glb") {
+        return true;
+    }
+#if RTV_ENABLE_ASSIMP_IMPORTER && RTV_ASSIMP_IMPORTER_AVAILABLE
+    return ext == ".fbx";
+#else
+    return false;
+#endif
 }
 
 bool isTextureAssetPath(const std::filesystem::path& path) {
@@ -760,7 +778,9 @@ EditorGlyphIcon editorGlyphForAssetType(AssetType type) {
     case AssetType::Scene: return EditorGlyphIcon::SceneFile;
     case AssetType::Prefab: return EditorGlyphIcon::Model;
     case AssetType::Animation: return EditorGlyphIcon::TimelineKey;
+    case AssetType::AnimationController: return EditorGlyphIcon::TimelineKey;
     case AssetType::Skeleton: return EditorGlyphIcon::Model;
+    case AssetType::SkeletalMesh: return EditorGlyphIcon::Model;
     case AssetType::Unknown:
     default: return EditorGlyphIcon::File;
     }
@@ -778,7 +798,9 @@ ImU32 assetTypeIconColor(AssetType type) {
     case AssetType::HDRI:
         return IM_COL32(184, 196, 211, 255);
     case AssetType::Animation:
+    case AssetType::AnimationController:
     case AssetType::Skeleton:
+    case AssetType::SkeletalMesh:
         return IM_COL32(190, 202, 184, 255);
     case AssetType::Unknown:
     default:
@@ -1160,6 +1182,60 @@ std::filesystem::path selectedAssetBrokenPlaceholderReportPath(const EditorRunti
 std::filesystem::path selectedAssetPackageInspectionReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const AssetGuid& guid) {
     std::filesystem::path path = assetValidationReportPath(state, browserRoot);
     path.replace_filename("asset_package_inspection_" + safeReportName(guid) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedFileNativeInspectionReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const std::filesystem::path& inspectedPath) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    const std::string name = inspectedPath.filename().empty() ? std::string("native_asset") : inspectedPath.filename().string();
+    const std::string key = canonicalForCompare(inspectedPath).generic_string();
+    path.replace_filename("native_asset_inspection_" + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedFilePackageInspectionReportPath(const EditorRuntimeState& state, const std::filesystem::path& browserRoot, const std::filesystem::path& inspectedPath) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    const std::string name = inspectedPath.filename().empty() ? std::string("package") : inspectedPath.filename().string();
+    const std::string key = canonicalForCompare(inspectedPath).generic_string();
+    path.replace_filename("rtpkg_inspection_" + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedFileMigrationReportPath(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& migratedPath,
+    bool package,
+    bool dryRun) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    const std::string name = migratedPath.filename().empty() ? (package ? std::string("package") : std::string("native_asset")) : migratedPath.filename().string();
+    const std::string key = canonicalForCompare(migratedPath).generic_string() + (dryRun ? "#dry_run" : "#mutate");
+    const std::string prefix = package ? "rtpkg_migration_" : "native_asset_migration_";
+    path.replace_filename(prefix + std::string(dryRun ? "dry_run_" : "") + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
+    return path;
+}
+
+std::filesystem::path selectedFilePackageRebuildReportPath(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& packagePath,
+    bool dryRun) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    const std::string name = packagePath.filename().empty() ? std::string("package") : packagePath.filename().string();
+    const std::string key = canonicalForCompare(packagePath).generic_string() + (dryRun ? "#rebuild_dry_run" : "#rebuild_mutate");
+    path.replace_filename(std::string("rtpkg_rebuild_") + (dryRun ? "dry_run_" : "") + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
+    return path;
+}
+
+std::filesystem::path nativeFileMigrationBatchPreflightReportPath(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& folder,
+    bool recursive) {
+    std::filesystem::path path = assetValidationReportPath(state, browserRoot);
+    const std::string name = folder.filename().empty() ? std::string("folder") : folder.filename().string();
+    const std::string key = canonicalForCompare(folder).generic_string() + (recursive ? "#recursive" : "#folder");
+    path.replace_filename("native_migration_batch_preflight_" + std::string(recursive ? "recursive_" : "") + safeReportName(name) + "_" + hex64(fnv1a64(key)) + ".json");
     return path;
 }
 
@@ -1607,6 +1683,26 @@ bool writeSourceControlActionPlanReport(
         {"plannedCommands", plannedCommands},
         {"blockers", blockers},
         {"warnings", warnings},
+        {"openProductionScope", {
+            {"currentReportScope", "content-browser-source-control-action-plan"},
+            {"implementedScope", nlohmann::json::array({
+                "dry-run-git-revert-plan",
+                "dry-run-git-checkout-plan",
+                "dry-run-git-submit-plan",
+                "provider-gap-reporting",
+                "external-user-confirmation-policy"
+            })},
+            {"openProviderScope", nlohmann::json::array({
+                "editor-executed-revert-checkout-submit",
+                "provider-lock-ownership-enforcement",
+                "perforce-provider-actions",
+                "provider-conflict-resolution"
+            })},
+            {"dryRunOnly", true},
+            {"editorExecutedMutationsImplemented", false},
+            {"providerBackedMutationsImplemented", false},
+            {"perforceProviderActionsImplemented", false},
+        }},
         {"policy", {
             {"description", "This report is a dry-run source-control action plan. It records intended commands and provider gaps without mutating the repository."},
             {"requiresUserConfirmationOutsideEditor", true},
@@ -1717,7 +1813,32 @@ bool writeSourceControlProviderReadinessReport(
             {"currentOwner", "unknown"},
             {"currentLockState", (p4Detected || lfsLockInfoAvailable) ? "provider-output-needs-parser" : "unknown-no-provider-lock-state"},
             {"conflictHandlingImplemented", false},
-            {"safeExternalReloadPromptImplemented", false},
+            {"safeExternalReloadPromptImplemented", true},
+            {"safeExternalReloadPromptScope", "selected-action-confirmation-prompts"},
+            {"selectedActionExternalChangePromptImplemented", true},
+            {"selectedActionExternalChangePromptScope", "reimport-repair-rebuild-confirmation-prompts"},
+            {"automaticExternalChangeReloadPromptImplemented", false},
+        }},
+        {"openProductionScope", {
+            {"currentReportScope", "content-browser-source-control-provider-readiness"},
+            {"implementedScope", nlohmann::json::array({
+                "git-status",
+                "git-diff",
+                "git-action-plan",
+                "provider-readiness-report",
+                "selected-action-external-change-confirmation-prompts"
+            })},
+            {"openProviderScope", nlohmann::json::array({
+                "editor-executed-revert-checkout-submit",
+                "provider-lock-ownership-enforcement",
+                "perforce-provider-mutations",
+                "provider-conflict-resolution",
+                "automatic-external-change-reload-prompt"
+            })},
+            {"providerBackedMutationsImplemented", false},
+            {"perforceProviderMutationsImplemented", false},
+            {"assetLockOwnershipEnforcementImplemented", false},
+            {"automaticExternalChangeReloadPromptImplemented", false},
         }},
         {"policy", {
             {"description", "This report inspects source-control provider readiness, lock/ownership visibility, and remaining provider gaps without mutating the repository."},
@@ -1871,9 +1992,32 @@ bool writeAssetExternalReloadReadinessReport(
                 ? "External source-control changes are present. Review diffs before explicit reimport, repair, rebuild, or thumbnail regeneration."
                 : "No source-control-changed asset paths were detected for this selected asset."}
         }},
+        {"openProductionScope", {
+            {"currentReportScope", "selected-asset-external-change-reload-readiness"},
+            {"implementedScope", nlohmann::json::array({
+                "selected-asset-source-generated-payload-thumbnail-state",
+                "source-control-changed-path-counts",
+                "selected-action-external-change-confirmation-prompts",
+                "explicit-follow-up-actions"
+            })},
+            {"openReloadScope", nlohmann::json::array({
+                "automatic-source-reload-prompt",
+                "automatic-generated-metadata-reload-prompt",
+                "automatic-runtime-payload-reload-prompt",
+                "provider-level-conflict-resolution"
+            })},
+            {"selectedActionExternalChangePromptImplemented", true},
+            {"automaticSourceReloadPromptImplemented", false},
+            {"automaticGeneratedMetadataReloadPromptImplemented", false},
+            {"automaticRuntimePayloadReloadPromptImplemented", false},
+            {"providerLevelConflictResolutionImplemented", false},
+        }},
         {"policy", {
             {"description", "This report is a safe external-change reload readiness review for the selected asset."},
             {"automaticReloadPromptImplemented", false},
+            {"automaticExternalChangeReloadPromptImplemented", false},
+            {"selectedActionExternalChangePromptImplemented", true},
+            {"selectedActionExternalChangePromptScope", "reimport-repair-rebuild-confirmation-prompts"},
             {"mutationExecuted", false},
             {"performedActions", nlohmann::json::array()},
             {"supportedFollowUpActions", {"Git Diff", "Git Status", "Repair Asset", "Reimport", "Rebuild Payload", "Reveal Source", "Reveal Metadata", "Reveal Payload"}},
@@ -2444,6 +2588,8 @@ nlohmann::json expectedDependencyAssetTypes(const std::string& role) {
         addType(AssetType::Mesh);
     } else if (lowerRole.find("prefab") != std::string::npos || lowerRole.find("model") != std::string::npos) {
         addType(AssetType::Prefab);
+    } else if (lowerRole.find("controller") != std::string::npos) {
+        addType(AssetType::AnimationController);
     } else if (lowerRole.find("anim") != std::string::npos) {
         addType(AssetType::Animation);
     } else if (lowerRole.find("skeleton") != std::string::npos || lowerRole.find("skin") != std::string::npos) {
@@ -3108,6 +3254,25 @@ nlohmann::json buildAssetProjectReferenceIndexReport(const EditorRuntimeState& s
         {"parseErrors", parseErrors},
         {"scannedFiles", scannedFiles},
         {"checkedFileTypes", nlohmann::json::array({".rtlevel", ".mscene", ".vproject", ".rtprefab.json", ".rtmesh.json", ".rtmaterial.json", ".rttexture.json", ".rthdri.json"})},
+        {"openProductionScope", {
+            {"currentReportScope", "asset-project-reference-index"},
+            {"implementedScope", nlohmann::json::array({
+                "on-demand-saved-project-reference-scan",
+                "saved-asset-reference-index-persistence",
+                "registered-reference-counts",
+                "unknown-guid-field-reporting",
+                "parse-error-reporting"
+            })},
+            {"openReferenceScope", nlohmann::json::array({
+                "continuous-background-index-updates",
+                "reference-rewrite-on-scan",
+                "generated-cache-payload-internals"
+            })},
+            {"onDemandOnly", true},
+            {"continuousBackgroundIndexImplemented", false},
+            {"referenceRewriteOnScanImplemented", false},
+            {"generatedCachePayloadInspectionImplemented", false},
+        }},
         {"persistence", "The latest generated index is also written to Saved/AssetReferenceIndex.json when the Project References action runs."},
         {"limitation", "This is a regenerated-on-demand saved-file JSON index for project content and scene roots. It is persisted as the latest index artifact, but it is not continuously updated in the background and does not rewrite references or inspect generated cache payload internals."},
     };
@@ -3517,7 +3682,9 @@ std::string nativeRuntimeExtensionForAssetType(AssetType type) {
     case AssetType::Prefab: return ".rtprefab";
     case AssetType::Scene: return ".rtlevel";
     case AssetType::Animation: return ".rtanim";
+    case AssetType::AnimationController: return ".rtanimcontroller";
     case AssetType::Skeleton: return ".rtskeleton";
+    case AssetType::SkeletalMesh: return ".rtskeletalmesh";
     case AssetType::Unknown: break;
     }
     return {};
@@ -3566,8 +3733,855 @@ nlohmann::json opaquePackageCandidateJson(const std::filesystem::path& importedP
         {"expectedExtension", ".rtpkg"},
         {"candidateCount", candidates.size()},
         {"candidates", candidates},
-        {"status", "not-emitted-by-current-transparent-pipeline"},
-        {"policy", "Opaque package emission/loading, migration/versioning, and binary package debug inspection remain future production package-system work."},
+        {"status", "candidate-path-readiness-only"},
+        {"policy", "CLI and project-cook package emission, migration, CPU-side mounting/loading, binary inspection, and Content Browser package mount/rebuild UI are implemented. This selected-asset report checks candidate paths and reports the implemented CPU AssetManager/SceneAsset/GpuScene package placement path; direct NativeAssetStore-to-GPU upload remains separate work."},
+    };
+}
+
+nlohmann::json nativeRuntimePlacementReadinessJson(
+    const AssetRecord& record,
+    const std::filesystem::path& importedPath,
+    const std::filesystem::path& cachePath) {
+    const std::string nativeExtension = nativeRuntimeExtensionForAssetType(record.type);
+    std::vector<std::pair<std::filesystem::path, std::string>> candidates;
+    auto appendCandidate = [&](std::filesystem::path path, std::string source) {
+        if (path.empty()) {
+            return;
+        }
+        const std::filesystem::path key = canonicalForCompare(path);
+        for (const auto& existing : candidates) {
+            if (canonicalForCompare(existing.first) == key) {
+                return;
+            }
+        }
+        candidates.push_back({std::move(path), std::move(source)});
+    };
+    auto appendRuntimeCandidate = [&](std::filesystem::path path, const char* source) {
+        if (path.empty()) {
+            return;
+        }
+        path.replace_extension(".rtpkg");
+        appendCandidate(path, std::string(source) + ":package");
+    };
+    auto appendNativeCandidate = [&](std::filesystem::path path, const char* source) {
+        if (path.empty() || nativeExtension.empty()) {
+            return;
+        }
+        path.replace_extension(nativeExtension);
+        appendCandidate(path, std::string(source) + ":native");
+    };
+    appendRuntimeCandidate(importedPath, "importedMetadata");
+    appendRuntimeCandidate(cachePath, "cookedPayload");
+    appendNativeCandidate(importedPath, "importedMetadata");
+    appendNativeCandidate(cachePath, "cookedPayload");
+
+    nlohmann::json candidateJson = nlohmann::json::array();
+    std::filesystem::path selectedInput;
+    std::string selectedSource;
+    for (const auto& [path, source] : candidates) {
+        const nlohmann::json pathJson = pathInspectionJson(path, source.c_str());
+        candidateJson.push_back(pathJson);
+        if (selectedInput.empty() && pathJson.value("isRegularFile", false)) {
+            selectedInput = path;
+            selectedSource = source;
+        }
+    }
+
+    nlohmann::json rendererUploadPlan = nlohmann::json::object();
+    nlohmann::json sceneAssetPlan = nlohmann::json::object();
+    nlohmann::json directStoreUploadPlan = nlohmann::json::object();
+    bool loadOk = false;
+    std::string loadError;
+    if (!selectedInput.empty()) {
+        try {
+            NativeAssetRuntimeLoader loader;
+            AssetManager scratchManager;
+            const NativeRuntimeLoadReport report = loader.loadLooseRoot(selectedInput, &scratchManager);
+            loadOk = report.ok;
+            rendererUploadPlan = {
+                {"available", report.rendererUploadPlan.available},
+                {"assetManagerBacked", report.rendererUploadPlan.assetManagerBacked},
+                {"packageBacked", report.rendererUploadPlan.packageBacked},
+                {"textureCount", report.rendererUploadPlan.textureCount},
+                {"textureResidentCount", report.rendererUploadPlan.textureResidentCount},
+                {"materialCount", report.rendererUploadPlan.materialCount},
+                {"meshCount", report.rendererUploadPlan.meshCount},
+                {"textureUploadBytes", report.rendererUploadPlan.textureUploadBytes},
+                {"vertexUploadBytes", report.rendererUploadPlan.vertexUploadBytes},
+                {"indexUploadBytes", report.rendererUploadPlan.indexUploadBytes},
+            };
+            sceneAssetPlan = {
+                {"available", report.sceneAssetPlan.available},
+                {"assetManagerBacked", report.sceneAssetPlan.assetManagerBacked},
+                {"packageBacked", report.sceneAssetPlan.packageBacked},
+                {"rendererPlaceable", report.sceneAssetPlan.rendererPlaceable},
+                {"textureCount", report.sceneAssetPlan.textureCount},
+                {"materialCount", report.sceneAssetPlan.materialCount},
+                {"meshCount", report.sceneAssetPlan.meshCount},
+                {"skinCount", report.sceneAssetPlan.skinCount},
+                {"skinnedNodeCount", report.sceneAssetPlan.skinnedNodeCount},
+                {"rootNodeCount", report.sceneAssetPlan.rootNodeCount},
+                {"missingMeshHandleCount", report.sceneAssetPlan.missingMeshHandleCount},
+                {"boundsAvailable", report.sceneAssetPlan.boundsAvailable},
+                {"boundsMin", report.sceneAssetPlan.boundsMin},
+                {"boundsMax", report.sceneAssetPlan.boundsMax},
+            };
+            directStoreUploadPlan = {
+                {"available", report.directStoreUploadPlan.available},
+                {"executable", report.directStoreUploadPlan.executable},
+                {"assetManagerBypass", report.directStoreUploadPlan.assetManagerBypass},
+                {"packageBacked", report.directStoreUploadPlan.packageBacked},
+                {"looseBacked", report.directStoreUploadPlan.looseBacked},
+                {"textureTicketCount", report.directStoreUploadPlan.textureTicketCount},
+                {"meshBufferTicketCount", report.directStoreUploadPlan.meshBufferTicketCount},
+                {"textureUploadBytes", report.directStoreUploadPlan.textureUploadBytes},
+                {"vertexUploadBytes", report.directStoreUploadPlan.vertexUploadBytes},
+                {"indexUploadBytes", report.directStoreUploadPlan.indexUploadBytes},
+                {"policy", report.directStoreUploadPlan.policy},
+                {"unavailableReason", report.directStoreUploadPlan.unavailableReason},
+                {"missingRequirementCount", report.directStoreUploadPlan.missingRequirements.size()},
+                {"missingRequirements", report.directStoreUploadPlan.missingRequirements},
+                {"uploadTicketQueueSimulationAvailable", report.directStoreUploadPlan.uploadTicketQueueSimulationAvailable},
+                {"uploadTicketQueueSimulationExecutable", report.directStoreUploadPlan.uploadTicketQueueSimulationExecutable},
+                {"uploadTicketQueueSubmittedBytes", report.directStoreUploadPlan.uploadTicketQueueSubmittedBytes},
+                {"uploadTicketQueueCompletedBytes", report.directStoreUploadPlan.uploadTicketQueueCompletedBytes},
+            };
+            if (!report.errors.empty()) {
+                loadError = report.errors.front().message;
+            }
+        } catch (const std::exception& ex) {
+            loadError = ex.what();
+        }
+    }
+
+    const bool scenePlaceable = sceneAssetPlan.value("rendererPlaceable", false);
+    const bool directStoreExecutable = directStoreUploadPlan.value("executable", false);
+    return {
+        {"schema", "ContentBrowserNativeRuntimePlacementReadinessV1"},
+        {"assetGuid", record.guid},
+        {"assetType", assetTypeName(record.type)},
+        {"candidateCount", candidateJson.size()},
+        {"candidates", candidateJson},
+        {"runtimeLoadAttempted", !selectedInput.empty()},
+        {"runtimeLoadOk", loadOk},
+        {"selectedInput", selectedInput.empty() ? std::string{} : selectedInput.generic_string()},
+        {"selectedInputSource", selectedSource},
+        {"loadError", loadError},
+        {"rendererUploadPlan", rendererUploadPlan},
+        {"sceneAssetPlan", sceneAssetPlan},
+        {"directStoreUploadPlan", directStoreUploadPlan},
+        {"uiSummary", {
+            {"cpuAssetManagerSceneAssetGpuScenePathAvailable", scenePlaceable},
+            {"directNativeStoreGpuUploadImplemented", directStoreExecutable},
+            {"directNativeStoreGpuUploadOpen", !directStoreExecutable},
+            {"placementPath", scenePlaceable ? "cpu-asset-manager-sceneasset-gpuscene-path" : "not-runtime-placeable-from-selected-candidates"},
+        }},
+        {"openProductionScope", {
+            {"currentReportScope", "content-browser-native-runtime-placement-readiness"},
+            {"implementedScope", nlohmann::json::array({
+                "scratch-native-runtime-load",
+                "cpu-asset-manager-backed-renderer-upload-plan",
+                "package-backed-sceneasset-construction-plan",
+                "direct-store-upload-ticket-plan-reporting",
+                "direct-store-upload-ticket-queue-simulation"
+            })},
+            {"openRuntimeScope", nlohmann::json::array({
+                "direct-native-store-to-gpu-upload-execution",
+                "renderer-owned-native-store-handles",
+                "vulkan-allocation-and-copy-submission",
+                "timeline-semaphore-fence-retirement",
+                "direct-store-resource-retirement"
+            })},
+            {"cpuAssetManagerSceneAssetGpuScenePathImplemented", scenePlaceable},
+            {"directNativeStoreGpuUploadExecutable", directStoreExecutable},
+            {"directNativeStoreGpuUploadImplemented", false},
+            {"rendererOwnedNativeStoreHandlesImplemented", false},
+        }},
+        {"policy", "Content Browser package inspection loads the selected native/package candidate into a scratch AssetManager and reports the existing CPU AssetManager -> SceneAsset -> GpuScene placement readiness. Direct NativeAssetStore-to-GPU upload remains explicitly non-executable until renderer-owned native-store handles, Vulkan allocation, timeline fences, and retirement are implemented."},
+    };
+}
+
+bool nativeStandaloneStorePath(const std::filesystem::path& path) {
+    const std::string ext = lowerString(path.extension().string());
+    return ext == ".rtmesh" || ext == ".rtmaterial" || ext == ".rttexture" ||
+        ext == ".rtskeleton" || ext == ".rtanim" || ext == ".rtanimcontroller" || ext == ".rtskeletalmesh";
+}
+
+void appendUniquePath(std::vector<std::filesystem::path>& paths, const std::filesystem::path& path) {
+    if (path.empty()) {
+        return;
+    }
+    const std::filesystem::path key = canonicalForCompare(path);
+    for (const std::filesystem::path& existing : paths) {
+        if (canonicalForCompare(existing) == key) {
+            return;
+        }
+    }
+    paths.push_back(path);
+}
+
+nlohmann::json nativeStoreMountReportJson(const NativeAssetStoreMountReport& report) {
+    nlohmann::json errors = nlohmann::json::array();
+    for (const NativeBinaryError& error : report.errors) {
+        errors.push_back({
+            {"code", nativeBinaryErrorCodeName(error.code)},
+            {"path", error.path.empty() ? std::string{} : error.path.generic_string()},
+            {"table", error.table},
+            {"message", error.message},
+        });
+    }
+    return {
+        {"ok", report.ok},
+        {"source", report.source},
+        {"path", report.path.empty() ? std::string{} : report.path.generic_string()},
+        {"generation", report.generation},
+        {"objectCount", report.objectCount},
+        {"warnings", report.warnings},
+        {"errors", errors},
+    };
+}
+
+nlohmann::json nativeStoreObjectSummaryJson(const NativeAssetStoreObject& object) {
+    return {
+        {"guid", object.guid},
+        {"kind", nativeAssetKindName(object.kind)},
+        {"source", nativeAssetStoreSourceName(object.source)},
+        {"path", object.path.empty() ? std::string{} : object.path.generic_string()},
+        {"packagePath", object.packagePath.empty() ? std::string{} : object.packagePath.generic_string()},
+        {"packageObjectPath", object.packageObjectPath},
+        {"generation", object.generation},
+        {"offset", object.offset},
+        {"size", object.size},
+        {"referenceCount", object.referenceCount},
+        {"payloadHashValid", object.payloadHashValid},
+        {"dependencyCount", object.dependencies.size()},
+        {"dependencies", object.dependencies},
+    };
+}
+
+nlohmann::json assetDependencyListJson(const std::vector<AssetDependency>& dependencies) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const AssetDependency& dependency : dependencies) {
+        out.push_back({
+            {"guid", dependency.guid},
+            {"kind", dependency.kind.empty() ? std::string("dependency") : dependency.kind},
+        });
+    }
+    return out;
+}
+
+nlohmann::json assetReferenceListJson(const std::vector<AssetGuid>& references) {
+    nlohmann::json out = nlohmann::json::array();
+    for (const AssetGuid& reference : references) {
+        out.push_back(reference);
+    }
+    return out;
+}
+
+nlohmann::json reverseAssetReferencesJson(const EditorRuntimeState& state, const AssetGuid& targetGuid) {
+    nlohmann::json out = nlohmann::json::array();
+    if (state.assetRegistry == nullptr || targetGuid.empty()) {
+        return out;
+    }
+    for (const AssetRecord& owner : state.assetRegistry->records()) {
+        if (owner.guid == targetGuid) {
+            continue;
+        }
+        for (const AssetDependency& dependency : owner.dependencies) {
+            if (dependency.guid == targetGuid) {
+                out.push_back({
+                    {"ownerGuid", owner.guid},
+                    {"ownerDisplayName", owner.displayName},
+                    {"ownerAssetType", assetTypeName(owner.type)},
+                    {"role", dependency.kind.empty() ? std::string("dependency") : dependency.kind},
+                    {"source", "Dependency"},
+                });
+            }
+        }
+        for (const AssetGuid& reference : owner.references) {
+            if (reference == targetGuid) {
+                out.push_back({
+                    {"ownerGuid", owner.guid},
+                    {"ownerDisplayName", owner.displayName},
+                    {"ownerAssetType", assetTypeName(owner.type)},
+                    {"role", "reference"},
+                    {"source", "Reference"},
+                });
+            }
+        }
+    }
+    return out;
+}
+
+nlohmann::json contentBrowserNativeAssetDetailsJson(
+    const EditorRuntimeState& state,
+    const AssetRecord& record,
+    const std::filesystem::path& sourcePath,
+    const std::filesystem::path& importedPath,
+    const nlohmann::json& nativeStoreReadiness,
+    const nlohmann::json& opaquePackageReadiness) {
+    const nlohmann::json query = nativeStoreReadiness.value("query", nlohmann::json::object());
+    const nlohmann::json lazyPayloadRead = nativeStoreReadiness.value("lazyPayloadRead", nlohmann::json::object());
+    const nlohmann::json nativeHealth = nativeStoreReadiness.value("health", nlohmann::json::object());
+    const bool nativeFound = nativeHealth.value("nativePayloadAvailable", false);
+    const bool nativeReadable = lazyPayloadRead.value("ok", false);
+    const bool metadataAvailable = !importedPath.empty() && regularFileExists(importedPath);
+    const bool nativeCorrupt = nativeFound && !nativeReadable;
+    bool packageCandidateAvailable = false;
+    for (const nlohmann::json& candidate : opaquePackageReadiness.value("candidates", nlohmann::json::array())) {
+        if (candidate.is_object() && candidate.value("isRegularFile", false)) {
+            packageCandidateAvailable = true;
+            break;
+        }
+    }
+
+    std::string runtimePath = "missing-placeholder";
+    if (nativeFound && nativeReadable) {
+        runtimePath = query.value("source", std::string{}) == "package" ? "package-native-payload" : "loose-native-payload";
+    } else if (metadataAvailable) {
+        runtimePath = "transparent-metadata-fallback";
+    }
+
+    return {
+        {"schema", "ContentBrowserNativeAssetDetailsV1"},
+        {"assetGuid", record.guid},
+        {"assetType", assetTypeName(record.type)},
+        {"transparentMetadataPath", importedPath.empty() ? std::string{} : importedPath.generic_string()},
+        {"nativePayloadPath", query.value("path", std::string{})},
+        {"packageMembership", {
+            {"packageCandidateAvailable", packageCandidateAvailable},
+            {"source", query.value("source", std::string("missing"))},
+            {"packagePath", query.value("packagePath", std::string{})},
+            {"packageObjectPath", query.value("packageObjectPath", std::string{})},
+        }},
+        {"hashes", {
+            {"sourceHash", record.sourceHash},
+            {"importedHash", record.importedHash},
+            {"importSettingsHash", record.importSettingsHash},
+            {"payloadHashValid", query.value("payloadHashValid", false)},
+        }},
+        {"migrationState", {
+            {"status", record.stale ? "stale-needs-reimport-or-migration" : "current-or-unknown"},
+            {"assetImportStatus", assetImportStatusName(record.status)},
+        }},
+        {"dependencies", assetDependencyListJson(record.dependencies)},
+        {"reverseReferences", reverseAssetReferencesJson(state, record.guid)},
+        {"directReferences", assetReferenceListJson(record.references)},
+        {"health", {
+            {"sourceMissing", record.sourceMissing || (!record.sourcePath.empty() && !regularFileExists(sourcePath))},
+            {"transparentMetadataMissing", record.importedMetadataMissing || (!record.importedPath.empty() && !metadataAvailable)},
+            {"nativePayloadMissing", nativeHealth.value("nativePayloadMissing", !nativeFound)},
+            {"nativePayloadStale", nativeHealth.value("nativePayloadStale", record.stale)},
+            {"nativePayloadCorrupt", nativeCorrupt},
+            {"dependenciesMissing", record.dependenciesMissing || nativeHealth.value("nativeDependenciesMissing", false)},
+            {"registryMissing", record.missing || record.status == AssetImportStatus::Missing},
+        }},
+        {"runtimeLoadDecision", {
+            {"path", runtimePath},
+            {"willLoadNative", nativeFound && nativeReadable},
+            {"willLoadPackage", nativeFound && nativeReadable && query.value("source", std::string{}) == "package"},
+            {"willUseTransparentFallback", !nativeFound && metadataAvailable},
+            {"willUseMissingPlaceholder", runtimePath == "missing-placeholder"},
+        }},
+    };
+}
+std::filesystem::path nativeStoreObjectDisplayPath(const NativeAssetStoreObject& object) {
+    if (object.source == NativeAssetStoreSource::Package) {
+        if (!object.packagePath.empty() && !object.packageObjectPath.empty()) {
+            return object.packagePath / object.packageObjectPath;
+        }
+        return object.packagePath;
+    }
+    return object.path;
+}
+
+bool nativeByteRangeInside(uint64_t offset, uint64_t size, uint64_t fileSize) {
+    return offset <= fileSize && size <= fileSize - offset;
+}
+
+std::string nativeDebugDirectoryString(
+    const std::vector<std::byte>& bytes,
+    const NativeAssetInspection& inspection,
+    uint32_t offset,
+    uint32_t size) {
+    if (size == 0 || offset >= inspection.header.debugDirectorySize) {
+        return {};
+    }
+    const uint64_t available = std::min<uint64_t>(size, inspection.header.debugDirectorySize - offset);
+    const uint64_t absoluteOffset = inspection.header.debugDirectoryOffset + offset;
+    if (!nativeByteRangeInside(absoluteOffset, available, bytes.size())) {
+        return {};
+    }
+    return std::string(
+        reinterpret_cast<const char*>(bytes.data() + absoluteOffset),
+        reinterpret_cast<const char*>(bytes.data() + absoluteOffset + available));
+}
+
+nlohmann::json nativeTexturePolicyMetadataJson(const std::vector<std::byte>& bytes, const std::filesystem::path& pathHint) {
+    nlohmann::json metadata = {
+        {"schema", "NativeTexturePolicyMetadataV1"},
+        {"decoded", false},
+        {"textureRole", std::string{}},
+        {"textureColorSpace", std::string{}},
+        {"intendedVkFormat", std::string{}},
+        {"emittedVkFormat", std::string{}},
+        {"compressionPolicy", std::string{}},
+        {"platformFormatPolicy", std::string{}},
+        {"platformSelectedVkFormat", std::string{}},
+        {"platformFormatSelectionReason", std::string{}},
+        {"platformFormatFallbackReason", std::string{}},
+    };
+    if (bytes.empty()) {
+        metadata["decodeError"] = "empty payload";
+        return metadata;
+    }
+    NativeAssetReader reader;
+    const NativeAssetInspection inspection = reader.inspectBytes(pathHint, bytes, true);
+    if (!inspection.ok || static_cast<NativeAssetKind>(inspection.header.assetKind) != NativeAssetKind::Texture) {
+        metadata["decodeError"] = inspection.ok ? std::string("not a native texture payload") : std::string("native inspection failed");
+        return metadata;
+    }
+
+    auto debugValue = [&](std::string_view key) {
+        for (const NativeDebugRecord& record : inspection.debugRecords) {
+            const std::string recordKey = nativeDebugDirectoryString(bytes, inspection, record.keyOffset, record.keySize);
+            if (recordKey == key) {
+                return nativeDebugDirectoryString(bytes, inspection, record.valueOffset, record.valueSize);
+            }
+        }
+        return std::string{};
+    };
+
+    metadata["decoded"] = true;
+    metadata["textureRole"] = debugValue("textureRole");
+    metadata["textureColorSpace"] = debugValue("textureColorSpace");
+    metadata["intendedVkFormat"] = debugValue("intendedVkFormat");
+    metadata["emittedVkFormat"] = debugValue("emittedVkFormat");
+    if (metadata.value("intendedVkFormat", std::string{}).empty()) {
+        metadata["intendedVkFormat"] = metadata.value("emittedVkFormat", std::string{});
+    }
+    if (metadata.value("emittedVkFormat", std::string{}).empty()) {
+        metadata["emittedVkFormat"] = metadata.value("intendedVkFormat", std::string{});
+    }
+    metadata["compressionPolicy"] = debugValue("compressionPolicy");
+    metadata["platformFormatPolicy"] = debugValue("platformFormatPolicy");
+    metadata["platformSelectedVkFormat"] = debugValue("platformSelectedVkFormat");
+    metadata["platformFormatSelectionReason"] = debugValue("platformFormatSelectionReason");
+    metadata["platformFormatFallbackReason"] = debugValue("platformFormatFallbackReason");
+    metadata["payloadHashValid"] = inspection.payloadHashValid;
+    return metadata;
+}
+
+std::string nativeTexturePolicyTooltipSuffix(const nlohmann::json& metadata) {
+    if (!metadata.value("decoded", false)) {
+        return {};
+    }
+    std::string suffix = " Role: " + metadata.value("textureRole", std::string("unknown")) +
+        "; color space: " + metadata.value("textureColorSpace", std::string("unknown")) +
+        "; emitted format: " + metadata.value("intendedVkFormat", std::string("unknown"));
+    const std::string selected = metadata.value("platformSelectedVkFormat", std::string{});
+    if (!selected.empty()) {
+        suffix += "; platform target: " + selected;
+    }
+    return suffix;
+}
+
+nlohmann::json nativeTextureGuidBindingReadinessJson(
+    const AssetRecord& record,
+    NativeAssetStore& store,
+    const NativeAssetStoreInspection& inspection) {
+    const bool textureLike = record.type == AssetType::Texture || record.type == AssetType::HDRI;
+    const bool materialLike = record.type == AssetType::Material;
+    nlohmann::json bindings = nlohmann::json::array();
+    nlohmann::json selectedTexture = nlohmann::json::object();
+    const auto ownerObject = store.find(record.guid);
+    bool ownerPayloadReadable = false;
+    bool allBindingsResolved = true;
+    bool anyBindingFallback = false;
+    bool anyBindingMissing = false;
+
+    if (textureLike && ownerObject.has_value()) {
+        NativeBinaryError textureReadError;
+        const std::vector<std::byte> textureBytes = store.readObjectBytes(record.guid, &textureReadError);
+        ownerPayloadReadable = !textureBytes.empty();
+        const nlohmann::json policyMetadata = nativeTexturePolicyMetadataJson(textureBytes, nativeStoreObjectDisplayPath(*ownerObject));
+        selectedTexture = {
+            {"guid", record.guid},
+            {"found", true},
+            {"nativeSource", nativeAssetStoreSourceName(ownerObject->source)},
+            {"nativePath", nativeStoreObjectDisplayPath(*ownerObject).generic_string()},
+            {"payloadReadable", ownerPayloadReadable},
+            {"payloadBytes", textureBytes.size()},
+            {"nativeTexturePolicyMetadata", policyMetadata},
+            {"fallbackStateReportable", true},
+            {"residentStateReportable", true},
+            {"repairAction", ownerPayloadReadable ? std::string{} : std::string("reimport_or_recook_source_asset")},
+            {"readError", textureReadError.message},
+        };
+    } else if (textureLike) {
+        selectedTexture = {
+            {"guid", record.guid},
+            {"found", false},
+            {"payloadReadable", false},
+            {"fallbackStateReportable", true},
+            {"residentStateReportable", true},
+            {"repairAction", "reimport_or_recook_source_asset"},
+        };
+        anyBindingMissing = true;
+    }
+
+    if (materialLike && ownerObject.has_value()) {
+        NativeBinaryError materialReadError;
+        const std::vector<std::byte> materialBytes = store.readObjectBytes(record.guid, &materialReadError);
+        ownerPayloadReadable = !materialBytes.empty();
+        if (ownerPayloadReadable) {
+            NativeAssetRuntimeLoader loader;
+            NativeRuntimeLoadedAsset materialAsset = loader.loadBytes(nativeStoreObjectDisplayPath(*ownerObject), materialBytes);
+            for (const NativeRuntimeTextureBinding& binding : materialAsset.materialTextureBindings) {
+                const auto textureObject = store.find(binding.textureGuid);
+                NativeBinaryError textureReadError;
+                const std::vector<std::byte> textureBytes = textureObject.has_value()
+                    ? store.readObjectBytes(binding.textureGuid, &textureReadError)
+                    : std::vector<std::byte>{};
+                const bool found = textureObject.has_value();
+                const bool payloadReadable = !textureBytes.empty();
+                const bool missing = !found || !payloadReadable;
+                allBindingsResolved = allBindingsResolved && !missing;
+                anyBindingMissing = anyBindingMissing || missing;
+                anyBindingFallback = anyBindingFallback || missing;
+                bindings.push_back({
+                    {"slot", binding.slot},
+                    {"slotName", binding.slotName},
+                    {"textureGuid", binding.textureGuid},
+                    {"cookedTextureIndex", binding.cookedTextureIndex},
+                    {"resolvedInNativeAssetStore", found},
+                    {"nativeSource", found ? nativeAssetStoreSourceName(textureObject->source) : std::string("missing")},
+                    {"nativePath", found ? nativeStoreObjectDisplayPath(*textureObject).generic_string() : std::string{}},
+                    {"payloadReadable", payloadReadable},
+                    {"payloadBytes", textureBytes.size()},
+                    {"residentStateReportable", true},
+                    {"fallbackStateReportable", true},
+                    {"fallback", missing},
+                    {"missing", missing},
+                    {"repairAction", missing ? std::string("reimport_or_recook_source_asset") : std::string{}},
+                    {"readError", textureReadError.message},
+                });
+            }
+        } else {
+            allBindingsResolved = false;
+            anyBindingMissing = true;
+            anyBindingFallback = true;
+        }
+    } else if (materialLike) {
+        allBindingsResolved = false;
+        anyBindingMissing = true;
+        anyBindingFallback = true;
+    }
+
+    return {
+        {"schema", "NativeTextureGuidBindingReadinessV1"},
+        {"assetGuid", record.guid},
+        {"assetType", assetTypeName(record.type)},
+        {"appliesToTextureLikeAsset", textureLike},
+        {"appliesToMaterialAsset", materialLike},
+        {"ownerNativePayloadFound", ownerObject.has_value()},
+        {"ownerPayloadReadable", ownerPayloadReadable},
+        {"selectedTexture", selectedTexture},
+        {"materialTextureBindingCount", bindings.size()},
+        {"materialTextureBindings", bindings},
+        {"allMaterialTextureBindingsResolved", materialLike ? nlohmann::json(allBindingsResolved) : nlohmann::json(nullptr)},
+        {"anyBindingFallback", anyBindingFallback},
+        {"anyBindingMissing", anyBindingMissing},
+        {"missingDependencyCount", inspection.missingDependencies.size()},
+        {"missingDependencies", inspection.missingDependencies},
+        {"reportedStates", nlohmann::json::array({"textureGuid", "nativeSource", "residentStateReportable", "fallbackStateReportable", "missing", "repairAction", "textureRole", "textureColorSpace", "intendedVkFormat", "compressionPolicy", "platformSelectedVkFormat"})},
+        {"policy", "Selected-asset package inspection decodes native material slots and resolves texture GUIDs through NativeAssetStore. Missing payloads remain fallback-safe and report reimport/recook repair actions."},
+    };
+}
+
+struct NativeTextureBindingTableBadge {
+    bool applies = false;
+    std::string label = "-";
+    std::string tooltip = "Native texture GUID binding does not apply to this asset type.";
+    ImVec4 color{0.55f, 0.60f, 0.66f, 1.0f};
+};
+
+struct NativeTexturePolicyTableFields {
+    bool applies = false;
+    bool decoded = false;
+    std::string role = "-";
+    std::string colorSpace = "-";
+    std::string emittedFormat = "-";
+    std::string compressionPolicy = "-";
+    std::string platformTarget = "-";
+    std::string tooltip = "Native texture policy columns apply to texture and HDRI native payloads.";
+};
+
+std::string policyMetadataValueOrDash(const nlohmann::json& metadata, const char* key) {
+    const std::string value = metadata.value(key, std::string{});
+    return value.empty() ? std::string("-") : value;
+}
+
+NativeTexturePolicyTableFields nativeTexturePolicyTableFieldsJson(
+    const AssetRecord& record,
+    NativeAssetStore& store) {
+    NativeTexturePolicyTableFields fields;
+    const bool textureLike = record.type == AssetType::Texture || record.type == AssetType::HDRI;
+    if (!textureLike) {
+        return fields;
+    }
+
+    fields.applies = true;
+    const auto object = store.find(record.guid);
+    if (!object.has_value()) {
+        fields.tooltip = "Native texture payload GUID was not found in mounted package/loose roots.";
+        return fields;
+    }
+
+    NativeBinaryError readError;
+    const std::vector<std::byte> bytes = store.readObjectBytes(record.guid, &readError);
+    if (bytes.empty()) {
+        fields.tooltip = "Native texture payload was found but could not be read.";
+        if (!readError.message.empty()) {
+            fields.tooltip += " Error: " + readError.message;
+        }
+        return fields;
+    }
+
+    const nlohmann::json metadata = nativeTexturePolicyMetadataJson(bytes, nativeStoreObjectDisplayPath(*object));
+    fields.decoded = metadata.value("decoded", false);
+    fields.role = policyMetadataValueOrDash(metadata, "textureRole");
+    fields.colorSpace = policyMetadataValueOrDash(metadata, "textureColorSpace");
+    fields.emittedFormat = policyMetadataValueOrDash(metadata, "emittedVkFormat");
+    fields.compressionPolicy = policyMetadataValueOrDash(metadata, "compressionPolicy");
+    fields.platformTarget = policyMetadataValueOrDash(metadata, "platformSelectedVkFormat");
+    fields.tooltip = std::string("Sortable native texture policy fields for registry table scanning.") +
+        nativeTexturePolicyTooltipSuffix(metadata);
+    return fields;
+}
+
+NativeTextureBindingTableBadge nativeTextureBindingTableBadgeJson(
+    const AssetRecord& record,
+    NativeAssetStore& store) {
+    NativeTextureBindingTableBadge badge;
+    const bool textureLike = record.type == AssetType::Texture || record.type == AssetType::HDRI;
+    const bool materialLike = record.type == AssetType::Material;
+    if (!textureLike && !materialLike) {
+        return badge;
+    }
+
+    badge.applies = true;
+    const auto object = store.find(record.guid);
+    if (!object.has_value()) {
+        badge.label = "Native missing";
+        badge.tooltip = "Native payload GUID was not found in the mounted package/loose roots. Repair action: reimport_or_recook_source_asset.";
+        badge.color = ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
+        return badge;
+    }
+
+    NativeBinaryError readError;
+    const std::vector<std::byte> bytes = store.readObjectBytes(record.guid, &readError);
+    if (bytes.empty()) {
+        badge.label = "Payload unreadable";
+        badge.tooltip = "Native payload was found but could not be read. Repair action: reimport_or_recook_source_asset.";
+        if (!readError.message.empty()) {
+            badge.tooltip += " Error: " + readError.message;
+        }
+        badge.color = ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
+        return badge;
+    }
+
+    if (textureLike) {
+        const nlohmann::json policyMetadata = nativeTexturePolicyMetadataJson(bytes, nativeStoreObjectDisplayPath(*object));
+        badge.label = "Texture ready";
+        badge.tooltip = std::string("Native texture payload is readable by GUID. Source: ") + nativeAssetStoreSourceName(object->source) +
+            "; resident/fallback state is reportable through native runtime loading and package inspection." +
+            nativeTexturePolicyTooltipSuffix(policyMetadata);
+        badge.color = ImVec4(0.54f, 0.82f, 0.60f, 1.0f);
+        return badge;
+    }
+
+    NativeAssetRuntimeLoader loader;
+    const NativeRuntimeLoadedAsset materialAsset = loader.loadBytes(nativeStoreObjectDisplayPath(*object), bytes);
+    if (!materialAsset.ok) {
+        badge.label = "Material unreadable";
+        badge.tooltip = "Native material payload was readable from the store but failed runtime decode. Repair action: reimport_or_recook_source_asset.";
+        badge.color = ImVec4(0.95f, 0.36f, 0.32f, 1.0f);
+        return badge;
+    }
+    if (materialAsset.materialTextureBindings.empty()) {
+        badge.label = "No textures";
+        badge.tooltip = "Native material has no texture GUID slots to resolve.";
+        badge.color = ImVec4(0.70f, 0.74f, 0.80f, 1.0f);
+        return badge;
+    }
+
+    uint32_t missingCount = 0;
+    uint32_t unreadableCount = 0;
+    for (const NativeRuntimeTextureBinding& binding : materialAsset.materialTextureBindings) {
+        const auto textureObject = store.find(binding.textureGuid);
+        if (!textureObject.has_value()) {
+            ++missingCount;
+            continue;
+        }
+        NativeBinaryError textureReadError;
+        const std::vector<std::byte> textureBytes = store.readObjectBytes(binding.textureGuid, &textureReadError);
+        if (textureBytes.empty()) {
+            ++unreadableCount;
+        }
+    }
+
+    if (missingCount == 0 && unreadableCount == 0) {
+        badge.label = "GUID ready";
+        badge.tooltip = "All native material texture GUID slots resolve to readable native texture payloads. Resident/fallback state is reportable through native runtime loading and package inspection.";
+        badge.color = ImVec4(0.54f, 0.82f, 0.60f, 1.0f);
+    } else {
+        badge.label = "Fallback " + std::to_string(missingCount + unreadableCount);
+        badge.tooltip = "One or more native material texture GUID slots are missing or unreadable. Missing=" + std::to_string(missingCount) +
+            ", unreadable=" + std::to_string(unreadableCount) + ". Repair action: reimport_or_recook_source_asset.";
+        badge.color = ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
+    }
+    return badge;
+}
+
+nlohmann::json nativeStoreReadinessJson(
+    const EditorRuntimeState& state,
+    const AssetRecord& record,
+    const std::filesystem::path& importedPath,
+    const std::filesystem::path& cachePath) {
+    std::vector<std::filesystem::path> packageCandidates;
+    auto appendPackageCandidate = [&](std::filesystem::path path) {
+        if (path.empty()) {
+            return;
+        }
+        if (lowerString(path.extension().string()) != ".rtpkg") {
+            path.replace_extension(".rtpkg");
+        }
+        appendUniquePath(packageCandidates, path);
+    };
+    appendPackageCandidate(importedPath);
+    appendPackageCandidate(cachePath);
+
+    std::vector<std::filesystem::path> looseRoots;
+    if (state.project != nullptr && !state.project->cacheRoot.empty()) {
+        appendUniquePath(looseRoots, state.project->cacheRoot);
+    }
+    if (nativeStandaloneStorePath(cachePath)) {
+        appendUniquePath(looseRoots, cachePath.parent_path());
+        if (state.project == nullptr) {
+            appendUniquePath(looseRoots, cachePath.parent_path().parent_path());
+        }
+    }
+    if (nativeStandaloneStorePath(importedPath)) {
+        appendUniquePath(looseRoots, importedPath.parent_path());
+    }
+
+    NativeAssetStore store;
+    nlohmann::json packageMounts = nlohmann::json::array();
+    nlohmann::json looseMounts = nlohmann::json::array();
+    for (const std::filesystem::path& packagePath : packageCandidates) {
+        if (regularFileExists(packagePath)) {
+            packageMounts.push_back(nativeStoreMountReportJson(store.mountPackage(packagePath)));
+        } else {
+            packageMounts.push_back({
+                {"ok", false},
+                {"source", "package"},
+                {"path", packagePath.generic_string()},
+                {"objectCount", 0},
+                {"missing", true},
+            });
+        }
+    }
+    for (const std::filesystem::path& root : looseRoots) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(root, ec)) {
+            looseMounts.push_back(nativeStoreMountReportJson(store.mountLooseRoot(root)));
+        } else {
+            looseMounts.push_back({
+                {"ok", false},
+                {"source", "loose_file"},
+                {"path", root.generic_string()},
+                {"objectCount", 0},
+                {"missing", true},
+            });
+        }
+    }
+
+    const NativeAssetStoreInspection inspection = store.inspect({record.guid});
+    const NativeAssetStoreObject query = inspection.queries.empty() ? NativeAssetStoreObject{.guid = record.guid} : inspection.queries.front();
+    nlohmann::json textureGuidBindingReadiness = nativeTextureGuidBindingReadinessJson(record, store, inspection);
+    NativeBinaryError readError;
+    const std::vector<std::byte> queryBytes = store.readObjectBytes(record.guid, &readError);
+    const bool found = query.source != NativeAssetStoreSource::Missing;
+    const bool stale = record.stale || record.status == AssetImportStatus::Stale;
+    const bool missingDependencies = !inspection.missingDependencies.empty();
+    nlohmann::json packageCandidatePaths = nlohmann::json::array();
+    for (const std::filesystem::path& path : packageCandidates) {
+        packageCandidatePaths.push_back(path.generic_string());
+    }
+    nlohmann::json looseRootPaths = nlohmann::json::array();
+    for (const std::filesystem::path& path : looseRoots) {
+        looseRootPaths.push_back(path.generic_string());
+    }
+
+    return {
+        {"schema", "NativeAssetStoreReadinessV1"},
+        {"assetGuid", record.guid},
+        {"assetType", assetTypeName(record.type)},
+        {"packageCandidates", packageCandidatePaths},
+        {"looseRoots", looseRootPaths},
+        {"packageMounts", packageMounts},
+        {"looseMounts", looseMounts},
+        {"mountedObjectCount", inspection.objects.size()},
+        {"query", nativeStoreObjectSummaryJson(query)},
+        {"lazyPayloadRead", {
+            {"attempted", found},
+            {"ok", !queryBytes.empty()},
+            {"size", queryBytes.size()},
+            {"error", readError.message},
+        }},
+        {"health", {
+            {"nativePayloadAvailable", found},
+            {"nativePayloadMissing", !found},
+            {"nativePayloadStale", stale},
+            {"nativeDependenciesMissing", missingDependencies},
+            {"missingDependencyCount", inspection.missingDependencies.size()},
+            {"status", found ? (stale ? "stale" : missingDependencies ? "dependency-missing" : "available") : "missing"},
+        }},
+        {"nativeTextureGuidBindingReadiness", textureGuidBindingReadiness},
+        {"missingDependencies", inspection.missingDependencies},
+        {"unloadSafetyPolicy", {
+            {"mountGenerationIdsReported", true},
+            {"objectReferenceCountsReported", true},
+            {"guardedPackageUnmountDiagnosticsImplemented", true},
+            {"liveRendererResourceRetirementImplemented", true},
+            {"liveRendererResourceRetirementPath", "cpu-asset-manager-gpuscene-renderer-replacement-queue"},
+            {"directNativeStoreRendererRetirementImplemented", false},
+        }},
+        {"openProductionScope", {
+            {"currentReportScope", "selected-asset-native-store-readiness-inventory"},
+            {"implementedScope", nlohmann::json::array({
+                "package-and-loose-root-mounting",
+                "guid-lookup",
+                "dependency-closure-validation",
+                "lazy-payload-byte-read",
+                "mount-generation-reporting",
+                "retain-release-reference-counts",
+                "guarded-package-unmount-diagnostics",
+                "cpu-asset-manager-gpuscene-renderer-replacement-queue-retirement"
+            })},
+            {"openRuntimeScope", nlohmann::json::array({
+                "direct-native-store-to-gpu-resource-creation",
+                "renderer-owned-native-store-handles",
+                "persistent-native-store-mount-ownership",
+                "direct-store-resource-retirement"
+            })},
+            {"cpuPackageUnloadRendererRetirementImplemented", true},
+            {"directNativeStoreGpuUploadImplemented", false},
+            {"directNativeStoreResourceCreationImplemented", false},
+            {"directNativeStoreRendererRetirementImplemented", false},
+        }},
+        {"policy", "NativeAssetStore readiness is an editor/reporting view of mounted package and loose native payload availability by GUID, mount generation, and reference count. Content Browser package unload retires active package-backed renderer resources through the existing CPU AssetManager -> GpuScene -> PathTracerRenderer replacement queue; direct NativeAssetStore-to-GPU resource creation and direct-store retirement remain open."},
     };
 }
 
@@ -3599,22 +4613,56 @@ nlohmann::json packageVersioningReadinessJson(const AssetRecord& record) {
             "DebugDirectory"
         })},
         {"migrationPolicy", {
-            {"migrationTableImplemented", false},
+            {"migrationTableImplemented", true},
             {"minimumReadableVersion", 1},
             {"currentWriterVersion", 1},
-            {"migrationStrategy", "Future package loader should migrate package header/object/chunk table versions before binding runtime payloads."},
-            {"backupPolicy", "Future package migration should write side-by-side backups before in-place package rewrites."},
+            {"migrationStrategy", "Native asset and .rtpkg CLI migration uses registered deterministic migrators, validates temp output, and replaces only after validation succeeds."},
+            {"backupPolicy", "Package migration writes side-by-side .before_migrate.<timestamp>.bak backups before successful in-place rewrites."},
         }},
         {"debugInspectionPolicy", {
-            {"binaryInspectorImplemented", false},
+            {"binaryInspectorImplemented", true},
             {"plannedInspectionFields", nlohmann::json::array({"header", "assetSummary", "dependencies", "objectTable", "chunkTable", "payloadHashes", "sourceControlPolicy", "migrationHistory"})},
-            {"currentInspectionFallback", "Use transparent JSON metadata, package candidate paths, and filesystem payload facts from this report."},
+            {"currentInspectionFallback", "Use --inspect-package for binary package inspection; this selected-asset report exposes candidate paths and NativeAssetStore readiness but does not open arbitrary package files."},
         }},
         {"implementationStatus", {
-            {"packageEmissionImplemented", false},
-            {"packageLoadingImplemented", false},
-            {"packageMigrationImplemented", false},
-            {"binaryDebugInspectionImplemented", false},
+            {"standalonePackageCliImplemented", true},
+            {"projectCookPackageEmissionImplemented", true},
+            {"cpuNativeAssetStorePackageMountImplemented", true},
+            {"nativeAssetStoreMountGenerationIdsImplemented", true},
+            {"nativeAssetStoreReferenceCountingImplemented", true},
+            {"guardedPackageUnmountDiagnosticsImplemented", true},
+            {"cpuRuntimeLoaderPackageDecodeImplemented", true},
+            {"packageMigrationCliImplemented", true},
+            {"binaryDebugInspectionImplemented", true},
+            {"packageInspectorUiMountImplemented", true},
+            {"packageInspectorUiRebuildImplemented", true},
+            {"automaticProjectPackageMountingImplemented", true},
+            {"rendererPackageResourcePlacementImplemented", true},
+            {"rendererPackageResourcePlacementPath", "cpu-asset-manager-sceneasset-gpuscene-path"},
+            {"directNativeStoreGpuUploadImplemented", false},
+            {"livePackageUnloadRendererRetirementImplemented", true},
+            {"packageInspectorUiImplemented", true},
+        }},
+        {"openProductionScope", {
+            {"currentReportScope", "selected-asset-package-versioning-inventory"},
+            {"implementedScope", nlohmann::json::array({
+                "standalone-package-cli",
+                "project-cook-package-emission",
+                "package-migration-with-backups",
+                "binary-package-inspection",
+                "cpu-native-asset-store-package-mount",
+                "content-browser-package-mount-rebuild-unload",
+                "cpu-asset-manager-sceneasset-gpuscene-placement"
+            })},
+            {"openRuntimeScope", nlohmann::json::array({
+                "direct-native-store-to-gpu-upload",
+                "renderer-owned-native-store-handles",
+                "direct-native-store-resource-retirement",
+                "future-payload-schema-migration-fixtures"
+            })},
+            {"directNativeStoreGpuUploadImplemented", false},
+            {"rendererOwnedNativeStoreHandlesImplemented", false},
+            {"futurePayloadSchemaMigrationFixturesAvailable", false},
         }},
     };
 }
@@ -3677,18 +4725,38 @@ nlohmann::json textureCookedBindingPolicyJson(
             {"requestedPolicy", record.importSettings.textureCompression.empty() ? std::string("PreserveSource") : record.importSettings.textureCompression},
             {"effectiveCookPolicy", textureLike ? "preserve-source-or-decoded-loose-payload" : "not-applicable"},
             {"platformTranscodeImplemented", false},
-            {"nativeCookedTextureEmissionImplemented", false},
+            {"nativeCookedTextureEmissionImplemented", true},
+            {"nativeMaterialTextureGuidBindingImplemented", true},
+            {"nativeTextureGuidBindingReportImplemented", true},
+            {"assetBrowserNativeTexturePolicyMetadataImplemented", true},
             {"basisStandaloneImportImplemented", false},
-            {"ktx2RuntimeTranscodeNote", "Runtime KTX2/BasisU texture loading may transcode for renderer upload, but the editor asset cook does not yet emit platform-specific native .rttexture payloads."},
+            {"ktx2RuntimeTranscodeNote", "KTX2/BasisU staging can preserve native KTX2 payloads or emit selected BC7 native .rttexture payloads through the policy-aware cook path; project package cook can emit initial source-backed KTX2/BasisU sidecars through explicit target sets."},
             {"supportedSourceContainers", nlohmann::json::array({"png", "jpg", "jpeg", "tga", "bmp", "hdr", "exr", "dds", "ktx", "ktx2"})},
             {"unsupportedSourceContainers", nlohmann::json::array({"basis"})},
         }},
+        {"openProductionScope", {
+            {"currentReportScope", "selected-asset-texture-policy-inventory"},
+            {"implementedScope", nlohmann::json::array({
+                "native-rttexture-emission",
+                "native-material-texture-guid-binding",
+                "asset-browser-native-texture-policy-metadata",
+                "project-package-texture-target-set-sidecars"
+            })},
+            {"openRuntimeScope", nlohmann::json::array({
+                "direct-native-store-to-gpu-texture-upload",
+                "live-device-targeted-texture-recook-transcode",
+                "standalone-basis-source-import",
+                "renderer-owned-native-texture-handle-retirement"
+            })},
+            {"directRendererNativeTextureUploadImplemented", false},
+            {"liveDeviceTargetedTextureRecookImplemented", false},
+            {"standaloneBasisSourceImportImplemented", false},
+        }},
         {"remainingWork", nlohmann::json::array({
-            "Native .rttexture emission/loading",
-            "Texture/HDR GUID binding through native cooked payloads",
-            "Platform compression/transcoding policy",
+            "Direct native-store-to-GPU texture upload with renderer-owned native handles",
+            "Live device-targeted texture recook/transcode and retirement scheduling",
             "Basis standalone source import",
-            "Material/environment rebinding to native texture payloads"
+            "Production renderer residency diagnostics for native texture variants"
         })},
     };
 }
@@ -3717,15 +4785,21 @@ nlohmann::json buildAssetPackageInspectionReport(const EditorRuntimeState& state
         {"importGroupName", record.importGroupName},
         {"importRootGuid", record.importRootGuid},
     };
+    nlohmann::json nativeStoreReadiness = nativeStoreReadinessJson(state, record, importedPath, cachePath);
+    nlohmann::json opaquePackageReadiness = opaquePackageCandidateJson(importedPath, cachePath);
+    nlohmann::json nativeRuntimePlacementReadiness = nativeRuntimePlacementReadinessJson(record, importedPath, cachePath);
 
     return {
         {"version", 1},
         {"kind", "SelectedAssetPackageInspectionReport"},
         {"targetGuid", record.guid},
         {"asset", assetRecordSummaryJson(state, record)},
+        {"contentBrowserNativeAssetDetails", contentBrowserNativeAssetDetailsJson(state, record, sourcePath, importedPath, nativeStoreReadiness, opaquePackageReadiness)},
         {"payloadPolicy", payloadPolicy},
         {"nativeRuntimeArtifactReadiness", nativeArtifactCandidateJson(record, importedPath, cachePath)},
-        {"opaquePackageReadiness", opaquePackageCandidateJson(importedPath, cachePath)},
+        {"nativeAssetStoreReadiness", nativeStoreReadiness},
+        {"nativeRuntimePlacementReadiness", nativeRuntimePlacementReadiness},
+        {"opaquePackageReadiness", opaquePackageReadiness},
         {"packageVersioningReadiness", packageVersioningReadinessJson(record)},
         {"textureCookedBindingPolicy", textureCookedBindingPolicyJson(record, sourcePath, importedPath, cachePath)},
         {"files", files},
@@ -3737,9 +4811,9 @@ nlohmann::json buildAssetPackageInspectionReport(const EditorRuntimeState& state
             {"cookedPayloadMissing", record.cookedPayloadMissing},
             {"dependenciesMissing", record.dependenciesMissing},
         }},
-        {"checkedScopes", nlohmann::json::array({"LoadedAssetRegistry", "ResolvedSourcePath", "ImportedMetadataJson", "CookedRuntimePayloadPath", "ThumbnailPath", "NativeStandaloneArtifactCandidates", "OpaquePackageCandidates", "PackageVersioningReadiness", "TextureCookedBindingPolicy"})},
-        {"uncheckedScopes", nlohmann::json::array({"OpaqueRtpkgObjects", "GeneratedCachePayloadInternals", "ExternalProjectFiles", "BinaryPayloadDeepInspection", "PackageMigrationTables", "PlatformTextureTranscodeOutputs"})},
-        {"limitation", "This report inspects selected transparent asset metadata and filesystem payload facts plus expected native/package candidate paths, package versioning/debug-readiness policy, and texture/HDR cooked-binding policy. It does not emit native runtime files, transcode platform texture payloads, parse binary cache payload internals, rewrite references, repair missing files, load .rtpkg packages, migrate packages, or inspect package internals."},
+        {"checkedScopes", nlohmann::json::array({"LoadedAssetRegistry", "ResolvedSourcePath", "ImportedMetadataJson", "CookedRuntimePayloadPath", "ThumbnailPath", "NativeStandaloneArtifactCandidates", "NativeAssetStoreGuidLookup", "NativeAssetStoreDependencyClosure", "NativeAssetStoreLazyPayloadRead", "NativeTextureGuidBindingReadiness", "NativeRuntimePlacementReadiness", "OpaquePackageCandidates", "PackageVersioningReadiness", "TextureCookedBindingPolicy"})},
+        {"uncheckedScopes", nlohmann::json::array({"GeneratedCachePayloadInternals", "ExternalProjectFiles", "DirectNativeStoreGpuUpload", "PlatformTextureTranscodeOutputs"})},
+        {"limitation", "This report inspects selected transparent asset metadata, filesystem payload facts, native/package candidate paths, NativeAssetStore GUID availability/dependency closure/lazy byte-read state, native texture GUID binding readiness, scratch runtime package/native placement readiness through the CPU AssetManager/SceneAsset/GpuScene path, package versioning/debug-readiness policy, and texture/HDR cooked-binding policy. It does not create renderer resources from native payloads, execute direct NativeAssetStore-to-GPU upload, transcode platform texture payloads, parse non-native generated cache internals, rewrite references, repair missing files, or automatically mount project packages."},
     };
 }
 
@@ -3781,6 +4855,18 @@ nlohmann::json buildAssetThumbnailReadinessReport(const EditorRuntimeState& stat
             {"rasterSourcePreviewSupported", rasterSourcePreview},
             {"generatedSourcePreviewSupported", metadataPreviewCandidate},
         }},
+        {"currentFallbackPreviewPlan", {
+            {"schema", "CpuThumbnailFallbackPlanV1"},
+            {"cpuRasterThumbnailCacheImplemented", true},
+            {"cpuRasterSamplingGrid", {12, 7}},
+            {"hdrToneMappedRasterPreviewImplemented", true},
+            {"rasterPreviewExtensions", nlohmann::json::array({".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr"})},
+            {"generatedPreviewDiskCacheImplemented", true},
+            {"generatedPreviewDiskCacheCandidate", metadataPreviewCandidate},
+            {"generatedPreviewDiskCacheKinds", nlohmann::json::array({"model", "scene", "project", "material", "ies", "volume", "folder"})},
+            {"rendererResourceCreationRequired", false},
+            {"asyncRenderedThumbnailGenerationImplemented", false},
+        }},
         {"asyncRenderedThumbnailPlan", {
             {"schema", "AsyncRenderedThumbnailPlanV1"},
             {"plannedJobTypes", nlohmann::json::array({"TextureThumbnail", "MaterialThumbnail", "PrefabModelThumbnail", "EnvironmentThumbnail", "LevelThumbnail"})},
@@ -3808,6 +4894,36 @@ nlohmann::json buildAssetThumbnailReadinessReport(const EditorRuntimeState& stat
 }
 
 nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state, const AssetRecord& record) {
+#if RTV_ENABLE_TINYOBJ_IMPORTER
+    constexpr bool tinyObjImporterEnabled = true;
+#else
+    constexpr bool tinyObjImporterEnabled = false;
+#endif
+#if RTV_TINYOBJ_IMPORTER_AVAILABLE
+    constexpr bool tinyObjImporterDependencyAvailable = true;
+#else
+    constexpr bool tinyObjImporterDependencyAvailable = false;
+#endif
+#if RTV_ENABLE_ASSIMP_IMPORTER
+    constexpr bool assimpImporterEnabled = true;
+#else
+    constexpr bool assimpImporterEnabled = false;
+#endif
+#if RTV_ASSIMP_IMPORTER_AVAILABLE
+    constexpr bool assimpImporterDependencyAvailable = true;
+#else
+    constexpr bool assimpImporterDependencyAvailable = false;
+#endif
+#if RTV_ENABLE_OPENUSD_IMPORTER
+    constexpr bool openUsdImporterEnabled = true;
+#else
+    constexpr bool openUsdImporterEnabled = false;
+#endif
+#if RTV_OPENUSD_IMPORTER_AVAILABLE
+    constexpr bool openUsdImporterDependencyAvailable = true;
+#else
+    constexpr bool openUsdImporterDependencyAvailable = false;
+#endif
     const std::filesystem::path sourcePath = resolveAssetRecordPath(state, record.sourcePath);
     const std::filesystem::path importedPath = resolveAssetRecordPath(state, record.importedPath);
     const std::filesystem::path cachePath = resolveAssetRecordPath(state, record.cachePath);
@@ -3824,13 +4940,18 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
     } else if (sourceExtension == ".obj") {
         sourceClass = "obj-model-partial";
         currentImportSupported = true;
+        currentPlaceAfterImportSupported = tinyObjImporterEnabled && tinyObjImporterDependencyAvailable;
     } else if (sourceExtension == ".mtl") {
         sourceClass = "mtl-material-source-partial";
         currentImportSupported = true;
     } else if (sourceExtension == ".fbx") {
-        sourceClass = "fbx-model-unsupported";
+        sourceClass = assimpImporterEnabled && assimpImporterDependencyAvailable ? "fbx-static-model-supported" : "fbx-model-unsupported";
+        currentImportSupported = assimpImporterEnabled && assimpImporterDependencyAvailable;
+        currentPlaceAfterImportSupported = assimpImporterEnabled && assimpImporterDependencyAvailable;
     } else if (sourceExtension == ".usd" || sourceExtension == ".usda" || sourceExtension == ".usdc" || sourceExtension == ".usdz") {
-        sourceClass = "usd-scene-unsupported";
+        sourceClass = openUsdImporterEnabled && openUsdImporterDependencyAvailable ? "usd-stage-metadata-native-cook-all-mesh-placement-supported" : "usd-scene-unsupported";
+        currentImportSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+        currentPlaceAfterImportSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
     } else if (sourceExtension == ".basis") {
         sourceClass = "basis-texture-unsupported";
     } else if (sourceExtension == ".dds" || sourceExtension == ".ktx" || sourceExtension == ".ktx2") {
@@ -3856,12 +4977,76 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
 
     nlohmann::json productionMatrix = nlohmann::json::array({
         productionFormatRow("glTF/GLB", "model-scene", true, true, true, true, "Current production baseline for source import, prefab metadata, cooked payload reuse, and import-and-place."),
-        productionFormatRow("OBJ/MTL", "model-material", true, false, false, false, "OBJ/MTL source discovery and preview/import routing exist, but full runtime cooking, material creation, texture binding, and viewport placement are not production-complete."),
-        productionFormatRow("FBX", "model-animation", false, false, false, false, "Full FBX importer remains future work."),
-        productionFormatRow("USD/USDZ", "scene-package", false, false, false, false, "USD/USDZ importer remains future work."),
+        productionFormatRow("OBJ/MTL", "model-material", true, tinyObjImporterEnabled && tinyObjImporterDependencyAvailable, true, tinyObjImporterEnabled && tinyObjImporterDependencyAvailable, "OBJ/MTL runtime mesh cooking, material creation, texture binding, and mesh placement are available when the tinyobj importer gate is enabled and the dependency is present."),
+        productionFormatRow("FBX", "model-animation", assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, "Static FBX scene import, external and embedded texture cooking/binding, native mesh/material cooking, import-and-place, skeleton/animation metadata bridge assets, and native skeletal mesh binding assets are available when the Assimp importer gate is enabled and the dependency is present; full runtime animation playback remains future work."),
+        productionFormatRow("USD/USDZ", "scene-package", openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, "OpenUSD stage metadata import, native .rtmesh cook, bound-material .rtmaterial cook, shader-network factor conversion, shader texture-reference diagnostics, shader texture material binding, USDZ package texture extraction/native cook, camera/light runtime record conversion, import-and-place of all cooked USD meshes with authored hierarchy entities, and live USD camera/light placement with ancestor hierarchy entities are available when the relevant gates are present; full USD/USDZ runtime/package parity and broader shader graph semantics remain future work."),
         productionFormatRow("Basis", "compressed-texture", false, false, false, false, "Standalone Basis source import and platform transcode policy remain future work."),
-        productionFormatRow("DDS/KTX/KTX2", "compressed-texture", true, false, false, false, "Container recognition exists through texture paths/policy reports, but native platform cook outputs are not emitted."),
+        productionFormatRow("DDS/KTX/KTX2", "compressed-texture", true, true, true, false, "DDS/KTX/KTX2 import/cook paths can preserve native payloads, KTX2/BasisU can emit selected BC7 native payloads, and project package cook can emit initial source-backed KTX2/BasisU sidecars; direct renderer upload remains open."),
     });
+
+    const char* objImporterDisabledReason = tinyObjImporterEnabled
+        ? (tinyObjImporterDependencyAvailable ? "available" : "tinyobjloader-dependency-missing")
+        : "RTV_ENABLE_TINYOBJ_IMPORTER=OFF";
+    const char* fbxImporterDisabledReason = assimpImporterEnabled
+        ? (assimpImporterDependencyAvailable ? "available" : "assimp-dependency-missing")
+        : "RTV_ENABLE_ASSIMP_IMPORTER=OFF";
+    const char* usdImporterDisabledReason = openUsdImporterEnabled
+        ? (openUsdImporterDependencyAvailable ? "available" : "openusd-dependency-missing")
+        : "RTV_ENABLE_OPENUSD_IMPORTER=OFF";
+    const bool objMtlImportAndPlaceSupported = tinyObjImporterEnabled && tinyObjImporterDependencyAvailable;
+    const bool fbxStaticImportSupported = assimpImporterEnabled && assimpImporterDependencyAvailable;
+    const bool usdStageMetadataImportSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdNativeMeshCookSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdMaterialBindingCookSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdShaderNetworkFactorConversionSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdShaderTextureReferenceDiagnosticsSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdShaderTextureMaterialBindingSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdCookedMeshViewportPlacementSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdAuthoredMeshTransformPlacementSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdParentHierarchyMeshTransformPlacementSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdCookedMeshHierarchyPlacementSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdzTextureProvenanceInspectionSupported = true;
+    const bool usdzPackageTextureExtractionSupported = true;
+    const bool usdCameraLightConversionSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdCameraLightViewportPlacementSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdCameraLightHierarchyPlacementSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    nlohmann::json supportedNow = nlohmann::json::array({
+        "gltf-glb-import-and-place",
+        "transparent-registry-metadata-inspection",
+        "selected-asset-importer-readiness-report",
+        "standalone-mtl-native-material-texture-cook",
+    });
+    if (objMtlImportAndPlaceSupported) {
+        supportedNow.push_back("obj-mtl-import-and-place");
+    }
+    if (fbxStaticImportSupported) {
+        supportedNow.push_back("fbx-static-import-and-native-cook");
+    }
+    if (usdStageMetadataImportSupported) {
+        supportedNow.push_back("usd-stage-metadata-import");
+        supportedNow.push_back("usd-native-rtmesh-cook");
+        supportedNow.push_back("usd-bound-material-rtmaterial-cook");
+        supportedNow.push_back("usd-shader-network-factor-conversion");
+        supportedNow.push_back("usd-shader-texture-reference-diagnostics");
+        supportedNow.push_back("usd-shader-texture-material-binding");
+        supportedNow.push_back("usdz-texture-provenance-inspection");
+        supportedNow.push_back("usdz-packaged-texture-extraction-native-cook");
+        supportedNow.push_back("usd-camera-light-runtime-records");
+        supportedNow.push_back("usd-import-and-place-all-cooked-meshes");
+        supportedNow.push_back("usd-authored-mesh-transform-placement");
+        supportedNow.push_back("usd-parent-hierarchy-mesh-transform-placement");
+        supportedNow.push_back("usd-cooked-mesh-hierarchy-placement");
+        supportedNow.push_back("usd-camera-light-viewport-placement");
+        supportedNow.push_back("usd-camera-light-hierarchy-placement");
+    }
+    nlohmann::json unsupportedActions = nlohmann::json::array({
+        fbxStaticImportSupported ? "full-fbx-import" : "fbx-import",
+        usdStageMetadataImportSupported ? "usd-usdz-full-scene-placement" : "usd-usdz-import",
+        "basis-import",
+    });
+    if (!objMtlImportAndPlaceSupported) {
+        unsupportedActions.push_back("obj-mtl-import-and-place");
+    }
 
     return {
         {"schema", "SelectedAssetImporterReadinessV1"},
@@ -3885,30 +5070,102 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
         {"productionImportMatrix", productionMatrix},
         {"objMtlProductionReadiness", {
             {"schema", "ObjMtlRuntimeCookingReadinessV1"},
+            {"tinyObjImporterEnabled", tinyObjImporterEnabled},
+            {"tinyObjImporterDependencyAvailable", tinyObjImporterDependencyAvailable},
+            {"tinyObjImporterDisabledReason", objImporterDisabledReason},
             {"sourceDiscoveryImplemented", currentImportSupported && (sourceExtension == ".obj" || sourceExtension == ".mtl")},
-            {"runtimeMeshCookingImplemented", false},
-            {"mtlMaterialCreationImplemented", false},
-            {"mtlTextureBindingImplemented", false},
-            {"viewportPlacementImplemented", false},
-            {"diagnosticsImplemented", false},
-            {"remainingStages", nlohmann::json::array({"parse-obj-geometry", "parse-mtl-materials", "resolve-texture-map-paths", "cook-runtime-mesh-payload", "create-material-assets", "bind-texture-assets-by-guid", "place-prefab-or-mesh-in-viewport", "write-import-diagnostics"})},
+            {"runtimeMeshCookingImplemented", tinyObjImporterEnabled && tinyObjImporterDependencyAvailable},
+            {"mtlMaterialCreationImplemented", true},
+            {"mtlTextureBindingImplemented", true},
+            {"objMaterialSlotGuidBindingImplemented", tinyObjImporterEnabled && tinyObjImporterDependencyAvailable},
+            {"objLinkedMtlTextureBindingImplemented", tinyObjImporterEnabled && tinyObjImporterDependencyAvailable},
+            {"viewportPlacementImplemented", tinyObjImporterEnabled && tinyObjImporterDependencyAvailable},
+            {"diagnosticsImplemented", true},
+            {"remainingStages", tinyObjImporterEnabled && tinyObjImporterDependencyAvailable
+                ? nlohmann::json::array()
+                : nlohmann::json::array({"enable-tinyobjloader", "parse-obj-geometry", "cook-runtime-mesh-payload", "bind-obj-primitives-to-mtl-material-guids", "cook-obj-linked-mtl-texture-maps", "place-prefab-or-mesh-in-viewport"})},
+        }},
+        {"fbxProductionReadiness", {
+            {"schema", "FbxImporterReadinessV1"},
+            {"assimpImporterEnabled", assimpImporterEnabled},
+            {"assimpImporterDependencyAvailable", assimpImporterDependencyAvailable},
+            {"assimpImporterDisabledReason", fbxImporterDisabledReason},
+            {"dependencyGateImplemented", true},
+            {"staticMeshImportImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"skeletonMetadataBridgeImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"animationMetadataBridgeImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"skeletalMeshBindingImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"skeletalMeshImportImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"animationImportImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"runtimeAnimationPlaybackImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"animationControllerBindingImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"animationPlaybackDisabledReason", assimpImporterEnabled && assimpImporterDependencyAvailable
+                ? ""
+                : fbxImporterDisabledReason},
+            {"nativeCookImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"externalTextureBindingImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"embeddedTextureBindingImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"viewportPlacementImplemented", assimpImporterEnabled && assimpImporterDependencyAvailable},
+            {"remainingStages", assimpImporterEnabled && assimpImporterDependencyAvailable
+                ? nlohmann::json::array({"production-fbx-skinned-renderer-placement", "richer-fbx-state-machine-authoring", "fbx-editor-preview-parity", "production-fbx-skeletal-fixture-parity"})
+                : nlohmann::json::array({"enable-assimp-importer", "install-assimp", "parse-fbx-static-scene", "cook-fbx-native-assets", "import-fbx-textures", "emit-fbx-skeleton-animation-metadata", "place-fbx-prefab-or-mesh-in-viewport"})},
+        }},
+        {"usdProductionReadiness", {
+            {"schema", "UsdImporterReadinessV1"},
+            {"openUsdImporterEnabled", openUsdImporterEnabled},
+            {"openUsdImporterDependencyAvailable", openUsdImporterDependencyAvailable},
+            {"openUsdImporterDisabledReason", usdImporterDisabledReason},
+            {"dependencyGateImplemented", true},
+            {"sceneGraphMetadataImportImplemented", openUsdImporterEnabled && openUsdImporterDependencyAvailable},
+            {"sceneGraphImportImplemented", openUsdImporterEnabled && openUsdImporterDependencyAvailable},
+            {"meshNativeCookImplemented", usdNativeMeshCookSupported},
+            {"materialBindingCookImplemented", usdMaterialBindingCookSupported},
+            {"materialNativeCookImplemented", usdMaterialBindingCookSupported},
+            {"shaderNetworkFactorConversionImplemented", usdShaderNetworkFactorConversionSupported},
+            {"shaderNetworkConversionImplemented", usdShaderNetworkFactorConversionSupported},
+            {"textureReferenceExtractionImplemented", usdShaderTextureReferenceDiagnosticsSupported},
+            {"shaderTextureMaterialBindingImplemented", usdShaderTextureMaterialBindingSupported},
+            {"meshMaterialCookImplemented", usdNativeMeshCookSupported && usdMaterialBindingCookSupported},
+            {"textureNativeCookImplemented", usdzPackageTextureExtractionSupported},
+            {"cameraRuntimeConversionImplemented", usdCameraLightConversionSupported},
+            {"lightRuntimeConversionImplemented", usdCameraLightConversionSupported},
+            {"cameraLightViewportPlacementImplemented", usdCameraLightViewportPlacementSupported},
+            {"cameraLightHierarchyPlacementImplemented", usdCameraLightHierarchyPlacementSupported},
+            {"usdzTextureProvenanceInspectionImplemented", usdzTextureProvenanceInspectionSupported},
+            {"usdzPackageTextureExtractionImplemented", usdzPackageTextureExtractionSupported},
+            {"usdzPackageTextureNativeCookImplemented", usdzPackageTextureExtractionSupported},
+            {"cookedMeshViewportPlacementImplemented", usdCookedMeshViewportPlacementSupported},
+            {"firstMeshViewportPlacementImplemented", usdCookedMeshViewportPlacementSupported},
+            {"authoredMeshTransformPlacementImplemented", usdAuthoredMeshTransformPlacementSupported},
+            {"parentHierarchyMeshTransformPlacementImplemented", usdParentHierarchyMeshTransformPlacementSupported},
+            {"cookedMeshHierarchyPlacementImplemented", usdCookedMeshHierarchyPlacementSupported},
+            {"nativeCookImplemented", usdNativeMeshCookSupported && usdMaterialBindingCookSupported},
+            {"viewportPlacementImplemented", usdCookedMeshHierarchyPlacementSupported || usdCameraLightHierarchyPlacementSupported},
+            {"remainingStages", openUsdImporterEnabled && openUsdImporterDependencyAvailable
+                ? nlohmann::json::array({"usd-runtime-package-parity", "full-usd-shader-graph-semantics"})
+                : nlohmann::json::array({"enable-openusd-importer", "install-openusd", "parse-usd-stage", "cook-usd-native-assets", "place-cooked-usd-meshes", "apply-authored-usd-mesh-transforms", "compose-usd-parent-hierarchy-mesh-transforms", "place-usd-cameras-and-lights", "place-full-usd-scene-hierarchy-in-viewport"})},
         }},
         {"compressedTexturePolicy", {
             {"basisStandaloneImportImplemented", false},
-            {"rawCompressedTexturePolicyImplemented", false},
-            {"platformTranscodeImplemented", false},
-            {"nativeRtTextureEmissionImplemented", false},
+            {"rawCompressedTexturePolicyImplemented", true},
+            {"rawCompressedTexturePolicyScope", "DDS/KTX/KTX2 recognition plus KTX2 native preservation and KTX2/BasisU transcode policy"},
+            {"platformTranscodeImplemented", true},
+            {"platformTranscodeScope", "policy-aware KTX2/BasisU-in-KTX2 target selection for realized single native payloads and package sidecars"},
+            {"nativeRtTextureEmissionImplemented", true},
+            {"nativeRtTextureEmissionScope", "preserved native-format KTX2 payloads and valid BasisU/UASTC KTX2 transcode-output payloads"},
+            {"ktx2BasisuPackageSidecarEmissionImplemented", true},
+            {"directRendererNativeTextureUploadImplemented", false},
             {"policyReportAvailableInPackageInspection", true},
             {"supportedRecognitionOnly", nlohmann::json::array({"dds", "ktx", "ktx2"})},
             {"unsupportedStandaloneSources", nlohmann::json::array({"basis"})},
         }},
-        {"unsupportedProductionImporters", nlohmann::json::array({"full-fbx-importer", "usd-usdz-importer", "basis-standalone-import", "full-obj-mtl-runtime-cooking", "obj-mtl-material-creation", "obj-mtl-texture-guid-binding", "obj-mtl-viewport-placement", "non-gltf-production-import-parity"})},
+        {"unsupportedProductionImporters", nlohmann::json::array({"full-fbx-importer", "usd-usdz-importer", "basis-standalone-import", "non-gltf-production-import-parity"})},
         {"policy", {
             {"description", "This report exposes selected-asset importer coverage and production import gaps without mutating the registry or claiming unsupported importers are implemented."},
             {"mutationExecuted", false},
             {"performedActions", nlohmann::json::array()},
-            {"supportedNow", nlohmann::json::array({"gltf-glb-import-and-place", "transparent-registry-metadata-inspection", "selected-asset-importer-readiness-report"})},
-            {"unsupportedActions", nlohmann::json::array({"fbx-import", "usd-usdz-import", "basis-import", "full-obj-mtl-runtime-cooking", "obj-mtl-material-texture-binding", "obj-mtl-viewport-placement"})},
+            {"supportedNow", supportedNow},
+            {"unsupportedActions", unsupportedActions},
         }},
     };
 }
@@ -4147,6 +5404,475 @@ bool writeAssetPackageInspectionReport(
     }
     file << buildAssetPackageInspectionReport(state, record).dump(2);
     return true;
+}
+
+bool writeNativeAssetFileInspectionReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& path,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedFileNativeInspectionReportPath(state, browserRoot, path);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create native asset inspection report folder: " + ec.message();
+        return false;
+    }
+    NativeAssetReader reader;
+    nlohmann::json report = nativeAssetInspectionToJson(reader.inspect(path, true), path);
+    report["schema"] = "NativeAssetFileInspectionReportV1";
+    report["inspectionSource"] = "ContentBrowser";
+    report["mutatingActionsAvailable"] = false;
+    report["followUpActions"] = nlohmann::json::array({"Inspect Package", "Reimport", "Rebuild Native Payload", "Migrate Native Asset"});
+    report["policy"] = "This Content Browser action is inspection-only and uses the same native asset reader as --inspect-native-asset. Migration and rebuild actions remain separate mutating workflows that require confirmation.";
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write native asset inspection report: " + outPath.string();
+        return false;
+    }
+    file << report.dump(2);
+    return true;
+}
+
+bool writeRtpkgFileInspectionReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& path,
+    std::filesystem::path& outPath,
+    std::string& outError) {
+    outPath = selectedFilePackageInspectionReportPath(state, browserRoot, path);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create package inspection report folder: " + ec.message();
+        return false;
+    }
+    RtpkgReader reader;
+    nlohmann::json report = rtpkgInspectionToJson(reader.inspect(path, true), path);
+    report["schema"] = "RtpkgFileInspectionReportV1";
+    report["inspectionSource"] = "ContentBrowser";
+    report["mutatingActionsAvailable"] = false;
+    report["mutatingFollowUpActionsAvailable"] = true;
+    report["mountPackageUiImplemented"] = true;
+    report["rebuildPackageUiImplemented"] = true;
+    report["followUpActions"] = nlohmann::json::array({"Inspect Native Asset", "Migrate Package", "Mount Package", "Rebuild Package"});
+    report["policy"] = "This Content Browser action is inspection-only and uses the same package reader as --inspect-package. Package migration, package mounting, and package rebuild are separate mutating workflows that require confirmation.";
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write package inspection report: " + outPath.string();
+        return false;
+    }
+    file << report.dump(2);
+    return true;
+}
+
+std::filesystem::path uniquePackageRebuildBackupPath(const std::filesystem::path& path) {
+    const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string base = path.string() + ".before_rebuild." + std::to_string(stamp);
+    std::filesystem::path candidate = base + ".bak";
+    for (uint32_t i = 1; std::filesystem::exists(candidate); ++i) {
+        candidate = base + "." + std::to_string(i) + ".bak";
+    }
+    return candidate;
+}
+
+nlohmann::json nativeBinaryErrorJson(const NativeBinaryError& error) {
+    return {
+        {"code", nativeBinaryErrorCodeName(error.code)},
+        {"path", error.path.empty() ? std::string{} : error.path.generic_string()},
+        {"table", error.table},
+        {"offset", error.offset},
+        {"expectedSize", error.expectedSize},
+        {"message", error.message},
+    };
+}
+
+nlohmann::json nativeMigrationSourceControlPreflightJson(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& path,
+    bool dryRun);
+
+bool writeRtpkgFileRebuildReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& path,
+    bool dryRun,
+    std::filesystem::path& outPath,
+    std::string& outError,
+    bool* outCanRebuild = nullptr) {
+    if (outCanRebuild != nullptr) {
+        *outCanRebuild = false;
+    }
+    outPath = selectedFilePackageRebuildReportPath(state, browserRoot, path, dryRun);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create package rebuild report folder: " + ec.message();
+        return false;
+    }
+
+    const std::filesystem::path sourceControlRoot = state.project != nullptr ? state.project->projectRoot : browserRoot;
+    auto sourceControlStatus = [&](const std::filesystem::path& candidate) {
+        return candidate.empty() ? std::string("Unavailable") : gitStatusLabelForPath(sourceControlRoot, candidate);
+    };
+
+    RtpkgReader reader;
+    const RtpkgInspection beforeInspection = reader.inspect(path, true);
+    nlohmann::json blockers = nlohmann::json::array();
+    nlohmann::json warnings = nlohmann::json::array();
+    nlohmann::json sourceInputs = nlohmann::json::array();
+    nlohmann::json nativeErrors = nlohmann::json::array();
+    std::vector<RtpkgAssetInput> rebuildInputs;
+
+    if (!beforeInspection.native.ok) {
+        blockers.push_back("Selected file failed .rtpkg inspection and cannot be rebuilt safely.");
+        for (const NativeBinaryError& error : beforeInspection.native.errors) {
+            nativeErrors.push_back(nativeBinaryErrorJson(error));
+        }
+    }
+    if (beforeInspection.embeddedAssets.empty()) {
+        blockers.push_back("Package contains no embedded native assets to rebuild from recorded source inputs.");
+    }
+
+    NativeAssetReader assetReader;
+    for (size_t index = 0; index < beforeInspection.embeddedAssets.size(); ++index) {
+        const RtpkgEmbeddedAssetInfo& embedded = beforeInspection.embeddedAssets[index];
+        const std::filesystem::path recordedSource = embedded.sourcePath;
+        std::filesystem::path resolvedSource = recordedSource;
+        if (!resolvedSource.empty() && !resolvedSource.is_absolute()) {
+            resolvedSource = path.parent_path() / resolvedSource;
+        }
+        const bool sourcePathRecorded = !recordedSource.empty();
+        const bool sourceExists = sourcePathRecorded && regularFileExists(resolvedSource);
+        const bool standaloneNative = sourceExists && nativeStandaloneStorePath(resolvedSource);
+        bool sourceReadable = false;
+        bool guidMatches = false;
+        bool kindMatches = false;
+        std::string sourceGuid;
+        NativeAssetKind sourceKind = NativeAssetKind::Unknown;
+        nlohmann::json sourceErrors = nlohmann::json::array();
+        if (standaloneNative) {
+            const NativeAssetInspection sourceInspection = assetReader.inspect(resolvedSource, true);
+            sourceReadable = sourceInspection.ok;
+            if (sourceInspection.ok) {
+                sourceGuid = nativeGuidToText(sourceInspection.header.assetGuid);
+                sourceKind = static_cast<NativeAssetKind>(sourceInspection.header.assetKind);
+                guidMatches = sourceGuid == embedded.guid;
+                kindMatches = sourceKind == embedded.kind;
+            } else {
+                for (const NativeBinaryError& error : sourceInspection.errors) {
+                    sourceErrors.push_back(nativeBinaryErrorJson(error));
+                }
+            }
+        }
+
+        if (!sourcePathRecorded) {
+            blockers.push_back("Embedded asset " + std::to_string(index) + " has no recorded source path in package debug records.");
+        } else if (!sourceExists) {
+            blockers.push_back("Embedded asset " + std::to_string(index) + " source file is missing: " + resolvedSource.string());
+        } else if (!standaloneNative) {
+            blockers.push_back("Embedded asset " + std::to_string(index) + " source is not a supported standalone native asset: " + resolvedSource.string());
+        } else if (!sourceReadable) {
+            blockers.push_back("Embedded asset " + std::to_string(index) + " source native asset failed validation: " + resolvedSource.string());
+        } else if (!guidMatches || !kindMatches) {
+            blockers.push_back("Embedded asset " + std::to_string(index) + " source no longer matches the package GUID/kind: " + resolvedSource.string());
+        } else {
+            rebuildInputs.push_back(RtpkgAssetInput{.path = resolvedSource, .packagePath = embedded.packagePath});
+        }
+
+        sourceInputs.push_back({
+            {"index", index},
+            {"packagePath", embedded.packagePath},
+            {"packageGuid", embedded.guid},
+            {"packageKind", nativeAssetKindName(embedded.kind)},
+            {"recordedSourcePath", recordedSource.empty() ? std::string{} : recordedSource.generic_string()},
+            {"resolvedSourcePath", resolvedSource.empty() ? std::string{} : resolvedSource.generic_string()},
+            {"sourcePathRecorded", sourcePathRecorded},
+            {"sourceExists", sourceExists},
+            {"standaloneNativeAsset", standaloneNative},
+            {"sourceReadable", sourceReadable},
+            {"sourceGuid", sourceGuid},
+            {"sourceKind", nativeAssetKindName(sourceKind)},
+            {"guidMatchesPackage", guidMatches},
+            {"kindMatchesPackage", kindMatches},
+            {"sourceControlStatus", sourceExists ? sourceControlStatus(resolvedSource) : std::string("Unavailable")},
+            {"errors", sourceErrors},
+        });
+    }
+
+    const bool canRebuild = beforeInspection.native.ok && !beforeInspection.embeddedAssets.empty() && blockers.empty() && rebuildInputs.size() == beforeInspection.embeddedAssets.size();
+    if (outCanRebuild != nullptr) {
+        *outCanRebuild = canRebuild;
+    }
+
+    bool mutationAttempted = false;
+    bool backupCreated = false;
+    bool mutated = false;
+    std::filesystem::path backupPath;
+    nlohmann::json afterInspectionJson = nlohmann::json::object();
+    if (!dryRun && canRebuild) {
+        backupPath = uniquePackageRebuildBackupPath(path);
+        std::filesystem::copy_file(path, backupPath, std::filesystem::copy_options::none, ec);
+        if (ec) {
+            blockers.push_back("Could not create package rebuild backup: " + ec.message());
+        } else {
+            backupCreated = true;
+            RtpkgWriteDesc desc;
+            desc.debugName = path.stem().string();
+            desc.assets = rebuildInputs;
+            RtpkgWriter writer;
+            NativeBinaryError writeError;
+            mutationAttempted = true;
+            if (!writer.write(path, desc, &writeError)) {
+                blockers.push_back("Package rebuild writer failed: " + writeError.message);
+                nativeErrors.push_back(nativeBinaryErrorJson(writeError));
+            } else {
+                const RtpkgInspection afterInspection = reader.inspect(path, true);
+                afterInspectionJson = rtpkgInspectionToJson(afterInspection, path);
+                if (afterInspection.native.ok) {
+                    mutated = true;
+                } else {
+                    blockers.push_back("Package rebuild output failed post-write validation.");
+                    for (const NativeBinaryError& error : afterInspection.native.errors) {
+                        nativeErrors.push_back(nativeBinaryErrorJson(error));
+                    }
+                }
+            }
+        }
+    }
+
+    nlohmann::json report = {
+        {"schema", "RtpkgFileRebuildReportV1"},
+        {"inspectionSource", "ContentBrowser"},
+        {"dryRun", dryRun},
+        {"confirmationRequired", dryRun},
+        {"ok", dryRun ? canRebuild : (mutated && blockers.empty())},
+        {"canRebuild", canRebuild},
+        {"mutationAttempted", mutationAttempted},
+        {"mutationExecuted", mutated},
+        {"mutated", mutated},
+        {"backupCreated", backupCreated},
+        {"backupPath", backupPath.empty() ? std::string{} : backupPath.generic_string()},
+        {"package", {
+            {"path", path.generic_string()},
+            {"exists", regularFileExists(path)},
+            {"sourceControlStatus", sourceControlStatus(path)},
+            {"embeddedAssetCount", beforeInspection.embeddedAssets.size()},
+        }},
+        {"sourceControlPreflight", nativeMigrationSourceControlPreflightJson(state, browserRoot, path, dryRun)},
+        {"plannedActions", nlohmann::json::array({
+            "Create side-by-side .before_rebuild backup",
+            "Rewrite .rtpkg from recorded standalone native source asset paths",
+            "Validate rebuilt package with RtpkgReader before reporting success"
+        })},
+        {"sourceInputs", sourceInputs},
+        {"sourceInputCount", sourceInputs.size()},
+        {"originalInspection", rtpkgInspectionToJson(beforeInspection, path)},
+        {"afterInspection", afterInspectionJson},
+        {"warnings", warnings},
+        {"blockers", blockers},
+        {"errors", nativeErrors},
+        {"policy", "Content Browser Rebuild Package rewrites a .rtpkg only after explicit confirmation, using original standalone native source asset paths recorded in package debug records. It creates a side-by-side backup before mutation and does not recook source DCC files or create renderer resources."},
+    };
+
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write package rebuild report: " + outPath.string();
+        return false;
+    }
+    file << report.dump(2);
+    if (!report.value("ok", false)) {
+        outError = dryRun ? "Package rebuild dry-run contains blockers." : "Package rebuild report contains errors.";
+    }
+    return true;
+}
+
+nlohmann::json nativeMigrationSourceControlPreflightJson(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& path,
+    bool dryRun) {
+    const std::filesystem::path workspaceRoot = state.project != nullptr ? state.project->projectRoot : browserRoot;
+    const std::string statusLabel = path.empty() ? std::string("Unavailable") : gitStatusLabelForPath(workspaceRoot, path);
+    nlohmann::json preflight = {
+        {"schema", "NativeMigrationSourceControlPreflightV1"},
+        {"provider", "git"},
+        {"path", path.empty() ? std::string{} : canonicalForCompare(path).generic_string()},
+        {"statusLabel", statusLabel},
+        {"sourceControlChanged", sourceControlDiffReportAvailable(statusLabel)},
+        {"dryRun", dryRun},
+        {"mutationExecuted", false},
+        {"providerExecutedSourceControlMutationImplemented", false},
+        {"editorExecutedSourceControlMutationImplemented", false},
+        {"requiresExternalReviewBeforeMutation", sourceControlDiffReportAvailable(statusLabel)},
+        {"plannedCommands", nlohmann::json::array()},
+        {"providerGaps", nlohmann::json::array({
+            "provider-executed-checkout-before-migration",
+            "provider-lock-ownership-enforcement",
+            "provider-submit-after-migration",
+            "perforce-provider-mutations"
+        })},
+        {"policy", "This source-control preflight is read-only. Native migration still requires explicit user confirmation, writes a backup, and does not execute checkout, lock, submit, or Perforce provider actions."},
+    };
+
+    std::optional<std::filesystem::path> gitRoot = findGitRoot(path);
+    if (!gitRoot.has_value() && !workspaceRoot.empty()) {
+        gitRoot = findGitRoot(workspaceRoot);
+    }
+    if (!gitRoot.has_value() || !pathIsWithin(path, *gitRoot)) {
+        preflight["repositoryAvailable"] = false;
+        preflight["repositoryRoot"] = std::string{};
+        preflight["repositoryRelativePath"] = std::string{};
+        preflight["focusedStatus"] = statusLabel;
+        preflight["repositoryBranchStatus"] = std::string{};
+        preflight["blockers"] = nlohmann::json::array({"Path is not inside an available Git repository for source-control preflight."});
+        return preflight;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path canonicalPath = canonicalForCompare(path);
+    const std::filesystem::path relative = std::filesystem::relative(canonicalPath, *gitRoot, ec);
+    if (ec) {
+        preflight["repositoryAvailable"] = false;
+        preflight["repositoryRoot"] = gitRoot->generic_string();
+        preflight["repositoryRelativePath"] = std::string{};
+        preflight["focusedStatus"] = statusLabel;
+        preflight["repositoryBranchStatus"] = std::string{};
+        preflight["blockers"] = nlohmann::json::array({"Could not resolve repository-relative path: " + ec.message()});
+        return preflight;
+    }
+
+#ifdef _WIN32
+    constexpr const char* stderrRedirect = " 2>NUL";
+#else
+    constexpr const char* stderrRedirect = " 2>/dev/null";
+#endif
+    const std::string rootArg = quoteCommandPath(*gitRoot);
+    const std::string pathArg = quoteCommandPath(relative);
+    const std::string focusedStatus = readCommandOutput("git -C " + rootArg + " status --short --ignored -- " + pathArg + stderrRedirect);
+    const std::string branchStatus = readCommandOutput("git -C " + rootArg + " status --short --branch" + stderrRedirect);
+    preflight["repositoryAvailable"] = true;
+    preflight["repositoryRoot"] = gitRoot->generic_string();
+    preflight["repositoryRelativePath"] = relative.generic_string();
+    preflight["focusedStatus"] = trimString(focusedStatus).empty() ? std::string("Clean") : focusedStatus;
+    preflight["repositoryBranchStatus"] = trimString(branchStatus).empty() ? std::string("Clean") : branchStatus;
+    preflight["blockers"] = nlohmann::json::array();
+    preflight["plannedCommands"] = nlohmann::json::array({
+        nlohmann::json{{"description", "Review selected native file status before migration."}, {"command", "git -C " + rootArg + " status --short --ignored -- " + pathArg}},
+        nlohmann::json{{"description", "Review selected native file diff before confirming migration when local changes exist."}, {"command", "git -C " + rootArg + " diff -- " + pathArg}, {"optional", true}},
+        nlohmann::json{{"description", "Stage migrated native file after validation and user review."}, {"command", "git -C " + rootArg + " add -- " + pathArg}, {"afterMigration", true}},
+        nlohmann::json{{"description", "Commit the reviewed native migration in the user's normal source-control workflow."}, {"command", "git -C " + rootArg + " commit"}, {"afterMigration", true}, {"externalUserActionRequired", true}}
+    });
+    return preflight;
+}
+
+bool writeNativeFileMigrationReport(
+    const EditorRuntimeState& state,
+    const std::filesystem::path& browserRoot,
+    const std::filesystem::path& path,
+    bool package,
+    bool dryRun,
+    std::filesystem::path& outPath,
+    std::string& outError,
+    NativeAssetMigrationReport* outMigration = nullptr) {
+    outPath = selectedFileMigrationReportPath(state, browserRoot, path, package, dryRun);
+    std::error_code ec;
+    std::filesystem::create_directories(outPath.parent_path(), ec);
+    if (ec) {
+        outError = "Could not create native migration report folder: " + ec.message();
+        return false;
+    }
+    NativeAssetMigrationOptions options;
+    options.package = package;
+    options.dryRun = dryRun;
+    NativeAssetMigrationReport migration = migrateNativeAssetFile(path, options);
+    if (outMigration != nullptr) {
+        *outMigration = migration;
+    }
+    nlohmann::json report = nativeAssetMigrationReportToJson(migration);
+    report["schema"] = package ? "RtpkgFileMigrationReportV1" : "NativeAssetFileMigrationReportV1";
+    report["inspectionSource"] = "ContentBrowser";
+    report["mutationExecuted"] = migration.mutationAttempted;
+    report["mutatingActionsAvailable"] = !dryRun;
+    report["confirmationRequired"] = !dryRun;
+    report["sourceControlPreflight"] = nativeMigrationSourceControlPreflightJson(state, browserRoot, path, dryRun);
+    report["openProductionScope"]["implementedScope"].push_back("source-control-preflight-and-action-plan-reporting");
+    report["policy"] = dryRun
+        ? "This Content Browser migration dry run is read-only. Confirm Migrate Native Asset or Migrate Package before any file mutation is attempted. Source-control preflight is report-only."
+        : "This Content Browser migration action mutates only after explicit confirmation and relies on the native migration API backup/temp-validation/replace policy. Source-control checkout, lock, and submit remain external/provider workflow steps.";
+    std::ofstream file(outPath, std::ios::trunc);
+    if (!file.is_open()) {
+        outError = "Could not write native migration report: " + outPath.string();
+        return false;
+    }
+    file << report.dump(2);
+    if (!migration.ok) {
+        outError = package ? "Package migration report contains errors." : "Native asset migration report contains errors.";
+    }
+    return true;
+}
+
+std::vector<std::string> migrationErrorMessages(const NativeAssetMigrationReport& migration) {
+    std::vector<std::string> messages;
+    for (const NativeBinaryError& error : migration.errors) {
+        std::string message = error.message.empty()
+            ? std::string(nativeBinaryErrorCodeName(error.code))
+            : error.message;
+        if (!error.table.empty()) {
+            message += " (" + error.table + ")";
+        }
+        messages.push_back(std::move(message));
+    }
+    return messages;
+}
+
+EditorNativeFileMigrationJobResult buildNativeFileMigrationJobResult(
+    const std::filesystem::path& path,
+    bool package,
+    bool dryRun,
+    const std::filesystem::path& reportPath,
+    const NativeAssetMigrationReport& migration,
+    bool wroteReport,
+    const std::string& reportError,
+    double elapsedMs) {
+    EditorNativeFileMigrationJobResult result;
+    result.package = package;
+    result.dryRun = dryRun;
+    result.success = wroteReport && migration.ok;
+    result.mutationAttempted = migration.mutationAttempted;
+    result.mutated = migration.mutated;
+    result.migrationRequired = migration.migrationRequired;
+    result.migrationAvailable = migration.migrationAvailable;
+    result.sourcePath = path;
+    result.reportPath = wroteReport ? reportPath : std::filesystem::path{};
+    result.backupPath = migration.backupPath;
+    result.title = package
+        ? (dryRun ? std::string("Migrate Package Dry Run") : std::string("Migrate Package"))
+        : (dryRun ? std::string("Migrate Native Asset Dry Run") : std::string("Migrate Native Asset"));
+    if (!wroteReport) {
+        result.status = reportError.empty() ? std::string("Migration report write failed") : reportError;
+    } else if (!migration.ok) {
+        result.status = reportError.empty() ? std::string("Migration report contains errors") : reportError;
+    } else if (dryRun) {
+        result.status = migration.migrationRequired
+            ? std::string("Dry run complete: migration available")
+            : std::string("Dry run complete: no migration required");
+    } else if (migration.mutated) {
+        result.status = "Migration completed with backup: " + migration.backupPath.string();
+    } else if (migration.migrationRequired && !migration.migrationAvailable) {
+        result.status = "Migration unavailable";
+    } else {
+        result.status = "Migration complete: no mutation required";
+    }
+    result.errors = migrationErrorMessages(migration);
+    if (!reportError.empty() && (!wroteReport || !migration.ok)) {
+        result.errors.push_back(reportError);
+    }
+    result.warnings = migration.warnings;
+    result.elapsedMs = elapsedMs;
+    return result;
 }
 
 bool writeAssetThumbnailReadinessReport(
@@ -4429,6 +6155,373 @@ void AssetBrowserPanel::drawExternalChangeConfirmPrompt(EditorRequests& requests
         pendingExternalChangeDisplayName_.clear();
         pendingExternalChangeSourcePath_.clear();
         pendingExternalChangeRiskLines_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void AssetBrowserPanel::beginNativeFileMigration(const EditorRuntimeState& state, const std::filesystem::path& path, bool package, EditorRequests& requests) {
+    std::filesystem::path reportPath;
+    std::string error;
+    NativeAssetMigrationReport migration;
+    const auto startedAt = std::chrono::steady_clock::now();
+    const bool wroteReport = writeNativeFileMigrationReport(state, browserRoot_, path, package, true, reportPath, error, &migration);
+    const double elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startedAt).count();
+    pendingNativeFileMigrationPath_ = path;
+    pendingNativeFileMigrationPackage_ = package;
+    pendingNativeFileMigrationAction_ = package ? "Migrate Package" : "Migrate Native Asset";
+    pendingNativeFileMigrationDryRunReportPath_ = wroteReport ? reportPath : std::filesystem::path{};
+    pendingNativeFileMigrationStatus_ = wroteReport
+        ? (error.empty() ? (pendingNativeFileMigrationAction_ + " dry-run report: " + reportPath.string()) : (pendingNativeFileMigrationAction_ + " dry-run report contains errors: " + reportPath.string()))
+        : (pendingNativeFileMigrationAction_ + " dry-run failed: " + error);
+    status_ = pendingNativeFileMigrationStatus_;
+    if (wroteReport) {
+        requests.openFilePath = reportPath;
+    }
+    requests.nativeFileMigrationJobResult = buildNativeFileMigrationJobResult(path, package, true, reportPath, migration, wroteReport, error, elapsedMs);
+    nativeFileMigrationPromptOpen_ = true;
+}
+
+void AssetBrowserPanel::queueNativeFileMigrationBatchForFolder(const EditorRuntimeState& state, const std::filesystem::path& folder, bool recursive, EditorRequests& requests) {
+    constexpr size_t kMaxNativeMigrationBatchFiles = 256;
+    std::vector<std::filesystem::path> candidates;
+    std::error_code ec;
+    auto considerPath = [&](const std::filesystem::path& path) {
+        const bool nativeAsset = nativeStandaloneStorePath(path);
+        const bool package = nativeAssetKindFromExtension(path) == NativeAssetKind::Package;
+        if (nativeAsset || package) {
+            candidates.push_back(path);
+        }
+    };
+
+    if (recursive) {
+        std::filesystem::recursive_directory_iterator it(folder, std::filesystem::directory_options::skip_permission_denied, ec);
+        const std::filesystem::recursive_directory_iterator endIt;
+        for (; !ec && it != endIt && candidates.size() < kMaxNativeMigrationBatchFiles; it.increment(ec)) {
+            if (it->is_regular_file(ec)) {
+                considerPath(it->path());
+            }
+        }
+    } else {
+        for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(folder, ec)) {
+            if (ec || candidates.size() >= kMaxNativeMigrationBatchFiles) {
+                break;
+            }
+            if (entry.is_regular_file(ec)) {
+                considerPath(entry.path());
+            }
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
+        return lowerString(lhs.generic_string()) < lowerString(rhs.generic_string());
+    });
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+    nlohmann::json batchFiles = nlohmann::json::array();
+    size_t changedFileCount = 0;
+    for (const std::filesystem::path& path : candidates) {
+        const bool package = nativeAssetKindFromExtension(path) == NativeAssetKind::Package;
+        requests.nativeFileMigrationJobRequests.push_back(EditorNativeFileMigrationJobRequest{
+            .package = package,
+            .dryRun = false,
+            .sourcePath = path,
+            .reportPath = selectedFileMigrationReportPath(state, browserRoot_, path, package, false),
+        });
+        nlohmann::json preflight = nativeMigrationSourceControlPreflightJson(state, browserRoot_, path, false);
+        if (preflight.value("sourceControlChanged", false)) {
+            ++changedFileCount;
+        }
+        batchFiles.push_back({
+            {"path", canonicalForCompare(path).generic_string()},
+            {"package", package},
+            {"sourceControlPreflight", std::move(preflight)},
+        });
+    }
+    lastNativeFileMigrationBatchCount_ = candidates.size();
+    const std::string scope = recursive ? "recursive" : "folder";
+
+    const std::filesystem::path preflightReportPath = nativeFileMigrationBatchPreflightReportPath(state, browserRoot_, folder, recursive);
+    std::error_code reportEc;
+    std::filesystem::create_directories(preflightReportPath.parent_path(), reportEc);
+    if (!reportEc) {
+        const nlohmann::json batchReport = {
+            {"schema", "NativeMigrationBatchSourceControlPreflightV1"},
+            {"scope", scope},
+            {"recursive", recursive},
+            {"folder", canonicalForCompare(folder).generic_string()},
+            {"fileCount", candidates.size()},
+            {"sourceControlChangedFileCount", changedFileCount},
+            {"capped", candidates.size() >= kMaxNativeMigrationBatchFiles},
+            {"maxBatchFiles", kMaxNativeMigrationBatchFiles},
+            {"mutationExecuted", false},
+            {"confirmationRequired", true},
+            {"providerExecutedSourceControlMutationImplemented", false},
+            {"files", batchFiles},
+            {"policy", "This batch source-control preflight is report-only. Each queued migration still runs through the background worker with backup/temp-validation/atomic-replace; checkout, lock, and submit remain external/provider workflow steps."},
+        };
+        std::ofstream batchFile(preflightReportPath, std::ios::trunc);
+        if (batchFile.is_open()) {
+            batchFile << batchReport.dump(2);
+        }
+        if (!candidates.empty()) {
+            requests.openFilePath = preflightReportPath;
+        }
+    }
+
+    status_ = candidates.empty()
+        ? ("No native files found for " + scope + " migration batch: " + folder.string())
+        : ("Queued " + scope + " native migration batch: " + std::to_string(candidates.size()) + " files" + (candidates.size() >= kMaxNativeMigrationBatchFiles ? " (capped)" : "") + " (" + std::to_string(changedFileCount) + " with source-control changes)");
+}
+void AssetBrowserPanel::beginNativePackageMount(const std::filesystem::path& path) {
+    pendingNativePackageMountPath_ = path;
+    nativePackageMountPromptOpen_ = true;
+    status_ = "Package mount confirmation required: " + path.string();
+}
+
+void AssetBrowserPanel::beginNativePackageUnload(const std::filesystem::path& path) {
+    pendingNativePackageUnloadPath_ = path;
+    nativePackageUnloadPromptOpen_ = true;
+    status_ = "Package unload confirmation required: " + path.string();
+}
+
+void AssetBrowserPanel::beginNativePackageRefresh(const std::filesystem::path& path) {
+    pendingNativePackageRefreshPath_ = path;
+    nativePackageRefreshPromptOpen_ = true;
+    status_ = "Package refresh confirmation required: " + path.string();
+}
+
+void AssetBrowserPanel::beginNativePackageRebuild(const EditorRuntimeState& state, const std::filesystem::path& path, EditorRequests& requests) {
+    std::filesystem::path reportPath;
+    std::string error;
+    bool canRebuild = false;
+    const bool wroteReport = writeRtpkgFileRebuildReport(state, browserRoot_, path, true, reportPath, error, &canRebuild);
+    pendingNativePackageRebuildPath_ = path;
+    pendingNativePackageRebuildDryRunReportPath_ = wroteReport ? reportPath : std::filesystem::path{};
+    pendingNativePackageRebuildCanConfirm_ = wroteReport && canRebuild;
+    pendingNativePackageRebuildStatus_ = wroteReport
+        ? (error.empty() ? ("Rebuild Package dry-run report: " + reportPath.string()) : ("Rebuild Package dry-run has blockers: " + reportPath.string()))
+        : ("Rebuild Package dry-run failed: " + error);
+    status_ = pendingNativePackageRebuildStatus_;
+    if (wroteReport) {
+        requests.openFilePath = reportPath;
+    }
+    nativePackageRebuildPromptOpen_ = true;
+}
+
+void AssetBrowserPanel::drawNativeFileMigrationConfirmPrompt(const EditorRuntimeState& state, EditorRequests& requests) {
+    if (nativeFileMigrationPromptOpen_) {
+        ImGui::OpenPopup("Confirm Native File Migration");
+        nativeFileMigrationPromptOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Confirm Native File Migration", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    const std::filesystem::path sourceControlRoot = state.project != nullptr ? state.project->projectRoot : browserRoot_;
+    const std::string sourceControlStatus = pendingNativeFileMigrationPath_.empty()
+        ? std::string("Unavailable")
+        : gitStatusLabelForPath(sourceControlRoot, pendingNativeFileMigrationPath_);
+    const bool changedExternally = sourceControlOverwriteRiskStatus(sourceControlStatus);
+    ImGui::TextWrapped("Confirm %s for this native file. The migration API writes a side-by-side backup, validates a temp migrated file, and replaces the original only after validation succeeds.", pendingNativeFileMigrationAction_.c_str());
+    ImGui::SeparatorText("File");
+    ImGui::TextWrapped("Path: %s", pendingNativeFileMigrationPath_.string().c_str());
+    ImGui::Text("Kind: %s", pendingNativeFileMigrationPackage_ ? "Package" : "Native Asset");
+    ImGui::TextColored(sourceControlStatusTextColor(sourceControlStatus), "Source Control: %s", sourceControlStatus.c_str());
+    if (changedExternally) {
+        ImGui::TextWrapped("This file has external source-control changes. Review the dry-run report and Git Diff before confirming if you need more context.");
+    }
+    ImGui::TextDisabled("Dry-run reports include read-only source-control preflight; checkout, lock, and submit remain external provider steps.");
+    if (!pendingNativeFileMigrationStatus_.empty()) {
+        ImGui::TextWrapped("Dry Run: %s", pendingNativeFileMigrationStatus_.c_str());
+    }
+    if (!pendingNativeFileMigrationDryRunReportPath_.empty()) {
+        if (ImGui::Button("Open Dry Run Report", ImVec2(170.0f, 0.0f))) {
+            requests.openFilePath = pendingNativeFileMigrationDryRunReportPath_;
+        }
+    }
+    ImGui::Separator();
+    const std::string confirmLabel = std::string("Confirm ") + pendingNativeFileMigrationAction_;
+    if (ImGui::Button(confirmLabel.c_str(), ImVec2(190.0f, 0.0f))) {
+        const std::filesystem::path reportPath = selectedFileMigrationReportPath(state, browserRoot_, pendingNativeFileMigrationPath_, pendingNativeFileMigrationPackage_, false);
+        requests.nativeFileMigrationJobRequest = EditorNativeFileMigrationJobRequest{
+            .package = pendingNativeFileMigrationPackage_,
+            .dryRun = false,
+            .sourcePath = pendingNativeFileMigrationPath_,
+            .reportPath = reportPath,
+        };
+        status_ = pendingNativeFileMigrationAction_ + " queued in background: " + pendingNativeFileMigrationPath_.string();
+        invalidateDirectoryCache();
+        pendingNativeFileMigrationPath_.clear();
+        pendingNativeFileMigrationDryRunReportPath_.clear();
+        pendingNativeFileMigrationPackage_ = false;
+        pendingNativeFileMigrationAction_.clear();
+        pendingNativeFileMigrationStatus_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+        status_ = "Native file migration canceled";
+        pendingNativeFileMigrationPath_.clear();
+        pendingNativeFileMigrationDryRunReportPath_.clear();
+        pendingNativeFileMigrationPackage_ = false;
+        pendingNativeFileMigrationAction_.clear();
+        pendingNativeFileMigrationStatus_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void AssetBrowserPanel::drawNativePackageMountConfirmPrompt(EditorRequests& requests) {
+    if (nativePackageMountPromptOpen_) {
+        ImGui::OpenPopup("Confirm Package Mount");
+        nativePackageMountPromptOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Confirm Package Mount", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::TextWrapped("Confirm mounting this .rtpkg package into the active CPU asset library. This decodes package mesh, material, and texture payloads for editor/runtime lookup but does not create renderer resources or overwrite files.");
+    ImGui::SeparatorText("Package");
+    ImGui::TextWrapped("Path: %s", pendingNativePackageMountPath_.string().c_str());
+    ImGui::TextDisabled("Direct renderer upload from package payloads remains separate roadmap work.");
+    ImGui::Separator();
+    if (ImGui::Button("Confirm Mount Package", ImVec2(190.0f, 0.0f))) {
+        requests.mountNativePackage = EditorNativePackageMountRequest{pendingNativePackageMountPath_};
+        status_ = "Queued package mount: " + pendingNativePackageMountPath_.string();
+        pendingNativePackageMountPath_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+        status_ = "Package mount canceled";
+        pendingNativePackageMountPath_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void AssetBrowserPanel::drawNativePackageUnloadConfirmPrompt(EditorRequests& requests) {
+    if (nativePackageUnloadPromptOpen_) {
+        ImGui::OpenPopup("Confirm Package Unload");
+        nativePackageUnloadPromptOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Confirm Package Unload", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::TextWrapped("Confirm unloading this .rtpkg package from the active runtime asset library. Package-backed CPU assets are removed, scene handles are remapped or cleared, and active renderer resources are retired through the normal replacement path when affected.");
+    ImGui::SeparatorText("Package");
+    ImGui::TextWrapped("Path: %s", pendingNativePackageUnloadPath_.string().c_str());
+    ImGui::TextDisabled("Direct native-store-to-GPU upload remains separate roadmap work.");
+    ImGui::Separator();
+    if (ImGui::Button("Confirm Unload Package", ImVec2(200.0f, 0.0f))) {
+        requests.unloadNativePackage = EditorNativePackageUnloadRequest{pendingNativePackageUnloadPath_};
+        status_ = "Queued package unload: " + pendingNativePackageUnloadPath_.string();
+        pendingNativePackageUnloadPath_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+        status_ = "Package unload canceled";
+        pendingNativePackageUnloadPath_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void AssetBrowserPanel::drawNativePackageRefreshConfirmPrompt(EditorRequests& requests) {
+    if (nativePackageRefreshPromptOpen_) {
+        ImGui::OpenPopup("Confirm Package Refresh");
+        nativePackageRefreshPromptOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Confirm Package Refresh", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::TextWrapped("Confirm refreshing this .rtpkg package from disk. Mounted package-backed CPU assets for this package are unloaded first, scene/runtime handles are remapped through the unload path when needed, and the current package file is decoded into the active CPU asset library again.");
+    ImGui::SeparatorText("Package");
+    ImGui::TextWrapped("Path: %s", pendingNativePackageRefreshPath_.string().c_str());
+    ImGui::TextDisabled("Refresh reuses the CPU AssetManager path; direct native-store-to-GPU upload remains separate roadmap work.");
+    ImGui::Separator();
+    if (ImGui::Button("Confirm Refresh Package", ImVec2(210.0f, 0.0f))) {
+        requests.refreshNativePackage = EditorNativePackageRefreshRequest{pendingNativePackageRefreshPath_};
+        status_ = "Queued package refresh: " + pendingNativePackageRefreshPath_.string();
+        pendingNativePackageRefreshPath_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+        status_ = "Package refresh canceled";
+        pendingNativePackageRefreshPath_.clear();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void AssetBrowserPanel::drawNativePackageRebuildConfirmPrompt(const EditorRuntimeState& state, EditorRequests& requests) {
+    if (nativePackageRebuildPromptOpen_) {
+        ImGui::OpenPopup("Confirm Package Rebuild");
+        nativePackageRebuildPromptOpen_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Confirm Package Rebuild", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    const std::filesystem::path sourceControlRoot = state.project != nullptr ? state.project->projectRoot : browserRoot_;
+    const std::string packageStatus = pendingNativePackageRebuildPath_.empty()
+        ? std::string("Unavailable")
+        : gitStatusLabelForPath(sourceControlRoot, pendingNativePackageRebuildPath_);
+    const bool changedExternally = sourceControlOverwriteRiskStatus(packageStatus);
+    ImGui::TextWrapped("Confirm rebuilding this .rtpkg package from the standalone native source asset paths recorded in the package debug records. A side-by-side backup is created before the package is rewritten and validated.");
+    ImGui::SeparatorText("Package");
+    ImGui::TextWrapped("Path: %s", pendingNativePackageRebuildPath_.string().c_str());
+    ImGui::TextColored(sourceControlStatusTextColor(packageStatus), "Source Control: %s", packageStatus.c_str());
+    if (changedExternally) {
+        ImGui::TextWrapped("This package has external source-control changes. Review the dry-run report and Git Diff before confirming if you need more context.");
+    }
+    if (!pendingNativePackageRebuildStatus_.empty()) {
+        ImGui::TextWrapped("Dry Run: %s", pendingNativePackageRebuildStatus_.c_str());
+    }
+    if (!pendingNativePackageRebuildDryRunReportPath_.empty()) {
+        if (ImGui::Button("Open Dry Run Report", ImVec2(170.0f, 0.0f))) {
+            requests.openFilePath = pendingNativePackageRebuildDryRunReportPath_;
+        }
+    }
+    if (!pendingNativePackageRebuildCanConfirm_) {
+        ImGui::TextWrapped("Rebuild is blocked until the dry-run report has no missing, unreadable, or mismatched recorded source inputs.");
+    }
+    ImGui::Separator();
+    if (!pendingNativePackageRebuildCanConfirm_) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Confirm Rebuild Package", ImVec2(200.0f, 0.0f))) {
+        std::filesystem::path reportPath;
+        std::string error;
+        bool canRebuild = false;
+        if (writeRtpkgFileRebuildReport(state, browserRoot_, pendingNativePackageRebuildPath_, false, reportPath, error, &canRebuild)) {
+            requests.openFilePath = reportPath;
+            status_ = error.empty() ? ("Rebuild Package report: " + reportPath.string()) : ("Rebuild Package report contains errors: " + reportPath.string());
+            invalidateDirectoryCache();
+        } else {
+            status_ = "Rebuild Package failed: " + error;
+        }
+        pendingNativePackageRebuildPath_.clear();
+        pendingNativePackageRebuildDryRunReportPath_.clear();
+        pendingNativePackageRebuildStatus_.clear();
+        pendingNativePackageRebuildCanConfirm_ = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (!pendingNativePackageRebuildCanConfirm_) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+        status_ = "Package rebuild canceled";
+        pendingNativePackageRebuildPath_.clear();
+        pendingNativePackageRebuildDryRunReportPath_.clear();
+        pendingNativePackageRebuildStatus_.clear();
+        pendingNativePackageRebuildCanConfirm_ = false;
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
@@ -5211,7 +7304,7 @@ std::string AssetBrowserPanel::relativeImportDestination(const std::filesystem::
     return relativeContentPath(path);
 }
 
-void AssetBrowserPanel::drawPathContextMenu(const std::filesystem::path& path, bool isDirectory, EditorRequests& requests) {
+void AssetBrowserPanel::drawPathContextMenu(const EditorRuntimeState& state, const std::filesystem::path& path, bool isDirectory, EditorRequests& requests) {
     if (isDirectory) {
         if (editorGlyphMenuItem(EditorGlyphIcon::Folder, "Open Folder")) {
             navigateTo(path);
@@ -5254,6 +7347,47 @@ void AssetBrowserPanel::drawPathContextMenu(const std::filesystem::path& path, b
     if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Import and Place...", canImportAndPlace)) {
         prepareImportDialog(path, currentPath_, 1);
     }
+    const NativeAssetKind nativeKind = nativeAssetKindFromExtension(path);
+    const bool isNativeStandalone = nativeStandaloneStorePath(path);
+    const bool isNativePackage = nativeKind == NativeAssetKind::Package;
+    if (editorGlyphMenuItem(EditorGlyphIcon::Details, "Inspect Native Asset", isNativeStandalone)) {
+        std::filesystem::path reportPath;
+        std::string error;
+        if (writeNativeAssetFileInspectionReport(state, browserRoot_, path, reportPath, error)) {
+            requests.openFilePath = reportPath;
+            status_ = "Native asset inspection report: " + reportPath.string();
+        } else {
+            status_ = "Native asset inspection failed: " + error;
+        }
+    }
+    if (editorGlyphMenuItem(EditorGlyphIcon::Details, "Inspect Package", isNativePackage)) {
+        std::filesystem::path reportPath;
+        std::string error;
+        if (writeRtpkgFileInspectionReport(state, browserRoot_, path, reportPath, error)) {
+            requests.openFilePath = reportPath;
+            status_ = "Package inspection report: " + reportPath.string();
+        } else {
+            status_ = "Package inspection failed: " + error;
+        }
+    }
+    if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Migrate Native Asset", isNativeStandalone)) {
+        beginNativeFileMigration(state, path, false, requests);
+    }
+    if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Migrate Package", isNativePackage)) {
+        beginNativeFileMigration(state, path, true, requests);
+    }
+    if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Mount Package", isNativePackage)) {
+        beginNativePackageMount(path);
+    }
+    if (editorGlyphMenuItem(EditorGlyphIcon::Command, "Unload Package", isNativePackage)) {
+        beginNativePackageUnload(path);
+    }
+    if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Refresh Package", isNativePackage)) {
+        beginNativePackageRefresh(path);
+    }
+    if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Rebuild Package", isNativePackage)) {
+        beginNativePackageRebuild(state, path, requests);
+    }
     editorGlyphMenuItem(EditorGlyphIcon::Details, "Preview", false);
     editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Reimport", false);
     ImGui::Separator();
@@ -5267,7 +7401,7 @@ void AssetBrowserPanel::drawPathContextMenu(const std::filesystem::path& path, b
     editorGlyphMenuItem(EditorGlyphIcon::Trash, "Delete", false);
 }
 
-void AssetBrowserPanel::drawFolderTree(const std::filesystem::path& path, EditorRequests& requests) {
+void AssetBrowserPanel::drawFolderTree(const EditorRuntimeState& state, const std::filesystem::path& path, EditorRequests& requests) {
     std::error_code ec;
     if (!std::filesystem::is_directory(path, ec)) {
         return;
@@ -5301,12 +7435,12 @@ void AssetBrowserPanel::drawFolderTree(const std::filesystem::path& path, Editor
     if (ImGui::BeginPopupContextItem("FolderContext")) {
         selectedPath_ = path;
         selectedRecordGuid_.clear();
-        drawPathContextMenu(path, true, requests);
+        drawPathContextMenu(state, path, true, requests);
         ImGui::EndPopup();
     }
     if (open) {
         for (const auto& child : listing.childDirectories) {
-            drawFolderTree(child, requests);
+            drawFolderTree(state, child, requests);
         }
         ImGui::TreePop();
     }
@@ -5361,7 +7495,7 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
             if (ImGui::BeginPopupContextItem("PathContext")) {
                 selectedPath_ = path;
                 selectedRecordGuid_.clear();
-                drawPathContextMenu(path, entry->isDirectory, requests);
+                drawPathContextMenu(state, path, entry->isDirectory, requests);
                 ImGui::EndPopup();
             }
             ImGui::TextWrapped("%s%s", selected ? "> " : "", path.filename().string().c_str());
@@ -5412,7 +7546,7 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
             if (ImGui::BeginPopupContextItem("PathContext")) {
                 selectedPath_ = path;
                 selectedRecordGuid_.clear();
-                drawPathContextMenu(path, isDir, requests);
+                drawPathContextMenu(state, path, isDir, requests);
                 ImGui::EndPopup();
             }
             ImGui::PopID();
@@ -5626,7 +7760,7 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
     }
     ImGui::EndGroup();
 
-    constexpr const char* typeFilters[] = {"All Types", "Mesh", "Material", "Texture", "HDRI", "Scene", "Prefab", "Animation", "Skeleton", "Unknown"};
+    constexpr const char* typeFilters[] = {"All Types", "Mesh", "Material", "Texture", "HDRI", "Scene", "Prefab", "Animation", "Skeleton", "Animation Controller", "Unknown"};
     constexpr const char* statusFilters[] = {"All Status", "Imported", "Missing", "Stale", "Failed", "Unknown"};
     constexpr const char* healthFilters[] = {
         "All Health",
@@ -5744,7 +7878,8 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
         case 6: return type == AssetType::Prefab;
         case 7: return type == AssetType::Animation;
         case 8: return type == AssetType::Skeleton;
-        case 9: return type == AssetType::Unknown;
+        case 9: return type == AssetType::AnimationController;
+        case 10: return type == AssetType::Unknown;
         default: return true;
         }
     };
@@ -6035,21 +8170,138 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
     auto overwriteRisksForRecord = [&](const AssetRecord& record) {
         return collectAssetOverwriteRisks(state, record, cachedSourceControlStatus);
     };
+    std::unordered_map<AssetGuid, NativeTextureBindingTableBadge> nativeTextureBadgeCache;
+    std::unordered_map<AssetGuid, NativeTexturePolicyTableFields> nativeTexturePolicyCache;
+    auto recordHasNativePayloadPath = [&](const AssetRecord& record) {
+        for (const std::string& rawPath : {record.importedPath, record.cachePath}) {
+            std::filesystem::path path = resolveAssetRecordPath(state, rawPath);
+            if (path.empty()) {
+                continue;
+            }
+            const std::string extension = lowerString(path.extension().string());
+            if (nativeStandaloneStorePath(path) || extension == ".rtpkg") {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto nativeTextureBadgeForRecord = [&](const AssetRecord& record) -> const NativeTextureBindingTableBadge& {
+        const auto existing = nativeTextureBadgeCache.find(record.guid);
+        if (existing != nativeTextureBadgeCache.end()) {
+            return existing->second;
+        }
+        NativeTextureBindingTableBadge badge;
+        const bool textureLike = record.type == AssetType::Texture || record.type == AssetType::HDRI;
+        const bool materialLike = record.type == AssetType::Material;
+        if (textureLike || materialLike) {
+            badge.applies = true;
+            if (recordHasNativePayloadPath(record)) {
+                badge.label = textureLike ? "Texture native" : "Material native";
+                badge.tooltip = "Native payload is referenced by registry metadata. Use Inspect Native Asset or Inspect Package for resident/fallback state; the registry table avoids mounting packages while scrolling.";
+                badge.color = ImVec4(0.54f, 0.82f, 0.60f, 1.0f);
+            } else {
+                badge.label = "Native missing";
+                badge.tooltip = "No native payload path is recorded for this asset. Repair action: reimport_or_recook_source_asset.";
+                badge.color = ImVec4(0.95f, 0.68f, 0.28f, 1.0f);
+            }
+        }
+        auto inserted = nativeTextureBadgeCache.emplace(record.guid, std::move(badge));
+        return inserted.first->second;
+    };
+    auto nativeTexturePolicyForRecord = [&](const AssetRecord& record) -> const NativeTexturePolicyTableFields& {
+        const auto existing = nativeTexturePolicyCache.find(record.guid);
+        if (existing != nativeTexturePolicyCache.end()) {
+            return existing->second;
+        }
+        NativeTexturePolicyTableFields fields;
+        const bool textureLike = record.type == AssetType::Texture || record.type == AssetType::HDRI;
+        if (textureLike) {
+            fields.applies = true;
+            fields.tooltip = recordHasNativePayloadPath(record)
+                ? "Native texture policy columns are available from explicit native asset/package inspection. The registry table intentionally avoids decoding payload bytes while scrolling."
+                : "No native texture payload path is recorded for this registry row.";
+        }
+        auto inserted = nativeTexturePolicyCache.emplace(record.guid, std::move(fields));
+        return inserted.first->second;
+    };
+    auto compareText = [](std::string lhs, std::string rhs) {
+        lhs = lowerString(trimString(std::move(lhs)));
+        rhs = lowerString(trimString(std::move(rhs)));
+        if (lhs == rhs) return 0;
+        return lhs < rhs ? -1 : 1;
+    };
+    auto compareRecordsForColumn = [&](const AssetRecord& lhs, const AssetRecord& rhs, int columnIndex) {
+        switch (columnIndex) {
+        case 0:
+            return static_cast<int>(state.editorPrefs != nullptr && assetGuidListContains(state.editorPrefs->favoriteAssetGuids, rhs.guid)) -
+                static_cast<int>(state.editorPrefs != nullptr && assetGuidListContains(state.editorPrefs->favoriteAssetGuids, lhs.guid));
+        case 1: return compareText(assetTypeName(lhs.type), assetTypeName(rhs.type));
+        case 2: return compareText(lhs.displayName.empty() ? lhs.guid : lhs.displayName, rhs.displayName.empty() ? rhs.guid : rhs.displayName);
+        case 3: return compareText(lhs.guid, rhs.guid);
+        case 4: return compareText(lhs.sourcePath, rhs.sourcePath);
+        case 5: return compareText(lhs.importedPath, rhs.importedPath);
+        case 6: return compareText(summarizeRecordSourceControl(lhs).label, summarizeRecordSourceControl(rhs).label);
+        case 7: return compareText(nativeTextureBadgeForRecord(lhs).label, nativeTextureBadgeForRecord(rhs).label);
+        case 8: return compareText(nativeTexturePolicyForRecord(lhs).role, nativeTexturePolicyForRecord(rhs).role);
+        case 9: return compareText(nativeTexturePolicyForRecord(lhs).colorSpace, nativeTexturePolicyForRecord(rhs).colorSpace);
+        case 10: return compareText(nativeTexturePolicyForRecord(lhs).emittedFormat, nativeTexturePolicyForRecord(rhs).emittedFormat);
+        case 11: return compareText(nativeTexturePolicyForRecord(lhs).compressionPolicy, nativeTexturePolicyForRecord(rhs).compressionPolicy);
+        case 12: return compareText(nativeTexturePolicyForRecord(lhs).platformTarget, nativeTexturePolicyForRecord(rhs).platformTarget);
+        case 13: return compareText(joinTagList(lhs.tags), joinTagList(rhs.tags));
+        case 14:
+            if (lhs.dependencies.size() == rhs.dependencies.size()) return 0;
+            return lhs.dependencies.size() < rhs.dependencies.size() ? -1 : 1;
+        case 15:
+            if (lhs.references.size() == rhs.references.size()) return 0;
+            return lhs.references.size() < rhs.references.size() ? -1 : 1;
+        case 16: return compareText(std::string(lhs.missing ? "missing" : "ok") + (lhs.stale ? " / stale" : ""), std::string(rhs.missing ? "missing" : "ok") + (rhs.stale ? " / stale" : ""));
+        case 17: return compareText(assetImportStatusName(lhs.status), assetImportStatusName(rhs.status));
+        case 18:
+            if (assetImportProgress(lhs) == assetImportProgress(rhs)) return 0;
+            return assetImportProgress(lhs) < assetImportProgress(rhs) ? -1 : 1;
+        default: return 0;
+        }
+    };
     const ImVec2 registryTableSize(0.0f, std::max(160.0f, ImGui::GetContentRegionAvail().y - 8.0f));
-    if (ImGui::BeginTable("AssetRegistryRecords", 13, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY, registryTableSize)) {
+    if (ImGui::BeginTable("AssetRegistryRecords", 19, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable, registryTableSize)) {
         ImGui::TableSetupColumn("Fav", ImGuiTableColumnFlags_WidthFixed, 38.0f);
         ImGui::TableSetupColumn("Type");
-        ImGui::TableSetupColumn("Name");
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort);
         ImGui::TableSetupColumn("GUID");
         ImGui::TableSetupColumn("Source");
         ImGui::TableSetupColumn("Imported");
         ImGui::TableSetupColumn("Git", ImGuiTableColumnFlags_WidthFixed, 118.0f);
+        ImGui::TableSetupColumn("Native Tex", ImGuiTableColumnFlags_WidthFixed, 118.0f);
+        ImGui::TableSetupColumn("Tex Role", ImGuiTableColumnFlags_WidthFixed, 92.0f);
+        ImGui::TableSetupColumn("Tex Color", ImGuiTableColumnFlags_WidthFixed, 86.0f);
+        ImGui::TableSetupColumn("Tex Format", ImGuiTableColumnFlags_WidthFixed, 122.0f);
+        ImGui::TableSetupColumn("Tex Compression", ImGuiTableColumnFlags_WidthFixed, 132.0f);
+        ImGui::TableSetupColumn("Tex Target", ImGuiTableColumnFlags_WidthFixed, 118.0f);
         ImGui::TableSetupColumn("Tags");
         ImGui::TableSetupColumn("Deps");
         ImGui::TableSetupColumn("Refs");
         ImGui::TableSetupColumn("Missing/Stale");
         ImGui::TableSetupColumn("Status");
         ImGui::TableSetupColumn("Progress", ImGuiTableColumnFlags_WidthFixed, EditorUiMetric::progressColumnWidth);
+        if (ImGuiTableSortSpecs* sortSpecs = ImGui::TableGetSortSpecs(); sortSpecs != nullptr && sortSpecs->SpecsCount > 0) {
+            std::stable_sort(visibleRecords.begin(), visibleRecords.end(), [&](const AssetRecord* lhs, const AssetRecord* rhs) {
+                if (lhs == nullptr || rhs == nullptr) {
+                    return lhs != nullptr;
+                }
+                for (int specIndex = 0; specIndex < sortSpecs->SpecsCount; ++specIndex) {
+                    const ImGuiTableColumnSortSpecs& spec = sortSpecs->Specs[specIndex];
+                    int comparison = compareRecordsForColumn(*lhs, *rhs, spec.ColumnIndex);
+                    if (comparison == 0) {
+                        continue;
+                    }
+                    if (spec.SortDirection == ImGuiSortDirection_Descending) {
+                        comparison = -comparison;
+                    }
+                    return comparison < 0;
+                }
+                return lhs->guid < rhs->guid;
+            });
+        }
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(visibleRecords.size()), EditorUiMetric::contentRowHeight);
@@ -6191,16 +8443,48 @@ void AssetBrowserPanel::drawRegistryTable(const EditorRuntimeState& state, Edito
                 ImGui::SetTooltip("%s", scmSummary.tooltip.c_str());
             }
             ImGui::TableSetColumnIndex(7);
-            ImGui::TextUnformatted(joinTagList(record.tags).c_str());
+            const NativeTextureBindingTableBadge& nativeBadge = nativeTextureBadgeForRecord(record);
+            ImGui::TextColored(nativeBadge.color, "%s", nativeBadge.label.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", nativeBadge.tooltip.c_str());
+            }
             ImGui::TableSetColumnIndex(8);
-            ImGui::Text("%zu", record.dependencies.size());
+            const NativeTexturePolicyTableFields& policyFields = nativeTexturePolicyForRecord(record);
+            ImGui::TextUnformatted(policyFields.role.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", policyFields.tooltip.c_str());
+            }
             ImGui::TableSetColumnIndex(9);
-            ImGui::Text("%zu", record.references.size());
+            ImGui::TextUnformatted(policyFields.colorSpace.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", policyFields.tooltip.c_str());
+            }
             ImGui::TableSetColumnIndex(10);
-            ImGui::Text("%s%s", record.missing ? "missing" : "ok", record.stale ? " / stale" : "");
+            ImGui::TextUnformatted(policyFields.emittedFormat.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", policyFields.tooltip.c_str());
+            }
             ImGui::TableSetColumnIndex(11);
-            ImGui::TextUnformatted(assetImportStatusName(record.status));
+            ImGui::TextUnformatted(policyFields.compressionPolicy.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", policyFields.tooltip.c_str());
+            }
             ImGui::TableSetColumnIndex(12);
+            ImGui::TextUnformatted(policyFields.platformTarget.c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", policyFields.tooltip.c_str());
+            }
+            ImGui::TableSetColumnIndex(13);
+            ImGui::TextUnformatted(joinTagList(record.tags).c_str());
+            ImGui::TableSetColumnIndex(14);
+            ImGui::Text("%zu", record.dependencies.size());
+            ImGui::TableSetColumnIndex(15);
+            ImGui::Text("%zu", record.references.size());
+            ImGui::TableSetColumnIndex(16);
+            ImGui::Text("%s%s", record.missing ? "missing" : "ok", record.stale ? " / stale" : "");
+            ImGui::TableSetColumnIndex(17);
+            ImGui::TextUnformatted(assetImportStatusName(record.status));
+            ImGui::TableSetColumnIndex(18);
             ImGui::ProgressBar(assetImportProgress(record), ImVec2(-FLT_MIN, 0.0f), assetImportProgressLabel(record));
             ImGui::PopID();
         }
@@ -6402,6 +8686,14 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             if (compatibilityMode_) {
                 ImGui::EndDisabled();
             }
+            ImGui::SameLine();
+            if (contentActionButton("MigrateNativeFilesInFolder", EditorGlyphIcon::Refresh, "Migrate Native Files", "Queue all native asset and .rtpkg files directly in this folder for background migration")) {
+                queueNativeFileMigrationBatchForFolder(state, selectedPath_, false, requests);
+            }
+            ImGui::SameLine();
+            if (contentActionButton("MigrateNativeFilesRecursive", EditorGlyphIcon::Refresh, "Migrate Recursive", "Queue native asset and .rtpkg files under this folder recursively for background migration, capped for safety")) {
+                queueNativeFileMigrationBatchForFolder(state, selectedPath_, true, requests);
+            }
         } else {
             const bool canOpen = canOpenOrApplyPath(selectedPath_);
             if (!canOpen) {
@@ -6433,6 +8725,102 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
                 prepareImportDialog(selectedPath_, currentPath_, 1);
             }
             if (!canImportAndPlace) {
+                ImGui::EndDisabled();
+            }
+            const bool canInspectNativeAsset = nativeStandaloneStorePath(selectedPath_);
+            const bool canInspectPackage = nativeAssetKindFromExtension(selectedPath_) == NativeAssetKind::Package;
+            ImGui::SameLine();
+            if (!canInspectNativeAsset) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("InspectNativeAssetFile", EditorGlyphIcon::Details, "Inspect Native Asset", "Write and open a read-only inspection report for this native asset file")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeNativeAssetFileInspectionReport(state, browserRoot_, selectedPath_, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Native asset inspection report: " + reportPath.string();
+                } else {
+                    status_ = "Native asset inspection failed: " + error;
+                }
+            }
+            if (!canInspectNativeAsset) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (!canInspectPackage) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("InspectRtpkgFile", EditorGlyphIcon::Details, "Inspect Package", "Write and open a read-only inspection report for this .rtpkg package file")) {
+                std::filesystem::path reportPath;
+                std::string error;
+                if (writeRtpkgFileInspectionReport(state, browserRoot_, selectedPath_, reportPath, error)) {
+                    requests.openFilePath = reportPath;
+                    status_ = "Package inspection report: " + reportPath.string();
+                } else {
+                    status_ = "Package inspection failed: " + error;
+                }
+            }
+            if (!canInspectPackage) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (!canInspectNativeAsset) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("MigrateNativeAssetFile", EditorGlyphIcon::Refresh, "Migrate Native Asset", "Write a dry-run report, request confirmation, then migrate this native asset file with backup and validation")) {
+                beginNativeFileMigration(state, selectedPath_, false, requests);
+            }
+            if (!canInspectNativeAsset) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (!canInspectPackage) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("MigrateRtpkgFile", EditorGlyphIcon::Refresh, "Migrate Package", "Write a dry-run report, request confirmation, then migrate this .rtpkg package with backup and validation")) {
+                beginNativeFileMigration(state, selectedPath_, true, requests);
+            }
+            if (!canInspectPackage) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (!canInspectPackage) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("MountRtpkgFile", EditorGlyphIcon::Add, "Mount Package", "Confirm and decode this .rtpkg package into the active CPU asset library")) {
+                beginNativePackageMount(selectedPath_);
+            }
+            if (!canInspectPackage) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (!canInspectPackage) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("UnloadRtpkgFile", EditorGlyphIcon::Command, "Unload Package", "Confirm and remove package-backed runtime assets, remap scene handles, and retire active renderer resources when affected")) {
+                beginNativePackageUnload(selectedPath_);
+            }
+            if (!canInspectPackage) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (!canInspectPackage) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("RefreshRtpkgFile", EditorGlyphIcon::Refresh, "Refresh Package", "Confirm and reload this .rtpkg package from disk through the active CPU asset library")) {
+                beginNativePackageRefresh(selectedPath_);
+            }
+            if (!canInspectPackage) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (!canInspectPackage) {
+                ImGui::BeginDisabled();
+            }
+            if (contentActionButton("RebuildRtpkgFile", EditorGlyphIcon::Refresh, "Rebuild Package", "Confirm and rewrite this .rtpkg package from the recorded native source inputs")) {
+                beginNativePackageRebuild(state, selectedPath_, requests);
+            }
+            if (!canInspectPackage) {
                 ImGui::EndDisabled();
             }
         }
@@ -7192,6 +9580,11 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
         ImGui::Text("Current Folder: %s", currentPath_.empty() ? "(none)" : relativeContentPath(currentPath_).c_str());
     }
     drawExternalChangeConfirmPrompt(requests);
+    drawNativeFileMigrationConfirmPrompt(state, requests);
+    drawNativePackageMountConfirmPrompt(requests);
+    drawNativePackageUnloadConfirmPrompt(requests);
+    drawNativePackageRefreshConfirmPrompt(requests);
+    drawNativePackageRebuildConfirmPrompt(state, requests);
 }
 
 void AssetBrowserPanel::drawImportSettingsDialog(EditorRequests& requests) {
@@ -7454,7 +9847,7 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         }
         ImGui::BeginChild("ContentFolders", ImVec2(treeWidth, 0.0f), true);
         if (!browserRoot_.empty()) {
-            drawFolderTree(browserRoot_, requests);
+            drawFolderTree(state, browserRoot_, requests);
         }
         if (state.editorPrefs != nullptr) {
             auto& prefs = *state.editorPrefs;
@@ -7633,3 +10026,6 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
 }
 
 } // namespace rtv
+
+
+

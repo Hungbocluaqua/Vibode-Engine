@@ -8,6 +8,7 @@
 #include <array>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace rtv {
 
@@ -51,6 +52,13 @@ public:
     [[nodiscard]] bool showAxes() const { return showAxes_; }
     void reloadViewportPreferences(const EditorPreferences& preferences);
 
+    struct GroupGizmoOriginal {
+        EntityId entity{};
+        Transform transform{};
+        glm::mat4 parentWorld{1.0f};
+        glm::mat4 world{1.0f};
+    };
+
 private:
     struct SnapSettings {
         bool enabled = false;
@@ -91,6 +99,8 @@ private:
     Transform gizmoDragOriginal_{};
     glm::mat4 gizmoDragParentWorld_{1.0f};
     glm::mat4 gizmoDragOriginalWorld_{1.0f};
+    std::vector<GroupGizmoOriginal> groupGizmoDragOriginals_;
+    glm::mat4 groupGizmoDragOriginalWorld_{1.0f};
 
     bool showGrid_ = false;
     bool showAxes_ = true;

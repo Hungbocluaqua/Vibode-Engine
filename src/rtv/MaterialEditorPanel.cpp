@@ -33,6 +33,9 @@ const std::array<ConductorPreset, 4> conductorPresets{{
     {"Silver", {0.16f, 0.14f, 0.13f}, {4.10f, 3.10f, 2.30f}},
 }};
 
+constexpr char kOpacitySlotLabel[] = {'O', 'p', 'a', 'c', 'i', 't', 'y', '\0'};
+constexpr char kHeightSlotLabel[] = {'H', 'e', 'i', 'g', 'h', 't', '\0'};
+
 glm::vec3 conductorF0(const glm::vec3& eta, const glm::vec3& k) {
     const glm::vec3 etaMinusOne = eta - glm::vec3{1.0f};
     const glm::vec3 etaPlusOne = eta + glm::vec3{1.0f};
@@ -59,6 +62,51 @@ void applyConductorPreset(MaterialAsset& material, const ConductorPreset& preset
     material.metallicFactor = 1.0f;
     material.baseColorFactor = glm::vec4{conductorF0(preset.eta, preset.k), material.baseColorFactor.a};
     material.roughnessFactor = std::min(material.roughnessFactor, 0.35f);
+}
+
+void drawTextureSlotControl(const char* label, TextureAssetHandle& handle, const AssetManager* assets, bool& changed) {
+    static constexpr char kTextureHandleInputLabel[] = {'#', '#', 'T', 'e', 'x', 't', 'u', 'r', 'e', 'H', 'a', 'n', 'd', 'l', 'e', '\0'};
+    static constexpr char kUnnamedLabel[] = {'(', 'u', 'n', 'n', 'a', 'm', 'e', 'd', ')', '\0'};
+    static constexpr char kMissingLabel[] = {'M', 'i', 's', 's', 'i', 'n', 'g', '\0'};
+    static constexpr char kNoneLabel[] = {'N', 'o', 'n', 'e', '\0'};
+    static constexpr char kClearLabel[] = {'C', 'l', 'e', 'a', 'r', '\0'};
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(170.0f);
+    int handleIndex = handle.valid() ? static_cast<int>(handle.index) : -1;
+    ImGui::SetNextItemWidth(96.0f);
+    if (ImGui::InputInt(kTextureHandleInputLabel, &handleIndex, 1, 16)) {
+        if (handleIndex < 0) {
+            if (handle.valid()) {
+                handle = {};
+                changed = true;
+            }
+        } else if (assets != nullptr) {
+            const TextureAssetHandle candidate{static_cast<uint32_t>(handleIndex)};
+            if (assets->texture(candidate) != nullptr && (!handle.valid() || handle.index != candidate.index)) {
+                handle = candidate;
+                changed = true;
+            }
+        }
+    }
+
+    ImGui::SameLine();
+    if (assets != nullptr && handle.valid()) {
+        if (const TextureAsset* texture = assets->texture(handle)) {
+            ImGui::TextUnformatted(texture->name.empty() ? kUnnamedLabel : texture->name.c_str());
+        } else {
+            ImGui::TextDisabled(kMissingLabel);
+        }
+    } else {
+        ImGui::TextDisabled(kNoneLabel);
+    }
+
+    ImGui::SameLine();
+    if (ImGui::SmallButton(kClearLabel) && handle.valid()) {
+        handle = {};
+        changed = true;
+    }
+    ImGui::PopID();
 }
 
 uint32_t materialIdForSelection(const EditorRuntimeState& state, const EditorSelection& selection) {
@@ -266,6 +314,9 @@ void MaterialEditorPanel::draw(const EditorRuntimeState& state, const EditorSele
     ImGui::Text("Normal: %u", edited.normalTexture.index);
     ImGui::Text("Metallic roughness: %u", edited.metallicRoughnessTexture.index);
     ImGui::Text("Emissive: %u", edited.emissiveTexture.index);
+
+    drawTextureSlotControl(kOpacitySlotLabel, edited.opacityTexture, state.assets, changed);
+    drawTextureSlotControl(kHeightSlotLabel, edited.heightTexture, state.assets, changed);
 
     if (changed) {
         requests.materialUpdate = EditorMaterialUpdate{.materialId = materialId, .material = edited};

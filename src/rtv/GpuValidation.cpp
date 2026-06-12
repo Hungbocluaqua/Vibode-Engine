@@ -48,6 +48,37 @@ void RendererValidationLog::recordSceneUpdateRoute(std::string kind, std::string
     });
 }
 
+void RendererValidationLog::recordSchedulerQueueEvent(std::string queue, std::string job, std::string status, uint64_t generation, double cpuMs) {
+    const bool frameBudgetViolation = status.find("budget_exhausted") != std::string::npos;
+    for (SchedulerQueueEvent& event : schedulerQueueEvents_) {
+        if (event.queue == queue && event.job == job && event.status == status && event.generation == generation) {
+            ++event.count;
+            event.totalCpuMs += cpuMs;
+            event.lastCpuMs = cpuMs;
+            event.frameBudgetViolationCount += frameBudgetViolation ? 1ull : 0ull;
+            if (event.minCpuMs <= 0.0 || cpuMs < event.minCpuMs) {
+                event.minCpuMs = cpuMs;
+            }
+            if (cpuMs > event.maxCpuMs) {
+                event.maxCpuMs = cpuMs;
+            }
+            return;
+        }
+    }
+    schedulerQueueEvents_.push_back(SchedulerQueueEvent{
+        .queue = std::move(queue),
+        .job = std::move(job),
+        .status = std::move(status),
+        .generation = generation,
+        .count = 1,
+        .totalCpuMs = cpuMs,
+        .lastCpuMs = cpuMs,
+        .minCpuMs = cpuMs,
+        .maxCpuMs = cpuMs,
+        .frameBudgetViolationCount = frameBudgetViolation ? 1ull : 0ull,
+    });
+}
+
 void RendererValidationLog::beginFrame(uint64_t frame) {
     currentFrame_ = frame;
     passEvents_.clear();
