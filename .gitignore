@@ -1,24 +1,48 @@
+# =============================================================================
 # Build output
-build/
-build_test/
-cmake-build-*/
-out/
-validation_output/
+# =============================================================================
+/build/
+/build_test/
+/out/
+/cmake-build-*/
+/validation_output/
+/install/
+/dist/
+/bin/
+/obj/
 
-# Visual Studio
-.vs/
-*.vcxproj
-*.vcxproj.filters
-*.vcxproj.user
-*.sln
+# CMake / Ninja generated files
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
-generate.stamp*
-install_manifest.txt
 CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+install_manifest.txt
+generate.stamp*
 _deps/
-x64/
+.ninja_deps
+.ninja_log
+build.ninja
+compile_commands.json
+
+# Visual Studio generated files
+/.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.user
+*.suo
+*.opensdf
+*.sdf
+ipch/
+/x64/
+/x86/
+/Debug/
+/Release/
+/RelWithDebInfo/
+/MinSizeRel/
 ALL_BUILD.dir/
 ZERO_CHECK.dir/
 rtvulkan.dir/
@@ -28,51 +52,180 @@ ZERO_CHECK.vcxproj*
 rtvulkan.vcxproj*
 volk.vcxproj*
 
-# Compiled object files
+# =============================================================================
+# Compiled binaries / object files / debug symbols
+# =============================================================================
 *.obj
 *.o
+*.lo
 *.lib
 *.a
 *.dll
 *.so
 *.dylib
-
-# Executables
 *.exe
-
-# Debug symbols
 *.pdb
 *.ilk
+*.exp
 
-# Compiled shaders
+# =============================================================================
+# Generated shader / renderer outputs
+# =============================================================================
 *.spv
+*.spv.tmp
+*.spv.log
+pipeline_cache.bin
 
-# IDE
-.idea/
-*.swp
-*.swo
-*~
-.vscode/
+# =============================================================================
+# Runtime/generated asset caches
+# =============================================================================
+*.cache.bin
+*.rtcache
+*.assetcache
+*.gpuassetcache
+*.streaming-cache
+*.tmp
+*.temp
 
-# Editor/runtime-local state
+# =============================================================================
+# Local diagnostics, captures, reports, dumps
+# =============================================================================
+*.log
+*.dmp
+*.dump
+*.trace
+*.rpd
+*.rdc
+*.nsight-gfx*
+*.pix3
+/diagnostics/
+/captures/
+/reports/
+/profiling/
+/screenshots/
+/frame_captures/
+
+# =============================================================================
+# Local editor/runtime state
+# =============================================================================
 /editor_preferences.json
 /rtv_editor.ini
 /rtv_editor/
+/nul
 
-# Local documentation and research notes
-/docs/
-
-# CodeGraph runtime state
-.codegraph/
-
-# Sponza scenes (large assets)
-Sponza/
-main_sponza/
-
-# San Miguel scene (large asset)
-san-miguel/
-
-# OS
+# =============================================================================
+# IDE/editor state
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# =============================================================================
+# Local AI/tool state
+# =============================================================================
+/.claude/
+# Local code index used by OpenCode/Codex. Keep locally, do not upload.
+/.codegraph/
+/.opencode/node_modules/
+/.opencode/package-lock.json
+/.opencode/package.json
+/.opencode/.gitignore
+
+# Keep intentional OpenCode config files tracked, such as:
+# /.opencode/dcp.jsonc
+# /opencode.json
+
+# =============================================================================
+# Node dependencies
+# =============================================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =============================================================================
+# Local documentation archives / research PDFs
+# =============================================================================
+# Keep markdown docs/plans in docs/, but do not upload large paper archives.
+/docs/Research papers/
+/docs/Research papers*/
+/docs/**/*.pdf
+
+# =============================================================================
+# Large local scene/assets - not committed to GitHub
+# =============================================================================
+/Sponza/
+/main_sponza/
+/san-miguel/
+/Bistro_v5_2/
+/JungleRuins/
+/niagara_bistro-master/
+/assets/
+/Assets/
+/content/
+/Content/
+/game_assets/
+/GameAssets/
+/asset_cache/
+/AssetCache/
+
+# Heavy imported/source asset formats
+*.fbx
+*.blend
+*.max
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.abc
+
+# Heavy texture/environment formats
+*.hdr
+*.exr
+*.tga
+*.tif
+*.tiff
+*.dds
+*.ktx
+*.ktx2
+
+# Keep small committed validation/test/project content visible to Git.
+!scenes/validation/**
+!tests/**/*
+!Samples/**/*
+!Projects/**/*
+
+# But still ignore generated/cooked caches inside those folders.
+scenes/validation/**/*.cache.bin
+tests/**/*.cache.bin
+Samples/**/*.cache.bin
+Projects/**/*.cache.bin
+
+# =============================================================================
+# Third-party generated/vendor build subfolders
+# =============================================================================
+third_party/**/build/
+third_party/**/bin/
+third_party/**/lib/
+third_party/**/*.pdb
+third_party/**/*.ilk
+third_party/**/*.exe
+third_party/**/*.dll
+third_party/**/*.obj
+third_party/**/*.o
+
+# =============================================================================
+# Python/tooling cache
+# =============================================================================
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
