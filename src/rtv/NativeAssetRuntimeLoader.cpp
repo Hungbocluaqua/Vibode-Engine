@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -102,12 +103,16 @@ bool nativeTextureBlockCompressedFormat(VkFormat format) {
     case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
     case VK_FORMAT_BC3_UNORM_BLOCK:
     case VK_FORMAT_BC3_SRGB_BLOCK:
     case VK_FORMAT_BC4_UNORM_BLOCK:
     case VK_FORMAT_BC4_SNORM_BLOCK:
     case VK_FORMAT_BC5_UNORM_BLOCK:
     case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
     case VK_FORMAT_BC7_UNORM_BLOCK:
     case VK_FORMAT_BC7_SRGB_BLOCK:
         return true;
@@ -186,6 +191,18 @@ std::string nativeDebugRecordValue(const NativeAssetInspection& inspection, cons
     return {};
 }
 
+uint32_t nativeDebugRecordUint32(const NativeAssetInspection& inspection, const char* key, uint32_t fallback) {
+    const std::string value = nativeDebugRecordValue(inspection, key);
+    if (value.empty()) {
+        return fallback;
+    }
+    try {
+        return static_cast<uint32_t>(std::stoul(value));
+    } catch (...) {
+        return fallback;
+    }
+}
+
 template <typename T>
 bool readPodChunk(const std::vector<std::byte>& bytes, const NativeChunkRecord* chunk, T& out) {
     static_assert(std::is_trivially_copyable_v<T>);
@@ -236,6 +253,88 @@ bool readJsonChunk(const std::vector<std::byte>& bytes, const NativeChunkRecord*
     } catch (const std::exception&) {
         out = nlohmann::json::object();
         return false;
+    }
+}
+
+glm::vec3 jsonVec3Or(const nlohmann::json& value, glm::vec3 fallback) {
+    if (!value.is_array() || value.size() < 3) {
+        return fallback;
+    }
+    return glm::vec3{
+        value[0].get<float>(),
+        value[1].get<float>(),
+        value[2].get<float>(),
+    };
+}
+
+void applyMaterialSemanticMetadata(MaterialAsset& material, const nlohmann::json& metadata) {
+    if (!metadata.is_object()) {
+        return;
+    }
+    material.nestedPriority = metadata.value("nestedPriority", material.nestedPriority);
+    if (const auto it = metadata.find("ior"); it != metadata.end() && it->is_object()) {
+        material.hasIor = it->value("present", material.hasIor != 0u) ? 1u : 0u;
+        material.iorFactor = it->value("factor", material.iorFactor);
+    }
+    if (const auto it = metadata.find("clearcoat"); it != metadata.end() && it->is_object()) {
+        material.hasClearcoat = it->value("present", material.hasClearcoat != 0u) ? 1u : 0u;
+        material.clearcoatFactor = it->value("factor", material.clearcoatFactor);
+        material.clearcoatRoughnessFactor = it->value("roughnessFactor", material.clearcoatRoughnessFactor);
+    }
+    if (const auto it = metadata.find("transmission"); it != metadata.end() && it->is_object()) {
+        material.hasTransmission = it->value("present", material.hasTransmission != 0u) ? 1u : 0u;
+        material.transmissionFactor = it->value("factor", material.transmissionFactor);
+    }
+    if (const auto it = metadata.find("volume"); it != metadata.end() && it->is_object()) {
+        material.hasVolume = it->value("present", material.hasVolume != 0u) ? 1u : 0u;
+        material.volumeThicknessFactor = it->value("thicknessFactor", material.volumeThicknessFactor);
+        material.volumeAttenuationDistance = it->value("attenuationDistance", material.volumeAttenuationDistance);
+        if (const auto color = it->find("attenuationColor"); color != it->end()) {
+            material.volumeAttenuationColor = jsonVec3Or(*color, material.volumeAttenuationColor);
+        }
+    }
+    if (const auto it = metadata.find("dispersion"); it != metadata.end() && it->is_object()) {
+        material.hasDispersion = it->value("present", material.hasDispersion != 0u) ? 1u : 0u;
+        material.dispersionFactor = it->value("factor", material.dispersionFactor);
+    }
+    if (const auto it = metadata.find("specular"); it != metadata.end() && it->is_object()) {
+        material.hasSpecular = it->value("present", material.hasSpecular != 0u) ? 1u : 0u;
+        material.specularFactor = it->value("factor", material.specularFactor);
+        if (const auto color = it->find("colorFactor"); color != it->end()) {
+            material.specularColorFactor = jsonVec3Or(*color, material.specularColorFactor);
+        }
+    }
+    if (const auto it = metadata.find("sheen"); it != metadata.end() && it->is_object()) {
+        material.hasSheen = it->value("present", material.hasSheen != 0u) ? 1u : 0u;
+        material.sheenRoughnessFactor = it->value("roughnessFactor", material.sheenRoughnessFactor);
+        if (const auto color = it->find("colorFactor"); color != it->end()) {
+            material.sheenColorFactor = jsonVec3Or(*color, material.sheenColorFactor);
+        }
+    }
+    if (const auto it = metadata.find("iridescence"); it != metadata.end() && it->is_object()) {
+        material.hasIridescence = it->value("present", material.hasIridescence != 0u) ? 1u : 0u;
+        material.iridescenceFactor = it->value("factor", material.iridescenceFactor);
+        material.iridescenceIor = it->value("ior", material.iridescenceIor);
+        material.iridescenceThicknessMinimum = it->value("thicknessMinimum", material.iridescenceThicknessMinimum);
+        material.iridescenceThicknessMaximum = it->value("thicknessMaximum", material.iridescenceThicknessMaximum);
+    }
+    if (const auto it = metadata.find("anisotropy"); it != metadata.end() && it->is_object()) {
+        material.hasAnisotropy = it->value("present", material.hasAnisotropy != 0u) ? 1u : 0u;
+        material.anisotropyStrength = it->value("strength", material.anisotropyStrength);
+        material.anisotropyRotation = it->value("rotation", material.anisotropyRotation);
+    }
+    if (const auto it = metadata.find("emissiveStrength"); it != metadata.end() && it->is_object()) {
+        material.hasEmissiveStrength = it->value("present", material.hasEmissiveStrength != 0u) ? 1u : 0u;
+        material.emissiveStrength = it->value("factor", material.emissiveStrength);
+    }
+    if (const auto it = metadata.find("conductor"); it != metadata.end() && it->is_object()) {
+        material.useConductorOptics = it->value("enabled", material.useConductorOptics != 0u) ? 1u : 0u;
+        if (const auto eta = it->find("eta"); eta != it->end()) {
+            material.conductorEta = jsonVec3Or(*eta, material.conductorEta);
+        }
+        if (const auto k = it->find("k"); k != it->end()) {
+            material.conductorK = jsonVec3Or(*k, material.conductorK);
+        }
     }
 }
 
@@ -375,6 +474,17 @@ std::filesystem::path nativeObjectRuntimePath(const NativeAssetStoreObject& obje
     return object.path;
 }
 
+std::string nativeRuntimePathKey(const std::filesystem::path& path) {
+    std::filesystem::path normalized = path.lexically_normal();
+    std::string key = normalized.generic_string();
+#if defined(_WIN32)
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+#endif
+    return key;
+}
+
 void applyNativeObjectTextureMetadata(TextureAsset& texture, const std::string& guid, const NativeAssetStoreObject* object) {
     texture.nativeGuid = guid;
     if (object != nullptr) {
@@ -411,6 +521,8 @@ nlohmann::json nativeTextureFormatSupportJson(const NativeTextureFormatSupport& 
         {"bc7UnormSampled", support.bc7UnormSampled},
         {"bc5UnormSampled", support.bc5UnormSampled},
         {"bc4UnormSampled", support.bc4UnormSampled},
+        {"bc6hUfloatSampled", support.bc6hUfloatSampled},
+        {"bc6hSfloatSampled", support.bc6hSfloatSampled},
         {"rgba8SrgbSampled", support.rgba8SrgbSampled},
         {"rgba8UnormSampled", support.rgba8UnormSampled},
         {"rgba16fSampled", support.rgba16fSampled},
@@ -423,6 +535,8 @@ int nativeTextureVariantFormatRank(VkFormat format) {
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC2_UNORM_BLOCK:
     case VK_FORMAT_BC3_SRGB_BLOCK:
     case VK_FORMAT_BC3_UNORM_BLOCK:
         return 325;
@@ -430,9 +544,14 @@ int nativeTextureVariantFormatRank(VkFormat format) {
     case VK_FORMAT_BC7_UNORM_BLOCK:
         return 400;
     case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK:
         return 350;
     case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK:
         return 300;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+        return 375;
     case VK_FORMAT_R16G16B16A16_SFLOAT:
         return 200;
     case VK_FORMAT_R8G8B8A8_SRGB:
@@ -701,6 +820,61 @@ void buildDirectStoreUploadTicketQueueSimulation(NativeRuntimeDirectStoreUploadP
     plan.uploadTicketQueuePolicy = "diagnostic-ticket-queue-simulation-only; no Vulkan resources, command buffers, or renderer-owned native-store handles are allocated.";
 }
 
+void finalizeLegacyCpuLoadPolicy(NativeRuntimeLoadReport& report) {
+    NativeRuntimeLegacyCpuLoadPolicyReport& policy = report.legacyCpuLoadPolicy;
+    const auto saturatedAdd = [](uint64_t a, uint64_t b) {
+        if (b > std::numeric_limits<uint64_t>::max() - a) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return a + b;
+    };
+
+    policy.available = true;
+    policy.assetManagerBacked = report.rendererUploadPlan.assetManagerBacked;
+    policy.packageBacked = report.rendererUploadPlan.packageBacked;
+    policy.looseBacked = report.directStoreUploadPlan.looseBacked || (!policy.packageBacked && !report.sourceRoot.empty());
+    policy.warningThresholdBytes = report.options.eagerCpuLoadWarningBytes;
+    policy.hardLimitBytes = report.options.eagerCpuLoadHardLimitBytes;
+    policy.allowLargeEagerCpuLoad = report.options.allowLargeEagerCpuLoad;
+    policy.policy = "legacy-eager-cpu-load-warning-and-hard-limit";
+    policy.recommendedAction = "Use the progressive native streaming path and DirectStorage-backed upload tickets for large package payloads.";
+
+    uint64_t estimated = 0;
+    estimated = saturatedAdd(estimated, report.rendererUploadPlan.textureUploadBytes);
+    estimated = saturatedAdd(estimated, report.rendererUploadPlan.vertexUploadBytes);
+    estimated = saturatedAdd(estimated, report.rendererUploadPlan.indexUploadBytes);
+    if (estimated == 0) {
+        const uint64_t vertexBytes = report.totalVertexCount > std::numeric_limits<uint64_t>::max() / sizeof(MeshVertex)
+            ? std::numeric_limits<uint64_t>::max()
+            : report.totalVertexCount * sizeof(MeshVertex);
+        const uint64_t indexBytes = report.totalIndexCount > std::numeric_limits<uint64_t>::max() / sizeof(uint32_t)
+            ? std::numeric_limits<uint64_t>::max()
+            : report.totalIndexCount * sizeof(uint32_t);
+        estimated = saturatedAdd(report.totalTextureBytes, saturatedAdd(vertexBytes, indexBytes));
+    }
+    policy.estimatedEagerCpuBytes = estimated;
+    policy.largeEagerLoadWarning = policy.assetManagerBacked && policy.warningThresholdBytes > 0 && estimated >= policy.warningThresholdBytes;
+    policy.hardLimitExceeded = policy.assetManagerBacked && !policy.allowLargeEagerCpuLoad && policy.hardLimitBytes > 0 && estimated >= policy.hardLimitBytes;
+    policy.streamingRecommended = policy.largeEagerLoadWarning || policy.hardLimitExceeded;
+
+    if (policy.largeEagerLoadWarning) {
+        report.warnings.push_back(
+            "Legacy eager CPU native runtime load decoded " + std::to_string(estimated) +
+            " bytes into AssetManager; large production payloads should use progressive native streaming and DirectStorage upload tickets.");
+    }
+    if (policy.hardLimitExceeded) {
+        report.errors.push_back(makeLoaderError(
+            NativeBinaryErrorCode::UnsupportedPlatformFeature,
+            report.sourceRoot,
+            "legacy_cpu_load_policy",
+            0,
+            estimated,
+            "Legacy eager CPU native runtime load exceeds the hard limit of " + std::to_string(policy.hardLimitBytes) +
+                " bytes; use progressive native streaming or explicitly allow large eager CPU loads for diagnostics."));
+        report.ok = false;
+    }
+}
+
 void appendControllerClipBinding(
     NativeRuntimeLoadedAsset& controllerAsset,
     const std::unordered_map<std::string, const NativeRuntimeLoadedAsset*>& animationsByGuid,
@@ -892,7 +1066,7 @@ NativeRuntimeLoadedAsset NativeAssetRuntimeLoader::loadBytes(const std::filesyst
     NativeRuntimeLoadedAsset result;
     result.path = pathHint;
     NativeAssetReader reader;
-    const NativeAssetInspection inspection = reader.inspectBytes(pathHint, bytes, true);
+    const NativeAssetInspection inspection = reader.inspectBytes(pathHint, bytes, options.validatePayloadHashes);
     if (!inspection.ok) {
         result.errors = inspection.errors;
         return result;
@@ -977,6 +1151,10 @@ NativeRuntimeLoadedAsset NativeAssetRuntimeLoader::loadBytes(const std::filesyst
         result.material.hasIridescence = (header.flags >> 7u) & 1u;
         result.material.hasAnisotropy = (header.flags >> 8u) & 1u;
         result.material.hasEmissiveStrength = (header.flags >> 9u) & 1u;
+        nlohmann::json materialMetadata;
+        if (readJsonChunk(bytes, findChunk(inspection, ChunkMetadataJson), materialMetadata)) {
+            applyMaterialSemanticMetadata(result.material, materialMetadata);
+        }
         std::vector<RtmaterialTextureSlotRecord> slots;
         if (header.textureSlotCount > 0 && !readVectorChunk(bytes, findChunk(inspection, ChunkMaterialTextureSlots), slots, header.textureSlotCount)) {
             result.errors.push_back(makeLoaderError(NativeBinaryErrorCode::CorruptTable, pathHint, "rtmaterial.textureSlots", 0, 0, "Invalid rtmaterial texture slot chunk"));
@@ -1028,6 +1206,10 @@ NativeRuntimeLoadedAsset NativeAssetRuntimeLoader::loadBytes(const std::filesyst
         result.texture.sourceContainerPreserved = result.textureSourceContainerPreserved;
         result.texture.sourceContainerTranscoded = result.textureSourceContainerTranscoded;
         result.texture.nativePayloadSource = nativeDebugRecordValue(inspection, "nativePayloadSource");
+        result.texture.sourceArrayLayers = nativeDebugRecordUint32(inspection, "sourceArrayLayers", std::max(1u, header.arrayLayers));
+        result.texture.sourceDepth = nativeDebugRecordUint32(inspection, "sourceDepth", std::max(1u, header.depth));
+        result.texture.sourceFaceCount = nativeDebugRecordUint32(inspection, "sourceFaceCount", 1u);
+        result.texture.sourceIsCubemap = nativeDebugRecordValue(inspection, "sourceIsCubemap") == "true";
         const bool ktx2OrBasisContainer = result.textureSourceContainerKind == "ktx2" ||
             result.textureSourceContainerKind == "basisu-ktx2" ||
             result.textureSourceContainerPreserved ||
@@ -1137,10 +1319,21 @@ NativeRuntimeLoadedAsset NativeAssetRuntimeLoader::loadBytes(const std::filesyst
 
 NativeRuntimeLoadReport NativeAssetRuntimeLoader::loadLooseRoot(const std::filesystem::path& root, AssetManager* manager, const NativeRuntimeLoadOptions& options) const {
     NativeRuntimeLoadReport report;
+    report.sourceRoot = root;
     report.options = options;
     std::unordered_map<std::string, TextureAssetHandle> textureHandlesByGuid;
     std::unordered_map<std::string, MaterialAssetHandle> materialHandlesByGuid;
     std::unordered_map<std::string, NativeAssetStoreObject> objectsByGuid;
+    std::unordered_set<std::string> looseFileAllowSet;
+    looseFileAllowSet.reserve(options.looseFileAllowList.size());
+    for (const std::filesystem::path& allowedPath : options.looseFileAllowList) {
+        if (!allowedPath.empty()) {
+            looseFileAllowSet.insert(nativeRuntimePathKey(allowedPath));
+        }
+    }
+    auto looseFileAllowed = [&](const std::filesystem::path& path) {
+        return looseFileAllowSet.empty() || looseFileAllowSet.find(nativeRuntimePathKey(path)) != looseFileAllowSet.end();
+    };
 
     auto rememberObjects = [&](const NativeAssetStoreInspection& inspection) {
         for (const NativeAssetStoreObject& object : inspection.objects) {
@@ -1177,9 +1370,65 @@ NativeRuntimeLoadReport NativeAssetRuntimeLoader::loadLooseRoot(const std::files
         if (asset.ok && asset.kind == NativeAssetKind::Mesh && manager != nullptr) {
             resolveNativeMeshMaterialSlots(asset, manager, materialHandlesByGuid, objectsByGuid);
         }
+        const uint64_t texturePayloadBytes = asset.ok && asset.kind == NativeAssetKind::Texture
+            ? static_cast<uint64_t>(asset.texture.rgba8.size())
+            : 0ull;
+        const uint64_t meshVertexCount = asset.ok && asset.kind == NativeAssetKind::Mesh
+            ? static_cast<uint64_t>(asset.mesh.vertices.size())
+            : 0ull;
+        const uint64_t meshIndexCount = asset.ok && asset.kind == NativeAssetKind::Mesh
+            ? static_cast<uint64_t>(asset.mesh.indices.size())
+            : 0ull;
+        const bool keepReportPayload = options.retainLoadedPayloadsInReport;
+        TextureAsset textureSummary;
+        if (asset.ok && asset.kind == NativeAssetKind::Texture && !keepReportPayload) {
+            textureSummary.name = asset.texture.name;
+            textureSummary.sourcePath = asset.texture.sourcePath;
+            textureSummary.width = asset.texture.width;
+            textureSummary.height = asset.texture.height;
+            textureSummary.channels = asset.texture.channels;
+            textureSummary.sourceArrayLayers = asset.texture.sourceArrayLayers;
+            textureSummary.sourceDepth = asset.texture.sourceDepth;
+            textureSummary.sourceFaceCount = asset.texture.sourceFaceCount;
+            textureSummary.sourceIsCubemap = asset.texture.sourceIsCubemap;
+            textureSummary.mipLevels = asset.texture.mipLevels;
+            textureSummary.srgb = asset.texture.srgb;
+            textureSummary.resident = asset.texture.resident;
+            textureSummary.fallback = asset.texture.fallback;
+            textureSummary.isCompressed = asset.texture.isCompressed;
+            textureSummary.linearColorSpace = asset.texture.linearColorSpace;
+            textureSummary.format = asset.texture.format;
+            textureSummary.compressedFormat = asset.texture.compressedFormat;
+            textureSummary.sampler = asset.texture.sampler;
+            textureSummary.nativeGuid = asset.texture.nativeGuid;
+            textureSummary.nativeSource = asset.texture.nativeSource;
+            textureSummary.nativePath = asset.texture.nativePath;
+            textureSummary.sourceContainerKind = asset.texture.sourceContainerKind;
+            textureSummary.nativePayloadSource = asset.texture.nativePayloadSource;
+            textureSummary.authoredRole = asset.texture.authoredRole;
+            textureSummary.sourceContainerPreserved = asset.texture.sourceContainerPreserved;
+            textureSummary.sourceContainerTranscoded = asset.texture.sourceContainerTranscoded;
+            textureSummary.mipData = asset.texture.mipData;
+        }
+        MeshAsset meshSummary;
+        if (asset.ok && asset.kind == NativeAssetKind::Mesh && !keepReportPayload) {
+            meshSummary.name = asset.mesh.name;
+            meshSummary.nativeGuid = asset.mesh.nativeGuid;
+            meshSummary.nativeSource = asset.mesh.nativeSource;
+            meshSummary.nativePath = asset.mesh.nativePath;
+        }
+        MaterialAsset materialSummary;
+        if (asset.ok && asset.kind == NativeAssetKind::Material && !keepReportPayload) {
+            materialSummary = asset.material;
+        }
+        if (!asset.textureVariantCandidate || asset.textureVariantSelected) {
+            appendDirectStoreUploadPlanForAsset(report, asset, object);
+        }
         if (asset.ok && manager != nullptr && registerWithManager) {
             if (asset.kind == NativeAssetKind::Texture) {
-                asset.textureHandle = manager->addTexture(asset.texture);
+                asset.textureHandle = keepReportPayload
+                    ? manager->addTexture(asset.texture)
+                    : manager->addTexture(std::move(asset.texture));
                 if (!asset.guid.empty()) {
                     textureHandlesByGuid[asset.guid] = asset.textureHandle;
                     if (object != nullptr) {
@@ -1187,12 +1436,25 @@ NativeRuntimeLoadReport NativeAssetRuntimeLoader::loadLooseRoot(const std::files
                     }
                 }
             } else if (asset.kind == NativeAssetKind::Material) {
-                asset.materialHandle = manager->addMaterial(asset.material);
+                asset.materialHandle = keepReportPayload
+                    ? manager->addMaterial(asset.material)
+                    : manager->addMaterial(std::move(asset.material));
                 if (!asset.guid.empty()) {
                     materialHandlesByGuid[asset.guid] = asset.materialHandle;
                 }
             } else if (asset.kind == NativeAssetKind::Mesh) {
-                asset.meshHandle = manager->addMesh(asset.mesh);
+                asset.meshHandle = keepReportPayload
+                    ? manager->addMesh(asset.mesh)
+                    : manager->addMesh(std::move(asset.mesh));
+            }
+        }
+        if (asset.ok && !keepReportPayload) {
+            if (asset.kind == NativeAssetKind::Texture) {
+                asset.texture = std::move(textureSummary);
+            } else if (asset.kind == NativeAssetKind::Material) {
+                asset.material = std::move(materialSummary);
+            } else if (asset.kind == NativeAssetKind::Mesh) {
+                asset.mesh = std::move(meshSummary);
             }
         }
         if (asset.ok && manager != nullptr) {
@@ -1206,28 +1468,25 @@ NativeRuntimeLoadReport NativeAssetRuntimeLoader::loadLooseRoot(const std::files
                 if (asset.texture.resident) {
                     ++report.rendererUploadPlan.textureResidentCount;
                 }
-                report.rendererUploadPlan.textureUploadBytes += asset.texture.rgba8.size();
+                report.rendererUploadPlan.textureUploadBytes += texturePayloadBytes;
             } else if (asset.kind == NativeAssetKind::Material && asset.materialHandle.valid()) {
                 ++report.rendererUploadPlan.materialCount;
             } else if (asset.kind == NativeAssetKind::Mesh && asset.meshHandle.valid()) {
                 ++report.rendererUploadPlan.meshCount;
-                report.rendererUploadPlan.vertexUploadBytes += sizeof(MeshVertex) * asset.mesh.vertices.size();
-                report.rendererUploadPlan.indexUploadBytes += sizeof(uint32_t) * asset.mesh.indices.size();
+                report.rendererUploadPlan.vertexUploadBytes += sizeof(MeshVertex) * meshVertexCount;
+                report.rendererUploadPlan.indexUploadBytes += sizeof(uint32_t) * meshIndexCount;
             }
-        }
-        if (!asset.textureVariantCandidate || asset.textureVariantSelected) {
-            appendDirectStoreUploadPlanForAsset(report, asset, object);
         }
         if (asset.ok) {
             if (asset.kind == NativeAssetKind::Texture) {
                 ++report.textureCount;
-                report.totalTextureBytes += asset.texture.rgba8.size();
+                report.totalTextureBytes += texturePayloadBytes;
             } else if (asset.kind == NativeAssetKind::Material) {
                 ++report.materialCount;
             } else if (asset.kind == NativeAssetKind::Mesh) {
                 ++report.meshCount;
-                report.totalVertexCount += asset.mesh.vertices.size();
-                report.totalIndexCount += asset.mesh.indices.size();
+                report.totalVertexCount += meshVertexCount;
+                report.totalIndexCount += meshIndexCount;
             } else if (asset.kind == NativeAssetKind::Skeleton) {
                 ++report.skeletonCount;
             } else if (asset.kind == NativeAssetKind::Animation) {
@@ -1274,6 +1533,9 @@ NativeRuntimeLoadReport NativeAssetRuntimeLoader::loadLooseRoot(const std::files
             if (object.kind == NativeAssetKind::Mesh || object.kind == NativeAssetKind::Material || object.kind == NativeAssetKind::Texture ||
                 object.kind == NativeAssetKind::Skeleton || object.kind == NativeAssetKind::Animation || object.kind == NativeAssetKind::AnimationController ||
                 object.kind == NativeAssetKind::SkeletalMesh) {
+                if (object.source == NativeAssetStoreSource::LooseFile && !looseFileAllowed(nativeObjectRuntimePath(object))) {
+                    continue;
+                }
                 objects.push_back(object);
                 if (object.kind == NativeAssetKind::Texture) {
                     ++textureVariantCounts[object.guid];
@@ -1360,6 +1622,7 @@ NativeRuntimeLoadReport NativeAssetRuntimeLoader::loadLooseRoot(const std::files
         buildDirectStoreUploadTicketQueueSimulation(report.directStoreUploadPlan);
         report.sceneAsset = buildNativeRuntimeSceneAsset(report, root);
         report.sceneAssetPlan = makeSceneAssetPlan(report, report.sceneAsset);
+        finalizeLegacyCpuLoadPolicy(report);
     };
 
     if (std::filesystem::is_regular_file(root, ec) && rootKind == NativeAssetKind::Package) {
@@ -1378,6 +1641,50 @@ NativeRuntimeLoadReport NativeAssetRuntimeLoader::loadLooseRoot(const std::files
     }
 
     if (std::filesystem::is_directory(root, ec)) {
+        if (!options.validatePayloadHashes) {
+            std::vector<NativeAssetStoreObject> objects;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(root, std::filesystem::directory_options::skip_permission_denied, ec)) {
+                if (ec) {
+                    report.warnings.push_back("Stopped fast loose native asset scan: " + ec.message());
+                    break;
+                }
+                std::error_code entryError;
+                if (!entry.is_regular_file(entryError)) {
+                    continue;
+                }
+                const NativeAssetKind kind = nativeAssetKindFromExtension(entry.path());
+                if (kind == NativeAssetKind::Unknown || kind == NativeAssetKind::Package) {
+                    continue;
+                }
+                if (kind != NativeAssetKind::Mesh && kind != NativeAssetKind::Material && kind != NativeAssetKind::Texture &&
+                    kind != NativeAssetKind::Skeleton && kind != NativeAssetKind::Animation && kind != NativeAssetKind::AnimationController &&
+                    kind != NativeAssetKind::SkeletalMesh) {
+                    continue;
+                }
+                if (!looseFileAllowed(entry.path())) {
+                    continue;
+                }
+                NativeAssetStoreObject object;
+                object.kind = kind;
+                object.source = NativeAssetStoreSource::LooseFile;
+                object.path = entry.path();
+                object.size = static_cast<uint64_t>(entry.file_size(entryError));
+                object.payloadHashValid = false;
+                objects.push_back(std::move(object));
+            }
+            sortObjectsForRuntimeLoad(objects);
+            for (NativeAssetStoreObject& object : objects) {
+                NativeRuntimeLoadedAsset asset = loadStandalone(object.path, options);
+                if (!asset.guid.empty()) {
+                    object.guid = asset.guid;
+                    objectsByGuid[asset.guid] = object;
+                }
+                addAsset(std::move(asset), &object);
+            }
+            report.ok = report.errors.empty() && (!report.assets.empty());
+            finalizeReport();
+            return report;
+        }
         NativeAssetStore store;
         NativeAssetStoreMountReport mount = store.mountLooseRoot(root);
         report.warnings.insert(report.warnings.end(), mount.warnings.begin(), mount.warnings.end());
@@ -1649,7 +1956,9 @@ nlohmann::json nativeRuntimeLoadReportToJson(const NativeRuntimeLoadReport& repo
             {"children", node.children},
             {"visible", node.visible},
             {"castShadow", node.castShadow},
+            {"receiveShadow", node.receiveShadow},
             {"visibleToCamera", node.visibleToCamera},
+            {"renderLayer", node.renderLayer},
         });
     }
     const nlohmann::json sceneAsset = {
@@ -1707,10 +2016,31 @@ nlohmann::json nativeRuntimeLoadReportToJson(const NativeRuntimeLoadReport& repo
         {"tickets", directStoreTickets},
         {"upload_ticket_queue_simulation", directStoreUploadTicketQueueSimulationJson(report.directStoreUploadPlan)},
     };
+    const nlohmann::json legacyCpuLoadPolicy = {
+        {"available", report.legacyCpuLoadPolicy.available},
+        {"asset_manager_backed", report.legacyCpuLoadPolicy.assetManagerBacked},
+        {"package_backed", report.legacyCpuLoadPolicy.packageBacked},
+        {"loose_backed", report.legacyCpuLoadPolicy.looseBacked},
+        {"estimated_eager_cpu_bytes", report.legacyCpuLoadPolicy.estimatedEagerCpuBytes},
+        {"warning_threshold_bytes", report.legacyCpuLoadPolicy.warningThresholdBytes},
+        {"hard_limit_bytes", report.legacyCpuLoadPolicy.hardLimitBytes},
+        {"allow_large_eager_cpu_load", report.legacyCpuLoadPolicy.allowLargeEagerCpuLoad},
+        {"large_eager_load_warning", report.legacyCpuLoadPolicy.largeEagerLoadWarning},
+        {"hard_limit_exceeded", report.legacyCpuLoadPolicy.hardLimitExceeded},
+        {"streaming_recommended", report.legacyCpuLoadPolicy.streamingRecommended},
+        {"policy", report.legacyCpuLoadPolicy.policy},
+        {"recommended_action", report.legacyCpuLoadPolicy.recommendedAction},
+    };
     return {
         {"ok", report.ok},
+        {"source_root", report.sourceRoot.empty() ? std::string{} : report.sourceRoot.generic_string()},
         {"nativeTextureFormatSupport", nativeTextureFormatSupportJson(report.options.textureFormatSupport)},
         {"rejectUnsupportedTextureFormats", report.options.rejectUnsupportedTextureFormats},
+        {"validatePayloadHashes", report.options.validatePayloadHashes},
+        {"retainLoadedPayloadsInReport", report.options.retainLoadedPayloadsInReport},
+        {"eagerCpuLoadWarningBytes", report.options.eagerCpuLoadWarningBytes},
+        {"eagerCpuLoadHardLimitBytes", report.options.eagerCpuLoadHardLimitBytes},
+        {"allowLargeEagerCpuLoad", report.options.allowLargeEagerCpuLoad},
         {"texture_count", report.textureCount},
         {"material_count", report.materialCount},
         {"mesh_count", report.meshCount},
@@ -1721,6 +2051,7 @@ nlohmann::json nativeRuntimeLoadReportToJson(const NativeRuntimeLoadReport& repo
         {"total_texture_bytes", report.totalTextureBytes},
         {"total_vertex_count", report.totalVertexCount},
         {"total_index_count", report.totalIndexCount},
+        {"legacy_cpu_load_policy", legacyCpuLoadPolicy},
         {"direct_store_upload_plan", directStoreUploadPlan},
         {"scene_asset", sceneAsset},
         {"assets", assets},

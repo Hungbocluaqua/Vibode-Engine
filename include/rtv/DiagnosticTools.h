@@ -2,6 +2,8 @@
 
 #include "rtv/HeadlessDiagnostics.h"
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -144,6 +146,11 @@ void writeCrashDumpPackage(
 [[nodiscard]] int checkBudget(
     const std::filesystem::path& budgetPath,
     const ProfileReport& profile);
+
+[[nodiscard]] int checkStreamingBudget(
+    const std::filesystem::path& budgetPath,
+    const ProfileReport& profile,
+    const nlohmann::json& streamingReport);
 
 [[nodiscard]] std::filesystem::path defaultDiagnosticArtifactDir(
     const std::filesystem::path& scenePath,

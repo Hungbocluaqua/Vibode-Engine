@@ -709,10 +709,18 @@ SceneAsset SceneDocument::toSceneAsset() const {
     scene.skins = sceneSkins_;
 
     std::vector<const Entity*> entities = registry_.entities();
-    std::unordered_map<uint64_t, uint32_t> nodeIndexForEntity;
-    nodeIndexForEntity.reserve(entities.size());
+    uint32_t maxEntityIndex = 0;
+    for (const Entity* entity : entities) {
+        if (entity != nullptr) {
+            maxEntityIndex = std::max(maxEntityIndex, entity->id.index);
+        }
+    }
+    std::vector<int32_t> nodeIndexForEntity(maxEntityIndex + 1u, -1);
     scene.nodes.reserve(entities.size());
     for (const Entity* entity : entities) {
+        if (entity == nullptr) {
+            continue;
+        }
         SceneNodeAsset node;
         node.name = entity->name;
         node.transform = entity->transform.localMatrix();
@@ -726,7 +734,9 @@ SceneAsset SceneDocument::toSceneAsset() const {
             node.skinIndex = entity->meshRenderer->skinIndex;
             node.visible = entity->meshRenderer->visible;
             node.castShadow = entity->meshRenderer->castShadow;
+            node.receiveShadow = entity->meshRenderer->receiveShadow;
             node.visibleToCamera = entity->meshRenderer->visibleToCamera;
+            node.renderLayer = entity->meshRenderer->renderLayer;
             if (node.mesh.valid()) {
                 scene.meshes.push_back(node.mesh);
             }
@@ -737,27 +747,32 @@ SceneAsset SceneDocument::toSceneAsset() const {
                 }
             }
         }
-        nodeIndexForEntity.emplace(entity->uuid, static_cast<uint32_t>(scene.nodes.size()));
+        if (entity->id.index < nodeIndexForEntity.size()) {
+            nodeIndexForEntity[entity->id.index] = static_cast<int32_t>(scene.nodes.size());
+        }
         scene.nodes.push_back(node);
     }
 
     for (size_t i = 0; i < entities.size(); ++i) {
         const Entity* entity = entities[i];
+        if (entity == nullptr || i >= scene.nodes.size()) {
+            continue;
+        }
         SceneNodeAsset& node = scene.nodes[i];
         if (entity->parent.valid()) {
             const Entity* parentEntity = registry_.entity(entity->parent);
-            const uint64_t key = parentEntity != nullptr ? parentEntity->uuid : 0u;
-            const auto it = nodeIndexForEntity.find(key);
-            if (it != nodeIndexForEntity.end()) {
-                node.parent = static_cast<int32_t>(it->second);
+            if (parentEntity != nullptr &&
+                parentEntity->id.index < nodeIndexForEntity.size() &&
+                nodeIndexForEntity[parentEntity->id.index] >= 0) {
+                node.parent = nodeIndexForEntity[parentEntity->id.index];
             }
         }
         for (EntityId child : entity->children) {
             const Entity* childEntity = registry_.entity(child);
-            const uint64_t key = childEntity != nullptr ? childEntity->uuid : 0u;
-            const auto it = nodeIndexForEntity.find(key);
-            if (it != nodeIndexForEntity.end()) {
-                node.children.push_back(it->second);
+            if (childEntity != nullptr &&
+                childEntity->id.index < nodeIndexForEntity.size() &&
+                nodeIndexForEntity[childEntity->id.index] >= 0) {
+                node.children.push_back(static_cast<uint32_t>(nodeIndexForEntity[childEntity->id.index]));
             }
         }
         if (node.parent < 0) {
@@ -990,7 +1005,9 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
             renderer["meshGuid"] = entity.meshRenderer->meshGuid;
             renderer["visible"] = entity.meshRenderer->visible;
             renderer["castShadow"] = entity.meshRenderer->castShadow;
+            renderer["receiveShadow"] = entity.meshRenderer->receiveShadow;
             renderer["visibleToCamera"] = entity.meshRenderer->visibleToCamera;
+            renderer["renderLayer"] = entity.meshRenderer->renderLayer;
             if (!entity.meshRenderer->morphWeights.empty()) {
                 renderer["morphWeights"] = entity.meshRenderer->morphWeights;
             }
@@ -1479,7 +1496,9 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
             renderer.meshGuid = source.value("meshGuid", std::string{});
             renderer.visible = source.value("visible", true);
             renderer.castShadow = source.value("castShadow", true);
+            renderer.receiveShadow = source.value("receiveShadow", true);
             renderer.visibleToCamera = source.value("visibleToCamera", true);
+            renderer.renderLayer = source.value("renderLayer", 0);
             renderer.morphWeights = floatVectorFromJson(source.value("morphWeights", nlohmann::json::array()));
             renderer.skinIndex = source.value("skinIndex", -1);
             renderer.activeMaterialVariantIndex = source.value("activeMaterialVariantIndex", UINT32_MAX);

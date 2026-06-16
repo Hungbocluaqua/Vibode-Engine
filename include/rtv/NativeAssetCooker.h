@@ -65,7 +65,8 @@ public:
     [[nodiscard]] NativeAssetCookResult cookMesh(
         const NativeAssetCookInput& input,
         const MeshAsset& mesh,
-        const std::vector<AssetGuid>& materialGuids) const;
+        const std::vector<AssetGuid>& materialGuids,
+        bool buildLocalBvh = true) const;
 
     [[nodiscard]] NativeAssetCookResult cookMaterial(
         const NativeAssetCookInput& input,

@@ -546,6 +546,7 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(51, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(52, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(54, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(55, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(kStbnScalarTextureBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, allRt),
         descriptorBinding(kStbnScalarSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, allRt),
     };
@@ -1831,12 +1832,10 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
     const bool underBudget = adaptiveSmoothedGpuMs_ <= 0.0f || adaptiveSmoothedGpuMs_ < targetMs * 0.82f;
     const uint32_t stableFramesForFullQuality = mode == 1u ? 6u : (mode == 2u ? 10u : 14u);
 
-    if (moving) {
-        adaptiveQualityTier_ = std::max(adaptiveQualityTier_, std::min(maxTier, mode));
-        adaptiveOverBudgetFrames_ = 0;
-    } else if (overBudget) {
+    if (overBudget) {
         ++adaptiveOverBudgetFrames_;
-        if (adaptiveOverBudgetFrames_ >= 6u) {
+        const uint32_t overBudgetThreshold = moving ? 3u : 6u;
+        if (adaptiveOverBudgetFrames_ >= overBudgetThreshold) {
             adaptiveQualityTier_ = std::min(maxTier, adaptiveQualityTier_ + 1u);
             adaptiveOverBudgetFrames_ = 0;
         }
@@ -1850,15 +1849,12 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
     }
 
     if (adaptiveQualityTier_ == 1u) {
-        adaptiveEffectiveMaxBounces_ = std::max(2u, settings_.maxBounces > 1u ? settings_.maxBounces - 1u : settings_.maxBounces);
         adaptiveEffectiveEnvironmentSamples_ = std::max(1u, settings_.environmentDirectSamples);
         adaptiveEffectiveAtrousIterations_ = std::max(1u, settings_.atrousIterations > 1u ? settings_.atrousIterations - 1u : settings_.atrousIterations);
     } else if (adaptiveQualityTier_ == 2u) {
-        adaptiveEffectiveMaxBounces_ = std::max(2u, std::min(settings_.maxBounces, settings_.maxBounces / 2u));
         adaptiveEffectiveEnvironmentSamples_ = 1u;
         adaptiveEffectiveAtrousIterations_ = std::max(2u, settings_.atrousIterations > 1u ? settings_.atrousIterations - 1u : 1u);
     } else {
-        adaptiveEffectiveMaxBounces_ = std::min(settings_.maxBounces, 2u);
         adaptiveEffectiveEnvironmentSamples_ = 1u;
         adaptiveEffectiveAtrousIterations_ = 1u;
     }
@@ -3228,6 +3224,132 @@ void PathTracerRenderer::resetAccumulation(AccumulationResetReason reason) {
     }
 }
 
+void PathTracerRenderer::applyStreamingResetMasks(
+    const std::vector<uint64_t>& temporalEntityUuids,
+    const std::vector<uint64_t>& restirEntityUuids,
+    const std::vector<uint32_t>& temporalInstanceIndices,
+    const std::vector<uint32_t>& restirInstanceIndices) {
+    if (temporalEntityUuids.empty() && restirEntityUuids.empty() &&
+        temporalInstanceIndices.empty() && restirInstanceIndices.empty()) {
+        return;
+    }
+    ++streamingResetMaskReport_.generation;
+    streamingResetMaskReport_.lastFrame = temporalFrameIndex_;
+    streamingResetMaskReport_.pendingTemporalEntityCount = static_cast<uint32_t>(std::min<size_t>(temporalEntityUuids.size(), UINT32_MAX));
+    streamingResetMaskReport_.pendingRestirEntityCount = static_cast<uint32_t>(std::min<size_t>(restirEntityUuids.size(), UINT32_MAX));
+    streamingResetMaskReport_.pendingDenoiserEntityCount = streamingResetMaskReport_.pendingTemporalEntityCount;
+    streamingResetMaskReport_.totalTemporalEntityCount += streamingResetMaskReport_.pendingTemporalEntityCount;
+    streamingResetMaskReport_.totalRestirEntityCount += streamingResetMaskReport_.pendingRestirEntityCount;
+    streamingResetMaskReport_.totalDenoiserEntityCount += streamingResetMaskReport_.pendingDenoiserEntityCount;
+    if (streamingResetMaskReport_.pendingDenoiserEntityCount > 0) {
+        denoiserHistoryValid_ = false;
+        denoiserFramesSinceReset_ = 0;
+        streamingResetMaskReport_.denoiserHistoryInvalidated = true;
+        streamingResetMaskReport_.denoiserHistoryInvalidationGeneration = streamingResetMaskReport_.generation;
+    } else {
+        streamingResetMaskReport_.denoiserHistoryInvalidated = false;
+    }
+    streamingResetMaskReport_.temporalEntityUuids = temporalEntityUuids;
+    streamingResetMaskReport_.restirEntityUuids = restirEntityUuids;
+    streamingResetMaskReport_.temporalInstanceIndices = temporalInstanceIndices;
+    streamingResetMaskReport_.restirInstanceIndices = restirInstanceIndices;
+    std::vector<StreamingResetMaskGpuRecord> records;
+    records.reserve(temporalEntityUuids.size() + restirEntityUuids.size());
+    const uint32_t generation = static_cast<uint32_t>(std::min<uint64_t>(streamingResetMaskReport_.generation, UINT32_MAX));
+    for (uint64_t uuid : temporalEntityUuids) {
+        records.push_back({
+            .entityUuid = uuid,
+            .flags = 1u,
+            .generation = generation,
+        });
+    }
+    for (uint64_t uuid : restirEntityUuids) {
+        records.push_back({
+            .entityUuid = uuid,
+            .flags = 2u,
+            .generation = generation,
+        });
+    }
+    const uint32_t recordCount = static_cast<uint32_t>(std::min<size_t>(records.size(), UINT32_MAX));
+    const VkDeviceSize requiredBytes = std::max<VkDeviceSize>(sizeof(StreamingResetMaskGpuRecord), records.size() * sizeof(StreamingResetMaskGpuRecord));
+    if (streamingResetMaskBuffer_.handle() == VK_NULL_HANDLE || streamingResetMaskBuffer_.size() < requiredBytes) {
+        const VkDeviceSize nextCapacityBytes = std::max<VkDeviceSize>(requiredBytes, 64ull * sizeof(StreamingResetMaskGpuRecord));
+        streamingResetMaskBuffer_.create(allocator_, BufferDesc{
+            .size = nextCapacityBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .memory = BufferMemory::Upload,
+            .persistentMapped = true,
+            .debugName = "streaming reset mask records",
+        });
+    }
+    if (!records.empty()) {
+        streamingResetMaskBuffer_.write(records.data(), records.size() * sizeof(StreamingResetMaskGpuRecord));
+        streamingResetMaskBuffer_.flush(records.size() * sizeof(StreamingResetMaskGpuRecord));
+    }
+    streamingResetMaskReport_.gpuRecordCount = recordCount;
+    streamingResetMaskReport_.gpuRecordCapacity = static_cast<uint32_t>(
+        std::min<uint64_t>(streamingResetMaskBuffer_.size() / sizeof(StreamingResetMaskGpuRecord), UINT32_MAX));
+    streamingResetMaskReport_.gpuBufferBytes = streamingResetMaskBuffer_.size();
+    streamingResetMaskReport_.gpuBufferAllocated = streamingResetMaskBuffer_.handle() != VK_NULL_HANDLE;
+
+    uint32_t maxInstanceIndex = 0;
+    bool hasInstanceMask = false;
+    for (uint32_t instanceIndex : temporalInstanceIndices) {
+        if (instanceIndex != UINT32_MAX) {
+            maxInstanceIndex = std::max(maxInstanceIndex, instanceIndex);
+            hasInstanceMask = true;
+        }
+    }
+    for (uint32_t instanceIndex : restirInstanceIndices) {
+        if (instanceIndex != UINT32_MAX) {
+            maxInstanceIndex = std::max(maxInstanceIndex, instanceIndex);
+            hasInstanceMask = true;
+        }
+    }
+    if (hasInstanceMask) {
+        const VkDeviceSize minMaskBytes = static_cast<VkDeviceSize>((static_cast<uint64_t>(maxInstanceIndex) + 1ull) * sizeof(uint32_t));
+        if (streamingResetInstanceMaskBuffer_.handle() == VK_NULL_HANDLE || streamingResetInstanceMaskBuffer_.size() < minMaskBytes) {
+            const VkDeviceSize nextCapacityBytes = std::max<VkDeviceSize>(minMaskBytes, static_cast<VkDeviceSize>(64ull * sizeof(uint32_t)));
+            streamingResetInstanceMaskBuffer_.create(allocator_, BufferDesc{
+                .size = nextCapacityBytes,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .memory = BufferMemory::Upload,
+                .persistentMapped = true,
+                .debugName = "streaming reset instance masks",
+            });
+        }
+        const size_t maskCapacity = static_cast<size_t>(streamingResetInstanceMaskBuffer_.size() / sizeof(uint32_t));
+        std::vector<uint32_t> instanceMasks(maskCapacity, 0u);
+        for (uint32_t instanceIndex : temporalInstanceIndices) {
+            if (instanceIndex < instanceMasks.size()) {
+                instanceMasks[instanceIndex] |= 1u;
+            }
+        }
+        for (uint32_t instanceIndex : restirInstanceIndices) {
+            if (instanceIndex < instanceMasks.size()) {
+                instanceMasks[instanceIndex] |= 2u;
+            }
+        }
+        const VkDeviceSize maskBytes = static_cast<VkDeviceSize>(instanceMasks.size() * sizeof(uint32_t));
+        streamingResetInstanceMaskBuffer_.write(instanceMasks.data(), maskBytes);
+        streamingResetInstanceMaskBuffer_.flush(maskBytes);
+        streamingResetMaskReport_.gpuInstanceMaskCount = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(maxInstanceIndex) + 1ull, UINT32_MAX));
+        streamingResetMaskReport_.gpuInstanceMaskCapacity = static_cast<uint32_t>(
+            std::min<uint64_t>(streamingResetInstanceMaskBuffer_.size() / sizeof(uint32_t), UINT32_MAX));
+    } else {
+        streamingResetMaskReport_.gpuInstanceMaskCount = 0;
+    }
+    streamingResetMaskReport_.gpuInstanceMaskBufferBytes = streamingResetInstanceMaskBuffer_.size();
+    streamingResetMaskReport_.gpuInstanceMaskBufferAllocated = streamingResetInstanceMaskBuffer_.handle() != VK_NULL_HANDLE;
+    validationLog_.recordPass(
+        "streaming reset masks temporal=" + std::to_string(streamingResetMaskReport_.pendingTemporalEntityCount) +
+        " restir=" + std::to_string(streamingResetMaskReport_.pendingRestirEntityCount) +
+        " denoiser=" + std::to_string(streamingResetMaskReport_.pendingDenoiserEntityCount) +
+        " gpu_records=" + std::to_string(streamingResetMaskReport_.gpuRecordCount) +
+        " instance_masks=" + std::to_string(streamingResetMaskReport_.gpuInstanceMaskCount) +
+        " generation=" + std::to_string(streamingResetMaskReport_.generation));
+}
+
 void PathTracerRenderer::loadEnvironment(const std::filesystem::path& path) {
     const uint64_t retireFrame = temporalFrameIndex_ + static_cast<uint32_t>(std::max<size_t>(frames_.size(), 1)) + 1u;
     scene_.loadEnvironment(uploader_, path, retireFrame);
@@ -4037,6 +4159,8 @@ void PathTracerRenderer::retireResolutionResources() {
     retireBuffer(velocityBuffer_);
     retireBuffer(entityIdBuffer_);
     retireBuffer(pathDataBuffer_);
+    retireBuffer(streamingResetMaskBuffer_);
+    retireBuffer(streamingResetInstanceMaskBuffer_);
     retireBuffer(rayTracingDiagnosticCountersBuffer_);
     retireBuffer(rayTracingDiagnosticCountersReadbackBuffer_);
     retireBuffer(wavefrontRayQueueBuffer_);
@@ -4459,6 +4583,21 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .memory = BufferMemory::GpuOnly,
         .debugName = "path data channels",
     });
+    streamingResetInstanceMaskBuffer_.create(allocator_, BufferDesc{
+        .size = 64ull * sizeof(uint32_t),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory = BufferMemory::Upload,
+        .persistentMapped = true,
+        .debugName = "streaming reset instance masks",
+    });
+    {
+        const std::array<uint32_t, 64> zeroMasks{};
+        streamingResetInstanceMaskBuffer_.write(zeroMasks.data(), zeroMasks.size() * sizeof(uint32_t));
+        streamingResetInstanceMaskBuffer_.flush(zeroMasks.size() * sizeof(uint32_t));
+        streamingResetMaskReport_.gpuInstanceMaskCapacity = static_cast<uint32_t>(zeroMasks.size());
+        streamingResetMaskReport_.gpuInstanceMaskBufferBytes = streamingResetInstanceMaskBuffer_.size();
+        streamingResetMaskReport_.gpuInstanceMaskBufferAllocated = streamingResetInstanceMaskBuffer_.handle() != VK_NULL_HANDLE;
+    }
     rayTracingDiagnosticCountersBuffer_.create(allocator_, BufferDesc{
         .size = kRayTracingDiagnosticCounterCount * sizeof(uint32_t),
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -7843,7 +7982,8 @@ void PathTracerRenderer::writeRayTracingDescriptors(
         .writeBuffer(45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialReservoirBuffer_.descriptorInfo())
         .writeBuffer(46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(47, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
-        .writeBuffer(48, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingDiagnosticCountersBuffer_.descriptorInfo());
+        .writeBuffer(48, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingDiagnosticCountersBuffer_.descriptorInfo())
+        .writeBuffer(55, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, streamingResetInstanceMaskBuffer_.descriptorInfo());
     writeStbnDescriptors(writer);
     const Buffer& wavefrontRayQueue = wavefrontRayQueueOverride != nullptr ? *wavefrontRayQueueOverride : wavefrontRayQueueBuffer_;
     if (includeWavefrontQueues &&
@@ -8464,11 +8604,14 @@ bool PathTracerRenderer::recordNrdDispatches(VkCommandBuffer commandBuffer) {
         return false;
     }
     nrd::ReblurSettings reblur{};
+    reblur.hitDistanceParameters.A = 3.0f;
+    reblur.hitDistanceParameters.B = 0.1f;
+    reblur.hitDistanceParameters.C = 20.0f;
     reblur.maxAccumulatedFrameNum = std::min(effectiveDenoiserMaxHistoryLength(), nrd::REBLUR_MAX_HISTORY_FRAME_NUM);
-    reblur.maxFastAccumulatedFrameNum = std::min(4u, reblur.maxAccumulatedFrameNum);
-    reblur.maxStabilizedFrameNum = std::min(12u, reblur.maxAccumulatedFrameNum);
-    reblur.historyFixFrameNum = std::min(2u, reblur.maxFastAccumulatedFrameNum > 0u ? reblur.maxFastAccumulatedFrameNum - 1u : 0u);
-    reblur.fastHistoryClampingSigmaScale = 1.5f;
+    reblur.maxFastAccumulatedFrameNum = std::min(6u, reblur.maxAccumulatedFrameNum);
+    reblur.maxStabilizedFrameNum = reblur.maxAccumulatedFrameNum;
+    reblur.historyFixFrameNum = std::min(3u, reblur.maxFastAccumulatedFrameNum > 0u ? reblur.maxFastAccumulatedFrameNum - 1u : 0u);
+    reblur.fastHistoryClampingSigmaScale = 2.0f;
     reblur.responsiveAccumulationSettings.roughnessThreshold = 0.35f;
     reblur.responsiveAccumulationSettings.minAccumulatedFrameNum = std::min(1u, reblur.historyFixFrameNum);
     result = nrd::SetDenoiserSettings(*runtime.instance, 1u, &reblur);
@@ -8616,6 +8759,7 @@ void PathTracerRenderer::recordNrdResolvePass(VkCommandBuffer commandBuffer) {
         .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
         .writeImage(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, denoisedImage_.storageDescriptor())
         .writeBuffer(6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
+        .writeBuffer(7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
         .update(context_.device(), set);
 
     nrdResolvePipeline_->bind(commandBuffer);
@@ -8812,6 +8956,8 @@ void PathTracerRenderer::recordMomentUpdatePass(VkCommandBuffer commandBuffer) {
         .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
         .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, worldPositionBuffer_.descriptorInfo())
         .writeImage(17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, momentDebugResolvedImage_.storageDescriptor())
+        .writeBuffer(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, entityIdBuffer_.descriptorInfo())
+        .writeBuffer(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, streamingResetInstanceMaskBuffer_.descriptorInfo())
         .update(context_.device(), set);
 
     momentUpdatePipeline_->bind(commandBuffer);
@@ -10701,6 +10847,8 @@ void PathTracerRenderer::recordTaaPass(VkCommandBuffer commandBuffer) {
         .writeBuffer(5, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
         .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
         .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeBuffer(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, entityIdBuffer_.descriptorInfo())
+        .writeBuffer(9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, streamingResetInstanceMaskBuffer_.descriptorInfo())
         .update(context_.device(), set);
 
     taaPipeline_->bind(commandBuffer);

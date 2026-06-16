@@ -35,6 +35,7 @@ enum class NativeAssetKind : uint32_t {
 enum class NativeChunkCompression : uint32_t {
     None = 0,
     ReservedZstd = 1,
+    ReservedGDeflate = 2,
 };
 
 enum class NativeDependencyFlags : uint32_t {
@@ -239,6 +240,19 @@ enum class NativeTextureRole : uint32_t {
     Height = 9,
     EnvironmentHdr = 10,
     Data = 11,
+    Specular = 12,
+    SpecularColor = 13,
+    Transmission = 14,
+    Clearcoat = 15,
+    ClearcoatRoughness = 16,
+    ClearcoatNormal = 17,
+    Sheen = 18,
+    SheenColor = 19,
+    SheenRoughness = 20,
+    Iridescence = 21,
+    IridescenceThickness = 22,
+    Anisotropy = 23,
+    Thickness = 24,
 };
 
 enum class NativeTextureCompressionPolicy : uint32_t {

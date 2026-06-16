@@ -18,6 +18,7 @@ struct PathDataRecord {
     vec4 denoiser_hit_distance;
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
 };
 layout(set = 0, binding = 2, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 
@@ -26,7 +27,6 @@ layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D out_normal_rough
 layout(set = 0, binding = 5, r32f) writeonly uniform image2D out_view_z;
 layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D out_diff_radiance_hitdist;
 layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D out_spec_radiance_hitdist;
-
 layout(set = 0, binding = 8, std140) uniform TaaParams {
     uint enabled;
     uint frame_count;
@@ -114,12 +114,6 @@ vec3 nrd_diffuse_material_factor(PathDataRecord path) {
     return max(path.albedo_roughness_hit_confidence.rgb, vec3(0.02));
 }
 
-vec3 nrd_specular_material_factor(PathDataRecord path, float roughness) {
-    vec3 specular = max(path.material_specular_albedo.rgb, vec3(0.0));
-    specular *= mix(0.10, 1.0, clamp(roughness, 0.0, 1.0));
-    return max(specular, vec3(0.02));
-}
-
 float nrd_spec_magic_curve(float roughness) {
     float f = 1.0 - exp2(-200.0 * roughness * roughness);
     f *= pow(clamp(roughness, 0.0, 1.0), 0.5);
@@ -127,32 +121,93 @@ float nrd_spec_magic_curve(float roughness) {
 }
 
 const vec3 NRD_REBLUR_HIT_DISTANCE_PARAMS = vec3(3.0, 0.1, 20.0);
+const float NRD_DENOISING_RANGE = 500000.0;
+const float NRD_MATERIAL_FACTOR_MIN_SCALE = 0.02;
+const float NRD_ROUGHNESS_FACTOR_MIN_SCALE = 0.1;
+
+bool nrd_invalid_float(float value) {
+    return isnan(value) || isinf(value);
+}
+
+bool nrd_invalid_vec3(vec3 value) {
+    return any(isnan(value)) || any(isinf(value));
+}
 
 float reblur_norm_hit_distance(float hitDistance, float viewZ, float roughness) {
+    if (nrd_invalid_float(hitDistance) || nrd_invalid_float(viewZ) || nrd_invalid_float(roughness)) {
+        return 0.0;
+    }
     float smc = nrd_spec_magic_curve(roughness);
     float scale = (NRD_REBLUR_HIT_DISTANCE_PARAMS.x + abs(viewZ) * NRD_REBLUR_HIT_DISTANCE_PARAMS.y) *
         mix(NRD_REBLUR_HIT_DISTANCE_PARAMS.z, 1.0, smc);
     return max(clamp(max(hitDistance, 0.0) / max(scale, 1.0e-4), 0.0, 1.0), 1.0e-6);
 }
 
-float path_distance_to_view_depth(ivec2 coords, ivec2 dims, float pathDistance) {
+vec3 primary_ray_direction(ivec2 coords, ivec2 dims) {
     vec2 jitter = camera.path_tracing_enabled != 0u ? vec2(0.5) + camera.jitter.xy : vec2(0.5);
     vec2 uv = (vec2(coords) + jitter) / vec2(max(dims, ivec2(1)));
     vec2 ndc = uv * 2.0 - vec2(1.0);
     if (camera.projection_controls.x >= 0.5) {
-        return clamp(pathDistance, 0.0, 65504.0);
+        return normalize(camera.forward.xyz);
     }
     float viewportAspect = float(dims.x) / max(float(dims.y), 1.0);
     float authoredAspect = camera.projection_controls.y > 0.0 ? camera.projection_controls.y : viewportAspect;
     float scale = tan(camera.fov_y * 0.5);
-    vec3 rayDir = normalize(camera.forward.xyz + camera.right.xyz * ndc.x * authoredAspect * scale - camera.up.xyz * ndc.y * scale);
+    return normalize(camera.forward.xyz + camera.right.xyz * ndc.x * authoredAspect * scale - camera.up.xyz * ndc.y * scale);
+}
+
+float path_distance_to_view_depth(ivec2 coords, ivec2 dims, float pathDistance) {
+    if (camera.projection_controls.x >= 0.5) {
+        return clamp(pathDistance, 0.0, NRD_DENOISING_RANGE);
+    }
+    vec3 rayDir = primary_ray_direction(coords, dims);
     float forwardCos = max(dot(rayDir, normalize(camera.forward.xyz)), 1.0e-4);
-    return clamp(pathDistance * forwardCos, 0.0, 65504.0);
+    return clamp(pathDistance * forwardCos, 0.0, NRD_DENOISING_RANGE);
+}
+
+vec3 nrd_environment_term_rtg(vec3 rf0, float noV, float roughness) {
+    float m = clamp(roughness * roughness, 0.0, 1.0);
+    vec4 x = vec4(1.0, noV, noV * noV, noV * noV * noV);
+    vec4 y = vec4(1.0, m, m * m, m * m * m);
+
+    mat2 m1 = mat2(0.99044, 1.29678, -1.28514, -0.755907);
+    mat3 m2 = mat3(1.0, 20.3225, 121.563, 2.92338, -27.0302, 626.13, 59.4188, 222.592, 316.627);
+    mat2 m3 = mat2(0.0365463, 9.0632, 3.32707, -9.04756);
+    mat3 m4 = mat3(1.0, 9.04401, 5.56589, 3.59685, -16.3174, 19.7886, -1.36772, 9.22949, -20.2123);
+
+    float bias = dot(m1 * x.xy, y.xy) / max(dot(m2 * x.xyw, y.xyw), 1.0e-6);
+    float scale = dot(m3 * x.xy, y.xy) / max(dot(m4 * x.xzw, y.xyw), 1.0e-6);
+    return clamp(rf0 * scale + bias, vec3(0.0), vec3(1.0));
+}
+
+void nrd_material_factors(vec3 normal, vec3 view, PathDataRecord path, float roughness, out vec3 diffFactor, out vec3 specFactor) {
+    float noV = abs(dot(normalize(normal), normalize(view)));
+    vec3 albedo = clamp(path.albedo_roughness_hit_confidence.rgb, vec3(0.0), vec3(1.0));
+    vec3 rf0 = clamp(path.material_specular_albedo.rgb, vec3(0.0), vec3(1.0));
+    vec3 fenv = nrd_environment_term_rtg(rf0, noV, roughness);
+    diffFactor = mix(vec3(NRD_MATERIAL_FACTOR_MIN_SCALE), vec3(1.0), (vec3(1.0) - fenv) * albedo);
+    specFactor = fenv * mix(vec3(NRD_ROUGHNESS_FACTOR_MIN_SCALE), vec3(1.0), vec3(roughness));
+    specFactor = mix(vec3(NRD_MATERIAL_FACTOR_MIN_SCALE), vec3(1.0), specFactor);
+}
+
+vec4 pack_nrd_normal_roughness(vec3 normal, float roughness) {
+    vec3 n = normalize(normal);
+    n /= max(max(abs(n.x), abs(n.y)), abs(n.z));
+    return vec4(n, roughness);
 }
 
 vec4 pack_reblur_radiance_hitdist(vec3 radiance, float normHitDistance) {
+    radiance = nrd_invalid_vec3(radiance) ? vec3(0.0) : radiance;
+    normHitDistance = nrd_invalid_float(normHitDistance) ? 0.0 : normHitDistance;
     radiance = clamp(max(radiance, vec3(0.0)), vec3(0.0), vec3(65504.0));
     return vec4(nrd_linear_to_ycocg(radiance), clamp(normHitDistance, 0.0, 1.0));
+}
+
+float valid_reblur_norm_hit_distance(float hitDistance, float viewZ, float roughness, float signalLuminance) {
+    if (signalLuminance <= 1.0e-5 || hitDistance <= 0.001 || nrd_invalid_float(hitDistance)) {
+        return 0.0;
+    }
+    return reblur_norm_hit_distance(hitDistance, viewZ, roughness);
 }
 
 void main() {
@@ -166,9 +221,9 @@ void main() {
     uvec4 packedDepthNormal = depth_normal_buffer[pixelIndex];
     float pathDistance = uintBitsToFloat(packedDepthNormal.x);
     bool surface = pathDistance < 1.0e9;
-    float viewZ = surface ? path_distance_to_view_depth(coords, dims, pathDistance) : 65504.0;
+    float viewZ = surface ? path_distance_to_view_depth(coords, dims, pathDistance) : NRD_DENOISING_RANGE + 1.0;
     if (!surface) {
-        viewZ = 65504.0;
+        viewZ = NRD_DENOISING_RANGE + 1.0;
     }
 
     vec3 normal = surface ? decode_octahedral_normal(packedDepthNormal.y) : vec3(0.0, 0.0, 1.0);
@@ -180,25 +235,29 @@ void main() {
         ? vec2(0.0)
         : -currentToPreviousPixels;
 
-    vec3 diffMaterialFactor = nrd_diffuse_material_factor(path);
-    vec3 specMaterialFactor = nrd_specular_material_factor(path, roughness);
-    vec3 diffRadiance = max(path.direct_diffuse.rgb + path.indirect_diffuse.rgb, vec3(0.0)) / diffMaterialFactor;
-    vec3 specRadiance = max(path.direct_specular.rgb + path.indirect_specular.rgb, vec3(0.0)) / specMaterialFactor;
-    float primaryHitDistance = path.direct_specular.a;
+    vec3 view = -primary_ray_direction(coords, dims);
+    vec3 diffMaterialFactor;
+    vec3 specMaterialFactor;
+    nrd_material_factors(normal, view, path, roughness, diffMaterialFactor, specMaterialFactor);
+    vec3 noisyDiffuse = max(path.direct_diffuse.rgb + path.indirect_diffuse.rgb + path.emissive_residual.rgb, vec3(0.0));
+    vec3 noisySpecular = max(path.direct_specular.rgb + path.indirect_specular.rgb, vec3(0.0));
+
+    vec3 diffRadiance = noisyDiffuse / diffMaterialFactor;
+    vec3 specRadiance = noisySpecular / specMaterialFactor;
     float diffHitDistance = path.denoiser_hit_distance.x;
     float specHitDistance = path.denoiser_hit_distance.y;
-    diffHitDistance = diffHitDistance > 0.001 && diffHitDistance < 65000.0 ? diffHitDistance : primaryHitDistance;
-    specHitDistance = specHitDistance > 0.001 && specHitDistance < 65000.0 ? specHitDistance : primaryHitDistance;
+    float diffNormHitDistance = valid_reblur_norm_hit_distance(diffHitDistance, viewZ, 1.0, nrd_luminance(noisyDiffuse));
+    float specNormHitDistance = valid_reblur_norm_hit_distance(specHitDistance, viewZ, roughness, nrd_luminance(noisySpecular));
     if (!surface) {
         diffRadiance = vec3(0.0);
         specRadiance = vec3(0.0);
-        diffHitDistance = 0.0;
-        specHitDistance = 0.0;
+        diffNormHitDistance = 0.0;
+        specNormHitDistance = 0.0;
     }
 
     imageStore(out_motion_vectors, coords, vec4(previousMinusCurrentPixels, 0.0, 0.0));
-    imageStore(out_normal_roughness, coords, vec4(normal, roughness));
+    imageStore(out_normal_roughness, coords, pack_nrd_normal_roughness(normal, roughness));
     imageStore(out_view_z, coords, vec4(viewZ, 0.0, 0.0, 0.0));
-    imageStore(out_diff_radiance_hitdist, coords, pack_reblur_radiance_hitdist(diffRadiance, reblur_norm_hit_distance(diffHitDistance, viewZ, 1.0)));
-    imageStore(out_spec_radiance_hitdist, coords, pack_reblur_radiance_hitdist(specRadiance, reblur_norm_hit_distance(specHitDistance, viewZ, roughness)));
+    imageStore(out_diff_radiance_hitdist, coords, pack_reblur_radiance_hitdist(diffRadiance, diffNormHitDistance));
+    imageStore(out_spec_radiance_hitdist, coords, pack_reblur_radiance_hitdist(specRadiance, specNormHitDistance));
 }

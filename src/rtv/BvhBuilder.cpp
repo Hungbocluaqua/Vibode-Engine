@@ -48,6 +48,10 @@ void buildTriangleFrame(BvhTriangle& tri) {
     return len2 > 1.0e-10f ? v / std::sqrt(len2) : fallback;
 }
 
+[[nodiscard]] bool validTangent(glm::vec4 tangent) {
+    return glm::dot(glm::vec3(tangent), glm::vec3(tangent)) > 1.0e-10f;
+}
+
 } // namespace
 
 BvhBuildResult buildBvh(
@@ -59,8 +63,9 @@ BvhBuildResult buildBvh(
     const std::vector<glm::vec4>* tangents,
     BvhBuildQuality quality) {
     BvhBuildResult result;
-    result.triangles.reserve(indices.size() / 3);
-    for (size_t i = 0; i < indices.size() / 3; ++i) {
+    const size_t triangleCount = indices.size() / 3;
+    result.triangles.reserve(triangleCount);
+    for (size_t i = 0; i < triangleCount; ++i) {
         const glm::vec3 v0 = vertices[indices[i * 3 + 0]];
         const glm::vec3 v1 = vertices[indices[i * 3 + 1]];
         const glm::vec3 v2 = vertices[indices[i * 3 + 2]];
@@ -70,7 +75,7 @@ BvhBuildResult buildBvh(
         const float normalLen2 = glm::dot(normal, normal);
         normal = normalLen2 > 0.0f ? normal / std::sqrt(normalLen2) : glm::vec3(0.0f, 1.0f, 0.0f);
 
-        BvhTriangle tri;
+        BvhTriangle& tri = result.triangles.emplace_back();
         tri.v0 = v0;
         tri.v1 = v1;
         tri.v2 = v2;
@@ -86,10 +91,6 @@ BvhBuildResult buildBvh(
         tri.n0 = normal;
         tri.n1 = normal;
         tri.n2 = normal;
-        buildTriangleFrame(tri);
-        tri.t0 = {tri.tangent, 1.0f};
-        tri.t1 = {tri.tangent, 1.0f};
-        tri.t2 = {tri.tangent, 1.0f};
         if (normals != nullptr &&
             indices[i * 3 + 0] < normals->size() &&
             indices[i * 3 + 1] < normals->size() &&
@@ -98,23 +99,33 @@ BvhBuildResult buildBvh(
             tri.n1 = normalizedOr((*normals)[indices[i * 3 + 1]], normal);
             tri.n2 = normalizedOr((*normals)[indices[i * 3 + 2]], normal);
         }
-        if (tangents != nullptr &&
+        const bool hasTangents = tangents != nullptr &&
             indices[i * 3 + 0] < tangents->size() &&
             indices[i * 3 + 1] < tangents->size() &&
-            indices[i * 3 + 2] < tangents->size()) {
+            indices[i * 3 + 2] < tangents->size();
+        if (hasTangents) {
             const glm::vec4 src0 = (*tangents)[indices[i * 3 + 0]];
             const glm::vec4 src1 = (*tangents)[indices[i * 3 + 1]];
             const glm::vec4 src2 = (*tangents)[indices[i * 3 + 2]];
-            tri.t0 = {normalizedOr(glm::vec3(src0), tri.tangent), src0.w < 0.0f ? -1.0f : 1.0f};
-            tri.t1 = {normalizedOr(glm::vec3(src1), tri.tangent), src1.w < 0.0f ? -1.0f : 1.0f};
-            tri.t2 = {normalizedOr(glm::vec3(src2), tri.tangent), src2.w < 0.0f ? -1.0f : 1.0f};
+            const bool allTangentsValid = validTangent(src0) && validTangent(src1) && validTangent(src2);
+            if (!allTangentsValid) {
+                buildTriangleFrame(tri);
+            }
+            const glm::vec3 fallback = allTangentsValid ? glm::vec3(1.0f, 0.0f, 0.0f) : tri.tangent;
+            tri.t0 = {normalizedOr(glm::vec3(src0), fallback), src0.w < 0.0f ? -1.0f : 1.0f};
+            tri.t1 = {normalizedOr(glm::vec3(src1), fallback), src1.w < 0.0f ? -1.0f : 1.0f};
+            tri.t2 = {normalizedOr(glm::vec3(src2), fallback), src2.w < 0.0f ? -1.0f : 1.0f};
+        } else {
+            buildTriangleFrame(tri);
+            tri.t0 = {tri.tangent, 1.0f};
+            tri.t1 = {tri.tangent, 1.0f};
+            tri.t2 = {tri.tangent, 1.0f};
         }
         tri.boundsMin = minVec(minVec(v0, v1), v2) - glm::vec3(triangleBoundsPadding);
         tri.boundsMax = maxVec(maxVec(v0, v1), v2) + glm::vec3(triangleBoundsPadding);
         tri.centroid = (v0 + v1 + v2) / 3.0f;
         tri.material = i < faceMaterials.size() ? faceMaterials[i] : 0u;
         tri.sourceIndex = static_cast<uint32_t>(i);
-        result.triangles.push_back(tri);
     }
 
     if (quality == BvhBuildQuality::MortonFast) {
@@ -129,6 +140,12 @@ BvhBuildResult buildBvh(
 std::vector<glm::vec4> packBvhNodesForGpu(const std::vector<PackedBvhNode>& nodes) {
     std::vector<glm::vec4> packed;
     packed.reserve(nodes.size() * 4);
+    appendBvhNodesForGpu(nodes, packed);
+    return packed;
+}
+
+void appendBvhNodesForGpu(const std::vector<PackedBvhNode>& nodes, std::vector<glm::vec4>& packed) {
+    packed.reserve(packed.size() + nodes.size() * 4);
     for (const PackedBvhNode& node : nodes) {
         packed.push_back({node.boundsMin, node.leaf ? 1.0f : 0.0f});
         packed.push_back({node.boundsMax, node.rope >= 0 ? static_cast<float>(node.rope + 1) : 0.0f});
@@ -144,12 +161,17 @@ std::vector<glm::vec4> packBvhNodesForGpu(const std::vector<PackedBvhNode>& node
         }
         packed.push_back({static_cast<float>(node.childCount), static_cast<float>(node.mortonFirst), 0.0f, 0.0f});
     }
-    return packed;
 }
 
 std::vector<glm::vec4> packTrianglesForGpu(const BvhBuildResult& bvh) {
     std::vector<glm::vec4> packed;
     packed.reserve(bvh.leafTriangleIndices.size() * 12);
+    appendTrianglesForGpu(bvh, packed);
+    return packed;
+}
+
+void appendTrianglesForGpu(const BvhBuildResult& bvh, std::vector<glm::vec4>& packed) {
+    packed.reserve(packed.size() + bvh.leafTriangleIndices.size() * 12);
     for (uint32_t idx : bvh.leafTriangleIndices) {
         const BvhTriangle& tri = bvh.triangles[idx];
         packed.push_back({tri.v0, 0.0f});
@@ -165,7 +187,6 @@ std::vector<glm::vec4> packTrianglesForGpu(const BvhBuildResult& bvh) {
         packed.push_back(tri.t1);
         packed.push_back(tri.t2);
     }
-    return packed;
 }
 
 } // namespace rtv

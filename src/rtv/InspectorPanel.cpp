@@ -1428,7 +1428,9 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
             bool deformationChanged = false;
             visibilityChanged |= inspectorCheckboxRow("Visible", &renderer.visible);
             visibilityChanged |= inspectorCheckboxRow("Cast Shadow", &renderer.castShadow);
+            visibilityChanged |= inspectorCheckboxRow("Receive Shadow", &renderer.receiveShadow);
             visibilityChanged |= inspectorCheckboxRow("Visible To Camera", &renderer.visibleToCamera);
+            visibilityChanged |= inspectorDragIntRow("Render Layer", &renderer.renderLayer, 1.0f, 0, 255);
             inspectorReadonlyRow("Mesh Asset", std::to_string(renderer.mesh.index));
             inspectorReadonlyRow("Renderer Instance Cache", std::to_string(renderer.rendererInstanceIndex));
             const MeshAsset* rendererMesh = nullptr;

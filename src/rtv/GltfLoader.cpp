@@ -12,6 +12,7 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <sstream>
@@ -35,6 +37,7 @@ namespace {
 
 struct AccessorView {
     const uint8_t* data = nullptr;
+    std::shared_ptr<std::vector<uint8_t>> ownedData;
     size_t count = 0;
     size_t byteStride = 0;
     size_t elementSize = 0;
@@ -54,6 +57,54 @@ struct AccessorView {
     }
     out = a * b;
     return true;
+}
+
+[[nodiscard]] const uint8_t* bufferRangeData(
+    const tinygltf::Model& model,
+    int bufferViewIndex,
+    size_t byteOffset,
+    size_t byteLength,
+    std::string_view label) {
+    if (bufferViewIndex < 0 || static_cast<size_t>(bufferViewIndex) >= model.bufferViews.size()) {
+        std::cerr << "glTF accessor warning: " << label << " references invalid bufferView " << bufferViewIndex << "\n";
+        return nullptr;
+    }
+    const tinygltf::BufferView& view = model.bufferViews[static_cast<size_t>(bufferViewIndex)];
+    if (view.buffer < 0 || static_cast<size_t>(view.buffer) >= model.buffers.size()) {
+        std::cerr << "glTF accessor warning: " << label << " references invalid buffer " << view.buffer << "\n";
+        return nullptr;
+    }
+    const tinygltf::Buffer& buffer = model.buffers[static_cast<size_t>(view.buffer)];
+    const size_t viewByteOffset = static_cast<size_t>(view.byteOffset);
+    const size_t viewByteLength = static_cast<size_t>(view.byteLength);
+    size_t viewEnd = 0;
+    if (!checkedAdd(viewByteOffset, viewByteLength, viewEnd) || viewEnd > buffer.data.size()) {
+        std::cerr << "glTF accessor warning: " << label << " bufferView range exceeds buffer size\n";
+        return nullptr;
+    }
+    size_t rangeEnd = 0;
+    if (!checkedAdd(byteOffset, byteLength, rangeEnd) || rangeEnd > viewByteLength) {
+        std::cerr << "glTF accessor warning: " << label << " range exceeds bufferView length\n";
+        return nullptr;
+    }
+    return buffer.data.data() + viewByteOffset + byteOffset;
+}
+
+[[nodiscard]] uint32_t readSparseIndexComponent(const uint8_t* src, int componentType) {
+    if (componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
+        return *src;
+    }
+    if (componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+        uint16_t value = 0;
+        std::memcpy(&value, src, sizeof(value));
+        return value;
+    }
+    if (componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
+        uint32_t value = 0;
+        std::memcpy(&value, src, sizeof(value));
+        return value;
+    }
+    return UINT32_MAX;
 }
 
 [[nodiscard]] const char* accessorTypeName(int type) {
@@ -156,17 +207,6 @@ enum class FloatAttributeComponentPolicy {
                   << " but got " << componentTypeName(accessor.componentType) << "; skipping attribute\n";
         return std::nullopt;
     }
-    if (accessor.bufferView < 0 || static_cast<size_t>(accessor.bufferView) >= model.bufferViews.size()) {
-        std::cerr << "glTF accessor warning: " << label << " references invalid bufferView " << accessor.bufferView << "\n";
-        return std::nullopt;
-    }
-
-    const tinygltf::BufferView& view = model.bufferViews[static_cast<size_t>(accessor.bufferView)];
-    if (view.buffer < 0 || static_cast<size_t>(view.buffer) >= model.buffers.size()) {
-        std::cerr << "glTF accessor warning: " << label << " references invalid buffer " << view.buffer << "\n";
-        return std::nullopt;
-    }
-
     const int componentSizeInt = tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(accessor.componentType));
     const int componentCountInt = tinygltf::GetNumComponentsInType(static_cast<uint32_t>(accessor.type));
     if (componentSizeInt <= 0 || componentCountInt <= 0) {
@@ -182,49 +222,118 @@ enum class FloatAttributeComponentPolicy {
         return std::nullopt;
     }
 
-    const int strideInt = accessor.ByteStride(view);
-    if (strideInt < 0) {
-        std::cerr << "glTF accessor warning: " << label << " has invalid byteStride\n";
-        return std::nullopt;
-    }
-    const size_t byteStride = strideInt > 0 ? static_cast<size_t>(strideInt) : elementSize;
-    if (byteStride < elementSize) {
-        std::cerr << "glTF accessor warning: " << label << " byteStride is smaller than element size\n";
+    size_t tightByteLength = 0;
+    if (!checkedMul(static_cast<size_t>(accessor.count), elementSize, tightByteLength)) {
+        std::cerr << "glTF accessor warning: " << label << " byte length overflow\n";
         return std::nullopt;
     }
 
-    const size_t accessorByteOffset = static_cast<size_t>(accessor.byteOffset);
-    const size_t viewByteOffset = static_cast<size_t>(view.byteOffset);
-    const size_t viewByteLength = static_cast<size_t>(view.byteLength);
-    const tinygltf::Buffer& buffer = model.buffers[static_cast<size_t>(view.buffer)];
-    const size_t bufferSize = buffer.data.size();
-
-    size_t viewEnd = 0;
-    if (!checkedAdd(viewByteOffset, viewByteLength, viewEnd) || viewEnd > bufferSize) {
-        std::cerr << "glTF accessor warning: " << label << " bufferView range exceeds buffer size\n";
-        return std::nullopt;
-    }
-    if (accessorByteOffset > viewByteLength) {
-        std::cerr << "glTF accessor warning: " << label << " byteOffset exceeds bufferView length\n";
-        return std::nullopt;
-    }
-
-    if (accessor.count > 0) {
-        size_t lastElementOffset = 0;
-        size_t lastElementEnd = 0;
-        if (!checkedMul(static_cast<size_t>(accessor.count - 1), byteStride, lastElementOffset) ||
-            !checkedAdd(accessorByteOffset, lastElementOffset, lastElementOffset) ||
-            !checkedAdd(lastElementOffset, elementSize, lastElementEnd) ||
-            lastElementEnd > viewByteLength) {
-            std::cerr << "glTF accessor warning: " << label << " computed byte range exceeds bufferView length\n";
+    const tinygltf::BufferView* view = nullptr;
+    size_t byteStride = elementSize;
+    const uint8_t* baseData = nullptr;
+    if (accessor.bufferView >= 0) {
+        if (static_cast<size_t>(accessor.bufferView) >= model.bufferViews.size()) {
+            std::cerr << "glTF accessor warning: " << label << " references invalid bufferView " << accessor.bufferView << "\n";
             return std::nullopt;
         }
+        view = &model.bufferViews[static_cast<size_t>(accessor.bufferView)];
+        const int strideInt = accessor.ByteStride(*view);
+        if (strideInt < 0) {
+            std::cerr << "glTF accessor warning: " << label << " has invalid byteStride\n";
+            return std::nullopt;
+        }
+        byteStride = strideInt > 0 ? static_cast<size_t>(strideInt) : elementSize;
+        if (byteStride < elementSize) {
+            std::cerr << "glTF accessor warning: " << label << " byteStride is smaller than element size\n";
+            return std::nullopt;
+        }
+        size_t requiredByteLength = 0;
+        if (accessor.count > 0) {
+            size_t lastElementOffset = 0;
+            if (!checkedMul(static_cast<size_t>(accessor.count - 1), byteStride, lastElementOffset) ||
+                !checkedAdd(lastElementOffset, elementSize, requiredByteLength)) {
+                std::cerr << "glTF accessor warning: " << label << " computed byte range overflows\n";
+                return std::nullopt;
+            }
+        }
+        baseData = bufferRangeData(model, accessor.bufferView, static_cast<size_t>(accessor.byteOffset), requiredByteLength, label);
+        if (baseData == nullptr && requiredByteLength > 0) {
+            return std::nullopt;
+        }
+    } else if (!accessor.sparse.isSparse && accessor.count > 0) {
+        std::cerr << "glTF accessor warning: " << label << " has no bufferView and is not sparse\n";
+        return std::nullopt;
     }
 
+    if (!accessor.sparse.isSparse) {
+        return AccessorView{
+            .data = baseData,
+            .ownedData = {},
+            .count = static_cast<size_t>(accessor.count),
+            .byteStride = byteStride,
+            .elementSize = elementSize,
+        };
+    }
+
+    const size_t sparseCount = static_cast<size_t>(std::max(accessor.sparse.count, 0));
+    if (sparseCount > static_cast<size_t>(accessor.count)) {
+        std::cerr << "glTF accessor warning: " << label << " sparse count exceeds accessor count\n";
+        return std::nullopt;
+    }
+    const int sparseIndexComponentSizeInt = tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(accessor.sparse.indices.componentType));
+    if (accessor.sparse.indices.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE &&
+        accessor.sparse.indices.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT &&
+        accessor.sparse.indices.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
+        std::cerr << "glTF accessor warning: " << label << " sparse indices use unsupported component "
+                  << componentTypeName(accessor.sparse.indices.componentType) << "\n";
+        return std::nullopt;
+    }
+    if (sparseIndexComponentSizeInt <= 0) {
+        return std::nullopt;
+    }
+    const size_t sparseIndexComponentSize = static_cast<size_t>(sparseIndexComponentSizeInt);
+    size_t sparseIndexBytes = 0;
+    size_t sparseValueBytes = 0;
+    if (!checkedMul(sparseCount, sparseIndexComponentSize, sparseIndexBytes) ||
+        !checkedMul(sparseCount, elementSize, sparseValueBytes)) {
+        std::cerr << "glTF accessor warning: " << label << " sparse byte length overflow\n";
+        return std::nullopt;
+    }
+    const uint8_t* sparseIndices = bufferRangeData(
+        model,
+        accessor.sparse.indices.bufferView,
+        static_cast<size_t>(accessor.sparse.indices.byteOffset),
+        sparseIndexBytes,
+        std::string(label) + " sparse indices");
+    const uint8_t* sparseValues = bufferRangeData(
+        model,
+        accessor.sparse.values.bufferView,
+        static_cast<size_t>(accessor.sparse.values.byteOffset),
+        sparseValueBytes,
+        std::string(label) + " sparse values");
+    if ((sparseIndices == nullptr && sparseIndexBytes > 0) || (sparseValues == nullptr && sparseValueBytes > 0)) {
+        return std::nullopt;
+    }
+
+    auto owned = std::make_shared<std::vector<uint8_t>>(tightByteLength, 0u);
+    if (baseData != nullptr) {
+        for (size_t i = 0; i < static_cast<size_t>(accessor.count); ++i) {
+            std::memcpy(owned->data() + i * elementSize, baseData + i * byteStride, elementSize);
+        }
+    }
+    for (size_t i = 0; i < sparseCount; ++i) {
+        const uint32_t index = readSparseIndexComponent(sparseIndices + i * sparseIndexComponentSize, accessor.sparse.indices.componentType);
+        if (index >= accessor.count) {
+            std::cerr << "glTF accessor warning: " << label << " sparse index " << index << " exceeds accessor count\n";
+            return std::nullopt;
+        }
+        std::memcpy(owned->data() + static_cast<size_t>(index) * elementSize, sparseValues + i * elementSize, elementSize);
+    }
     return AccessorView{
-        .data = buffer.data.data() + viewByteOffset + accessorByteOffset,
+        .data = owned->data(),
+        .ownedData = std::move(owned),
         .count = static_cast<size_t>(accessor.count),
-        .byteStride = byteStride,
+        .byteStride = elementSize,
         .elementSize = elementSize,
     };
 }
@@ -297,41 +406,41 @@ enum class FloatAttributeComponentPolicy {
     return makeAccessorView(model, accessorIndex, accessor.type, accessor.componentType, "COLOR_0");
 }
 
-[[nodiscard]] std::optional<AccessorView> makeJointAccessorView(const tinygltf::Model& model, int accessorIndex) {
+[[nodiscard]] std::optional<AccessorView> makeJointAccessorView(const tinygltf::Model& model, int accessorIndex, std::string_view label = "JOINTS_0") {
     if (accessorIndex < 0 || static_cast<size_t>(accessorIndex) >= model.accessors.size()) {
-        std::cerr << "glTF accessor warning: JOINTS_0 accessor index " << accessorIndex << " is out of range\n";
+        std::cerr << "glTF accessor warning: " << label << " accessor index " << accessorIndex << " is out of range\n";
         return std::nullopt;
     }
     const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(accessorIndex)];
     if (accessor.type != TINYGLTF_TYPE_VEC4) {
-        std::cerr << "glTF accessor warning: JOINTS_0 expected VEC4 but got " << accessorTypeName(accessor.type) << "; skipping attribute\n";
+        std::cerr << "glTF accessor warning: " << label << " expected VEC4 but got " << accessorTypeName(accessor.type) << "; skipping attribute\n";
         return std::nullopt;
     }
     if (accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE &&
         accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-        std::cerr << "glTF accessor warning: JOINTS_0 uses unsupported component " << componentTypeName(accessor.componentType) << "; skipping attribute\n";
+        std::cerr << "glTF accessor warning: " << label << " uses unsupported component " << componentTypeName(accessor.componentType) << "; skipping attribute\n";
         return std::nullopt;
     }
-    return makeAccessorView(model, accessorIndex, TINYGLTF_TYPE_VEC4, accessor.componentType, "JOINTS_0");
+    return makeAccessorView(model, accessorIndex, TINYGLTF_TYPE_VEC4, accessor.componentType, label);
 }
 
-[[nodiscard]] std::optional<AccessorView> makeWeightAccessorView(const tinygltf::Model& model, int accessorIndex) {
+[[nodiscard]] std::optional<AccessorView> makeWeightAccessorView(const tinygltf::Model& model, int accessorIndex, std::string_view label = "WEIGHTS_0") {
     if (accessorIndex < 0 || static_cast<size_t>(accessorIndex) >= model.accessors.size()) {
-        std::cerr << "glTF accessor warning: WEIGHTS_0 accessor index " << accessorIndex << " is out of range\n";
+        std::cerr << "glTF accessor warning: " << label << " accessor index " << accessorIndex << " is out of range\n";
         return std::nullopt;
     }
     const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(accessorIndex)];
     if (accessor.type != TINYGLTF_TYPE_VEC4) {
-        std::cerr << "glTF accessor warning: WEIGHTS_0 expected VEC4 but got " << accessorTypeName(accessor.type) << "; skipping attribute\n";
+        std::cerr << "glTF accessor warning: " << label << " expected VEC4 but got " << accessorTypeName(accessor.type) << "; skipping attribute\n";
         return std::nullopt;
     }
     if (accessor.componentType != TINYGLTF_COMPONENT_TYPE_FLOAT &&
         accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE &&
         accessor.componentType != TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-        std::cerr << "glTF accessor warning: WEIGHTS_0 uses unsupported component " << componentTypeName(accessor.componentType) << "; skipping attribute\n";
+        std::cerr << "glTF accessor warning: " << label << " uses unsupported component " << componentTypeName(accessor.componentType) << "; skipping attribute\n";
         return std::nullopt;
     }
-    return makeAccessorView(model, accessorIndex, TINYGLTF_TYPE_VEC4, accessor.componentType, "WEIGHTS_0");
+    return makeAccessorView(model, accessorIndex, TINYGLTF_TYPE_VEC4, accessor.componentType, label);
 }
 
 template <typename T>
@@ -449,7 +558,16 @@ template <typename T>
     return joints;
 }
 
-[[nodiscard]] glm::vec4 readWeightElement(const tinygltf::Accessor& accessor, const AccessorView& view, size_t index) {
+[[nodiscard]] glm::vec4 normalizeSkinWeights(glm::vec4 weights) {
+    weights = glm::clamp(weights, glm::vec4{0.0f}, glm::vec4{1.0f});
+    const float sum = weights.x + weights.y + weights.z + weights.w;
+    if (sum > 1.0e-6f) {
+        weights /= sum;
+    }
+    return weights;
+}
+
+[[nodiscard]] glm::vec4 readWeightElementRaw(const tinygltf::Accessor& accessor, const AccessorView& view, size_t index) {
     const uint8_t* src = view.data + index * view.byteStride;
     glm::vec4 weights{0.0f};
     for (int c = 0; c < 4; ++c) {
@@ -465,12 +583,43 @@ template <typename T>
             weights[c] = static_cast<float>(src[c]) / 255.0f;
         }
     }
-    weights = glm::clamp(weights, glm::vec4{0.0f}, glm::vec4{1.0f});
-    const float sum = weights.x + weights.y + weights.z + weights.w;
-    if (sum > 1.0e-6f) {
-        weights /= sum;
+    return glm::clamp(weights, glm::vec4{0.0f}, glm::vec4{1.0f});
+}
+
+[[nodiscard]] glm::vec4 readWeightElement(const tinygltf::Accessor& accessor, const AccessorView& view, size_t index) {
+    return normalizeSkinWeights(readWeightElementRaw(accessor, view, index));
+}
+
+struct GltfSkinInfluence {
+    uint32_t joint = 0u;
+    float weight = 0.0f;
+};
+
+[[nodiscard]] std::array<GltfSkinInfluence, 4> topFourSkinInfluences(
+    glm::uvec4 joints0,
+    glm::vec4 weights0,
+    glm::uvec4 joints1 = glm::uvec4{0u},
+    glm::vec4 weights1 = glm::vec4{0.0f}) {
+    std::array<GltfSkinInfluence, 8> candidates{{
+        {joints0.x, weights0.x}, {joints0.y, weights0.y}, {joints0.z, weights0.z}, {joints0.w, weights0.w},
+        {joints1.x, weights1.x}, {joints1.y, weights1.y}, {joints1.z, weights1.z}, {joints1.w, weights1.w},
+    }};
+    std::stable_sort(candidates.begin(), candidates.end(), [](const GltfSkinInfluence& a, const GltfSkinInfluence& b) {
+        return a.weight > b.weight;
+    });
+    std::array<GltfSkinInfluence, 4> out{{
+        candidates[0], candidates[1], candidates[2], candidates[3],
+    }};
+    float sum = 0.0f;
+    for (const GltfSkinInfluence& influence : out) {
+        sum += std::max(influence.weight, 0.0f);
     }
-    return weights;
+    if (sum > 1.0e-6f) {
+        for (GltfSkinInfluence& influence : out) {
+            influence.weight = std::max(influence.weight, 0.0f) / sum;
+        }
+    }
+    return out;
 }
 
 [[nodiscard]] std::vector<std::string> morphTargetNamesForMesh(const tinygltf::Mesh& mesh) {
@@ -489,6 +638,64 @@ template <typename T>
         names.push_back(value.IsString() ? value.Get<std::string>() : std::string{});
     }
     return names;
+}
+
+[[nodiscard]] const char* gltfPrimitiveModeName(int mode) {
+    switch (mode) {
+    case TINYGLTF_MODE_POINTS: return "POINTS";
+    case TINYGLTF_MODE_LINE: return "LINES";
+    case TINYGLTF_MODE_LINE_LOOP: return "LINE_LOOP";
+    case TINYGLTF_MODE_LINE_STRIP: return "LINE_STRIP";
+    case TINYGLTF_MODE_TRIANGLES: return "TRIANGLES";
+    case TINYGLTF_MODE_TRIANGLE_STRIP: return "TRIANGLE_STRIP";
+    case TINYGLTF_MODE_TRIANGLE_FAN: return "TRIANGLE_FAN";
+    default: return "UNKNOWN";
+    }
+}
+
+[[nodiscard]] std::vector<uint32_t> triangulateGltfPrimitiveIndices(const std::vector<uint32_t>& localIndices, int mode) {
+    std::vector<uint32_t> triangles;
+    if (mode == TINYGLTF_MODE_TRIANGLES) {
+        const size_t triangleIndexCount = localIndices.size() - (localIndices.size() % 3u);
+        triangles.assign(localIndices.begin(), localIndices.begin() + static_cast<std::ptrdiff_t>(triangleIndexCount));
+        return triangles;
+    }
+    if (mode == TINYGLTF_MODE_TRIANGLE_STRIP) {
+        if (localIndices.size() < 3u) {
+            return triangles;
+        }
+        triangles.reserve((localIndices.size() - 2u) * 3u);
+        for (size_t i = 0; i + 2u < localIndices.size(); ++i) {
+            const uint32_t a = localIndices[i];
+            const uint32_t b = localIndices[i + 1u];
+            const uint32_t c = localIndices[i + 2u];
+            if (a == b || b == c || a == c) {
+                continue;
+            }
+            if ((i & 1u) == 0u) {
+                triangles.insert(triangles.end(), {a, b, c});
+            } else {
+                triangles.insert(triangles.end(), {b, a, c});
+            }
+        }
+        return triangles;
+    }
+    if (mode == TINYGLTF_MODE_TRIANGLE_FAN) {
+        if (localIndices.size() < 3u) {
+            return triangles;
+        }
+        triangles.reserve((localIndices.size() - 2u) * 3u);
+        const uint32_t center = localIndices.front();
+        for (size_t i = 1; i + 1u < localIndices.size(); ++i) {
+            const uint32_t b = localIndices[i];
+            const uint32_t c = localIndices[i + 1u];
+            if (center == b || b == c || center == c) {
+                continue;
+            }
+            triangles.insert(triangles.end(), {center, b, c});
+        }
+    }
+    return triangles;
 }
 
 [[nodiscard]] std::vector<float> morphWeightsFromGltf(const std::vector<double>& sourceWeights) {
@@ -806,6 +1013,8 @@ bool loadImageDataPreservingKtx2(
     switch (role) {
     case NativeTextureRole::BaseColor:
     case NativeTextureRole::Emissive:
+    case NativeTextureRole::SpecularColor:
+    case NativeTextureRole::SheenColor:
         return NativeTextureColorSpace::Srgb;
     case NativeTextureRole::EnvironmentHdr:
         return NativeTextureColorSpace::HdrLinear;
@@ -839,6 +1048,10 @@ bool loadImageDataPreservingKtx2(
             texture.width = static_cast<uint32_t>(td.width);
             texture.height = static_cast<uint32_t>(td.height);
             texture.channels = 4;
+            texture.sourceArrayLayers = td.sourceArrayLayers;
+            texture.sourceDepth = td.sourceDepth;
+            texture.sourceFaceCount = td.sourceFaceCount;
+            texture.sourceIsCubemap = td.sourceIsCubemap;
             texture.mipLevels = td.mipLevels;
             texture.isCompressed = td.isCompressed;
             texture.linearColorSpace = td.linearColorSpace;
@@ -864,6 +1077,10 @@ bool loadImageDataPreservingKtx2(
             texture.width = static_cast<uint32_t>(td.width);
             texture.height = static_cast<uint32_t>(td.height);
             texture.channels = 4;
+            texture.sourceArrayLayers = td.sourceArrayLayers;
+            texture.sourceDepth = td.sourceDepth;
+            texture.sourceFaceCount = td.sourceFaceCount;
+            texture.sourceIsCubemap = td.sourceIsCubemap;
             texture.mipLevels = td.mipLevels;
             texture.isCompressed = td.isCompressed;
             texture.linearColorSpace = td.linearColorSpace;
@@ -1498,6 +1715,7 @@ struct PunctualLightJsonFallback {
         }
         std::cerr << "glTF material extension warning: material '" << (source.name.empty() ? "(unnamed)" : source.name)
                   << "' uses unsupported extension '" << name << "'\n";
+        material.unsupportedSourceFeatures.push_back(name);
     }
 
     const bool hasTextureTransform =
@@ -1682,12 +1900,26 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
     };
     auto rolePriority = [](NativeTextureRole role) -> int {
         switch (role) {
-        case NativeTextureRole::Normal: return 6;
-        case NativeTextureRole::BaseColor: return 5;
-        case NativeTextureRole::Emissive: return 5;
+        case NativeTextureRole::Normal:
+        case NativeTextureRole::ClearcoatNormal: return 6;
+        case NativeTextureRole::BaseColor:
+        case NativeTextureRole::Emissive:
+        case NativeTextureRole::SpecularColor:
+        case NativeTextureRole::SheenColor: return 5;
         case NativeTextureRole::MetallicRoughness: return 4;
-        case NativeTextureRole::Occlusion: return 3;
-        case NativeTextureRole::Opacity: return 3;
+        case NativeTextureRole::Occlusion:
+        case NativeTextureRole::Opacity:
+        case NativeTextureRole::Roughness:
+        case NativeTextureRole::ClearcoatRoughness:
+        case NativeTextureRole::SheenRoughness: return 3;
+        case NativeTextureRole::Specular:
+        case NativeTextureRole::Transmission:
+        case NativeTextureRole::Clearcoat:
+        case NativeTextureRole::Sheen:
+        case NativeTextureRole::Iridescence:
+        case NativeTextureRole::IridescenceThickness:
+        case NativeTextureRole::Anisotropy:
+        case NativeTextureRole::Thickness:
         case NativeTextureRole::Data: return 2;
         case NativeTextureRole::Unknown: return 0;
         default: return 1;
@@ -1713,9 +1945,9 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_pbrSpecularGlossiness", "specularGlossinessTexture"), dataTextureUse);
         markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_pbrSpecularGlossiness", "specularGlossinessTexture"), NativeTextureRole::Data);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenColorTexture"), colorTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenColorTexture"), NativeTextureRole::BaseColor);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenColorTexture"), NativeTextureRole::SheenColor);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularColorTexture"), colorTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularColorTexture"), NativeTextureRole::BaseColor);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularColorTexture"), NativeTextureRole::SpecularColor);
         markTextureUse(pbr.metallicRoughnessTexture.index, dataTextureUse);
         markTextureRole(pbr.metallicRoughnessTexture.index, NativeTextureRole::MetallicRoughness);
         markTextureUse(sourceMaterial.normalTexture.index, dataTextureUse);
@@ -1723,25 +1955,25 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         markTextureUse(sourceMaterial.occlusionTexture.index, dataTextureUse);
         markTextureRole(sourceMaterial.occlusionTexture.index, NativeTextureRole::Occlusion);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatTexture"), NativeTextureRole::Data);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatTexture"), NativeTextureRole::Clearcoat);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatRoughnessTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatRoughnessTexture"), NativeTextureRole::Roughness);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatRoughnessTexture"), NativeTextureRole::ClearcoatRoughness);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatNormalTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatNormalTexture"), NativeTextureRole::Normal);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_clearcoat", "clearcoatNormalTexture"), NativeTextureRole::ClearcoatNormal);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_transmission", "transmissionTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_transmission", "transmissionTexture"), NativeTextureRole::Opacity);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_transmission", "transmissionTexture"), NativeTextureRole::Transmission);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_volume", "thicknessTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_volume", "thicknessTexture"), NativeTextureRole::Data);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_volume", "thicknessTexture"), NativeTextureRole::Thickness);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularTexture"), NativeTextureRole::Data);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_specular", "specularTexture"), NativeTextureRole::Specular);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenRoughnessTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenRoughnessTexture"), NativeTextureRole::Roughness);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_sheen", "sheenRoughnessTexture"), NativeTextureRole::SheenRoughness);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceTexture"), NativeTextureRole::Data);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceTexture"), NativeTextureRole::Iridescence);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceThicknessTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceThicknessTexture"), NativeTextureRole::Data);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_iridescence", "iridescenceThicknessTexture"), NativeTextureRole::IridescenceThickness);
         markTextureUse(extensionTextureIndex(sourceMaterial, "KHR_materials_anisotropy", "anisotropyTexture"), dataTextureUse);
-        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_anisotropy", "anisotropyTexture"), NativeTextureRole::Data);
+        markTextureRole(extensionTextureIndex(sourceMaterial, "KHR_materials_anisotropy", "anisotropyTexture"), NativeTextureRole::Anisotropy);
     }
 
     std::vector<TextureAssetHandle> textureHandles;
@@ -1763,6 +1995,9 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         }
         texture.srgb = colorTextureUse[textureIndex] && !dataTextureUse[textureIndex] && !texture.linearColorSpace;
         texture.sampler = samplerFromGltf(model, sourceTexture);
+        if (nativeTextureRoles[textureIndex] != NativeTextureRole::Unknown) {
+            texture.authoredRole = nativeTextureRoleName(nativeTextureRoles[textureIndex]);
+        }
         textureHandles.push_back(assets_.addTexture(std::move(texture)));
     }
     scene.textures = textureHandles;
@@ -1807,7 +2042,11 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
         const std::vector<std::string> morphTargetNames = morphTargetNamesForMesh(sourceMesh);
 
         for (const tinygltf::Primitive& primitive : sourceMesh.primitives) {
-            if (primitive.mode != TINYGLTF_MODE_TRIANGLES) {
+            if (primitive.mode != TINYGLTF_MODE_TRIANGLES &&
+                primitive.mode != TINYGLTF_MODE_TRIANGLE_STRIP &&
+                primitive.mode != TINYGLTF_MODE_TRIANGLE_FAN) {
+                std::cerr << "glTF primitive warning: mode " << gltfPrimitiveModeName(primitive.mode)
+                          << " is not renderable by the mesh importer; skipping primitive\n";
                 continue;
             }
 
@@ -1838,14 +2077,14 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
                 continue;
             }
 
-            std::vector<uint32_t> decodedIndices;
+            std::vector<uint32_t> decodedLocalIndices;
             if (primitive.indices >= 0) {
                 const auto indexView = makeIndexAccessorView(model, primitive.indices);
                 if (!indexView.has_value()) {
                     continue;
                 }
                 const tinygltf::Accessor& indexAccessor = model.accessors[static_cast<size_t>(primitive.indices)];
-                decodedIndices.reserve(indexView->count);
+                decodedLocalIndices.reserve(indexView->count);
                 bool indicesValid = true;
                 for (size_t i = 0; i < indexView->count; ++i) {
                     const uint32_t index = readIndexElement(indexAccessor, *indexView, i);
@@ -1854,16 +2093,25 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
                         indicesValid = false;
                         break;
                     }
-                    decodedIndices.push_back(firstVertex + index);
+                    decodedLocalIndices.push_back(index);
                 }
                 if (!indicesValid) {
                     continue;
                 }
             } else {
-                decodedIndices.reserve(vertexCount);
+                decodedLocalIndices.reserve(vertexCount);
                 for (uint32_t i = 0; i < static_cast<uint32_t>(vertexCount); ++i) {
-                    decodedIndices.push_back(firstVertex + i);
+                    decodedLocalIndices.push_back(i);
                 }
+            }
+            std::vector<uint32_t> decodedIndices = triangulateGltfPrimitiveIndices(decodedLocalIndices, primitive.mode);
+            if (decodedIndices.empty()) {
+                std::cerr << "glTF primitive warning: mode " << gltfPrimitiveModeName(primitive.mode)
+                          << " did not produce any non-degenerate triangles; skipping primitive\n";
+                continue;
+            }
+            for (uint32_t& index : decodedIndices) {
+                index += firstVertex;
             }
 
             mesh.vertices.resize(mesh.vertices.size() + vertexCount);
@@ -1962,29 +2210,55 @@ SceneAsset GltfLoader::load(const std::filesystem::path& path) {
                 }
             }
 
-            const auto jointsIt = primitive.attributes.find("JOINTS_0");
-            if (jointsIt != primitive.attributes.end()) {
-                const auto jointsView = makeJointAccessorView(model, jointsIt->second);
-                if (jointsView.has_value() && jointsView->count >= vertexCount) {
-                    const tinygltf::Accessor& jointsAccessor = model.accessors[static_cast<size_t>(jointsIt->second)];
-                    for (size_t i = 0; i < vertexCount; ++i) {
-                        mesh.vertices[firstVertex + i].joints = readJointElement(jointsAccessor, *jointsView, i);
-                    }
-                } else {
-                    std::cerr << "glTF accessor warning: JOINTS_0 count is shorter than POSITION count; using default joints\n";
+            struct SkinSetView {
+                const tinygltf::Accessor* jointsAccessor = nullptr;
+                AccessorView jointsView{};
+                const tinygltf::Accessor* weightsAccessor = nullptr;
+                AccessorView weightsView{};
+                bool valid = false;
+            };
+            auto skinSetView = [&](const char* jointsName, const char* weightsName) -> SkinSetView {
+                SkinSetView set{};
+                const auto jointsIt = primitive.attributes.find(jointsName);
+                const auto weightsIt = primitive.attributes.find(weightsName);
+                if (jointsIt == primitive.attributes.end() && weightsIt == primitive.attributes.end()) {
+                    return set;
                 }
-            }
-
-            const auto weightsIt = primitive.attributes.find("WEIGHTS_0");
-            if (weightsIt != primitive.attributes.end()) {
-                const auto weightsView = makeWeightAccessorView(model, weightsIt->second);
-                if (weightsView.has_value() && weightsView->count >= vertexCount) {
-                    const tinygltf::Accessor& weightsAccessor = model.accessors[static_cast<size_t>(weightsIt->second)];
-                    for (size_t i = 0; i < vertexCount; ++i) {
-                        mesh.vertices[firstVertex + i].weights = readWeightElement(weightsAccessor, *weightsView, i);
-                    }
-                } else {
-                    std::cerr << "glTF accessor warning: WEIGHTS_0 count is shorter than POSITION count; using default weights\n";
+                if (jointsIt == primitive.attributes.end() || weightsIt == primitive.attributes.end()) {
+                    std::cerr << "glTF accessor warning: " << jointsName << "/" << weightsName
+                              << " must be paired; skipping skin influence set\n";
+                    return set;
+                }
+                auto jointsView = makeJointAccessorView(model, jointsIt->second, jointsName);
+                auto weightsView = makeWeightAccessorView(model, weightsIt->second, weightsName);
+                if (!jointsView.has_value() || !weightsView.has_value() ||
+                    jointsView->count < vertexCount || weightsView->count < vertexCount) {
+                    std::cerr << "glTF accessor warning: " << jointsName << "/" << weightsName
+                              << " count is shorter than POSITION count; skipping skin influence set\n";
+                    return set;
+                }
+                set.jointsAccessor = &model.accessors[static_cast<size_t>(jointsIt->second)];
+                set.weightsAccessor = &model.accessors[static_cast<size_t>(weightsIt->second)];
+                set.jointsView = std::move(*jointsView);
+                set.weightsView = std::move(*weightsView);
+                set.valid = true;
+                return set;
+            };
+            const SkinSetView skin0 = skinSetView("JOINTS_0", "WEIGHTS_0");
+            const SkinSetView skin1 = skinSetView("JOINTS_1", "WEIGHTS_1");
+            if (skin0.valid || skin1.valid) {
+                if (skin0.valid && skin1.valid) {
+                    std::cout << "glTF skinning: merging JOINTS_0/WEIGHTS_0 and JOINTS_1/WEIGHTS_1 influences into top-4 runtime weights\n";
+                }
+                for (size_t i = 0; i < vertexCount; ++i) {
+                    const glm::uvec4 joints0 = skin0.valid ? readJointElement(*skin0.jointsAccessor, skin0.jointsView, i) : glm::uvec4{0u};
+                    const glm::vec4 weights0 = skin0.valid ? readWeightElementRaw(*skin0.weightsAccessor, skin0.weightsView, i) : glm::vec4{0.0f};
+                    const glm::uvec4 joints1 = skin1.valid ? readJointElement(*skin1.jointsAccessor, skin1.jointsView, i) : glm::uvec4{0u};
+                    const glm::vec4 weights1 = skin1.valid ? readWeightElementRaw(*skin1.weightsAccessor, skin1.weightsView, i) : glm::vec4{0.0f};
+                    const std::array<GltfSkinInfluence, 4> influences = topFourSkinInfluences(joints0, weights0, joints1, weights1);
+                    MeshVertex& vertex = mesh.vertices[firstVertex + i];
+                    vertex.joints = glm::uvec4{influences[0].joint, influences[1].joint, influences[2].joint, influences[3].joint};
+                    vertex.weights = glm::vec4{influences[0].weight, influences[1].weight, influences[2].weight, influences[3].weight};
                 }
             }
             mesh.indices.insert(mesh.indices.end(), decodedIndices.begin(), decodedIndices.end());
@@ -2275,6 +2549,10 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     texture.width = cachedTex.width;
                     texture.height = cachedTex.height;
                     texture.channels = cachedTex.channels;
+                    texture.sourceArrayLayers = cachedTex.sourceArrayLayers;
+                    texture.sourceDepth = cachedTex.sourceDepth;
+                    texture.sourceFaceCount = cachedTex.sourceFaceCount;
+                    texture.sourceIsCubemap = cachedTex.sourceIsCubemap;
                     texture.mipLevels = cachedTex.mipLevels;
                     texture.srgb = cachedTex.srgb;
                     texture.fallback = cachedTex.fallback;
@@ -2319,6 +2597,7 @@ SceneAsset GltfLoader::loadWithCache(const std::filesystem::path& path) {
                     material.volumeThicknessFactor = cachedMat.volumeThicknessFactor;
                     material.volumeAttenuationDistance = cachedMat.volumeAttenuationDistance;
                     material.volumeAttenuationColor = cachedMat.volumeAttenuationColor;
+                    material.nestedPriority = cachedMat.nestedPriority;
                     material.hasDispersion = cachedMat.hasDispersion;
                     material.dispersionFactor = cachedMat.dispersionFactor;
                     material.hasSpecular = cachedMat.hasSpecular;
@@ -2566,6 +2845,10 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedTex.width = texture->width;
         cachedTex.height = texture->height;
         cachedTex.channels = texture->channels;
+        cachedTex.sourceArrayLayers = texture->sourceArrayLayers;
+        cachedTex.sourceDepth = texture->sourceDepth;
+        cachedTex.sourceFaceCount = texture->sourceFaceCount;
+        cachedTex.sourceIsCubemap = texture->sourceIsCubemap;
         cachedTex.mipLevels = texture->mipLevels;
         cachedTex.srgb = texture->srgb;
         cachedTex.fallback = texture->fallback;
@@ -2607,6 +2890,7 @@ CachedScene GltfLoader::buildCachedScene(const std::filesystem::path& path, cons
         cachedMat.volumeThicknessFactor = material->volumeThicknessFactor;
         cachedMat.volumeAttenuationDistance = material->volumeAttenuationDistance;
         cachedMat.volumeAttenuationColor = material->volumeAttenuationColor;
+        cachedMat.nestedPriority = material->nestedPriority;
         cachedMat.hasDispersion = material->hasDispersion;
         cachedMat.dispersionFactor = material->dispersionFactor;
         cachedMat.hasSpecular = material->hasSpecular;

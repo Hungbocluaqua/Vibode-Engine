@@ -19,12 +19,18 @@ struct PathComponents {
     vec3 direct_light;
     vec3 indirect_light;
     vec3 emissive_light;
+    vec3 visible_emissive_light;
     vec3 environment_light;
     vec3 restir_initial_direct_light;
     vec3 first_albedo;
     vec3 first_specular_albedo;
     float first_roughness;
     float first_occlusion;
+    float first_metallic;
+    float first_alpha;
+    uint first_alpha_mode;
+    float first_transmission;
+    uint first_mat_type;
     float first_light_pdf;
     float first_bsdf_pdf;
     float first_mis_weight;
@@ -536,7 +542,11 @@ void store_initial_restir_gi_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims
         restir_gi_set_material_id(reservoir, components.restir_gi_candidate_material_id);
     }
 
-    if (restirGiDebugView && debug_params.view != 70u && restir_gi_reservoir_valid(reservoir) && temporal_history_available()) {
+    if (restirGiDebugView &&
+        debug_params.view != 70u &&
+        restir_gi_reservoir_valid(reservoir) &&
+        temporal_history_available() &&
+        !streaming_instance_reset_mask(components.instance_id, 2u)) {
         vec2 velocityPixels = restir_unpack_velocity_pixels(packedVelocity);
         bool velocityNotSaturated = max(abs(velocityPixels.x), abs(velocityPixels.y)) < SCREEN_VELOCITY_SATURATION_THRESHOLD;
         vec2 historyPos = vec2(coords) - velocityPixels;
@@ -719,11 +729,10 @@ vec3 caustic_shadow_transmittance_stats(
     transmissiveHits = 0u;
     visiblePath = 0u;
     blockedPath = 0u;
-    if (camera.path_trace_controls.w == 0u) {
-        return shadow_transmittance(origin, direction, tMax, rayTime);
+    bool causticDiagnosticsEnabled = camera.path_trace_controls.w != 0u;
+    if (causticDiagnosticsEnabled) {
+        record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_ATTEMPTS);
     }
-
-    record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_ATTEMPTS);
     vec3 throughput = vec3(1.0);
     vec3 rayOrigin = origin;
     vec3 rayDir = normalize(direction);
@@ -732,7 +741,9 @@ vec3 caustic_shadow_transmittance_stats(
         RayPayload shadowHit = trace_shadow_surface(rayOrigin, rayDir, shadow_self_hit_epsilon(), remaining, rayTime);
         if (shadowHit.hit == 0u) {
             if (transmissiveHits > 0u) {
-                record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_VISIBLE);
+                if (causticDiagnosticsEnabled) {
+                    record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_VISIBLE);
+                }
                 visiblePath = 1u;
             }
             return throughput * vec3(homogeneous_transmittance_scalar(remaining));
@@ -740,12 +751,16 @@ vec3 caustic_shadow_transmittance_stats(
 
         Material material = material_for_hit(shadowHit, rayDir);
         if (!(material.mat_type == 2u && material_is_delta(material))) {
-            record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            if (causticDiagnosticsEnabled) {
+                record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            }
             blockedPath = 1u;
             return vec3(0.0);
         }
         transmissiveHits += 1u;
-        record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_HITS);
+        if (causticDiagnosticsEnabled) {
+            record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_HITS);
+        }
 
         vec3 dispersionIor = material_dispersion_ior(material);
         vec3 etaRgb = shadowHit.front_face != 0u ? (vec3(1.0) / dispersionIor) : dispersionIor;
@@ -753,7 +768,9 @@ vec3 caustic_shadow_transmittance_stats(
         float cosTheta = min(dot(-rayDir, shadowHit.normal), 1.0);
         float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
         if (eta * sinTheta > 1.0) {
-            record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            if (causticDiagnosticsEnabled) {
+                record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            }
             blockedPath = 1u;
             return vec3(0.0);
         }
@@ -769,7 +786,9 @@ vec3 caustic_shadow_transmittance_stats(
         throughput *= material.color * surfaceT * volumeT * (vec3(1.0) - fresnel);
         remaining = max(remaining - shadowHit.t, 0.0);
         if (remaining <= shadow_distance_bias() || max(max(throughput.r, throughput.g), throughput.b) <= 1.0e-5) {
-            record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            if (causticDiagnosticsEnabled) {
+                record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+            }
             blockedPath = 1u;
             return vec3(0.0);
         }
@@ -780,12 +799,16 @@ vec3 caustic_shadow_transmittance_stats(
 
     bool blocked = trace_shadow(rayOrigin, rayDir, remaining, rayTime);
     if (blocked) {
-        record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+        if (causticDiagnosticsEnabled) {
+            record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
+        }
         blockedPath = 1u;
         return vec3(0.0);
     }
     if (transmissiveHits > 0u) {
-        record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_VISIBLE);
+        if (causticDiagnosticsEnabled) {
+            record_rt_counter(RT_DIAG_CAUSTIC_TRANSMISSIVE_VISIBLE);
+        }
         visiblePath = 1u;
     }
     return throughput * vec3(homogeneous_transmittance_scalar(remaining));
@@ -1433,12 +1456,18 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.direct_light = vec3(0.0);
     components.indirect_light = vec3(0.0);
     components.emissive_light = vec3(0.0);
+    components.visible_emissive_light = vec3(0.0);
     components.environment_light = vec3(0.0);
     components.restir_initial_direct_light = vec3(0.0);
     components.first_albedo = vec3(1.0);
     components.first_specular_albedo = vec3(0.04);
     components.first_roughness = 1.0;
     components.first_occlusion = 1.0;
+    components.first_metallic = 0.0;
+    components.first_alpha = 1.0;
+    components.first_alpha_mode = 0u;
+    components.first_transmission = 0.0;
+    components.first_mat_type = 0u;
     components.first_light_pdf = 0.0;
     components.first_bsdf_pdf = 0.0;
     components.first_mis_weight = 0.0;
@@ -1580,6 +1609,11 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.first_specular_albedo = pbr_specular_reflectance(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.first_roughness = material.roughness;
             components.first_occlusion = material.occlusion;
+            components.first_metallic = material.metallic;
+            components.first_alpha = material.alpha_factor;
+            components.first_alpha_mode = material.alpha_mode;
+            components.first_transmission = material.transmission_factor;
+            components.first_mat_type = material.mat_type;
             components.first_specular_probability = pbr_specular_sample_probability(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.first_material_id = hit.material_id;
             components.restir_gi_candidate_material_id = hit.material_id;
@@ -1628,6 +1662,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 components.indirect_light += unlit;
             }
             components.emissive_light += unlit;
+            if (bounce == 0u) {
+                components.visible_emissive_light += unlit;
+            }
             break;
         }
         bool hitEmissiveSurface = has_positive_radiance(material.emissive);
@@ -1652,6 +1689,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 }
             }
             components.emissive_light += emit;
+            if (bounce == 0u) {
+                components.visible_emissive_light += emit;
+            }
         }
 
         vec3 emissiveDirect;
@@ -1726,7 +1766,8 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         vec3 restirDirect = directSampleType == 1u ? throughput * emissiveDirect : vec3(0.0);
         vec3 nonRestirDirect = max(direct - restirDirect, vec3(0.0));
         if (bounce == 0u && restir_mode() != 0u) {
-            bool historyAvailable = temporal_history_available();
+            bool historyAvailable = temporal_history_available() &&
+                !streaming_instance_reset_mask(hit.instance_id, 2u);
             uint packedFirstVel = compute_surface_velocity(
                 hit.world_pos,
                 hit.local_pos,
@@ -2062,6 +2103,7 @@ void main() {
         vec3 accumulated_direct = vec3(0.0);
         vec3 accumulated_indirect = vec3(0.0);
         vec3 accumulated_emissive = vec3(0.0);
+        vec3 accumulated_visible_emissive = vec3(0.0);
         vec3 accumulated_environment = vec3(0.0);
         vec3 accumulated_restir_direct = vec3(0.0);
         vec3 accumulated_caustic_debug = vec3(0.0);
@@ -2084,6 +2126,7 @@ void main() {
             accumulated_direct += sample_components.direct_light;
             accumulated_indirect += sample_components.indirect_light;
             accumulated_emissive += sample_components.emissive_light;
+            accumulated_visible_emissive += sample_components.visible_emissive_light;
             accumulated_environment += sample_components.environment_light;
             accumulated_restir_direct += sample_components.restir_initial_direct_light;
             accumulated_caustic_debug += vec3(
@@ -2105,6 +2148,7 @@ void main() {
         components.direct_light = accumulated_direct * invSpp;
         components.indirect_light = accumulated_indirect * invSpp;
         components.emissive_light = accumulated_emissive * invSpp;
+        components.visible_emissive_light = accumulated_visible_emissive * invSpp;
         components.environment_light = accumulated_environment * invSpp;
         components.restir_initial_direct_light = accumulated_restir_direct * invSpp;
         components.caustic_visible_paths = accumulated_caustic_debug.x * invSpp;
@@ -2151,12 +2195,7 @@ void main() {
             primaryHitDistance)
         : 0.0;
     components.specular_hit_distance = did_hit
-        ? weighted_effect_hit_distance(
-            directSpecularWeight,
-            components.direct_light_hit_distance,
-            indirectSpecularWeight,
-            components.secondary_hit_distance,
-            primaryHitDistance)
+        ? sanitize_effect_hit_distance(components.secondary_hit_distance, 65504.0)
         : 0.0;
     vec3 fallbackRayDirection = normalize(ray.direction);
     components.diffuse_ray_direction = did_hit
@@ -2196,6 +2235,7 @@ void main() {
     pathData.specular_ray_direction_hit_distance = vec4(
         components.specular_ray_direction,
         components.specular_hit_distance);
+    pathData.emissive_residual = vec4(max(components.visible_emissive_light, vec3(0.0)), 0.0);
     path_data_buffer[pixel_index] = pathData;
     uint packedVelocity = did_hit
         ? compute_surface_velocity(
@@ -2262,6 +2302,20 @@ void main() {
         output_value = did_hit ? components.first_albedo : vec3(0.0);
     } else if (debug_params.view == 89u) {
         output_value = did_hit ? vec3(clamp(components.first_occlusion, 0.0, 1.0)) : vec3(0.0);
+    } else if (debug_params.view == 102u) {
+        output_value = did_hit ? vec3(clamp(components.first_metallic, 0.0, 1.0)) : vec3(0.0);
+    } else if (debug_params.view == 103u) {
+        // Material alpha: grayscale opacity; tint by alpha mode (green=opaque, blue=mask, red=blend).
+        float alpha = did_hit ? clamp(components.first_alpha, 0.0, 1.0) : 0.0;
+        vec3 modeTint = components.first_alpha_mode == 1u
+            ? vec3(0.2, 0.4, 1.0)
+            : (components.first_alpha_mode == 2u ? vec3(1.0, 0.3, 0.2) : vec3(0.3, 1.0, 0.4));
+        output_value = did_hit ? alpha * modeTint : vec3(0.0);
+    } else if (debug_params.view == 104u) {
+        output_value = did_hit ? vec3(clamp(components.first_transmission, 0.0, 1.0)) : vec3(0.0);
+    } else if (debug_params.view == 105u) {
+        // Material type/workflow id mapped to a distinct color per closure type.
+        output_value = did_hit ? id_color(components.first_mat_type + 1u) : vec3(0.0);
     } else if (debug_params.view == 23u) {
         output_value = components.first_bounce_throughput;
     } else if (debug_params.view == 24u) {

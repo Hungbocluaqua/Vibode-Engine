@@ -160,22 +160,15 @@ NativeAssetCookResult finishWrite(const std::filesystem::path& path, const Nativ
     NativeAssetCookResult result;
     result.path = path;
     NativeBinaryError error;
+    NativeAssetWriteResult writeResult;
     NativeAssetWriter writer;
-    if (!writer.write(path, desc, &error)) {
+    if (!writer.write(path, desc, &error, &writeResult)) {
         result.errors.push_back(error.message.empty() ? "Native asset write failed" : error.message);
         return result;
     }
-    NativeAssetReader reader;
-    const NativeAssetInspection inspection = reader.inspect(path, true);
-    if (!inspection.ok) {
-        for (const NativeBinaryError& inspectError : inspection.errors) {
-            result.errors.push_back(inspectError.message);
-        }
-        return result;
-    }
     result.success = true;
-    result.payloadHash = nativeHashHex(inspection.header.payloadHash);
-    result.payloadBytes = inspection.header.fileSize;
+    result.payloadHash = nativeHashHex(writeResult.payloadHash);
+    result.payloadBytes = writeResult.fileSize;
     return result;
 }
 
@@ -286,6 +279,70 @@ void addTextureSlot(std::vector<RtmaterialTextureSlotRecord>& slots, uint32_t sl
     slots.push_back(record);
 }
 
+nlohmann::json materialSemanticMetadataJson(const MaterialAsset& material) {
+    return {
+        {"schema", "RtMaterialSemanticMetadataV1"},
+        {"workflow", material.materialWorkflow},
+        {"normalMapConvention", material.normalMapConvention},
+        {"specularTextureAlphaMode", material.specularTextureAlphaMode},
+        {"ior", {
+            {"present", material.hasIor != 0u},
+            {"factor", material.iorFactor},
+        }},
+        {"clearcoat", {
+            {"present", material.hasClearcoat != 0u},
+            {"factor", material.clearcoatFactor},
+            {"roughnessFactor", material.clearcoatRoughnessFactor},
+        }},
+        {"transmission", {
+            {"present", material.hasTransmission != 0u},
+            {"factor", material.transmissionFactor},
+        }},
+        {"volume", {
+            {"present", material.hasVolume != 0u},
+            {"thicknessFactor", material.volumeThicknessFactor},
+            {"attenuationDistance", material.volumeAttenuationDistance},
+            {"attenuationColor", {material.volumeAttenuationColor.x, material.volumeAttenuationColor.y, material.volumeAttenuationColor.z}},
+        }},
+        {"dispersion", {
+            {"present", material.hasDispersion != 0u},
+            {"factor", material.dispersionFactor},
+        }},
+        {"specular", {
+            {"present", material.hasSpecular != 0u},
+            {"factor", material.specularFactor},
+            {"colorFactor", {material.specularColorFactor.x, material.specularColorFactor.y, material.specularColorFactor.z}},
+        }},
+        {"sheen", {
+            {"present", material.hasSheen != 0u},
+            {"colorFactor", {material.sheenColorFactor.x, material.sheenColorFactor.y, material.sheenColorFactor.z}},
+            {"roughnessFactor", material.sheenRoughnessFactor},
+        }},
+        {"iridescence", {
+            {"present", material.hasIridescence != 0u},
+            {"factor", material.iridescenceFactor},
+            {"ior", material.iridescenceIor},
+            {"thicknessMinimum", material.iridescenceThicknessMinimum},
+            {"thicknessMaximum", material.iridescenceThicknessMaximum},
+        }},
+        {"anisotropy", {
+            {"present", material.hasAnisotropy != 0u},
+            {"strength", material.anisotropyStrength},
+            {"rotation", material.anisotropyRotation},
+        }},
+        {"emissiveStrength", {
+            {"present", material.hasEmissiveStrength != 0u},
+            {"factor", material.emissiveStrength},
+        }},
+        {"nestedPriority", material.nestedPriority},
+        {"conductor", {
+            {"enabled", material.useConductorOptics != 0u},
+            {"eta", {material.conductorEta.x, material.conductorEta.y, material.conductorEta.z}},
+            {"k", {material.conductorK.x, material.conductorK.y, material.conductorK.z}},
+        }},
+    };
+}
+
 uint32_t samplerPacked(const TextureSamplerDesc& sampler) {
     return static_cast<uint32_t>(sampler.minFilter) |
         (static_cast<uint32_t>(sampler.magFilter) << 4u) |
@@ -316,12 +373,16 @@ bool nativeTextureBlockCompressedFormat(VkFormat format) {
     case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
     case VK_FORMAT_BC3_UNORM_BLOCK:
     case VK_FORMAT_BC3_SRGB_BLOCK:
     case VK_FORMAT_BC4_UNORM_BLOCK:
     case VK_FORMAT_BC4_SNORM_BLOCK:
     case VK_FORMAT_BC5_UNORM_BLOCK:
     case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
     case VK_FORMAT_BC7_UNORM_BLOCK:
     case VK_FORMAT_BC7_SRGB_BLOCK:
         return true;
@@ -776,7 +837,8 @@ NativeAssetCooker::NativeAssetCooker(NativeTextureFormatSupport formatSupport)
 NativeAssetCookResult NativeAssetCooker::cookMesh(
     const NativeAssetCookInput& input,
     const MeshAsset& mesh,
-    const std::vector<AssetGuid>& materialGuids) const {
+    const std::vector<AssetGuid>& materialGuids,
+    bool buildLocalBvh) const {
     NativeAssetWriteDesc desc = baseWriteDesc(input, NativeAssetKind::Mesh);
 
     RtmeshPayloadHeader header;
@@ -827,7 +889,7 @@ NativeAssetCookResult NativeAssetCooker::cookMesh(
             faceMaterials.push_back(materialIndex);
         }
     }
-    if (!mesh.vertices.empty() && !mesh.indices.empty() && faceMaterials.size() == mesh.indices.size() / 3u) {
+    if (buildLocalBvh && !mesh.vertices.empty() && !mesh.indices.empty() && faceMaterials.size() == mesh.indices.size() / 3u) {
         std::vector<glm::vec3> positions;
         std::vector<glm::vec2> texcoords;
         std::vector<glm::vec3> normals;
@@ -926,6 +988,7 @@ NativeAssetCookResult NativeAssetCooker::cookMaterial(
     appendChunk(desc, ChunkPayloadHeader, bytesOf(header));
     appendChunk(desc, ChunkMaterialTextureSlots, bytesOfVector(slots));
     appendChunk(desc, ChunkMaterialTextureTransforms, bytesOfVector(materialTextureTransformRecords(material)));
+    appendChunk(desc, ChunkMetadataJson, bytesOfString(materialSemanticMetadataJson(material).dump(2)));
     return finishWrite(input.outputPath, desc);
 }
 
@@ -985,6 +1048,10 @@ NativeAssetCookResult NativeAssetCooker::cookTexture(
     }
     desc.debugRecords.push_back(NativeBinaryDebugInput{.type = 1, .key = "sourceContainerPreserved", .value = texture.sourceContainerPreserved ? "true" : "false"});
     desc.debugRecords.push_back(NativeBinaryDebugInput{.type = 1, .key = "sourceContainerTranscoded", .value = texture.sourceContainerTranscoded ? "true" : "false"});
+    desc.debugRecords.push_back(NativeBinaryDebugInput{.type = 1, .key = "sourceArrayLayers", .value = std::to_string(texture.sourceArrayLayers)});
+    desc.debugRecords.push_back(NativeBinaryDebugInput{.type = 1, .key = "sourceDepth", .value = std::to_string(texture.sourceDepth)});
+    desc.debugRecords.push_back(NativeBinaryDebugInput{.type = 1, .key = "sourceFaceCount", .value = std::to_string(texture.sourceFaceCount)});
+    desc.debugRecords.push_back(NativeBinaryDebugInput{.type = 1, .key = "sourceIsCubemap", .value = texture.sourceIsCubemap ? "true" : "false"});
     desc.debugRecords.push_back(NativeBinaryDebugInput{.type = 1, .key = std::string(kJsonVariantPlan), .value = nativeTexturePayloadVariantPlanJson(payloadVariantPlan).dump()});
     if (!formatSelection.fallbackReason.empty()) {
         desc.debugRecords.push_back(NativeBinaryDebugInput{.type = 2, .key = "platformFormatFallbackReason", .value = formatSelection.fallbackReason});

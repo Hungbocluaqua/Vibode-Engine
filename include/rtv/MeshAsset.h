@@ -79,6 +79,7 @@ struct MaterialAsset {
     float volumeThicknessFactor = 0.0f;
     float volumeAttenuationDistance = 0.0f;
     glm::vec3 volumeAttenuationColor{1.0f};
+    int32_t nestedPriority = 0;
     uint32_t hasDispersion = 0;
     float dispersionFactor = 0.0f;
     uint32_t hasSpecular = 0;
@@ -142,6 +143,11 @@ struct MaterialAsset {
     uint32_t normalMapConvention = kMaterialNormalMapOpenGL;
     uint32_t specularTextureAlphaMode = kMaterialSpecularTextureAlphaNone;
     uint32_t shaderCompatibilityMask = 1u;
+    // Import-time only diagnostic: source authoring features the runtime PBR closure
+    // could not represent (e.g. unrecognized glTF material extensions). Not serialized
+    // into the cooked native payload; populated by the importer/loader and surfaced in
+    // import reports and material metadata sidecars.
+    std::vector<std::string> unsupportedSourceFeatures;
 };
 
 constexpr uint32_t kPrimitiveAlphaClassOpaque = 0u;
@@ -307,7 +313,9 @@ struct SceneNodeAsset {
     int32_t skinIndex = -1;
     bool visible = true;
     bool castShadow = true;
+    bool receiveShadow = true;
     bool visibleToCamera = true;
+    int32_t renderLayer = 0;
     bool hasCamera = false;
     uint32_t cameraProjection = 0;
     float cameraYfov = 60.0f * 0.017453292519943295f;

@@ -80,6 +80,32 @@ std::string trimString(std::string value) {
     return value;
 }
 
+constexpr uint64_t kNativePackageCpuMountUiByteLimit = 128ull * 1024ull * 1024ull;
+
+uint64_t fileSizeOrZero(const std::filesystem::path& path) {
+    std::error_code ec;
+    const uint64_t size = std::filesystem::file_size(path, ec);
+    return ec ? 0ull : size;
+}
+
+bool nativePackageCpuMountUiBlocked(const std::filesystem::path& path) {
+    return fileSizeOrZero(path) >= kNativePackageCpuMountUiByteLimit;
+}
+
+std::string byteCountLabel(uint64_t bytes) {
+    std::ostringstream ss;
+    if (bytes >= 1024ull * 1024ull * 1024ull) {
+        ss << std::fixed << std::setprecision(2) << (static_cast<double>(bytes) / static_cast<double>(1024ull * 1024ull * 1024ull)) << " GiB";
+    } else if (bytes >= 1024ull * 1024ull) {
+        ss << std::fixed << std::setprecision(1) << (static_cast<double>(bytes) / static_cast<double>(1024ull * 1024ull)) << " MiB";
+    } else if (bytes >= 1024ull) {
+        ss << std::fixed << std::setprecision(1) << (static_cast<double>(bytes) / static_cast<double>(1024ull)) << " KiB";
+    } else {
+        ss << bytes << " B";
+    }
+    return ss.str();
+}
+
 std::string quoteCommandPath(const std::filesystem::path& path) {
     std::string value = path.string();
     std::string escaped;
@@ -448,6 +474,11 @@ bool isModelAssetPath(const std::filesystem::path& path) {
     if (ext == ".gltf" || ext == ".glb" || ext == ".obj") {
         return true;
     }
+#if RTV_ENABLE_OPENUSD_IMPORTER && RTV_OPENUSD_IMPORTER_AVAILABLE
+    if (ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz") {
+        return true;
+    }
+#endif
 #if RTV_ENABLE_ASSIMP_IMPORTER && RTV_ASSIMP_IMPORTER_AVAILABLE
     return ext == ".fbx";
 #else
@@ -460,6 +491,11 @@ bool isPlaceablePrefabSourcePath(const std::filesystem::path& path) {
     if (ext == ".gltf" || ext == ".glb") {
         return true;
     }
+#if RTV_ENABLE_OPENUSD_IMPORTER && RTV_OPENUSD_IMPORTER_AVAILABLE
+    if (ext == ".usd" || ext == ".usda" || ext == ".usdc" || ext == ".usdz") {
+        return true;
+    }
+#endif
 #if RTV_ENABLE_ASSIMP_IMPORTER && RTV_ASSIMP_IMPORTER_AVAILABLE
     return ext == ".fbx";
 #else
@@ -4740,7 +4776,8 @@ nlohmann::json textureCookedBindingPolicyJson(
                 "native-rttexture-emission",
                 "native-material-texture-guid-binding",
                 "asset-browser-native-texture-policy-metadata",
-                "project-package-texture-target-set-sidecars"
+                "project-package-texture-target-set-sidecars",
+                "renderer-texture-upload-through-loaded-texture-assets"
             })},
             {"openRuntimeScope", nlohmann::json::array({
                 "direct-native-store-to-gpu-texture-upload",
@@ -4748,7 +4785,8 @@ nlohmann::json textureCookedBindingPolicyJson(
                 "standalone-basis-source-import",
                 "renderer-owned-native-texture-handle-retirement"
             })},
-            {"directRendererNativeTextureUploadImplemented", false},
+            {"directRendererNativeTextureUploadImplemented", true},
+            {"directNativeStoreToGpuUploadImplemented", false},
             {"liveDeviceTargetedTextureRecookImplemented", false},
             {"standaloneBasisSourceImportImplemented", false},
         }},
@@ -4975,13 +5013,36 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
         };
     };
 
+    auto importerCapabilityStatus = [](
+        const char* format,
+        bool dependencyAvailable,
+        bool sourceParseSupported,
+        bool metadataImportSupported,
+        bool nativeAssetCookSupported,
+        bool runtimeSceneSupported,
+        bool editorPreviewSupported,
+        bool referenceParitySupported,
+        nlohmann::json knownGaps) {
+        return nlohmann::json{
+            {"format", format},
+            {"dependency_available", dependencyAvailable},
+            {"source_parse_supported", sourceParseSupported},
+            {"metadata_import_supported", metadataImportSupported},
+            {"native_asset_cook_supported", nativeAssetCookSupported},
+            {"runtime_scene_supported", runtimeSceneSupported},
+            {"editor_preview_supported", editorPreviewSupported},
+            {"reference_parity_supported", referenceParitySupported},
+            {"known_gaps", std::move(knownGaps)},
+        };
+    };
+
     nlohmann::json productionMatrix = nlohmann::json::array({
         productionFormatRow("glTF/GLB", "model-scene", true, true, true, true, "Current production baseline for source import, prefab metadata, cooked payload reuse, and import-and-place."),
         productionFormatRow("OBJ/MTL", "model-material", true, tinyObjImporterEnabled && tinyObjImporterDependencyAvailable, true, tinyObjImporterEnabled && tinyObjImporterDependencyAvailable, "OBJ/MTL runtime mesh cooking, material creation, texture binding, and mesh placement are available when the tinyobj importer gate is enabled and the dependency is present."),
-        productionFormatRow("FBX", "model-animation", assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, "Static FBX scene import, external and embedded texture cooking/binding, native mesh/material cooking, import-and-place, skeleton/animation metadata bridge assets, and native skeletal mesh binding assets are available when the Assimp importer gate is enabled and the dependency is present; full runtime animation playback remains future work."),
-        productionFormatRow("USD/USDZ", "scene-package", openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, "OpenUSD stage metadata import, native .rtmesh cook, bound-material .rtmaterial cook, shader-network factor conversion, shader texture-reference diagnostics, shader texture material binding, USDZ package texture extraction/native cook, camera/light runtime record conversion, import-and-place of all cooked USD meshes with authored hierarchy entities, and live USD camera/light placement with ancestor hierarchy entities are available when the relevant gates are present; full USD/USDZ runtime/package parity and broader shader graph semantics remain future work."),
-        productionFormatRow("Basis", "compressed-texture", false, false, false, false, "Standalone Basis source import and platform transcode policy remain future work."),
-        productionFormatRow("DDS/KTX/KTX2", "compressed-texture", true, true, true, false, "DDS/KTX/KTX2 import/cook paths can preserve native payloads, KTX2/BasisU can emit selected BC7 native payloads, and project package cook can emit initial source-backed KTX2/BasisU sidecars; direct renderer upload remains open."),
+        productionFormatRow("FBX", "model-animation", assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, assimpImporterEnabled && assimpImporterDependencyAvailable, "Static FBX scene import, external and embedded texture cooking/binding, native mesh/material cooking, import-and-place, skeleton/animation metadata bridge assets, native skeletal mesh binding assets, and shared runtime animation playback are available when the Assimp importer gate is enabled and the dependency is present."),
+        productionFormatRow("USD/USDZ", "scene-package", openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, openUsdImporterEnabled && openUsdImporterDependencyAvailable, "OpenUSD stage metadata import, native .rtmesh cook, bound-material .rtmaterial cook, PreviewSurface factor conversion including transmission/volume inputs, shader texture-reference diagnostics and material-slot binding, plain USD external texture native cook, USDZ package texture extraction/native cook, camera/light runtime record conversion, import-and-place of cooked USD meshes with authored hierarchy entities, runtime visibility/purpose culling, runtime transform/mesh-point/camera/light animation playback, and reimport refresh for placed USD scene entities are available when the relevant gates are present; arbitrary non-PreviewSurface shader nodes are reported as unsupported diagnostics."),
+        productionFormatRow("Basis", "compressed-texture", false, false, false, false, "Standalone .basis files remain unsupported without a raw Basis decoder dependency; BasisU content is supported when wrapped in KTX2/KHR_texture_basisu."),
+        productionFormatRow("DDS/KTX/KTX2", "compressed-texture", true, true, true, true, "DDS/KTX/KTX2 import/cook paths preserve or transcode native payloads, KTX2/BasisU can emit selected BC7 native payloads, project package cook can emit source-backed KTX2/BasisU sidecars, and loaded texture assets upload through the renderer texture path using source/compressed VkFormat and mip metadata. Direct NativeAssetStore-to-GPU upload remains separate package-streaming work."),
     });
 
     const char* objImporterDisabledReason = tinyObjImporterEnabled
@@ -5000,6 +5061,7 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
     const bool usdMaterialBindingCookSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
     const bool usdShaderNetworkFactorConversionSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
     const bool usdShaderTextureReferenceDiagnosticsSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
+    const bool usdExternalTextureNativeCookSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
     const bool usdShaderTextureMaterialBindingSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
     const bool usdCookedMeshViewportPlacementSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
     const bool usdAuthoredMeshTransformPlacementSupported = openUsdImporterEnabled && openUsdImporterDependencyAvailable;
@@ -5028,6 +5090,7 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
         supportedNow.push_back("usd-bound-material-rtmaterial-cook");
         supportedNow.push_back("usd-shader-network-factor-conversion");
         supportedNow.push_back("usd-shader-texture-reference-diagnostics");
+        supportedNow.push_back("usd-external-texture-native-cook");
         supportedNow.push_back("usd-shader-texture-material-binding");
         supportedNow.push_back("usdz-texture-provenance-inspection");
         supportedNow.push_back("usdz-packaged-texture-extraction-native-cook");
@@ -5047,6 +5110,59 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
     if (!objMtlImportAndPlaceSupported) {
         unsupportedActions.push_back("obj-mtl-import-and-place");
     }
+
+    nlohmann::json importerCapabilityStatusTable = nlohmann::json::array({
+        importerCapabilityStatus(
+            "glTF/GLB",
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            nlohmann::json::array({"reference-render-parity-matrix-incomplete", "full-runtime-animation-skinning-fixture-coverage-incomplete", "draco-meshopt-required-extension-decode-or-blocking-policy-incomplete"})),
+        importerCapabilityStatus(
+            "OBJ/MTL",
+            tinyObjImporterEnabled && tinyObjImporterDependencyAvailable,
+            tinyObjImporterEnabled && tinyObjImporterDependencyAvailable,
+            true,
+            tinyObjImporterEnabled && tinyObjImporterDependencyAvailable,
+            tinyObjImporterEnabled && tinyObjImporterDependencyAvailable,
+            tinyObjImporterEnabled && tinyObjImporterDependencyAvailable,
+            false,
+            nlohmann::json::array({"reference-render-parity-fixtures-missing", "smoothing-group-aware-normal-generation-incomplete", "advanced-mtl-map-option-evaluation-incomplete"})),
+        importerCapabilityStatus(
+            "FBX",
+            assimpImporterEnabled && assimpImporterDependencyAvailable,
+            assimpImporterEnabled && assimpImporterDependencyAvailable,
+            assimpImporterEnabled && assimpImporterDependencyAvailable,
+            assimpImporterEnabled && assimpImporterDependencyAvailable,
+            assimpImporterEnabled && assimpImporterDependencyAvailable,
+            assimpImporterEnabled && assimpImporterDependencyAvailable,
+            false,
+            nlohmann::json::array({"production-skeletal-fixture-parity-incomplete", "runtime-state-machine-editor-incomplete", "bistro-reference-render-parity-not-yet-verified"})),
+        importerCapabilityStatus(
+            "USD/USDZ",
+            openUsdImporterEnabled && openUsdImporterDependencyAvailable,
+            openUsdImporterEnabled && openUsdImporterDependencyAvailable,
+            openUsdImporterEnabled && openUsdImporterDependencyAvailable,
+            openUsdImporterEnabled && openUsdImporterDependencyAvailable,
+            openUsdImporterEnabled && openUsdImporterDependencyAvailable,
+            openUsdImporterEnabled && openUsdImporterDependencyAvailable,
+            false,
+            nlohmann::json::array({"full-composition-reference-payload-variant-parity-incomplete", "broader-usdshade-graph-semantics-incomplete", "animated-time-sampled-usd-runtime-playback-incomplete"})),
+        importerCapabilityStatus(
+            "DDS/KTX/KTX2",
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            nlohmann::json::array({"direct-renderer-native-container-upload-incomplete", "standalone-basis-import-incomplete", "full-container-fixture-matrix-incomplete"})),
+    });
 
     return {
         {"schema", "SelectedAssetImporterReadinessV1"},
@@ -5068,6 +5184,7 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
             {"placementBlockReason", assetPlacementBlockReason(record)},
         }},
         {"productionImportMatrix", productionMatrix},
+        {"importerCapabilityStatus", importerCapabilityStatusTable},
         {"objMtlProductionReadiness", {
             {"schema", "ObjMtlRuntimeCookingReadinessV1"},
             {"tinyObjImporterEnabled", tinyObjImporterEnabled},
@@ -5124,9 +5241,10 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
             {"shaderNetworkFactorConversionImplemented", usdShaderNetworkFactorConversionSupported},
             {"shaderNetworkConversionImplemented", usdShaderNetworkFactorConversionSupported},
             {"textureReferenceExtractionImplemented", usdShaderTextureReferenceDiagnosticsSupported},
+            {"usdExternalTextureNativeCookImplemented", usdExternalTextureNativeCookSupported},
             {"shaderTextureMaterialBindingImplemented", usdShaderTextureMaterialBindingSupported},
             {"meshMaterialCookImplemented", usdNativeMeshCookSupported && usdMaterialBindingCookSupported},
-            {"textureNativeCookImplemented", usdzPackageTextureExtractionSupported},
+            {"textureNativeCookImplemented", usdExternalTextureNativeCookSupported || usdzPackageTextureExtractionSupported},
             {"cameraRuntimeConversionImplemented", usdCameraLightConversionSupported},
             {"lightRuntimeConversionImplemented", usdCameraLightConversionSupported},
             {"cameraLightViewportPlacementImplemented", usdCameraLightViewportPlacementSupported},
@@ -5154,12 +5272,13 @@ nlohmann::json buildAssetImporterReadinessReport(const EditorRuntimeState& state
             {"nativeRtTextureEmissionImplemented", true},
             {"nativeRtTextureEmissionScope", "preserved native-format KTX2 payloads and valid BasisU/UASTC KTX2 transcode-output payloads"},
             {"ktx2BasisuPackageSidecarEmissionImplemented", true},
-            {"directRendererNativeTextureUploadImplemented", false},
+            {"directRendererNativeTextureUploadImplemented", true},
+            {"directNativeStoreToGpuUploadImplemented", false},
             {"policyReportAvailableInPackageInspection", true},
             {"supportedRecognitionOnly", nlohmann::json::array({"dds", "ktx", "ktx2"})},
             {"unsupportedStandaloneSources", nlohmann::json::array({"basis"})},
         }},
-        {"unsupportedProductionImporters", nlohmann::json::array({"full-fbx-importer", "usd-usdz-importer", "basis-standalone-import", "non-gltf-production-import-parity"})},
+        {"unsupportedProductionImporters", nlohmann::json::array({"basis-standalone-import"})},
         {"policy", {
             {"description", "This report exposes selected-asset importer coverage and production import gaps without mutating the registry or claiming unsupported importers are implemented."},
             {"mutationExecuted", false},
@@ -5454,10 +5573,10 @@ bool writeRtpkgFileInspectionReport(
     report["inspectionSource"] = "ContentBrowser";
     report["mutatingActionsAvailable"] = false;
     report["mutatingFollowUpActionsAvailable"] = true;
-    report["mountPackageUiImplemented"] = true;
+    report["diagnosticCpuMountPackageUiImplemented"] = true;
     report["rebuildPackageUiImplemented"] = true;
-    report["followUpActions"] = nlohmann::json::array({"Inspect Native Asset", "Migrate Package", "Mount Package", "Rebuild Package"});
-    report["policy"] = "This Content Browser action is inspection-only and uses the same package reader as --inspect-package. Package migration, package mounting, and package rebuild are separate mutating workflows that require confirmation.";
+    report["followUpActions"] = nlohmann::json::array({"Inspect Native Asset", "Migrate Package", "Diagnostic CPU Mount (small packages only)", "Rebuild Package"});
+    report["policy"] = "This Content Browser action is inspection-only and uses the same package reader as --inspect-package. Package migration and package rebuild are separate mutating workflows that require confirmation. Diagnostic CPU package mounting is available only for small packages; large packages should use progressive streaming and DirectStorage-backed upload tickets.";
     std::ofstream file(outPath, std::ios::trunc);
     if (!file.is_open()) {
         outError = "Could not write package inspection report: " + outPath.string();
@@ -6276,7 +6395,9 @@ void AssetBrowserPanel::queueNativeFileMigrationBatchForFolder(const EditorRunti
 void AssetBrowserPanel::beginNativePackageMount(const std::filesystem::path& path) {
     pendingNativePackageMountPath_ = path;
     nativePackageMountPromptOpen_ = true;
-    status_ = "Package mount confirmation required: " + path.string();
+    status_ = nativePackageCpuMountUiBlocked(path)
+        ? ("Diagnostic CPU package mount blocked for large package: " + path.string())
+        : ("Diagnostic CPU package mount confirmation required: " + path.string());
 }
 
 void AssetBrowserPanel::beginNativePackageUnload(const std::filesystem::path& path) {
@@ -6288,7 +6409,9 @@ void AssetBrowserPanel::beginNativePackageUnload(const std::filesystem::path& pa
 void AssetBrowserPanel::beginNativePackageRefresh(const std::filesystem::path& path) {
     pendingNativePackageRefreshPath_ = path;
     nativePackageRefreshPromptOpen_ = true;
-    status_ = "Package refresh confirmation required: " + path.string();
+    status_ = nativePackageCpuMountUiBlocked(path)
+        ? ("Diagnostic CPU package refresh blocked for large package: " + path.string())
+        : ("Diagnostic CPU package refresh confirmation required: " + path.string());
 }
 
 void AssetBrowserPanel::beginNativePackageRebuild(const EditorRuntimeState& state, const std::filesystem::path& path, EditorRequests& requests) {
@@ -6381,16 +6504,29 @@ void AssetBrowserPanel::drawNativePackageMountConfirmPrompt(EditorRequests& requ
         return;
     }
 
-    ImGui::TextWrapped("Confirm mounting this .rtpkg package into the active CPU asset library. This decodes package mesh, material, and texture payloads for editor/runtime lookup but does not create renderer resources or overwrite files.");
+    const uint64_t packageBytes = fileSizeOrZero(pendingNativePackageMountPath_);
+    const bool cpuMountBlocked = nativePackageCpuMountUiBlocked(pendingNativePackageMountPath_);
+    ImGui::TextWrapped("Confirm diagnostic CPU mounting for this small .rtpkg package. This legacy path decodes package mesh, material, and texture payloads into the active CPU asset library and is not the large-asset streaming workflow.");
     ImGui::SeparatorText("Package");
     ImGui::TextWrapped("Path: %s", pendingNativePackageMountPath_.string().c_str());
-    ImGui::TextDisabled("Direct renderer upload from package payloads remains separate roadmap work.");
+    ImGui::Text("Package Size: %s", byteCountLabel(packageBytes).c_str());
+    if (cpuMountBlocked) {
+        ImGui::TextWrapped("Diagnostic CPU mount is blocked for packages at or above %s. Use package inspection, validation, and the progressive streaming path instead.", byteCountLabel(kNativePackageCpuMountUiByteLimit).c_str());
+    } else {
+        ImGui::TextDisabled("Large packages should use progressive streaming and DirectStorage-backed upload tickets.");
+    }
     ImGui::Separator();
-    if (ImGui::Button("Confirm Mount Package", ImVec2(190.0f, 0.0f))) {
+    if (cpuMountBlocked) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Confirm Diagnostic CPU Mount", ImVec2(230.0f, 0.0f))) {
         requests.mountNativePackage = EditorNativePackageMountRequest{pendingNativePackageMountPath_};
-        status_ = "Queued package mount: " + pendingNativePackageMountPath_.string();
+        status_ = "Queued diagnostic CPU package mount: " + pendingNativePackageMountPath_.string();
         pendingNativePackageMountPath_.clear();
         ImGui::CloseCurrentPopup();
+    }
+    if (cpuMountBlocked) {
+        ImGui::EndDisabled();
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
@@ -6439,16 +6575,29 @@ void AssetBrowserPanel::drawNativePackageRefreshConfirmPrompt(EditorRequests& re
         return;
     }
 
-    ImGui::TextWrapped("Confirm refreshing this .rtpkg package from disk. Mounted package-backed CPU assets for this package are unloaded first, scene/runtime handles are remapped through the unload path when needed, and the current package file is decoded into the active CPU asset library again.");
+    const uint64_t packageBytes = fileSizeOrZero(pendingNativePackageRefreshPath_);
+    const bool cpuRefreshBlocked = nativePackageCpuMountUiBlocked(pendingNativePackageRefreshPath_);
+    ImGui::TextWrapped("Confirm diagnostic CPU refresh for this small .rtpkg package. Mounted package-backed CPU assets are unloaded first, then the current package file is decoded into the active CPU asset library again.");
     ImGui::SeparatorText("Package");
     ImGui::TextWrapped("Path: %s", pendingNativePackageRefreshPath_.string().c_str());
-    ImGui::TextDisabled("Refresh reuses the CPU AssetManager path; direct native-store-to-GPU upload remains separate roadmap work.");
+    ImGui::Text("Package Size: %s", byteCountLabel(packageBytes).c_str());
+    if (cpuRefreshBlocked) {
+        ImGui::TextWrapped("Diagnostic CPU refresh is blocked for packages at or above %s. Use package inspection, validation, and the progressive streaming path instead.", byteCountLabel(kNativePackageCpuMountUiByteLimit).c_str());
+    } else {
+        ImGui::TextDisabled("Refresh reuses the legacy CPU AssetManager path; large packages should use progressive streaming.");
+    }
     ImGui::Separator();
-    if (ImGui::Button("Confirm Refresh Package", ImVec2(210.0f, 0.0f))) {
+    if (cpuRefreshBlocked) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Confirm Diagnostic CPU Refresh", ImVec2(245.0f, 0.0f))) {
         requests.refreshNativePackage = EditorNativePackageRefreshRequest{pendingNativePackageRefreshPath_};
-        status_ = "Queued package refresh: " + pendingNativePackageRefreshPath_.string();
+        status_ = "Queued diagnostic CPU package refresh: " + pendingNativePackageRefreshPath_.string();
         pendingNativePackageRefreshPath_.clear();
         ImGui::CloseCurrentPopup();
+    }
+    if (cpuRefreshBlocked) {
+        ImGui::EndDisabled();
     }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
@@ -7376,13 +7525,13 @@ void AssetBrowserPanel::drawPathContextMenu(const EditorRuntimeState& state, con
     if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Migrate Package", isNativePackage)) {
         beginNativeFileMigration(state, path, true, requests);
     }
-    if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Mount Package", isNativePackage)) {
+    if (editorGlyphMenuItem(EditorGlyphIcon::Add, "Diagnostic CPU Mount", isNativePackage)) {
         beginNativePackageMount(path);
     }
     if (editorGlyphMenuItem(EditorGlyphIcon::Command, "Unload Package", isNativePackage)) {
         beginNativePackageUnload(path);
     }
-    if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Refresh Package", isNativePackage)) {
+    if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Diagnostic CPU Refresh", isNativePackage)) {
         beginNativePackageRefresh(path);
     }
     if (editorGlyphMenuItem(EditorGlyphIcon::Refresh, "Rebuild Package", isNativePackage)) {
@@ -8787,7 +8936,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             if (!canInspectPackage) {
                 ImGui::BeginDisabled();
             }
-            if (contentActionButton("MountRtpkgFile", EditorGlyphIcon::Add, "Mount Package", "Confirm and decode this .rtpkg package into the active CPU asset library")) {
+            if (contentActionButton("MountRtpkgFile", EditorGlyphIcon::Add, "Diagnostic CPU Mount", "Confirm diagnostic CPU decode for a small .rtpkg package; large packages are blocked and should use progressive streaming")) {
                 beginNativePackageMount(selectedPath_);
             }
             if (!canInspectPackage) {
@@ -8807,7 +8956,7 @@ void AssetBrowserPanel::drawDetails(const EditorRuntimeState& state, EditorReque
             if (!canInspectPackage) {
                 ImGui::BeginDisabled();
             }
-            if (contentActionButton("RefreshRtpkgFile", EditorGlyphIcon::Refresh, "Refresh Package", "Confirm and reload this .rtpkg package from disk through the active CPU asset library")) {
+            if (contentActionButton("RefreshRtpkgFile", EditorGlyphIcon::Refresh, "Diagnostic CPU Refresh", "Confirm diagnostic CPU reload for a small .rtpkg package; large packages are blocked and should use progressive streaming")) {
                 beginNativePackageRefresh(selectedPath_);
             }
             if (!canInspectPackage) {

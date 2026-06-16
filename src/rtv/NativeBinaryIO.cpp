@@ -35,6 +35,23 @@ uint64_t fnv1a(const std::byte* data, size_t size, uint64_t seed) {
     return value;
 }
 
+void fnv1aUpdate(uint64_t& value, const std::byte* data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        value ^= static_cast<uint8_t>(data[i]);
+        value *= kFnvPrime;
+    }
+}
+
+std::array<uint8_t, 32> nativeHashPartsToBytes(const std::array<uint64_t, 4>& parts) {
+    std::array<uint8_t, 32> hash{};
+    for (size_t i = 0; i < parts.size(); ++i) {
+        for (size_t b = 0; b < 8; ++b) {
+            hash[i * 8 + b] = static_cast<uint8_t>((parts[i] >> (b * 8)) & 0xffu);
+        }
+    }
+    return hash;
+}
+
 template <typename T>
 void appendPod(std::vector<std::byte>& out, const T& value) {
     const auto* bytes = reinterpret_cast<const std::byte*>(&value);
@@ -132,15 +149,28 @@ NativeTextureRole fixtureTextureRoleFromString(std::string_view value) {
     const std::string role = lowerFixtureAscii(value);
     if (role == "basecolor" || role == "base_color" || role == "albedo" || role == "diffuse") return NativeTextureRole::BaseColor;
     if (role == "normal" || role == "norm" || role == "nrm") return NativeTextureRole::Normal;
-    if (role == "metallicroughness" || role == "metallic_roughness" || role == "metalrough" || role == "orm" || role == "rma" || role == "mrao") return NativeTextureRole::MetallicRoughness;
+    if (role == "metallicroughness" || role == "metallic_roughness" || role == "metalrough" || role == "orm" || role == "rma" || role == "mra" || role == "mrao" || role == "rmao") return NativeTextureRole::MetallicRoughness;
     if (role == "metallic" || role == "metalness" || role == "metal") return NativeTextureRole::Metallic;
     if (role == "roughness" || role == "rough") return NativeTextureRole::Roughness;
     if (role == "occlusion" || role == "ambientocclusion" || role == "ao") return NativeTextureRole::Occlusion;
     if (role == "emissive" || role == "emission" || role == "emit") return NativeTextureRole::Emissive;
     if (role == "opacity" || role == "alpha" || role == "transparency" || role == "mask") return NativeTextureRole::Opacity;
     if (role == "height" || role == "displacement" || role == "disp" || role == "bump") return NativeTextureRole::Height;
+    if (role == "thickness" || role == "volume_thickness" || role == "volumethickness") return NativeTextureRole::Thickness;
     if (role == "environmenthdr" || role == "environment" || role == "hdr" || role == "hdri") return NativeTextureRole::EnvironmentHdr;
     if (role == "data") return NativeTextureRole::Data;
+    if (role == "specular") return NativeTextureRole::Specular;
+    if (role == "specularcolor" || role == "specular_color") return NativeTextureRole::SpecularColor;
+    if (role == "transmission") return NativeTextureRole::Transmission;
+    if (role == "clearcoat") return NativeTextureRole::Clearcoat;
+    if (role == "clearcoatroughness" || role == "clearcoat_roughness") return NativeTextureRole::ClearcoatRoughness;
+    if (role == "clearcoatnormal" || role == "clearcoat_normal") return NativeTextureRole::ClearcoatNormal;
+    if (role == "sheen") return NativeTextureRole::Sheen;
+    if (role == "sheencolor" || role == "sheen_color") return NativeTextureRole::SheenColor;
+    if (role == "sheenroughness" || role == "sheen_roughness") return NativeTextureRole::SheenRoughness;
+    if (role == "iridescence") return NativeTextureRole::Iridescence;
+    if (role == "iridescencethickness" || role == "iridescence_thickness") return NativeTextureRole::IridescenceThickness;
+    if (role == "anisotropy") return NativeTextureRole::Anisotropy;
     return NativeTextureRole::Unknown;
 }
 
@@ -157,6 +187,19 @@ const char* fixtureTextureRoleName(NativeTextureRole role) {
     case NativeTextureRole::Height: return "height";
     case NativeTextureRole::EnvironmentHdr: return "environmentHDR";
     case NativeTextureRole::Data: return "data";
+    case NativeTextureRole::Specular: return "specular";
+    case NativeTextureRole::SpecularColor: return "specularColor";
+    case NativeTextureRole::Transmission: return "transmission";
+    case NativeTextureRole::Clearcoat: return "clearcoat";
+    case NativeTextureRole::ClearcoatRoughness: return "clearcoatRoughness";
+    case NativeTextureRole::ClearcoatNormal: return "clearcoatNormal";
+    case NativeTextureRole::Sheen: return "sheen";
+    case NativeTextureRole::SheenColor: return "sheenColor";
+    case NativeTextureRole::SheenRoughness: return "sheenRoughness";
+    case NativeTextureRole::Iridescence: return "iridescence";
+    case NativeTextureRole::IridescenceThickness: return "iridescenceThickness";
+    case NativeTextureRole::Anisotropy: return "anisotropy";
+    case NativeTextureRole::Thickness: return "thickness";
     case NativeTextureRole::Unknown:
     default: return "unknown";
     }
@@ -188,6 +231,36 @@ void appendPadding(std::vector<std::byte>& out, uint64_t alignment = kNativeAsse
     while (out.size() < aligned) {
         out.push_back(std::byte{0});
     }
+}
+
+bool writeRaw(std::ofstream& file, const std::byte* data, uint64_t size) {
+    if (size == 0) {
+        return true;
+    }
+    file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    return file.good();
+}
+
+bool writeVector(std::ofstream& file, const std::vector<std::byte>& bytes) {
+    return writeRaw(file, bytes.data(), static_cast<uint64_t>(bytes.size()));
+}
+
+bool writePadding(std::ofstream& file, uint64_t& cursor, uint64_t alignment = kNativeAssetAlignment) {
+    const uint64_t aligned = nativeAlignUp(cursor, alignment);
+    if (aligned == cursor) {
+        return true;
+    }
+    std::array<std::byte, kNativeAssetAlignment> zeros{};
+    uint64_t remaining = aligned - cursor;
+    while (remaining > 0) {
+        const uint64_t chunk = std::min<uint64_t>(remaining, zeros.size());
+        if (!writeRaw(file, zeros.data(), chunk)) {
+            return false;
+        }
+        remaining -= chunk;
+        cursor += chunk;
+    }
+    return true;
 }
 
 bool readFileBytes(const std::filesystem::path& path, std::vector<std::byte>& bytes, NativeBinaryError* error) {
@@ -321,6 +394,15 @@ nlohmann::json hashJson(const std::array<uint8_t, 32>& hash) {
     return nativeHashHex(hash);
 }
 
+const char* nativeChunkCompressionNameLocal(uint32_t compression) {
+    switch (static_cast<NativeChunkCompression>(compression)) {
+    case NativeChunkCompression::None: return "none";
+    case NativeChunkCompression::ReservedZstd: return "zstd";
+    case NativeChunkCompression::ReservedGDeflate: return "gdeflate";
+    }
+    return "unknown";
+}
+
 bool replaceFileAtomically(const std::filesystem::path& tempPath, const std::filesystem::path& destination, std::error_code& ec) {
     ec.clear();
 #if defined(_WIN32)
@@ -346,19 +428,13 @@ uint64_t nativeAlignUp(uint64_t value, uint64_t alignment) {
 }
 
 std::array<uint8_t, 32> nativeHashBytes(const std::byte* data, size_t size) {
-    std::array<uint8_t, 32> hash{};
     const std::array<uint64_t, 4> parts{
         fnv1a(data, size, 0x9ae16a3b2f90404full),
         fnv1a(data, size, 0xc949d7c7509e6557ull),
         fnv1a(data, size, 0xff51afd7ed558ccdull),
         fnv1a(data, size, 0xc4ceb9fe1a85ec53ull),
     };
-    for (size_t i = 0; i < parts.size(); ++i) {
-        for (size_t b = 0; b < 8; ++b) {
-            hash[i * 8 + b] = static_cast<uint8_t>((parts[i] >> (b * 8)) & 0xffu);
-        }
-    }
-    return hash;
+    return nativeHashPartsToBytes(parts);
 }
 
 std::array<uint8_t, 32> nativeHashBytes(const std::vector<std::byte>& data) {
@@ -469,15 +545,19 @@ std::string nativeBinaryErrorCodeName(NativeBinaryErrorCode code) {
     return "unknown";
 }
 
-bool NativeAssetWriter::write(const std::filesystem::path& path, const NativeAssetWriteDesc& desc, NativeBinaryError* error) const {
+bool NativeAssetWriter::write(
+    const std::filesystem::path& path,
+    const NativeAssetWriteDesc& desc,
+    NativeBinaryError* error,
+    NativeAssetWriteResult* result) const {
     if (desc.kind == NativeAssetKind::Unknown || desc.kind == NativeAssetKind::Package) {
         if (error) {
             *error = makeError(NativeBinaryErrorCode::CorruptHeader, path, "header", 0, sizeof(NativeAssetHeader), "Unsupported standalone native asset kind");
         }
         return false;
     }
-    std::vector<std::byte> bytes;
-    bytes.resize(sizeof(NativeAssetHeader));
+    std::vector<std::byte> metadataBytes;
+    metadataBytes.resize(sizeof(NativeAssetHeader));
 
     std::map<std::string, uint32_t> stringOffsets;
     std::vector<std::byte> debugDirectory;
@@ -526,43 +606,51 @@ bool NativeAssetWriter::write(const std::filesystem::path& path, const NativeAss
     object.debugNameSize = static_cast<uint32_t>(desc.debugName.size());
     std::vector<NativeObjectRecord> objectRecords{object};
 
-    appendPadding(bytes);
-    const uint64_t objectTableOffset = bytes.size();
-    for (const auto& record : objectRecords) appendPod(bytes, record);
-    appendPadding(bytes);
-    const uint64_t chunkTableOffset = bytes.size();
+    appendPadding(metadataBytes);
+    const uint64_t objectTableOffset = metadataBytes.size();
+    for (const auto& record : objectRecords) appendPod(metadataBytes, record);
+    appendPadding(metadataBytes);
+    const uint64_t chunkTableOffset = metadataBytes.size();
     const uint64_t chunkTableSize = static_cast<uint64_t>(desc.chunks.size()) * sizeof(NativeChunkRecord);
-    bytes.resize(bytes.size() + static_cast<size_t>(chunkTableSize));
-    appendPadding(bytes);
-    const uint64_t dependencyTableOffset = bytes.size();
-    for (const auto& record : dependencyRecords) appendPod(bytes, record);
-    appendPadding(bytes);
-    const uint64_t debugRecordTableOffset = bytes.size();
-    for (const auto& record : debugRecords) appendPod(bytes, record);
-    for (const auto& record : desc.migrationRecords) appendPod(bytes, record);
-    appendPadding(bytes);
-    const uint64_t debugDirectoryOffset = bytes.size();
-    appendBytes(bytes, debugDirectory);
-    appendPadding(bytes);
+    metadataBytes.resize(metadataBytes.size() + static_cast<size_t>(chunkTableSize));
+    appendPadding(metadataBytes);
+    const uint64_t dependencyTableOffset = metadataBytes.size();
+    for (const auto& record : dependencyRecords) appendPod(metadataBytes, record);
+    appendPadding(metadataBytes);
+    const uint64_t debugRecordTableOffset = metadataBytes.size();
+    for (const auto& record : debugRecords) appendPod(metadataBytes, record);
+    for (const auto& record : desc.migrationRecords) appendPod(metadataBytes, record);
+    appendPadding(metadataBytes);
+    const uint64_t debugDirectoryOffset = metadataBytes.size();
+    appendBytes(metadataBytes, debugDirectory);
+    appendPadding(metadataBytes);
 
     std::vector<NativeChunkRecord> chunkRecords;
     chunkRecords.reserve(desc.chunks.size());
-    std::vector<std::byte> payloadBytes;
+    std::array<uint64_t, 4> payloadHashParts{
+        kFnvOffset ^ 0x9ae16a3b2f90404full,
+        kFnvOffset ^ 0xc949d7c7509e6557ull,
+        kFnvOffset ^ 0xff51afd7ed558ccdull,
+        kFnvOffset ^ 0xc4ceb9fe1a85ec53ull,
+    };
+    uint64_t fileSize = metadataBytes.size();
     for (const auto& input : desc.chunks) {
-        appendPadding(bytes);
+        fileSize = nativeAlignUp(fileSize);
         NativeChunkRecord record{};
         record.type = input.type;
         record.compression = static_cast<uint32_t>(input.compression);
-        record.offset = bytes.size();
+        record.offset = fileSize;
         record.size = input.payload.size();
         record.uncompressedSize = input.payload.size();
         record.payloadHash = nativeHashBytes(input.payload);
         record.flags = input.flags;
-        appendBytes(bytes, input.payload);
-        appendBytes(payloadBytes, input.payload);
+        fileSize += input.payload.size();
+        for (uint64_t& part : payloadHashParts) {
+            fnv1aUpdate(part, input.payload.data(), input.payload.size());
+        }
         chunkRecords.push_back(record);
     }
-    appendPadding(bytes);
+    fileSize = nativeAlignUp(fileSize);
 
     NativeAssetHeader header{};
     header.magic = desc.magic != 0 ? desc.magic : nativeAssetMagicForKind(desc.kind);
@@ -571,7 +659,7 @@ bool NativeAssetWriter::write(const std::filesystem::path& path, const NativeAss
     header.assetGuid = desc.assetGuid;
     header.sourceHash = desc.sourceHash;
     header.importSettingsHash = desc.importSettingsHash;
-    header.payloadHash = nativeHashBytes(payloadBytes);
+    header.payloadHash = nativeHashPartsToBytes(payloadHashParts);
     header.objectTableOffset = objectTableOffset;
     header.objectTableCount = static_cast<uint32_t>(objectRecords.size());
     header.objectTableStride = sizeof(NativeObjectRecord);
@@ -586,11 +674,15 @@ bool NativeAssetWriter::write(const std::filesystem::path& path, const NativeAss
     header.migrationTableOffset = debugRecordTableOffset + static_cast<uint64_t>(debugRecords.size()) * sizeof(NativeDebugRecord);
     header.migrationTableCount = static_cast<uint32_t>(desc.migrationRecords.size());
     header.migrationTableStride = sizeof(NativeMigrationRecord);
-    header.fileSize = bytes.size();
+    header.fileSize = fileSize;
 
-    std::memcpy(bytes.data(), &header, sizeof(header));
+    std::memcpy(metadataBytes.data(), &header, sizeof(header));
     if (!chunkRecords.empty()) {
-        std::memcpy(bytes.data() + chunkTableOffset, chunkRecords.data(), chunkRecords.size() * sizeof(NativeChunkRecord));
+        std::memcpy(metadataBytes.data() + chunkTableOffset, chunkRecords.data(), chunkRecords.size() * sizeof(NativeChunkRecord));
+    }
+    if (result != nullptr) {
+        result->fileSize = header.fileSize;
+        result->payloadHash = header.payloadHash;
     }
 
     const std::filesystem::path tempPath = path.string() + ".tmp";
@@ -609,33 +701,50 @@ bool NativeAssetWriter::write(const std::filesystem::path& path, const NativeAss
         std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) {
             if (error) {
-                *error = makeError(NativeBinaryErrorCode::IoError, tempPath, "file", 0, bytes.size(), "Could not open temporary native asset file for writing");
+                *error = makeError(NativeBinaryErrorCode::IoError, tempPath, "file", 0, header.fileSize, "Could not open temporary native asset file for writing");
             }
             return false;
         }
-        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        if (!file.good()) {
+        uint64_t cursor = 0;
+        if (!writeVector(file, metadataBytes)) {
             if (error) {
-                *error = makeError(NativeBinaryErrorCode::IoError, tempPath, "file", 0, bytes.size(), "Could not write complete native asset file");
+                *error = makeError(NativeBinaryErrorCode::IoError, tempPath, "file", cursor, header.fileSize, "Could not write native asset metadata");
             }
             return false;
         }
-    }
-
-    NativeAssetReader reader;
-    NativeAssetInspection inspection = reader.inspect(tempPath, true);
-    if (!inspection.ok) {
-        if (error) {
-            *error = inspection.errors.empty()
-                ? makeError(NativeBinaryErrorCode::CorruptHeader, tempPath, "file", 0, bytes.size(), "Native asset self-validation failed")
-                : inspection.errors.front();
+        cursor += metadataBytes.size();
+        for (const auto& input : desc.chunks) {
+            if (!writePadding(file, cursor)) {
+                if (error) {
+                    *error = makeError(NativeBinaryErrorCode::IoError, tempPath, "file", cursor, header.fileSize, "Could not write native asset chunk padding");
+                }
+                return false;
+            }
+            if (!writeVector(file, input.payload)) {
+                if (error) {
+                    *error = makeError(NativeBinaryErrorCode::IoError, tempPath, "file", cursor, input.payload.size(), "Could not write native asset chunk payload");
+                }
+                return false;
+            }
+            cursor += input.payload.size();
         }
-        return false;
+        if (!writePadding(file, cursor)) {
+            if (error) {
+                *error = makeError(NativeBinaryErrorCode::IoError, tempPath, "file", cursor, header.fileSize, "Could not write final native asset padding");
+            }
+            return false;
+        }
+        if (cursor != header.fileSize) {
+            if (error) {
+                *error = makeError(NativeBinaryErrorCode::IoError, tempPath, "file", cursor, header.fileSize, "Native asset streaming writer size mismatch");
+            }
+            return false;
+        }
     }
 
     if (!replaceFileAtomically(tempPath, path, ec)) {
         if (error) {
-            *error = makeError(NativeBinaryErrorCode::IoError, path, "file", 0, bytes.size(), "Could not atomically replace native asset destination: " + ec.message());
+            *error = makeError(NativeBinaryErrorCode::IoError, path, "file", 0, header.fileSize, "Could not atomically replace native asset destination: " + ec.message());
         }
         return false;
     }
@@ -716,7 +825,12 @@ NativeAssetInspection NativeAssetReader::inspectBytes(const std::filesystem::pat
         }
     }
 
-    std::vector<std::byte> payloadBytes;
+    std::array<uint64_t, 4> payloadHashParts{
+        kFnvOffset ^ 0x9ae16a3b2f90404full,
+        kFnvOffset ^ 0xc949d7c7509e6557ull,
+        kFnvOffset ^ 0xff51afd7ed558ccdull,
+        kFnvOffset ^ 0xc4ceb9fe1a85ec53ull,
+    };
     for (const NativeChunkRecord& chunk : inspection.chunks) {
         if (!rangeInside(chunk.offset, chunk.size, bytes.size())) {
             inspection.errors.push_back(makeError(NativeBinaryErrorCode::CorruptTable, pathHint, "chunkPayload", chunk.offset, chunk.size, "Chunk payload is outside the file"));
@@ -728,10 +842,14 @@ NativeAssetInspection NativeAssetReader::inspectBytes(const std::filesystem::pat
                 inspection.errors.push_back(makeError(NativeBinaryErrorCode::HashMismatch, pathHint, "chunkPayload", chunk.offset, chunk.size, "Chunk payload hash does not match the chunk table"));
             }
         }
-        payloadBytes.insert(payloadBytes.end(), bytes.begin() + static_cast<size_t>(chunk.offset), bytes.begin() + static_cast<size_t>(chunk.offset + chunk.size));
+        if (validatePayloadHash) {
+            for (uint64_t& part : payloadHashParts) {
+                fnv1aUpdate(part, bytes.data() + chunk.offset, static_cast<size_t>(chunk.size));
+            }
+        }
     }
     if (validatePayloadHash) {
-        const auto payloadHash = nativeHashBytes(payloadBytes);
+        const auto payloadHash = nativeHashPartsToBytes(payloadHashParts);
         inspection.payloadHashValid = payloadHash == header.payloadHash;
         if (!inspection.payloadHashValid) {
             inspection.errors.push_back(makeError(NativeBinaryErrorCode::HashMismatch, pathHint, "payloadHash", offsetof(NativeAssetHeader, payloadHash), header.payloadHash.size(), "Header payload hash does not match concatenated chunk payloads"));
@@ -773,6 +891,7 @@ nlohmann::json nativeAssetInspectionToJson(const NativeAssetInspection& inspecti
             {"index", i},
             {"type", c.type},
             {"compression", c.compression},
+            {"compression_name", nativeChunkCompressionNameLocal(c.compression)},
             {"offset", c.offset},
             {"size", c.size},
             {"uncompressed_size", c.uncompressedSize},

@@ -62,6 +62,7 @@ struct PathDataRecord {
     vec4 denoiser_hit_distance;
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
 };
 layout(set = 0, binding = 42, std430) buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 layout(set = 0, binding = 37, std140) uniform PrevCamera {
@@ -227,6 +228,15 @@ layout(set = 0, binding = 47, std430) readonly buffer RtMeshGeometryRanges {
 layout(set = 0, binding = 48, std430) buffer RtDiagnosticCounters {
     uint rt_diagnostic_counters[];
 };
+layout(set = 0, binding = 55, std430) readonly buffer StreamingResetInstanceMasks {
+    uint streaming_reset_instance_masks[];
+};
+
+bool streaming_instance_reset_mask(uint instanceId, uint flag) {
+    return instanceId != 0xffffffffu &&
+        instanceId < streaming_reset_instance_masks.length() &&
+        (streaming_reset_instance_masks[instanceId] & flag) != 0u;
+}
 
 const uint RTV_DEBUG_FLAG_RAY_TRACING_COUNTERS = 1u << 0u;
 const uint RT_DIAG_CAMERA_ANY_HIT_INVOCATIONS = 0u;

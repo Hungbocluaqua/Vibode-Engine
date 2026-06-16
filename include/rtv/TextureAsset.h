@@ -45,6 +45,10 @@ struct TextureAsset {
     uint32_t width = 1;
     uint32_t height = 1;
     uint32_t channels = 4;
+    uint32_t sourceArrayLayers = 1;
+    uint32_t sourceDepth = 1;
+    uint32_t sourceFaceCount = 1;
+    bool sourceIsCubemap = false;
     int mipLevels = 1;
     bool srgb = true;
     bool resident = false;
@@ -59,6 +63,10 @@ struct TextureAsset {
     std::filesystem::path nativePath;
     std::string sourceContainerKind;
     std::string nativePayloadSource;
+    // Role authored by the source material binding (e.g. glTF material slot/extension),
+    // when known. Empty means "infer from filename/format". This lets the importer
+    // prefer the authored material role over filename heuristics during cooking.
+    std::string authoredRole;
     bool sourceContainerPreserved = false;
     bool sourceContainerTranscoded = false;
     std::vector<uint8_t> rgba8;

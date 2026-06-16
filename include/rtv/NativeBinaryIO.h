@@ -57,6 +57,11 @@ struct NativeAssetWriteDesc {
     std::vector<NativeMigrationRecord> migrationRecords;
 };
 
+struct NativeAssetWriteResult {
+    uint64_t fileSize = 0;
+    std::array<uint8_t, 32> payloadHash{};
+};
+
 struct NativeAssetInspection {
     bool ok = false;
     bool migrationRequired = false;
@@ -88,7 +93,11 @@ struct NativeAssetInspection {
 
 class NativeAssetWriter {
 public:
-    [[nodiscard]] bool write(const std::filesystem::path& path, const NativeAssetWriteDesc& desc, NativeBinaryError* error = nullptr) const;
+    [[nodiscard]] bool write(
+        const std::filesystem::path& path,
+        const NativeAssetWriteDesc& desc,
+        NativeBinaryError* error = nullptr,
+        NativeAssetWriteResult* result = nullptr) const;
 };
 
 class NativeAssetReader {

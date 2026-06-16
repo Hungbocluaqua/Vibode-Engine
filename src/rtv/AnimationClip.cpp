@@ -44,6 +44,16 @@ AnimationTrackPath trackPathFromString(const std::string& path) {
     if (path == "rotation") return AnimationTrackPath::Rotation;
     if (path == "scale") return AnimationTrackPath::Scale;
     if (path == "weights") return AnimationTrackPath::Weights;
+    if (path == "meshVertexPositions") return AnimationTrackPath::MeshVertexPositions;
+    if (path == "cameraYfov") return AnimationTrackPath::CameraYfov;
+    if (path == "cameraAspectRatio") return AnimationTrackPath::CameraAspectRatio;
+    if (path == "cameraOrthoXmag") return AnimationTrackPath::CameraOrthoXmag;
+    if (path == "cameraOrthoYmag") return AnimationTrackPath::CameraOrthoYmag;
+    if (path == "cameraNearFar") return AnimationTrackPath::CameraNearFar;
+    if (path == "lightColor") return AnimationTrackPath::LightColor;
+    if (path == "lightIntensity") return AnimationTrackPath::LightIntensity;
+    if (path == "lightRadius") return AnimationTrackPath::LightRadius;
+    if (path == "lightConeAngles") return AnimationTrackPath::LightConeAngles;
     return AnimationTrackPath::Unknown;
 }
 
@@ -54,7 +64,20 @@ size_t expectedComponentCount(AnimationTrackPath path) {
         return 3;
     case AnimationTrackPath::Rotation:
         return 4;
+    case AnimationTrackPath::CameraNearFar:
+    case AnimationTrackPath::LightConeAngles:
+        return 2;
+    case AnimationTrackPath::LightColor:
+        return 3;
+    case AnimationTrackPath::CameraYfov:
+    case AnimationTrackPath::CameraAspectRatio:
+    case AnimationTrackPath::CameraOrthoXmag:
+    case AnimationTrackPath::CameraOrthoYmag:
+    case AnimationTrackPath::LightIntensity:
+    case AnimationTrackPath::LightRadius:
+        return 1;
     case AnimationTrackPath::Weights:
+    case AnimationTrackPath::MeshVertexPositions:
     case AnimationTrackPath::Unknown:
         return 0;
     }
@@ -124,6 +147,16 @@ bool validateTrack(const AnimationClip::Track& track) {
         }
         for (size_t i = 0; i < track.times.size(); ++i) {
             if (track.values[i].size() != weightCount) {
+                return false;
+            }
+        }
+    } else if (track.path == AnimationTrackPath::MeshVertexPositions) {
+        const size_t componentCount = track.values.front().size();
+        if (componentCount == 0 || componentCount % 3u != 0u) {
+            return false;
+        }
+        for (size_t i = 0; i < track.times.size(); ++i) {
+            if (track.values[i].size() != componentCount) {
                 return false;
             }
         }
@@ -203,6 +236,29 @@ glm::vec3 vec3FromTrackValue(const std::vector<float>& value, glm::vec3 fallback
         return fallback;
     }
     return glm::vec3{value[0], value[1], value[2]};
+}
+
+glm::vec2 vec2FromTrackValue(const std::vector<float>& value, glm::vec2 fallback) {
+    if (value.size() < 2) {
+        return fallback;
+    }
+    return glm::vec2{value[0], value[1]};
+}
+
+float scalarFromTrackValue(const std::vector<float>& value, float fallback) {
+    return value.empty() ? fallback : value.front();
+}
+
+std::vector<glm::vec3> vec3ArrayFromTrackValue(const std::vector<float>& value) {
+    std::vector<glm::vec3> result;
+    if (value.size() < 3u) {
+        return result;
+    }
+    result.reserve(value.size() / 3u);
+    for (size_t i = 0; i + 2u < value.size(); i += 3u) {
+        result.push_back(glm::vec3{value[i], value[i + 1u], value[i + 2u]});
+    }
+    return result;
 }
 
 glm::quat quatFromTrackValue(const std::vector<float>& value) {
@@ -417,6 +473,36 @@ AnimationSample AnimationClip::sample(double timeSeconds, bool loop) const {
         } else if (track.path == AnimationTrackPath::Weights) {
             nodeSample.morphWeights = sampleVectorTrack(track, sample.timeSeconds);
             nodeSample.hasMorphWeights = true;
+        } else if (track.path == AnimationTrackPath::MeshVertexPositions) {
+            nodeSample.meshVertexPositions = vec3ArrayFromTrackValue(sampleVectorTrack(track, sample.timeSeconds));
+            nodeSample.hasMeshVertexPositions = !nodeSample.meshVertexPositions.empty();
+        } else if (track.path == AnimationTrackPath::CameraYfov) {
+            nodeSample.cameraYfov = scalarFromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.cameraYfov);
+            nodeSample.hasCameraYfov = true;
+        } else if (track.path == AnimationTrackPath::CameraAspectRatio) {
+            nodeSample.cameraAspectRatio = scalarFromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.cameraAspectRatio);
+            nodeSample.hasCameraAspectRatio = true;
+        } else if (track.path == AnimationTrackPath::CameraOrthoXmag) {
+            nodeSample.cameraOrthoXmag = scalarFromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.cameraOrthoXmag);
+            nodeSample.hasCameraOrthoXmag = true;
+        } else if (track.path == AnimationTrackPath::CameraOrthoYmag) {
+            nodeSample.cameraOrthoYmag = scalarFromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.cameraOrthoYmag);
+            nodeSample.hasCameraOrthoYmag = true;
+        } else if (track.path == AnimationTrackPath::CameraNearFar) {
+            nodeSample.cameraNearFar = vec2FromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.cameraNearFar);
+            nodeSample.hasCameraNearFar = true;
+        } else if (track.path == AnimationTrackPath::LightColor) {
+            nodeSample.lightColor = vec3FromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.lightColor);
+            nodeSample.hasLightColor = true;
+        } else if (track.path == AnimationTrackPath::LightIntensity) {
+            nodeSample.lightIntensity = scalarFromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.lightIntensity);
+            nodeSample.hasLightIntensity = true;
+        } else if (track.path == AnimationTrackPath::LightRadius) {
+            nodeSample.lightRadius = scalarFromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.lightRadius);
+            nodeSample.hasLightRadius = true;
+        } else if (track.path == AnimationTrackPath::LightConeAngles) {
+            nodeSample.lightConeAngles = vec2FromTrackValue(sampleVectorTrack(track, sample.timeSeconds), nodeSample.lightConeAngles);
+            nodeSample.hasLightConeAngles = true;
         }
     }
     return sample;

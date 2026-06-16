@@ -20,6 +20,10 @@ struct TextureData {
     int height = 0;
     int depth = 0;
     int mipLevels = 0;
+    uint32_t sourceArrayLayers = 1;
+    uint32_t sourceDepth = 1;
+    uint32_t sourceFaceCount = 1;
+    bool sourceIsCubemap = false;
     std::vector<unsigned char> pixels;
     std::vector<TextureMipLevel> mipData;
     bool isCompressed = false;

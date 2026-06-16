@@ -392,7 +392,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             settings.toneMapper = static_cast<ToneMapper>(toneMapperIndex2);
             changed = true;
         }
-        changed |= ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 8.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Exposure", &settings.exposure, 0.05f, 64.0f, "%.2f");
         tooltip("Overall brightness multiplier. Higher values make the image brighter.");
         changed |= ImGui::Checkbox("Auto Exposure", &settings.autoExposureEnabled);
         changed |= ImGui::Checkbox("Physical Camera", &settings.usePhysicalCamera);
@@ -461,8 +461,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         }
         if (ImGui::TreeNodeEx("Advanced", ImGuiTreeNodeFlags_DefaultOpen)) {
             changed |= ImGui::SliderFloat("Target Luminance", &settings.targetLuminance, 0.01f, 1.0f, "%.3f");
-            changed |= ImGui::SliderFloat("Min Exposure", &settings.minExposure, 0.01f, 8.0f, "%.2f");
-            changed |= ImGui::SliderFloat("Max Exposure", &settings.maxExposure, 0.01f, 16.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Min Exposure", &settings.minExposure, 0.01f, 64.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Max Exposure", &settings.maxExposure, 0.01f, 64.0f, "%.2f");
             changed |= ImGui::SliderFloat("Adaptation Speed", &settings.adaptationSpeed, 0.0f, 10.0f, "%.2f");
             changed |= ImGui::SliderFloat("Contrast", &settings.contrast, 0.0f, 2.0f, "%.2f");
             changed |= ImGui::SliderFloat("Saturation", &settings.saturation, 0.0f, 2.0f, "%.2f");

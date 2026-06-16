@@ -19,6 +19,10 @@ struct CachedTextureData {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t channels = 4;
+    uint32_t sourceArrayLayers = 1;
+    uint32_t sourceDepth = 1;
+    uint32_t sourceFaceCount = 1;
+    bool sourceIsCubemap = false;
     int mipLevels = 1;
     bool srgb = false;
     bool fallback = false;
@@ -54,6 +58,7 @@ struct CachedMaterialData {
     float volumeThicknessFactor = 0.0f;
     float volumeAttenuationDistance = 0.0f;
     glm::vec3 volumeAttenuationColor{1.0f};
+    int32_t nestedPriority = 0;
     uint32_t hasDispersion = 0;
     float dispersionFactor = 0.0f;
     uint32_t hasSpecular = 0;

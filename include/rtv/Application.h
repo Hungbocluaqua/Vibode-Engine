@@ -10,11 +10,18 @@
 #include "rtv/AnimationController.h"
 #include "rtv/CameraController.h"
 #include "rtv/EditorPanels.h"
+#include "rtv/GpuSceneStreamingState.h"
 #include "rtv/GpuProfiler.h"
+#include "rtv/IncrementalGpuSceneUpdateQueue.h"
 #include "rtv/SceneDocument.h"
 #include "rtv/SceneEventBus.h"
 #include "rtv/SceneToGpuSceneBuilder.h"
 #include "rtv/NotificationManager.h"
+#include "rtv/Prefab.h"
+#include "rtv/NativeGpuAssetCache.h"
+#include "rtv/StreamingGpuWorkQueue.h"
+#include "rtv/StreamingIoBackend.h"
+#include "rtv/StreamingRuntime.h"
 #include "rtv/UndoStack.h"
 #include "rtv/HeadlessDiagnostics.h"
 
@@ -82,7 +89,8 @@ public:
         bool headless = false,
         bool disableAsyncCompute = false,
         bool singleQueueFallback = false,
-        bool disableResourceAliasing = false);
+        bool disableResourceAliasing = false,
+        StreamingRuntimeOptions streamingOptions = {});
     ~Application();
 
     void run(uint32_t maxFrames = 0);
@@ -116,6 +124,7 @@ public:
     [[nodiscard]] std::vector<TopologyRebuildTicketSnapshot> editorTopologyRebuildTicketSnapshots(bool includeStages = false) const;
     [[nodiscard]] uint64_t editorTopologyRebuildLatestGeneration() const { return editorTopologyRebuildTickets_.latestGeneration(); }
     [[nodiscard]] uint64_t editorTopologyRebuildNextTimelineValue() const { return editorTopologyRebuildTickets_.nextTimelineValue(); }
+    [[nodiscard]] nlohmann::json streamingRuntimeReport() const;
     [[nodiscard]] FrameWorkSchedulerSnapshot frameWorkSchedulerSnapshot() const { return frameWorkScheduler_.snapshot(); }
     [[nodiscard]] const AnimatedGeometryStats& latestAnimatedGeometryStats() const { return latestAnimatedGeometryStats_; }
     [[nodiscard]] const std::vector<GpuSkinningInstancePlan>& latestGpuSkinningPlan() const { return latestGpuSkinningPlan_; }
@@ -359,6 +368,43 @@ private:
         std::future<EditorNativeFileMigrationJobResult> future;
     };
 
+    struct ProgressiveRuntimeLoadBatchResult {
+        uint64_t serial = 0;
+        uint32_t firstFile = 0;
+        uint32_t fileCount = 0;
+        uint64_t bytes = 0;
+        AssetManager assets;
+        PrefabRuntimeBindings bindings;
+        std::unordered_map<AssetGuid, TextureAssetHandle> textures;
+        std::vector<std::filesystem::path> files;
+        std::vector<std::string> errors;
+        StreamingIoMetrics ioMetrics{};
+        std::vector<std::string> ioErrors;
+        bool ok = false;
+    };
+
+    struct ActiveProgressiveRuntimeLoadJob {
+        uint64_t serial = 0;
+        AssetGuid rootGuid;
+        EntityId rootEntity{};
+        std::string label;
+        AssetRecord record{};
+        std::filesystem::path root;
+        std::filesystem::path nativeLoadRoot;
+        std::vector<std::filesystem::path> files;
+        uint64_t totalBytes = 0;
+        uint64_t loadedBytes = 0;
+        uint64_t appliedBytes = 0;
+        uint32_t nextFile = 0;
+        uint32_t loadedFiles = 0;
+        uint32_t failedFiles = 0;
+        uint32_t reboundRenderers = 0;
+        bool cancelled = false;
+        bool failed = false;
+        bool batchInFlight = false;
+        std::future<ProgressiveRuntimeLoadBatchResult> future;
+    };
+
     void initWindow();
     void initVulkan();
     void mainLoop(uint32_t maxFrames);
@@ -432,8 +478,18 @@ private:
     [[nodiscard]] std::optional<AssetImportWorkspace> prepareAssetImportWorkspace(const std::filesystem::path& sourcePath);
     [[nodiscard]] bool queueAssetImportNonMutating(const EditorImportAssetRequest& request, bool placeAfterImport);
     [[nodiscard]] bool placePrefabAsset(const AssetGuid& prefabGuid, const std::optional<Transform>& placementTransform = std::nullopt);
+    [[nodiscard]] bool queueProgressiveRuntimeLoadForPrefab(
+        const AssetRecord& prefabRecord,
+        const PrefabAsset& prefab,
+        const std::filesystem::path& root,
+        EntityId rootEntity,
+        const std::vector<std::filesystem::path>& files,
+        uint64_t totalBytes);
+    void pollProgressiveRuntimeLoadJob();
+    void startNextProgressiveRuntimeLoadBatch();
+    void applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchResult&& result);
     [[nodiscard]] std::optional<uint32_t> loadedMeshIndexForRecord(const AssetRecord& record) const;
-    [[nodiscard]] bool placeMeshAsset(const EditorMeshAssetPlacement& request);
+    [[nodiscard]] bool placeMeshAsset(const EditorMeshAssetPlacement& request, bool deferSceneUpdate = false);
     [[nodiscard]] std::optional<UsdRuntimeMeshHierarchyPlacementResult> placeUsdRuntimeMeshHierarchy(
         const AssetRecord& sceneRecord,
         const std::filesystem::path& root,
@@ -507,6 +563,8 @@ private:
     void reloadShadersFromEditor();
     void initializeEditorTicketProbeQueues();
     void stepEditorTicketProbeQueues();
+    void stepStreamingGpuWorkQueue();
+    void stepStreamingGpuSceneUpdateQueue();
     void startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot, const EditorRenderRequest* request = nullptr);
     void prepareEditorRenderJobFrame();
     void updateEditorRenderJob(float deltaSeconds);
@@ -570,6 +628,16 @@ private:
     bool disableAsyncCompute_ = false;
     bool singleQueueFallback_ = false;
     bool disableResourceAliasing_ = false;
+    StreamingRuntimeOptions streamingOptions_{};
+    NativeAssetCatalog nativeAssetCatalog_;
+    NativeGpuAssetCache nativeGpuAssetCache_;
+    NativeGpuAssetEvictionResult lastStreamingEviction_{};
+    StreamingGpuWorkQueue streamingGpuWorkQueue_;
+    IncrementalGpuSceneUpdateQueue streamingGpuSceneUpdateQueue_;
+    IncrementalGpuSceneApplyFrameResult lastStreamingGpuSceneApply_{};
+    StreamingIoMetrics streamingIoMetrics_{};
+    StreamingRuntimeState streamingRuntimeState_;
+    std::vector<GpuSceneStreamingInstanceSnapshot> lastStreamingGpuSceneSnapshots_;
     bool pendingOpenLevel_ = false;
     bool pendingSaveLevel_ = false;
     bool pendingSaveAll_ = false;
@@ -579,6 +647,7 @@ private:
     AssetManager assets_;
     std::unordered_map<std::string, AnimationClip> animationClipCache_;
     std::unordered_map<std::string, AnimationController> animationControllerCache_;
+    std::unordered_map<uint32_t, std::vector<glm::vec3>> animationMeshBasePositions_;
     std::unordered_map<AssetGuid, std::filesystem::path> nativeRuntimeAnimationPathsByGuid_;
     std::unordered_set<std::string> failedAnimationClipLoads_;
     std::unordered_set<std::string> failedAnimationControllerLoads_;
@@ -628,10 +697,13 @@ private:
     uint64_t nextNativeFileMigrationJobSerial_ = 1;
     EditorJobCenterState completedNativeFileMigrationJob_{};
     std::optional<ActiveNativeFileMigrationJob> activeNativeFileMigrationJob_{};
+    std::optional<ActiveProgressiveRuntimeLoadJob> activeProgressiveRuntimeLoadJob_{};
+    uint64_t nextProgressiveRuntimeLoadJobSerial_ = 1;
     std::deque<EditorNativeFileMigrationJobRequest> pendingNativeFileMigrationJobs_;
     uint64_t frameWorkProbeJobId_ = 0;
     bool frameWorkProbeCompletionPending_ = false;
     uint64_t editorGpuUploadCompletedTimeline_ = 0;
+    uint64_t streamingGpuWorkCompletedTimeline_ = 0;
     uint64_t editorTopologyRebuildCompletedTimeline_ = 0;
     UndoStack undoStack_;
     SceneToGpuSceneBuilder sceneBuilder_;

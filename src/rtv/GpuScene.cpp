@@ -309,6 +309,7 @@ uint32_t cachedMaterialTextureFlag(const CachedScene& cached, int32_t textureInd
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
     case VK_FORMAT_BC3_SRGB_BLOCK:
     case VK_FORMAT_BC7_SRGB_BLOCK:
         return 0;
@@ -899,6 +900,7 @@ bool isSrgbTextureFormat(VkFormat format) {
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
     case VK_FORMAT_BC3_SRGB_BLOCK:
     case VK_FORMAT_BC7_SRGB_BLOCK:
         return true;
@@ -2781,10 +2783,16 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         prep.firstIndex = static_cast<uint32_t>(localIndices.size());
         prep.primitiveOffset = static_cast<uint32_t>(primitiveRecords.size());
         prep.localTriangleCursor = localTriangleCursor;
-        prep.positions.reserve(mesh->vertices.size());
-        prep.texcoords.reserve(mesh->vertices.size());
-        prep.normals.reserve(mesh->vertices.size());
-        prep.tangents.reserve(mesh->vertices.size());
+        const bool hasUsableCachedLocalBvh = !mesh->cachedLocalBvhNodes.empty() &&
+            !mesh->cachedLocalBvhTriangles.empty() &&
+            mesh->cachedLocalBvhNodes.size() % 4u == 0u &&
+            mesh->cachedLocalBvhTriangles.size() % 12u == 0u;
+        if (!hasUsableCachedLocalBvh) {
+            prep.positions.reserve(mesh->vertices.size());
+            prep.texcoords.reserve(mesh->vertices.size());
+            prep.normals.reserve(mesh->vertices.size());
+            prep.tangents.reserve(mesh->vertices.size());
+        }
         localVertexData.reserve(localVertexData.size() + mesh->vertices.size());
 
         const std::vector<MeshVertex>* sourceVertices = &mesh->vertices;
@@ -2803,10 +2811,12 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             tangent = tangentLen2 > 1.0e-10f ? glm::normalize(tangent) : glm::vec3{1.0f, 0.0f, 0.0f};
             const glm::vec4 packedTangent{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f};
             localVertexData.push_back(makeLocalVertex(vertex.position, normal, vertex.texcoord, packedTangent, vertex.color, vertex.texcoord1));
-            prep.positions.push_back(vertex.position);
-            prep.texcoords.push_back(vertex.texcoord);
-            prep.normals.push_back(normal);
-            prep.tangents.push_back(packedTangent);
+            if (!hasUsableCachedLocalBvh) {
+                prep.positions.push_back(vertex.position);
+                prep.texcoords.push_back(vertex.texcoord);
+                prep.normals.push_back(normal);
+                prep.tangents.push_back(packedTangent);
+            }
             includePoint(prep.localBounds, vertex.position);
         }
         localIndices.reserve(localIndices.size() + mesh->indices.size());
@@ -2821,8 +2831,10 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             const uint32_t alphaClass = materialIndex < materialAlphaClasses.size()
                 ? materialAlphaClasses[materialIndex]
                 : kPrimitiveAlphaClassOpaque;
-            for (uint32_t triangle = 0; triangle < triangleCount; ++triangle) {
-                prep.faceMaterials.push_back(materialIndex);
+            if (!hasUsableCachedLocalBvh) {
+                for (uint32_t triangle = 0; triangle < triangleCount; ++triangle) {
+                    prep.faceMaterials.push_back(materialIndex);
+                }
             }
             primitiveRecords.push_back(makePrimitiveRecord(
                 prep.firstIndex + primitive.firstIndex,
@@ -2888,12 +2900,10 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         } else {
             const int32_t bvhTaskIndex = bvhTaskIndexForMesh[i];
             const BvhBuildResult& localBvh = bvhResults[static_cast<size_t>(bvhTaskIndex)].bvh;
-            const std::vector<glm::vec4> packedLocalBvh = packBvhNodesForGpu(localBvh.packedNodes);
-            const std::vector<glm::vec4> packedLocalTriangles = packTrianglesForGpu(localBvh);
             localBvhNodeCount = static_cast<uint32_t>(localBvh.packedNodes.size());
             localTriangleCount = static_cast<uint32_t>(localBvh.leafTriangleIndices.size());
-            localBvhData.insert(localBvhData.end(), packedLocalBvh.begin(), packedLocalBvh.end());
-            localTriangleData.insert(localTriangleData.end(), packedLocalTriangles.begin(), packedLocalTriangles.end());
+            appendBvhNodesForGpu(localBvh.packedNodes, localBvhData);
+            appendTrianglesForGpu(localBvh, localTriangleData);
         }
 
         const uint32_t meshRecordIndex = static_cast<uint32_t>(meshRecords.size());
@@ -3110,6 +3120,10 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedTex.width = texture->width;
             cachedTex.height = texture->height;
             cachedTex.channels = texture->channels;
+            cachedTex.sourceArrayLayers = texture->sourceArrayLayers;
+            cachedTex.sourceDepth = texture->sourceDepth;
+            cachedTex.sourceFaceCount = texture->sourceFaceCount;
+            cachedTex.sourceIsCubemap = texture->sourceIsCubemap;
             cachedTex.mipLevels = texture->mipLevels;
             cachedTex.srgb = texture->srgb;
             cachedTex.fallback = texture->fallback;
@@ -3173,6 +3187,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             cachedMat.volumeThicknessFactor = material->volumeThicknessFactor;
             cachedMat.volumeAttenuationDistance = material->volumeAttenuationDistance;
             cachedMat.volumeAttenuationColor = material->volumeAttenuationColor;
+            cachedMat.nestedPriority = material->nestedPriority;
             cachedMat.hasDispersion = material->hasDispersion;
             cachedMat.dispersionFactor = material->dispersionFactor;
             cachedMat.occlusionStrength = material->occlusionStrength;
@@ -3223,8 +3238,8 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             gpuCached.materials.push_back(std::move(cachedMat));
         }
 
-        uint32_t meshPrepIndex = 0;
-        for (const auto& prep : meshPrep) {
+        for (size_t meshPrepIndex = 0; meshPrepIndex < meshPrep.size(); ++meshPrepIndex) {
+            const auto& prep = meshPrep[meshPrepIndex];
             CachedMeshData cachedMesh;
             cachedMesh.name = prep.mesh->name;
             cachedMesh.vertices = prep.mesh->vertices;
@@ -3249,19 +3264,32 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             }
             gpuCached.meshes.push_back(std::move(cachedMesh));
 
-            const BvhBuildResult& localBvh = bvhResults[meshPrepIndex].bvh;
             CachedMeshGpuRecord gpuRec;
             const auto& rec = meshRecords[meshPrepIndex];
             gpuRec.vertexIndexData = rec.vertexIndexData;
             gpuRec.primitiveData = rec.primitiveData;
             gpuRec.bvhData = rec.bvhData;
             gpuRec.flags = rec.flags;
-            gpuRec.localBvh.packedNodes = packBvhNodesForGpu(localBvh.packedNodes);
-            gpuRec.localBvh.triangleData = packTrianglesForGpu(localBvh);
-            gpuRec.localBvh.triangleCount = static_cast<uint32_t>(localBvh.triangles.size());
-            gpuRec.localBvh.leafTriangleCount = static_cast<uint32_t>(localBvh.leafTriangleIndices.size());
+            const bool hasUsableCachedLocalBvh = !prep.mesh->cachedLocalBvhNodes.empty() &&
+                !prep.mesh->cachedLocalBvhTriangles.empty() &&
+                prep.mesh->cachedLocalBvhNodes.size() % 4u == 0u &&
+                prep.mesh->cachedLocalBvhTriangles.size() % 12u == 0u;
+            if (hasUsableCachedLocalBvh) {
+                gpuRec.localBvh.packedNodes = prep.mesh->cachedLocalBvhNodes;
+                gpuRec.localBvh.triangleData = prep.mesh->cachedLocalBvhTriangles;
+                gpuRec.localBvh.triangleCount = static_cast<uint32_t>(prep.mesh->indices.size() / 3u);
+                gpuRec.localBvh.leafTriangleCount = static_cast<uint32_t>(prep.mesh->cachedLocalBvhTriangles.size() / 12u);
+            } else {
+                const int32_t bvhTaskIndex = bvhTaskIndexForMesh[meshPrepIndex];
+                if (bvhTaskIndex >= 0 && static_cast<size_t>(bvhTaskIndex) < bvhResults.size()) {
+                    const BvhBuildResult& localBvh = bvhResults[static_cast<size_t>(bvhTaskIndex)].bvh;
+                    gpuRec.localBvh.packedNodes = packBvhNodesForGpu(localBvh.packedNodes);
+                    gpuRec.localBvh.triangleData = packTrianglesForGpu(localBvh);
+                    gpuRec.localBvh.triangleCount = static_cast<uint32_t>(localBvh.triangles.size());
+                    gpuRec.localBvh.leafTriangleCount = static_cast<uint32_t>(localBvh.leafTriangleIndices.size());
+                }
+            }
             gpuCached.meshGpuRecords.push_back(std::move(gpuRec));
-            ++meshPrepIndex;
         }
 
         for (size_t i = 0; i < importedScene.nodes.size(); ++i) {

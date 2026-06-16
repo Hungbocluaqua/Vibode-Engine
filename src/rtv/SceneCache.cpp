@@ -10,7 +10,7 @@ namespace rtv {
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x53434E45;
-constexpr uint32_t kCacheVersion = 51;
+constexpr uint32_t kCacheVersion = 53;
 
 uint64_t fnv1a64(const uint8_t* data, size_t len) {
     uint64_t hash = 0xCBF29CE484222325ULL;
@@ -266,6 +266,10 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeUint32(file, tex.width);
         writeUint32(file, tex.height);
         writeUint32(file, tex.channels);
+        writeUint32(file, tex.sourceArrayLayers);
+        writeUint32(file, tex.sourceDepth);
+        writeUint32(file, tex.sourceFaceCount);
+        writeUint32(file, tex.sourceIsCubemap ? 1u : 0u);
         writeInt32(file, tex.mipLevels);
         writeUint32(file, tex.srgb ? 1u : 0u);
         writeUint32(file, tex.fallback ? 1u : 0u);
@@ -311,6 +315,7 @@ bool SceneCache::save(const std::filesystem::path& cachePath, const CachedScene&
         writeFloat(file, mat.volumeThicknessFactor);
         writeFloat(file, mat.volumeAttenuationDistance);
         writeBytes(file, &mat.volumeAttenuationColor, sizeof(mat.volumeAttenuationColor));
+        writeInt32(file, mat.nestedPriority);
         writeUint32(file, mat.hasDispersion);
         writeFloat(file, mat.dispersionFactor);
         writeUint32(file, mat.hasSpecular);
@@ -626,6 +631,12 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readUint32(file, tex.width)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, tex.height)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, tex.channels)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, tex.sourceArrayLayers)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, tex.sourceDepth)) { std::fclose(file); return std::nullopt; }
+        if (!readUint32(file, tex.sourceFaceCount)) { std::fclose(file); return std::nullopt; }
+        uint32_t sourceIsCubemapVal = 0;
+        if (!readUint32(file, sourceIsCubemapVal)) { std::fclose(file); return std::nullopt; }
+        tex.sourceIsCubemap = sourceIsCubemapVal != 0u;
         int32_t mipLevelsVal = 1;
         if (!readInt32(file, mipLevelsVal)) { std::fclose(file); return std::nullopt; }
         tex.mipLevels = mipLevelsVal;
@@ -688,6 +699,7 @@ std::optional<CachedScene> SceneCache::load(const std::filesystem::path& cachePa
         if (!readFloat(file, mat.volumeThicknessFactor)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.volumeAttenuationDistance)) { std::fclose(file); return std::nullopt; }
         if (!readBytes(file, &mat.volumeAttenuationColor, sizeof(mat.volumeAttenuationColor))) { std::fclose(file); return std::nullopt; }
+        if (!readInt32(file, mat.nestedPriority)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.hasDispersion)) { std::fclose(file); return std::nullopt; }
         if (!readFloat(file, mat.dispersionFactor)) { std::fclose(file); return std::nullopt; }
         if (!readUint32(file, mat.hasSpecular)) { std::fclose(file); return std::nullopt; }

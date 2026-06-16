@@ -21,6 +21,8 @@ struct NativeTextureFormatSupport {
     bool bc7UnormSampled = false;
     bool bc5UnormSampled = false;
     bool bc4UnormSampled = false;
+    bool bc6hUfloatSampled = false;
+    bool bc6hSfloatSampled = false;
     bool rgba8SrgbSampled = true;
     bool rgba8UnormSampled = true;
     bool rgba16fSampled = true;

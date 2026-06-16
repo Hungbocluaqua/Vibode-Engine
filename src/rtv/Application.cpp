@@ -8,6 +8,7 @@
 #include "rtv/EditorLog.h"
 #include "rtv/FileDialog.h"
 #include "rtv/GltfLoader.h"
+#include "rtv/GpuSceneStreamingState.h"
 #include "rtv/NativeAssetRuntimeLoader.h"
 #include "rtv/NativeAssetMigration.h"
 #include "rtv/NativeTextureFormatPolicy.h"
@@ -48,6 +49,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -762,6 +764,8 @@ nlohmann::json nativeTextureFormatSupportJson(const NativeTextureFormatSupport& 
         {"bc7UnormSampled", support.bc7UnormSampled},
         {"bc5UnormSampled", support.bc5UnormSampled},
         {"bc4UnormSampled", support.bc4UnormSampled},
+        {"bc6hUfloatSampled", support.bc6hUfloatSampled},
+        {"bc6hSfloatSampled", support.bc6hSfloatSampled},
         {"rgba8SrgbSampled", support.rgba8SrgbSampled},
         {"rgba8UnormSampled", support.rgba8UnormSampled},
         {"rgba16fSampled", support.rgba16fSampled},
@@ -792,6 +796,8 @@ NativeTextureFormatSupport nativeTextureCustomTargetSetSupport(const EditorNativ
     support.bc7UnormSampled = custom.bc7UnormSampled;
     support.bc5UnormSampled = custom.bc5UnormSampled;
     support.bc4UnormSampled = custom.bc4UnormSampled;
+    support.bc6hUfloatSampled = false;
+    support.bc6hSfloatSampled = false;
     support.rgba8SrgbSampled = custom.rgba8SrgbSampled;
     support.rgba8UnormSampled = custom.rgba8UnormSampled;
     support.rgba16fSampled = custom.rgba16fSampled;
@@ -810,6 +816,8 @@ NativeTextureFormatSupport nativeTextureLibraryTargetSetSupport(const EditorNati
     support.bc7UnormSampled = custom.bc7UnormSampled;
     support.bc5UnormSampled = custom.bc5UnormSampled;
     support.bc4UnormSampled = custom.bc4UnormSampled;
+    support.bc6hUfloatSampled = false;
+    support.bc6hSfloatSampled = false;
     support.rgba8SrgbSampled = custom.rgba8SrgbSampled;
     support.rgba8UnormSampled = custom.rgba8UnormSampled;
     support.rgba16fSampled = custom.rgba16fSampled;
@@ -1074,6 +1082,46 @@ std::filesystem::path editorNativePackageRefreshDetectionReportPath(const std::o
         : (std::filesystem::current_path() / "out" / "editor_tools");
     const std::string name = packagePath.filename().empty() ? std::string("package") : packagePath.filename().string();
     return root / "Reports" / ("content_browser_native_package_refresh_detected_" + safeReportName(name) + ".json");
+}
+
+uint64_t regularFileSizeOrZero(const std::filesystem::path& path) {
+    std::error_code ec;
+    const uintmax_t size = std::filesystem::file_size(path, ec);
+    return ec ? 0ull : static_cast<uint64_t>(std::min<uintmax_t>(size, std::numeric_limits<uint64_t>::max()));
+}
+
+nlohmann::json legacyCpuPackageMountBlockedJson(
+    std::string schema,
+    std::string inspectionSource,
+    const std::filesystem::path& packagePath,
+    uint64_t packageBytes,
+    const NativeRuntimeLoadOptions& loadOptions) {
+    return {
+        {"schema", std::move(schema)},
+        {"inspectionSource", std::move(inspectionSource)},
+        {"ok", false},
+        {"package", {
+            {"path", packagePath.generic_string()},
+            {"exists", true},
+            {"sizeBytes", packageBytes},
+        }},
+        {"mutationExecuted", false},
+        {"legacy_cpu_load_policy", {
+            {"available", true},
+            {"asset_manager_backed", false},
+            {"package_backed", true},
+            {"estimated_eager_cpu_bytes", packageBytes},
+            {"warning_threshold_bytes", loadOptions.eagerCpuLoadWarningBytes},
+            {"hard_limit_bytes", loadOptions.eagerCpuLoadHardLimitBytes},
+            {"allow_large_eager_cpu_load", loadOptions.allowLargeEagerCpuLoad},
+            {"large_eager_load_warning", packageBytes >= loadOptions.eagerCpuLoadWarningBytes},
+            {"hard_limit_exceeded", packageBytes >= loadOptions.eagerCpuLoadHardLimitBytes && !loadOptions.allowLargeEagerCpuLoad},
+            {"streaming_recommended", true},
+            {"policy", "legacy-eager-cpu-package-mount-blocked-before-decode"},
+            {"recommended_action", "Use package inspection/validation and the progressive native streaming path instead of blocking CPU AssetManager package mount."},
+        }},
+        {"error", "Legacy eager CPU package mount is blocked for large packages before payload decode."},
+    };
 }
 
 std::filesystem::path normalizedPackagePathKey(const std::filesystem::path& path) {
@@ -2337,6 +2385,68 @@ private:
     std::string label_;
 };
 
+class SceneAndAssetAppendSnapshotCommand final : public ICommand {
+public:
+    SceneAndAssetAppendSnapshotCommand(
+        SceneDocument& document,
+        AssetManager& assets,
+        SceneDocument beforeDocument,
+        AssetLoadStats beforeAssetStats,
+        SceneDocument afterDocument,
+        SceneUpdateKind updateKind,
+        std::string label)
+        : document_(document),
+          assets_(assets),
+          beforeDocument_(std::move(beforeDocument)),
+          beforeAssetStats_(beforeAssetStats),
+          afterDocument_(std::move(afterDocument)),
+          updateKind_(updateKind),
+          label_(std::move(label)) {
+        const auto appendRange = [](auto& out, const auto& source, uint32_t begin) {
+            const size_t start = std::min<size_t>(begin, source.size());
+            out.insert(out.end(), source.begin() + static_cast<std::ptrdiff_t>(start), source.end());
+        };
+        appendRange(appendedTextures_, assets_.textures(), beforeAssetStats_.textureCount);
+        appendRange(appendedMaterials_, assets_.materials(), beforeAssetStats_.materialCount);
+        appendRange(appendedMeshes_, assets_.meshes(), beforeAssetStats_.meshCount);
+    }
+
+    void undo() override {
+        document_ = beforeDocument_;
+        assets_.truncateTo(beforeAssetStats_);
+        document_.markDirty(updateKind_);
+    }
+
+    void redo() override {
+        assets_.truncateTo(beforeAssetStats_);
+        for (const TextureAsset& texture : appendedTextures_) {
+            (void)assets_.addTexture(texture);
+        }
+        for (const MaterialAsset& material : appendedMaterials_) {
+            (void)assets_.addMaterial(material);
+        }
+        for (const MeshAsset& mesh : appendedMeshes_) {
+            (void)assets_.addMesh(mesh);
+        }
+        document_ = afterDocument_;
+        document_.markDirty(updateKind_);
+    }
+
+    [[nodiscard]] const std::string& label() const override { return label_; }
+
+private:
+    SceneDocument& document_;
+    AssetManager& assets_;
+    SceneDocument beforeDocument_;
+    AssetLoadStats beforeAssetStats_{};
+    SceneDocument afterDocument_;
+    std::vector<TextureAsset> appendedTextures_;
+    std::vector<MaterialAsset> appendedMaterials_;
+    std::vector<MeshAsset> appendedMeshes_;
+    SceneUpdateKind updateKind_ = SceneUpdateKind::TopologyChanged;
+    std::string label_;
+};
+
 void ensureMaterialSlotsForRenderer(MeshRenderer& renderer, const AssetManager& assets) {
     if (!renderer.materialSlots.empty()) {
         return;
@@ -2431,6 +2541,173 @@ void remapSceneAssetHandles(SceneAsset& scene, const ImportedAssetHandleRemap& r
 
 std::string importModeForRecord(const AssetRecord& record, const std::filesystem::path& root);
 
+bool shouldDeferInteractiveTopologyRebuild(const SceneDocument& document, const AssetManager& assets) {
+    constexpr size_t kLargeSceneEntityThreshold = 512;
+    constexpr size_t kLargeSceneMeshThreshold = 128;
+    constexpr size_t kLargeSceneTextureThreshold = 128;
+    constexpr uint64_t kLargeSceneTriangleThreshold = 500000ull;
+
+    if (document.registry().entities().size() >= kLargeSceneEntityThreshold ||
+        assets.meshes().size() >= kLargeSceneMeshThreshold ||
+        assets.textures().size() >= kLargeSceneTextureThreshold) {
+        return true;
+    }
+    uint64_t triangleCount = 0;
+    for (const MeshAsset& mesh : assets.meshes()) {
+        triangleCount += static_cast<uint64_t>(mesh.indices.size() / 3u);
+        if (triangleCount >= kLargeSceneTriangleThreshold) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool populatePrefabBindingsFromLoadedAssets(
+    const PrefabAsset& prefab,
+    const AssetManager& assets,
+    PrefabRuntimeBindings& bindings) {
+    PrefabRuntimeBindings resolvedBindings;
+    std::unordered_map<AssetGuid, MeshAssetHandle> loadedMeshes;
+    std::unordered_map<AssetGuid, MaterialAssetHandle> loadedMaterials;
+    const auto& meshes = assets.meshes();
+    loadedMeshes.reserve(meshes.size());
+    for (uint32_t i = 0; i < meshes.size(); ++i) {
+        const MeshAsset& mesh = meshes[i];
+        if (!mesh.nativeGuid.empty()) {
+            loadedMeshes.emplace(mesh.nativeGuid, MeshAssetHandle{i});
+        }
+    }
+    const auto& materials = assets.materials();
+    loadedMaterials.reserve(materials.size());
+    for (uint32_t i = 0; i < materials.size(); ++i) {
+        const MaterialAsset& material = materials[i];
+        if (!material.nativeGuid.empty()) {
+            loadedMaterials.emplace(material.nativeGuid, MaterialAssetHandle{i});
+        }
+    }
+
+    bool needsMesh = false;
+    bool reboundMesh = false;
+    for (const PrefabNodeAsset& node : prefab.nodes) {
+        if (!node.meshGuid.empty()) {
+            needsMesh = true;
+            const auto meshIt = loadedMeshes.find(node.meshGuid);
+            if (meshIt == loadedMeshes.end()) {
+                return false;
+            }
+            resolvedBindings.meshes[node.meshGuid] = meshIt->second;
+            reboundMesh = true;
+        }
+        for (const AssetGuid& materialGuid : node.materialGuids) {
+            if (materialGuid.empty()) {
+                continue;
+            }
+            const auto materialIt = loadedMaterials.find(materialGuid);
+            if (materialIt == loadedMaterials.end()) {
+                return false;
+            }
+            resolvedBindings.materials[materialGuid] = materialIt->second;
+        }
+    }
+    if (needsMesh && !reboundMesh) {
+        return false;
+    }
+    bindings.meshes.insert(resolvedBindings.meshes.begin(), resolvedBindings.meshes.end());
+    bindings.materials.insert(resolvedBindings.materials.begin(), resolvedBindings.materials.end());
+    return true;
+}
+
+bool isNativeRuntimeAssetRecordType(AssetType type) {
+    return type == AssetType::Texture ||
+        type == AssetType::Material ||
+        type == AssetType::Mesh ||
+        type == AssetType::Skeleton ||
+        type == AssetType::Animation ||
+        type == AssetType::AnimationController ||
+        type == AssetType::SkeletalMesh;
+}
+
+std::vector<std::filesystem::path> nativeRuntimeCacheAllowListForRecord(
+    const AssetRecord& rootRecord,
+    const std::filesystem::path& root,
+    const AssetRegistry* registry) {
+    std::vector<std::filesystem::path> paths;
+    if (registry == nullptr) {
+        return paths;
+    }
+
+    std::unordered_map<AssetGuid, const AssetRecord*> recordsByGuid;
+    recordsByGuid.reserve(registry->records().size());
+    for (const AssetRecord& record : registry->records()) {
+        if (!record.guid.empty()) {
+            recordsByGuid.emplace(record.guid, &record);
+        }
+    }
+
+    std::unordered_set<AssetGuid> visited;
+    std::vector<AssetGuid> pending;
+    pending.push_back(rootRecord.guid);
+    while (!pending.empty()) {
+        const AssetGuid guid = std::move(pending.back());
+        pending.pop_back();
+        if (guid.empty() || !visited.insert(guid).second) {
+            continue;
+        }
+        const auto recordIt = recordsByGuid.find(guid);
+        if (recordIt == recordsByGuid.end() || recordIt->second == nullptr) {
+            continue;
+        }
+        const AssetRecord& record = *recordIt->second;
+        if (isNativeRuntimeAssetRecordType(record.type) && !record.cachePath.empty()) {
+            std::filesystem::path path = record.cachePath;
+            if (!path.is_absolute()) {
+                path = root / path;
+            }
+            paths.push_back(path.lexically_normal());
+        }
+        for (const AssetDependency& dependency : record.dependencies) {
+            if (!dependency.guid.empty()) {
+                pending.push_back(dependency.guid);
+            }
+        }
+    }
+
+    if (paths.empty() && (!rootRecord.importGroupId.empty() || !rootRecord.importRootGuid.empty())) {
+        for (const AssetRecord& record : registry->records()) {
+            const bool sameRoot = !rootRecord.importRootGuid.empty() && record.importRootGuid == rootRecord.importRootGuid;
+            const bool sameGroup = !rootRecord.importGroupId.empty() && record.importGroupId == rootRecord.importGroupId;
+            if ((!sameRoot && !sameGroup) || !isNativeRuntimeAssetRecordType(record.type) || record.cachePath.empty()) {
+                continue;
+            }
+            std::filesystem::path path = record.cachePath;
+            if (!path.is_absolute()) {
+                path = root / path;
+            }
+            paths.push_back(path.lexically_normal());
+        }
+    }
+
+    std::sort(paths.begin(), paths.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+        return a.generic_string() < b.generic_string();
+    });
+    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+    return paths;
+}
+
+uint64_t existingFileBytes(const std::vector<std::filesystem::path>& paths) {
+    uint64_t total = 0;
+    for (const std::filesystem::path& path : paths) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(path, ec)) {
+            const uintmax_t size = std::filesystem::file_size(path, ec);
+            if (!ec) {
+                total += static_cast<uint64_t>(size);
+            }
+        }
+    }
+    return total;
+}
+
 bool appendCachedPrefabRuntimeAssets(
     const AssetRecord& prefabRecord,
     const std::filesystem::path& root,
@@ -2471,7 +2748,24 @@ bool appendCachedPrefabRuntimeAssets(
         }
 
         NativeAssetRuntimeLoader loader;
-        NativeRuntimeLoadReport loadReport = loader.loadLooseRoot(nativeLoadRoot, &destination, nativeLoadOptions);
+        NativeRuntimeLoadOptions loadOptions = nativeLoadOptions;
+        loadOptions.retainLoadedPayloadsInReport = false;
+        loadOptions.looseFileAllowList = nativeRuntimeCacheAllowListForRecord(prefabRecord, root, registry);
+        NativeRuntimeLoadReport loadReport = loader.loadLooseRoot(nativeLoadRoot, &destination, loadOptions);
+        std::unordered_map<std::string, AssetGuid> registryGuidByCachePath;
+        if (registry != nullptr) {
+            registryGuidByCachePath.reserve(registry->records().size());
+            for (const AssetRecord& record : registry->records()) {
+                if ((record.type != AssetType::Mesh && record.type != AssetType::Material) || record.cachePath.empty()) {
+                    continue;
+                }
+                std::filesystem::path recordCachePath = record.cachePath;
+                if (!recordCachePath.is_absolute()) {
+                    recordCachePath = root / recordCachePath;
+                }
+                registryGuidByCachePath.emplace(normalizedPathForCompare(recordCachePath).generic_string(), record.guid);
+            }
+        }
         auto registryGuidForNativeAsset = [&](const NativeRuntimeLoadedAsset& asset) -> AssetGuid {
             if (registry == nullptr || asset.path.empty()) {
                 return asset.guid;
@@ -2482,18 +2776,10 @@ bool appendCachedPrefabRuntimeAssets(
             if (expectedType == AssetType::Unknown) {
                 return asset.guid;
             }
-            const std::filesystem::path assetPath = normalizedPathForCompare(asset.path);
-            for (const AssetRecord& record : registry->records()) {
-                if (record.type != expectedType || record.cachePath.empty()) {
-                    continue;
-                }
-                std::filesystem::path recordCachePath = record.cachePath;
-                if (!recordCachePath.is_absolute()) {
-                    recordCachePath = root / recordCachePath;
-                }
-                if (normalizedPathForCompare(recordCachePath) == assetPath) {
-                    return record.guid;
-                }
+            (void)expectedType;
+            const auto guidIt = registryGuidByCachePath.find(normalizedPathForCompare(asset.path).generic_string());
+            if (guidIt != registryGuidByCachePath.end()) {
+                return guidIt->second;
             }
             return asset.guid;
         };
@@ -2515,7 +2801,11 @@ bool appendCachedPrefabRuntimeAssets(
             std::cout << "Native runtime assets restored for placement: " << nativeLoadRoot.string()
                       << " meshes=" << loadReport.meshCount
                       << " materials=" << loadReport.materialCount
-                      << " textures=" << loadReport.textureCount << '\n';
+                      << " textures=" << loadReport.textureCount;
+            if (!loadOptions.looseFileAllowList.empty()) {
+                std::cout << " filteredFiles=" << loadOptions.looseFileAllowList.size();
+            }
+            std::cout << '\n';
             return true;
         }
         if (error != nullptr) {
@@ -2529,13 +2819,17 @@ bool appendCachedPrefabRuntimeAssets(
 
     std::vector<TextureAssetHandle> textures;
     textures.reserve(cached->textures.size());
-    for (const CachedTextureData& cachedTex : cached->textures) {
+    for (CachedTextureData& cachedTex : cached->textures) {
         TextureAsset texture;
         texture.name = cachedTex.name;
         texture.sourcePath = cachedTex.sourcePath.empty() ? sourcePath : std::filesystem::path(cachedTex.sourcePath);
         texture.width = cachedTex.width;
         texture.height = cachedTex.height;
         texture.channels = cachedTex.channels;
+        texture.sourceArrayLayers = cachedTex.sourceArrayLayers;
+        texture.sourceDepth = cachedTex.sourceDepth;
+        texture.sourceFaceCount = cachedTex.sourceFaceCount;
+        texture.sourceIsCubemap = cachedTex.sourceIsCubemap;
         texture.mipLevels = cachedTex.mipLevels;
         texture.srgb = cachedTex.srgb;
         texture.fallback = cachedTex.fallback;
@@ -2543,8 +2837,8 @@ bool appendCachedPrefabRuntimeAssets(
         texture.linearColorSpace = cachedTex.linearColorSpace;
         texture.format = static_cast<VkFormat>(cachedTex.format);
         texture.compressedFormat = static_cast<VkFormat>(cachedTex.compressedFormat);
-        texture.rgba8 = cachedTex.rgba8;
-        texture.mipData = cachedTex.mipData;
+        texture.rgba8 = std::move(cachedTex.rgba8);
+        texture.mipData = std::move(cachedTex.mipData);
         texture.sampler.minFilter = static_cast<TextureFilter>(cachedTex.minFilter);
         texture.sampler.magFilter = static_cast<TextureFilter>(cachedTex.magFilter);
         texture.sampler.wrapS = static_cast<TextureWrap>(cachedTex.wrapS);
@@ -2594,6 +2888,7 @@ bool appendCachedPrefabRuntimeAssets(
         material.volumeThicknessFactor = cachedMat.volumeThicknessFactor;
         material.volumeAttenuationDistance = cachedMat.volumeAttenuationDistance;
         material.volumeAttenuationColor = cachedMat.volumeAttenuationColor;
+        material.nestedPriority = cachedMat.nestedPriority;
         material.hasDispersion = cachedMat.hasDispersion;
         material.dispersionFactor = cachedMat.dispersionFactor;
         material.hasSpecular = cachedMat.hasSpecular;
@@ -2667,19 +2962,19 @@ bool appendCachedPrefabRuntimeAssets(
 
     std::vector<MeshAssetHandle> meshes;
     meshes.reserve(cached->meshes.size());
-    for (const CachedMeshData& cachedMesh : cached->meshes) {
+    for (CachedMeshData& cachedMesh : cached->meshes) {
         MeshAsset mesh;
         mesh.name = cachedMesh.name;
-        mesh.vertices = cachedMesh.vertices;
-        mesh.indices = cachedMesh.indices;
-        mesh.defaultMorphWeights = cachedMesh.defaultMorphWeights;
-        for (const CachedPrimitiveData& cachedPrim : cachedMesh.primitives) {
+        mesh.vertices = std::move(cachedMesh.vertices);
+        mesh.indices = std::move(cachedMesh.indices);
+        mesh.defaultMorphWeights = std::move(cachedMesh.defaultMorphWeights);
+        for (CachedPrimitiveData& cachedPrim : cachedMesh.primitives) {
             MeshPrimitiveAsset primitive;
             primitive.firstVertex = cachedPrim.firstVertex;
             primitive.vertexCount = cachedPrim.vertexCount;
             primitive.firstIndex = cachedPrim.firstIndex;
             primitive.indexCount = cachedPrim.indexCount;
-            primitive.morphTargets = cachedPrim.morphTargets;
+            primitive.morphTargets = std::move(cachedPrim.morphTargets);
             if (cachedPrim.materialIndex >= 0 && static_cast<size_t>(cachedPrim.materialIndex) < materials.size()) {
                 primitive.material = materials[static_cast<size_t>(cachedPrim.materialIndex)];
             } else if (!materials.empty()) {
@@ -2902,6 +3197,32 @@ std::unordered_map<std::string, nlohmann::json> usdPrimMetadataByPath(const nloh
     return result;
 }
 
+bool usdPrimRuntimeRenderable(const nlohmann::json& primJson) {
+    if (!primJson.is_object()) {
+        return true;
+    }
+    if (!primJson.value("active", true) || !primJson.value("visible", true)) {
+        return false;
+    }
+    const std::string purpose = lowerAscii(primJson.value("purpose", std::string{}));
+    return purpose.empty() || purpose == "default" || purpose == "render";
+}
+
+void applyUsdPrimRuntimeCulling(Entity& entity, const nlohmann::json& primJson) {
+    const bool renderable = usdPrimRuntimeRenderable(primJson);
+    if (entity.meshRenderer.has_value()) {
+        MeshRenderer& renderer = *entity.meshRenderer;
+        renderer.visible = renderable;
+        renderer.visibleToCamera = renderable;
+        renderer.castShadow = renderable;
+        renderer.receiveShadow = renderable;
+    }
+    if (entity.light.has_value()) {
+        entity.light->enabled = entity.light->enabled && renderable;
+        entity.light->visibleToCamera = entity.light->visibleToCamera && renderable;
+    }
+}
+
 std::string usdPrimPathEntityTag(const std::string& path) {
     return "usdPrimPath:" + path;
 }
@@ -3042,6 +3363,9 @@ bool appendPrefabRuntimeAssets(
     PrefabRuntimeBindings& bindings,
     const NativeRuntimeLoadOptions& nativeLoadOptions,
     std::string* error) {
+    if (populatePrefabBindingsFromLoadedAssets(prefab, destination, bindings)) {
+        return true;
+    }
     const std::filesystem::path sourcePath = resolveAssetSourcePath(prefabRecord, root);
     if (appendCachedPrefabRuntimeAssets(prefabRecord, root, sourcePath, prefab.runtimeCachePath, registry, destination, bindings, nativeLoadOptions, error)) {
         return true;
@@ -3088,6 +3412,195 @@ uint32_t rebindGuidBackedRenderers(SceneDocument& document, const PrefabRuntimeB
         }
     }
     return rebound;
+}
+
+class SceneAndNativeAssetAppendReloadCommand final : public ICommand {
+public:
+    SceneAndNativeAssetAppendReloadCommand(
+        SceneDocument& document,
+        AssetManager& assets,
+        const AssetRegistry& registry,
+        AssetRecord record,
+        std::filesystem::path root,
+        std::optional<PrefabAsset> prefab,
+        SceneDocument beforeDocument,
+        AssetLoadStats beforeAssetStats,
+        SceneDocument afterDocument,
+        NativeRuntimeLoadOptions nativeLoadOptions,
+        SceneUpdateKind updateKind,
+        std::string label)
+        : document_(document),
+          assets_(assets),
+          registry_(registry),
+          record_(std::move(record)),
+          root_(std::move(root)),
+          prefab_(std::move(prefab)),
+          beforeDocument_(std::move(beforeDocument)),
+          beforeAssetStats_(beforeAssetStats),
+          afterDocument_(std::move(afterDocument)),
+          nativeLoadOptions_(nativeLoadOptions),
+          updateKind_(updateKind),
+          label_(std::move(label)) {}
+
+    void undo() override {
+        document_ = beforeDocument_;
+        assets_.truncateTo(beforeAssetStats_);
+        document_.markDirty(updateKind_);
+    }
+
+    void redo() override {
+        assets_.truncateTo(beforeAssetStats_);
+        PrefabRuntimeBindings bindings;
+        std::string error;
+        NativeRuntimeLoadOptions loadOptions = nativeLoadOptions_;
+        loadOptions.retainLoadedPayloadsInReport = false;
+        const bool restored = prefab_.has_value()
+            ? appendPrefabRuntimeAssets(record_, *prefab_, root_, &registry_, assets_, bindings, loadOptions, &error)
+            : appendCachedPrefabRuntimeAssets(
+                record_,
+                root_,
+                resolveAssetSourcePath(record_, root_),
+                resolveAssetCachePath(record_, root_),
+                &registry_,
+                assets_,
+                bindings,
+                loadOptions,
+                &error);
+        if (!restored) {
+            document_ = beforeDocument_;
+            document_.markDirty(updateKind_);
+            std::cerr << "Redo failed for " << label_ << ": " << error << '\n';
+            return;
+        }
+        SceneDocument reboundDocument = afterDocument_;
+        (void)rebindGuidBackedRenderers(reboundDocument, bindings);
+        document_ = std::move(reboundDocument);
+        document_.markDirty(updateKind_);
+    }
+
+    [[nodiscard]] const std::string& label() const override { return label_; }
+
+private:
+    SceneDocument& document_;
+    AssetManager& assets_;
+    const AssetRegistry& registry_;
+    AssetRecord record_;
+    std::filesystem::path root_;
+    std::optional<PrefabAsset> prefab_;
+    SceneDocument beforeDocument_;
+    AssetLoadStats beforeAssetStats_{};
+    SceneDocument afterDocument_;
+    NativeRuntimeLoadOptions nativeLoadOptions_;
+    SceneUpdateKind updateKind_ = SceneUpdateKind::TopologyChanged;
+    std::string label_;
+};
+
+bool sceneHasUsdRuntimePlacement(
+    SceneDocument& document,
+    const std::vector<EditorMeshAssetPlacement>& meshPlacements,
+    const std::optional<nlohmann::json>& runtimePayload) {
+    std::unordered_set<AssetGuid> meshGuids;
+    meshGuids.reserve(meshPlacements.size());
+    for (const EditorMeshAssetPlacement& placement : meshPlacements) {
+        if (!placement.meshGuid.empty()) {
+            meshGuids.insert(placement.meshGuid);
+        }
+    }
+    if (!meshGuids.empty()) {
+        for (Entity* entity : document.registry().entities()) {
+            if (entity == nullptr || !entity->meshRenderer.has_value()) {
+                continue;
+            }
+            const MeshRenderer& renderer = *entity->meshRenderer;
+            if (!renderer.meshGuid.empty() && meshGuids.find(renderer.meshGuid) != meshGuids.end()) {
+                return true;
+            }
+        }
+    }
+
+    if (!runtimePayload.has_value() || !runtimePayload->is_object()) {
+        return false;
+    }
+    const nlohmann::json usdStageImport = runtimePayload->value("usdStageImport", nlohmann::json::object());
+    const nlohmann::json prims = usdStageImport.value("prims", nlohmann::json::array());
+    if (!prims.is_array()) {
+        return false;
+    }
+    for (const nlohmann::json& prim : prims) {
+        if (!prim.is_object()) {
+            continue;
+        }
+        const std::string path = prim.value("path", std::string{});
+        if (!path.empty() && findEntityWithTag(document, usdPrimPathEntityTag(path)).valid()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool attachUsdRuntimeAnimationPlayer(
+    SceneDocument& document,
+    const nlohmann::json& runtimePayload,
+    const std::filesystem::path& root) {
+    const nlohmann::json controllers = runtimePayload.value("animationControllerAssets", nlohmann::json::array());
+    const nlohmann::json animations = runtimePayload.value("animationAssets", nlohmann::json::array());
+    if (!controllers.is_array() || controllers.empty() || !animations.is_array() || animations.empty()) {
+        return false;
+    }
+    const nlohmann::json controller = controllers.front();
+    const nlohmann::json animation = animations.front();
+    const AssetGuid controllerGuid = controller.value("guid", std::string{});
+    const AssetGuid animationGuid = animation.value("guid", std::string{});
+    if (controllerGuid.empty() || animationGuid.empty()) {
+        return false;
+    }
+    EntityId target{};
+    const nlohmann::json usdStageImport = runtimePayload.value("usdStageImport", nlohmann::json::object());
+    const nlohmann::json rootPrims = usdStageImport.value("rootPrims", nlohmann::json::array());
+    if (rootPrims.is_array()) {
+        for (const nlohmann::json& item : rootPrims) {
+            if (!item.is_string()) {
+                continue;
+            }
+            target = findEntityWithTag(document, usdPrimPathEntityTag(item.get<std::string>()));
+            if (target.valid()) {
+                break;
+            }
+        }
+    }
+    if (!target.valid()) {
+        for (Entity* entity : document.registry().entities()) {
+            if (entity != nullptr && std::any_of(entity->tags.begin(), entity->tags.end(), [](const std::string& tag) {
+                return tag.rfind("usdPrimPath:", 0) == 0;
+            })) {
+                target = entity->id;
+                break;
+            }
+        }
+    }
+    Entity* entity = document.registry().entity(target);
+    if (entity == nullptr) {
+        return false;
+    }
+    AnimationPlayer player;
+    player.animationGuid = animationGuid;
+    player.controllerGuid = controllerGuid;
+    const std::string animationPath = animation.value("path", std::string{});
+    const std::string controllerPath = controller.value("path", std::string{});
+    if (!animationPath.empty()) {
+        player.animationPath = root / animationPath;
+    }
+    if (!controllerPath.empty()) {
+        player.controllerPath = root / controllerPath;
+    }
+    player.enabled = true;
+    player.playOnStart = true;
+    player.playing = true;
+    player.loop = true;
+    player.applyRootMotion = false;
+    player.applyMorphWeights = true;
+    entity->animationPlayer = std::move(player);
+    return true;
 }
 
 std::filesystem::path resolveProjectRoot() {
@@ -3229,7 +3742,8 @@ Application::Application(
     bool headless,
     bool disableAsyncCompute,
     bool singleQueueFallback,
-    bool disableResourceAliasing)
+    bool disableResourceAliasing,
+    StreamingRuntimeOptions streamingOptions)
     : debugView_(debugView),
       gltfPath_(std::move(gltfPath)),
       hdrPath_(std::move(hdrPath)),
@@ -3248,7 +3762,9 @@ Application::Application(
       disableAsyncCompute_(disableAsyncCompute),
       singleQueueFallback_(singleQueueFallback),
       disableResourceAliasing_(disableResourceAliasing),
+      streamingOptions_(streamingOptions),
       headless_(headless) {
+    streamingRuntimeState_.setOptions(streamingOptions_);
     if (!headless_) {
         initWindow();
     }
@@ -3272,6 +3788,12 @@ Application::Application(
 }
 
 Application::~Application() {
+    if (activeProgressiveRuntimeLoadJob_.has_value()) {
+        activeProgressiveRuntimeLoadJob_->cancelled = true;
+        if (activeProgressiveRuntimeLoadJob_->future.valid()) {
+            activeProgressiveRuntimeLoadJob_->future.wait();
+        }
+    }
     asyncSceneLoader_.requestCancel();
     asyncSceneLoader_.wait();
     waitForAssetImportWorker();
@@ -3332,6 +3854,9 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
         stepEditorTicketProbeQueues();
+        stepStreamingGpuWorkQueue();
+        stepStreamingGpuSceneUpdateQueue();
+        pollProgressiveRuntimeLoadJob();
         applyValidationObjectMotion(nextDiagnosticFrameIndex_);
         applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
         updateAnimationPlayers(deltaSeconds);
@@ -3369,6 +3894,9 @@ void Application::renderFrames(uint32_t count) {
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
         lastFrameSeconds_ = seconds;
         stepEditorTicketProbeQueues();
+        stepStreamingGpuWorkQueue();
+        stepStreamingGpuSceneUpdateQueue();
+        pollProgressiveRuntimeLoadJob();
         applyValidationObjectMotion(nextDiagnosticFrameIndex_);
         applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
         updateAnimationPlayers(deltaSeconds);
@@ -3415,6 +3943,180 @@ std::vector<MainThreadApplyTicketSnapshot> Application::editorMainThreadApplyTic
 
 std::vector<TopologyRebuildTicketSnapshot> Application::editorTopologyRebuildTicketSnapshots(bool includeStages) const {
     return editorTopologyRebuildTickets_.snapshots(includeStages);
+}
+
+namespace {
+
+rtv::NativeGpuAssetKind nativeGpuAssetKindForCatalogEntry(const rtv::NativeAssetCatalogEntry& entry) {
+    switch (entry.nativeKind) {
+    case rtv::NativeAssetKind::Mesh:
+    case rtv::NativeAssetKind::SkeletalMesh:
+        return rtv::NativeGpuAssetKind::Mesh;
+    case rtv::NativeAssetKind::Texture:
+        return rtv::NativeGpuAssetKind::Texture;
+    case rtv::NativeAssetKind::Material:
+        return rtv::NativeGpuAssetKind::Material;
+    default:
+        break;
+    }
+    switch (entry.assetType) {
+    case rtv::AssetType::Mesh:
+        return rtv::NativeGpuAssetKind::Mesh;
+    case rtv::AssetType::Texture:
+        return rtv::NativeGpuAssetKind::Texture;
+    case rtv::AssetType::Material:
+        return rtv::NativeGpuAssetKind::Material;
+    default:
+        return rtv::NativeGpuAssetKind::Material;
+    }
+}
+
+uint64_t estimatedMeshUploadBytes(const rtv::MeshAsset& mesh) {
+    const uint64_t vertexBytes = static_cast<uint64_t>(mesh.vertices.size()) * static_cast<uint64_t>(sizeof(rtv::MeshVertex));
+    const uint64_t indexBytes = static_cast<uint64_t>(mesh.indices.size()) * static_cast<uint64_t>(sizeof(uint32_t));
+    return vertexBytes + indexBytes;
+}
+
+uint64_t estimatedTextureUploadBytes(const rtv::TextureAsset& texture) {
+    uint64_t bytes = 0;
+    for (const rtv::TextureMipLevel& mip : texture.mipData) {
+        bytes += mip.size;
+    }
+    if (bytes != 0) {
+        return bytes;
+    }
+    if (!texture.rgba8.empty()) {
+        return static_cast<uint64_t>(texture.rgba8.size());
+    }
+    const uint64_t channelBytes = std::max<uint32_t>(1u, texture.channels);
+    return static_cast<uint64_t>(std::max<uint32_t>(1u, texture.width)) *
+        static_cast<uint64_t>(std::max<uint32_t>(1u, texture.height)) *
+        channelBytes;
+}
+
+uint32_t materialTextureDependencyCount(const rtv::MaterialAsset& material) {
+    const rtv::TextureAssetHandle handles[] = {
+        material.baseColorTexture,
+        material.normalTexture,
+        material.metallicRoughnessTexture,
+        material.emissiveTexture,
+        material.clearcoatTexture,
+        material.clearcoatRoughnessTexture,
+        material.clearcoatNormalTexture,
+        material.transmissionTexture,
+        material.volumeThicknessTexture,
+        material.specularTexture,
+        material.specularColorTexture,
+        material.sheenColorTexture,
+        material.sheenRoughnessTexture,
+        material.iridescenceTexture,
+        material.iridescenceThicknessTexture,
+        material.anisotropyTexture,
+        material.occlusionTexture,
+        material.opacityTexture,
+        material.heightTexture,
+    };
+    uint32_t count = 0;
+    for (const rtv::TextureAssetHandle handle : handles) {
+        if (handle.valid()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool materialContributesRestirLightCandidate(const rtv::MaterialAsset& material) {
+    const glm::vec3 emissive = material.emissiveFactor * std::max(material.emissiveStrength, 0.0f);
+    return emissive.x > 0.0f ||
+        emissive.y > 0.0f ||
+        emissive.z > 0.0f ||
+        material.emissiveTexture.valid();
+}
+
+double estimatedBlasBuildMs(const rtv::MeshAsset& mesh) {
+    uint64_t primitiveCount = 0;
+    for (const rtv::MeshPrimitiveAsset& primitive : mesh.primitives) {
+        primitiveCount += static_cast<uint64_t>(primitive.indexCount / 3u);
+    }
+    return std::clamp(0.15 + static_cast<double>(primitiveCount) / 250000.0, 0.15, 4.0);
+}
+
+} // namespace
+
+nlohmann::json Application::streamingRuntimeReport() const {
+    nlohmann::json report = streamingRuntimeState_.toJson(&nativeAssetCatalog_);
+    const NativeGpuAssetCacheStats nativeGpuStats = nativeGpuAssetCache_.stats();
+    const uint64_t gpuBudget = streamingOptions_.gpuMemoryBudgetBytes;
+    const uint64_t cpuBudget = streamingOptions_.cpuMemoryBudgetBytes;
+    report["native_gpu_asset_cache"] = {
+        {"stats", nativeGpuAssetCacheStatsJson(nativeGpuStats)},
+        {"memory_pressure", {
+            {"eviction_enabled", streamingOptions_.evictionEnabled},
+            {"gpu_budget_bytes", gpuBudget},
+            {"cpu_budget_bytes", cpuBudget},
+            {"resident_gpu_bytes", nativeGpuStats.residentGpuBytes},
+            {"resident_cpu_bytes", nativeGpuStats.residentCpuBytes},
+            {"over_gpu_budget_bytes", nativeGpuStats.residentGpuBytes > gpuBudget ? nativeGpuStats.residentGpuBytes - gpuBudget : 0ull},
+            {"over_cpu_budget_bytes", nativeGpuStats.residentCpuBytes > cpuBudget ? nativeGpuStats.residentCpuBytes - cpuBudget : 0ull},
+            {"evictable_assets", nativeGpuStats.evictableCount},
+            {"retired_assets", nativeGpuStats.retiredCount},
+        }},
+        {"last_eviction", nativeGpuAssetEvictionResultJson(lastStreamingEviction_)},
+        {"assets", nativeGpuAssetCacheSnapshotsJson(nativeGpuAssetCache_.snapshots())},
+    };
+    GpuSceneStreamingState gpuSceneStreaming;
+    gpuSceneStreaming.rebuild(sceneDocument_, gpuInstanceEntities_, &nativeGpuAssetCache_);
+    const GpuSceneStreamingUpdatePlan gpuSceneUpdatePlan = buildGpuSceneStreamingUpdatePlan(
+        lastStreamingGpuSceneSnapshots_,
+        gpuSceneStreaming.instances());
+    report["gpu_scene_streaming"] = {
+        {"stats", gpuSceneStreamingStatsJson(gpuSceneStreaming.stats())},
+        {"update_plan", gpuSceneStreamingUpdatePlanJson(gpuSceneUpdatePlan)},
+        {"instances", gpuSceneStreamingInstancesJson(gpuSceneStreaming.instances())},
+    };
+    report["incremental_gpu_scene_update_queue"] = {
+        {"stats", incrementalGpuSceneUpdateStatsJson(streamingGpuSceneUpdateQueue_.stats())},
+        {"last_frame", incrementalGpuSceneApplyFrameResultJson(lastStreamingGpuSceneApply_)},
+        {"operations", incrementalGpuSceneUpdateSnapshotsJson(streamingGpuSceneUpdateQueue_.snapshots())},
+    };
+    if (pathTracer_ != nullptr) {
+        const PathTracerRenderer::StreamingResetMaskReport& resetMasks = pathTracer_->streamingResetMaskReport();
+        report["streaming_reset_masks"] = {
+            {"generation", resetMasks.generation},
+            {"last_frame", resetMasks.lastFrame},
+            {"pending_temporal_entity_count", resetMasks.pendingTemporalEntityCount},
+            {"pending_restir_entity_count", resetMasks.pendingRestirEntityCount},
+            {"pending_denoiser_entity_count", resetMasks.pendingDenoiserEntityCount},
+            {"total_temporal_entity_count", resetMasks.totalTemporalEntityCount},
+            {"total_restir_entity_count", resetMasks.totalRestirEntityCount},
+            {"total_denoiser_entity_count", resetMasks.totalDenoiserEntityCount},
+            {"denoiser_history_invalidated", resetMasks.denoiserHistoryInvalidated},
+            {"denoiser_history_invalidation_generation", resetMasks.denoiserHistoryInvalidationGeneration},
+            {"gpu_record_count", resetMasks.gpuRecordCount},
+            {"gpu_record_capacity", resetMasks.gpuRecordCapacity},
+            {"gpu_buffer_bytes", resetMasks.gpuBufferBytes},
+            {"gpu_buffer_allocated", resetMasks.gpuBufferAllocated},
+            {"gpu_instance_mask_count", resetMasks.gpuInstanceMaskCount},
+            {"gpu_instance_mask_capacity", resetMasks.gpuInstanceMaskCapacity},
+            {"gpu_instance_mask_buffer_bytes", resetMasks.gpuInstanceMaskBufferBytes},
+            {"gpu_instance_mask_buffer_allocated", resetMasks.gpuInstanceMaskBufferAllocated},
+            {"temporal_entity_uuids", resetMasks.temporalEntityUuids},
+            {"restir_entity_uuids", resetMasks.restirEntityUuids},
+            {"temporal_instance_indices", resetMasks.temporalInstanceIndices},
+            {"restir_instance_indices", resetMasks.restirInstanceIndices},
+        };
+    }
+    report["streaming_gpu_work_queue"] = {
+        {"stats", streamingGpuWorkQueueStatsJson(streamingGpuWorkQueue_.stats())},
+        {"hitch_summary", streamingGpuWorkPressureStatsJson(streamingGpuWorkQueue_.pressureStats())},
+        {"tickets", streamingGpuWorkQueueSnapshotsJson(streamingGpuWorkQueue_.snapshots())},
+        {"next_timeline_value", streamingGpuWorkQueue_.nextTimelineValue()},
+    };
+    report["streaming_io"] = {
+        {"backend", streamingIoBackendAvailabilityJson(streamingOptions_)},
+        {"metrics", streamingIoMetricsJson(streamingIoMetrics_)},
+    };
+    return report;
 }
 
 std::filesystem::path Application::assetResolutionRoot() const {
@@ -3465,7 +4167,7 @@ std::optional<std::filesystem::path> Application::resolveAnimationControllerPath
     const std::filesystem::path root = assetResolutionRoot();
     if (!player.controllerGuid.empty()) {
         const auto recordIt = std::find_if(assetRegistry_.records().begin(), assetRegistry_.records().end(), [&](const AssetRecord& record) {
-            return record.guid == player.controllerGuid && record.type == AssetType::Animation;
+            return record.guid == player.controllerGuid && record.type == AssetType::AnimationController;
         });
         if (recordIt != assetRegistry_.records().end()) {
             const std::filesystem::path nativePath = resolveAssetCachePath(*recordIt, root);
@@ -3805,6 +4507,20 @@ void Application::updateAnimationPlayers(float deltaSeconds) {
         }
         return false;
     };
+    auto differentVec3Vector = [](const std::vector<glm::vec3>& a, const MeshAsset& mesh) {
+        constexpr float eps = 1.0e-5f;
+        if (a.size() != mesh.vertices.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < a.size(); ++i) {
+            const glm::vec3 current = mesh.vertices[i].position;
+            const glm::vec3 next = a[i];
+            if (std::abs(current.x - next.x) > eps || std::abs(current.y - next.y) > eps || std::abs(current.z - next.z) > eps) {
+                return true;
+            }
+        }
+        return false;
+    };
     auto pathKey = [](int32_t node, AnimationTrackPath path) -> uint64_t {
         return (static_cast<uint64_t>(static_cast<uint32_t>(node)) << 32u) | static_cast<uint64_t>(static_cast<uint32_t>(path));
     };
@@ -3868,6 +4584,68 @@ void Application::updateAnimationPlayers(float deltaSeconds) {
         } else if (b->hasMorphWeights) {
             result.morphWeights = b->morphWeights;
             result.hasMorphWeights = true;
+        }
+        if (a->hasMeshVertexPositions && b->hasMeshVertexPositions) {
+            const size_t count = std::min(a->meshVertexPositions.size(), b->meshVertexPositions.size());
+            result.meshVertexPositions.resize(count);
+            for (size_t i = 0; i < count; ++i) {
+                result.meshVertexPositions[i] = glm::mix(a->meshVertexPositions[i], b->meshVertexPositions[i], alpha);
+            }
+            result.hasMeshVertexPositions = !result.meshVertexPositions.empty();
+        } else if (a->hasMeshVertexPositions) {
+            result.meshVertexPositions = a->meshVertexPositions;
+            result.hasMeshVertexPositions = true;
+        } else if (b->hasMeshVertexPositions) {
+            result.meshVertexPositions = b->meshVertexPositions;
+            result.hasMeshVertexPositions = true;
+        }
+        auto blendScalar = [alpha](bool hasA, float av, bool hasB, float bv, bool& hasOut, float& out) {
+            if (hasA && hasB) {
+                out = av + (bv - av) * alpha;
+                hasOut = true;
+            } else if (hasA) {
+                out = av;
+                hasOut = true;
+            } else if (hasB) {
+                out = bv;
+                hasOut = true;
+            }
+        };
+        blendScalar(a->hasCameraYfov, a->cameraYfov, b->hasCameraYfov, b->cameraYfov, result.hasCameraYfov, result.cameraYfov);
+        blendScalar(a->hasCameraAspectRatio, a->cameraAspectRatio, b->hasCameraAspectRatio, b->cameraAspectRatio, result.hasCameraAspectRatio, result.cameraAspectRatio);
+        blendScalar(a->hasCameraOrthoXmag, a->cameraOrthoXmag, b->hasCameraOrthoXmag, b->cameraOrthoXmag, result.hasCameraOrthoXmag, result.cameraOrthoXmag);
+        blendScalar(a->hasCameraOrthoYmag, a->cameraOrthoYmag, b->hasCameraOrthoYmag, b->cameraOrthoYmag, result.hasCameraOrthoYmag, result.cameraOrthoYmag);
+        blendScalar(a->hasLightIntensity, a->lightIntensity, b->hasLightIntensity, b->lightIntensity, result.hasLightIntensity, result.lightIntensity);
+        blendScalar(a->hasLightRadius, a->lightRadius, b->hasLightRadius, b->lightRadius, result.hasLightRadius, result.lightRadius);
+        if (a->hasCameraNearFar && b->hasCameraNearFar) {
+            result.cameraNearFar = glm::mix(a->cameraNearFar, b->cameraNearFar, alpha);
+            result.hasCameraNearFar = true;
+        } else if (a->hasCameraNearFar) {
+            result.cameraNearFar = a->cameraNearFar;
+            result.hasCameraNearFar = true;
+        } else if (b->hasCameraNearFar) {
+            result.cameraNearFar = b->cameraNearFar;
+            result.hasCameraNearFar = true;
+        }
+        if (a->hasLightColor && b->hasLightColor) {
+            result.lightColor = glm::mix(a->lightColor, b->lightColor, alpha);
+            result.hasLightColor = true;
+        } else if (a->hasLightColor) {
+            result.lightColor = a->lightColor;
+            result.hasLightColor = true;
+        } else if (b->hasLightColor) {
+            result.lightColor = b->lightColor;
+            result.hasLightColor = true;
+        }
+        if (a->hasLightConeAngles && b->hasLightConeAngles) {
+            result.lightConeAngles = glm::mix(a->lightConeAngles, b->lightConeAngles, alpha);
+            result.hasLightConeAngles = true;
+        } else if (a->hasLightConeAngles) {
+            result.lightConeAngles = a->lightConeAngles;
+            result.hasLightConeAngles = true;
+        } else if (b->hasLightConeAngles) {
+            result.lightConeAngles = b->lightConeAngles;
+            result.hasLightConeAngles = true;
         }
         return result;
     };
@@ -4300,6 +5078,84 @@ void Application::updateAnimationPlayers(float deltaSeconds) {
                 differentFloatVector(target.meshRenderer->morphWeights, nodeSample.morphWeights)) {
                 target.meshRenderer->morphWeights = nodeSample.morphWeights;
                 sceneTopologyChanged = true;
+            }
+            if (nodeSample.hasMeshVertexPositions && target.meshRenderer.has_value()) {
+                MeshRenderer& renderer = *target.meshRenderer;
+                MeshAsset* mesh = assets_.mesh(renderer.mesh);
+                if (mesh != nullptr && nodeSample.meshVertexPositions.size() == mesh->vertices.size() && differentVec3Vector(nodeSample.meshVertexPositions, *mesh)) {
+                    std::vector<glm::vec3>& basePositions = animationMeshBasePositions_[renderer.mesh.index];
+                    if (basePositions.size() != mesh->vertices.size()) {
+                        basePositions.clear();
+                        basePositions.reserve(mesh->vertices.size());
+                        for (const MeshVertex& vertex : mesh->vertices) {
+                            basePositions.push_back(vertex.position);
+                        }
+                    }
+                    for (size_t i = 0; i < mesh->vertices.size(); ++i) {
+                        mesh->vertices[i].position = nodeSample.meshVertexPositions[i];
+                    }
+                    mesh->cachedLocalBvhNodes.clear();
+                    mesh->cachedLocalBvhTriangles.clear();
+                    sceneTopologyChanged = true;
+                }
+            }
+            if (target.camera.has_value()) {
+                Camera& camera = *target.camera;
+                bool cameraChanged = false;
+                if (nodeSample.hasCameraYfov && std::abs(camera.verticalFovRadians - nodeSample.cameraYfov) > 1.0e-5f) {
+                    camera.verticalFovRadians = nodeSample.cameraYfov;
+                    cameraChanged = true;
+                }
+                if (nodeSample.hasCameraAspectRatio && std::abs(camera.aspectRatio - nodeSample.cameraAspectRatio) > 1.0e-5f) {
+                    camera.aspectRatio = nodeSample.cameraAspectRatio;
+                    cameraChanged = true;
+                }
+                if (nodeSample.hasCameraOrthoXmag && std::abs(camera.orthographicXmag - nodeSample.cameraOrthoXmag) > 1.0e-5f) {
+                    camera.orthographicXmag = nodeSample.cameraOrthoXmag;
+                    cameraChanged = true;
+                }
+                if (nodeSample.hasCameraOrthoYmag && std::abs(camera.orthographicYmag - nodeSample.cameraOrthoYmag) > 1.0e-5f) {
+                    camera.orthographicYmag = nodeSample.cameraOrthoYmag;
+                    cameraChanged = true;
+                }
+                if (nodeSample.hasCameraNearFar &&
+                    (std::abs(camera.nearPlane - nodeSample.cameraNearFar.x) > 1.0e-5f ||
+                     std::abs(camera.farPlane - nodeSample.cameraNearFar.y) > 1.0e-5f)) {
+                    camera.nearPlane = nodeSample.cameraNearFar.x;
+                    camera.farPlane = nodeSample.cameraNearFar.y;
+                    cameraChanged = true;
+                }
+                if (cameraChanged) {
+                    sceneDocument_.markDirty(SceneUpdateKind::CameraOnly);
+                    sceneTransformChanged = true;
+                }
+            }
+            if (target.light.has_value()) {
+                Light& light = *target.light;
+                bool lightChanged = false;
+                if (nodeSample.hasLightColor && differentVec3(light.color, nodeSample.lightColor)) {
+                    light.color = nodeSample.lightColor;
+                    lightChanged = true;
+                }
+                if (nodeSample.hasLightIntensity && std::abs(light.intensity - nodeSample.lightIntensity) > 1.0e-5f) {
+                    light.intensity = nodeSample.lightIntensity;
+                    lightChanged = true;
+                }
+                if (nodeSample.hasLightRadius && std::abs(light.sizeOrRadius - nodeSample.lightRadius) > 1.0e-5f) {
+                    light.sizeOrRadius = nodeSample.lightRadius;
+                    lightChanged = true;
+                }
+                if (nodeSample.hasLightConeAngles &&
+                    (std::abs(light.innerConeRadians - nodeSample.lightConeAngles.x) > 1.0e-5f ||
+                     std::abs(light.outerConeRadians - nodeSample.lightConeAngles.y) > 1.0e-5f)) {
+                    light.innerConeRadians = nodeSample.lightConeAngles.x;
+                    light.outerConeRadians = nodeSample.lightConeAngles.y;
+                    lightChanged = true;
+                }
+                if (lightChanged) {
+                    sceneDocument_.markDirty(SceneUpdateKind::LightOnly);
+                    sceneTransformChanged = true;
+                }
             }
         }
     }
@@ -4901,6 +5757,9 @@ void Application::mainLoop(uint32_t maxFrames) {
         }
         frameWorkScheduler_.tick();
         stepEditorTicketProbeQueues();
+        stepStreamingGpuWorkQueue();
+        stepStreamingGpuSceneUpdateQueue();
+        pollProgressiveRuntimeLoadJob();
         EditorJobCenterState jobCenter;
         jobCenter.frameWorkScheduler = frameWorkScheduler_.snapshot();
         jobCenter.frameWorkSchedulerAvailable = true;
@@ -6778,6 +7637,8 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
                 (void)loadPrefabAsset(resolveAssetRecordPath(*recordIt, registryRoot), prefab, &prefabError);
                 NativeRuntimeLoadOptions nativeLoadOptions;
                 nativeLoadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
+                nativeLoadOptions.validatePayloadHashes = false;
+                nativeLoadOptions.retainLoadedPayloadsInReport = false;
                 if (std::string bindError; !appendPrefabRuntimeAssets(*recordIt, prefab, registryRoot, &assetRegistry_, result.assets, prefabBindings, nativeLoadOptions, &bindError)) {
                     std::cerr << "Prefab runtime binding failed during scene load: " << bindError << '\n';
                 }
@@ -7664,11 +8525,37 @@ bool Application::mountProjectStartupNativePackage(AssetManager& assets) {
         return false;
     }
 
-    NativeAssetRuntimeLoader loader;
     NativeRuntimeLoadOptions loadOptions;
     loadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
-    NativeRuntimeLoadReport loadReport = loader.loadLooseRoot(packagePath, &assets, loadOptions);
+    const uint64_t packageBytes = regularFileSizeOrZero(packagePath);
     const std::filesystem::path reportPath = projectStartupNativePackageMountReportPath(project);
+    if (packageBytes >= loadOptions.eagerCpuLoadWarningBytes) {
+        nlohmann::json report = legacyCpuPackageMountBlockedJson(
+            "ProjectStartupNativePackageMountV1",
+            "ApplicationProjectOpen",
+            packagePath,
+            packageBytes,
+            loadOptions);
+        report["project"] = {
+            {"name", project.name},
+            {"projectFile", project.projectFile.generic_string()},
+            {"buildRoot", project.buildRoot.generic_string()},
+        };
+        report["package"]["automaticStartupMount"] = true;
+        report["policy"] = "Project-open automatic CPU package mount is skipped for large .rtpkg files. Large project payloads should use progressive native streaming and DirectStorage-backed upload tickets.";
+        std::string writeError;
+        if (!writeCookJsonArtifact(reportPath, report, &writeError)) {
+            std::cerr << "Startup native package blocked-report write failed: " << writeError << '\n';
+        }
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->editor().log().add(EditorLogCategory::Warning, "Startup native package CPU mount skipped for large package: " + packagePath.string());
+        }
+        notifications_.notify("Startup package uses streaming path", NotificationType::Info, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
+        return false;
+    }
+
+    NativeAssetRuntimeLoader loader;
+    NativeRuntimeLoadReport loadReport = loader.loadLooseRoot(packagePath, &assets, loadOptions);
     nlohmann::json report = nativeRuntimeLoadReportToJson(loadReport);
     report["schema"] = "ProjectStartupNativePackageMountV1";
     report["inspectionSource"] = "ApplicationProjectOpen";
@@ -7811,16 +8698,41 @@ bool Application::mountNativePackageFromEditor(const std::filesystem::path& pack
         return false;
     }
 
+    NativeRuntimeLoadOptions loadOptions;
+    loadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
+    const std::filesystem::path reportPath = editorNativePackageMountReportPath(project_, packagePath);
+    const uint64_t packageBytes = regularFileSizeOrZero(packagePath);
+    if (packageBytes >= loadOptions.eagerCpuLoadWarningBytes) {
+        nlohmann::json report = legacyCpuPackageMountBlockedJson(
+            "ContentBrowserPackageMountV1",
+            "ContentBrowserDiagnosticCpuMountPackage",
+            packagePath,
+            packageBytes,
+            loadOptions);
+        report["package"]["mountedFromUi"] = true;
+        report["project"] = project_.has_value()
+            ? nlohmann::json{{"name", project_->name}, {"projectFile", project_->projectFile.generic_string()}, {"projectRoot", project_->projectRoot.generic_string()}}
+            : nlohmann::json{{"name", ""}, {"projectFile", ""}, {"projectRoot", ""}};
+        report["policy"] = "Content Browser diagnostic CPU package mount is blocked for large .rtpkg files before payload decode. Use package inspection, validation, and progressive streaming instead.";
+        std::string writeError;
+        const bool wroteReport = writeCookJsonArtifact(reportPath, report, &writeError);
+        notifications_.notify("Diagnostic CPU mount blocked", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->editor().log().add(EditorLogCategory::Warning, "Diagnostic CPU package mount blocked for large package: " + packagePath.string() + (wroteReport ? " report=" + reportPath.string() : std::string{}));
+        }
+        if (wroteReport) {
+            (void)openFileInShell(reportPath);
+        }
+        return false;
+    }
+
     const size_t textureCountBefore = assets_.textures().size();
     const size_t materialCountBefore = assets_.materials().size();
     const size_t meshCountBefore = assets_.meshes().size();
 
     NativeAssetRuntimeLoader loader;
-    NativeRuntimeLoadOptions loadOptions;
-    loadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
     NativeRuntimeLoadReport loadReport = loader.loadLooseRoot(packagePath, &assets_, loadOptions);
 
-    const std::filesystem::path reportPath = editorNativePackageMountReportPath(project_, packagePath);
     nlohmann::json report = nativeRuntimeLoadReportToJson(loadReport);
     report["schema"] = "ContentBrowserPackageMountV1";
     report["inspectionSource"] = "ContentBrowserMountPackage";
@@ -7846,7 +8758,7 @@ bool Application::mountNativePackageFromEditor(const std::filesystem::path& pack
     report["mutatedState"] = "CPU AssetManager";
     report["rendererPlacementFromPackageImplemented"] = true;
     report["directRendererResourceUploadFromPackageImplemented"] = false;
-    report["policy"] = "Content Browser Mount Package decodes .rtpkg mesh, material, and texture payloads into the active CPU AssetManager after explicit confirmation. It does not overwrite files, mutate the asset registry, or create/upload renderer resources directly.";
+    report["policy"] = "Content Browser Diagnostic CPU Mount decodes small .rtpkg mesh, material, and texture payloads into the active CPU AssetManager after explicit confirmation. Large packages are blocked before payload decode and should use progressive native streaming instead.";
 
     std::string writeError;
     const bool wroteReport = writeCookJsonArtifact(reportPath, report, &writeError);
@@ -7854,13 +8766,13 @@ bool Application::mountNativePackageFromEditor(const std::filesystem::path& pack
         std::cerr << "Content Browser package mount report write failed: " << writeError << '\n';
     }
 
-    const std::string summary = "Mounted package from Content Browser: " + packagePath.string() +
+    const std::string summary = "Diagnostic CPU mounted package from Content Browser: " + packagePath.string() +
         " meshes=" + std::to_string(loadReport.meshCount) +
         " materials=" + std::to_string(loadReport.materialCount) +
         " textures=" + std::to_string(loadReport.textureCount);
     if (loadReport.ok) {
         rememberMountedNativePackage(packagePath, loadReport);
-        notifications_.notify("Package mounted", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+        notifications_.notify("Diagnostic CPU package mounted", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
         std::cout << summary << '\n';
         if (uiOverlay_ != nullptr) {
             uiOverlay_->editor().log().add(EditorLogCategory::Command, summary + (wroteReport ? " report=" + reportPath.string() : std::string{}));
@@ -7871,14 +8783,14 @@ bool Application::mountNativePackageFromEditor(const std::filesystem::path& pack
         return true;
     }
 
-    notifications_.notify("Package mount failed", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
-    std::cerr << "Content Browser package mount failed: " << packagePath.string();
+    notifications_.notify("Diagnostic CPU package mount failed", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+    std::cerr << "Content Browser diagnostic CPU package mount failed: " << packagePath.string();
     if (wroteReport) {
         std::cerr << " report=" << reportPath.string();
     }
     std::cerr << '\n';
     if (uiOverlay_ != nullptr) {
-        uiOverlay_->editor().log().add(EditorLogCategory::Warning, "Package mount failed: " + packagePath.string() + (wroteReport ? " report=" + reportPath.string() : std::string{}));
+        uiOverlay_->editor().log().add(EditorLogCategory::Warning, "Diagnostic CPU package mount failed: " + packagePath.string() + (wroteReport ? " report=" + reportPath.string() : std::string{}));
     }
     if (wroteReport) {
         (void)openFileInShell(reportPath);
@@ -8197,6 +9109,35 @@ bool Application::refreshNativePackageFromEditor(const std::filesystem::path& pa
         return false;
     }
 
+    NativeRuntimeLoadOptions loadOptions;
+    loadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
+    const uint64_t packageBytes = regularFileSizeOrZero(packagePath);
+    if (packageBytes >= loadOptions.eagerCpuLoadWarningBytes) {
+        nlohmann::json report = legacyCpuPackageMountBlockedJson(
+            "ContentBrowserPackageRefreshV1",
+            "ContentBrowserDiagnosticCpuRefreshPackage",
+            packagePath,
+            packageBytes,
+            loadOptions);
+        report["package"]["refreshedFromUi"] = true;
+        report["project"] = project_.has_value()
+            ? nlohmann::json{{"name", project_->name}, {"projectFile", project_->projectFile.generic_string()}, {"projectRoot", project_->projectRoot.generic_string()}}
+            : nlohmann::json{{"name", ""}, {"projectFile", ""}, {"projectRoot", ""}};
+        report["unloadAttempted"] = false;
+        report["mountAttempted"] = false;
+        report["policy"] = "Content Browser diagnostic CPU refresh is blocked for large .rtpkg files before unload/remount. Use package inspection, validation, and progressive streaming instead.";
+        std::string writeError;
+        const bool wroteReport = writeCookJsonArtifact(reportPath, report, &writeError);
+        notifications_.notify("Diagnostic CPU refresh blocked", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->editor().log().add(EditorLogCategory::Warning, "Diagnostic CPU package refresh blocked for large package: " + packagePath.string() + (wroteReport ? " report=" + reportPath.string() : std::string{}));
+        }
+        if (wroteReport) {
+            (void)openFileInShell(reportPath);
+        }
+        return false;
+    }
+
     size_t mountedTextureCount = 0;
     size_t mountedMaterialCount = 0;
     size_t mountedMeshCount = 0;
@@ -8242,9 +9183,9 @@ bool Application::refreshNativePackageFromEditor(const std::filesystem::path& pa
         {"unloadReportPath", hadMountedAssets ? unloadReportPath.generic_string() : std::string{}},
         {"mountReportPath", mountReportPath.generic_string()},
         {"mutationExecuted", mountOk || hadMountedAssets},
-        {"mutatedState", "CPU AssetManager through package unload/remount; SceneDocument/GpuScene/PathTracerRenderer retirement path only when unload affected active package-backed assets"},
+        {"mutatedState", "CPU AssetManager through diagnostic package unload/remount; SceneDocument/GpuScene/PathTracerRenderer retirement path only when unload affected active package-backed assets"},
         {"directRendererResourceUploadFromPackageImplemented", false},
-        {"policy", "Content Browser Refresh Package is available as an explicit selected-action workflow and as a timestamp-polled mounted-package refresh path. It unloads currently mounted package-backed CPU assets for the selected .rtpkg when present, then remounts the current package file through the existing CPU AssetManager runtime loader path. It does not implement direct NativeAssetStore-to-GPU upload."},
+        {"policy", "Content Browser Diagnostic CPU Refresh is available for small packages as an explicit selected-action workflow and as a timestamp-polled mounted-package refresh path. Large packages are blocked before unload/remount and should use progressive native streaming instead."},
         {"limitations", nlohmann::json::array({
             "Continuous mounted-package refresh is timestamp-poll based and routes changed packages through the existing refresh request path; provider-level conflict resolution remains separate source-control work.",
             "Direct NativeAssetStore-to-GPU upload and renderer-owned native store handles remain open roadmap work."
@@ -8256,14 +9197,14 @@ bool Application::refreshNativePackageFromEditor(const std::filesystem::path& pa
         std::cerr << "Content Browser package refresh report write failed: " << writeError << '\n';
     }
 
-    const std::string summary = "Refreshed package from Content Browser: " + packagePath.string() +
+    const std::string summary = "Diagnostic CPU refreshed package from Content Browser: " + packagePath.string() +
         " previousMeshes=" + std::to_string(mountedMeshCount) +
         " previousMaterials=" + std::to_string(mountedMaterialCount) +
         " previousTextures=" + std::to_string(mountedTextureCount) +
         " unload=" + (hadMountedAssets ? (unloadOk ? "ok" : "failed") : "skipped") +
         " mount=" + (mountOk ? "ok" : "failed");
     if (mountOk) {
-        notifications_.notify("Package refreshed", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+        notifications_.notify("Diagnostic CPU package refreshed", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
         std::cout << summary << '\n';
         if (uiOverlay_ != nullptr) {
             uiOverlay_->editor().log().add(EditorLogCategory::Command, summary + (wroteReport ? " report=" + reportPath.string() : std::string{}));
@@ -8272,7 +9213,7 @@ bool Application::refreshNativePackageFromEditor(const std::filesystem::path& pa
             (void)openFileInShell(reportPath);
         }
     } else {
-        notifications_.notify("Package refresh failed", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
+        notifications_.notify("Diagnostic CPU package refresh failed", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
         std::cerr << summary << '\n';
         if (uiOverlay_ != nullptr) {
             uiOverlay_->editor().log().add(EditorLogCategory::Warning, summary + (wroteReport ? " report=" + reportPath.string() : std::string{}));
@@ -8844,11 +9785,24 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid, const std::optio
     PrefabRuntimeBindings bindings;
     NativeRuntimeLoadOptions nativeLoadOptions;
     nativeLoadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
-    if (std::string bindError; !appendPrefabRuntimeAssets(*prefabRecord, prefab, root, &assetRegistry_, assets_, bindings, nativeLoadOptions, &bindError)) {
-        assets_.truncateTo(beforeAssetStats);
-        notifications_.notify("Prefab runtime binding failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
-        std::cerr << "Prefab runtime binding failed: " << bindError << '\n';
-        return false;
+    nativeLoadOptions.validatePayloadHashes = false;
+    nativeLoadOptions.retainLoadedPayloadsInReport = false;
+    const std::vector<std::filesystem::path> runtimeAllowList = nativeRuntimeCacheAllowListForRecord(*prefabRecord, root, &assetRegistry_);
+    const uint64_t runtimePayloadBytes = existingFileBytes(runtimeAllowList);
+    constexpr uint64_t kMaxEagerPrefabRuntimePayloadBytes = 4ull * 1024ull * 1024ull * 1024ull;
+    const bool deferRuntimePayloadLoad = runtimePayloadBytes > kMaxEagerPrefabRuntimePayloadBytes;
+    if (deferRuntimePayloadLoad) {
+        std::cout << "Prefab runtime payload deferred for placement: " << prefabGuid
+                  << " files=" << runtimeAllowList.size()
+                  << " bytes=" << runtimePayloadBytes
+                  << " threshold=" << kMaxEagerPrefabRuntimePayloadBytes << '\n';
+    } else {
+        if (std::string bindError; !appendPrefabRuntimeAssets(*prefabRecord, prefab, root, &assetRegistry_, assets_, bindings, nativeLoadOptions, &bindError)) {
+            assets_.truncateTo(beforeAssetStats);
+            notifications_.notify("Prefab runtime binding failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
+            std::cerr << "Prefab runtime binding failed: " << bindError << '\n';
+            return false;
+        }
     }
 
     const SceneDocument beforeDocument = sceneDocument_;
@@ -8867,14 +9821,46 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid, const std::optio
             rootEntity->defaultTransform = *placementTransform;
         }
     }
-    undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
-        sceneDocument_,
-        beforeDocument,
-        sceneDocument_,
-        SceneUpdateKind::TopologyChanged,
-        "Place Prefab Asset"));
+    if (deferRuntimePayloadLoad) {
+        undoStack_.pushCommand(std::make_unique<AppSceneDocumentSnapshotCommand>(
+            sceneDocument_,
+            beforeDocument,
+            sceneDocument_,
+            SceneUpdateKind::TopologyChanged,
+            "Place Prefab Asset"));
+        if (streamingOptions_.enabled) {
+            (void)queueProgressiveRuntimeLoadForPrefab(
+                *prefabRecord,
+                prefab,
+                root,
+                instance.instanceRoot,
+                runtimeAllowList,
+                runtimePayloadBytes);
+        }
+    } else {
+        undoStack_.pushCommand(std::make_unique<SceneAndNativeAssetAppendReloadCommand>(
+            sceneDocument_,
+            assets_,
+            assetRegistry_,
+            *prefabRecord,
+            root,
+            std::optional<PrefabAsset>{prefab},
+            beforeDocument,
+            beforeAssetStats,
+            sceneDocument_,
+            nativeLoadOptions,
+            SceneUpdateKind::TopologyChanged,
+            "Place Prefab Asset"));
+    }
     sceneUnsavedDirty_ = true;
-    (void)applyPendingSceneUpdate(false);
+    const bool deferRendererRebuild = shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+    (void)applyPendingSceneUpdate(!deferRendererRebuild);
+    if (deferRendererRebuild) {
+        notifications_.notify("Prefab placed; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+    }
+    if (deferRuntimePayloadLoad) {
+        notifications_.notify("Large prefab placed with runtime payload deferred", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 7.0f);
+    }
     editorPlacement_.entity = instance.instanceRoot;
     editorPlacement_.serial = nextEditorPlacementSerial_++;
     editorPlacement_.label = prefab.name.empty() ? "Prefab asset" : prefab.name;
@@ -8883,7 +9869,480 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid, const std::optio
     return true;
 }
 
-bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
+bool Application::queueProgressiveRuntimeLoadForPrefab(
+    const AssetRecord& prefabRecord,
+    const PrefabAsset& prefab,
+    const std::filesystem::path& root,
+    EntityId rootEntity,
+    const std::vector<std::filesystem::path>& files,
+    uint64_t totalBytes) {
+    if (!streamingOptions_.enabled || files.empty()) {
+        return false;
+    }
+    if (activeProgressiveRuntimeLoadJob_.has_value()) {
+        streamingRuntimeState_.pushEvent("progressive runtime load skipped because another root is active: " + prefabRecord.guid);
+        return false;
+    }
+
+    nativeAssetCatalog_.buildFromRegistry(assetRegistry_, root);
+    for (const AssetGuid& guid : nativeAssetCatalog_.dependencyClosure(prefabRecord.guid)) {
+        streamingRuntimeState_.catalogAsset(guid);
+        streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Requested);
+        if (const NativeAssetCatalogEntry* entry = nativeAssetCatalog_.find(guid); entry != nullptr && entry->streamable) {
+            nativeGpuAssetCache_.upsert(NativeGpuAssetDesc{
+                .kind = nativeGpuAssetKindForCatalogEntry(*entry),
+                .guid = guid,
+                .label = entry->displayName.empty() ? guid : entry->displayName,
+                .cpuBytes = entry->estimatedCpuBytes,
+                .gpuBytes = entry->estimatedGpuBytes,
+                .uploadBytes = entry->fileBytes,
+                .fallbackDescriptorBound = true,
+            });
+        }
+    }
+
+    std::filesystem::path nativeLoadRoot = root;
+    if (!files.empty()) {
+        nativeLoadRoot = files.front().parent_path();
+        for (const std::filesystem::path& file : files) {
+            std::filesystem::path parent = file.parent_path();
+            while (!parent.empty()) {
+                const std::string parentString = parent.lexically_normal().generic_string();
+                const std::string rootString = nativeLoadRoot.lexically_normal().generic_string();
+                if (rootString.rfind(parentString, 0) == 0) {
+                    nativeLoadRoot = parent;
+                    break;
+                }
+                parent = parent.parent_path();
+            }
+        }
+    }
+
+    ActiveProgressiveRuntimeLoadJob job;
+    job.serial = nextProgressiveRuntimeLoadJobSerial_++;
+    job.rootGuid = prefabRecord.guid;
+    job.rootEntity = rootEntity;
+    job.label = prefab.name.empty() ? (prefabRecord.displayName.empty() ? std::string("Prefab") : prefabRecord.displayName) : prefab.name;
+    job.record = prefabRecord;
+    job.root = root;
+    job.nativeLoadRoot = nativeLoadRoot;
+    job.files = files;
+    job.totalBytes = totalBytes;
+    activeProgressiveRuntimeLoadJob_ = std::move(job);
+
+    streamingRuntimeState_.setActiveRoot(StreamingRootSnapshot{
+        .serial = activeProgressiveRuntimeLoadJob_->serial,
+        .rootGuid = activeProgressiveRuntimeLoadJob_->rootGuid,
+        .label = activeProgressiveRuntimeLoadJob_->label,
+        .rootPath = activeProgressiveRuntimeLoadJob_->nativeLoadRoot,
+        .totalFiles = static_cast<uint32_t>(activeProgressiveRuntimeLoadJob_->files.size()),
+        .queuedBytes = activeProgressiveRuntimeLoadJob_->totalBytes,
+        .active = true,
+        .status = "queued",
+    });
+    streamingRuntimeState_.pushEvent("queued progressive runtime load for prefab " + prefabRecord.guid);
+    notifications_.notify("Progressive runtime streaming queued", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+    startNextProgressiveRuntimeLoadBatch();
+    return true;
+}
+
+void Application::startNextProgressiveRuntimeLoadBatch() {
+    if (!activeProgressiveRuntimeLoadJob_.has_value()) {
+        return;
+    }
+    ActiveProgressiveRuntimeLoadJob& job = *activeProgressiveRuntimeLoadJob_;
+    if (job.cancelled || job.batchInFlight || job.nextFile >= job.files.size()) {
+        return;
+    }
+
+    const uint64_t batchLimit = std::max<uint64_t>(1ull * 1024ull * 1024ull, streamingOptions_.cpuBatchBytes);
+    uint64_t batchBytes = 0;
+    std::vector<std::filesystem::path> batchFiles;
+    const uint32_t firstFile = job.nextFile;
+    while (job.nextFile < job.files.size()) {
+        const std::filesystem::path& path = job.files[job.nextFile];
+        uint64_t fileBytes = 0;
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(path, ec)) {
+            const uintmax_t size = std::filesystem::file_size(path, ec);
+            if (!ec) {
+                fileBytes = static_cast<uint64_t>(size);
+            }
+        }
+        if (!batchFiles.empty() && batchBytes + fileBytes > batchLimit) {
+            break;
+        }
+        batchBytes += fileBytes;
+        batchFiles.push_back(path);
+        ++job.nextFile;
+        if (batchBytes >= batchLimit) {
+            break;
+        }
+    }
+    if (batchFiles.empty()) {
+        return;
+    }
+
+    std::vector<std::tuple<std::filesystem::path, AssetGuid, AssetType>> registryCachePaths;
+    registryCachePaths.reserve(assetRegistry_.records().size());
+    for (const AssetRecord& record : assetRegistry_.records()) {
+        if (record.cachePath.empty() || record.guid.empty()) {
+            continue;
+        }
+        std::filesystem::path path = record.cachePath;
+        if (!path.is_absolute()) {
+            path = job.root / path;
+        }
+        registryCachePaths.emplace_back(path.lexically_normal(), record.guid, record.type);
+    }
+
+    const uint64_t serial = job.serial;
+    const std::filesystem::path nativeLoadRoot = job.nativeLoadRoot;
+    const StreamingRuntimeOptions streamingOptions = streamingOptions_;
+    NativeRuntimeLoadOptions loadOptions;
+    loadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
+    loadOptions.validatePayloadHashes = false;
+    loadOptions.retainLoadedPayloadsInReport = false;
+    loadOptions.looseFileAllowList = batchFiles;
+
+    job.batchInFlight = true;
+    for (const std::filesystem::path& file : batchFiles) {
+        streamingRuntimeState_.pushEvent("queued native streaming file " + file.filename().string());
+    }
+    streamingRuntimeState_.setActiveRoot(StreamingRootSnapshot{
+        .serial = job.serial,
+        .rootGuid = job.rootGuid,
+        .label = job.label,
+        .rootPath = job.nativeLoadRoot,
+        .totalFiles = static_cast<uint32_t>(job.files.size()),
+        .loadedFiles = job.loadedFiles,
+        .failedFiles = job.failedFiles,
+        .queuedBytes = job.totalBytes,
+        .loadedBytes = job.loadedBytes,
+        .appliedBytes = job.appliedBytes,
+        .reboundRenderers = job.reboundRenderers,
+        .active = true,
+        .status = "loading batch",
+    });
+
+    job.future = std::async(std::launch::async, [serial, firstFile, batchBytes, batchFiles = std::move(batchFiles), registryCachePaths = std::move(registryCachePaths), nativeLoadRoot, loadOptions, streamingOptions]() mutable {
+        ProgressiveRuntimeLoadBatchResult result;
+        result.serial = serial;
+        result.firstFile = firstFile;
+        result.fileCount = static_cast<uint32_t>(batchFiles.size());
+        result.bytes = batchBytes;
+        result.files = batchFiles;
+
+        std::unique_ptr<StreamingIoBackend> ioBackend = makeStreamingIoBackend(streamingOptions);
+        std::vector<StreamingIoReadRequest> ioRequests;
+        ioRequests.reserve(batchFiles.size());
+        for (const std::filesystem::path& file : batchFiles) {
+            uint64_t fileBytes = 0;
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(file, ec)) {
+                const uintmax_t size = std::filesystem::file_size(file, ec);
+                if (!ec) {
+                    fileBytes = static_cast<uint64_t>(size);
+                }
+            }
+            StreamingIoReadRequest request;
+            request.path = file;
+            request.size = fileBytes;
+            request.label = "progressive runtime streaming read " + file.filename().string();
+            ioRequests.push_back(std::move(request));
+        }
+        bool ioOk = true;
+        const std::vector<StreamingIoReadResult> ioReads = ioBackend->readBatch(ioRequests);
+        for (const StreamingIoReadResult& read : ioReads) {
+            if (!read.ok) {
+                ioOk = false;
+                result.ioErrors.push_back(read.path.string() + ": " + read.error);
+            }
+        }
+        result.ioMetrics = ioBackend->metrics();
+        if (!ioOk) {
+            result.ok = false;
+            return result;
+        }
+
+        NativeAssetRuntimeLoader loader;
+        NativeRuntimeLoadReport report = loader.loadLooseRoot(nativeLoadRoot, &result.assets, loadOptions);
+        result.ok = report.ok;
+        for (const NativeBinaryError& error : report.errors) {
+            result.errors.push_back(error.message);
+        }
+
+        auto registryGuidForNativeAsset = [&](const NativeRuntimeLoadedAsset& asset) -> AssetGuid {
+            if (asset.path.empty()) {
+                return asset.guid;
+            }
+            const std::filesystem::path assetPath = asset.path.lexically_normal();
+            for (const auto& [cachePath, guid, type] : registryCachePaths) {
+                const bool typeMatches =
+                    (asset.kind == NativeAssetKind::Mesh && type == AssetType::Mesh) ||
+                    (asset.kind == NativeAssetKind::Texture && type == AssetType::Texture) ||
+                    (asset.kind == NativeAssetKind::Material && type == AssetType::Material);
+                if (typeMatches && cachePath == assetPath) {
+                    return guid;
+                }
+            }
+            return asset.guid;
+        };
+
+        for (const NativeRuntimeLoadedAsset& asset : report.assets) {
+            if (!asset.ok) {
+                continue;
+            }
+            const AssetGuid bindingGuid = registryGuidForNativeAsset(asset);
+            if (bindingGuid.empty()) {
+                continue;
+            }
+            if (asset.kind == NativeAssetKind::Mesh && asset.meshHandle.valid()) {
+                result.bindings.meshes[bindingGuid] = asset.meshHandle;
+            } else if (asset.kind == NativeAssetKind::Texture && asset.textureHandle.valid()) {
+                result.textures[bindingGuid] = asset.textureHandle;
+            } else if (asset.kind == NativeAssetKind::Material && asset.materialHandle.valid()) {
+                result.bindings.materials[bindingGuid] = asset.materialHandle;
+            }
+        }
+        return result;
+    });
+}
+
+void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchResult&& result) {
+    if (!activeProgressiveRuntimeLoadJob_.has_value() || activeProgressiveRuntimeLoadJob_->serial != result.serial) {
+        return;
+    }
+    ActiveProgressiveRuntimeLoadJob& job = *activeProgressiveRuntimeLoadJob_;
+    job.batchInFlight = false;
+    streamingIoMetrics_ = result.ioMetrics;
+    for (const std::string& error : result.ioErrors) {
+        streamingRuntimeState_.pushEvent("streaming I/O failed: " + error);
+    }
+
+    ImportedAssetHandleRemap remap = appendImportedAssets(assets_, result.assets);
+    PrefabRuntimeBindings liveBindings;
+    for (const auto& [guid, handle] : result.textures) {
+        if (handle.valid() && handle.index < remap.textures.size()) {
+            const TextureAssetHandle liveHandle = remap.textures[handle.index];
+            const TextureAsset* texture = assets_.texture(liveHandle);
+            const uint32_t mipCount = texture != nullptr
+                ? static_cast<uint32_t>(std::max(1, texture->mipLevels))
+                : 1u;
+            const uint64_t uploadBytes = texture != nullptr ? estimatedTextureUploadBytes(*texture) : 0ull;
+            nativeGpuAssetCache_.upsert(NativeGpuAssetDesc{
+                .kind = NativeGpuAssetKind::Texture,
+                .guid = guid,
+                .label = texture != nullptr && !texture->name.empty() ? texture->name : guid,
+                .cpuBytes = uploadBytes,
+                .gpuBytes = uploadBytes,
+                .uploadBytes = uploadBytes,
+                .mipCount = mipCount,
+                .residentMipCount = 0,
+                .fallbackDescriptorBound = true,
+            });
+            streamingRuntimeState_.setAssetState(guid, StreamingAssetState::UploadQueued);
+            uint64_t firstUploadTicket = 0;
+            auto mipUploadBytes = [&](uint32_t mipLevel) -> uint64_t {
+                if (texture != nullptr && mipLevel < texture->mipData.size() && texture->mipData[mipLevel].size != 0) {
+                    return texture->mipData[mipLevel].size;
+                }
+                if (mipLevel == 0 && texture != nullptr && !texture->rgba8.empty()) {
+                    return static_cast<uint64_t>(texture->rgba8.size());
+                }
+                return std::max<uint64_t>(1ull, uploadBytes / std::max<uint32_t>(1u, mipCount));
+            };
+            for (uint32_t queuedMip = 0; queuedMip < mipCount; ++queuedMip) {
+                const uint32_t mipLevel = mipCount - 1u - queuedMip;
+                const uint64_t mipBytes = mipUploadBytes(mipLevel);
+                const uint64_t uploadTicket = streamingGpuWorkQueue_.enqueue(StreamingGpuWorkDesc{
+                    .kind = StreamingGpuWorkKind::ImageMipUpload,
+                    .label = "stream texture mip " + std::to_string(mipLevel) + "/" + std::to_string(mipCount) + " " + guid,
+                    .ownerGuid = guid,
+                    .bytes = mipBytes,
+                    .estimatedGpuMs = std::clamp(static_cast<double>(mipBytes) / (64.0 * 1024.0 * 1024.0), 0.03, 0.75),
+                    .textureMipLevel = mipLevel,
+                    .textureMipCount = mipCount,
+                });
+                if (firstUploadTicket == 0) {
+                    firstUploadTicket = uploadTicket;
+                }
+            }
+            (void)nativeGpuAssetCache_.markUploading(guid, firstUploadTicket);
+        }
+    }
+    for (const auto& [guid, handle] : result.bindings.meshes) {
+        if (handle.valid() && handle.index < remap.meshes.size()) {
+            liveBindings.meshes[guid] = remap.meshes[handle.index];
+            streamingRuntimeState_.setAssetState(guid, StreamingAssetState::UploadQueued);
+            const MeshAssetHandle liveHandle = remap.meshes[handle.index];
+            const MeshAsset* mesh = assets_.mesh(liveHandle);
+            const uint64_t uploadBytes = mesh != nullptr ? estimatedMeshUploadBytes(*mesh) : 0ull;
+            nativeGpuAssetCache_.upsert(NativeGpuAssetDesc{
+                .kind = NativeGpuAssetKind::Mesh,
+                .guid = guid,
+                .label = mesh != nullptr && !mesh->name.empty() ? mesh->name : guid,
+                .cpuBytes = uploadBytes,
+                .gpuBytes = uploadBytes,
+                .uploadBytes = uploadBytes,
+                .fallbackDescriptorBound = true,
+            });
+            const uint64_t uploadChunkBytes = std::max<uint64_t>(1ull * 1024ull * 1024ull, streamingOptions_.uploadBytesPerFrame);
+            uint64_t uploaded = 0;
+            uint64_t firstUploadTicket = 0;
+            do {
+                const uint64_t chunkBytes = uploadBytes == 0
+                    ? 0
+                    : std::min(uploadChunkBytes, uploadBytes - uploaded);
+                const uint64_t uploadTicket = streamingGpuWorkQueue_.enqueue(StreamingGpuWorkDesc{
+                    .kind = StreamingGpuWorkKind::BufferUpload,
+                    .label = "stream mesh buffers " + guid,
+                    .ownerGuid = guid,
+                    .bytes = chunkBytes,
+                    .estimatedGpuMs = 0.10,
+                });
+                if (firstUploadTicket == 0) {
+                    firstUploadTicket = uploadTicket;
+                }
+                uploaded += chunkBytes;
+            } while (uploaded < uploadBytes);
+            (void)nativeGpuAssetCache_.markUploading(guid, firstUploadTicket);
+            const uint64_t blasTicket = streamingGpuWorkQueue_.enqueue(StreamingGpuWorkDesc{
+                .kind = StreamingGpuWorkKind::BlasBuild,
+                .label = "build streamed mesh BLAS " + guid,
+                .ownerGuid = guid,
+                .estimatedGpuMs = mesh != nullptr ? estimatedBlasBuildMs(*mesh) : 0.25,
+                .blasBuilds = 1,
+            });
+            (void)nativeGpuAssetCache_.markBlasBuildQueued(guid, blasTicket);
+            const uint64_t tlasTicket = streamingGpuWorkQueue_.enqueue(StreamingGpuWorkDesc{
+                .kind = StreamingGpuWorkKind::TlasPatch,
+                .label = "patch streamed mesh TLAS " + guid,
+                .ownerGuid = guid,
+                .estimatedGpuMs = 0.08,
+                .tlasPatches = 1,
+            });
+            (void)nativeGpuAssetCache_.markTlasPatchQueued(guid, tlasTicket);
+        }
+    }
+    for (const auto& [guid, handle] : result.bindings.materials) {
+        if (handle.valid() && handle.index < remap.materials.size()) {
+            liveBindings.materials[guid] = remap.materials[handle.index];
+            streamingRuntimeState_.setAssetState(guid, StreamingAssetState::UploadQueued);
+            const MaterialAssetHandle liveHandle = remap.materials[handle.index];
+            const MaterialAsset* material = assets_.material(liveHandle);
+            const uint32_t dependencyCount = material != nullptr ? materialTextureDependencyCount(*material) : 0u;
+            nativeGpuAssetCache_.upsert(NativeGpuAssetDesc{
+                .kind = NativeGpuAssetKind::Material,
+                .guid = guid,
+                .label = material != nullptr && !material->name.empty() ? material->name : guid,
+                .descriptorDependencyCount = dependencyCount,
+                .descriptorResidentDependencyCount = 0,
+                .fallbackDescriptorBound = true,
+                .descriptorPatchPending = true,
+                .restirLightCandidate = material != nullptr && materialContributesRestirLightCandidate(*material),
+            });
+            const uint64_t descriptorTicket = streamingGpuWorkQueue_.enqueue(StreamingGpuWorkDesc{
+                .kind = StreamingGpuWorkKind::DescriptorUpdate,
+                .label = "patch streamed material descriptors " + guid,
+                .ownerGuid = guid,
+                .estimatedGpuMs = 0.03,
+                .descriptorUpdates = std::max<uint32_t>(1u, dependencyCount),
+            });
+            (void)nativeGpuAssetCache_.markUploading(guid, descriptorTicket);
+            (void)nativeGpuAssetCache_.markDescriptorPatchQueued(guid, descriptorTicket);
+        }
+    }
+
+    const uint32_t rebound = rebindGuidBackedRenderers(sceneDocument_, liveBindings);
+    job.reboundRenderers += rebound;
+    job.loadedFiles += result.fileCount;
+    job.loadedBytes += result.bytes;
+    job.appliedBytes += result.bytes;
+    if (!result.ok) {
+        job.failed = true;
+        job.failedFiles += result.fileCount;
+        for (const std::string& error : result.errors) {
+            streamingRuntimeState_.pushEvent("streaming batch failed: " + error);
+        }
+        for (const std::string& error : result.ioErrors) {
+            streamingRuntimeState_.pushEvent("streaming batch failed: " + error);
+        }
+    }
+
+    if (rebound > 0) {
+        sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+        (void)applyPendingSceneUpdate(!shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_));
+    }
+
+    const bool complete = job.nextFile >= job.files.size();
+    streamingRuntimeState_.setActiveRoot(StreamingRootSnapshot{
+        .serial = job.serial,
+        .rootGuid = job.rootGuid,
+        .label = job.label,
+        .rootPath = job.nativeLoadRoot,
+        .totalFiles = static_cast<uint32_t>(job.files.size()),
+        .loadedFiles = job.loadedFiles,
+        .failedFiles = job.failedFiles,
+        .queuedBytes = job.totalBytes,
+        .loadedBytes = job.loadedBytes,
+        .appliedBytes = job.appliedBytes,
+        .reboundRenderers = job.reboundRenderers,
+        .active = !complete,
+        .complete = complete,
+        .failed = job.failed,
+        .status = complete ? "complete" : "applied batch",
+    });
+
+    if (complete) {
+        streamingRuntimeState_.pushEvent("completed progressive runtime load for prefab " + job.rootGuid);
+        notifications_.notify("Progressive runtime streaming complete", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
+        activeProgressiveRuntimeLoadJob_.reset();
+        return;
+    }
+    startNextProgressiveRuntimeLoadBatch();
+}
+
+void Application::pollProgressiveRuntimeLoadJob() {
+    if (!activeProgressiveRuntimeLoadJob_.has_value()) {
+        return;
+    }
+    ActiveProgressiveRuntimeLoadJob& job = *activeProgressiveRuntimeLoadJob_;
+    if (job.rootEntity.valid() && sceneDocument_.registry().entity(job.rootEntity) == nullptr) {
+        job.cancelled = true;
+    }
+    if (job.cancelled) {
+        if (job.future.valid()) {
+            job.future.wait();
+        }
+        streamingRuntimeState_.setActiveRoot(StreamingRootSnapshot{
+            .serial = job.serial,
+            .rootGuid = job.rootGuid,
+            .label = job.label,
+            .rootPath = job.nativeLoadRoot,
+            .totalFiles = static_cast<uint32_t>(job.files.size()),
+            .loadedFiles = job.loadedFiles,
+            .failedFiles = job.failedFiles,
+            .queuedBytes = job.totalBytes,
+            .loadedBytes = job.loadedBytes,
+            .appliedBytes = job.appliedBytes,
+            .reboundRenderers = job.reboundRenderers,
+            .cancelled = true,
+            .status = "cancelled",
+        });
+        activeProgressiveRuntimeLoadJob_.reset();
+        return;
+    }
+    if (!job.batchInFlight || !job.future.valid()) {
+        startNextProgressiveRuntimeLoadBatch();
+        return;
+    }
+    if (job.future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        applyProgressiveRuntimeLoadBatch(job.future.get());
+    }
+}
+
+bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request, bool deferSceneUpdate) {
     const AssetRecord* meshRecord = nullptr;
     for (const AssetRecord& record : assetRegistry_.records()) {
         if (record.guid == request.meshGuid) {
@@ -8901,30 +10360,31 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
         return false;
     }
 
-    const AssetManager beforeAssets = assets_;
+    const AssetLoadStats beforeAssetStats = assets_.stats();
     bool restoredRuntimeAssets = false;
     std::optional<uint32_t> meshIndex = loadedMeshIndexForRecord(*meshRecord);
+    std::filesystem::path root = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
+    if (!project_.has_value() && assetRegistry_.state().path.has_parent_path()) {
+        root = assetRegistry_.state().path.parent_path();
+    }
+    NativeRuntimeLoadOptions nativeLoadOptions;
+    nativeLoadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
+    nativeLoadOptions.validatePayloadHashes = false;
+    nativeLoadOptions.retainLoadedPayloadsInReport = false;
     if (!meshIndex.has_value()) {
-        std::filesystem::path root = project_.has_value() ? project_->projectRoot : std::filesystem::current_path();
-        if (!project_.has_value() && assetRegistry_.state().path.has_parent_path()) {
-            root = assetRegistry_.state().path.parent_path();
-        }
-
-        AssetManager nextAssets = assets_;
         PrefabRuntimeBindings bindings;
         std::string bindError;
-        NativeRuntimeLoadOptions nativeLoadOptions;
-        nativeLoadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
         if (!appendCachedPrefabRuntimeAssets(
                 *meshRecord,
                 root,
                 resolveAssetSourcePath(*meshRecord, root),
                 resolveAssetCachePath(*meshRecord, root),
                 &assetRegistry_,
-                nextAssets,
+                assets_,
                 bindings,
                 nativeLoadOptions,
                 &bindError)) {
+            assets_.truncateTo(beforeAssetStats);
             notifications_.notify("Mesh cooked payload is unavailable", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
             if (!bindError.empty()) {
                 std::cerr << "Mesh runtime binding failed: " << bindError << '\n';
@@ -8933,11 +10393,11 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
         }
         const auto restoredMesh = bindings.meshes.find(request.meshGuid);
         if (restoredMesh == bindings.meshes.end() || !restoredMesh->second.valid()) {
+            assets_.truncateTo(beforeAssetStats);
             notifications_.notify("Mesh cooked payload does not contain this asset", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
             std::cerr << "Mesh runtime binding did not expose GUID: " << request.meshGuid << '\n';
             return false;
         }
-        assets_ = std::move(nextAssets);
         meshIndex = restoredMesh->second.index;
         restoredRuntimeAssets = true;
     }
@@ -8945,7 +10405,7 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
     if (assets_.mesh(meshHandle) == nullptr) {
         notifications_.notify("Mesh runtime data is unavailable", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         if (restoredRuntimeAssets) {
-            assets_ = beforeAssets;
+            assets_.truncateTo(beforeAssetStats);
         }
         return false;
     }
@@ -8971,7 +10431,7 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
         Entity* target = sceneDocument_.registry().entity(request.attachEntity);
         if (target == nullptr) {
             if (restoredRuntimeAssets) {
-                assets_ = beforeAssets;
+                assets_.truncateTo(beforeAssetStats);
             }
             notifications_.notify("Mesh hierarchy target is unavailable", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
             return false;
@@ -8984,13 +10444,17 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
         sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
         sceneUnsavedDirty_ = true;
         if (restoredRuntimeAssets) {
-            undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+            undoStack_.pushCommand(std::make_unique<SceneAndNativeAssetAppendReloadCommand>(
                 sceneDocument_,
                 assets_,
+                assetRegistry_,
+                *meshRecord,
+                root,
+                std::nullopt,
                 beforeDocument,
-                beforeAssets,
+                beforeAssetStats,
                 sceneDocument_,
-                assets_,
+                nativeLoadOptions,
                 SceneUpdateKind::TopologyChanged,
                 "Place Mesh Asset In Hierarchy"));
         } else {
@@ -9001,7 +10465,13 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
                 SceneUpdateKind::TopologyChanged,
                 "Place Mesh Asset In Hierarchy"));
         }
-        (void)applyPendingSceneUpdate(true);
+        const bool deferRendererRebuild = deferSceneUpdate || shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+        if (!deferSceneUpdate) {
+            (void)applyPendingSceneUpdate(!deferRendererRebuild);
+            if (deferRendererRebuild) {
+                notifications_.notify("Mesh placed; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+            }
+        }
         editorPlacement_.entity = request.attachEntity;
         editorPlacement_.serial = nextEditorPlacementSerial_++;
         editorPlacement_.label = target->name.empty() ? (meshRecord->displayName.empty() ? "Mesh Asset" : meshRecord->displayName) : target->name;
@@ -9013,7 +10483,7 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
         Entity* target = sceneDocument_.registry().entity(request.replaceEntity);
         if (target == nullptr || !target->meshRenderer.has_value()) {
             if (restoredRuntimeAssets) {
-                assets_ = beforeAssets;
+                assets_.truncateTo(beforeAssetStats);
             }
             notifications_.notify("Mesh replacement target is unavailable", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 5.0f);
             return false;
@@ -9022,13 +10492,17 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
         sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
         sceneUnsavedDirty_ = true;
         if (restoredRuntimeAssets) {
-            undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+            undoStack_.pushCommand(std::make_unique<SceneAndNativeAssetAppendReloadCommand>(
                 sceneDocument_,
                 assets_,
+                assetRegistry_,
+                *meshRecord,
+                root,
+                std::nullopt,
                 beforeDocument,
-                beforeAssets,
+                beforeAssetStats,
                 sceneDocument_,
-                assets_,
+                nativeLoadOptions,
                 SceneUpdateKind::TopologyChanged,
                 "Replace Mesh Asset"));
         } else {
@@ -9039,7 +10513,13 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
                 SceneUpdateKind::TopologyChanged,
                 "Replace Mesh Asset"));
         }
-        (void)applyPendingSceneUpdate(true);
+        const bool deferRendererRebuild = deferSceneUpdate || shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+        if (!deferSceneUpdate) {
+            (void)applyPendingSceneUpdate(!deferRendererRebuild);
+            if (deferRendererRebuild) {
+                notifications_.notify("Mesh replaced; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+            }
+        }
         editorPlacement_.entity = request.replaceEntity;
         editorPlacement_.serial = nextEditorPlacementSerial_++;
         editorPlacement_.label = target->name.empty() ? (meshRecord->displayName.empty() ? "Mesh Asset" : meshRecord->displayName) : target->name;
@@ -9055,7 +10535,7 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
     if (entity == nullptr) {
         sceneDocument_ = beforeDocument;
         if (restoredRuntimeAssets) {
-            assets_ = beforeAssets;
+            assets_.truncateTo(beforeAssetStats);
         }
         notifications_.notify("Mesh placement failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 6.0f);
         return false;
@@ -9069,13 +10549,17 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
     sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
     sceneUnsavedDirty_ = true;
     if (restoredRuntimeAssets) {
-        undoStack_.pushCommand(std::make_unique<SceneAndAssetsSnapshotCommand>(
+        undoStack_.pushCommand(std::make_unique<SceneAndNativeAssetAppendReloadCommand>(
             sceneDocument_,
             assets_,
+            assetRegistry_,
+            *meshRecord,
+            root,
+            std::nullopt,
             beforeDocument,
-            beforeAssets,
+            beforeAssetStats,
             sceneDocument_,
-            assets_,
+            nativeLoadOptions,
             SceneUpdateKind::TopologyChanged,
             "Place Mesh Asset"));
     } else {
@@ -9086,7 +10570,13 @@ bool Application::placeMeshAsset(const EditorMeshAssetPlacement& request) {
             SceneUpdateKind::TopologyChanged,
             "Place Mesh Asset"));
     }
-    (void)applyPendingSceneUpdate(true);
+    const bool deferRendererRebuild = deferSceneUpdate || shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+    if (!deferSceneUpdate) {
+        (void)applyPendingSceneUpdate(!deferRendererRebuild);
+        if (deferRendererRebuild) {
+            notifications_.notify("Mesh placed; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+        }
+    }
     editorPlacement_.entity = created;
     editorPlacement_.serial = nextEditorPlacementSerial_++;
     editorPlacement_.label = entityName;
@@ -9144,8 +10634,10 @@ std::optional<Application::UsdRuntimeMeshHierarchyPlacementResult> Application::
             if (const auto transform = usdPrimLocalTransform(prim)) {
                 entity->transform = *transform;
             }
+            entity->sourceNodeIndex = prim.value("index", -1);
             entity->defaultTransform = entity->transform;
             addEntityTagIfMissing(*entity, tag);
+            applyUsdPrimRuntimeCulling(*entity, prim);
         }
         entityByPrimPath[path] = id;
         ++result.hierarchyEntityCount;
@@ -9155,6 +10647,7 @@ std::optional<Application::UsdRuntimeMeshHierarchyPlacementResult> Application::
 
     struct PendingMeshAttach {
         EditorMeshAssetPlacement placement;
+        std::string primPath;
         EntityId entity{};
         bool hasLocalTransform = false;
     };
@@ -9183,7 +10676,7 @@ std::optional<Application::UsdRuntimeMeshHierarchyPlacementResult> Application::
         if (localTransform.has_value()) {
             attach.placementTransform = *localTransform;
         }
-        pendingAttaches.push_back(PendingMeshAttach{std::move(attach), entity, localTransform.has_value()});
+        pendingAttaches.push_back(PendingMeshAttach{std::move(attach), primPath, entity, localTransform.has_value()});
     }
 
     if (pendingAttaches.empty()) {
@@ -9202,12 +10695,26 @@ std::optional<Application::UsdRuntimeMeshHierarchyPlacementResult> Application::
     }
 
     for (const PendingMeshAttach& pending : pendingAttaches) {
-        if (!placeMeshAsset(pending.placement)) {
+        if (!placeMeshAsset(pending.placement, true)) {
             continue;
+        }
+        if (Entity* entity = sceneDocument_.registry().entity(pending.entity)) {
+            if (const auto primIt = primByPath.find(pending.primPath); primIt != primByPath.end()) {
+                applyUsdPrimRuntimeCulling(*entity, primIt->second);
+                sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+                sceneUnsavedDirty_ = true;
+            }
         }
         ++result.meshCount;
         if (pending.hasLocalTransform) {
             ++result.transformCount;
+        }
+    }
+    if (result.meshCount > 0) {
+        const bool deferRendererRebuild = shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+        (void)applyPendingSceneUpdate(!deferRendererRebuild);
+        if (deferRendererRebuild) {
+            notifications_.notify("USD mesh hierarchy placed; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
         }
     }
     return result;
@@ -9273,8 +10780,10 @@ std::optional<Application::UsdRuntimeScenePlacementResult> Application::placeUsd
             if (const auto transform = usdPrimLocalTransform(prim)) {
                 entity->transform = *transform;
             }
+            entity->sourceNodeIndex = prim.value("index", -1);
             applyDefaultTransform(*entity);
             addEntityTagIfMissing(*entity, tag);
+            applyUsdPrimRuntimeCulling(*entity, prim);
         }
         entityByPrimPath[path] = id;
         ++result.hierarchyEntityCount;
@@ -9318,6 +10827,9 @@ std::optional<Application::UsdRuntimeScenePlacementResult> Application::placeUsd
             }
             const bool active = !hadActiveCamera && !firstCreatedCamera.valid();
             sceneDocument_.registry().addCamera(id, cameraFromUsdRuntimeJson(cameraJson, active));
+            if (const auto primIt = primByPath.find(primPath); primIt != primByPath.end()) {
+                applyUsdPrimRuntimeCulling(*entity, primIt->second);
+            }
             if (active) {
                 firstCreatedCamera = id;
             }
@@ -9341,6 +10853,9 @@ std::optional<Application::UsdRuntimeScenePlacementResult> Application::placeUsd
                 continue;
             }
             sceneDocument_.registry().addLight(id, lightFromUsdRuntimeJson(lightJson));
+            if (const auto primIt = primByPath.find(primPath); primIt != primByPath.end()) {
+                applyUsdPrimRuntimeCulling(*entity, primIt->second);
+            }
             ++result.lightCount;
             updateMask |= SceneUpdateMaskLight;
         }
@@ -9362,7 +10877,11 @@ std::optional<Application::UsdRuntimeScenePlacementResult> Application::placeUsd
         sceneDocument_,
         sceneUpdateKindFromMask(updateMask),
         result.hierarchyEntityCount > result.cameraCount + result.lightCount ? "Place USD Camera/Light Hierarchy" : "Place USD Cameras And Lights"));
-    (void)applyPendingSceneUpdate(true);
+    const bool deferRendererRebuild = shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+    (void)applyPendingSceneUpdate(!deferRendererRebuild);
+    if (deferRendererRebuild) {
+        notifications_.notify("USD cameras/lights placed; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+    }
     if (firstCreatedEntity.valid()) {
         editorPlacement_.entity = firstCreatedEntity;
         editorPlacement_.serial = nextEditorPlacementSerial_++;
@@ -9419,6 +10938,8 @@ bool Application::placeMeshScatterAssets(const EditorMeshScatterPlacement& reque
         std::string bindError;
         NativeRuntimeLoadOptions nativeLoadOptions;
         nativeLoadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
+        nativeLoadOptions.validatePayloadHashes = false;
+        nativeLoadOptions.retainLoadedPayloadsInReport = false;
         if (!appendCachedPrefabRuntimeAssets(
                 *meshRecord,
                 root,
@@ -9533,7 +11054,11 @@ bool Application::placeMeshScatterAssets(const EditorMeshScatterPlacement& reque
             SceneUpdateKind::TopologyChanged,
             undoLabel));
     }
-    (void)applyPendingSceneUpdate(true);
+    const bool deferRendererRebuild = shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+    (void)applyPendingSceneUpdate(!deferRendererRebuild);
+    if (deferRendererRebuild) {
+        notifications_.notify("Scatter placed; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+    }
     editorPlacement_.entity = firstCreated;
     editorPlacement_.serial = nextEditorPlacementSerial_++;
     editorPlacement_.label = undoLabel;
@@ -11579,6 +13104,7 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
                   << " report=" << result.importReportPath.string() << '\n';
         std::string placementStatus = "Import and Place completed";
         if (job.placeAfterImport) {
+            try {
             bool placed = false;
             if (result.record.type == AssetType::Prefab) {
                 placed = placePrefabAsset(importedGuid);
@@ -11588,20 +13114,23 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
                 size_t placedCount = 0;
                 size_t transformPlacementCount = 0;
                 size_t meshHierarchyEntityCount = 0;
+                bool placementNeedsSceneUpdate = false;
                 const std::vector<EditorMeshAssetPlacement> usdMeshPlacements = placeableUsdMeshChildPlacements();
                 const auto meshHierarchyPlacement = placeUsdRuntimeMeshHierarchy(result.record, job.workspace.root, usdMeshPlacements);
                 if (meshHierarchyPlacement.has_value() && meshHierarchyPlacement->meshCount > 0) {
                     placed = true;
+                    placementNeedsSceneUpdate = true;
                     placedCount = meshHierarchyPlacement->meshCount;
                     transformPlacementCount = meshHierarchyPlacement->transformCount;
                     meshHierarchyEntityCount = meshHierarchyPlacement->hierarchyEntityCount;
                 } else {
                     for (const EditorMeshAssetPlacement& usdMeshPlacement : usdMeshPlacements) {
-                        if (!placeMeshAsset(usdMeshPlacement)) {
+                        if (!placeMeshAsset(usdMeshPlacement, true)) {
                             placed = false;
                             break;
                         }
                         placed = true;
+                        placementNeedsSceneUpdate = true;
                         ++placedCount;
                         if (usdMeshPlacement.placementTransform.has_value()) {
                             ++transformPlacementCount;
@@ -11617,6 +13146,25 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
                         lightCount = sceneEntities->lightCount;
                         hierarchyEntityCount = sceneEntities->hierarchyEntityCount;
                         placed = placed || cameraCount > 0 || lightCount > 0;
+                        placementNeedsSceneUpdate = placementNeedsSceneUpdate || hierarchyEntityCount > 0;
+                    }
+                }
+                bool animationPlayerAttached = false;
+                if (placed) {
+                    if (const std::optional<nlohmann::json> runtimePayload = runtimePayloadForImportedRecord(result.record, job.workspace.root)) {
+                        animationPlayerAttached = attachUsdRuntimeAnimationPlayer(sceneDocument_, *runtimePayload, job.workspace.root);
+                        if (animationPlayerAttached) {
+                            sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+                            sceneUnsavedDirty_ = true;
+                            placementNeedsSceneUpdate = true;
+                        }
+                    }
+                }
+                if (placementNeedsSceneUpdate || sceneDocument_.dirty()) {
+                    const bool deferRendererRebuild = shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+                    (void)applyPendingSceneUpdate(!deferRendererRebuild);
+                    if (deferRendererRebuild) {
+                        notifications_.notify("Import placed; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
                     }
                 }
                 if (placed) {
@@ -11639,6 +13187,9 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
                     if (hierarchyEntityCount > cameraCount + lightCount) {
                         parts.push_back(std::to_string(hierarchyEntityCount) + " USD hierarchy entities created");
                     }
+                    if (animationPlayerAttached) {
+                        parts.push_back("USD transform animation attached");
+                    }
                     std::string summary;
                     for (const std::string& part : parts) {
                         if (!summary.empty()) {
@@ -11653,6 +13204,21 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
             }
             if (!placed) {
                 result.warnings.push_back("Import staged, but viewport placement failed. See editor log for placement error details.");
+                recordCompletedImportJob(false, "Import staged; placement failed", result.warnings);
+                return false;
+            }
+            } catch (const std::bad_alloc&) {
+                const std::string message = "Import staged, but viewport placement ran out of system memory. Try import-only, close other memory-heavy applications, or place a smaller/streamed subset.";
+                result.warnings.push_back(message);
+                notifications_.notify("Import placement ran out of memory", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 8.0f);
+                std::cerr << message << '\n';
+                recordCompletedImportJob(false, "Import staged; placement ran out of memory", result.warnings);
+                return false;
+            } catch (const std::exception& ex) {
+                const std::string message = std::string("Import staged, but viewport placement failed: ") + ex.what();
+                result.warnings.push_back(message);
+                notifications_.notify("Import placement failed", NotificationType::Error, NotificationAction::OpenContent, "Open Content", 8.0f);
+                std::cerr << message << '\n';
                 recordCompletedImportJob(false, "Import staged; placement failed", result.warnings);
                 return false;
             }
@@ -11677,6 +13243,8 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
             (void)loadPrefabAsset(resolveAssetRecordPath(*refreshedRecord, job.workspace.root), prefab, &prefabError);
             NativeRuntimeLoadOptions nativeLoadOptions;
             nativeLoadOptions.textureFormatSupport = nativeTextureFormatSupportForContext(context_.get());
+            nativeLoadOptions.validatePayloadHashes = false;
+            nativeLoadOptions.retainLoadedPayloadsInReport = false;
             if (std::string bindError; appendPrefabRuntimeAssets(*refreshedRecord, prefab, job.workspace.root, &assetRegistry_, nextAssets, bindings, nativeLoadOptions, &bindError)) {
                 const SceneDocument beforeDocument = sceneDocument_;
                 const AssetManager beforeAssets = assets_;
@@ -11694,13 +13262,59 @@ bool Application::applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAss
                         SceneUpdateKind::TopologyChanged,
                         "Reimport Asset"));
                     sceneUnsavedDirty_ = true;
-                    (void)applyPendingSceneUpdate(true);
+                    const bool deferRendererRebuild = shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+                    (void)applyPendingSceneUpdate(!deferRendererRebuild);
+                    if (deferRendererRebuild) {
+                        notifications_.notify("Reimport rebound prefab; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+                    }
                 }
             } else {
                 notifications_.notify("Reimported metadata; runtime refresh failed", NotificationType::Warning, NotificationAction::OpenContent, "Open Content", 6.0f);
                 std::cerr << "Reimport runtime refresh failed: " << bindError << '\n';
                 result.warnings.push_back("Runtime refresh failed: " + bindError);
             }
+        }
+    } else if (job.originalType == AssetType::Scene && result.record.type == AssetType::Scene) {
+        const std::vector<EditorMeshAssetPlacement> usdMeshPlacements = placeableUsdMeshChildPlacements();
+        const std::optional<nlohmann::json> runtimePayload = runtimePayloadForImportedRecord(result.record, job.workspace.root);
+        if (sceneHasUsdRuntimePlacement(sceneDocument_, usdMeshPlacements, runtimePayload)) {
+            size_t refreshedMeshes = 0;
+            size_t refreshedMeshTransforms = 0;
+            size_t refreshedHierarchyEntities = 0;
+            size_t refreshedCameras = 0;
+            size_t refreshedLights = 0;
+            size_t refreshedSceneHierarchyEntities = 0;
+
+            if (const auto meshHierarchyPlacement = placeUsdRuntimeMeshHierarchy(result.record, job.workspace.root, usdMeshPlacements)) {
+                refreshedMeshes = meshHierarchyPlacement->meshCount;
+                refreshedMeshTransforms = meshHierarchyPlacement->transformCount;
+                refreshedHierarchyEntities = meshHierarchyPlacement->hierarchyEntityCount;
+            }
+            if (const auto sceneEntities = placeUsdRuntimeSceneEntities(result.record, job.workspace.root)) {
+                refreshedCameras = sceneEntities->cameraCount;
+                refreshedLights = sceneEntities->lightCount;
+                refreshedSceneHierarchyEntities = sceneEntities->hierarchyEntityCount;
+            }
+            const bool refreshedAnimationPlayer = runtimePayload.has_value()
+                ? attachUsdRuntimeAnimationPlayer(sceneDocument_, *runtimePayload, job.workspace.root)
+                : false;
+            if (refreshedAnimationPlayer) {
+                sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+                sceneUnsavedDirty_ = true;
+                const bool deferRendererRebuild = shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+                (void)applyPendingSceneUpdate(!deferRendererRebuild);
+                if (deferRendererRebuild) {
+                    notifications_.notify("Reimport refreshed USD animation; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
+                }
+            }
+            std::cout << "USD scene runtime refresh after reimport: meshes=" << refreshedMeshes
+                      << " meshTransforms=" << refreshedMeshTransforms
+                      << " meshHierarchyEntities=" << refreshedHierarchyEntities
+                      << " cameras=" << refreshedCameras
+                      << " lights=" << refreshedLights
+                      << " sceneHierarchyEntities=" << refreshedSceneHierarchyEntities
+                      << " animationPlayer=" << (refreshedAnimationPlayer ? "true" : "false")
+                      << " source=" << job.request.sourcePath.string() << '\n';
         }
     }
 
@@ -11934,16 +13548,6 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         if (requests.resetCamera) {
             cameraController_.reset(*pathTracer_);
         }
-        if (requests.sceneUpdate.has_value()) {
-            std::vector<LiveMainThreadApplyOperation> operations;
-            operations.push_back(LiveMainThreadApplyOperation{
-                .kind = LiveMainThreadApplyOperationKind::MarkSceneUpdate,
-                .sceneUpdateKind = *requests.sceneUpdate,
-            });
-            if (!queueLiveMainThreadApplyBatch("Mark Scene Update", std::move(operations))) {
-                (void)markSceneUpdateFromEditor(*requests.sceneUpdate, false);
-            }
-        }
         if (requests.timelineChanged.has_value()) {
             std::vector<LiveMainThreadApplyOperation> operations;
             operations.push_back(LiveMainThreadApplyOperation{
@@ -11961,6 +13565,9 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
         RendererSettings pending = *pendingPostFrameSettings_;
         pendingPostFrameSettings_.reset();
         applyRendererSettingsSafely(pending, true);
+    }
+    if (requests.sceneUpdate.has_value()) {
+        (void)markSceneUpdateFromEditor(*requests.sceneUpdate, true);
     }
 
     const std::filesystem::path renderOutputRoot = editorRenderOutputRoot(project_);
@@ -13144,15 +14751,14 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         if (uiOverlay_) {
             uiOverlay_->invalidateRendererTextures();
         }
-        gpuSceneAsset_ = sceneBuild.sceneAsset;
-        gpuInstanceEntities_ = sceneBuild.instanceEntities;
-    latestAnimatedGeometryStats_ = sceneBuild.animatedGeometry;
-    latestGpuSkinningPlan_ = sceneBuild.gpuSkinningPlan;
-    latestGpuSkinningJointMatrices_ = sceneBuild.gpuSkinningJointMatrices;
-    latestGpuSkinningPreviousJointMatrices_ = sceneBuild.gpuSkinningPreviousJointMatrices;
-    latestGpuSkinningSourceVertices_ = sceneBuild.gpuSkinningSourceVertices;
-    latestGpuSkinningMorphDeltas_ = sceneBuild.gpuSkinningMorphDeltas;
-        rebuildGpuSceneAsset();
+        gpuSceneAsset_ = std::move(sceneBuild.sceneAsset);
+        gpuInstanceEntities_ = std::move(sceneBuild.instanceEntities);
+        latestAnimatedGeometryStats_ = sceneBuild.animatedGeometry;
+        latestGpuSkinningPlan_ = std::move(sceneBuild.gpuSkinningPlan);
+        latestGpuSkinningJointMatrices_ = std::move(sceneBuild.gpuSkinningJointMatrices);
+        latestGpuSkinningPreviousJointMatrices_ = std::move(sceneBuild.gpuSkinningPreviousJointMatrices);
+        latestGpuSkinningSourceVertices_ = std::move(sceneBuild.gpuSkinningSourceVertices);
+        latestGpuSkinningMorphDeltas_ = std::move(sceneBuild.gpuSkinningMorphDeltas);
         preparePathTracerForRendererReplacement(previousSettings);
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
@@ -13170,16 +14776,21 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         applySceneWorldComponentsToDocumentSettings(sceneDocument_);
     };
 
+    bool builtSceneCommitted = false;
     auto syncBuiltScene = [&]() {
+        if (builtSceneCommitted) {
+            return;
+        }
         SceneGpuBuildResult& sceneBuild = ensureBuild();
-        gpuSceneAsset_ = sceneBuild.sceneAsset;
-        gpuInstanceEntities_ = sceneBuild.instanceEntities;
-    latestAnimatedGeometryStats_ = sceneBuild.animatedGeometry;
-    latestGpuSkinningPlan_ = sceneBuild.gpuSkinningPlan;
-    latestGpuSkinningJointMatrices_ = sceneBuild.gpuSkinningJointMatrices;
-    latestGpuSkinningPreviousJointMatrices_ = sceneBuild.gpuSkinningPreviousJointMatrices;
-    latestGpuSkinningSourceVertices_ = sceneBuild.gpuSkinningSourceVertices;
-    latestGpuSkinningMorphDeltas_ = sceneBuild.gpuSkinningMorphDeltas;
+        gpuSceneAsset_ = std::move(sceneBuild.sceneAsset);
+        gpuInstanceEntities_ = std::move(sceneBuild.instanceEntities);
+        latestAnimatedGeometryStats_ = sceneBuild.animatedGeometry;
+        latestGpuSkinningPlan_ = std::move(sceneBuild.gpuSkinningPlan);
+        latestGpuSkinningJointMatrices_ = std::move(sceneBuild.gpuSkinningJointMatrices);
+        latestGpuSkinningPreviousJointMatrices_ = std::move(sceneBuild.gpuSkinningPreviousJointMatrices);
+        latestGpuSkinningSourceVertices_ = std::move(sceneBuild.gpuSkinningSourceVertices);
+        latestGpuSkinningMorphDeltas_ = std::move(sceneBuild.gpuSkinningMorphDeltas);
+        builtSceneCommitted = true;
     };
 
     auto completeAfterRebuild = [&]() {
@@ -13517,6 +15128,147 @@ void Application::stepEditorTicketProbeQueues() {
             topologyResult.consumedMs);
     }
     editorTopologyRebuildCompletedTimeline_ = editorTopologyRebuildTickets_.nextTimelineValue() > 0 ? editorTopologyRebuildTickets_.nextTimelineValue() - 1ull : 0ull;
+}
+
+void Application::stepStreamingGpuWorkQueue() {
+    if (streamingGpuWorkCompletedTimeline_ != 0) {
+        (void)streamingGpuWorkQueue_.completeTimeline(streamingGpuWorkCompletedTimeline_);
+        const std::vector<StreamingGpuWorkSnapshot> snapshots = streamingGpuWorkQueue_.snapshots();
+        std::unordered_map<AssetGuid, bool> ownerComplete;
+        std::unordered_map<AssetGuid, bool> ownerFailed;
+        for (const StreamingGpuWorkSnapshot& ticket : snapshots) {
+            if (ticket.ownerGuid.empty()) {
+                continue;
+            }
+            if (ticket.kind == StreamingGpuWorkKind::ImageMipUpload &&
+                ticket.state == StreamingGpuWorkState::Complete &&
+                ticket.textureMipLevel != UINT32_MAX) {
+                (void)nativeGpuAssetCache_.markTextureMipResident(ticket.ownerGuid, ticket.textureMipLevel);
+            }
+            if (ticket.kind == StreamingGpuWorkKind::DescriptorUpdate &&
+                ticket.state == StreamingGpuWorkState::Complete) {
+                (void)nativeGpuAssetCache_.markDescriptorPatchComplete(ticket.ownerGuid);
+            }
+            if (ticket.kind == StreamingGpuWorkKind::BlasBuild &&
+                ticket.state == StreamingGpuWorkState::Complete) {
+                (void)nativeGpuAssetCache_.markBlasReady(ticket.ownerGuid);
+            }
+            if (ticket.kind == StreamingGpuWorkKind::TlasPatch &&
+                ticket.state == StreamingGpuWorkState::Complete) {
+                (void)nativeGpuAssetCache_.markTlasVisible(ticket.ownerGuid);
+            }
+            auto completeIt = ownerComplete.find(ticket.ownerGuid);
+            if (completeIt == ownerComplete.end()) {
+                completeIt = ownerComplete.emplace(ticket.ownerGuid, true).first;
+            }
+            if (ticket.state != StreamingGpuWorkState::Complete) {
+                completeIt->second = false;
+            }
+            if (ticket.state == StreamingGpuWorkState::Cancelled || ticket.state == StreamingGpuWorkState::Failed) {
+                ownerFailed[ticket.ownerGuid] = true;
+            }
+        }
+        for (const auto& [guid, complete] : ownerComplete) {
+            if (ownerFailed[guid]) {
+                streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Failed, "streaming GPU work failed or was cancelled");
+                (void)nativeGpuAssetCache_.markFailed(guid);
+            } else if (complete && streamingRuntimeState_.assetState(guid) != StreamingAssetState::GpuResident) {
+                streamingRuntimeState_.setAssetState(guid, StreamingAssetState::GpuResident);
+                (void)nativeGpuAssetCache_.markResident(guid);
+                streamingRuntimeState_.pushEvent("streaming GPU work completed for " + guid);
+            }
+        }
+    }
+
+    const StreamingGpuWorkFrameResult result = streamingGpuWorkQueue_.submitFrame(StreamingGpuWorkBudget{
+        .maxUploadBytes = std::max<uint64_t>(1ull * 1024ull * 1024ull, streamingOptions_.uploadBytesPerFrame),
+        .maxStagingBytes = std::max<uint64_t>(2ull * 1024ull * 1024ull, streamingOptions_.uploadBytesPerFrame * 2ull),
+        .maxGpuMs = 2.0,
+        .maxSubmissions = 8,
+        .maxBlasBuilds = 2,
+        .maxTlasPatches = 4,
+        .maxDescriptorUpdates = 512,
+    });
+    if (result.submittedTickets > 0) {
+        streamingRuntimeState_.pushEvent("submitted streaming GPU work tickets: " + std::to_string(result.submittedTickets));
+    }
+    streamingGpuWorkCompletedTimeline_ = streamingGpuWorkQueue_.nextTimelineValue() > 0 ? streamingGpuWorkQueue_.nextTimelineValue() - 1ull : 0ull;
+
+    if (streamingOptions_.evictionEnabled) {
+        lastStreamingEviction_ = nativeGpuAssetCache_.evictToBudget(NativeGpuAssetCacheBudget{
+            .maxGpuBytes = streamingOptions_.gpuMemoryBudgetBytes,
+            .maxCpuBytes = streamingOptions_.cpuMemoryBudgetBytes,
+        });
+        if (lastStreamingEviction_.evictedAssets > 0) {
+            streamingRuntimeState_.pushEvent(
+                "streaming cache eviction retired " + std::to_string(lastStreamingEviction_.evictedAssets) +
+                " assets, freed " + std::to_string(lastStreamingEviction_.freedGpuBytes) + " GPU bytes");
+            for (const AssetGuid& guid : lastStreamingEviction_.evictedGuids) {
+                streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Evicted);
+            }
+        } else if (!lastStreamingEviction_.budgetMet) {
+            streamingRuntimeState_.pushEvent("streaming cache remains over budget; no evictable assets were available");
+        }
+    }
+}
+
+void Application::stepStreamingGpuSceneUpdateQueue() {
+    GpuSceneStreamingState gpuSceneStreaming;
+    gpuSceneStreaming.rebuild(sceneDocument_, gpuInstanceEntities_, &nativeGpuAssetCache_);
+    const GpuSceneStreamingUpdatePlan updatePlan = buildGpuSceneStreamingUpdatePlan(
+        lastStreamingGpuSceneSnapshots_,
+        gpuSceneStreaming.instances());
+    if (!updatePlan.entries.empty()) {
+        streamingGpuSceneUpdateQueue_.enqueueUpdatePlan(updatePlan);
+        if (updatePlan.becameRenderableInstances > 0 || updatePlan.becameNonRenderableInstances > 0) {
+            streamingRuntimeState_.pushEvent(
+                "queued incremental GpuScene updates: +" + std::to_string(updatePlan.becameRenderableInstances) +
+                " renderable, -" + std::to_string(updatePlan.becameNonRenderableInstances) + " renderable");
+        }
+    }
+    lastStreamingGpuSceneSnapshots_ = gpuSceneStreaming.instances();
+
+    lastStreamingGpuSceneApply_ = streamingGpuSceneUpdateQueue_.applyFrame(IncrementalGpuSceneApplyBudget{
+        .maxApplyMs = 1.0,
+        .maxOperations = 16,
+        .maxTlasPatches = 4,
+        .maxDescriptorPatches = 64,
+        .maxResetMasks = 64,
+    });
+    if (lastStreamingGpuSceneApply_.appliedOperations > 0) {
+        if (pathTracer_ != nullptr) {
+            std::unordered_map<uint64_t, uint32_t> instanceIndexByEntityUuid;
+            instanceIndexByEntityUuid.reserve(gpuSceneStreaming.instances().size());
+            for (const GpuSceneStreamingInstanceSnapshot& snapshot : gpuSceneStreaming.instances()) {
+                if (snapshot.entityUuid != 0 && snapshot.gpuInstanceIndex != UINT32_MAX) {
+                    instanceIndexByEntityUuid.emplace(snapshot.entityUuid, snapshot.gpuInstanceIndex);
+                }
+            }
+            auto collectInstanceIndices = [&](const std::vector<uint64_t>& entityUuids) {
+                std::vector<uint32_t> result;
+                result.reserve(entityUuids.size());
+                for (uint64_t uuid : entityUuids) {
+                    const auto found = instanceIndexByEntityUuid.find(uuid);
+                    if (found != instanceIndexByEntityUuid.end()) {
+                        result.push_back(found->second);
+                    }
+                }
+                return result;
+            };
+            std::vector<uint32_t> temporalInstanceIndices =
+                collectInstanceIndices(lastStreamingGpuSceneApply_.temporalResetEntityUuids);
+            std::vector<uint32_t> restirInstanceIndices =
+                collectInstanceIndices(lastStreamingGpuSceneApply_.restirResetEntityUuids);
+            pathTracer_->applyStreamingResetMasks(
+                lastStreamingGpuSceneApply_.temporalResetEntityUuids,
+                lastStreamingGpuSceneApply_.restirResetEntityUuids,
+                temporalInstanceIndices,
+                restirInstanceIndices);
+        }
+        streamingRuntimeState_.pushEvent(
+            "applied incremental GpuScene update operations: " +
+            std::to_string(lastStreamingGpuSceneApply_.appliedOperations));
+    }
 }
 
 void Application::preparePathTracerForRendererReplacement(const RendererSettings& previousSettings) {

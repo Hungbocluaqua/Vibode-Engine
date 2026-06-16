@@ -21,6 +21,7 @@ struct PathDataRecord {
     vec4 denoiser_hit_distance;
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
 };
 
 layout(set = 0, binding = 6, std430) buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };

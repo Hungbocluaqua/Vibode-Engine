@@ -1067,7 +1067,9 @@ EntityId SceneOperations::mergeSceneAsset(const SceneAsset& scene, const std::st
             renderer.skinIndex = node.skinIndex >= 0 ? skinOffset + node.skinIndex : -1;
             renderer.visible = node.visible;
             renderer.castShadow = node.castShadow;
+            renderer.receiveShadow = node.receiveShadow;
             renderer.visibleToCamera = node.visibleToCamera;
+            renderer.renderLayer = node.renderLayer;
             entity->meshRenderer = renderer;
         }
         if (node.hasCamera) {

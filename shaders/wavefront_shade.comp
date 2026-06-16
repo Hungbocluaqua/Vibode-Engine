@@ -116,6 +116,7 @@ void write_primary_gbuffer_miss(uint pixel_index, vec3 ray_dir, vec3 radiance) {
     path_data.denoiser_hit_distance = vec4(0.0, 0.0, 65504.0, 0.0);
     path_data.diffuse_ray_direction_hit_distance = vec4(normalize(ray_dir), 0.0);
     path_data.specular_ray_direction_hit_distance = vec4(normalize(ray_dir), 0.0);
+    path_data.emissive_residual = vec4(0.0);
     path_data_buffer[pixel_index] = path_data;
 }
 
@@ -140,6 +141,7 @@ void write_primary_gbuffer_hit(uint pixel_index, WavefrontHit hit, Material mate
     vec3 camera_ray_dir = normalize(hit_pos - camera.pos.xyz);
     path_data.diffuse_ray_direction_hit_distance = vec4(camera_ray_dir, depth);
     path_data.specular_ray_direction_hit_distance = vec4(camera_ray_dir, 65504.0);
+    path_data.emissive_residual = vec4(0.0);
     path_data_buffer[pixel_index] = path_data;
 }
 

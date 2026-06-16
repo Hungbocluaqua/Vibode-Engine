@@ -32,6 +32,7 @@ nlohmann::json importSettingsJson(const AssetImportSettings& settings) {
         {"buildCookedPayloadsNow", settings.buildCookedPayloadsNow},
         {"generateThumbnails", settings.generateThumbnails},
         {"unitScale", settings.unitScale},
+        {"emissiveScale", settings.emissiveScale},
         {"coordinateConversion", settings.coordinateConversion},
         {"materialImportMode", settings.materialImportMode},
         {"textureImportMode", settings.textureImportMode},
@@ -56,6 +57,7 @@ AssetImportSettings importSettingsFromJson(const nlohmann::json& json) {
     settings.buildCookedPayloadsNow = json.value("buildCookedPayloadsNow", settings.buildCookedPayloadsNow);
     settings.generateThumbnails = json.value("generateThumbnails", settings.generateThumbnails);
     settings.unitScale = json.value("unitScale", settings.unitScale);
+    settings.emissiveScale = json.value("emissiveScale", settings.emissiveScale);
     settings.coordinateConversion = json.value("coordinateConversion", settings.coordinateConversion);
     settings.materialImportMode = json.value("materialImportMode", settings.materialImportMode);
     settings.textureImportMode = json.value("textureImportMode", settings.textureImportMode);

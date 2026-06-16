@@ -749,7 +749,7 @@ void drawDroppedFileActionPopup(const EditorRuntimeState& state, EditorRequests&
         disabledDroppedFileAction(EditorGlyphIcon::Add, "Import and Place", "FBX cannot be placed until FBX import and runtime mesh cooking are implemented.");
     } else if (isDroppedUsdSource(droppedPath)) {
 #if RTV_ENABLE_OPENUSD_IMPORTER && RTV_OPENUSD_IMPORTER_AVAILABLE
-        ImGui::TextDisabled("USD/USDZ metadata, native mesh/material cook, shader factors, shader texture bindings, USDZ packaged texture cook, cooked-mesh hierarchy placement, and camera/light hierarchy placement are available; runtime parity is not complete in this build.");
+        ImGui::TextDisabled("USD/USDZ metadata, native mesh/material cook, PreviewSurface factors, shader texture bindings, USDZ packaged texture cook, cooked-mesh hierarchy placement, camera/light hierarchy placement, runtime animation playback, and reimport refresh are available.");
         if (editorGlyphMenuItem(EditorGlyphIcon::Import, "Import Asset")) {
             requests.importAsset = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state)};
             consume();
@@ -758,7 +758,7 @@ void drawDroppedFileActionPopup(const EditorRuntimeState& state, EditorRequests&
             requests.importAndPlace = EditorImportAssetRequest{.sourcePath = droppedPath, .destinationFolder = importDestinationForDroppedFile(state), .mode = "ImportAndPlace"};
             consume();
         }
-        ImGui::TextDisabled("Import and Place adds cooked USD meshes plus USD cameras/lights into authored hierarchy entities. Full USD runtime/package parity remains future work.");
+        ImGui::TextDisabled("Import and Place adds cooked USD meshes plus USD cameras/lights into authored hierarchy entities; non-PreviewSurface shader nodes are reported as unsupported diagnostics.");
 #else
         ImGui::TextDisabled("USD/USDZ import is not implemented in this build.");
         disabledDroppedFileAction(EditorGlyphIcon::Import, "Import Asset", "Enable RTV_ENABLE_OPENUSD_IMPORTER with OpenUSD installed before USD stage import work can run.");
@@ -4284,7 +4284,7 @@ void EditorLayer::drawRenderWorldSettingsPanel(EditorRuntimeState& state, Editor
             changed |= ImGui::SliderFloat("Contrast", &postProcess->contrast, 0.0f, 2.0f, "%.3f");
         } else {
             changed |= ImGui::Checkbox("Post Process Enabled", &world.postProcessEnabled);
-            changed |= ImGui::DragFloat("Exposure", &render.exposure, 0.02f, -20.0f, 20.0f, "%.2f");
+            changed |= ImGui::DragFloat("Exposure", &render.exposure, 0.02f, -20.0f, 64.0f, "%.2f");
             changed |= ImGui::SliderFloat("Saturation", &render.saturation, 0.0f, 2.0f, "%.3f");
             changed |= ImGui::SliderFloat("Contrast", &render.contrast, 0.0f, 2.0f, "%.3f");
         }

@@ -505,6 +505,10 @@ OpacityMicromapCpuData generateOpacityMicromapData(const CachedScene& cached, ui
         texture.width = cachedTexture.width;
         texture.height = cachedTexture.height;
         texture.channels = cachedTexture.channels;
+        texture.sourceArrayLayers = cachedTexture.sourceArrayLayers;
+        texture.sourceDepth = cachedTexture.sourceDepth;
+        texture.sourceFaceCount = cachedTexture.sourceFaceCount;
+        texture.sourceIsCubemap = cachedTexture.sourceIsCubemap;
         texture.mipLevels = cachedTexture.mipLevels;
         texture.srgb = cachedTexture.srgb;
         texture.fallback = cachedTexture.fallback;

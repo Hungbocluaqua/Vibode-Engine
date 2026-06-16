@@ -1548,6 +1548,167 @@ int checkBudget(const std::filesystem::path& budgetPath, const ProfileReport& pr
     return failures.empty() ? 0 : 1;
 }
 
+int checkStreamingBudget(
+    const std::filesystem::path& budgetPath,
+    const ProfileReport& profile,
+    const json& streamingReport) {
+    const json budget = readJsonFile(budgetPath);
+    json failures = json::array();
+    json warnings = json::array();
+
+    auto failMs = [&failures](std::string metric, double actual, double limit) {
+        if (actual > limit) {
+            failures.push_back({
+                {"metric", std::move(metric)},
+                {"actual_ms", actual},
+                {"budget_ms", limit},
+            });
+        }
+    };
+    auto failBytes = [&failures](std::string metric, uint64_t actual, uint64_t limit) {
+        if (actual > limit) {
+            failures.push_back({
+                {"metric", std::move(metric)},
+                {"actual_bytes", actual},
+                {"budget_bytes", limit},
+            });
+        }
+    };
+    auto failCount = [&failures](std::string metric, uint64_t actual, uint64_t limit) {
+        if (actual > limit) {
+            failures.push_back({
+                {"metric", std::move(metric)},
+                {"actual", actual},
+                {"budget", limit},
+            });
+        }
+    };
+
+    const std::string schema = budget.value("schema", "");
+    if (schema != "StreamingRegressionBudgetV1") {
+        warnings.push_back({
+            {"metric", "schema"},
+            {"message", "budget schema is not StreamingRegressionBudgetV1; checking recognized streaming fields only"},
+            {"actual", schema},
+        });
+    }
+
+    if (budget.contains("max_cpu_frame_ms_p95")) {
+        failMs("cpu_frame_ms.p95", profile.cpuFrameMs.p95, budget["max_cpu_frame_ms_p95"].get<double>());
+    }
+    if (budget.contains("max_cpu_frame_ms_p99")) {
+        failMs("cpu_frame_ms.p99", profile.cpuFrameMs.p99, budget["max_cpu_frame_ms_p99"].get<double>());
+    }
+    if (budget.contains("max_gpu_frame_ms_p95")) {
+        failMs("gpu_frame_ms.p95", profile.gpuFrameMs.p95, budget["max_gpu_frame_ms_p95"].get<double>());
+    }
+    if (budget.contains("max_gpu_frame_ms_p99")) {
+        failMs("gpu_frame_ms.p99", profile.gpuFrameMs.p99, budget["max_gpu_frame_ms_p99"].get<double>());
+    }
+
+    const uint64_t residentCpuBytes = uintAt(streamingReport, {"native_gpu_asset_cache", "memory_pressure", "resident_cpu_bytes"});
+    const uint64_t residentGpuBytes = uintAt(streamingReport, {"native_gpu_asset_cache", "memory_pressure", "resident_gpu_bytes"});
+    const uint64_t retainedStagingBytes = uintAt(streamingReport, {"streaming_gpu_work_queue", "stats", "retained_staging_bytes"});
+    const uint64_t peakRetainedStagingBytes = uintAt(streamingReport, {"streaming_gpu_work_queue", "stats", "peak_retained_staging_bytes"});
+    const uint64_t inFlightUploadBytes = uintAt(streamingReport, {"native_gpu_asset_cache", "stats", "in_flight_upload_bytes"});
+    const uint64_t requestedUploadBytesPerFrame = uintAt(streamingReport, {"options", "upload_bytes_per_frame"});
+    const uint64_t submittedUploadBytesLastFrame = uintAt(streamingReport, {"streaming_gpu_work_queue", "hitch_summary", "last_frame", "submitted_bytes"});
+    const uint64_t peakStreamingCpuBytes = residentCpuBytes + inFlightUploadBytes + std::max(retainedStagingBytes, peakRetainedStagingBytes);
+    const uint64_t peakStreamingGpuBytes = residentGpuBytes + uintAt(streamingReport, {"native_gpu_asset_cache", "memory_pressure", "over_gpu_budget_bytes"});
+
+    if (budget.contains("max_cpu_streaming_memory_mb")) {
+        const uint64_t limit = bytesFromBudgetValue(budget["max_cpu_streaming_memory_mb"]) * 1024ull * 1024ull;
+        failBytes("streaming.cpu_memory", peakStreamingCpuBytes, limit);
+    }
+    if (budget.contains("max_gpu_streaming_memory_mb")) {
+        const uint64_t limit = bytesFromBudgetValue(budget["max_gpu_streaming_memory_mb"]) * 1024ull * 1024ull;
+        failBytes("streaming.gpu_memory", peakStreamingGpuBytes, limit);
+    }
+    if (budget.contains("max_upload_bytes_per_frame")) {
+        const uint64_t limit = bytesFromBudgetValue(budget["max_upload_bytes_per_frame"]);
+        failBytes("streaming.upload_bytes_per_frame.configured", requestedUploadBytesPerFrame, limit);
+        failBytes("streaming.upload_bytes_per_frame.last_frame", submittedUploadBytesLastFrame, limit);
+    }
+
+    if (budget.contains("max_hitch_count")) {
+        const uint64_t limit = bytesFromBudgetValue(budget["max_hitch_count"]);
+        const uint64_t stalledFrames = uintAt(streamingReport, {"streaming_gpu_work_queue", "hitch_summary", "stalled_frames"});
+        const uint64_t failedAssets = uintAt(streamingReport, {"queue_snapshot", "failed"}) +
+            uintAt(streamingReport, {"gpu_scene_streaming", "stats", "failed_instances"});
+        const uint64_t hitchCount = stalledFrames + failedAssets;
+        failCount("streaming.hitch_count", hitchCount, limit);
+    }
+
+    if (budget.contains("max_main_thread_apply_ms_p99")) {
+        warnings.push_back({
+            {"metric", "main_thread_apply_ms.p99"},
+            {"message", "streaming runtime report does not yet expose main-thread apply p99; budget field recorded but not enforced"},
+            {"budget_ms", budget["max_main_thread_apply_ms_p99"]},
+        });
+    }
+
+    const json requiredMilestones = budget.value("minimum_progressive_visibility_milestones", json::array());
+    for (const json& milestoneValue : requiredMilestones) {
+        if (!milestoneValue.is_string()) {
+            continue;
+        }
+        const std::string milestone = milestoneValue.get<std::string>();
+        bool present = false;
+        if (milestone == "metadata_shell") {
+            present = uintAt(streamingReport, {"gpu_scene_streaming", "stats", "instance_count"}) > 0 ||
+                uintAt(streamingReport, {"catalog", "asset_count"}) > 0 ||
+                !streamingReport.value("asset_states", json::array()).empty();
+        } else if (milestone == "proxy_visible") {
+            present = uintAt(streamingReport, {"gpu_scene_streaming", "stats", "fallback_descriptor_instances"}) > 0 ||
+                uintAt(streamingReport, {"native_gpu_asset_cache", "stats", "fallback_descriptor_count"}) > 0;
+        } else if (milestone == "first_renderable_geometry" || milestone == "minimum_residency") {
+            present = uintAt(streamingReport, {"gpu_scene_streaming", "stats", "renderable_instances"}) > 0 ||
+                uintAt(streamingReport, {"native_gpu_asset_cache", "stats", "mesh_renderable_count"}) > 0;
+        } else if (milestone == "full_quality_residency") {
+            const uint64_t totalMips = uintAt(streamingReport, {"native_gpu_asset_cache", "stats", "total_texture_mip_count"});
+            present = uintAt(streamingReport, {"native_gpu_asset_cache", "stats", "texture_fully_resident_count"}) > 0 ||
+                (totalMips > 0 &&
+                    uintAt(streamingReport, {"native_gpu_asset_cache", "stats", "resident_texture_mip_count"}) >= totalMips);
+        } else {
+            warnings.push_back({
+                {"metric", "minimum_progressive_visibility_milestones." + milestone},
+                {"message", "unknown streaming milestone; not enforced"},
+            });
+            continue;
+        }
+
+        if (!present) {
+            failures.push_back({
+                {"metric", "minimum_progressive_visibility_milestones." + milestone},
+                {"actual", false},
+                {"budget", true},
+            });
+        }
+    }
+
+    const json result = {
+        {"schema", "StreamingRegressionBudgetCheckV1"},
+        {"budget", budgetPath.generic_string()},
+        {"budget_name", budget.value("name", budgetPath.stem().string())},
+        {"status", failures.empty() ? "pass" : "fail"},
+        {"observed", {
+            {"cpu_frame_ms_p95", profile.cpuFrameMs.p95},
+            {"cpu_frame_ms_p99", profile.cpuFrameMs.p99},
+            {"gpu_frame_ms_p95", profile.gpuFrameMs.p95},
+            {"gpu_frame_ms_p99", profile.gpuFrameMs.p99},
+            {"streaming_cpu_memory_bytes", peakStreamingCpuBytes},
+            {"streaming_gpu_memory_bytes", peakStreamingGpuBytes},
+            {"configured_upload_bytes_per_frame", requestedUploadBytesPerFrame},
+            {"last_frame_upload_bytes", submittedUploadBytesLastFrame},
+            {"stalled_frames", uintAt(streamingReport, {"streaming_gpu_work_queue", "hitch_summary", "stalled_frames"})},
+        }},
+        {"warnings", warnings},
+        {"failures", failures},
+    };
+    std::cout << result.dump(2) << "\n";
+    return failures.empty() ? 0 : 1;
+}
+
 std::filesystem::path defaultDiagnosticArtifactDir(const std::filesystem::path& scenePath, std::string_view name) {
     const std::string caseName = scenePath.empty() ? "default" : scenePath.stem().string();
     return std::filesystem::path("out") / "diagnostics" / caseName / std::string(name);

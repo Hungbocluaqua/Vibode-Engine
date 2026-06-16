@@ -1,13 +1,19 @@
 #include "rtv/RtpkgIO.h"
 
+#include "rtv/StreamingIoBackend.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <numeric>
 #include <set>
 #include <system_error>
 
@@ -125,6 +131,94 @@ std::string lowerAscii(std::string value) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
     return value;
+}
+
+const char* nativeChunkCompressionName(uint32_t compression) {
+    switch (static_cast<NativeChunkCompression>(compression)) {
+    case NativeChunkCompression::None: return "none";
+    case NativeChunkCompression::ReservedZstd: return "zstd";
+    case NativeChunkCompression::ReservedGDeflate: return "gdeflate";
+    }
+    return "unknown";
+}
+
+bool nativeChunkCompressionKnown(uint32_t compression) {
+    return compression == static_cast<uint32_t>(NativeChunkCompression::None) ||
+        compression == static_cast<uint32_t>(NativeChunkCompression::ReservedZstd) ||
+        compression == static_cast<uint32_t>(NativeChunkCompression::ReservedGDeflate);
+}
+
+bool nativeChunkCompressionDirectStorageCompatible(uint32_t compression) {
+    return compression == static_cast<uint32_t>(NativeChunkCompression::None) ||
+        compression == static_cast<uint32_t>(NativeChunkCompression::ReservedZstd) ||
+        compression == static_cast<uint32_t>(NativeChunkCompression::ReservedGDeflate);
+}
+
+bool nativeChunkCompressionRequiresCpuFallback(uint32_t compression) {
+    return compression == static_cast<uint32_t>(NativeChunkCompression::ReservedZstd) ||
+        compression == static_cast<uint32_t>(NativeChunkCompression::ReservedGDeflate);
+}
+
+struct RtpkgCompressionEstimate {
+    std::string profile;
+    std::string requiredRuntimeSupport;
+    bool directStorageCompatible = false;
+    bool cpuFallbackAvailable = true;
+    bool gpuDecompressionAvailable = false;
+    uint64_t compressedBytes = 0;
+    double ratio = 1.0;
+};
+
+RtpkgCompressionEstimate estimateRtpkgCompression(std::string profile, const std::byte* bytes, size_t size) {
+    profile = lowerAscii(std::move(profile));
+    RtpkgCompressionEstimate out;
+    out.profile = profile.empty() ? "none" : profile;
+    out.compressedBytes = static_cast<uint64_t>(size);
+    out.ratio = size == 0 ? 1.0 : static_cast<double>(out.compressedBytes) / static_cast<double>(size);
+    out.requiredRuntimeSupport = "none";
+    if (out.profile == "none" || out.profile == "uncompressed") {
+        out.profile = "none";
+        return out;
+    }
+
+    std::array<uint32_t, 256> histogram{};
+    uint64_t repeatedPairs = 0;
+    for (size_t i = 0; i < size; ++i) {
+        ++histogram[static_cast<uint8_t>(bytes[i])];
+        if (i > 0 && bytes[i] == bytes[i - 1]) {
+            ++repeatedPairs;
+        }
+    }
+    double entropy = 0.0;
+    if (size > 0) {
+        for (uint32_t count : histogram) {
+            if (count == 0) {
+                continue;
+            }
+            const double p = static_cast<double>(count) / static_cast<double>(size);
+            entropy -= p * std::log2(p);
+        }
+    }
+    const double repetition = size > 1 ? static_cast<double>(repeatedPairs) / static_cast<double>(size - 1) : 0.0;
+    double ratio = std::clamp(0.18 + entropy / 8.0 * 0.78 - repetition * 0.25, 0.12, 1.0);
+    if (out.profile == "zstd" || out.profile == "directstorage-zstd" || out.profile == "dstorage-zstd") {
+        out.profile = "zstd";
+        out.requiredRuntimeSupport = "DirectStorage 1.4 Zstd or CPU Zstd fallback";
+        out.directStorageCompatible = true;
+        ratio = std::clamp(ratio * 0.92, 0.10, 1.0);
+    } else if (out.profile == "gdeflate" || out.profile == "directstorage-gdeflate" || out.profile == "dstorage-gdeflate") {
+        out.profile = "gdeflate";
+        out.requiredRuntimeSupport = "DirectStorage GDeflate or CPU decompression fallback";
+        out.directStorageCompatible = true;
+        ratio = std::clamp(ratio * 0.98, 0.12, 1.0);
+    } else {
+        out.requiredRuntimeSupport = "unknown compression profile";
+        out.cpuFallbackAvailable = false;
+        ratio = 1.0;
+    }
+    out.ratio = ratio;
+    out.compressedBytes = static_cast<uint64_t>(std::ceil(static_cast<double>(size) * ratio));
+    return out;
 }
 
 bool isStandaloneNativeAssetPath(const std::filesystem::path& path) {
@@ -499,7 +593,22 @@ RtpkgInspection RtpkgReader::inspect(const std::filesystem::path& path, bool val
         info.guid = nativeGuidToText(object.objectGuid);
         info.packageOffset = chunk.offset;
         info.packageSize = chunk.size;
+        info.packageChunkIndex = object.firstChunk;
+        info.compression = chunk.compression;
+        info.directStorageCompatible = nativeChunkCompressionDirectStorageCompatible(chunk.compression);
+        info.cpuFallbackRequired = nativeChunkCompressionRequiresCpuFallback(chunk.compression);
+        info.runtimePayloadDecodeReady = chunk.compression == static_cast<uint32_t>(NativeChunkCompression::None);
         info.sourceSize = chunk.uncompressedSize;
+        if (!nativeChunkCompressionKnown(chunk.compression)) {
+            result.native.ok = false;
+            result.native.errors.push_back(makePackageError(
+                NativeBinaryErrorCode::UnsupportedPlatformFeature,
+                path,
+                "packageChunk",
+                chunk.offset,
+                chunk.size,
+                "Package chunk uses an unknown compression metadata value"));
+        }
         if (validatePayloadHash) {
             info.payloadHashValid = nativeHashBytes(bytes.data() + chunk.offset, static_cast<size_t>(chunk.size)) == chunk.payloadHash;
             if (!info.payloadHashValid) {
@@ -507,17 +616,19 @@ RtpkgInspection RtpkgReader::inspect(const std::filesystem::path& path, bool val
                 result.native.errors.push_back(makePackageError(NativeBinaryErrorCode::HashMismatch, path, "packageChunk", chunk.offset, chunk.size, "Embedded native asset chunk hash does not match package chunk table"));
             }
         }
-        std::vector<std::byte> embeddedBytes(bytes.begin() + static_cast<size_t>(chunk.offset), bytes.begin() + static_cast<size_t>(chunk.offset + chunk.size));
-        const NativeAssetInspection embeddedInspection = embeddedReader.inspectBytes(info.packagePath.empty() ? path : std::filesystem::path(info.packagePath), embeddedBytes, validatePayloadHash);
-        if (!embeddedInspection.ok || embeddedInspection.header.assetGuid != object.objectGuid || embeddedInspection.header.assetKind != object.assetKind) {
-            result.native.ok = false;
-            result.native.errors.push_back(makePackageError(
-                embeddedInspection.ok ? NativeBinaryErrorCode::CorruptTable : (embeddedInspection.errors.empty() ? NativeBinaryErrorCode::CorruptHeader : embeddedInspection.errors.front().code),
-                path,
-                "embeddedAsset",
-                chunk.offset,
-                chunk.size,
-                "Embedded native asset payload failed validation or does not match package object GUID/kind"));
+        if (info.runtimePayloadDecodeReady) {
+            std::vector<std::byte> embeddedBytes(bytes.begin() + static_cast<size_t>(chunk.offset), bytes.begin() + static_cast<size_t>(chunk.offset + chunk.size));
+            const NativeAssetInspection embeddedInspection = embeddedReader.inspectBytes(info.packagePath.empty() ? path : std::filesystem::path(info.packagePath), embeddedBytes, validatePayloadHash);
+            if (!embeddedInspection.ok || embeddedInspection.header.assetGuid != object.objectGuid || embeddedInspection.header.assetKind != object.assetKind) {
+                result.native.ok = false;
+                result.native.errors.push_back(makePackageError(
+                    embeddedInspection.ok ? NativeBinaryErrorCode::CorruptTable : (embeddedInspection.errors.empty() ? NativeBinaryErrorCode::CorruptHeader : embeddedInspection.errors.front().code),
+                    path,
+                    "embeddedAsset",
+                    chunk.offset,
+                    chunk.size,
+                    "Embedded native asset payload failed validation or does not match package object GUID/kind"));
+            }
         }
         result.embeddedAssets.push_back(std::move(info));
     }
@@ -562,6 +673,31 @@ std::vector<RtpkgAssetInput> collectRtpkgAssetInputs(const std::vector<std::file
 nlohmann::json rtpkgInspectionToJson(const RtpkgInspection& inspection, const std::filesystem::path& path) {
     nlohmann::json report = nativeAssetInspectionToJson(inspection.native, path);
     nlohmann::json embedded = nlohmann::json::array();
+    uint32_t uncompressedChunks = 0;
+    uint32_t zstdChunks = 0;
+    uint32_t gdeflateChunks = 0;
+    uint32_t unsupportedCompressionChunks = 0;
+    uint32_t directStorageCompatibleChunks = 0;
+    uint32_t cpuFallbackRequiredChunks = 0;
+    uint32_t runtimePayloadDecodeReadyChunks = 0;
+    for (const NativeChunkRecord& chunk : inspection.native.chunks) {
+        if (chunk.compression == static_cast<uint32_t>(NativeChunkCompression::None)) {
+            ++uncompressedChunks;
+            ++runtimePayloadDecodeReadyChunks;
+        } else if (chunk.compression == static_cast<uint32_t>(NativeChunkCompression::ReservedZstd)) {
+            ++zstdChunks;
+            ++cpuFallbackRequiredChunks;
+        } else if (chunk.compression == static_cast<uint32_t>(NativeChunkCompression::ReservedGDeflate)) {
+            ++gdeflateChunks;
+            ++cpuFallbackRequiredChunks;
+        } else {
+            ++unsupportedCompressionChunks;
+        }
+        if (nativeChunkCompressionDirectStorageCompatible(chunk.compression)) {
+            ++directStorageCompatibleChunks;
+        }
+    }
+
     for (size_t i = 0; i < inspection.embeddedAssets.size(); ++i) {
         const RtpkgEmbeddedAssetInfo& asset = inspection.embeddedAssets[i];
         embedded.push_back({
@@ -571,8 +707,14 @@ nlohmann::json rtpkgInspectionToJson(const RtpkgInspection& inspection, const st
             {"kind", nativeAssetKindName(asset.kind)},
             {"guid", asset.guid},
             {"source_size", asset.sourceSize},
+            {"package_chunk_index", asset.packageChunkIndex == UINT32_MAX ? nlohmann::json(nullptr) : nlohmann::json(asset.packageChunkIndex)},
             {"package_offset", asset.packageOffset},
             {"package_size", asset.packageSize},
+            {"compression", asset.compression},
+            {"compression_name", nativeChunkCompressionName(asset.compression)},
+            {"directstorage_compatible", asset.directStorageCompatible},
+            {"cpu_fallback_required", asset.cpuFallbackRequired},
+            {"runtime_payload_decode_ready", asset.runtimePayloadDecodeReady},
             {"payload_hash_valid", asset.payloadHashValid},
         });
     }
@@ -582,8 +724,316 @@ nlohmann::json rtpkgInspectionToJson(const RtpkgInspection& inspection, const st
         {"object_table_valid", inspection.native.ok && inspection.native.header.objectTableCount == inspection.embeddedAssets.size()},
         {"chunk_table_valid", inspection.native.ok && inspection.native.header.chunkTableCount > 0 && inspection.native.header.chunkTableCount <= inspection.embeddedAssets.size()},
         {"dependency_table_count", inspection.native.header.dependencyTableCount},
+        {"compression", {
+            {"chunk_count", inspection.native.chunks.size()},
+            {"uncompressed_chunks", uncompressedChunks},
+            {"zstd_metadata_chunks", zstdChunks},
+            {"gdeflate_metadata_chunks", gdeflateChunks},
+            {"unsupported_compression_chunks", unsupportedCompressionChunks},
+            {"directstorage_compatible_chunks", directStorageCompatibleChunks},
+            {"cpu_fallback_required_chunks", cpuFallbackRequiredChunks},
+            {"runtime_payload_decode_ready_chunks", runtimePayloadDecodeReadyChunks},
+            {"directstorage_ready", inspection.native.ok && unsupportedCompressionChunks == 0 && directStorageCompatibleChunks == inspection.native.chunks.size()},
+            {"runtime_payload_decode_ready", inspection.native.ok && runtimePayloadDecodeReadyChunks == inspection.native.chunks.size()},
+        }},
     };
     return report;
+}
+
+nlohmann::json rtpkgValidationIssueJson(
+    std::string severity,
+    std::string code,
+    std::string message,
+    nlohmann::json details = nlohmann::json::object()) {
+    nlohmann::json issue = {
+        {"severity", std::move(severity)},
+        {"code", std::move(code)},
+        {"message", std::move(message)},
+    };
+    if (!details.empty()) {
+        issue["details"] = std::move(details);
+    }
+    return issue;
+}
+
+nlohmann::json rtpkgNativeErrorIssueJson(const NativeBinaryError& error) {
+    return rtpkgValidationIssueJson(
+        "error",
+        nativeBinaryErrorCodeName(error.code),
+        error.message,
+        {
+            {"path", error.path.empty() ? std::string{} : error.path.generic_string()},
+            {"table", error.table},
+            {"offset", error.offset},
+            {"expected_size", error.expectedSize},
+        });
+}
+
+nlohmann::json validateRtpkgInspectionToJson(const RtpkgInspection& inspection, const std::filesystem::path& path) {
+    nlohmann::json failures = nlohmann::json::array();
+    nlohmann::json warnings = nlohmann::json::array();
+    nlohmann::json requirements = nlohmann::json::object();
+    auto fail = [&](std::string code, std::string message, nlohmann::json details = nlohmann::json::object()) {
+        failures.push_back(rtpkgValidationIssueJson("error", std::move(code), std::move(message), std::move(details)));
+    };
+    auto warn = [&](std::string code, std::string message, nlohmann::json details = nlohmann::json::object()) {
+        warnings.push_back(rtpkgValidationIssueJson("warning", std::move(code), std::move(message), std::move(details)));
+    };
+
+    for (const NativeBinaryError& error : inspection.native.errors) {
+        failures.push_back(rtpkgNativeErrorIssueJson(error));
+    }
+    for (const std::string& warning : inspection.native.warnings) {
+        warnings.push_back(rtpkgValidationIssueJson("warning", "native_warning", warning));
+    }
+
+    const bool isPackage =
+        inspection.native.header.magic == kNativeAssetMagicRtpkg &&
+        inspection.native.header.assetKind == static_cast<uint32_t>(NativeAssetKind::Package);
+    const bool hasAssets = !inspection.embeddedAssets.empty();
+    const bool objectTableMatches = inspection.native.header.objectTableCount == inspection.embeddedAssets.size();
+    const bool oneChunkPerAsset =
+        inspection.native.header.chunkTableCount == inspection.embeddedAssets.size() &&
+        inspection.native.chunks.size() == inspection.embeddedAssets.size();
+
+    uint32_t hashValidAssets = 0;
+    uint32_t directStorageCompatibleAssets = 0;
+    uint32_t runtimeDecodeReadyAssets = 0;
+    uint32_t cpuFallbackRequiredAssets = 0;
+    uint32_t unsupportedCompressionAssets = 0;
+    uint64_t packagePayloadBytes = 0;
+    std::set<std::string> guids;
+    std::set<std::string> duplicateGuids;
+    std::set<std::string> validDuplicateTextureVariantGuids;
+    std::set<std::string> invalidDuplicateGuids;
+    std::map<std::string, std::vector<const RtpkgEmbeddedAssetInfo*>> assetsByGuid;
+    std::set<std::string> packagePaths;
+    std::set<std::string> duplicatePackagePaths;
+    for (const RtpkgEmbeddedAssetInfo& asset : inspection.embeddedAssets) {
+        packagePayloadBytes += asset.packageSize;
+        if (asset.payloadHashValid) {
+            ++hashValidAssets;
+        }
+        if (asset.directStorageCompatible) {
+            ++directStorageCompatibleAssets;
+        }
+        if (asset.runtimePayloadDecodeReady) {
+            ++runtimeDecodeReadyAssets;
+        }
+        if (asset.cpuFallbackRequired) {
+            ++cpuFallbackRequiredAssets;
+        }
+        if (!nativeChunkCompressionKnown(asset.compression)) {
+            ++unsupportedCompressionAssets;
+        }
+        if (!asset.guid.empty() && !guids.insert(asset.guid).second) {
+            duplicateGuids.insert(asset.guid);
+        }
+        if (!asset.guid.empty()) {
+            assetsByGuid[asset.guid].push_back(&asset);
+        }
+        const std::string packagePath = lowerAscii(asset.packagePath);
+        if (!packagePath.empty() && !packagePaths.insert(packagePath).second) {
+            duplicatePackagePaths.insert(asset.packagePath);
+        }
+    }
+    for (const auto& [guid, assets] : assetsByGuid) {
+        if (assets.size() <= 1) {
+            continue;
+        }
+        bool allTextureVariants = true;
+        std::set<std::string> variantPackagePaths;
+        std::set<std::string> variantPayloadHashes;
+        for (const RtpkgEmbeddedAssetInfo* asset : assets) {
+            allTextureVariants = allTextureVariants && asset->kind == NativeAssetKind::Texture;
+            allTextureVariants = allTextureVariants && !asset->packagePath.empty();
+            allTextureVariants = allTextureVariants && variantPackagePaths.insert(lowerAscii(asset->packagePath)).second;
+            if (asset->packageChunkIndex == UINT32_MAX || asset->packageChunkIndex >= inspection.native.chunks.size()) {
+                allTextureVariants = false;
+            } else {
+                allTextureVariants = allTextureVariants && variantPayloadHashes.insert(nativeHashHex(inspection.native.chunks[asset->packageChunkIndex].payloadHash)).second;
+            }
+        }
+        if (allTextureVariants) {
+            validDuplicateTextureVariantGuids.insert(guid);
+        } else {
+            invalidDuplicateGuids.insert(guid);
+        }
+    }
+
+    const bool allHashesValid = hasAssets && hashValidAssets == inspection.embeddedAssets.size();
+    const bool allDirectStorageCompatible = hasAssets && directStorageCompatibleAssets == inspection.embeddedAssets.size();
+    const bool allRuntimeDecodeReady = hasAssets && runtimeDecodeReadyAssets == inspection.embeddedAssets.size();
+    const bool noUnsupportedCompression = unsupportedCompressionAssets == 0;
+    const bool runtimeIndependent = hasAssets && oneChunkPerAsset && packagePayloadBytes > 0;
+
+    requirements = {
+        {"native_container_ok", inspection.native.ok},
+        {"is_rtpkg_package", isPackage},
+        {"has_embedded_assets", hasAssets},
+        {"object_table_matches_embedded_assets", objectTableMatches},
+        {"one_payload_chunk_per_embedded_asset", oneChunkPerAsset},
+        {"all_payload_hashes_valid", allHashesValid},
+        {"no_duplicate_embedded_guids", invalidDuplicateGuids.empty()},
+        {"duplicate_embedded_guid_count", duplicateGuids.size()},
+        {"valid_duplicate_texture_variant_guid_count", validDuplicateTextureVariantGuids.size()},
+        {"no_duplicate_package_paths", duplicatePackagePaths.empty()},
+        {"no_unsupported_compression", noUnsupportedCompression},
+        {"directstorage_ready", allDirectStorageCompatible && noUnsupportedCompression},
+        {"runtime_payload_decode_ready", allRuntimeDecodeReady},
+        {"runtime_independent_of_source_files", runtimeIndependent},
+    };
+
+    if (!inspection.native.ok) {
+        fail("native_container_invalid", "Native package container inspection failed");
+    }
+    if (!isPackage) {
+        fail("not_rtpkg_package", "File is not a valid .rtpkg package");
+    }
+    if (!hasAssets) {
+        fail("empty_package", "Package contains no embedded native assets");
+    }
+    if (!objectTableMatches) {
+        fail("object_table_mismatch", "Package object table does not match embedded asset count", {
+            {"object_table_count", inspection.native.header.objectTableCount},
+            {"embedded_asset_count", inspection.embeddedAssets.size()},
+        });
+    }
+    if (!oneChunkPerAsset) {
+        fail("chunk_table_mismatch", "Package must contain exactly one payload chunk per embedded asset", {
+            {"chunk_table_count", inspection.native.header.chunkTableCount},
+            {"chunk_count", inspection.native.chunks.size()},
+            {"embedded_asset_count", inspection.embeddedAssets.size()},
+        });
+    }
+    if (!allHashesValid) {
+        fail("payload_hash_validation_failed", "Not every embedded payload hash validates", {
+            {"hash_valid_assets", hashValidAssets},
+            {"embedded_asset_count", inspection.embeddedAssets.size()},
+        });
+    }
+    if (!invalidDuplicateGuids.empty()) {
+        fail("duplicate_embedded_guids", "Package contains duplicate embedded asset GUIDs that are not valid texture target variants", {
+            {"guids", invalidDuplicateGuids},
+            {"valid_texture_variant_guids", validDuplicateTextureVariantGuids},
+        });
+    }
+    if (!duplicatePackagePaths.empty()) {
+        fail("duplicate_package_paths", "Package contains duplicate embedded package paths", {
+            {"package_paths", duplicatePackagePaths},
+        });
+    }
+    if (!noUnsupportedCompression) {
+        fail("unsupported_compression", "Package contains chunks with unsupported compression metadata", {
+            {"unsupported_compression_assets", unsupportedCompressionAssets},
+        });
+    }
+    if (!allDirectStorageCompatible) {
+        fail("directstorage_incompatible_chunks", "Package contains chunks that are not compatible with DirectStorage metadata", {
+            {"directstorage_compatible_assets", directStorageCompatibleAssets},
+            {"embedded_asset_count", inspection.embeddedAssets.size()},
+        });
+    }
+    if (!allRuntimeDecodeReady) {
+        fail("runtime_payload_decode_unavailable", "Package contains compressed payloads without an implemented runtime decode path", {
+            {"runtime_decode_ready_assets", runtimeDecodeReadyAssets},
+            {"cpu_fallback_required_assets", cpuFallbackRequiredAssets},
+            {"embedded_asset_count", inspection.embeddedAssets.size()},
+        });
+    }
+    if (!runtimeIndependent) {
+        fail("runtime_source_dependency_risk", "Package payload table is not self-contained enough for source-file-independent runtime loading", {
+            {"payload_bytes", packagePayloadBytes},
+            {"chunk_count", inspection.native.chunks.size()},
+            {"embedded_asset_count", inspection.embeddedAssets.size()},
+        });
+    }
+    if (cpuFallbackRequiredAssets > 0) {
+        warn("cpu_decompression_required", "Package contains DirectStorage-compatible compressed chunks that currently require CPU fallback", {
+            {"cpu_fallback_required_assets", cpuFallbackRequiredAssets},
+        });
+    }
+
+    const bool ok = failures.empty();
+    return {
+        {"schema", "RtpkgValidationReportV1"},
+        {"ok", ok},
+        {"package_path", path.generic_string()},
+        {"asset_count", inspection.embeddedAssets.size()},
+        {"chunk_count", inspection.native.chunks.size()},
+        {"payload_bytes", packagePayloadBytes},
+        {"hash_valid_assets", hashValidAssets},
+        {"directstorage_compatible_assets", directStorageCompatibleAssets},
+        {"runtime_decode_ready_assets", runtimeDecodeReadyAssets},
+        {"requirements", requirements},
+        {"failures", failures},
+        {"warnings", warnings},
+        {"inspection", rtpkgInspectionToJson(inspection, path)},
+    };
+}
+
+std::string rtpkgPatchAssetKey(const RtpkgEmbeddedAssetInfo& asset) {
+    if (!asset.guid.empty()) {
+        return "guid:" + lowerAscii(asset.guid);
+    }
+    return "path:" + lowerAscii(asset.packagePath);
+}
+
+std::string rtpkgPatchPayloadHashHex(const RtpkgInspection& inspection, const RtpkgEmbeddedAssetInfo& asset) {
+    if (asset.packageChunkIndex == UINT32_MAX || asset.packageChunkIndex >= inspection.native.chunks.size()) {
+        return {};
+    }
+    return nativeHashHex(inspection.native.chunks[asset.packageChunkIndex].payloadHash);
+}
+
+nlohmann::json rtpkgPatchAssetJson(
+    std::string action,
+    std::string key,
+    std::string reason,
+    const RtpkgInspection* baseInspection,
+    const RtpkgEmbeddedAssetInfo* baseAsset,
+    const RtpkgInspection* updatedInspection,
+    const RtpkgEmbeddedAssetInfo* updatedAsset) {
+    const RtpkgEmbeddedAssetInfo* primary = updatedAsset ? updatedAsset : baseAsset;
+    nlohmann::json item = {
+        {"action", std::move(action)},
+        {"key", std::move(key)},
+        {"reason", std::move(reason)},
+        {"guid", primary ? primary->guid : std::string{}},
+        {"package_path", primary ? primary->packagePath : std::string{}},
+        {"kind", primary ? nativeAssetKindName(primary->kind) : std::string{}},
+        {"base_package_size", baseAsset ? baseAsset->packageSize : 0},
+        {"updated_package_size", updatedAsset ? updatedAsset->packageSize : 0},
+        {"base_source_size", baseAsset ? baseAsset->sourceSize : 0},
+        {"updated_source_size", updatedAsset ? updatedAsset->sourceSize : 0},
+        {"base_compression", baseAsset ? nativeChunkCompressionName(baseAsset->compression) : std::string{}},
+        {"updated_compression", updatedAsset ? nativeChunkCompressionName(updatedAsset->compression) : std::string{}},
+        {"base_payload_hash", (baseInspection && baseAsset) ? rtpkgPatchPayloadHashHex(*baseInspection, *baseAsset) : std::string{}},
+        {"updated_payload_hash", (updatedInspection && updatedAsset) ? rtpkgPatchPayloadHashHex(*updatedInspection, *updatedAsset) : std::string{}},
+    };
+    if (baseAsset) {
+        item["base_package_path"] = baseAsset->packagePath;
+        item["base_guid"] = baseAsset->guid;
+        item["base_kind"] = nativeAssetKindName(baseAsset->kind);
+    }
+    if (updatedAsset) {
+        item["updated_package_path"] = updatedAsset->packagePath;
+        item["updated_guid"] = updatedAsset->guid;
+        item["updated_kind"] = nativeAssetKindName(updatedAsset->kind);
+    }
+    return item;
+}
+
+bool rtpkgPatchSameAssetContent(
+    const RtpkgInspection& baseInspection,
+    const RtpkgEmbeddedAssetInfo& baseAsset,
+    const RtpkgInspection& updatedInspection,
+    const RtpkgEmbeddedAssetInfo& updatedAsset) {
+    return baseAsset.kind == updatedAsset.kind &&
+        baseAsset.sourceSize == updatedAsset.sourceSize &&
+        baseAsset.packageSize == updatedAsset.packageSize &&
+        baseAsset.compression == updatedAsset.compression &&
+        rtpkgPatchPayloadHashHex(baseInspection, baseAsset) == rtpkgPatchPayloadHashHex(updatedInspection, updatedAsset);
 }
 
 int writeRtpkgCommand(const std::filesystem::path& packagePath, const std::vector<std::filesystem::path>& inputs, const std::filesystem::path& root) {
@@ -624,6 +1074,342 @@ int inspectRtpkgCommand(const std::filesystem::path& path, const std::filesystem
         std::cout << report.dump(2) << '\n';
     }
     return inspection.native.ok ? 0 : 1;
+}
+
+int validateRtpkgCommand(const std::filesystem::path& path, const std::filesystem::path& jsonOut) {
+    RtpkgReader reader;
+    const RtpkgInspection inspection = reader.inspect(path, true);
+    const nlohmann::json report = validateRtpkgInspectionToJson(inspection, path);
+    if (!jsonOut.empty()) {
+        std::error_code ec;
+        const std::filesystem::path parent = jsonOut.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                std::cerr << "Failed to create native package validation report directory: " << parent << " (" << ec.message() << ")\n";
+                return 1;
+            }
+        }
+        std::ofstream out(jsonOut);
+        if (!out.is_open()) {
+            std::cerr << "Failed to write native package validation JSON: " << jsonOut << '\n';
+            return 1;
+        }
+        out << report.dump(2);
+    } else {
+        std::cout << report.dump(2) << '\n';
+    }
+    return report.value("ok", false) ? 0 : 1;
+}
+
+int planRtpkgPatchCommand(
+    const std::filesystem::path& basePath,
+    const std::filesystem::path& updatedPath,
+    const std::filesystem::path& jsonOut) {
+    RtpkgReader reader;
+    const RtpkgInspection baseInspection = reader.inspect(basePath, true);
+    const RtpkgInspection updatedInspection = reader.inspect(updatedPath, true);
+    const nlohmann::json baseValidation = validateRtpkgInspectionToJson(baseInspection, basePath);
+    const nlohmann::json updatedValidation = validateRtpkgInspectionToJson(updatedInspection, updatedPath);
+
+    std::map<std::string, const RtpkgEmbeddedAssetInfo*> baseAssets;
+    std::map<std::string, const RtpkgEmbeddedAssetInfo*> updatedAssets;
+    uint64_t basePayloadBytes = 0;
+    uint64_t updatedPayloadBytes = 0;
+    for (const RtpkgEmbeddedAssetInfo& asset : baseInspection.embeddedAssets) {
+        basePayloadBytes += asset.packageSize;
+        baseAssets.emplace(rtpkgPatchAssetKey(asset), &asset);
+    }
+    for (const RtpkgEmbeddedAssetInfo& asset : updatedInspection.embeddedAssets) {
+        updatedPayloadBytes += asset.packageSize;
+        updatedAssets.emplace(rtpkgPatchAssetKey(asset), &asset);
+    }
+
+    nlohmann::json actions = nlohmann::json::array();
+    uint32_t addedAssets = 0;
+    uint32_t removedAssets = 0;
+    uint32_t changedAssets = 0;
+    uint32_t unchangedAssets = 0;
+    uint64_t patchPayloadBytes = 0;
+    uint64_t removedPayloadBytes = 0;
+    uint64_t reusedPayloadBytes = 0;
+
+    std::set<std::string> keys;
+    for (const auto& [key, asset] : baseAssets) {
+        (void)asset;
+        keys.insert(key);
+    }
+    for (const auto& [key, asset] : updatedAssets) {
+        (void)asset;
+        keys.insert(key);
+    }
+
+    for (const std::string& key : keys) {
+        const auto baseIt = baseAssets.find(key);
+        const auto updatedIt = updatedAssets.find(key);
+        const RtpkgEmbeddedAssetInfo* baseAsset = baseIt == baseAssets.end() ? nullptr : baseIt->second;
+        const RtpkgEmbeddedAssetInfo* updatedAsset = updatedIt == updatedAssets.end() ? nullptr : updatedIt->second;
+        if (baseAsset && updatedAsset) {
+            if (rtpkgPatchSameAssetContent(baseInspection, *baseAsset, updatedInspection, *updatedAsset)) {
+                ++unchangedAssets;
+                reusedPayloadBytes += updatedAsset->packageSize;
+                actions.push_back(rtpkgPatchAssetJson("unchanged", key, "payload_reusable", &baseInspection, baseAsset, &updatedInspection, updatedAsset));
+            } else {
+                ++changedAssets;
+                patchPayloadBytes += updatedAsset->packageSize;
+                actions.push_back(rtpkgPatchAssetJson("changed", key, "payload_or_metadata_changed", &baseInspection, baseAsset, &updatedInspection, updatedAsset));
+            }
+        } else if (updatedAsset) {
+            ++addedAssets;
+            patchPayloadBytes += updatedAsset->packageSize;
+            actions.push_back(rtpkgPatchAssetJson("added", key, "new_asset", nullptr, nullptr, &updatedInspection, updatedAsset));
+        } else if (baseAsset) {
+            ++removedAssets;
+            removedPayloadBytes += baseAsset->packageSize;
+            actions.push_back(rtpkgPatchAssetJson("removed", key, "removed_asset", &baseInspection, baseAsset, nullptr, nullptr));
+        }
+    }
+
+    const bool baseOk = baseValidation.value("ok", false);
+    const bool updatedOk = updatedValidation.value("ok", false);
+    const bool ok = baseOk && updatedOk;
+    const double reuseRatio = updatedPayloadBytes == 0
+        ? 0.0
+        : static_cast<double>(reusedPayloadBytes) / static_cast<double>(updatedPayloadBytes);
+    const nlohmann::json report = {
+        {"schema", "RtpkgPatchPlanV1"},
+        {"ok", ok},
+        {"patch_ready", ok},
+        {"requires_full_rewrite", !ok},
+        {"base_package_path", basePath.generic_string()},
+        {"updated_package_path", updatedPath.generic_string()},
+        {"base_asset_count", baseInspection.embeddedAssets.size()},
+        {"updated_asset_count", updatedInspection.embeddedAssets.size()},
+        {"added_assets", addedAssets},
+        {"removed_assets", removedAssets},
+        {"changed_assets", changedAssets},
+        {"unchanged_assets", unchangedAssets},
+        {"base_payload_bytes", basePayloadBytes},
+        {"updated_payload_bytes", updatedPayloadBytes},
+        {"patch_payload_bytes", patchPayloadBytes},
+        {"removed_payload_bytes", removedPayloadBytes},
+        {"reused_payload_bytes", reusedPayloadBytes},
+        {"reuse_ratio", reuseRatio},
+        {"base_validation", {
+            {"ok", baseOk},
+            {"failure_count", baseValidation.value("failures", nlohmann::json::array()).size()},
+            {"requirements", baseValidation.value("requirements", nlohmann::json::object())},
+        }},
+        {"updated_validation", {
+            {"ok", updatedOk},
+            {"failure_count", updatedValidation.value("failures", nlohmann::json::array()).size()},
+            {"requirements", updatedValidation.value("requirements", nlohmann::json::object())},
+        }},
+        {"actions", actions},
+    };
+
+    if (!jsonOut.empty()) {
+        std::error_code ec;
+        const std::filesystem::path parent = jsonOut.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                std::cerr << "Failed to create native package patch-plan report directory: " << parent << " (" << ec.message() << ")\n";
+                return 1;
+            }
+        }
+        std::ofstream out(jsonOut);
+        if (!out.is_open()) {
+            std::cerr << "Failed to write native package patch-plan JSON: " << jsonOut << '\n';
+            return 1;
+        }
+        out << report.dump(2);
+    } else {
+        std::cout << report.dump(2) << '\n';
+    }
+    return ok ? 0 : 1;
+}
+
+int simulateRtpkgCompressionCommand(
+    const std::filesystem::path& path,
+    std::string_view profile,
+    const std::filesystem::path& jsonOut) {
+    RtpkgReader reader;
+    const RtpkgInspection inspection = reader.inspect(path, true);
+    std::vector<std::byte> bytes;
+    NativeBinaryError readError;
+    if (inspection.native.ok && !readFileBytes(path, bytes, &readError)) {
+        std::cerr << "Failed to read native package for compression simulation: " << readError.message << '\n';
+        return 1;
+    }
+
+    nlohmann::json chunks = nlohmann::json::array();
+    uint64_t totalSourceBytes = 0;
+    uint64_t totalEstimatedBytes = 0;
+    uint32_t directStorageCompatibleChunks = 0;
+    uint32_t cpuFallbackChunks = 0;
+    uint32_t gpuDecompressionChunks = 0;
+    const std::string selectedProfile = std::string(profile.empty() ? "none" : profile);
+    for (size_t i = 0; i < inspection.native.chunks.size(); ++i) {
+        const NativeChunkRecord& chunk = inspection.native.chunks[i];
+        const bool rangeValid = rangeInside(chunk.offset, chunk.size, bytes.size());
+        RtpkgCompressionEstimate estimate;
+        if (rangeValid) {
+            estimate = estimateRtpkgCompression(
+                selectedProfile,
+                bytes.data() + static_cast<size_t>(chunk.offset),
+                static_cast<size_t>(chunk.size));
+        } else {
+            estimate.profile = lowerAscii(selectedProfile);
+        }
+        totalSourceBytes += chunk.uncompressedSize;
+        totalEstimatedBytes += estimate.compressedBytes;
+        directStorageCompatibleChunks += estimate.directStorageCompatible ? 1u : 0u;
+        cpuFallbackChunks += estimate.cpuFallbackAvailable ? 1u : 0u;
+        gpuDecompressionChunks += estimate.gpuDecompressionAvailable ? 1u : 0u;
+        chunks.push_back({
+            {"index", i},
+            {"type", chunk.type},
+            {"existing_compression", nativeChunkCompressionName(chunk.compression)},
+            {"package_offset", chunk.offset},
+            {"package_size", chunk.size},
+            {"uncompressed_size", chunk.uncompressedSize},
+            {"range_valid", rangeValid},
+            {"simulated_compression", estimate.profile},
+            {"estimated_compressed_size", estimate.compressedBytes},
+            {"estimated_ratio", estimate.ratio},
+            {"required_runtime_support", estimate.requiredRuntimeSupport},
+            {"directstorage_compatible", estimate.directStorageCompatible},
+            {"cpu_fallback_available", estimate.cpuFallbackAvailable},
+            {"gpu_decompression_available", estimate.gpuDecompressionAvailable},
+        });
+    }
+
+    const nlohmann::json report = {
+        {"schema", "RtpkgCompressionSimulationV1"},
+        {"ok", inspection.native.ok},
+        {"package_path", path.generic_string()},
+        {"profile", lowerAscii(selectedProfile)},
+        {"asset_count", inspection.embeddedAssets.size()},
+        {"chunk_count", inspection.native.chunks.size()},
+        {"source_bytes", totalSourceBytes},
+        {"estimated_compressed_bytes", totalEstimatedBytes},
+        {"estimated_ratio", totalSourceBytes == 0 ? 1.0 : static_cast<double>(totalEstimatedBytes) / static_cast<double>(totalSourceBytes)},
+        {"directstorage_compatible_chunks", directStorageCompatibleChunks},
+        {"cpu_fallback_chunks", cpuFallbackChunks},
+        {"gpu_decompression_chunks", gpuDecompressionChunks},
+        {"compression_metadata_ready", inspection.native.ok && !inspection.native.chunks.empty()},
+        {"payloads_rewritten", false},
+        {"chunks", chunks},
+        {"inspection", rtpkgInspectionToJson(inspection, path)},
+    };
+
+    if (!jsonOut.empty()) {
+        std::error_code ec;
+        const std::filesystem::path parent = jsonOut.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+        }
+        std::ofstream out(jsonOut);
+        if (!out.is_open()) {
+            std::cerr << "Failed to write native package compression simulation JSON: " << jsonOut << '\n';
+            return 1;
+        }
+        out << report.dump(2);
+    } else {
+        std::cout << report.dump(2) << '\n';
+    }
+    return inspection.native.ok ? 0 : 1;
+}
+
+int simulateRtpkgStreamingIoCommand(
+    const std::filesystem::path& path,
+    const StreamingRuntimeOptions& options,
+    const std::filesystem::path& jsonOut) {
+    RtpkgReader reader;
+    const RtpkgInspection inspection = reader.inspect(path, true);
+    std::unique_ptr<StreamingIoBackend> backend = makeStreamingIoBackend(options);
+
+    nlohmann::json chunkReads = nlohmann::json::array();
+    bool ok = inspection.native.ok;
+    uint64_t hashValidChunks = 0;
+    uint64_t bytesRead = 0;
+    const auto benchmarkStart = std::chrono::steady_clock::now();
+    if (inspection.native.ok) {
+        for (size_t i = 0; i < inspection.native.chunks.size(); ++i) {
+            const NativeChunkRecord& chunk = inspection.native.chunks[i];
+            StreamingIoReadRequest request;
+            request.path = path;
+            request.offset = chunk.offset;
+            request.size = chunk.size;
+            request.label = "rtpkg chunk " + std::to_string(i);
+            StreamingIoReadResult result = backend->read(request);
+            const bool sizeMatches = result.ok && result.completedBytes == chunk.size && result.bytes.size() == chunk.size;
+            const bool hashValid = sizeMatches && nativeHashBytes(result.bytes) == chunk.payloadHash;
+            ok = ok && result.ok && hashValid;
+            hashValidChunks += hashValid ? 1ull : 0ull;
+            bytesRead += result.completedBytes;
+            chunkReads.push_back({
+                {"index", i},
+                {"type", chunk.type},
+                {"compression", chunk.compression},
+                {"compression_name", nativeChunkCompressionName(chunk.compression)},
+                {"offset", chunk.offset},
+                {"requested_bytes", chunk.size},
+                {"completed_bytes", result.completedBytes},
+                {"backend", streamingIoBackendKindName(result.backend)},
+                {"effective_backend", backend->name()},
+                {"ok", result.ok},
+                {"size_matches", sizeMatches},
+                {"payload_hash_valid", hashValid},
+                {"fallback_reason", result.fallbackReason},
+                {"error", result.error},
+            });
+        }
+    }
+    const auto benchmarkEnd = std::chrono::steady_clock::now();
+    const double elapsedMs = std::chrono::duration<double, std::milli>(benchmarkEnd - benchmarkStart).count();
+    const StreamingIoMetrics metrics = backend->metrics();
+    const double throughputMiBPerSec = elapsedMs <= 0.0
+        ? 0.0
+        : (static_cast<double>(metrics.bytesCompleted) / (1024.0 * 1024.0)) / (elapsedMs / 1000.0);
+
+    const nlohmann::json report = {
+        {"schema", "RtpkgStreamingIoProbeV1"},
+        {"ok", ok},
+        {"package_path", path.generic_string()},
+        {"options", streamingRuntimeOptionsToJson(options)},
+        {"availability", streamingIoBackendAvailabilityJson(options)},
+        {"metrics", streamingIoMetricsJson(metrics)},
+        {"elapsed_ms", elapsedMs},
+        {"throughput_mib_per_sec", throughputMiBPerSec},
+        {"chunk_count", inspection.native.chunks.size()},
+        {"hash_valid_chunks", hashValidChunks},
+        {"bytes_read", bytesRead},
+        {"reads", chunkReads},
+        {"package", rtpkgInspectionToJson(inspection, path)},
+    };
+
+    if (!jsonOut.empty()) {
+        std::error_code ec;
+        const std::filesystem::path parent = jsonOut.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                std::cerr << "Failed to create native package streaming I/O report directory: " << parent << " (" << ec.message() << ")\n";
+                return 1;
+            }
+        }
+        std::ofstream out(jsonOut);
+        if (!out.is_open()) {
+            std::cerr << "Failed to write native package streaming I/O report: " << jsonOut << '\n';
+            return 1;
+        }
+        out << report.dump(2);
+    } else {
+        std::cout << report.dump(2) << '\n';
+    }
+    return ok ? 0 : 1;
 }
 
 } // namespace rtv

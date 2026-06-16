@@ -19,6 +19,16 @@ enum class AnimationTrackPath {
     Rotation,
     Scale,
     Weights,
+    MeshVertexPositions,
+    CameraYfov,
+    CameraAspectRatio,
+    CameraOrthoXmag,
+    CameraOrthoYmag,
+    CameraNearFar,
+    LightColor,
+    LightIntensity,
+    LightRadius,
+    LightConeAngles,
     Unknown,
 };
 
@@ -31,6 +41,26 @@ struct AnimationNodeSample {
     glm::vec3 scale{1.0f};
     bool hasMorphWeights = false;
     std::vector<float> morphWeights;
+    bool hasMeshVertexPositions = false;
+    std::vector<glm::vec3> meshVertexPositions;
+    bool hasCameraYfov = false;
+    float cameraYfov = 0.0f;
+    bool hasCameraAspectRatio = false;
+    float cameraAspectRatio = 0.0f;
+    bool hasCameraOrthoXmag = false;
+    float cameraOrthoXmag = 0.0f;
+    bool hasCameraOrthoYmag = false;
+    float cameraOrthoYmag = 0.0f;
+    bool hasCameraNearFar = false;
+    glm::vec2 cameraNearFar{0.01f, 1000.0f};
+    bool hasLightColor = false;
+    glm::vec3 lightColor{1.0f};
+    bool hasLightIntensity = false;
+    float lightIntensity = 1.0f;
+    bool hasLightRadius = false;
+    float lightRadius = 1.0f;
+    bool hasLightConeAngles = false;
+    glm::vec2 lightConeAngles{0.35f, 0.70f};
 };
 
 struct AnimationSample {

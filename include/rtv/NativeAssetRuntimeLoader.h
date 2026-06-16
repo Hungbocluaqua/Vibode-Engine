@@ -21,6 +21,12 @@ namespace rtv {
 struct NativeRuntimeLoadOptions {
     NativeTextureFormatSupport textureFormatSupport = nativeTextureOfflineFallbackFormatSupport();
     bool rejectUnsupportedTextureFormats = true;
+    bool validatePayloadHashes = true;
+    bool retainLoadedPayloadsInReport = true;
+    uint64_t eagerCpuLoadWarningBytes = 128ull * 1024ull * 1024ull;
+    uint64_t eagerCpuLoadHardLimitBytes = 2ull * 1024ull * 1024ull * 1024ull;
+    bool allowLargeEagerCpuLoad = false;
+    std::vector<std::filesystem::path> looseFileAllowList;
 };
 
 struct NativeRuntimeTextureBinding {
@@ -185,8 +191,25 @@ struct NativeRuntimeSceneAssetPlan {
     std::array<float, 3> boundsMax{};
 };
 
+struct NativeRuntimeLegacyCpuLoadPolicyReport {
+    bool available = false;
+    bool assetManagerBacked = false;
+    bool packageBacked = false;
+    bool looseBacked = false;
+    uint64_t estimatedEagerCpuBytes = 0;
+    uint64_t warningThresholdBytes = 0;
+    uint64_t hardLimitBytes = 0;
+    bool allowLargeEagerCpuLoad = false;
+    bool largeEagerLoadWarning = false;
+    bool hardLimitExceeded = false;
+    bool streamingRecommended = false;
+    std::string policy;
+    std::string recommendedAction;
+};
+
 struct NativeRuntimeLoadReport {
     bool ok = false;
+    std::filesystem::path sourceRoot;
     uint32_t textureCount = 0;
     uint32_t materialCount = 0;
     uint32_t meshCount = 0;
@@ -200,6 +223,7 @@ struct NativeRuntimeLoadReport {
     NativeRuntimeRendererUploadPlan rendererUploadPlan;
     NativeRuntimeDirectStoreUploadPlan directStoreUploadPlan;
     NativeRuntimeSceneAssetPlan sceneAssetPlan;
+    NativeRuntimeLegacyCpuLoadPolicyReport legacyCpuLoadPolicy;
     SceneAsset sceneAsset;
     NativeRuntimeLoadOptions options;
     std::vector<NativeRuntimeLoadedAsset> assets;

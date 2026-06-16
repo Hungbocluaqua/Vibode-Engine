@@ -21,8 +21,11 @@ struct PathDataRecord {
     vec4 denoiser_hit_distance;
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
 };
 layout(set = 0, binding = 7, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
+layout(set = 0, binding = 8, std430) readonly buffer EntityIdBuffer { uint entity_id_buffer[]; };
+layout(set = 0, binding = 9, std430) readonly buffer StreamingResetInstanceMasks { uint streaming_reset_instance_masks[]; };
 
 layout(set = 0, binding = 5, std140) uniform TaaParams {
     uint enabled;
@@ -151,10 +154,15 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
     vec3 current = texture(sampler2D(input_color, input_sampler), uv).rgb;
     ivec2 renderCoords = clamp(ivec2(floor(uv * vec2(renderDims))), ivec2(0), renderDims - ivec2(1));
     uint pixel_index = uint(renderCoords.y) * uint(renderDims.x) + uint(renderCoords.x);
+    uint instance_id = entity_id_buffer[pixel_index];
+    bool streaming_temporal_reset =
+        instance_id != 0xffffffffu &&
+        instance_id < streaming_reset_instance_masks.length() &&
+        (streaming_reset_instance_masks[instance_id] & 1u) != 0u;
     vec4 centerDn = decode_depth_normal(depth_normal_buffer[pixel_index]);
     PathDataRecord pathData = path_data_buffer[pixel_index];
     float specularLum = luminance(pathData.direct_specular.rgb + pathData.indirect_specular.rgb);
-    float diffuseLum = luminance(pathData.direct_diffuse.rgb + pathData.indirect_diffuse.rgb);
+    float diffuseLum = luminance(pathData.direct_diffuse.rgb + pathData.indirect_diffuse.rgb + pathData.emissive_residual.rgb);
     float specularSignal = clamp(specularLum / max(specularLum + diffuseLum, 1.0e-4), 0.0, 1.0);
     vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], params.velocity_scale);
     vec2 displayVelocityPixels = velocity_pixels * (vec2(displayDims) / max(vec2(renderDims), vec2(1.0)));
@@ -162,6 +170,7 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
     bool history_valid =
         params.enabled != 0u &&
         params.reset_history == 0u &&
+        !streaming_temporal_reset &&
         params.history_valid != 0u &&
         temporal_history_pixel_valid(history_pos, displayDims, 0.5) &&
         geometry_history_valid(renderCoords, renderDims, centerDn.x, centerDn.yzw);

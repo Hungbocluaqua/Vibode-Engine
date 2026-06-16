@@ -33,6 +33,10 @@ void growBounds(Bounds3& bounds, const BvhTriangle& tri) {
     return {minVec(left.min, right.min), maxVec(left.max, right.max)};
 }
 
+[[nodiscard]] Bounds3 nodeBounds(const BinaryBvhNode& node) {
+    return {node.boundsMin, node.boundsMax};
+}
+
 [[nodiscard]] float surfaceArea(const Bounds3& bounds) {
     const glm::vec3 d = glm::max(bounds.max - bounds.min, glm::vec3(0.0f));
     return 2.0f * (d.x * d.y + d.y * d.z + d.z * d.x);
@@ -131,9 +135,9 @@ struct Split {
 }
 
 [[nodiscard]] int buildNode(BvhBuildResult& result, std::vector<uint32_t>& refs, size_t begin, size_t end, uint32_t depth) {
-    const Bounds3 bounds = triangleBounds(result.triangles, refs, begin, end);
     const size_t count = end - begin;
     if (count <= leafTriLimit || depth >= maxDepth) {
+        const Bounds3 bounds = triangleBounds(result.triangles, refs, begin, end);
         BinaryBvhNode leaf;
         leaf.boundsMin = bounds.min;
         leaf.boundsMax = bounds.max;
@@ -169,6 +173,7 @@ struct Split {
     }
 
     if (mid == begin || mid == end) {
+        const Bounds3 bounds = triangleBounds(result.triangles, refs, begin, end);
         BinaryBvhNode leaf;
         leaf.boundsMin = bounds.min;
         leaf.boundsMax = bounds.max;
@@ -181,12 +186,15 @@ struct Split {
     }
 
     BinaryBvhNode node;
-    node.boundsMin = bounds.min;
-    node.boundsMax = bounds.max;
     const int nodeIdx = static_cast<int>(result.binaryNodes.size());
     result.binaryNodes.push_back(node);
     result.binaryNodes[nodeIdx].left = buildNode(result, refs, begin, mid, depth + 1u);
     result.binaryNodes[nodeIdx].right = buildNode(result, refs, mid, end, depth + 1u);
+    const BinaryBvhNode& left = result.binaryNodes[static_cast<size_t>(result.binaryNodes[nodeIdx].left)];
+    const BinaryBvhNode& right = result.binaryNodes[static_cast<size_t>(result.binaryNodes[nodeIdx].right)];
+    const Bounds3 bounds = mergeBounds(nodeBounds(left), nodeBounds(right));
+    result.binaryNodes[nodeIdx].boundsMin = bounds.min;
+    result.binaryNodes[nodeIdx].boundsMax = bounds.max;
     return nodeIdx;
 }
 
@@ -208,7 +216,7 @@ void buildSahBinaryBvh(BvhBuildResult& result) {
     for (size_t i = 0; i < result.triangles.size(); ++i) {
         result.mortonCodes[i] = morton3D30(result.triangles[i].centroid, cBounds);
     }
-    std::stable_sort(refs.begin(), refs.end(), [&](uint32_t a, uint32_t b) {
+    std::sort(refs.begin(), refs.end(), [&](uint32_t a, uint32_t b) {
         if (result.mortonCodes[a] == result.mortonCodes[b]) {
             return a < b;
         }
@@ -220,9 +228,9 @@ void buildSahBinaryBvh(BvhBuildResult& result) {
 }
 
 int buildMortonNode(BvhBuildResult& result, const std::vector<uint32_t>& refs, size_t begin, size_t end, uint32_t depth) {
-    const Bounds3 bounds = triangleBounds(result.triangles, refs, begin, end);
     const size_t count = end - begin;
     if (count <= leafTriLimit || depth >= maxDepth) {
+        const Bounds3 bounds = triangleBounds(result.triangles, refs, begin, end);
         BinaryBvhNode leaf;
         leaf.boundsMin = bounds.min;
         leaf.boundsMax = bounds.max;
@@ -235,13 +243,16 @@ int buildMortonNode(BvhBuildResult& result, const std::vector<uint32_t>& refs, s
     }
 
     BinaryBvhNode node;
-    node.boundsMin = bounds.min;
-    node.boundsMax = bounds.max;
     const int nodeIdx = static_cast<int>(result.binaryNodes.size());
     result.binaryNodes.push_back(node);
     const size_t mid = begin + count / 2u;
     result.binaryNodes[nodeIdx].left = buildMortonNode(result, refs, begin, mid, depth + 1u);
     result.binaryNodes[nodeIdx].right = buildMortonNode(result, refs, mid, end, depth + 1u);
+    const BinaryBvhNode& left = result.binaryNodes[static_cast<size_t>(result.binaryNodes[nodeIdx].left)];
+    const BinaryBvhNode& right = result.binaryNodes[static_cast<size_t>(result.binaryNodes[nodeIdx].right)];
+    const Bounds3 bounds = mergeBounds(nodeBounds(left), nodeBounds(right));
+    result.binaryNodes[nodeIdx].boundsMin = bounds.min;
+    result.binaryNodes[nodeIdx].boundsMax = bounds.max;
     return nodeIdx;
 }
 

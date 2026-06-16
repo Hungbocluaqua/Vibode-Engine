@@ -7,6 +7,8 @@
 
 #include <ktx.h>
 #include <ktxvulkan.h>
+#include <tinyexr.h>
+#include <tiffio.h>
 
 #include <algorithm>
 #include <cctype>
@@ -62,6 +64,272 @@ constexpr uint32_t fourCc(char a, char b, char c, char d) {
     return data != nullptr && size >= 4u && std::memcmp(data, "DDS ", 4u) == 0;
 }
 
+// OpenEXR files start with the magic number 0x76 0x2f 0x31 0x01.
+constexpr uint8_t exrMagic[4] = {0x76, 0x2f, 0x31, 0x01};
+
+[[nodiscard]] bool isExrBuffer(const uint8_t* data, size_t size) {
+    return data != nullptr && size >= sizeof(exrMagic) && std::memcmp(data, exrMagic, sizeof(exrMagic)) == 0;
+}
+
+[[nodiscard]] bool isExrFile(std::string_view path) {
+    std::ifstream file(std::string(path), std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    uint8_t header[4] = {};
+    file.read(reinterpret_cast<char*>(header), sizeof(header));
+    return file.gcount() == sizeof(header) && std::memcmp(header, exrMagic, sizeof(exrMagic)) == 0;
+}
+
+[[nodiscard]] bool isTiffHeader(const uint8_t* data, size_t size) {
+    if (data == nullptr || size < 4u) {
+        return false;
+    }
+    const bool littleTiff = data[0] == 'I' && data[1] == 'I' && data[2] == 42u && data[3] == 0u;
+    const bool bigTiff = data[0] == 'M' && data[1] == 'M' && data[2] == 0u && data[3] == 42u;
+    const bool littleBigTiff = data[0] == 'I' && data[1] == 'I' && data[2] == 43u && data[3] == 0u;
+    const bool bigBigTiff = data[0] == 'M' && data[1] == 'M' && data[2] == 0u && data[3] == 43u;
+    return littleTiff || bigTiff || littleBigTiff || bigBigTiff;
+}
+
+[[nodiscard]] bool isTiffBuffer(const uint8_t* data, size_t size) {
+    return isTiffHeader(data, size);
+}
+
+[[nodiscard]] bool isTiffFile(std::string_view path) {
+    std::ifstream file(std::string(path), std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    uint8_t header[4] = {};
+    file.read(reinterpret_cast<char*>(header), sizeof(header));
+    return file.gcount() == sizeof(header) && isTiffHeader(header, sizeof(header));
+}
+
+// Decode an OpenEXR image (file or memory) into a 32-bit float RGBA TextureData.
+// tinyexr returns tightly packed RGBA float scanlines in top-down order, which
+// matches the orientation stb_image produces, so no vertical flip is applied here.
+[[nodiscard]] TextureData decodeExrToFloatRgba(const float* rgba, int width, int height) {
+    TextureData result;
+    result.width = width;
+    result.height = height;
+    result.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    result.linearColorSpace = true;
+    const size_t byteSize = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
+    result.pixels.resize(byteSize);
+    std::memcpy(result.pixels.data(), rgba, byteSize);
+    return result;
+}
+
+[[nodiscard]] TextureData loadExrFromFile(const std::string& filepath) {
+    float* rgba = nullptr;
+    int width = 0;
+    int height = 0;
+    const char* err = nullptr;
+    const int rc = LoadEXR(&rgba, &width, &height, filepath.c_str(), &err);
+    if (rc != TINYEXR_SUCCESS) {
+        std::string message = std::string("LoadEXR failed for ") + filepath;
+        if (err != nullptr) {
+            message += std::string(": ") + err;
+            FreeEXRErrorMessage(err);
+        }
+        throw std::runtime_error(message);
+    }
+    TextureData result = decodeExrToFloatRgba(rgba, width, height);
+    free(rgba);
+    return result;
+}
+
+[[nodiscard]] TextureData loadExrFromMemory(const uint8_t* data, size_t size) {
+    float* rgba = nullptr;
+    int width = 0;
+    int height = 0;
+    const char* err = nullptr;
+    const int rc = LoadEXRFromMemory(&rgba, &width, &height, data, size, &err);
+    if (rc != TINYEXR_SUCCESS) {
+        std::string message = "LoadEXRFromMemory failed";
+        if (err != nullptr) {
+            message += std::string(": ") + err;
+            FreeEXRErrorMessage(err);
+        }
+        throw std::runtime_error(message);
+    }
+    TextureData result = decodeExrToFloatRgba(rgba, width, height);
+    free(rgba);
+    return result;
+}
+
+[[nodiscard]] TextureData decodeTiffToRgba8(TIFF* tiff, std::string_view sourceLabel) {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (TIFFGetField(tiff, TIFFTAG_IMAGEWIDTH, &width) != 1 || TIFFGetField(tiff, TIFFTAG_IMAGELENGTH, &height) != 1) {
+        throw std::runtime_error(std::string("TIFF missing image dimensions for ") + std::string(sourceLabel));
+    }
+    if (width == 0u || height == 0u) {
+        throw std::runtime_error(std::string("TIFF has empty image dimensions for ") + std::string(sourceLabel));
+    }
+    if (width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        height > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error(std::string("TIFF dimensions exceed TextureData limits for ") + std::string(sourceLabel));
+    }
+    if (width > std::numeric_limits<size_t>::max() / height) {
+        throw std::runtime_error(std::string("TIFF dimensions overflow for ") + std::string(sourceLabel));
+    }
+
+    const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (pixelCount > std::numeric_limits<size_t>::max() / 4u) {
+        throw std::runtime_error(std::string("TIFF pixel buffer overflow for ") + std::string(sourceLabel));
+    }
+
+    std::vector<uint32_t> raster(pixelCount);
+    if (TIFFReadRGBAImageOriented(tiff, width, height, raster.data(), ORIENTATION_TOPLEFT, 0) != 1) {
+        throw std::runtime_error(std::string("TIFFReadRGBAImageOriented failed for ") + std::string(sourceLabel));
+    }
+
+    TextureData result;
+    result.width = static_cast<int>(width);
+    result.height = static_cast<int>(height);
+    result.format = VK_FORMAT_R8G8B8A8_UNORM;
+    result.pixels.resize(pixelCount * 4u);
+    for (size_t i = 0; i < pixelCount; ++i) {
+        const uint32_t pixel = raster[i];
+        result.pixels[i * 4u + 0u] = static_cast<unsigned char>(TIFFGetR(pixel));
+        result.pixels[i * 4u + 1u] = static_cast<unsigned char>(TIFFGetG(pixel));
+        result.pixels[i * 4u + 2u] = static_cast<unsigned char>(TIFFGetB(pixel));
+        result.pixels[i * 4u + 3u] = static_cast<unsigned char>(TIFFGetA(pixel));
+    }
+    return result;
+}
+
+[[nodiscard]] TextureData loadTiffFromFile(const std::string& filepath) {
+    TIFF* tiff = TIFFOpen(filepath.c_str(), "r");
+    if (tiff == nullptr) {
+        throw std::runtime_error(std::string("TIFFOpen failed for ") + filepath);
+    }
+    try {
+        TextureData result = decodeTiffToRgba8(tiff, filepath);
+        TIFFClose(tiff);
+        return result;
+    } catch (...) {
+        TIFFClose(tiff);
+        throw;
+    }
+}
+
+struct TiffMemoryStream {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    size_t offset = 0;
+};
+
+tmsize_t tiffMemoryRead(thandle_t handle, void* buffer, tmsize_t byteCount) {
+    if (handle == nullptr || buffer == nullptr || byteCount <= 0) {
+        return 0;
+    }
+    auto* stream = static_cast<TiffMemoryStream*>(handle);
+    if (stream->offset >= stream->size) {
+        return 0;
+    }
+    const size_t available = stream->size - stream->offset;
+    const size_t requested = static_cast<size_t>(byteCount);
+    const size_t copied = std::min(available, requested);
+    std::memcpy(buffer, stream->data + stream->offset, copied);
+    stream->offset += copied;
+    return static_cast<tmsize_t>(copied);
+}
+
+tmsize_t tiffMemoryWrite(thandle_t, void*, tmsize_t) {
+    return 0;
+}
+
+toff_t tiffMemorySeek(thandle_t handle, toff_t offset, int whence) {
+    if (handle == nullptr) {
+        return static_cast<toff_t>(-1);
+    }
+    auto* stream = static_cast<TiffMemoryStream*>(handle);
+    size_t base = 0;
+    switch (whence) {
+    case SEEK_SET:
+        base = 0;
+        break;
+    case SEEK_CUR:
+        base = stream->offset;
+        break;
+    case SEEK_END:
+        base = stream->size;
+        break;
+    default:
+        return static_cast<toff_t>(-1);
+    }
+    if (offset > static_cast<toff_t>(std::numeric_limits<size_t>::max())) {
+        return static_cast<toff_t>(-1);
+    }
+    const size_t relative = static_cast<size_t>(offset);
+    if (base > std::numeric_limits<size_t>::max() - relative) {
+        return static_cast<toff_t>(-1);
+    }
+    const size_t next = base + relative;
+    if (next > stream->size) {
+        return static_cast<toff_t>(-1);
+    }
+    stream->offset = next;
+    return static_cast<toff_t>(stream->offset);
+}
+
+int tiffMemoryClose(thandle_t) {
+    return 0;
+}
+
+toff_t tiffMemorySize(thandle_t handle) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    const auto* stream = static_cast<const TiffMemoryStream*>(handle);
+    return static_cast<toff_t>(stream->size);
+}
+
+int tiffMemoryMap(thandle_t handle, void** base, toff_t* size) {
+    if (handle == nullptr || base == nullptr || size == nullptr) {
+        return 0;
+    }
+    const auto* stream = static_cast<const TiffMemoryStream*>(handle);
+    *base = const_cast<uint8_t*>(stream->data);
+    *size = static_cast<toff_t>(stream->size);
+    return 1;
+}
+
+void tiffMemoryUnmap(thandle_t, void*, toff_t) {
+}
+
+[[nodiscard]] TextureData loadTiffFromMemory(const uint8_t* data, size_t size) {
+    if (size > static_cast<size_t>(std::numeric_limits<toff_t>::max())) {
+        throw std::runtime_error("TIFF memory load failed: byte buffer is too large");
+    }
+    TiffMemoryStream stream{data, size, 0u};
+    TIFF* tiff = TIFFClientOpen(
+        "memory.tiff",
+        "r",
+        static_cast<thandle_t>(&stream),
+        tiffMemoryRead,
+        tiffMemoryWrite,
+        tiffMemorySeek,
+        tiffMemoryClose,
+        tiffMemorySize,
+        tiffMemoryMap,
+        tiffMemoryUnmap);
+    if (tiff == nullptr) {
+        throw std::runtime_error("TIFFClientOpen failed for memory buffer");
+    }
+    try {
+        TextureData result = decodeTiffToRgba8(tiff, "memory buffer");
+        TIFFClose(tiff);
+        return result;
+    } catch (...) {
+        TIFFClose(tiff);
+        throw;
+    }
+}
+
 [[nodiscard]] std::string lowerAscii(std::string_view value) {
     std::string out;
     out.reserve(value.size());
@@ -102,6 +370,14 @@ TextureData TextureLoader::loadRgba8(std::string_view path) {
     int height = 0;
     int channels = 0;
     const std::string filepath(path);
+
+    if (isExrFile(filepath)) {
+        return loadExrFromFile(filepath);
+    }
+
+    if (isTiffFile(filepath)) {
+        return loadTiffFromFile(filepath);
+    }
 
     if (stbi_is_hdr(filepath.c_str())) {
         float* loaded = stbi_loadf(filepath.c_str(), &width, &height, &channels, STBI_rgb_alpha);
@@ -166,6 +442,14 @@ TextureData TextureLoader::loadRgba8(const uint8_t* data, size_t size) {
     int channels = 0;
     const int byteCount = static_cast<int>(size);
 
+    if (isExrBuffer(data, size)) {
+        return loadExrFromMemory(data, size);
+    }
+
+    if (isTiffBuffer(data, size)) {
+        return loadTiffFromMemory(data, size);
+    }
+
     if (stbi_is_hdr_from_memory(data, byteCount)) {
         float* loaded = stbi_loadf_from_memory(data, byteCount, &width, &height, &channels, STBI_rgb_alpha);
         if (loaded == nullptr) {
@@ -228,6 +512,178 @@ namespace {
     return blocksWide * blocksHigh * blockBytes;
 }
 
+[[nodiscard]] uint32_t popcount32(uint32_t value) {
+    uint32_t count = 0;
+    while (value != 0u) {
+        count += value & 1u;
+        value >>= 1u;
+    }
+    return count;
+}
+
+[[nodiscard]] uint32_t legacyDdsCubemapFaceCount(uint32_t caps2) {
+    constexpr uint32_t ddsCaps2CubemapPositiveX = 0x00000400u;
+    constexpr uint32_t ddsCaps2CubemapNegativeX = 0x00000800u;
+    constexpr uint32_t ddsCaps2CubemapPositiveY = 0x00001000u;
+    constexpr uint32_t ddsCaps2CubemapNegativeY = 0x00002000u;
+    constexpr uint32_t ddsCaps2CubemapPositiveZ = 0x00004000u;
+    constexpr uint32_t ddsCaps2CubemapNegativeZ = 0x00008000u;
+    const uint32_t faceMask = caps2 & (
+        ddsCaps2CubemapPositiveX | ddsCaps2CubemapNegativeX |
+        ddsCaps2CubemapPositiveY | ddsCaps2CubemapNegativeY |
+        ddsCaps2CubemapPositiveZ | ddsCaps2CubemapNegativeZ);
+    const uint32_t faceCount = popcount32(faceMask);
+    return faceCount > 0u ? faceCount : 6u;
+}
+
+[[nodiscard]] uint32_t trailingZeroCount32(uint32_t value) {
+    if (value == 0u) {
+        return 32u;
+    }
+    uint32_t count = 0;
+    while ((value & 1u) == 0u) {
+        value >>= 1u;
+        ++count;
+    }
+    return count;
+}
+
+[[nodiscard]] uint8_t unpackMaskedChannel(uint32_t pixel, uint32_t mask, uint8_t fallback) {
+    if (mask == 0u) {
+        return fallback;
+    }
+    const uint32_t shift = trailingZeroCount32(mask);
+    const uint32_t bits = popcount32(mask);
+    if (bits == 0u) {
+        return fallback;
+    }
+    const uint32_t value = (pixel & mask) >> shift;
+    const uint32_t maxValue = (1u << bits) - 1u;
+    return static_cast<uint8_t>((value * 255u + maxValue / 2u) / maxValue);
+}
+
+struct DdsUncompressedLayout {
+    enum class Kind {
+        MaskedUnorm,
+        Rgba16Float,
+        Rgba32Float,
+    };
+
+    Kind kind = Kind::MaskedUnorm;
+    uint32_t bitsPerPixel = 0u;
+    uint32_t rMask = 0u;
+    uint32_t gMask = 0u;
+    uint32_t bMask = 0u;
+    uint32_t aMask = 0u;
+};
+
+void appendUncompressedDdsMip(
+    TextureData& tex,
+    const std::vector<uint8_t>& raw,
+    size_t srcOffset,
+    uint32_t width,
+    uint32_t height,
+    uint32_t bitsPerPixel,
+    uint32_t rMask,
+    uint32_t gMask,
+    uint32_t bMask,
+    uint32_t aMask) {
+    if (width == 0u || height == 0u || bitsPerPixel == 0u || (bitsPerPixel % 8u) != 0u || bitsPerPixel > 32u) {
+        throw std::runtime_error("DDS: unsupported uncompressed pixel layout");
+    }
+    const uint32_t bytesPerPixel = bitsPerPixel / 8u;
+    const uint64_t srcBytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * bytesPerPixel;
+    if (srcOffset > raw.size() || srcBytes > raw.size() - srcOffset) {
+        throw std::runtime_error("DDS: uncompressed mip payload exceeds file bounds");
+    }
+
+    const uint64_t dstOffset = static_cast<uint64_t>(tex.pixels.size());
+    const uint64_t dstBytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ull;
+    tex.pixels.resize(tex.pixels.size() + static_cast<size_t>(dstBytes));
+    uint8_t* dst = tex.pixels.data() + dstOffset;
+    const uint8_t* src = raw.data() + srcOffset;
+    for (uint64_t pixelIndex = 0; pixelIndex < static_cast<uint64_t>(width) * static_cast<uint64_t>(height); ++pixelIndex) {
+        uint32_t pixel = 0;
+        const uint8_t* pixelBytes = src + pixelIndex * bytesPerPixel;
+        for (uint32_t byte = 0; byte < bytesPerPixel; ++byte) {
+            pixel |= static_cast<uint32_t>(pixelBytes[byte]) << (8u * byte);
+        }
+        dst[pixelIndex * 4ull + 0ull] = unpackMaskedChannel(pixel, rMask, 0u);
+        dst[pixelIndex * 4ull + 1ull] = unpackMaskedChannel(pixel, gMask, 0u);
+        dst[pixelIndex * 4ull + 2ull] = unpackMaskedChannel(pixel, bMask, 0u);
+        dst[pixelIndex * 4ull + 3ull] = unpackMaskedChannel(pixel, aMask, 255u);
+    }
+    tex.mipData.push_back(TextureMipLevel{
+        .offset = dstOffset,
+        .size = dstBytes,
+        .width = std::max(width, 1u),
+        .height = std::max(height, 1u),
+    });
+}
+
+[[nodiscard]] float halfToFloat(uint16_t value) {
+    const uint32_t sign = (static_cast<uint32_t>(value & 0x8000u)) << 16u;
+    const uint32_t exponent = (value >> 10u) & 0x1fu;
+    uint32_t mantissa = value & 0x03ffu;
+    uint32_t bits = sign;
+    if (exponent == 0u) {
+        if (mantissa != 0u) {
+            int32_t normalizedExponent = -14;
+            while ((mantissa & 0x0400u) == 0u) {
+                mantissa <<= 1u;
+                --normalizedExponent;
+            }
+            mantissa &= 0x03ffu;
+            bits |= (static_cast<uint32_t>(normalizedExponent + 127) << 23u) | (mantissa << 13u);
+        }
+    } else if (exponent == 31u) {
+        bits |= 0x7f800000u | (mantissa << 13u);
+    } else {
+        bits |= ((exponent + 112u) << 23u) | (mantissa << 13u);
+    }
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+void appendFloatDdsMip(
+    TextureData& tex,
+    const std::vector<uint8_t>& raw,
+    size_t srcOffset,
+    uint32_t width,
+    uint32_t height,
+    DdsUncompressedLayout::Kind kind) {
+    const uint32_t bytesPerPixel = kind == DdsUncompressedLayout::Kind::Rgba16Float ? 8u : 16u;
+    const uint64_t srcBytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * bytesPerPixel;
+    if (srcOffset > raw.size() || srcBytes > raw.size() - srcOffset) {
+        throw std::runtime_error("DDS: float mip payload exceeds file bounds");
+    }
+
+    const uint64_t dstOffset = static_cast<uint64_t>(tex.pixels.size());
+    const uint64_t dstBytes = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ull * sizeof(float);
+    tex.pixels.resize(tex.pixels.size() + static_cast<size_t>(dstBytes));
+    auto* dst = reinterpret_cast<float*>(tex.pixels.data() + dstOffset);
+    const uint8_t* src = raw.data() + srcOffset;
+    for (uint64_t pixelIndex = 0; pixelIndex < static_cast<uint64_t>(width) * static_cast<uint64_t>(height); ++pixelIndex) {
+        if (kind == DdsUncompressedLayout::Kind::Rgba16Float) {
+            const uint8_t* pixel = src + pixelIndex * 8ull;
+            for (uint32_t channel = 0; channel < 4u; ++channel) {
+                const uint16_t half = static_cast<uint16_t>(pixel[channel * 2u]) |
+                                      (static_cast<uint16_t>(pixel[channel * 2u + 1u]) << 8u);
+                dst[pixelIndex * 4ull + channel] = halfToFloat(half);
+            }
+        } else {
+            std::memcpy(dst + pixelIndex * 4ull, src + pixelIndex * 16ull, 4u * sizeof(float));
+        }
+    }
+    tex.mipData.push_back(TextureMipLevel{
+        .offset = dstOffset,
+        .size = dstBytes,
+        .width = std::max(width, 1u),
+        .height = std::max(height, 1u),
+    });
+}
+
 [[nodiscard]] uint64_t readU64(const uint8_t* ptr, size_t offset) {
     return *reinterpret_cast<const uint64_t*>(ptr + offset);
 }
@@ -246,9 +702,11 @@ namespace {
     switch (vkFormat) {
     case VK_FORMAT_BC1_RGB_UNORM_BLOCK:  case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC2_UNORM_BLOCK:      case VK_FORMAT_BC2_SRGB_BLOCK:
     case VK_FORMAT_BC3_UNORM_BLOCK:      case VK_FORMAT_BC3_SRGB_BLOCK:
     case VK_FORMAT_BC4_UNORM_BLOCK:      case VK_FORMAT_BC4_SNORM_BLOCK:
     case VK_FORMAT_BC5_UNORM_BLOCK:      case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
     case VK_FORMAT_BC7_UNORM_BLOCK:      case VK_FORMAT_BC7_SRGB_BLOCK:
         return true;
     default:
@@ -398,76 +856,209 @@ void appendTextureMip(TextureData& tex, const uint8_t* src, uint64_t srcOffset, 
 
     const uint32_t height = readU32(raw.data(), 12);
     const uint32_t width = readU32(raw.data(), 16);
+    const uint32_t headerDepth = std::max(readU32(raw.data(), 24), 1u);
     const uint32_t mipCount = std::max(readU32(raw.data(), 28), 1u);
     const uint32_t pfFlags = readU32(raw.data(), 80);
     const uint32_t ddsFourCc = readU32(raw.data(), 84);
-    if ((pfFlags & 0x4u) == 0u) {
-        throw std::runtime_error("DDS: only FourCC block-compressed payloads are supported");
-    }
+    const uint32_t caps2 = readU32(raw.data(), 112);
 
     uint32_t dataOffset = 128u;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t blockBytes = 0;
-    switch (ddsFourCc) {
-    case fourCc('D', 'X', 'T', '1'):
-        format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-        blockBytes = 8u;
-        break;
-    case fourCc('D', 'X', 'T', '5'):
-        format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
-        blockBytes = 16u;
-        break;
-    case fourCc('A', 'T', 'I', '2'):
-    case fourCc('B', 'C', '5', 'U'):
-        format = VK_FORMAT_BC5_UNORM_BLOCK;
-        blockBytes = 16u;
-        break;
-    case fourCc('D', 'X', '1', '0'): {
-        if (raw.size() < 148u) {
-            throw std::runtime_error("DDS: truncated DX10 header");
+    DdsUncompressedLayout uncompressed{};
+    bool hasUncompressedLayout = false;
+    uint32_t sourceDepth = ((caps2 & 0x00200000u) != 0u) ? headerDepth : 1u;
+    bool sourceIsCubemap = (caps2 & 0x00000200u) != 0u;
+    uint32_t sourceFaceCount = sourceIsCubemap ? legacyDdsCubemapFaceCount(caps2) : 1u;
+    uint32_t sourceArrayLayers = sourceFaceCount;
+    if ((pfFlags & 0x4u) != 0u) {
+        switch (ddsFourCc) {
+        case fourCc('D', 'X', 'T', '1'):
+            format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+            blockBytes = 8u;
+            break;
+        case fourCc('D', 'X', 'T', '3'):
+            format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK;
+            blockBytes = 16u;
+            break;
+        case fourCc('D', 'X', 'T', '5'):
+            format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+            blockBytes = 16u;
+            break;
+        case fourCc('A', 'T', 'I', '1'):
+        case fourCc('B', 'C', '4', 'U'):
+            format = VK_FORMAT_BC4_UNORM_BLOCK;
+            blockBytes = 8u;
+            break;
+        case fourCc('B', 'C', '4', 'S'):
+            format = VK_FORMAT_BC4_SNORM_BLOCK;
+            blockBytes = 8u;
+            break;
+        case fourCc('A', 'T', 'I', '2'):
+        case fourCc('B', 'C', '5', 'U'):
+            format = VK_FORMAT_BC5_UNORM_BLOCK;
+            blockBytes = 16u;
+            break;
+        case fourCc('B', 'C', '5', 'S'):
+            format = VK_FORMAT_BC5_SNORM_BLOCK;
+            blockBytes = 16u;
+            break;
+        case fourCc('D', 'X', '1', '0'): {
+            if (raw.size() < 148u) {
+                throw std::runtime_error("DDS: truncated DX10 header");
+            }
+            const uint32_t dxgiFormat = readU32(raw.data(), 128);
+            const uint32_t resourceDimension = readU32(raw.data(), 132);
+            const uint32_t miscFlag = readU32(raw.data(), 136);
+            const uint32_t dx10ArraySize = std::max(readU32(raw.data(), 140), 1u);
+            dataOffset = 148u;
+            sourceIsCubemap = (miscFlag & 0x4u) != 0u;
+            sourceFaceCount = sourceIsCubemap ? 6u : 1u;
+            sourceArrayLayers = dx10ArraySize * sourceFaceCount;
+            sourceDepth = resourceDimension == 4u ? headerDepth : 1u;
+            switch (dxgiFormat) {
+            case 2u:
+                format = VK_FORMAT_R32G32B32A32_SFLOAT;
+                uncompressed = DdsUncompressedLayout{DdsUncompressedLayout::Kind::Rgba32Float, 128u, 0u, 0u, 0u, 0u};
+                hasUncompressedLayout = true;
+                break;
+            case 10u:
+                format = VK_FORMAT_R32G32B32A32_SFLOAT;
+                uncompressed = DdsUncompressedLayout{DdsUncompressedLayout::Kind::Rgba16Float, 64u, 0u, 0u, 0u, 0u};
+                hasUncompressedLayout = true;
+                break;
+            case 28u:
+                format = VK_FORMAT_R8G8B8A8_UNORM;
+                uncompressed = DdsUncompressedLayout{DdsUncompressedLayout::Kind::MaskedUnorm, 32u, 0x000000ffu, 0x0000ff00u, 0x00ff0000u, 0xff000000u};
+                hasUncompressedLayout = true;
+                break;
+            case 29u:
+                format = VK_FORMAT_R8G8B8A8_SRGB;
+                uncompressed = DdsUncompressedLayout{DdsUncompressedLayout::Kind::MaskedUnorm, 32u, 0x000000ffu, 0x0000ff00u, 0x00ff0000u, 0xff000000u};
+                hasUncompressedLayout = true;
+                break;
+            case 49u:
+                format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+                uncompressed = DdsUncompressedLayout{DdsUncompressedLayout::Kind::MaskedUnorm, 16u, 0x000000ffu, 0x0000ff00u, 0u, 0u};
+                hasUncompressedLayout = true;
+                break;
+            case 61u:
+                format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+                uncompressed = DdsUncompressedLayout{DdsUncompressedLayout::Kind::MaskedUnorm, 8u, 0x000000ffu, 0u, 0u, 0u};
+                hasUncompressedLayout = true;
+                break;
+            case 87u:
+                format = VK_FORMAT_R8G8B8A8_UNORM;
+                uncompressed = DdsUncompressedLayout{DdsUncompressedLayout::Kind::MaskedUnorm, 32u, 0x00ff0000u, 0x0000ff00u, 0x000000ffu, 0xff000000u};
+                hasUncompressedLayout = true;
+                break;
+            case 91u:
+                format = VK_FORMAT_R8G8B8A8_SRGB;
+                uncompressed = DdsUncompressedLayout{DdsUncompressedLayout::Kind::MaskedUnorm, 32u, 0x00ff0000u, 0x0000ff00u, 0x000000ffu, 0xff000000u};
+                hasUncompressedLayout = true;
+                break;
+            case 71u: format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; blockBytes = 8u; break;
+            case 72u: format = VK_FORMAT_BC1_RGBA_SRGB_BLOCK; blockBytes = 8u; break;
+            case 74u: format = VK_FORMAT_BC2_UNORM_BLOCK; blockBytes = 16u; break;
+            case 75u: format = VK_FORMAT_BC2_SRGB_BLOCK; blockBytes = 16u; break;
+            case 77u: format = VK_FORMAT_BC3_UNORM_BLOCK; blockBytes = 16u; break;
+            case 78u: format = VK_FORMAT_BC3_SRGB_BLOCK; blockBytes = 16u; break;
+            case 80u: format = VK_FORMAT_BC4_UNORM_BLOCK; blockBytes = 8u; break;
+            case 81u: format = VK_FORMAT_BC4_SNORM_BLOCK; blockBytes = 8u; break;
+            case 83u: format = VK_FORMAT_BC5_UNORM_BLOCK; blockBytes = 16u; break;
+            case 84u: format = VK_FORMAT_BC5_SNORM_BLOCK; blockBytes = 16u; break;
+            case 95u: format = VK_FORMAT_BC6H_UFLOAT_BLOCK; blockBytes = 16u; break;
+            case 96u: format = VK_FORMAT_BC6H_SFLOAT_BLOCK; blockBytes = 16u; break;
+            case 98u: format = VK_FORMAT_BC7_UNORM_BLOCK; blockBytes = 16u; break;
+            case 99u: format = VK_FORMAT_BC7_SRGB_BLOCK; blockBytes = 16u; break;
+            default: break;
+            }
+            break;
         }
-        const uint32_t dxgiFormat = readU32(raw.data(), 128);
-        dataOffset = 148u;
-        switch (dxgiFormat) {
-        case 71u: format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; blockBytes = 8u; break;
-        case 72u: format = VK_FORMAT_BC1_RGBA_SRGB_BLOCK; blockBytes = 8u; break;
-        case 77u: format = VK_FORMAT_BC3_UNORM_BLOCK; blockBytes = 16u; break;
-        case 78u: format = VK_FORMAT_BC3_SRGB_BLOCK; blockBytes = 16u; break;
-        case 83u: format = VK_FORMAT_BC5_UNORM_BLOCK; blockBytes = 16u; break;
-        case 98u: format = VK_FORMAT_BC7_UNORM_BLOCK; blockBytes = 16u; break;
-        case 99u: format = VK_FORMAT_BC7_SRGB_BLOCK; blockBytes = 16u; break;
-        default: break;
+        default:
+            break;
         }
-        break;
-    }
-    default:
-        break;
-    }
-    if (format == VK_FORMAT_UNDEFINED || blockBytes == 0u) {
-        throw std::runtime_error("DDS: unsupported FourCC block-compressed format");
+        if (format == VK_FORMAT_UNDEFINED || (blockBytes == 0u && !hasUncompressedLayout)) {
+            throw std::runtime_error("DDS: unsupported FourCC block-compressed format");
+        }
+    } else if ((pfFlags & 0x40u) != 0u) {
+        format = colorSpace == NativeTextureColorSpace::Srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+        uncompressed = DdsUncompressedLayout{
+            DdsUncompressedLayout::Kind::MaskedUnorm,
+            readU32(raw.data(), 88),
+            readU32(raw.data(), 92),
+            readU32(raw.data(), 96),
+            readU32(raw.data(), 100),
+            readU32(raw.data(), 104),
+        };
+        hasUncompressedLayout = true;
+    } else {
+        throw std::runtime_error("DDS: unsupported pixel format flags");
     }
 
     TextureData result;
     result.width = static_cast<int>(width);
     result.height = static_cast<int>(height);
+    result.depth = static_cast<int>(sourceDepth);
     result.mipLevels = static_cast<int>(mipCount);
-    result.isCompressed = true;
+    result.sourceArrayLayers = sourceArrayLayers;
+    result.sourceDepth = sourceDepth;
+    result.sourceFaceCount = sourceFaceCount;
+    result.sourceIsCubemap = sourceIsCubemap;
+    result.isCompressed = blockBytes != 0u;
     result.format = format;
-    result.compressedFormat = format;
+    result.compressedFormat = blockBytes != 0u ? format : VK_FORMAT_UNDEFINED;
+    result.linearColorSpace = format == VK_FORMAT_R32G32B32A32_SFLOAT;
     result.sourceContainerKind = "dds";
-    result.nativePayloadSource = "dds-preserved-native-payload";
-    result.sourceContainerPreserved = true;
+    result.nativePayloadSource = blockBytes != 0u ? "dds-preserved-native-payload" :
+        (result.linearColorSpace ? "dds-float-decoded-rgba32f" : "dds-uncompressed-decoded-rgba8");
+    result.sourceContainerPreserved = blockBytes != 0u;
+    result.sourceContainerTranscoded = blockBytes == 0u;
 
+    const uint64_t subresourceCount = static_cast<uint64_t>(std::max(sourceArrayLayers, 1u));
     size_t srcOffset = dataOffset;
-    for (uint32_t mip = 0; mip < mipCount; ++mip) {
-        const uint32_t mipWidth = mipExtent(width, mip);
-        const uint32_t mipHeight = mipExtent(height, mip);
-        const uint32_t mipBytes = blockCompressedMipBytes(mipWidth, mipHeight, blockBytes);
-        if (srcOffset > raw.size() || mipBytes > raw.size() - srcOffset) {
-            throw std::runtime_error("DDS: mip payload exceeds file bounds");
+    for (uint64_t subresource = 0; subresource < subresourceCount; ++subresource) {
+        const bool uploadableFirst2DSubresource = subresource == 0u;
+        for (uint32_t mip = 0; mip < mipCount; ++mip) {
+            const uint32_t mipWidth = mipExtent(width, mip);
+            const uint32_t mipHeight = mipExtent(height, mip);
+            const uint32_t mipDepth = mipExtent(sourceDepth, mip);
+            if (blockBytes != 0u) {
+                const uint32_t firstSliceBytes = blockCompressedMipBytes(mipWidth, mipHeight, blockBytes);
+                const uint64_t mipBytes = static_cast<uint64_t>(firstSliceBytes) * static_cast<uint64_t>(std::max(mipDepth, 1u));
+                if (srcOffset > raw.size() || mipBytes > raw.size() - srcOffset) {
+                    throw std::runtime_error("DDS: mip payload exceeds file bounds");
+                }
+                if (uploadableFirst2DSubresource) {
+                    appendTextureMip(result, raw.data(), srcOffset, firstSliceBytes, mipWidth, mipHeight, raw.size());
+                }
+                srcOffset += mipBytes;
+            } else {
+                const size_t sliceBytes = static_cast<size_t>(mipWidth) * static_cast<size_t>(mipHeight) * static_cast<size_t>(uncompressed.bitsPerPixel / 8u);
+                const size_t mipBytes = sliceBytes * static_cast<size_t>(std::max(mipDepth, 1u));
+                if (srcOffset > raw.size() || mipBytes > raw.size() - srcOffset) {
+                    throw std::runtime_error("DDS: mip payload exceeds file bounds");
+                }
+                if (uploadableFirst2DSubresource) {
+                    if (uncompressed.kind == DdsUncompressedLayout::Kind::MaskedUnorm) {
+                        appendUncompressedDdsMip(
+                            result,
+                            raw,
+                            srcOffset,
+                            mipWidth,
+                            mipHeight,
+                            uncompressed.bitsPerPixel,
+                            uncompressed.rMask,
+                            uncompressed.gMask,
+                            uncompressed.bMask,
+                            uncompressed.aMask);
+                    } else {
+                        appendFloatDdsMip(result, raw, srcOffset, mipWidth, mipHeight, uncompressed.kind);
+                    }
+                }
+                srcOffset += mipBytes;
+            }
         }
-        appendTextureMip(result, raw.data(), srcOffset, mipBytes, mipWidth, mipHeight, raw.size());
-        srcOffset += mipBytes;
     }
     result.mipLevels = std::max<int>(1, static_cast<int>(result.mipData.size()));
     return result;
@@ -727,12 +1318,32 @@ TextureData TextureLoader::load(const uint8_t* data, size_t size, const NativeTe
 
 VkFormat TextureLoader::compressedFormatFor(VkFormat baseFormat, bool srgb) {
     switch (baseFormat) {
-    case VK_FORMAT_BC7_UNORM_BLOCK:
-        return srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
-    case VK_FORMAT_BC5_UNORM_BLOCK:
-        return VK_FORMAT_BC5_UNORM_BLOCK;
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+        return srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+        return srgb ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK;
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+        return VK_FORMAT_BC2_SRGB_BLOCK;
     case VK_FORMAT_BC3_UNORM_BLOCK:
         return srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+        return VK_FORMAT_BC3_SRGB_BLOCK;
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK:
+        return baseFormat;
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+        return srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return VK_FORMAT_BC7_SRGB_BLOCK;
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+        return baseFormat;
     default:
         return srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     }

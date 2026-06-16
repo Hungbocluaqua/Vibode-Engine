@@ -42,5 +42,5 @@ void main() {
 
     float visibilityConfidence = visibility == RESTIR_VISIBILITY_VISIBLE ? 1.0 : 0.65;
     float confidence = clamp(reservoir.sample_value_confidence.a * visibilityConfidence, 0.0, 1.0);
-    imageStore(output_direct_light, coords, vec4(max(reservoir.sample_value_confidence.rgb, vec3(0.0)) * confidence, confidence));
+    imageStore(output_direct_light, coords, vec4(max(reservoir.sample_value_confidence.rgb, vec3(0.0)), confidence));
 }

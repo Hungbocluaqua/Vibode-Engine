@@ -9,6 +9,7 @@
 #include "rtv/NativeAssetRuntimeLoader.h"
 #include "rtv/NativeAssetStore.h"
 #include "rtv/NativeBinaryIO.h"
+#include "rtv/NativeGpuAssetCache.h"
 #include "rtv/NativeTextureFormatPolicy.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/Project.h"
@@ -18,7 +19,13 @@
 #include "rtv/RenderGraph.h"
 #include "rtv/RtpkgIO.h"
 #include "rtv/RuntimeSkeleton.h"
+#include "rtv/StreamingIoBackend.h"
+#include "rtv/StreamingGpuWorkQueue.h"
+#include "rtv/StreamingRuntime.h"
+#include "rtv/StreamingScheduler.h"
 #include "rtv/TextureLoader.h"
+#include "rtv/GpuSceneStreamingState.h"
+#include "rtv/IncrementalGpuSceneUpdateQueue.h"
 #include "rtv/GpuProfiler.h"
 #include "rtv/GpuUploadTicket.h"
 #include "rtv/MainThreadApplyTicket.h"
@@ -526,6 +533,38 @@ struct NativeTextureFormatPolicySimulationArgs {
     bool enabled = false;
 };
 
+struct StreamingSchedulerSimulationArgs {
+    bool enabled = false;
+    uint32_t taskCount = 32;
+    rtv::StreamingSchedulerBudget budget{};
+    uint32_t cancelAfterFrame = 0;
+};
+
+struct NativeGpuAssetCacheSimulationArgs {
+    bool enabled = false;
+    uint32_t assetCount = 48;
+    rtv::NativeGpuAssetCacheBudget budget{};
+};
+
+struct GpuSceneStreamingStateSimulationArgs {
+    bool enabled = false;
+    uint32_t instanceCount = 32;
+};
+
+struct IncrementalGpuSceneUpdateSimulationArgs {
+    bool enabled = false;
+    uint32_t instanceCount = 32;
+    uint32_t cancelAfterFrame = 0;
+    rtv::IncrementalGpuSceneApplyBudget budget{};
+};
+
+struct StreamingGpuWorkQueueSimulationArgs {
+    bool enabled = false;
+    uint32_t ticketCount = 36;
+    uint32_t completeLagFrames = 1;
+    rtv::StreamingGpuWorkBudget budget{};
+};
+
 bool parseGpuUploadTicketSimulationArg(std::string_view arg, int argc, char** argv, int& index, GpuUploadTicketSimulationArgs& args) {
     if (arg == "--simulate-gpu-upload-ticket") {
         args.enabled = true;
@@ -606,6 +645,162 @@ bool parseNativeTextureFormatPolicySimulationArg(std::string_view arg, int, char
     return false;
 }
 
+bool parseStreamingSchedulerSimulationArg(std::string_view arg, int argc, char** argv, int& index, StreamingSchedulerSimulationArgs& args) {
+    if (arg == "--simulate-streaming-scheduler") {
+        args.enabled = true;
+        return true;
+    }
+    if (arg == "--streaming-scheduler-task-count" && index + 1 < argc) {
+        args.taskCount = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--streaming-scheduler-max-tasks" && index + 1 < argc) {
+        args.budget.maxTasksPerFrame = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--streaming-scheduler-cpu-ms" && index + 1 < argc) {
+        args.budget.maxCpuMs = std::stod(argv[++index]);
+        return true;
+    }
+    if (arg == "--streaming-scheduler-io-mb" && index + 1 < argc) {
+        args.budget.maxIoBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--streaming-scheduler-upload-mb" && index + 1 < argc) {
+        args.budget.maxUploadBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--streaming-scheduler-memory-mb" && index + 1 < argc) {
+        args.budget.maxTransientMemoryBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--streaming-scheduler-cancel-after-frame" && index + 1 < argc) {
+        args.cancelAfterFrame = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    return false;
+}
+
+bool parseNativeGpuAssetCacheSimulationArg(std::string_view arg, int argc, char** argv, int& index, NativeGpuAssetCacheSimulationArgs& args) {
+    if (arg == "--simulate-native-gpu-cache") {
+        args.enabled = true;
+        return true;
+    }
+    if (arg == "--native-gpu-cache-assets" && index + 1 < argc) {
+        args.assetCount = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--native-gpu-cache-gpu-budget-mb" && index + 1 < argc) {
+        args.budget.maxGpuBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--native-gpu-cache-cpu-budget-mb" && index + 1 < argc) {
+        args.budget.maxCpuBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--native-gpu-cache-evict-selected") {
+        args.budget.allowSelectedEviction = true;
+        return true;
+    }
+    if (arg == "--native-gpu-cache-evict-pinned") {
+        args.budget.allowPinnedEviction = true;
+        return true;
+    }
+    return false;
+}
+
+bool parseGpuSceneStreamingStateSimulationArg(std::string_view arg, int argc, char** argv, int& index, GpuSceneStreamingStateSimulationArgs& args) {
+    if (arg == "--simulate-gpu-scene-streaming") {
+        args.enabled = true;
+        return true;
+    }
+    if (arg == "--gpu-scene-streaming-instances" && index + 1 < argc) {
+        args.instanceCount = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    return false;
+}
+
+bool parseIncrementalGpuSceneUpdateSimulationArg(std::string_view arg, int argc, char** argv, int& index, IncrementalGpuSceneUpdateSimulationArgs& args) {
+    if (arg == "--simulate-incremental-gpu-scene-update") {
+        args.enabled = true;
+        return true;
+    }
+    if (arg == "--incremental-gpu-scene-instances" && index + 1 < argc) {
+        args.instanceCount = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--incremental-gpu-scene-ms" && index + 1 < argc) {
+        args.budget.maxApplyMs = std::stod(argv[++index]);
+        return true;
+    }
+    if (arg == "--incremental-gpu-scene-operations" && index + 1 < argc) {
+        args.budget.maxOperations = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--incremental-gpu-scene-tlas-patches" && index + 1 < argc) {
+        args.budget.maxTlasPatches = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--incremental-gpu-scene-descriptor-patches" && index + 1 < argc) {
+        args.budget.maxDescriptorPatches = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--incremental-gpu-scene-reset-masks" && index + 1 < argc) {
+        args.budget.maxResetMasks = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--incremental-gpu-scene-cancel-after-frame" && index + 1 < argc) {
+        args.cancelAfterFrame = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    return false;
+}
+
+bool parseStreamingGpuWorkQueueSimulationArg(std::string_view arg, int argc, char** argv, int& index, StreamingGpuWorkQueueSimulationArgs& args) {
+    if (arg == "--simulate-streaming-gpu-work") {
+        args.enabled = true;
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-tickets" && index + 1 < argc) {
+        args.ticketCount = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-upload-mb" && index + 1 < argc) {
+        args.budget.maxUploadBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-staging-mb" && index + 1 < argc) {
+        args.budget.maxStagingBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-ms" && index + 1 < argc) {
+        args.budget.maxGpuMs = std::stod(argv[++index]);
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-submissions" && index + 1 < argc) {
+        args.budget.maxSubmissions = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-blas-builds" && index + 1 < argc) {
+        args.budget.maxBlasBuilds = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-tlas-patches" && index + 1 < argc) {
+        args.budget.maxTlasPatches = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-descriptor-updates" && index + 1 < argc) {
+        args.budget.maxDescriptorUpdates = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    if (arg == "--streaming-gpu-work-complete-lag-frames" && index + 1 < argc) {
+        args.completeLagFrames = static_cast<uint32_t>(std::stoul(argv[++index]));
+        return true;
+    }
+    return false;
+}
+
 bool parseNativePackageAnimationSelectionArg(
     std::string_view arg,
     int argc,
@@ -626,6 +821,79 @@ bool parseNativePackageAnimationSelectionArg(
     }
     if (arg == "--native-package-animation-entity-uuid" && index + 1 < argc) {
         selection.entityUuid = static_cast<uint64_t>(std::stoull(argv[++index]));
+        return true;
+    }
+    return false;
+}
+
+bool parseStreamingRuntimeArg(
+    std::string_view arg,
+    int argc,
+    char** argv,
+    int& index,
+    rtv::StreamingRuntimeOptions& options,
+    std::optional<std::filesystem::path>& dumpStreamingPath,
+    std::optional<std::filesystem::path>& streamingValidationScenePath) {
+    if (arg == "--streaming" && index + 1 < argc) {
+        options.enabled = rtv::parseStreamingOnOff(argv[++index]);
+        return true;
+    }
+    if ((arg == "--streaming-budget-preset" || arg == "--streaming-preset") && index + 1 < argc) {
+        const std::string_view preset(argv[++index]);
+        if (!rtv::applyStreamingBudgetPreset(preset, options)) {
+            throw std::runtime_error("Unknown streaming budget preset: " + std::string(preset));
+        }
+        return true;
+    }
+    if (arg == "--streaming-budget-mb" && index + 1 < argc) {
+        options.budgetPreset = "custom";
+        options.budgetBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--streaming-upload-mb-per-frame" && index + 1 < argc) {
+        options.budgetPreset = "custom";
+        options.uploadBytesPerFrame = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--streaming-cpu-memory-mb" && index + 1 < argc) {
+        options.budgetPreset = "custom";
+        options.cpuMemoryBudgetBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        options.cpuBatchBytes = std::max<uint64_t>(16ull * 1024ull * 1024ull, options.cpuMemoryBudgetBytes / 2ull);
+        return true;
+    }
+    if (arg == "--streaming-gpu-memory-mb" && index + 1 < argc) {
+        options.budgetPreset = "custom";
+        options.gpuMemoryBudgetBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
+        return true;
+    }
+    if (arg == "--streaming-io-backend" && index + 1 < argc) {
+        options.ioBackend = rtv::parseStreamingIoBackendKind(argv[++index]);
+        options.directStorageEnabled = options.ioBackend == rtv::StreamingIoBackendKind::DirectStorage;
+        return true;
+    }
+    if (arg == "--streaming-directstorage" && index + 1 < argc) {
+        options.directStorageEnabled = rtv::parseStreamingOnOff(argv[++index]);
+        if (options.directStorageEnabled) {
+            options.ioBackend = rtv::StreamingIoBackendKind::DirectStorage;
+        } else if (options.ioBackend == rtv::StreamingIoBackendKind::DirectStorage) {
+            options.ioBackend = rtv::StreamingIoBackendKind::Win32;
+        }
+        return true;
+    }
+    if (arg == "--streaming-force-cpu-decompress" && index + 1 < argc) {
+        options.forceCpuDecompress = rtv::parseStreamingOnOff(argv[++index]);
+        return true;
+    }
+    if (arg == "--streaming-disable-eviction") {
+        options.evictionEnabled = false;
+        return true;
+    }
+    if (arg == "--dump-streaming" && index + 1 < argc) {
+        dumpStreamingPath = std::filesystem::path(argv[++index]);
+        return true;
+    }
+    if (arg == "--streaming-validation-scene" && index + 1 < argc) {
+        streamingValidationScenePath = std::filesystem::path(argv[++index]);
         return true;
     }
     return false;
@@ -666,6 +934,8 @@ nlohmann::json nativeTextureFormatSupportJson(const rtv::NativeTextureFormatSupp
         {"bc7UnormSampled", support.bc7UnormSampled},
         {"bc5UnormSampled", support.bc5UnormSampled},
         {"bc4UnormSampled", support.bc4UnormSampled},
+        {"bc6hUfloatSampled", support.bc6hUfloatSampled},
+        {"bc6hSfloatSampled", support.bc6hSfloatSampled},
         {"rgba8SrgbSampled", support.rgba8SrgbSampled},
         {"rgba8UnormSampled", support.rgba8UnormSampled},
         {"rgba16fSampled", support.rgba16fSampled},
@@ -687,6 +957,8 @@ rtv::NativeTextureFormatSupport nativeTextureFormatSupportFromJson(const nlohman
     support.bc7UnormSampled = json.value("bc7UnormSampled", support.bc7UnormSampled);
     support.bc5UnormSampled = json.value("bc5UnormSampled", support.bc5UnormSampled);
     support.bc4UnormSampled = json.value("bc4UnormSampled", support.bc4UnormSampled);
+    support.bc6hUfloatSampled = json.value("bc6hUfloatSampled", support.bc6hUfloatSampled);
+    support.bc6hSfloatSampled = json.value("bc6hSfloatSampled", support.bc6hSfloatSampled);
     support.rgba8SrgbSampled = json.value("rgba8SrgbSampled", support.rgba8SrgbSampled);
     support.rgba8UnormSampled = json.value("rgba8UnormSampled", support.rgba8UnormSampled);
     support.rgba16fSampled = json.value("rgba16fSampled", support.rgba16fSampled);
@@ -764,6 +1036,7 @@ nlohmann::json nativeTextureFormatPolicyProfileJson(std::string_view name, const
         {rtv::NativeTextureRole::Occlusion, rtv::NativeTextureColorSpace::Linear},
         {rtv::NativeTextureRole::Opacity, rtv::NativeTextureColorSpace::Linear},
         {rtv::NativeTextureRole::Height, rtv::NativeTextureColorSpace::Linear},
+        {rtv::NativeTextureRole::Thickness, rtv::NativeTextureColorSpace::Linear},
         {rtv::NativeTextureRole::EnvironmentHdr, rtv::NativeTextureColorSpace::HdrLinear},
         {rtv::NativeTextureRole::Data, rtv::NativeTextureColorSpace::Linear},
         {rtv::NativeTextureRole::Unknown, rtv::NativeTextureColorSpace::Srgb},
@@ -1448,6 +1721,8 @@ rtv::NativeTextureColorSpace cookTextureColorSpaceForLoadedTexture(const rtv::Na
     switch (loaded.textureRole) {
     case rtv::NativeTextureRole::BaseColor:
     case rtv::NativeTextureRole::Emissive:
+    case rtv::NativeTextureRole::SpecularColor:
+    case rtv::NativeTextureRole::SheenColor:
         return rtv::NativeTextureColorSpace::Srgb;
     case rtv::NativeTextureRole::EnvironmentHdr:
         return rtv::NativeTextureColorSpace::HdrLinear;
@@ -1458,7 +1733,18 @@ rtv::NativeTextureColorSpace cookTextureColorSpaceForLoadedTexture(const rtv::Na
     case rtv::NativeTextureRole::Occlusion:
     case rtv::NativeTextureRole::Opacity:
     case rtv::NativeTextureRole::Height:
+    case rtv::NativeTextureRole::Thickness:
     case rtv::NativeTextureRole::Data:
+    case rtv::NativeTextureRole::Specular:
+    case rtv::NativeTextureRole::Transmission:
+    case rtv::NativeTextureRole::Clearcoat:
+    case rtv::NativeTextureRole::ClearcoatRoughness:
+    case rtv::NativeTextureRole::ClearcoatNormal:
+    case rtv::NativeTextureRole::Sheen:
+    case rtv::NativeTextureRole::SheenRoughness:
+    case rtv::NativeTextureRole::Iridescence:
+    case rtv::NativeTextureRole::IridescenceThickness:
+    case rtv::NativeTextureRole::Anisotropy:
         return rtv::NativeTextureColorSpace::Linear;
     case rtv::NativeTextureRole::Unknown:
     default:
@@ -1477,6 +1763,10 @@ rtv::TextureAsset cookTextureAssetFromData(
     texture.width = static_cast<uint32_t>(std::max(1, data.width));
     texture.height = static_cast<uint32_t>(std::max(1, data.height));
     texture.channels = 4;
+    texture.sourceArrayLayers = data.sourceArrayLayers;
+    texture.sourceDepth = data.sourceDepth;
+    texture.sourceFaceCount = data.sourceFaceCount;
+    texture.sourceIsCubemap = data.sourceIsCubemap;
     texture.mipLevels = std::max(1, data.mipLevels);
     texture.srgb = colorSpace == rtv::NativeTextureColorSpace::Srgb && !data.linearColorSpace;
     texture.linearColorSpace = colorSpace == rtv::NativeTextureColorSpace::HdrLinear || data.linearColorSpace;
@@ -2088,6 +2378,7 @@ int cookProjectCommand(
     const std::filesystem::path validationReportPath = outputDir / "asset_validation_report.json";
     const std::filesystem::path packagePath = outputDir / (cookPackageBaseName(project) + ".rtpkg");
     const std::filesystem::path packageInspectionPath = outputDir / (cookPackageBaseName(project) + ".rtpkg.inspection.json");
+    const std::filesystem::path packageValidationPath = outputDir / (cookPackageBaseName(project) + ".rtpkg.validation.json");
     std::string packageStatus = "pending";
     std::string packageError;
     size_t packageInputCount = 0;
@@ -2152,6 +2443,7 @@ int cookProjectCommand(
             {"package", {
                 {"path", relativePathString(packagePath, outputDir)},
                 {"inspection", relativePathString(packageInspectionPath, outputDir)},
+                {"validation", relativePathString(packageValidationPath, outputDir)},
                 {"status", packageStatus},
                 {"inputCount", packageInputCount},
                 {"bytes", packageBytes},
@@ -2189,6 +2481,7 @@ int cookProjectCommand(
         manifest["nativePackage"] = {
             {"path", relativePathString(packagePath, outputDir)},
             {"inspection", relativePathString(packageInspectionPath, outputDir)},
+            {"validation", relativePathString(packageValidationPath, outputDir)},
             {"status", packageStatus},
             {"inputCount", packageInputCount},
             {"bytes", packageBytes},
@@ -2316,15 +2609,24 @@ int cookProjectCommand(
                 rtv::RtpkgReader packageReader;
                 const rtv::RtpkgInspection packageInspection = packageReader.inspect(packagePath, true);
                 const nlohmann::json packageInspectionJson = rtv::rtpkgInspectionToJson(packageInspection, packagePath);
+                const nlohmann::json packageValidationJson = rtv::validateRtpkgInspectionToJson(packageInspection, packagePath);
                 std::string writeError;
                 if (!writeJsonFile(packageInspectionPath, packageInspectionJson, &writeError)) {
                     packageStatus = "failed_inspection_write";
                     packageError = writeError;
                     errors.push_back("Native package inspection report write failed: " + packageError);
+                } else if (!writeJsonFile(packageValidationPath, packageValidationJson, &writeError)) {
+                    packageStatus = "failed_validation_write";
+                    packageError = writeError;
+                    errors.push_back("Native package validation report write failed: " + packageError);
                 } else if (!packageInspection.native.ok) {
                     packageStatus = "failed_inspection";
                     packageError = packageInspection.native.errors.empty() ? std::string("Native package inspection failed.") : packageInspection.native.errors.front().message;
                     errors.push_back("Native package inspection failed: " + packageError);
+                } else if (!packageValidationJson.value("ok", false)) {
+                    packageStatus = "failed_validation";
+                    packageError = "Native package strict validation failed.";
+                    errors.push_back("Native package strict validation failed: " + relativePathString(packageValidationPath, outputDir));
                 } else {
                     packageStatus = "success";
                     packageError.clear();
@@ -2346,6 +2648,7 @@ int cookProjectCommand(
     if (packageStatus == "success") {
         std::cout << "Cook native package: " << packagePath.string() << " (" << packageInputCount << " assets)\n";
         std::cout << "Cook native package inspection: " << packageInspectionPath.string() << '\n';
+        std::cout << "Cook native package validation: " << packageValidationPath.string() << '\n';
     } else {
         std::cout << "Cook native package status: " << packageStatus << " " << packageError << '\n';
     }
@@ -2359,7 +2662,9 @@ int stageImportCommand(
     const std::filesystem::path& sourcePath,
     const std::filesystem::path& workspaceRoot,
     const std::filesystem::path& jsonOut,
-    const rtv::NativeTextureFormatSupport& textureFormatSupport) {
+    const rtv::NativeTextureFormatSupport& textureFormatSupport,
+    float emissiveScale = 1.0f,
+    bool buildBlasCache = true) {
     const std::filesystem::path root = workspaceRoot.empty()
         ? (std::filesystem::current_path() / "out" / "stage_import_workspace")
         : workspaceRoot;
@@ -2386,7 +2691,9 @@ int stageImportCommand(
     request.mode = "ImportAsset";
     request.settings.copySourceIntoProject = false;
     request.settings.buildCookedPayloadsNow = true;
+    request.settings.buildBlasCache = buildBlasCache;
     request.settings.generateThumbnails = false;
+    request.settings.emissiveScale = emissiveScale;
     const rtv::StagedAssetImportResult result = rtv::stagePlaceholderAssetImport(request, workspace);
 
     nlohmann::json records = nlohmann::json::array();
@@ -2600,6 +2907,7 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> dumpBindingsPath;
         std::optional<std::filesystem::path> crashDumpPackageDir;
         std::optional<std::filesystem::path> checkBudgetPath;
+        std::optional<std::filesystem::path> checkStreamingBudgetPath;
         std::optional<std::filesystem::path> descriptorLifetimeStressPath;
         std::optional<std::filesystem::path> nativePackageScenePath;
         rtv::NativePackageAnimationSelection nativePackageAnimationSelection;
@@ -2615,6 +2923,8 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> stageImportPath;
         std::filesystem::path stageImportWorkspaceRoot;
         std::filesystem::path stageImportJsonPath;
+        float stageImportEmissiveScale = 1.0f;
+        bool stageImportBuildBlasCache = true;
         std::optional<std::filesystem::path> inspectNativeAssetPath;
         std::optional<std::filesystem::path> inspectAnimationControllerPath;
         std::optional<std::filesystem::path> inspectRuntimeSkeletonPath;
@@ -2640,6 +2950,12 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> loadNativeRuntimeAssetsPath;
         std::optional<std::filesystem::path> writeRtpkgPath;
         std::optional<std::filesystem::path> inspectRtpkgPath;
+        std::optional<std::filesystem::path> validateRtpkgPath;
+        std::optional<std::filesystem::path> planRtpkgPatchBasePath;
+        std::optional<std::filesystem::path> planRtpkgPatchUpdatedPath;
+        std::optional<std::filesystem::path> simulateRtpkgCompressionPath;
+        std::optional<std::filesystem::path> simulateRtpkgStreamingIoPath;
+        std::string rtpkgCompressionProfile = "zstd";
         std::filesystem::path rtpkgRoot;
         std::vector<std::filesystem::path> rtpkgInputs;
         std::filesystem::path cookOutputDir;
@@ -2650,10 +2966,26 @@ int main(int argc, char** argv) {
         MainThreadApplySimulationArgs mainThreadApplySimulation;
         TopologyRebuildSimulationArgs topologyRebuildSimulation;
         NativeTextureFormatPolicySimulationArgs nativeTextureFormatPolicySimulation;
+        StreamingSchedulerSimulationArgs streamingSchedulerSimulation;
+        NativeGpuAssetCacheSimulationArgs nativeGpuAssetCacheSimulation;
+        GpuSceneStreamingStateSimulationArgs gpuSceneStreamingStateSimulation;
+        IncrementalGpuSceneUpdateSimulationArgs incrementalGpuSceneUpdateSimulation;
+        StreamingGpuWorkQueueSimulationArgs streamingGpuWorkQueueSimulation;
         uint32_t descriptorLifetimeStressCycles = 12;
         uint32_t descriptorLifetimeStressFrames = 2;
         bool validateGpuLabels = false;
         bool shaderHotReloadReport = false;
+        rtv::StreamingRuntimeOptions streamingOptions;
+        std::optional<std::filesystem::path> dumpStreamingPath;
+        std::optional<std::filesystem::path> streamingValidationScenePath;
+        std::optional<std::filesystem::path> validateNativeCatalogPath;
+        std::filesystem::path streamingCatalogRoot;
+        std::filesystem::path streamingCatalogJsonPath;
+        std::optional<std::filesystem::path> simulateStreamingIoPath;
+        bool simulateStreamingIoBatch = false;
+        uint32_t streamingIoBatchRequests = 16;
+        uint64_t streamingIoBatchChunkBytes = 256ull * 1024ull;
+        std::filesystem::path streamingIoJsonPath;
         std::optional<std::string> cameraName;
         std::optional<uint32_t> frameIndex;
         std::vector<std::string> disabledPasses;
@@ -2680,8 +3012,41 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
 
+            if (arg == "--check-streaming-budget" && i + 1 < argc) {
+                checkStreamingBudgetPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--simulate-rtpkg-compression" && i + 1 < argc) {
+                simulateRtpkgCompressionPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--simulate-rtpkg-streaming-io" && i + 1 < argc) {
+                simulateRtpkgStreamingIoPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--validate-rtpkg" && i + 1 < argc) {
+                validateRtpkgPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--plan-rtpkg-patch" && i + 2 < argc) {
+                planRtpkgPatchBasePath = std::filesystem::path(argv[++i]);
+                planRtpkgPatchUpdatedPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--rtpkg-compression-profile" && i + 1 < argc) {
+                rtpkgCompressionProfile = argv[++i];
+                continue;
+            }
             if (arg == "--mutate-animation-controller" && i + 1 < argc) {
                 mutateAnimationControllerPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--stage-import-emissive-scale" && i + 1 < argc) {
+                stageImportEmissiveScale = std::strtof(argv[++i], nullptr);
+                continue;
+            }
+            if (arg == "--stage-import-no-blas-cache") {
+                stageImportBuildBlasCache = false;
                 continue;
             }
             if (arg == "--controller-mutation-json" && i + 1 < argc) {
@@ -2720,6 +3085,39 @@ int main(int argc, char** argv) {
                 }
                 continue;
             }
+            if (arg == "--validate-native-catalog" && i + 1 < argc) {
+                validateNativeCatalogPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--streaming-catalog-root" && i + 1 < argc) {
+                streamingCatalogRoot = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--streaming-catalog-json" && i + 1 < argc) {
+                streamingCatalogJsonPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--simulate-streaming-io" && i + 1 < argc) {
+                simulateStreamingIoPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
+            if (arg == "--simulate-streaming-io-batch" && i + 1 < argc) {
+                simulateStreamingIoPath = std::filesystem::path(argv[++i]);
+                simulateStreamingIoBatch = true;
+                continue;
+            }
+            if (arg == "--streaming-io-batch-requests" && i + 1 < argc) {
+                streamingIoBatchRequests = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--streaming-io-batch-chunk-kb" && i + 1 < argc) {
+                streamingIoBatchChunkBytes = static_cast<uint64_t>(std::stoull(argv[++i])) * 1024ull;
+                continue;
+            }
+            if (arg == "--streaming-io-json" && i + 1 < argc) {
+                streamingIoJsonPath = std::filesystem::path(argv[++i]);
+                continue;
+            }
 
             if (parseGpuUploadTicketSimulationArg(arg, argc, argv, i, gpuUploadSimulation)) {
                 continue;
@@ -2733,7 +3131,25 @@ int main(int argc, char** argv) {
             if (parseNativeTextureFormatPolicySimulationArg(arg, argc, argv, i, nativeTextureFormatPolicySimulation)) {
                 continue;
             }
+            if (parseStreamingSchedulerSimulationArg(arg, argc, argv, i, streamingSchedulerSimulation)) {
+                continue;
+            }
+            if (parseNativeGpuAssetCacheSimulationArg(arg, argc, argv, i, nativeGpuAssetCacheSimulation)) {
+                continue;
+            }
+            if (parseGpuSceneStreamingStateSimulationArg(arg, argc, argv, i, gpuSceneStreamingStateSimulation)) {
+                continue;
+            }
+            if (parseIncrementalGpuSceneUpdateSimulationArg(arg, argc, argv, i, incrementalGpuSceneUpdateSimulation)) {
+                continue;
+            }
+            if (parseStreamingGpuWorkQueueSimulationArg(arg, argc, argv, i, streamingGpuWorkQueueSimulation)) {
+                continue;
+            }
             if (parseNativePackageAnimationSelectionArg(arg, argc, argv, i, nativePackageAnimationSelection)) {
+                continue;
+            }
+            if (parseStreamingRuntimeArg(arg, argc, argv, i, streamingOptions, dumpStreamingPath, streamingValidationScenePath)) {
                 continue;
             }
             if ((arg == "--reflex" || arg == "--streamline-reflex") && i + 1 < argc) {
@@ -3103,6 +3519,58 @@ int main(int argc, char** argv) {
         if (nativeTextureFormatPolicySimulation.enabled) {
             return simulateNativeTextureFormatPolicyCommand(inspectionJsonPath.value_or(std::filesystem::path{}));
         }
+        if (streamingSchedulerSimulation.enabled) {
+            return rtv::simulateStreamingSchedulerCommand(
+                streamingSchedulerSimulation.taskCount,
+                streamingSchedulerSimulation.budget,
+                streamingSchedulerSimulation.cancelAfterFrame,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (nativeGpuAssetCacheSimulation.enabled) {
+            return rtv::simulateNativeGpuAssetCacheCommand(
+                nativeGpuAssetCacheSimulation.assetCount,
+                nativeGpuAssetCacheSimulation.budget,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (gpuSceneStreamingStateSimulation.enabled) {
+            return rtv::simulateGpuSceneStreamingStateCommand(
+                gpuSceneStreamingStateSimulation.instanceCount,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (incrementalGpuSceneUpdateSimulation.enabled) {
+            return rtv::simulateIncrementalGpuSceneUpdateQueueCommand(
+                incrementalGpuSceneUpdateSimulation.instanceCount,
+                incrementalGpuSceneUpdateSimulation.budget,
+                incrementalGpuSceneUpdateSimulation.cancelAfterFrame,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (streamingGpuWorkQueueSimulation.enabled) {
+            return rtv::simulateStreamingGpuWorkQueueCommand(
+                streamingGpuWorkQueueSimulation.ticketCount,
+                streamingGpuWorkQueueSimulation.budget,
+                streamingGpuWorkQueueSimulation.completeLagFrames,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (validateNativeCatalogPath.has_value()) {
+            return rtv::validateNativeAssetCatalogCommand(
+                *validateNativeCatalogPath,
+                streamingCatalogRoot,
+                streamingCatalogJsonPath.empty() ? inspectionJsonPath.value_or(std::filesystem::path{}) : streamingCatalogJsonPath);
+        }
+        if (simulateStreamingIoPath.has_value()) {
+            if (simulateStreamingIoBatch) {
+                return rtv::simulateStreamingIoBatchCommand(
+                    *simulateStreamingIoPath,
+                    streamingOptions,
+                    streamingIoBatchRequests,
+                    streamingIoBatchChunkBytes,
+                    streamingIoJsonPath.empty() ? inspectionJsonPath.value_or(std::filesystem::path{}) : streamingIoJsonPath);
+            }
+            return rtv::simulateStreamingIoBackendCommand(
+                *simulateStreamingIoPath,
+                streamingOptions,
+                streamingIoJsonPath.empty() ? inspectionJsonPath.value_or(std::filesystem::path{}) : streamingIoJsonPath);
+        }
         if (emitBasisuKtx2FixturePath.has_value()) {
             return emitBasisuKtx2FixtureCommand(*emitBasisuKtx2FixturePath, inspectionJsonPath.value_or(std::filesystem::path{}));
         }
@@ -3125,7 +3593,7 @@ int main(int argc, char** argv) {
                 controllerForceOverwrite);
         }
         if (stageImportPath.has_value()) {
-            return stageImportCommand(*stageImportPath, stageImportWorkspaceRoot, stageImportJsonPath, nativeTextureFormatSupport);
+            return stageImportCommand(*stageImportPath, stageImportWorkspaceRoot, stageImportJsonPath, nativeTextureFormatSupport, stageImportEmissiveScale, stageImportBuildBlasCache);
         }
         if (emitNativeFixturePath.has_value()) {
             return rtv::emitNativeAssetFixtureCommand(*emitNativeFixturePath, emitNativeFixtureKind, emitNativeFixtureGuid, emitNativeFixtureTextureFormat, emitNativeFixtureMaterialTextureGuid, emitNativeFixtureTextureRole);
@@ -3164,6 +3632,30 @@ int main(int argc, char** argv) {
         if (inspectRtpkgPath.has_value()) {
             return rtv::inspectRtpkgCommand(*inspectRtpkgPath, inspectionJsonPath.value_or(std::filesystem::path{}));
         }
+        if (validateRtpkgPath.has_value()) {
+            return rtv::validateRtpkgCommand(*validateRtpkgPath, inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (planRtpkgPatchBasePath.has_value() || planRtpkgPatchUpdatedPath.has_value()) {
+            if (!planRtpkgPatchBasePath.has_value() || !planRtpkgPatchUpdatedPath.has_value()) {
+                throw std::runtime_error("--plan-rtpkg-patch requires base.rtpkg and updated.rtpkg");
+            }
+            return rtv::planRtpkgPatchCommand(
+                *planRtpkgPatchBasePath,
+                *planRtpkgPatchUpdatedPath,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (simulateRtpkgCompressionPath.has_value()) {
+            return rtv::simulateRtpkgCompressionCommand(
+                *simulateRtpkgCompressionPath,
+                rtpkgCompressionProfile,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
+        if (simulateRtpkgStreamingIoPath.has_value()) {
+            return rtv::simulateRtpkgStreamingIoCommand(
+                *simulateRtpkgStreamingIoPath,
+                streamingOptions,
+                inspectionJsonPath.value_or(std::filesystem::path{}));
+        }
 
         for (const std::string& viewName : sequenceViewNames) {
             diagConfig.sequenceViews.push_back(rtv::parseRendererDebugView(viewName));
@@ -3171,6 +3663,9 @@ int main(int argc, char** argv) {
 
         if (diagConfig.headless && maxFrames == 0) {
             maxFrames = diagConfig.totalFrames;
+        }
+        if (streamingValidationScenePath.has_value() && !scenePath.has_value() && !gltfPath.has_value() && !nativePackageScenePath.has_value()) {
+            scenePath = *streamingValidationScenePath;
         }
         if (maxFrames != 0) {
             diagConfig.totalFrames = maxFrames;
@@ -3193,6 +3688,7 @@ int main(int argc, char** argv) {
             dumpMemoryPath.has_value() ||
             dumpFrameTimelinePath.has_value() ||
             checkBudgetPath.has_value() ||
+            checkStreamingBudgetPath.has_value() ||
             crashDumpPackageDir.has_value() ||
             wavefrontValidationMode;
         const bool needsRenderGraph =
@@ -3280,7 +3776,8 @@ int main(int argc, char** argv) {
             diagConfig.headless,
             diagConfig.disableAsyncCompute,
             diagConfig.singleQueueFallback,
-            diagConfig.disableResourceAliasing);
+            diagConfig.disableResourceAliasing,
+            streamingOptions);
 
         if (auto* renderer = app.pathTracer()) {
             renderer->setRayTracingDiagnosticCountersEnabled(diagConfig.profile);
@@ -3645,7 +4142,7 @@ int main(int argc, char** argv) {
             dumpMemoryPath.has_value() || dumpFrameTimelinePath.has_value() ||
             dumpResourceLifetimesPath.has_value() || dumpBindingsPath.has_value() ||
             dumpShaderReportPath.has_value() || crashDumpPackageDir.has_value() ||
-            baselineMode || validateGpuLabels || checkBudgetPath.has_value()) {
+            baselineMode || validateGpuLabels || checkBudgetPath.has_value() || checkStreamingBudgetPath.has_value()) {
             diag.run(app);
 
             if (diagConfig.profileJsonPath.has_value()) {
@@ -3691,11 +4188,30 @@ int main(int argc, char** argv) {
         if (dumpBindingsPath.has_value()) {
             rtv::writeBindingsReport(*dumpBindingsPath, diagConfig.dumpRenderGraphPath);
         }
+        std::optional<nlohmann::json> streamingBudgetReport;
+        if (dumpStreamingPath.has_value() || checkStreamingBudgetPath.has_value()) {
+            std::string writeError;
+            nlohmann::json report = app.streamingRuntimeReport();
+            report["diagnostic_source"] = diagnosticSourcePath.generic_string();
+            report["streaming_validation_scene"] = streamingValidationScenePath.has_value()
+                ? streamingValidationScenePath->generic_string()
+                : std::string{};
+            streamingBudgetReport = report;
+            if (dumpStreamingPath.has_value() && !writeJsonFile(*dumpStreamingPath, report, &writeError)) {
+                std::cerr << "Could not write streaming JSON: " << writeError << '\n';
+                finalExitCode = std::max(finalExitCode, 1);
+            }
+        }
         if (validateGpuLabels) {
             finalExitCode = std::max(finalExitCode, rtv::validateGpuLabels(diagConfig.dumpRenderGraphPath));
         }
         if (checkBudgetPath.has_value()) {
             finalExitCode = std::max(finalExitCode, rtv::checkBudget(*checkBudgetPath, diag.profileReport()));
+        }
+        if (checkStreamingBudgetPath.has_value()) {
+            finalExitCode = std::max(
+                finalExitCode,
+                rtv::checkStreamingBudget(*checkStreamingBudgetPath, diag.profileReport(), *streamingBudgetReport));
         }
         if (baselineMode) {
             const rtv::BaselinePaths paths = rtv::baselinePathsFor(diagnosticSourcePath, baselineRoot);

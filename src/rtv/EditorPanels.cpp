@@ -37,8 +37,8 @@ void debugViewTooltip(RendererDebugView view) {
 
 } // namespace
 
-const std::array<RendererDebugView, 96>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 96> views = {
+const std::array<RendererDebugView, 100>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 100> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -71,6 +71,10 @@ const std::array<RendererDebugView, 96>& editorDebugViews() {
         RendererDebugView::DirectSampleType,
         RendererDebugView::CausticVisibility,
         RendererDebugView::Albedo,
+        RendererDebugView::Metallic,
+        RendererDebugView::MaterialAlpha,
+        RendererDebugView::MaterialTransmission,
+        RendererDebugView::MaterialWorkflow,
         RendererDebugView::MaterialOcclusion,
         RendererDebugView::PathDataAlbedo,
         RendererDebugView::PathDataMetrics,

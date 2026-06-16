@@ -55,6 +55,10 @@ struct AssetImportSettings {
     bool buildCookedPayloadsNow = true;
     bool generateThumbnails = true;
     float unitScale = 1.0f;
+    // Optional source-package emissive scaling applied to imported material emissive factors.
+    // 1.0 leaves emissive untouched. Used to normalize over-bright authored emissive from
+    // some source packages without editing the source asset.
+    float emissiveScale = 1.0f;
     std::string coordinateConversion = "None";
     std::string materialImportMode = "ImportMaterials";
     std::string textureImportMode = "ImportTextures";

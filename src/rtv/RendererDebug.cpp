@@ -100,6 +100,10 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "rejection" || key == "denoiserrejection") { return RendererDebugView::DenoiserRejection; }
     if (key == "depth") { return RendererDebugView::Depth; }
     if (key == "roughness") { return RendererDebugView::Roughness; }
+    if (key == "metallic" || key == "metalness" || key == "metal") { return RendererDebugView::Metallic; }
+    if (key == "alpha" || key == "materialalpha" || key == "materialopacity") { return RendererDebugView::MaterialAlpha; }
+    if (key == "transmission" || key == "materialtransmission" || key == "transmissionfactor") { return RendererDebugView::MaterialTransmission; }
+    if (key == "materialworkflow" || key == "workflow" || key == "materialtype" || key == "mattype") { return RendererDebugView::MaterialWorkflow; }
     if (key == "direct" || key == "directlighting") { return RendererDebugView::DirectLighting; }
     if (key == "indirect" || key == "indirectlighting") { return RendererDebugView::IndirectLighting; }
     if (key == "emissive" || key == "emissivecontribution") { return RendererDebugView::EmissiveContribution; }
@@ -399,6 +403,10 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::DenoiserDiffuseRawVariance: return "denoiser-diffuse-raw-variance";
     case RendererDebugView::DenoiserSpecularRawVariance: return "denoiser-specular-raw-variance";
     case RendererDebugView::MaterialOcclusion: return "material-occlusion";
+    case RendererDebugView::Metallic: return "metallic";
+    case RendererDebugView::MaterialAlpha: return "material-alpha";
+    case RendererDebugView::MaterialTransmission: return "material-transmission";
+    case RendererDebugView::MaterialWorkflow: return "material-workflow";
     }
     return "beauty";
 }

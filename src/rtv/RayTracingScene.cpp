@@ -190,6 +190,7 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
     const GpuScene& scene,
     const std::vector<MeshOpacityMicromapBuild>& opacityMicromapBuilds,
     const OpacityMicromapBuildStats& opacityMicromapStats,
+    const std::vector<uint8_t>* activeMeshMask,
     std::vector<uint32_t>& geometryTriangleOffsets,
     std::vector<MeshGeometryRangeGpu>& meshGeometryRanges,
     RayTracingBlasGeometryStats& stats) {
@@ -203,6 +204,11 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
         const RayTracingMeshBuildInput& mesh = rtMeshes[meshBuildIndex];
         MeshBlasGeometryPlan plan;
         plan.meshBuildIndex = meshBuildIndex;
+        if (activeMeshMask != nullptr &&
+            (meshBuildIndex >= activeMeshMask->size() || (*activeMeshMask)[meshBuildIndex] == 0u)) {
+            plans[meshBuildIndex] = std::move(plan);
+            continue;
+        }
         const bool meshHasOmm = opacityMicromapStats.active &&
             meshBuildIndex < opacityMicromapBuilds.size() &&
             opacityMicromapBuilds[meshBuildIndex].enabled &&
@@ -309,6 +315,7 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
     ResourceAllocator& allocator,
     const GpuScene& scene,
     RayTracingSceneBuildOptions options,
+    const std::vector<uint8_t>* activeMeshMask,
     OpacityMicromapBuildStats& stats) {
     stats = {};
     stats.requested = options.opacityMicromapsEnabled;
@@ -340,6 +347,10 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
     const auto& rtMeshes = scene.rayTracingMeshes();
     std::vector<MeshOpacityMicromapBuild> builds(rtMeshes.size());
     for (uint32_t meshBuildIndex = 0; meshBuildIndex < rtMeshes.size(); ++meshBuildIndex) {
+        if (activeMeshMask != nullptr &&
+            (meshBuildIndex >= activeMeshMask->size() || (*activeMeshMask)[meshBuildIndex] == 0u)) {
+            continue;
+        }
         const RayTracingMeshBuildInput& mesh = rtMeshes[meshBuildIndex];
         const uint32_t primitiveCount = mesh.indexCount / 3u;
         if (!mesh.containsAlphaTestedGeometry || primitiveCount == 0) {
@@ -495,14 +506,36 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
     return builds;
 }
 
-uint32_t countValidRtInstances(const GpuScene& scene, size_t blasCount) {
-    uint32_t count = 0;
-    for (const RayTracingInstanceBuildInput& instance : scene.rayTracingInstances()) {
-        if (instance.meshIndex < blasCount) {
-            ++count;
+uint8_t rayTracingInstanceMask(const RayTracingInstanceBuildInput& instance) {
+    uint8_t mask = 0u;
+    const uint32_t flags = instance.flags == 0u
+        ? (instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow)
+        : instance.flags;
+    if (instance.visible && (flags & instanceFlagVisible) != 0u) {
+        if ((flags & instanceFlagVisibleToCamera) != 0u) {
+            mask |= rayMaskCamera;
+        }
+        if ((flags & instanceFlagCastShadow) != 0u) {
+            mask |= rayMaskShadow;
         }
     }
-    return count;
+    return mask;
+}
+
+std::vector<uint8_t> collectActiveRtMeshes(
+    const GpuScene& scene,
+    size_t meshCount,
+    uint32_t& activeInstanceCount) {
+    std::vector<uint8_t> activeMeshes(meshCount, 0u);
+    activeInstanceCount = 0u;
+    for (const RayTracingInstanceBuildInput& instance : scene.rayTracingInstances()) {
+        if (instance.meshIndex >= meshCount || rayTracingInstanceMask(instance) == 0u) {
+            continue;
+        }
+        activeMeshes[instance.meshIndex] = 1u;
+        ++activeInstanceCount;
+    }
+    return activeMeshes;
 }
 
 void accelerationBuildBarrier(VkCommandBuffer cmd) {
@@ -550,21 +583,14 @@ std::vector<VkAccelerationStructureInstanceKHR> buildVkInstances(
             continue;
         }
 
+        const uint8_t mask = rayTracingInstanceMask(instance);
+        if (mask == 0u) {
+            continue;
+        }
+
         VkAccelerationStructureInstanceKHR vkInstance{};
         vkInstance.transform = toVkTransform(instance.transform);
         vkInstance.instanceCustomIndex = instance.instanceIndex;
-        uint8_t mask = 0u;
-        const uint32_t flags = instance.flags == 0u
-            ? (instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow)
-            : instance.flags;
-        if (instance.visible && (flags & instanceFlagVisible) != 0u) {
-            if ((flags & instanceFlagVisibleToCamera) != 0u) {
-                mask |= rayMaskCamera;
-            }
-            if ((flags & instanceFlagCastShadow) != 0u) {
-                mask |= rayMaskShadow;
-            }
-        }
         vkInstance.mask = mask;
         vkInstance.instanceShaderBindingTableRecordOffset = 0;
         vkInstance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
@@ -577,19 +603,7 @@ std::vector<VkAccelerationStructureInstanceKHR> buildVkInstances(
 VkAccelerationStructureMotionInstanceNV makeVkMotionInstance(
     const RayTracingInstanceBuildInput& instance,
     const AccelerationStructure& blas) {
-    uint8_t mask = 0u;
-    const uint32_t flags = instance.flags == 0u
-        ? (instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow)
-        : instance.flags;
-    if (instance.visible && (flags & instanceFlagVisible) != 0u) {
-        if ((flags & instanceFlagVisibleToCamera) != 0u) {
-            mask |= rayMaskCamera;
-        }
-        if ((flags & instanceFlagCastShadow) != 0u) {
-            mask |= rayMaskShadow;
-        }
-    }
-
+    const uint8_t mask = rayTracingInstanceMask(instance);
     VkAccelerationStructureMotionInstanceNV vkInstance{};
     vkInstance.type = VK_ACCELERATION_STRUCTURE_MOTION_INSTANCE_TYPE_MATRIX_MOTION_NV;
     vkInstance.flags = 0;
@@ -641,6 +655,9 @@ std::vector<VkAccelerationStructureMotionInstanceNV> buildVkMotionInstances(
     instances.reserve(scene.rayTracingInstances().size());
     for (const RayTracingInstanceBuildInput& instance : scene.rayTracingInstances()) {
         if (instance.meshIndex >= blases.size() || blases[instance.meshIndex].handle() == VK_NULL_HANDLE) {
+            continue;
+        }
+        if (rayTracingInstanceMask(instance) == 0u) {
             continue;
         }
         instances.push_back(makeVkMotionInstance(instance, blases[instance.meshIndex]));
@@ -719,11 +736,19 @@ void RayTracingScene::build(
     motionBlurActive_ = options.motionBlurEnabled && context.supportsRayTracingMotionBlur();
     motionInstanceStats_ = {};
 
+    const auto& rtMeshes = scene.rayTracingMeshes();
+    uint32_t plannedInstanceCount = 0u;
+    const std::vector<uint8_t> activeMeshMask = collectActiveRtMeshes(scene, rtMeshes.size(), plannedInstanceCount);
+    if (plannedInstanceCount == 0u) {
+        throw std::runtime_error("Cannot build ray tracing TLAS: no valid instances");
+    }
+
     std::vector<MeshOpacityMicromapBuild> opacityMicromapBuilds = prepareOpacityMicromapBuilds(
         context,
         allocator,
         scene,
         options,
+        &activeMeshMask,
         opacityMicromapStats_);
     if (opacityMicromapStats_.active) {
         opacityMicromapDevice_ = device;
@@ -756,13 +781,13 @@ void RayTracingScene::build(
         }
     }
 
-    const auto& rtMeshes = scene.rayTracingMeshes();
     std::vector<uint32_t> geometryTriangleOffsets;
     std::vector<MeshGeometryRangeGpu> meshGeometryRanges;
     std::vector<MeshBlasGeometryPlan> blasGeometryPlans = buildBlasGeometryPlans(
         scene,
         opacityMicromapBuilds,
         opacityMicromapStats_,
+        &activeMeshMask,
         geometryTriangleOffsets,
         meshGeometryRanges,
         blasGeometryStats_);
@@ -896,11 +921,6 @@ void RayTracingScene::build(
 
     if (blasBuildSizes.empty()) {
         throw std::runtime_error("Cannot build ray tracing scene: no valid BLAS inputs");
-    }
-
-    uint32_t plannedInstanceCount = countValidRtInstances(scene, blases_.size());
-    if (plannedInstanceCount == 0) {
-        throw std::runtime_error("Cannot build ray tracing TLAS: no valid instances");
     }
 
     VkAccelerationStructureGeometryInstancesDataKHR tlasInstancesDataForSizing{};
@@ -1178,6 +1198,7 @@ bool RayTracingScene::recordDynamicBlasUpdates(
         scene,
         noOpacityMicromapBuilds,
         noOpacityMicromapStats,
+        nullptr,
         geometryTriangleOffsets,
         meshGeometryRanges,
         ignoredStats);

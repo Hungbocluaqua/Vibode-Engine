@@ -77,5 +77,7 @@ enum class BvhBuildQuality {
 
 [[nodiscard]] std::vector<glm::vec4> packBvhNodesForGpu(const std::vector<PackedBvhNode>& nodes);
 [[nodiscard]] std::vector<glm::vec4> packTrianglesForGpu(const BvhBuildResult& bvh);
+void appendBvhNodesForGpu(const std::vector<PackedBvhNode>& nodes, std::vector<glm::vec4>& packed);
+void appendTrianglesForGpu(const BvhBuildResult& bvh, std::vector<glm::vec4>& packed);
 
 } // namespace rtv

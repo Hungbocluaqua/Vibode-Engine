@@ -27,7 +27,16 @@ PipelineCache::PipelineCache(VkDevice device, const std::filesystem::path& cache
         std::cout << "Loaded pipeline cache from " << cachePath.string()
                   << " (" << initialData.size() << " bytes)\n";
     }
-    checkVk(vkCreatePipelineCache(device_, &createInfo, nullptr, &cache_), "vkCreatePipelineCache");
+    VkResult result = vkCreatePipelineCache(device_, &createInfo, nullptr, &cache_);
+    if (result != VK_SUCCESS && !initialData.empty()) {
+        std::cerr << "Pipeline cache rejected by driver from " << cachePath.string()
+                  << " with VkResult " << result
+                  << "; retrying with an empty cache\n";
+        createInfo.initialDataSize = 0;
+        createInfo.pInitialData = nullptr;
+        result = vkCreatePipelineCache(device_, &createInfo, nullptr, &cache_);
+    }
+    checkVk(result, "vkCreatePipelineCache");
 }
 
 PipelineCache::~PipelineCache() {

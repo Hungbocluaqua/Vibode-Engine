@@ -24,6 +24,7 @@ struct PathDataRecord {
     vec4 denoiser_hit_distance;
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
 };
 
 layout(set = 0, binding = 0, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
@@ -63,6 +64,8 @@ layout(set = 0, binding = 14, std140) uniform PrevCamera {
 } prev_camera;
 layout(set = 0, binding = 15, std430) readonly buffer InputDepthNormal { uvec4 input_depth_normal[]; };
 layout(set = 0, binding = 16, std430) readonly buffer WorldPosition { uvec2 world_position[]; };
+layout(set = 0, binding = 18, std430) readonly buffer EntityIdBuffer { uint entity_id_buffer[]; };
+layout(set = 0, binding = 19, std430) readonly buffer StreamingResetInstanceMasks { uint streaming_reset_instance_masks[]; };
 
 float luminance(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
@@ -199,6 +202,11 @@ void main() {
     }
 
     uint pixel_index = uint(coords.y) * uint(dims.x) + uint(coords.x);
+    uint instance_id = entity_id_buffer[pixel_index];
+    bool streaming_temporal_reset =
+        instance_id != 0xffffffffu &&
+        instance_id < streaming_reset_instance_masks.length() &&
+        (streaming_reset_instance_masks[instance_id] & 1u) != 0u;
     vec4 center_dn = decode_depth_normal(shared_dn_tile[moment_shared_index(ivec2(gl_LocalInvocationID.xy) + ivec2(MOMENT_TILE_RADIUS))]);
     float center_depth = center_dn.r;
     vec3 center_normal = center_dn.gba;
@@ -209,7 +217,7 @@ void main() {
     float cur_id_lum = luminance(max(path.indirect_diffuse.rgb, vec3(0.0)));
     float cur_is_lum = luminance(max(path.indirect_specular.rgb, vec3(0.0)));
 
-    bool reset = moment_params.reset_history != 0u;
+    bool reset = moment_params.reset_history != 0u || streaming_temporal_reset;
     bool sky = !is_surface_depth(center_depth);
 
     vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], TEMPORAL_VELOCITY_PACK_SCALE);

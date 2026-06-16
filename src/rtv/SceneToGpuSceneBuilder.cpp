@@ -362,8 +362,17 @@ void applyRendererMaterialBindings(
 
     const size_t count = std::min(result.sceneAsset.nodes.size(), entities.size());
     std::vector<uint8_t> classifiedNodes(result.sceneAsset.nodes.size(), 0u);
-    const std::vector<glm::mat4> nodeWorldTransforms = sceneNodeWorldTransforms(result.sceneAsset);
-    const std::vector<glm::mat4> previousNodeWorldTransforms = sceneNodeWorldTransforms(result.sceneAsset, true);
+    std::vector<glm::mat4> nodeWorldTransforms;
+    std::vector<glm::mat4> previousNodeWorldTransforms;
+    bool worldTransformsComputed = false;
+    auto ensureWorldTransforms = [&]() {
+        if (worldTransformsComputed) {
+            return;
+        }
+        nodeWorldTransforms = sceneNodeWorldTransforms(result.sceneAsset);
+        previousNodeWorldTransforms = sceneNodeWorldTransforms(result.sceneAsset, true);
+        worldTransformsComputed = true;
+    };
     for (size_t nodeIndex = 0; nodeIndex < count; ++nodeIndex) {
         const Entity* entity = entities[nodeIndex];
         if (entity == nullptr || !entity->meshRenderer.has_value()) {
@@ -387,6 +396,7 @@ void applyRendererMaterialBindings(
             static_cast<size_t>(skinIndex) < result.sceneAsset.skins.size() &&
             hasActiveSkinningPayload(*sourceMesh);
         if (needsSkinRuntimeMesh) {
+            ensureWorldTransforms();
             result.gpuSkinningPlan.push_back(recordGpuSkinningPlan(
                 result.animatedGeometry,
                 *sourceMesh,
@@ -449,6 +459,7 @@ void applyRendererMaterialBindings(
             applyMorphTargetWeights(runtimeMesh, morphWeights);
         }
         if (needsSkinRuntimeMesh) {
+            ensureWorldTransforms();
             applySkinningPayload(
                 runtimeMesh,
                 result.sceneAsset.skins[static_cast<size_t>(skinIndex)],
@@ -481,6 +492,7 @@ void applyRendererMaterialBindings(
             static_cast<size_t>(node.skinIndex) < result.sceneAsset.skins.size() &&
             hasActiveSkinningPayload(*sourceMesh);
         if (needsSkinRuntimeMesh) {
+            ensureWorldTransforms();
             result.gpuSkinningPlan.push_back(recordGpuSkinningPlan(
                 result.animatedGeometry,
                 *sourceMesh,

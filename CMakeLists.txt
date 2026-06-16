@@ -15,6 +15,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(imguizmo CONFIG REQUIRED)
 find_package(unofficial-spirv-reflect CONFIG REQUIRED)
 find_package(Ktx CONFIG REQUIRED)
+find_package(TIFF REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
 option(RTV_ENABLE_TINYOBJ_IMPORTER "Enable OBJ/MTL runtime importer through tinyobjloader when available" OFF)
@@ -64,6 +65,10 @@ set(STREAMLINE_SDK_DIR "" CACHE PATH "Path to NVIDIA Streamline SDK/release dire
 if(STREAMLINE_SDK_DIR STREQUAL "" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Streamline/include/sl.h")
     set(STREAMLINE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Streamline" CACHE PATH "Path to NVIDIA Streamline SDK/release directory" FORCE)
 endif()
+set(DIRECTSTORAGE_SDK_DIR "" CACHE PATH "Path to Microsoft DirectStorage SDK package root")
+if(DIRECTSTORAGE_SDK_DIR STREQUAL "" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectStorage/Microsoft.Direct3D.DirectStorage.1.4.0-preview1-2603.504/native/include/dstorage.h")
+    set(DIRECTSTORAGE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectStorage/Microsoft.Direct3D.DirectStorage.1.4.0-preview1-2603.504" CACHE PATH "Path to Microsoft DirectStorage SDK package root" FORCE)
+endif()
 
 if(NOT DEFINED ENV{VULKAN_SDK})
     message(FATAL_ERROR "VULKAN_SDK is not set. Install the Vulkan SDK and open a new terminal.")
@@ -99,6 +104,8 @@ add_executable(rtvulkan
     "${IMGUI_SOURCE_DIR}/imgui_widgets.cpp"
     "${IMGUI_SOURCE_DIR}/backends/imgui_impl_glfw.cpp"
     src/third_party/imgui/imgui_impl_vulkan.cpp
+    src/third_party/tinyexr/tinyexr_impl.cpp
+    third_party/tinyexr/deps/miniz/miniz.c
     src/main.cpp
     src/rtv/AnimationClip.cpp
     src/rtv/AnimationController.cpp
@@ -146,6 +153,8 @@ add_executable(rtvulkan
     src/rtv/GpuDiagnosticsPanel.cpp
     src/rtv/GpuProfiler.cpp
     src/rtv/GpuScene.cpp
+    src/rtv/GpuSceneStreamingState.cpp
+    src/rtv/IncrementalGpuSceneUpdateQueue.cpp
     src/rtv/GpuUploadTicket.cpp
     src/rtv/GpuValidation.cpp
     src/rtv/GraphicsPipeline.cpp
@@ -162,6 +171,7 @@ add_executable(rtvulkan
     src/rtv/NativeAssetMigration.cpp
     src/rtv/NativeAssetRuntimeLoader.cpp
     src/rtv/NativeAssetStore.cpp
+    src/rtv/NativeGpuAssetCache.cpp
     src/rtv/NativeBinaryIO.cpp
     src/rtv/NativeAssetCooker.cpp
     src/rtv/NativeTextureFormatPolicy.cpp
@@ -204,6 +214,10 @@ add_executable(rtvulkan
     src/rtv/ShaderModule.cpp
     src/rtv/ShaderReflection.cpp
     src/rtv/StreamlineRuntime.cpp
+    src/rtv/StreamingGpuWorkQueue.cpp
+    src/rtv/StreamingIoBackend.cpp
+    src/rtv/StreamingRuntime.cpp
+    src/rtv/StreamingScheduler.cpp
     src/rtv/Swapchain.cpp
     src/rtv/TextureLoader.cpp
     src/rtv/TemporalSystem.cpp
@@ -218,6 +232,9 @@ add_executable(rtvulkan
 )
 
 target_include_directories(rtvulkan PRIVATE include ${Stb_INCLUDE_DIR} ${TINYGLTF_INCLUDE_DIRS} "${IMGUI_SOURCE_DIR}" "${IMGUI_SOURCE_DIR}/backends")
+target_include_directories(rtvulkan PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyexr"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyexr/deps/miniz")
 if(RTV_TINYOBJ_IMPORTER_AVAILABLE)
     target_include_directories(rtvulkan PRIVATE ${TINYOBJLOADER_INCLUDE_DIRS})
 endif()
@@ -265,11 +282,39 @@ target_link_libraries(rtvulkan PRIVATE
     imguizmo::imguizmo
     unofficial::spirv-reflect
     KTX::ktx
+    TIFF::TIFF
 )
 
 if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
     target_compile_definitions(rtvulkan PRIVATE RTV_HAS_RENDERDOC=1)
     target_include_directories(rtvulkan PRIVATE "${RENDERDOC_SDK_DIR}")
+endif()
+
+if(WIN32 AND EXISTS "${DIRECTSTORAGE_SDK_DIR}/native/include/dstorage.h")
+    set(RTV_DIRECTSTORAGE_ARCH "x64")
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(RTV_DIRECTSTORAGE_ARCH "x86")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64")
+        set(RTV_DIRECTSTORAGE_ARCH "ARM64")
+    endif()
+    set(RTV_DIRECTSTORAGE_LIB "${DIRECTSTORAGE_SDK_DIR}/native/lib/${RTV_DIRECTSTORAGE_ARCH}/dstorage.lib")
+    set(RTV_DIRECTSTORAGE_BIN_DIR "${DIRECTSTORAGE_SDK_DIR}/native/bin/${RTV_DIRECTSTORAGE_ARCH}")
+    if(EXISTS "${RTV_DIRECTSTORAGE_LIB}" AND EXISTS "${RTV_DIRECTSTORAGE_BIN_DIR}/dstorage.dll" AND EXISTS "${RTV_DIRECTSTORAGE_BIN_DIR}/dstoragecore.dll")
+        target_compile_definitions(rtvulkan PRIVATE
+            RTV_WITH_DIRECTSTORAGE=1
+            "RTV_DIRECTSTORAGE_SDK_DIR=\"${DIRECTSTORAGE_SDK_DIR}\"")
+        target_include_directories(rtvulkan PRIVATE "${DIRECTSTORAGE_SDK_DIR}/native/include")
+        target_link_libraries(rtvulkan PRIVATE "${RTV_DIRECTSTORAGE_LIB}")
+        foreach(RTV_DIRECTSTORAGE_RUNTIME_NAME IN ITEMS dstorage.dll dstoragecore.dll)
+            add_custom_command(TARGET rtvulkan POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${RTV_DIRECTSTORAGE_BIN_DIR}/${RTV_DIRECTSTORAGE_RUNTIME_NAME}"
+                    "$<TARGET_FILE_DIR:rtvulkan>/${RTV_DIRECTSTORAGE_RUNTIME_NAME}")
+        endforeach()
+        message(STATUS "DirectStorage SDK enabled: ${DIRECTSTORAGE_SDK_DIR} (${RTV_DIRECTSTORAGE_ARCH})")
+    else()
+        message(WARNING "DirectStorage SDK headers found but ${RTV_DIRECTSTORAGE_ARCH} lib/runtime files are missing under ${DIRECTSTORAGE_SDK_DIR}")
+    endif()
 endif()
 
 if(EXISTS "${NRD_SDK_DIR}/Include/NRD.h" OR EXISTS "${NRD_SDK_DIR}/Include/NRDDescs.h" OR EXISTS "${NRD_SDK_DIR}/Include/NRDIntegration.hpp")
@@ -449,8 +494,20 @@ if(WIN32)
     target_link_libraries(rtvulkan PRIVATE Comdlg32 User32 Shell32 Dwmapi)
 endif()
 
+add_executable(rtv_bvh_benchmark
+    tools/bvh_benchmark.cpp
+    src/rtv/BvhBuilder.cpp
+    src/rtv/BvhCollapse.cpp
+    src/rtv/MortonCodes.cpp
+    src/rtv/SahBuilder.cpp
+)
+target_include_directories(rtv_bvh_benchmark PRIVATE include)
+target_link_libraries(rtv_bvh_benchmark PRIVATE glm::glm)
+
 if(MSVC)
-    target_compile_options(rtvulkan PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(rtvulkan PRIVATE /W4 /permissive- /EHsc /bigobj)
+    target_compile_options(rtv_bvh_benchmark PRIVATE /W4 /permissive- /EHsc)
 else()
     target_compile_options(rtvulkan PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(rtv_bvh_benchmark PRIVATE -Wall -Wextra -Wpedantic)
 endif()

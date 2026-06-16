@@ -58,7 +58,7 @@ struct RendererSettings {
     bool autoExposureEnabled = false;
     float targetLuminance = 0.18f;
     float minExposure = 0.25f;
-    float maxExposure = 8.0f;
+    float maxExposure = 64.0f;
     float adaptationSpeed = 2.0f;
     float histogramMinLogLuminance = -10.0f;
     float histogramMaxLogLuminance = 10.0f;

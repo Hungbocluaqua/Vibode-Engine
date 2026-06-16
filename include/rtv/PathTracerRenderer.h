@@ -176,6 +176,37 @@ public:
         bool skinnedMotionVectorsDescriptorBound = false;
     };
 
+    struct StreamingResetMaskReport {
+        uint64_t generation = 0;
+        uint64_t lastFrame = 0;
+        uint32_t pendingTemporalEntityCount = 0;
+        uint32_t pendingRestirEntityCount = 0;
+        uint32_t pendingDenoiserEntityCount = 0;
+        uint32_t totalTemporalEntityCount = 0;
+        uint32_t totalRestirEntityCount = 0;
+        uint32_t totalDenoiserEntityCount = 0;
+        uint64_t denoiserHistoryInvalidationGeneration = 0;
+        bool denoiserHistoryInvalidated = false;
+        uint32_t gpuRecordCount = 0;
+        uint32_t gpuRecordCapacity = 0;
+        uint64_t gpuBufferBytes = 0;
+        bool gpuBufferAllocated = false;
+        uint32_t gpuInstanceMaskCount = 0;
+        uint32_t gpuInstanceMaskCapacity = 0;
+        uint64_t gpuInstanceMaskBufferBytes = 0;
+        bool gpuInstanceMaskBufferAllocated = false;
+        std::vector<uint64_t> temporalEntityUuids;
+        std::vector<uint64_t> restirEntityUuids;
+        std::vector<uint32_t> temporalInstanceIndices;
+        std::vector<uint32_t> restirInstanceIndices;
+    };
+
+    struct alignas(16) StreamingResetMaskGpuRecord {
+        uint64_t entityUuid = 0;
+        uint32_t flags = 0;
+        uint32_t generation = 0;
+    };
+
     PathTracerRenderer(
         const VulkanContext& context,
         ResourceAllocator& allocator,
@@ -220,6 +251,11 @@ public:
         float nearPlane,
         float farPlane);
     void resetAccumulation(AccumulationResetReason reason = AccumulationResetReason::Manual);
+    void applyStreamingResetMasks(
+        const std::vector<uint64_t>& temporalEntityUuids,
+        const std::vector<uint64_t>& restirEntityUuids,
+        const std::vector<uint32_t>& temporalInstanceIndices = {},
+        const std::vector<uint32_t>& restirInstanceIndices = {});
     void loadEnvironment(const std::filesystem::path& path);
     [[nodiscard]] bool shadersNeedReload();
     bool updateMaterials(const SceneAsset& scene, const AssetManager& assets);
@@ -235,6 +271,7 @@ public:
     [[nodiscard]] bool pickPending() const;
 
     [[nodiscard]] const RendererSettings& settings() const { return settings_; }
+    [[nodiscard]] const StreamingResetMaskReport& streamingResetMaskReport() const { return streamingResetMaskReport_; }
     [[nodiscard]] const GpuSkinningResourcePlan& gpuSkinningResourcePlan() const { return gpuSkinningResourcePlan_; }
     void updateGpuSkinningOutputReadbackValidation();
     [[nodiscard]] const OpacityMicromapDeviceInfo& opacityMicromapInfo() const;
@@ -540,7 +577,7 @@ private:
         uint32_t pixelCount = 0;
         float targetLuminance = 0.18f;
         float minExposure = 0.25f;
-        float maxExposure = 8.0f;
+        float maxExposure = 64.0f;
         float adaptationSpeed = 2.0f;
         float lowPercentile = 0.05f;
         float highPercentile = 0.95f;
@@ -643,6 +680,7 @@ private:
         glm::vec4 denoiserHitDistance{};
         glm::vec4 diffuseRayDirectionHitDistance{};
         glm::vec4 specularRayDirectionHitDistance{};
+        glm::vec4 emissiveResidual{};
     };
 
     struct alignas(16) WavefrontQueueHeaderGpu {
@@ -1107,6 +1145,8 @@ private:
     Buffer velocityBuffer_;
     Buffer entityIdBuffer_;
     Buffer pathDataBuffer_;
+    Buffer streamingResetMaskBuffer_;
+    Buffer streamingResetInstanceMaskBuffer_;
     Buffer rayTracingDiagnosticCountersBuffer_;
     Buffer rayTracingDiagnosticCountersReadbackBuffer_;
     Buffer gpuSkinningSourceVertexBuffer_;
@@ -1277,6 +1317,7 @@ private:
     std::vector<std::filesystem::path> shaderSources_;
     std::filesystem::path shaderOutputDirectory_;
     uint32_t selectedInstanceId_ = UINT32_MAX;
+    StreamingResetMaskReport streamingResetMaskReport_{};
     std::unique_ptr<NrdRuntime> nrdRuntime_;
     bool nrdAvailable_ = false;
     bool nrdCreationFailed_ = false;
