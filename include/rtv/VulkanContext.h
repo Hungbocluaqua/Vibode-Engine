@@ -19,7 +19,9 @@ struct QueueFamilyIndices {
     std::optional<uint32_t> graphics;
     std::optional<uint32_t> present;
     std::optional<uint32_t> compute;
+    std::optional<uint32_t> transfer;
     uint32_t computeQueueIndex = 0;
+    uint32_t transferQueueIndex = 0;
 
     [[nodiscard]] bool complete() const {
         return graphics.has_value() && present.has_value();
@@ -29,6 +31,11 @@ struct QueueFamilyIndices {
     }
     [[nodiscard]] bool hasAsyncCompute() const {
         return compute.has_value();
+    }
+    [[nodiscard]] bool hasDedicatedTransfer() const {
+        return transfer.has_value() &&
+            transfer.value() != graphics.value_or(UINT32_MAX) &&
+            transfer.value() != compute.value_or(UINT32_MAX);
     }
 };
 
@@ -95,7 +102,9 @@ public:
     [[nodiscard]] VkQueue graphicsQueue() const { return graphicsQueue_; }
     [[nodiscard]] VkQueue presentQueue() const { return presentQueue_; }
     [[nodiscard]] VkQueue computeQueue() const { return computeQueue_; }
+    [[nodiscard]] VkQueue transferQueue() const { return transferQueue_; }
     [[nodiscard]] bool hasIndependentComputeQueue() const { return computeQueue_ != VK_NULL_HANDLE && computeQueue_ != graphicsQueue_; }
+    [[nodiscard]] bool hasIndependentTransferQueue() const { return transferQueue_ != VK_NULL_HANDLE && transferQueue_ != graphicsQueue_; }
     [[nodiscard]] bool hasAsyncComputeQueue() const { return queueFamilies_.hasDedicatedCompute(); }
     [[nodiscard]] bool canAsyncCompute() const { return queueFamilies_.hasAsyncCompute(); }
     [[nodiscard]] const QueueFamilyIndices& queueFamilies() const { return queueFamilies_; }
@@ -161,6 +170,7 @@ private:
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
     VkQueue computeQueue_ = VK_NULL_HANDLE;
+    VkQueue transferQueue_ = VK_NULL_HANDLE;
     VkSemaphore timelineSemaphore_ = VK_NULL_HANDLE;
     bool timelineSemaphoreSupported_ = false;
     bool samplerAnisotropy_ = false;

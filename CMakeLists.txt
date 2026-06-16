@@ -214,10 +214,12 @@ add_executable(rtvulkan
     src/rtv/ShaderModule.cpp
     src/rtv/ShaderReflection.cpp
     src/rtv/StreamlineRuntime.cpp
+    src/rtv/StreamingGpuTransferExecutor.cpp
     src/rtv/StreamingGpuWorkQueue.cpp
     src/rtv/StreamingIoBackend.cpp
     src/rtv/StreamingRuntime.cpp
     src/rtv/StreamingScheduler.cpp
+    src/rtv/StreamingStagingRing.cpp
     src/rtv/Swapchain.cpp
     src/rtv/TextureLoader.cpp
     src/rtv/TemporalSystem.cpp

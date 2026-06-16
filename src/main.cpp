@@ -21,6 +21,7 @@
 #include "rtv/RuntimeSkeleton.h"
 #include "rtv/StreamingIoBackend.h"
 #include "rtv/StreamingGpuWorkQueue.h"
+#include "rtv/StreamingGpuTransferExecutor.h"
 #include "rtv/StreamingRuntime.h"
 #include "rtv/StreamingScheduler.h"
 #include "rtv/TextureLoader.h"
@@ -2975,6 +2976,7 @@ int main(int argc, char** argv) {
         uint32_t descriptorLifetimeStressFrames = 2;
         bool validateGpuLabels = false;
         bool shaderHotReloadReport = false;
+        bool selfTestStreamingTransfer = false;
         rtv::StreamingRuntimeOptions streamingOptions;
         std::optional<std::filesystem::path> dumpStreamingPath;
         std::optional<std::filesystem::path> streamingValidationScenePath;
@@ -3464,6 +3466,13 @@ int main(int argc, char** argv) {
                 cameraName = std::string(argv[++i]);
             } else if (arg == "--frame-index" && i + 1 < argc) {
                 frameIndex = static_cast<uint32_t>(std::stoul(argv[++i]));
+            }
+        }
+
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--selftest-streaming-transfer") {
+                selfTestStreamingTransfer = true;
+                break;
             }
         }
 
@@ -4114,6 +4123,37 @@ int main(int argc, char** argv) {
                 });
         }
 #endif
+
+        if (selfTestStreamingTransfer) {
+            const rtv::VulkanContext* context = app.vulkanContext();
+            rtv::ResourceAllocator* allocator = app.resourceAllocator();
+            if (context == nullptr || allocator == nullptr) {
+                std::cerr << "--selftest-streaming-transfer requires an initialized device\n";
+                return 1;
+            }
+            rtv::StreamingGpuTransferExecutor executor;
+            if (!executor.initialize(*context, *allocator, 8ull * 1024ull * 1024ull)) {
+                std::cerr << "--selftest-streaming-transfer: executor initialization failed\n";
+                return 1;
+            }
+            std::string selfTestError;
+            const bool ok = executor.runSelfTest(selfTestError);
+            nlohmann::json report;
+            report["self_test"] = "streaming_gpu_transfer_executor";
+            report["passed"] = ok;
+            if (!ok) {
+                report["error"] = selfTestError;
+            }
+            report["stats"] = rtv::streamingGpuTransferExecutorStatsJson(executor.stats());
+            executor.shutdown();
+            const std::string serialized = report.dump(2);
+            if (inspectionJsonPath.has_value()) {
+                std::ofstream out(*inspectionJsonPath);
+                out << serialized << '\n';
+            }
+            std::cout << serialized << '\n';
+            return ok ? 0 : 1;
+        }
 
         if (diagConfig.headless) {
             app.runHeadless(diagConfig.warmupFrames, maxFrames);

@@ -364,6 +364,9 @@ void VulkanContext::createDevice() {
     if (queueFamilies_.compute.has_value()) {
         requireQueue(queueFamilies_.compute.value(), queueFamilies_.computeQueueIndex);
     }
+    if (queueFamilies_.transfer.has_value()) {
+        requireQueue(queueFamilies_.transfer.value(), queueFamilies_.transferQueueIndex);
+    }
     if (streamlineVulkanRequirements_.initialized) {
         if (streamlineVulkanRequirements_.graphicsQueuesRequired > 0u) {
             queueCountForFamily = availableQueuesForFamily(queueFamilies_.graphics.value());
@@ -609,6 +612,9 @@ void VulkanContext::createDevice() {
     if (queueFamilies_.compute.has_value()) {
         vkGetDeviceQueue(device_, queueFamilies_.compute.value(), queueFamilies_.computeQueueIndex, &computeQueue_);
     }
+    if (queueFamilies_.transfer.has_value()) {
+        vkGetDeviceQueue(device_, queueFamilies_.transfer.value(), queueFamilies_.transferQueueIndex, &transferQueue_);
+    }
     if (timelineSemaphoreSupported_) {
         VkSemaphoreTypeCreateInfo timelineCreateInfo{};
         timelineCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
@@ -697,9 +703,13 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice physicalDev
     std::optional<uint32_t> dedicatedCompute;
     std::optional<uint32_t> sameFamilyCompute;
     uint32_t sameFamilyComputeQueueIndex = 0;
+    std::optional<uint32_t> dedicatedTransfer;
+    std::optional<uint32_t> transferOnlyCompute;
     for (uint32_t i = 0; i < queueFamilyCount; ++i) {
         const bool hasGraphics = (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
         const bool hasCompute = (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+        const bool hasTransfer = (families[i].queueFlags &
+            (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0;
 
         if (hasGraphics && !indices.graphics.has_value()) {
             indices.graphics = i;
@@ -710,6 +720,14 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice physicalDev
         if (hasGraphics && hasCompute && families[i].queueCount > 1 && !sameFamilyCompute.has_value()) {
             sameFamilyCompute = i;
             sameFamilyComputeQueueIndex = 1;
+        }
+        // Prefer a true DMA transfer family: TRANSFER capable but neither graphics nor compute.
+        if (hasTransfer && !hasGraphics && !hasCompute && !dedicatedTransfer.has_value()) {
+            dedicatedTransfer = i;
+        }
+        // Next preference: a transfer-capable compute-only family (still off the graphics queue).
+        if (hasTransfer && !hasGraphics && hasCompute && !transferOnlyCompute.has_value()) {
+            transferOnlyCompute = i;
         }
 
         if (!headless_ && surface_ != VK_NULL_HANDLE) {
@@ -737,6 +755,21 @@ QueueFamilyIndices VulkanContext::findQueueFamilies(VkPhysicalDevice physicalDev
     } else if (indices.graphics.has_value()) {
         indices.compute = *indices.graphics;
         indices.computeQueueIndex = 0;
+    }
+
+    // Resolve a transfer queue family. Prefer a true DMA-only family, then a
+    // transfer-capable compute-only family, and finally fall back to the graphics
+    // family so the upload path always has a valid queue.
+    if (dedicatedTransfer.has_value()) {
+        indices.transfer = *dedicatedTransfer;
+        indices.transferQueueIndex = 0;
+    } else if (transferOnlyCompute.has_value() &&
+        (!indices.compute.has_value() || *transferOnlyCompute != *indices.compute)) {
+        indices.transfer = *transferOnlyCompute;
+        indices.transferQueueIndex = 0;
+    } else if (indices.graphics.has_value()) {
+        indices.transfer = *indices.graphics;
+        indices.transferQueueIndex = 0;
     }
 
     return indices;

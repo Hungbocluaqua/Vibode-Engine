@@ -1,5 +1,7 @@
 #include "rtv/StreamingGpuWorkQueue.h"
 
+#include "rtv/StreamingStagingRing.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -468,6 +470,11 @@ int simulateStreamingGpuWorkQueueCommand(
         (void)queue.enqueue(makeSimulationTicket(i));
     }
 
+    // Model the bounded staging ring that backs real device uploads. Sizing the
+    // ring to the per-frame staging budget proves that the ring math recycles
+    // memory across timeline-completed frames rather than growing unbounded.
+    StreamingStagingRing stagingRing(budget.maxStagingBytes != 0 ? budget.maxStagingBytes : 128ull * 1024ull * 1024ull);
+
     nlohmann::json frames = nlohmann::json::array();
     std::deque<uint64_t> submittedTimelineHistory;
     constexpr uint32_t kMaxFrames = 512;
@@ -476,8 +483,12 @@ int simulateStreamingGpuWorkQueueCommand(
             const uint64_t completedTimeline = submittedTimelineHistory.front();
             submittedTimelineHistory.pop_front();
             (void)queue.completeTimeline(completedTimeline);
+            (void)stagingRing.retire(completedTimeline);
         }
         StreamingGpuWorkFrameResult result = queue.submitFrame(budget);
+        if (result.submittedStagingBytes != 0 && result.highestSubmittedTimeline != 0) {
+            (void)stagingRing.allocate(result.submittedStagingBytes, result.highestSubmittedTimeline);
+        }
         if (result.highestSubmittedTimeline != 0) {
             submittedTimelineHistory.push_back(result.highestSubmittedTimeline);
         }
@@ -486,6 +497,7 @@ int simulateStreamingGpuWorkQueueCommand(
             const uint64_t completedTimeline = submittedTimelineHistory.front();
             submittedTimelineHistory.pop_front();
             (void)queue.completeTimeline(completedTimeline);
+            (void)stagingRing.retire(completedTimeline);
             continue;
         }
         if (result.submittedTickets == 0 && submittedTimelineHistory.empty()) {
@@ -494,6 +506,7 @@ int simulateStreamingGpuWorkQueueCommand(
     }
     if (!submittedTimelineHistory.empty()) {
         (void)queue.completeTimeline(submittedTimelineHistory.back());
+        (void)stagingRing.retire(submittedTimelineHistory.back());
     }
 
     const nlohmann::json report = {
@@ -513,6 +526,7 @@ int simulateStreamingGpuWorkQueueCommand(
         {"frames", frames},
         {"stats", streamingGpuWorkQueueStatsJson(queue.stats())},
         {"hitch_summary", streamingGpuWorkPressureStatsJson(queue.pressureStats())},
+        {"staging_ring", streamingStagingRingStatsJson(stagingRing.stats())},
         {"tickets", streamingGpuWorkQueueSnapshotsJson(queue.snapshots())},
     };
 
