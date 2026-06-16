@@ -228,7 +228,7 @@ layout(set = 0, binding = 47, std430) readonly buffer RtMeshGeometryRanges {
 layout(set = 0, binding = 48, std430) buffer RtDiagnosticCounters {
     uint rt_diagnostic_counters[];
 };
-layout(set = 0, binding = 55, std430) readonly buffer StreamingResetInstanceMasks {
+layout(set = 0, binding = 57, std430) readonly buffer StreamingResetInstanceMasks {
     uint streaming_reset_instance_masks[];
 };
 
