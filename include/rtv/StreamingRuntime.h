@@ -52,6 +52,14 @@ enum class StreamingAssetState : uint8_t {
     Evicted,
 };
 
+struct NativeAssetCatalogChunk {
+    uint32_t type = 0;
+    uint32_t compression = 0;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    uint64_t uncompressedSize = 0;
+};
+
 struct NativeAssetCatalogEntry {
     AssetGuid guid;
     AssetType assetType = AssetType::Unknown;
@@ -64,6 +72,18 @@ struct NativeAssetCatalogEntry {
     std::vector<AssetDependency> dependencies;
     bool cacheFileExists = false;
     bool streamable = false;
+
+    // Chunk-level metadata parsed from the native asset header/chunk table without reading payloads.
+    // Populated when the cache file is a loose native asset whose tables parse cleanly.
+    bool chunkMetadataResident = false;
+    bool chunkMetadataValid = false;
+    uint32_t chunkCount = 0;
+    uint64_t payloadBytes = 0;          // Sum of chunk on-disk sizes.
+    uint64_t uncompressedPayloadBytes = 0; // Sum of chunk uncompressed sizes.
+    uint64_t metadataBytes = 0;         // Bytes occupied by header + tables (file minus first chunk offset region).
+    bool compressedPayload = false;     // True when any chunk uses a non-None compression.
+    std::vector<NativeAssetCatalogChunk> chunks;
+    std::string chunkParseError;        // Non-empty when chunk metadata parsing failed.
 };
 
 class NativeAssetCatalog {
@@ -75,6 +95,8 @@ public:
     [[nodiscard]] const NativeAssetCatalogEntry* find(const AssetGuid& guid) const;
     [[nodiscard]] std::vector<AssetGuid> dependencyClosure(const AssetGuid& rootGuid) const;
     [[nodiscard]] uint64_t closureFileBytes(const AssetGuid& rootGuid) const;
+    [[nodiscard]] uint64_t closurePayloadBytes(const AssetGuid& rootGuid) const;
+    [[nodiscard]] uint64_t closureChunkCount(const AssetGuid& rootGuid) const;
     [[nodiscard]] nlohmann::json toJson() const;
 
 private:

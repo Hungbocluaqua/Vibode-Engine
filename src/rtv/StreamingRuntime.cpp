@@ -204,6 +204,55 @@ void NativeAssetCatalog::buildFromRegistry(const AssetRegistry& registry, const 
         entry.estimatedCpuBytes = entry.fileBytes;
         entry.estimatedGpuBytes = entry.fileBytes;
         entry.streamable = entry.cacheFileExists && entry.nativeKind != NativeAssetKind::Unknown && entry.nativeKind != NativeAssetKind::Package;
+
+        // Parse chunk-level metadata from the native header/chunk table without reading payloads.
+        // This is what lets the catalog answer "which chunks does this asset need" cheaply and gives
+        // accurate payload/metadata byte accounting for streaming budgets.
+        if (entry.cacheFileExists &&
+            entry.nativeKind != NativeAssetKind::Unknown &&
+            entry.nativeKind != NativeAssetKind::Package) {
+            const NativeAssetInspection tables = NativeAssetReader{}.inspectTablesOnly(entry.cachePath);
+            if (tables.ok) {
+                entry.chunkMetadataResident = true;
+                entry.chunkMetadataValid = true;
+                entry.chunkCount = static_cast<uint32_t>(tables.chunks.size());
+                uint64_t firstChunkOffset = entry.fileBytes;
+                for (const NativeChunkRecord& chunk : tables.chunks) {
+                    NativeAssetCatalogChunk catalogChunk;
+                    catalogChunk.type = chunk.type;
+                    catalogChunk.compression = chunk.compression;
+                    catalogChunk.offset = chunk.offset;
+                    catalogChunk.size = chunk.size;
+                    catalogChunk.uncompressedSize = chunk.uncompressedSize;
+                    entry.payloadBytes += chunk.size;
+                    entry.uncompressedPayloadBytes += chunk.uncompressedSize;
+                    if (chunk.compression != static_cast<uint32_t>(NativeChunkCompression::None)) {
+                        entry.compressedPayload = true;
+                    }
+                    if (chunk.size > 0 && chunk.offset < firstChunkOffset) {
+                        firstChunkOffset = chunk.offset;
+                    }
+                    entry.chunks.push_back(catalogChunk);
+                }
+                entry.metadataBytes = entry.chunks.empty()
+                    ? entry.fileBytes
+                    : std::min<uint64_t>(firstChunkOffset, entry.fileBytes);
+                // Uncompressed payload is the better GPU upload estimate than raw file bytes.
+                if (entry.uncompressedPayloadBytes > 0) {
+                    entry.estimatedGpuBytes = entry.uncompressedPayloadBytes;
+                }
+            } else {
+                entry.chunkMetadataResident = true;
+                entry.chunkMetadataValid = false;
+                entry.streamable = false;
+                if (!tables.errors.empty()) {
+                    entry.chunkParseError = tables.errors.front().message;
+                } else {
+                    entry.chunkParseError = "native asset table parse failed";
+                }
+            }
+        }
+
         entries_[entry.guid] = std::move(entry);
     }
 }
@@ -249,10 +298,40 @@ uint64_t NativeAssetCatalog::closureFileBytes(const AssetGuid& rootGuid) const {
     return total;
 }
 
+uint64_t NativeAssetCatalog::closurePayloadBytes(const AssetGuid& rootGuid) const {
+    uint64_t total = 0;
+    for (const AssetGuid& guid : dependencyClosure(rootGuid)) {
+        if (const NativeAssetCatalogEntry* entry = find(guid)) {
+            total += entry->chunkMetadataValid ? entry->payloadBytes : entry->fileBytes;
+        }
+    }
+    return total;
+}
+
+uint64_t NativeAssetCatalog::closureChunkCount(const AssetGuid& rootGuid) const {
+    uint64_t total = 0;
+    for (const AssetGuid& guid : dependencyClosure(rootGuid)) {
+        if (const NativeAssetCatalogEntry* entry = find(guid)) {
+            total += entry->chunkCount;
+        }
+    }
+    return total;
+}
+
 nlohmann::json NativeAssetCatalog::toJson() const {
     nlohmann::json assets = nlohmann::json::array();
     for (const auto& [guid, entry] : entries_) {
-        assets.push_back({
+        nlohmann::json chunks = nlohmann::json::array();
+        for (const NativeAssetCatalogChunk& chunk : entry.chunks) {
+            chunks.push_back({
+                {"type", chunk.type},
+                {"compression", chunk.compression},
+                {"offset", chunk.offset},
+                {"size", chunk.size},
+                {"uncompressed_size", chunk.uncompressedSize},
+            });
+        }
+        nlohmann::json item = {
             {"guid", guid},
             {"asset_type", assetTypeName(entry.assetType)},
             {"native_kind", nativeAssetKindName(entry.nativeKind)},
@@ -263,11 +342,23 @@ nlohmann::json NativeAssetCatalog::toJson() const {
             {"estimated_gpu_bytes", entry.estimatedGpuBytes},
             {"cache_file_exists", entry.cacheFileExists},
             {"streamable", entry.streamable},
+            {"chunk_metadata_resident", entry.chunkMetadataResident},
+            {"chunk_metadata_valid", entry.chunkMetadataValid},
+            {"chunk_count", entry.chunkCount},
+            {"payload_bytes", entry.payloadBytes},
+            {"uncompressed_payload_bytes", entry.uncompressedPayloadBytes},
+            {"metadata_bytes", entry.metadataBytes},
+            {"compressed_payload", entry.compressedPayload},
+            {"chunks", chunks},
             {"dependencies", dependencyJson(entry.dependencies)},
-        });
+        };
+        if (!entry.chunkParseError.empty()) {
+            item["chunk_parse_error"] = entry.chunkParseError;
+        }
+        assets.push_back(std::move(item));
     }
     return {
-        {"schema", "NativeAssetCatalogV1"},
+        {"schema", "NativeAssetCatalogV2"},
         {"asset_count", entries_.size()},
         {"assets", assets},
     };
@@ -408,10 +499,17 @@ int validateNativeAssetCatalogCommand(
 
     uint64_t streamableBytes = 0;
     uint64_t missingBytes = 0;
+    uint64_t totalPayloadBytes = 0;
+    uint64_t totalUncompressedPayloadBytes = 0;
+    uint64_t totalMetadataBytes = 0;
+    uint64_t totalChunkCount = 0;
     uint32_t streamableCount = 0;
     uint32_t missingCacheCount = 0;
     uint32_t nonStreamableCount = 0;
     uint32_t missingDependencyCount = 0;
+    uint32_t chunkMetadataValidCount = 0;
+    uint32_t chunkMetadataInvalidCount = 0;
+    uint32_t compressedPayloadCount = 0;
     nlohmann::json issues = nlohmann::json::array();
     nlohmann::json roots = nlohmann::json::array();
 
@@ -421,6 +519,27 @@ int validateNativeAssetCatalogCommand(
             streamableBytes += entry.fileBytes;
         } else {
             ++nonStreamableCount;
+        }
+        if (entry.chunkMetadataValid) {
+            ++chunkMetadataValidCount;
+            totalPayloadBytes += entry.payloadBytes;
+            totalUncompressedPayloadBytes += entry.uncompressedPayloadBytes;
+            totalMetadataBytes += entry.metadataBytes;
+            totalChunkCount += entry.chunkCount;
+            if (entry.compressedPayload) {
+                ++compressedPayloadCount;
+            }
+        } else if (entry.chunkMetadataResident) {
+            ++chunkMetadataInvalidCount;
+            issues.push_back({
+                {"severity", "error"},
+                {"kind", "ChunkMetadataParseFailed"},
+                {"guid", guid},
+                {"asset_type", assetTypeName(entry.assetType)},
+                {"native_kind", nativeAssetKindName(entry.nativeKind)},
+                {"cache_path", entry.cachePath.generic_string()},
+                {"error", entry.chunkParseError},
+            });
         }
         if (!entry.cacheFileExists) {
             ++missingCacheCount;
@@ -470,13 +589,15 @@ int validateNativeAssetCatalogCommand(
             {"display_name", record.displayName},
             {"dependency_count", closure.size()},
             {"estimated_streaming_bytes", catalog.closureFileBytes(record.guid)},
+            {"closure_payload_bytes", catalog.closurePayloadBytes(record.guid)},
+            {"closure_chunk_count", catalog.closureChunkCount(record.guid)},
             {"dependencies", closure},
         });
     }
 
     const nlohmann::json report = {
         {"schema", "NativeAssetCatalogValidationV1"},
-        {"ok", missingCacheCount == 0 && missingDependencyCount == 0},
+        {"ok", missingCacheCount == 0 && missingDependencyCount == 0 && chunkMetadataInvalidCount == 0},
         {"registry_path", registryPath.generic_string()},
         {"root", resolvedRoot.generic_string()},
         {"asset_count", catalog.entries().size()},
@@ -484,8 +605,15 @@ int validateNativeAssetCatalogCommand(
         {"non_streamable_count", nonStreamableCount},
         {"missing_cache_count", missingCacheCount},
         {"missing_dependency_count", missingDependencyCount},
+        {"chunk_metadata_valid_count", chunkMetadataValidCount},
+        {"chunk_metadata_invalid_count", chunkMetadataInvalidCount},
+        {"compressed_payload_count", compressedPayloadCount},
         {"streamable_bytes", streamableBytes},
         {"missing_bytes", missingBytes},
+        {"total_payload_bytes", totalPayloadBytes},
+        {"total_uncompressed_payload_bytes", totalUncompressedPayloadBytes},
+        {"total_metadata_bytes", totalMetadataBytes},
+        {"total_chunk_count", totalChunkCount},
         {"roots", roots},
         {"issues", issues},
         {"catalog", catalog.toJson()},

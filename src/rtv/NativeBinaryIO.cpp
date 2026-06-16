@@ -870,6 +870,101 @@ NativeAssetInspection NativeAssetReader::inspect(const std::filesystem::path& pa
     return inspectBytes(path, bytes, validatePayloadHash);
 }
 
+NativeAssetInspection NativeAssetReader::inspectTablesOnly(const std::filesystem::path& path) const {
+    NativeAssetInspection inspection{};
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        inspection.errors.push_back(makeError(NativeBinaryErrorCode::IoError, path, "file", 0, 0, "Could not open native asset file for reading"));
+        return inspection;
+    }
+    const std::streamoff actualSize = file.tellg();
+    if (actualSize < static_cast<std::streamoff>(sizeof(NativeAssetHeader))) {
+        inspection.errors.push_back(makeError(NativeBinaryErrorCode::CorruptHeader, path, "header", 0, sizeof(NativeAssetHeader), "Native asset file is smaller than the shared header"));
+        return inspection;
+    }
+    const uint64_t fileSize = static_cast<uint64_t>(actualSize);
+
+    file.seekg(0, std::ios::beg);
+    file.read(reinterpret_cast<char*>(&inspection.header), sizeof(NativeAssetHeader));
+    if (!file.good()) {
+        inspection.errors.push_back(makeError(NativeBinaryErrorCode::IoError, path, "header", 0, sizeof(NativeAssetHeader), "Could not read native asset header"));
+        return inspection;
+    }
+    const NativeAssetHeader& header = inspection.header;
+
+    if (header.endianMarker != kNativeAssetEndianMarker) {
+        inspection.errors.push_back(makeError(NativeBinaryErrorCode::CorruptHeader, path, "header", offsetof(NativeAssetHeader, endianMarker), sizeof(header.endianMarker), "Native asset endian marker is invalid"));
+    }
+    if (header.headerSize != sizeof(NativeAssetHeader)) {
+        inspection.errors.push_back(makeError(NativeBinaryErrorCode::CorruptHeader, path, "header", offsetof(NativeAssetHeader, headerSize), sizeof(header.headerSize), "Native asset header size is not supported by this reader"));
+    }
+    const NativeAssetKind expectedKind = nativeAssetKindFromExtension(path);
+    if (expectedKind != NativeAssetKind::Unknown && header.magic != nativeAssetMagicForKind(expectedKind)) {
+        inspection.errors.push_back(makeError(NativeBinaryErrorCode::CorruptHeader, path, "header", offsetof(NativeAssetHeader, magic), sizeof(header.magic), "Native asset magic does not match the file extension"));
+    }
+    if (header.fileSize != fileSize) {
+        inspection.errors.push_back(makeError(NativeBinaryErrorCode::CorruptHeader, path, "header", offsetof(NativeAssetHeader, fileSize), fileSize, "Native asset file size field does not match the actual file size"));
+    }
+    // If the header is already inconsistent there is no point trying to read tables from it.
+    if (!inspection.errors.empty()) {
+        return inspection;
+    }
+
+    // The native writer lays out every metadata table (object/chunk/dependency tables, the debug
+    // record table, migration records, and the debug string directory) before any payload chunk
+    // bytes. Read only the prefix that spans those tables so payload chunks are never touched.
+    auto tableEnd = [](uint64_t offset, uint64_t count, uint64_t stride) -> uint64_t {
+        return offset + count * stride;
+    };
+    uint64_t metadataEnd = sizeof(NativeAssetHeader);
+    metadataEnd = std::max(metadataEnd, tableEnd(header.objectTableOffset, header.objectTableCount, header.objectTableStride));
+    metadataEnd = std::max(metadataEnd, tableEnd(header.chunkTableOffset, header.chunkTableCount, header.chunkTableStride));
+    metadataEnd = std::max(metadataEnd, tableEnd(header.dependencyTableOffset, header.dependencyTableCount, header.dependencyTableStride));
+    metadataEnd = std::max(metadataEnd, tableEnd(header.migrationTableOffset, header.migrationTableCount, header.migrationTableStride));
+    metadataEnd = std::max(metadataEnd, header.debugDirectoryOffset + header.debugDirectorySize);
+    if (metadataEnd > fileSize) {
+        inspection.errors.push_back(makeError(NativeBinaryErrorCode::CorruptTable, path, "metadata", metadataEnd, fileSize, "Native asset metadata tables extend beyond the file"));
+        return inspection;
+    }
+
+    std::vector<std::byte> prefix(static_cast<size_t>(metadataEnd));
+    std::memcpy(prefix.data(), &inspection.header, sizeof(NativeAssetHeader));
+    if (metadataEnd > sizeof(NativeAssetHeader)) {
+        file.seekg(static_cast<std::streamoff>(sizeof(NativeAssetHeader)), std::ios::beg);
+        file.read(
+            reinterpret_cast<char*>(prefix.data()) + sizeof(NativeAssetHeader),
+            static_cast<std::streamsize>(metadataEnd - sizeof(NativeAssetHeader)));
+        if (!file.good()) {
+            inspection.errors.push_back(makeError(NativeBinaryErrorCode::IoError, path, "metadata", sizeof(NativeAssetHeader), metadataEnd, "Could not read native asset metadata tables"));
+            return inspection;
+        }
+    }
+
+    readRecordRange(prefix, path, "objectTable", header.objectTableOffset, header.objectTableCount, header.objectTableStride, inspection.objects, inspection.errors);
+    readRecordRange(prefix, path, "chunkTable", header.chunkTableOffset, header.chunkTableCount, header.chunkTableStride, inspection.chunks, inspection.errors);
+    readRecordRange(prefix, path, "dependencyTable", header.dependencyTableOffset, header.dependencyTableCount, header.dependencyTableStride, inspection.dependencies, inspection.errors);
+    readRecordRange(prefix, path, "migrationTable", header.migrationTableOffset, header.migrationTableCount, header.migrationTableStride, inspection.migrations, inspection.errors);
+
+    if (header.debugDirectorySize > 0 && rangeInside(header.debugDirectoryOffset, header.debugDirectorySize, prefix.size())) {
+        inspection.debugDirectory.assign(
+            prefix.begin() + static_cast<size_t>(header.debugDirectoryOffset),
+            prefix.begin() + static_cast<size_t>(header.debugDirectoryOffset + header.debugDirectorySize));
+    }
+
+    // Validate chunk payload ranges against the header file-size field (payloads are not read here).
+    for (const NativeChunkRecord& chunk : inspection.chunks) {
+        if (!rangeInside(chunk.offset, chunk.size, fileSize)) {
+            inspection.errors.push_back(makeError(NativeBinaryErrorCode::CorruptTable, path, "chunkPayload", chunk.offset, chunk.size, "Chunk payload range is outside the file"));
+        }
+    }
+
+    inspection.migrationRequired = header.contentVersion < kNativeAssetReadableVersionMax;
+    inspection.payloadHashValid = false; // Payload hashes are intentionally not verified in tables-only mode.
+    inspection.ok = inspection.errors.empty();
+    return inspection;
+}
+
 nlohmann::json nativeAssetInspectionToJson(const NativeAssetInspection& inspection, const std::filesystem::path& path) {
     const NativeAssetHeader& h = inspection.header;
     nlohmann::json errors = nlohmann::json::array();

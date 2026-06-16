@@ -104,6 +104,12 @@ class NativeAssetReader {
 public:
     [[nodiscard]] NativeAssetInspection inspect(const std::filesystem::path& path, bool validatePayloadHash = true) const;
     [[nodiscard]] NativeAssetInspection inspectBytes(const std::filesystem::path& pathHint, const std::vector<std::byte>& bytes, bool validatePayloadHash = true) const;
+    // Reads only the header and metadata tables (object/chunk/dependency/migration tables plus the
+    // debug directory) without loading any payload chunk bytes. This is the bounded, streaming-friendly
+    // read used by the native asset catalog to answer "which chunks does this asset need" cheaply.
+    // Chunk payload offset/size ranges are validated against the header file-size field rather than the
+    // in-memory buffer, and payload hashes are not verified.
+    [[nodiscard]] NativeAssetInspection inspectTablesOnly(const std::filesystem::path& path) const;
 };
 
 [[nodiscard]] nlohmann::json nativeAssetInspectionToJson(const NativeAssetInspection& inspection, const std::filesystem::path& path);
