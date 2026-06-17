@@ -17,6 +17,7 @@ class VulkanContext;
 class ResourceAllocator;
 class Buffer;
 class Image;
+class AccelerationStructure;
 
 // Real device-backed transfer executor for streaming uploads.
 //
@@ -41,6 +42,7 @@ public:
         uint32_t totalSubmissions = 0;
         uint32_t totalBufferCopies = 0;
         uint32_t totalImageCopies = 0;
+        uint32_t totalBlasBuilds = 0;
         uint64_t totalUploadedBytes = 0;
         uint32_t stagingAllocationFailures = 0;
         StreamingStagingRingStats staging{};
@@ -62,6 +64,21 @@ public:
     // back-pressure) - the caller should retry next frame.
     [[nodiscard]] bool stageBufferUpload(Buffer& destination, const void* src, uint64_t bytes, uint64_t dstOffset = 0);
     [[nodiscard]] bool stageImageMipUpload(Image& destination, const void* src, uint64_t bytes, uint32_t mipLevel, uint32_t width, uint32_t height);
+
+    struct BlasTriangleBuild {
+        AccelerationStructure* destination = nullptr;
+        Buffer* scratch = nullptr;
+        Buffer* vertexBuffer = nullptr;
+        Buffer* indexBuffer = nullptr;
+        uint64_t vertexDataOffset = 0;
+        uint64_t indexDataOffset = 0;
+        uint32_t vertexCount = 0;
+        uint32_t indexCount = 0;
+        uint32_t vertexStride = 0;
+        VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    };
+
+    [[nodiscard]] bool stageBlasBuild(const BlasTriangleBuild& build);
 
     // Flush all copies recorded since the last submitFrame() as one transfer
     // submission that signals the next timeline value. Returns the signaled
@@ -90,9 +107,12 @@ private:
     struct InFlightBatch {
         uint64_t timelineValue = 0;
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        bool graphics = false;
     };
 
     [[nodiscard]] VkCommandBuffer beginBatch();
+    [[nodiscard]] VkCommandBuffer beginGraphicsBatch();
+    uint64_t submitGraphicsFrame(uint64_t waitTimelineValue = 0);
     void recycleCompleted(uint64_t completedTimeline);
 
     VkDevice device_ = VK_NULL_HANDLE;
@@ -100,21 +120,29 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queueFamily_ = UINT32_MAX;
     bool dedicatedTransferQueue_ = false;
+    VkQueue graphicsQueue_ = VK_NULL_HANDLE;
+    uint32_t graphicsQueueFamily_ = UINT32_MAX;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
+    VkCommandPool graphicsCommandPool_ = VK_NULL_HANDLE;
     VkSemaphore timeline_ = VK_NULL_HANDLE;
     uint64_t nextTimelineValue_ = 1;
     uint64_t submittedTimeline_ = 0;
     uint64_t completedTimeline_ = 0;
+    uint64_t accelerationStructureScratchAlignment_ = 256;
 
     StreamingStagingRing stagingRing_;
     VkCommandBuffer openBatch_ = VK_NULL_HANDLE;
     uint32_t openBatchCopies_ = 0;
+    VkCommandBuffer openGraphicsBatch_ = VK_NULL_HANDLE;
+    uint32_t openGraphicsBatchOps_ = 0;
     std::deque<InFlightBatch> inFlight_;
     std::vector<VkCommandBuffer> freeCommandBuffers_;
+    std::vector<VkCommandBuffer> freeGraphicsCommandBuffers_;
 
     uint32_t totalSubmissions_ = 0;
     uint32_t totalBufferCopies_ = 0;
     uint32_t totalImageCopies_ = 0;
+    uint32_t totalBlasBuilds_ = 0;
     uint64_t totalUploadedBytes_ = 0;
     uint32_t stagingAllocationFailures_ = 0;
 };

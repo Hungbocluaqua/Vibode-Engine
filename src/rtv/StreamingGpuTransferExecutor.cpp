@@ -1,5 +1,6 @@
 #include "rtv/StreamingGpuTransferExecutor.h"
 
+#include "rtv/AccelerationStructure.h"
 #include "rtv/Buffer.h"
 #include "rtv/Check.h"
 #include "rtv/Image.h"
@@ -42,12 +43,27 @@ bool StreamingGpuTransferExecutor::initialize(const VulkanContext& context, Reso
         queueFamily_ = families.graphics.value();
         dedicatedTransferQueue_ = false;
     }
+    graphicsQueue_ = context.graphicsQueue();
+    graphicsQueueFamily_ = families.graphics.value();
+    accelerationStructureScratchAlignment_ = std::max<uint64_t>(
+        1ull,
+        context.rayTracingInfo().accelerationStructureProperties.minAccelerationStructureScratchOffsetAlignment);
 
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = queueFamily_;
     if (vkCreateCommandPool(device_, &poolInfo, nullptr, &commandPool_) != VK_SUCCESS) {
+        device_ = VK_NULL_HANDLE;
+        return false;
+    }
+    VkCommandPoolCreateInfo graphicsPoolInfo{};
+    graphicsPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    graphicsPoolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    graphicsPoolInfo.queueFamilyIndex = graphicsQueueFamily_;
+    if (vkCreateCommandPool(device_, &graphicsPoolInfo, nullptr, &graphicsCommandPool_) != VK_SUCCESS) {
+        vkDestroyCommandPool(device_, commandPool_, nullptr);
+        commandPool_ = VK_NULL_HANDLE;
         device_ = VK_NULL_HANDLE;
         return false;
     }
@@ -60,6 +76,8 @@ bool StreamingGpuTransferExecutor::initialize(const VulkanContext& context, Reso
     semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     semInfo.pNext = &timelineInfo;
     if (vkCreateSemaphore(device_, &semInfo, nullptr, &timeline_) != VK_SUCCESS) {
+        vkDestroyCommandPool(device_, graphicsCommandPool_, nullptr);
+        graphicsCommandPool_ = VK_NULL_HANDLE;
         vkDestroyCommandPool(device_, commandPool_, nullptr);
         commandPool_ = VK_NULL_HANDLE;
         device_ = VK_NULL_HANDLE;
@@ -91,13 +109,22 @@ void StreamingGpuTransferExecutor::shutdown() {
         vkDestroyCommandPool(device_, commandPool_, nullptr);
         commandPool_ = VK_NULL_HANDLE;
     }
+    if (graphicsCommandPool_ != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(device_, graphicsCommandPool_, nullptr);
+        graphicsCommandPool_ = VK_NULL_HANDLE;
+    }
     stagingRing_ = StreamingStagingRing();
     inFlight_.clear();
     freeCommandBuffers_.clear();
+    freeGraphicsCommandBuffers_.clear();
     openBatch_ = VK_NULL_HANDLE;
     openBatchCopies_ = 0;
+    openGraphicsBatch_ = VK_NULL_HANDLE;
+    openGraphicsBatchOps_ = 0;
     device_ = VK_NULL_HANDLE;
     allocator_ = nullptr;
+    graphicsQueue_ = VK_NULL_HANDLE;
+    graphicsQueueFamily_ = UINT32_MAX;
 }
 
 VkCommandBuffer StreamingGpuTransferExecutor::beginBatch() {
@@ -123,6 +150,32 @@ VkCommandBuffer StreamingGpuTransferExecutor::beginBatch() {
     checkVk(vkBeginCommandBuffer(cmd, &beginInfo), "vkBeginCommandBuffer(streaming transfer)");
     openBatch_ = cmd;
     openBatchCopies_ = 0;
+    return cmd;
+}
+
+VkCommandBuffer StreamingGpuTransferExecutor::beginGraphicsBatch() {
+    if (openGraphicsBatch_ != VK_NULL_HANDLE) {
+        return openGraphicsBatch_;
+    }
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (!freeGraphicsCommandBuffers_.empty()) {
+        cmd = freeGraphicsCommandBuffers_.back();
+        freeGraphicsCommandBuffers_.pop_back();
+        vkResetCommandBuffer(cmd, 0);
+    } else {
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = graphicsCommandPool_;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+        checkVk(vkAllocateCommandBuffers(device_, &allocInfo, &cmd), "vkAllocateCommandBuffers(streaming graphics)");
+    }
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    checkVk(vkBeginCommandBuffer(cmd, &beginInfo), "vkBeginCommandBuffer(streaming graphics)");
+    openGraphicsBatch_ = cmd;
+    openGraphicsBatchOps_ = 0;
     return cmd;
 }
 
@@ -227,6 +280,74 @@ bool StreamingGpuTransferExecutor::stageImageMipUpload(
     return true;
 }
 
+bool StreamingGpuTransferExecutor::stageBlasBuild(const BlasTriangleBuild& build) {
+    if (device_ == VK_NULL_HANDLE ||
+        build.destination == nullptr ||
+        build.scratch == nullptr ||
+        build.vertexBuffer == nullptr ||
+        build.indexBuffer == nullptr ||
+        build.destination->handle() == VK_NULL_HANDLE ||
+        build.scratch->handle() == VK_NULL_HANDLE ||
+        build.vertexBuffer->handle() == VK_NULL_HANDLE ||
+        build.indexBuffer->handle() == VK_NULL_HANDLE ||
+        build.vertexCount == 0 ||
+        build.indexCount < 3 ||
+        build.vertexStride == 0) {
+        return false;
+    }
+
+    VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
+    triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    triangles.vertexData.deviceAddress = build.vertexBuffer->deviceAddress() + build.vertexDataOffset;
+    triangles.vertexStride = build.vertexStride;
+    triangles.maxVertex = build.vertexCount - 1u;
+    triangles.indexType = VK_INDEX_TYPE_UINT32;
+    triangles.indexData.deviceAddress = build.indexBuffer->deviceAddress() + build.indexDataOffset;
+
+    VkAccelerationStructureGeometryKHR geometry{};
+    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geometry.geometry.triangles = triangles;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    buildInfo.flags = build.flags;
+    buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &geometry;
+    buildInfo.dstAccelerationStructure = build.destination->handle();
+    buildInfo.scratchData.deviceAddress = Buffer::alignUp(build.scratch->deviceAddress(), accelerationStructureScratchAlignment_);
+
+    VkAccelerationStructureBuildRangeInfoKHR range{};
+    range.primitiveCount = build.indexCount / 3u;
+    range.primitiveOffset = 0;
+    range.firstVertex = 0;
+    range.transformOffset = 0;
+    const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = {&range};
+
+    VkCommandBuffer cmd = beginGraphicsBatch();
+    vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, ranges);
+
+    VkMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_MEMORY_READ_BIT;
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+
+    ++openGraphicsBatchOps_;
+    ++totalBlasBuilds_;
+    return true;
+}
+
 uint64_t StreamingGpuTransferExecutor::submitFrame() {
     if (device_ == VK_NULL_HANDLE || openBatch_ == VK_NULL_HANDLE || openBatchCopies_ == 0) {
         // Nothing recorded: discard an empty open batch if present.
@@ -268,15 +389,72 @@ uint64_t StreamingGpuTransferExecutor::submitFrame() {
     return signalValue;
 }
 
+uint64_t StreamingGpuTransferExecutor::submitGraphicsFrame(uint64_t waitTimelineValue) {
+    if (device_ == VK_NULL_HANDLE || openGraphicsBatch_ == VK_NULL_HANDLE || openGraphicsBatchOps_ == 0) {
+        if (openGraphicsBatch_ != VK_NULL_HANDLE) {
+            vkEndCommandBuffer(openGraphicsBatch_);
+            freeGraphicsCommandBuffers_.push_back(openGraphicsBatch_);
+            openGraphicsBatch_ = VK_NULL_HANDLE;
+            openGraphicsBatchOps_ = 0;
+        }
+        return 0;
+    }
+    checkVk(vkEndCommandBuffer(openGraphicsBatch_), "vkEndCommandBuffer(streaming graphics)");
+
+    const uint64_t signalValue = nextTimelineValue_++;
+
+    VkCommandBufferSubmitInfo cmdInfo{};
+    cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdInfo.commandBuffer = openGraphicsBatch_;
+
+    VkSemaphoreSubmitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitInfo.semaphore = timeline_;
+    waitInfo.value = waitTimelineValue;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+
+    VkSemaphoreSubmitInfo signalInfo{};
+    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signalInfo.semaphore = timeline_;
+    signalInfo.value = signalValue;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+
+    VkSubmitInfo2 submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmdInfo;
+    if (waitTimelineValue != 0) {
+        submit.waitSemaphoreInfoCount = 1;
+        submit.pWaitSemaphoreInfos = &waitInfo;
+    }
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signalInfo;
+    checkVk(vkQueueSubmit2(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit2(streaming graphics)");
+
+    inFlight_.push_back(InFlightBatch{.timelineValue = signalValue, .commandBuffer = openGraphicsBatch_, .graphics = true});
+    submittedTimeline_ = signalValue;
+    ++totalSubmissions_;
+    openGraphicsBatch_ = VK_NULL_HANDLE;
+    openGraphicsBatchOps_ = 0;
+    return signalValue;
+}
+
 uint64_t StreamingGpuTransferExecutor::submitTimelineMarker() {
     if (device_ == VK_NULL_HANDLE || timeline_ == VK_NULL_HANDLE) {
         return 0;
     }
-    // If copies are already recorded, their submission timeline is the marker
-    // for that batch. Callers that need a distinct no-op marker should call
-    // again after the batch has been submitted.
+    uint64_t waitForTransferTimeline = 0;
     if (openBatch_ != VK_NULL_HANDLE && openBatchCopies_ > 0) {
-        return submitFrame();
+        waitForTransferTimeline = submitFrame();
+    }
+    if (openGraphicsBatch_ != VK_NULL_HANDLE && openGraphicsBatchOps_ > 0) {
+        const uint64_t graphicsTimeline = submitGraphicsFrame(waitForTransferTimeline);
+        if (graphicsTimeline != 0) {
+            return graphicsTimeline;
+        }
+    }
+    if (waitForTransferTimeline != 0) {
+        return waitForTransferTimeline;
     }
     // Discard an empty open batch if one was begun but nothing recorded.
     if (openBatch_ != VK_NULL_HANDLE) {
@@ -284,6 +462,12 @@ uint64_t StreamingGpuTransferExecutor::submitTimelineMarker() {
         freeCommandBuffers_.push_back(openBatch_);
         openBatch_ = VK_NULL_HANDLE;
         openBatchCopies_ = 0;
+    }
+    if (openGraphicsBatch_ != VK_NULL_HANDLE) {
+        vkEndCommandBuffer(openGraphicsBatch_);
+        freeGraphicsCommandBuffers_.push_back(openGraphicsBatch_);
+        openGraphicsBatch_ = VK_NULL_HANDLE;
+        openGraphicsBatchOps_ = 0;
     }
 
     // Submit an empty batch whose only purpose is to advance the device timeline
@@ -309,7 +493,11 @@ uint64_t StreamingGpuTransferExecutor::submitTimelineMarker() {
 
 void StreamingGpuTransferExecutor::recycleCompleted(uint64_t completedTimeline) {
     while (!inFlight_.empty() && inFlight_.front().timelineValue <= completedTimeline) {
-        freeCommandBuffers_.push_back(inFlight_.front().commandBuffer);
+        if (inFlight_.front().graphics) {
+            freeGraphicsCommandBuffers_.push_back(inFlight_.front().commandBuffer);
+        } else {
+            freeCommandBuffers_.push_back(inFlight_.front().commandBuffer);
+        }
         inFlight_.pop_front();
     }
     (void)stagingRing_.retire(completedTimeline);
@@ -339,6 +527,7 @@ StreamingGpuTransferExecutor::Stats StreamingGpuTransferExecutor::stats() const 
     out.totalSubmissions = totalSubmissions_;
     out.totalBufferCopies = totalBufferCopies_;
     out.totalImageCopies = totalImageCopies_;
+    out.totalBlasBuilds = totalBlasBuilds_;
     out.totalUploadedBytes = totalUploadedBytes_;
     out.stagingAllocationFailures = stagingAllocationFailures_;
     out.staging = stagingRing_.stats();
@@ -459,6 +648,107 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
         return false;
     }
 
+    struct SelfTestVertex {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+    };
+    const std::array<SelfTestVertex, 3> vertices{{
+        {.x = 0.0f, .y = 0.0f, .z = 0.0f},
+        {.x = 1.0f, .y = 0.0f, .z = 0.0f},
+        {.x = 0.0f, .y = 1.0f, .z = 0.0f},
+    }};
+    const std::array<uint32_t, 3> indices{{0u, 1u, 2u}};
+    Buffer blasVertices(*allocator_, BufferDesc{
+        .size = sizeof(SelfTestVertex) * vertices.size(),
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "streaming transfer selftest BLAS vertices",
+    });
+    Buffer blasIndices(*allocator_, BufferDesc{
+        .size = sizeof(uint32_t) * indices.size(),
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "streaming transfer selftest BLAS indices",
+    });
+    if (!stageBufferUpload(blasVertices, vertices.data(), sizeof(SelfTestVertex) * vertices.size(), 0) ||
+        !stageBufferUpload(blasIndices, indices.data(), sizeof(uint32_t) * indices.size(), 0)) {
+        errorOut = "stageBufferUpload(BLAS inputs) failed";
+        return false;
+    }
+
+    VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
+    triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    triangles.vertexData.deviceAddress = blasVertices.deviceAddress();
+    triangles.vertexStride = sizeof(SelfTestVertex);
+    triangles.maxVertex = static_cast<uint32_t>(vertices.size() - 1u);
+    triangles.indexType = VK_INDEX_TYPE_UINT32;
+    triangles.indexData.deviceAddress = blasIndices.deviceAddress();
+
+    VkAccelerationStructureGeometryKHR geometry{};
+    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geometry.geometry.triangles = triangles;
+
+    VkAccelerationStructureBuildGeometryInfoKHR blasSizeInfo{};
+    blasSizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    blasSizeInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    blasSizeInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    blasSizeInfo.geometryCount = 1;
+    blasSizeInfo.pGeometries = &geometry;
+    const uint32_t primitiveCount = 1;
+    VkAccelerationStructureBuildSizesInfoKHR blasSizes{};
+    blasSizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    vkGetAccelerationStructureBuildSizesKHR(
+        device_,
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &blasSizeInfo,
+        &primitiveCount,
+        &blasSizes);
+    AccelerationStructure blas(device_, *allocator_, AccelerationStructureDesc{
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+        .size = blasSizes.accelerationStructureSize,
+        .debugName = "streaming transfer selftest BLAS",
+    });
+    Buffer blasScratch(*allocator_, BufferDesc{
+        .size = blasSizes.buildScratchSize + accelerationStructureScratchAlignment_,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "streaming transfer selftest BLAS scratch",
+    });
+    if (!stageBlasBuild(BlasTriangleBuild{
+            .destination = &blas,
+            .scratch = &blasScratch,
+            .vertexBuffer = &blasVertices,
+            .indexBuffer = &blasIndices,
+            .vertexCount = static_cast<uint32_t>(vertices.size()),
+            .indexCount = static_cast<uint32_t>(indices.size()),
+            .vertexStride = sizeof(SelfTestVertex),
+        })) {
+        errorOut = "stageBlasBuild failed";
+        return false;
+    }
+    const uint64_t blasTimeline = submitTimelineMarker();
+    VkSemaphoreWaitInfo blasWait{};
+    blasWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    blasWait.semaphoreCount = 1;
+    blasWait.pSemaphores = &timeline_;
+    blasWait.pValues = &blasTimeline;
+    if (blasTimeline == 0 || vkWaitSemaphores(device_, &blasWait, UINT64_MAX) != VK_SUCCESS) {
+        errorOut = "vkWaitSemaphores(BLAS build) failed";
+        return false;
+    }
+    if (poll() < blasTimeline) {
+        errorOut = "BLAS build timeline did not complete after wait";
+        return false;
+    }
+
     const uint64_t markerTimeline = submitTimelineMarker();
     if (markerTimeline == 0) {
         errorOut = "submitTimelineMarker failed";
@@ -511,6 +801,7 @@ nlohmann::json streamingGpuTransferExecutorStatsJson(const StreamingGpuTransferE
         {"total_submissions", stats.totalSubmissions},
         {"total_buffer_copies", stats.totalBufferCopies},
         {"total_image_copies", stats.totalImageCopies},
+        {"total_blas_builds", stats.totalBlasBuilds},
         {"total_uploaded_bytes", stats.totalUploadedBytes},
         {"staging_allocation_failures", stats.stagingAllocationFailures},
         {"staging_ring", streamingStagingRingStatsJson(stats.staging)},
