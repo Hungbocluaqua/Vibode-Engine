@@ -15322,6 +15322,11 @@ void Application::stepStreamingGpuWorkQueue() {
         }
         streamingGpuWorkCompletedTimeline_ = completedWorkQueueTimeline;
     }
+    const uint32_t retiredStreamingResources = nativeGpuAssetCache_.retireCompletedResources(streamingGpuWorkCompletedTimeline_);
+    if (retiredStreamingResources > 0) {
+        streamingRuntimeState_.pushEvent(
+            "released fence-retired streaming GPU resources: " + std::to_string(retiredStreamingResources));
+    }
 
     {
         if (streamingGpuWorkCompletedTimeline_ != 0) {
@@ -15489,11 +15494,12 @@ void Application::stepStreamingGpuWorkQueue() {
         lastStreamingEviction_ = nativeGpuAssetCache_.evictToBudget(NativeGpuAssetCacheBudget{
             .maxGpuBytes = streamingOptions_.gpuMemoryBudgetBytes,
             .maxCpuBytes = streamingOptions_.cpuMemoryBudgetBytes,
-        });
+        }, streamingGpuWorkCompletedTimeline_);
         if (lastStreamingEviction_.evictedAssets > 0) {
             streamingRuntimeState_.pushEvent(
                 "streaming cache eviction retired " + std::to_string(lastStreamingEviction_.evictedAssets) +
-                " assets, freed " + std::to_string(lastStreamingEviction_.freedGpuBytes) + " GPU bytes");
+                " assets, pending release of " + std::to_string(lastStreamingEviction_.pendingRetiredGpuBytes) +
+                " GPU resource bytes");
             for (const AssetGuid& guid : lastStreamingEviction_.evictedGuids) {
                 streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Evicted);
             }

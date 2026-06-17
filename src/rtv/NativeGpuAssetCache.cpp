@@ -222,10 +222,7 @@ bool NativeGpuAssetCache::markDescriptorPatchComplete(const AssetGuid& guid) {
 bool NativeGpuAssetCache::markFailed(const AssetGuid& guid) {
     if (Entry* entry = find(guid)) {
         entry->residency = NativeGpuAssetResidency::Failed;
-        entry->gpuBuffer.reset();
-        entry->gpuImage.reset();
-        entry->ownedGpuBufferBytes = 0;
-        entry->ownedGpuImageBytes = 0;
+        retireEntryResources(*entry, entry->desc.uploadTicketId);
         entry->desc.fallbackDescriptorBound = true;
         entry->desc.blasBuildPending = false;
         entry->desc.blasReady = false;
@@ -350,7 +347,42 @@ const Image* NativeGpuAssetCache::imageResource(const AssetGuid& guid) const {
     return entry != nullptr ? entry->gpuImage.get() : nullptr;
 }
 
-NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuAssetCacheBudget& budget) {
+uint32_t NativeGpuAssetCache::retireCompletedResources(uint64_t completedTimeline) {
+    uint32_t retired = 0;
+    auto out = retiredResources_.begin();
+    for (auto it = retiredResources_.begin(); it != retiredResources_.end(); ++it) {
+        if (it->retireAfterTimeline <= completedTimeline) {
+            ++retired;
+            continue;
+        }
+        if (out != it) {
+            *out = std::move(*it);
+        }
+        ++out;
+    }
+    retiredResources_.erase(out, retiredResources_.end());
+    return retired;
+}
+
+void NativeGpuAssetCache::retireEntryResources(Entry& entry, uint64_t retireAfterTimeline) {
+    if (entry.gpuBuffer == nullptr && entry.gpuImage == nullptr) {
+        entry.ownedGpuBufferBytes = 0;
+        entry.ownedGpuImageBytes = 0;
+        return;
+    }
+    const uint64_t retiredBytes = entry.ownedGpuBufferBytes + entry.ownedGpuImageBytes;
+    retiredResources_.push_back(RetiredResource{
+        .guid = entry.desc.guid,
+        .retireAfterTimeline = retireAfterTimeline,
+        .gpuBytes = retiredBytes,
+        .gpuBuffer = std::move(entry.gpuBuffer),
+        .gpuImage = std::move(entry.gpuImage),
+    });
+    entry.ownedGpuBufferBytes = 0;
+    entry.ownedGpuImageBytes = 0;
+}
+
+NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuAssetCacheBudget& budget, uint64_t retireAfterTimeline) {
     NativeGpuAssetEvictionResult result;
     NativeGpuAssetCacheStats current = stats();
     if (current.residentGpuBytes <= budget.maxGpuBytes && current.residentCpuBytes <= budget.maxCpuBytes) {
@@ -376,10 +408,8 @@ NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuA
             break;
         }
         entry->residency = NativeGpuAssetResidency::Retired;
-        entry->gpuBuffer.reset();
-        entry->gpuImage.reset();
-        entry->ownedGpuBufferBytes = 0;
-        entry->ownedGpuImageBytes = 0;
+        const uint64_t retiredResourceBytes = entry->ownedGpuBufferBytes + entry->ownedGpuImageBytes;
+        retireEntryResources(*entry, retireAfterTimeline);
         entry->desc.fallbackDescriptorBound = true;
         entry->desc.blasBuildPending = false;
         entry->desc.blasReady = false;
@@ -394,6 +424,7 @@ NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuA
         result.evictedGuids.push_back(entry->desc.guid);
         result.freedGpuBytes += entry->desc.gpuBytes;
         result.freedCpuBytes += entry->desc.cpuBytes;
+        result.pendingRetiredGpuBytes += retiredResourceBytes;
         ++result.evictedAssets;
         current.residentGpuBytes = entry->desc.gpuBytes > current.residentGpuBytes ? 0 : current.residentGpuBytes - entry->desc.gpuBytes;
         current.residentCpuBytes = entry->desc.cpuBytes > current.residentCpuBytes ? 0 : current.residentCpuBytes - entry->desc.cpuBytes;
@@ -406,6 +437,10 @@ NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuA
 NativeGpuAssetCacheStats NativeGpuAssetCache::stats() const {
     NativeGpuAssetCacheStats out;
     out.assetCount = static_cast<uint32_t>(entries_.size());
+    out.pendingRetiredResourceCount = static_cast<uint32_t>(retiredResources_.size());
+    for (const RetiredResource& retired : retiredResources_) {
+        out.pendingRetiredGpuBytes += retired.gpuBytes;
+    }
     for (const Entry& entry : entries_) {
         if (entry.desc.fallbackDescriptorBound) {
             ++out.fallbackDescriptorCount;
@@ -579,9 +614,11 @@ nlohmann::json nativeGpuAssetCacheStatsJson(const NativeGpuAssetCacheStats& stat
         {"descriptor_fallback_material_count", stats.descriptorFallbackMaterialCount},
         {"restir_light_candidate_material_count", stats.restirLightCandidateMaterialCount},
         {"fallback_descriptor_count", stats.fallbackDescriptorCount},
+        {"pending_retired_resource_count", stats.pendingRetiredResourceCount},
         {"resident_gpu_bytes", stats.residentGpuBytes},
         {"resident_cpu_bytes", stats.residentCpuBytes},
         {"in_flight_upload_bytes", stats.inFlightUploadBytes},
+        {"pending_retired_gpu_bytes", stats.pendingRetiredGpuBytes},
     };
 }
 
@@ -594,6 +631,7 @@ nlohmann::json nativeGpuAssetEvictionResultJson(const NativeGpuAssetEvictionResu
         {"evicted_assets", result.evictedAssets},
         {"freed_gpu_bytes", result.freedGpuBytes},
         {"freed_cpu_bytes", result.freedCpuBytes},
+        {"pending_retired_gpu_bytes", result.pendingRetiredGpuBytes},
         {"budget_met", result.budgetMet},
         {"evicted_guids", evictedGuids},
     };

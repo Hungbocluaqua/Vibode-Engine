@@ -132,15 +132,18 @@ struct NativeGpuAssetCacheStats {
     uint32_t descriptorFallbackMaterialCount = 0;
     uint32_t restirLightCandidateMaterialCount = 0;
     uint32_t fallbackDescriptorCount = 0;
+    uint32_t pendingRetiredResourceCount = 0;
     uint64_t residentGpuBytes = 0;
     uint64_t residentCpuBytes = 0;
     uint64_t inFlightUploadBytes = 0;
+    uint64_t pendingRetiredGpuBytes = 0;
 };
 
 struct NativeGpuAssetEvictionResult {
     uint32_t evictedAssets = 0;
     uint64_t freedGpuBytes = 0;
     uint64_t freedCpuBytes = 0;
+    uint64_t pendingRetiredGpuBytes = 0;
     bool budgetMet = true;
     std::vector<AssetGuid> evictedGuids;
 };
@@ -171,7 +174,8 @@ public:
     [[nodiscard]] bool ensureImageResource(ResourceAllocator& allocator, const AssetGuid& guid, const ImageDesc& desc, uint64_t estimatedBytes);
     [[nodiscard]] Image* imageResource(const AssetGuid& guid);
     [[nodiscard]] const Image* imageResource(const AssetGuid& guid) const;
-    [[nodiscard]] NativeGpuAssetEvictionResult evictToBudget(const NativeGpuAssetCacheBudget& budget);
+    uint32_t retireCompletedResources(uint64_t completedTimeline);
+    [[nodiscard]] NativeGpuAssetEvictionResult evictToBudget(const NativeGpuAssetCacheBudget& budget, uint64_t retireAfterTimeline = 0);
     [[nodiscard]] NativeGpuAssetCacheStats stats() const;
     [[nodiscard]] std::vector<NativeGpuAssetSnapshot> snapshots() const;
 
@@ -187,12 +191,22 @@ private:
         std::unique_ptr<Image> gpuImage;
     };
 
+    struct RetiredResource {
+        AssetGuid guid;
+        uint64_t retireAfterTimeline = 0;
+        uint64_t gpuBytes = 0;
+        std::unique_ptr<Buffer> gpuBuffer;
+        std::unique_ptr<Image> gpuImage;
+    };
+
     [[nodiscard]] Entry* find(const AssetGuid& guid);
     [[nodiscard]] const Entry* find(const AssetGuid& guid) const;
     [[nodiscard]] bool evictable(const Entry& entry, const NativeGpuAssetCacheBudget& budget) const;
+    void retireEntryResources(Entry& entry, uint64_t retireAfterTimeline);
 
     uint64_t frameCounter_ = 1;
     std::vector<Entry> entries_;
+    std::vector<RetiredResource> retiredResources_;
 };
 
 [[nodiscard]] const char* nativeGpuAssetKindName(NativeGpuAssetKind kind);
