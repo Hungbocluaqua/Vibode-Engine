@@ -1,15 +1,19 @@
 #pragma once
 
 #include "rtv/AssetRegistry.h"
+#include "rtv/Buffer.h"
 
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace rtv {
+
+class ResourceAllocator;
 
 enum class NativeGpuAssetKind : uint8_t {
     Mesh,
@@ -74,6 +78,7 @@ struct NativeGpuAssetSnapshot {
     uint64_t cpuBytes = 0;
     uint64_t gpuBytes = 0;
     uint64_t uploadBytes = 0;
+    uint64_t ownedGpuBufferBytes = 0;
     uint64_t uploadTicketId = 0;
     uint64_t blasBuildTicketId = 0;
     uint64_t tlasPatchTicketId = 0;
@@ -99,6 +104,7 @@ struct NativeGpuAssetSnapshot {
     bool pinned = false;
     bool selected = false;
     bool evictable = false;
+    bool ownsGpuBuffer = false;
 };
 
 struct NativeGpuAssetCacheStats {
@@ -138,6 +144,8 @@ struct NativeGpuAssetEvictionResult {
 
 class NativeGpuAssetCache {
 public:
+    ~NativeGpuAssetCache();
+
     void upsert(NativeGpuAssetDesc desc);
     [[nodiscard]] bool addRef(const AssetGuid& guid);
     [[nodiscard]] bool release(const AssetGuid& guid);
@@ -154,6 +162,9 @@ public:
     [[nodiscard]] bool setPinned(const AssetGuid& guid, bool pinned);
     [[nodiscard]] bool setSelected(const AssetGuid& guid, bool selected);
     [[nodiscard]] bool touch(const AssetGuid& guid);
+    [[nodiscard]] bool ensureBufferResource(ResourceAllocator& allocator, const AssetGuid& guid, uint64_t bytes, uint32_t usageFlags, const char* debugName);
+    [[nodiscard]] Buffer* bufferResource(const AssetGuid& guid);
+    [[nodiscard]] const Buffer* bufferResource(const AssetGuid& guid) const;
     [[nodiscard]] NativeGpuAssetEvictionResult evictToBudget(const NativeGpuAssetCacheBudget& budget);
     [[nodiscard]] NativeGpuAssetCacheStats stats() const;
     [[nodiscard]] std::vector<NativeGpuAssetSnapshot> snapshots() const;
@@ -164,6 +175,8 @@ private:
         NativeGpuAssetResidency residency = NativeGpuAssetResidency::Queued;
         uint32_t refCount = 0;
         uint64_t lastTouchedFrame = 0;
+        uint64_t ownedGpuBufferBytes = 0;
+        std::unique_ptr<Buffer> gpuBuffer;
     };
 
     [[nodiscard]] Entry* find(const AssetGuid& guid);

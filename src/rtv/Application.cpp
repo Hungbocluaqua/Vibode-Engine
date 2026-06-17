@@ -1,6 +1,7 @@
 #include "rtv/Application.h"
 
 #include "rtv/AssetImport.h"
+#include "rtv/Buffer.h"
 #include "rtv/CommandSystem.h"
 #include "rtv/BufferUploader.h"
 #include "rtv/DiagnosticImageExport.h"
@@ -42,6 +43,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -3979,6 +3981,40 @@ uint64_t estimatedMeshUploadBytes(const rtv::MeshAsset& mesh) {
     return vertexBytes + indexBytes;
 }
 
+std::vector<uint8_t> meshUploadPayloadChunk(const rtv::MeshAsset& mesh, uint64_t byteOffset, uint64_t byteCount) {
+    const uint64_t totalBytes = estimatedMeshUploadBytes(mesh);
+    if (byteCount == 0 || byteOffset >= totalBytes) {
+        return {};
+    }
+    byteCount = std::min(byteCount, totalBytes - byteOffset);
+    std::vector<uint8_t> out(static_cast<size_t>(byteCount));
+
+    const uint64_t vertexBytes = static_cast<uint64_t>(mesh.vertices.size()) * static_cast<uint64_t>(sizeof(rtv::MeshVertex));
+    const auto copyRange = [&](uint64_t srcStart, uint64_t srcSize, const void* srcData) {
+        const uint64_t srcEnd = srcStart + srcSize;
+        const uint64_t dstEnd = byteOffset + byteCount;
+        const uint64_t overlapBegin = std::max(byteOffset, srcStart);
+        const uint64_t overlapEnd = std::min(dstEnd, srcEnd);
+        if (overlapBegin >= overlapEnd) {
+            return;
+        }
+        const uint64_t dstOffset = overlapBegin - byteOffset;
+        const uint64_t srcOffset = overlapBegin - srcStart;
+        std::memcpy(
+            out.data() + static_cast<size_t>(dstOffset),
+            static_cast<const uint8_t*>(srcData) + static_cast<size_t>(srcOffset),
+            static_cast<size_t>(overlapEnd - overlapBegin));
+    };
+
+    if (!mesh.vertices.empty()) {
+        copyRange(0, vertexBytes, mesh.vertices.data());
+    }
+    if (!mesh.indices.empty()) {
+        copyRange(vertexBytes, totalBytes - vertexBytes, mesh.indices.data());
+    }
+    return out;
+}
+
 uint64_t estimatedTextureUploadBytes(const rtv::TextureAsset& texture) {
     uint64_t bytes = 0;
     for (const rtv::TextureMipLevel& mip : texture.mipData) {
@@ -4115,13 +4151,24 @@ nlohmann::json Application::streamingRuntimeReport() const {
             {"executor_timeline", executorTimeline},
         });
     }
+    bool hasPayloadBackedWork = false;
+    for (const StreamingGpuWorkSnapshot& ticket : streamingGpuWorkQueue_.snapshots()) {
+        hasPayloadBackedWork = hasPayloadBackedWork || ticket.payloadBacked;
+    }
+    uint64_t pendingPayloadBytes = 0;
+    for (const auto& [ticketId, payload] : streamingGpuBufferUploadPayloads_) {
+        (void)ticketId;
+        pendingPayloadBytes += static_cast<uint64_t>(payload.bytes.size());
+    }
     report["streaming_gpu_work_queue"] = {
         {"stats", streamingGpuWorkQueueStatsJson(streamingGpuWorkQueue_.stats())},
         {"hitch_summary", streamingGpuWorkPressureStatsJson(streamingGpuWorkQueue_.pressureStats())},
         {"tickets", streamingGpuWorkQueueSnapshotsJson(streamingGpuWorkQueue_.snapshots())},
         {"next_timeline_value", streamingGpuWorkQueue_.nextTimelineValue()},
         {"completed_timeline", streamingGpuWorkCompletedTimeline_},
-        {"payload_backed_executor_work", false},
+        {"payload_backed_executor_work", hasPayloadBackedWork},
+        {"pending_payload_buffer_uploads", streamingGpuBufferUploadPayloads_.size()},
+        {"pending_payload_buffer_upload_bytes", pendingPayloadBytes},
         {"marker_only_completion_event_emitted", streamingGpuMarkerOnlyCompletionEventEmitted_},
         {"pending_timeline_markers", streamingGpuTimelineMarkers},
         {"transfer_executor_ready", streamingGpuTransferExecutorReady_},
@@ -10203,6 +10250,27 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
                 .uploadBytes = uploadBytes,
                 .fallbackDescriptorBound = true,
             });
+            bool meshPayloadBacked = false;
+            if (mesh != nullptr && uploadBytes > 0 && allocator_ != nullptr) {
+                const VkBufferUsageFlags usage =
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+                const std::string debugName = "streaming mesh payload " + guid;
+                try {
+                    meshPayloadBacked = nativeGpuAssetCache_.ensureBufferResource(
+                        *allocator_,
+                        guid,
+                        uploadBytes,
+                        usage,
+                        debugName.c_str());
+                } catch (const std::exception& e) {
+                    streamingRuntimeState_.pushEvent("streaming mesh GPU buffer allocation failed for " + guid + ": " + e.what());
+                    meshPayloadBacked = false;
+                }
+            }
             const uint64_t uploadChunkBytes = std::max<uint64_t>(1ull * 1024ull * 1024ull, streamingOptions_.uploadBytesPerFrame);
             uint64_t uploaded = 0;
             uint64_t firstUploadTicket = 0;
@@ -10216,7 +10284,15 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
                     .ownerGuid = guid,
                     .bytes = chunkBytes,
                     .estimatedGpuMs = 0.10,
+                    .payloadBacked = meshPayloadBacked && chunkBytes > 0,
                 });
+                if (meshPayloadBacked && chunkBytes > 0 && mesh != nullptr) {
+                    streamingGpuBufferUploadPayloads_[uploadTicket] = StreamingGpuBufferUploadPayload{
+                        .ownerGuid = guid,
+                        .destinationOffset = uploaded,
+                        .bytes = meshUploadPayloadChunk(*mesh, uploaded, chunkBytes),
+                    };
+                }
                 if (firstUploadTicket == 0) {
                     firstUploadTicket = uploadTicket;
                 }
@@ -15174,8 +15250,10 @@ void Application::stepStreamingGpuWorkQueue() {
         streamingGpuWorkCompletedTimeline_ = completedWorkQueueTimeline;
     }
 
-    if (streamingGpuWorkCompletedTimeline_ != 0) {
-        (void)streamingGpuWorkQueue_.completeTimeline(streamingGpuWorkCompletedTimeline_);
+    {
+        if (streamingGpuWorkCompletedTimeline_ != 0) {
+            (void)streamingGpuWorkQueue_.completeTimeline(streamingGpuWorkCompletedTimeline_);
+        }
         const std::vector<StreamingGpuWorkSnapshot> snapshots = streamingGpuWorkQueue_.snapshots();
         std::unordered_map<AssetGuid, bool> ownerComplete;
         std::unordered_map<AssetGuid, bool> ownerFailed;
@@ -15258,6 +15336,34 @@ void Application::stepStreamingGpuWorkQueue() {
     }
 
     if (streamingGpuTransferExecutorReady_) {
+        bool submittedPayloadWork = false;
+        for (const StreamingGpuSubmittedTicket& ticket : result.submitted) {
+            if (!ticket.payloadBacked || ticket.kind != StreamingGpuWorkKind::BufferUpload) {
+                continue;
+            }
+            auto payloadIt = streamingGpuBufferUploadPayloads_.find(ticket.id);
+            Buffer* destination = payloadIt != streamingGpuBufferUploadPayloads_.end()
+                ? nativeGpuAssetCache_.bufferResource(payloadIt->second.ownerGuid)
+                : nullptr;
+            if (payloadIt == streamingGpuBufferUploadPayloads_.end() ||
+                destination == nullptr ||
+                payloadIt->second.bytes.empty() ||
+                payloadIt->second.bytes.size() != ticket.bytes ||
+                !streamingGpuTransferExecutor_.stageBufferUpload(
+                    *destination,
+                    payloadIt->second.bytes.data(),
+                    static_cast<uint64_t>(payloadIt->second.bytes.size()),
+                    payloadIt->second.destinationOffset)) {
+                (void)streamingGpuWorkQueue_.fail(ticket.id);
+                streamingRuntimeState_.pushEvent("streaming GPU payload staging failed for ticket " + std::to_string(ticket.id));
+                if (payloadIt != streamingGpuBufferUploadPayloads_.end()) {
+                    streamingGpuBufferUploadPayloads_.erase(payloadIt);
+                }
+                continue;
+            }
+            submittedPayloadWork = true;
+            streamingGpuBufferUploadPayloads_.erase(payloadIt);
+        }
         const uint64_t workQueueTimeline = result.highestSubmittedTimeline;
         if (workQueueTimeline != 0 &&
             (streamingGpuWorkTimelineMarkers_.empty() ||
@@ -15265,6 +15371,9 @@ void Application::stepStreamingGpuWorkQueue() {
             const uint64_t marker = streamingGpuTransferExecutor_.submitTimelineMarker();
             if (marker != 0) {
                 streamingGpuWorkTimelineMarkers_.emplace_back(workQueueTimeline, marker);
+                if (submittedPayloadWork) {
+                    streamingRuntimeState_.pushEvent("submitted payload-backed streaming GPU transfers through device timeline " + std::to_string(marker));
+                }
             }
         }
     } else if (!liveDeviceAvailable) {

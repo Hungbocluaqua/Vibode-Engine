@@ -1,5 +1,8 @@
 #include "rtv/NativeGpuAssetCache.h"
 
+#include "rtv/Buffer.h"
+#include "rtv/ResourceAllocator.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -8,6 +11,8 @@
 #include <utility>
 
 namespace rtv {
+
+NativeGpuAssetCache::~NativeGpuAssetCache() = default;
 
 const char* nativeGpuAssetKindName(NativeGpuAssetKind kind) {
     switch (kind) {
@@ -217,6 +222,8 @@ bool NativeGpuAssetCache::markDescriptorPatchComplete(const AssetGuid& guid) {
 bool NativeGpuAssetCache::markFailed(const AssetGuid& guid) {
     if (Entry* entry = find(guid)) {
         entry->residency = NativeGpuAssetResidency::Failed;
+        entry->gpuBuffer.reset();
+        entry->ownedGpuBufferBytes = 0;
         entry->desc.fallbackDescriptorBound = true;
         entry->desc.blasBuildPending = false;
         entry->desc.blasReady = false;
@@ -262,6 +269,49 @@ bool NativeGpuAssetCache::touch(const AssetGuid& guid) {
     return false;
 }
 
+bool NativeGpuAssetCache::ensureBufferResource(
+    ResourceAllocator& allocator,
+    const AssetGuid& guid,
+    uint64_t bytes,
+    uint32_t usageFlags,
+    const char* debugName) {
+    if (bytes == 0 || usageFlags == 0) {
+        return false;
+    }
+    Entry* entry = find(guid);
+    if (entry == nullptr) {
+        return false;
+    }
+    if (entry->gpuBuffer != nullptr &&
+        entry->gpuBuffer->handle() != VK_NULL_HANDLE &&
+        entry->gpuBuffer->size() >= bytes &&
+        (entry->gpuBuffer->usage() & usageFlags) == usageFlags) {
+        entry->ownedGpuBufferBytes = static_cast<uint64_t>(entry->gpuBuffer->size());
+        entry->lastTouchedFrame = ++frameCounter_;
+        return true;
+    }
+
+    BufferDesc desc{};
+    desc.size = static_cast<VkDeviceSize>(bytes);
+    desc.usage = static_cast<VkBufferUsageFlags>(usageFlags);
+    desc.memory = BufferMemory::GpuOnly;
+    desc.debugName = debugName;
+    entry->gpuBuffer = std::make_unique<Buffer>(allocator, desc);
+    entry->ownedGpuBufferBytes = bytes;
+    entry->lastTouchedFrame = ++frameCounter_;
+    return true;
+}
+
+Buffer* NativeGpuAssetCache::bufferResource(const AssetGuid& guid) {
+    Entry* entry = find(guid);
+    return entry != nullptr ? entry->gpuBuffer.get() : nullptr;
+}
+
+const Buffer* NativeGpuAssetCache::bufferResource(const AssetGuid& guid) const {
+    const Entry* entry = find(guid);
+    return entry != nullptr ? entry->gpuBuffer.get() : nullptr;
+}
+
 NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuAssetCacheBudget& budget) {
     NativeGpuAssetEvictionResult result;
     NativeGpuAssetCacheStats current = stats();
@@ -288,6 +338,8 @@ NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuA
             break;
         }
         entry->residency = NativeGpuAssetResidency::Retired;
+        entry->gpuBuffer.reset();
+        entry->ownedGpuBufferBytes = 0;
         entry->desc.fallbackDescriptorBound = true;
         entry->desc.blasBuildPending = false;
         entry->desc.blasReady = false;
@@ -394,6 +446,7 @@ std::vector<NativeGpuAssetSnapshot> NativeGpuAssetCache::snapshots() const {
             .cpuBytes = entry.desc.cpuBytes,
             .gpuBytes = entry.desc.gpuBytes,
             .uploadBytes = entry.desc.uploadBytes,
+            .ownedGpuBufferBytes = entry.ownedGpuBufferBytes,
             .uploadTicketId = entry.desc.uploadTicketId,
             .blasBuildTicketId = entry.desc.blasBuildTicketId,
             .tlasPatchTicketId = entry.desc.tlasPatchTicketId,
@@ -419,6 +472,7 @@ std::vector<NativeGpuAssetSnapshot> NativeGpuAssetCache::snapshots() const {
             .pinned = entry.desc.pinned,
             .selected = entry.desc.selected,
             .evictable = evictable(entry, defaultBudget),
+            .ownsGpuBuffer = entry.gpuBuffer != nullptr && entry.gpuBuffer->handle() != VK_NULL_HANDLE,
         });
     }
     std::sort(out.begin(), out.end(), [](const NativeGpuAssetSnapshot& a, const NativeGpuAssetSnapshot& b) {
@@ -514,6 +568,7 @@ nlohmann::json nativeGpuAssetCacheSnapshotsJson(const std::vector<NativeGpuAsset
             {"cpu_bytes", snapshot.cpuBytes},
             {"gpu_bytes", snapshot.gpuBytes},
             {"upload_bytes", snapshot.uploadBytes},
+            {"owned_gpu_buffer_bytes", snapshot.ownedGpuBufferBytes},
             {"upload_ticket_id", snapshot.uploadTicketId},
             {"blas_build_ticket_id", snapshot.blasBuildTicketId},
             {"tlas_patch_ticket_id", snapshot.tlasPatchTicketId},
@@ -539,6 +594,7 @@ nlohmann::json nativeGpuAssetCacheSnapshotsJson(const std::vector<NativeGpuAsset
             {"pinned", snapshot.pinned},
             {"selected", snapshot.selected},
             {"evictable", snapshot.evictable},
+            {"owns_gpu_buffer", snapshot.ownsGpuBuffer},
         });
     }
     return out;

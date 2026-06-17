@@ -24,11 +24,26 @@ ResourceAllocator::ResourceAllocator(const VulkanContext& context) {
     supportsMemoryBudget_ = context.supportsMemoryBudget();
     maxSamplerAnisotropy_ = context.maxSamplerAnisotropy();
     const QueueFamilyIndices& queues = context.queueFamilies();
-    if (queues.graphics.has_value() && queues.compute.has_value() && queues.graphics.value() != queues.compute.value()) {
+    auto appendQueueFamily = [&](std::optional<uint32_t> family) {
+        if (!family.has_value()) {
+            return;
+        }
+        for (uint32_t i = 0; i < graphicsComputeQueueFamilyCount_; ++i) {
+            if (graphicsComputeQueueFamilies_[i] == family.value()) {
+                return;
+            }
+        }
+        if (graphicsComputeQueueFamilyCount_ < graphicsComputeQueueFamilies_.size()) {
+            graphicsComputeQueueFamilies_[graphicsComputeQueueFamilyCount_++] = family.value();
+        }
+    };
+    appendQueueFamily(queues.graphics);
+    appendQueueFamily(queues.compute);
+    appendQueueFamily(queues.transfer);
+    if (graphicsComputeQueueFamilyCount_ > 1) {
         graphicsComputeSharingMode_ = VK_SHARING_MODE_CONCURRENT;
-        graphicsComputeQueueFamilyCount_ = 2;
-        graphicsComputeQueueFamilies_[0] = queues.graphics.value();
-        graphicsComputeQueueFamilies_[1] = queues.compute.value();
+    } else {
+        graphicsComputeQueueFamilyCount_ = 0;
     }
 
     VmaVulkanFunctions functions{};

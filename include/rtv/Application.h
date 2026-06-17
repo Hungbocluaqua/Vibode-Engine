@@ -638,6 +638,12 @@ private:
     bool streamingGpuTransferExecutorReady_ = false;
     bool streamingGpuTransferExecutorInitAttempted_ = false;
     bool streamingGpuMarkerOnlyCompletionEventEmitted_ = false;
+    struct StreamingGpuBufferUploadPayload {
+        AssetGuid ownerGuid;
+        uint64_t destinationOffset = 0;
+        std::vector<uint8_t> bytes;
+    };
+    std::unordered_map<uint64_t, StreamingGpuBufferUploadPayload> streamingGpuBufferUploadPayloads_;
     // Maps a streaming work-queue submitted timeline value to the real device
     // transfer-executor timeline marker that gates its completion. Front-to-back
     // ascending; drained as the device signals each marker.

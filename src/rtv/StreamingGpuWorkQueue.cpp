@@ -124,6 +124,16 @@ StreamingGpuWorkFrameResult StreamingGpuWorkQueue::submitFrame(const StreamingGp
         result.submittedTlasPatches += ticket.desc.tlasPatches;
         result.submittedDescriptorUpdates += ticket.desc.descriptorUpdates;
         result.highestSubmittedTimeline = ticket.submittedTimeline;
+        result.submitted.push_back(StreamingGpuSubmittedTicket{
+            .id = ticket.id,
+            .kind = ticket.desc.kind,
+            .ownerGuid = ticket.desc.ownerGuid,
+            .bytes = ticket.desc.bytes,
+            .submittedTimeline = ticket.submittedTimeline,
+            .retainedStagingBytes = ticket.retainedStagingBytes,
+            .textureMipLevel = ticket.desc.textureMipLevel,
+            .payloadBacked = ticket.desc.payloadBacked,
+        });
         peakRetainedStagingBytes_ = std::max(peakRetainedStagingBytes_, retainedStagingBytes());
     }
     result.retainedStagingBytes = retainedStagingBytes();
@@ -153,6 +163,18 @@ bool StreamingGpuWorkQueue::cancel(uint64_t id) {
     for (Ticket& ticket : tickets_) {
         if (ticket.id == id && !terminal(ticket.state)) {
             ticket.state = StreamingGpuWorkState::Cancelled;
+            ticket.retainedStagingBytes = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool StreamingGpuWorkQueue::fail(uint64_t id) {
+    for (Ticket& ticket : tickets_) {
+        if (ticket.id == id && !terminal(ticket.state)) {
+            ticket.state = StreamingGpuWorkState::Failed;
+            ticket.retainedStagingBytes = 0;
             return true;
         }
     }
@@ -369,6 +391,20 @@ nlohmann::json streamingGpuWorkFrameResultJson(const StreamingGpuWorkFrameResult
         hitchSources.push_back("DescriptorUpdate");
     }
 
+    nlohmann::json submitted = nlohmann::json::array();
+    for (const StreamingGpuSubmittedTicket& ticket : frame.submitted) {
+        submitted.push_back({
+            {"id", ticket.id},
+            {"kind", streamingGpuWorkKindName(ticket.kind)},
+            {"owner_guid", ticket.ownerGuid},
+            {"bytes", ticket.bytes},
+            {"submitted_timeline", ticket.submittedTimeline},
+            {"retained_staging_bytes", ticket.retainedStagingBytes},
+            {"texture_mip_level", ticket.textureMipLevel == UINT32_MAX ? nlohmann::json(nullptr) : nlohmann::json(ticket.textureMipLevel)},
+            {"payload_backed", ticket.payloadBacked},
+        });
+    }
+
     return {
         {"frame_index", frame.frameIndex},
         {"submitted_tickets", frame.submittedTickets},
@@ -388,6 +424,7 @@ nlohmann::json streamingGpuWorkFrameResultJson(const StreamingGpuWorkFrameResult
         {"blas_budget_exhausted", frame.blasBudgetExhausted},
         {"tlas_budget_exhausted", frame.tlasBudgetExhausted},
         {"descriptor_budget_exhausted", frame.descriptorBudgetExhausted},
+        {"submitted", submitted},
         {"hitch_sources", hitchSources},
     };
 }

@@ -72,7 +72,7 @@ private:
     float maxSamplerAnisotropy_ = 1.0f;
     VkSharingMode graphicsComputeSharingMode_ = VK_SHARING_MODE_EXCLUSIVE;
     uint32_t graphicsComputeQueueFamilyCount_ = 0;
-    std::array<uint32_t, 2> graphicsComputeQueueFamilies_{};
+    std::array<uint32_t, 3> graphicsComputeQueueFamilies_{};
     mutable uint64_t previousBudgetUsageBytes_ = 0;
     mutable uint64_t peakBudgetUsageBytes_ = 0;
     mutable bool hasPreviousBudgetUsage_ = false;

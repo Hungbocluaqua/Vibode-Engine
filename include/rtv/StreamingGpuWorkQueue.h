@@ -52,6 +52,17 @@ struct StreamingGpuWorkBudget {
     uint32_t maxDescriptorUpdates = 256;
 };
 
+struct StreamingGpuSubmittedTicket {
+    uint64_t id = 0;
+    StreamingGpuWorkKind kind = StreamingGpuWorkKind::BufferUpload;
+    std::string ownerGuid;
+    uint64_t bytes = 0;
+    uint64_t submittedTimeline = 0;
+    uint64_t retainedStagingBytes = 0;
+    uint32_t textureMipLevel = UINT32_MAX;
+    bool payloadBacked = false;
+};
+
 struct StreamingGpuWorkFrameResult {
     uint32_t frameIndex = 0;
     uint32_t submittedTickets = 0;
@@ -71,6 +82,7 @@ struct StreamingGpuWorkFrameResult {
     bool blasBudgetExhausted = false;
     bool tlasBudgetExhausted = false;
     bool descriptorBudgetExhausted = false;
+    std::vector<StreamingGpuSubmittedTicket> submitted;
 };
 
 struct StreamingGpuWorkSnapshot {
@@ -129,6 +141,7 @@ public:
     [[nodiscard]] StreamingGpuWorkFrameResult submitFrame(const StreamingGpuWorkBudget& budget);
     [[nodiscard]] bool completeTimeline(uint64_t completedTimeline);
     [[nodiscard]] bool cancel(uint64_t id);
+    [[nodiscard]] bool fail(uint64_t id);
     [[nodiscard]] bool empty() const;
     [[nodiscard]] uint64_t nextTimelineValue() const { return nextTimelineValue_; }
     [[nodiscard]] std::vector<StreamingGpuWorkSnapshot> snapshots() const;
