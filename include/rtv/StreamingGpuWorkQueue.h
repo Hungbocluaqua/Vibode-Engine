@@ -39,6 +39,7 @@ struct StreamingGpuWorkDesc {
     uint32_t tlasPatches = 0;
     uint32_t descriptorUpdates = 0;
     bool requiresGraphicsQueue = true;
+    bool payloadBacked = false;
 };
 
 struct StreamingGpuWorkBudget {
@@ -88,6 +89,7 @@ struct StreamingGpuWorkSnapshot {
     uint64_t submittedTimeline = 0;
     uint64_t retainedStagingBytes = 0;
     bool requiresGraphicsQueue = true;
+    bool payloadBacked = false;
     bool canCancel = false;
     bool canRetire = false;
 };

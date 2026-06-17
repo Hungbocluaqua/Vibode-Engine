@@ -15177,30 +15177,30 @@ void Application::stepStreamingGpuWorkQueue() {
     if (streamingGpuWorkCompletedTimeline_ != 0) {
         (void)streamingGpuWorkQueue_.completeTimeline(streamingGpuWorkCompletedTimeline_);
         const std::vector<StreamingGpuWorkSnapshot> snapshots = streamingGpuWorkQueue_.snapshots();
-        bool payloadBackedGpuWork = false;
         std::unordered_map<AssetGuid, bool> ownerComplete;
         std::unordered_map<AssetGuid, bool> ownerFailed;
+        std::unordered_map<AssetGuid, bool> ownerPayloadBacked;
         for (const StreamingGpuWorkSnapshot& ticket : snapshots) {
             if (ticket.ownerGuid.empty()) {
                 continue;
             }
-            if (payloadBackedGpuWork &&
+            if (ticket.payloadBacked &&
                 ticket.kind == StreamingGpuWorkKind::ImageMipUpload &&
                 ticket.state == StreamingGpuWorkState::Complete &&
                 ticket.textureMipLevel != UINT32_MAX) {
                 (void)nativeGpuAssetCache_.markTextureMipResident(ticket.ownerGuid, ticket.textureMipLevel);
             }
-            if (payloadBackedGpuWork &&
+            if (ticket.payloadBacked &&
                 ticket.kind == StreamingGpuWorkKind::DescriptorUpdate &&
                 ticket.state == StreamingGpuWorkState::Complete) {
                 (void)nativeGpuAssetCache_.markDescriptorPatchComplete(ticket.ownerGuid);
             }
-            if (payloadBackedGpuWork &&
+            if (ticket.payloadBacked &&
                 ticket.kind == StreamingGpuWorkKind::BlasBuild &&
                 ticket.state == StreamingGpuWorkState::Complete) {
                 (void)nativeGpuAssetCache_.markBlasReady(ticket.ownerGuid);
             }
-            if (payloadBackedGpuWork &&
+            if (ticket.payloadBacked &&
                 ticket.kind == StreamingGpuWorkKind::TlasPatch &&
                 ticket.state == StreamingGpuWorkState::Complete) {
                 (void)nativeGpuAssetCache_.markTlasVisible(ticket.ownerGuid);
@@ -15212,19 +15212,27 @@ void Application::stepStreamingGpuWorkQueue() {
             if (ticket.state != StreamingGpuWorkState::Complete) {
                 completeIt->second = false;
             }
+            auto payloadBackedIt = ownerPayloadBacked.find(ticket.ownerGuid);
+            if (payloadBackedIt == ownerPayloadBacked.end()) {
+                payloadBackedIt = ownerPayloadBacked.emplace(ticket.ownerGuid, true).first;
+            }
+            if (!ticket.payloadBacked) {
+                payloadBackedIt->second = false;
+            }
             if (ticket.state == StreamingGpuWorkState::Cancelled || ticket.state == StreamingGpuWorkState::Failed) {
                 ownerFailed[ticket.ownerGuid] = true;
             }
         }
         for (const auto& [guid, complete] : ownerComplete) {
+            const bool payloadBacked = ownerPayloadBacked[guid];
             if (ownerFailed[guid]) {
                 streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Failed, "streaming GPU work failed or was cancelled");
                 (void)nativeGpuAssetCache_.markFailed(guid);
-            } else if (complete && payloadBackedGpuWork && streamingRuntimeState_.assetState(guid) != StreamingAssetState::GpuResident) {
+            } else if (complete && payloadBacked && streamingRuntimeState_.assetState(guid) != StreamingAssetState::GpuResident) {
                 streamingRuntimeState_.setAssetState(guid, StreamingAssetState::GpuResident);
                 (void)nativeGpuAssetCache_.markResident(guid);
                 streamingRuntimeState_.pushEvent("streaming GPU work completed for " + guid);
-            } else if (complete && !payloadBackedGpuWork) {
+            } else if (complete && !payloadBacked) {
                 if (streamingRuntimeState_.assetState(guid) != StreamingAssetState::Uploading) {
                     streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Uploading);
                 }

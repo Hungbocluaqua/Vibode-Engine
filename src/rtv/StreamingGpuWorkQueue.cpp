@@ -185,6 +185,7 @@ std::vector<StreamingGpuWorkSnapshot> StreamingGpuWorkQueue::snapshots() const {
             .submittedTimeline = ticket.submittedTimeline,
             .retainedStagingBytes = ticket.retainedStagingBytes,
             .requiresGraphicsQueue = ticket.desc.requiresGraphicsQueue,
+            .payloadBacked = ticket.desc.payloadBacked,
             .canCancel = !terminal(ticket.state),
             .canRetire = terminal(ticket.state) && ticket.retainedStagingBytes == 0,
         });
@@ -453,6 +454,7 @@ nlohmann::json streamingGpuWorkQueueSnapshotsJson(const std::vector<StreamingGpu
             {"submitted_timeline", snapshot.submittedTimeline},
             {"retained_staging_bytes", snapshot.retainedStagingBytes},
             {"requires_graphics_queue", snapshot.requiresGraphicsQueue},
+            {"payload_backed", snapshot.payloadBacked},
             {"can_cancel", snapshot.canCancel},
             {"can_retire", snapshot.canRetire},
         });
