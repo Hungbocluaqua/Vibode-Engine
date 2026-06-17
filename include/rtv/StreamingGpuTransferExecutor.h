@@ -66,6 +66,12 @@ public:
     // timeline value (0 if nothing was recorded).
     uint64_t submitFrame();
 
+    // Signal a timeline value for the current transfer batch. If copies are
+    // recorded, submitFrame() is used and that submission's timeline gates the
+    // batch. Otherwise, submit a no-op timeline marker. Returns the signaled
+    // value, or 0 if the executor is unavailable.
+    uint64_t submitTimelineMarker();
+
     // Poll the device timeline and reclaim staging for completed submissions.
     // Returns the completed timeline value.
     uint64_t poll();

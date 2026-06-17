@@ -134,8 +134,8 @@ uint64_t StreamingStagingRing::retire(uint64_t completedTimeline) {
     highestRetiredTimeline_ = std::max(highestRetiredTimeline_, completedTimeline);
     if (pending_.empty()) {
         // Fully drained: collapse monotonic counters to avoid unbounded growth.
-        head_ = head_ % capacityBytes_;
-        tail_ = head_;
+        head_ = 0;
+        tail_ = 0;
     }
     return reclaimed;
 }

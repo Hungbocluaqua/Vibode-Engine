@@ -19,6 +19,7 @@
 #include "rtv/NotificationManager.h"
 #include "rtv/Prefab.h"
 #include "rtv/NativeGpuAssetCache.h"
+#include "rtv/StreamingGpuTransferExecutor.h"
 #include "rtv/StreamingGpuWorkQueue.h"
 #include "rtv/StreamingIoBackend.h"
 #include "rtv/StreamingRuntime.h"
@@ -633,6 +634,14 @@ private:
     NativeGpuAssetCache nativeGpuAssetCache_;
     NativeGpuAssetEvictionResult lastStreamingEviction_{};
     StreamingGpuWorkQueue streamingGpuWorkQueue_;
+    StreamingGpuTransferExecutor streamingGpuTransferExecutor_;
+    bool streamingGpuTransferExecutorReady_ = false;
+    bool streamingGpuTransferExecutorInitAttempted_ = false;
+    bool streamingGpuMarkerOnlyCompletionEventEmitted_ = false;
+    // Maps a streaming work-queue submitted timeline value to the real device
+    // transfer-executor timeline marker that gates its completion. Front-to-back
+    // ascending; drained as the device signals each marker.
+    std::deque<std::pair<uint64_t, uint64_t>> streamingGpuWorkTimelineMarkers_;
     IncrementalGpuSceneUpdateQueue streamingGpuSceneUpdateQueue_;
     IncrementalGpuSceneApplyFrameResult lastStreamingGpuSceneApply_{};
     StreamingIoMetrics streamingIoMetrics_{};

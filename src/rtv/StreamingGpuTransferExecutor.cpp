@@ -134,6 +134,10 @@ bool StreamingGpuTransferExecutor::stageBufferUpload(Buffer& destination, const 
         ++stagingAllocationFailures_;
         return false; // bounded back-pressure
     }
+    if (alloc->mapped == nullptr || alloc->buffer == VK_NULL_HANDLE) {
+        ++stagingAllocationFailures_;
+        return false;
+    }
     std::memcpy(alloc->mapped, src, static_cast<size_t>(bytes));
 
     VkCommandBuffer cmd = beginBatch();
@@ -186,6 +190,45 @@ uint64_t StreamingGpuTransferExecutor::submitFrame() {
     ++totalSubmissions_;
     openBatch_ = VK_NULL_HANDLE;
     openBatchCopies_ = 0;
+    return signalValue;
+}
+
+uint64_t StreamingGpuTransferExecutor::submitTimelineMarker() {
+    if (device_ == VK_NULL_HANDLE || timeline_ == VK_NULL_HANDLE) {
+        return 0;
+    }
+    // If copies are already recorded, their submission timeline is the marker
+    // for that batch. Callers that need a distinct no-op marker should call
+    // again after the batch has been submitted.
+    if (openBatch_ != VK_NULL_HANDLE && openBatchCopies_ > 0) {
+        return submitFrame();
+    }
+    // Discard an empty open batch if one was begun but nothing recorded.
+    if (openBatch_ != VK_NULL_HANDLE) {
+        vkEndCommandBuffer(openBatch_);
+        freeCommandBuffers_.push_back(openBatch_);
+        openBatch_ = VK_NULL_HANDLE;
+        openBatchCopies_ = 0;
+    }
+
+    // Submit an empty batch whose only purpose is to advance the device timeline
+    // so streaming completion can be gated on real GPU progress (never faked).
+    const uint64_t signalValue = nextTimelineValue_++;
+
+    VkSemaphoreSubmitInfo signalInfo{};
+    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signalInfo.semaphore = timeline_;
+    signalInfo.value = signalValue;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+
+    VkSubmitInfo2 submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signalInfo;
+    checkVk(vkQueueSubmit2(queue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit2(streaming transfer marker)");
+
+    submittedTimeline_ = signalValue;
+    ++totalSubmissions_;
     return signalValue;
 }
 

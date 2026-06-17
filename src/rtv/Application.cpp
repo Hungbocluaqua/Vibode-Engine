@@ -3809,6 +3809,8 @@ Application::~Application() {
         commandSystem_->setPathTracer(nullptr);
     }
     retiredPathTracers_.clear();
+    streamingGpuTransferExecutor_.shutdown();
+    streamingGpuTransferExecutorReady_ = false;
     pathTracer_.reset();
     commandSystem_.reset();
     uiOverlay_.reset();
@@ -4106,11 +4108,25 @@ nlohmann::json Application::streamingRuntimeReport() const {
             {"restir_instance_indices", resetMasks.restirInstanceIndices},
         };
     }
+    nlohmann::json streamingGpuTimelineMarkers = nlohmann::json::array();
+    for (const auto& [workQueueTimeline, executorTimeline] : streamingGpuWorkTimelineMarkers_) {
+        streamingGpuTimelineMarkers.push_back({
+            {"work_queue_timeline", workQueueTimeline},
+            {"executor_timeline", executorTimeline},
+        });
+    }
     report["streaming_gpu_work_queue"] = {
         {"stats", streamingGpuWorkQueueStatsJson(streamingGpuWorkQueue_.stats())},
         {"hitch_summary", streamingGpuWorkPressureStatsJson(streamingGpuWorkQueue_.pressureStats())},
         {"tickets", streamingGpuWorkQueueSnapshotsJson(streamingGpuWorkQueue_.snapshots())},
         {"next_timeline_value", streamingGpuWorkQueue_.nextTimelineValue()},
+        {"completed_timeline", streamingGpuWorkCompletedTimeline_},
+        {"payload_backed_executor_work", false},
+        {"marker_only_completion_event_emitted", streamingGpuMarkerOnlyCompletionEventEmitted_},
+        {"pending_timeline_markers", streamingGpuTimelineMarkers},
+        {"transfer_executor_ready", streamingGpuTransferExecutorReady_},
+        {"transfer_executor_init_attempted", streamingGpuTransferExecutorInitAttempted_},
+        {"transfer_executor", streamingGpuTransferExecutorStatsJson(streamingGpuTransferExecutor_.stats())},
     };
     report["streaming_io"] = {
         {"backend", streamingIoBackendAvailabilityJson(streamingOptions_)},
@@ -15131,29 +15147,61 @@ void Application::stepEditorTicketProbeQueues() {
 }
 
 void Application::stepStreamingGpuWorkQueue() {
+    // Gate work-queue completion on real device-timeline progress when a live
+    // transfer executor is available. The work queue remains the accounting
+    // layer; live completion advances only after the executor's device timeline
+    // marker signals.
+    const bool liveDeviceAvailable = context_ != nullptr && allocator_ != nullptr;
+    if (!streamingGpuTransferExecutorInitAttempted_ && liveDeviceAvailable) {
+        streamingGpuTransferExecutorInitAttempted_ = true;
+        const uint64_t stagingCapacity = std::max<uint64_t>(
+            4ull * 1024ull * 1024ull, streamingOptions_.uploadBytesPerFrame * 4ull);
+        streamingGpuTransferExecutorReady_ =
+            streamingGpuTransferExecutor_.initialize(*context_, *allocator_, stagingCapacity);
+        if (!streamingGpuTransferExecutorReady_) {
+            streamingRuntimeState_.pushEvent("streaming GPU transfer executor initialization failed; GPU work tickets remain pending");
+        }
+    }
+
+    if (streamingGpuTransferExecutorReady_) {
+        const uint64_t completedMarker = streamingGpuTransferExecutor_.poll();
+        uint64_t completedWorkQueueTimeline = streamingGpuWorkCompletedTimeline_;
+        while (!streamingGpuWorkTimelineMarkers_.empty() &&
+               streamingGpuWorkTimelineMarkers_.front().second <= completedMarker) {
+            completedWorkQueueTimeline = streamingGpuWorkTimelineMarkers_.front().first;
+            streamingGpuWorkTimelineMarkers_.pop_front();
+        }
+        streamingGpuWorkCompletedTimeline_ = completedWorkQueueTimeline;
+    }
+
     if (streamingGpuWorkCompletedTimeline_ != 0) {
         (void)streamingGpuWorkQueue_.completeTimeline(streamingGpuWorkCompletedTimeline_);
         const std::vector<StreamingGpuWorkSnapshot> snapshots = streamingGpuWorkQueue_.snapshots();
+        bool payloadBackedGpuWork = false;
         std::unordered_map<AssetGuid, bool> ownerComplete;
         std::unordered_map<AssetGuid, bool> ownerFailed;
         for (const StreamingGpuWorkSnapshot& ticket : snapshots) {
             if (ticket.ownerGuid.empty()) {
                 continue;
             }
-            if (ticket.kind == StreamingGpuWorkKind::ImageMipUpload &&
+            if (payloadBackedGpuWork &&
+                ticket.kind == StreamingGpuWorkKind::ImageMipUpload &&
                 ticket.state == StreamingGpuWorkState::Complete &&
                 ticket.textureMipLevel != UINT32_MAX) {
                 (void)nativeGpuAssetCache_.markTextureMipResident(ticket.ownerGuid, ticket.textureMipLevel);
             }
-            if (ticket.kind == StreamingGpuWorkKind::DescriptorUpdate &&
+            if (payloadBackedGpuWork &&
+                ticket.kind == StreamingGpuWorkKind::DescriptorUpdate &&
                 ticket.state == StreamingGpuWorkState::Complete) {
                 (void)nativeGpuAssetCache_.markDescriptorPatchComplete(ticket.ownerGuid);
             }
-            if (ticket.kind == StreamingGpuWorkKind::BlasBuild &&
+            if (payloadBackedGpuWork &&
+                ticket.kind == StreamingGpuWorkKind::BlasBuild &&
                 ticket.state == StreamingGpuWorkState::Complete) {
                 (void)nativeGpuAssetCache_.markBlasReady(ticket.ownerGuid);
             }
-            if (ticket.kind == StreamingGpuWorkKind::TlasPatch &&
+            if (payloadBackedGpuWork &&
+                ticket.kind == StreamingGpuWorkKind::TlasPatch &&
                 ticket.state == StreamingGpuWorkState::Complete) {
                 (void)nativeGpuAssetCache_.markTlasVisible(ticket.ownerGuid);
             }
@@ -15172,10 +15220,18 @@ void Application::stepStreamingGpuWorkQueue() {
             if (ownerFailed[guid]) {
                 streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Failed, "streaming GPU work failed or was cancelled");
                 (void)nativeGpuAssetCache_.markFailed(guid);
-            } else if (complete && streamingRuntimeState_.assetState(guid) != StreamingAssetState::GpuResident) {
+            } else if (complete && payloadBackedGpuWork && streamingRuntimeState_.assetState(guid) != StreamingAssetState::GpuResident) {
                 streamingRuntimeState_.setAssetState(guid, StreamingAssetState::GpuResident);
                 (void)nativeGpuAssetCache_.markResident(guid);
                 streamingRuntimeState_.pushEvent("streaming GPU work completed for " + guid);
+            } else if (complete && !payloadBackedGpuWork) {
+                if (streamingRuntimeState_.assetState(guid) != StreamingAssetState::Uploading) {
+                    streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Uploading);
+                }
+                if (!streamingGpuMarkerOnlyCompletionEventEmitted_) {
+                    streamingRuntimeState_.pushEvent("streaming GPU timeline marker completed logical tickets; payload-backed uploads/builds are not wired yet, so assets remain uploading");
+                    streamingGpuMarkerOnlyCompletionEventEmitted_ = true;
+                }
             }
         }
     }
@@ -15192,7 +15248,25 @@ void Application::stepStreamingGpuWorkQueue() {
     if (result.submittedTickets > 0) {
         streamingRuntimeState_.pushEvent("submitted streaming GPU work tickets: " + std::to_string(result.submittedTickets));
     }
-    streamingGpuWorkCompletedTimeline_ = streamingGpuWorkQueue_.nextTimelineValue() > 0 ? streamingGpuWorkQueue_.nextTimelineValue() - 1ull : 0ull;
+
+    if (streamingGpuTransferExecutorReady_) {
+        const uint64_t workQueueTimeline = result.highestSubmittedTimeline;
+        if (workQueueTimeline != 0 &&
+            (streamingGpuWorkTimelineMarkers_.empty() ||
+             streamingGpuWorkTimelineMarkers_.back().first < workQueueTimeline)) {
+            const uint64_t marker = streamingGpuTransferExecutor_.submitTimelineMarker();
+            if (marker != 0) {
+                streamingGpuWorkTimelineMarkers_.emplace_back(workQueueTimeline, marker);
+            }
+        }
+    } else if (!liveDeviceAvailable) {
+        // Offline/CPU-only paths keep the accounting simulation behavior.
+        streamingGpuWorkCompletedTimeline_ = streamingGpuWorkQueue_.nextTimelineValue() > 0 ? streamingGpuWorkQueue_.nextTimelineValue() - 1ull : 0ull;
+    } else {
+        // Live Vulkan path failed to initialize its executor. Do not fake GPU
+        // completion; tickets stay pending so diagnostics expose the failure.
+        streamingGpuWorkCompletedTimeline_ = 0;
+    }
 
     if (streamingOptions_.evictionEnabled) {
         lastStreamingEviction_ = nativeGpuAssetCache_.evictToBudget(NativeGpuAssetCacheBudget{
