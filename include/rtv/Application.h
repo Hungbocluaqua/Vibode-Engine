@@ -650,8 +650,16 @@ private:
         uint32_t height = 1;
         std::vector<uint8_t> bytes;
     };
+    struct StreamingGpuBlasBuildPayload {
+        AssetGuid ownerGuid;
+        uint64_t indexDataOffset = 0;
+        uint32_t vertexCount = 0;
+        uint32_t indexCount = 0;
+        uint32_t vertexStride = 0;
+    };
     std::unordered_map<uint64_t, StreamingGpuBufferUploadPayload> streamingGpuBufferUploadPayloads_;
     std::unordered_map<uint64_t, StreamingGpuImageMipUploadPayload> streamingGpuImageMipUploadPayloads_;
+    std::unordered_map<uint64_t, StreamingGpuBlasBuildPayload> streamingGpuBlasBuildPayloads_;
     // Maps a streaming work-queue submitted timeline value to the real device
     // transfer-executor timeline marker that gates its completion. Front-to-back
     // ascending; drained as the device signals each marker.

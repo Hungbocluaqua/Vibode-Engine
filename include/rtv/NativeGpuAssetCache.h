@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtv/AssetRegistry.h"
+#include "rtv/AccelerationStructure.h"
 #include "rtv/Buffer.h"
 #include "rtv/Image.h"
 
@@ -81,6 +82,8 @@ struct NativeGpuAssetSnapshot {
     uint64_t uploadBytes = 0;
     uint64_t ownedGpuBufferBytes = 0;
     uint64_t ownedGpuImageBytes = 0;
+    uint64_t ownedBlasBytes = 0;
+    uint64_t ownedBlasScratchBytes = 0;
     uint64_t uploadTicketId = 0;
     uint64_t blasBuildTicketId = 0;
     uint64_t tlasPatchTicketId = 0;
@@ -108,6 +111,7 @@ struct NativeGpuAssetSnapshot {
     bool evictable = false;
     bool ownsGpuBuffer = false;
     bool ownsGpuImage = false;
+    bool ownsBlas = false;
 };
 
 struct NativeGpuAssetCacheStats {
@@ -174,6 +178,11 @@ public:
     [[nodiscard]] bool ensureImageResource(ResourceAllocator& allocator, const AssetGuid& guid, const ImageDesc& desc, uint64_t estimatedBytes);
     [[nodiscard]] Image* imageResource(const AssetGuid& guid);
     [[nodiscard]] const Image* imageResource(const AssetGuid& guid) const;
+    [[nodiscard]] bool ensureBlasResource(VkDevice device, ResourceAllocator& allocator, const AssetGuid& guid, uint64_t blasBytes, uint64_t scratchBytes, uint64_t scratchAlignment, const char* debugName);
+    [[nodiscard]] AccelerationStructure* blasResource(const AssetGuid& guid);
+    [[nodiscard]] const AccelerationStructure* blasResource(const AssetGuid& guid) const;
+    [[nodiscard]] Buffer* blasScratchResource(const AssetGuid& guid);
+    [[nodiscard]] const Buffer* blasScratchResource(const AssetGuid& guid) const;
     uint32_t retireCompletedResources(uint64_t completedTimeline);
     [[nodiscard]] NativeGpuAssetEvictionResult evictToBudget(const NativeGpuAssetCacheBudget& budget, uint64_t retireAfterTimeline = 0);
     [[nodiscard]] NativeGpuAssetCacheStats stats() const;
@@ -187,8 +196,12 @@ private:
         uint64_t lastTouchedFrame = 0;
         uint64_t ownedGpuBufferBytes = 0;
         uint64_t ownedGpuImageBytes = 0;
+        uint64_t ownedBlasBytes = 0;
+        uint64_t ownedBlasScratchBytes = 0;
         std::unique_ptr<Buffer> gpuBuffer;
         std::unique_ptr<Image> gpuImage;
+        std::unique_ptr<AccelerationStructure> blas;
+        std::unique_ptr<Buffer> blasScratch;
     };
 
     struct RetiredResource {
@@ -197,11 +210,15 @@ private:
         uint64_t gpuBytes = 0;
         std::unique_ptr<Buffer> gpuBuffer;
         std::unique_ptr<Image> gpuImage;
+        std::unique_ptr<AccelerationStructure> blas;
+        std::unique_ptr<Buffer> blasScratch;
     };
 
     [[nodiscard]] Entry* find(const AssetGuid& guid);
     [[nodiscard]] const Entry* find(const AssetGuid& guid) const;
     [[nodiscard]] bool evictable(const Entry& entry, const NativeGpuAssetCacheBudget& budget) const;
+    [[nodiscard]] uint64_t ownedGpuBytes(const Entry& entry) const;
+    [[nodiscard]] uint64_t accountedGpuBytes(const Entry& entry) const;
     void retireEntryResources(Entry& entry, uint64_t retireAfterTimeline);
 
     uint64_t frameCounter_ = 1;

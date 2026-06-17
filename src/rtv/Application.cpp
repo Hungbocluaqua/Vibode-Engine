@@ -4095,6 +4095,53 @@ double estimatedBlasBuildMs(const rtv::MeshAsset& mesh) {
     return std::clamp(0.15 + static_cast<double>(primitiveCount) / 250000.0, 0.15, 4.0);
 }
 
+struct MeshBlasBuildSizing {
+    uint64_t accelerationStructureBytes = 0;
+    uint64_t scratchBytes = 0;
+};
+
+std::optional<MeshBlasBuildSizing> queryMeshBlasBuildSizing(VkDevice device, const rtv::MeshAsset& mesh) {
+    if (device == VK_NULL_HANDLE || mesh.vertices.empty() || mesh.indices.size() < 3) {
+        return std::nullopt;
+    }
+    VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
+    triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    triangles.vertexStride = sizeof(rtv::MeshVertex);
+    triangles.maxVertex = static_cast<uint32_t>(mesh.vertices.size() - 1u);
+    triangles.indexType = VK_INDEX_TYPE_UINT32;
+
+    VkAccelerationStructureGeometryKHR geometry{};
+    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geometry.geometry.triangles = triangles;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &geometry;
+
+    const uint32_t primitiveCount = static_cast<uint32_t>(mesh.indices.size() / 3u);
+    VkAccelerationStructureBuildSizesInfoKHR sizes{};
+    sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    vkGetAccelerationStructureBuildSizesKHR(
+        device,
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &buildInfo,
+        &primitiveCount,
+        &sizes);
+    if (sizes.accelerationStructureSize == 0 || sizes.buildScratchSize == 0) {
+        return std::nullopt;
+    }
+    return MeshBlasBuildSizing{
+        .accelerationStructureBytes = sizes.accelerationStructureSize,
+        .scratchBytes = sizes.buildScratchSize,
+    };
+}
+
 } // namespace
 
 nlohmann::json Application::streamingRuntimeReport() const {
@@ -4182,6 +4229,7 @@ nlohmann::json Application::streamingRuntimeReport() const {
         (void)ticketId;
         pendingPayloadBytes += static_cast<uint64_t>(payload.bytes.size());
     }
+    const size_t pendingBlasBuildPayloads = streamingGpuBlasBuildPayloads_.size();
     report["streaming_gpu_work_queue"] = {
         {"stats", streamingGpuWorkQueueStatsJson(streamingGpuWorkQueue_.stats())},
         {"hitch_summary", streamingGpuWorkPressureStatsJson(streamingGpuWorkQueue_.pressureStats())},
@@ -4191,6 +4239,7 @@ nlohmann::json Application::streamingRuntimeReport() const {
         {"payload_backed_executor_work", hasPayloadBackedWork},
         {"pending_payload_buffer_uploads", streamingGpuBufferUploadPayloads_.size()},
         {"pending_payload_image_mip_uploads", streamingGpuImageMipUploadPayloads_.size()},
+        {"pending_payload_blas_builds", pendingBlasBuildPayloads},
         {"pending_payload_buffer_upload_bytes", pendingBufferPayloadBytes},
         {"pending_payload_upload_bytes", pendingPayloadBytes},
         {"marker_only_completion_event_emitted", streamingGpuMarkerOnlyCompletionEventEmitted_},
@@ -10324,6 +10373,8 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
                 .fallbackDescriptorBound = true,
             });
             bool meshPayloadBacked = false;
+            bool meshBlasBacked = false;
+            uint64_t meshBlasIndexOffset = 0;
             if (mesh != nullptr && uploadBytes > 0 && allocator_ != nullptr) {
                 const VkBufferUsageFlags usage =
                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
@@ -10342,6 +10393,26 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
                 } catch (const std::exception& e) {
                     streamingRuntimeState_.pushEvent("streaming mesh GPU buffer allocation failed for " + guid + ": " + e.what());
                     meshPayloadBacked = false;
+                }
+                if (meshPayloadBacked && context_ != nullptr) {
+                    const std::optional<MeshBlasBuildSizing> blasSizing = queryMeshBlasBuildSizing(context_->device(), *mesh);
+                    if (blasSizing.has_value()) {
+                        const std::string blasDebugName = "streaming mesh BLAS " + guid;
+                        try {
+                            meshBlasBacked = nativeGpuAssetCache_.ensureBlasResource(
+                                context_->device(),
+                                *allocator_,
+                                guid,
+                                blasSizing->accelerationStructureBytes,
+                                blasSizing->scratchBytes,
+                                context_->rayTracingInfo().accelerationStructureProperties.minAccelerationStructureScratchOffsetAlignment,
+                                blasDebugName.c_str());
+                            meshBlasIndexOffset = static_cast<uint64_t>(mesh->vertices.size()) * static_cast<uint64_t>(sizeof(MeshVertex));
+                        } catch (const std::exception& e) {
+                            streamingRuntimeState_.pushEvent("streaming mesh BLAS allocation failed for " + guid + ": " + e.what());
+                            meshBlasBacked = false;
+                        }
+                    }
                 }
             }
             const uint64_t uploadChunkBytes = std::max<uint64_t>(1ull * 1024ull * 1024ull, streamingOptions_.uploadBytesPerFrame);
@@ -10378,7 +10449,17 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
                 .ownerGuid = guid,
                 .estimatedGpuMs = mesh != nullptr ? estimatedBlasBuildMs(*mesh) : 0.25,
                 .blasBuilds = 1,
+                .payloadBacked = meshBlasBacked,
             });
+            if (meshBlasBacked && mesh != nullptr) {
+                streamingGpuBlasBuildPayloads_[blasTicket] = StreamingGpuBlasBuildPayload{
+                    .ownerGuid = guid,
+                    .indexDataOffset = meshBlasIndexOffset,
+                    .vertexCount = static_cast<uint32_t>(mesh->vertices.size()),
+                    .indexCount = static_cast<uint32_t>(mesh->indices.size()),
+                    .vertexStride = sizeof(MeshVertex),
+                };
+            }
             (void)nativeGpuAssetCache_.markBlasBuildQueued(guid, blasTicket);
             const uint64_t tlasTicket = streamingGpuWorkQueue_.enqueue(StreamingGpuWorkDesc{
                 .kind = StreamingGpuWorkKind::TlasPatch,
@@ -15467,6 +15548,41 @@ void Application::stepStreamingGpuWorkQueue() {
                 }
                 submittedPayloadWork = true;
                 streamingGpuImageMipUploadPayloads_.erase(payloadIt);
+            } else if (ticket.kind == StreamingGpuWorkKind::BlasBuild) {
+                auto payloadIt = streamingGpuBlasBuildPayloads_.find(ticket.id);
+                Buffer* meshBuffer = payloadIt != streamingGpuBlasBuildPayloads_.end()
+                    ? nativeGpuAssetCache_.bufferResource(payloadIt->second.ownerGuid)
+                    : nullptr;
+                AccelerationStructure* blas = payloadIt != streamingGpuBlasBuildPayloads_.end()
+                    ? nativeGpuAssetCache_.blasResource(payloadIt->second.ownerGuid)
+                    : nullptr;
+                Buffer* scratch = payloadIt != streamingGpuBlasBuildPayloads_.end()
+                    ? nativeGpuAssetCache_.blasScratchResource(payloadIt->second.ownerGuid)
+                    : nullptr;
+                if (payloadIt == streamingGpuBlasBuildPayloads_.end() ||
+                    meshBuffer == nullptr ||
+                    blas == nullptr ||
+                    scratch == nullptr ||
+                    !streamingGpuTransferExecutor_.stageBlasBuild(StreamingGpuTransferExecutor::BlasTriangleBuild{
+                        .destination = blas,
+                        .scratch = scratch,
+                        .vertexBuffer = meshBuffer,
+                        .indexBuffer = meshBuffer,
+                        .vertexDataOffset = 0,
+                        .indexDataOffset = payloadIt->second.indexDataOffset,
+                        .vertexCount = payloadIt->second.vertexCount,
+                        .indexCount = payloadIt->second.indexCount,
+                        .vertexStride = payloadIt->second.vertexStride,
+                    })) {
+                    (void)streamingGpuWorkQueue_.fail(ticket.id);
+                    streamingRuntimeState_.pushEvent("streaming GPU BLAS payload staging failed for ticket " + std::to_string(ticket.id));
+                    if (payloadIt != streamingGpuBlasBuildPayloads_.end()) {
+                        streamingGpuBlasBuildPayloads_.erase(payloadIt);
+                    }
+                    continue;
+                }
+                submittedPayloadWork = true;
+                streamingGpuBlasBuildPayloads_.erase(payloadIt);
             }
         }
         const uint64_t workQueueTimeline = result.highestSubmittedTimeline;
