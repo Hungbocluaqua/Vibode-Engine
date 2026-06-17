@@ -43,6 +43,7 @@ public:
         uint32_t totalBufferCopies = 0;
         uint32_t totalImageCopies = 0;
         uint32_t totalBlasBuilds = 0;
+        uint32_t totalTlasBuilds = 0;
         uint64_t totalUploadedBytes = 0;
         uint32_t stagingAllocationFailures = 0;
         StreamingStagingRingStats staging{};
@@ -79,6 +80,19 @@ public:
     };
 
     [[nodiscard]] bool stageBlasBuild(const BlasTriangleBuild& build);
+
+    struct TlasBuild {
+        AccelerationStructure* destination = nullptr;
+        Buffer* scratch = nullptr;
+        Buffer* instanceBuffer = nullptr;
+        uint64_t instanceDataOffset = 0;
+        uint32_t instanceCount = 0;
+        VkBuildAccelerationStructureFlagsKHR flags =
+            VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+            VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    };
+
+    [[nodiscard]] bool stageTlasBuild(const TlasBuild& build);
 
     // Flush all copies recorded since the last submitFrame() as one transfer
     // submission that signals the next timeline value. Returns the signaled
@@ -143,6 +157,7 @@ private:
     uint32_t totalBufferCopies_ = 0;
     uint32_t totalImageCopies_ = 0;
     uint32_t totalBlasBuilds_ = 0;
+    uint32_t totalTlasBuilds_ = 0;
     uint64_t totalUploadedBytes_ = 0;
     uint32_t stagingAllocationFailures_ = 0;
 };

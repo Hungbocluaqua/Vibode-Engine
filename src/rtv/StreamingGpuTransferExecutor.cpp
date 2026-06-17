@@ -348,6 +348,62 @@ bool StreamingGpuTransferExecutor::stageBlasBuild(const BlasTriangleBuild& build
     return true;
 }
 
+bool StreamingGpuTransferExecutor::stageTlasBuild(const TlasBuild& build) {
+    if (device_ == VK_NULL_HANDLE ||
+        build.destination == nullptr ||
+        build.scratch == nullptr ||
+        build.instanceBuffer == nullptr ||
+        build.destination->handle() == VK_NULL_HANDLE ||
+        build.scratch->handle() == VK_NULL_HANDLE ||
+        build.instanceBuffer->handle() == VK_NULL_HANDLE ||
+        build.instanceCount == 0) {
+        return false;
+    }
+
+    VkAccelerationStructureGeometryInstancesDataKHR instances{};
+    instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    instances.arrayOfPointers = VK_FALSE;
+    instances.data.deviceAddress = build.instanceBuffer->deviceAddress() + build.instanceDataOffset;
+
+    VkAccelerationStructureGeometryKHR geometry{};
+    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    geometry.geometry.instances = instances;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    buildInfo.flags = build.flags;
+    buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &geometry;
+    buildInfo.dstAccelerationStructure = build.destination->handle();
+    buildInfo.scratchData.deviceAddress = Buffer::alignUp(build.scratch->deviceAddress(), accelerationStructureScratchAlignment_);
+
+    VkAccelerationStructureBuildRangeInfoKHR range{};
+    range.primitiveCount = build.instanceCount;
+    const VkAccelerationStructureBuildRangeInfoKHR* ranges[] = {&range};
+
+    VkCommandBuffer cmd = beginGraphicsBatch();
+    vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, ranges);
+
+    VkMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_MEMORY_READ_BIT;
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+
+    ++openGraphicsBatchOps_;
+    ++totalTlasBuilds_;
+    return true;
+}
+
 uint64_t StreamingGpuTransferExecutor::submitFrame() {
     if (device_ == VK_NULL_HANDLE || openBatch_ == VK_NULL_HANDLE || openBatchCopies_ == 0) {
         // Nothing recorded: discard an empty open batch if present.
@@ -528,6 +584,7 @@ StreamingGpuTransferExecutor::Stats StreamingGpuTransferExecutor::stats() const 
     out.totalBufferCopies = totalBufferCopies_;
     out.totalImageCopies = totalImageCopies_;
     out.totalBlasBuilds = totalBlasBuilds_;
+    out.totalTlasBuilds = totalTlasBuilds_;
     out.totalUploadedBytes = totalUploadedBytes_;
     out.stagingAllocationFailures = stagingAllocationFailures_;
     out.staging = stagingRing_.stats();
@@ -749,6 +806,91 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
         return false;
     }
 
+    VkAccelerationStructureInstanceKHR instance{};
+    instance.transform.matrix[0][0] = 1.0f;
+    instance.transform.matrix[1][1] = 1.0f;
+    instance.transform.matrix[2][2] = 1.0f;
+    instance.instanceCustomIndex = 0;
+    instance.mask = 0xFF;
+    instance.instanceShaderBindingTableRecordOffset = 0;
+    instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    instance.accelerationStructureReference = blas.deviceAddress();
+
+    Buffer instanceUpload(*allocator_, BufferDesc{
+        .size = sizeof(VkAccelerationStructureInstanceKHR),
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "streaming transfer selftest TLAS instance",
+    });
+    if (!stageBufferUpload(instanceUpload, &instance, sizeof(instance), 0)) {
+        errorOut = "stageBufferUpload(TLAS instance) failed";
+        return false;
+    }
+
+    VkAccelerationStructureGeometryInstancesDataKHR tlasInstances{};
+    tlasInstances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tlasInstances.arrayOfPointers = VK_FALSE;
+    tlasInstances.data.deviceAddress = instanceUpload.deviceAddress();
+
+    VkAccelerationStructureGeometryKHR tlasGeometry{};
+    tlasGeometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    tlasGeometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeometry.geometry.instances = tlasInstances;
+
+    VkAccelerationStructureBuildGeometryInfoKHR tlasSizeInfo{};
+    tlasSizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    tlasSizeInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tlasSizeInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+        VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    tlasSizeInfo.geometryCount = 1;
+    tlasSizeInfo.pGeometries = &tlasGeometry;
+    const uint32_t tlasPrimitiveCount = 1;
+    VkAccelerationStructureBuildSizesInfoKHR tlasSizes{};
+    tlasSizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    vkGetAccelerationStructureBuildSizesKHR(
+        device_,
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &tlasSizeInfo,
+        &tlasPrimitiveCount,
+        &tlasSizes);
+    AccelerationStructure tlas(device_, *allocator_, AccelerationStructureDesc{
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+        .size = tlasSizes.accelerationStructureSize,
+        .allowUpdate = true,
+        .debugName = "streaming transfer selftest TLAS",
+    });
+    Buffer tlasScratch(*allocator_, BufferDesc{
+        .size = tlasSizes.buildScratchSize + accelerationStructureScratchAlignment_,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "streaming transfer selftest TLAS scratch",
+    });
+    if (!stageTlasBuild(TlasBuild{
+            .destination = &tlas,
+            .scratch = &tlasScratch,
+            .instanceBuffer = &instanceUpload,
+            .instanceCount = 1,
+        })) {
+        errorOut = "stageTlasBuild failed";
+        return false;
+    }
+    const uint64_t tlasTimeline = submitTimelineMarker();
+    VkSemaphoreWaitInfo tlasWait{};
+    tlasWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    tlasWait.semaphoreCount = 1;
+    tlasWait.pSemaphores = &timeline_;
+    tlasWait.pValues = &tlasTimeline;
+    if (tlasTimeline == 0 || vkWaitSemaphores(device_, &tlasWait, UINT64_MAX) != VK_SUCCESS) {
+        errorOut = "vkWaitSemaphores(TLAS build) failed";
+        return false;
+    }
+    if (poll() < tlasTimeline) {
+        errorOut = "TLAS build timeline did not complete after wait";
+        return false;
+    }
+
     const uint64_t markerTimeline = submitTimelineMarker();
     if (markerTimeline == 0) {
         errorOut = "submitTimelineMarker failed";
@@ -802,6 +944,7 @@ nlohmann::json streamingGpuTransferExecutorStatsJson(const StreamingGpuTransferE
         {"total_buffer_copies", stats.totalBufferCopies},
         {"total_image_copies", stats.totalImageCopies},
         {"total_blas_builds", stats.totalBlasBuilds},
+        {"total_tlas_builds", stats.totalTlasBuilds},
         {"total_uploaded_bytes", stats.totalUploadedBytes},
         {"staging_allocation_failures", stats.stagingAllocationFailures},
         {"staging_ring", streamingStagingRingStatsJson(stats.staging)},
