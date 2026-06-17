@@ -348,6 +348,45 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
         errorOut = "readback bytes did not match uploaded pattern";
         return false;
     }
+
+    const uint64_t markerTimeline = submitTimelineMarker();
+    if (markerTimeline == 0) {
+        errorOut = "submitTimelineMarker failed";
+        return false;
+    }
+    VkSemaphoreWaitInfo markerWait{};
+    markerWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    markerWait.semaphoreCount = 1;
+    markerWait.pSemaphores = &timeline_;
+    markerWait.pValues = &markerTimeline;
+    if (vkWaitSemaphores(device_, &markerWait, UINT64_MAX) != VK_SUCCESS) {
+        errorOut = "vkWaitSemaphores(marker) failed";
+        return false;
+    }
+    if (poll() < markerTimeline) {
+        errorOut = "timeline marker did not complete after wait";
+        return false;
+    }
+
+    StreamingStagingRing cpuRing(1024u, 1u);
+    const std::optional<StreamingStagingAllocation> a = cpuRing.allocate(700, 1);
+    const std::optional<StreamingStagingAllocation> b = cpuRing.allocate(200, 2);
+    if (!a.has_value() || !b.has_value()) {
+        errorOut = "CPU staging ring setup allocation failed";
+        return false;
+    }
+    (void)cpuRing.retire(1);
+    const std::optional<StreamingStagingAllocation> c = cpuRing.allocate(300, 3);
+    if (!c.has_value() || c->offset != 0) {
+        errorOut = "CPU staging ring wrap allocation failed";
+        return false;
+    }
+    (void)cpuRing.retire(3);
+    const StreamingStagingRingStats cpuStats = cpuRing.stats();
+    if (cpuStats.inFlightBytes != 0 || cpuStats.freeBytes != cpuStats.capacityBytes || cpuStats.liveAllocationCount != 0) {
+        errorOut = "CPU staging ring did not fully drain after wrapped allocations";
+        return false;
+    }
     return true;
 }
 
