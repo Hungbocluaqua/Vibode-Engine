@@ -15526,6 +15526,11 @@ void Application::stepStreamingGpuWorkQueue() {
         }
         for (const auto& [guid, complete] : ownerComplete) {
             const bool payloadBacked = ownerPayloadBacked[guid];
+            const auto nativeIt = nativeSnapshotByGuid.find(guid);
+            const bool rendererVisibleComplete = nativeIt != nativeSnapshotByGuid.end() &&
+                (nativeIt->second.tlasVisible ||
+                 nativeIt->second.descriptorPatchComplete ||
+                 nativeIt->second.residency == NativeGpuAssetResidency::Resident);
             if (ownerFailed[guid]) {
                 streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Failed, "streaming GPU work failed or was cancelled");
                 (void)nativeGpuAssetCache_.markFailed(guid);
@@ -15533,12 +15538,16 @@ void Application::stepStreamingGpuWorkQueue() {
                 streamingRuntimeState_.setAssetState(guid, StreamingAssetState::GpuResident);
                 (void)nativeGpuAssetCache_.markResident(guid);
                 streamingRuntimeState_.pushEvent("streaming GPU work completed for " + guid);
+            } else if (complete && !payloadBacked && rendererVisibleComplete) {
+                if (streamingRuntimeState_.assetState(guid) != StreamingAssetState::GpuResident) {
+                    streamingRuntimeState_.setAssetState(guid, StreamingAssetState::GpuResident);
+                }
             } else if (complete && !payloadBacked) {
                 if (streamingRuntimeState_.assetState(guid) != StreamingAssetState::Uploading) {
                     streamingRuntimeState_.setAssetState(guid, StreamingAssetState::Uploading);
                 }
                 if (!streamingGpuMarkerOnlyCompletionEventEmitted_) {
-                    streamingRuntimeState_.pushEvent("streaming GPU timeline marker completed logical tickets; payload-backed uploads/builds are not wired yet, so assets remain uploading");
+                    streamingRuntimeState_.pushEvent("streaming GPU timeline marker completed logical tickets; renderer-visible TLAS/descriptor patches must complete before assets become resident");
                     streamingGpuMarkerOnlyCompletionEventEmitted_ = true;
                 }
             }
