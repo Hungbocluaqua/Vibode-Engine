@@ -4230,6 +4230,7 @@ nlohmann::json Application::streamingRuntimeReport() const {
         pendingPayloadBytes += static_cast<uint64_t>(payload.bytes.size());
     }
     const size_t pendingBlasBuildPayloads = streamingGpuBlasBuildPayloads_.size();
+    const size_t pendingBlasCompactionPayloads = streamingGpuBlasCompactionPayloads_.size();
     report["streaming_gpu_work_queue"] = {
         {"stats", streamingGpuWorkQueueStatsJson(streamingGpuWorkQueue_.stats())},
         {"hitch_summary", streamingGpuWorkPressureStatsJson(streamingGpuWorkQueue_.pressureStats())},
@@ -4240,6 +4241,7 @@ nlohmann::json Application::streamingRuntimeReport() const {
         {"pending_payload_buffer_uploads", streamingGpuBufferUploadPayloads_.size()},
         {"pending_payload_image_mip_uploads", streamingGpuImageMipUploadPayloads_.size()},
         {"pending_payload_blas_builds", pendingBlasBuildPayloads},
+        {"pending_payload_blas_compactions", pendingBlasCompactionPayloads},
         {"pending_payload_buffer_upload_bytes", pendingBufferPayloadBytes},
         {"pending_payload_upload_bytes", pendingPayloadBytes},
         {"marker_only_completion_event_emitted", streamingGpuMarkerOnlyCompletionEventEmitted_},
@@ -15417,6 +15419,13 @@ void Application::stepStreamingGpuWorkQueue() {
         std::unordered_map<AssetGuid, bool> ownerComplete;
         std::unordered_map<AssetGuid, bool> ownerFailed;
         std::unordered_map<AssetGuid, bool> ownerPayloadBacked;
+        std::unordered_map<AssetGuid, NativeGpuAssetSnapshot> nativeSnapshotByGuid;
+        for (const NativeGpuAssetSnapshot& snapshot : nativeGpuAssetCache_.snapshots()) {
+            if (!snapshot.guid.empty()) {
+                nativeSnapshotByGuid[snapshot.guid] = snapshot;
+            }
+        }
+        std::unordered_set<AssetGuid> ownerDeferredForCompaction;
         for (const StreamingGpuWorkSnapshot& ticket : snapshots) {
             if (ticket.ownerGuid.empty()) {
                 continue;
@@ -15435,7 +15444,59 @@ void Application::stepStreamingGpuWorkQueue() {
             if (ticket.payloadBacked &&
                 ticket.kind == StreamingGpuWorkKind::BlasBuild &&
                 ticket.state == StreamingGpuWorkState::Complete) {
-                (void)nativeGpuAssetCache_.markBlasReady(ticket.ownerGuid);
+                bool compactionQueued = false;
+                const auto nativeIt = nativeSnapshotByGuid.find(ticket.ownerGuid);
+                const bool compactionAlreadyHandled = nativeIt != nativeSnapshotByGuid.end() &&
+                    (nativeIt->second.blasReady ||
+                     nativeIt->second.blasCompactionPending ||
+                     nativeIt->second.blasCompacted);
+                AccelerationStructure* blas = nativeGpuAssetCache_.blasResource(ticket.ownerGuid);
+                const uint64_t compactedSize =
+                    streamingGpuTransferExecutorReady_ && blas != nullptr
+                    ? streamingGpuTransferExecutor_.consumeCompactedBlasSize(*blas)
+                    : 0ull;
+                if (!compactionAlreadyHandled &&
+                    compactedSize != 0 &&
+                    blas != nullptr &&
+                    compactedSize < static_cast<uint64_t>(blas->size()) &&
+                    context_ != nullptr &&
+                    allocator_ != nullptr) {
+                    const std::string compactDebugName = "streaming compacted BLAS " + ticket.ownerGuid;
+                    try {
+                        compactionQueued = nativeGpuAssetCache_.ensurePendingCompactedBlasResource(
+                            context_->device(),
+                            *allocator_,
+                            ticket.ownerGuid,
+                            compactedSize,
+                            compactDebugName.c_str());
+                    } catch (const std::exception& e) {
+                        streamingRuntimeState_.pushEvent("streaming BLAS compaction allocation failed for " + ticket.ownerGuid + ": " + e.what());
+                        compactionQueued = false;
+                    }
+                    if (compactionQueued) {
+                        const uint64_t compactionTicket = streamingGpuWorkQueue_.enqueue(StreamingGpuWorkDesc{
+                            .kind = StreamingGpuWorkKind::BlasCompaction,
+                            .label = "compact streamed mesh BLAS " + ticket.ownerGuid,
+                            .ownerGuid = ticket.ownerGuid,
+                            .estimatedGpuMs = 0.20,
+                            .blasBuilds = 1,
+                            .payloadBacked = true,
+                        });
+                        streamingGpuBlasCompactionPayloads_[compactionTicket] = ticket.ownerGuid;
+                        (void)nativeGpuAssetCache_.markBlasCompactionQueued(ticket.ownerGuid, compactionTicket);
+                        ownerDeferredForCompaction.insert(ticket.ownerGuid);
+                    }
+                }
+                if (!compactionQueued && !compactionAlreadyHandled) {
+                    (void)nativeGpuAssetCache_.markBlasReady(ticket.ownerGuid);
+                }
+            }
+            if (ticket.payloadBacked &&
+                ticket.kind == StreamingGpuWorkKind::BlasCompaction &&
+                ticket.state == StreamingGpuWorkState::Complete) {
+                if (!nativeGpuAssetCache_.markBlasCompacted(ticket.ownerGuid, streamingGpuWorkCompletedTimeline_)) {
+                    (void)nativeGpuAssetCache_.markBlasReady(ticket.ownerGuid);
+                }
             }
             if (ticket.payloadBacked &&
                 ticket.kind == StreamingGpuWorkKind::TlasPatch &&
@@ -15447,6 +15508,9 @@ void Application::stepStreamingGpuWorkQueue() {
                 completeIt = ownerComplete.emplace(ticket.ownerGuid, true).first;
             }
             if (ticket.state != StreamingGpuWorkState::Complete) {
+                completeIt->second = false;
+            }
+            if (ownerDeferredForCompaction.find(ticket.ownerGuid) != ownerDeferredForCompaction.end()) {
                 completeIt->second = false;
             }
             auto payloadBackedIt = ownerPayloadBacked.find(ticket.ownerGuid);
@@ -15573,6 +15637,8 @@ void Application::stepStreamingGpuWorkQueue() {
                         .vertexCount = payloadIt->second.vertexCount,
                         .indexCount = payloadIt->second.indexCount,
                         .vertexStride = payloadIt->second.vertexStride,
+                        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                            VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR,
                     })) {
                     (void)streamingGpuWorkQueue_.fail(ticket.id);
                     streamingRuntimeState_.pushEvent("streaming GPU BLAS payload staging failed for ticket " + std::to_string(ticket.id));
@@ -15583,6 +15649,27 @@ void Application::stepStreamingGpuWorkQueue() {
                 }
                 submittedPayloadWork = true;
                 streamingGpuBlasBuildPayloads_.erase(payloadIt);
+            } else if (ticket.kind == StreamingGpuWorkKind::BlasCompaction) {
+                auto payloadIt = streamingGpuBlasCompactionPayloads_.find(ticket.id);
+                AccelerationStructure* source = payloadIt != streamingGpuBlasCompactionPayloads_.end()
+                    ? nativeGpuAssetCache_.blasResource(payloadIt->second)
+                    : nullptr;
+                AccelerationStructure* destination = payloadIt != streamingGpuBlasCompactionPayloads_.end()
+                    ? nativeGpuAssetCache_.pendingCompactedBlasResource(payloadIt->second)
+                    : nullptr;
+                if (payloadIt == streamingGpuBlasCompactionPayloads_.end() ||
+                    source == nullptr ||
+                    destination == nullptr ||
+                    !streamingGpuTransferExecutor_.stageBlasCompaction(*source, *destination)) {
+                    (void)streamingGpuWorkQueue_.fail(ticket.id);
+                    streamingRuntimeState_.pushEvent("streaming GPU BLAS compaction staging failed for ticket " + std::to_string(ticket.id));
+                    if (payloadIt != streamingGpuBlasCompactionPayloads_.end()) {
+                        streamingGpuBlasCompactionPayloads_.erase(payloadIt);
+                    }
+                    continue;
+                }
+                submittedPayloadWork = true;
+                streamingGpuBlasCompactionPayloads_.erase(payloadIt);
             }
         }
         const uint64_t workQueueTimeline = result.highestSubmittedTimeline;

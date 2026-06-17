@@ -122,6 +122,8 @@ bool NativeGpuAssetCache::markBlasBuildQueued(const AssetGuid& guid, uint64_t bl
         entry->desc.blasBuildTicketId = blasBuildTicketId;
         entry->desc.blasBuildPending = true;
         entry->desc.blasReady = false;
+        entry->desc.blasCompactionPending = false;
+        entry->desc.blasCompacted = false;
         entry->desc.tlasVisible = false;
         entry->lastTouchedFrame = ++frameCounter_;
         return true;
@@ -132,10 +134,49 @@ bool NativeGpuAssetCache::markBlasBuildQueued(const AssetGuid& guid, uint64_t bl
 bool NativeGpuAssetCache::markBlasReady(const AssetGuid& guid) {
     if (Entry* entry = find(guid)) {
         entry->desc.blasBuildPending = false;
+        entry->desc.blasCompactionPending = false;
         entry->desc.blasReady = true;
         if (entry->residency == NativeGpuAssetResidency::Queued) {
             entry->residency = NativeGpuAssetResidency::Uploading;
         }
+        entry->lastTouchedFrame = ++frameCounter_;
+        return true;
+    }
+    return false;
+}
+
+bool NativeGpuAssetCache::markBlasCompactionQueued(const AssetGuid& guid, uint64_t blasCompactionTicketId) {
+    if (Entry* entry = find(guid)) {
+        entry->desc.blasCompactionTicketId = blasCompactionTicketId;
+        entry->desc.blasCompactionPending = true;
+        entry->desc.blasReady = false;
+        entry->lastTouchedFrame = ++frameCounter_;
+        return true;
+    }
+    return false;
+}
+
+bool NativeGpuAssetCache::markBlasCompacted(const AssetGuid& guid, uint64_t retireAfterTimeline) {
+    if (Entry* entry = find(guid)) {
+        if (entry->pendingCompactedBlas == nullptr ||
+            entry->pendingCompactedBlas->handle() == VK_NULL_HANDLE ||
+            entry->pendingCompactedBlasBytes == 0) {
+            return false;
+        }
+        const uint64_t oldBlasBytes = entry->ownedBlasBytes;
+        retiredResources_.push_back(RetiredResource{
+            .guid = entry->desc.guid,
+            .retireAfterTimeline = retireAfterTimeline,
+            .gpuBytes = oldBlasBytes,
+            .blas = std::move(entry->blas),
+        });
+        entry->blas = std::move(entry->pendingCompactedBlas);
+        entry->ownedBlasBytes = entry->pendingCompactedBlasBytes;
+        entry->pendingCompactedBlasBytes = 0;
+        entry->desc.blasBuildPending = false;
+        entry->desc.blasCompactionPending = false;
+        entry->desc.blasCompacted = true;
+        entry->desc.blasReady = true;
         entry->lastTouchedFrame = ++frameCounter_;
         return true;
     }
@@ -398,6 +439,43 @@ const AccelerationStructure* NativeGpuAssetCache::blasResource(const AssetGuid& 
     return entry != nullptr ? entry->blas.get() : nullptr;
 }
 
+bool NativeGpuAssetCache::ensurePendingCompactedBlasResource(
+    VkDevice device,
+    ResourceAllocator& allocator,
+    const AssetGuid& guid,
+    uint64_t blasBytes,
+    const char* debugName) {
+    Entry* entry = find(guid);
+    if (entry == nullptr || device == VK_NULL_HANDLE || blasBytes == 0) {
+        return false;
+    }
+    if (entry->pendingCompactedBlas != nullptr &&
+        entry->pendingCompactedBlas->handle() != VK_NULL_HANDLE &&
+        entry->pendingCompactedBlas->size() >= blasBytes) {
+        entry->pendingCompactedBlasBytes = entry->pendingCompactedBlas->size();
+        entry->lastTouchedFrame = ++frameCounter_;
+        return true;
+    }
+    entry->pendingCompactedBlas = std::make_unique<AccelerationStructure>(device, allocator, AccelerationStructureDesc{
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+        .size = static_cast<VkDeviceSize>(blasBytes),
+        .debugName = debugName,
+    });
+    entry->pendingCompactedBlasBytes = blasBytes;
+    entry->lastTouchedFrame = ++frameCounter_;
+    return true;
+}
+
+AccelerationStructure* NativeGpuAssetCache::pendingCompactedBlasResource(const AssetGuid& guid) {
+    Entry* entry = find(guid);
+    return entry != nullptr ? entry->pendingCompactedBlas.get() : nullptr;
+}
+
+const AccelerationStructure* NativeGpuAssetCache::pendingCompactedBlasResource(const AssetGuid& guid) const {
+    const Entry* entry = find(guid);
+    return entry != nullptr ? entry->pendingCompactedBlas.get() : nullptr;
+}
+
 Buffer* NativeGpuAssetCache::blasScratchResource(const AssetGuid& guid) {
     Entry* entry = find(guid);
     return entry != nullptr ? entry->blasScratch.get() : nullptr;
@@ -431,13 +509,15 @@ void NativeGpuAssetCache::retireEntryResources(Entry& entry, uint64_t retireAfte
         entry.ownedGpuImageBytes = 0;
         entry.ownedBlasBytes = 0;
         entry.ownedBlasScratchBytes = 0;
+        entry.pendingCompactedBlasBytes = 0;
         return;
     }
     const uint64_t retiredBytes =
         entry.ownedGpuBufferBytes +
         entry.ownedGpuImageBytes +
         entry.ownedBlasBytes +
-        entry.ownedBlasScratchBytes;
+        entry.ownedBlasScratchBytes +
+        entry.pendingCompactedBlasBytes;
     retiredResources_.push_back(RetiredResource{
         .guid = entry.desc.guid,
         .retireAfterTimeline = retireAfterTimeline,
@@ -445,12 +525,14 @@ void NativeGpuAssetCache::retireEntryResources(Entry& entry, uint64_t retireAfte
         .gpuBuffer = std::move(entry.gpuBuffer),
         .gpuImage = std::move(entry.gpuImage),
         .blas = std::move(entry.blas),
+        .pendingCompactedBlas = std::move(entry.pendingCompactedBlas),
         .blasScratch = std::move(entry.blasScratch),
     });
     entry.ownedGpuBufferBytes = 0;
     entry.ownedGpuImageBytes = 0;
     entry.ownedBlasBytes = 0;
     entry.ownedBlasScratchBytes = 0;
+    entry.pendingCompactedBlasBytes = 0;
 }
 
 NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuAssetCacheBudget& budget, uint64_t retireAfterTimeline) {
@@ -483,11 +565,14 @@ NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuA
             entry->ownedGpuBufferBytes +
             entry->ownedGpuImageBytes +
             entry->ownedBlasBytes +
-            entry->ownedBlasScratchBytes;
+            entry->ownedBlasScratchBytes +
+            entry->pendingCompactedBlasBytes;
         retireEntryResources(*entry, retireAfterTimeline);
         entry->desc.fallbackDescriptorBound = true;
         entry->desc.blasBuildPending = false;
         entry->desc.blasReady = false;
+        entry->desc.blasCompactionPending = false;
+        entry->desc.blasCompacted = false;
         entry->desc.tlasPatchPending = false;
         entry->desc.tlasVisible = false;
         entry->desc.restirLightCandidate = false;
@@ -554,6 +639,12 @@ NativeGpuAssetCacheStats NativeGpuAssetCache::stats() const {
         if (entry.desc.blasReady) {
             ++out.blasReadyCount;
         }
+        if (entry.desc.blasCompactionPending) {
+            ++out.blasCompactionPendingCount;
+        }
+        if (entry.desc.blasCompacted) {
+            ++out.blasCompactedCount;
+        }
         if (entry.desc.tlasPatchPending) {
             ++out.tlasPatchPendingCount;
         }
@@ -601,8 +692,10 @@ std::vector<NativeGpuAssetSnapshot> NativeGpuAssetCache::snapshots() const {
             .ownedGpuImageBytes = entry.ownedGpuImageBytes,
             .ownedBlasBytes = entry.ownedBlasBytes,
             .ownedBlasScratchBytes = entry.ownedBlasScratchBytes,
+            .pendingCompactedBlasBytes = entry.pendingCompactedBlasBytes,
             .uploadTicketId = entry.desc.uploadTicketId,
             .blasBuildTicketId = entry.desc.blasBuildTicketId,
+            .blasCompactionTicketId = entry.desc.blasCompactionTicketId,
             .tlasPatchTicketId = entry.desc.tlasPatchTicketId,
             .lastTouchedFrame = entry.lastTouchedFrame,
             .mipCount = entry.desc.mipCount,
@@ -618,6 +711,8 @@ std::vector<NativeGpuAssetSnapshot> NativeGpuAssetCache::snapshots() const {
             .fallbackDescriptorBound = entry.desc.fallbackDescriptorBound,
             .blasBuildPending = entry.desc.blasBuildPending,
             .blasReady = entry.desc.blasReady,
+            .blasCompactionPending = entry.desc.blasCompactionPending,
+            .blasCompacted = entry.desc.blasCompacted,
             .tlasPatchPending = entry.desc.tlasPatchPending,
             .tlasVisible = entry.desc.tlasVisible,
             .descriptorPatchPending = entry.desc.descriptorPatchPending,
@@ -655,7 +750,8 @@ uint64_t NativeGpuAssetCache::ownedGpuBytes(const Entry& entry) const {
     return entry.ownedGpuBufferBytes +
         entry.ownedGpuImageBytes +
         entry.ownedBlasBytes +
-        entry.ownedBlasScratchBytes;
+        entry.ownedBlasScratchBytes +
+        entry.pendingCompactedBlasBytes;
 }
 
 uint64_t NativeGpuAssetCache::accountedGpuBytes(const Entry& entry) const {
@@ -696,6 +792,8 @@ nlohmann::json nativeGpuAssetCacheStatsJson(const NativeGpuAssetCacheStats& stat
         {"total_texture_mip_count", stats.totalTextureMipCount},
         {"blas_pending_count", stats.blasPendingCount},
         {"blas_ready_count", stats.blasReadyCount},
+        {"blas_compaction_pending_count", stats.blasCompactionPendingCount},
+        {"blas_compacted_count", stats.blasCompactedCount},
         {"tlas_patch_pending_count", stats.tlasPatchPendingCount},
         {"tlas_visible_count", stats.tlasVisibleCount},
         {"mesh_renderable_count", stats.meshRenderableCount},
@@ -742,8 +840,10 @@ nlohmann::json nativeGpuAssetCacheSnapshotsJson(const std::vector<NativeGpuAsset
             {"owned_gpu_image_bytes", snapshot.ownedGpuImageBytes},
             {"owned_blas_bytes", snapshot.ownedBlasBytes},
             {"owned_blas_scratch_bytes", snapshot.ownedBlasScratchBytes},
+            {"pending_compacted_blas_bytes", snapshot.pendingCompactedBlasBytes},
             {"upload_ticket_id", snapshot.uploadTicketId},
             {"blas_build_ticket_id", snapshot.blasBuildTicketId},
+            {"blas_compaction_ticket_id", snapshot.blasCompactionTicketId},
             {"tlas_patch_ticket_id", snapshot.tlasPatchTicketId},
             {"last_touched_frame", snapshot.lastTouchedFrame},
             {"mip_count", snapshot.mipCount},
@@ -759,6 +859,8 @@ nlohmann::json nativeGpuAssetCacheSnapshotsJson(const std::vector<NativeGpuAsset
             {"fallback_descriptor_bound", snapshot.fallbackDescriptorBound},
             {"blas_build_pending", snapshot.blasBuildPending},
             {"blas_ready", snapshot.blasReady},
+            {"blas_compaction_pending", snapshot.blasCompactionPending},
+            {"blas_compacted", snapshot.blasCompacted},
             {"tlas_patch_pending", snapshot.tlasPatchPending},
             {"tlas_visible", snapshot.tlasVisible},
             {"descriptor_patch_pending", snapshot.descriptorPatchPending},

@@ -50,6 +50,7 @@ struct NativeGpuAssetDesc {
     uint64_t uploadBytes = 0;
     uint64_t uploadTicketId = 0;
     uint64_t blasBuildTicketId = 0;
+    uint64_t blasCompactionTicketId = 0;
     uint64_t tlasPatchTicketId = 0;
     uint32_t mipCount = 0;
     uint32_t residentMipCount = 0;
@@ -63,6 +64,8 @@ struct NativeGpuAssetDesc {
     bool fallbackDescriptorBound = true;
     bool blasBuildPending = false;
     bool blasReady = false;
+    bool blasCompactionPending = false;
+    bool blasCompacted = false;
     bool tlasPatchPending = false;
     bool tlasVisible = false;
     bool descriptorPatchPending = false;
@@ -84,8 +87,10 @@ struct NativeGpuAssetSnapshot {
     uint64_t ownedGpuImageBytes = 0;
     uint64_t ownedBlasBytes = 0;
     uint64_t ownedBlasScratchBytes = 0;
+    uint64_t pendingCompactedBlasBytes = 0;
     uint64_t uploadTicketId = 0;
     uint64_t blasBuildTicketId = 0;
+    uint64_t blasCompactionTicketId = 0;
     uint64_t tlasPatchTicketId = 0;
     uint64_t lastTouchedFrame = 0;
     uint32_t mipCount = 0;
@@ -101,6 +106,8 @@ struct NativeGpuAssetSnapshot {
     bool fallbackDescriptorBound = true;
     bool blasBuildPending = false;
     bool blasReady = false;
+    bool blasCompactionPending = false;
+    bool blasCompacted = false;
     bool tlasPatchPending = false;
     bool tlasVisible = false;
     bool descriptorPatchPending = false;
@@ -128,6 +135,8 @@ struct NativeGpuAssetCacheStats {
     uint32_t totalTextureMipCount = 0;
     uint32_t blasPendingCount = 0;
     uint32_t blasReadyCount = 0;
+    uint32_t blasCompactionPendingCount = 0;
+    uint32_t blasCompactedCount = 0;
     uint32_t tlasPatchPendingCount = 0;
     uint32_t tlasVisibleCount = 0;
     uint32_t meshRenderableCount = 0;
@@ -165,6 +174,8 @@ public:
     [[nodiscard]] bool markTextureMipResident(const AssetGuid& guid, uint32_t mipLevel);
     [[nodiscard]] bool markBlasBuildQueued(const AssetGuid& guid, uint64_t blasBuildTicketId);
     [[nodiscard]] bool markBlasReady(const AssetGuid& guid);
+    [[nodiscard]] bool markBlasCompactionQueued(const AssetGuid& guid, uint64_t blasCompactionTicketId);
+    [[nodiscard]] bool markBlasCompacted(const AssetGuid& guid, uint64_t retireAfterTimeline);
     [[nodiscard]] bool markTlasPatchQueued(const AssetGuid& guid, uint64_t tlasPatchTicketId);
     [[nodiscard]] bool markTlasVisible(const AssetGuid& guid);
     [[nodiscard]] bool markDescriptorPatchQueued(const AssetGuid& guid, uint64_t descriptorTicketId);
@@ -179,8 +190,11 @@ public:
     [[nodiscard]] Image* imageResource(const AssetGuid& guid);
     [[nodiscard]] const Image* imageResource(const AssetGuid& guid) const;
     [[nodiscard]] bool ensureBlasResource(VkDevice device, ResourceAllocator& allocator, const AssetGuid& guid, uint64_t blasBytes, uint64_t scratchBytes, uint64_t scratchAlignment, const char* debugName);
+    [[nodiscard]] bool ensurePendingCompactedBlasResource(VkDevice device, ResourceAllocator& allocator, const AssetGuid& guid, uint64_t blasBytes, const char* debugName);
     [[nodiscard]] AccelerationStructure* blasResource(const AssetGuid& guid);
     [[nodiscard]] const AccelerationStructure* blasResource(const AssetGuid& guid) const;
+    [[nodiscard]] AccelerationStructure* pendingCompactedBlasResource(const AssetGuid& guid);
+    [[nodiscard]] const AccelerationStructure* pendingCompactedBlasResource(const AssetGuid& guid) const;
     [[nodiscard]] Buffer* blasScratchResource(const AssetGuid& guid);
     [[nodiscard]] const Buffer* blasScratchResource(const AssetGuid& guid) const;
     uint32_t retireCompletedResources(uint64_t completedTimeline);
@@ -198,9 +212,11 @@ private:
         uint64_t ownedGpuImageBytes = 0;
         uint64_t ownedBlasBytes = 0;
         uint64_t ownedBlasScratchBytes = 0;
+        uint64_t pendingCompactedBlasBytes = 0;
         std::unique_ptr<Buffer> gpuBuffer;
         std::unique_ptr<Image> gpuImage;
         std::unique_ptr<AccelerationStructure> blas;
+        std::unique_ptr<AccelerationStructure> pendingCompactedBlas;
         std::unique_ptr<Buffer> blasScratch;
     };
 
@@ -211,6 +227,7 @@ private:
         std::unique_ptr<Buffer> gpuBuffer;
         std::unique_ptr<Image> gpuImage;
         std::unique_ptr<AccelerationStructure> blas;
+        std::unique_ptr<AccelerationStructure> pendingCompactedBlas;
         std::unique_ptr<Buffer> blasScratch;
     };
 

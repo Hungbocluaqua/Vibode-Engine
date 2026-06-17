@@ -660,6 +660,7 @@ private:
     std::unordered_map<uint64_t, StreamingGpuBufferUploadPayload> streamingGpuBufferUploadPayloads_;
     std::unordered_map<uint64_t, StreamingGpuImageMipUploadPayload> streamingGpuImageMipUploadPayloads_;
     std::unordered_map<uint64_t, StreamingGpuBlasBuildPayload> streamingGpuBlasBuildPayloads_;
+    std::unordered_map<uint64_t, AssetGuid> streamingGpuBlasCompactionPayloads_;
     // Maps a streaming work-queue submitted timeline value to the real device
     // transfer-executor timeline marker that gates its completion. Front-to-back
     // ascending; drained as the device signals each marker.

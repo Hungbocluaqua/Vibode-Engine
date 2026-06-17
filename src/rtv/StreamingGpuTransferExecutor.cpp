@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <vector>
 #include <utility>
 
 namespace rtv {
@@ -105,6 +106,19 @@ void StreamingGpuTransferExecutor::shutdown() {
         vkDestroySemaphore(device_, timeline_, nullptr);
         timeline_ = VK_NULL_HANDLE;
     }
+    for (const PendingCompactionQuery& query : openGraphicsCompactionQueries_) {
+        if (query.queryPool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device_, query.queryPool, nullptr);
+        }
+    }
+    openGraphicsCompactionQueries_.clear();
+    for (const PendingCompactionQuery& query : pendingCompactionQueries_) {
+        if (query.queryPool != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device_, query.queryPool, nullptr);
+        }
+    }
+    pendingCompactionQueries_.clear();
+    compactedBlasSizes_.clear();
     if (commandPool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(device_, commandPool_, nullptr);
         commandPool_ = VK_NULL_HANDLE;
@@ -343,9 +357,87 @@ bool StreamingGpuTransferExecutor::stageBlasBuild(const BlasTriangleBuild& build
     dependency.pMemoryBarriers = &barrier;
     vkCmdPipelineBarrier2(cmd, &dependency);
 
+    if ((build.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR) != 0u) {
+        VkQueryPoolCreateInfo queryInfo{};
+        queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        queryInfo.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+        queryInfo.queryCount = 1;
+        VkQueryPool queryPool = VK_NULL_HANDLE;
+        if (vkCreateQueryPool(device_, &queryInfo, nullptr, &queryPool) == VK_SUCCESS) {
+            vkCmdResetQueryPool(cmd, queryPool, 0, 1);
+            VkAccelerationStructureKHR accelerationStructure = build.destination->handle();
+            vkCmdWriteAccelerationStructuresPropertiesKHR(
+                cmd,
+                1,
+                &accelerationStructure,
+                VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                queryPool,
+                0);
+            openGraphicsCompactionQueries_.push_back(PendingCompactionQuery{
+                .source = build.destination,
+                .queryPool = queryPool,
+            });
+        }
+    }
+
     ++openGraphicsBatchOps_;
     ++totalBlasBuilds_;
     return true;
+}
+
+bool StreamingGpuTransferExecutor::stageBlasCompaction(AccelerationStructure& source, AccelerationStructure& destination) {
+    if (device_ == VK_NULL_HANDLE ||
+        source.handle() == VK_NULL_HANDLE ||
+        destination.handle() == VK_NULL_HANDLE ||
+        source.type() != VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
+        destination.type() != VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
+        return false;
+    }
+
+    VkCopyAccelerationStructureInfoKHR copyInfo{};
+    copyInfo.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
+    copyInfo.src = source.handle();
+    copyInfo.dst = destination.handle();
+    copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+
+    VkCommandBuffer cmd = beginGraphicsBatch();
+    vkCmdCopyAccelerationStructureKHR(cmd, &copyInfo);
+
+    VkMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR;
+    barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_MEMORY_READ_BIT;
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+
+    ++openGraphicsBatchOps_;
+    ++totalBlasCompactions_;
+    return true;
+}
+
+uint64_t StreamingGpuTransferExecutor::compactedBlasSize(const AccelerationStructure& source) const {
+    for (const auto& [storedSource, bytes] : compactedBlasSizes_) {
+        if (storedSource == &source) {
+            return bytes;
+        }
+    }
+    return 0;
+}
+
+uint64_t StreamingGpuTransferExecutor::consumeCompactedBlasSize(const AccelerationStructure& source) {
+    for (auto it = compactedBlasSizes_.begin(); it != compactedBlasSizes_.end(); ++it) {
+        if (it->first == &source) {
+            const uint64_t bytes = it->second;
+            compactedBlasSizes_.erase(it);
+            return bytes;
+        }
+    }
+    return 0;
 }
 
 bool StreamingGpuTransferExecutor::stageTlasBuild(const TlasBuild& build) {
@@ -467,13 +559,13 @@ uint64_t StreamingGpuTransferExecutor::submitGraphicsFrame(uint64_t waitTimeline
     waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     waitInfo.semaphore = timeline_;
     waitInfo.value = waitTimelineValue;
-    waitInfo.stageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     VkSemaphoreSubmitInfo signalInfo{};
     signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     signalInfo.semaphore = timeline_;
     signalInfo.value = signalValue;
-    signalInfo.stageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     VkSubmitInfo2 submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
@@ -488,6 +580,11 @@ uint64_t StreamingGpuTransferExecutor::submitGraphicsFrame(uint64_t waitTimeline
     checkVk(vkQueueSubmit2(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit2(streaming graphics)");
 
     inFlight_.push_back(InFlightBatch{.timelineValue = signalValue, .commandBuffer = openGraphicsBatch_, .graphics = true});
+    for (PendingCompactionQuery& query : openGraphicsCompactionQueries_) {
+        query.timelineValue = signalValue;
+        pendingCompactionQueries_.push_back(query);
+    }
+    openGraphicsCompactionQueries_.clear();
     submittedTimeline_ = signalValue;
     ++totalSubmissions_;
     openGraphicsBatch_ = VK_NULL_HANDLE;
@@ -557,6 +654,41 @@ void StreamingGpuTransferExecutor::recycleCompleted(uint64_t completedTimeline) 
         inFlight_.pop_front();
     }
     (void)stagingRing_.retire(completedTimeline);
+    auto queryOut = pendingCompactionQueries_.begin();
+    for (auto queryIt = pendingCompactionQueries_.begin(); queryIt != pendingCompactionQueries_.end(); ++queryIt) {
+        if (queryIt->timelineValue <= completedTimeline) {
+            uint64_t compactedSize = 0;
+            const VkResult queryResult = vkGetQueryPoolResults(
+                device_,
+                queryIt->queryPool,
+                0,
+                1,
+                sizeof(compactedSize),
+                &compactedSize,
+                sizeof(compactedSize),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (queryResult == VK_SUCCESS && queryIt->source != nullptr && compactedSize != 0) {
+                auto found = std::find_if(
+                    compactedBlasSizes_.begin(),
+                    compactedBlasSizes_.end(),
+                    [&](const auto& stored) { return stored.first == queryIt->source; });
+                if (found != compactedBlasSizes_.end()) {
+                    found->second = compactedSize;
+                } else {
+                    compactedBlasSizes_.emplace_back(queryIt->source, compactedSize);
+                }
+            }
+            if (queryIt->queryPool != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(device_, queryIt->queryPool, nullptr);
+            }
+            continue;
+        }
+        if (queryOut != queryIt) {
+            *queryOut = *queryIt;
+        }
+        ++queryOut;
+    }
+    pendingCompactionQueries_.erase(queryOut, pendingCompactionQueries_.end());
 }
 
 uint64_t StreamingGpuTransferExecutor::poll() {
@@ -584,6 +716,7 @@ StreamingGpuTransferExecutor::Stats StreamingGpuTransferExecutor::stats() const 
     out.totalBufferCopies = totalBufferCopies_;
     out.totalImageCopies = totalImageCopies_;
     out.totalBlasBuilds = totalBlasBuilds_;
+    out.totalBlasCompactions = totalBlasCompactions_;
     out.totalTlasBuilds = totalTlasBuilds_;
     out.totalUploadedBytes = totalUploadedBytes_;
     out.stagingAllocationFailures = stagingAllocationFailures_;
@@ -756,7 +889,8 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
     VkAccelerationStructureBuildGeometryInfoKHR blasSizeInfo{};
     blasSizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     blasSizeInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    blasSizeInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    blasSizeInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+        VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
     blasSizeInfo.geometryCount = 1;
     blasSizeInfo.pGeometries = &geometry;
     const uint32_t primitiveCount = 1;
@@ -787,6 +921,8 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
             .vertexCount = static_cast<uint32_t>(vertices.size()),
             .indexCount = static_cast<uint32_t>(indices.size()),
             .vertexStride = sizeof(SelfTestVertex),
+            .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR,
         })) {
         errorOut = "stageBlasBuild failed";
         return false;
@@ -805,6 +941,35 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
         errorOut = "BLAS build timeline did not complete after wait";
         return false;
     }
+    const uint64_t compactedBlasBytes = consumeCompactedBlasSize(blas);
+    AccelerationStructure compactedBlas;
+    const AccelerationStructure* tlasBlas = &blas;
+    if (compactedBlasBytes != 0 && compactedBlasBytes < static_cast<uint64_t>(blas.size())) {
+        compactedBlas.create(device_, *allocator_, AccelerationStructureDesc{
+            .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+            .size = compactedBlasBytes,
+            .debugName = "streaming transfer selftest compacted BLAS",
+        });
+        if (!stageBlasCompaction(blas, compactedBlas)) {
+            errorOut = "stageBlasCompaction failed";
+            return false;
+        }
+        const uint64_t compactTimeline = submitTimelineMarker();
+        VkSemaphoreWaitInfo compactWait{};
+        compactWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        compactWait.semaphoreCount = 1;
+        compactWait.pSemaphores = &timeline_;
+        compactWait.pValues = &compactTimeline;
+        if (compactTimeline == 0 || vkWaitSemaphores(device_, &compactWait, UINT64_MAX) != VK_SUCCESS) {
+            errorOut = "vkWaitSemaphores(BLAS compaction) failed";
+            return false;
+        }
+        if (poll() < compactTimeline) {
+            errorOut = "BLAS compaction timeline did not complete after wait";
+            return false;
+        }
+        tlasBlas = &compactedBlas;
+    }
 
     VkAccelerationStructureInstanceKHR instance{};
     instance.transform.matrix[0][0] = 1.0f;
@@ -814,7 +979,7 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
     instance.mask = 0xFF;
     instance.instanceShaderBindingTableRecordOffset = 0;
     instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    instance.accelerationStructureReference = blas.deviceAddress();
+    instance.accelerationStructureReference = tlasBlas->deviceAddress();
 
     Buffer instanceUpload(*allocator_, BufferDesc{
         .size = sizeof(VkAccelerationStructureInstanceKHR),
@@ -944,6 +1109,7 @@ nlohmann::json streamingGpuTransferExecutorStatsJson(const StreamingGpuTransferE
         {"total_buffer_copies", stats.totalBufferCopies},
         {"total_image_copies", stats.totalImageCopies},
         {"total_blas_builds", stats.totalBlasBuilds},
+        {"total_blas_compactions", stats.totalBlasCompactions},
         {"total_tlas_builds", stats.totalTlasBuilds},
         {"total_uploaded_bytes", stats.totalUploadedBytes},
         {"staging_allocation_failures", stats.stagingAllocationFailures},

@@ -43,6 +43,7 @@ public:
         uint32_t totalBufferCopies = 0;
         uint32_t totalImageCopies = 0;
         uint32_t totalBlasBuilds = 0;
+        uint32_t totalBlasCompactions = 0;
         uint32_t totalTlasBuilds = 0;
         uint64_t totalUploadedBytes = 0;
         uint32_t stagingAllocationFailures = 0;
@@ -80,6 +81,9 @@ public:
     };
 
     [[nodiscard]] bool stageBlasBuild(const BlasTriangleBuild& build);
+    [[nodiscard]] bool stageBlasCompaction(AccelerationStructure& source, AccelerationStructure& destination);
+    [[nodiscard]] uint64_t compactedBlasSize(const AccelerationStructure& source) const;
+    [[nodiscard]] uint64_t consumeCompactedBlasSize(const AccelerationStructure& source);
 
     struct TlasBuild {
         AccelerationStructure* destination = nullptr;
@@ -123,6 +127,11 @@ private:
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
         bool graphics = false;
     };
+    struct PendingCompactionQuery {
+        const AccelerationStructure* source = nullptr;
+        VkQueryPool queryPool = VK_NULL_HANDLE;
+        uint64_t timelineValue = 0;
+    };
 
     [[nodiscard]] VkCommandBuffer beginBatch();
     [[nodiscard]] VkCommandBuffer beginGraphicsBatch();
@@ -149,6 +158,9 @@ private:
     uint32_t openBatchCopies_ = 0;
     VkCommandBuffer openGraphicsBatch_ = VK_NULL_HANDLE;
     uint32_t openGraphicsBatchOps_ = 0;
+    std::vector<PendingCompactionQuery> openGraphicsCompactionQueries_;
+    std::vector<PendingCompactionQuery> pendingCompactionQueries_;
+    std::vector<std::pair<const AccelerationStructure*, uint64_t>> compactedBlasSizes_;
     std::deque<InFlightBatch> inFlight_;
     std::vector<VkCommandBuffer> freeCommandBuffers_;
     std::vector<VkCommandBuffer> freeGraphicsCommandBuffers_;
@@ -157,6 +169,7 @@ private:
     uint32_t totalBufferCopies_ = 0;
     uint32_t totalImageCopies_ = 0;
     uint32_t totalBlasBuilds_ = 0;
+    uint32_t totalBlasCompactions_ = 0;
     uint32_t totalTlasBuilds_ = 0;
     uint64_t totalUploadedBytes_ = 0;
     uint32_t stagingAllocationFailures_ = 0;
