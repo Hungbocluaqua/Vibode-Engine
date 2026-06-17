@@ -112,6 +112,12 @@ uint64_t IncrementalGpuSceneUpdateQueue::enqueue(IncrementalGpuSceneOperationDes
 
 void IncrementalGpuSceneUpdateQueue::enqueueUpdatePlan(const GpuSceneStreamingUpdatePlan& plan) {
     for (const GpuSceneStreamingUpdatePlanEntry& entry : plan.entries) {
+        const bool needsTlasPatch =
+            (entry.renderabilityChanged && !entry.becameRenderable && !entry.removed) ||
+            entry.currentState == GpuSceneStreamingInstanceState::PendingTlas;
+        const bool needsDescriptorPatch =
+            entry.becameRenderable ||
+            entry.currentState == GpuSceneStreamingInstanceState::PendingMaterials;
         if (entry.removed && entry.becameNonRenderable) {
             (void)enqueue(makeOperation(
                 IncrementalGpuSceneOperationKind::RemoveInstance,
@@ -131,22 +137,20 @@ void IncrementalGpuSceneUpdateQueue::enqueueUpdatePlan(const GpuSceneStreamingUp
                 entry,
                 "patch streamed BLAS handle " + std::to_string(entry.entityUuid),
                 0.05));
+        }
+        if (needsTlasPatch) {
             (void)enqueue(makeOperation(
                 IncrementalGpuSceneOperationKind::PatchTlas,
                 entry,
                 "patch streamed TLAS instance " + std::to_string(entry.entityUuid),
                 0.08));
+        }
+        if (needsDescriptorPatch) {
             (void)enqueue(makeOperation(
                 IncrementalGpuSceneOperationKind::PatchDescriptors,
                 entry,
                 "patch streamed descriptors " + std::to_string(entry.entityUuid),
                 0.04));
-        } else if (entry.renderabilityChanged) {
-            (void)enqueue(makeOperation(
-                IncrementalGpuSceneOperationKind::PatchTlas,
-                entry,
-                "patch streamed TLAS visibility " + std::to_string(entry.entityUuid),
-                0.06));
         }
         if (entry.resetTemporalHistory) {
             (void)enqueue(makeOperation(
@@ -221,9 +225,17 @@ IncrementalGpuSceneApplyFrameResult IncrementalGpuSceneUpdateQueue::applyFrame(c
         frame.appliedMs += operation.desc.estimatedApplyMs;
         if (isTlasPatch(operation.desc.kind)) {
             ++frame.appliedTlasPatches;
+            frame.tlasPatchEntityUuids.push_back(operation.desc.entityUuid);
+            if (!operation.desc.meshGuid.empty()) {
+                frame.tlasPatchMeshGuids.push_back(operation.desc.meshGuid);
+            }
         }
         if (isDescriptorPatch(operation.desc.kind)) {
             ++frame.appliedDescriptorPatches;
+            frame.descriptorPatchEntityUuids.push_back(operation.desc.entityUuid);
+            if (!operation.desc.meshGuid.empty()) {
+                frame.descriptorPatchMeshGuids.push_back(operation.desc.meshGuid);
+            }
             if (operation.desc.kind == IncrementalGpuSceneOperationKind::UpdateRestirLightCandidates) {
                 frame.restirLightCandidateEntityUuids.push_back(operation.desc.entityUuid);
             }
@@ -322,6 +334,10 @@ nlohmann::json incrementalGpuSceneApplyFrameResultJson(const IncrementalGpuScene
         {"temporal_reset_entity_uuids", frame.temporalResetEntityUuids},
         {"restir_reset_entity_uuids", frame.restirResetEntityUuids},
         {"restir_light_candidate_entity_uuids", frame.restirLightCandidateEntityUuids},
+        {"tlas_patch_entity_uuids", frame.tlasPatchEntityUuids},
+        {"tlas_patch_mesh_guids", frame.tlasPatchMeshGuids},
+        {"descriptor_patch_entity_uuids", frame.descriptorPatchEntityUuids},
+        {"descriptor_patch_mesh_guids", frame.descriptorPatchMeshGuids},
         {"apply_budget_exhausted", frame.applyBudgetExhausted},
         {"operation_budget_exhausted", frame.operationBudgetExhausted},
         {"tlas_budget_exhausted", frame.tlasBudgetExhausted},

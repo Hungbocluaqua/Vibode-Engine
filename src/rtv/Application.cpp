@@ -15650,6 +15650,122 @@ void Application::stepStreamingGpuSceneUpdateQueue() {
     });
     if (lastStreamingGpuSceneApply_.appliedOperations > 0) {
         if (pathTracer_ != nullptr) {
+            auto uniqueAssetGuids = [](const std::vector<AssetGuid>& guids) {
+                std::vector<AssetGuid> result;
+                std::unordered_set<AssetGuid> seen;
+                result.reserve(guids.size());
+                seen.reserve(guids.size());
+                for (const AssetGuid& guid : guids) {
+                    if (!guid.empty() && seen.insert(guid).second) {
+                        result.push_back(guid);
+                    }
+                }
+                return result;
+            };
+            auto collectMaterialGuids = [&](const std::vector<uint64_t>& entityUuids) {
+                std::unordered_set<uint64_t> requestedEntities;
+                requestedEntities.reserve(entityUuids.size());
+                for (uint64_t uuid : entityUuids) {
+                    if (uuid != 0) {
+                        requestedEntities.insert(uuid);
+                    }
+                }
+                std::vector<AssetGuid> result;
+                if (requestedEntities.empty()) {
+                    return result;
+                }
+                std::unordered_set<AssetGuid> seen;
+                for (const Entity* entity : sceneDocument_.registry().entities()) {
+                    if (entity == nullptr ||
+                        requestedEntities.find(entity->uuid) == requestedEntities.end() ||
+                        !entity->meshRenderer.has_value()) {
+                        continue;
+                    }
+                    for (const MaterialSlot& slot : entity->meshRenderer->materialSlots) {
+                        const AssetGuid& guid = slot.overrideMaterialGuid.value_or(slot.materialGuid);
+                        if (!guid.empty() && seen.insert(guid).second) {
+                            result.push_back(guid);
+                        }
+                    }
+                }
+                return result;
+            };
+            std::unordered_map<uint64_t, AssetGuid> meshGuidByEntityUuid;
+            meshGuidByEntityUuid.reserve(gpuSceneStreaming.instances().size());
+            for (const GpuSceneStreamingInstanceSnapshot& snapshot : gpuSceneStreaming.instances()) {
+                if (snapshot.entityUuid != 0 && !snapshot.meshGuid.empty()) {
+                    meshGuidByEntityUuid[snapshot.entityUuid] = snapshot.meshGuid;
+                }
+            }
+            auto meshGuidForEntityUuid = [&](uint64_t uuid) -> AssetGuid {
+                const auto found = meshGuidByEntityUuid.find(uuid);
+                return found != meshGuidByEntityUuid.end() ? found->second : AssetGuid{};
+            };
+            bool rebuiltStreamingGpuScene = false;
+            auto ensureStreamingGpuSceneAsset = [&]() {
+                if (!rebuiltStreamingGpuScene) {
+                    rebuildGpuSceneAsset();
+                    rebuiltStreamingGpuScene = true;
+                }
+            };
+
+            if (lastStreamingGpuSceneApply_.appliedDescriptorPatches > 0) {
+                ensureStreamingGpuSceneAsset();
+                const bool descriptorsPatched =
+                    gpuSceneAsset_.has_value() &&
+                    !gpuSceneAsset_->meshes.empty() &&
+                    pathTracer_->updateMaterials(*gpuSceneAsset_, assets_);
+                if (descriptorsPatched) {
+                    for (const AssetGuid& guid : collectMaterialGuids(lastStreamingGpuSceneApply_.descriptorPatchEntityUuids)) {
+                        (void)nativeGpuAssetCache_.markDescriptorPatchComplete(guid);
+                        streamingRuntimeState_.setAssetState(guid, StreamingAssetState::GpuResident);
+                    }
+                    streamingRuntimeState_.pushEvent(
+                        "patched streamed material descriptors: " +
+                        std::to_string(lastStreamingGpuSceneApply_.appliedDescriptorPatches));
+                } else {
+                    for (uint64_t uuid : lastStreamingGpuSceneApply_.descriptorPatchEntityUuids) {
+                        (void)streamingGpuSceneUpdateQueue_.enqueue(IncrementalGpuSceneOperationDesc{
+                            .kind = IncrementalGpuSceneOperationKind::PatchDescriptors,
+                            .entityUuid = uuid,
+                            .meshGuid = meshGuidForEntityUuid(uuid),
+                            .label = "retry streamed descriptors " + std::to_string(uuid),
+                            .estimatedApplyMs = 0.04,
+                        });
+                    }
+                    streamingRuntimeState_.pushEvent("streamed material descriptor patch could not be applied to the live renderer");
+                }
+            }
+
+            if (lastStreamingGpuSceneApply_.appliedTlasPatches > 0) {
+                ensureStreamingGpuSceneAsset();
+                const bool tlasPatched =
+                    gpuSceneAsset_.has_value() &&
+                    !gpuSceneAsset_->meshes.empty() &&
+                    pathTracer_->updateSceneVisibility(*gpuSceneAsset_, assets_);
+                if (tlasPatched) {
+                    for (const AssetGuid& guid : uniqueAssetGuids(lastStreamingGpuSceneApply_.tlasPatchMeshGuids)) {
+                        (void)nativeGpuAssetCache_.markTlasVisible(guid);
+                        (void)nativeGpuAssetCache_.markResident(guid);
+                        streamingRuntimeState_.setAssetState(guid, StreamingAssetState::GpuResident);
+                    }
+                    streamingRuntimeState_.pushEvent(
+                        "patched streamed TLAS visibility: " +
+                        std::to_string(lastStreamingGpuSceneApply_.appliedTlasPatches));
+                } else {
+                    for (uint64_t uuid : lastStreamingGpuSceneApply_.tlasPatchEntityUuids) {
+                        (void)streamingGpuSceneUpdateQueue_.enqueue(IncrementalGpuSceneOperationDesc{
+                            .kind = IncrementalGpuSceneOperationKind::PatchTlas,
+                            .entityUuid = uuid,
+                            .meshGuid = meshGuidForEntityUuid(uuid),
+                            .label = "retry streamed TLAS patch " + std::to_string(uuid),
+                            .estimatedApplyMs = 0.08,
+                        });
+                    }
+                    streamingRuntimeState_.pushEvent("streamed TLAS patch could not be applied to the live renderer");
+                }
+            }
+
             std::unordered_map<uint64_t, uint32_t> instanceIndexByEntityUuid;
             instanceIndexByEntityUuid.reserve(gpuSceneStreaming.instances().size());
             for (const GpuSceneStreamingInstanceSnapshot& snapshot : gpuSceneStreaming.instances()) {

@@ -38,6 +38,15 @@ bool cacheEntryResident(const CacheSnapshotMap& cache, const AssetGuid& guid) {
     return snapshot != nullptr && snapshot->residency == NativeGpuAssetResidency::Resident;
 }
 
+bool cacheEntryMeshPayloadReady(const CacheSnapshotMap& cache, const AssetGuid& guid) {
+    const NativeGpuAssetSnapshot* snapshot = cacheSnapshotFor(cache, guid);
+    return snapshot != nullptr &&
+        snapshot->kind == NativeGpuAssetKind::Mesh &&
+        (snapshot->residency == NativeGpuAssetResidency::Resident ||
+         snapshot->blasReady ||
+         snapshot->tlasVisible);
+}
+
 bool cacheEntryBlasReady(const CacheSnapshotMap& cache, const AssetGuid& guid) {
     const NativeGpuAssetSnapshot* snapshot = cacheSnapshotFor(cache, guid);
     return snapshot != nullptr && snapshot->blasReady;
@@ -121,7 +130,7 @@ GpuSceneStreamingInstanceSnapshot makeSnapshot(
     snapshot.visible = entity.visible && renderer.visible;
     snapshot.castShadow = renderer.castShadow;
     snapshot.visibleToCamera = renderer.visibleToCamera;
-    snapshot.cacheResident = cacheEntryResident(cache, renderer.meshGuid);
+    snapshot.cacheResident = cacheEntryMeshPayloadReady(cache, renderer.meshGuid);
     snapshot.blasReady = cacheEntryBlasReady(cache, renderer.meshGuid);
     snapshot.tlasVisible = cacheEntryTlasVisible(cache, renderer.meshGuid);
     snapshot.fallbackDescriptors = cacheEntryUsesFallback(cache, renderer.meshGuid) || anyMaterialFallback(renderer, cache);

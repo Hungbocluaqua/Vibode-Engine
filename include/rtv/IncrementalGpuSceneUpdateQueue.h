@@ -56,6 +56,10 @@ struct IncrementalGpuSceneApplyFrameResult {
     std::vector<uint64_t> temporalResetEntityUuids;
     std::vector<uint64_t> restirResetEntityUuids;
     std::vector<uint64_t> restirLightCandidateEntityUuids;
+    std::vector<uint64_t> tlasPatchEntityUuids;
+    std::vector<AssetGuid> tlasPatchMeshGuids;
+    std::vector<uint64_t> descriptorPatchEntityUuids;
+    std::vector<AssetGuid> descriptorPatchMeshGuids;
     bool applyBudgetExhausted = false;
     bool operationBudgetExhausted = false;
     bool tlasBudgetExhausted = false;
