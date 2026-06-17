@@ -643,7 +643,15 @@ private:
         uint64_t destinationOffset = 0;
         std::vector<uint8_t> bytes;
     };
+    struct StreamingGpuImageMipUploadPayload {
+        AssetGuid ownerGuid;
+        uint32_t mipLevel = 0;
+        uint32_t width = 1;
+        uint32_t height = 1;
+        std::vector<uint8_t> bytes;
+    };
     std::unordered_map<uint64_t, StreamingGpuBufferUploadPayload> streamingGpuBufferUploadPayloads_;
+    std::unordered_map<uint64_t, StreamingGpuImageMipUploadPayload> streamingGpuImageMipUploadPayloads_;
     // Maps a streaming work-queue submitted timeline value to the real device
     // transfer-executor timeline marker that gates its completion. Front-to-back
     // ascending; drained as the device signals each marker.

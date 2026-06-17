@@ -16,6 +16,7 @@ namespace rtv {
 class VulkanContext;
 class ResourceAllocator;
 class Buffer;
+class Image;
 
 // Real device-backed transfer executor for streaming uploads.
 //
@@ -60,6 +61,7 @@ public:
     // submitFrame() to flush. Returns false if the staging ring is full (bounded
     // back-pressure) - the caller should retry next frame.
     [[nodiscard]] bool stageBufferUpload(Buffer& destination, const void* src, uint64_t bytes, uint64_t dstOffset = 0);
+    [[nodiscard]] bool stageImageMipUpload(Image& destination, const void* src, uint64_t bytes, uint32_t mipLevel, uint32_t width, uint32_t height);
 
     // Flush all copies recorded since the last submitFrame() as one transfer
     // submission that signals the next timeline value. Returns the signaled

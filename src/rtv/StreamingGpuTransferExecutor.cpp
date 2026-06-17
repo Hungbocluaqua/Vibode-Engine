@@ -2,11 +2,15 @@
 
 #include "rtv/Buffer.h"
 #include "rtv/Check.h"
+#include "rtv/Image.h"
+#include "rtv/ImageBarrier.h"
 #include "rtv/ResourceAllocator.h"
 #include "rtv/VulkanContext.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <utility>
 
@@ -148,6 +152,77 @@ bool StreamingGpuTransferExecutor::stageBufferUpload(Buffer& destination, const 
     vkCmdCopyBuffer(cmd, alloc->buffer, destination.handle(), 1, &copy);
     ++openBatchCopies_;
     ++totalBufferCopies_;
+    totalUploadedBytes_ += bytes;
+    return true;
+}
+
+bool StreamingGpuTransferExecutor::stageImageMipUpload(
+    Image& destination,
+    const void* src,
+    uint64_t bytes,
+    uint32_t mipLevel,
+    uint32_t width,
+    uint32_t height) {
+    if (device_ == VK_NULL_HANDLE || src == nullptr || bytes == 0 || destination.handle() == VK_NULL_HANDLE || mipLevel >= destination.mipLevels()) {
+        return false;
+    }
+    const uint64_t targetTimeline = nextTimelineValue_;
+    std::optional<StreamingStagingAllocation> alloc = stagingRing_.allocate(bytes, targetTimeline);
+    if (!alloc.has_value()) {
+        ++stagingAllocationFailures_;
+        return false;
+    }
+    if (alloc->mapped == nullptr || alloc->buffer == VK_NULL_HANDLE) {
+        ++stagingAllocationFailures_;
+        return false;
+    }
+    std::memcpy(alloc->mapped, src, static_cast<size_t>(bytes));
+
+    VkCommandBuffer cmd = beginBatch();
+    barrier::cmdTransitionImage(cmd, {
+        .image = destination.handle(),
+        .oldLayout = destination.layout(),
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .range = barrier::colorRange(mipLevel, 1),
+        .srcStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccess = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+    });
+
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = alloc->offset;
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.mipLevel = mipLevel;
+    copy.imageSubresource.baseArrayLayer = 0;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {
+        std::max(width, 1u),
+        std::max(height, 1u),
+        1u,
+    };
+    vkCmdCopyBufferToImage(
+        cmd,
+        alloc->buffer,
+        destination.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
+
+    barrier::cmdTransitionImage(cmd, {
+        .image = destination.handle(),
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .range = barrier::colorRange(mipLevel, 1),
+        .srcStage = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccess = VK_ACCESS_2_MEMORY_READ_BIT,
+    });
+    destination.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    ++openBatchCopies_;
+    ++totalImageCopies_;
     totalUploadedBytes_ += bytes;
     return true;
 }
@@ -346,6 +421,41 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
     }
     if (std::memcmp(readBytes, pattern.data(), pattern.size()) != 0) {
         errorOut = "readback bytes did not match uploaded pattern";
+        return false;
+    }
+
+    std::array<uint8_t, 4u * 4u * 4u> imagePattern{};
+    for (size_t i = 0; i < imagePattern.size(); ++i) {
+        imagePattern[i] = static_cast<uint8_t>((i * 17u + 3u) & 0xFFu);
+    }
+    Image image(*allocator_, ImageDesc{
+        .width = 4,
+        .height = 4,
+        .depth = 1,
+        .mipLevels = 1,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .createDefaultView = true,
+        .debugName = "streaming transfer selftest image",
+    });
+    if (!stageImageMipUpload(image, imagePattern.data(), imagePattern.size(), 0, 4, 4)) {
+        errorOut = "stageImageMipUpload failed";
+        return false;
+    }
+    const uint64_t imageTimeline = submitFrame();
+    VkSemaphoreWaitInfo imageWait{};
+    imageWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    imageWait.semaphoreCount = 1;
+    imageWait.pSemaphores = &timeline_;
+    imageWait.pValues = &imageTimeline;
+    if (vkWaitSemaphores(device_, &imageWait, UINT64_MAX) != VK_SUCCESS) {
+        errorOut = "vkWaitSemaphores(image upload) failed";
+        return false;
+    }
+    if (poll() < imageTimeline) {
+        errorOut = "image upload timeline did not complete after wait";
         return false;
     }
 

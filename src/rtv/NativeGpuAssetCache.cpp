@@ -223,7 +223,9 @@ bool NativeGpuAssetCache::markFailed(const AssetGuid& guid) {
     if (Entry* entry = find(guid)) {
         entry->residency = NativeGpuAssetResidency::Failed;
         entry->gpuBuffer.reset();
+        entry->gpuImage.reset();
         entry->ownedGpuBufferBytes = 0;
+        entry->ownedGpuImageBytes = 0;
         entry->desc.fallbackDescriptorBound = true;
         entry->desc.blasBuildPending = false;
         entry->desc.blasReady = false;
@@ -312,6 +314,42 @@ const Buffer* NativeGpuAssetCache::bufferResource(const AssetGuid& guid) const {
     return entry != nullptr ? entry->gpuBuffer.get() : nullptr;
 }
 
+bool NativeGpuAssetCache::ensureImageResource(
+    ResourceAllocator& allocator,
+    const AssetGuid& guid,
+    const ImageDesc& desc,
+    uint64_t estimatedBytes) {
+    Entry* entry = find(guid);
+    if (entry == nullptr || desc.width == 0 || desc.height == 0 || desc.usage == 0) {
+        return false;
+    }
+    if (entry->gpuImage != nullptr &&
+        entry->gpuImage->handle() != VK_NULL_HANDLE &&
+        entry->gpuImage->width() == std::max(desc.width, 1u) &&
+        entry->gpuImage->height() == std::max(desc.height, 1u) &&
+        entry->gpuImage->mipLevels() == std::max(desc.mipLevels, 1u) &&
+        entry->gpuImage->format() == desc.format) {
+        entry->ownedGpuImageBytes = std::max(entry->ownedGpuImageBytes, estimatedBytes);
+        entry->lastTouchedFrame = ++frameCounter_;
+        return true;
+    }
+
+    entry->gpuImage = std::make_unique<Image>(allocator, desc);
+    entry->ownedGpuImageBytes = estimatedBytes;
+    entry->lastTouchedFrame = ++frameCounter_;
+    return true;
+}
+
+Image* NativeGpuAssetCache::imageResource(const AssetGuid& guid) {
+    Entry* entry = find(guid);
+    return entry != nullptr ? entry->gpuImage.get() : nullptr;
+}
+
+const Image* NativeGpuAssetCache::imageResource(const AssetGuid& guid) const {
+    const Entry* entry = find(guid);
+    return entry != nullptr ? entry->gpuImage.get() : nullptr;
+}
+
 NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuAssetCacheBudget& budget) {
     NativeGpuAssetEvictionResult result;
     NativeGpuAssetCacheStats current = stats();
@@ -339,7 +377,9 @@ NativeGpuAssetEvictionResult NativeGpuAssetCache::evictToBudget(const NativeGpuA
         }
         entry->residency = NativeGpuAssetResidency::Retired;
         entry->gpuBuffer.reset();
+        entry->gpuImage.reset();
         entry->ownedGpuBufferBytes = 0;
+        entry->ownedGpuImageBytes = 0;
         entry->desc.fallbackDescriptorBound = true;
         entry->desc.blasBuildPending = false;
         entry->desc.blasReady = false;
@@ -447,6 +487,7 @@ std::vector<NativeGpuAssetSnapshot> NativeGpuAssetCache::snapshots() const {
             .gpuBytes = entry.desc.gpuBytes,
             .uploadBytes = entry.desc.uploadBytes,
             .ownedGpuBufferBytes = entry.ownedGpuBufferBytes,
+            .ownedGpuImageBytes = entry.ownedGpuImageBytes,
             .uploadTicketId = entry.desc.uploadTicketId,
             .blasBuildTicketId = entry.desc.blasBuildTicketId,
             .tlasPatchTicketId = entry.desc.tlasPatchTicketId,
@@ -473,6 +514,7 @@ std::vector<NativeGpuAssetSnapshot> NativeGpuAssetCache::snapshots() const {
             .selected = entry.desc.selected,
             .evictable = evictable(entry, defaultBudget),
             .ownsGpuBuffer = entry.gpuBuffer != nullptr && entry.gpuBuffer->handle() != VK_NULL_HANDLE,
+            .ownsGpuImage = entry.gpuImage != nullptr && entry.gpuImage->handle() != VK_NULL_HANDLE,
         });
     }
     std::sort(out.begin(), out.end(), [](const NativeGpuAssetSnapshot& a, const NativeGpuAssetSnapshot& b) {
@@ -569,6 +611,7 @@ nlohmann::json nativeGpuAssetCacheSnapshotsJson(const std::vector<NativeGpuAsset
             {"gpu_bytes", snapshot.gpuBytes},
             {"upload_bytes", snapshot.uploadBytes},
             {"owned_gpu_buffer_bytes", snapshot.ownedGpuBufferBytes},
+            {"owned_gpu_image_bytes", snapshot.ownedGpuImageBytes},
             {"upload_ticket_id", snapshot.uploadTicketId},
             {"blas_build_ticket_id", snapshot.blasBuildTicketId},
             {"tlas_patch_ticket_id", snapshot.tlasPatchTicketId},
@@ -595,6 +638,7 @@ nlohmann::json nativeGpuAssetCacheSnapshotsJson(const std::vector<NativeGpuAsset
             {"selected", snapshot.selected},
             {"evictable", snapshot.evictable},
             {"owns_gpu_buffer", snapshot.ownsGpuBuffer},
+            {"owns_gpu_image", snapshot.ownsGpuImage},
         });
     }
     return out;

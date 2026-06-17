@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -4032,6 +4033,21 @@ uint64_t estimatedTextureUploadBytes(const rtv::TextureAsset& texture) {
         channelBytes;
 }
 
+std::vector<uint8_t> textureMipUploadPayload(const rtv::TextureAsset& texture, uint32_t mipLevel) {
+    if (mipLevel < texture.mipData.size()) {
+        const rtv::TextureMipLevel& mip = texture.mipData[mipLevel];
+        if (mip.size != 0 && mip.offset <= texture.rgba8.size() && mip.size <= texture.rgba8.size() - mip.offset) {
+            const auto begin = texture.rgba8.begin() + static_cast<std::ptrdiff_t>(mip.offset);
+            const auto end = begin + static_cast<std::ptrdiff_t>(mip.size);
+            return std::vector<uint8_t>(begin, end);
+        }
+    }
+    if (mipLevel == 0 && !texture.rgba8.empty()) {
+        return texture.rgba8;
+    }
+    return {};
+}
+
 uint32_t materialTextureDependencyCount(const rtv::MaterialAsset& material) {
     const rtv::TextureAssetHandle handles[] = {
         material.baseColorTexture,
@@ -4155,8 +4171,14 @@ nlohmann::json Application::streamingRuntimeReport() const {
     for (const StreamingGpuWorkSnapshot& ticket : streamingGpuWorkQueue_.snapshots()) {
         hasPayloadBackedWork = hasPayloadBackedWork || ticket.payloadBacked;
     }
+    uint64_t pendingBufferPayloadBytes = 0;
     uint64_t pendingPayloadBytes = 0;
     for (const auto& [ticketId, payload] : streamingGpuBufferUploadPayloads_) {
+        (void)ticketId;
+        pendingBufferPayloadBytes += static_cast<uint64_t>(payload.bytes.size());
+        pendingPayloadBytes += static_cast<uint64_t>(payload.bytes.size());
+    }
+    for (const auto& [ticketId, payload] : streamingGpuImageMipUploadPayloads_) {
         (void)ticketId;
         pendingPayloadBytes += static_cast<uint64_t>(payload.bytes.size());
     }
@@ -4168,7 +4190,9 @@ nlohmann::json Application::streamingRuntimeReport() const {
         {"completed_timeline", streamingGpuWorkCompletedTimeline_},
         {"payload_backed_executor_work", hasPayloadBackedWork},
         {"pending_payload_buffer_uploads", streamingGpuBufferUploadPayloads_.size()},
-        {"pending_payload_buffer_upload_bytes", pendingPayloadBytes},
+        {"pending_payload_image_mip_uploads", streamingGpuImageMipUploadPayloads_.size()},
+        {"pending_payload_buffer_upload_bytes", pendingBufferPayloadBytes},
+        {"pending_payload_upload_bytes", pendingPayloadBytes},
         {"marker_only_completion_event_emitted", streamingGpuMarkerOnlyCompletionEventEmitted_},
         {"pending_timeline_markers", streamingGpuTimelineMarkers},
         {"transfer_executor_ready", streamingGpuTransferExecutorReady_},
@@ -10204,6 +10228,34 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
                 .residentMipCount = 0,
                 .fallbackDescriptorBound = true,
             });
+            bool textureImageBacked = false;
+            if (texture != nullptr && uploadBytes > 0 && allocator_ != nullptr) {
+                const VkFormat imageFormat = texture->isCompressed && texture->compressedFormat != VK_FORMAT_UNDEFINED
+                    ? texture->compressedFormat
+                    : texture->format;
+                const std::string debugName = "streaming texture payload " + guid;
+                try {
+                    textureImageBacked = nativeGpuAssetCache_.ensureImageResource(
+                        *allocator_,
+                        guid,
+                        ImageDesc{
+                            .width = std::max(texture->width, 1u),
+                            .height = std::max(texture->height, 1u),
+                            .depth = 1,
+                            .mipLevels = mipCount,
+                            .format = imageFormat,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .createDefaultView = true,
+                            .debugName = debugName.c_str(),
+                        },
+                        uploadBytes);
+                } catch (const std::exception& e) {
+                    streamingRuntimeState_.pushEvent("streaming texture GPU image allocation failed for " + guid + ": " + e.what());
+                    textureImageBacked = false;
+                }
+            }
             streamingRuntimeState_.setAssetState(guid, StreamingAssetState::UploadQueued);
             uint64_t firstUploadTicket = 0;
             auto mipUploadBytes = [&](uint32_t mipLevel) -> uint64_t {
@@ -10218,6 +10270,17 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
             for (uint32_t queuedMip = 0; queuedMip < mipCount; ++queuedMip) {
                 const uint32_t mipLevel = mipCount - 1u - queuedMip;
                 const uint64_t mipBytes = mipUploadBytes(mipLevel);
+                std::vector<uint8_t> mipPayload;
+                uint32_t mipWidth = texture != nullptr ? std::max(1u, texture->width >> mipLevel) : 1u;
+                uint32_t mipHeight = texture != nullptr ? std::max(1u, texture->height >> mipLevel) : 1u;
+                if (textureImageBacked && texture != nullptr && mipBytes > 0) {
+                    mipPayload = textureMipUploadPayload(*texture, mipLevel);
+                    if (mipLevel < texture->mipData.size()) {
+                        mipWidth = std::max(texture->mipData[mipLevel].width, 1u);
+                        mipHeight = std::max(texture->mipData[mipLevel].height, 1u);
+                    }
+                }
+                const bool mipPayloadBacked = !mipPayload.empty();
                 const uint64_t uploadTicket = streamingGpuWorkQueue_.enqueue(StreamingGpuWorkDesc{
                     .kind = StreamingGpuWorkKind::ImageMipUpload,
                     .label = "stream texture mip " + std::to_string(mipLevel) + "/" + std::to_string(mipCount) + " " + guid,
@@ -10226,7 +10289,17 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
                     .estimatedGpuMs = std::clamp(static_cast<double>(mipBytes) / (64.0 * 1024.0 * 1024.0), 0.03, 0.75),
                     .textureMipLevel = mipLevel,
                     .textureMipCount = mipCount,
+                    .payloadBacked = mipPayloadBacked,
                 });
+                if (mipPayloadBacked) {
+                    streamingGpuImageMipUploadPayloads_[uploadTicket] = StreamingGpuImageMipUploadPayload{
+                        .ownerGuid = guid,
+                        .mipLevel = mipLevel,
+                        .width = mipWidth,
+                        .height = mipHeight,
+                        .bytes = std::move(mipPayload),
+                    };
+                }
                 if (firstUploadTicket == 0) {
                     firstUploadTicket = uploadTicket;
                 }
@@ -15338,31 +15411,58 @@ void Application::stepStreamingGpuWorkQueue() {
     if (streamingGpuTransferExecutorReady_) {
         bool submittedPayloadWork = false;
         for (const StreamingGpuSubmittedTicket& ticket : result.submitted) {
-            if (!ticket.payloadBacked || ticket.kind != StreamingGpuWorkKind::BufferUpload) {
+            if (!ticket.payloadBacked) {
                 continue;
             }
-            auto payloadIt = streamingGpuBufferUploadPayloads_.find(ticket.id);
-            Buffer* destination = payloadIt != streamingGpuBufferUploadPayloads_.end()
-                ? nativeGpuAssetCache_.bufferResource(payloadIt->second.ownerGuid)
-                : nullptr;
-            if (payloadIt == streamingGpuBufferUploadPayloads_.end() ||
-                destination == nullptr ||
-                payloadIt->second.bytes.empty() ||
-                payloadIt->second.bytes.size() != ticket.bytes ||
-                !streamingGpuTransferExecutor_.stageBufferUpload(
-                    *destination,
-                    payloadIt->second.bytes.data(),
-                    static_cast<uint64_t>(payloadIt->second.bytes.size()),
-                    payloadIt->second.destinationOffset)) {
-                (void)streamingGpuWorkQueue_.fail(ticket.id);
-                streamingRuntimeState_.pushEvent("streaming GPU payload staging failed for ticket " + std::to_string(ticket.id));
-                if (payloadIt != streamingGpuBufferUploadPayloads_.end()) {
-                    streamingGpuBufferUploadPayloads_.erase(payloadIt);
+            if (ticket.kind == StreamingGpuWorkKind::BufferUpload) {
+                auto payloadIt = streamingGpuBufferUploadPayloads_.find(ticket.id);
+                Buffer* destination = payloadIt != streamingGpuBufferUploadPayloads_.end()
+                    ? nativeGpuAssetCache_.bufferResource(payloadIt->second.ownerGuid)
+                    : nullptr;
+                if (payloadIt == streamingGpuBufferUploadPayloads_.end() ||
+                    destination == nullptr ||
+                    payloadIt->second.bytes.empty() ||
+                    payloadIt->second.bytes.size() != ticket.bytes ||
+                    !streamingGpuTransferExecutor_.stageBufferUpload(
+                        *destination,
+                        payloadIt->second.bytes.data(),
+                        static_cast<uint64_t>(payloadIt->second.bytes.size()),
+                        payloadIt->second.destinationOffset)) {
+                    (void)streamingGpuWorkQueue_.fail(ticket.id);
+                    streamingRuntimeState_.pushEvent("streaming GPU buffer payload staging failed for ticket " + std::to_string(ticket.id));
+                    if (payloadIt != streamingGpuBufferUploadPayloads_.end()) {
+                        streamingGpuBufferUploadPayloads_.erase(payloadIt);
+                    }
+                    continue;
                 }
-                continue;
+                submittedPayloadWork = true;
+                streamingGpuBufferUploadPayloads_.erase(payloadIt);
+            } else if (ticket.kind == StreamingGpuWorkKind::ImageMipUpload) {
+                auto payloadIt = streamingGpuImageMipUploadPayloads_.find(ticket.id);
+                Image* destination = payloadIt != streamingGpuImageMipUploadPayloads_.end()
+                    ? nativeGpuAssetCache_.imageResource(payloadIt->second.ownerGuid)
+                    : nullptr;
+                if (payloadIt == streamingGpuImageMipUploadPayloads_.end() ||
+                    destination == nullptr ||
+                    payloadIt->second.bytes.empty() ||
+                    payloadIt->second.bytes.size() != ticket.bytes ||
+                    !streamingGpuTransferExecutor_.stageImageMipUpload(
+                        *destination,
+                        payloadIt->second.bytes.data(),
+                        static_cast<uint64_t>(payloadIt->second.bytes.size()),
+                        payloadIt->second.mipLevel,
+                        payloadIt->second.width,
+                        payloadIt->second.height)) {
+                    (void)streamingGpuWorkQueue_.fail(ticket.id);
+                    streamingRuntimeState_.pushEvent("streaming GPU image mip payload staging failed for ticket " + std::to_string(ticket.id));
+                    if (payloadIt != streamingGpuImageMipUploadPayloads_.end()) {
+                        streamingGpuImageMipUploadPayloads_.erase(payloadIt);
+                    }
+                    continue;
+                }
+                submittedPayloadWork = true;
+                streamingGpuImageMipUploadPayloads_.erase(payloadIt);
             }
-            submittedPayloadWork = true;
-            streamingGpuBufferUploadPayloads_.erase(payloadIt);
         }
         const uint64_t workQueueTimeline = result.highestSubmittedTimeline;
         if (workQueueTimeline != 0 &&

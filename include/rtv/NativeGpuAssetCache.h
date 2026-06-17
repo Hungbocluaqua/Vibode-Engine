@@ -2,6 +2,7 @@
 
 #include "rtv/AssetRegistry.h"
 #include "rtv/Buffer.h"
+#include "rtv/Image.h"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -79,6 +80,7 @@ struct NativeGpuAssetSnapshot {
     uint64_t gpuBytes = 0;
     uint64_t uploadBytes = 0;
     uint64_t ownedGpuBufferBytes = 0;
+    uint64_t ownedGpuImageBytes = 0;
     uint64_t uploadTicketId = 0;
     uint64_t blasBuildTicketId = 0;
     uint64_t tlasPatchTicketId = 0;
@@ -105,6 +107,7 @@ struct NativeGpuAssetSnapshot {
     bool selected = false;
     bool evictable = false;
     bool ownsGpuBuffer = false;
+    bool ownsGpuImage = false;
 };
 
 struct NativeGpuAssetCacheStats {
@@ -165,6 +168,9 @@ public:
     [[nodiscard]] bool ensureBufferResource(ResourceAllocator& allocator, const AssetGuid& guid, uint64_t bytes, uint32_t usageFlags, const char* debugName);
     [[nodiscard]] Buffer* bufferResource(const AssetGuid& guid);
     [[nodiscard]] const Buffer* bufferResource(const AssetGuid& guid) const;
+    [[nodiscard]] bool ensureImageResource(ResourceAllocator& allocator, const AssetGuid& guid, const ImageDesc& desc, uint64_t estimatedBytes);
+    [[nodiscard]] Image* imageResource(const AssetGuid& guid);
+    [[nodiscard]] const Image* imageResource(const AssetGuid& guid) const;
     [[nodiscard]] NativeGpuAssetEvictionResult evictToBudget(const NativeGpuAssetCacheBudget& budget);
     [[nodiscard]] NativeGpuAssetCacheStats stats() const;
     [[nodiscard]] std::vector<NativeGpuAssetSnapshot> snapshots() const;
@@ -176,7 +182,9 @@ private:
         uint32_t refCount = 0;
         uint64_t lastTouchedFrame = 0;
         uint64_t ownedGpuBufferBytes = 0;
+        uint64_t ownedGpuImageBytes = 0;
         std::unique_ptr<Buffer> gpuBuffer;
+        std::unique_ptr<Image> gpuImage;
     };
 
     [[nodiscard]] Entry* find(const AssetGuid& guid);
