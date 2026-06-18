@@ -42,6 +42,44 @@ const char* restirModeName(RestirMode mode) {
     return "classic-nee";
 }
 
+const char* restirDiModeName(RestirDiMode mode) {
+    switch (mode) {
+    case RestirDiMode::Off: return "off";
+    case RestirDiMode::Legacy: return "legacy";
+    case RestirDiMode::Production: return "production";
+    case RestirDiMode::ReferenceValidation: return "reference-validation";
+    case RestirDiMode::HybridCompare: return "hybrid-compare";
+    }
+    return "off";
+}
+
+RestirDiMode parseRestirDiMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "off" || key == "disabled" || key == "none") { return RestirDiMode::Off; }
+    if (key == "legacy" || key == "old" || key == "current") { return RestirDiMode::Legacy; }
+    if (key == "production" || key == "prod" || key == "new" || key == "default") { return RestirDiMode::Production; }
+    if (key == "reference" || key == "validation" || key == "referencevalidation" || key == "ref") { return RestirDiMode::ReferenceValidation; }
+    if (key == "hybrid" || key == "hybridcompare" || key == "compare") { return RestirDiMode::HybridCompare; }
+    return RestirDiMode::Off;
+}
+
+const char* restirDiReservoirLayoutName(RestirDiReservoirLayout layout) {
+    switch (layout) {
+    case RestirDiReservoirLayout::Legacy: return "legacy";
+    case RestirDiReservoirLayout::ProductionPacked: return "production-packed";
+    case RestirDiReservoirLayout::ValidationFull: return "validation-full";
+    }
+    return "legacy";
+}
+
+RestirDiReservoirLayout parseRestirDiReservoirLayout(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "legacy" || key == "old") { return RestirDiReservoirLayout::Legacy; }
+    if (key == "packed" || key == "production" || key == "productionpacked" || key == "compact") { return RestirDiReservoirLayout::ProductionPacked; }
+    if (key == "full" || key == "validation" || key == "validationfull" || key == "uncompressed") { return RestirDiReservoirLayout::ValidationFull; }
+    return RestirDiReservoirLayout::Legacy;
+}
+
 const char* renderPresetName(RenderPreset preset) {
     switch (preset) {
     case RenderPreset::Custom: return "custom";
@@ -407,6 +445,24 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::MaterialAlpha: return "material-alpha";
     case RendererDebugView::MaterialTransmission: return "material-transmission";
     case RendererDebugView::MaterialWorkflow: return "material-workflow";
+    case RendererDebugView::RestirDiSelectedLight: return "restir-di-selected-light";
+    case RendererDebugView::RestirDiTarget: return "restir-di-target";
+    case RendererDebugView::RestirDiSourcePdf: return "restir-di-source-pdf";
+    case RendererDebugView::RestirDiVisibility: return "restir-di-visibility";
+    case RendererDebugView::RestirDiRejectionReason: return "restir-di-rejection-reason";
+    case RendererDebugView::RestirDiTemporalAcceptance: return "restir-di-temporal-acceptance";
+    case RendererDebugView::RestirDiSpatialAcceptance: return "restir-di-spatial-acceptance";
+    case RendererDebugView::RestirDiFinalContribution: return "restir-di-final-contribution";
+    case RendererDebugView::RestirDiReceiverPosition: return "restir-di-receiver-position";
+    case RendererDebugView::RestirDiReceiverNormal: return "restir-di-receiver-normal";
+    case RendererDebugView::RestirDiLightVersion: return "restir-di-light-version";
+    case RendererDebugView::RestirDiInitialReservoir: return "restir-di-initial-reservoir";
+    case RendererDebugView::RestirDiTemporalReservoir: return "restir-di-temporal-reservoir";
+    case RendererDebugView::RestirDiSpatialReservoir: return "restir-di-spatial-reservoir";
+    case RendererDebugView::RestirDiFinalReservoir: return "restir-di-final-reservoir";
+    case RendererDebugView::RestirDiWeightSum: return "restir-di-weight-sum";
+    case RendererDebugView::RestirDiM: return "restir-di-m";
+    case RendererDebugView::RestirDiLightClass: return "restir-di-light-class";
     }
     return "beauty";
 }

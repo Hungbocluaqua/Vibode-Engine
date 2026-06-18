@@ -177,7 +177,15 @@ public:
         WavefrontSortedTraceEnd = 76,
         DynamicBlasUpdateStart = 77,
         DynamicBlasUpdateEnd = 78,
-        Count = 79,
+        RestirDiTemporalStart = 79,
+        RestirDiTemporalEnd = 80,
+        RestirDiSpatialStart = 81,
+        RestirDiSpatialEnd = 82,
+        RestirDiFinalStart = 83,
+        RestirDiFinalEnd = 84,
+        RestirDiHistoryCopyStart = 85,
+        RestirDiHistoryCopyEnd = 86,
+        Count = 87,
     };
 
     GpuProfiler() = default;

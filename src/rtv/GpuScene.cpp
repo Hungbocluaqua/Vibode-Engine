@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -69,8 +70,9 @@ constexpr uint32_t materialVec4Stride = materialParameterVec4Stride + materialTe
 constexpr uint32_t materialTypeImportedPbr = 3u;
 constexpr uint32_t materialTypeDielectric = 2u;
 constexpr uint32_t materialTypeUnlit = 5u;
-constexpr float materialDeltaRoughnessThreshold = 0.001f;
 constexpr float materialTransmissionDielectricThreshold = 0.001f;
+constexpr float legacyGlassTransmissionFactor = 0.92f;
+constexpr float legacyGlassTintLuminanceFloor = 0.02f;
 constexpr float emissiveTextureAverageFallback = 1.0f;
 
 static_assert(sizeof(GpuMeshRecord) == 64);
@@ -157,15 +159,107 @@ MaterialTextureUploadPayload makeMaterialTextureUploadPayload(const TextureAsset
     return payload;
 }
 
+bool materialNameImpliesLegacyGlass(std::string_view name) {
+    std::string lower;
+    lower.reserve(name.size());
+    for (char c : name) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return lower.find("glass") != std::string::npos ||
+        lower.find("transparent") != std::string::npos ||
+        lower.find("translucent") != std::string::npos;
+}
+
+bool materialPathImpliesLegacyGlass(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return false;
+    }
+    return materialNameImpliesLegacyGlass(path.stem().string()) ||
+        materialNameImpliesLegacyGlass(path.filename().string()) ||
+        materialNameImpliesLegacyGlass(path.generic_string());
+}
+
+float rgbLuminance(glm::vec3 value) {
+    return value.x * 0.2126f + value.y * 0.7152f + value.z * 0.0722f;
+}
+
+bool materialHasExplicitTransmission(const MaterialAsset& material) {
+    return material.hasTransmission != 0u ||
+        material.transmissionFactor > materialTransmissionDielectricThreshold ||
+        material.transmissionTexture.valid();
+}
+
+bool materialHasExplicitTransmission(const CachedMaterialData& material) {
+    return material.hasTransmission != 0u ||
+        material.transmissionFactor > materialTransmissionDielectricThreshold ||
+        material.transmissionTextureIndex >= 0;
+}
+
+bool materialUsesLegacyGlassTransmission(const MaterialAsset* material) {
+    const bool identityImpliesGlass = material != nullptr &&
+        (materialNameImpliesLegacyGlass(material->name) ||
+         materialPathImpliesLegacyGlass(material->nativePath) ||
+         materialNameImpliesLegacyGlass(material->nativeSource));
+    return material != nullptr &&
+        !materialHasExplicitTransmission(*material) &&
+        material->metallicFactor <= 0.05f &&
+        identityImpliesGlass;
+}
+
+bool materialUsesLegacyGlassTransmission(const CachedMaterialData& material) {
+    return !materialHasExplicitTransmission(material) &&
+        material.metallicFactor <= 0.05f &&
+        materialNameImpliesLegacyGlass(material.name);
+}
+
+float effectiveMaterialTransmissionFactor(const MaterialAsset* material) {
+    if (material == nullptr) {
+        return 0.0f;
+    }
+    if (materialUsesLegacyGlassTransmission(material)) {
+        return legacyGlassTransmissionFactor;
+    }
+    return material->transmissionFactor;
+}
+
+float effectiveMaterialTransmissionFactor(const CachedMaterialData& material) {
+    if (materialUsesLegacyGlassTransmission(material)) {
+        return legacyGlassTransmissionFactor;
+    }
+    return material.transmissionFactor;
+}
+
+glm::vec4 effectiveMaterialBaseColor(const MaterialAsset* material, glm::vec4 fallback) {
+    if (material == nullptr) {
+        return fallback;
+    }
+    glm::vec4 base = material->baseColorFactor;
+    if (materialUsesLegacyGlassTransmission(material) &&
+        !material->baseColorTexture.valid() &&
+        rgbLuminance(glm::vec3(base)) < legacyGlassTintLuminanceFloor) {
+        base = glm::vec4(glm::vec3(1.0f), base.a);
+    }
+    return base;
+}
+
+glm::vec4 effectiveMaterialBaseColor(const CachedMaterialData& material) {
+    glm::vec4 base = material.baseColorFactor;
+    if (materialUsesLegacyGlassTransmission(material) &&
+        material.baseColorTextureIndex < 0 &&
+        rgbLuminance(glm::vec3(base)) < legacyGlassTintLuminanceFloor) {
+        base = glm::vec4(glm::vec3(1.0f), base.a);
+    }
+    return base;
+}
+
 uint32_t importedMaterialType(const MaterialAsset* material) {
     if (material != nullptr && (material->shaderCompatibilityMask & kMaterialClosureFlagUnlit) != 0u) {
         return materialTypeUnlit;
     }
+    const float transmissionFactor = effectiveMaterialTransmissionFactor(material);
     if (material != nullptr &&
-        material->hasTransmission != 0u &&
-        material->transmissionFactor > materialTransmissionDielectricThreshold &&
-        material->metallicFactor <= 0.0f &&
-        material->roughnessFactor < materialDeltaRoughnessThreshold) {
+        transmissionFactor > materialTransmissionDielectricThreshold &&
+        material->metallicFactor <= 0.05f) {
         return materialTypeDielectric;
     }
     return materialTypeImportedPbr;
@@ -285,10 +379,9 @@ uint32_t importedMaterialType(const CachedMaterialData& material) {
     if ((material.shaderCompatibilityMask & kMaterialClosureFlagUnlit) != 0u) {
         return materialTypeUnlit;
     }
-    if (material.hasTransmission != 0u &&
-        material.transmissionFactor > materialTransmissionDielectricThreshold &&
-        material.metallicFactor <= 0.0f &&
-        material.roughnessFactor < materialDeltaRoughnessThreshold) {
+    const float transmissionFactor = effectiveMaterialTransmissionFactor(material);
+    if (transmissionFactor > materialTransmissionDielectricThreshold &&
+        material.metallicFactor <= 0.05f) {
         return materialTypeDielectric;
     }
     return materialTypeImportedPbr;
@@ -458,7 +551,11 @@ void appendGltfMaterialExtensionData(
     float volumeThicknessTexture = -1.0f,
     float specularTexture = -1.0f,
     float specularColorTexture = -1.0f,
-    float anisotropyTexture = -1.0f) {
+    float anisotropyTexture = -1.0f,
+    float transmissionFactor = -1.0f) {
+    const float effectiveTransmission = transmissionFactor >= 0.0f
+        ? transmissionFactor
+        : (material != nullptr ? effectiveMaterialTransmissionFactor(material) : 0.0f);
     materialData.push_back({
         material != nullptr ? material->clearcoatFactor : 0.0f,
         material != nullptr ? material->clearcoatRoughnessFactor : 0.0f,
@@ -466,7 +563,7 @@ void appendGltfMaterialExtensionData(
         clearcoatRoughnessTexture});
     materialData.push_back({
         clearcoatNormalTexture,
-        material != nullptr ? material->transmissionFactor : 0.0f,
+        effectiveTransmission,
         transmissionTexture,
         material != nullptr ? material->specularFactor : 1.0f});
     materialData.push_back({
@@ -488,6 +585,7 @@ void appendGltfMaterialExtensionData(
 }
 
 void appendGltfMaterialExtensionData(std::vector<glm::vec4>& materialData, const CachedMaterialData& material) {
+    const float effectiveTransmission = effectiveMaterialTransmissionFactor(material);
     materialData.push_back({
         material.clearcoatFactor,
         material.clearcoatRoughnessFactor,
@@ -495,7 +593,7 @@ void appendGltfMaterialExtensionData(std::vector<glm::vec4>& materialData, const
         material.clearcoatRoughnessTextureIndex >= 0 ? static_cast<float>(material.clearcoatRoughnessTextureIndex) : -1.0f});
     materialData.push_back({
         material.clearcoatNormalTextureIndex >= 0 ? static_cast<float>(material.clearcoatNormalTextureIndex) : -1.0f,
-        material.transmissionFactor,
+        effectiveTransmission,
         material.transmissionTextureIndex >= 0 ? static_cast<float>(material.transmissionTextureIndex) : -1.0f,
         material.specularFactor});
     materialData.push_back({
@@ -598,14 +696,15 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
     std::vector<glm::vec4> materialData;
     materialData.reserve(std::max<size_t>(1, cached.materials.size()) * materialVec4Stride);
     for (const CachedMaterialData& material : cached.materials) {
+        const glm::vec4 base = effectiveMaterialBaseColor(material);
         const uint32_t flags =
             cachedMaterialTextureFlag(cached, material.baseColorTextureIndex, materialFlagManualBaseColorSrgb) |
             cachedMaterialTextureFlag(cached, material.emissiveTextureIndex, materialFlagManualEmissiveSrgb) |
             materialSemanticFlags(material);
         const float type = static_cast<float>(importedMaterialType(material));
-        materialData.push_back({glm::vec3(material.baseColorFactor), material.roughnessFactor});
+        materialData.push_back({glm::vec3(base), material.roughnessFactor});
         materialData.push_back({material.iorFactor, type, material.metallicFactor, static_cast<float>(flags)});
-        materialData.push_back({material.emissiveFactor, material.baseColorFactor.a});
+        materialData.push_back({material.emissiveFactor, base.a});
         materialData.push_back({
             material.baseColorTextureIndex >= 0 ? static_cast<float>(material.baseColorTextureIndex) : -1.0f,
             material.normalTextureIndex >= 0 ? static_cast<float>(material.normalTextureIndex) : -1.0f,
@@ -673,6 +772,7 @@ struct MaterialCpu {
     uint32_t type = 0;
     float metallic = 0.0f;
     glm::vec3 emissive{};
+    float transmission = 0.0f;
 };
 
 struct TriBuild {
@@ -2160,7 +2260,7 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
     materialData.reserve(importedScene.materials.size() * materialVec4Stride);
     for (MaterialAssetHandle handle : importedScene.materials) {
         const MaterialAsset* material = assets.material(handle);
-        const glm::vec4 base = material != nullptr ? material->baseColorFactor : glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+        const glm::vec4 base = effectiveMaterialBaseColor(material, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
         const glm::vec3 emissive = material != nullptr ? material->emissiveFactor : glm::vec3(0.0f);
         const float roughness = material != nullptr ? material->roughnessFactor : 1.0f;
         const float metallic = material != nullptr ? material->metallicFactor : 0.0f;
@@ -2208,7 +2308,8 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
             material != nullptr ? textureSlotFor(material->volumeThicknessTexture) : -1.0f,
             material != nullptr ? textureSlotFor(material->specularTexture) : -1.0f,
             material != nullptr ? textureSlotFor(material->specularColorTexture) : -1.0f,
-            material != nullptr ? textureSlotFor(material->anisotropyTexture) : -1.0f);
+            material != nullptr ? textureSlotFor(material->anisotropyTexture) : -1.0f,
+            effectiveMaterialTransmissionFactor(material));
         appendOpacityHeightTextureIndices(
             materialData,
             material != nullptr ? textureSlotFor(material->opacityTexture) : -1.0f,
@@ -2487,7 +2588,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         {{0.63f, 0.06f, 0.05f}, 1.0f, 1.0f, 0, 0.0f, {0.0f, 0.0f, 0.0f}},
         {{0.14f, 0.45f, 0.09f}, 1.0f, 1.0f, 0, 0.0f, {0.0f, 0.0f, 0.0f}},
         {{1.0f, 1.0f, 1.0f}, 1.0f, 1.0f, 0, 0.0f, {15.0f, 13.0f, 10.0f}},
-        {{0.86f, 0.95f, 1.0f}, 0.0f, 1.33f, 2, 0.0f, {}},
+        {{0.86f, 0.95f, 1.0f}, 0.0f, 1.33f, 2, 0.0f, {}, 1.0f},
         {{0.95f, 0.96f, 0.97f}, 0.08f, 1.5f, 3, 1.0f, {}},
         {{0.95f, 0.93f, 0.88f}, 0.12f, 1.5f, 4, 0.0f, {}},
     };
@@ -2633,7 +2734,18 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
         materialData.push_back({0.5f, 0.0f, 1.0f, 0.0f});
         appendConductorOptics(materialData, nullptr);
-        appendGltfMaterialExtensionData(materialData, nullptr);
+        appendGltfMaterialExtensionData(
+            materialData,
+            nullptr,
+            -1.0f,
+            -1.0f,
+            -1.0f,
+            -1.0f,
+            -1.0f,
+            -1.0f,
+            -1.0f,
+            -1.0f,
+            m.transmission);
         appendOpacityHeightTextureIndices(materialData);
         appendMaterialTextureTransforms(materialData, nullptr);
         materialEmissive.push_back(m.emissive);
@@ -2752,7 +2864,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
 
     for (MaterialAssetHandle handle : materialHandles) {
         const MaterialAsset* material = assets.material(handle);
-        const glm::vec4 base = material != nullptr ? material->baseColorFactor : glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+        const glm::vec4 base = effectiveMaterialBaseColor(material, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
         const glm::vec3 emissive = material != nullptr ? material->emissiveFactor : glm::vec3(0.0f);
         const float roughness = material != nullptr ? material->roughnessFactor : 1.0f;
         const float metallic = material != nullptr ? material->metallicFactor : 0.0f;
@@ -2814,7 +2926,8 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             volumeThicknessTexture,
             specularTexture,
             specularColorTexture,
-            anisotropyTexture);
+            anisotropyTexture,
+            effectiveMaterialTransmissionFactor(material));
         appendOpacityHeightTextureIndices(materialData, opacityTexture, heightTexture, material != nullptr ? material->heightScale : 0.025f);
         appendMaterialTextureTransforms(materialData, material);
         materialEmissive.push_back(materialEmissiveLightEstimate(material, assets));

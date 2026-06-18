@@ -630,6 +630,30 @@ private:
         glm::vec4 cameraPosition{};
     };
 
+    struct RestirDiParams {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t frameIndex = 0;
+        uint32_t enabled = 0;
+        uint32_t temporalMaxAge = 32;
+        uint32_t spatialRounds = 4;
+        uint32_t spatialMaxM = 64;
+        uint32_t visibilityPolicy = 0;
+        float spatialRadius = 3.0f;
+        float normalThreshold = 0.85f;
+        float depthThreshold = 0.05f;
+        float temporalLuminanceLimitFactor = 8.0f;
+        float confidenceDecay = 0.96f;
+        float lumClampNeighborAvgFactor = 6.0f;
+        float lumClampNeighborMaxFactor = 3.0f;
+        float fireflyClamp = 8.0f;
+        float productionClampLuminance = 0.0f;
+        uint32_t useFallbackInitial = 1;
+        uint32_t spatialResultValid = 0;
+        uint32_t padding0 = 0;
+        uint32_t padding1 = 0;
+    };
+
     struct FogParams {
         uint32_t width = 0;
         uint32_t height = 0;
@@ -653,6 +677,28 @@ private:
         glm::uvec4 sampleMetadata{};
     };
     static_assert(sizeof(RestirReservoirGpu) == 96);
+
+    // New ReSTIR DI data model (per plan Phase 1)
+    struct RestirDiReceiverGpu {
+        glm::vec4 worldPositionDepth{};      // xyz=world position, w=hit distance
+        glm::vec4 normalRoughness{};         // xyz=shading normal, w=roughness
+        glm::vec4 tangentMaterialId{};       // xyz=tangent, w=material ID
+        glm::vec4 bitangentInstanceId{};     // xyz=bitangent, w=instance ID
+        glm::vec4 viewDirectionHitDist{};    // xyz=view direction from surface, w=hit distance
+        glm::uvec4 primitiveMeshFlags{};     // x=primitive ID, y=mesh ID, z=surface flags, w=padding
+    };
+    static_assert(sizeof(RestirDiReceiverGpu) == 96);
+
+    struct RestirDiReservoirGpu {
+        glm::uvec4 sampleMetadata{};          // x=lightID, y=lightKind, z=lightVersion, w=materialID
+        glm::uvec4 reservoirMetadata{};       // x=packed age/M/vis/valid, y=packed pdf/prevWeight, z=compatSig, w=rejectFlags
+        glm::vec4 samplePositionDistance{};   // xyz=world pos, w=distance
+        glm::vec4 sampleDirectionPdf{};       // xyz=sample dir at orig receiver, w=cond PDF
+        glm::vec4 sampleRadianceTarget{};     // rgb=radiance, w=target
+        glm::vec4 sampleNormalWeightSum{};    // xyz=light normal, w=weight sum
+        glm::vec4 contributionConfidence{};   // rgb=contribution (debug), w=confidence
+    };
+    static_assert(sizeof(RestirDiReservoirGpu) == 112);
 
     struct RestirGiReservoirGpu {
         glm::vec4 radianceWeightSum{};
@@ -896,6 +942,15 @@ private:
     void recordRestirSpatialCopyPass(VkCommandBuffer commandBuffer);
     void recordRestirGiSpatialPass(VkCommandBuffer commandBuffer);
     void recordRestirGiFinalPass(VkCommandBuffer commandBuffer);
+    void recordRestirDiTemporal(VkCommandBuffer commandBuffer);
+    void recordRestirDiTemporalPass(VkCommandBuffer commandBuffer);
+    void recordRestirDiSpatial(VkCommandBuffer commandBuffer);
+    void recordRestirDiSpatialPass(VkCommandBuffer commandBuffer);
+    void recordRestirDiFinal(VkCommandBuffer commandBuffer);
+    void recordRestirDiFinalPass(VkCommandBuffer commandBuffer);
+    void recordRestirDiHistoryCopy(VkCommandBuffer commandBuffer);
+    void recordRestirDiHistoryCopyPass(VkCommandBuffer commandBuffer);
+    void recordRestirDiCountersReadback(VkCommandBuffer commandBuffer);
     void recordHeightFog(VkCommandBuffer commandBuffer);
     void recordHeightFogPass(VkCommandBuffer commandBuffer);
     void recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy = false);
@@ -961,6 +1016,10 @@ private:
     [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
     [[nodiscard]] bool shouldRunRestirGiFinal() const;
+    [[nodiscard]] bool shouldUseNewRestirDi() const;
+    [[nodiscard]] bool shouldRunRestirDiTemporal() const;
+    [[nodiscard]] bool shouldRunRestirDiSpatial() const;
+    [[nodiscard]] bool shouldRunRestirDiFinal() const;
     [[nodiscard]] bool shouldRunWavefrontDebugWrite() const;
     [[nodiscard]] bool shouldUseWavefrontFinalOutput() const;
     [[nodiscard]] bool effectiveLimitSamplesPerPixel() const;
@@ -1072,6 +1131,7 @@ private:
     MomentParams momentParams_{};
     TaaParams taaParams_{};
     RestirSpatialParams restirSpatialParams_{};
+    RestirDiParams restirDiParams_{};
     FogParams fogParams_{};
     PrevCameraUniform prevCamera_{};
     RendererDebugParams debugParams_{};
@@ -1091,6 +1151,7 @@ private:
     bool asyncTaaHistoryCopyPending_ = false;
     bool asyncPostProcessPending_ = false;
     bool restirGiHistoryValid_ = false;
+    bool restirDiHistoryValid_ = false;
     bool restirGiUncompressedLayout_ = false;
     bool resourceAliasingEnabled_ = true;
     uint64_t pickSceneVersion_ = 0;
@@ -1198,6 +1259,16 @@ private:
     Buffer previousRestirGiReservoirBuffer_;
     Buffer restirGiSpatialReservoirBuffer_;
     Buffer wavefrontRestirGiReservoirBuffer_;
+
+    // New ReSTIR DI buffers (plan Phase 1)
+    Buffer restirDiReceiverBuffer_;
+    Buffer restirDiInitialReservoirBuffer_;
+    Buffer restirDiTemporalReservoirBuffer_;
+    Buffer restirDiSpatialReservoirBuffer_;
+    Buffer restirDiFinalReservoirBuffer_;
+    Buffer previousRestirDiReservoirBuffer_;
+    Buffer restirDiCountersBuffer_;
+    Buffer restirDiCountersReadbackBuffer_;
     Buffer selectionParamsBuffer_;
     Buffer histogramBuffer_;
     Buffer exposureBuffer_;
@@ -1219,6 +1290,9 @@ private:
     std::unique_ptr<ShaderModule> restirSpatialShader_;
     std::unique_ptr<ShaderModule> restirGiSpatialShader_;
     std::unique_ptr<ShaderModule> restirGiFinalShader_;
+    std::unique_ptr<ShaderModule> restirDiTemporalShader_;
+    std::unique_ptr<ShaderModule> restirDiSpatialShader_;
+    std::unique_ptr<ShaderModule> restirDiFinalShader_;
     std::unique_ptr<ShaderModule> fogShader_;
     std::unique_ptr<ShaderModule> transmittanceShader_;
     std::unique_ptr<ShaderModule> multiScatterShader_;
@@ -1261,6 +1335,9 @@ private:
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirGiSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirGiFinalPipeline_;
+    std::unique_ptr<ComputePipeline> restirDiTemporalPipeline_;
+    std::unique_ptr<ComputePipeline> restirDiSpatialPipeline_;
+    std::unique_ptr<ComputePipeline> restirDiFinalPipeline_;
     std::unique_ptr<ComputePipeline> fogPipeline_;
     std::unique_ptr<ComputePipeline> selectionOutlinePipeline_;
     std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
@@ -1295,6 +1372,9 @@ private:
     VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirGiSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirGiFinalSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout restirDiTemporalSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout restirDiSpatialSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout restirDiFinalSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout fogSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout selectionOutlineSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout luminanceHistogramSetLayout_ = VK_NULL_HANDLE;

@@ -1,0 +1,274 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "restir_di_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Input buffers
+layout(set = 0, binding = 0, std430) readonly buffer SpatialReservoirs {
+    RestirDiReservoir spatial_reservoirs[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer ReceiverBuffer {
+    RestirDiReceiver receivers[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer InitialReservoirs {
+    RestirDiReservoir initial_reservoirs[];
+};
+
+// Output HDR image. The DI pass replaces only the direct-lighting portion.
+layout(set = 0, binding = 3, rgba16f) uniform image2D raw_image;
+
+// Output: final reservoir for history copy
+layout(set = 0, binding = 4, std430) writeonly buffer FinalReservoirs {
+    RestirDiReservoir final_reservoirs[];
+};
+
+// Counter buffer
+layout(set = 0, binding = 5, std430) buffer Counters {
+    uint final_pixels_processed;
+    uint final_reservoir_valid;
+    uint final_reservoir_invalid;
+    uint final_fallback_to_initial;
+    uint final_visibility_checked;
+    uint final_visibility_visible;
+    uint final_visibility_occluded;
+    uint final_estimate_produced;
+    uint final_clamped;
+    uint final_rejection_flags;
+} counters;
+
+layout(set = 0, binding = 6, std140) uniform Params {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint enabled;
+    uint temporalMaxAge;
+    uint spatialRounds;
+    uint spatialMaxM;
+    uint visibilityPolicy;
+    float spatialRadius;
+    float normalThreshold;
+    float depthThreshold;
+    float temporalLuminanceLimitFactor;
+    float confidenceDecay;
+    float lumClampNeighborAvgFactor;
+    float lumClampNeighborMaxFactor;
+    float fireflyClamp;
+    float productionClampLuminance;
+    uint useFallbackInitial;
+    uint spatialResultValid;
+    uint padding0;
+    uint padding1;
+} params;
+
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
+};
+
+layout(set = 0, binding = 7, std430) buffer PathDataBuffer {
+    PathDataRecord path_data_buffer[];
+};
+
+layout(set = 0, binding = 8, std430) buffer AccumulationBuffer {
+    vec4 accumulation_buffer[];
+};
+
+layout(set = 0, binding = 9, std140) uniform RendererDebug {
+    uint view;
+    uint flags;
+    uint selected_instance;
+    float scale;
+} debug_params;
+
+float luminance(vec3 value) {
+    return dot(value, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void replace_direct_lighting(ivec2 coords, uint pixelIndex, vec3 finalContribution) {
+    if (debug_params.view != 0u) {
+        return;
+    }
+
+    PathDataRecord path = path_data_buffer[pixelIndex];
+    vec3 oldDiffuse = max(path.direct_diffuse.rgb, vec3(0.0));
+    vec3 oldSpecular = max(path.direct_specular.rgb, vec3(0.0));
+    vec3 oldDirect = oldDiffuse + oldSpecular;
+    vec3 directDelta = finalContribution - oldDirect;
+
+    vec4 accumulated = accumulation_buffer[pixelIndex];
+    float accumulationSamples = max(accumulated.a, 1.0);
+    accumulation_buffer[pixelIndex] = vec4(max(accumulated.rgb + directDelta, vec3(0.0)), accumulated.a);
+
+    vec3 base = imageLoad(raw_image, coords).rgb;
+    vec3 replaced = max(base + directDelta / accumulationSamples, vec3(0.0));
+    imageStore(raw_image, coords, vec4(replaced, 1.0));
+
+    float diffuseLum = luminance(oldDiffuse);
+    float specularLum = luminance(oldSpecular);
+    float totalLum = diffuseLum + specularLum;
+    float specularWeight = totalLum > 1.0e-6 ? clamp(specularLum / totalLum, 0.0, 1.0) : 0.0;
+    path.direct_diffuse.rgb = finalContribution * (1.0 - specularWeight);
+    path.direct_specular.rgb = finalContribution * specularWeight;
+    path.direct_diffuse.a = luminance(max(path.direct_diffuse.rgb, vec3(0.0)));
+    path.direct_specular.a = luminance(max(path.direct_specular.rgb, vec3(0.0)));
+    path_data_buffer[pixelIndex] = path;
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+
+    // Load receiver
+    RestirDiReceiver receiver = receivers[pixelIndex];
+
+    // Load spatial reservoir
+    RestirDiReservoir selected = spatial_reservoirs[pixelIndex];
+    uint rejectionFlags = 0u;
+    bool usedFallback = false;
+
+    // Determine which reservoir to use for final shading
+    if (!restir_di_reservoir_valid(selected) || params.enabled == 0u) {
+        // Fall back to initial reservoir
+        if (params.useFallbackInitial != 0u) {
+            selected = initial_reservoirs[pixelIndex];
+            usedFallback = true;
+            atomicAdd(counters.final_fallback_to_initial, 1u);
+        }
+    }
+
+    if (!restir_di_reservoir_valid(selected)) {
+        // No valid reservoir: keep the existing path-traced lighting intact.
+        final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+        atomicAdd(counters.final_reservoir_invalid, 1u);
+        atomicAdd(counters.final_pixels_processed, 1u);
+        return;
+    }
+
+    atomicAdd(counters.final_reservoir_valid, 1u);
+
+    // Check surface validity
+    uint surfaceFlags = receiver.primitive_mesh_flags.z;
+    if ((surfaceFlags & (RESTIR_DI_SURFACE_SKY |
+                         RESTIR_DI_SURFACE_INVALID |
+                         RESTIR_DI_SURFACE_DELTA |
+                         RESTIR_DI_SURFACE_ALPHA |
+                         RESTIR_DI_SURFACE_UNLIT)) != 0u) {
+        final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+        atomicAdd(counters.final_pixels_processed, 1u);
+        return;
+    }
+
+    // Re-evaluate sample at current receiver
+    vec3 receiverPos = receiver.worldPosition_depth.xyz;
+    vec3 receiverNormal = normalize(receiver.normal_roughness.xyz);
+    vec3 samplePos = selected.samplePosition_distance.xyz;
+    float sampleDist = selected.samplePosition_distance.w;
+
+    // Compute direction to light
+    vec3 toLight = samplePos - receiverPos;
+    float distToLight = length(toLight);
+    vec3 sampleDir;
+    if (distToLight > 1.0e-4) {
+        sampleDir = toLight / distToLight;
+    } else {
+        sampleDir = normalize(selected.sampleDirection_pdf.xyz);
+        distToLight = sampleDist;
+    }
+
+    // Cosine at receiver
+    float cosReceiver = max(dot(receiverNormal, sampleDir), 0.0);
+    vec3 estimate;
+    if (cosReceiver <= 0.0) {
+        estimate = vec3(0.0);
+        rejectionFlags |= RESTIR_DI_REJECT_TARGET_ZERO;
+    } else {
+        // Radiance from selected sample
+        vec3 radiance = max(selected.sampleRadiance_target.rgb, vec3(0.0));
+
+        // Compute final estimate
+        // L = f(x, selected) * W / max(M * p_hat(x, selected), epsilon)
+        float weightSum = restir_di_weight_sum(selected);
+        float m = float(max(restir_di_m(selected), 1u));
+        float target = restir_di_target(selected);
+
+        estimate = restir_di_final_estimate(radiance, weightSum, m, target);
+    }
+
+    // Visibility
+    uint visibility = restir_di_visibility(selected);
+    if (params.visibilityPolicy == 1u) {
+        atomicAdd(counters.final_visibility_checked, 1u);
+        if (visibility == RESTIR_DI_VISIBILITY_UNKNOWN) {
+            // In reference mode, unknown visibility requires a trace
+            // We can't trace rays from a compute shader easily, so mark as
+            // needing further processing. For now, treat unknown as visible
+            // with a warning in production mode.
+            atomicAdd(counters.final_visibility_visible, 1u);
+        } else if (visibility == RESTIR_DI_VISIBILITY_OCCLUDED) {
+            atomicAdd(counters.final_visibility_occluded, 1u);
+            // Fallback to initial if spatial sample is occluded
+            if (usedFallback) {
+                final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+                atomicAdd(counters.final_pixels_processed, 1u);
+                return;
+            }
+            estimate = vec3(0.0);
+        } else {
+            atomicAdd(counters.final_visibility_visible, 1u);
+        }
+    }
+
+    // Production clamps
+    if (params.fireflyClamp > 0.0) {
+        float lum = dot(estimate, vec3(0.2126, 0.7152, 0.0722));
+        if (lum > params.fireflyClamp) {
+            estimate *= params.fireflyClamp / max(lum, 1.0e-8);
+            atomicAdd(counters.final_clamped, 1u);
+            rejectionFlags |= RESTIR_DI_REJECT_CLAMPED;
+        }
+    }
+
+    if (params.productionClampLuminance > 0.0) {
+        float lum = dot(estimate, vec3(0.2126, 0.7152, 0.0722));
+        if (lum > params.productionClampLuminance) {
+            estimate *= params.productionClampLuminance / max(lum, 1.0e-8);
+            atomicAdd(counters.final_clamped, 1u);
+            rejectionFlags |= RESTIR_DI_REJECT_CLAMPED;
+        }
+    }
+
+    vec3 finalContribution = max(estimate, vec3(0.0));
+    if (any(isnan(finalContribution)) || any(isinf(finalContribution))) {
+        finalContribution = vec3(0.0);
+    }
+    replace_direct_lighting(coords, pixelIndex, finalContribution);
+    atomicAdd(counters.final_estimate_produced, 1u);
+
+    // Prepare final reservoir for history copy
+    // Preserve sample identity, update age, set as valid
+    RestirDiReservoir historyReservoir = selected;
+    restir_di_set_age(historyReservoir, min(restir_di_age(selected) + 1u, 255u));
+    restir_di_set_valid(historyReservoir, true);
+    historyReservoir.contribution_confidence.w = clamp(selected.contribution_confidence.w, 0.0, 1.0);
+    historyReservoir.reservoirMetadata.w = rejectionFlags;
+
+    // Store final estimate in contribution field for debug
+    historyReservoir.contribution_confidence.rgb = finalContribution;
+
+    final_reservoirs[pixelIndex] = historyReservoir;
+    atomicAdd(counters.final_pixels_processed, 1u);
+}

@@ -2164,6 +2164,9 @@ bool applyMaterialMetadataOverrideForGuid(
     if (recordIt == registry->records().end() || recordIt->importedPath.empty()) {
         return false;
     }
+    if (material.name.empty() && !recordIt->displayName.empty()) {
+        material.name = recordIt->displayName;
+    }
 
     std::filesystem::path metadataPath = recordIt->importedPath;
     if (!metadataPath.is_absolute()) {

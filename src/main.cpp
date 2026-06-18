@@ -2876,6 +2876,13 @@ int main(int argc, char** argv) {
         std::optional<rtv::RenderPreset> renderPresetOverride;
         std::optional<bool> restirGiOverride;
         std::optional<bool> restirGiFinalStabilizationOverride;
+        std::optional<rtv::RestirDiMode> restirDiModeOverride;
+        std::optional<bool> restirDiTemporalOverride;
+        std::optional<bool> restirDiSpatialOverride;
+        std::optional<uint32_t> restirDiSpatialRoundsOverride;
+        std::optional<float> restirDiSpatialRadiusOverride;
+        std::optional<uint32_t> restirDiTemporalMaxAgeOverride;
+        std::optional<rtv::RestirDiReservoirLayout> restirDiReservoirLayoutOverride;
         std::optional<bool> opacityMicromapOverride;
         std::optional<uint32_t> opacityMicromapSubdivisionOverride;
         std::optional<bool> wavefrontQueuesOverride;
@@ -3176,6 +3183,37 @@ int main(int argc, char** argv) {
             if ((arg == "--reflex" || arg == "--streamline-reflex") && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 streamlineReflexOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
+
+            if (arg == "--restir-di" && i + 1 < argc) {
+                restirDiModeOverride = rtv::parseRestirDiMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-di-temporal" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirDiTemporalOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
+            if (arg == "--restir-di-spatial" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirDiSpatialOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
+            if (arg == "--restir-di-spatial-rounds" && i + 1 < argc) {
+                restirDiSpatialRoundsOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--restir-di-spatial-radius" && i + 1 < argc) {
+                restirDiSpatialRadiusOverride = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-di-max-age" && i + 1 < argc) {
+                restirDiTemporalMaxAgeOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--restir-di-layout" && i + 1 < argc) {
+                restirDiReservoirLayoutOverride = rtv::parseRestirDiReservoirLayout(argv[++i]);
                 continue;
             }
 
@@ -3874,6 +3912,38 @@ int main(int argc, char** argv) {
                     std::cerr << "Warning: DLSS Frame Generation requested, but unavailable: "
                               << nvidiaStatus.dlssFrameGenerationUnavailableReason << ".\n";
                 }
+            }
+            if (restirDiModeOverride.has_value() ||
+                restirDiTemporalOverride.has_value() ||
+                restirDiSpatialOverride.has_value() ||
+                restirDiSpatialRoundsOverride.has_value() ||
+                restirDiSpatialRadiusOverride.has_value() ||
+                restirDiTemporalMaxAgeOverride.has_value() ||
+                restirDiReservoirLayoutOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (restirDiModeOverride.has_value()) {
+                    settings.restirDiMode = *restirDiModeOverride;
+                }
+                if (restirDiTemporalOverride.has_value()) {
+                    settings.restirDiTemporalEnabled = *restirDiTemporalOverride;
+                }
+                if (restirDiSpatialOverride.has_value()) {
+                    settings.restirDiSpatialEnabled = *restirDiSpatialOverride;
+                }
+                if (restirDiSpatialRoundsOverride.has_value()) {
+                    settings.restirDiSpatialRounds = *restirDiSpatialRoundsOverride;
+                }
+                if (restirDiSpatialRadiusOverride.has_value()) {
+                    settings.restirDiSpatialRadius = *restirDiSpatialRadiusOverride;
+                }
+                if (restirDiTemporalMaxAgeOverride.has_value()) {
+                    settings.restirDiTemporalMaxAge = *restirDiTemporalMaxAgeOverride;
+                }
+                if (restirDiReservoirLayoutOverride.has_value()) {
+                    settings.restirDiReservoirLayout = *restirDiReservoirLayoutOverride;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
             }
             if (taaMotionFeedbackOverride.has_value() || taaReactiveFeedbackOverride.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();

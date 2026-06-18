@@ -759,7 +759,7 @@ void main() {
     uint next_depth = depth + 1u;
     if (next_depth < max(pc.max_depth, 1u)) {
         uint material_bucket_flags = path_material_bucket_flags(hit);
-        if (material.mat_type == 1u && material_is_delta(material)) {
+        if (material.mat_type == 1u && !material_is_transmissive(material) && material_is_delta(material)) {
             vec3 reflected = reflect(ray_dir, normal);
             if (dot(reflected, normal) > 0.0) {
                 vec3 next_throughput = clamp_path_throughput(throughput * material.color, next_depth, material.roughness, true);
@@ -767,7 +767,7 @@ void main() {
                 state.throughput = vec4(next_throughput, 1.0);
                 continued = true;
             }
-        } else if (material.mat_type == 2u && material_is_delta(material)) {
+        } else if (material_is_transmissive(material)) {
             float dispersion_sample = sample_dimension_1d(ivec2(source_pixel), camera.temporal_frame_index, depth, SAMPLE_DIM_DIELECTRIC + 1u);
             uint dispersion_channel = material_dispersion_channel(material, dispersion_sample);
             vec3 dispersion_ior = material_dispersion_ior(material);
@@ -785,7 +785,7 @@ void main() {
                 : refract(ray_dir, normal, refraction_ratio);
             vec3 next_throughput = throughput * material.color * material_dispersion_channel_weight(material, dispersion_channel);
             if (!reflected) {
-                next_throughput *= max(material.transmission_factor, 0.0);
+                next_throughput *= material_effective_transmission(material);
             }
             if (!reflected && !front_face) {
                 next_throughput *= material_volume_transmittance(material, hit.position_t.w);

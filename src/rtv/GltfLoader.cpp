@@ -1436,6 +1436,21 @@ struct PunctualLightJsonFallback {
     return fallback;
 }
 
+bool materialNameImpliesLegacyGlass(std::string_view name) {
+    std::string lower;
+    lower.reserve(name.size());
+    for (char c : name) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return lower.find("glass") != std::string::npos ||
+        lower.find("transparent") != std::string::npos ||
+        lower.find("translucent") != std::string::npos;
+}
+
+float materialTintLuminance(glm::vec3 value) {
+    return value.x * 0.2126f + value.y * 0.7152f + value.z * 0.0722f;
+}
+
 [[nodiscard]] MaterialAsset materialFromGltf(const tinygltf::Material& source, const std::vector<TextureAssetHandle>& textures) {
     auto textureHandle = [&](int textureIndex) {
         if (textureIndex >= 0 && static_cast<size_t>(textureIndex) < textures.size()) {
@@ -1716,6 +1731,20 @@ struct PunctualLightJsonFallback {
         std::cerr << "glTF material extension warning: material '" << (source.name.empty() ? "(unnamed)" : source.name)
                   << "' uses unsupported extension '" << name << "'\n";
         material.unsupportedSourceFeatures.push_back(name);
+    }
+
+    if (material.hasTransmission == 0u &&
+        material.transmissionFactor <= 0.001f &&
+        !material.transmissionTexture.valid() &&
+        material.metallicFactor <= 0.05f &&
+        materialNameImpliesLegacyGlass(material.name)) {
+        material.hasTransmission = 1u;
+        material.transmissionFactor = 0.92f;
+        material.shaderCompatibilityMask |= kMaterialClosureFlagTransmission;
+        if (!material.baseColorTexture.valid() &&
+            materialTintLuminance(glm::vec3(material.baseColorFactor)) < 0.02f) {
+            material.baseColorFactor = glm::vec4(glm::vec3(1.0f), material.baseColorFactor.a);
+        }
     }
 
     const bool hasTextureTransform =

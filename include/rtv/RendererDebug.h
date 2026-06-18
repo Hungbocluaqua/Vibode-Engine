@@ -119,12 +119,44 @@ enum class RendererDebugView : uint32_t {
     DenoiserDiffuseRawVariance = 87,
     DenoiserSpecularRawVariance = 88,
     MaterialOcclusion = 89,
+    RestirDiSelectedLight = 106,
+    RestirDiTarget = 107,
+    RestirDiSourcePdf = 108,
+    RestirDiVisibility = 109,
+    RestirDiRejectionReason = 110,
+    RestirDiTemporalAcceptance = 111,
+    RestirDiSpatialAcceptance = 112,
+    RestirDiFinalContribution = 113,
+    RestirDiReceiverPosition = 114,
+    RestirDiReceiverNormal = 115,
+    RestirDiLightVersion = 116,
+    RestirDiInitialReservoir = 117,
+    RestirDiTemporalReservoir = 118,
+    RestirDiSpatialReservoir = 119,
+    RestirDiFinalReservoir = 120,
+    RestirDiWeightSum = 121,
+    RestirDiM = 122,
+    RestirDiLightClass = 123,
 };
 
 enum class RestirMode : uint32_t {
     ClassicNee = 0,
     RestirOnly = 1,
     HybridCompare = 2,
+};
+
+enum class RestirDiMode : uint32_t {
+    Off = 0,
+    Legacy = 1,
+    Production = 2,
+    ReferenceValidation = 3,
+    HybridCompare = 4,
+};
+
+enum class RestirDiReservoirLayout : uint32_t {
+    Legacy = 0,
+    ProductionPacked = 1,
+    ValidationFull = 2,
 };
 
 enum class AdaptiveQualityMode : uint32_t {
@@ -163,6 +195,10 @@ inline constexpr uint32_t rendererDebugFlagRayTracingCounters = 1u << 0u;
 
 [[nodiscard]] const char* toneMapperName(ToneMapper toneMapper);
 [[nodiscard]] const char* restirModeName(RestirMode mode);
+[[nodiscard]] const char* restirDiModeName(RestirDiMode mode);
+[[nodiscard]] RestirDiMode parseRestirDiMode(std::string_view value);
+[[nodiscard]] const char* restirDiReservoirLayoutName(RestirDiReservoirLayout layout);
+[[nodiscard]] RestirDiReservoirLayout parseRestirDiReservoirLayout(std::string_view value);
 [[nodiscard]] const char* renderPresetName(RenderPreset preset);
 [[nodiscard]] RenderPreset parseRenderPreset(std::string_view value);
 [[nodiscard]] const char* denoiserBackendName(DenoiserBackend backend);

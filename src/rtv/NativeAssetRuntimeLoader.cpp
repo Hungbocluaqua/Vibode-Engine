@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
@@ -265,6 +266,52 @@ glm::vec3 jsonVec3Or(const nlohmann::json& value, glm::vec3 fallback) {
         value[1].get<float>(),
         value[2].get<float>(),
     };
+}
+
+bool materialNameImpliesLegacyGlass(std::string_view name) {
+    std::string lower;
+    lower.reserve(name.size());
+    for (char c : name) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return lower.find("glass") != std::string::npos ||
+        lower.find("transparent") != std::string::npos ||
+        lower.find("translucent") != std::string::npos;
+}
+
+bool materialPathImpliesLegacyGlass(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return false;
+    }
+    return materialNameImpliesLegacyGlass(path.stem().string()) ||
+        materialNameImpliesLegacyGlass(path.filename().string()) ||
+        materialNameImpliesLegacyGlass(path.generic_string());
+}
+
+float materialTintLuminance(glm::vec3 value) {
+    return value.x * 0.2126f + value.y * 0.7152f + value.z * 0.0722f;
+}
+
+void applyLegacyGlassMaterialInference(MaterialAsset& material) {
+    const bool identityImpliesGlass =
+        materialNameImpliesLegacyGlass(material.name) ||
+        materialPathImpliesLegacyGlass(material.nativePath) ||
+        materialNameImpliesLegacyGlass(material.nativeSource);
+    if (material.hasTransmission != 0u ||
+        material.transmissionFactor > 0.001f ||
+        material.transmissionTexture.valid() ||
+        material.metallicFactor > 0.05f ||
+        !identityImpliesGlass) {
+        return;
+    }
+
+    material.hasTransmission = 1u;
+    material.transmissionFactor = 0.92f;
+    material.shaderCompatibilityMask |= kMaterialClosureFlagTransmission;
+    if (!material.baseColorTexture.valid() &&
+        materialTintLuminance(glm::vec3(material.baseColorFactor)) < 0.02f) {
+        material.baseColorFactor = glm::vec4(glm::vec3(1.0f), material.baseColorFactor.a);
+    }
 }
 
 void applyMaterialSemanticMetadata(MaterialAsset& material, const nlohmann::json& metadata) {
@@ -1179,6 +1226,7 @@ NativeRuntimeLoadedAsset NativeAssetRuntimeLoader::loadBytes(const std::filesyst
                 assignMaterialTextureTransform(result.material, i, transforms[i]);
             }
         }
+        applyLegacyGlassMaterialInference(result.material);
     } else if (result.kind == NativeAssetKind::Texture) {
         RttexturePayloadHeader header;
         if (!readPodChunk(bytes, findChunk(inspection, ChunkPayloadHeader), header)) {

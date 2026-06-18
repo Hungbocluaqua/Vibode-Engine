@@ -1,0 +1,331 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define RTV_STBN_TEXTURE_ENABLED 1
+#include "blue_noise.glsl"
+#include "restir_di_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Input buffers
+layout(set = 0, binding = 0, std430) readonly buffer InitialReservoirs {
+    RestirDiReservoir initial_reservoirs[];
+};
+layout(set = 0, binding = 1, std430) readonly buffer PreviousReservoirs {
+    RestirDiReservoir previous_reservoirs[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer ReceiverBuffer {
+    RestirDiReceiver receivers[];
+};
+layout(set = 0, binding = 3, std430) readonly buffer VelocityBuffer {
+    uvec4 velocity_buffer[];
+};
+
+// Output
+layout(set = 0, binding = 4, std430) writeonly buffer TemporalReservoirs {
+    RestirDiReservoir temporal_reservoirs[];
+};
+
+// Counter buffer
+layout(set = 0, binding = 5, std430) buffer Counters {
+    uint temporal_pixels_processed;
+    uint temporal_reproject_valid;
+    uint temporal_reproject_invalid;
+    uint temporal_previous_valid;
+    uint temporal_previous_invalid;
+    uint temporal_surface_rejected;
+    uint temporal_age_rejected;
+    uint temporal_light_version_rejected;
+    uint temporal_target_rejected;
+    uint temporal_pdf_rejected;
+    uint temporal_visibility_skipped;
+    uint temporal_visibility_passed;
+    uint temporal_visibility_failed;
+    uint temporal_accepted_previous;
+    uint temporal_accepted_current;
+    uint temporal_clamped;
+} counters;
+
+layout(set = 0, binding = 6, std140) uniform Params {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint enabled;
+    uint temporalMaxAge;
+    uint spatialRounds;
+    uint spatialMaxM;
+    uint visibilityPolicy;
+    float spatialRadius;
+    float normalThreshold;
+    float depthThreshold;
+    float temporalLuminanceLimitFactor;
+    float confidenceDecay;
+    float lumClampNeighborAvgFactor;
+    float lumClampNeighborMaxFactor;
+    float fireflyClamp;
+    float productionClampLuminance;
+    uint useFallbackInitial;
+    uint spatialResultValid;
+    uint padding0;
+    uint padding1;
+} params;
+
+// Velocity unpacking
+vec2 unpack_velocity_pixels(uint packed) {
+    ivec2 v = ivec2(packed & 0xffffu, (packed >> 16u) & 0xffffu);
+    if (v.x >= 32768) v.x -= 65536;
+    if (v.y >= 32768) v.y -= 65536;
+    return vec2(v);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+
+    // Load current receiver
+    RestirDiReceiver receiver = receivers[pixelIndex];
+
+    // Check surface validity
+    uint surfaceFlags = receiver.primitive_mesh_flags.z;
+    if ((surfaceFlags & (RESTIR_DI_SURFACE_SKY | RESTIR_DI_SURFACE_INVALID | RESTIR_DI_SURFACE_DELTA | RESTIR_DI_SURFACE_UNLIT)) != 0u) {
+        temporal_reservoirs[pixelIndex] = initial_reservoirs[pixelIndex];
+        atomicAdd(counters.temporal_surface_rejected, 1u);
+        return;
+    }
+
+    // Load initial reservoir
+    RestirDiReservoir current = initial_reservoirs[pixelIndex];
+    uint rejectionFlags = RESTIR_DI_REJECT_NONE;
+
+    // Try temporal reuse
+    if (params.enabled == 0u) {
+        temporal_reservoirs[pixelIndex] = current;
+        atomicAdd(counters.temporal_pixels_processed, 1u);
+        return;
+    }
+
+    // Unpack velocity for reprojection
+    uint packedVelocity = velocity_buffer[pixelIndex].x;
+    vec2 velocityPixels = unpack_velocity_pixels(packedVelocity);
+    ivec2 reprojectedCoords = coords - ivec2(int(round(velocityPixels.x)), int(round(velocityPixels.y)));
+
+    bool reprojectValid = reprojectedCoords.x >= 0 && reprojectedCoords.y >= 0 &&
+        reprojectedCoords.x < int(params.width) && reprojectedCoords.y < int(params.height);
+
+    if (!reprojectValid || length(velocityPixels) > 48.0) {
+        atomicAdd(counters.temporal_reproject_invalid, 1u);
+        temporal_reservoirs[pixelIndex] = current;
+        atomicAdd(counters.temporal_pixels_processed, 1u);
+        return;
+    }
+    atomicAdd(counters.temporal_reproject_valid, 1u);
+
+    // Load previous reservoir
+    uint prevIndex = uint(reprojectedCoords.y) * params.width + uint(reprojectedCoords.x);
+    RestirDiReservoir previous = previous_reservoirs[prevIndex];
+
+    // Check previous validity
+    if (!restir_di_reservoir_valid(previous)) {
+        atomicAdd(counters.temporal_previous_invalid, 1u);
+        temporal_reservoirs[pixelIndex] = current;
+        atomicAdd(counters.temporal_pixels_processed, 1u);
+        return;
+    }
+    atomicAdd(counters.temporal_previous_valid, 1u);
+
+    // Age gate
+    if (restir_di_age(previous) >= params.temporalMaxAge) {
+        atomicAdd(counters.temporal_age_rejected, 1u);
+        rejectionFlags |= RESTIR_DI_REJECT_AGE;
+        current.reservoirMetadata.w = rejectionFlags;
+        temporal_reservoirs[pixelIndex] = current;
+        atomicAdd(counters.temporal_pixels_processed, 1u);
+        return;
+    }
+
+    // Load previous receiver for surface compatibility
+    RestirDiReceiver prevReceiver = receivers[prevIndex];
+
+    // Surface compatibility
+    if (!restir_di_surface_compatible(receiver, prevReceiver, params.normalThreshold, params.depthThreshold)) {
+        atomicAdd(counters.temporal_surface_rejected, 1u);
+        rejectionFlags |= RESTIR_DI_REJECT_SURFACE_MISMATCH;
+        current.reservoirMetadata.w = rejectionFlags;
+        temporal_reservoirs[pixelIndex] = current;
+        atomicAdd(counters.temporal_pixels_processed, 1u);
+        return;
+    }
+
+    // Light version check (reservoir stores the version from when it was created)
+    // For now, if light IDs match but versions differ, reject
+    if (restir_di_light_id(current) == restir_di_light_id(previous) &&
+        restir_di_light_version(current) != restir_di_light_version(previous) &&
+        restir_di_light_version(previous) != 0u) {
+        atomicAdd(counters.temporal_light_version_rejected, 1u);
+        rejectionFlags |= RESTIR_DI_REJECT_LIGHT_VERSION;
+        current.reservoirMetadata.w = rejectionFlags;
+        temporal_reservoirs[pixelIndex] = current;
+        atomicAdd(counters.temporal_pixels_processed, 1u);
+        return;
+    }
+
+    // Re-evaluate previous sample's target at current receiver
+    // The previous reservoir stores the sample direction and radiance at original receiver
+    // We need to re-evaluate the target function at the current receiver
+    vec3 prevSampleDirection = normalize(previous.sampleDirection_pdf.xyz);
+    if (dot(prevSampleDirection, prevSampleDirection) < 0.001) {
+        // Direction not stored, use position-based direction
+        prevSampleDirection = normalize(previous.samplePosition_distance.xyz - receiver.worldPosition_depth.xyz);
+    }
+
+    // Compute geometric term at current receiver using stored light normal
+    vec3 lightNormal = normalize(previous.sampleNormal_weightSum.xyz);
+    vec3 receiverNormal = normalize(receiver.normal_roughness.xyz);
+
+    float cosAtReceiver = max(dot(receiverNormal, prevSampleDirection), 0.0);
+    float cosAtLight = max(dot(lightNormal, -prevSampleDirection), 0.0);
+
+    // Distance to light
+    float distToLight = length(previous.samplePosition_distance.xyz - receiver.worldPosition_depth.xyz);
+    if (distToLight < 1.0e-4) distToLight = previous.samplePosition_distance.w;
+
+    // Reconstructed radiance at current receiver
+    // For non-physical lights (directional), radiance is constant
+    // For physical lights, radiance falls off with distance
+    vec3 reEvalRadiance = max(previous.sampleRadiance_target.rgb, vec3(0.0));
+
+    // Target function at current receiver
+    float targetAtCurrent = restir_di_target_function(reEvalRadiance * cosAtReceiver);
+
+    if (targetAtCurrent <= 1.0e-6) {
+        atomicAdd(counters.temporal_target_rejected, 1u);
+        rejectionFlags |= RESTIR_DI_REJECT_TARGET_ZERO;
+        current.reservoirMetadata.w = rejectionFlags;
+        temporal_reservoirs[pixelIndex] = current;
+        atomicAdd(counters.temporal_pixels_processed, 1u);
+        return;
+    }
+
+    // Source PDF check at current receiver
+    float sourcePdf = restir_di_source_pdf(previous);
+    if (sourcePdf <= 1.0e-6) {
+        atomicAdd(counters.temporal_pdf_rejected, 1u);
+        rejectionFlags |= RESTIR_DI_REJECT_PDF_ZERO;
+        current.reservoirMetadata.w = rejectionFlags;
+        temporal_reservoirs[pixelIndex] = current;
+        atomicAdd(counters.temporal_pixels_processed, 1u);
+        return;
+    }
+
+    // Compute shifted weight
+    float prevTarget = max(previous.sampleRadiance_target.w, 1.0e-6);
+    float prevWeightSum = restir_di_weight_sum(previous);
+    float shiftedWeight = restir_di_shift_weight(targetAtCurrent, prevTarget, prevWeightSum);
+
+    // Visibility policy
+    uint prevVisibility = restir_di_visibility(previous);
+    if (params.visibilityPolicy == 1u) {
+        // Reference: require visibility check (note: we can't actually trace rays from compute easily)
+        // For now, trust the stored visibility if it was previously verified
+        if (prevVisibility == RESTIR_DI_VISIBILITY_UNKNOWN) {
+            atomicAdd(counters.temporal_visibility_skipped, 1u);
+            // Fall through - accept with unknown visibility
+        } else if (prevVisibility == RESTIR_DI_VISIBILITY_OCCLUDED) {
+            atomicAdd(counters.temporal_visibility_failed, 1u);
+            rejectionFlags |= RESTIR_DI_REJECT_VISIBILITY;
+            current.reservoirMetadata.w = rejectionFlags;
+            temporal_reservoirs[pixelIndex] = current;
+            atomicAdd(counters.temporal_pixels_processed, 1u);
+            return;
+        }
+        atomicAdd(counters.temporal_visibility_passed, 1u);
+    } else {
+        atomicAdd(counters.temporal_visibility_skipped, 1u);
+    }
+
+    // Compute current reservoir weight
+    float currentWeight = restir_di_target(current);
+    float currentM = float(restir_di_m(current));
+
+    // Reservoir update
+    // Current and previous candidates compete via weighted reservoir sampling
+    float rngValue = sample_dimension_1d(coords, params.frameIndex, 0u, 12u);
+
+    // Motion-based cap on temporal selection probability
+    float motionMagnitude = length(velocityPixels);
+    float motionConfidence = 1.0 - clamp(motionMagnitude / 24.0, 0.0, 0.85);
+    float previousM_float = float(restir_di_m(previous));
+
+    float previousMass = shiftedWeight * min(previousM_float, float(params.spatialMaxM)) * motionConfidence;
+    float currentMass = currentWeight * currentM;
+
+    float totalMass = currentMass + previousMass;
+    float previousProbability = 0.0;
+    bool selectPrevious = false;
+
+    if (totalMass > 1.0e-8) {
+        previousProbability = clamp(previousMass / totalMass, 0.0, 1.0);
+        selectPrevious = rngValue < previousProbability;
+    }
+
+    RestirDiReservoir selected = selectPrevious ? previous : current;
+
+    // Update reservoir state
+    if (selectPrevious) {
+        // Shift the previous sample's metadata to current receiver
+        selected.sampleDirection_pdf.xyz = prevSampleDirection;
+        selected.sampleRadiance_target.w = targetAtCurrent;
+        atomicAdd(counters.temporal_accepted_previous, 1u);
+    } else {
+        atomicAdd(counters.temporal_accepted_current, 1u);
+    }
+
+    // Age update
+    restir_di_set_age(selected, selectPrevious ? min(restir_di_age(previous) + 1u, params.temporalMaxAge) : 0u);
+
+    // M update
+    float combinedM = currentM + previousM_float * motionConfidence;
+    restir_di_set_m(selected, uint(clamp(ceil(combinedM), 1.0, float(params.spatialMaxM))));
+
+    // Weight sum update
+    restir_di_set_weight_sum(selected, clamp(currentWeight + previousMass, 0.0, 65504.0));
+
+    // Visibility: inherit from selected reservoir
+    restir_di_set_visibility(selected, selectPrevious ? prevVisibility : RESTIR_DI_VISIBILITY_UNKNOWN);
+
+    // Store previous weight for debug
+    restir_di_set_previous_weight(selected, previousProbability);
+
+    // Confidence: reduce under motion
+    float confidence = selectPrevious ?
+        clamp(restir_di_confidence(previous) * motionConfidence, 0.0, 1.0) :
+        1.0;
+    selected.contribution_confidence.w = confidence;
+
+    // Production stabilization: luminance clamping
+    if (params.temporalLuminanceLimitFactor > 0.0 && selectPrevious) {
+        float currentLum = restir_di_target_function(restir_di_target(current) > 0.0 ?
+            current.sampleRadiance_target.rgb : vec3(0.0));
+        float limit = max(currentLum * params.temporalLuminanceLimitFactor, 0.01);
+        float prevLum = restir_di_target(selected);
+        if (prevLum > limit && limit > 0.0) {
+            float scale = limit / max(prevLum, 1.0e-8);
+            selected.sampleRadiance_target.rgb *= scale;
+            selected.sampleRadiance_target.w *= scale;
+            atomicAdd(counters.temporal_clamped, 1u);
+            rejectionFlags |= RESTIR_DI_REJECT_CLAMPED;
+        }
+    }
+
+    // Set valid
+    restir_di_set_valid(selected, true);
+    selected.reservoirMetadata.w = rejectionFlags;
+    selected.reservoirMetadata.z = previous.reservoirMetadata.z; // preserve compat signature
+
+    temporal_reservoirs[pixelIndex] = selected;
+    atomicAdd(counters.temporal_pixels_processed, 1u);
+}

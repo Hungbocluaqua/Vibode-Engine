@@ -99,6 +99,34 @@ struct RestirGiReservoir {
 layout(set = 0, binding = 43, std430) buffer RestirGiReservoirBuffer { RestirGiReservoir restir_gi_reservoirs[]; };
 layout(set = 0, binding = 44, std430) readonly buffer PreviousRestirGiReservoirBuffer { RestirGiReservoir previous_restir_gi_reservoirs[]; };
 layout(set = 0, binding = 45, std430) buffer RestirGiSpatialReservoirBuffer { RestirGiReservoir restir_gi_spatial_reservoirs[]; };
+// New ReSTIR DI data model (Phase 1-2) — guard macros so restir_di_common.glsl
+// (included by compute passes) can define the same structs without conflict.
+#ifndef RTV_RESTIR_DI_RECEIVER_DEFINED
+#define RTV_RESTIR_DI_RECEIVER_DEFINED
+struct RestirDiReceiver {
+    vec4 worldPosition_depth;
+    vec4 normal_roughness;
+    vec4 tangent_materialId;
+    vec4 bitangent_instanceId;
+    vec4 viewDirection_hitDist;
+    uvec4 primitive_mesh_flags;
+};
+#endif
+#ifndef RTV_RESTIR_DI_RESERVOIR_DEFINED
+#define RTV_RESTIR_DI_RESERVOIR_DEFINED
+struct RestirDiReservoir {
+    uvec4 sampleMetadata;
+    uvec4 reservoirMetadata;
+    vec4 samplePosition_distance;
+    vec4 sampleDirection_pdf;
+    vec4 sampleRadiance_target;
+    vec4 sampleNormal_weightSum;
+    vec4 contribution_confidence;
+};
+#endif
+layout(set = 0, binding = 52, std430) buffer RestirDiReceiverBuffer { RestirDiReceiver restir_di_receivers[]; };
+layout(set = 0, binding = 53, std430) buffer RestirDiInitialReservoirBuffer { RestirDiReservoir restir_di_initial_reservoirs[]; };
+layout(set = 0, binding = 54, std430) readonly buffer PreviousRestirDiReservoirBuffer { RestirDiReservoir previous_restir_di_reservoirs[]; };
 layout(set = 0, binding = 10, std430) readonly buffer MeshMaterials { vec4 mesh_materials[]; };
 
 layout(set = 0, binding = 11, std140) uniform MeshParams {
@@ -363,6 +391,14 @@ struct MaterialClosure {
     float pad;
 };
 
+float material_effective_transmission(Material material) {
+    float explicitTransmission = clamp(material.transmission_factor, 0.0, 1.0);
+    if (explicitTransmission > 1.0e-5 || material.transmission_texture >= 0) {
+        return explicitTransmission;
+    }
+    return material.mat_type == 2u ? 1.0 : 0.0;
+}
+
 MaterialClosure material_to_closure(Material m) {
     MaterialClosure c;
     c.color = m.color;
@@ -389,7 +425,7 @@ MaterialClosure material_to_closure(Material m) {
         return c;
     }
 
-    if (m.transmission_factor > 1.0e-5) {
+    if (material_effective_transmission(m) > 1.0e-5) {
         c.flags |= MATERIAL_CLOSURE_FLAG_TRANSMISSION;
     }
     if (m.clearcoat_factor > 1.0e-5) {
@@ -414,6 +450,10 @@ MaterialClosure material_to_closure(Material m) {
 
 bool material_is_unlit(Material material) {
     return material.mat_type == 5u;
+}
+
+bool material_is_transmissive(Material material) {
+    return material_effective_transmission(material) > 1.0e-5;
 }
 
 bool closure_has_flag(MaterialClosure c, uint flag) {
@@ -477,8 +517,8 @@ const float MATERIAL_DELTA_ROUGHNESS_THRESHOLD = 0.001;
 const float MATERIAL_MIN_GGX_ROUGHNESS = 0.001;
 
 bool material_is_delta(Material material) {
-    return (material.mat_type == 1u || material.mat_type == 2u) &&
-        material.roughness < MATERIAL_DELTA_ROUGHNESS_THRESHOLD;
+    return material_is_transmissive(material) ||
+        (material.mat_type == 1u && material.roughness < MATERIAL_DELTA_ROUGHNESS_THRESHOLD);
 }
 
 float ggx_safe_roughness(float roughness) {
@@ -2139,7 +2179,7 @@ vec3 pbr_diffuse_energy(Material material) {
     vec3 f0 = pbr_f0(material);
     return clamp(vec3(1.0) - pbr_average_fresnel(f0), vec3(0.0), vec3(1.0)) *
         (1.0 - clamp(material.metallic, 0.0, 1.0)) *
-        (1.0 - clamp(material.transmission_factor, 0.0, 1.0));
+        (1.0 - material_effective_transmission(material));
 }
 
 float material_sheen_weight(Material material, float NdotV) {

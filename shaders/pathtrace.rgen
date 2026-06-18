@@ -4,6 +4,7 @@
 #extension GL_NV_ray_tracing_motion_blur : require
 #endif
 #include "rt_common.glsl"
+#include "restir_di_common.glsl"
 
 layout(set = 0, binding = 33) uniform accelerationStructureEXT topLevelAS;
 layout(location = 0) rayPayloadEXT RayPayload payload;
@@ -364,6 +365,73 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
         components.restir_di_sample_normal);
 
     restir_reservoirs[pixelIndex] = current;
+}
+
+void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_position, vec3 hit_normal, float hit_depth, bool did_hit) {
+    // Write receiver surface data
+    RestirDiReceiver receiver;
+    if (did_hit) {
+        uint surfaceFlags = 0u;
+        if (components.first_mat_type == 1u || components.first_mat_type == 2u) {
+            surfaceFlags |= RESTIR_DI_SURFACE_DELTA;
+        }
+        if (components.first_transmission > 1.0e-4) {
+            surfaceFlags |= RESTIR_DI_SURFACE_DELTA;
+        }
+        if (components.first_alpha_mode != 0u || components.first_alpha < 0.999) {
+            surfaceFlags |= RESTIR_DI_SURFACE_ALPHA;
+        }
+        if (components.first_mat_type == 5u) {
+            surfaceFlags |= RESTIR_DI_SURFACE_UNLIT;
+        }
+        receiver.worldPosition_depth = vec4(hit_position, hit_depth);
+        receiver.normal_roughness = vec4(hit_normal, components.first_roughness);
+        receiver.tangent_materialId = vec4(0.0, 0.0, 1.0, float(components.first_material_id));
+        receiver.bitangent_instanceId = vec4(1.0, 0.0, 0.0, float(components.instance_id));
+        receiver.viewDirection_hitDist = vec4(-normalize(hit_position - camera.pos.xyz), hit_depth);
+        receiver.primitive_mesh_flags = uvec4(components.primitive_id, components.mesh_id, surfaceFlags, 0u);
+    } else {
+        receiver.worldPosition_depth = vec4(0.0, 0.0, 0.0, 9999.0);
+        receiver.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
+        receiver.tangent_materialId = vec4(1.0, 0.0, 0.0, float(0xffffffffu));
+        receiver.bitangent_instanceId = vec4(0.0, 1.0, 0.0, float(0xffffffffu));
+        receiver.viewDirection_hitDist = vec4(0.0, 0.0, 1.0, 9999.0);
+        receiver.primitive_mesh_flags = uvec4(0u, 0u, 1u /*RESTIR_DI_SURFACE_SKY*/, 0u);
+    }
+    restir_di_receivers[pixelIndex] = receiver;
+
+    // Write initial DI reservoir
+    RestirDiReservoir initial = restir_di_empty_reservoir();
+    float targetLum = restir_di_target_function(components.restir_initial_direct_light);
+    if (did_hit && targetLum > 1.0e-6) {
+        vec3 toLight = components.restir_di_sample_position - hit_position;
+        float distToLight = length(toLight);
+        vec3 sampleDir = distToLight > 1.0e-4 ? toLight / distToLight : vec3(0.0, 1.0, 0.0);
+
+        initial.sampleMetadata = uvec4(
+            components.restir_di_light_index,
+            components.restir_di_light_kind,
+            0u, // light version
+            components.first_material_id);
+        initial.samplePosition_distance = vec4(
+            components.restir_di_sample_position,
+            components.restir_di_sample_distance);
+        initial.sampleDirection_pdf = vec4(sampleDir, components.first_light_pdf);
+        initial.sampleRadiance_target = vec4(
+            components.restir_di_sample_radiance,
+            targetLum);
+        initial.sampleNormal_weightSum = vec4(
+            components.restir_di_sample_normal,
+            targetLum / max(components.first_light_pdf, 1.0e-6));
+        initial.contribution_confidence = vec4(0.0, 0.0, 0.0, 1.0);
+        restir_di_set_valid(initial, true);
+        restir_di_set_age(initial, 0u);
+        restir_di_set_m(initial, 1u);
+        restir_di_set_visibility(initial, 0u);
+        restir_di_set_source_pdf(initial, components.first_light_pdf);
+        restir_di_set_previous_weight(initial, 0.0);
+    }
+    restir_di_initial_reservoirs[pixelIndex] = initial;
 }
 
 float restir_gi_target_function(RestirGiReservoir reservoir);
@@ -750,7 +818,7 @@ vec3 caustic_shadow_transmittance_stats(
         }
 
         Material material = material_for_hit(shadowHit, rayDir);
-        if (!(material.mat_type == 2u && material_is_delta(material))) {
+        if (!material_is_transmissive(material)) {
             if (causticDiagnosticsEnabled) {
                 record_rt_counter(RT_DIAG_CAUSTIC_SHADOW_BLOCKED);
             }
@@ -775,7 +843,7 @@ vec3 caustic_shadow_transmittance_stats(
             return vec3(0.0);
         }
 
-        float surfaceT = homogeneous_transmittance_scalar(shadowHit.t);
+        float surfaceT = homogeneous_transmittance_scalar(shadowHit.t) * material_effective_transmission(material);
         vec3 fresnel = vec3(
             reflectance(cosTheta, etaRgb.r),
             reflectance(cosTheta, etaRgb.g),
@@ -1612,7 +1680,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.first_metallic = material.metallic;
             components.first_alpha = material.alpha_factor;
             components.first_alpha_mode = material.alpha_mode;
-            components.first_transmission = material.transmission_factor;
+            components.first_transmission = material_effective_transmission(material);
             components.first_mat_type = material.mat_type;
             components.first_specular_probability = pbr_specular_sample_probability(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.first_material_id = hit.material_id;
@@ -1927,7 +1995,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         previousEventType = PATH_EVENT_NONE;
         previousBrdfPdf = 0.0;
         bool continuedPath = false;
-        if (material.mat_type == 1u && material_is_delta(material)) {
+        if (material.mat_type == 1u && !material_is_transmissive(material) && material_is_delta(material)) {
             ray.direction = reflect(ray.direction, hit.normal);
             if (dot(ray.direction, hit.normal) <= 0.0) {
                 break;
@@ -1940,7 +2008,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             }
             previousEventType = PATH_EVENT_DELTA;
             continuedPath = true;
-        } else if (material.mat_type == 2u && material_is_delta(material)) {
+        } else if (material_is_transmissive(material)) {
             float dispersionSample = sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_DIELECTRIC + 1u);
             uint dispersionChannel = material_dispersion_channel(material, dispersionSample);
             vec3 dispersionIor = material_dispersion_ior(material);
@@ -1959,7 +2027,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             ray.origin = hit.world_pos + (dot(ray.direction, hit.normal) > 0.0 ? hit.normal : -hit.normal) * shadow_self_hit_epsilon();
             throughput *= material.color * material_dispersion_channel_weight(material, dispersionChannel);
             if (!reflected) {
-                throughput *= max(material.transmission_factor, 0.0);
+                throughput *= material_effective_transmission(material);
             }
             if (!reflected && hit.front_face == 0u) {
                 throughput *= material_volume_transmittance(material, hit.t);
@@ -2250,6 +2318,7 @@ void main() {
     velocity_buffer[pixel_index] = packedVelocity;
     store_initial_restir_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
     store_initial_restir_gi_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
+    store_new_restir_di(pixel_index, components, hit_position, hit_normal, hit_depth, did_hit);
 
     entity_id_buffer[pixel_index] = did_hit && components.instance_id != 0xffffffffu
         ? components.instance_id
