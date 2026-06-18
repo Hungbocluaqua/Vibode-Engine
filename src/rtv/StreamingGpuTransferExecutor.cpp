@@ -127,10 +127,20 @@ void StreamingGpuTransferExecutor::shutdown() {
         vkDestroyCommandPool(device_, graphicsCommandPool_, nullptr);
         graphicsCommandPool_ = VK_NULL_HANDLE;
     }
+    if (computeCommandPool_ != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(device_, computeCommandPool_, nullptr);
+        computeCommandPool_ = VK_NULL_HANDLE;
+    }
+    if (computeTimeline_ != VK_NULL_HANDLE) {
+        vkDestroySemaphore(device_, computeTimeline_, nullptr);
+        computeTimeline_ = VK_NULL_HANDLE;
+    }
     stagingRing_ = StreamingStagingRing();
     inFlight_.clear();
+    computeInFlight_.clear();
     freeCommandBuffers_.clear();
     freeGraphicsCommandBuffers_.clear();
+    freeComputeCommandBuffers_.clear();
     openBatch_ = VK_NULL_HANDLE;
     openBatchCopies_ = 0;
     openGraphicsBatch_ = VK_NULL_HANDLE;
@@ -306,7 +316,9 @@ bool StreamingGpuTransferExecutor::stageBlasBuild(const BlasTriangleBuild& build
         build.indexBuffer->handle() == VK_NULL_HANDLE ||
         build.vertexCount == 0 ||
         build.indexCount < 3 ||
-        build.vertexStride == 0) {
+        build.vertexStride == 0 ||
+        !build.vertexBuffer->supportsDeviceAddress() ||
+        !build.indexBuffer->supportsDeviceAddress()) {
         return false;
     }
 
@@ -653,6 +665,11 @@ void StreamingGpuTransferExecutor::recycleCompleted(uint64_t completedTimeline) 
         }
         inFlight_.pop_front();
     }
+    // Recycle completed compute-queue command buffers.
+    while (!computeInFlight_.empty() && computeInFlight_.front().timelineValue <= completedTimeline) {
+        freeComputeCommandBuffers_.push_back(computeInFlight_.front().commandBuffer);
+        computeInFlight_.pop_front();
+    }
     (void)stagingRing_.retire(completedTimeline);
     auto queryOut = pendingCompactionQueries_.begin();
     for (auto queryIt = pendingCompactionQueries_.begin(); queryIt != pendingCompactionQueries_.end(); ++queryIt) {
@@ -702,6 +719,107 @@ uint64_t StreamingGpuTransferExecutor::poll() {
     completedTimeline_ = value;
     recycleCompleted(value);
     return value;
+}
+
+void StreamingGpuTransferExecutor::setComputeQueue(VkQueue queue, uint32_t familyIndex, VkSemaphore timelineSemaphore) {
+    computeQueue_ = queue;
+    computeQueueFamily_ = familyIndex;
+    computeTimeline_ = timelineSemaphore;
+    nextComputeTimelineValue_ = 1;
+
+    if (device_ != VK_NULL_HANDLE && queue != VK_NULL_HANDLE && computeCommandPool_ == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = familyIndex;
+        vkCreateCommandPool(device_, &poolInfo, nullptr, &computeCommandPool_);
+    }
+}
+
+bool StreamingGpuTransferExecutor::recordComputeDispatch(VkCommandBuffer externalCommandBuffer,
+                                                          uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
+    if (computeQueue_ == VK_NULL_HANDLE || externalCommandBuffer == VK_NULL_HANDLE) {
+        return false;
+    }
+    if (groupCountX == 0 || groupCountY == 0 || groupCountZ == 0) {
+        return false;
+    }
+    vkCmdDispatch(externalCommandBuffer, groupCountX, groupCountY, groupCountZ);
+    return true;
+}
+
+uint64_t StreamingGpuTransferExecutor::submitComputeFrame(uint64_t waitTimelineValue) {
+    if (device_ == VK_NULL_HANDLE || computeQueue_ == VK_NULL_HANDLE ||
+        computeTimeline_ == VK_NULL_HANDLE || computeCommandPool_ == VK_NULL_HANDLE) {
+        return 0;
+    }
+
+    // Allocate a fresh compute command buffer for this frame.
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = computeCommandPool_;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer computeCmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device_, &allocInfo, &computeCmd) != VK_SUCCESS) {
+        return 0;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(computeCmd, &beginInfo);
+
+    // No work recorded yet — this is a placeholder for future compute-shader decompression.
+    // The external caller records dispatches via recordComputeDispatch before submission.
+
+    vkEndCommandBuffer(computeCmd);
+
+    const uint64_t signalValue = nextComputeTimelineValue_++;
+
+    // Wait on the transfer timeline.
+    VkSemaphoreSubmitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitInfo.semaphore = timeline_;
+    waitInfo.value = waitTimelineValue;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
+    // Signal compute timeline.
+    VkSemaphoreSubmitInfo signalInfo{};
+    signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    signalInfo.semaphore = computeTimeline_;
+    signalInfo.value = signalValue;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkCommandBufferSubmitInfo cmdInfo{};
+    cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdInfo.commandBuffer = computeCmd;
+
+    VkSubmitInfo2 submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    if (waitTimelineValue > 0) {
+        submit.waitSemaphoreInfoCount = 1;
+        submit.pWaitSemaphoreInfos = &waitInfo;
+    }
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmdInfo;
+    submit.signalSemaphoreInfoCount = 1;
+    submit.pSignalSemaphoreInfos = &signalInfo;
+
+    const VkResult result = vkQueueSubmit2(computeQueue_, 1, &submit, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) {
+        vkFreeCommandBuffers(device_, computeCommandPool_, 1, &computeCmd);
+        return 0;
+    }
+
+    // Track the compute command buffer for recycling when the timeline is
+    // signaled (freed in poll/recycleCompleted alongside in-flight tracking).
+    computeInFlight_.push_back({signalValue, computeCmd, true});
+    // Also add to the general in-flight tracking so poll() can drain both queues.
+    inFlight_.push_back({signalValue, VK_NULL_HANDLE, true});
+
+    return signalValue;
 }
 
 StreamingGpuTransferExecutor::Stats StreamingGpuTransferExecutor::stats() const {

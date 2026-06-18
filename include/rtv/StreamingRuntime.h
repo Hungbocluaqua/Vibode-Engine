@@ -28,11 +28,17 @@ struct StreamingRuntimeOptions {
     uint64_t cpuMemoryBudgetBytes = 512ull * 1024ull * 1024ull;
     uint64_t gpuMemoryBudgetBytes = 1024ull * 1024ull * 1024ull;
     uint64_t uploadBytesPerFrame = 64ull * 1024ull * 1024ull;
-    uint64_t cpuBatchBytes = 256ull * 1024ull * 1024ull;
+    uint64_t cpuBatchBytes = 64ull * 1024ull * 1024ull;
     bool directStorageEnabled = false;
     bool forceCpuDecompress = false;
     bool evictionEnabled = true;
     StreamingIoBackendKind ioBackend = StreamingIoBackendKind::Win32;
+
+    // Async compute streaming controls.
+    bool asyncComputeStreamingEnabled = true;
+    uint64_t asyncComputeFrameBudgetUs = 16600;        // ~16.6ms default
+    uint64_t asyncComputeMinStreamingHeadroomUs = 2000;  // 2ms minimum headroom
+    bool validateAsyncComputeParity = false;
 };
 
 enum class StreamingAssetState : uint8_t {

@@ -81,6 +81,82 @@ static_assert(sizeof(GpuInstanceBoundsRecord) == 32);
 static_assert(sizeof(GpuLightRecord) == 80);
 static_assert(sizeof(MeshParamsUniform) == 80);
 
+struct MaterialTextureUploadPayload {
+    std::vector<uint8_t> bytes;
+    std::vector<TextureMipLevel> mipData;
+    uint32_t width = 1;
+    uint32_t height = 1;
+    bool capped = false;
+};
+
+bool validMipRange(const TextureAsset& texture, const TextureMipLevel& mip) {
+    return mip.size != 0 &&
+        mip.offset <= texture.rgba8.size() &&
+        mip.size <= texture.rgba8.size() - mip.offset;
+}
+
+uint32_t previewBaseMipFor(const TextureAsset& texture, uint32_t maxDimension) {
+    if (maxDimension == 0 || texture.mipData.empty()) {
+        return 0;
+    }
+    for (uint32_t mip = 0; mip < static_cast<uint32_t>(texture.mipData.size()); ++mip) {
+        const TextureMipLevel& level = texture.mipData[mip];
+        if (level.size == 0) {
+            continue;
+        }
+        const uint32_t width = std::max(level.width, 1u);
+        const uint32_t height = std::max(level.height, 1u);
+        if (std::max(width, height) <= maxDimension) {
+            return mip;
+        }
+    }
+    return static_cast<uint32_t>(texture.mipData.size() - 1u);
+}
+
+MaterialTextureUploadPayload makeMaterialTextureUploadPayload(const TextureAsset& texture, uint32_t maxDimension) {
+    MaterialTextureUploadPayload payload;
+    payload.width = std::max(texture.width, 1u);
+    payload.height = std::max(texture.height, 1u);
+    if (texture.rgba8.empty()) {
+        return payload;
+    }
+
+    const uint32_t firstMip = previewBaseMipFor(texture, maxDimension);
+    if (firstMip == 0 || texture.mipData.empty()) {
+        payload.bytes = texture.rgba8;
+        payload.mipData = texture.mipData;
+        return payload;
+    }
+
+    for (uint32_t mip = firstMip; mip < static_cast<uint32_t>(texture.mipData.size()); ++mip) {
+        const TextureMipLevel& sourceMip = texture.mipData[mip];
+        if (!validMipRange(texture, sourceMip)) {
+            continue;
+        }
+        const uint64_t destinationOffset = static_cast<uint64_t>(payload.bytes.size());
+        const auto begin = texture.rgba8.begin() + static_cast<std::ptrdiff_t>(sourceMip.offset);
+        const auto end = begin + static_cast<std::ptrdiff_t>(sourceMip.size);
+        payload.bytes.insert(payload.bytes.end(), begin, end);
+        payload.mipData.push_back(TextureMipLevel{
+            .offset = destinationOffset,
+            .size = sourceMip.size,
+            .width = std::max(sourceMip.width, 1u),
+            .height = std::max(sourceMip.height, 1u),
+        });
+    }
+
+    if (payload.bytes.empty() || payload.mipData.empty()) {
+        payload.bytes = texture.rgba8;
+        payload.mipData = texture.mipData;
+        return payload;
+    }
+
+    payload.width = payload.mipData.front().width;
+    payload.height = payload.mipData.front().height;
+    payload.capped = true;
+    return payload;
+}
+
 uint32_t importedMaterialType(const MaterialAsset* material) {
     if (material != nullptr && (material->shaderCompatibilityMask & kMaterialClosureFlagUnlit) != 0u) {
         return materialTypeUnlit;
@@ -1499,11 +1575,13 @@ GpuScene::GpuScene(
     const AssetManager* assets,
     std::optional<std::filesystem::path> environmentPath,
     std::optional<std::filesystem::path> sceneCachePath,
-    uint32_t opacityMicromapSubdivisionLevel)
+    uint32_t opacityMicromapSubdivisionLevel,
+    uint32_t materialTextureMaxDimension)
     : allocator_(allocator),
       environmentPath_(std::move(environmentPath)),
       sceneCachePath_(std::move(sceneCachePath)),
-      opacityMicromapSubdivisionLevel_(opacityMicromapSubdivisionLevel) {
+      opacityMicromapSubdivisionLevel_(opacityMicromapSubdivisionLevel),
+      materialTextureMaxDimension_(materialTextureMaxDimension) {
     materialTextureAnisotropy_ = allocator_.supportsSamplerAnisotropy()
         ? std::clamp(8.0f, 1.0f, allocator_.maxSamplerAnisotropy())
         : 1.0f;
@@ -1837,26 +1915,43 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
     std::vector<PendingTexture> pendingTextures;
     pendingTextures.reserve(std::max(1u, textureCount));
     uint64_t highPrecisionBytes = 0;
+    uint64_t sourceTexturePayloadBytes = 0;
+    uint64_t uploadedTexturePayloadBytes = 0;
+    uint32_t cappedPreviewTextures = 0;
 
     for (uint32_t slot = 0; slot < std::max(1u, textureCount); ++slot) {
         const TextureAsset* texture = slot < textureCount ? assets.texture(importedScene.textures[slot]) : nullptr;
         std::vector<uint8_t> pixels;
+        std::vector<TextureMipLevel> uploadMipData;
         uint32_t width = 1;
         uint32_t height = 1;
         const char* name = "imported material texture";
         if (texture != nullptr && !texture->rgba8.empty() && texture->width > 0 && texture->height > 0) {
-            pixels = texture->fallback ? fallbackTexturePixels(usage, slot) : texture->rgba8;
-            width = texture->width;
-            height = texture->height;
+            if (texture->fallback) {
+                pixels = fallbackTexturePixels(usage, slot);
+                width = texture->width;
+                height = texture->height;
+            } else {
+                MaterialTextureUploadPayload uploadPayload = makeMaterialTextureUploadPayload(*texture, materialTextureMaxDimension_);
+                pixels = std::move(uploadPayload.bytes);
+                uploadMipData = std::move(uploadPayload.mipData);
+                width = uploadPayload.width;
+                height = uploadPayload.height;
+                if (uploadPayload.capped) {
+                    ++cappedPreviewTextures;
+                }
+            }
             name = texture->fallback ? "fallback material texture" : name;
         } else {
             pixels = fallbackTexturePixels(usage, slot);
             name = "default material texture";
         }
+        sourceTexturePayloadBytes += texture != nullptr ? static_cast<uint64_t>(texture->rgba8.size()) : static_cast<uint64_t>(pixels.size());
+        uploadedTexturePayloadBytes += static_cast<uint64_t>(pixels.size());
 
-        const bool hasUploadedMips = texture != nullptr && !texture->mipData.empty();
+        const bool hasUploadedMips = !uploadMipData.empty();
         const uint32_t textureMipLevels = hasUploadedMips
-            ? static_cast<uint32_t>(texture->mipData.size())
+            ? static_cast<uint32_t>(uploadMipData.size())
             : (texture != nullptr && texture->isCompressed
                 ? std::max(1u, static_cast<uint32_t>(texture->mipLevels))
                 : std::max(1u, static_cast<uint32_t>(std::floor(std::log2(std::max(width, height))) + 1u)));
@@ -1896,12 +1991,20 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
         pendingTextures.push_back({
             std::move(image),
             std::move(pixels),
-            texture != nullptr ? texture->mipData : std::vector<TextureMipLevel>{},
+            std::move(uploadMipData),
             samplerDesc,
             std::move(registration),
         });
     }
     warnHighPrecisionTextureBudget("Material", highPrecisionBytes);
+    if (materialTextureMaxDimension_ > 0 && cappedPreviewTextures > 0) {
+        constexpr double oneMiB = 1024.0 * 1024.0;
+        std::cout << "Material texture preview cap: max_dim=" << materialTextureMaxDimension_
+                  << " capped=" << cappedPreviewTextures << " / " << textureCount
+                  << " upload=" << (static_cast<double>(uploadedTexturePayloadBytes) / oneMiB)
+                  << " MiB source=" << (static_cast<double>(sourceTexturePayloadBytes) / oneMiB)
+                  << " MiB\n";
+    }
 
     BatchUploader batch(uploader);
     batch.begin();
@@ -2194,14 +2297,19 @@ bool GpuScene::rebuildEmissiveLightRecords(const SceneAsset& scene, float& emiss
     return !emissiveLightRecords_.empty() || !scene.lights.empty();
 }
 
-bool GpuScene::updateSceneLights(BufferUploader& uploader, const SceneAsset& scene, uint64_t retireFrame) {
+bool GpuScene::updateSceneLights(
+    BufferUploader& uploader,
+    const SceneAsset& scene,
+    uint64_t retireFrame,
+    bool logLightBvhStats,
+    bool rebuildLightBvh) {
     if (lightRecords_ == nullptr || meshParamsBuffer_ == nullptr) {
         return false;
     }
 
     float totalWeight = emissiveLightRecords_.empty() ? 0.0f : emissiveLightRecords_.back().data0.y;
     std::vector<GpuLightRecord> records = combineLightRecords(emissiveLightRecords_, scene.lights, totalWeight, totalWeight);
-    uploadLightRecords(uploader, std::move(records), totalWeight, retireFrame);
+    uploadLightRecords(uploader, std::move(records), totalWeight, retireFrame, logLightBvhStats, rebuildLightBvh);
     return true;
 }
 
@@ -2745,9 +2853,6 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     const BvhBuildQuality importedBvhQuality = importedTriangleCount >= fastImportedBvhTriangleThreshold
         ? BvhBuildQuality::MortonFast
         : BvhBuildQuality::BinnedSah;
-    if (importedBvhQuality == BvhBuildQuality::MortonFast) {
-        std::cout << "Large imported geometry detected; using fast Morton BVH build for " << importedTriangleCount << " triangles.\n";
-    }
 
     struct MeshPrep {
         MeshAssetHandle handle;
@@ -2875,6 +2980,17 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     }
 
     const auto bvhResults = ParallelBvhBuilder::buildAll(bvhTasks);
+    if (importedBvhQuality == BvhBuildQuality::MortonFast) {
+        if (bvhTasks.empty()) {
+            std::cout << "Large imported geometry detected; reusing cached local BVHs for "
+                      << meshPrep.size() << " meshes (" << importedTriangleCount
+                      << " triangles), no CPU local BVH rebuild needed.\n";
+        } else {
+            std::cout << "Large imported geometry detected; building missing local BVHs with fast Morton for "
+                      << bvhTasks.size() << " / " << meshPrep.size()
+                      << " meshes (" << importedTriangleCount << " triangles total).\n";
+        }
+    }
     if (!bvhTasks.empty() && bvhTasks.size() != meshPrep.size()) {
         std::cout << "Imported scene reused cached local BVHs for " << (meshPrep.size() - bvhTasks.size())
                   << " / " << meshPrep.size() << " meshes.\n";
@@ -3682,7 +3798,13 @@ void GpuScene::uploadEnvironmentParams() {
     }
 }
 
-void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight, uint64_t retireFrame) {
+void GpuScene::uploadLightRecords(
+    BufferUploader& uploader,
+    std::vector<GpuLightRecord> lightRecords,
+    float totalWeight,
+    uint64_t retireFrame,
+    bool logLightBvhStats,
+    bool rebuildLightBvh) {
     if (lightRecords.empty()) {
         lightRecords.push_back(GpuLightRecord{});
         totalWeight = 0.0f;
@@ -3703,10 +3825,12 @@ void GpuScene::uploadLightRecords(BufferUploader& uploader, std::vector<GpuLight
         meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
         meshParamsBuffer_->flush(sizeof(meshParams_));
     }
-    uploadLightBvh(uploader, lightRecords, retireFrame);
+    if (rebuildLightBvh) {
+        uploadLightBvh(uploader, lightRecords, retireFrame, logLightBvhStats);
+    }
 }
 
-void GpuScene::uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords, uint64_t retireFrame) {
+void GpuScene::uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords, uint64_t retireFrame, bool logStats) {
     std::vector<LightBvhPrimitive> lightPrimitives;
     lightPrimitives.reserve(lightRecords.size());
     for (uint32_t i = 0; i < static_cast<uint32_t>(lightRecords.size()); ++i) {
@@ -3714,7 +3838,7 @@ void GpuScene::uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLig
     }
     std::vector<LightBvhNode> bvhNodes = buildLightBvh(lightPrimitives, 1);
     const LightBvhStats stats = computeLightBvhStats(bvhNodes);
-    if (stats.nodeCount > 0u) {
+    if (logStats && stats.nodeCount > 0u) {
         std::cout << "Light BVH: nodes=" << stats.nodeCount
                   << " leaves=" << stats.leafCount
                   << " max_depth=" << stats.maxDepth

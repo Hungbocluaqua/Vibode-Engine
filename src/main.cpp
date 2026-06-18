@@ -859,7 +859,10 @@ bool parseStreamingRuntimeArg(
     if (arg == "--streaming-cpu-memory-mb" && index + 1 < argc) {
         options.budgetPreset = "custom";
         options.cpuMemoryBudgetBytes = static_cast<uint64_t>(std::stoull(argv[++index])) * 1024ull * 1024ull;
-        options.cpuBatchBytes = std::max<uint64_t>(16ull * 1024ull * 1024ull, options.cpuMemoryBudgetBytes / 2ull);
+        options.cpuBatchBytes = std::clamp<uint64_t>(
+            options.cpuMemoryBudgetBytes / 2ull,
+            16ull * 1024ull * 1024ull,
+            128ull * 1024ull * 1024ull);
         return true;
     }
     if (arg == "--streaming-gpu-memory-mb" && index + 1 < argc) {
@@ -891,6 +894,22 @@ bool parseStreamingRuntimeArg(
     }
     if (arg == "--dump-streaming" && index + 1 < argc) {
         dumpStreamingPath = std::filesystem::path(argv[++index]);
+        return true;
+    }
+    if (arg == "--streaming-async-compute" && index + 1 < argc) {
+        options.asyncComputeStreamingEnabled = rtv::parseStreamingOnOff(argv[++index]);
+        return true;
+    }
+    if (arg == "--streaming-async-compute-frame-budget-us" && index + 1 < argc) {
+        options.asyncComputeFrameBudgetUs = static_cast<uint64_t>(std::stoull(argv[++index]));
+        return true;
+    }
+    if (arg == "--streaming-async-compute-min-headroom-us" && index + 1 < argc) {
+        options.asyncComputeMinStreamingHeadroomUs = static_cast<uint64_t>(std::stoull(argv[++index]));
+        return true;
+    }
+    if (arg == "--validate-async-compute-parity") {
+        options.validateAsyncComputeParity = true;
         return true;
     }
     if (arg == "--streaming-validation-scene" && index + 1 < argc) {

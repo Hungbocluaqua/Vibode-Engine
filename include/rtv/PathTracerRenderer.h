@@ -221,7 +221,8 @@ public:
         std::optional<std::filesystem::path> sceneCachePath = std::nullopt,
         bool resourceAliasingEnabled = true,
         GpuSkinningResourcePlan gpuSkinningResourcePlan = {},
-        const RendererSettings* initialSettings = nullptr);
+        const RendererSettings* initialSettings = nullptr,
+        uint32_t materialTextureMaxDimension = 0);
     ~PathTracerRenderer();
     void releaseExclusiveRuntimeForRendererReplacement();
 
@@ -259,7 +260,7 @@ public:
     void loadEnvironment(const std::filesystem::path& path);
     [[nodiscard]] bool shadersNeedReload();
     bool updateMaterials(const SceneAsset& scene, const AssetManager& assets);
-    bool updateSceneLights(const SceneAsset& scene);
+    bool updateSceneLights(const SceneAsset& scene, bool rebuildLightBvh = true);
     bool updateSceneTransforms(const SceneAsset& scene, const AssetManager& assets);
     bool updateSceneVisibility(const SceneAsset& scene, const AssetManager& assets);
     bool updateGpuSkinningJointPayloads(

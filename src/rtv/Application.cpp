@@ -10,6 +10,7 @@
 #include "rtv/FileDialog.h"
 #include "rtv/GltfLoader.h"
 #include "rtv/GpuSceneStreamingState.h"
+#include "rtv/NativeAssetFormat.h"
 #include "rtv/NativeAssetRuntimeLoader.h"
 #include "rtv/NativeAssetMigration.h"
 #include "rtv/NativeTextureFormatPolicy.h"
@@ -78,6 +79,7 @@ constexpr int initialWidth = 1280;
 constexpr int initialHeight = 720;
 constexpr uint64_t largeSceneTriangleThreshold = 1'000'000ull;
 constexpr float defaultMaxFrameDeltaSeconds = 1.0f / 30.0f;
+constexpr uint32_t streamingFinalRebuildMaterialTexturePreviewMaxDimension = 1024u;
 
 constexpr RendererDebugView intermediateViews[] = {
     RendererDebugView::Beauty,
@@ -2690,7 +2692,25 @@ std::vector<std::filesystem::path> nativeRuntimeCacheAllowListForRecord(
         }
     }
 
-    std::sort(paths.begin(), paths.end(), [](const std::filesystem::path& a, const std::filesystem::path& b) {
+    auto runtimePayloadSortRank = [](const std::filesystem::path& path) {
+        const NativeAssetKind kind = nativeAssetKindFromExtension(path);
+        if (kind == NativeAssetKind::Texture) {
+            return 0;
+        }
+        if (kind == NativeAssetKind::Material) {
+            return 1;
+        }
+        if (kind == NativeAssetKind::Mesh || kind == NativeAssetKind::SkeletalMesh) {
+            return 2;
+        }
+        return 3;
+    };
+    std::sort(paths.begin(), paths.end(), [&](const std::filesystem::path& a, const std::filesystem::path& b) {
+        const int ar = runtimePayloadSortRank(a);
+        const int br = runtimePayloadSortRank(b);
+        if (ar != br) {
+            return ar < br;
+        }
         return a.generic_string() < b.generic_string();
     });
     paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
@@ -3791,18 +3811,44 @@ Application::Application(
 }
 
 Application::~Application() {
-    if (activeProgressiveRuntimeLoadJob_.has_value()) {
-        activeProgressiveRuntimeLoadJob_->cancelled = true;
-        if (activeProgressiveRuntimeLoadJob_->future.valid()) {
-            activeProgressiveRuntimeLoadJob_->future.wait();
-        }
-    }
+    std::cerr << "[shutdown] Application destructor begin\n";
+
+    // Phase 1: Streaming runtime shutdown
+    shutdownStreamingRuntime();
+    std::cerr << "[shutdown] streaming runtime drained\n";
     asyncSceneLoader_.requestCancel();
     asyncSceneLoader_.wait();
     waitForAssetImportWorker();
-    if (commandSystem_) {
-        commandSystem_->waitIdle();
+
+    // Phase 2: Stop GPU work producers
+    if (streamingGpuTransferExecutorReady_) {
+        streamingGpuTransferExecutor_.shutdown();
+        streamingGpuTransferExecutorReady_ = false;
+        std::cerr << "[shutdown] transfer executor stopped\n";
     }
+
+    // Phase 3: Wait idle (non-throwing)
+    if (commandSystem_) {
+        try {
+            commandSystem_->waitIdle();
+            std::cerr << "[shutdown] command system idle OK\n";
+        } catch (const std::exception& e) {
+            std::cerr << "[shutdown] command system waitIdle threw: " << e.what() << " -- continuing teardown\n";
+        } catch (...) {
+            std::cerr << "[shutdown] command system waitIdle threw unknown -- continuing teardown\n";
+        }
+    }
+
+    // Phase 4: Drain GPU resources (queues idle, safe to destroy)
+    streamingGpuBufferUploadPayloads_.clear();
+    streamingGpuImageMipUploadPayloads_.clear();
+    streamingGpuBlasBuildPayloads_.clear();
+    streamingGpuBlasCompactionPayloads_.clear();
+    streamingGpuWorkTimelineMarkers_.clear();
+    streamingGpuWorkQueue_ = StreamingGpuWorkQueue();
+    streamingGpuSceneUpdateQueue_ = IncrementalGpuSceneUpdateQueue();
+    nativeGpuAssetCache_.clear();
+    std::cerr << "[shutdown] GPU payloads + cache drained\n";
 
     if (uiOverlay_) {
         (void)saveActiveEditorPreferences();
@@ -3812,8 +3858,6 @@ Application::~Application() {
         commandSystem_->setPathTracer(nullptr);
     }
     retiredPathTracers_.clear();
-    streamingGpuTransferExecutor_.shutdown();
-    streamingGpuTransferExecutorReady_ = false;
     pathTracer_.reset();
     commandSystem_.reset();
     uiOverlay_.reset();
@@ -4077,6 +4121,30 @@ uint32_t materialTextureDependencyCount(const rtv::MaterialAsset& material) {
         }
     }
     return count;
+}
+
+void assignStreamingMaterialTextureSlot(rtv::MaterialAsset& material, uint32_t slot, rtv::TextureAssetHandle handle) {
+    switch (static_cast<rtv::RtmaterialTextureSlot>(slot)) {
+    case rtv::RtmaterialTextureSlot::BaseColor: material.baseColorTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Normal: material.normalTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::MetallicRoughness: material.metallicRoughnessTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Occlusion: material.occlusionTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Emissive: material.emissiveTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Transmission: material.transmissionTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Clearcoat: material.clearcoatTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::ClearcoatRoughness: material.clearcoatRoughnessTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::ClearcoatNormal: material.clearcoatNormalTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::VolumeThickness: material.volumeThicknessTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::SheenColor: material.sheenColorTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::SheenRoughness: material.sheenRoughnessTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Specular: material.specularTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::SpecularColor: material.specularColorTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Iridescence: material.iridescenceTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::IridescenceThickness: material.iridescenceThicknessTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Anisotropy: material.anisotropyTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Opacity: material.opacityTexture = handle; break;
+    case rtv::RtmaterialTextureSlot::Height: material.heightTexture = handle; break;
+    }
 }
 
 bool materialContributesRestirLightCandidate(const rtv::MaterialAsset& material) {
@@ -9991,7 +10059,11 @@ bool Application::placePrefabAsset(const AssetGuid& prefabGuid, const std::optio
             "Place Prefab Asset"));
     }
     sceneUnsavedDirty_ = true;
-    const bool deferRendererRebuild = shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+    const bool streamingPlacementActive = deferRuntimePayloadLoad && activeProgressiveRuntimeLoadJob_.has_value();
+    const bool deferRendererRebuild = streamingPlacementActive || shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_);
+    if (streamingPlacementActive) {
+        std::cerr << "[streaming] renderer rebuild DEFERRED: streaming in progress\n";
+    }
     (void)applyPendingSceneUpdate(!deferRendererRebuild);
     if (deferRendererRebuild) {
         notifications_.notify("Prefab placed; renderer rebuild deferred for large scene", NotificationType::Info, NotificationAction::OpenContent, "Open Content", 5.0f);
@@ -10171,6 +10243,7 @@ void Application::startNextProgressiveRuntimeLoadBatch() {
         result.bytes = batchBytes;
         result.files = batchFiles;
 
+        try {
         std::unique_ptr<StreamingIoBackend> ioBackend = makeStreamingIoBackend(streamingOptions);
         std::vector<StreamingIoReadRequest> ioRequests;
         ioRequests.reserve(batchFiles.size());
@@ -10206,6 +10279,9 @@ void Application::startNextProgressiveRuntimeLoadBatch() {
         NativeAssetRuntimeLoader loader;
         NativeRuntimeLoadReport report = loader.loadLooseRoot(nativeLoadRoot, &result.assets, loadOptions);
         result.ok = report.ok;
+        if (result.ok) {
+            result.loadedFiles = result.fileCount;
+        }
         for (const NativeBinaryError& error : report.errors) {
             result.errors.push_back(error.message);
         }
@@ -10241,9 +10317,31 @@ void Application::startNextProgressiveRuntimeLoadBatch() {
                 result.textures[bindingGuid] = asset.textureHandle;
             } else if (asset.kind == NativeAssetKind::Material && asset.materialHandle.valid()) {
                 result.bindings.materials[bindingGuid] = asset.materialHandle;
+                const AssetGuid materialBindingKey = asset.guid.empty() ? bindingGuid : asset.guid;
+                auto& bindings = result.materialTextureBindings[materialBindingKey];
+                bindings.reserve(asset.materialTextureBindings.size());
+                for (const NativeRuntimeTextureBinding& binding : asset.materialTextureBindings) {
+                    if (!binding.textureGuid.empty()) {
+                        bindings.push_back(Application::StreamedMaterialTextureBinding{
+                            .slot = binding.slot,
+                            .textureGuid = binding.textureGuid,
+                        });
+                    }
+                }
             }
         }
         return result;
+        } catch (const std::exception& e) {
+            result.ok = false;
+            result.errors.push_back(std::string("exception: ") + e.what());
+            std::cerr << "[streaming batch " << firstFile << "] CRASH in async worker: " << e.what() << '\n';
+            return result;
+        } catch (...) {
+            result.ok = false;
+            result.errors.push_back("unknown exception");
+            std::cerr << "[streaming batch " << firstFile << "] CRASH in async worker: unknown exception\n";
+            return result;
+        }
     });
 }
 
@@ -10258,12 +10356,88 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
         streamingRuntimeState_.pushEvent("streaming I/O failed: " + error);
     }
 
+    std::cerr << "[streaming] batch APPLY START loadedFiles=" << result.fileCount
+              << " bytes=" << result.bytes
+              << " ok=" << (result.ok ? "yes" : "no")
+              << " errors=" << result.errors.size()
+              << " ioErrors=" << result.ioErrors.size() << '\n';
+    if (!result.ok) {
+        job.failed = true;
+        job.failedFiles += result.fileCount;
+        job.loadedFiles += result.loadedFiles;
+        job.loadedBytes += result.loadedFiles != 0 ? result.bytes : 0ull;
+        for (const std::string& error : result.errors) {
+            streamingRuntimeState_.pushEvent("streaming batch failed: " + error);
+        }
+        for (const std::string& error : result.ioErrors) {
+            streamingRuntimeState_.pushEvent("streaming batch failed: " + error);
+        }
+        startNextProgressiveRuntimeLoadBatch();
+        return;
+    }
+
     ImportedAssetHandleRemap remap = appendImportedAssets(assets_, result.assets);
+    for (auto& [guid, bindings] : result.materialTextureBindings) {
+        if (!guid.empty() && !bindings.empty()) {
+            job.materialTextureBindings[guid] = std::move(bindings);
+        }
+    }
+
+    auto repairStreamedMaterialTextureBindings = [&]() {
+        std::unordered_map<AssetGuid, TextureAssetHandle> textureByGuid;
+        const auto& textures = assets_.textures();
+        textureByGuid.reserve(textures.size());
+        for (uint32_t i = 0; i < textures.size(); ++i) {
+            if (!textures[i].nativeGuid.empty()) {
+                textureByGuid[textures[i].nativeGuid] = TextureAssetHandle{i};
+            }
+        }
+
+        uint32_t repairedSlots = 0;
+        const auto& materials = assets_.materials();
+        for (uint32_t i = 0; i < materials.size(); ++i) {
+            const MaterialAsset& materialView = materials[i];
+            if (materialView.nativeGuid.empty()) {
+                continue;
+            }
+            const auto bindingIt = job.materialTextureBindings.find(materialView.nativeGuid);
+            if (bindingIt == job.materialTextureBindings.end()) {
+                continue;
+            }
+            MaterialAsset* material = assets_.material(MaterialAssetHandle{i});
+            if (material == nullptr) {
+                continue;
+            }
+            for (const StreamedMaterialTextureBinding& binding : bindingIt->second) {
+                const auto textureIt = textureByGuid.find(binding.textureGuid);
+                if (textureIt == textureByGuid.end() || !textureIt->second.valid()) {
+                    continue;
+                }
+                assignStreamingMaterialTextureSlot(*material, binding.slot, textureIt->second);
+                assets_.markTextureResident(textureIt->second, true);
+                ++repairedSlots;
+            }
+        }
+        return repairedSlots;
+    };
+    const uint32_t repairedTextureSlots = repairStreamedMaterialTextureBindings();
+    if (repairedTextureSlots > 0) {
+        streamingRuntimeState_.pushEvent("repaired streamed material texture bindings: " + std::to_string(repairedTextureSlots));
+        std::cerr << "[streaming] repaired streamed material texture bindings: " << repairedTextureSlots << '\n';
+        sceneDocument_.markDirty(SceneUpdateKind::MaterialOnly);
+    }
+
     PrefabRuntimeBindings liveBindings;
+    const bool deferLiveStreamingGpuWork = job.state == ActiveProgressiveRuntimeLoadJob::State::Loading ||
+        job.state == ActiveProgressiveRuntimeLoadJob::State::Completing;
     for (const auto& [guid, handle] : result.textures) {
         if (handle.valid() && handle.index < remap.textures.size()) {
             const TextureAssetHandle liveHandle = remap.textures[handle.index];
             const TextureAsset* texture = assets_.texture(liveHandle);
+            if (deferLiveStreamingGpuWork) {
+                streamingRuntimeState_.setAssetState(guid, StreamingAssetState::CpuReadyTransient);
+                continue;
+            }
             const uint32_t mipCount = texture != nullptr
                 ? static_cast<uint32_t>(std::max(1, texture->mipLevels))
                 : 1u;
@@ -10361,6 +10535,10 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
     for (const auto& [guid, handle] : result.bindings.meshes) {
         if (handle.valid() && handle.index < remap.meshes.size()) {
             liveBindings.meshes[guid] = remap.meshes[handle.index];
+            if (deferLiveStreamingGpuWork) {
+                streamingRuntimeState_.setAssetState(guid, StreamingAssetState::CpuReadyTransient);
+                continue;
+            }
             streamingRuntimeState_.setAssetState(guid, StreamingAssetState::UploadQueued);
             const MeshAssetHandle liveHandle = remap.meshes[handle.index];
             const MeshAsset* mesh = assets_.mesh(liveHandle);
@@ -10383,7 +10561,8 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
                 const std::string debugName = "streaming mesh payload " + guid;
                 try {
                     meshPayloadBacked = nativeGpuAssetCache_.ensureBufferResource(
@@ -10476,6 +10655,10 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
     for (const auto& [guid, handle] : result.bindings.materials) {
         if (handle.valid() && handle.index < remap.materials.size()) {
             liveBindings.materials[guid] = remap.materials[handle.index];
+            if (deferLiveStreamingGpuWork) {
+                streamingRuntimeState_.setAssetState(guid, StreamingAssetState::CpuReadyTransient);
+                continue;
+            }
             streamingRuntimeState_.setAssetState(guid, StreamingAssetState::UploadQueued);
             const MaterialAssetHandle liveHandle = remap.materials[handle.index];
             const MaterialAsset* material = assets_.material(liveHandle);
@@ -10507,20 +10690,10 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
     job.loadedFiles += result.fileCount;
     job.loadedBytes += result.bytes;
     job.appliedBytes += result.bytes;
-    if (!result.ok) {
-        job.failed = true;
-        job.failedFiles += result.fileCount;
-        for (const std::string& error : result.errors) {
-            streamingRuntimeState_.pushEvent("streaming batch failed: " + error);
-        }
-        for (const std::string& error : result.ioErrors) {
-            streamingRuntimeState_.pushEvent("streaming batch failed: " + error);
-        }
-    }
 
     if (rebound > 0) {
         sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
-        (void)applyPendingSceneUpdate(!shouldDeferInteractiveTopologyRebuild(sceneDocument_, assets_));
+        (void)applyPendingSceneUpdate(false);
     }
 
     const bool complete = job.nextFile >= job.files.size();
@@ -10543,7 +10716,30 @@ void Application::applyProgressiveRuntimeLoadBatch(ProgressiveRuntimeLoadBatchRe
     });
 
     if (complete) {
+        job.state = ActiveProgressiveRuntimeLoadJob::State::Completing;
         streamingRuntimeState_.pushEvent("completed progressive runtime load for prefab " + job.rootGuid);
+        std::cerr << "[streaming] progressive load COMPLETE: loadedFiles=" << job.loadedFiles
+                  << "/" << job.files.size()
+                  << " failed=" << job.failedFiles
+                  << " bytes=" << job.loadedBytes << '\n';
+        std::cerr << "[streaming] triggering final deferred rebuild\n";
+        job.state = ActiveProgressiveRuntimeLoadJob::State::FinalRebuild;
+        sceneDocument_.markDirty(SceneUpdateKind::TopologyChanged);
+        const bool rebuilt = applyPendingSceneUpdate(true);
+        if (!rebuilt) {
+            streamingRuntimeState_.pushEvent("progressive runtime final renderer rebuild was not applied");
+            std::cerr << "[streaming] final deferred rebuild did not run\n";
+        }
+        streamingGpuSceneUpdateQueue_ = IncrementalGpuSceneUpdateQueue();
+        lastStreamingGpuSceneSnapshots_.clear();
+        streamingGpuWorkQueue_ = StreamingGpuWorkQueue();
+        streamingGpuWorkTimelineMarkers_.clear();
+        streamingGpuBufferUploadPayloads_.clear();
+        streamingGpuImageMipUploadPayloads_.clear();
+        streamingGpuBlasBuildPayloads_.clear();
+        streamingGpuBlasCompactionPayloads_.clear();
+        streamingGpuWorkCompletedTimeline_ = 0;
+        job.state = ActiveProgressiveRuntimeLoadJob::State::Done;
         notifications_.notify("Progressive runtime streaming complete", NotificationType::Success, NotificationAction::OpenContent, "Open Content", 5.0f);
         activeProgressiveRuntimeLoadJob_.reset();
         return;
@@ -10561,7 +10757,13 @@ void Application::pollProgressiveRuntimeLoadJob() {
     }
     if (job.cancelled) {
         if (job.future.valid()) {
-            job.future.wait();
+            try {
+                (void)job.future.get();
+            } catch (const std::exception& e) {
+                streamingRuntimeState_.pushEvent(std::string("streaming batch cancel consumed exception: ") + e.what());
+            } catch (...) {
+                streamingRuntimeState_.pushEvent("streaming batch cancel consumed unknown exception");
+            }
         }
         streamingRuntimeState_.setActiveRoot(StreamingRootSnapshot{
             .serial = job.serial,
@@ -13685,12 +13887,14 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 (void)applyRendererSettingsFromEditor(*requests.settings, false);
             }
         }
+        bool interactiveLightPreview = false;
         if (requests.previewEntityTransform.has_value()) {
             sceneUnsavedDirty_ = true;
             if (Entity* entity = sceneDocument_.registry().entity(requests.previewEntityTransform->entity)) {
                 entity->transform = requests.previewEntityTransform->transform;
                 entity->transform.dirty = true;
                 sceneDocument_.markDirty(requests.previewEntityTransform->updateKind);
+                interactiveLightPreview = requests.previewEntityTransform->updateKind == SceneUpdateKind::LightOnly;
             }
         }
         if (requests.previewEntityTransforms.has_value()) {
@@ -13700,6 +13904,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                     entity->transform.dirty = true;
                     sceneDocument_.markDirty(preview.updateKind);
                     sceneUnsavedDirty_ = true;
+                    interactiveLightPreview = interactiveLightPreview || preview.updateKind == SceneUpdateKind::LightOnly;
                 }
             }
         }
@@ -13710,7 +13915,7 @@ void Application::applyEditorRequests(const EditorRequests& requests, bool allow
                 sceneDocument_.markDirty(SceneUpdateKind::TransformOnly);
             }
         }
-        (void)applyPendingSceneUpdate(false);
+        (void)applyPendingSceneUpdate(false, interactiveLightPreview);
         if (requests.toggleDenoiser) {
             std::vector<LiveMainThreadApplyOperation> operations;
             operations.push_back(LiveMainThreadApplyOperation{
@@ -14844,7 +15049,8 @@ void Application::updateSunDrag(double mouseX, double mouseY) {
     sun->sun->azimuth = sunDrag_.azimuth;
     sun->sun->elevation = sunDrag_.elevation;
     sceneDocument_.markDirty(SceneUpdateKind::LightOnly);
-    (void)applyPendingSceneUpdate(false);
+    applySceneWorldComponentsToDocumentSettings(sceneDocument_);
+    applyRendererSettingsSafely(rendererSettingsFromDocument(sceneDocument_, pathTracer_->settings()), false);
 }
 
 void Application::finishSunDrag(bool cancel) {
@@ -14865,6 +15071,8 @@ void Application::finishSunDrag(bool cancel) {
             SceneOperations sceneOps(sceneDocument_, &sceneEventBus_);
             sceneOps.setUndoStack(&undoStack_);
             sceneOps.commitSunDrag(std::move(*sunDrag_.beforeDocument), SceneUpdateKind::LightOnly);
+            sceneUnsavedDirty_ = true;
+            sceneDocument_.clearDirty();
         }
     }
 
@@ -14934,7 +15142,7 @@ void Application::processSunDragControls(bool shortcutsBlocked, bool viewportHov
     }
 }
 
-bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
+bool Application::applyPendingSceneUpdate(bool allowResourceRebuild, bool interactiveLightPreview) {
     if (!pathTracer_ || !sceneDocument_.dirty()) {
         return false;
     }
@@ -14968,6 +15176,18 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
     if (route.actionMask == 0u) {
         sceneDocument_.clearDirty();
         return recordRouteAndReturn(true);
+    }
+    if (route.requiresRendererRebuild && activeProgressiveRuntimeLoadJob_.has_value()) {
+        const ActiveProgressiveRuntimeLoadJob& streamingJob = *activeProgressiveRuntimeLoadJob_;
+        if (streamingJob.state != ActiveProgressiveRuntimeLoadJob::State::FinalRebuild &&
+            streamingJob.state != ActiveProgressiveRuntimeLoadJob::State::Done) {
+            if (lastStreamingTopologyBlockLogSerial_ != streamingJob.serial) {
+                lastStreamingTopologyBlockLogSerial_ = streamingJob.serial;
+                std::cerr << "[streaming] topology rebuild blocked until progressive load completes (job "
+                          << streamingJob.serial << ")\n";
+            }
+            return recordRouteAndReturn(false, "+StreamingDeferred", "deferred_streaming");
+        }
     }
     if (!allowResourceRebuild &&
         route.requiresRendererRebuild) {
@@ -15008,11 +15228,23 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
         latestGpuSkinningSourceVertices_ = std::move(sceneBuild.gpuSkinningSourceVertices);
         latestGpuSkinningMorphDeltas_ = std::move(sceneBuild.gpuSkinningMorphDeltas);
         preparePathTracerForRendererReplacement(previousSettings);
+        const bool streamingFinalRebuild =
+            activeProgressiveRuntimeLoadJob_.has_value() &&
+            activeProgressiveRuntimeLoadJob_->state == ActiveProgressiveRuntimeLoadJob::State::FinalRebuild;
+        const uint32_t materialTextureMaxDimension = streamingFinalRebuild
+            ? streamingFinalRebuildMaterialTexturePreviewMaxDimension
+            : 0u;
+        if (materialTextureMaxDimension != 0u && gpuSceneAsset_.has_value() && !gpuSceneAsset_->textures.empty()) {
+            std::cerr << "[streaming] final rebuild using material texture preview cap: max_dim="
+                      << materialTextureMaxDimension
+                      << " textures=" << gpuSceneAsset_->textures.size() << '\n';
+        }
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
             currentSceneCachePathForRenderer(),
-            &replacementSettings);
+            &replacementSettings,
+            materialTextureMaxDimension);
         retirePathTracer(std::move(pathTracer_));
         pathTracer_ = std::move(nextPathTracer);
         applyActiveSceneCamera();
@@ -15111,7 +15343,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild) {
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::UpdateLights)) {
         syncBuiltScene();
         applyRendererSettingsSafely(ensureBuild().rendererSettings, allowResourceRebuild);
-        if (!pathTracer_->updateSceneLights(*gpuSceneAsset_)) {
+        if (!pathTracer_->updateSceneLights(*gpuSceneAsset_, !interactiveLightPreview)) {
             pathTracer_->resetAccumulation(route.resetReason);
         }
     }
@@ -15378,6 +15610,50 @@ void Application::stepEditorTicketProbeQueues() {
     editorTopologyRebuildCompletedTimeline_ = editorTopologyRebuildTickets_.nextTimelineValue() > 0 ? editorTopologyRebuildTickets_.nextTimelineValue() - 1ull : 0ull;
 }
 
+void Application::shutdownStreamingRuntime() {
+    std::cerr << "[shutdown] shutdownStreamingRuntime begin\n";
+
+    if (activeProgressiveRuntimeLoadJob_.has_value()) {
+        activeProgressiveRuntimeLoadJob_->cancelled = true;
+        if (activeProgressiveRuntimeLoadJob_->future.valid()) {
+            try {
+                ProgressiveRuntimeLoadBatchResult unused = activeProgressiveRuntimeLoadJob_->future.get();
+                std::cerr << "[shutdown] consumed batch result: ok=" << (unused.ok ? "yes" : "no")
+                          << " loadedFiles=" << unused.loadedFiles
+                          << " errors=" << unused.errors.size() << "\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[shutdown] future.get() exception: " << e.what() << "\n";
+            } catch (...) {
+                std::cerr << "[shutdown] future.get() unknown exception\n";
+            }
+        }
+        std::cerr << "[shutdown] progressive job cancelled: loaded="
+                  << activeProgressiveRuntimeLoadJob_->loadedFiles
+                  << "/" << activeProgressiveRuntimeLoadJob_->files.size()
+                  << " batchInFlight=" << (activeProgressiveRuntimeLoadJob_->batchInFlight ? "yes" : "no") << "\n";
+        activeProgressiveRuntimeLoadJob_.reset();
+    }
+
+    streamingGpuWorkQueue_ = StreamingGpuWorkQueue();
+    streamingGpuSceneUpdateQueue_ = IncrementalGpuSceneUpdateQueue();
+    lastStreamingGpuSceneSnapshots_.clear();
+    streamingGpuWorkTimelineMarkers_.clear();
+    streamingGpuBufferUploadPayloads_.clear();
+    streamingGpuImageMipUploadPayloads_.clear();
+    streamingGpuBlasBuildPayloads_.clear();
+    streamingGpuBlasCompactionPayloads_.clear();
+    streamingGpuWorkCompletedTimeline_ = 0;
+
+    if (streamingGpuTransferExecutorReady_) {
+        streamingGpuTransferExecutor_.shutdown();
+        streamingGpuTransferExecutorReady_ = false;
+    }
+
+    nativeGpuAssetCache_.clear();
+
+    std::cerr << "[shutdown] shutdownStreamingRuntime end\n";
+}
+
 void Application::stepStreamingGpuWorkQueue() {
     // Gate work-queue completion on real device-timeline progress when a live
     // transfer executor is available. The work queue remains the accounting
@@ -15522,6 +15798,10 @@ void Application::stepStreamingGpuWorkQueue() {
             }
             if (ticket.state == StreamingGpuWorkState::Cancelled || ticket.state == StreamingGpuWorkState::Failed) {
                 ownerFailed[ticket.ownerGuid] = true;
+                streamingGpuBufferUploadPayloads_.erase(ticket.id);
+                streamingGpuImageMipUploadPayloads_.erase(ticket.id);
+                streamingGpuBlasBuildPayloads_.erase(ticket.id);
+                streamingGpuBlasCompactionPayloads_.erase(ticket.id);
             }
         }
         for (const auto& [guid, complete] : ownerComplete) {
@@ -15722,6 +16002,15 @@ void Application::stepStreamingGpuWorkQueue() {
 }
 
 void Application::stepStreamingGpuSceneUpdateQueue() {
+    if (activeProgressiveRuntimeLoadJob_.has_value()) {
+        const ActiveProgressiveRuntimeLoadJob::State state = activeProgressiveRuntimeLoadJob_->state;
+        if (state != ActiveProgressiveRuntimeLoadJob::State::FinalRebuild &&
+            state != ActiveProgressiveRuntimeLoadJob::State::Done) {
+            lastStreamingGpuSceneApply_ = IncrementalGpuSceneApplyFrameResult{};
+            return;
+        }
+    }
+
     GpuSceneStreamingState gpuSceneStreaming;
     gpuSceneStreaming.rebuild(sceneDocument_, gpuInstanceEntities_, &nativeGpuAssetCache_);
     const GpuSceneStreamingUpdatePlan updatePlan = buildGpuSceneStreamingUpdatePlan(
@@ -15799,7 +16088,8 @@ void Application::stepStreamingGpuSceneUpdateQueue() {
             };
             bool rebuiltStreamingGpuScene = false;
             auto ensureStreamingGpuSceneAsset = [&]() {
-                if (!rebuiltStreamingGpuScene) {
+                if (!rebuiltStreamingGpuScene &&
+                    (!gpuSceneAsset_.has_value() || gpuSceneAsset_->meshes.empty())) {
                     rebuildGpuSceneAsset();
                     rebuiltStreamingGpuScene = true;
                 }
@@ -15820,15 +16110,6 @@ void Application::stepStreamingGpuSceneUpdateQueue() {
                         "patched streamed material descriptors: " +
                         std::to_string(lastStreamingGpuSceneApply_.appliedDescriptorPatches));
                 } else {
-                    for (uint64_t uuid : lastStreamingGpuSceneApply_.descriptorPatchEntityUuids) {
-                        (void)streamingGpuSceneUpdateQueue_.enqueue(IncrementalGpuSceneOperationDesc{
-                            .kind = IncrementalGpuSceneOperationKind::PatchDescriptors,
-                            .entityUuid = uuid,
-                            .meshGuid = meshGuidForEntityUuid(uuid),
-                            .label = "retry streamed descriptors " + std::to_string(uuid),
-                            .estimatedApplyMs = 0.04,
-                        });
-                    }
                     streamingRuntimeState_.pushEvent("streamed material descriptor patch could not be applied to the live renderer");
                 }
             }
@@ -15849,15 +16130,6 @@ void Application::stepStreamingGpuSceneUpdateQueue() {
                         "patched streamed TLAS visibility: " +
                         std::to_string(lastStreamingGpuSceneApply_.appliedTlasPatches));
                 } else {
-                    for (uint64_t uuid : lastStreamingGpuSceneApply_.tlasPatchEntityUuids) {
-                        (void)streamingGpuSceneUpdateQueue_.enqueue(IncrementalGpuSceneOperationDesc{
-                            .kind = IncrementalGpuSceneOperationKind::PatchTlas,
-                            .entityUuid = uuid,
-                            .meshGuid = meshGuidForEntityUuid(uuid),
-                            .label = "retry streamed TLAS patch " + std::to_string(uuid),
-                            .estimatedApplyMs = 0.08,
-                        });
-                    }
                     streamingRuntimeState_.pushEvent("streamed TLAS patch could not be applied to the live renderer");
                 }
             }
@@ -15948,7 +16220,8 @@ std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
     const SceneAsset* sceneAsset,
     const AssetManager* assets,
     std::optional<std::filesystem::path> sceneCachePath,
-    const RendererSettings* settingsToRestore) {
+    const RendererSettings* settingsToRestore,
+    uint32_t materialTextureMaxDimension) {
     const auto projectRoot = resolveProjectRoot();
     const auto shaderDir = projectRoot / "native" / "vulkan" / "shaders";
     const auto shaderOutDir = projectRoot / "native" / "vulkan" / "build" / "shaders";
@@ -15998,7 +16271,8 @@ std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
         std::move(sceneCachePath),
         !disableResourceAliasing_,
         skinningResourcePlan,
-        settingsToRestore);
+        settingsToRestore,
+        materialTextureMaxDimension);
     if (settingsToRestore != nullptr) {
         renderer->applySettings(*settingsToRestore);
     }

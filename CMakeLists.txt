@@ -100,6 +100,7 @@ add_executable(rtvulkan
     src/main.cpp
     src/rtv/AnimationClip.cpp
     src/rtv/AnimationController.cpp
+    src/rtv/AnimationStreamingManager.cpp
     src/rtv/Application.cpp
     src/rtv/AccelerationStructure.cpp
     src/rtv/AsyncSceneLoader.cpp
@@ -142,6 +143,7 @@ add_executable(rtvulkan
     src/rtv/FrameResources.cpp
     src/rtv/GltfLoader.cpp
     src/rtv/GpuDiagnosticsPanel.cpp
+    src/rtv/GeometryPagingManager.cpp
     src/rtv/GpuProfiler.cpp
     src/rtv/GpuScene.cpp
     src/rtv/GpuSceneStreamingState.cpp
@@ -151,6 +153,7 @@ add_executable(rtvulkan
     src/rtv/GraphicsPipeline.cpp
     src/rtv/HdrLoader.cpp
     src/rtv/HeadlessDiagnostics.cpp
+    src/rtv/HlodStreamingManager.cpp
     src/rtv/Image.cpp
     src/rtv/ImageBarrier.cpp
     src/rtv/InspectorPanel.cpp
@@ -158,6 +161,7 @@ add_executable(rtvulkan
     src/rtv/LightBvh.cpp
     src/rtv/MainThreadApplyTicket.cpp
     src/rtv/MaterialEditorPanel.cpp
+    src/rtv/MaterialStreamingManager.cpp
     src/rtv/MortonCodes.cpp
     src/rtv/NativeAssetMigration.cpp
     src/rtv/NativeAssetRuntimeLoader.cpp
@@ -175,6 +179,8 @@ add_executable(rtvulkan
     src/rtv/PipelineCache.cpp
     src/rtv/PipelineDemo.cpp
     src/rtv/Prefab.cpp
+    src/rtv/PreviewProxyManager.cpp
+    src/rtv/ProgressiveCookManager.cpp
     src/rtv/Project.cpp
     src/rtv/RenderSettingsPanel.cpp
     src/rtv/RenderGraph.cpp
@@ -205,6 +211,8 @@ add_executable(rtvulkan
     src/rtv/ShaderModule.cpp
     src/rtv/ShaderReflection.cpp
     src/rtv/StreamlineRuntime.cpp
+    src/rtv/StreamingAsyncComputeBudgeter.cpp
+    src/rtv/StreamingDebugOverlay.cpp
     src/rtv/StreamingGpuTransferExecutor.cpp
     src/rtv/StreamingGpuWorkQueue.cpp
     src/rtv/StreamingIoBackend.cpp
@@ -213,6 +221,7 @@ add_executable(rtvulkan
     src/rtv/StreamingStagingRing.cpp
     src/rtv/Swapchain.cpp
     src/rtv/TextureLoader.cpp
+    src/rtv/TextureStreamingManager.cpp
     src/rtv/TemporalSystem.cpp
     src/rtv/TopologyRebuildTicket.cpp
     src/rtv/UiOverlay.cpp

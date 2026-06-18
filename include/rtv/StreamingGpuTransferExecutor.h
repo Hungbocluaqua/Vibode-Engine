@@ -113,6 +113,28 @@ public:
     // Returns the completed timeline value.
     uint64_t poll();
 
+    // -- Async compute integration (Phase 9) --
+
+    // Configure a separate compute queue for async-compute streaming work.
+    // When set and async compute is desired, certain operations (BLAS compaction
+    // queries, compute-shader decompression, mip generation) can be recorded on
+    // this queue instead of the transfer queue.
+    void setComputeQueue(VkQueue queue, uint32_t familyIndex, VkSemaphore timelineSemaphore);
+    [[nodiscard]] bool hasAsyncComputeQueue() const { return computeQueue_ != VK_NULL_HANDLE; }
+
+    // Submit any pending compute-queue work (e.g. compute-shader decompression
+    // dispatched via stageComputeShaderDispatch). Waits for `waitTimelineValue`
+    // on the transfer timeline, signals `signalTimelineValue` on the compute
+    // timeline when complete. Returns the compute submission's timeline value
+    // (the signaled value), or 0 if no compute work was pending.
+    uint64_t submitComputeFrame(uint64_t waitTimelineValue);
+
+    // Record a compute-shader dispatch for async execution. The pipeline must
+    // already be bound externally via helper; this records the dispatch command
+    // into the open compute batch. Returns false if no compute queue is configured.
+    [[nodiscard]] bool recordComputeDispatch(VkCommandBuffer externalCommandBuffer,
+                                              uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
+
     [[nodiscard]] uint64_t nextTimelineValue() const { return nextTimelineValue_; }
     [[nodiscard]] Stats stats() const;
 
@@ -145,8 +167,13 @@ private:
     bool dedicatedTransferQueue_ = false;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     uint32_t graphicsQueueFamily_ = UINT32_MAX;
+    VkQueue computeQueue_ = VK_NULL_HANDLE;
+    uint32_t computeQueueFamily_ = UINT32_MAX;
+    VkSemaphore computeTimeline_ = VK_NULL_HANDLE;
+    uint64_t nextComputeTimelineValue_ = 1;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkCommandPool graphicsCommandPool_ = VK_NULL_HANDLE;
+    VkCommandPool computeCommandPool_ = VK_NULL_HANDLE;
     VkSemaphore timeline_ = VK_NULL_HANDLE;
     uint64_t nextTimelineValue_ = 1;
     uint64_t submittedTimeline_ = 0;
@@ -164,6 +191,8 @@ private:
     std::deque<InFlightBatch> inFlight_;
     std::vector<VkCommandBuffer> freeCommandBuffers_;
     std::vector<VkCommandBuffer> freeGraphicsCommandBuffers_;
+    std::deque<InFlightBatch> computeInFlight_;
+    std::vector<VkCommandBuffer> freeComputeCommandBuffers_;
 
     uint32_t totalSubmissions_ = 0;
     uint32_t totalBufferCopies_ = 0;

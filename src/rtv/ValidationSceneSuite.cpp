@@ -7,7 +7,7 @@ namespace rtv {
 
 namespace {
 
-constexpr std::array<ValidationSceneDescriptor, 5> kValidationScenes{{
+constexpr std::array<ValidationSceneDescriptor, 7> kValidationScenes{{
     {
         "Transform Stress",
         "AS refit",
@@ -42,6 +42,20 @@ constexpr std::array<ValidationSceneDescriptor, 5> kValidationScenes{{
         "Horizon, sun elevation, exposure transitions, and aerial perspective bring-up.",
         "scenes/validation/atmosphere_validation.rtlevel",
         "pending-reference-atmosphere-validation",
+    },
+    {
+        "ReSTIR Streaming Stability",
+        "Streaming/ReSTIR",
+        "ReSTIR DI light candidate updates and ReSTIR GI reservoir invalidation during streaming geometry placement.",
+        "scenes/validation/restir_streaming_stability.rtlevel",
+        "pending-reference-restir-streaming-stability",
+    },
+    {
+        "Streaming Reset Mask",
+        "Streaming/Temporal",
+        "Temporal/denoiser/ReSTIR reset mask correctness when streaming instances transition pending-to-resident.",
+        "scenes/validation/streaming_reset_mask.rtlevel",
+        "pending-reference-streaming-reset-mask",
     },
 }};
 

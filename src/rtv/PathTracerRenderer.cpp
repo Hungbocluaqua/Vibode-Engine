@@ -819,7 +819,8 @@ PathTracerRenderer::PathTracerRenderer(
     std::optional<std::filesystem::path> sceneCachePath,
     bool resourceAliasingEnabled,
     GpuSkinningResourcePlan gpuSkinningResourcePlan,
-    const RendererSettings* initialSettings)
+    const RendererSettings* initialSettings,
+    uint32_t materialTextureMaxDimension)
     : context_(context),
       allocator_(allocator),
       uploader_(uploader),
@@ -832,7 +833,8 @@ PathTracerRenderer::PathTracerRenderer(
           std::move(sceneCachePath),
           initialSettings != nullptr
               ? initialSettings->opacityMicromapSubdivisionLevel
-              : kDefaultOpacityMicromapSubdivisionLevel),
+              : kDefaultOpacityMicromapSubdivisionLevel,
+          materialTextureMaxDimension),
       gpuSkinningResourcePlan_(std::move(gpuSkinningResourcePlan)),
       resourceAliasingEnabled_(resourceAliasingEnabled) {
     temporalSystem_ = std::make_unique<TemporalSystem>();
@@ -3369,9 +3371,9 @@ bool PathTracerRenderer::updateMaterials(const SceneAsset& scene, const AssetMan
     return updated;
 }
 
-bool PathTracerRenderer::updateSceneLights(const SceneAsset& scene) {
+bool PathTracerRenderer::updateSceneLights(const SceneAsset& scene, bool rebuildLightBvh) {
     const uint64_t retireFrame = temporalFrameIndex_ + static_cast<uint32_t>(std::max<size_t>(frames_.size(), 1)) + 1u;
-    const bool updated = scene_.updateSceneLights(uploader_, scene, retireFrame);
+    const bool updated = scene_.updateSceneLights(uploader_, scene, retireFrame, false, rebuildLightBvh);
     if (updated) {
         resetAccumulation(AccumulationResetReason::LightingChanged);
     }

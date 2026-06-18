@@ -2,6 +2,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -149,6 +150,12 @@ public:
     [[nodiscard]] StreamingGpuWorkPressureStats pressureStats() const;
 
 private:
+    enum class OwnerDependencyState : uint8_t {
+        Ready,
+        Waiting,
+        Failed,
+    };
+
     struct Ticket {
         uint64_t id = 0;
         StreamingGpuWorkDesc desc{};
@@ -158,6 +165,7 @@ private:
     };
 
     [[nodiscard]] bool canSubmit(const Ticket& ticket, const StreamingGpuWorkBudget& budget, const StreamingGpuWorkFrameResult& frame, StreamingGpuWorkFrameResult& exhausted) const;
+    [[nodiscard]] OwnerDependencyState ownerDependencyState(std::size_t ticketIndex) const;
     [[nodiscard]] bool usesStaging(const Ticket& ticket) const;
     [[nodiscard]] uint64_t retainedStagingBytes() const;
     void recordPressure(const StreamingGpuWorkFrameResult& frame);

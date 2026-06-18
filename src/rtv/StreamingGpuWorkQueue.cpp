@@ -95,8 +95,18 @@ uint64_t StreamingGpuWorkQueue::enqueue(StreamingGpuWorkDesc desc) {
 StreamingGpuWorkFrameResult StreamingGpuWorkQueue::submitFrame(const StreamingGpuWorkBudget& budget) {
     StreamingGpuWorkFrameResult result;
     result.frameIndex = frameIndex_++;
-    for (Ticket& ticket : tickets_) {
+    for (std::size_t ticketIndex = 0; ticketIndex < tickets_.size(); ++ticketIndex) {
+        Ticket& ticket = tickets_[ticketIndex];
         if (ticket.state != StreamingGpuWorkState::Queued) {
+            continue;
+        }
+        const OwnerDependencyState dependency = ownerDependencyState(ticketIndex);
+        if (dependency == OwnerDependencyState::Failed) {
+            ticket.state = StreamingGpuWorkState::Failed;
+            ticket.retainedStagingBytes = 0;
+            continue;
+        }
+        if (dependency == OwnerDependencyState::Waiting) {
             continue;
         }
         StreamingGpuWorkFrameResult exhausted;
@@ -291,6 +301,30 @@ bool StreamingGpuWorkQueue::canSubmit(
         return false;
     }
     return true;
+}
+
+StreamingGpuWorkQueue::OwnerDependencyState StreamingGpuWorkQueue::ownerDependencyState(std::size_t ticketIndex) const {
+    if (ticketIndex >= tickets_.size()) {
+        return OwnerDependencyState::Failed;
+    }
+    const Ticket& ticket = tickets_[ticketIndex];
+    if (ticket.desc.ownerGuid.empty()) {
+        return OwnerDependencyState::Ready;
+    }
+    for (std::size_t priorIndex = 0; priorIndex < ticketIndex; ++priorIndex) {
+        const Ticket& prior = tickets_[priorIndex];
+        if (prior.desc.ownerGuid != ticket.desc.ownerGuid) {
+            continue;
+        }
+        if (prior.state == StreamingGpuWorkState::Failed ||
+            prior.state == StreamingGpuWorkState::Cancelled) {
+            return OwnerDependencyState::Failed;
+        }
+        if (prior.state != StreamingGpuWorkState::Complete) {
+            return OwnerDependencyState::Waiting;
+        }
+    }
+    return OwnerDependencyState::Ready;
 }
 
 bool StreamingGpuWorkQueue::usesStaging(const Ticket& ticket) const {

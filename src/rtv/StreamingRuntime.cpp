@@ -141,7 +141,7 @@ bool applyStreamingBudgetPreset(std::string_view preset, StreamingRuntimeOptions
         return false;
     }
     options.budgetBytes = options.gpuMemoryBudgetBytes;
-    options.cpuBatchBytes = std::max<uint64_t>(16ull * kMiB, options.cpuMemoryBudgetBytes / 2ull);
+    options.cpuBatchBytes = std::max<uint64_t>(16ull * kMiB, std::min<uint64_t>(options.cpuMemoryBudgetBytes / 2ull, 128ull * kMiB));
     return true;
 }
 
@@ -158,6 +158,10 @@ nlohmann::json streamingRuntimeOptionsToJson(const StreamingRuntimeOptions& opti
         {"directstorage_enabled", options.directStorageEnabled},
         {"force_cpu_decompress", options.forceCpuDecompress},
         {"eviction_enabled", options.evictionEnabled},
+        {"async_compute_streaming_enabled", options.asyncComputeStreamingEnabled},
+        {"async_compute_frame_budget_us", options.asyncComputeFrameBudgetUs},
+        {"async_compute_min_streaming_headroom_us", options.asyncComputeMinStreamingHeadroomUs},
+        {"validate_async_compute_parity", options.validateAsyncComputeParity},
     };
 }
 

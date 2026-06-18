@@ -31,7 +31,13 @@ CommandSystem::CommandSystem(const VulkanContext& context, Swapchain& swapchain,
 }
 
 CommandSystem::~CommandSystem() {
-    waitIdle();
+    try {
+        waitIdle();
+    } catch (const std::exception& e) {
+        std::cerr << "[shutdown] CommandSystem::~CommandSystem waitIdle exception: " << e.what() << " — continuing teardown\n";
+    } catch (...) {
+        std::cerr << "[shutdown] CommandSystem::~CommandSystem waitIdle unknown exception — continuing teardown\n";
+    }
     destroyPresentSemaphores();
     destroyFrameResources();
 }

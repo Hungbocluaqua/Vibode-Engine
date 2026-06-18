@@ -203,7 +203,8 @@ public:
         const AssetManager* assets = nullptr,
         std::optional<std::filesystem::path> environmentPath = std::nullopt,
         std::optional<std::filesystem::path> sceneCachePath = std::nullopt,
-        uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel);
+        uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel,
+        uint32_t materialTextureMaxDimension = 0);
     ~GpuScene();
 
     [[nodiscard]] Buffer& vertices() { return *vertices_; }
@@ -266,7 +267,12 @@ public:
     void releaseRetiredMaterialSamplers(uint64_t completedFrame);
     void loadEnvironment(BufferUploader& uploader, const std::filesystem::path& path, uint64_t retireFrame);
     bool updateImportedMaterials(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
-    bool updateSceneLights(BufferUploader& uploader, const SceneAsset& scene, uint64_t retireFrame);
+    bool updateSceneLights(
+        BufferUploader& uploader,
+        const SceneAsset& scene,
+        uint64_t retireFrame,
+        bool logLightBvhStats = true,
+        bool rebuildLightBvh = true);
     bool updateInstanceTransforms(BufferUploader& uploader, const SceneAsset& scene, const AssetManager& assets, uint64_t retireFrame);
 
 private:
@@ -288,8 +294,14 @@ private:
     void createEnvironment(BufferUploader& uploader);
     void uploadEnvironmentParams();
     bool rebuildEmissiveLightRecords(const SceneAsset& scene, float& emissiveTotalWeight);
-    void uploadLightRecords(BufferUploader& uploader, std::vector<GpuLightRecord> lightRecords, float totalWeight, uint64_t retireFrame = 0);
-    void uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords, uint64_t retireFrame = 0);
+    void uploadLightRecords(
+        BufferUploader& uploader,
+        std::vector<GpuLightRecord> lightRecords,
+        float totalWeight,
+        uint64_t retireFrame = 0,
+        bool logLightBvhStats = true,
+        bool rebuildLightBvh = true);
+    void uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLightRecord>& lightRecords, uint64_t retireFrame = 0, bool logStats = true);
     void destroyMaterialTextureSamplers();
     void retireMaterialTextureSampler(VkSampler sampler, uint64_t retireFrame);
     void retireBuffer(std::unique_ptr<Buffer> buffer, uint64_t retireFrame);
@@ -303,6 +315,7 @@ private:
     std::optional<std::filesystem::path> environmentPath_;
     std::optional<std::filesystem::path> sceneCachePath_;
     uint32_t opacityMicromapSubdivisionLevel_ = kDefaultOpacityMicromapSubdivisionLevel;
+    uint32_t materialTextureMaxDimension_ = 0;
     std::unique_ptr<Buffer> vertices_;
     std::unique_ptr<Buffer> indices_;
     std::unique_ptr<Buffer> bvhNodes_;

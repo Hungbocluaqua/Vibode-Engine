@@ -165,6 +165,11 @@ class NativeGpuAssetCache {
 public:
     ~NativeGpuAssetCache();
 
+    // Release all cached GPU resources (buffers, images, acceleration structures,
+    // scratch buffers). Must be called before the Vulkan device/allocator is
+    // destroyed. After calling clear(), the cache is empty and safe to destroy.
+    void clear();
+
     void upsert(NativeGpuAssetDesc desc);
     [[nodiscard]] bool addRef(const AssetGuid& guid);
     [[nodiscard]] bool release(const AssetGuid& guid);

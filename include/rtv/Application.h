@@ -19,10 +19,19 @@
 #include "rtv/NotificationManager.h"
 #include "rtv/Prefab.h"
 #include "rtv/NativeGpuAssetCache.h"
+#include "rtv/AnimationStreamingManager.h"
+#include "rtv/GeometryPagingManager.h"
+#include "rtv/HlodStreamingManager.h"
+#include "rtv/MaterialStreamingManager.h"
+#include "rtv/PreviewProxyManager.h"
+#include "rtv/ProgressiveCookManager.h"
 #include "rtv/StreamingGpuTransferExecutor.h"
 #include "rtv/StreamingGpuWorkQueue.h"
 #include "rtv/StreamingIoBackend.h"
+#include "rtv/StreamingAsyncComputeBudgeter.h"
+#include "rtv/StreamingDebugOverlay.h"
 #include "rtv/StreamingRuntime.h"
+#include "rtv/TextureStreamingManager.h"
 #include "rtv/UndoStack.h"
 #include "rtv/HeadlessDiagnostics.h"
 
@@ -369,14 +378,22 @@ private:
         std::future<EditorNativeFileMigrationJobResult> future;
     };
 
+    struct StreamedMaterialTextureBinding {
+        uint32_t slot = 0;
+        AssetGuid textureGuid;
+    };
+
     struct ProgressiveRuntimeLoadBatchResult {
         uint64_t serial = 0;
         uint32_t firstFile = 0;
         uint32_t fileCount = 0;
+        uint32_t loadedFiles = 0;
         uint64_t bytes = 0;
+        double elapsedMs = 0.0;
         AssetManager assets;
         PrefabRuntimeBindings bindings;
         std::unordered_map<AssetGuid, TextureAssetHandle> textures;
+        std::unordered_map<AssetGuid, std::vector<StreamedMaterialTextureBinding>> materialTextureBindings;
         std::vector<std::filesystem::path> files;
         std::vector<std::string> errors;
         StreamingIoMetrics ioMetrics{};
@@ -385,7 +402,15 @@ private:
     };
 
     struct ActiveProgressiveRuntimeLoadJob {
+        enum class State : uint8_t {
+            Loading,       // Batches in progress — all topology rebuilds blocked.
+            Completing,    // Last batch applied — about to trigger final rebuild.
+            FinalRebuild,  // Final rebuild in flight — bypass guard for this one call.
+            Done,          // Streaming complete — guard removed.
+        };
+
         uint64_t serial = 0;
+        State state = State::Loading;
         AssetGuid rootGuid;
         EntityId rootEntity{};
         std::string label;
@@ -400,6 +425,7 @@ private:
         uint32_t loadedFiles = 0;
         uint32_t failedFiles = 0;
         uint32_t reboundRenderers = 0;
+        std::unordered_map<AssetGuid, std::vector<StreamedMaterialTextureBinding>> materialTextureBindings;
         bool cancelled = false;
         bool failed = false;
         bool batchInFlight = false;
@@ -559,11 +585,13 @@ private:
     void waitForAssetImportWorker();
     [[nodiscard]] bool applyCompletedAssetImport(AsyncAssetImportJob&& job, StagedAssetImportResult&& result);
     [[nodiscard]] bool mergeSceneIntoCurrent(const std::filesystem::path& path, bool allowResourceRebuild);
-    bool applyPendingSceneUpdate(bool allowResourceRebuild);
+    bool applyPendingSceneUpdate(bool allowResourceRebuild, bool interactiveLightPreview = false);
     void applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange);
     void reloadShadersFromEditor();
     void initializeEditorTicketProbeQueues();
     void stepEditorTicketProbeQueues();
+    void configureStreamingAsyncComputeBudgeter();
+    void shutdownStreamingRuntime();
     void stepStreamingGpuWorkQueue();
     void stepStreamingGpuSceneUpdateQueue();
     void startEditorRenderJob(EditorRenderJobKind kind, const std::filesystem::path& renderOutputRoot, const EditorRenderRequest* request = nullptr);
@@ -581,7 +609,8 @@ private:
         const SceneAsset* sceneAsset,
         const AssetManager* assets,
         std::optional<std::filesystem::path> sceneCachePath,
-        const RendererSettings* settingsToRestore);
+        const RendererSettings* settingsToRestore,
+        uint32_t materialTextureMaxDimension = 0);
     void createPathTracer(const RendererSettings* settingsToRestore = nullptr);
     void applyActiveSceneCamera();
     void syncActiveSceneCameraFromController();
@@ -635,6 +664,15 @@ private:
     NativeGpuAssetEvictionResult lastStreamingEviction_{};
     StreamingGpuWorkQueue streamingGpuWorkQueue_;
     StreamingGpuTransferExecutor streamingGpuTransferExecutor_;
+    StreamingAsyncComputeBudgeter streamingAsyncComputeBudgeter_;
+    AnimationStreamingManager animationStreamingManager_;
+    GeometryPagingManager geometryPagingManager_;
+    HlodStreamingManager hlodStreamingManager_;
+    PreviewProxyManager previewProxyManager_;
+    ProgressiveCookManager progressiveCookManager_;
+    StreamingDebugOverlay streamingDebugOverlay_;
+    MaterialStreamingManager materialStreamingManager_;
+    TextureStreamingManager textureStreamingManager_;
     bool streamingGpuTransferExecutorReady_ = false;
     bool streamingGpuTransferExecutorInitAttempted_ = false;
     bool streamingGpuMarkerOnlyCompletionEventEmitted_ = false;
@@ -731,6 +769,7 @@ private:
     std::optional<ActiveNativeFileMigrationJob> activeNativeFileMigrationJob_{};
     std::optional<ActiveProgressiveRuntimeLoadJob> activeProgressiveRuntimeLoadJob_{};
     uint64_t nextProgressiveRuntimeLoadJobSerial_ = 1;
+    uint64_t lastStreamingTopologyBlockLogSerial_ = 0;
     std::deque<EditorNativeFileMigrationJobRequest> pendingNativeFileMigrationJobs_;
     uint64_t frameWorkProbeJobId_ = 0;
     bool frameWorkProbeCompletionPending_ = false;

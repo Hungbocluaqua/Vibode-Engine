@@ -12,7 +12,15 @@
 
 namespace rtv {
 
-NativeGpuAssetCache::~NativeGpuAssetCache() = default;
+NativeGpuAssetCache::~NativeGpuAssetCache() {
+    clear();
+}
+
+void NativeGpuAssetCache::clear() {
+    entries_.clear();
+    retiredResources_.clear();
+    frameCounter_ = 1;
+}
 
 const char* nativeGpuAssetKindName(NativeGpuAssetKind kind) {
     switch (kind) {
