@@ -3431,10 +3431,18 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
             {"Lightweight Sponza", "Scene-loading coverage", std::filesystem::path("Samples/LightweightSponza/LightweightSponza.vproject"), std::filesystem::path("Sponza/glTF/Sponza.gltf"), true},
             {"Cinematic Lighting", "Close camera lighting check", std::filesystem::path("Samples/CinematicLighting/CinematicLighting.vproject"), std::filesystem::path("scenes/validation/closeup_cornell.rtlevel"), false},
         };
+        bool anySampleAvailable = false;
         for (int i = 0; i < 3; ++i) {
             const SampleProjectCard& sample = samples[i];
             const bool projectAvailable = std::filesystem::exists(sample.projectFile);
             const bool sceneAvailable = std::filesystem::exists(sample.scenePath);
+            if (!projectAvailable && !sceneAvailable) {
+                continue;
+            }
+            if (anySampleAvailable) {
+                ImGui::SameLine();
+            }
+            anySampleAvailable = true;
             ImGui::PushID(i);
             ImGui::BeginGroup();
             if (projectManagerCard(
@@ -3443,15 +3451,12 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
                     false,
                     ImVec2(EditorUiMetric::projectCardWidth, EditorUiMetric::projectCardHeight),
                     sample.importAsScene ? EditorGlyphIcon::Model : EditorGlyphIcon::SceneFile,
-                    projectAvailable ? "Project" : sceneAvailable ? "Scene" : "Missing")) {
+                    projectAvailable ? "Project" : "Scene")) {
                 if (projectAvailable) {
                     requests.openProject = OpenProjectRequest{sample.projectFile};
                 } else if (sceneAvailable) {
                     queueSampleProjectOpen(sample.scenePath, sample.importAsScene, requests);
                 }
-            }
-            if (!projectAvailable && !sceneAvailable) {
-                ImGui::BeginDisabled();
             }
             if (ImGui::SmallButton(projectAvailable ? "Open Project" : sample.importAsScene ? "Import Scene" : "Open Scene")) {
                 if (projectAvailable) {
@@ -3460,14 +3465,8 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
                     queueSampleProjectOpen(sample.scenePath, sample.importAsScene, requests);
                 }
             }
-            if (!projectAvailable && !sceneAvailable) {
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                ImGui::TextDisabled("Not found");
-            } else {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", projectAvailable ? sample.projectFile.filename().string().c_str() : sample.scenePath.filename().string().c_str());
-            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", projectAvailable ? sample.projectFile.filename().string().c_str() : sample.scenePath.filename().string().c_str());
             if (projectAvailable && sceneAvailable) {
                 if (sample.importAsScene) {
                     if (ImGui::SmallButton("Import Asset Scene")) {
@@ -3481,9 +3480,9 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
             }
             ImGui::EndGroup();
             ImGui::PopID();
-            if (i != 2) {
-                ImGui::SameLine();
-            }
+        }
+        if (!anySampleAvailable) {
+            ImGui::TextDisabled("No local sample projects installed.");
         }
     } else {
         ImGui::SeparatorText("Open Project");

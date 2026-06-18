@@ -11644,7 +11644,11 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                     {"parent", node.parent},
                     {"transform", transformJsonFromMatrix(node.transform)},
                     {"matrix", matrixJson(node.transform)},
+#if RTV_ENABLE_ASSIMP_IMPORTER && RTV_ASSIMP_IMPORTER_AVAILABLE
                     {"geometricTransform", fbxTransformDiagnostics(nullptr, node.transform)},
+#else
+                    {"geometricTransform", nlohmann::json::object()},
+#endif
                     {"visible", node.visible},
                     {"visibleToCamera", node.visibleToCamera},
                     {"castShadow", node.castShadow},
@@ -12854,6 +12858,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                 }
             }
             const nlohmann::json meshReports = usdRuntimeMeshes.diagnostics.value("meshes", nlohmann::json::array());
+#if RTV_ENABLE_OPENUSD_IMPORTER && RTV_OPENUSD_IMPORTER_AVAILABLE
             if (meshReports.is_array()) {
                 for (const nlohmann::json& meshReport : meshReports) {
                     if (!meshReport.is_object()) {
@@ -12895,6 +12900,7 @@ StagedAssetImportResult stagePlaceholderAssetImport(
                         values);
                 }
             }
+#endif
             if (!meshPointChannels.empty()) {
                 if (usdAnimations.empty()) {
                     usdAnimations.push_back({

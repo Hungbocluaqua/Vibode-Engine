@@ -19,10 +19,7 @@ find_package(TIFF REQUIRED)
 find_path(TINYGLTF_INCLUDE_DIRS "tiny_gltf.h")
 
 option(RTV_ENABLE_TINYOBJ_IMPORTER "Enable OBJ/MTL runtime importer through tinyobjloader when available" OFF)
-find_path(TINYOBJLOADER_INCLUDE_DIRS "tiny_obj_loader.h"
-    HINTS
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyobjloader"
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyobjloader/include")
+find_path(TINYOBJLOADER_INCLUDE_DIRS "tiny_obj_loader.h")
 set(RTV_TINYOBJ_IMPORTER_AVAILABLE OFF)
 if(TINYOBJLOADER_INCLUDE_DIRS)
     set(RTV_TINYOBJ_IMPORTER_AVAILABLE ON)
@@ -62,13 +59,7 @@ set(RENDERDOC_SDK_DIR "" CACHE PATH "Path to RenderDoc SDK directory")
 set(NRD_SDK_DIR "" CACHE PATH "Path to NVIDIA Real-Time Denoisers SDK/source checkout")
 set(DLSS_SDK_DIR "" CACHE PATH "Path to NVIDIA DLSS/NGX SDK directory")
 set(STREAMLINE_SDK_DIR "" CACHE PATH "Path to NVIDIA Streamline SDK/release directory")
-if(STREAMLINE_SDK_DIR STREQUAL "" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Streamline/include/sl.h")
-    set(STREAMLINE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Streamline" CACHE PATH "Path to NVIDIA Streamline SDK/release directory" FORCE)
-endif()
 set(DIRECTSTORAGE_SDK_DIR "" CACHE PATH "Path to Microsoft DirectStorage SDK package root")
-if(DIRECTSTORAGE_SDK_DIR STREQUAL "" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectStorage/Microsoft.Direct3D.DirectStorage.1.4.0-preview1-2603.504/native/include/dstorage.h")
-    set(DIRECTSTORAGE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectStorage/Microsoft.Direct3D.DirectStorage.1.4.0-preview1-2603.504" CACHE PATH "Path to Microsoft DirectStorage SDK package root" FORCE)
-endif()
 
 if(NOT DEFINED ENV{VULKAN_SDK})
     message(FATAL_ERROR "VULKAN_SDK is not set. Install the Vulkan SDK and open a new terminal.")
