@@ -1,0 +1,231 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+#define RTV_RESTIR_DI_ENABLE_RAY_QUERY 1
+layout(set = 0, binding = 33) uniform accelerationStructureEXT topLevelAS;
+#include "restir_di_common.glsl"
+#include "restir_gi_common.glsl"
+#include "restir_gi_prod_packing.glsl"
+#include "restir_gi_reconnection.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer TemporalReservoirs { ProdRestirGiReservoir temporal_reservoirs[]; };
+layout(set = 0, binding = 1, std430) buffer SpatialReservoirs { ProdRestirGiReservoir spatial_reservoirs[]; };
+layout(set = 0, binding = 2, std430) readonly buffer ReceiverBuffer { RestirGiReceiver receivers[]; };
+layout(set = 0, binding = 3, std430) buffer RestirGiCounterBuffer { uint restir_gi_counters[]; };
+layout(set = 0, binding = 4, std430) readonly buffer ActiveTileMask { uint active_tile_mask[]; };
+const uint GI_COUNTER_SPATIAL_PIXELS = 10u;
+const uint GI_COUNTER_SPATIAL_NEIGHBORS_TESTED = 11u;
+const uint GI_COUNTER_SPATIAL_ACCEPTED = 12u;
+const uint GI_COUNTER_SPATIAL_REJECT_INVALID = 13u;
+const uint GI_COUNTER_SPATIAL_REJECT_SURFACE = 14u;
+const uint GI_COUNTER_SPATIAL_REJECT_TARGET = 15u;
+const uint GI_COUNTER_SPATIAL_SELECTED_NEIGHBOR = 16u;
+const uint GI_COUNTER_SPATIAL_CLAMP = 27u;
+const uint GI_COUNTER_PATH_SPATIAL_REJECT_PATH_CLASS = 36u;
+const uint GI_COUNTER_PATH_SPATIAL_CENTER_CURRENT_ONLY = 37u;
+const uint GI_COUNTER_VISIBILITY_RAYS = 42u;
+const uint GI_COUNTER_VISIBILITY_UNKNOWN = 43u;
+const uint GI_COUNTER_VERSION_REJECT = 44u;
+const uint GI_COUNTER_NON_FINITE = 45u;
+
+layout(push_constant, std430) uniform PushConstants {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint enabled;
+    uint spatialRounds;
+    uint halfResolution;
+    uint visibilityRayBudget;
+    float spatialRadius;
+    float depthThresholdScale;
+    float compatibilityThreshold;
+    float rawOutputIsCurrentSample;
+    vec4 cameraPosition;
+} pc;
+
+#define GI_COUNTER_ADD(counter, value) (((pc.enabled & 4u) != 0u) ? atomicAdd(counter, value) : 0u)
+#define GI_ACTIVE_TILE_MASK_ENABLED ((pc.enabled & 8u) != 0u)
+
+const uint GI_ACTIVE_TILE_SIZE = 16u;
+
+bool active_tile_contains(ivec2 fullPixel) {
+    if (!GI_ACTIVE_TILE_MASK_ENABLED) return true;
+    uint tileColumns = (pc.width + GI_ACTIVE_TILE_SIZE - 1u) / GI_ACTIVE_TILE_SIZE;
+    uint tileIndex = uint(fullPixel.y) / GI_ACTIVE_TILE_SIZE * tileColumns +
+        uint(fullPixel.x) / GI_ACTIVE_TILE_SIZE;
+    return active_tile_mask[tileIndex] != 0u;
+}
+
+float rng01(uint index, uint dimension) {
+    uint h = restir_gi_hash_u32(index ^ (pc.frameIndex * 0x9e3779b9u) ^ (dimension * 0x85ebca6bu));
+    return float(h & 0x00ffffffu) / 16777216.0;
+}
+
+ivec2 representative_full_pixel(ivec2 reusePixel) {
+    ivec2 phase = ivec2(int(pc.frameIndex & 1u), int((pc.frameIndex >> 1u) & 1u));
+    return pc.halfResolution != 0u
+        ? min(reusePixel * 2 + phase, ivec2(int(pc.width) - 1, int(pc.height) - 1))
+        : reusePixel;
+}
+
+bool receivers_compatible(RestirGiReceiver center, RestirGiReceiver neighbor) {
+    if (!restir_gi_receiver_valid_for_reuse(center) || !restir_gi_receiver_valid_for_reuse(neighbor)) return false;
+    float normalDot = dot(restir_gi_receiver_normal(center), restir_gi_receiver_normal(neighbor));
+    if (normalDot < 1.0 - pc.compatibilityThreshold) return false;
+    float depthScale = max(abs(restir_gi_receiver_depth(center)), 1.0e-3);
+    return abs(restir_gi_receiver_depth(center) - restir_gi_receiver_depth(neighbor)) <=
+        pc.depthThresholdScale * depthScale;
+}
+
+bool trace_visibility(RestirGiReceiver receiver, ProdRestirGiReservoir reservoir) {
+    bool environment = prod_unpack_path_class(reservoir) == PROD_PATH_CLASS_ENVIRONMENT_REUSABLE;
+    vec3 origin = restir_gi_receiver_position(receiver);
+    vec3 direction;
+    float tMax;
+    if (environment) {
+        direction = normalize(reservoir.x2PositionDistance.xyz);
+        tMax = 10000.0;
+    } else {
+        vec3 delta = reservoir.x2PositionDistance.xyz - origin;
+        tMax = length(delta);
+        if (tMax <= 1.0e-3) return false;
+        direction = delta / tMax;
+    }
+    float bias = max(1.0e-4, 1.0e-4 * min(tMax, 100.0));
+    uint visibility = restir_di_ray_query_visible(
+        origin + restir_gi_receiver_geometry_normal(receiver) * bias,
+        direction,
+        max(tMax - 2.0 * bias, bias),
+        0u);
+    GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_VISIBILITY_RAYS], 1u);
+    return visibility == RESTIR_DI_VISIBILITY_VISIBLE;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    uint outWidth = pc.halfResolution != 0u ? (pc.width + 1u) / 2u : pc.width;
+    uint outHeight = pc.halfResolution != 0u ? (pc.height + 1u) / 2u : pc.height;
+    if (pixel.x >= int(outWidth) || pixel.y >= int(outHeight)) return;
+    uint pixelIndex = uint(pixel.y) * outWidth + uint(pixel.x);
+    if (!active_tile_contains(representative_full_pixel(pixel))) {
+        spatial_reservoirs[pixelIndex] = temporal_reservoirs[pixelIndex];
+        return;
+    }
+    GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_PIXELS], 1u);
+
+    RestirGiReceiver center = receivers[uint(representative_full_pixel(pixel).y) * pc.width +
+        uint(representative_full_pixel(pixel).x)];
+    ProdRestirGiReservoir selected = temporal_reservoirs[pixelIndex];
+    if (!restir_gi_receiver_valid_for_reuse(center) || !prod_reservoir_reusable(selected)) {
+        if (!prod_reservoir_reusable(selected)) GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_PATH_SPATIAL_CENTER_CURRENT_ONLY], 1u);
+        spatial_reservoirs[pixelIndex] = selected;
+        return;
+    }
+    if (pc.enabled == 0u || pc.spatialRounds == 0u) {
+        prod_set_meta(selected, prod_unpack_age(selected),
+            prod_unpack_flags(selected) | PROD_FLAG_VALID | PROD_FLAG_FINALIZED,
+            prod_unpack_path_class(selected), prod_unpack_confidence(selected));
+        spatial_reservoirs[pixelIndex] = selected;
+        return;
+    }
+
+    vec3 selectedDirection;
+    float selectedDistance;
+    if (!restir_gi_reconnect_sample(selected, center, pc.cameraPosition.xyz, selectedDirection, selectedDistance)) {
+        spatial_reservoirs[pixelIndex] = temporal_reservoirs[pixelIndex];
+        return;
+    }
+    float totalWeight = prod_unpack_weight_sum(selected);
+    float totalM = prod_unpack_sample_count(selected);
+    uint raysUsed = 0u;
+
+    for (uint roundIndex = 0u; roundIndex < pc.spatialRounds; ++roundIndex) {
+        float angle = rng01(pixelIndex, roundIndex * 2u) * 6.28318530718;
+        float radius = max(1.0, pc.spatialRadius) * sqrt(rng01(pixelIndex, roundIndex * 2u + 1u));
+        ivec2 offset = ivec2(round(vec2(cos(angle), sin(angle)) * radius));
+        ivec2 neighborPixel = clamp(pixel + offset, ivec2(0), ivec2(int(outWidth) - 1, int(outHeight) - 1));
+        uint neighborIndex = uint(neighborPixel.y) * outWidth + uint(neighborPixel.x);
+        if (neighborIndex == pixelIndex) continue;
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_NEIGHBORS_TESTED], 1u);
+
+        ProdRestirGiReservoir candidate = temporal_reservoirs[neighborIndex];
+        if (!prod_reservoir_reusable(candidate)) {
+            GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_REJECT_INVALID], 1u);
+            continue;
+        }
+        RestirGiReceiver neighbor = receivers[uint(representative_full_pixel(neighborPixel).y) * pc.width +
+            uint(representative_full_pixel(neighborPixel).x)];
+        if (!receivers_compatible(center, neighbor)) {
+            GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_REJECT_SURFACE], 1u);
+            continue;
+        }
+        if (prod_unpack_version_hash(candidate) != restir_gi_receiver_version_hash(center)) {
+            GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_VERSION_REJECT], 1u);
+            continue;
+        }
+        float candidateSourceTarget = prod_unpack_target(candidate);
+        vec3 shiftedDirection;
+        float shiftedDistance;
+        if (!restir_gi_reconnect_sample(candidate, center, pc.cameraPosition.xyz, shiftedDirection, shiftedDistance)) {
+            GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_REJECT_TARGET], 1u);
+            continue;
+        }
+
+        float visibilityConfidence = 1.0;
+        uint flags = prod_unpack_flags(candidate);
+#if RTV_RESTIR_GI_VALIDATION_FULL
+        if (!trace_visibility(center, candidate)) {
+            GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_REJECT_TARGET], 1u);
+            continue;
+        }
+        flags |= PROD_FLAG_VISIBLE | PROD_FLAG_VISIBILITY_KNOWN |
+            PROD_FLAG_RECONNECTED_VISIBILITY;
+#else
+        if (raysUsed < pc.visibilityRayBudget) {
+            ++raysUsed;
+            if (!trace_visibility(center, candidate)) {
+                GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_REJECT_TARGET], 1u);
+                continue;
+            }
+            flags |= PROD_FLAG_VISIBLE | PROD_FLAG_VISIBILITY_KNOWN |
+                PROD_FLAG_RECONNECTED_VISIBILITY;
+        } else {
+            bool risky = (flags & PROD_FLAG_ALPHA_TESTED) != 0u ||
+                prod_unpack_path_class(candidate) == PROD_PATH_CLASS_GLOSSY_REUSABLE;
+            if (risky) {
+                GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_VISIBILITY_UNKNOWN], 1u);
+                continue;
+            }
+            visibilityConfidence = 0.35;
+            flags &= ~(PROD_FLAG_VISIBILITY_KNOWN | PROD_FLAG_RECONNECTED_VISIBILITY);
+        }
+#endif
+
+        float candidateWeight = prod_shifted_reservoir_weight(
+            candidate, candidateSourceTarget, prod_unpack_target(candidate)) * visibilityConfidence;
+        if (!restir_gi_finite(candidateWeight) || candidateWeight <= 0.0) {
+            GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_NON_FINITE], 1u);
+            continue;
+        }
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_ACCEPTED], 1u);
+        float newWeight = totalWeight + candidateWeight;
+        if (rng01(pixelIndex, 64u + roundIndex) < candidateWeight / max(newWeight, 1.0e-10)) {
+            selected = candidate;
+            prod_set_meta(selected, prod_unpack_age(candidate), flags,
+                prod_unpack_path_class(candidate), prod_unpack_confidence(candidate) * visibilityConfidence);
+            GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_SELECTED_NEIGHBOR], 1u);
+        }
+        totalWeight = newWeight;
+        totalM += prod_unpack_sample_count(candidate);
+    }
+
+    if (totalM > 255.0 || totalWeight > 65504.0) GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_CLAMP], 1u);
+    prod_finalize_mass(selected, min(totalWeight, 3.4e38), totalM);
+    prod_set_meta(selected, prod_unpack_age(selected),
+        prod_unpack_flags(selected) | PROD_FLAG_VALID | PROD_FLAG_FINALIZED,
+        prod_unpack_path_class(selected), prod_unpack_confidence(selected));
+    spatial_reservoirs[pixelIndex] = selected;
+}

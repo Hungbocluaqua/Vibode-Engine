@@ -789,6 +789,7 @@ SceneAsset SceneDocument::toSceneAsset() const {
             light.outerConeRadians = entity->light->outerConeRadians;
             light.enabled = entity->light->enabled;
             light.nodeIndex = static_cast<int32_t>(i);
+            light.persistentId = entity->uuid;
             scene.lights.push_back(light);
         }
     }
@@ -886,7 +887,23 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"skyIntensity", renderSettings_.skyIntensity},
         {"indirectStrength", renderSettings_.indirectStrength},
         {"restirMode", static_cast<uint32_t>(renderSettings_.restirMode)},
+        {"restirDiMode", static_cast<uint32_t>(renderSettings_.restirDiMode)},
+        {"restirDiTemporalEnabled", renderSettings_.restirDiTemporalEnabled},
+        {"restirDiSpatialEnabled", renderSettings_.restirDiSpatialEnabled},
+        {"restirDiFinalVisibilityEnabled", renderSettings_.restirDiFinalVisibilityEnabled},
+        {"restirDiSpatialRounds", renderSettings_.restirDiSpatialRounds},
+        {"restirDiSpatialRadius", renderSettings_.restirDiSpatialRadius},
+        {"restirDiTemporalMaxAge", renderSettings_.restirDiTemporalMaxAge},
+        {"restirDiMaxM", renderSettings_.restirDiMaxM},
+        {"restirDiVisibilityRayBudget", renderSettings_.restirDiVisibilityRayBudget},
+        {"restirDiProductionStabilizationEnabled", renderSettings_.restirDiProductionStabilizationEnabled},
+        {"restirDiClampLuminance", renderSettings_.restirDiClampLuminance},
+        {"restirDiIncludeSun", renderSettings_.restirDiIncludeSun},
+        {"restirDiIncludeEnvironment", renderSettings_.restirDiIncludeEnvironment},
+        {"restirDiReservoirLayout", static_cast<uint32_t>(renderSettings_.restirDiReservoirLayout)},
         {"restirGiEnabled", renderSettings_.restirGiEnabled},
+        {"restirGiMode", static_cast<uint32_t>(renderSettings_.restirGiMode)},
+        {"restirGiReservoirLayout", static_cast<uint32_t>(renderSettings_.restirGiReservoirLayout)},
         {"denoiserEnabled", renderSettings_.denoiserEnabled},
         {"denoiserBackend", static_cast<uint32_t>(renderSettings_.denoiserBackend)},
         {"denoiseWhileMoving", renderSettings_.denoiseWhileMoving},
@@ -924,6 +941,8 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"restirGiHalfResolution", renderSettings_.restirGiHalfResolution},
         {"restirGiVisibilityRayBudget", renderSettings_.restirGiVisibilityRayBudget},
         {"restirGiFinalStabilizationEnabled", renderSettings_.restirGiFinalStabilizationEnabled},
+        {"restirGiActiveTileMaskMode", static_cast<uint32_t>(renderSettings_.restirGiActiveTileMaskMode)},
+        {"restirHistoryCopyMode", static_cast<uint32_t>(renderSettings_.restirHistoryCopyMode)},
         {"adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)},
         {"adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs},
         {"usePhysicalCamera", renderSettings_.usePhysicalCamera},
@@ -1355,7 +1374,73 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.sunAngularRadius = render.value("sunAngularRadius", renderSettings_.sunAngularRadius);
         renderSettings_.indirectStrength = render.value("indirectStrength", renderSettings_.indirectStrength);
         renderSettings_.restirMode = static_cast<RestirMode>(render.value("restirMode", static_cast<uint32_t>(renderSettings_.restirMode)));
+        const bool hasRestirDiMode = render.contains("restirDiMode");
+        const uint32_t restirDiModeValue = hasRestirDiMode
+            ? render.value("restirDiMode", static_cast<uint32_t>(renderSettings_.restirDiMode))
+            : static_cast<uint32_t>(RestirDiMode::Legacy);
+        const uint32_t restirDiLayoutValue = render.contains("restirDiReservoirLayout")
+            ? render.value("restirDiReservoirLayout", static_cast<uint32_t>(renderSettings_.restirDiReservoirLayout))
+            : static_cast<uint32_t>(hasRestirDiMode
+                ? renderSettings_.restirDiReservoirLayout
+                : RestirDiReservoirLayout::Legacy);
+        if (restirDiModeValue > static_cast<uint32_t>(RestirDiMode::HybridCompare) ||
+            restirDiLayoutValue > static_cast<uint32_t>(RestirDiReservoirLayout::ValidationFull)) {
+            return false;
+        }
+        const auto restirDiMode = static_cast<RestirDiMode>(restirDiModeValue);
+        const auto restirDiLayout = static_cast<RestirDiReservoirLayout>(restirDiLayoutValue);
+        const bool legacyDiMode = restirDiMode == RestirDiMode::Off || restirDiMode == RestirDiMode::Legacy;
+        if ((legacyDiMode && restirDiLayout != RestirDiReservoirLayout::Legacy) ||
+            (!legacyDiMode && restirDiLayout == RestirDiReservoirLayout::Legacy)) {
+            return false;
+        }
+        renderSettings_.restirDiMode = restirDiMode;
+        renderSettings_.restirDiReservoirLayout = restirDiLayout;
+        renderSettings_.restirDiTemporalEnabled = render.value("restirDiTemporalEnabled", renderSettings_.restirDiTemporalEnabled);
+        renderSettings_.restirDiSpatialEnabled = render.value("restirDiSpatialEnabled", renderSettings_.restirDiSpatialEnabled);
+        renderSettings_.restirDiFinalVisibilityEnabled = render.value("restirDiFinalVisibilityEnabled", renderSettings_.restirDiFinalVisibilityEnabled);
+        renderSettings_.restirDiSpatialRounds = render.value("restirDiSpatialRounds", renderSettings_.restirDiSpatialRounds);
+        renderSettings_.restirDiSpatialRadius = render.value("restirDiSpatialRadius", renderSettings_.restirDiSpatialRadius);
+        renderSettings_.restirDiTemporalMaxAge = render.value("restirDiTemporalMaxAge", renderSettings_.restirDiTemporalMaxAge);
+        renderSettings_.restirDiMaxM = render.value("restirDiMaxM", renderSettings_.restirDiMaxM);
+        renderSettings_.restirDiVisibilityRayBudget = render.value("restirDiVisibilityRayBudget", renderSettings_.restirDiVisibilityRayBudget);
+        renderSettings_.restirDiProductionStabilizationEnabled = render.value("restirDiProductionStabilizationEnabled", renderSettings_.restirDiProductionStabilizationEnabled);
+        renderSettings_.restirDiClampLuminance = render.value("restirDiClampLuminance", renderSettings_.restirDiClampLuminance);
+        renderSettings_.restirDiIncludeSun = render.value("restirDiIncludeSun", renderSettings_.restirDiIncludeSun);
+        renderSettings_.restirDiIncludeEnvironment = render.value("restirDiIncludeEnvironment", renderSettings_.restirDiIncludeEnvironment);
+        if (restirDiMode == RestirDiMode::ReferenceValidation &&
+            (!renderSettings_.restirDiFinalVisibilityEnabled ||
+             restirDiLayout != RestirDiReservoirLayout::ValidationFull)) {
+            return false;
+        }
         renderSettings_.restirGiEnabled = render.value("restirGiEnabled", renderSettings_.restirGiEnabled);
+        const uint32_t restirGiModeValue = render.contains("restirGiMode")
+            ? render.value("restirGiMode", static_cast<uint32_t>(renderSettings_.restirGiMode))
+            : static_cast<uint32_t>(renderSettings_.restirGiEnabled
+                ? RestirGiMode::Production
+                : RestirGiMode::Off);
+        const uint32_t restirGiLayoutValue = render.value("restirGiReservoirLayout", static_cast<uint32_t>(renderSettings_.restirGiReservoirLayout));
+        if (restirGiModeValue > static_cast<uint32_t>(RestirGiMode::ReferenceValidation) ||
+            restirGiLayoutValue > static_cast<uint32_t>(RestirGiReservoirLayout::ValidationFull)) {
+            return false;
+        }
+        const auto restirGiMode = static_cast<RestirGiMode>(restirGiModeValue);
+        const auto restirGiLayout = static_cast<RestirGiReservoirLayout>(restirGiLayoutValue);
+        if (restirGiMode == RestirGiMode::LegacyCache &&
+            restirGiLayout != RestirGiReservoirLayout::LegacyCachePacked) {
+            return false;
+        }
+        if ((restirGiMode == RestirGiMode::Production ||
+             restirGiMode == RestirGiMode::ReferenceValidation) &&
+            restirGiLayout == RestirGiReservoirLayout::LegacyCachePacked) {
+            return false;
+        }
+        if (restirGiMode == RestirGiMode::ReferenceValidation &&
+            restirGiLayout != RestirGiReservoirLayout::ValidationFull) {
+            return false;
+        }
+        renderSettings_.restirGiMode = restirGiMode;
+        renderSettings_.restirGiReservoirLayout = restirGiLayout;
         renderSettings_.denoiserEnabled = render.value("denoiserEnabled", renderSettings_.denoiserEnabled);
         renderSettings_.denoiserBackend = static_cast<DenoiserBackend>(render.value("denoiserBackend", static_cast<uint32_t>(renderSettings_.denoiserBackend)));
         renderSettings_.denoiseWhileMoving = render.value("denoiseWhileMoving", renderSettings_.denoiseWhileMoving);
@@ -1393,6 +1478,20 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.restirGiHalfResolution = render.value("restirGiHalfResolution", renderSettings_.restirGiHalfResolution);
         renderSettings_.restirGiVisibilityRayBudget = render.value("restirGiVisibilityRayBudget", renderSettings_.restirGiVisibilityRayBudget);
         renderSettings_.restirGiFinalStabilizationEnabled = render.value("restirGiFinalStabilizationEnabled", renderSettings_.restirGiFinalStabilizationEnabled);
+        if (render.contains("restirGiActiveTileMaskMode")) {
+            const uint32_t mode = render.value("restirGiActiveTileMaskMode", static_cast<uint32_t>(renderSettings_.restirGiActiveTileMaskMode));
+            renderSettings_.restirGiActiveTileMaskMode = mode <= static_cast<uint32_t>(RestirGiActiveTileMaskMode::Auto)
+                ? static_cast<RestirGiActiveTileMaskMode>(mode)
+                : RestirGiActiveTileMaskMode::Off;
+        } else if (render.contains("restirGiActiveTileMaskEnabled")) {
+            renderSettings_.restirGiActiveTileMaskMode = render.value("restirGiActiveTileMaskEnabled", false)
+                ? RestirGiActiveTileMaskMode::On
+                : RestirGiActiveTileMaskMode::Off;
+        }
+        const uint32_t historyCopyMode = render.value("restirHistoryCopyMode", static_cast<uint32_t>(renderSettings_.restirHistoryCopyMode));
+        renderSettings_.restirHistoryCopyMode = historyCopyMode <= static_cast<uint32_t>(RestirHistoryCopyMode::PingPong)
+            ? static_cast<RestirHistoryCopyMode>(historyCopyMode)
+            : RestirHistoryCopyMode::Copy;
         renderSettings_.adaptiveQualityMode = static_cast<AdaptiveQualityMode>(render.value("adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)));
         renderSettings_.adaptiveGpuFrameTargetMs = render.value("adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs);
         renderSettings_.usePhysicalCamera = render.value("usePhysicalCamera", renderSettings_.usePhysicalCamera);

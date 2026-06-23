@@ -48,10 +48,16 @@ float timingForPassName(const GpuFrameTimings& timings, const std::string& name)
     if (name.find("path_trace") == 0) return timings.pathTraceMs;
     if (name.find("restir_history_clear") == 0) return timings.restirHistoryClearMs;
     if (name.find("restir_gi_clear") == 0) return timings.restirGiClearMs;
+    if (name.find("restir_gi_temporal") == 0) return timings.restirGiTemporalMs;
     if (name.find("restir_spatial_copy") == 0) return timings.restirSpatialCopyMs;
     if (name.find("restir_spatial") == 0) return timings.restirSpatialMs;
     if (name.find("restir_gi_spatial") == 0) return timings.restirGiSpatialMs;
+    if (name.find("restir_gi_upsample") == 0) return timings.restirGiUpsampleMs;
     if (name.find("restir_gi_final") == 0) return timings.restirGiFinalMs;
+    if (name.find("restir_gi_counters_readback") == 0) return timings.restirGiCountersReadbackMs;
+    if (name.find("restir_di_temporal") == 0) return timings.restirDiTemporalMs;
+    if (name.find("restir_di_spatial") == 0) return timings.restirDiSpatialMs;
+    if (name.find("restir_di_final") == 0) return timings.restirDiFinalMs;
     if (name.find("fog") == 0) return timings.fogIntegrateMs;
     if (name.find("atmosphere") == 0) return timings.atmosphereMs;
     if (name.find("temporal_denoiser") == 0) return timings.denoiserMs;

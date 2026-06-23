@@ -22,6 +22,7 @@ struct PathDataRecord {
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
     vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
 };
 layout(set = 0, binding = 7, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 layout(set = 0, binding = 8, std430) readonly buffer EntityIdBuffer { uint entity_id_buffer[]; };
@@ -194,7 +195,9 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
         float neighborhoodDelta = abs(historyLum - meanLum) / (meanLum + sigmaLum + 0.02);
         float motionConfidence = temporal_motion_confidence(displayVelocityPixels, 18.0, 0.12);
         float motion = 1.0 - motionConfidence;
-        float reactive = temporal_reactive_weight(lumDelta, clipDelta, neighborhoodDelta);
+        float reactive = max(
+            temporal_reactive_weight(lumDelta, clipDelta, neighborhoodDelta),
+            clamp(pathData.emissive_residual.a, 0.0, 1.0));
         float specularReactive = smoothstep(0.35, 0.85, specularSignal) * max(motion, reactive);
         sharpenAmount = params.camera_moving != 0u
             ? 0.0

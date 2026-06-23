@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <future>
+#include <numeric>
 #include <thread>
 
 namespace rtv {
@@ -50,6 +51,14 @@ std::vector<ParallelBvhBuildResult> ParallelBvhBuilder::buildAll(
     const uint32_t workerCount = (maxThreads > 0) ? std::min(maxThreads, hardwareThreads) : hardwareThreads;
     const uint32_t clampedWorkers = std::min(workerCount, static_cast<uint32_t>(tasks.size()));
 
+    std::vector<uint32_t> taskOrder(tasks.size());
+    std::iota(taskOrder.begin(), taskOrder.end(), 0u);
+    std::sort(taskOrder.begin(), taskOrder.end(), [&](uint32_t a, uint32_t b) {
+        const size_t aIndexCount = tasks[a].indices != nullptr ? tasks[a].indices->size() : 0u;
+        const size_t bIndexCount = tasks[b].indices != nullptr ? tasks[b].indices->size() : 0u;
+        return aIndexCount > bIndexCount;
+    });
+
     std::atomic<uint32_t> nextTask{0};
     std::vector<std::future<void>> workers;
     workers.reserve(clampedWorkers);
@@ -57,10 +66,11 @@ std::vector<ParallelBvhBuildResult> ParallelBvhBuilder::buildAll(
     for (uint32_t w = 0; w < clampedWorkers; ++w) {
         workers.push_back(std::async(std::launch::async, [&]() {
             while (true) {
-                uint32_t taskIndex = nextTask.fetch_add(1);
-                if (taskIndex >= tasks.size()) {
+                uint32_t orderIndex = nextTask.fetch_add(1);
+                if (orderIndex >= taskOrder.size()) {
                     break;
                 }
+                const uint32_t taskIndex = taskOrder[orderIndex];
                 results[taskIndex] = buildTask(tasks[taskIndex]);
             }
         }));

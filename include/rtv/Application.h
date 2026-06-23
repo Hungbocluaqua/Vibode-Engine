@@ -97,6 +97,8 @@ public:
         bool validationCameraMotion = false,
         bool validationObjectMotion = false,
         bool headless = false,
+        uint32_t headlessWidth = 1280,
+        uint32_t headlessHeight = 720,
         bool disableAsyncCompute = false,
         bool singleQueueFallback = false,
         bool disableResourceAliasing = false,
@@ -605,10 +607,11 @@ private:
     void retirePathTracer(std::unique_ptr<PathTracerRenderer> renderer);
     void releaseRetiredPathTracers();
     [[nodiscard]] std::optional<std::filesystem::path> currentSceneCachePathForRenderer() const;
+    [[nodiscard]] SceneCachePolicy currentSceneCachePolicyForRenderer() const;
     [[nodiscard]] std::unique_ptr<PathTracerRenderer> makePathTracer(
         const SceneAsset* sceneAsset,
         const AssetManager* assets,
-        std::optional<std::filesystem::path> sceneCachePath,
+        SceneCachePolicy sceneCachePolicy,
         const RendererSettings* settingsToRestore,
         uint32_t materialTextureMaxDimension = 0);
     void createPathTracer(const RendererSettings* settingsToRestore = nullptr);
@@ -624,6 +627,7 @@ private:
     GLFWwindow* window_ = nullptr;
     bool mainWindowHiddenUntilRenderer_ = false;
     bool headless_ = false;
+    VkExtent2D headlessExtent_{1280, 720};
     uint32_t nextDiagnosticFrameIndex_ = 0;
     uint32_t warmupFrameCount_ = 0;
     uint32_t totalFrameCount_ = 0;

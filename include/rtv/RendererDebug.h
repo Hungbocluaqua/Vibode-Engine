@@ -137,6 +137,11 @@ enum class RendererDebugView : uint32_t {
     RestirDiWeightSum = 121,
     RestirDiM = 122,
     RestirDiLightClass = 123,
+    RestirDiAge = 124,
+    RestirDiConfidence = 125,
+    RestirDiReferenceDiff = 126,
+    RestirGiGrid = 127,
+    RestirGiPathClass = 128,
 };
 
 enum class RestirMode : uint32_t {
@@ -157,6 +162,30 @@ enum class RestirDiReservoirLayout : uint32_t {
     Legacy = 0,
     ProductionPacked = 1,
     ValidationFull = 2,
+};
+
+enum class RestirGiMode : uint32_t {
+    Off = 0,
+    LegacyCache = 1,
+    Production = 2,
+    ReferenceValidation = 3,
+};
+
+enum class RestirGiReservoirLayout : uint32_t {
+    LegacyCachePacked = 0,
+    ProductionPacked = 1,
+    ValidationFull = 2,
+};
+
+enum class RestirGiActiveTileMaskMode : uint32_t {
+    Off = 0,
+    On = 1,
+    Auto = 2,
+};
+
+enum class RestirHistoryCopyMode : uint32_t {
+    Copy = 0,
+    PingPong = 1,
 };
 
 enum class AdaptiveQualityMode : uint32_t {
@@ -199,6 +228,14 @@ inline constexpr uint32_t rendererDebugFlagRayTracingCounters = 1u << 0u;
 [[nodiscard]] RestirDiMode parseRestirDiMode(std::string_view value);
 [[nodiscard]] const char* restirDiReservoirLayoutName(RestirDiReservoirLayout layout);
 [[nodiscard]] RestirDiReservoirLayout parseRestirDiReservoirLayout(std::string_view value);
+[[nodiscard]] const char* restirGiModeName(RestirGiMode mode);
+[[nodiscard]] RestirGiMode parseRestirGiMode(std::string_view value);
+[[nodiscard]] const char* restirGiReservoirLayoutName(RestirGiReservoirLayout layout);
+[[nodiscard]] RestirGiReservoirLayout parseRestirGiReservoirLayout(std::string_view value);
+[[nodiscard]] const char* restirGiActiveTileMaskModeName(RestirGiActiveTileMaskMode mode);
+[[nodiscard]] RestirGiActiveTileMaskMode parseRestirGiActiveTileMaskMode(std::string_view value);
+[[nodiscard]] const char* restirHistoryCopyModeName(RestirHistoryCopyMode mode);
+[[nodiscard]] RestirHistoryCopyMode parseRestirHistoryCopyMode(std::string_view value);
 [[nodiscard]] const char* renderPresetName(RenderPreset preset);
 [[nodiscard]] RenderPreset parseRenderPreset(std::string_view value);
 [[nodiscard]] const char* denoiserBackendName(DenoiserBackend backend);

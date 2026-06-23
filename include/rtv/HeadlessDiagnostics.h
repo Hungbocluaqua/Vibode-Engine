@@ -23,6 +23,8 @@ class PathTracerRenderer;
 
 struct HeadlessDiagnosticsConfig {
     bool headless = false;
+    uint32_t headlessWidth = 1280;
+    uint32_t headlessHeight = 720;
     uint32_t warmupFrames = 0;
     uint32_t totalFrames = 120;
     std::optional<uint32_t> fixedSeed;
@@ -53,6 +55,9 @@ struct ProfileReport {
     std::string driverVersion;
     std::string vulkanVersion;
     std::string restirGiLayout = "compressed";
+    RestirHistoryCopyMode effectiveRestirHistoryCopyMode = RestirHistoryCopyMode::Copy;
+    std::string restirHistoryCopyFallbackReason;
+    bool effectiveRestirGiActiveTileMaskEnabled = false;
 
     struct Resolution {
         uint32_t renderWidth = 0;
@@ -80,10 +85,18 @@ struct ProfileReport {
         float pathTrace = 0.0f;
         float restirHistoryClear = 0.0f;
         float restirGiClear = 0.0f;
+        float restirGiTemporal = 0.0f;
         float restirSpatial = 0.0f;
         float restirSpatialCopy = 0.0f;
         float restirGiSpatial = 0.0f;
+        float restirGiUpsample = 0.0f;
         float restirGiFinal = 0.0f;
+        float restirGiCountersReadback = 0.0f;
+        float restirDiTemporal = 0.0f;
+        float restirDiSpatial = 0.0f;
+        float restirDiFinal = 0.0f;
+        float restirDiHistoryCopy = 0.0f;
+        float restirDiCountersReadback = 0.0f;
         float fogIntegrate = 0.0f;
         float atmosphere = 0.0f;
         float atmosphereTransmittance = 0.0f;
@@ -245,6 +258,10 @@ struct ProfileReport {
         uint64_t causticShadowBlocked = 0;
     } rayTracingDiagnosticCounters{};
 
+    std::vector<uint64_t> restirDiCounters;
+    std::vector<uint64_t> restirGiCounters;
+    bool restirDiHistoryValid = false;
+
     struct RayTracingGeometryReport {
         uint32_t opaquePrimitiveCount = 0;
         uint32_t alphaTestedPrimitiveCount = 0;
@@ -260,6 +277,7 @@ struct ProfileReport {
         uint32_t blasAlphaTestedGeometryCount = 0;
         uint32_t blasBlendedGeometryCount = 0;
         uint32_t blasOpacityMicromapGeometryCount = 0;
+        uint32_t blasBuildBatchCount = 0;
     } rayTracingGeometry{};
 
     struct AnimatedGeometryReport {
@@ -556,11 +574,27 @@ struct ProfileReport {
         uint64_t temporalHistoryBytes = 0;
         uint64_t restirReservoirBytes = 0;
         uint64_t restirDiCurrentBytes = 0;
+        uint64_t restirDiInitialBytes = 0;
+        uint64_t restirDiTemporalBytes = 0;
         uint64_t restirDiPreviousBytes = 0;
         uint64_t restirDiSpatialBytes = 0;
+        uint64_t restirDiFinalBytes = 0;
+        uint64_t restirDiReceiverBytes = 0;
+        uint64_t restirDiPreviousReceiverBytes = 0;
+        uint64_t restirDiCountersBytes = 0;
+        uint64_t restirDiPhysicalBytes = 0;
+        uint64_t restirDiAliasSavingsBytes = 0;
         uint64_t restirGiCurrentBytes = 0;
         uint64_t restirGiPreviousBytes = 0;
         uint64_t restirGiSpatialBytes = 0;
+        uint64_t restirGiProductionTemporalBytes = 0;
+        uint64_t restirGiProductionSpatialBytes = 0;
+        uint64_t restirGiProductionPreviousBytes = 0;
+        uint64_t restirGiProductionUpsampledBytes = 0;
+        uint64_t restirGiActiveTileMaskBytes = 0;
+        uint64_t restirGiCountersBytes = 0;
+        uint64_t restirGiReceiverBytes = 0;
+        uint64_t restirGiPreviousReceiverBytes = 0;
         uint64_t stagingUploadTotalBytes = 0;
         uint64_t stagingUploadPeakBytes = 0;
         uint64_t stagingUploadLastBytes = 0;

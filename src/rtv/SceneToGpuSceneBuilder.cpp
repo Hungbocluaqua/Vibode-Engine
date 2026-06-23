@@ -685,6 +685,8 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.restirGiHalfResolution = render.restirGiHalfResolution;
     result.rendererSettings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
     result.rendererSettings.restirGiFinalStabilizationEnabled = render.restirGiFinalStabilizationEnabled;
+    result.rendererSettings.restirGiActiveTileMaskMode = render.restirGiActiveTileMaskMode;
+    result.rendererSettings.restirHistoryCopyMode = render.restirHistoryCopyMode;
     result.rendererSettings.adaptiveQualityMode = render.adaptiveQualityMode;
     result.rendererSettings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
     result.rendererSettings.materialTextureAnisotropy = render.materialTextureAnisotropy;

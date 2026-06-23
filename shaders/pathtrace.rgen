@@ -1,10 +1,23 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_ARB_shading_language_packing : require
 #if RTV_MOTION_BLUR_ENABLED
 #extension GL_NV_ray_tracing_motion_blur : require
 #endif
 #include "rt_common.glsl"
-#include "restir_di_common.glsl"
+
+vec3 restir_gi_receiver_position(RestirGiReceiver r) { return r.positionDepth.xyz; }
+float restir_gi_receiver_depth(RestirGiReceiver r) { return r.positionDepth.w; }
+vec3 restir_gi_receiver_normal(RestirGiReceiver r) { return normalize(r.normalRoughness.xyz); }
+float restir_gi_receiver_roughness(RestirGiReceiver r) { return clamp(r.normalRoughness.w, 0.0, 1.0); }
+vec3 restir_gi_receiver_geometry_normal(RestirGiReceiver r) { return normalize(r.geometryNormalMetal.xyz); }
+float restir_gi_receiver_metallic(RestirGiReceiver r) { return clamp(r.geometryNormalMetal.w, 0.0, 1.0); }
+vec3 restir_gi_receiver_albedo(RestirGiReceiver r) { return r.albedoOcclusion.rgb; }
+float restir_gi_receiver_occlusion(RestirGiReceiver r) { return clamp(r.albedoOcclusion.a, 0.0, 1.0); }
+uint restir_gi_receiver_material_id(RestirGiReceiver r) { return r.materialIds.x; }
+
+#include "restir_gi_prod_packing.glsl"
+#include "restir_gi_reconnection.glsl"
 
 layout(set = 0, binding = 33) uniform accelerationStructureEXT topLevelAS;
 layout(location = 0) rayPayloadEXT RayPayload payload;
@@ -24,7 +37,10 @@ struct PathComponents {
     vec3 environment_light;
     vec3 restir_initial_direct_light;
     vec3 first_albedo;
+    vec3 first_geom_normal; // Phase 2: geometric normal for GI receiver
     vec3 first_specular_albedo;
+    vec3 restir_di_base_color;
+    vec3 restir_di_f0;
     float first_roughness;
     float first_occlusion;
     float first_metallic;
@@ -32,6 +48,9 @@ struct PathComponents {
     uint first_alpha_mode;
     float first_transmission;
     uint first_mat_type;
+    uint restir_di_material_supported;
+    uint restir_di_material_pbr;
+    uint restir_gi_receiver_supported;
     float first_light_pdf;
     float first_bsdf_pdf;
     float first_mis_weight;
@@ -49,6 +68,7 @@ struct PathComponents {
     vec3 restir_di_sample_position;
     vec3 restir_di_sample_radiance;
     vec3 restir_di_sample_normal;
+    vec3 first_view_direction;
     float restir_di_sample_distance;
     uint restir_di_light_index;
     uint restir_di_light_kind;
@@ -71,10 +91,15 @@ struct PathComponents {
     vec3 restir_gi_candidate_position;
     vec3 restir_gi_candidate_normal;
     vec3 restir_gi_candidate_radiance;
+    vec3 restir_gi_candidate_suffix_radiance;
+    vec3 restir_gi_candidate_source_direction;
     vec3 restir_gi_receiver_position;
     float restir_gi_candidate_roughness;
     float restir_gi_candidate_hit_distance;
+    float restir_gi_candidate_source_pdf;
     float restir_gi_candidate_target_pdf;
+    uint restir_gi_candidate_path_class;
+    uint restir_gi_candidate_reuse_flags;
     uint restir_gi_candidate_material_id;
     uint bounce_count;
     uint instance_id;
@@ -239,13 +264,25 @@ bool restir_gi_enabled() {
     return (camera.restir_gi_controls.y & 2u) != 0u;
 }
 
+bool restir_gi_legacy_cache_mode() {
+    return (camera.restir_gi_controls.y & 8u) != 0u;
+}
+
 bool restir_gi_debug_view() {
     return (debug_params.view >= 68u && debug_params.view <= 73u) ||
         debug_params.view == 90u ||
-        debug_params.view == 91u;
+        debug_params.view == 91u ||
+        debug_params.view == 127u ||
+        debug_params.view == 128u;
 }
 
 uint direct_light_ris_candidate_count() {
+    // The standalone DI reservoir stores one source proposal. Multi-candidate
+    // RIS has a sample-conditional effective PDF that cannot be reconstructed
+    // after shifting the sample to another receiver.
+    if (camera.restir_di_controls.x != 0u) {
+        return 1u;
+    }
     uint count = restir_mode() != 0u ? 4u : 1u;
     if (mesh_params.light_count > 65536u) {
         count = max(count, 12u);
@@ -368,68 +405,138 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
 }
 
 void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_position, vec3 hit_normal, float hit_depth, bool did_hit) {
+    atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_PIXELS], 1u);
     // Write receiver surface data
     RestirDiReceiver receiver;
     if (did_hit) {
         uint surfaceFlags = 0u;
-        if (components.first_mat_type == 1u || components.first_mat_type == 2u) {
+        if ((components.first_mat_type == 1u &&
+             components.first_roughness < MATERIAL_DELTA_ROUGHNESS_THRESHOLD) ||
+            components.first_mat_type == 2u) {
             surfaceFlags |= RESTIR_DI_SURFACE_DELTA;
         }
         if (components.first_transmission > 1.0e-4) {
             surfaceFlags |= RESTIR_DI_SURFACE_DELTA;
         }
-        if (components.first_alpha_mode != 0u || components.first_alpha < 0.999) {
-            surfaceFlags |= RESTIR_DI_SURFACE_ALPHA;
-        }
         if (components.first_mat_type == 5u) {
             surfaceFlags |= RESTIR_DI_SURFACE_UNLIT;
         }
+        if (components.restir_di_material_pbr != 0u) {
+            surfaceFlags |= RESTIR_DI_SURFACE_PBR;
+        }
+        if (components.restir_di_material_supported == 0u) {
+            surfaceFlags |= RESTIR_DI_SURFACE_UNSUPPORTED;
+        }
         receiver.worldPosition_depth = vec4(hit_position, hit_depth);
-        receiver.normal_roughness = vec4(hit_normal, components.first_roughness);
-        receiver.tangent_materialId = vec4(0.0, 0.0, 1.0, float(components.first_material_id));
-        receiver.bitangent_instanceId = vec4(1.0, 0.0, 0.0, float(components.instance_id));
-        receiver.viewDirection_hitDist = vec4(-normalize(hit_position - camera.pos.xyz), hit_depth);
-        receiver.primitive_mesh_flags = uvec4(components.primitive_id, components.mesh_id, surfaceFlags, 0u);
+        receiver.normal_roughness = vec4(components.first_geom_normal, components.first_roughness);
+#if RTV_RESTIR_DI_VALIDATION_FULL
+        receiver.tangent_materialId = vec4(components.restir_di_base_color, float(components.first_material_id));
+        receiver.bitangent_instanceId = vec4(components.restir_di_f0, float(components.instance_id));
+        receiver.viewDirection_hitDist = vec4(normalize(components.first_view_direction), hit_depth);
+        receiver.primitive_mesh_flags = uvec4(
+            components.primitive_id,
+            components.mesh_id,
+            surfaceFlags,
+            floatBitsToUint(clamp(components.first_metallic, 0.0, 1.0)));
+#else
+        uint surfaceSignature = components.first_material_id * 747796405u ^
+            components.instance_id * 2891336453u;
+        receiver.packedMaterialSurface = uvec4(
+            packUnorm4x8(vec4(clamp(components.restir_di_base_color, 0.0, 1.0), clamp(components.first_metallic, 0.0, 1.0))),
+            packUnorm4x8(vec4(clamp(components.restir_di_f0, 0.0, 1.0), float(surfaceFlags) / 255.0)),
+            surfaceSignature,
+            packSnorm2x16(restir_di_oct_encode(normalize(components.first_view_direction))));
+#endif
     } else {
         receiver.worldPosition_depth = vec4(0.0, 0.0, 0.0, 9999.0);
         receiver.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
+#if RTV_RESTIR_DI_VALIDATION_FULL
         receiver.tangent_materialId = vec4(1.0, 0.0, 0.0, float(0xffffffffu));
         receiver.bitangent_instanceId = vec4(0.0, 1.0, 0.0, float(0xffffffffu));
         receiver.viewDirection_hitDist = vec4(0.0, 0.0, 1.0, 9999.0);
         receiver.primitive_mesh_flags = uvec4(0u, 0u, 1u /*RESTIR_DI_SURFACE_SKY*/, 0u);
+#else
+        receiver.packedMaterialSurface = uvec4(
+            packUnorm4x8(vec4(0.0)),
+            packUnorm4x8(vec4(0.0, 0.0, 0.0, float(RESTIR_DI_SURFACE_SKY) / 255.0)),
+            0xffffffffu,
+            packSnorm2x16(vec2(0.0)));
+#endif
     }
     restir_di_receivers[pixelIndex] = receiver;
 
     // Write initial DI reservoir
     RestirDiReservoir initial = restir_di_empty_reservoir();
-    float targetLum = restir_di_target_function(components.restir_initial_direct_light);
-    if (did_hit && targetLum > 1.0e-6) {
+    // estimate_direct_lighting returns f / p. Recover the reusable integrand f;
+    // the reservoir normalization below reconstructs the original NEE estimate.
+    vec3 initialIntegrand = components.restir_initial_direct_light * components.first_light_pdf;
+    float targetLum = restir_di_target_function(initialIntegrand);
+    bool finiteCandidate = !any(isnan(components.restir_initial_direct_light)) &&
+        !any(isinf(components.restir_initial_direct_light)) &&
+        !any(isnan(components.restir_di_sample_radiance)) &&
+        !any(isinf(components.restir_di_sample_radiance)) &&
+        !isnan(components.first_light_pdf) && !isinf(components.first_light_pdf) &&
+        !any(isnan(initialIntegrand)) && !any(isinf(initialIntegrand)) &&
+        !isnan(targetLum) && !isinf(targetLum);
+    bool validPdf = components.first_light_pdf > 1.0e-6;
+    bool validIdentity = components.restir_di_light_index < mesh_params.light_count &&
+        components.restir_di_light_index < 0x01000000u;
+    float initialWeight = targetLum / max(components.first_light_pdf, 1.0e-6);
+    bool validSurface = components.restir_di_material_supported != 0u &&
+        components.caustic_transmissive_hits <= 0.0;
+    bool proposalAttempted = did_hit && validSurface && camera.direct_lighting_enabled != 0u &&
+        mesh_params.light_count > 0u;
+    restir_di_set_m(initial, proposalAttempted ? 1u : 0u);
+    if (did_hit && validSurface && targetLum > 1.0e-6 && finiteCandidate && validPdf && validIdentity &&
+        !isnan(initialWeight) && !isinf(initialWeight)) {
         vec3 toLight = components.restir_di_sample_position - hit_position;
         float distToLight = length(toLight);
         vec3 sampleDir = distToLight > 1.0e-4 ? toLight / distToLight : vec3(0.0, 1.0, 0.0);
 
+        LightRecord identityRecord = light_records[components.restir_di_light_index];
         initial.sampleMetadata = uvec4(
-            components.restir_di_light_index,
-            components.restir_di_light_kind,
-            0u, // light version
-            components.first_material_id);
+            restir_di_identity_hash(identityRecord.identity.xy),
+            identityRecord.identity.z,
+            (components.restir_di_light_index << 8u) | (components.restir_di_light_kind & 0xffu),
+            0u);
         initial.samplePosition_distance = vec4(
             components.restir_di_sample_position,
             components.restir_di_sample_distance);
-        initial.sampleDirection_pdf = vec4(sampleDir, components.first_light_pdf);
-        initial.sampleRadiance_target = vec4(
-            components.restir_di_sample_radiance,
-            targetLum);
-        initial.sampleNormal_weightSum = vec4(
-            components.restir_di_sample_normal,
-            targetLum / max(components.first_light_pdf, 1.0e-6));
-        initial.contribution_confidence = vec4(0.0, 0.0, 0.0, 1.0);
+        restir_di_set_direction(initial, sampleDir);
+        restir_di_set_sample_radiance(initial, components.restir_di_sample_radiance);
+        restir_di_set_target(initial, targetLum);
+        restir_di_set_light_normal(initial, components.restir_di_sample_normal);
+#if !RTV_RESTIR_DI_VALIDATION_FULL
+        if (initialWeight > 65504.0) {
+            atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_WEIGHT_OVERFLOW], 1u);
+        }
+#endif
+        restir_di_set_weight_sum(initial, initialWeight);
         restir_di_set_valid(initial, true);
         restir_di_set_age(initial, 0u);
         restir_di_set_m(initial, 1u);
-        restir_di_set_visibility(initial, 0u);
+        restir_di_set_visibility(initial, RESTIR_DI_VISIBILITY_VISIBLE);
         restir_di_set_source_pdf(initial, components.first_light_pdf);
         restir_di_set_previous_weight(initial, 0.0);
+        restir_di_set_confidence(initial, 1.0);
+        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_VALID], 1u);
+        uint lightKind = components.restir_di_light_kind;
+        uint classCounter = lightKind <= 1u ? RESTIR_DI_COUNTER_INITIAL_EMISSIVE :
+            lightKind == 2u ? RESTIR_DI_COUNTER_INITIAL_DIRECTIONAL :
+            lightKind == 3u ? RESTIR_DI_COUNTER_INITIAL_POINT :
+            lightKind == 4u ? RESTIR_DI_COUNTER_INITIAL_AREA :
+            RESTIR_DI_COUNTER_INITIAL_SPOT;
+        atomicAdd(restir_di_counters[classCounter], 1u);
+    } else if (!did_hit || !validSurface) {
+        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_SURFACE], 1u);
+    } else if (!finiteCandidate) {
+        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_NON_FINITE], 1u);
+    } else if (!validPdf) {
+        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_PDF], 1u);
+    } else if (!validIdentity) {
+        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_IDENTITY], 1u);
+    } else {
+        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_TARGET], 1u);
     }
     restir_di_initial_reservoirs[pixelIndex] = initial;
 }
@@ -586,31 +693,44 @@ void store_initial_restir_gi_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims
 
     RestirGiReservoir reservoir = empty_restir_gi_reservoir();
 
-#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    reservoir.receiver_position_hit_distance.xyz = components.restir_gi_receiver_position;
-#endif
-    restir_gi_set_material_id(reservoir, components.restir_gi_candidate_material_id);
-
     if (components.restir_gi_candidate_valid != 0u) {
-        vec3 radiance = max(components.restir_gi_candidate_radiance, vec3(0.0));
+        vec3 selectedIntegrand = max(components.restir_gi_candidate_radiance, vec3(0.0));
         float targetPdf = max(components.restir_gi_candidate_target_pdf, 1.0e-4);
+        float sourcePdf = max(components.restir_gi_candidate_source_pdf, 1.0e-8);
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
         reservoir.hit_position_target_pdf.xyz = components.restir_gi_candidate_position;
-        reservoir.receiver_position_hit_distance.xyz = components.restir_gi_receiver_position;
+        reservoir.suffix_radiance_source_pdf = vec4(
+            max(components.restir_gi_candidate_suffix_radiance, vec3(0.0)),
+            sourcePdf);
 #endif
         restir_gi_set_hit_distance_target_pdf(reservoir, components.restir_gi_candidate_hit_distance, targetPdf);
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+        reservoir.source_direction_distance = vec4(
+            normalize(components.restir_gi_candidate_source_direction),
+            components.restir_gi_candidate_hit_distance);
+#endif
         restir_gi_set_normal(reservoir, components.restir_gi_candidate_normal);
-        reservoir.radiance_weight_sum = vec4(radiance, 1.0);
+        reservoir.radiance_weight_sum = vec4(selectedIntegrand, targetPdf / sourcePdf);
         restir_gi_set_metadata(
             reservoir,
             1u,
             0u,
-            RESTIR_GI_FLAG_VALID | RESTIR_GI_FLAG_VISIBLE,
+            RESTIR_GI_FLAG_VALID | RESTIR_GI_FLAG_VISIBLE | components.restir_gi_candidate_reuse_flags,
             clamp(components.restir_gi_candidate_roughness, 0.0, 1.0));
+#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
+        reservoir.metadata.z |= (components.restir_gi_candidate_path_class & 0xffu) << 8u;
+        uint sceneVersion = camera.gi_version_controls.z ^
+            (camera.gi_version_controls.x * 16777619u) ^
+            (camera.gi_version_controls.w * 2166136261u);
+        reservoir.metadata.w = restir_gi_hash_u32(
+            sceneVersion ^ restir_gi_hash_u32(camera.gi_version_controls.y + 0x9e3779b9u));
+#else
         restir_gi_set_material_id(reservoir, components.restir_gi_candidate_material_id);
+#endif
     }
 
-    if (restirGiDebugView &&
+    if (restir_gi_legacy_cache_mode() &&
+        restirGiDebugView &&
         debug_params.view != 70u &&
         restir_gi_reservoir_valid(reservoir) &&
         temporal_history_available() &&
@@ -633,6 +753,41 @@ void store_initial_restir_gi_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims
     }
 
     restir_gi_reservoirs[pixelIndex] = reservoir;
+}
+
+// Phase 2: Populate the GI receiver buffer for reuse passes.
+void store_restir_gi_receiver(uint pixelIndex, ivec2 coords, uint packedVelocity, PathComponents components, vec3 hitPosition, vec3 hitNormal, float hitDepth, bool didHit) {
+    if ((camera.restir_gi_controls.y & 4u) == 0u) {
+        return;
+    }
+    RestirGiReceiver receiver;
+    if (didHit && components.first_material_id != 0xffffffffu) {
+        receiver.positionDepth = vec4(hitPosition, hitDepth);
+        receiver.normalRoughness = vec4(hitNormal, components.first_roughness);
+        receiver.geometryNormalMetal = vec4(components.first_geom_normal, components.first_metallic);
+        receiver.albedoOcclusion = vec4(components.restir_di_base_color, components.first_occlusion);
+        receiver.materialIds = uvec4(
+            components.first_material_id,
+            components.instance_id,
+            components.mesh_id,
+            components.primitive_id);
+    } else {
+        receiver.positionDepth = vec4(0.0, 0.0, 0.0, 65504.0);
+        receiver.normalRoughness = vec4(0.0, 1.0, 0.0, 1.0);
+        receiver.geometryNormalMetal = vec4(0.0, 1.0, 0.0, 0.0);
+        receiver.albedoOcclusion = vec4(0.0);
+        receiver.materialIds = uvec4(0xffffffffu);
+    }
+    uint cutBit = temporal_history_available() ? 0u : 1u;
+    uint sceneVersion = camera.gi_version_controls.z ^
+        (camera.gi_version_controls.x * 16777619u) ^
+        (camera.gi_version_controls.w * 2166136261u);
+    receiver.motion = uvec4(
+        packedVelocity,
+        cutBit,
+        sceneVersion,
+        camera.gi_version_controls.y);
+    restir_gi_receivers[pixelIndex] = receiver;
 }
 
 void reset_payload() {
@@ -936,6 +1091,27 @@ bool sample_emissive_light(
         lightNormalOut = -wi;
         pdfSolidAngle = selectedPdf;
         distanceToLight = 10000.0;
+        return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+    }
+    if (selected.metadata.x == 1u) {
+        vec3 center = selected.data1.xyz;
+        float radius = max(selected.data0.z, 1.0e-6);
+        float z = rand_f32(rng) * 2.0 - 1.0;
+        float phi = 2.0 * PI * rand_f32(rng);
+        float radial = sqrt(max(1.0 - z * z, 0.0));
+        vec3 lightNormal = vec3(radial * cos(phi), z, radial * sin(phi));
+        vec3 samplePos = center + lightNormal * radius;
+        vec3 toLight = samplePos - hitPos;
+        float distSq = dot(toLight, toLight);
+        distanceToLight = sqrt(max(distSq, 1.0e-8));
+        wi = toLight / distanceToLight;
+        float cosLight = max(dot(-wi, lightNormal), 0.0);
+        samplePosition = samplePos;
+        sampleRadiance = max(selected.data2.xyz, vec3(0.0));
+        lightNormalOut = lightNormal;
+        emission = sampleRadiance;
+        float area = max(selected.data0.w, 1.0e-6);
+        pdfSolidAngle = cosLight > 1.0e-6 ? selectedPdf * distSq / (cosLight * area) : 0.0;
         return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
     }
     if (selected.metadata.x == 3u) {
@@ -1454,7 +1630,6 @@ RestirReservoir restir_temporal_resample(RestirReservoir current, RestirReservoi
 
     float currentMass = max(restir_weight_sum(current), restir_target_function(current));
     float previousMass = max(restir_weight_sum(previous), restir_target_function(previous)) *
-        min(restir_sample_count(previous), 32.0) *
         clamp(previous.sample_value_confidence.a, 0.0, 1.0) *
         clamp(motionConfidence, 0.0, 1.0) *
         restir_age_confidence(previous, 32.0);
@@ -1529,6 +1704,8 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.restir_initial_direct_light = vec3(0.0);
     components.first_albedo = vec3(1.0);
     components.first_specular_albedo = vec3(0.04);
+    components.restir_di_base_color = vec3(1.0);
+    components.restir_di_f0 = vec3(0.04);
     components.first_roughness = 1.0;
     components.first_occlusion = 1.0;
     components.first_metallic = 0.0;
@@ -1536,6 +1713,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.first_alpha_mode = 0u;
     components.first_transmission = 0.0;
     components.first_mat_type = 0u;
+    components.restir_di_material_supported = 0u;
+    components.restir_di_material_pbr = 0u;
+    components.restir_gi_receiver_supported = 0u;
     components.first_light_pdf = 0.0;
     components.first_bsdf_pdf = 0.0;
     components.first_mis_weight = 0.0;
@@ -1553,6 +1733,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.restir_di_sample_position = vec3(0.0);
     components.restir_di_sample_radiance = vec3(0.0);
     components.restir_di_sample_normal = vec3(0.0, 1.0, 0.0);
+    components.first_view_direction = -normalize(ray.direction);
     components.restir_di_sample_distance = 0.0;
     components.restir_di_light_index = 0u;
     components.restir_di_light_kind = 0u;
@@ -1575,10 +1756,15 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.restir_gi_candidate_position = vec3(0.0);
     components.restir_gi_candidate_normal = vec3(0.0, 1.0, 0.0);
     components.restir_gi_candidate_radiance = vec3(0.0);
+    components.restir_gi_candidate_suffix_radiance = vec3(0.0);
+    components.restir_gi_candidate_source_direction = vec3(0.0, 1.0, 0.0);
     components.restir_gi_receiver_position = vec3(0.0);
     components.restir_gi_candidate_roughness = 1.0;
     components.restir_gi_candidate_hit_distance = 65504.0;
+    components.restir_gi_candidate_source_pdf = 0.0;
     components.restir_gi_candidate_target_pdf = 0.0;
+    components.restir_gi_candidate_path_class = PROD_PATH_CLASS_INVALID;
+    components.restir_gi_candidate_reuse_flags = 0u;
     components.restir_gi_candidate_material_id = 0xffffffffu;
     components.bounce_count = 0u;
     components.instance_id = 0xffffffffu;
@@ -1655,6 +1841,38 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 envContributionScale *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
             }
             env *= envContributionScale;
+            if (bounce == 1u && previousEventType == PATH_EVENT_BSDF && previousBrdfPdf > 1.0e-8 &&
+                components.first_transmission <= 1.0e-5 && components.first_roughness >= 0.2 &&
+                components.restir_gi_receiver_supported != 0u) {
+                RestirGiReceiver sourceReceiver;
+                sourceReceiver.positionDepth = vec4(components.restir_gi_receiver_position, first_depth);
+                sourceReceiver.normalRoughness = vec4(first_normal, components.first_roughness);
+                sourceReceiver.geometryNormalMetal = vec4(components.first_geom_normal, components.first_metallic);
+                sourceReceiver.albedoOcclusion = vec4(components.restir_di_base_color, components.first_occlusion);
+                sourceReceiver.materialIds = uvec4(components.first_material_id, components.instance_id, components.mesh_id, components.primitive_id);
+                sourceReceiver.motion = uvec4(0u);
+                vec3 sourceDirection = normalize(ray.direction);
+                vec3 receiverFactor = restir_gi_receiver_factor(sourceReceiver, camera.pos.xyz, sourceDirection);
+                vec3 selectedIntegrand = max(env, vec3(0.0)) * previousBrdfPdf;
+                vec3 suffix = selectedIntegrand / max(receiverFactor, vec3(1.0e-6));
+                float target = restir_gi_luma(selectedIntegrand);
+                if (target > 1.0e-8 && restir_gi_finite3(suffix)) {
+                    components.restir_gi_candidate_valid = 1u;
+                    components.restir_gi_candidate_position = sourceDirection;
+                    components.restir_gi_candidate_normal = -sourceDirection;
+                    components.restir_gi_candidate_radiance = selectedIntegrand;
+                    components.restir_gi_candidate_suffix_radiance = suffix;
+                    components.restir_gi_candidate_source_direction = sourceDirection;
+                    components.restir_gi_candidate_roughness = 1.0;
+                    components.restir_gi_candidate_hit_distance = -1.0;
+                    components.restir_gi_candidate_source_pdf = previousBrdfPdf;
+                    components.restir_gi_candidate_target_pdf = target;
+                    components.restir_gi_candidate_path_class = PROD_PATH_CLASS_ENVIRONMENT_REUSABLE;
+                    components.restir_gi_candidate_reuse_flags = PROD_FLAG_ENVIRONMENT |
+                        (components.first_alpha_mode != 0u ? PROD_FLAG_ALPHA_TESTED : 0u);
+                    components.restir_gi_candidate_material_id = components.first_material_id;
+                }
+            }
             radiance += env;
             if (bounce > 0u) {
                 components.indirect_light += env;
@@ -1670,11 +1888,14 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             first_depth = hit.t;
             first_normal = hit.normal;
             first_position = hit.world_pos;
+            components.first_geom_normal = hit.geom_normal;
             components.restir_gi_receiver_position = hit.world_pos;
             components.first_local_pos = hit.local_pos;
             components.first_barycentrics = hit.barycentrics;
             components.first_albedo = pbr_diffuse_reflectance(material);
             components.first_specular_albedo = pbr_specular_reflectance(material, max(dot(hit.normal, -ray.direction), 0.0));
+            components.restir_di_base_color = clamp(material.color, vec3(0.0), vec3(1.0));
+            components.restir_di_f0 = pbr_f0(material);
             components.first_roughness = material.roughness;
             components.first_occlusion = material.occlusion;
             components.first_metallic = material.metallic;
@@ -1682,6 +1903,25 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.first_alpha_mode = material.alpha_mode;
             components.first_transmission = material_effective_transmission(material);
             components.first_mat_type = material.mat_type;
+            bool restirDiSpecialClosure = material.mat_type == 2u || material.mat_type == 4u || material.mat_type == 5u ||
+                material_effective_transmission(material) > 1.0e-5 ||
+                material.clearcoat_factor > 1.0e-5 ||
+                luminance(max(material.sheen_color, vec3(0.0))) > 1.0e-5 ||
+                abs(material.anisotropy_strength) > 1.0e-4 ||
+                material.use_conductor_optics != 0u ||
+                material.iridescence_factor > 1.0e-5 ||
+                (specular_aa_enabled() && material.normal_variance > 1.0e-5);
+            components.restir_di_material_supported = restirDiSpecialClosure ? 0u : 1u;
+            components.restir_di_material_pbr = material.mat_type == 1u || material.mat_type == 3u ? 1u : 0u;
+            bool restirGiUnsupportedClosure = material.mat_type == 2u || material.mat_type == 4u || material.mat_type == 5u ||
+                material_effective_transmission(material) > 1.0e-5 ||
+                material.clearcoat_factor > 1.0e-5 ||
+                luminance(max(material.sheen_color, vec3(0.0))) > 1.0e-5 ||
+                abs(material.anisotropy_strength) > 1.0e-4 ||
+                material.use_conductor_optics != 0u ||
+                material.iridescence_factor > 1.0e-5 ||
+                homogeneous_volume_enabled();
+            components.restir_gi_receiver_supported = restirGiUnsupportedClosure ? 0u : 1u;
             components.first_specular_probability = pbr_specular_sample_probability(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.first_material_id = hit.material_id;
             components.restir_gi_candidate_material_id = hit.material_id;
@@ -1719,6 +1959,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         }
 
         vec3 wo = -ray.direction;
+        if (bounce == 0u) {
+            components.first_view_direction = normalize(wo);
+        }
         if (material_is_unlit(material)) {
             float unlitContributionScale = bounce > 0u ? camera.indirect_strength : 1.0;
             if (bounce > 0u) {
@@ -1919,14 +2162,23 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         if (bounce > 0u) {
             bounceContributionScale *= mix(components.first_occlusion, 1.0, components.first_specular_probability);
         }
-        vec3 scaledShadedDirect = shadedDirect * atmosTransmittance * bounceContributionScale;
+        vec3 unclampedShadedDirect = shadedDirect * atmosTransmittance * bounceContributionScale;
+        vec3 scaledShadedDirect = unclampedShadedDirect;
         scaledShadedDirect = clamp_luminance_preserve_hue(
             scaledShadedDirect,
             direct_contribution_luminance_limit(bounce, directSampleType, material.roughness));
         radiance += scaledShadedDirect;
         if (bounce == 0u) {
             components.direct_light += scaledShadedDirect;
-            components.restir_initial_direct_light += restirDirect * atmosTransmittance;
+            vec3 unclampedInitialDirect = direct * atmosTransmittance;
+            vec3 clampedInitialDirect = clamp_luminance_preserve_hue(
+                unclampedInitialDirect,
+                direct_contribution_luminance_limit(0u, directSampleType, material.roughness));
+            float unclampedInitialLum = luminance(unclampedInitialDirect);
+            float initialClampScale = unclampedInitialLum > 1.0e-8
+                ? clamp(luminance(clampedInitialDirect) / unclampedInitialLum, 0.0, 1.0)
+                : 1.0;
+            components.restir_initial_direct_light += restirDirect * atmosTransmittance * initialClampScale;
             components.first_light_pdf = lightPdf;
             components.first_bsdf_pdf = bsdfPdfForLight;
             components.first_mis_weight = misWeight;
@@ -1954,16 +2206,48 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         }
         if (bounce == 1u && previousEventType == PATH_EVENT_BSDF) {
             restirGiCandidateRadiance += scaledShadedDirect;
-            float candidateTargetPdf = luminance(restirGiCandidateRadiance);
-            if (candidateTargetPdf > 1.0e-6) {
+            bool receiverSupported = components.restir_gi_receiver_supported != 0u &&
+                components.first_transmission <= 1.0e-5 &&
+                components.first_roughness >= 0.2 && components.first_mat_type != 2u &&
+                material_effective_transmission(material) <= 1.0e-5 &&
+                !homogeneous_volume_enabled();
+            float distance = max(length(hit.world_pos - first_position), 1.0e-4);
+            vec3 sourceDirection = normalize(hit.world_pos - first_position);
+            float measurePdf = restir_gi_source_measure_pdf(
+                previousBrdfPdf, sourceDirection, hit.normal, distance, false);
+            RestirGiReceiver sourceReceiver;
+            sourceReceiver.positionDepth = vec4(first_position, first_depth);
+            sourceReceiver.normalRoughness = vec4(first_normal, components.first_roughness);
+            sourceReceiver.geometryNormalMetal = vec4(components.first_geom_normal, components.first_metallic);
+            sourceReceiver.albedoOcclusion = vec4(components.restir_di_base_color, components.first_occlusion);
+            sourceReceiver.materialIds = uvec4(components.first_material_id, components.instance_id, components.mesh_id, components.primitive_id);
+            sourceReceiver.motion = uvec4(0u);
+            vec3 receiverFactor = restir_gi_receiver_factor(sourceReceiver, camera.pos.xyz, sourceDirection);
+            float measureFactor = max(dot(normalize(hit.normal), -sourceDirection), 0.0) / (distance * distance);
+            vec3 selectedIntegrand = max(restirGiCandidateRadiance, vec3(0.0)) * measurePdf;
+            vec3 suffix = selectedIntegrand / max(receiverFactor * measureFactor, vec3(1.0e-8));
+            float candidateTargetPdf = luminance(selectedIntegrand);
+            if (receiverSupported && previousBrdfPdf > 1.0e-8 && measurePdf > 1.0e-10 &&
+                candidateTargetPdf > 1.0e-8 && restir_gi_finite3(suffix)) {
                 components.restir_gi_candidate_valid = 1u;
                 components.restir_gi_candidate_position = hit.world_pos;
                 components.restir_gi_candidate_normal = hit.normal;
-                components.restir_gi_candidate_radiance = restirGiCandidateRadiance;
+                components.restir_gi_candidate_radiance = selectedIntegrand;
+                components.restir_gi_candidate_suffix_radiance = suffix;
+                components.restir_gi_candidate_source_direction = sourceDirection;
                 components.restir_gi_receiver_position = first_position;
-                components.restir_gi_candidate_roughness = components.first_roughness;
-                components.restir_gi_candidate_hit_distance = min(hit.t, 65504.0);
+                components.restir_gi_candidate_roughness = material.roughness;
+                components.restir_gi_candidate_hit_distance = min(distance, 65504.0);
+                components.restir_gi_candidate_source_pdf = measurePdf;
                 components.restir_gi_candidate_target_pdf = candidateTargetPdf;
+                components.restir_gi_candidate_path_class = hitEmissiveSurface
+                    ? PROD_PATH_CLASS_EMISSIVE_REUSABLE
+                    : (components.first_roughness < 0.65 || components.first_metallic > 0.35
+                        ? PROD_PATH_CLASS_GLOSSY_REUSABLE
+                        : PROD_PATH_CLASS_DIFFUSE_REUSABLE);
+                components.restir_gi_candidate_reuse_flags =
+                    (components.first_alpha_mode != 0u || material.alpha_mode != 0u)
+                    ? PROD_FLAG_ALPHA_TESTED : 0u;
                 components.restir_gi_candidate_material_id = components.first_material_id;
             }
         }
@@ -2304,6 +2588,10 @@ void main() {
         components.specular_ray_direction,
         components.specular_hit_distance);
     pathData.emissive_residual = vec4(max(components.visible_emissive_light, vec3(0.0)), 0.0);
+    vec3 restirGiCurrentFallback = components.restir_gi_candidate_valid != 0u
+        ? components.restir_gi_candidate_radiance / max(components.restir_gi_candidate_source_pdf, 1.0e-8)
+        : vec3(0.0);
+    pathData.restir_gi_fallback_reactive = vec4(max(restirGiCurrentFallback, vec3(0.0)), pathSpecularWeight);
     path_data_buffer[pixel_index] = pathData;
     uint packedVelocity = did_hit
         ? compute_surface_velocity(
@@ -2318,7 +2606,10 @@ void main() {
     velocity_buffer[pixel_index] = packedVelocity;
     store_initial_restir_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
     store_initial_restir_gi_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
-    store_new_restir_di(pixel_index, components, hit_position, hit_normal, hit_depth, did_hit);
+    store_restir_gi_receiver(pixel_index, ivec2(pixel), packedVelocity, components, hit_position, hit_normal, hit_depth, did_hit);
+    if (restir_di_raygen_params.width != 0u) {
+        store_new_restir_di(pixel_index, components, hit_position, hit_normal, hit_depth, did_hit);
+    }
 
     entity_id_buffer[pixel_index] = did_hit && components.instance_id != 0xffffffffu
         ? components.instance_id
@@ -2385,6 +2676,69 @@ void main() {
     } else if (debug_params.view == 105u) {
         // Material type/workflow id mapped to a distinct color per closure type.
         output_value = did_hit ? id_color(components.first_mat_type + 1u) : vec3(0.0);
+    } else if (debug_params.view == 106u) {
+        // RestirDiSelectedLight — visualize light type by color
+        uint lightKind = restir_di_light_kind(restir_di_initial_reservoirs[pixel_index]);
+        output_value = id_color(lightKind + 1u);
+    } else if (debug_params.view == 107u) {
+        // RestirDiTarget — target function luminance (normalized)
+        float targetLum = restir_di_target(restir_di_initial_reservoirs[pixel_index]);
+        output_value = vec3(clamp(targetLum / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 108u) {
+        // RestirDiSourcePdf
+        float srcPdf = restir_di_source_pdf(restir_di_initial_reservoirs[pixel_index]);
+        output_value = vec3(clamp(log2(max(srcPdf, 1e-6) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 109u) {
+        // RestirDiVisibility — green=visible, red=occluded, blue=unknown
+        uint vis = restir_di_visibility(restir_di_initial_reservoirs[pixel_index]);
+        output_value = vis == RESTIR_DI_VISIBILITY_VISIBLE ? vec3(0,1,0) :
+                       vis == RESTIR_DI_VISIBILITY_OCCLUDED ? vec3(1,0,0) :
+                       vec3(0,0,1);
+    } else if (debug_params.view == 110u) {
+        // RestirDiRejectionReason — color by rejection flag bits
+        uint rej = restir_di_rejection_flags(restir_di_initial_reservoirs[pixel_index]);
+        output_value = vec3(float(rej & 1u), float((rej>>1u)&1u), float((rej>>2u)&1u));
+    } else if (debug_params.view == 111u) {
+        // RestirDiTemporalAcceptance — show temporal selection
+        float prevW = restir_di_previous_weight(restir_di_initial_reservoirs[pixel_index]);
+        output_value = vec3(prevW, 1.0 - prevW, 0.0);
+    } else if (debug_params.view == 113u) {
+        // RestirDiFinalContribution — show direct light contribution
+        RestirDiReservoir finalRes = restir_di_initial_reservoirs[pixel_index];
+        output_value = restir_di_reservoir_valid(finalRes)
+            ? restir_di_sample_radiance(finalRes) * restir_di_weight_sum(finalRes) /
+                max(float(max(restir_di_m(finalRes), 1u)) * restir_di_target(finalRes), 1.0e-6) * debug_params.scale
+            : vec3(0.0);
+    } else if (debug_params.view == 114u) {
+        // RestirDiReceiverPosition — world-space position
+        RestirDiReceiver recv = restir_di_receivers[pixel_index];
+        output_value = fract(recv.worldPosition_depth.xyz * 0.25);
+    } else if (debug_params.view == 115u) {
+        // RestirDiReceiverNormal
+        RestirDiReceiver recv = restir_di_receivers[pixel_index];
+        output_value = recv.normal_roughness.xyz * 0.5 + vec3(0.5);
+    } else if (debug_params.view == 116u) {
+        // RestirDiLightVersion
+        uint lv = restir_di_light_version(restir_di_initial_reservoirs[pixel_index]);
+        output_value = vec3(float(lv & 0xffu) / 255.0);
+    } else if (debug_params.view == 117u || debug_params.view == 118u || debug_params.view == 119u) {
+        // RestirDiInitial/Temporal/SpatialReservoir — contribution debug
+        RestirDiReservoir diRes = restir_di_initial_reservoirs[pixel_index];
+        output_value = restir_di_reservoir_valid(diRes)
+            ? restir_di_sample_radiance(diRes) * debug_params.scale
+            : vec3(0.0);
+    } else if (debug_params.view == 121u) {
+        // RestirDiWeightSum
+        float ws = restir_di_weight_sum(restir_di_initial_reservoirs[pixel_index]);
+        output_value = vec3(clamp(ws / 64.0, 0.0, 1.0));
+    } else if (debug_params.view == 122u) {
+        // RestirDiM
+        float mVal = float(restir_di_m(restir_di_initial_reservoirs[pixel_index]));
+        output_value = vec3(clamp(mVal / 32.0, 0.0, 1.0));
+    } else if (debug_params.view == 123u) {
+        // RestirDiLightClass
+        uint lk = restir_di_light_kind(restir_di_initial_reservoirs[pixel_index]);
+        output_value = id_color(lk + 1u);
     } else if (debug_params.view == 23u) {
         output_value = components.first_bounce_throughput;
     } else if (debug_params.view == 24u) {

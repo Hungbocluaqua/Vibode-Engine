@@ -80,6 +80,79 @@ RestirDiReservoirLayout parseRestirDiReservoirLayout(std::string_view value) {
     return RestirDiReservoirLayout::Legacy;
 }
 
+const char* restirGiModeName(RestirGiMode mode) {
+    switch (mode) {
+    case RestirGiMode::Off: return "off";
+    case RestirGiMode::LegacyCache: return "legacy-cache";
+    case RestirGiMode::Production: return "production";
+    case RestirGiMode::ReferenceValidation: return "reference-validation";
+    }
+    return "off";
+}
+
+RestirGiMode parseRestirGiMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "off" || key == "false" || key == "0" || key == "disabled" || key == "none") { return RestirGiMode::Off; }
+    if (key == "legacy" || key == "legacycache" || key == "old" || key == "current") { return RestirGiMode::LegacyCache; }
+    if (key == "on" || key == "true" || key == "1" ||
+        key == "production" || key == "prod" || key == "new" || key == "default") { return RestirGiMode::Production; }
+    if (key == "reference" || key == "validation" || key == "referencevalidation" || key == "ref") { return RestirGiMode::ReferenceValidation; }
+    return RestirGiMode::LegacyCache;
+}
+
+const char* restirGiReservoirLayoutName(RestirGiReservoirLayout layout) {
+    switch (layout) {
+    case RestirGiReservoirLayout::LegacyCachePacked: return "legacy-cache-packed";
+    case RestirGiReservoirLayout::ProductionPacked: return "production-packed";
+    case RestirGiReservoirLayout::ValidationFull: return "validation-full";
+    }
+    return "production-packed";
+}
+
+RestirGiReservoirLayout parseRestirGiReservoirLayout(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "legacy" || key == "legacycachepacked" || key == "legacycache" || key == "old") { return RestirGiReservoirLayout::LegacyCachePacked; }
+    if (key == "packed" || key == "production" || key == "productionpacked" || key == "compact" || key == "compressed") { return RestirGiReservoirLayout::ProductionPacked; }
+    if (key == "full" || key == "validation" || key == "validationfull" || key == "uncompressed") { return RestirGiReservoirLayout::ValidationFull; }
+    return RestirGiReservoirLayout::ProductionPacked;
+}
+
+const char* restirGiActiveTileMaskModeName(RestirGiActiveTileMaskMode mode) {
+    switch (mode) {
+    case RestirGiActiveTileMaskMode::Off: return "off";
+    case RestirGiActiveTileMaskMode::On: return "on";
+    case RestirGiActiveTileMaskMode::Auto: return "auto";
+    }
+    return "off";
+}
+
+RestirGiActiveTileMaskMode parseRestirGiActiveTileMaskMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "on" || key == "true" || key == "1" || key == "yes") {
+        return RestirGiActiveTileMaskMode::On;
+    }
+    if (key == "auto") {
+        return RestirGiActiveTileMaskMode::Auto;
+    }
+    return RestirGiActiveTileMaskMode::Off;
+}
+
+const char* restirHistoryCopyModeName(RestirHistoryCopyMode mode) {
+    switch (mode) {
+    case RestirHistoryCopyMode::Copy: return "copy";
+    case RestirHistoryCopyMode::PingPong: return "pingpong";
+    }
+    return "copy";
+}
+
+RestirHistoryCopyMode parseRestirHistoryCopyMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "pingpong") {
+        return RestirHistoryCopyMode::PingPong;
+    }
+    return RestirHistoryCopyMode::Copy;
+}
+
 const char* renderPresetName(RenderPreset preset) {
     switch (preset) {
     case RenderPreset::Custom: return "custom";
@@ -142,6 +215,27 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "alpha" || key == "materialalpha" || key == "materialopacity") { return RendererDebugView::MaterialAlpha; }
     if (key == "transmission" || key == "materialtransmission" || key == "transmissionfactor") { return RendererDebugView::MaterialTransmission; }
     if (key == "materialworkflow" || key == "workflow" || key == "materialtype" || key == "mattype") { return RendererDebugView::MaterialWorkflow; }
+    if (key == "restirdilight" || key == "restirdiselectedlight" || key == "dilight") { return RendererDebugView::RestirDiSelectedLight; }
+    if (key == "restirditarget" || key == "restirditargetfunction" || key == "ditarget") { return RendererDebugView::RestirDiTarget; }
+    if (key == "restirdisourcepdf" || key == "restirdipdf" || key == "disourcepdf") { return RendererDebugView::RestirDiSourcePdf; }
+    if (key == "restirdivisibility" || key == "restirdivis" || key == "divisibility") { return RendererDebugView::RestirDiVisibility; }
+    if (key == "restirdirejection" || key == "restirdirejectionreason" || key == "direjection") { return RendererDebugView::RestirDiRejectionReason; }
+    if (key == "restirditemporalacceptance" || key == "ditacceptance") { return RendererDebugView::RestirDiTemporalAcceptance; }
+    if (key == "restirdispatialacceptance" || key == "disacceptance") { return RendererDebugView::RestirDiSpatialAcceptance; }
+    if (key == "restirdifinal" || key == "restirdicontribution" || key == "difinalcontribution") { return RendererDebugView::RestirDiFinalContribution; }
+    if (key == "restirdireceiver" || key == "restirdireceiverposition" || key == "direceiver") { return RendererDebugView::RestirDiReceiverPosition; }
+    if (key == "restirdinormal" || key == "restirdireceivernormal" || key == "dinormal") { return RendererDebugView::RestirDiReceiverNormal; }
+    if (key == "restirdilightversion" || key == "dilightversion") { return RendererDebugView::RestirDiLightVersion; }
+    if (key == "restirdiweightsum" || key == "diweightsum" || key == "restirdiw") { return RendererDebugView::RestirDiWeightSum; }
+    if (key == "restirdim" || key == "dim" || key == "restirdisamplecount") { return RendererDebugView::RestirDiM; }
+    if (key == "restirdilightclass" || key == "dilightclass" || key == "restirdilighttype" || key == "dilighttype") { return RendererDebugView::RestirDiLightClass; }
+    if (key == "restirdiage" || key == "diage") { return RendererDebugView::RestirDiAge; }
+    if (key == "restirdiconfidence" || key == "diconfidence") { return RendererDebugView::RestirDiConfidence; }
+    if (key == "restirdireferencediff" || key == "direferencediff") { return RendererDebugView::RestirDiReferenceDiff; }
+    if (key == "restirdiinitial" || key == "restirdiinitreservoir" || key == "diinitialreservoir") { return RendererDebugView::RestirDiInitialReservoir; }
+    if (key == "restirditemporalreservoir" || key == "ditemporalreservoir") { return RendererDebugView::RestirDiTemporalReservoir; }
+    if (key == "restirdispatialreservoir" || key == "dispatialreservoir") { return RendererDebugView::RestirDiSpatialReservoir; }
+    if (key == "restirdifinalreservoir" || key == "difinalreservoir") { return RendererDebugView::RestirDiFinalReservoir; }
     if (key == "direct" || key == "directlighting") { return RendererDebugView::DirectLighting; }
     if (key == "indirect" || key == "indirectlighting") { return RendererDebugView::IndirectLighting; }
     if (key == "emissive" || key == "emissivecontribution") { return RendererDebugView::EmissiveContribution; }
@@ -269,6 +363,12 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     }
     if (key == "restirgihitdistance" || key == "gihitdistance" || key == "gireservoirhitdistance") {
         return RendererDebugView::RestirGiHitDistance;
+    }
+    if (key == "restirgigrid" || key == "gigrid" || key == "restirgiperiodicity" || key == "giperiodicity") {
+        return RendererDebugView::RestirGiGrid;
+    }
+    if (key == "restirgipathclass" || key == "gipathclass" || key == "restirgiclass" || key == "giclass") {
+        return RendererDebugView::RestirGiPathClass;
     }
     if (key == "wavefrontqueueoccupancy" || key == "wavefrontoccupancy" || key == "queueoccupancy") {
         return RendererDebugView::WavefrontQueueOccupancy;
@@ -418,6 +518,29 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirGiFinal: return "restir-gi-final";
     case RendererDebugView::RestirGiNormal: return "restir-gi-normal";
     case RendererDebugView::RestirGiHitDistance: return "restir-gi-hit-distance";
+    case RendererDebugView::RestirGiGrid: return "restir-gi-grid";
+    case RendererDebugView::RestirGiPathClass: return "restir-gi-path-class";
+    case RendererDebugView::RestirDiSelectedLight: return "restir-di-selected-light";
+    case RendererDebugView::RestirDiTarget: return "restir-di-target";
+    case RendererDebugView::RestirDiSourcePdf: return "restir-di-source-pdf";
+    case RendererDebugView::RestirDiVisibility: return "restir-di-visibility";
+    case RendererDebugView::RestirDiRejectionReason: return "restir-di-rejection-reason";
+    case RendererDebugView::RestirDiTemporalAcceptance: return "restir-di-temporal-accepted";
+    case RendererDebugView::RestirDiSpatialAcceptance: return "restir-di-spatial-accepted";
+    case RendererDebugView::RestirDiFinalContribution: return "restir-di-final";
+    case RendererDebugView::RestirDiReceiverPosition: return "restir-di-receiver-position";
+    case RendererDebugView::RestirDiReceiverNormal: return "restir-di-receiver-normal";
+    case RendererDebugView::RestirDiLightVersion: return "restir-di-light-version";
+    case RendererDebugView::RestirDiInitialReservoir: return "restir-di-initial-reservoir";
+    case RendererDebugView::RestirDiTemporalReservoir: return "restir-di-temporal-reservoir";
+    case RendererDebugView::RestirDiSpatialReservoir: return "restir-di-spatial-reservoir";
+    case RendererDebugView::RestirDiFinalReservoir: return "restir-di-final-reservoir";
+    case RendererDebugView::RestirDiWeightSum: return "restir-di-weight-sum";
+    case RendererDebugView::RestirDiM: return "restir-di-m";
+    case RendererDebugView::RestirDiLightClass: return "restir-di-light-type";
+    case RendererDebugView::RestirDiAge: return "restir-di-age";
+    case RendererDebugView::RestirDiConfidence: return "restir-di-confidence";
+    case RendererDebugView::RestirDiReferenceDiff: return "restir-di-reference-diff";
     case RendererDebugView::WavefrontQueueOccupancy: return "wavefront-queue-occupancy";
     case RendererDebugView::WavefrontPathDepth: return "wavefront-path-depth";
     case RendererDebugView::WavefrontLiveRays: return "wavefront-live-rays";
@@ -445,24 +568,6 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::MaterialAlpha: return "material-alpha";
     case RendererDebugView::MaterialTransmission: return "material-transmission";
     case RendererDebugView::MaterialWorkflow: return "material-workflow";
-    case RendererDebugView::RestirDiSelectedLight: return "restir-di-selected-light";
-    case RendererDebugView::RestirDiTarget: return "restir-di-target";
-    case RendererDebugView::RestirDiSourcePdf: return "restir-di-source-pdf";
-    case RendererDebugView::RestirDiVisibility: return "restir-di-visibility";
-    case RendererDebugView::RestirDiRejectionReason: return "restir-di-rejection-reason";
-    case RendererDebugView::RestirDiTemporalAcceptance: return "restir-di-temporal-acceptance";
-    case RendererDebugView::RestirDiSpatialAcceptance: return "restir-di-spatial-acceptance";
-    case RendererDebugView::RestirDiFinalContribution: return "restir-di-final-contribution";
-    case RendererDebugView::RestirDiReceiverPosition: return "restir-di-receiver-position";
-    case RendererDebugView::RestirDiReceiverNormal: return "restir-di-receiver-normal";
-    case RendererDebugView::RestirDiLightVersion: return "restir-di-light-version";
-    case RendererDebugView::RestirDiInitialReservoir: return "restir-di-initial-reservoir";
-    case RendererDebugView::RestirDiTemporalReservoir: return "restir-di-temporal-reservoir";
-    case RendererDebugView::RestirDiSpatialReservoir: return "restir-di-spatial-reservoir";
-    case RendererDebugView::RestirDiFinalReservoir: return "restir-di-final-reservoir";
-    case RendererDebugView::RestirDiWeightSum: return "restir-di-weight-sum";
-    case RendererDebugView::RestirDiM: return "restir-di-m";
-    case RendererDebugView::RestirDiLightClass: return "restir-di-light-class";
     }
     return "beauty";
 }

@@ -166,9 +166,7 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         }
     };
 
-    int selectedDebug = editorDebugViewIndex(settings.debugView);
-    if (ImGui::BeginCombo(label, rendererDebugViewName(settings.debugView))) {
-        (void)selectedDebug;
+    if (ImGui::BeginCombo(label, rendererDebugViewName(settings.debugView), ImGuiComboFlags_HeightLarge)) {
         ImGui::SeparatorText("Core");
         selectable(RendererDebugView::Beauty);
         selectable(RendererDebugView::Depth);
@@ -178,10 +176,26 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::Variance);
         selectable(RendererDebugView::ReprojectionConfidence);
         selectable(RendererDebugView::DenoiserRejection);
+
         ImGui::SeparatorText("Material");
         selectable(RendererDebugView::Albedo);
+        selectable(RendererDebugView::Roughness);
+        selectable(RendererDebugView::Metallic);
+        selectable(RendererDebugView::MaterialAlpha);
+        selectable(RendererDebugView::MaterialTransmission);
+        selectable(RendererDebugView::MaterialWorkflow);
+        selectable(RendererDebugView::MaterialOcclusion);
+        selectable(RendererDebugView::ClayMaterial);
+        selectable(RendererDebugView::InstanceId);
+        selectable(RendererDebugView::MeshId);
+
+        ImGui::SeparatorText("Path Data");
         selectable(RendererDebugView::PathDataAlbedo);
         selectable(RendererDebugView::PathDataMetrics);
+        selectable(RendererDebugView::SampleDimension);
+        selectable(RendererDebugView::SampleScramble);
+
+        ImGui::SeparatorText("Denoiser");
         selectable(RendererDebugView::DenoiserKernelRadius);
         selectable(RendererDebugView::DenoiserHitDistance);
         selectable(RendererDebugView::DenoiserVirtualMotion);
@@ -202,17 +216,16 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::DenoiserIndirectSpecularVariance);
         selectable(RendererDebugView::DenoiserDiffuseHistoryLength);
         selectable(RendererDebugView::DenoiserSpecularHistoryLength);
+        selectable(RendererDebugView::DenoiserDiffuseRawVariance);
+        selectable(RendererDebugView::DenoiserSpecularRawVariance);
+
+        ImGui::SeparatorText("Moments");
         selectable(RendererDebugView::MomentUpdateValidity);
         selectable(RendererDebugView::MomentDisocclusionConfidence);
         selectable(RendererDebugView::MomentNormalCone);
         selectable(RendererDebugView::MomentDepthDelta);
         selectable(RendererDebugView::MomentHistoryKindValid);
-        selectable(RendererDebugView::DenoiserDiffuseRawVariance);
-        selectable(RendererDebugView::DenoiserSpecularRawVariance);
-        selectable(RendererDebugView::Roughness);
-        selectable(RendererDebugView::ClayMaterial);
-        selectable(RendererDebugView::InstanceId);
-        selectable(RendererDebugView::MeshId);
+
         ImGui::SeparatorText("Lighting");
         selectable(RendererDebugView::DirectLighting);
         selectable(RendererDebugView::PathDirectDiffuse);
@@ -232,24 +245,27 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::RisRawLightPdf);
         selectable(RendererDebugView::RisEffectiveLightPdf);
         selectable(RendererDebugView::RisPdfRatio);
-        selectable(RendererDebugView::SampleDimension);
-        selectable(RendererDebugView::SampleScramble);
         selectable(RendererDebugView::DirectSampleType);
         selectable(RendererDebugView::CausticVisibility);
+
         ImGui::SeparatorText("Transport");
         selectable(RendererDebugView::FirstBounceThroughput);
         selectable(RendererDebugView::SecondaryEnvironmentMiss);
         selectable(RendererDebugView::BounceCount);
         selectable(RendererDebugView::SecondaryEnvironmentRadiance);
         selectable(RendererDebugView::WhiteEnvironmentTransport);
+
         ImGui::SeparatorText("Atmosphere");
         selectable(RendererDebugView::AtmosphereSkyView);
         selectable(RendererDebugView::AtmosphereTransmittance);
         selectable(RendererDebugView::AtmosphereAerialPerspective);
         selectable(RendererDebugView::AtmosphereMultiScatter);
-        ImGui::SeparatorText("Temporal / ReSTIR");
+
+        ImGui::SeparatorText("Temporal");
         selectable(RendererDebugView::TemporalReactiveMask);
         selectable(RendererDebugView::TemporalHistoryWeight);
+
+        ImGui::SeparatorText("ReSTIR");
         selectable(RendererDebugView::RestirReservoirAge);
         selectable(RendererDebugView::RestirReservoirConfidence);
         selectable(RendererDebugView::RestirReservoirM);
@@ -262,6 +278,7 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::RestirGiFinal);
         selectable(RendererDebugView::RestirGiNormal);
         selectable(RendererDebugView::RestirGiHitDistance);
+
         ImGui::SeparatorText("Wavefront Queue");
         selectable(RendererDebugView::WavefrontQueueOccupancy);
         selectable(RendererDebugView::WavefrontPathDepth);

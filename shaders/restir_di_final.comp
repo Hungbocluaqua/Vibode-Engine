@@ -1,6 +1,11 @@
-#version 450
+#version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_ARB_shading_language_packing : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
 
+#define RTV_RESTIR_DI_ENABLE_RAY_QUERY 1
+layout(set = 0, binding = 10) uniform accelerationStructureEXT topLevelAS;
 #include "restir_di_common.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -26,16 +31,7 @@ layout(set = 0, binding = 4, std430) writeonly buffer FinalReservoirs {
 
 // Counter buffer
 layout(set = 0, binding = 5, std430) buffer Counters {
-    uint final_pixels_processed;
-    uint final_reservoir_valid;
-    uint final_reservoir_invalid;
-    uint final_fallback_to_initial;
-    uint final_visibility_checked;
-    uint final_visibility_visible;
-    uint final_visibility_occluded;
-    uint final_estimate_produced;
-    uint final_clamped;
-    uint final_rejection_flags;
+    uint values[];
 } counters;
 
 layout(set = 0, binding = 6, std140) uniform Params {
@@ -56,11 +52,17 @@ layout(set = 0, binding = 6, std140) uniform Params {
     float lumClampNeighborMaxFactor;
     float fireflyClamp;
     float productionClampLuminance;
-    uint useFallbackInitial;
+    uint mode;
     uint spatialResultValid;
-    uint padding0;
-    uint padding1;
+    uint visibilityRayBudget;
+    uint historyValid;
+    uint materialVisibilityFlags;
+    uint counterEnabled;
+    uint rawOutputIsCurrentSample;
+    uint padding2;
 } params;
+
+#define DI_COUNTER_ADD(counter, value) ((params.counterEnabled != 0u) ? atomicAdd(counter, value) : 0u)
 
 struct PathDataRecord {
     vec4 direct_diffuse;
@@ -73,6 +75,7 @@ struct PathDataRecord {
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
     vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
 };
 
 layout(set = 0, binding = 7, std430) buffer PathDataBuffer {
@@ -90,11 +93,229 @@ layout(set = 0, binding = 9, std140) uniform RendererDebug {
     float scale;
 } debug_params;
 
+layout(set = 0, binding = 11, std430) readonly buffer TemporalReservoirs {
+    RestirDiReservoir temporal_reservoirs[];
+};
+
+layout(set = 0, binding = 14, std430) buffer VarianceBuffer {
+    uint variance_buffer[];
+};
+
+const uint DEBUG_RESTIR_DI_SELECTED_LIGHT = 106u;
+const uint DEBUG_RESTIR_DI_TARGET = 107u;
+const uint DEBUG_RESTIR_DI_SOURCE_PDF = 108u;
+const uint DEBUG_RESTIR_DI_VISIBILITY = 109u;
+const uint DEBUG_RESTIR_DI_REJECTION = 110u;
+const uint DEBUG_RESTIR_DI_TEMPORAL_ACCEPTANCE = 111u;
+const uint DEBUG_RESTIR_DI_SPATIAL_ACCEPTANCE = 112u;
+const uint DEBUG_RESTIR_DI_FINAL_CONTRIBUTION = 113u;
+const uint DEBUG_RESTIR_DI_RECEIVER_POSITION = 114u;
+const uint DEBUG_RESTIR_DI_RECEIVER_NORMAL = 115u;
+const uint DEBUG_RESTIR_DI_LIGHT_VERSION = 116u;
+const uint DEBUG_RESTIR_DI_INITIAL = 117u;
+const uint DEBUG_RESTIR_DI_TEMPORAL = 118u;
+const uint DEBUG_RESTIR_DI_SPATIAL = 119u;
+const uint DEBUG_RESTIR_DI_FINAL = 120u;
+const uint DEBUG_RESTIR_DI_WEIGHT_SUM = 121u;
+const uint DEBUG_RESTIR_DI_M = 122u;
+const uint DEBUG_RESTIR_DI_LIGHT_CLASS = 123u;
+const uint DEBUG_RESTIR_DI_AGE = 124u;
+const uint DEBUG_RESTIR_DI_CONFIDENCE = 125u;
+const uint DEBUG_RESTIR_DI_REFERENCE_DIFF = 126u;
+const uint DEBUG_RESTIR_LEGACY_AGE = 35u;
+const uint DEBUG_RESTIR_LEGACY_CONFIDENCE = 36u;
+const uint DEBUG_RESTIR_LEGACY_M = 37u;
+
 float luminance(vec3 value) {
     return dot(value, vec3(0.2126, 0.7152, 0.0722));
 }
 
-void replace_direct_lighting(ivec2 coords, uint pixelIndex, vec3 finalContribution) {
+vec3 restir_di_reservoir_estimate_at_receiver(RestirDiReservoir reservoir, RestirDiReceiver receiver);
+
+vec3 clamp_luminance_preserve_hue(vec3 value, float maxLum) {
+    float valueLum = luminance(max(value, vec3(0.0)));
+    if (valueLum <= maxLum || valueLum <= 1.0e-6) {
+        return value;
+    }
+    return value * (maxLum / valueLum);
+}
+
+float restir_di_initial_direct_luminance_limit(RestirDiReceiver receiver) {
+    float base = max(params.fireflyClamp, 1.0);
+    float roughnessScale = mix(0.75, 1.35, clamp(receiver.normal_roughness.w, 0.0, 1.0));
+    return max(base, base * 4.0 * roughnessScale);
+}
+
+vec3 restir_di_initial_replacement_estimate(RestirDiReservoir reservoir, RestirDiReceiver receiver) {
+    vec3 estimate = restir_di_reservoir_estimate_at_receiver(reservoir, receiver);
+    return clamp_luminance_preserve_hue(
+        estimate,
+        restir_di_initial_direct_luminance_limit(receiver));
+}
+
+uint pack_variance(float value) {
+    return packUnorm2x16(vec2(clamp(value / 64.0, 0.0, 1.0), 0.0));
+}
+
+RestirDiReservoir restir_di_empty_with_m(RestirDiReservoir source) {
+    RestirDiReservoir empty = restir_di_empty_reservoir();
+    restir_di_set_m(empty, restir_di_m(source));
+    return empty;
+}
+
+void restir_di_atomic_add_u64(uint lowIndex, uint highIndex, uint value) {
+    uint previous = DI_COUNTER_ADD(counters.values[lowIndex], value);
+    if (previous > 0xffffffffu - value) {
+        DI_COUNTER_ADD(counters.values[highIndex], 1u);
+    }
+}
+
+vec3 restir_di_id_color(uint id) {
+    uint h = id * 747796405u + 2891336453u;
+    h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    h = (h >> 22u) ^ h;
+    return vec3(
+        float((h >> 0u) & 255u),
+        float((h >> 8u) & 255u),
+        float((h >> 16u) & 255u)) / 255.0;
+}
+
+vec3 restir_di_visibility_color(uint visibility) {
+    if (visibility == RESTIR_DI_VISIBILITY_VISIBLE) return vec3(0.0, 1.0, 0.0);
+    if (visibility == RESTIR_DI_VISIBILITY_OCCLUDED) return vec3(1.0, 0.0, 0.0);
+    if (visibility == RESTIR_DI_VISIBILITY_INVALID) return vec3(1.0, 0.0, 1.0);
+    return vec3(0.0, 0.2, 1.0);
+}
+
+vec3 restir_di_reservoir_estimate_at_receiver(RestirDiReservoir reservoir, RestirDiReceiver receiver) {
+    if (!restir_di_reservoir_valid(reservoir)) return vec3(0.0);
+    RestirDiLightRecord light;
+    uint lightIndex;
+    if (!restir_di_resolve_light(reservoir, light, lightIndex)) return vec3(0.0);
+    vec3 lightNormal = restir_di_light_normal(reservoir);
+    float pdf = restir_di_pdf_at_receiver(
+        lightIndex, light, receiver.worldPosition_depth.xyz,
+        reservoir.samplePosition_distance.xyz, lightNormal);
+    vec3 direction;
+    float distanceToLight;
+    vec3 integrand = restir_di_evaluate_integrand(
+        reservoir, receiver, light, pdf, direction, distanceToLight, lightNormal);
+    return restir_di_final_estimate(
+        integrand,
+        restir_di_weight_sum(reservoir),
+        float(max(restir_di_m(reservoir), 1u)),
+        restir_di_target(reservoir));
+}
+
+vec3 restir_di_reservoir_debug(RestirDiReservoir reservoir, uint view) {
+    if (!restir_di_reservoir_valid(reservoir)) {
+        return vec3(0.0);
+    }
+    if (view == DEBUG_RESTIR_DI_SELECTED_LIGHT) {
+        return restir_di_id_color(restir_di_light_id(reservoir) + 1u);
+    }
+    if (view == DEBUG_RESTIR_DI_TARGET) {
+        return vec3(clamp(restir_di_target(reservoir) / 16.0, 0.0, 1.0));
+    }
+    if (view == DEBUG_RESTIR_DI_SOURCE_PDF) {
+        return vec3(clamp(log2(max(restir_di_source_pdf(reservoir), 1.0e-6) + 1.0) / 16.0, 0.0, 1.0));
+    }
+    if (view == DEBUG_RESTIR_DI_VISIBILITY) {
+        return restir_di_visibility_color(restir_di_visibility(reservoir));
+    }
+    if (view == DEBUG_RESTIR_DI_REJECTION) {
+        uint flags = restir_di_rejection_flags(reservoir);
+        return vec3(float((flags >> 0u) & 1u), float((flags >> 1u) & 1u), float((flags >> 2u) & 1u));
+    }
+    if (view == DEBUG_RESTIR_DI_LIGHT_VERSION) {
+        return vec3(float(restir_di_light_version(reservoir) & 255u) / 255.0);
+    }
+    if (view == DEBUG_RESTIR_DI_WEIGHT_SUM) {
+        return vec3(clamp(restir_di_weight_sum(reservoir) / 64.0, 0.0, 1.0));
+    }
+    if (view == DEBUG_RESTIR_DI_M || view == DEBUG_RESTIR_LEGACY_M) {
+        float maxM = max(float(params.spatialMaxM), 1.0);
+        return vec3(clamp(float(restir_di_m(reservoir)) / maxM, 0.0, 1.0));
+    }
+    if (view == DEBUG_RESTIR_DI_LIGHT_CLASS) {
+        return restir_di_id_color(restir_di_light_kind(reservoir) + 1u);
+    }
+    if (view == DEBUG_RESTIR_DI_AGE || view == DEBUG_RESTIR_LEGACY_AGE) {
+        float maxAge = max(float(params.temporalMaxAge), 1.0);
+        return vec3(clamp(float(restir_di_age(reservoir)) / maxAge, 0.0, 1.0));
+    }
+    if (view == DEBUG_RESTIR_DI_CONFIDENCE || view == DEBUG_RESTIR_LEGACY_CONFIDENCE) {
+        float confidence = restir_di_confidence(reservoir);
+        return vec3(1.0 - confidence, confidence, 0.0);
+    }
+    return restir_di_sample_radiance(reservoir) * debug_params.scale;
+}
+
+bool restir_di_write_debug(
+    ivec2 coords,
+    RestirDiReceiver receiver,
+    RestirDiReservoir initial,
+    RestirDiReservoir temporal,
+    RestirDiReservoir spatial,
+    RestirDiReservoir finalReservoir) {
+    uint view = debug_params.view;
+    vec3 color;
+    if (view == DEBUG_RESTIR_DI_RECEIVER_POSITION) {
+        color = fract(receiver.worldPosition_depth.xyz * 0.25);
+    } else if (view == DEBUG_RESTIR_DI_RECEIVER_NORMAL) {
+        color = normalize(receiver.normal_roughness.xyz) * 0.5 + vec3(0.5);
+    } else if (view == DEBUG_RESTIR_DI_TEMPORAL_ACCEPTANCE) {
+        float previousWeight = restir_di_previous_weight(temporal);
+        color = vec3(previousWeight, 1.0 - previousWeight, 0.0);
+    } else if (view == DEBUG_RESTIR_DI_SPATIAL_ACCEPTANCE) {
+        bool selectedNeighbor = restir_di_reservoir_valid(spatial) &&
+            restir_di_reservoir_valid(temporal) &&
+            (restir_di_light_id(spatial) != restir_di_light_id(temporal) ||
+             restir_di_m(spatial) > restir_di_m(temporal));
+        color = selectedNeighbor ? vec3(0.1, 0.9, 1.0) : vec3(1.0, 0.75, 0.1);
+    } else if (view == DEBUG_RESTIR_DI_REFERENCE_DIFF) {
+        vec3 initialEstimate = restir_di_reservoir_estimate_at_receiver(initial, receiver);
+        vec3 finalEstimate = restir_di_reservoir_estimate_at_receiver(finalReservoir, receiver);
+        color = abs(finalEstimate - initialEstimate) * debug_params.scale;
+    } else if (view == DEBUG_RESTIR_DI_FINAL || view == DEBUG_RESTIR_DI_FINAL_CONTRIBUTION) {
+        color = restir_di_reservoir_estimate_at_receiver(finalReservoir, receiver) * debug_params.scale;
+    } else if (view == DEBUG_RESTIR_DI_INITIAL) {
+        color = restir_di_reservoir_debug(initial, view);
+    } else if (view == DEBUG_RESTIR_DI_TEMPORAL) {
+        color = restir_di_reservoir_debug(temporal, view);
+    } else if (view == DEBUG_RESTIR_DI_SPATIAL) {
+        color = restir_di_reservoir_debug(spatial, view);
+    } else if (view == DEBUG_RESTIR_DI_FINAL ||
+               view == DEBUG_RESTIR_DI_FINAL_CONTRIBUTION ||
+               view == DEBUG_RESTIR_DI_SELECTED_LIGHT ||
+               view == DEBUG_RESTIR_DI_TARGET ||
+               view == DEBUG_RESTIR_DI_SOURCE_PDF ||
+               view == DEBUG_RESTIR_DI_VISIBILITY ||
+               view == DEBUG_RESTIR_DI_REJECTION ||
+               view == DEBUG_RESTIR_DI_LIGHT_VERSION ||
+               view == DEBUG_RESTIR_DI_WEIGHT_SUM ||
+               view == DEBUG_RESTIR_DI_M ||
+               view == DEBUG_RESTIR_DI_LIGHT_CLASS ||
+               view == DEBUG_RESTIR_DI_AGE ||
+               view == DEBUG_RESTIR_DI_CONFIDENCE ||
+               view == DEBUG_RESTIR_LEGACY_AGE ||
+               view == DEBUG_RESTIR_LEGACY_CONFIDENCE ||
+               view == DEBUG_RESTIR_LEGACY_M) {
+        color = restir_di_reservoir_debug(finalReservoir, view);
+    } else {
+        return false;
+    }
+    imageStore(raw_image, coords, vec4(max(color, vec3(0.0)), 1.0));
+    return true;
+}
+
+void replace_direct_lighting(
+    ivec2 coords,
+    uint pixelIndex,
+    vec3 initialContribution,
+    vec3 finalContribution,
+    RestirDiReservoir selected,
+    RestirDiReceiver receiver) {
     if (debug_params.view != 0u) {
         return;
     }
@@ -103,24 +324,69 @@ void replace_direct_lighting(ivec2 coords, uint pixelIndex, vec3 finalContributi
     vec3 oldDiffuse = max(path.direct_diffuse.rgb, vec3(0.0));
     vec3 oldSpecular = max(path.direct_specular.rgb, vec3(0.0));
     vec3 oldDirect = oldDiffuse + oldSpecular;
-    vec3 directDelta = finalContribution - oldDirect;
+    vec3 directDelta = finalContribution - max(initialContribution, vec3(0.0));
+    vec3 newDirect = max(oldDirect + directDelta, vec3(0.0));
 
     vec4 accumulated = accumulation_buffer[pixelIndex];
     float accumulationSamples = max(accumulated.a, 1.0);
     accumulation_buffer[pixelIndex] = vec4(max(accumulated.rgb + directDelta, vec3(0.0)), accumulated.a);
 
     vec3 base = imageLoad(raw_image, coords).rgb;
-    vec3 replaced = max(base + directDelta / accumulationSamples, vec3(0.0));
+    float rawDeltaScale = params.rawOutputIsCurrentSample != 0u ? 1.0 : 1.0 / accumulationSamples;
+    vec3 replaced = max(base + directDelta * rawDeltaScale, vec3(0.0));
     imageStore(raw_image, coords, vec4(replaced, 1.0));
 
     float diffuseLum = luminance(oldDiffuse);
     float specularLum = luminance(oldSpecular);
     float totalLum = diffuseLum + specularLum;
-    float specularWeight = totalLum > 1.0e-6 ? clamp(specularLum / totalLum, 0.0, 1.0) : 0.0;
-    path.direct_diffuse.rgb = finalContribution * (1.0 - specularWeight);
-    path.direct_specular.rgb = finalContribution * specularWeight;
+    vec3 receiverDiffuse = restir_di_receiver_base_color(receiver) *
+        (1.0 - restir_di_receiver_metallic(receiver));
+    vec3 receiverSpecular = restir_di_receiver_specular_color(receiver);
+    float materialTotal = luminance(receiverDiffuse) + luminance(receiverSpecular);
+    float materialSpecularWeight = materialTotal > 1.0e-6
+        ? luminance(receiverSpecular) / materialTotal
+        : 0.0;
+    float specularWeight = totalLum > 1.0e-6
+        ? clamp(specularLum / totalLum, 0.0, 1.0)
+        : clamp(materialSpecularWeight, 0.0, 1.0);
+    path.direct_diffuse.rgb = newDirect * (1.0 - specularWeight);
+    path.direct_specular.rgb = newDirect * specularWeight;
     path.direct_diffuse.a = luminance(max(path.direct_diffuse.rgb, vec3(0.0)));
     path.direct_specular.a = luminance(max(path.direct_specular.rgb, vec3(0.0)));
+
+    RestirDiLightRecord guideLight;
+    uint guideLightIndex;
+    if (restir_di_reservoir_valid(selected) &&
+        restir_di_resolve_light(selected, guideLight, guideLightIndex)) {
+        uint kind = restir_di_light_kind(selected);
+        vec3 guideDirection;
+        float guideDistance;
+        if (kind == 2u) {
+            guideDirection = normalize(guideLight.data1.xyz);
+            guideDistance = 10000.0;
+        } else {
+            vec3 toLight = selected.samplePosition_distance.xyz - receiver.worldPosition_depth.xyz;
+            guideDistance = length(toLight);
+            guideDirection = toLight / max(guideDistance, 1.0e-6);
+        }
+        float indirectDiffuseLum = luminance(max(path.indirect_diffuse.rgb, vec3(0.0)));
+        float indirectSpecularLum = luminance(max(path.indirect_specular.rgb, vec3(0.0)));
+        if (luminance(path.direct_diffuse.rgb) >= indirectDiffuseLum) {
+            path.diffuse_ray_direction_hit_distance = vec4(guideDirection, guideDistance);
+            path.denoiser_hit_distance.x = guideDistance;
+        }
+        if (luminance(path.direct_specular.rgb) >= indirectSpecularLum) {
+            path.specular_ray_direction_hit_distance = vec4(guideDirection, guideDistance);
+            path.denoiser_hit_distance.y = guideDistance;
+        }
+    }
+    vec3 currentSignal = max(path.direct_diffuse.rgb, vec3(0.0)) +
+        max(path.direct_specular.rgb, vec3(0.0)) +
+        max(path.indirect_diffuse.rgb, vec3(0.0)) +
+        max(path.indirect_specular.rgb, vec3(0.0)) +
+        max(path.emissive_residual.rgb, vec3(0.0));
+    vec3 accumulatedAverage = max(accumulation_buffer[pixelIndex].rgb, vec3(0.0)) / accumulationSamples;
+    variance_buffer[pixelIndex] = pack_variance(abs(luminance(currentSignal) - luminance(accumulatedAverage)));
     path_data_buffer[pixelIndex] = path;
 }
 
@@ -131,44 +397,137 @@ void main() {
     }
 
     uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_PIXELS], 1u);
 
     // Load receiver
     RestirDiReceiver receiver = receivers[pixelIndex];
+    uint surfaceFlags = restir_di_receiver_surface_flags(receiver);
+    bool unsupportedSurface = (surfaceFlags & (RESTIR_DI_SURFACE_SKY |
+                                               RESTIR_DI_SURFACE_INVALID |
+                                               RESTIR_DI_SURFACE_DELTA |
+                                               RESTIR_DI_SURFACE_ALPHA |
+                                               RESTIR_DI_SURFACE_UNLIT |
+                                               RESTIR_DI_SURFACE_UNSUPPORTED)) != 0u;
+    if (unsupportedSurface && debug_params.view == 0u) {
+        final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
+        return;
+    }
 
     // Load spatial reservoir
     RestirDiReservoir selected = spatial_reservoirs[pixelIndex];
-    uint rejectionFlags = 0u;
+    RestirDiReservoir spatialDebug = selected;
+    RestirDiReservoir temporalDebug = temporal_reservoirs[pixelIndex];
+    RestirDiReservoir initial = initial_reservoirs[pixelIndex];
+    uint rejectionFlags = restir_di_rejection_flags(selected) |
+        restir_di_rejection_flags(temporalDebug);
     bool usedFallback = false;
+
+    // Hybrid compare keeps classic NEE on the left and applies the new DI
+    // estimator on the right while still producing valid per-pixel history.
+    if (params.mode == 4u && coords.x < int(params.width / 2u)) {
+        final_reservoirs[pixelIndex] = initial;
+        restir_di_write_debug(coords, receiver, initial, temporalDebug, spatialDebug, initial);
+        return;
+    }
 
     // Determine which reservoir to use for final shading
     if (!restir_di_reservoir_valid(selected) || params.enabled == 0u) {
         // Fall back to initial reservoir
-        if (params.useFallbackInitial != 0u) {
-            selected = initial_reservoirs[pixelIndex];
+        if (restir_di_reservoir_valid(initial)) {
+            selected = initial;
             usedFallback = true;
-            atomicAdd(counters.final_fallback_to_initial, 1u);
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_FALLBACK], 1u);
         }
     }
 
     if (!restir_di_reservoir_valid(selected)) {
         // No valid reservoir: keep the existing path-traced lighting intact.
-        final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
-        atomicAdd(counters.final_reservoir_invalid, 1u);
-        atomicAdd(counters.final_pixels_processed, 1u);
+        final_reservoirs[pixelIndex] = restir_di_empty_with_m(selected);
+        restir_di_write_debug(
+            coords,
+            receiver,
+            initial,
+            temporalDebug,
+            spatialDebug,
+            restir_di_empty_reservoir());
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
         return;
     }
 
-    atomicAdd(counters.final_reservoir_valid, 1u);
+    RestirDiLightRecord selectedLight;
+    uint resolvedLightIndex;
+    if (!restir_di_resolve_light(selected, selectedLight, resolvedLightIndex)) {
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_LIGHT_REJECTED], 1u);
+        if (!usedFallback && restir_di_reservoir_valid(initial) &&
+            restir_di_resolve_light(initial, selectedLight, resolvedLightIndex)) {
+            selected = initial;
+            usedFallback = true;
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_FALLBACK], 1u);
+        } else {
+            final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+            restir_di_write_debug(
+                coords,
+                receiver,
+                initial,
+                temporalDebug,
+                spatialDebug,
+                restir_di_empty_reservoir());
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
+            return;
+        }
+    }
+    uint selectedKind = restir_di_light_kind(selected);
+    selected.sampleMetadata.z = (resolvedLightIndex << 8u) | (selectedKind & 0xffu);
 
     // Check surface validity
-    uint surfaceFlags = receiver.primitive_mesh_flags.z;
-    if ((surfaceFlags & (RESTIR_DI_SURFACE_SKY |
-                         RESTIR_DI_SURFACE_INVALID |
-                         RESTIR_DI_SURFACE_DELTA |
-                         RESTIR_DI_SURFACE_ALPHA |
-                         RESTIR_DI_SURFACE_UNLIT)) != 0u) {
+    if (unsupportedSurface) {
         final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
-        atomicAdd(counters.final_pixels_processed, 1u);
+        restir_di_write_debug(
+            coords,
+            receiver,
+            initial,
+            temporalDebug,
+            spatialDebug,
+            restir_di_empty_reservoir());
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
+        return;
+    }
+
+    uint visibility = restir_di_visibility(selected);
+    if ((visibility == RESTIR_DI_VISIBILITY_OCCLUDED ||
+         (visibility == RESTIR_DI_VISIBILITY_UNKNOWN && params.visibilityRayBudget == 0u)) &&
+        !usedFallback) {
+        // Occluded reused sample: fall back to initial candidate
+        if (restir_di_reservoir_valid(initial)) {
+            selected = initial;
+            usedFallback = true;
+            visibility = restir_di_visibility(selected);
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_FALLBACK], 1u);
+        } else {
+            final_reservoirs[pixelIndex] = restir_di_empty_with_m(selected);
+            restir_di_write_debug(
+                coords,
+                receiver,
+                initial,
+                temporalDebug,
+                spatialDebug,
+                restir_di_empty_reservoir());
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
+            return;
+        }
+    }
+
+    if (usedFallback && !restir_di_resolve_light(selected, selectedLight, resolvedLightIndex)) {
+        final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+        restir_di_write_debug(
+            coords,
+            receiver,
+            initial,
+            temporalDebug,
+            spatialDebug,
+            restir_di_empty_reservoir());
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
         return;
     }
 
@@ -176,99 +535,165 @@ void main() {
     vec3 receiverPos = receiver.worldPosition_depth.xyz;
     vec3 receiverNormal = normalize(receiver.normal_roughness.xyz);
     vec3 samplePos = selected.samplePosition_distance.xyz;
-    float sampleDist = selected.samplePosition_distance.w;
-
-    // Compute direction to light
-    vec3 toLight = samplePos - receiverPos;
-    float distToLight = length(toLight);
     vec3 sampleDir;
-    if (distToLight > 1.0e-4) {
-        sampleDir = toLight / distToLight;
-    } else {
-        sampleDir = normalize(selected.sampleDirection_pdf.xyz);
-        distToLight = sampleDist;
+    float distToLight;
+    vec3 selectedLightNormal = restir_di_light_normal(selected);
+    float selectedPdf = restir_di_pdf_at_receiver(
+        resolvedLightIndex, selectedLight, receiverPos, samplePos, selectedLightNormal);
+    vec3 radiance = restir_di_evaluate_integrand(
+        selected, receiver, selectedLight, selectedPdf,
+        sampleDir, distToLight, selectedLightNormal);
+
+    // Reference mode always validates visibility. Production validates any
+    // shifted sample whose visibility is no longer current at this receiver.
+    bool needsVisibility = params.visibilityPolicy == 1u ||
+        visibility == RESTIR_DI_VISIBILITY_UNKNOWN;
+    if (needsVisibility && params.visibilityRayBudget > 0u &&
+        distToLight > RESTIR_DI_VISIBILITY_EPSILON * 2.0) {
+        float tmax = distToLight - RESTIR_DI_VISIBILITY_EPSILON * 2.0;
+        vec3 shadowOrigin = receiverPos +
+            sampleDir * RESTIR_DI_VISIBILITY_EPSILON +
+            receiverNormal * RESTIR_DI_VISIBILITY_EPSILON;
+        visibility = restir_di_ray_query_visible(
+            shadowOrigin,
+            sampleDir,
+            tmax,
+            params.materialVisibilityFlags);
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_VISIBILITY_CHECKED], 1u);
+    } else if (needsVisibility && params.visibilityRayBudget > 0u) {
+        visibility = RESTIR_DI_VISIBILITY_VISIBLE;
     }
 
-    // Cosine at receiver
-    float cosReceiver = max(dot(receiverNormal, sampleDir), 0.0);
-    vec3 estimate;
-    if (cosReceiver <= 0.0) {
-        estimate = vec3(0.0);
-        rejectionFlags |= RESTIR_DI_REJECT_TARGET_ZERO;
-    } else {
-        // Radiance from selected sample
-        vec3 radiance = max(selected.sampleRadiance_target.rgb, vec3(0.0));
-
-        // Compute final estimate
-        // L = f(x, selected) * W / max(M * p_hat(x, selected), epsilon)
-        float weightSum = restir_di_weight_sum(selected);
-        float m = float(max(restir_di_m(selected), 1u));
-        float target = restir_di_target(selected);
-
-        estimate = restir_di_final_estimate(radiance, weightSum, m, target);
-    }
+    float weightSum = restir_di_weight_sum(selected);
+    float m = float(max(restir_di_m(selected), 1u));
+    float target = restir_di_target(selected);
+    vec3 estimate = restir_di_final_estimate(radiance, weightSum, m, target);
 
     // Visibility
-    uint visibility = restir_di_visibility(selected);
-    if (params.visibilityPolicy == 1u) {
-        atomicAdd(counters.final_visibility_checked, 1u);
-        if (visibility == RESTIR_DI_VISIBILITY_UNKNOWN) {
-            // In reference mode, unknown visibility requires a trace
-            // We can't trace rays from a compute shader easily, so mark as
-            // needing further processing. For now, treat unknown as visible
-            // with a warning in production mode.
-            atomicAdd(counters.final_visibility_visible, 1u);
-        } else if (visibility == RESTIR_DI_VISIBILITY_OCCLUDED) {
-            atomicAdd(counters.final_visibility_occluded, 1u);
-            // Fallback to initial if spatial sample is occluded
-            if (usedFallback) {
+    if (visibility == RESTIR_DI_VISIBILITY_UNKNOWN || visibility == RESTIR_DI_VISIBILITY_INVALID) {
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_UNKNOWN_VISIBILITY], 1u);
+        final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+        restir_di_write_debug(
+            coords,
+            receiver,
+            initial,
+            temporalDebug,
+            spatialDebug,
+            restir_di_empty_reservoir());
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
+        return;
+    } else if (visibility == RESTIR_DI_VISIBILITY_OCCLUDED) {
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_OCCLUDED], 1u);
+        rejectionFlags |= RESTIR_DI_REJECT_VISIBILITY;
+        if (!usedFallback && restir_di_reservoir_valid(initial)) {
+            vec3 fallbackEstimate = restir_di_initial_replacement_estimate(initial, receiver);
+            if (!any(isnan(fallbackEstimate)) && !any(isinf(fallbackEstimate))) {
+                selected = initial;
+                estimate = max(fallbackEstimate, vec3(0.0));
+                usedFallback = true;
+                DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_FALLBACK], 1u);
+            } else {
                 final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
-                atomicAdd(counters.final_pixels_processed, 1u);
+                DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
                 return;
             }
-            estimate = vec3(0.0);
         } else {
-            atomicAdd(counters.final_visibility_visible, 1u);
+            final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
+            return;
         }
+    } else {
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_VISIBLE], 1u);
     }
 
     // Production clamps
-    if (params.fireflyClamp > 0.0) {
+    float estimateHistoryScale = 1.0;
+    if (params.temporalLuminanceLimitFactor > 0.0 && params.fireflyClamp > 0.0) {
         float lum = dot(estimate, vec3(0.2126, 0.7152, 0.0722));
         if (lum > params.fireflyClamp) {
-            estimate *= params.fireflyClamp / max(lum, 1.0e-8);
-            atomicAdd(counters.final_clamped, 1u);
+            float clampScale = params.fireflyClamp / max(lum, 1.0e-8);
+            estimate *= clampScale;
+            estimateHistoryScale *= clampScale;
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_CLAMPED], 1u);
             rejectionFlags |= RESTIR_DI_REJECT_CLAMPED;
         }
     }
 
-    if (params.productionClampLuminance > 0.0) {
+    if (params.temporalLuminanceLimitFactor > 0.0 && params.productionClampLuminance > 0.0) {
         float lum = dot(estimate, vec3(0.2126, 0.7152, 0.0722));
         if (lum > params.productionClampLuminance) {
-            estimate *= params.productionClampLuminance / max(lum, 1.0e-8);
-            atomicAdd(counters.final_clamped, 1u);
+            float clampScale = params.productionClampLuminance / max(lum, 1.0e-8);
+            estimate *= clampScale;
+            estimateHistoryScale *= clampScale;
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_CLAMPED], 1u);
             rejectionFlags |= RESTIR_DI_REJECT_CLAMPED;
         }
     }
 
+    vec3 initialContribution = restir_di_initial_replacement_estimate(initial, receiver);
+    bool initialFinite = !any(isnan(initialContribution)) && !any(isinf(initialContribution));
     vec3 finalContribution = max(estimate, vec3(0.0));
     if (any(isnan(finalContribution)) || any(isinf(finalContribution))) {
-        finalContribution = vec3(0.0);
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_NON_FINITE], 1u);
+        if (restir_di_reservoir_valid(initial) && initialFinite) {
+            selected = initial;
+            finalContribution = max(initialContribution, vec3(0.0));
+            usedFallback = true;
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_FALLBACK], 1u);
+        } else {
+            final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
+            return;
+        }
     }
-    replace_direct_lighting(coords, pixelIndex, finalContribution);
-    atomicAdd(counters.final_estimate_produced, 1u);
+    if (!initialFinite) {
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_NON_FINITE], 1u);
+        final_reservoirs[pixelIndex] = restir_di_empty_reservoir();
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_INVALID], 1u);
+        return;
+    }
+    replace_direct_lighting(coords, pixelIndex, initialContribution, finalContribution, selected, receiver);
+    DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_ESTIMATE], 1u);
+    DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_VALID], 1u);
 
     // Prepare final reservoir for history copy
     // Preserve sample identity, update age, set as valid
     RestirDiReservoir historyReservoir = selected;
-    restir_di_set_age(historyReservoir, min(restir_di_age(selected) + 1u, 255u));
-    restir_di_set_valid(historyReservoir, true);
-    historyReservoir.contribution_confidence.w = clamp(selected.contribution_confidence.w, 0.0, 1.0);
-    historyReservoir.reservoirMetadata.w = rejectionFlags;
+    restir_di_set_age(historyReservoir, restir_di_age(selected));
+    restir_di_set_valid(historyReservoir, restir_di_reservoir_valid(historyReservoir));
+    restir_di_set_confidence(historyReservoir, restir_di_confidence(selected));
+    restir_di_set_rejection_flags(historyReservoir, rejectionFlags);
+    if (estimateHistoryScale < 0.999) {
+        restir_di_set_weight_sum(
+            historyReservoir,
+            restir_di_weight_sum(historyReservoir) * clamp(estimateHistoryScale, 0.0, 1.0));
+    }
 
-    // Store final estimate in contribution field for debug
+    const float aggregateScale = 256.0;
+    restir_di_atomic_add_u64(
+        RESTIR_DI_COUNTER_SUM_M_LOW, RESTIR_DI_COUNTER_SUM_M_HIGH,
+        restir_di_m(historyReservoir));
+    restir_di_atomic_add_u64(
+        RESTIR_DI_COUNTER_SUM_AGE_LOW, RESTIR_DI_COUNTER_SUM_AGE_HIGH,
+        restir_di_age(historyReservoir));
+    restir_di_atomic_add_u64(
+        RESTIR_DI_COUNTER_SUM_WEIGHT_LOW, RESTIR_DI_COUNTER_SUM_WEIGHT_HIGH,
+        uint(round(clamp(restir_di_weight_sum(historyReservoir), 0.0, 65535.0) * aggregateScale)));
+    restir_di_atomic_add_u64(
+        RESTIR_DI_COUNTER_SUM_LUMINANCE_LOW, RESTIR_DI_COUNTER_SUM_LUMINANCE_HIGH,
+        uint(round(clamp(luminance(finalContribution), 0.0, 65535.0) * aggregateScale)));
+
+    // ValidationFull preserves the finalized contribution for inspection.
+#if RTV_RESTIR_DI_VALIDATION_FULL
     historyReservoir.contribution_confidence.rgb = finalContribution;
+#endif
 
     final_reservoirs[pixelIndex] = historyReservoir;
-    atomicAdd(counters.final_pixels_processed, 1u);
+    restir_di_write_debug(
+        coords,
+        receiver,
+        initial,
+        temporalDebug,
+        spatialDebug,
+        historyReservoir);
 }

@@ -824,9 +824,14 @@ void RayTracingScene::build(
         sizeof(MeshGeometryRangeGpu) * meshGeometryRanges.size());
     meshGeometryRangesBuffer_.flush(sizeof(MeshGeometryRangeGpu) * meshGeometryRanges.size());
 
+    auto alignScratchSize = [scratchAlignment](VkDeviceSize size) {
+        return scratchAlignment > 0 ? Buffer::alignUp(std::max<VkDeviceSize>(size, 4), scratchAlignment) : std::max<VkDeviceSize>(size, 4);
+    };
+
     std::vector<BlasBuildSizes> blasBuildSizes;
     blasBuildSizes.reserve(rtMeshes.size());
-    VkDeviceSize maxBuildScratchSize = opacityMicromapStats_.active ? opacityMicromapStats_.buildScratchBytes : 0;
+    VkDeviceSize maxBuildScratchSize = opacityMicromapStats_.active ? alignScratchSize(opacityMicromapStats_.buildScratchBytes) : 0;
+    VkDeviceSize totalBlasScratchSize = 0;
     for (uint32_t meshBuildIndex = 0; meshBuildIndex < rtMeshes.size(); ++meshBuildIndex) {
         const RayTracingMeshBuildInput& mesh = rtMeshes[meshBuildIndex];
         if (mesh.meshIndex >= blases_.size() || mesh.vertexCount == 0 || mesh.indexCount < 3) {
@@ -908,7 +913,9 @@ void RayTracingScene::build(
             primitiveCounts.data(),
             &sizes);
 
-        maxBuildScratchSize = std::max(maxBuildScratchSize, sizes.buildScratchSize);
+        const VkDeviceSize alignedBuildScratchSize = alignScratchSize(sizes.buildScratchSize);
+        maxBuildScratchSize = std::max(maxBuildScratchSize, alignedBuildScratchSize);
+        totalBlasScratchSize += alignedBuildScratchSize;
         if (meshAllowsDynamicBlasUpdate(mesh, options)) {
             dynamicBlasUpdateScratchSize_ = std::max(dynamicBlasUpdateScratchSize_, sizes.updateScratchSize);
         }
@@ -951,11 +958,16 @@ void RayTracingScene::build(
         &tlasBuildInfoForSizing,
         &plannedInstanceCount,
         &tlasSizes);
-    maxBuildScratchSize = std::max(maxBuildScratchSize, tlasSizes.buildScratchSize);
+    maxBuildScratchSize = std::max(maxBuildScratchSize, alignScratchSize(tlasSizes.buildScratchSize));
+
+    constexpr VkDeviceSize targetBlasBatchScratchBytes = 256ull * 1024ull * 1024ull;
+    const VkDeviceSize blasScratchCapacity = std::max<VkDeviceSize>(
+        maxBuildScratchSize,
+        std::min(totalBlasScratchSize, targetBlasBatchScratchBytes));
 
     Buffer buildScratch = createScratch(
         allocator,
-        maxBuildScratchSize + scratchAlignment,
+        std::max(maxBuildScratchSize, blasScratchCapacity) + scratchAlignment,
         "ray tracing AS build scratch arena");
     const VkDeviceAddress scratchAddress = Buffer::alignUp(buildScratch.deviceAddress(), scratchAlignment);
 
@@ -987,7 +999,30 @@ void RayTracingScene::build(
         }
     }
 
+    constexpr uint32_t maxBlasBuildsPerBatch = 32u;
+    uint32_t pendingBlasBuilds = 0;
+    uint32_t blasBuildBatchCount = 0;
+    VkDeviceSize currentBlasBatchScratch = 0;
+    auto flushBlasBatch = [&]() {
+        if (pendingBlasBuilds == 0u) {
+            return;
+        }
+        accelerationBuildBarrier(cmd);
+        ++blasBuildBatchCount;
+        pendingBlasBuilds = 0;
+        currentBlasBatchScratch = 0;
+    };
+
     for (const BlasBuildSizes& record : blasBuildSizes) {
+        const VkDeviceSize buildScratchSize = alignScratchSize(record.sizes.buildScratchSize);
+        if (pendingBlasBuilds > 0u &&
+            (pendingBlasBuilds >= maxBlasBuildsPerBatch ||
+             currentBlasBatchScratch + buildScratchSize > blasScratchCapacity)) {
+            flushBlasBatch();
+        }
+        const VkDeviceSize scratchOffset = currentBlasBatchScratch;
+        currentBlasBatchScratch += buildScratchSize;
+
         const RayTracingMeshBuildInput& mesh = rtMeshes[record.meshBuildIndex];
         const MeshBlasGeometryPlan& plan = blasGeometryPlans[record.meshBuildIndex];
         std::vector<VkAccelerationStructureGeometryTrianglesDataKHR> triangleDatas;
@@ -1066,7 +1101,7 @@ void RayTracingScene::build(
         accelerationStructureBytes_ += record.sizes.accelerationStructureSize;
 
         buildInfo.dstAccelerationStructure = blases_[mesh.meshIndex].handle();
-        buildInfo.scratchData.deviceAddress = scratchAddress;
+        buildInfo.scratchData.deviceAddress = scratchAddress + scratchOffset;
 
         std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> rangePtrs;
         rangePtrs.reserve(ranges.size());
@@ -1074,8 +1109,10 @@ void RayTracingScene::build(
             rangePtrs.push_back(&range);
         }
         vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, rangePtrs.data());
-        accelerationBuildBarrier(cmd);
+        ++pendingBlasBuilds;
     }
+    flushBlasBatch();
+    blasGeometryStats_.buildBatchCount = blasBuildBatchCount;
 
     const std::vector<VkAccelerationStructureInstanceKHR> instances = motionBlurActive_ ? std::vector<VkAccelerationStructureInstanceKHR>{} : buildVkInstances(scene, blases_);
     const std::vector<VkAccelerationStructureMotionInstanceNV> motionInstances = motionBlurActive_ ? buildVkMotionInstances(scene, blases_) : std::vector<VkAccelerationStructureMotionInstanceNV>{};
@@ -1154,6 +1191,7 @@ void RayTracingScene::build(
     std::cout << "RT scene: BLAS=" << blases_.size()
               << " instances=" << instanceCount_
               << " geometries=" << blasGeometryStats_.geometryCount
+              << " blas_batches=" << blasGeometryStats_.buildBatchCount
               << " AS memory=" << (static_cast<double>(accelerationStructureBytes_) / (1024.0 * 1024.0)) << " MB";
     if (motionBlurActive_) {
         std::cout << " motion_blur=active";

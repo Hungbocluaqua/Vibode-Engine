@@ -151,10 +151,18 @@ void GpuProfiler::collectCompletedFrame() {
     timings_.pathTraceMs = smooth(timings_.pathTraceMs, elapsedMs(PathTraceStart, PathTraceEnd));
     timings_.restirHistoryClearMs = smooth(timings_.restirHistoryClearMs, elapsedMs(RestirHistoryClearStart, RestirHistoryClearEnd));
     timings_.restirGiClearMs = smooth(timings_.restirGiClearMs, elapsedMs(RestirGiClearStart, RestirGiClearEnd));
+    timings_.restirGiTemporalMs = smooth(timings_.restirGiTemporalMs, elapsedMs(RestirGiTemporalStart, RestirGiTemporalEnd));
     timings_.restirSpatialMs = smooth(timings_.restirSpatialMs, elapsedMs(RestirSpatialStart, RestirSpatialEnd));
     timings_.restirSpatialCopyMs = smooth(timings_.restirSpatialCopyMs, elapsedMs(RestirSpatialCopyStart, RestirSpatialCopyEnd));
     timings_.restirGiSpatialMs = smooth(timings_.restirGiSpatialMs, elapsedMs(RestirGiSpatialStart, RestirGiSpatialEnd));
+    timings_.restirGiUpsampleMs = smooth(timings_.restirGiUpsampleMs, elapsedMs(RestirGiUpsampleStart, RestirGiUpsampleEnd));
     timings_.restirGiFinalMs = smooth(timings_.restirGiFinalMs, elapsedMs(RestirGiFinalStart, RestirGiFinalEnd));
+    timings_.restirGiCountersReadbackMs = smooth(timings_.restirGiCountersReadbackMs, elapsedMs(RestirGiCountersReadbackStart, RestirGiCountersReadbackEnd));
+    timings_.restirDiTemporalMs = smooth(timings_.restirDiTemporalMs, elapsedMs(RestirDiTemporalStart, RestirDiTemporalEnd));
+    timings_.restirDiSpatialMs = smooth(timings_.restirDiSpatialMs, elapsedMs(RestirDiSpatialStart, RestirDiSpatialEnd));
+    timings_.restirDiFinalMs = smooth(timings_.restirDiFinalMs, elapsedMs(RestirDiFinalStart, RestirDiFinalEnd));
+    timings_.restirDiHistoryCopyMs = smooth(timings_.restirDiHistoryCopyMs, elapsedMs(RestirDiHistoryCopyStart, RestirDiHistoryCopyEnd));
+    timings_.restirDiCountersReadbackMs = smooth(timings_.restirDiCountersReadbackMs, elapsedMs(RestirDiCountersReadbackStart, RestirDiCountersReadbackEnd));
     timings_.fogIntegrateMs = smooth(timings_.fogIntegrateMs, elapsedMs(FogIntegrateStart, FogIntegrateEnd));
     timings_.atmosphereMs = smooth(timings_.atmosphereMs, elapsedMs(AtmosphereStart, AtmosphereEnd));
     timings_.atmosphereTransmittanceMs = smooth(timings_.atmosphereTransmittanceMs, elapsedMs(AtmosphereTransmittanceStart, AtmosphereTransmittanceEnd));
@@ -197,10 +205,18 @@ void GpuProfiler::collectCompletedFrame() {
     timings_.computeLaneMs =
         timings_.restirHistoryClearMs +
         timings_.restirGiClearMs +
+        timings_.restirGiTemporalMs +
         timings_.restirSpatialMs +
         timings_.restirSpatialCopyMs +
         timings_.restirGiSpatialMs +
+        timings_.restirGiUpsampleMs +
         timings_.restirGiFinalMs +
+        timings_.restirGiCountersReadbackMs +
+        timings_.restirDiTemporalMs +
+        timings_.restirDiSpatialMs +
+        timings_.restirDiFinalMs +
+        timings_.restirDiHistoryCopyMs +
+        timings_.restirDiCountersReadbackMs +
         timings_.fogIntegrateMs +
         timings_.atmosphereMs +
         timings_.denoiserMs +

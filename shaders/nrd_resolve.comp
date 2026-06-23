@@ -18,6 +18,7 @@ struct PathDataRecord {
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
     vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
 };
 layout(set = 0, binding = 3, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 layout(set = 0, binding = 4, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };

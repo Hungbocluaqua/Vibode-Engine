@@ -1625,6 +1625,11 @@ RendererSettings interactiveSettingsForScene(RendererSettings settings, const Sc
         setBool(settings.dlssFrameGenerationEnabled, false, largeSceneSettingsChanged);
         setBool(settings.dlssRayReconstructionEnabled, false, largeSceneSettingsChanged);
         setBool(settings.restirGiEnabled, false, largeSceneSettingsChanged);
+        if (settings.restirGiMode != RestirGiMode::Off) {
+            settings.restirGiMode = RestirGiMode::Off;
+            settings.restirGiReservoirLayout = RestirGiReservoirLayout::LegacyCachePacked;
+            largeSceneSettingsChanged = true;
+        }
         setBool(settings.restirGiHalfResolution, true, largeSceneSettingsChanged);
         setUint(settings.restirGiSpatialRounds, 1u, largeSceneSettingsChanged);
         capFloat(settings.restirGiSpatialRadius, 3.0f, largeSceneSettingsChanged);
@@ -1688,6 +1693,22 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.skyIntensity = settings.skyIntensity;
     render.indirectStrength = settings.indirectStrength;
     render.restirMode = settings.restirMode;
+    render.restirDiMode = settings.restirDiMode;
+    render.restirDiTemporalEnabled = settings.restirDiTemporalEnabled;
+    render.restirDiSpatialEnabled = settings.restirDiSpatialEnabled;
+    render.restirDiFinalVisibilityEnabled = settings.restirDiFinalVisibilityEnabled;
+    render.restirDiSpatialRounds = settings.restirDiSpatialRounds;
+    render.restirDiSpatialRadius = settings.restirDiSpatialRadius;
+    render.restirDiTemporalMaxAge = settings.restirDiTemporalMaxAge;
+    render.restirDiMaxM = settings.restirDiMaxM;
+    render.restirDiVisibilityRayBudget = settings.restirDiVisibilityRayBudget;
+    render.restirDiProductionStabilizationEnabled = settings.restirDiProductionStabilizationEnabled;
+    render.restirDiClampLuminance = settings.restirDiClampLuminance;
+    render.restirDiIncludeSun = settings.restirDiIncludeSun;
+    render.restirDiIncludeEnvironment = settings.restirDiIncludeEnvironment;
+    render.restirDiReservoirLayout = settings.restirDiReservoirLayout;
+    render.restirGiMode = settings.restirGiMode;
+    render.restirGiReservoirLayout = settings.restirGiReservoirLayout;
     render.restirGiEnabled = settings.restirGiEnabled;
     render.denoiserEnabled = settings.denoiserEnabled;
     render.denoiserBackend = settings.denoiserBackend;
@@ -1724,6 +1745,8 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.restirGiHalfResolution = settings.restirGiHalfResolution;
     render.restirGiVisibilityRayBudget = settings.restirGiVisibilityRayBudget;
     render.restirGiFinalStabilizationEnabled = settings.restirGiFinalStabilizationEnabled;
+    render.restirGiActiveTileMaskMode = settings.restirGiActiveTileMaskMode;
+    render.restirHistoryCopyMode = settings.restirHistoryCopyMode;
     render.adaptiveQualityMode = settings.adaptiveQualityMode;
     render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
     render.usePhysicalCamera = settings.usePhysicalCamera;
@@ -1781,6 +1804,22 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.skyIntensity = render.skyIntensity;
     settings.indirectStrength = render.indirectStrength;
     settings.restirMode = render.restirMode;
+    settings.restirDiMode = render.restirDiMode;
+    settings.restirDiTemporalEnabled = render.restirDiTemporalEnabled;
+    settings.restirDiSpatialEnabled = render.restirDiSpatialEnabled;
+    settings.restirDiFinalVisibilityEnabled = render.restirDiFinalVisibilityEnabled;
+    settings.restirDiSpatialRounds = render.restirDiSpatialRounds;
+    settings.restirDiSpatialRadius = render.restirDiSpatialRadius;
+    settings.restirDiTemporalMaxAge = render.restirDiTemporalMaxAge;
+    settings.restirDiMaxM = render.restirDiMaxM;
+    settings.restirDiVisibilityRayBudget = render.restirDiVisibilityRayBudget;
+    settings.restirDiProductionStabilizationEnabled = render.restirDiProductionStabilizationEnabled;
+    settings.restirDiClampLuminance = render.restirDiClampLuminance;
+    settings.restirDiIncludeSun = render.restirDiIncludeSun;
+    settings.restirDiIncludeEnvironment = render.restirDiIncludeEnvironment;
+    settings.restirDiReservoirLayout = render.restirDiReservoirLayout;
+    settings.restirGiMode = render.restirGiMode;
+    settings.restirGiReservoirLayout = render.restirGiReservoirLayout;
     settings.restirGiEnabled = render.restirGiEnabled;
     settings.denoiserEnabled = render.denoiserEnabled;
     settings.denoiserBackend = render.denoiserBackend;
@@ -1817,6 +1856,8 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.restirGiHalfResolution = render.restirGiHalfResolution;
     settings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
     settings.restirGiFinalStabilizationEnabled = render.restirGiFinalStabilizationEnabled;
+    settings.restirGiActiveTileMaskMode = render.restirGiActiveTileMaskMode;
+    settings.restirHistoryCopyMode = render.restirHistoryCopyMode;
     settings.adaptiveQualityMode = render.adaptiveQualityMode;
     settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
     settings.usePhysicalCamera = render.usePhysicalCamera;
@@ -3766,6 +3807,8 @@ Application::Application(
     bool validationCameraMotion,
     bool validationObjectMotion,
     bool headless,
+    uint32_t headlessWidth,
+    uint32_t headlessHeight,
     bool disableAsyncCompute,
     bool singleQueueFallback,
     bool disableResourceAliasing,
@@ -3789,7 +3832,8 @@ Application::Application(
       singleQueueFallback_(singleQueueFallback),
       disableResourceAliasing_(disableResourceAliasing),
       streamingOptions_(streamingOptions),
-      headless_(headless) {
+      headless_(headless),
+      headlessExtent_{std::max(headlessWidth, 1u), std::max(headlessHeight, 1u)} {
     streamingRuntimeState_.setOptions(streamingOptions_);
     if (!headless_) {
         initWindow();
@@ -5517,7 +5561,7 @@ bool Application::runDescriptorLifetimeStress(
             std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
                 gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
                 gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
-                currentSceneCachePathForRenderer(),
+                currentSceneCachePolicyForRenderer(),
                 &previousSettings);
             retirePathTracer(std::move(pathTracer_));
             pathTracer_ = std::move(nextPathTracer);
@@ -5720,8 +5764,7 @@ void Application::initVulkan() {
     uploadContext_ = std::make_unique<UploadContext>(context_->device(), context_->graphicsQueue(), context_->queueFamilies().graphics.value());
     uploader_ = std::make_unique<BufferUploader>(*allocator_, *uploadContext_);
     if (headless_) {
-        constexpr VkExtent2D defaultExtent{1280, 720};
-        swapchain_ = std::make_unique<Swapchain>(*context_, defaultExtent);
+        swapchain_ = std::make_unique<Swapchain>(*context_, headlessExtent_);
     } else {
         swapchain_ = std::make_unique<Swapchain>(*context_, window_);
     }
@@ -5854,6 +5897,12 @@ void Application::initVulkan() {
     }
     if (restirGiOverride_.has_value()) {
         startupSettings.restirGiEnabled = *restirGiOverride_;
+        startupSettings.restirGiMode = *restirGiOverride_
+            ? RestirGiMode::Production
+            : RestirGiMode::Off;
+        startupSettings.restirGiReservoirLayout = *restirGiOverride_
+            ? RestirGiReservoirLayout::ProductionPacked
+            : RestirGiReservoirLayout::LegacyCachePacked;
         startupSettings.renderPreset = RenderPreset::Custom;
         syncDocumentRenderSettings(sceneDocument_, startupSettings);
     }
@@ -7880,13 +7929,27 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
         const std::optional<std::filesystem::path> cachePath = sceneDirtyAfterApply
             ? SceneCache::cachePathFor(result.sourcePath)
             : (nextGltfPath.has_value() ? SceneCache::cachePathFor(*nextGltfPath) : std::optional<std::filesystem::path>{});
-        std::optional<std::filesystem::path> rendererCachePath;
-        if (result.importedScene.has_value() && cachePath.has_value() && nextDocument.prefabInstances().empty() &&
-            build.sceneAsset.meshes.size() == result.importedScene->meshes.size() &&
-            build.sceneAsset.materials.size() == result.importedScene->materials.size() &&
-            build.sceneAsset.textures.size() == result.importedScene->textures.size() &&
-            build.sceneAsset.nodes.size() == result.importedScene->nodes.size()) {
-            rendererCachePath = cachePath;
+        SceneCachePolicy rendererCachePolicy;
+        if (result.importedScene.has_value() && cachePath.has_value()) {
+            const bool geometrySignatureMatches =
+                build.sceneAsset.meshes.size() == result.importedScene->meshes.size() &&
+                build.sceneAsset.materials.size() == result.importedScene->materials.size() &&
+                build.sceneAsset.textures.size() == result.importedScene->textures.size();
+            const bool fullSceneSignatureMatches =
+                geometrySignatureMatches &&
+                build.sceneAsset.nodes.size() == result.importedScene->nodes.size() &&
+                nextDocument.prefabInstances().empty();
+            if (fullSceneSignatureMatches) {
+                rendererCachePolicy = SceneCachePolicy{
+                    .mode = SceneCacheMode::FullReadWrite,
+                    .path = cachePath,
+                };
+            } else if (geometrySignatureMatches) {
+                rendererCachePolicy = SceneCachePolicy{
+                    .mode = SceneCacheMode::GeometryReadOnly,
+                    .path = cachePath,
+                };
+            }
         }
 
         std::cout << sceneLoadModeLabel(result.mode) << " apply stage: renderer_create meshes="
@@ -7906,7 +7969,7 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             build.sceneAsset.meshes.empty() ? nullptr : &build.sceneAsset,
             build.sceneAsset.meshes.empty() ? nullptr : &result.assets,
-            rendererCachePath,
+            std::move(rendererCachePolicy),
             &replacementSettings);
         rendererCreateMs = elapsedMs(rendererCreateStart);
 
@@ -9026,7 +9089,7 @@ bool Application::rebuildRendererAfterNativePackageUnload(bool affectedActiveRen
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
-            currentSceneCachePathForRenderer(),
+            currentSceneCachePolicyForRenderer(),
             &previousSettings);
         if (uiOverlay_ != nullptr) {
             uiOverlay_->invalidateRendererTextures();
@@ -15245,7 +15308,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild, bool intera
         std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
             gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
-            currentSceneCachePathForRenderer(),
+            currentSceneCachePolicyForRenderer(),
             &replacementSettings,
             materialTextureMaxDimension);
         retirePathTracer(std::move(pathTracer_));
@@ -15346,7 +15409,8 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild, bool intera
     if (sceneUpdateRouteHasAction(route, SceneUpdateGpuAction::UpdateLights)) {
         syncBuiltScene();
         applyRendererSettingsSafely(ensureBuild().rendererSettings, allowResourceRebuild);
-        if (!pathTracer_->updateSceneLights(*gpuSceneAsset_, !interactiveLightPreview)) {
+        (void)interactiveLightPreview;
+        if (!pathTracer_->updateSceneLights(*gpuSceneAsset_, true)) {
             pathTracer_->resetAccumulation(route.resetReason);
         }
     }
@@ -15503,7 +15567,7 @@ void Application::reloadShadersFromEditor() {
     std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
         gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
         gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
-        currentSceneCachePathForRenderer(),
+        currentSceneCachePolicyForRenderer(),
         &previousSettings);
     if (uiOverlay_) {
         uiOverlay_->invalidateRendererTextures();
@@ -16203,26 +16267,37 @@ void Application::releaseRetiredPathTracers() {
 }
 
 std::optional<std::filesystem::path> Application::currentSceneCachePathForRenderer() const {
+    const SceneCachePolicy policy = currentSceneCachePolicyForRenderer();
+    return policy.path;
+}
+
+SceneCachePolicy Application::currentSceneCachePolicyForRenderer() const {
     if (!gltfPath_.has_value() || !gpuSceneAsset_.has_value() || gpuSceneAsset_->meshes.empty()) {
-        return std::nullopt;
+        return {};
     }
-    if (sceneUnsavedDirty_ || !sceneDocument_.prefabInstances().empty()) {
-        return std::nullopt;
+    if (sceneUnsavedDirty_ || !importedScene_.has_value()) {
+        return {};
     }
-    if (!importedScene_.has_value() ||
-        gpuSceneAsset_->meshes.size() != importedScene_->meshes.size() ||
-        gpuSceneAsset_->materials.size() != importedScene_->materials.size() ||
-        gpuSceneAsset_->textures.size() != importedScene_->textures.size() ||
-        gpuSceneAsset_->nodes.size() != importedScene_->nodes.size()) {
-        return std::nullopt;
+    const bool geometrySignatureMatches =
+        gpuSceneAsset_->meshes.size() == importedScene_->meshes.size() &&
+        gpuSceneAsset_->materials.size() == importedScene_->materials.size() &&
+        gpuSceneAsset_->textures.size() == importedScene_->textures.size();
+    if (!geometrySignatureMatches) {
+        return {};
     }
-    return SceneCache::cachePathFor(*gltfPath_);
+    const bool fullSceneSignatureMatches =
+        sceneDocument_.prefabInstances().empty() &&
+        gpuSceneAsset_->nodes.size() == importedScene_->nodes.size();
+    return SceneCachePolicy{
+        .mode = fullSceneSignatureMatches ? SceneCacheMode::FullReadWrite : SceneCacheMode::GeometryReadOnly,
+        .path = SceneCache::cachePathFor(*gltfPath_),
+    };
 }
 
 std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
     const SceneAsset* sceneAsset,
     const AssetManager* assets,
-    std::optional<std::filesystem::path> sceneCachePath,
+    SceneCachePolicy sceneCachePolicy,
     const RendererSettings* settingsToRestore,
     uint32_t materialTextureMaxDimension) {
     const auto projectRoot = resolveProjectRoot();
@@ -16271,7 +16346,7 @@ std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
         sceneAsset,
         sceneAsset != nullptr ? assets : nullptr,
         hdrPath_,
-        std::move(sceneCachePath),
+        std::move(sceneCachePolicy),
         !disableResourceAliasing_,
         skinningResourcePlan,
         settingsToRestore,
@@ -16284,7 +16359,10 @@ std::unique_ptr<PathTracerRenderer> Application::makePathTracer(
 
 void Application::createPathTracer(const RendererSettings* settingsToRestore) {
     const SceneAsset* sceneAsset = gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr;
-    pathTracer_ = makePathTracer(sceneAsset, sceneAsset != nullptr ? &assets_ : nullptr, currentSceneCachePathForRenderer(), settingsToRestore);
+    pathTracer_ = makePathTracer(sceneAsset, sceneAsset != nullptr ? &assets_ : nullptr, currentSceneCachePolicyForRenderer(), settingsToRestore);
+    if (sceneAsset == nullptr && gpuSceneAsset_.has_value() && !gpuSceneAsset_->lights.empty()) {
+        (void)pathTracer_->updateSceneLights(*gpuSceneAsset_, true);
+    }
 }
 
 void Application::initializeRendererFromCurrentScene(const RendererSettings* settingsToRestore) {

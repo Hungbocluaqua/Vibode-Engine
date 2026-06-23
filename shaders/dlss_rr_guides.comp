@@ -19,6 +19,7 @@ struct PathDataRecord {
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
     vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
 };
 layout(set = 0, binding = 2, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 
@@ -236,7 +237,9 @@ void main() {
     vec3 specularRayDirection = surface ? guide_direction(reflect(fallbackRayDirection, orientedNormal), fallbackRayDirection) : fallbackRayDirection;
     float diffuseRayDirectionHitDistance = surface ? diffuseHitDistance : 0.0;
     float specularRayDirectionHitDistance = surface ? specularHitDistance : 0.0;
-    float disocclusion = disocclusion_mask(coords, dims, surface, currentToPreviousPixels);
+    float disocclusion = max(
+        disocclusion_mask(coords, dims, surface, currentToPreviousPixels),
+        clamp(path.emissive_residual.a, 0.0, 1.0));
 
     imageStore(output_depth, coords, vec4(linearDepth, 0.0, 0.0, 0.0));
     imageStore(output_motion_vectors, coords, vec4(previousMinusCurrentPixels, 0.0, 0.0));

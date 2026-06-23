@@ -12,6 +12,12 @@ namespace rtv {
 
 inline constexpr uint32_t kMaxSamplesPerPixel = 64u;
 
+enum class RestirCounterMode : uint32_t {
+    Auto = 0,
+    On = 1,
+    Off = 2,
+};
+
 struct RendererSettings {
     RenderPreset renderPreset = RenderPreset::Balanced;
     bool pathTracingEnabled = true;
@@ -76,7 +82,7 @@ struct RendererSettings {
     glm::vec3 heightFogColor{0.65f, 0.72f, 0.85f};
     float indirectStrength = 1.0f;
     RestirMode restirMode = RestirMode::RestirOnly;
-    RestirDiMode restirDiMode = RestirDiMode::Legacy;
+    RestirDiMode restirDiMode = RestirDiMode::Production;
     bool restirDiTemporalEnabled = true;
     bool restirDiSpatialEnabled = true;
     bool restirDiFinalVisibilityEnabled = false;
@@ -90,6 +96,8 @@ struct RendererSettings {
     bool restirDiIncludeSun = false;
     bool restirDiIncludeEnvironment = false;
     RestirDiReservoirLayout restirDiReservoirLayout = RestirDiReservoirLayout::ProductionPacked;
+    RestirGiMode restirGiMode = RestirGiMode::Production;
+    RestirGiReservoirLayout restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
     bool restirGiEnabled = true;
     float environmentIntensity = 1.0f;
     float environmentRotation = 0.0f;
@@ -116,14 +124,18 @@ struct RendererSettings {
     float fireflyClamp = 8.0f;
     float maxFrameDeltaSeconds = 1.0f / 30.0f;
     float russianRouletteMinSurvival = 0.05f;
-    uint32_t restirGiTemporalMaxAge = 18;
-    uint32_t restirGiSpatialRounds = 3;
-    float restirGiSpatialRadius = 3.75f;
+    uint32_t restirGiTemporalMaxAge = 12;
+    uint32_t restirGiSpatialRounds = 2;
+    float restirGiSpatialRadius = 3.0f;
     float restirGiDepthThresholdScale = 0.85f;
-    float restirGiSpatialCompatibilityThreshold = 0.06f;
+    float restirGiSpatialCompatibilityThreshold = 0.08f;
     bool restirGiHalfResolution = false;
-    uint32_t restirGiVisibilityRayBudget = 2;
+    uint32_t restirGiVisibilityRayBudget = 1;
     bool restirGiFinalStabilizationEnabled = true;
+    float restirGiMinFinalBlendStrength = 0.01f;
+    RestirGiActiveTileMaskMode restirGiActiveTileMaskMode = RestirGiActiveTileMaskMode::Off;
+    RestirHistoryCopyMode restirHistoryCopyMode = RestirHistoryCopyMode::Copy;
+    RestirCounterMode restirCounterMode = RestirCounterMode::Auto;
     AdaptiveQualityMode adaptiveQualityMode = AdaptiveQualityMode::Balanced;
     float adaptiveGpuFrameTargetMs = 16.6f;
 
@@ -162,7 +174,7 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
     settings.streamlineReflexEnabled = false;
     settings.dlssSharpeningStrength = 0.0f;
     settings.restirMode = RestirMode::RestirOnly;
-    settings.restirDiMode = RestirDiMode::Legacy;
+    settings.restirDiMode = RestirDiMode::Production;
     settings.restirDiTemporalEnabled = true;
     settings.restirDiSpatialEnabled = true;
     settings.restirDiFinalVisibilityEnabled = false;
@@ -176,8 +188,12 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
     settings.restirDiIncludeSun = false;
     settings.restirDiIncludeEnvironment = false;
     settings.restirDiReservoirLayout = RestirDiReservoirLayout::ProductionPacked;
+    settings.restirGiMode = RestirGiMode::Production;
+    settings.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
     settings.restirGiEnabled = true;
     settings.restirGiFinalStabilizationEnabled = true;
+    settings.restirGiActiveTileMaskMode = RestirGiActiveTileMaskMode::Off;
+    settings.restirHistoryCopyMode = RestirHistoryCopyMode::Copy;
 
     switch (preset) {
     case RenderPreset::Low:
@@ -204,6 +220,11 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
         settings.restirGiSpatialCompatibilityThreshold = 0.08f;
         settings.restirGiHalfResolution = true;
         settings.restirGiVisibilityRayBudget = 1;
+        // DI quality scaling for Low
+        settings.restirDiSpatialRounds = 2;
+        settings.restirDiSpatialRadius = 2.0f;
+        settings.restirDiTemporalMaxAge = 16;
+        settings.restirDiMaxM = 32;
         settings.adaptiveQualityMode = AdaptiveQualityMode::Balanced;
         break;
     case RenderPreset::Balanced:
@@ -223,13 +244,18 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
         settings.materialTextureAnisotropy = 4.0f;
         settings.specularAaEnabled = true;
         settings.fireflyClamp = 8.0f;
-        settings.restirGiTemporalMaxAge = 18;
-        settings.restirGiSpatialRounds = 3;
-        settings.restirGiSpatialRadius = 3.75f;
+        settings.restirGiTemporalMaxAge = 12;
+        settings.restirGiSpatialRounds = 2;
+        settings.restirGiSpatialRadius = 3.0f;
         settings.restirGiDepthThresholdScale = 0.85f;
-        settings.restirGiSpatialCompatibilityThreshold = 0.06f;
+        settings.restirGiSpatialCompatibilityThreshold = 0.08f;
         settings.restirGiHalfResolution = false;
-        settings.restirGiVisibilityRayBudget = 2;
+        settings.restirGiVisibilityRayBudget = 1;
+        // DI quality scaling for Balanced
+        settings.restirDiSpatialRounds = 4;
+        settings.restirDiSpatialRadius = 3.0f;
+        settings.restirDiTemporalMaxAge = 32;
+        settings.restirDiMaxM = 64;
         settings.adaptiveQualityMode = AdaptiveQualityMode::Balanced;
         break;
     case RenderPreset::Ultra:
@@ -256,6 +282,11 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
         settings.restirGiSpatialCompatibilityThreshold = 0.05f;
         settings.restirGiHalfResolution = false;
         settings.restirGiVisibilityRayBudget = 4;
+        // DI quality scaling for Ultra
+        settings.restirDiSpatialRounds = 6;
+        settings.restirDiSpatialRadius = 4.0f;
+        settings.restirDiTemporalMaxAge = 48;
+        settings.restirDiMaxM = 96;
         settings.adaptiveQualityMode = AdaptiveQualityMode::Off;
         break;
     case RenderPreset::Custom:

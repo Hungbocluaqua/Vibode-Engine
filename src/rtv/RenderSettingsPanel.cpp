@@ -68,7 +68,23 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.skyIntensity = render.skyIntensity;
         settings.indirectStrength = render.indirectStrength;
         settings.restirMode = render.restirMode;
+        settings.restirDiMode = render.restirDiMode;
+        settings.restirDiTemporalEnabled = render.restirDiTemporalEnabled;
+        settings.restirDiSpatialEnabled = render.restirDiSpatialEnabled;
+        settings.restirDiFinalVisibilityEnabled = render.restirDiFinalVisibilityEnabled;
+        settings.restirDiSpatialRounds = render.restirDiSpatialRounds;
+        settings.restirDiSpatialRadius = render.restirDiSpatialRadius;
+        settings.restirDiTemporalMaxAge = render.restirDiTemporalMaxAge;
+        settings.restirDiMaxM = render.restirDiMaxM;
+        settings.restirDiVisibilityRayBudget = render.restirDiVisibilityRayBudget;
+        settings.restirDiProductionStabilizationEnabled = render.restirDiProductionStabilizationEnabled;
+        settings.restirDiClampLuminance = render.restirDiClampLuminance;
+        settings.restirDiIncludeSun = render.restirDiIncludeSun;
+        settings.restirDiIncludeEnvironment = render.restirDiIncludeEnvironment;
+        settings.restirDiReservoirLayout = render.restirDiReservoirLayout;
         settings.restirGiEnabled = render.restirGiEnabled;
+        settings.restirGiMode = render.restirGiMode;
+        settings.restirGiReservoirLayout = render.restirGiReservoirLayout;
         settings.denoiserEnabled = render.denoiserEnabled;
         settings.denoiserBackend = render.denoiserBackend;
         settings.denoiseWhileMoving = render.denoiseWhileMoving;
@@ -105,6 +121,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.restirGiHalfResolution = render.restirGiHalfResolution;
         settings.restirGiVisibilityRayBudget = render.restirGiVisibilityRayBudget;
         settings.restirGiFinalStabilizationEnabled = render.restirGiFinalStabilizationEnabled;
+        settings.restirGiActiveTileMaskMode = render.restirGiActiveTileMaskMode;
+        settings.restirHistoryCopyMode = render.restirHistoryCopyMode;
         settings.adaptiveQualityMode = render.adaptiveQualityMode;
         settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
         settings.usePhysicalCamera = render.usePhysicalCamera;
@@ -210,8 +228,128 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed = true;
     }
     tooltip("Hybrid ReSTIR direct-light mode. Classic NEE remains the reference baseline.");
-    changed |= ImGui::Checkbox("ReSTIR GI", &settings.restirGiEnabled);
+    const char* restirDiModeItems[] = {"Off", "Legacy", "Production", "Reference Validation", "Hybrid Compare"};
+    int restirDiModeIndex = static_cast<int>(settings.restirDiMode);
+    if (ImGui::Combo("ReSTIR DI Pipeline", &restirDiModeIndex, restirDiModeItems, 5)) {
+        settings.restirDiMode = static_cast<RestirDiMode>(restirDiModeIndex);
+        if (settings.restirDiMode == RestirDiMode::Off || settings.restirDiMode == RestirDiMode::Legacy) {
+            settings.restirDiReservoirLayout = RestirDiReservoirLayout::Legacy;
+        } else if (settings.restirDiMode == RestirDiMode::ReferenceValidation) {
+            settings.restirDiReservoirLayout = RestirDiReservoirLayout::ValidationFull;
+            settings.restirDiFinalVisibilityEnabled = true;
+            settings.restirDiProductionStabilizationEnabled = false;
+        } else if (settings.restirDiReservoirLayout == RestirDiReservoirLayout::Legacy) {
+            settings.restirDiReservoirLayout = RestirDiReservoirLayout::ProductionPacked;
+        }
+        changed = true;
+    }
+    tooltip("Selects the rollback path, shipping ReSTIR DI pipeline, strict reference estimator, or comparison mode.");
+    if (settings.restirDiMode == RestirDiMode::Production ||
+        settings.restirDiMode == RestirDiMode::ReferenceValidation ||
+        settings.restirDiMode == RestirDiMode::HybridCompare) {
+        if (ImGui::CollapsingHeader("ReSTIR DI Tuning")) {
+            const char* layoutItems[] = {"Legacy", "Production Packed", "Validation Full"};
+            int layoutIndex = static_cast<int>(settings.restirDiReservoirLayout);
+            if (ImGui::Combo("DI Reservoir Layout", &layoutIndex, layoutItems, 3)) {
+                const auto requested = static_cast<RestirDiReservoirLayout>(layoutIndex);
+                if (requested != RestirDiReservoirLayout::Legacy &&
+                    (settings.restirDiMode != RestirDiMode::ReferenceValidation ||
+                     requested == RestirDiReservoirLayout::ValidationFull)) {
+                    settings.restirDiReservoirLayout = requested;
+                    changed = true;
+                }
+            }
+            tooltip("Production Packed is the shipping ABI. Validation Full is the inspectable reference ABI.");
+            changed |= ImGui::Checkbox("DI Temporal Reuse", &settings.restirDiTemporalEnabled);
+            changed |= ImGui::Checkbox("DI Spatial Reuse", &settings.restirDiSpatialEnabled);
+            changed |= ImGui::Checkbox("DI Final Visibility", &settings.restirDiFinalVisibilityEnabled);
+            tooltip("Required in Reference Validation; traces current visibility before finalizing a reused sample.");
+            const uint32_t minRounds = 1u;
+            const uint32_t maxRounds = 16u;
+            const uint32_t minAge = 1u;
+            const uint32_t maxAge = 255u;
+            const uint32_t minM = 1u;
+            const uint32_t maxM = 255u;
+            const uint32_t minVisibilityRays = 0u;
+            const uint32_t maxVisibilityRays = 4u;
+            changed |= ImGui::SliderScalar("DI Spatial Rounds", ImGuiDataType_U32, &settings.restirDiSpatialRounds, &minRounds, &maxRounds);
+            changed |= ImGui::SliderFloat("DI Spatial Radius", &settings.restirDiSpatialRadius, 0.5f, 32.0f, "%.2f");
+            changed |= ImGui::SliderScalar("DI Temporal Max Age", ImGuiDataType_U32, &settings.restirDiTemporalMaxAge, &minAge, &maxAge);
+            changed |= ImGui::SliderScalar("DI Max M", ImGuiDataType_U32, &settings.restirDiMaxM, &minM, &maxM);
+            changed |= ImGui::SliderScalar("DI Visibility Ray Budget", ImGuiDataType_U32, &settings.restirDiVisibilityRayBudget, &minVisibilityRays, &maxVisibilityRays);
+            tooltip("Maximum shifted-sample visibility queries per pixel in each DI reuse stage. Zero falls back to the current-frame candidate.");
+            changed |= ImGui::Checkbox("DI Production Stabilization", &settings.restirDiProductionStabilizationEnabled);
+            tooltip("Biased temporal and luminance stabilization for production. Reference Validation disables it.");
+            changed |= ImGui::SliderFloat("DI Luminance Clamp", &settings.restirDiClampLuminance, 0.0f, 1000.0f, "%.1f");
+            ImGui::BeginDisabled();
+            bool sunOutside = false;
+            bool environmentOutside = false;
+            ImGui::Checkbox("Sample Sun In DI", &sunOutside);
+            ImGui::Checkbox("Sample Environment In DI", &environmentOutside);
+            ImGui::EndDisabled();
+            tooltip("Sun and environment use specialized samplers outside ReSTIR DI and are composed exactly once.");
+        }
+    }
+    if (ImGui::Checkbox("ReSTIR GI", &settings.restirGiEnabled)) {
+        settings.restirGiMode = settings.restirGiEnabled ? RestirGiMode::Production : RestirGiMode::Off;
+        settings.restirGiReservoirLayout = settings.restirGiEnabled
+            ? RestirGiReservoirLayout::ProductionPacked
+            : RestirGiReservoirLayout::LegacyCachePacked;
+        changed = true;
+    }
     tooltip("Enables ReSTIR GI reservoir reuse and final GI contribution in normal beauty rendering.");
+    {
+        const char* giModeItems[] = {"Off", "Legacy Cache", "Production", "Reference Validation"};
+        int giMode = static_cast<int>(settings.restirGiMode);
+        if (giMode < 0 || giMode > 3) {
+            giMode = 2;
+            settings.restirGiMode = RestirGiMode::Production;
+            changed = true;
+        }
+        if (ImGui::Combo("GI Mode", &giMode, giModeItems, 4)) {
+            settings.restirGiMode = static_cast<RestirGiMode>(giMode);
+            if (settings.restirGiMode == RestirGiMode::Off ||
+                settings.restirGiMode == RestirGiMode::LegacyCache) {
+                settings.restirGiReservoirLayout = RestirGiReservoirLayout::LegacyCachePacked;
+            } else if (settings.restirGiMode == RestirGiMode::ReferenceValidation) {
+                settings.restirGiReservoirLayout = RestirGiReservoirLayout::ValidationFull;
+                settings.restirGiFinalStabilizationEnabled = false;
+            } else if (settings.restirGiReservoirLayout == RestirGiReservoirLayout::LegacyCachePacked) {
+                settings.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
+            }
+            changed = true;
+        }
+        tooltip("Production is the default GI path. Reference Validation forces validation-full layout and disables biased final stabilization.");
+    }
+    {
+        const char* layoutItems[] = {"Legacy Cache Packed", "Production Packed", "Validation Full"};
+        int layout = static_cast<int>(settings.restirGiReservoirLayout);
+        if (layout < 0 || layout > 2) {
+            layout = static_cast<int>(RestirGiReservoirLayout::ProductionPacked);
+            settings.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
+        }
+        const bool forceLegacyLayout = settings.restirGiMode == RestirGiMode::Off ||
+            settings.restirGiMode == RestirGiMode::LegacyCache;
+        const bool forceValidationLayout = settings.restirGiMode == RestirGiMode::ReferenceValidation;
+        ImGui::BeginDisabled(forceLegacyLayout || forceValidationLayout);
+        if (ImGui::Combo("GI Reservoir Layout", &layout, layoutItems, 3)) {
+            settings.restirGiReservoirLayout = static_cast<RestirGiReservoirLayout>(layout);
+            changed = true;
+        }
+        ImGui::EndDisabled();
+        if (forceLegacyLayout && settings.restirGiReservoirLayout != RestirGiReservoirLayout::LegacyCachePacked) {
+            settings.restirGiReservoirLayout = RestirGiReservoirLayout::LegacyCachePacked;
+            changed = true;
+        } else if (forceValidationLayout && settings.restirGiReservoirLayout != RestirGiReservoirLayout::ValidationFull) {
+            settings.restirGiReservoirLayout = RestirGiReservoirLayout::ValidationFull;
+            changed = true;
+        } else if (settings.restirGiMode == RestirGiMode::Production &&
+                   settings.restirGiReservoirLayout == RestirGiReservoirLayout::LegacyCachePacked) {
+            settings.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
+            changed = true;
+        }
+        tooltip("Legacy mode uses legacy-cache-packed. Production defaults to production-packed; validation-full is available for ABI comparisons.");
+    }
     if (ImGui::CollapsingHeader("ReSTIR GI Tuning")) {
         const char* presetItems[] = {"Custom", "Reference", "Balanced", "Performance"};
         int preset = 0;
@@ -226,13 +364,13 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 settings.restirGiVisibilityRayBudget = 0;
                 settings.restirGiFinalStabilizationEnabled = false;
             } else if (preset == 2) {
-                settings.restirGiTemporalMaxAge = 24;
-                settings.restirGiSpatialRounds = 4;
-                settings.restirGiSpatialRadius = 4.25f;
-                settings.restirGiDepthThresholdScale = 1.0f;
-                settings.restirGiSpatialCompatibilityThreshold = 0.05f;
+                settings.restirGiTemporalMaxAge = 12;
+                settings.restirGiSpatialRounds = 2;
+                settings.restirGiSpatialRadius = 3.0f;
+                settings.restirGiDepthThresholdScale = 0.85f;
+                settings.restirGiSpatialCompatibilityThreshold = 0.08f;
                 settings.restirGiHalfResolution = false;
-                settings.restirGiVisibilityRayBudget = 2;
+                settings.restirGiVisibilityRayBudget = 1;
                 settings.restirGiFinalStabilizationEnabled = true;
             } else {
                 settings.restirGiTemporalMaxAge = 16;
@@ -251,6 +389,18 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         tooltip("Applies confidence, motion, history, and luminance clamps to the final ReSTIR GI contribution. Disable for raw reservoir A/B checks.");
         changed |= ImGui::Checkbox("GI Half Resolution Reuse", &settings.restirGiHalfResolution);
         tooltip("Uses one spatial GI reservoir per 2x2 pixel group for the GI debug/final path.");
+        int activeTileMaskMode = static_cast<int>(settings.restirGiActiveTileMaskMode);
+        if (ImGui::Combo("GI Active Tile Mask", &activeTileMaskMode, "Off\0On\0Auto\0")) {
+            settings.restirGiActiveTileMaskMode = static_cast<RestirGiActiveTileMaskMode>(activeTileMaskMode);
+            changed = true;
+        }
+        tooltip("Skips production GI reuse/final work on 16x16 tiles without reusable GI candidates. Auto probes off/on and keeps the faster mode.");
+        int historyCopyMode = static_cast<int>(settings.restirHistoryCopyMode);
+        if (ImGui::Combo("ReSTIR History Copy", &historyCopyMode, "Copy\0Ping-pong\0")) {
+            settings.restirHistoryCopyMode = static_cast<RestirHistoryCopyMode>(historyCopyMode);
+            changed = true;
+        }
+        tooltip("Experimental: ping-pong can avoid DI/GI history copies when supported. Copy remains the default.");
         changed |= ImGui::SliderScalar("GI Temporal Max Age", ImGuiDataType_U32, &settings.restirGiTemporalMaxAge, &minRestirGiAge, &maxRestirGiAge);
         changed |= ImGui::SliderScalar("GI Spatial Rounds", ImGuiDataType_U32, &settings.restirGiSpatialRounds, &minRestirGiRounds, &maxRestirGiRounds);
         changed |= ImGui::SliderFloat("GI Spatial Radius", &settings.restirGiSpatialRadius, 1.0f, 8.0f, "%.2f");
@@ -587,6 +737,11 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 render.directLightingEnabled != settings.directLightingEnabled ||
                 render.environmentDirectSamples != settings.environmentDirectSamples ||
                 render.restirMode != settings.restirMode ||
+                render.restirDiMode != settings.restirDiMode ||
+                render.restirDiTemporalEnabled != settings.restirDiTemporalEnabled ||
+                render.restirDiSpatialEnabled != settings.restirDiSpatialEnabled ||
+                render.restirDiFinalVisibilityEnabled != settings.restirDiFinalVisibilityEnabled ||
+                render.restirDiReservoirLayout != settings.restirDiReservoirLayout ||
                 render.restirGiEnabled != settings.restirGiEnabled ||
                 std::abs(render.skyIntensity - settings.skyIntensity) > 0.0001f;
             render.renderPreset = settings.renderPreset;
@@ -615,6 +770,22 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.skyIntensity = settings.skyIntensity;
             render.indirectStrength = settings.indirectStrength;
             render.restirMode = settings.restirMode;
+            render.restirDiMode = settings.restirDiMode;
+            render.restirDiTemporalEnabled = settings.restirDiTemporalEnabled;
+            render.restirDiSpatialEnabled = settings.restirDiSpatialEnabled;
+            render.restirDiFinalVisibilityEnabled = settings.restirDiFinalVisibilityEnabled;
+            render.restirDiSpatialRounds = settings.restirDiSpatialRounds;
+            render.restirDiSpatialRadius = settings.restirDiSpatialRadius;
+            render.restirDiTemporalMaxAge = settings.restirDiTemporalMaxAge;
+            render.restirDiMaxM = settings.restirDiMaxM;
+            render.restirDiVisibilityRayBudget = settings.restirDiVisibilityRayBudget;
+            render.restirDiProductionStabilizationEnabled = settings.restirDiProductionStabilizationEnabled;
+            render.restirDiClampLuminance = settings.restirDiClampLuminance;
+            render.restirDiIncludeSun = settings.restirDiIncludeSun;
+            render.restirDiIncludeEnvironment = settings.restirDiIncludeEnvironment;
+            render.restirDiReservoirLayout = settings.restirDiReservoirLayout;
+            render.restirGiMode = settings.restirGiMode;
+            render.restirGiReservoirLayout = settings.restirGiReservoirLayout;
             render.restirGiEnabled = settings.restirGiEnabled;
             render.denoiserEnabled = settings.denoiserEnabled;
             render.denoiserBackend = settings.denoiserBackend;
@@ -652,6 +823,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.restirGiHalfResolution = settings.restirGiHalfResolution;
             render.restirGiVisibilityRayBudget = settings.restirGiVisibilityRayBudget;
             render.restirGiFinalStabilizationEnabled = settings.restirGiFinalStabilizationEnabled;
+            render.restirGiActiveTileMaskMode = settings.restirGiActiveTileMaskMode;
+            render.restirHistoryCopyMode = settings.restirHistoryCopyMode;
             render.adaptiveQualityMode = settings.adaptiveQualityMode;
             render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
             render.usePhysicalCamera = settings.usePhysicalCamera;

@@ -13,10 +13,18 @@ struct GpuFrameTimings {
     float pathTraceMs = 0.0f;
     float restirHistoryClearMs = 0.0f;
     float restirGiClearMs = 0.0f;
+    float restirGiTemporalMs = 0.0f;
     float restirSpatialMs = 0.0f;
     float restirSpatialCopyMs = 0.0f;
     float restirGiSpatialMs = 0.0f;
+    float restirGiUpsampleMs = 0.0f;
     float restirGiFinalMs = 0.0f;
+    float restirGiCountersReadbackMs = 0.0f;
+    float restirDiTemporalMs = 0.0f;
+    float restirDiSpatialMs = 0.0f;
+    float restirDiFinalMs = 0.0f;
+    float restirDiHistoryCopyMs = 0.0f;
+    float restirDiCountersReadbackMs = 0.0f;
     float fogIntegrateMs = 0.0f;
     float atmosphereMs = 0.0f;
     float atmosphereTransmittanceMs = 0.0f;
@@ -58,10 +66,18 @@ struct GpuFrameTimings {
         return pathTraceMs +
             restirHistoryClearMs +
             restirGiClearMs +
+            restirGiTemporalMs +
             restirSpatialMs +
             restirSpatialCopyMs +
             restirGiSpatialMs +
+            restirGiUpsampleMs +
             restirGiFinalMs +
+            restirGiCountersReadbackMs +
+            restirDiTemporalMs +
+            restirDiSpatialMs +
+            restirDiFinalMs +
+            restirDiHistoryCopyMs +
+            restirDiCountersReadbackMs +
             fogIntegrateMs +
             atmosphereMs +
             denoiserMs +
@@ -185,7 +201,15 @@ public:
         RestirDiFinalEnd = 84,
         RestirDiHistoryCopyStart = 85,
         RestirDiHistoryCopyEnd = 86,
-        Count = 87,
+        RestirDiCountersReadbackStart = 87,
+        RestirDiCountersReadbackEnd = 88,
+        RestirGiTemporalStart = 89,
+        RestirGiTemporalEnd = 90,
+        RestirGiUpsampleStart = 91,
+        RestirGiUpsampleEnd = 92,
+        RestirGiCountersReadbackStart = 93,
+        RestirGiCountersReadbackEnd = 94,
+        Count = 95,
     };
 
     GpuProfiler() = default;

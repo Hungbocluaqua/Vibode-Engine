@@ -6,12 +6,15 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 
 namespace rtv {
 
 namespace {
+
+constexpr VkDeviceSize maxBufferUploadChunkBytes = 256ull * 1024ull * 1024ull;
 
 std::vector<VkBufferImageCopy> makeMipCopyRegions(std::span<const TextureMipLevel> mipData, uint32_t imageMipLevels) {
     std::vector<VkBufferImageCopy> regions;
@@ -99,35 +102,47 @@ void BufferUploader::uploadToBuffer(Buffer& destination, const void* data, VkDev
         throw std::runtime_error("Upload exceeds destination buffer size");
     }
 
-    Buffer staging(allocator_, {
-        .size = byteSize,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .memory = BufferMemory::Upload,
-        .persistentMapped = true,
-        .debugName = "upload staging buffer",
-    });
-    staging.write(data, byteSize);
-    staging.flush(byteSize);
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    VkDeviceSize uploaded = 0;
+    uint32_t chunkCount = 0;
+    while (uploaded < byteSize) {
+        const VkDeviceSize chunkBytes = std::min(byteSize - uploaded, maxBufferUploadChunkBytes);
+        Buffer staging(allocator_, {
+            .size = chunkBytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .memory = BufferMemory::Upload,
+            .persistentMapped = true,
+            .debugName = "upload staging buffer",
+        });
+        staging.write(bytes + uploaded, chunkBytes);
+        staging.flush(chunkBytes);
 
-    VkCommandBuffer cmd = uploadContext_.begin();
-    VkBufferCopy copy{};
-    copy.size = byteSize;
-    copy.dstOffset = dstOffset;
-    vkCmdCopyBuffer(cmd, staging.handle(), destination.handle(), 1, &copy);
+        VkCommandBuffer cmd = uploadContext_.begin();
+        VkBufferCopy copy{};
+        copy.size = chunkBytes;
+        copy.dstOffset = dstOffset + uploaded;
+        vkCmdCopyBuffer(cmd, staging.handle(), destination.handle(), 1, &copy);
 
-    barrier::cmdBufferBarrier(cmd, {
-        .buffer = destination.handle(),
-        .offset = dstOffset,
-        .size = byteSize,
-        .srcStage = VK_PIPELINE_STAGE_2_COPY_BIT,
-        .srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .dstStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        .dstAccess = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-    });
-    uploadContext_.submitAndWait(cmd);
-    recordUploadTicket(GpuUploadResourceKind::Buffer, byteSize, "Vulkan buffer upload");
-    recordUpload(byteSize);
-    ++stats_.bufferUploadCount;
+        barrier::cmdBufferBarrier(cmd, {
+            .buffer = destination.handle(),
+            .offset = dstOffset + uploaded,
+            .size = chunkBytes,
+            .srcStage = VK_PIPELINE_STAGE_2_COPY_BIT,
+            .srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstAccess = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+        });
+        uploadContext_.submitAndWait(cmd);
+        recordUploadTicket(GpuUploadResourceKind::Buffer, chunkBytes, "Vulkan buffer upload");
+        recordUpload(chunkBytes);
+        ++stats_.bufferUploadCount;
+        uploaded += chunkBytes;
+        ++chunkCount;
+    }
+    if (chunkCount > 1) {
+        std::cout << "Buffer upload chunked: chunks=" << chunkCount
+                  << " max_chunk_bytes=" << maxBufferUploadChunkBytes << '\n';
+    }
 }
 
 void BufferUploader::uploadToImage2D(Image& image, const void* rgbaBytes, VkDeviceSize byteSize, VkImageLayout finalLayout) {

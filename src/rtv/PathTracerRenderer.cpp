@@ -70,6 +70,7 @@ constexpr VkDeviceSize kFrameFogParamsOffset = 24576;
 constexpr VkDeviceSize kFrameMomentParamsOffset = 28672;
 constexpr VkDeviceSize kFrameRestirDiParamsOffset = 32768;
 constexpr uint32_t kRendererFramesInFlight = 3;
+constexpr uint32_t kRestirGiActiveTileSize = 16;
 constexpr VkPipelineStageFlags2 kCrossQueueShaderStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 constexpr uint32_t kRayTracingDiagnosticCounterCount = 14;
 constexpr uint32_t kWavefrontQueueClearValidationValue = 0x57465131u; // WFQ1
@@ -183,6 +184,19 @@ VkDescriptorSetLayoutBinding descriptorBinding(uint32_t binding, VkDescriptorTyp
     return result;
 }
 
+void addOrUpdateDescriptorBinding(
+    std::vector<VkDescriptorSetLayoutBinding>& bindings,
+    VkDescriptorSetLayoutBinding binding) {
+    auto found = std::find_if(bindings.begin(), bindings.end(), [binding](const VkDescriptorSetLayoutBinding& candidate) {
+        return candidate.binding == binding.binding;
+    });
+    if (found == bindings.end()) {
+        bindings.push_back(binding);
+        return;
+    }
+    found->stageFlags |= binding.stageFlags;
+}
+
 bool isWavefrontDebugView(RendererDebugView view) {
     return view == RendererDebugView::WavefrontQueueOccupancy ||
         view == RendererDebugView::WavefrontPathDepth ||
@@ -192,6 +206,30 @@ bool isWavefrontDebugView(RendererDebugView view) {
         view == RendererDebugView::WavefrontRestirDi ||
         view == RendererDebugView::WavefrontDirectLighting ||
         view == RendererDebugView::WavefrontRestirGi;
+}
+
+bool isRestirDiDebugView(RendererDebugView view) {
+    return view == RendererDebugView::RestirDiSelectedLight ||
+        view == RendererDebugView::RestirDiTarget ||
+        view == RendererDebugView::RestirDiSourcePdf ||
+        view == RendererDebugView::RestirDiVisibility ||
+        view == RendererDebugView::RestirDiRejectionReason ||
+        view == RendererDebugView::RestirDiTemporalAcceptance ||
+        view == RendererDebugView::RestirDiSpatialAcceptance ||
+        view == RendererDebugView::RestirDiFinalContribution ||
+        view == RendererDebugView::RestirDiReceiverPosition ||
+        view == RendererDebugView::RestirDiReceiverNormal ||
+        view == RendererDebugView::RestirDiLightVersion ||
+        view == RendererDebugView::RestirDiInitialReservoir ||
+        view == RendererDebugView::RestirDiTemporalReservoir ||
+        view == RendererDebugView::RestirDiSpatialReservoir ||
+        view == RendererDebugView::RestirDiFinalReservoir ||
+        view == RendererDebugView::RestirDiWeightSum ||
+        view == RendererDebugView::RestirDiM ||
+        view == RendererDebugView::RestirDiLightClass ||
+        view == RendererDebugView::RestirDiAge ||
+        view == RendererDebugView::RestirDiConfidence ||
+        view == RendererDebugView::RestirDiReferenceDiff;
 }
 
 bool requiresWavefrontShadowTrace(RendererDebugView view) {
@@ -546,8 +584,13 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(50, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(51, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(52, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(53, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(54, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(57, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
+        descriptorBinding(58, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(59, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(60, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(61, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(kStbnScalarTextureBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, allRt),
         descriptorBinding(kStbnScalarSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, allRt),
     };
@@ -558,7 +601,16 @@ std::vector<VkDescriptorSetLayoutBinding> wavefrontShadeBindings() {
     for (VkDescriptorSetLayoutBinding& binding : bindings) {
         binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
-    bindings.push_back(descriptorBinding(53, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT));
+    return bindings;
+}
+
+std::vector<VkDescriptorSetLayoutBinding> computeBindingsWithStbn(std::vector<VkDescriptorSetLayoutBinding> bindings) {
+    addOrUpdateDescriptorBinding(
+        bindings,
+        descriptorBinding(kStbnScalarTextureBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_SHADER_STAGE_COMPUTE_BIT));
+    addOrUpdateDescriptorBinding(
+        bindings,
+        descriptorBinding(kStbnScalarSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, VK_SHADER_STAGE_COMPUTE_BIT));
     return bindings;
 }
 
@@ -567,12 +619,12 @@ bool restirGiUncompressedLayoutFromEnvironment() {
     char* value = nullptr;
     size_t length = 0;
     _dupenv_s(&value, &length, "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT");
-    const bool enabled = value == nullptr || value[0] == '\0' || value[0] != '0';
+    const bool enabled = value != nullptr && value[0] != '\0' && value[0] != '0';
     std::free(value);
     return enabled;
 #else
     const char* value = std::getenv("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT");
-    return value == nullptr || value[0] == '\0' || value[0] != '0';
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
 #endif
 }
 
@@ -817,7 +869,7 @@ PathTracerRenderer::PathTracerRenderer(
     const SceneAsset* importedScene,
     const AssetManager* assets,
     std::optional<std::filesystem::path> environmentPath,
-    std::optional<std::filesystem::path> sceneCachePath,
+    SceneCachePolicy sceneCachePolicy,
     bool resourceAliasingEnabled,
     GpuSkinningResourcePlan gpuSkinningResourcePlan,
     const RendererSettings* initialSettings,
@@ -831,10 +883,11 @@ PathTracerRenderer::PathTracerRenderer(
           importedScene,
           assets,
           std::move(environmentPath),
-          std::move(sceneCachePath),
+          std::move(sceneCachePolicy),
           initialSettings != nullptr
               ? initialSettings->opacityMicromapSubdivisionLevel
               : kDefaultOpacityMicromapSubdivisionLevel,
+          (initialSettings == nullptr || initialSettings->opacityMicromapsEnabled) && context.supportsOpacityMicromaps(),
           materialTextureMaxDimension),
       gpuSkinningResourcePlan_(std::move(gpuSkinningResourcePlan)),
       resourceAliasingEnabled_(resourceAliasingEnabled) {
@@ -896,6 +949,30 @@ PathTracerRenderer::PathTracerRenderer(
     shaderCompiler_ = std::make_unique<ShaderCompiler>(glslangPath());
     shaderOutputDirectory_ = shaderOutputDirectory;
     ShaderCompiler& compiler = *shaderCompiler_;
+    const std::vector<std::pair<std::string, std::string>> restirDiPackedDefines{
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+    };
+    const std::vector<std::pair<std::string, std::string>> restirDiFullDefines{
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+    };
+    const std::vector<std::pair<std::string, std::string>> restirGiFullDefines{
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+    };
+    const std::vector<std::pair<std::string, std::string>> restirGiValidationDefines{
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+        {"RTV_RESTIR_GI_VALIDATION_FULL", "1"},
+    };
+    const std::vector<std::pair<std::string, std::string>> restirGiValidationPassDefines{
+        {"RTV_RESTIR_GI_VALIDATION_FULL", "1"},
+    };
+    const std::vector<std::pair<std::string, std::string>> restirAllFullDefines{
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+    };
     const auto denoiserSpv = compiler.compileIfNeeded(shaderDirectory / "denoiser.comp", shaderOutputDirectory);
     const auto momentUpdateSpv = compiler.compileIfNeeded(shaderDirectory / "moment_update.comp", shaderOutputDirectory);
     const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
@@ -907,9 +984,32 @@ PathTracerRenderer::PathTracerRenderer(
     const auto restirSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_spatial.comp", shaderOutputDirectory);
     const auto restirGiSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_spatial.comp", shaderOutputDirectory);
     const auto restirGiFinalSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_final.comp", shaderOutputDirectory);
-    const auto restirDiTemporalSpv = compiler.compileIfNeeded(shaderDirectory / "restir_di_temporal.comp", shaderOutputDirectory);
-    const auto restirDiSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_di_spatial.comp", shaderOutputDirectory);
-    const auto restirDiFinalSpv = compiler.compileIfNeeded(shaderDirectory / "restir_di_final.comp", shaderOutputDirectory);
+    const auto restirGiTemporalSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_temporal.comp", shaderOutputDirectory);
+    const auto restirGiTemporalFullSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_gi_temporal.comp", shaderOutputDirectory, ".gi_full", restirGiFullDefines);
+    const auto restirGiTemporalValidationSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_gi_temporal.comp", shaderOutputDirectory, ".gi_validation", restirGiValidationDefines);
+    const auto restirGiSpatialProdSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_spatial_production.comp", shaderOutputDirectory);
+    const auto restirGiSpatialValidationSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_gi_spatial_production.comp", shaderOutputDirectory, ".gi_validation", restirGiValidationPassDefines);
+    const auto restirGiFinalProdSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_final_production.comp", shaderOutputDirectory);
+    const auto restirGiFinalValidationSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_gi_final_production.comp", shaderOutputDirectory, ".gi_validation", restirGiValidationPassDefines);
+    const auto restirGiUpsampleSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_upsample.comp", shaderOutputDirectory);
+    const auto restirGiUpsampleValidationSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_gi_upsample.comp", shaderOutputDirectory, ".gi_validation", restirGiValidationPassDefines);
+    const auto restirDiTemporalSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_di_temporal.comp", shaderOutputDirectory, ".di_packed", restirDiPackedDefines);
+    const auto restirDiTemporalFullSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_di_temporal.comp", shaderOutputDirectory, ".di_full", restirDiFullDefines);
+    const auto restirDiSpatialSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_di_spatial.comp", shaderOutputDirectory, ".di_packed", restirDiPackedDefines);
+    const auto restirDiSpatialFullSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_di_spatial.comp", shaderOutputDirectory, ".di_full", restirDiFullDefines);
+    const auto restirDiFinalSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_di_final.comp", shaderOutputDirectory, ".di_packed", restirDiPackedDefines);
+    const auto restirDiFinalFullSpv = compiler.compileIfNeeded(
+        shaderDirectory / "restir_di_final.comp", shaderOutputDirectory, ".di_full", restirDiFullDefines);
     const auto fogSpv = compiler.compileIfNeeded(shaderDirectory / "fog_integrate.comp", shaderOutputDirectory);
     const auto transmittanceSpv = compiler.compileIfNeeded(shaderDirectory / "transmittance_lut.comp", shaderOutputDirectory);
     const auto multiScatterSpv = compiler.compileIfNeeded(shaderDirectory / "multi_scatter_lut.comp", shaderOutputDirectory);
@@ -943,9 +1043,21 @@ PathTracerRenderer::PathTracerRenderer(
     restirSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirSpatialSpv), "restir spatial compute");
     restirGiSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiSpatialSpv), "restir gi spatial compute");
     restirGiFinalShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiFinalSpv), "restir gi final compute");
+    restirGiTemporalShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiTemporalSpv), "restir gi temporal compute");
+    restirGiTemporalFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiTemporalFullSpv), "restir gi temporal full compute");
+    restirGiTemporalValidationShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiTemporalValidationSpv), "restir gi temporal validation compute");
+    restirGiSpatialProdShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiSpatialProdSpv), "restir gi production spatial compute");
+    restirGiSpatialValidationShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiSpatialValidationSpv), "restir gi validation spatial compute");
+    restirGiFinalProdShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiFinalProdSpv), "restir gi production final compute");
+    restirGiFinalValidationShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiFinalValidationSpv), "restir gi validation final compute");
+    restirGiUpsampleShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiUpsampleSpv), "restir gi production upsample compute");
+    restirGiUpsampleValidationShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiUpsampleValidationSpv), "restir gi validation upsample compute");
     restirDiTemporalShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiTemporalSpv), "restir di temporal compute");
+    restirDiTemporalFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiTemporalFullSpv), "restir di temporal full compute");
     restirDiSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiSpatialSpv), "restir di spatial compute");
+    restirDiSpatialFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiSpatialFullSpv), "restir di spatial full compute");
     restirDiFinalShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiFinalSpv), "restir di final compute");
+    restirDiFinalFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiFinalFullSpv), "restir di final full compute");
     fogShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(fogSpv), "height fog integrate compute");
     transmittanceShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(transmittanceSpv), "atmosphere transmittance lut compute");
     multiScatterShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(multiScatterSpv), "atmosphere multi scatter lut compute");
@@ -967,14 +1079,55 @@ PathTracerRenderer::PathTracerRenderer(
     wavefrontDirectLightingValidateShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(wavefrontDirectValidateSpv), "wavefront direct lighting validate compute");
     fullscreenVertexShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(vertSpv), "fullscreen vertex");
     fullscreenFragmentShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(fragSpv), "fullscreen fragment");
-    const auto raygenSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace.rgen", shaderOutputDirectory);
+    const auto raygenSpv = compiler.compileIfNeeded(
+        shaderDirectory / "pathtrace.rgen", shaderOutputDirectory, ".di_packed", restirDiPackedDefines);
+    const auto raygenFullSpv = compiler.compileIfNeeded(
+        shaderDirectory / "pathtrace.rgen", shaderOutputDirectory, ".di_full", restirDiFullDefines);
+    const auto raygenGiFullSpv = compiler.compileIfNeeded(
+        shaderDirectory / "pathtrace.rgen", shaderOutputDirectory, ".gi_full", restirGiFullDefines);
+    const auto raygenAllFullSpv = compiler.compileIfNeeded(
+        shaderDirectory / "pathtrace.rgen", shaderOutputDirectory, ".di_full.gi_full", restirAllFullDefines);
     std::optional<std::filesystem::path> raygenMotionSpv;
+    std::optional<std::filesystem::path> raygenMotionFullSpv;
+    std::optional<std::filesystem::path> raygenMotionGiFullSpv;
+    std::optional<std::filesystem::path> raygenMotionAllFullSpv;
     if (context_.supportsRayTracingMotionBlur()) {
         raygenMotionSpv = compiler.compileIfNeeded(
             shaderDirectory / "pathtrace.rgen",
             shaderOutputDirectory,
-            ".motion",
-            {{"RTV_MOTION_BLUR_ENABLED", "1"}});
+            ".motion.di_packed",
+            {
+                {"RTV_MOTION_BLUR_ENABLED", "1"},
+                {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+            });
+        raygenMotionFullSpv = compiler.compileIfNeeded(
+            shaderDirectory / "pathtrace.rgen",
+            shaderOutputDirectory,
+            ".motion.di_full",
+            {
+                {"RTV_MOTION_BLUR_ENABLED", "1"},
+                {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
+                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+            });
+        raygenMotionGiFullSpv = compiler.compileIfNeeded(
+            shaderDirectory / "pathtrace.rgen",
+            shaderOutputDirectory,
+            ".motion.gi_full",
+            {
+                {"RTV_MOTION_BLUR_ENABLED", "1"},
+                {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+            });
+        raygenMotionAllFullSpv = compiler.compileIfNeeded(
+            shaderDirectory / "pathtrace.rgen",
+            shaderOutputDirectory,
+            ".motion.di_full.gi_full",
+            {
+                {"RTV_MOTION_BLUR_ENABLED", "1"},
+                {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
+                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+            });
     }
     const auto wavefrontTraceRaygenSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_trace.rgen", shaderOutputDirectory);
     std::optional<std::filesystem::path> wavefrontTraceRaygenSerSpv;
@@ -992,8 +1145,20 @@ PathTracerRenderer::PathTracerRenderer(
     const auto primaryAnyHitSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace.rahit", shaderOutputDirectory);
     const auto shadowAnyHitSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace_shadow.rahit", shaderOutputDirectory);
     raygenShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenSpv), "path trace raygen");
+    raygenFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenFullSpv), "path trace raygen full");
+    raygenGiFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenGiFullSpv), "path trace raygen gi full");
+    raygenAllFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenAllFullSpv), "path trace raygen all full");
     if (raygenMotionSpv.has_value()) {
         raygenMotionShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(*raygenMotionSpv), "path trace raygen motion blur");
+    }
+    if (raygenMotionFullSpv.has_value()) {
+        raygenMotionFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(*raygenMotionFullSpv), "path trace raygen full motion blur");
+    }
+    if (raygenMotionGiFullSpv.has_value()) {
+        raygenMotionGiFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(*raygenMotionGiFullSpv), "path trace raygen gi full motion blur");
+    }
+    if (raygenMotionAllFullSpv.has_value()) {
+        raygenMotionAllFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(*raygenMotionAllFullSpv), "path trace raygen all full motion blur");
     }
     wavefrontTraceRaygenShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(wavefrontTraceRaygenSpv), "wavefront trace raygen");
     if (wavefrontTraceRaygenSerSpv.has_value()) {
@@ -1017,6 +1182,10 @@ PathTracerRenderer::PathTracerRenderer(
         shaderDirectory / "restir_spatial.comp",
         shaderDirectory / "restir_gi_spatial.comp",
         shaderDirectory / "restir_gi_final.comp",
+        shaderDirectory / "restir_gi_temporal.comp",
+        shaderDirectory / "restir_gi_spatial_production.comp",
+        shaderDirectory / "restir_gi_final_production.comp",
+        shaderDirectory / "restir_gi_upsample.comp",
         shaderDirectory / "restir_di_temporal.comp",
         shaderDirectory / "restir_di_spatial.comp",
         shaderDirectory / "restir_di_final.comp",
@@ -1077,12 +1246,49 @@ PathTracerRenderer::PathTracerRenderer(
     dlssRayReconstructionGuidesSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({dlssRayReconstructionGuidesShader_->reflection()}, 0));
     nrdPrepareSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({nrdPrepareShader_->reflection()}, 0));
     nrdResolveSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({nrdResolveShader_->reflection()}, 0));
-    restirSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirSpatialShader_->reflection()}, 0));
-    restirGiSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiSpatialShader_->reflection()}, 0));
+    auto createComputeMaterialTextureLayout = [this](
+        std::vector<VkDescriptorSetLayoutBinding> bindings,
+        bool includeStbn) {
+        if (includeStbn) {
+            bindings = computeBindingsWithStbn(std::move(bindings));
+        }
+        std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), 0);
+        const BindlessCapabilities& bindless = context_.bindlessCapabilities();
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            if (bindings[i].binding != 41u) {
+                continue;
+            }
+            // SPIR-V reflection reports zero for an unsized descriptor array.
+            // Match the renderer-wide bindless material texture contract.
+            bindings[i].descriptorCount = 1024u;
+            if (bindless.partiallyBound) {
+                bindingFlags[i] |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+            }
+            if (bindless.updateAfterBind) {
+                bindingFlags[i] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+            }
+        }
+        const VkDescriptorSetLayoutCreateFlags layoutFlags = bindless.updateAfterBind
+            ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT
+            : 0u;
+        return layoutCache_->createLayout(std::move(bindings), layoutFlags, std::move(bindingFlags));
+    };
+    restirSpatialSetLayout_ = layoutCache_->createLayout(computeBindingsWithStbn(ShaderReflection::bindingsForSet({restirSpatialShader_->reflection()}, 0)));
+    restirGiSpatialSetLayout_ = layoutCache_->createLayout(computeBindingsWithStbn(ShaderReflection::bindingsForSet({restirGiSpatialShader_->reflection()}, 0)));
     restirGiFinalSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiFinalShader_->reflection()}, 0));
-    restirDiTemporalSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirDiTemporalShader_->reflection()}, 0));
-    restirDiSpatialSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirDiSpatialShader_->reflection()}, 0));
-    restirDiFinalSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirDiFinalShader_->reflection()}, 0));
+    restirGiTemporalSetLayout_ = createComputeMaterialTextureLayout(
+        ShaderReflection::bindingsForSet({restirGiTemporalShader_->reflection()}, 0), false);
+    restirGiSpatialProdSetLayout_ = createComputeMaterialTextureLayout(
+        ShaderReflection::bindingsForSet({restirGiSpatialProdShader_->reflection()}, 0), false);
+    restirGiFinalProdSetLayout_ = createComputeMaterialTextureLayout(
+        ShaderReflection::bindingsForSet({restirGiFinalProdShader_->reflection()}, 0), false);
+    restirGiUpsampleSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiUpsampleShader_->reflection()}, 0));
+    restirDiTemporalSetLayout_ = createComputeMaterialTextureLayout(
+        ShaderReflection::bindingsForSet({restirDiTemporalShader_->reflection()}, 0), true);
+    restirDiSpatialSetLayout_ = createComputeMaterialTextureLayout(
+        ShaderReflection::bindingsForSet({restirDiSpatialShader_->reflection()}, 0), true);
+    restirDiFinalSetLayout_ = createComputeMaterialTextureLayout(
+        ShaderReflection::bindingsForSet({restirDiFinalShader_->reflection()}, 0), false);
     fogSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({fogShader_->reflection()}, 0));
     selectionOutlineSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({selectionOutlineShader_->reflection()}, 0));
     luminanceHistogramSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({luminanceHistogramShader_->reflection()}, 0));
@@ -1201,6 +1407,60 @@ PathTracerRenderer::PathTracerRenderer(
         std::vector<VkDescriptorSetLayout>{restirGiFinalSetLayout_},
         ShaderReflection::mergePushConstants({restirGiFinalShader_->reflection()}),
         *pipelineCache_);
+    restirGiTemporalPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiTemporalShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiTemporalShader_->reflection()}),
+        *pipelineCache_);
+    restirGiTemporalFullPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiTemporalFullShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiTemporalFullShader_->reflection()}),
+        *pipelineCache_);
+    restirGiTemporalValidationPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiTemporalValidationShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiTemporalValidationShader_->reflection()}),
+        *pipelineCache_);
+    restirGiSpatialProdPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiSpatialProdShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiSpatialProdSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiSpatialProdShader_->reflection()}),
+        *pipelineCache_);
+    restirGiSpatialValidationPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiSpatialValidationShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiSpatialProdSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiSpatialValidationShader_->reflection()}),
+        *pipelineCache_);
+    restirGiFinalProdPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiFinalProdShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiFinalProdSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiFinalProdShader_->reflection()}),
+        *pipelineCache_);
+    restirGiFinalValidationPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiFinalValidationShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiFinalProdSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiFinalValidationShader_->reflection()}),
+        *pipelineCache_);
+    restirGiUpsamplePipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiUpsampleShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiUpsampleSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiUpsampleShader_->reflection()}),
+        *pipelineCache_);
+    restirGiUpsampleValidationPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirGiUpsampleValidationShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiUpsampleSetLayout_},
+        ShaderReflection::mergePushConstants({restirGiUpsampleValidationShader_->reflection()}),
+        *pipelineCache_);
     restirDiTemporalPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirDiTemporalShader_,
@@ -1218,6 +1478,24 @@ PathTracerRenderer::PathTracerRenderer(
         *restirDiFinalShader_,
         std::vector<VkDescriptorSetLayout>{restirDiFinalSetLayout_},
         ShaderReflection::mergePushConstants({restirDiFinalShader_->reflection()}),
+        *pipelineCache_);
+    restirDiTemporalFullPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirDiTemporalFullShader_,
+        std::vector<VkDescriptorSetLayout>{restirDiTemporalSetLayout_},
+        ShaderReflection::mergePushConstants({restirDiTemporalFullShader_->reflection()}),
+        *pipelineCache_);
+    restirDiSpatialFullPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirDiSpatialFullShader_,
+        std::vector<VkDescriptorSetLayout>{restirDiSpatialSetLayout_},
+        ShaderReflection::mergePushConstants({restirDiSpatialFullShader_->reflection()}),
+        *pipelineCache_);
+    restirDiFinalFullPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *restirDiFinalFullShader_,
+        std::vector<VkDescriptorSetLayout>{restirDiFinalSetLayout_},
+        ShaderReflection::mergePushConstants({restirDiFinalFullShader_->reflection()}),
         *pipelineCache_);
     fogPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -1359,45 +1637,18 @@ PathTracerRenderer::PathTracerRenderer(
                 rayTracingScene_->opacityMicromapStats().active,
                 true);
         }
-        wavefrontTracePipeline_ = std::make_unique<RayTracingPipeline>(
-            context_.device(),
-            context_.rayTracingInfo().rayTracingPipelineProperties,
-            *wavefrontTraceRaygenShader_,
-            *wavefrontShadowTraceRaygenShader_,
-            *primaryMissShader_,
-            *shadowMissShader_,
-            *closestHitShader_,
-            *primaryAnyHitShader_,
-            *shadowAnyHitShader_,
-            std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_},
-            *pipelineCache_,
-            allocator_,
-            uploader_,
-            rayTracingScene_->opacityMicromapStats().active);
-        if (wavefrontTraceRaygenSerShader_ != nullptr) {
-            wavefrontTraceSerPipeline_ = std::make_unique<RayTracingPipeline>(
-                context_.device(),
-                context_.rayTracingInfo().rayTracingPipelineProperties,
-                *wavefrontTraceRaygenSerShader_,
-                *wavefrontShadowTraceRaygenShader_,
-                *primaryMissShader_,
-                *shadowMissShader_,
-                *closestHitShader_,
-                *primaryAnyHitShader_,
-                *shadowAnyHitShader_,
-                std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_},
-                *pipelineCache_,
-                allocator_,
-                uploader_,
-                rayTracingScene_->opacityMicromapStats().active,
-                false,
-                true);
+        ensureRayTracingVariantPipelines(
+            settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull,
+            usesRestirGiUncompressedInitialReservoir());
+        if (settings_.wavefrontTraceEnabled || settings_.wavefrontShadowTraceEnabled) {
+            ensureWavefrontTracePipelines();
         }
         std::cout << "RT pipeline: SBT=" << rayTracingPipeline_->sbtBytes() << " bytes\n";
     }
 
     frames_.reserve(kRendererFramesInFlight);
     profilers_.reserve(kRendererFramesInFlight);
+    restirGiActiveTileMaskProfilerModes_.assign(kRendererFramesInFlight, -1);
     for (uint32_t i = 0; i < kRendererFramesInFlight; ++i) {
         frames_.push_back(std::make_unique<FrameResources>(context_.device(), allocator_, 64 * 1024));
         profilers_.emplace_back(context_.device(), context_.physicalDevice());
@@ -1440,6 +1691,103 @@ PathTracerRenderer::PathTracerRenderer(
     }
     if (dlssRequested()) {
         initializeDlssRuntime();
+    }
+}
+
+void PathTracerRenderer::ensureRayTracingVariantPipelines(bool restirDiValidationFull, bool restirGiInitialFull) {
+    if (rayTracingScene_ == nullptr || pipelineCache_ == nullptr) {
+        return;
+    }
+    const bool ommActive = rayTracingScene_->opacityMicromapStats().active;
+    const std::vector<VkDescriptorSetLayout> layouts{rayTracingSetLayout_, atmosphereSetLayout_};
+    auto makeRtPipeline = [&](ShaderModule* raygen, bool motion = false, bool ser = false) -> std::unique_ptr<RayTracingPipeline> {
+        if (raygen == nullptr) {
+            return nullptr;
+        }
+        return std::make_unique<RayTracingPipeline>(
+            context_.device(),
+            context_.rayTracingInfo().rayTracingPipelineProperties,
+            *raygen,
+            *primaryMissShader_,
+            *shadowMissShader_,
+            *closestHitShader_,
+            *primaryAnyHitShader_,
+            *shadowAnyHitShader_,
+            layouts,
+            *pipelineCache_,
+            allocator_,
+            uploader_,
+            ommActive,
+            motion,
+            ser);
+    };
+
+    if (restirDiValidationFull && !restirGiInitialFull && rayTracingFullPipeline_ == nullptr) {
+        rayTracingFullPipeline_ = makeRtPipeline(raygenFullShader_.get());
+    }
+    if (restirGiInitialFull && !restirDiValidationFull && rayTracingGiFullPipeline_ == nullptr) {
+        rayTracingGiFullPipeline_ = makeRtPipeline(raygenGiFullShader_.get());
+    }
+    if (restirDiValidationFull && restirGiInitialFull && rayTracingAllFullPipeline_ == nullptr) {
+        rayTracingAllFullPipeline_ = makeRtPipeline(raygenAllFullShader_.get());
+    }
+
+    if (settings_.motionBlurEnabled) {
+        if (restirDiValidationFull && !restirGiInitialFull && rayTracingMotionFullPipeline_ == nullptr) {
+            rayTracingMotionFullPipeline_ = makeRtPipeline(raygenMotionFullShader_.get(), true);
+        }
+        if (restirGiInitialFull && !restirDiValidationFull && rayTracingMotionGiFullPipeline_ == nullptr) {
+            rayTracingMotionGiFullPipeline_ = makeRtPipeline(raygenMotionGiFullShader_.get(), true);
+        }
+        if (restirDiValidationFull && restirGiInitialFull && rayTracingMotionAllFullPipeline_ == nullptr) {
+            rayTracingMotionAllFullPipeline_ = makeRtPipeline(raygenMotionAllFullShader_.get(), true);
+        }
+    }
+}
+
+void PathTracerRenderer::ensureWavefrontTracePipelines() {
+    if (rayTracingScene_ == nullptr || pipelineCache_ == nullptr || wavefrontTraceRaygenShader_ == nullptr) {
+        return;
+    }
+    const bool ommActive = rayTracingScene_->opacityMicromapStats().active;
+    const std::vector<VkDescriptorSetLayout> layouts{rayTracingSetLayout_, atmosphereSetLayout_};
+    if (wavefrontTracePipeline_ == nullptr) {
+        wavefrontTracePipeline_ = std::make_unique<RayTracingPipeline>(
+            context_.device(),
+            context_.rayTracingInfo().rayTracingPipelineProperties,
+            *wavefrontTraceRaygenShader_,
+            *wavefrontShadowTraceRaygenShader_,
+            *primaryMissShader_,
+            *shadowMissShader_,
+            *closestHitShader_,
+            *primaryAnyHitShader_,
+            *shadowAnyHitShader_,
+            layouts,
+            *pipelineCache_,
+            allocator_,
+            uploader_,
+            ommActive);
+    }
+    if (settings_.shaderExecutionReorderingEnabled &&
+        wavefrontTraceSerPipeline_ == nullptr &&
+        wavefrontTraceRaygenSerShader_ != nullptr) {
+        wavefrontTraceSerPipeline_ = std::make_unique<RayTracingPipeline>(
+            context_.device(),
+            context_.rayTracingInfo().rayTracingPipelineProperties,
+            *wavefrontTraceRaygenSerShader_,
+            *wavefrontShadowTraceRaygenShader_,
+            *primaryMissShader_,
+            *shadowMissShader_,
+            *closestHitShader_,
+            *primaryAnyHitShader_,
+            *shadowAnyHitShader_,
+            layouts,
+            *pipelineCache_,
+            allocator_,
+            uploader_,
+            ommActive,
+            false,
+            true);
     }
 }
 
@@ -1767,8 +2115,10 @@ bool PathTracerRenderer::shadersNeedReload() {
 }
 
 void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D renderExtent, VkExtent2D displayExtent) {
+    const size_t profilerSlot = frameIndex % profilers_.size();
     currentFrame_ = frames_.at(frameIndex % frames_.size()).get();
-    currentProfiler_ = &profilers_.at(frameIndex % profilers_.size());
+    currentProfiler_ = &profilers_.at(profilerSlot);
+    const int8_t completedMaskMode = restirGiActiveTileMaskProfilerModes_.at(profilerSlot);
     currentProfiler_->collectCompletedFrame();
     releaseRetiredResolutionResources();
     scene_.releaseRetiredMaterialSamplers(temporalFrameIndex_);
@@ -1788,6 +2138,57 @@ void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D renderExtent
         memoryPressureQualityChanged_ = false;
     }
     updateAdaptiveQuality(currentProfiler_->timings());
+    if (settings_.restirGiActiveTileMaskMode == RestirGiActiveTileMaskMode::Auto && shouldUseNewRestirGi()) {
+        constexpr uint32_t kProbeFrames = 8u;
+        constexpr uint32_t kReprobeFrames = 240u;
+        const GpuFrameTimings& timings = currentProfiler_->timings();
+        const float giMs = timings.restirGiTemporalMs +
+            timings.restirGiSpatialMs +
+            timings.restirGiUpsampleMs +
+            timings.restirGiFinalMs;
+        if (giMs > 0.0f) {
+            if (completedMaskMode >= 0 &&
+                restirGiActiveTileMaskAutoFrame_ > 0u &&
+                restirGiActiveTileMaskAutoFrame_ <= kProbeFrames * 2u) {
+                if (completedMaskMode != 0) {
+                    restirGiActiveTileMaskAutoOnMs_ += giMs;
+                    ++restirGiActiveTileMaskAutoOnSamples_;
+                } else {
+                    restirGiActiveTileMaskAutoOffMs_ += giMs;
+                    ++restirGiActiveTileMaskAutoOffSamples_;
+                }
+            }
+            if (restirGiActiveTileMaskAutoFrame_ < kProbeFrames) {
+                restirGiActiveTileMaskAutoEnabled_ = false;
+            } else if (restirGiActiveTileMaskAutoFrame_ < kProbeFrames * 2u) {
+                restirGiActiveTileMaskAutoEnabled_ = true;
+            } else if (restirGiActiveTileMaskAutoFrame_ == kProbeFrames * 2u) {
+                const float offAvg = restirGiActiveTileMaskAutoOffMs_ /
+                    static_cast<float>(std::max(restirGiActiveTileMaskAutoOffSamples_, 1u));
+                const float onAvg = restirGiActiveTileMaskAutoOnMs_ /
+                    static_cast<float>(std::max(restirGiActiveTileMaskAutoOnSamples_, 1u));
+                restirGiActiveTileMaskAutoEnabled_ = onAvg < offAvg * 0.98f;
+            } else if (restirGiActiveTileMaskAutoFrame_ >= kReprobeFrames) {
+                restirGiActiveTileMaskAutoEnabled_ = false;
+                restirGiActiveTileMaskAutoFrame_ = 0;
+                restirGiActiveTileMaskAutoOffMs_ = 0.0f;
+                restirGiActiveTileMaskAutoOnMs_ = 0.0f;
+                restirGiActiveTileMaskAutoOffSamples_ = 0;
+                restirGiActiveTileMaskAutoOnSamples_ = 0;
+            }
+            ++restirGiActiveTileMaskAutoFrame_;
+        }
+        restirGiActiveTileMaskProfilerModes_[profilerSlot] =
+            restirGiActiveTileMaskAutoEnabled_ ? 1 : 0;
+    } else {
+        restirGiActiveTileMaskAutoEnabled_ = false;
+        restirGiActiveTileMaskAutoFrame_ = 0;
+        restirGiActiveTileMaskAutoOffMs_ = 0.0f;
+        restirGiActiveTileMaskAutoOnMs_ = 0.0f;
+        restirGiActiveTileMaskAutoOffSamples_ = 0;
+        restirGiActiveTileMaskAutoOnSamples_ = 0;
+        std::fill(restirGiActiveTileMaskProfilerModes_.begin(), restirGiActiveTileMaskProfilerModes_.end(), -1);
+    }
     if (temporalFrameIndex_ > 0 && temporalFrameIndex_ % 120u == 0u) {
         const GpuFrameTimings& timings = currentProfiler_->timings();
         std::cout << "GPU timings: path=" << timings.pathTraceMs
@@ -2058,7 +2459,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         0.02f,
         0.50f);
     next.restirGiTemporalMaxAge = std::clamp(next.restirGiTemporalMaxAge, 1u, 64u);
-    next.restirGiSpatialRounds = std::clamp(next.restirGiSpatialRounds, 1u, 8u);
+    next.restirGiSpatialRounds = std::clamp(next.restirGiSpatialRounds, 0u, 8u);
     next.restirGiSpatialRadius = std::clamp(
         std::isfinite(next.restirGiSpatialRadius) ? next.restirGiSpatialRadius : 4.25f,
         1.0f,
@@ -2072,6 +2473,30 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         0.0f,
         0.85f);
     next.restirGiVisibilityRayBudget = std::clamp(next.restirGiVisibilityRayBudget, 0u, 4u);
+    next.restirGiMinFinalBlendStrength = std::clamp(
+        std::isfinite(next.restirGiMinFinalBlendStrength) ? next.restirGiMinFinalBlendStrength : 0.01f,
+        0.0f,
+        1.0f);
+    if (static_cast<uint32_t>(next.restirCounterMode) > static_cast<uint32_t>(RestirCounterMode::Off)) {
+        next.restirCounterMode = RestirCounterMode::Auto;
+    }
+    if (static_cast<uint32_t>(next.restirGiMode) > static_cast<uint32_t>(RestirGiMode::ReferenceValidation)) {
+        next.restirGiMode = RestirGiMode::Production;
+    }
+    if (static_cast<uint32_t>(next.restirGiReservoirLayout) > static_cast<uint32_t>(RestirGiReservoirLayout::ValidationFull)) {
+        next.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
+    }
+    if (next.restirGiMode == RestirGiMode::LegacyCache) {
+        next.restirGiReservoirLayout = RestirGiReservoirLayout::LegacyCachePacked;
+    } else if (next.restirGiMode == RestirGiMode::Production &&
+               next.restirGiReservoirLayout == RestirGiReservoirLayout::LegacyCachePacked) {
+        next.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
+    } else if (next.restirGiMode == RestirGiMode::ReferenceValidation) {
+        next.restirGiReservoirLayout = RestirGiReservoirLayout::ValidationFull;
+        next.restirGiFinalStabilizationEnabled = false;
+        next.restirGiVisibilityRayBudget = std::max(next.restirGiVisibilityRayBudget, 1u);
+    }
+    next.restirGiEnabled = next.restirGiMode != RestirGiMode::Off;
     if (!context_.supportsOpacityMicromaps()) {
         next.opacityMicromapsEnabled = false;
     }
@@ -2135,17 +2560,26 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     next.restirDiTemporalMaxAge = std::clamp(next.restirDiTemporalMaxAge, 1u, 255u);
     next.restirDiMaxM = std::clamp(next.restirDiMaxM, 1u, 255u);
     next.restirDiVisibilityRayBudget = std::clamp(next.restirDiVisibilityRayBudget, 0u, 4u);
+    next.restirDiIncludeSun = false;
+    next.restirDiIncludeEnvironment = false;
     next.restirDiClampLuminance = std::clamp(
         std::isfinite(next.restirDiClampLuminance) ? next.restirDiClampLuminance : 8.0f,
         0.0f, 1000.0f);
     if (static_cast<uint32_t>(next.restirDiReservoirLayout) > static_cast<uint32_t>(RestirDiReservoirLayout::ValidationFull)) {
         next.restirDiReservoirLayout = RestirDiReservoirLayout::ProductionPacked;
     }
+    if (static_cast<uint32_t>(next.restirGiActiveTileMaskMode) > static_cast<uint32_t>(RestirGiActiveTileMaskMode::Auto)) {
+        next.restirGiActiveTileMaskMode = RestirGiActiveTileMaskMode::Off;
+    }
+    if (static_cast<uint32_t>(next.restirHistoryCopyMode) > static_cast<uint32_t>(RestirHistoryCopyMode::PingPong)) {
+        next.restirHistoryCopyMode = RestirHistoryCopyMode::Copy;
+    }
     // ReferenceValidation forces certain settings
     if (next.restirDiMode == RestirDiMode::ReferenceValidation) {
         next.restirDiFinalVisibilityEnabled = true;
         next.restirDiProductionStabilizationEnabled = false;
         next.restirDiReservoirLayout = RestirDiReservoirLayout::ValidationFull;
+        next.restirDiVisibilityRayBudget = std::max(next.restirDiVisibilityRayBudget, 1u);
     }
     if (static_cast<uint32_t>(next.renderPreset) > static_cast<uint32_t>(RenderPreset::Ultra)) {
         next.renderPreset = RenderPreset::Custom;
@@ -2175,6 +2609,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.restirDiMode != settings_.restirDiMode ||
         next.restirDiTemporalEnabled != settings_.restirDiTemporalEnabled ||
         next.restirDiSpatialEnabled != settings_.restirDiSpatialEnabled ||
+        next.restirDiFinalVisibilityEnabled != settings_.restirDiFinalVisibilityEnabled ||
         next.restirDiSpatialRounds != settings_.restirDiSpatialRounds ||
         std::abs(next.restirDiSpatialRadius - settings_.restirDiSpatialRadius) > 0.0001f ||
         next.restirDiTemporalMaxAge != settings_.restirDiTemporalMaxAge ||
@@ -2186,6 +2621,8 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.restirDiIncludeEnvironment != settings_.restirDiIncludeEnvironment ||
         next.restirDiReservoirLayout != settings_.restirDiReservoirLayout ||
         next.restirGiEnabled != settings_.restirGiEnabled ||
+        next.restirGiMode != settings_.restirGiMode ||
+        next.restirGiReservoirLayout != settings_.restirGiReservoirLayout ||
         next.specularAaEnabled != settings_.specularAaEnabled ||
         next.opacityMicromapsEnabled != settings_.opacityMicromapsEnabled ||
         next.opacityMicromapSubdivisionLevel != settings_.opacityMicromapSubdivisionLevel ||
@@ -2277,6 +2714,10 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.restirGiHalfResolution != settings_.restirGiHalfResolution ||
         next.restirGiVisibilityRayBudget != settings_.restirGiVisibilityRayBudget ||
         next.restirGiFinalStabilizationEnabled != settings_.restirGiFinalStabilizationEnabled ||
+        std::abs(next.restirGiMinFinalBlendStrength - settings_.restirGiMinFinalBlendStrength) > 0.0001f ||
+        next.restirGiActiveTileMaskMode != settings_.restirGiActiveTileMaskMode ||
+        next.restirHistoryCopyMode != settings_.restirHistoryCopyMode ||
+        next.restirCounterMode != settings_.restirCounterMode ||
         next.adaptiveQualityMode != settings_.adaptiveQualityMode ||
         std::abs(next.adaptiveGpuFrameTargetMs - settings_.adaptiveGpuFrameTargetMs) > 0.0001f ||
         next.wavefrontQueuesEnabled != settings_.wavefrontQueuesEnabled ||
@@ -2303,6 +2744,8 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         next.restirMode != settings_.restirMode ||
         next.restirGiEnabled != settings_.restirGiEnabled ||
+        next.restirGiMode != settings_.restirGiMode ||
+        next.restirGiReservoirLayout != settings_.restirGiReservoirLayout ||
         std::abs(next.sunIntensity - settings_.sunIntensity) > 0.0001f ||
         std::abs(next.sunIlluminanceLux - settings_.sunIlluminanceLux) > 0.5f ||
         glm::length(next.sunColor - settings_.sunColor) > 0.0001f ||
@@ -2315,6 +2758,24 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.mieScaleHeight - settings_.mieScaleHeight) > 0.5f ||
         std::abs(next.mieAnisotropy - settings_.mieAnisotropy) > 0.0001f ||
         std::abs(next.groundAlbedo - settings_.groundAlbedo) > 0.0001f;
+    const bool restirDiChanged =
+        next.restirDiMode != settings_.restirDiMode ||
+        next.restirDiTemporalEnabled != settings_.restirDiTemporalEnabled ||
+        next.restirDiSpatialEnabled != settings_.restirDiSpatialEnabled ||
+        next.restirDiFinalVisibilityEnabled != settings_.restirDiFinalVisibilityEnabled ||
+        next.restirDiSpatialRounds != settings_.restirDiSpatialRounds ||
+        std::abs(next.restirDiSpatialRadius - settings_.restirDiSpatialRadius) > 0.0001f ||
+        next.restirDiTemporalMaxAge != settings_.restirDiTemporalMaxAge ||
+        next.restirDiMaxM != settings_.restirDiMaxM ||
+        next.restirDiVisibilityRayBudget != settings_.restirDiVisibilityRayBudget ||
+        next.restirDiProductionStabilizationEnabled != settings_.restirDiProductionStabilizationEnabled ||
+        std::abs(next.restirDiClampLuminance - settings_.restirDiClampLuminance) > 0.0001f ||
+        next.restirDiIncludeSun != settings_.restirDiIncludeSun ||
+        next.restirDiIncludeEnvironment != settings_.restirDiIncludeEnvironment ||
+        next.restirDiReservoirLayout != settings_.restirDiReservoirLayout ||
+        next.samplesPerPixel != settings_.samplesPerPixel ||
+        next.limitSamplesPerPixel != settings_.limitSamplesPerPixel ||
+        next.homogeneousVolumeEnabled != settings_.homogeneousVolumeEnabled;
     const bool denoiserChanged =
         next.denoiserEnabled != settings_.denoiserEnabled ||
         next.denoiserBackend != settings_.denoiserBackend ||
@@ -2374,18 +2835,27 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.restirGiSpatialCompatibilityThreshold - settings_.restirGiSpatialCompatibilityThreshold) > 0.0001f ||
         next.restirGiHalfResolution != settings_.restirGiHalfResolution ||
         next.restirGiVisibilityRayBudget != settings_.restirGiVisibilityRayBudget ||
-        next.restirGiFinalStabilizationEnabled != settings_.restirGiFinalStabilizationEnabled;
+        next.restirGiFinalStabilizationEnabled != settings_.restirGiFinalStabilizationEnabled ||
+        next.restirGiActiveTileMaskMode != settings_.restirGiActiveTileMaskMode ||
+        next.restirHistoryCopyMode != settings_.restirHistoryCopyMode ||
+        next.restirGiMode != settings_.restirGiMode ||
+        next.restirGiReservoirLayout != settings_.restirGiReservoirLayout;
     const bool renderResolutionChanged =
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f;
     const bool materialTextureFilteringChanged =
         std::abs(next.materialTextureAnisotropy - settings_.materialTextureAnisotropy) > 0.0001f;
     const bool motionBlurStructureChanged = next.motionBlurEnabled != settings_.motionBlurEnabled;
+    const bool restirGiActiveTileMaskModeChanged =
+        next.restirGiActiveTileMaskMode != settings_.restirGiActiveTileMaskMode;
     const bool nrdRequestedAfter = next.denoiserBackend == DenoiserBackend::Nrd;
     const bool dlssRequestedAfter = next.temporalUpscaler == TemporalUpscaler::Dlss ||
         next.dlssRayReconstructionEnabled ||
         next.dlssFrameGenerationEnabled;
 
     settings_ = next;
+    if (restirDiChanged || debugChanged) {
+        reconcileRestirDiResources();
+    }
     if (nrdRequestedAfter && !nrdAvailable_) {
         initializeNrdRuntime();
         if (nrdAvailable_ && nrdRuntime_ != nullptr && renderExtent_.width > 0u && renderExtent_.height > 0u) {
@@ -2412,6 +2882,15 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         adaptiveQualityTier_ = 0;
         adaptiveOverBudgetFrames_ = 0;
     }
+    if (renderChanged || restirDiChanged || restirGiActiveTileMaskModeChanged) {
+        restirGiActiveTileMaskAutoEnabled_ = false;
+        restirGiActiveTileMaskAutoFrame_ = 0;
+        restirGiActiveTileMaskAutoOffMs_ = 0.0f;
+        restirGiActiveTileMaskAutoOnMs_ = 0.0f;
+        restirGiActiveTileMaskAutoOffSamples_ = 0;
+        restirGiActiveTileMaskAutoOnSamples_ = 0;
+        std::fill(restirGiActiveTileMaskProfilerModes_.begin(), restirGiActiveTileMaskProfilerModes_.end(), -1);
+    }
     if (materialTextureFilteringChanged) {
         const uint64_t retireFrame = temporalFrameIndex_ + static_cast<uint64_t>(frames_.size()) + 1ull;
         scene_.setMaterialTextureAnisotropy(settings_.materialTextureAnisotropy, retireFrame);
@@ -2434,13 +2913,16 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         settings_.environmentIntensity,
         settings_.environmentRotation,
         settings_.environmentBackgroundIntensity);
+    if (environmentChanged || environmentUploaded) {
+        ++environmentVersionCounter_;
+    }
     if (renderResolutionChanged) {
         resetAccumulation(AccumulationResetReason::Resize);
     } else if (materialTextureFilteringChanged) {
         resetAccumulation(AccumulationResetReason::RenderSettingsChanged);
     } else if (environmentChanged || environmentUploaded) {
         resetAccumulation(AccumulationResetReason::EnvironmentChanged);
-    } else if (lightingChanged) {
+    } else if (lightingChanged || restirDiChanged) {
         resetAccumulation(AccumulationResetReason::LightingChanged);
     } else if (renderChanged) {
         resetAccumulation(AccumulationResetReason::RenderSettingsChanged);
@@ -3277,10 +3759,11 @@ void PathTracerRenderer::resetAccumulation(AccumulationResetReason reason) {
         temporalSystem_->setCameraCut(reason != AccumulationResetReason::CameraMoved, reason);
     }
     if (reason != AccumulationResetReason::CameraMoved) {
-    denoiserHistoryValid_ = false;
-    denoiserFramesSinceReset_ = 0;
-    taaHistoryValid_ = false;
+        denoiserHistoryValid_ = false;
+        denoiserFramesSinceReset_ = 0;
+        taaHistoryValid_ = false;
         restirGiHistoryValid_ = false;
+        restirDiHistoryValid_ = false;
     }
     frameCount_ = 0;
     if (reason != AccumulationResetReason::CameraMoved) {
@@ -3316,6 +3799,11 @@ void PathTracerRenderer::applyStreamingResetMasks(
         streamingResetMaskReport_.denoiserHistoryInvalidationGeneration = streamingResetMaskReport_.generation;
     } else {
         streamingResetMaskReport_.denoiserHistoryInvalidated = false;
+    }
+    if (streamingResetMaskReport_.pendingRestirEntityCount > 0 || !restirInstanceIndices.empty()) {
+        ++objectVersionCounter_;
+        ++lightVersionCounter_;
+        restirDiHistoryValid_ = false;
     }
     streamingResetMaskReport_.temporalEntityUuids = temporalEntityUuids;
     streamingResetMaskReport_.restirEntityUuids = restirEntityUuids;
@@ -3426,12 +3914,15 @@ void PathTracerRenderer::loadEnvironment(const std::filesystem::path& path) {
         settings_.environmentIntensity,
         settings_.environmentRotation,
         settings_.environmentBackgroundIntensity);
+    ++environmentVersionCounter_;
     resetAccumulation(AccumulationResetReason::EnvironmentChanged);
 }
 
 bool PathTracerRenderer::updateMaterials(const SceneAsset& scene, const AssetManager& assets) {
     const bool updated = scene_.updateImportedMaterials(uploader_, scene, assets);
     if (updated) {
+        ++materialVersionCounter_;
+        ++lightVersionCounter_;
         resetAccumulation(AccumulationResetReason::MaterialChanged);
     }
     return updated;
@@ -3441,6 +3932,7 @@ bool PathTracerRenderer::updateSceneLights(const SceneAsset& scene, bool rebuild
     const uint64_t retireFrame = temporalFrameIndex_ + static_cast<uint32_t>(std::max<size_t>(frames_.size(), 1)) + 1u;
     const bool updated = scene_.updateSceneLights(uploader_, scene, retireFrame, false, rebuildLightBvh);
     if (updated) {
+        ++lightVersionCounter_;
         resetAccumulation(AccumulationResetReason::LightingChanged);
     }
     return updated;
@@ -3492,6 +3984,8 @@ bool PathTracerRenderer::updateSceneTransforms(const SceneAsset& scene, const As
         !rayTracingScene_->refitTransforms(context_, allocator_, uploader_, scene_)) {
         rayTracingScene_ = std::make_unique<RayTracingScene>(context_, allocator_, uploader_, scene_);
     }
+    ++objectVersionCounter_;
+    ++lightVersionCounter_;
     resetAccumulation(AccumulationResetReason::SceneChanged);
     return true;
 }
@@ -3558,6 +4052,7 @@ bool PathTracerRenderer::updateSceneVisibility(const SceneAsset& scene, const As
         !rayTracingScene_->refitTransforms(context_, allocator_, uploader_, scene_)) {
         return false;
     }
+    ++objectVersionCounter_;
     resetAccumulation(AccumulationResetReason::SceneChanged);
     return true;
 }
@@ -4259,15 +4754,27 @@ void PathTracerRenderer::retireResolutionResources() {
     retireBuffer(previousRestirReservoirBuffer_);
     retireBuffer(restirSpatialReservoirBuffer_);
     retireBuffer(restirGiReservoirBuffer_);
+    retireBuffer(restirGiProductionReservoirBuffer_);
+    retireBuffer(previousRestirGiProductionReservoirBuffer_);
     retireBuffer(previousRestirGiReservoirBuffer_);
     retireBuffer(restirGiSpatialReservoirBuffer_);
     retireBuffer(wavefrontRestirGiReservoirBuffer_);
+    retireBuffer(restirGiReceiverBuffer_);
+    retireBuffer(restirGiTemporalReservoirBuffer_);
+    retireBuffer(previousRestirGiReceiverBuffer_);
+    retireBuffer(restirGiHalfResSpatialBuffer_);
+    retireBuffer(restirGiHalfResReceiverBuffer_);
+    retireBuffer(restirGiUpsampledReservoirBuffer_);
+    retireBuffer(restirGiActiveTileMaskBuffer_);
+    retireBuffer(restirGiCountersBuffer_);
+    retireBuffer(restirGiCountersReadbackBuffer_);
     retireBuffer(restirDiReceiverBuffer_);
     retireBuffer(restirDiInitialReservoirBuffer_);
     retireBuffer(restirDiTemporalReservoirBuffer_);
     retireBuffer(restirDiSpatialReservoirBuffer_);
     retireBuffer(restirDiFinalReservoirBuffer_);
     retireBuffer(previousRestirDiReservoirBuffer_);
+    retireBuffer(previousRestirDiReceiverBuffer_);
     retireBuffer(restirDiCountersBuffer_);
     retireBuffer(restirDiCountersReadbackBuffer_);
     retireBuffer(selectionParamsBuffer_);
@@ -4310,6 +4817,128 @@ void PathTracerRenderer::releaseRetiredResolutionResources() {
                 return temporalFrameIndex_ >= retired.releaseFrame;
             }),
         retiredResolutionResources_.end());
+}
+
+void PathTracerRenderer::createRestirDiResources(VkDeviceSize pixelCount) {
+    if (!shouldUseNewRestirDi() || pixelCount == 0 ||
+        restirDiReceiverBuffer_.handle() != VK_NULL_HANDLE) {
+        return;
+    }
+    const VkDeviceSize receiverStride = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
+        ? sizeof(RestirDiReceiverGpu)
+        : sizeof(RestirDiReceiverPackedGpu);
+    restirDiReceiverBuffer_.create(allocator_, BufferDesc{
+        .size = pixelCount * receiverStride,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "restir di receiver",
+    });
+    const VkDeviceSize reservoirStride = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
+        ? sizeof(RestirDiReservoirGpu)
+        : sizeof(RestirDiReservoirPackedGpu);
+    const BufferDesc reservoirDesc{
+        .size = pixelCount * reservoirStride,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "restir di reservoir",
+    };
+    auto createReservoir = [&](Buffer& buffer, const char* debugName) {
+        BufferDesc desc = reservoirDesc;
+        desc.debugName = debugName;
+        buffer.create(allocator_, desc);
+    };
+    createReservoir(restirDiInitialReservoirBuffer_, "restir di initial reservoir");
+    createReservoir(restirDiTemporalReservoirBuffer_, "restir di temporal reservoir");
+    createReservoir(restirDiSpatialReservoirBuffer_, "restir di spatial reservoir");
+    if (!shouldAliasRestirDiFinal() || settings_.restirHistoryCopyMode == RestirHistoryCopyMode::PingPong) {
+        createReservoir(restirDiFinalReservoirBuffer_, "restir di final reservoir");
+    }
+    previousRestirDiReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = reservoirDesc.size,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "restir di previous reservoir",
+    });
+    previousRestirDiReceiverBuffer_.create(allocator_, BufferDesc{
+        .size = pixelCount * receiverStride,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "restir di previous receiver",
+    });
+    restirDiCountersBuffer_.create(allocator_, BufferDesc{
+        .size = sizeof(uint32_t) * 64 * kRendererFramesInFlight,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "restir di counters",
+    });
+    restirDiCountersReadbackBuffer_.create(allocator_, BufferDesc{
+        .size = sizeof(uint32_t) * 64 * kRendererFramesInFlight,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::Readback,
+        .persistentMapped = true,
+        .debugName = "restir di counters readback",
+    });
+    restirDiHistoryValid_ = false;
+}
+
+void PathTracerRenderer::reconcileRestirDiResources() {
+    const VkDeviceSize pixelCount = static_cast<VkDeviceSize>(renderExtent_.width) * renderExtent_.height;
+    if (shouldUseNewRestirDi()) {
+        const VkDeviceSize reservoirStride = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
+            ? sizeof(RestirDiReservoirGpu)
+            : sizeof(RestirDiReservoirPackedGpu);
+        const VkDeviceSize receiverStride = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
+            ? sizeof(RestirDiReceiverGpu)
+            : sizeof(RestirDiReceiverPackedGpu);
+        const bool finalAllocationMismatch = shouldAliasRestirDiFinal()
+            ? restirDiFinalReservoirBuffer_.handle() != VK_NULL_HANDLE
+            : (restirDiFinalReservoirBuffer_.handle() == VK_NULL_HANDLE ||
+                restirDiFinalReservoirBuffer_.size() != pixelCount * reservoirStride);
+        if (restirDiInitialReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+            (restirDiInitialReservoirBuffer_.size() != pixelCount * reservoirStride ||
+                restirDiReceiverBuffer_.size() != pixelCount * receiverStride ||
+                finalAllocationMismatch)) {
+            RetiredResolutionResources retired{};
+            retired.releaseFrame = temporalFrameIndex_ + static_cast<uint32_t>(std::max<size_t>(frames_.size(), 1)) + 1u;
+            auto retire = [&](Buffer& buffer) {
+                if (buffer.handle() != VK_NULL_HANDLE) retired.buffers.push_back(std::move(buffer));
+            };
+            retire(restirDiReceiverBuffer_);
+            retire(restirDiInitialReservoirBuffer_);
+            retire(restirDiTemporalReservoirBuffer_);
+            retire(restirDiSpatialReservoirBuffer_);
+            retire(restirDiFinalReservoirBuffer_);
+            retire(previousRestirDiReservoirBuffer_);
+            retire(previousRestirDiReceiverBuffer_);
+            retire(restirDiCountersBuffer_);
+            retire(restirDiCountersReadbackBuffer_);
+            retiredResolutionResources_.push_back(std::move(retired));
+            restirDiHistoryValid_ = false;
+        }
+        createRestirDiResources(pixelCount);
+        return;
+    }
+    if (restirDiReceiverBuffer_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    RetiredResolutionResources retired{};
+    retired.releaseFrame = temporalFrameIndex_ + static_cast<uint32_t>(std::max<size_t>(frames_.size(), 1)) + 1u;
+    auto retire = [&](Buffer& buffer) {
+        if (buffer.handle() != VK_NULL_HANDLE) {
+            retired.buffers.push_back(std::move(buffer));
+        }
+    };
+    retire(restirDiReceiverBuffer_);
+    retire(restirDiInitialReservoirBuffer_);
+    retire(restirDiTemporalReservoirBuffer_);
+    retire(restirDiSpatialReservoirBuffer_);
+    retire(restirDiFinalReservoirBuffer_);
+    retire(previousRestirDiReservoirBuffer_);
+    retire(previousRestirDiReceiverBuffer_);
+    retire(restirDiCountersBuffer_);
+    retire(restirDiCountersReadbackBuffer_);
+    retiredResolutionResources_.push_back(std::move(retired));
+    restirDiHistoryValid_ = false;
 }
 
 void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkExtent2D displayExtent) {
@@ -4829,92 +5458,133 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .memory = BufferMemory::GpuOnly,
         .debugName = "restir spatial reservoir",
     };
-    const VkDeviceSize restirGiReservoirBytes = pixelCount * restirGiReservoirStride();
-    const BufferDesc restirGiCurrentDesc{
-        .size = restirGiReservoirBytes,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = resourceAliasingEnabled_ && restirSpatialDesc.size == restirGiReservoirBytes && restirSpatialDesc.usage == (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
-            ? "alias group restir gi current / restir spatial reservoir"
-            : "restir gi current reservoir",
-    };
-    restirGiReservoirBuffer_.create(allocator_, restirGiCurrentDesc);
-    if (resourceAliasingEnabled_ &&
-        restirSpatialDesc.size == restirGiCurrentDesc.size &&
-        restirSpatialDesc.usage == restirGiCurrentDesc.usage &&
-        restirSpatialDesc.memory == restirGiCurrentDesc.memory) {
-        restirSpatialReservoirBuffer_.aliasFrom(restirGiReservoirBuffer_, restirSpatialDesc);
+    if (shouldUseRestirGiReservoirs()) {
+        const VkDeviceSize restirGiReservoirBytes = pixelCount * restirGiReservoirStride();
+        const BufferDesc restirGiCurrentDesc{
+            .size = restirGiReservoirBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = resourceAliasingEnabled_ && restirSpatialDesc.size == restirGiReservoirBytes && restirSpatialDesc.usage == (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+                ? "alias group restir gi current / restir spatial reservoir"
+                : "restir gi current reservoir",
+        };
+        restirGiReservoirBuffer_.create(allocator_, restirGiCurrentDesc);
+        if (resourceAliasingEnabled_ &&
+            restirSpatialDesc.size == restirGiCurrentDesc.size &&
+            restirSpatialDesc.usage == restirGiCurrentDesc.usage &&
+            restirSpatialDesc.memory == restirGiCurrentDesc.memory) {
+            restirSpatialReservoirBuffer_.aliasFrom(restirGiReservoirBuffer_, restirSpatialDesc);
+        } else {
+            restirSpatialReservoirBuffer_.create(allocator_, restirSpatialDesc);
+        }
+        const BufferDesc previousRestirGiDesc{
+            .size = restirGiReservoirBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi previous reservoir",
+        };
+        const BufferDesc restirGiLegacySpatialDesc{
+            .size = restirGiReservoirBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi spatial reservoir",
+        };
+        if (shouldUseRestirGiLegacyCache()) {
+            previousRestirGiReservoirBuffer_.create(allocator_, previousRestirGiDesc);
+            restirGiSpatialReservoirBuffer_.create(allocator_, restirGiLegacySpatialDesc);
+        } else {
+            // New GI reads production history. Keep valid legacy descriptor bindings without
+            // paying for two unused full-resolution allocations.
+            previousRestirGiReservoirBuffer_.aliasFrom(restirGiReservoirBuffer_, previousRestirGiDesc);
+            restirGiSpatialReservoirBuffer_.aliasFrom(restirGiReservoirBuffer_, restirGiLegacySpatialDesc);
+        }
+        const bool needsWavefrontGiReservoir = settings_.wavefrontQueuesEnabled ||
+            settings_.wavefrontShadeEnabled || settings_.wavefrontFinalOutputEnabled ||
+            settings_.debugView == RendererDebugView::WavefrontRestirGi;
+        if (needsWavefrontGiReservoir) {
+            wavefrontRestirGiReservoirBuffer_.create(allocator_, BufferDesc{
+                .size = restirGiReservoirBytes,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .memory = BufferMemory::GpuOnly,
+                .debugName = "wavefront restir gi candidate reservoir",
+            });
+        }
+        const uint32_t restirGiWidth = effectiveRestirGiHalfResolution()
+            ? (renderExtent_.width + 1u) / 2u
+            : renderExtent_.width;
+        const uint32_t restirGiHeight = effectiveRestirGiHalfResolution()
+            ? (renderExtent_.height + 1u) / 2u
+            : renderExtent_.height;
+        const VkDeviceSize restirGiProductionStride = shouldUseRestirGiReferenceValidation()
+            ? sizeof(RestirGiReservoirValidationGpu)
+            : sizeof(RestirGiReservoirProductionPackedGpu);
+        const VkDeviceSize restirGiProductionBytes =
+            static_cast<VkDeviceSize>(restirGiWidth) * restirGiHeight * restirGiProductionStride;
+        const VkDeviceSize restirGiProductionFullBytes = pixelCount * restirGiProductionStride;
+        restirGiTemporalReservoirBuffer_.create(allocator_, BufferDesc{
+            .size = restirGiProductionBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi production temporal reservoir",
+        });
+        restirGiProductionReservoirBuffer_.create(allocator_, BufferDesc{
+            .size = restirGiProductionBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi production spatial reservoir",
+        });
+        previousRestirGiProductionReservoirBuffer_.create(allocator_, BufferDesc{
+            .size = restirGiProductionBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi previous production reservoir",
+        });
+        if (effectiveRestirGiHalfResolution()) {
+            restirGiUpsampledReservoirBuffer_.create(allocator_, BufferDesc{
+                .size = restirGiProductionFullBytes,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .memory = BufferMemory::GpuOnly,
+                .debugName = "restir gi production upsampled reservoir",
+            });
+        }
+        const uint32_t restirGiTileColumns = (renderExtent_.width + kRestirGiActiveTileSize - 1u) / kRestirGiActiveTileSize;
+        const uint32_t restirGiTileRows = (renderExtent_.height + kRestirGiActiveTileSize - 1u) / kRestirGiActiveTileSize;
+        restirGiActiveTileMaskBuffer_.create(allocator_, BufferDesc{
+            .size = std::max<VkDeviceSize>(1u, static_cast<VkDeviceSize>(restirGiTileColumns) * restirGiTileRows) * sizeof(uint32_t),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi active tile mask",
+        });
+        const VkDeviceSize restirGiReceiverBytes = pixelCount * sizeof(RestirGiReceiverGpu);
+        restirGiReceiverBuffer_.create(allocator_, BufferDesc{
+            .size = restirGiReceiverBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi receiver",
+        });
+        previousRestirGiReceiverBuffer_.create(allocator_, BufferDesc{
+            .size = restirGiReceiverBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi previous receiver",
+        });
+        restirGiCountersBuffer_.create(allocator_, BufferDesc{
+            .size = sizeof(uint32_t) * 64 * kRendererFramesInFlight,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = "restir gi counters",
+        });
+        restirGiCountersReadbackBuffer_.create(allocator_, BufferDesc{
+            .size = sizeof(uint32_t) * 64 * kRendererFramesInFlight,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::Readback,
+            .persistentMapped = true,
+            .debugName = "restir gi counters readback",
+        });
     } else {
         restirSpatialReservoirBuffer_.create(allocator_, restirSpatialDesc);
     }
-    previousRestirGiReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = restirGiReservoirBytes,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir gi previous reservoir",
-    });
-    restirGiSpatialReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = restirGiReservoirBytes,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir gi spatial reservoir",
-    });
-    wavefrontRestirGiReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = restirGiReservoirBytes,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "wavefront restir gi candidate reservoir",
-    });
-    // New ReSTIR DI buffers (plan Phase 1)
-    restirDiReceiverBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirDiReceiverGpu),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir di receiver",
-    });
-    restirDiInitialReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirDiReservoirGpu),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir di initial reservoir",
-    });
-    restirDiTemporalReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirDiReservoirGpu),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir di temporal reservoir",
-    });
-    restirDiSpatialReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirDiReservoirGpu),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir di spatial reservoir",
-    });
-    restirDiFinalReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirDiReservoirGpu),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir di final reservoir",
-    });
-    previousRestirDiReservoirBuffer_.create(allocator_, BufferDesc{
-        .size = pixelCount * sizeof(RestirDiReservoirGpu),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir di previous reservoir",
-    });
-    restirDiCountersBuffer_.create(allocator_, BufferDesc{
-        .size = sizeof(uint32_t) * 64,  // ample counter space
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .memory = BufferMemory::GpuOnly,
-        .debugName = "restir di counters",
-    });
-    restirDiCountersReadbackBuffer_.create(allocator_, BufferDesc{
-        .size = sizeof(uint32_t) * 64,
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .memory = BufferMemory::Readback,
-        .persistentMapped = true,
-        .debugName = "restir di counters readback",
-    });
+    createRestirDiResources(pixelCount);
     selectionParamsBuffer_.create(allocator_, BufferDesc{
         .size = sizeof(SelectionParams),
         .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -5014,15 +5684,31 @@ void PathTracerRenderer::updateCamera() {
         settings_.sunDirection,
         settings_.usePhysicalCamera ? settings_.sunIlluminanceLux : settings_.sunIntensity);
     camera_.sunColorAngularRadius = glm::vec4(settings_.sunColor, settings_.sunAngularRadius);
+    const uint32_t restirGiFlags =
+        (effectiveRestirGiHalfResolution() ? 1u : 0u) |
+        (settings_.restirGiEnabled ? 2u : 0u) |
+        (restirGiReceiverBuffer_.handle() != VK_NULL_HANDLE ? 4u : 0u) |
+        (shouldUseRestirGiLegacyCache() ? 8u : 0u);
     camera_.restirGiControls = glm::uvec4(
         settings_.restirGiTemporalMaxAge,
-        (effectiveRestirGiHalfResolution() ? 1u : 0u) | (settings_.restirGiEnabled ? 2u : 0u),
+        restirGiFlags,
         settings_.restirGiVisibilityRayBudget,
         settings_.specularAaEnabled ? 1u : 0u);
+    camera_.giVersionControls = glm::uvec4(
+        lightVersionCounter_,
+        materialVersionCounter_,
+        objectVersionCounter_,
+        environmentVersionCounter_);
+    camera_.restirDiControls = glm::uvec4(
+        shouldRunRestirDiEstimator() ? 1u : 0u,
+        restirDiHistoryValid_ ? 1u : 0u,
+        static_cast<uint32_t>(settings_.restirDiMode),
+        static_cast<uint32_t>(settings_.restirDiReservoirLayout));
     camera_.pathTraceControls = glm::uvec4(
         settings_.samplesPerPixel,
         effectiveLimitSamplesPerPixel() ? 1u : 0u,
-        rayTracingDiagnosticCountersEnabled_ ? 1u : 0u,
+        (rayTracingDiagnosticCountersEnabled_ ? 1u : 0u) |
+            (shouldRunRestirDiEstimator() ? 2u : 0u),
         settings_.mneeCausticsEnabled ? 1u : 0u);
     camera_.dofControls = glm::vec4(
         settings_.dofApertureRadius,
@@ -5041,9 +5727,15 @@ void PathTracerRenderer::updateCamera() {
         settings_.homogeneousVolumeAnisotropy);
     const bool temporalCameraCut = temporalSystem_ ? temporalSystem_->isCameraCut() : temporalFrameIndex_ <= 1u;
     const bool temporalHistoryAvailable = !temporalCameraCut;
+    const bool standaloneDiSelected = settings_.restirDiMode == RestirDiMode::Production ||
+        settings_.restirDiMode == RestirDiMode::ReferenceValidation ||
+        settings_.restirDiMode == RestirDiMode::HybridCompare;
+    const RestirMode raygenRestirMode = standaloneDiSelected || settings_.restirDiMode == RestirDiMode::Off
+        ? RestirMode::ClassicNee
+        : settings_.restirMode;
     camera_.atmosphere = glm::vec4(
         settings_.sunElevation,
-        static_cast<float>(settings_.restirMode),
+        static_cast<float>(raygenRestirMode),
         temporalHistoryAvailable ? 1.0f : 0.0f,
         settings_.sunAzimuth);
     camera_.frameCount = frameCount_;
@@ -5184,11 +5876,11 @@ void PathTracerRenderer::updateCamera() {
     frameUniforms.flush(sizeof(restirSpatialParams_), kFrameRestirSpatialParamsOffset);
 
     // Populate and upload ReSTIR DI params for the new pipeline passes
-    if (shouldUseNewRestirDi()) {
+    if (shouldRunRestirDiEstimator()) {
         restirDiParams_.width = renderExtent_.width;
         restirDiParams_.height = renderExtent_.height;
         restirDiParams_.frameIndex = temporalFrameIndex_;
-        restirDiParams_.enabled = settings_.restirDiTemporalEnabled ? 1u : 0u;
+        restirDiParams_.enabled = 1u;
         restirDiParams_.temporalMaxAge = settings_.restirDiTemporalMaxAge;
         restirDiParams_.spatialRounds = settings_.restirDiSpatialRounds;
         restirDiParams_.spatialMaxM = settings_.restirDiMaxM;
@@ -5203,11 +5895,22 @@ void PathTracerRenderer::updateCamera() {
         restirDiParams_.productionClampLuminance = settings_.restirDiProductionStabilizationEnabled
             ? settings_.restirDiClampLuminance : 0.0f;
         restirDiParams_.visibilityPolicy = settings_.restirDiFinalVisibilityEnabled ? 1u : 0u;
-        restirDiParams_.useFallbackInitial = 1u;
-        restirDiParams_.spatialResultValid = 0u;
-        frameUniforms.write(&restirDiParams_, sizeof(restirDiParams_), kFrameRestirDiParamsOffset);
-        frameUniforms.flush(sizeof(restirDiParams_), kFrameRestirDiParamsOffset);
+        restirDiParams_.mode = settings_.restirMode == RestirMode::HybridCompare ||
+                settings_.restirDiMode == RestirDiMode::HybridCompare
+            ? static_cast<uint32_t>(RestirDiMode::HybridCompare)
+            : static_cast<uint32_t>(settings_.restirDiMode);
+        restirDiParams_.spatialResultValid = settings_.restirDiSpatialEnabled ? 1u : 0u;
+        restirDiParams_.visibilityRayBudget = settings_.restirDiVisibilityRayBudget;
+        restirDiParams_.historyValid = restirDiHistoryValid_ ? 1u : 0u;
+        restirDiParams_.materialVisibilityFlags =
+            (rayTracingScene_ != nullptr && rayTracingScene_->opacityMicromapStats().active) ? 1u : 0u;
+        restirDiParams_.counterEnabled = shouldCollectRestirCounters() ? 1u : 0u;
+        restirDiParams_.rawOutputIsCurrentSample = shouldRunDlssRayReconstruction() ? 1u : 0u;
+    } else {
+        restirDiParams_ = RestirDiParams{};
     }
+    frameUniforms.write(&restirDiParams_, sizeof(restirDiParams_), kFrameRestirDiParamsOffset);
+    frameUniforms.flush(sizeof(restirDiParams_), kFrameRestirDiParamsOffset);
 
     fogParams_.width = renderExtent_.width;
     fogParams_.height = renderExtent_.height;
@@ -5303,12 +6006,6 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer, bool def
     }
     recordPathTraceGraph(commandBuffer);
     currentProfiler_->markStatsSubmitted();
-    // New ReSTIR DI pipeline (Phases 3-5)
-    if (shouldUseNewRestirDi()) {
-        recordRestirDiTemporal(commandBuffer);
-        recordRestirDiSpatial(commandBuffer);
-        recordRestirDiFinal(commandBuffer);
-    }
     recordRestirSpatial(commandBuffer);
     recordHeightFog(commandBuffer);
 
@@ -5832,6 +6529,8 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
     const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
     const RenderGraphResourceId rayTracingDiagnosticCounters = graph.createBuffer(bufferResource(rayTracingDiagnosticCountersBuffer_, "ray tracing diagnostic counters"));
+    const RenderGraphResourceId sceneLightRecords = graph.createBuffer(bufferResource(scene_.lightRecords(), "scene light records"));
+    const RenderGraphResourceId sceneMeshParams = graph.createBuffer(bufferResource(scene_.meshParamsBuffer(), "scene mesh params"));
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     RenderGraphResourceId wavefrontRestirReservoir{};
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
@@ -5840,6 +6539,16 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
         ((temporalSystem_ != nullptr && temporalSystem_->isCameraCut()) ||
          (temporalSystem_ == nullptr && temporalFrameIndex_ <= 1u));
     const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
+    const bool useNewRestirDi = shouldRunRestirDiEstimator() &&
+        restirDiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiInitialReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiSpatialReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiFinalOutputBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiPreviousHistoryReservoirBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiPreviousReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiCountersBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiCountersReadbackBuffer_.handle() != VK_NULL_HANDLE;
     const bool useWavefrontQueues = settings_.wavefrontQueuesEnabled &&
         wavefrontRayQueueBuffer_.handle() != VK_NULL_HANDLE &&
         wavefrontHitQueueBuffer_.handle() != VK_NULL_HANDLE &&
@@ -5891,17 +6600,66 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     RenderGraphResourceId restirGiReservoir{};
     RenderGraphResourceId previousRestirGiReservoir{};
     RenderGraphResourceId restirGiSpatialReservoir{};
+    RenderGraphResourceId restirGiReceiver{};
+    RenderGraphResourceId previousRestirGiReceiver{};
+    RenderGraphResourceId restirGiTemporalReservoir{};
+    RenderGraphResourceId restirGiProductionReservoir{};
+    RenderGraphResourceId previousRestirGiProductionReservoir{};
+    RenderGraphResourceId restirGiUpsampledReservoir{};
+    RenderGraphResourceId restirGiActiveTileMask{};
+    RenderGraphResourceId restirGiCounters{};
+    RenderGraphResourceId restirGiCountersReadback{};
     RenderGraphResourceId wavefrontRestirGiReservoir{};
     if (useRestirGiReservoirs) {
         restirGiReservoir = graph.createBuffer(bufferResource(restirGiReservoirBuffer_, "restir gi reservoir"));
         previousRestirGiReservoir = graph.createBuffer(bufferResource(previousRestirGiReservoirBuffer_, "previous restir gi reservoir"));
         restirGiSpatialReservoir = graph.createBuffer(bufferResource(restirGiSpatialReservoirBuffer_, "restir gi spatial reservoir"));
+        restirGiReceiver = graph.createBuffer(bufferResource(restirGiCurrentReceiverBuffer(), "restir gi receiver"));
+        previousRestirGiReceiver = graph.createBuffer(bufferResource(restirGiPreviousReceiverBuffer(), "previous restir gi receiver"));
+        if (shouldUseNewRestirGi()) {
+            restirGiTemporalReservoir = graph.createBuffer(bufferResource(restirGiTemporalReservoirBuffer_, "restir gi production temporal reservoir"));
+            restirGiProductionReservoir = graph.createBuffer(bufferResource(restirGiCurrentProductionHistoryBuffer(), "restir gi production spatial reservoir"));
+            previousRestirGiProductionReservoir = graph.createBuffer(bufferResource(restirGiPreviousProductionHistoryBuffer(), "previous restir gi production reservoir"));
+            if (restirGiCountersBuffer_.handle() != VK_NULL_HANDLE &&
+                restirGiCountersReadbackBuffer_.handle() != VK_NULL_HANDLE) {
+                restirGiCounters = graph.createBuffer(bufferResource(restirGiCountersBuffer_, "restir gi counters"));
+                restirGiCountersReadback = graph.createBuffer(bufferResource(restirGiCountersReadbackBuffer_, "restir gi counters readback"));
+            }
+            if (restirGiUpsampledReservoirBuffer_.handle() != VK_NULL_HANDLE) {
+                restirGiUpsampledReservoir = graph.createBuffer(bufferResource(restirGiUpsampledReservoirBuffer_, "restir gi production upsampled reservoir"));
+            }
+            if (restirGiActiveTileMaskBuffer_.handle() != VK_NULL_HANDLE) {
+                restirGiActiveTileMask = graph.createBuffer(bufferResource(restirGiActiveTileMaskBuffer_, "restir gi active tile mask"));
+            }
+        }
     }
     if (useWavefrontQueues && wavefrontRestirGiReservoirBuffer_.handle() != VK_NULL_HANDLE) {
         wavefrontRestirGiReservoir = graph.createBuffer(bufferResource(wavefrontRestirGiReservoirBuffer_, "wavefront restir gi candidate reservoir"));
     }
     if (useWavefrontQueues && wavefrontRestirReservoirBuffer_.handle() != VK_NULL_HANDLE) {
         wavefrontRestirReservoir = graph.createBuffer(bufferResource(wavefrontRestirReservoirBuffer_, "wavefront restir di candidate reservoir"));
+    }
+    RenderGraphResourceId restirDiReceiver{};
+    RenderGraphResourceId restirDiPreviousReceiver{};
+    RenderGraphResourceId restirDiInitial{};
+    RenderGraphResourceId restirDiTemporal{};
+    RenderGraphResourceId restirDiSpatial{};
+    RenderGraphResourceId restirDiFinal{};
+    RenderGraphResourceId restirDiPrevious{};
+    RenderGraphResourceId restirDiCounters{};
+    RenderGraphResourceId restirDiCountersReadback{};
+    if (useNewRestirDi) {
+        restirDiReceiver = graph.createBuffer(bufferResource(restirDiCurrentReceiverBuffer(), "restir di receiver"));
+        restirDiPreviousReceiver = graph.createBuffer(bufferResource(restirDiPreviousReceiverBuffer(), "restir di previous receiver"));
+        restirDiInitial = graph.createBuffer(bufferResource(restirDiInitialReservoirBuffer_, "restir di initial reservoir"));
+        restirDiTemporal = graph.createBuffer(bufferResource(restirDiTemporalReservoirBuffer_, "restir di temporal reservoir"));
+        restirDiSpatial = graph.createBuffer(bufferResource(restirDiSpatialReservoirBuffer_, "restir di spatial reservoir"));
+        restirDiFinal = shouldAliasRestirDiFinal()
+            ? restirDiTemporal
+            : graph.createBuffer(bufferResource(restirDiCurrentHistoryReservoirBuffer(), "restir di final reservoir"));
+        restirDiPrevious = graph.createBuffer(bufferResource(restirDiPreviousHistoryReservoirBuffer(), "restir di previous reservoir"));
+        restirDiCounters = graph.createBuffer(bufferResource(restirDiCountersBuffer_, "restir di counters"));
+        restirDiCountersReadback = graph.createBuffer(bufferResource(restirDiCountersReadbackBuffer_, "restir di counters readback"));
     }
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
     if (resetRestirHistory) {
@@ -5914,22 +6672,23 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 currentProfiler_->write(cmd, GpuProfiler::RestirHistoryClearEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
             });
     }
-    if (useRestirGiReservoirs) {
+    if (useRestirGiReservoirs && !restirGiHistoryValid_) {
         RenderGraphPass& restirGiClearPass = graph.addPass("restir_gi_clear")
-            .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer);
-        if (!restirGiHistoryValid_) {
-            restirGiClearPass
-                .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
-                .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer);
+            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirGiReceiver, PipelineDomain::Transfer);
+        if (previousRestirGiProductionReservoir.valid()) {
+            restirGiClearPass.addStorageWrite(previousRestirGiProductionReservoir, PipelineDomain::Transfer);
         }
         restirGiClearPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                 validationLog_.recordPass("restir gi reservoir clear");
                 currentProfiler_->write(cmd, GpuProfiler::RestirGiClearStart, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
-                vkCmdFillBuffer(cmd, restirGiReservoirBuffer_.handle(), 0, restirGiReservoirBuffer_.size(), 0u);
-                if (!restirGiHistoryValid_) {
-                    vkCmdFillBuffer(cmd, previousRestirGiReservoirBuffer_.handle(), 0, previousRestirGiReservoirBuffer_.size(), 0u);
-                    vkCmdFillBuffer(cmd, restirGiSpatialReservoirBuffer_.handle(), 0, restirGiSpatialReservoirBuffer_.size(), 0u);
+                vkCmdFillBuffer(cmd, previousRestirGiReservoirBuffer_.handle(), 0, previousRestirGiReservoirBuffer_.size(), 0u);
+                if (previousRestirGiProductionReservoirBuffer_.handle() != VK_NULL_HANDLE) {
+                    vkCmdFillBuffer(cmd, previousRestirGiProductionReservoirBuffer_.handle(), 0, previousRestirGiProductionReservoirBuffer_.size(), 0u);
                 }
+                vkCmdFillBuffer(cmd, restirGiSpatialReservoirBuffer_.handle(), 0, restirGiSpatialReservoirBuffer_.size(), 0u);
+                vkCmdFillBuffer(cmd, previousRestirGiReceiverBuffer_.handle(), 0, previousRestirGiReceiverBuffer_.size(), 0u);
                 currentProfiler_->write(cmd, GpuProfiler::RestirGiClearEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
             });
     }
@@ -6025,6 +6784,43 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 recordWavefrontShadowTracePass(cmd);
             });
     }
+    if (useNewRestirDi && !restirDiHistoryValid_) {
+        graph.addPass("restir_di_history_clear")
+            .addStorageWrite(restirDiPrevious, PipelineDomain::Transfer)
+            .addStorageWrite(restirDiPreviousReceiver, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                validationLog_.recordPass("restir di history clear");
+                vkCmdFillBuffer(cmd, previousRestirDiReservoirBuffer_.handle(), 0,
+                    previousRestirDiReservoirBuffer_.size(), 0u);
+                vkCmdFillBuffer(cmd, previousRestirDiReceiverBuffer_.handle(), 0,
+                    previousRestirDiReceiverBuffer_.size(), 0u);
+            });
+    }
+    if (useNewRestirDi && shouldCollectRestirCounters()) {
+        graph.addPass("restir_di_counters_clear")
+            .addStorageWrite(restirDiCounters, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                constexpr VkDeviceSize slotSize = sizeof(uint32_t) * 64u;
+                const VkDeviceSize slotOffset = (temporalFrameIndex_ % kRendererFramesInFlight) * slotSize;
+                vkCmdFillBuffer(cmd, restirDiCountersBuffer_.handle(), slotOffset, slotSize, 0u);
+            });
+    }
+    if (shouldCollectRestirCounters() && restirGiCounters.valid()) {
+        graph.addPass("restir_gi_counters_clear")
+            .addStorageWrite(restirGiCounters, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                constexpr VkDeviceSize slotSize = sizeof(uint32_t) * 64u;
+                const VkDeviceSize slotOffset = (temporalFrameIndex_ % kRendererFramesInFlight) * slotSize;
+                vkCmdFillBuffer(cmd, restirGiCountersBuffer_.handle(), slotOffset, slotSize, 0u);
+            });
+    }
+    if (shouldUseRestirGiActiveTileMask() && restirGiActiveTileMask.valid()) {
+        graph.addPass("restir_gi_active_tile_mask_clear")
+            .addStorageWrite(restirGiActiveTileMask, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                vkCmdFillBuffer(cmd, restirGiActiveTileMaskBuffer_.handle(), 0, restirGiActiveTileMaskBuffer_.size(), 0u);
+            });
+    }
     if (!useWavefrontFinalOutput) {
         RenderGraphPass& pathTracePass = graph.addPass("path_trace_rt")
             .addStorageWrite(raw, traceDomain)
@@ -6042,11 +6838,100 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             pathTracePass
                 .addStorageReadWrite(restirGiReservoir, traceDomain)
                 .addStorageRead(previousRestirGiReservoir, traceDomain)
-                .addStorageRead(restirGiSpatialReservoir, traceDomain);
+                .addStorageRead(restirGiSpatialReservoir, traceDomain)
+                .addStorageWrite(restirGiReceiver, traceDomain)
+                .addStorageRead(previousRestirGiReceiver, traceDomain);
+        }
+        if (useNewRestirDi) {
+            pathTracePass
+                .addStorageWrite(restirDiReceiver, traceDomain)
+                .addStorageWrite(restirDiInitial, traceDomain)
+                .addStorageReadWrite(restirDiCounters, traceDomain);
         }
         pathTracePass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             recordPathTracePass(cmd);
         });
+    }
+    if (useNewRestirDi) {
+        RenderGraphResourceId finalInput = restirDiInitial;
+        RenderGraphResourceId temporalDebugInput = restirDiInitial;
+        if (shouldRunRestirDiTemporal()) {
+            graph.addPass("restir_di_temporal")
+                .addStorageRead(restirDiInitial, PipelineDomain::Compute)
+                .addStorageRead(restirDiPrevious, PipelineDomain::Compute)
+                .addStorageRead(restirDiReceiver, PipelineDomain::Compute)
+                .addStorageRead(restirDiPreviousReceiver, PipelineDomain::Compute)
+                .addStorageRead(velocity, PipelineDomain::Compute)
+                .addStorageRead(sceneLightRecords, PipelineDomain::Compute)
+                .addUniformBuffer(sceneMeshParams, PipelineDomain::Compute)
+                .addStorageReadWrite(restirDiCounters, PipelineDomain::Compute)
+                .addStorageWrite(restirDiTemporal, PipelineDomain::Compute)
+                .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                    recordRestirDiTemporalPass(cmd);
+                });
+            finalInput = restirDiTemporal;
+            temporalDebugInput = restirDiTemporal;
+        }
+        if (shouldRunRestirDiSpatial()) {
+            graph.addPass("restir_di_spatial")
+                .addStorageRead(finalInput, PipelineDomain::Compute)
+                .addStorageRead(restirDiReceiver, PipelineDomain::Compute)
+                .addStorageRead(sceneLightRecords, PipelineDomain::Compute)
+                .addUniformBuffer(sceneMeshParams, PipelineDomain::Compute)
+                .addStorageReadWrite(restirDiCounters, PipelineDomain::Compute)
+                .addStorageWrite(restirDiSpatial, PipelineDomain::Compute)
+                .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                    recordRestirDiSpatialPass(cmd);
+                });
+            finalInput = restirDiSpatial;
+        }
+        if (shouldRunRestirDiFinal()) {
+            RenderGraphPass& finalPass = graph.addPass("restir_di_final");
+            finalPass
+                .addStorageRead(finalInput, PipelineDomain::Compute)
+                .addStorageRead(restirDiInitial, PipelineDomain::Compute)
+                .addStorageRead(restirDiReceiver, PipelineDomain::Compute)
+                .addStorageRead(sceneLightRecords, PipelineDomain::Compute)
+                .addUniformBuffer(sceneMeshParams, PipelineDomain::Compute)
+                .addStorageReadWrite(restirDiCounters, PipelineDomain::Compute)
+                .addStorageReadWrite(raw, PipelineDomain::Compute)
+                .addStorageReadWrite(pathData, PipelineDomain::Compute)
+                .addStorageReadWrite(accumulation, PipelineDomain::Compute)
+                .addStorageReadWrite(variance, PipelineDomain::Compute);
+            if (shouldAliasRestirDiFinal()) {
+                finalPass.addStorageReadWrite(restirDiFinal, PipelineDomain::Compute);
+            } else {
+                finalPass
+                    .addStorageRead(temporalDebugInput, PipelineDomain::Compute)
+                    .addStorageWrite(restirDiFinal, PipelineDomain::Compute);
+            }
+            finalPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirDiFinalPass(cmd);
+            });
+            if (shouldUseRestirHistoryPingPong()) {
+                restirDiHistoryValid_ = true;
+                if (temporalSystem_) {
+                    temporalSystem_->markSlotWritten("restir_di_reservoir");
+                }
+            } else {
+                graph.addPass("restir_di_history_copy")
+                    .addStorageRead(restirDiFinal, PipelineDomain::Transfer)
+                    .addStorageWrite(restirDiPrevious, PipelineDomain::Transfer)
+                    .addStorageRead(restirDiReceiver, PipelineDomain::Transfer)
+                    .addStorageWrite(restirDiPreviousReceiver, PipelineDomain::Transfer)
+                    .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                        recordRestirDiHistoryCopyPass(cmd);
+                    });
+            }
+            if (shouldCollectRestirCounters()) {
+                graph.addPass("restir_di_counters_readback")
+                    .addStorageRead(restirDiCounters, PipelineDomain::Transfer)
+                    .addStorageWrite(restirDiCountersReadback, PipelineDomain::Transfer)
+                    .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                        recordRestirDiCountersReadback(cmd);
+                    });
+            }
+        }
     }
     if (useWavefrontShadowTrace && !useWavefrontFinalOutput) {
         graph.addPass("wavefront_direct_lighting_validate")
@@ -6074,7 +6959,7 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 recordWavefrontTraceValidationPass(cmd);
             });
     }
-    if (useRestirGiReservoirs && !useWavefrontFinalOutput) {
+    if (useRestirGiReservoirs && shouldUseRestirGiLegacyCache() && !useWavefrontFinalOutput) {
         graph.addPass("restir_gi_spatial")
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
             .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
@@ -6097,6 +6982,81 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
                 recordRestirGiFinalPass(cmd);
             });
+    }
+    if (shouldRunRestirGiTemporal()) {
+        RenderGraphPass& restirGiTemporalPass = graph.addPass("restir_gi_temporal");
+        restirGiTemporalPass
+            .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(previousRestirGiProductionReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
+            .addStorageRead(previousRestirGiReceiver, PipelineDomain::Compute)
+            .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
+            .addStorageWrite(restirGiTemporalReservoir, PipelineDomain::Compute);
+        if (restirGiActiveTileMask.valid()) {
+            restirGiTemporalPass.addStorageReadWrite(restirGiActiveTileMask, PipelineDomain::Compute);
+        }
+        restirGiTemporalPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirGiTemporalPass(cmd);
+            });
+    }
+    if (shouldRunRestirGiSpatialProd()) {
+        RenderGraphPass& restirGiSpatialProdPass = graph.addPass("restir_gi_spatial_production");
+        restirGiSpatialProdPass
+            .addStorageRead(restirGiTemporalReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
+            .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
+            .addStorageWrite(restirGiProductionReservoir, PipelineDomain::Compute);
+        if (restirGiActiveTileMask.valid()) {
+            restirGiSpatialProdPass.addStorageRead(restirGiActiveTileMask, PipelineDomain::Compute);
+        }
+        restirGiSpatialProdPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirGiSpatialProdPass(cmd);
+            });
+    }
+    if (shouldRunRestirGiUpsample()) {
+        RenderGraphPass& restirGiUpsamplePass = graph.addPass("restir_gi_upsample");
+        restirGiUpsamplePass
+            .addStorageRead(restirGiProductionReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiTemporalReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
+            .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
+            .addStorageWrite(restirGiUpsampledReservoir, PipelineDomain::Compute);
+        if (restirGiActiveTileMask.valid()) {
+            restirGiUpsamplePass.addStorageRead(restirGiActiveTileMask, PipelineDomain::Compute);
+        }
+        restirGiUpsamplePass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirGiUpsamplePass(cmd);
+            });
+    }
+    if (shouldRunRestirGiFinalProd()) {
+        const RenderGraphResourceId finalCurrentReservoir = restirGiTemporalReservoir;
+        const RenderGraphResourceId finalSpatialReservoir = shouldRunRestirGiUpsample()
+            ? restirGiUpsampledReservoir
+            : (shouldRunRestirGiSpatialStage() ? restirGiProductionReservoir : restirGiTemporalReservoir);
+        RenderGraphPass& restirGiFinalProdPass = graph.addPass("restir_gi_final_production");
+        restirGiFinalProdPass
+            .addStorageReadWrite(raw, PipelineDomain::Compute)
+            .addStorageReadWrite(accumulation, PipelineDomain::Compute)
+            .addStorageRead(finalCurrentReservoir, PipelineDomain::Compute)
+            .addStorageRead(finalSpatialReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
+            .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
+            .addStorageReadWrite(pathData, PipelineDomain::Compute);
+        if (restirGiActiveTileMask.valid()) {
+            restirGiFinalProdPass.addStorageRead(restirGiActiveTileMask, PipelineDomain::Compute);
+        }
+        restirGiFinalProdPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirGiFinalProdPass(cmd);
+            });
+        if (shouldCollectRestirCounters() && restirGiCounters.valid() && restirGiCountersReadback.valid()) {
+            graph.addPass("restir_gi_counters_readback")
+                .addStorageRead(restirGiCounters, PipelineDomain::Transfer)
+                .addStorageWrite(restirGiCountersReadback, PipelineDomain::Transfer)
+                .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                    recordRestirGiCountersReadback(cmd);
+                });
+        }
     }
     if (useWavefrontFinalOutput) {
         const RenderGraphResourceId wavefrontFinalCompactValidation = graph.createBuffer(bufferResource(wavefrontCompactValidationBuffer_, "wavefront final compact validation"));
@@ -7084,6 +8044,7 @@ void PathTracerRenderer::recordWavefrontHitQueueCountClearPass(VkCommandBuffer c
 }
 
 void PathTracerRenderer::recordWavefrontShadowTracePass(VkCommandBuffer commandBuffer, bool profile) {
+    ensureWavefrontTracePipelines();
     RayTracingPipeline* tracePipeline = settings_.shaderExecutionReorderingEnabled && wavefrontTraceSerPipeline_ != nullptr
         ? wavefrontTraceSerPipeline_.get()
         : wavefrontTracePipeline_.get();
@@ -7354,6 +8315,248 @@ void PathTracerRenderer::recordRestirGiFinalPass(VkCommandBuffer commandBuffer) 
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiFinalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
+void PathTracerRenderer::recordRestirGiTemporalPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("restir gi production temporal");
+    if (!shouldRunRestirGiTemporal()) {
+        return;
+    }
+    ComputePipeline* pipeline = shouldUseRestirGiReferenceValidation()
+        ? restirGiTemporalValidationPipeline_.get()
+        : (usesRestirGiUncompressedInitialReservoir()
+            ? restirGiTemporalFullPipeline_.get()
+            : restirGiTemporalPipeline_.get());
+    if (pipeline == nullptr) {
+        return;
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiTemporalStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(restirGiTemporalSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiTemporalReservoirBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiPreviousProductionHistoryBuffer().descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentReceiverBuffer().descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiPreviousReceiverBuffer().descriptorInfo())
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCountersBuffer_.descriptorInfo(
+            (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
+            sizeof(uint32_t) * 64u))
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiActiveTileMaskBuffer_.descriptorInfo())
+        .writeBuffer(13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.meshParamsBuffer().descriptorInfo())
+        .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.materials().descriptorInfo())
+        .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.rtTriangleMaterialIds().descriptorInfo())
+        .writeBuffer(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
+        .writeBuffer(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
+        .writeBuffer(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
+        .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
+        .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
+        .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
+        .writeAccelerationStructure(33, rayTracingScene_->tlas())
+        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
+        .update(context_.device(), set);
+
+    const RestirGiTemporalPush push{
+        .width = renderExtent_.width,
+        .height = renderExtent_.height,
+        .frameIndex = temporalFrameIndex_,
+        .temporalMaxAge = settings_.restirGiTemporalMaxAge,
+        .depthThresholdScale = settings_.restirGiDepthThresholdScale,
+        .visibilityRayBudget = settings_.restirGiVisibilityRayBudget,
+        .giHalfResolution = effectiveRestirGiHalfResolution() ? 1u : 0u,
+        .enabled = (shouldUseNewRestirGi() ? 1u : 0u) |
+            (shouldCollectRestirCounters() ? 4u : 0u) |
+            (!shouldRunRestirGiSpatialStage() ? 8u : 0u) |
+            (shouldUseRestirGiActiveTileMask() ? 16u : 0u),
+        .cameraPosition = glm::vec4(glm::vec3(camera_.pos), 1.0f),
+        .reprojectionMatrix = glm::mat4(1.0f),
+    };
+
+    pipeline->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, pipeline->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    const uint32_t dispatchWidth = effectiveRestirGiHalfResolution() ? (renderExtent_.width + 1u) / 2u : renderExtent_.width;
+    const uint32_t dispatchHeight = effectiveRestirGiHalfResolution() ? (renderExtent_.height + 1u) / 2u : renderExtent_.height;
+    pipeline->dispatch(commandBuffer, dispatchWidth, dispatchHeight);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiTemporalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordRestirGiSpatialProdPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("restir gi production spatial");
+    if (!shouldRunRestirGiSpatialProd()) {
+        return;
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiSpatialStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(restirGiSpatialProdSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiTemporalReservoirBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentProductionHistoryBuffer().descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentReceiverBuffer().descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCountersBuffer_.descriptorInfo(
+            (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
+            sizeof(uint32_t) * 64u))
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiActiveTileMaskBuffer_.descriptorInfo())
+        .writeBuffer(13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.meshParamsBuffer().descriptorInfo())
+        .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.materials().descriptorInfo())
+        .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.rtTriangleMaterialIds().descriptorInfo())
+        .writeBuffer(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
+        .writeBuffer(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
+        .writeBuffer(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
+        .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
+        .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
+        .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
+        .writeAccelerationStructure(33, rayTracingScene_->tlas())
+        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
+        .update(context_.device(), set);
+
+    const RestirGiSpatialProdPush push{
+        .width = renderExtent_.width,
+        .height = renderExtent_.height,
+        .frameIndex = temporalFrameIndex_,
+        .enabled = (shouldUseNewRestirGi() ? 1u : 0u) |
+            (shouldCollectRestirCounters() ? 4u : 0u) |
+            (shouldUseRestirGiActiveTileMask() ? 8u : 0u),
+        .spatialRounds = settings_.restirGiSpatialRounds,
+        .halfResolution = effectiveRestirGiHalfResolution() ? 1u : 0u,
+        .visibilityRayBudget = settings_.restirGiVisibilityRayBudget,
+        .spatialRadius = settings_.restirGiSpatialRadius,
+        .depthThresholdScale = settings_.restirGiDepthThresholdScale,
+        .compatibilityThreshold = settings_.restirGiSpatialCompatibilityThreshold,
+        .rawOutputIsCurrentSample = settings_.limitSamplesPerPixel ? 1.0f : 0.0f,
+        .cameraPosition = glm::vec4(glm::vec3(camera_.pos), 1.0f),
+    };
+
+    ComputePipeline* pipeline = shouldUseRestirGiReferenceValidation()
+        ? restirGiSpatialValidationPipeline_.get()
+        : restirGiSpatialProdPipeline_.get();
+    if (pipeline == nullptr) return;
+    pipeline->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, pipeline->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    const uint32_t dispatchWidth = effectiveRestirGiHalfResolution() ? (renderExtent_.width + 1u) / 2u : renderExtent_.width;
+    const uint32_t dispatchHeight = effectiveRestirGiHalfResolution() ? (renderExtent_.height + 1u) / 2u : renderExtent_.height;
+    pipeline->dispatch(commandBuffer, dispatchWidth, dispatchHeight);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiSpatialEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordRestirGiFinalProdPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("restir gi production final");
+    if (!shouldRunRestirGiFinalProd()) {
+        return;
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiFinalStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    const Buffer& currentInput = restirGiTemporalReservoirBuffer_;
+    const Buffer& spatialInput = shouldRunRestirGiUpsample()
+        ? restirGiUpsampledReservoirBuffer_
+        : (shouldRunRestirGiSpatialStage()
+            ? restirGiCurrentProductionHistoryBuffer()
+            : restirGiTemporalReservoirBuffer_);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(restirGiFinalProdSetLayout_);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, currentInput.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spatialInput.descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentReceiverBuffer().descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumulationBuffer_.descriptorInfo())
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
+        .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCountersBuffer_.descriptorInfo(
+            (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
+            sizeof(uint32_t) * 64u))
+        .writeBuffer(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiActiveTileMaskBuffer_.descriptorInfo())
+        .writeBuffer(13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.meshParamsBuffer().descriptorInfo())
+        .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.materials().descriptorInfo())
+        .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.rtTriangleMaterialIds().descriptorInfo())
+        .writeBuffer(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
+        .writeBuffer(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
+        .writeBuffer(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
+        .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
+        .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
+        .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
+        .writeAccelerationStructure(33, rayTracingScene_->tlas())
+        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
+        .update(context_.device(), set);
+
+    const uint32_t enabledFlags =
+        (shouldUseNewRestirGi() ? 1u : 0u) |
+        ((settings_.restirGiFinalStabilizationEnabled && !shouldUseRestirGiReferenceValidation()) ? 2u : 0u) |
+        (shouldCollectRestirCounters() ? 4u : 0u) |
+        (shouldUseRestirGiActiveTileMask() ? 8u : 0u);
+    const RestirGiFinalProdPush push{
+        .width = renderExtent_.width,
+        .height = renderExtent_.height,
+        .frameIndex = temporalFrameIndex_,
+        .enabled = enabledFlags,
+        .debugView = static_cast<uint32_t>(settings_.debugView),
+        .fireflyClamp = settings_.fireflyClamp,
+        .indirectStrength = settings_.indirectStrength,
+        .rawOutputIsCurrentSample = shouldRunDlssRayReconstruction() ? 1.0f : 0.0f,
+        .halfResolution = effectiveRestirGiHalfResolution() ? 1u : 0u,
+        .visibilityRayBudget = settings_.restirGiVisibilityRayBudget,
+        .referenceValidation = shouldUseRestirGiReferenceValidation() ? 1u : 0u,
+        .minFinalBlendStrength = settings_.restirGiMinFinalBlendStrength,
+        .cameraPosition = glm::vec4(glm::vec3(camera_.pos), 1.0f),
+    };
+
+    ComputePipeline* pipeline = shouldUseRestirGiReferenceValidation()
+        ? restirGiFinalValidationPipeline_.get()
+        : restirGiFinalProdPipeline_.get();
+    if (pipeline == nullptr) return;
+    pipeline->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, pipeline->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiFinalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordRestirGiUpsamplePass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("restir gi production upsample");
+    if (!shouldRunRestirGiUpsample()) {
+        return;
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiUpsampleStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(restirGiUpsampleSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentProductionHistoryBuffer().descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiUpsampledReservoirBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentReceiverBuffer().descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiTemporalReservoirBuffer_.descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCountersBuffer_.descriptorInfo(
+            (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
+            sizeof(uint32_t) * 64u))
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiActiveTileMaskBuffer_.descriptorInfo())
+        .update(context_.device(), set);
+
+    const RestirGiUpsamplePush push{
+        .fullWidth = renderExtent_.width,
+        .fullHeight = renderExtent_.height,
+        .halfWidth = (renderExtent_.width + 1u) / 2u,
+        .halfHeight = (renderExtent_.height + 1u) / 2u,
+        .frameIndex = temporalFrameIndex_,
+        .depthThresholdScale = settings_.restirGiDepthThresholdScale,
+        .normalThreshold = 1.0f - settings_.restirGiSpatialCompatibilityThreshold,
+        .flags = 1u | (shouldCollectRestirCounters() ? 2u : 0u) |
+            (shouldUseRestirGiActiveTileMask() ? 4u : 0u),
+        .cameraPosition = glm::vec4(glm::vec3(camera_.pos), 1.0f),
+    };
+
+    ComputePipeline* pipeline = shouldUseRestirGiReferenceValidation()
+        ? restirGiUpsampleValidationPipeline_.get()
+        : restirGiUpsamplePipeline_.get();
+    if (pipeline == nullptr) return;
+    pipeline->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(commandBuffer, pipeline->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiUpsampleEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
 void PathTracerRenderer::recordRestirDiTemporal(VkCommandBuffer commandBuffer) {
     if (!shouldRunRestirDiTemporal()) return;
     RenderGraph graph(&allocator_, resourceAliasingEnabled_);
@@ -7369,8 +8572,9 @@ void PathTracerRenderer::recordRestirDiTemporal(VkCommandBuffer commandBuffer) {
         };
     };
     const auto initialRes = graph.createBuffer(bufferResource(restirDiInitialReservoirBuffer_, "restir di initial"));
-    const auto previousRes = graph.createBuffer(bufferResource(previousRestirDiReservoirBuffer_, "restir di previous"));
-    const auto receiverRes = graph.createBuffer(bufferResource(restirDiReceiverBuffer_, "restir di receiver"));
+    const auto previousRes = graph.createBuffer(bufferResource(restirDiPreviousHistoryReservoirBuffer(), "restir di previous"));
+    const auto receiverRes = graph.createBuffer(bufferResource(restirDiCurrentReceiverBuffer(), "restir di receiver"));
+    const auto previousReceiverRes = graph.createBuffer(bufferResource(restirDiPreviousReceiverBuffer(), "restir di previous receiver"));
     const auto velocityRes = graph.createBuffer(bufferResource(velocityBuffer_, "velocity"));
     const auto temporalRes = graph.createBuffer(bufferResource(restirDiTemporalReservoirBuffer_, "restir di temporal"));
     const auto countersRes = graph.createBuffer(bufferResource(restirDiCountersBuffer_, "restir di counters"));
@@ -7379,6 +8583,7 @@ void PathTracerRenderer::recordRestirDiTemporal(VkCommandBuffer commandBuffer) {
         .addStorageRead(initialRes, PipelineDomain::Compute)
         .addStorageRead(previousRes, PipelineDomain::Compute)
         .addStorageRead(receiverRes, PipelineDomain::Compute)
+        .addStorageRead(previousReceiverRes, PipelineDomain::Compute)
         .addStorageRead(velocityRes, PipelineDomain::Compute)
         .addStorageWrite(temporalRes, PipelineDomain::Compute)
         .addStorageReadWrite(countersRes, PipelineDomain::Compute)
@@ -7391,34 +8596,45 @@ void PathTracerRenderer::recordRestirDiTemporal(VkCommandBuffer commandBuffer) {
 
 void PathTracerRenderer::recordRestirDiTemporalPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("restir di temporal");
-    if (restirDiTemporalPipeline_ == nullptr || restirDiTemporalSetLayout_ == VK_NULL_HANDLE) return;
+    ComputePipeline* pipeline = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
+        ? restirDiTemporalFullPipeline_.get()
+        : restirDiTemporalPipeline_.get();
+    if (pipeline == nullptr || restirDiTemporalSetLayout_ == VK_NULL_HANDLE) return;
 
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiTemporalStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-
-    // Clear counters
-    vkCmdFillBuffer(commandBuffer, restirDiCountersBuffer_.handle(), 0, restirDiCountersBuffer_.size(), 0u);
-    VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(restirDiTemporalSetLayout_);
     DescriptorWriter writer;
     writer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiInitialReservoirBuffer_.descriptorInfo())
-        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirDiReservoirBuffer_.descriptorInfo())
-        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiReceiverBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiPreviousHistoryReservoirBuffer().descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCurrentReceiverBuffer().descriptorInfo())
         .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
         .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiTemporalReservoirBuffer_.descriptorInfo())
-        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCountersBuffer_.descriptorInfo())
-        .writeBuffer(6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirDiParamsOffset, sizeof(RestirDiParams)));
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCountersBuffer_.descriptorInfo(
+            (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
+            sizeof(uint32_t) * 64u))
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirDiParamsOffset, sizeof(RestirDiParams)))
+        .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiPreviousReceiverBuffer().descriptorInfo())
+        .writeBuffer(12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightRecords().descriptorInfo())
+        .writeBuffer(13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.meshParamsBuffer().descriptorInfo())
+        .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.materials().descriptorInfo())
+        .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.rtTriangleMaterialIds().descriptorInfo())
+        .writeBuffer(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
+        .writeBuffer(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
+        .writeBuffer(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
+        .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
+        .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
+        .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
+        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
+        .writeAccelerationStructure(10, rayTracingScene_->tlas());
     writeStbnDescriptors(writer);
     writer.update(context_.device(), set);
 
-    restirDiTemporalPipeline_->bind(commandBuffer);
+    pipeline->bind(commandBuffer);
     const VkDescriptorSet ds = set.handle();
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirDiTemporalPipeline_->layout(), 0, 1, &ds, 0, nullptr);
-    restirDiTemporalPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiTemporalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
@@ -7437,7 +8653,7 @@ void PathTracerRenderer::recordRestirDiSpatial(VkCommandBuffer commandBuffer) {
         };
     };
     const auto temporalRes = graph.createBuffer(bufferResource(restirDiTemporalReservoirBuffer_, "restir di temporal in"));
-    const auto receiverRes = graph.createBuffer(bufferResource(restirDiReceiverBuffer_, "restir di receiver"));
+    const auto receiverRes = graph.createBuffer(bufferResource(restirDiCurrentReceiverBuffer(), "restir di receiver"));
     const auto spatialRes = graph.createBuffer(bufferResource(restirDiSpatialReservoirBuffer_, "restir di spatial"));
     const auto countersRes = graph.createBuffer(bufferResource(restirDiCountersBuffer_, "restir di counters"));
 
@@ -7455,25 +8671,45 @@ void PathTracerRenderer::recordRestirDiSpatial(VkCommandBuffer commandBuffer) {
 
 void PathTracerRenderer::recordRestirDiSpatialPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("restir di spatial");
-    if (restirDiSpatialPipeline_ == nullptr || restirDiSpatialSetLayout_ == VK_NULL_HANDLE) return;
+    ComputePipeline* pipeline = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
+        ? restirDiSpatialFullPipeline_.get()
+        : restirDiSpatialPipeline_.get();
+    if (pipeline == nullptr || restirDiSpatialSetLayout_ == VK_NULL_HANDLE) return;
 
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiSpatialStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(restirDiSpatialSetLayout_);
     DescriptorWriter writer;
+    const Buffer& spatialInputBuffer = shouldRunRestirDiTemporal()
+        ? restirDiTemporalReservoirBuffer_
+        : restirDiInitialReservoirBuffer_;
     writer
-        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiTemporalReservoirBuffer_.descriptorInfo())
-        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiReceiverBuffer_.descriptorInfo())
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spatialInputBuffer.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCurrentReceiverBuffer().descriptorInfo())
         .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiSpatialReservoirBuffer_.descriptorInfo())
-        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCountersBuffer_.descriptorInfo())
-        .writeBuffer(4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirDiParamsOffset, sizeof(RestirDiParams)));
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCountersBuffer_.descriptorInfo(
+            (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
+            sizeof(uint32_t) * 64u))
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirDiParamsOffset, sizeof(RestirDiParams)))
+        .writeBuffer(12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightRecords().descriptorInfo())
+        .writeBuffer(13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.meshParamsBuffer().descriptorInfo())
+        .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.materials().descriptorInfo())
+        .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.rtTriangleMaterialIds().descriptorInfo())
+        .writeBuffer(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
+        .writeBuffer(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
+        .writeBuffer(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
+        .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
+        .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
+        .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
+        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
+        .writeAccelerationStructure(10, rayTracingScene_->tlas());
     writeStbnDescriptors(writer);
     writer.update(context_.device(), set);
 
-    restirDiSpatialPipeline_->bind(commandBuffer);
+    pipeline->bind(commandBuffer);
     const VkDescriptorSet ds = set.handle();
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirDiSpatialPipeline_->layout(), 0, 1, &ds, 0, nullptr);
-    restirDiSpatialPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiSpatialEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
@@ -7491,13 +8727,24 @@ void PathTracerRenderer::recordRestirDiFinal(VkCommandBuffer commandBuffer) {
             .debugName = name,
         };
     };
-    const auto spatialRes = graph.createBuffer(bufferResource(restirDiSpatialReservoirBuffer_, "restir di spatial in"));
-    const auto receiverRes = graph.createBuffer(bufferResource(restirDiReceiverBuffer_, "restir di receiver"));
+    const Buffer& finalInputBuffer = shouldRunRestirDiSpatial()
+        ? restirDiSpatialReservoirBuffer_
+        : (shouldRunRestirDiTemporal() ? restirDiTemporalReservoirBuffer_ : restirDiInitialReservoirBuffer_);
+    const Buffer& temporalDebugBuffer = shouldRunRestirDiTemporal()
+        ? restirDiTemporalReservoirBuffer_
+        : restirDiInitialReservoirBuffer_;
+    const auto spatialRes = graph.createBuffer(bufferResource(finalInputBuffer, "restir di final input"));
+    const auto receiverRes = graph.createBuffer(bufferResource(restirDiCurrentReceiverBuffer(), "restir di receiver"));
     const auto initialRes = graph.createBuffer(bufferResource(restirDiInitialReservoirBuffer_, "restir di initial"));
-    const auto finalRes = graph.createBuffer(bufferResource(restirDiFinalReservoirBuffer_, "restir di final"));
+    const auto temporalRes = graph.createBuffer(bufferResource(temporalDebugBuffer, "restir di temporal debug"));
+    const Buffer& finalOutputBuffer = restirDiFinalOutputBuffer();
+    const auto finalRes = shouldAliasRestirDiFinal()
+        ? temporalRes
+        : graph.createBuffer(bufferResource(finalOutputBuffer, "restir di final"));
     const auto countersRes = graph.createBuffer(bufferResource(restirDiCountersBuffer_, "restir di counters"));
     const auto pathDataRes = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
     const auto accumulationRes = graph.createBuffer(bufferResource(accumulationBuffer_, "accumulation"));
+    const auto varianceRes = graph.createBuffer(bufferResource(varianceBuffer_, "variance"));
 
     // Register rawImage_ for the DI final write so barriers are correct
     const ResourceAccess pathWrite{
@@ -7518,64 +8765,184 @@ void PathTracerRenderer::recordRestirDiFinal(VkCommandBuffer commandBuffer) {
         .debugName = "raw hdr",
     });
 
-    graph.addPass("restir_di_final")
+    RenderGraphPass& finalPass = graph.addPass("restir_di_final");
+    finalPass
         .addStorageRead(spatialRes, PipelineDomain::Compute)
         .addStorageRead(receiverRes, PipelineDomain::Compute)
         .addStorageRead(initialRes, PipelineDomain::Compute)
-        .addStorageWrite(finalRes, PipelineDomain::Compute)
         .addStorageReadWrite(countersRes, PipelineDomain::Compute)
         .addStorageReadWrite(rawTex, PipelineDomain::Compute)
         .addStorageReadWrite(pathDataRes, PipelineDomain::Compute)
         .addStorageReadWrite(accumulationRes, PipelineDomain::Compute)
-        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
-            recordRestirDiFinalPass(cmd);
-        });
+        .addStorageReadWrite(varianceRes, PipelineDomain::Compute);
+    if (shouldAliasRestirDiFinal()) {
+        finalPass.addStorageReadWrite(finalRes, PipelineDomain::Compute);
+    } else {
+        finalPass
+            .addStorageRead(temporalRes, PipelineDomain::Compute)
+            .addStorageWrite(finalRes, PipelineDomain::Compute);
+    }
+    finalPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+        recordRestirDiFinalPass(cmd);
+    });
     graph.compile();
     graph.execute(commandBuffer, temporalFrameIndex_);
 }
 
 void PathTracerRenderer::recordRestirDiFinalPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("restir di final");
-    if (restirDiFinalPipeline_ == nullptr || restirDiFinalSetLayout_ == VK_NULL_HANDLE) return;
+    ComputePipeline* pipeline = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
+        ? restirDiFinalFullPipeline_.get()
+        : restirDiFinalPipeline_.get();
+    if (pipeline == nullptr || restirDiFinalSetLayout_ == VK_NULL_HANDLE) return;
 
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiFinalStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(restirDiFinalSetLayout_);
     DescriptorWriter writer;
+    const Buffer& finalInputBuffer = shouldRunRestirDiSpatial()
+        ? restirDiSpatialReservoirBuffer_
+        : (shouldRunRestirDiTemporal() ? restirDiTemporalReservoirBuffer_ : restirDiInitialReservoirBuffer_);
+    const Buffer& temporalDebugBuffer = shouldRunRestirDiTemporal()
+        ? restirDiTemporalReservoirBuffer_
+        : restirDiInitialReservoirBuffer_;
     writer
-        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiSpatialReservoirBuffer_.descriptorInfo())
-        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiReceiverBuffer_.descriptorInfo())
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, finalInputBuffer.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCurrentReceiverBuffer().descriptorInfo())
         .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiInitialReservoirBuffer_.descriptorInfo())
         .writeImage(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
-        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiFinalReservoirBuffer_.descriptorInfo())
-        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCountersBuffer_.descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCurrentHistoryReservoirBuffer().descriptorInfo())
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCountersBuffer_.descriptorInfo(
+            (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
+            sizeof(uint32_t) * 64u))
         .writeBuffer(6, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameRestirDiParamsOffset, sizeof(RestirDiParams)))
         .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
         .writeBuffer(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumulationBuffer_.descriptorInfo())
-        .writeBuffer(9, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameDebugParamsOffset, sizeof(RendererDebugParams)));
-    writeStbnDescriptors(writer);
+        .writeBuffer(9, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameDebugParamsOffset, sizeof(RendererDebugParams)))
+        .writeBuffer(11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, temporalDebugBuffer.descriptorInfo())
+        .writeBuffer(12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightRecords().descriptorInfo())
+        .writeBuffer(13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.meshParamsBuffer().descriptorInfo())
+        .writeBuffer(14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, varianceBuffer_.descriptorInfo())
+        .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.materials().descriptorInfo())
+        .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.rtTriangleMaterialIds().descriptorInfo())
+        .writeBuffer(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
+        .writeBuffer(18, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
+        .writeBuffer(19, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
+        .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
+        .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
+        .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
+        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
+        .writeAccelerationStructure(10, rayTracingScene_->tlas());
     writer.update(context_.device(), set);
 
-    restirDiFinalPipeline_->bind(commandBuffer);
+    pipeline->bind(commandBuffer);
     const VkDescriptorSet ds = set.handle();
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, restirDiFinalPipeline_->layout(), 0, 1, &ds, 0, nullptr);
-    restirDiFinalPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiFinalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
 
 void PathTracerRenderer::recordRestirDiHistoryCopy(VkCommandBuffer commandBuffer) {
-    if (!shouldUseNewRestirDi()) return;
-    if (restirDiFinalReservoirBuffer_.handle() == VK_NULL_HANDLE ||
-        previousRestirDiReservoirBuffer_.handle() == VK_NULL_HANDLE) return;
-    recordRestirDiHistoryCopyPass(commandBuffer);
+    if (!shouldRunRestirDiFinal()) return;
+    if (restirDiCurrentHistoryReservoirBuffer().handle() == VK_NULL_HANDLE ||
+        restirDiPreviousHistoryReservoirBuffer().handle() == VK_NULL_HANDLE ||
+        restirDiCurrentReceiverBuffer().handle() == VK_NULL_HANDLE ||
+        restirDiPreviousReceiverBuffer().handle() == VK_NULL_HANDLE) return;
+    const bool collectCounters = shouldCollectRestirCounters();
+    if (collectCounters &&
+        (restirDiCountersBuffer_.handle() == VK_NULL_HANDLE ||
+         restirDiCountersReadbackBuffer_.handle() == VK_NULL_HANDLE)) return;
+
+    if (shouldUseRestirHistoryPingPong()) {
+        restirDiHistoryValid_ = true;
+        if (temporalSystem_) {
+            temporalSystem_->markSlotWritten("restir_di_reservoir");
+        }
+        if (!collectCounters) {
+            return;
+        }
+
+        RenderGraph graph(&allocator_, resourceAliasingEnabled_);
+        auto bufferResource = [](const Buffer& buffer, const char* name) {
+            return RenderGraphResource{
+                .type = RenderGraphResource::Type::Buffer,
+                .lifetime = RenderGraphResource::Lifetime::Persistent,
+                .size = buffer.size(),
+                .buffer = buffer.handle(),
+                .bufferOffset = buffer.baseOffset(),
+                .external = true,
+                .debugName = name,
+            };
+        };
+        const auto countersRes = graph.createBuffer(bufferResource(restirDiCountersBuffer_, "restir di counters"));
+        const auto countersReadbackRes = graph.createBuffer(bufferResource(restirDiCountersReadbackBuffer_, "restir di counters readback"));
+        graph.addPass("restir_di_counters_readback")
+            .addStorageRead(countersRes, PipelineDomain::Transfer)
+            .addStorageWrite(countersReadbackRes, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirDiCountersReadback(cmd);
+            });
+        graph.compile();
+        graph.execute(commandBuffer, temporalFrameIndex_);
+        return;
+    }
+
+    RenderGraph graph(&allocator_, resourceAliasingEnabled_);
+    auto bufferResource = [](const Buffer& buffer, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = buffer.size(),
+            .buffer = buffer.handle(),
+            .bufferOffset = buffer.baseOffset(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+    const auto finalRes = graph.createBuffer(bufferResource(restirDiCurrentHistoryReservoirBuffer(), "restir di final"));
+    const auto previousRes = graph.createBuffer(bufferResource(restirDiPreviousHistoryReservoirBuffer(), "restir di previous"));
+    const auto receiverRes = graph.createBuffer(bufferResource(restirDiCurrentReceiverBuffer(), "restir di receiver"));
+    const auto previousReceiverRes = graph.createBuffer(bufferResource(restirDiPreviousReceiverBuffer(), "restir di previous receiver"));
+    RenderGraphResourceId countersRes{};
+    RenderGraphResourceId countersReadbackRes{};
+    if (collectCounters) {
+        countersRes = graph.createBuffer(bufferResource(restirDiCountersBuffer_, "restir di counters"));
+        countersReadbackRes = graph.createBuffer(bufferResource(restirDiCountersReadbackBuffer_, "restir di counters readback"));
+    }
+
+    graph.addPass("restir_di_history_copy")
+        .addStorageRead(finalRes, PipelineDomain::Transfer)
+        .addStorageWrite(previousRes, PipelineDomain::Transfer)
+        .addStorageRead(receiverRes, PipelineDomain::Transfer)
+        .addStorageWrite(previousReceiverRes, PipelineDomain::Transfer)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordRestirDiHistoryCopyPass(cmd);
+        });
+    if (collectCounters) {
+        graph.addPass("restir_di_counters_readback")
+            .addStorageRead(countersRes, PipelineDomain::Transfer)
+            .addStorageWrite(countersReadbackRes, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRestirDiCountersReadback(cmd);
+            });
+    }
+    graph.compile();
+    graph.execute(commandBuffer, temporalFrameIndex_);
 }
 
 void PathTracerRenderer::recordRestirDiHistoryCopyPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("restir di history copy");
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiHistoryCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
     VkBufferCopy copy{};
-    copy.size = restirDiFinalReservoirBuffer_.size();
-    vkCmdCopyBuffer(commandBuffer, restirDiFinalReservoirBuffer_.handle(), previousRestirDiReservoirBuffer_.handle(), 1, &copy);
+    copy.size = restirDiCurrentHistoryReservoirBuffer().size();
+    vkCmdCopyBuffer(commandBuffer, restirDiCurrentHistoryReservoirBuffer().handle(), restirDiPreviousHistoryReservoirBuffer().handle(), 1, &copy);
+    VkBufferCopy receiverCopy{};
+    receiverCopy.size = restirDiCurrentReceiverBuffer().size();
+    vkCmdCopyBuffer(commandBuffer, restirDiCurrentReceiverBuffer().handle(), restirDiPreviousReceiverBuffer().handle(), 1, &receiverCopy);
+    restirDiHistoryValid_ = true;
+    if (temporalSystem_) {
+        temporalSystem_->markSlotWritten("restir_di_reservoir");
+    }
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiHistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
@@ -7583,9 +8950,26 @@ void PathTracerRenderer::recordRestirDiCountersReadback(VkCommandBuffer commandB
     if (!shouldUseNewRestirDi()) return;
     if (restirDiCountersBuffer_.handle() == VK_NULL_HANDLE ||
         restirDiCountersReadbackBuffer_.handle() == VK_NULL_HANDLE) return;
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiCountersReadbackStart, VK_PIPELINE_STAGE_2_COPY_BIT);
     VkBufferCopy copy{};
-    copy.size = std::min(restirDiCountersBuffer_.size(), restirDiCountersReadbackBuffer_.size());
+    copy.size = sizeof(uint32_t) * 64u;
+    copy.srcOffset = (temporalFrameIndex_ % kRendererFramesInFlight) * copy.size;
+    copy.dstOffset = copy.srcOffset;
     vkCmdCopyBuffer(commandBuffer, restirDiCountersBuffer_.handle(), restirDiCountersReadbackBuffer_.handle(), 1, &copy);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiCountersReadbackEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
+}
+
+void PathTracerRenderer::recordRestirGiCountersReadback(VkCommandBuffer commandBuffer) {
+    if (!shouldUseNewRestirGi()) return;
+    if (restirGiCountersBuffer_.handle() == VK_NULL_HANDLE ||
+        restirGiCountersReadbackBuffer_.handle() == VK_NULL_HANDLE) return;
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiCountersReadbackStart, VK_PIPELINE_STAGE_2_COPY_BIT);
+    VkBufferCopy copy{};
+    copy.size = sizeof(uint32_t) * 64u;
+    copy.srcOffset = (temporalFrameIndex_ % kRendererFramesInFlight) * copy.size;
+    copy.dstOffset = copy.srcOffset;
+    vkCmdCopyBuffer(commandBuffer, restirGiCountersBuffer_.handle(), restirGiCountersReadbackBuffer_.handle(), 1, &copy);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiCountersReadbackEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
 }
 
 void PathTracerRenderer::recordHeightFog(VkCommandBuffer commandBuffer) {
@@ -7764,10 +9148,44 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
     const RenderGraphResourceId restirSpatialReservoir = graph.createBuffer(bufferResource(restirSpatialReservoirBuffer_, "restir spatial reservoir"));
     const bool resetRestirHistory =
+        settings_.restirDiMode == RestirDiMode::Legacy &&
+        settings_.restirDiMode == RestirDiMode::Legacy &&
         settings_.restirMode != RestirMode::ClassicNee &&
         ((temporalSystem_ != nullptr && temporalSystem_->isCameraCut()) ||
          (temporalSystem_ == nullptr && temporalFrameIndex_ <= 1u));
     const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
+    const bool useNewRestirDi = shouldRunRestirDiEstimator() &&
+        restirDiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiInitialReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiSpatialReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiFinalOutputBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiPreviousHistoryReservoirBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiPreviousReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiCountersBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiCountersReadbackBuffer_.handle() != VK_NULL_HANDLE;
+    RenderGraphResourceId restirDiReceiver{};
+    RenderGraphResourceId restirDiPreviousReceiver{};
+    RenderGraphResourceId restirDiInitial{};
+    RenderGraphResourceId restirDiTemporal{};
+    RenderGraphResourceId restirDiSpatial{};
+    RenderGraphResourceId restirDiFinal{};
+    RenderGraphResourceId restirDiPrevious{};
+    RenderGraphResourceId restirDiCounters{};
+    RenderGraphResourceId restirDiCountersReadback{};
+    if (useNewRestirDi) {
+        restirDiReceiver = graph.createBuffer(bufferResource(restirDiCurrentReceiverBuffer(), "restir di receiver"));
+        restirDiPreviousReceiver = graph.createBuffer(bufferResource(restirDiPreviousReceiverBuffer(), "restir di previous receiver"));
+        restirDiInitial = graph.createBuffer(bufferResource(restirDiInitialReservoirBuffer_, "restir di initial reservoir"));
+        restirDiTemporal = graph.createBuffer(bufferResource(restirDiTemporalReservoirBuffer_, "restir di temporal reservoir"));
+        restirDiSpatial = graph.createBuffer(bufferResource(restirDiSpatialReservoirBuffer_, "restir di spatial reservoir"));
+        restirDiFinal = shouldAliasRestirDiFinal()
+            ? restirDiTemporal
+            : graph.createBuffer(bufferResource(restirDiCurrentHistoryReservoirBuffer(), "restir di final reservoir"));
+        restirDiPrevious = graph.createBuffer(bufferResource(restirDiPreviousHistoryReservoirBuffer(), "restir di previous reservoir"));
+        restirDiCounters = graph.createBuffer(bufferResource(restirDiCountersBuffer_, "restir di counters"));
+        restirDiCountersReadback = graph.createBuffer(bufferResource(restirDiCountersReadbackBuffer_, "restir di counters readback"));
+    }
     const bool useWavefrontQueues = settings_.wavefrontQueuesEnabled &&
         wavefrontRayQueueBuffer_.handle() != VK_NULL_HANDLE &&
         wavefrontHitQueueBuffer_.handle() != VK_NULL_HANDLE &&
@@ -7817,11 +9235,38 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     RenderGraphResourceId restirGiReservoir{};
     RenderGraphResourceId previousRestirGiReservoir{};
     RenderGraphResourceId restirGiSpatialReservoir{};
+    RenderGraphResourceId restirGiReceiver{};
+    RenderGraphResourceId previousRestirGiReceiver{};
+    RenderGraphResourceId restirGiTemporalReservoir{};
+    RenderGraphResourceId restirGiProductionReservoir{};
+    RenderGraphResourceId previousRestirGiProductionReservoir{};
+    RenderGraphResourceId restirGiUpsampledReservoir{};
+    RenderGraphResourceId restirGiActiveTileMask{};
+    RenderGraphResourceId restirGiCounters{};
+    RenderGraphResourceId restirGiCountersReadback{};
     RenderGraphResourceId wavefrontRestirGiReservoir{};
     if (useRestirGiReservoirs) {
         restirGiReservoir = graph.createBuffer(bufferResource(restirGiReservoirBuffer_, "restir gi reservoir"));
         previousRestirGiReservoir = graph.createBuffer(bufferResource(previousRestirGiReservoirBuffer_, "previous restir gi reservoir"));
         restirGiSpatialReservoir = graph.createBuffer(bufferResource(restirGiSpatialReservoirBuffer_, "restir gi spatial reservoir"));
+        restirGiReceiver = graph.createBuffer(bufferResource(restirGiCurrentReceiverBuffer(), "restir gi receiver"));
+        previousRestirGiReceiver = graph.createBuffer(bufferResource(restirGiPreviousReceiverBuffer(), "previous restir gi receiver"));
+        if (shouldUseNewRestirGi()) {
+            restirGiTemporalReservoir = graph.createBuffer(bufferResource(restirGiTemporalReservoirBuffer_, "restir gi production temporal reservoir"));
+            restirGiProductionReservoir = graph.createBuffer(bufferResource(restirGiCurrentProductionHistoryBuffer(), "restir gi production spatial reservoir"));
+            previousRestirGiProductionReservoir = graph.createBuffer(bufferResource(restirGiPreviousProductionHistoryBuffer(), "previous restir gi production reservoir"));
+            if (restirGiCountersBuffer_.handle() != VK_NULL_HANDLE &&
+                restirGiCountersReadbackBuffer_.handle() != VK_NULL_HANDLE) {
+                restirGiCounters = graph.createBuffer(bufferResource(restirGiCountersBuffer_, "restir gi counters"));
+                restirGiCountersReadback = graph.createBuffer(bufferResource(restirGiCountersReadbackBuffer_, "restir gi counters readback"));
+            }
+            if (restirGiUpsampledReservoirBuffer_.handle() != VK_NULL_HANDLE) {
+                restirGiUpsampledReservoir = graph.createBuffer(bufferResource(restirGiUpsampledReservoirBuffer_, "restir gi production upsampled reservoir"));
+            }
+            if (restirGiActiveTileMaskBuffer_.handle() != VK_NULL_HANDLE) {
+                restirGiActiveTileMask = graph.createBuffer(bufferResource(restirGiActiveTileMaskBuffer_, "restir gi active tile mask"));
+            }
+        }
     }
     if (useWavefrontQueues && wavefrontRestirGiReservoirBuffer_.handle() != VK_NULL_HANDLE) {
         wavefrontRestirGiReservoir = graph.createBuffer(bufferResource(wavefrontRestirGiReservoirBuffer_, "wavefront restir gi candidate reservoir"));
@@ -7835,13 +9280,13 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         graph.addPass("restir_history_clear")
             .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer);
     }
-    if (useRestirGiReservoirs) {
+    if (useRestirGiReservoirs && !restirGiHistoryValid_) {
         RenderGraphPass& restirGiClearPass = graph.addPass("restir_gi_clear")
-            .addStorageWrite(restirGiReservoir, PipelineDomain::Transfer);
-        if (!restirGiHistoryValid_) {
-            restirGiClearPass
-                .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
-                .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer);
+            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(restirGiSpatialReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirGiReceiver, PipelineDomain::Transfer);
+        if (previousRestirGiProductionReservoir.valid()) {
+            restirGiClearPass.addStorageWrite(previousRestirGiProductionReservoir, PipelineDomain::Transfer);
         }
     }
     if (useWavefrontQueues) {
@@ -7908,6 +9353,23 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageReadWrite(wavefrontPixelState, PipelineDomain::RayTracing)
             .addStorageWrite(wavefrontShadowTraceValidation, PipelineDomain::RayTracing);
     }
+    if (useNewRestirDi && !restirDiHistoryValid_) {
+        graph.addPass("restir_di_history_clear")
+            .addStorageWrite(restirDiPrevious, PipelineDomain::Transfer)
+            .addStorageWrite(restirDiPreviousReceiver, PipelineDomain::Transfer);
+    }
+    if (useNewRestirDi && shouldCollectRestirCounters()) {
+        graph.addPass("restir_di_counters_clear")
+            .addStorageWrite(restirDiCounters, PipelineDomain::Transfer);
+    }
+    if (shouldCollectRestirCounters() && restirGiCounters.valid()) {
+        graph.addPass("restir_gi_counters_clear")
+            .addStorageWrite(restirGiCounters, PipelineDomain::Transfer);
+    }
+    if (shouldUseRestirGiActiveTileMask() && restirGiActiveTileMask.valid()) {
+        graph.addPass("restir_gi_active_tile_mask_clear")
+            .addStorageWrite(restirGiActiveTileMask, PipelineDomain::Transfer);
+    }
     if (!useWavefrontFinalOutput) {
         RenderGraphPass& pathTracePass = graph.addPass("path_trace_rt")
             .addStorageWrite(raw, traceDomain)
@@ -7925,7 +9387,68 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             pathTracePass
                 .addStorageReadWrite(restirGiReservoir, traceDomain)
                 .addStorageRead(previousRestirGiReservoir, traceDomain)
-                .addStorageRead(restirGiSpatialReservoir, traceDomain);
+                .addStorageRead(restirGiSpatialReservoir, traceDomain)
+                .addStorageWrite(restirGiReceiver, traceDomain)
+                .addStorageRead(previousRestirGiReceiver, traceDomain);
+        }
+        if (useNewRestirDi) {
+            pathTracePass
+                .addStorageWrite(restirDiReceiver, traceDomain)
+                .addStorageWrite(restirDiInitial, traceDomain)
+                .addStorageReadWrite(restirDiCounters, traceDomain);
+        }
+    }
+    if (useNewRestirDi) {
+        RenderGraphResourceId finalInput = restirDiInitial;
+        RenderGraphResourceId temporalDebugInput = restirDiInitial;
+        if (settings_.restirDiTemporalEnabled) {
+            graph.addPass("restir_di_temporal")
+                .addStorageRead(restirDiInitial, PipelineDomain::Compute)
+                .addStorageRead(restirDiPrevious, PipelineDomain::Compute)
+                .addStorageRead(restirDiReceiver, PipelineDomain::Compute)
+                .addStorageRead(restirDiPreviousReceiver, PipelineDomain::Compute)
+                .addStorageRead(velocity, PipelineDomain::Compute)
+                .addStorageReadWrite(restirDiCounters, PipelineDomain::Compute)
+                .addStorageWrite(restirDiTemporal, PipelineDomain::Compute);
+            finalInput = restirDiTemporal;
+            temporalDebugInput = restirDiTemporal;
+        }
+        if (settings_.restirDiSpatialEnabled) {
+            graph.addPass("restir_di_spatial")
+                .addStorageRead(finalInput, PipelineDomain::Compute)
+                .addStorageRead(restirDiReceiver, PipelineDomain::Compute)
+                .addStorageReadWrite(restirDiCounters, PipelineDomain::Compute)
+                .addStorageWrite(restirDiSpatial, PipelineDomain::Compute);
+            finalInput = restirDiSpatial;
+        }
+        RenderGraphPass& finalPass = graph.addPass("restir_di_final");
+        finalPass
+            .addStorageRead(finalInput, PipelineDomain::Compute)
+            .addStorageRead(restirDiInitial, PipelineDomain::Compute)
+            .addStorageRead(restirDiReceiver, PipelineDomain::Compute)
+            .addStorageReadWrite(restirDiCounters, PipelineDomain::Compute)
+            .addStorageReadWrite(raw, PipelineDomain::Compute)
+            .addStorageReadWrite(pathData, PipelineDomain::Compute)
+            .addStorageReadWrite(accumulation, PipelineDomain::Compute)
+            .addStorageReadWrite(variance, PipelineDomain::Compute);
+        if (shouldAliasRestirDiFinal()) {
+            finalPass.addStorageReadWrite(restirDiFinal, PipelineDomain::Compute);
+        } else {
+            finalPass
+                .addStorageRead(temporalDebugInput, PipelineDomain::Compute)
+                .addStorageWrite(restirDiFinal, PipelineDomain::Compute);
+        }
+        if (!shouldUseRestirHistoryPingPong()) {
+            graph.addPass("restir_di_history_copy")
+                .addStorageRead(restirDiFinal, PipelineDomain::Transfer)
+                .addStorageWrite(restirDiPrevious, PipelineDomain::Transfer)
+                .addStorageRead(restirDiReceiver, PipelineDomain::Transfer)
+                .addStorageWrite(restirDiPreviousReceiver, PipelineDomain::Transfer);
+        }
+        if (shouldCollectRestirCounters()) {
+            graph.addPass("restir_di_counters_readback")
+                .addStorageRead(restirDiCounters, PipelineDomain::Transfer)
+                .addStorageWrite(restirDiCountersReadback, PipelineDomain::Transfer);
         }
     }
     if (useWavefrontShadowTrace && !useWavefrontFinalOutput) {
@@ -7945,7 +9468,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageRead(entityIds, PipelineDomain::Compute)
             .addStorageWrite(wavefrontTraceValidation, PipelineDomain::Compute);
     }
-    if (useRestirGiReservoirs && !useWavefrontFinalOutput) {
+    if (useRestirGiReservoirs && shouldUseRestirGiLegacyCache() && !useWavefrontFinalOutput) {
         graph.addPass("restir_gi_spatial")
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
             .addStorageRead(previousRestirGiReservoir, PipelineDomain::Compute)
@@ -7962,6 +9485,66 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Compute)
             .addStorageRead(velocity, PipelineDomain::Compute)
             .addStorageReadWrite(pathData, PipelineDomain::Compute);
+    }
+    if (shouldRunRestirGiTemporal()) {
+        RenderGraphPass& restirGiTemporalPass = graph.addPass("restir_gi_temporal");
+        restirGiTemporalPass
+            .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
+            .addStorageRead(previousRestirGiProductionReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
+            .addStorageRead(previousRestirGiReceiver, PipelineDomain::Compute)
+            .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
+            .addStorageWrite(restirGiTemporalReservoir, PipelineDomain::Compute);
+        if (restirGiActiveTileMask.valid()) {
+            restirGiTemporalPass.addStorageReadWrite(restirGiActiveTileMask, PipelineDomain::Compute);
+        }
+    }
+    if (shouldRunRestirGiSpatialProd()) {
+        RenderGraphPass& restirGiSpatialProdPass = graph.addPass("restir_gi_spatial_production");
+        restirGiSpatialProdPass
+            .addStorageRead(restirGiTemporalReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
+            .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
+            .addStorageWrite(restirGiProductionReservoir, PipelineDomain::Compute);
+        if (restirGiActiveTileMask.valid()) {
+            restirGiSpatialProdPass.addStorageRead(restirGiActiveTileMask, PipelineDomain::Compute);
+        }
+    }
+    if (shouldRunRestirGiUpsample()) {
+        RenderGraphPass& restirGiUpsamplePass = graph.addPass("restir_gi_upsample");
+        restirGiUpsamplePass
+            .addStorageRead(restirGiProductionReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiTemporalReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
+            .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
+            .addStorageWrite(restirGiUpsampledReservoir, PipelineDomain::Compute);
+        if (restirGiActiveTileMask.valid()) {
+            restirGiUpsamplePass.addStorageRead(restirGiActiveTileMask, PipelineDomain::Compute);
+        }
+    }
+    if (shouldRunRestirGiFinalProd()) {
+        const RenderGraphResourceId finalCurrentReservoir = restirGiTemporalReservoir;
+        const RenderGraphResourceId finalSpatialReservoir = shouldRunRestirGiUpsample()
+            ? restirGiUpsampledReservoir
+            : (shouldRunRestirGiSpatialStage() ? restirGiProductionReservoir : restirGiTemporalReservoir);
+        RenderGraphPass& restirGiFinalProdPass = graph.addPass("restir_gi_final_production");
+        restirGiFinalProdPass
+            .addStorageReadWrite(raw, PipelineDomain::Compute)
+            .addStorageReadWrite(accumulation, PipelineDomain::Compute)
+            .addStorageRead(finalCurrentReservoir, PipelineDomain::Compute)
+            .addStorageRead(finalSpatialReservoir, PipelineDomain::Compute)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
+            .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
+            .addStorageReadWrite(pathData, PipelineDomain::Compute);
+        if (restirGiActiveTileMask.valid()) {
+            restirGiFinalProdPass.addStorageRead(restirGiActiveTileMask, PipelineDomain::Compute);
+        }
+        if (shouldCollectRestirCounters() && restirGiCounters.valid() && restirGiCountersReadback.valid()) {
+            graph.addPass("restir_gi_counters_readback")
+                .addStorageRead(restirGiCounters, PipelineDomain::Transfer)
+                .addStorageWrite(restirGiCountersReadback, PipelineDomain::Transfer);
+        }
     }
     if (useWavefrontFinalOutput) {
         const RenderGraphResourceId wavefrontFinalCompactValidation = graph.createBuffer(bufferResource(wavefrontCompactValidationBuffer_, "wavefront final compact validation"));
@@ -8333,6 +9916,24 @@ void PathTracerRenderer::writeRayTracingDescriptors(
     gpuSkinningResourcePlan_.skinnedMotionVectorsDescriptorBound =
         gpuSkinningResourcePlan_.skinnedMotionVectorsEnabled &&
         gpuSkinningPreviousVertexBuffer_.handle() != VK_NULL_HANDLE;
+    const Buffer& restirDiReceiverBinding = restirDiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE
+        ? restirDiCurrentReceiverBuffer() : depthNormalBuffer_;
+    const Buffer& restirDiInitialBinding = restirDiInitialReservoirBuffer_.handle() != VK_NULL_HANDLE
+        ? restirDiInitialReservoirBuffer_ : restirReservoirBuffer_;
+    const Buffer& previousRestirDiBinding = restirDiPreviousHistoryReservoirBuffer().handle() != VK_NULL_HANDLE
+        ? restirDiPreviousHistoryReservoirBuffer() : previousRestirReservoirBuffer_;
+    const Buffer& restirDiCountersBinding = restirDiCountersBuffer_.handle() != VK_NULL_HANDLE
+        ? restirDiCountersBuffer_ : rayTracingDiagnosticCountersBuffer_;
+    const Buffer& restirGiCurrentBinding = restirGiReservoirBuffer_.handle() != VK_NULL_HANDLE
+        ? restirGiReservoirBuffer_ : restirReservoirBuffer_;
+    const Buffer& previousRestirGiBinding = previousRestirGiReservoirBuffer_.handle() != VK_NULL_HANDLE
+        ? previousRestirGiReservoirBuffer_ : previousRestirReservoirBuffer_;
+    const Buffer& restirGiSpatialBinding = restirGiSpatialReservoirBuffer_.handle() != VK_NULL_HANDLE
+        ? restirGiSpatialReservoirBuffer_ : restirSpatialReservoirBuffer_;
+    const Buffer& restirGiReceiverBinding = restirGiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE
+        ? restirGiCurrentReceiverBuffer() : depthNormalBuffer_;
+    const Buffer& previousRestirGiReceiverBinding = restirGiPreviousReceiverBuffer().handle() != VK_NULL_HANDLE
+        ? restirGiPreviousReceiverBuffer() : depthNormalBuffer_;
     writer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumulationBuffer_.descriptorInfo())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
@@ -8369,16 +9970,26 @@ void PathTracerRenderer::writeRayTracingDescriptors(
         .writeBuffer(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirReservoirBuffer_.descriptorInfo())
         .writeBuffer(40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightBvhNodes().descriptorInfo())
         .writeBuffer(42, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
-        .writeBuffer(43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
-        .writeBuffer(44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirGiReservoirBuffer_.descriptorInfo())
-        .writeBuffer(45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialReservoirBuffer_.descriptorInfo())
+        .writeBuffer(43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentBinding.descriptorInfo())
+        .writeBuffer(44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirGiBinding.descriptorInfo())
+        .writeBuffer(45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialBinding.descriptorInfo())
         .writeBuffer(46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(47, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
         .writeBuffer(48, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingDiagnosticCountersBuffer_.descriptorInfo())
-        .writeBuffer(52, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiReceiverBuffer_.descriptorInfo())
-        .writeBuffer(53, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiInitialReservoirBuffer_.descriptorInfo())
-        .writeBuffer(54, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirDiReservoirBuffer_.descriptorInfo())
-        .writeBuffer(57, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, streamingResetInstanceMaskBuffer_.descriptorInfo());
+        .writeBuffer(52, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiReceiverBinding.descriptorInfo())
+        .writeBuffer(53, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiInitialBinding.descriptorInfo())
+        .writeBuffer(54, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirDiBinding.descriptorInfo())
+        .writeBuffer(57, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, streamingResetInstanceMaskBuffer_.descriptorInfo())
+        .writeBuffer(58, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReceiverBinding.descriptorInfo())
+        .writeBuffer(59, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirGiReceiverBinding.descriptorInfo())
+        .writeBuffer(60, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiCountersBinding.handle() == restirDiCountersBuffer_.handle()
+            ? restirDiCountersBinding.descriptorInfo(
+                (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
+                sizeof(uint32_t) * 64u)
+            : restirDiCountersBinding.descriptorInfo())
+        .writeBuffer(61, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(
+            kFrameRestirDiParamsOffset,
+            sizeof(RestirDiParams)));
     writeStbnDescriptors(writer);
     const Buffer& wavefrontRayQueue = wavefrontRayQueueOverride != nullptr ? *wavefrontRayQueueOverride : wavefrontRayQueueBuffer_;
     if (includeWavefrontQueues &&
@@ -8392,14 +10003,29 @@ void PathTracerRenderer::writeRayTracingDescriptors(
 }
 
 void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) {
-    if (rayTracingPipeline_ == nullptr || rayTracingScene_ == nullptr) {
+    const bool restirDiValidationFull = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull;
+    const bool restirGiInitialFull = usesRestirGiUncompressedInitialReservoir();
+    ensureRayTracingVariantPipelines(restirDiValidationFull, restirGiInitialFull);
+    RayTracingPipeline* basePipeline = rayTracingPipeline_.get();
+    RayTracingPipeline* motionPipeline = rayTracingMotionPipeline_.get();
+    if (restirDiValidationFull && restirGiInitialFull) {
+        basePipeline = rayTracingAllFullPipeline_.get();
+        motionPipeline = rayTracingMotionAllFullPipeline_.get();
+    } else if (restirDiValidationFull) {
+        basePipeline = rayTracingFullPipeline_.get();
+        motionPipeline = rayTracingMotionFullPipeline_.get();
+    } else if (restirGiInitialFull) {
+        basePipeline = rayTracingGiFullPipeline_.get();
+        motionPipeline = rayTracingMotionGiFullPipeline_.get();
+    }
+    if (basePipeline == nullptr || rayTracingScene_ == nullptr) {
         throw std::runtime_error("Hardware ray tracing backend is active but RT pipeline/scene is not initialized");
     }
     RayTracingPipeline* pipeline = settings_.motionBlurEnabled &&
             rayTracingScene_->motionBlurActive() &&
-            rayTracingMotionPipeline_ != nullptr
-        ? rayTracingMotionPipeline_.get()
-        : rayTracingPipeline_.get();
+            motionPipeline != nullptr
+        ? motionPipeline
+        : basePipeline;
 
     DescriptorSet set = currentFrame_->descriptors().allocate(rayTracingSetLayout_);
     DescriptorSet atmosphereSet = currentFrame_->descriptors().allocate(atmosphereSetLayout_);
@@ -8429,6 +10055,7 @@ void PathTracerRenderer::recordWavefrontTracePass(
     GpuProfiler::Query profilerStart,
     GpuProfiler::Query profilerEnd) {
     const Buffer& rayQueue = wavefrontRayQueueOverride != nullptr ? *wavefrontRayQueueOverride : wavefrontRayQueueBuffer_;
+    ensureWavefrontTracePipelines();
     RayTracingPipeline* tracePipeline = settings_.shaderExecutionReorderingEnabled && wavefrontTraceSerPipeline_ != nullptr
         ? wavefrontTraceSerPipeline_.get()
         : wavefrontTracePipeline_.get();
@@ -9593,7 +11220,13 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
     });
     const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
     RenderGraphResourceId restirGiSpatialReservoir{};
+    RenderGraphResourceId restirGiTemporalReservoir{};
+    RenderGraphResourceId restirGiProductionReservoir{};
+    RenderGraphResourceId restirGiProductionHistorySource{};
     RenderGraphResourceId previousRestirGiReservoir{};
+    RenderGraphResourceId previousRestirGiProductionReservoir{};
+    RenderGraphResourceId restirGiReceiver{};
+    RenderGraphResourceId previousRestirGiReceiver{};
     if (useRestirGiReservoirs) {
         restirGiSpatialReservoir = graph.createBuffer(RenderGraphResource{
             .type = RenderGraphResource::Type::Buffer,
@@ -9620,6 +11253,78 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
                 .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
             },
             .debugName = "previous restir gi reservoir",
+        });
+        if (shouldUseNewRestirGi() && restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE) {
+            restirGiTemporalReservoir = graph.createBuffer(RenderGraphResource{
+                .type = RenderGraphResource::Type::Buffer,
+                .lifetime = RenderGraphResource::Lifetime::Persistent,
+                .size = restirGiTemporalReservoirBuffer_.size(),
+                .buffer = restirGiTemporalReservoirBuffer_.handle(),
+                .external = true,
+                .hasInitialAccess = true,
+                .initialAccess = ResourceAccess{
+                    .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                },
+                .debugName = "restir gi production temporal reservoir",
+            });
+        }
+        if (shouldUseNewRestirGi() && restirGiCurrentProductionHistoryBuffer().handle() != VK_NULL_HANDLE) {
+            restirGiProductionReservoir = graph.createBuffer(RenderGraphResource{
+                .type = RenderGraphResource::Type::Buffer,
+                .lifetime = RenderGraphResource::Lifetime::Persistent,
+                .size = restirGiCurrentProductionHistoryBuffer().size(),
+                .buffer = restirGiCurrentProductionHistoryBuffer().handle(),
+                .external = true,
+                .hasInitialAccess = true,
+                .initialAccess = ResourceAccess{
+                    .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                },
+                .debugName = "restir gi production reservoir",
+            });
+            restirGiProductionHistorySource = shouldRunRestirGiSpatialStage()
+                ? restirGiProductionReservoir
+                : restirGiTemporalReservoir;
+            previousRestirGiProductionReservoir = graph.createBuffer(RenderGraphResource{
+                .type = RenderGraphResource::Type::Buffer,
+                .lifetime = RenderGraphResource::Lifetime::Persistent,
+                .size = restirGiPreviousProductionHistoryBuffer().size(),
+                .buffer = restirGiPreviousProductionHistoryBuffer().handle(),
+                .external = true,
+                .hasFinalAccess = true,
+                .finalAccess = ResourceAccess{
+                    .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                },
+                .debugName = "previous restir gi production reservoir",
+            });
+        }
+        restirGiReceiver = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiCurrentReceiverBuffer().size(),
+            .buffer = restirGiCurrentReceiverBuffer().handle(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            },
+            .debugName = "restir gi receiver",
+        });
+        previousRestirGiReceiver = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiPreviousReceiverBuffer().size(),
+            .buffer = restirGiPreviousReceiverBuffer().handle(),
+            .external = true,
+            .hasFinalAccess = true,
+            .finalAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            },
+            .debugName = "previous restir gi receiver",
         });
     }
     RenderGraphPass& historyCopyPass = graph.addPass("history_copy")
@@ -9648,7 +11353,14 @@ void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
     if (useRestirGiReservoirs) {
         historyCopyPass
             .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
-            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirGiReceiver, PipelineDomain::Transfer);
+        if (restirGiProductionHistorySource.valid() && previousRestirGiProductionReservoir.valid()) {
+            historyCopyPass
+                .addStorageRead(restirGiProductionHistorySource, PipelineDomain::Transfer)
+                .addStorageWrite(previousRestirGiProductionReservoir, PipelineDomain::Transfer);
+        }
     }
     historyCopyPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             copyHistoryResourcesPass(cmd);
@@ -9773,7 +11485,13 @@ void PathTracerRenderer::copyNrdHistoryResources(VkCommandBuffer commandBuffer) 
     });
     const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
     RenderGraphResourceId restirGiSpatialReservoir{};
+    RenderGraphResourceId restirGiTemporalReservoir{};
+    RenderGraphResourceId restirGiProductionReservoir{};
+    RenderGraphResourceId restirGiProductionHistorySource{};
     RenderGraphResourceId previousRestirGiReservoir{};
+    RenderGraphResourceId previousRestirGiProductionReservoir{};
+    RenderGraphResourceId restirGiReceiver{};
+    RenderGraphResourceId previousRestirGiReceiver{};
     if (useRestirGiReservoirs) {
         restirGiSpatialReservoir = graph.createBuffer(RenderGraphResource{
             .type = RenderGraphResource::Type::Buffer,
@@ -9801,6 +11519,78 @@ void PathTracerRenderer::copyNrdHistoryResources(VkCommandBuffer commandBuffer) 
             },
             .debugName = "previous restir gi reservoir",
         });
+        if (shouldUseNewRestirGi() && restirGiCurrentProductionHistoryBuffer().handle() != VK_NULL_HANDLE) {
+            if (restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE) {
+                restirGiTemporalReservoir = graph.createBuffer(RenderGraphResource{
+                    .type = RenderGraphResource::Type::Buffer,
+                    .lifetime = RenderGraphResource::Lifetime::Persistent,
+                    .size = restirGiTemporalReservoirBuffer_.size(),
+                    .buffer = restirGiTemporalReservoirBuffer_.handle(),
+                    .external = true,
+                    .hasInitialAccess = true,
+                    .initialAccess = ResourceAccess{
+                        .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    },
+                    .debugName = "restir gi production temporal reservoir",
+                });
+            }
+            restirGiProductionReservoir = graph.createBuffer(RenderGraphResource{
+                .type = RenderGraphResource::Type::Buffer,
+                .lifetime = RenderGraphResource::Lifetime::Persistent,
+                .size = restirGiCurrentProductionHistoryBuffer().size(),
+                .buffer = restirGiCurrentProductionHistoryBuffer().handle(),
+                .external = true,
+                .hasInitialAccess = true,
+                .initialAccess = ResourceAccess{
+                    .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                },
+                .debugName = "restir gi production reservoir",
+            });
+            previousRestirGiProductionReservoir = graph.createBuffer(RenderGraphResource{
+                .type = RenderGraphResource::Type::Buffer,
+                .lifetime = RenderGraphResource::Lifetime::Persistent,
+                .size = restirGiPreviousProductionHistoryBuffer().size(),
+                .buffer = restirGiPreviousProductionHistoryBuffer().handle(),
+                .external = true,
+                .hasFinalAccess = true,
+                .finalAccess = ResourceAccess{
+                    .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                },
+                .debugName = "previous restir gi production reservoir",
+            });
+            restirGiProductionHistorySource = shouldRunRestirGiSpatialStage()
+                ? restirGiProductionReservoir
+                : restirGiTemporalReservoir;
+        }
+        restirGiReceiver = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiCurrentReceiverBuffer().size(),
+            .buffer = restirGiCurrentReceiverBuffer().handle(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            },
+            .debugName = "restir gi receiver",
+        });
+        previousRestirGiReceiver = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiPreviousReceiverBuffer().size(),
+            .buffer = restirGiPreviousReceiverBuffer().handle(),
+            .external = true,
+            .hasFinalAccess = true,
+            .finalAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            },
+            .debugName = "previous restir gi receiver",
+        });
     }
 
     RenderGraphPass& historyCopyPass = graph.addPass("nrd_history_copy")
@@ -9813,7 +11603,14 @@ void PathTracerRenderer::copyNrdHistoryResources(VkCommandBuffer commandBuffer) 
     if (useRestirGiReservoirs) {
         historyCopyPass
             .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
-            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirGiReceiver, PipelineDomain::Transfer);
+        if (restirGiProductionHistorySource.valid() && previousRestirGiProductionReservoir.valid()) {
+            historyCopyPass
+                .addStorageRead(restirGiProductionHistorySource, PipelineDomain::Transfer)
+                .addStorageWrite(previousRestirGiProductionReservoir, PipelineDomain::Transfer);
+        }
     }
     historyCopyPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             copyNrdHistoryResourcesPass(cmd);
@@ -9854,24 +11651,36 @@ void PathTracerRenderer::copyNrdHistoryResourcesPass(VkCommandBuffer commandBuff
     vkCmdCopyBuffer(commandBuffer, restirReservoirBuffer_.handle(), previousRestirReservoirBuffer_.handle(), 1, &restirCopy);
 
     if (shouldUseRestirGiReservoirs()) {
-        VkBufferCopy restirGiCopy{};
-        restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
-        vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        if (shouldUseRestirGiLegacyCache()) {
+            VkBufferCopy restirGiCopy{};
+            restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
+            vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        }
+        const Buffer& restirGiHistorySource = restirGiProductionHistorySourceBuffer();
+        if (!shouldUseRestirHistoryPingPong() &&
+            shouldUseNewRestirGi() &&
+            restirGiHistorySource.handle() != VK_NULL_HANDLE &&
+            restirGiPreviousProductionHistoryBuffer().handle() != VK_NULL_HANDLE) {
+            VkBufferCopy restirGiProductionCopy{};
+            restirGiProductionCopy.size = std::min(restirGiHistorySource.size(), restirGiPreviousProductionHistoryBuffer().size());
+            vkCmdCopyBuffer(
+                commandBuffer,
+                restirGiHistorySource.handle(),
+                restirGiPreviousProductionHistoryBuffer().handle(),
+                1,
+                &restirGiProductionCopy);
+        }
+        if (!shouldUseRestirHistoryPingPong()) {
+            VkBufferCopy restirGiReceiverCopy{};
+            restirGiReceiverCopy.size = restirGiCurrentReceiverBuffer().size();
+            vkCmdCopyBuffer(commandBuffer, restirGiCurrentReceiverBuffer().handle(), restirGiPreviousReceiverBuffer().handle(), 1, &restirGiReceiverCopy);
+        }
         restirGiHistoryValid_ = true;
-    }
-    if (shouldUseNewRestirDi() && restirDiFinalReservoirBuffer_.handle() != VK_NULL_HANDLE && previousRestirDiReservoirBuffer_.handle() != VK_NULL_HANDLE) {
-        VkBufferCopy restirDiCopy{};
-        restirDiCopy.size = restirDiFinalReservoirBuffer_.size();
-        vkCmdCopyBuffer(commandBuffer, restirDiFinalReservoirBuffer_.handle(), previousRestirDiReservoirBuffer_.handle(), 1, &restirDiCopy);
-        restirDiHistoryValid_ = true;
     }
     if (temporalSystem_) {
         temporalSystem_->markSlotWritten("denoiser_history");
         temporalSystem_->markSlotWritten("previous_world_position");
         temporalSystem_->markSlotWritten("restir_reservoir");
-        if (shouldUseNewRestirDi()) {
-            temporalSystem_->markSlotWritten("restir_di_reservoir");
-        }
     }
     denoiserHistoryValid_ = true;
     currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
@@ -9949,16 +11758,31 @@ void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer)
     restirCopy.size = restirReservoirBuffer_.size();
     vkCmdCopyBuffer(commandBuffer, restirReservoirBuffer_.handle(), previousRestirReservoirBuffer_.handle(), 1, &restirCopy);
     if (shouldUseRestirGiReservoirs()) {
-        VkBufferCopy restirGiCopy{};
-        restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
-        vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        if (shouldUseRestirGiLegacyCache()) {
+            VkBufferCopy restirGiCopy{};
+            restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
+            vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        }
+        const Buffer& restirGiHistorySource = restirGiProductionHistorySourceBuffer();
+        if (!shouldUseRestirHistoryPingPong() &&
+            shouldUseNewRestirGi() &&
+            restirGiHistorySource.handle() != VK_NULL_HANDLE &&
+            restirGiPreviousProductionHistoryBuffer().handle() != VK_NULL_HANDLE) {
+            VkBufferCopy restirGiProductionCopy{};
+            restirGiProductionCopy.size = std::min(restirGiHistorySource.size(), restirGiPreviousProductionHistoryBuffer().size());
+            vkCmdCopyBuffer(
+                commandBuffer,
+                restirGiHistorySource.handle(),
+                restirGiPreviousProductionHistoryBuffer().handle(),
+                1,
+                &restirGiProductionCopy);
+        }
+        if (!shouldUseRestirHistoryPingPong()) {
+            VkBufferCopy restirGiReceiverCopy{};
+            restirGiReceiverCopy.size = restirGiCurrentReceiverBuffer().size();
+            vkCmdCopyBuffer(commandBuffer, restirGiCurrentReceiverBuffer().handle(), restirGiPreviousReceiverBuffer().handle(), 1, &restirGiReceiverCopy);
+        }
         restirGiHistoryValid_ = true;
-    }
-    if (shouldUseNewRestirDi() && restirDiFinalReservoirBuffer_.handle() != VK_NULL_HANDLE && previousRestirDiReservoirBuffer_.handle() != VK_NULL_HANDLE) {
-        VkBufferCopy restirDiCopy{};
-        restirDiCopy.size = restirDiFinalReservoirBuffer_.size();
-        vkCmdCopyBuffer(commandBuffer, restirDiFinalReservoirBuffer_.handle(), previousRestirDiReservoirBuffer_.handle(), 1, &restirDiCopy);
-        restirDiHistoryValid_ = true;
     }
     if (temporalSystem_) {
         temporalSystem_->markSlotWritten("denoiser_history");
@@ -9966,9 +11790,6 @@ void PathTracerRenderer::copyHistoryResourcesPass(VkCommandBuffer commandBuffer)
         temporalSystem_->markSlotWritten("denoiser_specular_history");
         temporalSystem_->markSlotWritten("previous_world_position");
         temporalSystem_->markSlotWritten("restir_reservoir");
-        if (shouldUseNewRestirDi()) {
-            temporalSystem_->markSlotWritten("restir_di_reservoir");
-        }
     }
     denoiserHistoryValid_ = true;
     currentProfiler_->write(commandBuffer, GpuProfiler::HistoryCopyEnd, VK_PIPELINE_STAGE_2_COPY_BIT);
@@ -10134,6 +11955,7 @@ bool PathTracerRenderer::shouldRunDlssRayReconstruction() const {
 bool PathTracerRenderer::shouldRunRestirSpatial() const {
     return !settings_.wavefrontFinalOutputEnabled &&
         !adaptiveSkipRestirSpatial_ &&
+        settings_.restirDiMode == RestirDiMode::Legacy &&
         settings_.restirMode != RestirMode::ClassicNee &&
         restirSpatialPipeline_ != nullptr &&
         restirSpatialSetLayout_ != VK_NULL_HANDLE &&
@@ -10143,7 +11965,12 @@ bool PathTracerRenderer::shouldRunRestirSpatial() const {
 }
 
 bool PathTracerRenderer::shouldUseRestirGiReservoirs() const {
-    return settings_.restirGiEnabled ||
+    // Wavefront final output owns its multi-bounce radiance and does not yet
+    // produce the megakernel receiver/fallback ABI required by production GI.
+    if (settings_.wavefrontFinalOutputEnabled) {
+        return false;
+    }
+    return settings_.restirGiMode != RestirGiMode::Off ||
         settings_.debugView == RendererDebugView::RestirGiValidity ||
         settings_.debugView == RendererDebugView::RestirGiAge ||
         settings_.debugView == RendererDebugView::RestirGiInitial ||
@@ -10152,50 +11979,302 @@ bool PathTracerRenderer::shouldUseRestirGiReservoirs() const {
         settings_.debugView == RendererDebugView::RestirGiFinal ||
         settings_.debugView == RendererDebugView::RestirGiNormal ||
         settings_.debugView == RendererDebugView::RestirGiHitDistance ||
+        settings_.debugView == RendererDebugView::RestirGiGrid ||
+        settings_.debugView == RendererDebugView::RestirGiPathClass ||
         settings_.debugView == RendererDebugView::WavefrontRestirGi;
 }
 
 bool PathTracerRenderer::shouldRunRestirGiFinal() const {
     return !settings_.wavefrontFinalOutputEnabled &&
-        (settings_.restirGiEnabled ||
+        (shouldUseRestirGiLegacyCache() ||
         settings_.debugView == RendererDebugView::RestirGiSpatial ||
-        settings_.debugView == RendererDebugView::RestirGiFinal);
+        settings_.debugView == RendererDebugView::RestirGiFinal ||
+        settings_.debugView == RendererDebugView::RestirGiGrid ||
+        settings_.debugView == RendererDebugView::RestirGiPathClass);
+}
+
+bool PathTracerRenderer::shouldRunRestirGiTemporal() const {
+    const ComputePipeline* temporalPipeline = usesRestirGiUncompressedInitialReservoir()
+        ? restirGiTemporalFullPipeline_.get()
+        : restirGiTemporalPipeline_.get();
+    return !settings_.wavefrontFinalOutputEnabled &&
+        shouldUseNewRestirGi() &&
+        temporalPipeline != nullptr &&
+        restirGiTemporalSetLayout_ != VK_NULL_HANDLE &&
+        restirGiReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirGiPreviousProductionHistoryBuffer().handle() != VK_NULL_HANDLE &&
+        restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirGiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        restirGiPreviousReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        rayTracingScene_ != nullptr &&
+        rayTracingScene_->tlas() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldRunRestirGiSpatialProd() const {
+    return !settings_.wavefrontFinalOutputEnabled &&
+        shouldUseNewRestirGi() &&
+        shouldRunRestirGiSpatialStage() &&
+        restirGiSpatialProdPipeline_ != nullptr &&
+        restirGiSpatialProdSetLayout_ != VK_NULL_HANDLE &&
+        restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirGiCurrentProductionHistoryBuffer().handle() != VK_NULL_HANDLE &&
+        restirGiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        rayTracingScene_ != nullptr &&
+        rayTracingScene_->tlas() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldRunRestirGiFinalProd() const {
+    return !settings_.wavefrontFinalOutputEnabled &&
+        shouldUseNewRestirGi() &&
+        restirGiFinalProdPipeline_ != nullptr &&
+        restirGiFinalProdSetLayout_ != VK_NULL_HANDLE &&
+        (shouldRunRestirGiUpsample()
+            ? restirGiUpsampledReservoirBuffer_.handle() != VK_NULL_HANDLE
+            : (restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+               restirGiCurrentProductionHistoryBuffer().handle() != VK_NULL_HANDLE)) &&
+        restirGiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        rawImage_.handle() != VK_NULL_HANDLE &&
+        pathDataBuffer_.handle() != VK_NULL_HANDLE &&
+        accumulationBuffer_.handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldRunRestirGiUpsample() const {
+    return !settings_.wavefrontFinalOutputEnabled &&
+        shouldUseNewRestirGi() &&
+        shouldRunRestirGiSpatialStage() &&
+        effectiveRestirGiHalfResolution() &&
+        restirGiUpsamplePipeline_ != nullptr &&
+        restirGiUpsampleSetLayout_ != VK_NULL_HANDLE &&
+        restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirGiCurrentProductionHistoryBuffer().handle() != VK_NULL_HANDLE &&
+        restirGiUpsampledReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirGiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldRunRestirGiSpatialStage() const {
+    return settings_.restirGiSpatialRounds > 0u ||
+        settings_.debugView == RendererDebugView::RestirGiSpatial ||
+        settings_.debugView == RendererDebugView::RestirGiGrid ||
+        settings_.debugView == RendererDebugView::RestirGiPathClass ||
+        shouldUseRestirGiReferenceValidation();
+}
+
+bool PathTracerRenderer::shouldUseRestirGiActiveTileMask() const {
+    const bool modeEnabled = settings_.restirGiActiveTileMaskMode == RestirGiActiveTileMaskMode::On ||
+        (settings_.restirGiActiveTileMaskMode == RestirGiActiveTileMaskMode::Auto && restirGiActiveTileMaskAutoEnabled_);
+    return modeEnabled &&
+        shouldUseNewRestirGi() &&
+        !shouldUseRestirGiReferenceValidation() &&
+        restirGiActiveTileMaskBuffer_.handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldCollectRestirCounters() const {
+    switch (settings_.restirCounterMode) {
+    case RestirCounterMode::On:
+        return true;
+    case RestirCounterMode::Off:
+        return false;
+    case RestirCounterMode::Auto:
+        break;
+    }
+    return rayTracingDiagnosticCountersEnabled_ ||
+        isRestirDiDebugView(settings_.debugView) ||
+        settings_.debugView == RendererDebugView::RestirGiValidity ||
+        settings_.debugView == RendererDebugView::RestirGiAge ||
+        settings_.debugView == RendererDebugView::RestirGiInitial ||
+        settings_.debugView == RendererDebugView::RestirGiTemporal ||
+        settings_.debugView == RendererDebugView::RestirGiSpatial ||
+        settings_.debugView == RendererDebugView::RestirGiFinal ||
+        settings_.debugView == RendererDebugView::RestirGiNormal ||
+        settings_.debugView == RendererDebugView::RestirGiHitDistance ||
+        settings_.debugView == RendererDebugView::RestirGiGrid ||
+        settings_.debugView == RendererDebugView::RestirGiPathClass ||
+        settings_.debugView == RendererDebugView::WavefrontRestirGi ||
+        settings_.restirDiMode == RestirDiMode::ReferenceValidation ||
+        settings_.restirDiMode == RestirDiMode::HybridCompare ||
+        settings_.restirGiMode == RestirGiMode::ReferenceValidation;
+}
+
+const Buffer& PathTracerRenderer::restirGiProductionHistorySourceBuffer() const {
+    return shouldRunRestirGiSpatialStage()
+        ? restirGiCurrentProductionHistoryBuffer()
+        : restirGiTemporalReservoirBuffer_;
+}
+
+bool PathTracerRenderer::shouldUseRestirHistoryPingPong() const {
+    return settings_.restirHistoryCopyMode == RestirHistoryCopyMode::PingPong &&
+        !settings_.wavefrontFinalOutputEnabled &&
+        restirDiFinalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        previousRestirDiReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiReceiverBuffer_.handle() != VK_NULL_HANDLE &&
+        previousRestirDiReceiverBuffer_.handle() != VK_NULL_HANDLE &&
+        restirGiProductionReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        previousRestirGiProductionReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        restirGiReceiverBuffer_.handle() != VK_NULL_HANDLE &&
+        previousRestirGiReceiverBuffer_.handle() != VK_NULL_HANDLE &&
+        shouldRunRestirGiSpatialStage();
+}
+
+RestirHistoryCopyMode PathTracerRenderer::effectiveRestirHistoryCopyMode() const {
+    return shouldUseRestirHistoryPingPong()
+        ? RestirHistoryCopyMode::PingPong
+        : RestirHistoryCopyMode::Copy;
+}
+
+const char* PathTracerRenderer::restirHistoryCopyFallbackReason() const {
+    if (settings_.restirHistoryCopyMode != RestirHistoryCopyMode::PingPong ||
+        shouldUseRestirHistoryPingPong()) {
+        return nullptr;
+    }
+    if (settings_.wavefrontFinalOutputEnabled) {
+        return "wavefront final output is enabled";
+    }
+    if (!shouldRunRestirGiSpatialStage()) {
+        return "ReSTIR GI spatial stage is inactive";
+    }
+    return "required DI/GI ping-pong history buffers are unavailable";
+}
+
+bool PathTracerRenderer::effectiveRestirGiActiveTileMaskEnabled() const {
+    return shouldUseRestirGiActiveTileMask();
+}
+
+const Buffer& PathTracerRenderer::restirDiCurrentReceiverBuffer() const {
+    if (!shouldUseRestirHistoryPingPong()) return restirDiReceiverBuffer_;
+    return (temporalFrameIndex_ & 1u) == 0u ? restirDiReceiverBuffer_ : previousRestirDiReceiverBuffer_;
+}
+
+const Buffer& PathTracerRenderer::restirDiPreviousReceiverBuffer() const {
+    if (!shouldUseRestirHistoryPingPong()) return previousRestirDiReceiverBuffer_;
+    return (temporalFrameIndex_ & 1u) == 0u ? previousRestirDiReceiverBuffer_ : restirDiReceiverBuffer_;
+}
+
+const Buffer& PathTracerRenderer::restirDiCurrentHistoryReservoirBuffer() const {
+    if (!shouldUseRestirHistoryPingPong()) return restirDiFinalOutputBuffer();
+    return (temporalFrameIndex_ & 1u) == 0u ? restirDiFinalReservoirBuffer_ : previousRestirDiReservoirBuffer_;
+}
+
+const Buffer& PathTracerRenderer::restirDiPreviousHistoryReservoirBuffer() const {
+    if (!shouldUseRestirHistoryPingPong()) return previousRestirDiReservoirBuffer_;
+    return (temporalFrameIndex_ & 1u) == 0u ? previousRestirDiReservoirBuffer_ : restirDiFinalReservoirBuffer_;
+}
+
+const Buffer& PathTracerRenderer::restirGiCurrentReceiverBuffer() const {
+    if (!shouldUseRestirHistoryPingPong()) return restirGiReceiverBuffer_;
+    return (temporalFrameIndex_ & 1u) == 0u ? restirGiReceiverBuffer_ : previousRestirGiReceiverBuffer_;
+}
+
+const Buffer& PathTracerRenderer::restirGiPreviousReceiverBuffer() const {
+    if (!shouldUseRestirHistoryPingPong()) return previousRestirGiReceiverBuffer_;
+    return (temporalFrameIndex_ & 1u) == 0u ? previousRestirGiReceiverBuffer_ : restirGiReceiverBuffer_;
+}
+
+const Buffer& PathTracerRenderer::restirGiCurrentProductionHistoryBuffer() const {
+    if (!shouldUseRestirHistoryPingPong()) return restirGiProductionReservoirBuffer_;
+    return (temporalFrameIndex_ & 1u) == 0u ? restirGiProductionReservoirBuffer_ : previousRestirGiProductionReservoirBuffer_;
+}
+
+const Buffer& PathTracerRenderer::restirGiPreviousProductionHistoryBuffer() const {
+    if (!shouldUseRestirHistoryPingPong()) return previousRestirGiProductionReservoirBuffer_;
+    return (temporalFrameIndex_ & 1u) == 0u ? previousRestirGiProductionReservoirBuffer_ : restirGiProductionReservoirBuffer_;
+}
+
+bool PathTracerRenderer::shouldUseRestirGiLegacyCache() const {
+    return settings_.restirGiMode == RestirGiMode::LegacyCache;
+}
+
+bool PathTracerRenderer::shouldUseRestirGiProduction() const {
+    return settings_.restirGiMode == RestirGiMode::Production;
+}
+
+bool PathTracerRenderer::shouldUseRestirGiReferenceValidation() const {
+    return settings_.restirGiMode == RestirGiMode::ReferenceValidation;
+}
+
+bool PathTracerRenderer::shouldUseNewRestirGi() const {
+    return shouldUseRestirGiProduction() || shouldUseRestirGiReferenceValidation();
+}
+
+bool PathTracerRenderer::usesRestirGiUncompressedInitialReservoir() const {
+    return restirGiUncompressedLayout_ ||
+        shouldUseNewRestirGi() ||
+        settings_.restirGiReservoirLayout == RestirGiReservoirLayout::ValidationFull;
 }
 
 bool PathTracerRenderer::shouldUseNewRestirDi() const {
-    return settings_.restirDiMode == RestirDiMode::Production ||
+    const bool diagnosticView = isRestirDiDebugView(settings_.debugView);
+    const bool productionMode = settings_.restirDiMode == RestirDiMode::Production ||
         settings_.restirDiMode == RestirDiMode::ReferenceValidation ||
         settings_.restirDiMode == RestirDiMode::HybridCompare;
+    const bool unsupportedRayQueryVisibility =
+        rayTracingScene_ != nullptr && rayTracingScene_->motionBlurActive();
+    return (productionMode || diagnosticView) &&
+        effectiveSamplesPerPixel() == 1u &&
+        !settings_.homogeneousVolumeEnabled &&
+        !unsupportedRayQueryVisibility;
+}
+
+bool PathTracerRenderer::shouldRunRestirDiEstimator() const {
+    const bool diagnosticOrValidation = isRestirDiDebugView(settings_.debugView) ||
+        settings_.restirDiMode == RestirDiMode::ReferenceValidation ||
+        settings_.restirDiMode == RestirDiMode::HybridCompare;
+    return shouldUseNewRestirDi() &&
+        (diagnosticOrValidation || !scene_.lightRecordsCpu().empty());
 }
 
 bool PathTracerRenderer::shouldRunRestirDiTemporal() const {
-    return shouldUseNewRestirDi() &&
+    return shouldRunRestirDiEstimator() &&
         settings_.restirDiTemporalEnabled &&
         restirDiTemporalPipeline_ != nullptr &&
         restirDiTemporalSetLayout_ != VK_NULL_HANDLE &&
-        restirDiReceiverBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
         restirDiInitialReservoirBuffer_.handle() != VK_NULL_HANDLE &&
-        previousRestirDiReservoirBuffer_.handle() != VK_NULL_HANDLE;
+        restirDiPreviousHistoryReservoirBuffer().handle() != VK_NULL_HANDLE &&
+        restirDiPreviousReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        rayTracingScene_ != nullptr &&
+        rayTracingScene_->tlas() != VK_NULL_HANDLE;
 }
 
 bool PathTracerRenderer::shouldRunRestirDiSpatial() const {
-    return shouldUseNewRestirDi() &&
+    return shouldRunRestirDiEstimator() &&
         settings_.restirDiSpatialEnabled &&
         restirDiSpatialPipeline_ != nullptr &&
         restirDiSpatialSetLayout_ != VK_NULL_HANDLE &&
         restirDiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
-        restirDiReceiverBuffer_.handle() != VK_NULL_HANDLE;
+        restirDiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
+        rayTracingScene_ != nullptr &&
+        rayTracingScene_->tlas() != VK_NULL_HANDLE;
 }
 
 bool PathTracerRenderer::shouldRunRestirDiFinal() const {
-    return shouldUseNewRestirDi() &&
+    return shouldRunRestirDiEstimator() &&
         restirDiFinalPipeline_ != nullptr &&
         restirDiFinalSetLayout_ != VK_NULL_HANDLE &&
         restirDiSpatialReservoirBuffer_.handle() != VK_NULL_HANDLE &&
-        restirDiReceiverBuffer_.handle() != VK_NULL_HANDLE &&
+        restirDiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
         rawImage_.handle() != VK_NULL_HANDLE &&
         pathDataBuffer_.handle() != VK_NULL_HANDLE &&
-        accumulationBuffer_.handle() != VK_NULL_HANDLE;
+        accumulationBuffer_.handle() != VK_NULL_HANDLE &&
+        rayTracingScene_ != nullptr &&
+        rayTracingScene_->tlas() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldAliasRestirDiFinal() const {
+    // Temporal is no longer sampled by reuse once spatial has completed. The
+    // final shader snapshots its same-pixel debug value before writing output.
+    return resourceAliasingEnabled_ &&
+        settings_.restirHistoryCopyMode != RestirHistoryCopyMode::PingPong &&
+        settings_.restirDiTemporalEnabled &&
+        settings_.restirDiSpatialEnabled;
+}
+
+const Buffer& PathTracerRenderer::restirDiFinalOutputBuffer() const {
+    if (shouldUseRestirHistoryPingPong()) {
+        return (temporalFrameIndex_ & 1u) == 0u ? restirDiFinalReservoirBuffer_ : previousRestirDiReservoirBuffer_;
+    }
+    return shouldAliasRestirDiFinal()
+        ? restirDiTemporalReservoirBuffer_
+        : restirDiFinalReservoirBuffer_;
 }
 
 bool PathTracerRenderer::shouldUseWavefrontFinalOutput() const {
@@ -10272,13 +12351,13 @@ uint32_t PathTracerRenderer::effectiveDenoiserMaxHistoryLength() const {
 }
 
 VkDeviceSize PathTracerRenderer::restirGiReservoirStride() const {
-    return restirGiUncompressedLayout_
+    return usesRestirGiUncompressedInitialReservoir()
         ? sizeof(RestirGiReservoirUncompressedGpu)
         : sizeof(RestirGiReservoirGpu);
 }
 
 const char* PathTracerRenderer::restirGiReservoirLayoutName() const {
-    return restirGiUncompressedLayout_ ? "uncompressed" : "compressed";
+    return rtv::restirGiReservoirLayoutName(settings_.restirGiReservoirLayout);
 }
 
 const Image& PathTracerRenderer::postDenoiseImage() const {
@@ -11731,7 +13810,13 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
     });
     const bool useRestirGiReservoirs = shouldUseRestirGiReservoirs();
     RenderGraphResourceId restirGiSpatialReservoir{};
+    RenderGraphResourceId restirGiTemporalReservoir{};
+    RenderGraphResourceId restirGiProductionReservoir{};
+    RenderGraphResourceId restirGiProductionHistorySource{};
     RenderGraphResourceId previousRestirGiReservoir{};
+    RenderGraphResourceId previousRestirGiProductionReservoir{};
+    RenderGraphResourceId restirGiReceiver{};
+    RenderGraphResourceId previousRestirGiReceiver{};
     if (useRestirGiReservoirs) {
         restirGiSpatialReservoir = graph.createBuffer(RenderGraphResource{
             .type = RenderGraphResource::Type::Buffer,
@@ -11759,6 +13844,78 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
             },
             .debugName = "previous restir gi reservoir",
         });
+        if (shouldUseNewRestirGi() && restirGiCurrentProductionHistoryBuffer().handle() != VK_NULL_HANDLE) {
+            if (restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE) {
+                restirGiTemporalReservoir = graph.createBuffer(RenderGraphResource{
+                    .type = RenderGraphResource::Type::Buffer,
+                    .lifetime = RenderGraphResource::Lifetime::Persistent,
+                    .size = restirGiTemporalReservoirBuffer_.size(),
+                    .buffer = restirGiTemporalReservoirBuffer_.handle(),
+                    .external = true,
+                    .hasInitialAccess = true,
+                    .initialAccess = ResourceAccess{
+                        .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    },
+                    .debugName = "restir gi production temporal reservoir",
+                });
+            }
+            restirGiProductionReservoir = graph.createBuffer(RenderGraphResource{
+                .type = RenderGraphResource::Type::Buffer,
+                .lifetime = RenderGraphResource::Lifetime::Persistent,
+                .size = restirGiCurrentProductionHistoryBuffer().size(),
+                .buffer = restirGiCurrentProductionHistoryBuffer().handle(),
+                .external = true,
+                .hasInitialAccess = true,
+                .initialAccess = ResourceAccess{
+                    .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                },
+                .debugName = "restir gi production reservoir",
+            });
+            previousRestirGiProductionReservoir = graph.createBuffer(RenderGraphResource{
+                .type = RenderGraphResource::Type::Buffer,
+                .lifetime = RenderGraphResource::Lifetime::Persistent,
+                .size = restirGiPreviousProductionHistoryBuffer().size(),
+                .buffer = restirGiPreviousProductionHistoryBuffer().handle(),
+                .external = true,
+                .hasFinalAccess = true,
+                .finalAccess = ResourceAccess{
+                    .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                },
+                .debugName = "previous restir gi production reservoir",
+            });
+            restirGiProductionHistorySource = shouldRunRestirGiSpatialStage()
+                ? restirGiProductionReservoir
+                : restirGiTemporalReservoir;
+        }
+        restirGiReceiver = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiCurrentReceiverBuffer().size(),
+            .buffer = restirGiCurrentReceiverBuffer().handle(),
+            .external = true,
+            .hasInitialAccess = true,
+            .initialAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            },
+            .debugName = "restir gi receiver",
+        });
+        previousRestirGiReceiver = graph.createBuffer(RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = restirGiPreviousReceiverBuffer().size(),
+            .buffer = restirGiPreviousReceiverBuffer().handle(),
+            .external = true,
+            .hasFinalAccess = true,
+            .finalAccess = ResourceAccess{
+                .stage = pathTraceShaderStage(),
+                .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            },
+            .debugName = "previous restir gi receiver",
+        });
     }
     RenderGraphPass& skipDenoiserCopyGraphPass = graph.addPass("skip_denoiser_copy")
         .addStorageRead(raw, PipelineDomain::Transfer)
@@ -11770,7 +13927,14 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
     if (useRestirGiReservoirs) {
         skipDenoiserCopyGraphPass
             .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
-            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+            .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer)
+            .addStorageRead(restirGiReceiver, PipelineDomain::Transfer)
+            .addStorageWrite(previousRestirGiReceiver, PipelineDomain::Transfer);
+        if (restirGiProductionHistorySource.valid() && previousRestirGiProductionReservoir.valid()) {
+            skipDenoiserCopyGraphPass
+                .addStorageRead(restirGiProductionHistorySource, PipelineDomain::Transfer)
+                .addStorageWrite(previousRestirGiProductionReservoir, PipelineDomain::Transfer);
+        }
     }
     skipDenoiserCopyGraphPass.setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             skipDenoiserCopyPass(cmd);
@@ -11809,9 +13973,30 @@ void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
     restirCopy.size = restirReservoirBuffer_.size();
     vkCmdCopyBuffer(commandBuffer, restirReservoirBuffer_.handle(), previousRestirReservoirBuffer_.handle(), 1, &restirCopy);
     if (shouldUseRestirGiReservoirs()) {
-        VkBufferCopy restirGiCopy{};
-        restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
-        vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        if (shouldUseRestirGiLegacyCache()) {
+            VkBufferCopy restirGiCopy{};
+            restirGiCopy.size = restirGiSpatialReservoirBuffer_.size();
+            vkCmdCopyBuffer(commandBuffer, restirGiSpatialReservoirBuffer_.handle(), previousRestirGiReservoirBuffer_.handle(), 1, &restirGiCopy);
+        }
+        const Buffer& restirGiHistorySource = restirGiProductionHistorySourceBuffer();
+        if (!shouldUseRestirHistoryPingPong() &&
+            shouldUseNewRestirGi() &&
+            restirGiHistorySource.handle() != VK_NULL_HANDLE &&
+            restirGiPreviousProductionHistoryBuffer().handle() != VK_NULL_HANDLE) {
+            VkBufferCopy restirGiProductionCopy{};
+            restirGiProductionCopy.size = std::min(restirGiHistorySource.size(), restirGiPreviousProductionHistoryBuffer().size());
+            vkCmdCopyBuffer(
+                commandBuffer,
+                restirGiHistorySource.handle(),
+                restirGiPreviousProductionHistoryBuffer().handle(),
+                1,
+                &restirGiProductionCopy);
+        }
+        if (!shouldUseRestirHistoryPingPong()) {
+            VkBufferCopy restirGiReceiverCopy{};
+            restirGiReceiverCopy.size = restirGiCurrentReceiverBuffer().size();
+            vkCmdCopyBuffer(commandBuffer, restirGiCurrentReceiverBuffer().handle(), restirGiPreviousReceiverBuffer().handle(), 1, &restirGiReceiverCopy);
+        }
         restirGiHistoryValid_ = true;
     }
     if (temporalSystem_) {
@@ -12023,18 +14208,16 @@ VkDeviceSize PathTracerRenderer::temporalHistoryMemory() const {
 
 VkDeviceSize PathTracerRenderer::restirReservoirMemory() const {
     VkDeviceSize total = 0;
-    std::array<VkBuffer, 8> seen{};
-    uint32_t seenCount = 0;
+    std::vector<VkBuffer> seen;
+    seen.reserve(17);
     auto addUnique = [&](const Buffer& buffer) {
         if (buffer.handle() == VK_NULL_HANDLE) {
             return;
         }
-        for (uint32_t i = 0; i < seenCount; ++i) {
-            if (seen[i] == buffer.handle()) {
-                return;
-            }
+        if (std::find(seen.begin(), seen.end(), buffer.handle()) != seen.end()) {
+            return;
         }
-        seen[seenCount++] = buffer.handle();
+        seen.push_back(buffer.handle());
         total += buffer.size();
     };
     addUnique(restirReservoirBuffer_);
@@ -12042,20 +14225,66 @@ VkDeviceSize PathTracerRenderer::restirReservoirMemory() const {
     addUnique(previousRestirReservoirBuffer_);
     addUnique(restirSpatialReservoirBuffer_);
     addUnique(restirGiReservoirBuffer_);
+    addUnique(restirGiProductionReservoirBuffer_);
+    addUnique(previousRestirGiProductionReservoirBuffer_);
     addUnique(previousRestirGiReservoirBuffer_);
     addUnique(restirGiSpatialReservoirBuffer_);
     addUnique(wavefrontRestirGiReservoirBuffer_);
+    addUnique(restirGiReceiverBuffer_);
+    addUnique(restirGiTemporalReservoirBuffer_);
+    addUnique(previousRestirGiReceiverBuffer_);
+    addUnique(restirGiActiveTileMaskBuffer_);
+    addUnique(restirGiCountersBuffer_);
+    addUnique(restirGiCountersReadbackBuffer_);
+    addUnique(restirDiReceiverBuffer_);
+    addUnique(restirDiInitialReservoirBuffer_);
+    addUnique(restirDiTemporalReservoirBuffer_);
+    addUnique(restirDiSpatialReservoirBuffer_);
+    addUnique(restirDiFinalReservoirBuffer_);
+    addUnique(previousRestirDiReservoirBuffer_);
+    addUnique(previousRestirDiReceiverBuffer_);
+    addUnique(restirDiCountersBuffer_);
+    addUnique(restirDiCountersReadbackBuffer_);
     return total;
 }
 
 PathTracerRenderer::RestirReservoirMemoryBreakdown PathTracerRenderer::restirReservoirMemoryBreakdown() const {
+    const Buffer& finalOutput = restirDiFinalOutputBuffer();
+    const VkDeviceSize logicalFinalBytes = finalOutput.size();
+    const VkDeviceSize logicalDiBytes =
+        restirDiInitialReservoirBuffer_.size() +
+        restirDiTemporalReservoirBuffer_.size() +
+        restirDiSpatialReservoirBuffer_.size() +
+        logicalFinalBytes +
+        previousRestirDiReservoirBuffer_.size() +
+        restirDiReceiverBuffer_.size() +
+        previousRestirDiReceiverBuffer_.size() +
+        restirDiCountersBuffer_.size() +
+        restirDiCountersReadbackBuffer_.size();
+    const VkDeviceSize aliasSavings = shouldAliasRestirDiFinal() ? logicalFinalBytes : 0;
     return RestirReservoirMemoryBreakdown{
-        .diCurrentBytes = restirReservoirBuffer_.size(),
-        .diPreviousBytes = previousRestirReservoirBuffer_.size(),
-        .diSpatialBytes = restirSpatialReservoirBuffer_.size(),
+        .diCurrentBytes = logicalFinalBytes,
+        .diInitialBytes = restirDiInitialReservoirBuffer_.size(),
+        .diTemporalBytes = restirDiTemporalReservoirBuffer_.size(),
+        .diPreviousBytes = previousRestirDiReservoirBuffer_.size(),
+        .diSpatialBytes = restirDiSpatialReservoirBuffer_.size(),
+        .diFinalBytes = logicalFinalBytes,
+        .diReceiverBytes = restirDiReceiverBuffer_.size(),
+        .diPreviousReceiverBytes = previousRestirDiReceiverBuffer_.size(),
+        .diCountersBytes = restirDiCountersBuffer_.size() + restirDiCountersReadbackBuffer_.size(),
+        .diPhysicalBytes = logicalDiBytes - aliasSavings,
+        .diAliasSavingsBytes = aliasSavings,
         .giCurrentBytes = restirGiReservoirBuffer_.size(),
         .giPreviousBytes = previousRestirGiReservoirBuffer_.size(),
         .giSpatialBytes = restirGiSpatialReservoirBuffer_.size(),
+        .giProductionTemporalBytes = restirGiTemporalReservoirBuffer_.size(),
+        .giProductionSpatialBytes = restirGiProductionReservoirBuffer_.size(),
+        .giProductionPreviousBytes = previousRestirGiProductionReservoirBuffer_.size(),
+        .giProductionUpsampledBytes = restirGiUpsampledReservoirBuffer_.size(),
+        .giActiveTileMaskBytes = restirGiActiveTileMaskBuffer_.size(),
+        .giCountersBytes = restirGiCountersBuffer_.size() + restirGiCountersReadbackBuffer_.size(),
+        .giReceiverBytes = restirGiReceiverBuffer_.size(),
+        .giPreviousReceiverBytes = previousRestirGiReceiverBuffer_.size(),
     };
 }
 

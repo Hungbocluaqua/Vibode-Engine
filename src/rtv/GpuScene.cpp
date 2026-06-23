@@ -16,10 +16,12 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -80,8 +82,37 @@ static_assert(sizeof(GpuPrimitiveRecord) == 32);
 static_assert(sizeof(GpuInstanceRecord) == 272);
 static_assert(sizeof(GpuLocalVertex) == 80);
 static_assert(sizeof(GpuInstanceBoundsRecord) == 32);
-static_assert(sizeof(GpuLightRecord) == 80);
+static_assert(sizeof(GpuLightRecord) == 96);
 static_assert(sizeof(MeshParamsUniform) == 80);
+
+template <typename Fn>
+void parallelFor(size_t count, const Fn& fn, size_t minItemsPerTask = 64) {
+    if (count == 0) {
+        return;
+    }
+    const size_t hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+    const size_t taskCount = std::min(hardwareThreads, std::max<size_t>(1, (count + minItemsPerTask - 1) / minItemsPerTask));
+    if (taskCount <= 1) {
+        fn(0, count);
+        return;
+    }
+
+    std::vector<std::future<void>> tasks;
+    tasks.reserve(taskCount - 1);
+    const size_t blockSize = (count + taskCount - 1) / taskCount;
+    size_t begin = 0;
+    for (size_t task = 0; task + 1 < taskCount; ++task) {
+        const size_t end = std::min(count, begin + blockSize);
+        tasks.push_back(std::async(std::launch::async, [begin, end, &fn]() {
+            fn(begin, end);
+        }));
+        begin = end;
+    }
+    fn(begin, count);
+    for (auto& task : tasks) {
+        task.get();
+    }
+}
 
 struct MaterialTextureUploadPayload {
     std::vector<uint8_t> bytes;
@@ -416,6 +447,37 @@ bool hasValidGpuCache(const CachedScene& cached, const SceneAsset& scene) {
     return true;
 }
 
+bool hasValidGpuGeometryCache(const CachedScene& cached, const SceneAsset& scene) {
+    if (cached.meshGpuRecords.empty() || cached.meshParams.meshCount == 0) {
+        return false;
+    }
+    if (cached.textures.size() != scene.textures.size() ||
+        cached.materials.size() != scene.materials.size() ||
+        cached.meshes.size() != scene.meshes.size()) {
+        return false;
+    }
+    if (cached.meshGpuRecords.size() != cached.meshParams.meshCount ||
+        cached.meshGpuRecords.size() != cached.meshes.size()) {
+        return false;
+    }
+    if (cached.primitiveRecords.empty() ||
+        cached.meshParams.localBvhNodeCount == 0 ||
+        cached.meshParams.localTriangleCount == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < cached.meshGpuRecords.size(); ++i) {
+        const CachedMeshGpuRecord& rec = cached.meshGpuRecords[i];
+        const CachedMeshData& mesh = cached.meshes[i];
+        if (rec.localBvh.packedNodes.empty() ||
+            rec.localBvh.triangleData.empty() ||
+            mesh.vertices.empty() ||
+            mesh.indices.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 CachedMeshParams toCachedMeshParams(const MeshParamsUniform& params) {
     return CachedMeshParams{
         .vertexCount = params.vertexCount,
@@ -738,6 +800,18 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
     return materialData;
 }
 
+bool materialDataContainsTransmission(const std::vector<glm::vec4>& materialData) {
+    const size_t materialCount = materialData.size() / materialVec4Stride;
+    for (size_t i = 0; i < materialCount; ++i) {
+        const size_t transmissionSlot = i * materialVec4Stride + 12u;
+        if (transmissionSlot < materialData.size() &&
+            materialData[transmissionSlot].y > materialTransmissionDielectricThreshold) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void addFileDependency(CachedScene& cached, const std::filesystem::path& path, std::unordered_set<std::string>& seen) {
     if (path.empty() || !std::filesystem::exists(path) || !std::filesystem::is_regular_file(path)) {
         return;
@@ -886,6 +960,93 @@ GpuLocalVertex makeLocalVertex(
         .color = color,
         .texcoord1 = {uv1, 0.0f, 0.0f},
     };
+}
+
+struct CachedMeshCpuPayload {
+    const CachedMeshData* mesh = nullptr;
+    std::vector<GpuLocalVertex> vertices;
+    CpuBounds bounds;
+};
+
+CachedMeshCpuPayload buildCachedMeshCpuPayload(const CachedMeshData& mesh) {
+    CachedMeshCpuPayload payload;
+    payload.mesh = &mesh;
+    std::vector<MeshVertex> vertices = mesh.vertices;
+    if (!mesh.defaultMorphWeights.empty()) {
+        MeshAsset morphMesh;
+        morphMesh.vertices = vertices;
+        morphMesh.defaultMorphWeights = mesh.defaultMorphWeights;
+        morphMesh.primitives.reserve(mesh.primitives.size());
+        for (const CachedPrimitiveData& cachedPrimitive : mesh.primitives) {
+            MeshPrimitiveAsset primitive;
+            primitive.firstVertex = cachedPrimitive.firstVertex;
+            primitive.vertexCount = cachedPrimitive.vertexCount;
+            primitive.morphTargets = cachedPrimitive.morphTargets;
+            morphMesh.primitives.push_back(std::move(primitive));
+        }
+        applyMorphTargetWeights(morphMesh, mesh.defaultMorphWeights);
+        vertices = std::move(morphMesh.vertices);
+    }
+
+    payload.vertices.reserve(vertices.size());
+    for (const MeshVertex& vertex : vertices) {
+        const float normalLen2 = glm::dot(vertex.normal, vertex.normal);
+        const glm::vec3 normal = normalLen2 > 1.0e-10f ? glm::normalize(vertex.normal) : glm::vec3{0.0f, 1.0f, 0.0f};
+        glm::vec3 tangent = glm::vec3(vertex.tangent);
+        const float tangentLen2 = glm::dot(tangent, tangent);
+        tangent = tangentLen2 > 1.0e-10f ? glm::normalize(tangent) : glm::vec3{1.0f, 0.0f, 0.0f};
+        payload.vertices.push_back(makeLocalVertex(
+            vertex.position,
+            normal,
+            vertex.texcoord,
+            glm::vec4{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f},
+            vertex.color,
+            vertex.texcoord1));
+        includePoint(payload.bounds, vertex.position);
+    }
+    return payload;
+}
+
+std::vector<CachedMeshCpuPayload> buildCachedMeshCpuPayloads(const std::vector<CachedMeshData>& meshes) {
+    std::vector<CachedMeshCpuPayload> payloads(meshes.size());
+    parallelFor(meshes.size(), [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            payloads[i] = buildCachedMeshCpuPayload(meshes[i]);
+        }
+    }, 1);
+    return payloads;
+}
+
+void appendCachedMeshCpuPayloads(
+    const std::vector<CachedMeshCpuPayload>& payloads,
+    std::vector<GpuLocalVertex>& localVertexData,
+    std::vector<uint32_t>& localIndices,
+    std::vector<CpuBounds>* localMeshBounds = nullptr) {
+    size_t vertexCount = 0;
+    size_t indexCount = 0;
+    for (const CachedMeshCpuPayload& payload : payloads) {
+        vertexCount += payload.vertices.size();
+        indexCount += payload.mesh != nullptr ? payload.mesh->indices.size() : 0;
+    }
+
+    localVertexData.reserve(localVertexData.size() + vertexCount);
+    localIndices.reserve(localIndices.size() + indexCount);
+    if (localMeshBounds != nullptr) {
+        localMeshBounds->reserve(localMeshBounds->size() + payloads.size());
+    }
+
+    for (const CachedMeshCpuPayload& payload : payloads) {
+        const uint32_t vertexBase = static_cast<uint32_t>(localVertexData.size());
+        localVertexData.insert(localVertexData.end(), payload.vertices.begin(), payload.vertices.end());
+        if (payload.mesh != nullptr) {
+            for (uint32_t index : payload.mesh->indices) {
+                localIndices.push_back(vertexBase + index);
+            }
+        }
+        if (localMeshBounds != nullptr) {
+            localMeshBounds->push_back(payload.bounds);
+        }
+    }
 }
 
 void threadTlasRopes(std::vector<CpuTlasNode>& nodes, uint32_t nodeIndex, int rope) {
@@ -1521,13 +1682,27 @@ std::vector<GpuLightRecord> buildLightRecords(
             const glm::vec3 boundsMax = glm::max(v0, glm::max(v1, v2));
             const glm::vec3 centroid = (v0 + v1 + v2) / 3.0f;
             const float weight = area * std::max(luminance(emissive), 0.0001f);
+            uint32_t generation = glm::floatBitsToUint(area) ^ glm::floatBitsToUint(luminance(emissive));
+            auto hashPosition = [&](const glm::vec3& value) {
+                for (uint32_t component = 0; component < 3u; ++component) {
+                    generation = (generation ^ glm::floatBitsToUint(value[component])) * 16777619u;
+                }
+            };
+            hashPosition(v0);
+            hashPosition(v1);
+            hashPosition(v2);
             totalArea += weight;
             lights.push_back(GpuLightRecord{
                 .metadata = {gpuLightTypeEmissiveTriangle, packedIndex, material, instanceIndex},
+                .identity = {
+                    packedIndex * 747796405u ^ instanceIndex * 2891336453u,
+                    0x454d4954u,
+                    generation,
+                    0u},
                 .data0 = {weight, totalArea, 0.0f, area},
-                .data1 = {centroid, 0.0f},
-                .data2 = {boundsMin, 0.0f},
-                .data3 = {boundsMax, 0.0f},
+                .data1 = {centroid, emissive.r},
+                .data2 = {boundsMin, emissive.g},
+                .data3 = {boundsMax, emissive.b},
             });
         }
     }
@@ -1541,11 +1716,21 @@ std::vector<GpuLightRecord> buildLightRecords(
         }
         const float area = 4.0f * 3.14159265358979323846f * sphere.w * sphere.w;
         const float weight = area * std::max(luminance(emissive), 0.0001f);
+        uint32_t generation = glm::floatBitsToUint(sphere.w) ^ glm::floatBitsToUint(luminance(emissive));
+        for (uint32_t component = 0; component < 3u; ++component) {
+            generation = (generation ^ glm::floatBitsToUint(sphere[component])) * 16777619u;
+        }
         totalArea += weight;
         lights.push_back(GpuLightRecord{
             .metadata = {gpuLightTypeEmissiveSphere, sphereIndex, 0u, static_cast<uint32_t>(lights.size())},
+            .identity = {
+                sphereIndex * 747796405u,
+                0x53504852u,
+                generation,
+                0u},
             .data0 = {weight, totalArea, sphere.w, area},
             .data1 = {glm::vec3(sphere), 0.0f},
+            .data2 = {emissive, 0.0f},
         });
     }
     return lights;
@@ -1611,6 +1796,25 @@ std::vector<GpuLightRecord> buildAuthoredLightRecords(const std::vector<SceneLig
 
         GpuLightRecord record{};
         record.metadata = {type, i, 0u, 0u};
+        uint32_t generation = 2166136261u;
+        auto hashWord = [&](uint32_t word) {
+            generation = (generation ^ word) * 16777619u;
+        };
+        hashWord(type);
+        hashWord(glm::floatBitsToUint(light.intensity));
+        hashWord(glm::floatBitsToUint(light.sizeOrRadius));
+        for (uint32_t component = 0; component < 3u; ++component) hashWord(glm::floatBitsToUint(light.color[component]));
+        for (uint32_t column = 0; column < 4u; ++column) {
+            for (uint32_t row = 0; row < 4u; ++row) hashWord(glm::floatBitsToUint(light.transform[column][row]));
+        }
+        const uint64_t persistentId = light.persistentId != 0u
+            ? light.persistentId
+            : (0x4155544800000000ull | static_cast<uint64_t>(static_cast<uint32_t>(std::max(light.nodeIndex, 0)) + 1u));
+        record.identity = {
+            static_cast<uint32_t>(persistentId),
+            static_cast<uint32_t>(persistentId >> 32u),
+            generation,
+            0u};
         record.data0 = {weight, totalWeight, size, area};
         record.data1 = type == gpuLightTypeDirectional ? glm::vec4(toLightDirection, normal.x) : glm::vec4(position, normal.x);
         record.data2 = {radiance, normal.y};
@@ -1674,25 +1878,44 @@ GpuScene::GpuScene(
     const SceneAsset* importedScene,
     const AssetManager* assets,
     std::optional<std::filesystem::path> environmentPath,
-    std::optional<std::filesystem::path> sceneCachePath,
+    SceneCachePolicy sceneCachePolicy,
     uint32_t opacityMicromapSubdivisionLevel,
+    bool opacityMicromapsEnabled,
     uint32_t materialTextureMaxDimension)
     : allocator_(allocator),
       environmentPath_(std::move(environmentPath)),
-      sceneCachePath_(std::move(sceneCachePath)),
+      sceneCachePolicy_(std::move(sceneCachePolicy)),
       opacityMicromapSubdivisionLevel_(opacityMicromapSubdivisionLevel),
+      opacityMicromapsEnabled_(opacityMicromapsEnabled),
       materialTextureMaxDimension_(materialTextureMaxDimension) {
     materialTextureAnisotropy_ = allocator_.supportsSamplerAnisotropy()
         ? std::clamp(8.0f, 1.0f, allocator_.maxSamplerAnisotropy())
         : 1.0f;
     bool usedGpuCache = false;
     if (importedScene != nullptr && assets != nullptr && !importedScene->meshes.empty()) {
-        if (sceneCachePath_.has_value() && importedScene->lights.empty()) {
-            auto cached = SceneCache::load(*sceneCachePath_);
-            if (cached.has_value() && hasValidGpuCache(*cached, *importedScene)) {
-                createImportedSceneFromCache(uploader, *cached, importedScene->lights);
-                usedGpuCache = true;
+        if (sceneCachePolicy_.canRead()) {
+            auto cached = SceneCache::load(*sceneCachePolicy_.path);
+            if (cached.has_value()) {
+                if (sceneCachePolicy_.mode == SceneCacheMode::FullReadWrite && importedScene->lights.empty()) {
+                    if (hasValidGpuCache(*cached, *importedScene)) {
+                        createImportedSceneFromCache(uploader, *cached, importedScene->lights);
+                        usedGpuCache = true;
+                    } else {
+                        std::cout << "GPU cache miss: full cache rejected for active scene signature.\n";
+                    }
+                } else if (sceneCachePolicy_.mode == SceneCacheMode::GeometryReadOnly) {
+                    if (hasValidGpuGeometryCache(*cached, *importedScene)) {
+                        createImportedSceneGeometryFromCache(uploader, *cached, *importedScene);
+                        usedGpuCache = true;
+                    } else {
+                        std::cout << "GPU geometry cache miss: geometry cache rejected for active scene signature.\n";
+                    }
+                }
+            } else {
+                std::cout << "GPU cache miss: failed to load " << sceneCachePolicy_.path->string() << ".\n";
             }
+        } else if (sceneCachePolicy_.mode == SceneCacheMode::Disabled) {
+            std::cout << "GPU cache disabled for renderer startup.\n";
         }
         if (!usedGpuCache) {
             createImportedScene(uploader, *importedScene, *assets);
@@ -2359,6 +2582,7 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
 
     uploader.uploadToBuffer(*materials_, materialData.data(), byteSize);
     meshParams_.materialCount = static_cast<uint32_t>(materialData.size() / materialVec4Stride);
+    hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
     if (meshParamsBuffer_ != nullptr) {
         meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
         meshParamsBuffer_->flush(sizeof(meshParams_));
@@ -2750,6 +2974,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         appendMaterialTextureTransforms(materialData, nullptr);
         materialEmissive.push_back(m.emissive);
     }
+    hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
 
     std::vector<glm::vec4> sphereData;
 
@@ -2862,77 +3087,106 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         return slot == UINT32_MAX ? -1.0f : static_cast<float>(slot);
     };
 
-    for (MaterialAssetHandle handle : materialHandles) {
-        const MaterialAsset* material = assets.material(handle);
-        const glm::vec4 base = effectiveMaterialBaseColor(material, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
-        const glm::vec3 emissive = material != nullptr ? material->emissiveFactor : glm::vec3(0.0f);
-        const float roughness = material != nullptr ? material->roughnessFactor : 1.0f;
-        const float metallic = material != nullptr ? material->metallicFactor : 0.0f;
-        const uint32_t type = importedMaterialType(material);
-        const float baseColorTexture = material != nullptr ? textureSlotFor(material->baseColorTexture) : -1.0f;
-        const float normalTexture = material != nullptr ? textureSlotFor(material->normalTexture) : -1.0f;
-        const float metallicRoughnessTexture = material != nullptr ? textureSlotFor(material->metallicRoughnessTexture) : -1.0f;
-        const float emissiveTexture = material != nullptr ? textureSlotFor(material->emissiveTexture) : -1.0f;
-        const float occlusionTexture = material != nullptr ? textureSlotFor(material->occlusionTexture) : -1.0f;
-        const float sheenColorTexture = material != nullptr ? textureSlotFor(material->sheenColorTexture) : -1.0f;
-        const float sheenRoughnessTexture = material != nullptr ? textureSlotFor(material->sheenRoughnessTexture) : -1.0f;
-        const float iridescenceTexture = material != nullptr ? textureSlotFor(material->iridescenceTexture) : -1.0f;
-        const float iridescenceThicknessTexture = material != nullptr ? textureSlotFor(material->iridescenceThicknessTexture) : -1.0f;
-        const float clearcoatTexture = material != nullptr ? textureSlotFor(material->clearcoatTexture) : -1.0f;
-        const float clearcoatRoughnessTexture = material != nullptr ? textureSlotFor(material->clearcoatRoughnessTexture) : -1.0f;
-        const float clearcoatNormalTexture = material != nullptr ? textureSlotFor(material->clearcoatNormalTexture) : -1.0f;
-        const float transmissionTexture = material != nullptr ? textureSlotFor(material->transmissionTexture) : -1.0f;
-        const float volumeThicknessTexture = material != nullptr ? textureSlotFor(material->volumeThicknessTexture) : -1.0f;
-        const float specularTexture = material != nullptr ? textureSlotFor(material->specularTexture) : -1.0f;
-        const float specularColorTexture = material != nullptr ? textureSlotFor(material->specularColorTexture) : -1.0f;
-        const float anisotropyTexture = material != nullptr ? textureSlotFor(material->anisotropyTexture) : -1.0f;
-        const float opacityTexture = material != nullptr ? textureSlotFor(material->opacityTexture) : -1.0f;
-        const float heightTexture = material != nullptr ? textureSlotFor(material->heightTexture) : -1.0f;
-        uint32_t flags = materialSemanticFlags(material);
-        if (material != nullptr) {
-            uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
-            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->baseColorTexture), textureUsage, slot)) {
-                flags |= materialFlagManualBaseColorSrgb;
+    struct PreparedMaterialGpuData {
+        std::array<glm::vec4, materialVec4Stride> rows{};
+        glm::vec3 emissive{0.0f};
+        bool opaqueTraversalSafe = false;
+        uint32_t alphaClass = kPrimitiveAlphaClassOpaque;
+    };
+    std::vector<PreparedMaterialGpuData> preparedMaterials(materialHandles.size());
+    parallelFor(materialHandles.size(), [&](size_t begin, size_t end) {
+        for (size_t materialIndex = begin; materialIndex < end; ++materialIndex) {
+            const MaterialAsset* material = assets.material(materialHandles[materialIndex]);
+            const glm::vec4 base = effectiveMaterialBaseColor(material, glm::vec4(0.8f, 0.8f, 0.8f, 1.0f));
+            const glm::vec3 emissive = material != nullptr ? material->emissiveFactor : glm::vec3(0.0f);
+            const float roughness = material != nullptr ? material->roughnessFactor : 1.0f;
+            const float metallic = material != nullptr ? material->metallicFactor : 0.0f;
+            const uint32_t type = importedMaterialType(material);
+            const float baseColorTexture = material != nullptr ? textureSlotFor(material->baseColorTexture) : -1.0f;
+            const float normalTexture = material != nullptr ? textureSlotFor(material->normalTexture) : -1.0f;
+            const float metallicRoughnessTexture = material != nullptr ? textureSlotFor(material->metallicRoughnessTexture) : -1.0f;
+            const float emissiveTexture = material != nullptr ? textureSlotFor(material->emissiveTexture) : -1.0f;
+            const float occlusionTexture = material != nullptr ? textureSlotFor(material->occlusionTexture) : -1.0f;
+            const float sheenColorTexture = material != nullptr ? textureSlotFor(material->sheenColorTexture) : -1.0f;
+            const float sheenRoughnessTexture = material != nullptr ? textureSlotFor(material->sheenRoughnessTexture) : -1.0f;
+            const float iridescenceTexture = material != nullptr ? textureSlotFor(material->iridescenceTexture) : -1.0f;
+            const float iridescenceThicknessTexture = material != nullptr ? textureSlotFor(material->iridescenceThicknessTexture) : -1.0f;
+            const float clearcoatTexture = material != nullptr ? textureSlotFor(material->clearcoatTexture) : -1.0f;
+            const float clearcoatRoughnessTexture = material != nullptr ? textureSlotFor(material->clearcoatRoughnessTexture) : -1.0f;
+            const float clearcoatNormalTexture = material != nullptr ? textureSlotFor(material->clearcoatNormalTexture) : -1.0f;
+            const float transmissionTexture = material != nullptr ? textureSlotFor(material->transmissionTexture) : -1.0f;
+            const float volumeThicknessTexture = material != nullptr ? textureSlotFor(material->volumeThicknessTexture) : -1.0f;
+            const float specularTexture = material != nullptr ? textureSlotFor(material->specularTexture) : -1.0f;
+            const float specularColorTexture = material != nullptr ? textureSlotFor(material->specularColorTexture) : -1.0f;
+            const float anisotropyTexture = material != nullptr ? textureSlotFor(material->anisotropyTexture) : -1.0f;
+            const float opacityTexture = material != nullptr ? textureSlotFor(material->opacityTexture) : -1.0f;
+            const float heightTexture = material != nullptr ? textureSlotFor(material->heightTexture) : -1.0f;
+            uint32_t flags = materialSemanticFlags(material);
+            if (material != nullptr) {
+                uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
+                if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->baseColorTexture), textureUsage, slot)) {
+                    flags |= materialFlagManualBaseColorSrgb;
+                }
+                slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
+                if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->emissiveTexture), textureUsage, slot)) {
+                    flags |= materialFlagManualEmissiveSrgb;
+                }
             }
-            slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
-            if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->emissiveTexture), textureUsage, slot)) {
-                flags |= materialFlagManualEmissiveSrgb;
+
+            std::vector<glm::vec4> rows;
+            rows.reserve(materialVec4Stride);
+            rows.push_back({glm::vec3(base), roughness});
+            rows.push_back({material != nullptr ? material->iorFactor : 1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
+            rows.push_back({emissive, base.a});
+            rows.push_back({baseColorTexture, normalTexture, metallicRoughnessTexture, emissiveTexture});
+            rows.push_back({
+                material != nullptr ? material->alphaCutoff : 0.5f,
+                material != nullptr ? static_cast<float>(material->alphaMode) : 0.0f,
+                material != nullptr ? static_cast<float>(material->doubleSided) : 0.0f,
+                0.0f});
+            appendConductorOptics(
+                rows,
+                material,
+                occlusionTexture,
+                sheenColorTexture,
+                sheenRoughnessTexture,
+                iridescenceTexture,
+                iridescenceThicknessTexture);
+            appendGltfMaterialExtensionData(
+                rows,
+                material,
+                clearcoatTexture,
+                clearcoatRoughnessTexture,
+                clearcoatNormalTexture,
+                transmissionTexture,
+                volumeThicknessTexture,
+                specularTexture,
+                specularColorTexture,
+                anisotropyTexture,
+                effectiveMaterialTransmissionFactor(material));
+            appendOpacityHeightTextureIndices(rows, opacityTexture, heightTexture, material != nullptr ? material->heightScale : 0.025f);
+            appendMaterialTextureTransforms(rows, material);
+            if (rows.size() != materialVec4Stride) {
+                throw std::runtime_error("Imported material GPU layout stride mismatch");
             }
+
+            PreparedMaterialGpuData prepared;
+            std::copy(rows.begin(), rows.end(), prepared.rows.begin());
+            prepared.emissive = materialEmissiveLightEstimate(material, assets);
+            prepared.opaqueTraversalSafe = material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u;
+            prepared.alphaClass = primitiveAlphaClassForMaterial(material);
+            preparedMaterials[materialIndex] = prepared;
         }
-        materialData.push_back({glm::vec3(base), roughness});
-        materialData.push_back({material != nullptr ? material->iorFactor : 1.5f, static_cast<float>(type), metallic, static_cast<float>(flags)});
-        materialData.push_back({emissive, base.a});
-        materialData.push_back({baseColorTexture, normalTexture, metallicRoughnessTexture, emissiveTexture});
-        materialData.push_back({
-            material != nullptr ? material->alphaCutoff : 0.5f,
-            material != nullptr ? static_cast<float>(material->alphaMode) : 0.0f,
-            material != nullptr ? static_cast<float>(material->doubleSided) : 0.0f,
-            0.0f});
-        appendConductorOptics(
-            materialData,
-            material,
-            occlusionTexture,
-            sheenColorTexture,
-            sheenRoughnessTexture,
-            iridescenceTexture,
-            iridescenceThicknessTexture);
-        appendGltfMaterialExtensionData(
-            materialData,
-            material,
-            clearcoatTexture,
-            clearcoatRoughnessTexture,
-            clearcoatNormalTexture,
-            transmissionTexture,
-            volumeThicknessTexture,
-            specularTexture,
-            specularColorTexture,
-            anisotropyTexture,
-            effectiveMaterialTransmissionFactor(material));
-        appendOpacityHeightTextureIndices(materialData, opacityTexture, heightTexture, material != nullptr ? material->heightScale : 0.025f);
-        appendMaterialTextureTransforms(materialData, material);
-        materialEmissive.push_back(materialEmissiveLightEstimate(material, assets));
-        materialOpaqueTraversalSafe.push_back(material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u);
-        materialAlphaClasses.push_back(primitiveAlphaClassForMaterial(material));
+    }, 4);
+    materialData.reserve(preparedMaterials.size() * materialVec4Stride);
+    materialEmissive.reserve(preparedMaterials.size());
+    materialOpaqueTraversalSafe.reserve(preparedMaterials.size());
+    materialAlphaClasses.reserve(preparedMaterials.size());
+    for (const PreparedMaterialGpuData& prepared : preparedMaterials) {
+        materialData.insert(materialData.end(), prepared.rows.begin(), prepared.rows.end());
+        materialEmissive.push_back(prepared.emissive);
+        materialOpaqueTraversalSafe.push_back(prepared.opaqueTraversalSafe);
+        materialAlphaClasses.push_back(prepared.alphaClass);
     }
     if (materialData.empty()) {
         materialData.push_back({0.8f, 0.8f, 0.8f, 1.0f});
@@ -2948,6 +3202,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         materialOpaqueTraversalSafe.push_back(false);
         materialAlphaClasses.push_back(kPrimitiveAlphaClassOpaque);
     }
+    hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
 
     std::unordered_map<uint32_t, uint32_t> materialIndexForAsset;
     materialIndexForAsset.reserve(materialHandles.size());
@@ -2967,6 +3222,15 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         ? BvhBuildQuality::MortonFast
         : BvhBuildQuality::BinnedSah;
 
+    struct ImportedMeshJob {
+        MeshAssetHandle handle;
+        const MeshAsset* mesh = nullptr;
+        uint32_t firstVertex = 0;
+        uint32_t firstIndex = 0;
+        uint32_t primitiveOffset = 0;
+        uint32_t localTriangleCursor = 0;
+    };
+
     struct MeshPrep {
         MeshAssetHandle handle;
         const MeshAsset* mesh = nullptr;
@@ -2984,90 +3248,122 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         std::vector<MeshVertex> morphedVertices;
     };
 
-    std::vector<MeshPrep> meshPrep;
-    meshPrep.reserve(importedScene.meshes.size());
+    std::vector<ImportedMeshJob> meshJobs;
+    meshJobs.reserve(importedScene.meshes.size());
+    uint32_t vertexCursor = 0;
+    uint32_t indexCursor = 0;
+    uint32_t primitiveCursor = 0;
     uint32_t localTriangleCursor = 0;
-
     for (MeshAssetHandle handle : importedScene.meshes) {
         const MeshAsset* mesh = assets.mesh(handle);
         if (mesh == nullptr || mesh->vertices.empty() || mesh->indices.empty()) {
             continue;
         }
-
-        MeshPrep prep;
-        prep.handle = handle;
-        prep.mesh = mesh;
-        prep.firstVertex = static_cast<uint32_t>(localVertexData.size());
-        prep.firstIndex = static_cast<uint32_t>(localIndices.size());
-        prep.primitiveOffset = static_cast<uint32_t>(primitiveRecords.size());
-        prep.localTriangleCursor = localTriangleCursor;
-        const bool hasUsableCachedLocalBvh = !mesh->cachedLocalBvhNodes.empty() &&
-            !mesh->cachedLocalBvhTriangles.empty() &&
-            mesh->cachedLocalBvhNodes.size() % 4u == 0u &&
-            mesh->cachedLocalBvhTriangles.size() % 12u == 0u;
-        if (!hasUsableCachedLocalBvh) {
-            prep.positions.reserve(mesh->vertices.size());
-            prep.texcoords.reserve(mesh->vertices.size());
-            prep.normals.reserve(mesh->vertices.size());
-            prep.tangents.reserve(mesh->vertices.size());
-        }
-        localVertexData.reserve(localVertexData.size() + mesh->vertices.size());
-
-        const std::vector<MeshVertex>* sourceVertices = &mesh->vertices;
-        if (hasActiveMorphTargetWeights(*mesh, mesh->defaultMorphWeights)) {
-            MeshAsset morphedMesh = *mesh;
-            applyMorphTargetWeights(morphedMesh, mesh->defaultMorphWeights);
-            prep.morphedVertices = std::move(morphedMesh.vertices);
-            sourceVertices = &prep.morphedVertices;
-        }
-
-        for (const MeshVertex& vertex : *sourceVertices) {
-            const float normalLen2 = glm::dot(vertex.normal, vertex.normal);
-            const glm::vec3 normal = normalLen2 > 1.0e-10f ? glm::normalize(vertex.normal) : glm::vec3{0.0f, 1.0f, 0.0f};
-            glm::vec3 tangent = glm::vec3(vertex.tangent);
-            const float tangentLen2 = glm::dot(tangent, tangent);
-            tangent = tangentLen2 > 1.0e-10f ? glm::normalize(tangent) : glm::vec3{1.0f, 0.0f, 0.0f};
-            const glm::vec4 packedTangent{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f};
-            localVertexData.push_back(makeLocalVertex(vertex.position, normal, vertex.texcoord, packedTangent, vertex.color, vertex.texcoord1));
-            if (!hasUsableCachedLocalBvh) {
-                prep.positions.push_back(vertex.position);
-                prep.texcoords.push_back(vertex.texcoord);
-                prep.normals.push_back(normal);
-                prep.tangents.push_back(packedTangent);
-            }
-            includePoint(prep.localBounds, vertex.position);
-        }
-        localIndices.reserve(localIndices.size() + mesh->indices.size());
-        for (uint32_t index : mesh->indices) {
-            localIndices.push_back(prep.firstVertex + index);
-        }
-
+        ImportedMeshJob job;
+        job.handle = handle;
+        job.mesh = mesh;
+        job.firstVertex = vertexCursor;
+        job.firstIndex = indexCursor;
+        job.primitiveOffset = primitiveCursor;
+        job.localTriangleCursor = localTriangleCursor;
+        uint32_t meshTriangleCount = 0;
         for (const MeshPrimitiveAsset& primitive : mesh->primitives) {
-            const uint32_t triangleCount = primitive.indexCount / 3u;
-            const auto materialIt = materialIndexForAsset.find(primitive.material.index);
-            const uint32_t materialIndex = materialIt != materialIndexForAsset.end() ? materialIt->second : 0u;
-            const uint32_t alphaClass = materialIndex < materialAlphaClasses.size()
-                ? materialAlphaClasses[materialIndex]
-                : kPrimitiveAlphaClassOpaque;
-            if (!hasUsableCachedLocalBvh) {
-                for (uint32_t triangle = 0; triangle < triangleCount; ++triangle) {
-                    prep.faceMaterials.push_back(materialIndex);
-                }
-            }
-            primitiveRecords.push_back(makePrimitiveRecord(
-                prep.firstIndex + primitive.firstIndex,
-                primitive.indexCount,
-                prep.firstVertex + primitive.firstVertex,
-                materialIndex,
-                prep.localTriangleCursor,
-                triangleCount,
-                alphaClass,
-                materialIndex < materialOpaqueTraversalSafe.size() && materialOpaqueTraversalSafe[materialIndex]));
-            prep.localTriangleCursor += triangleCount;
+            meshTriangleCount += primitive.indexCount / 3u;
         }
-        localTriangleCursor = prep.localTriangleCursor;
-        meshPrep.push_back(std::move(prep));
+        meshJobs.push_back(job);
+        vertexCursor += static_cast<uint32_t>(mesh->vertices.size());
+        indexCursor += static_cast<uint32_t>(mesh->indices.size());
+        primitiveCursor += static_cast<uint32_t>(mesh->primitives.size());
+        localTriangleCursor += meshTriangleCount;
     }
+
+    std::vector<MeshPrep> meshPrep(meshJobs.size());
+    localVertexData.resize(vertexCursor);
+    localIndices.resize(indexCursor);
+    primitiveRecords.resize(primitiveCursor);
+    const auto& materialIndexForAssetLookup = materialIndexForAsset;
+    parallelFor(meshJobs.size(), [&](size_t begin, size_t end) {
+        for (size_t meshJobIndex = begin; meshJobIndex < end; ++meshJobIndex) {
+            const ImportedMeshJob& job = meshJobs[meshJobIndex];
+            const MeshAsset* mesh = job.mesh;
+            MeshPrep prep;
+            prep.handle = job.handle;
+            prep.mesh = mesh;
+            prep.firstVertex = job.firstVertex;
+            prep.firstIndex = job.firstIndex;
+            prep.primitiveOffset = job.primitiveOffset;
+            prep.localTriangleCursor = job.localTriangleCursor;
+            prep.meshRecordIndex = static_cast<uint32_t>(meshJobIndex);
+            const bool hasUsableCachedLocalBvh = !mesh->cachedLocalBvhNodes.empty() &&
+                !mesh->cachedLocalBvhTriangles.empty() &&
+                mesh->cachedLocalBvhNodes.size() % 4u == 0u &&
+                mesh->cachedLocalBvhTriangles.size() % 12u == 0u;
+            if (!hasUsableCachedLocalBvh) {
+                prep.positions.reserve(mesh->vertices.size());
+                prep.texcoords.reserve(mesh->vertices.size());
+                prep.normals.reserve(mesh->vertices.size());
+                prep.tangents.reserve(mesh->vertices.size());
+            }
+
+            const std::vector<MeshVertex>* sourceVertices = &mesh->vertices;
+            if (hasActiveMorphTargetWeights(*mesh, mesh->defaultMorphWeights)) {
+                MeshAsset morphedMesh = *mesh;
+                applyMorphTargetWeights(morphedMesh, mesh->defaultMorphWeights);
+                prep.morphedVertices = std::move(morphedMesh.vertices);
+                sourceVertices = &prep.morphedVertices;
+            }
+
+            for (size_t vertexIndex = 0; vertexIndex < sourceVertices->size(); ++vertexIndex) {
+                const MeshVertex& vertex = (*sourceVertices)[vertexIndex];
+                const float normalLen2 = glm::dot(vertex.normal, vertex.normal);
+                const glm::vec3 normal = normalLen2 > 1.0e-10f ? glm::normalize(vertex.normal) : glm::vec3{0.0f, 1.0f, 0.0f};
+                glm::vec3 tangent = glm::vec3(vertex.tangent);
+                const float tangentLen2 = glm::dot(tangent, tangent);
+                tangent = tangentLen2 > 1.0e-10f ? glm::normalize(tangent) : glm::vec3{1.0f, 0.0f, 0.0f};
+                const glm::vec4 packedTangent{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f};
+                localVertexData[static_cast<size_t>(prep.firstVertex) + vertexIndex] =
+                    makeLocalVertex(vertex.position, normal, vertex.texcoord, packedTangent, vertex.color, vertex.texcoord1);
+                if (!hasUsableCachedLocalBvh) {
+                    prep.positions.push_back(vertex.position);
+                    prep.texcoords.push_back(vertex.texcoord);
+                    prep.normals.push_back(normal);
+                    prep.tangents.push_back(packedTangent);
+                }
+                includePoint(prep.localBounds, vertex.position);
+            }
+
+            for (size_t indexOffset = 0; indexOffset < mesh->indices.size(); ++indexOffset) {
+                localIndices[static_cast<size_t>(prep.firstIndex) + indexOffset] = prep.firstVertex + mesh->indices[indexOffset];
+            }
+
+            uint32_t localTriangleWriteCursor = prep.localTriangleCursor;
+            for (size_t primitiveIndex = 0; primitiveIndex < mesh->primitives.size(); ++primitiveIndex) {
+                const MeshPrimitiveAsset& primitive = mesh->primitives[primitiveIndex];
+                const uint32_t triangleCount = primitive.indexCount / 3u;
+                const auto materialIt = materialIndexForAssetLookup.find(primitive.material.index);
+                const uint32_t materialIndex = materialIt != materialIndexForAssetLookup.end() ? materialIt->second : 0u;
+                const uint32_t alphaClass = materialIndex < materialAlphaClasses.size()
+                    ? materialAlphaClasses[materialIndex]
+                    : kPrimitiveAlphaClassOpaque;
+                if (!hasUsableCachedLocalBvh) {
+                    for (uint32_t triangle = 0; triangle < triangleCount; ++triangle) {
+                        prep.faceMaterials.push_back(materialIndex);
+                    }
+                }
+                primitiveRecords[static_cast<size_t>(prep.primitiveOffset) + primitiveIndex] = makePrimitiveRecord(
+                    prep.firstIndex + primitive.firstIndex,
+                    primitive.indexCount,
+                    prep.firstVertex + primitive.firstVertex,
+                    materialIndex,
+                    localTriangleWriteCursor,
+                    triangleCount,
+                    alphaClass,
+                    materialIndex < materialOpaqueTraversalSafe.size() && materialOpaqueTraversalSafe[materialIndex]);
+                localTriangleWriteCursor += triangleCount;
+            }
+            meshPrep[meshJobIndex] = std::move(prep);
+        }
+    }, 1);
 
     std::vector<ParallelBvhBuildTask> bvhTasks;
     bvhTasks.reserve(meshPrep.size());
@@ -3177,26 +3473,28 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         meshRecordIndexForAsset.emplace(prep.handle.index, meshRecordIndex);
     }
 
+    struct PendingImportedInstance {
+        glm::mat4 transform{1.0f};
+        uint32_t meshRecordIndex = 0;
+        uint32_t flags = instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow;
+    };
+    std::vector<PendingImportedInstance> pendingInstances;
+    pendingInstances.reserve(importedScene.nodes.size());
+
     auto appendInstance = [&](const glm::mat4& transform, uint32_t meshIndex, uint32_t flags) {
         auto recordIt = meshRecordIndexForAsset.find(meshIndex);
         if (recordIt == meshRecordIndexForAsset.end()) {
             return;
         }
         const uint32_t meshRecordIndex = recordIt->second;
-        const GpuMeshRecord& meshRecord = meshRecords[meshRecordIndex];
-        const uint32_t primitiveOffset = meshRecord.primitiveData.x;
-        const uint32_t primitiveCount = meshRecord.primitiveData.y;
-        const uint32_t instanceIndex = static_cast<uint32_t>(instanceRecords.size());
-        instanceRecords.push_back(makeInstanceRecord(transform, meshRecordIndex, primitiveOffset, primitiveCount, flags));
-        rayTracingInstances_.push_back(RayTracingInstanceBuildInput{
-            .instanceIndex = instanceIndex,
-            .meshIndex = meshRecordIndex,
+        if (meshRecordIndex >= meshRecords.size() || meshRecordIndex >= localMeshBounds.size()) {
+            return;
+        }
+        pendingInstances.push_back(PendingImportedInstance{
             .transform = transform,
-            .previousTransform = transform,
+            .meshRecordIndex = meshRecordIndex,
             .flags = flags,
-            .visible = (flags & instanceFlagVisible) != 0u,
         });
-        instanceBounds.push_back(makeInstanceBoundsRecord(transformBounds(localMeshBounds[meshRecordIndex], transform), instanceIndex, meshRecordIndex));
     };
 
     auto visitNode = [&](auto&& self, uint32_t nodeIndex, glm::mat4 parent) -> void {
@@ -3223,6 +3521,37 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             }
         }
     }
+
+    instanceRecords.resize(pendingInstances.size());
+    instanceBounds.resize(pendingInstances.size());
+    rayTracingInstances_.resize(pendingInstances.size());
+    parallelFor(pendingInstances.size(), [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            const PendingImportedInstance& pending = pendingInstances[i];
+            const GpuMeshRecord& meshRecord = meshRecords[pending.meshRecordIndex];
+            const uint32_t primitiveOffset = meshRecord.primitiveData.x;
+            const uint32_t primitiveCount = meshRecord.primitiveData.y;
+            const uint32_t instanceIndex = static_cast<uint32_t>(i);
+            instanceRecords[i] = makeInstanceRecord(
+                pending.transform,
+                pending.meshRecordIndex,
+                primitiveOffset,
+                primitiveCount,
+                pending.flags);
+            rayTracingInstances_[i] = RayTracingInstanceBuildInput{
+                .instanceIndex = instanceIndex,
+                .meshIndex = pending.meshRecordIndex,
+                .transform = pending.transform,
+                .previousTransform = pending.transform,
+                .flags = pending.flags,
+                .visible = (pending.flags & instanceFlagVisible) != 0u,
+            };
+            instanceBounds[i] = makeInstanceBoundsRecord(
+                transformBounds(localMeshBounds[pending.meshRecordIndex], pending.transform),
+                instanceIndex,
+                pending.meshRecordIndex);
+        }
+    }, 16);
 
     if (instanceRecords.empty() || localVertexData.empty() || localIndices.empty() || localBvhData.empty() || localTriangleData.empty()) {
         createCornellBox(uploader);
@@ -3272,8 +3601,14 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     materialEmissiveCpu_ = materialEmissive;
     sphereDataCpu_ = sphereData;
     logRayTracingGeometryStats("Imported scene", rayTracingGeometryStats_);
-    opacityMicromapData_ = generateOpacityMicromapData(importedScene, assets, opacityMicromapSubdivisionLevel_);
-    logOpacityMicromapPreprocessStats("Imported scene", opacityMicromapData_.stats);
+    if (opacityMicromapsEnabled_) {
+        opacityMicromapData_ = generateOpacityMicromapData(importedScene, assets, opacityMicromapSubdivisionLevel_);
+        logOpacityMicromapPreprocessStats("Imported scene", opacityMicromapData_.stats);
+    } else {
+        opacityMicromapData_ = {};
+        opacityMicromapData_.stats.subdivisionLevel = opacityMicromapSubdivisionLevel_;
+        std::cout << "Imported scene OMM preprocess skipped: opacity micromaps disabled.\n";
+    }
 
     {
         BatchUploader batch(uploader);
@@ -3311,7 +3646,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     meshParamsBuffer_->flush(sizeof(meshParams_));
     uploadLightBvh(uploader, lightRecords);
 
-    if (sceneCachePath_.has_value() && !importedScene.sourcePath.empty() && importedScene.lights.empty()) {
+    if (sceneCachePolicy_.canWrite() && !importedScene.sourcePath.empty() && importedScene.lights.empty()) {
         CachedScene gpuCached;
         gpuCached.name = importedScene.name;
         gpuCached.sourceMtime = SceneCache::fileMtime(importedScene.sourcePath);
@@ -3552,9 +3887,9 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         }
         if (!importedScene.lights.empty()) {
             appendCachedSceneLights(gpuCached, importedScene.lights);
-        } else if (sceneCachePath_.has_value() &&
-                   SceneCache::isCacheValid(importedScene.sourcePath, *sceneCachePath_)) {
-            auto sourceCached = SceneCache::load(*sceneCachePath_);
+        } else if (sceneCachePolicy_.path.has_value() &&
+                   SceneCache::isCacheValid(importedScene.sourcePath, *sceneCachePolicy_.path)) {
+            auto sourceCached = SceneCache::load(*sceneCachePolicy_.path);
             if (sourceCached.has_value() && !sourceCached->sceneLights.empty()) {
                 gpuCached.sceneLights = sourceCached->sceneLights;
                 std::cout << "GPU scene cache preserved " << gpuCached.sceneLights.size()
@@ -3588,6 +3923,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         for (const auto& light : lightRecords) {
             CachedLightRecord cachedLight;
             cachedLight.metadata = light.metadata;
+            cachedLight.identity = light.identity;
             cachedLight.data0 = light.data0;
             cachedLight.data1 = light.data1;
             cachedLight.data2 = light.data2;
@@ -3596,8 +3932,8 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         }
         gpuCached.meshParams = toCachedMeshParams(meshParams_);
 
-        if (SceneCache::save(*sceneCachePath_, gpuCached)) {
-            std::cout << "GPU scene cache saved: " << sceneCachePath_->string() << "\n";
+        if (SceneCache::save(*sceneCachePolicy_.path, gpuCached)) {
+            std::cout << "GPU scene cache saved: " << sceneCachePolicy_.path->string() << "\n";
         }
     }
 }
@@ -3685,74 +4021,48 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         localTriangleData.insert(localTriangleData.end(), cachedMesh.localBvh.triangleData.begin(), cachedMesh.localBvh.triangleData.end());
     }
 
-    for (const CachedMeshData& mesh : cached.meshes) {
-        const uint32_t vertexBase = static_cast<uint32_t>(localVertexData.size());
-        std::vector<MeshVertex> vertices = mesh.vertices;
-        if (!mesh.defaultMorphWeights.empty()) {
-            MeshAsset morphMesh;
-            morphMesh.vertices = vertices;
-            morphMesh.defaultMorphWeights = mesh.defaultMorphWeights;
-            morphMesh.primitives.reserve(mesh.primitives.size());
-            for (const CachedPrimitiveData& cachedPrimitive : mesh.primitives) {
-                MeshPrimitiveAsset primitive;
-                primitive.firstVertex = cachedPrimitive.firstVertex;
-                primitive.vertexCount = cachedPrimitive.vertexCount;
-                primitive.morphTargets = cachedPrimitive.morphTargets;
-                morphMesh.primitives.push_back(std::move(primitive));
-            }
-            applyMorphTargetWeights(morphMesh, mesh.defaultMorphWeights);
-            vertices = std::move(morphMesh.vertices);
-        }
-        localVertexData.reserve(localVertexData.size() + vertices.size());
-        for (const MeshVertex& vertex : vertices) {
-            const float normalLen2 = glm::dot(vertex.normal, vertex.normal);
-            const glm::vec3 normal = normalLen2 > 1.0e-10f ? glm::normalize(vertex.normal) : glm::vec3{0.0f, 1.0f, 0.0f};
-            glm::vec3 tangent = glm::vec3(vertex.tangent);
-            const float tangentLen2 = glm::dot(tangent, tangent);
-            tangent = tangentLen2 > 1.0e-10f ? glm::normalize(tangent) : glm::vec3{1.0f, 0.0f, 0.0f};
-            localVertexData.push_back(makeLocalVertex(
-                vertex.position,
-                normal,
-                vertex.texcoord,
-                glm::vec4{tangent, vertex.tangent.w < 0.0f ? -1.0f : 1.0f},
-                vertex.color,
-                vertex.texcoord1));
-        }
-        localIndices.reserve(localIndices.size() + mesh.indices.size());
-        for (uint32_t index : mesh.indices) {
-            localIndices.push_back(vertexBase + index);
-        }
-    }
+    const std::vector<CachedMeshCpuPayload> cachedMeshPayloads = buildCachedMeshCpuPayloads(cached.meshes);
+    appendCachedMeshCpuPayloads(cachedMeshPayloads, localVertexData, localIndices);
 
-    for (const auto& cachedInst : cached.instanceRecords) {
-        GpuInstanceRecord rec{};
-        rec.transform = cachedInst.transform;
-        rec.inverseTransform = cachedInst.inverseTransform;
-        rec.normalTransform = glm::transpose(cachedInst.inverseTransform);
-        rec.prevTransform = cachedInst.transform;
-        rec.metadata = cachedInst.metadata;
-        instanceRecords.push_back(rec);
-        rayTracingInstances_.push_back(RayTracingInstanceBuildInput{
-            .instanceIndex = static_cast<uint32_t>(instanceRecords.size() - 1),
-            .meshIndex = rec.metadata.x,
-            .transform = rec.transform,
-            .previousTransform = rec.prevTransform,
-            .flags = rec.metadata.w,
-        });
-    }
+    instanceRecords.resize(cached.instanceRecords.size());
+    rayTracingInstances_.resize(cached.instanceRecords.size());
+    parallelFor(cached.instanceRecords.size(), [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            const CachedInstanceRecord& cachedInst = cached.instanceRecords[i];
+            GpuInstanceRecord rec{};
+            rec.transform = cachedInst.transform;
+            rec.inverseTransform = cachedInst.inverseTransform;
+            rec.normalTransform = glm::transpose(cachedInst.inverseTransform);
+            rec.prevTransform = cachedInst.transform;
+            rec.metadata = cachedInst.metadata;
+            instanceRecords[i] = rec;
+            rayTracingInstances_[i] = RayTracingInstanceBuildInput{
+                .instanceIndex = static_cast<uint32_t>(i),
+                .meshIndex = rec.metadata.x,
+                .transform = rec.transform,
+                .previousTransform = rec.prevTransform,
+                .flags = rec.metadata.w,
+            };
+        }
+    }, 16);
 
-    for (const auto& cachedBounds : cached.instanceBounds) {
-        GpuInstanceBoundsRecord rec{};
-        rec.bmin = cachedBounds.bmin;
-        rec.bmax = cachedBounds.bmax;
-        instanceBounds.push_back(rec);
-    }
+    instanceBounds.resize(cached.instanceBounds.size());
+    parallelFor(cached.instanceBounds.size(), [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            const CachedInstanceBoundsRecord& cachedBounds = cached.instanceBounds[i];
+            instanceBounds[i] = GpuInstanceBoundsRecord{
+                .bmin = cachedBounds.bmin,
+                .bmax = cachedBounds.bmax,
+            };
+        }
+    }, 16);
 
     std::vector<GpuLightRecord> cachedLightRecords;
     cachedLightRecords.reserve(cached.lightRecords.size());
     for (const auto& cachedLight : cached.lightRecords) {
         GpuLightRecord rec{};
         rec.metadata = cachedLight.metadata;
+        rec.identity = cachedLight.identity;
         rec.data0 = cachedLight.data0;
         rec.data1 = cachedLight.data1;
         rec.data2 = cachedLight.data2;
@@ -3783,6 +4093,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     meshParams_.localIndexCount = static_cast<uint32_t>(localIndices.size());
     const std::vector<glm::vec4> materialData = buildCachedMaterialData(cached);
     meshParams_.materialCount = static_cast<uint32_t>(materialData.size() / materialVec4Stride);
+    hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
     primitiveRecordCpu_ = primitiveRecords;
@@ -3792,8 +4103,14 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     materialEmissiveCpu_ = extractMaterialEmissive(materialData);
     sphereDataCpu_.clear();
     logRayTracingGeometryStats("Cached scene", rayTracingGeometryStats_);
-    opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_);
-    logOpacityMicromapPreprocessStats("Cached scene", opacityMicromapData_.stats);
+    if (opacityMicromapsEnabled_) {
+        opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_);
+        logOpacityMicromapPreprocessStats("Cached scene", opacityMicromapData_.stats);
+    } else {
+        opacityMicromapData_ = {};
+        opacityMicromapData_.stats.subdivisionLevel = opacityMicromapSubdivisionLevel_;
+        std::cout << "Cached scene OMM preprocess skipped: opacity micromaps disabled.\n";
+    }
 
     {
         BatchUploader batch(uploader);
@@ -3833,6 +4150,299 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         .memory = BufferMemory::Upload,
         .persistentMapped = true,
         .debugName = "imported mesh params (cached)",
+    });
+    meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
+    meshParamsBuffer_->flush(sizeof(meshParams_));
+    uploadLightBvh(uploader, lightRecords);
+}
+
+void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, const CachedScene& cached, const SceneAsset& activeScene) {
+    std::cout << "GPU geometry cache hit: restoring cached mesh/BVH data for "
+              << cached.meshGpuRecords.size()
+              << " meshes and rebuilding active instances/lights.\n";
+    createCachedMaterialTextures(uploader, cached);
+
+    std::vector<GpuMeshRecord> meshRecords;
+    meshRecords.reserve(cached.meshGpuRecords.size());
+    std::vector<GpuPrimitiveRecord> primitiveRecords;
+    primitiveRecords.reserve(cached.primitiveRecords.size());
+    std::vector<GpuInstanceRecord> instanceRecords;
+    std::vector<GpuInstanceBoundsRecord> instanceBounds;
+    std::vector<GpuLocalVertex> localVertexData;
+    std::vector<uint32_t> localIndices;
+    std::vector<glm::vec4> localBvhData;
+    std::vector<glm::vec4> localTriangleData;
+    std::vector<CpuBounds> localMeshBounds;
+    localMeshBounds.reserve(cached.meshes.size());
+    rayTracingMeshes_.clear();
+    rayTracingInstances_.clear();
+
+    std::vector<bool> materialOpaqueTraversalSafe;
+    materialOpaqueTraversalSafe.reserve(cached.materials.size());
+    std::vector<uint32_t> materialAlphaClasses;
+    materialAlphaClasses.reserve(cached.materials.size());
+    for (const CachedMaterialData& material : cached.materials) {
+        materialOpaqueTraversalSafe.push_back(material.alphaMode == kMaterialAlphaModeOpaque && material.doubleSided != 0u);
+        if (material.alphaMode == kMaterialAlphaModeMask) {
+            materialAlphaClasses.push_back(kPrimitiveAlphaClassAlphaTested);
+        } else if (material.alphaMode == kMaterialAlphaModeBlend) {
+            materialAlphaClasses.push_back(kPrimitiveAlphaClassBlended);
+        } else {
+            materialAlphaClasses.push_back(kPrimitiveAlphaClassOpaque);
+        }
+    }
+
+    for (const CachedPrimitiveRecord& cachedPrim : cached.primitiveRecords) {
+        primitiveRecords.push_back(GpuPrimitiveRecord{
+            .indexData = cachedPrim.indexData,
+            .metadata = cachedPrim.metadata,
+        });
+    }
+    annotatePrimitiveAlphaClasses(primitiveRecords, materialAlphaClasses, &materialOpaqueTraversalSafe);
+
+    for (size_t meshIndex = 0; meshIndex < cached.meshGpuRecords.size(); ++meshIndex) {
+        const CachedMeshGpuRecord& cachedMesh = cached.meshGpuRecords[meshIndex];
+        GpuMeshRecord rec{};
+        rec.vertexIndexData = cachedMesh.vertexIndexData;
+        rec.primitiveData = cachedMesh.primitiveData;
+        rec.flags = cachedMesh.flags;
+        rec.bvhData.x = static_cast<uint32_t>(localBvhData.size() / 4u);
+        rec.bvhData.y = static_cast<uint32_t>(cachedMesh.localBvh.packedNodes.size());
+        rec.bvhData.z = static_cast<uint32_t>(localTriangleData.size() / 12u);
+        rec.bvhData.w = cachedMesh.localBvh.leafTriangleCount;
+        meshRecords.push_back(rec);
+
+        const uint32_t activeMeshHandle = meshIndex < activeScene.meshes.size()
+            ? activeScene.meshes[meshIndex].index
+            : 0xffffffffu;
+        rayTracingMeshes_.push_back(RayTracingMeshBuildInput{
+            .meshIndex = static_cast<uint32_t>(meshRecords.size() - 1),
+            .sourceMeshHandleIndex = activeMeshHandle,
+            .firstVertex = rec.vertexIndexData.x,
+            .vertexCount = rec.vertexIndexData.y,
+            .firstIndex = rec.vertexIndexData.z,
+            .indexCount = rec.vertexIndexData.w,
+            .primitiveOffset = rec.primitiveData.x,
+            .primitiveCount = rec.primitiveData.y,
+            .containsAlphaTestedGeometry = meshPrimitiveAlphaClass(
+                primitiveRecords,
+                rec.primitiveData.x,
+                rec.primitiveData.y,
+                kPrimitiveAlphaClassAlphaTested) != 0u,
+            .containsBlendedGeometry = meshPrimitiveAlphaClass(
+                primitiveRecords,
+                rec.primitiveData.x,
+                rec.primitiveData.y,
+                kPrimitiveAlphaClassBlended) != 0u,
+            .opaqueTraversalSafe = primitivesAreOpaqueTraversalSafe(
+                primitiveRecords,
+                rec.primitiveData.x,
+                rec.primitiveData.y,
+                materialOpaqueTraversalSafe),
+            .updateMode = AccelUpdateMode::Static,
+        });
+
+        localBvhData.insert(localBvhData.end(), cachedMesh.localBvh.packedNodes.begin(), cachedMesh.localBvh.packedNodes.end());
+        localTriangleData.insert(localTriangleData.end(), cachedMesh.localBvh.triangleData.begin(), cachedMesh.localBvh.triangleData.end());
+    }
+
+    const std::vector<CachedMeshCpuPayload> cachedMeshPayloads = buildCachedMeshCpuPayloads(cached.meshes);
+    appendCachedMeshCpuPayloads(cachedMeshPayloads, localVertexData, localIndices, &localMeshBounds);
+
+    std::unordered_map<uint32_t, uint32_t> meshRecordIndexForAsset;
+    meshRecordIndexForAsset.reserve(activeScene.meshes.size());
+    const size_t mappedMeshCount = std::min(activeScene.meshes.size(), meshRecords.size());
+    for (size_t i = 0; i < mappedMeshCount; ++i) {
+        if (activeScene.meshes[i].valid()) {
+            meshRecordIndexForAsset.emplace(activeScene.meshes[i].index, static_cast<uint32_t>(i));
+        }
+    }
+
+    struct PendingGeometryCacheInstance {
+        glm::mat4 transform{1.0f};
+        glm::mat4 previousTransform{1.0f};
+        uint32_t meshRecordIndex = 0;
+        uint32_t flags = instanceFlagVisible | instanceFlagVisibleToCamera | instanceFlagCastShadow;
+    };
+    std::vector<PendingGeometryCacheInstance> pendingInstances;
+    pendingInstances.reserve(activeScene.nodes.size());
+
+    auto appendInstance = [&](const glm::mat4& transform, const glm::mat4& previousTransform, uint32_t meshHandleIndex, uint32_t flags) {
+        auto recordIt = meshRecordIndexForAsset.find(meshHandleIndex);
+        if (recordIt == meshRecordIndexForAsset.end()) {
+            return;
+        }
+        const uint32_t meshRecordIndex = recordIt->second;
+        if (meshRecordIndex >= meshRecords.size() || meshRecordIndex >= localMeshBounds.size()) {
+            return;
+        }
+        pendingInstances.push_back(PendingGeometryCacheInstance{
+            .transform = transform,
+            .previousTransform = previousTransform,
+            .meshRecordIndex = meshRecordIndex,
+            .flags = flags,
+        });
+    };
+
+    auto visitNode = [&](auto&& self, uint32_t nodeIndex, const glm::mat4& parent, const glm::mat4& previousParent) -> void {
+        if (nodeIndex >= activeScene.nodes.size()) {
+            return;
+        }
+        const SceneNodeAsset& node = activeScene.nodes[nodeIndex];
+        const glm::mat4 world = parent * node.transform;
+        const glm::mat4 nodePrevious = node.previousTransformValid ? node.previousTransform : node.transform;
+        const glm::mat4 previousWorld = previousParent * nodePrevious;
+        if (node.mesh.valid()) {
+            appendInstance(world, previousWorld, node.mesh.index, nodeInstanceFlags(node));
+        }
+        for (uint32_t child : node.children) {
+            self(self, child, world, previousWorld);
+        }
+    };
+    if (!activeScene.rootNodes.empty()) {
+        for (uint32_t root : activeScene.rootNodes) {
+            visitNode(visitNode, root, glm::mat4{1.0f}, glm::mat4{1.0f});
+        }
+    } else {
+        for (uint32_t i = 0; i < activeScene.nodes.size(); ++i) {
+            if (activeScene.nodes[i].parent < 0) {
+                visitNode(visitNode, i, glm::mat4{1.0f}, glm::mat4{1.0f});
+            }
+        }
+    }
+
+    instanceRecords.resize(pendingInstances.size());
+    instanceBounds.resize(pendingInstances.size());
+    rayTracingInstances_.resize(pendingInstances.size());
+    parallelFor(pendingInstances.size(), [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            const PendingGeometryCacheInstance& pending = pendingInstances[i];
+            const GpuMeshRecord& meshRecord = meshRecords[pending.meshRecordIndex];
+            const uint32_t primitiveOffset = meshRecord.primitiveData.x;
+            const uint32_t primitiveCount = meshRecord.primitiveData.y;
+            const uint32_t instanceIndex = static_cast<uint32_t>(i);
+            instanceRecords[i] = makeInstanceRecord(
+                pending.transform,
+                pending.meshRecordIndex,
+                primitiveOffset,
+                primitiveCount,
+                pending.flags,
+                &pending.previousTransform);
+            rayTracingInstances_[i] = RayTracingInstanceBuildInput{
+                .instanceIndex = instanceIndex,
+                .meshIndex = pending.meshRecordIndex,
+                .transform = pending.transform,
+                .previousTransform = pending.previousTransform,
+                .flags = pending.flags,
+                .visible = (pending.flags & instanceFlagVisible) != 0u,
+            };
+            instanceBounds[i] = makeInstanceBoundsRecord(
+                transformBounds(localMeshBounds[pending.meshRecordIndex], pending.transform),
+                instanceIndex,
+                pending.meshRecordIndex);
+        }
+    }, 16);
+
+    if (instanceRecords.empty() || localVertexData.empty() || localIndices.empty() || localBvhData.empty() || localTriangleData.empty()) {
+        std::cout << "GPU geometry cache rejected at rebuild: active scene produced no valid instances.\n";
+        createCornellBox(uploader);
+        return;
+    }
+
+    const std::vector<uint32_t> rtTriangleMaterialIds =
+        buildRtTriangleMaterialIds(primitiveRecords, static_cast<uint32_t>(localIndices.size() / 3u));
+    std::vector<glm::vec4> tlasData;
+    std::vector<uint32_t> tlasInstanceIndices;
+    buildTlas(instanceBounds, tlasData, tlasInstanceIndices);
+
+    const std::vector<glm::vec4> materialData = buildCachedMaterialData(cached);
+    std::vector<glm::vec4> sphereData;
+    float emissiveTotalArea = 0.0f;
+    const std::vector<glm::vec3> materialEmissive = extractMaterialEmissive(materialData);
+    emissiveLightRecords_ = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
+    float lightSelectionWeight = emissiveTotalArea;
+    const std::vector<GpuLightRecord> lightRecords = combineLightRecords(
+        emissiveLightRecords_,
+        activeScene.lights,
+        emissiveTotalArea,
+        lightSelectionWeight);
+    lightRecordCpu_ = lightRecords;
+
+    meshParams_ = fromCachedMeshParams(cached.meshParams);
+    meshParams_.enabled = 1;
+    meshParams_.vertexCount = static_cast<uint32_t>(localVertexData.size());
+    meshParams_.triangleCount = static_cast<uint32_t>(localIndices.size() / 3u);
+    meshParams_.materialCount = static_cast<uint32_t>(materialData.size() / materialVec4Stride);
+    meshParams_.primitiveCount = static_cast<uint32_t>(primitiveRecords.size());
+    meshParams_.instanceCount = static_cast<uint32_t>(instanceRecords.size());
+    meshParams_.lightCount = static_cast<uint32_t>(lightRecords.size());
+    meshParams_.meshCount = static_cast<uint32_t>(meshRecords.size());
+    meshParams_.localVertexCount = static_cast<uint32_t>(localVertexData.size());
+    meshParams_.localIndexCount = static_cast<uint32_t>(localIndices.size());
+    meshParams_.localBvhNodeCount = static_cast<uint32_t>(localBvhData.size() / 4u);
+    meshParams_.localTriangleCount = static_cast<uint32_t>(localTriangleData.size() / 12u);
+    meshParams_.tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u);
+    meshParams_.tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size());
+    applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
+    hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
+    rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
+    primitiveRecordCpu_ = primitiveRecords;
+    localVertexCpu_ = localVertexData;
+    meshRecordCpu_ = meshRecords;
+    localTriangleDataCpu_ = localTriangleData;
+    materialEmissiveCpu_ = materialEmissive;
+    sphereDataCpu_.clear();
+    instanceRecordCpu_ = instanceRecords;
+
+    std::cout << "Imported scene GPU data from geometry cache: meshes=" << meshParams_.meshCount
+              << " instances=" << meshParams_.instanceCount
+              << " local_triangles=" << meshParams_.localTriangleCount
+              << " local_bvh_nodes=" << meshParams_.localBvhNodeCount
+              << " tlas_nodes=" << meshParams_.tlasNodeCount << '\n';
+    logRayTracingGeometryStats("Geometry cached scene", rayTracingGeometryStats_);
+    if (opacityMicromapsEnabled_) {
+        opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_);
+        logOpacityMicromapPreprocessStats("Geometry cached scene", opacityMicromapData_.stats);
+    } else {
+        opacityMicromapData_ = {};
+        opacityMicromapData_.stats.subdivisionLevel = opacityMicromapSubdivisionLevel_;
+        std::cout << "Geometry cached scene OMM preprocess skipped: opacity micromaps disabled.\n";
+    }
+
+    {
+        BatchUploader batch(uploader);
+        batch.begin();
+
+        std::vector<glm::vec4> emptyVec4;
+        std::vector<uint32_t> emptyU32;
+        uploadVectorBatched(batch, vertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported scene vertices (geometry cache)");
+        uploadVectorBatched(batch, indices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyU32, "imported scene indices (geometry cache)");
+        uploadVectorBatched(batch, bvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported scene bvh nodes (geometry cache)");
+        uploadVectorBatched(batch, triangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported scene triangles (geometry cache)");
+
+        uploadVectorBatched(batch, materials_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, materialData, "imported scene materials (geometry cache)");
+        uploadVectorBatched(batch, spheres_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, sphereData, "imported scene spheres (geometry cache)");
+        uploadVectorBatched(batch, meshRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, meshRecords, "imported mesh records (geometry cache)");
+        uploadVectorBatched(batch, primitiveRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, primitiveRecords, "imported primitive records (geometry cache)");
+        uploadVectorBatched(batch, instanceRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceRecords, "imported instance records (geometry cache)");
+        uploadVectorBatched(batch, rtTriangleMaterialIds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rtTriangleMaterialIds, "imported rt triangle material ids (geometry cache)");
+        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, lightRecords, "imported emissive light records (geometry cache)");
+        uploadVectorBatched(batch, localVertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localVertexData, "imported local mesh vertices (geometry cache)");
+        uploadVectorBatched(batch, localIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localIndices, "imported local mesh indices (geometry cache)");
+        uploadVectorBatched(batch, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "imported instance bounds (geometry cache)");
+        uploadVectorBatched(batch, localBvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, localBvhData, "imported local bvh nodes (geometry cache)");
+        uploadVectorBatched(batch, localTriangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, localTriangleData, "imported local bvh triangles (geometry cache)");
+        uploadVectorBatched(batch, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasData, "imported tlas nodes (geometry cache)");
+        uploadVectorBatched(batch, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasInstanceIndices, "imported tlas instance indices (geometry cache)");
+        batch.submit();
+    }
+
+    meshParamsBuffer_ = std::make_unique<Buffer>(allocator_, BufferDesc{
+        .size = sizeof(MeshParamsUniform),
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        .memory = BufferMemory::Upload,
+        .persistentMapped = true,
+        .debugName = "imported mesh params (geometry cache)",
     });
     meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
     meshParamsBuffer_->flush(sizeof(meshParams_));

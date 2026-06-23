@@ -117,6 +117,7 @@ void write_primary_gbuffer_miss(uint pixel_index, vec3 ray_dir, vec3 radiance) {
     path_data.diffuse_ray_direction_hit_distance = vec4(normalize(ray_dir), 0.0);
     path_data.specular_ray_direction_hit_distance = vec4(normalize(ray_dir), 0.0);
     path_data.emissive_residual = vec4(0.0);
+    path_data.restir_gi_fallback_reactive = vec4(0.0);
     path_data_buffer[pixel_index] = path_data;
 }
 
@@ -142,6 +143,7 @@ void write_primary_gbuffer_hit(uint pixel_index, WavefrontHit hit, Material mate
     path_data.diffuse_ray_direction_hit_distance = vec4(camera_ray_dir, depth);
     path_data.specular_ray_direction_hit_distance = vec4(camera_ray_dir, 65504.0);
     path_data.emissive_residual = vec4(0.0);
+    path_data.restir_gi_fallback_reactive = vec4(0.0);
     path_data_buffer[pixel_index] = path_data;
 }
 
@@ -223,10 +225,11 @@ RestirGiReservoir wavefront_empty_restir_gi_reservoir() {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.hit_position_target_pdf = vec4(0.0);
     reservoir.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
+    reservoir.suffix_radiance_source_pdf = vec4(0.0);
+    reservoir.source_direction_distance = vec4(0.0);
 #endif
     reservoir.radiance_weight_sum = vec4(0.0);
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    reservoir.receiver_position_hit_distance = vec4(0.0);
     reservoir.metadata = uvec4(0u);
 #else
     reservoir.metadata = uvec4(
@@ -254,7 +257,10 @@ RestirGiReservoir wavefront_make_restir_gi_candidate(
     float target_pdf = max(luminance(radiance), 1.0e-4);
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.hit_position_target_pdf.xyz = hit.position_t.xyz;
-    reservoir.receiver_position_hit_distance.xyz = receiver_position;
+    vec3 source_delta = hit.position_t.xyz - receiver_position;
+    reservoir.source_direction_distance = vec4(
+        normalize(source_delta),
+        min(length(source_delta), 65504.0));
 #endif
     restir_gi_set_hit_distance_target_pdf(reservoir, min(hit.position_t.w, 65504.0), target_pdf);
     restir_gi_set_normal(reservoir, normal);

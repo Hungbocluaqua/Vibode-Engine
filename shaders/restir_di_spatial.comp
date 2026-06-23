@@ -1,7 +1,12 @@
-#version 450
+#version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_ARB_shading_language_packing : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 #define RTV_STBN_TEXTURE_ENABLED 1
+#define RTV_RESTIR_DI_ENABLE_RAY_QUERY 1
+layout(set = 0, binding = 10) uniform accelerationStructureEXT topLevelAS;
 #include "blue_noise.glsl"
 #include "restir_di_common.glsl"
 
@@ -22,16 +27,7 @@ layout(set = 0, binding = 2, std430) writeonly buffer SpatialReservoirs {
 
 // Counter buffer
 layout(set = 0, binding = 3, std430) buffer Counters {
-    uint spatial_pixels_processed;
-    uint spatial_neighbors_tested;
-    uint spatial_neighbors_accepted;
-    uint spatial_surface_rejected;
-    uint spatial_target_rejected;
-    uint spatial_visibility_rejected;
-    uint spatial_selected_center;
-    uint spatial_selected_neighbor;
-    uint spatial_clamped;
-    uint spatial_rounds_executed;
+    uint values[];
 } counters;
 
 layout(set = 0, binding = 4, std140) uniform Params {
@@ -52,23 +48,31 @@ layout(set = 0, binding = 4, std140) uniform Params {
     float lumClampNeighborMaxFactor;
     float fireflyClamp;
     float productionClampLuminance;
-    uint useFallbackInitial;
+    uint mode;
     uint spatialResultValid;
-    uint padding0;
-    uint padding1;
+    uint visibilityRayBudget;
+    uint historyValid;
+    uint materialVisibilityFlags;
+    uint counterEnabled;
+    uint rawOutputIsCurrentSample;
+    uint padding2;
 } params;
+
+#define DI_COUNTER_ADD(counter, value) ((params.counterEnabled != 0u) ? atomicAdd(counter, value) : 0u)
 
 // Blue-noise neighbor offset
 ivec2 blue_noise_offset(ivec2 coords, uint roundIndex) {
     vec2 sampleValue = sample_dimension_2d(coords, params.frameIndex, roundIndex, 8u);
     float angle = sampleValue.x * 2.0 * 3.14159265;
-    float r = 0.5 + sampleValue.y * params.spatialRadius;
+    float r = params.spatialRadius * sqrt(sampleValue.y);
     float ca = cos(angle);
     float sa = sin(angle);
-    uint h = sample_dimension_seed(coords, params.frameIndex, roundIndex, 10u);
     ivec2 offset = ivec2(int(floor(ca * r + 0.5)), int(floor(sa * r + 0.5)));
-    offset.x += int(h & 1u);
-    offset.y += int((h >> 1u) & 1u);
+    if (all(equal(offset, ivec2(0)))) {
+        uint h = sample_dimension_seed(coords, params.frameIndex, roundIndex, 10u);
+        const ivec2 cardinal[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+        offset = cardinal[h & 3u];
+    }
     return offset;
 }
 
@@ -79,37 +83,37 @@ void main() {
     }
 
     uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_PIXELS], 1u);
 
     // Load center receiver
     RestirDiReceiver centerReceiver = receivers[pixelIndex];
 
     // Check surface validity
-    uint surfaceFlags = centerReceiver.primitive_mesh_flags.z;
+    uint surfaceFlags = restir_di_receiver_surface_flags(centerReceiver);
     if ((surfaceFlags & (RESTIR_DI_SURFACE_SKY |
                          RESTIR_DI_SURFACE_INVALID |
                          RESTIR_DI_SURFACE_DELTA |
                          RESTIR_DI_SURFACE_ALPHA |
-                         RESTIR_DI_SURFACE_UNLIT)) != 0u) {
+                         RESTIR_DI_SURFACE_UNLIT |
+                         RESTIR_DI_SURFACE_UNSUPPORTED)) != 0u) {
         spatial_reservoirs[pixelIndex] = temporal_reservoirs[pixelIndex];
         return;
     }
 
     // Load center temporal reservoir as starting point
     RestirDiReservoir merged = temporal_reservoirs[pixelIndex];
-    uint rejectionFlags = RESTIR_DI_REJECT_NONE;
+    float mergedMFloat = float(restir_di_m(merged));
+    uint rejectionFlags = restir_di_rejection_flags(merged);
 
-    if (params.enabled == 0u || params.spatialRounds == 0u) {
+    if (params.spatialResultValid == 0u || params.spatialRounds == 0u) {
         spatial_reservoirs[pixelIndex] = merged;
-        atomicAdd(counters.spatial_pixels_processed, 1u);
         return;
     }
-
-    bool centerValid = restir_di_reservoir_valid(merged);
-    float totalWeight = centerValid ? max(restir_di_target(merged), 0.0) * max(restir_di_confidence(merged), 0.05) : 0.0;
 
     float neighborLuminanceSum = 0.0;
     float maxNeighborLum = 0.0;
     uint neighborCount = 0u;
+    bool selectedNeighbor = false;
 
     for (uint roundIndex = 0u; roundIndex < params.spatialRounds; ++roundIndex) {
         ivec2 sampleCoords = coords + blue_noise_offset(coords, roundIndex);
@@ -119,25 +123,40 @@ void main() {
         }
 
         uint sampleIndex = uint(sampleCoords.y) * params.width + uint(sampleCoords.x);
-        atomicAdd(counters.spatial_neighbors_tested, 1u);
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_NEIGHBORS_TESTED], 1u);
 
         // Load neighbor reservoir
         RestirDiReservoir candidate = temporal_reservoirs[sampleIndex];
-        if (!restir_di_reservoir_valid(candidate)) continue;
+
+        // Surface compatibility is independent of whether this proposal found
+        // a non-zero sample. Compatible zero-weight proposals still contribute
+        // to M and therefore to the estimator normalization.
+        RestirDiReceiver neighborReceiver = receivers[sampleIndex];
+        if (!restir_di_surface_compatible(centerReceiver, neighborReceiver, params.normalThreshold, params.depthThreshold)) {
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_SURFACE_REJECTED], 1u);
+            continue;
+        }
+        if (!restir_di_reservoir_valid(candidate)) {
+            mergedMFloat += float(restir_di_m(candidate));
+            continue;
+        }
+        RestirDiLightRecord candidateLight;
+        uint resolvedLightIndex;
+        if (!restir_di_resolve_light(candidate, candidateLight, resolvedLightIndex)) {
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_LIGHT_REJECTED], 1u);
+            continue;
+        }
+        float candidateM = float(restir_di_m(candidate));
+        if (candidateM <= 0.0) {
+            rejectionFlags |= RESTIR_DI_REJECT_NAN;
+            continue;
+        }
 
         // Visibility gate
         if (params.visibilityPolicy == 1u &&
             restir_di_visibility(candidate) == RESTIR_DI_VISIBILITY_OCCLUDED) {
-            atomicAdd(counters.spatial_visibility_rejected, 1u);
-            continue;
-        }
-
-        // Load neighbor receiver
-        RestirDiReceiver neighborReceiver = receivers[sampleIndex];
-
-        // Surface compatibility
-        if (!restir_di_surface_compatible(centerReceiver, neighborReceiver, params.normalThreshold, params.depthThreshold)) {
-            atomicAdd(counters.spatial_surface_rejected, 1u);
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_VISIBILITY_REJECTED], 1u);
+            mergedMFloat += candidateM;
             continue;
         }
 
@@ -145,84 +164,142 @@ void main() {
         vec3 candidateDirection;
         vec3 candidatePosition = candidate.samplePosition_distance.xyz;
         vec3 centerPosition = centerReceiver.worldPosition_depth.xyz;
-        vec3 toLight = candidatePosition - centerPosition;
-        float distToLight = length(toLight);
-        if (distToLight > 1.0e-4) {
-            candidateDirection = toLight / distToLight;
-        } else {
-            candidateDirection = normalize(candidate.sampleDirection_pdf.xyz);
-            distToLight = candidate.samplePosition_distance.w;
+        float distToLight;
+        uint candidateKind = restir_di_light_kind(candidate);
+        vec3 candidateLightNormal = restir_di_light_normal(candidate);
+        if (candidateKind == 4u || candidateKind == 5u) {
+            candidateLightNormal = normalize(vec3(candidateLight.data1.w, candidateLight.data2.w, candidateLight.data3.x));
         }
+        float shiftedPdf = restir_di_pdf_at_receiver(
+            resolvedLightIndex,
+            candidateLight,
+            centerPosition,
+            candidatePosition,
+            candidateLightNormal);
+        vec3 candidateRadiance = restir_di_evaluate_integrand(
+            candidate,
+            centerReceiver,
+            candidateLight,
+            shiftedPdf,
+            candidateDirection,
+            distToLight,
+            candidateLightNormal);
 
         vec3 centerNormal = normalize(centerReceiver.normal_roughness.xyz);
-        float cosAtCenter = max(dot(centerNormal, candidateDirection), 0.0);
-        vec3 candidateRadiance = max(candidate.sampleRadiance_target.rgb, vec3(0.0));
-        float targetAtCenter = restir_di_target_function(candidateRadiance * cosAtCenter);
+
+        // Visibility check in ReferenceValidation mode
+        bool visibilityChecked = false;
+        if (params.visibilityPolicy == 1u && roundIndex < params.visibilityRayBudget &&
+            distToLight > RESTIR_DI_VISIBILITY_EPSILON * 2.0) {
+            float tmax = distToLight - RESTIR_DI_VISIBILITY_EPSILON * 2.0;
+            vec3 shadowOrigin = centerPosition +
+                candidateDirection * RESTIR_DI_VISIBILITY_EPSILON +
+                centerNormal * RESTIR_DI_VISIBILITY_EPSILON;
+            uint visResult = restir_di_ray_query_visible(
+                shadowOrigin,
+                candidateDirection,
+                tmax,
+                params.materialVisibilityFlags);
+            visibilityChecked = true;
+            if (visResult == RESTIR_DI_VISIBILITY_OCCLUDED) {
+                DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_VISIBILITY_REJECTED], 1u);
+                mergedMFloat += candidateM;
+                continue;
+            }
+        }
+
+        float targetAtCenter = restir_di_target_function(candidateRadiance);
 
         if (targetAtCenter <= 1.0e-6) {
-            atomicAdd(counters.spatial_target_rejected, 1u);
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_TARGET_REJECTED], 1u);
+            mergedMFloat += candidateM;
             continue;
         }
 
         // Compute shifted weight
-        float candidateTarget = max(candidate.sampleRadiance_target.w, 1.0e-6);
+        float candidateTarget = max(restir_di_target(candidate), 1.0e-6);
         float candidateWeightSum = restir_di_weight_sum(candidate);
         float shiftedWeight = restir_di_shift_weight(targetAtCenter, candidateTarget, candidateWeightSum);
 
         // Compatibility-weighted weight for reservoir update
-        float candidateConfidence = restir_di_confidence(candidate);
-        float candidateWeight = shiftedWeight * max(candidateConfidence, 0.05);
-        float candidateM = float(restir_di_m(candidate));
+        float candidateWeight = shiftedWeight;
+        if (!(candidateWeight > 0.0) || isnan(candidateWeight) || isinf(candidateWeight)) {
+            rejectionFlags |= RESTIR_DI_REJECT_NAN;
+            continue;
+        }
 
         // Stochastic selection
         float rngValue = sample_dimension_1d(coords, params.frameIndex, roundIndex, 15u);
 
-        restir_di_reservoir_update(merged, candidate, candidateWeight, candidateM, rngValue, rejectionFlags);
+        float reservoirWeightBefore = restir_di_weight_sum(merged);
+        float selectionProbability = candidateWeight / max(reservoirWeightBefore + candidateWeight, 1.0e-8);
+        RestirDiReservoir shiftedCandidate = candidate;
+        restir_di_set_direction(shiftedCandidate, candidateDirection);
+        shiftedCandidate.samplePosition_distance.w = distToLight;
+        restir_di_set_target(shiftedCandidate, targetAtCenter);
+        shiftedCandidate.sampleMetadata.z = (resolvedLightIndex << 8u) | (candidateKind & 0xffu);
+        if (shiftedPdf <= 1.0e-6) {
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_TARGET_REJECTED], 1u);
+            mergedMFloat += candidateM;
+            continue;
+        }
+        restir_di_set_source_pdf(shiftedCandidate, shiftedPdf);
+        restir_di_set_light_normal(shiftedCandidate, candidateLightNormal);
+        restir_di_set_visibility(shiftedCandidate, visibilityChecked
+            ? RESTIR_DI_VISIBILITY_VISIBLE
+            : RESTIR_DI_VISIBILITY_UNKNOWN);
+
+        if (!restir_di_reservoir_update(merged, shiftedCandidate, candidateWeight, candidateM, rngValue, rejectionFlags)) {
+            continue;
+        }
+        mergedMFloat += candidateM;
+        if (rngValue < selectionProbability) {
+            selectedNeighbor = true;
+        }
 
         neighborLuminanceSum += targetAtCenter;
         maxNeighborLum = max(maxNeighborLum, targetAtCenter);
         neighborCount += 1u;
-        atomicAdd(counters.spatial_neighbors_accepted, 1u);
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_NEIGHBORS_ACCEPTED], 1u);
 
-        // Track selection
-        if (rngValue < candidateWeight / max(totalWeight + candidateWeight, 1.0e-8)) {
-            atomicAdd(counters.spatial_selected_neighbor, 1u);
-            // Update candidate direction to center
-            merged.sampleDirection_pdf.xyz = candidateDirection;
-            merged.sampleRadiance_target.w = targetAtCenter;
-        } else {
-            atomicAdd(counters.spatial_selected_center, 1u);
-        }
-
-        totalWeight += candidateWeight;
     }
 
+    float cappedMergedM = min(mergedMFloat, float(max(params.spatialMaxM, 1u)));
+    if (mergedMFloat > cappedMergedM) {
+        float massScale = cappedMergedM / max(mergedMFloat, 1.0);
+        restir_di_set_weight_sum(merged, restir_di_weight_sum(merged) * massScale);
+    }
+    restir_di_set_m(merged, uint(clamp(ceil(cappedMergedM), 0.0, 255.0)));
+
     // Production stabilization: clamp against neighbors
-    if (neighborCount > 0u && restir_di_reservoir_valid(merged)) {
+    if (params.temporalLuminanceLimitFactor > 0.0 &&
+        neighborCount > 0u && restir_di_reservoir_valid(merged)) {
         float neighborAvgLum = neighborLuminanceSum / float(neighborCount);
         float mergedLum = restir_di_target(merged);
         float lumCap = max(max(neighborAvgLum * params.lumClampNeighborAvgFactor,
                                maxNeighborLum * params.lumClampNeighborMaxFactor), 0.05);
-
-        if (mergedLum > lumCap && lumCap > 0.0) {
-            float scale = lumCap / max(mergedLum, 1.0e-8);
-            merged.sampleRadiance_target.rgb *= scale;
-            merged.sampleRadiance_target.w *= scale;
-            atomicAdd(counters.spatial_clamped, 1u);
+        if (mergedLum > lumCap && mergedLum > 1.0e-6) {
+            float capScale = lumCap / mergedLum;
+            restir_di_set_weight_sum(merged, restir_di_weight_sum(merged) * capScale);
             rejectionFlags |= RESTIR_DI_REJECT_CLAMPED;
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_CLAMPED], 1u);
         }
 
         // Confidence decay
-        merged.contribution_confidence.w = clamp(restir_di_confidence(merged) * params.confidenceDecay, 0.0, 1.0);
+        restir_di_set_confidence(merged, restir_di_confidence(merged) * params.confidenceDecay);
     }
 
     // Set rejection flags
-    merged.reservoirMetadata.w = rejectionFlags;
+    restir_di_set_rejection_flags(merged, rejectionFlags);
 
     // Preserve validity
     restir_di_set_valid(merged, restir_di_reservoir_valid(merged));
 
     spatial_reservoirs[pixelIndex] = merged;
-    atomicAdd(counters.spatial_pixels_processed, 1u);
-    atomicAdd(counters.spatial_rounds_executed, params.spatialRounds);
+    if (neighborCount > 0u) {
+        DI_COUNTER_ADD(counters.values[selectedNeighbor
+            ? RESTIR_DI_COUNTER_SPATIAL_SELECTED_NEIGHBOR
+            : RESTIR_DI_COUNTER_SPATIAL_SELECTED_CENTER], 1u);
+    }
+    DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_ROUNDS], params.spatialRounds);
 }

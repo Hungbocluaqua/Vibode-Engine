@@ -1,0 +1,152 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "restir_gi_common.glsl"
+#include "restir_gi_prod_packing.glsl"
+#include "restir_gi_reconnection.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer HalfResSpatialReservoirs { ProdRestirGiReservoir half_spatial[]; };
+layout(set = 0, binding = 1, std430) buffer FullResReservoirs { ProdRestirGiReservoir full_reservoirs[]; };
+layout(set = 0, binding = 2, std430) readonly buffer FullResReceivers { RestirGiReceiver receivers[]; };
+layout(set = 0, binding = 3, std430) readonly buffer HalfResCurrentReservoirs { ProdRestirGiReservoir half_current[]; };
+layout(set = 0, binding = 4, std430) buffer RestirGiCounterBuffer { uint restir_gi_counters[]; };
+layout(set = 0, binding = 5, std430) readonly buffer ActiveTileMask { uint active_tile_mask[]; };
+
+const uint GI_COUNTER_UPSAMPLE_PIXELS = 22u;
+const uint GI_COUNTER_UPSAMPLE_ACCEPTED = 23u;
+const uint GI_COUNTER_UPSAMPLE_FALLBACK = 24u;
+
+layout(push_constant, std430) uniform PushConstants {
+    uint fullWidth;
+    uint fullHeight;
+    uint halfWidth;
+    uint halfHeight;
+    uint frameIndex;
+    float depthThresholdScale;
+    float normalThreshold;
+    uint flags;
+    vec4 cameraPosition;
+} pc;
+
+#define GI_UPSAMPLE_BILATERAL_ENABLED ((pc.flags & 1u) != 0u)
+#define GI_COUNTER_ADD(counter, value) (((pc.flags & 2u) != 0u) ? atomicAdd(counter, value) : 0u)
+#define GI_ACTIVE_TILE_MASK_ENABLED ((pc.flags & 4u) != 0u)
+
+const uint GI_ACTIVE_TILE_SIZE = 16u;
+
+bool active_tile_contains(ivec2 fullPixel) {
+    if (!GI_ACTIVE_TILE_MASK_ENABLED) return true;
+    uint tileColumns = (pc.fullWidth + GI_ACTIVE_TILE_SIZE - 1u) / GI_ACTIVE_TILE_SIZE;
+    uint tileIndex = uint(fullPixel.y) / GI_ACTIVE_TILE_SIZE * tileColumns +
+        uint(fullPixel.x) / GI_ACTIVE_TILE_SIZE;
+    return active_tile_mask[tileIndex] != 0u;
+}
+
+uint full_index(ivec2 p) { return uint(p.y) * pc.fullWidth + uint(p.x); }
+uint half_index(ivec2 p) { return uint(p.y) * pc.halfWidth + uint(p.x); }
+
+float random01(uint index, uint dimension) {
+    uint h = restir_gi_hash_u32(index ^ (pc.frameIndex * 0x9e3779b9u) ^ dimension * 0x85ebca6bu);
+    return float(h & 0x00ffffffu) / 16777216.0;
+}
+
+ivec2 representative_full_pixel(ivec2 halfPixel) {
+    ivec2 phase = ivec2(int(pc.frameIndex & 1u), int((pc.frameIndex >> 1u) & 1u));
+    return min(halfPixel * 2 + phase, ivec2(int(pc.fullWidth) - 1, int(pc.fullHeight) - 1));
+}
+
+float compatibility(RestirGiReceiver center, RestirGiReceiver representative, ivec2 fullPixel, ivec2 halfPixel) {
+    if (!restir_gi_receiver_valid_for_reuse(center) || !restir_gi_receiver_valid_for_reuse(representative)) return 0.0;
+    float depthScale = max(abs(restir_gi_receiver_depth(center)), 1.0e-3);
+    float depthDelta = abs(restir_gi_receiver_depth(center) - restir_gi_receiver_depth(representative));
+    float depthWeight = exp(-depthDelta / max(pc.depthThresholdScale * depthScale, 1.0e-5));
+    float normalDot = clamp(dot(restir_gi_receiver_normal(center), restir_gi_receiver_normal(representative)), 0.0, 1.0);
+    float normalWeight = normalDot < pc.normalThreshold ? 0.0 : smoothstep(pc.normalThreshold, 1.0, normalDot);
+    vec2 sampleCenter = vec2(halfPixel * 2) + vec2(0.5);
+    float spatialWeight = exp(-dot(vec2(fullPixel) - sampleCenter, vec2(fullPixel) - sampleCenter) / 8.0);
+    return depthWeight * normalWeight * spatialWeight;
+}
+
+void main() {
+    ivec2 fullPixel = ivec2(gl_GlobalInvocationID.xy);
+    if (fullPixel.x >= int(pc.fullWidth) || fullPixel.y >= int(pc.fullHeight)) return;
+    uint outputIndex = full_index(fullPixel);
+    if (!active_tile_contains(fullPixel)) {
+        full_reservoirs[outputIndex] = prod_empty_reservoir();
+        return;
+    }
+    GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_UPSAMPLE_PIXELS], 1u);
+    RestirGiReceiver center = receivers[outputIndex];
+    if (!restir_gi_receiver_valid_for_reuse(center)) {
+        full_reservoirs[outputIndex] = prod_empty_reservoir();
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_UPSAMPLE_FALLBACK], 1u);
+        return;
+    }
+
+    ivec2 centerHalf = clamp(fullPixel / 2, ivec2(0), ivec2(int(pc.halfWidth) - 1, int(pc.halfHeight) - 1));
+    ProdRestirGiReservoir selected = prod_empty_reservoir();
+    float totalWeight = 0.0;
+    float totalM = 0.0;
+    uint dimension = 0u;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 hp = centerHalf + ivec2(x, y);
+            if (hp.x < 0 || hp.y < 0 || hp.x >= int(pc.halfWidth) || hp.y >= int(pc.halfHeight)) {
+                ++dimension;
+                continue;
+            }
+            ProdRestirGiReservoir candidate = half_spatial[half_index(hp)];
+            if (!prod_reservoir_reusable(candidate)) { ++dimension; continue; }
+            RestirGiReceiver representative = receivers[full_index(representative_full_pixel(hp))];
+            float bilateral = GI_UPSAMPLE_BILATERAL_ENABLED
+                ? compatibility(center, representative, fullPixel, hp) : 1.0;
+            float sourceTarget = prod_unpack_target(candidate);
+            vec3 direction;
+            float distance;
+            if (bilateral <= 0.0 || !restir_gi_reconnect_sample(candidate, center, pc.cameraPosition.xyz, direction, distance)) {
+                ++dimension;
+                continue;
+            }
+            float selectionWeight = bilateral * prod_shifted_reservoir_weight(
+                candidate, sourceTarget, prod_unpack_target(candidate));
+            if (!restir_gi_finite(selectionWeight) || selectionWeight <= 0.0) {
+                ++dimension;
+                continue;
+            }
+            float nextTotal = totalWeight + selectionWeight;
+            if (random01(outputIndex, dimension++) < selectionWeight / max(nextTotal, 1.0e-10)) selected = candidate;
+            totalWeight = nextTotal;
+            totalM += prod_unpack_sample_count(candidate) * bilateral;
+        }
+    }
+
+    if (!prod_reservoir_reusable(selected)) {
+        ProdRestirGiReservoir fallback = half_current[half_index(centerHalf)];
+        float sourceTarget = prod_unpack_target(fallback);
+        vec3 direction;
+        float distance;
+        if (prod_reservoir_reusable(fallback) &&
+            restir_gi_reconnect_sample(fallback, center, pc.cameraPosition.xyz, direction, distance)) {
+            float shiftedWeight = prod_shifted_reservoir_weight(
+                fallback, sourceTarget, prod_unpack_target(fallback));
+            prod_finalize_mass(fallback, shiftedWeight, prod_unpack_sample_count(fallback));
+            selected = fallback;
+        } else {
+            selected = prod_empty_reservoir();
+        }
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_UPSAMPLE_FALLBACK], 1u);
+    } else {
+        prod_finalize_mass(selected, totalWeight, totalM);
+        uint flags = (prod_unpack_flags(selected) | PROD_FLAG_VALID | PROD_FLAG_FINALIZED) &
+            ~(PROD_FLAG_VISIBILITY_KNOWN | PROD_FLAG_RECONNECTED_VISIBILITY);
+        prod_set_meta(selected, prod_unpack_age(selected), flags,
+            prod_unpack_path_class(selected), prod_unpack_confidence(selected));
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_UPSAMPLE_ACCEPTED], 1u);
+    }
+    uint finalFlags = prod_unpack_flags(selected) &
+        ~(PROD_FLAG_VISIBILITY_KNOWN | PROD_FLAG_RECONNECTED_VISIBILITY);
+    prod_set_meta(selected, prod_unpack_age(selected), finalFlags,
+        prod_unpack_path_class(selected), prod_unpack_confidence(selected));
+    full_reservoirs[outputIndex] = selected;
+}

@@ -217,6 +217,7 @@ struct CachedInstanceBoundsRecord {
 
 struct CachedLightRecord {
     glm::uvec4 metadata{};
+    glm::uvec4 identity{};
     glm::vec4 data0{};
     glm::vec4 data1{};
     glm::vec4 data2{};

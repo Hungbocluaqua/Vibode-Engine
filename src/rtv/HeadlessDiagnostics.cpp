@@ -30,6 +30,59 @@
 
 namespace rtv {
 
+namespace {
+
+bool isRestirGiExportView(RendererDebugView view) {
+    return view == RendererDebugView::RestirGiValidity ||
+        view == RendererDebugView::RestirGiAge ||
+        view == RendererDebugView::RestirGiInitial ||
+        view == RendererDebugView::RestirGiTemporal ||
+        view == RendererDebugView::RestirGiSpatial ||
+        view == RendererDebugView::RestirGiFinal ||
+        view == RendererDebugView::RestirGiNormal ||
+        view == RendererDebugView::RestirGiHitDistance ||
+        view == RendererDebugView::RestirGiGrid ||
+        view == RendererDebugView::RestirGiPathClass ||
+        view == RendererDebugView::WavefrontRestirGi;
+}
+
+bool isRestirDiExportView(RendererDebugView view) {
+    return view == RendererDebugView::RestirDiSelectedLight ||
+        view == RendererDebugView::RestirDiTarget ||
+        view == RendererDebugView::RestirDiSourcePdf ||
+        view == RendererDebugView::RestirDiVisibility ||
+        view == RendererDebugView::RestirDiRejectionReason ||
+        view == RendererDebugView::RestirDiTemporalAcceptance ||
+        view == RendererDebugView::RestirDiSpatialAcceptance ||
+        view == RendererDebugView::RestirDiFinalContribution ||
+        view == RendererDebugView::RestirDiReceiverPosition ||
+        view == RendererDebugView::RestirDiReceiverNormal ||
+        view == RendererDebugView::RestirDiLightVersion ||
+        view == RendererDebugView::RestirDiInitialReservoir ||
+        view == RendererDebugView::RestirDiTemporalReservoir ||
+        view == RendererDebugView::RestirDiSpatialReservoir ||
+        view == RendererDebugView::RestirDiFinalReservoir ||
+        view == RendererDebugView::RestirDiWeightSum ||
+        view == RendererDebugView::RestirDiM ||
+        view == RendererDebugView::RestirDiLightClass ||
+        view == RendererDebugView::RestirDiAge ||
+        view == RendererDebugView::RestirDiConfidence ||
+        view == RendererDebugView::RestirDiReferenceDiff ||
+        view == RendererDebugView::WavefrontRestirDi;
+}
+
+bool shouldExportDebugViewForSettings(const RendererSettings& settings, RendererDebugView view) {
+    if (settings.restirGiMode == RestirGiMode::Off && isRestirGiExportView(view)) {
+        return false;
+    }
+    if (settings.restirDiMode == RestirDiMode::Off && isRestirDiExportView(view)) {
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 void to_json(nlohmann::json& j, const ProfileReport::Resolution& r) {
     j["render_extent"] = {{"width", r.renderWidth}, {"height", r.renderHeight}};
     j["display_extent"] = {{"width", r.displayWidth}, {"height", r.displayHeight}};
@@ -48,10 +101,18 @@ void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
     j["path_trace"] = p.pathTrace;
     j["restir_history_clear"] = p.restirHistoryClear;
     j["restir_gi_clear"] = p.restirGiClear;
+    j["restir_gi_temporal"] = p.restirGiTemporal;
     j["restir_spatial"] = p.restirSpatial;
     j["restir_spatial_copy"] = p.restirSpatialCopy;
     j["restir_gi_spatial"] = p.restirGiSpatial;
+    j["restir_gi_upsample"] = p.restirGiUpsample;
     j["restir_gi_final"] = p.restirGiFinal;
+    j["restir_gi_counters_readback"] = p.restirGiCountersReadback;
+    j["restir_di_temporal"] = p.restirDiTemporal;
+    j["restir_di_spatial"] = p.restirDiSpatial;
+    j["restir_di_final"] = p.restirDiFinal;
+    j["restir_di_history_copy"] = p.restirDiHistoryCopy;
+    j["restir_di_counters_readback"] = p.restirDiCountersReadback;
     j["fog_integrate"] = p.fogIntegrate;
     j["atmosphere"] = p.atmosphere;
     j["atmosphere_transmittance"] = p.atmosphereTransmittance;
@@ -467,6 +528,7 @@ void to_json(nlohmann::json& j, const ProfileReport::RayTracingGeometryReport& s
     j["blas_alpha_tested_geometry_count"] = s.blasAlphaTestedGeometryCount;
     j["blas_blended_geometry_count"] = s.blasBlendedGeometryCount;
     j["blas_opacity_micromap_geometry_count"] = s.blasOpacityMicromapGeometryCount;
+    j["blas_build_batch_count"] = s.blasBuildBatchCount;
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::AnimatedGeometryReport& s) {
@@ -815,11 +877,27 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryReport& m) {
     j["temporal_history_bytes"] = m.temporalHistoryBytes;
     j["restir_reservoir_bytes"] = m.restirReservoirBytes;
     j["restir_di_current_bytes"] = m.restirDiCurrentBytes;
+    j["restir_di_initial_bytes"] = m.restirDiInitialBytes;
+    j["restir_di_temporal_bytes"] = m.restirDiTemporalBytes;
     j["restir_di_previous_bytes"] = m.restirDiPreviousBytes;
     j["restir_di_spatial_bytes"] = m.restirDiSpatialBytes;
+    j["restir_di_final_bytes"] = m.restirDiFinalBytes;
+    j["restir_di_receiver_bytes"] = m.restirDiReceiverBytes;
+    j["restir_di_previous_receiver_bytes"] = m.restirDiPreviousReceiverBytes;
+    j["restir_di_counters_bytes"] = m.restirDiCountersBytes;
+    j["restir_di_physical_bytes"] = m.restirDiPhysicalBytes;
+    j["restir_di_alias_savings_bytes"] = m.restirDiAliasSavingsBytes;
     j["restir_gi_current_bytes"] = m.restirGiCurrentBytes;
     j["restir_gi_previous_bytes"] = m.restirGiPreviousBytes;
     j["restir_gi_spatial_bytes"] = m.restirGiSpatialBytes;
+    j["restir_gi_production_temporal_bytes"] = m.restirGiProductionTemporalBytes;
+    j["restir_gi_production_spatial_bytes"] = m.restirGiProductionSpatialBytes;
+    j["restir_gi_production_previous_bytes"] = m.restirGiProductionPreviousBytes;
+    j["restir_gi_production_upsampled_bytes"] = m.restirGiProductionUpsampledBytes;
+    j["restir_gi_active_tile_mask_bytes"] = m.restirGiActiveTileMaskBytes;
+    j["restir_gi_counters_bytes"] = m.restirGiCountersBytes;
+    j["restir_gi_receiver_bytes"] = m.restirGiReceiverBytes;
+    j["restir_gi_previous_receiver_bytes"] = m.restirGiPreviousReceiverBytes;
     j["staging_upload_total_bytes"] = m.stagingUploadTotalBytes;
     j["staging_upload_peak_bytes"] = m.stagingUploadPeakBytes;
     j["staging_upload_last_bytes"] = m.stagingUploadLastBytes;
@@ -947,7 +1025,23 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["max_bounces"] = s.maxBounces;
     j["atrous_iterations"] = s.atrousIterations;
     j["restir_mode"] = restirModeName(s.restirMode);
+    j["restir_di_mode"] = restirDiModeName(s.restirDiMode);
+    j["restir_di_layout"] = restirDiReservoirLayoutName(s.restirDiReservoirLayout);
+    j["restir_di_temporal_enabled"] = s.restirDiTemporalEnabled;
+    j["restir_di_spatial_enabled"] = s.restirDiSpatialEnabled;
+    j["restir_di_final_visibility_enabled"] = s.restirDiFinalVisibilityEnabled;
+    j["restir_di_spatial_rounds"] = s.restirDiSpatialRounds;
+    j["restir_di_spatial_radius"] = s.restirDiSpatialRadius;
+    j["restir_di_temporal_max_age"] = s.restirDiTemporalMaxAge;
+    j["restir_di_max_m"] = s.restirDiMaxM;
+    j["restir_di_visibility_ray_budget"] = s.restirDiVisibilityRayBudget;
+    j["restir_di_stabilization_enabled"] = s.restirDiProductionStabilizationEnabled;
+    j["restir_di_clamp_luminance"] = s.restirDiClampLuminance;
+    j["restir_di_include_sun"] = s.restirDiIncludeSun;
+    j["restir_di_include_environment"] = s.restirDiIncludeEnvironment;
     j["restir_gi_enabled"] = s.restirGiEnabled;
+    j["restir_gi_mode"] = restirGiModeName(s.restirGiMode);
+    j["restir_gi_layout"] = restirGiReservoirLayoutName(s.restirGiReservoirLayout);
     j["tone_mapper"] = toneMapperName(s.toneMapper);
     j["exposure"] = s.exposure;
     j["render_resolution_scale"] = s.renderResolutionScale;
@@ -1019,6 +1113,11 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["restir_gi_half_resolution"] = s.restirGiHalfResolution;
     j["restir_gi_visibility_ray_budget"] = s.restirGiVisibilityRayBudget;
     j["restir_gi_final_stabilization_enabled"] = s.restirGiFinalStabilizationEnabled;
+    j["restir_gi_min_final_blend_strength"] = s.restirGiMinFinalBlendStrength;
+    j["restir_gi_active_tile_mask_mode"] = restirGiActiveTileMaskModeName(s.restirGiActiveTileMaskMode);
+    j["restir_history_copy_mode_requested"] = restirHistoryCopyModeName(s.restirHistoryCopyMode);
+    j["restir_counter_mode"] = s.restirCounterMode == RestirCounterMode::On ? "on"
+        : s.restirCounterMode == RestirCounterMode::Off ? "off" : "auto";
     j["adaptive_quality_mode"] = s.adaptiveQualityMode == AdaptiveQualityMode::Off ? "off"
         : s.adaptiveQualityMode == AdaptiveQualityMode::Conservative ? "conservative"
         : s.adaptiveQualityMode == AdaptiveQualityMode::Balanced ? "balanced" : "aggressive";
@@ -1110,10 +1209,18 @@ GpuFrameTimings percentileGpuTimings(
     result.pathTraceMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::pathTraceMs, percentile);
     result.restirHistoryClearMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirHistoryClearMs, percentile);
     result.restirGiClearMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiClearMs, percentile);
+    result.restirGiTemporalMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiTemporalMs, percentile);
     result.restirSpatialMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirSpatialMs, percentile);
     result.restirSpatialCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirSpatialCopyMs, percentile);
     result.restirGiSpatialMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiSpatialMs, percentile);
+    result.restirGiUpsampleMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiUpsampleMs, percentile);
     result.restirGiFinalMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiFinalMs, percentile);
+    result.restirGiCountersReadbackMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiCountersReadbackMs, percentile);
+    result.restirDiTemporalMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirDiTemporalMs, percentile);
+    result.restirDiSpatialMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirDiSpatialMs, percentile);
+    result.restirDiFinalMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirDiFinalMs, percentile);
+    result.restirDiHistoryCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirDiHistoryCopyMs, percentile);
+    result.restirDiCountersReadbackMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirDiCountersReadbackMs, percentile);
     result.fogIntegrateMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::fogIntegrateMs, percentile);
     result.atmosphereMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereMs, percentile);
     result.atmosphereTransmittanceMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereTransmittanceMs, percentile);
@@ -1164,10 +1271,18 @@ void assignPerPassGpuMs(ProfileReport::PerPassGpuMs& out, const GpuFrameTimings&
     out.pathTrace = timings.pathTraceMs;
     out.restirHistoryClear = timings.restirHistoryClearMs;
     out.restirGiClear = timings.restirGiClearMs;
+    out.restirGiTemporal = timings.restirGiTemporalMs;
     out.restirSpatial = timings.restirSpatialMs;
     out.restirSpatialCopy = timings.restirSpatialCopyMs;
     out.restirGiSpatial = timings.restirGiSpatialMs;
+    out.restirGiUpsample = timings.restirGiUpsampleMs;
     out.restirGiFinal = timings.restirGiFinalMs;
+    out.restirGiCountersReadback = timings.restirGiCountersReadbackMs;
+    out.restirDiTemporal = timings.restirDiTemporalMs;
+    out.restirDiSpatial = timings.restirDiSpatialMs;
+    out.restirDiFinal = timings.restirDiFinalMs;
+    out.restirDiHistoryCopy = timings.restirDiHistoryCopyMs;
+    out.restirDiCountersReadback = timings.restirDiCountersReadbackMs;
     out.fogIntegrate = timings.fogIntegrateMs;
     out.atmosphere = timings.atmosphereMs;
     out.atmosphereTransmittance = timings.atmosphereTransmittanceMs;
@@ -1220,10 +1335,18 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
         result.pathTraceMs += values[i].pathTraceMs;
         result.restirHistoryClearMs += values[i].restirHistoryClearMs;
         result.restirGiClearMs += values[i].restirGiClearMs;
+        result.restirGiTemporalMs += values[i].restirGiTemporalMs;
         result.restirSpatialMs += values[i].restirSpatialMs;
         result.restirSpatialCopyMs += values[i].restirSpatialCopyMs;
         result.restirGiSpatialMs += values[i].restirGiSpatialMs;
+        result.restirGiUpsampleMs += values[i].restirGiUpsampleMs;
         result.restirGiFinalMs += values[i].restirGiFinalMs;
+        result.restirGiCountersReadbackMs += values[i].restirGiCountersReadbackMs;
+        result.restirDiTemporalMs += values[i].restirDiTemporalMs;
+        result.restirDiSpatialMs += values[i].restirDiSpatialMs;
+        result.restirDiFinalMs += values[i].restirDiFinalMs;
+        result.restirDiHistoryCopyMs += values[i].restirDiHistoryCopyMs;
+        result.restirDiCountersReadbackMs += values[i].restirDiCountersReadbackMs;
         result.fogIntegrateMs += values[i].fogIntegrateMs;
         result.atmosphereMs += values[i].atmosphereMs;
         result.atmosphereTransmittanceMs += values[i].atmosphereTransmittanceMs;
@@ -1266,10 +1389,18 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
     result.pathTraceMs *= invCount;
     result.restirHistoryClearMs *= invCount;
     result.restirGiClearMs *= invCount;
+    result.restirGiTemporalMs *= invCount;
     result.restirSpatialMs *= invCount;
     result.restirSpatialCopyMs *= invCount;
     result.restirGiSpatialMs *= invCount;
+    result.restirGiUpsampleMs *= invCount;
     result.restirGiFinalMs *= invCount;
+    result.restirGiCountersReadbackMs *= invCount;
+    result.restirDiTemporalMs *= invCount;
+    result.restirDiSpatialMs *= invCount;
+    result.restirDiFinalMs *= invCount;
+    result.restirDiHistoryCopyMs *= invCount;
+    result.restirDiCountersReadbackMs *= invCount;
     result.fogIntegrateMs *= invCount;
     result.atmosphereMs *= invCount;
     result.atmosphereTransmittanceMs *= invCount;
@@ -1563,6 +1694,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.rayTracingGeometry.blasAlphaTestedGeometryCount = rtStats.blasGeometry.alphaTestedGeometryCount;
     profileReport_.rayTracingGeometry.blasBlendedGeometryCount = rtStats.blasGeometry.blendedGeometryCount;
     profileReport_.rayTracingGeometry.blasOpacityMicromapGeometryCount = rtStats.blasGeometry.opacityMicromapGeometryCount;
+    profileReport_.rayTracingGeometry.blasBuildBatchCount = rtStats.blasGeometry.buildBatchCount;
 
     const AnimatedGeometryStats& animatedGeometry = app.latestAnimatedGeometryStats();
     profileReport_.animatedGeometry.meshInstanceCount = animatedGeometry.meshInstanceCount;
@@ -2182,11 +2314,27 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.restirReservoirBytes = static_cast<uint64_t>(renderer->restirReservoirMemory());
     const auto reservoirBreakdown = renderer->restirReservoirMemoryBreakdown();
     profileReport_.memory.restirDiCurrentBytes = static_cast<uint64_t>(reservoirBreakdown.diCurrentBytes);
+    profileReport_.memory.restirDiInitialBytes = static_cast<uint64_t>(reservoirBreakdown.diInitialBytes);
+    profileReport_.memory.restirDiTemporalBytes = static_cast<uint64_t>(reservoirBreakdown.diTemporalBytes);
     profileReport_.memory.restirDiPreviousBytes = static_cast<uint64_t>(reservoirBreakdown.diPreviousBytes);
     profileReport_.memory.restirDiSpatialBytes = static_cast<uint64_t>(reservoirBreakdown.diSpatialBytes);
+    profileReport_.memory.restirDiFinalBytes = static_cast<uint64_t>(reservoirBreakdown.diFinalBytes);
+    profileReport_.memory.restirDiReceiverBytes = static_cast<uint64_t>(reservoirBreakdown.diReceiverBytes);
+    profileReport_.memory.restirDiPreviousReceiverBytes = static_cast<uint64_t>(reservoirBreakdown.diPreviousReceiverBytes);
+    profileReport_.memory.restirDiCountersBytes = static_cast<uint64_t>(reservoirBreakdown.diCountersBytes);
+    profileReport_.memory.restirDiPhysicalBytes = static_cast<uint64_t>(reservoirBreakdown.diPhysicalBytes);
+    profileReport_.memory.restirDiAliasSavingsBytes = static_cast<uint64_t>(reservoirBreakdown.diAliasSavingsBytes);
     profileReport_.memory.restirGiCurrentBytes = static_cast<uint64_t>(reservoirBreakdown.giCurrentBytes);
     profileReport_.memory.restirGiPreviousBytes = static_cast<uint64_t>(reservoirBreakdown.giPreviousBytes);
     profileReport_.memory.restirGiSpatialBytes = static_cast<uint64_t>(reservoirBreakdown.giSpatialBytes);
+    profileReport_.memory.restirGiProductionTemporalBytes = static_cast<uint64_t>(reservoirBreakdown.giProductionTemporalBytes);
+    profileReport_.memory.restirGiProductionSpatialBytes = static_cast<uint64_t>(reservoirBreakdown.giProductionSpatialBytes);
+    profileReport_.memory.restirGiProductionPreviousBytes = static_cast<uint64_t>(reservoirBreakdown.giProductionPreviousBytes);
+    profileReport_.memory.restirGiProductionUpsampledBytes = static_cast<uint64_t>(reservoirBreakdown.giProductionUpsampledBytes);
+    profileReport_.memory.restirGiActiveTileMaskBytes = static_cast<uint64_t>(reservoirBreakdown.giActiveTileMaskBytes);
+    profileReport_.memory.restirGiCountersBytes = static_cast<uint64_t>(reservoirBreakdown.giCountersBytes);
+    profileReport_.memory.restirGiReceiverBytes = static_cast<uint64_t>(reservoirBreakdown.giReceiverBytes);
+    profileReport_.memory.restirGiPreviousReceiverBytes = static_cast<uint64_t>(reservoirBreakdown.giPreviousReceiverBytes);
     if (auto* uploader = app.bufferUploader()) {
         const auto& uploadStats = uploader->stats();
         profileReport_.memory.stagingUploadTotalBytes = uploadStats.totalUploadedBytes;
@@ -2282,6 +2430,11 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.validationErrorCount = 0;
 
     profileReport_.settings = renderer->settings();
+    profileReport_.effectiveRestirHistoryCopyMode = renderer->effectiveRestirHistoryCopyMode();
+    profileReport_.effectiveRestirGiActiveTileMaskEnabled = renderer->effectiveRestirGiActiveTileMaskEnabled();
+    if (const char* reason = renderer->restirHistoryCopyFallbackReason()) {
+        profileReport_.restirHistoryCopyFallbackReason = reason;
+    }
     const auto nvidiaStatus = renderer->nvidiaIntegrationStatus();
     profileReport_.nvidiaIntegrations.nrdSdkConfigured = nvidiaStatus.nrdSdkConfigured;
     profileReport_.nvidiaIntegrations.nrdRequestable = nvidiaStatus.nrdRequestable;
@@ -2397,6 +2550,15 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
         profileReport_.warnings.push_back("DLSS Frame Generation requested but unavailable: " + nvidiaStatus.dlssFrameGenerationUnavailableReason);
     }
 
+    // Read back DI counters if available
+    if (auto* diCounters = renderer->restirDiCounterData()) {
+        profileReport_.restirDiCounters.assign(diCounters, diCounters + 64);
+    }
+    if (auto* giCounters = renderer->restirGiCounterData()) {
+        profileReport_.restirGiCounters.assign(giCounters, giCounters + 64);
+    }
+    profileReport_.restirDiHistoryValid = renderer->restirDiHistoryValid();
+
     return profileReport_;
 }
 
@@ -2449,6 +2611,425 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         })},
     };
     j["memory"] = profileReport_.memory;
+    j["restir_di_counters"] = profileReport_.restirDiCounters;
+    j["restir_gi_counters"] = profileReport_.restirGiCounters;
+    auto diCounter = [this](size_t index) -> uint64_t {
+        return index < profileReport_.restirDiCounters.size()
+            ? static_cast<uint64_t>(profileReport_.restirDiCounters[index])
+            : 0ull;
+    };
+    auto ratioOrNull = [](uint64_t numerator, uint64_t denominator) -> nlohmann::json {
+        return denominator == 0ull
+            ? nlohmann::json(nullptr)
+            : nlohmann::json(static_cast<double>(numerator) / static_cast<double>(denominator));
+    };
+    auto diCounter64 = [&diCounter](size_t lowIndex, size_t highIndex) -> uint64_t {
+        return diCounter(lowIndex) | (diCounter(highIndex) << 32u);
+    };
+    auto averageOrNull = [](uint64_t sum, uint64_t count, double scale = 1.0) -> nlohmann::json {
+        return count == 0ull
+            ? nlohmann::json(nullptr)
+            : nlohmann::json(static_cast<double>(sum) / (static_cast<double>(count) * scale));
+    };
+    const uint64_t temporalAccepted = diCounter(29);
+    const uint64_t temporalSelected = temporalAccepted + diCounter(30);
+    const uint64_t spatialTested = diCounter(33);
+    const uint64_t spatialAccepted = diCounter(34);
+    const uint64_t finalPixels = diCounter(48);
+    const uint64_t finalFallback = diCounter(51);
+    const uint64_t unknownVisibility = diCounter(58);
+    const uint64_t clampCount = diCounter(31) + diCounter(40) + diCounter(55);
+    const uint64_t nonFiniteCount = diCounter(4) + diCounter(13) + diCounter(57);
+    const uint64_t sumM = diCounter64(14, 15);
+    const uint64_t sumAge = diCounter64(43, 44);
+    const uint64_t sumWeight = diCounter64(45, 46);
+    const uint64_t sumLuminance = diCounter64(47, 60);
+    const uint64_t finalEstimateCount = diCounter(56);
+    const bool initialPassActive = diCounter(0) > 0ull;
+    const bool temporalPassActive = diCounter(16) > 0ull;
+    const bool spatialPassActive = spatialTested > 0ull;
+    const bool finalPassActive = finalPixels > 0ull;
+    const bool newDiRequested =
+        profileReport_.settings.restirDiMode == RestirDiMode::Production ||
+        profileReport_.settings.restirDiMode == RestirDiMode::ReferenceValidation ||
+        profileReport_.settings.restirDiMode == RestirDiMode::HybridCompare;
+    const uint64_t diTotalBytes =
+        profileReport_.memory.restirDiInitialBytes +
+        profileReport_.memory.restirDiTemporalBytes +
+        profileReport_.memory.restirDiSpatialBytes +
+        profileReport_.memory.restirDiFinalBytes +
+        profileReport_.memory.restirDiPreviousBytes +
+        profileReport_.memory.restirDiReceiverBytes +
+        profileReport_.memory.restirDiPreviousReceiverBytes +
+        profileReport_.memory.restirDiCountersBytes;
+    nlohmann::json diWarnings = nlohmann::json::array();
+    if (initialPassActive && !profileReport_.restirDiHistoryValid && newDiRequested) {
+        diWarnings.push_back({
+            {"code", "RESTIR_DI_HISTORY_INVALID"},
+            {"severity", "warning"},
+            {"pass", "restir_di_temporal"},
+            {"count", 1},
+        });
+    }
+    const uint64_t diPixels = static_cast<uint64_t>(profileReport_.resolution.renderWidth) *
+        static_cast<uint64_t>(profileReport_.resolution.renderHeight);
+    const uint64_t diReservoirStride = diPixels > 0ull && profileReport_.memory.restirDiInitialBytes > 0ull
+        ? profileReport_.memory.restirDiInitialBytes / diPixels
+        : 0ull;
+    const uint64_t diReceiverStride = diPixels > 0ull && profileReport_.memory.restirDiReceiverBytes > 0ull
+        ? profileReport_.memory.restirDiReceiverBytes / diPixels
+        : 0ull;
+    const uint32_t diReservoirBufferCount = profileReport_.memory.restirDiInitialBytes > 0ull ? 5u : 0u;
+    const uint32_t diReceiverBufferCount = profileReport_.memory.restirDiReceiverBytes > 0ull ? 2u : 0u;
+    j["restir_di"] = {
+        {"schema_version", 1},
+        {"layout_version", 3},
+        {"mode", restirDiModeName(profileReport_.settings.restirDiMode)},
+        {"layout", restirDiReservoirLayoutName(profileReport_.settings.restirDiReservoirLayout)},
+        {"counter_scope", "last_completed_frame"},
+        {"counter_value_bits", 32},
+        {"aggregate_encoding", "uint32-low-high-with-carry"},
+        {"history_valid", profileReport_.restirDiHistoryValid},
+        {"history_reset_reason", profileReport_.restirDiHistoryValid
+            ? "none"
+            : (initialPassActive ? "not_finalized" : "inactive")},
+        {"fallback_reason", newDiRequested && !initialPassActive
+            ? "pipeline_inactive_or_unsupported"
+            : "none"},
+        {"light_identity", {
+            {"scheme", "persistent-id-hash32-generation-cached-index"},
+            {"reorder_fallback", "history-invalidation"},
+            {"distribution_version_policy", "source-mass-preserved-current-pdf-recomputed"},
+        }},
+        {"direct_light_ownership", {
+            {"emissive_and_analytic_lights", initialPassActive ? "restir_di" : "classic_nee"},
+            {"sun", "classic_nee"},
+            {"environment", "classic_nee"},
+            {"participating_media", "classic_nee"},
+        }},
+        {"stabilization", {
+            {"enabled", profileReport_.settings.restirDiProductionStabilizationEnabled},
+            {"clamp_luminance", profileReport_.settings.restirDiClampLuminance},
+            {"reference_mode", profileReport_.settings.restirDiMode == RestirDiMode::ReferenceValidation},
+        }},
+        {"render_extent", {
+            {"width", profileReport_.resolution.renderWidth},
+            {"height", profileReport_.resolution.renderHeight},
+        }},
+        {"active_passes", {
+            {"initial", initialPassActive},
+            {"temporal", temporalPassActive},
+            {"spatial", spatialPassActive},
+            {"final", finalPassActive},
+            {"history_copy", profileReport_.restirDiHistoryValid},
+        }},
+        {"initial_valid_count", diCounter(1)},
+        {"initial_invalid_surface_count", diCounter(2)},
+        {"initial_invalid_target_count", diCounter(3)},
+        {"initial_non_finite_count", diCounter(4)},
+        {"initial_invalid_pdf_count", diCounter(10)},
+        {"initial_invalid_identity_count", diCounter(11)},
+        {"initial_weight_overflow_count", diCounter(12)},
+        {"temporal_non_finite_count", diCounter(13)},
+        {"initial_light_class_counts", {
+            {"emissive", diCounter(5)},
+            {"directional", diCounter(6)},
+            {"point", diCounter(7)},
+            {"area", diCounter(8)},
+            {"spot", diCounter(9)},
+        }},
+        {"temporal_tested_count", diCounter(17)},
+        {"temporal_accepted_count", temporalAccepted},
+        {"temporal_rejected_count", diCounter(17) > temporalSelected ? diCounter(17) - temporalSelected : 0ull},
+        {"spatial_tested_count", spatialTested},
+        {"spatial_accepted_count", spatialAccepted},
+        {"spatial_rejected_count", spatialTested > spatialAccepted ? spatialTested - spatialAccepted : 0ull},
+        {"final_visible_count", diCounter(53)},
+        {"final_occluded_count", diCounter(54)},
+        {"final_valid_count", diCounter(49)},
+        {"final_invalid_count", diCounter(50)},
+        {"final_estimate_count", finalEstimateCount},
+        {"final_fallback_count", finalFallback},
+        {"clamp_count", clampCount},
+        {"non_finite_count", nonFiniteCount},
+        {"light_version_rejection_count", diCounter(23) + diCounter(42) + diCounter(59)},
+        {"spatial_light_identity_rejection_count", diCounter(42)},
+        {"final_light_identity_rejection_count", diCounter(59)},
+        {"surface_rejection_count", diCounter(21) + diCounter(35)},
+        {"visibility_rejection_count", diCounter(28) + diCounter(37)},
+        {"temporal_acceptance_ratio", ratioOrNull(temporalAccepted, temporalSelected)},
+        {"spatial_acceptance_ratio", ratioOrNull(spatialAccepted, spatialTested)},
+        {"final_fallback_ratio", ratioOrNull(finalFallback, finalPixels)},
+        {"unknown_visibility_ratio", ratioOrNull(unknownVisibility, finalPixels)},
+        {"clamp_ratio", ratioOrNull(clampCount, finalPixels)},
+        {"non_finite_ratio", ratioOrNull(nonFiniteCount, diCounter(0) + finalPixels)},
+        {"aggregate_totals", {
+            {"m", sumM},
+            {"age", sumAge},
+            {"weight_sum_fixed_8", sumWeight},
+            {"final_luminance_fixed_8", sumLuminance},
+            {"sample_count", finalEstimateCount},
+        }},
+        {"average_m", averageOrNull(sumM, finalEstimateCount)},
+        {"average_age", averageOrNull(sumAge, finalEstimateCount)},
+        {"average_weight_sum", averageOrNull(sumWeight, finalEstimateCount, 256.0)},
+        {"average_final_luminance", averageOrNull(sumLuminance, finalEstimateCount, 256.0)},
+        {"memory", {
+            {"reservoir_stride", diReservoirStride},
+            {"receiver_stride", diReceiverStride},
+            {"reservoir_buffer_count", diReservoirBufferCount},
+            {"physically_allocated_reservoir_buffer_count",
+                diReservoirBufferCount > 0u && profileReport_.memory.restirDiAliasSavingsBytes > 0ull
+                    ? diReservoirBufferCount - 1u
+                    : diReservoirBufferCount},
+            {"receiver_buffer_count", diReceiverBufferCount},
+            {"initial_bytes", profileReport_.memory.restirDiInitialBytes},
+            {"temporal_bytes", profileReport_.memory.restirDiTemporalBytes},
+            {"spatial_bytes", profileReport_.memory.restirDiSpatialBytes},
+            {"final_bytes", profileReport_.memory.restirDiFinalBytes},
+            {"previous_bytes", profileReport_.memory.restirDiPreviousBytes},
+            {"receiver_bytes", profileReport_.memory.restirDiReceiverBytes},
+            {"previous_receiver_bytes", profileReport_.memory.restirDiPreviousReceiverBytes},
+            {"counters_bytes", profileReport_.memory.restirDiCountersBytes},
+            {"logical_bytes", diTotalBytes},
+            {"physically_allocated_bytes", profileReport_.memory.restirDiPhysicalBytes},
+            {"alias_savings_bytes", profileReport_.memory.restirDiAliasSavingsBytes},
+            {"total_bytes", diTotalBytes},
+        }},
+        {"warnings", std::move(diWarnings)},
+    };
+    auto giCounter = [this](size_t index) -> uint64_t {
+        return index < profileReport_.restirGiCounters.size()
+            ? static_cast<uint64_t>(profileReport_.restirGiCounters[index])
+            : 0ull;
+    };
+    const uint64_t giTemporalPixels = giCounter(0);
+    const uint64_t giTemporalCurrentValid = giCounter(1);
+    const uint64_t giTemporalPreviousValid = giCounter(2);
+    const uint64_t giTemporalAccepted = giCounter(3);
+    const uint64_t giTemporalRejected =
+        giCounter(4) + giCounter(5) + giCounter(6) + giCounter(7) + giCounter(8) + giCounter(9);
+    const uint64_t giSpatialPixels = giCounter(10);
+    const uint64_t giSpatialTested = giCounter(11);
+    const uint64_t giSpatialAccepted = giCounter(12);
+    const uint64_t giFinalPixels = giCounter(17);
+    const uint64_t giFinalFallback = giCounter(20);
+    const uint64_t giClampCount = giCounter(21) + giCounter(27);
+    const uint64_t giUpsamplePixels = giCounter(22);
+    const uint64_t giUpsampleAccepted = giCounter(23);
+    const uint64_t giUpsampleFallback = giCounter(24);
+    constexpr double giGridFixedScale = 512.0;
+    const uint64_t giPixels = static_cast<uint64_t>(profileReport_.resolution.renderWidth) *
+        static_cast<uint64_t>(profileReport_.resolution.renderHeight);
+    const uint64_t giXEvenCount =
+        ((static_cast<uint64_t>(profileReport_.resolution.renderWidth) + 1ull) / 2ull) *
+        static_cast<uint64_t>(profileReport_.resolution.renderHeight);
+    const uint64_t giXOddCount =
+        (static_cast<uint64_t>(profileReport_.resolution.renderWidth) / 2ull) *
+        static_cast<uint64_t>(profileReport_.resolution.renderHeight);
+    const uint64_t giYEvenCount =
+        static_cast<uint64_t>(profileReport_.resolution.renderWidth) *
+        ((static_cast<uint64_t>(profileReport_.resolution.renderHeight) + 1ull) / 2ull);
+    const uint64_t giYOddCount =
+        static_cast<uint64_t>(profileReport_.resolution.renderWidth) *
+        (static_cast<uint64_t>(profileReport_.resolution.renderHeight) / 2ull);
+    auto gridAverage = [giGridFixedScale](uint64_t sumFixed, uint64_t count) -> double {
+        return count == 0ull ? 0.0 : static_cast<double>(sumFixed) / (static_cast<double>(count) * giGridFixedScale);
+    };
+    auto gridScore = [](double a, double b) -> nlohmann::json {
+        const double mean = std::max((std::abs(a) + std::abs(b)) * 0.5, 1.0e-6);
+        return nlohmann::json(std::abs(a - b) / mean);
+    };
+    const double giGridXEven = gridAverage(giCounter(28), giXEvenCount);
+    const double giGridXOdd = gridAverage(giCounter(29), giXOddCount);
+    const double giGridYEven = gridAverage(giCounter(30), giYEvenCount);
+    const double giGridYOdd = gridAverage(giCounter(31), giYOddCount);
+    const bool giGridAvailable = giFinalPixels > 0ull && (giCounter(28) + giCounter(29) + giCounter(30) + giCounter(31)) > 0ull;
+    const nlohmann::json giGridHorizontalScore = giGridAvailable ? gridScore(giGridXEven, giGridXOdd) : nlohmann::json(nullptr);
+    const nlohmann::json giGridVerticalScore = giGridAvailable ? gridScore(giGridYEven, giGridYOdd) : nlohmann::json(nullptr);
+    nlohmann::json giGridOverallScore = nullptr;
+    if (giGridAvailable && giGridHorizontalScore.is_number() && giGridVerticalScore.is_number()) {
+        giGridOverallScore = std::max(giGridHorizontalScore.get<double>(), giGridVerticalScore.get<double>());
+    }
+    const uint64_t giPathTemporalCurrentOnly = giCounter(34);
+    const uint64_t giPathFinalCurrentOnly = giCounter(41);
+    const uint64_t giPathFinalClassified =
+        giCounter(38) + giCounter(39) + giCounter(40) + giCounter(41);
+    const uint64_t giActiveTileCount = giCounter(46);
+    const uint64_t giActivePixelCount = giCounter(47);
+    const uint64_t giTileColumns = (static_cast<uint64_t>(profileReport_.resolution.renderWidth) + 15ull) / 16ull;
+    const uint64_t giTileRows = (static_cast<uint64_t>(profileReport_.resolution.renderHeight) + 15ull) / 16ull;
+    const uint64_t giTileCount = giTileColumns * giTileRows;
+    const uint64_t giReusePixels =
+        (profileReport_.settings.restirGiHalfResolution && giPixels > 0ull)
+            ? ((static_cast<uint64_t>(profileReport_.resolution.renderWidth) + 1ull) / 2ull) *
+                ((static_cast<uint64_t>(profileReport_.resolution.renderHeight) + 1ull) / 2ull)
+            : giPixels;
+    const uint64_t giProductionStride = giReusePixels > 0ull && profileReport_.memory.restirGiProductionTemporalBytes > 0ull
+        ? profileReport_.memory.restirGiProductionTemporalBytes / giReusePixels
+        : 0ull;
+    const uint64_t giReceiverStride = giPixels > 0ull && profileReport_.memory.restirGiReceiverBytes > 0ull
+        ? profileReport_.memory.restirGiReceiverBytes / giPixels
+        : 0ull;
+    const uint64_t giTotalBytes =
+        profileReport_.memory.restirGiCurrentBytes +
+        profileReport_.memory.restirGiPreviousBytes +
+        profileReport_.memory.restirGiSpatialBytes +
+        profileReport_.memory.restirGiProductionTemporalBytes +
+        profileReport_.memory.restirGiProductionSpatialBytes +
+        profileReport_.memory.restirGiProductionPreviousBytes +
+        profileReport_.memory.restirGiProductionUpsampledBytes +
+        profileReport_.memory.restirGiActiveTileMaskBytes +
+        profileReport_.memory.restirGiReceiverBytes +
+        profileReport_.memory.restirGiPreviousReceiverBytes +
+        profileReport_.memory.restirGiCountersBytes;
+    const uint64_t giAliasSavings =
+        (profileReport_.settings.restirGiMode == RestirGiMode::Production ||
+         profileReport_.settings.restirGiMode == RestirGiMode::ReferenceValidation)
+        ? profileReport_.memory.restirGiPreviousBytes + profileReport_.memory.restirGiSpatialBytes
+        : 0ull;
+    const uint64_t giPhysicalBytes = giTotalBytes >= giAliasSavings ? giTotalBytes - giAliasSavings : giTotalBytes;
+    nlohmann::json giWarnings = nlohmann::json::array();
+    const bool giProductionPassesActive = !profileReport_.settings.wavefrontFinalOutputEnabled &&
+        (profileReport_.settings.restirGiMode == RestirGiMode::Production ||
+         profileReport_.settings.restirGiMode == RestirGiMode::ReferenceValidation);
+    if (giProductionPassesActive &&
+        profileReport_.restirGiCounters.empty()) {
+        giWarnings.push_back({
+            {"code", "RESTIR_GI_COUNTERS_UNAVAILABLE"},
+            {"severity", "warning"},
+            {"pass", "restir_gi_counters_readback"},
+            {"count", 1},
+        });
+    }
+    j["restir_gi"] = {
+        {"schema_version", 2},
+        {"mode", restirGiModeName(profileReport_.settings.restirGiMode)},
+        {"layout", profileReport_.restirGiLayout},
+        {"effective_production_reuse", giProductionPassesActive},
+        {"wavefront_current_frame_fallback", profileReport_.settings.wavefrontFinalOutputEnabled},
+        {"counter_scope", "last_completed_frame"},
+        {"counter_value_bits", 32},
+        {"history_valid", giTemporalPreviousValid > 0ull || giTemporalAccepted > 0ull},
+        {"half_resolution", profileReport_.settings.restirGiHalfResolution},
+        {"render_extent", {
+            {"width", profileReport_.resolution.renderWidth},
+            {"height", profileReport_.resolution.renderHeight},
+        }},
+        {"reuse_extent", {
+            {"width", profileReport_.settings.restirGiHalfResolution
+                ? (profileReport_.resolution.renderWidth + 1u) / 2u
+                : profileReport_.resolution.renderWidth},
+            {"height", profileReport_.settings.restirGiHalfResolution
+                ? (profileReport_.resolution.renderHeight + 1u) / 2u
+                : profileReport_.resolution.renderHeight},
+        }},
+        {"active_passes", {
+            {"temporal", giProductionPassesActive},
+            {"spatial", profileReport_.settings.restirGiSpatialRounds > 0u &&
+                giProductionPassesActive},
+            {"upsample", profileReport_.settings.restirGiHalfResolution &&
+                giProductionPassesActive},
+            {"final", giProductionPassesActive},
+        }},
+        {"temporal_pixels", giTemporalPixels},
+        {"temporal_current_valid_count", giTemporalCurrentValid},
+        {"temporal_previous_valid_count", giTemporalPreviousValid},
+        {"temporal_accepted_count", giTemporalAccepted},
+        {"temporal_rejected_count", giTemporalRejected},
+        {"temporal_reject_camera_cut_count", giCounter(4)},
+        {"temporal_reject_offscreen_count", giCounter(5)},
+        {"temporal_reject_surface_count", giCounter(6)},
+        {"temporal_reject_age_count", giCounter(7)},
+        {"temporal_reject_target_count", giCounter(8)},
+        {"temporal_reject_velocity_count", giCounter(9)},
+        {"temporal_acceptance_ratio", ratioOrNull(giTemporalAccepted, giTemporalPreviousValid)},
+        {"active_tile_mask_mode", restirGiActiveTileMaskModeName(profileReport_.settings.restirGiActiveTileMaskMode)},
+        {"active_tile_count", giActiveTileCount},
+        {"active_tile_total_count", giTileCount},
+        {"active_tile_coverage", ratioOrNull(giActiveTileCount, giTileCount)},
+        {"active_pixel_count", giActivePixelCount},
+        {"active_pixel_coverage", ratioOrNull(giActivePixelCount, giReusePixels)},
+        {"spatial_pixels", giSpatialPixels},
+        {"spatial_tested_count", giSpatialTested},
+        {"spatial_accepted_count", giSpatialAccepted},
+        {"spatial_rejected_count", giSpatialTested > giSpatialAccepted ? giSpatialTested - giSpatialAccepted : 0ull},
+        {"spatial_reject_invalid_count", giCounter(13)},
+        {"spatial_reject_surface_count", giCounter(14)},
+        {"spatial_reject_target_count", giCounter(15)},
+        {"spatial_selected_neighbor_count", giCounter(16)},
+        {"spatial_acceptance_ratio", ratioOrNull(giSpatialAccepted, giSpatialTested)},
+        {"upsample_pixels", giUpsamplePixels},
+        {"upsample_accepted_count", giUpsampleAccepted},
+        {"upsample_fallback_count", giUpsampleFallback},
+        {"upsample_fallback_ratio", ratioOrNull(giUpsampleFallback, giUpsamplePixels)},
+        {"final_pixels", giFinalPixels},
+        {"final_spatial_used_count", giCounter(18)},
+        {"final_current_used_count", giCounter(19)},
+        {"final_fallback_count", giFinalFallback},
+        {"final_stabilized_count", giCounter(25)},
+        {"final_fallback_ratio", ratioOrNull(giFinalFallback, giFinalPixels)},
+        {"clamp_count", giClampCount},
+        {"clamp_ratio", ratioOrNull(giClampCount, giFinalPixels)},
+        {"visibility_ray_count", giCounter(42)},
+        {"visibility_unknown_count", giCounter(43)},
+        {"version_reject_count", giCounter(44)},
+        {"non_finite_reject_count", giCounter(45)},
+        {"half_res_grid_score", giGridOverallScore},
+        {"grid_score", giGridOverallScore},
+        {"grid", {
+            {"schema_version", 1},
+            {"metric", "even_odd_final_gi_perceptual_luma_periodicity"},
+            {"counter_encoding", "sqrt_luma_clamped_0_1_fixed_9"},
+            {"available", giGridAvailable},
+            {"horizontal_score", giGridHorizontalScore},
+            {"vertical_score", giGridVerticalScore},
+            {"score", giGridOverallScore},
+            {"x_even_average_luma", giGridAvailable ? nlohmann::json(giGridXEven) : nlohmann::json(nullptr)},
+            {"x_odd_average_luma", giGridAvailable ? nlohmann::json(giGridXOdd) : nlohmann::json(nullptr)},
+            {"y_even_average_luma", giGridAvailable ? nlohmann::json(giGridYEven) : nlohmann::json(nullptr)},
+            {"y_odd_average_luma", giGridAvailable ? nlohmann::json(giGridYOdd) : nlohmann::json(nullptr)},
+        }},
+        {"path_classes", {
+            {"schema_version", 2},
+            {"policy", "diffuse_glossy_environment_emissive_reusable_unsafe_closures_current_only"},
+            {"debug_view", "restir-gi-path-class"},
+            {"temporal_diffuse_reusable_count", giCounter(32)},
+            {"temporal_glossy_reusable_count", giCounter(33)},
+            {"temporal_unsupported_current_only_count", giCounter(34)},
+            {"temporal_current_only_count", giPathTemporalCurrentOnly},
+            {"temporal_current_only_reuse_reject_count", giCounter(35)},
+            {"spatial_path_class_reject_count", giCounter(36)},
+            {"spatial_center_current_only_count", giCounter(37)},
+            {"final_diffuse_reusable_count", giCounter(38)},
+            {"final_glossy_reusable_count", giCounter(39)},
+            {"final_environment_or_emissive_reusable_count", giCounter(40)},
+            {"final_current_only_count", giPathFinalCurrentOnly},
+            {"final_unknown_or_invalid_count", giCounter(41)},
+            {"final_classified_count", giPathFinalClassified},
+            {"final_current_only_ratio", ratioOrNull(giPathFinalCurrentOnly, giPathFinalClassified)},
+        }},
+        {"memory", {
+            {"production_reservoir_stride", giProductionStride},
+            {"receiver_stride", giReceiverStride},
+            {"legacy_current_bytes", profileReport_.memory.restirGiCurrentBytes},
+            {"legacy_previous_bytes", profileReport_.memory.restirGiPreviousBytes},
+            {"legacy_spatial_bytes", profileReport_.memory.restirGiSpatialBytes},
+            {"production_temporal_bytes", profileReport_.memory.restirGiProductionTemporalBytes},
+            {"production_spatial_bytes", profileReport_.memory.restirGiProductionSpatialBytes},
+            {"production_previous_bytes", profileReport_.memory.restirGiProductionPreviousBytes},
+            {"production_upsampled_bytes", profileReport_.memory.restirGiProductionUpsampledBytes},
+            {"active_tile_mask_bytes", profileReport_.memory.restirGiActiveTileMaskBytes},
+            {"receiver_bytes", profileReport_.memory.restirGiReceiverBytes},
+            {"previous_receiver_bytes", profileReport_.memory.restirGiPreviousReceiverBytes},
+            {"counters_bytes", profileReport_.memory.restirGiCountersBytes},
+            {"logical_bytes", giTotalBytes},
+            {"physical_bytes", giPhysicalBytes},
+            {"alias_savings_bytes", giAliasSavings},
+            {"total_bytes", giPhysicalBytes},
+        }},
+        {"warnings", std::move(giWarnings)},
+    };
     j["adaptive_quality"] = profileReport_.adaptiveQuality;
     j["memory_pressure_quality"] = profileReport_.memoryPressureQuality;
     j["nvidia_integrations"] = profileReport_.nvidiaIntegrations;
@@ -2473,6 +3054,14 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["validation_error_count"] = profileReport_.validationErrorCount;
     j["warnings"] = profileReport_.warnings;
     j["settings"] = profileReport_.settings;
+    j["settings"]["restir_gi_active_tile_mask_enabled"] =
+        profileReport_.effectiveRestirGiActiveTileMaskEnabled;
+    j["settings"]["restir_history_copy_mode_effective"] =
+        restirHistoryCopyModeName(profileReport_.effectiveRestirHistoryCopyMode);
+    j["settings"]["restir_history_copy_mode_fallback_reason"] =
+        profileReport_.restirHistoryCopyFallbackReason.empty()
+        ? nlohmann::json(nullptr)
+        : nlohmann::json(profileReport_.restirHistoryCopyFallbackReason);
     const auto dir = path.parent_path();
     if (!dir.empty() && !std::filesystem::exists(dir)) { std::filesystem::create_directories(dir); }
     std::ofstream file(path);
@@ -2506,12 +3095,19 @@ void HeadlessDiagnostics::exportDebugViews(Application& app, const std::filesyst
     }
 
     const auto views = DiagnosticImageExport::allExportViews();
+    const RendererSettings exportSettings = renderer->settings();
     std::vector<std::string> exported;
+    std::vector<std::string> skipped;
     const uint32_t kWarmupFrames = config_.warmupFrames > 0 ? config_.warmupFrames : 4;
 
     for (auto view : views) {
         std::string viewName = rendererDebugViewName(view);
         auto outputPath = dir / (viewName + ".png");
+        if (!shouldExportDebugViewForSettings(exportSettings, view)) {
+            std::cout << "Skipping debug view: " << viewName << " (disabled feature)\n";
+            skipped.push_back(viewName);
+            continue;
+        }
         std::cout << "Exporting debug view: " << viewName << "...\n";
 
         app.applyDebugView(view);
@@ -2530,13 +3126,18 @@ void HeadlessDiagnostics::exportDebugViews(Application& app, const std::filesyst
     }
 
     exporter.writeExportManifest(dir, exported, displayExtent.width, displayExtent.height);
-    if (!missing.empty()) {
+    if (!missing.empty() || !skipped.empty()) {
         auto manifestPath = dir / "export_manifest.json";
         if (std::filesystem::exists(manifestPath)) {
             std::ifstream in(manifestPath);
             nlohmann::json manifest;
             in >> manifest;
-            manifest["missing_debug_views"] = missing;
+            if (!missing.empty()) {
+                manifest["missing_debug_views"] = missing;
+            }
+            if (!skipped.empty()) {
+                manifest["skipped_debug_views"] = skipped;
+            }
             std::ofstream out(manifestPath);
             out << manifest.dump(2);
         }
@@ -2775,6 +3376,7 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
                 if (sceneConfig.wavefrontValidationMode) {
                     settings.debugView = RendererDebugView::Beauty;
                     settings.restirMode = RestirMode::ClassicNee;
+                    settings.restirGiMode = RestirGiMode::Off;
                     settings.restirGiEnabled = false;
                     settings.wavefrontQueuesEnabled = true;
                     settings.wavefrontPrimaryGenerateEnabled = true;

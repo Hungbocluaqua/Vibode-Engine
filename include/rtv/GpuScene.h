@@ -49,13 +49,15 @@ struct alignas(16) CameraUniform {
     glm::vec4 renderControls{}; // x = shadow ray bias, y = shadow distance bias, z = firefly clamp, w = RR min survival
     glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
     glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
-    glm::uvec4 restirGiControls{24u, 0u, 0u, 1u}; // x = temporal max age, y bits: 0 half-resolution reuse, 1 GI enabled, z = visibility ray budget, w = specular AA enabled
+    glm::uvec4 restirGiControls{24u, 0u, 0u, 1u}; // x = max age, y bits: 0 half-res, 1 enabled, 2 receiver buffer, 3 legacy cache, z = visibility rays, w = specular AA
     glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, z = RT counters, w = caustic visibility
     glm::vec4 dofControls{0.0f, 10.0f, 0.0f, 0.0f}; // x = aperture radius, y = focus distance, z = blade count, w = bokeh rotation
     glm::vec4 motionBlurControls{0.0f, 0.0f, 1.0f, 0.0f}; // x = enabled, y = shutter open, z = shutter close, w = external denoiser raw input
     glm::vec4 volumeControls{0.0f, 0.0f, 0.0f, 0.0f}; // x = enabled, y = sigma_s, z = sigma_a, w = anisotropy
     glm::vec4 projectionControls{0.0f, 0.0f, 1.0f, 1.0f}; // x = projection: 0 perspective, 1 orthographic; y = authored aspect; zw = ortho x/y magnification
     glm::vec4 clipControls{0.01f, 1000.0f, 0.0f, 0.0f}; // xy = near/far planes
+    glm::uvec4 giVersionControls{0u, 0u, 0u, 0u}; // Phase 8: x = light version, y = material version, z = object version, w = environment version
+    glm::uvec4 restirDiControls{0u, 0u, 0u, 0u}; // x = new ReSTIR DI raygen writes enabled
 };
 
 static_assert(offsetof(CameraUniform, jitter) == 128, "CameraUniform::jitter must match std140 layout");
@@ -70,7 +72,9 @@ static_assert(offsetof(CameraUniform, motionBlurControls) == 256, "CameraUniform
 static_assert(offsetof(CameraUniform, volumeControls) == 272, "CameraUniform::volumeControls must match std140 layout");
 static_assert(offsetof(CameraUniform, projectionControls) == 288, "CameraUniform::projectionControls must match std140 layout");
 static_assert(offsetof(CameraUniform, clipControls) == 304, "CameraUniform::clipControls must match std140 layout");
-static_assert(sizeof(CameraUniform) == 320, "CameraUniform size must match std140 layout");
+static_assert(offsetof(CameraUniform, giVersionControls) == 320, "CameraUniform::giVersionControls must match std140 layout");
+static_assert(offsetof(CameraUniform, restirDiControls) == 336, "CameraUniform::restirDiControls must match std140 layout");
+static_assert(sizeof(CameraUniform) == 352, "CameraUniform size must match std140 layout");
 
 struct MeshParamsUniform {
     uint32_t vertexCount = 0;
@@ -130,11 +134,13 @@ struct GpuInstanceBoundsRecord {
 
 struct GpuLightRecord {
     glm::uvec4 metadata{};
+    glm::uvec4 identity{}; // low/high persistent ID, generation, reserved
     glm::vec4 data0{};
     glm::vec4 data1{};
     glm::vec4 data2{};
     glm::vec4 data3{};
 };
+static_assert(sizeof(GpuLightRecord) == 96);
 
 struct EnvParamsUniform {
     uint32_t enabled = 1;
@@ -194,6 +200,24 @@ struct RayTracingInstanceBuildInput {
     bool visible = true;
 };
 
+enum class SceneCacheMode : uint32_t {
+    Disabled,
+    FullReadWrite,
+    GeometryReadOnly,
+};
+
+struct SceneCachePolicy {
+    SceneCacheMode mode = SceneCacheMode::Disabled;
+    std::optional<std::filesystem::path> path;
+
+    [[nodiscard]] bool canRead() const {
+        return mode != SceneCacheMode::Disabled && path.has_value();
+    }
+    [[nodiscard]] bool canWrite() const {
+        return mode == SceneCacheMode::FullReadWrite && path.has_value();
+    }
+};
+
 class GpuScene {
 public:
     GpuScene(
@@ -202,8 +226,9 @@ public:
         const SceneAsset* importedScene = nullptr,
         const AssetManager* assets = nullptr,
         std::optional<std::filesystem::path> environmentPath = std::nullopt,
-        std::optional<std::filesystem::path> sceneCachePath = std::nullopt,
+        SceneCachePolicy sceneCachePolicy = {},
         uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel,
+        bool opacityMicromapsEnabled = true,
         uint32_t materialTextureMaxDimension = 0);
     ~GpuScene();
 
@@ -260,6 +285,7 @@ public:
     [[nodiscard]] const std::vector<GpuLocalVertex>& localVerticesCpu() const { return localVertexCpu_; }
     [[nodiscard]] const std::vector<GpuLightRecord>& lightRecordsCpu() const { return lightRecordCpu_; }
     [[nodiscard]] const OpacityMicromapCpuData& opacityMicromapData() const { return opacityMicromapData_; }
+    [[nodiscard]] bool hasTransmissiveMaterials() const { return hasTransmissiveMaterials_; }
 
     bool setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity);
     bool setSkyCdfDimensions(uint32_t width, uint32_t height);
@@ -288,6 +314,7 @@ private:
     void createCornellBox(BufferUploader& uploader);
     void createImportedScene(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
     void createImportedSceneFromCache(BufferUploader& uploader, const CachedScene& cached, const std::vector<SceneLightAsset>& activeSceneLights);
+    void createImportedSceneGeometryFromCache(BufferUploader& uploader, const CachedScene& cached, const SceneAsset& activeScene);
     void createDefaultMaterialTexture(BufferUploader& uploader);
     void createImportedMaterialTextures(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
     void createCachedMaterialTextures(BufferUploader& uploader, const CachedScene& cached);
@@ -313,8 +340,9 @@ private:
 
     ResourceAllocator& allocator_;
     std::optional<std::filesystem::path> environmentPath_;
-    std::optional<std::filesystem::path> sceneCachePath_;
+    SceneCachePolicy sceneCachePolicy_;
     uint32_t opacityMicromapSubdivisionLevel_ = kDefaultOpacityMicromapSubdivisionLevel;
+    bool opacityMicromapsEnabled_ = true;
     uint32_t materialTextureMaxDimension_ = 0;
     std::unique_ptr<Buffer> vertices_;
     std::unique_ptr<Buffer> indices_;
@@ -369,6 +397,7 @@ private:
     std::vector<glm::vec4> sphereDataCpu_;
     std::vector<GpuLightRecord> emissiveLightRecords_;
     std::vector<GpuInstanceRecord> instanceRecordCpu_;
+    bool hasTransmissiveMaterials_ = false;
 };
 
 } // namespace rtv

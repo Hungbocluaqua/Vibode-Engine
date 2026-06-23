@@ -2,7 +2,7 @@
 #define RTV_RESTIR_COMMON_GLSL
 
 #ifndef RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-#define RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT 1
+#define RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT 0
 #endif
 
 struct RestirReservoir {
@@ -14,6 +14,8 @@ struct RestirReservoir {
     uvec4 sample_metadata;
 };
 
+#ifndef RTV_RESTIR_GI_RESERVOIR_DEFINED
+#define RTV_RESTIR_GI_RESERVOIR_DEFINED
 struct RestirGiReservoir {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     vec4 hit_position_target_pdf;
@@ -25,6 +27,7 @@ struct RestirGiReservoir {
 #endif
     uvec4 metadata;
 };
+#endif // RTV_RESTIR_GI_RESERVOIR_DEFINED
 
 const uint RESTIR_VISIBILITY_UNKNOWN = 0u;
 const uint RESTIR_VISIBILITY_VISIBLE = 1u;
@@ -324,9 +327,13 @@ float restir_gi_age_normalized(RestirGiReservoir reservoir, float maxAge) {
     return clamp(float(restir_gi_age(reservoir)) / max(maxAge, 1.0), 0.0, 1.0);
 }
 
+#ifndef RTV_RESTIR_LUMINANCE_DEFINED
+#define RTV_RESTIR_LUMINANCE_DEFINED
+#define RTV_RESTIR_UTILITY_FUNCTIONS_DEFINED
 float restir_luminance(vec3 value) {
     return dot(value, vec3(0.2126, 0.7152, 0.0722));
 }
+#endif
 
 float restir_gi_target_function(RestirGiReservoir reservoir) {
     return max(restir_gi_target_pdf(reservoir), restir_luminance(max(reservoir.radiance_weight_sum.rgb, vec3(0.0))));

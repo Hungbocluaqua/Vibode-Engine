@@ -1,5 +1,6 @@
 #include "rtv/ShaderCompiler.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 #include <regex>
@@ -128,9 +129,17 @@ bool ShaderCompiler::needsCompileWithSignature(
 }
 
 std::string ShaderCompiler::compileSignature(const std::vector<std::pair<std::string, std::string>>& extraDefines) const {
+    auto hasExtraDefine = [&](const char* name) {
+        return std::any_of(extraDefines.begin(), extraDefines.end(), [&](const auto& define) {
+            return define.first == name;
+        });
+    };
     std::string signature = "RTV_USE_DIMENSIONED_SAMPLER=" + environmentValueOrDefault("RTV_USE_DIMENSIONED_SAMPLER", "1") +
-        "\nRTV_DENOISER_SHARED_TILE=" + environmentValueOrDefault("RTV_DENOISER_SHARED_TILE", "1") +
-        "\nRTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=" + environmentValueOrDefault("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1") + "\n";
+        "\nRTV_DENOISER_SHARED_TILE=" + environmentValueOrDefault("RTV_DENOISER_SHARED_TILE", "1") + "\n";
+    if (!hasExtraDefine("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT")) {
+        signature += "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=" +
+            environmentValueOrDefault("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0") + "\n";
+    }
     for (const auto& [name, value] : extraDefines) {
         signature += name + "=" + value + "\n";
     }
@@ -138,14 +147,21 @@ std::string ShaderCompiler::compileSignature(const std::vector<std::pair<std::st
 }
 
 std::string ShaderCompiler::compileDefineArgs(const std::vector<std::pair<std::string, std::string>>& extraDefines) const {
+    auto hasExtraDefine = [&](const char* name) {
+        return std::any_of(extraDefines.begin(), extraDefines.end(), [&](const auto& define) {
+            return define.first == name;
+        });
+    };
     auto defineArg = [](const char* name, const char* fallback) {
         const std::string finalValue = environmentValueOrDefault(name, fallback);
         return std::string("-D") + name + "=" + finalValue + " ";
     };
 
     std::string args = defineArg("RTV_USE_DIMENSIONED_SAMPLER", "1") +
-        defineArg("RTV_DENOISER_SHARED_TILE", "1") +
-        defineArg("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1");
+        defineArg("RTV_DENOISER_SHARED_TILE", "1");
+    if (!hasExtraDefine("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT")) {
+        args += defineArg("RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0");
+    }
     for (const auto& [name, value] : extraDefines) {
         args += "-D" + name + "=" + value + " ";
     }

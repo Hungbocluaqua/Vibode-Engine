@@ -218,7 +218,7 @@ public:
         const SceneAsset* importedScene = nullptr,
         const AssetManager* assets = nullptr,
         std::optional<std::filesystem::path> environmentPath = std::nullopt,
-        std::optional<std::filesystem::path> sceneCachePath = std::nullopt,
+        SceneCachePolicy sceneCachePolicy = {},
         bool resourceAliasingEnabled = true,
         GpuSkinningResourcePlan gpuSkinningResourcePlan = {},
         const RendererSettings* initialSettings = nullptr,
@@ -350,6 +350,28 @@ public:
     [[nodiscard]] bool hardwareRayTracingAvailable() const;
     [[nodiscard]] RayTracingRendererStats rayTracingStats() const;
     [[nodiscard]] RayTracingDiagnosticCounters rayTracingDiagnosticCounters() const;
+    [[nodiscard]] const uint32_t* restirDiCounterData() const {
+        if (restirDiCountersReadbackBuffer_.handle() == VK_NULL_HANDLE) return nullptr;
+        if (restirDiCountersReadbackBuffer_.mappedData() == nullptr) return nullptr;
+        restirDiCountersReadbackBuffer_.invalidate(restirDiCountersReadbackBuffer_.size());
+        const size_t slotCount = std::max<size_t>(frames_.size(), 1u);
+        const size_t slot = temporalFrameIndex_ == 0u ? 0u : (temporalFrameIndex_ - 1u) % slotCount;
+        const auto* bytes = static_cast<const uint8_t*>(restirDiCountersReadbackBuffer_.mappedData());
+        return reinterpret_cast<const uint32_t*>(bytes + slot * sizeof(uint32_t) * 64u);
+    }
+    [[nodiscard]] const uint32_t* restirGiCounterData() const {
+        if (restirGiCountersReadbackBuffer_.handle() == VK_NULL_HANDLE) return nullptr;
+        if (restirGiCountersReadbackBuffer_.mappedData() == nullptr) return nullptr;
+        restirGiCountersReadbackBuffer_.invalidate(restirGiCountersReadbackBuffer_.size());
+        const size_t slotCount = std::max<size_t>(frames_.size(), 1u);
+        const size_t slot = temporalFrameIndex_ == 0u ? 0u : (temporalFrameIndex_ - 1u) % slotCount;
+        const auto* bytes = static_cast<const uint8_t*>(restirGiCountersReadbackBuffer_.mappedData());
+        return reinterpret_cast<const uint32_t*>(bytes + slot * sizeof(uint32_t) * 64u);
+    }
+    [[nodiscard]] bool restirDiHistoryValid() const { return restirDiHistoryValid_; }
+    [[nodiscard]] RestirHistoryCopyMode effectiveRestirHistoryCopyMode() const;
+    [[nodiscard]] const char* restirHistoryCopyFallbackReason() const;
+    [[nodiscard]] bool effectiveRestirGiActiveTileMaskEnabled() const;
     [[nodiscard]] uint32_t effectiveSamplesPerPixel() const {
         return effectiveLimitSamplesPerPixel() ? 1u : std::max(1u, settings_.samplesPerPixel);
     }
@@ -508,11 +530,27 @@ public:
     [[nodiscard]] const char* restirGiReservoirLayoutName() const;
     struct RestirReservoirMemoryBreakdown {
         VkDeviceSize diCurrentBytes = 0;
+        VkDeviceSize diInitialBytes = 0;
+        VkDeviceSize diTemporalBytes = 0;
         VkDeviceSize diPreviousBytes = 0;
         VkDeviceSize diSpatialBytes = 0;
+        VkDeviceSize diFinalBytes = 0;
+        VkDeviceSize diReceiverBytes = 0;
+        VkDeviceSize diPreviousReceiverBytes = 0;
+        VkDeviceSize diCountersBytes = 0;
+        VkDeviceSize diPhysicalBytes = 0;
+        VkDeviceSize diAliasSavingsBytes = 0;
         VkDeviceSize giCurrentBytes = 0;
         VkDeviceSize giPreviousBytes = 0;
         VkDeviceSize giSpatialBytes = 0;
+        VkDeviceSize giProductionTemporalBytes = 0;
+        VkDeviceSize giProductionSpatialBytes = 0;
+        VkDeviceSize giProductionPreviousBytes = 0;
+        VkDeviceSize giProductionUpsampledBytes = 0;
+        VkDeviceSize giActiveTileMaskBytes = 0;
+        VkDeviceSize giCountersBytes = 0;
+        VkDeviceSize giReceiverBytes = 0;
+        VkDeviceSize giPreviousReceiverBytes = 0;
     };
     [[nodiscard]] RestirReservoirMemoryBreakdown restirReservoirMemoryBreakdown() const;
     [[nodiscard]] DescriptorAllocator::Stats descriptorPoolStats() const;
@@ -522,6 +560,9 @@ public:
     void setRayTracingDiagnosticCountersEnabled(bool enabled);
 
 private:
+    void ensureRayTracingVariantPipelines(bool restirDiValidationFull, bool restirGiInitialFull);
+    void ensureWavefrontTracePipelines();
+
     struct DenoiserParams {
         uint32_t enabled = 1;
         float strength = 1.0f;
@@ -648,10 +689,14 @@ private:
         float lumClampNeighborMaxFactor = 3.0f;
         float fireflyClamp = 8.0f;
         float productionClampLuminance = 0.0f;
-        uint32_t useFallbackInitial = 1;
+        uint32_t mode = 0;
         uint32_t spatialResultValid = 0;
-        uint32_t padding0 = 0;
-        uint32_t padding1 = 0;
+        uint32_t visibilityRayBudget = 1;
+        uint32_t historyValid = 0;
+        uint32_t materialVisibilityFlags = 0;
+        uint32_t counterEnabled = 0;
+        uint32_t rawOutputIsCurrentSample = 0;
+        uint32_t padding2 = 0;
     };
 
     struct FogParams {
@@ -679,7 +724,7 @@ private:
     static_assert(sizeof(RestirReservoirGpu) == 96);
 
     // New ReSTIR DI data model (per plan Phase 1)
-    struct RestirDiReceiverGpu {
+    struct alignas(16) RestirDiReceiverGpu {
         glm::vec4 worldPositionDepth{};      // xyz=world position, w=hit distance
         glm::vec4 normalRoughness{};         // xyz=shading normal, w=roughness
         glm::vec4 tangentMaterialId{};       // xyz=tangent, w=material ID
@@ -688,9 +733,21 @@ private:
         glm::uvec4 primitiveMeshFlags{};     // x=primitive ID, y=mesh ID, z=surface flags, w=padding
     };
     static_assert(sizeof(RestirDiReceiverGpu) == 96);
+    static_assert(alignof(RestirDiReceiverGpu) == 16);
+    static_assert(offsetof(RestirDiReceiverGpu, normalRoughness) == 16);
+    static_assert(offsetof(RestirDiReceiverGpu, primitiveMeshFlags) == 80);
 
-    struct RestirDiReservoirGpu {
-        glm::uvec4 sampleMetadata{};          // x=lightID, y=lightKind, z=lightVersion, w=materialID
+    struct alignas(16) RestirDiReceiverPackedGpu {
+        glm::vec4 worldPositionDepth{};
+        glm::vec4 normalRoughness{};
+        glm::uvec4 packedMaterialSurface{};
+    };
+    static_assert(sizeof(RestirDiReceiverPackedGpu) == 48);
+    static_assert(alignof(RestirDiReceiverPackedGpu) == 16);
+    static_assert(offsetof(RestirDiReceiverPackedGpu, packedMaterialSurface) == 32);
+
+    struct alignas(16) RestirDiReservoirGpu {
+        glm::uvec4 sampleMetadata{};          // x=identity hash, y=generation, z=packed light index/kind, w=packed radiance
         glm::uvec4 reservoirMetadata{};       // x=packed age/M/vis/valid, y=packed pdf/prevWeight, z=compatSig, w=rejectFlags
         glm::vec4 samplePositionDistance{};   // xyz=world pos, w=distance
         glm::vec4 sampleDirectionPdf{};       // xyz=sample dir at orig receiver, w=cond PDF
@@ -699,6 +756,20 @@ private:
         glm::vec4 contributionConfidence{};   // rgb=contribution (debug), w=confidence
     };
     static_assert(sizeof(RestirDiReservoirGpu) == 112);
+    static_assert(alignof(RestirDiReservoirGpu) == 16);
+    static_assert(offsetof(RestirDiReservoirGpu, reservoirMetadata) == 16);
+    static_assert(offsetof(RestirDiReservoirGpu, samplePositionDistance) == 32);
+    static_assert(offsetof(RestirDiReservoirGpu, contributionConfidence) == 96);
+
+    struct alignas(16) RestirDiReservoirPackedGpu {
+        glm::uvec4 sampleMetadata{};
+        glm::uvec4 reservoirMetadata{};
+        glm::vec4 samplePositionDistance{};
+    };
+    static_assert(sizeof(RestirDiReservoirPackedGpu) == 48);
+    static_assert(alignof(RestirDiReservoirPackedGpu) == 16);
+    static_assert(offsetof(RestirDiReservoirPackedGpu, reservoirMetadata) == 16);
+    static_assert(offsetof(RestirDiReservoirPackedGpu, samplePositionDistance) == 32);
 
     struct RestirGiReservoirGpu {
         glm::vec4 radianceWeightSum{};
@@ -711,11 +782,46 @@ private:
     struct RestirGiReservoirUncompressedGpu {
         glm::vec4 hitPositionTargetPdf{};
         glm::vec4 normalRoughness{};
+        glm::vec4 suffixRadianceSourcePdf{};
+        glm::vec4 sourceDirectionDistance{};
         glm::vec4 radianceWeightSum{};
-        glm::vec4 receiverPositionHitDistance{};
         glm::uvec4 metadata{};
     };
-    static_assert(sizeof(RestirGiReservoirUncompressedGpu) == 80);
+    static_assert(sizeof(RestirGiReservoirUncompressedGpu) == 96);
+
+    // ── New ReSTIR GI data model (Phase 2) ──────────────────────────
+    struct RestirGiReceiverGpu {
+        glm::vec4 positionDepth{};          // xyz = x1 world position, w = primary depth
+        glm::vec4 normalRoughness{};        // xyz = shading normal, w = roughness
+        glm::vec4 geometryNormalMetal{};    // xyz = geometric normal, w = metallic or closure mask
+        glm::vec4 albedoOcclusion{};        // rgb = metallic-roughness base color, a = occlusion
+        glm::uvec4 materialIds{};           // material, instance, mesh, primitive
+        glm::uvec4 motion{};                // packed velocity, camera cut, object version, material version
+    };
+    static_assert(sizeof(RestirGiReceiverGpu) == 96);
+
+    // Production reservoir layout (96 bytes, supports measure-correct reconnection).
+    struct RestirGiReservoirProductionPackedGpu {
+        glm::vec4 x2PositionDistance{};
+        glm::vec4 x2NormalRoughness{};
+        glm::vec4 suffixRadianceSourcePdf{};
+        glm::vec4 sourceDirectionBsdfPdf{};
+        glm::vec4 selectedIntegrandTarget{};
+        glm::vec4 reservoirData{};
+    };
+    static_assert(sizeof(RestirGiReservoirProductionPackedGpu) == 96);
+
+    struct RestirGiReservoirValidationGpu {
+        glm::vec4 x2PositionDistance{};
+        glm::vec4 x2NormalRoughness{};
+        glm::vec4 suffixRadiance{};
+        glm::vec4 sourceThroughput{};
+        glm::uvec4 sampleIds{};
+        glm::vec4 selectedContribution{};
+        glm::vec4 weightData{};
+        glm::uvec4 metadata{};
+    };
+    static_assert(sizeof(RestirGiReservoirValidationGpu) == 128);
 
     struct PathDataGpu {
         glm::vec4 directDiffuse{};
@@ -728,6 +834,7 @@ private:
         glm::vec4 diffuseRayDirectionHitDistance{};
         glm::vec4 specularRayDirectionHitDistance{};
         glm::vec4 emissiveResidual{};
+        glm::vec4 restirGiFallbackReactive{};
     };
 
     struct alignas(16) WavefrontQueueHeaderGpu {
@@ -929,6 +1036,8 @@ private:
     static_assert(sizeof(GpuSkinningPush) == 36);
 
     void createResolutionResources(VkExtent2D renderExtent, VkExtent2D displayExtent);
+    void createRestirDiResources(VkDeviceSize pixelCount);
+    void reconcileRestirDiResources();
     void retireResolutionResources();
     void releaseRetiredResolutionResources();
     void updateCamera();
@@ -942,6 +1051,50 @@ private:
     void recordRestirSpatialCopyPass(VkCommandBuffer commandBuffer);
     void recordRestirGiSpatialPass(VkCommandBuffer commandBuffer);
     void recordRestirGiFinalPass(VkCommandBuffer commandBuffer);
+    void recordRestirGiTemporalPass(VkCommandBuffer commandBuffer);       // Phase 4
+    void recordRestirGiSpatialProdPass(VkCommandBuffer commandBuffer);    // Phase 5 production
+    void recordRestirGiFinalProdPass(VkCommandBuffer commandBuffer);      // Phase 6 production
+    void recordRestirGiUpsamplePass(VkCommandBuffer commandBuffer);       // Phase 7
+
+    // Push constant structs for production GI passes (must match shader std430 layouts)
+    // Use alignas(16) and verify with static_assert on total size.
+    struct alignas(16) RestirGiTemporalPush {
+        uint32_t width, height, frameIndex, temporalMaxAge;
+        float depthThresholdScale;
+        uint32_t visibilityRayBudget, giHalfResolution, enabled;
+        alignas(16) glm::vec4 cameraPosition;       // offset 32
+        glm::mat4 reprojectionMatrix;                // offset 48
+    };
+    static_assert(sizeof(RestirGiTemporalPush) == 112, "Temporal push must be 112 bytes");
+
+    struct alignas(16) RestirGiSpatialProdPush {
+        uint32_t width, height, frameIndex, enabled;
+        uint32_t spatialRounds, halfResolution, visibilityRayBudget;
+        float spatialRadius, depthThresholdScale, compatibilityThreshold;
+        float rawOutputIsCurrentSample;
+        alignas(16) glm::vec4 cameraPosition;       // offset 48
+    };
+    static_assert(sizeof(RestirGiSpatialProdPush) == 64, "SpatialProd push must be 64 bytes");
+
+    struct alignas(16) RestirGiFinalProdPush {
+        uint32_t width, height, frameIndex, enabled;
+        uint32_t debugView;
+        float fireflyClamp, indirectStrength, rawOutputIsCurrentSample;
+        uint32_t halfResolution, visibilityRayBudget, referenceValidation;
+        float minFinalBlendStrength;
+        alignas(16) glm::vec4 cameraPosition;
+    };
+    static_assert(sizeof(RestirGiFinalProdPush) == 64, "FinalProd push must be 64 bytes");
+
+    struct alignas(16) RestirGiUpsamplePush {
+        uint32_t fullWidth, fullHeight, halfWidth, halfHeight;
+        uint32_t frameIndex;
+        float depthThresholdScale, normalThreshold;
+        uint32_t flags;
+        alignas(16) glm::vec4 cameraPosition;
+    };
+    static_assert(sizeof(RestirGiUpsamplePush) == 48, "Upsample push must be 48 bytes");
+
     void recordRestirDiTemporal(VkCommandBuffer commandBuffer);
     void recordRestirDiTemporalPass(VkCommandBuffer commandBuffer);
     void recordRestirDiSpatial(VkCommandBuffer commandBuffer);
@@ -951,6 +1104,7 @@ private:
     void recordRestirDiHistoryCopy(VkCommandBuffer commandBuffer);
     void recordRestirDiHistoryCopyPass(VkCommandBuffer commandBuffer);
     void recordRestirDiCountersReadback(VkCommandBuffer commandBuffer);
+    void recordRestirGiCountersReadback(VkCommandBuffer commandBuffer);
     void recordHeightFog(VkCommandBuffer commandBuffer);
     void recordHeightFogPass(VkCommandBuffer commandBuffer);
     void recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy = false);
@@ -985,6 +1139,7 @@ private:
     void copyHistoryResourcesPass(VkCommandBuffer commandBuffer);
     void copyNrdHistoryResources(VkCommandBuffer commandBuffer);
     void copyNrdHistoryResourcesPass(VkCommandBuffer commandBuffer);
+    [[nodiscard]] bool copyRestirDiHistoryBuffers(VkCommandBuffer commandBuffer);
     void recordWavefrontQueueClearPass(VkCommandBuffer commandBuffer);
     void recordWavefrontPrimaryGeneratePass(VkCommandBuffer commandBuffer);
     void recordWavefrontShadePass(
@@ -1016,10 +1171,35 @@ private:
     [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
     [[nodiscard]] bool shouldRunRestirGiFinal() const;
+    [[nodiscard]] bool shouldRunRestirGiTemporal() const;            // Phase 4
+    [[nodiscard]] bool shouldRunRestirGiSpatialProd() const;         // Phase 5 production
+    [[nodiscard]] bool shouldRunRestirGiFinalProd() const;           // Phase 6 production
+    [[nodiscard]] bool shouldRunRestirGiUpsample() const;            // Phase 7
+    [[nodiscard]] bool shouldRunRestirGiSpatialStage() const;
+    [[nodiscard]] bool shouldUseRestirGiActiveTileMask() const;
+    [[nodiscard]] bool shouldCollectRestirCounters() const;
+    [[nodiscard]] bool shouldUseRestirHistoryPingPong() const;
+    [[nodiscard]] const Buffer& restirDiCurrentReceiverBuffer() const;
+    [[nodiscard]] const Buffer& restirDiPreviousReceiverBuffer() const;
+    [[nodiscard]] const Buffer& restirDiCurrentHistoryReservoirBuffer() const;
+    [[nodiscard]] const Buffer& restirDiPreviousHistoryReservoirBuffer() const;
+    [[nodiscard]] const Buffer& restirGiCurrentReceiverBuffer() const;
+    [[nodiscard]] const Buffer& restirGiPreviousReceiverBuffer() const;
+    [[nodiscard]] const Buffer& restirGiCurrentProductionHistoryBuffer() const;
+    [[nodiscard]] const Buffer& restirGiPreviousProductionHistoryBuffer() const;
+    [[nodiscard]] const Buffer& restirGiProductionHistorySourceBuffer() const;
+    [[nodiscard]] bool shouldUseRestirGiLegacyCache() const;
+    [[nodiscard]] bool shouldUseRestirGiProduction() const;
+    [[nodiscard]] bool shouldUseRestirGiReferenceValidation() const;
+    [[nodiscard]] bool shouldUseNewRestirGi() const;
+    [[nodiscard]] bool usesRestirGiUncompressedInitialReservoir() const;
     [[nodiscard]] bool shouldUseNewRestirDi() const;
+    [[nodiscard]] bool shouldRunRestirDiEstimator() const;
     [[nodiscard]] bool shouldRunRestirDiTemporal() const;
     [[nodiscard]] bool shouldRunRestirDiSpatial() const;
     [[nodiscard]] bool shouldRunRestirDiFinal() const;
+    [[nodiscard]] bool shouldAliasRestirDiFinal() const;
+    [[nodiscard]] const Buffer& restirDiFinalOutputBuffer() const;
     [[nodiscard]] bool shouldRunWavefrontDebugWrite() const;
     [[nodiscard]] bool shouldUseWavefrontFinalOutput() const;
     [[nodiscard]] bool effectiveLimitSamplesPerPixel() const;
@@ -1153,6 +1333,16 @@ private:
     bool restirGiHistoryValid_ = false;
     bool restirDiHistoryValid_ = false;
     bool restirGiUncompressedLayout_ = false;
+    bool restirGiActiveTileMaskAutoEnabled_ = false;
+    uint32_t restirGiActiveTileMaskAutoFrame_ = 0;
+    float restirGiActiveTileMaskAutoOffMs_ = 0.0f;
+    float restirGiActiveTileMaskAutoOnMs_ = 0.0f;
+    uint32_t restirGiActiveTileMaskAutoOffSamples_ = 0;
+    uint32_t restirGiActiveTileMaskAutoOnSamples_ = 0;
+    uint32_t lightVersionCounter_ = 0u;          // Phase 8
+    uint32_t materialVersionCounter_ = 0u;       // Phase 8
+    uint32_t objectVersionCounter_ = 0u;         // Phase 8
+    uint32_t environmentVersionCounter_ = 0u;    // Phase 8
     bool resourceAliasingEnabled_ = true;
     uint64_t pickSceneVersion_ = 0;
     PendingPickRequest pendingPick_{};
@@ -1256,9 +1446,20 @@ private:
     Buffer previousRestirReservoirBuffer_;
     Buffer restirSpatialReservoirBuffer_;
     Buffer restirGiReservoirBuffer_;
+    Buffer restirGiProductionReservoirBuffer_;  // Reconnected production reservoir (96B logical ABI)
+    Buffer previousRestirGiProductionReservoirBuffer_;
     Buffer previousRestirGiReservoirBuffer_;
     Buffer restirGiSpatialReservoirBuffer_;
     Buffer wavefrontRestirGiReservoirBuffer_;
+    Buffer restirGiReceiverBuffer_;          // Phase 2: receiver data for GI reuse
+    Buffer restirGiTemporalReservoirBuffer_; // Phase 4: temporal reuse output
+    Buffer previousRestirGiReceiverBuffer_;  // Phase 4: previous frame receiver data
+    Buffer restirGiHalfResSpatialBuffer_;    // Phase 7: half-resolution spatial output
+    Buffer restirGiHalfResReceiverBuffer_;   // Phase 7: half-resolution receiver data
+    Buffer restirGiUpsampledReservoirBuffer_; // Phase 7: upsampled full-res output
+    Buffer restirGiActiveTileMaskBuffer_;
+    Buffer restirGiCountersBuffer_;
+    Buffer restirGiCountersReadbackBuffer_;
 
     // New ReSTIR DI buffers (plan Phase 1)
     Buffer restirDiReceiverBuffer_;
@@ -1267,6 +1468,7 @@ private:
     Buffer restirDiSpatialReservoirBuffer_;
     Buffer restirDiFinalReservoirBuffer_;
     Buffer previousRestirDiReservoirBuffer_;
+    Buffer previousRestirDiReceiverBuffer_;
     Buffer restirDiCountersBuffer_;
     Buffer restirDiCountersReadbackBuffer_;
     Buffer selectionParamsBuffer_;
@@ -1290,9 +1492,21 @@ private:
     std::unique_ptr<ShaderModule> restirSpatialShader_;
     std::unique_ptr<ShaderModule> restirGiSpatialShader_;
     std::unique_ptr<ShaderModule> restirGiFinalShader_;
+    std::unique_ptr<ShaderModule> restirGiSpatialProdShader_;     // Phase 5 production
+    std::unique_ptr<ShaderModule> restirGiFinalProdShader_;       // Phase 6 production
+    std::unique_ptr<ShaderModule> restirGiTemporalShader_;        // Phase 4
+    std::unique_ptr<ShaderModule> restirGiTemporalFullShader_;
+    std::unique_ptr<ShaderModule> restirGiTemporalValidationShader_;
+    std::unique_ptr<ShaderModule> restirGiUpsampleShader_;        // Phase 7
+    std::unique_ptr<ShaderModule> restirGiSpatialValidationShader_;
+    std::unique_ptr<ShaderModule> restirGiFinalValidationShader_;
+    std::unique_ptr<ShaderModule> restirGiUpsampleValidationShader_;
     std::unique_ptr<ShaderModule> restirDiTemporalShader_;
     std::unique_ptr<ShaderModule> restirDiSpatialShader_;
     std::unique_ptr<ShaderModule> restirDiFinalShader_;
+    std::unique_ptr<ShaderModule> restirDiTemporalFullShader_;
+    std::unique_ptr<ShaderModule> restirDiSpatialFullShader_;
+    std::unique_ptr<ShaderModule> restirDiFinalFullShader_;
     std::unique_ptr<ShaderModule> fogShader_;
     std::unique_ptr<ShaderModule> transmittanceShader_;
     std::unique_ptr<ShaderModule> multiScatterShader_;
@@ -1308,6 +1522,12 @@ private:
     std::unique_ptr<ShaderModule> fullscreenFragmentShader_;
     std::unique_ptr<ShaderModule> raygenShader_;
     std::unique_ptr<ShaderModule> raygenMotionShader_;
+    std::unique_ptr<ShaderModule> raygenFullShader_;
+    std::unique_ptr<ShaderModule> raygenMotionFullShader_;
+    std::unique_ptr<ShaderModule> raygenGiFullShader_;
+    std::unique_ptr<ShaderModule> raygenMotionGiFullShader_;
+    std::unique_ptr<ShaderModule> raygenAllFullShader_;
+    std::unique_ptr<ShaderModule> raygenMotionAllFullShader_;
     std::unique_ptr<ShaderModule> primaryMissShader_;
     std::unique_ptr<ShaderModule> shadowMissShader_;
     std::unique_ptr<ShaderModule> closestHitShader_;
@@ -1335,9 +1555,21 @@ private:
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirGiSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirGiFinalPipeline_;
+    std::unique_ptr<ComputePipeline> restirGiTemporalPipeline_;     // Phase 4
+    std::unique_ptr<ComputePipeline> restirGiTemporalFullPipeline_;
+    std::unique_ptr<ComputePipeline> restirGiTemporalValidationPipeline_;
+    std::unique_ptr<ComputePipeline> restirGiSpatialProdPipeline_;  // Phase 5 production
+    std::unique_ptr<ComputePipeline> restirGiFinalProdPipeline_;    // Phase 6 production
+    std::unique_ptr<ComputePipeline> restirGiUpsamplePipeline_;     // Phase 7
+    std::unique_ptr<ComputePipeline> restirGiSpatialValidationPipeline_;
+    std::unique_ptr<ComputePipeline> restirGiFinalValidationPipeline_;
+    std::unique_ptr<ComputePipeline> restirGiUpsampleValidationPipeline_;
     std::unique_ptr<ComputePipeline> restirDiTemporalPipeline_;
     std::unique_ptr<ComputePipeline> restirDiSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirDiFinalPipeline_;
+    std::unique_ptr<ComputePipeline> restirDiTemporalFullPipeline_;
+    std::unique_ptr<ComputePipeline> restirDiSpatialFullPipeline_;
+    std::unique_ptr<ComputePipeline> restirDiFinalFullPipeline_;
     std::unique_ptr<ComputePipeline> fogPipeline_;
     std::unique_ptr<ComputePipeline> selectionOutlinePipeline_;
     std::unique_ptr<ComputePipeline> luminanceHistogramPipeline_;
@@ -1354,6 +1586,12 @@ private:
     std::unique_ptr<GraphicsPipeline> graphicsPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingMotionPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingFullPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingMotionFullPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingGiFullPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingMotionGiFullPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingAllFullPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingMotionAllFullPipeline_;
     std::unique_ptr<RayTracingPipeline> wavefrontTracePipeline_;
     std::unique_ptr<RayTracingPipeline> wavefrontTraceSerPipeline_;
     std::unique_ptr<RayTracingScene> rayTracingScene_;
@@ -1372,6 +1610,10 @@ private:
     VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirGiSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirGiFinalSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout restirGiTemporalSetLayout_ = VK_NULL_HANDLE;  // Phase 4
+    VkDescriptorSetLayout restirGiSpatialProdSetLayout_ = VK_NULL_HANDLE; // Phase 5
+    VkDescriptorSetLayout restirGiFinalProdSetLayout_ = VK_NULL_HANDLE;   // Phase 6
+    VkDescriptorSetLayout restirGiUpsampleSetLayout_ = VK_NULL_HANDLE;    // Phase 7
     VkDescriptorSetLayout restirDiTemporalSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirDiSpatialSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirDiFinalSetLayout_ = VK_NULL_HANDLE;
@@ -1391,6 +1633,7 @@ private:
     VkDescriptorSetLayout graphicsSetLayout_ = VK_NULL_HANDLE;
     std::vector<std::unique_ptr<FrameResources>> frames_;
     std::vector<GpuProfiler> profilers_;
+    std::vector<int8_t> restirGiActiveTileMaskProfilerModes_;
     FrameResources* currentFrame_ = nullptr;
     GpuProfiler* currentProfiler_ = nullptr;
     RendererValidationLog validationLog_;

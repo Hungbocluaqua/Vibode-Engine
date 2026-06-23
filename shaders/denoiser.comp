@@ -41,6 +41,7 @@ struct PathDataRecord {
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
     vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
 };
 layout(set = 0, binding = 10, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 layout(set = 0, binding = 11, rgba16f) readonly uniform image2D diffuse_history;
@@ -549,7 +550,9 @@ void main() {
     float lum_delta = abs(history_lum_before_clip - center_lum) / (max(center_lum, history_lum_before_clip) + 0.02);
     float clipped_lum_delta = abs(history_lum_before_clip - history_lum_after_clip) / (history_lum_before_clip + 0.02);
     float neighborhood_lum_delta = abs(history_lum_before_clip - lum_mean) / (lum_mean + lum_sigma + 0.02);
-    float reactive_mask = temporal_reactive_weight(lum_delta, clipped_lum_delta, neighborhood_lum_delta);
+    float reactive_mask = max(
+        temporal_reactive_weight(lum_delta, clipped_lum_delta, neighborhood_lum_delta),
+        clamp(path_data.emissive_residual.a, 0.0, 1.0));
 
     vec2 m_dd = imageLoad(direct_diffuse_moments, coords).rg;
     vec2 m_ds = imageLoad(direct_specular_moments, coords).rg;
@@ -739,7 +742,12 @@ void main() {
         debug_color = vec3(specular_var);
     }
 
-    vec3 denoised = params.debug_view == 0u ? resolved_color : debug_color;
+    // Prefer the accumulated path-traced signal once it is more stable than the temporal filter.
+    float converged_raw_blend =
+        smoothstep(16.0, 64.0, float(params.frames_since_reset)) *
+        (1.0 - motion_filter_boost);
+    vec3 beauty_color = mix(resolved_color, center_color, converged_raw_blend);
+    vec3 denoised = params.debug_view == 0u ? beauty_color : debug_color;
     imageStore(output_diffuse_history, coords, vec4(resolved_diffuse, 1.0));
     imageStore(output_specular_history, coords, vec4(resolved_specular, 1.0));
     imageStore(output_denoised, coords, vec4(denoised, 1.0));

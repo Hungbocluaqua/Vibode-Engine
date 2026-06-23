@@ -52,6 +52,7 @@ struct RayTracingBlasGeometryStats {
     uint32_t opacityMicromapGeometryCount = 0;
     uint32_t gpuSkinnedMeshCount = 0;
     uint32_t gpuSkinnedGeometryCount = 0;
+    uint32_t buildBatchCount = 0;
 };
 
 struct RayTracingMotionInstanceStats {

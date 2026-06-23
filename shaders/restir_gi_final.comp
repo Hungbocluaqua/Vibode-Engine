@@ -1,6 +1,10 @@
-#version 450
+// ReSTIR GI Final Shading (LegacyCache)
+// Self-contained: no rt_common.glsl dependency.
+
+#version 460
 #extension GL_GOOGLE_include_directive : require
 
+#include "path_data_common.glsl"
 #include "restir_common.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -10,44 +14,9 @@ layout(set = 0, binding = 1, std430) readonly buffer CurrentGiReservoirs { Resti
 layout(set = 0, binding = 3, std430) readonly buffer SpatialGiReservoirs { RestirGiReservoir spatial_gi_reservoirs[]; };
 layout(set = 0, binding = 7, std430) buffer AccumulationBuffer { vec4 accumulation_buffer[]; };
 layout(set = 0, binding = 8, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
-
-struct PathDataRecord {
-    vec4 direct_diffuse;
-    vec4 direct_specular;
-    vec4 indirect_diffuse;
-    vec4 indirect_specular;
-    vec4 albedo_roughness_hit_confidence;
-    vec4 material_specular_albedo;
-    vec4 denoiser_hit_distance;
-    vec4 diffuse_ray_direction_hit_distance;
-    vec4 specular_ray_direction_hit_distance;
-    vec4 emissive_residual;
-};
-
 layout(set = 0, binding = 6, std430) buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 
-const float SCREEN_VELOCITY_PACK_SCALE = 512.0;
-
-vec2 restir_unpack_velocity_pixels(uint packedVelocity) {
-    int x = int(packedVelocity & 0xffffu);
-    int y = int((packedVelocity >> 16u) & 0xffffu);
-    if (x >= 32768) {
-        x -= 65536;
-    }
-    if (y >= 32768) {
-        y -= 65536;
-    }
-    return vec2(float(x), float(y)) * (SCREEN_VELOCITY_PACK_SCALE / 32767.0);
-}
-
-layout(set = 0, binding = 4, std140) uniform RendererDebug {
-    uint view;
-    uint flags;
-    uint selected_instance;
-    float scale;
-} debug_params;
-
-layout(set = 0, binding = 5, std140) uniform RestirGiFinalParams {
+layout(set = 0, binding = 5, std140) uniform RestirGiSpatialParams {
     uint width;
     uint height;
     uint frame_count;
@@ -63,48 +32,47 @@ layout(set = 0, binding = 5, std140) uniform RestirGiFinalParams {
     vec4 camera_position;
 } params;
 
-vec3 reservoir_radiance(RestirGiReservoir reservoir) {
-    return restir_gi_reservoir_valid(reservoir) ? max(reservoir.radiance_weight_sum.rgb, vec3(0.0)) : vec3(0.0);
-}
-
-float luminance(vec3 value) {
-    return dot(value, vec3(0.2126, 0.7152, 0.0722));
-}
-
-float reservoir_confidence(RestirGiReservoir reservoir) {
-    if (!restir_gi_reservoir_valid(reservoir)) {
-        return 0.0;
-    }
-    float sampleConfidence = clamp(restir_gi_sample_count(reservoir) / 16.0, 0.0, 1.0);
-    float ageConfidence = 1.0 - restir_gi_age_normalized(reservoir, 32.0);
-    return sampleConfidence * ageConfidence * (restir_gi_visible(reservoir) ? 1.0 : 0.0);
-}
-
-vec3 clamp_luminance_preserve_hue(vec3 value, float maxLum) {
-    value = max(value, vec3(0.0));
-    float valueLum = luminance(value);
-    if (valueLum <= maxLum || valueLum <= 1.0e-6) {
-        return value;
-    }
-    return value * (maxLum / valueLum);
-}
+layout(set = 0, binding = 4, std140) uniform DebugParams {
+    uint view;
+    uint flags;
+    uint selected_instance;
+    float scale;
+} debug_params;
 
 void main() {
-    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
-    if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
-        return;
-    }
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(params.width) || pixel.y >= int(params.height)) return;
+    uint pixelIndex = pixel.y * params.width + pixel.x;
 
-    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
-    RestirGiReservoir currentReservoir = current_gi_reservoirs[pixelIndex];
-    RestirGiReservoir spatialReservoir = spatial_gi_reservoirs[pixelIndex];
+    RestirGiReservoir currentRes = current_gi_reservoirs[pixelIndex];
+    RestirGiReservoir spatialRes = spatial_gi_reservoirs[pixelIndex];
+    RestirGiReservoir selectedRes = restir_gi_reservoir_valid(spatialRes) ? spatialRes : currentRes;
 
-    vec3 currentGi = reservoir_radiance(currentReservoir);
-    vec3 spatialGi = reservoir_radiance(spatialReservoir);
+    vec3 currentGi = restir_gi_reservoir_valid(currentRes) ? max(currentRes.radiance_weight_sum.rgb, vec3(0.0)) : vec3(0.0);
+    vec3 spatialGi = restir_gi_reservoir_valid(spatialRes) ? max(spatialRes.radiance_weight_sum.rgb, vec3(0.0)) : vec3(0.0);
     float debugScale = max(debug_params.scale, 1.0);
 
     if (debug_params.view == 72u) {
-        imageStore(raw_image, coords, vec4(spatialGi * debugScale * 16.0, 1.0));
+        imageStore(raw_image, pixel, vec4(spatialGi * debugScale * 16.0, 1.0));
+        return;
+    }
+    if (debug_params.view == 127u) {
+        vec3 targetGi = restir_gi_reservoir_valid(spatialRes) ? spatialGi : currentGi;
+        float l = clamp(restir_luminance(max(targetGi, vec3(0.0))) * debugScale * 16.0, 0.0, 1.0);
+        vec3 tint = ((pixel.x ^ pixel.y) & 1) == 0
+            ? vec3(0.2, 0.55, 1.0)
+            : vec3(1.0, 0.45, 0.15);
+        imageStore(raw_image, pixel, vec4(tint * l, 1.0));
+        return;
+    }
+    if (debug_params.view == 128u) {
+        if (!restir_gi_reservoir_valid(selectedRes)) {
+            imageStore(raw_image, pixel, vec4(0.3, 0.0, 0.05, 1.0));
+            return;
+        }
+        float roughness = restir_gi_roughness(selectedRes);
+        vec3 tint = roughness >= 0.35 ? vec3(0.1, 0.9, 0.35) : vec3(1.0, 0.55, 0.08);
+        imageStore(raw_image, pixel, vec4(tint, 1.0));
         return;
     }
 
@@ -113,77 +81,75 @@ void main() {
     if (!beautyView && !finalDebugView) {
         return;
     }
-    if (params.enabled == 0u && !finalDebugView) {
+    if ((params.enabled & 1u) == 0u && !finalDebugView) {
         return;
     }
 
-    vec3 base = max(imageLoad(raw_image, coords).rgb, vec3(0.0));
-    vec4 accumulated = accumulation_buffer[pixelIndex];
-    float accumulationSamples = max(accumulated.a, 1.0);
-    RestirGiReservoir confidenceReservoir = restir_gi_reservoir_valid(spatialReservoir)
-        ? spatialReservoir
-        : currentReservoir;
-    vec3 targetGi = restir_gi_reservoir_valid(spatialReservoir)
-        ? spatialGi
-        : currentGi;
-    float giConfidence = reservoir_confidence(confidenceReservoir);
-    float baseLum = luminance(base);
-    float currentLum = luminance(currentGi);
-    float targetLum = luminance(targetGi);
-    bool finalStabilizationEnabled = (params.enabled & 2u) != 0u;
-    float replacementStrength = 1.0;
-    vec3 replacementGi = targetGi;
-    if (finalStabilizationEnabled) {
-        float radianceAgreement = sqrt((min(currentLum, targetLum) + 0.01) / (max(currentLum, targetLum) + 0.01));
-        float darkStability = smoothstep(0.035, 0.35, baseLum);
-        float historyStability = smoothstep(2.0, 12.0, accumulationSamples);
-        float motionPixels = length(restir_unpack_velocity_pixels(velocity_buffer[pixelIndex]));
-        float motionStability = 1.0 - smoothstep(1.0, 18.0, motionPixels);
-        replacementStrength = clamp(
-            giConfidence *
-            mix(0.10, 0.65, darkStability) *
-            mix(0.35, 1.0, historyStability) *
-            mix(0.25, 1.0, motionStability) *
-            mix(0.40, 1.0, radianceAgreement),
-            0.0,
-            0.65);
-        replacementGi = mix(currentGi, targetGi, replacementStrength);
-        float replacementLumLimit = max(
-            0.006,
-            currentLum * mix(1.15, 2.50, darkStability) +
-            baseLum * mix(0.10, 0.35, darkStability) +
-            mix(0.006, 0.025, darkStability));
-        replacementGi = clamp_luminance_preserve_hue(replacementGi, replacementLumLimit);
-    }
-    vec3 giDelta = replacementGi - currentGi;
-    accumulation_buffer[pixelIndex] = vec4(max(accumulated.rgb + giDelta, vec3(0.0)), accumulated.a);
-    float rawDeltaScale = params.raw_output_is_current_sample > 0.5 ? 1.0 : (1.0 / accumulationSamples);
-    vec3 replaced = max(base + giDelta * rawDeltaScale, vec3(0.0));
-    imageStore(raw_image, coords, vec4(replaced, 1.0));
-
-    PathDataRecord path = path_data_buffer[pixelIndex];
-    path.indirect_diffuse.rgb = max(path.indirect_diffuse.rgb + giDelta, vec3(0.0));
-    float guideStrength = giConfidence * replacementStrength;
-    path.indirect_diffuse.a = max(path.indirect_diffuse.a, guideStrength);
-    if (restir_gi_reservoir_valid(confidenceReservoir)) {
-        float giHitDistance = clamp(restir_gi_hit_distance(confidenceReservoir), 0.0, 65504.0);
-        if (guideStrength > 0.04 && giHitDistance > 0.001 && giHitDistance < 65504.0) {
-            float guideBlend = clamp(guideStrength, 0.0, 0.75);
-            float previousDiffuseHitDistance = path.denoiser_hit_distance.x > 0.001 && path.denoiser_hit_distance.x < 65504.0
-                ? path.denoiser_hit_distance.x
-                : giHitDistance;
-            path.denoiser_hit_distance.x = mix(previousDiffuseHitDistance, giHitDistance, guideBlend);
-            path.diffuse_ray_direction_hit_distance.w = path.denoiser_hit_distance.x;
-#if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-            vec3 giDirection = confidenceReservoir.hit_position_target_pdf.xyz - confidenceReservoir.receiver_position_hit_distance.xyz;
-            if (dot(giDirection, giDirection) > 1.0e-8) {
-                vec3 previousDiffuseDirection = dot(path.diffuse_ray_direction_hit_distance.xyz, path.diffuse_ray_direction_hit_distance.xyz) > 1.0e-8
-                    ? normalize(path.diffuse_ray_direction_hit_distance.xyz)
-                    : normalize(giDirection);
-                path.diffuse_ray_direction_hit_distance.xyz = normalize(mix(previousDiffuseDirection, normalize(giDirection), guideBlend));
-            }
-#endif
+    float giConfidence = 0.0;
+    {
+        if (restir_gi_reservoir_valid(selectedRes)) {
+            float sampleFactor = clamp(restir_gi_sample_count(selectedRes) / 16.0, 0.0, 1.0);
+            float ageFactor = 1.0 - clamp(float(restir_gi_age(selectedRes)) / 32.0, 0.0, 0.75);
+            float visFactor = restir_gi_visible(selectedRes) ? 1.0 : 0.25;
+            giConfidence = sampleFactor * ageFactor * visFactor;
         }
     }
-    path_data_buffer[pixelIndex] = path;
+
+    vec4 rawBase = imageLoad(raw_image, pixel);
+    vec4 accumulated = accumulation_buffer[pixelIndex];
+    float accumSamples = max(accumulated.a, 1.0);
+
+    bool finalStabilizationEnabled = (params.enabled & 2u) != 0u;
+    vec3 targetGi = restir_gi_reservoir_valid(spatialRes) ? spatialGi : currentGi;
+    vec3 replacementGi = targetGi;
+    float replacementStrength = 1.0;
+
+    if (finalStabilizationEnabled) {
+        float baseLum = max(restir_luminance(rawBase.rgb), 1.0e-6);
+        float giLum = max(restir_luminance(targetGi), 1.0e-6);
+        float rawLum = max(restir_luminance(rawBase.rgb + targetGi), 1.0e-6);
+        float ratio = min(baseLum, giLum) / max(rawLum, 1.0e-6);
+        float agreementFactor = sqrt(clamp(ratio, 0.0, 1.0));
+        float historyFactor = 1.0 - exp(-accumSamples / 16.0);
+        uint packedVel = velocity_buffer[pixelIndex];
+        int encodedX = int(packedVel & 0xffffu);
+        int encodedY = int((packedVel >> 16u) & 0xffffu);
+        if (encodedX >= 32768) encodedX -= 65536;
+        if (encodedY >= 32768) encodedY -= 65536;
+        float motionMag = length(vec2(encodedX, encodedY) * (512.0 / 32767.0));
+        float motionFactor = 1.0 - smoothstep(0.0, 4.0, motionMag);
+        replacementStrength = agreementFactor * historyFactor * motionFactor * giConfidence;
+        replacementStrength = clamp(replacementStrength, 0.0, 0.65);
+        replacementGi = mix(currentGi, targetGi, replacementStrength);
+    }
+
+    float currentLum = restir_luminance(replacementGi);
+    float baseLum = restir_luminance(rawBase.rgb);
+    float maxGiLum = baseLum * 4.0 + 0.5;
+    if (currentLum > maxGiLum) replacementGi *= maxGiLum / currentLum;
+
+    vec3 giDelta = replacementGi - currentGi;
+    accumulated.rgb = max(accumulated.rgb + giDelta, vec3(0.0));
+    accumulation_buffer[pixelIndex] = accumulated;
+
+    float rawDeltaScale = params.raw_output_is_current_sample > 0.5 ? 1.0 : 1.0 / max(accumulated.a, 1.0);
+    imageStore(raw_image, pixel, vec4(max(rawBase.rgb + giDelta * rawDeltaScale, vec3(0.0)), 1.0));
+
+    PathDataRecord pathData = path_data_buffer[pixelIndex];
+    pathData.indirect_diffuse.rgb = max(pathData.indirect_diffuse.rgb + giDelta, vec3(0.0));
+    float guideStrength = giConfidence * replacementStrength;
+    pathData.indirect_diffuse.a = max(pathData.indirect_diffuse.a, guideStrength);
+    if (restir_gi_reservoir_valid(selectedRes)) {
+        float giHitDistance = clamp(restir_gi_hit_distance(selectedRes), 0.0, 65504.0);
+        if (guideStrength > 0.04 && giHitDistance > 0.001 && giHitDistance < 65504.0) {
+            float guideBlend = clamp(guideStrength, 0.0, 0.75);
+            float previousDiffuseHitDistance =
+                pathData.denoiser_hit_distance.x > 0.001 && pathData.denoiser_hit_distance.x < 65504.0
+                    ? pathData.denoiser_hit_distance.x
+                    : giHitDistance;
+            pathData.denoiser_hit_distance.x = mix(previousDiffuseHitDistance, giHitDistance, guideBlend);
+            pathData.diffuse_ray_direction_hit_distance.w = pathData.denoiser_hit_distance.x;
+        }
+    }
+    path_data_buffer[pixelIndex] = pathData;
 }

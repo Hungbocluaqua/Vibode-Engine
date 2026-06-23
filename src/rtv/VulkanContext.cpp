@@ -455,20 +455,29 @@ void VulkanContext::createDevice() {
     bufferDeviceAddress.bufferDeviceAddress = rayTracingInfo_.capabilities.bufferDeviceAddress ? VK_TRUE : VK_FALSE;
 
     void* featureTail = &features13;
+    const bool usePromotedVulkan12Features =
+#if defined(RTV_STREAMLINE_SDK_CONFIGURED)
+        enableStreamlineFeatures12;
+#else
+        false;
+#endif
     if (rayTracingInfo_.capabilities.supported) {
         rayTracingPipeline.pNext = featureTail;
         accelerationStructure.pNext = &rayTracingPipeline;
         rayQuery.pNext = &accelerationStructure;
-        bufferDeviceAddress.pNext = &rayQuery;
-        featureTail = &bufferDeviceAddress;
-    } else if (rayTracingInfo_.capabilities.bufferDeviceAddress) {
+        if (usePromotedVulkan12Features) {
+            featureTail = &rayQuery;
+        } else {
+            bufferDeviceAddress.pNext = &rayQuery;
+            featureTail = &bufferDeviceAddress;
+        }
+    } else if (rayTracingInfo_.capabilities.bufferDeviceAddress && !usePromotedVulkan12Features) {
         bufferDeviceAddress.pNext = featureTail;
         featureTail = &bufferDeviceAddress;
     }
 
     VkPhysicalDeviceDescriptorIndexingFeatures descriptorIndexing{};
     descriptorIndexing.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
-    descriptorIndexing.pNext = featureTail;
     if (bindlessCapabilities_.descriptorIndexing) {
         descriptorIndexing.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     }
@@ -481,7 +490,10 @@ void VulkanContext::createDevice() {
     if (bindlessCapabilities_.updateAfterBind) {
         descriptorIndexing.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
     }
-    featureTail = &descriptorIndexing;
+    if (!usePromotedVulkan12Features) {
+        descriptorIndexing.pNext = featureTail;
+        featureTail = &descriptorIndexing;
+    }
 
     VkPhysicalDeviceOpacityMicromapFeaturesEXT opacityMicromapFeatures{};
     opacityMicromapFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
@@ -512,7 +524,7 @@ void VulkanContext::createDevice() {
     VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphore{};
     timelineSemaphore.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
     timelineSemaphore.timelineSemaphore = VK_TRUE;
-    if (timelineSemaphoreSupported_) {
+    if (timelineSemaphoreSupported_ && !usePromotedVulkan12Features) {
         timelineSemaphore.pNext = featureTail;
         featureTail = &timelineSemaphore;
     }
@@ -538,13 +550,27 @@ void VulkanContext::createDevice() {
     storage8BitFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
     storage8BitFeatures.storageBuffer8BitAccess = storageBuffer8BitAccess_ ? VK_TRUE : VK_FALSE;
     storage8BitFeatures.uniformAndStorageBuffer8BitAccess = uniformAndStorageBuffer8BitAccess_ ? VK_TRUE : VK_FALSE;
-    if (storageBuffer8BitAccess_ || uniformAndStorageBuffer8BitAccess_) {
+    if ((storageBuffer8BitAccess_ || uniformAndStorageBuffer8BitAccess_) && !usePromotedVulkan12Features) {
         storage8BitFeatures.pNext = featureTail;
         featureTail = &storage8BitFeatures;
     }
 
 #if defined(RTV_STREAMLINE_SDK_CONFIGURED)
     if (enableStreamlineFeatures12) {
+        streamlineFeatures12.timelineSemaphore = timelineSemaphoreSupported_ ? VK_TRUE : streamlineFeatures12.timelineSemaphore;
+        streamlineFeatures12.bufferDeviceAddress = rayTracingInfo_.capabilities.bufferDeviceAddress ? VK_TRUE : streamlineFeatures12.bufferDeviceAddress;
+        streamlineFeatures12.shaderSampledImageArrayNonUniformIndexing =
+            bindlessCapabilities_.descriptorIndexing ? VK_TRUE : streamlineFeatures12.shaderSampledImageArrayNonUniformIndexing;
+        streamlineFeatures12.runtimeDescriptorArray =
+            bindlessCapabilities_.runtimeDescriptorArray ? VK_TRUE : streamlineFeatures12.runtimeDescriptorArray;
+        streamlineFeatures12.descriptorBindingPartiallyBound =
+            bindlessCapabilities_.partiallyBound ? VK_TRUE : streamlineFeatures12.descriptorBindingPartiallyBound;
+        streamlineFeatures12.descriptorBindingSampledImageUpdateAfterBind =
+            bindlessCapabilities_.updateAfterBind ? VK_TRUE : streamlineFeatures12.descriptorBindingSampledImageUpdateAfterBind;
+        streamlineFeatures12.storageBuffer8BitAccess =
+            storageBuffer8BitAccess_ ? VK_TRUE : streamlineFeatures12.storageBuffer8BitAccess;
+        streamlineFeatures12.uniformAndStorageBuffer8BitAccess =
+            uniformAndStorageBuffer8BitAccess_ ? VK_TRUE : streamlineFeatures12.uniformAndStorageBuffer8BitAccess;
         streamlineFeatures12.pNext = featureTail;
         featureTail = &streamlineFeatures12;
     }
@@ -602,6 +628,16 @@ void VulkanContext::createDevice() {
                 std::cout << "Streamline Vulkan device extension unavailable: " << extension << '\n';
             }
         }
+    }
+    const bool khrBufferDeviceAddressEnabled = std::any_of(enabledExtensions.begin(), enabledExtensions.end(), [](const char* extension) {
+        return std::strcmp(extension, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) == 0;
+    });
+    if (khrBufferDeviceAddressEnabled) {
+        enabledExtensions.erase(
+            std::remove_if(enabledExtensions.begin(), enabledExtensions.end(), [](const char* extension) {
+                return std::strcmp(extension, VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) == 0;
+            }),
+            enabledExtensions.end());
     }
     createInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
     createInfo.ppEnabledExtensionNames = enabledExtensions.data();

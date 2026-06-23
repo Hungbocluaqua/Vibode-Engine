@@ -2876,12 +2876,32 @@ int main(int argc, char** argv) {
         std::optional<rtv::RenderPreset> renderPresetOverride;
         std::optional<bool> restirGiOverride;
         std::optional<bool> restirGiFinalStabilizationOverride;
+        std::optional<rtv::RestirGiMode> restirGiModeOverride;
+        std::optional<rtv::RestirGiReservoirLayout> restirGiReservoirLayoutOverride;
+        std::optional<uint32_t> restirGiTemporalMaxAgeOverride;
+        std::optional<uint32_t> restirGiSpatialRoundsOverride;
+        std::optional<float> restirGiSpatialRadiusOverride;
+        std::optional<float> restirGiDepthThresholdScaleOverride;
+        std::optional<float> restirGiSpatialCompatibilityThresholdOverride;
+        std::optional<bool> restirGiHalfResolutionOverride;
+        std::optional<uint32_t> restirGiVisibilityRayBudgetOverride;
+        std::optional<float> restirGiMinFinalBlendStrengthOverride;
+        std::optional<rtv::RestirGiActiveTileMaskMode> restirGiActiveTileMaskOverride;
+        std::optional<rtv::RestirHistoryCopyMode> restirHistoryCopyModeOverride;
+        std::optional<rtv::RestirCounterMode> restirCounterModeOverride;
         std::optional<rtv::RestirDiMode> restirDiModeOverride;
         std::optional<bool> restirDiTemporalOverride;
         std::optional<bool> restirDiSpatialOverride;
+        std::optional<bool> restirDiFinalVisibilityOverride;
         std::optional<uint32_t> restirDiSpatialRoundsOverride;
         std::optional<float> restirDiSpatialRadiusOverride;
         std::optional<uint32_t> restirDiTemporalMaxAgeOverride;
+        std::optional<uint32_t> restirDiMaxMOverride;
+        std::optional<uint32_t> restirDiVisibilityRayBudgetOverride;
+        std::optional<float> restirDiClampLuminanceOverride;
+        std::optional<bool> restirDiIncludeSunOverride;
+        std::optional<bool> restirDiIncludeEnvironmentOverride;
+        std::optional<bool> restirDiStabilizationOverride;
         std::optional<rtv::RestirDiReservoirLayout> restirDiReservoirLayoutOverride;
         std::optional<bool> opacityMicromapOverride;
         std::optional<uint32_t> opacityMicromapSubdivisionOverride;
@@ -3039,6 +3059,15 @@ int main(int argc, char** argv) {
 
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
+
+            if (arg == "--headless-width" && i + 1 < argc) {
+                diagConfig.headlessWidth = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
+                continue;
+            }
+            if (arg == "--headless-height" && i + 1 < argc) {
+                diagConfig.headlessHeight = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
+                continue;
+            }
 
             if (arg == "--check-streaming-budget" && i + 1 < argc) {
                 checkStreamingBudgetPath = std::filesystem::path(argv[++i]);
@@ -3200,6 +3229,11 @@ int main(int argc, char** argv) {
                 restirDiSpatialOverride = !(value == "off" || value == "false" || value == "0");
                 continue;
             }
+            if (arg == "--restir-di-final-visibility" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirDiFinalVisibilityOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
             if (arg == "--restir-di-spatial-rounds" && i + 1 < argc) {
                 restirDiSpatialRoundsOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
                 continue;
@@ -3212,8 +3246,102 @@ int main(int argc, char** argv) {
                 restirDiTemporalMaxAgeOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
                 continue;
             }
+            if (arg == "--restir-di-max-m" && i + 1 < argc) {
+                restirDiMaxMOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if ((arg == "--restir-di-visibility-rays" ||
+                 arg == "--restir-di-visibility-ray-budget") && i + 1 < argc) {
+                restirDiVisibilityRayBudgetOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--restir-di-clamp-luminance" && i + 1 < argc) {
+                restirDiClampLuminanceOverride = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-di-include-sun" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirDiIncludeSunOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
+            if (arg == "--restir-di-include-environment" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirDiIncludeEnvironmentOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
+            if (arg == "--restir-di-stabilization" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirDiStabilizationOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
             if (arg == "--restir-di-layout" && i + 1 < argc) {
                 restirDiReservoirLayoutOverride = rtv::parseRestirDiReservoirLayout(argv[++i]);
+                continue;
+            }
+            if ((arg == "--restir-gi" || arg == "--restir-gi-mode") && i + 1 < argc) {
+                restirGiModeOverride = rtv::parseRestirGiMode(argv[++i]);
+                restirGiOverride = *restirGiModeOverride != rtv::RestirGiMode::Off;
+                continue;
+            }
+            if (arg == "--restir-gi-layout" && i + 1 < argc) {
+                restirGiReservoirLayoutOverride = rtv::parseRestirGiReservoirLayout(argv[++i]);
+                continue;
+            }
+            if ((arg == "--restir-gi-max-age" || arg == "--restir-gi-temporal-max-age") && i + 1 < argc) {
+                restirGiTemporalMaxAgeOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--restir-gi-spatial-rounds" && i + 1 < argc) {
+                restirGiSpatialRoundsOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--restir-gi-spatial-radius" && i + 1 < argc) {
+                restirGiSpatialRadiusOverride = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-gi-depth-threshold-scale" && i + 1 < argc) {
+                restirGiDepthThresholdScaleOverride = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-gi-spatial-compatibility-threshold" && i + 1 < argc) {
+                restirGiSpatialCompatibilityThresholdOverride = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-gi-half-resolution" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                restirGiHalfResolutionOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
+            if ((arg == "--restir-gi-visibility-ray-budget" || arg == "--restir-gi-visibility-rays") && i + 1 < argc) {
+                restirGiVisibilityRayBudgetOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--restir-gi-min-final-blend-strength" && i + 1 < argc) {
+                restirGiMinFinalBlendStrengthOverride = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-gi-active-tile-mask" && i + 1 < argc) {
+                restirGiActiveTileMaskOverride = rtv::parseRestirGiActiveTileMaskMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-history-copy-mode" && i + 1 < argc) {
+                restirHistoryCopyModeOverride = rtv::parseRestirHistoryCopyMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--restir-counters" && i + 1 < argc) {
+                std::string value = argv[++i];
+                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+                    return static_cast<char>(std::tolower(ch));
+                });
+                if (value == "auto" || value == "default") {
+                    restirCounterModeOverride = rtv::RestirCounterMode::Auto;
+                } else if (value == "on" || value == "true" || value == "1") {
+                    restirCounterModeOverride = rtv::RestirCounterMode::On;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    restirCounterModeOverride = rtv::RestirCounterMode::Off;
+                } else {
+                    throw std::runtime_error("Invalid --restir-counters value: expected auto, on, or off");
+                }
                 continue;
             }
 
@@ -3282,9 +3410,6 @@ int main(int argc, char** argv) {
                 }
             } else if (arg == "--render-preset" && i + 1 < argc) {
                 renderPresetOverride = rtv::parseRenderPreset(argv[++i]);
-            } else if (arg == "--restir-gi" && i + 1 < argc) {
-                const std::string_view value(argv[++i]);
-                restirGiOverride = !(value == "off" || value == "false" || value == "0");
             } else if ((arg == "--restir-gi-final-stabilization" || arg == "--restir-gi-stabilization") && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 restirGiFinalStabilizationOverride = !(value == "off" || value == "false" || value == "0");
@@ -3840,6 +3965,8 @@ int main(int argc, char** argv) {
             opacityMicromapSubdivisionOverride,
             debugViewProvided, validationCameraMotion, validationObjectMotion,
             diagConfig.headless,
+            diagConfig.headlessWidth,
+            diagConfig.headlessHeight,
             diagConfig.disableAsyncCompute,
             diagConfig.singleQueueFallback,
             diagConfig.disableResourceAliasing,
@@ -3861,6 +3988,92 @@ int main(int argc, char** argv) {
             if (restirGiFinalStabilizationOverride.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();
                 settings.restirGiFinalStabilizationEnabled = *restirGiFinalStabilizationOverride;
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (restirGiModeOverride.has_value() ||
+                restirGiReservoirLayoutOverride.has_value() ||
+                restirGiTemporalMaxAgeOverride.has_value() ||
+                restirGiSpatialRoundsOverride.has_value() ||
+                restirGiSpatialRadiusOverride.has_value() ||
+                restirGiDepthThresholdScaleOverride.has_value() ||
+                restirGiSpatialCompatibilityThresholdOverride.has_value() ||
+                restirGiHalfResolutionOverride.has_value() ||
+                restirGiVisibilityRayBudgetOverride.has_value() ||
+                restirGiMinFinalBlendStrengthOverride.has_value() ||
+                restirGiActiveTileMaskOverride.has_value() ||
+                restirHistoryCopyModeOverride.has_value() ||
+                restirCounterModeOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (restirGiModeOverride.has_value()) {
+                    settings.restirGiMode = *restirGiModeOverride;
+                    settings.restirGiEnabled = settings.restirGiMode != rtv::RestirGiMode::Off;
+                }
+                if (restirGiReservoirLayoutOverride.has_value()) {
+                    settings.restirGiReservoirLayout = *restirGiReservoirLayoutOverride;
+                }
+                if (restirGiTemporalMaxAgeOverride.has_value()) {
+                    settings.restirGiTemporalMaxAge = *restirGiTemporalMaxAgeOverride;
+                }
+                if (restirGiSpatialRoundsOverride.has_value()) {
+                    settings.restirGiSpatialRounds = *restirGiSpatialRoundsOverride;
+                }
+                if (restirGiSpatialRadiusOverride.has_value()) {
+                    settings.restirGiSpatialRadius = *restirGiSpatialRadiusOverride;
+                }
+                if (restirGiDepthThresholdScaleOverride.has_value()) {
+                    settings.restirGiDepthThresholdScale = *restirGiDepthThresholdScaleOverride;
+                }
+                if (restirGiSpatialCompatibilityThresholdOverride.has_value()) {
+                    settings.restirGiSpatialCompatibilityThreshold = *restirGiSpatialCompatibilityThresholdOverride;
+                }
+                if (restirGiHalfResolutionOverride.has_value()) {
+                    settings.restirGiHalfResolution = *restirGiHalfResolutionOverride;
+                }
+                if (restirGiVisibilityRayBudgetOverride.has_value()) {
+                    settings.restirGiVisibilityRayBudget = *restirGiVisibilityRayBudgetOverride;
+                }
+                if (restirGiMinFinalBlendStrengthOverride.has_value()) {
+                    settings.restirGiMinFinalBlendStrength = *restirGiMinFinalBlendStrengthOverride;
+                }
+                if (restirGiActiveTileMaskOverride.has_value()) {
+                    settings.restirGiActiveTileMaskMode = *restirGiActiveTileMaskOverride;
+                }
+                if (restirHistoryCopyModeOverride.has_value()) {
+                    settings.restirHistoryCopyMode = *restirHistoryCopyModeOverride;
+                }
+                if (restirCounterModeOverride.has_value()) {
+                    settings.restirCounterMode = *restirCounterModeOverride;
+                }
+                if (restirGiModeOverride.has_value() && !restirGiReservoirLayoutOverride.has_value()) {
+                    switch (settings.restirGiMode) {
+                    case rtv::RestirGiMode::Off:
+                    case rtv::RestirGiMode::LegacyCache:
+                        settings.restirGiReservoirLayout = rtv::RestirGiReservoirLayout::LegacyCachePacked;
+                        break;
+                    case rtv::RestirGiMode::Production:
+                        settings.restirGiReservoirLayout = rtv::RestirGiReservoirLayout::ProductionPacked;
+                        break;
+                    case rtv::RestirGiMode::ReferenceValidation:
+                        settings.restirGiReservoirLayout = rtv::RestirGiReservoirLayout::ValidationFull;
+                        break;
+                    }
+                }
+                if (settings.restirGiMode == rtv::RestirGiMode::LegacyCache &&
+                    settings.restirGiReservoirLayout != rtv::RestirGiReservoirLayout::LegacyCachePacked) {
+                    throw std::runtime_error("Legacy ReSTIR GI requires the legacy-cache-packed layout");
+                }
+                if ((settings.restirGiMode == rtv::RestirGiMode::Production ||
+                     settings.restirGiMode == rtv::RestirGiMode::ReferenceValidation) &&
+                    settings.restirGiReservoirLayout == rtv::RestirGiReservoirLayout::LegacyCachePacked) {
+                    throw std::runtime_error("Production/reference ReSTIR GI cannot use the legacy-cache-packed layout");
+                }
+                if (settings.restirGiMode == rtv::RestirGiMode::ReferenceValidation) {
+                    if (settings.restirGiReservoirLayout != rtv::RestirGiReservoirLayout::ValidationFull) {
+                        throw std::runtime_error("Reference ReSTIR GI requires the validation-full layout");
+                    }
+                    settings.restirGiFinalStabilizationEnabled = false;
+                }
                 settings.renderPreset = rtv::RenderPreset::Custom;
                 renderer->applySettings(settings);
             }
@@ -3916,9 +4129,16 @@ int main(int argc, char** argv) {
             if (restirDiModeOverride.has_value() ||
                 restirDiTemporalOverride.has_value() ||
                 restirDiSpatialOverride.has_value() ||
+                restirDiFinalVisibilityOverride.has_value() ||
                 restirDiSpatialRoundsOverride.has_value() ||
                 restirDiSpatialRadiusOverride.has_value() ||
                 restirDiTemporalMaxAgeOverride.has_value() ||
+                restirDiMaxMOverride.has_value() ||
+                restirDiVisibilityRayBudgetOverride.has_value() ||
+                restirDiClampLuminanceOverride.has_value() ||
+                restirDiIncludeSunOverride.has_value() ||
+                restirDiIncludeEnvironmentOverride.has_value() ||
+                restirDiStabilizationOverride.has_value() ||
                 restirDiReservoirLayoutOverride.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();
                 if (restirDiModeOverride.has_value()) {
@@ -3930,6 +4150,9 @@ int main(int argc, char** argv) {
                 if (restirDiSpatialOverride.has_value()) {
                     settings.restirDiSpatialEnabled = *restirDiSpatialOverride;
                 }
+                if (restirDiFinalVisibilityOverride.has_value()) {
+                    settings.restirDiFinalVisibilityEnabled = *restirDiFinalVisibilityOverride;
+                }
                 if (restirDiSpatialRoundsOverride.has_value()) {
                     settings.restirDiSpatialRounds = *restirDiSpatialRoundsOverride;
                 }
@@ -3939,8 +4162,54 @@ int main(int argc, char** argv) {
                 if (restirDiTemporalMaxAgeOverride.has_value()) {
                     settings.restirDiTemporalMaxAge = *restirDiTemporalMaxAgeOverride;
                 }
+                if (restirDiMaxMOverride.has_value()) {
+                    settings.restirDiMaxM = *restirDiMaxMOverride;
+                }
+                if (restirDiVisibilityRayBudgetOverride.has_value()) {
+                    settings.restirDiVisibilityRayBudget = *restirDiVisibilityRayBudgetOverride;
+                }
+                if (restirDiClampLuminanceOverride.has_value()) {
+                    settings.restirDiClampLuminance = *restirDiClampLuminanceOverride;
+                }
+                if (restirDiIncludeSunOverride.has_value()) {
+                    settings.restirDiIncludeSun = *restirDiIncludeSunOverride;
+                }
+                if (restirDiIncludeEnvironmentOverride.has_value()) {
+                    settings.restirDiIncludeEnvironment = *restirDiIncludeEnvironmentOverride;
+                }
+                if (restirDiStabilizationOverride.has_value()) {
+                    settings.restirDiProductionStabilizationEnabled = *restirDiStabilizationOverride;
+                }
                 if (restirDiReservoirLayoutOverride.has_value()) {
                     settings.restirDiReservoirLayout = *restirDiReservoirLayoutOverride;
+                }
+                const bool legacyDiMode = settings.restirDiMode == rtv::RestirDiMode::Off ||
+                    settings.restirDiMode == rtv::RestirDiMode::Legacy;
+                if (restirDiModeOverride.has_value() && !restirDiReservoirLayoutOverride.has_value()) {
+                    settings.restirDiReservoirLayout = legacyDiMode
+                        ? rtv::RestirDiReservoirLayout::Legacy
+                        : settings.restirDiMode == rtv::RestirDiMode::ReferenceValidation
+                            ? rtv::RestirDiReservoirLayout::ValidationFull
+                            : rtv::RestirDiReservoirLayout::ProductionPacked;
+                }
+                if ((legacyDiMode && settings.restirDiReservoirLayout != rtv::RestirDiReservoirLayout::Legacy) ||
+                    (!legacyDiMode && settings.restirDiReservoirLayout == rtv::RestirDiReservoirLayout::Legacy)) {
+                    throw std::runtime_error("Incompatible --restir-di and --restir-di-layout selection");
+                }
+                if (settings.restirDiMode == rtv::RestirDiMode::ReferenceValidation) {
+                    if (restirDiFinalVisibilityOverride.has_value() && !*restirDiFinalVisibilityOverride) {
+                        throw std::runtime_error("Reference ReSTIR DI requires final visibility");
+                    }
+                    if (settings.restirDiReservoirLayout != rtv::RestirDiReservoirLayout::ValidationFull) {
+                        throw std::runtime_error("Reference ReSTIR DI requires the validation-full layout");
+                    }
+                    settings.restirDiFinalVisibilityEnabled = true;
+                    settings.restirDiProductionStabilizationEnabled = false;
+                }
+                if (settings.restirDiIncludeSun || settings.restirDiIncludeEnvironment) {
+                    throw std::runtime_error(
+                        "Sun and environment are specialized direct-light channels outside ReSTIR DI; "
+                        "--restir-di-include-sun/environment must remain off");
                 }
                 settings.renderPreset = rtv::RenderPreset::Custom;
                 renderer->applySettings(settings);
@@ -4124,6 +4393,8 @@ int main(int argc, char** argv) {
                 rtv::RendererSettings settings = renderer->settings();
                 settings.restirMode = rtv::RestirMode::ClassicNee;
                 settings.restirGiEnabled = false;
+                settings.restirGiMode = rtv::RestirGiMode::Off;
+                settings.restirGiReservoirLayout = rtv::RestirGiReservoirLayout::LegacyCachePacked;
                 settings.wavefrontQueuesEnabled = true;
                 settings.wavefrontPrimaryGenerateEnabled = true;
                 settings.wavefrontTraceEnabled = true;
@@ -4144,10 +4415,14 @@ int main(int argc, char** argv) {
                     } else if (name == "restir") {
                         settings.restirMode = rtv::RestirMode::ClassicNee;
                         settings.restirGiEnabled = false;
+                        settings.restirGiMode = rtv::RestirGiMode::Off;
+                        settings.restirGiReservoirLayout = rtv::RestirGiReservoirLayout::LegacyCachePacked;
                     } else if (name == "restirdi" || name == "restirspatial") {
                         settings.restirMode = rtv::RestirMode::ClassicNee;
                     } else if (name == "restirgi") {
                         settings.restirGiEnabled = false;
+                        settings.restirGiMode = rtv::RestirGiMode::Off;
+                        settings.restirGiReservoirLayout = rtv::RestirGiReservoirLayout::LegacyCachePacked;
                     } else if (name == "autoexposure") {
                         settings.autoExposureEnabled = false;
                     } else {

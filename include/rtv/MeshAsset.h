@@ -345,6 +345,7 @@ struct SceneLightAsset {
     float outerConeRadians = 0.70f;
     bool enabled = true;
     int32_t nodeIndex = -1;
+    uint64_t persistentId = 0;
 };
 
 struct SceneAsset {

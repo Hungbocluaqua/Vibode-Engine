@@ -3189,7 +3189,12 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                 };
                 timingRow("Path Trace", timings.pathTraceMs);
                 timingRow("ReSTIR DI", timings.restirSpatialMs);
-                timingRow("ReSTIR GI", timings.restirGiSpatialMs + timings.restirGiFinalMs);
+                timingRow("ReSTIR GI",
+                    timings.restirGiTemporalMs +
+                    timings.restirGiSpatialMs +
+                    timings.restirGiUpsampleMs +
+                    timings.restirGiFinalMs +
+                    timings.restirGiCountersReadbackMs);
                 timingRow("Denoiser", timings.denoiserMs + timings.momentUpdateMs);
                 timingRow("TAA", timings.taaMs + timings.taaHistoryCopyMs);
                 timingRow("Tone Map", timings.toneMapMs);

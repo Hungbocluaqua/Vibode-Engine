@@ -17,7 +17,9 @@ class ResourceAllocator;
 
 class BatchUploader final : private NonCopyable {
 public:
-    explicit BatchUploader(BufferUploader& uploader);
+    static constexpr VkDeviceSize defaultMaxStagingBytes = 256ull * 1024ull * 1024ull;
+
+    explicit BatchUploader(BufferUploader& uploader, VkDeviceSize maxStagingBytes = defaultMaxStagingBytes);
     ~BatchUploader();
 
     void begin();
@@ -51,6 +53,7 @@ private:
     };
 
     BufferUploader& uploader_;
+    VkDeviceSize maxStagingBytes_ = defaultMaxStagingBytes;
     std::vector<PendingBufferOp> pendingBuffers_;
     std::vector<PendingImageOp> pendingImages_;
     bool recording_ = false;

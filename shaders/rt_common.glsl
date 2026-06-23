@@ -7,7 +7,7 @@
 #include "blue_noise.glsl"
 
 #ifndef RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-#define RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT 1
+#define RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT 0
 #endif
 
 layout(set = 0, binding = 0, std430) buffer AccumulationBuffer { vec4 accumulation_buffer[]; };
@@ -44,6 +44,8 @@ layout(set = 0, binding = 1, std140) uniform Camera {
     vec4 volume_controls;
     vec4 projection_controls;
     vec4 clip_controls;
+    uvec4 gi_version_controls;   // Phase 8: x = light, y = material, z = object, w = environment version
+    uvec4 restir_di_controls;     // x = new ReSTIR DI raygen writes enabled
 } camera;
 
 layout(set = 0, binding = 2, std430) buffer VarianceBuffer { uint variance_buffer[]; };
@@ -52,6 +54,8 @@ layout(set = 0, binding = 4, std430) buffer DepthNormalBuffer { uvec4 depth_norm
 layout(set = 0, binding = 5, std430) buffer WorldPositionBuffer { uvec2 world_position_buffer[]; };
 layout(set = 0, binding = 35, std430) buffer EntityIdBuffer { uint entity_id_buffer[]; };
 layout(set = 0, binding = 36, std430) buffer VelocityBuffer { uint velocity_buffer[]; };
+#ifndef RTV_PATH_DATA_COMMON_GLSL
+#define RTV_PATH_DATA_COMMON_GLSL
 struct PathDataRecord {
     vec4 direct_diffuse;
     vec4 direct_specular;
@@ -63,7 +67,9 @@ struct PathDataRecord {
     vec4 diffuse_ray_direction_hit_distance;
     vec4 specular_ray_direction_hit_distance;
     vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
 };
+#endif
 layout(set = 0, binding = 42, std430) buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
 layout(set = 0, binding = 37, std140) uniform PrevCamera {
     mat4 view_proj;
@@ -83,22 +89,42 @@ struct RestirReservoir {
 };
 layout(set = 0, binding = 38, std430) buffer RestirReservoirBuffer { RestirReservoir restir_reservoirs[]; };
 layout(set = 0, binding = 39, std430) readonly buffer PreviousRestirReservoirBuffer { RestirReservoir previous_restir_reservoirs[]; };
+#ifndef RTV_RESTIR_GI_RESERVOIR_DEFINED
+#define RTV_RESTIR_GI_RESERVOIR_DEFINED
 struct RestirGiReservoir {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     vec4 hit_position_target_pdf; // xyz = selected indirect hit point, w = target pdf
     vec4 normal_roughness; // xyz = selected hit normal, w = roughness
+    vec4 suffix_radiance_source_pdf; // rgb = receiver-independent suffix, w = proposal PDF in selected measure
+    vec4 source_direction_distance; // xyz = source receiver direction, w = finite distance or -1 for environment
 #endif
-    vec4 radiance_weight_sum; // rgb = selected indirect radiance, w = weight sum
+    vec4 radiance_weight_sum; // rgb = selected integrand, w = weight sum
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    vec4 receiver_position_hit_distance; // xyz = receiver point, w = hit distance
-    uvec4 metadata; // x = sample count, y = age, z = flags, w = material id
+    uvec4 metadata; // x = sample count, y = age, z = flags | path class << 8, w = version hash
 #else
     uvec4 metadata; // x = sample/age/flags/roughness, y = oct normal, z = material id, w = fp16(hit distance, target pdf)
 #endif
 };
+#endif
+
+// ReSTIR GI Receiver struct (Phase 2)
+#ifndef RTV_RESTIR_GI_RECEIVER_DEFINED
+#define RTV_RESTIR_GI_RECEIVER_DEFINED
+struct RestirGiReceiver {
+    vec4 positionDepth;
+    vec4 normalRoughness;
+    vec4 geometryNormalMetal;
+    vec4 albedoOcclusion;
+    uvec4 materialIds;
+    uvec4 motion;
+};
+#endif
+
 layout(set = 0, binding = 43, std430) buffer RestirGiReservoirBuffer { RestirGiReservoir restir_gi_reservoirs[]; };
 layout(set = 0, binding = 44, std430) readonly buffer PreviousRestirGiReservoirBuffer { RestirGiReservoir previous_restir_gi_reservoirs[]; };
 layout(set = 0, binding = 45, std430) buffer RestirGiSpatialReservoirBuffer { RestirGiReservoir restir_gi_spatial_reservoirs[]; };
+layout(set = 0, binding = 58, std430) buffer RestirGiReceiverBuffer { RestirGiReceiver restir_gi_receivers[]; };
+layout(set = 0, binding = 59, std430) readonly buffer PreviousRestirGiReceiverBuffer { RestirGiReceiver previous_restir_gi_receivers[]; };
 // New ReSTIR DI data model (Phase 1-2) — guard macros so restir_di_common.glsl
 // (included by compute passes) can define the same structs without conflict.
 #ifndef RTV_RESTIR_DI_RECEIVER_DEFINED
@@ -106,10 +132,14 @@ layout(set = 0, binding = 45, std430) buffer RestirGiSpatialReservoirBuffer { Re
 struct RestirDiReceiver {
     vec4 worldPosition_depth;
     vec4 normal_roughness;
+#if RTV_RESTIR_DI_VALIDATION_FULL
     vec4 tangent_materialId;
     vec4 bitangent_instanceId;
     vec4 viewDirection_hitDist;
     uvec4 primitive_mesh_flags;
+#else
+    uvec4 packedMaterialSurface;
+#endif
 };
 #endif
 #ifndef RTV_RESTIR_DI_RESERVOIR_DEFINED
@@ -118,15 +148,81 @@ struct RestirDiReservoir {
     uvec4 sampleMetadata;
     uvec4 reservoirMetadata;
     vec4 samplePosition_distance;
+#if RTV_RESTIR_DI_VALIDATION_FULL
     vec4 sampleDirection_pdf;
     vec4 sampleRadiance_target;
     vec4 sampleNormal_weightSum;
     vec4 contribution_confidence;
+#endif
 };
 #endif
+#ifndef RTV_RESTIR_DI_SURFACE_CONSTANTS_DEFINED
+#define RTV_RESTIR_DI_SURFACE_CONSTANTS_DEFINED
+const uint RESTIR_DI_SURFACE_SKY       = 1u << 0u;
+const uint RESTIR_DI_SURFACE_INVALID   = 1u << 1u;
+const uint RESTIR_DI_SURFACE_DELTA     = 1u << 2u;
+const uint RESTIR_DI_SURFACE_ALPHA     = 1u << 3u;
+const uint RESTIR_DI_SURFACE_UNLIT     = 1u << 4u;
+const uint RESTIR_DI_SURFACE_PBR       = 1u << 5u;
+const uint RESTIR_DI_SURFACE_UNSUPPORTED = 1u << 6u;
+#endif
+#ifndef RTV_RESTIR_DI_VISIBILITY_CONSTANTS_DEFINED
+#define RTV_RESTIR_DI_VISIBILITY_CONSTANTS_DEFINED
+const uint RESTIR_DI_VISIBILITY_UNKNOWN  = 0u;
+const uint RESTIR_DI_VISIBILITY_VISIBLE  = 1u;
+const uint RESTIR_DI_VISIBILITY_OCCLUDED = 2u;
+const uint RESTIR_DI_VISIBILITY_INVALID  = 3u;
+#endif
+const uint RESTIR_DI_COUNTER_INITIAL_PIXELS = 0u;
+const uint RESTIR_DI_COUNTER_INITIAL_VALID = 1u;
+const uint RESTIR_DI_COUNTER_INITIAL_INVALID_SURFACE = 2u;
+const uint RESTIR_DI_COUNTER_INITIAL_INVALID_TARGET = 3u;
+const uint RESTIR_DI_COUNTER_INITIAL_NON_FINITE = 4u;
+const uint RESTIR_DI_COUNTER_INITIAL_EMISSIVE = 5u;
+const uint RESTIR_DI_COUNTER_INITIAL_DIRECTIONAL = 6u;
+const uint RESTIR_DI_COUNTER_INITIAL_POINT = 7u;
+const uint RESTIR_DI_COUNTER_INITIAL_AREA = 8u;
+const uint RESTIR_DI_COUNTER_INITIAL_SPOT = 9u;
+const uint RESTIR_DI_COUNTER_INITIAL_INVALID_PDF = 10u;
+const uint RESTIR_DI_COUNTER_INITIAL_INVALID_IDENTITY = 11u;
+const uint RESTIR_DI_COUNTER_INITIAL_WEIGHT_OVERFLOW = 12u;
+const uint RESTIR_DI_COUNTER_TEMPORAL_NON_FINITE = 13u;
+uint restir_di_pack_radiance(vec3 value) {
+    uvec3 encoded = uvec3(round(clamp(log2(vec3(1.0) + max(value, vec3(0.0))) / 16.0, 0.0, 1.0) * 1023.0));
+    return encoded.x | (encoded.y << 10u) | (encoded.z << 20u);
+}
+vec3 restir_di_unpack_radiance(uint packed) {
+    uvec3 encoded = uvec3(packed & 1023u, (packed >> 10u) & 1023u, (packed >> 20u) & 1023u);
+    return exp2(vec3(encoded) * (16.0 / 1023.0)) - vec3(1.0);
+}
 layout(set = 0, binding = 52, std430) buffer RestirDiReceiverBuffer { RestirDiReceiver restir_di_receivers[]; };
 layout(set = 0, binding = 53, std430) buffer RestirDiInitialReservoirBuffer { RestirDiReservoir restir_di_initial_reservoirs[]; };
 layout(set = 0, binding = 54, std430) readonly buffer PreviousRestirDiReservoirBuffer { RestirDiReservoir previous_restir_di_reservoirs[]; };
+layout(set = 0, binding = 60, std430) buffer RestirDiCounterBuffer { uint restir_di_counters[]; };
+layout(set = 0, binding = 61, std140) uniform RestirDiRaygenParams {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint enabled;
+    uint temporalMaxAge;
+    uint spatialRounds;
+    uint spatialMaxM;
+    uint visibilityPolicy;
+    float spatialRadius;
+    float normalThreshold;
+    float depthThreshold;
+    float temporalLuminanceLimitFactor;
+    float confidenceDecay;
+    float lumClampNeighborAvgFactor;
+    float lumClampNeighborMaxFactor;
+    float fireflyClamp;
+    float productionClampLuminance;
+    uint useFallbackInitial;
+    uint spatialResultValid;
+    uint lightVersion;
+    uint distributionVersion;
+} restir_di_raygen_params;
+
 layout(set = 0, binding = 10, std430) readonly buffer MeshMaterials { vec4 mesh_materials[]; };
 
 layout(set = 0, binding = 11, std140) uniform MeshParams {
@@ -203,6 +299,7 @@ layout(set = 0, binding = 22, std430) readonly buffer SceneInstanceRecords {
 
 struct LightRecord {
     uvec4 metadata;
+    uvec4 identity;
     vec4 data0;
     vec4 data1;
     vec4 data2;
@@ -283,7 +380,7 @@ const uint RT_DIAG_CAUSTIC_TRANSMISSIVE_VISIBLE = 12u;
 const uint RT_DIAG_CAUSTIC_SHADOW_BLOCKED = 13u;
 
 void record_rt_counter(uint counterIndex) {
-    if (camera.path_trace_controls.z != 0u) {
+    if ((camera.path_trace_controls.z & 1u) != 0u) {
         atomicAdd(rt_diagnostic_counters[counterIndex], 1u);
     }
 }
@@ -668,9 +765,10 @@ bool restir_reservoir_valid(RestirReservoir reservoir) {
 
 bool restir_gi_reservoir_valid(RestirGiReservoir reservoir) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    return (reservoir.metadata.z & RESTIR_GI_FLAG_VALID) != 0u &&
+    return ((reservoir.metadata.z & 0xffu) & RESTIR_GI_FLAG_VALID) != 0u &&
         reservoir.radiance_weight_sum.w > 0.0 &&
         reservoir.hit_position_target_pdf.w > 0.0 &&
+        reservoir.suffix_radiance_source_pdf.w > 0.0 &&
         reservoir.metadata.x > 0u;
 #else
     return ((reservoir.metadata.x >> 16u) & RESTIR_GI_FLAG_VALID) != 0u &&
@@ -702,7 +800,7 @@ uint restir_gi_age(RestirGiReservoir reservoir) {
 
 uint restir_gi_flags(RestirGiReservoir reservoir) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    return reservoir.metadata.z;
+    return reservoir.metadata.z & 0xffu;
 #else
     return (reservoir.metadata.x >> 16u) & 0xffu;
 #endif
@@ -714,7 +812,7 @@ bool restir_gi_visible(RestirGiReservoir reservoir) {
 
 uint restir_gi_material_id(RestirGiReservoir reservoir) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    return reservoir.metadata.w;
+    return 0xffffffffu;
 #else
     return reservoir.metadata.z;
 #endif
@@ -739,8 +837,7 @@ vec3 restir_gi_normal(RestirGiReservoir reservoir) {
 bool restir_gi_has_positions(RestirGiReservoir reservoir) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     return restir_gi_reservoir_valid(reservoir) &&
-        dot(reservoir.hit_position_target_pdf.xyz - reservoir.receiver_position_hit_distance.xyz,
-            reservoir.hit_position_target_pdf.xyz - reservoir.receiver_position_hit_distance.xyz) > 1.0e-8;
+        reservoir.source_direction_distance.w > 0.0;
 #else
     return false;
 #endif
@@ -756,7 +853,8 @@ vec3 restir_gi_hit_position(RestirGiReservoir reservoir) {
 
 vec3 restir_gi_receiver_position(RestirGiReservoir reservoir) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    return reservoir.receiver_position_hit_distance.xyz;
+    return reservoir.hit_position_target_pdf.xyz -
+        normalize(reservoir.source_direction_distance.xyz) * reservoir.source_direction_distance.w;
 #else
     return vec3(0.0);
 #endif
@@ -764,7 +862,8 @@ vec3 restir_gi_receiver_position(RestirGiReservoir reservoir) {
 
 void restir_gi_set_receiver_position(inout RestirGiReservoir reservoir, vec3 receiverPosition) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    reservoir.receiver_position_hit_distance.xyz = receiverPosition;
+    vec3 delta = reservoir.hit_position_target_pdf.xyz - receiverPosition;
+    reservoir.source_direction_distance = vec4(normalize(delta), length(delta));
 #endif
 }
 
@@ -780,7 +879,7 @@ void restir_gi_set_metadata(inout RestirGiReservoir reservoir, uint sampleCount,
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.metadata.x = sampleCount;
     reservoir.metadata.y = age;
-    reservoir.metadata.z = flags;
+    reservoir.metadata.z = (reservoir.metadata.z & 0xffffff00u) | (flags & 0xffu);
     reservoir.normal_roughness.w = clamp(roughness, 0.0, 1.0);
 #else
     reservoir.metadata.x = restir_gi_pack_metadata(sampleCount, age, flags, roughness);
@@ -797,7 +896,7 @@ void restir_gi_set_normal(inout RestirGiReservoir reservoir, vec3 normal) {
 
 void restir_gi_set_material_id(inout RestirGiReservoir reservoir, uint materialId) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    reservoir.metadata.w = materialId;
+    // The full estimator layout uses metadata.w for the scene version hash.
 #else
     reservoir.metadata.z = materialId;
 #endif
@@ -805,7 +904,7 @@ void restir_gi_set_material_id(inout RestirGiReservoir reservoir, uint materialI
 
 float restir_gi_hit_distance(RestirGiReservoir reservoir) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    return reservoir.receiver_position_hit_distance.w;
+    return abs(reservoir.source_direction_distance.w);
 #else
     return unpackHalf2x16(reservoir.metadata.w).x;
 #endif
@@ -822,7 +921,7 @@ float restir_gi_target_pdf(RestirGiReservoir reservoir) {
 void restir_gi_set_hit_distance_target_pdf(inout RestirGiReservoir reservoir, float hitDistance, float targetPdf) {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.hit_position_target_pdf.w = max(targetPdf, 1.0e-4);
-    reservoir.receiver_position_hit_distance.w = max(hitDistance, 0.0);
+    reservoir.source_direction_distance.w = max(hitDistance, 0.0);
 #else
     reservoir.metadata.w = packHalf2x16(vec2(clamp(hitDistance, 0.0, 65504.0), clamp(targetPdf, 1.0e-4, 65504.0)));
 #endif
@@ -833,10 +932,11 @@ RestirGiReservoir empty_restir_gi_reservoir() {
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     reservoir.hit_position_target_pdf = vec4(0.0);
     reservoir.normal_roughness = vec4(0.0, 1.0, 0.0, 1.0);
+    reservoir.suffix_radiance_source_pdf = vec4(0.0);
+    reservoir.source_direction_distance = vec4(0.0);
 #endif
     reservoir.radiance_weight_sum = vec4(0.0);
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
-    reservoir.receiver_position_hit_distance = vec4(0.0);
     reservoir.metadata = uvec4(0u);
 #else
     reservoir.metadata = uvec4(restir_gi_pack_metadata(0u, 0u, 0u, 1.0), encode_octahedral_normal(vec3(0.0, 1.0, 0.0)), 0u, 0u);
@@ -2736,4 +2836,177 @@ vec3 sample_brdf(inout uint state, Material material, vec3 wo, vec3 n, vec3 tang
         return wi;
     }
     return sample_cosine_hemisphere(state, n, pdf);
+}
+
+// ---------------------------------------------------------------------------
+// ReSTIR DI helper functions for raygen — mirrors restir_di_common.glsl
+// but defined here to avoid include conflicts across ray tracing stages.
+// ---------------------------------------------------------------------------
+RestirDiReservoir restir_di_empty_reservoir() {
+    RestirDiReservoir r;
+    r.sampleMetadata = uvec4(0u);
+    r.reservoirMetadata = uvec4(0u);
+    r.samplePosition_distance = vec4(0.0);
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    r.sampleDirection_pdf = vec4(0.0, 0.0, 1.0, 1.0e-6);
+    r.sampleRadiance_target = vec4(0.0);
+    r.sampleNormal_weightSum = vec4(0.0, 1.0, 0.0, 0.0);
+    r.contribution_confidence = vec4(0.0);
+#else
+    r.sampleMetadata.w = restir_di_pack_radiance(vec3(0.0));
+    r.reservoirMetadata.z = packSnorm2x16(vec2(0.0));
+    r.reservoirMetadata.w = packHalf2x16(vec2(0.0));
+#endif
+    r.reservoirMetadata.y = packHalf2x16(vec2(1.0e-6, 0.0));
+    return r;
+}
+
+float restir_di_target_function(vec3 radiance) {
+    return max(dot(radiance, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
+}
+
+void restir_di_set_valid(inout RestirDiReservoir r, bool valid) {
+    if (valid) r.reservoirMetadata.x |= (1u << 18u);
+    else r.reservoirMetadata.x &= ~(1u << 18u);
+}
+void restir_di_set_age(inout RestirDiReservoir r, uint age) {
+    r.reservoirMetadata.x = (r.reservoirMetadata.x & ~0xffu) | min(age, 255u);
+}
+void restir_di_set_m(inout RestirDiReservoir r, uint m) {
+    r.reservoirMetadata.x = (r.reservoirMetadata.x & ~0xff00u) | (min(m, 255u) << 8u);
+}
+void restir_di_set_visibility(inout RestirDiReservoir r, uint vis) {
+    r.reservoirMetadata.x = (r.reservoirMetadata.x & ~0x30000u) | ((vis & 3u) << 16u);
+}
+void restir_di_set_source_pdf(inout RestirDiReservoir r, float pdf) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    r.sampleDirection_pdf.w = max(pdf, 1.0e-6);
+#endif
+    float prevWeight = unpackHalf2x16(r.reservoirMetadata.y).y;
+    r.reservoirMetadata.y = packHalf2x16(vec2(clamp(pdf, 1.0e-6, 65504.0), prevWeight));
+}
+void restir_di_set_previous_weight(inout RestirDiReservoir r, float w) {
+    float pdf = unpackHalf2x16(r.reservoirMetadata.y).x;
+    r.reservoirMetadata.y = packHalf2x16(vec2(pdf, clamp(w, 0.0, 1.0)));
+}
+bool restir_di_reservoir_valid(RestirDiReservoir r) {
+    bool validBit = (r.reservoirMetadata.x & (1u << 18u)) != 0u;
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    float target = r.sampleRadiance_target.w;
+    float weight = r.sampleNormal_weightSum.w;
+    float pdf = r.sampleDirection_pdf.w;
+    vec3 radiance = r.sampleRadiance_target.xyz;
+#else
+    vec2 targetWeight = unpackHalf2x16(r.reservoirMetadata.w);
+    float target = targetWeight.x;
+    float weight = targetWeight.y;
+    float pdf = unpackHalf2x16(r.reservoirMetadata.y).x;
+    vec3 radiance = restir_di_unpack_radiance(r.sampleMetadata.w);
+#endif
+    return validBit && ((r.reservoirMetadata.x >> 8u) & 0xffu) > 0u &&
+        target > 0.0 && weight > 0.0 && pdf > 0.0 &&
+        !isnan(target) && !isinf(target) && !isnan(weight) && !isinf(weight) &&
+        !isnan(pdf) && !isinf(pdf) &&
+        !any(isnan(r.samplePosition_distance.xyz)) && !any(isinf(r.samplePosition_distance.xyz)) &&
+        !any(isnan(radiance)) && !any(isinf(radiance));
+}
+uint restir_di_light_kind(RestirDiReservoir r) { return r.sampleMetadata.z & 0xffu; }
+uint restir_di_light_id(RestirDiReservoir r) { return r.sampleMetadata.x; }
+uint restir_di_light_index(RestirDiReservoir r) { return r.sampleMetadata.z >> 8u; }
+uint restir_di_light_version(RestirDiReservoir r) { return r.sampleMetadata.y; }
+float restir_di_target(RestirDiReservoir r) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    return max(r.sampleRadiance_target.w, 0.0);
+#else
+    return max(unpackHalf2x16(r.reservoirMetadata.w).x, 0.0);
+#endif
+}
+
+uint restir_di_identity_hash(uvec2 identity) {
+    uint h = identity.x ^ (identity.y + 0x9e3779b9u + (identity.x << 6u) + (identity.x >> 2u));
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    return h ^ (h >> 16u);
+}
+float restir_di_source_pdf(RestirDiReservoir r) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    return max(r.sampleDirection_pdf.w, 1.0e-6);
+#else
+    return max(unpackHalf2x16(r.reservoirMetadata.y).x, 1.0e-6);
+#endif
+}
+float restir_di_weight_sum(RestirDiReservoir r) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    return max(r.sampleNormal_weightSum.w, 0.0);
+#else
+    return max(unpackHalf2x16(r.reservoirMetadata.w).y, 0.0);
+#endif
+}
+void restir_di_set_weight_sum(inout RestirDiReservoir r, float ws) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    r.sampleNormal_weightSum.w = max(ws, 0.0);
+#else
+    vec2 targetWeight = unpackHalf2x16(r.reservoirMetadata.w);
+    r.reservoirMetadata.w = packHalf2x16(vec2(targetWeight.x, clamp(ws, 0.0, 65504.0)));
+#endif
+}
+void restir_di_set_target(inout RestirDiReservoir r, float target) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    r.sampleRadiance_target.w = max(target, 0.0);
+#else
+    vec2 targetWeight = unpackHalf2x16(r.reservoirMetadata.w);
+    r.reservoirMetadata.w = packHalf2x16(vec2(clamp(target, 0.0, 65504.0), targetWeight.y));
+#endif
+}
+void restir_di_set_sample_radiance(inout RestirDiReservoir r, vec3 radiance) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    r.sampleRadiance_target.rgb = max(radiance, vec3(0.0));
+#else
+    r.sampleMetadata.w = restir_di_pack_radiance(radiance);
+#endif
+}
+void restir_di_set_confidence(inout RestirDiReservoir r, float confidence) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    r.contribution_confidence.w = clamp(confidence, 0.0, 1.0);
+#else
+    uint packedConfidence = uint(round(clamp(confidence, 0.0, 1.0) * 31.0));
+    r.reservoirMetadata.x = (r.reservoirMetadata.x & 0x07ffffffu) |
+        (packedConfidence << 27u);
+#endif
+}
+vec3 restir_di_sample_radiance(RestirDiReservoir r) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    return max(r.sampleRadiance_target.rgb, vec3(0.0));
+#else
+    return max(restir_di_unpack_radiance(r.sampleMetadata.w), vec3(0.0));
+#endif
+}
+void restir_di_set_direction(inout RestirDiReservoir r, vec3 direction) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    r.sampleDirection_pdf.xyz = normalize(direction);
+#endif
+}
+vec2 restir_di_oct_encode(vec3 value) {
+    vec3 n = normalize(value);
+    n /= max(abs(n.x) + abs(n.y) + abs(n.z), 1.0e-6);
+    return n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * sign(n.xy);
+}
+void restir_di_set_light_normal(inout RestirDiReservoir r, vec3 normal) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    r.sampleNormal_weightSum.xyz = normalize(normal);
+#else
+    r.reservoirMetadata.z = packSnorm2x16(restir_di_oct_encode(normal));
+#endif
+}
+float restir_di_previous_weight(RestirDiReservoir r) { return unpackHalf2x16(r.reservoirMetadata.y).y; }
+uint restir_di_m(RestirDiReservoir r) { return (r.reservoirMetadata.x >> 8u) & 0xffu; }
+uint restir_di_visibility(RestirDiReservoir r) { return (r.reservoirMetadata.x >> 16u) & 3u; }
+uint restir_di_rejection_flags(RestirDiReservoir r) {
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    return r.reservoirMetadata.w;
+#else
+    return (r.reservoirMetadata.x >> 19u) & 0xffu;
+#endif
 }
