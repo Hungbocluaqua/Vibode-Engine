@@ -49,7 +49,6 @@ uint32_t nodeInstanceFlags(const SceneNodeAsset& node) {
     return flags;
 }
 
-constexpr uint32_t maxMaterialTextures = 1024;
 constexpr uint32_t sceneLightTypeDirectional = 0u;
 constexpr uint32_t sceneLightTypePoint = 1u;
 constexpr uint32_t sceneLightTypeArea = 2u;
@@ -1881,13 +1880,16 @@ GpuScene::GpuScene(
     SceneCachePolicy sceneCachePolicy,
     uint32_t opacityMicromapSubdivisionLevel,
     bool opacityMicromapsEnabled,
-    uint32_t materialTextureMaxDimension)
+    uint32_t materialTextureMaxDimension,
+    uint32_t materialTextureSlotCapacity)
     : allocator_(allocator),
       environmentPath_(std::move(environmentPath)),
       sceneCachePolicy_(std::move(sceneCachePolicy)),
       opacityMicromapSubdivisionLevel_(opacityMicromapSubdivisionLevel),
       opacityMicromapsEnabled_(opacityMicromapsEnabled),
-      materialTextureMaxDimension_(materialTextureMaxDimension) {
+      materialTextureMaxDimension_(materialTextureMaxDimension),
+      materialTextureSlotCapacity_(std::max(1u, materialTextureSlotCapacity)) {
+    meshParams_.bindlessTextureCapacity = materialTextureSlotCapacity_;
     materialTextureAnisotropy_ = allocator_.supportsSamplerAnisotropy()
         ? std::clamp(8.0f, 1.0f, allocator_.maxSamplerAnisotropy())
         : 1.0f;
@@ -2151,6 +2153,16 @@ std::vector<VkDescriptorImageInfo> GpuScene::materialCombinedDescriptors() const
     return result;
 }
 
+VkDescriptorImageInfo GpuScene::materialCombinedDescriptor(uint32_t slot) const {
+    const auto& texDescs = materialTextureTable_.descriptors();
+    if (slot >= texDescs.size()) {
+        return {};
+    }
+    VkDescriptorImageInfo combined = texDescs[slot];
+    combined.sampler = slot < materialTextureSamplers_.size() ? materialTextureSamplers_[slot] : materialSampler_;
+    return combined;
+}
+
 bool GpuScene::setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity) {
     const uint32_t enabledValue = enabled ? 1u : 0u;
     const bool changed =
@@ -2205,7 +2217,7 @@ void GpuScene::createDefaultMaterialTexture(BufferUploader& uploader) {
     });
     uploader.uploadToImage2D(*image, white.data(), white.size(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     images.push_back(std::move(image));
-    materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
+    materialTextureTable_.setImages(std::move(images), materialTextureSlotCapacity_);
     materialTextureTable_.setRegistrationInfo(std::vector<BindlessTextureRegistrationInfo>{BindlessTextureRegistrationInfo{
         .slot = 0,
         .nativeSource = "default",
@@ -2226,7 +2238,13 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
     }
 
     const std::vector<TextureColorUsage> usage = classifyTextureUsage(importedScene, assets);
-    const uint32_t textureCount = std::min<uint32_t>(static_cast<uint32_t>(importedScene.textures.size()), maxMaterialTextures);
+    if (importedScene.textures.size() > materialTextureSlotCapacity_) {
+        throw std::runtime_error(
+            "Imported scene requires " + std::to_string(importedScene.textures.size()) +
+            " material texture slots, but the bindless texture heap capacity is " +
+            std::to_string(materialTextureSlotCapacity_));
+    }
+    const uint32_t textureCount = std::min<uint32_t>(static_cast<uint32_t>(importedScene.textures.size()), materialTextureSlotCapacity_);
 
     struct PendingTexture {
         std::unique_ptr<Image> image;
@@ -2348,7 +2366,7 @@ void GpuScene::createImportedMaterialTextures(BufferUploader& uploader, const Sc
         images.push_back(std::move(pending.image));
     }
 
-    materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
+    materialTextureTable_.setImages(std::move(images), materialTextureSlotCapacity_);
     materialTextureTable_.setRegistrationInfo(std::move(registrations));
     std::cout << "Material textures resident: " << materialTextureTable_.residentCount() << " / " << materialTextureTable_.slotCount() << " slots\n";
 }
@@ -2368,7 +2386,13 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
     materialSamplerDesc_ = materialSamplerDesc;
     materialSampler_ = createMaterialSampler(allocator_, materialSamplerDesc_, materialTextureAnisotropy_);
 
-    const uint32_t textureCount = std::min<uint32_t>(static_cast<uint32_t>(cached.textures.size()), maxMaterialTextures);
+    if (cached.textures.size() > materialTextureSlotCapacity_) {
+        throw std::runtime_error(
+            "Cached scene requires " + std::to_string(cached.textures.size()) +
+            " material texture slots, but the bindless texture heap capacity is " +
+            std::to_string(materialTextureSlotCapacity_));
+    }
+    const uint32_t textureCount = std::min<uint32_t>(static_cast<uint32_t>(cached.textures.size()), materialTextureSlotCapacity_);
 
     struct PendingTexture {
         std::unique_ptr<Image> image;
@@ -2457,7 +2481,7 @@ void GpuScene::createCachedMaterialTextures(BufferUploader& uploader, const Cach
         images.push_back(std::move(pending.image));
     }
 
-    materialTextureTable_.setImages(std::move(images), maxMaterialTextures);
+    materialTextureTable_.setImages(std::move(images), materialTextureSlotCapacity_);
     materialTextureTable_.setRegistrationInfo(std::move(registrations));
     std::cout << "Cached material textures resident: " << materialTextureTable_.residentCount() << " / " << materialTextureTable_.slotCount() << " slots\n";
 }
@@ -2475,7 +2499,7 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
 
     const std::vector<TextureColorUsage> textureUsage = classifyTextureUsage(importedScene, assets);
     auto textureSlotFor = [&](TextureAssetHandle texture) {
-        const uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, texture, maxMaterialTextures);
+        const uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, texture, materialTextureSlotCapacity_);
         return slot == UINT32_MAX ? -1.0f : static_cast<float>(slot);
     };
 
@@ -2490,11 +2514,11 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         const uint32_t type = importedMaterialType(material);
         uint32_t flags = materialSemanticFlags(material);
         if (material != nullptr) {
-            uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
+            uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, materialTextureSlotCapacity_);
             if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->baseColorTexture), textureUsage, slot)) {
                 flags |= materialFlagManualBaseColorSrgb;
             }
-            slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
+            slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, materialTextureSlotCapacity_);
             if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->emissiveTexture), textureUsage, slot)) {
                 flags |= materialFlagManualEmissiveSrgb;
             }
@@ -3001,6 +3025,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         .localTriangleCount = static_cast<uint32_t>(bvh.leafTriangleIndices.size()),
         .tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u),
         .tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size()),
+        .bindlessTextureCapacity = materialTextureSlotCapacity_,
     };
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, emissiveTotalArea);
     std::cout << "Cornell scene: vertices=" << meshParams_.vertexCount
@@ -3083,7 +3108,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     }
     const std::vector<TextureColorUsage> textureUsage = classifyTextureUsage(importedScene, assets);
     auto textureSlotFor = [&](TextureAssetHandle texture) {
-        const uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, texture, maxMaterialTextures);
+        const uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, texture, materialTextureSlotCapacity_);
         return slot == UINT32_MAX ? -1.0f : static_cast<float>(slot);
     };
 
@@ -3123,11 +3148,11 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             const float heightTexture = material != nullptr ? textureSlotFor(material->heightTexture) : -1.0f;
             uint32_t flags = materialSemanticFlags(material);
             if (material != nullptr) {
-                uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, maxMaterialTextures);
+                uint32_t slot = GpuScene::textureSlotIndexFor(importedScene, material->baseColorTexture, materialTextureSlotCapacity_);
                 if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->baseColorTexture), textureUsage, slot)) {
                     flags |= materialFlagManualBaseColorSrgb;
                 }
-                slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, maxMaterialTextures);
+                slot = GpuScene::textureSlotIndexFor(importedScene, material->emissiveTexture, materialTextureSlotCapacity_);
                 if (slot != UINT32_MAX && importedMaterialTextureNeedsManualSrgb(assets.texture(material->emissiveTexture), textureUsage, slot)) {
                     flags |= materialFlagManualEmissiveSrgb;
                 }
@@ -3586,6 +3611,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         .localTriangleCount = static_cast<uint32_t>(localTriangleData.size() / 12u),
         .tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u),
         .tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size()),
+        .bindlessTextureCapacity = materialTextureSlotCapacity_,
     };
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     std::cout << "Imported scene GPU data: meshes=" << meshParams_.meshCount
@@ -4088,6 +4114,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     const std::vector<uint32_t> rtTriangleMaterialIds =
         buildRtTriangleMaterialIds(primitiveRecords, static_cast<uint32_t>(localIndices.size() / 3u));
     meshParams_ = fromCachedMeshParams(cached.meshParams);
+    meshParams_.bindlessTextureCapacity = materialTextureSlotCapacity_;
     meshParams_.enabled = 1;
     meshParams_.localVertexCount = static_cast<uint32_t>(localVertexData.size());
     meshParams_.localIndexCount = static_cast<uint32_t>(localIndices.size());
@@ -4369,6 +4396,7 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
     lightRecordCpu_ = lightRecords;
 
     meshParams_ = fromCachedMeshParams(cached.meshParams);
+    meshParams_.bindlessTextureCapacity = materialTextureSlotCapacity_;
     meshParams_.enabled = 1;
     meshParams_.vertexCount = static_cast<uint32_t>(localVertexData.size());
     meshParams_.triangleCount = static_cast<uint32_t>(localIndices.size() / 3u);

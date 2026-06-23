@@ -25,7 +25,9 @@ void SceneStatsPanel::draw(const EditorRuntimeState& state) {
     ImGui::Text("Vertices: %u", meshParams.vertexCount);
     ImGui::Text("Instances: %u", meshParams.instanceCount);
     ImGui::Text("Materials: %u", meshParams.materialCount);
-    ImGui::Text("Textures: %zu", state.renderer.scene().materialTextureDescriptors().size());
+    ImGui::Text("Textures: %u resident / %u capacity",
+        state.renderer.scene().materialTextureCount(),
+        state.renderer.scene().materialTextureSlotCapacity());
 
     ImGui::SeparatorText("Geometry");
     ImGui::Text("Local vertices: %u", meshParams.localVertexCount);

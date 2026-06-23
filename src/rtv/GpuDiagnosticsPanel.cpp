@@ -63,7 +63,12 @@ void GpuDiagnosticsPanel::draw(const EditorRuntimeState& state) {
 
     ImGui::SeparatorText("Memory");
     const auto& texTable = state.renderer.scene().materialTextureTable();
+    const auto heap = state.renderer.bindlessTextureHeapStats();
     ImGui::Text("Textures:      %u / %u slots", texTable.residentCount(), texTable.slotCount());
+    ImGui::Text("Bindless heap: %u descriptors / %u capacity, patches %u",
+        heap.descriptorCount,
+        heap.capacity,
+        heap.patchCount);
     ImGui::Text("Texture alloc: %u allocated, %.1f%% frag",
         texTable.allocatedCount(), texTable.fragmentation() * 100.0f);
     if (state.sceneDocument != nullptr) {

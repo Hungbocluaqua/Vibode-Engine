@@ -25,6 +25,9 @@ struct BindlessCapabilities {
 
 [[nodiscard]] BindlessCapabilities queryBindlessCapabilities(VkPhysicalDevice physicalDevice);
 
+[[nodiscard]] bool supportsFullBindlessTextures(const BindlessCapabilities& caps);
+[[nodiscard]] uint32_t fullBindlessTextureCapacityOrThrow(const BindlessCapabilities& caps);
+
 [[nodiscard]] constexpr uint32_t maxMaterialTextureSlots(const BindlessCapabilities& caps) {
     constexpr uint32_t kDefaultLimit = 128;
     constexpr uint32_t kReasonableCap = 65536;
@@ -33,6 +36,43 @@ struct BindlessCapabilities {
     }
     return caps.maxSampledImages > kReasonableCap ? kReasonableCap : caps.maxSampledImages;
 }
+
+struct BindlessTextureHeapStats {
+    uint32_t capacity = 0;
+    uint32_t descriptorCount = 0;
+    uint32_t patchCount = 0;
+    bool initialized = false;
+};
+
+class BindlessTextureHeap {
+public:
+    BindlessTextureHeap() = default;
+    ~BindlessTextureHeap();
+
+    BindlessTextureHeap(const BindlessTextureHeap&) = delete;
+    BindlessTextureHeap& operator=(const BindlessTextureHeap&) = delete;
+
+    void init(VkDevice device, const BindlessCapabilities& caps, uint32_t capacity);
+    void destroy();
+    void updateAll(const std::vector<VkDescriptorImageInfo>& descriptors);
+    void patch(uint32_t slot, const VkDescriptorImageInfo& descriptor);
+
+    [[nodiscard]] VkDescriptorSetLayout layout() const { return layout_; }
+    [[nodiscard]] VkDescriptorSet descriptorSet() const { return descriptorSet_; }
+    [[nodiscard]] uint32_t capacity() const { return capacity_; }
+    [[nodiscard]] uint32_t patchCount() const { return patchCount_; }
+    [[nodiscard]] bool initialized() const { return descriptorSet_ != VK_NULL_HANDLE; }
+    [[nodiscard]] BindlessTextureHeapStats stats() const;
+
+private:
+    VkDevice device_ = VK_NULL_HANDLE;
+    VkDescriptorPool pool_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
+    uint32_t capacity_ = 0;
+    uint32_t descriptorCount_ = 0;
+    uint32_t patchCount_ = 0;
+};
 
 struct TextureHandle { uint32_t index = UINT32_MAX; [[nodiscard]] bool valid() const { return index != UINT32_MAX; } };
 struct MaterialHandle { uint32_t index = UINT32_MAX; [[nodiscard]] bool valid() const { return index != UINT32_MAX; } };

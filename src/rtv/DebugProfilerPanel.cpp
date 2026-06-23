@@ -140,7 +140,9 @@ void DebugProfilerPanel::draw(EditorRuntimeState& state, EditorRequests& request
     ImGui::Text("BVH nodes: %u", meshParams.bvhNodeCount);
     ImGui::Text("Local BVH: %u nodes  %u triangles", meshParams.localBvhNodeCount, meshParams.localTriangleCount);
     ImGui::Text("TLAS: %u nodes  %u indices", meshParams.tlasNodeCount, meshParams.tlasInstanceIndexCount);
-    ImGui::Text("Descriptor texture slots: %zu", state.renderer.scene().materialTextureDescriptors().size());
+    ImGui::Text("Texture slots: %u resident / %u capacity",
+        state.renderer.scene().materialTextureCount(),
+        state.renderer.scene().materialTextureSlotCapacity());
     const RayTracingRendererStats rtStats = state.renderer.rayTracingStats();
     if (rtStats.active) {
         ImGui::SeparatorText("Hardware RT");

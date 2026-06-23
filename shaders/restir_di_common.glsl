@@ -133,7 +133,7 @@ layout(set = 0, binding = 13, std140) uniform RestirDiSceneParams {
     uint tlasInstanceIndexCount;
     uint authoredLightOffset;
     uint authoredLightCount;
-    uint padding4;
+    uint bindlessTextureCapacity;
 } restir_di_scene;
 
 // Surface flags
@@ -872,7 +872,7 @@ const float RESTIR_DI_VISIBILITY_EPSILON = 0.001;
 #endif
 
 const uint RESTIR_DI_MATERIAL_STRIDE = 52u;
-const uint RESTIR_DI_MATERIAL_TEXTURE_LIMIT = 1024u;
+#define RESTIR_DI_MATERIAL_TEXTURE_LIMIT restir_di_scene.bindlessTextureCapacity
 const uint RESTIR_DI_ALPHA_MODE_OPAQUE = 0u;
 const uint RESTIR_DI_ALPHA_MODE_MASK = 1u;
 const uint RESTIR_DI_ALPHA_MODE_BLEND = 2u;
@@ -942,7 +942,7 @@ layout(set = 0, binding = 21, std430) readonly buffer RestirDiGeometryTriangleOf
 layout(set = 0, binding = 22, std430) readonly buffer RestirDiMeshGeometryRanges {
     uvec2 restir_di_mesh_geometry_ranges[];
 };
-layout(set = 0, binding = 41) uniform sampler2D restir_di_material_textures[];
+layout(set = 2, binding = 0) uniform sampler2D restir_di_material_textures[];
 
 RestirDiMaterialVisibility restir_di_decode_material_visibility(uint materialIndex) {
     uint materialCount = max(restir_di_scene.materialCount, 1u);

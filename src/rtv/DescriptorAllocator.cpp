@@ -90,14 +90,12 @@ VkDescriptorPool DescriptorAllocator::createPool() {
         throw std::runtime_error(message.str());
     }
 
-    // One renderer frame typically allocates one bindless ray tracing set plus
-    // a small number of pass-local sets. Keep pool sizes tied to those feature
-    // counts instead of multiplying every set by the bindless array length.
-    constexpr uint32_t kBindlessCombinedImageSamplers = 1024;
+    // The full bindless texture heap owns its own update-after-bind pool; this
+    // allocator only needs room for pass-local sampled textures.
     const std::array<VkDescriptorPoolSize, 7> sizes = {{
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, setsPerPool_ * 4},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setsPerPool_ * 32},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kBindlessCombinedImageSamplers + setsPerPool_ * 16},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, setsPerPool_ * 16},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, setsPerPool_ * 8},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, setsPerPool_ * 8},
         {VK_DESCRIPTOR_TYPE_SAMPLER, setsPerPool_ * 4},

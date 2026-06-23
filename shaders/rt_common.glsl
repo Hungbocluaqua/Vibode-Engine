@@ -245,7 +245,7 @@ layout(set = 0, binding = 11, std140) uniform MeshParams {
     uint tlas_instance_index_count;
     uint authored_light_offset;
     uint authored_light_count;
-    uint _padding4;
+    uint bindless_texture_capacity;
 } mesh_params;
 
 layout(set = 0, binding = 12) uniform texture2D env_map;
@@ -276,7 +276,7 @@ layout(set = 0, binding = 18, std140) uniform RendererDebug {
     float scale;
 } debug_params;
 
-layout(set = 0, binding = 41) uniform sampler2D material_textures[];
+layout(set = 2, binding = 0) uniform sampler2D material_textures[];
 
 struct PrimitiveRecord {
     uvec4 index_data;
@@ -601,7 +601,7 @@ const uint MATERIAL_TEXTURE_TRANSFORM_VOLUME_THICKNESS = 13u;
 const uint MATERIAL_TEXTURE_TRANSFORM_SPECULAR = 14u;
 const uint MATERIAL_TEXTURE_TRANSFORM_SPECULAR_COLOR = 15u;
 const uint MATERIAL_TEXTURE_TRANSFORM_ANISOTROPY = 16u;
-const int MATERIAL_TEXTURE_LIMIT = 1024;
+#define MATERIAL_TEXTURE_LIMIT int(mesh_params.bindless_texture_capacity)
 const uint MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB = 1u << 0u;
 const uint MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB = 1u << 1u;
 const uint MATERIAL_FLAG_NORMAL_MAP_DIRECTX = 1u << 2u;

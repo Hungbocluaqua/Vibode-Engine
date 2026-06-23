@@ -554,6 +554,7 @@ public:
     };
     [[nodiscard]] RestirReservoirMemoryBreakdown restirReservoirMemoryBreakdown() const;
     [[nodiscard]] DescriptorAllocator::Stats descriptorPoolStats() const;
+    [[nodiscard]] BindlessTextureHeapStats bindlessTextureHeapStats() const { return bindlessTextureHeap_.stats(); }
 
     void setDumpRenderGraphPath(std::optional<std::filesystem::path> path) { dumpRenderGraphPath_ = std::move(path); }
     void setDumpRenderGraphDotPath(std::optional<std::filesystem::path> path) { dumpRenderGraphDotPath_ = std::move(path); }
@@ -1631,6 +1632,8 @@ private:
     VkDescriptorSetLayout wavefrontCompactSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout wavefrontSortSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout graphicsSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout emptySetLayout_ = VK_NULL_HANDLE;
+    BindlessTextureHeap bindlessTextureHeap_;
     std::vector<std::unique_ptr<FrameResources>> frames_;
     std::vector<GpuProfiler> profilers_;
     std::vector<int8_t> restirGiActiveTileMaskProfilerModes_;

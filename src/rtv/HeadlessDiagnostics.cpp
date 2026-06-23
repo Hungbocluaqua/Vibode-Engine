@@ -861,6 +861,13 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryReport::DescriptorPoo
     j["pool_growth_count"] = d.poolGrowthCount;
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::MemoryReport::BindlessTextureHeapReport& h) {
+    j["initialized"] = h.initialized;
+    j["capacity"] = h.capacity;
+    j["descriptor_count"] = h.descriptorCount;
+    j["patch_count"] = h.patchCount;
+}
+
 void to_json(nlohmann::json& j, const ProfileReport::MemoryReport::UiReport& u) {
     j["present"] = u.present;
     j["descriptor_max_sets"] = u.descriptorMaxSets;
@@ -907,6 +914,7 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryReport& m) {
     j["staging_batch_upload_count"] = m.stagingBatchUploadCount;
     j["vma_budget"] = m.vmaBudget;
     j["descriptors"] = m.descriptors;
+    j["bindless_texture_heap"] = m.bindlessTextureHeap;
     j["ui"] = m.ui;
 }
 
@@ -2366,6 +2374,11 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.descriptors.failedAllocations = descriptorStats.failedAllocations;
     profileReport_.memory.descriptors.fragmentedPoolFailures = descriptorStats.fragmentedPoolFailures;
     profileReport_.memory.descriptors.poolGrowthCount = descriptorStats.poolGrowthCount;
+    const auto bindlessHeapStats = renderer->bindlessTextureHeapStats();
+    profileReport_.memory.bindlessTextureHeap.initialized = bindlessHeapStats.initialized;
+    profileReport_.memory.bindlessTextureHeap.capacity = bindlessHeapStats.capacity;
+    profileReport_.memory.bindlessTextureHeap.descriptorCount = bindlessHeapStats.descriptorCount;
+    profileReport_.memory.bindlessTextureHeap.patchCount = bindlessHeapStats.patchCount;
     profileReport_.restirGiLayout = renderer->restirGiReservoirLayoutName();
 
     const auto adaptiveState = renderer->adaptiveQualityState();

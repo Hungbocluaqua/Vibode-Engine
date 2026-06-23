@@ -1412,11 +1412,13 @@ void writeBindingsReport(
             {"binding_38", "restir reservoir storage buffer"},
             {"binding_39", "previous restir reservoir storage buffer"},
             {"binding_40", "light BVH nodes storage buffer"},
-            {"binding_41", "bindless combined image samplers"},
             {"binding_42", "path data storage buffer"},
             {"binding_43", "ReSTIR GI current reservoir storage buffer"},
             {"binding_44", "ReSTIR GI previous reservoir storage buffer"},
             {"binding_45", "ReSTIR GI spatial reservoir storage buffer"},
+        }},
+        {"bindless_texture_heap_set_2", {
+            {"binding_0", "full bindless combined image sampler heap"},
         }},
     };
     writeJsonFile(outputPath, {{"passes", passes}, {"known_descriptor_sets", knownSets}});

@@ -646,6 +646,13 @@ struct ProfileReport {
             uint32_t poolGrowthCount = 0;
         } descriptors{};
 
+        struct BindlessTextureHeapReport {
+            bool initialized = false;
+            uint32_t capacity = 0;
+            uint32_t descriptorCount = 0;
+            uint32_t patchCount = 0;
+        } bindlessTextureHeap{};
+
         struct UiReport {
             bool present = false;
             uint32_t descriptorMaxSets = 0;

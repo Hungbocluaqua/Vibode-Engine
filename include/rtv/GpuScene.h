@@ -96,7 +96,7 @@ struct MeshParamsUniform {
     uint32_t tlasInstanceIndexCount = 0;
     uint32_t authoredLightOffset = 0;
     uint32_t authoredLightCount = 0;
-    uint32_t padding4 = 0;
+    uint32_t bindlessTextureCapacity = 0;
 };
 
 struct GpuMeshRecord {
@@ -229,7 +229,8 @@ public:
         SceneCachePolicy sceneCachePolicy = {},
         uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel,
         bool opacityMicromapsEnabled = true,
-        uint32_t materialTextureMaxDimension = 0);
+        uint32_t materialTextureMaxDimension = 0,
+        uint32_t materialTextureSlotCapacity = 1);
     ~GpuScene();
 
     [[nodiscard]] Buffer& vertices() { return *vertices_; }
@@ -270,10 +271,12 @@ public:
     [[nodiscard]] VkSampler environmentSampler() const { return environmentSampler_; }
     [[nodiscard]] const std::vector<VkDescriptorImageInfo>& materialTextureDescriptors() const { return materialTextureTable_.descriptors(); }
     [[nodiscard]] std::vector<VkDescriptorImageInfo> materialCombinedDescriptors() const;
+    [[nodiscard]] VkDescriptorImageInfo materialCombinedDescriptor(uint32_t slot) const;
     [[nodiscard]] VkSampler materialSampler() const { return materialSampler_; }
     [[nodiscard]] const BindlessTextureTable& materialTextureTable() const { return materialTextureTable_; }
     [[nodiscard]] VkImageView materialTextureImageView(uint32_t index) const { return materialTextureTable_.imageView(index); }
     [[nodiscard]] uint32_t materialTextureCount() const { return materialTextureTable_.residentCount(); }
+    [[nodiscard]] uint32_t materialTextureSlotCapacity() const { return materialTextureSlotCapacity_; }
     [[nodiscard]] float materialTextureAnisotropy() const { return materialTextureAnisotropy_; }
 
     [[nodiscard]] const MeshParamsUniform& meshParams() const { return meshParams_; }
@@ -344,6 +347,7 @@ private:
     uint32_t opacityMicromapSubdivisionLevel_ = kDefaultOpacityMicromapSubdivisionLevel;
     bool opacityMicromapsEnabled_ = true;
     uint32_t materialTextureMaxDimension_ = 0;
+    uint32_t materialTextureSlotCapacity_ = 1;
     std::unique_ptr<Buffer> vertices_;
     std::unique_ptr<Buffer> indices_;
     std::unique_ptr<Buffer> bvhNodes_;

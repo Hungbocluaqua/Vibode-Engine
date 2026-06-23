@@ -532,6 +532,15 @@ void copyNgxRowMajorMatrix(std::array<float, 16>& dst, const glm::mat4& src) {
 
 #endif
 
+void bindBindlessTextureHeap(
+    VkCommandBuffer commandBuffer,
+    VkPipelineBindPoint bindPoint,
+    VkPipelineLayout layout,
+    const BindlessTextureHeap& heap) {
+    const VkDescriptorSet descriptorSet = heap.descriptorSet();
+    vkCmdBindDescriptorSets(commandBuffer, bindPoint, layout, 2, 1, &descriptorSet, 0, nullptr);
+}
+
 std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
     constexpr VkShaderStageFlags allRt =
         VK_SHADER_STAGE_RAYGEN_BIT_KHR |
@@ -572,7 +581,6 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
-        descriptorBinding(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, allRt, 1024),
         descriptorBinding(42, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
@@ -888,12 +896,16 @@ PathTracerRenderer::PathTracerRenderer(
               ? initialSettings->opacityMicromapSubdivisionLevel
               : kDefaultOpacityMicromapSubdivisionLevel,
           (initialSettings == nullptr || initialSettings->opacityMicromapsEnabled) && context.supportsOpacityMicromaps(),
-          materialTextureMaxDimension),
+          materialTextureMaxDimension,
+          fullBindlessTextureCapacityOrThrow(context.bindlessCapabilities())),
       gpuSkinningResourcePlan_(std::move(gpuSkinningResourcePlan)),
       resourceAliasingEnabled_(resourceAliasingEnabled) {
     temporalSystem_ = std::make_unique<TemporalSystem>();
     if (!context_.supportsHardwareRayTracing()) {
         throw std::runtime_error("Hardware ray tracing is required but this Vulkan device does not support the required KHR ray tracing features/extensions");
+    }
+    if (!supportsFullBindlessTextures(context_.bindlessCapabilities())) {
+        (void)fullBindlessTextureCapacityOrThrow(context_.bindlessCapabilities());
     }
     if (initialSettings != nullptr) {
         settings_ = *initialSettings;
@@ -1238,6 +1250,9 @@ PathTracerRenderer::PathTracerRenderer(
         binding.stageFlags = VK_SHADER_STAGE_ALL;
     }
     atmosphereSetLayout_ = layoutCache_->createLayout(std::move(atmosphereBindings));
+    emptySetLayout_ = layoutCache_->createLayout({});
+    bindlessTextureHeap_.init(context_.device(), context_.bindlessCapabilities(), scene_.materialTextureSlotCapacity());
+    bindlessTextureHeap_.updateAll(scene_.materialCombinedDescriptors());
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
     momentUpdateSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({momentUpdateShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
@@ -1252,26 +1267,7 @@ PathTracerRenderer::PathTracerRenderer(
         if (includeStbn) {
             bindings = computeBindingsWithStbn(std::move(bindings));
         }
-        std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), 0);
-        const BindlessCapabilities& bindless = context_.bindlessCapabilities();
-        for (size_t i = 0; i < bindings.size(); ++i) {
-            if (bindings[i].binding != 41u) {
-                continue;
-            }
-            // SPIR-V reflection reports zero for an unsized descriptor array.
-            // Match the renderer-wide bindless material texture contract.
-            bindings[i].descriptorCount = 1024u;
-            if (bindless.partiallyBound) {
-                bindingFlags[i] |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-            }
-            if (bindless.updateAfterBind) {
-                bindingFlags[i] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
-            }
-        }
-        const VkDescriptorSetLayoutCreateFlags layoutFlags = bindless.updateAfterBind
-            ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT
-            : 0u;
-        return layoutCache_->createLayout(std::move(bindings), layoutFlags, std::move(bindingFlags));
+        return layoutCache_->createLayout(std::move(bindings));
     };
     restirSpatialSetLayout_ = layoutCache_->createLayout(computeBindingsWithStbn(ShaderReflection::bindingsForSet({restirSpatialShader_->reflection()}, 0)));
     restirGiSpatialSetLayout_ = layoutCache_->createLayout(computeBindingsWithStbn(ShaderReflection::bindingsForSet({restirGiSpatialShader_->reflection()}, 0)));
@@ -1296,24 +1292,7 @@ PathTracerRenderer::PathTracerRenderer(
     toneMapSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({toneMapShader_->reflection()}, 0));
     wavefrontQueueClearSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({wavefrontQueueClearShader_->reflection()}, 0));
     wavefrontPrimaryGenerateSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({wavefrontPrimaryGenerateShader_->reflection()}, 0));
-    {
-        std::vector<VkDescriptorBindingFlags> shadeBindingFlags(wavefrontShadeBindings().size(), 0);
-        const auto shadeBindings = wavefrontShadeBindings();
-        const BindlessCapabilities& shadeBindless = context_.bindlessCapabilities();
-        for (size_t i = 0; i < shadeBindings.size(); ++i) {
-            if (shadeBindings[i].binding == 41) {
-                if (shadeBindless.partiallyBound) {
-                    shadeBindingFlags[i] |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-                }
-                if (shadeBindless.updateAfterBind) {
-                    shadeBindingFlags[i] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
-                }
-            }
-        }
-        const VkDescriptorSetLayoutCreateFlags shadeLayoutFlags =
-            shadeBindless.updateAfterBind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
-        wavefrontShadeSetLayout_ = layoutCache_->createLayout(wavefrontShadeBindings(), shadeLayoutFlags, std::move(shadeBindingFlags));
-    }
+    wavefrontShadeSetLayout_ = layoutCache_->createLayout(wavefrontShadeBindings());
     wavefrontTraceValidateSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({wavefrontTraceValidateShader_->reflection()}, 0));
     wavefrontDirectLightingValidateSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({wavefrontDirectLightingValidateShader_->reflection()}, 0));
     wavefrontDebugWriteSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({wavefrontDebugWriteShader_->reflection()}, 0));
@@ -1323,22 +1302,7 @@ PathTracerRenderer::PathTracerRenderer(
         fullscreenVertexShader_->reflection(),
         fullscreenFragmentShader_->reflection(),
     }, 0));
-    std::vector<VkDescriptorBindingFlags> rtBindingFlags(rayTracingBindings().size(), 0);
-    const auto rtBindings = rayTracingBindings();
-    const BindlessCapabilities& rtBindless = context_.bindlessCapabilities();
-    for (size_t i = 0; i < rtBindings.size(); ++i) {
-        if (rtBindings[i].binding == 41) {
-            if (rtBindless.partiallyBound) {
-                rtBindingFlags[i] |= VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-            }
-            if (rtBindless.updateAfterBind) {
-                rtBindingFlags[i] |= VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
-            }
-        }
-    }
-    const VkDescriptorSetLayoutCreateFlags rtLayoutFlags =
-        rtBindless.updateAfterBind ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
-    rayTracingSetLayout_ = layoutCache_->createLayout(rayTracingBindings(), rtLayoutFlags, std::move(rtBindingFlags));
+    rayTracingSetLayout_ = layoutCache_->createLayout(rayTracingBindings());
 
     denoiserPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -1410,43 +1374,43 @@ PathTracerRenderer::PathTracerRenderer(
     restirGiTemporalPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiTemporalShader_,
-        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiTemporalShader_->reflection()}),
         *pipelineCache_);
     restirGiTemporalFullPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiTemporalFullShader_,
-        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiTemporalFullShader_->reflection()}),
         *pipelineCache_);
     restirGiTemporalValidationPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiTemporalValidationShader_,
-        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiTemporalValidationShader_->reflection()}),
         *pipelineCache_);
     restirGiSpatialProdPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiSpatialProdShader_,
-        std::vector<VkDescriptorSetLayout>{restirGiSpatialProdSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirGiSpatialProdSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiSpatialProdShader_->reflection()}),
         *pipelineCache_);
     restirGiSpatialValidationPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiSpatialValidationShader_,
-        std::vector<VkDescriptorSetLayout>{restirGiSpatialProdSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirGiSpatialProdSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiSpatialValidationShader_->reflection()}),
         *pipelineCache_);
     restirGiFinalProdPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiFinalProdShader_,
-        std::vector<VkDescriptorSetLayout>{restirGiFinalProdSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirGiFinalProdSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiFinalProdShader_->reflection()}),
         *pipelineCache_);
     restirGiFinalValidationPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiFinalValidationShader_,
-        std::vector<VkDescriptorSetLayout>{restirGiFinalProdSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirGiFinalProdSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiFinalValidationShader_->reflection()}),
         *pipelineCache_);
     restirGiUpsamplePipeline_ = std::make_unique<ComputePipeline>(
@@ -1464,37 +1428,37 @@ PathTracerRenderer::PathTracerRenderer(
     restirDiTemporalPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirDiTemporalShader_,
-        std::vector<VkDescriptorSetLayout>{restirDiTemporalSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirDiTemporalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirDiTemporalShader_->reflection()}),
         *pipelineCache_);
     restirDiSpatialPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirDiSpatialShader_,
-        std::vector<VkDescriptorSetLayout>{restirDiSpatialSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirDiSpatialSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirDiSpatialShader_->reflection()}),
         *pipelineCache_);
     restirDiFinalPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirDiFinalShader_,
-        std::vector<VkDescriptorSetLayout>{restirDiFinalSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirDiFinalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirDiFinalShader_->reflection()}),
         *pipelineCache_);
     restirDiTemporalFullPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirDiTemporalFullShader_,
-        std::vector<VkDescriptorSetLayout>{restirDiTemporalSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirDiTemporalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirDiTemporalFullShader_->reflection()}),
         *pipelineCache_);
     restirDiSpatialFullPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirDiSpatialFullShader_,
-        std::vector<VkDescriptorSetLayout>{restirDiSpatialSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirDiSpatialSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirDiSpatialFullShader_->reflection()}),
         *pipelineCache_);
     restirDiFinalFullPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirDiFinalFullShader_,
-        std::vector<VkDescriptorSetLayout>{restirDiFinalSetLayout_},
+        std::vector<VkDescriptorSetLayout>{restirDiFinalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirDiFinalFullShader_->reflection()}),
         *pipelineCache_);
     fogPipeline_ = std::make_unique<ComputePipeline>(
@@ -1542,7 +1506,7 @@ PathTracerRenderer::PathTracerRenderer(
     wavefrontShadePipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *wavefrontShadeShader_,
-        std::vector<VkDescriptorSetLayout>{wavefrontShadeSetLayout_, atmosphereSetLayout_},
+        std::vector<VkDescriptorSetLayout>{wavefrontShadeSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({wavefrontShadeShader_->reflection()}),
         *pipelineCache_);
     wavefrontTraceValidatePipeline_ = std::make_unique<ComputePipeline>(
@@ -1615,7 +1579,7 @@ PathTracerRenderer::PathTracerRenderer(
             *closestHitShader_,
             *primaryAnyHitShader_,
             *shadowAnyHitShader_,
-            std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_},
+            std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
             *pipelineCache_,
             allocator_,
             uploader_,
@@ -1630,7 +1594,7 @@ PathTracerRenderer::PathTracerRenderer(
                 *closestHitShader_,
                 *primaryAnyHitShader_,
                 *shadowAnyHitShader_,
-                std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_},
+                std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
                 *pipelineCache_,
                 allocator_,
                 uploader_,
@@ -1699,7 +1663,7 @@ void PathTracerRenderer::ensureRayTracingVariantPipelines(bool restirDiValidatio
         return;
     }
     const bool ommActive = rayTracingScene_->opacityMicromapStats().active;
-    const std::vector<VkDescriptorSetLayout> layouts{rayTracingSetLayout_, atmosphereSetLayout_};
+    const std::vector<VkDescriptorSetLayout> layouts{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()};
     auto makeRtPipeline = [&](ShaderModule* raygen, bool motion = false, bool ser = false) -> std::unique_ptr<RayTracingPipeline> {
         if (raygen == nullptr) {
             return nullptr;
@@ -1750,7 +1714,7 @@ void PathTracerRenderer::ensureWavefrontTracePipelines() {
         return;
     }
     const bool ommActive = rayTracingScene_->opacityMicromapStats().active;
-    const std::vector<VkDescriptorSetLayout> layouts{rayTracingSetLayout_, atmosphereSetLayout_};
+    const std::vector<VkDescriptorSetLayout> layouts{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()};
     if (wavefrontTracePipeline_ == nullptr) {
         wavefrontTracePipeline_ = std::make_unique<RayTracingPipeline>(
             context_.device(),
@@ -2893,7 +2857,12 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     }
     if (materialTextureFilteringChanged) {
         const uint64_t retireFrame = temporalFrameIndex_ + static_cast<uint64_t>(frames_.size()) + 1ull;
-        scene_.setMaterialTextureAnisotropy(settings_.materialTextureAnisotropy, retireFrame);
+        if (scene_.setMaterialTextureAnisotropy(settings_.materialTextureAnisotropy, retireFrame)) {
+            const uint32_t textureSlots = scene_.materialTextureSlotCapacity();
+            for (uint32_t slot = 0; slot < textureSlots; ++slot) {
+                bindlessTextureHeap_.patch(slot, scene_.materialCombinedDescriptor(slot));
+            }
+        }
     }
     if (taaChanged || renderResolutionChanged) {
         taaHistoryValid_ = false;
@@ -7623,7 +7592,7 @@ void PathTracerRenderer::recordWavefrontShadePass(
     };
 
     wavefrontShadePipeline_->bind(commandBuffer);
-    const std::array<VkDescriptorSet, 2> descriptorSets{set.handle(), atmosphereSet.handle()};
+    const std::array<VkDescriptorSet, 3> descriptorSets{set.handle(), atmosphereSet.handle(), bindlessTextureHeap_.descriptorSet()};
     vkCmdBindDescriptorSets(
         commandBuffer,
         VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -8080,7 +8049,7 @@ void PathTracerRenderer::recordWavefrontShadowTracePass(VkCommandBuffer commandB
         .update(context_.device(), atmosphereSet);
 
     tracePipeline->bind(commandBuffer);
-    const std::array<VkDescriptorSet, 2> descriptorSets{set.handle(), atmosphereSet.handle()};
+    const std::array<VkDescriptorSet, 3> descriptorSets{set.handle(), atmosphereSet.handle(), bindlessTextureHeap_.descriptorSet()};
     vkCmdBindDescriptorSets(
         commandBuffer,
         VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -8351,7 +8320,6 @@ void PathTracerRenderer::recordRestirGiTemporalPass(VkCommandBuffer commandBuffe
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
         .writeAccelerationStructure(33, rayTracingScene_->tlas())
-        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .update(context_.device(), set);
 
     const RestirGiTemporalPush push{
@@ -8373,6 +8341,7 @@ void PathTracerRenderer::recordRestirGiTemporalPass(VkCommandBuffer commandBuffe
     pipeline->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    bindBindlessTextureHeap(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), bindlessTextureHeap_);
     vkCmdPushConstants(commandBuffer, pipeline->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     const uint32_t dispatchWidth = effectiveRestirGiHalfResolution() ? (renderExtent_.width + 1u) / 2u : renderExtent_.width;
     const uint32_t dispatchHeight = effectiveRestirGiHalfResolution() ? (renderExtent_.height + 1u) / 2u : renderExtent_.height;
@@ -8406,7 +8375,6 @@ void PathTracerRenderer::recordRestirGiSpatialProdPass(VkCommandBuffer commandBu
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
         .writeAccelerationStructure(33, rayTracingScene_->tlas())
-        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .update(context_.device(), set);
 
     const RestirGiSpatialProdPush push{
@@ -8433,6 +8401,7 @@ void PathTracerRenderer::recordRestirGiSpatialProdPass(VkCommandBuffer commandBu
     pipeline->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    bindBindlessTextureHeap(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), bindlessTextureHeap_);
     vkCmdPushConstants(commandBuffer, pipeline->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     const uint32_t dispatchWidth = effectiveRestirGiHalfResolution() ? (renderExtent_.width + 1u) / 2u : renderExtent_.width;
     const uint32_t dispatchHeight = effectiveRestirGiHalfResolution() ? (renderExtent_.height + 1u) / 2u : renderExtent_.height;
@@ -8477,7 +8446,6 @@ void PathTracerRenderer::recordRestirGiFinalProdPass(VkCommandBuffer commandBuff
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
         .writeAccelerationStructure(33, rayTracingScene_->tlas())
-        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .update(context_.device(), set);
 
     const uint32_t enabledFlags =
@@ -8508,6 +8476,7 @@ void PathTracerRenderer::recordRestirGiFinalProdPass(VkCommandBuffer commandBuff
     pipeline->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    bindBindlessTextureHeap(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), bindlessTextureHeap_);
     vkCmdPushConstants(commandBuffer, pipeline->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiFinalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
@@ -8626,7 +8595,6 @@ void PathTracerRenderer::recordRestirDiTemporalPass(VkCommandBuffer commandBuffe
         .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
-        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .writeAccelerationStructure(10, rayTracingScene_->tlas());
     writeStbnDescriptors(writer);
     writer.update(context_.device(), set);
@@ -8634,6 +8602,7 @@ void PathTracerRenderer::recordRestirDiTemporalPass(VkCommandBuffer commandBuffe
     pipeline->bind(commandBuffer);
     const VkDescriptorSet ds = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    bindBindlessTextureHeap(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), bindlessTextureHeap_);
     pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiTemporalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
@@ -8701,7 +8670,6 @@ void PathTracerRenderer::recordRestirDiSpatialPass(VkCommandBuffer commandBuffer
         .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
-        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .writeAccelerationStructure(10, rayTracingScene_->tlas());
     writeStbnDescriptors(writer);
     writer.update(context_.device(), set);
@@ -8709,6 +8677,7 @@ void PathTracerRenderer::recordRestirDiSpatialPass(VkCommandBuffer commandBuffer
     pipeline->bind(commandBuffer);
     const VkDescriptorSet ds = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    bindBindlessTextureHeap(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), bindlessTextureHeap_);
     pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiSpatialEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
@@ -8831,13 +8800,13 @@ void PathTracerRenderer::recordRestirDiFinalPass(VkCommandBuffer commandBuffer) 
         .writeBuffer(20, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->geometryTriangleOffsetsBuffer().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->meshGeometryRangesBuffer().descriptorInfo())
-        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .writeAccelerationStructure(10, rayTracingScene_->tlas());
     writer.update(context_.device(), set);
 
     pipeline->bind(commandBuffer);
     const VkDescriptorSet ds = set.handle();
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), 0, 1, &ds, 0, nullptr);
+    bindBindlessTextureHeap(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->layout(), bindlessTextureHeap_);
     pipeline->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiFinalEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 }
@@ -9953,7 +9922,6 @@ void PathTracerRenderer::writeRayTracingDescriptors(
         .writeBuffer(21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.primitiveRecords().descriptorInfo())
         .writeBuffer(22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.instanceRecords().descriptorInfo())
         .writeBuffer(24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightRecords().descriptorInfo())
-        .writeImageArray(41, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, scene_.materialCombinedDescriptors())
         .writeBuffer(25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.meshRecords().descriptorInfo())
         .writeBuffer(26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localVertices().descriptorInfo())
         .writeBuffer(27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.localIndices().descriptorInfo())
@@ -10041,7 +10009,7 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
         .update(context_.device(), atmosphereSet);
 
     pipeline->bind(commandBuffer);
-    const std::array<VkDescriptorSet, 2> descriptorSets{set.handle(), atmosphereSet.handle()};
+    const std::array<VkDescriptorSet, 3> descriptorSets{set.handle(), atmosphereSet.handle(), bindlessTextureHeap_.descriptorSet()};
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline->layout(), 0, static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 0, nullptr);
     pipeline->traceRays(commandBuffer, renderExtent_.width, renderExtent_.height);
 }
@@ -10087,7 +10055,7 @@ void PathTracerRenderer::recordWavefrontTracePass(
         .update(context_.device(), atmosphereSet);
 
     tracePipeline->bind(commandBuffer);
-    const std::array<VkDescriptorSet, 2> descriptorSets{set.handle(), atmosphereSet.handle()};
+    const std::array<VkDescriptorSet, 3> descriptorSets{set.handle(), atmosphereSet.handle(), bindlessTextureHeap_.descriptorSet()};
     vkCmdBindDescriptorSets(
         commandBuffer,
         VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
