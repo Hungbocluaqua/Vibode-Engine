@@ -8,6 +8,7 @@
 #include "rtv/VulkanContext.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -46,6 +47,11 @@ constexpr uint8_t rayMaskShadow = 0x02u;
 
 struct BlasBuildSizes {
     uint32_t meshBuildIndex = 0;
+    enum class Partition : uint8_t {
+        All,
+        SingleSided,
+        DoubleSided,
+    } partition = Partition::All;
     std::vector<uint32_t> primitiveCounts;
     VkAccelerationStructureBuildSizesInfoKHR sizes{};
 };
@@ -54,7 +60,7 @@ struct BlasGeometryRange {
     uint32_t firstIndex = 0;
     uint32_t indexCount = 0;
     uint32_t alphaClass = kPrimitiveAlphaClassOpaque;
-    bool opaqueTraversalSafe = false;
+    bool doubleSided = false;
     bool useOpacityMicromap = false;
 };
 
@@ -63,9 +69,20 @@ struct MeshGeometryRangeGpu {
     uint32_t count = 0;
 };
 
+struct TlasGeometryRangeGpu {
+    uint32_t offset = 0;
+    uint32_t count = 0;
+    uint32_t instanceIndex = 0xffffffffu;
+    uint32_t _pad = 0u;
+};
+
 struct MeshBlasGeometryPlan {
     uint32_t meshBuildIndex = 0;
     std::vector<BlasGeometryRange> ranges;
+    bool splitSidedness = false;
+    MeshGeometryRangeGpu allGeometryRange{};
+    MeshGeometryRangeGpu singleSidedGeometryRange{};
+    MeshGeometryRangeGpu doubleSidedGeometryRange{};
 };
 
 struct MeshOpacityMicromapBuild {
@@ -83,6 +100,20 @@ struct MeshOpacityMicromapBuild {
     VkMicromapBuildSizesInfoEXT sizes{};
     VkMicromapEXT micromap = VK_NULL_HANDLE;
 };
+
+bool rangeIncludedInPartition(
+    const BlasGeometryRange& range,
+    BlasBuildSizes::Partition partition) {
+    switch (partition) {
+    case BlasBuildSizes::Partition::SingleSided:
+        return !range.doubleSided;
+    case BlasBuildSizes::Partition::DoubleSided:
+        return range.doubleSided;
+    case BlasBuildSizes::Partition::All:
+    default:
+        return true;
+    }
+}
 
 constexpr VkDeviceSize kOpacityMicromapBuildInputAlignment = 256;
 constexpr uint32_t kOpacity4StateTransparent = 0u;
@@ -156,8 +187,8 @@ uint32_t primitiveAlphaClass(const GpuPrimitiveRecord& primitive) {
     return primitive.metadata.z;
 }
 
-bool primitiveOpaqueTraversalSafe(const GpuPrimitiveRecord& primitive) {
-    return primitive.metadata.w != 0u && primitiveAlphaClass(primitive) == kPrimitiveAlphaClassOpaque;
+bool primitiveDoubleSided(const GpuPrimitiveRecord& primitive) {
+    return primitive.metadata.w != 0u;
 }
 
 void appendBlasGeometryRange(
@@ -165,13 +196,13 @@ void appendBlasGeometryRange(
     const GpuPrimitiveRecord& primitive,
     bool useOpacityMicromap) {
     const uint32_t alphaClass = primitiveAlphaClass(primitive);
-    const bool opaqueSafe = primitiveOpaqueTraversalSafe(primitive);
+    const bool doubleSided = primitiveDoubleSided(primitive);
     if (!ranges.empty()) {
         BlasGeometryRange& back = ranges.back();
         const bool contiguous = primitive.indexData.x == back.firstIndex + back.indexCount;
         if (contiguous &&
             back.alphaClass == alphaClass &&
-            back.opaqueTraversalSafe == opaqueSafe &&
+            back.doubleSided == doubleSided &&
             back.useOpacityMicromap == useOpacityMicromap) {
             back.indexCount += primitive.indexData.y;
             return;
@@ -181,7 +212,7 @@ void appendBlasGeometryRange(
         .firstIndex = primitive.indexData.x,
         .indexCount = primitive.indexData.y,
         .alphaClass = alphaClass,
-        .opaqueTraversalSafe = opaqueSafe,
+        .doubleSided = doubleSided,
         .useOpacityMicromap = useOpacityMicromap,
     });
 }
@@ -191,12 +222,17 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
     const std::vector<MeshOpacityMicromapBuild>& opacityMicromapBuilds,
     const OpacityMicromapBuildStats& opacityMicromapStats,
     const std::vector<uint8_t>* activeMeshMask,
+    bool hardwareBackfaceCullingEnabled,
+    MixedSidedSplitMode mixedSidedSplitMode,
     std::vector<uint32_t>& geometryTriangleOffsets,
     std::vector<MeshGeometryRangeGpu>& meshGeometryRanges,
     RayTracingBlasGeometryStats& stats) {
     stats = {};
     const auto& rtMeshes = scene.rayTracingMeshes();
     const auto& primitiveRecords = scene.primitiveRecordsCpu();
+    const bool enableMixedSidednessPartitioning =
+        hardwareBackfaceCullingEnabled &&
+        mixedSidedSplitMode == MixedSidedSplitMode::Compact;
     std::vector<MeshBlasGeometryPlan> plans(rtMeshes.size());
     meshGeometryRanges.assign(rtMeshes.size(), MeshGeometryRangeGpu{});
 
@@ -214,15 +250,27 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
             opacityMicromapBuilds[meshBuildIndex].enabled &&
             opacityMicromapBuilds[meshBuildIndex].micromap != VK_NULL_HANDLE;
 
-        if (mesh.indexCount >= 3u && (!meshHasOmm || !mesh.containsBlendedGeometry)) {
+        const bool preserveSidednessRanges =
+            enableMixedSidednessPartitioning &&
+            hardwareBackfaceCullingEnabled &&
+            !meshHasOmm &&
+            mesh.updateMode == AccelUpdateMode::Static &&
+            mesh.containsSingleSidedGeometry &&
+            mesh.containsDoubleSidedGeometry;
+        const bool preserveAlphaClassRanges = meshHasOmm &&
+            (mesh.containsAlphaTestedGeometry || mesh.containsBlendedGeometry);
+        if (mesh.indexCount >= 3u &&
+            !preserveAlphaClassRanges &&
+            !preserveSidednessRanges) {
             const uint32_t fallbackAlphaClass = mesh.containsBlendedGeometry ? kPrimitiveAlphaClassBlended :
                 (mesh.containsAlphaTestedGeometry ? kPrimitiveAlphaClassAlphaTested : kPrimitiveAlphaClassOpaque);
             plan.ranges.push_back(BlasGeometryRange{
                 .firstIndex = mesh.firstIndex,
                 .indexCount = mesh.indexCount,
                 .alphaClass = fallbackAlphaClass,
-                .opaqueTraversalSafe = mesh.opaqueTraversalSafe && fallbackAlphaClass == kPrimitiveAlphaClassOpaque,
-                .useOpacityMicromap = meshHasOmm && !mesh.containsBlendedGeometry,
+                .doubleSided = mesh.containsDoubleSidedGeometry,
+                .useOpacityMicromap = meshHasOmm &&
+                    (mesh.containsAlphaTestedGeometry || mesh.containsBlendedGeometry),
             });
         } else if (!primitiveRecords.empty() && mesh.primitiveOffset < primitiveRecords.size()) {
             const uint32_t primitiveEnd = std::min<uint32_t>(
@@ -233,7 +281,9 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
                 if (primitive.indexData.y < 3u) {
                     continue;
                 }
-                const bool useOmm = meshHasOmm && primitiveAlphaClass(primitive) == kPrimitiveAlphaClassAlphaTested;
+                const uint32_t alphaClass = primitiveAlphaClass(primitive);
+                const bool useOmm = meshHasOmm &&
+                    (alphaClass == kPrimitiveAlphaClassAlphaTested || alphaClass == kPrimitiveAlphaClassBlended);
                 appendBlasGeometryRange(plan.ranges, primitive, useOmm);
             }
         }
@@ -245,14 +295,39 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
                 .firstIndex = mesh.firstIndex,
                 .indexCount = mesh.indexCount,
                 .alphaClass = fallbackAlphaClass,
-                .opaqueTraversalSafe = mesh.opaqueTraversalSafe && fallbackAlphaClass == kPrimitiveAlphaClassOpaque,
-                .useOpacityMicromap = meshHasOmm && mesh.containsAlphaTestedGeometry && !mesh.containsBlendedGeometry,
+                .doubleSided = mesh.containsDoubleSidedGeometry,
+                .useOpacityMicromap = meshHasOmm &&
+                    (mesh.containsAlphaTestedGeometry || mesh.containsBlendedGeometry),
             });
         }
 
-        const uint32_t offsetBase = static_cast<uint32_t>(geometryTriangleOffsets.size());
+        bool hasSingleSided = false;
+        bool hasDoubleSided = false;
+        auto appendGeometryOffsets = [&](BlasBuildSizes::Partition partition) {
+            MeshGeometryRangeGpu range{
+                .offset = static_cast<uint32_t>(geometryTriangleOffsets.size()),
+                .count = 0u,
+            };
+            for (const BlasGeometryRange& geometryRange : plan.ranges) {
+                if (!rangeIncludedInPartition(geometryRange, partition)) {
+                    continue;
+                }
+                geometryTriangleOffsets.push_back(geometryRange.firstIndex / 3u);
+                ++range.count;
+            }
+            return range;
+        };
+
+        plan.allGeometryRange = appendGeometryOffsets(BlasBuildSizes::Partition::All);
         for (const BlasGeometryRange& range : plan.ranges) {
-            geometryTriangleOffsets.push_back(range.firstIndex / 3u);
+            const uint64_t triangleCount = range.indexCount / 3u;
+            hasDoubleSided |= range.doubleSided;
+            hasSingleSided |= !range.doubleSided;
+            if (range.doubleSided) {
+                stats.cullDisabledTriangleCount += triangleCount;
+            } else {
+                stats.cullableTriangleCount += triangleCount;
+            }
             ++stats.geometryCount;
             switch (range.alphaClass) {
             case kPrimitiveAlphaClassAlphaTested:
@@ -269,11 +344,20 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
                 ++stats.opacityMicromapGeometryCount;
             }
         }
+        plan.splitSidedness =
+            enableMixedSidednessPartitioning &&
+            hardwareBackfaceCullingEnabled &&
+            !meshHasOmm &&
+            mesh.updateMode == AccelUpdateMode::Static &&
+            hasSingleSided &&
+            hasDoubleSided;
+        if (plan.splitSidedness) {
+            ++stats.splitMeshCount;
+            plan.singleSidedGeometryRange = appendGeometryOffsets(BlasBuildSizes::Partition::SingleSided);
+            plan.doubleSidedGeometryRange = appendGeometryOffsets(BlasBuildSizes::Partition::DoubleSided);
+        }
         if (mesh.meshIndex < meshGeometryRanges.size()) {
-            meshGeometryRanges[mesh.meshIndex] = MeshGeometryRangeGpu{
-                .offset = offsetBase,
-                .count = static_cast<uint32_t>(plan.ranges.size()),
-            };
+            meshGeometryRanges[mesh.meshIndex] = plan.allGeometryRange;
         }
         plans[meshBuildIndex] = std::move(plan);
     }
@@ -353,7 +437,7 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
         }
         const RayTracingMeshBuildInput& mesh = rtMeshes[meshBuildIndex];
         const uint32_t primitiveCount = mesh.indexCount / 3u;
-        if (!mesh.containsAlphaTestedGeometry || primitiveCount == 0) {
+        if ((!mesh.containsAlphaTestedGeometry && !mesh.containsBlendedGeometry) || primitiveCount == 0) {
             continue;
         }
 
@@ -365,8 +449,11 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
         build.indexValues.assign(primitiveCount, defaultOpacityIndex);
         uint32_t meshIndexedTriangleCount = 0;
 
+        const uint32_t opacityLookupMeshIndex = mesh.sourceMeshHandleIndex != 0xffffffffu
+            ? mesh.sourceMeshHandleIndex
+            : mesh.meshIndex;
         for (uint32_t localPrimitive = 0; localPrimitive < mesh.primitiveCount; ++localPrimitive) {
-            const uint64_t key = (static_cast<uint64_t>(mesh.meshIndex) << 32u) | localPrimitive;
+            const uint64_t key = (static_cast<uint64_t>(opacityLookupMeshIndex) << 32u) | localPrimitive;
             auto found = primitiveMap.find(key);
             if (found == primitiveMap.end()) {
                 continue;
@@ -380,10 +467,14 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
                 continue;
             }
 
-            if (primitive.firstIndex < mesh.firstIndex) {
+            uint32_t primitiveFirstIndex = primitive.firstIndex;
+            if (primitiveFirstIndex < mesh.firstIndex) {
+                primitiveFirstIndex += mesh.firstIndex;
+            }
+            if (primitiveFirstIndex < mesh.firstIndex) {
                 continue;
             }
-            const uint32_t meshTriangleOffset = (primitive.firstIndex - mesh.firstIndex) / 3u;
+            const uint32_t meshTriangleOffset = (primitiveFirstIndex - mesh.firstIndex) / 3u;
             for (uint32_t tri = 0; tri < primitive.triangleCount; ++tri) {
                 const uint64_t stateBase = static_cast<uint64_t>(primitive.stateOffset) +
                     static_cast<uint64_t>(tri) * microTriangleCount;
@@ -522,6 +613,24 @@ uint8_t rayTracingInstanceMask(const RayTracingInstanceBuildInput& instance) {
     return mask;
 }
 
+bool transformFlipsFacing(const glm::mat4& transform) {
+    return glm::dot(
+        glm::vec3(transform[0]),
+        glm::cross(glm::vec3(transform[1]), glm::vec3(transform[2]))) < 0.0f;
+}
+
+VkGeometryInstanceFlagsKHR rayTracingInstanceFlags(
+    const RayTracingInstanceBuildInput& instance,
+    bool cullDisabled) {
+    VkGeometryInstanceFlagsKHR flags = cullDisabled
+        ? VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
+        : 0u;
+    if (transformFlipsFacing(instance.transform)) {
+        flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
+    }
+    return flags;
+}
+
 std::vector<uint8_t> collectActiveRtMeshes(
     const GpuScene& scene,
     size_t meshCount,
@@ -575,9 +684,17 @@ void dynamicBlasInputBarrier(VkCommandBuffer cmd, const Buffer& vertexBuffer) {
 
 std::vector<VkAccelerationStructureInstanceKHR> buildVkInstances(
     const GpuScene& scene,
-    const std::vector<AccelerationStructure>& blases) {
+    const std::vector<AccelerationStructure>& blases,
+    const std::vector<AccelerationStructure>& doubleSidedBlases,
+    const std::vector<uint8_t>& meshCullDisabled,
+    const std::vector<uint8_t>& meshHasDoubleSidedBlas,
+    const std::vector<MeshBlasGeometryPlan>& blasGeometryPlans,
+    const std::vector<MeshGeometryRangeGpu>& meshGeometryRanges,
+    std::vector<TlasGeometryRangeGpu>& tlasGeometryRanges) {
     std::vector<VkAccelerationStructureInstanceKHR> instances;
-    instances.reserve(scene.rayTracingInstances().size());
+    instances.reserve(scene.rayTracingInstances().size() * 2u);
+    tlasGeometryRanges.clear();
+    tlasGeometryRanges.reserve(scene.rayTracingInstances().size() * 2u);
     for (const RayTracingInstanceBuildInput& instance : scene.rayTracingInstances()) {
         if (instance.meshIndex >= blases.size() || blases[instance.meshIndex].handle() == VK_NULL_HANDLE) {
             continue;
@@ -588,14 +705,59 @@ std::vector<VkAccelerationStructureInstanceKHR> buildVkInstances(
             continue;
         }
 
-        VkAccelerationStructureInstanceKHR vkInstance{};
-        vkInstance.transform = toVkTransform(instance.transform);
-        vkInstance.instanceCustomIndex = instance.instanceIndex;
-        vkInstance.mask = mask;
-        vkInstance.instanceShaderBindingTableRecordOffset = 0;
-        vkInstance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        vkInstance.accelerationStructureReference = blases[instance.meshIndex].deviceAddress();
-        instances.push_back(vkInstance);
+        auto fallbackRange = [&]() {
+            if (instance.meshIndex < blasGeometryPlans.size() &&
+                blasGeometryPlans[instance.meshIndex].allGeometryRange.count > 0u) {
+                return blasGeometryPlans[instance.meshIndex].allGeometryRange;
+            }
+            if (instance.meshIndex < meshGeometryRanges.size()) {
+                return meshGeometryRanges[instance.meshIndex];
+            }
+            return MeshGeometryRangeGpu{.offset = 0u, .count = 1u};
+        };
+
+        auto appendInstance = [&](const AccelerationStructure& blas, bool cullDisabled, MeshGeometryRangeGpu geometryRange) {
+            const uint32_t tlasRecordIndex = static_cast<uint32_t>(tlasGeometryRanges.size());
+            VkAccelerationStructureInstanceKHR vkInstance{};
+            vkInstance.transform = toVkTransform(instance.transform);
+            vkInstance.instanceCustomIndex = tlasRecordIndex;
+            vkInstance.mask = mask;
+            vkInstance.instanceShaderBindingTableRecordOffset = 0;
+            vkInstance.flags = rayTracingInstanceFlags(instance, cullDisabled);
+            vkInstance.accelerationStructureReference = blas.deviceAddress();
+            instances.push_back(vkInstance);
+            const MeshGeometryRangeGpu resolvedRange = geometryRange.count > 0u ? geometryRange : fallbackRange();
+            tlasGeometryRanges.push_back(TlasGeometryRangeGpu{
+                .offset = resolvedRange.offset,
+                .count = resolvedRange.count,
+                .instanceIndex = instance.instanceIndex,
+                ._pad = 0u,
+            });
+        };
+
+        const bool primaryCullDisabled =
+            instance.meshIndex < meshCullDisabled.size() &&
+            meshCullDisabled[instance.meshIndex] != 0u;
+        const bool split =
+            instance.meshIndex < meshHasDoubleSidedBlas.size() &&
+            meshHasDoubleSidedBlas[instance.meshIndex] != 0u &&
+            instance.meshIndex < blasGeometryPlans.size();
+        appendInstance(
+            blases[instance.meshIndex],
+            primaryCullDisabled,
+            split ? blasGeometryPlans[instance.meshIndex].singleSidedGeometryRange : fallbackRange());
+
+        if (split &&
+            instance.meshIndex < doubleSidedBlases.size() &&
+            doubleSidedBlases[instance.meshIndex].handle() != VK_NULL_HANDLE) {
+            appendInstance(
+                doubleSidedBlases[instance.meshIndex],
+                true,
+                blasGeometryPlans[instance.meshIndex].doubleSidedGeometryRange);
+        }
+    }
+    if (tlasGeometryRanges.empty()) {
+        tlasGeometryRanges.push_back(TlasGeometryRangeGpu{.offset = 0u, .count = 1u, .instanceIndex = 0u, ._pad = 0u});
     }
     return instances;
 }
@@ -613,7 +775,7 @@ VkAccelerationStructureMotionInstanceNV makeVkMotionInstance(
     matrix.instanceCustomIndex = instance.instanceIndex;
     matrix.mask = mask;
     matrix.instanceShaderBindingTableRecordOffset = 0;
-    matrix.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    matrix.flags = rayTracingInstanceFlags(instance, true);
     matrix.accelerationStructureReference = blas.deviceAddress();
     return vkInstance;
 }
@@ -727,14 +889,22 @@ void RayTracingScene::build(
 
     blases_.clear();
     blases_.resize(scene.rayTracingMeshes().size());
+    doubleSidedBlases_.clear();
+    doubleSidedBlases_.resize(scene.rayTracingMeshes().size());
+    meshCullDisabled_.assign(scene.rayTracingMeshes().size(), 1u);
+    meshHasDoubleSidedBlas_.assign(scene.rayTracingMeshes().size(), 0u);
     destroyOpacityMicromaps();
     accelerationStructureBytes_ = 0;
+    actualBlasCount_ = 0;
     dynamicBlasUpdateScratchSize_ = 0;
     dynamicBlasUpdateCount_ = 0;
     lastDynamicBlasUpdateRecordMs_ = 0.0f;
     opacityMicromapStats_ = {};
     motionBlurActive_ = options.motionBlurEnabled && context.supportsRayTracingMotionBlur();
     motionInstanceStats_ = {};
+    const bool hardwareBackfaceCullingEnabled =
+        options.hardwareBackfaceCullingEnabled && !motionBlurActive_;
+    hardwareBackfaceCullingEnabled_ = hardwareBackfaceCullingEnabled;
 
     const auto& rtMeshes = scene.rayTracingMeshes();
     uint32_t plannedInstanceCount = 0u;
@@ -788,9 +958,21 @@ void RayTracingScene::build(
         opacityMicromapBuilds,
         opacityMicromapStats_,
         &activeMeshMask,
+        hardwareBackfaceCullingEnabled,
+        options.mixedSidedSplitMode,
         geometryTriangleOffsets,
         meshGeometryRanges,
         blasGeometryStats_);
+    blasGeometryStats_.hardwareBackfaceCullingEnabled = hardwareBackfaceCullingEnabled;
+    for (const RayTracingInstanceBuildInput& instance : scene.rayTracingInstances()) {
+        if (rayTracingInstanceMask(instance) == 0u ||
+            instance.meshIndex >= blasGeometryPlans.size() ||
+            !blasGeometryPlans[instance.meshIndex].splitSidedness) {
+            continue;
+        }
+        ++plannedInstanceCount;
+        ++blasGeometryStats_.duplicatedTlasInstanceCount;
+    }
     for (uint32_t meshBuildIndex = 0; meshBuildIndex < rtMeshes.size() && meshBuildIndex < blasGeometryPlans.size(); ++meshBuildIndex) {
         if (gpuSkinnedBindingForMesh(rtMeshes[meshBuildIndex], options) != nullptr) {
             ++blasGeometryStats_.gpuSkinnedMeshCount;
@@ -844,86 +1026,115 @@ void RayTracingScene::build(
         if (plan.ranges.empty()) {
             continue;
         }
-        std::vector<VkAccelerationStructureGeometryTrianglesDataKHR> triangleDatas;
-        std::vector<VkAccelerationStructureTrianglesOpacityMicromapEXT> opacityInfos;
-        std::vector<VkAccelerationStructureGeometryKHR> geometries;
-        std::vector<uint32_t> primitiveCounts;
-        triangleDatas.reserve(plan.ranges.size());
-        opacityInfos.reserve(plan.ranges.size());
-        geometries.reserve(plan.ranges.size());
-        primitiveCounts.reserve(plan.ranges.size());
+        meshCullDisabled_[mesh.meshIndex] =
+            !hardwareBackfaceCullingEnabled ||
+            (!plan.splitSidedness &&
+             std::any_of(plan.ranges.begin(), plan.ranges.end(), [](const BlasGeometryRange& range) {
+                 return range.doubleSided;
+             }))
+            ? 1u
+            : 0u;
+        meshHasDoubleSidedBlas_[mesh.meshIndex] = plan.splitSidedness ? 1u : 0u;
 
-        for (const BlasGeometryRange& range : plan.ranges) {
-            VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
-            triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-            triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-            triangles.vertexData.deviceAddress = rayTracingVertexAddressForMesh(scene, mesh, options);
-            triangles.vertexStride = sizeof(GpuLocalVertex);
-            triangles.maxVertex = mesh.firstVertex + mesh.vertexCount - 1u;
-            triangles.indexType = VK_INDEX_TYPE_UINT32;
-            triangles.indexData.deviceAddress = scene.localIndices().deviceAddress() + sizeof(uint32_t) * range.firstIndex;
+        auto appendBuildSizes = [&](BlasBuildSizes::Partition partition) {
+            std::vector<VkAccelerationStructureGeometryTrianglesDataKHR> triangleDatas;
+            std::vector<VkAccelerationStructureTrianglesOpacityMicromapEXT> opacityInfos;
+            std::vector<VkAccelerationStructureGeometryKHR> geometries;
+            std::vector<uint32_t> primitiveCounts;
+            triangleDatas.reserve(plan.ranges.size());
+            opacityInfos.reserve(plan.ranges.size());
+            geometries.reserve(plan.ranges.size());
+            primitiveCounts.reserve(plan.ranges.size());
+            for (const BlasGeometryRange& range : plan.ranges) {
+                if (!rangeIncludedInPartition(range, partition)) {
+                    continue;
+                }
+                VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
+                triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+                triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+                triangles.vertexData.deviceAddress = rayTracingVertexAddressForMesh(scene, mesh, options);
+                triangles.vertexStride = sizeof(GpuLocalVertex);
+                triangles.maxVertex = mesh.firstVertex + mesh.vertexCount - 1u;
+                triangles.indexType = VK_INDEX_TYPE_UINT32;
+                triangles.indexData.deviceAddress = scene.localIndices().deviceAddress() + sizeof(uint32_t) * range.firstIndex;
 
-            if (range.useOpacityMicromap &&
-                meshBuildIndex < opacityMicromapBuilds.size() &&
-                opacityMicromapBuilds[meshBuildIndex].micromap != VK_NULL_HANDLE) {
-                MeshOpacityMicromapBuild& opacityBuild = opacityMicromapBuilds[meshBuildIndex];
-                opacityInfos.push_back(VkAccelerationStructureTrianglesOpacityMicromapEXT{});
-                VkAccelerationStructureTrianglesOpacityMicromapEXT& opacityInfo = opacityInfos.back();
-                opacityInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT;
-                opacityInfo.indexType = VK_INDEX_TYPE_UINT32;
-                opacityInfo.indexBuffer.deviceAddress = opacityBuild.indexBuffer.deviceAddress() +
-                    sizeof(uint32_t) * ((range.firstIndex - mesh.firstIndex) / 3u);
-                opacityInfo.indexStride = sizeof(uint32_t);
-                opacityInfo.baseTriangle = 0;
-                opacityInfo.usageCountsCount = 1;
-                opacityInfo.pUsageCounts = &opacityBuild.usage;
-                opacityInfo.micromap = opacityBuild.micromap;
-                triangles.pNext = &opacityInfo;
+                if (range.useOpacityMicromap &&
+                    meshBuildIndex < opacityMicromapBuilds.size() &&
+                    opacityMicromapBuilds[meshBuildIndex].micromap != VK_NULL_HANDLE) {
+                    MeshOpacityMicromapBuild& opacityBuild = opacityMicromapBuilds[meshBuildIndex];
+                    opacityInfos.push_back(VkAccelerationStructureTrianglesOpacityMicromapEXT{});
+                    VkAccelerationStructureTrianglesOpacityMicromapEXT& opacityInfo = opacityInfos.back();
+                    opacityInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT;
+                    opacityInfo.indexType = VK_INDEX_TYPE_UINT32;
+                    opacityInfo.indexBuffer.deviceAddress = opacityBuild.indexBuffer.deviceAddress() +
+                        sizeof(uint32_t) * ((range.firstIndex - mesh.firstIndex) / 3u);
+                    opacityInfo.indexStride = sizeof(uint32_t);
+                    opacityInfo.baseTriangle = 0;
+                    opacityInfo.usageCountsCount = 1;
+                    opacityInfo.pUsageCounts = &opacityBuild.usage;
+                    opacityInfo.micromap = opacityBuild.micromap;
+                    triangles.pNext = &opacityInfo;
+                }
+
+                triangleDatas.push_back(triangles);
+                VkAccelerationStructureGeometryKHR geometry{};
+                geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+                geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+                geometry.flags = range.alphaClass == kPrimitiveAlphaClassOpaque
+                    ? VK_GEOMETRY_OPAQUE_BIT_KHR
+                    : 0;
+                geometry.geometry.triangles = triangleDatas.back();
+                geometries.push_back(geometry);
+                primitiveCounts.push_back(range.indexCount / 3u);
+            }
+            if (geometries.empty()) {
+                return;
             }
 
-            triangleDatas.push_back(triangles);
-            VkAccelerationStructureGeometryKHR geometry{};
-            geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-            geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-            geometry.flags = range.opaqueTraversalSafe ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
-            geometry.geometry.triangles = triangleDatas.back();
-            geometries.push_back(geometry);
-            primitiveCounts.push_back(range.indexCount / 3u);
-        }
+            VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+            buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+            buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+            if (std::any_of(plan.ranges.begin(), plan.ranges.end(), [&](const BlasGeometryRange& range) {
+                    return range.useOpacityMicromap && rangeIncludedInPartition(range, partition);
+                })) {
+                buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_EXT;
+            }
+            if (partition == BlasBuildSizes::Partition::All && meshAllowsDynamicBlasUpdate(mesh, options)) {
+                buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+            }
+            buildInfo.geometryCount = static_cast<uint32_t>(geometries.size());
+            buildInfo.pGeometries = geometries.data();
 
-        VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
-        buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-        buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        if (std::any_of(plan.ranges.begin(), plan.ranges.end(), [](const BlasGeometryRange& range) { return range.useOpacityMicromap; })) {
-            buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_EXT;
-        }
-        if (meshAllowsDynamicBlasUpdate(mesh, options)) {
-            buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-        }
-        buildInfo.geometryCount = static_cast<uint32_t>(geometries.size());
-        buildInfo.pGeometries = geometries.data();
+            VkAccelerationStructureBuildSizesInfoKHR sizes{};
+            sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+            vkGetAccelerationStructureBuildSizesKHR(
+                device,
+                VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                &buildInfo,
+                primitiveCounts.data(),
+                &sizes);
 
-        VkAccelerationStructureBuildSizesInfoKHR sizes{};
-        sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-        vkGetAccelerationStructureBuildSizesKHR(
-            device,
-            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-            &buildInfo,
-            primitiveCounts.data(),
-            &sizes);
+            const VkDeviceSize alignedBuildScratchSize = alignScratchSize(sizes.buildScratchSize);
+            maxBuildScratchSize = std::max(maxBuildScratchSize, alignedBuildScratchSize);
+            totalBlasScratchSize += alignedBuildScratchSize;
+            if (partition == BlasBuildSizes::Partition::All && meshAllowsDynamicBlasUpdate(mesh, options)) {
+                dynamicBlasUpdateScratchSize_ = std::max(dynamicBlasUpdateScratchSize_, sizes.updateScratchSize);
+            }
+            blasBuildSizes.push_back(BlasBuildSizes{
+                .meshBuildIndex = meshBuildIndex,
+                .partition = partition,
+                .primitiveCounts = std::move(primitiveCounts),
+                .sizes = sizes,
+            });
+        };
 
-        const VkDeviceSize alignedBuildScratchSize = alignScratchSize(sizes.buildScratchSize);
-        maxBuildScratchSize = std::max(maxBuildScratchSize, alignedBuildScratchSize);
-        totalBlasScratchSize += alignedBuildScratchSize;
-        if (meshAllowsDynamicBlasUpdate(mesh, options)) {
-            dynamicBlasUpdateScratchSize_ = std::max(dynamicBlasUpdateScratchSize_, sizes.updateScratchSize);
+        if (plan.splitSidedness) {
+            appendBuildSizes(BlasBuildSizes::Partition::SingleSided);
+            appendBuildSizes(BlasBuildSizes::Partition::DoubleSided);
+        } else {
+            appendBuildSizes(BlasBuildSizes::Partition::All);
         }
-        blasBuildSizes.push_back(BlasBuildSizes{
-            .meshBuildIndex = meshBuildIndex,
-            .primitiveCounts = primitiveCounts,
-            .sizes = sizes,
-        });
     }
 
     if (blasBuildSizes.empty()) {
@@ -1035,6 +1246,10 @@ void RayTracingScene::build(
         ranges.reserve(plan.ranges.size());
 
         for (const BlasGeometryRange& geometryRange : plan.ranges) {
+            const bool rangeIncluded = rangeIncludedInPartition(geometryRange, record.partition);
+            if (!rangeIncluded) {
+                continue;
+            }
             VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
             triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
             triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
@@ -1066,7 +1281,9 @@ void RayTracingScene::build(
             VkAccelerationStructureGeometryKHR geometry{};
             geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
             geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-            geometry.flags = geometryRange.opaqueTraversalSafe ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+            geometry.flags = geometryRange.alphaClass == kPrimitiveAlphaClassOpaque
+                ? VK_GEOMETRY_OPAQUE_BIT_KHR
+                : 0;
             geometry.geometry.triangles = triangleDatas.back();
             geometries.push_back(geometry);
 
@@ -1082,25 +1299,39 @@ void RayTracingScene::build(
         buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
         buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
         buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-        if (std::any_of(plan.ranges.begin(), plan.ranges.end(), [](const BlasGeometryRange& range) { return range.useOpacityMicromap; })) {
+        if (std::any_of(plan.ranges.begin(), plan.ranges.end(), [&](const BlasGeometryRange& range) {
+                return range.useOpacityMicromap && rangeIncludedInPartition(range, record.partition);
+            })) {
             buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DISABLE_OPACITY_MICROMAPS_BIT_EXT;
         }
-        const bool allowBlasUpdate = meshAllowsDynamicBlasUpdate(mesh, options);
+        const bool allowBlasUpdate =
+            record.partition == BlasBuildSizes::Partition::All &&
+            meshAllowsDynamicBlasUpdate(mesh, options);
         if (allowBlasUpdate) {
             buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
         }
         buildInfo.geometryCount = static_cast<uint32_t>(geometries.size());
         buildInfo.pGeometries = geometries.data();
 
-        blases_[mesh.meshIndex].create(device, allocator, AccelerationStructureDesc{
+        AccelerationStructure& destination =
+            record.partition == BlasBuildSizes::Partition::DoubleSided
+                ? doubleSidedBlases_[mesh.meshIndex]
+                : blases_[mesh.meshIndex];
+        destination.create(device, allocator, AccelerationStructureDesc{
             .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
             .size = record.sizes.accelerationStructureSize,
             .allowUpdate = allowBlasUpdate,
-            .debugName = "ray tracing BLAS",
+            .debugName = record.partition == BlasBuildSizes::Partition::DoubleSided
+                ? "ray tracing double-sided BLAS"
+                : "ray tracing BLAS",
         });
         accelerationStructureBytes_ += record.sizes.accelerationStructureSize;
+        if (record.partition == BlasBuildSizes::Partition::DoubleSided) {
+            blasGeometryStats_.splitBlasBytes += record.sizes.accelerationStructureSize;
+        }
+        ++actualBlasCount_;
 
-        buildInfo.dstAccelerationStructure = blases_[mesh.meshIndex].handle();
+        buildInfo.dstAccelerationStructure = destination.handle();
         buildInfo.scratchData.deviceAddress = scratchAddress + scratchOffset;
 
         std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> rangePtrs;
@@ -1113,8 +1344,20 @@ void RayTracingScene::build(
     }
     flushBlasBatch();
     blasGeometryStats_.buildBatchCount = blasBuildBatchCount;
+    blasGeometryStats_.actualBlasCount = actualBlasCount_;
 
-    const std::vector<VkAccelerationStructureInstanceKHR> instances = motionBlurActive_ ? std::vector<VkAccelerationStructureInstanceKHR>{} : buildVkInstances(scene, blases_);
+    std::vector<TlasGeometryRangeGpu> tlasGeometryRanges;
+    const std::vector<VkAccelerationStructureInstanceKHR> instances = motionBlurActive_
+        ? std::vector<VkAccelerationStructureInstanceKHR>{}
+        : buildVkInstances(
+            scene,
+            blases_,
+            doubleSidedBlases_,
+            meshCullDisabled_,
+            meshHasDoubleSidedBlas_,
+            blasGeometryPlans,
+            meshGeometryRanges,
+            tlasGeometryRanges);
     const std::vector<VkAccelerationStructureMotionInstanceNV> motionInstances = motionBlurActive_ ? buildVkMotionInstances(scene, blases_) : std::vector<VkAccelerationStructureMotionInstanceNV>{};
     const uint32_t builtInstanceCount = static_cast<uint32_t>(motionBlurActive_ ? motionInstances.size() : instances.size());
     if (builtInstanceCount == 0) {
@@ -1136,6 +1379,21 @@ void RayTracingScene::build(
     });
     instanceBuffer_.write(motionBlurActive_ ? static_cast<const void*>(motionInstances.data()) : static_cast<const void*>(instances.data()), instanceBytes);
     instanceBuffer_.flush();
+
+    if (motionBlurActive_) {
+        tlasGeometryRanges.assign(1u, TlasGeometryRangeGpu{.offset = 0u, .count = 1u, .instanceIndex = 0u, ._pad = 0u});
+    }
+    tlasGeometryRangesBuffer_.create(allocator, BufferDesc{
+        .size = sizeof(TlasGeometryRangeGpu) * tlasGeometryRanges.size(),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .memory = BufferMemory::Upload,
+        .persistentMapped = true,
+        .debugName = "ray tracing TLAS geometry ranges",
+    });
+    tlasGeometryRangesBuffer_.write(
+        tlasGeometryRanges.data(),
+        sizeof(TlasGeometryRangeGpu) * tlasGeometryRanges.size());
+    tlasGeometryRangesBuffer_.flush(sizeof(TlasGeometryRangeGpu) * tlasGeometryRanges.size());
 
     VkAccelerationStructureGeometryInstancesDataKHR instancesData{};
     instancesData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
@@ -1188,9 +1446,11 @@ void RayTracingScene::build(
         opacityMicromapStats_.buildMs = std::chrono::duration<float, std::milli>(opacityBuildEnd - opacityBuildStart).count();
     }
 
-    std::cout << "RT scene: BLAS=" << blases_.size()
+    std::cout << "RT scene: BLAS=" << actualBlasCount_
               << " instances=" << instanceCount_
               << " geometries=" << blasGeometryStats_.geometryCount
+              << " split_meshes=" << blasGeometryStats_.splitMeshCount
+              << " duplicated_instances=" << blasGeometryStats_.duplicatedTlasInstanceCount
               << " blas_batches=" << blasGeometryStats_.buildBatchCount
               << " AS memory=" << (static_cast<double>(accelerationStructureBytes_) / (1024.0 * 1024.0)) << " MB";
     if (motionBlurActive_) {
@@ -1237,6 +1497,8 @@ bool RayTracingScene::recordDynamicBlasUpdates(
         noOpacityMicromapBuilds,
         noOpacityMicromapStats,
         nullptr,
+        false,
+        MixedSidedSplitMode::Off,
         geometryTriangleOffsets,
         meshGeometryRanges,
         ignoredStats);
@@ -1288,7 +1550,9 @@ bool RayTracingScene::recordDynamicBlasUpdates(
             VkAccelerationStructureGeometryKHR geometry{};
             geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
             geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-            geometry.flags = geometryRange.opaqueTraversalSafe ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
+            geometry.flags = geometryRange.alphaClass == kPrimitiveAlphaClassOpaque
+                ? VK_GEOMETRY_OPAQUE_BIT_KHR
+                : 0;
             geometry.geometry.triangles = triangleDatas.back();
             geometries.push_back(geometry);
 
@@ -1339,8 +1603,24 @@ bool RayTracingScene::refitTransforms(
     if (!context.supportsHardwareRayTracing() || tlas_.handle() == VK_NULL_HANDLE || !tlas_.allowUpdate()) {
         return false;
     }
+    if (blasGeometryStats_.splitMeshCount > 0u) {
+        return false;
+    }
 
-    const std::vector<VkAccelerationStructureInstanceKHR> instances = motionBlurActive_ ? std::vector<VkAccelerationStructureInstanceKHR>{} : buildVkInstances(scene, blases_);
+    std::vector<TlasGeometryRangeGpu> ignoredTlasGeometryRanges;
+    const std::vector<MeshGeometryRangeGpu> emptyMeshGeometryRanges;
+    const std::vector<MeshBlasGeometryPlan> emptyGeometryPlans;
+    const std::vector<VkAccelerationStructureInstanceKHR> instances = motionBlurActive_
+        ? std::vector<VkAccelerationStructureInstanceKHR>{}
+        : buildVkInstances(
+            scene,
+            blases_,
+            doubleSidedBlases_,
+            meshCullDisabled_,
+            meshHasDoubleSidedBlas_,
+            emptyGeometryPlans,
+            emptyMeshGeometryRanges,
+            ignoredTlasGeometryRanges);
     const std::vector<VkAccelerationStructureMotionInstanceNV> motionInstances = motionBlurActive_ ? buildVkMotionInstances(scene, blases_) : std::vector<VkAccelerationStructureMotionInstanceNV>{};
     const uint32_t builtInstanceCount = static_cast<uint32_t>(motionBlurActive_ ? motionInstances.size() : instances.size());
     if (builtInstanceCount == 0 || builtInstanceCount != instanceCount_) {

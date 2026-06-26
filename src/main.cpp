@@ -28,6 +28,8 @@
 #include "rtv/GpuSceneStreamingState.h"
 #include "rtv/IncrementalGpuSceneUpdateQueue.h"
 #include "rtv/GpuProfiler.h"
+#include "rtv/GpuCrashDiagnostics.h"
+#include "rtv/NsightPerfMarkers.h"
 #include "rtv/GpuUploadTicket.h"
 #include "rtv/MainThreadApplyTicket.h"
 #include "rtv/TopologyRebuildTicket.h"
@@ -2859,6 +2861,8 @@ int cookAnimationControllerCommand(
 
 int main(int argc, char** argv) {
     try {
+        const bool viewerExecutable = argc > 0 &&
+            std::filesystem::path(argv[0]).stem().string() == "rtviewer";
         uint32_t maxFrames = 0;
         rtv::RendererDebugView debugView = rtv::RendererDebugView::Beauty;
         bool debugViewProvided = false;
@@ -2871,6 +2875,10 @@ int main(int argc, char** argv) {
         std::optional<bool> dlssFrameGenerationOverride;
         std::optional<bool> dlssRayReconstructionOverride;
         std::optional<bool> streamlineReflexOverride;
+        std::optional<bool> streamlineNvPerfOverride;
+        rtv::NsightPerfReportOptions nsightPerfReportOptions;
+        std::optional<uint32_t> nsightPerfCaptureAfterFrames;
+        bool nsightPerfOutputProvided = false;
         std::optional<float> dlssSharpeningOverride;
         std::optional<rtv::RestirMode> restirModeOverride;
         std::optional<rtv::RenderPreset> renderPresetOverride;
@@ -2904,7 +2912,15 @@ int main(int argc, char** argv) {
         std::optional<bool> restirDiStabilizationOverride;
         std::optional<rtv::RestirDiReservoirLayout> restirDiReservoirLayoutOverride;
         std::optional<bool> opacityMicromapOverride;
+        std::optional<bool> hardwareBackfaceCullingOverride;
+        std::optional<rtv::MixedSidedSplitMode> mixedSidedSplitModeOverride;
+        std::optional<rtv::PathTraceKernelMode> pathTraceKernelModeOverride;
+        std::optional<rtv::BlendedDecalShadowMode> blendedDecalShadowModeOverride;
+        std::optional<rtv::Native2BDirectReuseMode> native2BDirectReuseModeOverride;
+        std::optional<bool> forceOpaqueCameraRaysOverride;
+        std::optional<bool> secondaryDirectLightingOverride;
         std::optional<uint32_t> opacityMicromapSubdivisionOverride;
+        std::optional<bool> opacityMicromapBlendOverride;
         std::optional<bool> wavefrontQueuesOverride;
         std::optional<bool> wavefrontPrimaryGenerateOverride;
         std::optional<bool> wavefrontTraceOverride;
@@ -2929,10 +2945,26 @@ int main(int argc, char** argv) {
         bool wavefrontValidationMode = false;
         std::optional<float> taaMotionFeedbackOverride;
         std::optional<float> taaReactiveFeedbackOverride;
+        std::optional<float> renderScaleOverride;
+        std::optional<uint32_t> maxBouncesOverride;
+        std::optional<uint32_t> atrousIterationsOverride;
+        std::optional<uint32_t> environmentSamplesOverride;
+        std::optional<bool> finalBounceFastPathOverride;
+        std::optional<float> native2BTerminalDirectSampleProbabilityOverride;
         std::optional<uint32_t> samplesPerPixelOverride;
         std::optional<bool> sppLimiterOverride;
         bool validationCameraMotion = false;
         bool validationObjectMotion = false;
+        bool rendererOnly = viewerExecutable;
+        uint32_t captureReadyAfterFrames = 60;
+        bool captureReadyLog = false;
+        uint32_t rendererOnlyLingerAfterCaptureReadyMs = 0;
+        std::optional<std::filesystem::path> captureReadyFilePath;
+        bool gpuMarkersEnabled = true;
+        bool gpuCrashDumpsEnabled = false;
+        std::filesystem::path gpuCrashDumpDir = "out/gpu_crash_dumps";
+        std::optional<std::filesystem::path> savePresentFramePath;
+        std::optional<std::filesystem::path> savePresentFrameOnHotkeyPath;
 
         rtv::HeadlessDiagnosticsConfig diagConfig;
         bool dumpRenderGraphDot = false;
@@ -3059,6 +3091,50 @@ int main(int argc, char** argv) {
 
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
+            if (arg == "--renderer-only") {
+                rendererOnly = true;
+            } else if (arg == "--capture-ready-after-frames" && i + 1 < argc) {
+                captureReadyAfterFrames = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
+            } else if (arg == "--capture-ready-log") {
+                captureReadyLog = true;
+            } else if (arg == "--renderer-only-linger-ms" && i + 1 < argc) {
+                rendererOnlyLingerAfterCaptureReadyMs = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if (arg == "--capture-ready-file" && i + 1 < argc) {
+                captureReadyFilePath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--save-present-frame" && i + 1 < argc) {
+                savePresentFramePath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--save-present-frame-on-hotkey" && i + 1 < argc) {
+                savePresentFrameOnHotkeyPath = std::filesystem::path(argv[++i]);
+            } else if (arg == "--resolution" && i + 1 < argc) {
+                const std::string value(argv[++i]);
+                const size_t sep = value.find_first_of("xX");
+                if (sep == std::string::npos) {
+                    throw std::runtime_error("--resolution expects WIDTHxHEIGHT");
+                }
+                diagConfig.headlessWidth = std::max(1u, static_cast<uint32_t>(std::stoul(value.substr(0, sep))));
+                diagConfig.headlessHeight = std::max(1u, static_cast<uint32_t>(std::stoul(value.substr(sep + 1))));
+            } else if (arg == "--gpu-markers" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    gpuMarkersEnabled = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    gpuMarkersEnabled = false;
+                } else {
+                    throw std::runtime_error("Invalid --gpu-markers value: expected on or off");
+                }
+            } else if (arg == "--gpu-crash-dumps" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                gpuCrashDumpsEnabled = value == "on" || value == "true" || value == "1";
+                if (!gpuCrashDumpsEnabled && value != "off" && value != "false" && value != "0") {
+                    throw std::runtime_error("Invalid --gpu-crash-dumps value: expected on or off");
+                }
+            } else if (arg == "--gpu-crash-dump-dir" && i + 1 < argc) {
+                gpuCrashDumpDir = argv[++i];
+            }
+        }
+
+        for (int i = 1; i < argc; ++i) {
+            std::string_view arg(argv[i]);
 
             if (arg == "--headless-width" && i + 1 < argc) {
                 diagConfig.headlessWidth = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
@@ -3066,6 +3142,78 @@ int main(int argc, char** argv) {
             }
             if (arg == "--headless-height" && i + 1 < argc) {
                 diagConfig.headlessHeight = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
+                continue;
+            }
+            if (arg == "--rt-diagnostic-counters" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    diagConfig.rayTracingDiagnosticCounters = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    diagConfig.rayTracingDiagnosticCounters = false;
+                } else {
+                    throw std::runtime_error("Invalid --rt-diagnostic-counters value: expected on or off");
+                }
+                continue;
+            }
+            if (arg == "--hardware-backface-culling" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    hardwareBackfaceCullingOverride = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    hardwareBackfaceCullingOverride = false;
+                } else {
+                    throw std::runtime_error("Invalid --hardware-backface-culling value: expected on or off");
+                }
+                continue;
+            }
+            if (arg == "--mixed-sided-split" && i + 1 < argc) {
+                mixedSidedSplitModeOverride = rtv::parseMixedSidedSplitMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--pathtrace-kernel" && i + 1 < argc) {
+                pathTraceKernelModeOverride = rtv::parsePathTraceKernelMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--blended-decal-shadow-mode" && i + 1 < argc) {
+                blendedDecalShadowModeOverride = rtv::parseBlendedDecalShadowMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--native2b-direct-reuse" && i + 1 < argc) {
+                native2BDirectReuseModeOverride = rtv::parseNative2BDirectReuseMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--force-opaque-camera-rays" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    forceOpaqueCameraRaysOverride = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    forceOpaqueCameraRaysOverride = false;
+                } else {
+                    throw std::runtime_error("Invalid --force-opaque-camera-rays value: expected on or off");
+                }
+                continue;
+            }
+            if (arg == "--secondary-direct-lighting" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    secondaryDirectLightingOverride = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    secondaryDirectLightingOverride = false;
+                } else {
+                    throw std::runtime_error(
+                        "Invalid --secondary-direct-lighting value: expected on or off");
+                }
+                continue;
+            }
+            if ((arg == "--final-bounce-fast-path" || arg == "--final-bounce-visibility") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    finalBounceFastPathOverride = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    finalBounceFastPathOverride = false;
+                } else {
+                    throw std::runtime_error("Invalid final-bounce fast-path value: expected on or off");
+                }
                 continue;
             }
 
@@ -3212,6 +3360,59 @@ int main(int argc, char** argv) {
             if ((arg == "--reflex" || arg == "--streamline-reflex") && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 streamlineReflexOverride = !(value == "off" || value == "false" || value == "0");
+                continue;
+            }
+            if (arg == "--nvperf") {
+                streamlineNvPerfOverride = true;
+                continue;
+            }
+            if (arg == "--nvperf-output" && i + 1 < argc) {
+                nsightPerfReportOptions.outputDirectory = argv[++i];
+                nsightPerfOutputProvided = true;
+                streamlineNvPerfOverride = true;
+                continue;
+            }
+            if (arg == "--nvperf-capture-after-frames" && i + 1 < argc) {
+                nsightPerfCaptureAfterFrames = static_cast<uint32_t>(std::stoul(argv[++i]));
+                streamlineNvPerfOverride = true;
+                continue;
+            }
+            if (arg == "--nvperf-html" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                nsightPerfReportOptions.enableHtmlReport =
+                    value == "on" || value == "true" || value == "1";
+                if (!nsightPerfReportOptions.enableHtmlReport &&
+                    value != "off" && value != "false" && value != "0") {
+                    throw std::runtime_error("Invalid --nvperf-html value: expected on or off");
+                }
+                streamlineNvPerfOverride = true;
+                continue;
+            }
+            if (arg == "--nvperf-csv" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                nsightPerfReportOptions.enableCsvReport =
+                    value == "on" || value == "true" || value == "1";
+                if (!nsightPerfReportOptions.enableCsvReport &&
+                    value != "off" && value != "false" && value != "0") {
+                    throw std::runtime_error("Invalid --nvperf-csv value: expected on or off");
+                }
+                streamlineNvPerfOverride = true;
+                continue;
+            }
+            if (arg == "--nvperf-raw-counter-images" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                nsightPerfReportOptions.writeCounterImages =
+                    value == "on" || value == "true" || value == "1";
+                if (!nsightPerfReportOptions.writeCounterImages &&
+                    value != "off" && value != "false" && value != "0") {
+                    throw std::runtime_error("Invalid --nvperf-raw-counter-images value: expected on or off");
+                }
+                streamlineNvPerfOverride = true;
+                continue;
+            }
+            if (arg == "--streamline-nvperf" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                streamlineNvPerfOverride = !(value == "off" || value == "false" || value == "0");
                 continue;
             }
 
@@ -3418,6 +3619,9 @@ int main(int argc, char** argv) {
                 opacityMicromapOverride = !(value == "off" || value == "false" || value == "0");
             } else if ((arg == "--omm-subdivision" || arg == "--opacity-micromap-subdivision") && i + 1 < argc) {
                 opacityMicromapSubdivisionOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if ((arg == "--omm-blend" || arg == "--opacity-micromap-blend") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                opacityMicromapBlendOverride = !(value == "off" || value == "false" || value == "0");
             } else if (arg == "--wavefront-queues" && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 wavefrontQueuesOverride = !(value == "off" || value == "false" || value == "0");
@@ -3648,6 +3852,22 @@ int main(int argc, char** argv) {
                 cameraName = std::string(argv[++i]);
             } else if (arg == "--frame-index" && i + 1 < argc) {
                 frameIndex = static_cast<uint32_t>(std::stoul(argv[++i]));
+            }
+        }
+
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view arg(argv[i]);
+            if ((arg == "--render-scale" || arg == "--render-resolution-scale") && i + 1 < argc) {
+                renderScaleOverride = std::stof(argv[++i]);
+            } else if ((arg == "--max-bounces" || arg == "--bounces") && i + 1 < argc) {
+                maxBouncesOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if ((arg == "--atrous-iterations" || arg == "--denoiser-atrous-iterations") && i + 1 < argc) {
+                atrousIterationsOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if ((arg == "--environment-samples" || arg == "--environment-direct-samples") && i + 1 < argc) {
+                environmentSamplesOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else if ((arg == "--native2b-terminal-direct-rate" ||
+                        arg == "--native2b-terminal-direct-sample-probability") && i + 1 < argc) {
+                native2BTerminalDirectSampleProbabilityOverride = std::stof(argv[++i]);
             }
         }
 
@@ -3912,6 +4132,16 @@ int main(int argc, char** argv) {
         if (needsDebugViews && !diagConfig.saveDebugViewsDir.has_value()) {
             diagConfig.saveDebugViewsDir = artifactBase / "debug_views";
         }
+        if (streamlineNvPerfOverride.value_or(false)) {
+            if (!nsightPerfOutputProvided) {
+                nsightPerfReportOptions.outputDirectory = (artifactBase / "nvperf").string();
+            }
+            nsightPerfReportOptions.startAfterFrames = nsightPerfCaptureAfterFrames.value_or(
+                diagConfig.headless
+                    ? diagConfig.warmupFrames
+                    : (rendererOnly ? captureReadyAfterFrames : 60u));
+            rtv::configureNsightPerfReport(nsightPerfReportOptions);
+        }
         if (shaderHotReloadReport && !dumpShaderReportPath.has_value()) {
             dumpShaderReportPath = artifactBase / "shader_hot_reload_report.json";
         }
@@ -3938,6 +4168,12 @@ int main(int argc, char** argv) {
         if (diagConfig.headless && !scenePath.has_value() && !gltfPath.has_value() && !nativePackageScenePath.has_value()) {
             throw std::runtime_error("--headless requires --scene <path>, --gltf <path>, or --native-package-scene <path>");
         }
+        if (rendererOnly && diagConfig.headless) {
+            throw std::runtime_error("--renderer-only cannot be combined with --headless");
+        }
+        if (rendererOnly && !scenePath.has_value() && !gltfPath.has_value() && !nativePackageScenePath.has_value()) {
+            throw std::runtime_error("--renderer-only requires --scene <path>, --gltf <path>, or --native-package-scene <path>");
+        }
         if (diagConfig.saveFrameSequenceDir.has_value() && !diagConfig.headless) {
             throw std::runtime_error("--save-frame-sequence requires --headless");
         }
@@ -3958,22 +4194,32 @@ int main(int argc, char** argv) {
         }
 #endif
 
+        rtv::GpuCrashDiagnostics gpuCrashDiagnostics;
+        rtv::recordGpuCrashDiagnosticsRequest(gpuCrashDumpsEnabled, gpuCrashDumpDir);
+        if (gpuCrashDumpsEnabled) {
+            (void)gpuCrashDiagnostics.enable(gpuCrashDumpDir);
+        }
+
         rtv::Application app(debugView, gltfPath, hdrPath, scenePath, nativePackageScenePath,
             nativePackageAnimationSelection,
             denoiserOverride, restirModeOverride, renderPresetOverride, restirGiOverride,
             opacityMicromapOverride,
+            opacityMicromapBlendOverride,
+            hardwareBackfaceCullingOverride,
             opacityMicromapSubdivisionOverride,
             debugViewProvided, validationCameraMotion, validationObjectMotion,
             diagConfig.headless,
+            rendererOnly ? rtv::ApplicationMode::RendererOnly : rtv::ApplicationMode::Editor,
             diagConfig.headlessWidth,
             diagConfig.headlessHeight,
-            diagConfig.disableAsyncCompute,
+            diagConfig.disableAsyncCompute || streamlineNvPerfOverride.value_or(false),
             diagConfig.singleQueueFallback,
             diagConfig.disableResourceAliasing,
             streamingOptions);
 
         if (auto* renderer = app.pathTracer()) {
-            renderer->setRayTracingDiagnosticCountersEnabled(diagConfig.profile);
+            renderer->setRayTracingDiagnosticCountersEnabled(diagConfig.rayTracingDiagnosticCounters);
+            renderer->setGpuMarkersEnabled(gpuMarkersEnabled);
             auto lower = [](std::string value) {
                 std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
                     return static_cast<char>(std::tolower(ch));
@@ -4082,6 +4328,7 @@ int main(int argc, char** argv) {
                 dlssFrameGenerationOverride.has_value() ||
                 dlssRayReconstructionOverride.has_value() ||
                 streamlineReflexOverride.has_value() ||
+                streamlineNvPerfOverride.has_value() ||
                 dlssSharpeningOverride.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();
                 if (denoiserBackendOverride.has_value()) {
@@ -4098,6 +4345,9 @@ int main(int argc, char** argv) {
                 }
                 if (streamlineReflexOverride.has_value()) {
                     settings.streamlineReflexEnabled = *streamlineReflexOverride;
+                }
+                if (streamlineNvPerfOverride.has_value()) {
+                    settings.streamlineNvPerfEnabled = *streamlineNvPerfOverride;
                 }
                 if (dlssSharpeningOverride.has_value()) {
                     settings.dlssSharpeningStrength = std::clamp(*dlssSharpeningOverride, 0.0f, 1.0f);
@@ -4120,6 +4370,19 @@ int main(int argc, char** argv) {
                 if (settings.streamlineReflexEnabled && !nvidiaStatus.streamlineReflex.requestable) {
                     std::cerr << "Warning: Streamline Reflex requested, but unavailable: "
                               << nvidiaStatus.streamlineReflex.unavailableReason << ".\n";
+                }
+                if (settings.streamlineNvPerfEnabled && !nvidiaStatus.streamlineNvPerf.requestable) {
+                    std::cerr << "Warning: Streamline NvPerf requested, but unavailable: "
+                              << nvidiaStatus.streamlineNvPerf.unavailableReason << ".";
+                    if (nvidiaStatus.nsightPerfSdk.reportGeneratorInitialized) {
+                        std::cerr << " Native Nsight Perf SDK diagnostics are ready for "
+                                  << nvidiaStatus.nsightPerfSdk.deviceName
+                                  << " (" << nvidiaStatus.nsightPerfSdk.chipName << ").";
+                    } else if (!nvidiaStatus.nsightPerfSdk.unavailableReason.empty()) {
+                        std::cerr << " Native Nsight Perf SDK unavailable: "
+                                  << nvidiaStatus.nsightPerfSdk.unavailableReason << ".";
+                    }
+                    std::cerr << "\n";
                 }
                 if (settings.dlssFrameGenerationEnabled && !nvidiaStatus.dlssFrameGenerationAvailable) {
                     std::cerr << "Warning: DLSS Frame Generation requested, but unavailable: "
@@ -4221,6 +4484,59 @@ int main(int argc, char** argv) {
                 }
                 if (taaReactiveFeedbackOverride.has_value()) {
                     settings.taaReactiveFeedback = *taaReactiveFeedbackOverride;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
+            if (renderScaleOverride.has_value() ||
+                maxBouncesOverride.has_value() ||
+                atrousIterationsOverride.has_value() ||
+                environmentSamplesOverride.has_value() ||
+                finalBounceFastPathOverride.has_value() ||
+                native2BTerminalDirectSampleProbabilityOverride.has_value() ||
+                mixedSidedSplitModeOverride.has_value() ||
+                pathTraceKernelModeOverride.has_value() ||
+                blendedDecalShadowModeOverride.has_value() ||
+                native2BDirectReuseModeOverride.has_value() ||
+                forceOpaqueCameraRaysOverride.has_value() ||
+                secondaryDirectLightingOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (renderScaleOverride.has_value()) {
+                    settings.renderResolutionScale = *renderScaleOverride;
+                }
+                if (maxBouncesOverride.has_value()) {
+                    settings.maxBounces = *maxBouncesOverride;
+                }
+                if (atrousIterationsOverride.has_value()) {
+                    settings.atrousIterations = *atrousIterationsOverride;
+                }
+                if (environmentSamplesOverride.has_value()) {
+                    settings.environmentDirectSamples = *environmentSamplesOverride;
+                }
+                if (finalBounceFastPathOverride.has_value()) {
+                    settings.finalBounceFastPathEnabled = *finalBounceFastPathOverride;
+                }
+                if (native2BTerminalDirectSampleProbabilityOverride.has_value()) {
+                    settings.native2BTerminalDirectSampleProbability =
+                        std::clamp(*native2BTerminalDirectSampleProbabilityOverride, 0.0f, 1.0f);
+                }
+                if (mixedSidedSplitModeOverride.has_value()) {
+                    settings.mixedSidedSplitMode = *mixedSidedSplitModeOverride;
+                }
+                if (pathTraceKernelModeOverride.has_value()) {
+                    settings.pathTraceKernelMode = *pathTraceKernelModeOverride;
+                }
+                if (blendedDecalShadowModeOverride.has_value()) {
+                    settings.blendedDecalShadowMode = *blendedDecalShadowModeOverride;
+                }
+                if (native2BDirectReuseModeOverride.has_value()) {
+                    settings.native2BDirectReuseMode = *native2BDirectReuseModeOverride;
+                }
+                if (forceOpaqueCameraRaysOverride.has_value()) {
+                    settings.forceOpaqueCameraRays = *forceOpaqueCameraRaysOverride;
+                }
+                if (secondaryDirectLightingOverride.has_value()) {
+                    settings.secondaryDirectLightingEnabled = *secondaryDirectLightingOverride;
                 }
                 settings.renderPreset = rtv::RenderPreset::Custom;
                 renderer->applySettings(settings);
@@ -4450,6 +4766,12 @@ int main(int argc, char** argv) {
             }
         }
 
+        app.configureCaptureReady(captureReadyAfterFrames, captureReadyLog);
+        app.setRendererOnlyLingerAfterCaptureReadyMs(rendererOnly ? rendererOnlyLingerAfterCaptureReadyMs : 0u);
+        app.setCaptureReadyFilePath(captureReadyFilePath);
+        app.setSavePresentFramePath(savePresentFramePath);
+        app.setSavePresentFrameOnHotkeyPath(savePresentFrameOnHotkeyPath);
+
         rtv::HeadlessDiagnostics diag(diagConfig);
         if (diagConfig.makeDebugPackageDir.has_value() || crashDumpPackageDir.has_value()) {
             diag.captureStdout();
@@ -4522,7 +4844,7 @@ int main(int argc, char** argv) {
         if (diagConfig.headless) {
             app.runHeadless(diagConfig.warmupFrames, maxFrames);
         } else {
-            app.run(maxFrames);
+            app.run(maxFrames, diagConfig.warmupFrames, needsProfile);
         }
 
         bool descriptorLifetimeStressPassed = true;

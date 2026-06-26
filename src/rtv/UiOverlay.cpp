@@ -141,6 +141,34 @@ uint8_t toneMapHdrPreview(float value) {
     return static_cast<uint8_t>(std::pow(mapped, 1.0f / 2.2f) * 255.0f + 0.5f);
 }
 
+const char* debugViewLabel(RendererDebugView view) {
+    return rendererDebugViewName(view);
+}
+
+const std::array<RendererDebugView, 18>& rendererOnlyDebugViews() {
+    static const std::array<RendererDebugView, 18> views{{
+        RendererDebugView::Beauty,
+        RendererDebugView::DirectLighting,
+        RendererDebugView::IndirectLighting,
+        RendererDebugView::Normals,
+        RendererDebugView::Depth,
+        RendererDebugView::MotionVectors,
+        RendererDebugView::Albedo,
+        RendererDebugView::Roughness,
+        RendererDebugView::Variance,
+        RendererDebugView::DenoiserRejection,
+        RendererDebugView::ReprojectionConfidence,
+        RendererDebugView::RestirDiFinalContribution,
+        RendererDebugView::RestirDiTemporalReservoir,
+        RendererDebugView::RestirDiSpatialReservoir,
+        RendererDebugView::RestirGiFinal,
+        RendererDebugView::RestirGiTemporal,
+        RendererDebugView::RestirGiSpatial,
+        RendererDebugView::WavefrontQueueOccupancy,
+    }};
+    return views;
+}
+
 uint32_t rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
     return static_cast<uint32_t>(r) | (static_cast<uint32_t>(g) << 8u) | (static_cast<uint32_t>(b) << 16u) | (static_cast<uint32_t>(a) << 24u);
 }
@@ -450,6 +478,9 @@ EditorRequests UiOverlay::build(
         NotificationManager* notifications,
         bool externalMouseCapture) {
     EditorRequests requests;
+    rendererOnlyMode_ = false;
+    rendererOnlyViewportHovered_ = false;
+    rendererOnlyViewportActive_ = false;
     if (!frameBegun_) {
         return requests;
     }
@@ -522,6 +553,267 @@ EditorRequests UiOverlay::build(
     return requests;
 }
 
+RendererOnlyRequests UiOverlay::buildRendererOnly(
+    PathTracerRenderer& renderer,
+    VkExtent2D extent,
+    const std::optional<std::filesystem::path>& gltfPath,
+    const std::optional<std::filesystem::path>& scenePath,
+    const std::optional<std::filesystem::path>& nativePackageScenePath,
+    CameraController* camera,
+    float cpuFrameMs,
+    bool captureReadyPrinted,
+    uint32_t captureReadyFrames,
+    uint32_t captureReadyAfterFrames) {
+    (void)extent;
+    RendererOnlyRequests requests;
+    rendererOnlyMode_ = true;
+    rendererOnlyViewportHovered_ = false;
+    rendererOnlyViewportActive_ = false;
+    rendersPathTracerInViewport_ = true;
+    if (!frameBegun_) {
+        return requests;
+    }
+
+    const VkExtent2D renderExtent = renderer.renderExtent();
+    const VkExtent2D displayExtent = renderer.displayExtent();
+    const VkDescriptorImageInfo descriptor = renderer.viewportImageDescriptor();
+    if (descriptor.imageView != VK_NULL_HANDLE && descriptor.imageView != viewportImageView_) {
+        invalidateViewportTexture();
+        viewportTexture_ = ImGui_ImplVulkan_AddTexture(descriptor.imageView, descriptor.imageLayout);
+        descriptorPoolStats_.viewportDescriptorAllocated = viewportTexture_ != VK_NULL_HANDLE ? 1u : 0u;
+        viewportImageView_ = descriptor.imageView;
+        viewportTextureExtent_ = displayExtent;
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+    ImGuiWindowFlags canvasFlags = ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoNavFocus;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    if (ImGui::Begin("RendererOnlyViewport", nullptr, canvasFlags)) {
+        const ImVec2 canvas = ImGui::GetContentRegionAvail();
+        rendererOnlyViewportHovered_ = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        rendererOnlyViewportActive_ = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        if (viewportTexture_ != VK_NULL_HANDLE && canvas.x > 1.0f && canvas.y > 1.0f) {
+            const float imageAspect = displayExtent.height > 0u
+                ? static_cast<float>(displayExtent.width) / static_cast<float>(displayExtent.height)
+                : 1.0f;
+            ImVec2 imageSize = canvas;
+            if (imageSize.y > 1.0f && imageSize.x / imageSize.y > imageAspect) {
+                imageSize.x = imageSize.y * imageAspect;
+            } else if (imageAspect > 0.0f) {
+                imageSize.y = imageSize.x / imageAspect;
+            }
+            ImGui::SetCursorPos(ImVec2((canvas.x - imageSize.x) * 0.5f, (canvas.y - imageSize.y) * 0.5f));
+            ImGui::Image(reinterpret_cast<ImTextureID>(viewportTexture_), imageSize);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+
+    const float panelWidth = std::min(380.0f, std::max(300.0f, viewport->WorkSize.x * 0.26f));
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - panelWidth - 12.0f, viewport->WorkPos.y + 12.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(panelWidth, std::min(viewport->WorkSize.y - 24.0f, 690.0f)), ImGuiCond_Always);
+    ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+    if (ImGui::Begin("Renderer", nullptr, panelFlags)) {
+        const std::filesystem::path activePath = scenePath.value_or(gltfPath.value_or(nativePackageScenePath.value_or(std::filesystem::path{})));
+        ImGui::TextUnformatted(activePath.empty() ? "Renderer Only" : activePath.filename().string().c_str());
+        ImGui::Text("CPU %.2f ms  GPU %.2f ms", cpuFrameMs, renderer.timings().totalMs());
+        ImGui::Text("%ux%u -> %ux%u", renderExtent.width, renderExtent.height, displayExtent.width, displayExtent.height);
+        ImGui::Text("Capture %s (%u/%u)",
+            captureReadyPrinted ? "ready" : "warming",
+            std::min(captureReadyFrames, captureReadyAfterFrames),
+            captureReadyAfterFrames);
+        ImGui::Separator();
+
+        RendererSettings settings = renderer.settings();
+        bool changed = false;
+
+        int preset = static_cast<int>(settings.renderPreset);
+        const char* presetItems[] = {"Custom", "Low", "Balanced", "Ultra", "Native30"};
+        if (ImGui::Combo("Preset", &preset, presetItems, IM_ARRAYSIZE(presetItems))) {
+            settings.renderPreset = static_cast<RenderPreset>(preset);
+            applyRenderPreset(settings, settings.renderPreset);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat("Render scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
+        int spp = static_cast<int>(settings.samplesPerPixel);
+        if (ImGui::SliderInt("SPP", &spp, 1, 8)) {
+            settings.samplesPerPixel = static_cast<uint32_t>(std::max(1, spp));
+            settings.renderPreset = RenderPreset::Custom;
+            changed = true;
+        }
+        int bounces = static_cast<int>(settings.maxBounces);
+        if (ImGui::SliderInt("Bounces", &bounces, 1, 16)) {
+            settings.maxBounces = static_cast<uint32_t>(std::max(1, bounces));
+            settings.renderPreset = RenderPreset::Custom;
+            changed = true;
+        }
+        changed |= ImGui::Checkbox("Denoiser", &settings.denoiserEnabled);
+        changed |= ImGui::Checkbox("TAA/TSR", &settings.taaEnabled);
+        bool dlss = settings.temporalUpscaler == TemporalUpscaler::Dlss;
+        if (ImGui::Checkbox("DLSS", &dlss)) {
+            settings.temporalUpscaler = dlss ? TemporalUpscaler::Dlss : TemporalUpscaler::TaaTsr;
+            changed = true;
+        }
+        changed |= ImGui::Checkbox("NvPerf", &settings.streamlineNvPerfEnabled);
+        changed |= ImGui::Checkbox("ReSTIR GI", &settings.restirGiEnabled);
+        changed |= ImGui::Checkbox("ReSTIR DI Temporal", &settings.restirDiTemporalEnabled);
+        changed |= ImGui::Checkbox("ReSTIR DI Spatial", &settings.restirDiSpatialEnabled);
+
+        const auto& debugViews = rendererOnlyDebugViews();
+        int debugIndex = 0;
+        for (size_t i = 0; i < debugViews.size(); ++i) {
+            if (debugViews[i] == settings.debugView) {
+                debugIndex = static_cast<int>(i);
+                break;
+            }
+        }
+        if (ImGui::BeginCombo("Debug view", debugViewLabel(debugViews[debugIndex]))) {
+            for (size_t i = 0; i < debugViews.size(); ++i) {
+                const bool selected = debugIndex == static_cast<int>(i);
+                if (ImGui::Selectable(debugViewLabel(debugViews[i]), selected)) {
+                    settings.debugView = debugViews[i];
+                    settings.renderPreset = RenderPreset::Custom;
+                    changed = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        int tone = static_cast<int>(settings.toneMapper);
+        const char* toneItems[] = {"Linear", "Reinhard", "ReinhardWhite", "ACES", "PBRNeutral", "AgX"};
+        if (ImGui::Combo("Tone map", &tone, toneItems, IM_ARRAYSIZE(toneItems))) {
+            settings.toneMapper = static_cast<ToneMapper>(tone);
+            settings.renderPreset = RenderPreset::Custom;
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat("Exposure", &settings.exposure, -8.0f, 8.0f, "%.2f");
+        changed |= ImGui::Checkbox("Auto exposure", &settings.autoExposureEnabled);
+
+        if (camera != nullptr) {
+            float moveSpeed = camera->moveSpeed();
+            float fastSpeed = camera->fastMoveSpeed();
+            if (ImGui::SliderFloat("Camera speed", &moveSpeed, 0.1f, 25.0f, "%.2f")) {
+                requests.cameraMoveSpeed = moveSpeed;
+            }
+            if (ImGui::SliderFloat("Fast speed", &fastSpeed, 0.5f, 75.0f, "%.2f")) {
+                requests.cameraFastMoveSpeed = fastSpeed;
+            }
+        }
+
+        if (changed) {
+            requests.settings = settings;
+            requests.resetAccumulation = AccumulationResetReason::RenderSettingsChanged;
+        }
+
+        ImGui::Separator();
+        const GpuFrameTimings& timings = renderer.timings();
+        ImGui::Text("PathTrace %.2f  DI %.2f/%.2f/%.2f",
+            timings.pathTraceMs,
+            timings.restirDiTemporalMs,
+            timings.restirDiSpatialMs,
+            timings.restirDiFinalMs);
+        ImGui::Text("GI %.2f/%.2f/%.2f  Denoise %.2f",
+            timings.restirGiTemporalMs,
+            timings.restirGiSpatialMs,
+            timings.restirGiFinalMs,
+            timings.denoiserMs);
+        ImGui::Text("TAA %.2f  ToneMap %.2f  Present %.2f",
+            timings.taaMs,
+            timings.toneMapMs,
+            timings.fullscreenMs + timings.editorPresentationMs);
+
+        ImGui::SeparatorText("Nsight Perf SDK");
+        const NsightPerfMarkerStatus perfStatus = nsightPerfMarkerStatus();
+        if (!rendererOnlyNsightOutputInitialized_) {
+            const std::string initialOutput = perfStatus.configuredOutputDirectory.empty()
+                ? std::string("out/nvperf")
+                : perfStatus.configuredOutputDirectory;
+            std::snprintf(rendererOnlyNsightOutput_.data(), rendererOnlyNsightOutput_.size(), "%s", initialOutput.c_str());
+            rendererOnlyNsightDelayFrames_ = static_cast<int>(perfStatus.startAfterFrames);
+            rendererOnlyNsightOutputInitialized_ = true;
+        }
+        ImGui::InputText("Report output", rendererOnlyNsightOutput_.data(), rendererOnlyNsightOutput_.size());
+        ImGui::InputInt("Start delay", &rendererOnlyNsightDelayFrames_);
+        rendererOnlyNsightDelayFrames_ = std::max(0, rendererOnlyNsightDelayFrames_);
+        const char* perfState = perfStatus.collectionActive
+            ? "collecting"
+            : perfStatus.captureRequested
+                ? "queued"
+                : perfStatus.captureSucceeded
+                    ? "complete"
+                    : perfStatus.captureFailed
+                        ? "failed"
+                        : perfStatus.reportGeneratorInitialized
+                            ? "ready"
+                            : "unavailable";
+        ImGui::Text("State: %s  frames: %llu", perfState, static_cast<unsigned long long>(perfStatus.framesObserved));
+        ImGui::Text("Ranges: %llu/%llu  failures: %llu/%llu",
+            static_cast<unsigned long long>(perfStatus.pushedRanges),
+            static_cast<unsigned long long>(perfStatus.poppedRanges),
+            static_cast<unsigned long long>(perfStatus.failedPushes),
+            static_cast<unsigned long long>(perfStatus.failedPops));
+        if (!perfStatus.unavailableReason.empty()) {
+            ImGui::TextWrapped("%s", perfStatus.unavailableReason.c_str());
+        }
+        if (ImGui::Button("Start GPU Report")) {
+            NsightPerfReportOptions options;
+            options.outputDirectory = rendererOnlyNsightOutput_.data();
+            options.startAfterFrames = static_cast<uint32_t>(rendererOnlyNsightDelayFrames_);
+            options.nestingLevels = 2;
+            options.enableHtmlReport = true;
+            options.enableCsvReport = true;
+            requests.startNsightPerfReport = std::move(options);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel Report")) {
+            requests.cancelNsightPerfReport = true;
+        }
+        if (!perfStatus.lastReportDirectory.empty()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Open Report")) {
+                requests.openNsightPerfReport = true;
+            }
+            ImGui::TextWrapped("%s", perfStatus.lastReportDirectory.c_str());
+        }
+
+        ImGui::Separator();
+        if (ImGui::Button("Save PNG")) {
+            requests.savePresentFrame = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Debug Views")) {
+            requests.saveDebugViews = true;
+        }
+        if (ImGui::Button("Profile JSON")) {
+            requests.dumpProfileJson = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset Accum")) {
+            requests.resetAccumulation = AccumulationResetReason::Manual;
+        }
+        if (ImGui::Button("Print CAPTURE_READY")) {
+            requests.printCaptureReady = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Run Quick A/B")) {
+            requests.runQuickExperimentMatrix = true;
+        }
+    }
+    ImGui::End();
+
+    ImGui::Render();
+    return requests;
+}
+
 EditorRequests UiOverlay::buildProjectManager(
     const ProjectContext* project,
     const AssetRegistry* assetRegistry,
@@ -535,6 +827,9 @@ EditorRequests UiOverlay::buildProjectManager(
     const EditorJobCenterState* jobCenter,
     NotificationManager* notifications) {
     EditorRequests requests;
+    rendererOnlyMode_ = false;
+    rendererOnlyViewportHovered_ = false;
+    rendererOnlyViewportActive_ = false;
     if (!frameBegun_) {
         return requests;
     }
@@ -608,16 +903,19 @@ bool UiOverlay::wantsTextInput() const {
 }
 
 bool UiOverlay::viewportInteractionActive() const {
-    return editor_.viewportInteractionActive();
+    return rendererOnlyViewportActive_ || editor_.viewportInteractionActive();
 }
 
 bool UiOverlay::viewportHovered() const {
-    return editor_.viewportHovered();
+    return rendererOnlyViewportHovered_ || editor_.viewportHovered();
 }
 
 VkExtent2D UiOverlay::desiredRenderExtent(VkExtent2D fallback) const {
     if (renderExtentOverride_.has_value() && renderExtentOverride_->width > 0u && renderExtentOverride_->height > 0u) {
         return *renderExtentOverride_;
+    }
+    if (rendererOnlyMode_) {
+        return fallback;
     }
     VkExtent2D extent = editor_.desiredRenderExtent(fallback);
     if (extent.width == 0 || extent.height == 0) {

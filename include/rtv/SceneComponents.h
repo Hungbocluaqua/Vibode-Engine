@@ -245,7 +245,13 @@ struct RenderSettings {
     bool pathTracingEnabled = true;
     bool cameraJitterEnabled = true;
     bool directLightingEnabled = true;
+    bool secondaryDirectLightingEnabled = true;
     uint32_t maxBounces = 5;
+    PathTraceKernelMode pathTraceKernelMode = PathTraceKernelMode::Generic;
+    bool finalBounceFastPathEnabled = false;
+    float native2BTerminalDirectSampleProbability = 1.0f;
+    BlendedDecalShadowMode blendedDecalShadowMode = BlendedDecalShadowMode::Exact;
+    Native2BDirectReuseMode native2BDirectReuseMode = Native2BDirectReuseMode::Off;
     uint32_t environmentDirectSamples = 1;
     ToneMapper toneMapper = ToneMapper::ACES;
     float exposure = 2.0f;
@@ -307,6 +313,7 @@ struct RenderSettings {
     bool dlssFrameGenerationEnabled = false;
     bool dlssRayReconstructionEnabled = false;
     bool streamlineReflexEnabled = false;
+    bool streamlineNvPerfEnabled = false;
     float dlssSharpeningStrength = 0.0f;
     float taaFeedback = 0.06f;
     float taaMotionFeedback = 0.90f;
@@ -319,6 +326,7 @@ struct RenderSettings {
     float materialTextureAnisotropy = 4.0f;
     bool specularAaEnabled = true;
     bool opacityMicromapsEnabled = true;
+    bool compactImportedEmissiveTriangleSampling = false;
     float shadowRayBias = 0.001f;
     float shadowDistanceBias = 0.002f;
     float fireflyClamp = 8.0f;

@@ -82,7 +82,7 @@ static_assert(sizeof(GpuInstanceRecord) == 272);
 static_assert(sizeof(GpuLocalVertex) == 80);
 static_assert(sizeof(GpuInstanceBoundsRecord) == 32);
 static_assert(sizeof(GpuLightRecord) == 96);
-static_assert(sizeof(MeshParamsUniform) == 80);
+static_assert(sizeof(MeshParamsUniform) == 96);
 
 template <typename Fn>
 void parallelFor(size_t count, const Fn& fn, size_t minItemsPerTask = 64) {
@@ -145,12 +145,80 @@ uint32_t previewBaseMipFor(const TextureAsset& texture, uint32_t maxDimension) {
     return static_cast<uint32_t>(texture.mipData.size() - 1u);
 }
 
+std::vector<uint8_t> downsampleRgba8Box(
+    const std::vector<uint8_t>& source,
+    uint32_t sourceWidth,
+    uint32_t sourceHeight,
+    uint32_t targetWidth,
+    uint32_t targetHeight) {
+    std::vector<uint8_t> result(static_cast<size_t>(targetWidth) * static_cast<size_t>(targetHeight) * 4u, 0u);
+    if (sourceWidth == 0u || sourceHeight == 0u || targetWidth == 0u || targetHeight == 0u ||
+        source.size() < static_cast<size_t>(sourceWidth) * static_cast<size_t>(sourceHeight) * 4u) {
+        return {};
+    }
+
+    for (uint32_t y = 0; y < targetHeight; ++y) {
+        const uint32_t y0 = (static_cast<uint64_t>(y) * sourceHeight) / targetHeight;
+        const uint32_t y1 = std::max<uint32_t>(
+            y0 + 1u,
+            (static_cast<uint64_t>(y + 1u) * sourceHeight + targetHeight - 1u) / targetHeight);
+        for (uint32_t x = 0; x < targetWidth; ++x) {
+            const uint32_t x0 = (static_cast<uint64_t>(x) * sourceWidth) / targetWidth;
+            const uint32_t x1 = std::max<uint32_t>(
+                x0 + 1u,
+                (static_cast<uint64_t>(x + 1u) * sourceWidth + targetWidth - 1u) / targetWidth);
+            uint64_t sum[4] = {};
+            uint32_t count = 0u;
+            for (uint32_t sy = y0; sy < std::min(y1, sourceHeight); ++sy) {
+                for (uint32_t sx = x0; sx < std::min(x1, sourceWidth); ++sx) {
+                    const size_t src = (static_cast<size_t>(sy) * sourceWidth + sx) * 4u;
+                    sum[0] += source[src + 0u];
+                    sum[1] += source[src + 1u];
+                    sum[2] += source[src + 2u];
+                    sum[3] += source[src + 3u];
+                    ++count;
+                }
+            }
+            const size_t dst = (static_cast<size_t>(y) * targetWidth + x) * 4u;
+            const uint32_t divisor = std::max(count, 1u);
+            result[dst + 0u] = static_cast<uint8_t>(sum[0] / divisor);
+            result[dst + 1u] = static_cast<uint8_t>(sum[1] / divisor);
+            result[dst + 2u] = static_cast<uint8_t>(sum[2] / divisor);
+            result[dst + 3u] = static_cast<uint8_t>(sum[3] / divisor);
+        }
+    }
+    return result;
+}
+
 MaterialTextureUploadPayload makeMaterialTextureUploadPayload(const TextureAsset& texture, uint32_t maxDimension) {
     MaterialTextureUploadPayload payload;
     payload.width = std::max(texture.width, 1u);
     payload.height = std::max(texture.height, 1u);
     if (texture.rgba8.empty()) {
         return payload;
+    }
+
+    if (maxDimension != 0u &&
+        texture.mipData.empty() &&
+        !texture.isCompressed &&
+        std::max(payload.width, payload.height) > maxDimension) {
+        const float scale = static_cast<float>(maxDimension) /
+            static_cast<float>(std::max(payload.width, payload.height));
+        const uint32_t cappedWidth = std::max(1u, static_cast<uint32_t>(std::round(static_cast<float>(payload.width) * scale)));
+        const uint32_t cappedHeight = std::max(1u, static_cast<uint32_t>(std::round(static_cast<float>(payload.height) * scale)));
+        std::vector<uint8_t> cappedBytes = downsampleRgba8Box(
+            texture.rgba8,
+            payload.width,
+            payload.height,
+            cappedWidth,
+            cappedHeight);
+        if (!cappedBytes.empty()) {
+            payload.bytes = std::move(cappedBytes);
+            payload.width = cappedWidth;
+            payload.height = cappedHeight;
+            payload.capped = true;
+            return payload;
+        }
     }
 
     const uint32_t firstMip = previewBaseMipFor(texture, maxDimension);
@@ -1478,10 +1546,10 @@ GpuPrimitiveRecord makePrimitiveRecord(
     uint32_t firstTriangle,
     uint32_t triangleCount,
     uint32_t alphaClass = kPrimitiveAlphaClassOpaque,
-    bool opaqueTraversalSafe = false) {
+    bool doubleSided = false) {
     return GpuPrimitiveRecord{
         .indexData = {firstIndex, indexCount, firstVertex, materialIndex},
-        .metadata = {firstTriangle, triangleCount, alphaClass, opaqueTraversalSafe ? 1u : 0u},
+        .metadata = {firstTriangle, triangleCount, alphaClass, doubleSided ? 1u : 0u},
     };
 }
 
@@ -1535,25 +1603,46 @@ std::vector<uint32_t> buildRtTriangleMaterialIds(const std::vector<GpuPrimitiveR
     return materialIds;
 }
 
-bool primitivesAreOpaqueTraversalSafe(
+std::vector<uint8_t> transmissiveMaterialMaskFromRows(const std::vector<glm::vec4>& materialData) {
+    const size_t materialCount = materialData.size() / materialVec4Stride;
+    std::vector<uint8_t> mask(materialCount, 0u);
+    for (size_t i = 0; i < materialCount; ++i) {
+        const glm::vec4& transmissionRow = materialData[i * materialVec4Stride + 12u];
+        if (transmissionRow.y > materialTransmissionDielectricThreshold) {
+            mask[i] = 1u;
+        }
+    }
+    return mask;
+}
+
+uint32_t countTransmissiveShadowCasterPrimitives(
+    const std::vector<GpuPrimitiveRecord>& primitiveRecords,
+    const std::vector<uint8_t>& materialTransmissive) {
+    uint32_t count = 0;
+    for (const GpuPrimitiveRecord& primitive : primitiveRecords) {
+        const uint32_t materialIndex = primitive.indexData.w;
+        if ((primitive.indexData.y / 3u) > 0u &&
+            materialIndex < materialTransmissive.size() &&
+            materialTransmissive[materialIndex] != 0u) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool primitivesContainSidedness(
     const std::vector<GpuPrimitiveRecord>& primitiveRecords,
     uint32_t primitiveOffset,
     uint32_t primitiveCount,
-    const std::vector<bool>& materialOpaqueTraversalSafe) {
-    if (primitiveCount == 0) {
-        return false;
-    }
+    bool doubleSided) {
     for (uint32_t i = 0; i < primitiveCount; ++i) {
         const uint32_t primitiveIndex = primitiveOffset + i;
-        if (primitiveIndex >= primitiveRecords.size()) {
-            return false;
-        }
-        const uint32_t materialIndex = primitiveRecords[primitiveIndex].indexData.w;
-        if (materialIndex >= materialOpaqueTraversalSafe.size() || !materialOpaqueTraversalSafe[materialIndex]) {
-            return false;
+        if (primitiveIndex < primitiveRecords.size() &&
+            (primitiveRecords[primitiveIndex].metadata.w != 0u) == doubleSided) {
+            return true;
         }
     }
-    return true;
+    return false;
 }
 
 float triangleArea(glm::vec3 v0, glm::vec3 v1, glm::vec3 v2) {
@@ -1586,6 +1675,31 @@ bool isAuthoredGpuLightRecord(const GpuLightRecord& record) {
         record.metadata.x == gpuLightTypePoint ||
         record.metadata.x == gpuLightTypeArea ||
         record.metadata.x == gpuLightTypeSpot;
+}
+
+float maxEmissiveTrianglePower(const std::vector<GpuLightRecord>& records) {
+    float maxPower = 0.0f;
+    for (const GpuLightRecord& record : records) {
+        if (record.metadata.x == gpuLightTypeEmissiveTriangle) {
+            maxPower = std::max(maxPower, record.data0.x);
+        }
+    }
+    return maxPower;
+}
+
+bool shouldDropLargeImportedEmissiveTrianglePayload(
+    uint32_t triangleCount,
+    float maxEmissivePower,
+    bool /*compactMode*/) {
+    return triangleCount >= 1'000'000u && maxEmissivePower <= 1.0e-3f;
+}
+
+void logDroppedImportedEmissiveTrianglePayload(uint32_t triangleCount, size_t payloadBytes, float maxEmissivePower) {
+    std::cout << "Imported emissive triangle sampling payload omitted: triangles=" << triangleCount
+              << " payload_bytes=" << payloadBytes
+              << " max_emissive_power=" << maxEmissivePower
+              << " reason=negligible_emission"
+              << " (direct surface hits remain visible)\n";
 }
 
 void applyLightRecordMetadataToMeshParams(MeshParamsUniform& params, const std::vector<GpuLightRecord>& records, float totalWeight) {
@@ -1881,14 +1995,18 @@ GpuScene::GpuScene(
     uint32_t opacityMicromapSubdivisionLevel,
     bool opacityMicromapsEnabled,
     uint32_t materialTextureMaxDimension,
-    uint32_t materialTextureSlotCapacity)
+    uint32_t materialTextureSlotCapacity,
+    bool compactImportedEmissiveTriangleSampling,
+    bool opacityMicromapBlendEnabled)
     : allocator_(allocator),
       environmentPath_(std::move(environmentPath)),
       sceneCachePolicy_(std::move(sceneCachePolicy)),
       opacityMicromapSubdivisionLevel_(opacityMicromapSubdivisionLevel),
       opacityMicromapsEnabled_(opacityMicromapsEnabled),
+      opacityMicromapBlendEnabled_(opacityMicromapBlendEnabled),
       materialTextureMaxDimension_(materialTextureMaxDimension),
-      materialTextureSlotCapacity_(std::max(1u, materialTextureSlotCapacity)) {
+      materialTextureSlotCapacity_(std::max(1u, materialTextureSlotCapacity)),
+      compactImportedEmissiveTriangleSampling_(compactImportedEmissiveTriangleSampling) {
     meshParams_.bindlessTextureCapacity = materialTextureSlotCapacity_;
     materialTextureAnisotropy_ = allocator_.supportsSamplerAnisotropy()
         ? std::clamp(8.0f, 1.0f, allocator_.maxSamplerAnisotropy())
@@ -2061,13 +2179,13 @@ uint32_t meshPrimitiveAlphaClass(
 void annotatePrimitiveAlphaClasses(
     std::vector<GpuPrimitiveRecord>& primitiveRecords,
     const std::vector<uint32_t>& materialAlphaClasses,
-    const std::vector<bool>* materialOpaqueTraversalSafe = nullptr) {
+    const std::vector<bool>* materialDoubleSided = nullptr) {
     for (GpuPrimitiveRecord& primitive : primitiveRecords) {
         const uint32_t materialIndex = primitive.indexData.w;
         primitive.metadata.z = materialIndex < materialAlphaClasses.size()
             ? materialAlphaClasses[materialIndex]
             : kPrimitiveAlphaClassOpaque;
-        primitive.metadata.w = materialOpaqueTraversalSafe != nullptr && materialIndex < materialOpaqueTraversalSafe->size() && (*materialOpaqueTraversalSafe)[materialIndex]
+        primitive.metadata.w = materialDoubleSided != nullptr && materialIndex < materialDoubleSided->size() && (*materialDoubleSided)[materialIndex]
             ? 1u
             : 0u;
     }
@@ -2590,11 +2708,11 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
             const uint32_t materialIndex = materialIt != materialIndexForAsset.end() ? materialIt->second : 0u;
             const MaterialAsset* material = assets.material(primitive.material);
             const uint32_t alphaClass = primitiveAlphaClassForMaterial(material);
-            const bool opaqueTraversalSafe = material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u;
+            const bool doubleSided = material != nullptr && material->doubleSided != 0u;
             const GpuPrimitiveRecord& current = primitiveRecordCpu_[primitiveCursor];
             if (current.indexData.w != materialIndex ||
                 current.metadata.z != alphaClass ||
-                current.metadata.w != (opaqueTraversalSafe ? 1u : 0u)) {
+                current.metadata.w != (doubleSided ? 1u : 0u)) {
                 return false;
             }
             ++primitiveCursor;
@@ -2606,6 +2724,9 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
 
     uploader.uploadToBuffer(*materials_, materialData.data(), byteSize);
     meshParams_.materialCount = static_cast<uint32_t>(materialData.size() / materialVec4Stride);
+    meshParams_.transmissiveShadowCasterCount = countTransmissiveShadowCasterPrimitives(
+        primitiveRecordCpu_,
+        transmissiveMaterialMaskFromRows(materialData));
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
     if (meshParamsBuffer_ != nullptr) {
         meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
@@ -2840,7 +2961,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         {{0.95f, 0.96f, 0.97f}, 0.08f, 1.5f, 3, 1.0f, {}},
         {{0.95f, 0.93f, 0.88f}, 0.12f, 1.5f, 4, 0.0f, {}},
     };
-    const std::vector<bool> materialOpaqueTraversalSafe(mats.size(), true);
+    const std::vector<bool> materialDoubleSided(mats.size(), true);
 
     auto pushSphereMesh = [&](glm::vec3 center, float radius, uint32_t material) {
         constexpr uint32_t longitude = 160;
@@ -2906,7 +3027,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
             triangle,
             1u,
             kPrimitiveAlphaClassOpaque,
-            faceMaterials[triangle] < materialOpaqueTraversalSafe.size() && materialOpaqueTraversalSafe[faceMaterials[triangle]]));
+            faceMaterials[triangle] < materialDoubleSided.size() && materialDoubleSided[faceMaterials[triangle]]));
     }
     const std::vector<GpuMeshRecord> meshRecords = {
         makeMeshRecord(
@@ -2937,11 +3058,16 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         .primitiveCount = static_cast<uint32_t>(primitiveRecords.size()),
         .containsAlphaTestedGeometry = false,
         .containsBlendedGeometry = false,
-        .opaqueTraversalSafe = primitivesAreOpaqueTraversalSafe(
+        .containsSingleSidedGeometry = primitivesContainSidedness(
             primitiveRecords,
             0u,
             static_cast<uint32_t>(primitiveRecords.size()),
-            materialOpaqueTraversalSafe),
+            false),
+        .containsDoubleSidedGeometry = primitivesContainSidedness(
+            primitiveRecords,
+            0u,
+            static_cast<uint32_t>(primitiveRecords.size()),
+            true),
         .updateMode = AccelUpdateMode::Static,
     });
     rayTracingInstances_.clear();
@@ -3026,6 +3152,9 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         .tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u),
         .tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size()),
         .bindlessTextureCapacity = materialTextureSlotCapacity_,
+        .transmissiveShadowCasterCount = countTransmissiveShadowCasterPrimitives(
+            primitiveRecords,
+            transmissiveMaterialMaskFromRows(materialData)),
     };
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, emissiveTotalArea);
     std::cout << "Cornell scene: vertices=" << meshParams_.vertexCount
@@ -3088,7 +3217,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     std::vector<glm::vec4> triangleData;
     std::vector<glm::vec4> materialData;
     std::vector<glm::vec3> materialEmissive;
-    std::vector<bool> materialOpaqueTraversalSafe;
+    std::vector<bool> materialDoubleSided;
     std::vector<uint32_t> materialAlphaClasses;
     std::vector<GpuMeshRecord> meshRecords;
     std::vector<GpuPrimitiveRecord> primitiveRecords;
@@ -3115,7 +3244,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     struct PreparedMaterialGpuData {
         std::array<glm::vec4, materialVec4Stride> rows{};
         glm::vec3 emissive{0.0f};
-        bool opaqueTraversalSafe = false;
+        bool doubleSided = false;
         uint32_t alphaClass = kPrimitiveAlphaClassOpaque;
     };
     std::vector<PreparedMaterialGpuData> preparedMaterials(materialHandles.size());
@@ -3198,19 +3327,19 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
             PreparedMaterialGpuData prepared;
             std::copy(rows.begin(), rows.end(), prepared.rows.begin());
             prepared.emissive = materialEmissiveLightEstimate(material, assets);
-            prepared.opaqueTraversalSafe = material != nullptr && material->alphaMode == 0u && material->doubleSided != 0u;
+            prepared.doubleSided = material != nullptr && material->doubleSided != 0u;
             prepared.alphaClass = primitiveAlphaClassForMaterial(material);
             preparedMaterials[materialIndex] = prepared;
         }
     }, 4);
     materialData.reserve(preparedMaterials.size() * materialVec4Stride);
     materialEmissive.reserve(preparedMaterials.size());
-    materialOpaqueTraversalSafe.reserve(preparedMaterials.size());
+    materialDoubleSided.reserve(preparedMaterials.size());
     materialAlphaClasses.reserve(preparedMaterials.size());
     for (const PreparedMaterialGpuData& prepared : preparedMaterials) {
         materialData.insert(materialData.end(), prepared.rows.begin(), prepared.rows.end());
         materialEmissive.push_back(prepared.emissive);
-        materialOpaqueTraversalSafe.push_back(prepared.opaqueTraversalSafe);
+        materialDoubleSided.push_back(prepared.doubleSided);
         materialAlphaClasses.push_back(prepared.alphaClass);
     }
     if (materialData.empty()) {
@@ -3224,7 +3353,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         appendOpacityHeightTextureIndices(materialData);
         appendMaterialTextureTransforms(materialData, nullptr);
         materialEmissive.push_back(glm::vec3(0.0f));
-        materialOpaqueTraversalSafe.push_back(false);
+        materialDoubleSided.push_back(false);
         materialAlphaClasses.push_back(kPrimitiveAlphaClassOpaque);
     }
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
@@ -3383,7 +3512,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
                     localTriangleWriteCursor,
                     triangleCount,
                     alphaClass,
-                    materialIndex < materialOpaqueTraversalSafe.size() && materialOpaqueTraversalSafe[materialIndex]);
+                    materialIndex < materialDoubleSided.size() && materialDoubleSided[materialIndex]);
                 localTriangleWriteCursor += triangleCount;
             }
             meshPrep[meshJobIndex] = std::move(prep);
@@ -3487,11 +3616,16 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
                 prep.primitiveOffset,
                 static_cast<uint32_t>(prep.mesh->primitives.size()),
                 kPrimitiveAlphaClassBlended) != 0u,
-            .opaqueTraversalSafe = primitivesAreOpaqueTraversalSafe(
+            .containsSingleSidedGeometry = primitivesContainSidedness(
                 primitiveRecords,
                 prep.primitiveOffset,
                 static_cast<uint32_t>(prep.mesh->primitives.size()),
-                materialOpaqueTraversalSafe),
+                false),
+            .containsDoubleSidedGeometry = primitivesContainSidedness(
+                primitiveRecords,
+                prep.primitiveOffset,
+                static_cast<uint32_t>(prep.mesh->primitives.size()),
+                true),
             .updateMode = AccelUpdateMode::Static,
         });
         localMeshBounds.push_back(prep.localBounds);
@@ -3590,6 +3724,19 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     std::vector<glm::vec4> sphereData;
     float emissiveTotalArea = 0.0f;
     emissiveLightRecords_ = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
+    const float maxEmissivePower = maxEmissiveTrianglePower(emissiveLightRecords_);
+    const bool dropEmissiveTrianglePayload = shouldDropLargeImportedEmissiveTrianglePayload(
+        localTriangleCursor,
+        maxEmissivePower,
+        compactImportedEmissiveTriangleSampling_);
+    if (dropEmissiveTrianglePayload) {
+        logDroppedImportedEmissiveTrianglePayload(
+            localTriangleCursor,
+            localTriangleData.size() * sizeof(glm::vec4),
+            maxEmissivePower);
+        emissiveLightRecords_.clear();
+        emissiveTotalArea = 0.0f;
+    }
     float lightSelectionWeight = emissiveTotalArea;
     const std::vector<GpuLightRecord> lightRecords = combineLightRecords(emissiveLightRecords_, importedScene.lights, emissiveTotalArea, lightSelectionWeight);
     lightRecordCpu_ = lightRecords;
@@ -3607,11 +3754,14 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         .meshCount = static_cast<uint32_t>(meshRecords.size()),
         .localVertexCount = static_cast<uint32_t>(localVertexData.size()),
         .localIndexCount = static_cast<uint32_t>(localIndices.size()),
-        .localBvhNodeCount = static_cast<uint32_t>(localBvhData.size() / 4u),
-        .localTriangleCount = static_cast<uint32_t>(localTriangleData.size() / 12u),
-        .tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u),
-        .tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size()),
+        .localBvhNodeCount = 0,
+        .localTriangleCount = dropEmissiveTrianglePayload ? 0u : static_cast<uint32_t>(localTriangleData.size() / 12u),
+        .tlasNodeCount = 0,
+        .tlasInstanceIndexCount = 0,
         .bindlessTextureCapacity = materialTextureSlotCapacity_,
+        .transmissiveShadowCasterCount = countTransmissiveShadowCasterPrimitives(
+            primitiveRecords,
+            transmissiveMaterialMaskFromRows(materialData)),
     };
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     std::cout << "Imported scene GPU data: meshes=" << meshParams_.meshCount
@@ -3628,7 +3778,11 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     sphereDataCpu_ = sphereData;
     logRayTracingGeometryStats("Imported scene", rayTracingGeometryStats_);
     if (opacityMicromapsEnabled_) {
-        opacityMicromapData_ = generateOpacityMicromapData(importedScene, assets, opacityMicromapSubdivisionLevel_);
+        opacityMicromapData_ = generateOpacityMicromapData(
+            importedScene,
+            assets,
+            opacityMicromapSubdivisionLevel_,
+            opacityMicromapBlendEnabled_);
         logOpacityMicromapPreprocessStats("Imported scene", opacityMicromapData_.stats);
     } else {
         opacityMicromapData_ = {};
@@ -3639,10 +3793,12 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     {
         BatchUploader batch(uploader);
         batch.begin();
+        const std::vector<glm::vec4> emptyVec4;
+        const std::vector<uint32_t> emptyU32;
         uploadVectorBatched(batch, vertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, vertexData, "imported scene vertices");
         uploadVectorBatched(batch, indices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, indices, "imported scene indices");
-        uploadVectorBatched(batch, bvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bvhData, "imported scene bvh nodes");
-        uploadVectorBatched(batch, triangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, triangleData, "imported scene triangles");
+        uploadVectorBatched(batch, bvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported scene bvh nodes");
+        uploadVectorBatched(batch, triangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported scene triangles");
         uploadVectorBatched(batch, materials_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, materialData, "imported scene materials");
         uploadVectorBatched(batch, spheres_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, sphereData, "imported scene spheres");
         uploadVectorBatched(batch, meshRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, meshRecords, "imported mesh records");
@@ -3653,10 +3809,10 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         uploadVectorBatched(batch, localVertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localVertexData, "imported local mesh vertices");
         uploadVectorBatched(batch, localIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localIndices, "imported local mesh indices");
         uploadVectorBatched(batch, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "imported instance bounds");
-        uploadVectorBatched(batch, localBvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, localBvhData, "imported local bvh nodes");
-        uploadVectorBatched(batch, localTriangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, localTriangleData, "imported local bvh triangles");
-        uploadVectorBatched(batch, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasData, "imported tlas nodes");
-        uploadVectorBatched(batch, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasInstanceIndices, "imported tlas instance indices");
+        uploadVectorBatched(batch, localBvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported local bvh nodes");
+        uploadVectorBatched(batch, localTriangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, dropEmissiveTrianglePayload ? emptyVec4 : localTriangleData, "imported local bvh triangles");
+        uploadVectorBatched(batch, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported tlas nodes");
+        uploadVectorBatched(batch, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyU32, "imported tlas instance indices");
         batch.submit();
     }
 
@@ -3984,12 +4140,12 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     lightRecords.reserve(cached.lightRecords.size());
     rayTracingMeshes_.clear();
     rayTracingInstances_.clear();
-    std::vector<bool> materialOpaqueTraversalSafe;
-    materialOpaqueTraversalSafe.reserve(cached.materials.size());
+    std::vector<bool> materialDoubleSided;
+    materialDoubleSided.reserve(cached.materials.size());
     std::vector<uint32_t> materialAlphaClasses;
     materialAlphaClasses.reserve(cached.materials.size());
     for (const CachedMaterialData& material : cached.materials) {
-        materialOpaqueTraversalSafe.push_back(material.alphaMode == kMaterialAlphaModeOpaque && material.doubleSided != 0u);
+        materialDoubleSided.push_back(material.doubleSided != 0u);
         if (material.alphaMode == kMaterialAlphaModeMask) {
             materialAlphaClasses.push_back(kPrimitiveAlphaClassAlphaTested);
         } else if (material.alphaMode == kMaterialAlphaModeBlend) {
@@ -4004,7 +4160,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         rec.metadata = cachedPrim.metadata;
         primitiveRecords.push_back(rec);
     }
-    annotatePrimitiveAlphaClasses(primitiveRecords, materialAlphaClasses, &materialOpaqueTraversalSafe);
+    annotatePrimitiveAlphaClasses(primitiveRecords, materialAlphaClasses, &materialDoubleSided);
 
     for (const auto& cachedMesh : cached.meshGpuRecords) {
         GpuMeshRecord rec{};
@@ -4035,11 +4191,16 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
                 rec.primitiveData.x,
                 rec.primitiveData.y,
                 kPrimitiveAlphaClassBlended) != 0u,
-            .opaqueTraversalSafe = primitivesAreOpaqueTraversalSafe(
+            .containsSingleSidedGeometry = primitivesContainSidedness(
                 primitiveRecords,
                 rec.primitiveData.x,
                 rec.primitiveData.y,
-                materialOpaqueTraversalSafe),
+                false),
+            .containsDoubleSidedGeometry = primitivesContainSidedness(
+                primitiveRecords,
+                rec.primitiveData.x,
+                rec.primitiveData.y,
+                true),
             .updateMode = AccelUpdateMode::Static,
         });
 
@@ -4102,7 +4263,20 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
             emissiveLightRecords_.push_back(record);
         }
     }
-    const float emissiveTotalWeight = emissiveLightRecords_.empty() ? 0.0f : emissiveLightRecords_.back().data0.y;
+    float emissiveTotalWeight = emissiveLightRecords_.empty() ? 0.0f : emissiveLightRecords_.back().data0.y;
+    const float maxEmissivePower = maxEmissiveTrianglePower(emissiveLightRecords_);
+    const bool dropEmissiveTrianglePayload = shouldDropLargeImportedEmissiveTrianglePayload(
+        static_cast<uint32_t>(localTriangleData.size() / 12u),
+        maxEmissivePower,
+        compactImportedEmissiveTriangleSampling_);
+    if (dropEmissiveTrianglePayload) {
+        logDroppedImportedEmissiveTrianglePayload(
+            static_cast<uint32_t>(localTriangleData.size() / 12u),
+            localTriangleData.size() * sizeof(glm::vec4),
+            maxEmissivePower);
+        emissiveLightRecords_.clear();
+        emissiveTotalWeight = 0.0f;
+    }
     float lightSelectionWeight = emissiveTotalWeight;
     lightRecords = combineLightRecords(
         emissiveLightRecords_,
@@ -4118,8 +4292,15 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     meshParams_.enabled = 1;
     meshParams_.localVertexCount = static_cast<uint32_t>(localVertexData.size());
     meshParams_.localIndexCount = static_cast<uint32_t>(localIndices.size());
+    meshParams_.localBvhNodeCount = 0;
+    meshParams_.localTriangleCount = dropEmissiveTrianglePayload ? 0u : static_cast<uint32_t>(localTriangleData.size() / 12u);
+    meshParams_.tlasNodeCount = 0;
+    meshParams_.tlasInstanceIndexCount = 0;
     const std::vector<glm::vec4> materialData = buildCachedMaterialData(cached);
     meshParams_.materialCount = static_cast<uint32_t>(materialData.size() / materialVec4Stride);
+    meshParams_.transmissiveShadowCasterCount = countTransmissiveShadowCasterPrimitives(
+        primitiveRecords,
+        transmissiveMaterialMaskFromRows(materialData));
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
@@ -4131,7 +4312,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     sphereDataCpu_.clear();
     logRayTracingGeometryStats("Cached scene", rayTracingGeometryStats_);
     if (opacityMicromapsEnabled_) {
-        opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_);
+        opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_, opacityMicromapBlendEnabled_);
         logOpacityMicromapPreprocessStats("Cached scene", opacityMicromapData_.stats);
     } else {
         opacityMicromapData_ = {};
@@ -4163,10 +4344,10 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         uploadVectorBatched(batch, localVertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localVertexData, "imported local mesh vertices (cached)");
         uploadVectorBatched(batch, localIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localIndices, "imported local mesh indices (cached)");
         uploadVectorBatched(batch, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "imported instance bounds (cached)");
-        uploadVectorBatched(batch, localBvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, localBvhData, "imported local bvh nodes (cached)");
-        uploadVectorBatched(batch, localTriangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, localTriangleData, "imported local bvh triangles (cached)");
-        uploadVectorBatched(batch, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, cached.tlasNodes, "imported tlas nodes (cached)");
-        uploadVectorBatched(batch, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, cached.tlasInstanceIndices, "imported tlas instance indices (cached)");
+        uploadVectorBatched(batch, localBvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported local bvh nodes (cached)");
+        uploadVectorBatched(batch, localTriangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, dropEmissiveTrianglePayload ? emptyVec4 : localTriangleData, "imported local bvh triangles (cached)");
+        uploadVectorBatched(batch, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported tlas nodes (cached)");
+        uploadVectorBatched(batch, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyU32, "imported tlas instance indices (cached)");
         batch.submit();
     }
 
@@ -4204,12 +4385,12 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
     rayTracingMeshes_.clear();
     rayTracingInstances_.clear();
 
-    std::vector<bool> materialOpaqueTraversalSafe;
-    materialOpaqueTraversalSafe.reserve(cached.materials.size());
+    std::vector<bool> materialDoubleSided;
+    materialDoubleSided.reserve(cached.materials.size());
     std::vector<uint32_t> materialAlphaClasses;
     materialAlphaClasses.reserve(cached.materials.size());
     for (const CachedMaterialData& material : cached.materials) {
-        materialOpaqueTraversalSafe.push_back(material.alphaMode == kMaterialAlphaModeOpaque && material.doubleSided != 0u);
+        materialDoubleSided.push_back(material.doubleSided != 0u);
         if (material.alphaMode == kMaterialAlphaModeMask) {
             materialAlphaClasses.push_back(kPrimitiveAlphaClassAlphaTested);
         } else if (material.alphaMode == kMaterialAlphaModeBlend) {
@@ -4225,7 +4406,7 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
             .metadata = cachedPrim.metadata,
         });
     }
-    annotatePrimitiveAlphaClasses(primitiveRecords, materialAlphaClasses, &materialOpaqueTraversalSafe);
+    annotatePrimitiveAlphaClasses(primitiveRecords, materialAlphaClasses, &materialDoubleSided);
 
     for (size_t meshIndex = 0; meshIndex < cached.meshGpuRecords.size(); ++meshIndex) {
         const CachedMeshGpuRecord& cachedMesh = cached.meshGpuRecords[meshIndex];
@@ -4261,11 +4442,16 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
                 rec.primitiveData.x,
                 rec.primitiveData.y,
                 kPrimitiveAlphaClassBlended) != 0u,
-            .opaqueTraversalSafe = primitivesAreOpaqueTraversalSafe(
+            .containsSingleSidedGeometry = primitivesContainSidedness(
                 primitiveRecords,
                 rec.primitiveData.x,
                 rec.primitiveData.y,
-                materialOpaqueTraversalSafe),
+                false),
+            .containsDoubleSidedGeometry = primitivesContainSidedness(
+                primitiveRecords,
+                rec.primitiveData.x,
+                rec.primitiveData.y,
+                true),
             .updateMode = AccelUpdateMode::Static,
         });
 
@@ -4387,6 +4573,19 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
     float emissiveTotalArea = 0.0f;
     const std::vector<glm::vec3> materialEmissive = extractMaterialEmissive(materialData);
     emissiveLightRecords_ = buildLightRecords(meshRecords, instanceRecords, localTriangleData, materialEmissive, sphereData, emissiveTotalArea);
+    const float maxEmissivePower = maxEmissiveTrianglePower(emissiveLightRecords_);
+    const bool dropEmissiveTrianglePayload = shouldDropLargeImportedEmissiveTrianglePayload(
+        static_cast<uint32_t>(localTriangleData.size() / 12u),
+        maxEmissivePower,
+        compactImportedEmissiveTriangleSampling_);
+    if (dropEmissiveTrianglePayload) {
+        logDroppedImportedEmissiveTrianglePayload(
+            static_cast<uint32_t>(localTriangleData.size() / 12u),
+            localTriangleData.size() * sizeof(glm::vec4),
+            maxEmissivePower);
+        emissiveLightRecords_.clear();
+        emissiveTotalArea = 0.0f;
+    }
     float lightSelectionWeight = emissiveTotalArea;
     const std::vector<GpuLightRecord> lightRecords = combineLightRecords(
         emissiveLightRecords_,
@@ -4407,10 +4606,13 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
     meshParams_.meshCount = static_cast<uint32_t>(meshRecords.size());
     meshParams_.localVertexCount = static_cast<uint32_t>(localVertexData.size());
     meshParams_.localIndexCount = static_cast<uint32_t>(localIndices.size());
-    meshParams_.localBvhNodeCount = static_cast<uint32_t>(localBvhData.size() / 4u);
-    meshParams_.localTriangleCount = static_cast<uint32_t>(localTriangleData.size() / 12u);
-    meshParams_.tlasNodeCount = static_cast<uint32_t>(tlasData.size() / 4u);
-    meshParams_.tlasInstanceIndexCount = static_cast<uint32_t>(tlasInstanceIndices.size());
+    meshParams_.localBvhNodeCount = 0;
+    meshParams_.localTriangleCount = dropEmissiveTrianglePayload ? 0u : static_cast<uint32_t>(localTriangleData.size() / 12u);
+    meshParams_.tlasNodeCount = 0;
+    meshParams_.tlasInstanceIndexCount = 0;
+    meshParams_.transmissiveShadowCasterCount = countTransmissiveShadowCasterPrimitives(
+        primitiveRecords,
+        transmissiveMaterialMaskFromRows(materialData));
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
     rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
@@ -4429,7 +4631,7 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
               << " tlas_nodes=" << meshParams_.tlasNodeCount << '\n';
     logRayTracingGeometryStats("Geometry cached scene", rayTracingGeometryStats_);
     if (opacityMicromapsEnabled_) {
-        opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_);
+        opacityMicromapData_ = generateOpacityMicromapData(cached, opacityMicromapSubdivisionLevel_, opacityMicromapBlendEnabled_);
         logOpacityMicromapPreprocessStats("Geometry cached scene", opacityMicromapData_.stats);
     } else {
         opacityMicromapData_ = {};
@@ -4458,10 +4660,10 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
         uploadVectorBatched(batch, localVertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localVertexData, "imported local mesh vertices (geometry cache)");
         uploadVectorBatched(batch, localIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localIndices, "imported local mesh indices (geometry cache)");
         uploadVectorBatched(batch, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "imported instance bounds (geometry cache)");
-        uploadVectorBatched(batch, localBvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, localBvhData, "imported local bvh nodes (geometry cache)");
-        uploadVectorBatched(batch, localTriangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, localTriangleData, "imported local bvh triangles (geometry cache)");
-        uploadVectorBatched(batch, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasData, "imported tlas nodes (geometry cache)");
-        uploadVectorBatched(batch, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, tlasInstanceIndices, "imported tlas instance indices (geometry cache)");
+        uploadVectorBatched(batch, localBvhNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported local bvh nodes (geometry cache)");
+        uploadVectorBatched(batch, localTriangles_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, dropEmissiveTrianglePayload ? emptyVec4 : localTriangleData, "imported local bvh triangles (geometry cache)");
+        uploadVectorBatched(batch, tlasNodes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyVec4, "imported tlas nodes (geometry cache)");
+        uploadVectorBatched(batch, tlasInstanceIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, emptyU32, "imported tlas instance indices (geometry cache)");
         batch.submit();
     }
 

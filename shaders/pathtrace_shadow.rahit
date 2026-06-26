@@ -7,7 +7,8 @@ layout(location = 1) rayPayloadInEXT uint shadow_occluded;
 
 void main() {
     record_rt_counter(RT_DIAG_SHADOW_ANY_HIT_INVOCATIONS);
-    uint instanceIndex = gl_InstanceCustomIndexEXT;
+    uint tlasRecordIndex = gl_InstanceCustomIndexEXT;
+    uint instanceIndex = scene_instance_index_from_tlas_record(tlasRecordIndex);
     if (instanceIndex >= mesh_params.instance_count) {
         record_rt_counter(RT_DIAG_SHADOW_ANY_HIT_IGNORED);
         ignoreIntersectionEXT;
@@ -18,7 +19,7 @@ void main() {
     uint meshIndex = instance.metadata.x;
     MeshRecord mesh = mesh_records[meshIndex];
     uint firstIndex = mesh.vertex_index_data.z;
-    uint globalTriangleIndex = geometry_triangle_offset(meshIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
+    uint globalTriangleIndex = geometry_triangle_offset(meshIndex, tlasRecordIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
     uint triIndex = globalTriangleIndex * 3u;
     uint i0 = local_mesh_indices[triIndex + 0u];
     uint i1 = local_mesh_indices[triIndex + 1u];
@@ -35,13 +36,32 @@ void main() {
     bool frontFace = dot(worldGeomNormal, gl_WorldRayDirectionEXT) < 0.0;
 
     uint materialIndex = material_for_triangle_index(globalTriangleIndex);
-    Material material = decode_material(materialIndex);
-    if (!frontFace && material.double_sided == 0u) {
+    MaterialRuntimeHeader materialHeader = decode_material_runtime_header(materialIndex);
+    record_rt_alpha_material_counter(materialIndex, RT_ALPHA_MATERIAL_COUNTER_SHADOW_ANY_HIT);
+    if (!frontFace && materialHeader.double_sided == 0u) {
         record_rt_counter(RT_DIAG_SHADOW_ANY_HIT_IGNORED);
         ignoreIntersectionEXT;
         return;
     }
-    if (material.alpha_mode == ALPHA_MODE_OPAQUE) {
+    if (materialHeader.alpha_mode == ALPHA_MODE_OPAQUE) {
+        record_rt_counter(RT_DIAG_SHADOW_ANY_HIT_ACCEPTED);
+        shadow_occluded = 1u;
+        terminateRayEXT;
+        return;
+    }
+
+    Material material = decode_material(materialIndex);
+    uint decalShadowMode = blended_decal_shadow_mode();
+    bool native2BActive = (camera.path_trace_controls.z & 16u) != 0u;
+    bool experimentalDecalShadow =
+        native2BActive &&
+        decalShadowMode != BLENDED_DECAL_SHADOW_MODE_EXACT &&
+        materialHeader.alpha_mode == ALPHA_MODE_BLEND &&
+        !material_is_transmissive(material) &&
+        !material_is_unlit(material) &&
+        material.emissive_texture < 0 &&
+        dot(max(material.emissive, vec3(0.0)), vec3(1.0)) <= 1.0e-6;
+    if (experimentalDecalShadow && decalShadowMode == BLENDED_DECAL_SHADOW_MODE_OPAQUE_SHADOW) {
         record_rt_counter(RT_DIAG_SHADOW_ANY_HIT_ACCEPTED);
         shadow_occluded = 1u;
         terminateRayEXT;
@@ -53,6 +73,19 @@ void main() {
         v0.position_uv_x.w * bary.x + v1.position_uv_x.w * bary.y + v2.position_uv_x.w * bary.z,
         v0.normal_uv_y.w * bary.x + v1.normal_uv_y.w * bary.y + v2.normal_uv_y.w * bary.z);
     vec2 uv1 = v0.texcoord1.xy * bary.x + v1.texcoord1.xy * bary.y + v2.texcoord1.xy * bary.z;
+    if (experimentalDecalShadow && decalShadowMode == BLENDED_DECAL_SHADOW_MODE_ALPHA_CUTOUT_PROXY) {
+        material.alpha_factor *= clamp((v0.color * bary.x + v1.color * bary.y + v2.color * bary.z).a, 0.0, 1.0);
+        if (material.alpha_factor < max(material.alpha_cutoff, 0.5)) {
+            record_rt_counter(RT_DIAG_SHADOW_ANY_HIT_IGNORED);
+            ignoreIntersectionEXT;
+            return;
+        }
+        record_rt_counter(RT_DIAG_SHADOW_ANY_HIT_ACCEPTED);
+        shadow_occluded = 1u;
+        terminateRayEXT;
+        return;
+    }
+
     apply_material_alpha_texture(material, uv, uv1);
     material.alpha_factor *= clamp((v0.color * bary.x + v1.color * bary.y + v2.color * bary.z).a, 0.0, 1.0);
     if (!accept_material_alpha(material)) {

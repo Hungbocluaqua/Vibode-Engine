@@ -40,6 +40,7 @@ struct AlphaMaterialView {
     float alphaCutoff = 0.5f;
     float baseAlpha = 1.0f;
     int32_t baseColorTextureIndex = -1;
+    int32_t opacityTextureIndex = -1;
     TextureTransformAsset baseColorTextureTransform{};
 };
 
@@ -202,6 +203,23 @@ struct GeneratedPrimitiveStates {
     return OpacityMicromapCpuState::Mixed;
 }
 
+[[nodiscard]] bool opacityMicromapEligibleAlphaClass(const MaterialAsset* material, bool includeBlendedPrimitives) {
+    if (material == nullptr) {
+        return false;
+    }
+    if (material->alphaMode == kMaterialAlphaModeMask) {
+        return true;
+    }
+    return includeBlendedPrimitives && material->alphaMode == kMaterialAlphaModeBlend;
+}
+
+[[nodiscard]] float visibilityAlphaCutoff(const MaterialAsset* material) {
+    if (material == nullptr) {
+        return 0.5f;
+    }
+    return material->alphaMode == kMaterialAlphaModeBlend ? 0.10f : material->alphaCutoff;
+}
+
 void accumulateState(OpacityMicromapPrimitiveCpuData& primitive, OpacityMicromapPreprocessStats& stats, OpacityMicromapCpuState state) {
     switch (state) {
     case OpacityMicromapCpuState::Opaque:
@@ -324,7 +342,8 @@ void accumulateState(OpacityMicromapPrimitiveCpuData& primitive, OpacityMicromap
 [[nodiscard]] std::string cacheKey(const AlphaPrimitiveRequest& request, uint32_t subdivisionLevel) {
     std::ostringstream stream;
     stream << request.meshIndex << ':' << request.primitiveIndex << ':' << request.materialIndex << ':'
-           << request.material.baseColorTextureIndex << ':' << request.material.alphaCutoff << ':'
+           << request.material.alphaMode << ':' << request.material.baseColorTextureIndex << ':'
+           << request.material.opacityTextureIndex << ':' << request.material.alphaCutoff << ':'
            << request.material.baseAlpha << ':' << subdivisionLevel;
     return stream.str();
 }
@@ -453,7 +472,8 @@ template <typename RequestBuilder>
 OpacityMicromapCpuData generateOpacityMicromapData(
     const SceneAsset& scene,
     const AssetManager& assets,
-    uint32_t subdivisionLevel) {
+    uint32_t subdivisionLevel,
+    bool includeBlendedPrimitives) {
     return generateFromRequests(subdivisionLevel, [&](OpacityMicromapPreprocessStats& stats) {
         std::vector<AlphaPrimitiveRequest> requests;
         for (uint32_t meshIndex = 0; meshIndex < static_cast<uint32_t>(scene.meshes.size()); ++meshIndex) {
@@ -465,20 +485,29 @@ OpacityMicromapCpuData generateOpacityMicromapData(
                 const MeshPrimitiveAsset& primitive = mesh->primitives[primitiveIndex];
                 const int32_t sceneMaterialIndex = materialIndexForHandle(scene, primitive.material);
                 const MaterialAsset* material = assets.material(primitive.material);
-                if (primitiveAlphaClassForMaterial(material) != kPrimitiveAlphaClassAlphaTested) {
+                if (!opacityMicromapEligibleAlphaClass(material, includeBlendedPrimitives)) {
                     continue;
                 }
+                const uint32_t alphaClass = primitiveAlphaClassForMaterial(material);
+                if (alphaClass == kPrimitiveAlphaClassAlphaTested) {
+                    ++stats.alphaTestedPrimitiveCount;
+                } else if (alphaClass == kPrimitiveAlphaClassBlended) {
+                    ++stats.blendedPrimitiveCount;
+                }
                 AlphaPrimitiveRequest request;
-                request.meshIndex = meshIndex;
+                request.meshIndex = scene.meshes[meshIndex].valid()
+                    ? scene.meshes[meshIndex].index
+                    : meshIndex;
                 request.primitiveIndex = primitiveIndex;
                 request.materialIndex = sceneMaterialIndex >= 0 ? static_cast<uint32_t>(sceneMaterialIndex) : 0u;
                 request.primitive = &primitive;
                 request.mesh = mesh;
                 if (material != nullptr) {
                     request.material.alphaMode = material->alphaMode;
-                    request.material.alphaCutoff = material->alphaCutoff;
+                    request.material.alphaCutoff = visibilityAlphaCutoff(material);
                     request.material.baseAlpha = material->baseColorFactor.a;
                     request.material.baseColorTextureIndex = textureIndexForHandle(scene, material->baseColorTexture);
+                    request.material.opacityTextureIndex = textureIndexForHandle(scene, material->opacityTexture);
                     request.material.baseColorTextureTransform = material->baseColorTextureTransform;
                     request.texture = textureView(assets.texture(material->baseColorTexture));
                 }
@@ -486,13 +515,18 @@ OpacityMicromapCpuData generateOpacityMicromapData(
             }
         }
         if (requests.empty()) {
-            stats.warnings.push_back("No alpha-tested primitives found for OMM preprocessing");
+            stats.warnings.push_back(includeBlendedPrimitives
+                    ? "No alpha-tested or blended primitives found for OMM preprocessing"
+                    : "No alpha-tested primitives found for OMM preprocessing");
         }
         return requests;
     });
 }
 
-OpacityMicromapCpuData generateOpacityMicromapData(const CachedScene& cached, uint32_t subdivisionLevel) {
+OpacityMicromapCpuData generateOpacityMicromapData(
+    const CachedScene& cached,
+    uint32_t subdivisionLevel,
+    bool includeBlendedPrimitives) {
     AssetManager assets;
     SceneAsset scene;
     scene.name = cached.name;
@@ -538,6 +572,9 @@ OpacityMicromapCpuData generateOpacityMicromapData(const CachedScene& cached, ui
         material.baseColorTexture = cachedMaterial.baseColorTextureIndex >= 0 && static_cast<size_t>(cachedMaterial.baseColorTextureIndex) < scene.textures.size()
             ? scene.textures[static_cast<size_t>(cachedMaterial.baseColorTextureIndex)]
             : TextureAssetHandle{};
+        material.opacityTexture = cachedMaterial.opacityTextureIndex >= 0 && static_cast<size_t>(cachedMaterial.opacityTextureIndex) < scene.textures.size()
+            ? scene.textures[static_cast<size_t>(cachedMaterial.opacityTextureIndex)]
+            : TextureAssetHandle{};
         material.baseColorTextureTransform = cachedMaterial.baseColorTextureTransform;
         scene.materials.push_back(assets.addMaterial(std::move(material)));
     }
@@ -566,9 +603,13 @@ OpacityMicromapCpuData generateOpacityMicromapData(const CachedScene& cached, ui
         scene.meshes.push_back(assets.addMesh(std::move(mesh)));
     }
 
-    OpacityMicromapCpuData data = generateOpacityMicromapData(scene, assets, subdivisionLevel);
-    if (!data.stats.warnings.empty() && data.stats.warnings.front() == "No alpha-tested primitives found for OMM preprocessing") {
-        data.stats.warnings.front() = "No alpha-tested cached primitives found for OMM preprocessing";
+    OpacityMicromapCpuData data = generateOpacityMicromapData(scene, assets, subdivisionLevel, includeBlendedPrimitives);
+    if (!data.stats.warnings.empty()) {
+        if (data.stats.warnings.front() == "No alpha-tested primitives found for OMM preprocessing") {
+            data.stats.warnings.front() = "No alpha-tested cached primitives found for OMM preprocessing";
+        } else if (data.stats.warnings.front() == "No alpha-tested or blended primitives found for OMM preprocessing") {
+            data.stats.warnings.front() = "No alpha-tested or blended cached primitives found for OMM preprocessing";
+        }
     }
     return data;
 }

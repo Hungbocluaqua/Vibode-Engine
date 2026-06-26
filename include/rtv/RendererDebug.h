@@ -188,6 +188,28 @@ enum class RestirHistoryCopyMode : uint32_t {
     PingPong = 1,
 };
 
+enum class MixedSidedSplitMode : uint32_t {
+    Off = 0,
+    Compact = 1,
+};
+
+enum class PathTraceKernelMode : uint32_t {
+    Generic = 0,
+    Native2B = 1,
+};
+
+enum class BlendedDecalShadowMode : uint32_t {
+    Exact = 0,
+    OpaqueShadow = 1,
+    AlphaCutoutProxy = 2,
+};
+
+enum class Native2BDirectReuseMode : uint32_t {
+    Off = 0,
+    Ris = 1,
+    Temporal = 2,
+};
+
 enum class AdaptiveQualityMode : uint32_t {
     Off = 0,
     Conservative = 1,
@@ -200,6 +222,7 @@ enum class RenderPreset : uint32_t {
     Low = 1,
     Balanced = 2,
     Ultra = 3,
+    Native30 = 4,
 };
 
 enum class DenoiserBackend : uint32_t {
@@ -236,6 +259,14 @@ inline constexpr uint32_t rendererDebugFlagRayTracingCounters = 1u << 0u;
 [[nodiscard]] RestirGiActiveTileMaskMode parseRestirGiActiveTileMaskMode(std::string_view value);
 [[nodiscard]] const char* restirHistoryCopyModeName(RestirHistoryCopyMode mode);
 [[nodiscard]] RestirHistoryCopyMode parseRestirHistoryCopyMode(std::string_view value);
+[[nodiscard]] const char* mixedSidedSplitModeName(MixedSidedSplitMode mode);
+[[nodiscard]] MixedSidedSplitMode parseMixedSidedSplitMode(std::string_view value);
+[[nodiscard]] const char* pathTraceKernelModeName(PathTraceKernelMode mode);
+[[nodiscard]] PathTraceKernelMode parsePathTraceKernelMode(std::string_view value);
+[[nodiscard]] const char* blendedDecalShadowModeName(BlendedDecalShadowMode mode);
+[[nodiscard]] BlendedDecalShadowMode parseBlendedDecalShadowMode(std::string_view value);
+[[nodiscard]] const char* native2BDirectReuseModeName(Native2BDirectReuseMode mode);
+[[nodiscard]] Native2BDirectReuseMode parseNative2BDirectReuseMode(std::string_view value);
 [[nodiscard]] const char* renderPresetName(RenderPreset preset);
 [[nodiscard]] RenderPreset parseRenderPreset(std::string_view value);
 [[nodiscard]] const char* denoiserBackendName(DenoiserBackend backend);

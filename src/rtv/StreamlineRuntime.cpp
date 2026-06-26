@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <filesystem>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -13,6 +15,9 @@
 #include <sl_dlss_d.h>
 #include <sl_helpers.h>
 #include <sl_helpers_vk.h>
+#if defined(RTV_STREAMLINE_HAS_NVPERF)
+#include <sl_nvperf.h>
+#endif
 #include <sl_pcl.h>
 #endif
 
@@ -55,6 +60,39 @@ struct StreamlineDispatch {
     PFun_slPCLSetMarker* slPCLSetMarker = nullptr;
 };
 
+std::mutex gStreamlineLogMutex;
+std::vector<std::string> gStreamlineLogMessages;
+
+const char* streamlineLogTypeName(sl::LogType type) {
+    switch (type) {
+    case sl::LogType::eInfo: return "info";
+    case sl::LogType::eWarn: return "warn";
+    case sl::LogType::eError: return "error";
+    default: return "unknown";
+    }
+}
+
+void streamlineLogMessageCallback(sl::LogType type, const char* message) {
+    if (type == sl::LogType::eInfo || message == nullptr || message[0] == '\0') {
+        return;
+    }
+    std::scoped_lock lock(gStreamlineLogMutex);
+    if (gStreamlineLogMessages.size() >= 32u) {
+        gStreamlineLogMessages.erase(gStreamlineLogMessages.begin());
+    }
+    gStreamlineLogMessages.push_back(std::string(streamlineLogTypeName(type)) + ": " + message);
+}
+
+void clearStreamlineLogMessages() {
+    std::scoped_lock lock(gStreamlineLogMutex);
+    gStreamlineLogMessages.clear();
+}
+
+std::vector<std::string> snapshotStreamlineLogMessages() {
+    std::scoped_lock lock(gStreamlineLogMutex);
+    return gStreamlineLogMessages;
+}
+
 template <typename T>
 T* streamlineProcAddress(void* module, const char* name) {
 #if defined(_WIN32)
@@ -74,6 +112,7 @@ sl::Feature streamlineFeatureId(StreamlineFeature feature) {
     case StreamlineFeature::Reflex: return sl::kFeatureReflex;
     case StreamlineFeature::Nis: return sl::kFeatureNIS;
     case StreamlineFeature::Nrd: return sl::kFeatureNRD_INVALID;
+    case StreamlineFeature::NvPerf: return sl::kFeatureNvPerf;
     }
     return sl::kFeatureCommon;
 }
@@ -84,18 +123,40 @@ std::string streamlineResultName(sl::Result result) {
     case sl::Result::eErrorIO: return "eErrorIO";
     case sl::Result::eErrorDriverOutOfDate: return "eErrorDriverOutOfDate";
     case sl::Result::eErrorOSOutOfDate: return "eErrorOSOutOfDate";
+    case sl::Result::eErrorOSDisabledHWS: return "eErrorOSDisabledHWS";
+    case sl::Result::eErrorDeviceNotCreated: return "eErrorDeviceNotCreated";
     case sl::Result::eErrorNoSupportedAdapterFound: return "eErrorNoSupportedAdapterFound";
     case sl::Result::eErrorAdapterNotSupported: return "eErrorAdapterNotSupported";
     case sl::Result::eErrorNoPlugins: return "eErrorNoPlugins";
     case sl::Result::eErrorVulkanAPI: return "eErrorVulkanAPI";
+    case sl::Result::eErrorDXGIAPI: return "eErrorDXGIAPI";
+    case sl::Result::eErrorD3DAPI: return "eErrorD3DAPI";
+    case sl::Result::eErrorNRDAPI: return "eErrorNRDAPI";
+    case sl::Result::eErrorNVAPI: return "eErrorNVAPI";
+    case sl::Result::eErrorReflexAPI: return "eErrorReflexAPI";
+    case sl::Result::eErrorNGXFailed: return "eErrorNGXFailed";
+    case sl::Result::eErrorJSONParsing: return "eErrorJSONParsing";
+    case sl::Result::eErrorMissingProxy: return "eErrorMissingProxy";
+    case sl::Result::eErrorMissingResourceState: return "eErrorMissingResourceState";
     case sl::Result::eErrorInvalidIntegration: return "eErrorInvalidIntegration";
     case sl::Result::eErrorMissingInputParameter: return "eErrorMissingInputParameter";
     case sl::Result::eErrorNotInitialized: return "eErrorNotInitialized";
+    case sl::Result::eErrorComputeFailed: return "eErrorComputeFailed";
     case sl::Result::eErrorInitNotCalled: return "eErrorInitNotCalled";
+    case sl::Result::eErrorExceptionHandler: return "eErrorExceptionHandler";
     case sl::Result::eErrorInvalidParameter: return "eErrorInvalidParameter";
+    case sl::Result::eErrorMissingConstants: return "eErrorMissingConstants";
+    case sl::Result::eErrorDuplicatedConstants: return "eErrorDuplicatedConstants";
+    case sl::Result::eErrorMissingOrInvalidAPI: return "eErrorMissingOrInvalidAPI";
+    case sl::Result::eErrorCommonConstantsMissing: return "eErrorCommonConstantsMissing";
+    case sl::Result::eErrorUnsupportedInterface: return "eErrorUnsupportedInterface";
     case sl::Result::eErrorFeatureMissing: return "eErrorFeatureMissing";
     case sl::Result::eErrorFeatureNotSupported: return "eErrorFeatureNotSupported";
+    case sl::Result::eErrorFeatureMissingHooks: return "eErrorFeatureMissingHooks";
     case sl::Result::eErrorFeatureFailedToLoad: return "eErrorFeatureFailedToLoad";
+    case sl::Result::eErrorFeatureWrongPriority: return "eErrorFeatureWrongPriority";
+    case sl::Result::eErrorFeatureMissingDependency: return "eErrorFeatureMissingDependency";
+    case sl::Result::eErrorFeatureManagerInvalidState: return "eErrorFeatureManagerInvalidState";
     case sl::Result::eErrorInvalidState: return "eErrorInvalidState";
     case sl::Result::eWarnOutOfVRAM: return "eWarnOutOfVRAM";
     default: break;
@@ -170,6 +231,10 @@ std::vector<sl::Feature> streamlineRequestedFeatures() {
 #endif
 #if defined(RTV_STREAMLINE_HAS_NIS)
     features.push_back(sl::kFeatureNIS);
+#endif
+#if defined(RTV_STREAMLINE_HAS_NVPERF)
+    features.push_back(sl::kFeatureImGUI);
+    features.push_back(sl::kFeatureNvPerf);
 #endif
     return features;
 }
@@ -302,6 +367,12 @@ std::string featureUnavailableReason(StreamlineFeature feature) {
 #else
         return "Configured Streamline SDK does not expose an NRD plugin path; direct NRD remains the production path";
 #endif
+    case StreamlineFeature::NvPerf:
+#if defined(RTV_STREAMLINE_HAS_NVPERF)
+        return "Streamline NvPerf is available after runtime initialization and a successful NvPerf feature evaluation";
+#else
+        return "Streamline NvPerf plugin was not detected in the configured SDK";
+#endif
     }
     return "Unknown Streamline feature";
 }
@@ -314,12 +385,38 @@ StreamlineFeatureStatus makeUnavailableFeatureStatus(StreamlineFeature feature) 
     return status;
 }
 
-std::filesystem::path defaultRuntimeDirectory() {
+std::filesystem::path executableDirectory() {
+#if defined(_WIN32)
+    std::wstring buffer(MAX_PATH, L'\0');
+    DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    while (length == buffer.size()) {
+        buffer.resize(buffer.size() * 2u);
+        length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    }
+    if (length == 0u) {
+        return {};
+    }
+    buffer.resize(length);
+    return std::filesystem::path(buffer).parent_path();
+#else
+    return {};
+#endif
+}
+
+std::filesystem::path configuredRuntimeDirectory() {
 #if defined(RTV_STREAMLINE_RUNTIME_DIR)
     return std::filesystem::path(RTV_STREAMLINE_RUNTIME_DIR);
 #else
     return {};
 #endif
+}
+
+std::filesystem::path defaultRuntimeDirectory() {
+    const std::filesystem::path executableDir = executableDirectory();
+    if (!executableDir.empty() && std::filesystem::exists(executableDir / "sl.interposer.dll")) {
+        return executableDir;
+    }
+    return configuredRuntimeDirectory();
 }
 
 } // namespace
@@ -398,8 +495,9 @@ void StreamlineRuntime::refreshCompileTimeStatus() {
     status_.reflex = makeUnavailableFeatureStatus(StreamlineFeature::Reflex);
     status_.nis = makeUnavailableFeatureStatus(StreamlineFeature::Nis);
     status_.nrd = makeUnavailableFeatureStatus(StreamlineFeature::Nrd);
+    status_.nvperf = makeUnavailableFeatureStatus(StreamlineFeature::NvPerf);
     if (!status_.runtimeConfigured && !status_.unavailableReason.empty()) {
-        for (StreamlineFeature feature : {StreamlineFeature::Dlss, StreamlineFeature::DlssRayReconstruction, StreamlineFeature::DlssFrameGeneration, StreamlineFeature::Reflex, StreamlineFeature::Nis, StreamlineFeature::Nrd}) {
+        for (StreamlineFeature feature : {StreamlineFeature::Dlss, StreamlineFeature::DlssRayReconstruction, StreamlineFeature::DlssFrameGeneration, StreamlineFeature::Reflex, StreamlineFeature::Nis, StreamlineFeature::Nrd, StreamlineFeature::NvPerf}) {
             StreamlineFeatureStatus& featureState = mutableFeatureStatus(feature);
             featureState.requestable = false;
             featureState.supported = false;
@@ -417,6 +515,9 @@ bool StreamlineRuntime::initialize(const StreamlineInitDesc& desc) {
     (void)desc;
     return false;
 #else
+    if (desc.enableLogging) {
+        clearStreamlineLogMessages();
+    }
     const std::filesystem::path runtimeDir = desc.runtimeDirectory.empty()
         ? defaultRuntimeDirectory()
         : desc.runtimeDirectory;
@@ -484,6 +585,8 @@ bool StreamlineRuntime::initialize(const StreamlineInitDesc& desc) {
     sl::Preferences preferences{};
     preferences.showConsole = false;
     preferences.logLevel = desc.enableLogging ? sl::LogLevel::eDefault : sl::LogLevel::eOff;
+    preferences.pathToLogsAndData = nullptr;
+    preferences.logMessageCallback = desc.enableLogging ? streamlineLogMessageCallback : nullptr;
     preferences.pathsToPlugins = pluginPaths;
     preferences.numPathsToPlugins = 1;
     preferences.featuresToLoad = featuresToLoad.empty() ? nullptr : featuresToLoad.data();
@@ -501,6 +604,7 @@ bool StreamlineRuntime::initialize(const StreamlineInitDesc& desc) {
     const sl::Result initResult = dispatch->slInit(preferences, sl::kSDKVersion);
     if (initResult != sl::Result::eOk) {
         status_.unavailableReason = "Streamline slInit failed: " + streamlineResultName(initResult);
+        status_.logMessages = snapshotStreamlineLogMessages();
         delete dispatch;
         FreeLibrary(module);
         return false;
@@ -510,6 +614,7 @@ bool StreamlineRuntime::initialize(const StreamlineInitDesc& desc) {
     dispatch_ = dispatch;
     status_.initialized = true;
     status_.unavailableReason.clear();
+    status_.logMessages = snapshotStreamlineLogMessages();
     if (vulkanInfo_.physicalDevice != VK_NULL_HANDLE) {
         queryCapabilities();
     }
@@ -560,6 +665,7 @@ bool StreamlineRuntime::setVulkanInfo(const StreamlineVulkanInfo& info) {
     status_.vulkanInfoSet = result == sl::Result::eOk;
     if (!status_.vulkanInfoSet) {
         status_.unavailableReason = "Streamline slSetVulkanInfo failed: " + streamlineResultName(result);
+        status_.logMessages = snapshotStreamlineLogMessages();
         return false;
     }
     queryCapabilities();
@@ -603,12 +709,13 @@ void StreamlineRuntime::queryCapabilities() {
     status_.reflex = makeUnavailableFeatureStatus(StreamlineFeature::Reflex);
     status_.nis = makeUnavailableFeatureStatus(StreamlineFeature::Nis);
     status_.nrd = makeUnavailableFeatureStatus(StreamlineFeature::Nrd);
+    status_.nvperf = makeUnavailableFeatureStatus(StreamlineFeature::NvPerf);
 #if defined(RTV_STREAMLINE_SDK_CONFIGURED)
     if (!status_.initialized || dispatch_ == nullptr) {
         return;
     }
     auto* dispatch = static_cast<StreamlineDispatch*>(dispatch_);
-    for (StreamlineFeature feature : {StreamlineFeature::Dlss, StreamlineFeature::DlssRayReconstruction, StreamlineFeature::DlssFrameGeneration, StreamlineFeature::Reflex, StreamlineFeature::Nis}) {
+    for (StreamlineFeature feature : {StreamlineFeature::Dlss, StreamlineFeature::DlssRayReconstruction, StreamlineFeature::DlssFrameGeneration, StreamlineFeature::Reflex, StreamlineFeature::Nis, StreamlineFeature::NvPerf}) {
         StreamlineFeatureStatus& featureState = mutableFeatureStatus(feature);
         featureState.requestable = true;
         sl::AdapterInfo adapter{};
@@ -622,6 +729,7 @@ void StreamlineRuntime::queryCapabilities() {
             featureState.requirements = streamlineFeatureRequirementsText(requirements);
         }
     }
+    status_.logMessages = snapshotStreamlineLogMessages();
 #endif
 }
 
@@ -654,6 +762,13 @@ bool StreamlineRuntime::setConstants(const StreamlineConstantsDesc& desc) {
 #if defined(RTV_STREAMLINE_SDK_CONFIGURED)
     auto* dispatch = static_cast<StreamlineDispatch*>(dispatch_);
     sl::Constants constants = streamlineConstantsFromDesc(desc);
+#if defined(RTV_STREAMLINE_HAS_NVPERF)
+    sl::NvPerfConstants nvperfConstants{};
+    if (desc.nvPerfEnabled) {
+        nvperfConstants.mode = sl::NvPerfMode::eOn;
+        constants.next = &nvperfConstants;
+    }
+#endif
     sl::ViewportHandle viewport(frame_.viewportId);
     const sl::Result result = dispatch->slSetConstants(constants, *static_cast<sl::FrameToken*>(nativeFrameToken_), viewport);
     if (result != sl::Result::eOk) {
@@ -758,6 +873,30 @@ bool StreamlineRuntime::setDlssRayReconstructionOptions(const StreamlineDlssRayR
 #endif
 }
 
+bool StreamlineRuntime::setNvPerfEnabled(bool enabled) {
+    if (!status_.initialized || !frameActive_ || nativeFrameToken_ == nullptr || dispatch_ == nullptr) {
+        return false;
+    }
+#if defined(RTV_STREAMLINE_SDK_CONFIGURED) && defined(RTV_STREAMLINE_HAS_NVPERF)
+    auto* dispatch = static_cast<StreamlineDispatch*>(dispatch_);
+    sl::Constants constants{};
+    sl::NvPerfConstants nvperfConstants{};
+    nvperfConstants.mode = enabled ? sl::NvPerfMode::eOn : sl::NvPerfMode::eOff;
+    constants.next = &nvperfConstants;
+    sl::ViewportHandle viewport(frame_.viewportId);
+    const sl::Result result = dispatch->slSetConstants(constants, *static_cast<sl::FrameToken*>(nativeFrameToken_), viewport);
+    if (result != sl::Result::eOk) {
+        status_.unavailableReason = "Streamline NvPerf constants failed: " + streamlineResultName(result);
+        return false;
+    }
+    return true;
+#else
+    (void)enabled;
+    status_.unavailableReason = featureUnavailableReason(StreamlineFeature::NvPerf);
+    return false;
+#endif
+}
+
 bool StreamlineRuntime::tagResourceForFrame(const StreamlineResourceTagDesc& desc) {
     if (!status_.initialized || !frameActive_ || nativeFrameToken_ == nullptr || dispatch_ == nullptr ||
         desc.image == VK_NULL_HANDLE || desc.memory == VK_NULL_HANDLE || desc.imageView == VK_NULL_HANDLE ||
@@ -809,7 +948,14 @@ bool StreamlineRuntime::evaluateFeature(StreamlineFeature feature, VkCommandBuff
 #if defined(RTV_STREAMLINE_SDK_CONFIGURED)
     auto* dispatch = static_cast<StreamlineDispatch*>(dispatch_);
     sl::CommandBuffer* nativeCommandBuffer = reinterpret_cast<sl::CommandBuffer*>(commandBuffer);
-    const sl::Result result = dispatch->slEvaluateFeature(streamlineFeatureId(feature), *static_cast<sl::FrameToken*>(nativeFrameToken_), nullptr, 0, nativeCommandBuffer);
+    sl::ViewportHandle viewport(frame_.viewportId);
+    const sl::BaseStructure* inputs[] = {&viewport};
+    const sl::Result result = dispatch->slEvaluateFeature(
+        streamlineFeatureId(feature),
+        *static_cast<sl::FrameToken*>(nativeFrameToken_),
+        inputs,
+        1u,
+        nativeCommandBuffer);
     if (result != sl::Result::eOk) {
         status_.unavailableReason = "Streamline slEvaluateFeature failed: " + streamlineResultName(result);
         return false;
@@ -901,6 +1047,7 @@ StreamlineFeatureStatus& StreamlineRuntime::mutableFeatureStatus(StreamlineFeatu
     case StreamlineFeature::Reflex: return status_.reflex;
     case StreamlineFeature::Nis: return status_.nis;
     case StreamlineFeature::Nrd: return status_.nrd;
+    case StreamlineFeature::NvPerf: return status_.nvperf;
     }
     return status_.dlss;
 }
@@ -913,6 +1060,7 @@ const StreamlineFeatureStatus& StreamlineRuntime::featureStatus(StreamlineFeatur
     case StreamlineFeature::Reflex: return status_.reflex;
     case StreamlineFeature::Nis: return status_.nis;
     case StreamlineFeature::Nrd: return status_.nrd;
+    case StreamlineFeature::NvPerf: return status_.nvperf;
     }
     return status_.dlss;
 }

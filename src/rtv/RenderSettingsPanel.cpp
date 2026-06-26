@@ -45,7 +45,13 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.pathTracingEnabled = render.pathTracingEnabled;
         settings.cameraJitterEnabled = render.cameraJitterEnabled;
         settings.directLightingEnabled = render.directLightingEnabled;
+        settings.secondaryDirectLightingEnabled = render.secondaryDirectLightingEnabled;
         settings.maxBounces = render.maxBounces;
+        settings.pathTraceKernelMode = render.pathTraceKernelMode;
+        settings.finalBounceFastPathEnabled = render.finalBounceFastPathEnabled;
+        settings.native2BTerminalDirectSampleProbability = render.native2BTerminalDirectSampleProbability;
+        settings.blendedDecalShadowMode = render.blendedDecalShadowMode;
+        settings.native2BDirectReuseMode = render.native2BDirectReuseMode;
         settings.environmentDirectSamples = render.environmentDirectSamples;
         settings.toneMapper = render.toneMapper;
         settings.exposure = render.exposure;
@@ -99,6 +105,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.dlssFrameGenerationEnabled = render.dlssFrameGenerationEnabled;
         settings.dlssRayReconstructionEnabled = render.dlssRayReconstructionEnabled;
         settings.streamlineReflexEnabled = render.streamlineReflexEnabled;
+        settings.streamlineNvPerfEnabled = render.streamlineNvPerfEnabled;
         settings.dlssSharpeningStrength = render.dlssSharpeningStrength;
         settings.taaFeedback = render.taaFeedback;
         settings.taaMotionFeedback = render.taaMotionFeedback;
@@ -110,6 +117,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.materialTextureAnisotropy = render.materialTextureAnisotropy;
         settings.specularAaEnabled = render.specularAaEnabled;
         settings.opacityMicromapsEnabled = render.opacityMicromapsEnabled;
+        settings.compactImportedEmissiveTriangleSampling = render.compactImportedEmissiveTriangleSampling;
         settings.shadowRayBias = render.shadowRayBias;
         settings.shadowDistanceBias = render.shadowDistanceBias;
         settings.fireflyClamp = render.fireflyClamp;
@@ -170,6 +178,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     const bool dlssRayReconstructionCanRequest = nvidiaStatus.dlssRayReconstructionRequestable || nvidiaStatus.dlssRayReconstructionAvailable;
     const bool dlssFrameGenerationCanRequest = nvidiaStatus.dlssFrameGenerationRequestable || nvidiaStatus.dlssFrameGenerationAvailable;
     const bool reflexCanRequest = nvidiaStatus.streamlineReflex.requestable || nvidiaStatus.streamlineReflex.supported;
+    const bool nvperfCanRequest = nvidiaStatus.streamlineNvPerf.requestable || nvidiaStatus.streamlineNvPerf.supported;
 
     ImGui::SeparatorText("Preview Actions");
     if (editorIconTextButton("RenderSettingsResetAccumulation", EditorGlyphIcon::Reset, "Reset Accumulation")) {
@@ -192,12 +201,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     tooltip("Toggle denoising without leaving the docked Render Settings workflow.");
 
     ImGui::SeparatorText("Rendering");
-    const char* renderPresetItems[] = {"Custom", "Low", "Balanced", "Ultra"};
+    const char* renderPresetItems[] = {"Custom", "Low", "Balanced", "Ultra", "Native 30"};
     int renderPresetIndex = static_cast<int>(settings.renderPreset);
-    if (renderPresetIndex < 0 || renderPresetIndex > 3) {
+    if (renderPresetIndex < 0 || renderPresetIndex > 4) {
         renderPresetIndex = 0;
     }
-    if (ImGui::Combo("Render Preset", &renderPresetIndex, renderPresetItems, 4)) {
+    if (ImGui::Combo("Render Preset", &renderPresetIndex, renderPresetItems, 5)) {
         applyRenderPreset(settings, static_cast<RenderPreset>(renderPresetIndex));
         presetApplied = true;
         changed = true;
@@ -206,6 +215,48 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     editorDebugViewCombo("Debug View", settings, changed);
     changed |= ImGui::SliderScalar("Max Bounces", ImGuiDataType_U32, &settings.maxBounces, &minBounces, &maxBounces);
     tooltip("Number of ray bounces. Higher is more accurate and slower; 4-8 for preview, 16 for final.");
+    const char* pathTraceKernelItems[] = {"Generic", "Native2B"};
+    int pathTraceKernelIndex = static_cast<int>(settings.pathTraceKernelMode);
+    if (pathTraceKernelIndex < 0 || pathTraceKernelIndex > 1) {
+        pathTraceKernelIndex = 0;
+    }
+    if (ImGui::Combo("Path Trace Kernel", &pathTraceKernelIndex, pathTraceKernelItems, 2)) {
+        settings.pathTraceKernelMode = static_cast<PathTraceKernelMode>(pathTraceKernelIndex);
+        changed = true;
+    }
+    tooltip("Native2B is a strict native 1 SPP, 2-bounce beauty specialization. It falls back unless the current settings match its quality-safe gates.");
+    const PathTraceKernelMode effectiveKernel = state.renderer.effectivePathTraceKernelMode();
+    ImGui::TextDisabled("Effective: %s", pathTraceKernelModeName(effectiveKernel));
+    if (settings.pathTraceKernelMode == PathTraceKernelMode::Native2B) {
+        const char* fallbackReason = state.renderer.pathTraceKernelFallbackReason();
+        if (fallbackReason != nullptr && fallbackReason[0] != '\0') {
+            ImGui::TextDisabled("Fallback: %s", fallbackReason);
+        } else {
+            ImGui::TextDisabled("Terminal payload: %s", state.renderer.native2BTerminalPayloadActive() ? "active" : "inactive");
+        }
+    }
+    const char* blendedDecalShadowItems[] = {"Exact", "Opaque Shadow", "Alpha Cutout Proxy"};
+    int blendedDecalShadowIndex = static_cast<int>(settings.blendedDecalShadowMode);
+    if (blendedDecalShadowIndex < 0 || blendedDecalShadowIndex > 2) {
+        blendedDecalShadowIndex = 0;
+    }
+    if (ImGui::Combo("Blended Decal Shadows", &blendedDecalShadowIndex, blendedDecalShadowItems, 3)) {
+        settings.blendedDecalShadowMode = static_cast<BlendedDecalShadowMode>(blendedDecalShadowIndex);
+        changed = true;
+    }
+    tooltip("Experimental Native2B traversal shortcut for decal-like BLEND materials. Exact is the quality-preserving default.");
+    const char* native2BDirectReuseItems[] = {"Off", "RIS", "Temporal"};
+    int native2BDirectReuseIndex = static_cast<int>(settings.native2BDirectReuseMode);
+    if (native2BDirectReuseIndex < 0 || native2BDirectReuseIndex > 2) {
+        native2BDirectReuseIndex = 0;
+    }
+    if (ImGui::Combo("Native2B Direct Reuse", &native2BDirectReuseIndex, native2BDirectReuseItems, 3)) {
+        settings.native2BDirectReuseMode = static_cast<Native2BDirectReuseMode>(native2BDirectReuseIndex);
+        changed = true;
+    }
+    tooltip("Experimental terminal direct-light reuse. Off keeps the exact estimator.");
+    changed |= ImGui::SliderFloat("Terminal Direct Rate", &settings.native2BTerminalDirectSampleProbability, 0.25f, 1.0f, "%.2f");
+    tooltip("Native2B widened quality/performance gate. 1.00 samples every terminal env/sun direct light; lower values sample stochastically and rely on temporal accumulation.");
     changed |= ImGui::SliderScalar("Environment Samples", ImGuiDataType_U32, &settings.environmentDirectSamples, &minEnvSamples, &maxEnvSamples);
     tooltip("Environment light samples per bounce. Higher values reduce fireflies.");
     changed |= ImGui::Checkbox("Limit to 1 SPP", &settings.limitSamplesPerPixel);
@@ -216,6 +267,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     changed |= ImGui::Checkbox("TAA Camera Jitter", &settings.cameraJitterEnabled);
     tooltip("Halton sub-pixel jitter. It is only applied while TAA is enabled.");
     changed |= ImGui::Checkbox("Direct Lighting", &settings.directLightingEnabled);
+    changed |= ImGui::Checkbox("Secondary Bounce Direct", &settings.secondaryDirectLightingEnabled);
+    tooltip("Samples direct lighting at secondary surface hits so two-bounce renders keep bounce illumination.");
     changed |= ImGui::SliderFloat("Indirect Strength", &settings.indirectStrength, 0.0f, 4.0f, "%.2f");
     tooltip("Multiplier for indirect lighting contribution.");
     const char* restirModeItems[] = {"Classic NEE", "ReSTIR Only", "Hybrid Compare"};
@@ -490,6 +543,16 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     tooltip(reflexCanRequest
         ? "Emits Streamline Reflex/PCL latency markers at simulation, render-submit, and present boundaries."
         : nvidiaStatus.streamlineReflex.unavailableReason.c_str());
+    bool nvperfEnabled = settings.streamlineNvPerfEnabled;
+    ImGui::BeginDisabled(!nvperfCanRequest);
+    if (ImGui::Checkbox("Streamline NvPerf", &nvperfEnabled)) {
+        settings.streamlineNvPerfEnabled = nvperfEnabled;
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    tooltip(nvperfCanRequest
+        ? "Requests Streamline NvPerf evaluation for Nsight Perf HUD and per-frame performance diagnostics."
+        : nvidiaStatus.streamlineNvPerf.unavailableReason.c_str());
     changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
     changed |= ImGui::SliderFloat("Material Anisotropy", &settings.materialTextureAnisotropy, 1.0f, 16.0f, "%.1fx");
     tooltip("Anisotropic filtering level for material textures. Unsupported devices clamp to 1x.");
@@ -748,7 +811,13 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.pathTracingEnabled = settings.pathTracingEnabled;
             render.cameraJitterEnabled = settings.cameraJitterEnabled;
             render.directLightingEnabled = settings.directLightingEnabled;
+            render.secondaryDirectLightingEnabled = settings.secondaryDirectLightingEnabled;
             render.maxBounces = settings.maxBounces;
+            render.pathTraceKernelMode = settings.pathTraceKernelMode;
+            render.finalBounceFastPathEnabled = settings.finalBounceFastPathEnabled;
+            render.native2BTerminalDirectSampleProbability = settings.native2BTerminalDirectSampleProbability;
+            render.blendedDecalShadowMode = settings.blendedDecalShadowMode;
+            render.native2BDirectReuseMode = settings.native2BDirectReuseMode;
             render.environmentDirectSamples = settings.environmentDirectSamples;
             render.toneMapper = settings.toneMapper;
             render.exposure = settings.exposure;
@@ -801,6 +870,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.dlssFrameGenerationEnabled = settings.dlssFrameGenerationEnabled;
             render.dlssRayReconstructionEnabled = settings.dlssRayReconstructionEnabled;
             render.streamlineReflexEnabled = settings.streamlineReflexEnabled;
+            render.streamlineNvPerfEnabled = settings.streamlineNvPerfEnabled;
             render.dlssSharpeningStrength = settings.dlssSharpeningStrength;
             render.taaFeedback = settings.taaFeedback;
             render.taaMotionFeedback = settings.taaMotionFeedback;
@@ -812,6 +882,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.materialTextureAnisotropy = settings.materialTextureAnisotropy;
             render.specularAaEnabled = settings.specularAaEnabled;
             render.opacityMicromapsEnabled = settings.opacityMicromapsEnabled;
+            render.compactImportedEmissiveTriangleSampling = settings.compactImportedEmissiveTriangleSampling;
             render.shadowRayBias = settings.shadowRayBias;
             render.shadowDistanceBias = settings.shadowDistanceBias;
             render.fireflyClamp = settings.fireflyClamp;

@@ -204,6 +204,95 @@ RayTracingPipeline::RayTracingPipeline(
 RayTracingPipeline::RayTracingPipeline(
     VkDevice device,
     const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& properties,
+    const ShaderModule& raygenShader,
+    const ShaderModule& primaryMissShader,
+    const ShaderModule& shadowMissShader,
+    const ShaderModule& terminalMissShader,
+    const ShaderModule& closestHitShader,
+    const ShaderModule& primaryAnyHitShader,
+    const ShaderModule& shadowAnyHitShader,
+    const ShaderModule& terminalClosestHitShader,
+    const ShaderModule& terminalAnyHitShader,
+    std::vector<VkDescriptorSetLayout> setLayouts,
+    PipelineCache& pipelineCache,
+    ResourceAllocator& allocator,
+    BufferUploader& uploader,
+    bool opacityMicromapsEnabled,
+    bool usePipelineCache)
+    : device_(device) {
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = static_cast<uint32_t>(setLayouts.size());
+    layoutInfo.pSetLayouts = setLayouts.data();
+    checkVk(vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &layout_), "vkCreatePipelineLayout(ray tracing native2b)");
+
+    std::array<VkPipelineShaderStageCreateInfo, 9> stages = {
+        raygenShader.stageInfo(),
+        primaryMissShader.stageInfo(),
+        shadowMissShader.stageInfo(),
+        terminalMissShader.stageInfo(),
+        closestHitShader.stageInfo(),
+        primaryAnyHitShader.stageInfo(),
+        shadowAnyHitShader.stageInfo(),
+        terminalClosestHitShader.stageInfo(),
+        terminalAnyHitShader.stageInfo(),
+    };
+
+    std::array<VkRayTracingShaderGroupCreateInfoKHR, 7> groups{};
+    for (auto& group : groups) {
+        group.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        group.generalShader = VK_SHADER_UNUSED_KHR;
+        group.closestHitShader = VK_SHADER_UNUSED_KHR;
+        group.anyHitShader = VK_SHADER_UNUSED_KHR;
+        group.intersectionShader = VK_SHADER_UNUSED_KHR;
+    }
+    groups[0].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[0].generalShader = 0;
+    groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[1].generalShader = 1;
+    groups[2].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[2].generalShader = 2;
+    groups[3].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[3].generalShader = 3;
+    groups[4].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[4].closestHitShader = 4;
+    groups[4].anyHitShader = 5;
+    groups[5].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[5].anyHitShader = 6;
+    groups[6].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[6].closestHitShader = 7;
+    groups[6].anyHitShader = 8;
+
+    VkRayTracingPipelineCreateInfoKHR pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+    pipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
+    pipelineInfo.pStages = stages.data();
+    pipelineInfo.groupCount = static_cast<uint32_t>(groups.size());
+    pipelineInfo.pGroups = groups.data();
+    pipelineInfo.maxPipelineRayRecursionDepth = 1;
+    pipelineInfo.layout = layout_;
+    applyRayTracingPipelineFlags(pipelineInfo, opacityMicromapsEnabled, false);
+    checkVk(vkCreateRayTracingPipelinesKHR(
+        device_, VK_NULL_HANDLE, usePipelineCache ? pipelineCache.handle() : VK_NULL_HANDLE,
+        1, &pipelineInfo, nullptr, &pipeline_), "vkCreateRayTracingPipelinesKHR(native2b)");
+
+    const uint32_t handleSize = properties.shaderGroupHandleSize;
+    const VkDeviceSize stride = Buffer::alignUp(handleSize, properties.shaderGroupHandleAlignment);
+    const VkDeviceSize raygenSectionSize = Buffer::alignUp(stride, properties.shaderGroupBaseAlignment);
+    const VkDeviceSize missSectionSize = Buffer::alignUp(stride * 3u, properties.shaderGroupBaseAlignment);
+    const VkDeviceSize hitSectionSize = Buffer::alignUp(stride * 3u, properties.shaderGroupBaseAlignment);
+    std::vector<uint8_t> handles(handleSize * groups.size());
+    checkVk(vkGetRayTracingShaderGroupHandlesKHR(
+        device_, pipeline_, 0, static_cast<uint32_t>(groups.size()), handles.size(), handles.data()),
+        "vkGetRayTracingShaderGroupHandlesKHR(native2b)");
+    uploadSbtSection(allocator, uploader, raygenSbt_, raygenRegion_, handles.data(), 0u, 1u, handleSize, stride, raygenSectionSize, "native2b raygen SBT");
+    uploadSbtSection(allocator, uploader, missSbt_, missRegion_, handles.data(), 1u, 3u, handleSize, stride, missSectionSize, "native2b miss SBT");
+    uploadSbtSection(allocator, uploader, hitSbt_, hitRegion_, handles.data(), 4u, 3u, handleSize, stride, hitSectionSize, "native2b hit SBT");
+}
+
+RayTracingPipeline::RayTracingPipeline(
+    VkDevice device,
+    const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& properties,
     const ShaderModule& primaryRaygenShader,
     const ShaderModule& shadowRaygenShader,
     const ShaderModule& primaryMissShader,

@@ -1,6 +1,8 @@
 #include "rtv/CommandSystem.h"
 
 #include "rtv/Check.h"
+#include "rtv/NsightMarkers.h"
+#include "rtv/NsightPerfMarkers.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/PipelineDemo.h"
 #include "rtv/ResourceDemo.h"
@@ -14,6 +16,29 @@
 #include <iostream>
 
 namespace rtv {
+namespace {
+
+void beginCommandBufferLabel(VkCommandBuffer commandBuffer, const char* name) {
+    if (vkCmdBeginDebugUtilsLabelEXT == nullptr || commandBuffer == VK_NULL_HANDLE) {
+        return;
+    }
+    VkDebugUtilsLabelEXT label{};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = name;
+    label.color[0] = 0.22f;
+    label.color[1] = 0.53f;
+    label.color[2] = 0.88f;
+    label.color[3] = 1.0f;
+    vkCmdBeginDebugUtilsLabelEXT(commandBuffer, &label);
+}
+
+void endCommandBufferLabel(VkCommandBuffer commandBuffer) {
+    if (vkCmdEndDebugUtilsLabelEXT != nullptr && commandBuffer != VK_NULL_HANDLE) {
+        vkCmdEndDebugUtilsLabelEXT(commandBuffer);
+    }
+}
+
+} // namespace
 
 CommandSystem::CommandSystem(const VulkanContext& context, Swapchain& swapchain, bool disableAsyncCompute, bool singleQueueFallback)
     : context_(context),
@@ -44,7 +69,10 @@ CommandSystem::~CommandSystem() {
 
 void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     FrameResources& frame = frames_[frameIndex_];
-    checkVk(vkWaitForFences(context_.device(), 1, &frame.inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    {
+        ScopedNsightRange range("Frame.WaitForFence");
+        checkVk(vkWaitForFences(context_.device(), 1, &frame.inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    }
 
     uint32_t imageIndex = 0;
     VkResult acquireResult = VK_SUCCESS;
@@ -53,6 +81,7 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
         imageIndex = headlessImageIndex_;
         headlessImageIndex_ = (headlessImageIndex_ + 1) % swapchain_.imageCount();
     } else {
+        ScopedNsightRange range("Frame.AcquireSwapchainImage");
         acquireResult = vkAcquireNextImageKHR(
             context_.device(),
             swapchain_.handle(),
@@ -100,13 +129,16 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     } else if (pipelineDemo_ != nullptr) {
         pipelineDemo_->beginFrame(frameIndex_);
     }
+    prepareNsightPerfFrame();
     recordWorkCommands(frame.commandBuffer, imageIndex, clearPhase);
     const bool asyncComputeRecorded = recordAsyncComputeCommands(frame);
     recordPresentationCommands(frame.postCommandBuffer, imageIndex, clearPhase);
     if (pathTracer_ != nullptr) {
         pathTracer_->markStreamlineReflexRenderSubmitStart();
     }
+    beginNsightPerfFrame(context_.graphicsQueue(), context_.queueFamilies().graphics.value());
     submitFrame(frame, imageIndex, asyncComputeRecorded);
+    endNsightPerfFrame();
     if (pathTracer_ != nullptr) {
         pathTracer_->markStreamlineReflexRenderSubmitEnd();
     }
@@ -128,7 +160,11 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     if (pathTracer_ != nullptr) {
         pathTracer_->markStreamlineReflexPresentStart();
     }
-    VkResult presentResult = vkQueuePresentKHR(context_.presentQueue(), &presentInfo);
+    VkResult presentResult = VK_SUCCESS;
+    {
+        ScopedNsightRange range("QueuePresent");
+        presentResult = vkQueuePresentKHR(context_.presentQueue(), &presentInfo);
+    }
     if (pathTracer_ != nullptr) {
         pathTracer_->markStreamlineReflexPresentEnd();
     }
@@ -281,6 +317,8 @@ void CommandSystem::recordPresentationCommands(VkCommandBuffer commandBuffer, ui
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     checkVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer(post)");
+    beginCommandBufferLabel(commandBuffer, "Frame.Presentation");
+    const bool perfRangeActive = beginNsightPerfCommandBufferRange(commandBuffer, "Frame.Presentation");
 
     const VkImage swapchainImage = swapchain_.image(imageIndex);
     transitionImage(
@@ -368,6 +406,10 @@ void CommandSystem::recordPresentationCommands(VkCommandBuffer commandBuffer, ui
             VK_ACCESS_2_NONE);
     }
 
+    if (perfRangeActive) {
+        (void)endNsightPerfCommandBufferRange(commandBuffer);
+    }
+    endCommandBufferLabel(commandBuffer);
     checkVk(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer(post)");
 }
 
@@ -447,11 +489,15 @@ void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool
     graphicsSubmit.pSignalSemaphoreInfos = graphicsSignalCount > 0 ? graphicsSignals.data() : nullptr;
 
     if (!asyncComputeRecorded) {
+        ScopedNsightRange range("QueueSubmit.Graphics");
         checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &graphicsSubmit, frame.inFlight), "vkQueueSubmit2(graphics)");
         return;
     }
 
-    checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &graphicsSubmit, VK_NULL_HANDLE), "vkQueueSubmit2(graphics async producer)");
+    {
+        ScopedNsightRange range("QueueSubmit.GraphicsProducer");
+        checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &graphicsSubmit, VK_NULL_HANDLE), "vkQueueSubmit2(graphics async producer)");
+    }
 
     const uint64_t computeTimelineValue = ++asyncTimelineValue_;
     VkSemaphoreSubmitInfo computeWait{};
@@ -478,7 +524,10 @@ void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool
     computeSubmit.pCommandBufferInfos = &computeCommand;
     computeSubmit.signalSemaphoreInfoCount = 1;
     computeSubmit.pSignalSemaphoreInfos = &computeSignal;
-    checkVk(vkQueueSubmit2(context_.computeQueue(), 1, &computeSubmit, VK_NULL_HANDLE), "vkQueueSubmit2(compute)");
+    {
+        ScopedNsightRange range("QueueSubmit.AsyncCompute");
+        checkVk(vkQueueSubmit2(context_.computeQueue(), 1, &computeSubmit, VK_NULL_HANDLE), "vkQueueSubmit2(compute)");
+    }
 
     std::array<VkSemaphoreSubmitInfo, 2> postWaits{};
     uint32_t postWaitCount = 0;
@@ -507,7 +556,10 @@ void CommandSystem::submitFrame(FrameResources& frame, uint32_t imageIndex, bool
     postSubmit.pCommandBufferInfos = &postCommand;
     postSubmit.signalSemaphoreInfoCount = !headless_ ? 1u : 0u;
     postSubmit.pSignalSemaphoreInfos = !headless_ ? &postSignal : nullptr;
-    checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &postSubmit, frame.inFlight), "vkQueueSubmit2(graphics async post)");
+    {
+        ScopedNsightRange range("QueueSubmit.GraphicsPresentation");
+        checkVk(vkQueueSubmit2(context_.graphicsQueue(), 1, &postSubmit, frame.inFlight), "vkQueueSubmit2(graphics async post)");
+    }
     asyncHistoryCompleteValue_ = computeTimelineValue;
 }
 

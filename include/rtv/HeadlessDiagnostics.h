@@ -2,9 +2,13 @@
 
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
+#include "rtv/GpuCrashDiagnostics.h"
+#include "rtv/NsightPerfDiagnostics.h"
 #include "rtv/GpuUploadTicket.h"
 #include "rtv/MainThreadApplyTicket.h"
 #include "rtv/TopologyRebuildTicket.h"
+
+#include <nlohmann/json.hpp>
 
 #include <array>
 #include <cstdint>
@@ -29,6 +33,7 @@ struct HeadlessDiagnosticsConfig {
     uint32_t totalFrames = 120;
     std::optional<uint32_t> fixedSeed;
     bool profile = false;
+    bool rayTracingDiagnosticCounters = false;
     bool runValidationSuite = false;
     std::optional<std::filesystem::path> profileJsonPath;
     std::optional<std::filesystem::path> dumpRenderGraphPath;
@@ -58,6 +63,10 @@ struct ProfileReport {
     RestirHistoryCopyMode effectiveRestirHistoryCopyMode = RestirHistoryCopyMode::Copy;
     std::string restirHistoryCopyFallbackReason;
     bool effectiveRestirGiActiveTileMaskEnabled = false;
+    PathTraceKernelMode effectivePathTraceKernelMode = PathTraceKernelMode::Generic;
+    bool native2BTerminalPayloadActive = false;
+    bool native2BCompactPrimaryLightsActive = false;
+    std::string pathTraceKernelFallbackReason;
 
     struct Resolution {
         uint32_t renderWidth = 0;
@@ -70,6 +79,7 @@ struct ProfileReport {
     uint32_t frameCount = 0;
     uint32_t warmupFrames = 0;
     uint32_t profiledFrames = 0;
+    bool rayTracingDiagnosticCountersEnabled = false;
 
     struct MinMaxAvg {
         float min = 0.0f;
@@ -169,6 +179,8 @@ struct ProfileReport {
             uint32_t subdivisionLevel = 0;
             uint32_t eligiblePrimitiveCount = 0;
             uint32_t generatedPrimitiveCount = 0;
+            uint32_t alphaTestedPrimitiveCount = 0;
+            uint32_t blendedPrimitiveCount = 0;
             uint32_t alphaTexturePrimitiveCount = 0;
             uint32_t constantAlphaPrimitiveCount = 0;
             uint32_t cacheEntryCount = 0;
@@ -242,6 +254,8 @@ struct ProfileReport {
     } pipelineStatistics{};
 
     struct RayTracingDiagnosticCounterReport {
+        static constexpr size_t kRawSlotCount = 64;
+        std::array<uint64_t, kRawSlotCount> rawSlots{};
         uint64_t cameraAnyHitInvocations = 0;
         uint64_t cameraAnyHitIgnored = 0;
         uint64_t cameraAnyHitAccepted = 0;
@@ -256,7 +270,49 @@ struct ProfileReport {
         uint64_t causticTransmissiveHits = 0;
         uint64_t causticTransmissiveVisible = 0;
         uint64_t causticShadowBlocked = 0;
+        uint64_t primarySurfaceTraceRays = 0;
+        uint64_t terminalSurfaceTraceRays = 0;
+        uint64_t shadowSurfaceTraceRays = 0;
+        uint64_t envDirectShadowRays = 0;
+        uint64_t sunDirectShadowRays = 0;
+        uint64_t emissiveDirectShadowRays = 0;
+        uint64_t transmissiveShadowSurfaceTraces = 0;
+        uint64_t fastShadowTransmittanceUsed = 0;
+        uint64_t fullShadowTransmittanceUsed = 0;
+        uint64_t terminalFastDirectUsed = 0;
+        uint64_t terminalGenericDirectUsed = 0;
+        uint64_t terminalMaterialFullDecode = 0;
+        uint64_t terminalMaterialHeaderOnly = 0;
+        uint64_t primaryAnyHitOpaque = 0;
+        uint64_t primaryAnyHitAlphaTested = 0;
+        uint64_t primaryAnyHitBlended = 0;
+        uint64_t terminalAnyHitInvocations = 0;
+        uint64_t terminalAnyHitOpaque = 0;
+        uint64_t terminalAnyHitAlphaTested = 0;
+        uint64_t terminalAnyHitBlended = 0;
+        uint64_t closestHitPrimary = 0;
+        uint64_t closestHitTerminal = 0;
+        uint64_t causticBlockerOpaque = 0;
+        uint64_t causticBlockerAlphaTested = 0;
+        uint64_t causticBlockerBlended = 0;
+        uint64_t terminalFastDirectFlagDisabled = 0;
+        uint64_t terminalFastDirectSceneLights = 0;
+        uint64_t terminalFastDirectTransmissiveScene = 0;
+        uint64_t terminalFastDirectVolume = 0;
+        uint64_t terminalFastDirectDebug = 0;
+        uint64_t terminalFastDirectMaterialTransmissive = 0;
+        uint64_t terminalDirectSkippedEmissiveOrUnlit = 0;
     } rayTracingDiagnosticCounters{};
+
+    struct AlphaAnyHitMaterialReport {
+        uint32_t materialIndex = 0;
+        uint64_t primaryAnyHit = 0;
+        uint64_t terminalAnyHit = 0;
+        uint64_t shadowAnyHit = 0;
+        uint64_t closestHit = 0;
+        uint64_t total = 0;
+    };
+    std::vector<AlphaAnyHitMaterialReport> alphaAnyHitTopMaterials;
 
     std::vector<uint64_t> restirDiCounters;
     std::vector<uint64_t> restirGiCounters;
@@ -278,6 +334,15 @@ struct ProfileReport {
         uint32_t blasBlendedGeometryCount = 0;
         uint32_t blasOpacityMicromapGeometryCount = 0;
         uint32_t blasBuildBatchCount = 0;
+        uint64_t cullableTriangleCount = 0;
+        uint64_t cullDisabledTriangleCount = 0;
+        uint32_t splitMeshCount = 0;
+        uint32_t duplicatedTlasInstanceCount = 0;
+        uint32_t actualBlasCount = 0;
+        uint64_t splitBlasBytes = 0;
+        bool hardwareBackfaceCullingEnabled = false;
+        uint32_t transmissiveShadowCasterCount = 0;
+        bool fastShadowTransmittanceEligible = false;
     } rayTracingGeometry{};
 
     struct AnimatedGeometryReport {
@@ -571,6 +636,12 @@ struct ProfileReport {
         uint64_t texturesBytes = 0;
         uint64_t buffersBytes = 0;
         uint64_t accelerationStructureBytes = 0;
+        uint64_t hardwareAccelerationStructureBytes = 0;
+        uint64_t gpuSceneBufferBytes = 0;
+        uint64_t gpuSceneGeometryBytes = 0;
+        uint64_t gpuSceneSoftwareBvhBytes = 0;
+        uint64_t gpuSceneLightBytes = 0;
+        uint64_t gpuSceneParameterBytes = 0;
         uint64_t temporalHistoryBytes = 0;
         uint64_t restirReservoirBytes = 0;
         uint64_t restirDiCurrentBytes = 0;
@@ -716,6 +787,7 @@ struct ProfileReport {
             uint32_t skippedUnsupported = 0;
             uint32_t skippedMissingTags = 0;
             uint64_t frameIndex = 0;
+            std::string lastError;
         };
 
         struct StreamlineReflexMarkerReport {
@@ -724,6 +796,17 @@ struct ProfileReport {
             uint32_t failed = 0;
             uint32_t skippedUnavailable = 0;
             uint64_t frameIndex = 0;
+        };
+
+        struct GpuCrashDumpReport {
+            bool buildAvailable = false;
+            bool requested = false;
+            bool enabled = false;
+            std::filesystem::path outputDirectory;
+            std::string unavailableReason;
+            uint32_t enableResult = 0;
+            uint32_t dumpCount = 0;
+            uint32_t shaderDebugInfoCount = 0;
         };
 
         bool nrdSdkConfigured = false;
@@ -753,21 +836,31 @@ struct ProfileReport {
         bool streamlineRuntimeConfigured = false;
         bool streamlineInitialized = false;
         bool streamlineVulkanInfoSet = false;
+        bool vulkanDebugUtilsEnabled = false;
+        bool vulkanDebugLabelsAvailable = false;
+        bool vulkanDebugObjectNamesAvailable = false;
         std::string streamlineRuntimeDirectory;
         std::string streamlineUnavailableReason;
+        std::vector<std::string> streamlineLogMessages;
         bool requestedStreamlineReflex = false;
         bool effectiveStreamlineReflex = false;
+        bool requestedStreamlineNvPerf = false;
+        bool effectiveStreamlineNvPerf = false;
         StreamlineFeatureReport streamlineDlss;
         StreamlineFeatureReport streamlineDlssRayReconstruction;
         StreamlineFeatureReport streamlineDlssFrameGeneration;
         StreamlineFeatureReport streamlineReflex;
         StreamlineFeatureReport streamlineNis;
         StreamlineFeatureReport streamlineNrd;
+        StreamlineFeatureReport streamlineNvPerf;
         StreamlineTagReport streamlineDlssTags;
         StreamlineTagReport streamlineDlssRayReconstructionTags;
         StreamlineEvaluationReport streamlineDlssEvaluation;
         StreamlineEvaluationReport streamlineDlssRayReconstructionEvaluation;
+        StreamlineEvaluationReport streamlineNvPerfEvaluation;
         StreamlineReflexMarkerReport streamlineReflexMarkers;
+        GpuCrashDumpReport gpuCrashDumps;
+        NsightPerfDiagnosticsReport nsightPerfSdk;
     } nvidiaIntegrations{};
 
     struct SceneUpdateRouteReport {
@@ -808,6 +901,13 @@ struct ProfileReport {
 
     uint32_t validationErrorCount = 0;
     std::vector<std::string> warnings;
+    nlohmann::json textureDiagnostics = nlohmann::json::object();
+    nlohmann::json optimizationHints = nlohmann::json::array();
+    nlohmann::json diagnosticReadiness = nlohmann::json::object();
+    nlohmann::json nsightAnalysisPlan = nlohmann::json::object();
+    nlohmann::json rayTracingShaderMap = nlohmann::json::object();
+    nlohmann::json accelerationStructureDiagnostics = nlohmann::json::object();
+    nlohmann::json barrierSyncDiagnostics = nlohmann::json::object();
 
     RendererSettings settings{};
 };

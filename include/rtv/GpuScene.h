@@ -50,14 +50,15 @@ struct alignas(16) CameraUniform {
     glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
     glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
     glm::uvec4 restirGiControls{24u, 0u, 0u, 1u}; // x = max age, y bits: 0 half-res, 1 enabled, 2 receiver buffer, 3 legacy cache, z = visibility rays, w = specular AA
-    glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, z = RT counters, w = caustic visibility
+    glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, z bits: 0 RT counters, 1 DI estimator, 2 HW backface culling, 3 final-bounce fast path, w = caustic visibility
     glm::vec4 dofControls{0.0f, 10.0f, 0.0f, 0.0f}; // x = aperture radius, y = focus distance, z = blade count, w = bokeh rotation
     glm::vec4 motionBlurControls{0.0f, 0.0f, 1.0f, 0.0f}; // x = enabled, y = shutter open, z = shutter close, w = external denoiser raw input
     glm::vec4 volumeControls{0.0f, 0.0f, 0.0f, 0.0f}; // x = enabled, y = sigma_s, z = sigma_a, w = anisotropy
     glm::vec4 projectionControls{0.0f, 0.0f, 1.0f, 1.0f}; // x = projection: 0 perspective, 1 orthographic; y = authored aspect; zw = ortho x/y magnification
     glm::vec4 clipControls{0.01f, 1000.0f, 0.0f, 0.0f}; // xy = near/far planes
     glm::uvec4 giVersionControls{0u, 0u, 0u, 0u}; // Phase 8: x = light version, y = material version, z = object version, w = environment version
-    glm::uvec4 restirDiControls{0u, 0u, 0u, 0u}; // x = new ReSTIR DI raygen writes enabled
+    glm::uvec4 restirDiControls{0u, 1u, 0u, 0u}; // x = new ReSTIR DI raygen writes enabled, y = secondary direct lighting enabled
+    glm::vec4 native2BControls{1.0f, 0.0f, 0.0f, 0.0f}; // x = terminal direct sample probability
 };
 
 static_assert(offsetof(CameraUniform, jitter) == 128, "CameraUniform::jitter must match std140 layout");
@@ -74,7 +75,8 @@ static_assert(offsetof(CameraUniform, projectionControls) == 288, "CameraUniform
 static_assert(offsetof(CameraUniform, clipControls) == 304, "CameraUniform::clipControls must match std140 layout");
 static_assert(offsetof(CameraUniform, giVersionControls) == 320, "CameraUniform::giVersionControls must match std140 layout");
 static_assert(offsetof(CameraUniform, restirDiControls) == 336, "CameraUniform::restirDiControls must match std140 layout");
-static_assert(sizeof(CameraUniform) == 352, "CameraUniform size must match std140 layout");
+static_assert(offsetof(CameraUniform, native2BControls) == 352, "CameraUniform::native2BControls must match std140 layout");
+static_assert(sizeof(CameraUniform) == 368, "CameraUniform size must match std140 layout");
 
 struct MeshParamsUniform {
     uint32_t vertexCount = 0;
@@ -97,6 +99,10 @@ struct MeshParamsUniform {
     uint32_t authoredLightOffset = 0;
     uint32_t authoredLightCount = 0;
     uint32_t bindlessTextureCapacity = 0;
+    uint32_t transmissiveShadowCasterCount = 0;
+    uint32_t reserved0 = 0;
+    uint32_t reserved1 = 0;
+    uint32_t reserved2 = 0;
 };
 
 struct GpuMeshRecord {
@@ -175,7 +181,8 @@ struct RayTracingMeshBuildInput {
     uint32_t primitiveCount = 0;
     bool containsAlphaTestedGeometry = false;
     bool containsBlendedGeometry = false;
-    bool opaqueTraversalSafe = false;
+    bool containsSingleSidedGeometry = false;
+    bool containsDoubleSidedGeometry = false;
     AccelUpdateMode updateMode = AccelUpdateMode::Static;
 };
 
@@ -230,7 +237,9 @@ public:
         uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel,
         bool opacityMicromapsEnabled = true,
         uint32_t materialTextureMaxDimension = 0,
-        uint32_t materialTextureSlotCapacity = 1);
+        uint32_t materialTextureSlotCapacity = 1,
+        bool compactImportedEmissiveTriangleSampling = false,
+        bool opacityMicromapBlendEnabled = false);
     ~GpuScene();
 
     [[nodiscard]] Buffer& vertices() { return *vertices_; }
@@ -276,6 +285,7 @@ public:
     [[nodiscard]] const BindlessTextureTable& materialTextureTable() const { return materialTextureTable_; }
     [[nodiscard]] VkImageView materialTextureImageView(uint32_t index) const { return materialTextureTable_.imageView(index); }
     [[nodiscard]] uint32_t materialTextureCount() const { return materialTextureTable_.residentCount(); }
+    [[nodiscard]] uint32_t materialTextureSamplerCount() const { return static_cast<uint32_t>(materialTextureSamplers_.size()); }
     [[nodiscard]] uint32_t materialTextureSlotCapacity() const { return materialTextureSlotCapacity_; }
     [[nodiscard]] float materialTextureAnisotropy() const { return materialTextureAnisotropy_; }
 
@@ -289,6 +299,55 @@ public:
     [[nodiscard]] const std::vector<GpuLightRecord>& lightRecordsCpu() const { return lightRecordCpu_; }
     [[nodiscard]] const OpacityMicromapCpuData& opacityMicromapData() const { return opacityMicromapData_; }
     [[nodiscard]] bool hasTransmissiveMaterials() const { return hasTransmissiveMaterials_; }
+
+    struct MemoryBreakdown {
+        VkDeviceSize totalBufferBytes = 0;
+        VkDeviceSize geometryBytes = 0;
+        VkDeviceSize softwareBvhBytes = 0;
+        VkDeviceSize lightBytes = 0;
+        VkDeviceSize parameterBytes = 0;
+    };
+
+    [[nodiscard]] MemoryBreakdown memoryBreakdown() const {
+        auto sizeOf = [](const std::unique_ptr<Buffer>& buffer) -> VkDeviceSize {
+            return buffer ? buffer->size() : 0;
+        };
+
+        MemoryBreakdown result{};
+        result.geometryBytes =
+            sizeOf(vertices_) +
+            sizeOf(indices_) +
+            sizeOf(materials_) +
+            sizeOf(spheres_) +
+            sizeOf(meshRecords_) +
+            sizeOf(primitiveRecords_) +
+            sizeOf(instanceRecords_) +
+            sizeOf(rtTriangleMaterialIds_) +
+            sizeOf(localVertices_) +
+            sizeOf(localIndices_) +
+            sizeOf(instanceBounds_);
+        result.softwareBvhBytes =
+            sizeOf(bvhNodes_) +
+            sizeOf(triangles_) +
+            sizeOf(localBvhNodes_) +
+            sizeOf(localTriangles_) +
+            sizeOf(tlasNodes_) +
+            sizeOf(tlasInstanceIndices_);
+        result.lightBytes =
+            sizeOf(lightRecords_) +
+            sizeOf(lightBvhNodes_) +
+            sizeOf(envRows_) +
+            sizeOf(envCols_);
+        result.parameterBytes =
+            sizeOf(meshParamsBuffer_) +
+            sizeOf(envParamsBuffer_);
+        result.totalBufferBytes =
+            result.geometryBytes +
+            result.softwareBvhBytes +
+            result.lightBytes +
+            result.parameterBytes;
+        return result;
+    }
 
     bool setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity);
     bool setSkyCdfDimensions(uint32_t width, uint32_t height);
@@ -346,8 +405,10 @@ private:
     SceneCachePolicy sceneCachePolicy_;
     uint32_t opacityMicromapSubdivisionLevel_ = kDefaultOpacityMicromapSubdivisionLevel;
     bool opacityMicromapsEnabled_ = true;
+    bool opacityMicromapBlendEnabled_ = false;
     uint32_t materialTextureMaxDimension_ = 0;
     uint32_t materialTextureSlotCapacity_ = 1;
+    bool compactImportedEmissiveTriangleSampling_ = false;
     std::unique_ptr<Buffer> vertices_;
     std::unique_ptr<Buffer> indices_;
     std::unique_ptr<Buffer> bvhNodes_;

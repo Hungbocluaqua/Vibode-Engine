@@ -2,7 +2,9 @@
 
 #include "rtv/EditorLayer.h"
 #include "rtv/Image.h"
+#include "rtv/NsightPerfMarkers.h"
 #include "rtv/NonCopyable.h"
+#include "rtv/RendererSettings.h"
 
 #include <Volk/volk.h>
 
@@ -28,7 +30,23 @@ class CameraController;
 class NotificationManager;
 class SceneDocument;
 class UndoStack;
+enum class AccumulationResetReason : uint32_t;
 struct SceneAsset;
+
+struct RendererOnlyRequests {
+    std::optional<RendererSettings> settings;
+    std::optional<AccumulationResetReason> resetAccumulation;
+    bool savePresentFrame = false;
+    bool saveDebugViews = false;
+    bool dumpProfileJson = false;
+    bool printCaptureReady = false;
+    std::optional<NsightPerfReportOptions> startNsightPerfReport;
+    bool cancelNsightPerfReport = false;
+    bool openNsightPerfReport = false;
+    bool runQuickExperimentMatrix = false;
+    std::optional<float> cameraMoveSpeed;
+    std::optional<float> cameraFastMoveSpeed;
+};
 
 class UiOverlay final : private NonCopyable {
 public:
@@ -73,6 +91,17 @@ public:
         float cpuFrameMs,
         NotificationManager* notifications,
         bool externalMouseCapture = false);
+    [[nodiscard]] RendererOnlyRequests buildRendererOnly(
+        PathTracerRenderer& renderer,
+        VkExtent2D extent,
+        const std::optional<std::filesystem::path>& gltfPath,
+        const std::optional<std::filesystem::path>& scenePath,
+        const std::optional<std::filesystem::path>& nativePackageScenePath,
+        CameraController* camera,
+        float cpuFrameMs,
+        bool captureReadyPrinted,
+        uint32_t captureReadyFrames,
+        uint32_t captureReadyAfterFrames);
     [[nodiscard]] EditorRequests buildProjectManager(
         const ProjectContext* project,
         const AssetRegistry* assetRegistry,
@@ -94,7 +123,7 @@ public:
     [[nodiscard]] bool wantsTextInput() const;
     [[nodiscard]] bool viewportInteractionActive() const;
     [[nodiscard]] bool viewportHovered() const;
-    [[nodiscard]] bool rendersPathTracerInViewport() const { return true; }
+    [[nodiscard]] bool rendersPathTracerInViewport() const { return rendersPathTracerInViewport_; }
     [[nodiscard]] VkExtent2D desiredRenderExtent(VkExtent2D fallback) const;
     void setRenderExtentOverride(std::optional<VkExtent2D> extent);
     void invalidateViewportTexture();
@@ -168,6 +197,13 @@ private:
     uint64_t uiFrameSerial_ = 0;
     uint64_t textureRetireFrameDelay_ = 4;
     bool frameBegun_ = false;
+    bool rendererOnlyViewportHovered_ = false;
+    bool rendererOnlyViewportActive_ = false;
+    bool rendererOnlyMode_ = false;
+    bool rendererOnlyNsightOutputInitialized_ = false;
+    std::array<char, 512> rendererOnlyNsightOutput_{};
+    int rendererOnlyNsightDelayFrames_ = 0;
+    bool rendersPathTracerInViewport_ = true;
 };
 
 } // namespace rtv

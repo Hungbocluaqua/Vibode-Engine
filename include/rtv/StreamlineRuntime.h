@@ -17,6 +17,7 @@ enum class StreamlineFeature : uint32_t {
     Reflex,
     Nis,
     Nrd,
+    NvPerf,
 };
 
 enum class StreamlineReflexMarker : uint32_t {
@@ -47,12 +48,14 @@ struct StreamlineStatus {
     std::string unavailableReason;
     std::vector<std::string> resolvedEntryPoints;
     std::vector<std::string> missingEntryPoints;
+    std::vector<std::string> logMessages;
     StreamlineFeatureStatus dlss;
     StreamlineFeatureStatus dlssRayReconstruction;
     StreamlineFeatureStatus dlssFrameGeneration;
     StreamlineFeatureStatus reflex;
     StreamlineFeatureStatus nis;
     StreamlineFeatureStatus nrd;
+    StreamlineFeatureStatus nvperf;
 };
 
 struct StreamlineInitDesc {
@@ -106,6 +109,7 @@ struct StreamlineConstantsDesc {
     bool cameraMotionIncluded = true;
     bool motionVectors3D = false;
     bool matricesValid = false;
+    bool nvPerfEnabled = false;
 };
 
 struct StreamlineResourceTagDesc {
@@ -187,6 +191,7 @@ public:
     bool setConstants(const StreamlineConstantsDesc& desc);
     bool setDlssOptions(const StreamlineDlssOptionsDesc& desc);
     bool setDlssRayReconstructionOptions(const StreamlineDlssRayReconstructionOptionsDesc& desc);
+    bool setNvPerfEnabled(bool enabled);
     bool tagResourceForFrame(const StreamlineResourceTagDesc& desc);
     bool evaluateFeature(StreamlineFeature feature, VkCommandBuffer commandBuffer);
     bool setReflexMarker(StreamlineReflexMarker marker);

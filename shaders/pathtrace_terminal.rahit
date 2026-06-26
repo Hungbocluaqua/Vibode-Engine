@@ -1,0 +1,58 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "rt_common.glsl"
+
+hitAttributeEXT vec2 attribs;
+layout(location = 2) rayPayloadInEXT TerminalRayPayload payload;
+
+void main() {
+    record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_INVOCATIONS);
+    record_rt_counter(RT_DIAG_TERMINAL_ANY_HIT_INVOCATIONS);
+    uint tlasRecordIndex = gl_InstanceCustomIndexEXT;
+    uint instanceIndex = scene_instance_index_from_tlas_record(tlasRecordIndex);
+    if (instanceIndex >= mesh_params.instance_count) {
+        ignoreIntersectionEXT;
+        return;
+    }
+    InstanceRecord instance = instance_records[instanceIndex];
+    uint meshIndex = instance.metadata.x;
+    MeshRecord mesh = mesh_records[meshIndex];
+    uint globalTriangleIndex = geometry_triangle_offset(
+        meshIndex, tlasRecordIndex, gl_GeometryIndexEXT, mesh.vertex_index_data.z) + gl_PrimitiveID;
+    uint triIndex = globalTriangleIndex * 3u;
+    LocalVertex v0 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex]);
+    LocalVertex v1 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex + 1u]);
+    LocalVertex v2 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex + 2u]);
+    vec3 p0 = v0.position_uv_x.xyz;
+    vec3 p1 = v1.position_uv_x.xyz;
+    vec3 p2 = v2.position_uv_x.xyz;
+    vec3 localGeomNormal = normalize(cross(p1 - p0, p2 - p0));
+    vec3 worldGeomNormal = normalize(mat3(instance.normal_transform) * localGeomNormal);
+    bool frontFace = dot(worldGeomNormal, gl_WorldRayDirectionEXT) < 0.0;
+    uint materialIndex = material_for_triangle_index(globalTriangleIndex);
+    MaterialRuntimeHeader header = decode_material_runtime_header(materialIndex);
+    record_rt_alpha_material_counter(materialIndex, RT_ALPHA_MATERIAL_COUNTER_TERMINAL_ANY_HIT);
+    record_rt_alpha_class_counter(
+        header.alpha_mode,
+        RT_DIAG_TERMINAL_ANY_HIT_OPAQUE,
+        RT_DIAG_TERMINAL_ANY_HIT_ALPHA_TESTED,
+        RT_DIAG_TERMINAL_ANY_HIT_BLENDED);
+    if (!frontFace && header.double_sided == 0u) {
+        ignoreIntersectionEXT;
+        return;
+    }
+    if (header.alpha_mode == ALPHA_MODE_OPAQUE) {
+        return;
+    }
+    Material material = decode_material(materialIndex);
+    vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    vec2 uv = vec2(
+        v0.position_uv_x.w * bary.x + v1.position_uv_x.w * bary.y + v2.position_uv_x.w * bary.z,
+        v0.normal_uv_y.w * bary.x + v1.normal_uv_y.w * bary.y + v2.normal_uv_y.w * bary.z);
+    vec2 uv1 = v0.texcoord1.xy * bary.x + v1.texcoord1.xy * bary.y + v2.texcoord1.xy * bary.z;
+    apply_material_alpha_texture(material, uv, uv1);
+    material.alpha_factor *= clamp((v0.color * bary.x + v1.color * bary.y + v2.color * bary.z).a, 0.0, 1.0);
+    if (!accept_material_alpha(material)) {
+        ignoreIntersectionEXT;
+    }
+}

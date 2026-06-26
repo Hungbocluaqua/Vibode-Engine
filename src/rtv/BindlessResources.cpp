@@ -237,6 +237,19 @@ VkImageView BindlessTextureTable::imageView(uint32_t index) const {
     return images_[index]->view();
 }
 
+BindlessTextureImageInfo BindlessTextureTable::imageInfo(uint32_t index) const {
+    if (index >= images_.size() || images_[index] == nullptr) {
+        return {};
+    }
+    const Image& image = *images_[index];
+    return {
+        .width = image.width(),
+        .height = image.height(),
+        .mipLevels = image.mipLevels(),
+        .format = image.format(),
+    };
+}
+
 void BindlessMaterialTable::init(uint32_t maxMaterials, Buffer& gpuBuffer) {
     gpuBuffer_ = &gpuBuffer;
     allocator_ = FreeListAllocator<uint32_t>(maxMaterials);

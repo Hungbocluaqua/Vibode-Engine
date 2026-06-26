@@ -65,11 +65,18 @@ class ResourceDemo;
 class PipelineDemo;
 class PathTracerRenderer;
 class Swapchain;
+struct RendererOnlyRequests;
 struct NativeRuntimeLoadReport;
 class UiOverlay;
 class UploadContext;
 class VulkanContext;
 struct NativeRuntimeLoadReport;
+
+enum class ApplicationMode : uint8_t {
+    Editor,
+    RendererOnly,
+    Headless,
+};
 
 struct NativePackageAnimationSelection {
     std::string controllerGuid;
@@ -92,11 +99,14 @@ public:
         std::optional<RenderPreset> renderPresetOverride = std::nullopt,
         std::optional<bool> restirGiOverride = std::nullopt,
         std::optional<bool> opacityMicromapOverride = std::nullopt,
+        std::optional<bool> opacityMicromapBlendOverride = std::nullopt,
+        std::optional<bool> hardwareBackfaceCullingOverride = std::nullopt,
         std::optional<uint32_t> opacityMicromapSubdivisionOverride = std::nullopt,
         bool debugViewOverride = false,
         bool validationCameraMotion = false,
         bool validationObjectMotion = false,
         bool headless = false,
+        ApplicationMode mode = ApplicationMode::Editor,
         uint32_t headlessWidth = 1280,
         uint32_t headlessHeight = 720,
         bool disableAsyncCompute = false,
@@ -105,7 +115,7 @@ public:
         StreamingRuntimeOptions streamingOptions = {});
     ~Application();
 
-    void run(uint32_t maxFrames = 0);
+    void run(uint32_t maxFrames = 0, uint32_t warmupFrames = 0, bool collectProfile = false);
     void runHeadless(uint32_t warmupFrames, uint32_t totalFrames);
     void renderFrames(uint32_t count);
     [[nodiscard]] bool runDescriptorLifetimeStress(
@@ -116,6 +126,16 @@ public:
     void setFrameCaptureCallbacks(std::function<void(uint32_t)> begin, std::function<void(uint32_t)> end);
     void resetAccumulation();
     void applyDebugView(RendererDebugView view);
+    void configureCaptureReady(uint32_t afterFrames, bool log);
+    void setRendererOnlyLingerAfterCaptureReadyMs(uint32_t milliseconds);
+    void setCaptureReadyFilePath(std::optional<std::filesystem::path> path);
+    void setSavePresentFramePath(std::optional<std::filesystem::path> path);
+    void setSavePresentFrameOnHotkeyPath(std::optional<std::filesystem::path> path);
+    bool savePresentFrame(const std::filesystem::path& path);
+    void dumpRendererOnlyProfileJson(const std::filesystem::path& path);
+    void exportRendererOnlyDebugViews(const std::filesystem::path& dir);
+    void printCaptureReadyMarker();
+    [[nodiscard]] nlohmann::json textureDiagnosticsJson() const;
     [[nodiscard]] bool applyNamedCamera(std::string_view cameraName);
     void onWindowFocusChanged(bool focused);
     void onFilesDropped(int count, const char** paths);
@@ -618,6 +638,9 @@ private:
     void applyActiveSceneCamera();
     void syncActiveSceneCameraFromController();
     void rebuildGpuSceneAsset();
+    void processRendererOnlyRequests(const RendererOnlyRequests& requests);
+    void updateCaptureReadyState(uint32_t frameNumber);
+    [[nodiscard]] std::string activeCaptureSceneName() const;
     [[nodiscard]] bool rebuildRendererAfterNativePackageUnload(bool affectedActiveRenderer, nlohmann::json& report);
     void initializeFallbackSceneDocument();
     void initializeProjectManagerStartupSceneDocument();
@@ -625,12 +648,29 @@ private:
     [[nodiscard]] bool pressedOnce(int key);
 
     GLFWwindow* window_ = nullptr;
+    ApplicationMode mode_ = ApplicationMode::Editor;
     bool mainWindowHiddenUntilRenderer_ = false;
     bool headless_ = false;
+    bool rendererOnly_ = false;
     VkExtent2D headlessExtent_{1280, 720};
+    uint32_t captureReadyAfterFrames_ = 60;
+    bool captureReadyLog_ = false;
+    bool captureReadyPrinted_ = false;
+    uint32_t captureReadyRenderedFrames_ = 0;
+    uint64_t captureReadyFrameSerial_ = 0;
+    uint32_t rendererOnlyLingerAfterCaptureReadyMs_ = 0;
+    std::chrono::steady_clock::time_point captureReadyPrintedAt_{};
+    std::optional<std::filesystem::path> captureReadyFilePath_;
+    uint64_t captureReadyImageUploadCount_ = 0;
+    bool captureReadyUploadSnapshotValid_ = false;
+    std::optional<std::filesystem::path> savePresentFramePath_;
+    std::optional<std::filesystem::path> savePresentFrameOnHotkeyPath_;
+    bool savePresentFrameHotkeyDown_ = false;
+    bool initialPresentFrameSaveComplete_ = false;
     uint32_t nextDiagnosticFrameIndex_ = 0;
     uint32_t warmupFrameCount_ = 0;
     uint32_t totalFrameCount_ = 0;
+    bool interactiveProfileCollectionEnabled_ = false;
     std::vector<float> cpuFrameTimings_;
     std::vector<float> gpuFrameTimings_;
     std::vector<GpuFrameTimings> perFrameGpuTimings_;
@@ -653,6 +693,8 @@ private:
     std::optional<RenderPreset> renderPresetOverride_;
     std::optional<bool> restirGiOverride_;
     std::optional<bool> opacityMicromapOverride_;
+    std::optional<bool> opacityMicromapBlendOverride_;
+    std::optional<bool> hardwareBackfaceCullingOverride_;
     std::optional<uint32_t> opacityMicromapSubdivisionOverride_;
     bool debugViewOverride_ = false;
     bool validationCameraMotion_ = false;
@@ -666,6 +708,7 @@ private:
     NativeAssetCatalog nativeAssetCatalog_;
     NativeGpuAssetCache nativeGpuAssetCache_;
     NativeGpuAssetEvictionResult lastStreamingEviction_{};
+    std::deque<std::pair<uint64_t, NativeGpuAssetEvictionResult>> streamingEvictionHistory_;
     StreamingGpuWorkQueue streamingGpuWorkQueue_;
     StreamingGpuTransferExecutor streamingGpuTransferExecutor_;
     StreamingAsyncComputeBudgeter streamingAsyncComputeBudgeter_;

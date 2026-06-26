@@ -627,7 +627,13 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.pathTracingEnabled = render.pathTracingEnabled;
     result.rendererSettings.cameraJitterEnabled = render.cameraJitterEnabled;
     result.rendererSettings.directLightingEnabled = render.directLightingEnabled;
+    result.rendererSettings.secondaryDirectLightingEnabled = render.secondaryDirectLightingEnabled;
     result.rendererSettings.maxBounces = render.maxBounces;
+    result.rendererSettings.pathTraceKernelMode = render.pathTraceKernelMode;
+    result.rendererSettings.finalBounceFastPathEnabled = render.finalBounceFastPathEnabled;
+    result.rendererSettings.native2BTerminalDirectSampleProbability = render.native2BTerminalDirectSampleProbability;
+    result.rendererSettings.blendedDecalShadowMode = render.blendedDecalShadowMode;
+    result.rendererSettings.native2BDirectReuseMode = render.native2BDirectReuseMode;
     result.rendererSettings.environmentDirectSamples = render.environmentDirectSamples;
     result.rendererSettings.toneMapper = render.toneMapper;
     result.rendererSettings.exposure = render.exposure;
@@ -668,6 +674,7 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.dlssFrameGenerationEnabled = render.dlssFrameGenerationEnabled;
     result.rendererSettings.dlssRayReconstructionEnabled = render.dlssRayReconstructionEnabled;
     result.rendererSettings.streamlineReflexEnabled = render.streamlineReflexEnabled;
+    result.rendererSettings.streamlineNvPerfEnabled = render.streamlineNvPerfEnabled;
     result.rendererSettings.dlssSharpeningStrength = render.dlssSharpeningStrength;
     result.rendererSettings.taaFeedback = render.taaFeedback;
     result.rendererSettings.taaMotionFeedback = render.taaMotionFeedback;
@@ -692,6 +699,7 @@ SceneGpuBuildResult SceneToGpuSceneBuilder::build(
     result.rendererSettings.materialTextureAnisotropy = render.materialTextureAnisotropy;
     result.rendererSettings.specularAaEnabled = render.specularAaEnabled;
     result.rendererSettings.opacityMicromapsEnabled = render.opacityMicromapsEnabled;
+    result.rendererSettings.compactImportedEmissiveTriangleSampling = render.compactImportedEmissiveTriangleSampling;
     result.rendererSettings.usePhysicalCamera = render.usePhysicalCamera;
     result.rendererSettings.physicalAperture = render.physicalAperture;
     result.rendererSettings.physicalShutterSeconds = render.physicalShutterSeconds;

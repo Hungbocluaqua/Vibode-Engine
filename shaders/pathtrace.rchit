@@ -7,7 +7,9 @@ layout(location = 0) rayPayloadInEXT RayPayload payload;
 
 void main() {
     record_rt_counter(RT_DIAG_CLOSEST_HIT_INVOCATIONS);
-    uint instanceIndex = gl_InstanceCustomIndexEXT;
+    record_rt_counter(RT_DIAG_CLOSEST_HIT_PRIMARY);
+    uint tlasRecordIndex = gl_InstanceCustomIndexEXT;
+    uint instanceIndex = scene_instance_index_from_tlas_record(tlasRecordIndex);
     if (instanceIndex >= mesh_params.instance_count) {
         payload.hit = 1u;
         payload.t = gl_HitTEXT;
@@ -27,7 +29,7 @@ void main() {
     uint meshIndex = instance.metadata.x;
     MeshRecord mesh = mesh_records[meshIndex];
     uint firstIndex = mesh.vertex_index_data.z;
-    uint globalTriangleIndex = geometry_triangle_offset(meshIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
+    uint globalTriangleIndex = geometry_triangle_offset(meshIndex, tlasRecordIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
     uint triIndex = globalTriangleIndex * 3u;
     uint i0 = local_mesh_indices[triIndex + 0u];
     uint i1 = local_mesh_indices[triIndex + 1u];
@@ -62,9 +64,10 @@ void main() {
     vec4 vertexColor = clamp(v0.color * bary.x + v1.color * bary.y + v2.color * bary.z, vec4(0.0), vec4(1.0));
 
     uint materialIndex = material_for_triangle_index(globalTriangleIndex);
-    Material materialForDiagnostics = decode_material(materialIndex);
-    if (materialForDiagnostics.alpha_mode != ALPHA_MODE_OPAQUE) {
+    MaterialRuntimeHeader materialHeader = decode_material_runtime_header(materialIndex);
+    if (materialHeader.alpha_mode != ALPHA_MODE_OPAQUE) {
         record_rt_counter(RT_DIAG_CLOSEST_HIT_ALPHA_MATERIAL);
+        record_rt_alpha_material_counter(materialIndex, RT_ALPHA_MATERIAL_COUNTER_CLOSEST_HIT);
     }
 
     vec3 localPos = p0 * bary.x + p1 * bary.y + p2 * bary.z;

@@ -76,6 +76,35 @@ ivec2 blue_noise_offset(ivec2 coords, uint roundIndex) {
     return offset;
 }
 
+bool restir_di_spatial_reservoir_compatible(
+    RestirDiReservoir center,
+    RestirDiReservoir candidate,
+    float shiftedPdf,
+    float shiftedTarget) {
+    if (!restir_di_reservoir_valid(candidate)) {
+        return false;
+    }
+    if (!restir_di_reservoir_valid(center)) {
+        return true;
+    }
+    if (restir_di_light_kind(center) != restir_di_light_kind(candidate)) {
+        return false;
+    }
+    uint centerVisibility = restir_di_visibility(center);
+    uint candidateVisibility = restir_di_visibility(candidate);
+    if (centerVisibility == RESTIR_DI_VISIBILITY_INVALID ||
+        candidateVisibility == RESTIR_DI_VISIBILITY_INVALID ||
+        candidateVisibility == RESTIR_DI_VISIBILITY_OCCLUDED) {
+        return false;
+    }
+
+    float centerPdf = restir_di_source_pdf(center);
+    float pdfRatio = min(centerPdf, shiftedPdf) / max(centerPdf, shiftedPdf);
+    float centerTarget = max(restir_di_target(center), 1.0e-5);
+    float targetRatio = min(centerTarget, shiftedTarget) / max(centerTarget, shiftedTarget);
+    return pdfRatio > 0.20 && targetRatio > 0.05;
+}
+
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
@@ -187,6 +216,13 @@ void main() {
 
         vec3 centerNormal = normalize(centerReceiver.normal_roughness.xyz);
 
+        float targetAtCenter = restir_di_target_function(candidateRadiance);
+        if (!restir_di_spatial_reservoir_compatible(merged, candidate, shiftedPdf, targetAtCenter)) {
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_TARGET_REJECTED], 1u);
+            mergedMFloat += candidateM;
+            continue;
+        }
+
         // Visibility check in ReferenceValidation mode
         bool visibilityChecked = false;
         if (params.visibilityPolicy == 1u && roundIndex < params.visibilityRayBudget &&
@@ -207,8 +243,6 @@ void main() {
                 continue;
             }
         }
-
-        float targetAtCenter = restir_di_target_function(candidateRadiance);
 
         if (targetAtCenter <= 1.0e-6) {
             DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_TARGET_REJECTED], 1u);

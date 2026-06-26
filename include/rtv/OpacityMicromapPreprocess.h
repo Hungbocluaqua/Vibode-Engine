@@ -40,6 +40,8 @@ struct OpacityMicromapPreprocessStats {
     uint32_t subdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel;
     uint32_t eligiblePrimitiveCount = 0;
     uint32_t generatedPrimitiveCount = 0;
+    uint32_t alphaTestedPrimitiveCount = 0;
+    uint32_t blendedPrimitiveCount = 0;
     uint32_t alphaTexturePrimitiveCount = 0;
     uint32_t constantAlphaPrimitiveCount = 0;
     uint32_t cacheEntryCount = 0;
@@ -65,11 +67,13 @@ struct OpacityMicromapCpuData {
 [[nodiscard]] OpacityMicromapCpuData generateOpacityMicromapData(
     const SceneAsset& scene,
     const AssetManager& assets,
-    uint32_t subdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel);
+    uint32_t subdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel,
+    bool includeBlendedPrimitives = false);
 
 [[nodiscard]] OpacityMicromapCpuData generateOpacityMicromapData(
     const CachedScene& cached,
-    uint32_t subdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel);
+    uint32_t subdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel,
+    bool includeBlendedPrimitives = false);
 
 bool writeOpacityMicromapDebugImages(const OpacityMicromapCpuData& data, const std::filesystem::path& directory);
 

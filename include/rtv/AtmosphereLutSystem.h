@@ -59,6 +59,7 @@ public:
     [[nodiscard]] VkSampler sampler() const { return sampler_; }
     [[nodiscard]] bool transmittanceReady() const { return transmittanceReady_; }
     [[nodiscard]] bool skyViewReady() const { return skyViewReady_; }
+    [[nodiscard]] bool hasPendingWork() const;
     [[nodiscard]] AtmosphereLutStats stats() const { return stats_; }
     [[nodiscard]] const AtmosphereSamplingSystem* samplingSystem() const { return samplingSystem_.get(); }
 

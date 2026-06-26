@@ -150,9 +150,14 @@ vec3 sharpen_resolved_color(vec3 center, vec3 up, vec3 down, vec3 left, vec3 rig
     return clamp(sharpened, lo, hi);
 }
 
+vec3 sample_current_display_color(ivec2 coords, ivec2 displayDims) {
+    vec2 uv = (vec2(coords) + vec2(0.5)) / vec2(displayDims);
+    return texture(sampler2D(input_color, input_sampler), uv).rgb;
+}
+
 vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out float sharpenAmount) {
     vec2 uv = (vec2(coords) + vec2(0.5)) / vec2(displayDims);
-    vec3 current = texture(sampler2D(input_color, input_sampler), uv).rgb;
+    vec3 current = sample_current_display_color(coords, displayDims);
     ivec2 renderCoords = clamp(ivec2(floor(uv * vec2(renderDims))), ivec2(0), renderDims - ivec2(1));
     uint pixel_index = uint(renderCoords.y) * uint(renderDims.x) + uint(renderCoords.x);
     uint instance_id = entity_id_buffer[pixel_index];
@@ -227,11 +232,10 @@ void main() {
     float sharpenAmount = 0.0;
     vec3 output_value = resolve_taa_pixel(coords, displayDims, renderDims, sharpenAmount);
     if (params.enabled != 0u && params.reset_history == 0u && sharpenAmount > 0.0) {
-        float ignored = 0.0;
-        vec3 up = resolve_taa_pixel(clamp(coords + ivec2(0, 1), ivec2(0), displayDims - ivec2(1)), displayDims, renderDims, ignored);
-        vec3 down = resolve_taa_pixel(clamp(coords + ivec2(0, -1), ivec2(0), displayDims - ivec2(1)), displayDims, renderDims, ignored);
-        vec3 left = resolve_taa_pixel(clamp(coords + ivec2(-1, 0), ivec2(0), displayDims - ivec2(1)), displayDims, renderDims, ignored);
-        vec3 right = resolve_taa_pixel(clamp(coords + ivec2(1, 0), ivec2(0), displayDims - ivec2(1)), displayDims, renderDims, ignored);
+        vec3 up = sample_current_display_color(clamp(coords + ivec2(0, 1), ivec2(0), displayDims - ivec2(1)), displayDims);
+        vec3 down = sample_current_display_color(clamp(coords + ivec2(0, -1), ivec2(0), displayDims - ivec2(1)), displayDims);
+        vec3 left = sample_current_display_color(clamp(coords + ivec2(-1, 0), ivec2(0), displayDims - ivec2(1)), displayDims);
+        vec3 right = sample_current_display_color(clamp(coords + ivec2(1, 0), ivec2(0), displayDims - ivec2(1)), displayDims);
         output_value = sharpen_resolved_color(output_value, up, down, left, right, sharpenAmount);
     }
 

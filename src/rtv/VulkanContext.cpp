@@ -285,6 +285,9 @@ void VulkanContext::createInstance(GLFWwindow* window) {
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
     const auto extensions = requiredInstanceExtensions(window);
+    debugUtilsExtensionEnabled_ = std::any_of(extensions.begin(), extensions.end(), [](const char* extension) {
+        return std::strcmp(extension, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
+    });
     const auto debugInfo = debugMessengerCreateInfo();
 
     VkInstanceCreateInfo createInfo{};
@@ -690,8 +693,8 @@ std::vector<const char*> VulkanContext::requiredInstanceExtensions(GLFWwindow* w
     std::vector<const char*> extensions;
     const std::vector<VkExtensionProperties> availableExtensions = availableInstanceExtensions();
     if (headless_) {
-        if (validationRequested()) {
-            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        if (extensionAvailable(availableExtensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+            appendUniqueExtension(extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         }
         if (streamlineVulkanRequirements_.initialized) {
             for (const std::string& extension : streamlineVulkanRequirements_.instanceExtensions) {
@@ -713,8 +716,8 @@ std::vector<const char*> VulkanContext::requiredInstanceExtensions(GLFWwindow* w
     }
 
     extensions.assign(glfwExtensions, glfwExtensions + glfwExtensionCount);
-    if (validationRequested()) {
-        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (extensionAvailable(availableExtensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+        appendUniqueExtension(extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
     if (streamlineVulkanRequirements_.initialized) {
         for (const std::string& extension : streamlineVulkanRequirements_.instanceExtensions) {

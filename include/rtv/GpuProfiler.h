@@ -225,11 +225,13 @@ public:
 
     void collectCompletedFrame();
     void resetForFrame(VkCommandBuffer commandBuffer);
-    void write(VkCommandBuffer commandBuffer, Query query, VkPipelineStageFlagBits2 stage) const;
+    void write(VkCommandBuffer commandBuffer, Query query, VkPipelineStageFlagBits2 stage);
     void beginPipelineStats(VkCommandBuffer commandBuffer) const;
     void endPipelineStats(VkCommandBuffer commandBuffer) const;
     void markSubmitted() { submitted_ = true; }
     void markStatsSubmitted() { statsSubmitted_ = true; }
+    void setGpuMarkersEnabled(bool enabled);
+    [[nodiscard]] bool gpuMarkersEnabled() const { return gpuMarkersEnabled_; }
 
     [[nodiscard]] const GpuFrameTimings& timings() const { return timings_; }
     [[nodiscard]] const GpuPipelineStatistics& pipelineStats() const { return pipelineStats_; }
@@ -241,6 +243,8 @@ private:
     float timestampPeriod_ = 1.0f;
     bool submitted_ = false;
     bool statsSubmitted_ = false;
+    bool gpuMarkersEnabled_ = true;
+    std::array<bool, Count> activeQueries_{};
     GpuFrameTimings timings_{};
     GpuPipelineStatistics pipelineStats_{};
     GpuPipelineStatistics smoothedPipelineStats_{};

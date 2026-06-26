@@ -59,7 +59,42 @@ set(RENDERDOC_SDK_DIR "" CACHE PATH "Path to RenderDoc SDK directory")
 set(NRD_SDK_DIR "" CACHE PATH "Path to NVIDIA Real-Time Denoisers SDK/source checkout")
 set(DLSS_SDK_DIR "" CACHE PATH "Path to NVIDIA DLSS/NGX SDK directory")
 set(STREAMLINE_SDK_DIR "" CACHE PATH "Path to NVIDIA Streamline SDK/release directory")
+option(STREAMLINE_PREFER_DEVELOPMENT_RUNTIME "Prefer Streamline's development runtime when available; required by NvPerf's sl.imgui dependency in current SDKs." ON)
 set(DIRECTSTORAGE_SDK_DIR "" CACHE PATH "Path to Microsoft DirectStorage SDK package root")
+set(NVTX3_INCLUDE_DIR "" CACHE PATH "Path containing nvtx3/nvToolsExt.h")
+set(NSIGHT_GRAPHICS_SDK_DIR "" CACHE PATH "Path to NVIDIA Nsight Graphics SDK")
+set(NSIGHT_AFTERMATH_SDK_DIR "" CACHE PATH "Path to NVIDIA Nsight Aftermath SDK")
+set(NSIGHT_PERF_SDK_DIR "" CACHE PATH "Path to NVIDIA Nsight Perf SDK")
+
+if(NVTX3_INCLUDE_DIR STREQUAL "" AND WIN32)
+    file(GLOB NVTX3_CANDIDATES LIST_DIRECTORIES true
+        "$ENV{ProgramFiles}/NVIDIA Corporation/Nsight Graphics */target/Resources/NVTX3/include"
+        "$ENV{ProgramFiles}/NVIDIA Corporation/Nsight Systems */target-windows-x64/nvtx/include")
+    list(SORT NVTX3_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+    foreach(CANDIDATE ${NVTX3_CANDIDATES})
+        if(EXISTS "${CANDIDATE}/nvtx3/nvToolsExt.h")
+            set(NVTX3_INCLUDE_DIR "${CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(WIN32 AND NSIGHT_GRAPHICS_SDK_DIR STREQUAL "")
+    file(GLOB NSIGHT_GRAPHICS_SDK_CANDIDATES LIST_DIRECTORIES true
+        "$ENV{ProgramFiles}/NVIDIA Corporation/Nsight Graphics */SDKs/NsightGraphicsSDK/*")
+    list(SORT NSIGHT_GRAPHICS_SDK_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+    if(NSIGHT_GRAPHICS_SDK_CANDIDATES)
+        list(GET NSIGHT_GRAPHICS_SDK_CANDIDATES 0 NSIGHT_GRAPHICS_SDK_DIR)
+    endif()
+endif()
+if(WIN32 AND NSIGHT_AFTERMATH_SDK_DIR STREQUAL "")
+    file(GLOB NSIGHT_AFTERMATH_SDK_CANDIDATES LIST_DIRECTORIES true
+        "$ENV{ProgramFiles}/NVIDIA Corporation/Nsight Graphics */SDKs/NsightAftermathSDK/*")
+    list(SORT NSIGHT_AFTERMATH_SDK_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+    if(NSIGHT_AFTERMATH_SDK_CANDIDATES)
+        list(GET NSIGHT_AFTERMATH_SDK_CANDIDATES 0 NSIGHT_AFTERMATH_SDK_DIR)
+    endif()
+endif()
 
 if(NOT DEFINED ENV{VULKAN_SDK})
     message(FATAL_ERROR "VULKAN_SDK is not set. Install the Vulkan SDK and open a new terminal.")
@@ -143,6 +178,7 @@ add_executable(rtvulkan
     src/rtv/FrameResources.cpp
     src/rtv/GltfLoader.cpp
     src/rtv/GpuDiagnosticsPanel.cpp
+    src/rtv/GpuCrashDiagnostics.cpp
     src/rtv/GeometryPagingManager.cpp
     src/rtv/GpuProfiler.cpp
     src/rtv/GpuScene.cpp
@@ -171,6 +207,10 @@ add_executable(rtvulkan
     src/rtv/NativeAssetCooker.cpp
     src/rtv/NativeTextureFormatPolicy.cpp
     src/rtv/NotificationManager.cpp
+    src/rtv/NsightMarkers.cpp
+    src/rtv/NsightPerfMarkers.cpp
+    src/rtv/NsightGraphicsRuntime.cpp
+    src/rtv/NsightPerfDiagnostics.cpp
     src/rtv/OpacityMicromapPreprocess.cpp
     src/rtv/ParallelBvhBuilder.cpp
     src/rtv/PathTracerRenderer.cpp
@@ -234,6 +274,34 @@ add_executable(rtvulkan
 )
 
 target_include_directories(rtvulkan PRIVATE include ${Stb_INCLUDE_DIR} ${TINYGLTF_INCLUDE_DIRS} "${IMGUI_SOURCE_DIR}" "${IMGUI_SOURCE_DIR}/backends")
+if(NOT NVTX3_INCLUDE_DIR STREQUAL "" AND EXISTS "${NVTX3_INCLUDE_DIR}/nvtx3/nvToolsExt.h")
+    target_include_directories(rtvulkan PRIVATE "${NVTX3_INCLUDE_DIR}")
+    target_compile_definitions(rtvulkan PRIVATE RTV_HAS_NVTX=1)
+    message(STATUS "NVTX3 renderer markers: enabled (${NVTX3_INCLUDE_DIR})")
+else()
+    message(STATUS "NVTX3 renderer markers: unavailable (set NVTX3_INCLUDE_DIR to enable)")
+endif()
+if(NOT NSIGHT_GRAPHICS_SDK_DIR STREQUAL "" AND EXISTS "${NSIGHT_GRAPHICS_SDK_DIR}/include/NGFX_Vulkan.h")
+    target_include_directories(rtvulkan PRIVATE "${NSIGHT_GRAPHICS_SDK_DIR}/include")
+    target_compile_definitions(rtvulkan PRIVATE RTV_HAS_NSIGHT_GRAPHICS_SDK=1)
+    message(STATUS "Nsight Graphics SDK frame boundaries: enabled (${NSIGHT_GRAPHICS_SDK_DIR})")
+else()
+    message(STATUS "Nsight Graphics SDK frame boundaries: unavailable")
+endif()
+if(NOT NSIGHT_AFTERMATH_SDK_DIR STREQUAL "" AND
+   EXISTS "${NSIGHT_AFTERMATH_SDK_DIR}/include/GFSDK_Aftermath_GpuCrashDump.h" AND
+   EXISTS "${NSIGHT_AFTERMATH_SDK_DIR}/lib/x64/GFSDK_Aftermath_Lib.x64.lib")
+    target_include_directories(rtvulkan PRIVATE "${NSIGHT_AFTERMATH_SDK_DIR}/include")
+    target_link_libraries(rtvulkan PRIVATE "${NSIGHT_AFTERMATH_SDK_DIR}/lib/x64/GFSDK_Aftermath_Lib.x64.lib")
+    target_compile_definitions(rtvulkan PRIVATE RTV_HAS_NSIGHT_AFTERMATH=1)
+    add_custom_command(TARGET rtvulkan POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${NSIGHT_AFTERMATH_SDK_DIR}/lib/x64/GFSDK_Aftermath_Lib.x64.dll"
+            "$<TARGET_FILE_DIR:rtvulkan>/GFSDK_Aftermath_Lib.x64.dll")
+    message(STATUS "Nsight Aftermath GPU crash dumps: enabled (${NSIGHT_AFTERMATH_SDK_DIR})")
+else()
+    message(STATUS "Nsight Aftermath GPU crash dumps: unavailable")
+endif()
 target_include_directories(rtvulkan PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyexr"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyexr/deps/miniz")
@@ -371,12 +439,14 @@ set(RTV_STREAMLINE_RUNTIME_DLL "")
 set(RTV_STREAMLINE_IMPORT_LIB "")
 set(RTV_STREAMLINE_FEATURE_DLLS "")
 set(RTV_STREAMLINE_MISSING_OPTIONAL_PLUGINS "")
+set(RTV_STREAMLINE_NVPERF_INCLUDE_DIR "")
 set(RTV_STREAMLINE_HAS_DLSS OFF)
 set(RTV_STREAMLINE_HAS_DLSS_RR OFF)
 set(RTV_STREAMLINE_HAS_DLSS_FG OFF)
 set(RTV_STREAMLINE_HAS_REFLEX OFF)
 set(RTV_STREAMLINE_HAS_NIS OFF)
 set(RTV_STREAMLINE_HAS_NRD OFF)
+set(RTV_STREAMLINE_HAS_NVPERF OFF)
 if(NOT STREAMLINE_SDK_DIR STREQUAL "")
     foreach(CANDIDATE IN ITEMS
         "${STREAMLINE_SDK_DIR}/include"
@@ -387,11 +457,18 @@ if(NOT STREAMLINE_SDK_DIR STREQUAL "")
         endif()
     endforeach()
 
-    foreach(CANDIDATE IN ITEMS
+    set(RTV_STREAMLINE_RUNTIME_CANDIDATES "")
+    if(STREAMLINE_PREFER_DEVELOPMENT_RUNTIME)
+        list(APPEND RTV_STREAMLINE_RUNTIME_CANDIDATES
+            "${STREAMLINE_SDK_DIR}/bin/x64/development"
+            "${STREAMLINE_SDK_DIR}/bin/development")
+    endif()
+    list(APPEND RTV_STREAMLINE_RUNTIME_CANDIDATES
         "${STREAMLINE_SDK_DIR}/bin/x64"
         "${STREAMLINE_SDK_DIR}/bin"
         "${STREAMLINE_SDK_DIR}/lib/x64"
         "${STREAMLINE_SDK_DIR}/lib/Windows_x86_64")
+    foreach(CANDIDATE IN LISTS RTV_STREAMLINE_RUNTIME_CANDIDATES)
         if(EXISTS "${CANDIDATE}/sl.interposer.dll")
             set(RTV_STREAMLINE_RUNTIME_DIR "${CANDIDATE}")
             set(RTV_STREAMLINE_RUNTIME_DLL "${CANDIDATE}/sl.interposer.dll")
@@ -409,7 +486,7 @@ if(NOT STREAMLINE_SDK_DIR STREQUAL "")
         endif()
     endforeach()
 
-    foreach(PLUGIN IN ITEMS sl.dlss.dll sl.dlss_d.dll sl.dlss_g.dll sl.reflex.dll sl.nis.dll sl.nrd.dll sl.common.dll)
+    foreach(PLUGIN IN ITEMS sl.dlss.dll sl.dlss_d.dll sl.dlss_g.dll sl.reflex.dll sl.nis.dll sl.nrd.dll sl.nvperf.dll sl.imgui.dll sl.common.dll)
         if(NOT RTV_STREAMLINE_RUNTIME_DIR STREQUAL "" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/${PLUGIN}")
             list(APPEND RTV_STREAMLINE_FEATURE_DLLS "${RTV_STREAMLINE_RUNTIME_DIR}/${PLUGIN}")
         else()
@@ -423,6 +500,7 @@ if(NOT STREAMLINE_SDK_DIR STREQUAL "")
     set(RTV_STREAMLINE_HAS_REFLEX OFF)
     set(RTV_STREAMLINE_HAS_NIS OFF)
     set(RTV_STREAMLINE_HAS_NRD OFF)
+    set(RTV_STREAMLINE_HAS_NVPERF OFF)
     if(NOT RTV_STREAMLINE_INCLUDE_DIR STREQUAL "" AND NOT RTV_STREAMLINE_RUNTIME_DIR STREQUAL "")
         if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_dlss.h" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.dlss.dll")
             set(RTV_STREAMLINE_HAS_DLSS ON)
@@ -441,6 +519,14 @@ if(NOT STREAMLINE_SDK_DIR STREQUAL "")
         endif()
         if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_nrd.h" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.nrd.dll")
             set(RTV_STREAMLINE_HAS_NRD ON)
+        endif()
+        if(EXISTS "${RTV_STREAMLINE_INCLUDE_DIR}/sl_nvperf.h")
+            set(RTV_STREAMLINE_NVPERF_INCLUDE_DIR "${RTV_STREAMLINE_INCLUDE_DIR}")
+        elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Streamline/include/sl_nvperf.h")
+            set(RTV_STREAMLINE_NVPERF_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Streamline/include")
+        endif()
+        if(NOT RTV_STREAMLINE_NVPERF_INCLUDE_DIR STREQUAL "" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.nvperf.dll" AND EXISTS "${RTV_STREAMLINE_RUNTIME_DIR}/sl.imgui.dll")
+            set(RTV_STREAMLINE_HAS_NVPERF ON)
         endif()
     endif()
 
@@ -465,6 +551,10 @@ if(NOT STREAMLINE_SDK_DIR STREQUAL "")
         if(RTV_STREAMLINE_HAS_NRD)
             target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_HAS_NRD=1)
         endif()
+        if(RTV_STREAMLINE_HAS_NVPERF)
+            target_compile_definitions(rtvulkan PRIVATE RTV_STREAMLINE_HAS_NVPERF=1)
+            target_include_directories(rtvulkan PRIVATE "${RTV_STREAMLINE_NVPERF_INCLUDE_DIR}")
+        endif()
     endif()
 
     if(NOT RTV_STREAMLINE_RUNTIME_DLL STREQUAL "")
@@ -485,15 +575,89 @@ if(NOT STREAMLINE_SDK_DIR STREQUAL "")
     endif()
 endif()
 
+set(RTV_NSIGHT_PERF_INCLUDE_DIR "")
+set(RTV_NSIGHT_PERF_UTILITY_INCLUDE_DIR "")
+set(RTV_NSIGHT_PERF_BIN_DIR "")
+set(RTV_NSIGHT_PERF_RUNTIME_DLL "")
+set(RTV_NSIGHT_PERF_IMPORT_LIB "")
+if(WIN32 AND NSIGHT_PERF_SDK_DIR STREQUAL "")
+    file(GLOB RTV_NSIGHT_PERF_SDK_CANDIDATES LIST_DIRECTORIES true
+        "$ENV{USERPROFILE}/Downloads/Compressed/NVIDIA_Nsight_Perf_SDK*_Windows"
+        "$ENV{USERPROFILE}/Downloads/NVIDIA_Nsight_Perf_SDK*_Windows")
+    if(RTV_NSIGHT_PERF_SDK_CANDIDATES)
+        list(SORT RTV_NSIGHT_PERF_SDK_CANDIDATES)
+        list(GET RTV_NSIGHT_PERF_SDK_CANDIDATES -1 RTV_NSIGHT_PERF_SDK_AUTO)
+        set(NSIGHT_PERF_SDK_DIR "${RTV_NSIGHT_PERF_SDK_AUTO}" CACHE PATH "Path to NVIDIA Nsight Perf SDK" FORCE)
+    endif()
+endif()
+if(NOT NSIGHT_PERF_SDK_DIR STREQUAL "")
+    foreach(CANDIDATE IN ITEMS
+        "${NSIGHT_PERF_SDK_DIR}/NvPerf/include"
+        "${NSIGHT_PERF_SDK_DIR}/redist/include")
+        if(EXISTS "${CANDIDATE}/nvperf_vulkan_host.h" AND EXISTS "${CANDIDATE}/nvperf_common.h")
+            set(RTV_NSIGHT_PERF_INCLUDE_DIR "${CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+    foreach(CANDIDATE IN ITEMS
+        "${NSIGHT_PERF_SDK_DIR}/redist/NvPerfUtility/include"
+        "${NSIGHT_PERF_SDK_DIR}/NvPerfUtility/include")
+        if(EXISTS "${CANDIDATE}/NvPerfReportGeneratorVulkan.h" AND EXISTS "${CANDIDATE}/NvPerfVulkan.h")
+            set(RTV_NSIGHT_PERF_UTILITY_INCLUDE_DIR "${CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+    foreach(CANDIDATE IN ITEMS
+        "${NSIGHT_PERF_SDK_DIR}/NvPerf/bin/x64"
+        "${NSIGHT_PERF_SDK_DIR}/redist/bin/x64"
+        "${NSIGHT_PERF_SDK_DIR}/bin/x64")
+        if(EXISTS "${CANDIDATE}/nvperf_grfx_host.dll")
+            set(RTV_NSIGHT_PERF_BIN_DIR "${CANDIDATE}")
+            set(RTV_NSIGHT_PERF_RUNTIME_DLL "${CANDIDATE}/nvperf_grfx_host.dll")
+            if(EXISTS "${CANDIDATE}/nvperf_grfx_host.lib")
+                set(RTV_NSIGHT_PERF_IMPORT_LIB "${CANDIDATE}/nvperf_grfx_host.lib")
+            endif()
+            break()
+        endif()
+    endforeach()
+    if(NOT RTV_NSIGHT_PERF_INCLUDE_DIR STREQUAL "" AND NOT RTV_NSIGHT_PERF_UTILITY_INCLUDE_DIR STREQUAL "" AND NOT RTV_NSIGHT_PERF_RUNTIME_DLL STREQUAL "")
+        target_compile_definitions(rtvulkan PRIVATE
+            RTV_NSIGHT_PERF_SDK_CONFIGURED=1
+            "RTV_NSIGHT_PERF_SDK_DIR=\"${NSIGHT_PERF_SDK_DIR}\""
+            "RTV_NSIGHT_PERF_RUNTIME_DLL=\"${RTV_NSIGHT_PERF_RUNTIME_DLL}\"")
+        target_include_directories(rtvulkan PRIVATE
+            "${RTV_NSIGHT_PERF_INCLUDE_DIR}"
+            "${RTV_NSIGHT_PERF_INCLUDE_DIR}/windows-desktop-x64"
+            "${RTV_NSIGHT_PERF_UTILITY_INCLUDE_DIR}")
+        if(NOT RTV_NSIGHT_PERF_IMPORT_LIB STREQUAL "")
+            target_link_libraries(rtvulkan PRIVATE "${RTV_NSIGHT_PERF_IMPORT_LIB}")
+        endif()
+        add_custom_command(TARGET rtvulkan POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${RTV_NSIGHT_PERF_RUNTIME_DLL}"
+                "$<TARGET_FILE_DIR:rtvulkan>/nvperf_grfx_host.dll")
+    endif()
+endif()
+
 message(STATUS "Streamline SDK include dir: ${RTV_STREAMLINE_INCLUDE_DIR}")
 message(STATUS "Streamline runtime dll: ${RTV_STREAMLINE_RUNTIME_DLL}")
 message(STATUS "Streamline import lib: ${RTV_STREAMLINE_IMPORT_LIB}")
 message(STATUS "Streamline feature dlls: ${RTV_STREAMLINE_FEATURE_DLLS}")
-message(STATUS "Streamline feature flags: DLSS=${RTV_STREAMLINE_HAS_DLSS}; DLSS_RR=${RTV_STREAMLINE_HAS_DLSS_RR}; DLSS_FG=${RTV_STREAMLINE_HAS_DLSS_FG}; Reflex=${RTV_STREAMLINE_HAS_REFLEX}; NIS=${RTV_STREAMLINE_HAS_NIS}; NRD=${RTV_STREAMLINE_HAS_NRD}")
+message(STATUS "Streamline feature flags: DLSS=${RTV_STREAMLINE_HAS_DLSS}; DLSS_RR=${RTV_STREAMLINE_HAS_DLSS_RR}; DLSS_FG=${RTV_STREAMLINE_HAS_DLSS_FG}; Reflex=${RTV_STREAMLINE_HAS_REFLEX}; NIS=${RTV_STREAMLINE_HAS_NIS}; NRD=${RTV_STREAMLINE_HAS_NRD}; NvPerf=${RTV_STREAMLINE_HAS_NVPERF}")
 message(STATUS "Streamline missing optional plugins: ${RTV_STREAMLINE_MISSING_OPTIONAL_PLUGINS}")
+message(STATUS "Nsight Perf SDK dir: ${NSIGHT_PERF_SDK_DIR}")
+message(STATUS "Nsight Perf include dir: ${RTV_NSIGHT_PERF_INCLUDE_DIR}")
+message(STATUS "Nsight Perf utility include dir: ${RTV_NSIGHT_PERF_UTILITY_INCLUDE_DIR}")
+message(STATUS "Nsight Perf runtime dll: ${RTV_NSIGHT_PERF_RUNTIME_DLL}")
 
 if(WIN32)
     target_link_libraries(rtvulkan PRIVATE Comdlg32 User32 Shell32 Dwmapi)
+    add_custom_command(TARGET rtvulkan POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:rtvulkan>"
+            "$<TARGET_FILE_DIR:rtvulkan>/rtviewer.exe"
+        COMMENT "Creating thin renderer-only rtviewer entrypoint")
+    add_custom_target(rtviewer DEPENDS rtvulkan)
 endif()
 
 add_executable(rtv_bvh_benchmark

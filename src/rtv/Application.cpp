@@ -3,6 +3,7 @@
 #include "rtv/AssetImport.h"
 #include "rtv/Buffer.h"
 #include "rtv/CommandSystem.h"
+#include "rtv/NsightPerfMarkers.h"
 #include "rtv/BufferUploader.h"
 #include "rtv/DiagnosticImageExport.h"
 #include "rtv/EditorCommands.h"
@@ -10,6 +11,7 @@
 #include "rtv/FileDialog.h"
 #include "rtv/GltfLoader.h"
 #include "rtv/GpuSceneStreamingState.h"
+#include "rtv/NsightGraphicsRuntime.h"
 #include "rtv/NativeAssetFormat.h"
 #include "rtv/NativeAssetRuntimeLoader.h"
 #include "rtv/NativeAssetMigration.h"
@@ -352,6 +354,42 @@ int runCookProjectProcess(
     CloseHandle(process.hProcess);
     CloseHandle(logHandle);
     return static_cast<int>(exitCode);
+}
+
+bool launchQuickNsightExperimentMatrix(const std::filesystem::path& scenePath) {
+    const std::filesystem::path script =
+        std::filesystem::current_path() / "scripts" / "nsight_raytracing_matrix.ps1";
+    if (!std::filesystem::exists(script) || scenePath.empty()) {
+        return false;
+    }
+    const std::wstring commandLine =
+        L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File " +
+        quoteWindowsArg(script.wstring()) +
+        L" -Scene " + quoteWindowsArg(scenePath.wstring()) +
+        L" -Quick";
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    const std::wstring workingDirectory = std::filesystem::current_path().wstring();
+    const BOOL created = CreateProcessW(
+        nullptr,
+        mutableCommand.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        workingDirectory.c_str(),
+        &startup,
+        &process);
+    if (!created) {
+        return false;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
 }
 #else
 std::string cookProcessCommandLine(
@@ -1671,7 +1709,13 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.pathTracingEnabled = settings.pathTracingEnabled;
     render.cameraJitterEnabled = settings.cameraJitterEnabled;
     render.directLightingEnabled = settings.directLightingEnabled;
+    render.secondaryDirectLightingEnabled = settings.secondaryDirectLightingEnabled;
     render.maxBounces = settings.maxBounces;
+    render.pathTraceKernelMode = settings.pathTraceKernelMode;
+    render.finalBounceFastPathEnabled = settings.finalBounceFastPathEnabled;
+    render.native2BTerminalDirectSampleProbability = settings.native2BTerminalDirectSampleProbability;
+    render.blendedDecalShadowMode = settings.blendedDecalShadowMode;
+    render.native2BDirectReuseMode = settings.native2BDirectReuseMode;
     render.environmentDirectSamples = settings.environmentDirectSamples;
     render.toneMapper = settings.toneMapper;
     render.exposure = settings.exposure;
@@ -1734,6 +1778,7 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.materialTextureAnisotropy = settings.materialTextureAnisotropy;
     render.specularAaEnabled = settings.specularAaEnabled;
     render.opacityMicromapsEnabled = settings.opacityMicromapsEnabled;
+    render.compactImportedEmissiveTriangleSampling = settings.compactImportedEmissiveTriangleSampling;
     render.shadowRayBias = settings.shadowRayBias;
     render.shadowDistanceBias = settings.shadowDistanceBias;
     render.fireflyClamp = settings.fireflyClamp;
@@ -1782,7 +1827,13 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.pathTracingEnabled = render.pathTracingEnabled;
     settings.cameraJitterEnabled = render.cameraJitterEnabled;
     settings.directLightingEnabled = render.directLightingEnabled;
+    settings.secondaryDirectLightingEnabled = render.secondaryDirectLightingEnabled;
     settings.maxBounces = render.maxBounces;
+    settings.pathTraceKernelMode = render.pathTraceKernelMode;
+    settings.finalBounceFastPathEnabled = render.finalBounceFastPathEnabled;
+    settings.native2BTerminalDirectSampleProbability = render.native2BTerminalDirectSampleProbability;
+    settings.blendedDecalShadowMode = render.blendedDecalShadowMode;
+    settings.native2BDirectReuseMode = render.native2BDirectReuseMode;
     settings.environmentDirectSamples = render.environmentDirectSamples;
     settings.toneMapper = render.toneMapper;
     settings.exposure = render.exposure;
@@ -1845,6 +1896,7 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.materialTextureAnisotropy = render.materialTextureAnisotropy;
     settings.specularAaEnabled = render.specularAaEnabled;
     settings.opacityMicromapsEnabled = render.opacityMicromapsEnabled;
+    settings.compactImportedEmissiveTriangleSampling = render.compactImportedEmissiveTriangleSampling;
     settings.shadowRayBias = render.shadowRayBias;
     settings.shadowDistanceBias = render.shadowDistanceBias;
     settings.fireflyClamp = render.fireflyClamp;
@@ -3802,11 +3854,14 @@ Application::Application(
     std::optional<RenderPreset> renderPresetOverride,
     std::optional<bool> restirGiOverride,
     std::optional<bool> opacityMicromapOverride,
+    std::optional<bool> opacityMicromapBlendOverride,
+    std::optional<bool> hardwareBackfaceCullingOverride,
     std::optional<uint32_t> opacityMicromapSubdivisionOverride,
     bool debugViewOverride,
     bool validationCameraMotion,
     bool validationObjectMotion,
     bool headless,
+    ApplicationMode mode,
     uint32_t headlessWidth,
     uint32_t headlessHeight,
     bool disableAsyncCompute,
@@ -3824,6 +3879,8 @@ Application::Application(
       renderPresetOverride_(renderPresetOverride),
       restirGiOverride_(restirGiOverride),
       opacityMicromapOverride_(opacityMicromapOverride),
+      opacityMicromapBlendOverride_(opacityMicromapBlendOverride),
+      hardwareBackfaceCullingOverride_(hardwareBackfaceCullingOverride),
       opacityMicromapSubdivisionOverride_(opacityMicromapSubdivisionOverride),
       debugViewOverride_(debugViewOverride),
       validationCameraMotion_(validationCameraMotion),
@@ -3832,13 +3889,16 @@ Application::Application(
       singleQueueFallback_(singleQueueFallback),
       disableResourceAliasing_(disableResourceAliasing),
       streamingOptions_(streamingOptions),
-      headless_(headless),
+      mode_(headless ? ApplicationMode::Headless : mode),
+      headless_(headless || mode == ApplicationMode::Headless),
+      rendererOnly_(mode == ApplicationMode::RendererOnly && !headless),
       headlessExtent_{std::max(headlessWidth, 1u), std::max(headlessHeight, 1u)} {
     streamingRuntimeState_.setOptions(streamingOptions_);
     if (!headless_) {
         initWindow();
     }
     initVulkan();
+    (void)initializeNsightGraphicsRuntime();
     frameWorkProbeJobId_ = frameWorkScheduler_.enqueue(FrameWorkJobDesc{
         .queue = FrameWorkQueue::MainThreadApply,
         .title = "Editor main loop scheduler probe",
@@ -3905,6 +3965,7 @@ Application::~Application() {
         commandSystem_->setPathTracer(nullptr);
     }
     retiredPathTracers_.clear();
+    shutdownNsightPerfMarkers();
     pathTracer_.reset();
     commandSystem_.reset();
     uiOverlay_.reset();
@@ -3924,7 +3985,20 @@ Application::~Application() {
     }
 }
 
-void Application::run(uint32_t maxFrames) {
+void Application::run(uint32_t maxFrames, uint32_t warmupFrames, bool collectProfile) {
+    interactiveProfileCollectionEnabled_ = collectProfile;
+    if (interactiveProfileCollectionEnabled_) {
+        warmupFrameCount_ = warmupFrames;
+        totalFrameCount_ = maxFrames;
+        cpuFrameTimings_.clear();
+        gpuFrameTimings_.clear();
+        perFrameGpuTimings_.clear();
+        if (maxFrames > 0u) {
+            cpuFrameTimings_.reserve(maxFrames);
+            gpuFrameTimings_.reserve(maxFrames);
+            perFrameGpuTimings_.reserve(maxFrames);
+        }
+    }
     mainLoop(maxFrames);
 }
 
@@ -3945,6 +4019,11 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
 
     for (uint32_t frameCount = 0; frameCount < renderedFrames; ++frameCount) {
         const auto frameStart = std::chrono::steady_clock::now();
+        if (frameCount == warmupFrames && uploader_ != nullptr) {
+            captureReadyImageUploadCount_ = uploader_->stats().imageUploadCount;
+            captureReadyUploadSnapshotValid_ = true;
+            captureReadyFrameSerial_ = frameSerial_;
+        }
 
         const float rawDeltaSeconds = 1.0f / 60.0f;
         const float deltaSeconds = clampFrameDeltaSeconds(rawDeltaSeconds, pathTracer_.get());
@@ -3980,7 +4059,23 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
             perFrameGpuTimings_.push_back(timings);
         }
     }
+    uint32_t nvPerfDrainFrames = 0;
+    constexpr uint32_t kMaxNvPerfDrainFrames = 256;
+    while (nsightPerfReportNeedsMoreFrames() && nvPerfDrainFrames < kMaxNvPerfDrainFrames) {
+        const float deltaSeconds = 1.0f / 60.0f;
+        commandSystem_->drawFrame(seconds, deltaSeconds);
+        seconds += deltaSeconds;
+        ++frameSerial_;
+        ++nvPerfDrainFrames;
+    }
+    if (nsightPerfReportNeedsMoreFrames()) {
+        std::cerr << "Warning: Nsight Perf report collection did not finish within "
+                  << kMaxNvPerfDrainFrames << " drain frames.\n";
+    }
     commandSystem_->waitIdle();
+    if (savePresentFramePath_.has_value() && !initialPresentFrameSaveComplete_) {
+        initialPresentFrameSaveComplete_ = savePresentFrame(*savePresentFramePath_);
+    }
 }
 
 void Application::renderFrames(uint32_t count) {
@@ -4124,6 +4219,130 @@ uint64_t estimatedTextureUploadBytes(const rtv::TextureAsset& texture) {
         channelBytes;
 }
 
+std::string textureFormatDiagnosticName(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8_UNORM: return "R8_UNORM";
+    case VK_FORMAT_R8G8_UNORM: return "R8G8_UNORM";
+    case VK_FORMAT_R8G8B8_UNORM: return "R8G8B8_UNORM";
+    case VK_FORMAT_R8G8B8_SRGB: return "R8G8B8_SRGB";
+    case VK_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+    case VK_FORMAT_R8G8B8A8_SRGB: return "R8G8B8A8_SRGB";
+    case VK_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+    case VK_FORMAT_B8G8R8A8_SRGB: return "B8G8R8A8_SRGB";
+    case VK_FORMAT_R16_UNORM: return "R16_UNORM";
+    case VK_FORMAT_R16G16_UNORM: return "R16G16_UNORM";
+    case VK_FORMAT_R16G16B16A16_UNORM: return "R16G16B16A16_UNORM";
+    case VK_FORMAT_R16_SFLOAT: return "R16_SFLOAT";
+    case VK_FORMAT_R16G16_SFLOAT: return "R16G16_SFLOAT";
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return "R16G16B16A16_SFLOAT";
+    case VK_FORMAT_R32_SFLOAT: return "R32_SFLOAT";
+    case VK_FORMAT_R32G32_SFLOAT: return "R32G32_SFLOAT";
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return "R32G32B32A32_SFLOAT";
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return "BC1_RGB_UNORM";
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return "BC1_RGB_SRGB";
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return "BC1_RGBA_UNORM";
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return "BC1_RGBA_SRGB";
+    case VK_FORMAT_BC2_UNORM_BLOCK: return "BC2_UNORM";
+    case VK_FORMAT_BC2_SRGB_BLOCK: return "BC2_SRGB";
+    case VK_FORMAT_BC3_UNORM_BLOCK: return "BC3_UNORM";
+    case VK_FORMAT_BC3_SRGB_BLOCK: return "BC3_SRGB";
+    case VK_FORMAT_BC4_UNORM_BLOCK: return "BC4_UNORM";
+    case VK_FORMAT_BC4_SNORM_BLOCK: return "BC4_SNORM";
+    case VK_FORMAT_BC5_UNORM_BLOCK: return "BC5_UNORM";
+    case VK_FORMAT_BC5_SNORM_BLOCK: return "BC5_SNORM";
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: return "BC6H_UFLOAT";
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK: return "BC6H_SFLOAT";
+    case VK_FORMAT_BC7_UNORM_BLOCK: return "BC7_UNORM";
+    case VK_FORMAT_BC7_SRGB_BLOCK: return "BC7_SRGB";
+    default: return "VkFormat_" + std::to_string(static_cast<uint32_t>(format));
+    }
+}
+
+uint32_t compressedFormatBlockBytes(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK:
+        return 8u;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK:
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return 16u;
+    default:
+        return 0u;
+    }
+}
+
+uint32_t uncompressedFormatTexelBytes(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_SRGB:
+        return 1u;
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8_SRGB:
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16_SFLOAT:
+        return 2u;
+    case VK_FORMAT_R8G8B8_UNORM:
+    case VK_FORMAT_R8G8B8_SRGB:
+        return 3u;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R32_SFLOAT:
+        return 4u;
+    case VK_FORMAT_R16G16B16_UNORM:
+    case VK_FORMAT_R16G16B16_SFLOAT:
+        return 6u;
+    case VK_FORMAT_R16G16B16A16_UNORM:
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+    case VK_FORMAT_R32G32_SFLOAT:
+        return 8u;
+    case VK_FORMAT_R32G32B32_SFLOAT:
+        return 12u;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return 16u;
+    default:
+        return 4u;
+    }
+}
+
+uint64_t estimateResidentImageBytes(VkFormat format, uint32_t width, uint32_t height, uint32_t mipLevels) {
+    if (width == 0u || height == 0u) {
+        return 0ull;
+    }
+    const uint32_t mipCount = std::max(1u, mipLevels);
+    const uint32_t blockBytes = compressedFormatBlockBytes(format);
+    const bool compressed = blockBytes != 0u;
+    const uint32_t texelBytes = uncompressedFormatTexelBytes(format);
+    uint64_t bytes = 0;
+    for (uint32_t mip = 0; mip < mipCount; ++mip) {
+        const uint32_t mipWidth = std::max(1u, width >> mip);
+        const uint32_t mipHeight = std::max(1u, height >> mip);
+        if (compressed) {
+            const uint64_t blocksWide = (static_cast<uint64_t>(mipWidth) + 3ull) / 4ull;
+            const uint64_t blocksHigh = (static_cast<uint64_t>(mipHeight) + 3ull) / 4ull;
+            bytes += blocksWide * blocksHigh * blockBytes;
+        } else {
+            bytes += static_cast<uint64_t>(mipWidth) * static_cast<uint64_t>(mipHeight) * texelBytes;
+        }
+    }
+    return bytes;
+}
+
 std::vector<uint8_t> textureMipUploadPayload(const rtv::TextureAsset& texture, uint32_t mipLevel) {
     if (mipLevel < texture.mipData.size()) {
         const rtv::TextureMipLevel& mip = texture.mipData[mipLevel];
@@ -4259,6 +4478,274 @@ std::optional<MeshBlasBuildSizing> queryMeshBlasBuildSizing(VkDevice device, con
 
 } // namespace
 
+nlohmann::json Application::textureDiagnosticsJson() const {
+    const float requestedMaterialAnisotropy = pathTracer_ != nullptr
+        ? pathTracer_->settings().materialTextureAnisotropy
+        : 0.0f;
+    const float effectiveMaterialAnisotropy = pathTracer_ != nullptr
+        ? pathTracer_->scene().materialTextureAnisotropy()
+        : 0.0f;
+    const uint32_t materialTextureCount = pathTracer_ != nullptr
+        ? pathTracer_->scene().materialTextureCount()
+        : 0u;
+    const uint32_t materialTextureSamplerCount = pathTracer_ != nullptr
+        ? pathTracer_->scene().materialTextureSamplerCount()
+        : 0u;
+    const bool anisotropicSamplingEnabled =
+        context_ != nullptr &&
+        context_->supportsSamplerAnisotropy() &&
+        effectiveMaterialAnisotropy > 1.0001f;
+    const uint32_t anisotropicTextureCount = anisotropicSamplingEnabled ? materialTextureCount : 0u;
+    const uint32_t highAnisotropyTextureCount =
+        effectiveMaterialAnisotropy >= 8.0f ? anisotropicTextureCount : 0u;
+    nlohmann::json report = {
+        {"bound_texture_count", 0},
+        {"total_texture_bytes", 0},
+        {"total_mip_count", 0},
+        {"missing_mip_chain_count", 0},
+        {"fallback_missing_texture_count", 0},
+        {"oversized_texture_count", 0},
+        {"sampler_anisotropy", requestedMaterialAnisotropy},
+        {"sampler_anisotropy_summary", {
+            {"supported", context_ != nullptr && context_->supportsSamplerAnisotropy()},
+            {"requested", requestedMaterialAnisotropy},
+            {"effective", effectiveMaterialAnisotropy},
+            {"device_max", context_ != nullptr ? context_->maxSamplerAnisotropy() : 1.0f},
+            {"bound_texture_count", materialTextureCount},
+            {"unique_sampler_count", materialTextureSamplerCount},
+            {"anisotropic_texture_count", anisotropicTextureCount},
+            {"high_anisotropy_texture_count", highAnisotropyTextureCount},
+        }},
+        {"streaming_upload_count", 0},
+        {"streaming_image_upload_count", 0},
+        {"streaming_image_uploads_after_capture_ready", 0},
+        {"streaming_image_uploads_during_capture", 0},
+        {"capture_upload_snapshot_valid", captureReadyUploadSnapshotValid_},
+        {"capture_snapshot_frame", captureReadyFrameSerial_},
+        {"runtime_residency", nlohmann::json::object()},
+        {"streaming_textures", nlohmann::json::array()},
+        {"eviction_history", nlohmann::json::array()},
+        {"top_largest_textures", nlohmann::json::array()},
+        {"warnings", nlohmann::json::array()},
+    };
+
+    struct TextureEntry {
+        std::string name;
+        std::filesystem::path sourcePath;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t mipCount = 0;
+        uint64_t bytes = 0;
+        uint32_t runtimeWidth = 0;
+        uint32_t runtimeHeight = 0;
+        uint32_t runtimeMipCount = 0;
+        uint64_t runtimeBytes = 0;
+        VkFormat runtimeFormat = VK_FORMAT_UNDEFINED;
+        bool runtimeResident = false;
+        bool fallback = false;
+        bool compressed = false;
+    };
+    std::vector<TextureEntry> entries;
+    uint64_t totalBytes = 0;
+    uint64_t runtimeImportedBytes = 0;
+    uint32_t totalMips = 0;
+    uint32_t runtimeImportedMips = 0;
+    uint32_t runtimeImportedCount = 0;
+    uint32_t runtimeImportedResidentCount = 0;
+    uint32_t missingMipChains = 0;
+    uint32_t fallbackCount = 0;
+    uint32_t oversizedCount = 0;
+    const VkExtent2D displayExtent = pathTracer_ != nullptr ? pathTracer_->displayExtent() : VkExtent2D{};
+    const BindlessTextureTable* residentTextures = pathTracer_ != nullptr
+        ? &pathTracer_->scene().materialTextureTable()
+        : nullptr;
+    const uint32_t oversizedWidth = std::max(1u, displayExtent.width) * 2u;
+    const uint32_t oversizedHeight = std::max(1u, displayExtent.height) * 2u;
+
+    if (importedScene_.has_value()) {
+        const std::vector<TextureAsset>& sceneTextures = assets_.textures();
+        entries.reserve(sceneTextures.size());
+        for (size_t textureIndex = 0; textureIndex < sceneTextures.size(); ++textureIndex) {
+            const TextureAsset& texture = sceneTextures[textureIndex];
+            const uint64_t bytes = estimatedTextureUploadBytes(texture);
+            const uint32_t sourceMipCount = texture.mipLevels > 0
+                ? static_cast<uint32_t>(texture.mipLevels)
+                : static_cast<uint32_t>(texture.mipData.size());
+            const BindlessTextureImageInfo resident = residentTextures != nullptr
+                ? residentTextures->imageInfo(static_cast<uint32_t>(textureIndex))
+                : BindlessTextureImageInfo{};
+            const uint32_t mipCount = resident.mipLevels > 0 ? resident.mipLevels : sourceMipCount;
+            const bool runtimeResident = resident.width > 0u && resident.height > 0u && resident.format != VK_FORMAT_UNDEFINED;
+            const uint32_t runtimeMipCount = runtimeResident ? std::max(1u, resident.mipLevels) : 0u;
+            const uint64_t runtimeBytes = runtimeResident
+                ? estimateResidentImageBytes(resident.format, resident.width, resident.height, runtimeMipCount)
+                : 0ull;
+            totalBytes += bytes;
+            totalMips += std::max(1u, mipCount);
+            ++runtimeImportedCount;
+            if (runtimeResident) {
+                ++runtimeImportedResidentCount;
+                runtimeImportedMips += runtimeMipCount;
+                runtimeImportedBytes += runtimeBytes;
+            }
+            if (std::max(texture.width, texture.height) > 1u && std::max(1u, mipCount) <= 1u) {
+                ++missingMipChains;
+            }
+            if (texture.fallback || (texture.rgba8.empty() && texture.mipData.empty())) {
+                ++fallbackCount;
+            }
+            if (displayExtent.width > 0u && displayExtent.height > 0u &&
+                (texture.width > oversizedWidth || texture.height > oversizedHeight)) {
+                ++oversizedCount;
+            }
+            entries.push_back(TextureEntry{
+                .name = texture.name.empty() ? texture.sourcePath.filename().string() : texture.name,
+                .sourcePath = texture.sourcePath,
+                .width = texture.width,
+                .height = texture.height,
+                .mipCount = std::max(1u, mipCount),
+                .bytes = bytes,
+                .runtimeWidth = resident.width,
+                .runtimeHeight = resident.height,
+                .runtimeMipCount = runtimeMipCount,
+                .runtimeBytes = runtimeBytes,
+                .runtimeFormat = resident.format,
+                .runtimeResident = runtimeResident,
+                .fallback = texture.fallback,
+                .compressed = texture.isCompressed,
+            });
+        }
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const TextureEntry& a, const TextureEntry& b) {
+        return a.bytes > b.bytes;
+    });
+    nlohmann::json top = nlohmann::json::array();
+    for (size_t i = 0; i < std::min<size_t>(entries.size(), 8u); ++i) {
+        const TextureEntry& entry = entries[i];
+        top.push_back({
+            {"name", entry.name},
+            {"source", entry.sourcePath.generic_string()},
+            {"width", entry.width},
+            {"height", entry.height},
+            {"mip_count", entry.mipCount},
+            {"estimated_bytes", entry.bytes},
+            {"runtime_resident", entry.runtimeResident},
+            {"runtime_width", entry.runtimeWidth},
+            {"runtime_height", entry.runtimeHeight},
+            {"runtime_mip_count", entry.runtimeMipCount},
+            {"runtime_format", textureFormatDiagnosticName(entry.runtimeFormat)},
+            {"runtime_estimated_bytes", entry.runtimeBytes},
+            {"fallback", entry.fallback},
+            {"compressed", entry.compressed},
+        });
+    }
+
+    std::vector<const TextureEntry*> runtimeEntries;
+    runtimeEntries.reserve(entries.size());
+    for (const TextureEntry& entry : entries) {
+        if (entry.runtimeResident) {
+            runtimeEntries.push_back(&entry);
+        }
+    }
+    std::sort(runtimeEntries.begin(), runtimeEntries.end(), [](const TextureEntry* a, const TextureEntry* b) {
+        return a->runtimeBytes > b->runtimeBytes;
+    });
+    nlohmann::json topRuntime = nlohmann::json::array();
+    for (size_t i = 0; i < std::min<size_t>(runtimeEntries.size(), 8u); ++i) {
+        const TextureEntry& entry = *runtimeEntries[i];
+        topRuntime.push_back({
+            {"name", entry.name},
+            {"source", entry.sourcePath.generic_string()},
+            {"width", entry.runtimeWidth},
+            {"height", entry.runtimeHeight},
+            {"mip_count", entry.runtimeMipCount},
+            {"format", textureFormatDiagnosticName(entry.runtimeFormat)},
+            {"estimated_resident_bytes", entry.runtimeBytes},
+            {"fallback", entry.fallback},
+        });
+    }
+
+    if (uploader_ != nullptr) {
+        const auto& uploadStats = uploader_->stats();
+        report["streaming_upload_count"] = uploadStats.uploadCount;
+        report["streaming_image_upload_count"] = uploadStats.imageUploadCount;
+        const uint64_t uploadsDuringCapture =
+            captureReadyUploadSnapshotValid_ && uploadStats.imageUploadCount >= captureReadyImageUploadCount_
+            ? uploadStats.imageUploadCount - captureReadyImageUploadCount_
+            : 0;
+        report["streaming_image_uploads_after_capture_ready"] = uploadsDuringCapture;
+        report["streaming_image_uploads_during_capture"] = uploadsDuringCapture;
+    }
+    report["bound_texture_count"] = static_cast<uint32_t>(entries.size());
+    report["total_texture_bytes"] = totalBytes;
+    report["total_mip_count"] = totalMips;
+    report["missing_mip_chain_count"] = missingMipChains;
+    report["fallback_missing_texture_count"] = fallbackCount;
+    report["oversized_texture_count"] = oversizedCount;
+    report["top_largest_textures"] = std::move(top);
+
+    const NativeGpuAssetCacheStats nativeStats = nativeGpuAssetCache_.stats();
+    report["runtime_residency"] = {
+        {"texture_count", nativeStats.textureCount},
+        {"fully_resident_texture_count", nativeStats.textureFullyResidentCount},
+        {"partially_resident_texture_count", nativeStats.texturePartiallyResidentCount},
+        {"fallback_texture_count", nativeStats.textureFallbackCount},
+        {"resident_mip_count", nativeStats.residentTextureMipCount},
+        {"total_mip_count", nativeStats.totalTextureMipCount},
+        {"resident_gpu_bytes", nativeStats.residentGpuBytes},
+        {"in_flight_upload_bytes", nativeStats.inFlightUploadBytes},
+        {"pending_retired_gpu_bytes", nativeStats.pendingRetiredGpuBytes},
+        {"pending_retired_resource_count", nativeStats.pendingRetiredResourceCount},
+        {"bound_imported_texture_count", runtimeImportedCount},
+        {"resident_imported_texture_count", runtimeImportedResidentCount},
+        {"resident_imported_mip_count", runtimeImportedMips},
+        {"estimated_resident_imported_bytes", runtimeImportedBytes},
+        {"top_runtime_imported_textures", std::move(topRuntime)},
+        {"last_eviction", nativeGpuAssetEvictionResultJson(lastStreamingEviction_)},
+        {"native_cache_assets", nativeGpuAssetCacheSnapshotsJson(nativeGpuAssetCache_.snapshots())},
+    };
+    report["streaming_textures"] = textureStreamingToJson(textureStreamingManager_.textures());
+    nlohmann::json evictionHistory = nlohmann::json::array();
+    for (const auto& [frame, eviction] : streamingEvictionHistory_) {
+        evictionHistory.push_back({
+            {"frame", frame},
+            {"result", nativeGpuAssetEvictionResultJson(eviction)},
+        });
+    }
+    report["eviction_history"] = std::move(evictionHistory);
+
+    nlohmann::json warnings = nlohmann::json::array();
+    if (missingMipChains > 0u) {
+        warnings.push_back("Missing mip chains on " + std::to_string(missingMipChains) + " texture(s)");
+    }
+    if (oversizedCount > 0u) {
+        warnings.push_back("Oversized textures relative to display resolution: " + std::to_string(oversizedCount));
+    }
+    if (fallbackCount > 0u) {
+        warnings.push_back("Fallback or missing texture payloads active: " + std::to_string(fallbackCount));
+    }
+    if (pathTracer_ != nullptr && pathTracer_->settings().materialTextureAnisotropy >= 8.0f) {
+        warnings.push_back("High material texture anisotropy during capture");
+    }
+    if (uploader_ != nullptr && captureReadyUploadSnapshotValid_ &&
+        uploader_->stats().imageUploadCount > captureReadyImageUploadCount_) {
+        warnings.push_back("Image uploads continued after CAPTURE_READY; capture may include active texture streaming");
+    }
+    if (nativeStats.texturePartiallyResidentCount > 0u) {
+        warnings.push_back(
+            "Partially resident native textures: " +
+            std::to_string(nativeStats.texturePartiallyResidentCount));
+    }
+    if (nativeStats.pendingRetiredGpuBytes > 0u) {
+        warnings.push_back(
+            "Evicted GPU resources are awaiting timeline retirement: " +
+            std::to_string(nativeStats.pendingRetiredGpuBytes) + " bytes");
+    }
+    report["warnings"] = std::move(warnings);
+    return report;
+}
+
 nlohmann::json Application::streamingRuntimeReport() const {
     nlohmann::json report = streamingRuntimeState_.toJson(&nativeAssetCatalog_);
     const NativeGpuAssetCacheStats nativeGpuStats = nativeGpuAssetCache_.stats();
@@ -4280,6 +4767,14 @@ nlohmann::json Application::streamingRuntimeReport() const {
         {"last_eviction", nativeGpuAssetEvictionResultJson(lastStreamingEviction_)},
         {"assets", nativeGpuAssetCacheSnapshotsJson(nativeGpuAssetCache_.snapshots())},
     };
+    nlohmann::json evictionHistory = nlohmann::json::array();
+    for (const auto& [frame, eviction] : streamingEvictionHistory_) {
+        evictionHistory.push_back({
+            {"frame", frame},
+            {"result", nativeGpuAssetEvictionResultJson(eviction)},
+        });
+    }
+    report["native_gpu_asset_cache"]["eviction_history"] = std::move(evictionHistory);
     GpuSceneStreamingState gpuSceneStreaming;
     gpuSceneStreaming.rebuild(sceneDocument_, gpuInstanceEntities_, &nativeGpuAssetCache_);
     const GpuSceneStreamingUpdatePlan gpuSceneUpdatePlan = buildGpuSceneStreamingUpdatePlan(
@@ -5724,6 +6219,219 @@ void Application::applyDebugView(RendererDebugView view) {
     }
 }
 
+void Application::configureCaptureReady(uint32_t afterFrames, bool log) {
+    captureReadyAfterFrames_ = std::max(1u, afterFrames);
+    captureReadyLog_ = log;
+    captureReadyUploadSnapshotValid_ = false;
+    captureReadyImageUploadCount_ = 0;
+}
+
+void Application::setRendererOnlyLingerAfterCaptureReadyMs(uint32_t milliseconds) {
+    rendererOnlyLingerAfterCaptureReadyMs_ = milliseconds;
+}
+
+void Application::setCaptureReadyFilePath(std::optional<std::filesystem::path> path) {
+    captureReadyFilePath_ = std::move(path);
+}
+
+void Application::setSavePresentFramePath(std::optional<std::filesystem::path> path) {
+    savePresentFramePath_ = std::move(path);
+    initialPresentFrameSaveComplete_ = false;
+}
+
+void Application::setSavePresentFrameOnHotkeyPath(std::optional<std::filesystem::path> path) {
+    savePresentFrameOnHotkeyPath_ = std::move(path);
+}
+
+bool Application::savePresentFrame(const std::filesystem::path& path) {
+    if (pathTracer_ == nullptr || context_ == nullptr || allocator_ == nullptr) {
+        return false;
+    }
+    const VkExtent2D extent = pathTracer_->displayExtent();
+    if (extent.width == 0u || extent.height == 0u || pathTracer_->presentationImage() == VK_NULL_HANDLE) {
+        return false;
+    }
+    DiagnosticImageExport exporter(*context_, *allocator_);
+    if (!exporter.initialize(VK_FORMAT_R8G8B8A8_UNORM, extent)) {
+        return false;
+    }
+    const bool ok = exporter.exportView(*pathTracer_, pathTracer_->settings().debugView, path, 0);
+    if (ok) {
+        std::cout << "Saved present frame: " << path.string() << '\n';
+    } else {
+        std::cerr << "Warning: failed to save present frame: " << path.string() << '\n';
+    }
+    return ok;
+}
+
+void Application::dumpRendererOnlyProfileJson(const std::filesystem::path& path) {
+    HeadlessDiagnosticsConfig config;
+    config.profile = true;
+    config.profileJsonPath = path;
+    HeadlessDiagnostics diag(config);
+    diag.run(*this);
+    diag.writeProfileJson(path);
+    std::cout << "Wrote renderer profile JSON: " << path.string() << '\n';
+}
+
+void Application::exportRendererOnlyDebugViews(const std::filesystem::path& dir) {
+    HeadlessDiagnosticsConfig config;
+    config.saveDebugViewsDir = dir;
+    HeadlessDiagnostics diag(config);
+    diag.exportDebugViews(*this, dir);
+    std::cout << "Wrote renderer debug views: " << dir.string() << '\n';
+}
+
+std::string Application::activeCaptureSceneName() const {
+    if (scenePath_.has_value()) {
+        return scenePath_->filename().string();
+    }
+    if (gltfPath_.has_value()) {
+        return gltfPath_->filename().string();
+    }
+    if (nativePackageScenePath_.has_value()) {
+        return nativePackageScenePath_->filename().string();
+    }
+    return "untitled";
+}
+
+void Application::printCaptureReadyMarker() {
+    captureReadyPrinted_ = true;
+    captureReadyFrameSerial_ = frameSerial_;
+    captureReadyPrintedAt_ = std::chrono::steady_clock::now();
+    const std::string marker = "CAPTURE_READY frame=" + std::to_string(frameSerial_) +
+        " scene=" + activeCaptureSceneName() +
+        " steady_frames=" + std::to_string(captureReadyRenderedFrames_);
+    std::cout << marker << '\n';
+    if (captureReadyFilePath_.has_value()) {
+        std::error_code ec;
+        if (const auto parent = captureReadyFilePath_->parent_path(); !parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+        }
+        std::ofstream out(*captureReadyFilePath_, std::ios::trunc);
+        if (out) {
+            out << marker << '\n';
+        }
+    }
+}
+
+void Application::processRendererOnlyRequests(const RendererOnlyRequests& requests) {
+    if (pathTracer_ == nullptr) {
+        return;
+    }
+    if (requests.cameraMoveSpeed.has_value()) {
+        cameraController_.setMoveSpeed(std::clamp(*requests.cameraMoveSpeed, 0.05f, 100.0f));
+    }
+    if (requests.cameraFastMoveSpeed.has_value()) {
+        cameraController_.setFastMoveSpeed(std::clamp(*requests.cameraFastMoveSpeed, 0.05f, 250.0f));
+    }
+    if (requests.settings.has_value()) {
+        if (pathTracer_->applySettings(*requests.settings)) {
+            syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
+        }
+    }
+    if (requests.resetAccumulation.has_value()) {
+        pathTracer_->resetAccumulation(*requests.resetAccumulation);
+    }
+    if (requests.savePresentFrame) {
+        (void)savePresentFrame(savePresentFramePath_.value_or(std::filesystem::path("out/diagnostic/present.png")));
+    }
+    if (requests.saveDebugViews) {
+        exportRendererOnlyDebugViews("out/diagnostic/debug_views");
+    }
+    if (requests.dumpProfileJson) {
+        dumpRendererOnlyProfileJson("out/diagnostic/profile.json");
+    }
+    if (requests.printCaptureReady) {
+        printCaptureReadyMarker();
+    }
+    if (requests.startNsightPerfReport.has_value()) {
+        if (requestNsightPerfReport(*requests.startNsightPerfReport)) {
+            std::cout << "Queued Nsight Perf SDK report: "
+                      << requests.startNsightPerfReport->outputDirectory << '\n';
+        } else {
+            std::cerr << "Failed to queue Nsight Perf SDK report: "
+                      << nsightPerfMarkerStatus().unavailableReason << '\n';
+        }
+    }
+    if (requests.cancelNsightPerfReport) {
+        cancelNsightPerfReport();
+        std::cout << "Cancelled Nsight Perf SDK report collection\n";
+    }
+    if (requests.openNsightPerfReport) {
+        const NsightPerfMarkerStatus status = nsightPerfMarkerStatus();
+        if (!status.lastReportDirectory.empty()) {
+#if defined(_WIN32)
+            (void)ShellExecuteA(
+                nullptr,
+                "open",
+                status.lastReportDirectory.c_str(),
+                nullptr,
+                nullptr,
+                SW_SHOWNORMAL);
+#endif
+        }
+    }
+    if (requests.runQuickExperimentMatrix) {
+        if (!scenePath_.has_value()) {
+            std::cerr << "Quick A/B matrix currently requires a --scene source\n";
+        } else {
+#if defined(_WIN32)
+            if (launchQuickNsightExperimentMatrix(*scenePath_)) {
+                std::cout << "Launched quick Nsight A/B matrix for " << scenePath_->string() << '\n';
+                if (window_ != nullptr) {
+                    glfwSetWindowShouldClose(window_, GLFW_TRUE);
+                }
+            } else {
+                std::cerr << "Failed to launch quick Nsight A/B matrix\n";
+            }
+#endif
+        }
+    }
+}
+
+void Application::updateCaptureReadyState(uint32_t frameNumber) {
+    if (!rendererOnly_ || pathTracer_ == nullptr) {
+        return;
+    }
+    const bool validImage = pathTracer_->presentationImage() != VK_NULL_HANDLE &&
+        pathTracer_->displayExtent().width > 0u &&
+        pathTracer_->displayExtent().height > 0u;
+    const bool validTimedFrame = pathTracer_->timings().totalMs() > 0.0f;
+    emitNsightFrameBoundary(
+        context_ != nullptr ? context_->graphicsQueue() : VK_NULL_HANDLE,
+        pathTracer_->presentationImage());
+    if (validImage && validTimedFrame) {
+        ++captureReadyRenderedFrames_;
+    } else {
+        captureReadyRenderedFrames_ = 0;
+    }
+
+    if (!captureReadyPrinted_ && captureReadyRenderedFrames_ >= captureReadyAfterFrames_) {
+        if (uploader_ != nullptr) {
+            captureReadyImageUploadCount_ = uploader_->stats().imageUploadCount;
+            captureReadyUploadSnapshotValid_ = true;
+        }
+        if (captureReadyLog_) {
+            printCaptureReadyMarker();
+        } else {
+            captureReadyPrinted_ = true;
+            captureReadyFrameSerial_ = frameNumber;
+        }
+        if (savePresentFramePath_.has_value() && !initialPresentFrameSaveComplete_) {
+            initialPresentFrameSaveComplete_ = savePresentFrame(*savePresentFramePath_);
+        }
+    }
+
+    if (savePresentFrameOnHotkeyPath_.has_value() && window_ != nullptr) {
+        const bool down = glfwGetKey(window_, GLFW_KEY_F10) == GLFW_PRESS;
+        if (down && !savePresentFrameHotkeyDown_) {
+            (void)savePresentFrame(*savePresentFrameOnHotkeyPath_);
+        }
+        savePresentFrameHotkeyDown_ = down;
+    }
+}
+
 void Application::initWindow() {
     if (glfwInit() != GLFW_TRUE) {
         throw std::runtime_error("glfwInit failed");
@@ -5732,9 +6440,11 @@ void Application::initWindow() {
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     const bool explicitStartupScene = scenePath_.has_value() || gltfPath_.has_value() || nativePackageScenePath_.has_value();
-    mainWindowHiddenUntilRenderer_ = !headless_ && !explicitStartupScene;
+    mainWindowHiddenUntilRenderer_ = !headless_ && !rendererOnly_ && !explicitStartupScene;
     glfwWindowHint(GLFW_VISIBLE, mainWindowHiddenUntilRenderer_ ? GLFW_FALSE : GLFW_TRUE);
-    window_ = glfwCreateWindow(initialWidth, initialHeight, "Vibode Engine", nullptr, nullptr);
+    const int windowWidth = rendererOnly_ ? static_cast<int>(headlessExtent_.width) : initialWidth;
+    const int windowHeight = rendererOnly_ ? static_cast<int>(headlessExtent_.height) : initialHeight;
+    window_ = glfwCreateWindow(windowWidth, windowHeight, "Vibode Engine", nullptr, nullptr);
     if (window_ == nullptr) {
         throw std::runtime_error("glfwCreateWindow failed");
     }
@@ -5791,15 +6501,15 @@ void Application::initVulkan() {
     if (explicitStartupScene && uiOverlay_ != nullptr) {
         uiOverlay_->editor().dismissProjectManager();
     }
-    const std::optional<std::filesystem::path> startupProjectOverride = !headless_ ? startupProjectOverridePath() : std::nullopt;
+    const std::optional<std::filesystem::path> startupProjectOverride = (!headless_ && !rendererOnly_) ? startupProjectOverridePath() : std::nullopt;
     const bool hasStartupProjectOverride = startupProjectOverride.has_value() && std::filesystem::exists(*startupProjectOverride);
     const std::filesystem::path startupProjectPath = hasStartupProjectOverride
         ? *startupProjectOverride
         : (startupPrefs != nullptr ? std::filesystem::path(startupPrefs->lastOpenedProject) : std::filesystem::path{});
-    const bool openLastProjectOnStartup = hasStartupProjectOverride ||
+    const bool openLastProjectOnStartup = !rendererOnly_ && (hasStartupProjectOverride ||
         (startupPrefs != nullptr && startupPrefs->openLastProject &&
-            !startupPrefs->lastOpenedProject.empty() && std::filesystem::exists(startupPrefs->lastOpenedProject));
-    const bool deferRendererForProjectManager = !headless_ && !explicitStartupScene && !openLastProjectOnStartup;
+            !startupPrefs->lastOpenedProject.empty() && std::filesystem::exists(startupPrefs->lastOpenedProject)));
+    const bool deferRendererForProjectManager = !headless_ && !rendererOnly_ && !explicitStartupScene && !openLastProjectOnStartup;
     if (deferRendererForProjectManager) {
         sceneUnsavedDirty_ = false;
         initializeProjectManagerStartupSceneDocument();
@@ -5911,6 +6621,14 @@ void Application::initVulkan() {
         startupSettings.renderPreset = RenderPreset::Custom;
         syncDocumentRenderSettings(sceneDocument_, startupSettings);
     }
+    if (opacityMicromapBlendOverride_.has_value()) {
+        startupSettings.opacityMicromapBlendEnabled = *opacityMicromapBlendOverride_;
+        startupSettings.renderPreset = RenderPreset::Custom;
+    }
+    if (hardwareBackfaceCullingOverride_.has_value()) {
+        startupSettings.hardwareBackfaceCullingEnabled = *hardwareBackfaceCullingOverride_;
+        startupSettings.renderPreset = RenderPreset::Custom;
+    }
     if (opacityMicromapSubdivisionOverride_.has_value()) {
         startupSettings.opacityMicromapSubdivisionLevel = *opacityMicromapSubdivisionOverride_;
         startupSettings.renderPreset = RenderPreset::Custom;
@@ -5919,7 +6637,7 @@ void Application::initVulkan() {
     syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
     applyActiveSceneCamera();
     sceneDocument_.clearDirty();
-    if (!headless_) {
+    if (!headless_ && !rendererOnly_) {
         if (loadedSceneDocument) {
             deserializeEditorSceneData();
         }
@@ -5972,6 +6690,7 @@ void Application::mainLoop(uint32_t maxFrames) {
     }
 
     while (glfwWindowShouldClose(window_) == GLFW_FALSE) {
+        const auto profileFrameStart = std::chrono::steady_clock::now();
         glfwPollEvents();
 
         const auto now = std::chrono::steady_clock::now();
@@ -6217,7 +6936,20 @@ void Application::mainLoop(uint32_t maxFrames) {
             jobCenter.completedNativeFileMigrationWarnings = completedNativeFileMigrationJob_.completedNativeFileMigrationWarnings;
             jobCenter.completedNativeFileMigrationWorkerTotalMs = completedNativeFileMigrationJob_.completedNativeFileMigrationWorkerTotalMs;
         }
-        if (uiOverlay_ && pathTracer_) {
+        if (rendererOnly_ && uiOverlay_ && pathTracer_) {
+            RendererOnlyRequests rendererOnlyRequests = uiOverlay_->buildRendererOnly(
+                *pathTracer_,
+                swapchain_->extent(),
+                gltfPath_,
+                scenePath_,
+                nativePackageScenePath_,
+                &cameraController_,
+                rawDeltaSeconds * 1000.0f,
+                captureReadyPrinted_,
+                captureReadyRenderedFrames_,
+                captureReadyAfterFrames_);
+            processRendererOnlyRequests(rendererOnlyRequests);
+        } else if (uiOverlay_ && pathTracer_) {
             editorRequests = uiOverlay_->build(
                 *pathTracer_,
                 swapchain_->extent(),
@@ -6260,25 +6992,29 @@ void Application::mainLoop(uint32_t maxFrames) {
                 &jobCenter,
                 &notifications_);
         }
-        pollMountedNativePackageChanges(editorRequests);
-        if (pendingUndo_) {
-            editorRequests.undo = true;
-            pendingUndo_ = false;
+        if (!rendererOnly_) {
+            pollMountedNativePackageChanges(editorRequests);
+            if (pendingUndo_) {
+                editorRequests.undo = true;
+                pendingUndo_ = false;
+            }
+            if (pendingRedo_) {
+                editorRequests.redo = true;
+                pendingRedo_ = false;
+            }
+            if (pendingSaveAll_) {
+                editorRequests.saveAll = true;
+                pendingSaveAll_ = false;
+            }
+            applyEditorRequests(editorRequests, false);
         }
-        if (pendingRedo_) {
-            editorRequests.redo = true;
-            pendingRedo_ = false;
-        }
-        if (pendingSaveAll_) {
-            editorRequests.saveAll = true;
-            pendingSaveAll_ = false;
-        }
-        applyEditorRequests(editorRequests, false);
         if (frameWorkProbeCompletionPending_) {
             frameWorkProbeCompletionPending_ = !frameWorkScheduler_.completeFence(frameWorkProbeJobId_);
         }
         updateAnimationPlayers(deltaSeconds);
-        prepareEditorRenderJobFrame();
+        if (!rendererOnly_) {
+            prepareEditorRenderJobFrame();
+        }
         if (beginFrameCapture_) {
             beginFrameCapture_(frameCount + 1u);
         }
@@ -6294,17 +7030,37 @@ void Application::mainLoop(uint32_t maxFrames) {
         if (endFrameCapture_) {
             endFrameCapture_(frameCount + 1u);
         }
-        updateEditorRenderJob(deltaSeconds);
-        applyEditorRequests(editorRequests, true);
-        pollAsyncSceneLoad();
-        pollAssetImportWorker();
-        pollCookProjectJob();
-        pollNativeFileMigrationJob();
-        captureProjectThumbnailIfReady();
+        updateCaptureReadyState(frameCount + 1u);
+        if (!rendererOnly_) {
+            updateEditorRenderJob(deltaSeconds);
+            applyEditorRequests(editorRequests, true);
+            pollAsyncSceneLoad();
+            pollAssetImportWorker();
+            pollCookProjectJob();
+            pollNativeFileMigrationJob();
+            captureProjectThumbnailIfReady();
+        }
         updateWindowTitle(seconds);
+
+        if (interactiveProfileCollectionEnabled_) {
+            const auto profileFrameEnd = std::chrono::steady_clock::now();
+            cpuFrameTimings_.push_back(
+                std::chrono::duration<float, std::milli>(profileFrameEnd - profileFrameStart).count());
+            if (pathTracer_ != nullptr) {
+                gpuFrameTimings_.push_back(pathTracer_->timings().totalMs());
+                perFrameGpuTimings_.push_back(pathTracer_->timings());
+            }
+        }
 
         ++frameCount;
         if (maxFrames > 0 && frameCount >= maxFrames) {
+            if (rendererOnly_ && rendererOnlyLingerAfterCaptureReadyMs_ > 0u && captureReadyPrinted_) {
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - captureReadyPrintedAt_);
+                if (elapsed.count() < static_cast<int64_t>(rendererOnlyLingerAfterCaptureReadyMs_)) {
+                    continue;
+                }
+            }
             break;
         }
     }
@@ -16054,6 +16810,12 @@ void Application::stepStreamingGpuWorkQueue() {
             .maxGpuBytes = streamingOptions_.gpuMemoryBudgetBytes,
             .maxCpuBytes = streamingOptions_.cpuMemoryBudgetBytes,
         }, streamingGpuWorkCompletedTimeline_);
+        if (lastStreamingEviction_.evictedAssets > 0 || !lastStreamingEviction_.budgetMet) {
+            streamingEvictionHistory_.emplace_back(frameSerial_, lastStreamingEviction_);
+            while (streamingEvictionHistory_.size() > 128u) {
+                streamingEvictionHistory_.pop_front();
+            }
+        }
         if (lastStreamingEviction_.evictedAssets > 0) {
             streamingRuntimeState_.pushEvent(
                 "streaming cache eviction retired " + std::to_string(lastStreamingEviction_.evictedAssets) +
@@ -16741,6 +17503,9 @@ void Application::updateWindowTitle(float seconds) {
     }
 
     std::ostringstream title;
+    if (rendererOnly_) {
+        title << "Renderer Only - ";
+    }
     title << (activeScenePath.empty() ? "Untitled Scene" : activeScenePath.stem().string());
     if (sceneUnsavedDirty_ || sceneDocument_.dirty()) {
         title << "*";

@@ -1,10 +1,13 @@
 #include "rtv/GpuProfiler.h"
 
 #include "rtv/Check.h"
+#include "rtv/NsightMarkers.h"
+#include "rtv/NsightPerfMarkers.h"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <optional>
 #include <utility>
 
 #ifndef VK_QUERY_PIPELINE_STATISTIC_RAY_INVOCATIONS_BIT_KHR
@@ -18,6 +21,138 @@
 #endif
 
 namespace rtv {
+
+namespace {
+
+const char* gpuMarkerBeginLabel(GpuProfiler::Query query) {
+    switch (query) {
+    case GpuProfiler::PathTraceStart: return "PathTrace";
+    case GpuProfiler::RestirHistoryClearStart: return "ReSTIR History Clear";
+    case GpuProfiler::RestirGiClearStart: return "ReSTIR GI Clear";
+    case GpuProfiler::RestirGiTemporalStart: return "ReSTIR GI Temporal";
+    case GpuProfiler::RestirSpatialStart: return "ReSTIR Spatial";
+    case GpuProfiler::RestirSpatialCopyStart: return "ReSTIR Spatial Copy";
+    case GpuProfiler::RestirGiSpatialStart: return "ReSTIR GI Spatial";
+    case GpuProfiler::RestirGiUpsampleStart: return "ReSTIR GI Upsample";
+    case GpuProfiler::RestirGiFinalStart: return "ReSTIR GI Final";
+    case GpuProfiler::RestirGiCountersReadbackStart: return "ReSTIR GI Counters Readback";
+    case GpuProfiler::RestirDiTemporalStart: return "ReSTIR DI Temporal";
+    case GpuProfiler::RestirDiSpatialStart: return "ReSTIR DI Spatial";
+    case GpuProfiler::RestirDiFinalStart: return "ReSTIR DI Final";
+    case GpuProfiler::RestirDiHistoryCopyStart: return "ReSTIR DI History Copy";
+    case GpuProfiler::RestirDiCountersReadbackStart: return "ReSTIR DI Counters Readback";
+    case GpuProfiler::FogIntegrateStart: return "Fog Integrate";
+    case GpuProfiler::AtmosphereStart: return "Atmosphere";
+    case GpuProfiler::AtmosphereTransmittanceStart: return "Atmosphere Transmittance";
+    case GpuProfiler::AtmosphereMultiScatterStart: return "Atmosphere Multi-Scatter";
+    case GpuProfiler::AtmosphereSkyViewStart: return "Atmosphere Sky View";
+    case GpuProfiler::AtmosphereSkyReprojectStart: return "Atmosphere Sky Reproject";
+    case GpuProfiler::AtmosphereSkyCdfStart: return "Atmosphere Sky CDF";
+    case GpuProfiler::AtmosphereAerialPerspectiveStart: return "Atmosphere Aerial Perspective";
+    case GpuProfiler::DenoiserStart: return "Denoiser";
+    case GpuProfiler::MomentUpdateStart: return "Moment Update";
+    case GpuProfiler::HistoryCopyStart: return "History Copy";
+    case GpuProfiler::SkipDenoiserCopyStart: return "Skip Denoiser Copy";
+    case GpuProfiler::TaaStart: return "TAA/TSR";
+    case GpuProfiler::TaaHistoryCopyStart: return "TAA History Copy";
+    case GpuProfiler::AutoExposureHistogramClearStart: return "AutoExposure Histogram Clear";
+    case GpuProfiler::AutoExposureHistogramStart: return "AutoExposure Histogram";
+    case GpuProfiler::AutoExposureReduceStart: return "AutoExposure Reduce";
+    case GpuProfiler::ToneMapStart: return "ToneMap";
+    case GpuProfiler::SelectionOutlineStart: return "Selection Outline";
+    case GpuProfiler::FullscreenStart: return "Fullscreen/Present";
+    case GpuProfiler::EditorPresentationStart: return "Editor Presentation";
+    case GpuProfiler::WavefrontShadowTraceStart: return "Wavefront Shadow Trace";
+    case GpuProfiler::WavefrontCompactStart: return "Wavefront Compact";
+    case GpuProfiler::WavefrontSortStart: return "Wavefront Sort";
+    case GpuProfiler::WavefrontShadeStart: return "Wavefront Shade";
+    case GpuProfiler::WavefrontSortedShadeStart: return "Wavefront Sorted Shade";
+    case GpuProfiler::WavefrontSecondaryShadeStart: return "Wavefront Secondary Shade";
+    case GpuProfiler::WavefrontTraceStart: return "Wavefront Trace";
+    case GpuProfiler::WavefrontSecondaryTraceStart: return "Wavefront Secondary Trace";
+    case GpuProfiler::WavefrontSortedTraceStart: return "Wavefront Sorted Trace";
+    case GpuProfiler::DynamicBlasUpdateStart: return "BLAS/TLAS Update";
+    case GpuProfiler::AsyncComputeStart: return "Async Compute";
+    default: return nullptr;
+    }
+}
+
+bool gpuMarkerEndsLabel(GpuProfiler::Query query) {
+    switch (query) {
+    case GpuProfiler::PathTraceEnd:
+    case GpuProfiler::RestirHistoryClearEnd:
+    case GpuProfiler::RestirGiClearEnd:
+    case GpuProfiler::RestirGiTemporalEnd:
+    case GpuProfiler::RestirSpatialEnd:
+    case GpuProfiler::RestirSpatialCopyEnd:
+    case GpuProfiler::RestirGiSpatialEnd:
+    case GpuProfiler::RestirGiUpsampleEnd:
+    case GpuProfiler::RestirGiFinalEnd:
+    case GpuProfiler::RestirGiCountersReadbackEnd:
+    case GpuProfiler::RestirDiTemporalEnd:
+    case GpuProfiler::RestirDiSpatialEnd:
+    case GpuProfiler::RestirDiFinalEnd:
+    case GpuProfiler::RestirDiHistoryCopyEnd:
+    case GpuProfiler::RestirDiCountersReadbackEnd:
+    case GpuProfiler::FogIntegrateEnd:
+    case GpuProfiler::AtmosphereEnd:
+    case GpuProfiler::AtmosphereTransmittanceEnd:
+    case GpuProfiler::AtmosphereMultiScatterEnd:
+    case GpuProfiler::AtmosphereSkyViewEnd:
+    case GpuProfiler::AtmosphereSkyReprojectEnd:
+    case GpuProfiler::AtmosphereSkyCdfEnd:
+    case GpuProfiler::AtmosphereAerialPerspectiveEnd:
+    case GpuProfiler::DenoiserEnd:
+    case GpuProfiler::MomentUpdateEnd:
+    case GpuProfiler::HistoryCopyEnd:
+    case GpuProfiler::SkipDenoiserCopyEnd:
+    case GpuProfiler::TaaEnd:
+    case GpuProfiler::TaaHistoryCopyEnd:
+    case GpuProfiler::AutoExposureHistogramClearEnd:
+    case GpuProfiler::AutoExposureHistogramEnd:
+    case GpuProfiler::AutoExposureReduceEnd:
+    case GpuProfiler::ToneMapEnd:
+    case GpuProfiler::SelectionOutlineEnd:
+    case GpuProfiler::FullscreenEnd:
+    case GpuProfiler::EditorPresentationEnd:
+    case GpuProfiler::WavefrontShadowTraceEnd:
+    case GpuProfiler::WavefrontCompactEnd:
+    case GpuProfiler::WavefrontSortEnd:
+    case GpuProfiler::WavefrontShadeEnd:
+    case GpuProfiler::WavefrontSortedShadeEnd:
+    case GpuProfiler::WavefrontSecondaryShadeEnd:
+    case GpuProfiler::WavefrontTraceEnd:
+    case GpuProfiler::WavefrontSecondaryTraceEnd:
+    case GpuProfiler::WavefrontSortedTraceEnd:
+    case GpuProfiler::DynamicBlasUpdateEnd:
+    case GpuProfiler::AsyncComputeEnd:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void beginGpuMarker(VkCommandBuffer commandBuffer, const char* label) {
+    if (label == nullptr || vkCmdBeginDebugUtilsLabelEXT == nullptr) {
+        return;
+    }
+    VkDebugUtilsLabelEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    info.pLabelName = label;
+    info.color[0] = 0.21f;
+    info.color[1] = 0.53f;
+    info.color[2] = 0.88f;
+    info.color[3] = 1.0f;
+    vkCmdBeginDebugUtilsLabelEXT(commandBuffer, &info);
+}
+
+void endGpuMarker(VkCommandBuffer commandBuffer) {
+    if (vkCmdEndDebugUtilsLabelEXT != nullptr) {
+        vkCmdEndDebugUtilsLabelEXT(commandBuffer);
+    }
+}
+
+} // namespace
 
 GpuProfiler::GpuProfiler(VkDevice device, VkPhysicalDevice physicalDevice) {
     create(device, physicalDevice);
@@ -40,6 +175,8 @@ GpuProfiler& GpuProfiler::operator=(GpuProfiler&& other) noexcept {
         timestampPeriod_ = other.timestampPeriod_;
         submitted_ = other.submitted_;
         statsSubmitted_ = other.statsSubmitted_;
+        gpuMarkersEnabled_ = other.gpuMarkersEnabled_;
+        activeQueries_ = other.activeQueries_;
         timings_ = other.timings_;
         pipelineStats_ = other.pipelineStats_;
         smoothedPipelineStats_ = other.smoothedPipelineStats_;
@@ -48,6 +185,7 @@ GpuProfiler& GpuProfiler::operator=(GpuProfiler&& other) noexcept {
         other.statsQueryPool_ = VK_NULL_HANDLE;
         other.submitted_ = false;
         other.statsSubmitted_ = false;
+        other.activeQueries_.fill(false);
     }
     return *this;
 }
@@ -103,6 +241,7 @@ void GpuProfiler::destroy() {
     statsQueryPool_ = VK_NULL_HANDLE;
     submitted_ = false;
     statsSubmitted_ = false;
+    activeQueries_.fill(false);
 }
 
 void GpuProfiler::collectCompletedFrame() {
@@ -136,7 +275,10 @@ void GpuProfiler::collectCompletedFrame() {
         return;
     }
 
-    const auto elapsedMs = [&](Query begin, Query end) {
+    const auto elapsedMs = [&](Query begin, Query end) -> std::optional<float> {
+        if (!activeQueries_[begin] || !activeQueries_[end]) {
+            return std::nullopt;
+        }
         if (timestamps[begin].available == 0 || timestamps[end].available == 0 ||
             timestamps[end].timestamp <= timestamps[begin].timestamp) {
             return 0.0f;
@@ -148,54 +290,61 @@ void GpuProfiler::collectCompletedFrame() {
     const auto smooth = [](float previous, float current) {
         return previous <= 0.0f ? current : previous * 0.8f + current * 0.2f;
     };
-    timings_.pathTraceMs = smooth(timings_.pathTraceMs, elapsedMs(PathTraceStart, PathTraceEnd));
-    timings_.restirHistoryClearMs = smooth(timings_.restirHistoryClearMs, elapsedMs(RestirHistoryClearStart, RestirHistoryClearEnd));
-    timings_.restirGiClearMs = smooth(timings_.restirGiClearMs, elapsedMs(RestirGiClearStart, RestirGiClearEnd));
-    timings_.restirGiTemporalMs = smooth(timings_.restirGiTemporalMs, elapsedMs(RestirGiTemporalStart, RestirGiTemporalEnd));
-    timings_.restirSpatialMs = smooth(timings_.restirSpatialMs, elapsedMs(RestirSpatialStart, RestirSpatialEnd));
-    timings_.restirSpatialCopyMs = smooth(timings_.restirSpatialCopyMs, elapsedMs(RestirSpatialCopyStart, RestirSpatialCopyEnd));
-    timings_.restirGiSpatialMs = smooth(timings_.restirGiSpatialMs, elapsedMs(RestirGiSpatialStart, RestirGiSpatialEnd));
-    timings_.restirGiUpsampleMs = smooth(timings_.restirGiUpsampleMs, elapsedMs(RestirGiUpsampleStart, RestirGiUpsampleEnd));
-    timings_.restirGiFinalMs = smooth(timings_.restirGiFinalMs, elapsedMs(RestirGiFinalStart, RestirGiFinalEnd));
-    timings_.restirGiCountersReadbackMs = smooth(timings_.restirGiCountersReadbackMs, elapsedMs(RestirGiCountersReadbackStart, RestirGiCountersReadbackEnd));
-    timings_.restirDiTemporalMs = smooth(timings_.restirDiTemporalMs, elapsedMs(RestirDiTemporalStart, RestirDiTemporalEnd));
-    timings_.restirDiSpatialMs = smooth(timings_.restirDiSpatialMs, elapsedMs(RestirDiSpatialStart, RestirDiSpatialEnd));
-    timings_.restirDiFinalMs = smooth(timings_.restirDiFinalMs, elapsedMs(RestirDiFinalStart, RestirDiFinalEnd));
-    timings_.restirDiHistoryCopyMs = smooth(timings_.restirDiHistoryCopyMs, elapsedMs(RestirDiHistoryCopyStart, RestirDiHistoryCopyEnd));
-    timings_.restirDiCountersReadbackMs = smooth(timings_.restirDiCountersReadbackMs, elapsedMs(RestirDiCountersReadbackStart, RestirDiCountersReadbackEnd));
-    timings_.fogIntegrateMs = smooth(timings_.fogIntegrateMs, elapsedMs(FogIntegrateStart, FogIntegrateEnd));
-    timings_.atmosphereMs = smooth(timings_.atmosphereMs, elapsedMs(AtmosphereStart, AtmosphereEnd));
-    timings_.atmosphereTransmittanceMs = smooth(timings_.atmosphereTransmittanceMs, elapsedMs(AtmosphereTransmittanceStart, AtmosphereTransmittanceEnd));
-    timings_.atmosphereMultiScatterMs = smooth(timings_.atmosphereMultiScatterMs, elapsedMs(AtmosphereMultiScatterStart, AtmosphereMultiScatterEnd));
-    timings_.atmosphereSkyViewMs = smooth(timings_.atmosphereSkyViewMs, elapsedMs(AtmosphereSkyViewStart, AtmosphereSkyViewEnd));
-    timings_.atmosphereSkyReprojectMs = smooth(timings_.atmosphereSkyReprojectMs, elapsedMs(AtmosphereSkyReprojectStart, AtmosphereSkyReprojectEnd));
-    timings_.atmosphereSkyCdfMs = smooth(timings_.atmosphereSkyCdfMs, elapsedMs(AtmosphereSkyCdfStart, AtmosphereSkyCdfEnd));
-    timings_.atmosphereAerialPerspectiveMs = smooth(timings_.atmosphereAerialPerspectiveMs, elapsedMs(AtmosphereAerialPerspectiveStart, AtmosphereAerialPerspectiveEnd));
-    timings_.denoiserMs = smooth(timings_.denoiserMs, elapsedMs(DenoiserStart, DenoiserEnd));
-    timings_.momentUpdateMs = smooth(timings_.momentUpdateMs, elapsedMs(MomentUpdateStart, MomentUpdateEnd));
-    timings_.historyCopyMs = smooth(timings_.historyCopyMs, elapsedMs(HistoryCopyStart, HistoryCopyEnd));
-    timings_.skipDenoiserCopyMs = smooth(timings_.skipDenoiserCopyMs, elapsedMs(SkipDenoiserCopyStart, SkipDenoiserCopyEnd));
-    timings_.taaMs = smooth(timings_.taaMs, elapsedMs(TaaStart, TaaEnd));
-    timings_.taaHistoryCopyMs = smooth(timings_.taaHistoryCopyMs, elapsedMs(TaaHistoryCopyStart, TaaHistoryCopyEnd));
-    timings_.autoExposureHistogramClearMs = smooth(timings_.autoExposureHistogramClearMs, elapsedMs(AutoExposureHistogramClearStart, AutoExposureHistogramClearEnd));
-    timings_.autoExposureHistogramMs = smooth(timings_.autoExposureHistogramMs, elapsedMs(AutoExposureHistogramStart, AutoExposureHistogramEnd));
-    timings_.autoExposureReduceMs = smooth(timings_.autoExposureReduceMs, elapsedMs(AutoExposureReduceStart, AutoExposureReduceEnd));
+    const auto updateTiming = [&](float& dst, Query begin, Query end) {
+        if (std::optional<float> current = elapsedMs(begin, end)) {
+            dst = smooth(dst, *current);
+        } else {
+            dst = 0.0f;
+        }
+    };
+    updateTiming(timings_.pathTraceMs, PathTraceStart, PathTraceEnd);
+    updateTiming(timings_.restirHistoryClearMs, RestirHistoryClearStart, RestirHistoryClearEnd);
+    updateTiming(timings_.restirGiClearMs, RestirGiClearStart, RestirGiClearEnd);
+    updateTiming(timings_.restirGiTemporalMs, RestirGiTemporalStart, RestirGiTemporalEnd);
+    updateTiming(timings_.restirSpatialMs, RestirSpatialStart, RestirSpatialEnd);
+    updateTiming(timings_.restirSpatialCopyMs, RestirSpatialCopyStart, RestirSpatialCopyEnd);
+    updateTiming(timings_.restirGiSpatialMs, RestirGiSpatialStart, RestirGiSpatialEnd);
+    updateTiming(timings_.restirGiUpsampleMs, RestirGiUpsampleStart, RestirGiUpsampleEnd);
+    updateTiming(timings_.restirGiFinalMs, RestirGiFinalStart, RestirGiFinalEnd);
+    updateTiming(timings_.restirGiCountersReadbackMs, RestirGiCountersReadbackStart, RestirGiCountersReadbackEnd);
+    updateTiming(timings_.restirDiTemporalMs, RestirDiTemporalStart, RestirDiTemporalEnd);
+    updateTiming(timings_.restirDiSpatialMs, RestirDiSpatialStart, RestirDiSpatialEnd);
+    updateTiming(timings_.restirDiFinalMs, RestirDiFinalStart, RestirDiFinalEnd);
+    updateTiming(timings_.restirDiHistoryCopyMs, RestirDiHistoryCopyStart, RestirDiHistoryCopyEnd);
+    updateTiming(timings_.restirDiCountersReadbackMs, RestirDiCountersReadbackStart, RestirDiCountersReadbackEnd);
+    updateTiming(timings_.fogIntegrateMs, FogIntegrateStart, FogIntegrateEnd);
+    updateTiming(timings_.atmosphereMs, AtmosphereStart, AtmosphereEnd);
+    updateTiming(timings_.atmosphereTransmittanceMs, AtmosphereTransmittanceStart, AtmosphereTransmittanceEnd);
+    updateTiming(timings_.atmosphereMultiScatterMs, AtmosphereMultiScatterStart, AtmosphereMultiScatterEnd);
+    updateTiming(timings_.atmosphereSkyViewMs, AtmosphereSkyViewStart, AtmosphereSkyViewEnd);
+    updateTiming(timings_.atmosphereSkyReprojectMs, AtmosphereSkyReprojectStart, AtmosphereSkyReprojectEnd);
+    updateTiming(timings_.atmosphereSkyCdfMs, AtmosphereSkyCdfStart, AtmosphereSkyCdfEnd);
+    updateTiming(timings_.atmosphereAerialPerspectiveMs, AtmosphereAerialPerspectiveStart, AtmosphereAerialPerspectiveEnd);
+    updateTiming(timings_.denoiserMs, DenoiserStart, DenoiserEnd);
+    updateTiming(timings_.momentUpdateMs, MomentUpdateStart, MomentUpdateEnd);
+    updateTiming(timings_.historyCopyMs, HistoryCopyStart, HistoryCopyEnd);
+    updateTiming(timings_.skipDenoiserCopyMs, SkipDenoiserCopyStart, SkipDenoiserCopyEnd);
+    updateTiming(timings_.taaMs, TaaStart, TaaEnd);
+    updateTiming(timings_.taaHistoryCopyMs, TaaHistoryCopyStart, TaaHistoryCopyEnd);
+    updateTiming(timings_.autoExposureHistogramClearMs, AutoExposureHistogramClearStart, AutoExposureHistogramClearEnd);
+    updateTiming(timings_.autoExposureHistogramMs, AutoExposureHistogramStart, AutoExposureHistogramEnd);
+    updateTiming(timings_.autoExposureReduceMs, AutoExposureReduceStart, AutoExposureReduceEnd);
     timings_.autoExposureMs = timings_.autoExposureHistogramClearMs + timings_.autoExposureHistogramMs + timings_.autoExposureReduceMs;
-    timings_.toneMapMs = smooth(timings_.toneMapMs, elapsedMs(ToneMapStart, ToneMapEnd));
-    timings_.selectionOutlineMs = smooth(timings_.selectionOutlineMs, elapsedMs(SelectionOutlineStart, SelectionOutlineEnd));
-    timings_.fullscreenMs = smooth(timings_.fullscreenMs, elapsedMs(FullscreenStart, FullscreenEnd));
-    timings_.editorPresentationMs = smooth(timings_.editorPresentationMs, elapsedMs(EditorPresentationStart, EditorPresentationEnd));
-    timings_.dynamicBlasUpdateMs = smooth(timings_.dynamicBlasUpdateMs, elapsedMs(DynamicBlasUpdateStart, DynamicBlasUpdateEnd));
-    timings_.wavefrontTraceMs = smooth(timings_.wavefrontTraceMs, elapsedMs(WavefrontTraceStart, WavefrontTraceEnd));
-    timings_.wavefrontSecondaryTraceMs = smooth(timings_.wavefrontSecondaryTraceMs, elapsedMs(WavefrontSecondaryTraceStart, WavefrontSecondaryTraceEnd));
-    timings_.wavefrontSortedTraceMs = smooth(timings_.wavefrontSortedTraceMs, elapsedMs(WavefrontSortedTraceStart, WavefrontSortedTraceEnd));
-    timings_.wavefrontShadowTraceMs = smooth(timings_.wavefrontShadowTraceMs, elapsedMs(WavefrontShadowTraceStart, WavefrontShadowTraceEnd));
-    timings_.wavefrontShadeMs = smooth(timings_.wavefrontShadeMs, elapsedMs(WavefrontShadeStart, WavefrontShadeEnd));
-    timings_.wavefrontSecondaryShadeMs = smooth(timings_.wavefrontSecondaryShadeMs, elapsedMs(WavefrontSecondaryShadeStart, WavefrontSecondaryShadeEnd));
-    timings_.wavefrontSortedShadeMs = smooth(timings_.wavefrontSortedShadeMs, elapsedMs(WavefrontSortedShadeStart, WavefrontSortedShadeEnd));
-    timings_.wavefrontCompactMs = smooth(timings_.wavefrontCompactMs, elapsedMs(WavefrontCompactStart, WavefrontCompactEnd));
-    timings_.wavefrontSortMs = smooth(timings_.wavefrontSortMs, elapsedMs(WavefrontSortStart, WavefrontSortEnd));
-    timings_.queueWaitMs = smooth(timings_.queueWaitMs, elapsedMs(AsyncProducerEnd, AsyncComputeStart));
+    updateTiming(timings_.toneMapMs, ToneMapStart, ToneMapEnd);
+    updateTiming(timings_.selectionOutlineMs, SelectionOutlineStart, SelectionOutlineEnd);
+    updateTiming(timings_.fullscreenMs, FullscreenStart, FullscreenEnd);
+    updateTiming(timings_.editorPresentationMs, EditorPresentationStart, EditorPresentationEnd);
+    updateTiming(timings_.dynamicBlasUpdateMs, DynamicBlasUpdateStart, DynamicBlasUpdateEnd);
+    updateTiming(timings_.wavefrontTraceMs, WavefrontTraceStart, WavefrontTraceEnd);
+    updateTiming(timings_.wavefrontSecondaryTraceMs, WavefrontSecondaryTraceStart, WavefrontSecondaryTraceEnd);
+    updateTiming(timings_.wavefrontSortedTraceMs, WavefrontSortedTraceStart, WavefrontSortedTraceEnd);
+    updateTiming(timings_.wavefrontShadowTraceMs, WavefrontShadowTraceStart, WavefrontShadowTraceEnd);
+    updateTiming(timings_.wavefrontShadeMs, WavefrontShadeStart, WavefrontShadeEnd);
+    updateTiming(timings_.wavefrontSecondaryShadeMs, WavefrontSecondaryShadeStart, WavefrontSecondaryShadeEnd);
+    updateTiming(timings_.wavefrontSortedShadeMs, WavefrontSortedShadeStart, WavefrontSortedShadeEnd);
+    updateTiming(timings_.wavefrontCompactMs, WavefrontCompactStart, WavefrontCompactEnd);
+    updateTiming(timings_.wavefrontSortMs, WavefrontSortStart, WavefrontSortEnd);
+    updateTiming(timings_.queueWaitMs, AsyncProducerEnd, AsyncComputeStart);
     timings_.rayTracingLaneMs = timings_.pathTraceMs +
         timings_.dynamicBlasUpdateMs +
         timings_.wavefrontTraceMs +
@@ -275,15 +424,33 @@ void GpuProfiler::resetForFrame(VkCommandBuffer commandBuffer) {
     if (queryPool_ != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(commandBuffer, queryPool_, 0, Count);
     }
+    activeQueries_.fill(false);
     if (statsQueryPool_ != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(commandBuffer, statsQueryPool_, 0, 1);
     }
 }
 
-void GpuProfiler::write(VkCommandBuffer commandBuffer, Query query, VkPipelineStageFlagBits2 stage) const {
+void GpuProfiler::write(VkCommandBuffer commandBuffer, Query query, VkPipelineStageFlagBits2 stage) {
+    if (gpuMarkersEnabled_) {
+        const char* label = gpuMarkerBeginLabel(query);
+        beginGpuMarker(commandBuffer, label);
+        beginNsightRange(label);
+        (void)beginNsightPerfCommandBufferRange(commandBuffer, label);
+    }
     if (queryPool_ != VK_NULL_HANDLE) {
+        activeQueries_[query] = true;
         vkCmdWriteTimestamp2(commandBuffer, stage, queryPool_, query);
     }
+    if (gpuMarkersEnabled_ && gpuMarkerEndsLabel(query)) {
+        endGpuMarker(commandBuffer);
+        endNsightRange();
+        (void)endNsightPerfCommandBufferRange(commandBuffer);
+    }
+}
+
+void GpuProfiler::setGpuMarkersEnabled(bool enabled) {
+    gpuMarkersEnabled_ = enabled;
+    setNsightMarkersEnabled(enabled);
 }
 
 void GpuProfiler::beginPipelineStats(VkCommandBuffer commandBuffer) const {

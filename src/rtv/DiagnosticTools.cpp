@@ -1551,6 +1551,200 @@ int checkBudget(const std::filesystem::path& budgetPath, const ProfileReport& pr
             });
         }
     }
+    auto jsonUint = [](const json& object, const char* key) -> uint64_t {
+        if (!object.is_object() || !object.contains(key)) {
+            return 0ull;
+        }
+        const json& value = object.at(key);
+        if (value.is_number_unsigned()) {
+            return value.get<uint64_t>();
+        }
+        if (value.is_number_integer()) {
+            return static_cast<uint64_t>(std::max<int64_t>(0, value.get<int64_t>()));
+        }
+        return 0ull;
+    };
+    auto jsonNestedUint = [&jsonUint](const json& object, const char* objectKey, const char* valueKey) -> uint64_t {
+        if (!object.is_object() || !object.contains(objectKey) || !object.at(objectKey).is_object()) {
+            return 0ull;
+        }
+        return jsonUint(object.at(objectKey), valueKey);
+    };
+    auto jsonBool = [](const json& object, const char* key) -> bool {
+        if (!object.is_object() || !object.contains(key)) {
+            return false;
+        }
+        const json& value = object.at(key);
+        return value.is_boolean() ? value.get<bool>() : false;
+    };
+    auto requireBool = [&failures, &budget](const char* key, bool actual, const char* metric) {
+        if (budget.value(key, false) && !actual) {
+            failures.push_back({
+                {"metric", metric},
+                {"actual", actual},
+                {"budget", true},
+            });
+        }
+    };
+    requireBool(
+        "require_gpu_markers",
+        profile.nvidiaIntegrations.vulkanDebugLabelsAvailable,
+        "nvidia_integrations.vulkan_debug_labels_available");
+    requireBool(
+        "require_gpu_object_names",
+        profile.nvidiaIntegrations.vulkanDebugObjectNamesAvailable,
+        "nvidia_integrations.vulkan_debug_object_names_available");
+    requireBool(
+        "require_nsight_perf_sdk",
+        profile.nvidiaIntegrations.nsightPerfSdk.reportGeneratorInitialized,
+        "nvidia_integrations.nsight_perf_sdk.report_generator_initialized");
+    requireBool(
+        "require_nsight_perf_command_buffer_ranges",
+        profile.nvidiaIntegrations.nsightPerfSdk.commandBufferRanges.commandBufferRangesAvailable,
+        "nvidia_integrations.nsight_perf_sdk.command_buffer_ranges.available");
+    requireBool(
+        "require_nsight_perf_range_emission",
+        profile.nvidiaIntegrations.nsightPerfSdk.commandBufferRanges.pushedRanges > 0ull &&
+            profile.nvidiaIntegrations.nsightPerfSdk.commandBufferRanges.failedPushes == 0ull,
+        "nvidia_integrations.nsight_perf_sdk.command_buffer_ranges.pushed_ranges");
+    requireBool(
+        "require_nsight_perf_report",
+        profile.nvidiaIntegrations.nsightPerfSdk.commandBufferRanges.captureSucceeded,
+        "nvidia_integrations.nsight_perf_sdk.command_buffer_ranges.capture_succeeded");
+    requireBool(
+        "require_gpu_crash_dump_build",
+        profile.nvidiaIntegrations.gpuCrashDumps.buildAvailable,
+        "nvidia_integrations.gpu_crash_dumps.build_available");
+    requireBool(
+        "require_gpu_crash_dumps_enabled",
+        profile.nvidiaIntegrations.gpuCrashDumps.requested && profile.nvidiaIntegrations.gpuCrashDumps.enabled,
+        "nvidia_integrations.gpu_crash_dumps.enabled");
+    if (budget.value("require_no_streaming_uploads", false)) {
+        const uint64_t streamingUploads =
+            profile.textureDiagnostics.is_object() &&
+                profile.textureDiagnostics.contains("streaming_image_uploads_during_capture")
+            ? jsonUint(profile.textureDiagnostics, "streaming_image_uploads_during_capture")
+            : jsonUint(profile.textureDiagnostics, "streaming_upload_count");
+        if (streamingUploads > 0ull) {
+            failures.push_back({
+                {"metric", "texture_cache_diagnostics.streaming_image_uploads_during_capture"},
+                {"actual", streamingUploads},
+                {"budget", 0},
+            });
+        }
+    }
+    if (budget.value("require_capture_ready_snapshot", false)) {
+        const bool snapshotValid = jsonBool(profile.textureDiagnostics, "capture_upload_snapshot_valid");
+        const uint64_t snapshotFrame = jsonUint(profile.textureDiagnostics, "capture_snapshot_frame");
+        if (!snapshotValid || snapshotFrame == 0ull) {
+            failures.push_back({
+                {"metric", "texture_cache_diagnostics.capture_ready_snapshot"},
+                {"capture_upload_snapshot_valid", snapshotValid},
+                {"capture_snapshot_frame", snapshotFrame},
+                {"budget", "capture-ready snapshot required"},
+            });
+        }
+    }
+    if (budget.contains("max_texture_warning_count")) {
+        const uint64_t maxWarnings = bytesFromBudgetValue(budget["max_texture_warning_count"]);
+        const uint64_t warningCount =
+            profile.textureDiagnostics.is_object() && profile.textureDiagnostics.contains("warnings") &&
+                profile.textureDiagnostics.at("warnings").is_array()
+            ? profile.textureDiagnostics.at("warnings").size()
+            : 0ull;
+        if (warningCount > maxWarnings) {
+            failures.push_back({
+                {"metric", "texture_cache_diagnostics.warnings"},
+                {"actual", warningCount},
+                {"budget", maxWarnings},
+            });
+        }
+    }
+    if (budget.value("require_runtime_texture_residency", false)) {
+        const uint64_t boundImported = jsonNestedUint(
+            profile.textureDiagnostics,
+            "runtime_residency",
+            "bound_imported_texture_count");
+        const uint64_t residentImported = jsonNestedUint(
+            profile.textureDiagnostics,
+            "runtime_residency",
+            "resident_imported_texture_count");
+        const uint64_t residentMips = jsonNestedUint(
+            profile.textureDiagnostics,
+            "runtime_residency",
+            "resident_imported_mip_count");
+        const uint64_t residentBytes = jsonNestedUint(
+            profile.textureDiagnostics,
+            "runtime_residency",
+            "estimated_resident_imported_bytes");
+        if (boundImported > 0ull && (residentImported == 0ull || residentMips == 0ull || residentBytes == 0ull)) {
+            failures.push_back({
+                {"metric", "texture_cache_diagnostics.runtime_residency.imported"},
+                {"bound_imported_texture_count", boundImported},
+                {"resident_imported_texture_count", residentImported},
+                {"resident_imported_mip_count", residentMips},
+                {"estimated_resident_imported_bytes", residentBytes},
+                {"budget", "runtime residency required for imported textures"},
+            });
+        }
+    }
+    if (budget.contains("min_imported_resident_texture_count")) {
+        const uint64_t minResident = bytesFromBudgetValue(budget["min_imported_resident_texture_count"]);
+        const uint64_t residentImported = jsonNestedUint(
+            profile.textureDiagnostics,
+            "runtime_residency",
+            "resident_imported_texture_count");
+        if (residentImported < minResident) {
+            failures.push_back({
+                {"metric", "texture_cache_diagnostics.runtime_residency.resident_imported_texture_count"},
+                {"actual", residentImported},
+                {"budget", minResident},
+            });
+        }
+    }
+    if (budget.contains("max_imported_runtime_texture_bytes")) {
+        const uint64_t maxBytes = bytesFromBudgetValue(budget["max_imported_runtime_texture_bytes"]);
+        const uint64_t residentBytes = jsonNestedUint(
+            profile.textureDiagnostics,
+            "runtime_residency",
+            "estimated_resident_imported_bytes");
+        if (residentBytes > maxBytes) {
+            failures.push_back({
+                {"metric", "texture_cache_diagnostics.runtime_residency.estimated_resident_imported_bytes"},
+                {"actual", residentBytes},
+                {"budget", maxBytes},
+            });
+        }
+    }
+    if (budget.contains("max_high_optimization_hint_count")) {
+        const uint64_t maxHints = bytesFromBudgetValue(budget["max_high_optimization_hint_count"]);
+        uint64_t highHintCount = 0;
+        if (profile.optimizationHints.is_array()) {
+            for (const json& hint : profile.optimizationHints) {
+                if (hint.value("severity", "") == "high") {
+                    ++highHintCount;
+                }
+            }
+        }
+        if (highHintCount > maxHints) {
+            failures.push_back({
+                {"metric", "optimization_hints.high_count"},
+                {"actual", highHintCount},
+                {"budget", maxHints},
+            });
+        }
+    }
+    if (budget.contains("max_acceleration_structure_mb")) {
+        const double maxAsMb = budget["max_acceleration_structure_mb"].get<double>();
+        const double actualAsMb = static_cast<double>(profile.memory.accelerationStructureBytes) / (1024.0 * 1024.0);
+        if (actualAsMb > maxAsMb) {
+            failures.push_back({
+                {"metric", "memory.acceleration_structure_mb"},
+                {"actual_mb", actualAsMb},
+                {"budget_mb", maxAsMb},
+            });
+        }
+    }
 
     const std::map<std::string, uint64_t> memoryBytes = profileMemoryBytes(profile);
     if (budget.contains("memory_total_bytes")) {

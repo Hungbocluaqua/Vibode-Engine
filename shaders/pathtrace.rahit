@@ -7,7 +7,8 @@ layout(location = 0) rayPayloadInEXT RayPayload payload;
 
 void main() {
     record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_INVOCATIONS);
-    uint instanceIndex = gl_InstanceCustomIndexEXT;
+    uint tlasRecordIndex = gl_InstanceCustomIndexEXT;
+    uint instanceIndex = scene_instance_index_from_tlas_record(tlasRecordIndex);
     if (instanceIndex >= mesh_params.instance_count) {
         record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
         ignoreIntersectionEXT;
@@ -18,7 +19,7 @@ void main() {
     uint meshIndex = instance.metadata.x;
     MeshRecord mesh = mesh_records[meshIndex];
     uint firstIndex = mesh.vertex_index_data.z;
-    uint globalTriangleIndex = geometry_triangle_offset(meshIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
+    uint globalTriangleIndex = geometry_triangle_offset(meshIndex, tlasRecordIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
     uint triIndex = globalTriangleIndex * 3u;
     uint i0 = local_mesh_indices[triIndex + 0u];
     uint i1 = local_mesh_indices[triIndex + 1u];
@@ -35,17 +36,24 @@ void main() {
     bool frontFace = dot(worldGeomNormal, gl_WorldRayDirectionEXT) < 0.0;
 
     uint materialIndex = material_for_triangle_index(globalTriangleIndex);
-    Material material = decode_material(materialIndex);
-    if (!frontFace && material.double_sided == 0u) {
+    MaterialRuntimeHeader materialHeader = decode_material_runtime_header(materialIndex);
+    record_rt_alpha_material_counter(materialIndex, RT_ALPHA_MATERIAL_COUNTER_PRIMARY_ANY_HIT);
+    record_rt_alpha_class_counter(
+        materialHeader.alpha_mode,
+        RT_DIAG_PRIMARY_ANY_HIT_OPAQUE,
+        RT_DIAG_PRIMARY_ANY_HIT_ALPHA_TESTED,
+        RT_DIAG_PRIMARY_ANY_HIT_BLENDED);
+    if (!frontFace && materialHeader.double_sided == 0u) {
         record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
         ignoreIntersectionEXT;
         return;
     }
-    if (material.alpha_mode == ALPHA_MODE_OPAQUE) {
+    if (materialHeader.alpha_mode == ALPHA_MODE_OPAQUE) {
         record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_ACCEPTED);
         return;
     }
 
+    Material material = decode_material(materialIndex);
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
     vec2 uv = vec2(
         v0.position_uv_x.w * bary.x + v1.position_uv_x.w * bary.y + v2.position_uv_x.w * bary.z,

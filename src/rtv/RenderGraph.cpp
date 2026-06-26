@@ -1,5 +1,7 @@
 #include "rtv/RenderGraph.h"
 
+#include "rtv/NsightMarkers.h"
+#include "rtv/NsightPerfMarkers.h"
 #include "rtv/ResourceAllocator.h"
 
 #include <algorithm>
@@ -731,6 +733,8 @@ void RenderGraph::execute(VkCommandBuffer commandBuffer, uint64_t frameIndex) {
         if (callback) {
             insertDebugBreadcrumb(commandBuffer, passes_[passIndex].name().c_str());
             beginDebugLabel(commandBuffer, passes_[passIndex].name().c_str());
+            ScopedNsightRange nsightRange(passes_[passIndex].name().c_str());
+            ScopedNsightPerfCommandBufferRange nsightPerfRange(commandBuffer, passes_[passIndex].name().c_str());
             callback(context, commandBuffer);
             endDebugLabel(commandBuffer);
         }
@@ -797,6 +801,8 @@ void RenderGraph::executeAsync(VkCommandBuffer graphicsCommandBuffer, VkCommandB
         if (callback) {
             insertDebugBreadcrumb(targetCmd, pass.name().c_str());
             beginDebugLabel(targetCmd, pass.name().c_str());
+            ScopedNsightRange nsightRange(pass.name().c_str());
+            ScopedNsightPerfCommandBufferRange nsightPerfRange(targetCmd, pass.name().c_str());
             callback(context, targetCmd);
             endDebugLabel(targetCmd);
         }

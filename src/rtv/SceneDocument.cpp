@@ -865,7 +865,13 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"pathTracingEnabled", renderSettings_.pathTracingEnabled},
         {"cameraJitterEnabled", renderSettings_.cameraJitterEnabled},
         {"directLightingEnabled", renderSettings_.directLightingEnabled},
+        {"secondaryDirectLightingEnabled", renderSettings_.secondaryDirectLightingEnabled},
         {"maxBounces", renderSettings_.maxBounces},
+        {"pathTraceKernelMode", pathTraceKernelModeName(renderSettings_.pathTraceKernelMode)},
+        {"finalBounceFastPathEnabled", renderSettings_.finalBounceFastPathEnabled},
+        {"native2BTerminalDirectSampleProbability", renderSettings_.native2BTerminalDirectSampleProbability},
+        {"blendedDecalShadowMode", blendedDecalShadowModeName(renderSettings_.blendedDecalShadowMode)},
+        {"native2BDirectReuseMode", native2BDirectReuseModeName(renderSettings_.native2BDirectReuseMode)},
         {"environmentDirectSamples", renderSettings_.environmentDirectSamples},
         {"toneMapper", static_cast<uint32_t>(renderSettings_.toneMapper)},
         {"exposure", renderSettings_.exposure},
@@ -918,6 +924,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"dlssFrameGenerationEnabled", renderSettings_.dlssFrameGenerationEnabled},
         {"dlssRayReconstructionEnabled", renderSettings_.dlssRayReconstructionEnabled},
         {"streamlineReflexEnabled", renderSettings_.streamlineReflexEnabled},
+        {"streamlineNvPerfEnabled", renderSettings_.streamlineNvPerfEnabled},
         {"dlssSharpeningStrength", renderSettings_.dlssSharpeningStrength},
         {"taaFeedback", renderSettings_.taaFeedback},
         {"taaMotionFeedback", renderSettings_.taaMotionFeedback},
@@ -930,6 +937,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy},
         {"specularAaEnabled", renderSettings_.specularAaEnabled},
         {"opacityMicromapsEnabled", renderSettings_.opacityMicromapsEnabled},
+        {"compactImportedEmissiveTriangleSampling", renderSettings_.compactImportedEmissiveTriangleSampling},
         {"shadowRayBias", renderSettings_.shadowRayBias},
         {"shadowDistanceBias", renderSettings_.shadowDistanceBias},
         {"fireflyClamp", renderSettings_.fireflyClamp},
@@ -1347,7 +1355,36 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.pathTracingEnabled = render.value("pathTracingEnabled", renderSettings_.pathTracingEnabled);
         renderSettings_.cameraJitterEnabled = render.value("cameraJitterEnabled", renderSettings_.cameraJitterEnabled);
         renderSettings_.directLightingEnabled = render.value("directLightingEnabled", renderSettings_.directLightingEnabled);
+        renderSettings_.secondaryDirectLightingEnabled = render.value("secondaryDirectLightingEnabled", renderSettings_.secondaryDirectLightingEnabled);
         renderSettings_.maxBounces = render.value("maxBounces", renderSettings_.maxBounces);
+        if (render.contains("pathTraceKernelMode")) {
+            if (render["pathTraceKernelMode"].is_string()) {
+                renderSettings_.pathTraceKernelMode = parsePathTraceKernelMode(render.value("pathTraceKernelMode", "generic"));
+            } else {
+                renderSettings_.pathTraceKernelMode = static_cast<PathTraceKernelMode>(
+                    render.value("pathTraceKernelMode", static_cast<uint32_t>(renderSettings_.pathTraceKernelMode)));
+            }
+        }
+        renderSettings_.finalBounceFastPathEnabled = render.value("finalBounceFastPathEnabled", renderSettings_.finalBounceFastPathEnabled);
+        renderSettings_.native2BTerminalDirectSampleProbability = render.value(
+            "native2BTerminalDirectSampleProbability",
+            renderSettings_.native2BTerminalDirectSampleProbability);
+        if (render.contains("blendedDecalShadowMode")) {
+            if (render["blendedDecalShadowMode"].is_string()) {
+                renderSettings_.blendedDecalShadowMode = parseBlendedDecalShadowMode(render.value("blendedDecalShadowMode", "exact"));
+            } else {
+                renderSettings_.blendedDecalShadowMode = static_cast<BlendedDecalShadowMode>(
+                    render.value("blendedDecalShadowMode", static_cast<uint32_t>(renderSettings_.blendedDecalShadowMode)));
+            }
+        }
+        if (render.contains("native2BDirectReuseMode")) {
+            if (render["native2BDirectReuseMode"].is_string()) {
+                renderSettings_.native2BDirectReuseMode = parseNative2BDirectReuseMode(render.value("native2BDirectReuseMode", "off"));
+            } else {
+                renderSettings_.native2BDirectReuseMode = static_cast<Native2BDirectReuseMode>(
+                    render.value("native2BDirectReuseMode", static_cast<uint32_t>(renderSettings_.native2BDirectReuseMode)));
+            }
+        }
         renderSettings_.environmentDirectSamples = render.value("environmentDirectSamples", renderSettings_.environmentDirectSamples);
         renderSettings_.toneMapper = static_cast<ToneMapper>(render.value("toneMapper", static_cast<uint32_t>(renderSettings_.toneMapper)));
         renderSettings_.exposure = render.value("exposure", renderSettings_.exposure);
@@ -1455,6 +1492,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.dlssFrameGenerationEnabled = render.value("dlssFrameGenerationEnabled", renderSettings_.dlssFrameGenerationEnabled);
         renderSettings_.dlssRayReconstructionEnabled = render.value("dlssRayReconstructionEnabled", renderSettings_.dlssRayReconstructionEnabled);
         renderSettings_.streamlineReflexEnabled = render.value("streamlineReflexEnabled", renderSettings_.streamlineReflexEnabled);
+        renderSettings_.streamlineNvPerfEnabled = render.value("streamlineNvPerfEnabled", renderSettings_.streamlineNvPerfEnabled);
         renderSettings_.dlssSharpeningStrength = render.value("dlssSharpeningStrength", renderSettings_.dlssSharpeningStrength);
         renderSettings_.taaFeedback = render.value("taaFeedback", renderSettings_.taaFeedback);
         renderSettings_.taaMotionFeedback = render.value("taaMotionFeedback", renderSettings_.taaMotionFeedback);
@@ -1467,6 +1505,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.materialTextureAnisotropy = render.value("materialTextureAnisotropy", renderSettings_.materialTextureAnisotropy);
         renderSettings_.specularAaEnabled = render.value("specularAaEnabled", renderSettings_.specularAaEnabled);
         renderSettings_.opacityMicromapsEnabled = render.value("opacityMicromapsEnabled", renderSettings_.opacityMicromapsEnabled);
+        renderSettings_.compactImportedEmissiveTriangleSampling = render.value("compactImportedEmissiveTriangleSampling", renderSettings_.compactImportedEmissiveTriangleSampling);
         renderSettings_.shadowRayBias = render.value("shadowRayBias", renderSettings_.shadowRayBias);
         renderSettings_.shadowDistanceBias = render.value("shadowDistanceBias", renderSettings_.shadowDistanceBias);
         renderSettings_.fireflyClamp = render.value("fireflyClamp", renderSettings_.fireflyClamp);

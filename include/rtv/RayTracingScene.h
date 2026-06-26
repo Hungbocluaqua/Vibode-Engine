@@ -3,6 +3,7 @@
 #include "rtv/AccelerationStructure.h"
 #include "rtv/Buffer.h"
 #include "rtv/NonCopyable.h"
+#include "rtv/RendererDebug.h"
 
 #include <Volk/volk.h>
 
@@ -19,6 +20,8 @@ class VulkanContext;
 struct RayTracingSceneBuildOptions {
     bool opacityMicromapsEnabled = false;
     bool motionBlurEnabled = false;
+    bool hardwareBackfaceCullingEnabled = true;
+    MixedSidedSplitMode mixedSidedSplitMode = MixedSidedSplitMode::Off;
     struct GpuSkinnedVertexBinding {
         uint32_t meshHandleIndex = 0xffffffffu;
         uint32_t currentVertexOffset = 0;
@@ -50,6 +53,13 @@ struct RayTracingBlasGeometryStats {
     uint32_t alphaTestedGeometryCount = 0;
     uint32_t blendedGeometryCount = 0;
     uint32_t opacityMicromapGeometryCount = 0;
+    uint64_t cullableTriangleCount = 0;
+    uint64_t cullDisabledTriangleCount = 0;
+    uint32_t splitMeshCount = 0;
+    uint32_t duplicatedTlasInstanceCount = 0;
+    uint32_t actualBlasCount = 0;
+    VkDeviceSize splitBlasBytes = 0;
+    bool hardwareBackfaceCullingEnabled = false;
     uint32_t gpuSkinnedMeshCount = 0;
     uint32_t gpuSkinnedGeometryCount = 0;
     uint32_t buildBatchCount = 0;
@@ -75,7 +85,7 @@ public:
     ~RayTracingScene();
 
     [[nodiscard]] VkAccelerationStructureKHR tlas() const { return tlas_.handle(); }
-    [[nodiscard]] uint32_t blasCount() const { return static_cast<uint32_t>(blases_.size()); }
+    [[nodiscard]] uint32_t blasCount() const { return actualBlasCount_; }
     [[nodiscard]] uint32_t instanceCount() const { return instanceCount_; }
     [[nodiscard]] VkDeviceSize accelerationStructureBytes() const { return accelerationStructureBytes_; }
     [[nodiscard]] const OpacityMicromapBuildStats& opacityMicromapStats() const { return opacityMicromapStats_; }
@@ -83,6 +93,7 @@ public:
     [[nodiscard]] const RayTracingMotionInstanceStats& motionInstanceStats() const { return motionInstanceStats_; }
     [[nodiscard]] const Buffer& geometryTriangleOffsetsBuffer() const { return geometryTriangleOffsetsBuffer_; }
     [[nodiscard]] const Buffer& meshGeometryRangesBuffer() const { return meshGeometryRangesBuffer_; }
+    [[nodiscard]] const Buffer& tlasGeometryRangesBuffer() const { return tlasGeometryRangesBuffer_; }
     [[nodiscard]] float lastTlasRefitMs() const { return lastTlasRefitMs_; }
     [[nodiscard]] uint32_t dynamicBlasUpdateCount() const { return dynamicBlasUpdateCount_; }
     [[nodiscard]] float lastDynamicBlasUpdateRecordMs() const { return lastDynamicBlasUpdateRecordMs_; }
@@ -109,20 +120,26 @@ private:
     void destroyOpacityMicromaps();
 
     std::vector<AccelerationStructure> blases_;
+    std::vector<AccelerationStructure> doubleSidedBlases_;
+    std::vector<uint8_t> meshCullDisabled_;
+    std::vector<uint8_t> meshHasDoubleSidedBlas_;
     AccelerationStructure tlas_;
     Buffer instanceBuffer_;
     Buffer tlasRefitScratch_;
     Buffer dynamicBlasUpdateScratch_;
     Buffer geometryTriangleOffsetsBuffer_;
     Buffer meshGeometryRangesBuffer_;
+    Buffer tlasGeometryRangesBuffer_;
     std::vector<VkMicromapEXT> opacityMicromaps_;
     std::vector<Buffer> opacityMicromapBuffers_;
     VkDevice opacityMicromapDevice_ = VK_NULL_HANDLE;
     uint32_t instanceCount_ = 0;
+    uint32_t actualBlasCount_ = 0;
     VkDeviceSize accelerationStructureBytes_ = 0;
     VkDeviceSize tlasUpdateScratchSize_ = 0;
     VkDeviceSize dynamicBlasUpdateScratchSize_ = 0;
     bool motionBlurActive_ = false;
+    bool hardwareBackfaceCullingEnabled_ = false;
     OpacityMicromapBuildStats opacityMicromapStats_{};
     RayTracingBlasGeometryStats blasGeometryStats_{};
     RayTracingMotionInstanceStats motionInstanceStats_{};

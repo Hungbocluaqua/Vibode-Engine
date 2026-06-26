@@ -131,6 +131,15 @@ public:
     [[nodiscard]] const StreamlineVulkanRequirements& streamlineVulkanRequirements() const { return streamlineVulkanRequirements_; }
     [[nodiscard]] float maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
     [[nodiscard]] bool supportsMemoryBudget() const { return supportsMemoryBudget_; }
+    [[nodiscard]] bool debugUtilsExtensionEnabled() const { return debugUtilsExtensionEnabled_; }
+    [[nodiscard]] bool debugUtilsLabelsAvailable() const {
+        return debugUtilsExtensionEnabled_ &&
+            vkCmdBeginDebugUtilsLabelEXT != nullptr &&
+            vkCmdEndDebugUtilsLabelEXT != nullptr;
+    }
+    [[nodiscard]] bool debugUtilsObjectNamesAvailable() const {
+        return debugUtilsExtensionEnabled_ && vkSetDebugUtilsObjectNameEXT != nullptr;
+    }
 
 private:
     explicit VulkanContext(bool headless);
@@ -179,6 +188,7 @@ private:
     bool uniformAndStorageBuffer8BitAccess_ = false;
     bool storageBuffer16BitAccess_ = false;
     bool uniformAndStorageBuffer16BitAccess_ = false;
+    bool debugUtilsExtensionEnabled_ = false;
     float maxSamplerAnisotropy_ = 1.0f;
     QueueFamilyIndices queueFamilies_{};
 };

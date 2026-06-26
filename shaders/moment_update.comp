@@ -51,6 +51,7 @@ layout(set = 0, binding = 11, std140) uniform MomentParams {
     float adaptive_alpha_ceiling;
     float variance_scale;
     float validity_threshold;
+    uint debug_view;
 } moment_params;
 
 layout(set = 0, binding = 12, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
@@ -308,14 +309,16 @@ void main() {
 
     uint packed_is_validity = (n_is & 0x7FFFu) | (valid ? 0x8000u : 0u);
 
-    float debug_normal_cone = normal_cone_min * 0.5 + 0.5;
-    float debug_depth_delta = clamp(max_relative_depth_delta, 0.0, 1.0);
-    float debug_kind_valid = history_kind_valid ? 1.0 : 0.0;
-    imageStore(out_moment_debug, coords, vec4(
-        disocclusion_confidence,
-        debug_normal_cone,
-        debug_depth_delta,
-        debug_kind_valid));
+    if (moment_params.debug_view >= 81u && moment_params.debug_view <= 84u) {
+        float debug_normal_cone = normal_cone_min * 0.5 + 0.5;
+        float debug_depth_delta = clamp(max_relative_depth_delta, 0.0, 1.0);
+        float debug_kind_valid = history_kind_valid ? 1.0 : 0.0;
+        imageStore(out_moment_debug, coords, vec4(
+            disocclusion_confidence,
+            debug_normal_cone,
+            debug_depth_delta,
+            debug_kind_valid));
+    }
 
     imageStore(out_direct_diffuse_moments, coords, vec4(new_dd, 0.0, 0.0));
     imageStore(out_direct_specular_moments, coords, vec4(new_ds, 0.0, 0.0));

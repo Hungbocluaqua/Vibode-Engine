@@ -234,6 +234,12 @@ bool AtmosphereLutSystem::isDirty(LutNode node) const {
     return stats_.dirty[lutNodeIndex(node)];
 }
 
+bool AtmosphereLutSystem::hasPendingWork() const {
+    return std::any_of(stats_.dirty.begin(), stats_.dirty.end(), [](bool dirty) {
+        return dirty;
+    });
+}
+
 void AtmosphereLutSystem::clearDirty(LutNode node) {
     stats_.dirty[lutNodeIndex(node)] = false;
 }

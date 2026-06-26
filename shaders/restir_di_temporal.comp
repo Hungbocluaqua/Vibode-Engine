@@ -316,7 +316,8 @@ void main() {
     bool selectPrevious = false;
 
     if (totalMass > 1.0e-8) {
-        previousProbability = clamp(previousMass / totalMass, 0.0, 1.0);
+        float motionCap = mix(0.85, 0.10, 1.0 - clamp(reuseConfidence, 0.0, 1.0));
+        previousProbability = clamp(previousMass / totalMass, 0.0, motionCap);
         selectPrevious = rngValue < previousProbability;
     }
 

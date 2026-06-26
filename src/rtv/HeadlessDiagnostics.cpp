@@ -186,6 +186,8 @@ void to_json(nlohmann::json& j, const ProfileReport::OpacityMicromapReport& o) {
         {"subdivision_level", o.preprocess.subdivisionLevel},
         {"eligible_primitive_count", o.preprocess.eligiblePrimitiveCount},
         {"generated_primitive_count", o.preprocess.generatedPrimitiveCount},
+        {"alpha_tested_primitive_count", o.preprocess.alphaTestedPrimitiveCount},
+        {"blended_primitive_count", o.preprocess.blendedPrimitiveCount},
         {"alpha_texture_primitive_count", o.preprocess.alphaTexturePrimitiveCount},
         {"constant_alpha_primitive_count", o.preprocess.constantAlphaPrimitiveCount},
         {"cache_entry_count", o.preprocess.cacheEntryCount},
@@ -280,6 +282,17 @@ void to_json(nlohmann::json& j, const ProfileReport::SchedulerQueueReport& r) {
         {"frame_budget_violation_count", r.frameBudgetViolationCount},
         {"submitted_bytes", r.submittedBytes},
         {"completed_bytes", r.completedBytes},
+    };
+}
+
+void to_json(nlohmann::json& j, const ProfileReport::AlphaAnyHitMaterialReport& r) {
+    j = nlohmann::json{
+        {"material_index", r.materialIndex},
+        {"primary_any_hit", r.primaryAnyHit},
+        {"terminal_any_hit", r.terminalAnyHit},
+        {"shadow_any_hit", r.shadowAnyHit},
+        {"closest_hit", r.closestHit},
+        {"total", r.total},
     };
 }
 
@@ -497,6 +510,7 @@ void to_json(nlohmann::json& j, const ProfileReport::PipelineStatistics& s) {
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::RayTracingDiagnosticCounterReport& s) {
+    j["raw_slots"] = s.rawSlots;
     j["camera_any_hit_invocations"] = s.cameraAnyHitInvocations;
     j["camera_any_hit_ignored"] = s.cameraAnyHitIgnored;
     j["camera_any_hit_accepted"] = s.cameraAnyHitAccepted;
@@ -511,6 +525,38 @@ void to_json(nlohmann::json& j, const ProfileReport::RayTracingDiagnosticCounter
     j["caustic_transmissive_hits"] = s.causticTransmissiveHits;
     j["caustic_transmissive_visible"] = s.causticTransmissiveVisible;
     j["caustic_shadow_blocked"] = s.causticShadowBlocked;
+    j["primary_surface_trace_rays"] = s.primarySurfaceTraceRays;
+    j["terminal_surface_trace_rays"] = s.terminalSurfaceTraceRays;
+    j["shadow_surface_trace_rays"] = s.shadowSurfaceTraceRays;
+    j["env_direct_shadow_rays"] = s.envDirectShadowRays;
+    j["sun_direct_shadow_rays"] = s.sunDirectShadowRays;
+    j["emissive_direct_shadow_rays"] = s.emissiveDirectShadowRays;
+    j["transmissive_shadow_surface_traces"] = s.transmissiveShadowSurfaceTraces;
+    j["fast_shadow_transmittance_used"] = s.fastShadowTransmittanceUsed;
+    j["full_shadow_transmittance_used"] = s.fullShadowTransmittanceUsed;
+    j["terminal_fast_direct_used"] = s.terminalFastDirectUsed;
+    j["terminal_generic_direct_used"] = s.terminalGenericDirectUsed;
+    j["terminal_material_full_decode"] = s.terminalMaterialFullDecode;
+    j["terminal_material_header_only"] = s.terminalMaterialHeaderOnly;
+    j["primary_any_hit_opaque"] = s.primaryAnyHitOpaque;
+    j["primary_any_hit_alpha_tested"] = s.primaryAnyHitAlphaTested;
+    j["primary_any_hit_blended"] = s.primaryAnyHitBlended;
+    j["terminal_any_hit_invocations"] = s.terminalAnyHitInvocations;
+    j["terminal_any_hit_opaque"] = s.terminalAnyHitOpaque;
+    j["terminal_any_hit_alpha_tested"] = s.terminalAnyHitAlphaTested;
+    j["terminal_any_hit_blended"] = s.terminalAnyHitBlended;
+    j["closest_hit_primary"] = s.closestHitPrimary;
+    j["closest_hit_terminal"] = s.closestHitTerminal;
+    j["caustic_blocker_opaque"] = s.causticBlockerOpaque;
+    j["caustic_blocker_alpha_tested"] = s.causticBlockerAlphaTested;
+    j["caustic_blocker_blended"] = s.causticBlockerBlended;
+    j["terminal_fast_direct_flag_disabled"] = s.terminalFastDirectFlagDisabled;
+    j["terminal_fast_direct_scene_lights"] = s.terminalFastDirectSceneLights;
+    j["terminal_fast_direct_transmissive_scene"] = s.terminalFastDirectTransmissiveScene;
+    j["terminal_fast_direct_volume"] = s.terminalFastDirectVolume;
+    j["terminal_fast_direct_debug"] = s.terminalFastDirectDebug;
+    j["terminal_fast_direct_material_transmissive"] = s.terminalFastDirectMaterialTransmissive;
+    j["terminal_direct_skipped_emissive_or_unlit"] = s.terminalDirectSkippedEmissiveOrUnlit;
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::RayTracingGeometryReport& s) {
@@ -529,6 +575,15 @@ void to_json(nlohmann::json& j, const ProfileReport::RayTracingGeometryReport& s
     j["blas_blended_geometry_count"] = s.blasBlendedGeometryCount;
     j["blas_opacity_micromap_geometry_count"] = s.blasOpacityMicromapGeometryCount;
     j["blas_build_batch_count"] = s.blasBuildBatchCount;
+    j["cullable_triangle_count"] = s.cullableTriangleCount;
+    j["cull_disabled_triangle_count"] = s.cullDisabledTriangleCount;
+    j["sidedness_split_mesh_count"] = s.splitMeshCount;
+    j["duplicated_tlas_instance_count"] = s.duplicatedTlasInstanceCount;
+    j["actual_blas_count"] = s.actualBlasCount;
+    j["sidedness_split_blas_bytes"] = s.splitBlasBytes;
+    j["hardware_backface_culling_enabled"] = s.hardwareBackfaceCullingEnabled;
+    j["transmissive_shadow_caster_count"] = s.transmissiveShadowCasterCount;
+    j["fast_shadow_transmittance_eligible"] = s.fastShadowTransmittanceEligible;
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::AnimatedGeometryReport& s) {
@@ -881,6 +936,12 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryReport& m) {
     j["textures_bytes"] = m.texturesBytes;
     j["buffers_bytes"] = m.buffersBytes;
     j["acceleration_structure_bytes"] = m.accelerationStructureBytes;
+    j["hardware_acceleration_structure_bytes"] = m.hardwareAccelerationStructureBytes;
+    j["gpu_scene_buffer_bytes"] = m.gpuSceneBufferBytes;
+    j["gpu_scene_geometry_bytes"] = m.gpuSceneGeometryBytes;
+    j["gpu_scene_software_bvh_bytes"] = m.gpuSceneSoftwareBvhBytes;
+    j["gpu_scene_light_bytes"] = m.gpuSceneLightBytes;
+    j["gpu_scene_parameter_bytes"] = m.gpuSceneParameterBytes;
     j["temporal_history_bytes"] = m.temporalHistoryBytes;
     j["restir_reservoir_bytes"] = m.restirReservoirBytes;
     j["restir_di_current_bytes"] = m.restirDiCurrentBytes;
@@ -970,6 +1031,7 @@ void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::St
     j["skipped_unsupported"] = e.skippedUnsupported;
     j["skipped_missing_tags"] = e.skippedMissingTags;
     j["frame_index"] = e.frameIndex;
+    j["last_error"] = e.lastError;
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::StreamlineReflexMarkerReport& m) {
@@ -978,6 +1040,66 @@ void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::St
     j["failed"] = m.failed;
     j["skipped_unavailable"] = m.skippedUnavailable;
     j["frame_index"] = m.frameIndex;
+}
+
+void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::GpuCrashDumpReport& g) {
+    j["build_available"] = g.buildAvailable;
+    j["requested"] = g.requested;
+    j["enabled"] = g.enabled;
+    j["output_directory"] = g.outputDirectory.string();
+    j["unavailable_reason"] = g.unavailableReason;
+    j["enable_result"] = g.enableResult;
+    j["dump_count"] = g.dumpCount;
+    j["shader_debug_info_count"] = g.shaderDebugInfoCount;
+}
+
+void to_json(nlohmann::json& j, const NsightPerfDiagnosticsReport& n) {
+    j["sdk_configured"] = n.sdkConfigured;
+    j["initialized"] = n.initialized;
+    j["vulkan_driver_loaded"] = n.vulkanDriverLoaded;
+    j["nvidia_device"] = n.nvidiaDevice;
+    j["gpu_supported"] = n.gpuSupported;
+    j["report_generator_initialized"] = n.reportGeneratorInitialized;
+    j["metrics_evaluator_initialized"] = n.metricsEvaluatorInitialized;
+    j["raw_counter_config_created"] = n.rawCounterConfigCreated;
+    j["init_status"] = n.initStatus;
+    j["runtime_dll"] = n.runtimeDll;
+    j["sdk_directory"] = n.sdkDirectory;
+    j["device_name"] = n.deviceName;
+    j["chip_name"] = n.chipName;
+    j["clock_status"] = n.clockStatus;
+    j["unavailable_reason"] = n.unavailableReason;
+    j["warnings"] = n.warnings;
+    j["command_buffer_ranges"] = {
+        {"sdk_configured", n.commandBufferRanges.sdkConfigured},
+        {"initialized", n.commandBufferRanges.initialized},
+        {"nvidia_device", n.commandBufferRanges.nvidiaDevice},
+        {"enabled", n.commandBufferRanges.enabled},
+        {"available", n.commandBufferRanges.commandBufferRangesAvailable},
+        {"report_generator_initialized", n.commandBufferRanges.reportGeneratorInitialized},
+        {"capture_requested", n.commandBufferRanges.captureRequested},
+        {"collection_active", n.commandBufferRanges.collectionActive},
+        {"capture_completed", n.commandBufferRanges.captureCompleted},
+        {"capture_succeeded", n.commandBufferRanges.captureSucceeded},
+        {"capture_failed", n.commandBufferRanges.captureFailed},
+        {"start_after_frames", n.commandBufferRanges.startAfterFrames},
+        {"nesting_levels", n.commandBufferRanges.nestingLevels},
+        {"html_report_enabled", n.commandBufferRanges.htmlReportEnabled},
+        {"csv_report_enabled", n.commandBufferRanges.csvReportEnabled},
+        {"counter_images_enabled", n.commandBufferRanges.counterImagesEnabled},
+        {"frames_observed", n.commandBufferRanges.framesObserved},
+        {"pushed_ranges", n.commandBufferRanges.pushedRanges},
+        {"popped_ranges", n.commandBufferRanges.poppedRanges},
+        {"failed_pushes", n.commandBufferRanges.failedPushes},
+        {"failed_pops", n.commandBufferRanges.failedPops},
+        {"capture_start_failures", n.commandBufferRanges.captureStartFailures},
+        {"frame_start_failures", n.commandBufferRanges.frameStartFailures},
+        {"frame_end_failures", n.commandBufferRanges.frameEndFailures},
+        {"recent_range_names", n.commandBufferRanges.recentRangeNames},
+        {"configured_output_directory", n.commandBufferRanges.configuredOutputDirectory},
+        {"last_report_directory", n.commandBufferRanges.lastReportDirectory},
+        {"unavailable_reason", n.commandBufferRanges.unavailableReason},
+    };
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n) {
@@ -1008,21 +1130,31 @@ void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n)
     j["streamline_runtime_configured"] = n.streamlineRuntimeConfigured;
     j["streamline_initialized"] = n.streamlineInitialized;
     j["streamline_vulkan_info_set"] = n.streamlineVulkanInfoSet;
+    j["vulkan_debug_utils_enabled"] = n.vulkanDebugUtilsEnabled;
+    j["vulkan_debug_labels_available"] = n.vulkanDebugLabelsAvailable;
+    j["vulkan_debug_object_names_available"] = n.vulkanDebugObjectNamesAvailable;
     j["streamline_runtime_directory"] = n.streamlineRuntimeDirectory;
     j["streamline_unavailable_reason"] = n.streamlineUnavailableReason;
+    j["streamline_log_messages"] = n.streamlineLogMessages;
     j["requested_streamline_reflex"] = n.requestedStreamlineReflex;
     j["effective_streamline_reflex"] = n.effectiveStreamlineReflex;
+    j["requested_streamline_nvperf"] = n.requestedStreamlineNvPerf;
+    j["effective_streamline_nvperf"] = n.effectiveStreamlineNvPerf;
     j["streamline_dlss"] = n.streamlineDlss;
     j["streamline_dlss_ray_reconstruction"] = n.streamlineDlssRayReconstruction;
     j["streamline_dlss_frame_generation"] = n.streamlineDlssFrameGeneration;
     j["streamline_reflex"] = n.streamlineReflex;
     j["streamline_nis"] = n.streamlineNis;
     j["streamline_nrd"] = n.streamlineNrd;
+    j["streamline_nvperf"] = n.streamlineNvPerf;
     j["streamline_dlss_tags"] = n.streamlineDlssTags;
     j["streamline_dlss_ray_reconstruction_tags"] = n.streamlineDlssRayReconstructionTags;
     j["streamline_dlss_evaluation"] = n.streamlineDlssEvaluation;
     j["streamline_dlss_ray_reconstruction_evaluation"] = n.streamlineDlssRayReconstructionEvaluation;
+    j["streamline_nvperf_evaluation"] = n.streamlineNvPerfEvaluation;
     j["streamline_reflex_markers"] = n.streamlineReflexMarkers;
+    j["gpu_crash_dumps"] = n.gpuCrashDumps;
+    j["nsight_perf_sdk"] = n.nsightPerfSdk;
 }
 
 void to_json(nlohmann::json& j, const RendererSettings& s) {
@@ -1055,7 +1187,15 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["render_resolution_scale"] = s.renderResolutionScale;
     j["specular_aa_enabled"] = s.specularAaEnabled;
     j["opacity_micromaps_enabled"] = s.opacityMicromapsEnabled;
+    j["opacity_micromap_blend_enabled"] = s.opacityMicromapBlendEnabled;
+    j["hardware_backface_culling_enabled"] = s.hardwareBackfaceCullingEnabled;
+    j["mixed_sided_split_mode"] = mixedSidedSplitModeName(s.mixedSidedSplitMode);
+    j["pathtrace_kernel_mode"] = pathTraceKernelModeName(s.pathTraceKernelMode);
+    j["blended_decal_shadow_mode"] = blendedDecalShadowModeName(s.blendedDecalShadowMode);
+    j["native2b_direct_reuse_mode"] = native2BDirectReuseModeName(s.native2BDirectReuseMode);
+    j["force_opaque_camera_rays"] = s.forceOpaqueCameraRays;
     j["opacity_micromap_subdivision_level"] = s.opacityMicromapSubdivisionLevel;
+    j["compact_imported_emissive_triangle_sampling"] = s.compactImportedEmissiveTriangleSampling;
     j["wavefront_queues_enabled"] = s.wavefrontQueuesEnabled;
     j["wavefront_primary_generate_enabled"] = s.wavefrontPrimaryGenerateEnabled;
     j["wavefront_trace_enabled"] = s.wavefrontTraceEnabled;
@@ -1091,6 +1231,7 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["dlss_frame_generation_enabled"] = s.dlssFrameGenerationEnabled;
     j["dlss_ray_reconstruction_enabled"] = s.dlssRayReconstructionEnabled;
     j["streamline_reflex_enabled"] = s.streamlineReflexEnabled;
+    j["streamline_nvperf_enabled"] = s.streamlineNvPerfEnabled;
     j["dlss_sharpening_strength"] = s.dlssSharpeningStrength;
     j["taa_feedback"] = s.taaFeedback;
     j["taa_motion_feedback"] = s.taaMotionFeedback;
@@ -1098,6 +1239,9 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["taa_sharpening_strength"] = s.taaSharpeningStrength;
     j["sunlight_enabled"] = s.sunlightEnabled;
     j["direct_lighting_enabled"] = s.directLightingEnabled;
+    j["secondary_direct_lighting_enabled"] = s.secondaryDirectLightingEnabled;
+    j["final_bounce_fast_path_enabled"] = s.finalBounceFastPathEnabled;
+    j["native2b_terminal_direct_sample_probability"] = s.native2BTerminalDirectSampleProbability;
     j["environment_enabled"] = s.environmentEnabled;
     j["environment_direct_samples"] = s.environmentDirectSamples;
     j["denoiser_strength"] = s.denoiserStrength;
@@ -1559,6 +1703,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.frameCount = config_.totalFrames;
     profileReport_.profiledFrames = config_.totalFrames > config_.warmupFrames
         ? config_.totalFrames - config_.warmupFrames : 0;
+    profileReport_.rayTracingDiagnosticCountersEnabled = config_.rayTracingDiagnosticCounters;
 
     const auto& cpuTimings = app.cpuFrameTimings();
     const auto& gpuTimingsVec = app.gpuFrameTimings();
@@ -1671,6 +1816,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.pipelineStatistics.aabbHits = stats.aabbHits;
 
     const auto rtCounters = renderer->rayTracingDiagnosticCounters();
+    profileReport_.rayTracingDiagnosticCounters.rawSlots = rtCounters.rawSlots;
     profileReport_.rayTracingDiagnosticCounters.cameraAnyHitInvocations = rtCounters.cameraAnyHitInvocations;
     profileReport_.rayTracingDiagnosticCounters.cameraAnyHitIgnored = rtCounters.cameraAnyHitIgnored;
     profileReport_.rayTracingDiagnosticCounters.cameraAnyHitAccepted = rtCounters.cameraAnyHitAccepted;
@@ -1685,12 +1831,100 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.rayTracingDiagnosticCounters.causticTransmissiveHits = rtCounters.causticTransmissiveHits;
     profileReport_.rayTracingDiagnosticCounters.causticTransmissiveVisible = rtCounters.causticTransmissiveVisible;
     profileReport_.rayTracingDiagnosticCounters.causticShadowBlocked = rtCounters.causticShadowBlocked;
+    profileReport_.rayTracingDiagnosticCounters.primarySurfaceTraceRays = rtCounters.primarySurfaceTraceRays;
+    profileReport_.rayTracingDiagnosticCounters.terminalSurfaceTraceRays = rtCounters.terminalSurfaceTraceRays;
+    profileReport_.rayTracingDiagnosticCounters.shadowSurfaceTraceRays = rtCounters.shadowSurfaceTraceRays;
+    profileReport_.rayTracingDiagnosticCounters.envDirectShadowRays = rtCounters.envDirectShadowRays;
+    profileReport_.rayTracingDiagnosticCounters.sunDirectShadowRays = rtCounters.sunDirectShadowRays;
+    profileReport_.rayTracingDiagnosticCounters.emissiveDirectShadowRays = rtCounters.emissiveDirectShadowRays;
+    profileReport_.rayTracingDiagnosticCounters.transmissiveShadowSurfaceTraces = rtCounters.transmissiveShadowSurfaceTraces;
+    profileReport_.rayTracingDiagnosticCounters.fastShadowTransmittanceUsed = rtCounters.fastShadowTransmittanceUsed;
+    profileReport_.rayTracingDiagnosticCounters.fullShadowTransmittanceUsed = rtCounters.fullShadowTransmittanceUsed;
+    profileReport_.rayTracingDiagnosticCounters.terminalFastDirectUsed = rtCounters.terminalFastDirectUsed;
+    profileReport_.rayTracingDiagnosticCounters.terminalGenericDirectUsed = rtCounters.terminalGenericDirectUsed;
+    profileReport_.rayTracingDiagnosticCounters.terminalMaterialFullDecode = rtCounters.terminalMaterialFullDecode;
+    profileReport_.rayTracingDiagnosticCounters.terminalMaterialHeaderOnly = rtCounters.terminalMaterialHeaderOnly;
+    profileReport_.rayTracingDiagnosticCounters.primaryAnyHitOpaque = rtCounters.primaryAnyHitOpaque;
+    profileReport_.rayTracingDiagnosticCounters.primaryAnyHitAlphaTested = rtCounters.primaryAnyHitAlphaTested;
+    profileReport_.rayTracingDiagnosticCounters.primaryAnyHitBlended = rtCounters.primaryAnyHitBlended;
+    profileReport_.rayTracingDiagnosticCounters.terminalAnyHitInvocations = rtCounters.terminalAnyHitInvocations;
+    profileReport_.rayTracingDiagnosticCounters.terminalAnyHitOpaque = rtCounters.terminalAnyHitOpaque;
+    profileReport_.rayTracingDiagnosticCounters.terminalAnyHitAlphaTested = rtCounters.terminalAnyHitAlphaTested;
+    profileReport_.rayTracingDiagnosticCounters.terminalAnyHitBlended = rtCounters.terminalAnyHitBlended;
+    profileReport_.rayTracingDiagnosticCounters.closestHitPrimary = rtCounters.closestHitPrimary;
+    profileReport_.rayTracingDiagnosticCounters.closestHitTerminal = rtCounters.closestHitTerminal;
+    profileReport_.rayTracingDiagnosticCounters.causticBlockerOpaque = rtCounters.causticBlockerOpaque;
+    profileReport_.rayTracingDiagnosticCounters.causticBlockerAlphaTested = rtCounters.causticBlockerAlphaTested;
+    profileReport_.rayTracingDiagnosticCounters.causticBlockerBlended = rtCounters.causticBlockerBlended;
+    profileReport_.rayTracingDiagnosticCounters.terminalFastDirectFlagDisabled = rtCounters.terminalFastDirectFlagDisabled;
+    profileReport_.rayTracingDiagnosticCounters.terminalFastDirectSceneLights = rtCounters.terminalFastDirectSceneLights;
+    profileReport_.rayTracingDiagnosticCounters.terminalFastDirectTransmissiveScene = rtCounters.terminalFastDirectTransmissiveScene;
+    profileReport_.rayTracingDiagnosticCounters.terminalFastDirectVolume = rtCounters.terminalFastDirectVolume;
+    profileReport_.rayTracingDiagnosticCounters.terminalFastDirectDebug = rtCounters.terminalFastDirectDebug;
+    profileReport_.rayTracingDiagnosticCounters.terminalFastDirectMaterialTransmissive = rtCounters.terminalFastDirectMaterialTransmissive;
+    profileReport_.rayTracingDiagnosticCounters.terminalDirectSkippedEmissiveOrUnlit = rtCounters.terminalDirectSkippedEmissiveOrUnlit;
+    profileReport_.alphaAnyHitTopMaterials.clear();
+    if (config_.rayTracingDiagnosticCounters && !rtCounters.alphaMaterialCounters.empty()) {
+        constexpr size_t stride = RayTracingDiagnosticCounters::kAlphaMaterialCounterStride;
+        const size_t materialSlots = rtCounters.alphaMaterialCounters.size() / stride;
+        std::vector<ProfileReport::AlphaAnyHitMaterialReport> materialReports;
+        materialReports.reserve(materialSlots);
+        for (size_t materialIndex = 0; materialIndex < materialSlots; ++materialIndex) {
+            ProfileReport::AlphaAnyHitMaterialReport report{};
+            report.materialIndex = static_cast<uint32_t>(materialIndex);
+            report.primaryAnyHit = rtCounters.alphaMaterialCounters[materialIndex * stride + 0u];
+            report.terminalAnyHit = rtCounters.alphaMaterialCounters[materialIndex * stride + 1u];
+            report.shadowAnyHit = rtCounters.alphaMaterialCounters[materialIndex * stride + 2u];
+            report.closestHit = rtCounters.alphaMaterialCounters[materialIndex * stride + 3u];
+            report.total = report.primaryAnyHit + report.terminalAnyHit + report.shadowAnyHit + report.closestHit;
+            if (report.total > 0ull) {
+                materialReports.push_back(report);
+            }
+        }
+        std::sort(materialReports.begin(), materialReports.end(), [](const auto& a, const auto& b) {
+            if (a.total != b.total) {
+                return a.total > b.total;
+            }
+            return a.materialIndex < b.materialIndex;
+        });
+        const size_t keepCount = std::min<size_t>(materialReports.size(), 16u);
+        profileReport_.alphaAnyHitTopMaterials.assign(materialReports.begin(), materialReports.begin() + keepCount);
+    }
+    if (config_.rayTracingDiagnosticCounters &&
+        (rtCounters.primaryAnyHitOpaque > 0u || rtCounters.terminalAnyHitOpaque > 0u)) {
+        profileReport_.warnings.push_back(
+            "Opaque material any-hit invocations were recorded; inspect BLAS geometry flags, SBT hit groups, and force-opaque ray experiments.");
+    }
+    const auto effectivePathTraceKernelMode = renderer->effectivePathTraceKernelMode();
+    const auto& rendererSettings = renderer->settings();
+    if (config_.rayTracingDiagnosticCounters &&
+        effectivePathTraceKernelMode == PathTraceKernelMode::Native2B &&
+        rtCounters.terminalGenericDirectUsed > rtCounters.terminalFastDirectUsed * 4ull &&
+        rtCounters.terminalGenericDirectUsed > 0ull) {
+        profileReport_.warnings.push_back(
+            "Native2B terminal direct lighting is dominated by the generic estimator; inspect terminal fast-direct blocker counters.");
+    }
+    if (!config_.rayTracingDiagnosticCounters &&
+        effectivePathTraceKernelMode == PathTraceKernelMode::Native2B &&
+        rendererSettings.secondaryDirectLightingEnabled &&
+        !rendererSettings.finalBounceFastPathEnabled) {
+        profileReport_.warnings.push_back(
+            "Native2B secondary direct lighting is using the generic terminal estimator; run with --rt-diagnostic-counters on or --final-bounce-fast-path on for the optimized experimental path.");
+    }
 
     const auto& rtStats = renderer->rayTracingStats();
     profileReport_.memory.accelerationStructureBytes = static_cast<uint64_t>(rtStats.accelerationStructureBytes);
     profileReport_.rayTracingGeometry.opaquePrimitiveCount = rtStats.geometry.opaquePrimitiveCount;
     profileReport_.rayTracingGeometry.alphaTestedPrimitiveCount = rtStats.geometry.alphaTestedPrimitiveCount;
     profileReport_.rayTracingGeometry.blendedPrimitiveCount = rtStats.geometry.blendedPrimitiveCount;
+    profileReport_.rayTracingGeometry.transmissiveShadowCasterCount =
+        renderer->scene().meshParams().transmissiveShadowCasterCount;
+    const auto& meshParams = renderer->scene().meshParams();
+    profileReport_.rayTracingGeometry.fastShadowTransmittanceEligible =
+        meshParams.transmissiveShadowCasterCount <= 64u &&
+        meshParams.transmissiveShadowCasterCount * 4u <= std::max(meshParams.primitiveCount, 1u) &&
+        !rendererSettings.homogeneousVolumeEnabled &&
+        !profileReport_.rayTracingDiagnosticCountersEnabled;
     profileReport_.rayTracingGeometry.opaqueTriangleCount = rtStats.geometry.opaqueTriangleCount;
     profileReport_.rayTracingGeometry.alphaTestedTriangleCount = rtStats.geometry.alphaTestedTriangleCount;
     profileReport_.rayTracingGeometry.blendedTriangleCount = rtStats.geometry.blendedTriangleCount;
@@ -1703,6 +1937,13 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.rayTracingGeometry.blasBlendedGeometryCount = rtStats.blasGeometry.blendedGeometryCount;
     profileReport_.rayTracingGeometry.blasOpacityMicromapGeometryCount = rtStats.blasGeometry.opacityMicromapGeometryCount;
     profileReport_.rayTracingGeometry.blasBuildBatchCount = rtStats.blasGeometry.buildBatchCount;
+    profileReport_.rayTracingGeometry.cullableTriangleCount = rtStats.blasGeometry.cullableTriangleCount;
+    profileReport_.rayTracingGeometry.cullDisabledTriangleCount = rtStats.blasGeometry.cullDisabledTriangleCount;
+    profileReport_.rayTracingGeometry.splitMeshCount = rtStats.blasGeometry.splitMeshCount;
+    profileReport_.rayTracingGeometry.duplicatedTlasInstanceCount = rtStats.blasGeometry.duplicatedTlasInstanceCount;
+    profileReport_.rayTracingGeometry.actualBlasCount = rtStats.blasGeometry.actualBlasCount;
+    profileReport_.rayTracingGeometry.splitBlasBytes = static_cast<uint64_t>(rtStats.blasGeometry.splitBlasBytes);
+    profileReport_.rayTracingGeometry.hardwareBackfaceCullingEnabled = rtStats.blasGeometry.hardwareBackfaceCullingEnabled;
 
     const AnimatedGeometryStats& animatedGeometry = app.latestAnimatedGeometryStats();
     profileReport_.animatedGeometry.meshInstanceCount = animatedGeometry.meshInstanceCount;
@@ -2289,6 +2530,8 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.opacityMicromap.preprocess.subdivisionLevel = rtStats.opacityMicromapPreprocess.subdivisionLevel;
     profileReport_.opacityMicromap.preprocess.eligiblePrimitiveCount = rtStats.opacityMicromapPreprocess.eligiblePrimitiveCount;
     profileReport_.opacityMicromap.preprocess.generatedPrimitiveCount = rtStats.opacityMicromapPreprocess.generatedPrimitiveCount;
+    profileReport_.opacityMicromap.preprocess.alphaTestedPrimitiveCount = rtStats.opacityMicromapPreprocess.alphaTestedPrimitiveCount;
+    profileReport_.opacityMicromap.preprocess.blendedPrimitiveCount = rtStats.opacityMicromapPreprocess.blendedPrimitiveCount;
     profileReport_.opacityMicromap.preprocess.alphaTexturePrimitiveCount = rtStats.opacityMicromapPreprocess.alphaTexturePrimitiveCount;
     profileReport_.opacityMicromap.preprocess.constantAlphaPrimitiveCount = rtStats.opacityMicromapPreprocess.constantAlphaPrimitiveCount;
     profileReport_.opacityMicromap.preprocess.cacheEntryCount = rtStats.opacityMicromapPreprocess.cacheEntryCount;
@@ -2318,6 +2561,13 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.opacityMicromap.build.fallbackReason = rtStats.opacityMicromapBuild.fallbackReason;
     profileReport_.memory.texturesBytes = static_cast<uint64_t>(renderer->estimatedTextureMemory());
     profileReport_.memory.buffersBytes = static_cast<uint64_t>(renderer->estimatedBufferMemory());
+    profileReport_.memory.hardwareAccelerationStructureBytes = profileReport_.memory.accelerationStructureBytes;
+    const auto sceneMemory = renderer->scene().memoryBreakdown();
+    profileReport_.memory.gpuSceneBufferBytes = static_cast<uint64_t>(sceneMemory.totalBufferBytes);
+    profileReport_.memory.gpuSceneGeometryBytes = static_cast<uint64_t>(sceneMemory.geometryBytes);
+    profileReport_.memory.gpuSceneSoftwareBvhBytes = static_cast<uint64_t>(sceneMemory.softwareBvhBytes);
+    profileReport_.memory.gpuSceneLightBytes = static_cast<uint64_t>(sceneMemory.lightBytes);
+    profileReport_.memory.gpuSceneParameterBytes = static_cast<uint64_t>(sceneMemory.parameterBytes);
     profileReport_.memory.temporalHistoryBytes = static_cast<uint64_t>(renderer->temporalHistoryMemory());
     profileReport_.memory.restirReservoirBytes = static_cast<uint64_t>(renderer->restirReservoirMemory());
     const auto reservoirBreakdown = renderer->restirReservoirMemoryBreakdown();
@@ -2379,6 +2629,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.bindlessTextureHeap.capacity = bindlessHeapStats.capacity;
     profileReport_.memory.bindlessTextureHeap.descriptorCount = bindlessHeapStats.descriptorCount;
     profileReport_.memory.bindlessTextureHeap.patchCount = bindlessHeapStats.patchCount;
+    profileReport_.textureDiagnostics = app.textureDiagnosticsJson();
     profileReport_.restirGiLayout = renderer->restirGiReservoirLayoutName();
 
     const auto adaptiveState = renderer->adaptiveQualityState();
@@ -2445,6 +2696,12 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.settings = renderer->settings();
     profileReport_.effectiveRestirHistoryCopyMode = renderer->effectiveRestirHistoryCopyMode();
     profileReport_.effectiveRestirGiActiveTileMaskEnabled = renderer->effectiveRestirGiActiveTileMaskEnabled();
+    profileReport_.effectivePathTraceKernelMode = renderer->effectivePathTraceKernelMode();
+    profileReport_.native2BTerminalPayloadActive = renderer->native2BTerminalPayloadActive();
+    profileReport_.native2BCompactPrimaryLightsActive = renderer->native2BCompactPrimaryLightsActive();
+    if (const char* reason = renderer->pathTraceKernelFallbackReason()) {
+        profileReport_.pathTraceKernelFallbackReason = reason;
+    }
     if (const char* reason = renderer->restirHistoryCopyFallbackReason()) {
         profileReport_.restirHistoryCopyFallbackReason = reason;
     }
@@ -2487,11 +2744,18 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.nvidiaIntegrations.streamlineRuntimeConfigured = nvidiaStatus.streamlineRuntimeConfigured;
     profileReport_.nvidiaIntegrations.streamlineInitialized = nvidiaStatus.streamlineInitialized;
     profileReport_.nvidiaIntegrations.streamlineVulkanInfoSet = nvidiaStatus.streamlineVulkanInfoSet;
+    profileReport_.nvidiaIntegrations.vulkanDebugUtilsEnabled = context->debugUtilsExtensionEnabled();
+    profileReport_.nvidiaIntegrations.vulkanDebugLabelsAvailable = context->debugUtilsLabelsAvailable();
+    profileReport_.nvidiaIntegrations.vulkanDebugObjectNamesAvailable = context->debugUtilsObjectNamesAvailable();
     profileReport_.nvidiaIntegrations.streamlineRuntimeDirectory = nvidiaStatus.streamlineRuntimeDirectory;
     profileReport_.nvidiaIntegrations.streamlineUnavailableReason = nvidiaStatus.streamlineUnavailableReason;
+    profileReport_.nvidiaIntegrations.streamlineLogMessages = nvidiaStatus.streamlineLogMessages;
     profileReport_.nvidiaIntegrations.requestedStreamlineReflex = profileReport_.settings.streamlineReflexEnabled;
     profileReport_.nvidiaIntegrations.effectiveStreamlineReflex =
         profileReport_.settings.streamlineReflexEnabled && nvidiaStatus.streamlineReflex.requestable;
+    profileReport_.nvidiaIntegrations.requestedStreamlineNvPerf = profileReport_.settings.streamlineNvPerfEnabled;
+    profileReport_.nvidiaIntegrations.effectiveStreamlineNvPerf =
+        profileReport_.settings.streamlineNvPerfEnabled && nvidiaStatus.streamlineNvPerfEvaluation.succeeded > 0u;
     auto copyStreamlineFeature = [](const StreamlineFeatureStatus& source) {
         ProfileReport::NvidiaIntegrationReport::StreamlineFeatureReport report;
         report.requestable = source.requestable;
@@ -2524,6 +2788,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
         report.skippedUnsupported = source.skippedUnsupported;
         report.skippedMissingTags = source.skippedMissingTags;
         report.frameIndex = source.frameIndex;
+        report.lastError = source.lastError;
         return report;
     };
     auto copyStreamlineReflexMarkers = [](const PathTracerRenderer::StreamlineReflexMarkerSummary& source) {
@@ -2541,11 +2806,29 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.nvidiaIntegrations.streamlineReflex = copyStreamlineFeature(nvidiaStatus.streamlineReflex);
     profileReport_.nvidiaIntegrations.streamlineNis = copyStreamlineFeature(nvidiaStatus.streamlineNis);
     profileReport_.nvidiaIntegrations.streamlineNrd = copyStreamlineFeature(nvidiaStatus.streamlineNrd);
+    profileReport_.nvidiaIntegrations.streamlineNvPerf = copyStreamlineFeature(nvidiaStatus.streamlineNvPerf);
     profileReport_.nvidiaIntegrations.streamlineDlssTags = copyStreamlineTags(nvidiaStatus.streamlineDlssTags);
     profileReport_.nvidiaIntegrations.streamlineDlssRayReconstructionTags = copyStreamlineTags(nvidiaStatus.streamlineDlssRayReconstructionTags);
     profileReport_.nvidiaIntegrations.streamlineDlssEvaluation = copyStreamlineEvaluation(nvidiaStatus.streamlineDlssEvaluation);
     profileReport_.nvidiaIntegrations.streamlineDlssRayReconstructionEvaluation = copyStreamlineEvaluation(nvidiaStatus.streamlineDlssRayReconstructionEvaluation);
+    profileReport_.nvidiaIntegrations.streamlineNvPerfEvaluation = copyStreamlineEvaluation(nvidiaStatus.streamlineNvPerfEvaluation);
     profileReport_.nvidiaIntegrations.streamlineReflexMarkers = copyStreamlineReflexMarkers(nvidiaStatus.streamlineReflexMarkers);
+    const GpuCrashDiagnosticsStatus gpuCrashStatus = gpuCrashDiagnosticsStatus();
+    profileReport_.nvidiaIntegrations.gpuCrashDumps.buildAvailable = gpuCrashStatus.buildAvailable;
+    profileReport_.nvidiaIntegrations.gpuCrashDumps.requested = gpuCrashStatus.requested;
+    profileReport_.nvidiaIntegrations.gpuCrashDumps.enabled = gpuCrashStatus.enabled;
+    profileReport_.nvidiaIntegrations.gpuCrashDumps.outputDirectory = gpuCrashStatus.outputDirectory;
+    profileReport_.nvidiaIntegrations.gpuCrashDumps.unavailableReason = gpuCrashStatus.unavailableReason;
+    profileReport_.nvidiaIntegrations.gpuCrashDumps.enableResult = gpuCrashStatus.enableResult;
+    profileReport_.nvidiaIntegrations.gpuCrashDumps.dumpCount = gpuCrashStatus.dumpCount;
+    profileReport_.nvidiaIntegrations.gpuCrashDumps.shaderDebugInfoCount = gpuCrashStatus.shaderDebugInfoCount;
+    profileReport_.nvidiaIntegrations.nsightPerfSdk = nvidiaStatus.nsightPerfSdk;
+    if (profileReport_.settings.streamlineNvPerfEnabled && !nvidiaStatus.nsightPerfSdk.reportGeneratorInitialized) {
+        const std::string reason = nvidiaStatus.nsightPerfSdk.unavailableReason.empty()
+            ? "native Nsight Perf SDK report generator did not initialize"
+            : nvidiaStatus.nsightPerfSdk.unavailableReason;
+        profileReport_.warnings.push_back("Nsight Perf SDK requested but unavailable: " + reason);
+    }
     if (profileReport_.settings.denoiserBackend == DenoiserBackend::Nrd && !nvidiaStatus.nrdAvailable) {
         profileReport_.warnings.push_back("NRD denoiser requested but unavailable: " + nvidiaStatus.nrdUnavailableReason);
     }
@@ -2562,6 +2845,414 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     if (profileReport_.settings.dlssFrameGenerationEnabled && !nvidiaStatus.dlssFrameGenerationAvailable) {
         profileReport_.warnings.push_back("DLSS Frame Generation requested but unavailable: " + nvidiaStatus.dlssFrameGenerationUnavailableReason);
     }
+
+    profileReport_.optimizationHints = nlohmann::json::array();
+    auto addOptimizationHint = [&](std::string severity, std::string category, std::string message, nlohmann::json evidence, std::string recommendation) {
+        profileReport_.optimizationHints.push_back({
+            {"severity", std::move(severity)},
+            {"category", std::move(category)},
+            {"message", std::move(message)},
+            {"evidence", std::move(evidence)},
+            {"recommendation", std::move(recommendation)},
+        });
+    };
+    const float totalGpuMs = std::max(profileReport_.gpuFrameMs.avg, 0.0f);
+    std::vector<std::pair<std::string, float>> passTimes = {
+        {"PathTrace", profileReport_.perPassGpuMs.pathTrace},
+        {"ReSTIR DI Temporal", profileReport_.perPassGpuMs.restirDiTemporal},
+        {"ReSTIR DI Spatial", profileReport_.perPassGpuMs.restirDiSpatial},
+        {"ReSTIR DI Final", profileReport_.perPassGpuMs.restirDiFinal},
+        {"ReSTIR GI Temporal", profileReport_.perPassGpuMs.restirGiTemporal},
+        {"ReSTIR GI Spatial", profileReport_.perPassGpuMs.restirGiSpatial},
+        {"ReSTIR GI Upsample", profileReport_.perPassGpuMs.restirGiUpsample},
+        {"ReSTIR GI Final", profileReport_.perPassGpuMs.restirGiFinal},
+        {"Denoiser", profileReport_.perPassGpuMs.denoiser},
+        {"Moment Update", profileReport_.perPassGpuMs.momentUpdate},
+        {"TAA/TSR", profileReport_.perPassGpuMs.taa},
+        {"ToneMap", profileReport_.perPassGpuMs.toneMap},
+        {"Fullscreen/Present", profileReport_.perPassGpuMs.fullscreen + profileReport_.perPassGpuMs.editorPresentation},
+        {"Dynamic BLAS Update", profileReport_.perPassGpuMs.dynamicBlasUpdate},
+        {"Wavefront Trace", profileReport_.perPassGpuMs.wavefrontTrace + profileReport_.perPassGpuMs.wavefrontSecondaryTrace + profileReport_.perPassGpuMs.wavefrontSortedTrace},
+        {"Wavefront Shade", profileReport_.perPassGpuMs.wavefrontShade + profileReport_.perPassGpuMs.wavefrontSecondaryShade + profileReport_.perPassGpuMs.wavefrontSortedShade},
+    };
+    const auto slowestPass = std::max_element(passTimes.begin(), passTimes.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.second < rhs.second;
+    });
+    if (slowestPass != passTimes.end() && slowestPass->second > 0.0f && totalGpuMs > 0.0f) {
+        const float fraction = slowestPass->second / totalGpuMs;
+        if (slowestPass->second >= 4.0f || fraction >= 0.35f) {
+            addOptimizationHint(
+                fraction >= 0.5f ? "high" : "medium",
+                "gpu_pass_hotspot",
+                "Dominant GPU pass detected: " + slowestPass->first,
+                {{"pass_ms", slowestPass->second}, {"gpu_frame_ms", totalGpuMs}, {"frame_fraction", fraction}},
+                slowestPass->first == "PathTrace"
+                    ? "Run Nsight GPU Trace with --ray-tracing-deep and inspect RT Shader Profiler, SER/OMM state, any-hit counters, and texture-cache diagnostics in the PathTrace marker."
+                    : "Drill into this marker in Nsight GPU Trace and compare it against engine pass timings before changing quality settings.");
+        }
+    }
+    const float temporalReuseMs =
+        profileReport_.perPassGpuMs.restirDiTemporal +
+        profileReport_.perPassGpuMs.restirDiSpatial +
+        profileReport_.perPassGpuMs.restirDiFinal +
+        profileReport_.perPassGpuMs.restirGiTemporal +
+        profileReport_.perPassGpuMs.restirGiSpatial +
+        profileReport_.perPassGpuMs.restirGiUpsample +
+        profileReport_.perPassGpuMs.restirGiFinal;
+    if (totalGpuMs > 0.0f && temporalReuseMs >= 2.0f && temporalReuseMs / totalGpuMs >= 0.2f) {
+        addOptimizationHint(
+            "medium",
+            "restir_cost",
+            "ReSTIR passes are a significant part of the frame.",
+            {{"restir_ms", temporalReuseMs}, {"gpu_frame_ms", totalGpuMs}, {"frame_fraction", temporalReuseMs / totalGpuMs}},
+            "Use the ReSTIR matrix scripts to compare DI/GI modes, then inspect reservoir counts, visibility rays, and active-tile/half-resolution settings.");
+    }
+    const float temporalPostMs =
+        profileReport_.perPassGpuMs.denoiser +
+        profileReport_.perPassGpuMs.momentUpdate +
+        profileReport_.perPassGpuMs.taa +
+        profileReport_.perPassGpuMs.historyCopy +
+        profileReport_.perPassGpuMs.taaHistoryCopy;
+    if (totalGpuMs > 0.0f && temporalPostMs >= 2.0f && temporalPostMs / totalGpuMs >= 0.2f) {
+        addOptimizationHint(
+            "medium",
+            "temporal_postprocess_cost",
+            "Denoising/TAA/history work is a significant part of the frame.",
+            {{"temporal_post_ms", temporalPostMs}, {"gpu_frame_ms", totalGpuMs}, {"frame_fraction", temporalPostMs / totalGpuMs}},
+            "Compare denoiser, TAA/TSR, and history-copy modes with fixed seeds; inspect variance, rejection, motion-vector, and temporal-history debug views.");
+    }
+    const auto textureValue = [&](const char* key) -> uint64_t {
+        if (!profileReport_.textureDiagnostics.is_object() || !profileReport_.textureDiagnostics.contains(key)) {
+            return 0u;
+        }
+        const auto& value = profileReport_.textureDiagnostics.at(key);
+        return value.is_number_unsigned() ? value.get<uint64_t>() : value.is_number_integer() ? static_cast<uint64_t>(std::max<int64_t>(value.get<int64_t>(), 0)) : 0u;
+    };
+    const uint64_t oversizedTextures = textureValue("oversized_texture_count");
+    const uint64_t streamingUploads = textureValue("streaming_image_uploads_during_capture");
+    const uint64_t lifetimeStreamingUploads = textureValue("streaming_upload_count");
+    const uint64_t fallbackTextures = textureValue("fallback_missing_texture_count");
+    if (oversizedTextures > 0u || streamingUploads > 0u || fallbackTextures > 0u) {
+        addOptimizationHint(
+            streamingUploads > 0u || fallbackTextures > 0u ? "high" : "medium",
+            "texture_cache_residency",
+            "Texture residency/cache diagnostics found capture-risk signals.",
+            {
+                {"bound_texture_count", textureValue("bound_texture_count")},
+                {"total_texture_bytes", textureValue("total_texture_bytes")},
+                {"oversized_texture_count", oversizedTextures},
+                {"streaming_image_uploads_during_capture", streamingUploads},
+                {"lifetime_streaming_upload_count", lifetimeStreamingUploads},
+                {"fallback_missing_texture_count", fallbackTextures},
+            },
+            streamingUploads > 0u
+                ? "Warm up until streaming uploads reach zero before taking Nsight captures; then inspect largest textures, mip chains, and texture-cache hit rate."
+                : "Check top_largest_textures and capture texture-cache metrics inside the dominant renderer pass.");
+    }
+    if (profileReport_.memoryPressureQuality.active || profileReport_.memoryPressureQuality.usageRatio >= 0.85f) {
+        addOptimizationHint(
+            profileReport_.memoryPressureQuality.usageRatio >= 0.9f ? "high" : "medium",
+            "memory_pressure",
+            "Memory pressure quality policy is active or near its threshold.",
+            {
+                {"usage_ratio", profileReport_.memoryPressureQuality.usageRatio},
+                {"tier", profileReport_.memoryPressureQuality.tier},
+                {"pressure", profileReport_.memoryPressureQuality.pressure},
+                {"effective_render_scale", profileReport_.memoryPressureQuality.effectiveRenderScale},
+            },
+            "Inspect VMA heap budgets, texture bytes, AS bytes, temporal history, and streaming uploads before comparing GPU timings.");
+    }
+    const uint64_t rtTriangleCount =
+        static_cast<uint64_t>(profileReport_.rayTracingGeometry.opaqueTriangleCount) +
+        static_cast<uint64_t>(profileReport_.rayTracingGeometry.alphaTestedTriangleCount) +
+        static_cast<uint64_t>(profileReport_.rayTracingGeometry.blendedTriangleCount);
+    if (profileReport_.memory.accelerationStructureBytes >= 512ull * 1024ull * 1024ull ||
+        rtTriangleCount >= 2000000ull) {
+        addOptimizationHint(
+            "medium",
+            "ray_tracing_geometry",
+            "Large ray tracing geometry or acceleration structure footprint detected.",
+            {
+                {"triangles", rtTriangleCount},
+                {"blas_count", profileReport_.rayTracingGeometry.actualBlasCount},
+                {"as_bytes", profileReport_.memory.accelerationStructureBytes},
+                {"hardware_backface_culling", profileReport_.rayTracingGeometry.hardwareBackfaceCullingEnabled},
+            },
+            "Use Nsight Graphics Ray Tracing Inspector for TLAS/BLAS overlap and traversal, then A/B hardware backface culling, OMM, and mixed-sided split modes.");
+    }
+    if (profileReport_.settings.streamlineNvPerfEnabled &&
+        profileReport_.nvidiaIntegrations.nsightPerfSdk.reportGeneratorInitialized &&
+        profileReport_.nvidiaIntegrations.streamlineNvPerfEvaluation.failed > 0u) {
+        addOptimizationHint(
+            "info",
+            "nvidia_perf_tooling",
+            "Streamline NvPerf plugin path failed, but the native Nsight Perf SDK diagnostics are ready.",
+            {
+                {"streamline_last_error", profileReport_.nvidiaIntegrations.streamlineNvPerfEvaluation.lastError},
+                {"native_device", profileReport_.nvidiaIntegrations.nsightPerfSdk.deviceName},
+                {"native_chip", profileReport_.nvidiaIntegrations.nsightPerfSdk.chipName},
+            },
+            "Use Nsight GPU Trace and the native nsight_perf_sdk block for renderer analysis; treat Streamline NvPerf as an optional HUD/plugin integration.");
+    }
+
+    auto readinessCheck = [](std::string name, bool pass, std::string message, nlohmann::json evidence = nlohmann::json::object()) {
+        return nlohmann::json{
+            {"name", std::move(name)},
+            {"pass", pass},
+            {"severity", pass ? "info" : "warning"},
+            {"message", std::move(message)},
+            {"evidence", std::move(evidence)},
+        };
+    };
+    nlohmann::json readinessChecks = nlohmann::json::array();
+    auto pushReadiness = [&](std::string name, bool pass, std::string message, nlohmann::json evidence = nlohmann::json::object()) {
+        readinessChecks.push_back(readinessCheck(std::move(name), pass, std::move(message), std::move(evidence)));
+    };
+    pushReadiness(
+        "profiled_frames",
+        profileReport_.profiledFrames > 0u,
+        profileReport_.profiledFrames > 0u ? "Profile contains at least one measured frame." : "Profile has no measured frames after warmup.",
+        {{"frame_count", profileReport_.frameCount}, {"warmup_frames", profileReport_.warmupFrames}, {"profiled_frames", profileReport_.profiledFrames}});
+    pushReadiness(
+        "valid_render_extent",
+        profileReport_.resolution.renderWidth > 0u && profileReport_.resolution.renderHeight > 0u,
+        "Render extent is non-zero.",
+        {{"width", profileReport_.resolution.renderWidth}, {"height", profileReport_.resolution.renderHeight}, {"render_scale", profileReport_.resolution.renderScale}});
+    pushReadiness(
+        "gpu_marker_labels",
+        profileReport_.nvidiaIntegrations.vulkanDebugLabelsAvailable,
+        profileReport_.nvidiaIntegrations.vulkanDebugLabelsAvailable
+            ? "Vulkan debug labels are available for Nsight/RenderDoc pass attribution."
+            : "Vulkan debug labels are unavailable; Nsight marker attribution may be blind.",
+        {{"debug_utils_enabled", profileReport_.nvidiaIntegrations.vulkanDebugUtilsEnabled}});
+    pushReadiness(
+        "gpu_object_names",
+        profileReport_.nvidiaIntegrations.vulkanDebugObjectNamesAvailable,
+        profileReport_.nvidiaIntegrations.vulkanDebugObjectNamesAvailable
+            ? "Vulkan object names are available for resource attribution."
+            : "Vulkan object names are unavailable; resource attribution may be weaker.");
+    pushReadiness(
+        "validation_clean",
+        profileReport_.validationErrorCount == 0u,
+        profileReport_.validationErrorCount == 0u ? "No validation errors were recorded." : "Validation errors were recorded; fix them before trusting performance.",
+        {{"validation_error_count", profileReport_.validationErrorCount}});
+    pushReadiness(
+        "streaming_idle",
+        streamingUploads == 0u,
+        streamingUploads == 0u ? "No image uploads were observed during the capture window." : "Image uploads were active during capture; warm up longer before capture.",
+        {
+            {"streaming_image_uploads_during_capture", streamingUploads},
+            {"lifetime_streaming_upload_count", lifetimeStreamingUploads},
+            {"capture_upload_snapshot_valid", profileReport_.textureDiagnostics.value("capture_upload_snapshot_valid", false)},
+        });
+    pushReadiness(
+        "native_nsight_perf_sdk",
+        profileReport_.nvidiaIntegrations.nsightPerfSdk.reportGeneratorInitialized,
+        profileReport_.nvidiaIntegrations.nsightPerfSdk.reportGeneratorInitialized
+            ? "Native Nsight Perf SDK readiness probe succeeded."
+            : "Native Nsight Perf SDK readiness probe is unavailable.",
+        {{"configured", profileReport_.nvidiaIntegrations.nsightPerfSdk.sdkConfigured}, {"reason", profileReport_.nvidiaIntegrations.nsightPerfSdk.unavailableReason}});
+    const NsightPerfMarkerStatus& nsightPerfRanges = profileReport_.nvidiaIntegrations.nsightPerfSdk.commandBufferRanges;
+    pushReadiness(
+        "native_nsight_perf_ranges",
+        !profileReport_.settings.streamlineNvPerfEnabled || nsightPerfRanges.commandBufferRangesAvailable,
+        nsightPerfRanges.commandBufferRangesAvailable
+            ? "Native Nsight Perf command-buffer range hooks are available for SDK-driven captures."
+            : "Native Nsight Perf command-buffer range hooks are unavailable.",
+        {
+            {"requested", profileReport_.settings.streamlineNvPerfEnabled},
+            {"enabled", nsightPerfRanges.enabled},
+            {"available", nsightPerfRanges.commandBufferRangesAvailable},
+            {"pushed_ranges", nsightPerfRanges.pushedRanges},
+            {"popped_ranges", nsightPerfRanges.poppedRanges},
+            {"failed_pushes", nsightPerfRanges.failedPushes},
+            {"failed_pops", nsightPerfRanges.failedPops},
+            {"capture_completed", nsightPerfRanges.captureCompleted},
+            {"capture_succeeded", nsightPerfRanges.captureSucceeded},
+            {"last_report_directory", nsightPerfRanges.lastReportDirectory},
+            {"recent_range_names", nsightPerfRanges.recentRangeNames},
+            {"reason", nsightPerfRanges.unavailableReason},
+        });
+    pushReadiness(
+        "native_nsight_perf_report",
+        !profileReport_.settings.streamlineNvPerfEnabled || nsightPerfRanges.captureSucceeded,
+        nsightPerfRanges.captureSucceeded
+            ? "Native Nsight Perf hardware-counter report completed."
+            : "Native Nsight Perf report was not completed; allow the collection to drain or inspect its failure counters.",
+        {
+            {"requested", profileReport_.settings.streamlineNvPerfEnabled},
+            {"capture_requested", nsightPerfRanges.captureRequested},
+            {"capture_completed", nsightPerfRanges.captureCompleted},
+            {"capture_succeeded", nsightPerfRanges.captureSucceeded},
+            {"capture_failed", nsightPerfRanges.captureFailed},
+            {"last_report_directory", nsightPerfRanges.lastReportDirectory},
+            {"capture_start_failures", nsightPerfRanges.captureStartFailures},
+            {"frame_start_failures", nsightPerfRanges.frameStartFailures},
+            {"frame_end_failures", nsightPerfRanges.frameEndFailures},
+        });
+    const auto& gpuCrashDumps = profileReport_.nvidiaIntegrations.gpuCrashDumps;
+    pushReadiness(
+        "gpu_crash_dumps",
+        !gpuCrashDumps.requested || gpuCrashDumps.enabled,
+        gpuCrashDumps.requested
+            ? (gpuCrashDumps.enabled
+                ? "Nsight Aftermath GPU crash dump collection is enabled."
+                : "GPU crash dumps were requested but Nsight Aftermath is not enabled.")
+            : "GPU crash dumps were not requested for this run.",
+        {
+            {"build_available", gpuCrashDumps.buildAvailable},
+            {"requested", gpuCrashDumps.requested},
+            {"enabled", gpuCrashDumps.enabled},
+            {"output_directory", gpuCrashDumps.outputDirectory.string()},
+            {"unavailable_reason", gpuCrashDumps.unavailableReason},
+            {"enable_result", gpuCrashDumps.enableResult},
+            {"dump_count", gpuCrashDumps.dumpCount},
+            {"shader_debug_info_count", gpuCrashDumps.shaderDebugInfoCount},
+        });
+    pushReadiness(
+        "rt_diagnostic_counters",
+        profileReport_.rayTracingDiagnosticCountersEnabled,
+        profileReport_.rayTracingDiagnosticCountersEnabled
+            ? "Shader RT diagnostic counters were enabled for this run."
+            : "Shader RT diagnostic counters were disabled; use --rt-diagnostic-counters on for short deep dives.");
+
+    uint32_t failedReadinessChecks = 0;
+    for (const auto& check : readinessChecks) {
+        if (!check.value("pass", false)) {
+            ++failedReadinessChecks;
+        }
+    }
+    profileReport_.diagnosticReadiness = {
+        {"schema", "RendererDiagnosticReadinessV1"},
+        {"status", failedReadinessChecks == 0u ? "pass" : (failedReadinessChecks <= 2u ? "warn" : "fail")},
+        {"failed_check_count", failedReadinessChecks},
+        {"checks", std::move(readinessChecks)},
+        {"recommended_capture_mode", "renderer-only"},
+        {"minimum_capture_ready_frames", 30},
+    };
+
+    std::vector<std::pair<std::string, float>> sortedPassTimes = passTimes;
+    std::sort(sortedPassTimes.begin(), sortedPassTimes.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.second > rhs.second;
+    });
+    nlohmann::json topPasses = nlohmann::json::array();
+    for (const auto& [name, ms] : sortedPassTimes) {
+        if (ms <= 0.0f || topPasses.size() >= 6u) {
+            continue;
+        }
+        topPasses.push_back({
+            {"name", name},
+            {"gpu_ms", ms},
+            {"frame_fraction", totalGpuMs > 0.0f ? nlohmann::json(ms / totalGpuMs) : nlohmann::json(nullptr)},
+        });
+    }
+    nlohmann::json metricPlan = nlohmann::json::array({
+        {
+            {"scope", "whole_frame"},
+            {"commands", nlohmann::json::array({"gputrace-stalls", "gputrace-bandwidth"})},
+            {"why", "First determine whether the frame is idle, synchronization-bound, memory-bound, or shader-bound."},
+        },
+        {
+            {"scope", "dominant_marker"},
+            {"commands", nlohmann::json::array({"gputrace-actions --with-metrics", "gputrace-shader-bound", "gputrace-texture-cache"})},
+            {"why", "Attribute the slowest renderer marker to SM occupancy, stalls, instruction pressure, or texture-cache misses."},
+        },
+    });
+    if (rtTriangleCount > 0u || profileReport_.perPassGpuMs.pathTrace > 0.0f) {
+        metricPlan.push_back({
+            {"scope", "ray_tracing"},
+            {"commands", nlohmann::json::array({"rtvulkan-capture --ray-tracing-deep", "Ray Tracing Inspector", "RT Shader Profiler"})},
+            {"why", "Inspect traversal, hit shader cost, any-hit density, SER behavior, OMM state, and SBT groups for PathTrace."},
+        });
+    }
+    if (oversizedTextures > 0u || textureValue("total_texture_bytes") > 1024ull * 1024ull * 1024ull) {
+        metricPlan.push_back({
+            {"scope", "texture_cache"},
+            {"commands", nlohmann::json::array({"gputrace-texture-cache --in-marker PathTrace", "gputrace-metric --name l1tex", "gputrace-metric --name dram"})},
+            {"why", "Texture residency or texture size suggests cache pressure may dominate ray payload shading."},
+        });
+    }
+    profileReport_.nsightAnalysisPlan = {
+        {"schema", "NsightAnalysisPlanV1"},
+        {"top_engine_passes", std::move(topPasses)},
+        {"recommended_metric_sets", nlohmann::json::array({"Throughput Metrics", "Ray Tracing", "Shader Profiler"})},
+        {"recommended_capture_flags", nlohmann::json::array({"--gpu-markers on", "--capture-ready-log", "--ray-tracing-deep for path tracing dives"})},
+        {"steps", std::move(metricPlan)},
+    };
+
+    profileReport_.rayTracingShaderMap = {
+        {"schema", "RayTracingShaderMapV1"},
+        {"effective_kernel", pathTraceKernelModeName(profileReport_.effectivePathTraceKernelMode)},
+        {"terminal_hit_group_active", profileReport_.native2BTerminalPayloadActive},
+        {"native2b_compact_primary_lights_active", profileReport_.native2BCompactPrimaryLightsActive},
+        {"shader_groups", nlohmann::json::array({
+            {{"stage", "raygen"}, {"file", "shaders/pathtrace.rgen"}, {"marker", "PathTrace"}, {"role", "primary path tracing launch"}},
+            {{"stage", "miss"}, {"file", "shaders/pathtrace.rmiss"}, {"marker", "PathTrace"}, {"role", "environment/background miss"}},
+            {{"stage", "closesthit"}, {"file", "shaders/pathtrace.rchit"}, {"marker", "PathTrace"}, {"role", "material closest-hit shading"}},
+            {{"stage", "anyhit"}, {"file", "shaders/pathtrace.rahit"}, {"marker", "PathTrace"}, {"role", "alpha/blended visibility filtering"}},
+            {{"stage", "terminal_closesthit"}, {"file", "shaders/pathtrace_terminal.rchit"}, {"marker", "PathTrace"}, {"role", "native2b terminal-bounce fast path"}, {"active", profileReport_.native2BTerminalPayloadActive}},
+            {{"stage", "terminal_anyhit"}, {"file", "shaders/pathtrace_terminal.rahit"}, {"marker", "PathTrace"}, {"role", "terminal alpha/blended filtering"}, {"active", profileReport_.native2BTerminalPayloadActive}},
+            {{"stage", "shadow_raygen"}, {"file", "shaders/pathtrace_shadow.rahit"}, {"marker", "PathTrace"}, {"role", "shadow/transmittance any-hit path"}},
+        })},
+        {"counter_mapping", {
+            {"primary_any_hit", "ray_tracing_diagnostic_counters.primary_any_hit_*"},
+            {"terminal_any_hit", "ray_tracing_diagnostic_counters.terminal_any_hit_*"},
+            {"shadow_any_hit", "ray_tracing_diagnostic_counters.shadow_any_hit_*"},
+            {"closest_hit", "ray_tracing_diagnostic_counters.closest_hit_*"},
+            {"alpha_material_hotspots", "alpha_any_hit_top_materials"},
+        }},
+    };
+
+    const double asMiB = static_cast<double>(profileReport_.memory.accelerationStructureBytes) / (1024.0 * 1024.0);
+    const uint64_t cullableTriangles = profileReport_.rayTracingGeometry.cullableTriangleCount;
+    const uint64_t cullDisabledTriangles = profileReport_.rayTracingGeometry.cullDisabledTriangleCount;
+    const double cullableRatio = (cullableTriangles + cullDisabledTriangles) > 0u
+        ? static_cast<double>(cullableTriangles) / static_cast<double>(cullableTriangles + cullDisabledTriangles)
+        : 0.0;
+    profileReport_.accelerationStructureDiagnostics = {
+        {"schema", "AccelerationStructureDiagnosticsV1"},
+        {"triangle_count", rtTriangleCount},
+        {"blas_count", profileReport_.rayTracingGeometry.actualBlasCount},
+        {"blas_build_batch_count", profileReport_.rayTracingGeometry.blasBuildBatchCount},
+        {"as_bytes", profileReport_.memory.accelerationStructureBytes},
+        {"as_mib", asMiB},
+        {"hardware_backface_culling_enabled", profileReport_.rayTracingGeometry.hardwareBackfaceCullingEnabled},
+        {"cullable_triangle_count", cullableTriangles},
+        {"cull_disabled_triangle_count", cullDisabledTriangles},
+        {"cullable_ratio", cullableRatio},
+        {"opacity_micromaps_active", profileReport_.opacityMicromap.build.active},
+        {"opacity_micromap_geometry_count", profileReport_.rayTracingGeometry.blasOpacityMicromapGeometryCount},
+        {"shader_execution_reordering_enabled", profileReport_.shaderExecutionReordering.enabled},
+        {"motion_blur_instances_active", profileReport_.rayTracingMotionBlur.motionInstancesActive},
+        {"recommendations", nlohmann::json::array({
+            "Use Ray Tracing Inspector to inspect TLAS/BLAS overlap, instance transforms, compaction, and per-hit-group traversal.",
+            "A/B --hardware-backface-culling and --mixed-sided-split on high triangle scenes.",
+            "Use --rt-diagnostic-counters on for short runs when any-hit or alpha material cost is suspected.",
+        })},
+    };
+
+    const bool asyncPotential = profileReport_.asyncCompute.enabled &&
+        profileReport_.asyncCompute.independentQueue &&
+        profileReport_.asyncCompute.timelineSemaphore;
+    profileReport_.barrierSyncDiagnostics = {
+        {"schema", "BarrierSyncDiagnosticsV1"},
+        {"queue_lane_ms", profileReport_.queueLaneMs},
+        {"async_compute", {
+            {"enabled", profileReport_.asyncCompute.enabled},
+            {"independent_queue", profileReport_.asyncCompute.independentQueue},
+            {"timeline_semaphore", profileReport_.asyncCompute.timelineSemaphore},
+            {"cross_family", profileReport_.asyncCompute.crossFamily},
+            {"single_queue_fallback", profileReport_.asyncCompute.singleQueueFallback},
+            {"overlap_potential", asyncPotential},
+        }},
+        {"rendergraph_required_for_barrier_counts", true},
+        {"rendergraph_outputs", nlohmann::json::array({"--dump-rendergraph", "--dump-resource-lifetimes", "--dump-bindings", "--dump-frame-timeline"})},
+        {"nsight_followup", nlohmann::json::array({
+            "Use Nsight Systems for CPU submit/wait gaps and queue overlap.",
+            "Use RenderGraph barrier JSON to find layout churn and pass-to-pass synchronization.",
+            "Inspect queue_wait in profile queue_lane_ms before optimizing shader code.",
+        })},
+    };
 
     // Read back DI counters if available
     if (auto* diCounters = renderer->restirDiCounterData()) {
@@ -2604,12 +3295,79 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["wavefront_queues"] = profileReport_.wavefrontQueues;
     j["wavefront_validation"] = profileReport_.wavefrontValidation;
     const uint64_t hitCount = profileReport_.pipelineStatistics.triangleHits + profileReport_.pipelineStatistics.aabbHits;
+    nlohmann::json rayTracingCounterTotals = nullptr;
+    nlohmann::json rayTracingCounterPerRenderedFrame = nullptr;
+    nlohmann::json rayTracingRawSlotsPerRenderedFrame = nullptr;
+    nlohmann::json alphaAnyHitTopMaterials = nullptr;
+    if (profileReport_.rayTracingDiagnosticCountersEnabled) {
+        rayTracingCounterTotals = profileReport_.rayTracingDiagnosticCounters;
+        const double frameDivisor = static_cast<double>(std::max(1u, profileReport_.frameCount));
+        const auto& counters = profileReport_.rayTracingDiagnosticCounters;
+        rayTracingRawSlotsPerRenderedFrame = nlohmann::json::array();
+        for (uint64_t slot : counters.rawSlots) {
+            rayTracingRawSlotsPerRenderedFrame.push_back(static_cast<double>(slot) / frameDivisor);
+        }
+        rayTracingCounterPerRenderedFrame = {
+            {"camera_any_hit_invocations", static_cast<double>(counters.cameraAnyHitInvocations) / frameDivisor},
+            {"camera_any_hit_ignored", static_cast<double>(counters.cameraAnyHitIgnored) / frameDivisor},
+            {"camera_any_hit_accepted", static_cast<double>(counters.cameraAnyHitAccepted) / frameDivisor},
+            {"shadow_any_hit_invocations", static_cast<double>(counters.shadowAnyHitInvocations) / frameDivisor},
+            {"shadow_any_hit_ignored", static_cast<double>(counters.shadowAnyHitIgnored) / frameDivisor},
+            {"shadow_any_hit_accepted", static_cast<double>(counters.shadowAnyHitAccepted) / frameDivisor},
+            {"surface_trace_rays", static_cast<double>(counters.surfaceTraceRays) / frameDivisor},
+            {"shadow_trace_rays", static_cast<double>(counters.shadowTraceRays) / frameDivisor},
+            {"closest_hit_invocations", static_cast<double>(counters.closestHitInvocations) / frameDivisor},
+            {"closest_hit_alpha_materials", static_cast<double>(counters.closestHitAlphaMaterials) / frameDivisor},
+            {"caustic_shadow_attempts", static_cast<double>(counters.causticShadowAttempts) / frameDivisor},
+            {"caustic_transmissive_hits", static_cast<double>(counters.causticTransmissiveHits) / frameDivisor},
+            {"caustic_transmissive_visible", static_cast<double>(counters.causticTransmissiveVisible) / frameDivisor},
+            {"caustic_shadow_blocked", static_cast<double>(counters.causticShadowBlocked) / frameDivisor},
+            {"primary_surface_trace_rays", static_cast<double>(counters.primarySurfaceTraceRays) / frameDivisor},
+            {"terminal_surface_trace_rays", static_cast<double>(counters.terminalSurfaceTraceRays) / frameDivisor},
+            {"shadow_surface_trace_rays", static_cast<double>(counters.shadowSurfaceTraceRays) / frameDivisor},
+            {"env_direct_shadow_rays", static_cast<double>(counters.envDirectShadowRays) / frameDivisor},
+            {"sun_direct_shadow_rays", static_cast<double>(counters.sunDirectShadowRays) / frameDivisor},
+            {"emissive_direct_shadow_rays", static_cast<double>(counters.emissiveDirectShadowRays) / frameDivisor},
+            {"transmissive_shadow_surface_traces", static_cast<double>(counters.transmissiveShadowSurfaceTraces) / frameDivisor},
+            {"fast_shadow_transmittance_used", static_cast<double>(counters.fastShadowTransmittanceUsed) / frameDivisor},
+            {"full_shadow_transmittance_used", static_cast<double>(counters.fullShadowTransmittanceUsed) / frameDivisor},
+            {"terminal_fast_direct_used", static_cast<double>(counters.terminalFastDirectUsed) / frameDivisor},
+            {"terminal_generic_direct_used", static_cast<double>(counters.terminalGenericDirectUsed) / frameDivisor},
+            {"terminal_material_full_decode", static_cast<double>(counters.terminalMaterialFullDecode) / frameDivisor},
+            {"terminal_material_header_only", static_cast<double>(counters.terminalMaterialHeaderOnly) / frameDivisor},
+            {"primary_any_hit_opaque", static_cast<double>(counters.primaryAnyHitOpaque) / frameDivisor},
+            {"primary_any_hit_alpha_tested", static_cast<double>(counters.primaryAnyHitAlphaTested) / frameDivisor},
+            {"primary_any_hit_blended", static_cast<double>(counters.primaryAnyHitBlended) / frameDivisor},
+            {"terminal_any_hit_invocations", static_cast<double>(counters.terminalAnyHitInvocations) / frameDivisor},
+            {"terminal_any_hit_opaque", static_cast<double>(counters.terminalAnyHitOpaque) / frameDivisor},
+            {"terminal_any_hit_alpha_tested", static_cast<double>(counters.terminalAnyHitAlphaTested) / frameDivisor},
+            {"terminal_any_hit_blended", static_cast<double>(counters.terminalAnyHitBlended) / frameDivisor},
+            {"closest_hit_primary", static_cast<double>(counters.closestHitPrimary) / frameDivisor},
+            {"closest_hit_terminal", static_cast<double>(counters.closestHitTerminal) / frameDivisor},
+            {"caustic_blocker_opaque", static_cast<double>(counters.causticBlockerOpaque) / frameDivisor},
+            {"caustic_blocker_alpha_tested", static_cast<double>(counters.causticBlockerAlphaTested) / frameDivisor},
+            {"caustic_blocker_blended", static_cast<double>(counters.causticBlockerBlended) / frameDivisor},
+            {"terminal_fast_direct_flag_disabled", static_cast<double>(counters.terminalFastDirectFlagDisabled) / frameDivisor},
+            {"terminal_fast_direct_scene_lights", static_cast<double>(counters.terminalFastDirectSceneLights) / frameDivisor},
+            {"terminal_fast_direct_transmissive_scene", static_cast<double>(counters.terminalFastDirectTransmissiveScene) / frameDivisor},
+            {"terminal_fast_direct_volume", static_cast<double>(counters.terminalFastDirectVolume) / frameDivisor},
+            {"terminal_fast_direct_debug", static_cast<double>(counters.terminalFastDirectDebug) / frameDivisor},
+            {"terminal_fast_direct_material_transmissive", static_cast<double>(counters.terminalFastDirectMaterialTransmissive) / frameDivisor},
+            {"terminal_direct_skipped_emissive_or_unlit", static_cast<double>(counters.terminalDirectSkippedEmissiveOrUnlit) / frameDivisor},
+        };
+        alphaAnyHitTopMaterials = profileReport_.alphaAnyHitTopMaterials;
+    }
     j["gpu_debug_counters"] = {
         {"ray_count", profileReport_.pipelineStatistics.rayInvocations},
         {"shadow_ray_count", nullptr},
         {"hit_count", hitCount},
         {"miss_count", profileReport_.pipelineStatistics.rayInvocations > hitCount ? profileReport_.pipelineStatistics.rayInvocations - hitCount : 0},
-        {"ray_tracing_any_hit", profileReport_.rayTracingDiagnosticCounters},
+        {"ray_tracing_instrumentation_enabled", profileReport_.rayTracingDiagnosticCountersEnabled},
+        {"ray_tracing_totals", rayTracingCounterTotals},
+        {"ray_tracing_per_rendered_frame", rayTracingCounterPerRenderedFrame},
+        {"ray_tracing_raw_slots_per_rendered_frame", rayTracingRawSlotsPerRenderedFrame},
+        {"alpha_any_hit_top_materials", alphaAnyHitTopMaterials},
+        {"alpha_any_hit_top_primitives", nullptr},
         {"path_length_histogram", nlohmann::json::array()},
         {"restir_accepted_count", nullptr},
         {"restir_rejected_count", nullptr},
@@ -2619,11 +3377,13 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"denoiser_history_rejected_count", nullptr},
         {"notes", nlohmann::json::array({
             "ray_count/hit_count/miss_count come from Vulkan pipeline statistics when available",
-            "ray_tracing_any_hit is shader-instrumented during profile runs and reports the last completed frame",
+            "ray tracing diagnostic totals accumulate over all rendered frames, including warmup, when --rt-diagnostic-counters is enabled",
+            "ray tracing diagnostic fields are null when shader instrumentation is disabled",
             "remaining counters require shader atomic instrumentation and are intentionally null until instrumented"
         })},
     };
     j["memory"] = profileReport_.memory;
+    j["texture_cache_diagnostics"] = profileReport_.textureDiagnostics;
     j["restir_di_counters"] = profileReport_.restirDiCounters;
     j["restir_gi_counters"] = profileReport_.restirGiCounters;
     auto diCounter = [this](size_t index) -> uint64_t {
@@ -3045,6 +3805,24 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     };
     j["adaptive_quality"] = profileReport_.adaptiveQuality;
     j["memory_pressure_quality"] = profileReport_.memoryPressureQuality;
+    j["active_passes"] = {
+        {"path_trace", profileReport_.settings.pathTracingEnabled},
+        {"pathtrace_kernel_native2b", profileReport_.effectivePathTraceKernelMode == PathTraceKernelMode::Native2B},
+        {"pathtrace_terminal_hit_group", profileReport_.native2BTerminalPayloadActive},
+        {"restir_di_temporal", profileReport_.perPassGpuMs.restirDiTemporal > 0.0f},
+        {"restir_di_spatial", profileReport_.perPassGpuMs.restirDiSpatial > 0.0f},
+        {"restir_di_final", profileReport_.perPassGpuMs.restirDiFinal > 0.0f},
+        {"restir_gi_temporal", profileReport_.perPassGpuMs.restirGiTemporal > 0.0f},
+        {"restir_gi_spatial", profileReport_.perPassGpuMs.restirGiSpatial > 0.0f},
+        {"restir_gi_final", profileReport_.perPassGpuMs.restirGiFinal > 0.0f},
+        {"restir_gi_upsample", profileReport_.perPassGpuMs.restirGiUpsample > 0.0f},
+        {"atmosphere_lut_update", profileReport_.perPassGpuMs.atmosphere > 0.0f},
+        {"denoiser", profileReport_.perPassGpuMs.denoiser > 0.0f},
+        {"moment_update", profileReport_.perPassGpuMs.momentUpdate > 0.0f},
+        {"taa", profileReport_.perPassGpuMs.taa > 0.0f},
+        {"history_copy", profileReport_.perPassGpuMs.historyCopy > 0.0f},
+        {"taa_history_copy", profileReport_.perPassGpuMs.taaHistoryCopy > 0.0f},
+    };
     j["nvidia_integrations"] = profileReport_.nvidiaIntegrations;
     j["scene_update_routes"] = profileReport_.sceneUpdateRoutes;
     j["scheduler_queues"] = profileReport_.schedulerQueues;
@@ -3066,6 +3844,12 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     };
     j["validation_error_count"] = profileReport_.validationErrorCount;
     j["warnings"] = profileReport_.warnings;
+    j["optimization_hints"] = profileReport_.optimizationHints;
+    j["diagnostic_readiness"] = profileReport_.diagnosticReadiness;
+    j["nsight_analysis_plan"] = profileReport_.nsightAnalysisPlan;
+    j["ray_tracing_shader_map"] = profileReport_.rayTracingShaderMap;
+    j["acceleration_structure_diagnostics"] = profileReport_.accelerationStructureDiagnostics;
+    j["barrier_sync_diagnostics"] = profileReport_.barrierSyncDiagnostics;
     j["settings"] = profileReport_.settings;
     j["settings"]["restir_gi_active_tile_mask_enabled"] =
         profileReport_.effectiveRestirGiActiveTileMaskEnabled;
@@ -3075,6 +3859,54 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         profileReport_.restirHistoryCopyFallbackReason.empty()
         ? nlohmann::json(nullptr)
         : nlohmann::json(profileReport_.restirHistoryCopyFallbackReason);
+    j["settings"]["pathtrace_kernel_mode_effective"] =
+        pathTraceKernelModeName(profileReport_.effectivePathTraceKernelMode);
+    j["settings"]["pathtrace_terminal_payload_enabled"] = profileReport_.native2BTerminalPayloadActive;
+    j["settings"]["pathtrace_terminal_hit_group_active"] = profileReport_.native2BTerminalPayloadActive;
+    j["settings"]["pathtrace_native2b_compact_primary_lights_active"] =
+        profileReport_.native2BCompactPrimaryLightsActive;
+    j["settings"]["pathtrace_kernel_fallback_reason"] =
+        profileReport_.pathTraceKernelFallbackReason.empty()
+        ? nlohmann::json(nullptr)
+        : nlohmann::json(profileReport_.pathTraceKernelFallbackReason);
+    j["settings"]["blended_decal_shadow_mode_requested"] =
+        blendedDecalShadowModeName(profileReport_.settings.blendedDecalShadowMode);
+    j["settings"]["blended_decal_shadow_mode_effective"] =
+        profileReport_.settings.blendedDecalShadowMode == BlendedDecalShadowMode::Exact ||
+            profileReport_.effectivePathTraceKernelMode == PathTraceKernelMode::Native2B
+        ? nlohmann::json(blendedDecalShadowModeName(profileReport_.settings.blendedDecalShadowMode))
+        : nlohmann::json("exact");
+    j["settings"]["native2b_direct_reuse_requested"] =
+        native2BDirectReuseModeName(profileReport_.settings.native2BDirectReuseMode);
+    const bool native2BDirectReuseEffective =
+        profileReport_.effectivePathTraceKernelMode == PathTraceKernelMode::Native2B &&
+        profileReport_.native2BTerminalPayloadActive &&
+        profileReport_.settings.finalBounceFastPathEnabled;
+    j["settings"]["native2b_direct_reuse_effective"] = native2BDirectReuseEffective
+        ? native2BDirectReuseModeName(profileReport_.settings.native2BDirectReuseMode)
+        : "off";
+    const bool nativeInternalExtent =
+        profileReport_.resolution.renderWidth == profileReport_.resolution.displayWidth &&
+        profileReport_.resolution.renderHeight == profileReport_.resolution.displayHeight;
+    const bool reconstructionRequested =
+        profileReport_.settings.temporalUpscaler == TemporalUpscaler::Dlss ||
+        profileReport_.settings.temporalUpscaler == TemporalUpscaler::Nis ||
+        profileReport_.settings.dlssRayReconstructionEnabled ||
+        profileReport_.settings.dlssFrameGenerationEnabled;
+    const bool strictNativeGate =
+        nativeInternalExtent &&
+        std::abs(profileReport_.resolution.renderScale - 1.0f) <= 0.001f &&
+        !reconstructionRequested;
+    j["benchmark_classification"] = {
+        {"strict_native_gate", strictNativeGate},
+        {"native_internal_extent", nativeInternalExtent},
+        {"reconstruction_or_frame_generation_requested", reconstructionRequested},
+        {"commercial_game_style_profile", !strictNativeGate},
+        {"internal_frame_time_ms", profileReport_.gpuFrameMs.avg},
+        {"reconstructed_output_fps", reconstructionRequested && profileReport_.gpuFrameMs.avg > 0.0f
+            ? nlohmann::json(1000.0f / profileReport_.gpuFrameMs.avg)
+            : nlohmann::json(nullptr)}
+    };
     const auto dir = path.parent_path();
     if (!dir.empty() && !std::filesystem::exists(dir)) { std::filesystem::create_directories(dir); }
     std::ofstream file(path);
@@ -3376,13 +4208,19 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
                 std::nullopt,
                 std::nullopt,
                 std::nullopt,
+                std::nullopt,
+                std::nullopt,
                 false,
                 false,
                 false,
                 true,
+                ApplicationMode::Headless,
+                sceneConfig.headlessWidth,
+                sceneConfig.headlessHeight,
                 sceneConfig.disableAsyncCompute,
                 sceneConfig.singleQueueFallback,
-                sceneConfig.disableResourceAliasing);
+                sceneConfig.disableResourceAliasing,
+                {});
             if (auto* renderer = app.pathTracer()) {
                 RendererSettings settings = renderer->settings();
                 settings.fixedSeed = sceneConfig.fixedSeed;

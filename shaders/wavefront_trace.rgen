@@ -106,7 +106,7 @@ void main() {
     record_rt_counter(RT_DIAG_SURFACE_TRACE_RAYS);
     traceRayEXT(
         topLevelAS,
-        0,
+        gl_RayFlagsCullBackFacingTrianglesEXT,
         RAY_MASK_CAMERA,
         0,
         2,

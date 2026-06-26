@@ -153,12 +153,85 @@ RestirHistoryCopyMode parseRestirHistoryCopyMode(std::string_view value) {
     return RestirHistoryCopyMode::Copy;
 }
 
+const char* mixedSidedSplitModeName(MixedSidedSplitMode mode) {
+    switch (mode) {
+    case MixedSidedSplitMode::Off: return "off";
+    case MixedSidedSplitMode::Compact: return "compact";
+    }
+    return "off";
+}
+
+MixedSidedSplitMode parseMixedSidedSplitMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "compact" || key == "on" || key == "true" || key == "1" || key == "yes") {
+        return MixedSidedSplitMode::Compact;
+    }
+    return MixedSidedSplitMode::Off;
+}
+
+const char* pathTraceKernelModeName(PathTraceKernelMode mode) {
+    switch (mode) {
+    case PathTraceKernelMode::Generic: return "generic";
+    case PathTraceKernelMode::Native2B: return "native2b";
+    }
+    return "generic";
+}
+
+PathTraceKernelMode parsePathTraceKernelMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "native2b" || key == "native2bounce" || key == "native2" || key == "2bounce") {
+        return PathTraceKernelMode::Native2B;
+    }
+    return PathTraceKernelMode::Generic;
+}
+
+const char* blendedDecalShadowModeName(BlendedDecalShadowMode mode) {
+    switch (mode) {
+    case BlendedDecalShadowMode::Exact: return "exact";
+    case BlendedDecalShadowMode::OpaqueShadow: return "opaque-shadow";
+    case BlendedDecalShadowMode::AlphaCutoutProxy: return "alpha-cutout-proxy";
+    }
+    return "exact";
+}
+
+BlendedDecalShadowMode parseBlendedDecalShadowMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "opaqueshadow" || key == "opaque" || key == "shadowopaque") {
+        return BlendedDecalShadowMode::OpaqueShadow;
+    }
+    if (key == "alphacutoutproxy" || key == "cutout" || key == "alphacutout" || key == "proxy") {
+        return BlendedDecalShadowMode::AlphaCutoutProxy;
+    }
+    return BlendedDecalShadowMode::Exact;
+}
+
+const char* native2BDirectReuseModeName(Native2BDirectReuseMode mode) {
+    switch (mode) {
+    case Native2BDirectReuseMode::Off: return "off";
+    case Native2BDirectReuseMode::Ris: return "ris";
+    case Native2BDirectReuseMode::Temporal: return "temporal";
+    }
+    return "off";
+}
+
+Native2BDirectReuseMode parseNative2BDirectReuseMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "ris") {
+        return Native2BDirectReuseMode::Ris;
+    }
+    if (key == "temporal" || key == "temporalreuse") {
+        return Native2BDirectReuseMode::Temporal;
+    }
+    return Native2BDirectReuseMode::Off;
+}
+
 const char* renderPresetName(RenderPreset preset) {
     switch (preset) {
     case RenderPreset::Custom: return "custom";
     case RenderPreset::Low: return "low";
     case RenderPreset::Balanced: return "balanced";
     case RenderPreset::Ultra: return "ultra";
+    case RenderPreset::Native30: return "native30";
     }
     return "custom";
 }
@@ -168,6 +241,7 @@ RenderPreset parseRenderPreset(std::string_view value) {
     if (key == "low" || key == "performance") { return RenderPreset::Low; }
     if (key == "balanced" || key == "game" || key == "default") { return RenderPreset::Balanced; }
     if (key == "ultra" || key == "quality" || key == "reference") { return RenderPreset::Ultra; }
+    if (key == "native30" || key == "native" || key == "1440p" || key == "realtimenative") { return RenderPreset::Native30; }
     return RenderPreset::Custom;
 }
 

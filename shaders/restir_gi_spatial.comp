@@ -182,7 +182,11 @@ RestirGiReservoir retarget_gi_candidate(
             vec3 origin = receiverPosition + wi * RESTIR_GI_VISIBILITY_EPSILON;
             float tmax = distance - RESTIR_GI_VISIBILITY_EPSILON * 2.0;
             rayQueryEXT rayQuery;
-            rayQueryInitializeEXT(rayQuery, topLevelAS, gl_RayFlagsOpaqueEXT, RAY_MASK_SHADOW,
+            rayQueryInitializeEXT(
+                rayQuery,
+                topLevelAS,
+                gl_RayFlagsOpaqueEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+                RAY_MASK_SHADOW,
                                    origin, 0.0, wi, tmax);
             while (rayQueryProceedEXT(rayQuery)) {}
             bool visible = rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT;

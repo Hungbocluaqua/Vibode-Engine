@@ -43,7 +43,9 @@ void main() {
     record_rt_counter(RT_DIAG_SHADOW_TRACE_RAYS);
     traceRayEXT(
         topLevelAS,
-        gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        gl_RayFlagsSkipClosestHitShaderEXT |
+            gl_RayFlagsTerminateOnFirstHitEXT |
+            gl_RayFlagsCullBackFacingTrianglesEXT,
         RAY_MASK_SHADOW,
         1,
         0,

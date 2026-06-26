@@ -5,6 +5,16 @@
 #include <algorithm>
 
 namespace rtv {
+namespace {
+
+uint32_t fullMipMask(uint32_t mipCount) {
+    if (mipCount == 0u) {
+        return 0u;
+    }
+    return mipCount >= 32u ? UINT32_MAX : ((1u << mipCount) - 1u);
+}
+
+} // namespace
 
 void TextureStreamingManager::registerTexture(AssetGuid guid, const std::string& name,
                                                 uint32_t width, uint32_t height, uint32_t mipCount,
@@ -27,8 +37,11 @@ void TextureStreamingManager::registerTexture(AssetGuid guid, const std::string&
 void TextureStreamingManager::markMipResident(AssetGuid guid, uint32_t mipLevel, uint64_t mipBytes) {
     for (TextureStreamingRecord& tex : textures_) {
         if (tex.textureGuid == guid) {
+            if (mipLevel >= std::min(tex.mipCount, 32u)) {
+                return;
+            }
             tex.residentMipsMask |= (1u << mipLevel);
-            tex.residentBytes += mipBytes;
+            tex.residentBytes = std::min(tex.totalBytes, tex.residentBytes + mipBytes);
 
             if (mipLevel < tex.highestResidentMip || tex.highestResidentMip == UINT32_MAX) {
                 tex.highestResidentMip = mipLevel;
@@ -38,7 +51,7 @@ void TextureStreamingManager::markMipResident(AssetGuid guid, uint32_t mipLevel,
             }
 
             // Update residency state.
-            if (tex.residentMipsMask == (1u << tex.mipCount) - 1u) {
+            if (tex.residentMipsMask == fullMipMask(tex.mipCount)) {
                 tex.residency = TextureMipResidency::FullMipChainResident;
             } else if (tex.highestResidentMip >= tex.mipCount / 2u) {
                 tex.residency = TextureMipResidency::StreamingHigherMips;
@@ -54,7 +67,7 @@ void TextureStreamingManager::markFullyResident(AssetGuid guid) {
     for (TextureStreamingRecord& tex : textures_) {
         if (tex.textureGuid == guid) {
             tex.residency = TextureMipResidency::FullMipChainResident;
-            tex.residentMipsMask = (1u << tex.mipCount) - 1u;
+            tex.residentMipsMask = fullMipMask(tex.mipCount);
             tex.residentBytes = tex.totalBytes;
             tex.highestResidentMip = 0;
             tex.lowestResidentMip = tex.mipCount > 0 ? tex.mipCount - 1u : 0;

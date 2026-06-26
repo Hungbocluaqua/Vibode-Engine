@@ -5,6 +5,7 @@
 
 #include <glm/glm.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 
@@ -30,6 +31,7 @@ struct RendererSettings {
     bool dlssFrameGenerationEnabled = false;
     bool dlssRayReconstructionEnabled = false;
     bool streamlineReflexEnabled = false;
+    bool streamlineNvPerfEnabled = false;
     float dlssSharpeningStrength = 0.0f;
     float taaFeedback = 0.06f;
     float taaMotionFeedback = 0.90f;
@@ -37,6 +39,7 @@ struct RendererSettings {
     float taaSharpeningStrength = 0.05f;
     bool sunlightEnabled = true;
     bool directLightingEnabled = true;
+    bool secondaryDirectLightingEnabled = true;
     bool environmentEnabled = true;
     uint32_t maxBounces = 5;
     uint32_t samplesPerPixel = 1;
@@ -106,6 +109,15 @@ struct RendererSettings {
     float materialTextureAnisotropy = 4.0f;
     bool specularAaEnabled = true;
     bool opacityMicromapsEnabled = true;
+    bool opacityMicromapBlendEnabled = false;
+    bool hardwareBackfaceCullingEnabled = true;
+    MixedSidedSplitMode mixedSidedSplitMode = MixedSidedSplitMode::Off;
+    PathTraceKernelMode pathTraceKernelMode = PathTraceKernelMode::Generic;
+    bool finalBounceFastPathEnabled = false;
+    float native2BTerminalDirectSampleProbability = 1.0f;
+    BlendedDecalShadowMode blendedDecalShadowMode = BlendedDecalShadowMode::Exact;
+    Native2BDirectReuseMode native2BDirectReuseMode = Native2BDirectReuseMode::Off;
+    bool forceOpaqueCameraRays = false;
     uint32_t opacityMicromapSubdivisionLevel = kDefaultOpacityMicromapSubdivisionLevel;
     bool wavefrontQueuesEnabled = false;
     bool wavefrontPrimaryGenerateEnabled = false;
@@ -158,6 +170,7 @@ struct RendererSettings {
     float homogeneousVolumeAbsorption = 0.0f;
     float homogeneousVolumeAnisotropy = 0.0f;
     bool mneeCausticsEnabled = false;
+    bool compactImportedEmissiveTriangleSampling = false;
 };
 
 inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
@@ -172,6 +185,7 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
     settings.dlssFrameGenerationEnabled = false;
     settings.dlssRayReconstructionEnabled = false;
     settings.streamlineReflexEnabled = false;
+    settings.streamlineNvPerfEnabled = false;
     settings.dlssSharpeningStrength = 0.0f;
     settings.restirMode = RestirMode::RestirOnly;
     settings.restirDiMode = RestirDiMode::Production;
@@ -188,12 +202,21 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
     settings.restirDiIncludeSun = false;
     settings.restirDiIncludeEnvironment = false;
     settings.restirDiReservoirLayout = RestirDiReservoirLayout::ProductionPacked;
+    settings.secondaryDirectLightingEnabled = true;
     settings.restirGiMode = RestirGiMode::Production;
     settings.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
     settings.restirGiEnabled = true;
     settings.restirGiFinalStabilizationEnabled = true;
     settings.restirGiActiveTileMaskMode = RestirGiActiveTileMaskMode::Off;
     settings.restirHistoryCopyMode = RestirHistoryCopyMode::Copy;
+    settings.compactImportedEmissiveTriangleSampling = false;
+    settings.finalBounceFastPathEnabled = false;
+    settings.native2BTerminalDirectSampleProbability = 1.0f;
+    settings.blendedDecalShadowMode = BlendedDecalShadowMode::Exact;
+    settings.native2BDirectReuseMode = Native2BDirectReuseMode::Off;
+    settings.forceOpaqueCameraRays = false;
+    settings.mixedSidedSplitMode = MixedSidedSplitMode::Off;
+    settings.pathTraceKernelMode = PathTraceKernelMode::Generic;
 
     switch (preset) {
     case RenderPreset::Low:
@@ -288,6 +311,48 @@ inline void applyRenderPreset(RendererSettings& settings, RenderPreset preset) {
         settings.restirDiTemporalMaxAge = 48;
         settings.restirDiMaxM = 96;
         settings.adaptiveQualityMode = AdaptiveQualityMode::Off;
+        break;
+    case RenderPreset::Native30:
+        settings.renderResolutionScale = 1.0f;
+        settings.maxBounces = 2;
+        settings.samplesPerPixel = 1;
+        settings.limitSamplesPerPixel = true;
+        settings.environmentDirectSamples = 1;
+        settings.atrousIterations = 1;
+        settings.denoiserStrength = 1.05f;
+        settings.denoiserMaxHistoryLength = 32;
+        settings.momentValidityThreshold = 0.20f;
+        settings.taaFeedback = 0.06f;
+        settings.taaMotionFeedback = 0.88f;
+        settings.taaReactiveFeedback = 0.96f;
+        settings.taaSharpeningStrength = 0.05f;
+        settings.materialTextureAnisotropy = 1.0f;
+        settings.specularAaEnabled = true;
+        settings.fireflyClamp = 8.0f;
+        settings.restirGiMode = RestirGiMode::Off;
+        settings.restirGiEnabled = false;
+        settings.restirGiTemporalMaxAge = 12;
+        settings.restirGiSpatialRounds = 0;
+        settings.restirGiSpatialRadius = 2.75f;
+        settings.restirGiDepthThresholdScale = 0.90f;
+        settings.restirGiSpatialCompatibilityThreshold = 0.09f;
+        settings.restirGiHalfResolution = true;
+        settings.restirGiVisibilityRayBudget = 1;
+        settings.restirGiActiveTileMaskMode = RestirGiActiveTileMaskMode::Off;
+        settings.restirDiSpatialRounds = 2;
+        settings.restirDiSpatialRadius = 2.5f;
+        settings.restirDiTemporalMaxAge = 24;
+        settings.restirDiMaxM = 32;
+        settings.restirHistoryCopyMode = RestirHistoryCopyMode::PingPong;
+        settings.opacityMicromapsEnabled = true;
+        settings.shaderExecutionReorderingEnabled = true;
+        settings.secondaryDirectLightingEnabled = true;
+        settings.compactImportedEmissiveTriangleSampling = true;
+        settings.finalBounceFastPathEnabled = true;
+        settings.native2BTerminalDirectSampleProbability = 1.0f;
+        settings.blendedDecalShadowMode = BlendedDecalShadowMode::OpaqueShadow;
+        settings.adaptiveQualityMode = AdaptiveQualityMode::Off;
+        settings.adaptiveGpuFrameTargetMs = 33.3f;
         break;
     case RenderPreset::Custom:
         break;

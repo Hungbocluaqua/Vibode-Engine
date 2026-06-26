@@ -95,6 +95,13 @@ struct BindlessTextureRegistrationInfo {
     bool missing = false;
 };
 
+struct BindlessTextureImageInfo {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mipLevels = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+};
+
 class BindlessTextureTable {
 public:
     BindlessTextureTable() = default;
@@ -113,6 +120,7 @@ public:
     [[nodiscard]] uint32_t residentCount() const { return static_cast<uint32_t>(images_.size()); }
     [[nodiscard]] uint32_t slotCount() const { return slotCount_; }
     [[nodiscard]] VkImageView imageView(uint32_t index) const;
+    [[nodiscard]] BindlessTextureImageInfo imageInfo(uint32_t index) const;
 
     [[nodiscard]] const FreeListAllocator<uint32_t>& allocator() const { return allocator_; }
     [[nodiscard]] float fragmentation() const { return allocator_.fragmentationRatio(); }

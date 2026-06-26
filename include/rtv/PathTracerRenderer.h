@@ -5,6 +5,7 @@
 #include "rtv/GpuValidation.h"
 #include "rtv/GpuScene.h"
 #include "rtv/Image.h"
+#include "rtv/NsightPerfDiagnostics.h"
 #include "rtv/PhysicalCamera.h"
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
@@ -65,6 +66,11 @@ struct RayTracingRendererStats {
 };
 
 struct RayTracingDiagnosticCounters {
+    static constexpr size_t kRawSlotCount = 64;
+    static constexpr size_t kAlphaMaterialCounterSlots = 4096;
+    static constexpr size_t kAlphaMaterialCounterStride = 4;
+    std::array<uint64_t, kRawSlotCount> rawSlots{};
+    std::vector<uint64_t> alphaMaterialCounters;
     uint64_t cameraAnyHitInvocations = 0;
     uint64_t cameraAnyHitIgnored = 0;
     uint64_t cameraAnyHitAccepted = 0;
@@ -79,6 +85,38 @@ struct RayTracingDiagnosticCounters {
     uint64_t causticTransmissiveHits = 0;
     uint64_t causticTransmissiveVisible = 0;
     uint64_t causticShadowBlocked = 0;
+    uint64_t primarySurfaceTraceRays = 0;
+    uint64_t terminalSurfaceTraceRays = 0;
+    uint64_t shadowSurfaceTraceRays = 0;
+    uint64_t envDirectShadowRays = 0;
+    uint64_t sunDirectShadowRays = 0;
+    uint64_t emissiveDirectShadowRays = 0;
+    uint64_t transmissiveShadowSurfaceTraces = 0;
+    uint64_t fastShadowTransmittanceUsed = 0;
+    uint64_t fullShadowTransmittanceUsed = 0;
+    uint64_t terminalFastDirectUsed = 0;
+    uint64_t terminalGenericDirectUsed = 0;
+    uint64_t terminalMaterialFullDecode = 0;
+    uint64_t terminalMaterialHeaderOnly = 0;
+    uint64_t primaryAnyHitOpaque = 0;
+    uint64_t primaryAnyHitAlphaTested = 0;
+    uint64_t primaryAnyHitBlended = 0;
+    uint64_t terminalAnyHitInvocations = 0;
+    uint64_t terminalAnyHitOpaque = 0;
+    uint64_t terminalAnyHitAlphaTested = 0;
+    uint64_t terminalAnyHitBlended = 0;
+    uint64_t closestHitPrimary = 0;
+    uint64_t closestHitTerminal = 0;
+    uint64_t causticBlockerOpaque = 0;
+    uint64_t causticBlockerAlphaTested = 0;
+    uint64_t causticBlockerBlended = 0;
+    uint64_t terminalFastDirectFlagDisabled = 0;
+    uint64_t terminalFastDirectSceneLights = 0;
+    uint64_t terminalFastDirectTransmissiveScene = 0;
+    uint64_t terminalFastDirectVolume = 0;
+    uint64_t terminalFastDirectDebug = 0;
+    uint64_t terminalFastDirectMaterialTransmissive = 0;
+    uint64_t terminalDirectSkippedEmissiveOrUnlit = 0;
 };
 
 enum class AccumulationResetReason : uint32_t {
@@ -272,6 +310,7 @@ public:
     [[nodiscard]] bool pickPending() const;
 
     [[nodiscard]] const RendererSettings& settings() const { return settings_; }
+    void setGpuMarkersEnabled(bool enabled);
     [[nodiscard]] const StreamingResetMaskReport& streamingResetMaskReport() const { return streamingResetMaskReport_; }
     [[nodiscard]] const GpuSkinningResourcePlan& gpuSkinningResourcePlan() const { return gpuSkinningResourcePlan_; }
     void updateGpuSkinningOutputReadbackValidation();
@@ -299,6 +338,7 @@ public:
         uint32_t skippedUnsupported = 0;
         uint32_t skippedMissingTags = 0;
         uint64_t frameIndex = 0;
+        std::string lastError;
     };
     struct StreamlineReflexMarkerSummary {
         uint32_t attempted = 0;
@@ -328,17 +368,21 @@ public:
         bool streamlineVulkanInfoSet = false;
         std::string streamlineRuntimeDirectory;
         std::string streamlineUnavailableReason;
+        std::vector<std::string> streamlineLogMessages;
         StreamlineFeatureStatus streamlineDlss;
         StreamlineFeatureStatus streamlineDlssRayReconstruction;
         StreamlineFeatureStatus streamlineDlssFrameGeneration;
         StreamlineFeatureStatus streamlineReflex;
         StreamlineFeatureStatus streamlineNis;
         StreamlineFeatureStatus streamlineNrd;
+        StreamlineFeatureStatus streamlineNvPerf;
         StreamlineTagSummary streamlineDlssTags;
         StreamlineTagSummary streamlineDlssRayReconstructionTags;
         StreamlineEvaluationSummary streamlineDlssEvaluation;
         StreamlineEvaluationSummary streamlineDlssRayReconstructionEvaluation;
+        StreamlineEvaluationSummary streamlineNvPerfEvaluation;
         StreamlineReflexMarkerSummary streamlineReflexMarkers;
+        NsightPerfDiagnosticsReport nsightPerfSdk;
     };
     struct NrdRuntime;
     [[nodiscard]] NvidiaIntegrationStatus nvidiaIntegrationStatus() const;
@@ -372,6 +416,10 @@ public:
     [[nodiscard]] RestirHistoryCopyMode effectiveRestirHistoryCopyMode() const;
     [[nodiscard]] const char* restirHistoryCopyFallbackReason() const;
     [[nodiscard]] bool effectiveRestirGiActiveTileMaskEnabled() const;
+    [[nodiscard]] PathTraceKernelMode effectivePathTraceKernelMode() const;
+    [[nodiscard]] bool native2BTerminalPayloadActive() const;
+    [[nodiscard]] bool native2BCompactPrimaryLightsActive() const;
+    [[nodiscard]] const char* pathTraceKernelFallbackReason() const;
     [[nodiscard]] uint32_t effectiveSamplesPerPixel() const {
         return effectiveLimitSamplesPerPixel() ? 1u : std::max(1u, settings_.samplesPerPixel);
     }
@@ -586,6 +634,7 @@ private:
         float adaptiveAlphaCeiling = 0.50f;
         float varianceScale = 4.0f;
         float validityThreshold = 0.25f;
+        uint32_t debugView = 0;
     };
 
     struct PrevCameraUniform {
@@ -1138,6 +1187,7 @@ private:
     void updateAdaptiveQuality(const GpuFrameTimings& timings);
     void copyHistoryResources(VkCommandBuffer commandBuffer);
     void copyHistoryResourcesPass(VkCommandBuffer commandBuffer);
+    void rotateRealtimeHistoryResources();
     void copyNrdHistoryResources(VkCommandBuffer commandBuffer);
     void copyNrdHistoryResourcesPass(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool copyRestirDiHistoryBuffers(VkCommandBuffer commandBuffer);
@@ -1169,6 +1219,7 @@ private:
     [[nodiscard]] bool dlssRequested() const;
     [[nodiscard]] bool shouldRunDlss() const;
     [[nodiscard]] bool shouldRunDlssRayReconstruction() const;
+    [[nodiscard]] bool shouldUseNative2BPathTraceKernel() const;
     [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
     [[nodiscard]] bool shouldRunRestirGiFinal() const;
@@ -1195,6 +1246,7 @@ private:
     [[nodiscard]] bool shouldUseNewRestirGi() const;
     [[nodiscard]] bool usesRestirGiUncompressedInitialReservoir() const;
     [[nodiscard]] bool shouldUseNewRestirDi() const;
+    [[nodiscard]] bool shouldSkipImportedEmissiveDirectSampling() const;
     [[nodiscard]] bool shouldRunRestirDiEstimator() const;
     [[nodiscard]] bool shouldRunRestirDiTemporal() const;
     [[nodiscard]] bool shouldRunRestirDiSpatial() const;
@@ -1331,6 +1383,8 @@ private:
     bool asyncHistoryCopyPending_ = false;
     bool asyncTaaHistoryCopyPending_ = false;
     bool asyncPostProcessPending_ = false;
+    bool engineHistoryRotationPending_ = false;
+    bool taaHistoryRotationPending_ = false;
     bool restirGiHistoryValid_ = false;
     bool restirDiHistoryValid_ = false;
     bool restirGiUncompressedLayout_ = false;
@@ -1402,6 +1456,8 @@ private:
     Buffer streamingResetInstanceMaskBuffer_;
     Buffer rayTracingDiagnosticCountersBuffer_;
     Buffer rayTracingDiagnosticCountersReadbackBuffer_;
+    Buffer rayTracingAlphaMaterialCountersBuffer_;
+    Buffer rayTracingAlphaMaterialCountersReadbackBuffer_;
     Buffer gpuSkinningSourceVertexBuffer_;
     Buffer gpuSkinningMorphDeltaBuffer_;
     Buffer gpuSkinningJointMatrixBuffer_;
@@ -1522,6 +1578,13 @@ private:
     std::unique_ptr<ShaderModule> fullscreenVertexShader_;
     std::unique_ptr<ShaderModule> fullscreenFragmentShader_;
     std::unique_ptr<ShaderModule> raygenShader_;
+    std::unique_ptr<ShaderModule> raygenNative2BShader_;
+    std::unique_ptr<ShaderModule> raygenNative2BCompactPrimaryLightsShader_;
+    std::unique_ptr<ShaderModule> raygenDiagnosticShader_;
+    std::unique_ptr<ShaderModule> raygenDiagnosticFullShader_;
+    std::unique_ptr<ShaderModule> raygenDiagnosticGiFullShader_;
+    std::unique_ptr<ShaderModule> raygenDiagnosticAllFullShader_;
+    std::unique_ptr<ShaderModule> raygenNative2BDiagnosticShader_;
     std::unique_ptr<ShaderModule> raygenMotionShader_;
     std::unique_ptr<ShaderModule> raygenFullShader_;
     std::unique_ptr<ShaderModule> raygenMotionFullShader_;
@@ -1531,9 +1594,17 @@ private:
     std::unique_ptr<ShaderModule> raygenMotionAllFullShader_;
     std::unique_ptr<ShaderModule> primaryMissShader_;
     std::unique_ptr<ShaderModule> shadowMissShader_;
+    std::unique_ptr<ShaderModule> terminalMissShader_;
     std::unique_ptr<ShaderModule> closestHitShader_;
     std::unique_ptr<ShaderModule> primaryAnyHitShader_;
     std::unique_ptr<ShaderModule> shadowAnyHitShader_;
+    std::unique_ptr<ShaderModule> terminalClosestHitShader_;
+    std::unique_ptr<ShaderModule> terminalAnyHitShader_;
+    std::unique_ptr<ShaderModule> closestHitDiagnosticShader_;
+    std::unique_ptr<ShaderModule> primaryAnyHitDiagnosticShader_;
+    std::unique_ptr<ShaderModule> shadowAnyHitDiagnosticShader_;
+    std::unique_ptr<ShaderModule> terminalClosestHitDiagnosticShader_;
+    std::unique_ptr<ShaderModule> terminalAnyHitDiagnosticShader_;
     std::unique_ptr<ShaderModule> wavefrontQueueClearShader_;
     std::unique_ptr<ShaderModule> wavefrontPrimaryGenerateShader_;
     std::unique_ptr<ShaderModule> wavefrontTraceRaygenShader_;
@@ -1586,6 +1657,13 @@ private:
     std::unique_ptr<ComputePipeline> wavefrontSortPipeline_;
     std::unique_ptr<GraphicsPipeline> graphicsPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingNative2BPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingNative2BCompactPrimaryLightsPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingDiagnosticPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingDiagnosticFullPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingDiagnosticGiFullPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingDiagnosticAllFullPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingNative2BDiagnosticPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingMotionPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingFullPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingMotionFullPipeline_;
@@ -1673,7 +1751,10 @@ private:
     StreamlineTagSummary streamlineDlssRayReconstructionTags_{};
     StreamlineEvaluationSummary streamlineDlssEvaluation_{};
     StreamlineEvaluationSummary streamlineDlssRayReconstructionEvaluation_{};
+    StreamlineEvaluationSummary streamlineNvPerfEvaluation_{};
     StreamlineReflexMarkerSummary streamlineReflexMarkers_{};
+    bool streamlineNvPerfConstantsAccepted_ = false;
+    mutable std::optional<NsightPerfDiagnosticsReport> nsightPerfDiagnosticsCache_;
 };
 
 } // namespace rtv
