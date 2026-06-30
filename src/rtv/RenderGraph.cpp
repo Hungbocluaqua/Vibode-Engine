@@ -5,6 +5,8 @@
 #include "rtv/ResourceAllocator.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <queue>
 #include <stdexcept>
@@ -241,6 +243,32 @@ void insertDebugBreadcrumb(VkCommandBuffer commandBuffer, const char* name) {
     label.color[2] = 0.30f;
     label.color[3] = 1.00f;
     vkCmdInsertDebugUtilsLabelEXT(commandBuffer, &label);
+}
+
+bool renderGraphTraceEnabled() {
+    static const bool enabled = [] {
+#if defined(_WIN32)
+        char* value = nullptr;
+        size_t length = 0;
+        if (_dupenv_s(&value, &length, "RTV_MAIN_LOOP_TRACE") != 0 || value == nullptr) {
+            return false;
+        }
+        const bool result = value[0] != '\0' && value[0] != '0';
+        std::free(value);
+        return result;
+#else
+        const char* value = std::getenv("RTV_MAIN_LOOP_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+#endif
+    }();
+    return enabled;
+}
+
+void traceRenderGraphPass(const char* phase, const std::string& name) {
+    if (!renderGraphTraceEnabled()) {
+        return;
+    }
+    std::cout << "RENDER_GRAPH pass=" << name << " phase=" << phase << '\n' << std::flush;
 }
 
 void emitBarrier(VkCommandBuffer commandBuffer, const RenderGraphResource& resource, const RenderGraphBarrier& barrier) {
@@ -731,12 +759,14 @@ void RenderGraph::execute(VkCommandBuffer commandBuffer, uint64_t frameIndex) {
         }
         const RenderGraphPass::ExecuteCallback& callback = passes_[passIndex].callback();
         if (callback) {
+            traceRenderGraphPass("begin", passes_[passIndex].name());
             insertDebugBreadcrumb(commandBuffer, passes_[passIndex].name().c_str());
             beginDebugLabel(commandBuffer, passes_[passIndex].name().c_str());
             ScopedNsightRange nsightRange(passes_[passIndex].name().c_str());
             ScopedNsightPerfCommandBufferRange nsightPerfRange(commandBuffer, passes_[passIndex].name().c_str());
             callback(context, commandBuffer);
             endDebugLabel(commandBuffer);
+            traceRenderGraphPass("end", passes_[passIndex].name());
         }
     }
     for (const RenderGraphBarrier& barrier : compiledBarriers_) {
@@ -799,12 +829,14 @@ void RenderGraph::executeAsync(VkCommandBuffer graphicsCommandBuffer, VkCommandB
 
         const RenderGraphPass::ExecuteCallback& callback = pass.callback();
         if (callback) {
+            traceRenderGraphPass("begin", pass.name());
             insertDebugBreadcrumb(targetCmd, pass.name().c_str());
             beginDebugLabel(targetCmd, pass.name().c_str());
             ScopedNsightRange nsightRange(pass.name().c_str());
             ScopedNsightPerfCommandBufferRange nsightPerfRange(targetCmd, pass.name().c_str());
             callback(context, targetCmd);
             endDebugLabel(targetCmd);
+            traceRenderGraphPass("end", pass.name());
         }
     }
 

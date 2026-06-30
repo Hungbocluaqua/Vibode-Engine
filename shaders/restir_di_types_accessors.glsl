@@ -49,6 +49,27 @@ const uint RESTIR_DI_SURFACE_PBR       = 1u << 5u;
 const uint RESTIR_DI_SURFACE_UNSUPPORTED = 1u << 6u;
 #endif
 
+#ifndef RTV_RESTIR_DI_LIGHT_KIND_CONSTANTS_DEFINED
+#define RTV_RESTIR_DI_LIGHT_KIND_CONSTANTS_DEFINED
+const uint RESTIR_DI_LIGHT_EMISSIVE_TRIANGLE = 0u;
+const uint RESTIR_DI_LIGHT_EMISSIVE_SPHERE   = 1u;
+const uint RESTIR_DI_LIGHT_DIRECTIONAL       = 2u;
+const uint RESTIR_DI_LIGHT_POINT             = 3u;
+const uint RESTIR_DI_LIGHT_AREA              = 4u;
+const uint RESTIR_DI_LIGHT_SPOT              = 5u;
+const uint RESTIR_DI_LIGHT_ENVIRONMENT       = 6u;
+const uint RESTIR_DI_LIGHT_SUN               = 7u;
+const uint RESTIR_DI_PSEUDO_LIGHT_INDEX      = 0u;
+const uint RESTIR_DI_ENVIRONMENT_ID_HASH     = 0x7e8f1a3du;
+const uint RESTIR_DI_ENVIRONMENT_VERSION     = 0x454e5631u;
+const uint RESTIR_DI_SUN_ID_HASH             = 0x51f5a91du;
+const uint RESTIR_DI_SUN_VERSION             = 0x53554e31u;
+
+bool restir_di_light_kind_infinite(uint kind) {
+    return kind == RESTIR_DI_LIGHT_ENVIRONMENT || kind == RESTIR_DI_LIGHT_SUN;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Reservoir metadata packing (ProductionPacked)
 // ---------------------------------------------------------------------------
@@ -62,7 +83,7 @@ uint restir_di_pack_reservoir_state(uint age, uint m, uint visibility, bool vali
     return packed;
 }
 
-// reservoirMetadata.y: [sourcePdf:fp16_hi][previousWeight:fp16_lo]
+// reservoirMetadata.y: packHalf2x16(vec2(sourcePdf, previousWeight))
 uint restir_di_pack_pdf_weight(float sourcePdf, float previousWeight) {
     return packHalf2x16(vec2(clamp(sourcePdf, 1.0e-6, 65504.0), clamp(previousWeight, 0.0, 1.0)));
 }
@@ -153,6 +174,8 @@ const uint RESTIR_DI_COUNTER_FINAL_NON_FINITE = 57u;
 const uint RESTIR_DI_COUNTER_FINAL_UNKNOWN_VISIBILITY = 58u;
 const uint RESTIR_DI_COUNTER_FINAL_LIGHT_REJECTED = 59u;
 const uint RESTIR_DI_COUNTER_SUM_LUMINANCE_HIGH = 60u;
+const uint RESTIR_DI_COUNTER_INITIAL_ENVIRONMENT = 61u;
+const uint RESTIR_DI_COUNTER_INITIAL_SUN = 62u;
 const uint RESTIR_DI_COUNTER_CAPACITY = 64u;
 
 const float RESTIR_DI_INVALID_ID_FLOAT = 4294967040.0;

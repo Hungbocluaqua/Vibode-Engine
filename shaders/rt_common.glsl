@@ -10,7 +10,6 @@
 #define RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT 0
 #endif
 
-
 #include "rt_resources.glsl"
 #include "rt_material.glsl"
 #include "rt_environment.glsl"

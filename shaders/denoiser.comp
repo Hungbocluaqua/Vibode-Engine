@@ -272,6 +272,41 @@ vec3 bilinear_prev_world(vec2 historyPos, ivec2 dims) {
     return mix(mix(w00, w10, fracValue.x), mix(w01, w11, fracValue.x), fracValue.y);
 }
 
+bool adaptive_raw_sampled(vec4 rawColor) {
+    return rawColor.a >= 0.0;
+}
+
+vec3 adaptive_fill_input_color(ivec2 coords, vec4 rawColor, ivec2 dims) {
+    if (adaptive_raw_sampled(rawColor)) {
+        return max(rawColor.rgb, vec3(0.0));
+    }
+
+    vec3 sumColor = vec3(0.0);
+    float sumWeight = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            if (x == 0 && y == 0) {
+                continue;
+            }
+            ivec2 sampleCoords = clamp(coords + ivec2(x, y), ivec2(0), dims - ivec2(1));
+            vec4 sampleRaw = imageLoad(input_color, sampleCoords);
+            if (!adaptive_raw_sampled(sampleRaw)) {
+                continue;
+            }
+            float distanceWeight = 1.0 / (1.0 + float(x * x + y * y));
+            sumColor += max(sampleRaw.rgb, vec3(0.0)) * distanceWeight;
+            sumWeight += distanceWeight;
+        }
+    }
+    if (sumWeight > 1.0e-5) {
+        return sumColor / sumWeight;
+    }
+    if (params.reset_history == 0u) {
+        return max(imageLoad(history_color, clamp(coords, ivec2(0), dims - ivec2(1))).rgb, vec3(0.0));
+    }
+    return vec3(0.0);
+}
+
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dims = imageSize(input_color);
@@ -296,7 +331,9 @@ void main() {
         return;
     }
 
-    vec3 center_color = imageLoad(input_color, coords).rgb;
+    vec4 center_raw = imageLoad(input_color, coords);
+    bool center_unsampled = !adaptive_raw_sampled(center_raw);
+    vec3 center_color = adaptive_fill_input_color(coords, center_raw, dims);
     uint pixel_index = uint(coords.y) * uint(dims.x) + uint(coords.x);
     vec4 center_dn = decode_depth_normal(input_depth_normal[pixel_index]);
     float center_depth = center_dn.r;
@@ -372,14 +409,14 @@ void main() {
                 if (iter == 0u) {
                     ivec2 tile_coords = ivec2(gl_LocalInvocationID.xy) + ivec2(kx + DENOISER_TILE_RADIUS, ky + DENOISER_TILE_RADIUS);
                     int tile_index = denoiser_shared_index(tile_coords);
-                    sample_color = shared_color_tile[tile_index].rgb;
+                    sample_color = adaptive_fill_input_color(sample_coords, shared_color_tile[tile_index], dims);
                     sample_dn = decode_depth_normal(shared_depth_normal_tile[tile_index]);
                 } else {
-                    sample_color = imageLoad(input_color, sample_coords).rgb;
+                    sample_color = adaptive_fill_input_color(sample_coords, imageLoad(input_color, sample_coords), dims);
                     sample_dn = decode_depth_normal(input_depth_normal[sample_index]);
                 }
 #else
-                vec3 sample_color = imageLoad(input_color, sample_coords).rgb;
+                vec3 sample_color = adaptive_fill_input_color(sample_coords, imageLoad(input_color, sample_coords), dims);
                 vec4 sample_dn = decode_depth_normal(input_depth_normal[sample_index]);
 #endif
                 PathDataRecord sample_path_data = path_data_buffer[sample_index];
@@ -508,6 +545,9 @@ void main() {
             relative_pos_diff,
             normal_cone_min,
             max_relative_depth_delta);
+    if (center_unsampled) {
+        base_disocclusion_confidence *= params.reset_history == 0u ? 0.55 : 0.15;
+    }
     float history_primary_hit_normalized = world_valid
         ? temporal_normalized_hit_distance(length(reprojected_wp - prev_camera.prev_pos.xyz))
         : center_primary_hit_normalized;

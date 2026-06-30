@@ -30,14 +30,14 @@ layout(set = 0, binding = 1, std140) uniform Camera {
     vec4 sun_direction_illuminance;
     vec4 sun_color_angular_radius;
     uvec4 restir_gi_controls;
-    uvec4 path_trace_controls;   // x = requested SPP, y = limit to 1 SPP, z bits: 0 RT counters, 1 DI estimator, 2 HW backface culling, 3 final-bounce fast path, 4 Native2B kernel, 5-6 blended decal shadow mode, 7-8 Native2B direct reuse mode, 9 force opaque camera rays, 10 compact imported emissive direct
+    uvec4 path_trace_controls;   // x = requested SPP, y = limit to 1 SPP, z bits: 0 RT counters, 1 DI estimator, 2 HW backface culling, 3 final-bounce fast path, 4 Native2B kernel, 5-6 blended decal shadow mode, 7-8 Native2B direct reuse mode, 9 force opaque camera rays, 10 compact imported emissive direct, 11 adaptive sample-count buffer
     vec4 dof_controls;
     vec4 motion_blur_controls;
     vec4 volume_controls;
     vec4 projection_controls;
     vec4 clip_controls;
     uvec4 gi_version_controls;   // Phase 8: x = light, y = material, z = object, w = environment version
-    uvec4 restir_di_controls;     // x = new ReSTIR DI raygen writes enabled, y = secondary direct lighting enabled
+    uvec4 restir_di_controls;     // x = new ReSTIR DI raygen writes enabled, y = secondary direct lighting enabled, z = include sun, w = include environment
     vec4 native2b_controls;       // x = terminal direct sample probability
 } camera;
 
@@ -258,6 +258,43 @@ layout(set = 0, binding = 48, std430) buffer RtDiagnosticCounters {
 layout(set = 0, binding = 63, std430) buffer RtAlphaMaterialCounters {
     uint rt_alpha_material_counters[];
 };
+layout(set = 0, binding = 64, std430) readonly buffer AdaptiveSamplingDensityBuffer {
+    float adaptive_sampling_density[];
+};
+layout(set = 0, binding = 65, std430) readonly buffer AdaptiveSamplingSampleCountBuffer {
+    uint adaptive_sampling_sample_count[];
+};
+layout(set = 0, binding = 66, std140) uniform ReGIRParamsBlock {
+    uvec4 grid_dimensions_reservoirs;
+    uvec4 controls;
+    vec4 grid_padding;
+    vec4 query_controls;
+    uvec4 environment_controls;
+} regir_params;
+struct ReGIRReservoir {
+    uvec4 metadata;
+    vec4 sample_position_weight;
+};
+layout(set = 0, binding = 67, std430) readonly buffer ReGIRReservoirBuffer {
+    ReGIRReservoir regir_reservoirs[];
+};
+layout(set = 0, binding = 68, std430) readonly buffer ReGIRInputReservoirBuffer {
+    ReGIRReservoir regir_input_reservoirs[];
+};
+layout(set = 0, binding = 69, std430) buffer ReGIRActiveCellsBuffer {
+    uint regir_active_cells[];
+};
+layout(set = 0, binding = 70, std430) readonly buffer ReGIRHashCurrentCellsBuffer {
+    uint regir_hash_current_cells[];
+};
+struct ReGIREnvironmentReservoir {
+    uvec4 metadata;
+    vec4 direction_pdf;
+    vec4 reservoir_state; // selected target, weight sum, average weight, M
+};
+layout(set = 0, binding = 71, std430) readonly buffer ReGIREnvironmentReservoirBuffer {
+    ReGIREnvironmentReservoir regir_environment_reservoirs[];
+};
 layout(set = 0, binding = 57, std430) readonly buffer StreamingResetInstanceMasks {
     uint streaming_reset_instance_masks[];
 };
@@ -270,10 +307,96 @@ layout(set = 0, binding = 57, std430) readonly buffer StreamingResetInstanceMask
 #define RTV_NATIVE2B_COMPACT_PRIMARY_LIGHTS 0
 #endif
 
+#ifndef RTV_REGIR_TRACE_ENABLED
+#define RTV_REGIR_TRACE_ENABLED 1
+#endif
+
 bool streaming_instance_reset_mask(uint instanceId, uint flag) {
     return instanceId != 0xffffffffu &&
         instanceId < streaming_reset_instance_masks.length() &&
         (streaming_reset_instance_masks[instanceId] & flag) != 0u;
+}
+
+bool regir_enabled() {
+#if RTV_REGIR_TRACE_ENABLED
+    return (regir_params.controls.x & 1u) != 0u &&
+        regir_params.grid_dimensions_reservoirs.x > 0u &&
+        regir_params.grid_dimensions_reservoirs.y > 0u &&
+        regir_params.grid_dimensions_reservoirs.z > 0u &&
+        regir_params.grid_dimensions_reservoirs.w > 0u;
+#else
+    return false;
+#endif
+}
+
+uint regir_grid_mode() {
+    return (regir_params.controls.x >> 1u) & 3u;
+}
+
+bool regir_active_grid_enabled() {
+    return regir_enabled() && regir_grid_mode() == 1u;
+}
+
+bool regir_hash_grid_enabled() {
+    return regir_enabled() && regir_grid_mode() == 2u;
+}
+
+#ifndef RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED
+#define RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED RTV_REGIR_TRACE_ENABLED
+#endif
+#ifndef RTV_REGIR_FRAME_COHERENT_FINITE_QUERY
+#define RTV_REGIR_FRAME_COHERENT_FINITE_QUERY 0
+#endif
+
+bool regir_finite_light_enabled() {
+#if RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED
+    return regir_enabled();
+#else
+    return false;
+#endif
+}
+
+bool regir_infinite_light_enabled() {
+    return regir_enabled() &&
+        (regir_params.controls.x & 8u) != 0u &&
+        regir_environment_reservoirs.length() > 1u;
+}
+
+bool regir_environment_enabled() {
+    return regir_infinite_light_enabled() && regir_params.environment_controls.z > 0u;
+}
+
+bool regir_sun_enabled() {
+    return regir_infinite_light_enabled() &&
+        regir_params.environment_controls.w > 0u &&
+        camera.sunlight_enabled != 0u;
+}
+
+bool regir_visibility_reuse_enabled() {
+    return regir_enabled() && (regir_params.controls.x & 16u) != 0u;
+}
+
+float regir_canonical_mix() {
+    return clamp(regir_params.query_controls.x, 0.0, 1.0);
+}
+
+bool regir_stochastic_query_enabled() {
+    return regir_params.query_controls.y > 0.5;
+}
+
+float regir_finite_query_probability() {
+#if RTV_REGIR_FRAME_COHERENT_FINITE_QUERY
+    return 1.0;
+#else
+    if (!regir_stochastic_query_enabled()) {
+        return 1.0;
+    }
+    return regir_hash_grid_enabled() ? (1.0 / 256.0) : 0.125;
+#endif
+}
+
+bool regir_spatial_reuse_enabled() {
+    return regir_params.query_controls.w > 0.5;
 }
 
 const uint RTV_DEBUG_FLAG_RAY_TRACING_COUNTERS = 1u << 0u;
@@ -356,6 +479,10 @@ bool force_opaque_terminal_rays_enabled() {
 
 bool compact_imported_emissive_direct_enabled() {
     return (camera.path_trace_controls.z & 1024u) != 0u;
+}
+
+bool adaptive_sample_count_enabled() {
+    return (camera.path_trace_controls.z & 2048u) != 0u;
 }
 
 bool compact_imported_emissive_terminal_direct_enabled() {

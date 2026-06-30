@@ -55,6 +55,9 @@ float timingForPassName(const GpuFrameTimings& timings, const std::string& name)
     if (name.find("restir_gi_upsample") == 0) return timings.restirGiUpsampleMs;
     if (name.find("restir_gi_final") == 0) return timings.restirGiFinalMs;
     if (name.find("restir_gi_counters_readback") == 0) return timings.restirGiCountersReadbackMs;
+    if (name.find("regir_spatial_reuse") == 0) return timings.regirSpatialReuseMs;
+    if (name.find("regir_temporal_reuse") == 0) return timings.regirTemporalReuseMs;
+    if (name.find("regir_build") == 0) return timings.regirBuildMs;
     if (name.find("restir_di_temporal") == 0) return timings.restirDiTemporalMs;
     if (name.find("restir_di_spatial") == 0) return timings.restirDiSpatialMs;
     if (name.find("restir_di_final") == 0) return timings.restirDiFinalMs;
@@ -62,6 +65,9 @@ float timingForPassName(const GpuFrameTimings& timings, const std::string& name)
     if (name.find("atmosphere") == 0) return timings.atmosphereMs;
     if (name.find("temporal_denoiser") == 0) return timings.denoiserMs;
     if (name.find("moment_update") == 0) return timings.momentUpdateMs;
+    if (name.find("adaptive_sampling_prepare") == 0) return timings.adaptiveSamplingDiagnosticsMs;
+    if (name.find("adaptive_sampling_diagnostics") == 0) return timings.adaptiveSamplingDiagnosticsMs;
+    if (name.find("adaptive_sampling_fill") == 0) return timings.adaptiveSamplingFillMs;
     if (name.find("skip_denoiser_copy") == 0) return timings.skipDenoiserCopyMs;
     if (name.find("history_copy") == 0) return timings.historyCopyMs;
     if (name.find("taa_history_copy") == 0) return timings.taaHistoryCopyMs;

@@ -1,0 +1,116 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct ReGIRReservoir {
+    uvec4 metadata;
+    vec4 sample_position_weight;
+};
+
+layout(set = 0, binding = 0, std140) uniform ReGIRParamsBlock {
+    uvec4 grid_dimensions_reservoirs;
+    uvec4 controls;
+    vec4 grid_padding;
+    vec4 query_controls;
+    uvec4 environment_controls;
+} regir_params;
+
+layout(set = 0, binding = 1, std430) readonly buffer ReGIRSpatialInputBuffer {
+    ReGIRReservoir input_reservoirs[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly buffer ReGIRSpatialOutputBuffer {
+    ReGIRReservoir output_reservoirs[];
+};
+
+uint hash_u32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+float rand01(inout uint state) {
+    state = hash_u32(state);
+    return float(state & 0x00ffffffu) / float(0x01000000u);
+}
+
+uint reservoir_index(uvec3 cell, uint reservoir, uvec3 dims, uint reservoirsPerCell) {
+    return (((cell.z * dims.y + cell.y) * dims.x + cell.x) * reservoirsPerCell) + reservoir;
+}
+
+void main() {
+    const uvec3 dims = max(regir_params.grid_dimensions_reservoirs.xyz, uvec3(1u));
+    const uint reservoirsPerCell = max(regir_params.grid_dimensions_reservoirs.w, 1u);
+    const uint reservoirCount = dims.x * dims.y * dims.z * reservoirsPerCell;
+    const uint reservoirIndex = gl_GlobalInvocationID.x;
+    if (reservoirIndex >= reservoirCount) {
+        return;
+    }
+
+    const uint cellReservoir = reservoirIndex % reservoirsPerCell;
+    const uint cellIndex = reservoirIndex / reservoirsPerCell;
+    const uint cellX = cellIndex % dims.x;
+    const uint cellY = (cellIndex / dims.x) % dims.y;
+    const uint cellZ = cellIndex / max(dims.x * dims.y, 1u);
+    const uvec3 cell = uvec3(cellX, cellY, cellZ);
+    const uint rounds = clamp(uint(regir_params.query_controls.z + 0.5), 1u, 8u);
+
+    ReGIRReservoir selected = input_reservoirs[reservoirIndex];
+    float weightSum = selected.metadata.w != 0u ? max(selected.sample_position_weight.w, 0.0) : 0.0;
+    uint neighborContributionCount = 0u;
+    uint rng = hash_u32(
+        reservoirIndex ^
+        (regir_params.controls.z * 747796405u) ^
+        (rounds * 2246822519u));
+
+    for (uint round = 0u; round < rounds; ++round) {
+        for (int dz = -1; dz <= 1; ++dz) {
+            int nz = int(cell.z) + dz;
+            if (nz < 0 || nz >= int(dims.z)) {
+                continue;
+            }
+            for (int dy = -1; dy <= 1; ++dy) {
+                int ny = int(cell.y) + dy;
+                if (ny < 0 || ny >= int(dims.y)) {
+                    continue;
+                }
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int nx = int(cell.x) + dx;
+                    if (nx < 0 || nx >= int(dims.x) || (dx == 0 && dy == 0 && dz == 0)) {
+                        continue;
+                    }
+                    const uint neighborReservoir = (cellReservoir + round) % reservoirsPerCell;
+                    const uint neighborIndex = reservoir_index(
+                        uvec3(uint(nx), uint(ny), uint(nz)),
+                        neighborReservoir,
+                        dims,
+                        reservoirsPerCell);
+                    ReGIRReservoir candidate = input_reservoirs[neighborIndex];
+                    if (candidate.metadata.w == 0u) {
+                        continue;
+                    }
+                    float weight = max(candidate.sample_position_weight.w, 0.0);
+                    if (weight <= 0.0) {
+                        continue;
+                    }
+                    ++neighborContributionCount;
+                    weightSum += weight;
+                    if (rand01(rng) * weightSum <= weight) {
+                        selected = candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    if (selected.metadata.w == 0u || weightSum <= 0.0) {
+        output_reservoirs[reservoirIndex] = selected;
+        return;
+    }
+    selected.metadata.w = max(1u, selected.metadata.w) + neighborContributionCount;
+    selected.sample_position_weight.w = max(selected.sample_position_weight.w, 0.0);
+    output_reservoirs[reservoirIndex] = selected;
+}

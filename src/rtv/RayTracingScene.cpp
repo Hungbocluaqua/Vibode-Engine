@@ -682,6 +682,24 @@ void dynamicBlasInputBarrier(VkCommandBuffer cmd, const Buffer& vertexBuffer) {
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
+void shaderStorageUploadBarrier(VkCommandBuffer cmd, const Buffer& buffer) {
+    VkBufferMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    barrier.buffer = buffer.handle();
+    barrier.offset = 0;
+    barrier.size = buffer.size();
+
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
 std::vector<VkAccelerationStructureInstanceKHR> buildVkInstances(
     const GpuScene& scene,
     const std::vector<AccelerationStructure>& blases,
@@ -981,30 +999,28 @@ void RayTracingScene::build(
     }
     geometryTriangleOffsetsBuffer_.create(allocator, BufferDesc{
         .size = sizeof(uint32_t) * geometryTriangleOffsets.size(),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        .memory = BufferMemory::Upload,
-        .persistentMapped = true,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
         .debugName = "ray tracing geometry triangle offsets",
     });
-    geometryTriangleOffsetsBuffer_.write(
+    uploader.uploadToBuffer(
+        geometryTriangleOffsetsBuffer_,
         geometryTriangleOffsets.data(),
         sizeof(uint32_t) * geometryTriangleOffsets.size());
-    geometryTriangleOffsetsBuffer_.flush(sizeof(uint32_t) * geometryTriangleOffsets.size());
 
     if (meshGeometryRanges.empty()) {
         meshGeometryRanges.push_back(MeshGeometryRangeGpu{.offset = 0u, .count = 1u});
     }
     meshGeometryRangesBuffer_.create(allocator, BufferDesc{
         .size = sizeof(MeshGeometryRangeGpu) * meshGeometryRanges.size(),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        .memory = BufferMemory::Upload,
-        .persistentMapped = true,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
         .debugName = "ray tracing mesh geometry ranges",
     });
-    meshGeometryRangesBuffer_.write(
+    uploader.uploadToBuffer(
+        meshGeometryRangesBuffer_,
         meshGeometryRanges.data(),
         sizeof(MeshGeometryRangeGpu) * meshGeometryRanges.size());
-    meshGeometryRangesBuffer_.flush(sizeof(MeshGeometryRangeGpu) * meshGeometryRanges.size());
 
     auto alignScratchSize = [scratchAlignment](VkDeviceSize size) {
         return scratchAlignment > 0 ? Buffer::alignUp(std::max<VkDeviceSize>(size, 4), scratchAlignment) : std::max<VkDeviceSize>(size, 4);
@@ -1385,15 +1401,23 @@ void RayTracingScene::build(
     }
     tlasGeometryRangesBuffer_.create(allocator, BufferDesc{
         .size = sizeof(TlasGeometryRangeGpu) * tlasGeometryRanges.size(),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        .memory = BufferMemory::Upload,
-        .persistentMapped = true,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
         .debugName = "ray tracing TLAS geometry ranges",
     });
-    tlasGeometryRangesBuffer_.write(
-        tlasGeometryRanges.data(),
-        sizeof(TlasGeometryRangeGpu) * tlasGeometryRanges.size());
-    tlasGeometryRangesBuffer_.flush(sizeof(TlasGeometryRangeGpu) * tlasGeometryRanges.size());
+    Buffer tlasGeometryRangesStaging(allocator, BufferDesc{
+        .size = tlasGeometryRangesBuffer_.size(),
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory = BufferMemory::Upload,
+        .persistentMapped = true,
+        .debugName = "ray tracing TLAS geometry ranges staging",
+    });
+    tlasGeometryRangesStaging.write(tlasGeometryRanges.data(), tlasGeometryRangesBuffer_.size());
+    tlasGeometryRangesStaging.flush(tlasGeometryRangesBuffer_.size());
+    VkBufferCopy tlasRangeCopy{};
+    tlasRangeCopy.size = tlasGeometryRangesBuffer_.size();
+    vkCmdCopyBuffer(cmd, tlasGeometryRangesStaging.handle(), tlasGeometryRangesBuffer_.handle(), 1, &tlasRangeCopy);
+    shaderStorageUploadBarrier(cmd, tlasGeometryRangesBuffer_);
 
     VkAccelerationStructureGeometryInstancesDataKHR instancesData{};
     instancesData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;

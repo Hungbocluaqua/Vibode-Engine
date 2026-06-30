@@ -6,6 +6,7 @@
 #include <Volk/volk.h>
 
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace rtv {
@@ -21,12 +22,14 @@ public:
     [[nodiscard]] VkShaderModule handle() const { return module_; }
     [[nodiscard]] VkShaderStageFlagBits stage() const { return reflection_.stage; }
     [[nodiscard]] const ShaderReflectionData& reflection() const { return reflection_; }
+    [[nodiscard]] const std::string& debugName() const { return debugName_; }
     [[nodiscard]] VkPipelineShaderStageCreateInfo stageInfo(const char* entryPoint = "main") const;
 
 private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkShaderModule module_ = VK_NULL_HANDLE;
     ShaderReflectionData reflection_{};
+    std::string debugName_;
 };
 
 } // namespace rtv

@@ -145,8 +145,8 @@ const char* debugViewLabel(RendererDebugView view) {
     return rendererDebugViewName(view);
 }
 
-const std::array<RendererDebugView, 18>& rendererOnlyDebugViews() {
-    static const std::array<RendererDebugView, 18> views{{
+const std::array<RendererDebugView, 37>& rendererOnlyDebugViews() {
+    static const std::array<RendererDebugView, 37> views{{
         RendererDebugView::Beauty,
         RendererDebugView::DirectLighting,
         RendererDebugView::IndirectLighting,
@@ -164,6 +164,25 @@ const std::array<RendererDebugView, 18>& rendererOnlyDebugViews() {
         RendererDebugView::RestirGiFinal,
         RendererDebugView::RestirGiTemporal,
         RendererDebugView::RestirGiSpatial,
+        RendererDebugView::AdaptiveDensityMap,
+        RendererDebugView::RegirGridOccupancy,
+        RendererDebugView::RegirReservoirWeight,
+        RendererDebugView::RegirSelectedLight,
+        RendererDebugView::RegirQueryCount,
+        RendererDebugView::RegirMisWeight,
+        RendererDebugView::RegirEffectivePdf,
+        RendererDebugView::RegirCanonicalUsed,
+        RendererDebugView::RegirQueryCell,
+        RendererDebugView::RegirActiveCellOccupancy,
+        RendererDebugView::RegirHashCollisions,
+        RendererDebugView::RegirSpatialInputWeight,
+        RendererDebugView::RegirSpatialOutputWeight,
+        RendererDebugView::RegirSpatialNeighborCount,
+        RendererDebugView::RegirEnvironmentSource,
+        RendererDebugView::RegirEnvironmentPdf,
+        RendererDebugView::RegirEnvironmentDirection,
+        RendererDebugView::RegirEnvironmentWeight,
+        RendererDebugView::RegirEnvironmentGeneration,
         RendererDebugView::WavefrontQueueOccupancy,
     }};
     return views;

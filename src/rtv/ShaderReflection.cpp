@@ -3,8 +3,14 @@
 #include <spirv-reflect/spirv_reflect.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 namespace rtv {
 
@@ -52,9 +58,160 @@ VkDescriptorType toVkDescriptorType(SpvReflectDescriptorType type) {
     }
 }
 
+uint64_t hashSpirv(const std::vector<uint32_t>& spirv) {
+    uint64_t hash = 1469598103934665603ull;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(spirv.data());
+    const size_t byteCount = spirv.size() * sizeof(uint32_t);
+    for (size_t i = 0; i < byteCount; ++i) {
+        hash ^= static_cast<uint64_t>(bytes[i]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::string environmentValue(const char* name) {
+#if defined(_MSC_VER)
+    char* value = nullptr;
+    size_t length = 0;
+    _dupenv_s(&value, &length, name);
+    if (value == nullptr) {
+        return {};
+    }
+    std::string result(value);
+    std::free(value);
+    return result;
+#else
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::string(value) : std::string{};
+#endif
+}
+
+std::filesystem::path reflectionCacheDirectory() {
+    const std::string configured = environmentValue("RTV_SHADER_REFLECTION_CACHE_DIR");
+    if (!configured.empty()) {
+        return configured;
+    }
+    return std::filesystem::temp_directory_path() / "rtvulkan_shader_reflection_v1";
+}
+
+std::filesystem::path reflectionCachePath(uint64_t spirvHash) {
+    char name[64]{};
+    std::snprintf(name, sizeof(name), "reflection_%016llx.bin", static_cast<unsigned long long>(spirvHash));
+    return reflectionCacheDirectory() / name;
+}
+
+template <typename T>
+bool readBinary(std::ifstream& file, T& value) {
+    file.read(reinterpret_cast<char*>(&value), sizeof(T));
+    return static_cast<bool>(file);
+}
+
+template <typename T>
+void writeBinary(std::ofstream& file, const T& value) {
+    file.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+bool tryLoadReflectionCache(uint64_t spirvHash, ShaderReflectionData& data) {
+    std::ifstream file(reflectionCachePath(spirvHash), std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t stage = 0;
+    uint32_t bindingCount = 0;
+    uint32_t pushCount = 0;
+    if (!readBinary(file, magic) ||
+        !readBinary(file, version) ||
+        !readBinary(file, stage) ||
+        !readBinary(file, bindingCount) ||
+        !readBinary(file, pushCount) ||
+        magic != 0x52534631u ||
+        version != 1u ||
+        bindingCount > 4096u ||
+        pushCount > 256u) {
+        return false;
+    }
+
+    ShaderReflectionData loaded{};
+    loaded.stage = static_cast<VkShaderStageFlagBits>(stage);
+    loaded.bindings.resize(bindingCount);
+    loaded.pushConstants.resize(pushCount);
+    for (ReflectedBinding& binding : loaded.bindings) {
+        uint32_t type = 0;
+        if (!readBinary(file, binding.set) ||
+            !readBinary(file, binding.binding) ||
+            !readBinary(file, binding.count) ||
+            !readBinary(file, type) ||
+            !readBinary(file, binding.stages)) {
+            return false;
+        }
+        binding.type = static_cast<VkDescriptorType>(type);
+    }
+    for (ReflectedPushConstant& push : loaded.pushConstants) {
+        if (!readBinary(file, push.offset) ||
+            !readBinary(file, push.size) ||
+            !readBinary(file, push.stages)) {
+            return false;
+        }
+    }
+    data = std::move(loaded);
+    return true;
+}
+
+void storeReflectionCache(uint64_t spirvHash, const ShaderReflectionData& data) {
+    try {
+        const std::filesystem::path directory = reflectionCacheDirectory();
+        std::filesystem::create_directories(directory);
+        const std::filesystem::path path = reflectionCachePath(spirvHash);
+        const std::filesystem::path tmp = path.string() + ".tmp";
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            return;
+        }
+        const uint32_t magic = 0x52534631u;
+        const uint32_t version = 1u;
+        const uint32_t stage = static_cast<uint32_t>(data.stage);
+        const uint32_t bindingCount = static_cast<uint32_t>(data.bindings.size());
+        const uint32_t pushCount = static_cast<uint32_t>(data.pushConstants.size());
+        writeBinary(file, magic);
+        writeBinary(file, version);
+        writeBinary(file, stage);
+        writeBinary(file, bindingCount);
+        writeBinary(file, pushCount);
+        for (const ReflectedBinding& binding : data.bindings) {
+            const uint32_t type = static_cast<uint32_t>(binding.type);
+            writeBinary(file, binding.set);
+            writeBinary(file, binding.binding);
+            writeBinary(file, binding.count);
+            writeBinary(file, type);
+            writeBinary(file, binding.stages);
+        }
+        for (const ReflectedPushConstant& push : data.pushConstants) {
+            writeBinary(file, push.offset);
+            writeBinary(file, push.size);
+            writeBinary(file, push.stages);
+        }
+        file.close();
+        if (!file) {
+            std::filesystem::remove(tmp);
+            return;
+        }
+        std::filesystem::rename(tmp, path);
+    } catch (const std::exception&) {
+    }
+}
+
 } // namespace
 
 ShaderReflectionData ShaderReflection::reflect(const std::vector<uint32_t>& spirv) {
+    const uint64_t spirvHash = hashSpirv(spirv);
+    ShaderReflectionData cached;
+    if (tryLoadReflectionCache(spirvHash, cached)) {
+        return cached;
+    }
+
     SpvReflectShaderModule module{};
     SpvReflectResult result = spvReflectCreateShaderModule(spirv.size() * sizeof(uint32_t), spirv.data(), &module);
     if (result != SPV_REFLECT_RESULT_SUCCESS) {
@@ -115,6 +272,7 @@ ShaderReflectionData ShaderReflection::reflect(const std::vector<uint32_t>& spir
     }
 
     spvReflectDestroyShaderModule(&module);
+    storeReflectionCache(spirvHash, data);
     return data;
 }
 

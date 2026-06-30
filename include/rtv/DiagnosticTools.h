@@ -19,6 +19,14 @@ struct ImageDiffMetrics {
     double ssim = 1.0;
     uint32_t maxError = 0;
     double changedPixelPercentage = 0.0;
+    double baselineMeanLuminance = 0.0;
+    double currentMeanLuminance = 0.0;
+    double meanLuminanceBias = 0.0;
+    double meanLuminanceBiasPercentage = 0.0;
+    double meanRedBias = 0.0;
+    double meanGreenBias = 0.0;
+    double meanBlueBias = 0.0;
+    double maxAbsMeanChannelBias = 0.0;
 };
 
 struct SequenceMetricSummary {

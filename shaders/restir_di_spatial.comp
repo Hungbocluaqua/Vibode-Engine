@@ -131,7 +131,18 @@ void main() {
 
     // Load center temporal reservoir as starting point
     RestirDiReservoir merged = temporal_reservoirs[pixelIndex];
-    float mergedMFloat = float(restir_di_m(merged));
+    // Neighboring temporal reservoirs contain heavily overlapping histories.
+    // Treat each input reservoir as one normalized representative estimate for
+    // this spatial stage; importing every historical M again would count the
+    // same temporal proposals repeatedly and bias W / M toward zero.
+    float centerSourceM = float(restir_di_m(merged));
+    if (centerSourceM > 0.0) {
+        restir_di_set_weight_sum(
+            merged,
+            restir_di_weight_sum(merged) / centerSourceM);
+        restir_di_set_m(merged, 1u);
+    }
+    float mergedMFloat = centerSourceM > 0.0 ? 1.0 : 0.0;
     uint rejectionFlags = restir_di_rejection_flags(merged);
 
     if (params.spatialResultValid == 0u || params.spatialRounds == 0u) {
@@ -166,7 +177,7 @@ void main() {
             continue;
         }
         if (!restir_di_reservoir_valid(candidate)) {
-            mergedMFloat += float(restir_di_m(candidate));
+            mergedMFloat += restir_di_m(candidate) > 0u ? 1.0 : 0.0;
             continue;
         }
         RestirDiLightRecord candidateLight;
@@ -185,7 +196,7 @@ void main() {
         if (params.visibilityPolicy == 1u &&
             restir_di_visibility(candidate) == RESTIR_DI_VISIBILITY_OCCLUDED) {
             DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_VISIBILITY_REJECTED], 1u);
-            mergedMFloat += candidateM;
+            mergedMFloat += 1.0;
             continue;
         }
 
@@ -195,8 +206,16 @@ void main() {
         vec3 centerPosition = centerReceiver.worldPosition_depth.xyz;
         float distToLight;
         uint candidateKind = restir_di_light_kind(candidate);
+        if (restir_di_light_kind_infinite(candidateKind) && params.visibilityPolicy == 0u) {
+            // Initial sampling still includes sun/environment. Do not spatially
+            // shift infinite-light reservoirs in production until final
+            // visibility/transmittance for shifted sky/sun samples is exact.
+            mergedMFloat += 1.0;
+            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_LIGHT_REJECTED], 1u);
+            continue;
+        }
         vec3 candidateLightNormal = restir_di_light_normal(candidate);
-        if (candidateKind == 4u || candidateKind == 5u) {
+        if (candidateKind == RESTIR_DI_LIGHT_AREA || candidateKind == RESTIR_DI_LIGHT_SPOT) {
             candidateLightNormal = normalize(vec3(candidateLight.data1.w, candidateLight.data2.w, candidateLight.data3.x));
         }
         float shiftedPdf = restir_di_pdf_at_receiver(
@@ -219,7 +238,7 @@ void main() {
         float targetAtCenter = restir_di_target_function(candidateRadiance);
         if (!restir_di_spatial_reservoir_compatible(merged, candidate, shiftedPdf, targetAtCenter)) {
             DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_TARGET_REJECTED], 1u);
-            mergedMFloat += candidateM;
+            mergedMFloat += 1.0;
             continue;
         }
 
@@ -239,21 +258,24 @@ void main() {
             visibilityChecked = true;
             if (visResult == RESTIR_DI_VISIBILITY_OCCLUDED) {
                 DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_VISIBILITY_REJECTED], 1u);
-                mergedMFloat += candidateM;
+                mergedMFloat += 1.0;
                 continue;
             }
         }
 
         if (targetAtCenter <= 1.0e-6) {
             DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_TARGET_REJECTED], 1u);
-            mergedMFloat += candidateM;
+            mergedMFloat += 1.0;
             continue;
         }
 
         // Compute shifted weight
         float candidateTarget = max(restir_di_target(candidate), 1.0e-6);
         float candidateWeightSum = restir_di_weight_sum(candidate);
-        float shiftedWeight = restir_di_shift_weight(targetAtCenter, candidateTarget, candidateWeightSum);
+        float shiftedWeight = restir_di_shift_weight(
+            targetAtCenter,
+            candidateTarget,
+            candidateWeightSum / candidateM);
 
         // Compatibility-weighted weight for reservoir update
         float candidateWeight = shiftedWeight;
@@ -274,19 +296,26 @@ void main() {
         shiftedCandidate.sampleMetadata.z = (resolvedLightIndex << 8u) | (candidateKind & 0xffu);
         if (shiftedPdf <= 1.0e-6) {
             DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_TARGET_REJECTED], 1u);
-            mergedMFloat += candidateM;
+            mergedMFloat += 1.0;
             continue;
         }
         restir_di_set_source_pdf(shiftedCandidate, shiftedPdf);
         restir_di_set_light_normal(shiftedCandidate, candidateLightNormal);
-        restir_di_set_visibility(shiftedCandidate, visibilityChecked
+        uint shiftedVisibility = visibilityChecked
             ? RESTIR_DI_VISIBILITY_VISIBLE
-            : RESTIR_DI_VISIBILITY_UNKNOWN);
+            : RESTIR_DI_VISIBILITY_UNKNOWN;
+        if (!visibilityChecked && params.visibilityPolicy == 0u &&
+            restir_di_light_kind_infinite(candidateKind)) {
+            shiftedVisibility = restir_di_visibility(candidate) == RESTIR_DI_VISIBILITY_OCCLUDED
+                ? RESTIR_DI_VISIBILITY_OCCLUDED
+                : RESTIR_DI_VISIBILITY_VISIBLE;
+        }
+        restir_di_set_visibility(shiftedCandidate, shiftedVisibility);
 
-        if (!restir_di_reservoir_update(merged, shiftedCandidate, candidateWeight, candidateM, rngValue, rejectionFlags)) {
+        if (!restir_di_reservoir_update(merged, shiftedCandidate, candidateWeight, 1.0, rngValue, rejectionFlags)) {
             continue;
         }
-        mergedMFloat += candidateM;
+        mergedMFloat += 1.0;
         if (rngValue < selectionProbability) {
             selectedNeighbor = true;
         }

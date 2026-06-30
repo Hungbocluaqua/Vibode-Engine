@@ -142,6 +142,29 @@ enum class RendererDebugView : uint32_t {
     RestirDiReferenceDiff = 126,
     RestirGiGrid = 127,
     RestirGiPathClass = 128,
+    AdaptiveDensityMap = 129,
+    AdaptiveSampleCount = 130,
+    AdaptiveUnsampledPixels = 131,
+    AdaptiveFilledImage = 132,
+    AdaptiveDisocclusionMask = 133,
+    RegirGridOccupancy = 134,
+    RegirReservoirWeight = 135,
+    RegirSelectedLight = 136,
+    RegirQueryCount = 137,
+    RegirMisWeight = 138,
+    RegirEffectivePdf = 139,
+    RegirCanonicalUsed = 140,
+    RegirQueryCell = 141,
+    RegirActiveCellOccupancy = 142,
+    RegirHashCollisions = 143,
+    RegirSpatialInputWeight = 144,
+    RegirSpatialOutputWeight = 145,
+    RegirSpatialNeighborCount = 146,
+    RegirEnvironmentSource = 147,
+    RegirEnvironmentPdf = 148,
+    RegirEnvironmentDirection = 149,
+    RegirEnvironmentWeight = 150,
+    RegirEnvironmentGeneration = 151,
 };
 
 enum class RestirMode : uint32_t {
@@ -188,6 +211,26 @@ enum class RestirHistoryCopyMode : uint32_t {
     PingPong = 1,
 };
 
+enum class ReservoirLayout : uint32_t {
+    LegacyDI = 0,
+    LegacyGI = 1,
+    PathSpace = 2,
+    PathSpaceCompressed = 3,
+};
+
+enum class LightingReuseMode : uint32_t {
+    LegacyRestirDiGi = 0,
+    LegacyRestirDiGiPlusReGIR = 1,
+    ExperimentalRestirPT = 2,
+    ValidateRestirPTAgainstLegacy = 3,
+};
+
+enum class AdaptiveSamplingMode : uint32_t {
+    Disabled = 0,
+    Heuristic = 1,
+    Neural = 2,
+};
+
 enum class MixedSidedSplitMode : uint32_t {
     Off = 0,
     Compact = 1,
@@ -208,6 +251,17 @@ enum class Native2BDirectReuseMode : uint32_t {
     Off = 0,
     Ris = 1,
     Temporal = 2,
+};
+
+enum class RegirQueryMode : uint32_t {
+    Deterministic = 0,
+    Stochastic = 1,
+};
+
+enum class RegirGridMode : uint32_t {
+    Dense = 0,
+    Active = 1,
+    Hash = 2,
 };
 
 enum class AdaptiveQualityMode : uint32_t {
@@ -259,6 +313,16 @@ inline constexpr uint32_t rendererDebugFlagRayTracingCounters = 1u << 0u;
 [[nodiscard]] RestirGiActiveTileMaskMode parseRestirGiActiveTileMaskMode(std::string_view value);
 [[nodiscard]] const char* restirHistoryCopyModeName(RestirHistoryCopyMode mode);
 [[nodiscard]] RestirHistoryCopyMode parseRestirHistoryCopyMode(std::string_view value);
+[[nodiscard]] const char* reservoirLayoutName(ReservoirLayout layout);
+[[nodiscard]] ReservoirLayout parseReservoirLayout(std::string_view value);
+[[nodiscard]] const char* lightingReuseModeName(LightingReuseMode mode);
+[[nodiscard]] LightingReuseMode parseLightingReuseMode(std::string_view value);
+[[nodiscard]] const char* regirQueryModeName(RegirQueryMode mode);
+[[nodiscard]] RegirQueryMode parseRegirQueryMode(std::string_view value);
+[[nodiscard]] const char* regirGridModeName(RegirGridMode mode);
+[[nodiscard]] RegirGridMode parseRegirGridMode(std::string_view value);
+[[nodiscard]] const char* adaptiveSamplingModeName(AdaptiveSamplingMode mode);
+[[nodiscard]] AdaptiveSamplingMode parseAdaptiveSamplingMode(std::string_view value);
 [[nodiscard]] const char* mixedSidedSplitModeName(MixedSidedSplitMode mode);
 [[nodiscard]] MixedSidedSplitMode parseMixedSidedSplitMode(std::string_view value);
 [[nodiscard]] const char* pathTraceKernelModeName(PathTraceKernelMode mode);

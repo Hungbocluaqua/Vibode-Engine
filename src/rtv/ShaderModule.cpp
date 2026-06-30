@@ -6,8 +6,8 @@
 
 namespace rtv {
 
-ShaderModule::ShaderModule(VkDevice device, std::vector<uint32_t> spirv, const char*)
-    : device_(device), reflection_(ShaderReflection::reflect(spirv)) {
+ShaderModule::ShaderModule(VkDevice device, std::vector<uint32_t> spirv, const char* debugName)
+    : device_(device), reflection_(ShaderReflection::reflect(spirv)), debugName_(debugName != nullptr ? debugName : "shader") {
     VkShaderModuleCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     createInfo.codeSize = spirv.size() * sizeof(uint32_t);
@@ -33,9 +33,11 @@ ShaderModule& ShaderModule::operator=(ShaderModule&& other) noexcept {
         device_ = other.device_;
         module_ = other.module_;
         reflection_ = other.reflection_;
+        debugName_ = std::move(other.debugName_);
         other.device_ = VK_NULL_HANDLE;
         other.module_ = VK_NULL_HANDLE;
         other.reflection_ = {};
+        other.debugName_.clear();
     }
     return *this;
 }

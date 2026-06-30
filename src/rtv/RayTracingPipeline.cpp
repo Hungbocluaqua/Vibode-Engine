@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 
 namespace rtv {
@@ -86,6 +88,15 @@ void applyRayTracingPipelineFlags(
     if (allowMotionBlur) {
         pipelineInfo.flags |= VK_PIPELINE_CREATE_RAY_TRACING_ALLOW_MOTION_BIT_NV;
     }
+}
+
+template <typename Fn>
+void timeRayTracingPipelineCreate(const std::string& label, Fn&& fn) {
+    const auto start = std::chrono::steady_clock::now();
+    fn();
+    const auto end = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration<double, std::milli>(end - start).count();
+    std::cout << "Pipeline create: ray tracing " << label << " took " << ms << " ms\n";
 }
 
 } // namespace
@@ -170,14 +181,16 @@ RayTracingPipeline::RayTracingPipeline(
         pipelineInfo,
         opacityMicromapsEnabled,
         allowMotionBlur);
-    checkVk(vkCreateRayTracingPipelinesKHR(
-        device_,
-        VK_NULL_HANDLE,
-        usePipelineCache ? pipelineCache.handle() : VK_NULL_HANDLE,
-        1,
-        &pipelineInfo,
-        nullptr,
-        &pipeline_), "vkCreateRayTracingPipelinesKHR");
+    timeRayTracingPipelineCreate(raygenShader.debugName(), [&]() {
+        checkVk(vkCreateRayTracingPipelinesKHR(
+            device_,
+            VK_NULL_HANDLE,
+            usePipelineCache ? pipelineCache.handle() : VK_NULL_HANDLE,
+            1,
+            &pipelineInfo,
+            nullptr,
+            &pipeline_), "vkCreateRayTracingPipelinesKHR");
+    });
 
     const uint32_t handleSize = properties.shaderGroupHandleSize;
     const uint32_t handleAlignment = properties.shaderGroupHandleAlignment;
@@ -218,7 +231,8 @@ RayTracingPipeline::RayTracingPipeline(
     ResourceAllocator& allocator,
     BufferUploader& uploader,
     bool opacityMicromapsEnabled,
-    bool usePipelineCache)
+    bool usePipelineCache,
+    bool deferSbtUpload)
     : device_(device) {
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -272,9 +286,11 @@ RayTracingPipeline::RayTracingPipeline(
     pipelineInfo.maxPipelineRayRecursionDepth = 1;
     pipelineInfo.layout = layout_;
     applyRayTracingPipelineFlags(pipelineInfo, opacityMicromapsEnabled, false);
-    checkVk(vkCreateRayTracingPipelinesKHR(
-        device_, VK_NULL_HANDLE, usePipelineCache ? pipelineCache.handle() : VK_NULL_HANDLE,
-        1, &pipelineInfo, nullptr, &pipeline_), "vkCreateRayTracingPipelinesKHR(native2b)");
+    timeRayTracingPipelineCreate(raygenShader.debugName(), [&]() {
+        checkVk(vkCreateRayTracingPipelinesKHR(
+            device_, VK_NULL_HANDLE, usePipelineCache ? pipelineCache.handle() : VK_NULL_HANDLE,
+            1, &pipelineInfo, nullptr, &pipeline_), "vkCreateRayTracingPipelinesKHR(native2b)");
+    });
 
     const uint32_t handleSize = properties.shaderGroupHandleSize;
     const VkDeviceSize stride = Buffer::alignUp(handleSize, properties.shaderGroupHandleAlignment);
@@ -285,9 +301,18 @@ RayTracingPipeline::RayTracingPipeline(
     checkVk(vkGetRayTracingShaderGroupHandlesKHR(
         device_, pipeline_, 0, static_cast<uint32_t>(groups.size()), handles.size(), handles.data()),
         "vkGetRayTracingShaderGroupHandlesKHR(native2b)");
-    uploadSbtSection(allocator, uploader, raygenSbt_, raygenRegion_, handles.data(), 0u, 1u, handleSize, stride, raygenSectionSize, "native2b raygen SBT");
-    uploadSbtSection(allocator, uploader, missSbt_, missRegion_, handles.data(), 1u, 3u, handleSize, stride, missSectionSize, "native2b miss SBT");
-    uploadSbtSection(allocator, uploader, hitSbt_, hitRegion_, handles.data(), 4u, 3u, handleSize, stride, hitSectionSize, "native2b hit SBT");
+    if (deferSbtUpload) {
+        deferredSbtHandles_ = std::move(handles);
+        deferredSbtHandleSize_ = handleSize;
+        deferredSbtStride_ = stride;
+        deferredRaygenSectionSize_ = raygenSectionSize;
+        deferredMissSectionSize_ = missSectionSize;
+        deferredHitSectionSize_ = hitSectionSize;
+    } else {
+        uploadSbtSection(allocator, uploader, raygenSbt_, raygenRegion_, handles.data(), 0u, 1u, handleSize, stride, raygenSectionSize, "native2b raygen SBT");
+        uploadSbtSection(allocator, uploader, missSbt_, missRegion_, handles.data(), 1u, 3u, handleSize, stride, missSectionSize, "native2b miss SBT");
+        uploadSbtSection(allocator, uploader, hitSbt_, hitRegion_, handles.data(), 4u, 3u, handleSize, stride, hitSectionSize, "native2b hit SBT");
+    }
 }
 
 RayTracingPipeline::RayTracingPipeline(
@@ -379,14 +404,16 @@ RayTracingPipeline::RayTracingPipeline(
         pipelineInfo,
         opacityMicromapsEnabled,
         allowMotionBlur);
-    checkVk(vkCreateRayTracingPipelinesKHR(
-        device_,
-        VK_NULL_HANDLE,
-        usePipelineCache ? pipelineCache.handle() : VK_NULL_HANDLE,
-        1,
-        &pipelineInfo,
-        nullptr,
-        &pipeline_), "vkCreateRayTracingPipelinesKHR(multi-raygen)");
+    timeRayTracingPipelineCreate(primaryRaygenShader.debugName(), [&]() {
+        checkVk(vkCreateRayTracingPipelinesKHR(
+            device_,
+            VK_NULL_HANDLE,
+            usePipelineCache ? pipelineCache.handle() : VK_NULL_HANDLE,
+            1,
+            &pipelineInfo,
+            nullptr,
+            &pipeline_), "vkCreateRayTracingPipelinesKHR(multi-raygen)");
+    });
 
     const uint32_t handleSize = properties.shaderGroupHandleSize;
     const uint32_t handleAlignment = properties.shaderGroupHandleAlignment;
@@ -409,6 +436,23 @@ RayTracingPipeline::RayTracingPipeline(
     uploadSbtRecords(allocator, uploader, raygenSbt_, raygenRegion_, handles.data(), {0u, 5u}, handleSize, raygenStride, raygenSectionSize, "raygen SBT");
     uploadSbtSection(allocator, uploader, missSbt_, missRegion_, handles.data(), 1u, 2u, handleSize, stride, missSectionSize, "miss SBT");
     uploadSbtSection(allocator, uploader, hitSbt_, hitRegion_, handles.data(), 3u, 2u, handleSize, stride, hitSectionSize, "hit SBT");
+}
+
+void RayTracingPipeline::finalizeDeferredSbtUpload(ResourceAllocator& allocator, BufferUploader& uploader) {
+    if (deferredSbtHandles_.empty()) {
+        return;
+    }
+    uploadSbtSection(
+        allocator, uploader, raygenSbt_, raygenRegion_, deferredSbtHandles_.data(),
+        0u, 1u, deferredSbtHandleSize_, deferredSbtStride_, deferredRaygenSectionSize_, "native2b raygen SBT");
+    uploadSbtSection(
+        allocator, uploader, missSbt_, missRegion_, deferredSbtHandles_.data(),
+        1u, 3u, deferredSbtHandleSize_, deferredSbtStride_, deferredMissSectionSize_, "native2b miss SBT");
+    uploadSbtSection(
+        allocator, uploader, hitSbt_, hitRegion_, deferredSbtHandles_.data(),
+        4u, 3u, deferredSbtHandleSize_, deferredSbtStride_, deferredHitSectionSize_, "native2b hit SBT");
+    deferredSbtHandles_.clear();
+    deferredSbtHandles_.shrink_to_fit();
 }
 
 RayTracingPipeline::~RayTracingPipeline() {

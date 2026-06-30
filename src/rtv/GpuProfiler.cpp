@@ -36,6 +36,9 @@ const char* gpuMarkerBeginLabel(GpuProfiler::Query query) {
     case GpuProfiler::RestirGiUpsampleStart: return "ReSTIR GI Upsample";
     case GpuProfiler::RestirGiFinalStart: return "ReSTIR GI Final";
     case GpuProfiler::RestirGiCountersReadbackStart: return "ReSTIR GI Counters Readback";
+    case GpuProfiler::RegirBuildStart: return "ReGIR Build";
+    case GpuProfiler::RegirSpatialReuseStart: return "ReGIR Spatial Reuse";
+    case GpuProfiler::RegirTemporalReuseStart: return "ReGIR Temporal Reuse";
     case GpuProfiler::RestirDiTemporalStart: return "ReSTIR DI Temporal";
     case GpuProfiler::RestirDiSpatialStart: return "ReSTIR DI Spatial";
     case GpuProfiler::RestirDiFinalStart: return "ReSTIR DI Final";
@@ -51,6 +54,8 @@ const char* gpuMarkerBeginLabel(GpuProfiler::Query query) {
     case GpuProfiler::AtmosphereAerialPerspectiveStart: return "Atmosphere Aerial Perspective";
     case GpuProfiler::DenoiserStart: return "Denoiser";
     case GpuProfiler::MomentUpdateStart: return "Moment Update";
+    case GpuProfiler::AdaptiveSamplingDiagnosticsStart: return "Adaptive Sampling Diagnostics";
+    case GpuProfiler::AdaptiveSamplingFillStart: return "Adaptive Sampling Fill";
     case GpuProfiler::HistoryCopyStart: return "History Copy";
     case GpuProfiler::SkipDenoiserCopyStart: return "Skip Denoiser Copy";
     case GpuProfiler::TaaStart: return "TAA/TSR";
@@ -89,6 +94,9 @@ bool gpuMarkerEndsLabel(GpuProfiler::Query query) {
     case GpuProfiler::RestirGiUpsampleEnd:
     case GpuProfiler::RestirGiFinalEnd:
     case GpuProfiler::RestirGiCountersReadbackEnd:
+    case GpuProfiler::RegirBuildEnd:
+    case GpuProfiler::RegirSpatialReuseEnd:
+    case GpuProfiler::RegirTemporalReuseEnd:
     case GpuProfiler::RestirDiTemporalEnd:
     case GpuProfiler::RestirDiSpatialEnd:
     case GpuProfiler::RestirDiFinalEnd:
@@ -104,6 +112,8 @@ bool gpuMarkerEndsLabel(GpuProfiler::Query query) {
     case GpuProfiler::AtmosphereAerialPerspectiveEnd:
     case GpuProfiler::DenoiserEnd:
     case GpuProfiler::MomentUpdateEnd:
+    case GpuProfiler::AdaptiveSamplingDiagnosticsEnd:
+    case GpuProfiler::AdaptiveSamplingFillEnd:
     case GpuProfiler::HistoryCopyEnd:
     case GpuProfiler::SkipDenoiserCopyEnd:
     case GpuProfiler::TaaEnd:
@@ -307,6 +317,9 @@ void GpuProfiler::collectCompletedFrame() {
     updateTiming(timings_.restirGiUpsampleMs, RestirGiUpsampleStart, RestirGiUpsampleEnd);
     updateTiming(timings_.restirGiFinalMs, RestirGiFinalStart, RestirGiFinalEnd);
     updateTiming(timings_.restirGiCountersReadbackMs, RestirGiCountersReadbackStart, RestirGiCountersReadbackEnd);
+    updateTiming(timings_.regirBuildMs, RegirBuildStart, RegirBuildEnd);
+    updateTiming(timings_.regirSpatialReuseMs, RegirSpatialReuseStart, RegirSpatialReuseEnd);
+    updateTiming(timings_.regirTemporalReuseMs, RegirTemporalReuseStart, RegirTemporalReuseEnd);
     updateTiming(timings_.restirDiTemporalMs, RestirDiTemporalStart, RestirDiTemporalEnd);
     updateTiming(timings_.restirDiSpatialMs, RestirDiSpatialStart, RestirDiSpatialEnd);
     updateTiming(timings_.restirDiFinalMs, RestirDiFinalStart, RestirDiFinalEnd);
@@ -322,6 +335,8 @@ void GpuProfiler::collectCompletedFrame() {
     updateTiming(timings_.atmosphereAerialPerspectiveMs, AtmosphereAerialPerspectiveStart, AtmosphereAerialPerspectiveEnd);
     updateTiming(timings_.denoiserMs, DenoiserStart, DenoiserEnd);
     updateTiming(timings_.momentUpdateMs, MomentUpdateStart, MomentUpdateEnd);
+    updateTiming(timings_.adaptiveSamplingDiagnosticsMs, AdaptiveSamplingDiagnosticsStart, AdaptiveSamplingDiagnosticsEnd);
+    updateTiming(timings_.adaptiveSamplingFillMs, AdaptiveSamplingFillStart, AdaptiveSamplingFillEnd);
     updateTiming(timings_.historyCopyMs, HistoryCopyStart, HistoryCopyEnd);
     updateTiming(timings_.skipDenoiserCopyMs, SkipDenoiserCopyStart, SkipDenoiserCopyEnd);
     updateTiming(timings_.taaMs, TaaStart, TaaEnd);
@@ -361,6 +376,9 @@ void GpuProfiler::collectCompletedFrame() {
         timings_.restirGiUpsampleMs +
         timings_.restirGiFinalMs +
         timings_.restirGiCountersReadbackMs +
+        timings_.regirBuildMs +
+        timings_.regirSpatialReuseMs +
+        timings_.regirTemporalReuseMs +
         timings_.restirDiTemporalMs +
         timings_.restirDiSpatialMs +
         timings_.restirDiFinalMs +
@@ -370,6 +388,8 @@ void GpuProfiler::collectCompletedFrame() {
         timings_.atmosphereMs +
         timings_.denoiserMs +
         timings_.momentUpdateMs +
+        timings_.adaptiveSamplingDiagnosticsMs +
+        timings_.adaptiveSamplingFillMs +
         timings_.historyCopyMs +
         timings_.skipDenoiserCopyMs +
         timings_.taaMs +

@@ -1690,8 +1690,10 @@ float maxEmissiveTrianglePower(const std::vector<GpuLightRecord>& records) {
 bool shouldDropLargeImportedEmissiveTrianglePayload(
     uint32_t triangleCount,
     float maxEmissivePower,
-    bool /*compactMode*/) {
-    return triangleCount >= 1'000'000u && maxEmissivePower <= 1.0e-3f;
+    bool compactMode) {
+    return triangleCount >= 1'000'000u &&
+        maxEmissivePower <= 1.0e-3f &&
+        (compactMode || maxEmissivePower <= 1.0e-6f);
 }
 
 void logDroppedImportedEmissiveTrianglePayload(uint32_t triangleCount, size_t payloadBytes, float maxEmissivePower) {
@@ -4791,6 +4793,11 @@ void GpuScene::uploadLightBvh(BufferUploader& uploader, const std::vector<GpuLig
     }
     std::vector<LightBvhNode> bvhNodes = buildLightBvh(lightPrimitives, 1);
     const LightBvhStats stats = computeLightBvhStats(bvhNodes);
+    if (stats.leafCount != lightRecords.size()) {
+        throw std::runtime_error(
+            "Light BVH topology is incomplete: reachable leaves=" + std::to_string(stats.leafCount) +
+            " records=" + std::to_string(lightRecords.size()));
+    }
     if (logStats && stats.nodeCount > 0u) {
         std::cout << "Light BVH: nodes=" << stats.nodeCount
                   << " leaves=" << stats.leafCount

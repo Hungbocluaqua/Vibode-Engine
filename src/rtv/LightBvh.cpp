@@ -186,15 +186,13 @@ void expand(Bounds& bounds, const Bounds& other) {
     return split;
 }
 
-uint32_t buildRecursive(
+void buildRecursive(
     std::vector<BuildItem>& items,
     uint32_t begin,
     uint32_t end,
     uint32_t maxLightsPerLeaf,
+    uint32_t nodeIndex,
     std::vector<LightBvhNode>& nodes) {
-    const uint32_t nodeIndex = static_cast<uint32_t>(nodes.size());
-    nodes.emplace_back();
-
     const uint32_t count = end - begin;
     const RangeSummary summary = summarize(items, begin, end);
     LightBvhNode& node = nodes[nodeIndex];
@@ -205,20 +203,23 @@ uint32_t buildRecursive(
     if (count <= std::max(maxLightsPerLeaf, 1u)) {
         node.lightIndex = static_cast<int32_t>(items[begin].primitive.lightIndex);
         node.lightCount = count == 1u ? 1u : 0u;
-        return nodeIndex;
+        return;
     }
 
     const uint32_t split = chooseSahSplit(items, begin, end, summary);
     const uint32_t firstChild = static_cast<uint32_t>(nodes.size());
-    buildRecursive(items, begin, split, maxLightsPerLeaf, nodes);
-    buildRecursive(items, split, end, maxLightsPerLeaf, nodes);
+    // The packed GPU format stores one child offset and assumes the two child
+    // roots are adjacent. Reserve both roots before recursively appending either
+    // subtree so a deep left subtree cannot displace the right child root.
+    nodes.resize(nodes.size() + 2u);
 
     LightBvhNode& inner = nodes[nodeIndex];
     inner.lightIndex = -1;
     inner.childOffset = firstChild;
     inner.childCount = 2u;
     inner.lightCount = 0u;
-    return nodeIndex;
+    buildRecursive(items, begin, split, maxLightsPerLeaf, firstChild, nodes);
+    buildRecursive(items, split, end, maxLightsPerLeaf, firstChild + 1u, nodes);
 }
 
 void accumulateStats(
@@ -289,7 +290,8 @@ std::vector<LightBvhNode> buildLightBvh(
     // GPU leaves encode one arbitrary light index. Keep explicit-primitive builds to single-light
     // leaves so spatially sorted leaves never imply a contiguous range in the original light buffer.
     const uint32_t effectiveMaxLightsPerLeaf = std::min(std::max(maxLightsPerLeaf, 1u), 1u);
-    buildRecursive(items, 0u, static_cast<uint32_t>(items.size()), effectiveMaxLightsPerLeaf, nodes);
+    nodes.emplace_back();
+    buildRecursive(items, 0u, static_cast<uint32_t>(items.size()), effectiveMaxLightsPerLeaf, 0u, nodes);
     return nodes;
 }
 

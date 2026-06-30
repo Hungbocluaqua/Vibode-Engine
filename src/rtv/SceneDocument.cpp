@@ -806,12 +806,12 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
     if (header_.sceneGuid.empty()) {
         header_.sceneGuid = generateSceneGuid();
     }
-    header_.formatVersion = 3;
+    header_.formatVersion = 4;
     header_.engineVersion = "0.1";
     header_.projectRelativePaths = true;
 
     nlohmann::json root;
-    root["version"] = 3;
+    root["version"] = 4;
     root["rtlevel"] = {
         {"formatVersion", header_.formatVersion},
         {"sceneGuid", header_.sceneGuid},
@@ -951,6 +951,35 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
         {"restirGiFinalStabilizationEnabled", renderSettings_.restirGiFinalStabilizationEnabled},
         {"restirGiActiveTileMaskMode", static_cast<uint32_t>(renderSettings_.restirGiActiveTileMaskMode)},
         {"restirHistoryCopyMode", static_cast<uint32_t>(renderSettings_.restirHistoryCopyMode)},
+        {"lightingReuseMode", static_cast<uint32_t>(renderSettings_.lightingReuseMode)},
+        {"regirGridDimensions", {renderSettings_.regirGridDimensions.x, renderSettings_.regirGridDimensions.y, renderSettings_.regirGridDimensions.z}},
+        {"regirReservoirsPerCell", renderSettings_.regirReservoirsPerCell},
+        {"regirCandidatesPerReservoir", renderSettings_.regirCandidatesPerReservoir},
+        {"regirGridPadding", renderSettings_.regirGridPadding},
+        {"regirCanonicalMix", renderSettings_.regirCanonicalMix},
+        {"regirQueryMode", static_cast<uint32_t>(renderSettings_.regirQueryMode)},
+        {"regirGridMode", static_cast<uint32_t>(renderSettings_.regirGridMode)},
+        {"regirFiniteQueryFramePeriod", renderSettings_.regirFiniteQueryFramePeriod},
+        {"regirSpatialReuse", renderSettings_.regirSpatialReuse},
+        {"regirSpatialRounds", renderSettings_.regirSpatialRounds},
+        {"regirTemporalReuse", renderSettings_.regirTemporalReuse},
+        {"regirTemporalHistory", renderSettings_.regirTemporalHistory},
+        {"regirTemporalMaxM", renderSettings_.regirTemporalMaxM},
+        {"regirVisibilityReuse", renderSettings_.regirVisibilityReuse},
+        {"regirEnvironment", renderSettings_.regirEnvironment},
+        {"pathReservoirLayout", static_cast<uint32_t>(renderSettings_.pathReservoirLayout)},
+        {"adaptiveSamplingMode", static_cast<uint32_t>(renderSettings_.adaptiveSamplingMode)},
+        {"adaptiveSamplingBudget", renderSettings_.adaptiveSamplingBudget},
+        {"adaptiveWeightVariance", renderSettings_.adaptiveWeightVariance},
+        {"adaptiveWeightHistory", renderSettings_.adaptiveWeightHistory},
+        {"adaptiveWeightMotion", renderSettings_.adaptiveWeightMotion},
+        {"adaptiveWeightDisocclusion", renderSettings_.adaptiveWeightDisocclusion},
+        {"adaptiveWeightReactive", renderSettings_.adaptiveWeightReactive},
+        {"adaptiveWeightEdge", renderSettings_.adaptiveWeightEdge},
+        {"adaptiveWeightSpecular", renderSettings_.adaptiveWeightSpecular},
+        {"adaptiveWeightDI", renderSettings_.adaptiveWeightDI},
+        {"adaptiveWeightGI", renderSettings_.adaptiveWeightGI},
+        {"adaptiveWeightVolumetric", renderSettings_.adaptiveWeightVolumetric},
         {"adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)},
         {"adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs},
         {"usePhysicalCamera", renderSettings_.usePhysicalCamera},
@@ -1295,6 +1324,7 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         header_.engineVersion = header.value("engineVersion", header_.engineVersion);
         header_.projectRelativePaths = header.value("projectRelativePaths", true);
     }
+    const uint32_t loadedFormatVersion = header_.formatVersion;
     if (header_.sceneGuid.empty()) {
         header_.sceneGuid = generateSceneGuid();
     }
@@ -1443,8 +1473,17 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.restirDiVisibilityRayBudget = render.value("restirDiVisibilityRayBudget", renderSettings_.restirDiVisibilityRayBudget);
         renderSettings_.restirDiProductionStabilizationEnabled = render.value("restirDiProductionStabilizationEnabled", renderSettings_.restirDiProductionStabilizationEnabled);
         renderSettings_.restirDiClampLuminance = render.value("restirDiClampLuminance", renderSettings_.restirDiClampLuminance);
-        renderSettings_.restirDiIncludeSun = render.value("restirDiIncludeSun", renderSettings_.restirDiIncludeSun);
-        renderSettings_.restirDiIncludeEnvironment = render.value("restirDiIncludeEnvironment", renderSettings_.restirDiIncludeEnvironment);
+        if (loadedFormatVersion < 4u) {
+            // These fields existed before they controlled shader behavior and
+            // were forced false by validation. Treat old serialized values as
+            // stale so existing scenes pick up the now-supported sun/env DI
+            // candidates; format 4+ preserves an intentional user choice.
+            renderSettings_.restirDiIncludeSun = true;
+            renderSettings_.restirDiIncludeEnvironment = true;
+        } else {
+            renderSettings_.restirDiIncludeSun = render.value("restirDiIncludeSun", renderSettings_.restirDiIncludeSun);
+            renderSettings_.restirDiIncludeEnvironment = render.value("restirDiIncludeEnvironment", renderSettings_.restirDiIncludeEnvironment);
+        }
         if (restirDiMode == RestirDiMode::ReferenceValidation &&
             (!renderSettings_.restirDiFinalVisibilityEnabled ||
              restirDiLayout != RestirDiReservoirLayout::ValidationFull)) {
@@ -1531,6 +1570,62 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.restirHistoryCopyMode = historyCopyMode <= static_cast<uint32_t>(RestirHistoryCopyMode::PingPong)
             ? static_cast<RestirHistoryCopyMode>(historyCopyMode)
             : RestirHistoryCopyMode::Copy;
+        const uint32_t lightingReuseMode = render.value("lightingReuseMode", static_cast<uint32_t>(renderSettings_.lightingReuseMode));
+        if (lightingReuseMode > static_cast<uint32_t>(LightingReuseMode::ValidateRestirPTAgainstLegacy)) {
+            return false;
+        }
+        renderSettings_.lightingReuseMode = static_cast<LightingReuseMode>(lightingReuseMode);
+        if (render.contains("regirGridDimensions") && render["regirGridDimensions"].is_array() && render["regirGridDimensions"].size() >= 3u) {
+            renderSettings_.regirGridDimensions = glm::uvec3(
+                render["regirGridDimensions"][0].get<uint32_t>(),
+                render["regirGridDimensions"][1].get<uint32_t>(),
+                render["regirGridDimensions"][2].get<uint32_t>());
+        }
+        renderSettings_.regirReservoirsPerCell = render.value("regirReservoirsPerCell", renderSettings_.regirReservoirsPerCell);
+        renderSettings_.regirCandidatesPerReservoir = render.value("regirCandidatesPerReservoir", renderSettings_.regirCandidatesPerReservoir);
+        renderSettings_.regirGridPadding = render.value("regirGridPadding", renderSettings_.regirGridPadding);
+        renderSettings_.regirCanonicalMix = render.value("regirCanonicalMix", renderSettings_.regirCanonicalMix);
+        const uint32_t regirQueryMode = render.value("regirQueryMode", static_cast<uint32_t>(renderSettings_.regirQueryMode));
+        if (regirQueryMode > static_cast<uint32_t>(RegirQueryMode::Stochastic)) {
+            return false;
+        }
+        renderSettings_.regirQueryMode = static_cast<RegirQueryMode>(regirQueryMode);
+        const uint32_t regirGridMode = render.value("regirGridMode", static_cast<uint32_t>(renderSettings_.regirGridMode));
+        if (regirGridMode > static_cast<uint32_t>(RegirGridMode::Hash)) {
+            return false;
+        }
+        renderSettings_.regirGridMode = static_cast<RegirGridMode>(regirGridMode);
+        renderSettings_.regirFiniteQueryFramePeriod = std::min(
+            render.value("regirFiniteQueryFramePeriod", renderSettings_.regirFiniteQueryFramePeriod),
+            4096u);
+        renderSettings_.regirSpatialReuse = render.value("regirSpatialReuse", renderSettings_.regirSpatialReuse);
+        renderSettings_.regirSpatialRounds = render.value("regirSpatialRounds", renderSettings_.regirSpatialRounds);
+        renderSettings_.regirTemporalReuse = render.value("regirTemporalReuse", renderSettings_.regirTemporalReuse);
+        renderSettings_.regirTemporalHistory = render.value("regirTemporalHistory", renderSettings_.regirTemporalHistory);
+        renderSettings_.regirTemporalMaxM = render.value("regirTemporalMaxM", renderSettings_.regirTemporalMaxM);
+        renderSettings_.regirVisibilityReuse = render.value("regirVisibilityReuse", renderSettings_.regirVisibilityReuse);
+        renderSettings_.regirEnvironment = render.value("regirEnvironment", renderSettings_.regirEnvironment);
+        const uint32_t pathReservoirLayout = render.value("pathReservoirLayout", static_cast<uint32_t>(renderSettings_.pathReservoirLayout));
+        if (pathReservoirLayout > static_cast<uint32_t>(ReservoirLayout::PathSpaceCompressed)) {
+            return false;
+        }
+        renderSettings_.pathReservoirLayout = static_cast<ReservoirLayout>(pathReservoirLayout);
+        const uint32_t adaptiveSamplingMode = render.value("adaptiveSamplingMode", static_cast<uint32_t>(renderSettings_.adaptiveSamplingMode));
+        if (adaptiveSamplingMode > static_cast<uint32_t>(AdaptiveSamplingMode::Neural)) {
+            return false;
+        }
+        renderSettings_.adaptiveSamplingMode = static_cast<AdaptiveSamplingMode>(adaptiveSamplingMode);
+        renderSettings_.adaptiveSamplingBudget = render.value("adaptiveSamplingBudget", renderSettings_.adaptiveSamplingBudget);
+        renderSettings_.adaptiveWeightVariance = render.value("adaptiveWeightVariance", renderSettings_.adaptiveWeightVariance);
+        renderSettings_.adaptiveWeightHistory = render.value("adaptiveWeightHistory", renderSettings_.adaptiveWeightHistory);
+        renderSettings_.adaptiveWeightMotion = render.value("adaptiveWeightMotion", renderSettings_.adaptiveWeightMotion);
+        renderSettings_.adaptiveWeightDisocclusion = render.value("adaptiveWeightDisocclusion", renderSettings_.adaptiveWeightDisocclusion);
+        renderSettings_.adaptiveWeightReactive = render.value("adaptiveWeightReactive", renderSettings_.adaptiveWeightReactive);
+        renderSettings_.adaptiveWeightEdge = render.value("adaptiveWeightEdge", renderSettings_.adaptiveWeightEdge);
+        renderSettings_.adaptiveWeightSpecular = render.value("adaptiveWeightSpecular", renderSettings_.adaptiveWeightSpecular);
+        renderSettings_.adaptiveWeightDI = render.value("adaptiveWeightDI", renderSettings_.adaptiveWeightDI);
+        renderSettings_.adaptiveWeightGI = render.value("adaptiveWeightGI", renderSettings_.adaptiveWeightGI);
+        renderSettings_.adaptiveWeightVolumetric = render.value("adaptiveWeightVolumetric", renderSettings_.adaptiveWeightVolumetric);
         renderSettings_.adaptiveQualityMode = static_cast<AdaptiveQualityMode>(render.value("adaptiveQualityMode", static_cast<uint32_t>(renderSettings_.adaptiveQualityMode)));
         renderSettings_.adaptiveGpuFrameTargetMs = render.value("adaptiveGpuFrameTargetMs", renderSettings_.adaptiveGpuFrameTargetMs);
         renderSettings_.usePhysicalCamera = render.value("usePhysicalCamera", renderSettings_.usePhysicalCamera);

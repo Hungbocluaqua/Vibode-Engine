@@ -3188,7 +3188,12 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
                     ImGui::Text("%.3f ms", ms);
                 };
                 timingRow("Path Trace", timings.pathTraceMs);
-                timingRow("ReSTIR DI", timings.restirSpatialMs);
+                timingRow("ReSTIR DI",
+                    timings.restirDiTemporalMs +
+                    timings.restirDiSpatialMs +
+                    timings.restirDiFinalMs +
+                    timings.restirDiHistoryCopyMs +
+                    timings.restirDiCountersReadbackMs);
                 timingRow("ReSTIR GI",
                     timings.restirGiTemporalMs +
                     timings.restirGiSpatialMs +

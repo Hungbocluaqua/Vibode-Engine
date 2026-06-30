@@ -13,6 +13,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 
 namespace rtv {
@@ -36,6 +37,32 @@ void endCommandBufferLabel(VkCommandBuffer commandBuffer) {
     if (vkCmdEndDebugUtilsLabelEXT != nullptr && commandBuffer != VK_NULL_HANDLE) {
         vkCmdEndDebugUtilsLabelEXT(commandBuffer);
     }
+}
+
+bool commandTraceEnabled() {
+    static const bool enabled = [] {
+#if defined(_WIN32)
+        char* value = nullptr;
+        size_t length = 0;
+        if (_dupenv_s(&value, &length, "RTV_MAIN_LOOP_TRACE") != 0 || value == nullptr) {
+            return false;
+        }
+        const bool result = value[0] != '\0' && value[0] != '0';
+        std::free(value);
+        return result;
+#else
+        const char* value = std::getenv("RTV_MAIN_LOOP_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+#endif
+    }();
+    return enabled;
+}
+
+void traceCommandPhase(const char* phase) {
+    if (!commandTraceEnabled()) {
+        return;
+    }
+    std::cout << "COMMAND_SYSTEM phase=" << phase << '\n' << std::flush;
 }
 
 } // namespace
@@ -69,10 +96,12 @@ CommandSystem::~CommandSystem() {
 
 void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     FrameResources& frame = frames_[frameIndex_];
+    traceCommandPhase("wait_fence_begin");
     {
         ScopedNsightRange range("Frame.WaitForFence");
         checkVk(vkWaitForFences(context_.device(), 1, &frame.inFlight, VK_TRUE, UINT64_MAX), "vkWaitForFences");
     }
+    traceCommandPhase("wait_fence_end");
 
     uint32_t imageIndex = 0;
     VkResult acquireResult = VK_SUCCESS;
@@ -81,6 +110,7 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
         imageIndex = headlessImageIndex_;
         headlessImageIndex_ = (headlessImageIndex_ + 1) % swapchain_.imageCount();
     } else {
+        traceCommandPhase("acquire_image_begin");
         ScopedNsightRange range("Frame.AcquireSwapchainImage");
         acquireResult = vkAcquireNextImageKHR(
             context_.device(),
@@ -95,14 +125,18 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
             return;
         }
         checkVk(acquireResult, "vkAcquireNextImageKHR");
+        traceCommandPhase("acquire_image_end");
     }
 
+    traceCommandPhase("reset_begin");
     checkVk(vkResetFences(context_.device(), 1, &frame.inFlight), "vkResetFences");
     checkVk(vkResetCommandPool(context_.device(), frame.commandPool, 0), "vkResetCommandPool");
     if (frame.computeCommandPool != VK_NULL_HANDLE) {
         checkVk(vkResetCommandPool(context_.device(), frame.computeCommandPool, 0), "vkResetCommandPool(compute)");
     }
+    traceCommandPhase("reset_end");
     if (pathTracer_ != nullptr) {
+        traceCommandPhase("path_tracer_begin_frame_prepare_begin");
         pathTracer_->refreshMemoryPressureQuality();
         VkExtent2D displayExtent = swapchain_.extent();
         if (uiOverlay_ != nullptr) {
@@ -123,21 +157,35 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
             uiOverlay_->invalidateViewportTexture();
         }
         pathTracer_->setFrameDeltaSeconds(deltaSeconds);
+        traceCommandPhase("path_tracer_begin_frame_begin");
         pathTracer_->beginFrame(frameIndex_, renderExtent, displayExtent);
+        traceCommandPhase("path_tracer_begin_frame_end");
         pathTracer_->markStreamlineReflexSimulationStart();
         pathTracer_->markStreamlineReflexSimulationEnd();
     } else if (pipelineDemo_ != nullptr) {
         pipelineDemo_->beginFrame(frameIndex_);
     }
+    traceCommandPhase("prepare_nvperf_begin");
     prepareNsightPerfFrame();
+    traceCommandPhase("prepare_nvperf_end");
+    traceCommandPhase("record_work_begin");
     recordWorkCommands(frame.commandBuffer, imageIndex, clearPhase);
+    traceCommandPhase("record_work_end");
+    traceCommandPhase("record_async_begin");
     const bool asyncComputeRecorded = recordAsyncComputeCommands(frame);
+    traceCommandPhase("record_async_end");
+    traceCommandPhase("record_presentation_begin");
     recordPresentationCommands(frame.postCommandBuffer, imageIndex, clearPhase);
+    traceCommandPhase("record_presentation_end");
     if (pathTracer_ != nullptr) {
         pathTracer_->markStreamlineReflexRenderSubmitStart();
     }
+    traceCommandPhase("begin_nvperf_begin");
     beginNsightPerfFrame(context_.graphicsQueue(), context_.queueFamilies().graphics.value());
+    traceCommandPhase("begin_nvperf_end");
+    traceCommandPhase("submit_begin");
     submitFrame(frame, imageIndex, asyncComputeRecorded);
+    traceCommandPhase("submit_end");
     endNsightPerfFrame();
     if (pathTracer_ != nullptr) {
         pathTracer_->markStreamlineReflexRenderSubmitEnd();
@@ -162,8 +210,10 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     }
     VkResult presentResult = VK_SUCCESS;
     {
+        traceCommandPhase("present_begin");
         ScopedNsightRange range("QueuePresent");
         presentResult = vkQueuePresentKHR(context_.presentQueue(), &presentInfo);
+        traceCommandPhase("present_end");
     }
     if (pathTracer_ != nullptr) {
         pathTracer_->markStreamlineReflexPresentEnd();
@@ -304,12 +354,16 @@ void CommandSystem::recordWorkCommands(VkCommandBuffer commandBuffer, uint32_t, 
     checkVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer");
 
     if (pathTracer_ != nullptr) {
+        traceCommandPhase("record_path_trace_begin");
         pathTracer_->recordPathTrace(commandBuffer, canRecordAsyncCompute());
+        traceCommandPhase("record_path_trace_end");
     } else if (pipelineDemo_ != nullptr) {
         pipelineDemo_->recordCompute(commandBuffer, clearPhase);
     }
 
+    traceCommandPhase("end_command_buffer_begin");
     checkVk(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+    traceCommandPhase("end_command_buffer_end");
 }
 
 void CommandSystem::recordPresentationCommands(VkCommandBuffer commandBuffer, uint32_t imageIndex, float clearPhase) const {

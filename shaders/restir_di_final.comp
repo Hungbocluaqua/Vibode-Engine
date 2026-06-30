@@ -361,8 +361,11 @@ void replace_direct_lighting(
         uint kind = restir_di_light_kind(selected);
         vec3 guideDirection;
         float guideDistance;
-        if (kind == 2u) {
+        if (kind == RESTIR_DI_LIGHT_DIRECTIONAL) {
             guideDirection = normalize(guideLight.data1.xyz);
+            guideDistance = 10000.0;
+        } else if (restir_di_light_kind_infinite(kind)) {
+            guideDirection = normalize(selected.samplePosition_distance.xyz);
             guideDistance = 10000.0;
         } else {
             vec3 toLight = selected.samplePosition_distance.xyz - receiver.worldPosition_depth.xyz;
@@ -546,6 +549,11 @@ void main() {
 
     // Reference mode always validates visibility. Production validates any
     // shifted sample whose visibility is no longer current at this receiver.
+    if (params.visibilityPolicy == 0u &&
+        visibility == RESTIR_DI_VISIBILITY_UNKNOWN &&
+        restir_di_light_kind_infinite(selectedKind)) {
+        visibility = RESTIR_DI_VISIBILITY_VISIBLE;
+    }
     bool needsVisibility = params.visibilityPolicy == 1u ||
         visibility == RESTIR_DI_VISIBILITY_UNKNOWN;
     if (needsVisibility && params.visibilityRayBudget > 0u &&

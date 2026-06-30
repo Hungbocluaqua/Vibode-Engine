@@ -17,6 +17,7 @@ public:
     ~PipelineCache();
 
     [[nodiscard]] VkPipelineCache handle() const { return cache_; }
+    bool mergeFrom(const PipelineCache& source);
     bool saveToFile(const std::filesystem::path& path) const;
     [[nodiscard]] static std::vector<uint8_t> loadFromFile(const std::filesystem::path& path);
 
@@ -25,6 +26,7 @@ private:
 
     VkDevice device_ = VK_NULL_HANDLE;
     VkPipelineCache cache_ = VK_NULL_HANDLE;
+    bool persistentFileWritesEnabled_ = true;
 };
 
 } // namespace rtv

@@ -50,7 +50,7 @@ struct alignas(16) CameraUniform {
     glm::vec4 sunDirectionIlluminance{0.0f, 0.8240f, -0.5661f, 100000.0f};
     glm::vec4 sunColorAngularRadius{1.0f, 1.0f, 1.0f, 0.00465f};
     glm::uvec4 restirGiControls{24u, 0u, 0u, 1u}; // x = max age, y bits: 0 half-res, 1 enabled, 2 receiver buffer, 3 legacy cache, z = visibility rays, w = specular AA
-    glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, z bits: 0 RT counters, 1 DI estimator, 2 HW backface culling, 3 final-bounce fast path, w = caustic visibility
+    glm::uvec4 pathTraceControls{1u, 1u, 0u, 0u}; // x = requested SPP, y = limit to 1 SPP, z bits include RT counters, ReSTIR DI, kernel options, adaptive sample-count buffer; w = caustic visibility
     glm::vec4 dofControls{0.0f, 10.0f, 0.0f, 0.0f}; // x = aperture radius, y = focus distance, z = blade count, w = bokeh rotation
     glm::vec4 motionBlurControls{0.0f, 0.0f, 1.0f, 0.0f}; // x = enabled, y = shutter open, z = shutter close, w = external denoiser raw input
     glm::vec4 volumeControls{0.0f, 0.0f, 0.0f, 0.0f}; // x = enabled, y = sigma_s, z = sigma_a, w = anisotropy
@@ -266,6 +266,7 @@ public:
     [[nodiscard]] Buffer& envParamsBuffer() { return *envParamsBuffer_; }
     [[nodiscard]] Buffer& lightBvhNodes() { return *lightBvhNodes_; }
     [[nodiscard]] Image& environmentImage() { return *environmentImage_; }
+    [[nodiscard]] const Buffer& lightRecords() const { return *lightRecords_; }
     [[nodiscard]] const Buffer& meshRecords() const { return *meshRecords_; }
     [[nodiscard]] const Buffer& primitiveRecords() const { return *primitiveRecords_; }
     [[nodiscard]] const Buffer& instanceRecords() const { return *instanceRecords_; }
@@ -277,6 +278,8 @@ public:
     [[nodiscard]] const Buffer& localTriangles() const { return *localTriangles_; }
     [[nodiscard]] const Buffer& tlasNodes() const { return *tlasNodes_; }
     [[nodiscard]] const Buffer& tlasInstanceIndices() const { return *tlasInstanceIndices_; }
+    [[nodiscard]] const Buffer& meshParamsBuffer() const { return *meshParamsBuffer_; }
+    [[nodiscard]] const Buffer& lightBvhNodes() const { return *lightBvhNodes_; }
     [[nodiscard]] VkSampler environmentSampler() const { return environmentSampler_; }
     [[nodiscard]] const std::vector<VkDescriptorImageInfo>& materialTextureDescriptors() const { return materialTextureTable_.descriptors(); }
     [[nodiscard]] std::vector<VkDescriptorImageInfo> materialCombinedDescriptors() const;

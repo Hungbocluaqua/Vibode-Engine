@@ -38,6 +38,20 @@ layout(set = 0, binding = 3, std430) readonly buffer Receivers { RestirGiReceive
 layout(set = 0, binding = 4, std430) readonly buffer PreviousReceivers { RestirGiReceiver previous_receivers[]; };
 layout(set = 0, binding = 5, std430) buffer RestirGiCounterBuffer { uint restir_gi_counters[]; };
 layout(set = 0, binding = 6, std430) buffer ActiveTileMask { uint active_tile_mask[]; };
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
+};
+layout(set = 0, binding = 7, std430) readonly buffer PathDataBuffer { PathDataRecord path_data[]; };
 const uint GI_COUNTER_TEMPORAL_PIXELS = 0u;
 const uint GI_COUNTER_TEMPORAL_CURRENT_VALID = 1u;
 const uint GI_COUNTER_TEMPORAL_PREVIOUS_VALID = 2u;
@@ -171,7 +185,7 @@ bool trace_visibility(RestirGiReceiver receiver, ProdRestirGiReservoir reservoir
     return visibility == RESTIR_DI_VISIBILITY_VISIBLE;
 }
 
-ProdRestirGiReservoir convert_current(RestirGiReservoir legacy, RestirGiReceiver receiver) {
+ProdRestirGiReservoir convert_current(RestirGiReservoir legacy, RestirGiReceiver receiver, uint sourceIndex) {
     ProdRestirGiReservoir result = prod_empty_reservoir();
 #if RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT
     if (!restir_gi_reservoir_valid(legacy)) return result;
@@ -203,6 +217,56 @@ ProdRestirGiReservoir convert_current(RestirGiReservoir legacy, RestirGiReceiver
     vec3 wi;
     float distance;
     if (!restir_gi_reconnect_sample(result, receiver, pc.cameraPosition.xyz, wi, distance)) return prod_empty_reservoir();
+#else
+    if (!restir_gi_reservoir_valid(legacy) || !restir_gi_receiver_valid_for_reuse(receiver)) return result;
+
+    bool glossyPath = restir_gi_receiver_roughness(receiver) < 0.65 ||
+        restir_gi_receiver_metallic(receiver) > 0.35;
+    vec3 sourceDirection = normalize(glossyPath
+        ? path_data[sourceIndex].specular_ray_direction_hit_distance.xyz
+        : path_data[sourceIndex].diffuse_ray_direction_hit_distance.xyz);
+    vec3 x2Normal = restir_gi_normal(legacy);
+    float distance = restir_gi_hit_distance(legacy);
+    bool environment = distance <= 1.0e-5;
+    uint pathClass = environment
+        ? PROD_PATH_CLASS_ENVIRONMENT_REUSABLE
+        : (glossyPath
+            ? PROD_PATH_CLASS_GLOSSY_REUSABLE
+            : PROD_PATH_CLASS_DIFFUSE_REUSABLE);
+    float target = max(restir_gi_target_pdf(legacy), 1.0e-8);
+    float weightSum = max(legacy.radiance_weight_sum.w, 0.0);
+    float sourcePdf = target / max(weightSum, 1.0e-8);
+    float sourceBsdfPdf = sourcePdf;
+    float measureFactor = 1.0;
+    vec3 x2Position = sourceDirection;
+    if (!environment) {
+        float d = max(distance, 1.0e-4);
+        float x2Cos = max(dot(x2Normal, -sourceDirection), 1.0e-5);
+        sourceBsdfPdf = sourcePdf * d * d / x2Cos;
+        measureFactor = x2Cos / (d * d);
+        x2Position = restir_gi_receiver_position(receiver) + sourceDirection * d;
+    }
+    vec3 selectedIntegrand = max(legacy.radiance_weight_sum.rgb, vec3(0.0));
+    vec3 receiverFactor = restir_gi_receiver_factor(receiver, pc.cameraPosition.xyz, sourceDirection);
+    vec3 suffix = selectedIntegrand / max(receiverFactor * measureFactor, vec3(1.0e-8));
+    if (!restir_gi_finite3(suffix) || sourcePdf <= 0.0 || sourceBsdfPdf <= 0.0) return result;
+
+    result.x2PositionDistance = vec4(x2Position, environment ? -1.0 : distance);
+    result.x2NormalRoughness = vec4(x2Normal, restir_gi_roughness(legacy));
+    result.suffixRadianceSourcePdf = vec4(max(suffix, vec3(0.0)), sourcePdf);
+    result.sourceDirectionBsdfPdf = vec4(sourceDirection, sourceBsdfPdf);
+    result.selectedIntegrandTarget = vec4(selectedIntegrand, target);
+    uint reuseFlags = PROD_FLAG_VALID | PROD_FLAG_VISIBLE | PROD_FLAG_VISIBILITY_KNOWN |
+        (restir_gi_flags(legacy) & PROD_FLAG_ALPHA_TESTED) |
+        (environment ? PROD_FLAG_ENVIRONMENT : 0u);
+    result.reservoirData = vec4(
+        weightSum,
+        max(restir_gi_sample_count(legacy), 1.0),
+        uintBitsToFloat(prod_pack_meta(restir_gi_age(legacy), reuseFlags, pathClass, 1.0)),
+        uintBitsToFloat(restir_gi_receiver_version_hash(receiver)));
+    vec3 wi;
+    float reconnectedDistance;
+    if (!restir_gi_reconnect_sample(result, receiver, pc.cameraPosition.xyz, wi, reconnectedDistance)) return prod_empty_reservoir();
 #endif
     return result;
 }
@@ -228,7 +292,7 @@ void main() {
     if (inBounds) {
         receiver = receivers[sourceIndex];
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_TEMPORAL_PIXELS], 1u);
-        current = convert_current(current_reservoirs[sourceIndex], receiver);
+        current = convert_current(current_reservoirs[sourceIndex], receiver, sourceIndex);
         currentValid = prod_reservoir_valid(current);
         currentActive = currentValid && restir_gi_receiver_valid_for_reuse(receiver);
     }

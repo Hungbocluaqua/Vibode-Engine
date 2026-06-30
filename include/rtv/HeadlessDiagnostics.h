@@ -102,6 +102,9 @@ struct ProfileReport {
         float restirGiUpsample = 0.0f;
         float restirGiFinal = 0.0f;
         float restirGiCountersReadback = 0.0f;
+        float regirBuild = 0.0f;
+        float regirSpatialReuse = 0.0f;
+        float regirTemporalReuse = 0.0f;
         float restirDiTemporal = 0.0f;
         float restirDiSpatial = 0.0f;
         float restirDiFinal = 0.0f;
@@ -117,6 +120,8 @@ struct ProfileReport {
         float atmosphereAerialPerspective = 0.0f;
         float denoiser = 0.0f;
         float momentUpdate = 0.0f;
+        float adaptiveSamplingDiagnostics = 0.0f;
+        float adaptiveSamplingFill = 0.0f;
         float historyCopy = 0.0f;
         float skipDenoiserCopy = 0.0f;
         float taa = 0.0f;
@@ -757,6 +762,40 @@ struct ProfileReport {
         uint32_t denoiserMaxHistoryLength = 0;
     } memoryPressureQuality{};
 
+    struct AdaptiveSamplingReport {
+        bool active = false;
+        bool statsValid = false;
+        float requestedBudgetSpp = 0.0f;
+        float averageDensity = 0.0f;
+        float desiredSamplesPerPixel = 0.0f;
+        float actualSamplesPerPixel = 0.0f;
+        float budgetErrorPercent = 0.0f;
+        uint32_t pixelCount = 0;
+        uint32_t actualSampleCount = 0;
+    } adaptiveSampling{};
+
+    struct RegirGridReport {
+        bool feedbackAvailable = false;
+        uint32_t activeCellCount = 0;
+        uint32_t hashCollisionCount = 0;
+        uint32_t hashSaturationCount = 0;
+        uint32_t hashCellCapacity = 0;
+        uint64_t totalCellCount = 0;
+        uint64_t denseReservoirBytes = 0;
+        uint64_t effectiveReservoirBytes = 0;
+        uint64_t backingBytes = 0;
+        uint32_t environmentBankSize = 0;
+        uint32_t sunBankSize = 0;
+        uint32_t validEnvironmentReservoirs = 0;
+        uint32_t validSunReservoirs = 0;
+        uint32_t environmentGeneration = 0;
+        uint32_t lightGeneration = 0;
+        uint64_t environmentBankBytes = 0;
+        bool environmentEffective = false;
+        bool sunEffective = false;
+        bool temporalHistoryValid = false;
+    } regirGrid{};
+
     struct NvidiaIntegrationReport {
         struct StreamlineFeatureReport {
             bool requestable = false;
@@ -857,6 +896,7 @@ struct ProfileReport {
         StreamlineTagReport streamlineDlssRayReconstructionTags;
         StreamlineEvaluationReport streamlineDlssEvaluation;
         StreamlineEvaluationReport streamlineDlssRayReconstructionEvaluation;
+        StreamlineEvaluationReport ngxDlssRayReconstructionEvaluation;
         StreamlineEvaluationReport streamlineNvPerfEvaluation;
         StreamlineReflexMarkerReport streamlineReflexMarkers;
         GpuCrashDumpReport gpuCrashDumps;

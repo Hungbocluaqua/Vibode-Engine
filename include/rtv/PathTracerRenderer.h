@@ -16,8 +16,10 @@
 #include <glm/glm.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -380,6 +382,7 @@ public:
         StreamlineTagSummary streamlineDlssRayReconstructionTags;
         StreamlineEvaluationSummary streamlineDlssEvaluation;
         StreamlineEvaluationSummary streamlineDlssRayReconstructionEvaluation;
+        StreamlineEvaluationSummary ngxDlssRayReconstructionEvaluation;
         StreamlineEvaluationSummary streamlineNvPerfEvaluation;
         StreamlineReflexMarkerSummary streamlineReflexMarkers;
         NsightPerfDiagnosticsReport nsightPerfSdk;
@@ -393,6 +396,56 @@ public:
     [[nodiscard]] float effectiveRenderResolutionScale() const;
     [[nodiscard]] bool hardwareRayTracingAvailable() const;
     [[nodiscard]] RayTracingRendererStats rayTracingStats() const;
+    struct RegirGridStats {
+        uint32_t activeCellCount = 0;
+        uint32_t hashCollisionCount = 0;
+        uint32_t hashSaturationCount = 0;
+        uint32_t hashCellCapacity = 0;
+        uint64_t totalCellCount = 0;
+        uint64_t denseReservoirBytes = 0;
+        uint64_t effectiveReservoirBytes = 0;
+        uint64_t backingBytes = 0;
+        bool feedbackAvailable = false;
+        uint32_t environmentBankSize = 0;
+        uint32_t sunBankSize = 0;
+        uint32_t validEnvironmentReservoirs = 0;
+        uint32_t validSunReservoirs = 0;
+        uint32_t environmentGeneration = 0;
+        uint32_t lightGeneration = 0;
+        uint64_t environmentBankBytes = 0;
+        bool environmentEffective = false;
+        bool sunEffective = false;
+        bool temporalHistoryValid = false;
+    };
+    [[nodiscard]] std::optional<RegirGridStats> regirGridStats() const;
+    struct AdaptiveSamplingStats {
+        uint32_t rawDensitySum256 = 0;
+        uint32_t pixelCount = 0;
+        uint32_t actualSampleCount = 0;
+        uint32_t desiredSampleSum64 = 0;
+        float averageDensity = 0.0f;
+        float averageDesiredSamplesPerPixel = 0.0f;
+        float averageActualSamplesPerPixel = 0.0f;
+    };
+    [[nodiscard]] std::optional<AdaptiveSamplingStats> adaptiveSamplingStats() const {
+        if (adaptiveSamplingStatsReadbackBuffer_.handle() == VK_NULL_HANDLE) return std::nullopt;
+        if (adaptiveSamplingStatsReadbackBuffer_.mappedData() == nullptr) return std::nullopt;
+        if (adaptiveSamplingStatsReadbackBuffer_.size() < sizeof(uint32_t) * 4u) return std::nullopt;
+        adaptiveSamplingStatsReadbackBuffer_.invalidate(sizeof(uint32_t) * 4u);
+        const auto* values = static_cast<const uint32_t*>(adaptiveSamplingStatsReadbackBuffer_.mappedData());
+        AdaptiveSamplingStats result{};
+        result.rawDensitySum256 = values[0];
+        result.pixelCount = values[1];
+        result.actualSampleCount = values[2];
+        result.desiredSampleSum64 = values[3];
+        if (result.pixelCount > 0u) {
+            const float invPixels = 1.0f / static_cast<float>(result.pixelCount);
+            result.averageDensity = static_cast<float>(result.rawDensitySum256) * invPixels / 256.0f;
+            result.averageDesiredSamplesPerPixel = static_cast<float>(result.desiredSampleSum64) * invPixels / 64.0f;
+            result.averageActualSamplesPerPixel = static_cast<float>(result.actualSampleCount) * invPixels;
+        }
+        return result;
+    }
     [[nodiscard]] RayTracingDiagnosticCounters rayTracingDiagnosticCounters() const;
     [[nodiscard]] const uint32_t* restirDiCounterData() const {
         if (restirDiCountersReadbackBuffer_.handle() == VK_NULL_HANDLE) return nullptr;
@@ -610,6 +663,8 @@ public:
 
 private:
     void ensureRayTracingVariantPipelines(bool restirDiValidationFull, bool restirGiInitialFull);
+    void ensureNative2BPathTracePipelines();
+    void finishNative2BPipelineBuild(bool finalizeSbt);
     void ensureWavefrontTracePipelines();
 
     struct DenoiserParams {
@@ -1085,12 +1140,50 @@ private:
     };
     static_assert(sizeof(GpuSkinningPush) == 36);
 
+    struct alignas(16) AdaptiveSamplingPush {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t debugView = 0;
+        uint32_t mode = 0;
+        glm::vec4 signalA{};
+        glm::vec4 signalB{};
+        glm::vec4 signalC{};
+    };
+    static_assert(sizeof(AdaptiveSamplingPush) == 64);
+
+    struct alignas(16) ReGIRParams {
+        glm::uvec4 gridDimensionsReservoirs{};
+        glm::uvec4 controls{};
+        glm::vec4 gridPadding{};
+        glm::vec4 queryControls{};
+        glm::uvec4 environmentControls{};
+    };
+    static_assert(sizeof(ReGIRParams) == 80);
+
+    struct alignas(16) ReGIRReservoirGpu {
+        glm::uvec4 metadata{};
+        glm::vec4 samplePositionWeight{};
+    };
+    static_assert(sizeof(ReGIRReservoirGpu) == 32);
+
+    struct alignas(16) ReGIREnvironmentReservoirGpu {
+        glm::uvec4 metadata{};
+        glm::vec4 directionPdf{};
+        glm::vec4 reservoirState{};
+    };
+    static_assert(sizeof(ReGIREnvironmentReservoirGpu) == 48);
+    static constexpr uint32_t kRegirEnvironmentBankSize = 64u;
+    static constexpr uint32_t kRegirSunBankSize = 64u;
+    static constexpr uint32_t kRegirInfiniteLightBankSize =
+        kRegirEnvironmentBankSize + kRegirSunBankSize;
+
     void createResolutionResources(VkExtent2D renderExtent, VkExtent2D displayExtent);
     void createRestirDiResources(VkDeviceSize pixelCount);
     void reconcileRestirDiResources();
     void retireResolutionResources();
     void releaseRetiredResolutionResources();
     void updateCamera();
+    void updateRegirParamsBuffer();
     void recordPathTraceGraph(VkCommandBuffer commandBuffer);
     [[nodiscard]] RayTracingSceneBuildOptions makeRayTracingSceneBuildOptions() const;
     [[nodiscard]] bool recordGpuSkinningPass(VkCommandBuffer commandBuffer);
@@ -1166,6 +1259,20 @@ private:
     void recordNrdResolvePass(VkCommandBuffer commandBuffer);
     void recordMomentUpdate(VkCommandBuffer commandBuffer);
     void recordMomentUpdatePass(VkCommandBuffer commandBuffer);
+    void recordAdaptiveSamplingPrepare(VkCommandBuffer commandBuffer);
+    void recordAdaptiveSamplingDiagnostics(VkCommandBuffer commandBuffer);
+    void recordAdaptiveSamplingDiagnosticsPass(VkCommandBuffer commandBuffer, bool profile = true);
+    void recordAdaptiveSamplingFill(VkCommandBuffer commandBuffer);
+    void recordAdaptiveSamplingFillPass(VkCommandBuffer commandBuffer);
+    void recordRegirBuildPass(VkCommandBuffer commandBuffer);
+    void recordRegirEnvironmentBuildPass(VkCommandBuffer commandBuffer);
+    void recordRegirActiveCellsClearPass(VkCommandBuffer commandBuffer);
+    void recordRegirActiveCellsReadbackPass(VkCommandBuffer commandBuffer);
+    void recordRegirHashCellsClearPass(VkCommandBuffer commandBuffer, bool clearCurrentTable);
+    void recordRegirHashCellsReadbackPass(VkCommandBuffer commandBuffer);
+    void recordRegirSpatialReusePass(VkCommandBuffer commandBuffer);
+    void recordRegirTemporalReusePass(VkCommandBuffer commandBuffer);
+    void recordRegirTemporalHistoryCopyPass(VkCommandBuffer commandBuffer);
     void recordTaa(VkCommandBuffer commandBuffer, bool deferHistoryCopy = false);
     void recordTaaPass(VkCommandBuffer commandBuffer);
     void copyTaaHistory(VkCommandBuffer commandBuffer);
@@ -1213,12 +1320,28 @@ private:
     [[nodiscard]] bool shouldRunDenoiser() const;
     [[nodiscard]] bool nrdRequested() const;
     [[nodiscard]] bool shouldRunNrdDenoiser() const;
+    [[nodiscard]] bool isAdaptiveSamplingDebugView() const;
+    [[nodiscard]] bool shouldRunAdaptiveSamplingPrepass() const;
+    [[nodiscard]] bool shouldRunAdaptiveSamplingDiagnostics() const;
+    [[nodiscard]] bool shouldRunAdaptiveSamplingFill() const;
+    [[nodiscard]] bool shouldUseRegir() const;
+    [[nodiscard]] bool shouldUseRegirEnvironment() const;
+    [[nodiscard]] bool shouldUseRegirActiveGrid() const;
+    [[nodiscard]] bool shouldUseRegirHashGrid() const;
+    [[nodiscard]] uint32_t regirHashCellCapacity() const;
+    [[nodiscard]] uint32_t regirStorageCellCapacity() const;
+    [[nodiscard]] bool shouldUseRegirSpatialReuse() const;
+    [[nodiscard]] bool shouldUseRegirTemporalReuse() const;
     [[nodiscard]] bool isNonDenoiserDebugView() const;
     [[nodiscard]] bool shouldBypassTemporalUpscalerForDebugView() const;
     [[nodiscard]] bool shouldRunTaa() const;
     [[nodiscard]] bool dlssRequested() const;
     [[nodiscard]] bool shouldRunDlss() const;
     [[nodiscard]] bool shouldRunDlssRayReconstruction() const;
+    [[nodiscard]] bool shouldUseGenericBeautyFastPath(bool restirDiValidationFull, bool restirGiInitialFull) const;
+    [[nodiscard]] bool shouldUseRegirBeautyFastPath(bool restirDiValidationFull, bool restirGiInitialFull) const;
+    [[nodiscard]] bool shouldTraceRegirFiniteLightsThisFrame() const;
+    [[nodiscard]] bool native2BSettingsEligible() const;
     [[nodiscard]] bool shouldUseNative2BPathTraceKernel() const;
     [[nodiscard]] bool shouldRunRestirSpatial() const;
     [[nodiscard]] bool shouldUseRestirGiReservoirs() const;
@@ -1259,6 +1382,7 @@ private:
     [[nodiscard]] bool effectiveRestirGiHalfResolution() const;
     [[nodiscard]] uint32_t effectiveDenoiserMaxHistoryLength() const;
     [[nodiscard]] VkDeviceSize restirGiReservoirStride() const;
+    [[nodiscard]] const Image& adaptiveDenoiserInputImage() const;
     [[nodiscard]] const Image& postDenoiseImage() const;
     [[nodiscard]] const Image& hdrPostProcessImage() const;
     void initializeNrdRuntime();
@@ -1314,6 +1438,8 @@ private:
         GpuProfiler::Query profilerEnd = GpuProfiler::WavefrontTraceEnd);
     void recordWavefrontDirectLightingValidationPass(VkCommandBuffer commandBuffer);
     void recordWavefrontTraceValidationPass(VkCommandBuffer commandBuffer);
+    [[nodiscard]] bool entityIdPickReadbackSourceOffset(VkDeviceSize& sourceOffset) const;
+    void recordEntityIdPickReadbackCopyPass(VkCommandBuffer commandBuffer, VkDeviceSize sourceOffset);
     [[nodiscard]] VkPipelineStageFlags2 pathTraceShaderStage() const;
 
     struct PendingPickRequest {
@@ -1387,6 +1513,11 @@ private:
     bool taaHistoryRotationPending_ = false;
     bool restirGiHistoryValid_ = false;
     bool restirDiHistoryValid_ = false;
+    bool regirTemporalHistoryValid_ = false;
+    bool regirActiveCellFeedbackValid_ = false;
+    bool regirHashTablesValid_ = false;
+    bool regirHashRotationPending_ = false;
+    glm::uvec4 regirTemporalHistoryVersion_{0u, 0u, 0u, 0u};
     bool restirGiUncompressedLayout_ = false;
     bool restirGiActiveTileMaskAutoEnabled_ = false;
     uint32_t restirGiActiveTileMaskAutoFrame_ = 0;
@@ -1422,6 +1553,9 @@ private:
     Image historyLengthResolvedImage_;
     Image momentDebugImage_;
     Image momentDebugResolvedImage_;
+    Image adaptiveSamplingDebugImage_;
+    Image adaptiveSamplingFilledMaskImage_;
+    Image adaptiveSamplingFilledImage_;
     Image taaImage_;
     Image taaHistoryImage_;
     Image dlssDepthImage_;
@@ -1451,7 +1585,22 @@ private:
     Buffer previousWorldPositionBuffer_;
     Buffer velocityBuffer_;
     Buffer entityIdBuffer_;
+    Buffer entityIdReadbackBuffer_;
     Buffer pathDataBuffer_;
+    Buffer adaptiveSamplingDensityBuffer_;
+    Buffer adaptiveSamplingSampleCountBuffer_;
+    Buffer adaptiveSamplingStatsBuffer_;
+    Buffer adaptiveSamplingStatsReadbackBuffer_;
+    Buffer regirParamsBuffer_;
+    Buffer regirReservoirBuffer_;
+    Buffer regirEnvironmentReservoirBuffer_;
+    Buffer regirSpatialReservoirBuffer_;
+    Buffer regirTemporalReservoirBuffer_;
+    Buffer regirPreviousReservoirBuffer_;
+    Buffer regirActiveCellBuffer_;
+    Buffer regirActiveCellReadbackBuffer_;
+    Buffer regirHashCurrentCellBuffer_;
+    Buffer regirHashNextCellBuffer_;
     Buffer streamingResetMaskBuffer_;
     Buffer streamingResetInstanceMaskBuffer_;
     Buffer rayTracingDiagnosticCountersBuffer_;
@@ -1536,10 +1685,17 @@ private:
     VkSampler nearestSampler_ = VK_NULL_HANDLE;
     std::vector<uint8_t> stbnScalarAtlas_;
     std::unique_ptr<DescriptorLayoutCache> layoutCache_;
-    std::unique_ptr<PipelineCache> pipelineCache_;
+    std::shared_ptr<PipelineCache> pipelineCache_;
     std::unique_ptr<AtmosphereLutSystem> atmosphereLutSystem_;
     std::unique_ptr<ShaderModule> denoiserShader_;
     std::unique_ptr<ShaderModule> momentUpdateShader_;
+    std::unique_ptr<ShaderModule> adaptiveSamplingShader_;
+    std::unique_ptr<ShaderModule> adaptiveSamplingDiscretizeShader_;
+    std::unique_ptr<ShaderModule> adaptiveSamplingFillShader_;
+    std::unique_ptr<ShaderModule> regirBuildShader_;
+    std::unique_ptr<ShaderModule> regirEnvironmentBuildShader_;
+    std::unique_ptr<ShaderModule> regirSpatialReuseShader_;
+    std::unique_ptr<ShaderModule> regirTemporalReuseShader_;
     std::unique_ptr<ShaderModule> taaShader_;
     std::unique_ptr<ShaderModule> gpuSkinningShader_;
     std::unique_ptr<ShaderModule> dlssGuidesShader_;
@@ -1578,6 +1734,9 @@ private:
     std::unique_ptr<ShaderModule> fullscreenVertexShader_;
     std::unique_ptr<ShaderModule> fullscreenFragmentShader_;
     std::unique_ptr<ShaderModule> raygenShader_;
+    std::unique_ptr<ShaderModule> raygenBeautyFastShader_;
+    std::unique_ptr<ShaderModule> raygenRegirBeautyFastShader_;
+    std::unique_ptr<ShaderModule> raygenRegirStochasticBeautyFastShader_;
     std::unique_ptr<ShaderModule> raygenNative2BShader_;
     std::unique_ptr<ShaderModule> raygenNative2BCompactPrimaryLightsShader_;
     std::unique_ptr<ShaderModule> raygenDiagnosticShader_;
@@ -1618,6 +1777,13 @@ private:
     std::unique_ptr<ShaderModule> wavefrontSortShader_;
     std::unique_ptr<ComputePipeline> denoiserPipeline_;
     std::unique_ptr<ComputePipeline> momentUpdatePipeline_;
+    std::unique_ptr<ComputePipeline> adaptiveSamplingPipeline_;
+    std::unique_ptr<ComputePipeline> adaptiveSamplingDiscretizePipeline_;
+    std::unique_ptr<ComputePipeline> adaptiveSamplingFillPipeline_;
+    std::unique_ptr<ComputePipeline> regirBuildPipeline_;
+    std::unique_ptr<ComputePipeline> regirEnvironmentBuildPipeline_;
+    std::unique_ptr<ComputePipeline> regirSpatialReusePipeline_;
+    std::unique_ptr<ComputePipeline> regirTemporalReusePipeline_;
     std::unique_ptr<ComputePipeline> taaPipeline_;
     std::unique_ptr<ComputePipeline> gpuSkinningPipeline_;
     std::unique_ptr<ComputePipeline> dlssGuidesPipeline_;
@@ -1657,8 +1823,28 @@ private:
     std::unique_ptr<ComputePipeline> wavefrontSortPipeline_;
     std::unique_ptr<GraphicsPipeline> graphicsPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingBeautyFastPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingRegirBeautyFastPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingRegirStochasticBeautyFastPipeline_;
+    enum class Native2BPipelineVariant {
+        Base,
+        CompactPrimaryLights,
+        Diagnostic,
+    };
+    struct Native2BPipelineBuildResult {
+        std::unique_ptr<PipelineCache> cache;
+        std::unique_ptr<RayTracingPipeline> pipeline;
+    };
+    struct Native2BPipelineBuildJob {
+        Native2BPipelineVariant variant = Native2BPipelineVariant::Base;
+        std::future<Native2BPipelineBuildResult> future;
+    };
     std::unique_ptr<RayTracingPipeline> rayTracingNative2BPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingNative2BCompactPrimaryLightsPipeline_;
+    std::optional<Native2BPipelineBuildJob> native2BPipelineBuildJob_;
+    bool native2BBasePipelineBuildFailed_ = false;
+    bool native2BCompactPipelineBuildFailed_ = false;
+    bool native2BDiagnosticPipelineBuildFailed_ = false;
     std::unique_ptr<RayTracingPipeline> rayTracingDiagnosticPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingDiagnosticFullPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingDiagnosticGiFullPipeline_;
@@ -1680,6 +1866,13 @@ private:
     VkDescriptorSetLayout rayTracingSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout denoiserSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout momentUpdateSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout adaptiveSamplingSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout adaptiveSamplingDiscretizeSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout adaptiveSamplingFillSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout regirBuildSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout regirEnvironmentBuildSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout regirSpatialReuseSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout regirTemporalReuseSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout taaSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout gpuSkinningSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dlssGuidesSetLayout_ = VK_NULL_HANDLE;
@@ -1719,8 +1912,15 @@ private:
     GpuProfiler* currentProfiler_ = nullptr;
     RendererValidationLog validationLog_;
     std::unique_ptr<ShaderCompiler> shaderCompiler_;
-    std::vector<std::filesystem::path> shaderSources_;
+    struct ShaderReloadDependency {
+        std::filesystem::path source;
+        std::filesystem::path output;
+        std::vector<std::pair<std::string, std::string>> extraDefines;
+    };
+    std::vector<ShaderReloadDependency> shaderReloadDependencies_;
     std::filesystem::path shaderOutputDirectory_;
+    std::chrono::steady_clock::time_point lastShaderReloadCheck_{};
+    bool shaderReloadCheckPrimed_ = false;
     uint32_t selectedInstanceId_ = UINT32_MAX;
     StreamingResetMaskReport streamingResetMaskReport_{};
     std::unique_ptr<NrdRuntime> nrdRuntime_;
@@ -1751,6 +1951,7 @@ private:
     StreamlineTagSummary streamlineDlssRayReconstructionTags_{};
     StreamlineEvaluationSummary streamlineDlssEvaluation_{};
     StreamlineEvaluationSummary streamlineDlssRayReconstructionEvaluation_{};
+    StreamlineEvaluationSummary ngxDlssRayReconstructionEvaluation_{};
     StreamlineEvaluationSummary streamlineNvPerfEvaluation_{};
     StreamlineReflexMarkerSummary streamlineReflexMarkers_{};
     bool streamlineNvPerfConstantsAccepted_ = false;

@@ -1,0 +1,156 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+const uint DEBUG_VIEW_ADAPTIVE_DENSITY_MAP = 129u;
+const uint DEBUG_VIEW_ADAPTIVE_SAMPLE_COUNT = 130u;
+const uint DEBUG_VIEW_ADAPTIVE_UNSAMPLED_PIXELS = 131u;
+const uint DEBUG_VIEW_ADAPTIVE_FILLED_IMAGE = 132u;
+const uint DEBUG_VIEW_ADAPTIVE_DISOCCLUSION_MASK = 133u;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D input_color;
+layout(set = 0, binding = 1, std430) buffer AdaptiveDensityBuffer { float adaptive_density[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer AdaptiveSampleCountBuffer { uint adaptive_sample_count[]; };
+layout(set = 0, binding = 3, std430) buffer AdaptiveStatsBuffer { uint adaptive_stats[]; };
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D output_debug;
+layout(set = 0, binding = 5, r32f) writeonly uniform image2D output_filled_mask;
+
+layout(push_constant) uniform AdaptiveSamplingParams {
+    uint width;
+    uint height;
+    uint debug_view;
+    uint mode;
+    vec4 signal_a; // x=budget, y=variance, z=history, w=motion
+    vec4 signal_b;
+    vec4 signal_c; // w=frame index
+} params;
+
+shared float shared_density_scale;
+
+float hash01(uvec3 v) {
+    uint x = v.x * 1664525u + v.y * 1013904223u + v.z * 747796405u + 2891336453u;
+    x ^= x >> 16u;
+    x *= 2246822519u;
+    x ^= x >> 13u;
+    x *= 3266489917u;
+    x ^= x >> 16u;
+    return float(x & 0x00ffffffu) / float(0x01000000u);
+}
+
+vec3 heatmap(float v) {
+    v = clamp(v, 0.0, 1.0);
+    vec3 a = mix(vec3(0.02, 0.08, 0.22), vec3(0.0, 0.65, 0.78), smoothstep(0.0, 0.45, v));
+    return mix(a, vec3(1.0, 0.72, 0.08), smoothstep(0.45, 1.0, v));
+}
+
+float density_bin_value(uint bin_index) {
+    if (bin_index >= 15u) {
+        return 1.0;
+    }
+    return (float(bin_index) + 0.5) / 16.0;
+}
+
+float estimate_budget_for_scale(float scale, float pixel_count) {
+    float sum_value = 0.0;
+    for (uint i = 0u; i < 16u; ++i) {
+        float bin_density = density_bin_value(i);
+        sum_value += min(bin_density * scale, 4.0) * float(adaptive_stats[4u + i]);
+    }
+    return sum_value / max(pixel_count, 1.0);
+}
+
+float solve_budget_scale(float requested_budget, float average_density, float pixel_count) {
+    float target = clamp(requested_budget, 0.0, 4.0);
+    if (target <= 1.0e-5 || average_density <= 1.0e-5 || pixel_count <= 0.5) {
+        return 0.0;
+    }
+
+    float exact_scale = target / max(average_density, 1.0e-5);
+    if (exact_scale <= 4.0) {
+        return exact_scale;
+    }
+
+    float lo = 0.0;
+    float hi = max(exact_scale, 1.0);
+    for (uint i = 0u; i < 12u && estimate_budget_for_scale(hi, pixel_count) < target; ++i) {
+        hi *= 2.0;
+    }
+    for (uint i = 0u; i < 18u; ++i) {
+        float mid = 0.5 * (lo + hi);
+        if (estimate_budget_for_scale(mid, pixel_count) < target) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return hi;
+}
+
+vec4 average_sampled_neighbor_color(ivec2 coords, ivec2 dims) {
+    vec3 sum_value = vec3(0.0);
+    float sum_weight = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            ivec2 sample_coords = clamp(coords + ivec2(x, y), ivec2(0), dims - ivec2(1));
+            vec4 raw = imageLoad(input_color, sample_coords);
+            if (raw.a < 0.0) {
+                continue;
+            }
+            float weight = 1.0 / (1.0 + float(x * x + y * y));
+            sum_value += max(raw.rgb, vec3(0.0)) * weight;
+            sum_weight += weight;
+        }
+    }
+    if (sum_weight <= 1.0e-5) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    return vec4(sum_value / sum_weight, 1.0);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(int(params.width), int(params.height));
+    float budget = clamp(params.signal_a.x, 0.0, 4.0);
+    uint reduced_sum = max(adaptive_stats[0], 1u);
+    uint reduced_count = max(adaptive_stats[1], 1u);
+    float average_density = float(reduced_sum) / (256.0 * float(reduced_count));
+    if (gl_LocalInvocationIndex == 0u) {
+        shared_density_scale = solve_budget_scale(budget, average_density, float(reduced_count));
+    }
+    barrier();
+    if (coords.x >= dims.x || coords.y >= dims.y) {
+        return;
+    }
+
+    uint pixel_index = uint(coords.y) * params.width + uint(coords.x);
+    float density = clamp(adaptive_density[pixel_index], 0.0, 1.0);
+    float desired_samples = params.mode == 0u || params.signal_c.w <= 1.0 || average_density <= 1.0e-5
+        ? budget
+        : density * shared_density_scale;
+    desired_samples = clamp(desired_samples, 0.0, 4.0);
+
+    float rnd = hash01(uvec3(uint(coords.x), uint(coords.y), uint(params.signal_c.w)));
+    uint integer_part = uint(floor(desired_samples));
+    uint sample_count = integer_part + (rnd < fract(desired_samples) ? 1u : 0u);
+    sample_count = min(sample_count, 4u);
+    adaptive_sample_count[pixel_index] = sample_count;
+    adaptive_density[pixel_index] = desired_samples;
+    atomicAdd(adaptive_stats[2], sample_count);
+    atomicAdd(adaptive_stats[3], uint(round(desired_samples * 64.0)));
+
+    bool sampled = sample_count > 0u;
+    vec4 out_color = vec4(heatmap(desired_samples / 4.0), 1.0);
+    if (params.debug_view == DEBUG_VIEW_ADAPTIVE_SAMPLE_COUNT) {
+        out_color = vec4(heatmap(float(sample_count) / 4.0), 1.0);
+    } else if (params.debug_view == DEBUG_VIEW_ADAPTIVE_UNSAMPLED_PIXELS) {
+        out_color = sampled ? vec4(0.02, 0.08, 0.02, 1.0) : vec4(1.0, 0.05, 0.02, 1.0);
+    } else if (params.debug_view == DEBUG_VIEW_ADAPTIVE_FILLED_IMAGE) {
+        vec4 source = imageLoad(input_color, coords);
+        out_color = sampled && source.a >= 0.0 ? vec4(max(source.rgb, vec3(0.0)), 1.0) : average_sampled_neighbor_color(coords, dims);
+    } else if (params.debug_view == DEBUG_VIEW_ADAPTIVE_DISOCCLUSION_MASK) {
+        out_color = vec4(vec3(sampled ? 0.0 : 1.0), 1.0);
+    }
+    imageStore(output_debug, coords, out_color);
+    imageStore(output_filled_mask, coords, vec4(sampled ? 0.0 : 1.0, 0.0, 0.0, 0.0));
+}

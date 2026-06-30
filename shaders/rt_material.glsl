@@ -962,14 +962,22 @@ uint geometry_triangle_offset(uint meshIndex, uint tlasRecordIndex, uint geometr
     return rt_geometry_triangle_offsets[range.x + min(geometryIndex, range.y - 1u)];
 }
 
-LocalVertex ray_tracing_local_vertex(uint meshIndex, uint vertexIndex) {
+uvec4 ray_tracing_gpu_skinning_binding(uint meshIndex) {
     if (meshIndex < mesh_params.mesh_count) {
-        uvec4 binding = gpu_skinning_rt_mesh_bindings[meshIndex];
-        if (binding.z != 0u && vertexIndex >= binding.x && (vertexIndex - binding.x) < binding.y) {
-            return gpu_skinning_rt_vertices[vertexIndex];
-        }
+        return gpu_skinning_rt_mesh_bindings[meshIndex];
+    }
+    return uvec4(0u);
+}
+
+LocalVertex ray_tracing_local_vertex_with_binding(uvec4 binding, uint vertexIndex) {
+    if (binding.z != 0u && vertexIndex >= binding.x && (vertexIndex - binding.x) < binding.y) {
+        return gpu_skinning_rt_vertices[vertexIndex];
     }
     return local_mesh_vertices[vertexIndex];
+}
+
+LocalVertex ray_tracing_local_vertex(uint meshIndex, uint vertexIndex) {
+    return ray_tracing_local_vertex_with_binding(ray_tracing_gpu_skinning_binding(meshIndex), vertexIndex);
 }
 
 bool ray_tracing_mesh_has_gpu_skinning(uint meshIndex) {
@@ -1004,6 +1012,16 @@ vec2 apply_material_texture_transform(Material material, uint slot, vec2 uv0, ve
     return transform0.xy + rotated;
 }
 
+float g_material_texture_lod = 0.0;
+
+void set_material_texture_lod(float lod) {
+    g_material_texture_lod = clamp(lod, 0.0, 4.0);
+}
+
+vec4 sample_material_texture(int textureIndex, vec2 uv) {
+    return textureLod(material_textures[nonuniformEXT(textureIndex)], uv, g_material_texture_lod);
+}
+
 vec2 apply_material_height_parallax(Material material, vec2 uv0, vec2 uv1, vec3 normal, vec3 tangent, vec3 bitangent, vec3 rayDirection) {
     if (material.height_texture < 0 || material.height_texture >= MATERIAL_TEXTURE_LIMIT) {
         return uv0;
@@ -1013,7 +1031,7 @@ vec2 apply_material_height_parallax(Material material, vec2 uv0, vec2 uv1, vec3 
     vec3 b = normalize(bitangent);
     vec3 viewDir = normalize(-rayDirection);
     vec3 viewTs = vec3(dot(viewDir, t), dot(viewDir, b), max(dot(viewDir, n), 0.08));
-    float height = texture(material_textures[nonuniformEXT(material.height_texture)], uv0).r;
+    float height = sample_material_texture(material.height_texture, uv0).r;
     float centeredHeight = clamp(height, 0.0, 1.0) - 0.5;
     return uv0 + (viewTs.xy / viewTs.z) * centeredHeight * clamp(material.height_scale, 0.0, 0.25);
 }
@@ -1023,7 +1041,7 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.base_color_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_BASE_COLOR, uv0, uv1);
-        vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
+        vec4 base = sample_material_texture(textureIndex, sampleUv);
         vec3 baseColor = (flags & MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB) != 0u
             ? pow(max(base.rgb, vec3(0.0)), vec3(2.2))
             : base.rgb;
@@ -1033,7 +1051,7 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.metallic_roughness_texture >= 0 && material.metallic_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.metallic_roughness_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_METALLIC_ROUGHNESS, uv0, uv1);
-        vec4 mr = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
+        vec4 mr = sample_material_texture(textureIndex, sampleUv);
         material.roughness = clamp(material.roughness * mr.g, 0.0, 1.0);
         material.metallic = clamp(material.metallic * mr.b, 0.0, 1.0);
         if (material.mat_type == 0u || material.mat_type == 3u) {
@@ -1043,7 +1061,7 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.emissive_texture >= 0 && material.emissive_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.emissive_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_EMISSIVE, uv0, uv1);
-        vec4 emissive = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
+        vec4 emissive = sample_material_texture(textureIndex, sampleUv);
         vec3 emissiveColor = (flags & MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB) != 0u
             ? pow(max(emissive.rgb, vec3(0.0)), vec3(2.2))
             : emissive.rgb;
@@ -1052,49 +1070,49 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.occlusion_texture >= 0 && material.occlusion_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.occlusion_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_OCCLUSION, uv0, uv1);
-        float ao = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).r;
+        float ao = sample_material_texture(textureIndex, sampleUv).r;
         material.occlusion = mix(1.0, clamp(ao, 0.0, 1.0), material.occlusion_strength);
     }
     if (material.sheen_color_texture >= 0 && material.sheen_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.sheen_color_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SHEEN_COLOR, uv0, uv1);
-        material.sheen_color *= texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).rgb;
+        material.sheen_color *= sample_material_texture(textureIndex, sampleUv).rgb;
     }
     if (material.sheen_roughness_texture >= 0 && material.sheen_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.sheen_roughness_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SHEEN_ROUGHNESS, uv0, uv1);
-        material.sheen_roughness = clamp(material.sheen_roughness * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).a, 0.0, 1.0);
+        material.sheen_roughness = clamp(material.sheen_roughness * sample_material_texture(textureIndex, sampleUv).a, 0.0, 1.0);
     }
     if (material.iridescence_texture >= 0 && material.iridescence_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.iridescence_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_IRIDESCENCE, uv0, uv1);
-        material.iridescence_factor = clamp(material.iridescence_factor * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).r, 0.0, 1.0);
+        material.iridescence_factor = clamp(material.iridescence_factor * sample_material_texture(textureIndex, sampleUv).r, 0.0, 1.0);
     }
     if (material.iridescence_thickness_texture >= 0 && material.iridescence_thickness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.iridescence_thickness_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_IRIDESCENCE_THICKNESS, uv0, uv1);
-        float thicknessMix = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).g;
+        float thicknessMix = sample_material_texture(textureIndex, sampleUv).g;
         material.iridescence_thickness_min = mix(material.iridescence_thickness_min, material.iridescence_thickness_max, clamp(thicknessMix, 0.0, 1.0));
     }
     if (material.clearcoat_texture >= 0 && material.clearcoat_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.clearcoat_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT, uv0, uv1);
-        material.clearcoat_factor = clamp(material.clearcoat_factor * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).r, 0.0, 1.0);
+        material.clearcoat_factor = clamp(material.clearcoat_factor * sample_material_texture(textureIndex, sampleUv).r, 0.0, 1.0);
     }
     if (material.clearcoat_roughness_texture >= 0 && material.clearcoat_roughness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.clearcoat_roughness_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT_ROUGHNESS, uv0, uv1);
-        material.clearcoat_roughness = clamp(material.clearcoat_roughness * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).g, 0.0, 1.0);
+        material.clearcoat_roughness = clamp(material.clearcoat_roughness * sample_material_texture(textureIndex, sampleUv).g, 0.0, 1.0);
     }
     if (material.transmission_texture >= 0 && material.transmission_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.transmission_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_TRANSMISSION, uv0, uv1);
-        material.transmission_factor = clamp(material.transmission_factor * texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).r, 0.0, 1.0);
+        material.transmission_factor = clamp(material.transmission_factor * sample_material_texture(textureIndex, sampleUv).r, 0.0, 1.0);
     }
     if (material.specular_texture >= 0 && material.specular_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.specular_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SPECULAR, uv0, uv1);
-        vec4 specularSample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
+        vec4 specularSample = sample_material_texture(textureIndex, sampleUv);
         if ((flags & MATERIAL_FLAG_SPECULAR_ALPHA_GLOSSINESS) != 0u) {
             float glossinessFactor = clamp(1.0 - material.roughness, 0.0, 1.0);
             material.roughness = clamp(1.0 - glossinessFactor * specularSample.a, 0.0, 1.0);
@@ -1108,12 +1126,12 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.specular_color_texture >= 0 && material.specular_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.specular_color_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_SPECULAR_COLOR, uv0, uv1);
-        material.specular_color *= max(texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).rgb, vec3(0.0));
+        material.specular_color *= max(sample_material_texture(textureIndex, sampleUv).rgb, vec3(0.0));
     }
     if (material.anisotropy_texture >= 0 && material.anisotropy_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.anisotropy_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_ANISOTROPY, uv0, uv1);
-        vec3 anisotropySample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).rgb;
+        vec3 anisotropySample = sample_material_texture(textureIndex, sampleUv).rgb;
         material.anisotropy_strength = clamp(material.anisotropy_strength * anisotropySample.b, -1.0, 1.0);
         vec2 direction = anisotropySample.rg * 2.0 - 1.0;
         if (dot(direction, direction) > 1.0e-6) {
@@ -1123,11 +1141,11 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.volume_thickness_texture >= 0 && material.volume_thickness_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.volume_thickness_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_VOLUME_THICKNESS, uv0, uv1);
-        material.volume_thickness_factor *= max(texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).g, 0.0);
+        material.volume_thickness_factor *= max(sample_material_texture(textureIndex, sampleUv).g, 0.0);
     }
     if (material.opacity_texture >= 0 && material.opacity_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.opacity_texture;
-        float opacity = texture(material_textures[nonuniformEXT(textureIndex)], uv0).r;
+        float opacity = sample_material_texture(textureIndex, uv0).r;
         material.alpha_factor *= clamp(opacity, 0.0, 1.0);
     }
 }
@@ -1155,12 +1173,12 @@ void apply_material_alpha_texture(inout Material material, vec2 uv0, vec2 uv1) {
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.base_color_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_BASE_COLOR, uv0, uv1);
-        vec4 base = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv);
+        vec4 base = sample_material_texture(textureIndex, sampleUv);
         material.alpha_factor *= base.a;
     }
     if (material.opacity_texture >= 0 && material.opacity_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.opacity_texture;
-        float opacity = texture(material_textures[nonuniformEXT(textureIndex)], uv0).r;
+        float opacity = sample_material_texture(textureIndex, uv0).r;
         material.alpha_factor *= clamp(opacity, 0.0, 1.0);
     }
 }
@@ -1181,7 +1199,7 @@ vec3 apply_normal_texture(inout Material material, vec2 uv0, vec2 uv1, vec3 norm
     }
     int textureIndex = material.normal_texture;
     vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_NORMAL, uv0, uv1);
-    vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).xyz * 2.0 - 1.0;
+    vec3 tangentSample = sample_material_texture(textureIndex, sampleUv).xyz * 2.0 - 1.0;
     uint flags = uint(round(material.pad2));
     if ((flags & MATERIAL_FLAG_NORMAL_MAP_DIRECTX) != 0u) {
         tangentSample.y = -tangentSample.y;
@@ -1204,7 +1222,7 @@ vec3 apply_clearcoat_normal_texture(inout Material material, vec2 uv0, vec2 uv1,
     }
     int textureIndex = material.clearcoat_normal_texture;
     vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_CLEARCOAT_NORMAL, uv0, uv1);
-    vec3 tangentSample = texture(material_textures[nonuniformEXT(textureIndex)], sampleUv).xyz * 2.0 - 1.0;
+    vec3 tangentSample = sample_material_texture(textureIndex, sampleUv).xyz * 2.0 - 1.0;
     uint flags = uint(round(material.pad2));
     if ((flags & MATERIAL_FLAG_NORMAL_MAP_DIRECTX) != 0u) {
         tangentSample.y = -tangentSample.y;
@@ -1255,7 +1273,7 @@ void apply_terminal_material_textures(inout Material material, vec2 uv0, vec2 uv
     uint flags = uint(round(material.pad2));
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_BASE_COLOR, uv0, uv1);
-        vec4 base = texture(material_textures[nonuniformEXT(material.base_color_texture)], sampleUv);
+        vec4 base = sample_material_texture(material.base_color_texture, sampleUv);
         material.color *= (flags & MATERIAL_FLAG_MANUAL_BASE_COLOR_SRGB) != 0u
             ? pow(max(base.rgb, vec3(0.0)), vec3(2.2))
             : base.rgb;
@@ -1263,7 +1281,7 @@ void apply_terminal_material_textures(inout Material material, vec2 uv0, vec2 uv
     }
     if (material.emissive_texture >= 0 && material.emissive_texture < MATERIAL_TEXTURE_LIMIT) {
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_EMISSIVE, uv0, uv1);
-        vec3 emissive = texture(material_textures[nonuniformEXT(material.emissive_texture)], sampleUv).rgb;
+        vec3 emissive = sample_material_texture(material.emissive_texture, sampleUv).rgb;
         material.emissive *= (flags & MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB) != 0u
             ? pow(max(emissive, vec3(0.0)), vec3(2.2))
             : emissive;

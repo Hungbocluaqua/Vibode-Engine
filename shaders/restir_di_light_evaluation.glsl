@@ -6,6 +6,29 @@ bool restir_di_resolve_light(
     RestirDiReservoir reservoir,
     out RestirDiLightRecord light,
     out uint resolvedIndex) {
+    uint reservoirKind = restir_di_light_kind(reservoir);
+    if (restir_di_light_kind_infinite(reservoirKind)) {
+        resolvedIndex = RESTIR_DI_PSEUDO_LIGHT_INDEX;
+        vec3 storedDirection = reservoir.samplePosition_distance.xyz;
+        float storedDirectionLen2 = dot(storedDirection, storedDirection);
+        vec3 direction = storedDirectionLen2 > 1.0e-8
+            ? storedDirection * inversesqrt(storedDirectionLen2)
+            : vec3(0.0, 1.0, 0.0);
+        vec3 radiance = restir_di_sample_radiance(reservoir);
+        float sourcePdf = restir_di_source_pdf(reservoir);
+        light.metadata = uvec4(reservoirKind, 0u, 0u, 0u);
+        light.identity = reservoirKind == RESTIR_DI_LIGHT_ENVIRONMENT
+            ? uvec4(RESTIR_DI_ENVIRONMENT_ID_HASH, 0u, RESTIR_DI_ENVIRONMENT_VERSION, 0u)
+            : uvec4(RESTIR_DI_SUN_ID_HASH, 0u, RESTIR_DI_SUN_VERSION, 0u);
+        light.data0 = vec4(sourcePdf, sourcePdf, 0.0, 0.0);
+        light.data1 = vec4(direction, 0.0);
+        light.data2 = vec4(radiance, 0.0);
+        light.data3 = vec4(0.0);
+        return sourcePdf > 1.0e-6 &&
+            storedDirectionLen2 > 1.0e-8 &&
+            dot(radiance, vec3(0.2126, 0.7152, 0.0722)) > 0.0;
+    }
+
     uint cachedIndex = restir_di_light_index(reservoir);
     if (cachedIndex < restir_di_scene.lightCount &&
         restir_di_light_identity_matches(reservoir, restir_di_light_records[cachedIndex])) {
@@ -26,6 +49,9 @@ bool restir_di_resolve_light(
 }
 
 float restir_di_light_selection_pdf(uint lightIndex, RestirDiLightRecord light) {
+    if (restir_di_light_kind_infinite(light.metadata.x)) {
+        return max(light.data0.x, 0.0);
+    }
     if (restir_di_scene.lightCount == 0u || restir_di_scene.totalLightWeight <= 1.0e-8) return 0.0;
     float authoredProbability = restir_di_scene.authoredLightCount == 0u
         ? 0.0
@@ -46,11 +72,19 @@ float restir_di_pdf_at_receiver(
     vec3 lightNormal) {
     float selectionPdf = restir_di_light_selection_pdf(lightIndex, light);
     uint kind = light.metadata.x;
-    if (kind == 2u || kind == 3u || kind == 5u) return selectionPdf;
+    if (kind == RESTIR_DI_LIGHT_DIRECTIONAL ||
+        kind == RESTIR_DI_LIGHT_POINT ||
+        kind == RESTIR_DI_LIGHT_SPOT ||
+        restir_di_light_kind_infinite(kind)) {
+        return selectionPdf;
+    }
     vec3 toLight = samplePosition - receiverPosition;
     float distanceSquared = dot(toLight, toLight);
     vec3 direction = toLight * inversesqrt(max(distanceSquared, 1.0e-8));
-    float cosineAtLight = max(dot(-direction, normalize(lightNormal)), 0.0);
+    float rawCosineAtLight = dot(-direction, normalize(lightNormal));
+    float cosineAtLight = kind == RESTIR_DI_LIGHT_EMISSIVE_TRIANGLE
+        ? abs(rawCosineAtLight)
+        : max(rawCosineAtLight, 0.0);
     float area = max(light.data0.w, 1.0e-6);
     return cosineAtLight > 1.0e-6 ? selectionPdf * distanceSquared / (cosineAtLight * area) : 0.0;
 }
@@ -67,7 +101,7 @@ vec3 restir_di_evaluate_integrand(
     out vec3 currentLightNormal) {
     uint kind = restir_di_light_kind(reservoir);
     vec3 samplePosition = reservoir.samplePosition_distance.xyz;
-    if (kind == 2u) {
+    if (kind == RESTIR_DI_LIGHT_DIRECTIONAL || restir_di_light_kind_infinite(kind)) {
         currentDirection = normalize(light.data1.xyz);
         currentDistance = 10000.0;
     } else {
@@ -76,8 +110,12 @@ vec3 restir_di_evaluate_integrand(
         currentDirection = toLight / max(currentDistance, 1.0e-6);
     }
     currentLightNormal = restir_di_light_normal(reservoir);
-    if (kind == 2u || kind == 3u) currentLightNormal = -currentDirection;
-    if (kind == 4u || kind == 5u) {
+    if (kind == RESTIR_DI_LIGHT_DIRECTIONAL ||
+        kind == RESTIR_DI_LIGHT_POINT ||
+        restir_di_light_kind_infinite(kind)) {
+        currentLightNormal = -currentDirection;
+    }
+    if (kind == RESTIR_DI_LIGHT_AREA || kind == RESTIR_DI_LIGHT_SPOT) {
         currentLightNormal = normalize(vec3(light.data1.w, light.data2.w, light.data3.x));
     }
 
@@ -85,12 +123,12 @@ vec3 restir_di_evaluate_integrand(
     // required for textured triangle emission and avoids replacing it with a
     // light-record average during reuse.
     vec3 incidentRadiance = restir_di_sample_radiance(reservoir);
-    if (kind == 2u || kind == 4u) {
+    if (kind == RESTIR_DI_LIGHT_DIRECTIONAL || kind == RESTIR_DI_LIGHT_AREA) {
         incidentRadiance = max(light.data2.xyz, vec3(0.0));
-    } else if (kind == 3u) {
+    } else if (kind == RESTIR_DI_LIGHT_POINT) {
         incidentRadiance = max(light.data2.xyz, vec3(0.0)) /
             max(currentDistance * currentDistance, 1.0e-4);
-    } else if (kind == 5u) {
+    } else if (kind == RESTIR_DI_LIGHT_SPOT) {
         vec3 spotDirection = currentLightNormal;
         float cosInner = cos(clamp(light.data3.y, 0.0, 3.14159265));
         float cosOuter = cos(clamp(max(light.data3.z, light.data3.y), 0.0, 3.14159265));

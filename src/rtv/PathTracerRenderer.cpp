@@ -28,16 +28,21 @@
 #include <cstdlib>
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -78,6 +83,149 @@ constexpr uint32_t kRayTracingDiagnosticCounterCount = RayTracingDiagnosticCount
 constexpr uint32_t kRayTracingAlphaMaterialCounterCount =
     RayTracingDiagnosticCounters::kAlphaMaterialCounterSlots *
     RayTracingDiagnosticCounters::kAlphaMaterialCounterStride;
+
+uint64_t fnv1aAppend(uint64_t hash, const void* data, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= static_cast<uint64_t>(bytes[i]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+uint64_t shaderSignatureDirectoryHash(const std::filesystem::path& shaderOutputDirectory) {
+    uint64_t hash = 1469598103934665603ull;
+    if (!std::filesystem::exists(shaderOutputDirectory)) {
+        return hash;
+    }
+
+    std::vector<std::filesystem::path> signatureFiles;
+    for (const auto& entry : std::filesystem::directory_iterator(shaderOutputDirectory)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const std::filesystem::path path = entry.path();
+        if (path.extension() == ".options") {
+            signatureFiles.push_back(path);
+        }
+    }
+    std::sort(signatureFiles.begin(), signatureFiles.end());
+
+    std::array<char, 4096> buffer{};
+    for (const std::filesystem::path& path : signatureFiles) {
+        const std::string name = path.filename().string();
+        hash = fnv1aAppend(hash, name.data(), name.size());
+        std::ifstream file(path, std::ios::binary);
+        while (file) {
+            file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const std::streamsize count = file.gcount();
+            if (count > 0) {
+                hash = fnv1aAppend(hash, buffer.data(), static_cast<size_t>(count));
+            }
+        }
+    }
+    return hash;
+}
+
+std::filesystem::path rendererPipelineCachePath(
+    VkPhysicalDevice physicalDevice,
+    const std::filesystem::path& shaderOutputDirectory) {
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+    const uint64_t shaderHash = shaderSignatureDirectoryHash(shaderOutputDirectory);
+    char fileName[160]{};
+    std::snprintf(
+        fileName,
+        sizeof(fileName),
+        "pipeline_cache_v2_vendor%04x_device%04x_driver%08x_shader%016llx.bin",
+        properties.vendorID,
+        properties.deviceID,
+        properties.driverVersion,
+        static_cast<unsigned long long>(shaderHash));
+    return shaderOutputDirectory / fileName;
+}
+
+class StartupTimingSummary {
+public:
+    void mark(const char* name) {
+        const auto now = Clock::now();
+        entries_.push_back(Entry{
+            name,
+            std::chrono::duration<double, std::milli>(now - last_).count(),
+            std::chrono::duration<double, std::milli>(now - start_).count(),
+        });
+        last_ = now;
+    }
+
+    void print() const {
+        std::cout << "Startup timings:\n";
+        for (const Entry& entry : entries_) {
+            std::cout << "  " << entry.name << " " << entry.deltaMs << " ms"
+                      << " (total " << entry.totalMs << " ms)\n";
+        }
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    struct Entry {
+        const char* name = "";
+        double deltaMs = 0.0;
+        double totalMs = 0.0;
+    };
+    Clock::time_point start_ = Clock::now();
+    Clock::time_point last_ = start_;
+    std::vector<Entry> entries_;
+};
+
+bool pathTraceRecordTraceEnabled() {
+    static const bool enabled = [] {
+#if defined(_WIN32)
+        char* value = nullptr;
+        size_t length = 0;
+        if (_dupenv_s(&value, &length, "RTV_MAIN_LOOP_TRACE") != 0 || value == nullptr) {
+            return false;
+        }
+        const bool result = value[0] != '\0' && value[0] != '0';
+        std::free(value);
+        return result;
+#else
+        const char* value = std::getenv("RTV_MAIN_LOOP_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+#endif
+    }();
+    return enabled;
+}
+
+void tracePathTraceRecordPhase(const char* phase) {
+    if (!pathTraceRecordTraceEnabled()) {
+        return;
+    }
+    std::cout << "PATH_TRACE_RECORD phase=" << phase << '\n' << std::flush;
+}
+
+std::string pipelineCachePoolKey(VkDevice device, const std::filesystem::path& path) {
+    std::ostringstream out;
+    out << reinterpret_cast<uintptr_t>(device) << ':'
+        << std::filesystem::absolute(path).lexically_normal().string();
+    return out.str();
+}
+
+std::shared_ptr<PipelineCache> sharedPipelineCache(VkDevice device, const std::filesystem::path& path) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::weak_ptr<PipelineCache>> caches;
+
+    const std::string key = pipelineCachePoolKey(device, path);
+    std::lock_guard lock(mutex);
+    auto& weak = caches[key];
+    if (auto existing = weak.lock()) {
+        std::cout << "Reusing in-process pipeline cache for " << path.string() << '\n';
+        return existing;
+    }
+
+    auto created = std::make_shared<PipelineCache>(device, path);
+    weak = created;
+    return created;
+}
 constexpr uint32_t kWavefrontQueueClearValidationValue = 0x57465131u; // WFQ1
 constexpr uint32_t kStbnTileSize = 128;
 constexpr uint32_t kStbnFrameCount = 64;
@@ -606,6 +754,14 @@ std::vector<VkDescriptorSetLayoutBinding> rayTracingBindings() {
         descriptorBinding(61, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(62, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
         descriptorBinding(63, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, allRt),
+        descriptorBinding(64, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(65, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(66, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(67, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(68, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(69, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(70, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
+        descriptorBinding(71, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_RAYGEN_BIT_KHR),
         descriptorBinding(kStbnScalarTextureBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, allRt),
         descriptorBinding(kStbnScalarSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, allRt),
     };
@@ -909,6 +1065,7 @@ PathTracerRenderer::PathTracerRenderer(
           initialSettings != nullptr && initialSettings->opacityMicromapBlendEnabled),
       gpuSkinningResourcePlan_(std::move(gpuSkinningResourcePlan)),
       resourceAliasingEnabled_(resourceAliasingEnabled) {
+    StartupTimingSummary startupTiming;
     temporalSystem_ = std::make_unique<TemporalSystem>();
     if (!context_.supportsHardwareRayTracing()) {
         throw std::runtime_error("Hardware ray tracing is required but this Vulkan device does not support the required KHR ray tracing features/extensions");
@@ -973,6 +1130,7 @@ PathTracerRenderer::PathTracerRenderer(
     if (restirGiUncompressedLayout_) {
         std::cout << "ReSTIR GI reservoir layout: uncompressed validation\n";
     }
+    startupTiming.mark("settings_and_capabilities");
 
     shaderCompiler_ = std::make_unique<ShaderCompiler>(glslangPath());
     shaderOutputDirectory_ = shaderOutputDirectory;
@@ -980,6 +1138,39 @@ PathTracerRenderer::PathTracerRenderer(
     const std::vector<std::pair<std::string, std::string>> restirDiPackedDefines{
         {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
         {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+    };
+    const std::vector<std::pair<std::string, std::string>> genericBeautyFastDefines{
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+        {"RTV_BEAUTY_OUTPUT_ONLY", "1"},
+        {"RTV_REGIR_TRACE_ENABLED", "0"},
+        {"RTV_MATERIAL_RAY_CONE_LOD", "1"},
+        {"RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT", "1"},
+        {"RTV_GENERIC_SECONDARY_DIRECT_PROB", "0.5"},
+        {"RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB", "0.5"},
+    };
+    const std::vector<std::pair<std::string, std::string>> regirBeautyFastDefines{
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+        {"RTV_BEAUTY_OUTPUT_ONLY", "1"},
+        {"RTV_REGIR_TRACE_ENABLED", "1"},
+        {"RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED", "1"},
+        {"RTV_REGIR_FRAME_COHERENT_FINITE_QUERY", "1"},
+        {"RTV_MATERIAL_RAY_CONE_LOD", "1"},
+        {"RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT", "1"},
+        {"RTV_GENERIC_SECONDARY_DIRECT_PROB", "0.5"},
+        {"RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB", "0.5"},
+    };
+    const std::vector<std::pair<std::string, std::string>> regirStochasticBeautyFastDefines{
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+        {"RTV_BEAUTY_OUTPUT_ONLY", "1"},
+        {"RTV_REGIR_TRACE_ENABLED", "1"},
+        {"RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED", "0"},
+        {"RTV_MATERIAL_RAY_CONE_LOD", "1"},
+        {"RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT", "1"},
+        {"RTV_GENERIC_SECONDARY_DIRECT_PROB", "0.5"},
+        {"RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB", "0.5"},
     };
     const std::vector<std::pair<std::string, std::string>> restirDiFullDefines{
         {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
@@ -1001,67 +1192,239 @@ PathTracerRenderer::PathTracerRenderer(
         {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
         {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
     };
-    const auto denoiserSpv = compiler.compileIfNeeded(shaderDirectory / "denoiser.comp", shaderOutputDirectory);
-    const auto momentUpdateSpv = compiler.compileIfNeeded(shaderDirectory / "moment_update.comp", shaderOutputDirectory);
-    const auto taaSpv = compiler.compileIfNeeded(shaderDirectory / "taa.comp", shaderOutputDirectory);
-    const auto gpuSkinningSpv = compiler.compileIfNeeded(shaderDirectory / "gpu_skinning.comp", shaderOutputDirectory);
-    const auto dlssGuidesSpv = compiler.compileIfNeeded(shaderDirectory / "dlss_guides.comp", shaderOutputDirectory);
-    const auto dlssRayReconstructionGuidesSpv = compiler.compileIfNeeded(shaderDirectory / "dlss_rr_guides.comp", shaderOutputDirectory);
-    const auto nrdPrepareSpv = compiler.compileIfNeeded(shaderDirectory / "nrd_prepare.comp", shaderOutputDirectory);
-    const auto nrdResolveSpv = compiler.compileIfNeeded(shaderDirectory / "nrd_resolve.comp", shaderOutputDirectory);
-    const auto restirSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_spatial.comp", shaderOutputDirectory);
-    const auto restirGiSpatialSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_spatial.comp", shaderOutputDirectory);
-    const auto restirGiFinalSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_final.comp", shaderOutputDirectory);
-    const auto restirGiTemporalSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_temporal.comp", shaderOutputDirectory);
-    const auto restirGiTemporalFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_gi_temporal.comp", shaderOutputDirectory, ".gi_full", restirGiFullDefines);
-    const auto restirGiTemporalValidationSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_gi_temporal.comp", shaderOutputDirectory, ".gi_validation", restirGiValidationDefines);
-    const auto restirGiSpatialProdSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_spatial_production.comp", shaderOutputDirectory);
-    const auto restirGiSpatialValidationSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_gi_spatial_production.comp", shaderOutputDirectory, ".gi_validation", restirGiValidationPassDefines);
-    const auto restirGiFinalProdSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_final_production.comp", shaderOutputDirectory);
-    const auto restirGiFinalValidationSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_gi_final_production.comp", shaderOutputDirectory, ".gi_validation", restirGiValidationPassDefines);
-    const auto restirGiUpsampleSpv = compiler.compileIfNeeded(shaderDirectory / "restir_gi_upsample.comp", shaderOutputDirectory);
-    const auto restirGiUpsampleValidationSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_gi_upsample.comp", shaderOutputDirectory, ".gi_validation", restirGiValidationPassDefines);
-    const auto restirDiTemporalSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_di_temporal.comp", shaderOutputDirectory, ".di_packed", restirDiPackedDefines);
-    const auto restirDiTemporalFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_di_temporal.comp", shaderOutputDirectory, ".di_full", restirDiFullDefines);
-    const auto restirDiSpatialSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_di_spatial.comp", shaderOutputDirectory, ".di_packed", restirDiPackedDefines);
-    const auto restirDiSpatialFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_di_spatial.comp", shaderOutputDirectory, ".di_full", restirDiFullDefines);
-    const auto restirDiFinalSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_di_final.comp", shaderOutputDirectory, ".di_packed", restirDiPackedDefines);
-    const auto restirDiFinalFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "restir_di_final.comp", shaderOutputDirectory, ".di_full", restirDiFullDefines);
-    const auto fogSpv = compiler.compileIfNeeded(shaderDirectory / "fog_integrate.comp", shaderOutputDirectory);
-    const auto transmittanceSpv = compiler.compileIfNeeded(shaderDirectory / "transmittance_lut.comp", shaderOutputDirectory);
-    const auto multiScatterSpv = compiler.compileIfNeeded(shaderDirectory / "multi_scatter_lut.comp", shaderOutputDirectory);
-    const auto skyViewSpv = compiler.compileIfNeeded(shaderDirectory / "sky_view_lut.comp", shaderOutputDirectory);
-    const auto skyReprojectSpv = compiler.compileIfNeeded(shaderDirectory / "sky_reproject.comp", shaderOutputDirectory);
-    const auto aerialPerspectiveSpv = compiler.compileIfNeeded(shaderDirectory / "aerial_perspective_lut.comp", shaderOutputDirectory);
-    const auto skyCdfSpv = compiler.compileIfNeeded(shaderDirectory / "sky_cdf.comp", shaderOutputDirectory);
-    const auto selectionSpv = compiler.compileIfNeeded(shaderDirectory / "selection_outline.comp", shaderOutputDirectory);
-    const auto histogramSpv = compiler.compileIfNeeded(shaderDirectory / "luminance_histogram.comp", shaderOutputDirectory);
-    const auto exposureSpv = compiler.compileIfNeeded(shaderDirectory / "exposure_reduce.comp", shaderOutputDirectory);
-    const auto toneMapSpv = compiler.compileIfNeeded(shaderDirectory / "tone_map.comp", shaderOutputDirectory);
-    const auto wavefrontQueueClearSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_queue_clear.comp", shaderOutputDirectory);
-    const auto wavefrontPrimaryGenerateSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_generate.comp", shaderOutputDirectory);
-    const auto wavefrontShadeSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_shade.comp", shaderOutputDirectory);
-    const auto wavefrontDebugWriteSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_write.comp", shaderOutputDirectory);
-    const auto wavefrontCompactSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_compact.comp", shaderOutputDirectory);
-    const auto wavefrontSortSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_sort.comp", shaderOutputDirectory);
-    const auto wavefrontTraceValidateSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_trace_validate.comp", shaderOutputDirectory);
-    const auto wavefrontDirectValidateSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_direct_validate.comp", shaderOutputDirectory);
-    const auto vertSpv = compiler.compileIfNeeded(shaderDirectory / "fullscreen.vert", shaderOutputDirectory);
-    const auto fragSpv = compiler.compileIfNeeded(shaderDirectory / "fullscreen.frag", shaderOutputDirectory);
+    std::vector<ShaderReloadDependency> shaderReloadDependencies;
+    auto compileShader = [&](const std::filesystem::path& source) {
+        const auto output = compiler.compileIfNeeded(source, shaderOutputDirectory);
+        shaderReloadDependencies.push_back(ShaderReloadDependency{source, output, {}});
+        return output;
+    };
+    auto compileShaderVariant = [&](
+        const std::filesystem::path& source,
+        const std::string& outputSuffix,
+        const std::vector<std::pair<std::string, std::string>>& extraDefines) {
+        const auto output = compiler.compileIfNeeded(source, shaderOutputDirectory, outputSuffix, extraDefines);
+        shaderReloadDependencies.push_back(ShaderReloadDependency{source, output, extraDefines});
+        return output;
+    };
 
+    const auto denoiserSpv = compileShader(shaderDirectory / "denoiser.comp");
+    const auto momentUpdateSpv = compileShader(shaderDirectory / "moment_update.comp");
+    const auto adaptiveSamplingSpv = compileShader(shaderDirectory / "adaptive_sampling.comp");
+    const auto adaptiveSamplingDiscretizeSpv = compileShader(shaderDirectory / "adaptive_discretize.comp");
+    const auto adaptiveSamplingFillSpv = compileShader(shaderDirectory / "adaptive_fill.comp");
+    const auto regirBuildSpv = compileShader(shaderDirectory / "regir_build.comp");
+    const auto regirEnvironmentBuildSpv = compileShader(shaderDirectory / "regir_environment_build.comp");
+    const auto regirSpatialReuseSpv = compileShader(shaderDirectory / "regir_spatial_reuse.comp");
+    const auto regirTemporalReuseSpv = compileShader(shaderDirectory / "regir_temporal_reuse.comp");
+    const auto taaSpv = compileShader(shaderDirectory / "taa.comp");
+    const auto gpuSkinningSpv = compileShader(shaderDirectory / "gpu_skinning.comp");
+    const auto dlssGuidesSpv = compileShader(shaderDirectory / "dlss_guides.comp");
+    const auto dlssRayReconstructionGuidesSpv = compileShader(shaderDirectory / "dlss_rr_guides.comp");
+    const auto nrdPrepareSpv = compileShader(shaderDirectory / "nrd_prepare.comp");
+    const auto nrdResolveSpv = compileShader(shaderDirectory / "nrd_resolve.comp");
+    const auto restirSpatialSpv = compileShader(shaderDirectory / "restir_spatial.comp");
+    const auto restirGiSpatialSpv = compileShader(shaderDirectory / "restir_gi_spatial.comp");
+    const auto restirGiFinalSpv = compileShader(shaderDirectory / "restir_gi_final.comp");
+    const auto restirGiTemporalSpv = compileShader(shaderDirectory / "restir_gi_temporal.comp");
+    const auto restirGiTemporalFullSpv = compileShaderVariant(shaderDirectory / "restir_gi_temporal.comp", ".gi_full", restirGiFullDefines);
+    const auto restirGiTemporalValidationSpv = compileShaderVariant(
+        shaderDirectory / "restir_gi_temporal.comp", ".gi_validation", restirGiValidationDefines);
+    const auto restirGiSpatialProdSpv = compileShader(shaderDirectory / "restir_gi_spatial_production.comp");
+    const auto restirGiSpatialValidationSpv = compileShaderVariant(
+        shaderDirectory / "restir_gi_spatial_production.comp", ".gi_validation", restirGiValidationPassDefines);
+    const auto restirGiFinalProdSpv = compileShader(shaderDirectory / "restir_gi_final_production.comp");
+    const auto restirGiFinalValidationSpv = compileShaderVariant(
+        shaderDirectory / "restir_gi_final_production.comp", ".gi_validation", restirGiValidationPassDefines);
+    const auto restirGiUpsampleSpv = compileShader(shaderDirectory / "restir_gi_upsample.comp");
+    const auto restirGiUpsampleValidationSpv = compileShaderVariant(
+        shaderDirectory / "restir_gi_upsample.comp", ".gi_validation", restirGiValidationPassDefines);
+    const auto restirDiTemporalSpv = compileShaderVariant(
+        shaderDirectory / "restir_di_temporal.comp", ".di_packed", restirDiPackedDefines);
+    const auto restirDiTemporalFullSpv = compileShaderVariant(
+        shaderDirectory / "restir_di_temporal.comp", ".di_full", restirDiFullDefines);
+    const auto restirDiSpatialSpv = compileShaderVariant(
+        shaderDirectory / "restir_di_spatial.comp", ".di_packed", restirDiPackedDefines);
+    const auto restirDiSpatialFullSpv = compileShaderVariant(
+        shaderDirectory / "restir_di_spatial.comp", ".di_full", restirDiFullDefines);
+    const auto restirDiFinalSpv = compileShaderVariant(
+        shaderDirectory / "restir_di_final.comp", ".di_packed", restirDiPackedDefines);
+    const auto restirDiFinalFullSpv = compileShaderVariant(
+        shaderDirectory / "restir_di_final.comp", ".di_full", restirDiFullDefines);
+    const auto fogSpv = compileShader(shaderDirectory / "fog_integrate.comp");
+    const auto transmittanceSpv = compileShader(shaderDirectory / "transmittance_lut.comp");
+    const auto multiScatterSpv = compileShader(shaderDirectory / "multi_scatter_lut.comp");
+    const auto skyViewSpv = compileShader(shaderDirectory / "sky_view_lut.comp");
+    const auto skyReprojectSpv = compileShader(shaderDirectory / "sky_reproject.comp");
+    const auto aerialPerspectiveSpv = compileShader(shaderDirectory / "aerial_perspective_lut.comp");
+    const auto skyCdfSpv = compileShader(shaderDirectory / "sky_cdf.comp");
+    const auto selectionSpv = compileShader(shaderDirectory / "selection_outline.comp");
+    const auto histogramSpv = compileShader(shaderDirectory / "luminance_histogram.comp");
+    const auto exposureSpv = compileShader(shaderDirectory / "exposure_reduce.comp");
+    const auto toneMapSpv = compileShader(shaderDirectory / "tone_map.comp");
+    const auto wavefrontQueueClearSpv = compileShader(shaderDirectory / "wavefront_queue_clear.comp");
+    const auto wavefrontPrimaryGenerateSpv = compileShader(shaderDirectory / "wavefront_generate.comp");
+    const auto wavefrontShadeSpv = compileShader(shaderDirectory / "wavefront_shade.comp");
+    const auto wavefrontDebugWriteSpv = compileShader(shaderDirectory / "wavefront_write.comp");
+    const auto wavefrontCompactSpv = compileShader(shaderDirectory / "wavefront_compact.comp");
+    const auto wavefrontSortSpv = compileShader(shaderDirectory / "wavefront_sort.comp");
+    const auto wavefrontTraceValidateSpv = compileShader(shaderDirectory / "wavefront_trace_validate.comp");
+    const auto wavefrontDirectValidateSpv = compileShader(shaderDirectory / "wavefront_direct_validate.comp");
+    const auto vertSpv = compileShader(shaderDirectory / "fullscreen.vert");
+    const auto fragSpv = compileShader(shaderDirectory / "fullscreen.frag");
+
+    const auto raygenSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen", ".di_packed", restirDiPackedDefines);
+    const auto raygenBeautyFastSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen", ".beauty_fast.di_packed", genericBeautyFastDefines);
+    const auto raygenRegirBeautyFastSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen", ".regir_beauty_fast.di_packed", regirBeautyFastDefines);
+    const auto raygenRegirStochasticBeautyFastSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen",
+        ".regir_stochastic_beauty_fast.di_packed",
+        regirStochasticBeautyFastDefines);
+    const auto raygenFullSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen", ".di_full", restirDiFullDefines);
+    const auto raygenGiFullSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen", ".gi_full", restirGiFullDefines);
+    const auto raygenAllFullSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen", ".di_full.gi_full", restirAllFullDefines);
+    std::optional<std::filesystem::path> raygenMotionSpv;
+    std::optional<std::filesystem::path> raygenMotionFullSpv;
+    std::optional<std::filesystem::path> raygenMotionGiFullSpv;
+    std::optional<std::filesystem::path> raygenMotionAllFullSpv;
+    if (context_.supportsRayTracingMotionBlur()) {
+        raygenMotionSpv = compileShaderVariant(
+            shaderDirectory / "pathtrace.rgen",
+            ".motion.di_packed",
+            {
+                {"RTV_MOTION_BLUR_ENABLED", "1"},
+                {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+            });
+        raygenMotionFullSpv = compileShaderVariant(
+            shaderDirectory / "pathtrace.rgen",
+            ".motion.di_full",
+            {
+                {"RTV_MOTION_BLUR_ENABLED", "1"},
+                {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
+                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+            });
+        raygenMotionGiFullSpv = compileShaderVariant(
+            shaderDirectory / "pathtrace.rgen",
+            ".motion.gi_full",
+            {
+                {"RTV_MOTION_BLUR_ENABLED", "1"},
+                {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+            });
+        raygenMotionAllFullSpv = compileShaderVariant(
+            shaderDirectory / "pathtrace.rgen",
+            ".motion.di_full.gi_full",
+            {
+                {"RTV_MOTION_BLUR_ENABLED", "1"},
+                {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
+                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+            });
+    }
+    const auto raygenNative2BSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen",
+        ".native2b",
+        {
+            {"RTV_NATIVE2B_PIPELINE", "1"},
+            {"RTV_MOTION_BLUR_ENABLED", "0"},
+            {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+        });
+    const auto raygenNative2BCompactPrimaryLightsSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen",
+        ".native2b.compact_primary_lights",
+        {
+            {"RTV_NATIVE2B_PIPELINE", "1"},
+            {"RTV_NATIVE2B_COMPACT_PRIMARY_LIGHTS", "1"},
+            {"RTV_MOTION_BLUR_ENABLED", "0"},
+            {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+        });
+    const std::vector<std::pair<std::string, std::string>> rtDiagnosticDefines{
+        {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
+        {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+    };
+    const auto raygenDiagnosticSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen",
+        ".rt_diag.di_packed",
+        rtDiagnosticDefines);
+    const auto raygenDiagnosticFullSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen",
+        ".rt_diag.di_full",
+        {
+            {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
+            {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
+            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+        });
+    const auto raygenDiagnosticGiFullSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen",
+        ".rt_diag.gi_full",
+        {
+            {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
+            {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+        });
+    const auto raygenDiagnosticAllFullSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen",
+        ".rt_diag.di_full.gi_full",
+        {
+            {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
+            {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
+            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
+        });
+    const auto raygenNative2BDiagnosticSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen",
+        ".rt_diag.native2b",
+        {
+            {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
+            {"RTV_NATIVE2B_PIPELINE", "1"},
+            {"RTV_MOTION_BLUR_ENABLED", "0"},
+            {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
+            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
+        });
+    const auto wavefrontTraceRaygenSpv = compileShader(shaderDirectory / "wavefront_trace.rgen");
+    std::optional<std::filesystem::path> wavefrontTraceRaygenSerSpv;
+    if (context_.supportsSER()) {
+        wavefrontTraceRaygenSerSpv = compileShaderVariant(
+            shaderDirectory / "wavefront_trace.rgen",
+            ".ser",
+            {{"RTV_SER_ENABLED", "1"}});
+    }
+    const auto wavefrontShadowTraceRaygenSpv = compileShader(shaderDirectory / "wavefront_shadow_trace.rgen");
+    const auto missSpv = compileShader(shaderDirectory / "pathtrace.rmiss");
+    const auto shadowMissSpv = compileShader(shaderDirectory / "pathtrace_shadow.rmiss");
+    const auto terminalMissSpv = compileShader(shaderDirectory / "pathtrace_terminal.rmiss");
+    const auto closestHitSpv = compileShader(shaderDirectory / "pathtrace.rchit");
+    const auto primaryAnyHitSpv = compileShader(shaderDirectory / "pathtrace.rahit");
+    const auto shadowAnyHitSpv = compileShader(shaderDirectory / "pathtrace_shadow.rahit");
+    const auto terminalClosestHitSpv = compileShader(shaderDirectory / "pathtrace_terminal.rchit");
+    const auto terminalAnyHitSpv = compileShader(shaderDirectory / "pathtrace_terminal.rahit");
+    const auto closestHitDiagnosticSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rchit", ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
+    const auto primaryAnyHitDiagnosticSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rahit", ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
+    const auto shadowAnyHitDiagnosticSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace_shadow.rahit", ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
+    const auto terminalClosestHitDiagnosticSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace_terminal.rchit", ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
+    const auto terminalAnyHitDiagnosticSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace_terminal.rahit", ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
+    startupTiming.mark("shader_validate_or_compile");
     denoiserShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(denoiserSpv), "temporal denoiser compute");
     momentUpdateShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(momentUpdateSpv), "moment update compute");
+    adaptiveSamplingShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(adaptiveSamplingSpv), "adaptive sampling density compute");
+    adaptiveSamplingDiscretizeShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(adaptiveSamplingDiscretizeSpv), "adaptive sampling discretize compute");
+    adaptiveSamplingFillShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(adaptiveSamplingFillSpv), "adaptive sampling fill compute");
+    regirBuildShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(regirBuildSpv), "ReGIR reservoir build compute");
+    regirEnvironmentBuildShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(regirEnvironmentBuildSpv), "ReGIR environment bank build compute");
+    regirSpatialReuseShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(regirSpatialReuseSpv), "ReGIR spatial reuse compute");
+    regirTemporalReuseShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(regirTemporalReuseSpv), "ReGIR temporal reuse compute");
     taaShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(taaSpv), "taa compute");
     gpuSkinningShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(gpuSkinningSpv), "gpu skinning compute");
     dlssGuidesShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(dlssGuidesSpv), "dlss guide image compute");
@@ -1107,154 +1470,16 @@ PathTracerRenderer::PathTracerRenderer(
     wavefrontDirectLightingValidateShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(wavefrontDirectValidateSpv), "wavefront direct lighting validate compute");
     fullscreenVertexShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(vertSpv), "fullscreen vertex");
     fullscreenFragmentShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(fragSpv), "fullscreen fragment");
-    const auto raygenSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen", shaderOutputDirectory, ".di_packed", restirDiPackedDefines);
-    const auto raygenFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen", shaderOutputDirectory, ".di_full", restirDiFullDefines);
-    const auto raygenGiFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen", shaderOutputDirectory, ".gi_full", restirGiFullDefines);
-    const auto raygenAllFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen", shaderOutputDirectory, ".di_full.gi_full", restirAllFullDefines);
-    std::optional<std::filesystem::path> raygenMotionSpv;
-    std::optional<std::filesystem::path> raygenMotionFullSpv;
-    std::optional<std::filesystem::path> raygenMotionGiFullSpv;
-    std::optional<std::filesystem::path> raygenMotionAllFullSpv;
-    if (context_.supportsRayTracingMotionBlur()) {
-        raygenMotionSpv = compiler.compileIfNeeded(
-            shaderDirectory / "pathtrace.rgen",
-            shaderOutputDirectory,
-            ".motion.di_packed",
-            {
-                {"RTV_MOTION_BLUR_ENABLED", "1"},
-                {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
-                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
-            });
-        raygenMotionFullSpv = compiler.compileIfNeeded(
-            shaderDirectory / "pathtrace.rgen",
-            shaderOutputDirectory,
-            ".motion.di_full",
-            {
-                {"RTV_MOTION_BLUR_ENABLED", "1"},
-                {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
-                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
-            });
-        raygenMotionGiFullSpv = compiler.compileIfNeeded(
-            shaderDirectory / "pathtrace.rgen",
-            shaderOutputDirectory,
-            ".motion.gi_full",
-            {
-                {"RTV_MOTION_BLUR_ENABLED", "1"},
-                {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
-                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
-            });
-        raygenMotionAllFullSpv = compiler.compileIfNeeded(
-            shaderDirectory / "pathtrace.rgen",
-            shaderOutputDirectory,
-            ".motion.di_full.gi_full",
-            {
-                {"RTV_MOTION_BLUR_ENABLED", "1"},
-                {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
-                {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
-            });
-    }
-    const auto raygenNative2BSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen",
-        shaderOutputDirectory,
-        ".native2b",
-        {
-            {"RTV_NATIVE2B_PIPELINE", "1"},
-            {"RTV_MOTION_BLUR_ENABLED", "0"},
-            {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
-            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
-        });
-    const auto raygenNative2BCompactPrimaryLightsSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen",
-        shaderOutputDirectory,
-        ".native2b.compact_primary_lights",
-        {
-            {"RTV_NATIVE2B_PIPELINE", "1"},
-            {"RTV_NATIVE2B_COMPACT_PRIMARY_LIGHTS", "1"},
-            {"RTV_MOTION_BLUR_ENABLED", "0"},
-            {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
-            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
-        });
-    const std::vector<std::pair<std::string, std::string>> rtDiagnosticDefines{
-        {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
-        {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
-        {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
-    };
-    const auto raygenDiagnosticSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen",
-        shaderOutputDirectory,
-        ".rt_diag.di_packed",
-        rtDiagnosticDefines);
-    const auto raygenDiagnosticFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen",
-        shaderOutputDirectory,
-        ".rt_diag.di_full",
-        {
-            {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
-            {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
-            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
-        });
-    const auto raygenDiagnosticGiFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen",
-        shaderOutputDirectory,
-        ".rt_diag.gi_full",
-        {
-            {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
-            {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
-            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
-        });
-    const auto raygenDiagnosticAllFullSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen",
-        shaderOutputDirectory,
-        ".rt_diag.di_full.gi_full",
-        {
-            {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
-            {"RTV_RESTIR_DI_VALIDATION_FULL", "1"},
-            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
-        });
-    const auto raygenNative2BDiagnosticSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rgen",
-        shaderOutputDirectory,
-        ".rt_diag.native2b",
-        {
-            {"RTV_RT_DIAGNOSTIC_COUNTERS", "1"},
-            {"RTV_NATIVE2B_PIPELINE", "1"},
-            {"RTV_MOTION_BLUR_ENABLED", "0"},
-            {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
-            {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
-        });
-    const auto wavefrontTraceRaygenSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_trace.rgen", shaderOutputDirectory);
-    std::optional<std::filesystem::path> wavefrontTraceRaygenSerSpv;
-    if (context_.supportsSER()) {
-        wavefrontTraceRaygenSerSpv = compiler.compileIfNeeded(
-            shaderDirectory / "wavefront_trace.rgen",
-            shaderOutputDirectory,
-            ".ser",
-            {{"RTV_SER_ENABLED", "1"}});
-    }
-    const auto wavefrontShadowTraceRaygenSpv = compiler.compileIfNeeded(shaderDirectory / "wavefront_shadow_trace.rgen", shaderOutputDirectory);
-    const auto missSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace.rmiss", shaderOutputDirectory);
-    const auto shadowMissSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace_shadow.rmiss", shaderOutputDirectory);
-    const auto terminalMissSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace_terminal.rmiss", shaderOutputDirectory);
-    const auto closestHitSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace.rchit", shaderOutputDirectory);
-    const auto primaryAnyHitSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace.rahit", shaderOutputDirectory);
-    const auto shadowAnyHitSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace_shadow.rahit", shaderOutputDirectory);
-    const auto terminalClosestHitSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace_terminal.rchit", shaderOutputDirectory);
-    const auto terminalAnyHitSpv = compiler.compileIfNeeded(shaderDirectory / "pathtrace_terminal.rahit", shaderOutputDirectory);
-    const auto closestHitDiagnosticSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rchit", shaderOutputDirectory, ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
-    const auto primaryAnyHitDiagnosticSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace.rahit", shaderOutputDirectory, ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
-    const auto shadowAnyHitDiagnosticSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace_shadow.rahit", shaderOutputDirectory, ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
-    const auto terminalClosestHitDiagnosticSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace_terminal.rchit", shaderOutputDirectory, ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
-    const auto terminalAnyHitDiagnosticSpv = compiler.compileIfNeeded(
-        shaderDirectory / "pathtrace_terminal.rahit", shaderOutputDirectory, ".rt_diag", {{"RTV_RT_DIAGNOSTIC_COUNTERS", "1"}});
     raygenShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenSpv), "path trace raygen");
+    raygenBeautyFastShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenBeautyFastSpv), "path trace generic beauty fast raygen");
+    raygenRegirBeautyFastShader_ = std::make_unique<ShaderModule>(
+        context_.device(),
+        ShaderCompiler::readSpirv(raygenRegirBeautyFastSpv),
+        "path trace regir beauty fast raygen");
+    raygenRegirStochasticBeautyFastShader_ = std::make_unique<ShaderModule>(
+        context_.device(),
+        ShaderCompiler::readSpirv(raygenRegirStochasticBeautyFastSpv),
+        "path trace regir stochastic beauty fast raygen");
     raygenNative2BShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenNative2BSpv), "path trace native2b raygen");
     raygenNative2BCompactPrimaryLightsShader_ = std::make_unique<ShaderModule>(
         context_.device(),
@@ -1298,61 +1523,14 @@ PathTracerRenderer::PathTracerRenderer(
     shadowAnyHitDiagnosticShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(shadowAnyHitDiagnosticSpv), "path trace diagnostic shadow any-hit");
     terminalClosestHitDiagnosticShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(terminalClosestHitDiagnosticSpv), "path trace diagnostic terminal closest-hit");
     terminalAnyHitDiagnosticShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(terminalAnyHitDiagnosticSpv), "path trace diagnostic terminal any-hit");
+    startupTiming.mark("shader_module_load_reflect");
 
-    shaderSources_ = {
-        shaderDirectory / "denoiser.comp",
-        shaderDirectory / "moment_update.comp",
-        shaderDirectory / "taa.comp",
-        shaderDirectory / "dlss_guides.comp",
-        shaderDirectory / "dlss_rr_guides.comp",
-        shaderDirectory / "nrd_prepare.comp",
-        shaderDirectory / "nrd_resolve.comp",
-        shaderDirectory / "restir_spatial.comp",
-        shaderDirectory / "restir_gi_spatial.comp",
-        shaderDirectory / "restir_gi_final.comp",
-        shaderDirectory / "restir_gi_temporal.comp",
-        shaderDirectory / "restir_gi_spatial_production.comp",
-        shaderDirectory / "restir_gi_final_production.comp",
-        shaderDirectory / "restir_gi_upsample.comp",
-        shaderDirectory / "restir_di_temporal.comp",
-        shaderDirectory / "restir_di_spatial.comp",
-        shaderDirectory / "restir_di_final.comp",
-        shaderDirectory / "fog_integrate.comp",
-        shaderDirectory / "transmittance_lut.comp",
-        shaderDirectory / "multi_scatter_lut.comp",
-        shaderDirectory / "sky_view_lut.comp",
-        shaderDirectory / "sky_reproject.comp",
-        shaderDirectory / "aerial_perspective_lut.comp",
-        shaderDirectory / "sky_cdf.comp",
-        shaderDirectory / "selection_outline.comp",
-        shaderDirectory / "luminance_histogram.comp",
-        shaderDirectory / "exposure_reduce.comp",
-        shaderDirectory / "tone_map.comp",
-        shaderDirectory / "wavefront_queue_clear.comp",
-        shaderDirectory / "wavefront_generate.comp",
-        shaderDirectory / "wavefront_shade.comp",
-        shaderDirectory / "wavefront_write.comp",
-        shaderDirectory / "wavefront_compact.comp",
-        shaderDirectory / "wavefront_sort.comp",
-        shaderDirectory / "wavefront_trace_validate.comp",
-        shaderDirectory / "wavefront_direct_validate.comp",
-        shaderDirectory / "fullscreen.vert",
-        shaderDirectory / "fullscreen.frag",
-        shaderDirectory / "pathtrace.rgen",
-        shaderDirectory / "wavefront_trace.rgen",
-        shaderDirectory / "wavefront_shadow_trace.rgen",
-        shaderDirectory / "pathtrace.rmiss",
-        shaderDirectory / "pathtrace_shadow.rmiss",
-        shaderDirectory / "pathtrace_terminal.rmiss",
-        shaderDirectory / "pathtrace.rchit",
-        shaderDirectory / "pathtrace.rahit",
-        shaderDirectory / "pathtrace_shadow.rahit",
-        shaderDirectory / "pathtrace_terminal.rchit",
-        shaderDirectory / "pathtrace_terminal.rahit",
-    };
+    shaderReloadDependencies_ = std::move(shaderReloadDependencies);
 
     layoutCache_ = std::make_unique<DescriptorLayoutCache>(context_.device());
-    pipelineCache_ = std::make_unique<PipelineCache>(context_.device(), shaderOutputDirectory / "pipeline_cache.bin");
+    pipelineCache_ = sharedPipelineCache(
+        context_.device(),
+        rendererPipelineCachePath(context_.physicalDevice(), shaderOutputDirectory));
     atmosphereLutSystem_ = std::make_unique<AtmosphereLutSystem>(
         context_.device(),
         allocator_,
@@ -1374,6 +1552,13 @@ PathTracerRenderer::PathTracerRenderer(
     bindlessTextureHeap_.updateAll(scene_.materialCombinedDescriptors());
     denoiserSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({denoiserShader_->reflection()}, 0));
     momentUpdateSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({momentUpdateShader_->reflection()}, 0));
+    adaptiveSamplingSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({adaptiveSamplingShader_->reflection()}, 0));
+    adaptiveSamplingDiscretizeSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({adaptiveSamplingDiscretizeShader_->reflection()}, 0));
+    adaptiveSamplingFillSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({adaptiveSamplingFillShader_->reflection()}, 0));
+    regirBuildSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({regirBuildShader_->reflection()}, 0));
+    regirEnvironmentBuildSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({regirEnvironmentBuildShader_->reflection()}, 0));
+    regirSpatialReuseSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({regirSpatialReuseShader_->reflection()}, 0));
+    regirTemporalReuseSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({regirTemporalReuseShader_->reflection()}, 0));
     taaSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({taaShader_->reflection()}, 0));
     gpuSkinningSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({gpuSkinningShader_->reflection()}, 0));
     dlssGuidesSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({dlssGuidesShader_->reflection()}, 0));
@@ -1422,6 +1607,7 @@ PathTracerRenderer::PathTracerRenderer(
         fullscreenFragmentShader_->reflection(),
     }, 0));
     rayTracingSetLayout_ = layoutCache_->createLayout(rayTracingBindings());
+    startupTiming.mark("descriptor_layouts");
 
     denoiserPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -1434,6 +1620,48 @@ PathTracerRenderer::PathTracerRenderer(
         *momentUpdateShader_,
         std::vector<VkDescriptorSetLayout>{momentUpdateSetLayout_},
         ShaderReflection::mergePushConstants({momentUpdateShader_->reflection()}),
+        *pipelineCache_);
+    adaptiveSamplingPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *adaptiveSamplingShader_,
+        std::vector<VkDescriptorSetLayout>{adaptiveSamplingSetLayout_},
+        ShaderReflection::mergePushConstants({adaptiveSamplingShader_->reflection()}),
+        *pipelineCache_);
+    adaptiveSamplingDiscretizePipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *adaptiveSamplingDiscretizeShader_,
+        std::vector<VkDescriptorSetLayout>{adaptiveSamplingDiscretizeSetLayout_},
+        ShaderReflection::mergePushConstants({adaptiveSamplingDiscretizeShader_->reflection()}),
+        *pipelineCache_);
+    adaptiveSamplingFillPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *adaptiveSamplingFillShader_,
+        std::vector<VkDescriptorSetLayout>{adaptiveSamplingFillSetLayout_},
+        ShaderReflection::mergePushConstants({adaptiveSamplingFillShader_->reflection()}),
+        *pipelineCache_);
+    regirBuildPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *regirBuildShader_,
+        std::vector<VkDescriptorSetLayout>{regirBuildSetLayout_},
+        ShaderReflection::mergePushConstants({regirBuildShader_->reflection()}),
+        *pipelineCache_);
+    regirEnvironmentBuildPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *regirEnvironmentBuildShader_,
+        std::vector<VkDescriptorSetLayout>{regirEnvironmentBuildSetLayout_},
+        ShaderReflection::mergePushConstants({regirEnvironmentBuildShader_->reflection()}),
+        *pipelineCache_);
+    regirSpatialReusePipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *regirSpatialReuseShader_,
+        std::vector<VkDescriptorSetLayout>{regirSpatialReuseSetLayout_},
+        ShaderReflection::mergePushConstants({regirSpatialReuseShader_->reflection()}),
+        *pipelineCache_);
+    regirTemporalReusePipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *regirTemporalReuseShader_,
+        std::vector<VkDescriptorSetLayout>{regirTemporalReuseSetLayout_},
+        ShaderReflection::mergePushConstants({regirTemporalReuseShader_->reflection()}),
         *pipelineCache_);
     taaPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -1490,12 +1718,14 @@ PathTracerRenderer::PathTracerRenderer(
         std::vector<VkDescriptorSetLayout>{restirGiFinalSetLayout_},
         ShaderReflection::mergePushConstants({restirGiFinalShader_->reflection()}),
         *pipelineCache_);
+    tracePathTraceRecordPhase("constructor_restir_gi_temporal_pipeline_begin");
     restirGiTemporalPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiTemporalShader_,
         std::vector<VkDescriptorSetLayout>{restirGiTemporalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiTemporalShader_->reflection()}),
         *pipelineCache_);
+    tracePathTraceRecordPhase("constructor_restir_gi_temporal_pipeline_end");
     restirGiTemporalFullPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiTemporalFullShader_,
@@ -1622,12 +1852,14 @@ PathTracerRenderer::PathTracerRenderer(
         std::vector<VkDescriptorSetLayout>{wavefrontPrimaryGenerateSetLayout_},
         ShaderReflection::mergePushConstants({wavefrontPrimaryGenerateShader_->reflection()}),
         *pipelineCache_);
+    tracePathTraceRecordPhase("constructor_wavefront_shade_pipeline_begin");
     wavefrontShadePipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *wavefrontShadeShader_,
         std::vector<VkDescriptorSetLayout>{wavefrontShadeSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({wavefrontShadeShader_->reflection()}),
         *pipelineCache_);
+    tracePathTraceRecordPhase("constructor_wavefront_shade_pipeline_end");
     wavefrontTraceValidatePipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *wavefrontTraceValidateShader_,
@@ -1658,6 +1890,7 @@ PathTracerRenderer::PathTracerRenderer(
         std::vector<VkDescriptorSetLayout>{wavefrontSortSetLayout_},
         ShaderReflection::mergePushConstants({wavefrontSortShader_->reflection()}),
         *pipelineCache_);
+    startupTiming.mark("compute_pipelines");
     graphicsPipeline_ = std::make_unique<GraphicsPipeline>(
         context_.device(),
         swapchainFormat,
@@ -1669,11 +1902,14 @@ PathTracerRenderer::PathTracerRenderer(
             fullscreenFragmentShader_->reflection(),
         }),
         *pipelineCache_);
+    startupTiming.mark("graphics_pipeline");
     createGpuSkinningResources();
     createGpuSkinningRayTracingBindings();
     dispatchInitialGpuSkinningForAccelerationStructures();
+    startupTiming.mark("gpu_skinning_resources");
 
     if (true) {
+        tracePathTraceRecordPhase("constructor_rt_scene_begin");
         RayTracingSceneBuildOptions rayTracingBuildOptions = makeRayTracingSceneBuildOptions();
         rayTracingScene_ = std::make_unique<RayTracingScene>(
             context_,
@@ -1681,6 +1917,8 @@ PathTracerRenderer::PathTracerRenderer(
             uploader_,
             scene_,
             std::move(rayTracingBuildOptions));
+        tracePathTraceRecordPhase("constructor_rt_scene_end");
+        startupTiming.mark("rt_scene_blas_tlas_build");
         const RayTracingBlasGeometryStats& blasGeometryStats = rayTracingScene_->blasGeometryStats();
         gpuSkinningResourcePlan_.rayTracingGeometryInputMeshCount = blasGeometryStats.gpuSkinnedMeshCount;
         gpuSkinningResourcePlan_.rayTracingGeometryInputGeometryCount = blasGeometryStats.gpuSkinnedGeometryCount;
@@ -1689,10 +1927,11 @@ PathTracerRenderer::PathTracerRenderer(
             gpuSkinningResourcePlan_.rayTracingDescriptorInputMeshCount > 0u &&
             gpuSkinningRayTracingBindingBuffer_.handle() != VK_NULL_HANDLE &&
             gpuSkinningCurrentVertexBuffer_.handle() != VK_NULL_HANDLE;
-        rayTracingPipeline_ = std::make_unique<RayTracingPipeline>(
+        tracePathTraceRecordPhase("constructor_rt_pipeline_begin");
+        rayTracingBeautyFastPipeline_ = std::make_unique<RayTracingPipeline>(
             context_.device(),
             context_.rayTracingInfo().rayTracingPipelineProperties,
-            *raygenShader_,
+            *raygenBeautyFastShader_,
             *primaryMissShader_,
             *shadowMissShader_,
             *closestHitShader_,
@@ -1703,97 +1942,10 @@ PathTracerRenderer::PathTracerRenderer(
             allocator_,
             uploader_,
             rayTracingScene_->opacityMicromapStats().active);
-        rayTracingNative2BPipeline_ = std::make_unique<RayTracingPipeline>(
-            context_.device(),
-            context_.rayTracingInfo().rayTracingPipelineProperties,
-            *raygenNative2BShader_,
-            *primaryMissShader_,
-            *shadowMissShader_,
-            *terminalMissShader_,
-            *closestHitShader_,
-            *primaryAnyHitShader_,
-            *shadowAnyHitShader_,
-            *terminalClosestHitShader_,
-            *terminalAnyHitShader_,
-            std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
-            *pipelineCache_,
-            allocator_,
-            uploader_,
-            rayTracingScene_->opacityMicromapStats().active);
-        rayTracingNative2BCompactPrimaryLightsPipeline_ = std::make_unique<RayTracingPipeline>(
-            context_.device(),
-            context_.rayTracingInfo().rayTracingPipelineProperties,
-            *raygenNative2BCompactPrimaryLightsShader_,
-            *primaryMissShader_,
-            *shadowMissShader_,
-            *terminalMissShader_,
-            *closestHitShader_,
-            *primaryAnyHitShader_,
-            *shadowAnyHitShader_,
-            *terminalClosestHitShader_,
-            *terminalAnyHitShader_,
-            std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
-            *pipelineCache_,
-            allocator_,
-            uploader_,
-            rayTracingScene_->opacityMicromapStats().active);
-        if (rayTracingDiagnosticCountersEnabled_) {
-            rayTracingDiagnosticPipeline_ = std::make_unique<RayTracingPipeline>(
-                context_.device(),
-                context_.rayTracingInfo().rayTracingPipelineProperties,
-                *raygenDiagnosticShader_,
-                *primaryMissShader_,
-                *shadowMissShader_,
-                *closestHitDiagnosticShader_,
-                *primaryAnyHitDiagnosticShader_,
-                *shadowAnyHitDiagnosticShader_,
-                std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
-                *pipelineCache_,
-                allocator_,
-                uploader_,
-                rayTracingScene_->opacityMicromapStats().active);
-            rayTracingNative2BDiagnosticPipeline_ = std::make_unique<RayTracingPipeline>(
-                context_.device(),
-                context_.rayTracingInfo().rayTracingPipelineProperties,
-                *raygenNative2BDiagnosticShader_,
-                *primaryMissShader_,
-                *shadowMissShader_,
-                *terminalMissShader_,
-                *closestHitDiagnosticShader_,
-                *primaryAnyHitDiagnosticShader_,
-                *shadowAnyHitDiagnosticShader_,
-                *terminalClosestHitDiagnosticShader_,
-                *terminalAnyHitDiagnosticShader_,
-                std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
-                *pipelineCache_,
-                allocator_,
-                uploader_,
-                rayTracingScene_->opacityMicromapStats().active);
-        }
-        if (raygenMotionShader_ != nullptr) {
-            rayTracingMotionPipeline_ = std::make_unique<RayTracingPipeline>(
-                context_.device(),
-                context_.rayTracingInfo().rayTracingPipelineProperties,
-                *raygenMotionShader_,
-                *primaryMissShader_,
-                *shadowMissShader_,
-                *closestHitShader_,
-                *primaryAnyHitShader_,
-                *shadowAnyHitShader_,
-                std::vector<VkDescriptorSetLayout>{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()},
-                *pipelineCache_,
-                allocator_,
-                uploader_,
-                rayTracingScene_->opacityMicromapStats().active,
-                true);
-        }
-        ensureRayTracingVariantPipelines(
-            settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull,
-            usesRestirGiUncompressedInitialReservoir());
-        if (settings_.wavefrontTraceEnabled || settings_.wavefrontShadowTraceEnabled) {
-            ensureWavefrontTracePipelines();
-        }
-        std::cout << "RT pipeline: SBT=" << rayTracingPipeline_->sbtBytes() << " bytes\n";
+        tracePathTraceRecordPhase("constructor_rt_pipeline_end");
+        startupTiming.mark("rt_pipeline_create");
+        std::cout << "RT pipeline variants: ReGIR/full generic/Native2B/diagnostic/motion/validation/wavefront pipelines are lazy\n";
+        std::cout << "RT pipeline: beauty_fast_sbt=" << rayTracingBeautyFastPipeline_->sbtBytes() << " bytes\n";
     }
 
     frames_.reserve(kRendererFramesInFlight);
@@ -1806,6 +1958,7 @@ PathTracerRenderer::PathTracerRenderer(
     for (auto& p : profilers_) {
         p.createPipelineStatsQuery(context_.device(), context_.supportsHardwareRayTracing());
     }
+    startupTiming.mark("frame_resources_profilers");
 
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -1819,6 +1972,7 @@ PathTracerRenderer::PathTracerRenderer(
     samplerInfo.minFilter = VK_FILTER_NEAREST;
     checkVk(vkCreateSampler(context_.device(), &samplerInfo, nullptr, &nearestSampler_), "vkCreateSampler(path tracer nearest)");
     createStbnResources(shaderDirectory);
+    startupTiming.mark("samplers_stbn");
 
     camera_.pos = {0.0f, 0.0f, 3.9f, 0.0f};
     camera_.forward = {0.0f, 0.0f, -1.0f, 0.0f};
@@ -1842,13 +1996,19 @@ PathTracerRenderer::PathTracerRenderer(
     if (dlssRequested()) {
         initializeDlssRuntime();
     }
+    startupTiming.mark("optional_nvidia_runtimes");
+    startupTiming.print();
 }
 
 void PathTracerRenderer::ensureRayTracingVariantPipelines(bool restirDiValidationFull, bool restirGiInitialFull) {
+    tracePathTraceRecordPhase("ensure_variants_enter");
     if (rayTracingScene_ == nullptr || pipelineCache_ == nullptr) {
+        tracePathTraceRecordPhase("ensure_variants_missing_scene_or_cache");
         return;
     }
+    tracePathTraceRecordPhase("ensure_variants_query_omm_begin");
     const bool ommActive = rayTracingScene_->opacityMicromapStats().active;
+    tracePathTraceRecordPhase("ensure_variants_query_omm_end");
     const std::vector<VkDescriptorSetLayout> layouts{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()};
     auto makeRtPipeline = [&](ShaderModule* raygen, bool motion = false, bool ser = false) -> std::unique_ptr<RayTracingPipeline> {
         if (raygen == nullptr) {
@@ -1891,38 +2051,301 @@ void PathTracerRenderer::ensureRayTracingVariantPipelines(bool restirDiValidatio
             ommActive);
     };
 
+    const bool needsOnlyBasePipeline =
+        !restirDiValidationFull &&
+        !restirGiInitialFull &&
+        !settings_.motionBlurEnabled &&
+        !rayTracingDiagnosticCountersEnabled_;
+    const bool fastGenericBeautyEligible = shouldUseGenericBeautyFastPath(restirDiValidationFull, restirGiInitialFull);
+    const bool fastRegirBeautyEligible =
+        settings_.pathTraceKernelMode == PathTraceKernelMode::Generic &&
+        settings_.debugView == RendererDebugView::Beauty &&
+        settings_.pathTracingEnabled &&
+        !settings_.motionBlurEnabled &&
+        !settings_.wavefrontFinalOutputEnabled &&
+        !rayTracingDiagnosticCountersEnabled_ &&
+        !restirDiValidationFull &&
+        !restirGiInitialFull &&
+        shouldUseRegir();
+    if (fastRegirBeautyEligible) {
+        if (rayTracingRegirBeautyFastPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_regir_beauty_fast_begin");
+            rayTracingRegirBeautyFastPipeline_ = makeRtPipeline(raygenRegirBeautyFastShader_.get());
+            tracePathTraceRecordPhase("ensure_variants_create_regir_beauty_fast_end");
+        }
+        if (rayTracingRegirStochasticBeautyFastPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_regir_stochastic_beauty_fast_begin");
+            rayTracingRegirStochasticBeautyFastPipeline_ = makeRtPipeline(raygenRegirStochasticBeautyFastShader_.get());
+            tracePathTraceRecordPhase("ensure_variants_create_regir_stochastic_beauty_fast_end");
+        }
+    }
+    if (!fastGenericBeautyEligible && !fastRegirBeautyEligible && rayTracingPipeline_ == nullptr) {
+        tracePathTraceRecordPhase("ensure_variants_create_full_generic_begin");
+        rayTracingPipeline_ = makeRtPipeline(raygenShader_.get());
+        tracePathTraceRecordPhase("ensure_variants_create_full_generic_end");
+    }
+    if (needsOnlyBasePipeline) {
+        tracePathTraceRecordPhase("ensure_variants_noop");
+        return;
+    }
+
     if (restirDiValidationFull && !restirGiInitialFull && rayTracingFullPipeline_ == nullptr) {
+        tracePathTraceRecordPhase("ensure_variants_create_di_full_begin");
         rayTracingFullPipeline_ = makeRtPipeline(raygenFullShader_.get());
+        tracePathTraceRecordPhase("ensure_variants_create_di_full_end");
     }
     if (restirGiInitialFull && !restirDiValidationFull && rayTracingGiFullPipeline_ == nullptr) {
+        tracePathTraceRecordPhase("ensure_variants_create_gi_full_begin");
         rayTracingGiFullPipeline_ = makeRtPipeline(raygenGiFullShader_.get());
+        tracePathTraceRecordPhase("ensure_variants_create_gi_full_end");
     }
     if (restirDiValidationFull && restirGiInitialFull && rayTracingAllFullPipeline_ == nullptr) {
+        tracePathTraceRecordPhase("ensure_variants_create_all_full_begin");
         rayTracingAllFullPipeline_ = makeRtPipeline(raygenAllFullShader_.get());
+        tracePathTraceRecordPhase("ensure_variants_create_all_full_end");
     }
     if (rayTracingDiagnosticCountersEnabled_) {
         if (restirDiValidationFull && !restirGiInitialFull && rayTracingDiagnosticFullPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_diag_di_full_begin");
             rayTracingDiagnosticFullPipeline_ = makeDiagnosticRtPipeline(raygenDiagnosticFullShader_.get());
+            tracePathTraceRecordPhase("ensure_variants_create_diag_di_full_end");
         }
         if (restirGiInitialFull && !restirDiValidationFull && rayTracingDiagnosticGiFullPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_diag_gi_full_begin");
             rayTracingDiagnosticGiFullPipeline_ = makeDiagnosticRtPipeline(raygenDiagnosticGiFullShader_.get());
+            tracePathTraceRecordPhase("ensure_variants_create_diag_gi_full_end");
         }
         if (restirDiValidationFull && restirGiInitialFull && rayTracingDiagnosticAllFullPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_diag_all_full_begin");
             rayTracingDiagnosticAllFullPipeline_ = makeDiagnosticRtPipeline(raygenDiagnosticAllFullShader_.get());
+            tracePathTraceRecordPhase("ensure_variants_create_diag_all_full_end");
         }
     }
 
     if (settings_.motionBlurEnabled) {
+        if (!restirDiValidationFull && !restirGiInitialFull && rayTracingMotionPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_motion_begin");
+            rayTracingMotionPipeline_ = makeRtPipeline(raygenMotionShader_.get(), true);
+            tracePathTraceRecordPhase("ensure_variants_create_motion_end");
+        }
         if (restirDiValidationFull && !restirGiInitialFull && rayTracingMotionFullPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_motion_di_full_begin");
             rayTracingMotionFullPipeline_ = makeRtPipeline(raygenMotionFullShader_.get(), true);
+            tracePathTraceRecordPhase("ensure_variants_create_motion_di_full_end");
         }
         if (restirGiInitialFull && !restirDiValidationFull && rayTracingMotionGiFullPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_motion_gi_full_begin");
             rayTracingMotionGiFullPipeline_ = makeRtPipeline(raygenMotionGiFullShader_.get(), true);
+            tracePathTraceRecordPhase("ensure_variants_create_motion_gi_full_end");
         }
         if (restirDiValidationFull && restirGiInitialFull && rayTracingMotionAllFullPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_motion_all_full_begin");
             rayTracingMotionAllFullPipeline_ = makeRtPipeline(raygenMotionAllFullShader_.get(), true);
+            tracePathTraceRecordPhase("ensure_variants_create_motion_all_full_end");
         }
     }
+    tracePathTraceRecordPhase("ensure_variants_exit");
+}
+
+void PathTracerRenderer::ensureNative2BPathTracePipelines() {
+    if (rayTracingScene_ == nullptr || pipelineCache_ == nullptr) {
+        return;
+    }
+
+    finishNative2BPipelineBuild(true);
+    if (native2BPipelineBuildJob_.has_value()) {
+        return;
+    }
+
+    const bool ommActive = rayTracingScene_->opacityMicromapStats().active;
+    const std::vector<VkDescriptorSetLayout> layouts{rayTracingSetLayout_, atmosphereSetLayout_, bindlessTextureHeap_.layout()};
+    const std::filesystem::path cachePath =
+        rendererPipelineCachePath(context_.physicalDevice(), shaderOutputDirectory_);
+
+    auto startNative2BBuild = [&](Native2BPipelineVariant variant,
+                                  ShaderModule* raygen,
+                                  ShaderModule* closestHit,
+                                  ShaderModule* primaryAnyHit,
+                                  ShaderModule* shadowAnyHit,
+                                  ShaderModule* terminalClosestHit,
+                                  ShaderModule* terminalAnyHit) {
+        if (raygen == nullptr ||
+            closestHit == nullptr ||
+            primaryAnyHit == nullptr ||
+            shadowAnyHit == nullptr ||
+            terminalClosestHit == nullptr ||
+            terminalAnyHit == nullptr) {
+            return;
+        }
+        const VkDevice device = context_.device();
+        const auto properties = context_.rayTracingInfo().rayTracingPipelineProperties;
+        ShaderModule* primaryMiss = primaryMissShader_.get();
+        ShaderModule* shadowMiss = shadowMissShader_.get();
+        ShaderModule* terminalMiss = terminalMissShader_.get();
+        ResourceAllocator* allocator = &allocator_;
+        BufferUploader* uploader = &uploader_;
+
+        if (context_.headless()) {
+            auto pipeline = std::make_unique<RayTracingPipeline>(
+                device,
+                properties,
+                *raygen,
+                *primaryMiss,
+                *shadowMiss,
+                *terminalMiss,
+                *closestHit,
+                *primaryAnyHit,
+                *shadowAnyHit,
+                *terminalClosestHit,
+                *terminalAnyHit,
+                layouts,
+                *pipelineCache_,
+                allocator_,
+                uploader_,
+                ommActive);
+            switch (variant) {
+            case Native2BPipelineVariant::Base:
+                rayTracingNative2BPipeline_ = std::move(pipeline);
+                break;
+            case Native2BPipelineVariant::CompactPrimaryLights:
+                rayTracingNative2BCompactPrimaryLightsPipeline_ = std::move(pipeline);
+                break;
+            case Native2BPipelineVariant::Diagnostic:
+                rayTracingNative2BDiagnosticPipeline_ = std::move(pipeline);
+                break;
+            }
+            return;
+        }
+
+        native2BPipelineBuildJob_.emplace();
+        native2BPipelineBuildJob_->variant = variant;
+        native2BPipelineBuildJob_->future = std::async(
+            std::launch::async,
+            [device,
+             properties,
+             raygen,
+             primaryMiss,
+             shadowMiss,
+             terminalMiss,
+             closestHit,
+             primaryAnyHit,
+             shadowAnyHit,
+             terminalClosestHit,
+             terminalAnyHit,
+             layouts,
+             cachePath,
+             allocator,
+             uploader,
+             ommActive]() mutable {
+                Native2BPipelineBuildResult result{};
+                result.cache = std::make_unique<PipelineCache>(device, cachePath);
+                result.pipeline = std::make_unique<RayTracingPipeline>(
+                    device,
+                    properties,
+                    *raygen,
+                    *primaryMiss,
+                    *shadowMiss,
+                    *terminalMiss,
+                    *closestHit,
+                    *primaryAnyHit,
+                    *shadowAnyHit,
+                    *terminalClosestHit,
+                    *terminalAnyHit,
+                    std::move(layouts),
+                    *result.cache,
+                    *allocator,
+                    *uploader,
+                    ommActive,
+                    true,
+                    true);
+                return result;
+            });
+    };
+
+    if (rayTracingNative2BPipeline_ == nullptr && !native2BBasePipelineBuildFailed_) {
+        startNative2BBuild(
+            Native2BPipelineVariant::Base,
+            raygenNative2BShader_.get(),
+            closestHitShader_.get(),
+            primaryAnyHitShader_.get(),
+            shadowAnyHitShader_.get(),
+            terminalClosestHitShader_.get(),
+            terminalAnyHitShader_.get());
+        return;
+    }
+    if (shouldSkipImportedEmissiveDirectSampling() &&
+        rayTracingNative2BCompactPrimaryLightsPipeline_ == nullptr &&
+        !native2BCompactPipelineBuildFailed_) {
+        startNative2BBuild(
+            Native2BPipelineVariant::CompactPrimaryLights,
+            raygenNative2BCompactPrimaryLightsShader_.get(),
+            closestHitShader_.get(),
+            primaryAnyHitShader_.get(),
+            shadowAnyHitShader_.get(),
+            terminalClosestHitShader_.get(),
+            terminalAnyHitShader_.get());
+        return;
+    }
+    if (rayTracingDiagnosticCountersEnabled_ &&
+        rayTracingNative2BDiagnosticPipeline_ == nullptr &&
+        !native2BDiagnosticPipelineBuildFailed_) {
+        startNative2BBuild(
+            Native2BPipelineVariant::Diagnostic,
+            raygenNative2BDiagnosticShader_.get(),
+            closestHitDiagnosticShader_.get(),
+            primaryAnyHitDiagnosticShader_.get(),
+            shadowAnyHitDiagnosticShader_.get(),
+            terminalClosestHitDiagnosticShader_.get(),
+            terminalAnyHitDiagnosticShader_.get());
+    }
+}
+
+void PathTracerRenderer::finishNative2BPipelineBuild(bool finalizeSbt) {
+    if (!native2BPipelineBuildJob_.has_value() ||
+        !native2BPipelineBuildJob_->future.valid()) {
+        return;
+    }
+    if (finalizeSbt &&
+        native2BPipelineBuildJob_->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return;
+    }
+
+    const Native2BPipelineVariant variant = native2BPipelineBuildJob_->variant;
+    try {
+        Native2BPipelineBuildResult result = native2BPipelineBuildJob_->future.get();
+        if (result.cache != nullptr && pipelineCache_ != nullptr &&
+            !pipelineCache_->mergeFrom(*result.cache)) {
+            std::cerr << "Failed to merge Native2B worker pipeline cache\n";
+        }
+        if (finalizeSbt && result.pipeline != nullptr) {
+            result.pipeline->finalizeDeferredSbtUpload(allocator_, uploader_);
+            switch (variant) {
+            case Native2BPipelineVariant::Base:
+                rayTracingNative2BPipeline_ = std::move(result.pipeline);
+                break;
+            case Native2BPipelineVariant::CompactPrimaryLights:
+                rayTracingNative2BCompactPrimaryLightsPipeline_ = std::move(result.pipeline);
+                break;
+            case Native2BPipelineVariant::Diagnostic:
+                rayTracingNative2BDiagnosticPipeline_ = std::move(result.pipeline);
+                break;
+            }
+        }
+    } catch (const std::exception& error) {
+        switch (variant) {
+        case Native2BPipelineVariant::Base:
+            native2BBasePipelineBuildFailed_ = true;
+            break;
+        case Native2BPipelineVariant::CompactPrimaryLights:
+            native2BCompactPipelineBuildFailed_ = true;
+            break;
+        case Native2BPipelineVariant::Diagnostic:
+            native2BDiagnosticPipelineBuildFailed_ = true;
+            break;
+        }
+        std::cerr << "Native2B pipeline build failed: " << error.what() << '\n';
+    }
+    native2BPipelineBuildJob_.reset();
 }
 
 void PathTracerRenderer::ensureWavefrontTracePipelines() {
@@ -1972,11 +2395,12 @@ void PathTracerRenderer::ensureWavefrontTracePipelines() {
 }
 
 PathTracerRenderer::~PathTracerRenderer() {
+    finishNative2BPipelineBuild(false);
     shutdownNrdRuntime();
     shutdownStreamlineRuntime();
     shutdownDlssRuntime();
-    if (pipelineCache_ && !shaderOutputDirectory_.empty()) {
-        pipelineCache_->saveToFile(shaderOutputDirectory_ / "pipeline_cache.bin");
+    if (pipelineCache_ && pipelineCache_.use_count() == 1 && !shaderOutputDirectory_.empty()) {
+        pipelineCache_->saveToFile(rendererPipelineCachePath(context_.physicalDevice(), shaderOutputDirectory_));
     }
     if (nearestSampler_ != VK_NULL_HANDLE) {
         vkDestroySampler(context_.device(), nearestSampler_, nullptr);
@@ -2286,8 +2710,17 @@ bool PathTracerRenderer::shadersNeedReload() {
     if (shaderCompiler_ == nullptr) {
         return false;
     }
-    for (const auto& source : shaderSources_) {
-        if (shaderCompiler_->needsCompile(source, shaderOutputDirectory_ / source.filename().replace_extension(".spv"))) {
+
+    constexpr auto kShaderReloadPollInterval = std::chrono::milliseconds(250);
+    const auto now = std::chrono::steady_clock::now();
+    if (shaderReloadCheckPrimed_ && now - lastShaderReloadCheck_ < kShaderReloadPollInterval) {
+        return false;
+    }
+    shaderReloadCheckPrimed_ = true;
+    lastShaderReloadCheck_ = now;
+
+    for (const ShaderReloadDependency& dependency : shaderReloadDependencies_) {
+        if (shaderCompiler_->needsCompile(dependency.source, dependency.output, dependency.extraDefines)) {
             return true;
         }
     }
@@ -2446,6 +2879,9 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
     const bool overBudget = adaptiveSmoothedGpuMs_ > targetMs * 0.96f || gpuMs > targetMs * 1.05f;
     const bool underBudget = adaptiveSmoothedGpuMs_ <= 0.0f || adaptiveSmoothedGpuMs_ < targetMs * 0.82f;
     const uint32_t stableFramesForFullQuality = mode == 1u ? 6u : (mode == 2u ? 10u : 14u);
+    const float totalMs = std::max(gpuMs, 1.0e-3f);
+    const bool pathTraceDominant = timings.pathTraceMs > targetMs * 0.72f ||
+        timings.pathTraceMs / totalMs > 0.70f;
 
     if (overBudget) {
         ++adaptiveOverBudgetFrames_;
@@ -2472,6 +2908,10 @@ void PathTracerRenderer::updateAdaptiveQuality(const GpuFrameTimings& timings) {
     } else {
         adaptiveEffectiveEnvironmentSamples_ = 1u;
         adaptiveEffectiveAtrousIterations_ = 1u;
+    }
+    if (pathTraceDominant && settings_.maxBounces > 3u) {
+        const uint32_t bounceReduction = adaptiveQualityTier_ >= 3u ? 2u : 1u;
+        adaptiveEffectiveMaxBounces_ = std::max(3u, settings_.maxBounces - bounceReduction);
     }
 
     if (temporalFrameIndex_ == 1u || temporalFrameIndex_ % 120u == 0u) {
@@ -2728,6 +3168,56 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::isfinite(next.adaptiveGpuFrameTargetMs) ? next.adaptiveGpuFrameTargetMs : 16.6f,
         4.0f,
         100.0f);
+    if (static_cast<uint32_t>(next.lightingReuseMode) > static_cast<uint32_t>(LightingReuseMode::ValidateRestirPTAgainstLegacy)) {
+        next.lightingReuseMode = LightingReuseMode::LegacyRestirDiGi;
+    }
+    if (static_cast<uint32_t>(next.pathReservoirLayout) > static_cast<uint32_t>(ReservoirLayout::PathSpaceCompressed)) {
+        next.pathReservoirLayout = ReservoirLayout::LegacyDI;
+    }
+    next.regirGridDimensions = glm::uvec3(
+        std::clamp(next.regirGridDimensions.x, 1u, 128u),
+        std::clamp(next.regirGridDimensions.y, 1u, 128u),
+        std::clamp(next.regirGridDimensions.z, 1u, 128u));
+    next.regirReservoirsPerCell = std::clamp(next.regirReservoirsPerCell, 1u, 64u);
+    next.regirCandidatesPerReservoir = std::clamp(next.regirCandidatesPerReservoir, 1u, 256u);
+    next.regirGridPadding = std::clamp(
+        std::isfinite(next.regirGridPadding) ? next.regirGridPadding : 0.10f,
+        0.0f,
+        0.5f);
+    next.regirCanonicalMix = std::clamp(
+        std::isfinite(next.regirCanonicalMix) ? next.regirCanonicalMix : 0.25f,
+        0.0f,
+        1.0f);
+    if (static_cast<uint32_t>(next.regirQueryMode) > static_cast<uint32_t>(RegirQueryMode::Stochastic)) {
+        next.regirQueryMode = RegirQueryMode::Stochastic;
+    }
+    if (static_cast<uint32_t>(next.regirGridMode) > static_cast<uint32_t>(RegirGridMode::Hash)) {
+        next.regirGridMode = RegirGridMode::Dense;
+    }
+    next.regirFiniteQueryFramePeriod = std::clamp(next.regirFiniteQueryFramePeriod, 0u, 4096u);
+    next.regirSpatialRounds = std::clamp(next.regirSpatialRounds, 1u, 8u);
+    next.regirTemporalHistory = std::clamp(next.regirTemporalHistory, 0u, 128u);
+    next.regirTemporalMaxM = std::clamp(next.regirTemporalMaxM, 1u, 1024u);
+    if (static_cast<uint32_t>(next.adaptiveSamplingMode) > static_cast<uint32_t>(AdaptiveSamplingMode::Neural)) {
+        next.adaptiveSamplingMode = AdaptiveSamplingMode::Disabled;
+    }
+    next.adaptiveSamplingBudget = std::clamp(
+        std::isfinite(next.adaptiveSamplingBudget) ? next.adaptiveSamplingBudget : 1.0f,
+        0.11f,
+        4.0f);
+    auto clampAdaptiveWeight = [](float value, float fallback) {
+        return std::clamp(std::isfinite(value) ? value : fallback, 0.0f, 1.0f);
+    };
+    next.adaptiveWeightVariance = clampAdaptiveWeight(next.adaptiveWeightVariance, 0.25f);
+    next.adaptiveWeightHistory = clampAdaptiveWeight(next.adaptiveWeightHistory, 0.10f);
+    next.adaptiveWeightMotion = clampAdaptiveWeight(next.adaptiveWeightMotion, 0.12f);
+    next.adaptiveWeightDisocclusion = clampAdaptiveWeight(next.adaptiveWeightDisocclusion, 0.12f);
+    next.adaptiveWeightReactive = clampAdaptiveWeight(next.adaptiveWeightReactive, 0.08f);
+    next.adaptiveWeightEdge = clampAdaptiveWeight(next.adaptiveWeightEdge, 0.08f);
+    next.adaptiveWeightSpecular = clampAdaptiveWeight(next.adaptiveWeightSpecular, 0.05f);
+    next.adaptiveWeightDI = clampAdaptiveWeight(next.adaptiveWeightDI, 0.07f);
+    next.adaptiveWeightGI = clampAdaptiveWeight(next.adaptiveWeightGI, 0.07f);
+    next.adaptiveWeightVolumetric = clampAdaptiveWeight(next.adaptiveWeightVolumetric, 0.06f);
     if (static_cast<uint32_t>(next.restirMode) > static_cast<uint32_t>(RestirMode::HybridCompare)) {
         next.restirMode = RestirMode::ClassicNee;
     }
@@ -2741,8 +3231,6 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
     next.restirDiTemporalMaxAge = std::clamp(next.restirDiTemporalMaxAge, 1u, 255u);
     next.restirDiMaxM = std::clamp(next.restirDiMaxM, 1u, 255u);
     next.restirDiVisibilityRayBudget = std::clamp(next.restirDiVisibilityRayBudget, 0u, 4u);
-    next.restirDiIncludeSun = false;
-    next.restirDiIncludeEnvironment = false;
     next.restirDiClampLuminance = std::clamp(
         std::isfinite(next.restirDiClampLuminance) ? next.restirDiClampLuminance : 8.0f,
         0.0f, 1000.0f);
@@ -2918,6 +3406,35 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.restirGiActiveTileMaskMode != settings_.restirGiActiveTileMaskMode ||
         next.restirHistoryCopyMode != settings_.restirHistoryCopyMode ||
         next.restirCounterMode != settings_.restirCounterMode ||
+        next.lightingReuseMode != settings_.lightingReuseMode ||
+        next.regirGridDimensions != settings_.regirGridDimensions ||
+        next.regirReservoirsPerCell != settings_.regirReservoirsPerCell ||
+        next.regirCandidatesPerReservoir != settings_.regirCandidatesPerReservoir ||
+        std::abs(next.regirGridPadding - settings_.regirGridPadding) > 0.0001f ||
+        std::abs(next.regirCanonicalMix - settings_.regirCanonicalMix) > 0.0001f ||
+        next.regirQueryMode != settings_.regirQueryMode ||
+        next.regirGridMode != settings_.regirGridMode ||
+        next.regirFiniteQueryFramePeriod != settings_.regirFiniteQueryFramePeriod ||
+        next.regirSpatialReuse != settings_.regirSpatialReuse ||
+        next.regirSpatialRounds != settings_.regirSpatialRounds ||
+        next.regirTemporalReuse != settings_.regirTemporalReuse ||
+        next.regirTemporalHistory != settings_.regirTemporalHistory ||
+        next.regirTemporalMaxM != settings_.regirTemporalMaxM ||
+        next.regirVisibilityReuse != settings_.regirVisibilityReuse ||
+        next.regirEnvironment != settings_.regirEnvironment ||
+        next.pathReservoirLayout != settings_.pathReservoirLayout ||
+        next.adaptiveSamplingMode != settings_.adaptiveSamplingMode ||
+        std::abs(next.adaptiveSamplingBudget - settings_.adaptiveSamplingBudget) > 0.0001f ||
+        std::abs(next.adaptiveWeightVariance - settings_.adaptiveWeightVariance) > 0.0001f ||
+        std::abs(next.adaptiveWeightHistory - settings_.adaptiveWeightHistory) > 0.0001f ||
+        std::abs(next.adaptiveWeightMotion - settings_.adaptiveWeightMotion) > 0.0001f ||
+        std::abs(next.adaptiveWeightDisocclusion - settings_.adaptiveWeightDisocclusion) > 0.0001f ||
+        std::abs(next.adaptiveWeightReactive - settings_.adaptiveWeightReactive) > 0.0001f ||
+        std::abs(next.adaptiveWeightEdge - settings_.adaptiveWeightEdge) > 0.0001f ||
+        std::abs(next.adaptiveWeightSpecular - settings_.adaptiveWeightSpecular) > 0.0001f ||
+        std::abs(next.adaptiveWeightDI - settings_.adaptiveWeightDI) > 0.0001f ||
+        std::abs(next.adaptiveWeightGI - settings_.adaptiveWeightGI) > 0.0001f ||
+        std::abs(next.adaptiveWeightVolumetric - settings_.adaptiveWeightVolumetric) > 0.0001f ||
         next.adaptiveQualityMode != settings_.adaptiveQualityMode ||
         std::abs(next.adaptiveGpuFrameTargetMs - settings_.adaptiveGpuFrameTargetMs) > 0.0001f ||
         next.wavefrontQueuesEnabled != settings_.wavefrontQueuesEnabled ||
@@ -2938,11 +3455,20 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.environmentIntensity - settings_.environmentIntensity) > 0.0001f ||
         std::abs(next.environmentRotation - settings_.environmentRotation) > 0.0001f ||
         std::abs(next.environmentBackgroundIntensity - settings_.environmentBackgroundIntensity) > 0.0001f;
+    const bool sunChanged =
+        next.sunlightEnabled != settings_.sunlightEnabled ||
+        std::abs(next.sunIntensity - settings_.sunIntensity) > 0.0001f ||
+        std::abs(next.sunIlluminanceLux - settings_.sunIlluminanceLux) > 0.5f ||
+        glm::length(next.sunColor - settings_.sunColor) > 0.0001f ||
+        glm::length(next.sunDirection - settings_.sunDirection) > 0.0001f ||
+        std::abs(next.sunAngularRadius - settings_.sunAngularRadius) > 0.0001f;
     const bool lightingChanged =
         next.sunlightEnabled != settings_.sunlightEnabled ||
         next.directLightingEnabled != settings_.directLightingEnabled ||
         next.environmentDirectSamples != settings_.environmentDirectSamples ||
         next.restirMode != settings_.restirMode ||
+        next.lightingReuseMode != settings_.lightingReuseMode ||
+        next.pathReservoirLayout != settings_.pathReservoirLayout ||
         next.restirGiEnabled != settings_.restirGiEnabled ||
         next.restirGiMode != settings_.restirGiMode ||
         next.restirGiReservoirLayout != settings_.restirGiReservoirLayout ||
@@ -3033,6 +3559,18 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         std::abs(next.shadowRayBias - settings_.shadowRayBias) > 0.000001f ||
         std::abs(next.shadowDistanceBias - settings_.shadowDistanceBias) > 0.000001f ||
         std::abs(next.fireflyClamp - settings_.fireflyClamp) > 0.0001f ||
+        next.adaptiveSamplingMode != settings_.adaptiveSamplingMode ||
+        std::abs(next.adaptiveSamplingBudget - settings_.adaptiveSamplingBudget) > 0.0001f ||
+        std::abs(next.adaptiveWeightVariance - settings_.adaptiveWeightVariance) > 0.0001f ||
+        std::abs(next.adaptiveWeightHistory - settings_.adaptiveWeightHistory) > 0.0001f ||
+        std::abs(next.adaptiveWeightMotion - settings_.adaptiveWeightMotion) > 0.0001f ||
+        std::abs(next.adaptiveWeightDisocclusion - settings_.adaptiveWeightDisocclusion) > 0.0001f ||
+        std::abs(next.adaptiveWeightReactive - settings_.adaptiveWeightReactive) > 0.0001f ||
+        std::abs(next.adaptiveWeightEdge - settings_.adaptiveWeightEdge) > 0.0001f ||
+        std::abs(next.adaptiveWeightSpecular - settings_.adaptiveWeightSpecular) > 0.0001f ||
+        std::abs(next.adaptiveWeightDI - settings_.adaptiveWeightDI) > 0.0001f ||
+        std::abs(next.adaptiveWeightGI - settings_.adaptiveWeightGI) > 0.0001f ||
+        std::abs(next.adaptiveWeightVolumetric - settings_.adaptiveWeightVolumetric) > 0.0001f ||
         std::abs(next.adaptiveGpuFrameTargetMs - settings_.adaptiveGpuFrameTargetMs) > 0.0001f ||
         std::abs(next.russianRouletteMinSurvival - settings_.russianRouletteMinSurvival) > 0.0001f ||
         next.restirGiTemporalMaxAge != settings_.restirGiTemporalMaxAge ||
@@ -3046,7 +3584,23 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.restirGiActiveTileMaskMode != settings_.restirGiActiveTileMaskMode ||
         next.restirHistoryCopyMode != settings_.restirHistoryCopyMode ||
         next.restirGiMode != settings_.restirGiMode ||
-        next.restirGiReservoirLayout != settings_.restirGiReservoirLayout;
+        next.restirGiReservoirLayout != settings_.restirGiReservoirLayout ||
+        next.lightingReuseMode != settings_.lightingReuseMode ||
+        next.regirGridDimensions != settings_.regirGridDimensions ||
+        next.regirReservoirsPerCell != settings_.regirReservoirsPerCell ||
+        next.regirCandidatesPerReservoir != settings_.regirCandidatesPerReservoir ||
+        std::abs(next.regirGridPadding - settings_.regirGridPadding) > 0.0001f ||
+        std::abs(next.regirCanonicalMix - settings_.regirCanonicalMix) > 0.0001f ||
+        next.regirQueryMode != settings_.regirQueryMode ||
+        next.regirGridMode != settings_.regirGridMode ||
+        next.regirFiniteQueryFramePeriod != settings_.regirFiniteQueryFramePeriod ||
+        next.regirSpatialReuse != settings_.regirSpatialReuse ||
+        next.regirSpatialRounds != settings_.regirSpatialRounds ||
+        next.regirTemporalReuse != settings_.regirTemporalReuse ||
+        next.regirTemporalHistory != settings_.regirTemporalHistory ||
+        next.regirTemporalMaxM != settings_.regirTemporalMaxM ||
+        next.regirVisibilityReuse != settings_.regirVisibilityReuse ||
+        next.regirEnvironment != settings_.regirEnvironment;
     const bool renderResolutionChanged =
         std::abs(next.renderResolutionScale - settings_.renderResolutionScale) > 0.0001f;
     const bool materialTextureFilteringChanged =
@@ -3057,6 +3611,20 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.mixedSidedSplitMode != settings_.mixedSidedSplitMode;
     const bool restirGiActiveTileMaskModeChanged =
         next.restirGiActiveTileMaskMode != settings_.restirGiActiveTileMaskMode;
+    const bool regirResourceConfigChanged =
+        next.lightingReuseMode != settings_.lightingReuseMode ||
+        next.regirGridDimensions != settings_.regirGridDimensions ||
+        next.regirReservoirsPerCell != settings_.regirReservoirsPerCell ||
+        next.regirEnvironment != settings_.regirEnvironment;
+    const bool regirActiveConfigChanged =
+        regirResourceConfigChanged ||
+        next.regirGridMode != settings_.regirGridMode;
+    const bool regirTemporalConfigChanged =
+        regirResourceConfigChanged ||
+        next.regirFiniteQueryFramePeriod != settings_.regirFiniteQueryFramePeriod ||
+        next.regirTemporalReuse != settings_.regirTemporalReuse ||
+        next.regirTemporalHistory != settings_.regirTemporalHistory ||
+        next.regirTemporalMaxM != settings_.regirTemporalMaxM;
     const bool nrdRequestedAfter = next.denoiserBackend == DenoiserBackend::Nrd;
     const bool dlssRequestedAfter = next.temporalUpscaler == TemporalUpscaler::Dlss ||
         next.dlssRayReconstructionEnabled ||
@@ -3066,6 +3634,22 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.streamlineNvPerfEnabled;
 
     settings_ = next;
+    if (sunChanged) {
+        ++lightVersionCounter_;
+    }
+    if (regirTemporalConfigChanged) {
+        regirTemporalHistoryValid_ = false;
+        regirTemporalHistoryVersion_ = glm::uvec4(0u);
+    }
+    if (regirActiveConfigChanged) {
+        regirActiveCellFeedbackValid_ = false;
+        regirHashTablesValid_ = false;
+        regirHashRotationPending_ = false;
+    }
+    if (regirResourceConfigChanged && renderExtent_.width > 0u && renderExtent_.height > 0u) {
+        retireResolutionResources();
+        createResolutionResources(renderExtent_, displayExtent_);
+    }
     setNsightPerfMarkersEnabled(settings_.streamlineNvPerfEnabled && nsightMarkersEnabled());
     if (restirDiChanged || debugChanged) {
         reconcileRestirDiResources();
@@ -3215,6 +3799,7 @@ PathTracerRenderer::NvidiaIntegrationStatus PathTracerRenderer::nvidiaIntegratio
     status.streamlineDlssRayReconstructionTags = streamlineDlssRayReconstructionTags_;
     status.streamlineDlssEvaluation = streamlineDlssEvaluation_;
     status.streamlineDlssRayReconstructionEvaluation = streamlineDlssRayReconstructionEvaluation_;
+    status.ngxDlssRayReconstructionEvaluation = ngxDlssRayReconstructionEvaluation_;
     status.streamlineNvPerfEvaluation = streamlineNvPerfEvaluation_;
     status.streamlineReflexMarkers = streamlineReflexMarkers_;
     if (!nsightPerfDiagnosticsCache_.has_value()) {
@@ -4005,6 +4590,11 @@ void PathTracerRenderer::resetAccumulation(AccumulationResetReason reason) {
         taaHistoryValid_ = false;
         restirGiHistoryValid_ = false;
         restirDiHistoryValid_ = false;
+        regirTemporalHistoryValid_ = false;
+        regirTemporalHistoryVersion_ = glm::uvec4(0u);
+        regirActiveCellFeedbackValid_ = false;
+        regirHashTablesValid_ = false;
+        regirHashRotationPending_ = false;
     }
     frameCount_ = 0;
     if (reason != AccumulationResetReason::CameraMoved) {
@@ -4045,6 +4635,10 @@ void PathTracerRenderer::applyStreamingResetMasks(
         ++objectVersionCounter_;
         ++lightVersionCounter_;
         restirDiHistoryValid_ = false;
+        regirTemporalHistoryValid_ = false;
+        regirActiveCellFeedbackValid_ = false;
+        regirHashTablesValid_ = false;
+        regirHashRotationPending_ = false;
     }
     streamingResetMaskReport_.temporalEntityUuids = temporalEntityUuids;
     streamingResetMaskReport_.restirEntityUuids = restirEntityUuids;
@@ -4328,19 +4922,18 @@ std::optional<uint32_t> PathTracerRenderer::consumePickedInstanceId() {
     if (temporalFrameIndex_ < pendingPick_.requestFrame + readbackDelay) {
         return std::nullopt;
     }
-    if (entityIdBuffer_.handle() == VK_NULL_HANDLE || entityIdBuffer_.mappedData() == nullptr || renderExtent_.width == 0 || renderExtent_.height == 0) {
+    if (entityIdReadbackBuffer_.handle() == VK_NULL_HANDLE ||
+        entityIdReadbackBuffer_.mappedData() == nullptr ||
+        renderExtent_.width == 0 ||
+        renderExtent_.height == 0) {
         pendingPick_ = {};
         return std::nullopt;
     }
 
-    const glm::vec2 viewportUv = pendingPick_.viewportUv;
     pendingPick_ = {};
-    const uint32_t x = std::min(renderExtent_.width - 1u, static_cast<uint32_t>(viewportUv.x * static_cast<float>(renderExtent_.width)));
-    const uint32_t y = std::min(renderExtent_.height - 1u, static_cast<uint32_t>(viewportUv.y * static_cast<float>(renderExtent_.height)));
-    const VkDeviceSize offset = (static_cast<VkDeviceSize>(y) * renderExtent_.width + x) * sizeof(uint32_t);
 
-    entityIdBuffer_.invalidate(sizeof(uint32_t), offset);
-    const uint32_t id = *reinterpret_cast<const uint32_t*>(static_cast<const std::byte*>(entityIdBuffer_.mappedData()) + offset);
+    entityIdReadbackBuffer_.invalidate(sizeof(uint32_t), 0);
+    const uint32_t id = *reinterpret_cast<const uint32_t*>(entityIdReadbackBuffer_.mappedData());
     if (id == UINT32_MAX) {
         return std::nullopt;
     }
@@ -4407,7 +5000,18 @@ bool PathTracerRenderer::hardwareRayTracingAvailable() const {
 
 RayTracingRendererStats PathTracerRenderer::rayTracingStats() const {
     RayTracingRendererStats stats{};
-    stats.active = rayTracingScene_ != nullptr && rayTracingPipeline_ != nullptr;
+    const RayTracingPipeline* statsPipeline =
+        rayTracingPipeline_ != nullptr ? rayTracingPipeline_.get() :
+        rayTracingBeautyFastPipeline_ != nullptr ? rayTracingBeautyFastPipeline_.get() :
+        rayTracingRegirBeautyFastPipeline_ != nullptr ? rayTracingRegirBeautyFastPipeline_.get() :
+        rayTracingRegirStochasticBeautyFastPipeline_ != nullptr ? rayTracingRegirStochasticBeautyFastPipeline_.get() :
+        rayTracingFullPipeline_ != nullptr ? rayTracingFullPipeline_.get() :
+        rayTracingGiFullPipeline_ != nullptr ? rayTracingGiFullPipeline_.get() :
+        rayTracingAllFullPipeline_ != nullptr ? rayTracingAllFullPipeline_.get() :
+        rayTracingMotionPipeline_ != nullptr ? rayTracingMotionPipeline_.get() :
+        rayTracingDiagnosticPipeline_ != nullptr ? rayTracingDiagnosticPipeline_.get() :
+        nullptr;
+    stats.active = rayTracingScene_ != nullptr && statsPipeline != nullptr;
     if (!stats.active) {
         return stats;
     }
@@ -4417,12 +5021,88 @@ RayTracingRendererStats PathTracerRenderer::rayTracingStats() const {
     stats.lastTlasRefitMs = rayTracingScene_->lastTlasRefitMs();
     stats.dynamicBlasUpdateCount = rayTracingScene_->dynamicBlasUpdateCount();
     stats.lastDynamicBlasUpdateRecordMs = rayTracingScene_->lastDynamicBlasUpdateRecordMs();
-    stats.sbtBytes = rayTracingPipeline_->sbtBytes();
+    stats.sbtBytes = statsPipeline->sbtBytes();
     stats.geometry = scene_.rayTracingGeometryStats();
     stats.blasGeometry = rayTracingScene_->blasGeometryStats();
     stats.motionInstances = rayTracingScene_->motionInstanceStats();
     stats.opacityMicromapPreprocess = scene_.opacityMicromapData().stats;
     stats.opacityMicromapBuild = rayTracingScene_->opacityMicromapStats();
+    return stats;
+}
+
+std::optional<PathTracerRenderer::RegirGridStats> PathTracerRenderer::regirGridStats() const {
+    const uint64_t totalCells =
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.x, 1u)) *
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.y, 1u)) *
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.z, 1u));
+    const uint64_t denseBytes =
+        totalCells *
+        static_cast<uint64_t>(std::max(settings_.regirReservoirsPerCell, 1u)) *
+        sizeof(ReGIRReservoirGpu);
+
+    RegirGridStats stats{};
+    stats.totalCellCount = totalCells;
+    stats.denseReservoirBytes = denseBytes;
+    stats.effectiveReservoirBytes = denseBytes;
+    stats.backingBytes = regirReservoirBuffer_.size();
+    const bool infiniteLightBankEffective = shouldUseRegirEnvironment();
+    const float sunPower = settings_.usePhysicalCamera
+        ? settings_.sunIlluminanceLux
+        : settings_.sunIntensity;
+    const bool sunAvailable = settings_.sunlightEnabled &&
+        settings_.sunDirection.y > 0.0f && sunPower > 0.0f &&
+        glm::dot(settings_.sunColor, glm::vec3(0.2126f, 0.7152f, 0.0722f)) > 0.0f;
+    stats.environmentEffective = infiniteLightBankEffective && scene_.envParams().enabled != 0u;
+    stats.sunEffective = infiniteLightBankEffective && sunAvailable;
+    stats.environmentBankSize = stats.environmentEffective ? kRegirEnvironmentBankSize : 0u;
+    stats.sunBankSize = stats.sunEffective ? kRegirSunBankSize : 0u;
+    stats.validEnvironmentReservoirs = stats.environmentBankSize;
+    stats.validSunReservoirs = stats.sunBankSize;
+    stats.environmentGeneration = environmentVersionCounter_;
+    stats.lightGeneration = lightVersionCounter_;
+    stats.temporalHistoryValid = regirTemporalHistoryValid_;
+    stats.environmentBankBytes = infiniteLightBankEffective ? regirEnvironmentReservoirBuffer_.size() : 0u;
+    stats.backingBytes += stats.environmentBankBytes;
+    stats.effectiveReservoirBytes += stats.environmentBankBytes;
+
+    if (!regirActiveCellFeedbackValid_ ||
+        regirActiveCellReadbackBuffer_.handle() == VK_NULL_HANDLE ||
+        regirActiveCellReadbackBuffer_.mappedData() == nullptr ||
+        regirActiveCellReadbackBuffer_.size() < sizeof(uint32_t) * 4u) {
+        return stats;
+    }
+
+    regirActiveCellReadbackBuffer_.invalidate(sizeof(uint32_t) * 4u);
+    const auto* values = static_cast<const uint32_t*>(regirActiveCellReadbackBuffer_.mappedData());
+    stats.activeCellCount = values[0];
+    stats.hashCollisionCount = values[1];
+    stats.hashSaturationCount = values[2];
+    stats.hashCellCapacity = values[3];
+    stats.feedbackAvailable = true;
+    if (settings_.regirGridMode == RegirGridMode::Active &&
+        settings_.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR) {
+        const uint64_t activeCells = std::min<uint64_t>(stats.activeCellCount, totalCells);
+        stats.effectiveReservoirBytes =
+            activeCells *
+            static_cast<uint64_t>(std::max(settings_.regirReservoirsPerCell, 1u)) *
+            sizeof(ReGIRReservoirGpu);
+        stats.backingBytes = regirReservoirBuffer_.size() + regirActiveCellBuffer_.size();
+        stats.effectiveReservoirBytes += regirActiveCellBuffer_.size();
+        stats.backingBytes += stats.environmentBankBytes;
+        stats.effectiveReservoirBytes += stats.environmentBankBytes;
+    } else if (settings_.regirGridMode == RegirGridMode::Hash &&
+        settings_.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR) {
+        const uint64_t activeCells = std::min<uint64_t>(stats.activeCellCount, regirHashCellCapacity());
+        const uint64_t hashTableBytes = regirHashCurrentCellBuffer_.size() + regirHashNextCellBuffer_.size();
+        stats.effectiveReservoirBytes =
+            activeCells *
+                static_cast<uint64_t>(std::max(settings_.regirReservoirsPerCell, 1u)) *
+                sizeof(ReGIRReservoirGpu) +
+            hashTableBytes;
+        stats.backingBytes = regirReservoirBuffer_.size() + hashTableBytes;
+        stats.backingBytes += stats.environmentBankBytes;
+        stats.effectiveReservoirBytes += stats.environmentBankBytes;
+    }
     return stats;
 }
 
@@ -4989,6 +5669,9 @@ void PathTracerRenderer::retireResolutionResources() {
     retireImage(historyLengthResolvedImage_);
     retireImage(momentDebugImage_);
     retireImage(momentDebugResolvedImage_);
+    retireImage(adaptiveSamplingDebugImage_);
+    retireImage(adaptiveSamplingFilledMaskImage_);
+    retireImage(adaptiveSamplingFilledImage_);
     retireImage(taaImage_);
     retireImage(taaHistoryImage_);
     retireImage(dlssDepthImage_);
@@ -5018,7 +5701,27 @@ void PathTracerRenderer::retireResolutionResources() {
     retireBuffer(previousWorldPositionBuffer_);
     retireBuffer(velocityBuffer_);
     retireBuffer(entityIdBuffer_);
+    retireBuffer(entityIdReadbackBuffer_);
     retireBuffer(pathDataBuffer_);
+    retireBuffer(adaptiveSamplingDensityBuffer_);
+    retireBuffer(adaptiveSamplingSampleCountBuffer_);
+    retireBuffer(adaptiveSamplingStatsBuffer_);
+    retireBuffer(adaptiveSamplingStatsReadbackBuffer_);
+    retireBuffer(regirParamsBuffer_);
+    retireBuffer(regirReservoirBuffer_);
+    retireBuffer(regirEnvironmentReservoirBuffer_);
+    retireBuffer(regirSpatialReservoirBuffer_);
+    retireBuffer(regirTemporalReservoirBuffer_);
+    retireBuffer(regirPreviousReservoirBuffer_);
+    retireBuffer(regirActiveCellBuffer_);
+    retireBuffer(regirActiveCellReadbackBuffer_);
+    retireBuffer(regirHashCurrentCellBuffer_);
+    retireBuffer(regirHashNextCellBuffer_);
+    regirActiveCellFeedbackValid_ = false;
+    regirHashTablesValid_ = false;
+    regirHashRotationPending_ = false;
+    regirTemporalHistoryValid_ = false;
+    regirTemporalHistoryVersion_ = glm::uvec4(0u);
     retireBuffer(streamingResetMaskBuffer_);
     retireBuffer(streamingResetInstanceMaskBuffer_);
     retireBuffer(rayTracingDiagnosticCountersBuffer_);
@@ -5390,6 +6093,27 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .debugName = "path tracer moment debug resolved",
     });
+    adaptiveSamplingDebugImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer adaptive sampling debug",
+    });
+    adaptiveSamplingFilledMaskImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R32_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .debugName = "path tracer adaptive sampling filled mask",
+    });
+    adaptiveSamplingFilledImage_.create(allocator_, ImageDesc{
+        .width = renderExtent.width,
+        .height = renderExtent.height,
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .debugName = "path tracer adaptive sampling filled hdr",
+    });
     taaImage_.create(allocator_, ImageDesc{
         .width = displayExtent.width,
         .height = displayExtent.height,
@@ -5576,16 +6300,141 @@ void PathTracerRenderer::createResolutionResources(VkExtent2D renderExtent, VkEx
     });
     entityIdBuffer_.create(allocator_, BufferDesc{
         .size = pixelCount * sizeof(uint32_t),
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "path entity ids",
+    });
+    entityIdReadbackBuffer_.create(allocator_, BufferDesc{
+        .size = sizeof(uint32_t),
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory = BufferMemory::Readback,
         .persistentMapped = true,
-        .debugName = "path entity id pick buffer",
+        .debugName = "path entity id pick readback",
     });
     pathDataBuffer_.create(allocator_, BufferDesc{
         .size = pixelCount * sizeof(PathDataGpu),
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .memory = BufferMemory::GpuOnly,
         .debugName = "path data channels",
+    });
+    adaptiveSamplingDensityBuffer_.create(allocator_, BufferDesc{
+        .size = pixelCount * sizeof(float),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "adaptive sampling density",
+    });
+    adaptiveSamplingSampleCountBuffer_.create(allocator_, BufferDesc{
+        .size = pixelCount * sizeof(uint32_t),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "adaptive sampling sample count",
+    });
+    adaptiveSamplingStatsBuffer_.create(allocator_, BufferDesc{
+        .size = sizeof(uint32_t) * 20u,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "adaptive sampling stats",
+    });
+    adaptiveSamplingStatsReadbackBuffer_.create(allocator_, BufferDesc{
+        .size = sizeof(uint32_t) * 4u,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::Readback,
+        .persistentMapped = true,
+        .debugName = "adaptive sampling stats readback",
+    });
+    regirParamsBuffer_.create(allocator_, BufferDesc{
+        .size = sizeof(ReGIRParams),
+        .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::Upload,
+        .persistentMapped = true,
+        .debugName = "ReGIR params",
+    });
+    const glm::uvec3 regirDims{
+        std::max(settings_.regirGridDimensions.x, 1u),
+        std::max(settings_.regirGridDimensions.y, 1u),
+        std::max(settings_.regirGridDimensions.z, 1u),
+    };
+    const uint32_t regirReservoirsPerCell = std::max(settings_.regirReservoirsPerCell, 1u);
+    const VkDeviceSize regirCellCount =
+        static_cast<VkDeviceSize>(regirDims.x) *
+        static_cast<VkDeviceSize>(regirDims.y) *
+        static_cast<VkDeviceSize>(regirDims.z);
+    const VkDeviceSize regirStorageCellCount = settings_.regirGridMode == RegirGridMode::Hash
+        ? static_cast<VkDeviceSize>(regirHashCellCapacity())
+        : regirCellCount;
+    const VkDeviceSize regirReservoirCount = regirStorageCellCount * static_cast<VkDeviceSize>(regirReservoirsPerCell);
+    const VkDeviceSize regirActiveBytes = regirReservoirCount * sizeof(ReGIRReservoirGpu);
+    const VkDeviceSize regirActiveCellBytes =
+        (4ull + regirCellCount) *
+        sizeof(uint32_t);
+    const VkDeviceSize regirHashCellBytes =
+        (4ull + static_cast<VkDeviceSize>(regirHashCellCapacity())) * sizeof(uint32_t);
+    const bool allocateRegirGrid = settings_.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR &&
+        regirActiveBytes > 0u;
+    regirReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = allocateRegirGrid ? regirActiveBytes : sizeof(ReGIRReservoirGpu),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = allocateRegirGrid ? "ReGIR reservoirs" : "ReGIR reservoirs fallback",
+    });
+    regirEnvironmentReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = allocateRegirGrid && settings_.regirEnvironment
+            ? sizeof(ReGIREnvironmentReservoirGpu) * kRegirInfiniteLightBankSize
+            : sizeof(ReGIREnvironmentReservoirGpu),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = allocateRegirGrid && settings_.regirEnvironment
+            ? "ReGIR environment reservoir bank"
+            : "ReGIR environment reservoir fallback",
+    });
+    regirSpatialReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = allocateRegirGrid ? regirActiveBytes : sizeof(ReGIRReservoirGpu),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = allocateRegirGrid ? "ReGIR spatial reservoirs" : "ReGIR spatial reservoirs fallback",
+    });
+    regirTemporalReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = allocateRegirGrid ? regirActiveBytes : sizeof(ReGIRReservoirGpu),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = allocateRegirGrid ? "ReGIR temporal reservoirs" : "ReGIR temporal reservoirs fallback",
+    });
+    regirPreviousReservoirBuffer_.create(allocator_, BufferDesc{
+        .size = allocateRegirGrid ? regirActiveBytes : sizeof(ReGIRReservoirGpu),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = allocateRegirGrid ? "ReGIR previous reservoirs" : "ReGIR previous reservoirs fallback",
+    });
+    regirActiveCellBuffer_.create(allocator_, BufferDesc{
+        .size = allocateRegirGrid && settings_.regirGridMode == RegirGridMode::Active
+            ? regirActiveCellBytes
+            : sizeof(uint32_t) * 5u,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = allocateRegirGrid ? "ReGIR active cell feedback" : "ReGIR active cell feedback fallback",
+    });
+    regirActiveCellReadbackBuffer_.create(allocator_, BufferDesc{
+        .size = sizeof(uint32_t) * 4u,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::Readback,
+        .persistentMapped = true,
+        .debugName = "ReGIR active cell feedback readback",
+    });
+    regirHashCurrentCellBuffer_.create(allocator_, BufferDesc{
+        .size = allocateRegirGrid && settings_.regirGridMode == RegirGridMode::Hash
+            ? regirHashCellBytes
+            : sizeof(uint32_t) * 5u,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "ReGIR current hash cells",
+    });
+    regirHashNextCellBuffer_.create(allocator_, BufferDesc{
+        .size = allocateRegirGrid && settings_.regirGridMode == RegirGridMode::Hash
+            ? regirHashCellBytes
+            : sizeof(uint32_t) * 5u,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "ReGIR next hash cells",
     });
     streamingResetInstanceMaskBuffer_.create(allocator_, BufferDesc{
         .size = 64ull * sizeof(uint32_t),
@@ -6029,8 +6878,8 @@ void PathTracerRenderer::updateCamera() {
     camera_.restirDiControls = glm::uvec4(
         shouldRunRestirDiEstimator() ? 1u : 0u,
         settings_.secondaryDirectLightingEnabled ? 1u : 0u,
-        static_cast<uint32_t>(settings_.restirDiMode),
-        static_cast<uint32_t>(settings_.restirDiReservoirLayout));
+        settings_.restirDiIncludeSun ? 1u : 0u,
+        settings_.restirDiIncludeEnvironment ? 1u : 0u);
     camera_.pathTraceControls = glm::uvec4(
         settings_.samplesPerPixel,
         effectiveLimitSamplesPerPixel() ? 1u : 0u,
@@ -6042,7 +6891,8 @@ void PathTracerRenderer::updateCamera() {
             ((static_cast<uint32_t>(settings_.blendedDecalShadowMode) & 3u) << 5u) |
             ((static_cast<uint32_t>(settings_.native2BDirectReuseMode) & 3u) << 7u) |
             (settings_.forceOpaqueCameraRays ? 512u : 0u) |
-            (shouldSkipImportedEmissiveDirectSampling() ? 1024u : 0u),
+            (shouldSkipImportedEmissiveDirectSampling() ? 1024u : 0u) |
+            (shouldRunAdaptiveSamplingPrepass() ? 2048u : 0u),
         settings_.mneeCausticsEnabled ? 1u : 0u);
     camera_.dofControls = glm::vec4(
         settings_.dofApertureRadius,
@@ -6263,6 +7113,7 @@ void PathTracerRenderer::updateCamera() {
 
     frameUniforms.write(&debugParams_, sizeof(debugParams_), kFrameDebugParamsOffset);
     frameUniforms.flush(sizeof(debugParams_), kFrameDebugParamsOffset);
+    updateRegirParamsBuffer();
 
     if (streamlineFrameActive_) {
         const glm::mat4 currentNonJitteredViewProj = nonJitteredProjection * view;
@@ -6311,15 +7162,192 @@ void PathTracerRenderer::updateCamera() {
     previousJitter_ = currentJitter;
 }
 
+void PathTracerRenderer::updateRegirParamsBuffer() {
+    if (regirParamsBuffer_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    const glm::uvec3 dims{
+        std::max(settings_.regirGridDimensions.x, 1u),
+        std::max(settings_.regirGridDimensions.y, 1u),
+        std::max(settings_.regirGridDimensions.z, 1u),
+    };
+    const uint32_t reservoirsPerCell = std::max(settings_.regirReservoirsPerCell, 1u);
+    const VkDeviceSize cellCount =
+        static_cast<VkDeviceSize>(dims.x) *
+        static_cast<VkDeviceSize>(dims.y) *
+        static_cast<VkDeviceSize>(dims.z);
+    const bool wantsRegir = settings_.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR;
+    const bool wantsActiveGrid = wantsRegir && settings_.regirGridMode == RegirGridMode::Active;
+    const bool wantsHashGrid = wantsRegir && settings_.regirGridMode == RegirGridMode::Hash;
+    const VkDeviceSize storageCellCount = wantsHashGrid
+        ? static_cast<VkDeviceSize>(regirHashCellCapacity())
+        : cellCount;
+    const VkDeviceSize targetReservoirBytes = wantsRegir
+        ? storageCellCount * static_cast<VkDeviceSize>(reservoirsPerCell) * sizeof(ReGIRReservoirGpu)
+        : sizeof(ReGIRReservoirGpu);
+    const VkDeviceSize targetEnvironmentReservoirBytes = wantsRegir && settings_.regirEnvironment
+        ? sizeof(ReGIREnvironmentReservoirGpu) * kRegirInfiniteLightBankSize
+        : sizeof(ReGIREnvironmentReservoirGpu);
+    const VkDeviceSize targetActiveCellBytes = wantsActiveGrid
+        ? (cellCount + 4ull) * sizeof(uint32_t)
+        : sizeof(uint32_t) * 5u;
+    const VkDeviceSize targetHashCellBytes = wantsHashGrid
+        ? (static_cast<VkDeviceSize>(regirHashCellCapacity()) + 4ull) * sizeof(uint32_t)
+        : sizeof(uint32_t) * 5u;
+    if (regirReservoirBuffer_.handle() == VK_NULL_HANDLE ||
+        regirReservoirBuffer_.size() != targetReservoirBytes) {
+        regirReservoirBuffer_.destroy();
+        regirReservoirBuffer_.create(allocator_, BufferDesc{
+            .size = std::max<VkDeviceSize>(targetReservoirBytes, sizeof(ReGIRReservoirGpu)),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = wantsRegir ? "ReGIR reservoirs" : "ReGIR reservoirs fallback",
+        });
+    }
+    if (regirEnvironmentReservoirBuffer_.handle() == VK_NULL_HANDLE ||
+        regirEnvironmentReservoirBuffer_.size() != targetEnvironmentReservoirBytes) {
+        regirEnvironmentReservoirBuffer_.destroy();
+        regirEnvironmentReservoirBuffer_.create(allocator_, BufferDesc{
+            .size = targetEnvironmentReservoirBytes,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = wantsRegir && settings_.regirEnvironment
+                ? "ReGIR environment reservoir bank"
+                : "ReGIR environment reservoir fallback",
+        });
+    }
+    if (regirSpatialReservoirBuffer_.handle() == VK_NULL_HANDLE ||
+        regirSpatialReservoirBuffer_.size() != targetReservoirBytes) {
+        regirSpatialReservoirBuffer_.destroy();
+        regirSpatialReservoirBuffer_.create(allocator_, BufferDesc{
+            .size = std::max<VkDeviceSize>(targetReservoirBytes, sizeof(ReGIRReservoirGpu)),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = wantsRegir ? "ReGIR spatial reservoirs" : "ReGIR spatial reservoirs fallback",
+        });
+    }
+    if (regirTemporalReservoirBuffer_.handle() == VK_NULL_HANDLE ||
+        regirTemporalReservoirBuffer_.size() != targetReservoirBytes) {
+        regirTemporalReservoirBuffer_.destroy();
+        regirTemporalReservoirBuffer_.create(allocator_, BufferDesc{
+            .size = std::max<VkDeviceSize>(targetReservoirBytes, sizeof(ReGIRReservoirGpu)),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = wantsRegir ? "ReGIR temporal reservoirs" : "ReGIR temporal reservoirs fallback",
+        });
+        regirTemporalHistoryValid_ = false;
+    }
+    if (regirActiveCellBuffer_.handle() == VK_NULL_HANDLE ||
+        regirActiveCellBuffer_.size() != targetActiveCellBytes) {
+        regirActiveCellBuffer_.destroy();
+        regirActiveCellBuffer_.create(allocator_, BufferDesc{
+            .size = std::max<VkDeviceSize>(targetActiveCellBytes, sizeof(uint32_t) * 5u),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = wantsRegir ? "ReGIR active cell feedback" : "ReGIR active cell feedback fallback",
+        });
+        regirActiveCellFeedbackValid_ = false;
+    }
+    if (regirActiveCellReadbackBuffer_.handle() == VK_NULL_HANDLE ||
+        regirActiveCellReadbackBuffer_.size() < sizeof(uint32_t) * 4u) {
+        regirActiveCellReadbackBuffer_.destroy();
+        regirActiveCellReadbackBuffer_.create(allocator_, BufferDesc{
+            .size = sizeof(uint32_t) * 4u,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::Readback,
+            .persistentMapped = true,
+            .debugName = "ReGIR active cell feedback readback",
+        });
+    }
+    auto reconcileHashCells = [&](Buffer& buffer, const char* debugName) {
+        if (buffer.handle() == VK_NULL_HANDLE ||
+            buffer.size() != targetHashCellBytes) {
+            buffer.destroy();
+            buffer.create(allocator_, BufferDesc{
+                .size = targetHashCellBytes,
+                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .memory = BufferMemory::GpuOnly,
+                .debugName = debugName,
+            });
+            regirHashTablesValid_ = false;
+            regirHashRotationPending_ = false;
+            regirActiveCellFeedbackValid_ = false;
+        }
+    };
+    reconcileHashCells(regirHashCurrentCellBuffer_, "ReGIR current hash cells");
+    reconcileHashCells(regirHashNextCellBuffer_, "ReGIR next hash cells");
+    if (regirPreviousReservoirBuffer_.handle() == VK_NULL_HANDLE ||
+        regirPreviousReservoirBuffer_.size() != targetReservoirBytes) {
+        regirPreviousReservoirBuffer_.destroy();
+        regirPreviousReservoirBuffer_.create(allocator_, BufferDesc{
+            .size = std::max<VkDeviceSize>(targetReservoirBytes, sizeof(ReGIRReservoirGpu)),
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            .memory = BufferMemory::GpuOnly,
+            .debugName = wantsRegir ? "ReGIR previous reservoirs" : "ReGIR previous reservoirs fallback",
+        });
+        regirTemporalHistoryValid_ = false;
+    }
+    const uint32_t regirTemporalHistoryFrames = settings_.regirTemporalReuse
+        ? std::max(settings_.regirTemporalHistory, 1u)
+        : 0u;
+    const glm::uvec4 currentRegirVersion{
+        lightVersionCounter_,
+        materialVersionCounter_,
+        objectVersionCounter_,
+        environmentVersionCounter_,
+    };
+    if (regirTemporalHistoryVersion_ != currentRegirVersion) {
+        regirTemporalHistoryValid_ = false;
+        regirActiveCellFeedbackValid_ = false;
+        regirHashTablesValid_ = false;
+        regirHashRotationPending_ = false;
+        regirTemporalHistoryVersion_ = currentRegirVersion;
+    }
+    const ReGIRParams params{
+        .gridDimensionsReservoirs = glm::uvec4(dims, reservoirsPerCell),
+        .controls = glm::uvec4(
+            (shouldUseRegir() ? 1u : 0u) |
+                (static_cast<uint32_t>(settings_.regirGridMode) << 1u) |
+                (settings_.regirEnvironment ? 8u : 0u) |
+                (settings_.regirVisibilityReuse ? 16u : 0u),
+            std::max(settings_.regirCandidatesPerReservoir, 1u),
+            settings_.fixedSeed.has_value() ? *settings_.fixedSeed : temporalFrameIndex_,
+            regirTemporalHistoryFrames),
+        .gridPadding = glm::vec4(
+            std::max(settings_.regirGridPadding, 0.0f),
+            settings_.regirTemporalReuse ? 1.0f : 0.0f,
+            regirTemporalHistoryValid_ ? 1.0f : 0.0f,
+            static_cast<float>(std::max(settings_.regirTemporalMaxM, 1u))),
+        .queryControls = glm::vec4(
+            std::clamp(settings_.regirCanonicalMix, 0.0f, 1.0f),
+            settings_.regirQueryMode == RegirQueryMode::Stochastic ? 1.0f : 0.0f,
+            settings_.regirSpatialReuse ? static_cast<float>(std::clamp(settings_.regirSpatialRounds, 1u, 8u)) : 1.0f,
+            settings_.regirSpatialReuse ? 1.0f : 0.0f),
+        .environmentControls = glm::uvec4(
+            environmentVersionCounter_,
+            kRegirInfiniteLightBankSize,
+            kRegirEnvironmentBankSize,
+            kRegirSunBankSize),
+    };
+    regirParamsBuffer_.write(&params, sizeof(params));
+    regirParamsBuffer_.flush(sizeof(params));
+}
+
 void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer, bool deferPostTraceCompute) {
+    tracePathTraceRecordPhase("begin");
     asyncHistoryCopyPending_ = false;
     asyncTaaHistoryCopyPending_ = false;
     asyncPostProcessPending_ = false;
     if (dumpRenderGraphPath_.has_value() || dumpRenderGraphDotPath_.has_value()) {
+        tracePathTraceRecordPhase("render_graph_plan_begin");
         recordRenderGraphPlan();
+        tracePathTraceRecordPhase("render_graph_plan_end");
     }
+    tracePathTraceRecordPhase("profiler_reset_begin");
     currentProfiler_->resetForFrame(commandBuffer);
+    tracePathTraceRecordPhase("profiler_reset_end");
     if (atmosphereLutSystem_ != nullptr) {
+        tracePathTraceRecordPhase("atmosphere_begin");
         atmosphereLutSystem_->setSkyDirection(settings_.sunDirection, settings_.skyIntensity);
         atmosphereLutSystem_->setAtmosphereParams(settings_.rayleighScaleHeight, settings_.mieScaleHeight, settings_.mieAnisotropy, settings_.groundAlbedo);
         atmosphereLutSystem_->setCameraPosition(glm::vec3(camera_.pos));
@@ -6332,9 +7360,13 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer, bool def
         if (const AtmosphereSamplingSystem* sampling = atmosphereLutSystem_->samplingSystem()) {
             scene_.setSkyCdfDimensions(sampling->skyViewWidth(), sampling->skyViewHeight());
         }
+        tracePathTraceRecordPhase("atmosphere_end");
     }
+    tracePathTraceRecordPhase("gpu_skinning_begin");
     const bool gpuSkinningDispatched = recordGpuSkinningPass(commandBuffer);
+    tracePathTraceRecordPhase("gpu_skinning_end");
     if (gpuSkinningDispatched && rayTracingScene_ != nullptr) {
+        tracePathTraceRecordPhase("dynamic_blas_begin");
         RayTracingSceneBuildOptions rayTracingBuildOptions = makeRayTracingSceneBuildOptions();
         currentProfiler_->write(commandBuffer, GpuProfiler::DynamicBlasUpdateStart, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
         if (rayTracingScene_->recordDynamicBlasUpdates(
@@ -6346,21 +7378,32 @@ void PathTracerRenderer::recordPathTrace(VkCommandBuffer commandBuffer, bool def
             validationLog_.recordPass("dynamic BLAS update recorded for GPU-skinned meshes");
         }
         currentProfiler_->write(commandBuffer, GpuProfiler::DynamicBlasUpdateEnd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+        tracePathTraceRecordPhase("dynamic_blas_end");
     }
+    tracePathTraceRecordPhase("path_trace_graph_begin");
     recordPathTraceGraph(commandBuffer);
+    tracePathTraceRecordPhase("path_trace_graph_end");
     currentProfiler_->markStatsSubmitted();
+    tracePathTraceRecordPhase("legacy_restir_spatial_begin");
     recordRestirSpatial(commandBuffer);
+    tracePathTraceRecordPhase("legacy_restir_spatial_end");
+    tracePathTraceRecordPhase("height_fog_begin");
     recordHeightFog(commandBuffer);
+    tracePathTraceRecordPhase("height_fog_end");
 
     if (deferPostTraceCompute) {
         currentProfiler_->write(commandBuffer, GpuProfiler::AsyncProducerEnd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
         asyncPostProcessPending_ = true;
     } else {
+        tracePathTraceRecordPhase("post_trace_compute_begin");
         recordPostTraceCompute(commandBuffer, false);
+        tracePathTraceRecordPhase("post_trace_compute_end");
     }
     cameraChangedThisFrame_ = false;
     if (temporalSystem_) {
+        tracePathTraceRecordPhase("temporal_end_frame_begin");
         temporalSystem_->endFrame();
+        tracePathTraceRecordPhase("temporal_end_frame_end");
     }
     if (streamlineFrameActive_) {
         streamlineNvPerfEvaluation_ = StreamlineEvaluationSummary{};
@@ -6420,6 +7463,11 @@ RayTracingSceneBuildOptions PathTracerRenderer::makeRayTracingSceneBuildOptions(
         .hardwareBackfaceCullingEnabled = settings_.hardwareBackfaceCullingEnabled,
         .mixedSidedSplitMode = settings_.mixedSidedSplitMode,
     };
+    const OpacityMicromapPreprocessStats& ommStats = scene_.opacityMicromapData().stats;
+    if (rayTracingBuildOptions.opacityMicromapsEnabled &&
+        ommStats.totalTriangleCount >= 1'000'000u) {
+        rayTracingBuildOptions.opacityMicromapsEnabled = false;
+    }
     if (gpuSkinningResourcePlan_.initialComputeDispatchSubmitted &&
         gpuSkinningCurrentVertexBuffer_.handle() != VK_NULL_HANDLE) {
         rayTracingBuildOptions.gpuSkinnedVertexBuffer = &gpuSkinningCurrentVertexBuffer_;
@@ -6755,6 +7803,9 @@ void PathTracerRenderer::updateGpuSkinningOutputReadbackValidation() {
 
 void PathTracerRenderer::recordPostTraceCompute(VkCommandBuffer commandBuffer, bool deferHistoryCopy) {
     const bool runDlssRayReconstruction = shouldRunDlssRayReconstruction();
+    if (shouldRunAdaptiveSamplingFill()) {
+        recordAdaptiveSamplingFill(commandBuffer);
+    }
     if (runDlssRayReconstruction) {
         (void)deferHistoryCopy;
         skipDenoiserPass(commandBuffer);
@@ -6774,6 +7825,9 @@ void PathTracerRenderer::recordPostTraceCompute(VkCommandBuffer commandBuffer, b
         }
     } else {
         skipDenoiserPass(commandBuffer);
+    }
+    if (shouldRunAdaptiveSamplingDiagnostics() && !shouldRunAdaptiveSamplingPrepass()) {
+        recordAdaptiveSamplingDiagnostics(commandBuffer);
     }
     if (!runDlssRayReconstruction) {
         if (shouldRunDlss()) {
@@ -6854,6 +7908,7 @@ void PathTracerRenderer::bindWavefrontFrameResources() {
 }
 
 void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
+    tracePathTraceRecordPhase("path_trace_graph_resources_begin");
     RenderGraph graph(&allocator_, resourceAliasingEnabled_);
     auto imageResource = [](const Image& image, const char* name) {
         return RenderGraphResource{
@@ -6891,12 +7946,54 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
     const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "depth normal"));
     const RenderGraphResourceId worldPosition = graph.createBuffer(bufferResource(worldPositionBuffer_, "world position"));
     const RenderGraphResourceId entityIds = graph.createBuffer(bufferResource(entityIdBuffer_, "entity ids"));
+    VkDeviceSize entityIdPickSourceOffset = 0;
+    const bool copyEntityIdPick = entityIdPickReadbackSourceOffset(entityIdPickSourceOffset);
+    RenderGraphResourceId entityIdPickReadback{};
+    if (copyEntityIdPick) {
+        entityIdPickReadback = graph.createBuffer(bufferResource(entityIdReadbackBuffer_, "entity id pick readback"));
+    }
     const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
     const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
+    const RenderGraphResourceId historyLength = graph.createTexture(imageResource(historyLengthImage_, "adaptive history length"));
+    const RenderGraphResourceId adaptiveSamplingDebug = graph.createTexture(imageResource(adaptiveSamplingDebugImage_, "adaptive sampling debug"));
+    const RenderGraphResourceId adaptiveSamplingFilledMask = graph.createTexture(imageResource(adaptiveSamplingFilledMaskImage_, "adaptive sampling filled mask"));
+    const RenderGraphResourceId adaptiveSamplingDensity = graph.createBuffer(bufferResource(adaptiveSamplingDensityBuffer_, "adaptive sampling density"));
+    const RenderGraphResourceId adaptiveSamplingSampleCount = graph.createBuffer(bufferResource(adaptiveSamplingSampleCountBuffer_, "adaptive sampling sample count"));
+    const RenderGraphResourceId adaptiveSamplingStats = graph.createBuffer(bufferResource(adaptiveSamplingStatsBuffer_, "adaptive sampling stats"));
+    const RenderGraphResourceId adaptiveSamplingStatsReadback = graph.createBuffer(bufferResource(adaptiveSamplingStatsReadbackBuffer_, "adaptive sampling stats readback"));
+    graph.resources()[historyLength.index].hasInitialAccess = true;
+    graph.resources()[historyLength.index].initialAccess = ResourceAccess{
+        .stage = historyLengthImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = historyLengthImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .layout = historyLengthImage_.layout(),
+    };
+    graph.resources()[adaptiveSamplingDebug.index].hasInitialAccess = true;
+    graph.resources()[adaptiveSamplingDebug.index].initialAccess = ResourceAccess{
+        .stage = adaptiveSamplingDebugImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = adaptiveSamplingDebugImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .layout = adaptiveSamplingDebugImage_.layout(),
+    };
+    graph.resources()[adaptiveSamplingFilledMask.index].hasInitialAccess = true;
+    graph.resources()[adaptiveSamplingFilledMask.index].initialAccess = ResourceAccess{
+        .stage = adaptiveSamplingFilledMaskImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = adaptiveSamplingFilledMaskImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .layout = adaptiveSamplingFilledMaskImage_.layout(),
+    };
     const RenderGraphResourceId rayTracingDiagnosticCounters = graph.createBuffer(bufferResource(rayTracingDiagnosticCountersBuffer_, "ray tracing diagnostic counters"));
     const RenderGraphResourceId rayTracingAlphaMaterialCounters = graph.createBuffer(bufferResource(rayTracingAlphaMaterialCountersBuffer_, "ray tracing alpha material counters"));
     const RenderGraphResourceId sceneLightRecords = graph.createBuffer(bufferResource(scene_.lightRecords(), "scene light records"));
     const RenderGraphResourceId sceneMeshParams = graph.createBuffer(bufferResource(scene_.meshParamsBuffer(), "scene mesh params"));
+    const RenderGraphResourceId sceneLightBvh = graph.createBuffer(bufferResource(scene_.lightBvhNodes(), "scene light bvh"));
+    const RenderGraphResourceId regirParams = graph.createBuffer(bufferResource(regirParamsBuffer_, "ReGIR params"));
+    const RenderGraphResourceId regirReservoir = graph.createBuffer(bufferResource(regirReservoirBuffer_, "ReGIR reservoirs"));
+    const RenderGraphResourceId regirEnvironmentReservoir = graph.createBuffer(bufferResource(regirEnvironmentReservoirBuffer_, "ReGIR environment reservoir bank"));
+    const RenderGraphResourceId regirSpatialReservoir = graph.createBuffer(bufferResource(regirSpatialReservoirBuffer_, "ReGIR spatial reservoirs"));
+    const RenderGraphResourceId regirTemporalReservoir = graph.createBuffer(bufferResource(regirTemporalReservoirBuffer_, "ReGIR temporal reservoirs"));
+    const RenderGraphResourceId regirPreviousReservoir = graph.createBuffer(bufferResource(regirPreviousReservoirBuffer_, "ReGIR previous reservoirs"));
+    const RenderGraphResourceId regirActiveCells = graph.createBuffer(bufferResource(regirActiveCellBuffer_, "ReGIR active cells"));
+    const RenderGraphResourceId regirActiveCellsReadback = graph.createBuffer(bufferResource(regirActiveCellReadbackBuffer_, "ReGIR active cells readback"));
+    const RenderGraphResourceId regirHashCurrentCells = graph.createBuffer(bufferResource(regirHashCurrentCellBuffer_, "ReGIR current hash cells"));
+    const RenderGraphResourceId regirHashNextCells = graph.createBuffer(bufferResource(regirHashNextCellBuffer_, "ReGIR next hash cells"));
     const RenderGraphResourceId restirReservoir = graph.createBuffer(bufferResource(restirReservoirBuffer_, "restir reservoir"));
     RenderGraphResourceId wavefrontRestirReservoir{};
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
@@ -6915,6 +8012,12 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
         restirDiPreviousReceiverBuffer().handle() != VK_NULL_HANDLE &&
         restirDiCountersBuffer_.handle() != VK_NULL_HANDLE &&
         restirDiCountersReadbackBuffer_.handle() != VK_NULL_HANDLE;
+    const bool useRegir = shouldUseRegir();
+    const bool useRegirEnvironment = shouldUseRegirEnvironment();
+    const bool useRegirActiveGrid = shouldUseRegirActiveGrid();
+    const bool useRegirHashGrid = shouldUseRegirHashGrid();
+    const bool useRegirSpatialReuse = shouldUseRegirSpatialReuse();
+    const bool useRegirTemporalReuse = shouldUseRegirTemporalReuse();
     const bool useWavefrontQueues = settings_.wavefrontQueuesEnabled &&
         wavefrontRayQueueBuffer_.handle() != VK_NULL_HANDLE &&
         wavefrontHitQueueBuffer_.handle() != VK_NULL_HANDLE &&
@@ -7027,7 +8130,9 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
         restirDiCounters = graph.createBuffer(bufferResource(restirDiCountersBuffer_, "restir di counters"));
         restirDiCountersReadback = graph.createBuffer(bufferResource(restirDiCountersReadbackBuffer_, "restir di counters readback"));
     }
+    tracePathTraceRecordPhase("path_trace_graph_resources_end");
     const PipelineDomain traceDomain = PipelineDomain::RayTracing;
+    tracePathTraceRecordPhase("path_trace_graph_clears_begin");
     if (resetRestirHistory) {
         graph.addPass("restir_history_clear")
             .addStorageWrite(previousRestirReservoir, PipelineDomain::Transfer)
@@ -7191,7 +8296,110 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 vkCmdFillBuffer(cmd, restirGiActiveTileMaskBuffer_.handle(), 0, restirGiActiveTileMaskBuffer_.size(), 0u);
             });
     }
+    if (shouldRunAdaptiveSamplingPrepass()) {
+        graph.addPass("adaptive_sampling_prepare")
+            .addStorageRead(raw, PipelineDomain::Compute)
+            .addStorageRead(pathData, PipelineDomain::Compute)
+            .addStorageRead(variance, PipelineDomain::Compute)
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
+            .addStorageRead(historyLength, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingDebug, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingFilledMask, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingDensity, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingSampleCount, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingStats, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingStatsReadback, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordAdaptiveSamplingPrepare(cmd);
+            });
+    }
+    tracePathTraceRecordPhase("path_trace_graph_clears_end");
+    tracePathTraceRecordPhase("path_trace_graph_regir_begin");
+    if (useRegirActiveGrid && !regirActiveCellFeedbackValid_) {
+        graph.addPass("regir_active_cells_bootstrap_clear")
+            .addStorageWrite(regirActiveCells, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirActiveCellsClearPass(cmd);
+            });
+    }
+    if (useRegirHashGrid && !regirHashTablesValid_) {
+        graph.addPass("regir_hash_cells_bootstrap_clear")
+            .addStorageWrite(regirHashCurrentCells, PipelineDomain::Transfer)
+            .addStorageWrite(regirHashNextCells, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirHashCellsClearPass(cmd, true);
+            });
+    }
+    if (useRegir) {
+        RenderGraphPass& regirBuildPass = graph.addPass("regir_build")
+            .addStorageRead(sceneLightRecords, PipelineDomain::Compute)
+            .addStorageRead(sceneLightBvh, PipelineDomain::Compute)
+            .addUniformBuffer(sceneMeshParams, PipelineDomain::Compute)
+            .addUniformBuffer(regirParams, PipelineDomain::Compute)
+            .addStorageWrite(regirReservoir, PipelineDomain::Compute)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirBuildPass(cmd);
+            });
+        if (useRegirHashGrid) {
+            regirBuildPass.addStorageRead(regirHashCurrentCells, PipelineDomain::Compute);
+        } else {
+            regirBuildPass.addStorageRead(regirActiveCells, PipelineDomain::Compute);
+        }
+    }
+    if (useRegirEnvironment) {
+        graph.addPass("regir_environment_build")
+            .addUniformBuffer(regirParams, PipelineDomain::Compute)
+            .addStorageWrite(regirEnvironmentReservoir, PipelineDomain::Compute)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirEnvironmentBuildPass(cmd);
+            });
+    }
+    if (useRegirActiveGrid) {
+        graph.addPass("regir_active_cells_clear")
+            .addStorageWrite(regirActiveCells, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirActiveCellsClearPass(cmd);
+            });
+    }
+    if (useRegirHashGrid) {
+        graph.addPass("regir_hash_next_cells_clear")
+            .addStorageWrite(regirHashNextCells, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirHashCellsClearPass(cmd, false);
+            });
+    }
+    if (useRegirSpatialReuse) {
+        graph.addPass("regir_spatial_reuse")
+            .addUniformBuffer(regirParams, PipelineDomain::Compute)
+            .addStorageRead(regirReservoir, PipelineDomain::Compute)
+            .addStorageWrite(regirSpatialReservoir, PipelineDomain::Compute)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirSpatialReusePass(cmd);
+            });
+    }
+    if (useRegirTemporalReuse) {
+        graph.addPass("regir_temporal_reuse")
+            .addUniformBuffer(regirParams, PipelineDomain::Compute)
+            .addStorageRead(useRegirSpatialReuse ? regirSpatialReservoir : regirReservoir, PipelineDomain::Compute)
+            .addStorageRead(regirPreviousReservoir, PipelineDomain::Compute)
+            .addStorageWrite(regirTemporalReservoir, PipelineDomain::Compute)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirTemporalReusePass(cmd);
+            });
+        graph.addPass("regir_temporal_history_copy")
+            .addStorageRead(regirTemporalReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(regirPreviousReservoir, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirTemporalHistoryCopyPass(cmd);
+            });
+    }
+    tracePathTraceRecordPhase("path_trace_graph_regir_end");
+    tracePathTraceRecordPhase("path_trace_graph_primary_path_begin");
     if (!useWavefrontFinalOutput) {
+        const RenderGraphResourceId effectiveRegirReservoir = useRegirTemporalReuse
+            ? regirTemporalReservoir
+            : (useRegirSpatialReuse ? regirSpatialReservoir : regirReservoir);
         RenderGraphPass& pathTracePass = graph.addPass("path_trace_rt")
             .addStorageWrite(raw, traceDomain)
             .addStorageWrite(entityIds, traceDomain)
@@ -7204,7 +8412,26 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             .addStorageWrite(rayTracingDiagnosticCounters, traceDomain)
             .addStorageWrite(rayTracingAlphaMaterialCounters, traceDomain)
             .addStorageRead(previousRestirReservoir, traceDomain)
+            .addUniformBuffer(regirParams, traceDomain)
+            .addStorageRead(effectiveRegirReservoir, traceDomain)
             .addStorageWrite(restirReservoir, traceDomain);
+        if (effectiveRegirReservoir.index != regirReservoir.index) {
+            pathTracePass.addStorageRead(regirReservoir, traceDomain);
+        }
+        if (useRegirEnvironment) {
+            pathTracePass.addStorageRead(regirEnvironmentReservoir, traceDomain);
+        }
+        if (useRegirActiveGrid) {
+            pathTracePass.addStorageReadWrite(regirActiveCells, traceDomain);
+        }
+        if (useRegirHashGrid) {
+            pathTracePass
+                .addStorageRead(regirHashCurrentCells, traceDomain)
+                .addStorageReadWrite(regirHashNextCells, traceDomain);
+        }
+        if (shouldRunAdaptiveSamplingPrepass()) {
+            pathTracePass.addStorageRead(adaptiveSamplingSampleCount, traceDomain);
+        }
         if (useRestirGiReservoirs) {
             pathTracePass
                 .addStorageReadWrite(restirGiReservoir, traceDomain)
@@ -7223,6 +8450,33 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             recordPathTracePass(cmd);
         });
     }
+    tracePathTraceRecordPhase("path_trace_graph_primary_path_end");
+    if (copyEntityIdPick) {
+        graph.addPass("entity_id_pick_readback")
+            .addStorageRead(entityIds, PipelineDomain::Transfer)
+            .addStorageWrite(entityIdPickReadback, PipelineDomain::Transfer)
+            .setExecuteCallback([this, entityIdPickSourceOffset](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordEntityIdPickReadbackCopyPass(cmd, entityIdPickSourceOffset);
+            });
+    }
+    if (useRegirActiveGrid && !useWavefrontFinalOutput) {
+        graph.addPass("regir_active_cells_readback")
+            .addStorageRead(regirActiveCells, PipelineDomain::Transfer)
+            .addStorageWrite(regirActiveCellsReadback, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirActiveCellsReadbackPass(cmd);
+            });
+    }
+    if (useRegirHashGrid && !useWavefrontFinalOutput) {
+        graph.addPass("regir_hash_cells_readback")
+            .addStorageRead(regirHashNextCells, PipelineDomain::Transfer)
+            .addStorageWrite(regirActiveCellsReadback, PipelineDomain::Transfer)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordRegirHashCellsReadbackPass(cmd);
+            });
+    }
+    tracePathTraceRecordPhase("path_trace_graph_regir_readback_end");
+    tracePathTraceRecordPhase("path_trace_graph_restir_di_begin");
     if (useNewRestirDi) {
         RenderGraphResourceId finalInput = restirDiInitial;
         RenderGraphResourceId temporalDebugInput = restirDiInitial;
@@ -7304,6 +8558,8 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             }
         }
     }
+    tracePathTraceRecordPhase("path_trace_graph_restir_di_end");
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_validation_begin");
     if (useWavefrontShadowTrace && !useWavefrontFinalOutput) {
         graph.addPass("wavefront_direct_lighting_validate")
             .addStorageRead(wavefrontPixelState, PipelineDomain::Compute)
@@ -7330,6 +8586,8 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 recordWavefrontTraceValidationPass(cmd);
             });
     }
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_validation_end");
+    tracePathTraceRecordPhase("path_trace_graph_restir_gi_begin");
     if (useRestirGiReservoirs && shouldUseRestirGiLegacyCache() && !useWavefrontFinalOutput) {
         graph.addPass("restir_gi_spatial")
             .addStorageRead(restirGiReservoir, PipelineDomain::Compute)
@@ -7361,6 +8619,7 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             .addStorageRead(previousRestirGiProductionReservoir, PipelineDomain::Compute)
             .addStorageRead(restirGiReceiver, PipelineDomain::Compute)
             .addStorageRead(previousRestirGiReceiver, PipelineDomain::Compute)
+            .addStorageRead(pathData, PipelineDomain::Compute)
             .addStorageReadWrite(restirGiCounters, PipelineDomain::Compute)
             .addStorageWrite(restirGiTemporalReservoir, PipelineDomain::Compute);
         if (restirGiActiveTileMask.valid()) {
@@ -7429,6 +8688,8 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 });
         }
     }
+    tracePathTraceRecordPhase("path_trace_graph_restir_gi_end");
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_final_begin");
     if (useWavefrontFinalOutput) {
         const RenderGraphResourceId wavefrontFinalCompactValidation = graph.createBuffer(bufferResource(wavefrontCompactValidationBuffer_, "wavefront final compact validation"));
         const RenderGraphResourceId wavefrontFinalShadeValidation = graph.createBuffer(bufferResource(wavefrontSecondaryShadeValidationBuffer_, "wavefront final shade validation"));
@@ -7552,6 +8813,8 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 });
         }
     }
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_final_end");
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_secondary_begin");
     if (useWavefrontSecondaryShade) {
         const RenderGraphResourceId wavefrontSecondaryShadeValidation = graph.createBuffer(bufferResource(wavefrontSecondaryShadeValidationBuffer_, "wavefront secondary shade validation"));
         RenderGraphPass& secondaryHitClear = graph.addPass("wavefront_secondary_hit_queue_clear")
@@ -7608,6 +8871,8 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                     &wavefrontSortDispatchBuffer_);
             });
     }
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_secondary_end");
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_sort_begin");
     if (useWavefrontSort) {
         const RenderGraphResourceId wavefrontSortedShadeValidation = graph.createBuffer(bufferResource(wavefrontSortedShadeValidationBuffer_, "wavefront sorted shade validation"));
         RenderGraphPass& sortedHitClear = graph.addPass("wavefront_sorted_hit_queue_clear")
@@ -7661,6 +8926,8 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                     sortedShadeFlags);
             });
     }
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_sort_end");
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_debug_begin");
     if (useWavefrontDebugWrite) {
         RenderGraphPass& debugWritePass = graph.addPass("wavefront_debug_write")
             .addStorageRead(wavefrontRayQueue, PipelineDomain::Compute)
@@ -7681,11 +8948,17 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
             debugWritePass.addStorageRead(wavefrontRestirGiReservoir, PipelineDomain::Compute);
         }
     }
+    tracePathTraceRecordPhase("path_trace_graph_wavefront_debug_end");
+    tracePathTraceRecordPhase("path_trace_graph_compile_begin");
     graph.compile();
+    tracePathTraceRecordPhase("path_trace_graph_compile_end");
+    tracePathTraceRecordPhase("path_trace_graph_execute_begin");
     graph.execute(commandBuffer, temporalFrameIndex_);
+    tracePathTraceRecordPhase("path_trace_graph_execute_end");
 }
 
 void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
+    tracePathTraceRecordPhase("path_trace_pass_begin");
     validationLog_.recordPass("path tracing rt");
     rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
@@ -7696,6 +8969,7 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
         rayTracingAlphaMaterialCountersBuffer_.handle() != VK_NULL_HANDLE &&
         rayTracingAlphaMaterialCountersReadbackBuffer_.handle() != VK_NULL_HANDLE;
     if (copyDiagnosticCounters && !rayTracingDiagnosticCountersCleared_) {
+        tracePathTraceRecordPhase("path_trace_pass_diag_clear_begin");
         vkCmdFillBuffer(
             commandBuffer,
             rayTracingDiagnosticCountersBuffer_.handle(),
@@ -7725,15 +8999,21 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
             rayTracingAlphaMaterialCountersBuffer_.handle(),
             rayTracingAlphaMaterialCountersBuffer_.size());
         rayTracingDiagnosticCountersCleared_ = true;
+        tracePathTraceRecordPhase("path_trace_pass_diag_clear_end");
     }
 
+    tracePathTraceRecordPhase("path_trace_pass_profile_begin");
     currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceStart, pathTraceShaderStage());
     currentProfiler_->beginPipelineStats(commandBuffer);
+    tracePathTraceRecordPhase("path_trace_pass_hardware_begin");
     recordHardwarePathTrace(commandBuffer);
+    tracePathTraceRecordPhase("path_trace_pass_hardware_end");
     currentProfiler_->endPipelineStats(commandBuffer);
     currentProfiler_->write(commandBuffer, GpuProfiler::PathTraceEnd, pathTraceShaderStage());
+    tracePathTraceRecordPhase("path_trace_pass_profile_end");
 
     if (copyDiagnosticCounters) {
+        tracePathTraceRecordPhase("path_trace_pass_diag_readback_begin");
         bufferMemoryBarrier(
             commandBuffer,
             pathTraceShaderStage(),
@@ -7770,7 +9050,9 @@ void PathTracerRenderer::recordPathTracePass(VkCommandBuffer commandBuffer) {
             rayTracingAlphaMaterialCountersReadbackBuffer_.handle(),
             1,
             &alphaCopy);
+        tracePathTraceRecordPhase("path_trace_pass_diag_readback_end");
     }
+    tracePathTraceRecordPhase("path_trace_pass_end");
 }
 
 void PathTracerRenderer::recordWavefrontQueueClearPass(VkCommandBuffer commandBuffer) {
@@ -8740,11 +10022,12 @@ void PathTracerRenderer::recordRestirGiTemporalPass(VkCommandBuffer commandBuffe
     if (pipeline == nullptr) {
         return;
     }
+    const Buffer& initialReservoir = restirGiReservoirBuffer_;
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirGiTemporalStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(restirGiTemporalSetLayout_);
     DescriptorWriter()
-        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiReservoirBuffer_.descriptorInfo())
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, initialReservoir.descriptorInfo())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiTemporalReservoirBuffer_.descriptorInfo())
         .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiPreviousProductionHistoryBuffer().descriptorInfo())
         .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentReceiverBuffer().descriptorInfo())
@@ -8753,6 +10036,7 @@ void PathTracerRenderer::recordRestirGiTemporalPass(VkCommandBuffer commandBuffe
             (temporalFrameIndex_ % kRendererFramesInFlight) * sizeof(uint32_t) * 64u,
             sizeof(uint32_t) * 64u))
         .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiActiveTileMaskBuffer_.descriptorInfo())
+        .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
         .writeBuffer(13, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.meshParamsBuffer().descriptorInfo())
         .writeBuffer(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.materials().descriptorInfo())
         .writeBuffer(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.rtTriangleMaterialIds().descriptorInfo())
@@ -9341,8 +10625,12 @@ void PathTracerRenderer::recordRestirDiHistoryCopy(VkCommandBuffer commandBuffer
                 recordRestirDiCountersReadback(cmd);
             });
     }
+    tracePathTraceRecordPhase("path_trace_graph_compile_begin");
     graph.compile();
+    tracePathTraceRecordPhase("path_trace_graph_compile_end");
+    tracePathTraceRecordPhase("path_trace_graph_execute_begin");
     graph.execute(commandBuffer, temporalFrameIndex_);
+    tracePathTraceRecordPhase("path_trace_graph_execute_end");
 }
 
 void PathTracerRenderer::recordRestirDiHistoryCopyPass(VkCommandBuffer commandBuffer) {
@@ -9512,6 +10800,12 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId taaHistory = graph.createTexture(imageResource(taaHistoryImage_, "taa history hdr"));
     const RenderGraphResourceId presentation = graph.createTexture(imageResource(presentationImage_, "presentation ldr"));
     const RenderGraphResourceId entityIds = graph.createBuffer(bufferResource(entityIdBuffer_, "entity ids"));
+    VkDeviceSize entityIdPickSourceOffset = 0;
+    const bool copyEntityIdPick = entityIdPickReadbackSourceOffset(entityIdPickSourceOffset);
+    RenderGraphResourceId entityIdPickReadback{};
+    if (copyEntityIdPick) {
+        entityIdPickReadback = graph.createBuffer(bufferResource(entityIdReadbackBuffer_, "entity id pick readback"));
+    }
     const RenderGraphResourceId accumulation = graph.createBuffer(bufferResource(accumulationBuffer_, "accumulation"));
     const RenderGraphResourceId variance = graph.createBuffer(bufferResource(varianceBuffer_, "variance"));
     const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "depth normal"));
@@ -9519,6 +10813,10 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId previousWorldPosition = graph.createBuffer(bufferResource(previousWorldPositionBuffer_, "previous world position"));
     const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
     const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data"));
+    const RenderGraphResourceId adaptiveSamplingDensity = graph.createBuffer(bufferResource(adaptiveSamplingDensityBuffer_, "adaptive sampling density"));
+    const RenderGraphResourceId adaptiveSamplingSampleCount = graph.createBuffer(bufferResource(adaptiveSamplingSampleCountBuffer_, "adaptive sampling sample count"));
+    const RenderGraphResourceId adaptiveSamplingStats = graph.createBuffer(bufferResource(adaptiveSamplingStatsBuffer_, "adaptive sampling stats"));
+    const RenderGraphResourceId adaptiveSamplingStatsReadback = graph.createBuffer(bufferResource(adaptiveSamplingStatsReadbackBuffer_, "adaptive sampling stats readback"));
     const RenderGraphResourceId rayTracingDiagnosticCounters = graph.createBuffer(bufferResource(rayTracingDiagnosticCountersBuffer_, "ray tracing diagnostic counters"));
     const RenderGraphResourceId rayTracingAlphaMaterialCounters = graph.createBuffer(bufferResource(rayTracingAlphaMaterialCountersBuffer_, "ray tracing alpha material counters"));
     const RenderGraphResourceId directDiffuseMoments = graph.createTexture(imageResource(directDiffuseMomentsImage_, "direct diffuse moments"));
@@ -9527,6 +10825,9 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     const RenderGraphResourceId indirectSpecularMoments = graph.createTexture(imageResource(indirectSpecularMomentsImage_, "indirect specular moments"));
     const RenderGraphResourceId historyLength = graph.createTexture(imageResource(historyLengthImage_, "history length"));
     const RenderGraphResourceId momentDebug = graph.createTexture(imageResource(momentDebugImage_, "moment debug"));
+    const RenderGraphResourceId adaptiveSamplingDebug = graph.createTexture(imageResource(adaptiveSamplingDebugImage_, "adaptive sampling debug"));
+    const RenderGraphResourceId adaptiveSamplingFilledMask = graph.createTexture(imageResource(adaptiveSamplingFilledMaskImage_, "adaptive sampling filled mask"));
+    const RenderGraphResourceId adaptiveSamplingFilled = graph.createTexture(imageResource(adaptiveSamplingFilledImage_, "adaptive filled hdr"));
     const RenderGraphResourceId directDiffuseResolvedMoments = graph.createTexture(imageResource(directDiffuseResolvedMomentsImage_, "current direct diffuse moments"));
     const RenderGraphResourceId directSpecularResolvedMoments = graph.createTexture(imageResource(directSpecularResolvedMomentsImage_, "current direct specular moments"));
     const RenderGraphResourceId indirectDiffuseResolvedMoments = graph.createTexture(imageResource(indirectDiffuseResolvedMomentsImage_, "current indirect diffuse moments"));
@@ -9563,6 +10864,19 @@ void PathTracerRenderer::recordRenderGraphPlan() {
     RenderGraphResourceId wavefrontRestirReservoir{};
     const RenderGraphResourceId previousRestirReservoir = graph.createBuffer(bufferResource(previousRestirReservoirBuffer_, "previous restir reservoir"));
     const RenderGraphResourceId restirSpatialReservoir = graph.createBuffer(bufferResource(restirSpatialReservoirBuffer_, "restir spatial reservoir"));
+    const RenderGraphResourceId sceneLightRecords = graph.createBuffer(bufferResource(scene_.lightRecords(), "scene light records"));
+    const RenderGraphResourceId sceneLightBvh = graph.createBuffer(bufferResource(scene_.lightBvhNodes(), "scene light bvh"));
+    const RenderGraphResourceId sceneMeshParams = graph.createBuffer(bufferResource(scene_.meshParamsBuffer(), "scene mesh params"));
+    const RenderGraphResourceId regirParams = graph.createBuffer(bufferResource(regirParamsBuffer_, "ReGIR params"));
+    const RenderGraphResourceId regirReservoir = graph.createBuffer(bufferResource(regirReservoirBuffer_, "ReGIR reservoirs"));
+    const RenderGraphResourceId regirEnvironmentReservoir = graph.createBuffer(bufferResource(regirEnvironmentReservoirBuffer_, "ReGIR environment reservoir bank"));
+    const RenderGraphResourceId regirSpatialReservoir = graph.createBuffer(bufferResource(regirSpatialReservoirBuffer_, "ReGIR spatial reservoirs"));
+    const RenderGraphResourceId regirTemporalReservoir = graph.createBuffer(bufferResource(regirTemporalReservoirBuffer_, "ReGIR temporal reservoirs"));
+    const RenderGraphResourceId regirPreviousReservoir = graph.createBuffer(bufferResource(regirPreviousReservoirBuffer_, "ReGIR previous reservoirs"));
+    const RenderGraphResourceId regirActiveCells = graph.createBuffer(bufferResource(regirActiveCellBuffer_, "ReGIR active cells"));
+    const RenderGraphResourceId regirActiveCellsReadback = graph.createBuffer(bufferResource(regirActiveCellReadbackBuffer_, "ReGIR active cells readback"));
+    const RenderGraphResourceId regirHashCurrentCells = graph.createBuffer(bufferResource(regirHashCurrentCellBuffer_, "ReGIR current hash cells"));
+    const RenderGraphResourceId regirHashNextCells = graph.createBuffer(bufferResource(regirHashNextCellBuffer_, "ReGIR next hash cells"));
     const bool resetRestirHistory =
         settings_.restirDiMode == RestirDiMode::Legacy &&
         settings_.restirDiMode == RestirDiMode::Legacy &&
@@ -9580,6 +10894,12 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         restirDiPreviousReceiverBuffer().handle() != VK_NULL_HANDLE &&
         restirDiCountersBuffer_.handle() != VK_NULL_HANDLE &&
         restirDiCountersReadbackBuffer_.handle() != VK_NULL_HANDLE;
+    const bool useRegir = shouldUseRegir();
+    const bool useRegirEnvironment = shouldUseRegirEnvironment();
+    const bool useRegirActiveGrid = shouldUseRegirActiveGrid();
+    const bool useRegirHashGrid = shouldUseRegirHashGrid();
+    const bool useRegirSpatialReuse = shouldUseRegirSpatialReuse();
+    const bool useRegirTemporalReuse = shouldUseRegirTemporalReuse();
     RenderGraphResourceId restirDiReceiver{};
     RenderGraphResourceId restirDiPreviousReceiver{};
     RenderGraphResourceId restirDiInitial{};
@@ -9786,7 +11106,76 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         graph.addPass("restir_gi_active_tile_mask_clear")
             .addStorageWrite(restirGiActiveTileMask, PipelineDomain::Transfer);
     }
+    if (shouldRunAdaptiveSamplingPrepass()) {
+        graph.addPass("adaptive_sampling_prepare")
+            .addStorageRead(raw, PipelineDomain::Compute)
+            .addStorageRead(pathData, PipelineDomain::Compute)
+            .addStorageRead(variance, PipelineDomain::Compute)
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
+            .addStorageRead(historyLength, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingDebug, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingFilledMask, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingDensity, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingSampleCount, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingStats, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingStatsReadback, PipelineDomain::Transfer);
+    }
+    if (useRegirActiveGrid && !regirActiveCellFeedbackValid_) {
+        graph.addPass("regir_active_cells_bootstrap_clear")
+            .addStorageWrite(regirActiveCells, PipelineDomain::Transfer);
+    }
+    if (useRegirHashGrid && !regirHashTablesValid_) {
+        graph.addPass("regir_hash_cells_bootstrap_clear")
+            .addStorageWrite(regirHashCurrentCells, PipelineDomain::Transfer)
+            .addStorageWrite(regirHashNextCells, PipelineDomain::Transfer);
+    }
+    if (useRegir) {
+        RenderGraphPass& regirBuildPass = graph.addPass("regir_build")
+            .addStorageRead(sceneLightRecords, PipelineDomain::Compute)
+            .addStorageRead(sceneLightBvh, PipelineDomain::Compute)
+            .addUniformBuffer(sceneMeshParams, PipelineDomain::Compute)
+            .addUniformBuffer(regirParams, PipelineDomain::Compute)
+            .addStorageWrite(regirReservoir, PipelineDomain::Compute);
+        if (useRegirHashGrid) {
+            regirBuildPass.addStorageRead(regirHashCurrentCells, PipelineDomain::Compute);
+        } else {
+            regirBuildPass.addStorageRead(regirActiveCells, PipelineDomain::Compute);
+        }
+    }
+    if (useRegirEnvironment) {
+        graph.addPass("regir_environment_build")
+            .addUniformBuffer(regirParams, PipelineDomain::Compute)
+            .addStorageWrite(regirEnvironmentReservoir, PipelineDomain::Compute);
+    }
+    if (useRegirActiveGrid) {
+        graph.addPass("regir_active_cells_clear")
+            .addStorageWrite(regirActiveCells, PipelineDomain::Transfer);
+    }
+    if (useRegirHashGrid) {
+        graph.addPass("regir_hash_next_cells_clear")
+            .addStorageWrite(regirHashNextCells, PipelineDomain::Transfer);
+    }
+    if (useRegirSpatialReuse) {
+        graph.addPass("regir_spatial_reuse")
+            .addUniformBuffer(regirParams, PipelineDomain::Compute)
+            .addStorageRead(regirReservoir, PipelineDomain::Compute)
+            .addStorageWrite(regirSpatialReservoir, PipelineDomain::Compute);
+    }
+    if (useRegirTemporalReuse) {
+        graph.addPass("regir_temporal_reuse")
+            .addUniformBuffer(regirParams, PipelineDomain::Compute)
+            .addStorageRead(useRegirSpatialReuse ? regirSpatialReservoir : regirReservoir, PipelineDomain::Compute)
+            .addStorageRead(regirPreviousReservoir, PipelineDomain::Compute)
+            .addStorageWrite(regirTemporalReservoir, PipelineDomain::Compute);
+        graph.addPass("regir_temporal_history_copy")
+            .addStorageRead(regirTemporalReservoir, PipelineDomain::Transfer)
+            .addStorageWrite(regirPreviousReservoir, PipelineDomain::Transfer);
+    }
     if (!useWavefrontFinalOutput) {
+        const RenderGraphResourceId effectiveRegirReservoir = useRegirTemporalReuse
+            ? regirTemporalReservoir
+            : (useRegirSpatialReuse ? regirSpatialReservoir : regirReservoir);
         RenderGraphPass& pathTracePass = graph.addPass("path_trace_rt")
             .addStorageWrite(raw, traceDomain)
             .addStorageWrite(entityIds, traceDomain)
@@ -9799,7 +11188,26 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageWrite(rayTracingDiagnosticCounters, traceDomain)
             .addStorageWrite(rayTracingAlphaMaterialCounters, traceDomain)
             .addStorageRead(previousRestirReservoir, traceDomain)
+            .addUniformBuffer(regirParams, traceDomain)
+            .addStorageRead(effectiveRegirReservoir, traceDomain)
             .addStorageWrite(restirReservoir, traceDomain);
+        if (effectiveRegirReservoir.index != regirReservoir.index) {
+            pathTracePass.addStorageRead(regirReservoir, traceDomain);
+        }
+        if (useRegirEnvironment) {
+            pathTracePass.addStorageRead(regirEnvironmentReservoir, traceDomain);
+        }
+        if (useRegirActiveGrid) {
+            pathTracePass.addStorageReadWrite(regirActiveCells, traceDomain);
+        }
+        if (useRegirHashGrid) {
+            pathTracePass
+                .addStorageRead(regirHashCurrentCells, traceDomain)
+                .addStorageReadWrite(regirHashNextCells, traceDomain);
+        }
+        if (shouldRunAdaptiveSamplingPrepass()) {
+            pathTracePass.addStorageRead(adaptiveSamplingSampleCount, traceDomain);
+        }
         if (useRestirGiReservoirs) {
             pathTracePass
                 .addStorageReadWrite(restirGiReservoir, traceDomain)
@@ -9814,6 +11222,21 @@ void PathTracerRenderer::recordRenderGraphPlan() {
                 .addStorageWrite(restirDiInitial, traceDomain)
                 .addStorageReadWrite(restirDiCounters, traceDomain);
         }
+    }
+    if (copyEntityIdPick) {
+        graph.addPass("entity_id_pick_readback")
+            .addStorageRead(entityIds, PipelineDomain::Transfer)
+            .addStorageWrite(entityIdPickReadback, PipelineDomain::Transfer);
+    }
+    if (useRegirActiveGrid && !useWavefrontFinalOutput) {
+        graph.addPass("regir_active_cells_readback")
+            .addStorageRead(regirActiveCells, PipelineDomain::Transfer)
+            .addStorageWrite(regirActiveCellsReadback, PipelineDomain::Transfer);
+    }
+    if (useRegirHashGrid && !useWavefrontFinalOutput) {
+        graph.addPass("regir_hash_cells_readback")
+            .addStorageRead(regirHashNextCells, PipelineDomain::Transfer)
+            .addStorageWrite(regirActiveCellsReadback, PipelineDomain::Transfer);
     }
     if (useNewRestirDi) {
         RenderGraphResourceId finalInput = restirDiInitial;
@@ -10115,9 +11538,17 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageRead(depthNormal, PipelineDomain::Compute);
     }
 
-    RenderGraphResourceId toneInput = raw;
+    if (shouldRunAdaptiveSamplingFill()) {
+        graph.addPass("adaptive_sampling_fill")
+            .addStorageRead(raw, PipelineDomain::Compute)
+            .addStorageRead(adaptiveSamplingFilledMask, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingFilled, PipelineDomain::Compute);
+    }
+
+    const RenderGraphResourceId adaptiveDenoiserInput = shouldRunAdaptiveSamplingFill() ? adaptiveSamplingFilled : raw;
+    RenderGraphResourceId toneInput = adaptiveDenoiserInput;
     if (shouldRunNrdDenoiser()) {
-        graph.addPass("nrd_prepare")
+        RenderGraphPass& nrdPrepare = graph.addPass("nrd_prepare")
             .addStorageRead(depthNormal, PipelineDomain::Compute)
             .addStorageRead(velocity, PipelineDomain::Compute)
             .addStorageRead(pathData, PipelineDomain::Compute)
@@ -10126,6 +11557,9 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             .addStorageWrite(nrdViewZ, PipelineDomain::Compute)
             .addStorageWrite(nrdDiffIn, PipelineDomain::Compute)
             .addStorageWrite(nrdSpecIn, PipelineDomain::Compute);
+        if (shouldRunAdaptiveSamplingPrepass()) {
+            nrdPrepare.addStorageRead(adaptiveSamplingFilledMask, PipelineDomain::Compute);
+        }
         RenderGraphPass& nrdDispatch = graph.addPass("nrd_reblur")
             .addStorageReadWrite(nrdMotion, PipelineDomain::Compute)
             .addStorageReadWrite(nrdNormalRoughness, PipelineDomain::Compute)
@@ -10138,7 +11572,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             nrdDispatch.addStorageReadWrite(resource, PipelineDomain::Compute);
         }
         graph.addPass("nrd_resolve")
-            .addStorageRead(raw, PipelineDomain::Compute)
+            .addStorageRead(adaptiveDenoiserInput, PipelineDomain::Compute)
             .addStorageRead(nrdDiffOut, PipelineDomain::Compute)
             .addStorageRead(nrdSpecOut, PipelineDomain::Compute)
             .addStorageRead(pathData, PipelineDomain::Compute)
@@ -10226,7 +11660,7 @@ void PathTracerRenderer::recordRenderGraphPlan() {
         toneInput = denoised;
     } else {
         RenderGraphPass& skipDenoiserCopyPass = graph.addPass("skip_denoiser_copy")
-            .addStorageRead(raw, PipelineDomain::Transfer)
+            .addStorageRead(adaptiveDenoiserInput, PipelineDomain::Transfer)
             .addStorageWrite(denoised, PipelineDomain::Transfer)
             .addStorageRead(worldPosition, PipelineDomain::Transfer)
             .addStorageWrite(previousWorldPosition, PipelineDomain::Transfer)
@@ -10236,6 +11670,23 @@ void PathTracerRenderer::recordRenderGraphPlan() {
             skipDenoiserCopyPass
                 .addStorageRead(restirGiSpatialReservoir, PipelineDomain::Transfer)
                 .addStorageWrite(previousRestirGiReservoir, PipelineDomain::Transfer);
+        }
+    }
+
+    if (shouldRunAdaptiveSamplingDiagnostics() && !shouldRunAdaptiveSamplingPrepass()) {
+        graph.addPass("adaptive_sampling_diagnostics")
+            .addStorageRead(raw, PipelineDomain::Compute)
+            .addStorageRead(pathData, PipelineDomain::Compute)
+            .addStorageRead(variance, PipelineDomain::Compute)
+            .addStorageRead(depthNormal, PipelineDomain::Compute)
+            .addStorageRead(velocity, PipelineDomain::Compute)
+            .addStorageRead(historyLength, PipelineDomain::Compute)
+            .addStorageWrite(adaptiveSamplingDebug, PipelineDomain::Compute)
+            .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+                recordAdaptiveSamplingDiagnosticsPass(cmd);
+            });
+        if (isAdaptiveSamplingDebugView()) {
+            toneInput = adaptiveSamplingDebug;
         }
     }
 
@@ -10351,6 +11802,10 @@ void PathTracerRenderer::writeRayTracingDescriptors(
         ? restirGiCurrentReceiverBuffer() : depthNormalBuffer_;
     const Buffer& previousRestirGiReceiverBinding = restirGiPreviousReceiverBuffer().handle() != VK_NULL_HANDLE
         ? restirGiPreviousReceiverBuffer() : depthNormalBuffer_;
+    const Buffer& regirReservoirBinding = shouldUseRegirTemporalReuse()
+        ? regirTemporalReservoirBuffer_
+        : (shouldUseRegirSpatialReuse() ? regirSpatialReservoirBuffer_ : regirReservoirBuffer_);
+    const Buffer& regirInputReservoirBinding = regirReservoirBuffer_;
     writer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumulationBuffer_.descriptorInfo())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
@@ -10394,6 +11849,15 @@ void PathTracerRenderer::writeRayTracingDescriptors(
         .writeBuffer(48, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingDiagnosticCountersBuffer_.descriptorInfo())
         .writeBuffer(62, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingScene_->tlasGeometryRangesBuffer().descriptorInfo())
         .writeBuffer(63, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rayTracingAlphaMaterialCountersBuffer_.descriptorInfo())
+        .writeBuffer(64, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, adaptiveSamplingDensityBuffer_.descriptorInfo())
+        .writeBuffer(65, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, adaptiveSamplingSampleCountBuffer_.descriptorInfo())
+        .writeBuffer(66, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, regirParamsBuffer_.descriptorInfo())
+        .writeBuffer(67, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirReservoirBinding.descriptorInfo())
+        .writeBuffer(68, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirInputReservoirBinding.descriptorInfo())
+        .writeBuffer(69, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            (shouldUseRegirHashGrid() ? regirHashNextCellBuffer_ : regirActiveCellBuffer_).descriptorInfo())
+        .writeBuffer(70, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirHashCurrentCellBuffer_.descriptorInfo())
+        .writeBuffer(71, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirEnvironmentReservoirBuffer_.descriptorInfo())
         .writeBuffer(52, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiReceiverBinding.descriptorInfo())
         .writeBuffer(53, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirDiInitialBinding.descriptorInfo())
         .writeBuffer(54, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirDiBinding.descriptorInfo())
@@ -10421,9 +11885,12 @@ void PathTracerRenderer::writeRayTracingDescriptors(
 }
 
 void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) {
+    tracePathTraceRecordPhase("hardware_path_trace_begin");
     const bool restirDiValidationFull = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull;
     const bool restirGiInitialFull = usesRestirGiUncompressedInitialReservoir();
+    tracePathTraceRecordPhase("hardware_path_trace_ensure_variants_begin");
     ensureRayTracingVariantPipelines(restirDiValidationFull, restirGiInitialFull);
+    tracePathTraceRecordPhase("hardware_path_trace_ensure_variants_end");
     RayTracingPipeline* basePipeline = rayTracingPipeline_.get();
     RayTracingPipeline* motionPipeline = rayTracingMotionPipeline_.get();
     if (restirDiValidationFull && restirGiInitialFull) {
@@ -10435,6 +11902,19 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
     } else if (restirGiInitialFull) {
         basePipeline = rayTracingGiFullPipeline_.get();
         motionPipeline = rayTracingMotionGiFullPipeline_.get();
+    }
+    if (shouldUseGenericBeautyFastPath(restirDiValidationFull, restirGiInitialFull)) {
+        basePipeline = rayTracingBeautyFastPipeline_.get();
+        motionPipeline = nullptr;
+    } else if (shouldUseRegirBeautyFastPath(restirDiValidationFull, restirGiInitialFull)) {
+        if (shouldTraceRegirFiniteLightsThisFrame()) {
+            basePipeline = rayTracingRegirBeautyFastPipeline_.get();
+        } else if (shouldUseRegirEnvironment()) {
+            basePipeline = rayTracingRegirStochasticBeautyFastPipeline_.get();
+        } else {
+            basePipeline = rayTracingBeautyFastPipeline_.get();
+        }
+        motionPipeline = nullptr;
     }
     if (basePipeline == nullptr || rayTracingScene_ == nullptr) {
         throw std::runtime_error("Hardware ray tracing backend is active but RT pipeline/scene is not initialized");
@@ -10460,23 +11940,6 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
             allocator_,
             uploader_,
             ommActive);
-        rayTracingNative2BDiagnosticPipeline_ = std::make_unique<RayTracingPipeline>(
-            context_.device(),
-            context_.rayTracingInfo().rayTracingPipelineProperties,
-            *raygenNative2BDiagnosticShader_,
-            *primaryMissShader_,
-            *shadowMissShader_,
-            *terminalMissShader_,
-            *closestHitDiagnosticShader_,
-            *primaryAnyHitDiagnosticShader_,
-            *shadowAnyHitDiagnosticShader_,
-            *terminalClosestHitDiagnosticShader_,
-            *terminalAnyHitDiagnosticShader_,
-            layouts,
-            *pipelineCache_,
-            allocator_,
-            uploader_,
-            ommActive);
     }
     RayTracingPipeline* pipeline = settings_.motionBlurEnabled &&
             rayTracingScene_->motionBlurActive() &&
@@ -10494,6 +11957,11 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
             pipeline = rayTracingDiagnosticPipeline_.get();
         }
     }
+    if (native2BSettingsEligible()) {
+        tracePathTraceRecordPhase("hardware_path_trace_ensure_native2b_begin");
+        ensureNative2BPathTracePipelines();
+        tracePathTraceRecordPhase("hardware_path_trace_ensure_native2b_end");
+    }
     if (shouldUseNative2BPathTraceKernel()) {
         if (rayTracingDiagnosticCountersEnabled_ && rayTracingNative2BDiagnosticPipeline_ != nullptr) {
             pipeline = rayTracingNative2BDiagnosticPipeline_.get();
@@ -10505,9 +11973,13 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
         }
     }
 
+    tracePathTraceRecordPhase("hardware_path_trace_allocate_descriptors_begin");
     DescriptorSet set = currentFrame_->descriptors().allocate(rayTracingSetLayout_);
     DescriptorSet atmosphereSet = currentFrame_->descriptors().allocate(atmosphereSetLayout_);
+    tracePathTraceRecordPhase("hardware_path_trace_allocate_descriptors_end");
+    tracePathTraceRecordPhase("hardware_path_trace_write_descriptors_begin");
     writeRayTracingDescriptors(set, false);
+    tracePathTraceRecordPhase("hardware_path_trace_write_ray_descriptors_end");
     DescriptorWriter()
         .writeImage(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->transmittanceLut().sampledDescriptor(VK_NULL_HANDLE))
         .writeImage(1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, atmosphereLutSystem_->skyViewLut().sampledDescriptor(VK_NULL_HANDLE))
@@ -10517,11 +11989,19 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
         .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, atmosphereLutSystem_->samplingSystem() != nullptr ? atmosphereLutSystem_->samplingSystem()->cdfRows().descriptorInfo() : scene_.envRows().descriptorInfo())
         .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, atmosphereLutSystem_->samplingSystem() != nullptr ? atmosphereLutSystem_->samplingSystem()->cdfCols().descriptorInfo() : scene_.envCols().descriptorInfo())
         .update(context_.device(), atmosphereSet);
+    tracePathTraceRecordPhase("hardware_path_trace_write_atmosphere_descriptors_end");
 
+    tracePathTraceRecordPhase("hardware_path_trace_bind_pipeline_begin");
     pipeline->bind(commandBuffer);
+    tracePathTraceRecordPhase("hardware_path_trace_bind_pipeline_end");
     const std::array<VkDescriptorSet, 3> descriptorSets{set.handle(), atmosphereSet.handle(), bindlessTextureHeap_.descriptorSet()};
+    tracePathTraceRecordPhase("hardware_path_trace_bind_descriptors_begin");
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline->layout(), 0, static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(), 0, nullptr);
+    tracePathTraceRecordPhase("hardware_path_trace_bind_descriptors_end");
+    tracePathTraceRecordPhase("hardware_path_trace_trace_rays_begin");
     pipeline->traceRays(commandBuffer, renderExtent_.width, renderExtent_.height);
+    tracePathTraceRecordPhase("hardware_path_trace_trace_rays_end");
+    tracePathTraceRecordPhase("hardware_path_trace_end");
 }
 
 void PathTracerRenderer::recordWavefrontTracePass(
@@ -10688,6 +12168,37 @@ void PathTracerRenderer::recordWavefrontTraceValidationPass(VkCommandBuffer comm
     VkBufferCopy copy{};
     copy.size = sizeof(WavefrontTraceValidationGpu);
     vkCmdCopyBuffer(commandBuffer, wavefrontTraceValidationBuffer_.handle(), wavefrontTraceValidationReadbackBuffer_.handle(), 1, &copy);
+}
+
+bool PathTracerRenderer::entityIdPickReadbackSourceOffset(VkDeviceSize& sourceOffset) const {
+    sourceOffset = 0;
+    if (!pendingPick_.active ||
+        pendingPick_.sceneVersion != pickSceneVersion_ ||
+        entityIdBuffer_.handle() == VK_NULL_HANDLE ||
+        entityIdReadbackBuffer_.handle() == VK_NULL_HANDLE ||
+        renderExtent_.width == 0 ||
+        renderExtent_.height == 0) {
+        return false;
+    }
+    const uint32_t x = std::min(
+        renderExtent_.width - 1u,
+        static_cast<uint32_t>(pendingPick_.viewportUv.x * static_cast<float>(renderExtent_.width)));
+    const uint32_t y = std::min(
+        renderExtent_.height - 1u,
+        static_cast<uint32_t>(pendingPick_.viewportUv.y * static_cast<float>(renderExtent_.height)));
+    sourceOffset = (static_cast<VkDeviceSize>(y) * renderExtent_.width + x) * sizeof(uint32_t);
+    return sourceOffset + sizeof(uint32_t) <= entityIdBuffer_.size();
+}
+
+void PathTracerRenderer::recordEntityIdPickReadbackCopyPass(VkCommandBuffer commandBuffer, VkDeviceSize sourceOffset) {
+    if (entityIdBuffer_.handle() == VK_NULL_HANDLE || entityIdReadbackBuffer_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    VkBufferCopy copy{};
+    copy.srcOffset = entityIdBuffer_.baseOffset() + sourceOffset;
+    copy.dstOffset = entityIdReadbackBuffer_.baseOffset();
+    copy.size = sizeof(uint32_t);
+    vkCmdCopyBuffer(commandBuffer, entityIdBuffer_.handle(), entityIdReadbackBuffer_.handle(), 1, &copy);
 }
 
 void PathTracerRenderer::recordSelectionOutline(VkCommandBuffer commandBuffer) {
@@ -11034,6 +12545,7 @@ void PathTracerRenderer::recordNrdPreparePass(VkCommandBuffer commandBuffer) {
     nrdTransitionImage(commandBuffer, runtime.viewZ, true);
     nrdTransitionImage(commandBuffer, runtime.diffRadianceHitdist, true);
     nrdTransitionImage(commandBuffer, runtime.specRadianceHitdist, true);
+    nrdTransitionImage(commandBuffer, adaptiveSamplingFilledMaskImage_, true);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(nrdPrepareSetLayout_);
     DescriptorWriter()
@@ -11047,6 +12559,7 @@ void PathTracerRenderer::recordNrdPreparePass(VkCommandBuffer commandBuffer) {
         .writeImage(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.specRadianceHitdist.storageDescriptor())
         .writeBuffer(8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
         .writeBuffer(9, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
+        .writeImage(10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, adaptiveSamplingFilledMaskImage_.storageDescriptor())
         .update(context_.device(), set);
 
     nrdPreparePipeline_->bind(commandBuffer);
@@ -11235,24 +12748,25 @@ void PathTracerRenderer::recordNrdResolvePass(VkCommandBuffer commandBuffer) {
     }
     validationLog_.recordPass("nrd resolve output");
     NrdRuntime& runtime = *nrdRuntime_;
+    const Image& inputImage = adaptiveDenoiserInputImage();
     barrier::cmdTransitionImage(commandBuffer, barrier::ImageTransition{
-        .image = rawImage_.handle(),
-        .oldLayout = rawImage_.layout(),
+        .image = inputImage.handle(),
+        .oldLayout = inputImage.layout(),
         .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .range = rawImage_.fullRange(),
+        .range = inputImage.fullRange(),
         .srcStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .srcAccess = VK_ACCESS_2_MEMORY_WRITE_BIT,
         .dstStage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .dstAccess = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
     });
-    rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    inputImage.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     nrdTransitionImage(commandBuffer, runtime.outDiffRadianceHitdist, true);
     nrdTransitionImage(commandBuffer, runtime.outSpecRadianceHitdist, true);
     nrdTransitionImage(commandBuffer, denoisedImage_, true);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(nrdResolveSetLayout_);
     DescriptorWriter()
-        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
+        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, inputImage.storageDescriptor())
         .writeImage(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.outDiffRadianceHitdist.storageDescriptor())
         .writeImage(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, runtime.outSpecRadianceHitdist.storageDescriptor())
         .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
@@ -11466,6 +12980,577 @@ void PathTracerRenderer::recordMomentUpdatePass(VkCommandBuffer commandBuffer) {
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, momentUpdatePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
     momentUpdatePipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
     currentProfiler_->write(commandBuffer, GpuProfiler::MomentUpdateEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordAdaptiveSamplingPrepare(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("adaptive sampling prepare");
+    recordAdaptiveSamplingDiagnosticsPass(commandBuffer, true);
+}
+
+void PathTracerRenderer::recordAdaptiveSamplingDiagnostics(VkCommandBuffer commandBuffer) {
+    RenderGraph graph(&allocator_, resourceAliasingEnabled_);
+    auto imageResource = [](const Image& image, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Texture,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .format = image.format(),
+            .extent = image.extent(),
+            .image = image.handle(),
+            .imageRange = image.fullRange(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+    auto bufferResource = [](const Buffer& buffer, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Buffer,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .size = buffer.size(),
+            .buffer = buffer.handle(),
+            .bufferOffset = buffer.baseOffset(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+
+    const RenderGraphResourceId raw = graph.createTexture(imageResource(rawImage_, "adaptive input raw hdr"));
+    const RenderGraphResourceId historyLength = graph.createTexture(imageResource(historyLengthImage_, "adaptive history length"));
+    const RenderGraphResourceId output = graph.createTexture(imageResource(adaptiveSamplingDebugImage_, "adaptive sampling debug"));
+    const RenderGraphResourceId filledMask = graph.createTexture(imageResource(adaptiveSamplingFilledMaskImage_, "adaptive sampling filled mask"));
+    const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "adaptive path data"));
+    const RenderGraphResourceId variance = graph.createBuffer(bufferResource(varianceBuffer_, "adaptive variance"));
+    const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "adaptive depth normal"));
+    const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "adaptive velocity"));
+    const RenderGraphResourceId density = graph.createBuffer(bufferResource(adaptiveSamplingDensityBuffer_, "adaptive sampling density"));
+    const RenderGraphResourceId sampleCount = graph.createBuffer(bufferResource(adaptiveSamplingSampleCountBuffer_, "adaptive sampling sample count"));
+    const RenderGraphResourceId stats = graph.createBuffer(bufferResource(adaptiveSamplingStatsBuffer_, "adaptive sampling stats"));
+    const RenderGraphResourceId statsReadback = graph.createBuffer(bufferResource(adaptiveSamplingStatsReadbackBuffer_, "adaptive sampling stats readback"));
+
+    auto setImageInitialAccess = [&](RenderGraphResourceId id, const Image& image, VkPipelineStageFlags2 stage, VkAccessFlags2 access) {
+        graph.resources()[id.index].hasInitialAccess = true;
+        graph.resources()[id.index].initialAccess = ResourceAccess{
+            .stage = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : stage,
+            .access = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : access,
+            .layout = image.layout(),
+        };
+    };
+    setImageInitialAccess(raw, rawImage_, kCrossQueueShaderStage, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    setImageInitialAccess(historyLength, historyLengthImage_, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    setImageInitialAccess(output, adaptiveSamplingDebugImage_, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    setImageInitialAccess(filledMask, adaptiveSamplingFilledMaskImage_, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    graph.resources()[pathData.index].hasInitialAccess = true;
+    graph.resources()[pathData.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[variance.index].hasInitialAccess = true;
+    graph.resources()[variance.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[depthNormal.index].hasInitialAccess = true;
+    graph.resources()[depthNormal.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    graph.resources()[velocity.index].hasInitialAccess = true;
+    graph.resources()[velocity.index].initialAccess = ResourceAccess{
+        .stage = pathTraceShaderStage(),
+        .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+
+    graph.addPass("adaptive_sampling_diagnostics")
+        .addStorageRead(raw, PipelineDomain::Compute)
+        .addStorageRead(pathData, PipelineDomain::Compute)
+        .addStorageRead(variance, PipelineDomain::Compute)
+        .addStorageRead(depthNormal, PipelineDomain::Compute)
+        .addStorageRead(velocity, PipelineDomain::Compute)
+        .addStorageRead(historyLength, PipelineDomain::Compute)
+        .addStorageWrite(output, PipelineDomain::Compute)
+        .addStorageWrite(filledMask, PipelineDomain::Compute)
+        .addStorageWrite(density, PipelineDomain::Compute)
+        .addStorageWrite(sampleCount, PipelineDomain::Compute)
+        .addStorageWrite(stats, PipelineDomain::Compute)
+        .addStorageWrite(statsReadback, PipelineDomain::Transfer)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordAdaptiveSamplingDiagnosticsPass(cmd, false);
+        });
+    graph.compile();
+    graph.execute(commandBuffer, temporalFrameIndex_);
+}
+
+void PathTracerRenderer::recordAdaptiveSamplingDiagnosticsPass(VkCommandBuffer commandBuffer, bool profile) {
+    validationLog_.recordPass("adaptive sampling diagnostics");
+    if (!shouldRunAdaptiveSamplingDiagnostics()) {
+        return;
+    }
+    if (profile) {
+        currentProfiler_->write(commandBuffer, GpuProfiler::AdaptiveSamplingDiagnosticsStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
+
+    adaptiveSamplingDebugImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    adaptiveSamplingFilledMaskImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    AdaptiveSamplingPush push{};
+    push.width = renderExtent_.width;
+    push.height = renderExtent_.height;
+    push.debugView = debugParams_.view;
+    push.mode = static_cast<uint32_t>(settings_.adaptiveSamplingMode);
+    push.signalA = glm::vec4(
+        settings_.adaptiveSamplingBudget,
+        settings_.adaptiveWeightVariance,
+        settings_.adaptiveWeightHistory,
+        settings_.adaptiveWeightMotion);
+    push.signalB = glm::vec4(
+        settings_.adaptiveWeightDisocclusion,
+        settings_.adaptiveWeightReactive,
+        settings_.adaptiveWeightEdge,
+        settings_.adaptiveWeightSpecular);
+    push.signalC = glm::vec4(
+        settings_.adaptiveWeightDI,
+        settings_.adaptiveWeightGI,
+        settings_.adaptiveWeightVolumetric,
+        static_cast<float>(temporalFrameIndex_));
+
+    vkCmdFillBuffer(commandBuffer, adaptiveSamplingStatsBuffer_.handle(), 0, adaptiveSamplingStatsBuffer_.size(), 0u);
+    auto bufferBarrier = [](VkBuffer buffer, VkDeviceSize size, VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
+        return VkBufferMemoryBarrier2{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask = srcStage,
+            .srcAccessMask = srcAccess,
+            .dstStageMask = dstStage,
+            .dstAccessMask = dstAccess,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer,
+            .offset = 0,
+            .size = size,
+        };
+    };
+    std::array<VkBufferMemoryBarrier2, 1> clearBarriers{
+        bufferBarrier(
+            adaptiveSamplingStatsBuffer_.handle(),
+            adaptiveSamplingStatsBuffer_.size(),
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+    };
+    VkDependencyInfo dependencyInfo{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = static_cast<uint32_t>(clearBarriers.size()),
+        .pBufferMemoryBarriers = clearBarriers.data(),
+    };
+    vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
+
+    DescriptorSet densitySet = currentFrame_->descriptors().allocate(adaptiveSamplingSetLayout_);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pathDataBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, varianceBuffer_.descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, depthNormalBuffer_.descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, velocityBuffer_.descriptorInfo())
+        .writeImage(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, historyLengthImage_.storageDescriptor())
+        .writeImage(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, adaptiveSamplingDebugImage_.storageDescriptor())
+        .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, adaptiveSamplingDensityBuffer_.descriptorInfo())
+        .writeBuffer(8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, adaptiveSamplingStatsBuffer_.descriptorInfo())
+        .update(context_.device(), densitySet);
+
+    adaptiveSamplingPipeline_->bind(commandBuffer);
+    vkCmdPushConstants(
+        commandBuffer,
+        adaptiveSamplingPipeline_->layout(),
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(push),
+        &push);
+    const VkDescriptorSet densityDescriptorSet = densitySet.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, adaptiveSamplingPipeline_->layout(), 0, 1, &densityDescriptorSet, 0, nullptr);
+    adaptiveSamplingPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+
+    std::array<VkBufferMemoryBarrier2, 2> densityBarriers{
+        bufferBarrier(
+            adaptiveSamplingDensityBuffer_.handle(),
+            adaptiveSamplingDensityBuffer_.size(),
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+        bufferBarrier(
+            adaptiveSamplingStatsBuffer_.handle(),
+            adaptiveSamplingStatsBuffer_.size(),
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT),
+    };
+    VkImageMemoryBarrier2 debugBarrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = adaptiveSamplingDebugImage_.handle(),
+        .subresourceRange = adaptiveSamplingDebugImage_.fullRange(),
+    };
+    dependencyInfo = VkDependencyInfo{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = static_cast<uint32_t>(densityBarriers.size()),
+        .pBufferMemoryBarriers = densityBarriers.data(),
+        .imageMemoryBarrierCount = 1u,
+        .pImageMemoryBarriers = &debugBarrier,
+    };
+    vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
+
+    DescriptorSet discretizeSet = currentFrame_->descriptors().allocate(adaptiveSamplingDiscretizeSetLayout_);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, adaptiveSamplingDensityBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, adaptiveSamplingSampleCountBuffer_.descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, adaptiveSamplingStatsBuffer_.descriptorInfo())
+        .writeImage(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, adaptiveSamplingDebugImage_.storageDescriptor())
+        .writeImage(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, adaptiveSamplingFilledMaskImage_.storageDescriptor())
+        .update(context_.device(), discretizeSet);
+    adaptiveSamplingDiscretizePipeline_->bind(commandBuffer);
+    vkCmdPushConstants(
+        commandBuffer,
+        adaptiveSamplingDiscretizePipeline_->layout(),
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(push),
+        &push);
+    const VkDescriptorSet discretizeDescriptorSet = discretizeSet.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, adaptiveSamplingDiscretizePipeline_->layout(), 0, 1, &discretizeDescriptorSet, 0, nullptr);
+    adaptiveSamplingDiscretizePipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    if (profile) {
+        currentProfiler_->write(commandBuffer, GpuProfiler::AdaptiveSamplingDiagnosticsEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
+
+    if (adaptiveSamplingStatsReadbackBuffer_.handle() != VK_NULL_HANDLE) {
+        const auto statsCopyBarrier = bufferBarrier(
+            adaptiveSamplingStatsBuffer_.handle(),
+            adaptiveSamplingStatsBuffer_.size(),
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT);
+        dependencyInfo = VkDependencyInfo{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .bufferMemoryBarrierCount = 1u,
+            .pBufferMemoryBarriers = &statsCopyBarrier,
+        };
+        vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
+
+        VkBufferCopy copy{};
+        copy.size = std::min(adaptiveSamplingStatsBuffer_.size(), adaptiveSamplingStatsReadbackBuffer_.size());
+        vkCmdCopyBuffer(
+            commandBuffer,
+            adaptiveSamplingStatsBuffer_.handle(),
+            adaptiveSamplingStatsReadbackBuffer_.handle(),
+            1,
+            &copy);
+    }
+}
+
+void PathTracerRenderer::recordAdaptiveSamplingFill(VkCommandBuffer commandBuffer) {
+    if (!shouldRunAdaptiveSamplingFill()) {
+        return;
+    }
+    RenderGraph graph(&allocator_, resourceAliasingEnabled_);
+    auto imageResource = [](const Image& image, const char* name) {
+        return RenderGraphResource{
+            .type = RenderGraphResource::Type::Texture,
+            .lifetime = RenderGraphResource::Lifetime::Persistent,
+            .format = image.format(),
+            .extent = image.extent(),
+            .image = image.handle(),
+            .imageRange = image.fullRange(),
+            .external = true,
+            .debugName = name,
+        };
+    };
+
+    const RenderGraphResourceId raw = graph.createTexture(imageResource(rawImage_, "adaptive fill input raw hdr"));
+    const RenderGraphResourceId filledMask = graph.createTexture(imageResource(adaptiveSamplingFilledMaskImage_, "adaptive sampling filled mask"));
+    const RenderGraphResourceId filled = graph.createTexture(imageResource(adaptiveSamplingFilledImage_, "adaptive filled hdr"));
+
+    auto setImageInitialAccess = [&](RenderGraphResourceId id, const Image& image, VkPipelineStageFlags2 stage, VkAccessFlags2 access) {
+        graph.resources()[id.index].hasInitialAccess = true;
+        graph.resources()[id.index].initialAccess = ResourceAccess{
+            .stage = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : stage,
+            .access = image.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE : access,
+            .layout = image.layout(),
+        };
+    };
+    setImageInitialAccess(raw, rawImage_, kCrossQueueShaderStage, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    setImageInitialAccess(filledMask, adaptiveSamplingFilledMaskImage_, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    setImageInitialAccess(filled, adaptiveSamplingFilledImage_, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    graph.addPass("adaptive_sampling_fill")
+        .addStorageRead(raw, PipelineDomain::Compute)
+        .addStorageRead(filledMask, PipelineDomain::Compute)
+        .addStorageWrite(filled, PipelineDomain::Compute)
+        .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
+            recordAdaptiveSamplingFillPass(cmd);
+        });
+    graph.compile();
+    graph.execute(commandBuffer, temporalFrameIndex_);
+}
+
+void PathTracerRenderer::recordAdaptiveSamplingFillPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("adaptive sampling fill");
+    if (!shouldRunAdaptiveSamplingFill()) {
+        return;
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::AdaptiveSamplingFillStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    adaptiveSamplingFilledMaskImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    adaptiveSamplingFilledImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+
+    struct AdaptiveFillPush {
+        uint32_t width;
+        uint32_t height;
+    };
+    const AdaptiveFillPush push{
+        .width = renderExtent_.width,
+        .height = renderExtent_.height,
+    };
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(adaptiveSamplingFillSetLayout_);
+    DescriptorWriter()
+        .writeImage(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, rawImage_.storageDescriptor())
+        .writeImage(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, adaptiveSamplingFilledMaskImage_.storageDescriptor())
+        .writeImage(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, adaptiveSamplingFilledImage_.storageDescriptor())
+        .update(context_.device(), set);
+
+    adaptiveSamplingFillPipeline_->bind(commandBuffer);
+    vkCmdPushConstants(
+        commandBuffer,
+        adaptiveSamplingFillPipeline_->layout(),
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        sizeof(push),
+        &push);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, adaptiveSamplingFillPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    adaptiveSamplingFillPipeline_->dispatch(commandBuffer, renderExtent_.width, renderExtent_.height);
+    currentProfiler_->write(commandBuffer, GpuProfiler::AdaptiveSamplingFillEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordRegirBuildPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("ReGIR build");
+    if (!shouldUseRegir()) {
+        return;
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RegirBuildStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    const VkDeviceSize reservoirCount64 =
+        static_cast<VkDeviceSize>(regirStorageCellCapacity()) *
+        static_cast<VkDeviceSize>(std::max(settings_.regirReservoirsPerCell, 1u));
+    const uint32_t reservoirCount = static_cast<uint32_t>(std::min<VkDeviceSize>(reservoirCount64, std::numeric_limits<uint32_t>::max()));
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(regirBuildSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightRecords().descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.lightBvhNodes().descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.meshParamsBuffer().descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, regirParamsBuffer_.descriptorInfo())
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirReservoirBuffer_.descriptorInfo())
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            (shouldUseRegirHashGrid() ? regirHashCurrentCellBuffer_ : regirActiveCellBuffer_).descriptorInfo())
+        .update(context_.device(), set);
+
+    regirBuildPipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, regirBuildPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    regirBuildPipeline_->dispatch(commandBuffer, reservoirCount, 1u, 64u, 1u);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RegirBuildEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordRegirEnvironmentBuildPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("ReGIR environment bank build");
+    if (!shouldUseRegirEnvironment()) {
+        return;
+    }
+
+    const Buffer& skyCdfCols = atmosphereLutSystem_ != nullptr &&
+        atmosphereLutSystem_->samplingSystem() != nullptr
+        ? atmosphereLutSystem_->samplingSystem()->cdfCols()
+        : scene_.envCols();
+    bufferMemoryBarrier(
+        commandBuffer,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        skyCdfCols.handle(),
+        skyCdfCols.size());
+    DescriptorSet set = currentFrame_->descriptors().allocate(regirEnvironmentBuildSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, regirParamsBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_.envParamsBuffer().descriptorInfo())
+        .writeImage(2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, scene_.environmentImage().sampledDescriptor(VK_NULL_HANDLE))
+        .writeImage(3, VK_DESCRIPTOR_TYPE_SAMPLER, VkDescriptorImageInfo{.sampler = scene_.environmentSampler()})
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.envRows().descriptorInfo())
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, scene_.envCols().descriptorInfo())
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, skyCdfCols.descriptorInfo())
+        .writeBuffer(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirEnvironmentReservoirBuffer_.descriptorInfo())
+        .writeBuffer(8, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
+        .update(context_.device(), set);
+
+    regirEnvironmentBuildPipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(
+        commandBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        regirEnvironmentBuildPipeline_->layout(),
+        0,
+        1,
+        &descriptorSet,
+        0,
+        nullptr);
+    regirEnvironmentBuildPipeline_->dispatch(commandBuffer, kRegirInfiniteLightBankSize, 1u, 64u, 1u);
+}
+
+void PathTracerRenderer::recordRegirActiveCellsClearPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("ReGIR active cells clear");
+    if (!shouldUseRegirActiveGrid() || regirActiveCellBuffer_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    vkCmdFillBuffer(commandBuffer, regirActiveCellBuffer_.handle(), 0, regirActiveCellBuffer_.size(), 0u);
+}
+
+void PathTracerRenderer::recordRegirActiveCellsReadbackPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("ReGIR active cells readback");
+    if (!shouldUseRegirActiveGrid() ||
+        regirActiveCellBuffer_.handle() == VK_NULL_HANDLE ||
+        regirActiveCellReadbackBuffer_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    VkBufferCopy copy{};
+    copy.size = std::min(regirActiveCellBuffer_.size(), regirActiveCellReadbackBuffer_.size());
+    vkCmdCopyBuffer(commandBuffer, regirActiveCellBuffer_.handle(), regirActiveCellReadbackBuffer_.handle(), 1, &copy);
+    regirActiveCellFeedbackValid_ = true;
+}
+
+void PathTracerRenderer::recordRegirHashCellsClearPass(VkCommandBuffer commandBuffer, bool clearCurrentTable) {
+    validationLog_.recordPass(clearCurrentTable ? "ReGIR hash cells bootstrap clear" : "ReGIR next hash cells clear");
+    if (!shouldUseRegirHashGrid()) {
+        return;
+    }
+    const uint32_t capacity = regirHashCellCapacity();
+    auto clearTable = [&](Buffer& buffer) {
+        vkCmdFillBuffer(commandBuffer, buffer.handle(), 0, buffer.size(), 0xffffffffu);
+        vkCmdFillBuffer(commandBuffer, buffer.handle(), 0, sizeof(uint32_t) * 3u, 0u);
+        vkCmdFillBuffer(commandBuffer, buffer.handle(), sizeof(uint32_t) * 3u, sizeof(uint32_t), capacity);
+    };
+    if (clearCurrentTable) {
+        clearTable(regirHashCurrentCellBuffer_);
+    }
+    clearTable(regirHashNextCellBuffer_);
+}
+
+void PathTracerRenderer::recordRegirHashCellsReadbackPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("ReGIR hash cells readback");
+    if (!shouldUseRegirHashGrid() ||
+        regirHashNextCellBuffer_.handle() == VK_NULL_HANDLE ||
+        regirActiveCellReadbackBuffer_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    VkBufferCopy copy{};
+    copy.size = std::min<VkDeviceSize>(regirHashNextCellBuffer_.size(), sizeof(uint32_t) * 4u);
+    vkCmdCopyBuffer(commandBuffer, regirHashNextCellBuffer_.handle(), regirActiveCellReadbackBuffer_.handle(), 1, &copy);
+    regirActiveCellFeedbackValid_ = true;
+    regirHashRotationPending_ = true;
+}
+
+void PathTracerRenderer::recordRegirSpatialReusePass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("ReGIR spatial reuse");
+    if (!shouldUseRegirSpatialReuse()) {
+        return;
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RegirSpatialReuseStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    const glm::uvec3 dims{
+        std::max(settings_.regirGridDimensions.x, 1u),
+        std::max(settings_.regirGridDimensions.y, 1u),
+        std::max(settings_.regirGridDimensions.z, 1u),
+    };
+    const VkDeviceSize reservoirCount64 =
+        static_cast<VkDeviceSize>(dims.x) *
+        static_cast<VkDeviceSize>(dims.y) *
+        static_cast<VkDeviceSize>(dims.z) *
+        static_cast<VkDeviceSize>(std::max(settings_.regirReservoirsPerCell, 1u));
+    const uint32_t reservoirCount = static_cast<uint32_t>(std::min<VkDeviceSize>(reservoirCount64, std::numeric_limits<uint32_t>::max()));
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(regirSpatialReuseSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, regirParamsBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirReservoirBuffer_.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirSpatialReservoirBuffer_.descriptorInfo())
+        .update(context_.device(), set);
+
+    regirSpatialReusePipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, regirSpatialReusePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    regirSpatialReusePipeline_->dispatch(commandBuffer, reservoirCount, 1u, 64u, 1u);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RegirSpatialReuseEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordRegirTemporalReusePass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("ReGIR temporal reuse");
+    if (!shouldUseRegirTemporalReuse()) {
+        return;
+    }
+    currentProfiler_->write(commandBuffer, GpuProfiler::RegirTemporalReuseStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    const glm::uvec3 dims{
+        std::max(settings_.regirGridDimensions.x, 1u),
+        std::max(settings_.regirGridDimensions.y, 1u),
+        std::max(settings_.regirGridDimensions.z, 1u),
+    };
+    const VkDeviceSize reservoirCount64 =
+        static_cast<VkDeviceSize>(dims.x) *
+        static_cast<VkDeviceSize>(dims.y) *
+        static_cast<VkDeviceSize>(dims.z) *
+        static_cast<VkDeviceSize>(std::max(settings_.regirReservoirsPerCell, 1u));
+    const uint32_t reservoirCount = static_cast<uint32_t>(std::min<VkDeviceSize>(reservoirCount64, std::numeric_limits<uint32_t>::max()));
+    const Buffer& currentReservoirs = shouldUseRegirSpatialReuse() ? regirSpatialReservoirBuffer_ : regirReservoirBuffer_;
+
+    DescriptorSet set = currentFrame_->descriptors().allocate(regirTemporalReuseSetLayout_);
+    DescriptorWriter()
+        .writeBuffer(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, regirParamsBuffer_.descriptorInfo())
+        .writeBuffer(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, currentReservoirs.descriptorInfo())
+        .writeBuffer(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirPreviousReservoirBuffer_.descriptorInfo())
+        .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, regirTemporalReservoirBuffer_.descriptorInfo())
+        .update(context_.device(), set);
+
+    regirTemporalReusePipeline_->bind(commandBuffer);
+    const VkDescriptorSet descriptorSet = set.handle();
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, regirTemporalReusePipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    regirTemporalReusePipeline_->dispatch(commandBuffer, reservoirCount, 1u, 64u, 1u);
+    currentProfiler_->write(commandBuffer, GpuProfiler::RegirTemporalReuseEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+}
+
+void PathTracerRenderer::recordRegirTemporalHistoryCopyPass(VkCommandBuffer commandBuffer) {
+    validationLog_.recordPass("ReGIR temporal history copy");
+    if (!shouldUseRegirTemporalReuse() ||
+        regirTemporalReservoirBuffer_.handle() == VK_NULL_HANDLE ||
+        regirPreviousReservoirBuffer_.handle() == VK_NULL_HANDLE) {
+        return;
+    }
+    VkBufferCopy copy{};
+    copy.size = std::min(regirTemporalReservoirBuffer_.size(), regirPreviousReservoirBuffer_.size());
+    vkCmdCopyBuffer(commandBuffer, regirTemporalReservoirBuffer_.handle(), regirPreviousReservoirBuffer_.handle(), 1, &copy);
+    regirTemporalHistoryValid_ = true;
+    regirTemporalHistoryVersion_ = glm::uvec4(
+        lightVersionCounter_,
+        materialVersionCounter_,
+        objectVersionCounter_,
+        environmentVersionCounter_);
 }
 
 void PathTracerRenderer::copyHistoryResources(VkCommandBuffer commandBuffer) {
@@ -12269,6 +14354,169 @@ bool PathTracerRenderer::shouldRunNrdDenoiser() const {
 #endif
 }
 
+bool PathTracerRenderer::isAdaptiveSamplingDebugView() const {
+    return settings_.debugView == RendererDebugView::AdaptiveDensityMap ||
+        settings_.debugView == RendererDebugView::AdaptiveSampleCount ||
+        settings_.debugView == RendererDebugView::AdaptiveUnsampledPixels ||
+        settings_.debugView == RendererDebugView::AdaptiveFilledImage ||
+        settings_.debugView == RendererDebugView::AdaptiveDisocclusionMask;
+}
+
+bool PathTracerRenderer::shouldRunAdaptiveSamplingPrepass() const {
+    return !settings_.wavefrontFinalOutputEnabled &&
+        settings_.adaptiveSamplingMode == AdaptiveSamplingMode::Heuristic &&
+        adaptiveSamplingDensityBuffer_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingSampleCountBuffer_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingStatsBuffer_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingFilledMaskImage_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingFilledImage_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingFillPipeline_ != nullptr &&
+        adaptiveSamplingFillSetLayout_ != VK_NULL_HANDLE &&
+        shouldRunAdaptiveSamplingDiagnostics();
+}
+
+bool PathTracerRenderer::shouldRunAdaptiveSamplingDiagnostics() const {
+    return !settings_.wavefrontFinalOutputEnabled &&
+        (settings_.adaptiveSamplingMode != AdaptiveSamplingMode::Disabled || isAdaptiveSamplingDebugView()) &&
+        adaptiveSamplingPipeline_ != nullptr &&
+        adaptiveSamplingDiscretizePipeline_ != nullptr &&
+        adaptiveSamplingSetLayout_ != VK_NULL_HANDLE &&
+        adaptiveSamplingDiscretizeSetLayout_ != VK_NULL_HANDLE &&
+        rawImage_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingDebugImage_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingFilledMaskImage_.handle() != VK_NULL_HANDLE &&
+        pathDataBuffer_.handle() != VK_NULL_HANDLE &&
+        varianceBuffer_.handle() != VK_NULL_HANDLE &&
+        depthNormalBuffer_.handle() != VK_NULL_HANDLE &&
+        velocityBuffer_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingDensityBuffer_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingSampleCountBuffer_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingStatsBuffer_.handle() != VK_NULL_HANDLE &&
+        historyLengthImage_.handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldRunAdaptiveSamplingFill() const {
+    return shouldRunAdaptiveSamplingPrepass() &&
+        adaptiveSamplingFilledImage_.handle() != VK_NULL_HANDLE &&
+        adaptiveSamplingFillPipeline_ != nullptr &&
+        adaptiveSamplingFillSetLayout_ != VK_NULL_HANDLE &&
+        (settings_.debugView == RendererDebugView::AdaptiveFilledImage ||
+            shouldRunNrdDenoiser() ||
+            shouldRunDlssRayReconstruction() ||
+            !shouldRunDenoiser());
+}
+
+bool PathTracerRenderer::shouldUseRegir() const {
+    const VkDeviceSize requiredBytes =
+        static_cast<VkDeviceSize>(regirStorageCellCapacity()) *
+        static_cast<VkDeviceSize>(std::max(settings_.regirReservoirsPerCell, 1u)) *
+        sizeof(ReGIRReservoirGpu);
+    return !settings_.wavefrontFinalOutputEnabled &&
+        settings_.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR &&
+        regirBuildPipeline_ != nullptr &&
+        regirBuildSetLayout_ != VK_NULL_HANDLE &&
+        regirParamsBuffer_.handle() != VK_NULL_HANDLE &&
+        regirReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        regirReservoirBuffer_.size() >= requiredBytes &&
+        scene_.lightRecords().handle() != VK_NULL_HANDLE &&
+        scene_.lightBvhNodes().handle() != VK_NULL_HANDLE &&
+        scene_.meshParamsBuffer().handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldUseRegirEnvironment() const {
+    const float sunPower = settings_.usePhysicalCamera
+        ? settings_.sunIlluminanceLux
+        : settings_.sunIntensity;
+    const bool sunAvailable = settings_.sunlightEnabled &&
+        settings_.sunDirection.y > 0.0f && sunPower > 0.0f &&
+        glm::dot(settings_.sunColor, glm::vec3(0.2126f, 0.7152f, 0.0722f)) > 0.0f;
+    return shouldUseRegir() &&
+        settings_.regirEnvironment &&
+        (scene_.envParams().enabled != 0u || sunAvailable) &&
+        regirEnvironmentBuildPipeline_ != nullptr &&
+        regirEnvironmentBuildSetLayout_ != VK_NULL_HANDLE &&
+        regirEnvironmentReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        regirEnvironmentReservoirBuffer_.size() >=
+            sizeof(ReGIREnvironmentReservoirGpu) * kRegirInfiniteLightBankSize;
+}
+
+bool PathTracerRenderer::shouldUseRegirActiveGrid() const {
+    const glm::uvec3 dims{
+        std::max(settings_.regirGridDimensions.x, 1u),
+        std::max(settings_.regirGridDimensions.y, 1u),
+        std::max(settings_.regirGridDimensions.z, 1u),
+    };
+    const VkDeviceSize requiredBytes =
+        (static_cast<VkDeviceSize>(dims.x) *
+            static_cast<VkDeviceSize>(dims.y) *
+            static_cast<VkDeviceSize>(dims.z) + 4ull) *
+        sizeof(uint32_t);
+    return shouldUseRegir() &&
+        settings_.regirGridMode == RegirGridMode::Active &&
+        regirActiveCellBuffer_.handle() != VK_NULL_HANDLE &&
+        regirActiveCellBuffer_.size() >= requiredBytes &&
+        regirActiveCellReadbackBuffer_.handle() != VK_NULL_HANDLE &&
+        regirActiveCellReadbackBuffer_.size() >= sizeof(uint32_t) * 4u;
+}
+
+uint32_t PathTracerRenderer::regirHashCellCapacity() const {
+    const uint64_t totalCells =
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.x, 1u)) *
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.y, 1u)) *
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.z, 1u));
+    const uint64_t target = totalCells <= 64ull ? totalCells : std::max<uint64_t>(64ull, totalCells / 4ull);
+    uint64_t capacity = 1ull;
+    while (capacity < target && capacity < (1ull << 31u)) {
+        capacity <<= 1u;
+    }
+    return static_cast<uint32_t>(std::max<uint64_t>(capacity, 1ull));
+}
+
+uint32_t PathTracerRenderer::regirStorageCellCapacity() const {
+    if (settings_.regirGridMode == RegirGridMode::Hash) {
+        return regirHashCellCapacity();
+    }
+    const uint64_t totalCells =
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.x, 1u)) *
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.y, 1u)) *
+        static_cast<uint64_t>(std::max(settings_.regirGridDimensions.z, 1u));
+    return static_cast<uint32_t>(std::min<uint64_t>(totalCells, std::numeric_limits<uint32_t>::max()));
+}
+
+bool PathTracerRenderer::shouldUseRegirHashGrid() const {
+    const VkDeviceSize requiredBytes =
+        (static_cast<VkDeviceSize>(regirHashCellCapacity()) + 4ull) * sizeof(uint32_t);
+    return shouldUseRegir() &&
+        settings_.regirGridMode == RegirGridMode::Hash &&
+        regirHashCurrentCellBuffer_.handle() != VK_NULL_HANDLE &&
+        regirHashCurrentCellBuffer_.size() >= requiredBytes &&
+        regirHashNextCellBuffer_.handle() != VK_NULL_HANDLE &&
+        regirHashNextCellBuffer_.size() >= requiredBytes &&
+        regirActiveCellReadbackBuffer_.handle() != VK_NULL_HANDLE;
+}
+
+bool PathTracerRenderer::shouldUseRegirSpatialReuse() const {
+    return shouldUseRegir() &&
+        settings_.regirGridMode != RegirGridMode::Hash &&
+        settings_.regirSpatialReuse &&
+        regirSpatialReusePipeline_ != nullptr &&
+        regirSpatialReuseSetLayout_ != VK_NULL_HANDLE &&
+        regirSpatialReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        regirSpatialReservoirBuffer_.size() >= regirReservoirBuffer_.size();
+}
+
+bool PathTracerRenderer::shouldUseRegirTemporalReuse() const {
+    return shouldUseRegir() &&
+        settings_.regirGridMode != RegirGridMode::Hash &&
+        settings_.regirTemporalReuse &&
+        regirTemporalReusePipeline_ != nullptr &&
+        regirTemporalReuseSetLayout_ != VK_NULL_HANDLE &&
+        regirTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        regirPreviousReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        regirTemporalReservoirBuffer_.size() >= regirReservoirBuffer_.size() &&
+        regirPreviousReservoirBuffer_.size() >= regirReservoirBuffer_.size();
+}
+
 bool PathTracerRenderer::isNonDenoiserDebugView() const {
     const uint32_t view = debugParams_.view;
     if (view == 0u) {
@@ -12367,9 +14615,45 @@ bool PathTracerRenderer::shouldRunDlssRayReconstruction() const {
         pathDataBuffer_.handle() != VK_NULL_HANDLE;
 }
 
-bool PathTracerRenderer::shouldUseNative2BPathTraceKernel() const {
+bool PathTracerRenderer::shouldUseGenericBeautyFastPath(bool restirDiValidationFull, bool restirGiInitialFull) const {
+    return rayTracingBeautyFastPipeline_ != nullptr &&
+        settings_.pathTraceKernelMode == PathTraceKernelMode::Generic &&
+        settings_.debugView == RendererDebugView::Beauty &&
+        settings_.pathTracingEnabled &&
+        !settings_.motionBlurEnabled &&
+        !settings_.wavefrontFinalOutputEnabled &&
+        !rayTracingDiagnosticCountersEnabled_ &&
+        !restirDiValidationFull &&
+        !restirGiInitialFull &&
+        !shouldUseRegir();
+}
+
+bool PathTracerRenderer::shouldUseRegirBeautyFastPath(bool restirDiValidationFull, bool restirGiInitialFull) const {
+    return rayTracingRegirBeautyFastPipeline_ != nullptr &&
+        rayTracingRegirStochasticBeautyFastPipeline_ != nullptr &&
+        settings_.pathTraceKernelMode == PathTraceKernelMode::Generic &&
+        settings_.debugView == RendererDebugView::Beauty &&
+        settings_.pathTracingEnabled &&
+        !settings_.motionBlurEnabled &&
+        !settings_.wavefrontFinalOutputEnabled &&
+        !rayTracingDiagnosticCountersEnabled_ &&
+        !restirDiValidationFull &&
+        !restirGiInitialFull &&
+        shouldUseRegir();
+}
+
+bool PathTracerRenderer::shouldTraceRegirFiniteLightsThisFrame() const {
+    if (settings_.regirQueryMode == RegirQueryMode::Deterministic) {
+        return true;
+    }
+    const uint32_t framePeriod = settings_.regirFiniteQueryFramePeriod > 0u
+        ? settings_.regirFiniteQueryFramePeriod
+        : (shouldUseRegirHashGrid() ? 256u : 8u);
+    return temporalFrameIndex_ % framePeriod == framePeriod - 1u;
+}
+
+bool PathTracerRenderer::native2BSettingsEligible() const {
     return settings_.pathTraceKernelMode == PathTraceKernelMode::Native2B &&
-        rayTracingNative2BPipeline_ != nullptr &&
         settings_.pathTracingEnabled &&
         settings_.maxBounces == 2u &&
         settings_.samplesPerPixel == 1u &&
@@ -12380,6 +14664,10 @@ bool PathTracerRenderer::shouldUseNative2BPathTraceKernel() const {
         !settings_.motionBlurEnabled &&
         settings_.debugView == RendererDebugView::Beauty &&
         !settings_.wavefrontFinalOutputEnabled;
+}
+
+bool PathTracerRenderer::shouldUseNative2BPathTraceKernel() const {
+    return native2BSettingsEligible() && rayTracingNative2BPipeline_ != nullptr;
 }
 
 bool PathTracerRenderer::native2BTerminalPayloadActive() const {
@@ -12395,7 +14683,6 @@ bool PathTracerRenderer::native2BCompactPrimaryLightsActive() const {
 
 const char* PathTracerRenderer::pathTraceKernelFallbackReason() const {
     if (settings_.pathTraceKernelMode != PathTraceKernelMode::Native2B) return nullptr;
-    if (rayTracingNative2BPipeline_ == nullptr) return "native2b_pipeline_unavailable";
     if (!settings_.pathTracingEnabled) return "path_tracing_disabled";
     if (settings_.maxBounces != 2u) return "requires_exactly_two_bounces";
     if (settings_.samplesPerPixel != 1u || !effectiveLimitSamplesPerPixel()) return "requires_effective_one_spp";
@@ -12404,6 +14691,15 @@ const char* PathTracerRenderer::pathTraceKernelFallbackReason() const {
     if (settings_.motionBlurEnabled) return "motion_blur_enabled";
     if (settings_.debugView != RendererDebugView::Beauty) return "debug_view_active";
     if (settings_.wavefrontFinalOutputEnabled) return "wavefront_final_output_enabled";
+    if (rayTracingNative2BPipeline_ == nullptr &&
+        native2BPipelineBuildJob_.has_value() &&
+        native2BPipelineBuildJob_->variant == Native2BPipelineVariant::Base) {
+        return "native2b_pipeline_compiling";
+    }
+    if (rayTracingNative2BPipeline_ == nullptr && native2BBasePipelineBuildFailed_) {
+        return "native2b_pipeline_build_failed";
+    }
+    if (rayTracingNative2BPipeline_ == nullptr) return "native2b_pipeline_unavailable";
     return nullptr;
 }
 
@@ -12458,11 +14754,12 @@ bool PathTracerRenderer::shouldRunRestirGiTemporal() const {
     const ComputePipeline* temporalPipeline = usesRestirGiUncompressedInitialReservoir()
         ? restirGiTemporalFullPipeline_.get()
         : restirGiTemporalPipeline_.get();
+    const Buffer& initialReservoir = restirGiReservoirBuffer_;
     return !settings_.wavefrontFinalOutputEnabled &&
         shouldUseNewRestirGi() &&
         temporalPipeline != nullptr &&
         restirGiTemporalSetLayout_ != VK_NULL_HANDLE &&
-        restirGiReservoirBuffer_.handle() != VK_NULL_HANDLE &&
+        initialReservoir.handle() != VK_NULL_HANDLE &&
         restirGiPreviousProductionHistoryBuffer().handle() != VK_NULL_HANDLE &&
         restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE &&
         restirGiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE &&
@@ -12687,7 +14984,6 @@ bool PathTracerRenderer::shouldUseNewRestirGi() const {
 
 bool PathTracerRenderer::usesRestirGiUncompressedInitialReservoir() const {
     return restirGiUncompressedLayout_ ||
-        shouldUseNewRestirGi() ||
         settings_.restirGiReservoirLayout == RestirGiReservoirLayout::ValidationFull;
 }
 
@@ -12872,11 +15168,23 @@ const char* PathTracerRenderer::restirGiReservoirLayoutName() const {
     return rtv::restirGiReservoirLayoutName(settings_.restirGiReservoirLayout);
 }
 
+const Image& PathTracerRenderer::adaptiveDenoiserInputImage() const {
+    return shouldRunAdaptiveSamplingFill() ? adaptiveSamplingFilledImage_ : rawImage_;
+}
+
 const Image& PathTracerRenderer::postDenoiseImage() const {
     return denoisedImage_;
 }
 
 const Image& PathTracerRenderer::hdrPostProcessImage() const {
+    if (settings_.debugView == RendererDebugView::AdaptiveFilledImage &&
+        adaptiveSamplingFilledImage_.handle() != VK_NULL_HANDLE &&
+        shouldRunAdaptiveSamplingFill()) {
+        return adaptiveSamplingFilledImage_;
+    }
+    if (isAdaptiveSamplingDebugView() && adaptiveSamplingDebugImage_.handle() != VK_NULL_HANDLE) {
+        return adaptiveSamplingDebugImage_;
+    }
     return (shouldRunTaa() || shouldRunDlss() || shouldRunDlssRayReconstruction()) ? taaImage_ : postDenoiseImage();
 }
 
@@ -13372,7 +15680,8 @@ void PathTracerRenderer::recordDlssRayReconstruction(VkCommandBuffer commandBuff
         };
     };
 
-    const RenderGraphResourceId input = graph.createTexture(imageResource(rawImage_, "dlss rr input raw hdr"));
+    const Image& inputImage = adaptiveDenoiserInputImage();
+    const RenderGraphResourceId input = graph.createTexture(imageResource(inputImage, shouldRunAdaptiveSamplingFill() ? "dlss rr input filled hdr" : "dlss rr input raw hdr"));
     const RenderGraphResourceId output = graph.createTexture(imageResource(taaImage_, "dlss rr output hdr"));
     const RenderGraphResourceId depthGuide = graph.createTexture(imageResource(dlssDepthImage_, "dlss rr depth guide"));
     const RenderGraphResourceId motionGuide = graph.createTexture(imageResource(dlssMotionVectorImage_, "dlss rr motion guide"));
@@ -13391,15 +15700,16 @@ void PathTracerRenderer::recordDlssRayReconstruction(VkCommandBuffer commandBuff
     const RenderGraphResourceId depthNormal = graph.createBuffer(bufferResource(depthNormalBuffer_, "depth normal"));
     const RenderGraphResourceId velocity = graph.createBuffer(bufferResource(velocityBuffer_, "screen velocity"));
     const RenderGraphResourceId pathData = graph.createBuffer(bufferResource(pathDataBuffer_, "path data channels"));
+    const RenderGraphResourceId adaptiveFilledMask = graph.createTexture(imageResource(adaptiveSamplingFilledMaskImage_, "adaptive sampling filled mask"));
     const RenderGraphResourceId previousWorldPosition = graph.createBuffer(bufferResource(previousWorldPositionBuffer_, "previous world position"));
 
     graph.resources()[input.index].hasInitialAccess = true;
     graph.resources()[input.index].initialAccess = ResourceAccess{
-        .stage = rawImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
-        .access = rawImage_.layout() == VK_IMAGE_LAYOUT_UNDEFINED
+        .stage = inputImage.layout() == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE : kCrossQueueShaderStage,
+        .access = inputImage.layout() == VK_IMAGE_LAYOUT_UNDEFINED
             ? VK_ACCESS_2_NONE
             : (VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT),
-        .layout = rawImage_.layout(),
+        .layout = inputImage.layout(),
     };
     graph.resources()[output.index].hasInitialAccess = true;
     graph.resources()[output.index].initialAccess = ResourceAccess{
@@ -13437,6 +15747,7 @@ void PathTracerRenderer::recordDlssRayReconstruction(VkCommandBuffer commandBuff
     setGuideInitialAccess(specularRayDirection, dlssSpecularRayDirectionImage_);
     setGuideInitialAccess(diffuseRayDirectionHit, dlssDiffuseRayDirectionHitDistanceImage_);
     setGuideInitialAccess(specularRayDirectionHit, dlssSpecularRayDirectionHitDistanceImage_);
+    setGuideInitialAccess(adaptiveFilledMask, adaptiveSamplingFilledMaskImage_);
     graph.resources()[depthNormal.index].hasInitialAccess = true;
     graph.resources()[depthNormal.index].initialAccess = ResourceAccess{
         .stage = pathTraceShaderStage(),
@@ -13458,7 +15769,7 @@ void PathTracerRenderer::recordDlssRayReconstruction(VkCommandBuffer commandBuff
         .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
     };
 
-    graph.addPass("dlss_rr_guides")
+    RenderGraphPass& guidesPass = graph.addPass("dlss_rr_guides")
         .addStorageRead(depthNormal, PipelineDomain::Compute)
         .addStorageRead(velocity, PipelineDomain::Compute)
         .addStorageRead(pathData, PipelineDomain::Compute)
@@ -13480,6 +15791,9 @@ void PathTracerRenderer::recordDlssRayReconstruction(VkCommandBuffer commandBuff
         .setExecuteCallback([this](FrameGraphContext&, VkCommandBuffer cmd) {
             recordDlssRayReconstructionGuidesPass(cmd);
         });
+    if (shouldRunAdaptiveSamplingPrepass()) {
+        guidesPass.addStorageRead(adaptiveFilledMask, PipelineDomain::Compute);
+    }
     graph.addPass("dlss_ray_reconstruction")
         .addStorageRead(input, PipelineDomain::Compute)
         .addStorageRead(depthGuide, PipelineDomain::Compute)
@@ -13521,6 +15835,7 @@ void PathTracerRenderer::recordDlssRayReconstructionGuidesPass(VkCommandBuffer c
     dlssSpecularRayDirectionImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     dlssDiffuseRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     dlssSpecularRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    adaptiveSamplingFilledMaskImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
     DescriptorSet set = currentFrame_->descriptors().allocate(dlssRayReconstructionGuidesSetLayout_);
     DescriptorWriter()
@@ -13545,6 +15860,7 @@ void PathTracerRenderer::recordDlssRayReconstructionGuidesPass(VkCommandBuffer c
         .writeImage(18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, dlssSpecularRayDirectionHitDistanceImage_.storageDescriptor())
         .writeBuffer(19, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameTaaParamsOffset, sizeof(TaaParams)))
         .writeBuffer(20, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
+        .writeImage(21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, adaptiveSamplingFilledMaskImage_.storageDescriptor())
         .update(context_.device(), set);
 
     dlssRayReconstructionGuidesPipeline_->bind(commandBuffer);
@@ -13556,7 +15872,8 @@ void PathTracerRenderer::recordDlssRayReconstructionGuidesPass(VkCommandBuffer c
 void PathTracerRenderer::recordDlssRayReconstructionPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("dlss ray reconstruction");
     currentProfiler_->write(commandBuffer, GpuProfiler::TaaStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-    rawImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    const Image& inputImage = adaptiveDenoiserInputImage();
+    inputImage.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     dlssDepthImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     dlssMotionVectorImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     dlssDiffuseAlbedoImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -13573,13 +15890,16 @@ void PathTracerRenderer::recordDlssRayReconstructionPass(VkCommandBuffer command
     dlssSpecularRayDirectionHitDistanceImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
 
+    ngxDlssRayReconstructionEvaluation_ = StreamlineEvaluationSummary{};
+    ngxDlssRayReconstructionEvaluation_.frameIndex = temporalFrameIndex_;
+
     if (streamlineFrameActive_) {
         streamlineDlssRayReconstructionTags_ = StreamlineTagSummary{};
         streamlineDlssRayReconstructionEvaluation_ = StreamlineEvaluationSummary{};
         auto tag = [&](const char* role, const Image& image, const char* producerPass) {
             (void)tagStreamlineImageResource(StreamlineFeature::DlssRayReconstruction, role, image, commandBuffer, producerPass, &streamlineDlssRayReconstructionTags_);
         };
-        tag("scaling-input-color", rawImage_, "path_trace_rt");
+        tag("scaling-input-color", inputImage, shouldRunAdaptiveSamplingFill() ? "adaptive_sampling_fill" : "path_trace_rt");
         tag("scaling-output-color", taaImage_, "dlss_ray_reconstruction");
         tag("depth", dlssDepthImage_, "dlss_rr_guides");
         tag("motion-vectors", dlssMotionVectorImage_, "dlss_rr_guides");
@@ -13631,6 +15951,11 @@ void PathTracerRenderer::recordDlssRayReconstructionPass(VkCommandBuffer command
     }
 
     if (!ensureDlssRayReconstructionFeature(commandBuffer)) {
+        ++ngxDlssRayReconstructionEvaluation_.attempted;
+        ++ngxDlssRayReconstructionEvaluation_.failed;
+        ngxDlssRayReconstructionEvaluation_.lastError = dlssRayReconstructionUnavailableReason_.empty()
+            ? "DLSS Ray Reconstruction feature could not be created"
+            : dlssRayReconstructionUnavailableReason_;
         fallbackBlitPostDenoiseToTemporalOutput(commandBuffer);
         currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
         return;
@@ -13647,7 +15972,7 @@ void PathTracerRenderer::recordDlssRayReconstructionPass(VkCommandBuffer command
             image.height(),
             writable);
     };
-    NVSDK_NGX_Resource_VK colorResource = makeResource(rawImage_, false);
+    NVSDK_NGX_Resource_VK colorResource = makeResource(inputImage, false);
     NVSDK_NGX_Resource_VK outputResource = makeResource(taaImage_, true);
     NVSDK_NGX_Resource_VK depthResource = makeResource(dlssDepthImage_, false);
     NVSDK_NGX_Resource_VK motionResource = makeResource(dlssMotionVectorImage_, false);
@@ -13716,6 +16041,7 @@ void PathTracerRenderer::recordDlssRayReconstructionPass(VkCommandBuffer command
     evalParams.InToneMapperType = ngxToneMapper(settings_.toneMapper);
     evalParams.InFrameTimeDeltaInMsec = frameDeltaSeconds_ > 0.0f ? frameDeltaSeconds_ * 1000.0f : 16.6667f;
 
+    ++ngxDlssRayReconstructionEvaluation_.attempted;
     NVSDK_NGX_Result result = NGX_VULKAN_EVALUATE_DLSSD_EXT(
         commandBuffer,
         reinterpret_cast<NVSDK_NGX_Handle*>(dlssRayReconstructionHandle_),
@@ -13724,12 +16050,16 @@ void PathTracerRenderer::recordDlssRayReconstructionPass(VkCommandBuffer command
     if (NVSDK_NGX_FAILED(result)) {
         dlssRayReconstructionUnavailableReason_ = ngxFailureMessage("NGX_VULKAN_EVALUATE_DLSSD_EXT", result);
         dlssRayReconstructionFeatureCreationFailed_ = true;
+        ++ngxDlssRayReconstructionEvaluation_.failed;
+        ngxDlssRayReconstructionEvaluation_.lastError = dlssRayReconstructionUnavailableReason_;
         validationLog_.recordPass("dlss ray reconstruction evaluation failed: " + dlssRayReconstructionUnavailableReason_);
         releaseDlssRayReconstructionFeature();
         fallbackBlitPostDenoiseToTemporalOutput(commandBuffer);
         currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
         return;
     }
+    ++ngxDlssRayReconstructionEvaluation_.succeeded;
+    ngxDlssRayReconstructionEvaluation_.lastError.clear();
 #endif
     taaImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     currentProfiler_->write(commandBuffer, GpuProfiler::TaaEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
@@ -13976,6 +16306,11 @@ void PathTracerRenderer::recordTaaHistoryCopyPass(VkCommandBuffer commandBuffer)
 }
 
 void PathTracerRenderer::rotateRealtimeHistoryResources() {
+    if (regirHashRotationPending_) {
+        std::swap(regirHashCurrentCellBuffer_, regirHashNextCellBuffer_);
+        regirHashRotationPending_ = false;
+        regirHashTablesValid_ = true;
+    }
     if (engineHistoryRotationPending_) {
         std::swap(denoisedImage_, historyImage_);
         std::swap(diffuseResolvedImage_, diffuseHistoryImage_);
@@ -14229,27 +16564,28 @@ void PathTracerRenderer::recordToneMapPass(VkCommandBuffer commandBuffer) {
 
 void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
     RenderGraph graph(&allocator_, resourceAliasingEnabled_);
+    const Image& inputImage = adaptiveDenoiserInputImage();
     const RenderGraphResourceId raw = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
         .lifetime = RenderGraphResource::Lifetime::Persistent,
-        .format = rawImage_.format(),
-        .extent = rawImage_.extent(),
-        .image = rawImage_.handle(),
-        .imageRange = rawImage_.fullRange(),
+        .format = inputImage.format(),
+        .extent = inputImage.extent(),
+        .image = inputImage.handle(),
+        .imageRange = inputImage.fullRange(),
         .external = true,
         .hasInitialAccess = true,
         .initialAccess = ResourceAccess{
-            .stage = pathTraceShaderStage(),
+            .stage = shouldRunAdaptiveSamplingFill() ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : pathTraceShaderStage(),
             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .layout = VK_IMAGE_LAYOUT_GENERAL,
+            .layout = inputImage.layout(),
         },
         .hasFinalAccess = true,
         .finalAccess = ResourceAccess{
-            .stage = pathTraceShaderStage(),
-            .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .access = VK_ACCESS_2_TRANSFER_READ_BIT,
             .layout = VK_IMAGE_LAYOUT_GENERAL,
         },
-        .debugName = "raw hdr",
+        .debugName = shouldRunAdaptiveSamplingFill() ? "adaptive filled hdr" : "raw hdr",
     });
     const RenderGraphResourceId denoised = graph.createTexture(RenderGraphResource{
         .type = RenderGraphResource::Type::Texture,
@@ -14458,14 +16794,15 @@ void PathTracerRenderer::skipDenoiserPass(VkCommandBuffer commandBuffer) {
         });
     graph.compile();
     graph.execute(commandBuffer, temporalFrameIndex_);
-    rawImage_.setLayout(VK_IMAGE_LAYOUT_GENERAL);
+    inputImage.setLayout(VK_IMAGE_LAYOUT_GENERAL);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass(adaptiveSkipDenoiser_ ? "adaptive skip denoiser copy" : "skip denoiser copy");
     currentProfiler_->write(commandBuffer, GpuProfiler::SkipDenoiserCopyStart, VK_PIPELINE_STAGE_2_COPY_BIT);
-    rawImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    const Image& inputImage = adaptiveDenoiserInputImage();
+    inputImage.setLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     denoisedImage_.setLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
     VkImageCopy copy{};
@@ -14473,10 +16810,10 @@ void PathTracerRenderer::skipDenoiserCopyPass(VkCommandBuffer commandBuffer) {
     copy.srcSubresource.layerCount = 1;
     copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.dstSubresource.layerCount = 1;
-    copy.extent = rawImage_.extent();
+    copy.extent = inputImage.extent();
     vkCmdCopyImage(
         commandBuffer,
-        rawImage_.handle(),
+        inputImage.handle(),
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         denoisedImage_.handle(),
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -14634,6 +16971,9 @@ VkDeviceSize PathTracerRenderer::estimatedTextureMemory() const {
     total += texSize(historyLengthResolvedImage_);
     total += texSize(momentDebugImage_);
     total += texSize(momentDebugResolvedImage_);
+    total += texSize(adaptiveSamplingDebugImage_);
+    total += texSize(adaptiveSamplingFilledMaskImage_);
+    total += texSize(adaptiveSamplingFilledImage_);
     total += texSize(taaImage_);
     total += texSize(taaHistoryImage_);
     total += texSize(dlssDepthImage_);
@@ -14682,7 +17022,12 @@ VkDeviceSize PathTracerRenderer::estimatedBufferMemory() const {
     total += previousWorldPositionBuffer_.size();
     total += velocityBuffer_.size();
     total += entityIdBuffer_.size();
+    total += entityIdReadbackBuffer_.size();
     total += pathDataBuffer_.size();
+    total += adaptiveSamplingDensityBuffer_.size();
+    total += adaptiveSamplingSampleCountBuffer_.size();
+    total += adaptiveSamplingStatsBuffer_.size();
+    total += adaptiveSamplingStatsReadbackBuffer_.size();
     total += rayTracingDiagnosticCountersBuffer_.size();
     total += rayTracingDiagnosticCountersReadbackBuffer_.size();
     total += rayTracingAlphaMaterialCountersBuffer_.size();
@@ -14755,6 +17100,15 @@ VkDeviceSize PathTracerRenderer::restirReservoirMemory() const {
     addUnique(restirGiActiveTileMaskBuffer_);
     addUnique(restirGiCountersBuffer_);
     addUnique(restirGiCountersReadbackBuffer_);
+    addUnique(regirReservoirBuffer_);
+    addUnique(regirEnvironmentReservoirBuffer_);
+    addUnique(regirSpatialReservoirBuffer_);
+    addUnique(regirTemporalReservoirBuffer_);
+    addUnique(regirPreviousReservoirBuffer_);
+    addUnique(regirActiveCellBuffer_);
+    addUnique(regirActiveCellReadbackBuffer_);
+    addUnique(regirHashCurrentCellBuffer_);
+    addUnique(regirHashNextCellBuffer_);
     addUnique(restirDiReceiverBuffer_);
     addUnique(restirDiInitialReservoirBuffer_);
     addUnique(restirDiTemporalReservoirBuffer_);

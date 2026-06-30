@@ -108,6 +108,9 @@ void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
     j["restir_gi_upsample"] = p.restirGiUpsample;
     j["restir_gi_final"] = p.restirGiFinal;
     j["restir_gi_counters_readback"] = p.restirGiCountersReadback;
+    j["regir_build"] = p.regirBuild;
+    j["regir_spatial_reuse"] = p.regirSpatialReuse;
+    j["regir_temporal_reuse"] = p.regirTemporalReuse;
     j["restir_di_temporal"] = p.restirDiTemporal;
     j["restir_di_spatial"] = p.restirDiSpatial;
     j["restir_di_final"] = p.restirDiFinal;
@@ -123,6 +126,8 @@ void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
     j["atmosphere_aerial_perspective"] = p.atmosphereAerialPerspective;
     j["denoiser"] = p.denoiser;
     j["moment_update"] = p.momentUpdate;
+    j["adaptive_sampling_diagnostics"] = p.adaptiveSamplingDiagnostics;
+    j["adaptive_sampling_fill"] = p.adaptiveSamplingFill;
     j["history_copy"] = p.historyCopy;
     j["skip_denoiser_copy"] = p.skipDenoiserCopy;
     j["taa"] = p.taa;
@@ -1002,6 +1007,18 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryPressureQualityReport
     j["denoiser_max_history_length"] = m.denoiserMaxHistoryLength;
 }
 
+void to_json(nlohmann::json& j, const ProfileReport::AdaptiveSamplingReport& a) {
+    j["active"] = a.active;
+    j["stats_valid"] = a.statsValid;
+    j["requested_budget_spp"] = a.requestedBudgetSpp;
+    j["average_density"] = a.averageDensity;
+    j["desired_samples_per_pixel"] = a.desiredSamplesPerPixel;
+    j["actual_samples_per_pixel"] = a.actualSamplesPerPixel;
+    j["budget_error_percent"] = a.budgetErrorPercent;
+    j["pixel_count"] = a.pixelCount;
+    j["actual_sample_count"] = a.actualSampleCount;
+}
+
 void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport::StreamlineFeatureReport& f) {
     j["requestable"] = f.requestable;
     j["supported"] = f.supported;
@@ -1151,6 +1168,7 @@ void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n)
     j["streamline_dlss_ray_reconstruction_tags"] = n.streamlineDlssRayReconstructionTags;
     j["streamline_dlss_evaluation"] = n.streamlineDlssEvaluation;
     j["streamline_dlss_ray_reconstruction_evaluation"] = n.streamlineDlssRayReconstructionEvaluation;
+    j["ngx_dlss_ray_reconstruction_evaluation"] = n.ngxDlssRayReconstructionEvaluation;
     j["streamline_nvperf_evaluation"] = n.streamlineNvPerfEvaluation;
     j["streamline_reflex_markers"] = n.streamlineReflexMarkers;
     j["gpu_crash_dumps"] = n.gpuCrashDumps;
@@ -1270,6 +1288,47 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["restir_history_copy_mode_requested"] = restirHistoryCopyModeName(s.restirHistoryCopyMode);
     j["restir_counter_mode"] = s.restirCounterMode == RestirCounterMode::On ? "on"
         : s.restirCounterMode == RestirCounterMode::Off ? "off" : "auto";
+    j["lighting_reuse_mode_requested"] = lightingReuseModeName(s.lightingReuseMode);
+    j["path_reservoir_layout_requested"] = reservoirLayoutName(s.pathReservoirLayout);
+    j["regir_grid_dimensions"] = {s.regirGridDimensions.x, s.regirGridDimensions.y, s.regirGridDimensions.z};
+    j["regir_reservoirs_per_cell"] = s.regirReservoirsPerCell;
+    j["regir_candidates_per_reservoir"] = s.regirCandidatesPerReservoir;
+    j["regir_grid_padding"] = s.regirGridPadding;
+    j["regir_canonical_mix"] = s.regirCanonicalMix;
+    j["regir_query_mode"] = regirQueryModeName(s.regirQueryMode);
+    j["regir_grid_mode_requested"] = regirGridModeName(s.regirGridMode);
+    const uint32_t requestedFiniteQueryFramePeriod = s.regirQueryMode == RegirQueryMode::Deterministic
+        ? 1u
+        : (s.regirFiniteQueryFramePeriod > 0u
+            ? s.regirFiniteQueryFramePeriod
+            : (s.regirGridMode == RegirGridMode::Hash ? 256u : 8u));
+    j["regir_finite_query_probability_requested"] =
+        1.0 / static_cast<double>(requestedFiniteQueryFramePeriod);
+    j["regir_finite_query_schedule"] = "frame-coherent";
+    j["regir_finite_query_frame_period_override"] = s.regirFiniteQueryFramePeriod;
+    j["regir_finite_query_frame_period_requested"] = requestedFiniteQueryFramePeriod;
+    j["regir_spatial_reuse_requested"] = s.regirSpatialReuse;
+    j["regir_spatial_rounds"] = s.regirSpatialRounds;
+    j["regir_temporal_reuse_requested"] = s.regirTemporalReuse;
+    j["regir_temporal_history"] = s.regirTemporalHistory;
+    j["regir_temporal_max_m"] = s.regirTemporalMaxM;
+    j["regir_visibility_reuse_requested"] = s.regirVisibilityReuse;
+    j["regir_environment_requested"] = s.regirEnvironment;
+    j["regir_infinite_lights_requested"] = s.regirEnvironment;
+    j["adaptive_sampling_mode_requested"] = adaptiveSamplingModeName(s.adaptiveSamplingMode);
+    j["adaptive_sampling_budget"] = s.adaptiveSamplingBudget;
+    j["adaptive_sampling_weights"] = {
+        {"variance", s.adaptiveWeightVariance},
+        {"history", s.adaptiveWeightHistory},
+        {"motion", s.adaptiveWeightMotion},
+        {"disocclusion", s.adaptiveWeightDisocclusion},
+        {"reactive", s.adaptiveWeightReactive},
+        {"edge", s.adaptiveWeightEdge},
+        {"specular", s.adaptiveWeightSpecular},
+        {"restir_di", s.adaptiveWeightDI},
+        {"restir_gi", s.adaptiveWeightGI},
+        {"volumetric", s.adaptiveWeightVolumetric},
+    };
     j["adaptive_quality_mode"] = s.adaptiveQualityMode == AdaptiveQualityMode::Off ? "off"
         : s.adaptiveQualityMode == AdaptiveQualityMode::Conservative ? "conservative"
         : s.adaptiveQualityMode == AdaptiveQualityMode::Balanced ? "balanced" : "aggressive";
@@ -1368,6 +1427,9 @@ GpuFrameTimings percentileGpuTimings(
     result.restirGiUpsampleMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiUpsampleMs, percentile);
     result.restirGiFinalMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiFinalMs, percentile);
     result.restirGiCountersReadbackMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirGiCountersReadbackMs, percentile);
+    result.regirBuildMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::regirBuildMs, percentile);
+    result.regirSpatialReuseMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::regirSpatialReuseMs, percentile);
+    result.regirTemporalReuseMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::regirTemporalReuseMs, percentile);
     result.restirDiTemporalMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirDiTemporalMs, percentile);
     result.restirDiSpatialMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirDiSpatialMs, percentile);
     result.restirDiFinalMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::restirDiFinalMs, percentile);
@@ -1383,6 +1445,8 @@ GpuFrameTimings percentileGpuTimings(
     result.atmosphereAerialPerspectiveMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::atmosphereAerialPerspectiveMs, percentile);
     result.denoiserMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::denoiserMs, percentile);
     result.momentUpdateMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::momentUpdateMs, percentile);
+    result.adaptiveSamplingDiagnosticsMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::adaptiveSamplingDiagnosticsMs, percentile);
+    result.adaptiveSamplingFillMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::adaptiveSamplingFillMs, percentile);
     result.historyCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::historyCopyMs, percentile);
     result.skipDenoiserCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::skipDenoiserCopyMs, percentile);
     result.taaMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::taaMs, percentile);
@@ -1430,6 +1494,9 @@ void assignPerPassGpuMs(ProfileReport::PerPassGpuMs& out, const GpuFrameTimings&
     out.restirGiUpsample = timings.restirGiUpsampleMs;
     out.restirGiFinal = timings.restirGiFinalMs;
     out.restirGiCountersReadback = timings.restirGiCountersReadbackMs;
+    out.regirBuild = timings.regirBuildMs;
+    out.regirSpatialReuse = timings.regirSpatialReuseMs;
+    out.regirTemporalReuse = timings.regirTemporalReuseMs;
     out.restirDiTemporal = timings.restirDiTemporalMs;
     out.restirDiSpatial = timings.restirDiSpatialMs;
     out.restirDiFinal = timings.restirDiFinalMs;
@@ -1445,6 +1512,8 @@ void assignPerPassGpuMs(ProfileReport::PerPassGpuMs& out, const GpuFrameTimings&
     out.atmosphereAerialPerspective = timings.atmosphereAerialPerspectiveMs;
     out.denoiser = timings.denoiserMs;
     out.momentUpdate = timings.momentUpdateMs;
+    out.adaptiveSamplingDiagnostics = timings.adaptiveSamplingDiagnosticsMs;
+    out.adaptiveSamplingFill = timings.adaptiveSamplingFillMs;
     out.historyCopy = timings.historyCopyMs;
     out.skipDenoiserCopy = timings.skipDenoiserCopyMs;
     out.taa = timings.taaMs;
@@ -1494,6 +1563,9 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
         result.restirGiUpsampleMs += values[i].restirGiUpsampleMs;
         result.restirGiFinalMs += values[i].restirGiFinalMs;
         result.restirGiCountersReadbackMs += values[i].restirGiCountersReadbackMs;
+        result.regirBuildMs += values[i].regirBuildMs;
+        result.regirSpatialReuseMs += values[i].regirSpatialReuseMs;
+        result.regirTemporalReuseMs += values[i].regirTemporalReuseMs;
         result.restirDiTemporalMs += values[i].restirDiTemporalMs;
         result.restirDiSpatialMs += values[i].restirDiSpatialMs;
         result.restirDiFinalMs += values[i].restirDiFinalMs;
@@ -1509,6 +1581,8 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
         result.atmosphereAerialPerspectiveMs += values[i].atmosphereAerialPerspectiveMs;
         result.denoiserMs += values[i].denoiserMs;
         result.momentUpdateMs += values[i].momentUpdateMs;
+        result.adaptiveSamplingDiagnosticsMs += values[i].adaptiveSamplingDiagnosticsMs;
+        result.adaptiveSamplingFillMs += values[i].adaptiveSamplingFillMs;
         result.historyCopyMs += values[i].historyCopyMs;
         result.skipDenoiserCopyMs += values[i].skipDenoiserCopyMs;
         result.taaMs += values[i].taaMs;
@@ -1548,6 +1622,9 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
     result.restirGiUpsampleMs *= invCount;
     result.restirGiFinalMs *= invCount;
     result.restirGiCountersReadbackMs *= invCount;
+    result.regirBuildMs *= invCount;
+    result.regirSpatialReuseMs *= invCount;
+    result.regirTemporalReuseMs *= invCount;
     result.restirDiTemporalMs *= invCount;
     result.restirDiSpatialMs *= invCount;
     result.restirDiFinalMs *= invCount;
@@ -1563,6 +1640,8 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
     result.atmosphereAerialPerspectiveMs *= invCount;
     result.denoiserMs *= invCount;
     result.momentUpdateMs *= invCount;
+    result.adaptiveSamplingDiagnosticsMs *= invCount;
+    result.adaptiveSamplingFillMs *= invCount;
     result.historyCopyMs *= invCount;
     result.skipDenoiserCopyMs *= invCount;
     result.taaMs *= invCount;
@@ -1750,7 +1829,9 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.shaderExecutionReordering.enabled = renderer->settings().shaderExecutionReorderingEnabled && serInfo.supported;
     profileReport_.shaderExecutionReordering.extensionSupported = serInfo.extensionSupported;
     profileReport_.shaderExecutionReordering.invocationReorderFeature = serInfo.invocationReorderFeature;
-    profileReport_.shaderExecutionReordering.dedicatedSerPipeline = profileReport_.shaderExecutionReordering.enabled;
+    profileReport_.shaderExecutionReordering.dedicatedSerPipeline =
+        profileReport_.shaderExecutionReordering.enabled &&
+        renderer->settings().wavefrontTraceEnabled;
     profileReport_.shaderExecutionReordering.pipelineCreateFlagRequired = false;
     profileReport_.shaderExecutionReordering.maxInvocationReorderDepthReported = serInfo.maxInvocationReorderDepthReported;
     profileReport_.shaderExecutionReordering.maxRayTracingInvocationReorderDepth = serInfo.maxRayTracingInvocationReorderDepth;
@@ -1913,6 +1994,27 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     }
 
     const auto& rtStats = renderer->rayTracingStats();
+    if (const auto regirStats = renderer->regirGridStats(); regirStats.has_value()) {
+        profileReport_.regirGrid.feedbackAvailable = regirStats->feedbackAvailable;
+        profileReport_.regirGrid.activeCellCount = regirStats->activeCellCount;
+        profileReport_.regirGrid.hashCollisionCount = regirStats->hashCollisionCount;
+        profileReport_.regirGrid.hashSaturationCount = regirStats->hashSaturationCount;
+        profileReport_.regirGrid.hashCellCapacity = regirStats->hashCellCapacity;
+        profileReport_.regirGrid.totalCellCount = regirStats->totalCellCount;
+        profileReport_.regirGrid.denseReservoirBytes = regirStats->denseReservoirBytes;
+        profileReport_.regirGrid.effectiveReservoirBytes = regirStats->effectiveReservoirBytes;
+        profileReport_.regirGrid.backingBytes = regirStats->backingBytes;
+        profileReport_.regirGrid.environmentBankSize = regirStats->environmentBankSize;
+        profileReport_.regirGrid.sunBankSize = regirStats->sunBankSize;
+        profileReport_.regirGrid.validEnvironmentReservoirs = regirStats->validEnvironmentReservoirs;
+        profileReport_.regirGrid.validSunReservoirs = regirStats->validSunReservoirs;
+        profileReport_.regirGrid.environmentGeneration = regirStats->environmentGeneration;
+        profileReport_.regirGrid.lightGeneration = regirStats->lightGeneration;
+        profileReport_.regirGrid.environmentBankBytes = regirStats->environmentBankBytes;
+        profileReport_.regirGrid.environmentEffective = regirStats->environmentEffective;
+        profileReport_.regirGrid.sunEffective = regirStats->sunEffective;
+        profileReport_.regirGrid.temporalHistoryValid = regirStats->temporalHistoryValid;
+    }
     profileReport_.memory.accelerationStructureBytes = static_cast<uint64_t>(rtStats.accelerationStructureBytes);
     profileReport_.rayTracingGeometry.opaquePrimitiveCount = rtStats.geometry.opaquePrimitiveCount;
     profileReport_.rayTracingGeometry.alphaTestedPrimitiveCount = rtStats.geometry.alphaTestedPrimitiveCount;
@@ -2653,6 +2755,38 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memoryPressureQuality.restirGiHalfResolution = memoryPressureState.restirGiHalfResolution;
     profileReport_.memoryPressureQuality.denoiserMaxHistoryLength = memoryPressureState.denoiserMaxHistoryLength;
 
+    profileReport_.adaptiveSampling.active =
+        renderer->settings().adaptiveSamplingMode == AdaptiveSamplingMode::Heuristic &&
+        (profileReport_.perPassGpuMs.adaptiveSamplingDiagnostics > 0.0f ||
+            profileReport_.perPassGpuMs.adaptiveSamplingFill > 0.0f);
+    profileReport_.adaptiveSampling.requestedBudgetSpp = renderer->settings().adaptiveSamplingBudget;
+    if (const auto adaptiveStats = renderer->adaptiveSamplingStats()) {
+        profileReport_.adaptiveSampling.statsValid = adaptiveStats->pixelCount > 0u;
+        profileReport_.adaptiveSampling.averageDensity = adaptiveStats->averageDensity;
+        profileReport_.adaptiveSampling.desiredSamplesPerPixel = adaptiveStats->averageDesiredSamplesPerPixel;
+        profileReport_.adaptiveSampling.actualSamplesPerPixel = adaptiveStats->averageActualSamplesPerPixel;
+        profileReport_.adaptiveSampling.pixelCount = adaptiveStats->pixelCount;
+        profileReport_.adaptiveSampling.actualSampleCount = adaptiveStats->actualSampleCount;
+        if (profileReport_.adaptiveSampling.statsValid &&
+            std::abs(profileReport_.adaptiveSampling.requestedBudgetSpp) > 1.0e-5f) {
+            profileReport_.adaptiveSampling.budgetErrorPercent =
+                (profileReport_.adaptiveSampling.actualSamplesPerPixel -
+                 profileReport_.adaptiveSampling.requestedBudgetSpp) /
+                profileReport_.adaptiveSampling.requestedBudgetSpp * 100.0f;
+        }
+    }
+    if (profileReport_.adaptiveSampling.active) {
+        if (!profileReport_.adaptiveSampling.statsValid) {
+            profileReport_.warnings.push_back("adaptive sampling was active but GPU budget stats were not available");
+        } else if (std::abs(profileReport_.adaptiveSampling.budgetErrorPercent) > 5.0f) {
+            std::ostringstream warning;
+            warning << "adaptive sampling actual spp drifted "
+                    << profileReport_.adaptiveSampling.budgetErrorPercent
+                    << "% from requested budget";
+            profileReport_.warnings.push_back(warning.str());
+        }
+    }
+
     profileReport_.sceneUpdateRoutes.clear();
     for (const SceneUpdateRouteEvent& route : renderer->validationLog().sceneUpdateRoutes()) {
         ProfileReport::SceneUpdateRouteReport report;
@@ -2694,6 +2828,19 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.validationErrorCount = 0;
 
     profileReport_.settings = renderer->settings();
+    if (profileReport_.settings.lightingReuseMode == LightingReuseMode::ExperimentalRestirPT ||
+        profileReport_.settings.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy) {
+        profileReport_.warnings.push_back(
+            std::string("Lighting reuse mode '") +
+            lightingReuseModeName(profileReport_.settings.lightingReuseMode) +
+            "' is requested, but only the legacy DI/GI path is currently effective.");
+    }
+    if (profileReport_.settings.adaptiveSamplingMode == AdaptiveSamplingMode::Neural) {
+        profileReport_.warnings.push_back(
+            std::string("Adaptive sampling mode '") +
+            adaptiveSamplingModeName(profileReport_.settings.adaptiveSamplingMode) +
+            "' is requested, but only the heuristic sparse adaptive sampling path is currently implemented.");
+    }
     profileReport_.effectiveRestirHistoryCopyMode = renderer->effectiveRestirHistoryCopyMode();
     profileReport_.effectiveRestirGiActiveTileMaskEnabled = renderer->effectiveRestirGiActiveTileMaskEnabled();
     profileReport_.effectivePathTraceKernelMode = renderer->effectivePathTraceKernelMode();
@@ -2811,6 +2958,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.nvidiaIntegrations.streamlineDlssRayReconstructionTags = copyStreamlineTags(nvidiaStatus.streamlineDlssRayReconstructionTags);
     profileReport_.nvidiaIntegrations.streamlineDlssEvaluation = copyStreamlineEvaluation(nvidiaStatus.streamlineDlssEvaluation);
     profileReport_.nvidiaIntegrations.streamlineDlssRayReconstructionEvaluation = copyStreamlineEvaluation(nvidiaStatus.streamlineDlssRayReconstructionEvaluation);
+    profileReport_.nvidiaIntegrations.ngxDlssRayReconstructionEvaluation = copyStreamlineEvaluation(nvidiaStatus.ngxDlssRayReconstructionEvaluation);
     profileReport_.nvidiaIntegrations.streamlineNvPerfEvaluation = copyStreamlineEvaluation(nvidiaStatus.streamlineNvPerfEvaluation);
     profileReport_.nvidiaIntegrations.streamlineReflexMarkers = copyStreamlineReflexMarkers(nvidiaStatus.streamlineReflexMarkers);
     const GpuCrashDiagnosticsStatus gpuCrashStatus = gpuCrashDiagnosticsStatus();
@@ -2866,8 +3014,13 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
         {"ReSTIR GI Spatial", profileReport_.perPassGpuMs.restirGiSpatial},
         {"ReSTIR GI Upsample", profileReport_.perPassGpuMs.restirGiUpsample},
         {"ReSTIR GI Final", profileReport_.perPassGpuMs.restirGiFinal},
+        {"ReGIR Build", profileReport_.perPassGpuMs.regirBuild},
+        {"ReGIR Spatial Reuse", profileReport_.perPassGpuMs.regirSpatialReuse},
+        {"ReGIR Temporal Reuse", profileReport_.perPassGpuMs.regirTemporalReuse},
         {"Denoiser", profileReport_.perPassGpuMs.denoiser},
         {"Moment Update", profileReport_.perPassGpuMs.momentUpdate},
+        {"Adaptive Sampling Diagnostics", profileReport_.perPassGpuMs.adaptiveSamplingDiagnostics},
+        {"Adaptive Sampling Fill", profileReport_.perPassGpuMs.adaptiveSamplingFill},
         {"TAA/TSR", profileReport_.perPassGpuMs.taa},
         {"ToneMap", profileReport_.perPassGpuMs.toneMap},
         {"Fullscreen/Present", profileReport_.perPassGpuMs.fullscreen + profileReport_.perPassGpuMs.editorPresentation},
@@ -2910,6 +3063,8 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     const float temporalPostMs =
         profileReport_.perPassGpuMs.denoiser +
         profileReport_.perPassGpuMs.momentUpdate +
+        profileReport_.perPassGpuMs.adaptiveSamplingDiagnostics +
+        profileReport_.perPassGpuMs.adaptiveSamplingFill +
         profileReport_.perPassGpuMs.taa +
         profileReport_.perPassGpuMs.historyCopy +
         profileReport_.perPassGpuMs.taaHistoryCopy;
@@ -3418,10 +3573,6 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     const uint64_t sumWeight = diCounter64(45, 46);
     const uint64_t sumLuminance = diCounter64(47, 60);
     const uint64_t finalEstimateCount = diCounter(56);
-    const bool initialPassActive = diCounter(0) > 0ull;
-    const bool temporalPassActive = diCounter(16) > 0ull;
-    const bool spatialPassActive = spatialTested > 0ull;
-    const bool finalPassActive = finalPixels > 0ull;
     const bool newDiRequested =
         profileReport_.settings.restirDiMode == RestirDiMode::Production ||
         profileReport_.settings.restirDiMode == RestirDiMode::ReferenceValidation ||
@@ -3435,6 +3586,25 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         profileReport_.memory.restirDiReceiverBytes +
         profileReport_.memory.restirDiPreviousReceiverBytes +
         profileReport_.memory.restirDiCountersBytes;
+    const bool diGpuPassEvidence =
+        profileReport_.perPassGpuMs.restirDiTemporal > 0.0f ||
+        profileReport_.perPassGpuMs.restirDiSpatial > 0.0f ||
+        profileReport_.perPassGpuMs.restirDiFinal > 0.0f ||
+        profileReport_.restirDiHistoryValid ||
+        finalPixels > 0ull;
+    const bool initialPassActive = newDiRequested &&
+        profileReport_.memory.restirDiInitialBytes > 0ull &&
+        profileReport_.memory.restirDiReceiverBytes > 0ull &&
+        (diCounter(0) > 0ull || diGpuPassEvidence);
+    const bool temporalPassActive = newDiRequested &&
+        profileReport_.settings.restirDiTemporalEnabled &&
+        (diCounter(16) > 0ull || profileReport_.perPassGpuMs.restirDiTemporal > 0.0f);
+    const bool spatialPassActive = newDiRequested &&
+        profileReport_.settings.restirDiSpatialEnabled &&
+        (spatialTested > 0ull || profileReport_.perPassGpuMs.restirDiSpatial > 0.0f);
+    const bool finalPassActive = newDiRequested &&
+        (finalPixels > 0ull || profileReport_.perPassGpuMs.restirDiFinal > 0.0f ||
+         profileReport_.restirDiHistoryValid);
     nlohmann::json diWarnings = nlohmann::json::array();
     if (initialPassActive && !profileReport_.restirDiHistoryValid && newDiRequested) {
         diWarnings.push_back({
@@ -3476,8 +3646,12 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         }},
         {"direct_light_ownership", {
             {"emissive_and_analytic_lights", initialPassActive ? "restir_di" : "classic_nee"},
-            {"sun", "classic_nee"},
-            {"environment", "classic_nee"},
+            {"sun", initialPassActive && profileReport_.settings.restirDiIncludeSun
+                ? "restir_di_candidate_with_classic_fallback"
+                : "classic_nee"},
+            {"environment", initialPassActive && profileReport_.settings.restirDiIncludeEnvironment
+                ? "restir_di_candidate_with_classic_fallback"
+                : "classic_nee"},
             {"participating_media", "classic_nee"},
         }},
         {"stabilization", {
@@ -3510,6 +3684,8 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"point", diCounter(7)},
             {"area", diCounter(8)},
             {"spot", diCounter(9)},
+            {"environment", diCounter(61)},
+            {"sun", diCounter(62)},
         }},
         {"temporal_tested_count", diCounter(17)},
         {"temporal_accepted_count", temporalAccepted},
@@ -3805,6 +3981,14 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     };
     j["adaptive_quality"] = profileReport_.adaptiveQuality;
     j["memory_pressure_quality"] = profileReport_.memoryPressureQuality;
+    j["adaptive_sampling"] = profileReport_.adaptiveSampling;
+    const auto isAdaptiveDebugView = [](RendererDebugView view) {
+        return view == RendererDebugView::AdaptiveDensityMap ||
+            view == RendererDebugView::AdaptiveSampleCount ||
+            view == RendererDebugView::AdaptiveUnsampledPixels ||
+            view == RendererDebugView::AdaptiveFilledImage ||
+            view == RendererDebugView::AdaptiveDisocclusionMask;
+    };
     j["active_passes"] = {
         {"path_trace", profileReport_.settings.pathTracingEnabled},
         {"pathtrace_kernel_native2b", profileReport_.effectivePathTraceKernelMode == PathTraceKernelMode::Native2B},
@@ -3812,6 +3996,30 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"restir_di_temporal", profileReport_.perPassGpuMs.restirDiTemporal > 0.0f},
         {"restir_di_spatial", profileReport_.perPassGpuMs.restirDiSpatial > 0.0f},
         {"restir_di_final", profileReport_.perPassGpuMs.restirDiFinal > 0.0f},
+        {"regir", profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR},
+        {"regir_spatial_reuse", profileReport_.perPassGpuMs.regirSpatialReuse > 0.0f ||
+            (profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR &&
+                profileReport_.settings.regirGridMode != RegirGridMode::Hash &&
+                profileReport_.settings.regirSpatialReuse)},
+        {"regir_temporal_reuse", profileReport_.perPassGpuMs.regirTemporalReuse > 0.0f ||
+            (profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR &&
+                profileReport_.settings.regirGridMode != RegirGridMode::Hash &&
+                profileReport_.settings.regirTemporalReuse)},
+        {"regir_visibility_reuse",
+            profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR &&
+            profileReport_.settings.regirVisibilityReuse},
+        {"regir_environment", profileReport_.regirGrid.environmentEffective},
+        {"regir_sun", profileReport_.regirGrid.sunEffective},
+        {"restir_pt", false},
+        {"adaptive_sampling",
+            profileReport_.settings.adaptiveSamplingMode == AdaptiveSamplingMode::Heuristic &&
+            (profileReport_.perPassGpuMs.adaptiveSamplingDiagnostics > 0.0f ||
+                profileReport_.perPassGpuMs.adaptiveSamplingFill > 0.0f)},
+        {"adaptive_sampling_diagnostics",
+            profileReport_.perPassGpuMs.adaptiveSamplingDiagnostics > 0.0f ||
+            profileReport_.settings.adaptiveSamplingMode != AdaptiveSamplingMode::Disabled ||
+            isAdaptiveDebugView(profileReport_.settings.debugView)},
+        {"adaptive_sampling_fill", profileReport_.perPassGpuMs.adaptiveSamplingFill > 0.0f},
         {"restir_gi_temporal", profileReport_.perPassGpuMs.restirGiTemporal > 0.0f},
         {"restir_gi_spatial", profileReport_.perPassGpuMs.restirGiSpatial > 0.0f},
         {"restir_gi_final", profileReport_.perPassGpuMs.restirGiFinal > 0.0f},
@@ -3885,6 +4093,117 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["settings"]["native2b_direct_reuse_effective"] = native2BDirectReuseEffective
         ? native2BDirectReuseModeName(profileReport_.settings.native2BDirectReuseMode)
         : "off";
+    const LightingReuseMode effectiveLightingReuseMode =
+        profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR
+        ? LightingReuseMode::LegacyRestirDiGiPlusReGIR
+        : LightingReuseMode::LegacyRestirDiGi;
+    j["settings"]["lighting_reuse_mode_effective"] = lightingReuseModeName(effectiveLightingReuseMode);
+    const bool regirRequested =
+        profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR;
+    const bool regirSpatialReuseEffective =
+        regirRequested &&
+        profileReport_.settings.regirGridMode != RegirGridMode::Hash &&
+        profileReport_.settings.regirSpatialReuse;
+    const bool regirTemporalReuseEffective =
+        regirRequested &&
+        profileReport_.settings.regirGridMode != RegirGridMode::Hash &&
+        profileReport_.settings.regirTemporalReuse;
+    const bool regirHashGrid =
+        regirRequested && profileReport_.settings.regirGridMode == RegirGridMode::Hash;
+    const bool regirHashSaturated =
+        regirHashGrid && profileReport_.regirGrid.hashSaturationCount > 0u;
+    const bool regirHashReuseFallback =
+        regirHashGrid &&
+        (profileReport_.settings.regirSpatialReuse || profileReport_.settings.regirTemporalReuse);
+    const bool regirUnsupportedAdvancedRequested =
+        regirHashSaturated || regirHashReuseFallback;
+    const uint64_t regirCellCount =
+        static_cast<uint64_t>(std::max(profileReport_.settings.regirGridDimensions.x, 1u)) *
+        static_cast<uint64_t>(std::max(profileReport_.settings.regirGridDimensions.y, 1u)) *
+        static_cast<uint64_t>(std::max(profileReport_.settings.regirGridDimensions.z, 1u));
+    const bool regirActiveGrid =
+        regirRequested && profileReport_.settings.regirGridMode == RegirGridMode::Active;
+    const uint64_t regirDenseMemoryBytes = profileReport_.regirGrid.denseReservoirBytes > 0u
+        ? profileReport_.regirGrid.denseReservoirBytes
+        : regirCellCount *
+            static_cast<uint64_t>(std::max(profileReport_.settings.regirReservoirsPerCell, 1u)) *
+            32ull;
+    const bool regirSparseGrid = regirActiveGrid || regirHashGrid;
+    const uint64_t regirActiveCells = regirSparseGrid
+        ? (profileReport_.regirGrid.feedbackAvailable
+            ? std::min<uint64_t>(profileReport_.regirGrid.activeCellCount, regirCellCount)
+            : 0ull)
+        : (regirRequested ? regirCellCount : 0ull);
+    const uint64_t regirEffectiveMemoryBytes = regirSparseGrid
+        ? (profileReport_.regirGrid.feedbackAvailable
+            ? profileReport_.regirGrid.effectiveReservoirBytes
+            : 0ull)
+        : (regirRequested
+            ? std::max<uint64_t>(profileReport_.regirGrid.effectiveReservoirBytes, regirDenseMemoryBytes)
+            : 0ull);
+    j["settings"]["regir_grid_mode_effective"] = !regirRequested
+        ? "off"
+        : regirGridModeName(regirHashGrid
+            ? RegirGridMode::Hash
+            : (regirActiveGrid ? RegirGridMode::Active : RegirGridMode::Dense));
+    const uint32_t effectiveFiniteQueryFramePeriod =
+        profileReport_.settings.regirQueryMode == RegirQueryMode::Deterministic
+            ? 1u
+            : (profileReport_.settings.regirFiniteQueryFramePeriod > 0u
+                ? profileReport_.settings.regirFiniteQueryFramePeriod
+                : (regirHashGrid ? 256u : 8u));
+    j["settings"]["regir_finite_query_probability_effective"] = !regirRequested
+        ? 0.0
+        : 1.0 / static_cast<double>(effectiveFiniteQueryFramePeriod);
+    j["settings"]["regir_finite_query_schedule"] = "frame-coherent";
+    j["settings"]["regir_finite_query_frame_period_override"] =
+        profileReport_.settings.regirFiniteQueryFramePeriod;
+    j["settings"]["regir_finite_query_frame_period_effective"] = !regirRequested
+        ? 0u
+        : effectiveFiniteQueryFramePeriod;
+    j["settings"]["regir_active_feedback_available"] = regirSparseGrid && profileReport_.regirGrid.feedbackAvailable;
+    j["settings"]["regir_active_cells"] = regirActiveCells;
+    j["settings"]["regir_hash_collisions"] = profileReport_.regirGrid.hashCollisionCount;
+    j["settings"]["regir_hash_saturations"] = profileReport_.regirGrid.hashSaturationCount;
+    j["settings"]["regir_hash_capacity"] = regirHashGrid ? profileReport_.regirGrid.hashCellCapacity : 0u;
+    j["settings"]["regir_dense_memory_bytes"] = regirRequested ? regirDenseMemoryBytes : 0ull;
+    j["settings"]["regir_backing_memory_bytes"] = regirRequested
+        ? profileReport_.regirGrid.backingBytes
+        : 0ull;
+    j["settings"]["regir_effective_memory_bytes"] = regirEffectiveMemoryBytes;
+    j["settings"]["regir_environment_effective"] = profileReport_.regirGrid.environmentEffective;
+    j["settings"]["regir_environment_bank_size"] = profileReport_.regirGrid.environmentBankSize;
+    j["settings"]["regir_infinite_lights_effective"] =
+        profileReport_.regirGrid.environmentEffective || profileReport_.regirGrid.sunEffective;
+    j["settings"]["regir_sun_effective"] = profileReport_.regirGrid.sunEffective;
+    j["settings"]["regir_sun_bank_size"] = profileReport_.regirGrid.sunBankSize;
+    j["settings"]["regir_environment_bank_bytes"] = profileReport_.regirGrid.environmentBankBytes;
+    j["settings"]["regir_infinite_light_bank_size"] =
+        profileReport_.regirGrid.environmentBankSize + profileReport_.regirGrid.sunBankSize;
+    j["settings"]["regir_infinite_light_bank_bytes"] = profileReport_.regirGrid.environmentBankBytes;
+    j["settings"]["regir_environment_valid_reservoirs"] = profileReport_.regirGrid.validEnvironmentReservoirs;
+    j["settings"]["regir_sun_valid_reservoirs"] = profileReport_.regirGrid.validSunReservoirs;
+    j["settings"]["regir_environment_generation"] = profileReport_.regirGrid.environmentGeneration;
+    j["settings"]["regir_light_generation"] = profileReport_.regirGrid.lightGeneration;
+    j["settings"]["regir_temporal_history_valid"] = profileReport_.regirGrid.temporalHistoryValid;
+    j["settings"]["regir_advanced_fallback"] = {
+        {"used", regirRequested && regirUnsupportedAdvancedRequested},
+        {"reason", regirHashSaturated
+            ? "hash_table_saturated_using_canonical_query_fallback"
+            : (regirHashReuseFallback
+                ? "hash_grid_spatial_temporal_reuse_not_implemented"
+                : "")},
+        {"spatial_reuse_effective", regirSpatialReuseEffective},
+        {"temporal_reuse_effective", regirTemporalReuseEffective},
+        {"visibility_reuse_effective",
+            regirRequested && profileReport_.settings.regirVisibilityReuse},
+    };
+    j["settings"]["adaptive_sampling_mode_effective"] =
+        profileReport_.settings.adaptiveSamplingMode == AdaptiveSamplingMode::Heuristic
+            ? adaptiveSamplingModeName(AdaptiveSamplingMode::Heuristic)
+            : adaptiveSamplingModeName(AdaptiveSamplingMode::Disabled);
+    j["settings"]["path_reservoir_layout_effective"] =
+        reservoirLayoutName(ReservoirLayout::LegacyDI);
     const bool nativeInternalExtent =
         profileReport_.resolution.renderWidth == profileReport_.resolution.displayWidth &&
         profileReport_.resolution.renderHeight == profileReport_.resolution.displayHeight;

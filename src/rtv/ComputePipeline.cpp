@@ -4,7 +4,26 @@
 #include "rtv/PipelineCache.h"
 #include "rtv/ShaderModule.h"
 
+#include <chrono>
+#include <iostream>
+#include <string>
+
 namespace rtv {
+
+namespace {
+
+template <typename Fn>
+void timePipelineCreate(const char* kind, const std::string& label, Fn&& fn) {
+    const auto start = std::chrono::steady_clock::now();
+    fn();
+    const auto end = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration<double, std::milli>(end - start).count();
+    if (ms >= 25.0) {
+        std::cout << "Pipeline create: " << kind << " " << label << " took " << ms << " ms\n";
+    }
+}
+
+} // namespace
 
 ComputePipeline::ComputePipeline(
     VkDevice device,
@@ -26,7 +45,9 @@ ComputePipeline::ComputePipeline(
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage = shader.stageInfo(entryPoint);
     pipelineInfo.layout = layout_;
-    checkVk(vkCreateComputePipelines(device_, pipelineCache.handle(), 1, &pipelineInfo, nullptr, &pipeline_), "vkCreateComputePipelines");
+    timePipelineCreate("compute", shader.debugName(), [&]() {
+        checkVk(vkCreateComputePipelines(device_, pipelineCache.handle(), 1, &pipelineInfo, nullptr, &pipeline_), "vkCreateComputePipelines");
+    });
 }
 
 ComputePipeline::~ComputePipeline() {

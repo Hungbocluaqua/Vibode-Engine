@@ -35,9 +35,10 @@ void main() {
     uint i1 = local_mesh_indices[triIndex + 1u];
     uint i2 = local_mesh_indices[triIndex + 2u];
 
-    LocalVertex v0 = ray_tracing_local_vertex(meshIndex, i0);
-    LocalVertex v1 = ray_tracing_local_vertex(meshIndex, i1);
-    LocalVertex v2 = ray_tracing_local_vertex(meshIndex, i2);
+    uvec4 skinningBinding = ray_tracing_gpu_skinning_binding(meshIndex);
+    LocalVertex v0 = ray_tracing_local_vertex_with_binding(skinningBinding, i0);
+    LocalVertex v1 = ray_tracing_local_vertex_with_binding(skinningBinding, i1);
+    LocalVertex v2 = ray_tracing_local_vertex_with_binding(skinningBinding, i2);
     vec3 p0 = v0.position_uv_x.xyz;
     vec3 p1 = v1.position_uv_x.xyz;
     vec3 p2 = v2.position_uv_x.xyz;

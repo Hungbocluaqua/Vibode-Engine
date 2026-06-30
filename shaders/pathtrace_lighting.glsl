@@ -1,6 +1,16 @@
 #ifndef RTV_PATHTRACE_LIGHTING_GLSL
 #define RTV_PATHTRACE_LIGHTING_GLSL
 
+#ifndef RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB
+#define RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB 1.0
+#endif
+#ifndef RTV_GENERIC_SECONDARY_DIRECT_PROB
+#define RTV_GENERIC_SECONDARY_DIRECT_PROB 1.0
+#endif
+#ifndef RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT
+#define RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT 0
+#endif
+
 // Direct-light sampling, visibility, ReSTIR reuse, and volume-light helpers.
 bool sample_emissive_light(
     inout uint rng,
@@ -163,14 +173,17 @@ bool sample_emissive_light(
     vec4 uv2 = local_triangle_data[ti + 5u];
     vec2 sampleUv = uv01.xy * bary.x + uv01.zw * bary.y + uv2.xy * bary.z;
     apply_material_textures(material, sampleUv, sampleUv);
-    sampleRadiance = material.emissive;
+    vec3 recordRadiance = vec3(selected.data1.w, selected.data2.w, selected.data3.w);
+    sampleRadiance = has_positive_radiance(material.emissive)
+        ? material.emissive
+        : max(recordRadiance, vec3(0.0));
     emission = sampleRadiance;
 
     vec3 toLight = samplePos - hitPos;
     float distSq = dot(toLight, toLight);
     distanceToLight = sqrt(max(distSq, 1e-8));
     wi = toLight / distanceToLight;
-    float cosLight = max(dot(-wi, lightNormal), 0.0);
+    float cosLight = abs(dot(-wi, lightNormal));
     samplePosition = samplePos;
     lightNormalOut = lightNormal;
     float selectionPdf = selectedPdf;
@@ -203,6 +216,723 @@ bool sample_sun_light(inout uint rng, out vec3 wi, out vec3 radiance, out float 
     return luminance(radiance) > 0.0 && pdfSolidAngle > 0.0;
 }
 
+bool sample_emissive_light_index(
+    inout uint rng,
+    uint lightIndex,
+    float selectedPdf,
+    vec3 hitPos,
+    out vec3 wi,
+    out vec3 emission,
+    out float pdfSolidAngle,
+    out float distanceToLight,
+    out uint lightIndexOut,
+    out uint lightKindOut,
+    out vec3 samplePosition,
+    out vec3 sampleRadiance,
+    out vec3 lightNormalOut) {
+    lightIndexOut = lightIndex;
+    lightKindOut = 0u;
+    samplePosition = vec3(0.0);
+    sampleRadiance = vec3(0.0);
+    lightNormalOut = vec3(0.0, 1.0, 0.0);
+    if (lightIndex >= mesh_params.light_count || mesh_params.emissive_total_area <= 1.0e-8) {
+        wi = vec3(0.0, 1.0, 0.0);
+        emission = vec3(0.0);
+        pdfSolidAngle = 0.0;
+        distanceToLight = 0.0;
+        return false;
+    }
+
+    LightRecord selected = light_records[lightIndex];
+    lightKindOut = selected.metadata.x;
+    if (selected.metadata.x == 2u) {
+        wi = normalize(selected.data1.xyz);
+        emission = selected.data2.xyz;
+        samplePosition = wi;
+        sampleRadiance = emission;
+        lightNormalOut = -wi;
+        pdfSolidAngle = selectedPdf;
+        distanceToLight = 10000.0;
+        return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+    }
+    if (selected.metadata.x == 1u) {
+        vec3 center = selected.data1.xyz;
+        float radius = max(selected.data0.z, 1.0e-6);
+        float z = rand_f32(rng) * 2.0 - 1.0;
+        float phi = 2.0 * PI * rand_f32(rng);
+        float radial = sqrt(max(1.0 - z * z, 0.0));
+        vec3 lightNormal = vec3(radial * cos(phi), z, radial * sin(phi));
+        vec3 samplePos = center + lightNormal * radius;
+        vec3 toLight = samplePos - hitPos;
+        float distSq = dot(toLight, toLight);
+        distanceToLight = sqrt(max(distSq, 1.0e-8));
+        wi = toLight / distanceToLight;
+        float cosLight = max(dot(-wi, lightNormal), 0.0);
+        samplePosition = samplePos;
+        sampleRadiance = max(selected.data2.xyz, vec3(0.0));
+        lightNormalOut = lightNormal;
+        emission = sampleRadiance;
+        float area = max(selected.data0.w, 1.0e-6);
+        pdfSolidAngle = cosLight > 1.0e-6 ? selectedPdf * distSq / (cosLight * area) : 0.0;
+        return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+    }
+    if (selected.metadata.x == 3u) {
+        vec3 samplePos = selected.data1.xyz;
+        vec3 toLight = samplePos - hitPos;
+        float distSq = dot(toLight, toLight);
+        distanceToLight = sqrt(max(distSq, 1e-8));
+        wi = toLight / distanceToLight;
+        samplePosition = samplePos;
+        sampleRadiance = selected.data2.xyz;
+        lightNormalOut = -wi;
+        emission = sampleRadiance / max(distSq, 1e-4);
+        pdfSolidAngle = selectedPdf;
+        return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+    }
+    if (selected.metadata.x == 5u) {
+        vec3 samplePos = selected.data1.xyz;
+        vec3 toLight = samplePos - hitPos;
+        float distSq = dot(toLight, toLight);
+        distanceToLight = sqrt(max(distSq, 1e-8));
+        wi = toLight / distanceToLight;
+        vec3 spotDirection = normalize(vec3(selected.data1.w, selected.data2.w, selected.data3.x));
+        float innerCone = clamp(selected.data3.y, 0.0, PI);
+        float outerCone = clamp(max(selected.data3.z, innerCone), 0.0, PI);
+        float cosInner = cos(innerCone);
+        float cosOuter = cos(outerCone);
+        float cosTheta = dot(-wi, spotDirection);
+        float coneWeight = clamp((cosTheta - cosOuter) / max(cosInner - cosOuter, 1.0e-4), 0.0, 1.0);
+        coneWeight *= coneWeight;
+        samplePosition = samplePos;
+        sampleRadiance = selected.data2.xyz * coneWeight;
+        lightNormalOut = spotDirection;
+        emission = sampleRadiance / max(distSq, 1e-4);
+        pdfSolidAngle = selectedPdf;
+        return coneWeight > 0.0 && has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+    }
+    if (selected.metadata.x == 4u) {
+        vec3 center = selected.data1.xyz;
+        vec3 lightNormal = normalize(vec3(selected.data1.w, selected.data2.w, selected.data3.x));
+        vec3 tangent = normalize(abs(lightNormal.y) < 0.99 ? cross(vec3(0.0, 1.0, 0.0), lightNormal) : cross(vec3(1.0, 0.0, 0.0), lightNormal));
+        vec3 bitangent = normalize(cross(lightNormal, tangent));
+        float halfSize = selected.data0.z * 0.5;
+        vec3 samplePos = center + tangent * ((rand_f32(rng) * 2.0 - 1.0) * halfSize) + bitangent * ((rand_f32(rng) * 2.0 - 1.0) * halfSize);
+        vec3 toLight = samplePos - hitPos;
+        float distSq = dot(toLight, toLight);
+        distanceToLight = sqrt(max(distSq, 1e-8));
+        wi = toLight / distanceToLight;
+        float cosLight = max(dot(-wi, lightNormal), 0.0);
+        samplePosition = samplePos;
+        sampleRadiance = selected.data2.xyz;
+        lightNormalOut = lightNormal;
+        emission = sampleRadiance;
+        float area = max(selected.data0.w, 1e-6);
+        pdfSolidAngle = cosLight > 1e-6 ? selectedPdf * distSq / (cosLight * area) : 0.0;
+        return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+    }
+    if (selected.metadata.x != 0u) {
+        wi = vec3(0.0, 1.0, 0.0);
+        emission = vec3(0.0);
+        pdfSolidAngle = 0.0;
+        distanceToLight = 0.0;
+        return false;
+    }
+
+    uint ti = selected.metadata.y * TRI_STRIDE;
+    uint instanceIndex = selected.metadata.w;
+    if (instanceIndex >= mesh_params.instance_count || ti + 3u >= mesh_params.local_triangle_count * TRI_STRIDE) {
+        wi = vec3(0.0, 1.0, 0.0);
+        emission = vec3(0.0);
+        pdfSolidAngle = 0.0;
+        distanceToLight = 0.0;
+        return false;
+    }
+
+    InstanceRecord instance = instance_records[instanceIndex];
+    vec4 td3 = local_triangle_data[ti + 3u];
+    Material material = decode_material(selected.metadata.z);
+    vec3 v0 = (instance.transform * vec4(local_triangle_data[ti + 0u].xyz, 1.0)).xyz;
+    vec3 v1 = (instance.transform * vec4(local_triangle_data[ti + 1u].xyz, 1.0)).xyz;
+    vec3 v2 = (instance.transform * vec4(local_triangle_data[ti + 2u].xyz, 1.0)).xyz;
+    float r1 = rand_f32(rng);
+    float r2 = rand_f32(rng);
+    float sr1 = sqrt(r1);
+    vec3 bary = vec3(1.0 - sr1, sr1 * (1.0 - r2), sr1 * r2);
+    vec3 samplePos = v0 * bary.x + v1 * bary.y + v2 * bary.z;
+    vec3 lightNormal = normalize(mat3(instance.normal_transform) * td3.xyz);
+    vec4 uv01 = local_triangle_data[ti + 4u];
+    vec4 uv2 = local_triangle_data[ti + 5u];
+    vec2 sampleUv = uv01.xy * bary.x + uv01.zw * bary.y + uv2.xy * bary.z;
+    apply_material_textures(material, sampleUv, sampleUv);
+    vec3 recordRadiance = vec3(selected.data1.w, selected.data2.w, selected.data3.w);
+    sampleRadiance = has_positive_radiance(material.emissive)
+        ? material.emissive
+        : max(recordRadiance, vec3(0.0));
+    emission = sampleRadiance;
+
+    vec3 toLight = samplePos - hitPos;
+    float distSq = dot(toLight, toLight);
+    distanceToLight = sqrt(max(distSq, 1e-8));
+    wi = toLight / distanceToLight;
+    float cosLight = abs(dot(-wi, lightNormal));
+    samplePosition = samplePos;
+    lightNormalOut = lightNormal;
+    float area = max(selected.data0.w, 1e-6);
+    pdfSolidAngle = cosLight > 1e-6 ? selectedPdf * distSq / (cosLight * area) : 0.0;
+    return has_positive_radiance(emission) && pdfSolidAngle > 0.0;
+}
+
+void mark_regir_active_cell(uint cellIndex, uint totalCells) {
+    if (!regir_active_grid_enabled() || cellIndex >= totalCells) {
+        return;
+    }
+    const uint slot = 4u + cellIndex;
+    if (slot >= regir_active_cells.length()) {
+        return;
+    }
+    const uint previous = atomicExchange(regir_active_cells[slot], 1u);
+    if (previous == 0u) {
+        atomicAdd(regir_active_cells[0], 1u);
+    }
+}
+
+const uint REGIR_HASH_EMPTY = 0xffffffffu;
+
+uint regir_hash_value(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+uint regir_hash_lookup_cell(uint cellIndex) {
+    if (!regir_hash_grid_enabled() || regir_hash_current_cells.length() < 5u) {
+        return REGIR_HASH_EMPTY;
+    }
+    const uint capacity = regir_hash_current_cells[3];
+    if (capacity == 0u || 4u + capacity > regir_hash_current_cells.length()) {
+        return REGIR_HASH_EMPTY;
+    }
+    const uint probeCount = min(capacity, 8u);
+    const uint baseSlot = regir_hash_value(cellIndex) & (capacity - 1u);
+    for (uint probe = 0u; probe < probeCount; ++probe) {
+        const uint slot = (baseSlot + probe) & (capacity - 1u);
+        const uint key = regir_hash_current_cells[4u + slot];
+        if (key == cellIndex) {
+            return slot;
+        }
+        if (key == REGIR_HASH_EMPTY) {
+            break;
+        }
+    }
+    return REGIR_HASH_EMPTY;
+}
+
+void mark_regir_hash_cell(uint cellIndex) {
+    if (!regir_hash_grid_enabled() || regir_active_cells.length() < 5u) {
+        return;
+    }
+    const uint capacity = regir_active_cells[3];
+    if (capacity == 0u || 4u + capacity > regir_active_cells.length()) {
+        return;
+    }
+    const uint probeCount = min(capacity, 8u);
+    const uint baseSlot = regir_hash_value(cellIndex) & (capacity - 1u);
+    for (uint probe = 0u; probe < probeCount; ++probe) {
+        const uint slot = (baseSlot + probe) & (capacity - 1u);
+        const uint previous = atomicCompSwap(regir_active_cells[4u + slot], REGIR_HASH_EMPTY, cellIndex);
+        if (previous == REGIR_HASH_EMPTY) {
+            atomicAdd(regir_active_cells[0], 1u);
+            return;
+        }
+        if (previous == cellIndex) {
+            return;
+        }
+        atomicAdd(regir_active_cells[1], 1u);
+    }
+    atomicAdd(regir_active_cells[2], 1u);
+}
+
+#if RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED
+bool sample_regir_emissive_light(
+    inout uint rng,
+    vec3 hitPos,
+    Material material,
+    vec3 wo,
+    vec3 lightingNormal,
+    vec3 tangent,
+    vec3 bitangent,
+    float rayTime,
+    out vec3 wi,
+    out vec3 emission,
+    out float pdfSolidAngle,
+    out float distanceToLight,
+    out uint lightIndexOut,
+    out uint lightKindOut,
+    out vec3 samplePosition,
+    out vec3 sampleRadiance,
+    out vec3 lightNormalOut,
+    out uint queryCountOut,
+    out float reservoirWeightOut,
+    out float spatialInputWeightOut,
+    out float spatialOutputWeightOut,
+    out uint spatialNeighborCountOut,
+    out float activeCellOccupancyOut,
+    out float hashCollisionsOut,
+    out uvec3 queryCellOut,
+    out vec3 reusedVisibilityOut,
+    out bool reusedVisibilityKnownOut,
+    out uint visibilityRaysOut,
+    out uint visibilityTransmissiveHitsOut,
+    out uint visibilityVisiblePathsOut,
+    out uint visibilityBlockedPathsOut) {
+    queryCountOut = 0u;
+    reservoirWeightOut = 0.0;
+    spatialInputWeightOut = 0.0;
+    spatialOutputWeightOut = 0.0;
+    spatialNeighborCountOut = 0u;
+    activeCellOccupancyOut = 0.0;
+    hashCollisionsOut = 0.0;
+    queryCellOut = uvec3(0u);
+    reusedVisibilityOut = vec3(1.0);
+    reusedVisibilityKnownOut = false;
+    visibilityRaysOut = 0u;
+    visibilityTransmissiveHitsOut = 0u;
+    visibilityVisiblePathsOut = 0u;
+    visibilityBlockedPathsOut = 0u;
+    lightIndexOut = 0xffffffffu;
+    if (!regir_enabled() || mesh_params.light_count == 0u) {
+        return false;
+    }
+    vec3 rootMin = light_bvh_nodes[0].xyz;
+    vec3 rootMax = light_bvh_nodes[1].xyz;
+    vec3 extent = max(rootMax - rootMin, vec3(1.0e-3));
+    vec3 padding = extent * max(regir_params.grid_padding.x, 0.0);
+    rootMin -= padding;
+    rootMax += padding;
+    extent = max(rootMax - rootMin, vec3(1.0e-3));
+    vec3 uv = clamp((hitPos - rootMin) / extent, vec3(0.0), vec3(0.999999));
+    uvec3 dims = max(regir_params.grid_dimensions_reservoirs.xyz, uvec3(1u));
+    if (regir_stochastic_query_enabled()) {
+        vec3 jitter = vec3(rand_f32(rng), rand_f32(rng), rand_f32(rng)) - vec3(0.5);
+        uv = clamp(uv + jitter / vec3(dims), vec3(0.0), vec3(0.999999));
+    }
+    uvec3 baseCell = min(uvec3(uv * vec3(dims)), dims - uvec3(1u));
+    queryCellOut = baseCell;
+    uint reservoirsPerCell = max(regir_params.grid_dimensions_reservoirs.w, 1u);
+    uint cellQueryExtent = regir_stochastic_query_enabled() ? 1u : 2u;
+    uint reservoirQueryCount = regir_stochastic_query_enabled()
+        ? min(reservoirsPerCell, 8u)
+        : reservoirsPerCell;
+    uint reservoirQueryStart = regir_stochastic_query_enabled()
+        ? min(uint(rand_f32(rng) * float(reservoirsPerCell)), reservoirsPerCell - 1u)
+        : 0u;
+    uint reservoirQueryStride = reservoirsPerCell > 1u ? reservoirsPerCell - 1u : 1u;
+    uint totalCells = dims.x * dims.y * dims.z;
+    if (regir_hash_grid_enabled() && regir_active_cells.length() >= 4u) {
+        const uint hashCapacity = max(regir_active_cells[3], 1u);
+        hashCollisionsOut = clamp(
+            float(regir_active_cells[1] + regir_active_cells[2]) / float(hashCapacity),
+            0.0,
+            1.0);
+    }
+
+    float sourceWeightSum = 0.0;
+    float inputSourceWeightSum = 0.0;
+    uint spatialNeighborCount = 0u;
+    uint queriedReservoirSlots = 0u;
+    uint activeReservoirSlots = 0u;
+    for (uint dz = 0u; dz < cellQueryExtent; ++dz) {
+        uint cz = min(baseCell.z + dz, dims.z - 1u);
+        for (uint dy = 0u; dy < cellQueryExtent; ++dy) {
+            uint cy = min(baseCell.y + dy, dims.y - 1u);
+            for (uint dx = 0u; dx < cellQueryExtent; ++dx) {
+                uint cx = min(baseCell.x + dx, dims.x - 1u);
+                uint cellIndex = (cz * dims.y + cy) * dims.x + cx;
+                mark_regir_active_cell(cellIndex, totalCells);
+                mark_regir_hash_cell(cellIndex);
+                uint storageCellIndex = cellIndex;
+                if (regir_hash_grid_enabled()) {
+                    storageCellIndex = regir_hash_lookup_cell(cellIndex);
+                    if (storageCellIndex == REGIR_HASH_EMPTY) {
+                        continue;
+                    }
+                }
+                for (uint ri = 0u; ri < reservoirQueryCount; ++ri) {
+                    uint r = (reservoirQueryStart + ri * reservoirQueryStride) % reservoirsPerCell;
+                    uint reservoirIndex = storageCellIndex * reservoirsPerCell + r;
+                    ReGIRReservoir inputReservoir = regir_input_reservoirs[reservoirIndex];
+                    if (inputReservoir.metadata.w != 0u && inputReservoir.metadata.x < mesh_params.light_count) {
+                        inputSourceWeightSum += max(inputReservoir.sample_position_weight.w, 0.0);
+                    }
+                    ReGIRReservoir reservoir = regir_reservoirs[reservoirIndex];
+                    ++queryCountOut;
+                    ++queriedReservoirSlots;
+                    if (reservoir.metadata.w == 0u || reservoir.metadata.x >= mesh_params.light_count) {
+                        continue;
+                    }
+                    float reservoirSourceWeight = max(reservoir.sample_position_weight.w, 0.0);
+                    if (reservoirSourceWeight <= 0.0) {
+                        continue;
+                    }
+                    ++activeReservoirSlots;
+                    sourceWeightSum += reservoirSourceWeight;
+                    if (regir_spatial_reuse_enabled()) {
+                        spatialNeighborCount += reservoir.metadata.w > inputReservoir.metadata.w
+                            ? reservoir.metadata.w - inputReservoir.metadata.w
+                            : 0u;
+                    }
+                }
+            }
+        }
+    }
+    activeCellOccupancyOut = queriedReservoirSlots > 0u
+        ? float(activeReservoirSlots) / float(queriedReservoirSlots)
+        : 0.0;
+    spatialInputWeightOut = inputSourceWeightSum;
+    spatialOutputWeightOut = sourceWeightSum;
+    spatialNeighborCountOut = spatialNeighborCount;
+    if (sourceWeightSum <= 0.0) {
+        return false;
+    }
+
+    float risWeightSum = 0.0;
+    uint validCandidateCount = 0u;
+    uint selectedLight = 0xffffffffu;
+    uint selectedKind = 0u;
+    vec3 selectedWi = vec3(0.0, 1.0, 0.0);
+    vec3 selectedEmission = vec3(0.0);
+    float selectedPdf = 0.0;
+    float selectedDistance = 0.0;
+    vec3 selectedPosition = vec3(0.0);
+    vec3 selectedRadiance = vec3(0.0);
+    vec3 selectedNormal = vec3(0.0, 1.0, 0.0);
+    float selectedTarget = 0.0;
+    vec3 selectedVisibility = vec3(1.0);
+    bool selectedVisibilityKnown = false;
+    const uint visibilityCandidateBudget = 4u;
+    for (uint dz = 0u; dz < cellQueryExtent; ++dz) {
+        uint cz = min(baseCell.z + dz, dims.z - 1u);
+        for (uint dy = 0u; dy < cellQueryExtent; ++dy) {
+            uint cy = min(baseCell.y + dy, dims.y - 1u);
+            for (uint dx = 0u; dx < cellQueryExtent; ++dx) {
+                uint cx = min(baseCell.x + dx, dims.x - 1u);
+                uint cellIndex = (cz * dims.y + cy) * dims.x + cx;
+                uint storageCellIndex = cellIndex;
+                if (regir_hash_grid_enabled()) {
+                    storageCellIndex = regir_hash_lookup_cell(cellIndex);
+                    if (storageCellIndex == REGIR_HASH_EMPTY) {
+                        continue;
+                    }
+                }
+                for (uint ri = 0u; ri < reservoirQueryCount; ++ri) {
+                    uint r = (reservoirQueryStart + ri * reservoirQueryStride) % reservoirsPerCell;
+                    ReGIRReservoir reservoir = regir_reservoirs[storageCellIndex * reservoirsPerCell + r];
+                    ++queryCountOut;
+                    if (reservoir.metadata.w == 0u || reservoir.metadata.x >= mesh_params.light_count) {
+                        continue;
+                    }
+                    float sourceWeight = max(reservoir.sample_position_weight.w, 0.0);
+                    if (sourceWeight <= 0.0) {
+                        continue;
+                    }
+                    float sourcePdf = sourceWeight / sourceWeightSum;
+                    vec3 candidateWi;
+                    vec3 candidateEmission;
+                    float candidatePdf;
+                    float candidateDistance;
+                    uint candidateLightIndex;
+                    uint candidateLightKind;
+                    vec3 candidatePosition;
+                    vec3 candidateRadiance;
+                    vec3 candidateNormal;
+                    if (!sample_emissive_light_index(
+                            rng,
+                            reservoir.metadata.x,
+                            sourcePdf,
+                            hitPos,
+                            candidateWi,
+                            candidateEmission,
+                            candidatePdf,
+                            candidateDistance,
+                            candidateLightIndex,
+                            candidateLightKind,
+                            candidatePosition,
+                            candidateRadiance,
+                            candidateNormal)) {
+                        continue;
+                    }
+                    float candidateCos = max(dot(lightingNormal, candidateWi), 0.0);
+                    if (candidateCos <= 0.0 || candidatePdf <= 1.0e-6) {
+                        continue;
+                    }
+                    if (regir_visibility_reuse_enabled() && validCandidateCount >= visibilityCandidateBudget) {
+                        continue;
+                    }
+                    vec3 candidateBsdf = eval_brdf(material, wo, candidateWi, lightingNormal, tangent, bitangent);
+                    vec3 candidateVisibility = vec3(1.0);
+                    bool candidateVisibilityKnown = false;
+                    if (regir_visibility_reuse_enabled()) {
+                        uint transmissiveHits;
+                        uint visiblePath;
+                        uint blockedPath;
+                        record_rt_counter(RT_DIAG_EMISSIVE_DIRECT_SHADOW_RAYS);
+                        candidateVisibility = direct_shadow_transmittance_stats(
+                            hitPos + lightingNormal * shadow_self_hit_epsilon(),
+                            candidateWi,
+                            max(candidateDistance - shadow_distance_bias(), 0.0),
+                            rayTime,
+                            material,
+                            transmissiveHits,
+                            visiblePath,
+                            blockedPath);
+                        ++visibilityRaysOut;
+                        visibilityTransmissiveHitsOut += transmissiveHits;
+                        visibilityVisiblePathsOut += visiblePath;
+                        visibilityBlockedPathsOut += blockedPath;
+                        candidateVisibilityKnown = true;
+                    }
+                    vec3 candidateNumerator =
+                        candidateBsdf * candidateEmission * candidateVisibility * candidateCos;
+                    float candidateTarget = max(
+                        dot(candidateNumerator, vec3(0.2126, 0.7152, 0.0722)),
+                        0.0);
+                    float risWeight = candidateTarget / max(candidatePdf, 1.0e-6);
+                    ++validCandidateCount;
+                    risWeightSum += risWeight;
+                    if (risWeight > 0.0 && rand_f32(rng) * risWeightSum <= risWeight) {
+                        selectedLight = reservoir.metadata.x;
+                        selectedKind = reservoir.metadata.y;
+                        selectedWi = candidateWi;
+                        selectedEmission = candidateEmission;
+                        selectedPdf = candidatePdf;
+                        selectedDistance = candidateDistance;
+                        selectedPosition = candidatePosition;
+                        selectedRadiance = candidateRadiance;
+                        selectedNormal = candidateNormal;
+                        selectedTarget = candidateTarget;
+                        selectedVisibility = candidateVisibility;
+                        selectedVisibilityKnown = candidateVisibilityKnown;
+                    }
+                }
+            }
+        }
+    }
+    reservoirWeightOut = risWeightSum;
+    if (selectedLight == 0xffffffffu || selectedTarget <= 0.0 || validCandidateCount == 0u) {
+        return false;
+    }
+    wi = selectedWi;
+    emission = selectedEmission;
+    pdfSolidAngle = selectedTarget * float(validCandidateCount) / max(risWeightSum, 1.0e-8);
+    distanceToLight = selectedDistance;
+    lightIndexOut = selectedLight;
+    lightKindOut = selectedKind;
+    samplePosition = selectedPosition;
+    sampleRadiance = selectedRadiance;
+    lightNormalOut = selectedNormal;
+    reusedVisibilityOut = selectedVisibility;
+    reusedVisibilityKnownOut = selectedVisibilityKnown;
+    return pdfSolidAngle > 0.0 && has_positive_radiance(emission);
+}
+#else
+bool sample_regir_emissive_light(
+    inout uint rng,
+    vec3 hitPos,
+    Material material,
+    vec3 wo,
+    vec3 lightingNormal,
+    vec3 tangent,
+    vec3 bitangent,
+    float rayTime,
+    out vec3 wi,
+    out vec3 emission,
+    out float pdfSolidAngle,
+    out float distanceToLight,
+    out uint lightIndexOut,
+    out uint lightKindOut,
+    out vec3 samplePosition,
+    out vec3 sampleRadiance,
+    out vec3 lightNormalOut,
+    out uint queryCountOut,
+    out float reservoirWeightOut,
+    out float spatialInputWeightOut,
+    out float spatialOutputWeightOut,
+    out uint spatialNeighborCountOut,
+    out float activeCellOccupancyOut,
+    out float hashCollisionsOut,
+    out uvec3 queryCellOut,
+    out vec3 reusedVisibilityOut,
+    out bool reusedVisibilityKnownOut,
+    out uint visibilityRaysOut,
+    out uint visibilityTransmissiveHitsOut,
+    out uint visibilityVisiblePathsOut,
+    out uint visibilityBlockedPathsOut) {
+    wi = vec3(0.0, 1.0, 0.0);
+    emission = vec3(0.0);
+    pdfSolidAngle = 0.0;
+    distanceToLight = 0.0;
+    lightIndexOut = 0xffffffffu;
+    lightKindOut = 0u;
+    samplePosition = vec3(0.0);
+    sampleRadiance = vec3(0.0);
+    lightNormalOut = vec3(0.0, 1.0, 0.0);
+    queryCountOut = 0u;
+    reservoirWeightOut = 0.0;
+    spatialInputWeightOut = 0.0;
+    spatialOutputWeightOut = 0.0;
+    spatialNeighborCountOut = 0u;
+    activeCellOccupancyOut = 0.0;
+    hashCollisionsOut = 0.0;
+    queryCellOut = uvec3(0u);
+    reusedVisibilityOut = vec3(1.0);
+    reusedVisibilityKnownOut = false;
+    visibilityRaysOut = 0u;
+    visibilityTransmissiveHitsOut = 0u;
+    visibilityVisiblePathsOut = 0u;
+    visibilityBlockedPathsOut = 0u;
+    return false;
+}
+#endif
+
+bool sample_regir_infinite_direction(
+    inout uint rng,
+    bool sampleSun,
+    out vec3 direction,
+    out float sourcePdf,
+    out vec3 radiance,
+    out uint sourceKind,
+    out uint sampleCount,
+    out uint generationMismatch) {
+    direction = vec3(0.0, 1.0, 0.0);
+    sourcePdf = 0.0;
+    radiance = vec3(0.0);
+    sourceKind = 0u;
+    sampleCount = 0u;
+    generationMismatch = 0u;
+    if ((sampleSun && !regir_sun_enabled()) || (!sampleSun && !regir_environment_enabled())) {
+        return false;
+    }
+
+    uint bankOffset = sampleSun ? regir_params.environment_controls.z : 0u;
+    uint configuredCount = sampleSun
+        ? regir_params.environment_controls.w
+        : regir_params.environment_controls.z;
+    if (bankOffset >= regir_environment_reservoirs.length()) {
+        return false;
+    }
+    uint bankSize = min(configuredCount, regir_environment_reservoirs.length() - bankOffset);
+    if (bankSize == 0u) {
+        return false;
+    }
+    for (uint attempt = 0u; attempt < 4u; ++attempt) {
+        uint slot = bankOffset + min(uint(rand_f32(rng) * float(bankSize)), bankSize - 1u);
+        ReGIREnvironmentReservoir reservoir = regir_environment_reservoirs[slot];
+        if (reservoir.metadata.x == 0u || reservoir.direction_pdf.w <= 0.0) {
+            continue;
+        }
+        uint expectedGeneration = sampleSun
+            ? camera.gi_version_controls.x
+            : camera.gi_version_controls.w;
+        if (reservoir.metadata.z != expectedGeneration ||
+            (sampleSun && reservoir.metadata.y != 4u) ||
+            (!sampleSun && reservoir.metadata.y == 4u)) {
+            generationMismatch = 1u;
+            continue;
+        }
+        direction = normalize(reservoir.direction_pdf.xyz);
+        float storedSourcePdf = reservoir.direction_pdf.w;
+        float selectedTarget = max(reservoir.reservoir_state.x, 0.0);
+        float weightSum = max(reservoir.reservoir_state.y, 0.0);
+        float reservoirM = max(reservoir.reservoir_state.w, 1.0);
+        float reconstructedPdf = weightSum > 0.0
+            ? selectedTarget * reservoirM / weightSum
+            : storedSourcePdf;
+        sourcePdf = reconstructedPdf > 0.0 ? reconstructedPdf : storedSourcePdf;
+        radiance = sampleSun
+            ? analytical_sun_center_radiance()
+            : environment_radiance(direction, ATMOSPHERE_RAY_QUALITY_FULL);
+        sourceKind = reservoir.metadata.y;
+        sampleCount = max(uint(reservoirM + 0.5), 1u);
+        return has_positive_radiance(radiance);
+    }
+    return false;
+}
+
+bool sample_regir_environment_direction(
+    inout uint rng,
+    out vec3 direction,
+    out float sourcePdf,
+    out vec3 radiance,
+    out uint sourceKind,
+    out uint sampleCount,
+    out uint generationMismatch) {
+    return sample_regir_infinite_direction(
+        rng, false, direction, sourcePdf, radiance, sourceKind, sampleCount, generationMismatch);
+}
+
+bool sample_regir_sun_direction(
+    inout uint rng,
+    out vec3 direction,
+    out float sourcePdf,
+    out vec3 radiance,
+    out uint sourceKind,
+    out uint sampleCount,
+    out uint generationMismatch) {
+    return sample_regir_infinite_direction(
+        rng, true, direction, sourcePdf, radiance, sourceKind, sampleCount, generationMismatch);
+}
+
+bool regir_environment_direct_available(uint bounce) {
+    return bounce >= 2u && regir_environment_enabled();
+}
+
+void regir_environment_sampling_probabilities(uint bounce, out float canonicalProbability, out float regirProbability) {
+    canonicalProbability = 1.0;
+    regirProbability = 0.0;
+    if (regir_environment_direct_available(bounce)) {
+        canonicalProbability = regir_canonical_mix();
+        regirProbability = 1.0 - canonicalProbability;
+    }
+}
+
+float environment_light_sampling_pdf(vec3 dir, uint bounce) {
+    float sourcePdf = environment_pdf(dir);
+    if (sourcePdf <= 0.0) {
+        return 0.0;
+    }
+    float canonicalProbability;
+    float regirProbability;
+    regir_environment_sampling_probabilities(bounce, canonicalProbability, regirProbability);
+    return sourcePdf * max(canonicalProbability + regirProbability, 0.0);
+}
+
+bool regir_sun_direct_available(uint bounce) {
+    return bounce >= 2u && regir_sun_enabled();
+}
+
+void regir_sun_sampling_probabilities(uint bounce, out float canonicalProbability, out float regirProbability) {
+    canonicalProbability = 1.0;
+    regirProbability = 0.0;
+    if (regir_sun_direct_available(bounce)) {
+        canonicalProbability = regir_canonical_mix();
+        regirProbability = 1.0 - canonicalProbability;
+    }
+}
+
+float sun_light_sampling_pdf(vec3 dir, uint bounce) {
+    float sourcePdf = analytical_sun_pdf(dir);
+    if (sourcePdf <= 0.0) {
+        return 0.0;
+    }
+    float canonicalProbability;
+    float regirProbability;
+    regir_sun_sampling_probabilities(bounce, canonicalProbability, regirProbability);
+    return sourcePdf * max(canonicalProbability + regirProbability, 0.0);
+}
+
 float emissive_hit_pdf(RayPayload hit, Material material, vec3 previousOrigin) {
     float totalArea = mesh_params.emissive_total_area;
     if (totalArea <= 1e-8 || !has_positive_radiance(material.emissive)) {
@@ -212,7 +942,7 @@ float emissive_hit_pdf(RayPayload hit, Material material, vec3 previousOrigin) {
     float distSq = dot(toLight, toLight);
     float dist = sqrt(max(distSq, 1e-8));
     vec3 wi = toLight / dist;
-    float cosLight = max(dot(-wi, hit.geom_normal), 0.0);
+    float cosLight = abs(dot(-wi, hit.geom_normal));
     return cosLight > 1e-6 ? distSq / (cosLight * totalArea) : 0.0;
 }
 
@@ -224,7 +954,7 @@ float terminal_emissive_hit_pdf(TerminalRayPayload hit, Material material, vec3 
     vec3 toLight = hitWorldPos - previousOrigin;
     float distSq = dot(toLight, toLight);
     vec3 wi = toLight / sqrt(max(distSq, 1e-8));
-    float cosLight = max(dot(-wi, hit.geom_normal), 0.0);
+    float cosLight = abs(dot(-wi, hit.geom_normal));
     return cosLight > 1e-6 ? distSq / (cosLight * totalArea) : 0.0;
 }
 
@@ -234,6 +964,7 @@ vec3 estimate_direct_lighting(
     Material material,
     vec3 wo,
     float rayTime,
+    uint bounce,
     out vec3 emissiveContribution,
     out vec3 environmentContribution,
     out float sampledLightPdf,
@@ -249,6 +980,26 @@ vec3 estimate_direct_lighting(
     out vec3 sampledLightDirection,
     out vec3 sampledLightRadiance,
     out vec3 sampledLightNormal,
+    out vec3 sampledRestirContribution,
+    out uint regirQueryCount,
+    out uint regirSelectedLight,
+    out float regirReservoirWeight,
+    out float regirMisWeight,
+    out float regirEffectivePdf,
+    out uint regirCanonicalUsed,
+    out uvec3 regirQueryCell,
+    out float regirActiveCellOccupancy,
+    out float regirHashCollisions,
+    out float regirSpatialInputWeight,
+    out float regirSpatialOutputWeight,
+    out uint regirSpatialNeighborCount,
+    out uint regirEnvironmentSourceKind,
+    out float regirEnvironmentSourcePdf,
+    out float regirEnvironmentEffectivePdf,
+    out vec3 regirEnvironmentDirection,
+    out float regirEnvironmentMisWeight,
+    out float regirEnvironmentM,
+    out uint regirEnvironmentGenerationMismatch,
     out uint causticTransmissiveHits,
     out uint causticVisiblePaths,
     out uint causticBlockedPaths) {
@@ -267,6 +1018,26 @@ vec3 estimate_direct_lighting(
     sampledLightDirection = vec3(0.0, 1.0, 0.0);
     sampledLightRadiance = vec3(0.0);
     sampledLightNormal = vec3(0.0, 1.0, 0.0);
+    sampledRestirContribution = vec3(0.0);
+    regirQueryCount = 0u;
+    regirSelectedLight = 0xffffffffu;
+    regirReservoirWeight = 0.0;
+    regirMisWeight = 0.0;
+    regirEffectivePdf = 0.0;
+    regirCanonicalUsed = 0u;
+    regirQueryCell = uvec3(0u);
+    regirActiveCellOccupancy = 0.0;
+    regirHashCollisions = 0.0;
+    regirSpatialInputWeight = 0.0;
+    regirSpatialOutputWeight = 0.0;
+    regirSpatialNeighborCount = 0u;
+    regirEnvironmentSourceKind = 0u;
+    regirEnvironmentSourcePdf = 0.0;
+    regirEnvironmentEffectivePdf = 0.0;
+    regirEnvironmentDirection = vec3(0.0, 1.0, 0.0);
+    regirEnvironmentMisWeight = 0.0;
+    regirEnvironmentM = 0.0;
+    regirEnvironmentGenerationMismatch = 0u;
     causticTransmissiveHits = 0u;
     causticVisiblePaths = 0u;
     causticBlockedPaths = 0u;
@@ -274,9 +1045,28 @@ vec3 estimate_direct_lighting(
     if (camera.direct_lighting_enabled == 0u || isDelta || debug_params.view == 27u) {
         return vec3(0.0);
     }
+    float secondaryDirectProbability = 1.0;
+#if RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT
+    if (bounce >= 1u &&
+        !regir_finite_light_enabled() &&
+        !regir_infinite_light_enabled()) {
+        secondaryDirectProbability = bounce >= 2u
+            ? clamp(float(RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB), 0.0, 1.0)
+            : clamp(float(RTV_GENERIC_SECONDARY_DIRECT_PROB), 0.0, 1.0);
+    }
+#endif
+    if (secondaryDirectProbability <= 0.0) {
+        return vec3(0.0);
+    }
+    if (secondaryDirectProbability < 0.999 &&
+        rand_f32(rng) >= secondaryDirectProbability) {
+        return vec3(0.0);
+    }
+    float secondaryDirectWeight = 1.0 / secondaryDirectProbability;
 
     vec3 lightingNormal = normalize(hit.geom_normal);
-    uint risCandidateCount = direct_light_ris_candidate_count();
+    bool regirCandidateAvailable = bounce >= 2u && regir_finite_light_enabled();
+    uint risCandidateCount = regirCandidateAvailable ? 1u : direct_light_ris_candidate_count();
     vec3 selectedWi = vec3(0.0, 1.0, 0.0);
     vec3 selectedEmission = vec3(0.0);
     vec3 selectedBsdf = vec3(0.0);
@@ -288,10 +1078,19 @@ vec3 estimate_direct_lighting(
     vec3 selectedLightPosition = vec3(0.0);
     vec3 selectedLightRadiance = vec3(0.0);
     vec3 selectedLightNormal = vec3(0.0, 1.0, 0.0);
+    vec3 selectedReusedVisibility = vec3(1.0);
+    bool selectedReusedVisibilityKnown = false;
     float selectedProxy = 0.0;
+    float sampledRestirProxy = 0.0;
     float proxyWeightSum = 0.0;
     bool selectedCandidate = false;
+    bool selectedUsedCanonical = false;
     if (mesh_params.light_count != 0u && mesh_params.emissive_total_area > 1.0e-8) {
+        float requestedCanonicalProbability = regirCandidateAvailable ? regir_canonical_mix() : 1.0;
+        float regirProbability = regirCandidateAvailable
+            ? (1.0 - requestedCanonicalProbability) * regir_finite_query_probability()
+            : 0.0;
+        float canonicalProbability = 1.0 - regirProbability;
         for (uint candidate = 0u; candidate < risCandidateCount; ++candidate) {
             vec3 candidateWi;
             vec3 candidateEmission;
@@ -302,7 +1101,67 @@ vec3 estimate_direct_lighting(
             vec3 candidateLightPosition;
             vec3 candidateLightRadiance;
             vec3 candidateLightNormal;
-            if (!sample_emissive_light(
+            uint candidateRegirQueries = 0u;
+            float candidateRegirWeight = 0.0;
+            float candidateRegirSpatialInputWeight = 0.0;
+            float candidateRegirSpatialOutputWeight = 0.0;
+            uint candidateRegirSpatialNeighborCount = 0u;
+            uvec3 candidateRegirCell = uvec3(0u);
+            float candidateRegirActiveCellOccupancy = 0.0;
+            float candidateRegirHashCollisions = 0.0;
+            vec3 candidateReusedVisibility = vec3(1.0);
+            bool candidateReusedVisibilityKnown = false;
+            uint candidateVisibilityRays = 0u;
+            uint candidateVisibilityTransmissiveHits = 0u;
+            uint candidateVisibilityVisiblePaths = 0u;
+            uint candidateVisibilityBlockedPaths = 0u;
+            bool candidateUsedCanonical = true;
+            bool sampledCandidate = false;
+            if (regirCandidateAvailable &&
+                regirProbability > 0.0 &&
+                rand_f32(rng) >= canonicalProbability) {
+                sampledCandidate = sample_regir_emissive_light(
+                    rng,
+                    hit.world_pos,
+                    material,
+                    wo,
+                    lightingNormal,
+                    hit.tangent,
+                    hit.bitangent,
+                    rayTime,
+                    candidateWi,
+                    candidateEmission,
+                    candidateLightPdf,
+                    candidateDistance,
+                    candidateLightIndex,
+                    candidateLightKind,
+                    candidateLightPosition,
+                    candidateLightRadiance,
+                    candidateLightNormal,
+                    candidateRegirQueries,
+                    candidateRegirWeight,
+                    candidateRegirSpatialInputWeight,
+                    candidateRegirSpatialOutputWeight,
+                    candidateRegirSpatialNeighborCount,
+                    candidateRegirActiveCellOccupancy,
+                    candidateRegirHashCollisions,
+                    candidateRegirCell,
+                    candidateReusedVisibility,
+                    candidateReusedVisibilityKnown,
+                    candidateVisibilityRays,
+                    candidateVisibilityTransmissiveHits,
+                    candidateVisibilityVisiblePaths,
+                    candidateVisibilityBlockedPaths);
+                causticTransmissiveHits += candidateVisibilityTransmissiveHits;
+                causticVisiblePaths += candidateVisibilityVisiblePaths;
+                causticBlockedPaths += candidateVisibilityBlockedPaths;
+                if (sampledCandidate) {
+                    candidateLightPdf *= regirProbability;
+                    candidateUsedCanonical = false;
+                }
+            }
+            if (!sampledCandidate && canonicalProbability > 0.0) {
+                sampledCandidate = sample_emissive_light(
                     rng,
                     hit.world_pos,
                     candidateWi,
@@ -313,7 +1172,22 @@ vec3 estimate_direct_lighting(
                     candidateLightKind,
                     candidateLightPosition,
                     candidateLightRadiance,
-                    candidateLightNormal)) {
+                    candidateLightNormal);
+                if (sampledCandidate) {
+                    candidateLightPdf *= canonicalProbability;
+                    candidateUsedCanonical = true;
+                }
+            }
+            regirQueryCount += candidateRegirQueries;
+            if (candidateRegirQueries > 0u) {
+                regirQueryCell = candidateRegirCell;
+                regirSpatialInputWeight = candidateRegirSpatialInputWeight;
+                regirSpatialOutputWeight = candidateRegirSpatialOutputWeight;
+                regirSpatialNeighborCount = candidateRegirSpatialNeighborCount;
+                regirActiveCellOccupancy = candidateRegirActiveCellOccupancy;
+                regirHashCollisions = candidateRegirHashCollisions;
+            }
+            if (!sampledCandidate) {
                 continue;
             }
             float candidateCos = max(dot(lightingNormal, candidateWi), 0.0);
@@ -322,7 +1196,8 @@ vec3 estimate_direct_lighting(
             }
             vec3 candidateBsdf = eval_brdf(material, wo, candidateWi, lightingNormal, hit.tangent, hit.bitangent);
             float candidateBsdfPdf = pdf_brdf(material, wo, candidateWi, lightingNormal, hit.tangent, hit.bitangent);
-            vec3 candidateEstimate = candidateBsdf * candidateEmission * candidateCos / max(candidateLightPdf, 1.0e-6);
+            vec3 candidateEstimate = candidateBsdf * candidateEmission *
+                candidateReusedVisibility * candidateCos / max(candidateLightPdf, 1.0e-6);
             float candidateProxy = max(dot(candidateEstimate, vec3(0.2126, 0.7152, 0.0722)), 0.0);
             proxyWeightSum += candidateProxy;
             if (candidateProxy > 0.0 && rand_f32(rng) * proxyWeightSum <= candidateProxy) {
@@ -337,29 +1212,44 @@ vec3 estimate_direct_lighting(
                 selectedLightPosition = candidateLightPosition;
                 selectedLightRadiance = candidateLightRadiance;
                 selectedLightNormal = candidateLightNormal;
+                selectedReusedVisibility = candidateReusedVisibility;
+                selectedReusedVisibilityKnown = candidateReusedVisibilityKnown;
                 selectedProxy = candidateProxy;
                 selectedCandidate = true;
+                selectedUsedCanonical = candidateUsedCanonical;
+                if (!candidateUsedCanonical) {
+                    regirSelectedLight = candidateLightIndex;
+                    regirReservoirWeight = candidateRegirWeight;
+                    regirSpatialInputWeight = candidateRegirSpatialInputWeight;
+                    regirSpatialOutputWeight = candidateRegirSpatialOutputWeight;
+                    regirSpatialNeighborCount = candidateRegirSpatialNeighborCount;
+                    regirActiveCellOccupancy = candidateRegirActiveCellOccupancy;
+                    regirHashCollisions = candidateRegirHashCollisions;
+                }
             }
         }
     }
     if (selectedCandidate && selectedProxy > 0.0) {
         float shadowDistance = max(selectedDistance - shadow_distance_bias(), 0.0);
-        uint transmissiveHits;
-        uint visiblePath;
-        uint blockedPath;
-        record_rt_counter(RT_DIAG_EMISSIVE_DIRECT_SHADOW_RAYS);
-        vec3 shadowT = direct_shadow_transmittance_stats(
-            shadow_origin(hit, selectedWi),
-            selectedWi,
-            shadowDistance,
-            rayTime,
-            material,
-            transmissiveHits,
-            visiblePath,
-            blockedPath);
-        causticTransmissiveHits += transmissiveHits;
-        causticVisiblePaths += visiblePath;
-        causticBlockedPaths += blockedPath;
+        vec3 shadowT = selectedReusedVisibility;
+        if (!selectedReusedVisibilityKnown) {
+            uint transmissiveHits;
+            uint visiblePath;
+            uint blockedPath;
+            record_rt_counter(RT_DIAG_EMISSIVE_DIRECT_SHADOW_RAYS);
+            shadowT = direct_shadow_transmittance_stats(
+                shadow_origin(hit, selectedWi),
+                selectedWi,
+                shadowDistance,
+                rayTime,
+                material,
+                transmissiveHits,
+                visiblePath,
+                blockedPath);
+            causticTransmissiveHits += transmissiveHits;
+            causticVisiblePaths += visiblePath;
+            causticBlockedPaths += blockedPath;
+        }
         float cosSurface = max(dot(lightingNormal, selectedWi), 0.0);
         if (luminance(shadowT) > 0.0 && cosSurface > 0.0) {
             float effectiveLightPdf = selectedLightPdf;
@@ -378,17 +1268,71 @@ vec3 estimate_direct_lighting(
             sampledLightPosition = selectedLightPosition;
             sampledLightDistance = selectedDistance;
             sampledLightDirection = selectedWi;
-            sampledLightRadiance = selectedLightRadiance;
+            sampledLightRadiance = selectedLightRadiance * shadowT;
             sampledLightNormal = selectedLightNormal;
+            if (regirCandidateAvailable) {
+                regirMisWeight = weight;
+                regirEffectivePdf = effectiveLightPdf;
+                regirCanonicalUsed = selectedUsedCanonical ? 1u : 0u;
+                if (selectedUsedCanonical) {
+                    regirSelectedLight = selectedLightIndex;
+                }
+            }
             emissiveContribution = selectedBsdf * selectedEmission * shadowT * cosSurface * weight / max(effectiveLightPdf, 1e-6);
+            sampledRestirContribution = emissiveContribution;
+            sampledRestirProxy = luminance(sampledRestirContribution);
         }
     }
 
-    uint envSampleCount = clamp(camera.environment_direct_samples, 1u, 8u);
-    for (uint envSample = 0u; envSample < envSampleCount; ++envSample) {
+    const bool secondaryOneInfiniteLight =
+#if RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT
+        bounce >= 1u &&
+        !regir_finite_light_enabled() &&
+        !regir_infinite_light_enabled() &&
+        env_params.enabled != 0u &&
+        camera.sunlight_enabled != 0u;
+#else
+        false;
+#endif
+    float infiniteLightSelector = secondaryOneInfiniteLight ? rand_f32(rng) : 0.0;
+    bool sampleEnvironmentDirect = !secondaryOneInfiniteLight || infiniteLightSelector < 0.5;
+    bool sampleSunDirect = !secondaryOneInfiniteLight || !sampleEnvironmentDirect;
+    float environmentTechniqueProbability = sampleEnvironmentDirect
+        ? (secondaryOneInfiniteLight ? 0.5 : 1.0)
+        : 0.0;
+    float sunTechniqueProbability = sampleSunDirect
+        ? (secondaryOneInfiniteLight ? 0.5 : 1.0)
+        : 0.0;
+    uint envDirectSampleCount = sampleEnvironmentDirect
+        ? (secondaryOneInfiniteLight ? 1u : clamp(camera.environment_direct_samples, 1u, 8u))
+        : 0u;
+    float envCanonicalProbability;
+    float envRegirProbability;
+    regir_environment_sampling_probabilities(bounce, envCanonicalProbability, envRegirProbability);
+    for (uint envSample = 0u; envSample < envDirectSampleCount; ++envSample) {
         vec3 envDir;
         float envPdf;
-        vec3 envRadiance = sample_environment_direction(rng, envDir, envPdf);
+        vec3 envRadiance;
+        uint envSourceKind;
+        uint envReservoirSampleCount;
+        uint envGenerationMismatch = 0u;
+        bool sampledEnvironmentBank = false;
+        if (envRegirProbability > 0.0 && rand_f32(rng) >= envCanonicalProbability) {
+            sampledEnvironmentBank = sample_regir_environment_direction(
+                rng,
+                envDir,
+                envPdf,
+                envRadiance,
+                envSourceKind,
+                envReservoirSampleCount,
+                envGenerationMismatch);
+        }
+        regirEnvironmentGenerationMismatch = max(regirEnvironmentGenerationMismatch, envGenerationMismatch);
+        if (!sampledEnvironmentBank) {
+            envRadiance = sample_environment_direction(rng, envDir, envPdf);
+            envSourceKind = 0u;
+            envReservoirSampleCount = 0u;
+        }
         if (envPdf <= 0.0) {
             continue;
         }
@@ -415,28 +1359,80 @@ vec3 estimate_direct_lighting(
         if (luminance(shadowT) > 0.0) {
             vec3 bsdf = eval_brdf(material, wo, envDir, lightingNormal, hit.tangent, hit.bitangent);
             float bsdfPdf = pdf_brdf(material, wo, envDir, lightingNormal, hit.tangent, hit.bitangent);
-            float weight = power_heuristic(envPdf, bsdfPdf);
-            if (sampledLightPdf <= 0.0) {
-                sampledLightPdf = envPdf;
-                sampledRawLightPdf = envPdf;
-                sampledEffectiveLightPdf = envPdf;
-                sampledBsdfPdf = bsdfPdf;
-                sampledMisWeight = weight;
-                sampledType = 2u;
-                sampledLightDirection = envDir;
-                sampledLightDistance = 10000.0;
+            float envEffectivePdf = environment_light_sampling_pdf(envDir, bounce);
+            if (envEffectivePdf <= 0.0) {
+                envEffectivePdf = envPdf;
             }
-            environmentContribution += bsdf * envRadiance * shadowT * cosSurface * weight / max(envPdf, 1e-6);
+            envEffectivePdf *= max(environmentTechniqueProbability, 1.0e-6);
+            float weight = power_heuristic(envEffectivePdf, bsdfPdf);
+            if (sampledEnvironmentBank) {
+                regirEnvironmentSourceKind = envSourceKind;
+                regirEnvironmentSourcePdf = envPdf;
+                regirEnvironmentEffectivePdf = envEffectivePdf;
+                regirEnvironmentDirection = envDir;
+                regirEnvironmentMisWeight = weight;
+                regirEnvironmentM = float(max(envReservoirSampleCount, 1u));
+            }
+            vec3 envSampleContribution = bsdf * envRadiance * shadowT * cosSurface * weight / max(envEffectivePdf, 1e-6);
+            if (camera.restir_di_controls.x != 0u && camera.restir_di_controls.w != 0u) {
+                vec3 envRestirContribution = envSampleContribution / float(envDirectSampleCount);
+                float envRestirProxy = luminance(envRestirContribution);
+                float envCandidateProxySum = sampledRestirProxy + envRestirProxy;
+                if (envRestirProxy > 0.0 &&
+                    rand_f32(rng) * max(envCandidateProxySum, 1.0e-8) <= envRestirProxy) {
+                    sampledLightPdf = envEffectivePdf * float(envDirectSampleCount);
+                    sampledRawLightPdf = envPdf;
+                    sampledEffectiveLightPdf = sampledLightPdf;
+                    sampledBsdfPdf = bsdfPdf;
+                    sampledMisWeight = weight;
+                    sampledType = 2u;
+                    sampledLightIndex = RESTIR_DI_PSEUDO_LIGHT_INDEX;
+                    sampledLightKind = RESTIR_DI_LIGHT_ENVIRONMENT;
+                    sampledLightPosition = normalize(envDir);
+                    sampledLightDirection = envDir;
+                    sampledLightDistance = 10000.0;
+                    sampledLightRadiance = envRadiance * shadowT;
+                    sampledLightNormal = -normalize(envDir);
+                    sampledRestirContribution = envRestirContribution;
+                }
+                sampledRestirProxy = envCandidateProxySum;
+            }
+            environmentContribution += envSampleContribution;
         }
     }
-    environmentContribution /= float(envSampleCount);
+    if (envDirectSampleCount > 0u) {
+        environmentContribution /= float(envDirectSampleCount);
+    }
 
     vec3 sunContribution = vec3(0.0);
-    {
+    if (sampleSunDirect) {
         vec3 sunWi;
         vec3 sunRadiance;
         float sunPdf;
-        if (sample_sun_light(rng, sunWi, sunRadiance, sunPdf)) {
+        uint sunSourceKind = 0u;
+        uint sunReservoirSampleCount = 0u;
+        uint sunGenerationMismatch = 0u;
+        bool sampledSunBank = false;
+        float sunCanonicalProbability;
+        float sunRegirProbability;
+        regir_sun_sampling_probabilities(bounce, sunCanonicalProbability, sunRegirProbability);
+        if (sunRegirProbability > 0.0 && rand_f32(rng) >= sunCanonicalProbability) {
+            sampledSunBank = sample_regir_sun_direction(
+                rng,
+                sunWi,
+                sunPdf,
+                sunRadiance,
+                sunSourceKind,
+                sunReservoirSampleCount,
+                sunGenerationMismatch);
+        }
+        regirEnvironmentGenerationMismatch = max(regirEnvironmentGenerationMismatch, sunGenerationMismatch);
+        if (!sampledSunBank) {
+            sunSourceKind = 0u;
+            sunReservoirSampleCount = 0u;
+        }
+        bool sampledSun = sampledSunBank || sample_sun_light(rng, sunWi, sunRadiance, sunPdf);
+        if (sampledSun) {
             float ndl = max(dot(lightingNormal, sunWi), 0.0);
             if (ndl <= 0.0) {
                 return emissiveContribution + environmentContribution;
@@ -460,22 +1456,54 @@ vec3 estimate_direct_lighting(
             if (luminance(shadowT) > 0.0) {
                 vec3 bsdf = eval_brdf(material, wo, sunWi, lightingNormal, hit.tangent, hit.bitangent);
                 float bsdfPdf = pdf_brdf(material, wo, sunWi, lightingNormal, hit.tangent, hit.bitangent);
-                float weight = power_heuristic(sunPdf, bsdfPdf);
-                if (sampledLightPdf <= 0.0) {
-                    sampledLightPdf = sunPdf;
-                    sampledRawLightPdf = sunPdf;
-                    sampledEffectiveLightPdf = sunPdf;
-                    sampledBsdfPdf = bsdfPdf;
-                    sampledMisWeight = weight;
-                    sampledType = 3u;
-                    sampledLightDirection = sunWi;
-                    sampledLightDistance = 10000.0;
+                float sunEffectivePdf = sun_light_sampling_pdf(sunWi, bounce);
+                if (sunEffectivePdf <= 0.0) {
+                    sunEffectivePdf = sunPdf;
                 }
-                sunContribution = bsdf * sunRadiance * sun_transmittance(hit.world_pos, sunWi) * shadowT * ndl * weight / max(sunPdf, 1e-6);
+                sunEffectivePdf *= max(sunTechniqueProbability, 1.0e-6);
+                float weight = power_heuristic(sunEffectivePdf, bsdfPdf);
+                vec3 sunIncidentRadiance = sunRadiance * sun_transmittance(hit.world_pos, sunWi);
+                vec3 sunCandidateContribution = bsdf * sunIncidentRadiance * shadowT * ndl * weight / max(sunEffectivePdf, 1e-6);
+                if (sampledSunBank) {
+                    regirEnvironmentSourceKind = sunSourceKind;
+                    regirEnvironmentSourcePdf = sunPdf;
+                    regirEnvironmentEffectivePdf = sunEffectivePdf;
+                    regirEnvironmentDirection = sunWi;
+                    regirEnvironmentMisWeight = weight;
+                    regirEnvironmentM = float(max(sunReservoirSampleCount, 1u));
+                }
+                if (camera.restir_di_controls.x != 0u && camera.restir_di_controls.z != 0u) {
+                    float sunRestirProxy = luminance(sunCandidateContribution);
+                    float sunCandidateProxySum = sampledRestirProxy + sunRestirProxy;
+                    if (sunRestirProxy > 0.0 &&
+                        rand_f32(rng) * max(sunCandidateProxySum, 1.0e-8) <= sunRestirProxy) {
+                        sampledLightPdf = sunEffectivePdf;
+                        sampledRawLightPdf = sunPdf;
+                        sampledEffectiveLightPdf = sunEffectivePdf;
+                        sampledBsdfPdf = bsdfPdf;
+                        sampledMisWeight = weight;
+                        sampledType = 3u;
+                        sampledLightIndex = RESTIR_DI_PSEUDO_LIGHT_INDEX;
+                        sampledLightKind = RESTIR_DI_LIGHT_SUN;
+                        sampledLightPosition = normalize(sunWi);
+                        sampledLightDirection = sunWi;
+                        sampledLightDistance = 10000.0;
+                        sampledLightRadiance = sunIncidentRadiance * shadowT;
+                        sampledLightNormal = -normalize(sunWi);
+                        sampledRestirContribution = sunCandidateContribution;
+                    }
+                    sampledRestirProxy = sunCandidateProxySum;
+                }
+                sunContribution = sunCandidateContribution;
             }
         }
     }
 
+    emissiveContribution *= secondaryDirectWeight;
+    environmentContribution *= secondaryDirectWeight;
+    sunContribution *= secondaryDirectWeight;
+    sampledRestirContribution *= secondaryDirectWeight;
+    sampledLightRadiance *= secondaryDirectWeight;
     return emissiveContribution + environmentContribution + sunContribution;
 }
 
@@ -495,6 +1523,9 @@ vec3 estimate_direct_lighting_env_sun_only(
     out uint sampledType,
     out vec3 sampledLightDirection,
     out float sampledLightDistance,
+    out vec3 sampledLightRadiance,
+    out vec3 sampledLightNormal,
+    out vec3 sampledRestirContribution,
     out uint causticTransmissiveHits,
     out uint causticVisiblePaths,
     out uint causticBlockedPaths) {
@@ -507,6 +1538,9 @@ vec3 estimate_direct_lighting_env_sun_only(
     sampledType = 0u;
     sampledLightDirection = vec3(0.0, 1.0, 0.0);
     sampledLightDistance = 0.0;
+    sampledLightRadiance = vec3(0.0);
+    sampledLightNormal = vec3(0.0, 1.0, 0.0);
+    sampledRestirContribution = vec3(0.0);
     causticTransmissiveHits = 0u;
     causticVisiblePaths = 0u;
     causticBlockedPaths = 0u;
@@ -516,6 +1550,7 @@ vec3 estimate_direct_lighting_env_sun_only(
     }
 
     vec3 lightingNormal = normalize(hit.geom_normal);
+    float sampledRestirProxy = 0.0;
     uint envSampleCount = clamp(camera.environment_direct_samples, 1u, 8u);
     for (uint envSample = 0u; envSample < envSampleCount; ++envSample) {
         vec3 envDir;
@@ -548,17 +1583,28 @@ vec3 estimate_direct_lighting_env_sun_only(
             vec3 bsdf = eval_brdf(material, wo, envDir, lightingNormal, hit.tangent, hit.bitangent);
             float bsdfPdf = pdf_brdf(material, wo, envDir, lightingNormal, hit.tangent, hit.bitangent);
             float weight = power_heuristic(envPdf, bsdfPdf);
-            if (sampledLightPdf <= 0.0) {
-                sampledLightPdf = envPdf;
-                sampledRawLightPdf = envPdf;
-                sampledEffectiveLightPdf = envPdf;
-                sampledBsdfPdf = bsdfPdf;
-                sampledMisWeight = weight;
-                sampledType = 2u;
-                sampledLightDirection = envDir;
-                sampledLightDistance = 10000.0;
+            vec3 envSampleContribution = bsdf * envRadiance * shadowT * cosSurface * weight / max(envPdf, 1e-6);
+            if (camera.restir_di_controls.x != 0u && camera.restir_di_controls.w != 0u) {
+                vec3 envRestirContribution = envSampleContribution / float(envSampleCount);
+                float envRestirProxy = luminance(envRestirContribution);
+                float envCandidateProxySum = sampledRestirProxy + envRestirProxy;
+                if (envRestirProxy > 0.0 &&
+                    rand_f32(rng) * max(envCandidateProxySum, 1.0e-8) <= envRestirProxy) {
+                    sampledLightPdf = envPdf * float(envSampleCount);
+                    sampledRawLightPdf = envPdf;
+                    sampledEffectiveLightPdf = sampledLightPdf;
+                    sampledBsdfPdf = bsdfPdf;
+                    sampledMisWeight = weight;
+                    sampledType = 2u;
+                    sampledLightDirection = envDir;
+                    sampledLightDistance = 10000.0;
+                    sampledLightRadiance = envRadiance * shadowT;
+                    sampledLightNormal = -normalize(envDir);
+                    sampledRestirContribution = envRestirContribution;
+                }
+                sampledRestirProxy = envCandidateProxySum;
             }
-            environmentContribution += bsdf * envRadiance * shadowT * cosSurface * weight / max(envPdf, 1e-6);
+            environmentContribution += envSampleContribution;
         }
     }
     environmentContribution /= float(envSampleCount);
@@ -592,17 +1638,28 @@ vec3 estimate_direct_lighting_env_sun_only(
             vec3 bsdf = eval_brdf(material, wo, sunWi, lightingNormal, hit.tangent, hit.bitangent);
             float bsdfPdf = pdf_brdf(material, wo, sunWi, lightingNormal, hit.tangent, hit.bitangent);
             float weight = power_heuristic(sunPdf, bsdfPdf);
-            if (sampledLightPdf <= 0.0) {
-                sampledLightPdf = sunPdf;
-                sampledRawLightPdf = sunPdf;
-                sampledEffectiveLightPdf = sunPdf;
-                sampledBsdfPdf = bsdfPdf;
-                sampledMisWeight = weight;
-                sampledType = 3u;
-                sampledLightDirection = sunWi;
-                sampledLightDistance = 10000.0;
+            vec3 sunIncidentRadiance = sunRadiance * sun_transmittance(hit.world_pos, sunWi);
+            vec3 sunCandidateContribution = bsdf * sunIncidentRadiance * shadowT * ndl * weight / max(sunPdf, 1e-6);
+            if (camera.restir_di_controls.x != 0u && camera.restir_di_controls.z != 0u) {
+                float sunRestirProxy = luminance(sunCandidateContribution);
+                float sunCandidateProxySum = sampledRestirProxy + sunRestirProxy;
+                if (sunRestirProxy > 0.0 &&
+                    rand_f32(rng) * max(sunCandidateProxySum, 1.0e-8) <= sunRestirProxy) {
+                    sampledLightPdf = sunPdf;
+                    sampledRawLightPdf = sunPdf;
+                    sampledEffectiveLightPdf = sunPdf;
+                    sampledBsdfPdf = bsdfPdf;
+                    sampledMisWeight = weight;
+                    sampledType = 3u;
+                    sampledLightDirection = sunWi;
+                    sampledLightDistance = 10000.0;
+                    sampledLightRadiance = sunIncidentRadiance * shadowT;
+                    sampledLightNormal = -normalize(sunWi);
+                    sampledRestirContribution = sunCandidateContribution;
+                }
+                sampledRestirProxy = sunCandidateProxySum;
             }
-            sunContribution = bsdf * sunRadiance * sun_transmittance(hit.world_pos, sunWi) * shadowT * ndl * weight / max(sunPdf, 1e-6);
+            sunContribution = sunCandidateContribution;
         }
     }
 

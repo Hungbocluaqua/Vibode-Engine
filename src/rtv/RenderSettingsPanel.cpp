@@ -131,6 +131,35 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.restirGiFinalStabilizationEnabled = render.restirGiFinalStabilizationEnabled;
         settings.restirGiActiveTileMaskMode = render.restirGiActiveTileMaskMode;
         settings.restirHistoryCopyMode = render.restirHistoryCopyMode;
+        settings.lightingReuseMode = render.lightingReuseMode;
+        settings.pathReservoirLayout = render.pathReservoirLayout;
+        settings.regirGridDimensions = render.regirGridDimensions;
+        settings.regirReservoirsPerCell = render.regirReservoirsPerCell;
+        settings.regirCandidatesPerReservoir = render.regirCandidatesPerReservoir;
+        settings.regirGridPadding = render.regirGridPadding;
+        settings.regirCanonicalMix = render.regirCanonicalMix;
+        settings.regirQueryMode = render.regirQueryMode;
+        settings.regirGridMode = render.regirGridMode;
+        settings.regirFiniteQueryFramePeriod = render.regirFiniteQueryFramePeriod;
+        settings.regirSpatialReuse = render.regirSpatialReuse;
+        settings.regirSpatialRounds = render.regirSpatialRounds;
+        settings.regirTemporalReuse = render.regirTemporalReuse;
+        settings.regirTemporalHistory = render.regirTemporalHistory;
+        settings.regirTemporalMaxM = render.regirTemporalMaxM;
+        settings.regirVisibilityReuse = render.regirVisibilityReuse;
+        settings.regirEnvironment = render.regirEnvironment;
+        settings.adaptiveSamplingMode = render.adaptiveSamplingMode;
+        settings.adaptiveSamplingBudget = render.adaptiveSamplingBudget;
+        settings.adaptiveWeightVariance = render.adaptiveWeightVariance;
+        settings.adaptiveWeightHistory = render.adaptiveWeightHistory;
+        settings.adaptiveWeightMotion = render.adaptiveWeightMotion;
+        settings.adaptiveWeightDisocclusion = render.adaptiveWeightDisocclusion;
+        settings.adaptiveWeightReactive = render.adaptiveWeightReactive;
+        settings.adaptiveWeightEdge = render.adaptiveWeightEdge;
+        settings.adaptiveWeightSpecular = render.adaptiveWeightSpecular;
+        settings.adaptiveWeightDI = render.adaptiveWeightDI;
+        settings.adaptiveWeightGI = render.adaptiveWeightGI;
+        settings.adaptiveWeightVolumetric = render.adaptiveWeightVolumetric;
         settings.adaptiveQualityMode = render.adaptiveQualityMode;
         settings.adaptiveGpuFrameTargetMs = render.adaptiveGpuFrameTargetMs;
         settings.usePhysicalCamera = render.usePhysicalCamera;
@@ -461,6 +490,129 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed |= ImGui::SliderFloat("GI Compatibility Cutoff", &settings.restirGiSpatialCompatibilityThreshold, 0.0f, 0.85f, "%.2f");
         changed |= ImGui::SliderScalar("GI Visibility Rays", ImGuiDataType_U32, &settings.restirGiVisibilityRayBudget, &minRestirGiVisibilityRays, &maxRestirGiVisibilityRays);
         tooltip("Ray-query visibility budget per pixel for temporal/spatial GI reuse. Zero validates all configured GI reuse candidates.");
+    }
+    if (ImGui::CollapsingHeader("Renderer Roadmap")) {
+        const char* lightingReuseItems[] = {"Legacy DI/GI", "Legacy DI/GI + ReGIR", "Experimental ReSTIR PT", "Validate ReSTIR PT"};
+        int lightingReuseIndex = static_cast<int>(settings.lightingReuseMode);
+        if (lightingReuseIndex < 0 || lightingReuseIndex > 3) {
+            lightingReuseIndex = 0;
+        }
+        if (ImGui::Combo("Lighting Reuse Mode", &lightingReuseIndex, lightingReuseItems, 4)) {
+            settings.lightingReuseMode = static_cast<LightingReuseMode>(lightingReuseIndex);
+            if (settings.lightingReuseMode == LightingReuseMode::ExperimentalRestirPT ||
+                settings.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy) {
+                settings.pathReservoirLayout = ReservoirLayout::PathSpace;
+            }
+            changed = true;
+        }
+        tooltip("Selects the production legacy path, future ReGIR path, or experimental ReSTIR PT validation path.");
+
+        if (settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR &&
+            ImGui::TreeNode("ReGIR Tuning")) {
+            const char* regirGridModeItems[] = {"Dense", "Active", "Hash"};
+            int regirGridModeIndex = static_cast<int>(settings.regirGridMode);
+            if (regirGridModeIndex < 0 || regirGridModeIndex > 2) {
+                regirGridModeIndex = 0;
+            }
+            if (ImGui::Combo("Grid Mode", &regirGridModeIndex, regirGridModeItems, 3)) {
+                settings.regirGridMode = static_cast<RegirGridMode>(regirGridModeIndex);
+                changed = true;
+            }
+            tooltip("Dense is the stable baseline. Active and Hash compact work around the previous frame's queried cells.");
+
+            const char* regirQueryModeItems[] = {"Deterministic", "Stochastic"};
+            int regirQueryModeIndex = static_cast<int>(settings.regirQueryMode);
+            if (regirQueryModeIndex < 0 || regirQueryModeIndex > 1) {
+                regirQueryModeIndex = 1;
+            }
+            if (ImGui::Combo("Query Mode", &regirQueryModeIndex, regirQueryModeItems, 2)) {
+                settings.regirQueryMode = static_cast<RegirQueryMode>(regirQueryModeIndex);
+                changed = true;
+            }
+            tooltip("Stochastic cell lookup reduces structured reuse artifacts. Deterministic is useful for debugging.");
+
+            const uint32_t minFiniteQueryPeriod = 0u;
+            const uint32_t maxFiniteQueryPeriod = 4096u;
+            changed |= ImGui::SliderScalar(
+                "Finite Query Period",
+                ImGuiDataType_U32,
+                &settings.regirFiniteQueryFramePeriod,
+                &minFiniteQueryPeriod,
+                &maxFiniteQueryPeriod);
+            tooltip("Frames between coherent finite-light queries. Zero selects the automatic grid-mode period.");
+
+            const uint32_t minGridDim = 1u;
+            const uint32_t maxGridDim = 128u;
+            changed |= ImGui::SliderScalar("Grid X", ImGuiDataType_U32, &settings.regirGridDimensions.x, &minGridDim, &maxGridDim);
+            changed |= ImGui::SliderScalar("Grid Y", ImGuiDataType_U32, &settings.regirGridDimensions.y, &minGridDim, &maxGridDim);
+            changed |= ImGui::SliderScalar("Grid Z", ImGuiDataType_U32, &settings.regirGridDimensions.z, &minGridDim, &maxGridDim);
+            tooltip("World-space grid dimensions. Large dense grids can allocate substantial reservoir memory.");
+
+            const uint32_t minReservoirs = 1u;
+            const uint32_t maxReservoirs = 64u;
+            const uint32_t minCandidates = 1u;
+            const uint32_t maxCandidates = 256u;
+            changed |= ImGui::SliderScalar("Reservoirs Per Cell", ImGuiDataType_U32, &settings.regirReservoirsPerCell, &minReservoirs, &maxReservoirs);
+            changed |= ImGui::SliderScalar("Candidates Per Reservoir", ImGuiDataType_U32, &settings.regirCandidatesPerReservoir, &minCandidates, &maxCandidates);
+            changed |= ImGui::SliderFloat("Grid Padding", &settings.regirGridPadding, 0.0f, 0.5f, "%.2f");
+            tooltip("Expands the light bounds before fitting the grid. Small padding avoids edge-cell misses.");
+
+            changed |= ImGui::SliderFloat("Canonical Mix", &settings.regirCanonicalMix, 0.0f, 1.0f, "%.2f");
+            tooltip("Fraction of secondary NEE samples that remain canonical for bias-safe ReGIR mixing.");
+
+            changed |= ImGui::Checkbox("Spatial Reuse", &settings.regirSpatialReuse);
+            const uint32_t minSpatialRounds = 1u;
+            const uint32_t maxSpatialRounds = 8u;
+            changed |= ImGui::SliderScalar("Spatial Rounds", ImGuiDataType_U32, &settings.regirSpatialRounds, &minSpatialRounds, &maxSpatialRounds);
+            changed |= ImGui::Checkbox("Temporal Reuse", &settings.regirTemporalReuse);
+            const uint32_t minTemporalHistory = 0u;
+            const uint32_t maxTemporalHistory = 128u;
+            const uint32_t minTemporalMaxM = 1u;
+            const uint32_t maxTemporalMaxM = 1024u;
+            changed |= ImGui::SliderScalar("Temporal History", ImGuiDataType_U32, &settings.regirTemporalHistory, &minTemporalHistory, &maxTemporalHistory);
+            changed |= ImGui::SliderScalar("Temporal Max M", ImGuiDataType_U32, &settings.regirTemporalMaxM, &minTemporalMaxM, &maxTemporalMaxM);
+
+            changed |= ImGui::Checkbox("Infinite Lights", &settings.regirEnvironment);
+            tooltip("Experimental global ReGIR banks for environment/sky and analytical-sun samples. Default off; inspect coverage with the ReGIR environment source debug view.");
+            changed |= ImGui::Checkbox("Visibility Reuse", &settings.regirVisibilityReuse);
+            tooltip("Experimental NEE++ mode. Resamples a bounded candidate set with current-point visibility and reuses the selected transmittance.");
+            ImGui::TreePop();
+        }
+
+        const char* reservoirLayoutItems[] = {"Legacy DI", "Legacy GI", "Path Space", "Path Space Compressed"};
+        int reservoirLayoutIndex = static_cast<int>(settings.pathReservoirLayout);
+        if (reservoirLayoutIndex < 0 || reservoirLayoutIndex > 3) {
+            reservoirLayoutIndex = 0;
+        }
+        if (ImGui::Combo("Path Reservoir Layout", &reservoirLayoutIndex, reservoirLayoutItems, 4)) {
+            settings.pathReservoirLayout = static_cast<ReservoirLayout>(reservoirLayoutIndex);
+            changed = true;
+        }
+        tooltip("Records the requested reservoir packing contract for GRIS/ReSTIR PT work.");
+
+        const char* adaptiveSamplingItems[] = {"Disabled", "Heuristic", "Neural"};
+        int adaptiveSamplingIndex = static_cast<int>(settings.adaptiveSamplingMode);
+        if (adaptiveSamplingIndex < 0 || adaptiveSamplingIndex > 2) {
+            adaptiveSamplingIndex = 0;
+        }
+        if (ImGui::Combo("Adaptive Sampling", &adaptiveSamplingIndex, adaptiveSamplingItems, 3)) {
+            settings.adaptiveSamplingMode = static_cast<AdaptiveSamplingMode>(adaptiveSamplingIndex);
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat("Adaptive Sampling Budget", &settings.adaptiveSamplingBudget, 0.11f, 4.0f, "%.2f spp");
+        if (ImGui::TreeNode("Adaptive Signal Weights")) {
+            changed |= ImGui::SliderFloat("Variance", &settings.adaptiveWeightVariance, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("History", &settings.adaptiveWeightHistory, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Motion", &settings.adaptiveWeightMotion, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Disocclusion", &settings.adaptiveWeightDisocclusion, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Reactive", &settings.adaptiveWeightReactive, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Edges", &settings.adaptiveWeightEdge, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Specular", &settings.adaptiveWeightSpecular, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("ReSTIR DI", &settings.adaptiveWeightDI, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("ReSTIR GI", &settings.adaptiveWeightGI, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::SliderFloat("Volumetric", &settings.adaptiveWeightVolumetric, 0.0f, 1.0f, "%.2f");
+            ImGui::TreePop();
+        }
     }
     const char* tsrPresetItems[] = {"Native", "Quality", "Balanced", "Performance"};
     int tsrPreset = settings.renderResolutionScale >= 0.99f ? 0 :
@@ -806,6 +958,26 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 render.restirDiFinalVisibilityEnabled != settings.restirDiFinalVisibilityEnabled ||
                 render.restirDiReservoirLayout != settings.restirDiReservoirLayout ||
                 render.restirGiEnabled != settings.restirGiEnabled ||
+                render.restirGiMode != settings.restirGiMode ||
+                render.restirGiReservoirLayout != settings.restirGiReservoirLayout ||
+                render.lightingReuseMode != settings.lightingReuseMode ||
+                render.pathReservoirLayout != settings.pathReservoirLayout ||
+                render.regirGridDimensions != settings.regirGridDimensions ||
+                render.regirReservoirsPerCell != settings.regirReservoirsPerCell ||
+                render.regirCandidatesPerReservoir != settings.regirCandidatesPerReservoir ||
+                std::abs(render.regirGridPadding - settings.regirGridPadding) > 0.0001f ||
+                std::abs(render.regirCanonicalMix - settings.regirCanonicalMix) > 0.0001f ||
+                render.regirQueryMode != settings.regirQueryMode ||
+                render.regirGridMode != settings.regirGridMode ||
+                render.regirFiniteQueryFramePeriod != settings.regirFiniteQueryFramePeriod ||
+                render.regirSpatialReuse != settings.regirSpatialReuse ||
+                render.regirSpatialRounds != settings.regirSpatialRounds ||
+                render.regirTemporalReuse != settings.regirTemporalReuse ||
+                render.regirTemporalHistory != settings.regirTemporalHistory ||
+                render.regirTemporalMaxM != settings.regirTemporalMaxM ||
+                render.regirVisibilityReuse != settings.regirVisibilityReuse ||
+                render.regirEnvironment != settings.regirEnvironment ||
+                render.adaptiveSamplingMode != settings.adaptiveSamplingMode ||
                 std::abs(render.skyIntensity - settings.skyIntensity) > 0.0001f;
             render.renderPreset = settings.renderPreset;
             render.pathTracingEnabled = settings.pathTracingEnabled;
@@ -896,6 +1068,35 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             render.restirGiFinalStabilizationEnabled = settings.restirGiFinalStabilizationEnabled;
             render.restirGiActiveTileMaskMode = settings.restirGiActiveTileMaskMode;
             render.restirHistoryCopyMode = settings.restirHistoryCopyMode;
+            render.lightingReuseMode = settings.lightingReuseMode;
+            render.pathReservoirLayout = settings.pathReservoirLayout;
+            render.regirGridDimensions = settings.regirGridDimensions;
+            render.regirReservoirsPerCell = settings.regirReservoirsPerCell;
+            render.regirCandidatesPerReservoir = settings.regirCandidatesPerReservoir;
+            render.regirGridPadding = settings.regirGridPadding;
+            render.regirCanonicalMix = settings.regirCanonicalMix;
+            render.regirQueryMode = settings.regirQueryMode;
+            render.regirGridMode = settings.regirGridMode;
+            render.regirFiniteQueryFramePeriod = settings.regirFiniteQueryFramePeriod;
+            render.regirSpatialReuse = settings.regirSpatialReuse;
+            render.regirSpatialRounds = settings.regirSpatialRounds;
+            render.regirTemporalReuse = settings.regirTemporalReuse;
+            render.regirTemporalHistory = settings.regirTemporalHistory;
+            render.regirTemporalMaxM = settings.regirTemporalMaxM;
+            render.regirVisibilityReuse = settings.regirVisibilityReuse;
+            render.regirEnvironment = settings.regirEnvironment;
+            render.adaptiveSamplingMode = settings.adaptiveSamplingMode;
+            render.adaptiveSamplingBudget = settings.adaptiveSamplingBudget;
+            render.adaptiveWeightVariance = settings.adaptiveWeightVariance;
+            render.adaptiveWeightHistory = settings.adaptiveWeightHistory;
+            render.adaptiveWeightMotion = settings.adaptiveWeightMotion;
+            render.adaptiveWeightDisocclusion = settings.adaptiveWeightDisocclusion;
+            render.adaptiveWeightReactive = settings.adaptiveWeightReactive;
+            render.adaptiveWeightEdge = settings.adaptiveWeightEdge;
+            render.adaptiveWeightSpecular = settings.adaptiveWeightSpecular;
+            render.adaptiveWeightDI = settings.adaptiveWeightDI;
+            render.adaptiveWeightGI = settings.adaptiveWeightGI;
+            render.adaptiveWeightVolumetric = settings.adaptiveWeightVolumetric;
             render.adaptiveQualityMode = settings.adaptiveQualityMode;
             render.adaptiveGpuFrameTargetMs = settings.adaptiveGpuFrameTargetMs;
             render.usePhysicalCamera = settings.usePhysicalCamera;

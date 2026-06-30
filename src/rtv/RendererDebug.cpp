@@ -153,6 +153,113 @@ RestirHistoryCopyMode parseRestirHistoryCopyMode(std::string_view value) {
     return RestirHistoryCopyMode::Copy;
 }
 
+const char* reservoirLayoutName(ReservoirLayout layout) {
+    switch (layout) {
+    case ReservoirLayout::LegacyDI: return "legacy-di";
+    case ReservoirLayout::LegacyGI: return "legacy-gi";
+    case ReservoirLayout::PathSpace: return "path-space";
+    case ReservoirLayout::PathSpaceCompressed: return "path-space-compressed";
+    }
+    return "legacy-di";
+}
+
+ReservoirLayout parseReservoirLayout(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "legacygi" || key == "gi" || key == "restirgi") {
+        return ReservoirLayout::LegacyGI;
+    }
+    if (key == "pathspace" || key == "path" || key == "restirpt") {
+        return ReservoirLayout::PathSpace;
+    }
+    if (key == "pathspacecompressed" || key == "compressed" || key == "compactpath") {
+        return ReservoirLayout::PathSpaceCompressed;
+    }
+    return ReservoirLayout::LegacyDI;
+}
+
+const char* lightingReuseModeName(LightingReuseMode mode) {
+    switch (mode) {
+    case LightingReuseMode::LegacyRestirDiGi: return "legacy";
+    case LightingReuseMode::LegacyRestirDiGiPlusReGIR: return "legacy-regir";
+    case LightingReuseMode::ExperimentalRestirPT: return "experimental-restir-pt";
+    case LightingReuseMode::ValidateRestirPTAgainstLegacy: return "validate-restir-pt";
+    }
+    return "legacy";
+}
+
+LightingReuseMode parseLightingReuseMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "legacyregir" || key == "regir" || key == "legacyrestirdigiplusregir") {
+        return LightingReuseMode::LegacyRestirDiGiPlusReGIR;
+    }
+    if (key == "experimentalrestirpt" || key == "restirpt" || key == "experimental") {
+        return LightingReuseMode::ExperimentalRestirPT;
+    }
+    if (key == "validaterestirpt" || key == "validate" || key == "compare" || key == "ab") {
+        return LightingReuseMode::ValidateRestirPTAgainstLegacy;
+    }
+    return LightingReuseMode::LegacyRestirDiGi;
+}
+
+const char* regirQueryModeName(RegirQueryMode mode) {
+    switch (mode) {
+    case RegirQueryMode::Deterministic: return "deterministic";
+    case RegirQueryMode::Stochastic: return "stochastic";
+    }
+    return "stochastic";
+}
+
+RegirQueryMode parseRegirQueryMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "deterministic" || key == "debug" || key == "repro") {
+        return RegirQueryMode::Deterministic;
+    }
+    if (key == "stochastic" || key == "jittered" || key == "production") {
+        return RegirQueryMode::Stochastic;
+    }
+    return RegirQueryMode::Stochastic;
+}
+
+const char* regirGridModeName(RegirGridMode mode) {
+    switch (mode) {
+    case RegirGridMode::Dense: return "dense";
+    case RegirGridMode::Active: return "active";
+    case RegirGridMode::Hash: return "hash";
+    }
+    return "dense";
+}
+
+RegirGridMode parseRegirGridMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "active" || key == "activegrid") {
+        return RegirGridMode::Active;
+    }
+    if (key == "hash" || key == "hashed" || key == "hashgrid") {
+        return RegirGridMode::Hash;
+    }
+    return RegirGridMode::Dense;
+}
+
+const char* adaptiveSamplingModeName(AdaptiveSamplingMode mode) {
+    switch (mode) {
+    case AdaptiveSamplingMode::Disabled: return "disabled";
+    case AdaptiveSamplingMode::Heuristic: return "heuristic";
+    case AdaptiveSamplingMode::Neural: return "neural";
+    }
+    return "disabled";
+}
+
+AdaptiveSamplingMode parseAdaptiveSamplingMode(std::string_view value) {
+    const std::string key = normalized(value);
+    if (key == "on" || key == "true" || key == "1" || key == "heuristic") {
+        return AdaptiveSamplingMode::Heuristic;
+    }
+    if (key == "neural" || key == "learned" || key == "unet") {
+        return AdaptiveSamplingMode::Neural;
+    }
+    return AdaptiveSamplingMode::Disabled;
+}
+
 const char* mixedSidedSplitModeName(MixedSidedSplitMode mode) {
     switch (mode) {
     case MixedSidedSplitMode::Off: return "off";
@@ -444,6 +551,76 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "restirgipathclass" || key == "gipathclass" || key == "restirgiclass" || key == "giclass") {
         return RendererDebugView::RestirGiPathClass;
     }
+    if (key == "adaptivedensity" || key == "adaptivedensitymap" || key == "samplingdensity" || key == "densitymap") {
+        return RendererDebugView::AdaptiveDensityMap;
+    }
+    if (key == "adaptivesamplecount" || key == "samplecountmap" || key == "adaptivespp" || key == "sppmap") {
+        return RendererDebugView::AdaptiveSampleCount;
+    }
+    if (key == "adaptiveunsampled" || key == "adaptiveunsampledpixels" || key == "unsampledpixels") {
+        return RendererDebugView::AdaptiveUnsampledPixels;
+    }
+    if (key == "adaptivefilled" || key == "adaptivefilledimage" || key == "filledimage") {
+        return RendererDebugView::AdaptiveFilledImage;
+    }
+    if (key == "adaptivedisocclusion" || key == "adaptivedisocclusionmask" || key == "disocclusionmask") {
+        return RendererDebugView::AdaptiveDisocclusionMask;
+    }
+    if (key == "regirgrid" || key == "regirgridoccupancy" || key == "regiroccupancy") {
+        return RendererDebugView::RegirGridOccupancy;
+    }
+    if (key == "regirweight" || key == "regirreservoirweight" || key == "regirreservoir") {
+        return RendererDebugView::RegirReservoirWeight;
+    }
+    if (key == "regirselectedlight" || key == "regirlight" || key == "regirselected") {
+        return RendererDebugView::RegirSelectedLight;
+    }
+    if (key == "regirquerycount" || key == "regirqueries" || key == "regirquery") {
+        return RendererDebugView::RegirQueryCount;
+    }
+    if (key == "regirmisweight" || key == "regirmis") {
+        return RendererDebugView::RegirMisWeight;
+    }
+    if (key == "regireffectivepdf" || key == "regirpdf") {
+        return RendererDebugView::RegirEffectivePdf;
+    }
+    if (key == "regircanonicalused" || key == "regircanonical" || key == "regirsource") {
+        return RendererDebugView::RegirCanonicalUsed;
+    }
+    if (key == "regirquerycell" || key == "regircell") {
+        return RendererDebugView::RegirQueryCell;
+    }
+    if (key == "regiractivecelloccupancy" || key == "regiractivecell" || key == "regiractiveoccupancy") {
+        return RendererDebugView::RegirActiveCellOccupancy;
+    }
+    if (key == "regirhashcollisions" || key == "regirhashcollision" || key == "regircollisions") {
+        return RendererDebugView::RegirHashCollisions;
+    }
+    if (key == "regirspatialinputweight" || key == "regirspatialinput" || key == "regirinputweight") {
+        return RendererDebugView::RegirSpatialInputWeight;
+    }
+    if (key == "regirspatialoutputweight" || key == "regirspatialoutput" || key == "regiroutputweight") {
+        return RendererDebugView::RegirSpatialOutputWeight;
+    }
+    if (key == "regirspatialneighborcount" || key == "regirspatialneighbors" || key == "regirneighborcount") {
+        return RendererDebugView::RegirSpatialNeighborCount;
+    }
+    if (key == "regirinfinitelightsource" || key == "regirinfinitesource" ||
+        key == "regirenvironmentsource" || key == "regirenvsource" || key == "regirenvkind") {
+        return RendererDebugView::RegirEnvironmentSource;
+    }
+    if (key == "regirenvironmentpdf" || key == "regirenvpdf" || key == "regirenveffectivepdf") {
+        return RendererDebugView::RegirEnvironmentPdf;
+    }
+    if (key == "regirenvironmentdirection" || key == "regirenvdirection" || key == "regirenvdir") {
+        return RendererDebugView::RegirEnvironmentDirection;
+    }
+    if (key == "regirenvironmentweight" || key == "regirenvweight" || key == "regirenvm") {
+        return RendererDebugView::RegirEnvironmentWeight;
+    }
+    if (key == "regirenvironmentgeneration" || key == "regirenvgeneration" || key == "regirenvstale") {
+        return RendererDebugView::RegirEnvironmentGeneration;
+    }
     if (key == "wavefrontqueueoccupancy" || key == "wavefrontoccupancy" || key == "queueoccupancy") {
         return RendererDebugView::WavefrontQueueOccupancy;
     }
@@ -594,6 +771,29 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirGiHitDistance: return "restir-gi-hit-distance";
     case RendererDebugView::RestirGiGrid: return "restir-gi-grid";
     case RendererDebugView::RestirGiPathClass: return "restir-gi-path-class";
+    case RendererDebugView::AdaptiveDensityMap: return "adaptive-density-map";
+    case RendererDebugView::AdaptiveSampleCount: return "adaptive-sample-count";
+    case RendererDebugView::AdaptiveUnsampledPixels: return "adaptive-unsampled-pixels";
+    case RendererDebugView::AdaptiveFilledImage: return "adaptive-filled-image";
+    case RendererDebugView::AdaptiveDisocclusionMask: return "adaptive-disocclusion-mask";
+    case RendererDebugView::RegirGridOccupancy: return "regir-grid-occupancy";
+    case RendererDebugView::RegirReservoirWeight: return "regir-reservoir-weight";
+    case RendererDebugView::RegirSelectedLight: return "regir-selected-light";
+    case RendererDebugView::RegirQueryCount: return "regir-query-count";
+    case RendererDebugView::RegirMisWeight: return "regir-mis-weight";
+    case RendererDebugView::RegirEffectivePdf: return "regir-effective-pdf";
+    case RendererDebugView::RegirCanonicalUsed: return "regir-canonical-used";
+    case RendererDebugView::RegirQueryCell: return "regir-query-cell";
+    case RendererDebugView::RegirActiveCellOccupancy: return "regir-active-cell-occupancy";
+    case RendererDebugView::RegirHashCollisions: return "regir-hash-collisions";
+    case RendererDebugView::RegirSpatialInputWeight: return "regir-spatial-input-weight";
+    case RendererDebugView::RegirSpatialOutputWeight: return "regir-spatial-output-weight";
+    case RendererDebugView::RegirSpatialNeighborCount: return "regir-spatial-neighbor-count";
+    case RendererDebugView::RegirEnvironmentSource: return "regir-infinite-source";
+    case RendererDebugView::RegirEnvironmentPdf: return "regir-environment-pdf";
+    case RendererDebugView::RegirEnvironmentDirection: return "regir-environment-direction";
+    case RendererDebugView::RegirEnvironmentWeight: return "regir-environment-weight";
+    case RendererDebugView::RegirEnvironmentGeneration: return "regir-environment-generation";
     case RendererDebugView::RestirDiSelectedLight: return "restir-di-selected-light";
     case RendererDebugView::RestirDiTarget: return "restir-di-target";
     case RendererDebugView::RestirDiSourcePdf: return "restir-di-source-pdf";

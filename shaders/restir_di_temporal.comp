@@ -194,7 +194,17 @@ void main() {
     float distToLight;
     vec3 lightNormal = restir_di_light_normal(previous);
     uint previousKind = restir_di_light_kind(previous);
-    if (previousKind == 4u || previousKind == 5u) {
+    if (restir_di_light_kind_infinite(previousKind) && params.visibilityPolicy == 0u) {
+        // Sun/environment are valid initial DI candidates, but production
+        // temporal shifting needs a current-receiver transmittance model for
+        // infinite lights before it is safe. Keep the current frame's all-light
+        // sample and avoid feeding long-lived shifted sky/sun reservoirs into
+        // the first-frame/final visibility path.
+        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_LIGHT_VERSION_REJECTED], 1u);
+        temporal_reservoirs[pixelIndex] = current;
+        return;
+    }
+    if (previousKind == RESTIR_DI_LIGHT_AREA || previousKind == RESTIR_DI_LIGHT_SPOT) {
         lightNormal = normalize(vec3(previousLight.data1.w, previousLight.data2.w, previousLight.data3.x));
     }
     vec3 receiverNormal = normalize(receiver.normal_roughness.xyz);
@@ -254,9 +264,12 @@ void main() {
         }
         // ReferenceValidation: trace actual shadow ray from current receiver to light
         vec3 lightPos = previous.samplePosition_distance.xyz;
-        bool directionalSample = restir_di_light_kind(previous) == 2u;
+        bool directionalSample = restir_di_light_kind(previous) == RESTIR_DI_LIGHT_DIRECTIONAL ||
+            restir_di_light_kind_infinite(restir_di_light_kind(previous));
         vec3 toLight = directionalSample
-            ? normalize(previousLight.data1.xyz)
+            ? (restir_di_light_kind_infinite(restir_di_light_kind(previous))
+                ? normalize(previous.samplePosition_distance.xyz)
+                : normalize(previousLight.data1.xyz))
             : lightPos - receiver.worldPosition_depth.xyz;
         float dist = directionalSample ? previous.samplePosition_distance.w : length(toLight);
         if (dist > RESTIR_DI_VISIBILITY_EPSILON * 2.0) {
@@ -302,7 +315,10 @@ void main() {
     // Current and previous candidates compete via weighted reservoir sampling
     float rngValue = sample_dimension_1d(coords, params.frameIndex, 0u, 12u);
 
-    // Motion-based cap on temporal selection probability
+    // Motion confidence already attenuates both the previous sample mass and
+    // its represented proposal count. Select from that same attenuated mass;
+    // applying an additional probability cap without reweighting the selected
+    // sample biases the reservoir and produces structured temporal artifacts.
     float motionMagnitude = length(velocityPixels);
     float motionConfidence = 1.0 - clamp(motionMagnitude / 24.0, 0.0, 0.85);
     float reuseConfidence = params.visibilityPolicy == 1u ? 1.0 : motionConfidence;
@@ -316,8 +332,7 @@ void main() {
     bool selectPrevious = false;
 
     if (totalMass > 1.0e-8) {
-        float motionCap = mix(0.85, 0.10, 1.0 - clamp(reuseConfidence, 0.0, 1.0));
-        previousProbability = clamp(previousMass / totalMass, 0.0, motionCap);
+        previousProbability = clamp(previousMass / totalMass, 0.0, 1.0);
         selectPrevious = rngValue < previousProbability;
     }
 
@@ -340,15 +355,23 @@ void main() {
     // Age update
     restir_di_set_age(selected, selectPrevious ? min(restir_di_age(previous) + 1u, params.temporalMaxAge) : 0u);
 
-    // M update
+    // M update. Reuse confidence can be fractional, but deterministically
+    // ceil-ing that fractional proposal count turns smooth motion-confidence
+    // gradients into visible M bands. Stochastic rounding preserves the
+    // expected proposal count without a fixed spatial quantization contour.
     float combinedM = currentM + previousM_float * reuseConfidence;
-    float cappedM = clamp(ceil(combinedM), 1.0, float(params.spatialMaxM));
-    restir_di_set_m(selected, uint(cappedM));
+    float cappedMFloat = clamp(combinedM, 1.0, float(params.spatialMaxM));
+    float baseMFloat = floor(cappedMFloat);
+    float mFraction = cappedMFloat - baseMFloat;
+    float mRng = sample_dimension_1d(coords, params.frameIndex, 0u, 13u);
+    uint roundedM = uint(baseMFloat) + (mRng < mFraction ? 1u : 0u);
+    roundedM = clamp(roundedM, 1u, params.spatialMaxM);
+    restir_di_set_m(selected, roundedM);
 
     // Weight sum update
     float combinedWeight = currentWeight + previousMass;
-    if (combinedM > cappedM && combinedM > 0.0) {
-        combinedWeight *= cappedM / combinedM;
+    if (combinedM > cappedMFloat && combinedM > 0.0) {
+        combinedWeight *= cappedMFloat / combinedM;
     }
     restir_di_set_weight_sum(selected, combinedWeight);
 
@@ -357,7 +380,8 @@ void main() {
     // pass to validate the selected shifted sample before it can shade.
     uint selectedVisibility = restir_di_visibility(current);
     if (selectPrevious) {
-        selectedVisibility = params.visibilityPolicy == 1u
+        selectedVisibility = params.visibilityPolicy == 1u ||
+            restir_di_light_kind_infinite(previousKind)
             ? prevVisibility
             : RESTIR_DI_VISIBILITY_UNKNOWN;
     }

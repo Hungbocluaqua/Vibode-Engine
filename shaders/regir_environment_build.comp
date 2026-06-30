@@ -1,0 +1,275 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const float PI = 3.14159265358979323846;
+const float HALF_RCP_PI_SQ = 0.0506605918210689;
+
+layout(set = 0, binding = 0, std140) uniform ReGIRParamsBlock {
+    uvec4 grid_dimensions_reservoirs;
+    uvec4 controls;
+    vec4 grid_padding;
+    vec4 query_controls;
+    uvec4 environment_controls;
+} regir_params;
+
+layout(set = 0, binding = 1, std140) uniform EnvParamsBlock {
+    uint enabled;
+    float intensity;
+    float rotation;
+    uint width;
+    uint height;
+    float background_intensity;
+    uint procedural;
+    uint sky_cdf_width;
+    float inv_total_lum;
+    uint sky_cdf_height;
+    float pad4;
+    float pad5;
+} env_params;
+
+layout(set = 0, binding = 2) uniform texture2D env_map;
+layout(set = 0, binding = 3) uniform sampler env_sampler;
+layout(set = 0, binding = 4, std430) readonly buffer EnvAliasRows {
+    vec2 env_alias_rows[];
+};
+layout(set = 0, binding = 5, std430) readonly buffer EnvAliasCols {
+    vec2 env_alias_cols[];
+};
+layout(set = 0, binding = 6, std430) readonly buffer SkyCdfCols {
+    float sky_cdf_cols[];
+};
+
+struct ReGIREnvironmentReservoir {
+    uvec4 metadata;
+    vec4 direction_pdf;
+    vec4 reservoir_state;
+};
+
+layout(set = 0, binding = 7, std430) writeonly buffer ReGIREnvironmentReservoirBuffer {
+    ReGIREnvironmentReservoir environment_reservoirs[];
+};
+
+layout(set = 0, binding = 8, std140) uniform Camera {
+    vec4 pos;
+    vec4 forward;
+    vec4 right;
+    vec4 up;
+    uint frame_count;
+    uint temporal_frame_index;
+    float effective_jitter_scale;
+    uint camera_moving;
+    float sun_intensity;
+    float sky_intensity;
+    float exposure;
+    uint path_tracing_enabled;
+    uint max_bounces;
+    uint sunlight_enabled;
+    uint direct_lighting_enabled;
+    float fov_y;
+    float sun_angular_radius;
+    float indirect_strength;
+    uint environment_direct_samples;
+    vec4 jitter;
+    vec4 atmosphere;
+    vec4 render_controls;
+    vec4 sun_direction_illuminance;
+    vec4 sun_color_angular_radius;
+    uvec4 restir_gi_controls;
+    uvec4 path_trace_controls;
+    vec4 dof_controls;
+    vec4 motion_blur_controls;
+    vec4 volume_controls;
+    vec4 projection_controls;
+    vec4 clip_controls;
+    uvec4 gi_version_controls;
+    uvec4 restir_di_controls;
+    vec4 native2b_controls;
+} camera;
+
+uint hash_u32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float rand01(inout uint state) {
+    state = hash_u32(state);
+    return float(state & 0x00ffffffu) / float(0x01000000u);
+}
+
+vec3 rotate_y(vec3 value, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return vec3(c * value.x + s * value.z, value.y, -s * value.x + c * value.z);
+}
+
+vec3 direction_from_uv(vec2 uv) {
+    float phi = (uv.x - 0.5) * 2.0 * PI;
+    float latitude = (uv.y - 0.5) * PI;
+    float cosLatitude = cos(latitude);
+    return normalize(vec3(cosLatitude * cos(phi), sin(latitude), cosLatitude * sin(phi)));
+}
+
+bool build_sun_sample(inout uint rng, out vec3 direction, out float sourcePdf) {
+    direction = vec3(0.0, 1.0, 0.0);
+    sourcePdf = 0.0;
+    vec3 sunDirection = normalize(camera.sun_direction_illuminance.xyz);
+    if (camera.sunlight_enabled == 0u || sunDirection.y <= 0.0 ||
+        dot(max(camera.sun_color_angular_radius.rgb, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722)) <= 0.0 ||
+        camera.sun_direction_illuminance.w <= 0.0) {
+        return false;
+    }
+
+    float radius = clamp(camera.sun_color_angular_radius.w, 0.0001, 0.08);
+    float cosRadius = cos(radius);
+    float cosTheta = mix(cosRadius, 1.0, rand01(rng));
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    float phi = 2.0 * PI * rand01(rng);
+    vec3 axis = abs(sunDirection.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(axis, sunDirection));
+    vec3 bitangent = cross(sunDirection, tangent);
+    direction = normalize(
+        tangent * cos(phi) * sinTheta +
+        bitangent * sin(phi) * sinTheta +
+        sunDirection * cosTheta);
+    sourcePdf = 1.0 / max(2.0 * PI * (1.0 - cosRadius), 1.0e-8);
+    return true;
+}
+
+bool build_environment_sample(
+    inout uint rng,
+    out vec3 direction,
+    out float sourcePdf,
+    out uint sourceKind) {
+    direction = vec3(0.0, 1.0, 0.0);
+    sourcePdf = 0.0;
+    sourceKind = 0u;
+    if (env_params.enabled == 0u) {
+        return false;
+    }
+
+    uint cdfPixelCount = max(env_params.sky_cdf_width, 1u) * max(env_params.sky_cdf_height, 1u);
+    bool skyCdfAvailable = env_params.procedural != 0u &&
+        cdfPixelCount > 0u && sky_cdf_cols.length() >= cdfPixelCount;
+    if (skyCdfAvailable) {
+        float sampleValue = rand01(rng);
+        uint low = 0u;
+        uint high = cdfPixelCount - 1u;
+        while (low < high) {
+            uint mid = (low + high) / 2u;
+            if (sky_cdf_cols[mid] < sampleValue) low = mid + 1u;
+            else high = mid;
+        }
+        uint x = low % env_params.sky_cdf_width;
+        uint y = low / env_params.sky_cdf_width;
+        vec2 uv = (vec2(x, y) + vec2(rand01(rng), rand01(rng))) /
+            vec2(env_params.sky_cdf_width, env_params.sky_cdf_height);
+        direction = direction_from_uv(uv);
+        float previous = low > 0u ? sky_cdf_cols[low - 1u] : 0.0;
+        float probability = max(sky_cdf_cols[low] - previous, 0.0);
+        float latitude = ((float(y) + 0.5) / float(env_params.sky_cdf_height) - 0.5) * PI;
+        sourcePdf = probability * float(cdfPixelCount) * HALF_RCP_PI_SQ / max(cos(latitude), 0.001);
+        sourceKind = 2u;
+    } else if (env_params.width > 0u && env_params.height > 0u &&
+        env_params.inv_total_lum > 0.0 &&
+        env_alias_rows.length() >= env_params.height &&
+        env_alias_cols.length() >= env_params.width * env_params.height) {
+        float rowSample = rand01(rng) * float(env_params.height);
+        uint rowCandidate = min(uint(rowSample), env_params.height - 1u);
+        vec2 rowAlias = env_alias_rows[rowCandidate];
+        uint row = fract(rowSample) <= rowAlias.x
+            ? rowCandidate
+            : min(uint(rowAlias.y + 0.5), env_params.height - 1u);
+        float columnSample = rand01(rng) * float(env_params.width);
+        uint columnCandidate = min(uint(columnSample), env_params.width - 1u);
+        uint columnOffset = row * env_params.width;
+        vec2 columnAlias = env_alias_cols[columnOffset + columnCandidate];
+        uint column = fract(columnSample) <= columnAlias.x
+            ? columnCandidate
+            : min(uint(columnAlias.y + 0.5), env_params.width - 1u);
+        vec2 uv = vec2(
+            (float(column) + 0.5) / float(env_params.width),
+            (float(row) + 0.5) / float(env_params.height));
+        direction = rotate_y(direction_from_uv(uv), -env_params.rotation);
+        vec3 radiance = texelFetch(sampler2D(env_map, env_sampler), ivec2(int(column), int(row)), 0).rgb;
+        float luminance = dot(max(radiance, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+        float latitude = ((float(row) + 0.5) / float(env_params.height) - 0.5) * PI;
+        sourcePdf = luminance * float(env_params.width * env_params.height) *
+            env_params.inv_total_lum * HALF_RCP_PI_SQ / max(cos(latitude), 0.001);
+        sourceKind = 1u;
+    } else {
+        float z = 1.0 - 2.0 * rand01(rng);
+        float phi = 2.0 * PI * rand01(rng);
+        float radius = sqrt(max(1.0 - z * z, 0.0));
+        direction = vec3(radius * cos(phi), z, radius * sin(phi));
+        sourcePdf = 1.0 / (4.0 * PI);
+        sourceKind = 3u;
+    }
+    return sourcePdf > 0.0;
+}
+
+void main() {
+    uint slot = gl_GlobalInvocationID.x;
+    if (slot >= environment_reservoirs.length()) {
+        return;
+    }
+
+    ReGIREnvironmentReservoir reservoir;
+    reservoir.metadata = uvec4(0u);
+    reservoir.direction_pdf = vec4(0.0, 1.0, 0.0, 0.0);
+    reservoir.reservoir_state = vec4(0.0);
+    bool featureEnabled = (regir_params.controls.x & 9u) == 9u;
+    uint environmentBankSize = regir_params.environment_controls.z;
+    uint sunBankSize = regir_params.environment_controls.w;
+    uint configuredBankSize = environmentBankSize + sunBankSize;
+    if (!featureEnabled || slot >= configuredBankSize) {
+        environment_reservoirs[slot] = reservoir;
+        return;
+    }
+
+    uint rng = hash_u32(slot ^ (regir_params.controls.z * 747796405u) ^ 0xa511e9b3u);
+    vec3 direction = vec3(0.0, 1.0, 0.0);
+    float sourcePdf = 0.0;
+    uint sourceKind = 0u;
+    uint sourceGeneration = regir_params.environment_controls.x;
+    bool sampleSun = slot >= environmentBankSize;
+    if (sampleSun) sourceGeneration = camera.gi_version_controls.x;
+    uint candidateCount = clamp(regir_params.controls.y, 1u, 32u);
+    float weightSum = 0.0;
+    float selectedTarget = 0.0;
+    uint validCandidates = 0u;
+    for (uint candidate = 0u; candidate < candidateCount; ++candidate) {
+        vec3 candidateDirection;
+        float candidatePdf;
+        uint candidateKind = sampleSun ? 4u : 0u;
+        bool valid = sampleSun
+            ? build_sun_sample(rng, candidateDirection, candidatePdf)
+            : build_environment_sample(rng, candidateDirection, candidatePdf, candidateKind);
+        if (!valid || candidatePdf <= 0.0) continue;
+        float candidateTarget = candidatePdf;
+        float candidateWeight = candidateTarget / candidatePdf;
+        ++validCandidates;
+        weightSum += candidateWeight;
+        if (rand01(rng) * weightSum <= candidateWeight) {
+            direction = candidateDirection;
+            sourcePdf = candidatePdf;
+            sourceKind = candidateKind;
+            selectedTarget = candidateTarget;
+        }
+    }
+
+    if (sourcePdf > 0.0 && validCandidates > 0u) {
+        reservoir.metadata = uvec4(1u, sourceKind, sourceGeneration, validCandidates);
+        reservoir.direction_pdf = vec4(direction, sourcePdf);
+        reservoir.reservoir_state = vec4(
+            selectedTarget,
+            weightSum,
+            weightSum / float(validCandidates),
+            float(validCandidates));
+    }
+    environment_reservoirs[slot] = reservoir;
+}

@@ -1,0 +1,87 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct ReGIRReservoir {
+    uvec4 metadata;
+    vec4 sample_position_weight;
+};
+
+layout(set = 0, binding = 0, std140) uniform ReGIRParamsBlock {
+    uvec4 grid_dimensions_reservoirs;
+    uvec4 controls;
+    vec4 grid_padding;
+    vec4 query_controls;
+    uvec4 environment_controls;
+} regir_params;
+
+layout(set = 0, binding = 1, std430) readonly buffer ReGIRTemporalCurrentBuffer {
+    ReGIRReservoir current_reservoirs[];
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer ReGIRTemporalPreviousBuffer {
+    ReGIRReservoir previous_reservoirs[];
+};
+
+layout(set = 0, binding = 3, std430) writeonly buffer ReGIRTemporalOutputBuffer {
+    ReGIRReservoir output_reservoirs[];
+};
+
+uint hash_u32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float rand01(inout uint state) {
+    state = hash_u32(state);
+    return float(state & 0x00ffffffu) / float(0x01000000u);
+}
+
+void main() {
+    const uvec3 dims = max(regir_params.grid_dimensions_reservoirs.xyz, uvec3(1u));
+    const uint reservoirsPerCell = max(regir_params.grid_dimensions_reservoirs.w, 1u);
+    const uint reservoirCount = dims.x * dims.y * dims.z * reservoirsPerCell;
+    const uint reservoirIndex = gl_GlobalInvocationID.x;
+    if (reservoirIndex >= reservoirCount) {
+        return;
+    }
+
+    ReGIRReservoir current = current_reservoirs[reservoirIndex];
+    const bool temporalEnabled = regir_params.grid_padding.y > 0.5;
+    const bool historyValid = regir_params.grid_padding.z > 0.5;
+    const uint historyFrames = max(regir_params.controls.w, 1u);
+    const uint maxM = max(uint(regir_params.grid_padding.w + 0.5), 1u);
+    if (!temporalEnabled || !historyValid || current.metadata.w == 0u) {
+        output_reservoirs[reservoirIndex] = current;
+        return;
+    }
+
+    ReGIRReservoir previous = previous_reservoirs[reservoirIndex];
+    if (previous.metadata.w == 0u) {
+        output_reservoirs[reservoirIndex] = current;
+        return;
+    }
+
+    const float currentWeight = max(current.sample_position_weight.w, 0.0) * float(max(current.metadata.w, 1u));
+    const float previousWeight = max(previous.sample_position_weight.w, 0.0) *
+        float(min(max(previous.metadata.w, 1u), maxM)) *
+        min(float(historyFrames), float(maxM));
+    const float weightSum = currentWeight + previousWeight;
+    if (weightSum <= 0.0) {
+        output_reservoirs[reservoirIndex] = current;
+        return;
+    }
+
+    uint rng = hash_u32(
+        reservoirIndex ^
+        (regir_params.controls.z * 747796405u) ^
+        (historyFrames * 2246822519u));
+    ReGIRReservoir selected = rand01(rng) * weightSum < previousWeight ? previous : current;
+    selected.metadata.w = min(maxM, max(current.metadata.w, 1u) + max(previous.metadata.w, 1u));
+    selected.sample_position_weight.w = max(selected.sample_position_weight.w, 0.0);
+    output_reservoirs[reservoirIndex] = selected;
+}

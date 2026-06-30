@@ -2882,6 +2882,24 @@ int main(int argc, char** argv) {
         std::optional<float> dlssSharpeningOverride;
         std::optional<rtv::RestirMode> restirModeOverride;
         std::optional<rtv::RenderPreset> renderPresetOverride;
+        std::optional<rtv::LightingReuseMode> lightingReuseModeOverride;
+        std::optional<glm::uvec3> regirGridDimensionsOverride;
+        std::optional<uint32_t> regirReservoirsPerCellOverride;
+        std::optional<uint32_t> regirCandidatesPerReservoirOverride;
+        std::optional<float> regirCanonicalMixOverride;
+        std::optional<rtv::RegirQueryMode> regirQueryModeOverride;
+        std::optional<rtv::RegirGridMode> regirGridModeOverride;
+        std::optional<uint32_t> regirFiniteQueryFramePeriodOverride;
+        std::optional<bool> regirSpatialReuseOverride;
+        std::optional<uint32_t> regirSpatialRoundsOverride;
+        std::optional<bool> regirTemporalReuseOverride;
+        std::optional<uint32_t> regirTemporalHistoryOverride;
+        std::optional<uint32_t> regirTemporalMaxMOverride;
+        std::optional<bool> regirVisibilityReuseOverride;
+        std::optional<bool> regirEnvironmentOverride;
+        std::optional<rtv::ReservoirLayout> pathReservoirLayoutOverride;
+        std::optional<rtv::AdaptiveSamplingMode> adaptiveSamplingModeOverride;
+        std::optional<float> adaptiveSamplingBudgetOverride;
         std::optional<bool> restirGiOverride;
         std::optional<bool> restirGiFinalStabilizationOverride;
         std::optional<rtv::RestirGiMode> restirGiModeOverride;
@@ -3088,6 +3106,24 @@ int main(int argc, char** argv) {
             }
             return result;
         };
+        auto parseUvec3 = [](std::string_view value) {
+            std::string normalized(value);
+            std::replace(normalized.begin(), normalized.end(), 'x', ',');
+            std::replace(normalized.begin(), normalized.end(), 'X', ',');
+            std::stringstream stream{normalized};
+            std::array<uint32_t, 3> components{};
+            std::string item;
+            for (uint32_t i = 0; i < 3u; ++i) {
+                if (!std::getline(stream, item, ',')) {
+                    throw std::runtime_error("Expected grid dimensions in XxYxZ form");
+                }
+                components[i] = static_cast<uint32_t>(std::stoul(item));
+            }
+            if (std::getline(stream, item, ',')) {
+                throw std::runtime_error("Expected exactly three grid dimensions");
+            }
+            return glm::uvec3(components[0], components[1], components[2]);
+        };
 
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
@@ -3172,6 +3208,117 @@ int main(int argc, char** argv) {
             }
             if (arg == "--pathtrace-kernel" && i + 1 < argc) {
                 pathTraceKernelModeOverride = rtv::parsePathTraceKernelMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--lighting-reuse-mode" && i + 1 < argc) {
+                lightingReuseModeOverride = rtv::parseLightingReuseMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--regir" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    lightingReuseModeOverride = rtv::LightingReuseMode::LegacyRestirDiGiPlusReGIR;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    lightingReuseModeOverride = rtv::LightingReuseMode::LegacyRestirDiGi;
+                } else {
+                    throw std::runtime_error("Invalid --regir value: expected on or off");
+                }
+                continue;
+            }
+            if (arg == "--regir-grid-dimensions" && i + 1 < argc) {
+                regirGridDimensionsOverride = parseUvec3(argv[++i]);
+                continue;
+            }
+            if (arg == "--regir-reservoirs-per-cell" && i + 1 < argc) {
+                regirReservoirsPerCellOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--regir-candidates-per-reservoir" && i + 1 < argc) {
+                regirCandidatesPerReservoirOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--regir-canonical-mix" && i + 1 < argc) {
+                regirCanonicalMixOverride = std::stof(argv[++i]);
+                continue;
+            }
+            if (arg == "--regir-query-mode" && i + 1 < argc) {
+                regirQueryModeOverride = rtv::parseRegirQueryMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--regir-grid-mode" && i + 1 < argc) {
+                regirGridModeOverride = rtv::parseRegirGridMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--regir-finite-query-frame-period" && i + 1 < argc) {
+                regirFiniteQueryFramePeriodOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--regir-spatial-reuse" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    regirSpatialReuseOverride = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    regirSpatialReuseOverride = false;
+                } else {
+                    throw std::runtime_error("Invalid --regir-spatial-reuse value: expected on or off");
+                }
+                continue;
+            }
+            if (arg == "--regir-spatial-rounds" && i + 1 < argc) {
+                regirSpatialRoundsOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--regir-temporal-reuse" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    regirTemporalReuseOverride = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    regirTemporalReuseOverride = false;
+                } else {
+                    throw std::runtime_error("Invalid --regir-temporal-reuse value: expected on or off");
+                }
+                continue;
+            }
+            if (arg == "--regir-temporal-history" && i + 1 < argc) {
+                regirTemporalHistoryOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--regir-temporal-max-m" && i + 1 < argc) {
+                regirTemporalMaxMOverride = static_cast<uint32_t>(std::stoul(argv[++i]));
+                continue;
+            }
+            if (arg == "--regir-visibility-reuse" && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    regirVisibilityReuseOverride = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    regirVisibilityReuseOverride = false;
+                } else {
+                    throw std::runtime_error("Invalid --regir-visibility-reuse value: expected on or off");
+                }
+                continue;
+            }
+            if ((arg == "--regir-environment" || arg == "--regir-infinite-lights") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                if (value == "on" || value == "true" || value == "1") {
+                    regirEnvironmentOverride = true;
+                } else if (value == "off" || value == "false" || value == "0") {
+                    regirEnvironmentOverride = false;
+                } else {
+                    throw std::runtime_error("Invalid " + std::string(arg) + " value: expected on or off");
+                }
+                continue;
+            }
+            if ((arg == "--path-reservoir-layout" || arg == "--reservoir-layout") && i + 1 < argc) {
+                pathReservoirLayoutOverride = rtv::parseReservoirLayout(argv[++i]);
+                continue;
+            }
+            if ((arg == "--adaptive-sampling" || arg == "--adaptive-sampling-mode") && i + 1 < argc) {
+                adaptiveSamplingModeOverride = rtv::parseAdaptiveSamplingMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--adaptive-sampling-budget" && i + 1 < argc) {
+                adaptiveSamplingBudgetOverride = std::stof(argv[++i]);
                 continue;
             }
             if (arg == "--blended-decal-shadow-mode" && i + 1 < argc) {
@@ -4237,6 +4384,91 @@ int main(int argc, char** argv) {
                 settings.renderPreset = rtv::RenderPreset::Custom;
                 renderer->applySettings(settings);
             }
+            if (lightingReuseModeOverride.has_value() ||
+                regirGridDimensionsOverride.has_value() ||
+                regirReservoirsPerCellOverride.has_value() ||
+                regirCandidatesPerReservoirOverride.has_value() ||
+                regirCanonicalMixOverride.has_value() ||
+                regirQueryModeOverride.has_value() ||
+                regirGridModeOverride.has_value() ||
+                regirFiniteQueryFramePeriodOverride.has_value() ||
+                regirSpatialReuseOverride.has_value() ||
+                regirSpatialRoundsOverride.has_value() ||
+                regirTemporalReuseOverride.has_value() ||
+                regirTemporalHistoryOverride.has_value() ||
+                regirTemporalMaxMOverride.has_value() ||
+                regirVisibilityReuseOverride.has_value() ||
+                regirEnvironmentOverride.has_value() ||
+                pathReservoirLayoutOverride.has_value() ||
+                adaptiveSamplingModeOverride.has_value() ||
+                adaptiveSamplingBudgetOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (lightingReuseModeOverride.has_value()) {
+                    settings.lightingReuseMode = *lightingReuseModeOverride;
+                    if ((settings.lightingReuseMode == rtv::LightingReuseMode::ExperimentalRestirPT ||
+                         settings.lightingReuseMode == rtv::LightingReuseMode::ValidateRestirPTAgainstLegacy) &&
+                        !pathReservoirLayoutOverride.has_value()) {
+                        settings.pathReservoirLayout = rtv::ReservoirLayout::PathSpace;
+                    }
+                }
+                if (regirGridDimensionsOverride.has_value()) {
+                    settings.regirGridDimensions = glm::uvec3(
+                        std::clamp(regirGridDimensionsOverride->x, 1u, 128u),
+                        std::clamp(regirGridDimensionsOverride->y, 1u, 128u),
+                        std::clamp(regirGridDimensionsOverride->z, 1u, 128u));
+                }
+                if (regirReservoirsPerCellOverride.has_value()) {
+                    settings.regirReservoirsPerCell = std::clamp(*regirReservoirsPerCellOverride, 1u, 64u);
+                }
+                if (regirCandidatesPerReservoirOverride.has_value()) {
+                    settings.regirCandidatesPerReservoir = std::clamp(*regirCandidatesPerReservoirOverride, 1u, 256u);
+                }
+                if (regirCanonicalMixOverride.has_value()) {
+                    settings.regirCanonicalMix = std::clamp(*regirCanonicalMixOverride, 0.0f, 1.0f);
+                }
+                if (regirQueryModeOverride.has_value()) {
+                    settings.regirQueryMode = *regirQueryModeOverride;
+                }
+                if (regirGridModeOverride.has_value()) {
+                    settings.regirGridMode = *regirGridModeOverride;
+                }
+                if (regirFiniteQueryFramePeriodOverride.has_value()) {
+                    settings.regirFiniteQueryFramePeriod =
+                        std::clamp(*regirFiniteQueryFramePeriodOverride, 0u, 4096u);
+                }
+                if (regirSpatialReuseOverride.has_value()) {
+                    settings.regirSpatialReuse = *regirSpatialReuseOverride;
+                }
+                if (regirSpatialRoundsOverride.has_value()) {
+                    settings.regirSpatialRounds = std::clamp(*regirSpatialRoundsOverride, 1u, 8u);
+                }
+                if (regirTemporalReuseOverride.has_value()) {
+                    settings.regirTemporalReuse = *regirTemporalReuseOverride;
+                }
+                if (regirTemporalHistoryOverride.has_value()) {
+                    settings.regirTemporalHistory = std::clamp(*regirTemporalHistoryOverride, 0u, 128u);
+                }
+                if (regirTemporalMaxMOverride.has_value()) {
+                    settings.regirTemporalMaxM = std::clamp(*regirTemporalMaxMOverride, 1u, 1024u);
+                }
+                if (regirVisibilityReuseOverride.has_value()) {
+                    settings.regirVisibilityReuse = *regirVisibilityReuseOverride;
+                }
+                if (regirEnvironmentOverride.has_value()) {
+                    settings.regirEnvironment = *regirEnvironmentOverride;
+                }
+                if (pathReservoirLayoutOverride.has_value()) {
+                    settings.pathReservoirLayout = *pathReservoirLayoutOverride;
+                }
+                if (adaptiveSamplingModeOverride.has_value()) {
+                    settings.adaptiveSamplingMode = *adaptiveSamplingModeOverride;
+                }
+                if (adaptiveSamplingBudgetOverride.has_value()) {
+                    settings.adaptiveSamplingBudget = std::clamp(*adaptiveSamplingBudgetOverride, 0.11f, 4.0f);
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
             if (restirGiModeOverride.has_value() ||
                 restirGiReservoirLayoutOverride.has_value() ||
                 restirGiTemporalMaxAgeOverride.has_value() ||
@@ -4469,11 +4701,6 @@ int main(int argc, char** argv) {
                     settings.restirDiFinalVisibilityEnabled = true;
                     settings.restirDiProductionStabilizationEnabled = false;
                 }
-                if (settings.restirDiIncludeSun || settings.restirDiIncludeEnvironment) {
-                    throw std::runtime_error(
-                        "Sun and environment are specialized direct-light channels outside ReSTIR DI; "
-                        "--restir-di-include-sun/environment must remain off");
-                }
                 settings.renderPreset = rtv::RenderPreset::Custom;
                 renderer->applySettings(settings);
             }
@@ -4506,6 +4733,7 @@ int main(int argc, char** argv) {
                 }
                 if (maxBouncesOverride.has_value()) {
                     settings.maxBounces = *maxBouncesOverride;
+                    settings.adaptiveQualityMode = rtv::AdaptiveQualityMode::Off;
                 }
                 if (atrousIterationsOverride.has_value()) {
                     settings.atrousIterations = *atrousIterationsOverride;
@@ -4758,11 +4986,6 @@ int main(int argc, char** argv) {
             }
             if (dumpRenderGraphDot && dotOutputPath.has_value()) {
                 renderer->setDumpRenderGraphDotPath(dotOutputPath);
-            }
-            if (diagConfig.disableAsyncCompute || diagConfig.singleQueueFallback) {
-                rtv::RendererSettings settings = renderer->settings();
-                settings.adaptiveQualityMode = rtv::AdaptiveQualityMode::Off;
-                renderer->applySettings(settings);
             }
         }
 

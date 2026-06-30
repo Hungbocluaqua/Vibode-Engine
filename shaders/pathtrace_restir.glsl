@@ -146,28 +146,54 @@ void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_po
         !any(isnan(initialIntegrand)) && !any(isinf(initialIntegrand)) &&
         !isnan(targetLum) && !isinf(targetLum);
     bool validPdf = components.first_light_pdf > 1.0e-6;
-    bool validIdentity = components.restir_di_light_index < mesh_params.light_count &&
-        components.restir_di_light_index < 0x01000000u;
+    bool infiniteLightCandidate = restir_di_light_kind_infinite(components.restir_di_light_kind) &&
+        components.restir_di_light_index == RESTIR_DI_PSEUDO_LIGHT_INDEX;
+    bool validIdentity = infiniteLightCandidate ||
+        (components.restir_di_light_index < mesh_params.light_count &&
+         components.restir_di_light_index < 0x01000000u);
     float initialWeight = targetLum / max(components.first_light_pdf, 1.0e-6);
     bool validSurface = components.restir_di_material_supported != 0u &&
         components.caustic_transmissive_hits <= 0.0;
-    bool proposalAttempted = did_hit && validSurface && camera.direct_lighting_enabled != 0u &&
-        mesh_params.light_count > 0u;
+    bool proposalAttempted = did_hit && validSurface &&
+        camera.direct_lighting_enabled != 0u;
     restir_di_set_m(initial, proposalAttempted ? 1u : 0u);
     if (did_hit && validSurface && targetLum > 1.0e-6 && finiteCandidate && validPdf && validIdentity &&
         !isnan(initialWeight) && !isinf(initialWeight)) {
-        vec3 toLight = components.restir_di_sample_position - hit_position;
-        float distToLight = length(toLight);
-        vec3 sampleDir = distToLight > 1.0e-4 ? toLight / distToLight : vec3(0.0, 1.0, 0.0);
+        vec3 sampleDir = vec3(0.0, 1.0, 0.0);
+        vec3 samplePosition = components.restir_di_sample_position;
+        if (infiniteLightCandidate) {
+            float dirLen2 = dot(components.restir_di_sample_position, components.restir_di_sample_position);
+            sampleDir = dirLen2 > 1.0e-8
+                ? components.restir_di_sample_position * inversesqrt(dirLen2)
+                : vec3(0.0, 1.0, 0.0);
+            samplePosition = sampleDir;
+        } else {
+            vec3 toLight = components.restir_di_sample_position - hit_position;
+            float distToLight = length(toLight);
+            sampleDir = distToLight > 1.0e-4 ? toLight / distToLight : vec3(0.0, 1.0, 0.0);
+        }
 
-        LightRecord identityRecord = light_records[components.restir_di_light_index];
+        uint identityHash = 0u;
+        uint identityVersion = 0u;
+        if (infiniteLightCandidate) {
+            identityHash = components.restir_di_light_kind == RESTIR_DI_LIGHT_ENVIRONMENT
+                ? RESTIR_DI_ENVIRONMENT_ID_HASH
+                : RESTIR_DI_SUN_ID_HASH;
+            identityVersion = components.restir_di_light_kind == RESTIR_DI_LIGHT_ENVIRONMENT
+                ? RESTIR_DI_ENVIRONMENT_VERSION
+                : RESTIR_DI_SUN_VERSION;
+        } else {
+            LightRecord identityRecord = light_records[components.restir_di_light_index];
+            identityHash = restir_di_identity_hash(identityRecord.identity.xy);
+            identityVersion = identityRecord.identity.z;
+        }
         initial.sampleMetadata = uvec4(
-            restir_di_identity_hash(identityRecord.identity.xy),
-            identityRecord.identity.z,
+            identityHash,
+            identityVersion,
             (components.restir_di_light_index << 8u) | (components.restir_di_light_kind & 0xffu),
             0u);
         initial.samplePosition_distance = vec4(
-            components.restir_di_sample_position,
+            samplePosition,
             components.restir_di_sample_distance);
         restir_di_set_direction(initial, sampleDir);
         restir_di_set_sample_radiance(initial, components.restir_di_sample_radiance);
@@ -188,11 +214,14 @@ void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_po
         restir_di_set_confidence(initial, 1.0);
         atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_VALID], 1u);
         uint lightKind = components.restir_di_light_kind;
-        uint classCounter = lightKind <= 1u ? RESTIR_DI_COUNTER_INITIAL_EMISSIVE :
-            lightKind == 2u ? RESTIR_DI_COUNTER_INITIAL_DIRECTIONAL :
-            lightKind == 3u ? RESTIR_DI_COUNTER_INITIAL_POINT :
-            lightKind == 4u ? RESTIR_DI_COUNTER_INITIAL_AREA :
-            RESTIR_DI_COUNTER_INITIAL_SPOT;
+        uint classCounter = lightKind <= RESTIR_DI_LIGHT_EMISSIVE_SPHERE ? RESTIR_DI_COUNTER_INITIAL_EMISSIVE :
+            lightKind == RESTIR_DI_LIGHT_DIRECTIONAL ? RESTIR_DI_COUNTER_INITIAL_DIRECTIONAL :
+            lightKind == RESTIR_DI_LIGHT_POINT ? RESTIR_DI_COUNTER_INITIAL_POINT :
+            lightKind == RESTIR_DI_LIGHT_AREA ? RESTIR_DI_COUNTER_INITIAL_AREA :
+            lightKind == RESTIR_DI_LIGHT_SPOT ? RESTIR_DI_COUNTER_INITIAL_SPOT :
+            lightKind == RESTIR_DI_LIGHT_ENVIRONMENT ? RESTIR_DI_COUNTER_INITIAL_ENVIRONMENT :
+            lightKind == RESTIR_DI_LIGHT_SUN ? RESTIR_DI_COUNTER_INITIAL_SUN :
+            RESTIR_DI_COUNTER_INITIAL_INVALID_IDENTITY;
         atomicAdd(restir_di_counters[classCounter], 1u);
     } else if (!did_hit || !validSurface) {
         atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_SURFACE], 1u);
@@ -359,7 +388,6 @@ void store_initial_restir_gi_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims
     }
 
     RestirGiReservoir reservoir = empty_restir_gi_reservoir();
-
     if (components.restir_gi_candidate_valid != 0u) {
         vec3 selectedIntegrand = max(components.restir_gi_candidate_radiance, vec3(0.0));
         float targetPdf = max(components.restir_gi_candidate_target_pdf, 1.0e-4);

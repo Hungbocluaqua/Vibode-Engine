@@ -83,6 +83,7 @@ layout(set = 0, binding = 20, std140) uniform Camera {
     vec4 projection_controls;
     vec4 clip_controls;
 } camera;
+layout(set = 0, binding = 21, r32f) readonly uniform image2D adaptive_filled_mask;
 
 const float WORLD_POSITION_PACK_RANGE = 64.0;
 
@@ -171,6 +172,10 @@ float guide_hit_distance(float value, float fallback) {
         : clamp(max(fallback, 0.0), 0.0, 65504.0);
 }
 
+bool adaptive_sample_count_enabled() {
+    return (camera.path_trace_controls.z & 2048u) != 0u;
+}
+
 vec3 guide_direction(vec3 value, vec3 fallback) {
     return dot(value, value) > 1.0e-8 ? normalize(value) : normalize(fallback);
 }
@@ -240,6 +245,9 @@ void main() {
     float disocclusion = max(
         disocclusion_mask(coords, dims, surface, currentToPreviousPixels),
         clamp(path.emissive_residual.a, 0.0, 1.0));
+    if (adaptive_sample_count_enabled()) {
+        disocclusion = max(disocclusion, clamp(imageLoad(adaptive_filled_mask, coords).r, 0.0, 1.0));
+    }
 
     imageStore(output_depth, coords, vec4(linearDepth, 0.0, 0.0, 0.0));
     imageStore(output_motion_vectors, coords, vec4(previousMinusCurrentPixels, 0.0, 0.0));

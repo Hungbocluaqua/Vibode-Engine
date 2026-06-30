@@ -1,0 +1,203 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const float PI = 3.14159265358979323846;
+
+struct LightRecord {
+    uvec4 metadata;
+    uvec4 identity;
+    vec4 data0;
+    vec4 data1;
+    vec4 data2;
+    vec4 data3;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer SceneLightRecords {
+    LightRecord light_records[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer LightBvhNodes {
+    vec4 light_bvh_nodes[];
+};
+
+layout(set = 0, binding = 2, std140) uniform MeshParams {
+    uint vertex_count;
+    uint triangle_count;
+    uint bvh_node_count;
+    uint material_count;
+    uint enabled;
+    uint sphere_count;
+    uint primitive_count;
+    uint instance_count;
+    uint light_count;
+    float emissive_total_area;
+    uint mesh_count;
+    uint local_vertex_count;
+    uint local_index_count;
+    uint local_bvh_node_count;
+    uint local_triangle_count;
+    uint tlas_node_count;
+    uint tlas_instance_index_count;
+    uint authored_light_offset;
+    uint authored_light_count;
+    uint bindless_texture_capacity;
+    uint transmissive_shadow_caster_count;
+    uint mesh_params_reserved0;
+    uint mesh_params_reserved1;
+    uint mesh_params_reserved2;
+} mesh_params;
+
+layout(set = 0, binding = 3, std140) uniform ReGIRParamsBlock {
+    uvec4 grid_dimensions_reservoirs;
+    uvec4 controls;
+    vec4 grid_padding;
+    vec4 query_controls;
+    uvec4 environment_controls;
+} regir_params;
+
+struct ReGIRReservoir {
+    uvec4 metadata;
+    vec4 sample_position_weight;
+};
+
+layout(set = 0, binding = 4, std430) buffer ReGIRReservoirBuffer {
+    ReGIRReservoir regir_reservoirs[];
+};
+
+layout(set = 0, binding = 5, std430) readonly buffer ReGIRActiveCellsBuffer {
+    uint regir_active_cells[];
+};
+
+uint hash_u32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float rand01(inout uint state) {
+    state = hash_u32(state);
+    return float(state & 0x00ffffffu) / float(0x01000000u);
+}
+
+float luminance(vec3 c) {
+    return dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 light_center(LightRecord light) {
+    if (light.metadata.x == 0u) {
+        return (light.data2.xyz + light.data3.xyz) * 0.5;
+    }
+    return light.data1.xyz;
+}
+
+float light_power(LightRecord light) {
+    if (light.metadata.x == 2u) {
+        return luminance(light.data2.xyz) * 1000000.0;
+    }
+    if (light.metadata.x == 3u || light.metadata.x == 5u) {
+        return luminance(light.data2.xyz);
+    }
+    return luminance(light.data2.xyz) * max(light.data0.w, 1.0e-6);
+}
+
+void main() {
+    const uint reservoirIndex = gl_GlobalInvocationID.x;
+    const uvec3 dims = max(regir_params.grid_dimensions_reservoirs.xyz, uvec3(1u));
+    const uint reservoirsPerCell = max(regir_params.grid_dimensions_reservoirs.w, 1u);
+    const uint totalCells = dims.x * dims.y * dims.z;
+    const uint gridMode = (regir_params.controls.x >> 1u) & 3u;
+    const uint storageCellCount = gridMode == 2u && regir_active_cells.length() >= 4u
+        ? regir_active_cells[3]
+        : totalCells;
+    const uint reservoirCount = storageCellCount * reservoirsPerCell;
+    if (reservoirIndex >= reservoirCount) {
+        return;
+    }
+
+    ReGIRReservoir emptyReservoir;
+    emptyReservoir.metadata = uvec4(0u, 0u, 0u, 0u);
+    emptyReservoir.sample_position_weight = vec4(0.0);
+
+    if ((regir_params.controls.x & 1u) == 0u || mesh_params.light_count == 0u || mesh_params.emissive_total_area <= 1.0e-8) {
+        regir_reservoirs[reservoirIndex] = emptyReservoir;
+        return;
+    }
+
+    vec3 rootMin = light_bvh_nodes[0].xyz;
+    vec3 rootMax = light_bvh_nodes[1].xyz;
+    vec3 extent = max(rootMax - rootMin, vec3(1.0e-3));
+    vec3 padding = extent * max(regir_params.grid_padding.x, 0.0);
+    rootMin -= padding;
+    rootMax += padding;
+    extent = max(rootMax - rootMin, vec3(1.0e-3));
+
+    const uint storageCellIndex = reservoirIndex / reservoirsPerCell;
+    uint cellIndex = storageCellIndex;
+    if (gridMode == 2u) {
+        const uint hashSlot = 4u + storageCellIndex;
+        if (hashSlot >= regir_active_cells.length() || regir_active_cells[hashSlot] == 0xffffffffu) {
+            regir_reservoirs[reservoirIndex] = emptyReservoir;
+            return;
+        }
+        cellIndex = regir_active_cells[hashSlot];
+        if (cellIndex >= totalCells) {
+            regir_reservoirs[reservoirIndex] = emptyReservoir;
+            return;
+        }
+    }
+    if (gridMode == 1u && regir_active_cells.length() >= 4u && regir_active_cells[0] > 0u) {
+        const uint activeSlot = 4u + cellIndex;
+        if (activeSlot >= regir_active_cells.length() || regir_active_cells[activeSlot] == 0u) {
+            regir_reservoirs[reservoirIndex] = emptyReservoir;
+            return;
+        }
+    }
+    const uint localReservoir = reservoirIndex - cellIndex * reservoirsPerCell;
+    const uint cellX = cellIndex % dims.x;
+    const uint cellY = (cellIndex / dims.x) % dims.y;
+    const uint cellZ = cellIndex / max(dims.x * dims.y, 1u);
+    const vec3 cellUv = (vec3(cellX, cellY, cellZ) + vec3(0.5)) / vec3(dims);
+    const vec3 cellCenter = rootMin + cellUv * extent;
+    const vec3 cellSize = extent / vec3(dims);
+    const float minDistance2 = max(dot(cellSize, cellSize) * 0.25, 1.0e-4);
+
+    uint rng = hash_u32(
+        reservoirIndex ^
+        (regir_params.controls.z * 747796405u) ^
+        (localReservoir * 2891336453u));
+    const uint candidateCount = max(regir_params.controls.y, 1u);
+    uint selectedLight = 0xffffffffu;
+    uint selectedKind = 0u;
+    vec3 selectedPosition = vec3(0.0);
+    float selectedWeight = 0.0;
+    float weightSum = 0.0;
+
+    for (uint candidate = 0u; candidate < candidateCount; ++candidate) {
+        const uint lightIndex = min(uint(rand01(rng) * float(mesh_params.light_count)), mesh_params.light_count - 1u);
+        LightRecord light = light_records[lightIndex];
+        vec3 center = light_center(light);
+        float distance2 = max(dot(center - cellCenter, center - cellCenter), minDistance2);
+        float weight = light_power(light) / distance2;
+        weightSum += weight;
+        if (weight > 0.0 && rand01(rng) * weightSum <= weight) {
+            selectedLight = lightIndex;
+            selectedKind = light.metadata.x;
+            selectedPosition = center;
+            selectedWeight = weight;
+        }
+    }
+
+    if (selectedLight == 0xffffffffu || weightSum <= 0.0) {
+        regir_reservoirs[reservoirIndex] = emptyReservoir;
+        return;
+    }
+
+    ReGIRReservoir reservoir;
+    reservoir.metadata = uvec4(selectedLight, selectedKind, candidateCount, 1u);
+    reservoir.sample_position_weight = vec4(selectedPosition, selectedWeight);
+    regir_reservoirs[reservoirIndex] = reservoir;
+}

@@ -1,6 +1,23 @@
 #ifndef RTV_PATHTRACE_INTEGRATOR_GLSL
 #define RTV_PATHTRACE_INTEGRATOR_GLSL
 
+#ifndef RTV_MATERIAL_RAY_CONE_LOD
+#define RTV_MATERIAL_RAY_CONE_LOD 0
+#endif
+
+float path_trace_material_texture_lod(uint bounce, float hitDistance) {
+#if RTV_MATERIAL_RAY_CONE_LOD
+    if (bounce == 0u) {
+        return 0.0;
+    }
+    float distanceTerm = log2(max(hitDistance, 1.0)) * 0.25;
+    float bounceTerm = float(min(bounce, 4u)) * 0.35;
+    return clamp(distanceTerm + bounceTerm - 0.35, 0.0, 2.5);
+#else
+    return 0.0;
+#endif
+}
+
 // Main path integration routine; include after all lighting and ray-query helpers.
 vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 dims, out bool did_hit, out float first_depth, out vec3 first_normal, out vec3 first_position, out PathComponents components) {
     vec3 radiance = vec3(0.0);
@@ -50,6 +67,25 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.caustic_transmissive_hits = 0.0;
     components.caustic_visible_paths = 0.0;
     components.caustic_blocked_paths = 0.0;
+    components.regir_query_count = 0u;
+    components.regir_selected_light = 0xffffffffu;
+    components.regir_reservoir_weight = 0.0;
+    components.regir_mis_weight = 0.0;
+    components.regir_effective_pdf = 0.0;
+    components.regir_canonical_used = 0u;
+    components.regir_query_cell = uvec3(0u);
+    components.regir_active_cell_occupancy = 0.0;
+    components.regir_hash_collisions = 0.0;
+    components.regir_spatial_input_weight = 0.0;
+    components.regir_spatial_output_weight = 0.0;
+    components.regir_spatial_neighbor_count = 0u;
+    components.regir_environment_source_kind = 0u;
+    components.regir_environment_source_pdf = 0.0;
+    components.regir_environment_effective_pdf = 0.0;
+    components.regir_environment_direction = vec3(0.0, 1.0, 0.0);
+    components.regir_environment_mis_weight = 0.0;
+    components.regir_environment_m = 0.0;
+    components.regir_environment_generation_mismatch = 0u;
     components.first_specular_probability = 0.0;
     components.direct_light_hit_distance = 65504.0;
     components.diffuse_hit_distance = 65504.0;
@@ -111,7 +147,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 vec3 sunDisk = environment_sun_disk_radiance(ray.direction);
                 vec3 env = throughput * (sky + sunDisk);
                 if (previousEventType == PATH_EVENT_BSDF && previousWasBrdfSample && env_params.enabled != 0u) {
-                    float envPdf = environment_pdf(ray.direction);
+                    float envPdf = environment_light_sampling_pdf(ray.direction, bounce);
                     if (envPdf > 1e-6) {
                         float skyWeight = power_heuristic(previousBrdfPdf, envPdf);
                         float sunPdf = analytical_sun_pdf(ray.direction);
@@ -168,6 +204,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
 #if RTV_NATIVE2B_COMPACT_PRIMARY_LIGHTS
             Material terminalMaterial = terminal_material_for_hit_fast(terminalRayHit, ray.direction);
 #else
+            set_material_texture_lod(path_trace_material_texture_lod(1u, terminalHit.t));
             Material terminalMaterial = material_for_hit(terminalRayHit, ray.direction);
 #endif
             const float terminalScale = camera.indirect_strength *
@@ -222,12 +259,33 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     vec3 terminalDirectLightDirection;
                     vec3 terminalDirectLightRadiance;
                     vec3 terminalDirectLightNormal;
+                    vec3 terminalRestirCandidateDirect;
+                    uint terminalRegirQueryCount;
+                    uint terminalRegirSelectedLight;
+                    float terminalRegirReservoirWeight;
+                    float terminalRegirMisWeight;
+                    float terminalRegirEffectivePdf;
+                    uint terminalRegirCanonicalUsed;
+                    uvec3 terminalRegirQueryCell;
+                    float terminalRegirActiveCellOccupancy;
+                    float terminalRegirHashCollisions;
+                    float terminalRegirSpatialInputWeight;
+                    float terminalRegirSpatialOutputWeight;
+                    uint terminalRegirSpatialNeighborCount;
+                    uint terminalRegirEnvironmentSourceKind;
+                    float terminalRegirEnvironmentSourcePdf;
+                    float terminalRegirEnvironmentEffectivePdf;
+                    vec3 terminalRegirEnvironmentDirection;
+                    float terminalRegirEnvironmentMisWeight;
+                    float terminalRegirEnvironmentM;
+                    uint terminalRegirEnvironmentGenerationMismatch;
                     terminalDirect = throughput * estimate_direct_lighting(
                         directRng,
                         terminalRayHit,
                         terminalMaterial,
                         -ray.direction,
                         ray.time,
+                        1u,
                         terminalEmissiveDirect,
                         terminalEnvDirect,
                         terminalLightPdf,
@@ -243,6 +301,26 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                         terminalDirectLightDirection,
                         terminalDirectLightRadiance,
                         terminalDirectLightNormal,
+                        terminalRestirCandidateDirect,
+                        terminalRegirQueryCount,
+                        terminalRegirSelectedLight,
+                        terminalRegirReservoirWeight,
+                        terminalRegirMisWeight,
+                        terminalRegirEffectivePdf,
+                        terminalRegirCanonicalUsed,
+                        terminalRegirQueryCell,
+                        terminalRegirActiveCellOccupancy,
+                        terminalRegirHashCollisions,
+                        terminalRegirSpatialInputWeight,
+                        terminalRegirSpatialOutputWeight,
+                        terminalRegirSpatialNeighborCount,
+                        terminalRegirEnvironmentSourceKind,
+                        terminalRegirEnvironmentSourcePdf,
+                        terminalRegirEnvironmentEffectivePdf,
+                        terminalRegirEnvironmentDirection,
+                        terminalRegirEnvironmentMisWeight,
+                        terminalRegirEnvironmentM,
+                        terminalRegirEnvironmentGenerationMismatch,
                         terminalCausticTransmissiveHits,
                         terminalCausticVisiblePaths,
                         terminalCausticBlockedPaths);
@@ -303,7 +381,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             }
             vec3 env = throughput * (sky + sunDisk);
             if (previousEventType == PATH_EVENT_BSDF && previousWasBrdfSample && env_params.enabled != 0u && debug_params.view != 27u) {
-                float envPdf = environment_pdf(ray.direction);
+                float envPdf = environment_light_sampling_pdf(ray.direction, bounce);
                 if (envPdf > 1e-6) {
                     float skyWeight = power_heuristic(previousBrdfPdf, envPdf);
                     float sunPdf = analytical_sun_pdf(ray.direction);
@@ -363,6 +441,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         }
         components.bounce_count += 1u;
 
+        set_material_texture_lod(path_trace_material_texture_lod(bounce, hit.t));
         Material material = material_for_hit(hit, ray.direction);
         if (bounce == 0u) {
             did_hit = true;
@@ -390,8 +469,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 luminance(max(material.sheen_color, vec3(0.0))) > 1.0e-5 ||
                 abs(material.anisotropy_strength) > 1.0e-4 ||
                 material.use_conductor_optics != 0u ||
-                material.iridescence_factor > 1.0e-5 ||
-                (specular_aa_enabled() && material.normal_variance > 1.0e-5);
+                material.iridescence_factor > 1.0e-5;
             components.restir_di_material_supported = restirDiSpecialClosure ? 0u : 1u;
             components.restir_di_material_pbr = material.mat_type == 1u || material.mat_type == 3u ? 1u : 0u;
             if (restir_gi_enabled() || restir_gi_debug_view()) {
@@ -540,9 +618,29 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         vec3 directLightDirection;
         vec3 directLightRadiance;
         vec3 directLightNormal;
+        vec3 restirCandidateDirect;
         uint causticTransmissiveHits;
         uint causticVisiblePaths;
         uint causticBlockedPaths;
+        uint regirQueryCount;
+        uint regirSelectedLight;
+        float regirReservoirWeight;
+        float regirMisWeight;
+        float regirEffectivePdf;
+        uint regirCanonicalUsed;
+        uvec3 regirQueryCell;
+        float regirActiveCellOccupancy;
+        float regirHashCollisions;
+        float regirSpatialInputWeight;
+        float regirSpatialOutputWeight;
+        uint regirSpatialNeighborCount;
+        uint regirEnvironmentSourceKind;
+        float regirEnvironmentSourcePdf;
+        float regirEnvironmentEffectivePdf;
+        vec3 regirEnvironmentDirection;
+        float regirEnvironmentMisWeight;
+        float regirEnvironmentM;
+        uint regirEnvironmentGenerationMismatch;
         vec3 direct = vec3(0.0);
         emissiveDirect = vec3(0.0);
         envDirect = vec3(0.0);
@@ -559,14 +657,37 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         directLightDirection = vec3(0.0, 1.0, 0.0);
         directLightRadiance = vec3(0.0);
         directLightNormal = vec3(0.0, 1.0, 0.0);
+        restirCandidateDirect = vec3(0.0);
         causticTransmissiveHits = 0u;
         causticVisiblePaths = 0u;
         causticBlockedPaths = 0u;
+        regirQueryCount = 0u;
+        regirSelectedLight = 0xffffffffu;
+        regirReservoirWeight = 0.0;
+        regirMisWeight = 0.0;
+        regirEffectivePdf = 0.0;
+        regirCanonicalUsed = 0u;
+        regirQueryCell = uvec3(0u);
+        regirActiveCellOccupancy = 0.0;
+        regirHashCollisions = 0.0;
+        regirSpatialInputWeight = 0.0;
+        regirSpatialOutputWeight = 0.0;
+        regirSpatialNeighborCount = 0u;
+        regirEnvironmentSourceKind = 0u;
+        regirEnvironmentSourcePdf = 0.0;
+        regirEnvironmentEffectivePdf = 0.0;
+        regirEnvironmentDirection = vec3(0.0, 1.0, 0.0);
+        regirEnvironmentMisWeight = 0.0;
+        regirEnvironmentM = 0.0;
+        regirEnvironmentGenerationMismatch = 0u;
         const bool allowSecondaryDirect = camera.restir_di_controls.y != 0u;
         if (!hitEmissiveSurface && (bounce == 0u || allowSecondaryDirect)) {
             uint directRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_LIGHT_SELECT);
 #if RTV_NATIVE2B_COMPACT_PRIMARY_LIGHTS
-            if (bounce == 0u && compact_imported_emissive_direct_enabled() && mesh_params.authored_light_count == 0u) {
+            if (bounce == 0u &&
+                compact_imported_emissive_direct_enabled() &&
+                mesh_params.authored_light_count == 0u &&
+                restir_di_raygen_params.enabled == 0u) {
                 direct = throughput * estimate_direct_lighting_env_sun_only(
                     directRng,
                     hit,
@@ -582,9 +703,19 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     directSampleType,
                     directLightDirection,
                     directLightDistance,
+                    directLightRadiance,
+                    directLightNormal,
+                    restirCandidateDirect,
                     causticTransmissiveHits,
                     causticVisiblePaths,
                     causticBlockedPaths);
+                if (directSampleType == 2u || directSampleType == 3u) {
+                    directLightIndex = RESTIR_DI_PSEUDO_LIGHT_INDEX;
+                    directLightKind = directSampleType == 2u
+                        ? RESTIR_DI_LIGHT_ENVIRONMENT
+                        : RESTIR_DI_LIGHT_SUN;
+                    directLightPosition = normalize(directLightDirection);
+                }
             } else {
 #endif
                 direct = throughput * estimate_direct_lighting(
@@ -593,6 +724,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     material,
                     wo,
                     ray.time,
+                    bounce,
                     emissiveDirect,
                     envDirect,
                     lightPdf,
@@ -608,6 +740,26 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     directLightDirection,
                     directLightRadiance,
                     directLightNormal,
+                    restirCandidateDirect,
+                    regirQueryCount,
+                    regirSelectedLight,
+                    regirReservoirWeight,
+                    regirMisWeight,
+                    regirEffectivePdf,
+                    regirCanonicalUsed,
+                    regirQueryCell,
+                    regirActiveCellOccupancy,
+                    regirHashCollisions,
+                    regirSpatialInputWeight,
+                    regirSpatialOutputWeight,
+                    regirSpatialNeighborCount,
+                    regirEnvironmentSourceKind,
+                    regirEnvironmentSourcePdf,
+                    regirEnvironmentEffectivePdf,
+                    regirEnvironmentDirection,
+                    regirEnvironmentMisWeight,
+                    regirEnvironmentM,
+                    regirEnvironmentGenerationMismatch,
                     causticTransmissiveHits,
                     causticVisiblePaths,
                     causticBlockedPaths);
@@ -619,8 +771,31 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         components.caustic_transmissive_hits += float(causticTransmissiveHits);
         components.caustic_visible_paths += float(causticVisiblePaths);
         components.caustic_blocked_paths += float(causticBlockedPaths);
+        if (regirQueryCount > 0u || regirEffectivePdf > 0.0) {
+            components.regir_query_count += regirQueryCount;
+            components.regir_selected_light = regirSelectedLight;
+            components.regir_reservoir_weight = regirReservoirWeight;
+            components.regir_mis_weight = regirMisWeight;
+            components.regir_effective_pdf = regirEffectivePdf;
+            components.regir_canonical_used = regirCanonicalUsed;
+            components.regir_query_cell = regirQueryCell;
+            components.regir_active_cell_occupancy = regirActiveCellOccupancy;
+            components.regir_hash_collisions = regirHashCollisions;
+            components.regir_spatial_input_weight = regirSpatialInputWeight;
+            components.regir_spatial_output_weight = regirSpatialOutputWeight;
+            components.regir_spatial_neighbor_count = regirSpatialNeighborCount;
+        }
+        if (regirEnvironmentEffectivePdf > 0.0 || regirEnvironmentGenerationMismatch != 0u) {
+            components.regir_environment_source_kind = regirEnvironmentSourceKind;
+            components.regir_environment_source_pdf = regirEnvironmentSourcePdf;
+            components.regir_environment_effective_pdf = regirEnvironmentEffectivePdf;
+            components.regir_environment_direction = regirEnvironmentDirection;
+            components.regir_environment_mis_weight = regirEnvironmentMisWeight;
+            components.regir_environment_m = regirEnvironmentM;
+            components.regir_environment_generation_mismatch = regirEnvironmentGenerationMismatch;
+        }
         vec3 shadedDirect = direct;
-        vec3 restirDirect = directSampleType == 1u ? throughput * emissiveDirect : vec3(0.0);
+        vec3 restirDirect = directSampleType != 0u ? throughput * restirCandidateDirect : vec3(0.0);
         vec3 nonRestirDirect = max(direct - restirDirect, vec3(0.0));
         if (bounce == 0u && restir_mode() != 0u) {
             bool historyAvailable = temporal_history_available() &&
@@ -733,7 +908,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.first_direct_sample_type = directSampleType;
             components.restir_di_sample_position = directLightPosition;
             components.restir_di_sample_distance = directLightDistance;
-            components.restir_di_sample_radiance = directLightRadiance;
+            components.restir_di_sample_radiance = directLightRadiance * atmosTransmittance * initialClampScale;
             components.restir_di_sample_normal = directLightNormal;
             components.restir_di_light_index = directLightIndex;
             components.restir_di_light_kind = directLightKind;

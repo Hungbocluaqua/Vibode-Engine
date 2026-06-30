@@ -49,7 +49,8 @@ public:
         ResourceAllocator& allocator,
         BufferUploader& uploader,
         bool opacityMicromapsEnabled = false,
-        bool usePipelineCache = true);
+        bool usePipelineCache = true,
+        bool deferSbtUpload = false);
     RayTracingPipeline(
         VkDevice device,
         const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& properties,
@@ -73,6 +74,7 @@ public:
     [[nodiscard]] VkPipelineLayout layout() const { return layout_; }
     [[nodiscard]] VkDeviceSize sbtBytes() const { return raygenSbt_.size() + missSbt_.size() + hitSbt_.size(); }
 
+    void finalizeDeferredSbtUpload(ResourceAllocator& allocator, BufferUploader& uploader);
     void bind(VkCommandBuffer commandBuffer) const;
     void traceRays(VkCommandBuffer commandBuffer, uint32_t width, uint32_t height, uint32_t raygenIndex = 0) const;
     void traceRaysIndirect(VkCommandBuffer commandBuffer, const Buffer& indirectBuffer, VkDeviceSize indirectOffset, uint32_t raygenIndex = 0) const;
@@ -88,6 +90,12 @@ private:
     VkStridedDeviceAddressRegionKHR missRegion_{};
     VkStridedDeviceAddressRegionKHR hitRegion_{};
     VkStridedDeviceAddressRegionKHR callableRegion_{};
+    std::vector<uint8_t> deferredSbtHandles_;
+    uint32_t deferredSbtHandleSize_ = 0;
+    VkDeviceSize deferredSbtStride_ = 0;
+    VkDeviceSize deferredRaygenSectionSize_ = 0;
+    VkDeviceSize deferredMissSectionSize_ = 0;
+    VkDeviceSize deferredHitSectionSize_ = 0;
 };
 
 } // namespace rtv

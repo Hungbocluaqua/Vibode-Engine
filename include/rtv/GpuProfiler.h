@@ -20,6 +20,9 @@ struct GpuFrameTimings {
     float restirGiUpsampleMs = 0.0f;
     float restirGiFinalMs = 0.0f;
     float restirGiCountersReadbackMs = 0.0f;
+    float regirBuildMs = 0.0f;
+    float regirSpatialReuseMs = 0.0f;
+    float regirTemporalReuseMs = 0.0f;
     float restirDiTemporalMs = 0.0f;
     float restirDiSpatialMs = 0.0f;
     float restirDiFinalMs = 0.0f;
@@ -35,6 +38,8 @@ struct GpuFrameTimings {
     float atmosphereAerialPerspectiveMs = 0.0f;
     float denoiserMs = 0.0f;
     float momentUpdateMs = 0.0f;
+    float adaptiveSamplingDiagnosticsMs = 0.0f;
+    float adaptiveSamplingFillMs = 0.0f;
     float historyCopyMs = 0.0f;
     float skipDenoiserCopyMs = 0.0f;
     float taaMs = 0.0f;
@@ -73,6 +78,9 @@ struct GpuFrameTimings {
             restirGiUpsampleMs +
             restirGiFinalMs +
             restirGiCountersReadbackMs +
+            regirBuildMs +
+            regirSpatialReuseMs +
+            regirTemporalReuseMs +
             restirDiTemporalMs +
             restirDiSpatialMs +
             restirDiFinalMs +
@@ -82,6 +90,8 @@ struct GpuFrameTimings {
             atmosphereMs +
             denoiserMs +
             momentUpdateMs +
+            adaptiveSamplingDiagnosticsMs +
+            adaptiveSamplingFillMs +
             historyCopyMs +
             skipDenoiserCopyMs +
             taaMs +
@@ -209,7 +219,17 @@ public:
         RestirGiUpsampleEnd = 92,
         RestirGiCountersReadbackStart = 93,
         RestirGiCountersReadbackEnd = 94,
-        Count = 95,
+        RegirBuildStart = 95,
+        RegirBuildEnd = 96,
+        RegirSpatialReuseStart = 97,
+        RegirSpatialReuseEnd = 98,
+        RegirTemporalReuseStart = 99,
+        RegirTemporalReuseEnd = 100,
+        AdaptiveSamplingDiagnosticsStart = 101,
+        AdaptiveSamplingDiagnosticsEnd = 102,
+        AdaptiveSamplingFillStart = 103,
+        AdaptiveSamplingFillEnd = 104,
+        Count = 105,
     };
 
     GpuProfiler() = default;

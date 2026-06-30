@@ -37,8 +37,8 @@ void debugViewTooltip(RendererDebugView view) {
 
 } // namespace
 
-const std::array<RendererDebugView, 100>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 100> views = {
+const std::array<RendererDebugView, 123>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 123> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -118,6 +118,29 @@ const std::array<RendererDebugView, 100>& editorDebugViews() {
         RendererDebugView::RestirGiFinal,
         RendererDebugView::RestirGiNormal,
         RendererDebugView::RestirGiHitDistance,
+        RendererDebugView::AdaptiveDensityMap,
+        RendererDebugView::AdaptiveSampleCount,
+        RendererDebugView::AdaptiveUnsampledPixels,
+        RendererDebugView::AdaptiveFilledImage,
+        RendererDebugView::AdaptiveDisocclusionMask,
+        RendererDebugView::RegirGridOccupancy,
+        RendererDebugView::RegirReservoirWeight,
+        RendererDebugView::RegirSelectedLight,
+        RendererDebugView::RegirQueryCount,
+        RendererDebugView::RegirMisWeight,
+        RendererDebugView::RegirEffectivePdf,
+        RendererDebugView::RegirCanonicalUsed,
+        RendererDebugView::RegirQueryCell,
+        RendererDebugView::RegirActiveCellOccupancy,
+        RendererDebugView::RegirHashCollisions,
+        RendererDebugView::RegirSpatialInputWeight,
+        RendererDebugView::RegirSpatialOutputWeight,
+        RendererDebugView::RegirSpatialNeighborCount,
+        RendererDebugView::RegirEnvironmentSource,
+        RendererDebugView::RegirEnvironmentPdf,
+        RendererDebugView::RegirEnvironmentDirection,
+        RendererDebugView::RegirEnvironmentWeight,
+        RendererDebugView::RegirEnvironmentGeneration,
         RendererDebugView::DenoiserDirectDiffuseVariance,
         RendererDebugView::DenoiserDirectSpecularVariance,
         RendererDebugView::DenoiserIndirectDiffuseVariance,
@@ -264,6 +287,33 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         ImGui::SeparatorText("Temporal");
         selectable(RendererDebugView::TemporalReactiveMask);
         selectable(RendererDebugView::TemporalHistoryWeight);
+
+        ImGui::SeparatorText("Adaptive Sampling");
+        selectable(RendererDebugView::AdaptiveDensityMap);
+        selectable(RendererDebugView::AdaptiveSampleCount);
+        selectable(RendererDebugView::AdaptiveUnsampledPixels);
+        selectable(RendererDebugView::AdaptiveFilledImage);
+        selectable(RendererDebugView::AdaptiveDisocclusionMask);
+
+        ImGui::SeparatorText("ReGIR");
+        selectable(RendererDebugView::RegirGridOccupancy);
+        selectable(RendererDebugView::RegirReservoirWeight);
+        selectable(RendererDebugView::RegirSelectedLight);
+        selectable(RendererDebugView::RegirQueryCount);
+        selectable(RendererDebugView::RegirMisWeight);
+        selectable(RendererDebugView::RegirEffectivePdf);
+        selectable(RendererDebugView::RegirCanonicalUsed);
+        selectable(RendererDebugView::RegirQueryCell);
+        selectable(RendererDebugView::RegirActiveCellOccupancy);
+        selectable(RendererDebugView::RegirHashCollisions);
+        selectable(RendererDebugView::RegirSpatialInputWeight);
+        selectable(RendererDebugView::RegirSpatialOutputWeight);
+        selectable(RendererDebugView::RegirSpatialNeighborCount);
+        selectable(RendererDebugView::RegirEnvironmentSource);
+        selectable(RendererDebugView::RegirEnvironmentPdf);
+        selectable(RendererDebugView::RegirEnvironmentDirection);
+        selectable(RendererDebugView::RegirEnvironmentWeight);
+        selectable(RendererDebugView::RegirEnvironmentGeneration);
 
         ImGui::SeparatorText("ReSTIR");
         selectable(RendererDebugView::RestirReservoirAge);

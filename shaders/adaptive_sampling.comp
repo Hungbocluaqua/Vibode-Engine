@@ -1,0 +1,196 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "temporal_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+const uint DEBUG_VIEW_ADAPTIVE_DENSITY_MAP = 129u;
+const uint DEBUG_VIEW_ADAPTIVE_SAMPLE_COUNT = 130u;
+const uint DEBUG_VIEW_ADAPTIVE_UNSAMPLED_PIXELS = 131u;
+const uint DEBUG_VIEW_ADAPTIVE_FILLED_IMAGE = 132u;
+const uint DEBUG_VIEW_ADAPTIVE_DISOCCLUSION_MASK = 133u;
+
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
+};
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D input_color;
+layout(set = 0, binding = 1, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VarianceBuffer { uint variance_buffer[]; };
+layout(set = 0, binding = 3, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
+layout(set = 0, binding = 4, std430) readonly buffer VelocityBuffer { uint velocity_buffer[]; };
+layout(set = 0, binding = 5, rgba16ui) readonly uniform uimage2D history_length_image;
+layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D output_debug;
+layout(set = 0, binding = 7, std430) writeonly buffer AdaptiveDensityBuffer { float adaptive_density[]; };
+layout(set = 0, binding = 8, std430) buffer AdaptiveStatsBuffer { uint adaptive_stats[]; };
+
+layout(push_constant) uniform AdaptiveSamplingParams {
+    uint width;
+    uint height;
+    uint debug_view;
+    uint mode;
+    vec4 signal_a; // x=budget, y=variance, z=history, w=motion
+    vec4 signal_b; // x=disocclusion, y=reactive, z=edge, w=specular
+    vec4 signal_c; // x=direct, y=gi, z=volumetric, w=frame index
+} params;
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float decode_variance(uint packed_value) {
+    return float(packed_value & 0xffffu) / 65535.0 * 64.0;
+}
+
+vec2 unpack_snorm2x16(uint packed_value) {
+    ivec2 quantized = ivec2(int(packed_value & 0xffffu), int((packed_value >> 16u) & 0xffffu));
+    if (quantized.x >= 32768) {
+        quantized.x -= 65536;
+    }
+    if (quantized.y >= 32768) {
+        quantized.y -= 65536;
+    }
+    return clamp(vec2(quantized) / 32767.0, vec2(-1.0), vec2(1.0));
+}
+
+vec3 decode_octahedral_normal(uint packed_value) {
+    vec2 f = unpack_snorm2x16(packed_value);
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+vec4 decode_depth_normal(uvec4 packed_value) {
+    return vec4(uintBitsToFloat(packed_value.x), decode_octahedral_normal(packed_value.y));
+}
+
+bool is_surface_depth(float depth) {
+    return depth < 1.0e9;
+}
+
+float hash01(uvec3 v) {
+    uint x = v.x * 1664525u + v.y * 1013904223u + v.z * 747796405u + 2891336453u;
+    x ^= x >> 16u;
+    x *= 2246822519u;
+    x ^= x >> 13u;
+    x *= 3266489917u;
+    x ^= x >> 16u;
+    return float(x & 0x00ffffffu) / float(0x01000000u);
+}
+
+vec3 heatmap(float v) {
+    v = clamp(v, 0.0, 1.0);
+    vec3 a = mix(vec3(0.02, 0.08, 0.22), vec3(0.0, 0.65, 0.78), smoothstep(0.0, 0.45, v));
+    return mix(a, vec3(1.0, 0.72, 0.08), smoothstep(0.45, 1.0, v));
+}
+
+vec4 average_neighbor_color(ivec2 coords, ivec2 dims) {
+    vec3 sum_value = vec3(0.0);
+    float count = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 sample_coords = clamp(coords + ivec2(x, y), ivec2(0), dims - ivec2(1));
+            vec3 c = max(imageLoad(input_color, sample_coords).rgb, vec3(0.0));
+            sum_value += c;
+            count += 1.0;
+        }
+    }
+    return vec4(sum_value / max(count, 1.0), 1.0);
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(int(params.width), int(params.height));
+    if (coords.x >= dims.x || coords.y >= dims.y) {
+        return;
+    }
+
+    uint pixel_index = uint(coords.y) * params.width + uint(coords.x);
+    PathDataRecord path = path_data_buffer[pixel_index];
+    vec4 dn = decode_depth_normal(depth_normal_buffer[pixel_index]);
+    float depth = dn.x;
+    vec3 normal = dn.yzw;
+    bool surface = is_surface_depth(depth);
+
+    float variance_signal = clamp(log2(1.0 + decode_variance(variance_buffer[pixel_index])) / 6.0, 0.0, 1.0);
+    uvec4 history = imageLoad(history_length_image, coords);
+    float history_len = float(max(max(history.x, history.y), max(history.z, history.w)));
+    float history_signal = 1.0 - clamp(history_len / 32.0, 0.0, 1.0);
+    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], TEMPORAL_VELOCITY_PACK_SCALE);
+    float motion_signal = clamp(length(velocity_pixels) / 24.0, 0.0, 1.0);
+
+    float edge_signal = 0.0;
+    float disocclusion_signal = history_signal;
+    if (surface) {
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                if (x == 0 && y == 0) {
+                    continue;
+                }
+                ivec2 sample_coords = clamp(coords + ivec2(x, y), ivec2(0), dims - ivec2(1));
+                uint sample_index = uint(sample_coords.y) * params.width + uint(sample_coords.x);
+                vec4 sample_dn = decode_depth_normal(depth_normal_buffer[sample_index]);
+                if (is_surface_depth(sample_dn.x)) {
+                    edge_signal = max(edge_signal, clamp(abs(sample_dn.x - depth) / max(depth, 0.05), 0.0, 1.0));
+                    edge_signal = max(edge_signal, 1.0 - clamp(dot(normal, sample_dn.yzw) * 0.5 + 0.5, 0.0, 1.0));
+                } else {
+                    edge_signal = 1.0;
+                }
+            }
+        }
+        disocclusion_signal = clamp(max(history_signal, max(edge_signal, motion_signal)), 0.0, 1.0);
+    }
+
+    float reactive_signal = clamp(max(path.restir_gi_fallback_reactive.w, luminance(abs(path.emissive_residual.rgb))) * 0.5, 0.0, 1.0);
+    float roughness = clamp(path.albedo_roughness_hit_confidence.w, 0.0, 1.0);
+    float specular_signal = clamp(luminance(max(path.direct_specular.rgb + path.indirect_specular.rgb, vec3(0.0))) / 4.0, 0.0, 1.0) *
+        (1.0 - roughness * 0.65);
+    float direct_signal = clamp(luminance(max(path.direct_diffuse.rgb + path.direct_specular.rgb, vec3(0.0))) / 8.0, 0.0, 1.0);
+    float gi_signal = clamp(luminance(max(path.indirect_diffuse.rgb + path.indirect_specular.rgb, vec3(0.0))) / 8.0, 0.0, 1.0);
+    float volumetric_signal = surface ? 0.0 : 0.35;
+
+    float weighted =
+        params.signal_a.y * variance_signal +
+        params.signal_a.z * history_signal +
+        params.signal_a.w * motion_signal +
+        params.signal_b.x * disocclusion_signal +
+        params.signal_b.y * reactive_signal +
+        params.signal_b.z * edge_signal +
+        params.signal_b.w * specular_signal +
+        params.signal_c.x * direct_signal +
+        params.signal_c.y * gi_signal +
+        params.signal_c.z * volumetric_signal;
+    float weight_sum =
+        params.signal_a.y + params.signal_a.z + params.signal_a.w +
+        params.signal_b.x + params.signal_b.y + params.signal_b.z + params.signal_b.w +
+        params.signal_c.x + params.signal_c.y + params.signal_c.z;
+    float density = clamp(weighted / max(weight_sum, 1.0e-4), 0.0, 1.0);
+    if (params.signal_c.w <= 1.0 || params.mode == 0u) {
+        density = 1.0;
+    }
+
+    adaptive_density[pixel_index] = density;
+    atomicAdd(adaptive_stats[0], uint(round(density * 256.0)));
+    atomicAdd(adaptive_stats[1], 1u);
+    uint density_bin = min(uint(floor(density * 16.0)), 15u);
+    atomicAdd(adaptive_stats[4u + density_bin], 1u);
+    vec4 out_color = vec4(heatmap(density), 1.0);
+    if (params.debug_view == DEBUG_VIEW_ADAPTIVE_DISOCCLUSION_MASK) {
+        out_color = vec4(vec3(disocclusion_signal), 1.0);
+    }
+
+    imageStore(output_debug, coords, out_color);
+}

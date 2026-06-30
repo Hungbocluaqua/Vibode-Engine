@@ -138,6 +138,9 @@ std::map<std::string, double> passGpuMsMap(const ProfileReport::PerPassGpuMs& pa
         {"restir_gi_upsample", passes.restirGiUpsample},
         {"restir_gi_final", passes.restirGiFinal},
         {"restir_gi_counters_readback", passes.restirGiCountersReadback},
+        {"regir_build", passes.regirBuild},
+        {"regir_spatial_reuse", passes.regirSpatialReuse},
+        {"regir_temporal_reuse", passes.regirTemporalReuse},
         {"restir_di_temporal", passes.restirDiTemporal},
         {"restir_di_spatial", passes.restirDiSpatial},
         {"restir_di_final", passes.restirDiFinal},
@@ -151,6 +154,8 @@ std::map<std::string, double> passGpuMsMap(const ProfileReport::PerPassGpuMs& pa
         {"atmosphere_aerial_perspective", passes.atmosphereAerialPerspective},
         {"denoiser", passes.denoiser},
         {"moment_update", passes.momentUpdate},
+        {"adaptive_sampling_diagnostics", passes.adaptiveSamplingDiagnostics},
+        {"adaptive_sampling_fill", passes.adaptiveSamplingFill},
         {"history_copy", passes.historyCopy},
         {"skip_denoiser_copy", passes.skipDenoiserCopy},
         {"taa", passes.taa},
@@ -362,6 +367,14 @@ json imageMetricsJson(const ImageDiffMetrics& metrics) {
         {"ssim", metrics.ssim},
         {"max_error", metrics.maxError},
         {"changed_pixel_percentage", metrics.changedPixelPercentage},
+        {"baseline_mean_luminance", metrics.baselineMeanLuminance},
+        {"current_mean_luminance", metrics.currentMeanLuminance},
+        {"mean_luminance_bias", metrics.meanLuminanceBias},
+        {"mean_luminance_bias_percentage", metrics.meanLuminanceBiasPercentage},
+        {"mean_red_bias", metrics.meanRedBias},
+        {"mean_green_bias", metrics.meanGreenBias},
+        {"mean_blue_bias", metrics.meanBlueBias},
+        {"max_abs_mean_channel_bias", metrics.maxAbsMeanChannelBias},
     };
 }
 
@@ -717,6 +730,9 @@ ImageDiffMetrics compareImages(
     double sumX2 = 0.0;
     double sumY2 = 0.0;
     double sumXY = 0.0;
+    double sumRedDelta = 0.0;
+    double sumGreenDelta = 0.0;
+    double sumBlueDelta = 0.0;
 
     for (size_t pixel = 0; pixel < pixelCount; ++pixel) {
         const size_t offset = pixel * 4u;
@@ -738,6 +754,9 @@ ImageDiffMetrics compareImages(
         }
         const double x = luminance(baseline.pixels[offset], baseline.pixels[offset + 1u], baseline.pixels[offset + 2u]);
         const double y = luminance(current.pixels[offset], current.pixels[offset + 1u], current.pixels[offset + 2u]);
+        sumRedDelta += static_cast<double>(current.pixels[offset]) - static_cast<double>(baseline.pixels[offset]);
+        sumGreenDelta += static_cast<double>(current.pixels[offset + 1u]) - static_cast<double>(baseline.pixels[offset + 1u]);
+        sumBlueDelta += static_cast<double>(current.pixels[offset + 2u]) - static_cast<double>(baseline.pixels[offset + 2u]);
         sumX += x;
         sumY += y;
         sumX2 += x * x;
@@ -786,6 +805,19 @@ ImageDiffMetrics compareImages(
     metrics.changedPixelPercentage = sampleCount > 0.0
         ? (static_cast<double>(changedPixels) / sampleCount) * 100.0
         : 0.0;
+    metrics.baselineMeanLuminance = meanX;
+    metrics.currentMeanLuminance = meanY;
+    metrics.meanLuminanceBias = meanY - meanX;
+    metrics.meanLuminanceBiasPercentage = std::abs(meanX) > 1.0e-8
+        ? (metrics.meanLuminanceBias / meanX) * 100.0
+        : 0.0;
+    metrics.meanRedBias = sampleCount > 0.0 ? sumRedDelta / sampleCount : 0.0;
+    metrics.meanGreenBias = sampleCount > 0.0 ? sumGreenDelta / sampleCount : 0.0;
+    metrics.meanBlueBias = sampleCount > 0.0 ? sumBlueDelta / sampleCount : 0.0;
+    metrics.maxAbsMeanChannelBias = std::max({
+        std::abs(metrics.meanRedBias),
+        std::abs(metrics.meanGreenBias),
+        std::abs(metrics.meanBlueBias)});
     return metrics;
 }
 

@@ -79,6 +79,7 @@ layout(set = 0, binding = 9, std140) uniform Camera {
     vec4 projection_controls;
     vec4 clip_controls;
 } camera;
+layout(set = 0, binding = 10, r32f) readonly uniform image2D adaptive_filled_mask;
 
 vec2 unpack_snorm2x16(uint packedValue) {
     ivec2 quantized = ivec2(int(packedValue & 0xffffu), int((packedValue >> 16u) & 0xffffu));
@@ -132,6 +133,14 @@ bool nrd_invalid_float(float value) {
 
 bool nrd_invalid_vec3(vec3 value) {
     return any(isnan(value)) || any(isinf(value));
+}
+
+bool adaptive_sample_count_enabled() {
+    return (camera.path_trace_controls.z & 2048u) != 0u;
+}
+
+bool adaptive_filled_pixel(ivec2 coords) {
+    return adaptive_sample_count_enabled() && imageLoad(adaptive_filled_mask, coords).r > 0.5;
 }
 
 float reblur_norm_hit_distance(float hitDistance, float viewZ, float roughness) {
@@ -249,6 +258,12 @@ void main() {
     float specHitDistance = path.denoiser_hit_distance.y;
     float diffNormHitDistance = valid_reblur_norm_hit_distance(diffHitDistance, viewZ, 1.0, nrd_luminance(noisyDiffuse));
     float specNormHitDistance = valid_reblur_norm_hit_distance(specHitDistance, viewZ, roughness, nrd_luminance(noisySpecular));
+    if (adaptive_filled_pixel(coords)) {
+        diffRadiance = vec3(0.0);
+        specRadiance = vec3(0.0);
+        diffNormHitDistance = 0.0;
+        specNormHitDistance = 0.0;
+    }
     if (!surface) {
         diffRadiance = vec3(0.0);
         specRadiance = vec3(0.0);
