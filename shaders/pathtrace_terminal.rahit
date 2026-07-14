@@ -19,10 +19,14 @@ void main() {
     MeshRecord mesh = mesh_records[meshIndex];
     uint globalTriangleIndex = geometry_triangle_offset(
         meshIndex, tlasRecordIndex, gl_GeometryIndexEXT, mesh.vertex_index_data.z) + gl_PrimitiveID;
-    uint triIndex = globalTriangleIndex * 3u;
-    LocalVertex v0 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex]);
-    LocalVertex v1 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex + 1u]);
-    LocalVertex v2 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex + 2u]);
+    uvec3 indices;
+    if (!ray_tracing_triangle_indices(globalTriangleIndex, indices)) {
+        ignoreIntersectionEXT;
+        return;
+    }
+    LocalVertex v0 = ray_tracing_local_vertex(meshIndex, indices.x);
+    LocalVertex v1 = ray_tracing_local_vertex(meshIndex, indices.y);
+    LocalVertex v2 = ray_tracing_local_vertex(meshIndex, indices.z);
     vec3 p0 = v0.position_uv_x.xyz;
     vec3 p1 = v1.position_uv_x.xyz;
     vec3 p2 = v2.position_uv_x.xyz;

@@ -1,6 +1,8 @@
 #include "rtv/DiagnosticTools.h"
 
+#include "rtv/DescriptorWriteDiagnostics.h"
 #include "rtv/RenderGraphDump.h"
+#include "rtv/ShaderReflection.h"
 
 #include <nlohmann/json.hpp>
 #include <stb_image.h>
@@ -10,6 +12,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -20,6 +23,7 @@
 #include <stdexcept>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 namespace rtv {
 namespace {
@@ -695,6 +699,375 @@ std::vector<unsigned char> readBinary(const std::filesystem::path& path) {
         std::istreambuf_iterator<char>());
 }
 
+std::vector<uint32_t> bytesToWords(const std::vector<unsigned char>& bytes) {
+    if (bytes.size() % sizeof(uint32_t) != 0) {
+        throw std::runtime_error("SPIR-V byte size is not aligned to 32-bit words");
+    }
+    std::vector<uint32_t> words(bytes.size() / sizeof(uint32_t));
+    if (!words.empty()) {
+        std::memcpy(words.data(), bytes.data(), bytes.size());
+    }
+    return words;
+}
+
+std::string descriptorTypeName(VkDescriptorType type) {
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_SAMPLER: return "sampler";
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: return "combined_image_sampler";
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: return "sampled_image";
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: return "storage_image";
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: return "uniform_texel_buffer";
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: return "storage_texel_buffer";
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: return "uniform_buffer";
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: return "storage_buffer";
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: return "uniform_buffer_dynamic";
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: return "storage_buffer_dynamic";
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT: return "input_attachment";
+    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: return "acceleration_structure";
+    default: return "unknown";
+    }
+}
+
+std::string shaderStageFlagsName(VkShaderStageFlags stages) {
+    std::vector<std::string> names;
+    if ((stages & VK_SHADER_STAGE_VERTEX_BIT) != 0) {
+        names.push_back("vertex");
+    }
+    if ((stages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0) {
+        names.push_back("fragment");
+    }
+    if ((stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0) {
+        names.push_back("compute");
+    }
+    if ((stages & VK_SHADER_STAGE_RAYGEN_BIT_KHR) != 0) {
+        names.push_back("raygen");
+    }
+    if ((stages & VK_SHADER_STAGE_ANY_HIT_BIT_KHR) != 0) {
+        names.push_back("any_hit");
+    }
+    if ((stages & VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) != 0) {
+        names.push_back("closest_hit");
+    }
+    if ((stages & VK_SHADER_STAGE_MISS_BIT_KHR) != 0) {
+        names.push_back("miss");
+    }
+    if ((stages & VK_SHADER_STAGE_INTERSECTION_BIT_KHR) != 0) {
+        names.push_back("intersection");
+    }
+    if ((stages & VK_SHADER_STAGE_CALLABLE_BIT_KHR) != 0) {
+        names.push_back("callable");
+    }
+    if (names.empty()) {
+        return "none";
+    }
+    std::ostringstream stream;
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) {
+            stream << "|";
+        }
+        stream << names[i];
+    }
+    return stream.str();
+}
+
+struct DescriptorExpectation {
+    const char* setName = "";
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    VkDescriptorType type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
+    const char* role = "";
+};
+
+std::vector<DescriptorExpectation> rendererDescriptorExpectations() {
+    return {
+        {"raytracing_set_0", 0, 38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "ReSTIR DI current reservoir storage buffer"},
+        {"raytracing_set_0", 0, 39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "ReSTIR DI previous reservoir storage buffer"},
+        {"raytracing_set_0", 0, 40, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "ReGIR light BVH nodes storage buffer"},
+        {"raytracing_set_0", 0, 42, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "path data storage buffer"},
+        {"raytracing_set_0", 0, 43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "ReSTIR GI current reservoir storage buffer"},
+        {"raytracing_set_0", 0, 44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "ReSTIR GI previous reservoir storage buffer"},
+        {"raytracing_set_0", 0, 45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "ReSTIR GI spatial reservoir storage buffer"},
+        {"bindless_texture_heap_set_2", 2, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, "bindless combined image sampler heap"},
+    };
+}
+
+json descriptorExpectationJson(const DescriptorExpectation& expectation) {
+    return {
+        {"set_name", expectation.setName},
+        {"set", expectation.set},
+        {"binding", expectation.binding},
+        {"type", descriptorTypeName(expectation.type)},
+        {"role", expectation.role},
+        {"required", true},
+    };
+}
+
+json descriptorExpectationsJson() {
+    json rows = json::array();
+    for (const DescriptorExpectation& expectation : rendererDescriptorExpectations()) {
+        rows.push_back(descriptorExpectationJson(expectation));
+    }
+    return rows;
+}
+
+json reflectedBindingJson(const ReflectedBinding& binding) {
+    return {
+        {"set", binding.set},
+        {"binding", binding.binding},
+        {"count", binding.count},
+        {"type", descriptorTypeName(binding.type)},
+        {"stage_flags", binding.stages},
+        {"stages", shaderStageFlagsName(binding.stages)},
+    };
+}
+
+struct ReflectedBindingRecord {
+    ReflectedBinding binding;
+    std::string source;
+};
+
+struct ReflectedBindingSummary {
+    uint32_t set = 0;
+    uint32_t binding = 0;
+    uint32_t minCount = 0;
+    uint32_t maxCount = 0;
+    uint32_t occurrenceCount = 0;
+    std::set<std::string> types;
+    std::set<std::string> stages;
+    std::set<std::string> sources;
+};
+
+json reflectedBindingSummaryJson(const ReflectedBindingSummary& summary) {
+    json sources = json::array();
+    uint32_t sourceCount = 0;
+    for (const std::string& source : summary.sources) {
+        if (sourceCount >= 16) {
+            break;
+        }
+        sources.push_back(source);
+        ++sourceCount;
+    }
+    return {
+        {"set", summary.set},
+        {"binding", summary.binding},
+        {"min_count", summary.minCount},
+        {"max_count", summary.maxCount},
+        {"occurrence_count", summary.occurrenceCount},
+        {"types", summary.types},
+        {"stages", summary.stages},
+        {"sources", sources},
+        {"truncated_sources", summary.sources.size() > sources.size()},
+    };
+}
+
+json descriptorReflectionAuditJson(
+    const std::vector<ReflectedBindingRecord>& reflectedBindings,
+    bool reflectionPassed) {
+    std::map<std::pair<uint32_t, uint32_t>, ReflectedBindingSummary> summaries;
+    std::set<uint32_t> reflectedSets;
+    for (const ReflectedBindingRecord& record : reflectedBindings) {
+        reflectedSets.insert(record.binding.set);
+        auto& summary = summaries[{record.binding.set, record.binding.binding}];
+        if (summary.occurrenceCount == 0) {
+            summary.set = record.binding.set;
+            summary.binding = record.binding.binding;
+            summary.minCount = record.binding.count;
+            summary.maxCount = record.binding.count;
+        } else {
+            summary.minCount = std::min(summary.minCount, record.binding.count);
+            summary.maxCount = std::max(summary.maxCount, record.binding.count);
+        }
+        ++summary.occurrenceCount;
+        summary.types.insert(descriptorTypeName(record.binding.type));
+        summary.stages.insert(shaderStageFlagsName(record.binding.stages));
+        summary.sources.insert(record.source);
+    }
+
+    json reflectedBindingRows = json::array();
+    for (const auto& [key, summary] : summaries) {
+        (void)key;
+        reflectedBindingRows.push_back(reflectedBindingSummaryJson(summary));
+    }
+
+    json expectations = json::array();
+    json failures = json::array();
+    for (const DescriptorExpectation& expectation : rendererDescriptorExpectations()) {
+        json matches = json::array();
+        bool hasBinding = false;
+        bool hasTypeMatch = false;
+        for (const ReflectedBindingRecord& record : reflectedBindings) {
+            if (record.binding.set != expectation.set || record.binding.binding != expectation.binding) {
+                continue;
+            }
+            hasBinding = true;
+            const bool typeMatches = record.binding.type == expectation.type;
+            hasTypeMatch = hasTypeMatch || typeMatches;
+            matches.push_back({
+                {"source", record.source},
+                {"count", record.binding.count},
+                {"type", descriptorTypeName(record.binding.type)},
+                {"stages", shaderStageFlagsName(record.binding.stages)},
+                {"type_matches", typeMatches},
+            });
+        }
+        const bool passed = hasBinding && hasTypeMatch;
+        json expectationJson = descriptorExpectationJson(expectation);
+        expectationJson["reflected"] = hasBinding;
+        expectationJson["type_matched"] = hasTypeMatch;
+        expectationJson["match_count"] = matches.size();
+        expectationJson["matches"] = matches;
+        expectationJson["passed"] = passed;
+        expectations.push_back(expectationJson);
+        if (!passed) {
+            failures.push_back({
+                {"set_name", expectation.setName},
+                {"set", expectation.set},
+                {"binding", expectation.binding},
+                {"expected_type", descriptorTypeName(expectation.type)},
+                {"role", expectation.role},
+                {"reason", hasBinding ? "descriptor type mismatch" : "descriptor binding not reflected by compiled shaders"},
+            });
+        }
+    }
+
+    return {
+        {"schema_version", 1},
+        {"reflection_passed", reflectionPassed},
+        {"reflected_binding_occurrence_count", reflectedBindings.size()},
+        {"reflected_unique_binding_count", summaries.size()},
+        {"reflected_descriptor_set_count", reflectedSets.size()},
+        {"reflected_descriptor_bindings", reflectedBindingRows},
+        {"known_set_expectation_count", rendererDescriptorExpectations().size()},
+        {"known_set_expectations", expectations},
+        {"failure_count", failures.size()},
+        {"failures", failures},
+        {"passed", reflectionPassed && !reflectedBindings.empty() && failures.empty()},
+        {"notes", json::array({
+            "Descriptor count 0 is used by SPIR-V reflection for runtime-sized descriptor arrays.",
+            "This audit verifies the renderer's documented ray tracing and bindless descriptor contracts against compiled SPIR-V.",
+        })},
+    };
+}
+
+json descriptorWriteRecordJson(const DescriptorWriteDiagnosticRecord& record) {
+    return {
+        {"sequence", record.sequence},
+        {"descriptor_set", record.descriptorSet},
+        {"descriptor_set_layout", record.descriptorSetLayout},
+        {"binding", record.binding},
+        {"array_element", record.arrayElement},
+        {"count", record.count},
+        {"type", descriptorTypeName(record.type)},
+        {"kind", record.kind},
+        {"source", record.source},
+        {"owner", record.owner},
+        {"pass", record.pass},
+        {"set_name", record.setName},
+        {"set_index", record.setIndex},
+    };
+}
+
+json descriptorWriteAggregateJson(const DescriptorWriteDiagnosticAggregate& aggregate) {
+    return {
+        {"descriptor_set_layout", aggregate.descriptorSetLayout},
+        {"binding", aggregate.binding},
+        {"type", descriptorTypeName(aggregate.type)},
+        {"kind", aggregate.kind},
+        {"source", aggregate.source},
+        {"owner", aggregate.owner},
+        {"pass", aggregate.pass},
+        {"set_name", aggregate.setName},
+        {"set_index", aggregate.setIndex},
+        {"min_count", aggregate.minCount},
+        {"max_count", aggregate.maxCount},
+        {"occurrence_count", aggregate.occurrenceCount},
+    };
+}
+
+json descriptorWriteDiagnosticsJson(const DescriptorWriteDiagnosticsSnapshot& snapshot) {
+    json recentWrites = json::array();
+    for (const DescriptorWriteDiagnosticRecord& record : snapshot.recentWrites) {
+        recentWrites.push_back(descriptorWriteRecordJson(record));
+    }
+    json aggregates = json::array();
+    for (const DescriptorWriteDiagnosticAggregate& aggregate : snapshot.aggregates) {
+        aggregates.push_back(descriptorWriteAggregateJson(aggregate));
+    }
+    return {
+        {"schema_version", 1},
+        {"update_call_count", snapshot.updateCallCount},
+        {"write_count", snapshot.writeCount},
+        {"unique_write_count", snapshot.aggregates.size()},
+        {"recent_write_limit", snapshot.recentWriteLimit},
+        {"dropped_recent_write_count", snapshot.droppedRecentWriteCount},
+        {"recent_writes", recentWrites},
+        {"unique_writes", aggregates},
+    };
+}
+
+json actualDescriptorWriteAuditJson(const DescriptorWriteDiagnosticsSnapshot& snapshot) {
+    json expectations = json::array();
+    json failures = json::array();
+    for (const DescriptorExpectation& expectation : rendererDescriptorExpectations()) {
+        bool matched = false;
+        uint64_t matchCount = 0;
+        uint64_t occurrenceCount = 0;
+        json matches = json::array();
+        for (const DescriptorWriteDiagnosticAggregate& aggregate : snapshot.aggregates) {
+            if (aggregate.binding != expectation.binding ||
+                aggregate.type != expectation.type ||
+                aggregate.setName != expectation.setName) {
+                continue;
+            }
+            matched = true;
+            ++matchCount;
+            occurrenceCount += aggregate.occurrenceCount;
+            matches.push_back(descriptorWriteAggregateJson(aggregate));
+        }
+
+        json expectationJson = descriptorExpectationJson(expectation);
+        expectationJson["actual_write_matched"] = matched;
+        expectationJson["match_count"] = matchCount;
+        expectationJson["occurrence_count"] = occurrenceCount;
+        expectationJson["matches"] = matches;
+        expectationJson["passed"] = matched;
+        expectations.push_back(expectationJson);
+        if (!matched) {
+            failures.push_back({
+                {"set_name", expectation.setName},
+                {"set", expectation.set},
+                {"binding", expectation.binding},
+                {"expected_type", descriptorTypeName(expectation.type)},
+                {"role", expectation.role},
+                {"reason", "expected descriptor binding was not observed in actual descriptor writes"},
+            });
+        }
+    }
+    return {
+        {"schema_version", 1},
+        {"write_count", snapshot.writeCount},
+        {"unique_write_count", snapshot.aggregates.size()},
+        {"known_set_expectation_count", rendererDescriptorExpectations().size()},
+        {"known_set_expectations", expectations},
+        {"failure_count", failures.size()},
+        {"failures", failures},
+        {"passed", snapshot.writeCount > 0 && failures.empty()},
+        {"notes", json::array({
+            "This audit is based on actual Vulkan descriptor updates recorded through DescriptorWriter and BindlessTextureHeap.",
+            "Expected bindings must match explicit owner-provided descriptor set names.",
+        })},
+    };
+}
+
+json reflectedPushConstantJson(const ReflectedPushConstant& pushConstant) {
+    return {
+        {"offset", pushConstant.offset},
+        {"size", pushConstant.size},
+        {"stage_flags", pushConstant.stages},
+        {"stages", shaderStageFlagsName(pushConstant.stages)},
+    };
+}
+
 json renderGraphOrEmpty(const std::optional<std::filesystem::path>& path) {
     if (!path.has_value() || !std::filesystem::exists(*path)) {
         return json::object();
@@ -824,14 +1197,35 @@ ImageDiffMetrics compareImages(
 int compareImageCommand(
     const std::filesystem::path& baselinePath,
     const std::filesystem::path& currentPath,
-    const std::optional<std::filesystem::path>& diffOutputPath) {
+    const std::optional<std::filesystem::path>& diffOutputPath,
+    const ImageCompareThresholds& thresholds) {
     const ImageDiffMetrics metrics = compareImages(baselinePath, currentPath, diffOutputPath);
     json result = imageMetricsJson(metrics);
     if (diffOutputPath.has_value()) {
         result["diff_image"] = diffOutputPath->string();
     }
+    std::vector<std::string> failures;
+    if (thresholds.minPsnr.has_value() && metrics.psnr < *thresholds.minPsnr) {
+        failures.push_back("psnr below threshold");
+    }
+    if (thresholds.minSsim.has_value() && metrics.ssim < *thresholds.minSsim) {
+        failures.push_back("ssim below threshold");
+    }
+    if (thresholds.maxChangedPixelPercentage.has_value() &&
+        metrics.changedPixelPercentage > *thresholds.maxChangedPixelPercentage) {
+        failures.push_back("changed pixel percentage above threshold");
+    }
+    result["status"] = failures.empty() ? "pass" : "fail";
+    result["failures"] = failures;
+    result["thresholds"] = {
+        {"min_psnr", thresholds.minPsnr.has_value() ? json(*thresholds.minPsnr) : json(nullptr)},
+        {"min_ssim", thresholds.minSsim.has_value() ? json(*thresholds.minSsim) : json(nullptr)},
+        {"max_changed_pixel_percentage", thresholds.maxChangedPixelPercentage.has_value()
+            ? json(*thresholds.maxChangedPixelPercentage)
+            : json(nullptr)},
+    };
     std::cout << result.dump(2) << "\n";
-    return 0;
+    return failures.empty() ? 0 : 1;
 }
 
 SequenceComparisonReport compareImageSequences(
@@ -1389,6 +1783,13 @@ void writeShaderReport(
     const std::filesystem::path& shaderSourceDir,
     const std::filesystem::path& shaderOutputDir) {
     json shaders = json::array();
+    json reflectionFailures = json::array();
+    uint32_t shaderCount = 0;
+    uint32_t spirvPresentCount = 0;
+    uint32_t reflectedShaderCount = 0;
+    uint32_t totalDescriptorBindingCount = 0;
+    uint32_t totalPushConstantRangeCount = 0;
+    std::vector<ReflectedBindingRecord> reflectedBindingRecords;
     if (std::filesystem::exists(shaderSourceDir)) {
         for (const auto& entry : std::filesystem::directory_iterator(shaderSourceDir)) {
             if (!entry.is_regular_file()) {
@@ -1399,6 +1800,7 @@ void writeShaderReport(
             if (ext != ".rgen" && ext != ".rchit" && ext != ".rahit" && ext != ".rmiss" && ext != ".comp" && ext != ".vert" && ext != ".frag") {
                 continue;
             }
+            ++shaderCount;
             const std::filesystem::path spirv = shaderOutputDir / (source.filename().string() + ".spv");
             json shader = {
                 {"source", source.string()},
@@ -1412,16 +1814,80 @@ void writeShaderReport(
                 {"compile_time_ms", nullptr},
                 {"hash", nullptr},
                 {"spirv_size_bytes", 0},
+                {"reflection", {
+                    {"available", false},
+                    {"descriptor_binding_count", 0},
+                    {"push_constant_range_count", 0},
+                    {"bindings", json::array()},
+                    {"descriptor_sets", json::object()},
+                    {"push_constants", json::array()},
+                    {"error", nullptr},
+                }},
             };
             if (std::filesystem::exists(spirv)) {
                 const std::vector<unsigned char> bytes = readBinary(spirv);
                 shader["hash"] = hexHashBytes(bytes);
                 shader["spirv_size_bytes"] = bytes.size();
+                ++spirvPresentCount;
+                try {
+                    const ShaderReflectionData reflection = ShaderReflection::reflect(bytesToWords(bytes));
+                    json bindingRows = json::array();
+                    json descriptorSets = json::object();
+                    for (const ReflectedBinding& binding : reflection.bindings) {
+                        reflectedBindingRecords.push_back({binding, source.string()});
+                        json bindingRow = reflectedBindingJson(binding);
+                        bindingRows.push_back(bindingRow);
+                        descriptorSets[std::to_string(binding.set)].push_back(std::move(bindingRow));
+                    }
+                    json pushRows = json::array();
+                    for (const ReflectedPushConstant& pushConstant : reflection.pushConstants) {
+                        pushRows.push_back(reflectedPushConstantJson(pushConstant));
+                    }
+                    shader["reflection"] = {
+                        {"available", true},
+                        {"stage", shaderStageFlagsName(static_cast<VkShaderStageFlags>(reflection.stage))},
+                        {"stage_flags", static_cast<uint32_t>(reflection.stage)},
+                        {"descriptor_binding_count", reflection.bindings.size()},
+                        {"push_constant_range_count", reflection.pushConstants.size()},
+                        {"bindings", std::move(bindingRows)},
+                        {"descriptor_sets", std::move(descriptorSets)},
+                        {"push_constants", std::move(pushRows)},
+                        {"error", nullptr},
+                    };
+                    ++reflectedShaderCount;
+                    totalDescriptorBindingCount += static_cast<uint32_t>(reflection.bindings.size());
+                    totalPushConstantRangeCount += static_cast<uint32_t>(reflection.pushConstants.size());
+                } catch (const std::exception& e) {
+                    shader["reflection"]["error"] = e.what();
+                    reflectionFailures.push_back({
+                        {"source", source.string()},
+                        {"spirv", spirv.string()},
+                        {"error", e.what()},
+                    });
+                }
             }
             shaders.push_back(shader);
         }
     }
-    writeJsonFile(outputPath, {{"shaders", shaders}});
+    const json reflectionValidation = {
+        {"schema_version", 1},
+        {"shader_count", shaderCount},
+        {"spirv_present_count", spirvPresentCount},
+        {"reflected_shader_count", reflectedShaderCount},
+        {"descriptor_binding_count", totalDescriptorBindingCount},
+        {"push_constant_range_count", totalPushConstantRangeCount},
+        {"failure_count", reflectionFailures.size()},
+        {"failures", reflectionFailures},
+        {"passed", shaderCount > 0 && spirvPresentCount > 0 && reflectedShaderCount == spirvPresentCount && reflectionFailures.empty()},
+    };
+    const json descriptorAudit = descriptorReflectionAuditJson(
+        reflectedBindingRecords,
+        reflectionValidation.value("passed", false));
+    writeJsonFile(outputPath, {
+        {"shaders", shaders},
+        {"reflection_validation", reflectionValidation},
+        {"descriptor_audit", descriptorAudit},
+    });
 }
 
 void writeBindingsReport(
@@ -1453,7 +1919,14 @@ void writeBindingsReport(
             {"binding_0", "full bindless combined image sampler heap"},
         }},
     };
-    writeJsonFile(outputPath, {{"passes", passes}, {"known_descriptor_sets", knownSets}});
+    const DescriptorWriteDiagnosticsSnapshot descriptorWrites = descriptorWriteDiagnosticsSnapshot();
+    writeJsonFile(outputPath, {
+        {"passes", passes},
+        {"known_descriptor_sets", knownSets},
+        {"known_descriptor_binding_expectations", descriptorExpectationsJson()},
+        {"descriptor_write_diagnostics", descriptorWriteDiagnosticsJson(descriptorWrites)},
+        {"actual_descriptor_write_audit", actualDescriptorWriteAuditJson(descriptorWrites)},
+    });
 }
 
 void writeCrashDumpPackage(
@@ -1575,7 +2048,13 @@ int checkBudget(const std::filesystem::path& budgetPath, const ProfileReport& pr
     }
     if (budget.contains("validation_error_count")) {
         const uint64_t maxValidationErrors = bytesFromBudgetValue(budget["validation_error_count"]);
-        if (profile.validationErrorCount > maxValidationErrors) {
+        if (!profile.validationEnabled) {
+            failures.push_back({
+                {"metric", "validation_enabled"},
+                {"actual", false},
+                {"budget", true},
+            });
+        } else if (profile.validationErrorCount > maxValidationErrors) {
             failures.push_back({
                 {"metric", "validation_error_count"},
                 {"actual", profile.validationErrorCount},
@@ -1651,6 +2130,111 @@ int checkBudget(const std::filesystem::path& budgetPath, const ProfileReport& pr
         "require_gpu_crash_dumps_enabled",
         profile.nvidiaIntegrations.gpuCrashDumps.requested && profile.nvidiaIntegrations.gpuCrashDumps.enabled,
         "nvidia_integrations.gpu_crash_dumps.enabled");
+
+    auto counterAt = [](const std::vector<uint64_t>& counters, size_t index) -> uint64_t {
+        return index < counters.size() ? counters[index] : 0ull;
+    };
+    auto addReservoirContractFailure = [&failures](
+                                           const char* metric,
+                                           bool active,
+                                           bool checked,
+                                           uint64_t sourcePdfViolations,
+                                           uint64_t targetPdfViolations,
+                                           uint64_t sourcePdfParityMismatches,
+                                           uint64_t targetPdfParityMismatches,
+                                           uint64_t nonFiniteViolations,
+                                           uint64_t budgetLimit) {
+        const uint64_t violations =
+            sourcePdfViolations +
+            targetPdfViolations +
+            sourcePdfParityMismatches +
+            targetPdfParityMismatches +
+            nonFiniteViolations;
+        if ((active && !checked) || violations > budgetLimit) {
+            failures.push_back({
+                {"metric", metric},
+                {"active", active},
+                {"checked", checked},
+                {"invalid_source_pdf_count", sourcePdfViolations},
+                {"invalid_target_pdf_count", targetPdfViolations},
+                {"source_pdf_parity_mismatch_count", sourcePdfParityMismatches},
+                {"target_pdf_parity_mismatch_count", targetPdfParityMismatches},
+                {"non_finite_count", nonFiniteViolations},
+                {"actual", violations},
+                {"budget", budgetLimit},
+            });
+        }
+    };
+    const bool requireAnyReservoirContract =
+        budget.value("require_restir_reservoir_contract_validation", false);
+    const bool diContractActive =
+        profile.settings.restirDiMode == RestirDiMode::Production ||
+        profile.settings.restirDiMode == RestirDiMode::ReferenceValidation ||
+        profile.settings.restirDiMode == RestirDiMode::HybridCompare;
+    const bool diContractChecked = diContractActive && !profile.restirDiCounters.empty();
+    const uint64_t diContractInvalidSourcePdf = 0ull;
+    const uint64_t diContractInvalidTargetPdf = counterAt(profile.restirDiCounters, 63);
+    const uint64_t diSourcePdfParityMismatch = 0ull;
+    const uint64_t diTargetPdfParityMismatch = 0ull;
+    const uint64_t diContractNonFinite = 0ull;
+    const bool giContractActive =
+        !profile.settings.wavefrontFinalOutputEnabled &&
+        (profile.settings.restirGiMode == RestirGiMode::Production ||
+         profile.settings.restirGiMode == RestirGiMode::ReferenceValidation);
+    const bool giContractChecked = giContractActive && !profile.restirGiCounters.empty();
+    const uint64_t giContractInvalidSourcePdf = counterAt(profile.restirGiCounters, 48);
+    const uint64_t giContractInvalidTargetPdf = counterAt(profile.restirGiCounters, 49);
+    const uint64_t giSourcePdfParityMismatch = counterAt(profile.restirGiCounters, 50);
+    const uint64_t giTargetPdfParityMismatch = counterAt(profile.restirGiCounters, 51);
+    const uint64_t giContractNonFinite = counterAt(profile.restirGiCounters, 45);
+    if (requireAnyReservoirContract || budget.value("require_restir_di_reservoir_contract_validation", false)) {
+        addReservoirContractFailure(
+            "restir_di.reservoir_contract_validation",
+            diContractActive,
+            diContractChecked,
+            diContractInvalidSourcePdf,
+            diContractInvalidTargetPdf,
+            diSourcePdfParityMismatch,
+            diTargetPdfParityMismatch,
+            diContractNonFinite,
+            0ull);
+    }
+    if (requireAnyReservoirContract || budget.value("require_restir_gi_reservoir_contract_validation", false)) {
+        addReservoirContractFailure(
+            "restir_gi.reservoir_contract_validation",
+            giContractActive,
+            giContractChecked,
+            giContractInvalidSourcePdf,
+            giContractInvalidTargetPdf,
+            giSourcePdfParityMismatch,
+            giTargetPdfParityMismatch,
+            giContractNonFinite,
+            0ull);
+    }
+    if (budget.contains("max_restir_di_reservoir_contract_violation_count")) {
+        addReservoirContractFailure(
+            "restir_di.reservoir_contract_validation.violation_count",
+            diContractActive,
+            diContractChecked,
+            diContractInvalidSourcePdf,
+            diContractInvalidTargetPdf,
+            diSourcePdfParityMismatch,
+            diTargetPdfParityMismatch,
+            diContractNonFinite,
+            bytesFromBudgetValue(budget["max_restir_di_reservoir_contract_violation_count"]));
+    }
+    if (budget.contains("max_restir_gi_reservoir_contract_violation_count")) {
+        addReservoirContractFailure(
+            "restir_gi.reservoir_contract_validation.violation_count",
+            giContractActive,
+            giContractChecked,
+            giContractInvalidSourcePdf,
+            giContractInvalidTargetPdf,
+            giSourcePdfParityMismatch,
+            giTargetPdfParityMismatch,
+            giContractNonFinite,
+            bytesFromBudgetValue(budget["max_restir_gi_reservoir_contract_violation_count"]));
+    }
     if (budget.value("require_no_streaming_uploads", false)) {
         const uint64_t streamingUploads =
             profile.textureDiagnostics.is_object() &&

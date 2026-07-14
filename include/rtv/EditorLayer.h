@@ -220,6 +220,7 @@ private:
     bool createDefaultScene_ = true;
     bool createDefaultContentFolders_ = true;
     int appliedThemePreset_ = -1;
+    float appliedUiScale_ = -1.0f;
     int appliedWorkspacePreset_ = -1;
 };
 

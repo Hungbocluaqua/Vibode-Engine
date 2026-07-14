@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <unordered_map>
 #include <vector>
 
 namespace rtv {
@@ -113,27 +114,27 @@ public:
     // Returns the completed timeline value.
     uint64_t poll();
 
-    // -- Async compute integration (Phase 9) --
+    enum class ComputeTimelineOwnership {
+        Borrowed,
+        Owned,
+    };
 
-    // Configure a separate compute queue for async-compute streaming work.
-    // When set and async compute is desired, certain operations (BLAS compaction
-    // queries, compute-shader decompression, mip generation) can be recorded on
-    // this queue instead of the transfer queue.
-    void setComputeQueue(VkQueue queue, uint32_t familyIndex, VkSemaphore timelineSemaphore);
-    [[nodiscard]] bool hasAsyncComputeQueue() const { return computeQueue_ != VK_NULL_HANDLE; }
+    // Configure a queue and timeline semaphore used only for dependency markers.
+    // Borrowed semaphores remain caller-owned and valid until reconfiguration or
+    // shutdown; Owned semaphores are destroyed by the executor after its final
+    // marker. The compute timeline must be distinct from the transfer timeline.
+    [[nodiscard]] bool setComputeQueue(
+        VkQueue queue,
+        VkSemaphore timelineSemaphore,
+        ComputeTimelineOwnership ownership);
+    [[nodiscard]] bool hasAsyncComputeQueue() const {
+        return computeQueue_ != VK_NULL_HANDLE && computeTimeline_ != VK_NULL_HANDLE;
+    }
 
-    // Submit any pending compute-queue work (e.g. compute-shader decompression
-    // dispatched via stageComputeShaderDispatch). Waits for `waitTimelineValue`
-    // on the transfer timeline, signals `signalTimelineValue` on the compute
-    // timeline when complete. Returns the compute submission's timeline value
-    // (the signaled value), or 0 if no compute work was pending.
-    uint64_t submitComputeFrame(uint64_t waitTimelineValue);
-
-    // Record a compute-shader dispatch for async execution. The pipeline must
-    // already be bound externally via helper; this records the dispatch command
-    // into the open compute batch. Returns false if no compute queue is configured.
-    [[nodiscard]] bool recordComputeDispatch(VkCommandBuffer externalCommandBuffer,
-                                              uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
+    // Submit a semaphore-only dependency marker. It waits for
+    // `waitTimelineValue` on the transfer timeline and signals the next value on
+    // the compute timeline. No command buffer or compute work is submitted.
+    uint64_t submitComputeTimelineMarker(uint64_t waitTimelineValue);
 
     [[nodiscard]] uint64_t nextTimelineValue() const { return nextTimelineValue_; }
     [[nodiscard]] Stats stats() const;
@@ -154,6 +155,10 @@ private:
         VkQueryPool queryPool = VK_NULL_HANDLE;
         uint64_t timelineValue = 0;
     };
+    struct TrackedImageLayouts {
+        VkImage image = VK_NULL_HANDLE;
+        std::vector<VkImageLayout> mips;
+    };
 
     [[nodiscard]] VkCommandBuffer beginBatch();
     [[nodiscard]] VkCommandBuffer beginGraphicsBatch();
@@ -168,12 +173,13 @@ private:
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     uint32_t graphicsQueueFamily_ = UINT32_MAX;
     VkQueue computeQueue_ = VK_NULL_HANDLE;
-    uint32_t computeQueueFamily_ = UINT32_MAX;
     VkSemaphore computeTimeline_ = VK_NULL_HANDLE;
+    bool computeTimelineOwned_ = false;
     uint64_t nextComputeTimelineValue_ = 1;
+    uint64_t submittedComputeTimeline_ = 0;
+    uint64_t completedComputeTimeline_ = 0;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     VkCommandPool graphicsCommandPool_ = VK_NULL_HANDLE;
-    VkCommandPool computeCommandPool_ = VK_NULL_HANDLE;
     VkSemaphore timeline_ = VK_NULL_HANDLE;
     uint64_t nextTimelineValue_ = 1;
     uint64_t submittedTimeline_ = 0;
@@ -188,11 +194,10 @@ private:
     std::vector<PendingCompactionQuery> openGraphicsCompactionQueries_;
     std::vector<PendingCompactionQuery> pendingCompactionQueries_;
     std::vector<std::pair<const AccelerationStructure*, uint64_t>> compactedBlasSizes_;
+    std::unordered_map<const Image*, TrackedImageLayouts> imageLayouts_;
     std::deque<InFlightBatch> inFlight_;
     std::vector<VkCommandBuffer> freeCommandBuffers_;
     std::vector<VkCommandBuffer> freeGraphicsCommandBuffers_;
-    std::deque<InFlightBatch> computeInFlight_;
-    std::vector<VkCommandBuffer> freeComputeCommandBuffers_;
 
     uint32_t totalSubmissions_ = 0;
     uint32_t totalBufferCopies_ = 0;

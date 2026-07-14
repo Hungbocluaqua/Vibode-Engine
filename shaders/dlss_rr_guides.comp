@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "temporal_common.glsl"
+#include "psr_guides.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -84,6 +85,8 @@ layout(set = 0, binding = 20, std140) uniform Camera {
     vec4 clip_controls;
 } camera;
 layout(set = 0, binding = 21, r32f) readonly uniform image2D adaptive_filled_mask;
+layout(set = 0, binding = 22, std430) readonly buffer PsrGuideBuffer { PsrGuideRecord psr_guide_buffer[]; };
+layout(set = 0, binding = 23, std430) readonly buffer PreviousPsrGuideSignatureBuffer { uint previous_psr_guide_signature_buffer[]; };
 
 const float WORLD_POSITION_PACK_RANGE = 64.0;
 
@@ -207,6 +210,25 @@ float disocclusion_mask(ivec2 coords, ivec2 dims, bool surface, vec2 currentToPr
     return 0.0;
 }
 
+float psr_disocclusion_mask(ivec2 coords, ivec2 dims, bool psrActive, PsrGuideRecord guide, vec2 currentToPreviousPixels) {
+    if (!psrActive) {
+        return 0.0;
+    }
+    if (params.reset_history != 0u) {
+        return 1.0;
+    }
+    if (temporal_velocity_pixels_are_invalid(currentToPreviousPixels, params.velocity_scale)) {
+        return 1.0;
+    }
+    vec2 historyPos = vec2(coords) - currentToPreviousPixels;
+    if (!temporal_history_pixel_valid(historyPos, dims, 0.0)) {
+        return 1.0;
+    }
+    ivec2 historyCoords = clamp(ivec2(round(historyPos)), ivec2(0), dims - ivec2(1));
+    uint historyIndex = uint(historyCoords.y) * uint(dims.x) + uint(historyCoords.x);
+    return previous_psr_guide_signature_buffer[historyIndex] == psr_guide_signature(guide) ? 0.0 : 1.0;
+}
+
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dims = ivec2(int(params.render_width), int(params.render_height));
@@ -224,6 +246,8 @@ void main() {
     }
 
     PathDataRecord path = path_data_buffer[pixelIndex];
+    PsrGuideRecord psrGuide = psr_guide_buffer[pixelIndex];
+    bool psrActive = surface && psr_guide_active(psrGuide);
     vec3 normal = surface ? decode_octahedral_normal(packedDepthNormal.y) : vec3(0.0, 0.0, 1.0);
     float roughness = surface ? clamp(path.albedo_roughness_hit_confidence.w, 0.001, 1.0) : 1.0;
     vec3 diffuseAlbedo = surface ? clamp(path.albedo_roughness_hit_confidence.rgb, 0.0, 1.0) : vec3(0.5);
@@ -231,8 +255,17 @@ void main() {
     float primaryHitDistance = path.direct_specular.a;
     float diffuseHitDistance = surface ? guide_hit_distance(path.denoiser_hit_distance.x, primaryHitDistance) : 0.0;
     float specularHitDistance = surface ? guide_hit_distance(path.denoiser_hit_distance.y, primaryHitDistance) : 0.0;
+    if (psrActive) {
+        linearDepth = clamp(psrGuide.distances.y, 0.0, 65504.0);
+        normal = psr_guide_normal(psrGuide);
+        roughness = clamp(psr_guide_roughness(psrGuide), 0.001, 1.0);
+        diffuseAlbedo = psr_guide_diffuse_albedo(psrGuide);
+        specularAlbedo = psr_guide_specular_f0(psrGuide);
+        specularHitDistance = max(psrGuide.distances.x, 0.0);
+    }
 
-    vec2 currentToPreviousPixels = temporal_unpack_velocity_pixels(velocity_buffer[pixelIndex], params.velocity_scale);
+    uint packedGuideVelocity = psrActive ? psrGuide.geometry.w : velocity_buffer[pixelIndex];
+    vec2 currentToPreviousPixels = temporal_unpack_velocity_pixels(packedGuideVelocity, params.velocity_scale);
     vec2 previousMinusCurrentPixels = temporal_velocity_pixels_are_invalid(currentToPreviousPixels, params.velocity_scale)
         ? vec2(0.0)
         : -currentToPreviousPixels;
@@ -242,8 +275,16 @@ void main() {
     vec3 specularRayDirection = surface ? guide_direction(reflect(fallbackRayDirection, orientedNormal), fallbackRayDirection) : fallbackRayDirection;
     float diffuseRayDirectionHitDistance = surface ? diffuseHitDistance : 0.0;
     float specularRayDirectionHitDistance = surface ? specularHitDistance : 0.0;
+    if (psrActive) {
+        diffuseRayDirection = normal;
+        specularRayDirection = psr_guide_ray_direction(psrGuide);
+        diffuseRayDirectionHitDistance = max(psrGuide.distances.x, 0.0);
+        specularRayDirectionHitDistance = max(psrGuide.distances.x, 0.0);
+    }
     float disocclusion = max(
         disocclusion_mask(coords, dims, surface, currentToPreviousPixels),
+        psr_disocclusion_mask(coords, dims, psrActive, psrGuide, currentToPreviousPixels));
+    disocclusion = max(disocclusion,
         clamp(path.emissive_residual.a, 0.0, 1.0));
     if (adaptive_sample_count_enabled()) {
         disocclusion = max(disocclusion, clamp(imageLoad(adaptive_filled_mask, coords).r, 0.0, 1.0));
@@ -257,7 +298,8 @@ void main() {
     imageStore(output_roughness, coords, vec4(roughness, 0.0, 0.0, 0.0));
     imageStore(output_diffuse_hit_distance, coords, vec4(diffuseHitDistance, 0.0, 0.0, 0.0));
     imageStore(output_specular_hit_distance, coords, vec4(specularHitDistance, 0.0, 0.0, 0.0));
-    imageStore(output_reflected_albedo, coords, vec4(specularAlbedo, 1.0));
+    imageStore(output_reflected_albedo, coords,
+        vec4(psrActive ? diffuseAlbedo : specularAlbedo, 1.0));
     imageStore(output_disocclusion_mask, coords, vec4(disocclusion, 0.0, 0.0, 0.0));
     imageStore(output_diffuse_ray_direction, coords, vec4(diffuseRayDirection, 1.0));
     imageStore(output_specular_ray_direction, coords, vec4(specularRayDirection, 1.0));

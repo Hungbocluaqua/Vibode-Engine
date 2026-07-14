@@ -24,10 +24,14 @@ layout(set = 0, binding = 61, std140) uniform RestirDiRaygenParams {
     float lumClampNeighborMaxFactor;
     float fireflyClamp;
     float productionClampLuminance;
-    uint useFallbackInitial;
+    uint mode;
     uint spatialResultValid;
-    uint lightVersion;
-    uint distributionVersion;
+    uint visibilityRayBudget;
+    uint historyValid;
+    uint materialVisibilityFlags;
+    uint counterEnabled;
+    uint rawOutputIsCurrentSample;
+    float shadowDistanceBias;
 } restir_di_raygen_params;
 
 

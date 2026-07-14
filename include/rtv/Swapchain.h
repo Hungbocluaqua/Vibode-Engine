@@ -24,6 +24,8 @@ public:
 
     [[nodiscard]] VkSwapchainKHR handle() const { return swapchain_; }
     [[nodiscard]] VkFormat format() const { return imageFormat_; }
+    [[nodiscard]] VkImageUsageFlags imageUsage() const { return imageUsage_; }
+    [[nodiscard]] bool supportsImageUsage(VkImageUsageFlags usage) const { return (imageUsage_ & usage) == usage; }
     [[nodiscard]] VkExtent2D extent() const { return extent_; }
     [[nodiscard]] VkImage image(uint32_t index) const { return images_.at(index); }
     [[nodiscard]] VkImageView imageView(uint32_t index) const { return imageViews_.at(index); }
@@ -51,6 +53,7 @@ private:
     bool headless_ = false;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat imageFormat_ = VK_FORMAT_UNDEFINED;
+    VkImageUsageFlags imageUsage_ = 0;
     VkExtent2D extent_{};
     std::vector<VkImage> images_;
     std::vector<VkImageView> imageViews_;

@@ -112,6 +112,13 @@ std::optional<StreamingStagingAllocation> StreamingStagingRing::allocate(uint64_
     return out;
 }
 
+void StreamingStagingRing::flush(uint64_t offset, uint64_t bytes) const {
+    if (buffer_.handle() == VK_NULL_HANDLE || bytes == 0 || offset >= capacityBytes_) {
+        return;
+    }
+    buffer_.flush(std::min(bytes, capacityBytes_ - offset), offset);
+}
+
 uint64_t StreamingStagingRing::retire(uint64_t completedTimeline) {
     uint64_t reclaimed = 0;
     while (!pending_.empty() && pending_.front().timelineValue <= completedTimeline) {

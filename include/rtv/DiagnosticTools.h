@@ -29,6 +29,12 @@ struct ImageDiffMetrics {
     double maxAbsMeanChannelBias = 0.0;
 };
 
+struct ImageCompareThresholds {
+    std::optional<double> minPsnr;
+    std::optional<double> minSsim;
+    std::optional<double> maxChangedPixelPercentage;
+};
+
 struct SequenceMetricSummary {
     uint32_t frameCount = 0;
     double averageMse = 0.0;
@@ -81,7 +87,8 @@ struct BaselinePaths {
 [[nodiscard]] int compareImageCommand(
     const std::filesystem::path& baselinePath,
     const std::filesystem::path& currentPath,
-    const std::optional<std::filesystem::path>& diffOutputPath);
+    const std::optional<std::filesystem::path>& diffOutputPath,
+    const ImageCompareThresholds& thresholds = {});
 
 [[nodiscard]] int compareImageSequenceCommand(
     const std::filesystem::path& baselineDir,

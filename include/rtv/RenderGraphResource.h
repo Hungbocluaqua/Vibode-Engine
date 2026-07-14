@@ -23,6 +23,7 @@ enum class ResourceState : uint8_t {
     ShaderRead,
     ShaderStorage,
     UniformBuffer,
+    RayTracingRead,
     RayTracing,
     ComputeShaderRead,
     ComputeShaderStorage,

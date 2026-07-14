@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rtv/EditorSelection.h"
+#include "rtv/EditorCommands.h"
 #include "rtv/EditorPreferences.h"
 #include "rtv/FrameWorkScheduler.h"
 #include "rtv/GpuUploadTicket.h"
@@ -42,13 +43,13 @@ struct EditorPanelVisibility {
     bool inspector = true;
     bool assetBrowser = true;
     bool renderWorldSettings = false;
-    bool timeline = true;
+    bool timeline = false;
     bool log = true;
-    bool console = false;
+    bool console = true;
     bool materialEditor = false;
     bool renderSettings = true;
     bool debugProfiler = false;
-    bool sceneStats = false;
+    bool sceneStats = true;
     bool gpuDiagnostics = false;
     bool jobCenter = false;
 };
@@ -66,6 +67,9 @@ struct EditorViewportState {
     bool hovered = false;
     bool mouseCaptureActive = false;
     bool leftClicked = false;
+    int activeTool = 0;
+    bool localTransform = false;
+    bool snapEnabled = false;
 };
 
 enum class EditorRenderJobKind : uint32_t {
@@ -601,6 +605,7 @@ struct EditorNativeFileMigrationJobResult {
 struct EditorRequests {
     std::optional<RendererSettings> settings;
     std::optional<AccumulationResetReason> resetAccumulation;
+    std::optional<EditorCommandId> viewportCommand;
     bool newScene = false;
     std::optional<std::filesystem::path> openScene;
     std::optional<std::filesystem::path> saveScene;
@@ -724,7 +729,7 @@ struct EditorRequests {
     std::optional<std::string> removeFavorite;
 };
 
-[[nodiscard]] const std::array<RendererDebugView, 123>& editorDebugViews();
+[[nodiscard]] const std::array<RendererDebugView, 159>& editorDebugViews();
 [[nodiscard]] int editorDebugViewIndex(RendererDebugView view);
 void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& changed);
 void requestSettings(EditorRequests& requests, const RendererSettings& settings);

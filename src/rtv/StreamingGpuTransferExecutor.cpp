@@ -3,6 +3,7 @@
 #include "rtv/AccelerationStructure.h"
 #include "rtv/Buffer.h"
 #include "rtv/Check.h"
+#include "rtv/GpuValidation.h"
 #include "rtv/Image.h"
 #include "rtv/ImageBarrier.h"
 #include "rtv/ResourceAllocator.h"
@@ -102,6 +103,20 @@ void StreamingGpuTransferExecutor::shutdown() {
         waitInfo.pValues = &submittedTimeline_;
         (void)vkWaitSemaphores(device_, &waitInfo, UINT64_MAX);
     }
+    if (computeTimeline_ != VK_NULL_HANDLE && submittedComputeTimeline_ > 0) {
+        VkSemaphoreWaitInfo waitInfo{};
+        waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        waitInfo.semaphoreCount = 1;
+        waitInfo.pSemaphores = &computeTimeline_;
+        waitInfo.pValues = &submittedComputeTimeline_;
+        (void)vkWaitSemaphores(device_, &waitInfo, UINT64_MAX);
+    }
+    const bool computeSharesTransferTimeline = computeTimeline_ == timeline_;
+    if (computeTimelineOwned_ && computeTimeline_ != VK_NULL_HANDLE && !computeSharesTransferTimeline) {
+        vkDestroySemaphore(device_, computeTimeline_, nullptr);
+    }
+    computeTimeline_ = VK_NULL_HANDLE;
+    computeTimelineOwned_ = false;
     if (timeline_ != VK_NULL_HANDLE) {
         vkDestroySemaphore(device_, timeline_, nullptr);
         timeline_ = VK_NULL_HANDLE;
@@ -119,6 +134,7 @@ void StreamingGpuTransferExecutor::shutdown() {
     }
     pendingCompactionQueries_.clear();
     compactedBlasSizes_.clear();
+    imageLayouts_.clear();
     if (commandPool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(device_, commandPool_, nullptr);
         commandPool_ = VK_NULL_HANDLE;
@@ -127,20 +143,10 @@ void StreamingGpuTransferExecutor::shutdown() {
         vkDestroyCommandPool(device_, graphicsCommandPool_, nullptr);
         graphicsCommandPool_ = VK_NULL_HANDLE;
     }
-    if (computeCommandPool_ != VK_NULL_HANDLE) {
-        vkDestroyCommandPool(device_, computeCommandPool_, nullptr);
-        computeCommandPool_ = VK_NULL_HANDLE;
-    }
-    if (computeTimeline_ != VK_NULL_HANDLE) {
-        vkDestroySemaphore(device_, computeTimeline_, nullptr);
-        computeTimeline_ = VK_NULL_HANDLE;
-    }
     stagingRing_ = StreamingStagingRing();
     inFlight_.clear();
-    computeInFlight_.clear();
     freeCommandBuffers_.clear();
     freeGraphicsCommandBuffers_.clear();
-    freeComputeCommandBuffers_.clear();
     openBatch_ = VK_NULL_HANDLE;
     openBatchCopies_ = 0;
     openGraphicsBatch_ = VK_NULL_HANDLE;
@@ -149,6 +155,10 @@ void StreamingGpuTransferExecutor::shutdown() {
     allocator_ = nullptr;
     graphicsQueue_ = VK_NULL_HANDLE;
     graphicsQueueFamily_ = UINT32_MAX;
+    computeQueue_ = VK_NULL_HANDLE;
+    nextComputeTimelineValue_ = 1;
+    submittedComputeTimeline_ = 0;
+    completedComputeTimeline_ = 0;
 }
 
 VkCommandBuffer StreamingGpuTransferExecutor::beginBatch() {
@@ -220,6 +230,7 @@ bool StreamingGpuTransferExecutor::stageBufferUpload(Buffer& destination, const 
         return false;
     }
     std::memcpy(alloc->mapped, src, static_cast<size_t>(bytes));
+    stagingRing_.flush(alloc->offset, bytes);
 
     VkCommandBuffer cmd = beginBatch();
     VkBufferCopy copy{};
@@ -254,11 +265,18 @@ bool StreamingGpuTransferExecutor::stageImageMipUpload(
         return false;
     }
     std::memcpy(alloc->mapped, src, static_cast<size_t>(bytes));
+    stagingRing_.flush(alloc->offset, bytes);
 
     VkCommandBuffer cmd = beginBatch();
+    TrackedImageLayouts& tracked = imageLayouts_[&destination];
+    if (tracked.image != destination.handle() || tracked.mips.size() != destination.mipLevels()) {
+        tracked.image = destination.handle();
+        tracked.mips.assign(destination.mipLevels(), destination.layout());
+    }
+    const VkImageLayout oldMipLayout = tracked.mips[mipLevel];
     barrier::cmdTransitionImage(cmd, {
         .image = destination.handle(),
-        .oldLayout = destination.layout(),
+        .oldLayout = oldMipLayout,
         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .range = barrier::colorRange(mipLevel, 1),
         .srcStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -296,6 +314,7 @@ bool StreamingGpuTransferExecutor::stageImageMipUpload(
         .dstStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .dstAccess = VK_ACCESS_2_MEMORY_READ_BIT,
     });
+    tracked.mips[mipLevel] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     destination.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     ++openBatchCopies_;
@@ -362,11 +381,15 @@ bool StreamingGpuTransferExecutor::stageBlasBuild(const BlasTriangleBuild& build
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
     barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_MEMORY_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+        VK_ACCESS_2_MEMORY_READ_BIT |
+        VK_ACCESS_2_MEMORY_WRITE_BIT;
     VkDependencyInfo dependency{};
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
+    recordManualBarrierEscape("StreamingGpuTransferExecutor", "streaming_blas_build", dependency);
     vkCmdPipelineBarrier2(cmd, &dependency);
 
     if ((build.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR) != 0u) {
@@ -417,14 +440,20 @@ bool StreamingGpuTransferExecutor::stageBlasCompaction(AccelerationStructure& so
 
     VkMemoryBarrier2 barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR;
+    // The dedicated copy stage requires VK_KHR_ray_tracing_maintenance1. The
+    // build stage also covers acceleration-structure copies on baseline KHR RT.
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
     barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_MEMORY_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+        VK_ACCESS_2_MEMORY_READ_BIT |
+        VK_ACCESS_2_MEMORY_WRITE_BIT;
     VkDependencyInfo dependency{};
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
+    recordManualBarrierEscape("StreamingGpuTransferExecutor", "streaming_blas_compaction", dependency);
     vkCmdPipelineBarrier2(cmd, &dependency);
 
     ++openGraphicsBatchOps_;
@@ -496,11 +525,15 @@ bool StreamingGpuTransferExecutor::stageTlasBuild(const TlasBuild& build) {
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
     barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_MEMORY_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+        VK_ACCESS_2_MEMORY_READ_BIT |
+        VK_ACCESS_2_MEMORY_WRITE_BIT;
     VkDependencyInfo dependency{};
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
+    recordManualBarrierEscape("StreamingGpuTransferExecutor", "streaming_tlas_build", dependency);
     vkCmdPipelineBarrier2(cmd, &dependency);
 
     ++openGraphicsBatchOps_;
@@ -522,6 +555,7 @@ uint64_t StreamingGpuTransferExecutor::submitFrame() {
     checkVk(vkEndCommandBuffer(openBatch_), "vkEndCommandBuffer(streaming transfer)");
 
     const uint64_t signalValue = nextTimelineValue_++;
+    const uint64_t waitValue = submittedTimeline_;
 
     VkCommandBufferSubmitInfo cmdInfo{};
     cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
@@ -533,10 +567,20 @@ uint64_t StreamingGpuTransferExecutor::submitFrame() {
     signalInfo.value = signalValue;
     signalInfo.stageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
 
+    VkSemaphoreSubmitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitInfo.semaphore = timeline_;
+    waitInfo.value = waitValue;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
     VkSubmitInfo2 submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
     submit.commandBufferInfoCount = 1;
     submit.pCommandBufferInfos = &cmdInfo;
+    if (waitValue != 0) {
+        submit.waitSemaphoreInfoCount = 1;
+        submit.pWaitSemaphoreInfos = &waitInfo;
+    }
     submit.signalSemaphoreInfoCount = 1;
     submit.pSignalSemaphoreInfos = &signalInfo;
     checkVk(vkQueueSubmit2(queue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit2(streaming transfer)");
@@ -562,6 +606,7 @@ uint64_t StreamingGpuTransferExecutor::submitGraphicsFrame(uint64_t waitTimeline
     checkVk(vkEndCommandBuffer(openGraphicsBatch_), "vkEndCommandBuffer(streaming graphics)");
 
     const uint64_t signalValue = nextTimelineValue_++;
+    const uint64_t orderedWaitTimelineValue = std::max(waitTimelineValue, submittedTimeline_);
 
     VkCommandBufferSubmitInfo cmdInfo{};
     cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
@@ -570,7 +615,7 @@ uint64_t StreamingGpuTransferExecutor::submitGraphicsFrame(uint64_t waitTimeline
     VkSemaphoreSubmitInfo waitInfo{};
     waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     waitInfo.semaphore = timeline_;
-    waitInfo.value = waitTimelineValue;
+    waitInfo.value = orderedWaitTimelineValue;
     waitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     VkSemaphoreSubmitInfo signalInfo{};
@@ -583,7 +628,7 @@ uint64_t StreamingGpuTransferExecutor::submitGraphicsFrame(uint64_t waitTimeline
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
     submit.commandBufferInfoCount = 1;
     submit.pCommandBufferInfos = &cmdInfo;
-    if (waitTimelineValue != 0) {
+    if (orderedWaitTimelineValue != 0) {
         submit.waitSemaphoreInfoCount = 1;
         submit.pWaitSemaphoreInfos = &waitInfo;
     }
@@ -638,6 +683,13 @@ uint64_t StreamingGpuTransferExecutor::submitTimelineMarker() {
     // Submit an empty batch whose only purpose is to advance the device timeline
     // so streaming completion can be gated on real GPU progress (never faked).
     const uint64_t signalValue = nextTimelineValue_++;
+    const uint64_t waitValue = submittedTimeline_;
+
+    VkSemaphoreSubmitInfo waitInfo{};
+    waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    waitInfo.semaphore = timeline_;
+    waitInfo.value = waitValue;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     VkSemaphoreSubmitInfo signalInfo{};
     signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -647,6 +699,10 @@ uint64_t StreamingGpuTransferExecutor::submitTimelineMarker() {
 
     VkSubmitInfo2 submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    if (waitValue != 0) {
+        submit.waitSemaphoreInfoCount = 1;
+        submit.pWaitSemaphoreInfos = &waitInfo;
+    }
     submit.signalSemaphoreInfoCount = 1;
     submit.pSignalSemaphoreInfos = &signalInfo;
     checkVk(vkQueueSubmit2(queue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit2(streaming transfer marker)");
@@ -658,17 +714,14 @@ uint64_t StreamingGpuTransferExecutor::submitTimelineMarker() {
 
 void StreamingGpuTransferExecutor::recycleCompleted(uint64_t completedTimeline) {
     while (!inFlight_.empty() && inFlight_.front().timelineValue <= completedTimeline) {
-        if (inFlight_.front().graphics) {
-            freeGraphicsCommandBuffers_.push_back(inFlight_.front().commandBuffer);
-        } else {
-            freeCommandBuffers_.push_back(inFlight_.front().commandBuffer);
+        if (inFlight_.front().commandBuffer != VK_NULL_HANDLE) {
+            if (inFlight_.front().graphics) {
+                freeGraphicsCommandBuffers_.push_back(inFlight_.front().commandBuffer);
+            } else {
+                freeCommandBuffers_.push_back(inFlight_.front().commandBuffer);
+            }
         }
         inFlight_.pop_front();
-    }
-    // Recycle completed compute-queue command buffers.
-    while (!computeInFlight_.empty() && computeInFlight_.front().timelineValue <= completedTimeline) {
-        freeComputeCommandBuffers_.push_back(computeInFlight_.front().commandBuffer);
-        computeInFlight_.pop_front();
     }
     (void)stagingRing_.retire(completedTimeline);
     auto queryOut = pendingCompactionQueries_.begin();
@@ -712,78 +765,90 @@ uint64_t StreamingGpuTransferExecutor::poll() {
     if (device_ == VK_NULL_HANDLE || timeline_ == VK_NULL_HANDLE) {
         return 0;
     }
-    uint64_t value = 0;
-    if (vkGetSemaphoreCounterValue(device_, timeline_, &value) != VK_SUCCESS) {
-        return completedTimeline_;
+    uint64_t transferValue = 0;
+    if (vkGetSemaphoreCounterValue(device_, timeline_, &transferValue) == VK_SUCCESS) {
+        completedTimeline_ = transferValue;
+        recycleCompleted(transferValue);
     }
-    completedTimeline_ = value;
-    recycleCompleted(value);
-    return value;
+    if (computeTimeline_ != VK_NULL_HANDLE) {
+        uint64_t computeValue = 0;
+        if (vkGetSemaphoreCounterValue(device_, computeTimeline_, &computeValue) == VK_SUCCESS) {
+            completedComputeTimeline_ = computeValue;
+        }
+    }
+    return completedTimeline_;
 }
 
-void StreamingGpuTransferExecutor::setComputeQueue(VkQueue queue, uint32_t familyIndex, VkSemaphore timelineSemaphore) {
+bool StreamingGpuTransferExecutor::setComputeQueue(
+    VkQueue queue,
+    VkSemaphore timelineSemaphore,
+    ComputeTimelineOwnership ownership) {
+    if ((queue == VK_NULL_HANDLE) != (timelineSemaphore == VK_NULL_HANDLE) ||
+        (timelineSemaphore != VK_NULL_HANDLE && timelineSemaphore == timeline_) ||
+        (device_ == VK_NULL_HANDLE && queue != VK_NULL_HANDLE)) {
+        return false;
+    }
+
+    uint64_t newCompletedTimeline = 0;
+    if (device_ != VK_NULL_HANDLE && timelineSemaphore != VK_NULL_HANDLE &&
+        vkGetSemaphoreCounterValue(device_, timelineSemaphore, &newCompletedTimeline) != VK_SUCCESS) {
+        return false;
+    }
+
+    if (device_ != VK_NULL_HANDLE && computeTimeline_ != VK_NULL_HANDLE &&
+        computeTimeline_ != timelineSemaphore && submittedComputeTimeline_ > completedComputeTimeline_) {
+        VkSemaphoreWaitInfo waitInfo{};
+        waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        waitInfo.semaphoreCount = 1;
+        waitInfo.pSemaphores = &computeTimeline_;
+        waitInfo.pValues = &submittedComputeTimeline_;
+        if (vkWaitSemaphores(device_, &waitInfo, UINT64_MAX) != VK_SUCCESS) {
+            return false;
+        }
+        completedComputeTimeline_ = submittedComputeTimeline_;
+    }
+
+    if (device_ != VK_NULL_HANDLE && computeTimelineOwned_ &&
+        computeTimeline_ != VK_NULL_HANDLE && computeTimeline_ != timelineSemaphore &&
+        computeTimeline_ != timeline_) {
+        vkDestroySemaphore(device_, computeTimeline_, nullptr);
+    }
+
+    const bool sameTimeline = computeTimeline_ == timelineSemaphore && timelineSemaphore != VK_NULL_HANDLE;
     computeQueue_ = queue;
-    computeQueueFamily_ = familyIndex;
     computeTimeline_ = timelineSemaphore;
-    nextComputeTimelineValue_ = 1;
-
-    if (device_ != VK_NULL_HANDLE && queue != VK_NULL_HANDLE && computeCommandPool_ == VK_NULL_HANDLE) {
-        VkCommandPoolCreateInfo poolInfo{};
-        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        poolInfo.queueFamilyIndex = familyIndex;
-        vkCreateCommandPool(device_, &poolInfo, nullptr, &computeCommandPool_);
+    computeTimelineOwned_ = ownership == ComputeTimelineOwnership::Owned &&
+        timelineSemaphore != VK_NULL_HANDLE && timelineSemaphore != timeline_;
+    if (sameTimeline) {
+        completedComputeTimeline_ = std::max(completedComputeTimeline_, newCompletedTimeline);
+        nextComputeTimelineValue_ = std::max(nextComputeTimelineValue_, completedComputeTimeline_ + 1);
+    } else {
+        completedComputeTimeline_ = newCompletedTimeline;
+        submittedComputeTimeline_ = newCompletedTimeline;
+        nextComputeTimelineValue_ = newCompletedTimeline + 1;
     }
-}
-
-bool StreamingGpuTransferExecutor::recordComputeDispatch(VkCommandBuffer externalCommandBuffer,
-                                                          uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ) {
-    if (computeQueue_ == VK_NULL_HANDLE || externalCommandBuffer == VK_NULL_HANDLE) {
-        return false;
-    }
-    if (groupCountX == 0 || groupCountY == 0 || groupCountZ == 0) {
-        return false;
-    }
-    vkCmdDispatch(externalCommandBuffer, groupCountX, groupCountY, groupCountZ);
     return true;
 }
 
-uint64_t StreamingGpuTransferExecutor::submitComputeFrame(uint64_t waitTimelineValue) {
+uint64_t StreamingGpuTransferExecutor::submitComputeTimelineMarker(uint64_t waitTimelineValue) {
     if (device_ == VK_NULL_HANDLE || computeQueue_ == VK_NULL_HANDLE ||
-        computeTimeline_ == VK_NULL_HANDLE || computeCommandPool_ == VK_NULL_HANDLE) {
+        computeTimeline_ == VK_NULL_HANDLE || waitTimelineValue > submittedTimeline_) {
         return 0;
     }
 
-    // Allocate a fresh compute command buffer for this frame.
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = computeCommandPool_;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer computeCmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(device_, &allocInfo, &computeCmd) != VK_SUCCESS) {
+    uint64_t currentComputeTimeline = 0;
+    if (vkGetSemaphoreCounterValue(device_, computeTimeline_, &currentComputeTimeline) != VK_SUCCESS) {
         return 0;
     }
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(computeCmd, &beginInfo);
-
-    // No work recorded yet — this is a placeholder for future compute-shader decompression.
-    // The external caller records dispatches via recordComputeDispatch before submission.
-
-    vkEndCommandBuffer(computeCmd);
-
-    const uint64_t signalValue = nextComputeTimelineValue_++;
+    completedComputeTimeline_ = std::max(completedComputeTimeline_, currentComputeTimeline);
+    const uint64_t signalValue = std::max(nextComputeTimelineValue_, currentComputeTimeline + 1);
 
     // Wait on the transfer timeline.
     VkSemaphoreSubmitInfo waitInfo{};
     waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     waitInfo.semaphore = timeline_;
     waitInfo.value = waitTimelineValue;
-    waitInfo.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     // Signal compute timeline.
     VkSemaphoreSubmitInfo signalInfo{};
@@ -792,32 +857,23 @@ uint64_t StreamingGpuTransferExecutor::submitComputeFrame(uint64_t waitTimelineV
     signalInfo.value = signalValue;
     signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
-    VkCommandBufferSubmitInfo cmdInfo{};
-    cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-    cmdInfo.commandBuffer = computeCmd;
-
     VkSubmitInfo2 submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
     if (waitTimelineValue > 0) {
         submit.waitSemaphoreInfoCount = 1;
         submit.pWaitSemaphoreInfos = &waitInfo;
     }
-    submit.commandBufferInfoCount = 1;
-    submit.pCommandBufferInfos = &cmdInfo;
     submit.signalSemaphoreInfoCount = 1;
     submit.pSignalSemaphoreInfos = &signalInfo;
 
     const VkResult result = vkQueueSubmit2(computeQueue_, 1, &submit, VK_NULL_HANDLE);
     if (result != VK_SUCCESS) {
-        vkFreeCommandBuffers(device_, computeCommandPool_, 1, &computeCmd);
         return 0;
     }
 
-    // Track the compute command buffer for recycling when the timeline is
-    // signaled (freed in poll/recycleCompleted alongside in-flight tracking).
-    computeInFlight_.push_back({signalValue, computeCmd, true});
-    // Also add to the general in-flight tracking so poll() can drain both queues.
-    inFlight_.push_back({signalValue, VK_NULL_HANDLE, true});
+    nextComputeTimelineValue_ = signalValue + 1;
+    submittedComputeTimeline_ = signalValue;
+    ++totalSubmissions_;
 
     return signalValue;
 }
@@ -829,7 +885,10 @@ StreamingGpuTransferExecutor::Stats StreamingGpuTransferExecutor::stats() const 
     out.transferQueueFamily = queueFamily_;
     out.submittedTimeline = submittedTimeline_;
     out.completedTimeline = completedTimeline_;
-    out.inFlightSubmissions = static_cast<uint32_t>(inFlight_.size());
+    const uint64_t pendingComputeMarkers = submittedComputeTimeline_ > completedComputeTimeline_
+        ? submittedComputeTimeline_ - completedComputeTimeline_
+        : 0;
+    out.inFlightSubmissions = static_cast<uint32_t>(inFlight_.size() + pendingComputeMarkers);
     out.totalSubmissions = totalSubmissions_;
     out.totalBufferCopies = totalBufferCopies_;
     out.totalImageCopies = totalImageCopies_;
@@ -921,39 +980,165 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
         return false;
     }
 
-    std::array<uint8_t, 4u * 4u * 4u> imagePattern{};
-    for (size_t i = 0; i < imagePattern.size(); ++i) {
-        imagePattern[i] = static_cast<uint8_t>((i * 17u + 3u) & 0xFFu);
+    struct SelfTestMipUpload {
+        uint32_t mipLevel = 0;
+        uint32_t width = 1;
+        uint32_t height = 1;
+        VkDeviceSize readbackOffset = 0;
+        std::vector<uint8_t> bytes;
+    };
+    std::array<SelfTestMipUpload, 3> mipUploads{{
+        {.mipLevel = 2, .width = 1, .height = 1, .bytes = std::vector<uint8_t>(1u * 1u * 4u)},
+        {.mipLevel = 0, .width = 4, .height = 4, .bytes = std::vector<uint8_t>(4u * 4u * 4u)},
+        {.mipLevel = 1, .width = 2, .height = 2, .bytes = std::vector<uint8_t>(2u * 2u * 4u)},
+    }};
+    for (SelfTestMipUpload& upload : mipUploads) {
+        for (size_t i = 0; i < upload.bytes.size(); ++i) {
+            upload.bytes[i] = static_cast<uint8_t>(
+                (i * 17u + static_cast<size_t>(upload.mipLevel) * 53u + 3u) & 0xFFu);
+        }
+    }
+    constexpr VkDeviceSize kImageCopyOffsetAlignment = 16;
+    VkDeviceSize imageReadbackBytes = 0;
+    for (SelfTestMipUpload& upload : mipUploads) {
+        upload.readbackOffset = Buffer::alignUp(imageReadbackBytes, kImageCopyOffsetAlignment);
+        imageReadbackBytes = upload.readbackOffset + static_cast<VkDeviceSize>(upload.bytes.size());
     }
     Image image(*allocator_, ImageDesc{
         .width = 4,
         .height = 4,
         .depth = 1,
-        .mipLevels = 1,
+        .mipLevels = 3,
         .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT,
         .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         .createDefaultView = true,
         .debugName = "streaming transfer selftest image",
     });
-    if (!stageImageMipUpload(image, imagePattern.data(), imagePattern.size(), 0, 4, 4)) {
-        errorOut = "stageImageMipUpload failed";
-        return false;
+    uint64_t imageTimeline = 0;
+    for (const SelfTestMipUpload& upload : mipUploads) {
+        if (!stageImageMipUpload(
+                image,
+                upload.bytes.data(),
+                upload.bytes.size(),
+                upload.mipLevel,
+                upload.width,
+                upload.height)) {
+            errorOut = "stageImageMipUpload(multi-mip) failed";
+            return false;
+        }
+        const uint64_t mipTimeline = submitFrame();
+        if (mipTimeline == 0 || mipTimeline <= imageTimeline) {
+            errorOut = "multi-mip image uploads did not produce increasing timeline values";
+            return false;
+        }
+        imageTimeline = mipTimeline;
     }
-    const uint64_t imageTimeline = submitFrame();
     VkSemaphoreWaitInfo imageWait{};
     imageWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     imageWait.semaphoreCount = 1;
     imageWait.pSemaphores = &timeline_;
     imageWait.pValues = &imageTimeline;
     if (vkWaitSemaphores(device_, &imageWait, UINT64_MAX) != VK_SUCCESS) {
-        errorOut = "vkWaitSemaphores(image upload) failed";
+        errorOut = "vkWaitSemaphores(multi-mip image uploads) failed";
         return false;
     }
     if (poll() < imageTimeline) {
-        errorOut = "image upload timeline did not complete after wait";
+        errorOut = "multi-mip image upload timeline did not complete after final wait";
         return false;
+    }
+
+    Buffer imageReadback(*allocator_, BufferDesc{
+        .size = imageReadbackBytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::Readback,
+        .persistentMapped = true,
+        .debugName = "streaming transfer selftest image readback",
+    });
+    VkCommandBuffer imageReadbackCmd = beginBatch();
+    std::array<VkBufferImageCopy, 3> imageCopies{};
+    TrackedImageLayouts& imageTrackedLayouts = imageLayouts_[&image];
+    for (size_t i = 0; i < mipUploads.size(); ++i) {
+        const SelfTestMipUpload& upload = mipUploads[i];
+        barrier::cmdTransitionImage(imageReadbackCmd, {
+            .image = image.handle(),
+            .oldLayout = imageTrackedLayouts.mips[upload.mipLevel],
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .range = barrier::colorRange(upload.mipLevel, 1),
+            .srcStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .srcAccess = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .dstStage = VK_PIPELINE_STAGE_2_COPY_BIT,
+            .dstAccess = VK_ACCESS_2_TRANSFER_READ_BIT,
+        });
+        imageTrackedLayouts.mips[upload.mipLevel] = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+        VkBufferImageCopy& imageCopy = imageCopies[i];
+        imageCopy.bufferOffset = upload.readbackOffset;
+        imageCopy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        imageCopy.imageSubresource.mipLevel = upload.mipLevel;
+        imageCopy.imageSubresource.baseArrayLayer = 0;
+        imageCopy.imageSubresource.layerCount = 1;
+        imageCopy.imageExtent = {upload.width, upload.height, 1};
+    }
+    vkCmdCopyImageToBuffer(
+        imageReadbackCmd,
+        image.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        imageReadback.handle(),
+        static_cast<uint32_t>(imageCopies.size()),
+        imageCopies.data());
+    for (const SelfTestMipUpload& upload : mipUploads) {
+        barrier::cmdTransitionImage(imageReadbackCmd, {
+            .image = image.handle(),
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .range = barrier::colorRange(upload.mipLevel, 1),
+            .srcStage = VK_PIPELINE_STAGE_2_COPY_BIT,
+            .srcAccess = VK_ACCESS_2_TRANSFER_READ_BIT,
+            .dstStage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstAccess = VK_ACCESS_2_MEMORY_READ_BIT,
+        });
+        imageTrackedLayouts.mips[upload.mipLevel] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    image.setLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    openBatchCopies_ += static_cast<uint32_t>(imageCopies.size());
+    totalImageCopies_ += static_cast<uint32_t>(imageCopies.size());
+
+    const uint64_t imageReadbackTimeline = submitFrame();
+    if (imageReadbackTimeline <= imageTimeline) {
+        errorOut = "multi-mip image readback did not produce a later timeline value";
+        return false;
+    }
+    VkSemaphoreWaitInfo imageReadbackWait{};
+    imageReadbackWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    imageReadbackWait.semaphoreCount = 1;
+    imageReadbackWait.pSemaphores = &timeline_;
+    imageReadbackWait.pValues = &imageReadbackTimeline;
+    if (vkWaitSemaphores(device_, &imageReadbackWait, UINT64_MAX) != VK_SUCCESS) {
+        errorOut = "vkWaitSemaphores(multi-mip image readback) failed";
+        return false;
+    }
+    if (poll() < imageReadbackTimeline) {
+        errorOut = "multi-mip image readback timeline did not complete after wait";
+        return false;
+    }
+    imageReadback.invalidate(imageReadbackBytes);
+    const uint8_t* imageReadbackData = static_cast<const uint8_t*>(imageReadback.mappedData());
+    if (imageReadbackData == nullptr) {
+        errorOut = "multi-mip image readback buffer not mapped";
+        return false;
+    }
+    for (const SelfTestMipUpload& upload : mipUploads) {
+        if (std::memcmp(
+                imageReadbackData + upload.readbackOffset,
+                upload.bytes.data(),
+                upload.bytes.size()) != 0) {
+            errorOut = "multi-mip image readback bytes did not match uploaded pattern";
+            return false;
+        }
     }
 
     struct SelfTestVertex {
@@ -1046,20 +1231,48 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
         return false;
     }
     const uint64_t blasTimeline = submitTimelineMarker();
-    VkSemaphoreWaitInfo blasWait{};
-    blasWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-    blasWait.semaphoreCount = 1;
-    blasWait.pSemaphores = &timeline_;
-    blasWait.pValues = &blasTimeline;
-    if (blasTimeline == 0 || vkWaitSemaphores(device_, &blasWait, UINT64_MAX) != VK_SUCCESS) {
-        errorOut = "vkWaitSemaphores(BLAS build) failed";
+    if (blasTimeline == 0) {
+        errorOut = "BLAS build did not produce a timeline value";
         return false;
     }
-    if (poll() < blasTimeline) {
-        errorOut = "BLAS build timeline did not complete after wait";
+
+    std::array<uint8_t, 256> postBlasPattern{};
+    for (size_t i = 0; i < postBlasPattern.size(); ++i) {
+        postBlasPattern[i] = static_cast<uint8_t>((i * 29u + 11u) & 0xFFu);
+    }
+    Buffer postBlasTransfer(*allocator_, BufferDesc{
+        .size = postBlasPattern.size(),
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .memory = BufferMemory::GpuOnly,
+        .debugName = "streaming transfer selftest post-BLAS transfer",
+    });
+    if (!stageBufferUpload(postBlasTransfer, postBlasPattern.data(), postBlasPattern.size(), 0)) {
+        errorOut = "stageBufferUpload(post-BLAS transfer) failed";
+        return false;
+    }
+    const uint64_t orderedTransferTimeline = submitFrame();
+    if (orderedTransferTimeline <= blasTimeline) {
+        errorOut = "post-BLAS transfer did not follow the graphics timeline value";
+        return false;
+    }
+    VkSemaphoreWaitInfo orderedWait{};
+    orderedWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    orderedWait.semaphoreCount = 1;
+    orderedWait.pSemaphores = &timeline_;
+    orderedWait.pValues = &orderedTransferTimeline;
+    if (vkWaitSemaphores(device_, &orderedWait, UINT64_MAX) != VK_SUCCESS) {
+        errorOut = "vkWaitSemaphores(transfer-BLAS-transfer chain) failed";
+        return false;
+    }
+    if (poll() < orderedTransferTimeline) {
+        errorOut = "transfer-BLAS-transfer timeline did not complete after final wait";
         return false;
     }
     const uint64_t compactedBlasBytes = consumeCompactedBlasSize(blas);
+    if (compactedBlasBytes == 0) {
+        errorOut = "BLAS compaction-size query was unavailable after the ordered final transfer";
+        return false;
+    }
     AccelerationStructure compactedBlas;
     const AccelerationStructure* tlasBlas = &blas;
     if (compactedBlasBytes != 0 && compactedBlasBytes < static_cast<uint64_t>(blas.size())) {
@@ -1190,6 +1403,55 @@ bool StreamingGpuTransferExecutor::runSelfTest(std::string& errorOut) {
     }
     if (poll() < markerTimeline) {
         errorOut = "timeline marker did not complete after wait";
+        return false;
+    }
+
+    if (!hasAsyncComputeQueue()) {
+        VkSemaphoreTypeCreateInfo computeTimelineInfo{};
+        computeTimelineInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+        computeTimelineInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        computeTimelineInfo.initialValue = 0;
+        VkSemaphoreCreateInfo computeSemaphoreInfo{};
+        computeSemaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        computeSemaphoreInfo.pNext = &computeTimelineInfo;
+        VkSemaphore selfTestComputeTimeline = VK_NULL_HANDLE;
+        if (vkCreateSemaphore(device_, &computeSemaphoreInfo, nullptr, &selfTestComputeTimeline) != VK_SUCCESS) {
+            errorOut = "vkCreateSemaphore(compute self-test timeline) failed";
+            return false;
+        }
+        if (!setComputeQueue(
+                graphicsQueue_,
+                selfTestComputeTimeline,
+                ComputeTimelineOwnership::Owned)) {
+            vkDestroySemaphore(device_, selfTestComputeTimeline, nullptr);
+            errorOut = "setComputeQueue(compute self-test timeline) failed";
+            return false;
+        }
+    }
+    const size_t transferInFlightBeforeCompute = inFlight_.size();
+    const uint64_t computeTimelineValue = submitComputeTimelineMarker(markerTimeline);
+    if (computeTimelineValue == 0) {
+        errorOut = "submitComputeTimelineMarker failed";
+        return false;
+    }
+    VkSemaphoreWaitInfo computeWait{};
+    computeWait.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    computeWait.semaphoreCount = 1;
+    computeWait.pSemaphores = &computeTimeline_;
+    computeWait.pValues = &computeTimelineValue;
+    if (vkWaitSemaphores(device_, &computeWait, UINT64_MAX) != VK_SUCCESS) {
+        errorOut = "vkWaitSemaphores(compute self-test) failed";
+        return false;
+    }
+    (void)poll();
+    if (completedComputeTimeline_ < computeTimelineValue) {
+        errorOut = "compute timeline marker did not complete on its own semaphore";
+        return false;
+    }
+    if (inFlight_.size() != transferInFlightBeforeCompute ||
+        std::find(freeGraphicsCommandBuffers_.begin(), freeGraphicsCommandBuffers_.end(), VK_NULL_HANDLE) !=
+            freeGraphicsCommandBuffers_.end()) {
+        errorOut = "compute completion corrupted transfer/graphics in-flight tracking";
         return false;
     }
 

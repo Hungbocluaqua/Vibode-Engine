@@ -30,9 +30,9 @@ public:
         const std::vector<std::pair<std::string, std::string>>& extraDefines) const;
     [[nodiscard]] std::string compileReason(const std::filesystem::path& source, const std::filesystem::path& output) const;
     [[nodiscard]] static std::vector<uint32_t> readSpirv(const std::filesystem::path& path);
+    [[nodiscard]] std::vector<std::filesystem::path> dependenciesFor(const std::filesystem::path& source) const;
 
 private:
-    [[nodiscard]] std::vector<std::filesystem::path> dependenciesFor(const std::filesystem::path& source) const;
     [[nodiscard]] bool needsCompileWithSignature(
         const std::filesystem::path& source,
         const std::filesystem::path& output,

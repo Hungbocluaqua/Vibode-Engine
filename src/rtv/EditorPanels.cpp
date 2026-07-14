@@ -37,8 +37,8 @@ void debugViewTooltip(RendererDebugView view) {
 
 } // namespace
 
-const std::array<RendererDebugView, 123>& editorDebugViews() {
-    static constexpr std::array<RendererDebugView, 123> views = {
+const std::array<RendererDebugView, 159>& editorDebugViews() {
+    static constexpr std::array<RendererDebugView, 159> views = {
         RendererDebugView::Beauty,
         RendererDebugView::Variance,
         RendererDebugView::Normals,
@@ -118,6 +118,13 @@ const std::array<RendererDebugView, 123>& editorDebugViews() {
         RendererDebugView::RestirGiFinal,
         RendererDebugView::RestirGiNormal,
         RendererDebugView::RestirGiHitDistance,
+        RendererDebugView::RestirGiTarget,
+        RendererDebugView::RestirGiSourcePdf,
+        RendererDebugView::RestirGiWeightSum,
+        RendererDebugView::RestirGiM,
+        RendererDebugView::RestirGiConfidence,
+        RendererDebugView::RestirGiVisibility,
+        RendererDebugView::RestirDiLightMapStatus,
         RendererDebugView::AdaptiveDensityMap,
         RendererDebugView::AdaptiveSampleCount,
         RendererDebugView::AdaptiveUnsampledPixels,
@@ -154,6 +161,35 @@ const std::array<RendererDebugView, 123>& editorDebugViews() {
         RendererDebugView::MomentHistoryKindValid,
         RendererDebugView::DenoiserDiffuseRawVariance,
         RendererDebugView::DenoiserSpecularRawVariance,
+        RendererDebugView::NrdValidation,
+        RendererDebugView::NrdDiffuseConfidence,
+        RendererDebugView::NrdSpecularConfidence,
+        RendererDebugView::NrdRawConfidenceGradient,
+        RendererDebugView::NrdFilteredConfidenceGradient,
+        RendererDebugView::NrdConfidenceHistory,
+        RendererDebugView::PsrActiveMask,
+        RendererDebugView::PsrDepth,
+        RendererDebugView::PsrMotion,
+        RendererDebugView::PsrNormalRoughness,
+        RendererDebugView::PsrHitDistance,
+        RendererDebugView::PsrAlbedoF0,
+        RendererDebugView::PsrRayDirection,
+        RendererDebugView::DlssDepth,
+        RendererDebugView::DlssMotionVectors,
+        RendererDebugView::DlssInputColor,
+        RendererDebugView::DlssOutputColor,
+        RendererDebugView::DlssRrDiffuseAlbedo,
+        RendererDebugView::DlssRrSpecularAlbedo,
+        RendererDebugView::DlssRrNormals,
+        RendererDebugView::DlssRrRoughness,
+        RendererDebugView::DlssRrDiffuseHitDistance,
+        RendererDebugView::DlssRrSpecularHitDistance,
+        RendererDebugView::DlssRrReflectedAlbedo,
+        RendererDebugView::DlssRrDisocclusionMask,
+        RendererDebugView::DlssRrDiffuseRayDirection,
+        RendererDebugView::DlssRrSpecularRayDirection,
+        RendererDebugView::DlssRrDiffuseRayDirectionHitDistance,
+        RendererDebugView::DlssRrSpecularRayDirectionHitDistance,
         RendererDebugView::WavefrontQueueOccupancy,
         RendererDebugView::WavefrontPathDepth,
         RendererDebugView::WavefrontLiveRays,
@@ -241,6 +277,39 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::DenoiserSpecularHistoryLength);
         selectable(RendererDebugView::DenoiserDiffuseRawVariance);
         selectable(RendererDebugView::DenoiserSpecularRawVariance);
+        selectable(RendererDebugView::NrdValidation);
+        selectable(RendererDebugView::NrdDiffuseConfidence);
+        selectable(RendererDebugView::NrdSpecularConfidence);
+        selectable(RendererDebugView::NrdRawConfidenceGradient);
+        selectable(RendererDebugView::NrdFilteredConfidenceGradient);
+        selectable(RendererDebugView::NrdConfidenceHistory);
+
+        ImGui::SeparatorText("Primary Surface Replacement");
+        selectable(RendererDebugView::PsrActiveMask);
+        selectable(RendererDebugView::PsrDepth);
+        selectable(RendererDebugView::PsrMotion);
+        selectable(RendererDebugView::PsrNormalRoughness);
+        selectable(RendererDebugView::PsrHitDistance);
+        selectable(RendererDebugView::PsrAlbedoF0);
+        selectable(RendererDebugView::PsrRayDirection);
+
+        ImGui::SeparatorText("DLSS Guides");
+        selectable(RendererDebugView::DlssDepth);
+        selectable(RendererDebugView::DlssMotionVectors);
+        selectable(RendererDebugView::DlssInputColor);
+        selectable(RendererDebugView::DlssOutputColor);
+        selectable(RendererDebugView::DlssRrDiffuseAlbedo);
+        selectable(RendererDebugView::DlssRrSpecularAlbedo);
+        selectable(RendererDebugView::DlssRrNormals);
+        selectable(RendererDebugView::DlssRrRoughness);
+        selectable(RendererDebugView::DlssRrDiffuseHitDistance);
+        selectable(RendererDebugView::DlssRrSpecularHitDistance);
+        selectable(RendererDebugView::DlssRrReflectedAlbedo);
+        selectable(RendererDebugView::DlssRrDisocclusionMask);
+        selectable(RendererDebugView::DlssRrDiffuseRayDirection);
+        selectable(RendererDebugView::DlssRrSpecularRayDirection);
+        selectable(RendererDebugView::DlssRrDiffuseRayDirectionHitDistance);
+        selectable(RendererDebugView::DlssRrSpecularRayDirectionHitDistance);
 
         ImGui::SeparatorText("Moments");
         selectable(RendererDebugView::MomentUpdateValidity);
@@ -328,6 +397,13 @@ void editorDebugViewCombo(const char* label, RendererSettings& settings, bool& c
         selectable(RendererDebugView::RestirGiFinal);
         selectable(RendererDebugView::RestirGiNormal);
         selectable(RendererDebugView::RestirGiHitDistance);
+        selectable(RendererDebugView::RestirGiTarget);
+        selectable(RendererDebugView::RestirGiSourcePdf);
+        selectable(RendererDebugView::RestirGiWeightSum);
+        selectable(RendererDebugView::RestirGiM);
+        selectable(RendererDebugView::RestirGiConfidence);
+        selectable(RendererDebugView::RestirGiVisibility);
+        selectable(RendererDebugView::RestirDiLightMapStatus);
 
         ImGui::SeparatorText("Wavefront Queue");
         selectable(RendererDebugView::WavefrontQueueOccupancy);

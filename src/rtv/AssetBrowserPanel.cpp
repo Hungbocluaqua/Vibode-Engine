@@ -6816,7 +6816,7 @@ bool AssetBrowserPanel::drawRasterThumbnail(const std::filesystem::path& path, I
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(min, max, IM_COL32(16, 18, 22, 255), EditorUiMetric::cardRounding);
     const ImVec2 innerMin(min.x + 4.0f, min.y + 4.0f);
-    const ImVec2 innerMax(max.x - 4.0f, max.y - 17.0f);
+    const ImVec2 innerMax(max.x - 4.0f, max.y - 4.0f);
     const float cellW = (innerMax.x - innerMin.x) / static_cast<float>(thumbnail.columns);
     const float cellH = (innerMax.y - innerMin.y) / static_cast<float>(thumbnail.rows);
     for (int row = 0; row < thumbnail.rows; ++row) {
@@ -6827,9 +6827,6 @@ bool AssetBrowserPanel::drawRasterThumbnail(const std::filesystem::path& path, I
         }
     }
     dl->AddRect(innerMin, innerMax, IM_COL32(255, 255, 255, 42), 1.0f);
-    const std::string badge = std::to_string(thumbnail.width) + "x" + std::to_string(thumbnail.height);
-    dl->AddRectFilled(ImVec2(min.x + 4.0f, max.y - 15.0f), ImVec2(max.x - 4.0f, max.y - 4.0f), IM_COL32(12, 15, 19, 205), 1.0f);
-    dl->AddText(ImVec2(min.x + 8.0f, max.y - 15.0f), IM_COL32(178, 188, 202, 255), badge.c_str());
     dl->AddRect(min, max, selected ? ImGui::GetColorU32(editorActiveRowColor()) : IM_COL32(54, 62, 72, 255), EditorUiMetric::cardRounding);
     return true;
 }
@@ -6855,11 +6852,9 @@ bool AssetBrowserPanel::drawGpuSceneTextureThumbnail(const EditorRuntimeState& s
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(min, max, IM_COL32(16, 18, 22, 255), EditorUiMetric::cardRounding);
     const ImVec2 imageMin(min.x + 4.0f, min.y + 4.0f);
-    const ImVec2 imageMax(max.x - 4.0f, max.y - 17.0f);
+    const ImVec2 imageMax(max.x - 4.0f, max.y - 4.0f);
     dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<uintptr_t>(texture)), imageMin, imageMax);
     dl->AddRect(imageMin, imageMax, IM_COL32(255, 255, 255, 42), 1.0f);
-    dl->AddRectFilled(ImVec2(min.x + 4.0f, max.y - 15.0f), ImVec2(max.x - 4.0f, max.y - 4.0f), IM_COL32(12, 15, 19, 205), 1.0f);
-    dl->AddText(ImVec2(min.x + 8.0f, max.y - 15.0f), IM_COL32(160, 210, 255, 255), "GPU texture");
     dl->AddRect(min, max, ImGui::GetColorU32(editorActiveRowColor()), EditorUiMetric::cardRounding);
     return true;
 }
@@ -6875,14 +6870,9 @@ bool AssetBrowserPanel::drawStandaloneGpuAssetPreview(const EditorRuntimeState& 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->AddRectFilled(min, max, IM_COL32(16, 18, 22, 255), EditorUiMetric::cardRounding);
     const ImVec2 imageMin(min.x + 4.0f, min.y + 4.0f);
-    const ImVec2 imageMax(max.x - 4.0f, max.y - 17.0f);
+    const ImVec2 imageMax(max.x - 4.0f, max.y - 4.0f);
     dl->AddImage(static_cast<ImTextureID>(reinterpret_cast<uintptr_t>(texture)), imageMin, imageMax);
     dl->AddRect(imageMin, imageMax, IM_COL32(255, 255, 255, 42), 1.0f);
-    dl->AddRectFilled(ImVec2(min.x + 4.0f, max.y - 15.0f), ImVec2(max.x - 4.0f, max.y - 4.0f), IM_COL32(12, 15, 19, 205), 1.0f);
-    const std::string badge = width > 0 && height > 0
-        ? "GPU preview " + std::to_string(width) + "x" + std::to_string(height)
-        : std::string("GPU preview");
-    dl->AddText(ImVec2(min.x + 8.0f, max.y - 15.0f), IM_COL32(160, 210, 255, 255), badge.c_str());
     dl->AddRect(min, max, selected ? ImGui::GetColorU32(editorActiveRowColor()) : IM_COL32(56, 66, 82, 210), EditorUiMetric::cardRounding);
     return true;
 }
@@ -7614,16 +7604,32 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
             const std::filesystem::path path = entry->path;
             const bool selected = selectedPath_ == path;
             ImGui::PushID(path.string().c_str());
-            const ImVec2 thumbSize(EditorUiMetric::contentGridThumbWidth, EditorUiMetric::contentGridThumbHeight);
-            ImGui::InvisibleButton("ContentGridThumb", thumbSize);
-            const ImVec2 thumbMin = ImGui::GetItemRectMin();
-            const ImVec2 thumbMax = ImGui::GetItemRectMax();
+            const ImVec2 cellSize(EditorUiMetric::contentGridCellWidth - 10.0f, EditorUiMetric::contentGridCellHeight);
+            ImGui::InvisibleButton("ContentGridTile", cellSize);
+            const ImVec2 cellMin = ImGui::GetItemRectMin();
+            const ImVec2 cellMax = ImGui::GetItemRectMax();
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(thumbMin, thumbMax, selected ? ImGui::GetColorU32(editorSelectedRowColor()) : IM_COL32(24, 27, 32, 255), EditorUiMetric::cardRounding);
-            dl->AddRect(thumbMin, thumbMax, selected ? ImGui::GetColorU32(editorActiveRowColor()) : IM_COL32(54, 62, 72, 255), EditorUiMetric::cardRounding);
-            if (!drawGpuSceneTextureThumbnail(state, path, thumbMin, thumbMax) &&
-                !drawStandaloneGpuAssetPreview(state, path, thumbMin, thumbMax, selected) &&
-                !drawRasterThumbnail(path, thumbMin, thumbMax, selected)) {
+            const bool hovered = ImGui::IsItemHovered();
+            const ImU32 cellBg = selected
+                ? ImGui::GetColorU32(ImVec4(0.090f, 0.185f, 0.315f, 0.95f))
+                : ImGui::GetColorU32(hovered ? ImVec4(0.105f, 0.125f, 0.150f, 1.0f) : editorCardBgColor());
+            dl->AddRectFilled(cellMin, cellMax, cellBg, EditorUiMetric::cardRounding);
+            dl->AddRect(cellMin, cellMax, selected ? ImGui::GetColorU32(editorAccentColor()) : ImGui::GetColorU32(editorToolbarBorderColor()), EditorUiMetric::cardRounding);
+            const ImVec2 thumbSize(EditorUiMetric::contentGridThumbWidth, EditorUiMetric::contentGridThumbHeight);
+            const ImVec2 thumbMin(
+                cellMin.x + (cellSize.x - thumbSize.x) * 0.5f,
+                cellMin.y + 10.0f);
+            const ImVec2 thumbMax(thumbMin.x + thumbSize.x, thumbMin.y + thumbSize.y);
+            dl->AddRectFilled(thumbMin, thumbMax, IM_COL32(22, 26, 32, 255), EditorUiMetric::cardRounding);
+            dl->AddRect(thumbMin, thumbMax, IM_COL32(54, 62, 72, 255), EditorUiMetric::cardRounding);
+            if (entry->isDirectory) {
+                drawContentGlyph(
+                    path,
+                    ImVec2(thumbMin.x + thumbSize.x * 0.28f, thumbMin.y + thumbSize.y * 0.18f),
+                    ImVec2(thumbMax.x - thumbSize.x * 0.28f, thumbMax.y - thumbSize.y * 0.18f));
+            } else if (!drawGpuSceneTextureThumbnail(state, path, thumbMin, thumbMax) &&
+                       !drawStandaloneGpuAssetPreview(state, path, thumbMin, thumbMax, selected) &&
+                       !drawRasterThumbnail(path, thumbMin, thumbMax, selected)) {
                 drawContentGlyph(
                     path,
                     ImVec2(thumbMin.x + thumbSize.x * 0.34f, thumbMin.y + thumbSize.y * 0.22f),
@@ -7647,7 +7653,17 @@ void AssetBrowserPanel::drawPathList(const EditorRuntimeState& state, EditorRequ
                 drawPathContextMenu(state, path, entry->isDirectory, requests);
                 ImGui::EndPopup();
             }
-            ImGui::TextWrapped("%s%s", selected ? "> " : "", path.filename().string().c_str());
+            std::string label = path.filename().empty() ? path.string() : path.filename().string();
+            const float labelWidth = cellSize.x - 14.0f;
+            while (label.size() > 6 && ImGui::CalcTextSize(label.c_str()).x > labelWidth) {
+                label.erase(label.size() - 4, 1);
+                label.replace(label.size() - 3, 3, "...");
+            }
+            const ImVec2 labelSize = ImGui::CalcTextSize(label.c_str());
+            dl->AddText(
+                ImVec2(cellMin.x + std::max(7.0f, (cellSize.x - labelSize.x) * 0.5f), thumbMax.y + 10.0f),
+                ImGui::GetColorU32(selected ? ImVec4(0.90f, 0.95f, 1.0f, 1.0f) : ImVec4(0.72f, 0.76f, 0.82f, 1.0f)),
+                label.c_str());
             ImGui::NextColumn();
             ImGui::PopID();
         }
@@ -9833,6 +9849,25 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
     syncBrowserRoot(state);
     refreshImportOperations(state);
 
+    if (!presentationPreferencesLoaded_ && state.editorPrefs != nullptr) {
+        viewMode_ = std::clamp(state.editorPrefs->contentBrowserMode, 0, 1);
+        gridView_ = state.editorPrefs->contentBrowserGridView;
+        showDetails_ = state.editorPrefs->contentBrowserShowDetails;
+        presentationPreferencesLoaded_ = true;
+    }
+    auto persistPresentation = [&]() {
+        if (state.editorPrefs == nullptr) {
+            return;
+        }
+        state.editorPrefs->contentBrowserMode = std::clamp(viewMode_, 0, 1);
+        state.editorPrefs->contentBrowserGridView = gridView_;
+        state.editorPrefs->contentBrowserShowDetails = showDetails_;
+        const std::filesystem::path prefsPath = state.editorPreferencesPath.empty()
+            ? EditorPreferences::defaultPath()
+            : state.editorPreferencesPath;
+        (void)state.editorPrefs->save(prefsPath);
+    };
+
     ImGui::BeginGroup();
     if (editorIconButton("ContentAdd", EditorGlyphIcon::Add, false)) {
         ImGui::OpenPopup("ContentAddMenu");
@@ -9879,6 +9914,16 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         ImGui::EndPopup();
     }
     ImGui::SameLine();
+    if (editorToolbarTextButton("ContentBrowseMode", EditorGlyphIcon::Grid, "Browse", viewMode_ == 0)) {
+        viewMode_ = 0;
+        persistPresentation();
+    }
+    ImGui::SameLine();
+    if (editorToolbarTextButton("ContentRegistryMode", EditorGlyphIcon::Details, "Registry", viewMode_ == 1)) {
+        viewMode_ = 1;
+        persistPresentation();
+    }
+    ImGui::SameLine();
     const bool canValidateProject = state.assetRegistry != nullptr;
     if (!canValidateProject) {
         ImGui::BeginDisabled();
@@ -9896,36 +9941,55 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
     if (!canValidateProject) {
         ImGui::EndDisabled();
     }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::InputTextWithHint("##contentFilter", "Filter in selected folder...", search_.data(), search_.size());
-    ImGui::SameLine();
-    ImGui::BeginDisabled(backStack_.empty());
-    if (editorIconButton("ContentBack", EditorGlyphIcon::Back, false)) {
-        forwardStack_.push_back(currentPath_);
-        const std::filesystem::path previous = backStack_.back();
-        backStack_.pop_back();
-        navigateTo(previous, false);
+    if (viewMode_ == 0) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::InputTextWithHint("##contentFilter", "Search assets...", search_.data(), search_.size());
+        ImGui::SameLine();
+        if (editorIconButton("ContentGridView", EditorGlyphIcon::Grid, gridView_)) {
+            gridView_ = true;
+            persistPresentation();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Thumbnail grid");
+        }
+        ImGui::SameLine();
+        if (editorIconButton("ContentListView", EditorGlyphIcon::List, !gridView_)) {
+            gridView_ = false;
+            persistPresentation();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Compact list");
+        }
+        ImGui::SameLine();
+        if (editorIconButton("ContentDetailsToggle", EditorGlyphIcon::Details, showDetails_)) {
+            showDetails_ = !showDetails_;
+            persistPresentation();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("Toggle details");
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(backStack_.empty());
+        if (editorIconButton("ContentBack", EditorGlyphIcon::Back, false)) {
+            forwardStack_.push_back(currentPath_);
+            const std::filesystem::path previous = backStack_.back();
+            backStack_.pop_back();
+            navigateTo(previous, false);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(forwardStack_.empty());
+        if (editorIconButton("ContentForward", EditorGlyphIcon::Forward, false)) {
+            backStack_.push_back(currentPath_);
+            const std::filesystem::path next = forwardStack_.back();
+            forwardStack_.pop_back();
+            navigateTo(next, false);
+        }
+        ImGui::EndDisabled();
     }
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip("Back");
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(forwardStack_.empty());
-    if (editorIconButton("ContentForward", EditorGlyphIcon::Forward, false)) {
-        backStack_.push_back(currentPath_);
-        const std::filesystem::path next = forwardStack_.back();
-        forwardStack_.pop_back();
-        navigateTo(next, false);
-    }
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-        ImGui::SetTooltip("Forward");
-    }
-    showDetails_ = true;
 
-    if (!browserRoot_.empty()) {
+    if (viewMode_ == 0 && !browserRoot_.empty()) {
         ImGui::SameLine();
         ImGui::TextDisabled("|");
         ImGui::SameLine();
@@ -9974,6 +10038,13 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         ImGui::SameLine();
         ImGui::TextDisabled("%s", state.sceneLoadRunning ? "Import / load in progress" : "Last import / load status");
         ImGui::TextWrapped("%s", sceneLoadStatus.c_str());
+    }
+
+    if (viewMode_ == 1) {
+        drawRegistryTable(state, requests);
+        drawImportOperations();
+        ImGui::End();
+        return;
     }
 
     const float browserHeight = ImGui::GetContentRegionAvail().y;
@@ -10138,8 +10209,6 @@ void AssetBrowserPanel::draw(const EditorRuntimeState& state, EditorSelection& s
         ImGui::SameLine();
         ImGui::BeginChild("ContentItems", ImVec2(-(detailsWidth + (showDetails_ ? sectionSpacing : 0.0f)), 0.0f), true);
         drawPathList(state, requests);
-        drawRegistryTable(state, requests);
-        drawImportOperations();
         ImGui::EndChild();
         if (showDetails_) {
             ImGui::SameLine();

@@ -65,6 +65,15 @@ set(NVTX3_INCLUDE_DIR "" CACHE PATH "Path containing nvtx3/nvToolsExt.h")
 set(NSIGHT_GRAPHICS_SDK_DIR "" CACHE PATH "Path to NVIDIA Nsight Graphics SDK")
 set(NSIGHT_AFTERMATH_SDK_DIR "" CACHE PATH "Path to NVIDIA Nsight Aftermath SDK")
 set(NSIGHT_PERF_SDK_DIR "" CACHE PATH "Path to NVIDIA Nsight Perf SDK")
+option(RTV_ENABLE_RTXDI "Enable the native NVIDIA RTXDI runtime" ON)
+set(RTXDI_LIBRARY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/RTXDI-Library" CACHE PATH "Path to the pinned RTXDI-Library checkout")
+
+if(RTV_ENABLE_RTXDI)
+    if(NOT EXISTS "${RTXDI_LIBRARY_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR "RTXDI-Library was not found at ${RTXDI_LIBRARY_DIR}. Initialize third_party/RTXDI-Library at the pinned submodule commit.")
+    endif()
+    add_subdirectory("${RTXDI_LIBRARY_DIR}" "${CMAKE_BINARY_DIR}/rtxdi" EXCLUDE_FROM_ALL)
+endif()
 
 if(NVTX3_INCLUDE_DIR STREQUAL "" AND WIN32)
     file(GLOB NVTX3_CANDIDATES LIST_DIRECTORIES true
@@ -225,6 +234,8 @@ add_executable(rtvulkan
     src/rtv/RenderSettingsPanel.cpp
     src/rtv/RenderGraph.cpp
     src/rtv/RenderGraphDump.cpp
+    src/rtv/RendererCoreRegressionTests.cpp
+    src/rtv/RtxdiRuntime.cpp
     src/rtv/RendererDebug.cpp
     src/rtv/RtpkgIO.cpp
     src/rtv/RuntimeSkeleton.cpp
@@ -275,8 +286,10 @@ add_executable(rtvulkan
 
 if(WIN32)
     set(RTV_GLSLANG_VALIDATOR "$ENV{VULKAN_SDK}/Bin/glslangValidator.exe")
+    set(RTV_DXC "$ENV{VULKAN_SDK}/Bin/dxc.exe")
 else()
     set(RTV_GLSLANG_VALIDATOR "$ENV{VULKAN_SDK}/Bin/glslangValidator")
+    set(RTV_DXC "$ENV{VULKAN_SDK}/Bin/dxc")
 endif()
 if(NOT EXISTS "${RTV_GLSLANG_VALIDATOR}")
     message(FATAL_ERROR "glslangValidator was not found at ${RTV_GLSLANG_VALIDATOR}")
@@ -301,6 +314,37 @@ file(GLOB RTV_SHADER_INCLUDE_FILES CONFIGURE_DEPENDS
     "${RTV_SHADER_SOURCE_DIR}/*.glsl"
 )
 set(RTV_SHADER_OUTPUTS)
+
+if(RTV_ENABLE_RTXDI)
+    if(NOT EXISTS "${RTV_DXC}")
+        message(FATAL_ERROR "DXC was not found at ${RTV_DXC}; native RTXDI SPIR-V compilation requires the Vulkan SDK DXC package.")
+    endif()
+    file(GLOB_RECURSE RTV_RTXDI_SHADER_DEPENDENCIES CONFIGURE_DEPENDS
+        "${RTXDI_LIBRARY_DIR}/Include/Rtxdi/*.h"
+        "${RTXDI_LIBRARY_DIR}/Include/Rtxdi/*.hlsli")
+
+    set(RTV_RTXDI_CONTRACT_SMOKE_SOURCE "${RTV_SHADER_SOURCE_DIR}/rtxdi/rtxdi_contract_smoke.hlsl")
+    set(RTV_RTXDI_CONTRACT_SMOKE_OUTPUT "${RTV_SHADER_OUTPUT_DIR}/rtxdi_contract_smoke.comp.spv")
+    add_custom_command(
+        OUTPUT "${RTV_RTXDI_CONTRACT_SMOKE_OUTPUT}" "${RTV_RTXDI_CONTRACT_SMOKE_OUTPUT}.options"
+        COMMAND ${CMAKE_COMMAND}
+            "-DDXC=${RTV_DXC}"
+            "-DSOURCE=${RTV_RTXDI_CONTRACT_SMOKE_SOURCE}"
+            "-DOUTPUT=${RTV_RTXDI_CONTRACT_SMOKE_OUTPUT}"
+            "-DOUTPUT_DIR=${RTV_SHADER_OUTPUT_DIR}"
+            "-DINCLUDE_DIR=${RTXDI_LIBRARY_DIR}/Include"
+            "-DPROFILE=cs_6_6"
+            "-DENTRY_POINT=main"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileHlslShader.cmake"
+        DEPENDS
+            "${RTV_RTXDI_CONTRACT_SMOKE_SOURCE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileHlslShader.cmake"
+            ${RTV_RTXDI_SHADER_DEPENDENCIES}
+        VERBATIM)
+    list(APPEND RTV_SHADER_OUTPUTS
+        "${RTV_RTXDI_CONTRACT_SMOKE_OUTPUT}"
+        "${RTV_RTXDI_CONTRACT_SMOKE_OUTPUT}.options")
+endif()
 
 function(rtv_add_shader_variant source suffix)
     set(extra_defines ${ARGN})
@@ -343,6 +387,9 @@ rtv_add_shader_variant("taa.comp" "")
 rtv_add_shader_variant("gpu_skinning.comp" "")
 rtv_add_shader_variant("dlss_guides.comp" "")
 rtv_add_shader_variant("dlss_rr_guides.comp" "")
+rtv_add_shader_variant("dlss_guide_visualize.comp" "")
+rtv_add_shader_variant("nrd_confidence_gradient.comp" "")
+rtv_add_shader_variant("nrd_confidence_filter.comp" "")
 rtv_add_shader_variant("nrd_prepare.comp" "")
 rtv_add_shader_variant("nrd_resolve.comp" "")
 rtv_add_shader_variant("restir_spatial.comp" "")
@@ -386,6 +433,7 @@ rtv_add_shader_variant("fullscreen.vert" "")
 rtv_add_shader_variant("fullscreen.frag" "")
 rtv_add_shader_variant("pathtrace.rgen" ".di_packed" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
 rtv_add_shader_variant("pathtrace.rgen" ".beauty_fast.di_packed" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0" "RTV_BEAUTY_OUTPUT_ONLY=1" "RTV_REGIR_TRACE_ENABLED=0" "RTV_MATERIAL_RAY_CONE_LOD=1" "RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT=1" "RTV_GENERIC_SECONDARY_DIRECT_PROB=0.5" "RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB=0.5")
+rtv_add_shader_variant("pathtrace.rgen" ".beauty_fast.no_textures.di_packed" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0" "RTV_BEAUTY_OUTPUT_ONLY=1" "RTV_REGIR_TRACE_ENABLED=0" "RTV_MATERIAL_RAY_CONE_LOD=1" "RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT=1" "RTV_GENERIC_SECONDARY_DIRECT_PROB=0.5" "RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB=0.5" "RTV_MATERIAL_TEXTURES_ENABLED=0")
 rtv_add_shader_variant("pathtrace.rgen" ".regir_beauty_fast.di_packed" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0" "RTV_BEAUTY_OUTPUT_ONLY=1" "RTV_REGIR_TRACE_ENABLED=1" "RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED=1" "RTV_REGIR_FRAME_COHERENT_FINITE_QUERY=1" "RTV_MATERIAL_RAY_CONE_LOD=1" "RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT=1" "RTV_GENERIC_SECONDARY_DIRECT_PROB=0.5" "RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB=0.5")
 rtv_add_shader_variant("pathtrace.rgen" ".regir_stochastic_beauty_fast.di_packed" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0" "RTV_BEAUTY_OUTPUT_ONLY=1" "RTV_REGIR_TRACE_ENABLED=1" "RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED=0" "RTV_MATERIAL_RAY_CONE_LOD=1" "RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT=1" "RTV_GENERIC_SECONDARY_DIRECT_PROB=0.5" "RTV_GENERIC_DEEP_SECONDARY_DIRECT_PROB=0.5")
 rtv_add_shader_variant("pathtrace.rgen" ".di_full" "RTV_RESTIR_DI_VALIDATION_FULL=1" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
@@ -395,13 +443,13 @@ rtv_add_shader_variant("pathtrace.rgen" ".motion.di_packed" "RTV_MOTION_BLUR_ENA
 rtv_add_shader_variant("pathtrace.rgen" ".motion.di_full" "RTV_MOTION_BLUR_ENABLED=1" "RTV_RESTIR_DI_VALIDATION_FULL=1" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
 rtv_add_shader_variant("pathtrace.rgen" ".motion.gi_full" "RTV_MOTION_BLUR_ENABLED=1" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=1")
 rtv_add_shader_variant("pathtrace.rgen" ".motion.di_full.gi_full" "RTV_MOTION_BLUR_ENABLED=1" "RTV_RESTIR_DI_VALIDATION_FULL=1" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=1")
-rtv_add_shader_variant("pathtrace.rgen" ".native2b" "RTV_NATIVE2B_PIPELINE=1" "RTV_MOTION_BLUR_ENABLED=0" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
-rtv_add_shader_variant("pathtrace.rgen" ".native2b.compact_primary_lights" "RTV_NATIVE2B_PIPELINE=1" "RTV_NATIVE2B_COMPACT_PRIMARY_LIGHTS=1" "RTV_MOTION_BLUR_ENABLED=0" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
+rtv_add_shader_variant("pathtrace.rgen" ".native2b" "RTV_NATIVE2B_PIPELINE=1" "RTV_BEAUTY_OUTPUT_ONLY=1" "RTV_REGIR_TRACE_ENABLED=0" "RTV_MOTION_BLUR_ENABLED=0" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
+rtv_add_shader_variant("pathtrace.rgen" ".native2b.compact_primary_lights" "RTV_NATIVE2B_PIPELINE=1" "RTV_NATIVE2B_COMPACT_PRIMARY_LIGHTS=1" "RTV_BEAUTY_OUTPUT_ONLY=1" "RTV_REGIR_TRACE_ENABLED=0" "RTV_MOTION_BLUR_ENABLED=0" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
 rtv_add_shader_variant("pathtrace.rgen" ".rt_diag.di_packed" "RTV_RT_DIAGNOSTIC_COUNTERS=1" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
 rtv_add_shader_variant("pathtrace.rgen" ".rt_diag.di_full" "RTV_RT_DIAGNOSTIC_COUNTERS=1" "RTV_RESTIR_DI_VALIDATION_FULL=1" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
 rtv_add_shader_variant("pathtrace.rgen" ".rt_diag.gi_full" "RTV_RT_DIAGNOSTIC_COUNTERS=1" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=1")
 rtv_add_shader_variant("pathtrace.rgen" ".rt_diag.di_full.gi_full" "RTV_RT_DIAGNOSTIC_COUNTERS=1" "RTV_RESTIR_DI_VALIDATION_FULL=1" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=1")
-rtv_add_shader_variant("pathtrace.rgen" ".rt_diag.native2b" "RTV_RT_DIAGNOSTIC_COUNTERS=1" "RTV_NATIVE2B_PIPELINE=1" "RTV_MOTION_BLUR_ENABLED=0" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
+rtv_add_shader_variant("pathtrace.rgen" ".rt_diag.native2b" "RTV_RT_DIAGNOSTIC_COUNTERS=1" "RTV_NATIVE2B_PIPELINE=1" "RTV_BEAUTY_OUTPUT_ONLY=1" "RTV_REGIR_TRACE_ENABLED=0" "RTV_MOTION_BLUR_ENABLED=0" "RTV_RESTIR_DI_VALIDATION_FULL=0" "RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT=0")
 rtv_add_shader_variant("wavefront_trace.rgen" "")
 rtv_add_shader_variant("wavefront_trace.rgen" ".ser" "RTV_SER_ENABLED=1")
 rtv_add_shader_variant("wavefront_shadow_trace.rgen" "")
@@ -491,7 +539,8 @@ target_compile_definitions(rtvulkan PRIVATE
     RTV_ENABLE_ASSIMP_IMPORTER=$<BOOL:${RTV_ENABLE_ASSIMP_IMPORTER}>
     RTV_ASSIMP_IMPORTER_AVAILABLE=$<BOOL:${RTV_ASSIMP_IMPORTER_AVAILABLE}>
     RTV_ENABLE_OPENUSD_IMPORTER=$<BOOL:${RTV_ENABLE_OPENUSD_IMPORTER}>
-    RTV_OPENUSD_IMPORTER_AVAILABLE=$<BOOL:${RTV_OPENUSD_IMPORTER_AVAILABLE}>)
+    RTV_OPENUSD_IMPORTER_AVAILABLE=$<BOOL:${RTV_OPENUSD_IMPORTER_AVAILABLE}>
+    RTV_HAS_RTXDI=$<BOOL:${RTV_ENABLE_RTXDI}>)
 target_link_libraries(rtvulkan PRIVATE
     volk
     glfw
@@ -503,6 +552,9 @@ target_link_libraries(rtvulkan PRIVATE
     KTX::ktx
     TIFF::TIFF
 )
+if(RTV_ENABLE_RTXDI)
+    target_link_libraries(rtvulkan PRIVATE Rtxdi)
+endif()
 
 if(EXISTS "${RENDERDOC_SDK_DIR}/renderdoc_app.h")
     target_compile_definitions(rtvulkan PRIVATE RTV_HAS_RENDERDOC=1)
@@ -830,3 +882,29 @@ endif()
 target_precompile_headers(rtvulkan PRIVATE
     "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/include/rtv/Pch.h>"
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME renderer_core_regressions
+        COMMAND $<TARGET_FILE:rtvulkan> --selftest-renderer-core)
+    add_test(NAME cli_rejects_unknown_argument
+        COMMAND $<TARGET_FILE:rtvulkan> --selftest-renderer-core --definitely-not-a-real-flag)
+    add_test(NAME cli_rejects_missing_value
+        COMMAND $<TARGET_FILE:rtvulkan> --selftest-renderer-core --render-scale)
+    add_test(NAME cli_accepts_known_value_argument
+        COMMAND $<TARGET_FILE:rtvulkan> --selftest-renderer-core --inspection-json renderer_core_cli_probe.json)
+    add_test(NAME cli_accepts_known_two_value_argument
+        COMMAND $<TARGET_FILE:rtvulkan> --selftest-renderer-core --compare-image baseline.png current.png)
+    add_test(NAME cli_rejects_missing_second_value
+        COMMAND $<TARGET_FILE:rtvulkan> --selftest-renderer-core --compare-image baseline.png)
+    add_test(NAME cli_known_option_table_matches_parser
+        COMMAND ${CMAKE_COMMAND}
+            -DMAIN_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp
+            -DOPTIONS_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/include/rtv/KnownCommandLineOptions.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyKnownCommandLineOptions.cmake)
+    set_tests_properties(
+        cli_rejects_unknown_argument
+        cli_rejects_missing_value
+        cli_rejects_missing_second_value
+        PROPERTIES WILL_FAIL TRUE)
+endif()

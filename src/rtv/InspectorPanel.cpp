@@ -654,8 +654,8 @@ bool beginInspectorPropertyRow(const char* label) {
     if (!ImGui::BeginTable(tableId.c_str(), 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoPadOuterX)) {
         return false;
     }
-    ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, EditorUiMetric::inspectorLabelWidth);
-    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.42f);
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.58f);
     ImGui::TableNextRow(ImGuiTableRowFlags_None, EditorUiMetric::inspectorRowHeight);
     ImGui::TableSetColumnIndex(0);
     ImGui::AlignTextToFramePadding();
@@ -815,7 +815,7 @@ void drawInspectorComponentHeader(
     const ImU32 detailColor = ImGui::GetColorU32(ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     const ImVec2 titleSize = ImGui::CalcTextSize(title);
     const float textX = iconMin.x + iconSize + 14.0f;
-    const bool hasDetail = detail != nullptr && detail[0] != '\0';
+    const bool hasDetail = false;
     const float lineHeight = ImGui::GetTextLineHeight();
     const float detailGap = hasDetail ? 2.0f : 0.0f;
     const float textBlockHeight = hasDetail ? (lineHeight * 2.0f + detailGap) : titleSize.y;
@@ -833,6 +833,9 @@ void drawInspectorComponentHeader(
     }
 
     ImGui::Dummy(size);
+    if (detail != nullptr && detail[0] != '\0' && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("%s", detail);
+    }
     if (popupId != nullptr && requests != nullptr) {
         const ImVec2 after = ImGui::GetCursorScreenPos();
         const float actionSize = EditorUiMetric::inspectorComponentActionSize;
@@ -918,6 +921,34 @@ void drawInspectorStateCard(EditorGlyphIcon icon, const char* title, const char*
     dl->AddText(ImVec2(min.x + 62.0f, min.y + 16.0f), IM_COL32(220, 226, 235, 255), title);
     dl->AddText(ImVec2(min.x + 62.0f, min.y + 40.0f), IM_COL32(142, 150, 164, 255), detail);
     ImGui::Dummy(size);
+}
+
+void drawInspectorEntityHeader(Entity& entity, EditorSelection& selection, EditorRequests& requests) {
+    const ImVec2 cursor = ImGui::GetCursorScreenPos();
+    const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const ImVec2 size(width, 56.0f);
+    const ImVec2 min = cursor;
+    const ImVec2 max(cursor.x + size.x, cursor.y + size.y);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(min, max, ImGui::GetColorU32(editorCardBgColor()), EditorUiMetric::cardRounding);
+    dl->AddRect(min, max, ImGui::GetColorU32(editorToolbarBorderColor()), EditorUiMetric::cardRounding);
+    dl->AddRectFilled(ImVec2(min.x, min.y), ImVec2(min.x + 3.0f, max.y), ImGui::GetColorU32(editorAccentColor()), EditorUiMetric::cardRounding);
+
+    const ImVec2 iconMin(min.x + 12.0f, min.y + 16.0f);
+    editorDrawIconGlyph(editorGlyphForEntity(entity), iconMin, ImVec2(iconMin.x + 24.0f, iconMin.y + 24.0f), ImGui::GetColorU32(editorIconTint(true)));
+
+    const std::string title = entity.name.empty() ? std::string("Unnamed Entity") : entity.name;
+    const std::string detail = "ID " + std::to_string(entity.id.index) + ":" + std::to_string(entity.id.generation) +
+        (entity.layer.empty() ? std::string{} : ("  |  Layer " + entity.layer));
+    dl->AddText(ImVec2(min.x + 48.0f, min.y + 9.0f), ImGui::GetColorU32(ImGuiCol_Text), title.c_str());
+    dl->AddText(ImVec2(min.x + 48.0f, min.y + 31.0f), ImGui::GetColorU32(ImGuiCol_TextDisabled), detail.c_str());
+
+    ImGui::Dummy(size);
+    const ImVec2 after = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(ImVec2(max.x - EditorUiMetric::inspectorComponentActionSize - 7.0f, min.y + 8.0f));
+    drawEntityActionsMenu(entity, selection, requests);
+    ImGui::SetCursorScreenPos(after);
+    ImGui::Spacing();
 }
 
 void drawInspectorLockedBanner() {
@@ -1006,9 +1037,7 @@ void InspectorPanel::draw(const EditorRuntimeState& state, EditorSelection& sele
         if (entityLocked) {
             drawInspectorLockedBanner();
         }
-        ImGui::TextDisabled("Entity");
-        ImGui::SameLine();
-        drawEntityActionsMenu(*entity, selection, requests);
+        drawInspectorEntityHeader(*entity, selection, requests);
         ImGui::BeginDisabled(entityLocked);
 
         static EntityId nameEditId{};

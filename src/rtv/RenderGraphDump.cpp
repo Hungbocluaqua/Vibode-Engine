@@ -6,11 +6,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace rtv {
 
@@ -44,51 +46,84 @@ const char* queueNameForDomain(RenderGraphQueueDomain domain) {
     return "unknown";
 }
 
-float timingForPassName(const GpuFrameTimings& timings, const std::string& name) {
-    if (name.find("path_trace") == 0) return timings.pathTraceMs;
-    if (name.find("restir_history_clear") == 0) return timings.restirHistoryClearMs;
-    if (name.find("restir_gi_clear") == 0) return timings.restirGiClearMs;
-    if (name.find("restir_gi_temporal") == 0) return timings.restirGiTemporalMs;
-    if (name.find("restir_spatial_copy") == 0) return timings.restirSpatialCopyMs;
-    if (name.find("restir_spatial") == 0) return timings.restirSpatialMs;
-    if (name.find("restir_gi_spatial") == 0) return timings.restirGiSpatialMs;
-    if (name.find("restir_gi_upsample") == 0) return timings.restirGiUpsampleMs;
-    if (name.find("restir_gi_final") == 0) return timings.restirGiFinalMs;
-    if (name.find("restir_gi_counters_readback") == 0) return timings.restirGiCountersReadbackMs;
-    if (name.find("regir_spatial_reuse") == 0) return timings.regirSpatialReuseMs;
-    if (name.find("regir_temporal_reuse") == 0) return timings.regirTemporalReuseMs;
-    if (name.find("regir_build") == 0) return timings.regirBuildMs;
-    if (name.find("restir_di_temporal") == 0) return timings.restirDiTemporalMs;
-    if (name.find("restir_di_spatial") == 0) return timings.restirDiSpatialMs;
-    if (name.find("restir_di_final") == 0) return timings.restirDiFinalMs;
-    if (name.find("fog") == 0) return timings.fogIntegrateMs;
-    if (name.find("atmosphere") == 0) return timings.atmosphereMs;
-    if (name.find("temporal_denoiser") == 0) return timings.denoiserMs;
-    if (name.find("moment_update") == 0) return timings.momentUpdateMs;
-    if (name.find("adaptive_sampling_prepare") == 0) return timings.adaptiveSamplingDiagnosticsMs;
-    if (name.find("adaptive_sampling_diagnostics") == 0) return timings.adaptiveSamplingDiagnosticsMs;
-    if (name.find("adaptive_sampling_fill") == 0) return timings.adaptiveSamplingFillMs;
-    if (name.find("skip_denoiser_copy") == 0) return timings.skipDenoiserCopyMs;
-    if (name.find("history_copy") == 0) return timings.historyCopyMs;
-    if (name.find("taa_history_copy") == 0) return timings.taaHistoryCopyMs;
-    if (name.find("taa") == 0) return timings.taaMs;
-    if (name.find("auto_exposure_histogram_clear") == 0) return timings.autoExposureHistogramClearMs;
-    if (name.find("auto_exposure_histogram") == 0) return timings.autoExposureHistogramMs;
-    if (name.find("auto_exposure_reduce") == 0) return timings.autoExposureReduceMs;
-    if (name.find("tone_map") == 0) return timings.toneMapMs;
-    if (name.find("selection_outline") == 0) return timings.selectionOutlineMs;
-    if (name.find("fullscreen") == 0) return timings.fullscreenMs;
-    if (name.find("editor_presentation") == 0) return timings.editorPresentationMs;
-    if (name == "wavefront_trace_rt") return timings.wavefrontTraceMs;
-    if (name == "wavefront_secondary_trace_rt") return timings.wavefrontSecondaryTraceMs;
-    if (name == "wavefront_sorted_trace_rt") return timings.wavefrontSortedTraceMs;
-    if (name == "wavefront_shadow_trace_rt") return timings.wavefrontShadowTraceMs;
-    if (name == "wavefront_shade") return timings.wavefrontShadeMs;
-    if (name == "wavefront_secondary_shade") return timings.wavefrontSecondaryShadeMs;
-    if (name == "wavefront_sorted_shade") return timings.wavefrontSortedShadeMs;
-    if (name == "wavefront_compact") return timings.wavefrontCompactMs;
-    if (name == "wavefront_sort") return timings.wavefrontSortMs;
-    return 0.0f;
+struct TimingMapping {
+    float gpuMs = 0.0f;
+    const char* profileTimingKey = "";
+    const char* timingSource = "unmapped";
+    const char* note = "";
+    bool mapped = false;
+};
+
+bool startsWith(const std::string& value, const char* prefix) {
+    return value.rfind(prefix, 0) == 0;
+}
+
+TimingMapping mappedTiming(const char* key, float gpuMs, const char* note = "") {
+    return {
+        .gpuMs = gpuMs,
+        .profileTimingKey = key,
+        .timingSource = "per_frame_gpu_timings",
+        .note = note,
+        .mapped = true,
+    };
+}
+
+TimingMapping timingForPassName(const GpuFrameTimings& timings, const std::string& name) {
+    if (name == "path_trace_rt" || startsWith(name, "path_trace")) {
+        return mappedTiming("path_trace", timings.pathTraceMs);
+    }
+    if (startsWith(name, "restir_history_clear")) return mappedTiming("restir_history_clear", timings.restirHistoryClearMs);
+    if (startsWith(name, "restir_gi_clear")) return mappedTiming("restir_gi_clear", timings.restirGiClearMs);
+    if (startsWith(name, "restir_gi_temporal")) return mappedTiming("restir_gi_temporal", timings.restirGiTemporalMs);
+    if (startsWith(name, "restir_spatial_copy")) return mappedTiming("restir_spatial_copy", timings.restirSpatialCopyMs);
+    if (startsWith(name, "restir_spatial")) return mappedTiming("restir_spatial", timings.restirSpatialMs);
+    if (startsWith(name, "restir_gi_spatial")) return mappedTiming("restir_gi_spatial", timings.restirGiSpatialMs);
+    if (startsWith(name, "restir_gi_upsample")) return mappedTiming("restir_gi_upsample", timings.restirGiUpsampleMs);
+    if (startsWith(name, "restir_gi_final")) return mappedTiming("restir_gi_final", timings.restirGiFinalMs);
+    if (startsWith(name, "restir_gi_counters_readback")) return mappedTiming("restir_gi_counters_readback", timings.restirGiCountersReadbackMs);
+    if (startsWith(name, "regir_spatial_reuse")) return mappedTiming("regir_spatial_reuse", timings.regirSpatialReuseMs);
+    if (startsWith(name, "regir_temporal_reuse")) return mappedTiming("regir_temporal_reuse", timings.regirTemporalReuseMs);
+    if (startsWith(name, "regir_build")) return mappedTiming("regir_build", timings.regirBuildMs);
+    if (startsWith(name, "restir_di_temporal")) return mappedTiming("restir_di_temporal", timings.restirDiTemporalMs);
+    if (startsWith(name, "restir_di_spatial")) return mappedTiming("restir_di_spatial", timings.restirDiSpatialMs);
+    if (startsWith(name, "restir_di_final")) return mappedTiming("restir_di_final", timings.restirDiFinalMs);
+    if (startsWith(name, "fog")) return mappedTiming("fog_integrate", timings.fogIntegrateMs);
+    if (startsWith(name, "atmosphere")) return mappedTiming("atmosphere", timings.atmosphereMs, "Aggregate atmosphere timing.");
+    if (startsWith(name, "temporal_denoiser") || startsWith(name, "nrd_reblur")) {
+        return mappedTiming("denoiser", timings.denoiserMs, "Aggregate denoiser timing.");
+    }
+    if (startsWith(name, "moment_update")) return mappedTiming("moment_update", timings.momentUpdateMs);
+    if (startsWith(name, "adaptive_sampling_prepare")) return mappedTiming("adaptive_sampling_diagnostics", timings.adaptiveSamplingDiagnosticsMs);
+    if (startsWith(name, "adaptive_sampling_diagnostics")) return mappedTiming("adaptive_sampling_diagnostics", timings.adaptiveSamplingDiagnosticsMs);
+    if (startsWith(name, "adaptive_sampling_fill")) return mappedTiming("adaptive_sampling_fill", timings.adaptiveSamplingFillMs);
+    if (startsWith(name, "skip_denoiser_copy")) return mappedTiming("skip_denoiser_copy", timings.skipDenoiserCopyMs);
+    if (startsWith(name, "history_copy")) return mappedTiming("history_copy", timings.historyCopyMs);
+    if (startsWith(name, "taa_history_copy")) return mappedTiming("taa_history_copy", timings.taaHistoryCopyMs);
+    if (name == "taa_resolve" || startsWith(name, "taa")) return mappedTiming("taa", timings.taaMs);
+    if (name == "dlss_guides") return mappedTiming("dlss_guides", timings.dlssGuidesMs);
+    if (name == "dlss_upscale") return mappedTiming("dlss", timings.dlssMs);
+    if (name == "dlss_rr_guides") return mappedTiming("dlss_rr_guides", timings.dlssRayReconstructionGuidesMs);
+    if (name == "dlss_ray_reconstruction") return mappedTiming("dlss_rr", timings.dlssRayReconstructionMs);
+    if (startsWith(name, "nrd_prepare") || startsWith(name, "nrd_resolve")) {
+        return mappedTiming("denoiser", timings.denoiserMs, "NRD prepare/resolve are currently represented by aggregate denoiser timing.");
+    }
+    if (startsWith(name, "auto_exposure_histogram_clear")) return mappedTiming("auto_exposure_histogram_clear", timings.autoExposureHistogramClearMs);
+    if (startsWith(name, "auto_exposure_histogram")) return mappedTiming("auto_exposure_histogram", timings.autoExposureHistogramMs);
+    if (startsWith(name, "auto_exposure_reduce")) return mappedTiming("auto_exposure_reduce", timings.autoExposureReduceMs);
+    if (startsWith(name, "tone_map")) return mappedTiming("tone_map", timings.toneMapMs);
+    if (startsWith(name, "selection_outline")) return mappedTiming("selection_outline", timings.selectionOutlineMs);
+    if (startsWith(name, "fullscreen")) return mappedTiming("fullscreen", timings.fullscreenMs);
+    if (startsWith(name, "editor_presentation")) return mappedTiming("editor_presentation", timings.editorPresentationMs);
+    if (name == "wavefront_trace_rt") return mappedTiming("wavefront_trace", timings.wavefrontTraceMs);
+    if (name == "wavefront_secondary_trace_rt") return mappedTiming("wavefront_secondary_trace", timings.wavefrontSecondaryTraceMs);
+    if (name == "wavefront_sorted_trace_rt") return mappedTiming("wavefront_sorted_trace", timings.wavefrontSortedTraceMs);
+    if (name == "wavefront_shadow_trace_rt") return mappedTiming("wavefront_shadow_trace", timings.wavefrontShadowTraceMs);
+    if (name == "wavefront_shade") return mappedTiming("wavefront_shade", timings.wavefrontShadeMs);
+    if (name == "wavefront_secondary_shade") return mappedTiming("wavefront_secondary_shade", timings.wavefrontSecondaryShadeMs);
+    if (name == "wavefront_sorted_shade") return mappedTiming("wavefront_sorted_shade", timings.wavefrontSortedShadeMs);
+    if (name == "wavefront_compact") return mappedTiming("wavefront_compact", timings.wavefrontCompactMs);
+    if (name == "wavefront_sort") return mappedTiming("wavefront_sort", timings.wavefrontSortMs);
+    return {};
 }
 
 const char* formatName(VkFormat format) {
@@ -150,12 +185,29 @@ bool resourcesAliasCompatible(const RenderGraphResource& a, const RenderGraphRes
         a.usage == b.usage;
 }
 
+VkDeviceSize bufferRangeEnd(VkDeviceSize offset, VkDeviceSize size) {
+    const VkDeviceSize maxValue = std::numeric_limits<VkDeviceSize>::max();
+    if (size == VK_WHOLE_SIZE || maxValue - offset < size) {
+        return maxValue;
+    }
+    return offset + size;
+}
+
+bool bufferRangesOverlap(const RenderGraphResource& a, const RenderGraphResource& b) {
+    if (a.buffer == VK_NULL_HANDLE || a.buffer != b.buffer) {
+        return false;
+    }
+    const VkDeviceSize aEnd = bufferRangeEnd(a.bufferOffset, a.size);
+    const VkDeviceSize bEnd = bufferRangeEnd(b.bufferOffset, b.size);
+    return a.bufferOffset < bEnd && b.bufferOffset < aEnd;
+}
+
 bool resourcesSharePhysicalHandle(const RenderGraphResource& a, const RenderGraphResource& b) {
     if (a.type != b.type) {
         return false;
     }
     if (a.type == RenderGraphResource::Type::Buffer) {
-        return a.buffer != VK_NULL_HANDLE && a.buffer == b.buffer;
+        return bufferRangesOverlap(a, b);
     }
     return a.image != VK_NULL_HANDLE && a.image == b.image;
 }
@@ -308,7 +360,14 @@ void dumpRenderGraphJson(
             }
         }
         pj["barriers"] = passBarriers;
-        pj["gpu_ms"] = timingForPassName(timings, pass.name());
+        const TimingMapping timing = timingForPassName(timings, pass.name());
+        pj["gpu_ms"] = timing.gpuMs;
+        pj["gpu_ms_mapped"] = timing.mapped;
+        pj["timing_source"] = timing.timingSource;
+        pj["profile_timing_key"] = timing.mapped ? nlohmann::json(timing.profileTimingKey) : nlohmann::json(nullptr);
+        if (timing.note[0] != '\0') {
+            pj["timing_note"] = timing.note;
+        }
 
         passesJson.push_back(pj);
     }
@@ -322,6 +381,7 @@ void dumpRenderGraphJson(
         rj["name"] = res.debugName ? res.debugName : "unnamed";
         rj["type"] = resourceTypeName(res.type);
         rj["lifetime"] = resourceLifetimeName(res.lifetime);
+        rj["external"] = res.external;
         if (res.type == RenderGraphResource::Type::Texture) {
             rj["format"] = static_cast<int>(res.format);
             rj["extent"] = { {"width", res.extent.width}, {"height", res.extent.height} };
@@ -438,6 +498,397 @@ void dumpRenderGraphJson(
     }
     j["barriers"] = barriersJson;
 
+    std::vector<std::vector<std::string>> resourceReaders(resources.size());
+    std::vector<std::vector<std::string>> resourceWriters(resources.size());
+    nlohmann::json invalidUses = nlohmann::json::array();
+    for (uint32_t passIndex : compiledOrder) {
+        if (passIndex >= passes.size()) {
+            continue;
+        }
+        const auto& pass = passes[passIndex];
+        for (const auto& use : pass.uses()) {
+            if (!use.resource.valid() || use.resource.index >= resources.size()) {
+                invalidUses.push_back({
+                    {"pass", pass.name()},
+                    {"resource_index", use.resource.index},
+                    {"access", use.access == PassAccess::Read ? "read" : (use.access == PassAccess::Write ? "write" : "read_write")},
+                    {"domain", pipelineDomainName(use.domain)},
+                });
+                continue;
+            }
+            if (use.access == PassAccess::Read || use.access == PassAccess::ReadWrite) {
+                resourceReaders[use.resource.index].push_back(pass.name());
+            }
+            if (use.access == PassAccess::Write || use.access == PassAccess::ReadWrite) {
+                resourceWriters[use.resource.index].push_back(pass.name());
+            }
+        }
+    }
+
+    nlohmann::json resourceOwnership = nlohmann::json::array();
+    nlohmann::json resourcesWithoutWriters = nlohmann::json::array();
+    nlohmann::json multiWriterResources = nlohmann::json::array();
+    for (uint32_t resourceIndex = 0; resourceIndex < resources.size(); ++resourceIndex) {
+        const auto& res = resources[resourceIndex];
+        const char* resourceName = res.debugName ? res.debugName : "unnamed";
+        nlohmann::json ownership = {
+            {"resource", resourceName},
+            {"index", resourceIndex},
+            {"lifetime", resourceLifetimeName(res.lifetime)},
+            {"external", res.external},
+            {"has_initial_access", res.hasInitialAccess},
+            {"first_writer", resourceWriters[resourceIndex].empty() ? nlohmann::json(nullptr) : nlohmann::json(resourceWriters[resourceIndex].front())},
+            {"writer_count", resourceWriters[resourceIndex].size()},
+            {"reader_count", resourceReaders[resourceIndex].size()},
+            {"writers", resourceWriters[resourceIndex]},
+            {"readers", resourceReaders[resourceIndex]},
+        };
+        resourceOwnership.push_back(ownership);
+
+        if (!res.external && !res.hasInitialAccess && resourceReaders[resourceIndex].size() > 0 && resourceWriters[resourceIndex].empty()) {
+            resourcesWithoutWriters.push_back(ownership);
+        }
+        if (resourceWriters[resourceIndex].size() > 1) {
+            multiWriterResources.push_back(ownership);
+        }
+    }
+    const bool ownershipValidationPassed = invalidUses.empty();
+    j["resource_ownership_validation"] = {
+        {"schema_version", 1},
+        {"pass_count", passes.size()},
+        {"compiled_pass_count", compiledOrder.size()},
+        {"resource_count", resources.size()},
+        {"invalid_use_count", invalidUses.size()},
+        {"resources_without_declared_writer_count", resourcesWithoutWriters.size()},
+        {"multi_writer_resource_count", multiWriterResources.size()},
+        {"invalid_uses", std::move(invalidUses)},
+        {"resources_without_declared_writer", std::move(resourcesWithoutWriters)},
+        {"multi_writer_resources", std::move(multiWriterResources)},
+        {"resource_ownership", std::move(resourceOwnership)},
+        {"passed", ownershipValidationPassed},
+    };
+
+    const uint32_t invalidPassIndex = std::numeric_limits<uint32_t>::max();
+    std::vector<uint32_t> passExecutionPosition(passes.size(), invalidPassIndex);
+    for (uint32_t orderIndex = 0; orderIndex < compiledOrder.size(); ++orderIndex) {
+        const uint32_t passIndex = compiledOrder[orderIndex];
+        if (passIndex < passExecutionPosition.size()) {
+            passExecutionPosition[passIndex] = orderIndex;
+        }
+    }
+    auto passIndexValid = [&](uint32_t passIndex) {
+        return passIndex == invalidPassIndex || passIndex < passes.size();
+    };
+    auto passExecutionOrder = [&](uint32_t passIndex) {
+        if (passIndex == invalidPassIndex || passIndex >= passExecutionPosition.size()) {
+            return invalidPassIndex;
+        }
+        return passExecutionPosition[passIndex];
+    };
+    auto passNameJson = [&](uint32_t passIndex) -> nlohmann::json {
+        if (passIndex == invalidPassIndex || passIndex >= passes.size()) {
+            return nullptr;
+        }
+        return passes[passIndex].name();
+    };
+    auto lifetimeResourceEvidence = [&](uint32_t resourceIndex, const TransientResourceLifetime& lifetime) {
+        const auto& res = resources[resourceIndex];
+        return nlohmann::json{
+            {"resource", res.debugName ? res.debugName : "unnamed"},
+            {"index", resourceIndex},
+            {"lifetime", resourceLifetimeName(res.lifetime)},
+            {"external", res.external},
+            {"first_use_pass", passNameJson(lifetime.firstUsePass)},
+            {"last_use_pass", passNameJson(lifetime.lastUsePass)},
+            {"first_read_pass", passNameJson(lifetime.firstReadPass)},
+            {"last_read_pass", passNameJson(lifetime.lastReadPass)},
+            {"first_write_pass", passNameJson(lifetime.firstWritePass)},
+            {"last_write_pass", passNameJson(lifetime.lastWritePass)},
+            {"alias_eligible", lifetime.aliasEligible},
+            {"aliased", lifetime.aliased},
+            {"alias_group", lifetime.aliasGroup},
+            {"estimated_bytes", lifetime.estimatedBytes},
+        };
+    };
+    auto lifetimeOverlapsByExecution = [&](const TransientResourceLifetime& a, const TransientResourceLifetime& b) {
+        const uint32_t aFirst = passExecutionOrder(a.firstUsePass);
+        const uint32_t aLast = passExecutionOrder(a.lastUsePass);
+        const uint32_t bFirst = passExecutionOrder(b.firstUsePass);
+        const uint32_t bLast = passExecutionOrder(b.lastUsePass);
+        if (aFirst == invalidPassIndex || aLast == invalidPassIndex ||
+            bFirst == invalidPassIndex || bLast == invalidPassIndex) {
+            return true;
+        }
+        return !(aLast < bFirst || bLast < aFirst);
+    };
+
+    nlohmann::json lifetimeViolations = nlohmann::json::array();
+    nlohmann::json lifetimeWarnings = nlohmann::json::array();
+    auto addLifetimeViolation = [&](const char* code, const char* message, nlohmann::json evidence) {
+        lifetimeViolations.push_back({
+            {"code", code},
+            {"message", message},
+            {"evidence", std::move(evidence)},
+        });
+    };
+    auto addLifetimeWarning = [&](const char* code, const char* message, nlohmann::json evidence) {
+        lifetimeWarnings.push_back({
+            {"code", code},
+            {"message", message},
+            {"evidence", std::move(evidence)},
+        });
+    };
+
+    uint32_t usedResourceCount = 0;
+    uint32_t transientResourceCount = 0;
+    uint32_t aliasEligibleResourceCount = 0;
+    uint32_t aliasedResourceCount = 0;
+    uint64_t estimatedTransientBytes = 0;
+    for (uint32_t resourceIndex = 0; resourceIndex < resources.size(); ++resourceIndex) {
+        const auto& res = resources[resourceIndex];
+        const bool used = !resourceReaders[resourceIndex].empty() || !resourceWriters[resourceIndex].empty();
+        const bool expectedAliasEligible = !res.external && res.lifetime == RenderGraphResource::Lifetime::Transient;
+        if (used) {
+            ++usedResourceCount;
+        }
+        if (res.lifetime == RenderGraphResource::Lifetime::Transient) {
+            ++transientResourceCount;
+        }
+        if (resourceIndex >= lifetimes.size()) {
+            addLifetimeViolation(
+                "missing_lifetime_record",
+                "Every render graph resource must have a compiled lifetime record.",
+                {
+                    {"resource", res.debugName ? res.debugName : "unnamed"},
+                    {"index", resourceIndex},
+                    {"used", used},
+                });
+            continue;
+        }
+
+        const TransientResourceLifetime& lifetime = lifetimes[resourceIndex];
+        if (lifetime.resourceIndex != resourceIndex) {
+            addLifetimeViolation(
+                "lifetime_resource_index_mismatch",
+                "Compiled lifetime record must point back to its resource index.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (used && (lifetime.firstUsePass == invalidPassIndex || lifetime.lastUsePass == invalidPassIndex)) {
+            addLifetimeViolation(
+                "used_resource_missing_use_interval",
+                "Used resources must report first and last use passes.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (!passIndexValid(lifetime.firstUsePass) ||
+            !passIndexValid(lifetime.lastUsePass) ||
+            !passIndexValid(lifetime.firstReadPass) ||
+            !passIndexValid(lifetime.lastReadPass) ||
+            !passIndexValid(lifetime.firstWritePass) ||
+            !passIndexValid(lifetime.lastWritePass)) {
+            addLifetimeViolation(
+                "lifetime_pass_index_out_of_range",
+                "Lifetime pass indices must reference compiled graph passes or be unset.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        const uint32_t firstUseOrder = passExecutionOrder(lifetime.firstUsePass);
+        const uint32_t lastUseOrder = passExecutionOrder(lifetime.lastUsePass);
+        if (used && firstUseOrder != invalidPassIndex && lastUseOrder != invalidPassIndex && firstUseOrder > lastUseOrder) {
+            addLifetimeViolation(
+                "lifetime_interval_inverted",
+                "Resource lifetime intervals must be ordered by compiled execution order.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (!resourceReaders[resourceIndex].empty() &&
+            (lifetime.firstReadPass == invalidPassIndex || lifetime.lastReadPass == invalidPassIndex)) {
+            addLifetimeViolation(
+                "resource_readers_missing_read_interval",
+                "Resources with readers must report first and last read passes.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (!resourceWriters[resourceIndex].empty() &&
+            (lifetime.firstWritePass == invalidPassIndex || lifetime.lastWritePass == invalidPassIndex)) {
+            addLifetimeViolation(
+                "resource_writers_missing_write_interval",
+                "Resources with writers must report first and last write passes.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        auto intervalWithinUse = [&](uint32_t passIndex) {
+            const uint32_t order = passExecutionOrder(passIndex);
+            return passIndex == invalidPassIndex ||
+                (firstUseOrder != invalidPassIndex &&
+                 lastUseOrder != invalidPassIndex &&
+                 order != invalidPassIndex &&
+                 firstUseOrder <= order &&
+                 order <= lastUseOrder);
+        };
+        if (!intervalWithinUse(lifetime.firstReadPass) ||
+            !intervalWithinUse(lifetime.lastReadPass) ||
+            !intervalWithinUse(lifetime.firstWritePass) ||
+            !intervalWithinUse(lifetime.lastWritePass)) {
+            addLifetimeViolation(
+                "read_write_interval_outside_use_interval",
+                "Read/write lifetime intervals must be contained inside the first/last use interval.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (!used && lifetime.firstUsePass != invalidPassIndex) {
+            addLifetimeWarning(
+                "unused_resource_has_lifetime_interval",
+                "A resource with no compiled readers or writers still reports a lifetime interval.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (lifetime.aliasEligible != expectedAliasEligible) {
+            addLifetimeViolation(
+                "alias_eligibility_mismatch",
+                "Only non-external transient resources may be alias-eligible.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (!expectedAliasEligible && (lifetime.aliased || lifetime.aliasGroup != 0u)) {
+            addLifetimeViolation(
+                "non_transient_resource_alias_state",
+                "Persistent, temporal, or external resources must not be assigned transient alias state.",
+                lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (lifetime.aliasEligible) {
+            ++aliasEligibleResourceCount;
+            estimatedTransientBytes += static_cast<uint64_t>(lifetime.estimatedBytes);
+        }
+        if (lifetime.aliased) {
+            ++aliasedResourceCount;
+        }
+    }
+
+    nlohmann::json aliasGroups = nlohmann::json::array();
+    uint32_t aliasGroupCount = 0;
+    uint64_t estimatedAliasSavingsBytes = 0;
+    std::vector<uint32_t> observedAliasGroups;
+    for (const TransientResourceLifetime& lifetime : lifetimes) {
+        if (lifetime.aliasGroup == 0u ||
+            std::find(observedAliasGroups.begin(), observedAliasGroups.end(), lifetime.aliasGroup) != observedAliasGroups.end()) {
+            continue;
+        }
+        observedAliasGroups.push_back(lifetime.aliasGroup);
+    }
+    for (uint32_t aliasGroup : observedAliasGroups) {
+        std::vector<uint32_t> groupResources;
+        uint64_t groupBytes = 0;
+        uint64_t groupMaxBytes = 0;
+        nlohmann::json groupResourceJson = nlohmann::json::array();
+        for (uint32_t resourceIndex = 0; resourceIndex < lifetimes.size() && resourceIndex < resources.size(); ++resourceIndex) {
+            const TransientResourceLifetime& lifetime = lifetimes[resourceIndex];
+            if (lifetime.aliasGroup != aliasGroup) {
+                continue;
+            }
+            groupResources.push_back(resourceIndex);
+            groupBytes += static_cast<uint64_t>(lifetime.estimatedBytes);
+            groupMaxBytes = std::max<uint64_t>(groupMaxBytes, static_cast<uint64_t>(lifetime.estimatedBytes));
+            groupResourceJson.push_back(lifetimeResourceEvidence(resourceIndex, lifetime));
+        }
+        if (groupResources.size() > 1) {
+            ++aliasGroupCount;
+            estimatedAliasSavingsBytes += groupBytes > groupMaxBytes ? groupBytes - groupMaxBytes : 0ull;
+        }
+        for (size_t a = 0; a < groupResources.size(); ++a) {
+            for (size_t b = a + 1; b < groupResources.size(); ++b) {
+                const uint32_t resourceA = groupResources[a];
+                const uint32_t resourceB = groupResources[b];
+                if (!resourcesAliasCompatible(resources[resourceA], resources[resourceB])) {
+                    addLifetimeViolation(
+                        "alias_group_incompatible_resources",
+                        "Resources assigned to the same alias group must have compatible type, format, extent, and usage.",
+                        {
+                            {"alias_group", aliasGroup},
+                            {"resource_a", lifetimeResourceEvidence(resourceA, lifetimes[resourceA])},
+                            {"resource_b", lifetimeResourceEvidence(resourceB, lifetimes[resourceB])},
+                        });
+                }
+                if (lifetimeOverlapsByExecution(lifetimes[resourceA], lifetimes[resourceB])) {
+                    addLifetimeViolation(
+                        "alias_group_lifetime_overlap",
+                        "Resources assigned to the same alias group must not overlap in compiled execution order.",
+                        {
+                            {"alias_group", aliasGroup},
+                            {"resource_a", lifetimeResourceEvidence(resourceA, lifetimes[resourceA])},
+                            {"resource_b", lifetimeResourceEvidence(resourceB, lifetimes[resourceB])},
+                        });
+                }
+            }
+        }
+        aliasGroups.push_back({
+            {"alias_group", aliasGroup},
+            {"resource_count", groupResources.size()},
+            {"estimated_group_bytes", groupBytes},
+            {"estimated_physical_bytes", groupMaxBytes},
+            {"estimated_saved_bytes", groupBytes > groupMaxBytes ? groupBytes - groupMaxBytes : 0ull},
+            {"resources", std::move(groupResourceJson)},
+        });
+    }
+
+    nlohmann::json sharedPhysicalBacking = nlohmann::json::array();
+    uint32_t sharedPhysicalBackingPairCount = 0;
+    uint32_t overlappingSharedPhysicalBackingPairCount = 0;
+    for (uint32_t i = 0; i < resources.size() && i < lifetimes.size(); ++i) {
+        if (lifetimes[i].firstUsePass == invalidPassIndex) {
+            continue;
+        }
+        for (uint32_t k = i + 1; k < resources.size() && k < lifetimes.size(); ++k) {
+            if (lifetimes[k].firstUsePass == invalidPassIndex || !resourcesSharePhysicalHandle(resources[i], resources[k])) {
+                continue;
+            }
+            const bool overlap = lifetimeOverlapsByExecution(lifetimes[i], lifetimes[k]);
+            const bool graphControlledAlias =
+                lifetimes[i].aliasEligible &&
+                lifetimes[k].aliasEligible &&
+                lifetimes[i].aliasGroup != 0u &&
+                lifetimes[i].aliasGroup == lifetimes[k].aliasGroup;
+            ++sharedPhysicalBackingPairCount;
+            if (overlap) {
+                ++overlappingSharedPhysicalBackingPairCount;
+            }
+            nlohmann::json backingPair = {
+                {"resource_a", lifetimeResourceEvidence(i, lifetimes[i])},
+                {"resource_b", lifetimeResourceEvidence(k, lifetimes[k])},
+                {"lifetimes_overlap", overlap},
+                {"graph_controlled_alias", graphControlledAlias},
+            };
+            sharedPhysicalBacking.push_back(backingPair);
+            if (overlap && (resources[i].external || resources[k].external)) {
+                addLifetimeWarning(
+                    "external_shared_physical_backing_overlap",
+                    "External persistent resources share the same physical backing over overlapping lifetimes; this is reported separately from graph-controlled transient aliasing.",
+                    backingPair);
+            } else if (overlap && !graphControlledAlias) {
+                addLifetimeViolation(
+                    "internal_shared_physical_backing_overlap",
+                    "Internal resources that share physical backing over overlapping lifetimes must be represented by an explicit graph-controlled alias contract.",
+                    backingPair);
+            }
+        }
+    }
+
+    const bool lifetimeValidationPassed = lifetimeViolations.empty();
+    j["resource_lifetime_validation"] = {
+        {"schema_version", 1},
+        {"resource_count", resources.size()},
+        {"lifetime_count", lifetimes.size()},
+        {"used_resource_count", usedResourceCount},
+        {"transient_resource_count", transientResourceCount},
+        {"aliasing_enabled", graph.aliasingEnabled()},
+        {"alias_eligible_resource_count", aliasEligibleResourceCount},
+        {"aliased_resource_count", aliasedResourceCount},
+        {"alias_group_count", aliasGroupCount},
+        {"estimated_transient_bytes", estimatedTransientBytes},
+        {"estimated_alias_savings_bytes", estimatedAliasSavingsBytes},
+        {"alias_groups", std::move(aliasGroups)},
+        {"shared_physical_backing_pair_count", sharedPhysicalBackingPairCount},
+        {"overlapping_shared_physical_backing_pair_count", overlappingSharedPhysicalBackingPairCount},
+        {"shared_physical_backing", std::move(sharedPhysicalBacking)},
+        {"violation_count", lifetimeViolations.size()},
+        {"warning_count", lifetimeWarnings.size()},
+        {"violations", std::move(lifetimeViolations)},
+        {"warnings", std::move(lifetimeWarnings)},
+        {"passed", lifetimeValidationPassed},
+    };
+
     const auto dir = outputPath.parent_path();
     if (!dir.empty()) {
         std::filesystem::create_directories(dir);
@@ -476,7 +927,7 @@ void dumpRenderGraphDot(
         const auto& pass = passes[passIndex];
         const RenderGraphQueueDomain domain = pass.queueDomain();
 
-        float gpuMs = timingForPassName(timings, pass.name());
+        const TimingMapping timing = timingForPassName(timings, pass.name());
         file << "    \"" << pass.name() << "\" [fillcolor=" << domainColor(domain)
              << ", label=\"" << pass.name() << "\\n(";
         switch (domain) {
@@ -486,7 +937,7 @@ void dumpRenderGraphDot(
         case RenderGraphQueueDomain::Graphics: file << "Graphics"; break;
         case RenderGraphQueueDomain::Transfer: file << "Transfer"; break;
         }
-        file << ")\\n" << gpuMs << "ms\"];\n";
+        file << ")\\n" << timing.gpuMs << "ms\"];\n";
     }
 
     file << "\n";

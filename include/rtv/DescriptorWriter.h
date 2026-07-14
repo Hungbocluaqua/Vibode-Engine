@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rtv/DescriptorWriteDiagnostics.h"
 #include "rtv/DescriptorSet.h"
 
 #include <Volk/volk.h>
@@ -15,7 +16,7 @@ public:
     DescriptorWriter& writeImage(uint32_t binding, VkDescriptorType type, const VkDescriptorImageInfo& imageInfo);
     DescriptorWriter& writeImageArray(uint32_t binding, VkDescriptorType type, const std::vector<VkDescriptorImageInfo>& imageInfos);
     DescriptorWriter& writeAccelerationStructure(uint32_t binding, VkAccelerationStructureKHR accelerationStructure);
-    void update(VkDevice device, DescriptorSet set) const;
+    void update(VkDevice device, DescriptorSet set, DescriptorWriteOwner owner = {}) const;
 
 private:
     struct PendingWrite {

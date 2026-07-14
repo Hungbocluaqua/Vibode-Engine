@@ -44,6 +44,10 @@ struct GpuFrameTimings {
     float skipDenoiserCopyMs = 0.0f;
     float taaMs = 0.0f;
     float taaHistoryCopyMs = 0.0f;
+    float dlssGuidesMs = 0.0f;
+    float dlssMs = 0.0f;
+    float dlssRayReconstructionGuidesMs = 0.0f;
+    float dlssRayReconstructionMs = 0.0f;
     float autoExposureMs = 0.0f;
     float autoExposureHistogramClearMs = 0.0f;
     float autoExposureHistogramMs = 0.0f;
@@ -96,6 +100,10 @@ struct GpuFrameTimings {
             skipDenoiserCopyMs +
             taaMs +
             taaHistoryCopyMs +
+            dlssGuidesMs +
+            dlssMs +
+            dlssRayReconstructionGuidesMs +
+            dlssRayReconstructionMs +
             autoExposureMs +
             toneMapMs +
             selectionOutlineMs +
@@ -229,7 +237,15 @@ public:
         AdaptiveSamplingDiagnosticsEnd = 102,
         AdaptiveSamplingFillStart = 103,
         AdaptiveSamplingFillEnd = 104,
-        Count = 105,
+        DlssGuidesStart = 105,
+        DlssGuidesEnd = 106,
+        DlssStart = 107,
+        DlssEnd = 108,
+        DlssRayReconstructionGuidesStart = 109,
+        DlssRayReconstructionGuidesEnd = 110,
+        DlssRayReconstructionStart = 111,
+        DlssRayReconstructionEnd = 112,
+        Count = 113,
     };
 
     GpuProfiler() = default;
@@ -249,7 +265,7 @@ public:
     void beginPipelineStats(VkCommandBuffer commandBuffer) const;
     void endPipelineStats(VkCommandBuffer commandBuffer) const;
     void markSubmitted() { submitted_ = true; }
-    void markStatsSubmitted() { statsSubmitted_ = true; }
+    void markStatsSubmitted() { statsSubmitted_ = statsQueryPool_ != VK_NULL_HANDLE; }
     void setGpuMarkersEnabled(bool enabled);
     [[nodiscard]] bool gpuMarkersEnabled() const { return gpuMarkersEnabled_; }
 

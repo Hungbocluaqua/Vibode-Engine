@@ -2189,7 +2189,7 @@ void drawViewportOverlayBackdrop(ImDrawList* drawList, ImVec2 min, ImVec2 max) {
 
 void drawViewportTopRail(ImDrawList* drawList, ImVec2 imagePos, ImVec2 avail) {
     const ImVec2 min(imagePos.x, imagePos.y);
-    const ImVec2 max(imagePos.x + avail.x, imagePos.y + editorIconButtonSize().y + 3.0f);
+    const ImVec2 max(imagePos.x + avail.x, imagePos.y + EditorUiMetric::toolbarButtonHeight + 6.0f);
     drawList->AddRectFilled(min, max, ImGui::GetColorU32(editorViewportOverlayBgColor()), 0.0f);
     drawList->AddLine(ImVec2(min.x, max.y), max, ImGui::GetColorU32(editorViewportOverlayBorderColor()), 1.0f);
 }
@@ -2218,6 +2218,20 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         const ImVec2 imagePos = ImGui::GetCursorScreenPos();
         lastContentExtent_.width = static_cast<uint32_t>(std::max(1.0f, std::floor(avail.x)));
         lastContentExtent_.height = static_cast<uint32_t>(std::max(1.0f, std::floor(avail.y)));
+        if (stableRenderExtent_.width == 0 || stableRenderExtent_.height == 0) {
+            stableRenderExtent_ = lastContentExtent_;
+            pendingRenderExtent_ = lastContentExtent_;
+            pendingRenderExtentFrames_ = 0;
+        } else if (pendingRenderExtent_.width == lastContentExtent_.width &&
+                   pendingRenderExtent_.height == lastContentExtent_.height) {
+            if (++pendingRenderExtentFrames_ >= 2u) {
+                stableRenderExtent_ = pendingRenderExtent_;
+                pendingRenderExtentFrames_ = 0;
+            }
+        } else {
+            pendingRenderExtent_ = lastContentExtent_;
+            pendingRenderExtentFrames_ = 1u;
+        }
         state.viewport.imageOrigin = {imagePos.x, imagePos.y};
         state.viewport.imageSize = {avail.x, avail.y};
         const ImVec2 mousePos = ImGui::GetIO().MousePos;
@@ -2229,8 +2243,8 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         state.viewport.leftClicked = hovered_ && !state.viewport.mouseCaptureActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 
         const bool imageMatchesPanel =
-            lastContentExtent_.width == state.viewport.displayExtent.width &&
-            lastContentExtent_.height == state.viewport.displayExtent.height;
+            stableRenderExtent_.width == state.viewport.displayExtent.width &&
+            stableRenderExtent_.height == state.viewport.displayExtent.height;
 
         if (imageMatchesPanel && state.viewport.textureReady && state.viewport.texture != VK_NULL_HANDLE) {
             ImGui::Image(
@@ -2656,6 +2670,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(EditorUiMetric::rowPaddingX, EditorUiMetric::rowPaddingY));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3.0f, 0.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, EditorUiMetric::compactButtonRounding);
+        const bool compactViewportToolbar = avail.x < 940.0f;
         ImGui::SetCursorScreenPos(ImVec2(imagePos.x + 4.0f, imagePos.y + 2.0f));
         ImGui::BeginGroup();
         auto toolButton = [&](EditorGlyphIcon icon, const char* id, EditorCommandId command, bool active) {
@@ -2669,29 +2684,35 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             }
             ImGui::SameLine();
         };
-        toolButton(EditorGlyphIcon::Select, "ViewportSelect", EditorCommandId::ViewportSelect, transformGizmoMode_ < 0);
-        toolButton(EditorGlyphIcon::Move, "ViewportMove", EditorCommandId::ViewportMove, transformGizmoMode_ == 0);
-        toolButton(EditorGlyphIcon::Rotate, "ViewportRotate", EditorCommandId::ViewportRotate, transformGizmoMode_ == 1);
-        toolButton(EditorGlyphIcon::Scale, "ViewportScale", EditorCommandId::ViewportScale, transformGizmoMode_ == 2);
-        toolButton(localGizmoMode_ ? EditorGlyphIcon::LocalSpace : EditorGlyphIcon::WorldSpace, "ViewportSpace", EditorCommandId::ViewportToggleLocal, localGizmoMode_);
-        if (state.editorPrefs != nullptr && selection.entityId().valid() && transformGizmoMode_ == 2) {
-            const bool linkedScale = state.editorPrefs->linkedScale;
-            const bool pressed = editorIconButton(
-                "ViewportLinkedScale",
-                linkedScale ? EditorGlyphIcon::Lock : EditorGlyphIcon::Unlock,
-                linkedScale);
-            viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Linked Scale");
-            }
-            if (pressed) {
-                state.editorPrefs->linkedScale = !linkedScale;
-            }
-            ImGui::SameLine();
-        }
-        toolButton(EditorGlyphIcon::Snap, "ViewportSnap", EditorCommandId::ViewportToggleSnap, snap_.enabled);
         toolButton(EditorGlyphIcon::Grid, "ViewportGrid", EditorCommandId::ViewportToggleGrid, showGrid_);
         toolButton(EditorGlyphIcon::Axes, "ViewportAxes", EditorCommandId::ViewportToggleAxes, showAxes_);
+        ImGui::Dummy(ImVec2(EditorUiMetric::toolbarGroupGap, 1.0f));
+        ImGui::SameLine();
+        auto toolbarActionButton = [&](const char* id, EditorGlyphIcon icon, const char* label, bool active, const char* tooltip, auto&& action) {
+            const bool pressed = compactViewportToolbar
+                ? editorIconButton(id, icon, active)
+                : editorToolbarTextButton(id, icon, label, active);
+            viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                ImGui::SetTooltip("%s", tooltip);
+            }
+            if (pressed) {
+                action();
+            }
+            ImGui::SameLine();
+        };
+        toolbarActionButton("ViewportResetAccumulation", EditorGlyphIcon::Reset, "Reset", false, "Reset accumulation", [&] {
+            requests.resetAccumulation = AccumulationResetReason::Manual;
+        });
+        toolbarActionButton("ViewportDebugView", EditorGlyphIcon::DrawDebug, "Debug", settings.debugView != RendererDebugView::Beauty, "Cycle debug view", [&] {
+            requests.toggleDebugView = true;
+        });
+        toolbarActionButton("ViewportIntermediate", EditorGlyphIcon::Details, "Intermediate", false, "Cycle intermediate render targets", [&] {
+            requests.cycleIntermediateView = true;
+        });
+        toolbarActionButton("ViewportDenoiser", EditorGlyphIcon::Render, "Denoiser", settings.denoiserEnabled, "Toggle denoiser", [&] {
+            requests.toggleDenoiser = true;
+        });
         if (selection.entityId().valid()) {
             if (editorIconButton("ViewportFrameSelected", EditorGlyphIcon::Frame, false)) { requests.focusOnEntity = selection.entityId(); }
             viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
@@ -2718,6 +2739,7 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             }
         }
         ImGui::EndGroup();
+        const float leftControlsRight = ImGui::GetItemRectMax().x;
         ImGui::PopStyleVar(3);
 
         const float gpuTotal = timings.totalMs();
@@ -2746,12 +2768,26 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
             cameraSpeed << std::fixed << std::setprecision(3) << state.camera->moveSpeed();
             cameraSpeedText = cameraSpeed.str();
         }
-        const float cameraSpeedWidth = cameraSpeedText.empty() ? 0.0f : editorIconTextButtonWidth(cameraSpeedText.c_str()) + ImGui::GetStyle().ItemSpacing.x;
-        const float overlayWidth = editorIconTextButtonWidth("View Settings") +
-            (hudVisible ? editorIconTextButtonWidth("Stats") + editorIconTextButtonWidth("Draw Debug") + cameraSpeedWidth + ImGui::GetStyle().ItemSpacing.x * 3.0f : 0.0f);
-        const float controlsX = std::max(imagePos.x + 8.0f, statusRight - overlayWidth);
-        const float statusX = std::max(imagePos.x + 8.0f, controlsX - statusSize.x - 14.0f);
+        const float overlaySpacing = ImGui::GetStyle().ItemSpacing.x;
+        const float viewSettingsWidth = compactViewportToolbar ? editorIconButtonSize().x : editorIconTextButtonWidth("View Settings");
+        const float statsWidth = compactViewportToolbar ? editorIconButtonSize().x : editorIconTextButtonWidth("Stats");
+        const float drawDebugWidth = compactViewportToolbar ? editorIconButtonSize().x : editorIconTextButtonWidth("Draw Debug");
+        const float cameraSpeedWidth = cameraSpeedText.empty() ? 0.0f : editorIconTextReadoutSize(cameraSpeedText.c_str()).x;
+        float overlayWidth = viewSettingsWidth;
+        int overlayItemCount = 1;
         if (hudVisible) {
+            overlayWidth += statsWidth + drawDebugWidth;
+            overlayItemCount += 2;
+        }
+        if (hudVisible && !cameraSpeedText.empty()) {
+            overlayWidth += cameraSpeedWidth;
+            ++overlayItemCount;
+        }
+        overlayWidth += overlaySpacing * static_cast<float>(overlayItemCount - 1);
+        const float controlsX = std::max(imagePos.x + 8.0f, statusRight - overlayWidth);
+        const float statusX = controlsX - statusSize.x - 14.0f;
+        const bool statusFits = statusX >= leftControlsRight + 10.0f;
+        if (hudVisible && statusFits) {
             dl->AddText(nullptr, ImGui::GetFontSize() * hudScale, ImVec2(statusX, statusY), IM_COL32(216, 221, 228, 245), statusText.c_str());
         }
 
@@ -2759,7 +2795,10 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
         ImGui::BeginGroup();
         auto overlayButton = [&](EditorGlyphIcon icon, const char* label, const char* popupName, const char* buttonId, const char* tooltip) {
             const bool open = ImGui::IsPopupOpen(popupName);
-            if (editorIconTextButton(buttonId, icon, label, open)) {
+            const bool pressed = compactViewportToolbar
+                ? editorIconButton(buttonId, icon, open)
+                : editorIconTextButton(buttonId, icon, label, open);
+            if (pressed) {
                 ImGui::OpenPopup(popupName);
             }
             viewportUiHovered = viewportUiHovered || ImGui::IsItemHovered();
@@ -3470,10 +3509,10 @@ void ViewportPanel::draw(EditorRuntimeState& state, EditorSelection& selection, 
 }
 
 VkExtent2D ViewportPanel::desiredRenderExtent(VkExtent2D fallback) const {
-    if (lastContentExtent_.width == 0 || lastContentExtent_.height == 0) {
+    if (stableRenderExtent_.width == 0 || stableRenderExtent_.height == 0) {
         return fallback;
     }
-    return lastContentExtent_;
+    return stableRenderExtent_;
 }
 
 void ViewportPanel::commitGizmoDrag(EditorRequests& requests, SceneDocument& document) {

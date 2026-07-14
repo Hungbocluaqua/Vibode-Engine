@@ -12,11 +12,16 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 
 namespace rtv {
 
 namespace {
+
+constexpr int kEditorLayoutVersion = 4;
 
 std::string activeSceneTitle(const EditorRuntimeState& state) {
     std::filesystem::path path;
@@ -73,6 +78,41 @@ void drawEditorSaveStateLabel(const EditorRuntimeState& state, const std::string
             state.projectSettingsDirty ? "dirty" : "saved",
             assetRegistryDirty(state) ? "dirty" : "saved");
     }
+}
+
+std::filesystem::path layoutVersionPath(const std::filesystem::path& layoutPath) {
+    std::filesystem::path versionPath = layoutPath;
+    versionPath += ".version";
+    return versionPath;
+}
+
+int readLayoutVersion(const std::filesystem::path& layoutPath) {
+    std::ifstream file(layoutVersionPath(layoutPath));
+    int version = 0;
+    if (file >> version) {
+        return version;
+    }
+    return 0;
+}
+
+void writeLayoutVersion(const std::filesystem::path& layoutPath) {
+    std::ofstream file(layoutVersionPath(layoutPath));
+    if (file.is_open()) {
+        file << kEditorLayoutVersion << '\n';
+    }
+}
+
+void backupLegacyLayout(const std::filesystem::path& layoutPath) {
+    if (layoutPath.empty() || !std::filesystem::exists(layoutPath)) {
+        return;
+    }
+    std::filesystem::path backupPath = layoutPath;
+    backupPath += ".pre-ui-redesign.bak";
+    if (std::filesystem::exists(backupPath)) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::copy_file(layoutPath, backupPath, std::filesystem::copy_options::none, ec);
 }
 
 void menuItemTooltip(const char* description, const char* disabledReason = nullptr) {
@@ -523,6 +563,8 @@ void EditorDockspace::begin(EditorRuntimeState& state, EditorPanelVisibility& vi
         ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoBringToFrontOnFocus |
         ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoBackground;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
@@ -532,7 +574,13 @@ void EditorDockspace::begin(EditorRuntimeState& state, EditorPanelVisibility& vi
     ImGui::PopStyleVar(3);
 
     const ImGuiID dockspaceId = ImGui::GetID("EditorDockspace");
-    ImGui::DockSpace(dockspaceId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
+    drawTopToolbar(state, visibility, requests);
+    ImVec2 dockspaceSize = ImGui::GetContentRegionAvail();
+    // DockSpace advances the parent cursor by ItemSpacing before the status bar.
+    const float statusBarReservation = EditorUiMetric::statusBarHeight + ImGui::GetStyle().ItemSpacing.y;
+    dockspaceSize.y = std::max(1.0f, dockspaceSize.y - statusBarReservation);
+    ImGui::DockSpace(dockspaceId, dockspaceSize, ImGuiDockNodeFlags_None);
+    drawBottomStatusBar(state);
     if (layoutResetRequested_) {
         buildDefaultLayout();
         layoutResetRequested_ = false;
@@ -597,6 +645,7 @@ void EditorDockspace::saveLayout() const {
             std::filesystem::create_directories(parent, ec);
         }
         ImGui::SaveIniSettingsToDisk(profilePath_.string().c_str());
+        writeLayoutVersion(profilePath_);
     }
 }
 
@@ -610,8 +659,13 @@ void EditorDockspace::setProfileFile(const std::filesystem::path& layoutPath) {
 
 void EditorDockspace::loadLayout() {
     if (!profilePath_.empty() && std::filesystem::exists(profilePath_)) {
-        ImGui::LoadIniSettingsFromDisk(profilePath_.string().c_str());
-        layoutResetRequested_ = false;
+        if (readLayoutVersion(profilePath_) == kEditorLayoutVersion) {
+            ImGui::LoadIniSettingsFromDisk(profilePath_.string().c_str());
+            layoutResetRequested_ = false;
+        } else {
+            backupLegacyLayout(profilePath_);
+            layoutResetRequested_ = true;
+        }
     }
 }
 
@@ -619,23 +673,36 @@ void EditorDockspace::buildDefaultLayout() {
     ImGuiID dockspaceId = ImGui::GetID("EditorDockspace");
     ImGui::DockBuilderRemoveNode(dockspaceId);
     ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
-    ImGui::DockBuilderSetNodeSize(dockspaceId, ImGui::GetMainViewport()->WorkSize);
+    ImVec2 dockSize = ImGui::GetMainViewport()->WorkSize;
+    dockSize.y = std::max(1.0f, dockSize.y - EditorUiMetric::mainToolbarHeight - EditorUiMetric::statusBarHeight);
+    ImGui::DockBuilderSetNodeSize(dockspaceId, dockSize);
+
+    const float workWidth = std::max(1.0f, dockSize.x);
+    const float workHeight = std::max(1.0f, dockSize.y);
+    const float leftWidth = std::clamp(workWidth * EditorUiMetric::dockLeftPanelRatio, 260.0f, 340.0f);
+    const float rightWidth = std::clamp(workWidth * EditorUiMetric::dockRightPanelRatio, 380.0f, 480.0f);
+    const float bottomHeight = std::clamp(workHeight * EditorUiMetric::dockBottomPanelRatio, 250.0f, 330.0f);
 
     ImGuiID center = dockspaceId;
+    ImGuiID left = 0;
     ImGuiID right = 0;
     ImGuiID bottom = 0;
-    ImGuiID rightBottom = 0;
-    ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, EditorUiMetric::dockRightPanelRatio, &right, &center);
-    ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, EditorUiMetric::dockBottomPanelRatio, &bottom, &center);
-    ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, EditorUiMetric::dockRightInspectorRatio, &rightBottom, &right);
+    ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, leftWidth / workWidth, &left, &center);
+    ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, rightWidth / std::max(1.0f, workWidth - leftWidth), &right, &center);
+    ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, bottomHeight / workHeight, &bottom, &center);
+
+    ImGuiID hierarchy = left;
+    ImGuiID sceneExplorer = 0;
+    ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, 0.30f, &sceneExplorer, &hierarchy);
 
     ImGui::DockBuilderDockWindow("Scene", center);
-    ImGui::DockBuilderDockWindow("Hierarchy", right);
+    ImGui::DockBuilderDockWindow("Hierarchy", hierarchy);
+    ImGui::DockBuilderDockWindow("Scene Explorer", sceneExplorer);
+    ImGui::DockBuilderDockWindow("Inspector", right);
     ImGui::DockBuilderDockWindow("Render Settings", right);
-    ImGui::DockBuilderDockWindow("Inspector", rightBottom);
-    ImGui::DockBuilderDockWindow("Content", bottom);
-    ImGui::DockBuilderDockWindow("Timeline", bottom);
     ImGui::DockBuilderDockWindow("Log", bottom);
+    ImGui::DockBuilderDockWindow("Console", bottom);
+    ImGui::DockBuilderDockWindow("Content", bottom);
     ImGui::DockBuilderFinish(dockspaceId);
 }
 
@@ -897,15 +964,178 @@ void EditorDockspace::executeCommand(EditorCommandId id, EditorRuntimeState& sta
     }
 }
 
+void EditorDockspace::drawTopToolbar(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests) {
+    const RendererSettings& settings = state.renderer.settings();
+    const float toolbarHeight = EditorUiMetric::mainToolbarHeight;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, editorToolbarBgColor());
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5.0f, 0.0f));
+    ImGui::BeginChild("EditorTopToolbar", ImVec2(0.0f, toolbarHeight), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 min = ImGui::GetWindowPos();
+    const ImVec2 max(min.x + ImGui::GetWindowWidth(), min.y + toolbarHeight);
+    dl->AddRectFilled(min, max, ImGui::GetColorU32(editorToolbarBgColor()));
+    dl->AddLine(ImVec2(min.x, max.y - 1.0f), ImVec2(max.x, max.y - 1.0f), ImGui::GetColorU32(editorToolbarBorderColor()));
+
+    ImGui::SetCursorPosY((toolbarHeight - EditorUiMetric::toolbarButtonHeight) * 0.5f);
+    auto commandButton = [&](const char* id, EditorGlyphIcon icon, EditorCommandId command, const char* tooltip, bool active = false) {
+        if (editorToolbarIconButton(id, icon, active)) {
+            executeCommand(command, state, visibility, requests);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            ImGui::SetTooltip("%s", tooltip);
+        }
+        ImGui::SameLine();
+    };
+
+    commandButton("TopSaveAll", EditorGlyphIcon::Save, EditorCommandId::SaveAll, "Save all");
+    commandButton("TopUndo", EditorGlyphIcon::Undo, EditorCommandId::Undo, "Undo", state.undoStack != nullptr && state.undoStack->canUndo());
+    commandButton("TopRedo", EditorGlyphIcon::Redo, EditorCommandId::Redo, "Redo", state.undoStack != nullptr && state.undoStack->canRedo());
+
+    auto viewportCommandButton = [&](const char* id, EditorGlyphIcon icon, EditorCommandId command, const char* tooltipText, bool active) {
+        if (editorToolbarIconButton(id, icon, active)) {
+            requests.viewportCommand = command;
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            const std::string shortcut = editorCommandShortcutDisplay(command, state.editorPrefs);
+            ImGui::SetTooltip(shortcut.empty() ? "%s" : "%s  %s", tooltipText, shortcut.c_str());
+        }
+        ImGui::SameLine();
+    };
+
+    ImGui::Dummy(ImVec2(EditorUiMetric::toolbarGroupGap, 1.0f));
+    ImGui::SameLine();
+    viewportCommandButton("TopViewportSelect", EditorGlyphIcon::Select, EditorCommandId::ViewportSelect, "Select", state.viewport.activeTool < 0);
+    viewportCommandButton("TopViewportMove", EditorGlyphIcon::Move, EditorCommandId::ViewportMove, "Move", state.viewport.activeTool == 0);
+    viewportCommandButton("TopViewportRotate", EditorGlyphIcon::Rotate, EditorCommandId::ViewportRotate, "Rotate", state.viewport.activeTool == 1);
+    viewportCommandButton("TopViewportScale", EditorGlyphIcon::Scale, EditorCommandId::ViewportScale, "Scale", state.viewport.activeTool == 2);
+    viewportCommandButton(
+        "TopViewportSpace",
+        state.viewport.localTransform ? EditorGlyphIcon::LocalSpace : EditorGlyphIcon::WorldSpace,
+        EditorCommandId::ViewportToggleLocal,
+        state.viewport.localTransform ? "Local coordinates" : "World coordinates",
+        state.viewport.localTransform);
+    viewportCommandButton("TopViewportSnap", EditorGlyphIcon::Snap, EditorCommandId::ViewportToggleSnap, "Snapping", state.viewport.snapEnabled);
+
+    ImGui::Dummy(ImVec2(EditorUiMetric::toolbarGroupGap, 1.0f));
+    ImGui::SameLine();
+    if (editorToolbarTextButton("TopRenderViewport", EditorGlyphIcon::Play, "Render", false)) {
+        executeCommand(EditorCommandId::RenderCurrentViewport, state, visibility, requests);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("Render current viewport");
+    }
+    ImGui::SameLine();
+    if (editorToolbarTextButton("TopRenderMode", EditorGlyphIcon::Render, settings.pathTracingEnabled ? "Path Tracing" : "Preview", settings.pathTracingEnabled)) {
+        ImGui::OpenPopup("TopRenderModePopup");
+    }
+    if (ImGui::BeginPopup("TopRenderModePopup")) {
+        RendererSettings next = settings;
+        bool changed = false;
+        changed |= ImGui::Checkbox("Path Tracing", &next.pathTracingEnabled);
+        changed |= ImGui::Checkbox("Denoiser", &next.denoiserEnabled);
+        changed |= ImGui::Checkbox("TAA", &next.taaEnabled);
+        changed |= ImGui::Checkbox("Limit to 1 SPP", &next.limitSamplesPerPixel);
+        if (changed) {
+            requestSettings(requests, next);
+        }
+        ImGui::EndPopup();
+    }
+
+    const char* readyLabel = state.sceneLoadRunning ? "Loading" : "Ready";
+    std::ostringstream spp;
+    spp << state.renderer.sampleCount() << " spp";
+    std::ostringstream fps;
+    if (state.cpuFrameMs > 0.0f) {
+        fps << std::fixed << std::setprecision(0) << (1000.0f / std::max(0.001f, state.cpuFrameMs)) << " FPS";
+    } else {
+        fps << "-- FPS";
+    }
+
+    const float itemSpacing = ImGui::GetStyle().ItemSpacing.x;
+    const float compactRightWidth = editorStatusPillSize("PT").x + editorStatusPillSize(readyLabel).x + editorToolbarTextButtonSize("View").x + itemSpacing * 2.0f;
+    const float detailedRightWidth = compactRightWidth + editorStatusPillSize(spp.str().c_str()).x + editorStatusPillSize(fps.str().c_str()).x + itemSpacing * 2.0f;
+    ImGui::SameLine();
+    const float minimumRightX = ImGui::GetCursorPosX() + EditorUiMetric::toolbarGroupGap;
+    const float rightEdge = ImGui::GetWindowContentRegionMax().x;
+    const bool compactStatus = rightEdge - minimumRightX < detailedRightWidth;
+    const float rightWidth = compactStatus ? compactRightWidth : detailedRightWidth;
+    const float rightX = std::max(minimumRightX, rightEdge - rightWidth);
+    ImGui::SetCursorPosX(rightX);
+
+    editorStatusPill("PT", settings.pathTracingEnabled, EditorGlyphIcon::Render);
+    ImGui::SameLine();
+    editorStatusPill(readyLabel, !state.sceneLoadRunning, EditorGlyphIcon::Stats);
+    ImGui::SameLine();
+    if (!compactStatus) {
+        editorStatusPill(spp.str().c_str(), false, EditorGlyphIcon::Stats);
+        ImGui::SameLine();
+        editorStatusPill(fps.str().c_str(), false, EditorGlyphIcon::Stats);
+        ImGui::SameLine();
+    }
+    if (editorToolbarTextButton("TopViewMenu", EditorGlyphIcon::ViewSettings, "View", false)) {
+        ImGui::OpenPopup("TopViewPopup");
+    }
+    if (ImGui::BeginPopup("TopViewPopup")) {
+        ImGui::MenuItem("Hierarchy", nullptr, &visibility.sceneHierarchy);
+        ImGui::MenuItem("Content", nullptr, &visibility.assetBrowser);
+        ImGui::MenuItem("Render Settings", nullptr, &visibility.renderSettings);
+        ImGui::MenuItem("Inspector", nullptr, &visibility.inspector);
+        ImGui::MenuItem("Log", nullptr, &visibility.log);
+        ImGui::MenuItem("Timeline", nullptr, &visibility.timeline);
+        ImGui::EndPopup();
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+}
+
+void EditorDockspace::drawBottomStatusBar(EditorRuntimeState& state) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, editorToolbarBgColor());
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 3.0f));
+    ImGui::BeginChild("EditorBottomStatusBar", ImVec2(0.0f, EditorUiMetric::statusBarHeight), false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 min = ImGui::GetWindowPos();
+    const ImVec2 max(min.x + ImGui::GetWindowWidth(), min.y + EditorUiMetric::statusBarHeight);
+    dl->AddLine(ImVec2(min.x, min.y), ImVec2(max.x, min.y), ImGui::GetColorU32(editorToolbarBorderColor()));
+
+    const std::string sceneTitle = activeSceneTitle(state);
+    const std::string saveLabel = editorSaveStateLabel(state);
+    ImGui::TextDisabled("Ready");
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+    ImGui::Text("Scene: %s", sceneTitle.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("|");
+    ImGui::SameLine();
+    drawEditorSaveStateLabel(state, saveLabel);
+
+    const float rightWidth = 360.0f;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX() + 10.0f, ImGui::GetWindowContentRegionMax().x - rightWidth));
+    ImGui::TextDisabled("Project: %s", state.project != nullptr ? "Open" : "None");
+    ImGui::SameLine();
+    ImGui::TextDisabled("| Vulkan | PT");
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
 void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests) {
     if (!ImGui::BeginMainMenuBar()) {
         return;
     }
 
     static std::array<char, 96> fileSearch{};
+    static std::array<char, 96> editSearch{};
     static std::array<char, 96> createSearch{};
     static std::array<char, 96> engineSearch{};
     static std::array<char, 96> windowSearch{};
+    static std::array<char, 96> toolsSearch{};
     static std::array<char, 96> renderSearch{};
     static std::array<char, 96> layoutSearch{};
     const EditorPreferences* prefs = state.editorPrefs;
@@ -915,13 +1145,13 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         visibility.inspector = true;
         visibility.assetBrowser = true;
         visibility.renderWorldSettings = false;
-        visibility.timeline = true;
+        visibility.timeline = false;
         visibility.log = true;
-        visibility.console = false;
+        visibility.console = true;
         visibility.materialEditor = false;
         visibility.renderSettings = true;
         visibility.debugProfiler = false;
-        visibility.sceneStats = false;
+        visibility.sceneStats = true;
         visibility.gpuDiagnostics = false;
         requests.resetLayout = true;
         requestResetLayout();
@@ -1013,31 +1243,6 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         if (filteredMenuItem("Close Scene", fileSearch.data(), nullptr, false, state.scenePath != nullptr && state.scenePath->has_value(), "No saved scene is currently open.", EditorGlyphIcon::SceneFile)) {
             requests.closeScene = true;
         }
-        menuSection("EDIT");
-        if (menuFilterMatches(fileSearch.data(), "Undo")) {
-            const std::string undoLabel = state.undoStack != nullptr && state.undoStack->canUndo()
-                ? std::string("Undo ") + state.undoStack->undoLabel()
-                : std::string("Undo");
-            const std::string undoShortcut = editorCommandShortcutDisplay(EditorCommandId::Undo, prefs);
-            const bool undoEnabled = state.undoStack != nullptr && state.undoStack->canUndo();
-            const std::string undoMenuLabel = menuLabelWithGlyphPadding(undoLabel.c_str());
-            if (ImGui::MenuItem(undoMenuLabel.c_str(), undoShortcut.empty() ? nullptr : undoShortcut.c_str(), false, undoEnabled)) {
-                executeCommand(EditorCommandId::Undo, state, visibility, requests);
-            }
-            drawMenuItemGlyph(EditorGlyphIcon::Undo, undoEnabled);
-        }
-        if (menuFilterMatches(fileSearch.data(), "Redo")) {
-            const std::string redoLabel = state.undoStack != nullptr && state.undoStack->canRedo()
-                ? std::string("Redo ") + state.undoStack->redoLabel()
-                : std::string("Redo");
-            const std::string redoShortcut = editorCommandShortcutDisplay(EditorCommandId::Redo, prefs);
-            const bool redoEnabled = state.undoStack != nullptr && state.undoStack->canRedo();
-            const std::string redoMenuLabel = menuLabelWithGlyphPadding(redoLabel.c_str());
-            if (ImGui::MenuItem(redoMenuLabel.c_str(), redoShortcut.empty() ? nullptr : redoShortcut.c_str(), false, redoEnabled)) {
-                executeCommand(EditorCommandId::Redo, state, visibility, requests);
-            }
-            drawMenuItemGlyph(EditorGlyphIcon::Redo, redoEnabled);
-        }
         menuSection("IMPORT / EXPORT");
         if (filteredCommandMenuItem(EditorCommandId::ImportAsset, prefs, fileSearch.data())) { executeCommand(EditorCommandId::ImportAsset, state, visibility, requests); }
         if (filteredCommandMenuItem(EditorCommandId::ImportAndPlace, prefs, fileSearch.data())) { executeCommand(EditorCommandId::ImportAndPlace, state, visibility, requests); }
@@ -1057,6 +1262,38 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         filteredPlaceholderMenuItem("Recent Projects", fileSearch.data(), EditorGlyphIcon::ProjectFile);
         menuSection("APPLICATION");
         if (filteredCommandMenuItem(EditorCommandId::Exit, prefs, fileSearch.data())) { executeCommand(EditorCommandId::Exit, state, visibility, requests); }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Edit")) {
+        drawMenuSearch("##EditMenuSearch", editSearch);
+        menuSection("HISTORY");
+        if (menuFilterMatches(editSearch.data(), "Undo")) {
+            const std::string undoLabel = state.undoStack != nullptr && state.undoStack->canUndo()
+                ? std::string("Undo ") + state.undoStack->undoLabel()
+                : std::string("Undo");
+            const std::string undoShortcut = editorCommandShortcutDisplay(EditorCommandId::Undo, prefs);
+            const bool undoEnabled = state.undoStack != nullptr && state.undoStack->canUndo();
+            const std::string undoMenuLabel = menuLabelWithGlyphPadding(undoLabel.c_str());
+            if (ImGui::MenuItem(undoMenuLabel.c_str(), undoShortcut.empty() ? nullptr : undoShortcut.c_str(), false, undoEnabled)) {
+                executeCommand(EditorCommandId::Undo, state, visibility, requests);
+            }
+            drawMenuItemGlyph(EditorGlyphIcon::Undo, undoEnabled);
+        }
+        if (menuFilterMatches(editSearch.data(), "Redo")) {
+            const std::string redoLabel = state.undoStack != nullptr && state.undoStack->canRedo()
+                ? std::string("Redo ") + state.undoStack->redoLabel()
+                : std::string("Redo");
+            const std::string redoShortcut = editorCommandShortcutDisplay(EditorCommandId::Redo, prefs);
+            const bool redoEnabled = state.undoStack != nullptr && state.undoStack->canRedo();
+            const std::string redoMenuLabel = menuLabelWithGlyphPadding(redoLabel.c_str());
+            if (ImGui::MenuItem(redoMenuLabel.c_str(), redoShortcut.empty() ? nullptr : redoShortcut.c_str(), false, redoEnabled)) {
+                executeCommand(EditorCommandId::Redo, state, visibility, requests);
+            }
+            drawMenuItemGlyph(EditorGlyphIcon::Redo, redoEnabled);
+        }
+        menuSection("COMMANDS");
+        if (filteredCommandMenuItem(EditorCommandId::CommandPalette, prefs, editSearch.data())) { executeCommand(EditorCommandId::CommandPalette, state, visibility, requests); }
         ImGui::EndMenu();
     }
 
@@ -1148,6 +1385,20 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         ImGui::EndMenu();
     }
 
+    if (ImGui::BeginMenu("Tools")) {
+        drawMenuSearch("##ToolsMenuSearch", toolsSearch);
+        menuSection("PROJECT");
+        if (filteredCommandMenuItem(EditorCommandId::ProjectSettings, prefs, toolsSearch.data(), state.project != nullptr, "No project is currently open.")) { executeCommand(EditorCommandId::ProjectSettings, state, visibility, requests); }
+        if (filteredCommandMenuItem(EditorCommandId::JobCenter, prefs, toolsSearch.data())) { executeCommand(EditorCommandId::JobCenter, state, visibility, requests); }
+        menuSection("DEVELOPER");
+        if (filteredCommandMenuItem(EditorCommandId::ReloadShaders, prefs, toolsSearch.data())) { executeCommand(EditorCommandId::ReloadShaders, state, visibility, requests); }
+        if (filteredCommandMenuItem(EditorCommandId::OpenLogFolder, prefs, toolsSearch.data())) { executeCommand(EditorCommandId::OpenLogFolder, state, visibility, requests); }
+        menuSection("REFERENCE");
+        if (filteredCommandMenuItem(EditorCommandId::ShowControls, prefs, toolsSearch.data())) { executeCommand(EditorCommandId::ShowControls, state, visibility, requests); }
+        if (filteredCommandMenuItem(EditorCommandId::ShowRendererInfo, prefs, toolsSearch.data())) { executeCommand(EditorCommandId::ShowRendererInfo, state, visibility, requests); }
+        ImGui::EndMenu();
+    }
+
     if (ImGui::BeginMenu("Render")) {
         drawMenuSearch("##RenderMenuSearch", renderSearch);
         menuSection("OUTPUT");
@@ -1201,6 +1452,12 @@ void EditorDockspace::drawMainMenu(EditorRuntimeState& state, EditorPanelVisibil
         menuSection("APPEARANCE");
         filteredPlaceholderMenuItem("UI Scale", layoutSearch.data(), EditorGlyphIcon::Layout);
         filteredPlaceholderMenuItem("Theme", layoutSearch.data(), EditorGlyphIcon::Layout);
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Help")) {
+        if (filteredCommandMenuItem(EditorCommandId::ShowControls, prefs, "")) { executeCommand(EditorCommandId::ShowControls, state, visibility, requests); }
+        if (filteredCommandMenuItem(EditorCommandId::ShowRendererInfo, prefs, "")) { executeCommand(EditorCommandId::ShowRendererInfo, state, visibility, requests); }
         ImGui::EndMenu();
     }
 

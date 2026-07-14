@@ -5,6 +5,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 struct ReGIRReservoir {
     uvec4 metadata;
     vec4 sample_position_weight;
+    vec4 proposal_pdf_m;
+    uvec4 light_identity;
 };
 
 layout(set = 0, binding = 0, std140) uniform ReGIRParamsBlock {
@@ -112,5 +114,11 @@ void main() {
     }
     selected.metadata.w = max(1u, selected.metadata.w) + neighborContributionCount;
     selected.sample_position_weight.w = max(selected.sample_position_weight.w, 0.0);
+    float selectedM = float(max(selected.metadata.w, 1u));
+    selected.proposal_pdf_m = vec4(
+        weightSum,
+        selected.sample_position_weight.w / max(weightSum, 1.0e-8),
+        weightSum / selectedM,
+        selectedM);
     output_reservoirs[reservoirIndex] = selected;
 }

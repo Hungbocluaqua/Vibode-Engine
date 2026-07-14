@@ -23,6 +23,8 @@ private:
     void loadLayout();
     void executeCommand(EditorCommandId id, EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
     void drawMainMenu(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
+    void drawTopToolbar(EditorRuntimeState& state, EditorPanelVisibility& visibility, EditorRequests& requests);
+    void drawBottomStatusBar(EditorRuntimeState& state);
     void drawDockTabIconOverlays(EditorPanelVisibility& visibility, EditorRequests& requests);
     void drawDockPanelChromeOverlays();
     void drawHelpWindows();

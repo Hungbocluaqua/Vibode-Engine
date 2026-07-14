@@ -551,26 +551,124 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
         SceneDocument& document = *state.sceneDocument;
         SceneRegistry& registry = document.registry();
 
-        ImGui::BeginGroup();
-        hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterMesh, EditorGlyphIcon::Model, "Filter mesh objects");
+        static std::array<char, 128> filterBuffer{};
+        ImGui::SetNextItemWidth(-72.0f);
+        ImGui::InputTextWithHint("##entityFilter", "Search scene...", filterBuffer.data(), filterBuffer.size());
         ImGui::SameLine();
-        hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterCamera, EditorGlyphIcon::Camera, "Filter cameras");
-        ImGui::SameLine();
-        hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterLight, EditorGlyphIcon::Light, "Filter lights and suns");
-        ImGui::SameLine();
-        hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterWorld, EditorGlyphIcon::Environment, "Filter world environment actors");
-        ImGui::SameLine();
-        hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterAtmosphere, EditorGlyphIcon::Sky, "Filter atmosphere, fog, and cloud actors");
-        ImGui::SameLine();
-        hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterEffects, EditorGlyphIcon::PostProcess, "Filter post-process and effects actors");
-        if (typeFilterMask_ != 0) {
-            ImGui::SameLine();
-            if (editorIconButton("HierarchyClearTypeFilters", EditorGlyphIcon::Exit, false, ImVec2(18.0f, 18.0f))) {
-                typeFilterMask_ = 0;
-            }
-            hierarchyTooltip("Clear hierarchy type filters");
+        const bool filtersActive = typeFilterMask_ != 0 || !layerFilter_.empty() || !tagFilter_.empty() || !collectionFilter_.empty();
+        if (editorIconButton("HierarchyFilter", EditorGlyphIcon::ViewSettings, filtersActive)) {
+            ImGui::OpenPopup("HierarchyFilterPopup");
         }
-        ImGui::EndGroup();
+        hierarchyTooltip("Filter hierarchy");
+        ImGui::SameLine();
+        if (editorIconButton("HierarchyAddEntity", EditorGlyphIcon::Add, false)) {
+            ImGui::OpenPopup("HierarchyCreatePopup");
+        }
+        hierarchyTooltip("Create entity");
+
+        if (ImGui::BeginPopup("HierarchyCreatePopup")) {
+            if (editorGlyphMenuItem(EditorGlyphIcon::Entity, "Empty Entity")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Empty};
+                requests.sceneUpdate = SceneUpdateKind::None;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Camera, "Camera")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Camera};
+                requests.sceneUpdate = SceneUpdateKind::CameraOnly;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Point Light")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Light};
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Spot Light")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::SpotLight};
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Light, "Area Light")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::AreaLight};
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Sun, "Sun")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::Sun};
+                requests.sceneUpdate = SceneUpdateKind::LightOnly;
+            }
+            ImGui::Separator();
+            if (editorGlyphMenuItem(EditorGlyphIcon::Environment, "Environment Light")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::EnvironmentLight};
+                requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Sky, "Sky Atmosphere")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::SkyAtmosphere};
+                requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Fog, "Height Fog")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::HeightFog};
+                requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::Cloud, "Volumetric Cloud")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::VolumetricCloud};
+                requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
+            }
+            if (editorGlyphMenuItem(EditorGlyphIcon::PostProcess, "Post Process Volume")) {
+                requests.createEntity = EditorEntityCreateRequest{.kind = EditorEntityCreateKind::PostProcessVolume};
+                requests.sceneUpdate = SceneUpdateKind::RendererSettingsOnly;
+            }
+            ImGui::EndPopup();
+        }
+
+        std::string filter = filterBuffer.data();
+        std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (ImGui::BeginPopup("HierarchyFilterPopup")) {
+            ImGui::TextDisabled("TYPE");
+            hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterMesh, EditorGlyphIcon::Model, "Mesh objects");
+            ImGui::SameLine();
+            hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterCamera, EditorGlyphIcon::Camera, "Cameras");
+            ImGui::SameLine();
+            hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterLight, EditorGlyphIcon::Light, "Lights");
+            ImGui::SameLine();
+            hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterWorld, EditorGlyphIcon::Environment, "World actors");
+            ImGui::SameLine();
+            hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterAtmosphere, EditorGlyphIcon::Sky, "Atmosphere");
+            ImGui::SameLine();
+            hierarchyTypeFilterButton(typeFilterMask_, HierarchyTypeFilterEffects, EditorGlyphIcon::PostProcess, "Effects");
+            ImGui::Separator();
+            drawHierarchyLayerControls(document, requests, layerFilter_);
+            drawHierarchyTagControls(document, tagFilter_);
+            drawHierarchyCollectionControls(document, collectionFilter_);
+            const std::vector<EntityId> popupSelection = collectFilteredSelectableEntities(
+                registry,
+                filter,
+                layerFilter_,
+                tagFilter_,
+                collectionFilter_,
+                typeFilterMask_);
+            ImGui::Separator();
+            ImGui::BeginDisabled(popupSelection.empty());
+            if (editorIconTextButton("HierarchySelectFiltered", EditorGlyphIcon::Select, "Select Filtered")) {
+                selection.selectEntities(popupSelection);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (editorIconTextButton("HierarchyResetFilters", EditorGlyphIcon::Reset, "Reset")) {
+                typeFilterMask_ = 0;
+                layerFilter_.clear();
+                tagFilter_.clear();
+                collectionFilter_.clear();
+            }
+            ImGui::EndPopup();
+        }
+
+        ImGui::TextDisabled("%zu entities", registry.entities().size());
+        if (selection.selectionCount() > 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(editorAccentColor(), "%zu selected", selection.selectionCount());
+        }
+        if (filtersActive) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("filtered");
+        }
+
         if (ImGui::BeginDragDropTarget()) {
             if (const auto* payload = ImGui::AcceptDragDropPayload("PREFAB_ASSET")) {
                 requests.placeAsset = std::string(static_cast<const char*>(payload->Data));
@@ -578,35 +676,6 @@ void SceneHierarchyPanel::draw(const EditorRuntimeState& state, EditorSelection&
             ImGui::EndDragDropTarget();
         }
 
-        static std::array<char, 128> filterBuffer{};
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::InputTextWithHint("##entityFilter", "Search...", filterBuffer.data(), filterBuffer.size());
-        std::string filter = filterBuffer.data();
-        std::transform(filter.begin(), filter.end(), filter.begin(), [](unsigned char ch) {
-            return static_cast<char>(std::tolower(ch));
-        });
-        drawHierarchyLayerControls(document, requests, layerFilter_);
-        drawHierarchyTagControls(document, tagFilter_);
-        drawHierarchyCollectionControls(document, collectionFilter_);
-        const std::vector<EntityId> filteredSelectable = collectFilteredSelectableEntities(
-            registry,
-            filter,
-            layerFilter_,
-            tagFilter_,
-            collectionFilter_,
-            typeFilterMask_);
-        ImGui::BeginDisabled(filteredSelectable.empty());
-        if (editorIconTextButton("HierarchySelectFiltered", EditorGlyphIcon::Select, "Select Filtered")) {
-            selection.selectEntities(filteredSelectable);
-        }
-        ImGui::EndDisabled();
-        hierarchyTooltip("Select all unlocked entities matching the current hierarchy filters.");
-        ImGui::SameLine();
-        ImGui::BeginDisabled(selection.selectionCount() == 0);
-        if (editorIconTextButton("HierarchyClearSelection", EditorGlyphIcon::Exit, "Clear Selection")) {
-            selection.clear();
-        }
-        ImGui::EndDisabled();
         ImGui::Separator();
 
         const EntityId selectedEntity = selection.entityId();

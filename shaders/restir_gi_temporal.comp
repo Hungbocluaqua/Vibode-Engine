@@ -73,6 +73,8 @@ const uint GI_COUNTER_VERSION_REJECT = 44u;
 const uint GI_COUNTER_NON_FINITE = 45u;
 const uint GI_COUNTER_ACTIVE_TILES = 46u;
 const uint GI_COUNTER_ACTIVE_PIXELS = 47u;
+const uint GI_COUNTER_CONTRACT_INVALID_SOURCE_PDF = 48u;
+const uint GI_COUNTER_CONTRACT_INVALID_TARGET_PDF = 49u;
 
 layout(push_constant, std430) uniform PushConstants {
     uint width;
@@ -94,6 +96,16 @@ layout(push_constant, std430) uniform PushConstants {
 const uint GI_ACTIVE_TILE_SIZE = 16u;
 shared uint s_activeTileBits[4];
 
+void record_prod_contract_violation(ProdRestirGiReservoir reservoir) {
+    if ((prod_unpack_flags(reservoir) & PROD_FLAG_VALID) == 0u) return;
+    if (prod_contract_invalid_source_pdf(reservoir)) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_CONTRACT_INVALID_SOURCE_PDF], 1u);
+    }
+    if (prod_contract_invalid_target_pdf(reservoir)) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_CONTRACT_INVALID_TARGET_PDF], 1u);
+    }
+}
+
 uint active_tile_index(ivec2 fullPixel) {
     uint tileColumns = (pc.width + GI_ACTIVE_TILE_SIZE - 1u) / GI_ACTIVE_TILE_SIZE;
     return uint(fullPixel.y) / GI_ACTIVE_TILE_SIZE * tileColumns +
@@ -101,6 +113,9 @@ uint active_tile_index(ivec2 fullPixel) {
 }
 
 void mark_active_tile_workgroup(ivec2 fullPixel, bool activeCandidate) {
+    if (!GI_ACTIVE_TILE_MASK_ENABLED) {
+        return;
+    }
     if (gl_LocalInvocationIndex < 4u) {
         s_activeTileBits[gl_LocalInvocationIndex] = 0u;
     }
@@ -294,6 +309,7 @@ void main() {
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_TEMPORAL_PIXELS], 1u);
         current = convert_current(current_reservoirs[sourceIndex], receiver, sourceIndex);
         currentValid = prod_reservoir_valid(current);
+        if (!currentValid) record_prod_contract_violation(current);
         currentActive = currentValid && restir_gi_receiver_valid_for_reuse(receiver);
     }
     mark_active_tile_workgroup(sourcePixel, currentActive);
@@ -330,8 +346,13 @@ void main() {
         ? uint(historyFull.y / 2) * outWidth + uint(historyFull.x / 2)
         : uint(historyFull.y) * outWidth + uint(historyFull.x);
     ProdRestirGiReservoir previous = previous_reservoirs[historyIndex];
-    if (!prod_reservoir_valid(previous) ||
-        (prod_unpack_flags(previous) & PROD_FLAG_FINALIZED) == 0u ||
+    if (!prod_reservoir_valid(previous)) {
+        record_prod_contract_violation(previous);
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_TEMPORAL_REJECT_AGE], 1u);
+        store_temporal_reservoir(outputIndex, current);
+        return;
+    }
+    if ((prod_unpack_flags(previous) & PROD_FLAG_FINALIZED) == 0u ||
         prod_unpack_age(previous) >= min(pc.temporalMaxAge, 255u)) {
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_TEMPORAL_REJECT_AGE], 1u);
         store_temporal_reservoir(outputIndex, current);

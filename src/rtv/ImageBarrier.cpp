@@ -1,5 +1,7 @@
 #include "rtv/ImageBarrier.h"
 
+#include "rtv/GpuValidation.h"
+
 namespace rtv::barrier {
 
 VkImageSubresourceRange colorRange(uint32_t baseMip, uint32_t mipCount) {
@@ -31,6 +33,7 @@ void cmdTransitionImage(VkCommandBuffer commandBuffer, const ImageTransition& tr
     dependency.imageMemoryBarrierCount = 1;
     dependency.pImageMemoryBarriers = &imageBarrier;
 
+    recordManualBarrierEscape("ImageBarrier", "cmdTransitionImage", dependency);
     vkCmdPipelineBarrier2(commandBuffer, &dependency);
 }
 
@@ -52,6 +55,7 @@ void cmdBufferBarrier(VkCommandBuffer commandBuffer, const BufferTransition& tra
     dependency.bufferMemoryBarrierCount = 1;
     dependency.pBufferMemoryBarriers = &bufferBarrier;
 
+    recordManualBarrierEscape("ImageBarrier", "cmdBufferBarrier", dependency);
     vkCmdPipelineBarrier2(commandBuffer, &dependency);
 }
 

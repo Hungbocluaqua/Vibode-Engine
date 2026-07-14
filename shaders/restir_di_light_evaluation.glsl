@@ -2,13 +2,51 @@
 #define RTV_RESTIR_DI_LIGHT_EVALUATION_GLSL
 
 // Compute-pass light resolution and target-integrand evaluation; requires restir_di_types_accessors.glsl.
-bool restir_di_resolve_light(
+const uint RESTIR_DI_LIGHT_MAP_INVALID = 0u;
+const uint RESTIR_DI_LIGHT_MAP_CACHED = 1u;
+const uint RESTIR_DI_LIGHT_MAP_REMAPPED = 2u;
+const uint RESTIR_DI_LIGHT_MAP_CHANGED = 3u;
+const uint RESTIR_DI_LIGHT_MAP_UNMAPPED = 4u;
+const uint RESTIR_DI_LIGHT_MAP_INFINITE = 5u;
+const uint RESTIR_DI_LIGHT_REMAP_SCAN_LIMIT = 2048u;
+
+bool restir_di_light_hash_kind_matches(RestirDiReservoir reservoir, RestirDiLightRecord light) {
+    return reservoir.sampleMetadata.x == restir_di_identity_hash(light.identity.xy) &&
+        restir_di_light_kind(reservoir) == light.metadata.x;
+}
+
+uvec4 restir_di_infinite_light_identity(uint reservoirKind, uint currentLightVersion, uint currentEnvironmentVersion) {
+    return reservoirKind == RESTIR_DI_LIGHT_ENVIRONMENT
+        ? uvec4(RESTIR_DI_ENVIRONMENT_ID_HASH, 0u, currentEnvironmentVersion, 0u)
+        : uvec4(RESTIR_DI_SUN_ID_HASH, 0u, currentLightVersion, 0u);
+}
+
+bool restir_di_resolve_light_with_status(
     RestirDiReservoir reservoir,
     out RestirDiLightRecord light,
-    out uint resolvedIndex) {
+    out uint resolvedIndex,
+    out uint mapStatus,
+    uint currentLightVersion,
+    uint currentEnvironmentVersion) {
+    mapStatus = RESTIR_DI_LIGHT_MAP_INVALID;
     uint reservoirKind = restir_di_light_kind(reservoir);
     if (restir_di_light_kind_infinite(reservoirKind)) {
         resolvedIndex = RESTIR_DI_PSEUDO_LIGHT_INDEX;
+        uvec4 currentIdentity = restir_di_infinite_light_identity(
+            reservoirKind,
+            currentLightVersion,
+            currentEnvironmentVersion);
+        if (reservoir.sampleMetadata.x != currentIdentity.x ||
+            reservoir.sampleMetadata.y != currentIdentity.z) {
+            light.metadata = uvec4(0u);
+            light.identity = currentIdentity;
+            light.data0 = vec4(0.0);
+            light.data1 = vec4(0.0);
+            light.data2 = vec4(0.0);
+            light.data3 = vec4(0.0);
+            mapStatus = RESTIR_DI_LIGHT_MAP_CHANGED;
+            return false;
+        }
         vec3 storedDirection = reservoir.samplePosition_distance.xyz;
         float storedDirectionLen2 = dot(storedDirection, storedDirection);
         vec3 direction = storedDirectionLen2 > 1.0e-8
@@ -17,13 +55,12 @@ bool restir_di_resolve_light(
         vec3 radiance = restir_di_sample_radiance(reservoir);
         float sourcePdf = restir_di_source_pdf(reservoir);
         light.metadata = uvec4(reservoirKind, 0u, 0u, 0u);
-        light.identity = reservoirKind == RESTIR_DI_LIGHT_ENVIRONMENT
-            ? uvec4(RESTIR_DI_ENVIRONMENT_ID_HASH, 0u, RESTIR_DI_ENVIRONMENT_VERSION, 0u)
-            : uvec4(RESTIR_DI_SUN_ID_HASH, 0u, RESTIR_DI_SUN_VERSION, 0u);
+        light.identity = currentIdentity;
         light.data0 = vec4(sourcePdf, sourcePdf, 0.0, 0.0);
         light.data1 = vec4(direction, 0.0);
         light.data2 = vec4(radiance, 0.0);
         light.data3 = vec4(0.0);
+        mapStatus = RESTIR_DI_LIGHT_MAP_INFINITE;
         return sourcePdf > 1.0e-6 &&
             storedDirectionLen2 > 1.0e-8 &&
             dot(radiance, vec3(0.2126, 0.7152, 0.0722)) > 0.0;
@@ -34,10 +71,34 @@ bool restir_di_resolve_light(
         restir_di_light_identity_matches(reservoir, restir_di_light_records[cachedIndex])) {
         resolvedIndex = cachedIndex;
         light = restir_di_light_records[cachedIndex];
+        mapStatus = RESTIR_DI_LIGHT_MAP_CACHED;
         return true;
     }
-    // Light/distribution changes invalidate DI history on the CPU. Avoid an
-    // unbounded per-pixel scan when a stale cached index does not match.
+
+    if (restir_di_scene.lightCount > RESTIR_DI_LIGHT_REMAP_SCAN_LIMIT) {
+        resolvedIndex = 0u;
+        light.metadata = uvec4(0u);
+        light.identity = uvec4(0u);
+        light.data0 = vec4(0.0);
+        light.data1 = vec4(0.0);
+        light.data2 = vec4(0.0);
+        light.data3 = vec4(0.0);
+        mapStatus = RESTIR_DI_LIGHT_MAP_UNMAPPED;
+        return false;
+    }
+
+    bool sawChangedIdentity = false;
+    for (uint i = 0u; i < restir_di_scene.lightCount; ++i) {
+        RestirDiLightRecord candidate = restir_di_light_records[i];
+        if (restir_di_light_identity_matches(reservoir, candidate)) {
+            resolvedIndex = i;
+            light = candidate;
+            mapStatus = RESTIR_DI_LIGHT_MAP_REMAPPED;
+            return true;
+        }
+        sawChangedIdentity = sawChangedIdentity || restir_di_light_hash_kind_matches(reservoir, candidate);
+    }
+
     resolvedIndex = 0u;
     light.metadata = uvec4(0u);
     light.identity = uvec4(0u);
@@ -45,7 +106,46 @@ bool restir_di_resolve_light(
     light.data1 = vec4(0.0);
     light.data2 = vec4(0.0);
     light.data3 = vec4(0.0);
+    mapStatus = sawChangedIdentity ? RESTIR_DI_LIGHT_MAP_CHANGED : RESTIR_DI_LIGHT_MAP_UNMAPPED;
     return false;
+}
+
+bool restir_di_resolve_light_with_status(
+    RestirDiReservoir reservoir,
+    out RestirDiLightRecord light,
+    out uint resolvedIndex,
+    out uint mapStatus) {
+    return restir_di_resolve_light_with_status(
+        reservoir,
+        light,
+        resolvedIndex,
+        mapStatus,
+        RESTIR_DI_SUN_VERSION,
+        RESTIR_DI_ENVIRONMENT_VERSION);
+}
+
+bool restir_di_resolve_light(
+    RestirDiReservoir reservoir,
+    out RestirDiLightRecord light,
+    out uint resolvedIndex,
+    uint currentLightVersion,
+    uint currentEnvironmentVersion) {
+    uint ignoredMapStatus;
+    return restir_di_resolve_light_with_status(
+        reservoir,
+        light,
+        resolvedIndex,
+        ignoredMapStatus,
+        currentLightVersion,
+        currentEnvironmentVersion);
+}
+
+bool restir_di_resolve_light(
+    RestirDiReservoir reservoir,
+    out RestirDiLightRecord light,
+    out uint resolvedIndex) {
+    uint ignoredMapStatus;
+    return restir_di_resolve_light_with_status(reservoir, light, resolvedIndex, ignoredMapStatus);
 }
 
 float restir_di_light_selection_pdf(uint lightIndex, RestirDiLightRecord light) {
@@ -91,14 +191,18 @@ float restir_di_pdf_at_receiver(
 
 vec3 restir_di_light_normal(RestirDiReservoir r);
 
-vec3 restir_di_evaluate_integrand(
+vec3 restir_di_evaluate_integrand_components(
     RestirDiReservoir reservoir,
     RestirDiReceiver current,
     RestirDiLightRecord light,
     float lightPdf,
     out vec3 currentDirection,
     out float currentDistance,
-    out vec3 currentLightNormal) {
+    out vec3 currentLightNormal,
+    out vec3 diffuseContribution,
+    out vec3 specularContribution) {
+    diffuseContribution = vec3(0.0);
+    specularContribution = vec3(0.0);
     uint kind = restir_di_light_kind(reservoir);
     vec3 samplePosition = reservoir.samplePosition_distance.xyz;
     if (kind == RESTIR_DI_LIGHT_DIRECTIONAL || restir_di_light_kind_infinite(kind)) {
@@ -197,7 +301,8 @@ vec3 restir_di_evaluate_integrand(
         max(3.14159265 * eV * eL, 1.0e-8);
 
     bool pbrClosure = (restir_di_receiver_surface_flags(current) & RESTIR_DI_SURFACE_PBR) != 0u;
-    vec3 bsdf = pbrClosure ? diffuse + specular : baseColor * (orenFactor / 3.14159265);
+    vec3 diffuseBsdf = pbrClosure ? diffuse : baseColor * (orenFactor / 3.14159265);
+    vec3 specularBsdf = pbrClosure ? specular : vec3(0.0);
 
     float diffusePdf = nDotL / 3.14159265;
     float smithG1V = 2.0 * nDotV /
@@ -211,7 +316,32 @@ vec3 restir_di_evaluate_integrand(
     float bsdfPdf = pbrClosure ? mix(diffusePdf, specularPdf, specularProbability) : diffusePdf;
     float lightPdf2 = lightPdf * lightPdf;
     float misWeight = lightPdf2 / max(lightPdf2 + bsdfPdf * bsdfPdf, 1.0e-8);
-    return max(bsdf * incidentRadiance * nDotL * misWeight, vec3(0.0));
+    vec3 incidentScale = incidentRadiance * nDotL * misWeight;
+    diffuseContribution = max(diffuseBsdf * incidentScale, vec3(0.0));
+    specularContribution = max(specularBsdf * incidentScale, vec3(0.0));
+    return diffuseContribution + specularContribution;
+}
+
+vec3 restir_di_evaluate_integrand(
+    RestirDiReservoir reservoir,
+    RestirDiReceiver current,
+    RestirDiLightRecord light,
+    float lightPdf,
+    out vec3 currentDirection,
+    out float currentDistance,
+    out vec3 currentLightNormal) {
+    vec3 diffuseContribution;
+    vec3 specularContribution;
+    return restir_di_evaluate_integrand_components(
+        reservoir,
+        current,
+        light,
+        lightPdf,
+        currentDirection,
+        currentDistance,
+        currentLightNormal,
+        diffuseContribution,
+        specularContribution);
 }
 
 

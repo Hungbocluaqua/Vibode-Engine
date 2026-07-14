@@ -2,6 +2,7 @@
 #include "rtv/AnimationController.h"
 #include "rtv/AssetImport.h"
 #include "rtv/AssetRegistry.h"
+#include "rtv/DescriptorWriteDiagnostics.h"
 #include "rtv/DiagnosticTools.h"
 #include "rtv/HeadlessDiagnostics.h"
 #include "rtv/NativeAssetMigration.h"
@@ -14,6 +15,7 @@
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/Project.h"
 #include "rtv/RendererDebug.h"
+#include "rtv/RendererCoreRegressionTests.h"
 #include "rtv/RendererSettings.h"
 #include "rtv/RenderGraphDump.h"
 #include "rtv/RenderGraph.h"
@@ -27,12 +29,15 @@
 #include "rtv/TextureLoader.h"
 #include "rtv/GpuSceneStreamingState.h"
 #include "rtv/IncrementalGpuSceneUpdateQueue.h"
+#include "rtv/KnownCommandLineOptions.h"
 #include "rtv/GpuProfiler.h"
+#include "rtv/GpuValidation.h"
 #include "rtv/GpuCrashDiagnostics.h"
 #include "rtv/NsightPerfMarkers.h"
 #include "rtv/GpuUploadTicket.h"
 #include "rtv/MainThreadApplyTicket.h"
 #include "rtv/TopologyRebuildTicket.h"
+#include "rtv/VulkanContext.h"
 
 #include <exception>
 #include <algorithm>
@@ -153,6 +158,73 @@ static void initRenderDoc() {
 #endif
 
 namespace {
+
+nlohmann::json backendComparisonPolicyJson() {
+    return {
+        {"schema_version", 1},
+        {"policy_name", "RTXDI Q5D backend comparison policy"},
+        {"promotion_gate", "scripts/backend_comparison_matrix.ps1"},
+        {"current_safe_default", {
+            {"denoiser_backend", "engine"},
+            {"temporal_upscaler", "taa-tsr"},
+            {"dlss_ray_reconstruction", false},
+            {"reason", "Engine denoiser plus TAA/TSR remains the safe default until Q5D evidence promotes another backend."},
+        }},
+        {"fallback_order", nlohmann::json::array({
+            {
+                {"rank", 1},
+                {"mode", "engine_taa"},
+                {"denoiser_backend", "engine"},
+                {"temporal_upscaler", "taa-tsr"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Always available safe default."},
+            },
+            {
+                {"rank", 2},
+                {"mode", "nrd_taa"},
+                {"denoiser_backend", "nrd"},
+                {"temporal_upscaler", "taa-tsr"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Use only when direct NRD is available and the Q5D matrix passes quality/stability gates."},
+            },
+            {
+                {"rank", 3},
+                {"mode", "engine_dlss"},
+                {"denoiser_backend", "engine"},
+                {"temporal_upscaler", "dlss"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Use when DLSS is available/requested; fall back to TAA/TSR when DLSS is unavailable."},
+            },
+            {
+                {"rank", 4},
+                {"mode", "nrd_dlss"},
+                {"denoiser_backend", "nrd"},
+                {"temporal_upscaler", "dlss"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Use only when NRD and DLSS are both available and Q5D evidence beats/ties lower-risk modes."},
+            },
+            {
+                {"rank", 5},
+                {"mode", "dlss_rr"},
+                {"denoiser_backend", "engine"},
+                {"temporal_upscaler", "dlss"},
+                {"dlss_ray_reconstruction", true},
+                {"condition", "Opt-in only; requires DLSS RR availability plus valid depth, motion, disocclusion, ray-direction, hit-distance, and reflected-albedo guides."},
+            },
+            {
+                {"rank", 6},
+                {"mode", "reference_no_temporal"},
+                {"denoiser_backend", "off"},
+                {"temporal_upscaler", "off"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Reference/diagnostic accumulation only; never a realtime fallback."},
+            },
+        })},
+        {"promotion_rule", "Do not change defaults until the candidate wins or ties equal-time quality/stability, has valid guide/profile diagnostics, and records a rollback CLI setting."},
+        {"failure_policy", "Backend-specific failures must be visible in profile JSON, validation logs, and debug guide exports; tone mapping, auto exposure, final-output clamps, or TAA history must not hide them."},
+        {"cli_query", "--print-backend-policy"},
+    };
+}
 
 std::filesystem::path resolveProjectPath(const std::filesystem::path& root, const std::string& value) {
     if (value.empty()) {
@@ -2861,8 +2933,16 @@ int cookAnimationControllerCommand(
 
 int main(int argc, char** argv) {
     try {
+        rtv::validateCommandLineArguments(argc, argv);
         const bool viewerExecutable = argc > 0 &&
             std::filesystem::path(argv[0]).stem().string() == "rtviewer";
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view arg(argv[i]);
+            if (arg == "--print-backend-policy" || arg == "--backend-policy") {
+                std::cout << backendComparisonPolicyJson().dump(2) << '\n';
+                return 0;
+            }
+        }
         uint32_t maxFrames = 0;
         rtv::RendererDebugView debugView = rtv::RendererDebugView::Beauty;
         bool debugViewProvided = false;
@@ -2973,6 +3053,8 @@ int main(int argc, char** argv) {
         std::optional<bool> sppLimiterOverride;
         bool validationCameraMotion = false;
         bool validationObjectMotion = false;
+        bool validationLightReorder = false;
+        bool validationLightFlicker = false;
         bool rendererOnly = viewerExecutable;
         uint32_t captureReadyAfterFrames = 60;
         bool captureReadyLog = false;
@@ -2994,6 +3076,7 @@ int main(int argc, char** argv) {
         std::optional<std::filesystem::path> compareImageSequenceBaselinePath;
         std::optional<std::filesystem::path> compareImageSequenceCurrentPath;
         std::optional<std::filesystem::path> compareImageOutputPath;
+        rtv::ImageCompareThresholds compareImageThresholds;
         bool updateBaseline = false;
         bool checkBaseline = false;
         std::filesystem::path baselineRoot = "baselines";
@@ -3073,6 +3156,7 @@ int main(int argc, char** argv) {
         bool validateGpuLabels = false;
         bool shaderHotReloadReport = false;
         bool selfTestStreamingTransfer = false;
+        bool selfTestRendererCore = false;
         rtv::StreamingRuntimeOptions streamingOptions;
         std::optional<std::filesystem::path> dumpStreamingPath;
         std::optional<std::filesystem::path> streamingValidationScenePath;
@@ -3564,7 +3648,13 @@ int main(int argc, char** argv) {
             }
 
             if (arg == "--restir-di" && i + 1 < argc) {
-                restirDiModeOverride = rtv::parseRestirDiMode(argv[++i]);
+                const std::string_view value(argv[++i]);
+                rtv::RestirDiMode parsedMode{};
+                if (!rtv::tryParseRestirDiMode(value, parsedMode)) {
+                    throw std::runtime_error("Invalid --restir-di value '" + std::string(value) +
+                        "'. Expected off, legacy, production, reference-validation, or hybrid-compare.");
+                }
+                restirDiModeOverride = parsedMode;
                 continue;
             }
             if (arg == "--restir-di-temporal" && i + 1 < argc) {
@@ -3627,7 +3717,13 @@ int main(int argc, char** argv) {
                 continue;
             }
             if ((arg == "--restir-gi" || arg == "--restir-gi-mode") && i + 1 < argc) {
-                restirGiModeOverride = rtv::parseRestirGiMode(argv[++i]);
+                const std::string_view value(argv[++i]);
+                rtv::RestirGiMode parsedMode{};
+                if (!rtv::tryParseRestirGiMode(value, parsedMode)) {
+                    throw std::runtime_error("Invalid " + std::string(arg) + " value '" + std::string(value) +
+                        "'. Expected off, legacy-cache, production, or reference-validation.");
+                }
+                restirGiModeOverride = parsedMode;
                 restirGiOverride = *restirGiModeOverride != rtv::RestirGiMode::Off;
                 continue;
             }
@@ -3834,10 +3930,14 @@ int main(int argc, char** argv) {
             } else if ((arg == "--spp-limit" || arg == "--limit-spp") && i + 1 < argc) {
                 const std::string_view value(argv[++i]);
                 sppLimiterOverride = !(value == "off" || value == "false" || value == "0");
-            } else if (arg == "--validation-camera-motion") {
-                validationCameraMotion = true;
-            } else if (arg == "--validation-object-motion") {
-                validationObjectMotion = true;
+            } else if (arg == "--validation-camera-motion" ||
+                       arg == "--validation-object-motion" ||
+                       arg == "--validation-light-reorder" ||
+                       arg == "--validation-light-flicker") {
+                validationCameraMotion = validationCameraMotion || arg == "--validation-camera-motion";
+                validationObjectMotion = validationObjectMotion || arg == "--validation-object-motion";
+                validationLightReorder = validationLightReorder || arg == "--validation-light-reorder";
+                validationLightFlicker = validationLightFlicker || arg == "--validation-light-flicker";
             } else if (arg == "--headless") {
                 diagConfig.headless = true;
             } else if (arg == "--warmup-frames" && i + 1 < argc) {
@@ -3978,6 +4078,8 @@ int main(int argc, char** argv) {
                     nativeStoreReleases.push_back(value);
                 } else if (arg == "--native-store-unmount-package") {
                     nativeStoreUnmountPackages.push_back(std::filesystem::path(value));
+                } else {
+                    throw std::runtime_error("Unknown command-line argument: " + std::string(arg));
                 }
             } else if (arg == "--load-native-runtime-assets" && i + 1 < argc) {
                 loadNativeRuntimeAssetsPath = std::filesystem::path(argv[++i]);
@@ -4015,14 +4117,25 @@ int main(int argc, char** argv) {
             } else if ((arg == "--native2b-terminal-direct-rate" ||
                         arg == "--native2b-terminal-direct-sample-probability") && i + 1 < argc) {
                 native2BTerminalDirectSampleProbabilityOverride = std::stof(argv[++i]);
+            } else if (arg == "--compare-min-psnr" && i + 1 < argc) {
+                compareImageThresholds.minPsnr = std::stod(argv[++i]);
+            } else if (arg == "--compare-min-ssim" && i + 1 < argc) {
+                compareImageThresholds.minSsim = std::stod(argv[++i]);
+            } else if (arg == "--compare-max-changed-pixels" && i + 1 < argc) {
+                compareImageThresholds.maxChangedPixelPercentage = std::stod(argv[++i]);
             }
         }
 
         for (int i = 1; i < argc; ++i) {
             if (std::string(argv[i]) == "--selftest-streaming-transfer") {
                 selfTestStreamingTransfer = true;
-                break;
+            } else if (std::string(argv[i]) == "--selftest-renderer-core") {
+                selfTestRendererCore = true;
             }
+        }
+
+        if (selfTestRendererCore) {
+            return rtv::runRendererCoreRegressionTests(std::cout);
         }
 
         if (compareProfileOldPath.has_value() || compareProfileNewPath.has_value()) {
@@ -4035,7 +4148,11 @@ int main(int argc, char** argv) {
             if (!compareImageBaselinePath.has_value() || !compareImageCurrentPath.has_value()) {
                 throw std::runtime_error("--compare-image requires baseline.png and current.png");
             }
-            return rtv::compareImageCommand(*compareImageBaselinePath, *compareImageCurrentPath, compareImageOutputPath);
+            return rtv::compareImageCommand(
+                *compareImageBaselinePath,
+                *compareImageCurrentPath,
+                compareImageOutputPath,
+                compareImageThresholds);
         }
         if (compareImageSequenceBaselinePath.has_value() || compareImageSequenceCurrentPath.has_value()) {
             if (!compareImageSequenceBaselinePath.has_value() || !compareImageSequenceCurrentPath.has_value()) {
@@ -4302,6 +4419,16 @@ int main(int argc, char** argv) {
             diagConfig.fixedSeed = *frameIndex;
         }
 
+        const bool needsManualBarrierDiagnostics =
+            needsProfile ||
+            needsRenderGraph ||
+            dumpMemoryPath.has_value() ||
+            dumpFrameTimelinePath.has_value() ||
+            dumpResourceLifetimesPath.has_value() ||
+            dumpBindingsPath.has_value() ||
+            dumpShaderReportPath.has_value() ||
+            validateGpuLabels;
+
         if (nativePackageScenePath.has_value() && (scenePath.has_value() || gltfPath.has_value())) {
             throw std::runtime_error("--native-package-scene is mutually exclusive with --scene and --gltf");
         }
@@ -4328,6 +4455,22 @@ int main(int argc, char** argv) {
             throw std::runtime_error("--descriptor-lifetime-stress requires --headless");
         }
 
+        if (restirModeOverride.has_value() && !restirDiModeOverride.has_value()) {
+            switch (*restirModeOverride) {
+            case rtv::RestirMode::ClassicNee:
+                restirDiModeOverride = rtv::RestirDiMode::Off;
+                break;
+            case rtv::RestirMode::RestirOnly:
+                restirDiModeOverride = rtv::RestirDiMode::Production;
+                break;
+            case rtv::RestirMode::HybridCompare:
+                restirDiModeOverride = rtv::RestirDiMode::HybridCompare;
+                break;
+            }
+        }
+        const std::optional<rtv::RestirMode> startupRestirModeOverride =
+            restirDiModeOverride.has_value() ? std::nullopt : restirModeOverride;
+
 #ifdef RTV_HAS_RENDERDOC
         if (diagConfig.captureRenderDocPath.has_value()) {
             rdocCaptureRequested = true;
@@ -4347,14 +4490,23 @@ int main(int argc, char** argv) {
             (void)gpuCrashDiagnostics.enable(gpuCrashDumpDir);
         }
 
+        if (dumpBindingsPath.has_value()) {
+            rtv::resetDescriptorWriteDiagnostics();
+        }
+        rtv::setManualBarrierEscapeDiagnosticsEnabled(needsManualBarrierDiagnostics);
+        if (needsManualBarrierDiagnostics) {
+            rtv::resetManualBarrierEscapeDiagnostics();
+        }
+
         rtv::Application app(debugView, gltfPath, hdrPath, scenePath, nativePackageScenePath,
             nativePackageAnimationSelection,
-            denoiserOverride, restirModeOverride, renderPresetOverride, restirGiOverride,
+            denoiserOverride, startupRestirModeOverride, renderPresetOverride, restirGiOverride,
             opacityMicromapOverride,
             opacityMicromapBlendOverride,
             hardwareBackfaceCullingOverride,
             opacityMicromapSubdivisionOverride,
-            debugViewProvided, validationCameraMotion, validationObjectMotion,
+            debugViewProvided, validationCameraMotion, validationObjectMotion, validationLightReorder,
+            validationLightFlicker,
             diagConfig.headless,
             rendererOnly ? rtv::ApplicationMode::RendererOnly : rtv::ApplicationMode::Editor,
             diagConfig.headlessWidth,
@@ -4621,7 +4773,8 @@ int main(int argc, char** argv) {
                               << nvidiaStatus.dlssFrameGenerationUnavailableReason << ".\n";
                 }
             }
-            if (restirDiModeOverride.has_value() ||
+            if (restirModeOverride.has_value() ||
+                restirDiModeOverride.has_value() ||
                 restirDiTemporalOverride.has_value() ||
                 restirDiSpatialOverride.has_value() ||
                 restirDiFinalVisibilityOverride.has_value() ||
@@ -4636,6 +4789,9 @@ int main(int argc, char** argv) {
                 restirDiStabilizationOverride.has_value() ||
                 restirDiReservoirLayoutOverride.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();
+                if (restirModeOverride.has_value()) {
+                    settings.restirMode = *restirModeOverride;
+                }
                 if (restirDiModeOverride.has_value()) {
                     settings.restirDiMode = *restirDiModeOverride;
                 }
@@ -4700,6 +4856,11 @@ int main(int argc, char** argv) {
                     }
                     settings.restirDiFinalVisibilityEnabled = true;
                     settings.restirDiProductionStabilizationEnabled = false;
+                }
+                if (settings.restirDiMode == rtv::RestirDiMode::Production ||
+                    settings.restirDiMode == rtv::RestirDiMode::HybridCompare) {
+                    settings.restirDiFinalVisibilityEnabled = true;
+                    settings.restirDiVisibilityRayBudget = std::max(settings.restirDiVisibilityRayBudget, 1u);
                 }
                 settings.renderPreset = rtv::RenderPreset::Custom;
                 renderer->applySettings(settings);
@@ -5046,15 +5207,29 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::string selfTestError;
-            const bool ok = executor.runSelfTest(selfTestError);
+            const bool functionalPass = executor.runSelfTest(selfTestError);
+            const auto selfTestStats = executor.stats();
+            executor.shutdown();
+            const bool validationEnabled = context->validationEnabled();
+            const uint64_t validationErrors = context->validationErrorCount();
+            const uint64_t validationWarnings = context->validationWarningCount();
+            const bool validationPass = validationEnabled && validationErrors == 0u;
+            const bool ok = functionalPass && validationPass;
             nlohmann::json report;
             report["self_test"] = "streaming_gpu_transfer_executor";
             report["passed"] = ok;
-            if (!ok) {
+            report["functional_passed"] = functionalPass;
+            report["validation_enabled"] = validationEnabled;
+            report["validation_error_count"] = validationErrors;
+            report["validation_warning_count"] = validationWarnings;
+            if (!functionalPass) {
                 report["error"] = selfTestError;
+            } else if (!validationEnabled) {
+                report["error"] = "Vulkan validation was not enabled for the streaming self-test";
+            } else if (!validationPass) {
+                report["error"] = "Vulkan validation reported errors during the streaming self-test";
             }
-            report["stats"] = rtv::streamingGpuTransferExecutorStatsJson(executor.stats());
-            executor.shutdown();
+            report["stats"] = rtv::streamingGpuTransferExecutorStatsJson(selfTestStats);
             const std::string serialized = report.dump(2);
             if (inspectionJsonPath.has_value()) {
                 std::ofstream out(*inspectionJsonPath);

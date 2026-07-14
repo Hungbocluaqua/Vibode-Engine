@@ -10,16 +10,6 @@
 #include <optional>
 #include <utility>
 
-#ifndef VK_QUERY_PIPELINE_STATISTIC_RAY_INVOCATIONS_BIT_KHR
-#define VK_QUERY_PIPELINE_STATISTIC_RAY_INVOCATIONS_BIT_KHR 0x00000001ull
-#endif
-#ifndef VK_QUERY_PIPELINE_STATISTIC_RAY_TRIANGLES_HIT_BIT_KHR
-#define VK_QUERY_PIPELINE_STATISTIC_RAY_TRIANGLES_HIT_BIT_KHR 0x00000002ull
-#endif
-#ifndef VK_QUERY_PIPELINE_STATISTIC_RAY_AABBS_HIT_BIT_KHR
-#define VK_QUERY_PIPELINE_STATISTIC_RAY_AABBS_HIT_BIT_KHR 0x00000004ull
-#endif
-
 namespace rtv {
 
 namespace {
@@ -60,6 +50,10 @@ const char* gpuMarkerBeginLabel(GpuProfiler::Query query) {
     case GpuProfiler::SkipDenoiserCopyStart: return "Skip Denoiser Copy";
     case GpuProfiler::TaaStart: return "TAA/TSR";
     case GpuProfiler::TaaHistoryCopyStart: return "TAA History Copy";
+    case GpuProfiler::DlssGuidesStart: return "DLSS Guides";
+    case GpuProfiler::DlssStart: return "DLSS";
+    case GpuProfiler::DlssRayReconstructionGuidesStart: return "DLSS RR Guides";
+    case GpuProfiler::DlssRayReconstructionStart: return "DLSS RR";
     case GpuProfiler::AutoExposureHistogramClearStart: return "AutoExposure Histogram Clear";
     case GpuProfiler::AutoExposureHistogramStart: return "AutoExposure Histogram";
     case GpuProfiler::AutoExposureReduceStart: return "AutoExposure Reduce";
@@ -118,6 +112,10 @@ bool gpuMarkerEndsLabel(GpuProfiler::Query query) {
     case GpuProfiler::SkipDenoiserCopyEnd:
     case GpuProfiler::TaaEnd:
     case GpuProfiler::TaaHistoryCopyEnd:
+    case GpuProfiler::DlssGuidesEnd:
+    case GpuProfiler::DlssEnd:
+    case GpuProfiler::DlssRayReconstructionGuidesEnd:
+    case GpuProfiler::DlssRayReconstructionEnd:
     case GpuProfiler::AutoExposureHistogramClearEnd:
     case GpuProfiler::AutoExposureHistogramEnd:
     case GpuProfiler::AutoExposureReduceEnd:
@@ -218,25 +216,14 @@ void GpuProfiler::create(VkDevice device, VkPhysicalDevice physicalDevice) {
 void GpuProfiler::createPipelineStatsQuery(VkDevice device, bool rayTracingAvailable) {
     if (statsQueryPool_ != VK_NULL_HANDLE) {
         vkDestroyQueryPool(device_, statsQueryPool_, nullptr);
+        statsQueryPool_ = VK_NULL_HANDLE;
     }
     device_ = device;
-
-    VkQueryPipelineStatisticFlags statsFlags =
-        VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
-    if (rayTracingAvailable) {
-        statsFlags |=
-            VK_QUERY_PIPELINE_STATISTIC_RAY_INVOCATIONS_BIT_KHR |
-            VK_QUERY_PIPELINE_STATISTIC_RAY_TRIANGLES_HIT_BIT_KHR |
-            VK_QUERY_PIPELINE_STATISTIC_RAY_AABBS_HIT_BIT_KHR;
-    }
-
-    VkQueryPoolCreateInfo info{};
-    info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-    info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
-    info.queryCount = 1;
-    info.pipelineStatistics = statsFlags;
-    checkVk(vkCreateQueryPool(device_, &info, nullptr, &statsQueryPool_),
-            "vkCreateQueryPool(gpu pipeline stats)");
+    (void)rayTracingAvailable;
+    // Vulkan has no portable pipeline-statistics bits for ray invocations or hits.
+    pipelineStats_ = {};
+    smoothedPipelineStats_ = {};
+    statsSubmitted_ = false;
 }
 
 void GpuProfiler::destroy() {
@@ -252,6 +239,8 @@ void GpuProfiler::destroy() {
     submitted_ = false;
     statsSubmitted_ = false;
     activeQueries_.fill(false);
+    pipelineStats_ = {};
+    smoothedPipelineStats_ = {};
 }
 
 void GpuProfiler::collectCompletedFrame() {
@@ -341,6 +330,10 @@ void GpuProfiler::collectCompletedFrame() {
     updateTiming(timings_.skipDenoiserCopyMs, SkipDenoiserCopyStart, SkipDenoiserCopyEnd);
     updateTiming(timings_.taaMs, TaaStart, TaaEnd);
     updateTiming(timings_.taaHistoryCopyMs, TaaHistoryCopyStart, TaaHistoryCopyEnd);
+    updateTiming(timings_.dlssGuidesMs, DlssGuidesStart, DlssGuidesEnd);
+    updateTiming(timings_.dlssMs, DlssStart, DlssEnd);
+    updateTiming(timings_.dlssRayReconstructionGuidesMs, DlssRayReconstructionGuidesStart, DlssRayReconstructionGuidesEnd);
+    updateTiming(timings_.dlssRayReconstructionMs, DlssRayReconstructionStart, DlssRayReconstructionEnd);
     updateTiming(timings_.autoExposureHistogramClearMs, AutoExposureHistogramClearStart, AutoExposureHistogramClearEnd);
     updateTiming(timings_.autoExposureHistogramMs, AutoExposureHistogramStart, AutoExposureHistogramEnd);
     updateTiming(timings_.autoExposureReduceMs, AutoExposureReduceStart, AutoExposureReduceEnd);
@@ -394,6 +387,10 @@ void GpuProfiler::collectCompletedFrame() {
         timings_.skipDenoiserCopyMs +
         timings_.taaMs +
         timings_.taaHistoryCopyMs +
+        timings_.dlssGuidesMs +
+        timings_.dlssMs +
+        timings_.dlssRayReconstructionGuidesMs +
+        timings_.dlssRayReconstructionMs +
         timings_.autoExposureMs +
         timings_.toneMapMs +
         timings_.selectionOutlineMs +

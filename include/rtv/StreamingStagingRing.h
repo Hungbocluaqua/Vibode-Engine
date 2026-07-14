@@ -63,6 +63,10 @@ public:
     // timeline value has signaled.
     [[nodiscard]] std::optional<StreamingStagingAllocation> allocate(uint64_t bytes, uint64_t timelineValue);
 
+    // Make a staged CPU write visible to the device before its copy command is
+    // submitted. VMA turns this into a no-op for host-coherent allocations.
+    void flush(uint64_t offset, uint64_t bytes) const;
+
     // Reclaim every allocation whose timeline value <= completedTimeline.
     // Returns the number of bytes reclaimed.
     uint64_t retire(uint64_t completedTimeline);

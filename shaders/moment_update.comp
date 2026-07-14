@@ -111,12 +111,16 @@ vec3 decode_world_position(uvec2 packedValue, vec3 origin) {
     }
     vec2 xy = unpack_snorm2x16(packedValue.x);
     float z = unpack_snorm2x16(packedValue.y).x;
-    return origin + vec3(xy.x, xy.y, z) * 8.0;
+    return origin + vec3(xy.x, xy.y, z) * 64.0;
 }
 
 vec3 reconstruct_current_world_position(ivec2 coords, float depth, ivec2 dims) {
     if (!is_surface_depth(depth)) {
         return vec3(0.0, 1.0e10, 0.0);
+    }
+    vec3 packedWorld = decode_world_position(world_position[uint(coords.y) * uint(dims.x) + uint(coords.x)], prev_camera.current_pos.xyz);
+    if (packedWorld.y < 1.0e9) {
+        return packedWorld;
     }
     vec2 uv = (vec2(coords) + vec2(0.5)) / vec2(dims);
     vec2 ndc = uv * 2.0 - 1.0;

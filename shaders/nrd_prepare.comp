@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "temporal_common.glsl"
+#include "psr_guides.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -28,6 +29,8 @@ layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D out_normal_rough
 layout(set = 0, binding = 5, r32f) writeonly uniform image2D out_view_z;
 layout(set = 0, binding = 6, rgba16f) writeonly uniform image2D out_diff_radiance_hitdist;
 layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D out_spec_radiance_hitdist;
+layout(set = 0, binding = 11, r16f) writeonly uniform image2D out_diff_confidence;
+layout(set = 0, binding = 12, r16f) writeonly uniform image2D out_spec_confidence;
 layout(set = 0, binding = 8, std140) uniform TaaParams {
     uint enabled;
     uint frame_count;
@@ -80,6 +83,8 @@ layout(set = 0, binding = 9, std140) uniform Camera {
     vec4 clip_controls;
 } camera;
 layout(set = 0, binding = 10, r32f) readonly uniform image2D adaptive_filled_mask;
+layout(set = 0, binding = 13, rgba16f) readonly uniform image2D filtered_confidence_gradient;
+layout(set = 0, binding = 14, std430) readonly buffer PsrGuideBuffer { PsrGuideRecord psr_guide_buffer[]; };
 
 vec2 unpack_snorm2x16(uint packedValue) {
     ivec2 quantized = ivec2(int(packedValue & 0xffffu), int((packedValue >> 16u) & 0xffffu));
@@ -220,6 +225,14 @@ float valid_reblur_norm_hit_distance(float hitDistance, float viewZ, float rough
     return reblur_norm_hit_distance(hitDistance, viewZ, roughness);
 }
 
+float nrd_history_confidence(bool validSurface, bool adaptiveFilled, float signalLuminance, float hitDistance) {
+    if (!validSurface || adaptiveFilled || signalLuminance <= 1.0e-5 || nrd_invalid_float(hitDistance)) {
+        return 0.0;
+    }
+    float hitConfidence = hitDistance > 0.001 ? 1.0 : 0.35;
+    return clamp(hitConfidence, 0.0, 1.0);
+}
+
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dims = ivec2(int(params.render_width), int(params.render_height));
@@ -238,14 +251,26 @@ void main() {
 
     vec3 normal = surface ? decode_octahedral_normal(packedDepthNormal.y) : vec3(0.0, 0.0, 1.0);
     PathDataRecord path = path_data_buffer[pixelIndex];
+    PsrGuideRecord psrGuide = psr_guide_buffer[pixelIndex];
+    bool psrActive = surface && psr_guide_active(psrGuide);
+    if (psrActive) {
+        viewZ = clamp(psrGuide.distances.y, 0.0, NRD_DENOISING_RANGE + 1.0);
+        normal = psr_guide_normal(psrGuide);
+        path.albedo_roughness_hit_confidence.rgb = psr_guide_diffuse_albedo(psrGuide);
+        path.material_specular_albedo.rgb = psr_guide_specular_f0(psrGuide);
+    }
     float roughness = clamp(path.albedo_roughness_hit_confidence.w, 0.001, 1.0);
+    if (psrActive) {
+        roughness = clamp(psr_guide_roughness(psrGuide), 0.001, 1.0);
+    }
 
-    vec2 currentToPreviousPixels = temporal_unpack_velocity_pixels(velocity_buffer[pixelIndex], params.velocity_scale);
+    uint packedGuideVelocity = psrActive ? psrGuide.geometry.w : velocity_buffer[pixelIndex];
+    vec2 currentToPreviousPixels = temporal_unpack_velocity_pixels(packedGuideVelocity, params.velocity_scale);
     vec2 previousMinusCurrentPixels = temporal_velocity_pixels_are_invalid(currentToPreviousPixels, params.velocity_scale)
         ? vec2(0.0)
         : -currentToPreviousPixels;
 
-    vec3 view = -primary_ray_direction(coords, dims);
+    vec3 view = psrActive ? -psr_guide_ray_direction(psrGuide) : -primary_ray_direction(coords, dims);
     vec3 diffMaterialFactor;
     vec3 specMaterialFactor;
     nrd_material_factors(normal, view, path, roughness, diffMaterialFactor, specMaterialFactor);
@@ -256,9 +281,22 @@ void main() {
     vec3 specRadiance = noisySpecular / specMaterialFactor;
     float diffHitDistance = path.denoiser_hit_distance.x;
     float specHitDistance = path.denoiser_hit_distance.y;
-    float diffNormHitDistance = valid_reblur_norm_hit_distance(diffHitDistance, viewZ, 1.0, nrd_luminance(noisyDiffuse));
-    float specNormHitDistance = valid_reblur_norm_hit_distance(specHitDistance, viewZ, roughness, nrd_luminance(noisySpecular));
-    if (adaptive_filled_pixel(coords)) {
+    if (psrActive) {
+        specHitDistance = max(psrGuide.distances.x, 0.0);
+    }
+    float diffLuminance = nrd_luminance(noisyDiffuse);
+    float specLuminance = nrd_luminance(noisySpecular);
+    float diffNormHitDistance = valid_reblur_norm_hit_distance(diffHitDistance, viewZ, 1.0, diffLuminance);
+    float specNormHitDistance = valid_reblur_norm_hit_distance(specHitDistance, viewZ, roughness, specLuminance);
+    bool adaptiveFilled = adaptive_filled_pixel(coords);
+    float diffConfidence = nrd_history_confidence(surface, adaptiveFilled, diffLuminance, diffHitDistance);
+    float specConfidence = nrd_history_confidence(surface, adaptiveFilled, specLuminance, specHitDistance);
+    vec4 confidenceGradient = imageLoad(filtered_confidence_gradient, coords);
+    if (confidenceGradient.z > 0.5) {
+        diffConfidence *= 1.0 - clamp(confidenceGradient.x, 0.0, 1.0);
+        specConfidence *= 1.0 - clamp(confidenceGradient.y, 0.0, 1.0);
+    }
+    if (adaptiveFilled) {
         diffRadiance = vec3(0.0);
         specRadiance = vec3(0.0);
         diffNormHitDistance = 0.0;
@@ -276,4 +314,6 @@ void main() {
     imageStore(out_view_z, coords, vec4(viewZ, 0.0, 0.0, 0.0));
     imageStore(out_diff_radiance_hitdist, coords, pack_reblur_radiance_hitdist(diffRadiance, diffNormHitDistance));
     imageStore(out_spec_radiance_hitdist, coords, pack_reblur_radiance_hitdist(specRadiance, specNormHitDistance));
+    imageStore(out_diff_confidence, coords, vec4(diffConfidence, 0.0, 0.0, 0.0));
+    imageStore(out_spec_confidence, coords, vec4(specConfidence, 0.0, 0.0, 0.0));
 }

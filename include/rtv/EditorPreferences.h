@@ -52,7 +52,10 @@ struct EditorPreferences {
     float uiScale = 1.0f;
     int themePreset = 0;
     int workspacePreset = 0;
-    int layoutVersion = 2;
+    int layoutVersion = 4;
+    int contentBrowserMode = 0;
+    bool contentBrowserGridView = true;
+    bool contentBrowserShowDetails = false;
     bool cookEmitNativeTextureTargetSets = false;
     int cookNativeTextureTargetSetProfile = 0;
     std::string cookNativeTextureTargetSetName = "editor-custom-target-set";

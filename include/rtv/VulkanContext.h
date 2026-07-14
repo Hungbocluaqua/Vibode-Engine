@@ -6,6 +6,7 @@
 
 #include <Volk/volk.h>
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -140,6 +141,14 @@ public:
     [[nodiscard]] bool debugUtilsObjectNamesAvailable() const {
         return debugUtilsExtensionEnabled_ && vkSetDebugUtilsObjectNameEXT != nullptr;
     }
+    [[nodiscard]] bool validationEnabled() const noexcept { return validationEnabled_; }
+    [[nodiscard]] uint64_t validationErrorCount() const noexcept {
+        return validationErrorCount_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t validationWarningCount() const noexcept {
+        return validationWarningCount_.load(std::memory_order_relaxed);
+    }
+    void resetValidationMessageCounts() const noexcept;
 
 private:
     explicit VulkanContext(bool headless);
@@ -149,6 +158,12 @@ private:
     void pickPhysicalDevice();
     void pickPhysicalDeviceHeadless();
     void createDevice();
+    [[nodiscard]] VkDebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo();
+    static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+        VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+        VkDebugUtilsMessageTypeFlagsEXT messageTypes,
+        const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
+        void* userData);
 
     [[nodiscard]] bool validationRequested() const;
     [[nodiscard]] bool validationAvailable() const;
@@ -189,8 +204,11 @@ private:
     bool storageBuffer16BitAccess_ = false;
     bool uniformAndStorageBuffer16BitAccess_ = false;
     bool debugUtilsExtensionEnabled_ = false;
+    bool validationEnabled_ = false;
     float maxSamplerAnisotropy_ = 1.0f;
     QueueFamilyIndices queueFamilies_{};
+    mutable std::atomic<uint64_t> validationErrorCount_{0};
+    mutable std::atomic<uint64_t> validationWarningCount_{0};
 };
 
 } // namespace rtv

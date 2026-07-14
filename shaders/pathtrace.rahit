@@ -39,14 +39,16 @@ void main() {
         return;
     }
 
-    uint triIndex = globalTriangleIndex * 3u;
-    uint i0 = local_mesh_indices[triIndex + 0u];
-    uint i1 = local_mesh_indices[triIndex + 1u];
-    uint i2 = local_mesh_indices[triIndex + 2u];
+    uvec3 indices;
+    if (!ray_tracing_triangle_indices(globalTriangleIndex, indices)) {
+        record_rt_counter(RT_DIAG_CAMERA_ANY_HIT_IGNORED);
+        ignoreIntersectionEXT;
+        return;
+    }
     uvec4 skinningBinding = ray_tracing_gpu_skinning_binding(meshIndex);
-    LocalVertex v0 = ray_tracing_local_vertex_with_binding(skinningBinding, i0);
-    LocalVertex v1 = ray_tracing_local_vertex_with_binding(skinningBinding, i1);
-    LocalVertex v2 = ray_tracing_local_vertex_with_binding(skinningBinding, i2);
+    LocalVertex v0 = ray_tracing_local_vertex_with_binding(skinningBinding, indices.x);
+    LocalVertex v1 = ray_tracing_local_vertex_with_binding(skinningBinding, indices.y);
+    LocalVertex v2 = ray_tracing_local_vertex_with_binding(skinningBinding, indices.z);
 
     Material material = decode_material(materialIndex);
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);

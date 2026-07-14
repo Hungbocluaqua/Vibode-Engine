@@ -59,6 +59,8 @@ layout(set = 0, binding = 3, std140) uniform ReGIRParamsBlock {
 struct ReGIRReservoir {
     uvec4 metadata;
     vec4 sample_position_weight;
+    vec4 proposal_pdf_m;
+    uvec4 light_identity;
 };
 
 layout(set = 0, binding = 4, std430) buffer ReGIRReservoirBuffer {
@@ -121,6 +123,8 @@ void main() {
     ReGIRReservoir emptyReservoir;
     emptyReservoir.metadata = uvec4(0u, 0u, 0u, 0u);
     emptyReservoir.sample_position_weight = vec4(0.0);
+    emptyReservoir.proposal_pdf_m = vec4(0.0);
+    emptyReservoir.light_identity = uvec4(0u);
 
     if ((regir_params.controls.x & 1u) == 0u || mesh_params.light_count == 0u || mesh_params.emissive_total_area <= 1.0e-8) {
         regir_reservoirs[reservoirIndex] = emptyReservoir;
@@ -175,6 +179,7 @@ void main() {
     vec3 selectedPosition = vec3(0.0);
     float selectedWeight = 0.0;
     float weightSum = 0.0;
+    uvec4 selectedIdentity = uvec4(0u);
 
     for (uint candidate = 0u; candidate < candidateCount; ++candidate) {
         const uint lightIndex = min(uint(rand01(rng) * float(mesh_params.light_count)), mesh_params.light_count - 1u);
@@ -188,6 +193,7 @@ void main() {
             selectedKind = light.metadata.x;
             selectedPosition = center;
             selectedWeight = weight;
+            selectedIdentity = light.identity;
         }
     }
 
@@ -199,5 +205,11 @@ void main() {
     ReGIRReservoir reservoir;
     reservoir.metadata = uvec4(selectedLight, selectedKind, candidateCount, 1u);
     reservoir.sample_position_weight = vec4(selectedPosition, selectedWeight);
+    reservoir.proposal_pdf_m = vec4(
+        weightSum,
+        selectedWeight / max(weightSum, 1.0e-8),
+        weightSum / float(candidateCount),
+        float(candidateCount));
+    reservoir.light_identity = selectedIdentity;
     regir_reservoirs[reservoirIndex] = reservoir;
 }

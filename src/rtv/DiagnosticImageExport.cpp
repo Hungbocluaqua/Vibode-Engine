@@ -2,6 +2,7 @@
 
 #include "rtv/Buffer.h"
 #include "rtv/Check.h"
+#include "rtv/GpuValidation.h"
 #include "rtv/Image.h"
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/RendererDebug.h"
@@ -81,7 +82,8 @@ bool DiagnosticImageExport::exportView(
     PathTracerRenderer& renderer,
     RendererDebugView view,
     const std::filesystem::path& outputPath,
-    uint32_t warmupFrames) {
+    uint32_t warmupFrames,
+    uint32_t maxOutputDimension) {
     (void)view;
     (void)warmupFrames;
     if (!initialized_) {
@@ -100,8 +102,8 @@ bool DiagnosticImageExport::exportView(
 
     VkImageMemoryBarrier2 preBarrier{};
     preBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    preBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    preBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    preBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    preBarrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
     preBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     preBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
     preBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -119,6 +121,7 @@ bool DiagnosticImageExport::exportView(
     preDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     preDependency.imageMemoryBarrierCount = 1;
     preDependency.pImageMemoryBarriers = &preBarrier;
+    recordManualBarrierEscape("DiagnosticImageExport", "presentation_to_transfer_src", preDependency);
     vkCmdPipelineBarrier2(commandBuffer_, &preDependency);
 
     VkBufferImageCopy region{};
@@ -139,8 +142,8 @@ bool DiagnosticImageExport::exportView(
     postBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     postBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
     postBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     postBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     postBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -156,6 +159,7 @@ bool DiagnosticImageExport::exportView(
     postDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     postDependency.imageMemoryBarrierCount = 1;
     postDependency.pImageMemoryBarriers = &postBarrier;
+    recordManualBarrierEscape("DiagnosticImageExport", "transfer_src_to_presentation", postDependency);
     vkCmdPipelineBarrier2(commandBuffer_, &postDependency);
 
     checkVk(vkEndCommandBuffer(commandBuffer_), "vkEndCommandBuffer(export)");
@@ -185,13 +189,43 @@ bool DiagnosticImageExport::exportView(
         std::filesystem::create_directories(dir);
     }
 
+    const unsigned char* pngData = data;
+    uint32_t pngWidth = extent_.width;
+    uint32_t pngHeight = extent_.height;
+    std::vector<unsigned char> thumbnailPixels;
+    const uint32_t sourceMaxDimension = std::max(extent_.width, extent_.height);
+    if (maxOutputDimension > 0u && sourceMaxDimension > maxOutputDimension) {
+        pngWidth = std::max(1u, static_cast<uint32_t>(
+            (static_cast<uint64_t>(extent_.width) * maxOutputDimension + sourceMaxDimension / 2u) / sourceMaxDimension));
+        pngHeight = std::max(1u, static_cast<uint32_t>(
+            (static_cast<uint64_t>(extent_.height) * maxOutputDimension + sourceMaxDimension / 2u) / sourceMaxDimension));
+        thumbnailPixels.resize(static_cast<size_t>(pngWidth) * pngHeight * 4u);
+        for (uint32_t y = 0; y < pngHeight; ++y) {
+            const uint32_t sourceY = std::min<uint32_t>(
+                extent_.height - 1u,
+                static_cast<uint32_t>((static_cast<uint64_t>(y) * extent_.height + pngHeight / 2u) / pngHeight));
+            for (uint32_t x = 0; x < pngWidth; ++x) {
+                const uint32_t sourceX = std::min<uint32_t>(
+                    extent_.width - 1u,
+                    static_cast<uint32_t>((static_cast<uint64_t>(x) * extent_.width + pngWidth / 2u) / pngWidth));
+                const size_t sourceIndex = (static_cast<size_t>(sourceY) * extent_.width + sourceX) * 4u;
+                const size_t destIndex = (static_cast<size_t>(y) * pngWidth + x) * 4u;
+                thumbnailPixels[destIndex + 0u] = data[sourceIndex + 0u];
+                thumbnailPixels[destIndex + 1u] = data[sourceIndex + 1u];
+                thumbnailPixels[destIndex + 2u] = data[sourceIndex + 2u];
+                thumbnailPixels[destIndex + 3u] = data[sourceIndex + 3u];
+            }
+        }
+        pngData = thumbnailPixels.data();
+    }
+
     int result = stbi_write_png(
         outputPath.string().c_str(),
-        static_cast<int>(extent_.width),
-        static_cast<int>(extent_.height),
+        static_cast<int>(pngWidth),
+        static_cast<int>(pngHeight),
         4,
-        data,
-        static_cast<int>(extent_.width * 4));
+        pngData,
+        static_cast<int>(pngWidth * 4u));
 
     return result != 0;
 }
@@ -303,6 +337,35 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::MomentHistoryKindValid,
         RendererDebugView::DenoiserDiffuseRawVariance,
         RendererDebugView::DenoiserSpecularRawVariance,
+        RendererDebugView::NrdValidation,
+        RendererDebugView::NrdDiffuseConfidence,
+        RendererDebugView::NrdSpecularConfidence,
+        RendererDebugView::NrdRawConfidenceGradient,
+        RendererDebugView::NrdFilteredConfidenceGradient,
+        RendererDebugView::NrdConfidenceHistory,
+        RendererDebugView::PsrActiveMask,
+        RendererDebugView::PsrDepth,
+        RendererDebugView::PsrMotion,
+        RendererDebugView::PsrNormalRoughness,
+        RendererDebugView::PsrHitDistance,
+        RendererDebugView::PsrAlbedoF0,
+        RendererDebugView::PsrRayDirection,
+        RendererDebugView::DlssDepth,
+        RendererDebugView::DlssMotionVectors,
+        RendererDebugView::DlssInputColor,
+        RendererDebugView::DlssOutputColor,
+        RendererDebugView::DlssRrDiffuseAlbedo,
+        RendererDebugView::DlssRrSpecularAlbedo,
+        RendererDebugView::DlssRrNormals,
+        RendererDebugView::DlssRrRoughness,
+        RendererDebugView::DlssRrDiffuseHitDistance,
+        RendererDebugView::DlssRrSpecularHitDistance,
+        RendererDebugView::DlssRrReflectedAlbedo,
+        RendererDebugView::DlssRrDisocclusionMask,
+        RendererDebugView::DlssRrDiffuseRayDirection,
+        RendererDebugView::DlssRrSpecularRayDirection,
+        RendererDebugView::DlssRrDiffuseRayDirectionHitDistance,
+        RendererDebugView::DlssRrSpecularRayDirectionHitDistance,
         RendererDebugView::RestirPairwiseMis,
         RendererDebugView::RestirGiValidity,
         RendererDebugView::RestirGiAge,
@@ -314,6 +377,12 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::RestirGiHitDistance,
         RendererDebugView::RestirGiGrid,
         RendererDebugView::RestirGiPathClass,
+        RendererDebugView::RestirGiTarget,
+        RendererDebugView::RestirGiSourcePdf,
+        RendererDebugView::RestirGiWeightSum,
+        RendererDebugView::RestirGiM,
+        RendererDebugView::RestirGiConfidence,
+        RendererDebugView::RestirGiVisibility,
         RendererDebugView::AdaptiveDensityMap,
         RendererDebugView::AdaptiveSampleCount,
         RendererDebugView::AdaptiveUnsampledPixels,
@@ -348,6 +417,7 @@ std::vector<RendererDebugView> DiagnosticImageExport::allExportViews() {
         RendererDebugView::RestirDiReceiverPosition,
         RendererDebugView::RestirDiReceiverNormal,
         RendererDebugView::RestirDiLightVersion,
+        RendererDebugView::RestirDiLightMapStatus,
         RendererDebugView::RestirDiInitialReservoir,
         RendererDebugView::RestirDiTemporalReservoir,
         RendererDebugView::RestirDiSpatialReservoir,

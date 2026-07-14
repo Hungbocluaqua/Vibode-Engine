@@ -204,6 +204,9 @@ bool EditorPreferences::save(const std::filesystem::path& path) const {
     json["themePreset"] = themePreset;
     json["workspacePreset"] = workspacePreset;
     json["layoutVersion"] = layoutVersion;
+    json["contentBrowserMode"] = std::clamp(contentBrowserMode, 0, 1);
+    json["contentBrowserGridView"] = contentBrowserGridView;
+    json["contentBrowserShowDetails"] = contentBrowserShowDetails;
     json["cookEmitNativeTextureTargetSets"] = cookEmitNativeTextureTargetSets;
     json["cookNativeTextureTargetSetProfile"] = std::clamp(cookNativeTextureTargetSetProfile, 0, 5);
     json["cookNativeTextureTargetSetName"] = cookNativeTextureTargetSetName;
@@ -324,6 +327,9 @@ void EditorPreferences::load(const std::filesystem::path& path) {
         if (json.contains("themePreset")) themePreset = json["themePreset"].get<int>();
         if (json.contains("workspacePreset")) workspacePreset = json["workspacePreset"].get<int>();
         if (json.contains("layoutVersion")) layoutVersion = json["layoutVersion"].get<int>();
+        if (json.contains("contentBrowserMode")) contentBrowserMode = std::clamp(json["contentBrowserMode"].get<int>(), 0, 1);
+        if (json.contains("contentBrowserGridView")) contentBrowserGridView = json["contentBrowserGridView"].get<bool>();
+        if (json.contains("contentBrowserShowDetails")) contentBrowserShowDetails = json["contentBrowserShowDetails"].get<bool>();
         if (json.contains("cookEmitNativeTextureTargetSets")) cookEmitNativeTextureTargetSets = json["cookEmitNativeTextureTargetSets"].get<bool>();
         if (json.contains("cookNativeTextureTargetSetProfile")) cookNativeTextureTargetSetProfile = std::clamp(json["cookNativeTextureTargetSetProfile"].get<int>(), 0, 5);
         if (json.contains("cookNativeTextureTargetSetName")) cookNativeTextureTargetSetName = json["cookNativeTextureTargetSetName"].get<std::string>();

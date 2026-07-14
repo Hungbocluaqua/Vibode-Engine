@@ -99,6 +99,25 @@ bool mainLoopTraceEnabled() {
     return enabled;
 }
 
+bool editorTicketProbesEnabled() {
+    static const bool enabled = [] {
+#if defined(_WIN32)
+        char* value = nullptr;
+        size_t length = 0;
+        if (_dupenv_s(&value, &length, "RTV_ENABLE_EDITOR_TICKET_PROBES") != 0 || value == nullptr) {
+            return false;
+        }
+        const bool result = value[0] != '\0' && value[0] != '0';
+        std::free(value);
+        return result;
+#else
+        const char* value = std::getenv("RTV_ENABLE_EDITOR_TICKET_PROBES");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+#endif
+    }();
+    return enabled;
+}
+
 void traceMainLoopPhase(uint32_t frame, const char* phase) {
     if (!mainLoopTraceEnabled()) {
         return;
@@ -1801,6 +1820,7 @@ void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings&
     render.dlssFrameGenerationEnabled = settings.dlssFrameGenerationEnabled;
     render.dlssRayReconstructionEnabled = settings.dlssRayReconstructionEnabled;
     render.streamlineReflexEnabled = settings.streamlineReflexEnabled;
+    render.streamlineNvPerfEnabled = settings.streamlineNvPerfEnabled;
     render.dlssSharpeningStrength = settings.dlssSharpeningStrength;
     render.taaFeedback = settings.taaFeedback;
     render.taaMotionFeedback = settings.taaMotionFeedback;
@@ -1948,6 +1968,7 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     settings.dlssFrameGenerationEnabled = render.dlssFrameGenerationEnabled;
     settings.dlssRayReconstructionEnabled = render.dlssRayReconstructionEnabled;
     settings.streamlineReflexEnabled = render.streamlineReflexEnabled;
+    settings.streamlineNvPerfEnabled = render.streamlineNvPerfEnabled;
     settings.dlssSharpeningStrength = render.dlssSharpeningStrength;
     settings.taaFeedback = render.taaFeedback;
     settings.taaMotionFeedback = render.taaMotionFeedback;
@@ -3951,6 +3972,8 @@ Application::Application(
     bool debugViewOverride,
     bool validationCameraMotion,
     bool validationObjectMotion,
+    bool validationLightReorder,
+    bool validationLightFlicker,
     bool headless,
     ApplicationMode mode,
     uint32_t headlessWidth,
@@ -3976,6 +3999,8 @@ Application::Application(
       debugViewOverride_(debugViewOverride),
       validationCameraMotion_(validationCameraMotion),
       validationObjectMotion_(validationObjectMotion),
+      validationLightReorder_(validationLightReorder),
+      validationLightFlicker_(validationLightFlicker),
       disableAsyncCompute_(disableAsyncCompute),
       singleQueueFallback_(singleQueueFallback),
       disableResourceAliasing_(disableResourceAliasing),
@@ -3990,22 +4015,24 @@ Application::Application(
     }
     initVulkan();
     (void)initializeNsightGraphicsRuntime();
-    frameWorkProbeJobId_ = frameWorkScheduler_.enqueue(FrameWorkJobDesc{
-        .queue = FrameWorkQueue::MainThreadApply,
-        .title = "Editor main loop scheduler probe",
-        .status = "waiting for fence",
-        .estimatedCostMs = 0.0,
-        .estimatedUploadBytes = 0,
-        .callback = [](FrameWorkJobContext&) {
-            return FrameWorkJobStepResult{
-                .complete = false,
-                .waitingForFence = true,
-                .progress = 0.25f,
-            };
-        },
-    });
-    frameWorkProbeCompletionPending_ = frameWorkProbeJobId_ != 0;
-    initializeEditorTicketProbeQueues();
+    if (editorTicketProbesEnabled()) {
+        frameWorkProbeJobId_ = frameWorkScheduler_.enqueue(FrameWorkJobDesc{
+            .queue = FrameWorkQueue::MainThreadApply,
+            .title = "Editor main loop scheduler probe",
+            .status = "waiting for fence",
+            .estimatedCostMs = 0.0,
+            .estimatedUploadBytes = 0,
+            .callback = [](FrameWorkJobContext&) {
+                return FrameWorkJobStepResult{
+                    .complete = false,
+                    .waitingForFence = true,
+                    .progress = 0.25f,
+                };
+            },
+        });
+        frameWorkProbeCompletionPending_ = frameWorkProbeJobId_ != 0;
+        initializeEditorTicketProbeQueues();
+    }
 }
 
 Application::~Application() {
@@ -4124,7 +4151,9 @@ void Application::runHeadless(uint32_t warmupFrames, uint32_t totalFrames) {
         stepStreamingGpuSceneUpdateQueue();
         pollProgressiveRuntimeLoadJob();
         applyValidationObjectMotion(nextDiagnosticFrameIndex_);
-        applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
+        applyValidationCameraMotion(nextDiagnosticFrameIndex_);
+        applyValidationLightReorder(nextDiagnosticFrameIndex_);
+        applyValidationLightFlicker(nextDiagnosticFrameIndex_++);
         updateAnimationPlayers(deltaSeconds);
         if (beginFrameCapture_) {
             beginFrameCapture_(frameCount + 1u);
@@ -4180,7 +4209,9 @@ void Application::renderFrames(uint32_t count) {
         stepStreamingGpuSceneUpdateQueue();
         pollProgressiveRuntimeLoadJob();
         applyValidationObjectMotion(nextDiagnosticFrameIndex_);
-        applyValidationCameraMotion(nextDiagnosticFrameIndex_++);
+        applyValidationCameraMotion(nextDiagnosticFrameIndex_);
+        applyValidationLightReorder(nextDiagnosticFrameIndex_);
+        applyValidationLightFlicker(nextDiagnosticFrameIndex_++);
         updateAnimationPlayers(deltaSeconds);
         if (beginFrameCapture_) {
             beginFrameCapture_(i + 1u);
@@ -4545,7 +4576,8 @@ std::optional<MeshBlasBuildSizing> queryMeshBlasBuildSizing(VkDevice device, con
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
     buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+        VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
     buildInfo.geometryCount = 1;
     buildInfo.pGeometries = &geometry;
 
@@ -4881,6 +4913,8 @@ nlohmann::json Application::streamingRuntimeReport() const {
         {"last_frame", incrementalGpuSceneApplyFrameResultJson(lastStreamingGpuSceneApply_)},
         {"operations", incrementalGpuSceneUpdateSnapshotsJson(streamingGpuSceneUpdateQueue_.snapshots())},
     };
+    report["streaming_async_compute"] =
+        streamingAsyncComputeBudgeterStateJson(streamingAsyncComputeBudgeter_.state());
     if (pathTracer_ != nullptr) {
         const PathTracerRenderer::StreamingResetMaskReport& resetMasks = pathTracer_->streamingResetMaskReport();
         report["streaming_reset_masks"] = {
@@ -6417,9 +6451,7 @@ void Application::processRendererOnlyRequests(const RendererOnlyRequests& reques
         cameraController_.setFastMoveSpeed(std::clamp(*requests.cameraFastMoveSpeed, 0.05f, 250.0f));
     }
     if (requests.settings.has_value()) {
-        if (pathTracer_->applySettings(*requests.settings)) {
-            syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
-        }
+        applyRendererSettingsSafely(*requests.settings, true);
     }
     if (requests.resetAccumulation.has_value()) {
         pathTracer_->resetAccumulation(*requests.resetAccumulation);
@@ -6555,6 +6587,22 @@ void Application::initWindow() {
               << "Files: drop .hdr for environment maps or .gltf/.glb for scene reload.\n";
 }
 
+void Application::configureStreamingAsyncComputeBudgeter() {
+    const bool asyncComputeAvailable =
+        context_ != nullptr &&
+        !disableAsyncCompute_ &&
+        !singleQueueFallback_ &&
+        context_->computeQueue() != VK_NULL_HANDLE &&
+        context_->hasIndependentComputeQueue() &&
+        context_->queueFamilies().compute.has_value() &&
+        context_->supportsTimelineSemaphore();
+    streamingAsyncComputeBudgeter_.configure(
+        streamingOptions_.asyncComputeFrameBudgetUs,
+        streamingOptions_.asyncComputeMinStreamingHeadroomUs,
+        asyncComputeAvailable,
+        streamingOptions_.asyncComputeStreamingEnabled);
+}
+
 void Application::initVulkan() {
     if (headless_) {
         context_ = VulkanContext::createHeadless();
@@ -6571,6 +6619,7 @@ void Application::initVulkan() {
     }
     commandSystem_ = std::make_unique<CommandSystem>(*context_, *swapchain_, disableAsyncCompute_, singleQueueFallback_);
     commandSystem_->setHeadless(headless_);
+    configureStreamingAsyncComputeBudgeter();
 
     if (!headless_) {
         uiOverlay_ = std::make_unique<UiOverlay>(window_, *context_, *swapchain_, *allocator_, *uploader_);
@@ -6666,7 +6715,6 @@ void Application::initVulkan() {
     }
     sceneUnsavedDirty_ = false;
     sceneDocument_.setSourceHdrPath(hdrPath_);
-    rebuildGpuSceneAsset();
     RendererSettings startupSettings{};
     startupSettings.debugView = debugView_;
     startupSettings = rendererSettingsFromDocument(sceneDocument_, startupSettings);
@@ -6724,6 +6772,8 @@ void Application::initVulkan() {
         startupSettings.opacityMicromapSubdivisionLevel = *opacityMicromapSubdivisionOverride_;
         startupSettings.renderPreset = RenderPreset::Custom;
     }
+    startupSettings = PathTracerRenderer::normalizeSettingsForDevice(startupSettings, *context_);
+    rebuildGpuSceneAsset(&startupSettings);
     traceStartupPhase("initial_create_path_tracer_begin");
     createPathTracer(&startupSettings);
     traceStartupPhase("initial_create_path_tracer_end");
@@ -6819,6 +6869,8 @@ void Application::mainLoop(uint32_t maxFrames) {
         traceMainLoopPhase(frameCount, "runtime_controls_end");
         applyValidationObjectMotion(frameCount);
         applyValidationCameraMotion(frameCount);
+        applyValidationLightReorder(frameCount);
+        applyValidationLightFlicker(frameCount);
         notifications_.update(deltaSeconds);
         updateAutosave(deltaSeconds);
         EditorRequests editorRequests;
@@ -6837,14 +6889,13 @@ void Application::mainLoop(uint32_t maxFrames) {
                 editorRequests.saveSceneAs = *path;
             }
         }
+        bool shaderReloadRequested = false;
         if (pendingReloadShaders_) {
             pendingReloadShaders_ = false;
-            editorRequests.reloadShaders = true;
-            editorRequests.resetAccumulation = AccumulationResetReason::ShaderReloaded;
+            shaderReloadRequested = true;
         }
         if (pathTracer_ && pathTracer_->shadersNeedReload()) {
-            editorRequests.reloadShaders = true;
-            editorRequests.resetAccumulation = AccumulationResetReason::ShaderReloaded;
+            shaderReloadRequested = true;
         }
         frameWorkScheduler_.tick();
         traceMainLoopPhase(frameCount, "job_snapshots_begin");
@@ -7112,6 +7163,10 @@ void Application::mainLoop(uint32_t maxFrames) {
                 &jobCenter,
                 &notifications_);
             traceMainLoopPhase(frameCount, "ui_build_project_manager_end");
+        }
+        if (shaderReloadRequested) {
+            editorRequests.reloadShaders = true;
+            editorRequests.resetAccumulation = AccumulationResetReason::ShaderReloaded;
         }
         if (!rendererOnly_) {
             traceMainLoopPhase(frameCount, "apply_requests_pre_render_begin");
@@ -7742,9 +7797,10 @@ void Application::captureProjectThumbnailIfReady() {
     }
 
     try {
+        constexpr uint32_t kProjectThumbnailMaxDimension = 768u;
         DiagnosticImageExport exporter(*context_, *allocator_);
         if (!exporter.initialize(swapchain_->format(), extent) ||
-            !exporter.exportView(*pathTracer_, RendererDebugView::Beauty, *pendingProjectThumbnailPath_, 0)) {
+            !exporter.exportView(*pathTracer_, RendererDebugView::Beauty, *pendingProjectThumbnailPath_, 0, kProjectThumbnailMaxDimension)) {
             pendingProjectThumbnailFrame_ = frameSerial_ + 1u;
             if (++pendingProjectThumbnailAttempts_ > 8u) {
                 notifications_.notify("Project thumbnail capture failed", NotificationType::Warning, NotificationAction::OpenProjectManager, "Project Manager", 5.0f);
@@ -8878,6 +8934,9 @@ bool Application::applyReplacementSceneResult(SceneLoadResult&& result, bool sce
                 &replacementSettings);
             traceStartupPhase("renderer_create_make_end");
         }
+        syncDocumentRenderSettings(
+            nextDocument,
+            reuseExistingFallbackRenderer ? pathTracer_->settings() : nextPathTracer->settings());
         rendererCreateMs = elapsedMs(rendererCreateStart);
 
         const auto stateSwapStart = std::chrono::steady_clock::now();
@@ -15954,6 +16013,53 @@ void Application::applyValidationObjectMotion(uint32_t frameIndex) {
     (void)applyPendingSceneUpdate(false);
 }
 
+void Application::applyValidationLightReorder(uint32_t frameIndex) {
+    if (!validationLightReorder_ ||
+        validationLightReorderApplied_ ||
+        pathTracer_ == nullptr ||
+        frameIndex == 0u) {
+        return;
+    }
+
+    validationLightReorderApplied_ = true;
+    SceneAsset scene = sceneDocument_.toSceneAsset();
+    if (scene.lights.size() < 2u) {
+        std::cout << "Validation light reorder skipped: fewer than two authored lights\n";
+        return;
+    }
+
+    std::reverse(scene.lights.begin(), scene.lights.end());
+    const bool updated = pathTracer_->updateSceneLights(scene, true);
+    std::cout << "Validation light reorder " << (updated ? "applied" : "skipped")
+              << ": authored_lights=" << scene.lights.size() << '\n';
+}
+
+void Application::applyValidationLightFlicker(uint32_t frameIndex) {
+    if (!validationLightFlicker_ || pathTracer_ == nullptr) {
+        return;
+    }
+
+    SceneAsset scene = sceneDocument_.toSceneAsset();
+    if (scene.lights.empty()) {
+        if (!validationLightFlickerUnavailableLogged_) {
+            std::cout << "Validation light flicker skipped: no authored lights\n";
+            validationLightFlickerUnavailableLogged_ = true;
+        }
+        return;
+    }
+
+    // Two bright frames, two near-off frames, then two bright frames. Keeping
+    // the source present exercises generation remapping without deleting it.
+    const uint32_t phase = frameIndex % 6u;
+    const bool nearOff = phase == 2u || phase == 3u;
+    const float baseIntensity = std::max(scene.lights.front().intensity, 0.001f);
+    scene.lights.front().intensity = nearOff ? baseIntensity * 0.02f : baseIntensity;
+    const bool updated = pathTracer_->updateSceneLights(scene, true);
+    std::cout << "Validation light flicker frame=" << frameIndex
+              << " state=" << (nearOff ? "near-off" : "bright")
+              << " update=" << (updated ? "applied" : "unchanged") << '\n';
+}
+
 void Application::beginSunDragArm(bool dragEligible) {
     if (window_ == nullptr || sunDrag_.phase != SunDragPhase::Idle) {
         return;
@@ -16225,6 +16331,7 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild, bool intera
         applyActiveSceneCamera();
         pathTracer_->resetAccumulation(route.resetReason);
         commandSystem_->setPathTracer(pathTracer_.get());
+        syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
     };
 
     auto syncDerivedSceneSettings = [&]() {
@@ -16396,26 +16503,57 @@ bool Application::applyPendingSceneUpdate(bool allowResourceRebuild, bool intera
 }
 
 void Application::applyRendererSettingsSafely(const RendererSettings& settings, bool allowRenderResolutionChange) {
-    if (pathTracer_ == nullptr) {
+    if (pathTracer_ == nullptr || context_ == nullptr) {
         return;
     }
 
     const RendererSettings current = pathTracer_->settings();
+    const RendererSettings requested = PathTracerRenderer::normalizeSettingsForDevice(settings, *context_);
+    const bool gpuSceneConfigurationChanged =
+        requested.opacityMicromapsEnabled != current.opacityMicromapsEnabled ||
+        requested.opacityMicromapSubdivisionLevel != current.opacityMicromapSubdivisionLevel ||
+        requested.opacityMicromapBlendEnabled != current.opacityMicromapBlendEnabled ||
+        requested.compactImportedEmissiveTriangleSampling != current.compactImportedEmissiveTriangleSampling;
     const bool renderResolutionChanged =
-        std::abs(settings.renderResolutionScale - current.renderResolutionScale) > 0.0001f;
-    if (!renderResolutionChanged || allowRenderResolutionChange) {
-        if (pathTracer_->applySettings(settings)) {
-            syncDocumentRenderSettings(sceneDocument_, settings);
+        std::abs(requested.renderResolutionScale - current.renderResolutionScale) > 0.0001f;
+
+    if (gpuSceneConfigurationChanged) {
+        if (!allowRenderResolutionChange) {
+            pendingPostFrameSettings_ = requested;
+            return;
         }
+        preparePathTracerForRendererReplacement(current);
+        std::unique_ptr<PathTracerRenderer> nextPathTracer = makePathTracer(
+            gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &*gpuSceneAsset_ : nullptr,
+            gpuSceneAsset_.has_value() && !gpuSceneAsset_->meshes.empty() ? &assets_ : nullptr,
+            currentSceneCachePolicyForRenderer(),
+            &requested);
+        if (uiOverlay_ != nullptr) {
+            uiOverlay_->invalidateRendererTextures();
+            uiOverlay_->editor().invalidateAssetThumbnails();
+        }
+        retirePathTracer(std::move(pathTracer_));
+        pathTracer_ = std::move(nextPathTracer);
+        applyActiveSceneCamera();
+        pathTracer_->resetAccumulation(AccumulationResetReason::RenderSettingsChanged);
+        if (commandSystem_ != nullptr) {
+            commandSystem_->setPathTracer(pathTracer_.get());
+        }
+        syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
         return;
     }
 
-    RendererSettings immediate = settings;
-    immediate.renderResolutionScale = current.renderResolutionScale;
-    if (pathTracer_->applySettings(immediate)) {
-        syncDocumentRenderSettings(sceneDocument_, settings);
+    if (!renderResolutionChanged || allowRenderResolutionChange) {
+        (void)pathTracer_->applySettings(requested);
+        syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
+        return;
     }
-    pendingPostFrameSettings_ = settings;
+
+    RendererSettings immediate = requested;
+    immediate.renderResolutionScale = current.renderResolutionScale;
+    (void)pathTracer_->applySettings(immediate);
+    syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
+    pendingPostFrameSettings_ = requested;
 }
 
 bool Application::applyRendererSettingsFromEditor(const RendererSettings& settings, bool allowRenderResolutionChange) {
@@ -16631,6 +16769,13 @@ void Application::shutdownStreamingRuntime() {
 }
 
 void Application::stepStreamingGpuWorkQueue() {
+    const float previousGpuMs = pathTracer_ != nullptr ? pathTracer_->timings().totalMs() : 0.0f;
+    const uint64_t previousGpuUs =
+        previousGpuMs > 0.0f && std::isfinite(previousGpuMs)
+        ? static_cast<uint64_t>(previousGpuMs * 1000.0f)
+        : 0ull;
+    (void)streamingAsyncComputeBudgeter_.beginFrame(previousGpuUs, frameSerial_);
+
     // Gate work-queue completion on real device-timeline progress when a live
     // transfer executor is available. The work queue remains the accounting
     // layer; live completion advances only after the executor's device timeline
@@ -16671,6 +16816,8 @@ void Application::stepStreamingGpuWorkQueue() {
         std::unordered_map<AssetGuid, bool> ownerComplete;
         std::unordered_map<AssetGuid, bool> ownerFailed;
         std::unordered_map<AssetGuid, bool> ownerPayloadBacked;
+        std::unordered_map<AssetGuid, bool> textureUploadsComplete;
+        std::unordered_map<AssetGuid, bool> textureUploadsPayloadBacked;
         std::unordered_map<AssetGuid, NativeGpuAssetSnapshot> nativeSnapshotByGuid;
         for (const NativeGpuAssetSnapshot& snapshot : nativeGpuAssetCache_.snapshots()) {
             if (!snapshot.guid.empty()) {
@@ -16681,6 +16828,12 @@ void Application::stepStreamingGpuWorkQueue() {
         for (const StreamingGpuWorkSnapshot& ticket : snapshots) {
             if (ticket.ownerGuid.empty()) {
                 continue;
+            }
+            if (ticket.kind == StreamingGpuWorkKind::ImageMipUpload) {
+                auto completeIt = textureUploadsComplete.emplace(ticket.ownerGuid, true).first;
+                completeIt->second = completeIt->second && ticket.state == StreamingGpuWorkState::Complete;
+                auto payloadIt = textureUploadsPayloadBacked.emplace(ticket.ownerGuid, true).first;
+                payloadIt->second = payloadIt->second && ticket.payloadBacked;
             }
             if (ticket.payloadBacked &&
                 ticket.kind == StreamingGpuWorkKind::ImageMipUpload &&
@@ -16779,6 +16932,39 @@ void Application::stepStreamingGpuWorkQueue() {
                 streamingGpuBlasBuildPayloads_.erase(ticket.id);
                 streamingGpuBlasCompactionPayloads_.erase(ticket.id);
             }
+        }
+        const std::vector<NativeGpuAssetSnapshot> currentNativeSnapshots = nativeGpuAssetCache_.snapshots();
+        for (const auto& [guid, uploadsComplete] : textureUploadsComplete) {
+            if (!uploadsComplete || !textureUploadsPayloadBacked[guid] || pathTracer_ == nullptr || !gpuSceneAsset_.has_value()) {
+                continue;
+            }
+            const auto currentNativeIt = std::find_if(
+                currentNativeSnapshots.begin(),
+                currentNativeSnapshots.end(),
+                [&](const NativeGpuAssetSnapshot& snapshot) { return snapshot.guid == guid; });
+            if (currentNativeIt == currentNativeSnapshots.end() ||
+                currentNativeIt->kind != NativeGpuAssetKind::Texture ||
+                currentNativeIt->descriptorPatchComplete ||
+                currentNativeIt->mipCount == 0 ||
+                currentNativeIt->residentMipCount < currentNativeIt->mipCount) {
+                continue;
+            }
+            TextureAssetHandle textureHandle{};
+            const std::vector<TextureAsset>& textures = assets_.textures();
+            for (uint32_t textureIndex = 0; textureIndex < textures.size(); ++textureIndex) {
+                if (textures[textureIndex].nativeGuid == guid) {
+                    textureHandle = TextureAssetHandle{textureIndex};
+                    break;
+                }
+            }
+            Image* image = nativeGpuAssetCache_.imageResource(guid);
+            if (!textureHandle.valid() || image == nullptr ||
+                !pathTracer_->patchStreamedMaterialTexture(*gpuSceneAsset_, textureHandle, *image)) {
+                continue;
+            }
+            (void)nativeGpuAssetCache_.markDescriptorPatchComplete(guid);
+            streamingRuntimeState_.setAssetState(guid, StreamingAssetState::GpuResident);
+            streamingRuntimeState_.pushEvent("published streamed texture descriptor for " + guid);
         }
         for (const auto& [guid, complete] : ownerComplete) {
             const bool payloadBacked = ownerPayloadBacked[guid];
@@ -17303,14 +17489,17 @@ void Application::initializeRendererFromCurrentScene(const RendererSettings* set
         lastStartupPhase = now;
     };
 
-    rebuildGpuSceneAsset();
-    logStartupPhase("rebuild_gpu_scene_asset");
     RendererSettings startupSettings = settingsToRestore != nullptr ? *settingsToRestore : RendererSettings{};
     if (settingsToRestore == nullptr) {
         startupSettings.debugView = debugView_;
         startupSettings = rendererSettingsFromDocument(sceneDocument_, startupSettings);
     }
+    if (context_ != nullptr) {
+        startupSettings = PathTracerRenderer::normalizeSettingsForDevice(startupSettings, *context_);
+    }
     logStartupPhase("resolve_startup_settings");
+    rebuildGpuSceneAsset(&startupSettings);
+    logStartupPhase("rebuild_gpu_scene_asset");
     createPathTracer(&startupSettings);
     logStartupPhase("create_path_tracer");
     syncDocumentRenderSettings(sceneDocument_, pathTracer_->settings());
@@ -17388,8 +17577,10 @@ void Application::syncActiveSceneCameraFromController() {
     sceneDocument_.markDirty(SceneUpdateKind::CameraOnly);
 }
 
-void Application::rebuildGpuSceneAsset() {
-    const RendererSettings settings = pathTracer_ != nullptr ? pathTracer_->settings() : RendererSettings{};
+void Application::rebuildGpuSceneAsset(const RendererSettings* settingsOverride) {
+    const RendererSettings settings = settingsOverride != nullptr
+        ? *settingsOverride
+        : (pathTracer_ != nullptr ? pathTracer_->settings() : RendererSettings{});
     (void)SunController::migrateLegacyDirectionalSun(sceneDocument_);
     (void)SunController::repairPrimarySunTransform(sceneDocument_);
     applyDocumentMaterialAssignments(sceneDocument_, assets_);

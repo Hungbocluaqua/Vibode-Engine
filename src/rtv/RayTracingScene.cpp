@@ -3,6 +3,7 @@
 #include "rtv/BufferUploader.h"
 #include "rtv/Check.h"
 #include "rtv/GpuScene.h"
+#include "rtv/GpuValidation.h"
 #include "rtv/ResourceAllocator.h"
 #include "rtv/UploadContext.h"
 #include "rtv/VulkanContext.h"
@@ -219,6 +220,7 @@ void appendBlasGeometryRange(
 
 std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
     const GpuScene& scene,
+    const RayTracingSceneBuildOptions& options,
     const std::vector<MeshOpacityMicromapBuild>& opacityMicromapBuilds,
     const OpacityMicromapBuildStats& opacityMicromapStats,
     const std::vector<uint8_t>* activeMeshMask,
@@ -254,11 +256,14 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
             enableMixedSidednessPartitioning &&
             hardwareBackfaceCullingEnabled &&
             !meshHasOmm &&
-            mesh.updateMode == AccelUpdateMode::Static &&
+            !mesh.containsAlphaTestedGeometry &&
+            !mesh.containsBlendedGeometry &&
+            !meshAllowsDynamicBlasUpdate(mesh, options) &&
             mesh.containsSingleSidedGeometry &&
             mesh.containsDoubleSidedGeometry;
-        const bool preserveAlphaClassRanges = meshHasOmm &&
-            (mesh.containsAlphaTestedGeometry || mesh.containsBlendedGeometry);
+        // Mixed alpha meshes need one stable primitive-ID domain for any-hit and OMM
+        // lookups. Splitting them changes gl_PrimitiveID addressing between BLAS ranges.
+        const bool preserveAlphaClassRanges = meshHasOmm && mesh.containsBlendedGeometry;
         if (mesh.indexCount >= 3u &&
             !preserveAlphaClassRanges &&
             !preserveSidednessRanges) {
@@ -348,7 +353,7 @@ std::vector<MeshBlasGeometryPlan> buildBlasGeometryPlans(
             enableMixedSidednessPartitioning &&
             hardwareBackfaceCullingEnabled &&
             !meshHasOmm &&
-            mesh.updateMode == AccelUpdateMode::Static &&
+            !meshAllowsDynamicBlasUpdate(mesh, options) &&
             hasSingleSided &&
             hasDoubleSided;
         if (plan.splitSidedness) {
@@ -437,7 +442,12 @@ std::vector<MeshOpacityMicromapBuild> prepareOpacityMicromapBuilds(
         }
         const RayTracingMeshBuildInput& mesh = rtMeshes[meshBuildIndex];
         const uint32_t primitiveCount = mesh.indexCount / 3u;
-        if ((!mesh.containsAlphaTestedGeometry && !mesh.containsBlendedGeometry) || primitiveCount == 0) {
+        // Vulkan requires UPDATE builds to use the same geometry pNext contract
+        // as the original build. Dynamic/GPU-skinned geometry therefore uses
+        // shader any-hit instead of attaching an OMM that its refit would drop.
+        if (meshAllowsDynamicBlasUpdate(mesh, options) ||
+            (!mesh.containsAlphaTestedGeometry && !mesh.containsBlendedGeometry) ||
+            primitiveCount == 0) {
             continue;
         }
 
@@ -655,12 +665,14 @@ void accelerationBuildBarrier(VkCommandBuffer cmd) {
     barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
         VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR |
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
 
     VkDependencyInfo dependency{};
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
+    recordManualBarrierEscape("RayTracingScene", "acceleration_build", dependency);
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
@@ -679,6 +691,7 @@ void dynamicBlasInputBarrier(VkCommandBuffer cmd, const Buffer& vertexBuffer) {
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.bufferMemoryBarrierCount = 1;
     dependency.pBufferMemoryBarriers = &barrier;
+    recordManualBarrierEscape("RayTracingScene", "dynamic_blas_input", dependency);
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
@@ -697,6 +710,7 @@ void shaderStorageUploadBarrier(VkCommandBuffer cmd, const Buffer& buffer) {
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.bufferMemoryBarrierCount = 1;
     dependency.pBufferMemoryBarriers = &barrier;
+    recordManualBarrierEscape("RayTracingScene", "shader_storage_upload", dependency);
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
@@ -782,7 +796,8 @@ std::vector<VkAccelerationStructureInstanceKHR> buildVkInstances(
 
 VkAccelerationStructureMotionInstanceNV makeVkMotionInstance(
     const RayTracingInstanceBuildInput& instance,
-    const AccelerationStructure& blas) {
+    const AccelerationStructure& blas,
+    uint32_t tlasRecordIndex) {
     const uint8_t mask = rayTracingInstanceMask(instance);
     VkAccelerationStructureMotionInstanceNV vkInstance{};
     vkInstance.type = VK_ACCELERATION_STRUCTURE_MOTION_INSTANCE_TYPE_MATRIX_MOTION_NV;
@@ -790,7 +805,7 @@ VkAccelerationStructureMotionInstanceNV makeVkMotionInstance(
     VkAccelerationStructureMatrixMotionInstanceNV& matrix = vkInstance.data.matrixMotionInstance;
     matrix.transformT0 = toVkTransform(instance.previousTransform);
     matrix.transformT1 = toVkTransform(instance.transform);
-    matrix.instanceCustomIndex = instance.instanceIndex;
+    matrix.instanceCustomIndex = tlasRecordIndex;
     matrix.mask = mask;
     matrix.instanceShaderBindingTableRecordOffset = 0;
     matrix.flags = rayTracingInstanceFlags(instance, true);
@@ -830,9 +845,14 @@ RayTracingMotionInstanceStats collectMotionInstanceStats(
 
 std::vector<VkAccelerationStructureMotionInstanceNV> buildVkMotionInstances(
     const GpuScene& scene,
-    const std::vector<AccelerationStructure>& blases) {
+    const std::vector<AccelerationStructure>& blases,
+    const std::vector<MeshBlasGeometryPlan>& blasGeometryPlans,
+    const std::vector<MeshGeometryRangeGpu>& meshGeometryRanges,
+    std::vector<TlasGeometryRangeGpu>& tlasGeometryRanges) {
     std::vector<VkAccelerationStructureMotionInstanceNV> instances;
     instances.reserve(scene.rayTracingInstances().size());
+    tlasGeometryRanges.clear();
+    tlasGeometryRanges.reserve(scene.rayTracingInstances().size());
     for (const RayTracingInstanceBuildInput& instance : scene.rayTracingInstances()) {
         if (instance.meshIndex >= blases.size() || blases[instance.meshIndex].handle() == VK_NULL_HANDLE) {
             continue;
@@ -840,7 +860,24 @@ std::vector<VkAccelerationStructureMotionInstanceNV> buildVkMotionInstances(
         if (rayTracingInstanceMask(instance) == 0u) {
             continue;
         }
-        instances.push_back(makeVkMotionInstance(instance, blases[instance.meshIndex]));
+        const uint32_t tlasRecordIndex = static_cast<uint32_t>(tlasGeometryRanges.size());
+        MeshGeometryRangeGpu range{.offset = 0u, .count = 1u};
+        if (instance.meshIndex < blasGeometryPlans.size() &&
+            blasGeometryPlans[instance.meshIndex].allGeometryRange.count > 0u) {
+            range = blasGeometryPlans[instance.meshIndex].allGeometryRange;
+        } else if (instance.meshIndex < meshGeometryRanges.size()) {
+            range = meshGeometryRanges[instance.meshIndex];
+        }
+        instances.push_back(makeVkMotionInstance(instance, blases[instance.meshIndex], tlasRecordIndex));
+        tlasGeometryRanges.push_back(TlasGeometryRangeGpu{
+            .offset = range.offset,
+            .count = range.count,
+            .instanceIndex = instance.instanceIndex,
+            ._pad = 0u,
+        });
+    }
+    if (tlasGeometryRanges.empty()) {
+        tlasGeometryRanges.push_back(TlasGeometryRangeGpu{.offset = 0u, .count = 1u, .instanceIndex = 0u, ._pad = 0u});
     }
     return instances;
 }
@@ -861,13 +898,18 @@ void micromapBuildBarrier(VkCommandBuffer cmd) {
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT;
     barrier.srcAccessMask = VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
-    barrier.dstAccessMask = VK_ACCESS_2_MICROMAP_READ_BIT_EXT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT |
+        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_2_MICROMAP_READ_BIT_EXT |
+        VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT |
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
 
     VkDependencyInfo dependency{};
     dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     dependency.memoryBarrierCount = 1;
     dependency.pMemoryBarriers = &barrier;
+    recordManualBarrierEscape("RayTracingScene", "micromap_build", dependency);
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
@@ -973,6 +1015,7 @@ void RayTracingScene::build(
     std::vector<MeshGeometryRangeGpu> meshGeometryRanges;
     std::vector<MeshBlasGeometryPlan> blasGeometryPlans = buildBlasGeometryPlans(
         scene,
+        options,
         opacityMicromapBuilds,
         opacityMicromapStats_,
         &activeMeshMask,
@@ -1219,10 +1262,10 @@ void RayTracingScene::build(
             micromapBuildInfo.triangleArray.deviceAddress = opacityBuild.triangleArrayBuffer.deviceAddress() + opacityBuild.triangleArrayBufferOffset;
             micromapBuildInfo.triangleArrayStride = sizeof(VkMicromapTriangleEXT);
             vkCmdBuildMicromapsEXT(cmd, 1, &micromapBuildInfo);
-            recordedOpacityMicromapBuilds = true;
-        }
-        if (recordedOpacityMicromapBuilds) {
+            // Every build reuses the same scratch address, so serialize it
+            // before recording the next micromap build.
             micromapBuildBarrier(cmd);
+            recordedOpacityMicromapBuilds = true;
         }
     }
 
@@ -1374,7 +1417,14 @@ void RayTracingScene::build(
             blasGeometryPlans,
             meshGeometryRanges,
             tlasGeometryRanges);
-    const std::vector<VkAccelerationStructureMotionInstanceNV> motionInstances = motionBlurActive_ ? buildVkMotionInstances(scene, blases_) : std::vector<VkAccelerationStructureMotionInstanceNV>{};
+    const std::vector<VkAccelerationStructureMotionInstanceNV> motionInstances = motionBlurActive_
+        ? buildVkMotionInstances(
+            scene,
+            blases_,
+            blasGeometryPlans,
+            meshGeometryRanges,
+            tlasGeometryRanges)
+        : std::vector<VkAccelerationStructureMotionInstanceNV>{};
     const uint32_t builtInstanceCount = static_cast<uint32_t>(motionBlurActive_ ? motionInstances.size() : instances.size());
     if (builtInstanceCount == 0) {
         throw std::runtime_error("Cannot build ray tracing TLAS: no valid instances");
@@ -1396,9 +1446,6 @@ void RayTracingScene::build(
     instanceBuffer_.write(motionBlurActive_ ? static_cast<const void*>(motionInstances.data()) : static_cast<const void*>(instances.data()), instanceBytes);
     instanceBuffer_.flush();
 
-    if (motionBlurActive_) {
-        tlasGeometryRanges.assign(1u, TlasGeometryRangeGpu{.offset = 0u, .count = 1u, .instanceIndex = 0u, ._pad = 0u});
-    }
     tlasGeometryRangesBuffer_.create(allocator, BufferDesc{
         .size = sizeof(TlasGeometryRangeGpu) * tlasGeometryRanges.size(),
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -1518,6 +1565,7 @@ bool RayTracingScene::recordDynamicBlasUpdates(
     const OpacityMicromapBuildStats noOpacityMicromapStats{};
     const std::vector<MeshBlasGeometryPlan> blasGeometryPlans = buildBlasGeometryPlans(
         scene,
+        options,
         noOpacityMicromapBuilds,
         noOpacityMicromapStats,
         nullptr,
@@ -1645,7 +1693,14 @@ bool RayTracingScene::refitTransforms(
             emptyGeometryPlans,
             emptyMeshGeometryRanges,
             ignoredTlasGeometryRanges);
-    const std::vector<VkAccelerationStructureMotionInstanceNV> motionInstances = motionBlurActive_ ? buildVkMotionInstances(scene, blases_) : std::vector<VkAccelerationStructureMotionInstanceNV>{};
+    const std::vector<VkAccelerationStructureMotionInstanceNV> motionInstances = motionBlurActive_
+        ? buildVkMotionInstances(
+            scene,
+            blases_,
+            emptyGeometryPlans,
+            emptyMeshGeometryRanges,
+            ignoredTlasGeometryRanges)
+        : std::vector<VkAccelerationStructureMotionInstanceNV>{};
     const uint32_t builtInstanceCount = static_cast<uint32_t>(motionBlurActive_ ? motionInstances.size() : instances.size());
     if (builtInstanceCount == 0 || builtInstanceCount != instanceCount_) {
         return false;

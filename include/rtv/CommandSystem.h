@@ -76,6 +76,7 @@ private:
     UiOverlay* uiOverlay_ = nullptr;
     std::array<FrameResources, framesInFlight> frames_{};
     std::vector<VkSemaphore> imageRenderFinished_;
+    std::vector<VkFence> imageInFlightFences_;
     mutable uint64_t asyncTimelineValue_ = 0;
     mutable uint64_t asyncHistoryCompleteValue_ = 0;
     uint32_t frameIndex_ = 0;

@@ -39,6 +39,14 @@ layout(set = 0, binding = 4, std140) uniform DebugParams {
     float scale;
 } debug_params;
 
+vec3 scalar_contract_color(float value, float range) {
+    if (isnan(value) || isinf(value) || value < 0.0) {
+        return vec3(1.0, 0.0, 0.8);
+    }
+    float normalizedValue = clamp(log2(max(value, 0.0) + 1.0) / max(range, 1.0e-6), 0.0, 1.0);
+    return vec3(normalizedValue, sqrt(normalizedValue), 1.0 - normalizedValue);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= int(params.width) || pixel.y >= int(params.height)) return;
@@ -73,6 +81,36 @@ void main() {
         float roughness = restir_gi_roughness(selectedRes);
         vec3 tint = roughness >= 0.35 ? vec3(0.1, 0.9, 0.35) : vec3(1.0, 0.55, 0.08);
         imageStore(raw_image, pixel, vec4(tint, 1.0));
+        return;
+    }
+    if (debug_params.view == 152u) {
+        imageStore(raw_image, pixel, vec4(scalar_contract_color(restir_gi_target_function(selectedRes), 16.0), 1.0));
+        return;
+    }
+    if (debug_params.view == 153u) {
+        imageStore(raw_image, pixel, vec4(scalar_contract_color(restir_gi_target_pdf(selectedRes), 16.0), 1.0));
+        return;
+    }
+    if (debug_params.view == 154u) {
+        imageStore(raw_image, pixel, vec4(scalar_contract_color(selectedRes.radiance_weight_sum.w, 16.0), 1.0));
+        return;
+    }
+    if (debug_params.view == 155u) {
+        imageStore(raw_image, pixel, vec4(vec3(clamp(restir_gi_sample_count(selectedRes) / 255.0, 0.0, 1.0)), 1.0));
+        return;
+    }
+    if (debug_params.view == 156u) {
+        float sampleFactor = restir_gi_reservoir_valid(selectedRes)
+            ? clamp(restir_gi_sample_count(selectedRes) / 16.0, 0.0, 1.0)
+            : 0.0;
+        float ageFactor = 1.0 - clamp(float(restir_gi_age(selectedRes)) / 32.0, 0.0, 0.75);
+        float visFactor = restir_gi_visible(selectedRes) ? 1.0 : 0.25;
+        imageStore(raw_image, pixel, vec4(vec3(sampleFactor * ageFactor * visFactor), 1.0));
+        return;
+    }
+    if (debug_params.view == 157u) {
+        bool valid = restir_gi_reservoir_valid(selectedRes);
+        imageStore(raw_image, pixel, vec4(0.35, restir_gi_visible(selectedRes) ? 1.0 : 0.0, valid ? 0.0 : 1.0, 1.0));
         return;
     }
 
@@ -135,21 +173,23 @@ void main() {
     float rawDeltaScale = params.raw_output_is_current_sample > 0.5 ? 1.0 : 1.0 / max(accumulated.a, 1.0);
     imageStore(raw_image, pixel, vec4(max(rawBase.rgb + giDelta * rawDeltaScale, vec3(0.0)), 1.0));
 
-    PathDataRecord pathData = path_data_buffer[pixelIndex];
-    pathData.indirect_diffuse.rgb = max(pathData.indirect_diffuse.rgb + giDelta, vec3(0.0));
+    vec4 indirectDiffuse = path_data_buffer[pixelIndex].indirect_diffuse;
+    indirectDiffuse.rgb = max(indirectDiffuse.rgb + giDelta, vec3(0.0));
     float guideStrength = giConfidence * replacementStrength;
-    pathData.indirect_diffuse.a = max(pathData.indirect_diffuse.a, guideStrength);
+    indirectDiffuse.a = max(indirectDiffuse.a, guideStrength);
+    path_data_buffer[pixelIndex].indirect_diffuse = indirectDiffuse;
     if (restir_gi_reservoir_valid(selectedRes)) {
         float giHitDistance = clamp(restir_gi_hit_distance(selectedRes), 0.0, 65504.0);
         if (guideStrength > 0.04 && giHitDistance > 0.001 && giHitDistance < 65504.0) {
             float guideBlend = clamp(guideStrength, 0.0, 0.75);
+            float currentDiffuseHitDistance = path_data_buffer[pixelIndex].denoiser_hit_distance.x;
             float previousDiffuseHitDistance =
-                pathData.denoiser_hit_distance.x > 0.001 && pathData.denoiser_hit_distance.x < 65504.0
-                    ? pathData.denoiser_hit_distance.x
+                currentDiffuseHitDistance > 0.001 && currentDiffuseHitDistance < 65504.0
+                    ? currentDiffuseHitDistance
                     : giHitDistance;
-            pathData.denoiser_hit_distance.x = mix(previousDiffuseHitDistance, giHitDistance, guideBlend);
-            pathData.diffuse_ray_direction_hit_distance.w = pathData.denoiser_hit_distance.x;
+            float resolvedHitDistance = mix(previousDiffuseHitDistance, giHitDistance, guideBlend);
+            path_data_buffer[pixelIndex].denoiser_hit_distance.x = resolvedHitDistance;
+            path_data_buffer[pixelIndex].diffuse_ray_direction_hit_distance.w = resolvedHitDistance;
         }
     }
-    path_data_buffer[pixelIndex] = pathData;
 }

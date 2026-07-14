@@ -6,6 +6,20 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set = 0, binding = 0, rgba16f) readonly uniform image2D raw_hdr;
 layout(set = 0, binding = 1, rgba16f) readonly uniform image2D nrd_diff_radiance_hitdist;
 layout(set = 0, binding = 2, rgba16f) readonly uniform image2D nrd_spec_radiance_hitdist;
+layout(set = 0, binding = 8, r16f) readonly uniform image2D nrd_diff_confidence;
+layout(set = 0, binding = 9, r16f) readonly uniform image2D nrd_spec_confidence;
+layout(set = 0, binding = 10, rgba16f) readonly uniform image2D nrd_raw_confidence_gradient;
+layout(set = 0, binding = 11, rgba16f) readonly uniform image2D nrd_filtered_confidence_gradient;
+
+layout(push_constant, std430) uniform PushConstants {
+    uint debug_view;
+} push_constants;
+
+const uint DEBUG_VIEW_NRD_DIFFUSE_CONFIDENCE = 160u;
+const uint DEBUG_VIEW_NRD_SPECULAR_CONFIDENCE = 161u;
+const uint DEBUG_VIEW_NRD_RAW_CONFIDENCE_GRADIENT = 162u;
+const uint DEBUG_VIEW_NRD_FILTERED_CONFIDENCE_GRADIENT = 163u;
+const uint DEBUG_VIEW_NRD_CONFIDENCE_HISTORY = 164u;
 
 struct PathDataRecord {
     vec4 direct_diffuse;
@@ -160,6 +174,35 @@ void main() {
 
     uint pixelIndex = uint(coords.y) * uint(dims.x) + uint(coords.x);
     vec3 raw = max(imageLoad(raw_hdr, coords).rgb, vec3(0.0));
+    if (push_constants.debug_view == DEBUG_VIEW_NRD_DIFFUSE_CONFIDENCE) {
+        float confidence = clamp(imageLoad(nrd_diff_confidence, coords).r, 0.0, 1.0);
+        imageStore(out_denoised_hdr, coords, vec4(vec3(confidence), 1.0));
+        return;
+    }
+    if (push_constants.debug_view == DEBUG_VIEW_NRD_SPECULAR_CONFIDENCE) {
+        float confidence = clamp(imageLoad(nrd_spec_confidence, coords).r, 0.0, 1.0);
+        imageStore(out_denoised_hdr, coords, vec4(vec3(confidence), 1.0));
+        return;
+    }
+    if (push_constants.debug_view == DEBUG_VIEW_NRD_RAW_CONFIDENCE_GRADIENT) {
+        vec2 gradient = clamp(imageLoad(nrd_raw_confidence_gradient, coords).xy, vec2(0.0), vec2(1.0));
+        imageStore(out_denoised_hdr, coords, vec4(gradient.x, gradient.y, max(gradient.x, gradient.y), 1.0));
+        return;
+    }
+    if (push_constants.debug_view == DEBUG_VIEW_NRD_FILTERED_CONFIDENCE_GRADIENT) {
+        vec2 gradient = clamp(imageLoad(nrd_filtered_confidence_gradient, coords).xy, vec2(0.0), vec2(1.0));
+        imageStore(out_denoised_hdr, coords, vec4(gradient.x, gradient.y, max(gradient.x, gradient.y), 1.0));
+        return;
+    }
+    if (push_constants.debug_view == DEBUG_VIEW_NRD_CONFIDENCE_HISTORY) {
+        vec4 rawGradient = imageLoad(nrd_raw_confidence_gradient, coords);
+        vec2 filteredGradient = clamp(imageLoad(nrd_filtered_confidence_gradient, coords).xy, vec2(0.0), vec2(1.0));
+        float effectiveHistoryConfidence = 1.0 - max(filteredGradient.x, filteredGradient.y);
+        float sourcePixelLookup = clamp(rawGradient.w, 0.0, 1.0);
+        float currentPixelValid = clamp(rawGradient.z, 0.0, 1.0);
+        imageStore(out_denoised_hdr, coords, vec4(effectiveHistoryConfidence, sourcePixelLookup, currentPixelValid, 1.0));
+        return;
+    }
     float viewZ = uintBitsToFloat(depth_normal_buffer[pixelIndex].x);
     if (!(viewZ < 1.0e9)) {
         imageStore(out_denoised_hdr, coords, vec4(raw, 1.0));
