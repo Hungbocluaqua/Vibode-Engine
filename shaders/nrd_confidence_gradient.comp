@@ -1,0 +1,291 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "temporal_common.glsl"
+
+#define RTV_RESTIR_DI_COMPUTE_ACCESSORS 1
+#include "restir_di_types_accessors.glsl"
+#include "restir_di_reuse.glsl"
+#include "restir_di_light_evaluation.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer DepthNormalBuffer { uvec4 depth_normal_buffer[]; };
+
+struct PathDataRecord {
+    vec4 direct_diffuse;
+    vec4 direct_specular;
+    vec4 indirect_diffuse;
+    vec4 indirect_specular;
+    vec4 albedo_roughness_hit_confidence;
+    vec4 material_specular_albedo;
+    vec4 denoiser_hit_distance;
+    vec4 diffuse_ray_direction_hit_distance;
+    vec4 specular_ray_direction_hit_distance;
+    vec4 emissive_residual;
+    vec4 restir_gi_fallback_reactive;
+};
+layout(set = 0, binding = 1, std430) readonly buffer PathDataBuffer { PathDataRecord path_data_buffer[]; };
+
+layout(set = 0, binding = 2, rgba16f) readonly uniform image2D previous_lighting_luminance;
+layout(set = 0, binding = 3, r32f) readonly uniform image2D adaptive_filled_mask;
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D current_lighting_luminance;
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D raw_confidence_gradient;
+
+layout(set = 0, binding = 6, std140) uniform TaaParams {
+    uint enabled;
+    uint frame_count;
+    uint width;
+    uint height;
+    float feedback;
+    float velocity_scale;
+    uint reset_history;
+    float sharpen_strength;
+    uint history_valid;
+    uint camera_moving;
+    uint render_width;
+    uint render_height;
+    float motion_feedback;
+    float reactive_feedback;
+} params;
+
+layout(set = 0, binding = 7, std430) readonly buffer RestirDiSourcePixels {
+    uint restir_di_source_pixels[];
+};
+layout(set = 0, binding = 8, std430) readonly buffer RestirDiCurrentReceivers {
+    RestirDiReceiver restir_di_current_receivers[];
+};
+layout(set = 0, binding = 9, std430) readonly buffer RestirDiPreviousReceivers {
+    RestirDiReceiver restir_di_previous_receivers[];
+};
+layout(set = 0, binding = 10, std430) readonly buffer RestirDiFinalReservoirs {
+    RestirDiReservoir restir_di_final_reservoirs[];
+};
+layout(set = 0, binding = 11, std430) readonly buffer RestirDiPreviousLightRecords {
+    RestirDiLightRecord restir_di_previous_light_records[];
+};
+
+layout(push_constant, std430) uniform ConfidenceReplayParams {
+    uint restir_available;
+    uint current_light_count;
+    uint previous_light_count;
+    uint previous_light_history_valid;
+} replay_params;
+
+const uint RESTIR_DI_SOURCE_PIXEL_INVALID = 0xffffffffu;
+const int NRD_CONFIDENCE_STRATUM_SIZE = 4;
+
+uint confidence_hash(uvec3 value) {
+    uint h = value.x * 0x8da6b343u ^ value.y * 0xd8163841u ^ value.z * 0xcb1ab31fu;
+    h ^= h >> 16u;
+    h *= 0x7feb352du;
+    h ^= h >> 15u;
+    h *= 0x846ca68bu;
+    return h ^ (h >> 16u);
+}
+
+ivec2 confidence_stratum_sample(ivec2 stratum, uint frameIndex) {
+    uint h = confidence_hash(uvec3(stratum, frameIndex));
+    return stratum * NRD_CONFIDENCE_STRATUM_SIZE +
+        ivec2(int(h & 3u), int((h >> 2u) & 3u));
+}
+
+ivec2 unpack_source_pixel(uint packed) {
+    return ivec2(int(packed & 0xffffu), int((packed >> 16u) & 0xffffu));
+}
+
+float nrd_luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float relative_gradient(float currentValue, float previousValue) {
+    float denom = max(max(abs(currentValue), abs(previousValue)), 1.0e-3);
+    return clamp(abs(currentValue - previousValue) / denom, 0.0, 1.0);
+}
+
+bool confidence_light_stable_identity_matches(RestirDiReservoir reservoir, RestirDiLightRecord light) {
+    return reservoir.sampleMetadata.x == restir_di_identity_hash(light.identity.xy) &&
+        restir_di_light_kind(reservoir) == light.metadata.x;
+}
+
+bool confidence_resolve_current_light(RestirDiReservoir reservoir, out RestirDiLightRecord light, out uint index) {
+    for (uint i = 0u; i < min(replay_params.current_light_count, restir_di_scene.lightCount); ++i) {
+        RestirDiLightRecord candidate = restir_di_light_records[i];
+        if (confidence_light_stable_identity_matches(reservoir, candidate)) {
+            light = candidate;
+            index = i;
+            return true;
+        }
+    }
+    index = 0u;
+    return false;
+}
+
+bool confidence_resolve_previous_light(RestirDiReservoir reservoir, out RestirDiLightRecord light, out uint index) {
+    for (uint i = 0u; i < replay_params.previous_light_count; ++i) {
+        RestirDiLightRecord candidate = restir_di_previous_light_records[i];
+        if (confidence_light_stable_identity_matches(reservoir, candidate)) {
+            light = candidate;
+            index = i;
+            return true;
+        }
+    }
+    index = 0u;
+    return false;
+}
+
+vec3 confidence_remap_sample_position(
+    RestirDiReservoir reservoir,
+    RestirDiLightRecord sourceLight,
+    RestirDiLightRecord targetLight) {
+    uint kind = restir_di_light_kind(reservoir);
+    if (kind == RESTIR_DI_LIGHT_POINT || kind == RESTIR_DI_LIGHT_SPOT) {
+        return targetLight.data1.xyz;
+    }
+    if (kind == RESTIR_DI_LIGHT_AREA) {
+        return reservoir.samplePosition_distance.xyz + targetLight.data1.xyz - sourceLight.data1.xyz;
+    }
+    return reservoir.samplePosition_distance.xyz;
+}
+
+bool confidence_replay_selected_light(
+    uint pixelIndex,
+    uint sourceIndex,
+    out vec2 currentLuminance,
+    out vec2 previousLuminance) {
+    currentLuminance = vec2(0.0);
+    previousLuminance = vec2(0.0);
+    if (replay_params.restir_available == 0u ||
+        replay_params.previous_light_history_valid == 0u) {
+        return false;
+    }
+
+    RestirDiReservoir reservoir = restir_di_final_reservoirs[pixelIndex];
+    if (!restir_di_reservoir_valid(reservoir) ||
+        restir_di_light_kind_infinite(restir_di_light_kind(reservoir))) {
+        return false;
+    }
+
+    RestirDiLightRecord currentLight;
+    RestirDiLightRecord previousLight;
+    uint currentLightIndex;
+    uint previousLightIndex;
+    if (!confidence_resolve_current_light(reservoir, currentLight, currentLightIndex) ||
+        !confidence_resolve_previous_light(reservoir, previousLight, previousLightIndex)) {
+        currentLuminance = vec2(1.0);
+        previousLuminance = vec2(0.0);
+        return true;
+    }
+
+    bool reservoirFromCurrent = reservoir.sampleMetadata.y == currentLight.identity.z;
+    RestirDiLightRecord sourceLight = reservoirFromCurrent ? currentLight : previousLight;
+    RestirDiReservoir currentSample = reservoir;
+    RestirDiReservoir previousSample = reservoir;
+    currentSample.samplePosition_distance.xyz = confidence_remap_sample_position(reservoir, sourceLight, currentLight);
+    previousSample.samplePosition_distance.xyz = confidence_remap_sample_position(reservoir, sourceLight, previousLight);
+
+    RestirDiReceiver currentReceiver = restir_di_current_receivers[pixelIndex];
+    RestirDiReceiver previousReceiver = restir_di_previous_receivers[sourceIndex];
+    uint invalidFlags = RESTIR_DI_SURFACE_SKY | RESTIR_DI_SURFACE_INVALID |
+        RESTIR_DI_SURFACE_DELTA | RESTIR_DI_SURFACE_UNLIT | RESTIR_DI_SURFACE_UNSUPPORTED;
+    if ((restir_di_receiver_surface_flags(currentReceiver) & invalidFlags) != 0u ||
+        (restir_di_receiver_surface_flags(previousReceiver) & invalidFlags) != 0u) {
+        return false;
+    }
+
+    vec3 currentNormal = restir_di_light_normal(currentSample);
+    vec3 previousNormal = restir_di_light_normal(previousSample);
+    float currentPdf = restir_di_pdf_at_receiver(
+        currentLightIndex,
+        currentLight,
+        currentReceiver.worldPosition_depth.xyz,
+        currentSample.samplePosition_distance.xyz,
+        currentNormal);
+    float previousPdf = max(restir_di_source_pdf(reservoir), 1.0e-6);
+    if (currentPdf <= 1.0e-6) {
+        currentLuminance = vec2(1.0);
+        previousLuminance = vec2(0.0);
+        return true;
+    }
+
+    vec3 direction;
+    float distanceToLight;
+    vec3 diffuseContribution;
+    vec3 specularContribution;
+    restir_di_evaluate_integrand_components(
+        currentSample,
+        currentReceiver,
+        currentLight,
+        currentPdf,
+        direction,
+        distanceToLight,
+        currentNormal,
+        diffuseContribution,
+        specularContribution);
+    currentLuminance = vec2(nrd_luminance(diffuseContribution), nrd_luminance(specularContribution));
+
+    restir_di_evaluate_integrand_components(
+        previousSample,
+        previousReceiver,
+        previousLight,
+        previousPdf,
+        direction,
+        distanceToLight,
+        previousNormal,
+        diffuseContribution,
+        specularContribution);
+    previousLuminance = vec2(nrd_luminance(diffuseContribution), nrd_luminance(specularContribution));
+    return !any(isnan(currentLuminance)) && !any(isinf(currentLuminance)) &&
+        !any(isnan(previousLuminance)) && !any(isinf(previousLuminance));
+}
+
+void main() {
+    ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(int(params.render_width), int(params.render_height));
+    if (dims.x <= 0 || dims.y <= 0 || coords.x >= dims.x || coords.y >= dims.y) {
+        return;
+    }
+
+    uint pixelIndex = uint(coords.y) * uint(dims.x) + uint(coords.x);
+    float pathDistance = uintBitsToFloat(depth_normal_buffer[pixelIndex].x);
+    bool surface = pathDistance < 1.0e9;
+    bool adaptiveFilled = imageLoad(adaptive_filled_mask, coords).r > 0.5;
+
+    PathDataRecord path = path_data_buffer[pixelIndex];
+    vec3 noisyDiffuse = max(path.direct_diffuse.rgb + path.indirect_diffuse.rgb + path.emissive_residual.rgb, vec3(0.0));
+    vec3 noisySpecular = max(path.direct_specular.rgb + path.indirect_specular.rgb, vec3(0.0));
+    float diffuseLuminance = surface && !adaptiveFilled ? nrd_luminance(noisyDiffuse) : 0.0;
+    float specularLuminance = surface && !adaptiveFilled ? nrd_luminance(noisySpecular) : 0.0;
+
+    uint packedSourcePixel = restir_di_source_pixels[pixelIndex];
+    ivec2 sourceCoords = packedSourcePixel == RESTIR_DI_SOURCE_PIXEL_INVALID
+        ? coords
+        : clamp(unpack_source_pixel(packedSourcePixel), ivec2(0), dims - ivec2(1));
+    float valid = surface && !adaptiveFilled ? 1.0 : 0.0;
+
+    imageStore(current_lighting_luminance, coords, vec4(diffuseLuminance, specularLuminance, valid, 1.0));
+
+    ivec2 stratum = coords / NRD_CONFIDENCE_STRATUM_SIZE;
+    ivec2 sparseSample = confidence_stratum_sample(stratum, params.frame_count);
+    if (coords != sparseSample) {
+        imageStore(raw_confidence_gradient, coords, vec4(0.0));
+        return;
+    }
+
+    vec4 previous = imageLoad(previous_lighting_luminance, sourceCoords);
+    bool historyValid = params.history_valid != 0u && params.reset_history == 0u && previous.z > 0.5;
+    vec2 replayCurrent;
+    vec2 replayPrevious;
+    uint sourceIndex = uint(sourceCoords.y) * uint(dims.x) + uint(sourceCoords.x);
+    bool replayValid = historyValid && confidence_replay_selected_light(
+        pixelIndex, sourceIndex, replayCurrent, replayPrevious);
+    float diffuseGradient = historyValid ? relative_gradient(diffuseLuminance, previous.x) : 1.0;
+    float specularGradient = historyValid ? relative_gradient(specularLuminance, previous.y) : 1.0;
+    if (replayValid) {
+        diffuseGradient = relative_gradient(replayCurrent.x, replayPrevious.x);
+        specularGradient = relative_gradient(replayCurrent.y, replayPrevious.y);
+    }
+    float sourceValid = packedSourcePixel == RESTIR_DI_SOURCE_PIXEL_INVALID ? 0.0 : 1.0;
+    imageStore(raw_confidence_gradient, coords,
+        vec4(diffuseGradient, specularGradient, valid, replayValid ? 1.0 : sourceValid * 0.5));
+}

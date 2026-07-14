@@ -806,7 +806,7 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
     if (header_.sceneGuid.empty()) {
         header_.sceneGuid = generateSceneGuid();
     }
-    header_.formatVersion = 4;
+    header_.formatVersion = 5;
     header_.engineVersion = "0.1";
     header_.projectRelativePaths = true;
 
@@ -1471,6 +1471,19 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.restirDiTemporalMaxAge = render.value("restirDiTemporalMaxAge", renderSettings_.restirDiTemporalMaxAge);
         renderSettings_.restirDiMaxM = render.value("restirDiMaxM", renderSettings_.restirDiMaxM);
         renderSettings_.restirDiVisibilityRayBudget = render.value("restirDiVisibilityRayBudget", renderSettings_.restirDiVisibilityRayBudget);
+        if (restirDiMode == RestirDiMode::Off) {
+            renderSettings_.restirMode = RestirMode::ClassicNee;
+        } else if (restirDiMode == RestirDiMode::Legacy) {
+            if (renderSettings_.restirMode == RestirMode::ClassicNee) {
+                renderSettings_.restirMode = RestirMode::RestirOnly;
+            }
+        } else {
+            renderSettings_.restirMode = restirDiMode == RestirDiMode::HybridCompare
+                ? RestirMode::HybridCompare
+                : RestirMode::ClassicNee;
+            renderSettings_.restirDiFinalVisibilityEnabled = true;
+            renderSettings_.restirDiVisibilityRayBudget = std::max(renderSettings_.restirDiVisibilityRayBudget, 1u);
+        }
         renderSettings_.restirDiProductionStabilizationEnabled = render.value("restirDiProductionStabilizationEnabled", renderSettings_.restirDiProductionStabilizationEnabled);
         renderSettings_.restirDiClampLuminance = render.value("restirDiClampLuminance", renderSettings_.restirDiClampLuminance);
         if (loadedFormatVersion < 4u) {
@@ -1483,6 +1496,15 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         } else {
             renderSettings_.restirDiIncludeSun = render.value("restirDiIncludeSun", renderSettings_.restirDiIncludeSun);
             renderSettings_.restirDiIncludeEnvironment = render.value("restirDiIncludeEnvironment", renderSettings_.restirDiIncludeEnvironment);
+        }
+        if (restirDiMode == RestirDiMode::ReferenceValidation) {
+            renderSettings_.restirDiFinalVisibilityEnabled = true;
+            renderSettings_.restirDiProductionStabilizationEnabled = false;
+            renderSettings_.restirDiVisibilityRayBudget = std::max(renderSettings_.restirDiVisibilityRayBudget, 1u);
+        } else if (restirDiMode == RestirDiMode::Production ||
+                   restirDiMode == RestirDiMode::HybridCompare) {
+            renderSettings_.restirDiFinalVisibilityEnabled = true;
+            renderSettings_.restirDiVisibilityRayBudget = std::max(renderSettings_.restirDiVisibilityRayBudget, 1u);
         }
         if (restirDiMode == RestirDiMode::ReferenceValidation &&
             (!renderSettings_.restirDiFinalVisibilityEnabled ||
@@ -1570,6 +1592,9 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.restirHistoryCopyMode = historyCopyMode <= static_cast<uint32_t>(RestirHistoryCopyMode::PingPong)
             ? static_cast<RestirHistoryCopyMode>(historyCopyMode)
             : RestirHistoryCopyMode::Copy;
+        if (loadedFormatVersion < 5u && renderSettings_.restirHistoryCopyMode == RestirHistoryCopyMode::Copy) {
+            renderSettings_.restirHistoryCopyMode = RestirHistoryCopyMode::PingPong;
+        }
         const uint32_t lightingReuseMode = render.value("lightingReuseMode", static_cast<uint32_t>(renderSettings_.lightingReuseMode));
         if (lightingReuseMode > static_cast<uint32_t>(LightingReuseMode::ValidateRestirPTAgainstLegacy)) {
             return false;

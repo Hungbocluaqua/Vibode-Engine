@@ -9,14 +9,17 @@
 #include "rtv/PathTracerRenderer.h"
 #include "rtv/RenderGraphDump.h"
 #include "rtv/RenderGraph.h"
+#include "rtv/RendererPassContracts.h"
 #include "rtv/ResourceAllocator.h"
 #include "rtv/Swapchain.h"
+#include "rtv/TemporalSystem.h"
 #include "rtv/UiOverlay.h"
 #include "rtv/VulkanContext.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -24,8 +27,10 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace rtv {
@@ -43,6 +48,12 @@ bool isRestirGiExportView(RendererDebugView view) {
         view == RendererDebugView::RestirGiHitDistance ||
         view == RendererDebugView::RestirGiGrid ||
         view == RendererDebugView::RestirGiPathClass ||
+        view == RendererDebugView::RestirGiTarget ||
+        view == RendererDebugView::RestirGiSourcePdf ||
+        view == RendererDebugView::RestirGiWeightSum ||
+        view == RendererDebugView::RestirGiM ||
+        view == RendererDebugView::RestirGiConfidence ||
+        view == RendererDebugView::RestirGiVisibility ||
         view == RendererDebugView::WavefrontRestirGi;
 }
 
@@ -58,6 +69,7 @@ bool isRestirDiExportView(RendererDebugView view) {
         view == RendererDebugView::RestirDiReceiverPosition ||
         view == RendererDebugView::RestirDiReceiverNormal ||
         view == RendererDebugView::RestirDiLightVersion ||
+        view == RendererDebugView::RestirDiLightMapStatus ||
         view == RendererDebugView::RestirDiInitialReservoir ||
         view == RendererDebugView::RestirDiTemporalReservoir ||
         view == RendererDebugView::RestirDiSpatialReservoir ||
@@ -71,6 +83,28 @@ bool isRestirDiExportView(RendererDebugView view) {
         view == RendererDebugView::WavefrontRestirDi;
 }
 
+bool isDlssExportView(RendererDebugView view) {
+    return view == RendererDebugView::DlssDepth ||
+        view == RendererDebugView::DlssMotionVectors ||
+        view == RendererDebugView::DlssInputColor ||
+        view == RendererDebugView::DlssOutputColor;
+}
+
+bool isDlssRayReconstructionExportView(RendererDebugView view) {
+    return view == RendererDebugView::DlssRrDiffuseAlbedo ||
+        view == RendererDebugView::DlssRrSpecularAlbedo ||
+        view == RendererDebugView::DlssRrNormals ||
+        view == RendererDebugView::DlssRrRoughness ||
+        view == RendererDebugView::DlssRrDiffuseHitDistance ||
+        view == RendererDebugView::DlssRrSpecularHitDistance ||
+        view == RendererDebugView::DlssRrReflectedAlbedo ||
+        view == RendererDebugView::DlssRrDisocclusionMask ||
+        view == RendererDebugView::DlssRrDiffuseRayDirection ||
+        view == RendererDebugView::DlssRrSpecularRayDirection ||
+        view == RendererDebugView::DlssRrDiffuseRayDirectionHitDistance ||
+        view == RendererDebugView::DlssRrSpecularRayDirectionHitDistance;
+}
+
 bool shouldExportDebugViewForSettings(const RendererSettings& settings, RendererDebugView view) {
     if (settings.restirGiMode == RestirGiMode::Off && isRestirGiExportView(view)) {
         return false;
@@ -78,7 +112,94 @@ bool shouldExportDebugViewForSettings(const RendererSettings& settings, Renderer
     if (settings.restirDiMode == RestirDiMode::Off && isRestirDiExportView(view)) {
         return false;
     }
+    if (isDlssExportView(view) &&
+        settings.temporalUpscaler != TemporalUpscaler::Dlss &&
+        !settings.dlssRayReconstructionEnabled) {
+        return false;
+    }
+    if (isDlssRayReconstructionExportView(view) && !settings.dlssRayReconstructionEnabled) {
+        return false;
+    }
     return true;
+}
+
+std::vector<std::string> exportableRendererDebugViewNames() {
+    const std::vector<RendererDebugView> views = DiagnosticImageExport::allExportViews();
+    std::vector<std::string> names;
+    names.reserve(views.size());
+    for (RendererDebugView view : views) {
+        names.emplace_back(rendererDebugViewName(view));
+    }
+    return names;
+}
+
+std::vector<std::string> reservoirContractDebugViews(const RendererSettings& settings) {
+    std::vector<RendererDebugView> views;
+    if (settings.restirDiMode != RestirDiMode::Off) {
+        views.insert(views.end(), {
+            RendererDebugView::RestirDiSelectedLight,
+            RendererDebugView::RestirDiTarget,
+            RendererDebugView::RestirDiSourcePdf,
+            RendererDebugView::RestirDiWeightSum,
+            RendererDebugView::RestirDiM,
+            RendererDebugView::RestirDiAge,
+            RendererDebugView::RestirDiConfidence,
+            RendererDebugView::RestirDiVisibility,
+            RendererDebugView::RestirDiRejectionReason,
+        });
+    }
+    if (settings.restirGiMode != RestirGiMode::Off) {
+        views.insert(views.end(), {
+            RendererDebugView::RestirGiTarget,
+            RendererDebugView::RestirGiSourcePdf,
+            RendererDebugView::RestirGiWeightSum,
+            RendererDebugView::RestirGiM,
+            RendererDebugView::RestirGiAge,
+            RendererDebugView::RestirGiConfidence,
+            RendererDebugView::RestirGiVisibility,
+            RendererDebugView::RestirGiPathClass,
+        });
+    }
+    std::vector<std::string> names;
+    names.reserve(views.size());
+    for (RendererDebugView view : views) {
+        names.emplace_back(rendererDebugViewName(view));
+    }
+    return names;
+}
+
+std::vector<std::string> dlssGuideContractDebugViews(const RendererSettings& settings) {
+    std::vector<RendererDebugView> views;
+    if (settings.temporalUpscaler == TemporalUpscaler::Dlss || settings.dlssRayReconstructionEnabled) {
+        views.insert(views.end(), {
+            RendererDebugView::DlssDepth,
+            RendererDebugView::DlssMotionVectors,
+            RendererDebugView::DlssInputColor,
+            RendererDebugView::DlssOutputColor,
+        });
+    }
+    if (settings.dlssRayReconstructionEnabled) {
+        views.insert(views.end(), {
+            RendererDebugView::DlssRrDiffuseAlbedo,
+            RendererDebugView::DlssRrSpecularAlbedo,
+            RendererDebugView::DlssRrNormals,
+            RendererDebugView::DlssRrRoughness,
+            RendererDebugView::DlssRrDiffuseHitDistance,
+            RendererDebugView::DlssRrSpecularHitDistance,
+            RendererDebugView::DlssRrReflectedAlbedo,
+            RendererDebugView::DlssRrDisocclusionMask,
+            RendererDebugView::DlssRrDiffuseRayDirection,
+            RendererDebugView::DlssRrSpecularRayDirection,
+            RendererDebugView::DlssRrDiffuseRayDirectionHitDistance,
+            RendererDebugView::DlssRrSpecularRayDirectionHitDistance,
+        });
+    }
+    std::vector<std::string> names;
+    names.reserve(views.size());
+    for (RendererDebugView view : views) {
+        names.emplace_back(rendererDebugViewName(view));
+    }
+    return names;
 }
 
 } // namespace
@@ -132,6 +253,10 @@ void to_json(nlohmann::json& j, const ProfileReport::PerPassGpuMs& p) {
     j["skip_denoiser_copy"] = p.skipDenoiserCopy;
     j["taa"] = p.taa;
     j["taa_history_copy"] = p.taaHistoryCopy;
+    j["dlss_guides"] = p.dlssGuides;
+    j["dlss"] = p.dlss;
+    j["dlss_rr_guides"] = p.dlssRayReconstructionGuides;
+    j["dlss_rr"] = p.dlssRayReconstruction;
     j["auto_exposure_histogram_clear"] = p.autoExposureHistogramClear;
     j["auto_exposure_histogram"] = p.autoExposureHistogram;
     j["auto_exposure_reduce"] = p.autoExposureReduce;
@@ -509,6 +634,9 @@ void appendCompletedTopologySchedulerReport(ProfileReport& report) {
 }
 
 void to_json(nlohmann::json& j, const ProfileReport::PipelineStatistics& s) {
+    j["supported"] = s.supported;
+    j["valid"] = s.valid;
+    j["unavailable_reason"] = s.unavailableReason;
     j["ray_invocations"] = s.rayInvocations;
     j["triangle_hits"] = s.triangleHits;
     j["aabb_hits"] = s.aabbHits;
@@ -1124,11 +1252,137 @@ void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n)
     j["nrd_requestable"] = n.nrdRequestable;
     j["nrd_available"] = n.nrdAvailable;
     j["nrd_unavailable_reason"] = n.nrdUnavailableReason;
+    j["nrd_direct_runtime_resources_ready"] = n.nrdDirectRuntimeResourcesReady;
+    j["nrd_history_confidence_inputs_allocated"] = n.nrdHistoryConfidenceInputsAllocated;
+    j["nrd_history_confidence_available"] = n.nrdHistoryConfidenceAvailable;
+    j["nrd_validation_output_allocated"] = n.nrdValidationOutputAllocated;
+    j["nrd_validation_output_enabled"] = n.nrdValidationOutputEnabled;
+    j["nrd_guide_contract_reason"] = n.nrdGuideContractReason;
+    j["nrd_guide_contract"] = {
+        {"schema_version", 1},
+        {"motion_vectors", true},
+        {"normal_roughness", true},
+        {"view_z", true},
+        {"diffuse_radiance_hit_distance", true},
+        {"specular_radiance_hit_distance", true},
+        {"diffuse_history_confidence", n.nrdHistoryConfidenceAvailable},
+        {"specular_history_confidence", n.nrdHistoryConfidenceAvailable},
+        {"history_confidence_common_setting", n.nrdHistoryConfidenceAvailable},
+        {"restir_source_pixel_lookup", n.nrdHistoryConfidenceAvailable},
+        {"validation_output_allocated", n.nrdValidationOutputAllocated},
+        {"validation_output_enabled", n.nrdValidationOutputEnabled},
+        {"validation_debug_view", "nrd-validation"},
+        {"confidence_debug_views", {
+            "nrd-diffuse-confidence",
+            "nrd-specular-confidence",
+            "nrd-raw-confidence-gradient",
+            "nrd-filtered-confidence-gradient",
+            "nrd-confidence-history",
+        }},
+        {"history_confidence_format", "r16f"},
+        {"gradient_format", "rgba16f"},
+        {"gradient_sampling", "rotating-4x4-strata"},
+        {"gradient_filter", "5x5-strata-wide-depth-normal-bilateral"},
+        {"selected_light_replay", "current-and-previous-receiver-evaluation"},
+        {"light_history_mapping", "stable-identity-current-previous-gpu-tables"},
+        {"primary_surface_replacement", {
+            {"schema_version", 1},
+            {"guide_record_bytes", 48},
+            {"activation", "first-bounce-delta-or-near-mirror-reflection"},
+            {"primary_fallback_populated", true},
+            {"capture_precedes_russian_roulette", true},
+            {"nrd_replacement_guides", {"motion", "view_z", "normal", "roughness", "diffuse_albedo", "specular_f0", "hit_distance", "ray_direction"}},
+            {"dlss_rr_replacement_guides", {"depth", "motion", "normal", "roughness", "diffuse_albedo", "specular_f0", "reflected_albedo", "hit_distance", "ray_direction"}},
+            {"debug_views", {
+                "psr-active-mask",
+                "psr-depth",
+                "psr-motion",
+                "psr-normal-roughness",
+                "psr-hit-distance",
+                "psr-albedo-f0",
+                "psr-ray-direction",
+            }},
+        }},
+        {"confidence_source", n.nrdHistoryConfidenceAvailable
+            ? "restir-selected-light-opposite-frame-replay"
+            : "not-generated"},
+    };
     j["nrd_backend_policy"] = n.nrdBackendPolicy;
     j["nrd_backend_policy_reason"] = n.nrdBackendPolicyReason;
     j["nrd_backends_mutually_exclusive"] = n.nrdBackendsMutuallyExclusive;
     j["requested_denoiser_backend"] = n.requestedDenoiserBackend;
     j["effective_denoiser_backend"] = n.effectiveDenoiserBackend;
+    j["backend_comparison_policy"] = {
+        {"schema_version", 1},
+        {"policy_name", "RTXDI Q5D backend comparison policy"},
+        {"promotion_gate", "scripts/backend_comparison_matrix.ps1"},
+        {"active_mode", {
+            {"requested_denoiser_backend", n.requestedDenoiserBackend},
+            {"effective_denoiser_backend", n.effectiveDenoiserBackend},
+            {"requested_temporal_upscaler", n.requestedTemporalUpscaler},
+            {"effective_temporal_upscaler", n.effectiveTemporalUpscaler},
+            {"requested_dlss_ray_reconstruction", n.requestedDlssRayReconstruction},
+            {"effective_dlss_ray_reconstruction", n.effectiveDlssRayReconstruction},
+        }},
+        {"current_safe_default", {
+            {"denoiser_backend", "engine"},
+            {"temporal_upscaler", "taa-tsr"},
+            {"dlss_ray_reconstruction", false},
+            {"reason", "Engine denoiser plus TAA/TSR remains the safe default until Q5D evidence promotes another backend."},
+        }},
+        {"fallback_order", {
+            {
+                {"rank", 1},
+                {"mode", "engine_taa"},
+                {"denoiser_backend", "engine"},
+                {"temporal_upscaler", "taa-tsr"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Always available safe default."},
+            },
+            {
+                {"rank", 2},
+                {"mode", "nrd_taa"},
+                {"denoiser_backend", "nrd"},
+                {"temporal_upscaler", "taa-tsr"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Use only when direct NRD is available and the Q5D matrix passes quality/stability gates."},
+            },
+            {
+                {"rank", 3},
+                {"mode", "engine_dlss"},
+                {"denoiser_backend", "engine"},
+                {"temporal_upscaler", "dlss"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Use when DLSS is available/requested; fall back to TAA/TSR when DLSS is unavailable."},
+            },
+            {
+                {"rank", 4},
+                {"mode", "nrd_dlss"},
+                {"denoiser_backend", "nrd"},
+                {"temporal_upscaler", "dlss"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Use only when NRD and DLSS are both available and Q5D evidence beats/ties lower-risk modes."},
+            },
+            {
+                {"rank", 5},
+                {"mode", "dlss_rr"},
+                {"denoiser_backend", "engine"},
+                {"temporal_upscaler", "dlss"},
+                {"dlss_ray_reconstruction", true},
+                {"condition", "Opt-in only; requires DLSS RR availability plus valid depth, motion, disocclusion, ray-direction, hit-distance, and reflected-albedo guides."},
+            },
+            {
+                {"rank", 6},
+                {"mode", "reference_no_temporal"},
+                {"denoiser_backend", "off"},
+                {"temporal_upscaler", "off"},
+                {"dlss_ray_reconstruction", false},
+                {"condition", "Reference/diagnostic accumulation only; never a realtime fallback."},
+            },
+        }},
+        {"promotion_rule", "Do not change defaults until the candidate wins or ties equal-time quality/stability, has valid guide/profile diagnostics, and records a rollback CLI setting."},
+        {"failure_policy", "Backend-specific failures must be visible in profile JSON, validation logs, and debug guide exports; tone mapping, auto exposure, final-output clamps, or TAA history must not hide them."},
+    };
     j["dlss_sdk_configured"] = n.dlssSdkConfigured;
     j["dlss_available"] = n.dlssAvailable;
     j["dlss_unavailable_reason"] = n.dlssUnavailableReason;
@@ -1136,10 +1390,154 @@ void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n)
     j["dlss_ray_reconstruction_unavailable_reason"] = n.dlssRayReconstructionUnavailableReason;
     j["requested_dlss_ray_reconstruction"] = n.requestedDlssRayReconstruction;
     j["effective_dlss_ray_reconstruction"] = n.effectiveDlssRayReconstruction;
+    auto taggedResource = [](const char* role, const char* debugView, const ProfileReport::NvidiaIntegrationReport::StreamlineTagReport& tags) {
+        return nlohmann::json{
+            {"role", role},
+            {"debug_view", debugView},
+            {"expected", true},
+            {"tagged", tags.tagged > 0},
+            {"failed", tags.failed},
+            {"invalid_layout", tags.invalidLayout},
+            {"invalid_format", tags.invalidFormat},
+            {"invalid_extent", tags.invalidExtent},
+            {"runtime_rejected", tags.runtimeRejected},
+            {"evaluation_result_source", "feature_evaluation_summary"},
+        };
+    };
+    j["dlss_guide_contract"] = {
+        {"schema_version", 1},
+        {"guide_pass_ready", n.dlssAvailable || n.streamlineDlss.supported},
+        {"debug_views", {
+            "dlss-depth",
+            "dlss-motion-vectors",
+            "dlss-input-color",
+            "dlss-output-color",
+        }},
+        {"depth_convention", "hardware-depth for DLSS upscale; linear view depth for DLSS Ray Reconstruction"},
+        {"motion_convention", "previous-minus-current pixels; Streamline tags and NGX eval use MV scale 1,1"},
+        {"jitter_convention", "NGX receives projection jitter as -camera.jitter.xy; Streamline frame constants use the same projection-space sign"},
+        {"roughness_clamp", "not used by DLSS upscale"},
+        {"tagged_resources", {
+            taggedResource("scaling-input-color", "dlss-input-color", n.streamlineDlssTags),
+            taggedResource("scaling-output-color", "dlss-output-color", n.streamlineDlssTags),
+            taggedResource("depth", "dlss-depth", n.streamlineDlssTags),
+            taggedResource("motion-vectors", "dlss-motion-vectors", n.streamlineDlssTags),
+        }},
+        {"streamline_tags", n.streamlineDlssTags},
+        {"streamline_evaluation", n.streamlineDlssEvaluation},
+    };
+    j["dlss_ray_reconstruction_guide_contract"] = {
+        {"schema_version", 1},
+        {"mode", n.dlssRayReconstructionGuideMode},
+        {"guide_pass_ready", n.dlssRayReconstructionGuidePassReady},
+        {"guide_images_allocated", n.dlssRayReconstructionGuideImagesAllocated},
+        {"guide_image_count", n.dlssRayReconstructionGuideImageCount},
+        {"psr_guide_buffer_allocated", n.dlssRayReconstructionPsrGuideBufferAllocated},
+        {"psr_history_signatures_allocated", n.dlssRayReconstructionPsrHistorySignaturesAllocated},
+        {"psr_history_signature_bytes_per_pixel", 4},
+        {"psr_history_signature_policy", "active replacement pixels invalidate disocclusion when reprojected previous signature differs"},
+        {"uses_psr_guides", n.dlssRayReconstructionUsesPsrGuides},
+        {"replacement_source", "primary-surface-replacement"},
+        {"guide_images", {
+            "depth",
+            "motion",
+            "diffuse_albedo",
+            "specular_albedo",
+            "normal",
+            "roughness",
+            "diffuse_hit_distance",
+            "specular_hit_distance",
+            "reflected_albedo",
+            "disocclusion_mask",
+            "diffuse_ray_direction",
+            "specular_ray_direction",
+            "diffuse_ray_direction_hit_distance",
+            "specular_ray_direction_hit_distance",
+        }},
+        {"debug_views", {
+            "dlss-depth",
+            "dlss-motion-vectors",
+            "dlss-input-color",
+            "dlss-output-color",
+            "dlss-rr-diffuse-albedo",
+            "dlss-rr-specular-albedo",
+            "dlss-rr-normals",
+            "dlss-rr-roughness",
+            "dlss-rr-diffuse-hit-distance",
+            "dlss-rr-specular-hit-distance",
+            "dlss-rr-reflected-albedo",
+            "dlss-rr-disocclusion-mask",
+            "dlss-rr-diffuse-ray-direction",
+            "dlss-rr-specular-ray-direction",
+            "dlss-rr-diffuse-ray-direction-hit-distance",
+            "dlss-rr-specular-ray-direction-hit-distance",
+        }},
+        {"guide_invariants", {
+            {"depth", "linear view depth, finite, nonnegative"},
+            {"motion", "previous-minus-current pixels, matching Streamline/NGX MV scale 1,1"},
+            {"jitter", "projection jitter sign documented as -camera.jitter.xy for NGX"},
+            {"normals", "normalized world-space vectors"},
+            {"roughness", "clamped to [0.001, 1]"},
+            {"hit_distance", "finite, nonnegative, paired with the matching ray-direction guide"},
+            {"disocclusion", "1 only for history reset, invalid/reprojected history, alpha/adaptive-fill breaks, or PSR signature changes"},
+            {"reflected_albedo", "specular/reflection albedo, with PSR reflected paths using replacement diffuse albedo"},
+        }},
+        {"guide_consistency_validator", {
+            {"schema_version", 1},
+            {"camera_motion", true},
+            {"previous_world_position", true},
+            {"material_id", true},
+            {"instance_id", true},
+            {"adaptive_fill_mask", true},
+            {"psr_history_signature", n.dlssRayReconstructionPsrHistorySignaturesAllocated},
+        }},
+        {"tagged_resources", {
+            taggedResource("scaling-input-color", "dlss-input-color", n.streamlineDlssRayReconstructionTags),
+            taggedResource("scaling-output-color", "dlss-output-color", n.streamlineDlssRayReconstructionTags),
+            taggedResource("depth", "dlss-depth", n.streamlineDlssRayReconstructionTags),
+            taggedResource("motion-vectors", "dlss-motion-vectors", n.streamlineDlssRayReconstructionTags),
+            taggedResource("albedo", "dlss-rr-diffuse-albedo", n.streamlineDlssRayReconstructionTags),
+            taggedResource("specular-albedo", "dlss-rr-specular-albedo", n.streamlineDlssRayReconstructionTags),
+            taggedResource("normals", "dlss-rr-normals", n.streamlineDlssRayReconstructionTags),
+            taggedResource("roughness", "dlss-rr-roughness", n.streamlineDlssRayReconstructionTags),
+            taggedResource("diffuse-hit-distance", "dlss-rr-diffuse-hit-distance", n.streamlineDlssRayReconstructionTags),
+            taggedResource("specular-hit-distance", "dlss-rr-specular-hit-distance", n.streamlineDlssRayReconstructionTags),
+            taggedResource("reflected-albedo", "dlss-rr-reflected-albedo", n.streamlineDlssRayReconstructionTags),
+            taggedResource("disocclusion-mask", "dlss-rr-disocclusion-mask", n.streamlineDlssRayReconstructionTags),
+            taggedResource("diffuse-ray-direction", "dlss-rr-diffuse-ray-direction", n.streamlineDlssRayReconstructionTags),
+            taggedResource("specular-ray-direction", "dlss-rr-specular-ray-direction", n.streamlineDlssRayReconstructionTags),
+            taggedResource("diffuse-ray-direction-hit-distance", "dlss-rr-diffuse-ray-direction-hit-distance", n.streamlineDlssRayReconstructionTags),
+            taggedResource("specular-ray-direction-hit-distance", "dlss-rr-specular-ray-direction-hit-distance", n.streamlineDlssRayReconstructionTags),
+        }},
+        {"streamline_tags", n.streamlineDlssRayReconstructionTags},
+        {"streamline_evaluation", n.streamlineDlssRayReconstructionEvaluation},
+        {"ngx_evaluation", n.ngxDlssRayReconstructionEvaluation},
+        {"psr_replaced_channels", {
+            "depth",
+            "motion",
+            "normal",
+            "roughness",
+            "diffuse_albedo",
+            "specular_f0",
+            "reflected_albedo",
+            "hit_distance",
+            "ray_direction",
+        }},
+    };
     j["dlss_frame_generation_available"] = n.dlssFrameGenerationAvailable;
     j["dlss_frame_generation_unavailable_reason"] = n.dlssFrameGenerationUnavailableReason;
     j["requested_dlss_frame_generation"] = n.requestedDlssFrameGeneration;
     j["effective_dlss_frame_generation"] = n.effectiveDlssFrameGeneration;
+    j["dlss_exposure_contract"] = {
+        {"schema_version", 1},
+        {"manual_exposure", n.dlssManualExposure},
+        {"auto_exposure_enabled", n.dlssAutoExposureEnabled},
+        {"exposure_buffer_available", n.dlssExposureBufferAvailable},
+        {"exposure_buffer_passed_to_sdk", n.dlssExposureBufferPassedToSdk},
+        {"pre_exposure", n.dlssPreExposure},
+        {"exposure_scale", n.dlssExposureScale},
+        {"policy", "DLSS/NGX currently receives explicit pre-exposure and exposure-scale constants; the renderer exposure buffer is reported but not passed to the SDK."},
+    };
     j["dlss_sharpening_strength"] = n.dlssSharpeningStrength;
     j["requested_temporal_upscaler"] = n.requestedTemporalUpscaler;
     j["effective_temporal_upscaler"] = n.effectiveTemporalUpscaler;
@@ -1268,6 +1666,7 @@ void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["sun_intensity"] = s.sunIntensity;
     j["sun_elevation"] = s.sunElevation;
     j["sun_azimuth"] = s.sunAzimuth;
+    j["sky_intensity"] = s.skyIntensity;
     j["gamma"] = s.gamma;
     j["contrast"] = s.contrast;
     j["saturation"] = s.saturation;
@@ -1451,6 +1850,10 @@ GpuFrameTimings percentileGpuTimings(
     result.skipDenoiserCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::skipDenoiserCopyMs, percentile);
     result.taaMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::taaMs, percentile);
     result.taaHistoryCopyMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::taaHistoryCopyMs, percentile);
+    result.dlssGuidesMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::dlssGuidesMs, percentile);
+    result.dlssMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::dlssMs, percentile);
+    result.dlssRayReconstructionGuidesMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::dlssRayReconstructionGuidesMs, percentile);
+    result.dlssRayReconstructionMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::dlssRayReconstructionMs, percentile);
     result.autoExposureMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::autoExposureMs, percentile);
     result.autoExposureHistogramClearMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::autoExposureHistogramClearMs, percentile);
     result.autoExposureHistogramMs = percentileGpuTiming(values, warmupFrames, &GpuFrameTimings::autoExposureHistogramMs, percentile);
@@ -1518,6 +1921,10 @@ void assignPerPassGpuMs(ProfileReport::PerPassGpuMs& out, const GpuFrameTimings&
     out.skipDenoiserCopy = timings.skipDenoiserCopyMs;
     out.taa = timings.taaMs;
     out.taaHistoryCopy = timings.taaHistoryCopyMs;
+    out.dlssGuides = timings.dlssGuidesMs;
+    out.dlss = timings.dlssMs;
+    out.dlssRayReconstructionGuides = timings.dlssRayReconstructionGuidesMs;
+    out.dlssRayReconstruction = timings.dlssRayReconstructionMs;
     out.autoExposureHistogramClear = timings.autoExposureHistogramClearMs;
     out.autoExposureHistogram = timings.autoExposureHistogramMs;
     out.autoExposureReduce = timings.autoExposureReduceMs;
@@ -1587,6 +1994,10 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
         result.skipDenoiserCopyMs += values[i].skipDenoiserCopyMs;
         result.taaMs += values[i].taaMs;
         result.taaHistoryCopyMs += values[i].taaHistoryCopyMs;
+        result.dlssGuidesMs += values[i].dlssGuidesMs;
+        result.dlssMs += values[i].dlssMs;
+        result.dlssRayReconstructionGuidesMs += values[i].dlssRayReconstructionGuidesMs;
+        result.dlssRayReconstructionMs += values[i].dlssRayReconstructionMs;
         result.autoExposureMs += values[i].autoExposureMs;
         result.autoExposureHistogramClearMs += values[i].autoExposureHistogramClearMs;
         result.autoExposureHistogramMs += values[i].autoExposureHistogramMs;
@@ -1646,6 +2057,10 @@ GpuFrameTimings averageGpuTimings(const std::vector<GpuFrameTimings>& values, ui
     result.skipDenoiserCopyMs *= invCount;
     result.taaMs *= invCount;
     result.taaHistoryCopyMs *= invCount;
+    result.dlssGuidesMs *= invCount;
+    result.dlssMs *= invCount;
+    result.dlssRayReconstructionGuidesMs *= invCount;
+    result.dlssRayReconstructionMs *= invCount;
     result.autoExposureMs *= invCount;
     result.autoExposureHistogramClearMs *= invCount;
     result.autoExposureHistogramMs *= invCount;
@@ -1747,6 +2162,542 @@ std::string sequenceFrameFileName(uint32_t frameIndex) {
     return stream.str();
 }
 
+const char* temporalResidencyName(TemporalSystem::TemporalResidency residency) {
+    switch (residency) {
+    case TemporalSystem::TemporalResidency::Persistent: return "persistent";
+    case TemporalSystem::TemporalResidency::Evictable: return "evictable";
+    case TemporalSystem::TemporalResidency::HalfResolution: return "half_resolution";
+    case TemporalSystem::TemporalResidency::DynamicResolution: return "dynamic_resolution";
+    }
+    return "unknown";
+}
+
+nlohmann::json temporalSystemDiagnosticsJson(const TemporalSystem* temporalSystem) {
+    if (temporalSystem == nullptr) {
+        return nlohmann::json{
+            {"schema_version", 1},
+            {"available", false},
+            {"slots", nlohmann::json::array()},
+        };
+    }
+
+    std::vector<std::pair<std::string, const TemporalSystem::HistorySlot*>> slots;
+    slots.reserve(temporalSystem->historySlots().size());
+    for (const auto& [name, slot] : temporalSystem->historySlots()) {
+        slots.emplace_back(name, &slot);
+    }
+    std::sort(slots.begin(), slots.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+
+    uint32_t validSlotCount = 0;
+    uint32_t residentSlotCount = 0;
+    nlohmann::json slotJson = nlohmann::json::array();
+    for (const auto& [name, slot] : slots) {
+        if (slot->valid) {
+            ++validSlotCount;
+        }
+        if (slot->resident) {
+            ++residentSlotCount;
+        }
+        slotJson.push_back({
+            {"name", name},
+            {"format", static_cast<int>(slot->format)},
+            {"extent", {{"width", slot->extent.width}, {"height", slot->extent.height}}},
+            {"valid", slot->valid},
+            {"resident", slot->resident},
+            {"last_written_frame", slot->lastWrittenFrame},
+            {"estimated_bytes", slot->estimatedBytes},
+            {"residency", temporalResidencyName(slot->residency)},
+            {"memory_budget_weight", slot->memoryBudgetWeight},
+        });
+    }
+
+    return nlohmann::json{
+        {"schema_version", 1},
+        {"available", true},
+        {"frame_index", temporalSystem->frameIndex()},
+        {"camera_cut", temporalSystem->isCameraCut()},
+        {"last_reset_reason", accumulationResetReasonName(temporalSystem->lastResetReason())},
+        {"total_history_memory_bytes", temporalSystem->totalHistoryMemoryBytes()},
+        {"slot_count", slots.size()},
+        {"valid_slot_count", validSlotCount},
+        {"resident_slot_count", residentSlotCount},
+        {"slots", std::move(slotJson)},
+    };
+}
+
+nlohmann::json validateRestirReferenceMatrixRows(
+    const nlohmann::json& rows,
+    const std::vector<std::string>& requiredScenes,
+    const std::vector<std::string>& requiredModes,
+    bool qualityRows) {
+    std::set<std::string> requiredKeys;
+    for (const std::string& scene : requiredScenes) {
+        for (const std::string& mode : requiredModes) {
+            requiredKeys.insert(scene + "|" + mode);
+        }
+    }
+
+    std::set<std::string> foundKeys;
+    nlohmann::json failedRows = nlohmann::json::array();
+    if (rows.is_array()) {
+        for (const nlohmann::json& row : rows) {
+            if (!row.is_object()) {
+                continue;
+            }
+            const std::string scene = row.value("scene", std::string{});
+            const std::string mode = row.value("mode", std::string{});
+            const std::string key = scene + "|" + mode;
+            if (requiredKeys.find(key) == requiredKeys.end()) {
+                continue;
+            }
+            foundKeys.insert(key);
+            const bool renderPassed = row.value("render_exit_code", -1) == 0;
+            const bool validationPassed =
+                row.contains("validation_enabled") &&
+                row.value("validation_enabled", false) &&
+                row.contains("validation_error_count") &&
+                row.value("validation_error_count", -1) == 0;
+            const bool qualityPassed = !qualityRows ||
+                (row.value("compare_exit_code", -1) == 0 &&
+                 row.value("status", std::string{}) == "pass");
+            if (!renderPassed || !validationPassed || !qualityPassed) {
+                failedRows.push_back({
+                    {"scene", scene},
+                    {"mode", mode},
+                    {"render_exit_code", row.value("render_exit_code", -1)},
+                    {"compare_exit_code", row.contains("compare_exit_code") ? row["compare_exit_code"] : nlohmann::json(nullptr)},
+                    {"validation_enabled", row.contains("validation_enabled") ? row["validation_enabled"] : nlohmann::json(nullptr)},
+                    {"validation_error_count", row.contains("validation_error_count") ? row["validation_error_count"] : nlohmann::json(nullptr)},
+                    {"status", row.contains("status") ? row["status"] : nlohmann::json(nullptr)},
+                });
+            }
+        }
+    }
+
+    nlohmann::json missingRows = nlohmann::json::array();
+    for (const std::string& key : requiredKeys) {
+        if (foundKeys.find(key) == foundKeys.end()) {
+            const size_t separator = key.find('|');
+            missingRows.push_back({
+                {"scene", key.substr(0, separator)},
+                {"mode", separator == std::string::npos ? std::string{} : key.substr(separator + 1u)},
+            });
+        }
+    }
+
+    const bool passed = rows.is_array() && missingRows.empty() && failedRows.empty();
+    return nlohmann::json{
+        {"row_count", rows.is_array() ? rows.size() : 0u},
+        {"required_row_count", requiredKeys.size()},
+        {"matched_row_count", foundKeys.size()},
+        {"missing_rows", std::move(missingRows)},
+        {"failed_rows", std::move(failedRows)},
+        {"passed", passed},
+    };
+}
+
+nlohmann::json restirReferenceMatrixArtifactAt(
+    const std::filesystem::path& root,
+    const std::vector<std::string>& requiredScenes,
+    const std::vector<std::string>& requiredModes,
+    const char* label) {
+    auto readJson = [](const std::filesystem::path& path, nlohmann::json& out, std::string& error) {
+        try {
+            std::ifstream file(path);
+            if (!file.is_open()) {
+                error = "not readable";
+                return false;
+            }
+            file >> out;
+            return true;
+        } catch (const std::exception& e) {
+            error = e.what();
+            return false;
+        }
+    };
+
+    const std::filesystem::path perfPath = root / "perf" / "summary.json";
+    const std::filesystem::path qualityPath = root / "quality_1spp" / "summary.json";
+    const std::filesystem::path combinedPath = root / "merged" / "combined_summary.json";
+    const std::filesystem::path aggregatePath = root / "merged" / "aggregate_summary.json";
+
+    nlohmann::json perfRows;
+    nlohmann::json qualityRows;
+    nlohmann::json combinedRows;
+    nlohmann::json aggregateRows;
+    std::string perfError;
+    std::string qualityError;
+    std::string combinedError;
+    std::string aggregateError;
+    const bool perfLoaded = readJson(perfPath, perfRows, perfError);
+    const bool qualityLoaded = readJson(qualityPath, qualityRows, qualityError);
+    const bool combinedLoaded = readJson(combinedPath, combinedRows, combinedError);
+    const bool aggregateLoaded = readJson(aggregatePath, aggregateRows, aggregateError);
+
+    nlohmann::json perfValidation = validateRestirReferenceMatrixRows(
+        perfRows,
+        requiredScenes,
+        requiredModes,
+        false);
+    nlohmann::json qualityValidation = validateRestirReferenceMatrixRows(
+        qualityRows,
+        requiredScenes,
+        requiredModes,
+        true);
+    const bool artifactPresent = perfLoaded && qualityLoaded && combinedLoaded && aggregateLoaded;
+    const bool passed =
+        artifactPresent &&
+        perfValidation.value("passed", false) &&
+        qualityValidation.value("passed", false);
+
+    return nlohmann::json{
+        {"label", label},
+        {"artifact_root", root.string()},
+        {"artifact_present", artifactPresent},
+        {"paths", {
+            {"perf_summary", perfPath.string()},
+            {"quality_summary", qualityPath.string()},
+            {"combined_summary", combinedPath.string()},
+            {"aggregate_summary", aggregatePath.string()},
+        }},
+        {"load_errors", {
+            {"perf_summary", perfLoaded ? nlohmann::json(nullptr) : nlohmann::json(perfError)},
+            {"quality_summary", qualityLoaded ? nlohmann::json(nullptr) : nlohmann::json(qualityError)},
+            {"combined_summary", combinedLoaded ? nlohmann::json(nullptr) : nlohmann::json(combinedError)},
+            {"aggregate_summary", aggregateLoaded ? nlohmann::json(nullptr) : nlohmann::json(aggregateError)},
+        }},
+        {"required_scenes", requiredScenes},
+        {"required_modes", requiredModes},
+        {"perf_validation", std::move(perfValidation)},
+        {"quality_validation", std::move(qualityValidation)},
+        {"aggregate_row_count", aggregateRows.is_array() ? aggregateRows.size() : 0u},
+        {"combined_row_count", combinedRows.is_array() ? combinedRows.size() : 0u},
+        {"passed", passed},
+    };
+}
+
+nlohmann::json restirReferenceMatrixArtifactJson() {
+    const std::vector<std::string> requiredScenes{
+        "cornell",
+        "closeup_cornell",
+        "material_grid",
+        "sponza_lightweight",
+        "san_miguel",
+        "bistro_interior",
+        "bistro_exterior",
+        "sponza_heavy",
+    };
+    const std::vector<std::string> requiredModes{
+        "di_off_gi_off",
+        "di_on_gi_off",
+        "di_off_gi_on",
+        "di_on_gi_on",
+    };
+    const std::vector<std::string> smokeScenes{"cornell"};
+
+    nlohmann::json full = restirReferenceMatrixArtifactAt(
+        std::filesystem::path("out") / "restir_reference_matrix",
+        requiredScenes,
+        requiredModes,
+        "full");
+    nlohmann::json smoke = restirReferenceMatrixArtifactAt(
+        std::filesystem::path("out") / "restir_reference_matrix_smoke",
+        smokeScenes,
+        requiredModes,
+        "cornell_smoke");
+    const bool fullPassed = full.value("passed", false);
+    return nlohmann::json{
+        {"schema_version", 1},
+        {"contract", "restir_reference_matrix_artifact"},
+        {"full", std::move(full)},
+        {"smoke", std::move(smoke)},
+        {"full_coverage_required", true},
+        {"passed", fullPassed},
+    };
+}
+
+nlohmann::json manualBarrierEscapeReportJson() {
+    const ManualBarrierEscapeDiagnosticsSnapshot snapshot = manualBarrierEscapeDiagnosticsSnapshot();
+    nlohmann::json failures = nlohmann::json::array();
+    nlohmann::json checks = nlohmann::json::array();
+    auto addCheck = [&](const char* name, bool passed, const char* message, nlohmann::json evidence = nlohmann::json::object()) {
+        checks.push_back({
+            {"name", name},
+            {"passed", passed},
+            {"message", message},
+            {"evidence", std::move(evidence)},
+        });
+        if (!passed) {
+            failures.push_back({
+                {"code", name},
+                {"message", message},
+            });
+        }
+    };
+
+    uint64_t aggregateBarrierCount = 0;
+    nlohmann::json aggregates = nlohmann::json::array();
+    for (const ManualBarrierEscapeAggregate& aggregate : snapshot.aggregates) {
+        aggregateBarrierCount += aggregate.count;
+        aggregates.push_back({
+            {"source", aggregate.source},
+            {"label", aggregate.label},
+            {"resource_kind", aggregate.resourceKind},
+            {"src_stage", static_cast<uint64_t>(aggregate.srcStage)},
+            {"src_access", static_cast<uint64_t>(aggregate.srcAccess)},
+            {"dst_stage", static_cast<uint64_t>(aggregate.dstStage)},
+            {"dst_access", static_cast<uint64_t>(aggregate.dstAccess)},
+            {"old_layout", static_cast<int>(aggregate.oldLayout)},
+            {"new_layout", static_cast<int>(aggregate.newLayout)},
+            {"count", aggregate.count},
+        });
+    }
+
+    nlohmann::json recentEvents = nlohmann::json::array();
+    for (const ManualBarrierEscapeEvent& event : snapshot.recentEvents) {
+        recentEvents.push_back({
+            {"sequence", event.sequence},
+            {"source", event.source},
+            {"label", event.label},
+            {"resource_kind", event.resourceKind},
+            {"resource_handle", event.resourceHandle},
+            {"src_stage", static_cast<uint64_t>(event.srcStage)},
+            {"src_access", static_cast<uint64_t>(event.srcAccess)},
+            {"dst_stage", static_cast<uint64_t>(event.dstStage)},
+            {"dst_access", static_cast<uint64_t>(event.dstAccess)},
+            {"old_layout", static_cast<int>(event.oldLayout)},
+            {"new_layout", static_cast<int>(event.newLayout)},
+        });
+    }
+
+    addCheck(
+        "manual_barrier_escape_diagnostics_enabled",
+        snapshot.enabled,
+        "Manual barrier escape diagnostics must be enabled for diagnostic/profile runs.");
+    addCheck(
+        "manual_barrier_escape_aggregate_consistent",
+        aggregateBarrierCount == snapshot.barrierCount,
+        "Manual barrier escape aggregate counts must match the recorded event count.",
+        {
+            {"aggregate_barrier_count", aggregateBarrierCount},
+            {"barrier_count", snapshot.barrierCount},
+        });
+
+    return nlohmann::json{
+        {"schema_version", 1},
+        {"contract", "manual_barrier_escape_report"},
+        {"scope", "manual_vkCmdPipelineBarrier2_calls_outside_rendergraph"},
+        {"rendergraph_barriers_excluded", true},
+        {"enabled", snapshot.enabled},
+        {"dependency_call_count", snapshot.dependencyCallCount},
+        {"barrier_count", snapshot.barrierCount},
+        {"aggregate_count", snapshot.aggregates.size()},
+        {"dropped_recent_event_count", snapshot.droppedRecentEventCount},
+        {"aggregates", std::move(aggregates)},
+        {"recent_events", std::move(recentEvents)},
+        {"checks", std::move(checks)},
+        {"failure_count", failures.size()},
+        {"failures", std::move(failures)},
+        {"passed", failures.empty()},
+    };
+}
+
+nlohmann::json renderGraphArtifactValidationJson(const std::optional<std::filesystem::path>& path) {
+    nlohmann::json checks = nlohmann::json::array();
+    nlohmann::json failures = nlohmann::json::array();
+    auto addCheck = [&](const char* name, bool passed, const char* message, nlohmann::json evidence = nlohmann::json::object()) {
+        checks.push_back({
+            {"name", name},
+            {"passed", passed},
+            {"message", message},
+            {"evidence", std::move(evidence)},
+        });
+        if (!passed) {
+            failures.push_back({
+                {"code", name},
+                {"message", message},
+            });
+        }
+    };
+
+    if (!path.has_value()) {
+        addCheck(
+            "rendergraph_artifact_not_requested",
+            true,
+            "No RenderGraph artifact was requested for this profile; runtime graph validation is deferred.");
+        return nlohmann::json{
+            {"schema_version", 1},
+            {"artifact_requested", false},
+            {"artifact_path", nullptr},
+            {"artifact_present", false},
+            {"validated", false},
+            {"resource_ownership_passed", nullptr},
+            {"resource_lifetime_passed", nullptr},
+            {"resource_lifetime_violation_count", nullptr},
+            {"resource_lifetime_warning_count", nullptr},
+            {"checks", std::move(checks)},
+            {"failure_count", failures.size()},
+            {"failures", std::move(failures)},
+            {"passed", true},
+        };
+    }
+
+    std::error_code existsError;
+    const bool artifactPresent = std::filesystem::exists(*path, existsError);
+    addCheck(
+        "rendergraph_artifact_present",
+        artifactPresent && !existsError,
+        "Requested RenderGraph JSON artifact must exist before profile JSON is written.",
+        {
+            {"path", path->string()},
+            {"exists_error", existsError ? existsError.message() : std::string{}},
+        });
+    if (!artifactPresent || existsError) {
+        return nlohmann::json{
+            {"schema_version", 1},
+            {"artifact_requested", true},
+            {"artifact_path", path->string()},
+            {"artifact_present", false},
+            {"validated", false},
+            {"resource_ownership_passed", nullptr},
+            {"resource_lifetime_passed", nullptr},
+            {"resource_lifetime_violation_count", nullptr},
+            {"resource_lifetime_warning_count", nullptr},
+            {"checks", std::move(checks)},
+            {"failure_count", failures.size()},
+            {"failures", std::move(failures)},
+            {"passed", false},
+        };
+    }
+
+    nlohmann::json renderGraph = nlohmann::json::object();
+    try {
+        std::ifstream file(*path);
+        if (!file.is_open()) {
+            addCheck(
+                "rendergraph_artifact_readable",
+                false,
+                "Requested RenderGraph JSON artifact must be readable.",
+                {{"path", path->string()}});
+        } else {
+            file >> renderGraph;
+            addCheck(
+                "rendergraph_artifact_readable",
+                true,
+                "Requested RenderGraph JSON artifact is readable.",
+                {{"path", path->string()}});
+        }
+    } catch (const std::exception& e) {
+        addCheck(
+            "rendergraph_artifact_parseable",
+            false,
+            "Requested RenderGraph JSON artifact must parse as JSON.",
+            {
+                {"path", path->string()},
+                {"error", e.what()},
+            });
+    }
+
+    const bool ownershipPresent =
+        renderGraph.is_object() &&
+        renderGraph.contains("resource_ownership_validation") &&
+        renderGraph["resource_ownership_validation"].is_object();
+    const bool lifetimePresent =
+        renderGraph.is_object() &&
+        renderGraph.contains("resource_lifetime_validation") &&
+        renderGraph["resource_lifetime_validation"].is_object();
+    const bool ownershipPassed = ownershipPresent &&
+        renderGraph["resource_ownership_validation"].value("passed", false);
+    const bool lifetimePassed = lifetimePresent &&
+        renderGraph["resource_lifetime_validation"].value("passed", false);
+    const uint32_t lifetimeViolationCount = lifetimePresent
+        ? renderGraph["resource_lifetime_validation"].value("violation_count", 0u)
+        : 0u;
+    const uint32_t lifetimeWarningCount = lifetimePresent
+        ? renderGraph["resource_lifetime_validation"].value("warning_count", 0u)
+        : 0u;
+    uint32_t passCount = 0;
+    uint32_t timingMappingFieldCount = 0;
+    uint32_t timingMappedCount = 0;
+    uint32_t timingUnmappedCount = 0;
+    nlohmann::json timingUnmappedPasses = nlohmann::json::array();
+    if (renderGraph.is_object() && renderGraph.contains("passes") && renderGraph["passes"].is_array()) {
+        for (const auto& pass : renderGraph["passes"]) {
+            ++passCount;
+            const bool hasTimingMappingFields =
+                pass.is_object() &&
+                pass.contains("gpu_ms_mapped") &&
+                pass.contains("timing_source") &&
+                pass.contains("profile_timing_key");
+            if (hasTimingMappingFields) {
+                ++timingMappingFieldCount;
+                if (pass.value("gpu_ms_mapped", false)) {
+                    ++timingMappedCount;
+                } else {
+                    ++timingUnmappedCount;
+                    timingUnmappedPasses.push_back(pass.value("name", ""));
+                }
+            }
+        }
+    }
+
+    addCheck(
+        "resource_ownership_validation_present",
+        ownershipPresent,
+        "RenderGraph artifact must include resource ownership validation.",
+        ownershipPresent ? renderGraph["resource_ownership_validation"] : nlohmann::json(nullptr));
+    addCheck(
+        "resource_ownership_validation_passed",
+        ownershipPassed,
+        "RenderGraph resource ownership validation must pass.",
+        ownershipPresent ? renderGraph["resource_ownership_validation"] : nlohmann::json(nullptr));
+    addCheck(
+        "resource_lifetime_validation_present",
+        lifetimePresent,
+        "RenderGraph artifact must include resource lifetime and aliasing validation.",
+        lifetimePresent ? renderGraph["resource_lifetime_validation"] : nlohmann::json(nullptr));
+    addCheck(
+        "resource_lifetime_validation_passed",
+        lifetimePassed,
+        "RenderGraph resource lifetime and aliasing validation must pass.",
+        lifetimePresent ? renderGraph["resource_lifetime_validation"] : nlohmann::json(nullptr));
+    addCheck(
+        "pass_timing_mapping_fields_present",
+        passCount > 0 && timingMappingFieldCount == passCount,
+        "Every RenderGraph pass row must include timing mapping provenance fields.",
+        {
+            {"pass_count", passCount},
+            {"timing_mapping_field_count", timingMappingFieldCount},
+            {"timing_mapped_count", timingMappedCount},
+            {"timing_unmapped_count", timingUnmappedCount},
+            {"timing_unmapped_passes", timingUnmappedPasses},
+        });
+
+    const bool validated = ownershipPresent && lifetimePresent;
+    const bool passed = failures.empty();
+    return nlohmann::json{
+        {"schema_version", 1},
+        {"artifact_requested", true},
+        {"artifact_path", path->string()},
+        {"artifact_present", true},
+        {"validated", validated},
+        {"resource_ownership_passed", ownershipPassed},
+        {"resource_lifetime_passed", lifetimePassed},
+        {"resource_lifetime_violation_count", lifetimeViolationCount},
+        {"resource_lifetime_warning_count", lifetimeWarningCount},
+        {"pass_timing_mapping_fields_present", passCount > 0 && timingMappingFieldCount == passCount},
+        {"pass_timing_mapped_count", timingMappedCount},
+        {"pass_timing_unmapped_count", timingUnmappedCount},
+        {"pass_timing_unmapped_passes", std::move(timingUnmappedPasses)},
+        {"checks", std::move(checks)},
+        {"failure_count", failures.size()},
+        {"failures", std::move(failures)},
+        {"passed", passed},
+    };
+}
+
 } // namespace
 
 HeadlessDiagnostics::HeadlessDiagnostics(const HeadlessDiagnosticsConfig& config)
@@ -1783,6 +2734,8 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.profiledFrames = config_.totalFrames > config_.warmupFrames
         ? config_.totalFrames - config_.warmupFrames : 0;
     profileReport_.rayTracingDiagnosticCountersEnabled = config_.rayTracingDiagnosticCounters;
+    profileReport_.lastAccumulationResetReason =
+        accumulationResetReasonName(renderer->lastAccumulationResetReason());
 
     const auto& cpuTimings = app.cpuFrameTimings();
     const auto& gpuTimingsVec = app.gpuFrameTimings();
@@ -1826,12 +2779,14 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.opacityMicromap.disabledReason = ommInfo.disabledReason;
     const auto& serInfo = context->serInfo();
     profileReport_.shaderExecutionReordering.supported = serInfo.supported;
-    profileReport_.shaderExecutionReordering.enabled = renderer->settings().shaderExecutionReorderingEnabled && serInfo.supported;
     profileReport_.shaderExecutionReordering.extensionSupported = serInfo.extensionSupported;
     profileReport_.shaderExecutionReordering.invocationReorderFeature = serInfo.invocationReorderFeature;
     profileReport_.shaderExecutionReordering.dedicatedSerPipeline =
-        profileReport_.shaderExecutionReordering.enabled &&
+        renderer->settings().shaderExecutionReorderingEnabled &&
+        serInfo.supported &&
         renderer->settings().wavefrontTraceEnabled;
+    profileReport_.shaderExecutionReordering.enabled =
+        profileReport_.shaderExecutionReordering.dedicatedSerPipeline;
     profileReport_.shaderExecutionReordering.pipelineCreateFlagRequired = false;
     profileReport_.shaderExecutionReordering.maxInvocationReorderDepthReported = serInfo.maxInvocationReorderDepthReported;
     profileReport_.shaderExecutionReordering.maxRayTracingInvocationReorderDepth = serInfo.maxRayTracingInvocationReorderDepth;
@@ -1842,6 +2797,12 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.shaderExecutionReordering.observedImprovementPercent = 0.0f;
     profileReport_.shaderExecutionReordering.reorderingHint = serReorderingHintName(serInfo.reorderingHint);
     profileReport_.shaderExecutionReordering.disabledReason = serInfo.disabledReason;
+    if (renderer->settings().shaderExecutionReorderingEnabled &&
+        serInfo.supported &&
+        !renderer->settings().wavefrontTraceEnabled) {
+        profileReport_.shaderExecutionReordering.disabledReason =
+            "the active generic path has no SER reorder instruction";
+    }
     const auto& motionBlurInfo = context->rayTracingMotionBlurInfo();
     profileReport_.rayTracingMotionBlur.supported = motionBlurInfo.supported;
     profileReport_.rayTracingMotionBlur.enabled = renderer->settings().motionBlurEnabled && motionBlurInfo.supported;
@@ -1895,6 +2856,11 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.pipelineStatistics.rayInvocations = stats.rayInvocations;
     profileReport_.pipelineStatistics.triangleHits = stats.triangleHits;
     profileReport_.pipelineStatistics.aabbHits = stats.aabbHits;
+    profileReport_.pipelineStatistics.supported = stats.valid;
+    profileReport_.pipelineStatistics.valid = stats.valid;
+    profileReport_.pipelineStatistics.unavailableReason = stats.valid
+        ? std::string{}
+        : "Vulkan exposes no portable ray-invocation or ray-hit pipeline-statistics queries; use --rt-diagnostic-counters or vendor profiling tools.";
 
     const auto rtCounters = renderer->rayTracingDiagnosticCounters();
     profileReport_.rayTracingDiagnosticCounters.rawSlots = rtCounters.rawSlots;
@@ -2671,6 +3637,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.gpuSceneLightBytes = static_cast<uint64_t>(sceneMemory.lightBytes);
     profileReport_.memory.gpuSceneParameterBytes = static_cast<uint64_t>(sceneMemory.parameterBytes);
     profileReport_.memory.temporalHistoryBytes = static_cast<uint64_t>(renderer->temporalHistoryMemory());
+    profileReport_.temporalSystemDiagnostics = temporalSystemDiagnosticsJson(renderer->temporalSystem());
     profileReport_.memory.restirReservoirBytes = static_cast<uint64_t>(renderer->restirReservoirMemory());
     const auto reservoirBreakdown = renderer->restirReservoirMemoryBreakdown();
     profileReport_.memory.restirDiCurrentBytes = static_cast<uint64_t>(reservoirBreakdown.diCurrentBytes);
@@ -2825,7 +3792,11 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     appendCompletedUploaderSchedulerReport(profileReport_);
     appendCompletedMainThreadApplySchedulerReport(profileReport_);
     appendCompletedTopologySchedulerReport(profileReport_);
-    profileReport_.validationErrorCount = 0;
+    profileReport_.validationEnabled = context->validationEnabled();
+    const uint64_t validationErrors = context->validationErrorCount();
+    profileReport_.validationErrorCount = validationErrors > UINT32_MAX
+        ? UINT32_MAX
+        : static_cast<uint32_t>(validationErrors);
 
     profileReport_.settings = renderer->settings();
     if (profileReport_.settings.lightingReuseMode == LightingReuseMode::ExperimentalRestirPT ||
@@ -2857,6 +3828,12 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.nvidiaIntegrations.nrdRequestable = nvidiaStatus.nrdRequestable;
     profileReport_.nvidiaIntegrations.nrdAvailable = nvidiaStatus.nrdAvailable;
     profileReport_.nvidiaIntegrations.nrdUnavailableReason = nvidiaStatus.nrdUnavailableReason;
+    profileReport_.nvidiaIntegrations.nrdDirectRuntimeResourcesReady = nvidiaStatus.nrdDirectRuntimeResourcesReady;
+    profileReport_.nvidiaIntegrations.nrdHistoryConfidenceInputsAllocated = nvidiaStatus.nrdHistoryConfidenceInputsAllocated;
+    profileReport_.nvidiaIntegrations.nrdHistoryConfidenceAvailable = nvidiaStatus.nrdHistoryConfidenceAvailable;
+    profileReport_.nvidiaIntegrations.nrdValidationOutputAllocated = nvidiaStatus.nrdValidationOutputAllocated;
+    profileReport_.nvidiaIntegrations.nrdValidationOutputEnabled = nvidiaStatus.nrdValidationOutputEnabled;
+    profileReport_.nvidiaIntegrations.nrdGuideContractReason = nvidiaStatus.nrdGuideContractReason;
     profileReport_.nvidiaIntegrations.requestedDenoiserBackend = denoiserBackendName(profileReport_.settings.denoiserBackend);
     profileReport_.nvidiaIntegrations.effectiveDenoiserBackend = denoiserBackendName(renderer->effectiveDenoiserBackend());
     if (profileReport_.settings.denoiserBackend != DenoiserBackend::Nrd) {
@@ -2879,11 +3856,24 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.nvidiaIntegrations.dlssRayReconstructionUnavailableReason = nvidiaStatus.dlssRayReconstructionUnavailableReason;
     profileReport_.nvidiaIntegrations.requestedDlssRayReconstruction = profileReport_.settings.dlssRayReconstructionEnabled;
     profileReport_.nvidiaIntegrations.effectiveDlssRayReconstruction = renderer->dlssRayReconstructionActive();
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionGuidePassReady = nvidiaStatus.dlssRayReconstructionGuidePassReady;
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionGuideImagesAllocated = nvidiaStatus.dlssRayReconstructionGuideImagesAllocated;
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionPsrGuideBufferAllocated = nvidiaStatus.dlssRayReconstructionPsrGuideBufferAllocated;
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionPsrHistorySignaturesAllocated = nvidiaStatus.dlssRayReconstructionPsrHistorySignaturesAllocated;
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionUsesPsrGuides = nvidiaStatus.dlssRayReconstructionUsesPsrGuides;
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionGuideImageCount = nvidiaStatus.dlssRayReconstructionGuideImageCount;
+    profileReport_.nvidiaIntegrations.dlssRayReconstructionGuideMode = nvidiaStatus.dlssRayReconstructionGuideMode;
     profileReport_.nvidiaIntegrations.dlssFrameGenerationAvailable = nvidiaStatus.dlssFrameGenerationAvailable;
     profileReport_.nvidiaIntegrations.dlssFrameGenerationUnavailableReason = nvidiaStatus.dlssFrameGenerationUnavailableReason;
     profileReport_.nvidiaIntegrations.requestedDlssFrameGeneration = profileReport_.settings.dlssFrameGenerationEnabled;
     profileReport_.nvidiaIntegrations.effectiveDlssFrameGeneration =
         profileReport_.settings.dlssFrameGenerationEnabled && nvidiaStatus.dlssFrameGenerationAvailable;
+    profileReport_.nvidiaIntegrations.dlssAutoExposureEnabled = nvidiaStatus.dlssAutoExposureEnabled;
+    profileReport_.nvidiaIntegrations.dlssExposureBufferAvailable = nvidiaStatus.dlssExposureBufferAvailable;
+    profileReport_.nvidiaIntegrations.dlssExposureBufferPassedToSdk = nvidiaStatus.dlssExposureBufferPassedToSdk;
+    profileReport_.nvidiaIntegrations.dlssManualExposure = nvidiaStatus.dlssManualExposure;
+    profileReport_.nvidiaIntegrations.dlssPreExposure = nvidiaStatus.dlssPreExposure;
+    profileReport_.nvidiaIntegrations.dlssExposureScale = nvidiaStatus.dlssExposureScale;
     profileReport_.nvidiaIntegrations.dlssSharpeningStrength = profileReport_.settings.dlssSharpeningStrength;
     profileReport_.nvidiaIntegrations.requestedTemporalUpscaler = temporalUpscalerName(profileReport_.settings.temporalUpscaler);
     profileReport_.nvidiaIntegrations.effectiveTemporalUpscaler = temporalUpscalerName(renderer->effectiveTemporalUpscaler());
@@ -3022,6 +4012,10 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
         {"Adaptive Sampling Diagnostics", profileReport_.perPassGpuMs.adaptiveSamplingDiagnostics},
         {"Adaptive Sampling Fill", profileReport_.perPassGpuMs.adaptiveSamplingFill},
         {"TAA/TSR", profileReport_.perPassGpuMs.taa},
+        {"DLSS Guides", profileReport_.perPassGpuMs.dlssGuides},
+        {"DLSS", profileReport_.perPassGpuMs.dlss},
+        {"DLSS RR Guides", profileReport_.perPassGpuMs.dlssRayReconstructionGuides},
+        {"DLSS RR", profileReport_.perPassGpuMs.dlssRayReconstruction},
         {"ToneMap", profileReport_.perPassGpuMs.toneMap},
         {"Fullscreen/Present", profileReport_.perPassGpuMs.fullscreen + profileReport_.perPassGpuMs.editorPresentation},
         {"Dynamic BLAS Update", profileReport_.perPassGpuMs.dynamicBlasUpdate},
@@ -3066,6 +4060,10 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
         profileReport_.perPassGpuMs.adaptiveSamplingDiagnostics +
         profileReport_.perPassGpuMs.adaptiveSamplingFill +
         profileReport_.perPassGpuMs.taa +
+        profileReport_.perPassGpuMs.dlssGuides +
+        profileReport_.perPassGpuMs.dlss +
+        profileReport_.perPassGpuMs.dlssRayReconstructionGuides +
+        profileReport_.perPassGpuMs.dlssRayReconstruction +
         profileReport_.perPassGpuMs.historyCopy +
         profileReport_.perPassGpuMs.taaHistoryCopy;
     if (totalGpuMs > 0.0f && temporalPostMs >= 2.0f && temporalPostMs / totalGpuMs >= 0.2f) {
@@ -3188,9 +4186,16 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
             : "Vulkan object names are unavailable; resource attribution may be weaker.");
     pushReadiness(
         "validation_clean",
-        profileReport_.validationErrorCount == 0u,
-        profileReport_.validationErrorCount == 0u ? "No validation errors were recorded." : "Validation errors were recorded; fix them before trusting performance.",
-        {{"validation_error_count", profileReport_.validationErrorCount}});
+        profileReport_.validationEnabled && profileReport_.validationErrorCount == 0u,
+        !profileReport_.validationEnabled
+            ? "Vulkan validation was not enabled for this build/run; use a validation-enabled build before trusting this check."
+            : (profileReport_.validationErrorCount == 0u
+                  ? "No validation errors were recorded."
+                  : "Validation errors were recorded; fix them before trusting performance."),
+        {
+            {"validation_enabled", profileReport_.validationEnabled},
+            {"validation_error_count", profileReport_.validationErrorCount},
+        });
     pushReadiness(
         "streaming_idle",
         streamingUploads == 0u,
@@ -3417,6 +4422,7 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
         profileReport_.restirGiCounters.assign(giCounters, giCounters + 64);
     }
     profileReport_.restirDiHistoryValid = renderer->restirDiHistoryValid();
+    profileReport_.restirGiHistoryValid = renderer->restirGiHistoryValid();
 
     return profileReport_;
 }
@@ -3433,6 +4439,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["frame_count"] = profileReport_.frameCount;
     j["warmup_frames"] = profileReport_.warmupFrames;
     j["profiled_frames"] = profileReport_.profiledFrames;
+    j["last_accumulation_reset_reason"] = profileReport_.lastAccumulationResetReason;
     j["cpu_frame_ms"] = profileReport_.cpuFrameMs;
     j["gpu_frame_ms"] = profileReport_.gpuFrameMs;
     j["per_pass_gpu_ms"] = profileReport_.perPassGpuMs;
@@ -3512,11 +4519,22 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         };
         alphaAnyHitTopMaterials = profileReport_.alphaAnyHitTopMaterials;
     }
+    const nlohmann::json pipelineRayCount = profileReport_.pipelineStatistics.valid
+        ? nlohmann::json(profileReport_.pipelineStatistics.rayInvocations)
+        : nlohmann::json(nullptr);
+    const nlohmann::json pipelineHitCount = profileReport_.pipelineStatistics.valid
+        ? nlohmann::json(hitCount)
+        : nlohmann::json(nullptr);
+    const nlohmann::json pipelineMissCount = profileReport_.pipelineStatistics.valid
+        ? nlohmann::json(profileReport_.pipelineStatistics.rayInvocations > hitCount
+              ? profileReport_.pipelineStatistics.rayInvocations - hitCount
+              : 0)
+        : nlohmann::json(nullptr);
     j["gpu_debug_counters"] = {
-        {"ray_count", profileReport_.pipelineStatistics.rayInvocations},
+        {"ray_count", pipelineRayCount},
         {"shadow_ray_count", nullptr},
-        {"hit_count", hitCount},
-        {"miss_count", profileReport_.pipelineStatistics.rayInvocations > hitCount ? profileReport_.pipelineStatistics.rayInvocations - hitCount : 0},
+        {"hit_count", pipelineHitCount},
+        {"miss_count", pipelineMissCount},
         {"ray_tracing_instrumentation_enabled", profileReport_.rayTracingDiagnosticCountersEnabled},
         {"ray_tracing_totals", rayTracingCounterTotals},
         {"ray_tracing_per_rendered_frame", rayTracingCounterPerRenderedFrame},
@@ -3531,13 +4549,14 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"denoiser_history_accepted_count", nullptr},
         {"denoiser_history_rejected_count", nullptr},
         {"notes", nlohmann::json::array({
-            "ray_count/hit_count/miss_count come from Vulkan pipeline statistics when available",
+            "ray_count/hit_count/miss_count are null because Vulkan has no portable ray-tracing pipeline-statistics query bits; use shader instrumentation or vendor tools",
             "ray tracing diagnostic totals accumulate over all rendered frames, including warmup, when --rt-diagnostic-counters is enabled",
             "ray tracing diagnostic fields are null when shader instrumentation is disabled",
             "remaining counters require shader atomic instrumentation and are intentionally null until instrumented"
         })},
     };
     j["memory"] = profileReport_.memory;
+    j["temporal_system"] = profileReport_.temporalSystemDiagnostics;
     j["texture_cache_diagnostics"] = profileReport_.textureDiagnostics;
     j["restir_di_counters"] = profileReport_.restirDiCounters;
     j["restir_gi_counters"] = profileReport_.restirGiCounters;
@@ -3614,6 +4633,15 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"count", 1},
         });
     }
+    const uint64_t diContractInvalidSourcePdf = 0ull;
+    const uint64_t diContractInvalidTargetPdf = 0ull;
+    const uint64_t diContractOrParityViolation = diCounter(63);
+    const uint64_t diContractViolationCount = diContractOrParityViolation;
+    const bool diContractChecked = newDiRequested &&
+        !profileReport_.restirDiCounters.empty() &&
+        (initialPassActive || temporalPassActive || spatialPassActive || finalPassActive);
+    const bool diContractPassed = !newDiRequested ||
+        (diContractChecked && diContractViolationCount == 0ull);
     const uint64_t diPixels = static_cast<uint64_t>(profileReport_.resolution.renderWidth) *
         static_cast<uint64_t>(profileReport_.resolution.renderHeight);
     const uint64_t diReservoirStride = diPixels > 0ull && profileReport_.memory.restirDiInitialBytes > 0ull
@@ -3629,6 +4657,52 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"layout_version", 3},
         {"mode", restirDiModeName(profileReport_.settings.restirDiMode)},
         {"layout", restirDiReservoirLayoutName(profileReport_.settings.restirDiReservoirLayout)},
+        {"reservoir_contract", {
+            {"schema_version", 1},
+            {"selected_sample_identity_stored", true},
+            {"selected_target_stored", true},
+            {"selected_source_pdf_stored", true},
+            {"weight_sum_stored", true},
+            {"sample_count_m_stored", true},
+            {"visibility_state_stored", true},
+            {"age_stored", true},
+            {"confidence_stored", true},
+            {"rejection_reason_stored", true},
+            {"debug_views", nlohmann::json::array({
+                "restir-di-selected-light",
+                "restir-di-target",
+                "restir-di-source-pdf",
+                "restir-di-weight-sum",
+                "restir-di-m",
+                "restir-di-visibility",
+                "restir-di-age",
+                "restir-di-confidence",
+                "restir-di-rejection-reason",
+            })},
+        }},
+        {"reservoir_contract_validation", {
+            {"schema_version", 1},
+            {"active", newDiRequested},
+            {"checked", diContractChecked},
+            {"passed", diContractPassed},
+            {"counter_scope", "last_completed_frame"},
+            {"invalid_source_pdf_count", diContractInvalidSourcePdf},
+            {"invalid_target_pdf_count", diContractInvalidTargetPdf},
+            {"non_finite_count", 0},
+            {"contract_or_parity_violation_count", diContractOrParityViolation},
+            {"violation_count", diContractViolationCount},
+            {"evidence", {
+                {"initial_invalid_pdf_count", diCounter(10)},
+                {"temporal_pdf_rejected_count", diCounter(25)},
+                {"initial_invalid_target_count", diCounter(3)},
+                {"temporal_target_rejected_count", diCounter(24)},
+                {"spatial_target_rejected_count", diCounter(36)},
+                {"initial_non_finite_count", diCounter(4)},
+                {"temporal_non_finite_count", diCounter(13)},
+                {"final_non_finite_count", diCounter(57)},
+                {"stored_reservoir_contract_or_parity_invalid_count", diContractOrParityViolation},
+            }},
+        }},
         {"counter_scope", "last_completed_frame"},
         {"counter_value_bits", 32},
         {"aggregate_encoding", "uint32-low-high-with-carry"},
@@ -3641,8 +4715,21 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             : "none"},
         {"light_identity", {
             {"scheme", "persistent-id-hash32-generation-cached-index"},
-            {"reorder_fallback", "history-invalidation"},
+            {"reorder_fallback", "cached-index-then-stable-identity-remap"},
             {"distribution_version_policy", "source-mass-preserved-current-pdf-recomputed"},
+        }},
+        {"light_history_mapping", {
+            {"schema_version", 1},
+            {"cached_index_fast_path", true},
+            {"stable_identity_remap_on_cached_mismatch", true},
+            {"remap_lookup_scope", "current-frame-scene-light-records"},
+            {"stable_identity_fields", {"identity_hash", "identity_generation", "light_kind"}},
+            {"changed_generation_policy", "reject"},
+            {"unmapped_deleted_policy", "reject"},
+            {"debug_view", "restir-di-light-map-status"},
+            {"temporal_changed_or_unmapped_rejection_count", diCounter(23)},
+            {"spatial_changed_or_unmapped_rejection_count", diCounter(42)},
+            {"final_changed_or_unmapped_rejection_count", diCounter(59)},
         }},
         {"direct_light_ownership", {
             {"emissive_and_analytic_lights", initialPassActive ? "restir_di" : "classic_nee"},
@@ -3668,7 +4755,8 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"temporal", temporalPassActive},
             {"spatial", spatialPassActive},
             {"final", finalPassActive},
-            {"history_copy", profileReport_.restirDiHistoryValid},
+            {"history_copy", profileReport_.perPassGpuMs.restirDiHistoryCopy > 0.0f},
+            {"history_valid", profileReport_.restirDiHistoryValid},
         }},
         {"initial_valid_count", diCounter(1)},
         {"initial_invalid_surface_count", diCounter(2)},
@@ -3806,8 +4894,12 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         giCounter(38) + giCounter(39) + giCounter(40) + giCounter(41);
     const uint64_t giActiveTileCount = giCounter(46);
     const uint64_t giActivePixelCount = giCounter(47);
-    const uint64_t giTileColumns = (static_cast<uint64_t>(profileReport_.resolution.renderWidth) + 15ull) / 16ull;
-    const uint64_t giTileRows = (static_cast<uint64_t>(profileReport_.resolution.renderHeight) + 15ull) / 16ull;
+    const uint64_t giTileColumns =
+        (static_cast<uint64_t>(profileReport_.resolution.renderWidth) + passes::RestirGIPass::kActiveTileSize - 1ull) /
+        passes::RestirGIPass::kActiveTileSize;
+    const uint64_t giTileRows =
+        (static_cast<uint64_t>(profileReport_.resolution.renderHeight) + passes::RestirGIPass::kActiveTileSize - 1ull) /
+        passes::RestirGIPass::kActiveTileSize;
     const uint64_t giTileCount = giTileColumns * giTileRows;
     const uint64_t giReusePixels =
         (profileReport_.settings.restirGiHalfResolution && giPixels > 0ull)
@@ -3851,15 +4943,86 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"count", 1},
         });
     }
+    const uint64_t giContractInvalidSourcePdf = giCounter(48);
+    const uint64_t giContractInvalidTargetPdf = giCounter(49);
+    const uint64_t giSourcePdfParityMismatch = giCounter(50);
+    const uint64_t giTargetPdfParityMismatch = giCounter(51);
+    const uint64_t giContractNonFinite = giCounter(45);
+    const uint64_t giContractViolationCount =
+        giContractInvalidSourcePdf +
+        giContractInvalidTargetPdf +
+        giSourcePdfParityMismatch +
+        giTargetPdfParityMismatch +
+        giContractNonFinite;
+    const bool giContractChecked = giProductionPassesActive && !profileReport_.restirGiCounters.empty();
+    const bool giContractPassed = !giProductionPassesActive ||
+        (giContractChecked && giContractViolationCount == 0ull);
     j["restir_gi"] = {
         {"schema_version", 2},
         {"mode", restirGiModeName(profileReport_.settings.restirGiMode)},
         {"layout", profileReport_.restirGiLayout},
+        {"reservoir_contract", {
+            {"schema_version", 1},
+            {"production_contract_active", giProductionPassesActive},
+            {"selected_target_stored", giProductionPassesActive},
+            {"selected_source_pdf_stored", giProductionPassesActive},
+            {"weight_sum_stored", true},
+            {"sample_count_m_stored", true},
+            {"visibility_state_stored", true},
+            {"age_stored", true},
+            {"confidence_stored", giProductionPassesActive},
+            {"path_class_stored", giProductionPassesActive},
+            {"legacy_limitation", giProductionPassesActive
+                ? "none"
+                : "legacy-cache GI stores target PDF/weight/M/age/visibility but not separate selected source PDF or path-class confidence"},
+            {"debug_views", nlohmann::json::array({
+                "restir-gi-target",
+                "restir-gi-source-pdf",
+                "restir-gi-weight-sum",
+                "restir-gi-m",
+                "restir-gi-visibility",
+                "restir-gi-age",
+                "restir-gi-confidence",
+                "restir-gi-path-class",
+            })},
+        }},
+        {"reservoir_contract_validation", {
+            {"schema_version", 1},
+            {"active", giProductionPassesActive},
+            {"checked", giContractChecked},
+            {"passed", giContractPassed},
+            {"counter_scope", "last_completed_frame"},
+            {"invalid_source_pdf_count", giContractInvalidSourcePdf},
+            {"invalid_target_pdf_count", giContractInvalidTargetPdf},
+            {"source_pdf_parity_mismatch_count", giSourcePdfParityMismatch},
+            {"target_pdf_parity_mismatch_count", giTargetPdfParityMismatch},
+            {"non_finite_count", giContractNonFinite},
+            {"violation_count", giContractViolationCount},
+            {"evidence", {
+                {"temporal_reject_target_count", giCounter(8)},
+                {"spatial_reject_target_count", giCounter(15)},
+                {"version_reject_count", giCounter(44)},
+                {"non_finite_reject_count", giCounter(45)},
+                {"contract_invalid_source_pdf_count", giContractInvalidSourcePdf},
+                {"contract_invalid_target_pdf_count", giContractInvalidTargetPdf},
+                {"source_pdf_parity_mismatch_count", giSourcePdfParityMismatch},
+                {"target_pdf_parity_mismatch_count", giTargetPdfParityMismatch},
+            }},
+        }},
+        {"bias_correction", {
+            {"schema_version", 1},
+            {"temporal_reuse_mass_policy", "visibility-confidence-scales-weight-and-effective-M"},
+            {"spatial_reuse_mass_policy", "visibility-confidence-scales-weight-and-effective-M"},
+            {"visibility_confidence_shortcut", "production-only-unknown-safe-candidates-use-reduced-effective-proposal-mass"},
+            {"reference_validation_visibility", "conservative-visibility-required-before-reuse"},
+            {"asymmetric_weight_sum_vs_m_damping", false},
+        }},
         {"effective_production_reuse", giProductionPassesActive},
         {"wavefront_current_frame_fallback", profileReport_.settings.wavefrontFinalOutputEnabled},
         {"counter_scope", "last_completed_frame"},
         {"counter_value_bits", 32},
-        {"history_valid", giTemporalPreviousValid > 0ull || giTemporalAccepted > 0ull},
+        {"history_valid", profileReport_.restirGiHistoryValid},
+        {"history_counter_evidence_available", !profileReport_.restirGiCounters.empty()},
         {"half_resolution", profileReport_.settings.restirGiHalfResolution},
         {"render_extent", {
             {"width", profileReport_.resolution.renderWidth},
@@ -3924,6 +5087,10 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"visibility_unknown_count", giCounter(43)},
         {"version_reject_count", giCounter(44)},
         {"non_finite_reject_count", giCounter(45)},
+        {"contract_invalid_source_pdf_count", giContractInvalidSourcePdf},
+        {"contract_invalid_target_pdf_count", giContractInvalidTargetPdf},
+        {"source_pdf_parity_mismatch_count", giSourcePdfParityMismatch},
+        {"target_pdf_parity_mismatch_count", giTargetPdfParityMismatch},
         {"half_res_grid_score", giGridOverallScore},
         {"grid_score", giGridOverallScore},
         {"grid", {
@@ -3989,13 +5156,28 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             view == RendererDebugView::AdaptiveFilledImage ||
             view == RendererDebugView::AdaptiveDisocclusionMask;
     };
+    auto activeDiCounter = [this](size_t index) -> uint64_t {
+        return index < profileReport_.restirDiCounters.size()
+            ? static_cast<uint64_t>(profileReport_.restirDiCounters[index])
+            : 0ull;
+    };
+    const bool restirDiTemporalActive =
+        profileReport_.perPassGpuMs.restirDiTemporal > 0.0f ||
+        activeDiCounter(16) > 0ull;
+    const bool restirDiSpatialActive =
+        profileReport_.perPassGpuMs.restirDiSpatial > 0.0f ||
+        activeDiCounter(33) > 0ull;
+    const bool restirDiFinalActive =
+        profileReport_.perPassGpuMs.restirDiFinal > 0.0f ||
+        activeDiCounter(48) > 0ull ||
+        profileReport_.restirDiHistoryValid;
     j["active_passes"] = {
         {"path_trace", profileReport_.settings.pathTracingEnabled},
         {"pathtrace_kernel_native2b", profileReport_.effectivePathTraceKernelMode == PathTraceKernelMode::Native2B},
         {"pathtrace_terminal_hit_group", profileReport_.native2BTerminalPayloadActive},
-        {"restir_di_temporal", profileReport_.perPassGpuMs.restirDiTemporal > 0.0f},
-        {"restir_di_spatial", profileReport_.perPassGpuMs.restirDiSpatial > 0.0f},
-        {"restir_di_final", profileReport_.perPassGpuMs.restirDiFinal > 0.0f},
+        {"restir_di_temporal", restirDiTemporalActive},
+        {"restir_di_spatial", restirDiSpatialActive},
+        {"restir_di_final", restirDiFinalActive},
         {"regir", profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR},
         {"regir_spatial_reuse", profileReport_.perPassGpuMs.regirSpatialReuse > 0.0f ||
             (profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR &&
@@ -4030,6 +5212,20 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"taa", profileReport_.perPassGpuMs.taa > 0.0f},
         {"history_copy", profileReport_.perPassGpuMs.historyCopy > 0.0f},
         {"taa_history_copy", profileReport_.perPassGpuMs.taaHistoryCopy > 0.0f},
+        {"dlss_guides",
+            profileReport_.perPassGpuMs.dlssGuides > 0.0f ||
+            (profileReport_.nvidiaIntegrations.effectiveTemporalUpscaler == "dlss" &&
+                !profileReport_.nvidiaIntegrations.effectiveDlssRayReconstruction)},
+        {"dlss",
+            profileReport_.perPassGpuMs.dlss > 0.0f ||
+            (profileReport_.nvidiaIntegrations.effectiveTemporalUpscaler == "dlss" &&
+                !profileReport_.nvidiaIntegrations.effectiveDlssRayReconstruction)},
+        {"dlss_rr_guides",
+            profileReport_.perPassGpuMs.dlssRayReconstructionGuides > 0.0f ||
+            profileReport_.nvidiaIntegrations.effectiveDlssRayReconstruction},
+        {"dlss_rr",
+            profileReport_.perPassGpuMs.dlssRayReconstruction > 0.0f ||
+            profileReport_.nvidiaIntegrations.effectiveDlssRayReconstruction},
     };
     j["nvidia_integrations"] = profileReport_.nvidiaIntegrations;
     j["scene_update_routes"] = profileReport_.sceneUpdateRoutes;
@@ -4050,6 +5246,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"tickets", profileReport_.topologyRebuildTickets},
         }},
     };
+    j["validation_enabled"] = profileReport_.validationEnabled;
     j["validation_error_count"] = profileReport_.validationErrorCount;
     j["warnings"] = profileReport_.warnings;
     j["optimization_hints"] = profileReport_.optimizationHints;
@@ -4058,6 +5255,115 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["ray_tracing_shader_map"] = profileReport_.rayTracingShaderMap;
     j["acceleration_structure_diagnostics"] = profileReport_.accelerationStructureDiagnostics;
     j["barrier_sync_diagnostics"] = profileReport_.barrierSyncDiagnostics;
+    const nlohmann::json temporalRuntimeValidation = rendererTemporalRuntimeValidationJson(
+        profileReport_.settings,
+        profileReport_.lastAccumulationResetReason,
+        profileReport_.frameCount,
+        profileReport_.profiledFrames,
+        profileReport_.memory.temporalHistoryBytes,
+        profileReport_.restirDiHistoryValid,
+        profileReport_.restirGiHistoryValid,
+        profileReport_.regirGrid.temporalHistoryValid,
+        profileReport_.temporalSystemDiagnostics);
+    const nlohmann::json activePassRuntimeValidation = rendererActivePassRuntimeValidationJson(
+        profileReport_.settings,
+        j["active_passes"],
+        nlohmann::json(profileReport_.perPassGpuMs),
+        j["restir_di"],
+        j["restir_gi"],
+        temporalRuntimeValidation,
+        nlohmann::json(profileReport_.nvidiaIntegrations));
+    passes::RegirPass::PromotionDiagnostics regirPromotionDiagnostics{};
+    regirPromotionDiagnostics.profiledFrames = profileReport_.profiledFrames;
+    regirPromotionDiagnostics.gpuFrameAvgMs = profileReport_.gpuFrameMs.avg;
+    regirPromotionDiagnostics.regirBuildMs = profileReport_.perPassGpuMs.regirBuild;
+    regirPromotionDiagnostics.regirSpatialReuseMs = profileReport_.perPassGpuMs.regirSpatialReuse;
+    regirPromotionDiagnostics.regirTemporalReuseMs = profileReport_.perPassGpuMs.regirTemporalReuse;
+    regirPromotionDiagnostics.feedbackAvailable = profileReport_.regirGrid.feedbackAvailable;
+    regirPromotionDiagnostics.activeCellCount = profileReport_.regirGrid.activeCellCount;
+    regirPromotionDiagnostics.hashCollisionCount = profileReport_.regirGrid.hashCollisionCount;
+    regirPromotionDiagnostics.hashSaturationCount = profileReport_.regirGrid.hashSaturationCount;
+    regirPromotionDiagnostics.hashCellCapacity = profileReport_.regirGrid.hashCellCapacity;
+    regirPromotionDiagnostics.totalCellCount = profileReport_.regirGrid.totalCellCount;
+    regirPromotionDiagnostics.denseReservoirBytes = profileReport_.regirGrid.denseReservoirBytes;
+    regirPromotionDiagnostics.effectiveReservoirBytes = profileReport_.regirGrid.effectiveReservoirBytes;
+    regirPromotionDiagnostics.backingBytes = profileReport_.regirGrid.backingBytes;
+    regirPromotionDiagnostics.environmentBankSize = profileReport_.regirGrid.environmentBankSize;
+    regirPromotionDiagnostics.sunBankSize = profileReport_.regirGrid.sunBankSize;
+    regirPromotionDiagnostics.validEnvironmentReservoirs = profileReport_.regirGrid.validEnvironmentReservoirs;
+    regirPromotionDiagnostics.validSunReservoirs = profileReport_.regirGrid.validSunReservoirs;
+    regirPromotionDiagnostics.environmentBankBytes = profileReport_.regirGrid.environmentBankBytes;
+    regirPromotionDiagnostics.environmentEffective = profileReport_.regirGrid.environmentEffective;
+    regirPromotionDiagnostics.sunEffective = profileReport_.regirGrid.sunEffective;
+    regirPromotionDiagnostics.temporalHistoryValid = profileReport_.regirGrid.temporalHistoryValid;
+    const std::vector<std::string> exportableDebugViews = exportableRendererDebugViewNames();
+    nlohmann::json rendererContracts = {
+        {"pass_contracts", rendererPassContractsJson(profileReport_.settings)},
+        {"contract_validation", rendererPassContractValidationJson(profileReport_.settings)},
+        {"pass_owner_registry_validation", rendererPassOwnerRegistryValidationJson(profileReport_.settings)},
+        {"profile_timing_coverage", rendererPassTimingCoverageJson(
+            profileReport_.settings,
+            nlohmann::json(profileReport_.perPassGpuMs))},
+        {"debug_output_coverage", rendererDebugOutputCoverageJson(
+            profileReport_.settings,
+            exportableDebugViews)},
+        {"debug_view_registry_validation", rendererDebugViewRegistryValidationJson(
+            profileReport_.settings,
+            exportableDebugViews)},
+        {"temporal_contract", rendererTemporalContractJson()},
+        {"temporal_runtime_validation", temporalRuntimeValidation},
+        {"application_bridge_contract", rendererApplicationBridgeContractJson()},
+        {"application_bridge_runtime_validation", rendererApplicationBridgeRuntimeValidationJson(
+            profileReport_.settings,
+            profileReport_.temporalSystemDiagnostics,
+            nlohmann::json(profileReport_.rayTracingGeometry),
+            nlohmann::json(profileReport_.sceneLights),
+            nlohmann::json(profileReport_.rayTracingDiagnosticCounters),
+            profileReport_.accelerationStructureDiagnostics,
+            j["restir_di"],
+            nlohmann::json(profileReport_.nvidiaIntegrations))},
+        {"active_pass_runtime_validation", activePassRuntimeValidation},
+        {"denoiser_upscaler_runtime_validation", rendererDenoiserUpscalerRuntimeValidationJson(
+            profileReport_.settings,
+            nlohmann::json(profileReport_.nvidiaIntegrations),
+            temporalRuntimeValidation,
+            activePassRuntimeValidation)},
+        {"performance_budget_validation", rendererPerformanceBudgetValidationJson(
+            profileReport_.settings,
+            profileReport_.profiledFrames,
+            j["resolution"],
+            j["gpu_frame_ms"],
+            nlohmann::json(profileReport_.perPassGpuMs))},
+        {"regir_promotion_gate", rendererRegirPromotionGateJson(
+            profileReport_.settings,
+            regirPromotionDiagnostics)},
+        {"restir_reservoir_runtime_validation", rendererRestirReservoirRuntimeValidationJson(
+            profileReport_.settings,
+            j["restir_di"],
+            j["restir_gi"])},
+        {"restir_reference_matrix_artifact", restirReferenceMatrixArtifactJson()},
+        {"rendergraph_artifact_validation", renderGraphArtifactValidationJson(config_.dumpRenderGraphPath)},
+        {"manual_barrier_escape_report", manualBarrierEscapeReportJson()},
+        {"diagnostic_runtime_validation", rendererDiagnosticRuntimeValidationJson(
+            profileReport_.settings,
+            profileReport_.diagnosticReadiness,
+            profileReport_.nsightAnalysisPlan,
+            profileReport_.rayTracingShaderMap,
+            profileReport_.accelerationStructureDiagnostics,
+            profileReport_.barrierSyncDiagnostics)},
+        {"supported_mode_matrix", rendererSupportedModeMatrixJson()},
+        {"current_mode_support", rendererCurrentModeSupportJson(profileReport_.settings)},
+        {"architecture_documentation", rendererArchitectureDocumentationJson()},
+        {"review_checklist", rendererReviewChecklistJson()},
+    };
+    rendererContracts["plan_phase_quality_lock"] =
+        rendererPlanPhaseQualityLockJson(rendererContracts);
+    rendererContracts["quality_gate_validation"] =
+        rendererQualityGateValidationJson(
+            rendererContracts,
+            profileReport_.validationEnabled,
+            profileReport_.validationErrorCount);
+    j["renderer_contracts"] = std::move(rendererContracts);
     j["settings"] = profileReport_.settings;
     j["settings"]["restir_gi_active_tile_mask_enabled"] =
         profileReport_.effectiveRestirGiActiveTileMaskEnabled;
@@ -4098,63 +5404,53 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         ? LightingReuseMode::LegacyRestirDiGiPlusReGIR
         : LightingReuseMode::LegacyRestirDiGi;
     j["settings"]["lighting_reuse_mode_effective"] = lightingReuseModeName(effectiveLightingReuseMode);
-    const bool regirRequested =
-        profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR;
+    const bool regirRequested = passes::RegirPass::isRequested(profileReport_.settings);
     const bool regirSpatialReuseEffective =
-        regirRequested &&
-        profileReport_.settings.regirGridMode != RegirGridMode::Hash &&
-        profileReport_.settings.regirSpatialReuse;
+        passes::RegirPass::spatialReuseEffective(profileReport_.settings, regirRequested);
     const bool regirTemporalReuseEffective =
-        regirRequested &&
-        profileReport_.settings.regirGridMode != RegirGridMode::Hash &&
-        profileReport_.settings.regirTemporalReuse;
-    const bool regirHashGrid =
-        regirRequested && profileReport_.settings.regirGridMode == RegirGridMode::Hash;
+        passes::RegirPass::temporalReuseEffective(profileReport_.settings, regirRequested);
+    const bool regirHashGrid = passes::RegirPass::hashGridActive(profileReport_.settings, regirRequested);
     const bool regirHashSaturated =
-        regirHashGrid && profileReport_.regirGrid.hashSaturationCount > 0u;
+        passes::RegirPass::hashGridSaturated(regirHashGrid, profileReport_.regirGrid.hashSaturationCount);
     const bool regirHashReuseFallback =
-        regirHashGrid &&
-        (profileReport_.settings.regirSpatialReuse || profileReport_.settings.regirTemporalReuse);
+        passes::RegirPass::hashReuseFallback(profileReport_.settings, regirHashGrid);
     const bool regirUnsupportedAdvancedRequested =
-        regirHashSaturated || regirHashReuseFallback;
-    const uint64_t regirCellCount =
-        static_cast<uint64_t>(std::max(profileReport_.settings.regirGridDimensions.x, 1u)) *
-        static_cast<uint64_t>(std::max(profileReport_.settings.regirGridDimensions.y, 1u)) *
-        static_cast<uint64_t>(std::max(profileReport_.settings.regirGridDimensions.z, 1u));
+        passes::RegirPass::unsupportedAdvancedRequested(
+            profileReport_.settings,
+            regirHashGrid,
+            profileReport_.regirGrid.hashSaturationCount);
+    const uint64_t regirCellCount = profileReport_.regirGrid.totalCellCount > 0ull
+        ? profileReport_.regirGrid.totalCellCount
+        : passes::RegirPass::gridCellCount(profileReport_.settings);
     const bool regirActiveGrid =
-        regirRequested && profileReport_.settings.regirGridMode == RegirGridMode::Active;
-    const uint64_t regirDenseMemoryBytes = profileReport_.regirGrid.denseReservoirBytes > 0u
-        ? profileReport_.regirGrid.denseReservoirBytes
-        : regirCellCount *
-            static_cast<uint64_t>(std::max(profileReport_.settings.regirReservoirsPerCell, 1u)) *
-            32ull;
+        passes::RegirPass::activeGridMode(profileReport_.settings, regirRequested);
+    const uint64_t regirDenseMemoryBytes = passes::RegirPass::denseReservoirBytes(
+        profileReport_.settings,
+        profileReport_.regirGrid.denseReservoirBytes,
+        64ull);
     const bool regirSparseGrid = regirActiveGrid || regirHashGrid;
-    const uint64_t regirActiveCells = regirSparseGrid
-        ? (profileReport_.regirGrid.feedbackAvailable
-            ? std::min<uint64_t>(profileReport_.regirGrid.activeCellCount, regirCellCount)
-            : 0ull)
-        : (regirRequested ? regirCellCount : 0ull);
-    const uint64_t regirEffectiveMemoryBytes = regirSparseGrid
-        ? (profileReport_.regirGrid.feedbackAvailable
-            ? profileReport_.regirGrid.effectiveReservoirBytes
-            : 0ull)
-        : (regirRequested
-            ? std::max<uint64_t>(profileReport_.regirGrid.effectiveReservoirBytes, regirDenseMemoryBytes)
-            : 0ull);
+    const uint64_t regirActiveCells = passes::RegirPass::effectiveActiveCellCount(
+        regirSparseGrid,
+        profileReport_.regirGrid.feedbackAvailable,
+        profileReport_.regirGrid.activeCellCount,
+        regirCellCount,
+        regirRequested);
+    const uint64_t regirEffectiveMemoryBytes = passes::RegirPass::effectiveReservoirBytes(
+        regirSparseGrid,
+        profileReport_.regirGrid.feedbackAvailable,
+        profileReport_.regirGrid.effectiveReservoirBytes,
+        regirDenseMemoryBytes,
+        regirRequested);
     j["settings"]["regir_grid_mode_effective"] = !regirRequested
         ? "off"
         : regirGridModeName(regirHashGrid
             ? RegirGridMode::Hash
             : (regirActiveGrid ? RegirGridMode::Active : RegirGridMode::Dense));
     const uint32_t effectiveFiniteQueryFramePeriod =
-        profileReport_.settings.regirQueryMode == RegirQueryMode::Deterministic
-            ? 1u
-            : (profileReport_.settings.regirFiniteQueryFramePeriod > 0u
-                ? profileReport_.settings.regirFiniteQueryFramePeriod
-                : (regirHashGrid ? 256u : 8u));
+        passes::RegirPass::effectiveFiniteQueryFramePeriod(profileReport_.settings, regirHashGrid);
     j["settings"]["regir_finite_query_probability_effective"] = !regirRequested
         ? 0.0
-        : 1.0 / static_cast<double>(effectiveFiniteQueryFramePeriod);
+        : passes::RegirPass::finiteQueryProbability(regirRequested, effectiveFiniteQueryFramePeriod);
     j["settings"]["regir_finite_query_schedule"] = "frame-coherent";
     j["settings"]["regir_finite_query_frame_period_override"] =
         profileReport_.settings.regirFiniteQueryFramePeriod;
@@ -4171,6 +5467,25 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         ? profileReport_.regirGrid.backingBytes
         : 0ull;
     j["settings"]["regir_effective_memory_bytes"] = regirEffectiveMemoryBytes;
+    j["settings"]["regir_reservoir_contract"] = {
+        {"schema_version", 1},
+        {"finite_reservoir_bytes", 64},
+        {"selected_light_index_stored", true},
+        {"selected_light_kind_stored", true},
+        {"selected_light_identity_stored", true},
+        {"selected_light_generation_stored", true},
+        {"cached_index_remap_policy", "identity-match-fast-path-scan-fallback"},
+        {"candidate_count_stored", true},
+        {"sample_count_m_stored", true},
+        {"sample_position_stored", true},
+        {"selected_source_weight_stored", true},
+        {"source_weight_sum_stored", true},
+        {"selected_source_pdf_stored", true},
+        {"average_source_weight_stored", true},
+        {"selected_target_stored", false},
+        {"selected_target_policy", "query-time-material-and-visibility-dependent"},
+        {"effective_query_pdf_debug_view", "regir-effective-pdf"},
+    };
     j["settings"]["regir_environment_effective"] = profileReport_.regirGrid.environmentEffective;
     j["settings"]["regir_environment_bank_size"] = profileReport_.regirGrid.environmentBankSize;
     j["settings"]["regir_infinite_lights_effective"] =
@@ -4288,9 +5603,29 @@ void HeadlessDiagnostics::exportDebugViews(Application& app, const std::filesyst
     if (std::find(exported.begin(), exported.end(), "metallic") == exported.end()) {
         missing.push_back("metallic");
     }
+    const std::vector<std::string> contractViews = reservoirContractDebugViews(exportSettings);
+    const std::vector<std::string> dlssGuideViews = dlssGuideContractDebugViews(exportSettings);
+    std::vector<std::string> missingContractViews;
+    for (const std::string& requiredView : contractViews) {
+        if (std::find(exported.begin(), exported.end(), requiredView) == exported.end()) {
+            missingContractViews.push_back(requiredView);
+            if (std::find(missing.begin(), missing.end(), requiredView) == missing.end()) {
+                missing.push_back(requiredView);
+            }
+        }
+    }
+    std::vector<std::string> missingDlssGuideViews;
+    for (const std::string& requiredView : dlssGuideViews) {
+        if (std::find(exported.begin(), exported.end(), requiredView) == exported.end()) {
+            missingDlssGuideViews.push_back(requiredView);
+            if (std::find(missing.begin(), missing.end(), requiredView) == missing.end()) {
+                missing.push_back(requiredView);
+            }
+        }
+    }
 
     exporter.writeExportManifest(dir, exported, displayExtent.width, displayExtent.height);
-    if (!missing.empty() || !skipped.empty()) {
+    {
         auto manifestPath = dir / "export_manifest.json";
         if (std::filesystem::exists(manifestPath)) {
             std::ifstream in(manifestPath);
@@ -4302,6 +5637,21 @@ void HeadlessDiagnostics::exportDebugViews(Application& app, const std::filesyst
             if (!skipped.empty()) {
                 manifest["skipped_debug_views"] = skipped;
             }
+            manifest["reservoir_contract_validation"] = {
+                {"schema_version", 1},
+                {"required_debug_views", contractViews},
+                {"missing_debug_views", missingContractViews},
+                {"passed", missingContractViews.empty()},
+            };
+            manifest["dlss_guide_contract_validation"] = {
+                {"schema_version", 1},
+                {"required_debug_views", dlssGuideViews},
+                {"missing_debug_views", missingDlssGuideViews},
+                {"passed", missingDlssGuideViews.empty()},
+                {"depth_convention", exportSettings.dlssRayReconstructionEnabled ? "linear-view-depth-for-rr" : "hardware-depth-for-dlss"},
+                {"motion_convention", "previous-minus-current pixels; NGX eval MV scale 1,1"},
+                {"jitter_convention", "NGX receives projection jitter as -camera.jitter.xy"},
+            };
             std::ofstream out(manifestPath);
             out << manifest.dump(2);
         }
@@ -4532,6 +5882,8 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
                 false,
                 false,
                 false,
+                false,
+                false,
                 true,
                 ApplicationMode::Headless,
                 sceneConfig.headlessWidth,
@@ -4581,6 +5933,7 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
             }
 
             result.gpuMsTotal = profile.gpuFrameMs.avg;
+            result.validationEnabled = profile.validationEnabled;
             result.validationErrors = profile.validationErrorCount;
             result.framesRendered = sceneConfig.totalFrames;
             result.wavefrontValidationEnabled = profile.wavefrontValidation.enabled;
@@ -4590,7 +5943,7 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
             result.wavefrontCheckedShadowRays = profile.wavefrontValidation.checkedShadowRays;
             result.wavefrontDirectLightingMismatches = profile.wavefrontValidation.directLightingMismatchCount;
             result.wavefrontProbeGpuMs = profile.wavefrontValidation.wavefrontProbeGpuMs;
-            result.status = result.validationErrors == 0 &&
+            result.status = result.validationEnabled && result.validationErrors == 0 &&
                 (!result.wavefrontValidationEnabled || result.wavefrontValidationPassed)
                 ? "pass"
                 : "fail";
@@ -4630,6 +5983,7 @@ ValidationSuiteSummary HeadlessDiagnostics::runValidationSuite() {
         sj["name"] = s.name;
         sj["status"] = s.status;
         sj["gpu_ms_total"] = s.gpuMsTotal;
+        sj["validation_enabled"] = s.validationEnabled;
         sj["validation_errors"] = s.validationErrors;
         sj["frames_rendered"] = s.framesRendered;
         if (s.wavefrontValidationEnabled) {

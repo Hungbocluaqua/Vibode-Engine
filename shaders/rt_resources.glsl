@@ -1,6 +1,8 @@
 #ifndef RTV_RT_RESOURCES_GLSL
 #define RTV_RT_RESOURCES_GLSL
 
+#include "psr_guides.glsl"
+
 // Renderer-wide descriptors and scene resource records. Descriptor bindings are ABI-stable.
 layout(set = 0, binding = 0, std430) buffer AccumulationBuffer { vec4 accumulation_buffer[]; };
 
@@ -274,6 +276,8 @@ layout(set = 0, binding = 66, std140) uniform ReGIRParamsBlock {
 struct ReGIRReservoir {
     uvec4 metadata;
     vec4 sample_position_weight;
+    vec4 proposal_pdf_m;
+    uvec4 light_identity;
 };
 layout(set = 0, binding = 67, std430) readonly buffer ReGIRReservoirBuffer {
     ReGIRReservoir regir_reservoirs[];

@@ -50,7 +50,10 @@ float temporal_motion_confidence(vec2 velocityPixels, float fullRejectPixels, fl
 }
 
 float temporal_reactive_weight(float lumDelta, float clipDelta, float neighborhoodDelta) {
-    return clamp(max(max(lumDelta - 0.12, clipDelta), neighborhoodDelta - 1.8) * 2.5, 0.0, 1.0);
+    float luminanceReactive = lumDelta - 0.18;
+    float clipReactive = clipDelta - 0.02;
+    float neighborhoodReactive = neighborhoodDelta - 2.4;
+    return clamp(max(max(luminanceReactive, clipReactive), neighborhoodReactive) * 1.65, 0.0, 1.0);
 }
 
 float temporal_variance_confidence(float variance, float scale) {

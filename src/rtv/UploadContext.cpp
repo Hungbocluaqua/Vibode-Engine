@@ -2,6 +2,8 @@
 
 #include "rtv/Check.h"
 
+#include <stdexcept>
+
 namespace rtv {
 
 UploadContext::UploadContext(VkDevice device, VkQueue queue, uint32_t queueFamilyIndex)
@@ -11,6 +13,13 @@ UploadContext::UploadContext(VkDevice device, VkQueue queue, uint32_t queueFamil
     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = queueFamilyIndex_;
     checkVk(vkCreateCommandPool(device_, &poolInfo, nullptr, &commandPool_), "vkCreateCommandPool(upload)");
+
+    VkCommandBufferAllocateInfo allocateInfo{};
+    allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocateInfo.commandPool = commandPool_;
+    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocateInfo.commandBufferCount = 1;
+    checkVk(vkAllocateCommandBuffers(device_, &allocateInfo, &commandBuffer_), "vkAllocateCommandBuffers(upload)");
 
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -30,27 +39,21 @@ UploadContext::~UploadContext() {
 
 VkCommandBuffer UploadContext::begin() {
     checkVk(vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences(upload)");
-    checkVk(vkResetFences(device_, 1, &fence_), "vkResetFences(upload)");
     checkVk(vkResetCommandPool(device_, commandPool_, 0), "vkResetCommandPool(upload)");
-
-    VkCommandBufferAllocateInfo allocateInfo{};
-    allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocateInfo.commandPool = commandPool_;
-    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocateInfo.commandBufferCount = 1;
-
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    checkVk(vkAllocateCommandBuffers(device_, &allocateInfo, &commandBuffer), "vkAllocateCommandBuffers(upload)");
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    checkVk(vkBeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer(upload)");
-    return commandBuffer;
+    checkVk(vkBeginCommandBuffer(commandBuffer_, &beginInfo), "vkBeginCommandBuffer(upload)");
+    return commandBuffer_;
 }
 
 void UploadContext::submitAndWait(VkCommandBuffer commandBuffer) {
+    if (commandBuffer != commandBuffer_) {
+        throw std::runtime_error("UploadContext can only submit its reusable command buffer");
+    }
     checkVk(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer(upload)");
+    checkVk(vkResetFences(device_, 1, &fence_), "vkResetFences(upload)");
 
     VkCommandBufferSubmitInfo commandBufferInfo{};
     commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;

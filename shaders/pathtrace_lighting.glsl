@@ -456,6 +456,38 @@ void mark_regir_hash_cell(uint cellIndex) {
 }
 
 #if RTV_REGIR_FINITE_LIGHT_TRACE_ENABLED
+bool regir_reservoir_identity_matches(ReGIRReservoir reservoir, LightRecord light) {
+    return reservoir.metadata.y == light.metadata.x &&
+        reservoir.light_identity.x == light.identity.x &&
+        reservoir.light_identity.y == light.identity.y &&
+        reservoir.light_identity.z == light.identity.z &&
+        reservoir.light_identity.w == light.identity.w;
+}
+
+bool resolve_regir_reservoir_light(ReGIRReservoir reservoir, out uint lightIndex) {
+    if (reservoir.metadata.w == 0u || mesh_params.light_count == 0u) {
+        lightIndex = 0u;
+        return false;
+    }
+
+    uint cachedIndex = reservoir.metadata.x;
+    if (cachedIndex < mesh_params.light_count &&
+        regir_reservoir_identity_matches(reservoir, light_records[cachedIndex])) {
+        lightIndex = cachedIndex;
+        return true;
+    }
+
+    for (uint i = 0u; i < mesh_params.light_count; ++i) {
+        if (regir_reservoir_identity_matches(reservoir, light_records[i])) {
+            lightIndex = i;
+            return true;
+        }
+    }
+
+    lightIndex = 0u;
+    return false;
+}
+
 bool sample_regir_emissive_light(
     inout uint rng,
     vec3 hitPos,
@@ -564,13 +596,15 @@ bool sample_regir_emissive_light(
                     uint r = (reservoirQueryStart + ri * reservoirQueryStride) % reservoirsPerCell;
                     uint reservoirIndex = storageCellIndex * reservoirsPerCell + r;
                     ReGIRReservoir inputReservoir = regir_input_reservoirs[reservoirIndex];
-                    if (inputReservoir.metadata.w != 0u && inputReservoir.metadata.x < mesh_params.light_count) {
+                    uint inputLightIndex;
+                    if (resolve_regir_reservoir_light(inputReservoir, inputLightIndex)) {
                         inputSourceWeightSum += max(inputReservoir.sample_position_weight.w, 0.0);
                     }
                     ReGIRReservoir reservoir = regir_reservoirs[reservoirIndex];
                     ++queryCountOut;
                     ++queriedReservoirSlots;
-                    if (reservoir.metadata.w == 0u || reservoir.metadata.x >= mesh_params.light_count) {
+                    uint resolvedLightIndex;
+                    if (!resolve_regir_reservoir_light(reservoir, resolvedLightIndex)) {
                         continue;
                     }
                     float reservoirSourceWeight = max(reservoir.sample_position_weight.w, 0.0);
@@ -631,14 +665,17 @@ bool sample_regir_emissive_light(
                     uint r = (reservoirQueryStart + ri * reservoirQueryStride) % reservoirsPerCell;
                     ReGIRReservoir reservoir = regir_reservoirs[storageCellIndex * reservoirsPerCell + r];
                     ++queryCountOut;
-                    if (reservoir.metadata.w == 0u || reservoir.metadata.x >= mesh_params.light_count) {
+                    uint resolvedLightIndex;
+                    if (!resolve_regir_reservoir_light(reservoir, resolvedLightIndex)) {
                         continue;
                     }
                     float sourceWeight = max(reservoir.sample_position_weight.w, 0.0);
                     if (sourceWeight <= 0.0) {
                         continue;
                     }
-                    float sourcePdf = sourceWeight / sourceWeightSum;
+                    float averageSourceWeight = max(reservoir.proposal_pdf_m.z, 1.0e-8);
+                    float sourcePdf = sourceWeight /
+                        max(averageSourceWeight * float(max(mesh_params.light_count, 1u)), 1.0e-8);
                     vec3 candidateWi;
                     vec3 candidateEmission;
                     float candidatePdf;
@@ -650,7 +687,7 @@ bool sample_regir_emissive_light(
                     vec3 candidateNormal;
                     if (!sample_emissive_light_index(
                             rng,
-                            reservoir.metadata.x,
+                            resolvedLightIndex,
                             sourcePdf,
                             hitPos,
                             candidateWi,
@@ -703,8 +740,8 @@ bool sample_regir_emissive_light(
                     ++validCandidateCount;
                     risWeightSum += risWeight;
                     if (risWeight > 0.0 && rand_f32(rng) * risWeightSum <= risWeight) {
-                        selectedLight = reservoir.metadata.x;
-                        selectedKind = reservoir.metadata.y;
+                        selectedLight = resolvedLightIndex;
+                        selectedKind = light_records[resolvedLightIndex].metadata.x;
                         selectedWi = candidateWi;
                         selectedEmission = candidateEmission;
                         selectedPdf = candidatePdf;
@@ -903,10 +940,14 @@ float environment_light_sampling_pdf(vec3 dir, uint bounce) {
     if (sourcePdf <= 0.0) {
         return 0.0;
     }
+#if RTV_REGIR_TRACE_ENABLED
     float canonicalProbability;
     float regirProbability;
     regir_environment_sampling_probabilities(bounce, canonicalProbability, regirProbability);
     return sourcePdf * max(canonicalProbability + regirProbability, 0.0);
+#else
+    return sourcePdf;
+#endif
 }
 
 bool regir_sun_direct_available(uint bounce) {
@@ -927,10 +968,14 @@ float sun_light_sampling_pdf(vec3 dir, uint bounce) {
     if (sourcePdf <= 0.0) {
         return 0.0;
     }
+#if RTV_REGIR_TRACE_ENABLED
     float canonicalProbability;
     float regirProbability;
     regir_sun_sampling_probabilities(bounce, canonicalProbability, regirProbability);
     return sourcePdf * max(canonicalProbability + regirProbability, 0.0);
+#else
+    return sourcePdf;
+#endif
 }
 
 float emissive_hit_pdf(RayPayload hit, Material material, vec3 previousOrigin) {
@@ -981,6 +1026,7 @@ vec3 estimate_direct_lighting(
     out vec3 sampledLightRadiance,
     out vec3 sampledLightNormal,
     out vec3 sampledRestirContribution,
+#if RTV_REGIR_TRACE_ENABLED
     out uint regirQueryCount,
     out uint regirSelectedLight,
     out float regirReservoirWeight,
@@ -1000,6 +1046,7 @@ vec3 estimate_direct_lighting(
     out float regirEnvironmentMisWeight,
     out float regirEnvironmentM,
     out uint regirEnvironmentGenerationMismatch,
+#endif
     out uint causticTransmissiveHits,
     out uint causticVisiblePaths,
     out uint causticBlockedPaths) {
@@ -1019,6 +1066,7 @@ vec3 estimate_direct_lighting(
     sampledLightRadiance = vec3(0.0);
     sampledLightNormal = vec3(0.0, 1.0, 0.0);
     sampledRestirContribution = vec3(0.0);
+#if RTV_REGIR_TRACE_ENABLED
     regirQueryCount = 0u;
     regirSelectedLight = 0xffffffffu;
     regirReservoirWeight = 0.0;
@@ -1038,11 +1086,12 @@ vec3 estimate_direct_lighting(
     regirEnvironmentMisWeight = 0.0;
     regirEnvironmentM = 0.0;
     regirEnvironmentGenerationMismatch = 0u;
+#endif
     causticTransmissiveHits = 0u;
     causticVisiblePaths = 0u;
     causticBlockedPaths = 0u;
     bool isDelta = material_is_delta(material);
-    if (camera.direct_lighting_enabled == 0u || isDelta || debug_params.view == 27u) {
+    if (camera.direct_lighting_enabled == 0u || isDelta || renderer_debug_view() == 27u) {
         return vec3(0.0);
     }
     float secondaryDirectProbability = 1.0;
@@ -1065,8 +1114,12 @@ vec3 estimate_direct_lighting(
     float secondaryDirectWeight = 1.0 / secondaryDirectProbability;
 
     vec3 lightingNormal = normalize(hit.geom_normal);
+#if RTV_REGIR_TRACE_ENABLED
     bool regirCandidateAvailable = bounce >= 2u && regir_finite_light_enabled();
     uint risCandidateCount = regirCandidateAvailable ? 1u : direct_light_ris_candidate_count();
+#else
+    uint risCandidateCount = direct_light_ris_candidate_count();
+#endif
     vec3 selectedWi = vec3(0.0, 1.0, 0.0);
     vec3 selectedEmission = vec3(0.0);
     vec3 selectedBsdf = vec3(0.0);
@@ -1084,13 +1137,19 @@ vec3 estimate_direct_lighting(
     float sampledRestirProxy = 0.0;
     float proxyWeightSum = 0.0;
     bool selectedCandidate = false;
+#if RTV_REGIR_TRACE_ENABLED
     bool selectedUsedCanonical = false;
+#endif
     if (mesh_params.light_count != 0u && mesh_params.emissive_total_area > 1.0e-8) {
+#if RTV_REGIR_TRACE_ENABLED
         float requestedCanonicalProbability = regirCandidateAvailable ? regir_canonical_mix() : 1.0;
         float regirProbability = regirCandidateAvailable
             ? (1.0 - requestedCanonicalProbability) * regir_finite_query_probability()
             : 0.0;
         float canonicalProbability = 1.0 - regirProbability;
+#else
+        const float canonicalProbability = 1.0;
+#endif
         for (uint candidate = 0u; candidate < risCandidateCount; ++candidate) {
             vec3 candidateWi;
             vec3 candidateEmission;
@@ -1101,6 +1160,7 @@ vec3 estimate_direct_lighting(
             vec3 candidateLightPosition;
             vec3 candidateLightRadiance;
             vec3 candidateLightNormal;
+#if RTV_REGIR_TRACE_ENABLED
             uint candidateRegirQueries = 0u;
             float candidateRegirWeight = 0.0;
             float candidateRegirSpatialInputWeight = 0.0;
@@ -1109,17 +1169,22 @@ vec3 estimate_direct_lighting(
             uvec3 candidateRegirCell = uvec3(0u);
             float candidateRegirActiveCellOccupancy = 0.0;
             float candidateRegirHashCollisions = 0.0;
+#endif
             vec3 candidateReusedVisibility = vec3(1.0);
             bool candidateReusedVisibilityKnown = false;
             uint candidateVisibilityRays = 0u;
             uint candidateVisibilityTransmissiveHits = 0u;
             uint candidateVisibilityVisiblePaths = 0u;
             uint candidateVisibilityBlockedPaths = 0u;
+#if RTV_REGIR_TRACE_ENABLED
             bool candidateUsedCanonical = true;
+#endif
             bool sampledCandidate = false;
+#if RTV_REGIR_TRACE_ENABLED
+            uint regirChoiceRng = rng ^ 0x9e3779b9u;
             if (regirCandidateAvailable &&
                 regirProbability > 0.0 &&
-                rand_f32(rng) >= canonicalProbability) {
+                rand_f32(regirChoiceRng) >= canonicalProbability) {
                 sampledCandidate = sample_regir_emissive_light(
                     rng,
                     hit.world_pos,
@@ -1160,6 +1225,7 @@ vec3 estimate_direct_lighting(
                     candidateUsedCanonical = false;
                 }
             }
+#endif
             if (!sampledCandidate && canonicalProbability > 0.0) {
                 sampledCandidate = sample_emissive_light(
                     rng,
@@ -1175,9 +1241,12 @@ vec3 estimate_direct_lighting(
                     candidateLightNormal);
                 if (sampledCandidate) {
                     candidateLightPdf *= canonicalProbability;
+#if RTV_REGIR_TRACE_ENABLED
                     candidateUsedCanonical = true;
+#endif
                 }
             }
+#if RTV_REGIR_TRACE_ENABLED
             regirQueryCount += candidateRegirQueries;
             if (candidateRegirQueries > 0u) {
                 regirQueryCell = candidateRegirCell;
@@ -1187,6 +1256,7 @@ vec3 estimate_direct_lighting(
                 regirActiveCellOccupancy = candidateRegirActiveCellOccupancy;
                 regirHashCollisions = candidateRegirHashCollisions;
             }
+#endif
             if (!sampledCandidate) {
                 continue;
             }
@@ -1216,6 +1286,7 @@ vec3 estimate_direct_lighting(
                 selectedReusedVisibilityKnown = candidateReusedVisibilityKnown;
                 selectedProxy = candidateProxy;
                 selectedCandidate = true;
+#if RTV_REGIR_TRACE_ENABLED
                 selectedUsedCanonical = candidateUsedCanonical;
                 if (!candidateUsedCanonical) {
                     regirSelectedLight = candidateLightIndex;
@@ -1226,6 +1297,7 @@ vec3 estimate_direct_lighting(
                     regirActiveCellOccupancy = candidateRegirActiveCellOccupancy;
                     regirHashCollisions = candidateRegirHashCollisions;
                 }
+#endif
             }
         }
     }
@@ -1270,6 +1342,7 @@ vec3 estimate_direct_lighting(
             sampledLightDirection = selectedWi;
             sampledLightRadiance = selectedLightRadiance * shadowT;
             sampledLightNormal = selectedLightNormal;
+#if RTV_REGIR_TRACE_ENABLED
             if (regirCandidateAvailable) {
                 regirMisWeight = weight;
                 regirEffectivePdf = effectiveLightPdf;
@@ -1278,6 +1351,7 @@ vec3 estimate_direct_lighting(
                     regirSelectedLight = selectedLightIndex;
                 }
             }
+#endif
             emissiveContribution = selectedBsdf * selectedEmission * shadowT * cosSurface * weight / max(effectiveLightPdf, 1e-6);
             sampledRestirContribution = emissiveContribution;
             sampledRestirProxy = luminance(sampledRestirContribution);
@@ -1306,13 +1380,16 @@ vec3 estimate_direct_lighting(
     uint envDirectSampleCount = sampleEnvironmentDirect
         ? (secondaryOneInfiniteLight ? 1u : clamp(camera.environment_direct_samples, 1u, 8u))
         : 0u;
+#if RTV_REGIR_TRACE_ENABLED
     float envCanonicalProbability;
     float envRegirProbability;
     regir_environment_sampling_probabilities(bounce, envCanonicalProbability, envRegirProbability);
+#endif
     for (uint envSample = 0u; envSample < envDirectSampleCount; ++envSample) {
         vec3 envDir;
         float envPdf;
         vec3 envRadiance;
+#if RTV_REGIR_TRACE_ENABLED
         uint envSourceKind;
         uint envReservoirSampleCount;
         uint envGenerationMismatch = 0u;
@@ -1333,6 +1410,9 @@ vec3 estimate_direct_lighting(
             envSourceKind = 0u;
             envReservoirSampleCount = 0u;
         }
+#else
+        envRadiance = sample_environment_direction(rng, envDir, envPdf);
+#endif
         if (envPdf <= 0.0) {
             continue;
         }
@@ -1365,6 +1445,7 @@ vec3 estimate_direct_lighting(
             }
             envEffectivePdf *= max(environmentTechniqueProbability, 1.0e-6);
             float weight = power_heuristic(envEffectivePdf, bsdfPdf);
+#if RTV_REGIR_TRACE_ENABLED
             if (sampledEnvironmentBank) {
                 regirEnvironmentSourceKind = envSourceKind;
                 regirEnvironmentSourcePdf = envPdf;
@@ -1373,6 +1454,7 @@ vec3 estimate_direct_lighting(
                 regirEnvironmentMisWeight = weight;
                 regirEnvironmentM = float(max(envReservoirSampleCount, 1u));
             }
+#endif
             vec3 envSampleContribution = bsdf * envRadiance * shadowT * cosSurface * weight / max(envEffectivePdf, 1e-6);
             if (camera.restir_di_controls.x != 0u && camera.restir_di_controls.w != 0u) {
                 vec3 envRestirContribution = envSampleContribution / float(envDirectSampleCount);
@@ -1409,6 +1491,7 @@ vec3 estimate_direct_lighting(
         vec3 sunWi;
         vec3 sunRadiance;
         float sunPdf;
+#if RTV_REGIR_TRACE_ENABLED
         uint sunSourceKind = 0u;
         uint sunReservoirSampleCount = 0u;
         uint sunGenerationMismatch = 0u;
@@ -1432,6 +1515,9 @@ vec3 estimate_direct_lighting(
             sunReservoirSampleCount = 0u;
         }
         bool sampledSun = sampledSunBank || sample_sun_light(rng, sunWi, sunRadiance, sunPdf);
+#else
+        bool sampledSun = sample_sun_light(rng, sunWi, sunRadiance, sunPdf);
+#endif
         if (sampledSun) {
             float ndl = max(dot(lightingNormal, sunWi), 0.0);
             if (ndl <= 0.0) {
@@ -1464,6 +1550,7 @@ vec3 estimate_direct_lighting(
                 float weight = power_heuristic(sunEffectivePdf, bsdfPdf);
                 vec3 sunIncidentRadiance = sunRadiance * sun_transmittance(hit.world_pos, sunWi);
                 vec3 sunCandidateContribution = bsdf * sunIncidentRadiance * shadowT * ndl * weight / max(sunEffectivePdf, 1e-6);
+#if RTV_REGIR_TRACE_ENABLED
                 if (sampledSunBank) {
                     regirEnvironmentSourceKind = sunSourceKind;
                     regirEnvironmentSourcePdf = sunPdf;
@@ -1472,6 +1559,7 @@ vec3 estimate_direct_lighting(
                     regirEnvironmentMisWeight = weight;
                     regirEnvironmentM = float(max(sunReservoirSampleCount, 1u));
                 }
+#endif
                 if (camera.restir_di_controls.x != 0u && camera.restir_di_controls.z != 0u) {
                     float sunRestirProxy = luminance(sunCandidateContribution);
                     float sunCandidateProxySum = sampledRestirProxy + sunRestirProxy;
@@ -1545,7 +1633,7 @@ vec3 estimate_direct_lighting_env_sun_only(
     causticVisiblePaths = 0u;
     causticBlockedPaths = 0u;
     bool isDelta = material_is_delta(material);
-    if (camera.direct_lighting_enabled == 0u || isDelta || debug_params.view == 27u) {
+    if (camera.direct_lighting_enabled == 0u || isDelta || renderer_debug_view() == 27u) {
         return vec3(0.0);
     }
 
@@ -1692,7 +1780,7 @@ bool native2b_terminal_direct_fast_supported(Material material) {
         record_rt_counter(RT_DIAG_TERMINAL_FAST_DIRECT_VOLUME);
         supported = false;
     }
-    if (camera.path_trace_controls.w != 0u || debug_params.view == 27u) {
+    if (camera.path_trace_controls.w != 0u || renderer_debug_view() == 27u) {
         record_rt_counter(RT_DIAG_TERMINAL_FAST_DIRECT_DEBUG);
         supported = false;
     }
@@ -1767,7 +1855,7 @@ vec3 estimate_native2b_terminal_env_sun_direct(
     out uint sampledType) {
     environmentContribution = vec3(0.0);
     sampledType = 0u;
-    if (camera.direct_lighting_enabled == 0u || material_is_delta(material) || debug_params.view == 27u) {
+    if (camera.direct_lighting_enabled == 0u || material_is_delta(material) || renderer_debug_view() == 27u) {
         return vec3(0.0);
     }
 

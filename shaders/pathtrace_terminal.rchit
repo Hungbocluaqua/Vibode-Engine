@@ -49,10 +49,14 @@ void main() {
     }
     record_rt_counter(RT_DIAG_TERMINAL_MATERIAL_FULL_DECODE);
 
-    uint triIndex = globalTriangleIndex * 3u;
-    LocalVertex v0 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex]);
-    LocalVertex v1 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex + 1u]);
-    LocalVertex v2 = ray_tracing_local_vertex(meshIndex, local_mesh_indices[triIndex + 2u]);
+    uvec3 indices;
+    if (!ray_tracing_triangle_indices(globalTriangleIndex, indices)) {
+        payload.hit = 0u;
+        return;
+    }
+    LocalVertex v0 = ray_tracing_local_vertex(meshIndex, indices.x);
+    LocalVertex v1 = ray_tracing_local_vertex(meshIndex, indices.y);
+    LocalVertex v2 = ray_tracing_local_vertex(meshIndex, indices.z);
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
     vec3 p0 = v0.position_uv_x.xyz;
     vec3 p1 = v1.position_uv_x.xyz;

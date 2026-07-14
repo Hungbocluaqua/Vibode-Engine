@@ -92,18 +92,16 @@ std::filesystem::path findEditorTablerIconFont() {
     return {};
 }
 
-std::filesystem::path findEditorUiTextFont() {
+std::filesystem::path findEditorUiTextFont(bool bold = false) {
 #if defined(_WIN32)
     char* windir = nullptr;
     size_t windirLength = 0;
     if (_dupenv_s(&windir, &windirLength, "WINDIR") == 0 && windir != nullptr) {
         const std::filesystem::path fonts = std::filesystem::path(windir) / "Fonts";
         std::free(windir);
-        const std::array<std::filesystem::path, 3> candidates{{
-            fonts / "segoeui.ttf",
-            fonts / "segoeuib.ttf",
-            fonts / "tahoma.ttf",
-        }};
+        const std::array<std::filesystem::path, 3> candidates = bold
+            ? std::array<std::filesystem::path, 3>{{fonts / "segoeuib.ttf", fonts / "segoeui.ttf", fonts / "tahomabd.ttf"}}
+            : std::array<std::filesystem::path, 3>{{fonts / "segoeui.ttf", fonts / "tahoma.ttf", fonts / "segoeuib.ttf"}};
         for (const std::filesystem::path& candidate : candidates) {
             if (std::filesystem::exists(candidate)) {
                 return candidate;
@@ -145,8 +143,8 @@ const char* debugViewLabel(RendererDebugView view) {
     return rendererDebugViewName(view);
 }
 
-const std::array<RendererDebugView, 37>& rendererOnlyDebugViews() {
-    static const std::array<RendererDebugView, 37> views{{
+const std::array<RendererDebugView, 73>& rendererOnlyDebugViews() {
+    static const std::array<RendererDebugView, 73> views{{
         RendererDebugView::Beauty,
         RendererDebugView::DirectLighting,
         RendererDebugView::IndirectLighting,
@@ -157,13 +155,49 @@ const std::array<RendererDebugView, 37>& rendererOnlyDebugViews() {
         RendererDebugView::Roughness,
         RendererDebugView::Variance,
         RendererDebugView::DenoiserRejection,
+        RendererDebugView::NrdValidation,
+        RendererDebugView::NrdDiffuseConfidence,
+        RendererDebugView::NrdSpecularConfidence,
+        RendererDebugView::NrdRawConfidenceGradient,
+        RendererDebugView::NrdFilteredConfidenceGradient,
+        RendererDebugView::NrdConfidenceHistory,
+        RendererDebugView::PsrActiveMask,
+        RendererDebugView::PsrDepth,
+        RendererDebugView::PsrMotion,
+        RendererDebugView::PsrNormalRoughness,
+        RendererDebugView::PsrHitDistance,
+        RendererDebugView::PsrAlbedoF0,
+        RendererDebugView::PsrRayDirection,
+        RendererDebugView::DlssDepth,
+        RendererDebugView::DlssMotionVectors,
+        RendererDebugView::DlssInputColor,
+        RendererDebugView::DlssOutputColor,
+        RendererDebugView::DlssRrDiffuseAlbedo,
+        RendererDebugView::DlssRrSpecularAlbedo,
+        RendererDebugView::DlssRrNormals,
+        RendererDebugView::DlssRrRoughness,
+        RendererDebugView::DlssRrDiffuseHitDistance,
+        RendererDebugView::DlssRrSpecularHitDistance,
+        RendererDebugView::DlssRrReflectedAlbedo,
+        RendererDebugView::DlssRrDisocclusionMask,
+        RendererDebugView::DlssRrDiffuseRayDirection,
+        RendererDebugView::DlssRrSpecularRayDirection,
+        RendererDebugView::DlssRrDiffuseRayDirectionHitDistance,
+        RendererDebugView::DlssRrSpecularRayDirectionHitDistance,
         RendererDebugView::ReprojectionConfidence,
         RendererDebugView::RestirDiFinalContribution,
         RendererDebugView::RestirDiTemporalReservoir,
         RendererDebugView::RestirDiSpatialReservoir,
+        RendererDebugView::RestirDiLightMapStatus,
         RendererDebugView::RestirGiFinal,
         RendererDebugView::RestirGiTemporal,
         RendererDebugView::RestirGiSpatial,
+        RendererDebugView::RestirGiTarget,
+        RendererDebugView::RestirGiSourcePdf,
+        RendererDebugView::RestirGiWeightSum,
+        RendererDebugView::RestirGiM,
+        RendererDebugView::RestirGiConfidence,
+        RendererDebugView::RestirGiVisibility,
         RendererDebugView::AdaptiveDensityMap,
         RendererDebugView::RegirGridOccupancy,
         RendererDebugView::RegirReservoirWeight,
@@ -1153,9 +1187,23 @@ void UiOverlay::loadEditorFonts() {
         textConfig.PixelSnapH = true;
         textConfig.OversampleH = 2;
         textConfig.OversampleV = 1;
-        if (ImFont* textFont = io.Fonts->AddFontFromFileTTF(textFontPath.string().c_str(), 14.0f, &textConfig, io.Fonts->GetGlyphRangesDefault())) {
+        if (ImFont* textFont = io.Fonts->AddFontFromFileTTF(textFontPath.string().c_str(), 15.0f, &textConfig, io.Fonts->GetGlyphRangesDefault())) {
             io.FontDefault = textFont;
         }
+    }
+
+    editorSetHeadingFont(nullptr);
+    const std::filesystem::path headingFontPath = findEditorUiTextFont(true);
+    if (!headingFontPath.empty()) {
+        ImFontConfig headingConfig{};
+        headingConfig.PixelSnapH = true;
+        headingConfig.OversampleH = 2;
+        headingConfig.OversampleV = 1;
+        editorSetHeadingFont(io.Fonts->AddFontFromFileTTF(
+            headingFontPath.string().c_str(),
+            15.0f,
+            &headingConfig,
+            io.Fonts->GetGlyphRangesDefault()));
     }
 
     if (io.Fonts->Fonts.empty()) {
@@ -1189,15 +1237,15 @@ void UiOverlay::loadEditorFonts() {
 void UiOverlay::applyDarkStyle() {
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowPadding = ImVec2(5.0f, 4.0f);
-    style.FramePadding = ImVec2(5.0f, 3.0f);
-    style.ItemSpacing = ImVec2(5.0f, 4.0f);
-    style.ItemInnerSpacing = ImVec2(4.0f, 3.0f);
-    style.ScrollbarSize = 10.0f;
+    style.WindowPadding = ImVec2(EditorUiMetric::panelPaddingX, EditorUiMetric::panelPaddingY);
+    style.FramePadding = ImVec2(EditorUiMetric::rowPaddingX, EditorUiMetric::rowPaddingY);
+    style.ItemSpacing = ImVec2(7.0f, 5.0f);
+    style.ItemInnerSpacing = ImVec2(6.0f, 4.0f);
+    style.ScrollbarSize = 11.0f;
     style.WindowRounding = 0.0f;
-    style.FrameRounding = 1.0f;
-    style.GrabRounding = 1.0f;
-    style.TabRounding = 1.0f;
+    style.FrameRounding = EditorUiMetric::compactButtonRounding;
+    style.GrabRounding = EditorUiMetric::compactButtonRounding;
+    style.TabRounding = EditorUiMetric::dockTabRounding;
     style.WindowBorderSize = 1.0f;
     style.FrameBorderSize = 0.0f;
     style.WindowMenuButtonPosition = ImGuiDir_Left;

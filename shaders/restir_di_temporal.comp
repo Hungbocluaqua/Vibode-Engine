@@ -61,7 +61,9 @@ layout(set = 0, binding = 6, std140) uniform Params {
     uint materialVisibilityFlags;
     uint counterEnabled;
     uint rawOutputIsCurrentSample;
-    uint padding2;
+    float shadowDistanceBias;
+    uint lightVersion;
+    uint environmentVersion;
 } params;
 
 #define DI_COUNTER_ADD(counter, value) ((params.counterEnabled != 0u) ? atomicAdd(counter, value) : 0u)
@@ -69,6 +71,23 @@ layout(set = 0, binding = 6, std140) uniform Params {
 layout(set = 0, binding = 7, std430) readonly buffer PreviousReceiverBuffer {
     RestirDiReceiver previous_receivers[];
 };
+
+layout(set = 0, binding = 24, std430) writeonly buffer TemporalSourcePixels {
+    uint temporal_source_pixels[];
+};
+
+const uint RESTIR_DI_SOURCE_PIXEL_INVALID = 0xffffffffu;
+
+uint restir_di_pack_source_pixel(ivec2 p) {
+    if (p.x < 0 || p.y < 0 || p.x > 65534 || p.y > 65534) {
+        return RESTIR_DI_SOURCE_PIXEL_INVALID;
+    }
+    return uint(p.x) | (uint(p.y) << 16u);
+}
+
+void restir_di_store_temporal_source(uint pixelIndex, ivec2 sourcePixel) {
+    temporal_source_pixels[pixelIndex] = restir_di_pack_source_pixel(sourcePixel);
+}
 
 // Velocity unpacking
 vec2 unpack_velocity_pixels(uint packed) {
@@ -99,6 +118,7 @@ void main() {
 
     uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
     DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_PIXELS], 1u);
+    restir_di_store_temporal_source(pixelIndex, coords);
 
     // Load current receiver
     RestirDiReceiver receiver = receivers[pixelIndex];
@@ -107,8 +127,9 @@ void main() {
     uint surfaceFlags = restir_di_receiver_surface_flags(receiver);
     if ((surfaceFlags & (RESTIR_DI_SURFACE_SKY | RESTIR_DI_SURFACE_INVALID |
                          RESTIR_DI_SURFACE_DELTA | RESTIR_DI_SURFACE_ALPHA |
-                         RESTIR_DI_SURFACE_UNLIT | RESTIR_DI_SURFACE_UNSUPPORTED)) != 0u) {
+        RESTIR_DI_SURFACE_UNLIT | RESTIR_DI_SURFACE_UNSUPPORTED)) != 0u) {
         temporal_reservoirs[pixelIndex] = initial_reservoirs[pixelIndex];
+        restir_di_store_temporal_source(pixelIndex, coords);
         DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_SURFACE_REJECTED], 1u);
         return;
     }
@@ -120,6 +141,7 @@ void main() {
     // Try temporal reuse
     if (params.enabled == 0u || params.historyValid == 0u) {
         temporal_reservoirs[pixelIndex] = current;
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
 
@@ -134,40 +156,72 @@ void main() {
     if (!reprojectValid || length(velocityPixels) > 48.0) {
         DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_REPROJECT_INVALID], 1u);
         temporal_reservoirs[pixelIndex] = current;
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
     DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_REPROJECT_VALID], 1u);
 
-    // Load previous reservoir
-    uint prevIndex = uint(reprojectedCoords.y) * params.width + uint(reprojectedCoords.x);
-    RestirDiReservoir previous = previous_reservoirs[prevIndex];
-
-    // Load previous receiver for surface compatibility
-    RestirDiReceiver prevReceiver = previous_receivers[prevIndex];
-
-    // Surface compatibility
-    if (!restir_di_surface_compatible(receiver, prevReceiver, params.normalThreshold, params.depthThreshold)) {
-        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_SURFACE_REJECTED], 1u);
-        rejectionFlags |= RESTIR_DI_REJECT_SURFACE_MISMATCH;
-        restir_di_set_rejection_flags(current, rejectionFlags);
-        temporal_reservoirs[pixelIndex] = current;
-        return;
-    }
-    float receiverWorldDelta = length(receiver.worldPosition_depth.xyz - prevReceiver.worldPosition_depth.xyz);
+    uint prevIndex = 0u;
+    ivec2 previousCoords = reprojectedCoords;
+    RestirDiReceiver prevReceiver;
+    bool foundCompatibleHistory = false;
+    float bestHistoryScore = 1.0e30;
     float receiverWorldLimit = max(0.05, max(abs(receiver.worldPosition_depth.w), 1.0) * params.depthThreshold);
-    if (receiverWorldDelta > receiverWorldLimit) {
+
+    int historySearchRadius = length(velocityPixels) > 0.25 ? 1 : 0;
+    for (int oy = -historySearchRadius; oy <= historySearchRadius; ++oy) {
+        for (int ox = -historySearchRadius; ox <= historySearchRadius; ++ox) {
+            ivec2 candidateCoords = reprojectedCoords + ivec2(ox, oy);
+            if (candidateCoords.x < 0 || candidateCoords.y < 0 ||
+                candidateCoords.x >= int(params.width) || candidateCoords.y >= int(params.height)) {
+                continue;
+            }
+
+            uint candidateIndex = uint(candidateCoords.y) * params.width + uint(candidateCoords.x);
+            RestirDiReceiver candidateReceiver = previous_receivers[candidateIndex];
+            if (!restir_di_surface_compatible(receiver, candidateReceiver, params.normalThreshold, params.depthThreshold)) {
+                continue;
+            }
+
+            float worldDelta = length(receiver.worldPosition_depth.xyz - candidateReceiver.worldPosition_depth.xyz);
+            if (worldDelta > receiverWorldLimit) {
+                continue;
+            }
+
+            vec3 currentNormal = normalize(receiver.normal_roughness.xyz);
+            vec3 previousNormal = normalize(candidateReceiver.normal_roughness.xyz);
+            float normalPenalty = 1.0 - clamp(dot(currentNormal, previousNormal), 0.0, 1.0);
+            float offsetPenalty = 0.05 * float(ox * ox + oy * oy);
+            float depthPenalty = worldDelta / max(receiverWorldLimit, 1.0e-4);
+            float validBonus = restir_di_reservoir_valid(previous_reservoirs[candidateIndex]) ? -0.25 : 0.0;
+            float score = depthPenalty + normalPenalty + offsetPenalty + validBonus;
+            if (score < bestHistoryScore) {
+                bestHistoryScore = score;
+                prevIndex = candidateIndex;
+                previousCoords = candidateCoords;
+                prevReceiver = candidateReceiver;
+                foundCompatibleHistory = true;
+            }
+        }
+    }
+
+    if (!foundCompatibleHistory) {
         DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_SURFACE_REJECTED], 1u);
         rejectionFlags |= RESTIR_DI_REJECT_SURFACE_MISMATCH;
         restir_di_set_rejection_flags(current, rejectionFlags);
         temporal_reservoirs[pixelIndex] = current;
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
+
+    RestirDiReservoir previous = previous_reservoirs[prevIndex];
 
     // An invalid reservoir can still represent zero-weight proposals. Merge
     // its M only after verifying that both receivers share a target domain.
     if (!restir_di_reservoir_valid(previous)) {
         DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_PREVIOUS_INVALID], 1u);
         temporal_reservoirs[pixelIndex] = merge_zero_weight_history_m(current, previous);
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
     DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_PREVIOUS_VALID], 1u);
@@ -177,16 +231,23 @@ void main() {
         rejectionFlags |= RESTIR_DI_REJECT_AGE;
         restir_di_set_rejection_flags(current, rejectionFlags);
         temporal_reservoirs[pixelIndex] = current;
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
 
     RestirDiLightRecord previousLight;
     uint resolvedLightIndex;
-    if (!restir_di_resolve_light(previous, previousLight, resolvedLightIndex)) {
+    if (!restir_di_resolve_light(
+            previous,
+            previousLight,
+            resolvedLightIndex,
+            params.lightVersion,
+            params.environmentVersion)) {
         DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_LIGHT_VERSION_REJECTED], 1u);
         rejectionFlags |= RESTIR_DI_REJECT_LIGHT_VERSION;
         restir_di_set_rejection_flags(current, rejectionFlags);
         temporal_reservoirs[pixelIndex] = current;
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
 
@@ -194,16 +255,6 @@ void main() {
     float distToLight;
     vec3 lightNormal = restir_di_light_normal(previous);
     uint previousKind = restir_di_light_kind(previous);
-    if (restir_di_light_kind_infinite(previousKind) && params.visibilityPolicy == 0u) {
-        // Sun/environment are valid initial DI candidates, but production
-        // temporal shifting needs a current-receiver transmittance model for
-        // infinite lights before it is safe. Keep the current frame's all-light
-        // sample and avoid feeding long-lived shifted sky/sun reservoirs into
-        // the first-frame/final visibility path.
-        DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_LIGHT_VERSION_REJECTED], 1u);
-        temporal_reservoirs[pixelIndex] = current;
-        return;
-    }
     if (previousKind == RESTIR_DI_LIGHT_AREA || previousKind == RESTIR_DI_LIGHT_SPOT) {
         lightNormal = normalize(vec3(previousLight.data1.w, previousLight.data2.w, previousLight.data3.x));
     }
@@ -231,6 +282,7 @@ void main() {
         rejectionFlags |= RESTIR_DI_REJECT_TARGET_ZERO;
         restir_di_set_rejection_flags(current, rejectionFlags);
         temporal_reservoirs[pixelIndex] = merge_zero_weight_history_m(current, previous);
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
 
@@ -240,6 +292,7 @@ void main() {
         rejectionFlags |= RESTIR_DI_REJECT_PDF_ZERO;
         restir_di_set_rejection_flags(current, rejectionFlags);
         temporal_reservoirs[pixelIndex] = merge_zero_weight_history_m(current, previous);
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
 
@@ -250,6 +303,7 @@ void main() {
     if (isnan(shiftedWeight) || isinf(shiftedWeight) || shiftedWeight < 0.0) {
         DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_NON_FINITE], 1u);
         temporal_reservoirs[pixelIndex] = current;
+        restir_di_store_temporal_source(pixelIndex, coords);
         return;
     }
 
@@ -260,6 +314,7 @@ void main() {
             rejectionFlags |= RESTIR_DI_REJECT_VISIBILITY;
             restir_di_set_rejection_flags(current, rejectionFlags);
             temporal_reservoirs[pixelIndex] = current;
+            restir_di_store_temporal_source(pixelIndex, coords);
             return;
         }
         // ReferenceValidation: trace actual shadow ray from current receiver to light
@@ -272,9 +327,10 @@ void main() {
                 : normalize(previousLight.data1.xyz))
             : lightPos - receiver.worldPosition_depth.xyz;
         float dist = directionalSample ? previous.samplePosition_distance.w : length(toLight);
-        if (dist > RESTIR_DI_VISIBILITY_EPSILON * 2.0) {
+        float finiteLightDistanceBias = max(params.shadowDistanceBias, RESTIR_DI_VISIBILITY_EPSILON * 2.0);
+        if (dist > finiteLightDistanceBias) {
             vec3 shadowDir = directionalSample ? toLight : toLight / dist;
-            float tmax = dist - RESTIR_DI_VISIBILITY_EPSILON * 2.0;
+            float tmax = dist - finiteLightDistanceBias;
             vec3 shadowOrigin = receiver.worldPosition_depth.xyz +
                 shadowDir * RESTIR_DI_VISIBILITY_EPSILON +
                 receiverNormal * RESTIR_DI_VISIBILITY_EPSILON;
@@ -288,6 +344,7 @@ void main() {
                 rejectionFlags |= RESTIR_DI_REJECT_VISIBILITY;
                 restir_di_set_rejection_flags(current, rejectionFlags);
                 temporal_reservoirs[pixelIndex] = merge_zero_weight_history_m(current, previous);
+                restir_di_store_temporal_source(pixelIndex, coords);
                 return;
             }
             DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_VISIBILITY_PASSED], 1u);
@@ -302,6 +359,7 @@ void main() {
             rejectionFlags |= RESTIR_DI_REJECT_VISIBILITY;
             restir_di_set_rejection_flags(current, rejectionFlags);
             temporal_reservoirs[pixelIndex] = merge_zero_weight_history_m(current, previous);
+            restir_di_store_temporal_source(pixelIndex, coords);
             return;
         }
         DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_TEMPORAL_VISIBILITY_SKIPPED], 1u);
@@ -401,4 +459,5 @@ void main() {
     restir_di_set_rejection_flags(selected, rejectionFlags);
 
     temporal_reservoirs[pixelIndex] = selected;
+    restir_di_store_temporal_source(pixelIndex, selectPrevious ? previousCoords : coords);
 }

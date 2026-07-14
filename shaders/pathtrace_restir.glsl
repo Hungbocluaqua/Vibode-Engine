@@ -72,7 +72,9 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
 }
 
 void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_position, vec3 hit_normal, float hit_depth, bool did_hit) {
-    atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_PIXELS], 1u);
+    if (restir_di_raygen_params.counterEnabled != 0u) {
+        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_PIXELS], 1u);
+    }
     // Write receiver surface data
     RestirDiReceiver receiver;
     if (did_hit) {
@@ -95,7 +97,7 @@ void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_po
             surfaceFlags |= RESTIR_DI_SURFACE_UNSUPPORTED;
         }
         receiver.worldPosition_depth = vec4(hit_position, hit_depth);
-        receiver.normal_roughness = vec4(components.first_geom_normal, components.first_roughness);
+        receiver.normal_roughness = vec4(normalize(hit_normal), components.first_roughness);
 #if RTV_RESTIR_DI_VALIDATION_FULL
         receiver.tangent_materialId = vec4(components.restir_di_base_color, float(components.first_material_id));
         receiver.bitangent_instanceId = vec4(components.restir_di_f0, float(components.instance_id));
@@ -180,8 +182,8 @@ void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_po
                 ? RESTIR_DI_ENVIRONMENT_ID_HASH
                 : RESTIR_DI_SUN_ID_HASH;
             identityVersion = components.restir_di_light_kind == RESTIR_DI_LIGHT_ENVIRONMENT
-                ? RESTIR_DI_ENVIRONMENT_VERSION
-                : RESTIR_DI_SUN_VERSION;
+                ? camera.gi_version_controls.w
+                : camera.gi_version_controls.x;
         } else {
             LightRecord identityRecord = light_records[components.restir_di_light_index];
             identityHash = restir_di_identity_hash(identityRecord.identity.xy);
@@ -200,7 +202,7 @@ void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_po
         restir_di_set_target(initial, targetLum);
         restir_di_set_light_normal(initial, components.restir_di_sample_normal);
 #if !RTV_RESTIR_DI_VALIDATION_FULL
-        if (initialWeight > 65504.0) {
+        if (restir_di_raygen_params.counterEnabled != 0u && initialWeight > 65504.0) {
             atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_WEIGHT_OVERFLOW], 1u);
         }
 #endif
@@ -212,27 +214,30 @@ void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_po
         restir_di_set_source_pdf(initial, components.first_light_pdf);
         restir_di_set_previous_weight(initial, 0.0);
         restir_di_set_confidence(initial, 1.0);
-        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_VALID], 1u);
-        uint lightKind = components.restir_di_light_kind;
-        uint classCounter = lightKind <= RESTIR_DI_LIGHT_EMISSIVE_SPHERE ? RESTIR_DI_COUNTER_INITIAL_EMISSIVE :
-            lightKind == RESTIR_DI_LIGHT_DIRECTIONAL ? RESTIR_DI_COUNTER_INITIAL_DIRECTIONAL :
-            lightKind == RESTIR_DI_LIGHT_POINT ? RESTIR_DI_COUNTER_INITIAL_POINT :
-            lightKind == RESTIR_DI_LIGHT_AREA ? RESTIR_DI_COUNTER_INITIAL_AREA :
-            lightKind == RESTIR_DI_LIGHT_SPOT ? RESTIR_DI_COUNTER_INITIAL_SPOT :
-            lightKind == RESTIR_DI_LIGHT_ENVIRONMENT ? RESTIR_DI_COUNTER_INITIAL_ENVIRONMENT :
-            lightKind == RESTIR_DI_LIGHT_SUN ? RESTIR_DI_COUNTER_INITIAL_SUN :
-            RESTIR_DI_COUNTER_INITIAL_INVALID_IDENTITY;
-        atomicAdd(restir_di_counters[classCounter], 1u);
-    } else if (!did_hit || !validSurface) {
-        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_SURFACE], 1u);
-    } else if (!finiteCandidate) {
-        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_NON_FINITE], 1u);
-    } else if (!validPdf) {
-        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_PDF], 1u);
-    } else if (!validIdentity) {
-        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_IDENTITY], 1u);
-    } else {
-        atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_INVALID_TARGET], 1u);
+        if (restir_di_raygen_params.counterEnabled != 0u) {
+            atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_VALID], 1u);
+            uint lightKind = components.restir_di_light_kind;
+            uint classCounter = lightKind <= RESTIR_DI_LIGHT_EMISSIVE_SPHERE ? RESTIR_DI_COUNTER_INITIAL_EMISSIVE :
+                lightKind == RESTIR_DI_LIGHT_DIRECTIONAL ? RESTIR_DI_COUNTER_INITIAL_DIRECTIONAL :
+                lightKind == RESTIR_DI_LIGHT_POINT ? RESTIR_DI_COUNTER_INITIAL_POINT :
+                lightKind == RESTIR_DI_LIGHT_AREA ? RESTIR_DI_COUNTER_INITIAL_AREA :
+                lightKind == RESTIR_DI_LIGHT_SPOT ? RESTIR_DI_COUNTER_INITIAL_SPOT :
+                lightKind == RESTIR_DI_LIGHT_ENVIRONMENT ? RESTIR_DI_COUNTER_INITIAL_ENVIRONMENT :
+                lightKind == RESTIR_DI_LIGHT_SUN ? RESTIR_DI_COUNTER_INITIAL_SUN :
+                RESTIR_DI_COUNTER_INITIAL_INVALID_IDENTITY;
+            atomicAdd(restir_di_counters[classCounter], 1u);
+        }
+    } else if (restir_di_raygen_params.counterEnabled != 0u) {
+        uint invalidCounter = (!did_hit || !validSurface)
+            ? RESTIR_DI_COUNTER_INITIAL_INVALID_SURFACE
+            : (!finiteCandidate
+                ? RESTIR_DI_COUNTER_INITIAL_NON_FINITE
+                : (!validPdf
+                    ? RESTIR_DI_COUNTER_INITIAL_INVALID_PDF
+                    : (!validIdentity
+                        ? RESTIR_DI_COUNTER_INITIAL_INVALID_IDENTITY
+                        : RESTIR_DI_COUNTER_INITIAL_INVALID_TARGET)));
+        atomicAdd(restir_di_counters[invalidCounter], 1u);
     }
     restir_di_initial_reservoirs[pixelIndex] = initial;
 }
@@ -426,7 +431,7 @@ void store_initial_restir_gi_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims
 
     if (restir_gi_legacy_cache_mode() &&
         restirGiDebugView &&
-        debug_params.view != 70u &&
+        renderer_debug_view() != 70u &&
         restir_gi_reservoir_valid(reservoir) &&
         temporal_history_available() &&
         !streaming_instance_reset_mask(components.instance_id, 2u)) {

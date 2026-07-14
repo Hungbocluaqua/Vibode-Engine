@@ -80,6 +80,8 @@ struct ProfileReport {
     uint32_t warmupFrames = 0;
     uint32_t profiledFrames = 0;
     bool rayTracingDiagnosticCountersEnabled = false;
+    std::string lastAccumulationResetReason = "Startup";
+    nlohmann::json temporalSystemDiagnostics = nlohmann::json::object();
 
     struct MinMaxAvg {
         float min = 0.0f;
@@ -126,6 +128,10 @@ struct ProfileReport {
         float skipDenoiserCopy = 0.0f;
         float taa = 0.0f;
         float taaHistoryCopy = 0.0f;
+        float dlssGuides = 0.0f;
+        float dlss = 0.0f;
+        float dlssRayReconstructionGuides = 0.0f;
+        float dlssRayReconstruction = 0.0f;
         float autoExposureHistogramClear = 0.0f;
         float autoExposureHistogram = 0.0f;
         float autoExposureReduce = 0.0f;
@@ -256,6 +262,9 @@ struct ProfileReport {
         uint64_t rayInvocations = 0;
         uint64_t triangleHits = 0;
         uint64_t aabbHits = 0;
+        bool supported = false;
+        bool valid = false;
+        std::string unavailableReason;
     } pipelineStatistics{};
 
     struct RayTracingDiagnosticCounterReport {
@@ -322,6 +331,7 @@ struct ProfileReport {
     std::vector<uint64_t> restirDiCounters;
     std::vector<uint64_t> restirGiCounters;
     bool restirDiHistoryValid = false;
+    bool restirGiHistoryValid = false;
 
     struct RayTracingGeometryReport {
         uint32_t opaquePrimitiveCount = 0;
@@ -852,6 +862,12 @@ struct ProfileReport {
         bool nrdRequestable = false;
         bool nrdAvailable = false;
         std::string nrdUnavailableReason;
+        bool nrdDirectRuntimeResourcesReady = false;
+        bool nrdHistoryConfidenceInputsAllocated = false;
+        bool nrdHistoryConfidenceAvailable = false;
+        bool nrdValidationOutputAllocated = false;
+        bool nrdValidationOutputEnabled = false;
+        std::string nrdGuideContractReason;
         std::string nrdBackendPolicy = "disabled";
         std::string nrdBackendPolicyReason;
         bool nrdBackendsMutuallyExclusive = true;
@@ -864,10 +880,23 @@ struct ProfileReport {
         std::string dlssRayReconstructionUnavailableReason;
         bool requestedDlssRayReconstruction = false;
         bool effectiveDlssRayReconstruction = false;
+        bool dlssRayReconstructionGuidePassReady = false;
+        bool dlssRayReconstructionGuideImagesAllocated = false;
+        bool dlssRayReconstructionPsrGuideBufferAllocated = false;
+        bool dlssRayReconstructionPsrHistorySignaturesAllocated = false;
+        bool dlssRayReconstructionUsesPsrGuides = false;
+        uint32_t dlssRayReconstructionGuideImageCount = 0;
+        std::string dlssRayReconstructionGuideMode;
         bool dlssFrameGenerationAvailable = false;
         std::string dlssFrameGenerationUnavailableReason;
         bool requestedDlssFrameGeneration = false;
         bool effectiveDlssFrameGeneration = false;
+        bool dlssAutoExposureEnabled = false;
+        bool dlssExposureBufferAvailable = false;
+        bool dlssExposureBufferPassedToSdk = false;
+        float dlssManualExposure = 1.0f;
+        float dlssPreExposure = 1.0f;
+        float dlssExposureScale = 1.0f;
         float dlssSharpeningStrength = 0.0f;
         std::string requestedTemporalUpscaler = "taa-tsr";
         std::string effectiveTemporalUpscaler = "taa-tsr";
@@ -939,6 +968,7 @@ struct ProfileReport {
     uint64_t topologyRebuildLatestGeneration = 0;
     uint64_t topologyRebuildNextTimelineValue = 0;
 
+    bool validationEnabled = false;
     uint32_t validationErrorCount = 0;
     std::vector<std::string> warnings;
     nlohmann::json textureDiagnostics = nlohmann::json::object();
@@ -956,6 +986,7 @@ struct ValidationSceneResult {
     std::string name;
     std::string status;
     float gpuMsTotal = 0.0f;
+    bool validationEnabled = false;
     uint32_t validationErrors = 0;
     uint32_t framesRendered = 0;
     bool wavefrontValidationEnabled = false;

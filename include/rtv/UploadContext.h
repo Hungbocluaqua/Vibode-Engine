@@ -26,6 +26,7 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex_ = 0;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
 };
 

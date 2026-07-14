@@ -27,7 +27,7 @@ struct RestirDiUniforms {
     uint materialVisibilityFlags;
     uint counterEnabled;
     uint padding1;
-    uint padding2;
+    float shadowDistanceBias;
 };
 
 const float RESTIR_DI_VISIBILITY_EPSILON = 0.001;

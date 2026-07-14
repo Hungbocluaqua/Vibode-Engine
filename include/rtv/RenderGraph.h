@@ -124,6 +124,8 @@ private:
     std::vector<RenderGraphPass> passes_;
     std::vector<uint32_t> compiledPassOrder_;
     std::vector<RenderGraphBarrier> compiledBarriers_;
+    std::vector<std::vector<uint32_t>> compiledBarrierBatches_;
+    std::vector<uint32_t> compiledFinalBarrierBatch_;
     std::vector<TransientResourceLifetime> resourceLifetimes_;
     std::unique_ptr<TransientResourcePool> transientPool_;
     VkQueue asyncComputeQueue_ = VK_NULL_HANDLE;

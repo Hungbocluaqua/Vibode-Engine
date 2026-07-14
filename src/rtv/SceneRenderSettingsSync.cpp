@@ -163,7 +163,13 @@ void applySceneWorldComponentsToRendererSettings(const SceneDocument& document, 
         settings.mieAnisotropy = std::clamp(selection.skyAtmosphere->mieAnisotropy, 0.0f, 0.99f);
         settings.groundAlbedo = std::clamp(selection.skyAtmosphere->groundAlbedo, 0.0f, 1.0f);
     } else {
-        settings.skyIntensity = 0.0f;
+        const bool proceduralEnvironment =
+            selection.environmentLight != nullptr &&
+            selection.environmentLight->enabled &&
+            selection.environmentLight->hdrPath.empty();
+        settings.skyIntensity = proceduralEnvironment
+            ? safeNonNegative(document.renderSettings().skyIntensity)
+            : 0.0f;
     }
 
     if (selection.heightFog != nullptr) {

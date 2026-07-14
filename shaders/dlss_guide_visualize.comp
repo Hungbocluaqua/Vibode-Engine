@@ -1,0 +1,78 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D source_texture;
+layout(set = 0, binding = 1) uniform sampler source_sampler;
+layout(set = 0, binding = 2, rgba8) writeonly uniform image2D output_image;
+
+layout(push_constant) uniform VisualizeParams {
+    uint mode;
+    float scale;
+    float bias;
+    float reserved0;
+} params;
+
+const uint MODE_HDR_COLOR = 0u;
+const uint MODE_LINEAR_COLOR = 1u;
+const uint MODE_SCALAR_01 = 2u;
+const uint MODE_LINEAR_DEPTH = 3u;
+const uint MODE_HARDWARE_DEPTH = 4u;
+const uint MODE_MOTION_PIXELS = 5u;
+const uint MODE_DIRECTION = 6u;
+const uint MODE_DISTANCE = 7u;
+
+vec3 linear_to_srgb(vec3 color) {
+    color = clamp(color, vec3(0.0), vec3(1.0));
+    vec3 lo = color * 12.92;
+    vec3 hi = 1.055 * pow(color, vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, lessThanEqual(color, vec3(0.0031308)));
+}
+
+vec3 tone_map_debug_hdr(vec3 color) {
+    color = max(color, vec3(0.0));
+    return color / (color + vec3(1.0));
+}
+
+vec3 visualize_scalar(float value) {
+    return vec3(clamp(value, 0.0, 1.0));
+}
+
+vec3 visualize_exponential(float value, float scale) {
+    float mapped = 1.0 - exp(-max(value, 0.0) * max(scale, 1.0e-6));
+    return vec3(clamp(mapped, 0.0, 1.0));
+}
+
+void main() {
+    ivec2 outSize = imageSize(output_image);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= outSize.x || p.y >= outSize.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(p) + vec2(0.5)) / vec2(max(outSize, ivec2(1)));
+    vec4 sampleValue = texture(sampler2D(source_texture, source_sampler), uv);
+
+    vec3 color;
+    if (params.mode == MODE_HDR_COLOR) {
+        color = tone_map_debug_hdr(sampleValue.rgb);
+    } else if (params.mode == MODE_LINEAR_COLOR) {
+        color = clamp(sampleValue.rgb, vec3(0.0), vec3(1.0));
+    } else if (params.mode == MODE_SCALAR_01 || params.mode == MODE_HARDWARE_DEPTH) {
+        color = visualize_scalar(sampleValue.r);
+    } else if (params.mode == MODE_LINEAR_DEPTH || params.mode == MODE_DISTANCE) {
+        color = visualize_exponential(sampleValue.r, params.scale);
+    } else if (params.mode == MODE_MOTION_PIXELS) {
+        vec2 encoded = vec2(0.5) + sampleValue.xy * max(params.scale, 1.0e-6);
+        color = vec3(clamp(encoded, vec2(0.0), vec2(1.0)), 0.5);
+    } else if (params.mode == MODE_DIRECTION) {
+        vec3 dir = sampleValue.xyz;
+        float len2 = dot(dir, dir);
+        dir = len2 > 1.0e-10 ? normalize(dir) : vec3(0.0, 0.0, 1.0);
+        color = dir * 0.5 + vec3(0.5);
+    } else {
+        color = clamp(sampleValue.rgb, vec3(0.0), vec3(1.0));
+    }
+
+    imageStore(output_image, p, vec4(linear_to_srgb(color), 1.0));
+}

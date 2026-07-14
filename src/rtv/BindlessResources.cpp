@@ -2,10 +2,12 @@
 
 #include "rtv/Buffer.h"
 #include "rtv/Check.h"
+#include "rtv/DescriptorWriteDiagnostics.h"
 #include "rtv/Image.h"
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -27,12 +29,43 @@ BindlessCapabilities queryBindlessCapabilities(VkPhysicalDevice physicalDevice) 
     props.pNext = &indexingProps;
     vkGetPhysicalDeviceProperties2(physicalDevice, &props);
 
+    const uint32_t maxPerStageSampledImages = indexingProps.maxPerStageDescriptorUpdateAfterBindSampledImages;
+    const uint32_t maxPerStageSamplers = indexingProps.maxPerStageDescriptorUpdateAfterBindSamplers;
+    const uint32_t maxDescriptorSetSampledImages = indexingProps.maxDescriptorSetUpdateAfterBindSampledImages;
+    const uint32_t maxDescriptorSetSamplers = indexingProps.maxDescriptorSetUpdateAfterBindSamplers;
+    const uint32_t maxUpdateAfterBindDescriptorsInAllPools = indexingProps.maxUpdateAfterBindDescriptorsInAllPools;
+    constexpr uint32_t kPerStagePassDescriptorReserve = 32;
+    // Keep room for the default pass-local DescriptorAllocator pool.
+    constexpr uint32_t kPassLocalPoolDescriptorReserve = 256u * (4u + 32u + 16u + 8u + 8u + 4u + 2u);
+    const uint32_t perStageSampledImageLimit = maxPerStageSampledImages > kPerStagePassDescriptorReserve
+        ? maxPerStageSampledImages - kPerStagePassDescriptorReserve
+        : 0;
+    const uint32_t perStageSamplerLimit = maxPerStageSamplers > kPerStagePassDescriptorReserve
+        ? maxPerStageSamplers - kPerStagePassDescriptorReserve
+        : 0;
+    const uint32_t heapPoolBudget = maxUpdateAfterBindDescriptorsInAllPools > kPassLocalPoolDescriptorReserve
+        ? maxUpdateAfterBindDescriptorsInAllPools - kPassLocalPoolDescriptorReserve
+        : 0;
+    const uint32_t perHeapPoolLimit = heapPoolBudget / kBindlessTextureHeapVersionCount;
+    const uint32_t maxCombinedImageSamplers = std::min({
+        perStageSampledImageLimit,
+        perStageSamplerLimit,
+        maxDescriptorSetSampledImages,
+        maxDescriptorSetSamplers,
+        perHeapPoolLimit,
+    });
+
     return {
         .descriptorIndexing = indexing.shaderSampledImageArrayNonUniformIndexing == VK_TRUE,
         .runtimeDescriptorArray = indexing.runtimeDescriptorArray == VK_TRUE,
         .partiallyBound = indexing.descriptorBindingPartiallyBound == VK_TRUE,
         .updateAfterBind = indexing.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE,
-        .maxSampledImages = indexingProps.maxDescriptorSetUpdateAfterBindSampledImages,
+        .maxSampledImages = maxCombinedImageSamplers,
+        .maxPerStageSampledImages = maxPerStageSampledImages,
+        .maxPerStageSamplers = maxPerStageSamplers,
+        .maxDescriptorSetSampledImages = maxDescriptorSetSampledImages,
+        .maxDescriptorSetSamplers = maxDescriptorSetSamplers,
+        .maxUpdateAfterBindDescriptorsInAllPools = maxUpdateAfterBindDescriptorsInAllPools,
     };
 }
 
@@ -48,7 +81,8 @@ uint32_t fullBindlessTextureCapacityOrThrow(const BindlessCapabilities& caps) {
     if (!supportsFullBindlessTextures(caps)) {
         throw std::runtime_error(
             "Full bindless textures require descriptor indexing, runtime descriptor arrays, "
-            "partially-bound sampled image descriptors, and sampled-image update-after-bind support");
+            "partially-bound sampled image descriptors, sampled-image update-after-bind support, "
+            "and non-zero combined image-sampler limits for the versioned heap");
     }
     return maxMaterialTextureSlots(caps);
 }
@@ -66,16 +100,23 @@ void BindlessTextureHeap::init(VkDevice device, const BindlessCapabilities& caps
         (void)fullBindlessTextureCapacityOrThrow(caps);
     }
     capacity_ = std::max(1u, capacity);
+    const uint32_t supportedCapacity = maxMaterialTextureSlots(caps);
+    if (capacity_ > supportedCapacity) {
+        throw std::runtime_error("Bindless texture heap capacity exceeds combined image-sampler descriptor limits");
+    }
     device_ = device;
+    descriptors_.resize(capacity_);
+    descriptorValid_.assign(capacity_, 0);
+    appliedGenerations_.fill(std::numeric_limits<uint64_t>::max());
 
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = capacity_;
+    poolSize.descriptorCount = capacity_ * kBindlessTextureHeapVersionCount;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = kBindlessTextureHeapVersionCount;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
     checkVk(vkCreateDescriptorPool(device_, &poolInfo, nullptr, &pool_), "vkCreateDescriptorPool(bindless texture heap)");
@@ -105,9 +146,10 @@ void BindlessTextureHeap::init(VkDevice device, const BindlessCapabilities& caps
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = pool_;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &layout_;
-    checkVk(vkAllocateDescriptorSets(device_, &allocInfo, &descriptorSet_), "vkAllocateDescriptorSets(bindless texture heap)");
+    const std::array<VkDescriptorSetLayout, kBindlessTextureHeapVersionCount> layouts{layout_, layout_, layout_};
+    allocInfo.descriptorSetCount = kBindlessTextureHeapVersionCount;
+    allocInfo.pSetLayouts = layouts.data();
+    checkVk(vkAllocateDescriptorSets(device_, &allocInfo, descriptorSets_.data()), "vkAllocateDescriptorSets(bindless texture heap)");
 }
 
 void BindlessTextureHeap::destroy() {
@@ -122,47 +164,104 @@ void BindlessTextureHeap::destroy() {
     device_ = VK_NULL_HANDLE;
     pool_ = VK_NULL_HANDLE;
     layout_ = VK_NULL_HANDLE;
-    descriptorSet_ = VK_NULL_HANDLE;
+    descriptorSets_.fill(VK_NULL_HANDLE);
+    appliedGenerations_.fill(0);
+    descriptors_.clear();
+    descriptorValid_.clear();
+    descriptorGeneration_ = 0;
+    currentFrameSlot_ = 0;
     capacity_ = 0;
     descriptorCount_ = 0;
     patchCount_ = 0;
+    frameSetSelected_ = false;
 }
 
 void BindlessTextureHeap::updateAll(const std::vector<VkDescriptorImageInfo>& descriptors) {
-    if (descriptorSet_ == VK_NULL_HANDLE || descriptors.empty()) {
+    if (descriptorSets_.front() == VK_NULL_HANDLE) {
         return;
     }
     if (descriptors.size() > capacity_) {
         throw std::runtime_error("Bindless texture heap descriptor update exceeds heap capacity");
     }
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptorSet_;
-    write.dstBinding = 0;
-    write.dstArrayElement = 0;
-    write.descriptorCount = static_cast<uint32_t>(descriptors.size());
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = descriptors.data();
-    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    std::fill(descriptorValid_.begin(), descriptorValid_.end(), 0);
+    std::copy(descriptors.begin(), descriptors.end(), descriptors_.begin());
+    std::fill_n(descriptorValid_.begin(), descriptors.size(), 1);
+    ++descriptorGeneration_;
     descriptorCount_ = static_cast<uint32_t>(descriptors.size());
     ++patchCount_;
 }
 
 void BindlessTextureHeap::patch(uint32_t slot, const VkDescriptorImageInfo& descriptor) {
-    if (descriptorSet_ == VK_NULL_HANDLE || slot >= capacity_) {
+    if (descriptorSets_.front() == VK_NULL_HANDLE || slot >= capacity_) {
         return;
     }
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptorSet_;
-    write.dstBinding = 0;
-    write.dstArrayElement = slot;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &descriptor;
-    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    descriptors_[slot] = descriptor;
+    descriptorValid_[slot] = 1;
+    ++descriptorGeneration_;
     descriptorCount_ = std::max(descriptorCount_, slot + 1u);
     ++patchCount_;
+}
+
+void BindlessTextureHeap::beginFrame(uint32_t frameIndex) {
+    if (descriptorSets_.front() == VK_NULL_HANDLE) {
+        throw std::runtime_error("Bindless texture heap is not initialized");
+    }
+    // CommandSystem waits this frame slot's fence before the renderer selects it.
+    currentFrameSlot_ = frameIndex % kBindlessTextureHeapVersionCount;
+    frameSetSelected_ = true;
+    if (appliedGenerations_[currentFrameSlot_] == descriptorGeneration_) {
+        return;
+    }
+
+    VkDescriptorSet descriptorSet = descriptorSets_[currentFrameSlot_];
+    uint32_t first = 0;
+    while (first < capacity_) {
+        while (first < capacity_ && descriptorValid_[first] == 0) {
+            ++first;
+        }
+        if (first == capacity_) {
+            break;
+        }
+        uint32_t end = first + 1;
+        while (end < capacity_ && descriptorValid_[end] != 0) {
+            ++end;
+        }
+
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = descriptorSet;
+        write.dstBinding = 0;
+        write.dstArrayElement = first;
+        write.descriptorCount = end - first;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = descriptors_.data() + first;
+        recordDescriptorWriteUpdate({{
+            .descriptorSet = descriptorSet,
+            .descriptorSetLayout = layout_,
+            .binding = 0,
+            .arrayElement = first,
+            .count = write.descriptorCount,
+            .type = write.descriptorType,
+            .kind = "image_array",
+            .source = "BindlessTextureHeap::beginFrame",
+            .owner = {
+                .owner = "BindlessTextureHeap",
+                .pass = "bindless_texture_heap",
+                .setName = "bindless_texture_heap_set_2",
+                .setIndex = 2,
+            },
+        }});
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+        first = end;
+    }
+    appliedGenerations_[currentFrameSlot_] = descriptorGeneration_;
+}
+
+VkDescriptorSet BindlessTextureHeap::descriptorSet() const {
+    if (!frameSetSelected_) {
+        throw std::runtime_error("Bindless texture heap descriptor set requested before beginFrame");
+    }
+    return descriptorSets_[currentFrameSlot_];
 }
 
 BindlessTextureHeapStats BindlessTextureHeap::stats() const {

@@ -29,7 +29,8 @@ public:
         PathTracerRenderer& renderer,
         RendererDebugView view,
         const std::filesystem::path& outputPath,
-        uint32_t warmupFrames = 4);
+        uint32_t warmupFrames = 4,
+        uint32_t maxOutputDimension = 0);
 
     void writeExportManifest(
         const std::filesystem::path& dir,

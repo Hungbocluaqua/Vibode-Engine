@@ -56,6 +56,18 @@ float prod_unpack_target(ProdRestirGiReservoir r) { return max(r.selectedIntegra
 float prod_unpack_source_pdf(ProdRestirGiReservoir r) { return max(r.suffixRadianceSourcePdf.w, 0.0); }
 uint prod_unpack_version_hash(ProdRestirGiReservoir r) { return floatBitsToUint(r.reservoirData.w); }
 
+bool prod_contract_finite(float v) {
+    return !isnan(v) && !isinf(v);
+}
+
+bool prod_contract_invalid_target_pdf(ProdRestirGiReservoir r) {
+    return !prod_contract_finite(r.selectedIntegrandTarget.w) || r.selectedIntegrandTarget.w <= 0.0;
+}
+
+bool prod_contract_invalid_source_pdf(ProdRestirGiReservoir r) {
+    return !prod_contract_finite(r.suffixRadianceSourcePdf.w) || r.suffixRadianceSourcePdf.w <= 0.0;
+}
+
 void prod_set_meta(inout ProdRestirGiReservoir r, uint age, uint flags, uint pathClass, float confidence) {
     r.reservoirData.z = uintBitsToFloat(prod_pack_meta(age, flags, pathClass, confidence));
 }

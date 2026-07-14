@@ -15,37 +15,47 @@
 namespace rtv {
 
 namespace EditorUiMetric {
-inline constexpr float panelPaddingX = 5.0f;
-inline constexpr float panelPaddingY = 4.0f;
-inline constexpr float rowPaddingX = 5.0f;
-inline constexpr float rowPaddingY = 2.0f;
-inline constexpr float compactButtonRounding = 1.0f;
+inline constexpr float panelPaddingX = 9.0f;
+inline constexpr float panelPaddingY = 8.0f;
+inline constexpr float rowPaddingX = 6.0f;
+inline constexpr float rowPaddingY = 4.0f;
+inline constexpr float compactButtonRounding = 4.0f;
+inline constexpr float mainToolbarHeight = 42.0f;
+inline constexpr float statusBarHeight = 24.0f;
+inline constexpr float toolbarButtonHeight = 30.0f;
+inline constexpr float toolbarIconButtonSize = 30.0f;
+inline constexpr float toolbarGroupGap = 10.0f;
+inline constexpr float statusPillHeight = 26.0f;
+inline constexpr float statusPillPaddingX = 10.0f;
+inline constexpr float panelHeaderHeight = 28.0f;
+inline constexpr float propertyRowHeight = 26.0f;
 inline constexpr float sidebarWidth = 204.0f;
 inline constexpr float detailsWidth = 284.0f;
-inline constexpr float cardRounding = 4.0f;
+inline constexpr float cardRounding = 5.0f;
 inline constexpr float cardPadding = 8.0f;
 inline constexpr float projectCardWidth = 214.0f;
 inline constexpr float projectCardHeight = 128.0f;
 inline constexpr float projectTemplateCardWidth = 205.0f;
 inline constexpr float projectCardPreviewHeight = 58.0f;
-inline constexpr float contentGridCellWidth = 98.0f;
-inline constexpr float contentGridThumbWidth = 78.0f;
-inline constexpr float contentGridThumbHeight = 46.0f;
+inline constexpr float contentGridCellWidth = 132.0f;
+inline constexpr float contentGridCellHeight = 136.0f;
+inline constexpr float contentGridThumbWidth = 112.0f;
+inline constexpr float contentGridThumbHeight = 82.0f;
 inline constexpr float assetPreviewMaxWidth = 244.0f;
 inline constexpr float assetPreviewHeight = 104.0f;
-inline constexpr float contentTreePanelRatio = 0.32f;
+inline constexpr float contentTreePanelRatio = 0.22f;
 inline constexpr float contentDetailsPanelRatio = 0.33f;
-inline constexpr float contentTreeMinWidth = 220.0f;
-inline constexpr float contentTreeMaxWidth = 420.0f;
+inline constexpr float contentTreeMinWidth = 190.0f;
+inline constexpr float contentTreeMaxWidth = 280.0f;
 inline constexpr float contentDetailsMinWidth = 260.0f;
 inline constexpr float contentDetailsMaxWidth = 420.0f;
 inline constexpr float contentListMinWidth = 220.0f;
 inline constexpr float progressColumnWidth = 128.0f;
-inline constexpr float hierarchyRowHeight = 30.0f;
+inline constexpr float hierarchyRowHeight = 26.0f;
 inline constexpr float hierarchyIndentSpacing = 18.0f;
 inline constexpr float hierarchyIconSize = 16.0f;
 inline constexpr float hierarchyRowRightFadeWidth = 58.0f;
-inline constexpr float contentRowHeight = 18.0f;
+inline constexpr float contentRowHeight = 24.0f;
 inline constexpr float timelineTrackRowHeight = 24.0f;
 inline constexpr float timelineFrameWidth = 96.0f;
 inline constexpr float timelineRangeFrameWidth = 82.0f;
@@ -71,16 +81,17 @@ inline constexpr float timelineKeyEditorFrameWidth = 74.0f;
 inline constexpr float timelineKeyEditorActionWidth = 78.0f;
 inline constexpr float timelineKeyDeleteButtonWidth = 22.0f;
 inline constexpr float timelineKeyDeleteButtonHeight = 20.0f;
-inline constexpr float inspectorRowHeight = 24.0f;
+inline constexpr float inspectorRowHeight = 26.0f;
 inline constexpr float inspectorLabelWidth = 132.0f;
-inline constexpr float inspectorComponentHeaderHeight = 38.0f;
+inline constexpr float inspectorComponentHeaderHeight = 34.0f;
 inline constexpr float inspectorComponentHeaderIconSize = 18.0f;
 inline constexpr float inspectorComponentActionSize = 22.0f;
 inline constexpr float viewportOverlayPaddingX = 5.0f;
 inline constexpr float viewportOverlayPaddingY = 2.0f;
 inline constexpr float viewportOverlayRounding = 2.0f;
-inline constexpr float dockRightPanelRatio = 0.300f;
-inline constexpr float dockBottomPanelRatio = 0.405f;
+inline constexpr float dockLeftPanelRatio = 0.170f;
+inline constexpr float dockRightPanelRatio = 0.250f;
+inline constexpr float dockBottomPanelRatio = 0.280f;
 inline constexpr float dockRightInspectorRatio = 0.485f;
 inline constexpr float dockSplitterThickness = 5.0f;
 inline constexpr float dockTabRounding = 2.0f;
@@ -107,9 +118,9 @@ inline constexpr float sceneTabCloseIconPaddingY = 2.0f;
 } // namespace EditorUiMetric
 
 namespace EditorDockWindowTitle {
-inline constexpr const char* Scene = "        Scene        ###Scene";
+inline constexpr const char* Scene = "      Viewport      ###Scene";
 inline constexpr const char* Hierarchy = "        Hierarchy        ###Hierarchy";
-inline constexpr const char* RenderSettings = "        Render World Settings        ###Render Settings";
+inline constexpr const char* RenderSettings = "        Render Settings        ###Render Settings";
 inline constexpr const char* Inspector = "        Inspector        ###Inspector";
 inline constexpr const char* MaterialEditor = "        Material Editor        ###Material Editor";
 inline constexpr const char* Content = "        Content        ###Content";
@@ -200,6 +211,19 @@ inline ImFont*& editorTablerIconFontStorage() {
     return font;
 }
 
+inline ImFont*& editorHeadingFontStorage() {
+    static ImFont* font = nullptr;
+    return font;
+}
+
+inline void editorSetHeadingFont(ImFont* font) {
+    editorHeadingFontStorage() = font;
+}
+
+inline ImFont* editorHeadingFont() {
+    return editorHeadingFontStorage();
+}
+
 inline void editorSetTablerIconFont(ImFont* font) {
     editorTablerIconFontStorage() = font;
 }
@@ -229,31 +253,31 @@ inline ImVec4 editorRowBandColor(bool alternate = false) {
 }
 
 inline ImVec4 editorWindowBgColor() {
-    return ImVec4(0.105f, 0.110f, 0.118f, 1.0f);
+    return ImVec4(0.063f, 0.078f, 0.094f, 1.0f);
 }
 
 inline ImVec4 editorChildBgColor() {
-    return ImVec4(0.128f, 0.132f, 0.140f, 1.0f);
+    return ImVec4(0.082f, 0.102f, 0.125f, 1.0f);
 }
 
 inline ImVec4 editorPopupBgColor() {
-    return ImVec4(0.105f, 0.110f, 0.118f, 1.0f);
+    return ImVec4(0.078f, 0.094f, 0.114f, 1.0f);
 }
 
 inline ImVec4 editorBorderColor() {
-    return ImVec4(0.215f, 0.225f, 0.245f, 0.92f);
+    return ImVec4(0.165f, 0.196f, 0.231f, 0.95f);
 }
 
 inline ImVec4 editorFrameBgColor() {
-    return ImVec4(0.150f, 0.155f, 0.165f, 1.0f);
+    return ImVec4(0.102f, 0.125f, 0.153f, 1.0f);
 }
 
 inline ImVec4 editorFrameBgHoveredColor() {
-    return ImVec4(0.185f, 0.195f, 0.215f, 1.0f);
+    return ImVec4(0.132f, 0.165f, 0.204f, 1.0f);
 }
 
 inline ImVec4 editorFrameBgActiveColor() {
-    return ImVec4(0.205f, 0.225f, 0.260f, 1.0f);
+    return ImVec4(0.145f, 0.190f, 0.245f, 1.0f);
 }
 
 inline ImVec4 editorTitleBgColor(bool active) {
@@ -261,7 +285,31 @@ inline ImVec4 editorTitleBgColor(bool active) {
 }
 
 inline ImVec4 editorMenuBarBgColor() {
-    return ImVec4(0.070f, 0.074f, 0.082f, 1.0f);
+    return ImVec4(0.045f, 0.055f, 0.067f, 1.0f);
+}
+
+inline ImVec4 editorToolbarBgColor() {
+    return ImVec4(0.061f, 0.075f, 0.091f, 1.0f);
+}
+
+inline ImVec4 editorToolbarBorderColor() {
+    return ImVec4(0.151f, 0.184f, 0.220f, 1.0f);
+}
+
+inline ImVec4 editorPanelHeaderBgColor() {
+    return ImVec4(0.095f, 0.108f, 0.126f, 1.0f);
+}
+
+inline ImVec4 editorCardBgColor() {
+    return ImVec4(0.075f, 0.090f, 0.110f, 1.0f);
+}
+
+inline ImVec4 editorAccentColor() {
+    return ImVec4(0.184f, 0.494f, 0.859f, 1.0f);
+}
+
+inline ImVec4 editorSuccessColor() {
+    return ImVec4(0.212f, 0.773f, 0.420f, 1.0f);
 }
 
 inline ImVec4 editorTabColor(bool active, bool hovered = false) {
@@ -961,7 +1009,11 @@ inline void editorDrawIconGlyph(EditorGlyphIcon icon, ImVec2 min, ImVec2 max, Im
 }
 
 inline ImVec2 editorIconButtonSize() {
-    return ImVec2(24.0f, 22.0f);
+    return ImVec2(28.0f, 26.0f);
+}
+
+inline ImVec2 editorToolbarIconButtonSize() {
+    return ImVec2(EditorUiMetric::toolbarIconButtonSize, EditorUiMetric::toolbarButtonHeight);
 }
 
 inline float editorIconTextButtonWidth(const char* label) {
@@ -1003,9 +1055,109 @@ inline bool editorIconTextButton(const char* id, EditorGlyphIcon icon, const cha
     return pressed;
 }
 
+inline bool editorToolbarIconButton(const char* id, EditorGlyphIcon icon, bool active = false) {
+    return editorIconButton(id, icon, active, editorToolbarIconButtonSize());
+}
+
+inline ImVec2 editorToolbarTextButtonSize(const char* label) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    return ImVec2(EditorUiMetric::iconTextButtonTextOffsetX + textSize.x + style.FramePadding.x + 4.0f, EditorUiMetric::toolbarButtonHeight);
+}
+
+inline bool editorToolbarTextButton(const char* id, EditorGlyphIcon icon, const char* label, bool active = false) {
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    const ImVec2 size = editorToolbarTextButtonSize(label);
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 bg = active
+        ? ImGui::GetColorU32(ImVec4(0.105f, 0.255f, 0.430f, 1.0f))
+        : ImGui::GetColorU32(hovered ? editorButtonColor(false, true) : ImVec4(0.090f, 0.103f, 0.120f, 1.0f));
+    dl->AddRectFilled(min, max, bg, EditorUiMetric::compactButtonRounding);
+    dl->AddRect(min, max, ImGui::GetColorU32(active ? editorAccentColor() : editorToolbarBorderColor()), EditorUiMetric::compactButtonRounding);
+    const ImU32 color = ImGui::GetColorU32(active ? ImVec4(0.88f, 0.94f, 1.0f, 1.0f) : editorIconTint(false));
+    editorDrawIconGlyph(icon, ImVec2(min.x + 7.0f, min.y + 5.0f), ImVec2(min.x + 23.0f, max.y - 5.0f), color);
+    dl->AddText(ImVec2(min.x + EditorUiMetric::iconTextButtonTextOffsetX, min.y + (size.y - textSize.y) * 0.5f), color, label);
+    return pressed;
+}
+
+inline ImVec2 editorStatusPillSize(const char* label) {
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    return ImVec2(textSize.x + EditorUiMetric::statusPillPaddingX * 2.0f + 18.0f, EditorUiMetric::statusPillHeight);
+}
+
+inline void editorStatusPill(const char* label, bool active = false, EditorGlyphIcon icon = EditorGlyphIcon::Stats) {
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    const ImVec2 size = editorStatusPillSize(label);
+    ImGui::InvisibleButton(label, size);
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 bg = ImGui::GetColorU32(active ? ImVec4(0.070f, 0.170f, 0.110f, 1.0f) : ImVec4(0.078f, 0.088f, 0.104f, 1.0f));
+    dl->AddRectFilled(min, max, bg, EditorUiMetric::compactButtonRounding);
+    dl->AddRect(min, max, ImGui::GetColorU32(active ? ImVec4(0.190f, 0.420f, 0.250f, 1.0f) : editorToolbarBorderColor()), EditorUiMetric::compactButtonRounding);
+    const ImU32 iconColor = ImGui::GetColorU32(active ? editorSuccessColor() : editorIconTint(false));
+    editorDrawIconGlyph(icon, ImVec2(min.x + 8.0f, min.y + 5.0f), ImVec2(min.x + 22.0f, max.y - 5.0f), iconColor);
+    dl->AddText(ImVec2(min.x + 28.0f, min.y + (size.y - textSize.y) * 0.5f), ImGui::GetColorU32(ImVec4(0.82f, 0.86f, 0.91f, 1.0f)), label);
+}
+
+inline bool editorPanelSectionHeader(const char* label, EditorGlyphIcon icon, bool open = true) {
+    if (editorHeadingFont() != nullptr) {
+        ImGui::PushFont(editorHeadingFont());
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 5.0f));
+    ImGui::PushStyleColor(ImGuiCol_Header, editorPanelHeaderBgColor());
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, editorHeaderColor(false, true));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, editorHeaderColor(true));
+    const std::string id = editorGlyphLabel(label);
+    const ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth | (open ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+    const bool result = ImGui::CollapsingHeader(id.c_str(), flags);
+    if (ImGui::IsItemVisible()) {
+        const ImVec2 min = ImGui::GetItemRectMin();
+        const ImVec2 max = ImGui::GetItemRectMax();
+        const float iconSize = 15.0f;
+        editorDrawIconGlyph(icon, ImVec2(min.x + 8.0f, min.y + (max.y - min.y - iconSize) * 0.5f), ImVec2(min.x + 8.0f + iconSize, min.y + (max.y - min.y + iconSize) * 0.5f), ImGui::GetColorU32(editorIconTint(result)));
+    }
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
+    if (editorHeadingFont() != nullptr) {
+        ImGui::PopFont();
+    }
+    return result;
+}
+
+inline bool editorBeginPropertyTable(const char* id, float labelRatio = 0.42f) {
+    if (!ImGui::BeginTable(id, 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
+        return false;
+    }
+    ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, labelRatio);
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f - labelRatio);
+    return true;
+}
+
+inline void editorPropertyTableRow(const char* label, const char* tooltip = nullptr) {
+    ImGui::TableNextRow(ImGuiTableRowFlags_None, EditorUiMetric::propertyRowHeight);
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("%s", label);
+    if (tooltip != nullptr && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip("%s", tooltip);
+    }
+    ImGui::TableSetColumnIndex(1);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+}
+
+inline ImVec2 editorIconTextReadoutSize(const char* label) {
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    return ImVec2(18.0f + EditorUiMetric::iconTextReadoutTextGap + textSize.x, editorIconButtonSize().y);
+}
+
 inline void editorIconTextReadout(EditorGlyphIcon icon, const char* label, ImU32 color) {
     const ImVec2 textSize = ImGui::CalcTextSize(label);
-    const ImVec2 size(18.0f + EditorUiMetric::iconTextReadoutTextGap + textSize.x, editorIconButtonSize().y);
+    const ImVec2 size = editorIconTextReadoutSize(label);
     ImGui::InvisibleButton("##iconTextReadout", size);
     const ImVec2 min = ImGui::GetItemRectMin();
     ImDrawList* dl = ImGui::GetWindowDrawList();

@@ -53,14 +53,19 @@ const char* restirDiModeName(RestirDiMode mode) {
     return "off";
 }
 
-RestirDiMode parseRestirDiMode(std::string_view value) {
+bool tryParseRestirDiMode(std::string_view value, RestirDiMode& out) {
     const std::string key = normalized(value);
-    if (key == "off" || key == "disabled" || key == "none") { return RestirDiMode::Off; }
-    if (key == "legacy" || key == "old" || key == "current") { return RestirDiMode::Legacy; }
-    if (key == "production" || key == "prod" || key == "new" || key == "default") { return RestirDiMode::Production; }
-    if (key == "reference" || key == "validation" || key == "referencevalidation" || key == "ref") { return RestirDiMode::ReferenceValidation; }
-    if (key == "hybrid" || key == "hybridcompare" || key == "compare") { return RestirDiMode::HybridCompare; }
-    return RestirDiMode::Off;
+    if (key == "off" || key == "disabled" || key == "none") { out = RestirDiMode::Off; return true; }
+    if (key == "legacy" || key == "old" || key == "current") { out = RestirDiMode::Legacy; return true; }
+    if (key == "production" || key == "prod" || key == "new" || key == "default") { out = RestirDiMode::Production; return true; }
+    if (key == "reference" || key == "validation" || key == "referencevalidation" || key == "ref") { out = RestirDiMode::ReferenceValidation; return true; }
+    if (key == "hybrid" || key == "hybridcompare" || key == "compare") { out = RestirDiMode::HybridCompare; return true; }
+    return false;
+}
+
+RestirDiMode parseRestirDiMode(std::string_view value) {
+    RestirDiMode mode = RestirDiMode::Off;
+    return tryParseRestirDiMode(value, mode) ? mode : RestirDiMode::Off;
 }
 
 const char* restirDiReservoirLayoutName(RestirDiReservoirLayout layout) {
@@ -90,14 +95,19 @@ const char* restirGiModeName(RestirGiMode mode) {
     return "off";
 }
 
-RestirGiMode parseRestirGiMode(std::string_view value) {
+bool tryParseRestirGiMode(std::string_view value, RestirGiMode& out) {
     const std::string key = normalized(value);
-    if (key == "off" || key == "false" || key == "0" || key == "disabled" || key == "none") { return RestirGiMode::Off; }
-    if (key == "legacy" || key == "legacycache" || key == "old" || key == "current") { return RestirGiMode::LegacyCache; }
+    if (key == "off" || key == "false" || key == "0" || key == "disabled" || key == "none") { out = RestirGiMode::Off; return true; }
+    if (key == "legacy" || key == "legacycache" || key == "old" || key == "current") { out = RestirGiMode::LegacyCache; return true; }
     if (key == "on" || key == "true" || key == "1" ||
-        key == "production" || key == "prod" || key == "new" || key == "default") { return RestirGiMode::Production; }
-    if (key == "reference" || key == "validation" || key == "referencevalidation" || key == "ref") { return RestirGiMode::ReferenceValidation; }
-    return RestirGiMode::LegacyCache;
+        key == "production" || key == "prod" || key == "new" || key == "default") { out = RestirGiMode::Production; return true; }
+    if (key == "reference" || key == "validation" || key == "referencevalidation" || key == "ref") { out = RestirGiMode::ReferenceValidation; return true; }
+    return false;
+}
+
+RestirGiMode parseRestirGiMode(std::string_view value) {
+    RestirGiMode mode = RestirGiMode::LegacyCache;
+    return tryParseRestirGiMode(value, mode) ? mode : RestirGiMode::LegacyCache;
 }
 
 const char* restirGiReservoirLayoutName(RestirGiReservoirLayout layout) {
@@ -407,6 +417,7 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "restirdireceiver" || key == "restirdireceiverposition" || key == "direceiver") { return RendererDebugView::RestirDiReceiverPosition; }
     if (key == "restirdinormal" || key == "restirdireceivernormal" || key == "dinormal") { return RendererDebugView::RestirDiReceiverNormal; }
     if (key == "restirdilightversion" || key == "dilightversion") { return RendererDebugView::RestirDiLightVersion; }
+    if (key == "restirdilightmapstatus" || key == "dilightmapstatus" || key == "restirdilightmapping" || key == "dilightmapping") { return RendererDebugView::RestirDiLightMapStatus; }
     if (key == "restirdiweightsum" || key == "diweightsum" || key == "restirdiw") { return RendererDebugView::RestirDiWeightSum; }
     if (key == "restirdim" || key == "dim" || key == "restirdisamplecount") { return RendererDebugView::RestirDiM; }
     if (key == "restirdilightclass" || key == "dilightclass" || key == "restirdilighttype" || key == "dilighttype") { return RendererDebugView::RestirDiLightClass; }
@@ -463,6 +474,46 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     if (key == "denoiserbasedisocclusion" || key == "basedisocclusion") { return RendererDebugView::DenoiserBaseDisocclusion; }
     if (key == "denoiserspecularchannelconfidence" || key == "specularchannelconfidence" || key == "specularconfidence") { return RendererDebugView::DenoiserSpecularChannelConfidence; }
     if (key == "denoiserspecularhistoryweight" || key == "specularhistoryweight") { return RendererDebugView::DenoiserSpecularHistoryWeight; }
+    if (key == "nrdvalidation" || key == "nrdvalidationoutput") { return RendererDebugView::NrdValidation; }
+    if (key == "nrddiffuseconfidence" || key == "nrddiffconfidence" || key == "nrddiffusehistoryconfidence") {
+        return RendererDebugView::NrdDiffuseConfidence;
+    }
+    if (key == "nrdspecularconfidence" || key == "nrdspecconfidence" || key == "nrdspecularhistoryconfidence") {
+        return RendererDebugView::NrdSpecularConfidence;
+    }
+    if (key == "nrdrawconfidencegradient" || key == "nrdrawgradient" || key == "nrdconfidencegradient") {
+        return RendererDebugView::NrdRawConfidenceGradient;
+    }
+    if (key == "nrdfilteredconfidencegradient" || key == "nrdfilteredgradient" || key == "nrdconfidencegradientfiltered") {
+        return RendererDebugView::NrdFilteredConfidenceGradient;
+    }
+    if (key == "nrdconfidencehistory" || key == "nrdhistoryconfidence" || key == "nrdhistory" ||
+        key == "nrdconfidencehistoryvalidity" || key == "nrdsourcepixelhistory") {
+        return RendererDebugView::NrdConfidenceHistory;
+    }
+    if (key == "psractivemask" || key == "psractive" || key == "primarysurfacereplacement") { return RendererDebugView::PsrActiveMask; }
+    if (key == "psrdepth" || key == "psrviewz" || key == "replacementdepth") { return RendererDebugView::PsrDepth; }
+    if (key == "psrmotion" || key == "psrvelocity" || key == "replacementmotion") { return RendererDebugView::PsrMotion; }
+    if (key == "psrnormalroughness" || key == "psrnormal" || key == "replacementnormal") { return RendererDebugView::PsrNormalRoughness; }
+    if (key == "psrhitdistance" || key == "replacementhitdistance") { return RendererDebugView::PsrHitDistance; }
+    if (key == "psralbedof0" || key == "psralbedo" || key == "psrf0") { return RendererDebugView::PsrAlbedoF0; }
+    if (key == "psrraydirection" || key == "psrdirection" || key == "reflectionraydirection") { return RendererDebugView::PsrRayDirection; }
+    if (key == "dlssdepth" || key == "dlssguidedepth") { return RendererDebugView::DlssDepth; }
+    if (key == "dlssmotion" || key == "dlssmotionvectors" || key == "dlssguidevelocity") { return RendererDebugView::DlssMotionVectors; }
+    if (key == "dlssinput" || key == "dlssinputcolor" || key == "dlssscalinginputcolor") { return RendererDebugView::DlssInputColor; }
+    if (key == "dlssoutput" || key == "dlssoutputcolor" || key == "dlssscalingoutputcolor") { return RendererDebugView::DlssOutputColor; }
+    if (key == "dlssrrdiffusealbedo" || key == "rrdiffusealbedo") { return RendererDebugView::DlssRrDiffuseAlbedo; }
+    if (key == "dlssrrspecularalbedo" || key == "rrspecularalbedo" || key == "dlssrrspecularf0") { return RendererDebugView::DlssRrSpecularAlbedo; }
+    if (key == "dlssrrnormals" || key == "dlssrrnormal" || key == "rrnormals") { return RendererDebugView::DlssRrNormals; }
+    if (key == "dlssrrroughness" || key == "rrroughness") { return RendererDebugView::DlssRrRoughness; }
+    if (key == "dlssrrdiffusehitdistance" || key == "rrdiffusehitdistance") { return RendererDebugView::DlssRrDiffuseHitDistance; }
+    if (key == "dlssrrspecularhitdistance" || key == "rrspecularhitdistance") { return RendererDebugView::DlssRrSpecularHitDistance; }
+    if (key == "dlssrrreflectedalbedo" || key == "rrreflectedalbedo") { return RendererDebugView::DlssRrReflectedAlbedo; }
+    if (key == "dlssrrdisocclusion" || key == "dlssrrdisocclusionmask" || key == "rrdisocclusion") { return RendererDebugView::DlssRrDisocclusionMask; }
+    if (key == "dlssrrdiffuseraydirection" || key == "rrdiffuseraydirection") { return RendererDebugView::DlssRrDiffuseRayDirection; }
+    if (key == "dlssrrspecularraydirection" || key == "rrspecularraydirection") { return RendererDebugView::DlssRrSpecularRayDirection; }
+    if (key == "dlssrrdiffuseraydirectionhitdistance" || key == "rrdiffuseraydirectionhitdistance") { return RendererDebugView::DlssRrDiffuseRayDirectionHitDistance; }
+    if (key == "dlssrrspecularraydirectionhitdistance" || key == "rrspecularraydirectionhitdistance") { return RendererDebugView::DlssRrSpecularRayDirectionHitDistance; }
     if (key == "directsample" || key == "directsampletype" || key == "sampletype") { return RendererDebugView::DirectSampleType; }
     if (key == "albedo" || key == "basecolor" || key == "basecolour") { return RendererDebugView::Albedo; }
     if (key == "occlusion" || key == "ao" || key == "materialocclusion" || key == "aotexture") {
@@ -550,6 +601,24 @@ RendererDebugView parseRendererDebugView(std::string_view value) {
     }
     if (key == "restirgipathclass" || key == "gipathclass" || key == "restirgiclass" || key == "giclass") {
         return RendererDebugView::RestirGiPathClass;
+    }
+    if (key == "restirgitarget" || key == "gitarget" || key == "restirgitargetfunction") {
+        return RendererDebugView::RestirGiTarget;
+    }
+    if (key == "restirgisourcepdf" || key == "gisourcepdf" || key == "restirgipdf") {
+        return RendererDebugView::RestirGiSourcePdf;
+    }
+    if (key == "restirgiweightsum" || key == "giweightsum" || key == "restirgiw") {
+        return RendererDebugView::RestirGiWeightSum;
+    }
+    if (key == "restirgim" || key == "gim" || key == "restirgisamplecount") {
+        return RendererDebugView::RestirGiM;
+    }
+    if (key == "restirgiconfidence" || key == "giconfidence") {
+        return RendererDebugView::RestirGiConfidence;
+    }
+    if (key == "restirgivisibility" || key == "restirgivis" || key == "givisibility") {
+        return RendererDebugView::RestirGiVisibility;
     }
     if (key == "adaptivedensity" || key == "adaptivedensitymap" || key == "samplingdensity" || key == "densitymap") {
         return RendererDebugView::AdaptiveDensityMap;
@@ -760,6 +829,35 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::DenoiserBaseDisocclusion: return "denoiser-base-disocclusion";
     case RendererDebugView::DenoiserSpecularChannelConfidence: return "denoiser-specular-channel-confidence";
     case RendererDebugView::DenoiserSpecularHistoryWeight: return "denoiser-specular-history-weight";
+    case RendererDebugView::NrdValidation: return "nrd-validation";
+    case RendererDebugView::NrdDiffuseConfidence: return "nrd-diffuse-confidence";
+    case RendererDebugView::NrdSpecularConfidence: return "nrd-specular-confidence";
+    case RendererDebugView::NrdRawConfidenceGradient: return "nrd-raw-confidence-gradient";
+    case RendererDebugView::NrdFilteredConfidenceGradient: return "nrd-filtered-confidence-gradient";
+    case RendererDebugView::NrdConfidenceHistory: return "nrd-confidence-history";
+    case RendererDebugView::PsrActiveMask: return "psr-active-mask";
+    case RendererDebugView::PsrDepth: return "psr-depth";
+    case RendererDebugView::PsrMotion: return "psr-motion";
+    case RendererDebugView::PsrNormalRoughness: return "psr-normal-roughness";
+    case RendererDebugView::PsrHitDistance: return "psr-hit-distance";
+    case RendererDebugView::PsrAlbedoF0: return "psr-albedo-f0";
+    case RendererDebugView::PsrRayDirection: return "psr-ray-direction";
+    case RendererDebugView::DlssDepth: return "dlss-depth";
+    case RendererDebugView::DlssMotionVectors: return "dlss-motion-vectors";
+    case RendererDebugView::DlssInputColor: return "dlss-input-color";
+    case RendererDebugView::DlssOutputColor: return "dlss-output-color";
+    case RendererDebugView::DlssRrDiffuseAlbedo: return "dlss-rr-diffuse-albedo";
+    case RendererDebugView::DlssRrSpecularAlbedo: return "dlss-rr-specular-albedo";
+    case RendererDebugView::DlssRrNormals: return "dlss-rr-normals";
+    case RendererDebugView::DlssRrRoughness: return "dlss-rr-roughness";
+    case RendererDebugView::DlssRrDiffuseHitDistance: return "dlss-rr-diffuse-hit-distance";
+    case RendererDebugView::DlssRrSpecularHitDistance: return "dlss-rr-specular-hit-distance";
+    case RendererDebugView::DlssRrReflectedAlbedo: return "dlss-rr-reflected-albedo";
+    case RendererDebugView::DlssRrDisocclusionMask: return "dlss-rr-disocclusion-mask";
+    case RendererDebugView::DlssRrDiffuseRayDirection: return "dlss-rr-diffuse-ray-direction";
+    case RendererDebugView::DlssRrSpecularRayDirection: return "dlss-rr-specular-ray-direction";
+    case RendererDebugView::DlssRrDiffuseRayDirectionHitDistance: return "dlss-rr-diffuse-ray-direction-hit-distance";
+    case RendererDebugView::DlssRrSpecularRayDirectionHitDistance: return "dlss-rr-specular-ray-direction-hit-distance";
     case RendererDebugView::RestirPairwiseMis: return "restir-pairwise-mis";
     case RendererDebugView::RestirGiValidity: return "restir-gi-validity";
     case RendererDebugView::RestirGiAge: return "restir-gi-age";
@@ -771,6 +869,12 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirGiHitDistance: return "restir-gi-hit-distance";
     case RendererDebugView::RestirGiGrid: return "restir-gi-grid";
     case RendererDebugView::RestirGiPathClass: return "restir-gi-path-class";
+    case RendererDebugView::RestirGiTarget: return "restir-gi-target";
+    case RendererDebugView::RestirGiSourcePdf: return "restir-gi-source-pdf";
+    case RendererDebugView::RestirGiWeightSum: return "restir-gi-weight-sum";
+    case RendererDebugView::RestirGiM: return "restir-gi-m";
+    case RendererDebugView::RestirGiConfidence: return "restir-gi-confidence";
+    case RendererDebugView::RestirGiVisibility: return "restir-gi-visibility";
     case RendererDebugView::AdaptiveDensityMap: return "adaptive-density-map";
     case RendererDebugView::AdaptiveSampleCount: return "adaptive-sample-count";
     case RendererDebugView::AdaptiveUnsampledPixels: return "adaptive-unsampled-pixels";
@@ -805,6 +909,7 @@ const char* rendererDebugViewName(RendererDebugView view) {
     case RendererDebugView::RestirDiReceiverPosition: return "restir-di-receiver-position";
     case RendererDebugView::RestirDiReceiverNormal: return "restir-di-receiver-normal";
     case RendererDebugView::RestirDiLightVersion: return "restir-di-light-version";
+    case RendererDebugView::RestirDiLightMapStatus: return "restir-di-light-map-status";
     case RendererDebugView::RestirDiInitialReservoir: return "restir-di-initial-reservoir";
     case RendererDebugView::RestirDiTemporalReservoir: return "restir-di-temporal-reservoir";
     case RendererDebugView::RestirDiSpatialReservoir: return "restir-di-spatial-reservoir";

@@ -1,6 +1,10 @@
 #ifndef RTV_RT_MATERIAL_GLSL
 #define RTV_RT_MATERIAL_GLSL
 
+#ifndef RTV_MATERIAL_TEXTURES_ENABLED
+#define RTV_MATERIAL_TEXTURES_ENABLED 1
+#endif
+
 // Material records, texture evaluation, alpha handling, and terminal material sampling.
 struct Material {
     uint material_data_index;
@@ -222,6 +226,7 @@ const uint MATERIAL_FLAG_MANUAL_EMISSIVE_SRGB = 1u << 1u;
 const uint MATERIAL_FLAG_NORMAL_MAP_DIRECTX = 1u << 2u;
 const uint MATERIAL_FLAG_SPECULAR_GLOSSINESS_WORKFLOW = 1u << 3u;
 const uint MATERIAL_FLAG_SPECULAR_ALPHA_GLOSSINESS = 1u << 4u;
+const uint MATERIAL_FLAG_MAY_BE_TRANSMISSIVE = 1u << 5u;
 const uint ALPHA_MODE_OPAQUE = 0u;
 const uint ALPHA_MODE_MASK = 1u;
 const uint ALPHA_MODE_BLEND = 2u;
@@ -717,13 +722,13 @@ uvec2 pack_world_position(vec3 world_pos) {
 }
 
 bool project_unjittered_to_pixels_checked(mat4 viewProj, vec2 jitterPixels, vec3 worldPos, ivec2 dims, out vec2 pixels) {
+    // PrevCamera matrices are uploaded without projection jitter; the jitter argument
+    // is retained for older call sites but must not be applied here.
     vec4 clip = viewProj * vec4(worldPos, 1.0);
     if (clip.w <= 0.0) {
         pixels = vec2(0.0);
         return false;
     }
-    vec2 invDims = 1.0 / vec2(max(dims, ivec2(1)));
-    clip.xy -= jitterPixels * 2.0 * invDims * clip.w;
     vec3 ndc = clip.xyz / clip.w;
     if (ndc.z < 0.0 || ndc.z > 1.0001) {
         pixels = vec2(0.0);
@@ -846,7 +851,9 @@ Material decode_material(uint mat_idx) {
     vec4 d0 = mesh_materials[idx + 0u];
     vec4 d1 = mesh_materials[idx + 1u];
     vec4 d2 = mesh_materials[idx + 2u];
+#if RTV_MATERIAL_TEXTURES_ENABLED
     vec4 d3 = mesh_materials[idx + 3u];
+#endif
     vec4 d4 = mesh_materials[idx + 4u];
     vec4 d5 = mesh_materials[idx + 5u];
     vec4 d6 = mesh_materials[idx + 6u];
@@ -860,7 +867,9 @@ Material decode_material(uint mat_idx) {
     vec4 d14 = mesh_materials[idx + 14u];
     vec4 d15 = mesh_materials[idx + 15u];
     vec4 d16 = mesh_materials[idx + 16u];
+#if RTV_MATERIAL_TEXTURES_ENABLED
     vec4 d17 = mesh_materials[idx + 17u];
+#endif
     Material m;
     m.material_data_index = idx;
     m.color = d0.xyz;
@@ -871,10 +880,17 @@ Material decode_material(uint mat_idx) {
     m.pad2 = d1.w;
     m.emissive = d2.xyz;
     m.alpha_factor = d2.w;
+#if RTV_MATERIAL_TEXTURES_ENABLED
     m.base_color_texture = int(round(d3.x));
     m.normal_texture = int(round(d3.y));
     m.metallic_roughness_texture = int(round(d3.z));
     m.emissive_texture = int(round(d3.w));
+#else
+    m.base_color_texture = -1;
+    m.normal_texture = -1;
+    m.metallic_roughness_texture = -1;
+    m.emissive_texture = -1;
+#endif
     m.alpha_cutoff = d4.x;
     m.alpha_mode = uint(round(d4.y));
     m.double_sided = uint(round(d4.z));
@@ -914,12 +930,24 @@ Material decode_material(uint mat_idx) {
     m.volume_attenuation_color = clamp(d15.xyz, vec3(0.0), vec3(1.0));
     m.volume_attenuation_distance = d15.w;
     m.dispersion_factor = max(d16.x, 0.0);
+#if RTV_MATERIAL_TEXTURES_ENABLED
     m.opacity_texture = int(round(d17.x));
     m.height_texture = int(round(d17.y));
     m.height_scale = d17.z;
+#else
+    m.opacity_texture = -1;
+    m.height_texture = -1;
+    m.height_scale = 0.0;
+#endif
     m.clearcoat_normal = vec3(0.0);
     m.clearcoat_normal_variance = 0.0;
     return m;
+}
+
+bool material_static_may_be_transmissive(uint mat_idx) {
+    uint idx = min(mat_idx, max(mesh_params.material_count, 1u) - 1u) * MATERIAL_STRIDE;
+    vec4 d1 = mesh_materials[idx + 1u];
+    return (uint(round(d1.w)) & MATERIAL_FLAG_MAY_BE_TRANSMISSIVE) != 0u;
 }
 
 uint material_for_triangle_index(uint triangleIndex) {
@@ -980,6 +1008,26 @@ LocalVertex ray_tracing_local_vertex(uint meshIndex, uint vertexIndex) {
     return ray_tracing_local_vertex_with_binding(ray_tracing_gpu_skinning_binding(meshIndex), vertexIndex);
 }
 
+bool ray_tracing_triangle_indices(uint triangleIndex, out uvec3 indices) {
+    indices = uvec3(0u);
+    if (triangleIndex > 0x55555555u) {
+        return false;
+    }
+
+    uint triIndex = triangleIndex * 3u;
+    if (triIndex + 2u >= mesh_params.local_index_count) {
+        return false;
+    }
+
+    indices = uvec3(
+        local_mesh_indices[triIndex + 0u],
+        local_mesh_indices[triIndex + 1u],
+        local_mesh_indices[triIndex + 2u]);
+    return indices.x < mesh_params.local_vertex_count &&
+        indices.y < mesh_params.local_vertex_count &&
+        indices.z < mesh_params.local_vertex_count;
+}
+
 bool ray_tracing_mesh_has_gpu_skinning(uint meshIndex) {
     return meshIndex < mesh_params.mesh_count && gpu_skinning_rt_mesh_bindings[meshIndex].z != 0u;
 }
@@ -1015,7 +1063,9 @@ vec2 apply_material_texture_transform(Material material, uint slot, vec2 uv0, ve
 float g_material_texture_lod = 0.0;
 
 void set_material_texture_lod(float lod) {
+#if RTV_MATERIAL_TEXTURES_ENABLED
     g_material_texture_lod = clamp(lod, 0.0, 4.0);
+#endif
 }
 
 vec4 sample_material_texture(int textureIndex, vec2 uv) {
@@ -1037,6 +1087,7 @@ vec2 apply_material_height_parallax(Material material, vec2 uv0, vec2 uv1, vec3 
 }
 
 void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
+#if RTV_MATERIAL_TEXTURES_ENABLED
     uint flags = uint(round(material.pad2));
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.base_color_texture;
@@ -1148,6 +1199,7 @@ void apply_material_textures(inout Material material, vec2 uv0, vec2 uv1) {
         float opacity = sample_material_texture(textureIndex, uv0).r;
         material.alpha_factor *= clamp(opacity, 0.0, 1.0);
     }
+#endif
 }
 
 vec3 material_volume_transmittance(Material material, float distance) {
@@ -1170,6 +1222,7 @@ void apply_material_vertex_color(inout Material material, vec4 vertexColor) {
 }
 
 void apply_material_alpha_texture(inout Material material, vec2 uv0, vec2 uv1) {
+#if RTV_MATERIAL_TEXTURES_ENABLED
     if (material.base_color_texture >= 0 && material.base_color_texture < MATERIAL_TEXTURE_LIMIT) {
         int textureIndex = material.base_color_texture;
         vec2 sampleUv = apply_material_texture_transform(material, MATERIAL_TEXTURE_TRANSFORM_BASE_COLOR, uv0, uv1);
@@ -1181,6 +1234,7 @@ void apply_material_alpha_texture(inout Material material, vec2 uv0, vec2 uv1) {
         float opacity = sample_material_texture(textureIndex, uv0).r;
         material.alpha_factor *= clamp(opacity, 0.0, 1.0);
     }
+#endif
 }
 
 bool accept_material_alpha(Material material) {
@@ -1259,7 +1313,7 @@ float material_specular_roughness(Material material) {
 }
 
 Material apply_debug_material_mode(Material material) {
-    if (debug_params.view == 22u || debug_params.view == 27u) {
+    if (renderer_debug_view() == 22u || renderer_debug_view() == 27u) {
         material.color = vec3(0.72, 0.70, 0.66);
         material.roughness = 0.85;
         material.metallic = 0.0;

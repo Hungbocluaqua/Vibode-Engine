@@ -49,6 +49,47 @@ struct ResourceStateEvent {
     VkAccessFlags2 afterAccess = VK_ACCESS_2_NONE;
 };
 
+struct ManualBarrierEscapeEvent {
+    uint64_t sequence = 0;
+    std::string source;
+    std::string label;
+    std::string resourceKind;
+    uint64_t resourceHandle = 0;
+    VkPipelineStageFlags2 srcStage = VK_PIPELINE_STAGE_2_NONE;
+    VkAccessFlags2 srcAccess = VK_ACCESS_2_NONE;
+    VkPipelineStageFlags2 dstStage = VK_PIPELINE_STAGE_2_NONE;
+    VkAccessFlags2 dstAccess = VK_ACCESS_2_NONE;
+    VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+
+struct ManualBarrierEscapeAggregate {
+    std::string source;
+    std::string label;
+    std::string resourceKind;
+    VkPipelineStageFlags2 srcStage = VK_PIPELINE_STAGE_2_NONE;
+    VkAccessFlags2 srcAccess = VK_ACCESS_2_NONE;
+    VkPipelineStageFlags2 dstStage = VK_PIPELINE_STAGE_2_NONE;
+    VkAccessFlags2 dstAccess = VK_ACCESS_2_NONE;
+    VkImageLayout oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    uint64_t count = 0;
+};
+
+struct ManualBarrierEscapeDiagnosticsSnapshot {
+    bool enabled = false;
+    uint64_t dependencyCallCount = 0;
+    uint64_t barrierCount = 0;
+    uint64_t droppedRecentEventCount = 0;
+    std::vector<ManualBarrierEscapeEvent> recentEvents;
+    std::vector<ManualBarrierEscapeAggregate> aggregates;
+};
+
+void setManualBarrierEscapeDiagnosticsEnabled(bool enabled);
+void resetManualBarrierEscapeDiagnostics();
+void recordManualBarrierEscape(std::string source, std::string label, const VkDependencyInfo& dependency);
+[[nodiscard]] ManualBarrierEscapeDiagnosticsSnapshot manualBarrierEscapeDiagnosticsSnapshot();
+
 class RendererValidationLog {
 public:
     void recordBarrier(std::string label, VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess);

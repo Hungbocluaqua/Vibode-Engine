@@ -105,6 +105,8 @@ public:
         bool debugViewOverride = false,
         bool validationCameraMotion = false,
         bool validationObjectMotion = false,
+        bool validationLightReorder = false,
+        bool validationLightFlicker = false,
         bool headless = false,
         ApplicationMode mode = ApplicationMode::Editor,
         uint32_t headlessWidth = 1280,
@@ -459,6 +461,8 @@ private:
     void mainLoop(uint32_t maxFrames);
     void applyValidationCameraMotion(uint32_t frameIndex);
     void applyValidationObjectMotion(uint32_t frameIndex);
+    void applyValidationLightReorder(uint32_t frameIndex);
+    void applyValidationLightFlicker(uint32_t frameIndex);
     void updateAutosave(float deltaSeconds);
     bool writeAutosave();
     void writeCrashMarker(bool running);
@@ -637,7 +641,7 @@ private:
     void createPathTracer(const RendererSettings* settingsToRestore = nullptr);
     void applyActiveSceneCamera();
     void syncActiveSceneCameraFromController();
-    void rebuildGpuSceneAsset();
+    void rebuildGpuSceneAsset(const RendererSettings* settingsOverride = nullptr);
     void processRendererOnlyRequests(const RendererOnlyRequests& requests);
     void updateCaptureReadyState(uint32_t frameNumber);
     [[nodiscard]] std::string activeCaptureSceneName() const;
@@ -699,6 +703,10 @@ private:
     bool debugViewOverride_ = false;
     bool validationCameraMotion_ = false;
     bool validationObjectMotion_ = false;
+    bool validationLightReorder_ = false;
+    bool validationLightReorderApplied_ = false;
+    bool validationLightFlicker_ = false;
+    bool validationLightFlickerUnavailableLogged_ = false;
     EntityId validationObjectMotionEntity_{};
     Transform validationObjectMotionBaseTransform_{};
     bool disableAsyncCompute_ = false;

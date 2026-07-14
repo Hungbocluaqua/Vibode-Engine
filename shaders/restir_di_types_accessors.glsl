@@ -176,6 +176,7 @@ const uint RESTIR_DI_COUNTER_FINAL_LIGHT_REJECTED = 59u;
 const uint RESTIR_DI_COUNTER_SUM_LUMINANCE_HIGH = 60u;
 const uint RESTIR_DI_COUNTER_INITIAL_ENVIRONMENT = 61u;
 const uint RESTIR_DI_COUNTER_INITIAL_SUN = 62u;
+const uint RESTIR_DI_COUNTER_CONTRACT_INVALID = 63u;
 const uint RESTIR_DI_COUNTER_CAPACITY = 64u;
 
 const float RESTIR_DI_INVALID_ID_FLOAT = 4294967040.0;
@@ -331,6 +332,25 @@ bool restir_di_reservoir_valid(RestirDiReservoir r) {
         !isnan(sourcePdf) && !isinf(sourcePdf) &&
         !any(isnan(r.samplePosition_distance)) && !any(isinf(r.samplePosition_distance)) &&
         !any(isnan(radiance)) && !any(isinf(radiance));
+}
+
+bool restir_di_valid_bit_contract_invalid(RestirDiReservoir r) {
+    bool stateValid = (r.reservoirMetadata.x & (1u << 18u)) != 0u;
+    if (!stateValid) return false;
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    float target = r.sampleRadiance_target.w;
+    float weightSum = r.sampleNormal_weightSum.w;
+    float sourcePdf = r.sampleDirection_pdf.w;
+#else
+    vec2 targetWeight = unpackHalf2x16(r.reservoirMetadata.w);
+    float target = targetWeight.x;
+    float weightSum = targetWeight.y;
+    float sourcePdf = unpackHalf2x16(r.reservoirMetadata.y).x;
+#endif
+    return target <= 0.0 || weightSum <= 0.0 || sourcePdf <= 0.0 ||
+        isnan(target) || isinf(target) ||
+        isnan(weightSum) || isinf(weightSum) ||
+        isnan(sourcePdf) || isinf(sourcePdf);
 }
 
 uint restir_di_age(RestirDiReservoir r) {
@@ -490,6 +510,25 @@ bool restir_di_reservoir_valid(RestirDiReservoir r) {
         !isnan(pdf) && !isinf(pdf) &&
         !any(isnan(r.samplePosition_distance.xyz)) && !any(isinf(r.samplePosition_distance.xyz)) &&
         !any(isnan(radiance)) && !any(isinf(radiance));
+}
+
+bool restir_di_valid_bit_contract_invalid(RestirDiReservoir r) {
+    bool validBit = (r.reservoirMetadata.x & (1u << 18u)) != 0u;
+    if (!validBit) return false;
+#if RTV_RESTIR_DI_VALIDATION_FULL
+    float target = r.sampleRadiance_target.w;
+    float weight = r.sampleNormal_weightSum.w;
+    float pdf = r.sampleDirection_pdf.w;
+#else
+    vec2 targetWeight = unpackHalf2x16(r.reservoirMetadata.w);
+    float target = targetWeight.x;
+    float weight = targetWeight.y;
+    float pdf = unpackHalf2x16(r.reservoirMetadata.y).x;
+#endif
+    return target <= 0.0 || weight <= 0.0 || pdf <= 0.0 ||
+        isnan(target) || isinf(target) ||
+        isnan(weight) || isinf(weight) ||
+        isnan(pdf) || isinf(pdf);
 }
 uint restir_di_light_kind(RestirDiReservoir r) { return r.sampleMetadata.z & 0xffu; }
 uint restir_di_light_id(RestirDiReservoir r) { return r.sampleMetadata.x; }

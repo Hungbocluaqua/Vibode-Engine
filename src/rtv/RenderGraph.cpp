@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <stdexcept>
 
@@ -201,12 +202,29 @@ bool lifetimeOverlaps(const TransientResourceLifetime& a, const TransientResourc
     return !(a.lastUsePass < b.firstUsePass || b.lastUsePass < a.firstUsePass);
 }
 
+VkDeviceSize bufferRangeEnd(VkDeviceSize offset, VkDeviceSize size) {
+    const VkDeviceSize maxValue = std::numeric_limits<VkDeviceSize>::max();
+    if (size == VK_WHOLE_SIZE || maxValue - offset < size) {
+        return maxValue;
+    }
+    return offset + size;
+}
+
+bool bufferRangesOverlap(const RenderGraphResource& a, const RenderGraphResource& b) {
+    if (a.buffer == VK_NULL_HANDLE || a.buffer != b.buffer) {
+        return false;
+    }
+    const VkDeviceSize aEnd = bufferRangeEnd(a.bufferOffset, a.size);
+    const VkDeviceSize bEnd = bufferRangeEnd(b.bufferOffset, b.size);
+    return a.bufferOffset < bEnd && b.bufferOffset < aEnd;
+}
+
 bool resourcesSharePhysicalHandle(const RenderGraphResource& a, const RenderGraphResource& b) {
     if (a.type != b.type) {
         return false;
     }
     if (a.type == RenderGraphResource::Type::Buffer) {
-        return a.buffer != VK_NULL_HANDLE && a.buffer == b.buffer;
+        return bufferRangesOverlap(a, b);
     }
     return a.image != VK_NULL_HANDLE && a.image == b.image;
 }
@@ -271,54 +289,92 @@ void traceRenderGraphPass(const char* phase, const std::string& name) {
     std::cout << "RENDER_GRAPH pass=" << name << " phase=" << phase << '\n' << std::flush;
 }
 
-void emitBarrier(VkCommandBuffer commandBuffer, const RenderGraphResource& resource, const RenderGraphBarrier& barrier) {
-    if (resource.type == RenderGraphResource::Type::Texture && resource.image != VK_NULL_HANDLE) {
-        if (barrier.before.stage == barrier.after.stage &&
-            barrier.before.access == barrier.after.access &&
-            barrier.before.layout == barrier.after.layout) {
-            return;
+bool accessIncludesWrite(VkAccessFlags2 access) {
+    constexpr VkAccessFlags2 writeAccess =
+        VK_ACCESS_2_SHADER_WRITE_BIT |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_2_TRANSFER_WRITE_BIT |
+        VK_ACCESS_2_HOST_WRITE_BIT |
+        VK_ACCESS_2_MEMORY_WRITE_BIT |
+        VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    return (access & writeAccess) != 0;
+}
+
+bool barrierRequired(
+    const RenderGraphResource& resource,
+    const ResourceAccess& before,
+    const ResourceAccess& after) {
+    if (resource.type == RenderGraphResource::Type::Texture && before.layout != after.layout) {
+        return true;
+    }
+    return accessIncludesWrite(before.access) || accessIncludesWrite(after.access);
+}
+
+void emitBarrierBatch(
+    VkCommandBuffer commandBuffer,
+    const std::vector<RenderGraphResource>& resources,
+    const std::vector<RenderGraphBarrier>& barriers,
+    const std::vector<uint32_t>& barrierIndices) {
+    if (barrierIndices.empty()) {
+        return;
+    }
+
+    std::vector<VkImageMemoryBarrier2> imageBarriers;
+    std::vector<VkBufferMemoryBarrier2> bufferBarriers;
+    imageBarriers.reserve(barrierIndices.size());
+    bufferBarriers.reserve(barrierIndices.size());
+
+    for (uint32_t barrierIndex : barrierIndices) {
+        if (barrierIndex >= barriers.size()) {
+            continue;
         }
+        const RenderGraphBarrier& barrier = barriers[barrierIndex];
+        if (barrier.resource.index >= resources.size()) {
+            continue;
+        }
+        const RenderGraphResource& resource = resources[barrier.resource.index];
+        if (!barrierRequired(resource, barrier.before, barrier.after)) {
+            continue;
+        }
+        if (resource.type == RenderGraphResource::Type::Texture && resource.image != VK_NULL_HANDLE) {
+            VkImageMemoryBarrier2 imageBarrier{};
+            imageBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            imageBarrier.srcStageMask = barrier.before.stage;
+            imageBarrier.srcAccessMask = barrier.before.access;
+            imageBarrier.dstStageMask = barrier.after.stage;
+            imageBarrier.dstAccessMask = barrier.after.access;
+            imageBarrier.oldLayout = barrier.before.layout;
+            imageBarrier.newLayout = barrier.after.layout;
+            imageBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            imageBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            imageBarrier.image = resource.image;
+            imageBarrier.subresourceRange = resource.imageRange;
+            imageBarriers.push_back(imageBarrier);
+        } else if (resource.type == RenderGraphResource::Type::Buffer && resource.buffer != VK_NULL_HANDLE) {
+            VkBufferMemoryBarrier2 bufferBarrier{};
+            bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            bufferBarrier.srcStageMask = barrier.before.stage;
+            bufferBarrier.srcAccessMask = barrier.before.access;
+            bufferBarrier.dstStageMask = barrier.after.stage;
+            bufferBarrier.dstAccessMask = barrier.after.access;
+            bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bufferBarrier.buffer = resource.buffer;
+            bufferBarrier.offset = resource.bufferOffset;
+            bufferBarrier.size = resource.size == 0 ? VK_WHOLE_SIZE : resource.size;
+            bufferBarriers.push_back(bufferBarrier);
+        }
+    }
 
-        VkImageMemoryBarrier2 imageBarrier{};
-        imageBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        imageBarrier.srcStageMask = barrier.before.stage;
-        imageBarrier.srcAccessMask = barrier.before.access;
-        imageBarrier.dstStageMask = barrier.after.stage;
-        imageBarrier.dstAccessMask = barrier.after.access;
-        imageBarrier.oldLayout = barrier.before.layout;
-        imageBarrier.newLayout = barrier.after.layout;
-        imageBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        imageBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        imageBarrier.image = resource.image;
-        imageBarrier.subresourceRange = resource.imageRange;
-
+    if (!imageBarriers.empty() || !bufferBarriers.empty()) {
         VkDependencyInfo dependency{};
         dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dependency.imageMemoryBarrierCount = 1;
-        dependency.pImageMemoryBarriers = &imageBarrier;
-        vkCmdPipelineBarrier2(commandBuffer, &dependency);
-    } else if (resource.type == RenderGraphResource::Type::Buffer && resource.buffer != VK_NULL_HANDLE) {
-        if (barrier.before.stage == barrier.after.stage &&
-            barrier.before.access == barrier.after.access) {
-            return;
-        }
-
-        VkBufferMemoryBarrier2 bufferBarrier{};
-        bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
-        bufferBarrier.srcStageMask = barrier.before.stage;
-        bufferBarrier.srcAccessMask = barrier.before.access;
-        bufferBarrier.dstStageMask = barrier.after.stage;
-        bufferBarrier.dstAccessMask = barrier.after.access;
-        bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bufferBarrier.buffer = resource.buffer;
-        bufferBarrier.offset = resource.bufferOffset;
-        bufferBarrier.size = resource.size == 0 ? VK_WHOLE_SIZE : resource.size;
-
-        VkDependencyInfo dependency{};
-        dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dependency.bufferMemoryBarrierCount = 1;
-        dependency.pBufferMemoryBarriers = &bufferBarrier;
+        dependency.imageMemoryBarrierCount = static_cast<uint32_t>(imageBarriers.size());
+        dependency.pImageMemoryBarriers = imageBarriers.data();
+        dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(bufferBarriers.size());
+        dependency.pBufferMemoryBarriers = bufferBarriers.data();
         vkCmdPipelineBarrier2(commandBuffer, &dependency);
     }
 }
@@ -348,6 +404,8 @@ ResourceAccess resourceAccessFor(ResourceState state, PipelineDomain domain) {
         return {domain == PipelineDomain::Compute ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL};
     case ResourceState::UniformBuffer:
         return {domain == PipelineDomain::Compute ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT, VK_ACCESS_2_UNIFORM_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED};
+    case ResourceState::RayTracingRead:
+        return {VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL};
     case ResourceState::RayTracing:
         return {VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL};
     case ResourceState::ComputeShaderRead:
@@ -378,7 +436,7 @@ RenderGraphPass& RenderGraphPass::addInputAttachment(RenderGraphResourceId id) {
 RenderGraphPass& RenderGraphPass::addStorageRead(RenderGraphResourceId id, PipelineDomain domain) {
     const ResourceState state = domain == PipelineDomain::Transfer
         ? ResourceState::TransferSource
-        : (domain == PipelineDomain::RayTracing ? ResourceState::RayTracing : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderRead : ResourceState::ShaderRead));
+        : (domain == PipelineDomain::RayTracing ? ResourceState::RayTracingRead : (domain == PipelineDomain::Compute ? ResourceState::ComputeShaderRead : ResourceState::ShaderRead));
     return addUse(id, state, PassAccess::Read, domain);
 }
 
@@ -481,6 +539,8 @@ bool RenderGraph::removePass(const char* name) {
 void RenderGraph::compile() {
     compiledPassOrder_.clear();
     compiledBarriers_.clear();
+    compiledBarrierBatches_.clear();
+    compiledFinalBarrierBatch_.clear();
     if (passes_.empty()) {
         compiled_ = true;
         return;
@@ -515,6 +575,17 @@ void RenderGraph::compile() {
     std::vector<std::vector<uint32_t>> edges(passes_.size());
     std::vector<uint32_t> indegree(passes_.size(), 0);
     std::vector<uint32_t> lastWriter(resources_.size(), std::numeric_limits<uint32_t>::max());
+    std::vector<std::vector<uint32_t>> readersSinceWrite(resources_.size());
+    const auto addEdge = [&](uint32_t before, uint32_t after) {
+        if (before == std::numeric_limits<uint32_t>::max() || before == after) {
+            return;
+        }
+        std::vector<uint32_t>& outgoing = edges[before];
+        if (std::find(outgoing.begin(), outgoing.end(), after) == outgoing.end()) {
+            outgoing.push_back(after);
+            ++indegree[after];
+        }
+    };
 
     for (uint32_t passIndex = 0; passIndex < passes_.size(); ++passIndex) {
         if (live[passIndex] == 0) {
@@ -525,12 +596,18 @@ void RenderGraph::compile() {
                 throw std::runtime_error("RenderGraph pass references a missing resource");
             }
             const uint32_t writer = lastWriter[use.resource.index];
-            if (writer != std::numeric_limits<uint32_t>::max() && writer != passIndex) {
-                edges[writer].push_back(passIndex);
-                ++indegree[passIndex];
-            }
+            addEdge(writer, passIndex);
             if (writesResource(use)) {
+                for (uint32_t reader : readersSinceWrite[use.resource.index]) {
+                    addEdge(reader, passIndex);
+                }
+                readersSinceWrite[use.resource.index].clear();
                 lastWriter[use.resource.index] = passIndex;
+            } else if (readsResource(use)) {
+                std::vector<uint32_t>& readers = readersSinceWrite[use.resource.index];
+                if (std::find(readers.begin(), readers.end(), passIndex) == readers.end()) {
+                    readers.push_back(passIndex);
+                }
             }
         }
     }
@@ -556,43 +633,60 @@ void RenderGraph::compile() {
         throw std::runtime_error("RenderGraph compile failed: cycle detected");
     }
 
-    std::vector<RenderGraphResourceUse> previousUse(resources_.size());
+    std::vector<ResourceAccess> previousAccess(resources_.size());
     std::vector<uint32_t> previousUsePass(resources_.size(), 0);
+    std::vector<RenderGraphQueueDomain> previousUseQueue(resources_.size(), RenderGraphQueueDomain::Graphics);
+    std::vector<uint8_t> previousUsesAreReads(resources_.size(), 0);
     std::vector<uint8_t> hasPreviousUse(resources_.size(), 0);
     for (uint32_t resourceIndex = 0; resourceIndex < resources_.size(); ++resourceIndex) {
         const RenderGraphResource& resource = resources_[resourceIndex];
         if (!resource.hasInitialAccess) {
             continue;
         }
-        previousUse[resourceIndex] = RenderGraphResourceUse{
-            .resource = RenderGraphResourceId{resourceIndex},
-            .state = ResourceState::Undefined,
-            .access = PassAccess::ReadWrite,
-            .domain = PipelineDomain::Graphics,
-        };
+        previousAccess[resourceIndex] = resource.initialAccess;
         previousUsePass[resourceIndex] = std::numeric_limits<uint32_t>::max();
+        previousUsesAreReads[resourceIndex] = accessIncludesWrite(resource.initialAccess.access) ? 0 : 1;
         hasPreviousUse[resourceIndex] = 1;
     }
     for (uint32_t passIndex : compiledPassOrder_) {
         for (const RenderGraphResourceUse& use : passes_[passIndex].uses()) {
+            const ResourceAccess currentAccess = resourceAccessFor(use.state, use.domain);
+            const bool currentIsReadOnly = readsResource(use) && !writesResource(use);
             if (hasPreviousUse[use.resource.index] != 0) {
-                const RenderGraphResourceUse& previous = previousUse[use.resource.index];
-                compiledBarriers_.push_back(RenderGraphBarrier{
+                RenderGraphBarrier barrier{
                     .resource = use.resource,
                     .beforePass = previousUsePass[use.resource.index],
                     .afterPass = passIndex,
-                    .before = previousUsePass[use.resource.index] == std::numeric_limits<uint32_t>::max()
-                        ? resources_[use.resource.index].initialAccess
-                        : resourceAccessFor(previous.state, previous.domain),
-                    .after = resourceAccessFor(use.state, use.domain),
-                    .beforeQueue = previousUsePass[use.resource.index] == std::numeric_limits<uint32_t>::max()
-                        ? RenderGraphQueueDomain::Graphics
-                        : passes_[previousUsePass[use.resource.index]].queueDomain(),
+                    .before = previousAccess[use.resource.index],
+                    .after = currentAccess,
+                    .beforeQueue = previousUseQueue[use.resource.index],
                     .afterQueue = passes_[passIndex].queueDomain(),
-                });
+                };
+                const bool samePass = previousUsePass[use.resource.index] == passIndex;
+                const bool needsBarrier = barrierRequired(resources_[use.resource.index], barrier.before, barrier.after);
+                if (!samePass && needsBarrier) {
+                    compiledBarriers_.push_back(barrier);
+                }
+
+                const bool accumulateReaders = !samePass && !needsBarrier &&
+                    previousUsesAreReads[use.resource.index] != 0 && currentIsReadOnly;
+                if (samePass || accumulateReaders) {
+                    previousAccess[use.resource.index].stage |= currentAccess.stage;
+                    previousAccess[use.resource.index].access |= currentAccess.access;
+                    if (samePass && previousAccess[use.resource.index].layout != currentAccess.layout) {
+                        throw std::runtime_error("RenderGraph pass uses one resource with conflicting image layouts");
+                    }
+                    previousUsePass[use.resource.index] = passIndex;
+                    previousUseQueue[use.resource.index] = passes_[passIndex].queueDomain();
+                    previousUsesAreReads[use.resource.index] =
+                        previousUsesAreReads[use.resource.index] != 0 && currentIsReadOnly ? 1 : 0;
+                    continue;
+                }
             }
-            previousUse[use.resource.index] = use;
+            previousAccess[use.resource.index] = currentAccess;
             previousUsePass[use.resource.index] = passIndex;
+            previousUseQueue[use.resource.index] = passes_[passIndex].queueDomain();
+            previousUsesAreReads[use.resource.index] = currentIsReadOnly ? 1 : 0;
             hasPreviousUse[use.resource.index] = 1;
         }
     }
@@ -601,18 +695,28 @@ void RenderGraph::compile() {
         if (!resource.hasFinalAccess || hasPreviousUse[resourceIndex] == 0) {
             continue;
         }
-        const RenderGraphResourceUse& previous = previousUse[resourceIndex];
-        compiledBarriers_.push_back(RenderGraphBarrier{
+        RenderGraphBarrier barrier{
             .resource = RenderGraphResourceId{resourceIndex},
             .beforePass = previousUsePass[resourceIndex],
             .afterPass = std::numeric_limits<uint32_t>::max(),
-            .before = resourceAccessFor(previous.state, previous.domain),
+            .before = previousAccess[resourceIndex],
             .after = resource.finalAccess,
-            .beforeQueue = previousUsePass[resourceIndex] == std::numeric_limits<uint32_t>::max()
-                ? RenderGraphQueueDomain::Graphics
-                : passes_[previousUsePass[resourceIndex]].queueDomain(),
+            .beforeQueue = previousUseQueue[resourceIndex],
             .afterQueue = RenderGraphQueueDomain::Graphics,
-        });
+        };
+        if (barrierRequired(resources_[resourceIndex], barrier.before, barrier.after)) {
+            compiledBarriers_.push_back(barrier);
+        }
+    }
+
+    compiledBarrierBatches_.resize(passes_.size());
+    for (uint32_t barrierIndex = 0; barrierIndex < compiledBarriers_.size(); ++barrierIndex) {
+        const uint32_t afterPass = compiledBarriers_[barrierIndex].afterPass;
+        if (afterPass == std::numeric_limits<uint32_t>::max()) {
+            compiledFinalBarrierBatch_.push_back(barrierIndex);
+        } else if (afterPass < compiledBarrierBatches_.size()) {
+            compiledBarrierBatches_[afterPass].push_back(barrierIndex);
+        }
     }
 
     compiled_ = true;
@@ -688,10 +792,16 @@ void RenderGraph::compile() {
     }
 
     for (uint32_t i = 0; i < resources_.size(); ++i) {
+        if (!resourceLifetimes_[i].aliasEligible) {
+            continue;
+        }
         if (resourceLifetimes_[i].firstUsePass == UINT32_MAX) {
             continue;
         }
         for (uint32_t j = 0; j < i; ++j) {
+            if (!resourceLifetimes_[j].aliasEligible) {
+                continue;
+            }
             if (resourceLifetimes_[j].firstUsePass == UINT32_MAX) {
                 continue;
             }
@@ -752,10 +862,8 @@ void RenderGraph::execute(VkCommandBuffer commandBuffer, uint64_t frameIndex) {
         .graph = this,
     };
     for (uint32_t passIndex : compiledPassOrder_) {
-        for (const RenderGraphBarrier& barrier : compiledBarriers_) {
-            if (barrier.afterPass == passIndex && barrier.resource.index < resources_.size()) {
-                emitBarrier(commandBuffer, resources_[barrier.resource.index], barrier);
-            }
+        if (passIndex < compiledBarrierBatches_.size()) {
+            emitBarrierBatch(commandBuffer, resources_, compiledBarriers_, compiledBarrierBatches_[passIndex]);
         }
         const RenderGraphPass::ExecuteCallback& callback = passes_[passIndex].callback();
         if (callback) {
@@ -769,11 +877,7 @@ void RenderGraph::execute(VkCommandBuffer commandBuffer, uint64_t frameIndex) {
             traceRenderGraphPass("end", passes_[passIndex].name());
         }
     }
-    for (const RenderGraphBarrier& barrier : compiledBarriers_) {
-        if (barrier.afterPass == std::numeric_limits<uint32_t>::max() && barrier.resource.index < resources_.size()) {
-            emitBarrier(commandBuffer, resources_[barrier.resource.index], barrier);
-        }
-    }
+    emitBarrierBatch(commandBuffer, resources_, compiledBarriers_, compiledFinalBarrierBatch_);
 }
 
 void RenderGraph::setAsyncComputeQueue(VkQueue queue, uint32_t familyIndex) {
@@ -821,10 +925,8 @@ void RenderGraph::executeAsync(VkCommandBuffer graphicsCommandBuffer, VkCommandB
             queueDomain == RenderGraphQueueDomain::SameFamilyCompute;
         VkCommandBuffer targetCmd = computeDomain ? computeCommandBuffer : graphicsCommandBuffer;
 
-        for (const RenderGraphBarrier& barrier : compiledBarriers_) {
-            if (barrier.afterPass == passIndex && barrier.resource.index < resources_.size()) {
-                emitBarrier(targetCmd, resources_[barrier.resource.index], barrier);
-            }
+        if (passIndex < compiledBarrierBatches_.size()) {
+            emitBarrierBatch(targetCmd, resources_, compiledBarriers_, compiledBarrierBatches_[passIndex]);
         }
 
         const RenderGraphPass::ExecuteCallback& callback = pass.callback();
@@ -840,23 +942,16 @@ void RenderGraph::executeAsync(VkCommandBuffer graphicsCommandBuffer, VkCommandB
         }
     }
 
-    for (const RenderGraphBarrier& barrier : compiledBarriers_) {
-        if (barrier.afterPass == std::numeric_limits<uint32_t>::max() && barrier.resource.index < resources_.size()) {
-            emitBarrier(graphicsCommandBuffer, resources_[barrier.resource.index], barrier);
-        }
-    }
+    emitBarrierBatch(graphicsCommandBuffer, resources_, compiledBarriers_, compiledFinalBarrierBatch_);
 }
 
 void RenderGraph::emitCompiledBarriers(VkCommandBuffer commandBuffer) const {
     if (!compiled_) {
         throw std::runtime_error("RenderGraph::emitCompiledBarriers called before compile");
     }
-    for (const RenderGraphBarrier& barrier : compiledBarriers_) {
-        if (barrier.resource.index >= resources_.size()) {
-            continue;
-        }
-        emitBarrier(commandBuffer, resources_[barrier.resource.index], barrier);
-    }
+    std::vector<uint32_t> allBarrierIndices(compiledBarriers_.size());
+    std::iota(allBarrierIndices.begin(), allBarrierIndices.end(), 0u);
+    emitBarrierBatch(commandBuffer, resources_, compiledBarriers_, allBarrierIndices);
 }
 
 void RenderGraph::reset() {
@@ -864,6 +959,8 @@ void RenderGraph::reset() {
     passes_.clear();
     compiledPassOrder_.clear();
     compiledBarriers_.clear();
+    compiledBarrierBatches_.clear();
+    compiledFinalBarrierBatch_.clear();
     resourceLifetimes_.clear();
     if (transientPool_) {
         transientPool_->beginFrame();

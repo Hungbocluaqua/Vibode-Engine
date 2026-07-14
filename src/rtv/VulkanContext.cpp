@@ -10,12 +10,16 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace rtv {
 
@@ -30,7 +34,6 @@ const std::vector<const char*> requiredDeviceExtensions = {
 const std::vector<const char*> optionalRayTracingDeviceExtensions = {
     VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
     VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
-    VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME,
     VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
     VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
     VK_KHR_RAY_QUERY_EXTENSION_NAME,
@@ -90,18 +93,30 @@ std::vector<const char*> cStringView(const std::vector<std::string>& values) {
     return result;
 }
 
-VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
+} // namespace
+
+VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
     VkDebugUtilsMessageTypeFlagsEXT,
     const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
-    void*) {
+    void* userData) {
+    auto* context = static_cast<VulkanContext*>(userData);
+    if (context != nullptr) {
+        if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+            context->validationErrorCount_.fetch_add(1, std::memory_order_relaxed);
+        } else if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
+            context->validationWarningCount_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        std::cerr << "Vulkan validation: " << callbackData->pMessage << '\n';
+        std::cerr << "Vulkan validation: "
+                  << (callbackData != nullptr && callbackData->pMessage != nullptr ? callbackData->pMessage : "unknown message")
+                  << '\n';
     }
     return VK_FALSE;
 }
 
-VkDebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo() {
+VkDebugUtilsMessengerCreateInfoEXT VulkanContext::debugMessengerCreateInfo() {
     VkDebugUtilsMessengerCreateInfoEXT info{};
     info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
     info.messageSeverity =
@@ -111,11 +126,15 @@ VkDebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo() {
         VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
         VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
         VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
-    info.pfnUserCallback = debugCallback;
+    info.pfnUserCallback = &VulkanContext::debugCallback;
+    info.pUserData = this;
     return info;
 }
 
-} // namespace
+void VulkanContext::resetValidationMessageCounts() const noexcept {
+    validationErrorCount_.store(0, std::memory_order_relaxed);
+    validationWarningCount_.store(0, std::memory_order_relaxed);
+}
 
 VulkanContext::VulkanContext(GLFWwindow* window) {
     headless_ = false;
@@ -275,6 +294,7 @@ void VulkanContext::createInstance(GLFWwindow* window) {
     if (validationRequested() && !validationAvailable()) {
         throw std::runtime_error("Vulkan validation layer VK_LAYER_KHRONOS_validation is not installed");
     }
+    validationEnabled_ = validationRequested();
 
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -288,6 +308,9 @@ void VulkanContext::createInstance(GLFWwindow* window) {
     debugUtilsExtensionEnabled_ = std::any_of(extensions.begin(), extensions.end(), [](const char* extension) {
         return std::strcmp(extension, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0;
     });
+    if (validationEnabled_ && !debugUtilsExtensionEnabled_) {
+        throw std::runtime_error("Vulkan validation requires VK_EXT_debug_utils so validation messages can be recorded");
+    }
     const auto debugInfo = debugMessengerCreateInfo();
 
     VkInstanceCreateInfo createInfo{};
@@ -296,7 +319,7 @@ void VulkanContext::createInstance(GLFWwindow* window) {
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     createInfo.ppEnabledExtensionNames = extensions.data();
 
-    if (validationRequested()) {
+    if (validationEnabled_) {
         createInfo.enabledLayerCount = 1;
         createInfo.ppEnabledLayerNames = &validationLayer;
         createInfo.pNext = &debugInfo;
@@ -306,7 +329,7 @@ void VulkanContext::createInstance(GLFWwindow* window) {
 }
 
 void VulkanContext::createDebugMessenger() {
-    if (!validationRequested()) {
+    if (!validationEnabled_) {
         return;
     }
 
@@ -338,7 +361,7 @@ void VulkanContext::pickPhysicalDevice() {
     }
 
     if (physicalDevice_ == VK_NULL_HANDLE || bestScore < 0) {
-        throw std::runtime_error("No suitable Vulkan 1.3 device with swapchain, dynamic rendering, and synchronization2 support was found");
+        throw std::runtime_error("No suitable Vulkan 1.3 device with swapchain, dynamic rendering, synchronization2, and shaderFloat64 support was found");
     }
 
     vkGetPhysicalDeviceProperties(physicalDevice_, &physicalDeviceProperties_);
@@ -532,14 +555,6 @@ void VulkanContext::createDevice() {
         featureTail = &timelineSemaphore;
     }
 
-    VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtMaintenance1Features{};
-    rtMaintenance1Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
-    rtMaintenance1Features.rayTracingMaintenance1 = VK_FALSE;
-    if (rayTracingInfo_.capabilities.supported) {
-        rtMaintenance1Features.pNext = featureTail;
-        featureTail = &rtMaintenance1Features;
-    }
-
     VkPhysicalDevice16BitStorageFeatures storage16BitFeatures{};
     storage16BitFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
     storage16BitFeatures.storageBuffer16BitAccess = storageBuffer16BitAccess_ ? VK_TRUE : VK_FALSE;
@@ -582,7 +597,6 @@ void VulkanContext::createDevice() {
     VkPhysicalDeviceFeatures2 features2{};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.features.shaderFloat64 = VK_TRUE;
-    features2.features.pipelineStatisticsQuery = VK_TRUE;
     features2.features.samplerAnisotropy = samplerAnisotropy_ ? VK_TRUE : VK_FALSE;
     features2.pNext = featureTail;
 
@@ -670,6 +684,28 @@ void VulkanContext::createDevice() {
 }
 
 bool VulkanContext::validationRequested() const {
+    auto parseEnvironmentFlag = [](std::string_view value) {
+        std::string normalized(value);
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
+        return !normalized.empty() && normalized != "0" && normalized != "false" &&
+            normalized != "off" && normalized != "no";
+    };
+#if defined(_WIN32)
+    char* forced = nullptr;
+    size_t forcedLength = 0;
+    if (_dupenv_s(&forced, &forcedLength, "RTV_ENABLE_VULKAN_VALIDATION") == 0 && forced != nullptr) {
+        const bool enabled = parseEnvironmentFlag(forced);
+        std::free(forced);
+        return enabled;
+    }
+    std::free(forced);
+#else
+    if (const char* forced = std::getenv("RTV_ENABLE_VULKAN_VALIDATION"); forced != nullptr) {
+        return parseEnvironmentFlag(forced);
+    }
+#endif
 #if defined(NDEBUG)
     return false;
 #else
@@ -840,7 +876,9 @@ bool VulkanContext::deviceSupportsRequiredFeatures(VkPhysicalDevice physicalDevi
     features2.pNext = &features13;
 
     vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
-    return features13.dynamicRendering == VK_TRUE && features13.synchronization2 == VK_TRUE;
+    return features13.dynamicRendering == VK_TRUE &&
+        features13.synchronization2 == VK_TRUE &&
+        features2.features.shaderFloat64 == VK_TRUE;
 }
 
 bool VulkanContext::deviceSupportsExtension(VkPhysicalDevice physicalDevice, const char* extensionName) const {
@@ -1118,7 +1156,7 @@ void VulkanContext::pickPhysicalDeviceHeadless() {
     }
 
     if (physicalDevice_ == VK_NULL_HANDLE || bestScore < 0) {
-        throw std::runtime_error("No suitable Vulkan 1.3 device with dynamic rendering and synchronization2 support was found");
+        throw std::runtime_error("No suitable Vulkan 1.3 device with dynamic rendering, synchronization2, and shaderFloat64 support was found");
     }
 
     vkGetPhysicalDeviceProperties(physicalDevice_, &physicalDeviceProperties_);

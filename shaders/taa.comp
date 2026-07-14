@@ -43,24 +43,59 @@ layout(set = 0, binding = 5, std140) uniform TaaParams {
     uint render_height;
     float motion_feedback;
     float reactive_feedback;
+    float input_pixel_offset_x;
+    float input_pixel_offset_y;
+    float clamping_factor;
+    float max_radiance;
 } params;
 
 float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
-vec3 load_history_bilinear(vec2 historyPos, ivec2 dims) {
-    ivec2 base = ivec2(floor(historyPos));
-    vec2 fracValue = fract(historyPos);
-    ivec2 p00 = clamp(base, ivec2(0), dims - ivec2(1));
-    ivec2 p10 = clamp(base + ivec2(1, 0), ivec2(0), dims - ivec2(1));
-    ivec2 p01 = clamp(base + ivec2(0, 1), ivec2(0), dims - ivec2(1));
-    ivec2 p11 = clamp(base + ivec2(1, 1), ivec2(0), dims - ivec2(1));
-    vec3 c00 = imageLoad(history_color, p00).rgb;
-    vec3 c10 = imageLoad(history_color, p10).rgb;
-    vec3 c01 = imageLoad(history_color, p01).rgb;
-    vec3 c11 = imageLoad(history_color, p11).rgb;
-    return mix(mix(c00, c10, fracValue.x), mix(c01, c11, fracValue.x), fracValue.y);
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+
+vec3 pq_encode(vec3 color) {
+    vec3 l = max(color, vec3(0.0)) / max(params.max_radiance, 1.0e-4);
+    vec3 lm = pow(l, vec3(PQ_M1));
+    vec3 n = (vec3(PQ_C1) + PQ_C2 * lm) / (vec3(1.0) + PQ_C3 * lm);
+    return clamp(pow(n, vec3(PQ_M2)), vec3(0.0), vec3(1.0));
+}
+
+vec3 pq_decode(vec3 color) {
+    vec3 np = pow(max(color, vec3(0.0)), vec3(1.0 / PQ_M2));
+    vec3 l = max(np - vec3(PQ_C1), vec3(0.0)) / max(vec3(PQ_C2) - PQ_C3 * np, vec3(1.0e-6));
+    return pow(max(l, vec3(0.0)), vec3(1.0 / PQ_M1)) * max(params.max_radiance, 1.0e-4);
+}
+
+vec3 load_history_texel(ivec2 coords, ivec2 dims) {
+    return imageLoad(history_color, clamp(coords, ivec2(0), dims - ivec2(1))).rgb;
+}
+
+vec3 load_history_catmull_rom(vec2 historyPos, ivec2 dims) {
+    vec2 tc = floor(historyPos - vec2(0.5)) + vec2(0.5);
+    vec2 f = clamp(historyPos - tc, vec2(0.0), vec2(1.0));
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = f2 - 0.5 * (f3 + f);
+    vec2 w1 = 1.5 * f3 - 2.5 * f2 + vec2(1.0);
+    vec2 w3 = 0.5 * (f3 - f2);
+    vec2 w2 = vec2(1.0) - w0 - w1 - w3;
+    vec2 base = tc - vec2(1.0);
+
+    vec3 result = vec3(0.0);
+    for (int y = 0; y < 4; ++y) {
+        float wy = y == 0 ? w0.y : (y == 1 ? w1.y : (y == 2 ? w2.y : w3.y));
+        for (int x = 0; x < 4; ++x) {
+            float wx = x == 0 ? w0.x : (x == 1 ? w1.x : (x == 2 ? w2.x : w3.x));
+            result += load_history_texel(ivec2(base) + ivec2(x, y), dims) * (wx * wy);
+        }
+    }
+    return max(result, vec3(0.0));
 }
 
 vec3 decode_octahedral_normal(uint packedValue) {
@@ -88,55 +123,42 @@ bool geometry_history_valid(ivec2 coords, ivec2 dims, float centerDepth, vec3 ce
     if (centerDepth >= 9999.0) {
         return true;
     }
-    const ivec2 offsets[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
-    float rejection = 0.0;
-    for (int i = 0; i < 4; ++i) {
-        ivec2 p = clamp(coords + offsets[i], ivec2(0), dims - ivec2(1));
-        vec4 sampleDn = decode_depth_normal(depth_normal_buffer[uint(p.y) * uint(dims.x) + uint(p.x)]);
-        if (sampleDn.x >= 9999.0) {
-            rejection = max(rejection, 1.0);
-            continue;
-        }
-        float relativeDepth = abs(sampleDn.x - centerDepth) / max(centerDepth, 0.01);
-        float normalDelta = 1.0 - clamp(dot(sampleDn.yzw, centerNormal), -1.0, 1.0);
-        rejection = max(rejection, relativeDepth * 5.0 + normalDelta * 2.0);
-    }
-    return rejection < 1.0;
+    float normalLengthSq = dot(centerNormal, centerNormal);
+    return centerDepth > 0.0 &&
+        centerDepth < 1.0e9 &&
+        normalLengthSq > 0.25 &&
+        normalLengthSq < 1.25;
 }
 
-void neighborhood_stats(ivec2 coords, ivec2 dims, vec3 center, out vec3 minColor, out vec3 maxColor, out float meanLum, out float sigmaLum) {
-    minColor = center;
-    maxColor = center;
+void neighborhood_stats_pq(ivec2 coords, ivec2 dims, out vec3 meanColor, out vec3 sigmaColor, out float meanLum, out float sigmaLum) {
+    vec3 colorSum = vec3(0.0);
+    vec3 colorSqSum = vec3(0.0);
     float lumSum = 0.0;
     float lumSqSum = 0.0;
     float sampleCount = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             ivec2 sample_coords = clamp(coords + ivec2(x, y), ivec2(0), dims - ivec2(1));
-            vec3 sample_color = texelFetch(sampler2D(input_color, input_sampler), sample_coords, 0).rgb;
-            float sampleLum = luminance(sample_color);
-            minColor = min(minColor, sample_color);
-            maxColor = max(maxColor, sample_color);
+            vec3 sample_linear = texelFetch(sampler2D(input_color, input_sampler), sample_coords, 0).rgb;
+            vec3 sample_color = pq_encode(sample_linear);
+            float sampleLum = luminance(sample_linear);
+            colorSum += sample_color;
+            colorSqSum += sample_color * sample_color;
             lumSum += sampleLum;
             lumSqSum += sampleLum * sampleLum;
             sampleCount += 1.0;
         }
     }
-    meanLum = lumSum / max(sampleCount, 1.0);
-    sigmaLum = sqrt(max(lumSqSum / max(sampleCount, 1.0) - meanLum * meanLum, 0.0));
+    float invCount = 1.0 / max(sampleCount, 1.0);
+    meanColor = colorSum * invCount;
+    sigmaColor = sqrt(max(colorSqSum * invCount - meanColor * meanColor, vec3(0.0)));
+    meanLum = lumSum * invCount;
+    sigmaLum = sqrt(max(lumSqSum * invCount - meanLum * meanLum, 0.0));
 }
 
-vec3 clamp_history(vec3 history, vec3 minColor, vec3 maxColor) {
-    vec3 p_clip = 0.5 * (maxColor + minColor);
-    vec3 e_clip = 0.5 * (maxColor - minColor) + vec3(0.001);
-    vec3 v_clip = history - p_clip;
-    vec3 v_unit = v_clip / e_clip;
-    vec3 a_unit = abs(v_unit);
-    float ma_unit = max(a_unit.x, max(a_unit.y, a_unit.z));
-    if (ma_unit > 1.0) {
-        return p_clip + v_clip / ma_unit;
-    }
-    return history;
+vec3 clamp_history_pq(vec3 history, vec3 meanColor, vec3 sigmaColor) {
+    vec3 sigma = max(sigmaColor * max(params.clamping_factor, 0.0), vec3(0.001));
+    return clamp(history, meanColor - sigma, meanColor + sigma);
 }
 
 vec3 sharpen_resolved_color(vec3 center, vec3 up, vec3 down, vec3 left, vec3 right, float amount) {
@@ -155,10 +177,42 @@ vec3 sample_current_display_color(ivec2 coords, ivec2 displayDims) {
     return texture(sampler2D(input_color, input_sampler), uv).rgb;
 }
 
+vec2 output_to_input(ivec2 coords, ivec2 displayDims, ivec2 renderDims) {
+    return (vec2(coords) + vec2(0.5)) * (vec2(renderDims) / vec2(displayDims)) -
+        vec2(0.5) +
+        vec2(params.input_pixel_offset_x, params.input_pixel_offset_y);
+}
+
+vec2 longest_valid_display_velocity(ivec2 centerCoords, ivec2 renderDims, vec2 displayScale, out bool centerVelocityValid) {
+    centerVelocityValid = false;
+    vec2 selectedVelocity = vec2(0.0);
+    float selectedLength = -1.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 p = clamp(centerCoords + ivec2(x, y), ivec2(0), renderDims - ivec2(1));
+            uint index = uint(p.y) * uint(renderDims.x) + uint(p.x);
+            vec2 velocityPixels = temporal_unpack_velocity_pixels(velocity_buffer[index], params.velocity_scale);
+            bool valid = !temporal_velocity_pixels_are_invalid(velocityPixels, params.velocity_scale);
+            if (x == 0 && y == 0) {
+                centerVelocityValid = valid;
+            }
+            if (!valid) {
+                continue;
+            }
+            float lenSq = dot(velocityPixels, velocityPixels);
+            if (lenSq > selectedLength) {
+                selectedLength = lenSq;
+                selectedVelocity = velocityPixels * displayScale;
+            }
+        }
+    }
+    return selectedVelocity;
+}
+
 vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out float sharpenAmount) {
-    vec2 uv = (vec2(coords) + vec2(0.5)) / vec2(displayDims);
-    vec3 current = sample_current_display_color(coords, displayDims);
-    ivec2 renderCoords = clamp(ivec2(floor(uv * vec2(renderDims))), ivec2(0), renderDims - ivec2(1));
+    vec2 inputPos = output_to_input(coords, displayDims, renderDims);
+    ivec2 renderCoords = clamp(ivec2(round(inputPos)), ivec2(0), renderDims - ivec2(1));
+    vec3 current = texelFetch(sampler2D(input_color, input_sampler), renderCoords, 0).rgb;
     uint pixel_index = uint(renderCoords.y) * uint(renderDims.x) + uint(renderCoords.x);
     uint instance_id = entity_id_buffer[pixel_index];
     bool streaming_temporal_reset =
@@ -167,16 +221,23 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
         (streaming_reset_instance_masks[instance_id] & 1u) != 0u;
     vec4 centerDn = decode_depth_normal(depth_normal_buffer[pixel_index]);
     PathDataRecord pathData = path_data_buffer[pixel_index];
-    float specularLum = luminance(pathData.direct_specular.rgb + pathData.indirect_specular.rgb);
-    float diffuseLum = luminance(pathData.direct_diffuse.rgb + pathData.indirect_diffuse.rgb + pathData.emissive_residual.rgb);
+    vec4 directSpecular = pathData.direct_specular;
+    vec4 indirectSpecular = pathData.indirect_specular;
+    vec4 directDiffuse = pathData.direct_diffuse;
+    vec4 indirectDiffuse = pathData.indirect_diffuse;
+    vec4 emissiveResidual = pathData.emissive_residual;
+    float specularLum = luminance(directSpecular.rgb + indirectSpecular.rgb);
+    float diffuseLum = luminance(directDiffuse.rgb + indirectDiffuse.rgb + emissiveResidual.rgb);
     float specularSignal = clamp(specularLum / max(specularLum + diffuseLum, 1.0e-4), 0.0, 1.0);
-    vec2 velocity_pixels = temporal_unpack_velocity_pixels(velocity_buffer[pixel_index], params.velocity_scale);
-    vec2 displayVelocityPixels = velocity_pixels * (vec2(displayDims) / max(vec2(renderDims), vec2(1.0)));
+    vec2 displayScale = vec2(displayDims) / max(vec2(renderDims), vec2(1.0));
+    bool centerVelocityValid = false;
+    vec2 displayVelocityPixels = longest_valid_display_velocity(renderCoords, renderDims, displayScale, centerVelocityValid);
     vec2 history_pos = temporal_reproject_pixel(coords, displayVelocityPixels);
     bool history_valid =
         params.enabled != 0u &&
         params.reset_history == 0u &&
         !streaming_temporal_reset &&
+        centerVelocityValid &&
         params.history_valid != 0u &&
         temporal_history_pixel_valid(history_pos, displayDims, 0.5) &&
         geometry_history_valid(renderCoords, renderDims, centerDn.x, centerDn.yzw);
@@ -184,39 +245,47 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
     vec3 output_value = current;
     sharpenAmount = params.camera_moving != 0u ? 0.0 : params.sharpen_strength * 0.35;
     if (history_valid) {
-        vec3 minColor;
-        vec3 maxColor;
+        vec3 meanColorPq;
+        vec3 sigmaColorPq;
         float meanLum;
         float sigmaLum;
-        neighborhood_stats(renderCoords, renderDims, current, minColor, maxColor, meanLum, sigmaLum);
+        neighborhood_stats_pq(renderCoords, renderDims, meanColorPq, sigmaColorPq, meanLum, sigmaLum);
 
-        vec3 historyRaw = load_history_bilinear(history_pos, displayDims);
-        vec3 history = clamp_history(historyRaw, minColor, maxColor);
+        vec3 currentPq = pq_encode(current);
+        vec3 historyRaw = load_history_catmull_rom(history_pos + vec2(0.5), displayDims);
+        vec3 historyRawPq = pq_encode(historyRaw);
+        vec3 historyPq = clamp_history_pq(historyRawPq, meanColorPq, sigmaColorPq);
+        vec3 history = pq_decode(historyPq);
         float currentLum = luminance(current);
         float historyLum = luminance(historyRaw);
         float clippedHistoryLum = luminance(history);
         float lumDelta = abs(currentLum - historyLum) / (max(currentLum, historyLum) + 0.02);
         float clipDelta = abs(historyLum - clippedHistoryLum) / (historyLum + 0.02);
         float neighborhoodDelta = abs(historyLum - meanLum) / (meanLum + sigmaLum + 0.02);
-        float motionConfidence = temporal_motion_confidence(displayVelocityPixels, 18.0, 0.12);
-        float motion = 1.0 - motionConfidence;
+        float motionWeight = smoothstep(0.0, 1.0, length(displayVelocityPixels));
+        float colorReactive = temporal_reactive_weight(lumDelta, clipDelta, neighborhoodDelta);
+        float staticReactiveDamping = mix(0.35, 1.0, motionWeight);
         float reactive = max(
-            temporal_reactive_weight(lumDelta, clipDelta, neighborhoodDelta),
-            clamp(pathData.emissive_residual.a, 0.0, 1.0));
+            colorReactive * staticReactiveDamping,
+            clamp(emissiveResidual.a, 0.0, 1.0));
+        vec2 distanceToLowResPixel = inputPos - vec2(renderCoords);
+        float upscalingFactor = displayScale.x;
+        float sampleWeight = clamp(1.0 - upscalingFactor * dot(distanceToLowResPixel, distanceToLowResPixel), 0.0, 1.0);
+        float blendWeight = clamp(max(motionWeight, sampleWeight) * params.feedback, 0.0, 1.0);
+        float motion = motionWeight;
         float specularReactive = smoothstep(0.35, 0.85, specularSignal) * max(motion, reactive);
+        float adaptiveReactive = max(reactive, specularReactive);
+        float reactiveCurrentWeight = adaptiveReactive * params.reactive_feedback;
+        reactiveCurrentWeight = min(reactiveCurrentWeight, mix(0.18, params.reactive_feedback, motionWeight));
+        blendWeight = clamp(max(
+            blendWeight,
+            max(motion * params.motion_feedback,
+                reactiveCurrentWeight)), 0.0, 1.0);
         sharpenAmount = params.camera_moving != 0u
             ? 0.0
-            : params.sharpen_strength * (1.0 - clamp(max(motion, reactive), 0.0, 1.0) * 0.65);
+            : params.sharpen_strength * (1.0 - clamp(max(motion, adaptiveReactive), 0.0, 1.0) * 0.65);
 
-        if (reactive >= 0.82 || lumDelta >= 0.85 || clipDelta >= 0.75 || specularReactive >= 0.72) {
-            float rejectAlpha = params.camera_moving != 0u ? params.reactive_feedback : 0.98;
-            output_value = mix(history, current, rejectAlpha);
-        } else {
-            float motionTarget = params.camera_moving != 0u ? params.motion_feedback : 0.95;
-            float alpha = mix(params.feedback, motionTarget, max(motion, reactive));
-            alpha = max(alpha, mix(0.0, 0.22, specularReactive));
-            output_value = mix(history, current, clamp(alpha, 0.06, 0.98));
-        }
+        output_value = pq_decode(mix(historyPq, currentPq, blendWeight));
     }
     return output_value;
 }

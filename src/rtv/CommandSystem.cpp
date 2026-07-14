@@ -1,6 +1,8 @@
 #include "rtv/CommandSystem.h"
 
+#include "rtv/BindlessResources.h"
 #include "rtv/Check.h"
+#include "rtv/GpuValidation.h"
 #include "rtv/NsightMarkers.h"
 #include "rtv/NsightPerfMarkers.h"
 #include "rtv/PathTracerRenderer.h"
@@ -15,8 +17,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 
 namespace rtv {
+static_assert(CommandSystem::framesInFlight == kBindlessTextureHeapVersionCount);
+
 namespace {
 
 void beginCommandBufferLabel(VkCommandBuffer commandBuffer, const char* name) {
@@ -105,6 +110,7 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
 
     uint32_t imageIndex = 0;
     VkResult acquireResult = VK_SUCCESS;
+    bool acquireSuboptimal = false;
 
     if (headless_) {
         imageIndex = headlessImageIndex_;
@@ -124,8 +130,19 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
             recreateSwapchainResources();
             return;
         }
-        checkVk(acquireResult, "vkAcquireNextImageKHR");
+        acquireSuboptimal = acquireResult == VK_SUBOPTIMAL_KHR;
+        if (acquireResult != VK_SUCCESS && !acquireSuboptimal) {
+            checkVk(acquireResult, "vkAcquireNextImageKHR");
+        }
         traceCommandPhase("acquire_image_end");
+    }
+
+    if (imageIndex >= imageInFlightFences_.size()) {
+        throw std::runtime_error("Swapchain returned an image index outside the tracked image set");
+    }
+    const VkFence imageFence = imageInFlightFences_[imageIndex];
+    if (imageFence != VK_NULL_HANDLE && imageFence != frame.inFlight) {
+        checkVk(vkWaitForFences(context_.device(), 1, &imageFence, VK_TRUE, UINT64_MAX), "vkWaitForFences(swapchain image)");
     }
 
     traceCommandPhase("reset_begin");
@@ -185,6 +202,7 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     traceCommandPhase("begin_nvperf_end");
     traceCommandPhase("submit_begin");
     submitFrame(frame, imageIndex, asyncComputeRecorded);
+    imageInFlightFences_[imageIndex] = frame.inFlight;
     traceCommandPhase("submit_end");
     endNsightPerfFrame();
     if (pathTracer_ != nullptr) {
@@ -218,7 +236,7 @@ void CommandSystem::drawFrame(float clearPhase, float deltaSeconds) {
     if (pathTracer_ != nullptr) {
         pathTracer_->markStreamlineReflexPresentEnd();
     }
-    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR || acquireSuboptimal) {
         recreateSwapchainResources();
     } else {
         checkVk(presentResult, "vkQueuePresentKHR");
@@ -298,6 +316,7 @@ void CommandSystem::createFrameResources() {
 }
 
 void CommandSystem::createPresentSemaphores() {
+    imageInFlightFences_.assign(swapchain_.imageCount(), VK_NULL_HANDLE);
     imageRenderFinished_.resize(swapchain_.imageCount());
     for (VkSemaphore& semaphore : imageRenderFinished_) {
         VkSemaphoreCreateInfo semaphoreInfo{};
@@ -331,6 +350,7 @@ void CommandSystem::destroyPresentSemaphores() {
         }
     }
     imageRenderFinished_.clear();
+    imageInFlightFences_.clear();
 }
 
 void CommandSystem::recreateSwapchainResources() {
@@ -426,7 +446,8 @@ void CommandSystem::recordPresentationCommands(VkCommandBuffer commandBuffer, ui
     }
     vkCmdEndRendering(commandBuffer);
 
-    if (resourceDemo_ != nullptr && pipelineDemo_ == nullptr && pathTracer_ == nullptr) {
+    if (resourceDemo_ != nullptr && pipelineDemo_ == nullptr && pathTracer_ == nullptr &&
+        swapchain_.supportsImageUsage(VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         transitionImage(
             commandBuffer,
             swapchainImage,
@@ -648,6 +669,7 @@ void CommandSystem::transitionImage(
     dependency.imageMemoryBarrierCount = 1;
     dependency.pImageMemoryBarriers = &barrier;
 
+    recordManualBarrierEscape("CommandSystem", "transitionImage", dependency);
     vkCmdPipelineBarrier2(commandBuffer, &dependency);
 }
 

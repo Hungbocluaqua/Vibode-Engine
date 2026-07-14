@@ -20,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cfloat>
 #include <cstdio>
@@ -2512,7 +2513,14 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
         }
     }
     updateJobCenterHistory(state);
+    state.viewport.activeTool = viewportPanel_.activeToolMode();
+    state.viewport.localTransform = viewportPanel_.localTransformMode();
+    state.viewport.snapEnabled = viewportPanel_.snapEnabled();
     dockspace_.begin(state, visibility_, requests);
+    if (requests.viewportCommand.has_value()) {
+        viewportPanel_.executeCommand(*requests.viewportCommand);
+        requests.viewportCommand.reset();
+    }
 
     if (requests.showProjectManager) {
         showProjectManager_ = true;
@@ -2608,7 +2616,7 @@ EditorRequests EditorLayer::draw(EditorRuntimeState& state) {
         debugProfilerPanel_.draw(state, requests);
     }
     if (visibility_.sceneStats) {
-        sceneStatsPanel_.draw(state);
+        sceneStatsPanel_.draw(state, requests);
     }
     if (visibility_.gpuDiagnostics) {
         gpuDiagnosticsPanel_.draw(state);
@@ -3996,21 +4004,23 @@ void EditorLayer::drawProjectManager(const ProjectManagerRuntimeState& state, Ed
 
 void EditorLayer::applyThemePreset() {
     const int preset = std::clamp(editorPrefs_.themePreset, 0, 2);
-    if (appliedThemePreset_ == preset) {
+    const float uiScale = std::clamp(editorPrefs_.uiScale, 0.75f, 1.75f);
+    if (appliedThemePreset_ == preset && std::abs(appliedUiScale_ - uiScale) < 0.001f) {
         return;
     }
     appliedThemePreset_ = preset;
+    appliedUiScale_ = uiScale;
 
     if (preset == 1) {
         ImGui::StyleColorsDark();
     } else {
         ImGui::StyleColorsDark();
         ImGuiStyle& style = ImGui::GetStyle();
-        style.WindowPadding = ImVec2(EditorUiMetric::panelPaddingX, EditorUiMetric::panelPaddingY);
-        style.FramePadding = ImVec2(EditorUiMetric::rowPaddingX, EditorUiMetric::rowPaddingY);
-        style.ItemSpacing = ImVec2(5.0f, 3.0f);
-        style.ItemInnerSpacing = ImVec2(4.0f, 2.0f);
-        style.ScrollbarSize = 10.0f;
+        style.WindowPadding = ImVec2(EditorUiMetric::panelPaddingX * uiScale, EditorUiMetric::panelPaddingY * uiScale);
+        style.FramePadding = ImVec2(EditorUiMetric::rowPaddingX * uiScale, EditorUiMetric::rowPaddingY * uiScale);
+        style.ItemSpacing = ImVec2(6.0f * uiScale, 4.0f * uiScale);
+        style.ItemInnerSpacing = ImVec2(5.0f * uiScale, 3.0f * uiScale);
+        style.ScrollbarSize = 11.0f * uiScale;
         style.WindowRounding = 0.0f;
         style.FrameRounding = preset == 2 ? 0.0f : EditorUiMetric::compactButtonRounding;
         style.GrabRounding = preset == 2 ? 0.0f : EditorUiMetric::compactButtonRounding;
@@ -4129,13 +4139,13 @@ void EditorLayer::applyWorkspacePreset() {
     visibility_.sceneHierarchy = preset != 3;
     visibility_.inspector = preset != 3;
     visibility_.assetBrowser = preset != 3;
-    visibility_.timeline = preset == 0;
+    visibility_.timeline = false;
     visibility_.log = preset != 3;
-    visibility_.console = false;
+    visibility_.console = preset == 0;
     visibility_.materialEditor = preset == 2;
     visibility_.renderSettings = preset != 2;
     visibility_.debugProfiler = false;
-    visibility_.sceneStats = preset == 1;
+    visibility_.sceneStats = preset == 0 || preset == 1;
     visibility_.gpuDiagnostics = false;
     visibility_.renderWorldSettings = false;
 }

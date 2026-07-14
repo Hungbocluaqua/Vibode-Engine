@@ -165,6 +165,42 @@ enum class RendererDebugView : uint32_t {
     RegirEnvironmentDirection = 149,
     RegirEnvironmentWeight = 150,
     RegirEnvironmentGeneration = 151,
+    RestirGiTarget = 152,
+    RestirGiSourcePdf = 153,
+    RestirGiWeightSum = 154,
+    RestirGiM = 155,
+    RestirGiConfidence = 156,
+    RestirGiVisibility = 157,
+    RestirDiLightMapStatus = 158,
+    NrdValidation = 159,
+    NrdDiffuseConfidence = 160,
+    NrdSpecularConfidence = 161,
+    NrdRawConfidenceGradient = 162,
+    NrdFilteredConfidenceGradient = 163,
+    NrdConfidenceHistory = 164,
+    PsrActiveMask = 165,
+    PsrDepth = 166,
+    PsrMotion = 167,
+    PsrNormalRoughness = 168,
+    PsrHitDistance = 169,
+    PsrAlbedoF0 = 170,
+    PsrRayDirection = 171,
+    DlssDepth = 172,
+    DlssMotionVectors = 173,
+    DlssInputColor = 174,
+    DlssOutputColor = 175,
+    DlssRrDiffuseAlbedo = 176,
+    DlssRrSpecularAlbedo = 177,
+    DlssRrNormals = 178,
+    DlssRrRoughness = 179,
+    DlssRrDiffuseHitDistance = 180,
+    DlssRrSpecularHitDistance = 181,
+    DlssRrReflectedAlbedo = 182,
+    DlssRrDisocclusionMask = 183,
+    DlssRrDiffuseRayDirection = 184,
+    DlssRrSpecularRayDirection = 185,
+    DlssRrDiffuseRayDirectionHitDistance = 186,
+    DlssRrSpecularRayDirectionHitDistance = 187,
 };
 
 enum class RestirMode : uint32_t {
@@ -302,10 +338,12 @@ inline constexpr uint32_t rendererDebugFlagRayTracingCounters = 1u << 0u;
 [[nodiscard]] const char* toneMapperName(ToneMapper toneMapper);
 [[nodiscard]] const char* restirModeName(RestirMode mode);
 [[nodiscard]] const char* restirDiModeName(RestirDiMode mode);
+[[nodiscard]] bool tryParseRestirDiMode(std::string_view value, RestirDiMode& out);
 [[nodiscard]] RestirDiMode parseRestirDiMode(std::string_view value);
 [[nodiscard]] const char* restirDiReservoirLayoutName(RestirDiReservoirLayout layout);
 [[nodiscard]] RestirDiReservoirLayout parseRestirDiReservoirLayout(std::string_view value);
 [[nodiscard]] const char* restirGiModeName(RestirGiMode mode);
+[[nodiscard]] bool tryParseRestirGiMode(std::string_view value, RestirGiMode& out);
 [[nodiscard]] RestirGiMode parseRestirGiMode(std::string_view value);
 [[nodiscard]] const char* restirGiReservoirLayoutName(RestirGiReservoirLayout layout);
 [[nodiscard]] RestirGiReservoirLayout parseRestirGiReservoirLayout(std::string_view value);

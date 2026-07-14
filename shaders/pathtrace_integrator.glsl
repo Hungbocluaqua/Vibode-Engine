@@ -67,6 +67,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.caustic_transmissive_hits = 0.0;
     components.caustic_visible_paths = 0.0;
     components.caustic_blocked_paths = 0.0;
+#if RTV_REGIR_TRACE_ENABLED
     components.regir_query_count = 0u;
     components.regir_selected_light = 0xffffffffu;
     components.regir_reservoir_weight = 0.0;
@@ -86,6 +87,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.regir_environment_mis_weight = 0.0;
     components.regir_environment_m = 0.0;
     components.regir_environment_generation_mismatch = 0u;
+#endif
     components.first_specular_probability = 0.0;
     components.direct_light_hit_distance = 65504.0;
     components.diffuse_hit_distance = 65504.0;
@@ -118,6 +120,8 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.primitive_id = 0xffffffffu;
     components.packed_velocity = 0u;
     components.packed_velocity_valid = 0u;
+    components.psr_candidate = 0u;
+    components.psr_guide = psr_invalid_guide();
 
     bool previousWasBrdfSample = false;
     uint previousEventType = PATH_EVENT_NONE;
@@ -139,7 +143,8 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     uint rrStartDepth = clamp(camera.max_bounces / 2u, 3u, 5u);
     for (uint bounce = 0u; bounce < bounceLimit; ++bounce) {
         rng ^= sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_PATH_SEED);
-        if (native2b_kernel_enabled() && bounce == 1u) {
+#if RTV_NATIVE2B_PIPELINE
+        if (bounce == 1u) {
             TerminalRayPayload terminalHit = trace_terminal_surface(ray.origin, ray.direction, 0.001, 10000.0);
             components.secondary_ray_direction = normalize(prevRayDir);
             if (terminalHit.hit == 0u) {
@@ -204,7 +209,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
 #if RTV_NATIVE2B_COMPACT_PRIMARY_LIGHTS
             Material terminalMaterial = terminal_material_for_hit_fast(terminalRayHit, ray.direction);
 #else
+#if RTV_MATERIAL_TEXTURES_ENABLED
             set_material_texture_lod(path_trace_material_texture_lod(1u, terminalHit.t));
+#endif
             Material terminalMaterial = material_for_hit(terminalRayHit, ray.direction);
 #endif
             const float terminalScale = camera.indirect_strength *
@@ -260,6 +267,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     vec3 terminalDirectLightRadiance;
                     vec3 terminalDirectLightNormal;
                     vec3 terminalRestirCandidateDirect;
+#if RTV_REGIR_TRACE_ENABLED
                     uint terminalRegirQueryCount;
                     uint terminalRegirSelectedLight;
                     float terminalRegirReservoirWeight;
@@ -279,6 +287,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     float terminalRegirEnvironmentMisWeight;
                     float terminalRegirEnvironmentM;
                     uint terminalRegirEnvironmentGenerationMismatch;
+#endif
                     terminalDirect = throughput * estimate_direct_lighting(
                         directRng,
                         terminalRayHit,
@@ -302,6 +311,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                         terminalDirectLightRadiance,
                         terminalDirectLightNormal,
                         terminalRestirCandidateDirect,
+#if RTV_REGIR_TRACE_ENABLED
                         terminalRegirQueryCount,
                         terminalRegirSelectedLight,
                         terminalRegirReservoirWeight,
@@ -321,6 +331,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                         terminalRegirEnvironmentMisWeight,
                         terminalRegirEnvironmentM,
                         terminalRegirEnvironmentGenerationMismatch,
+#endif
                         terminalCausticTransmissiveHits,
                         terminalCausticVisiblePaths,
                         terminalCausticBlockedPaths);
@@ -342,6 +353,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             }
             break;
         }
+#endif
         RayPayload hit = trace_surface(ray.origin, ray.direction, 0.001, 10000.0, ray.time);
         float segmentDistance = hit.hit != 0u ? hit.t : 10000.0;
 #if !RTV_NATIVE2B_PIPELINE
@@ -380,7 +392,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                 sky *= env_params.background_intensity;
             }
             vec3 env = throughput * (sky + sunDisk);
-            if (previousEventType == PATH_EVENT_BSDF && previousWasBrdfSample && env_params.enabled != 0u && debug_params.view != 27u) {
+            if (previousEventType == PATH_EVENT_BSDF && previousWasBrdfSample && env_params.enabled != 0u && renderer_debug_view() != 27u) {
                 float envPdf = environment_light_sampling_pdf(ray.direction, bounce);
                 if (envPdf > 1e-6) {
                     float skyWeight = power_heuristic(previousBrdfPdf, envPdf);
@@ -441,7 +453,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         }
         components.bounce_count += 1u;
 
+#if RTV_MATERIAL_TEXTURES_ENABLED
         set_material_texture_lod(path_trace_material_texture_lod(bounce, hit.t));
+#endif
         Material material = material_for_hit(hit, ray.direction);
         if (bounce == 0u) {
             did_hit = true;
@@ -491,9 +505,61 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.instance_id = hit.instance_id;
             components.mesh_id = hit.mesh_id;
             components.primitive_id = hit.primitive_id;
+            uvec2 psrPackedPosition = pack_world_position(hit.world_pos);
+            uint psrPrimaryVelocity = compute_surface_velocity(
+                hit.world_pos,
+                hit.local_pos,
+                hit.instance_id,
+                hit.mesh_id,
+                hit.primitive_id,
+                hit.barycentrics,
+                dims);
+            uint psrIdentity = pcg_hash(hit.instance_id ^ (hit.primitive_id * 0x9e3779b9u));
+            components.psr_guide.geometry = uvec4(
+                psrPackedPosition,
+                psr_pack_direction(hit.normal),
+                psrPrimaryVelocity);
+            components.psr_guide.material = uvec4(
+                packUnorm4x8(vec4(clamp(components.first_albedo, 0.0, 1.0), 1.0)),
+                packUnorm4x8(vec4(clamp(components.restir_di_f0, 0.0, 1.0), 1.0)),
+                psr_pack_direction(ray.direction),
+                psr_pack_metadata(true, false, material.roughness, psrIdentity));
+            components.psr_guide.distances = vec4(
+                min(hit.t, 65504.0),
+                max(dot(hit.world_pos - camera.pos.xyz, camera.forward.xyz), 0.0),
+                min(hit.t, 65504.0),
+                0.0);
+            components.packed_velocity = psrPrimaryVelocity;
+            components.packed_velocity_valid = 1u;
         } else if (bounce == 1u) {
             components.secondary_hit_distance = min(hit.t, 65504.0);
             components.secondary_ray_direction = normalize(prevRayDir);
+            if (components.psr_candidate != 0u) {
+                uvec2 psrPackedPosition = pack_world_position(hit.world_pos);
+                uint psrMotion = compute_surface_velocity(
+                    hit.world_pos,
+                    hit.local_pos,
+                    hit.instance_id,
+                    hit.mesh_id,
+                    hit.primitive_id,
+                    hit.barycentrics,
+                    dims);
+                uint psrIdentity = pcg_hash(hit.instance_id ^ (hit.primitive_id * 0x9e3779b9u));
+                components.psr_guide.geometry = uvec4(
+                    psrPackedPosition,
+                    psr_pack_direction(hit.normal),
+                    psrMotion);
+                components.psr_guide.material = uvec4(
+                    packUnorm4x8(vec4(clamp(pbr_diffuse_reflectance(material), 0.0, 1.0), 1.0)),
+                    packUnorm4x8(vec4(clamp(pbr_f0(material), 0.0, 1.0), 1.0)),
+                    psr_pack_direction(prevRayDir),
+                    psr_pack_metadata(true, true, material.roughness, psrIdentity));
+                components.psr_guide.distances = vec4(
+                    min(hit.t, 65504.0),
+                    max(dot(hit.world_pos - camera.pos.xyz, camera.forward.xyz), 0.0),
+                    components.psr_guide.distances.z,
+                    0.0);
+            }
         }
 
         const bool finalBounceFastPath =
@@ -505,7 +571,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             previousWasBrdfSample &&
             !restir_gi_enabled() &&
             !homogeneous_volume_enabled() &&
-            debug_params.view != 27u;
+            renderer_debug_view() != 27u;
         if (finalBounceFastPath) {
             Material terminalMaterial = decode_material(hit.material_id);
             const float terminalScale = camera.indirect_strength *
@@ -531,7 +597,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             break;
         }
 
-        if (camera.sunlight_enabled != 0u && debug_params.view != 27u) {
+        if (camera.sunlight_enabled != 0u && renderer_debug_view() != 27u) {
             float segDist = length(hit.world_pos - prevHitPos);
             if (bounce > 0u && segDist > 0.1) {
                 vec3 segTrans = atmosphere_segment_transmittance(prevHitPos, prevRayDir, segDist, 8);
@@ -539,7 +605,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             }
         }
 
-        if (bounce == 0u && debug_params.view == 24u) {
+        if (bounce == 0u && renderer_debug_view() == 24u) {
             float testPdf;
             uint envTestRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_ENVIRONMENT);
             vec3 testDir = sample_cosine_hemisphere(envTestRng, hit.normal, testPdf);
@@ -547,7 +613,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.secondary_env_miss = testHit.hit == 0u ? 1.0 : 0.0;
             return vec3(components.secondary_env_miss);
         }
-        if (bounce == 0u && debug_params.view == 26u) {
+        if (bounce == 0u && renderer_debug_view() == 26u) {
             float testPdf;
             uint envTestRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_ENVIRONMENT + 2u);
             vec3 testDir = sample_cosine_hemisphere(envTestRng, hit.normal, testPdf);
@@ -622,6 +688,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         uint causticTransmissiveHits;
         uint causticVisiblePaths;
         uint causticBlockedPaths;
+#if RTV_REGIR_TRACE_ENABLED
         uint regirQueryCount;
         uint regirSelectedLight;
         float regirReservoirWeight;
@@ -641,6 +708,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         float regirEnvironmentMisWeight;
         float regirEnvironmentM;
         uint regirEnvironmentGenerationMismatch;
+#endif
         vec3 direct = vec3(0.0);
         emissiveDirect = vec3(0.0);
         envDirect = vec3(0.0);
@@ -661,6 +729,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         causticTransmissiveHits = 0u;
         causticVisiblePaths = 0u;
         causticBlockedPaths = 0u;
+#if RTV_REGIR_TRACE_ENABLED
         regirQueryCount = 0u;
         regirSelectedLight = 0xffffffffu;
         regirReservoirWeight = 0.0;
@@ -680,6 +749,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         regirEnvironmentMisWeight = 0.0;
         regirEnvironmentM = 0.0;
         regirEnvironmentGenerationMismatch = 0u;
+#endif
         const bool allowSecondaryDirect = camera.restir_di_controls.y != 0u;
         if (!hitEmissiveSurface && (bounce == 0u || allowSecondaryDirect)) {
             uint directRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_LIGHT_SELECT);
@@ -741,6 +811,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     directLightRadiance,
                     directLightNormal,
                     restirCandidateDirect,
+#if RTV_REGIR_TRACE_ENABLED
                     regirQueryCount,
                     regirSelectedLight,
                     regirReservoirWeight,
@@ -760,6 +831,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     regirEnvironmentMisWeight,
                     regirEnvironmentM,
                     regirEnvironmentGenerationMismatch,
+#endif
                     causticTransmissiveHits,
                     causticVisiblePaths,
                     causticBlockedPaths);
@@ -771,6 +843,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         components.caustic_transmissive_hits += float(causticTransmissiveHits);
         components.caustic_visible_paths += float(causticVisiblePaths);
         components.caustic_blocked_paths += float(causticBlockedPaths);
+#if RTV_REGIR_TRACE_ENABLED
         if (regirQueryCount > 0u || regirEffectivePdf > 0.0) {
             components.regir_query_count += regirQueryCount;
             components.regir_selected_light = regirSelectedLight;
@@ -794,6 +867,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.regir_environment_m = regirEnvironmentM;
             components.regir_environment_generation_mismatch = regirEnvironmentGenerationMismatch;
         }
+#endif
         vec3 shadedDirect = direct;
         vec3 restirDirect = directSampleType != 0u ? throughput * restirCandidateDirect : vec3(0.0);
         vec3 nonRestirDirect = max(direct - restirDirect, vec3(0.0));
@@ -1016,6 +1090,8 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, true);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
+                components.psr_candidate = 1u;
+                components.psr_guide.material.z = psr_pack_direction(ray.direction);
             }
             previousEventType = PATH_EVENT_DELTA;
             continuedPath = true;
@@ -1046,12 +1122,17 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, true);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
+                components.psr_candidate = reflected && material.roughness <= 0.2 ? 1u : 0u;
+                if (components.psr_candidate != 0u) {
+                    components.psr_guide.material.z = psr_pack_direction(ray.direction);
+                }
             }
             previousEventType = PATH_EVENT_DELTA;
             continuedPath = true;
         } else {
             float bsdfPdf;
             uint bsdfRng = sample_dimension_seed(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_BSDF);
+            vec3 mirrorDirection = reflect(ray.direction, hit.normal);
             vec3 wi = sample_brdf(bsdfRng, material, wo, hit.normal, hit.tangent, hit.bitangent, bsdfPdf);
             rng ^= bsdfRng;
             float cosTheta = max(dot(hit.normal, wi), 0.0);
@@ -1069,6 +1150,12 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             throughput = clamp_path_throughput(throughput, bounce + 1u, material.roughness, false);
             if (bounce == 0u) {
                 components.first_bounce_throughput = throughput;
+                float mirrorAlignmentThreshold = mix(0.997, 0.90, clamp(material.roughness / 0.2, 0.0, 1.0));
+                components.psr_candidate = material.roughness <= 0.2 &&
+                    dot(normalize(wi), normalize(mirrorDirection)) >= mirrorAlignmentThreshold ? 1u : 0u;
+                if (components.psr_candidate != 0u) {
+                    components.psr_guide.material.z = psr_pack_direction(ray.direction);
+                }
             }
             continuedPath = true;
         }
@@ -1081,7 +1168,7 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
         prevRayDir = ray.direction;
 
         uint completedDepth = bounce + 1u;
-        if (completedDepth >= rrStartDepth && completedDepth < bounceLimit && debug_params.view != 27u) {
+        if (completedDepth >= rrStartDepth && completedDepth < bounceLimit && renderer_debug_view() != 27u) {
             float p = clamp(luminance(throughput), russian_roulette_min_survival(), 0.95);
             if (sample_dimension_1d(coords, camera.temporal_frame_index, bounce, SAMPLE_DIM_RUSSIAN_ROULETTE) > p) {
                 break;

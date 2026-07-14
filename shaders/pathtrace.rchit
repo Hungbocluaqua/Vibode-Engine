@@ -30,15 +30,16 @@ void main() {
     MeshRecord mesh = mesh_records[meshIndex];
     uint firstIndex = mesh.vertex_index_data.z;
     uint globalTriangleIndex = geometry_triangle_offset(meshIndex, tlasRecordIndex, gl_GeometryIndexEXT, firstIndex) + gl_PrimitiveID;
-    uint triIndex = globalTriangleIndex * 3u;
-    uint i0 = local_mesh_indices[triIndex + 0u];
-    uint i1 = local_mesh_indices[triIndex + 1u];
-    uint i2 = local_mesh_indices[triIndex + 2u];
+    uvec3 indices;
+    if (!ray_tracing_triangle_indices(globalTriangleIndex, indices)) {
+        payload.hit = 0u;
+        return;
+    }
 
     uvec4 skinningBinding = ray_tracing_gpu_skinning_binding(meshIndex);
-    LocalVertex v0 = ray_tracing_local_vertex_with_binding(skinningBinding, i0);
-    LocalVertex v1 = ray_tracing_local_vertex_with_binding(skinningBinding, i1);
-    LocalVertex v2 = ray_tracing_local_vertex_with_binding(skinningBinding, i2);
+    LocalVertex v0 = ray_tracing_local_vertex_with_binding(skinningBinding, indices.x);
+    LocalVertex v1 = ray_tracing_local_vertex_with_binding(skinningBinding, indices.y);
+    LocalVertex v2 = ray_tracing_local_vertex_with_binding(skinningBinding, indices.z);
     vec3 p0 = v0.position_uv_x.xyz;
     vec3 p1 = v1.position_uv_x.xyz;
     vec3 p2 = v2.position_uv_x.xyz;

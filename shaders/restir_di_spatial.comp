@@ -55,8 +55,36 @@ layout(set = 0, binding = 4, std140) uniform Params {
     uint materialVisibilityFlags;
     uint counterEnabled;
     uint rawOutputIsCurrentSample;
-    uint padding2;
+    float shadowDistanceBias;
+    uint lightVersion;
+    uint environmentVersion;
 } params;
+
+layout(set = 0, binding = 24, std430) readonly buffer TemporalSourcePixels {
+    uint temporal_source_pixels[];
+};
+
+layout(set = 0, binding = 25, std430) writeonly buffer SpatialSourcePixels {
+    uint spatial_source_pixels[];
+};
+
+const uint RESTIR_DI_SOURCE_PIXEL_INVALID = 0xffffffffu;
+
+uint restir_di_pack_source_pixel(ivec2 p) {
+    if (p.x < 0 || p.y < 0 || p.x > 65534 || p.y > 65534) {
+        return RESTIR_DI_SOURCE_PIXEL_INVALID;
+    }
+    return uint(p.x) | (uint(p.y) << 16u);
+}
+
+uint restir_di_input_source_pixel(uint pixelIndex, ivec2 fallbackCoords) {
+    uint fallback = restir_di_pack_source_pixel(fallbackCoords);
+    if (params.temporalMaxAge == 0u) {
+        return fallback;
+    }
+    uint source = temporal_source_pixels[pixelIndex];
+    return source == RESTIR_DI_SOURCE_PIXEL_INVALID ? fallback : source;
+}
 
 #define DI_COUNTER_ADD(counter, value) ((params.counterEnabled != 0u) ? atomicAdd(counter, value) : 0u)
 
@@ -126,11 +154,13 @@ void main() {
                          RESTIR_DI_SURFACE_UNLIT |
                          RESTIR_DI_SURFACE_UNSUPPORTED)) != 0u) {
         spatial_reservoirs[pixelIndex] = temporal_reservoirs[pixelIndex];
+        spatial_source_pixels[pixelIndex] = restir_di_input_source_pixel(pixelIndex, coords);
         return;
     }
 
     // Load center temporal reservoir as starting point
     RestirDiReservoir merged = temporal_reservoirs[pixelIndex];
+    uint mergedSourcePixel = restir_di_input_source_pixel(pixelIndex, coords);
     // Neighboring temporal reservoirs contain heavily overlapping histories.
     // Treat each input reservoir as one normalized representative estimate for
     // this spatial stage; importing every historical M again would count the
@@ -147,6 +177,7 @@ void main() {
 
     if (params.spatialResultValid == 0u || params.spatialRounds == 0u) {
         spatial_reservoirs[pixelIndex] = merged;
+        spatial_source_pixels[pixelIndex] = mergedSourcePixel;
         return;
     }
 
@@ -154,8 +185,18 @@ void main() {
     float maxNeighborLum = 0.0;
     uint neighborCount = 0u;
     bool selectedNeighbor = false;
+    uint localSpatialRounds = params.spatialRounds;
+    uint currentSourcePixel = restir_di_pack_source_pixel(coords);
+    bool sourceIsCurrent = mergedSourcePixel == currentSourcePixel ||
+        mergedSourcePixel == RESTIR_DI_SOURCE_PIXEL_INVALID;
+    bool unstableHistory = sourceIsCurrent ||
+        (restir_di_confidence(merged) < 0.35 &&
+         restir_di_previous_weight(merged) < 0.15);
+    if (unstableHistory && localSpatialRounds < 8u) {
+        localSpatialRounds = min(localSpatialRounds + 1u, 8u);
+    }
 
-    for (uint roundIndex = 0u; roundIndex < params.spatialRounds; ++roundIndex) {
+    for (uint roundIndex = 0u; roundIndex < localSpatialRounds; ++roundIndex) {
         ivec2 sampleCoords = coords + blue_noise_offset(coords, roundIndex);
         if (sampleCoords.x < 0 || sampleCoords.y < 0 ||
             sampleCoords.x >= int(params.width) || sampleCoords.y >= int(params.height)) {
@@ -182,7 +223,12 @@ void main() {
         }
         RestirDiLightRecord candidateLight;
         uint resolvedLightIndex;
-        if (!restir_di_resolve_light(candidate, candidateLight, resolvedLightIndex)) {
+        if (!restir_di_resolve_light(
+                candidate,
+                candidateLight,
+                resolvedLightIndex,
+                params.lightVersion,
+                params.environmentVersion)) {
             DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_LIGHT_REJECTED], 1u);
             continue;
         }
@@ -206,14 +252,6 @@ void main() {
         vec3 centerPosition = centerReceiver.worldPosition_depth.xyz;
         float distToLight;
         uint candidateKind = restir_di_light_kind(candidate);
-        if (restir_di_light_kind_infinite(candidateKind) && params.visibilityPolicy == 0u) {
-            // Initial sampling still includes sun/environment. Do not spatially
-            // shift infinite-light reservoirs in production until final
-            // visibility/transmittance for shifted sky/sun samples is exact.
-            mergedMFloat += 1.0;
-            DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_LIGHT_REJECTED], 1u);
-            continue;
-        }
         vec3 candidateLightNormal = restir_di_light_normal(candidate);
         if (candidateKind == RESTIR_DI_LIGHT_AREA || candidateKind == RESTIR_DI_LIGHT_SPOT) {
             candidateLightNormal = normalize(vec3(candidateLight.data1.w, candidateLight.data2.w, candidateLight.data3.x));
@@ -244,9 +282,10 @@ void main() {
 
         // Visibility check in ReferenceValidation mode
         bool visibilityChecked = false;
+        float finiteLightDistanceBias = max(params.shadowDistanceBias, RESTIR_DI_VISIBILITY_EPSILON * 2.0);
         if (params.visibilityPolicy == 1u && roundIndex < params.visibilityRayBudget &&
-            distToLight > RESTIR_DI_VISIBILITY_EPSILON * 2.0) {
-            float tmax = distToLight - RESTIR_DI_VISIBILITY_EPSILON * 2.0;
+            distToLight > finiteLightDistanceBias) {
+            float tmax = distToLight - finiteLightDistanceBias;
             vec3 shadowOrigin = centerPosition +
                 candidateDirection * RESTIR_DI_VISIBILITY_EPSILON +
                 centerNormal * RESTIR_DI_VISIBILITY_EPSILON;
@@ -318,6 +357,7 @@ void main() {
         mergedMFloat += 1.0;
         if (rngValue < selectionProbability) {
             selectedNeighbor = true;
+            mergedSourcePixel = restir_di_input_source_pixel(sampleIndex, sampleCoords);
         }
 
         neighborLuminanceSum += targetAtCenter;
@@ -359,10 +399,11 @@ void main() {
     restir_di_set_valid(merged, restir_di_reservoir_valid(merged));
 
     spatial_reservoirs[pixelIndex] = merged;
+    spatial_source_pixels[pixelIndex] = mergedSourcePixel;
     if (neighborCount > 0u) {
         DI_COUNTER_ADD(counters.values[selectedNeighbor
             ? RESTIR_DI_COUNTER_SPATIAL_SELECTED_NEIGHBOR
             : RESTIR_DI_COUNTER_SPATIAL_SELECTED_CENTER], 1u);
     }
-    DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_ROUNDS], params.spatialRounds);
+    DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_SPATIAL_ROUNDS], localSpatialRounds);
 }

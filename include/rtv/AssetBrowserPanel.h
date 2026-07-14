@@ -167,8 +167,10 @@ private:
     std::string selectedRecordGuid_;
     std::vector<std::filesystem::path> backStack_;
     std::vector<std::filesystem::path> forwardStack_;
-    bool gridView_ = false;
-    bool showDetails_ = true;
+    int viewMode_ = 0;
+    bool gridView_ = true;
+    bool showDetails_ = false;
+    bool presentationPreferencesLoaded_ = false;
     bool compatibilityMode_ = true;
     bool openImportSettings_ = false;
     int importMode_ = 0;

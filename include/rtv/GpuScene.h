@@ -284,6 +284,12 @@ public:
     [[nodiscard]] const std::vector<VkDescriptorImageInfo>& materialTextureDescriptors() const { return materialTextureTable_.descriptors(); }
     [[nodiscard]] std::vector<VkDescriptorImageInfo> materialCombinedDescriptors() const;
     [[nodiscard]] VkDescriptorImageInfo materialCombinedDescriptor(uint32_t slot) const;
+    [[nodiscard]] bool streamedMaterialTextureDescriptor(
+        const SceneAsset& scene,
+        TextureAssetHandle texture,
+        const Image& image,
+        uint32_t& slotOut,
+        VkDescriptorImageInfo& descriptorOut) const;
     [[nodiscard]] VkSampler materialSampler() const { return materialSampler_; }
     [[nodiscard]] const BindlessTextureTable& materialTextureTable() const { return materialTextureTable_; }
     [[nodiscard]] VkImageView materialTextureImageView(uint32_t index) const { return materialTextureTable_.imageView(index); }
@@ -302,6 +308,7 @@ public:
     [[nodiscard]] const std::vector<GpuLightRecord>& lightRecordsCpu() const { return lightRecordCpu_; }
     [[nodiscard]] const OpacityMicromapCpuData& opacityMicromapData() const { return opacityMicromapData_; }
     [[nodiscard]] bool hasTransmissiveMaterials() const { return hasTransmissiveMaterials_; }
+    [[nodiscard]] bool hasMaterialTextures() const { return hasMaterialTextures_; }
 
     struct MemoryBreakdown {
         VkDeviceSize totalBufferBytes = 0;
@@ -378,7 +385,7 @@ private:
 
     void createCornellBox(BufferUploader& uploader);
     void createImportedScene(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
-    void createImportedSceneFromCache(BufferUploader& uploader, const CachedScene& cached, const std::vector<SceneLightAsset>& activeSceneLights);
+    void createImportedSceneFromCache(BufferUploader& uploader, const CachedScene& cached, const SceneAsset& activeScene);
     void createImportedSceneGeometryFromCache(BufferUploader& uploader, const CachedScene& cached, const SceneAsset& activeScene);
     void createDefaultMaterialTexture(BufferUploader& uploader);
     void createImportedMaterialTextures(BufferUploader& uploader, const SceneAsset& importedScene, const AssetManager& assets);
@@ -466,6 +473,7 @@ private:
     std::vector<GpuLightRecord> emissiveLightRecords_;
     std::vector<GpuInstanceRecord> instanceRecordCpu_;
     bool hasTransmissiveMaterials_ = false;
+    bool hasMaterialTextures_ = false;
 };
 
 } // namespace rtv

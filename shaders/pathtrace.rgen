@@ -4,6 +4,9 @@
 #ifndef RTV_NATIVE2B_PIPELINE
 #define RTV_NATIVE2B_PIPELINE 0
 #endif
+#if !RTV_NATIVE2B_PIPELINE
+#extension GL_EXT_ray_query : require
+#endif
 #ifndef RTV_BEAUTY_OUTPUT_ONLY
 #define RTV_BEAUTY_OUTPUT_ONLY 0
 #endif
@@ -29,9 +32,13 @@ uint restir_gi_receiver_material_id(RestirGiReceiver r) { return r.materialIds.x
 #include "restir_gi_reconnection.glsl"
 
 layout(set = 0, binding = 33) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 72, std430) buffer PsrGuideBuffer { PsrGuideRecord psr_guide_buffer[]; };
+layout(set = 0, binding = 73, std430) buffer PsrGuideSignatureBuffer { uint psr_guide_signature_buffer[]; };
 layout(location = 0) rayPayloadEXT RayPayload payload;
 layout(location = 1) rayPayloadEXT uint shadow_occluded;
+#if RTV_NATIVE2B_PIPELINE
 layout(location = 2) rayPayloadEXT TerminalRayPayload terminal_payload;
+#endif
 
 const uint RAY_MASK_CAMERA = 0x01u;
 const uint RAY_MASK_SHADOW = 0x02u;
@@ -85,6 +92,7 @@ struct PathComponents {
     float caustic_transmissive_hits;
     float caustic_visible_paths;
     float caustic_blocked_paths;
+#if RTV_REGIR_TRACE_ENABLED
     uint regir_query_count;
     uint regir_selected_light;
     float regir_reservoir_weight;
@@ -104,6 +112,7 @@ struct PathComponents {
     float regir_environment_mis_weight;
     float regir_environment_m;
     uint regir_environment_generation_mismatch;
+#endif
     float first_specular_probability;
     float direct_light_hit_distance;
     float diffuse_hit_distance;
@@ -136,6 +145,8 @@ struct PathComponents {
     uint primitive_id;
     uint packed_velocity;
     uint packed_velocity_valid;
+    uint psr_candidate;
+    PsrGuideRecord psr_guide;
 };
 
 struct Ray {
@@ -191,6 +202,8 @@ void main() {
         world_position_buffer[pixel_index] = uvec2(0u);
         velocity_buffer[pixel_index] = packedVelocity;
         path_data_buffer[pixel_index] = empty_adaptive_path_data();
+        psr_guide_buffer[pixel_index] = psr_invalid_guide();
+        psr_guide_signature_buffer[pixel_index] = 0u;
         entity_id_buffer[pixel_index] = 0xffffffffu;
         if (restir_mode() != 0u) {
             restir_reservoirs[pixel_index] = empty_restir_reservoir();
@@ -285,7 +298,14 @@ void main() {
 #endif
     vec4 previous = (camera.frame_count <= 1u || camera.path_tracing_enabled == 0u) ? vec4(0.0) : accumulation_buffer[pixel_index];
     vec3 previous_average = previous.rgb / max(previous.a, 1.0);
+    vec3 unclamped_sample_color = max(sample_color, vec3(0.0));
     sample_color = clamp_firefly_sample(sample_color, previous_average, camera.frame_count);
+    float sampleClampScale = 1.0;
+    float unclampedSampleLum = dot(unclamped_sample_color, vec3(0.2126, 0.7152, 0.0722));
+    float clampedSampleLum = dot(max(sample_color, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+    if (unclampedSampleLum > 1.0e-6 && clampedSampleLum < unclampedSampleLum) {
+        sampleClampScale = clamp(clampedSampleLum / unclampedSampleLum, 0.0, 1.0);
+    }
     vec3 rr_sample_color = sample_color;
     vec4 accumulated = previous + vec4(sample_color, 1.0);
     accumulation_buffer[pixel_index] = accumulated;
@@ -302,10 +322,10 @@ void main() {
         ? clamp(1.0 - abs(lum - avgLum) / (max(max(lum, avgLum), 0.0) + 1.0), 0.0, 1.0)
         : 0.0;
     float primaryHitDistance = did_hit ? min(hit_depth, 65504.0) : 65504.0;
-    vec3 directDiffuseSignal = components.direct_light * pathDiffuseWeight;
-    vec3 directSpecularSignal = components.direct_light * pathSpecularWeight;
-    vec3 indirectDiffuseSignal = (components.indirect_light + components.environment_light) * pathDiffuseWeight;
-    vec3 indirectSpecularSignal = (components.indirect_light + components.environment_light) * pathSpecularWeight;
+    vec3 directDiffuseSignal = components.direct_light * pathDiffuseWeight * sampleClampScale;
+    vec3 directSpecularSignal = components.direct_light * pathSpecularWeight * sampleClampScale;
+    vec3 indirectDiffuseSignal = (components.indirect_light + components.environment_light) * pathDiffuseWeight * sampleClampScale;
+    vec3 indirectSpecularSignal = (components.indirect_light + components.environment_light) * pathSpecularWeight * sampleClampScale;
     float directDiffuseWeight = luminance(max(directDiffuseSignal, vec3(0.0)));
     float directSpecularWeight = luminance(max(directSpecularSignal, vec3(0.0)));
     float indirectDiffuseWeight = luminance(max(indirectDiffuseSignal, vec3(0.0)));
@@ -339,7 +359,7 @@ void main() {
             fallbackRayDirection)
         : fallbackRayDirection;
     PathDataRecord pathData;
-    float emissiveSignal = luminance(components.emissive_light);
+    float emissiveSignal = luminance(components.emissive_light * sampleClampScale);
     pathData.direct_diffuse = vec4(directDiffuseSignal, emissiveSignal);
     pathData.direct_specular = vec4(directSpecularSignal, primaryHitDistance);
     pathData.indirect_diffuse = vec4(indirectDiffuseSignal, confidence);
@@ -359,9 +379,9 @@ void main() {
     pathData.specular_ray_direction_hit_distance = vec4(
         components.specular_ray_direction,
         components.specular_hit_distance);
-    pathData.emissive_residual = vec4(max(components.visible_emissive_light, vec3(0.0)), 0.0);
+    pathData.emissive_residual = vec4(max(components.visible_emissive_light * sampleClampScale, vec3(0.0)), 0.0);
     vec3 restirGiCurrentFallback = components.restir_gi_candidate_valid != 0u
-        ? components.restir_gi_candidate_radiance / max(components.restir_gi_candidate_source_pdf, 1.0e-8)
+        ? (components.restir_gi_candidate_radiance * sampleClampScale) / max(components.restir_gi_candidate_source_pdf, 1.0e-8)
         : vec3(0.0);
     pathData.restir_gi_fallback_reactive = vec4(max(restirGiCurrentFallback, vec3(0.0)), pathSpecularWeight);
     path_data_buffer[pixel_index] = pathData;
@@ -378,9 +398,23 @@ void main() {
                 ivec2(size)))
         : compute_sky_velocity(ray.direction, ivec2(size));
     velocity_buffer[pixel_index] = packedVelocity;
+    if (psr_guide_valid(components.psr_guide)) {
+        components.psr_guide.geometry.w = psr_guide_active(components.psr_guide)
+            ? components.psr_guide.geometry.w
+            : packedVelocity;
+    }
+    psr_guide_buffer[pixel_index] = components.psr_guide;
+    psr_guide_signature_buffer[pixel_index] = psr_guide_signature(components.psr_guide);
     store_initial_restir_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
     if (!native2b_kernel_enabled() || restir_gi_enabled() || restir_gi_debug_view()) {
-        store_initial_restir_gi_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, components);
+        PathComponents restirGiComponents = components;
+        if (sampleClampScale < 0.999999 && restirGiComponents.restir_gi_candidate_valid != 0u) {
+            restirGiComponents.restir_gi_candidate_radiance *= sampleClampScale;
+            restirGiComponents.restir_gi_candidate_suffix_radiance *= sampleClampScale;
+            restirGiComponents.restir_gi_candidate_target_pdf =
+                max(luminance(max(restirGiComponents.restir_gi_candidate_radiance, vec3(0.0))), 1.0e-8);
+        }
+        store_initial_restir_gi_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, restirGiComponents);
         store_restir_gi_receiver(pixel_index, ivec2(pixel), packedVelocity, components, hit_position, hit_normal, hit_depth, did_hit);
     }
     if (restir_di_raygen_params.width != 0u) {
@@ -637,12 +671,16 @@ void main() {
         output_value = vec3(previousWeight, 1.0 - previousWeight, clamp(restir_reservoirs[pixel_index].sample_value_confidence.a, 0.0, 1.0));
     } else if (debug_params.view == 68u) {
         RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
-        RestirGiReservoir previousReservoir = previous_restir_gi_reservoirs[pixel_index];
-        RestirGiReservoir spatialReservoir = restir_gi_spatial_reservoirs[pixel_index];
-        output_value = vec3(
-            restir_gi_reservoir_valid(reservoir) ? 1.0 : 0.0,
-            restir_gi_reservoir_valid(previousReservoir) ? 1.0 : 0.0,
-            restir_gi_reservoir_valid(spatialReservoir) ? 1.0 : 0.0);
+        if ((camera.restir_gi_controls.y & 8u) == 0u) {
+            output_value = vec3(restir_gi_reservoir_valid(reservoir) ? 1.0 : 0.0);
+        } else {
+            RestirGiReservoir previousReservoir = previous_restir_gi_reservoirs[pixel_index];
+            RestirGiReservoir spatialReservoir = restir_gi_spatial_reservoirs[pixel_index];
+            output_value = vec3(
+                restir_gi_reservoir_valid(reservoir) ? 1.0 : 0.0,
+                restir_gi_reservoir_valid(previousReservoir) ? 1.0 : 0.0,
+                restir_gi_reservoir_valid(spatialReservoir) ? 1.0 : 0.0);
+        }
     } else if (debug_params.view == 69u) {
         RestirGiReservoir reservoir = restir_gi_reservoirs[pixel_index];
         output_value = vec3(
@@ -714,6 +752,33 @@ void main() {
             temporal_normalized_hit_distance(pathData.denoiser_hit_distance.x),
             temporal_normalized_hit_distance(pathData.denoiser_hit_distance.y),
             clamp(pathData.indirect_diffuse.a, 0.0, 1.0));
+    } else if (debug_params.view == 165u) {
+        output_value = psr_guide_active(components.psr_guide)
+            ? vec3(0.05, 1.0, 0.25)
+            : (psr_guide_valid(components.psr_guide) ? vec3(0.12) : vec3(0.0));
+    } else if (debug_params.view == 166u) {
+        float viewZ = psr_guide_valid(components.psr_guide) ? components.psr_guide.distances.y : 0.0;
+        output_value = vec3(clamp(log2(max(viewZ, 0.0) + 1.0) / 16.0, 0.0, 1.0));
+    } else if (debug_params.view == 167u) {
+        vec2 motion = psr_guide_motion_pixels(components.psr_guide);
+        output_value = vec3(clamp(abs(motion) / 32.0, vec2(0.0), vec2(1.0)),
+            psr_guide_active(components.psr_guide) ? 1.0 : 0.0);
+    } else if (debug_params.view == 168u) {
+        vec3 normal = psr_guide_normal(components.psr_guide);
+        output_value = psr_guide_valid(components.psr_guide)
+            ? vec3(normal.xy * 0.5 + 0.5, psr_guide_roughness(components.psr_guide))
+            : vec3(0.0);
+    } else if (debug_params.view == 169u) {
+        float hitDistance = psr_guide_valid(components.psr_guide) ? components.psr_guide.distances.x : 0.0;
+        output_value = vec3(temporal_normalized_hit_distance(hitDistance));
+    } else if (debug_params.view == 170u) {
+        output_value = pixel.x < size.x / 2u
+            ? psr_guide_diffuse_albedo(components.psr_guide)
+            : psr_guide_specular_f0(components.psr_guide);
+    } else if (debug_params.view == 171u) {
+        output_value = psr_guide_valid(components.psr_guide)
+            ? psr_guide_ray_direction(components.psr_guide) * 0.5 + 0.5
+            : vec3(0.0);
     }
     imageStore(output_color, ivec2(pixel), vec4(output_value, 1.0));
 #endif

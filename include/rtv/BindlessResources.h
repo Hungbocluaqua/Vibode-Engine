@@ -4,6 +4,7 @@
 
 #include <Volk/volk.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -11,6 +12,8 @@
 #include <vector>
 
 namespace rtv {
+
+inline constexpr uint32_t kBindlessTextureHeapVersionCount = 3;
 
 class Image;
 class Buffer;
@@ -21,6 +24,11 @@ struct BindlessCapabilities {
     bool partiallyBound = false;
     bool updateAfterBind = false;
     uint32_t maxSampledImages = 0;
+    uint32_t maxPerStageSampledImages = 0;
+    uint32_t maxPerStageSamplers = 0;
+    uint32_t maxDescriptorSetSampledImages = 0;
+    uint32_t maxDescriptorSetSamplers = 0;
+    uint32_t maxUpdateAfterBindDescriptorsInAllPools = 0;
 };
 
 [[nodiscard]] BindlessCapabilities queryBindlessCapabilities(VkPhysicalDevice physicalDevice);
@@ -56,22 +64,29 @@ public:
     void destroy();
     void updateAll(const std::vector<VkDescriptorImageInfo>& descriptors);
     void patch(uint32_t slot, const VkDescriptorImageInfo& descriptor);
+    void beginFrame(uint32_t frameIndex);
 
     [[nodiscard]] VkDescriptorSetLayout layout() const { return layout_; }
-    [[nodiscard]] VkDescriptorSet descriptorSet() const { return descriptorSet_; }
+    [[nodiscard]] VkDescriptorSet descriptorSet() const;
     [[nodiscard]] uint32_t capacity() const { return capacity_; }
     [[nodiscard]] uint32_t patchCount() const { return patchCount_; }
-    [[nodiscard]] bool initialized() const { return descriptorSet_ != VK_NULL_HANDLE; }
+    [[nodiscard]] bool initialized() const { return descriptorSets_.front() != VK_NULL_HANDLE; }
     [[nodiscard]] BindlessTextureHeapStats stats() const;
 
 private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, kBindlessTextureHeapVersionCount> descriptorSets_{};
+    std::array<uint64_t, kBindlessTextureHeapVersionCount> appliedGenerations_{};
+    std::vector<VkDescriptorImageInfo> descriptors_;
+    std::vector<uint8_t> descriptorValid_;
+    uint64_t descriptorGeneration_ = 0;
+    uint32_t currentFrameSlot_ = 0;
     uint32_t capacity_ = 0;
     uint32_t descriptorCount_ = 0;
     uint32_t patchCount_ = 0;
+    bool frameSetSelected_ = false;
 };
 
 struct TextureHandle { uint32_t index = UINT32_MAX; [[nodiscard]] bool valid() const { return index != UINT32_MAX; } };

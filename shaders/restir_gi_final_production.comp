@@ -39,6 +39,10 @@ const uint GI_COUNTER_VISIBILITY_RAYS = 42u;
 const uint GI_COUNTER_VISIBILITY_UNKNOWN = 43u;
 const uint GI_COUNTER_VERSION_REJECT = 44u;
 const uint GI_COUNTER_NON_FINITE = 45u;
+const uint GI_COUNTER_CONTRACT_INVALID_SOURCE_PDF = 48u;
+const uint GI_COUNTER_CONTRACT_INVALID_TARGET_PDF = 49u;
+const uint GI_COUNTER_SOURCE_PDF_PARITY_MISMATCH = 50u;
+const uint GI_COUNTER_TARGET_PDF_PARITY_MISMATCH = 51u;
 
 const uint DEBUG_VIEW_RESTIR_GI_VALIDITY = 68u;
 const uint DEBUG_VIEW_RESTIR_GI_AGE = 69u;
@@ -50,6 +54,12 @@ const uint DEBUG_VIEW_RESTIR_GI_NORMAL = 90u;
 const uint DEBUG_VIEW_RESTIR_GI_HIT_DISTANCE = 91u;
 const uint DEBUG_VIEW_RESTIR_GI_GRID = 127u;
 const uint DEBUG_VIEW_RESTIR_GI_PATH_CLASS = 128u;
+const uint DEBUG_VIEW_RESTIR_GI_TARGET = 152u;
+const uint DEBUG_VIEW_RESTIR_GI_SOURCE_PDF = 153u;
+const uint DEBUG_VIEW_RESTIR_GI_WEIGHT_SUM = 154u;
+const uint DEBUG_VIEW_RESTIR_GI_M = 155u;
+const uint DEBUG_VIEW_RESTIR_GI_CONFIDENCE = 156u;
+const uint DEBUG_VIEW_RESTIR_GI_VISIBILITY = 157u;
 
 layout(push_constant, std430) uniform PushConstants {
     uint width;
@@ -72,6 +82,42 @@ layout(push_constant, std430) uniform PushConstants {
 
 const uint GI_ACTIVE_TILE_SIZE = 16u;
 
+void record_prod_contract_violation(ProdRestirGiReservoir reservoir) {
+    if ((prod_unpack_flags(reservoir) & PROD_FLAG_VALID) == 0u) return;
+    if (prod_contract_invalid_source_pdf(reservoir)) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_CONTRACT_INVALID_SOURCE_PDF], 1u);
+    }
+    if (prod_contract_invalid_target_pdf(reservoir)) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_CONTRACT_INVALID_TARGET_PDF], 1u);
+    }
+}
+
+bool relative_mismatch(float storedValue, float evaluatedValue, float tolerance) {
+    if (!prod_contract_finite(storedValue) || !prod_contract_finite(evaluatedValue)) {
+        return true;
+    }
+    float scale = max(max(abs(storedValue), abs(evaluatedValue)), 1.0e-6);
+    return abs(storedValue - evaluatedValue) / scale > tolerance;
+}
+
+void record_prod_parity_violation(ProdRestirGiReservoir reservoir, float storedTarget, float distance) {
+    bool environment = prod_unpack_path_class(reservoir) == PROD_PATH_CLASS_ENVIRONMENT_REUSABLE ||
+        (prod_unpack_flags(reservoir) & PROD_FLAG_ENVIRONMENT) != 0u;
+    float sourceDistance = environment ? distance : max(abs(reservoir.x2PositionDistance.w), 1.0e-4);
+    float reconstructedSourcePdf = restir_gi_source_measure_pdf(
+        reservoir.sourceDirectionBsdfPdf.w,
+        reservoir.sourceDirectionBsdfPdf.xyz,
+        reservoir.x2NormalRoughness.xyz,
+        sourceDistance,
+        environment);
+    if (relative_mismatch(prod_unpack_source_pdf(reservoir), reconstructedSourcePdf, 1.0e-4)) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SOURCE_PDF_PARITY_MISMATCH], 1u);
+    }
+    if (relative_mismatch(storedTarget, prod_unpack_target(reservoir), 1.0e-4)) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_TARGET_PDF_PARITY_MISMATCH], 1u);
+    }
+}
+
 bool active_tile_contains(ivec2 pixel) {
     if (!GI_ACTIVE_TILE_MASK_ENABLED) return true;
     uint tileColumns = (pc.width + GI_ACTIVE_TILE_SIZE - 1u) / GI_ACTIVE_TILE_SIZE;
@@ -90,7 +136,8 @@ vec2 unpack_velocity_pixels(uint packed) {
 bool is_gi_debug(uint view) {
     return (view >= DEBUG_VIEW_RESTIR_GI_VALIDITY && view <= DEBUG_VIEW_RESTIR_GI_FINAL) ||
         view == DEBUG_VIEW_RESTIR_GI_NORMAL || view == DEBUG_VIEW_RESTIR_GI_HIT_DISTANCE ||
-        view == DEBUG_VIEW_RESTIR_GI_GRID || view == DEBUG_VIEW_RESTIR_GI_PATH_CLASS;
+        view == DEBUG_VIEW_RESTIR_GI_GRID || view == DEBUG_VIEW_RESTIR_GI_PATH_CLASS ||
+        (view >= DEBUG_VIEW_RESTIR_GI_TARGET && view <= DEBUG_VIEW_RESTIR_GI_VISIBILITY);
 }
 
 bool trace_visibility(RestirGiReceiver receiver, ProdRestirGiReservoir reservoir) {
@@ -117,6 +164,15 @@ bool trace_visibility(RestirGiReceiver receiver, ProdRestirGiReservoir reservoir
     return visibility == RESTIR_DI_VISIBILITY_VISIBLE;
 }
 
+vec3 clamp_gi_final_luminance(vec3 value, float maxLum) {
+    value = max(value, vec3(0.0));
+    float lum = restir_gi_luma(value);
+    if (maxLum <= 0.0 || lum <= maxLum || lum <= 1.0e-8) {
+        return value;
+    }
+    return value * (maxLum / lum);
+}
+
 vec3 evaluate_final(
     inout ProdRestirGiReservoir reservoir,
     RestirGiReceiver receiver,
@@ -127,13 +183,17 @@ vec3 evaluate_final(
 {
     confidence = 0.0;
     visible = false;
-    if (!prod_reservoir_reusable(reservoir)) return vec3(0.0);
+    if (!prod_reservoir_reusable(reservoir)) {
+        record_prod_contract_violation(reservoir);
+        return vec3(0.0);
+    }
     if (prod_unpack_version_hash(reservoir) != restir_gi_receiver_version_hash(receiver)) {
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_VERSION_REJECT], 1u);
         return vec3(0.0);
     }
     float sourceTarget = prod_unpack_target(reservoir);
     if (!restir_gi_reconnect_sample(reservoir, receiver, pc.cameraPosition.xyz, direction, distance)) return vec3(0.0);
+    record_prod_parity_violation(reservoir, sourceTarget, distance);
     float shiftedWeight = prod_shifted_reservoir_weight(
         reservoir, sourceTarget, prod_unpack_target(reservoir));
     if (!restir_gi_finite(shiftedWeight) || shiftedWeight <= 0.0) {
@@ -188,6 +248,14 @@ vec3 class_color(uint c, float confidence) {
     return color * (0.25 + 0.75 * confidence);
 }
 
+vec3 scalar_contract_color(float value, float range) {
+    if (!restir_gi_finite(value) || value < 0.0) {
+        return vec3(1.0, 0.0, 0.8);
+    }
+    float normalizedValue = clamp(log2(max(value, 0.0) + 1.0) / max(range, 1.0e-6), 0.0, 1.0);
+    return vec3(normalizedValue, sqrt(normalizedValue), 1.0 - normalizedValue);
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height) || (pc.enabled & 1u) == 0u) return;
@@ -214,11 +282,16 @@ void main() {
     ProdRestirGiReservoir selected = useSpatial ? spatial : current;
     if (!debugGi && pc.referenceValidation == 0u &&
         (!restir_gi_receiver_valid_for_reuse(receiver) || !prod_reservoir_reusable(selected))) {
+        if (!prod_reservoir_reusable(selected)) record_prod_contract_violation(selected);
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_FINAL_FALLBACK], 1u);
         return;
     }
     PathDataRecord pathData = path_data_buffer[pixelIndex];
-    vec3 currentFallback = max(pathData.restir_gi_fallback_reactive.rgb, vec3(0.0));
+    vec4 giFallbackReactive = pathData.restir_gi_fallback_reactive;
+    vec3 currentFallback = max(giFallbackReactive.rgb, vec3(0.0));
+    if (pc.referenceValidation == 0u && pc.fireflyClamp > 0.0) {
+        currentFallback = clamp_gi_final_luminance(currentFallback, pc.fireflyClamp);
+    }
     if (useSpatial) GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_FINAL_SPATIAL_USED], 1u);
     else GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_FINAL_CURRENT_USED], 1u);
 
@@ -267,7 +340,7 @@ void main() {
     bool clamped = false;
     float finalLum = restir_gi_luma(finalSample);
     if (pc.referenceValidation == 0u && pc.fireflyClamp > 0.0 && finalLum > pc.fireflyClamp) {
-        finalSample *= pc.fireflyClamp / max(finalLum, 1.0e-8);
+        finalSample = clamp_gi_final_luminance(finalSample, pc.fireflyClamp);
         clamped = true;
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_FINAL_CLAMP], 1u);
     }
@@ -317,6 +390,28 @@ void main() {
     if (pc.debugView == DEBUG_VIEW_RESTIR_GI_PATH_CLASS) {
         imageStore(rawImage, pixel, vec4(class_color(pathClass, confidence), 1.0)); return;
     }
+    if (pc.debugView == DEBUG_VIEW_RESTIR_GI_TARGET) {
+        imageStore(rawImage, pixel, vec4(scalar_contract_color(prod_unpack_target(selected), 16.0), 1.0)); return;
+    }
+    if (pc.debugView == DEBUG_VIEW_RESTIR_GI_SOURCE_PDF) {
+        imageStore(rawImage, pixel, vec4(scalar_contract_color(prod_unpack_source_pdf(selected), 16.0), 1.0)); return;
+    }
+    if (pc.debugView == DEBUG_VIEW_RESTIR_GI_WEIGHT_SUM) {
+        imageStore(rawImage, pixel, vec4(scalar_contract_color(prod_unpack_weight_sum(selected), 16.0), 1.0)); return;
+    }
+    if (pc.debugView == DEBUG_VIEW_RESTIR_GI_M) {
+        imageStore(rawImage, pixel, vec4(vec3(clamp(prod_unpack_sample_count(selected) / 255.0, 0.0, 1.0)), 1.0)); return;
+    }
+    if (pc.debugView == DEBUG_VIEW_RESTIR_GI_CONFIDENCE) {
+        imageStore(rawImage, pixel, vec4(vec3(clamp(prod_unpack_confidence(selected), 0.0, 1.0)), 1.0)); return;
+    }
+    if (pc.debugView == DEBUG_VIEW_RESTIR_GI_VISIBILITY) {
+        uint flags = prod_unpack_flags(selected);
+        bool known = (flags & PROD_FLAG_VISIBILITY_KNOWN) != 0u;
+        bool selectedVisible = (flags & PROD_FLAG_VISIBLE) != 0u;
+        imageStore(rawImage, pixel, vec4(known ? 0.0 : 0.35, selectedVisible ? 1.0 : 0.0,
+            prod_reservoir_valid(selected) ? 0.0 : 1.0, 1.0)); return;
+    }
     if (pc.debugView == DEBUG_VIEW_RESTIR_GI_GRID) {
         vec3 tint = ((pixel.x ^ pixel.y) & 1) == 0 ? vec3(0.2, 0.55, 1.0) : vec3(1.0, 0.45, 0.15);
         imageStore(rawImage, pixel, vec4(tint * clamp(restir_gi_luma(replacement) * 8.0, 0.0, 1.0), 1.0)); return;
@@ -328,7 +423,7 @@ void main() {
     float rawDeltaScale = pc.rawOutputIsCurrentSample > 0.5 ? 1.0 : 1.0 / max(accumulated.a, 1.0);
     imageStore(rawImage, pixel, vec4(max(raw.rgb + delta * rawDeltaScale, vec3(0.0)), 1.0));
 
-    float specularWeight = clamp(pathData.restir_gi_fallback_reactive.a, 0.0, 1.0);
+    float specularWeight = clamp(giFallbackReactive.a, 0.0, 1.0);
     pathData.indirect_diffuse.rgb = max(pathData.indirect_diffuse.rgb + delta * (1.0 - specularWeight), vec3(0.0));
     pathData.indirect_specular.rgb = max(pathData.indirect_specular.rgb + delta * specularWeight, vec3(0.0));
     pathData.indirect_diffuse.a = max(pathData.indirect_diffuse.a, confidence);
@@ -336,7 +431,9 @@ void main() {
     if (estimatorValid) {
         pathData.denoiser_hit_distance.x = distance;
         pathData.diffuse_ray_direction_hit_distance = vec4(direction, distance);
-        if (specularWeight > 0.0) pathData.specular_ray_direction_hit_distance = vec4(direction, distance);
+        if (specularWeight > 0.0) {
+            pathData.specular_ray_direction_hit_distance = vec4(direction, distance);
+        }
     }
     path_data_buffer[pixelIndex] = pathData;
 }

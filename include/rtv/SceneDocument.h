@@ -17,7 +17,7 @@
 namespace rtv {
 
 struct RtLevelHeader {
-    uint32_t formatVersion = 4;
+    uint32_t formatVersion = 5;
     std::string sceneGuid;
     std::string engineVersion = "0.1";
     bool projectRelativePaths = true;

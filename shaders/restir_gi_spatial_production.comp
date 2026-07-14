@@ -30,6 +30,8 @@ const uint GI_COUNTER_VISIBILITY_RAYS = 42u;
 const uint GI_COUNTER_VISIBILITY_UNKNOWN = 43u;
 const uint GI_COUNTER_VERSION_REJECT = 44u;
 const uint GI_COUNTER_NON_FINITE = 45u;
+const uint GI_COUNTER_CONTRACT_INVALID_SOURCE_PDF = 48u;
+const uint GI_COUNTER_CONTRACT_INVALID_TARGET_PDF = 49u;
 
 layout(push_constant, std430) uniform PushConstants {
     uint width;
@@ -50,6 +52,16 @@ layout(push_constant, std430) uniform PushConstants {
 #define GI_ACTIVE_TILE_MASK_ENABLED ((pc.enabled & 8u) != 0u)
 
 const uint GI_ACTIVE_TILE_SIZE = 16u;
+
+void record_prod_contract_violation(ProdRestirGiReservoir reservoir) {
+    if ((prod_unpack_flags(reservoir) & PROD_FLAG_VALID) == 0u) return;
+    if (prod_contract_invalid_source_pdf(reservoir)) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_CONTRACT_INVALID_SOURCE_PDF], 1u);
+    }
+    if (prod_contract_invalid_target_pdf(reservoir)) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_CONTRACT_INVALID_TARGET_PDF], 1u);
+    }
+}
 
 bool active_tile_contains(ivec2 fullPixel) {
     if (!GI_ACTIVE_TILE_MASK_ENABLED) return true;
@@ -120,6 +132,7 @@ void main() {
         uint(representative_full_pixel(pixel).x)];
     ProdRestirGiReservoir selected = temporal_reservoirs[pixelIndex];
     if (!restir_gi_receiver_valid_for_reuse(center) || !prod_reservoir_reusable(selected)) {
+        if (!prod_reservoir_reusable(selected)) record_prod_contract_violation(selected);
         if (!prod_reservoir_reusable(selected)) GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_PATH_SPATIAL_CENTER_CURRENT_ONLY], 1u);
         spatial_reservoirs[pixelIndex] = selected;
         return;
@@ -153,6 +166,7 @@ void main() {
 
         ProdRestirGiReservoir candidate = temporal_reservoirs[neighborIndex];
         if (!prod_reservoir_reusable(candidate)) {
+            record_prod_contract_violation(candidate);
             GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_REJECT_INVALID], 1u);
             continue;
         }
@@ -204,8 +218,9 @@ void main() {
         }
 #endif
 
+        float reuseMassScale = visibilityConfidence;
         float candidateWeight = prod_shifted_reservoir_weight(
-            candidate, candidateSourceTarget, prod_unpack_target(candidate)) * visibilityConfidence;
+            candidate, candidateSourceTarget, prod_unpack_target(candidate)) * reuseMassScale;
         if (!restir_gi_finite(candidateWeight) || candidateWeight <= 0.0) {
             GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_NON_FINITE], 1u);
             continue;
@@ -219,7 +234,9 @@ void main() {
             GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_SELECTED_NEIGHBOR], 1u);
         }
         totalWeight = newWeight;
-        totalM += prod_unpack_sample_count(candidate);
+        // Reliability damping changes the effective proposal mass. Keep W and M
+        // symmetric so visibility-confidence shortcuts do not darken the final estimator.
+        totalM += prod_unpack_sample_count(candidate) * reuseMassScale;
     }
 
     if (totalM > 255.0 || totalWeight > 65504.0) GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_CLAMP], 1u);

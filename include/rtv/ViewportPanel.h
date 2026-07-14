@@ -44,6 +44,9 @@ public:
     [[nodiscard]] bool interactionActive() const { return focused_ || hovered_; }
     [[nodiscard]] bool hovered() const { return hovered_; }
     [[nodiscard]] GizmoInteractionState gizmoState() const { return gizmoState_; }
+    [[nodiscard]] int activeToolMode() const { return transformGizmoMode_; }
+    [[nodiscard]] bool localTransformMode() const { return localGizmoMode_; }
+    [[nodiscard]] bool snapEnabled() const { return snap_.enabled; }
     void executeCommand(EditorCommandId id);
 
     void setShowGrid(bool show) { showGrid_ = show; }
@@ -73,6 +76,9 @@ private:
     void persistViewportPreferences(EditorPreferences& preferences, const std::filesystem::path& path) const;
 
     VkExtent2D lastContentExtent_{};
+    VkExtent2D stableRenderExtent_{};
+    VkExtent2D pendingRenderExtent_{};
+    uint32_t pendingRenderExtentFrames_ = 0;
     int transformGizmoMode_ = 0;
     bool localGizmoMode_ = false;
     SnapSettings snap_{};

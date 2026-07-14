@@ -169,11 +169,12 @@ bool restir_gi_debug_view() {
 #if RTV_NATIVE2B_PIPELINE
     return false;
 #else
-    return (debug_params.view >= 68u && debug_params.view <= 73u) ||
-        debug_params.view == 90u ||
-        debug_params.view == 91u ||
-        debug_params.view == 127u ||
-        debug_params.view == 128u;
+    uint debugView = renderer_debug_view();
+    return (debugView >= 68u && debugView <= 73u) ||
+        debugView == 90u ||
+        debugView == 91u ||
+        debugView == 127u ||
+        debugView == 128u;
 #endif
 }
 
@@ -181,7 +182,7 @@ bool native2b_kernel_enabled() {
 #if RTV_NATIVE2B_PIPELINE
     return true;
 #else
-    return (camera.path_trace_controls.z & 16u) != 0u;
+    return false;
 #endif
 }
 

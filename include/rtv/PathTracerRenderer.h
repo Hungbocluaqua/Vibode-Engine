@@ -266,6 +266,10 @@ public:
     ~PathTracerRenderer();
     void releaseExclusiveRuntimeForRendererReplacement();
 
+    [[nodiscard]] static RendererSettings normalizeSettingsForDevice(
+        const RendererSettings& settings,
+        const VulkanContext& context);
+
     void beginFrame(uint32_t frameIndex, VkExtent2D renderExtent, VkExtent2D displayExtent);
     void setFrameDeltaSeconds(float deltaSeconds) { frameDeltaSeconds_ = deltaSeconds; }
     void recordPathTrace(VkCommandBuffer commandBuffer, bool deferPostTraceCompute = false);
@@ -292,6 +296,7 @@ public:
         float nearPlane,
         float farPlane);
     void resetAccumulation(AccumulationResetReason reason = AccumulationResetReason::Manual);
+    void resetAccumulationPreserveTemporalHistory(AccumulationResetReason reason);
     void applyStreamingResetMasks(
         const std::vector<uint64_t>& temporalEntityUuids,
         const std::vector<uint64_t>& restirEntityUuids,
@@ -300,6 +305,10 @@ public:
     void loadEnvironment(const std::filesystem::path& path);
     [[nodiscard]] bool shadersNeedReload();
     bool updateMaterials(const SceneAsset& scene, const AssetManager& assets);
+    bool patchStreamedMaterialTexture(
+        const SceneAsset& scene,
+        TextureAssetHandle texture,
+        const Image& image);
     bool updateSceneLights(const SceneAsset& scene, bool rebuildLightBvh = true);
     bool updateSceneTransforms(const SceneAsset& scene, const AssetManager& assets);
     bool updateSceneVisibility(const SceneAsset& scene, const AssetManager& assets);
@@ -354,6 +363,12 @@ public:
         bool nrdRequestable = false;
         bool nrdAvailable = false;
         std::string nrdUnavailableReason;
+        bool nrdDirectRuntimeResourcesReady = false;
+        bool nrdHistoryConfidenceInputsAllocated = false;
+        bool nrdHistoryConfidenceAvailable = false;
+        bool nrdValidationOutputAllocated = false;
+        bool nrdValidationOutputEnabled = false;
+        std::string nrdGuideContractReason;
         bool dlssSdkConfigured = false;
         bool dlssRequestable = false;
         bool dlssAvailable = false;
@@ -361,9 +376,22 @@ public:
         bool dlssRayReconstructionRequestable = false;
         bool dlssRayReconstructionAvailable = false;
         std::string dlssRayReconstructionUnavailableReason;
+        bool dlssRayReconstructionGuidePassReady = false;
+        bool dlssRayReconstructionGuideImagesAllocated = false;
+        bool dlssRayReconstructionPsrGuideBufferAllocated = false;
+        bool dlssRayReconstructionPsrHistorySignaturesAllocated = false;
+        bool dlssRayReconstructionUsesPsrGuides = false;
+        uint32_t dlssRayReconstructionGuideImageCount = 0;
+        std::string dlssRayReconstructionGuideMode;
         bool dlssFrameGenerationRequestable = false;
         bool dlssFrameGenerationAvailable = false;
         std::string dlssFrameGenerationUnavailableReason;
+        bool dlssAutoExposureEnabled = false;
+        bool dlssExposureBufferAvailable = false;
+        bool dlssExposureBufferPassedToSdk = false;
+        float dlssManualExposure = 1.0f;
+        float dlssPreExposure = 1.0f;
+        float dlssExposureScale = 1.0f;
         bool streamlineSdkConfigured = false;
         bool streamlineRuntimeConfigured = false;
         bool streamlineInitialized = false;
@@ -466,6 +494,7 @@ public:
         return reinterpret_cast<const uint32_t*>(bytes + slot * sizeof(uint32_t) * 64u);
     }
     [[nodiscard]] bool restirDiHistoryValid() const { return restirDiHistoryValid_; }
+    [[nodiscard]] bool restirGiHistoryValid() const { return restirGiHistoryValid_; }
     [[nodiscard]] RestirHistoryCopyMode effectiveRestirHistoryCopyMode() const;
     [[nodiscard]] const char* restirHistoryCopyFallbackReason() const;
     [[nodiscard]] bool effectiveRestirGiActiveTileMaskEnabled() const;
@@ -713,6 +742,13 @@ private:
         float whitePoint = 4.0f;
     };
 
+    struct DlssGuideVisualizeParams {
+        uint32_t mode = 0;
+        float scale = 1.0f;
+        float bias = 0.0f;
+        float reserved0 = 0.0f;
+    };
+
     struct HistogramParams {
         uint32_t width = 0;
         uint32_t height = 0;
@@ -756,8 +792,12 @@ private:
         uint32_t cameraMoving = 0;
         uint32_t renderWidth = 0;
         uint32_t renderHeight = 0;
-    float motionFeedback = 0.90f;
-    float reactiveFeedback = 0.98f;
+        float motionFeedback = 0.90f;
+        float reactiveFeedback = 0.98f;
+        float inputPixelOffsetX = 0.0f;
+        float inputPixelOffsetY = 0.0f;
+        float clampingFactor = 1.3f;
+        float maxRadiance = 200.0f;
     };
 
     struct RestirSpatialParams {
@@ -801,7 +841,9 @@ private:
         uint32_t materialVisibilityFlags = 0;
         uint32_t counterEnabled = 0;
         uint32_t rawOutputIsCurrentSample = 0;
-        uint32_t padding2 = 0;
+        float shadowDistanceBias = 0.002f;
+        uint32_t lightVersion = 0;
+        uint32_t environmentVersion = 0;
     };
 
     struct FogParams {
@@ -941,6 +983,13 @@ private:
         glm::vec4 emissiveResidual{};
         glm::vec4 restirGiFallbackReactive{};
     };
+
+    struct PsrGuideGpu {
+        glm::uvec4 geometry{};
+        glm::uvec4 material{};
+        glm::vec4 distances{};
+    };
+    static_assert(sizeof(PsrGuideGpu) == 48);
 
     struct alignas(16) WavefrontQueueHeaderGpu {
         // counters: x=count, y=capacity, z=read offset, w=write offset.
@@ -1163,8 +1212,10 @@ private:
     struct alignas(16) ReGIRReservoirGpu {
         glm::uvec4 metadata{};
         glm::vec4 samplePositionWeight{};
+        glm::vec4 proposalPdfM{};
+        glm::uvec4 lightIdentity{};
     };
-    static_assert(sizeof(ReGIRReservoirGpu) == 32);
+    static_assert(sizeof(ReGIRReservoirGpu) == 64);
 
     struct alignas(16) ReGIREnvironmentReservoirGpu {
         glm::uvec4 metadata{};
@@ -1254,6 +1305,8 @@ private:
     void recordDenoiser(VkCommandBuffer commandBuffer);
     void recordDenoiserPass(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool recordNrdDenoiser(VkCommandBuffer commandBuffer);
+    void recordNrdConfidenceGradientPass(VkCommandBuffer commandBuffer);
+    void recordNrdConfidenceFilterPass(VkCommandBuffer commandBuffer);
     void recordNrdPreparePass(VkCommandBuffer commandBuffer);
     [[nodiscard]] bool recordNrdDispatches(VkCommandBuffer commandBuffer);
     void recordNrdResolvePass(VkCommandBuffer commandBuffer);
@@ -1283,6 +1336,8 @@ private:
     void recordDlssRayReconstruction(VkCommandBuffer commandBuffer);
     void recordDlssRayReconstructionGuidesPass(VkCommandBuffer commandBuffer);
     void recordDlssRayReconstructionPass(VkCommandBuffer commandBuffer);
+    void recordDlssGuideVisualization(VkCommandBuffer commandBuffer);
+    void recordDlssGuideVisualizationPass(VkCommandBuffer commandBuffer);
     void recordAutoExposure(VkCommandBuffer commandBuffer);
     void recordAutoExposureHistogramPass(VkCommandBuffer commandBuffer);
     void recordAutoExposureReducePass(VkCommandBuffer commandBuffer);
@@ -1333,6 +1388,12 @@ private:
     [[nodiscard]] bool shouldUseRegirSpatialReuse() const;
     [[nodiscard]] bool shouldUseRegirTemporalReuse() const;
     [[nodiscard]] bool isNonDenoiserDebugView() const;
+    [[nodiscard]] bool isDlssDebugView() const;
+    [[nodiscard]] bool isDlssRayReconstructionDebugView() const;
+    [[nodiscard]] bool isDlssGuideDebugView() const;
+    [[nodiscard]] const Image& dlssGuideVisualizationSource() const;
+    [[nodiscard]] uint32_t dlssGuideVisualizationMode() const;
+    [[nodiscard]] float dlssGuideVisualizationScale() const;
     [[nodiscard]] bool shouldBypassTemporalUpscalerForDebugView() const;
     [[nodiscard]] bool shouldRunTaa() const;
     [[nodiscard]] bool dlssRequested() const;
@@ -1420,6 +1481,7 @@ private:
     void dispatchInitialGpuSkinningForAccelerationStructures();
     void writeStbnDescriptors(DescriptorWriter& writer) const;
     [[nodiscard]] float stbnScalarSample(int32_t x, int32_t y, uint32_t frameIndex) const;
+    [[nodiscard]] uint32_t sampleFrameIndex() const;
     void fallbackBlitPostDenoiseToTemporalOutput(VkCommandBuffer commandBuffer);
     void skipDenoiserPass(VkCommandBuffer commandBuffer);
     void skipDenoiserCopyPass(VkCommandBuffer commandBuffer);
@@ -1457,6 +1519,7 @@ private:
     const VulkanContext& context_;
     ResourceAllocator& allocator_;
     BufferUploader& uploader_;
+    RendererSettings settings_{};
     GpuScene scene_;
     GpuSkinningResourcePlan gpuSkinningResourcePlan_{};
 
@@ -1483,7 +1546,6 @@ private:
     std::string memoryPressureName_ = "normal";
     AccumulationResetReason lastResetReason_ = AccumulationResetReason::Startup;
     CameraUniform camera_{};
-    RendererSettings settings_{};
     std::optional<std::filesystem::path> dumpRenderGraphPath_;
     std::optional<std::filesystem::path> dumpRenderGraphDotPath_;
     DenoiserParams denoiserParams_{};
@@ -1497,6 +1559,7 @@ private:
     bool rayTracingDiagnosticCountersEnabled_ = false;
     bool rayTracingDiagnosticCountersCleared_ = false;
     glm::mat4 previousViewProj_{1.0f};
+    glm::mat4 previousNonJitteredViewProj_{1.0f};
     glm::mat4 nrdViewToClip_{1.0f};
     glm::mat4 nrdViewToClipPrev_{1.0f};
     glm::mat4 nrdWorldToView_{1.0f};
@@ -1587,6 +1650,9 @@ private:
     Buffer entityIdBuffer_;
     Buffer entityIdReadbackBuffer_;
     Buffer pathDataBuffer_;
+    Buffer psrGuideBuffer_;
+    Buffer psrGuideSignatureBuffer_;
+    Buffer previousPsrGuideSignatureBuffer_;
     Buffer adaptiveSamplingDensityBuffer_;
     Buffer adaptiveSamplingSampleCountBuffer_;
     Buffer adaptiveSamplingStatsBuffer_;
@@ -1673,6 +1739,9 @@ private:
     Buffer restirDiTemporalReservoirBuffer_;
     Buffer restirDiSpatialReservoirBuffer_;
     Buffer restirDiFinalReservoirBuffer_;
+    Buffer restirDiTemporalSourcePixelBuffer_;
+    Buffer restirDiSpatialSourcePixelBuffer_;
+    Buffer restirDiFinalSourcePixelBuffer_;
     Buffer previousRestirDiReservoirBuffer_;
     Buffer previousRestirDiReceiverBuffer_;
     Buffer restirDiCountersBuffer_;
@@ -1700,6 +1769,9 @@ private:
     std::unique_ptr<ShaderModule> gpuSkinningShader_;
     std::unique_ptr<ShaderModule> dlssGuidesShader_;
     std::unique_ptr<ShaderModule> dlssRayReconstructionGuidesShader_;
+    std::unique_ptr<ShaderModule> dlssGuideVisualizeShader_;
+    std::unique_ptr<ShaderModule> nrdConfidenceGradientShader_;
+    std::unique_ptr<ShaderModule> nrdConfidenceFilterShader_;
     std::unique_ptr<ShaderModule> nrdPrepareShader_;
     std::unique_ptr<ShaderModule> nrdResolveShader_;
     std::unique_ptr<ShaderModule> restirSpatialShader_;
@@ -1735,6 +1807,7 @@ private:
     std::unique_ptr<ShaderModule> fullscreenFragmentShader_;
     std::unique_ptr<ShaderModule> raygenShader_;
     std::unique_ptr<ShaderModule> raygenBeautyFastShader_;
+    std::unique_ptr<ShaderModule> raygenBeautyFastNoTexturesShader_;
     std::unique_ptr<ShaderModule> raygenRegirBeautyFastShader_;
     std::unique_ptr<ShaderModule> raygenRegirStochasticBeautyFastShader_;
     std::unique_ptr<ShaderModule> raygenNative2BShader_;
@@ -1788,6 +1861,9 @@ private:
     std::unique_ptr<ComputePipeline> gpuSkinningPipeline_;
     std::unique_ptr<ComputePipeline> dlssGuidesPipeline_;
     std::unique_ptr<ComputePipeline> dlssRayReconstructionGuidesPipeline_;
+    std::unique_ptr<ComputePipeline> dlssGuideVisualizePipeline_;
+    std::unique_ptr<ComputePipeline> nrdConfidenceGradientPipeline_;
+    std::unique_ptr<ComputePipeline> nrdConfidenceFilterPipeline_;
     std::unique_ptr<ComputePipeline> nrdPreparePipeline_;
     std::unique_ptr<ComputePipeline> nrdResolvePipeline_;
     std::unique_ptr<ComputePipeline> restirSpatialPipeline_;
@@ -1877,6 +1953,9 @@ private:
     VkDescriptorSetLayout gpuSkinningSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dlssGuidesSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout dlssRayReconstructionGuidesSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dlssGuideVisualizeSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout nrdConfidenceGradientSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout nrdConfidenceFilterSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout nrdPrepareSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout nrdResolveSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout restirSpatialSetLayout_ = VK_NULL_HANDLE;
@@ -1918,6 +1997,12 @@ private:
         std::vector<std::pair<std::string, std::string>> extraDefines;
     };
     std::vector<ShaderReloadDependency> shaderReloadDependencies_;
+    struct ShaderReloadWatchFile {
+        std::filesystem::path path;
+        std::filesystem::file_time_type writeTime{};
+        bool exists = false;
+    };
+    std::vector<ShaderReloadWatchFile> shaderReloadWatchFiles_;
     std::filesystem::path shaderOutputDirectory_;
     std::chrono::steady_clock::time_point lastShaderReloadCheck_{};
     bool shaderReloadCheckPrimed_ = false;

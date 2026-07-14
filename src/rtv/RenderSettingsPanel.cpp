@@ -9,11 +9,27 @@
 #include <rtv/PhysicalCamera.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <string>
 
 namespace rtv {
 
 namespace {
+
+std::string gRenderSettingsFilter;
+bool gRenderSettingsRowTableOpen = false;
+
+bool containsInsensitive(const char* text, const std::string& needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    std::string haystack = text != nullptr ? text : "";
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return haystack.find(needle) != std::string::npos;
+}
 
 void tooltip(const char* text) {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
@@ -27,6 +43,111 @@ const char* serReorderingHintName(VkRayTracingInvocationReorderModeNV hint) {
         case VK_RAY_TRACING_INVOCATION_REORDER_MODE_NONE_NV: return "none";
         default: return "unknown";
     }
+}
+
+float renderSettingsControlWidth() {
+    const float available = ImGui::GetContentRegionAvail().x;
+    return std::clamp(available * 0.62f, 190.0f, 390.0f);
+}
+
+float renderSettingsLabelWidth() {
+    const float available = ImGui::GetContentRegionAvail().x;
+    return std::clamp(available * 0.38f, 128.0f, 210.0f);
+}
+
+void renderSettingsBeginRow(const char* label) {
+    ImGui::PushID(label);
+    gRenderSettingsRowTableOpen = ImGui::BeginTable(
+        "##PropertyRow",
+        2,
+        ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings);
+    if (gRenderSettingsRowTableOpen) {
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.42f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.58f);
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, EditorUiMetric::propertyRowHeight);
+        ImGui::TableSetColumnIndex(0);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", label);
+        ImGui::TableSetColumnIndex(1);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+    }
+}
+
+void renderSettingsEndRow() {
+    if (gRenderSettingsRowTableOpen) {
+        ImGui::EndTable();
+        gRenderSettingsRowTableOpen = false;
+    }
+    ImGui::PopID();
+}
+
+bool renderSettingsComboRow(const char* label, int* currentItem, const char* const items[], int itemsCount) {
+    renderSettingsBeginRow(label);
+    const bool changed = ImGui::Combo("##value", currentItem, items, itemsCount);
+    renderSettingsEndRow();
+    return changed;
+}
+
+bool renderSettingsComboRow(const char* label, int* currentItem, const char* itemsSeparatedByZeros) {
+    renderSettingsBeginRow(label);
+    const bool changed = ImGui::Combo("##value", currentItem, itemsSeparatedByZeros);
+    renderSettingsEndRow();
+    return changed;
+}
+
+bool renderSettingsSliderFloatRow(const char* label, float* value, float minValue, float maxValue, const char* format) {
+    renderSettingsBeginRow(label);
+    const bool changed = ImGui::SliderFloat("##value", value, minValue, maxValue, format);
+    renderSettingsEndRow();
+    return changed;
+}
+
+bool renderSettingsSliderScalarRow(const char* label, ImGuiDataType dataType, void* value, const void* minValue, const void* maxValue, const char* format = nullptr) {
+    renderSettingsBeginRow(label);
+    const bool changed = ImGui::SliderScalar("##value", dataType, value, minValue, maxValue, format);
+    renderSettingsEndRow();
+    return changed;
+}
+
+bool renderSettingsCheckboxRow(const char* label, bool* value) {
+    renderSettingsBeginRow(label);
+    const bool changed = ImGui::Checkbox("##value", value);
+    renderSettingsEndRow();
+    return changed;
+}
+
+void renderSettingsInfoRow(const char* label, const char* value) {
+    renderSettingsBeginRow(label);
+    ImGui::TextUnformatted(value);
+    renderSettingsEndRow();
+}
+
+bool renderSettingsBeginSection(const char* label, ImGuiTreeNodeFlags flags = 0, const char* keywords = nullptr) {
+    if (!gRenderSettingsFilter.empty() &&
+        !containsInsensitive(label, gRenderSettingsFilter) &&
+        !containsInsensitive(keywords, gRenderSettingsFilter)) {
+        return false;
+    }
+    ImGui::Spacing();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 6.0f));
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.120f, 0.137f, 0.160f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.160f, 0.180f, 0.212f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.160f, 0.300f, 0.490f, 0.96f));
+    const bool open = ImGui::CollapsingHeader(label, flags);
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
+    if (open) {
+        ImGui::Indent(8.0f);
+        ImGui::Spacing();
+        ImGui::PushItemWidth(renderSettingsControlWidth());
+    }
+    return open;
+}
+
+void renderSettingsEndSection() {
+    ImGui::PopItemWidth();
+    ImGui::Unindent(8.0f);
+    ImGui::Spacing();
 }
 
 } // namespace
@@ -209,59 +330,54 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     const bool reflexCanRequest = nvidiaStatus.streamlineReflex.requestable || nvidiaStatus.streamlineReflex.supported;
     const bool nvperfCanRequest = nvidiaStatus.streamlineNvPerf.requestable || nvidiaStatus.streamlineNvPerf.supported;
 
-    ImGui::SeparatorText("Preview Actions");
-    if (editorIconTextButton("RenderSettingsResetAccumulation", EditorGlyphIcon::Reset, "Reset Accumulation")) {
-        requests.resetAccumulation = AccumulationResetReason::Manual;
-    }
-    tooltip("Clear path tracing accumulation and rebuild the current preview from a fresh sample history.");
-    ImGui::SameLine();
-    if (editorIconTextButton("RenderSettingsCycleDebugView", EditorGlyphIcon::DrawDebug, "Debug View")) {
-        requests.toggleDebugView = true;
-    }
-    tooltip("Cycle the active renderer debug view for the current viewport preview.");
-    if (editorIconTextButton("RenderSettingsCycleIntermediate", EditorGlyphIcon::Stats, "Intermediate")) {
-        requests.cycleIntermediateView = true;
-    }
-    tooltip("Cycle intermediate render targets exposed by the renderer diagnostic path.");
-    ImGui::SameLine();
-    if (editorIconTextButton("RenderSettingsToggleDenoiser", EditorGlyphIcon::Render, "Denoiser", settings.denoiserEnabled)) {
-        requests.toggleDenoiser = true;
-    }
-    tooltip("Toggle denoising without leaving the docked Render Settings workflow.");
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f, 4.0f));
 
-    ImGui::SeparatorText("Rendering");
+    static std::array<char, 96> settingsSearch{};
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##RenderSettingsSearch", "Search render settings...", settingsSearch.data(), settingsSearch.size());
+    gRenderSettingsFilter = settingsSearch.data();
+    std::transform(gRenderSettingsFilter.begin(), gRenderSettingsFilter.end(), gRenderSettingsFilter.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    ImGui::Spacing();
+
+    if (renderSettingsBeginSection("Quality", ImGuiTreeNodeFlags_DefaultOpen, "preset debug bounces kernel samples spp resolution scale")) {
+    ImGui::SeparatorText("Preset");
     const char* renderPresetItems[] = {"Custom", "Low", "Balanced", "Ultra", "Native 30"};
     int renderPresetIndex = static_cast<int>(settings.renderPreset);
     if (renderPresetIndex < 0 || renderPresetIndex > 4) {
         renderPresetIndex = 0;
     }
-    if (ImGui::Combo("Render Preset", &renderPresetIndex, renderPresetItems, 5)) {
+    if (renderSettingsComboRow("Render Preset", &renderPresetIndex, renderPresetItems, 5)) {
         applyRenderPreset(settings, static_cast<RenderPreset>(renderPresetIndex));
         presetApplied = true;
         changed = true;
     }
     tooltip("Game-ready presets tune path tracing, ReSTIR, denoiser, TAA, and render scale together.");
-    editorDebugViewCombo("Debug View", settings, changed);
-    changed |= ImGui::SliderScalar("Max Bounces", ImGuiDataType_U32, &settings.maxBounces, &minBounces, &maxBounces);
+    renderSettingsBeginRow("Debug View");
+    editorDebugViewCombo("##value", settings, changed);
+    renderSettingsEndRow();
+    changed |= renderSettingsSliderScalarRow("Max Bounces", ImGuiDataType_U32, &settings.maxBounces, &minBounces, &maxBounces);
     tooltip("Number of ray bounces. Higher is more accurate and slower; 4-8 for preview, 16 for final.");
     const char* pathTraceKernelItems[] = {"Generic", "Native2B"};
     int pathTraceKernelIndex = static_cast<int>(settings.pathTraceKernelMode);
     if (pathTraceKernelIndex < 0 || pathTraceKernelIndex > 1) {
         pathTraceKernelIndex = 0;
     }
-    if (ImGui::Combo("Path Trace Kernel", &pathTraceKernelIndex, pathTraceKernelItems, 2)) {
+    if (renderSettingsComboRow("Path Trace Kernel", &pathTraceKernelIndex, pathTraceKernelItems, 2)) {
         settings.pathTraceKernelMode = static_cast<PathTraceKernelMode>(pathTraceKernelIndex);
         changed = true;
     }
     tooltip("Native2B is a strict native 1 SPP, 2-bounce beauty specialization. It falls back unless the current settings match its quality-safe gates.");
     const PathTraceKernelMode effectiveKernel = state.renderer.effectivePathTraceKernelMode();
-    ImGui::TextDisabled("Effective: %s", pathTraceKernelModeName(effectiveKernel));
+    renderSettingsInfoRow("Effective Kernel", pathTraceKernelModeName(effectiveKernel));
     if (settings.pathTraceKernelMode == PathTraceKernelMode::Native2B) {
         const char* fallbackReason = state.renderer.pathTraceKernelFallbackReason();
         if (fallbackReason != nullptr && fallbackReason[0] != '\0') {
-            ImGui::TextDisabled("Fallback: %s", fallbackReason);
+            renderSettingsInfoRow("Fallback", fallbackReason);
         } else {
-            ImGui::TextDisabled("Terminal payload: %s", state.renderer.native2BTerminalPayloadActive() ? "active" : "inactive");
+            renderSettingsInfoRow("Terminal Payload", state.renderer.native2BTerminalPayloadActive() ? "active" : "inactive");
         }
     }
     const char* blendedDecalShadowItems[] = {"Exact", "Opaque Shadow", "Alpha Cutout Proxy"};
@@ -269,7 +385,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     if (blendedDecalShadowIndex < 0 || blendedDecalShadowIndex > 2) {
         blendedDecalShadowIndex = 0;
     }
-    if (ImGui::Combo("Blended Decal Shadows", &blendedDecalShadowIndex, blendedDecalShadowItems, 3)) {
+    if (renderSettingsComboRow("Blended Decal Shadows", &blendedDecalShadowIndex, blendedDecalShadowItems, 3)) {
         settings.blendedDecalShadowMode = static_cast<BlendedDecalShadowMode>(blendedDecalShadowIndex);
         changed = true;
     }
@@ -279,100 +395,114 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     if (native2BDirectReuseIndex < 0 || native2BDirectReuseIndex > 2) {
         native2BDirectReuseIndex = 0;
     }
-    if (ImGui::Combo("Native2B Direct Reuse", &native2BDirectReuseIndex, native2BDirectReuseItems, 3)) {
+    if (renderSettingsComboRow("Native2B Direct Reuse", &native2BDirectReuseIndex, native2BDirectReuseItems, 3)) {
         settings.native2BDirectReuseMode = static_cast<Native2BDirectReuseMode>(native2BDirectReuseIndex);
         changed = true;
     }
     tooltip("Experimental terminal direct-light reuse. Off keeps the exact estimator.");
-    changed |= ImGui::SliderFloat("Terminal Direct Rate", &settings.native2BTerminalDirectSampleProbability, 0.25f, 1.0f, "%.2f");
+    changed |= renderSettingsSliderFloatRow("Terminal Direct Rate", &settings.native2BTerminalDirectSampleProbability, 0.25f, 1.0f, "%.2f");
     tooltip("Native2B widened quality/performance gate. 1.00 samples every terminal env/sun direct light; lower values sample stochastically and rely on temporal accumulation.");
-    changed |= ImGui::SliderScalar("Environment Samples", ImGuiDataType_U32, &settings.environmentDirectSamples, &minEnvSamples, &maxEnvSamples);
+    ImGui::SeparatorText("Sampling");
+    changed |= renderSettingsSliderScalarRow("Environment Samples", ImGuiDataType_U32, &settings.environmentDirectSamples, &minEnvSamples, &maxEnvSamples);
     tooltip("Environment light samples per bounce. Higher values reduce fireflies.");
-    changed |= ImGui::Checkbox("Limit to 1 SPP", &settings.limitSamplesPerPixel);
+    changed |= renderSettingsCheckboxRow("Limit to 1 SPP", &settings.limitSamplesPerPixel);
     tooltip("Keeps real-time path tracing at one path sample per pixel per frame. Disable for stills or high-end budgets.");
-    changed |= ImGui::SliderScalar("Samples Per Pixel", ImGuiDataType_U32, &settings.samplesPerPixel, &minSpp, &maxSpp);
+    changed |= renderSettingsSliderScalarRow("Samples Per Pixel", ImGuiDataType_U32, &settings.samplesPerPixel, &minSpp, &maxSpp);
     tooltip("Requested path samples per pixel per frame when the 1 SPP limiter is disabled.");
-    changed |= ImGui::Checkbox("Path Tracing", &settings.pathTracingEnabled);
-    changed |= ImGui::Checkbox("TAA Camera Jitter", &settings.cameraJitterEnabled);
+    renderSettingsEndSection();
+    }
+
+    if (renderSettingsBeginSection("Lighting", ImGuiTreeNodeFlags_DefaultOpen, "path tracing jitter direct indirect environment samples mis light")) {
+    changed |= renderSettingsCheckboxRow("Path Tracing", &settings.pathTracingEnabled);
+    changed |= renderSettingsCheckboxRow("TAA Camera Jitter", &settings.cameraJitterEnabled);
     tooltip("Halton sub-pixel jitter. It is only applied while TAA is enabled.");
-    changed |= ImGui::Checkbox("Direct Lighting", &settings.directLightingEnabled);
-    changed |= ImGui::Checkbox("Secondary Bounce Direct", &settings.secondaryDirectLightingEnabled);
+    changed |= renderSettingsCheckboxRow("Direct Lighting", &settings.directLightingEnabled);
+    changed |= renderSettingsCheckboxRow("Secondary Bounce Direct", &settings.secondaryDirectLightingEnabled);
     tooltip("Samples direct lighting at secondary surface hits so two-bounce renders keep bounce illumination.");
-    changed |= ImGui::SliderFloat("Indirect Strength", &settings.indirectStrength, 0.0f, 4.0f, "%.2f");
+    changed |= renderSettingsSliderFloatRow("Indirect Strength", &settings.indirectStrength, 0.0f, 4.0f, "%.2f");
     tooltip("Multiplier for indirect lighting contribution.");
-    const char* restirModeItems[] = {"Classic NEE", "ReSTIR Only", "Hybrid Compare"};
-    int restirModeIndex = static_cast<int>(settings.restirMode);
-    if (restirModeIndex < 0 || restirModeIndex > 2) {
-        restirModeIndex = 0;
+    renderSettingsEndSection();
     }
-    if (ImGui::Combo("ReSTIR Mode", &restirModeIndex, restirModeItems, 3)) {
-        settings.restirMode = static_cast<RestirMode>(restirModeIndex);
-        changed = true;
-    }
-    tooltip("Hybrid ReSTIR direct-light mode. Classic NEE remains the reference baseline.");
-    const char* restirDiModeItems[] = {"Off", "Legacy", "Production", "Reference Validation", "Hybrid Compare"};
-    int restirDiModeIndex = static_cast<int>(settings.restirDiMode);
-    if (ImGui::Combo("ReSTIR DI Pipeline", &restirDiModeIndex, restirDiModeItems, 5)) {
-        settings.restirDiMode = static_cast<RestirDiMode>(restirDiModeIndex);
-        if (settings.restirDiMode == RestirDiMode::Off || settings.restirDiMode == RestirDiMode::Legacy) {
-            settings.restirDiReservoirLayout = RestirDiReservoirLayout::Legacy;
-        } else if (settings.restirDiMode == RestirDiMode::ReferenceValidation) {
-            settings.restirDiReservoirLayout = RestirDiReservoirLayout::ValidationFull;
-            settings.restirDiFinalVisibilityEnabled = true;
-            settings.restirDiProductionStabilizationEnabled = false;
-        } else if (settings.restirDiReservoirLayout == RestirDiReservoirLayout::Legacy) {
-            settings.restirDiReservoirLayout = RestirDiReservoirLayout::ProductionPacked;
+
+    if (renderSettingsBeginSection("ReSTIR", ImGuiTreeNodeFlags_DefaultOpen, "restir di gi reservoir temporal spatial reuse visibility")) {
+        if (ImGui::TreeNodeEx("Direct Lighting", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth)) {
+        const char* restirModeItems[] = {"Classic NEE", "ReSTIR Only", "Hybrid Compare"};
+        int restirModeIndex = static_cast<int>(settings.restirMode);
+        if (restirModeIndex < 0 || restirModeIndex > 2) {
+            restirModeIndex = 0;
         }
-        changed = true;
-    }
-    tooltip("Selects the rollback path, shipping ReSTIR DI pipeline, strict reference estimator, or comparison mode.");
-    if (settings.restirDiMode == RestirDiMode::Production ||
-        settings.restirDiMode == RestirDiMode::ReferenceValidation ||
-        settings.restirDiMode == RestirDiMode::HybridCompare) {
-        if (ImGui::CollapsingHeader("ReSTIR DI Tuning")) {
-            const char* layoutItems[] = {"Legacy", "Production Packed", "Validation Full"};
-            int layoutIndex = static_cast<int>(settings.restirDiReservoirLayout);
-            if (ImGui::Combo("DI Reservoir Layout", &layoutIndex, layoutItems, 3)) {
-                const auto requested = static_cast<RestirDiReservoirLayout>(layoutIndex);
-                if (requested != RestirDiReservoirLayout::Legacy &&
-                    (settings.restirDiMode != RestirDiMode::ReferenceValidation ||
-                     requested == RestirDiReservoirLayout::ValidationFull)) {
-                    settings.restirDiReservoirLayout = requested;
-                    changed = true;
-                }
+        if (renderSettingsComboRow("ReSTIR Mode", &restirModeIndex, restirModeItems, 3)) {
+            settings.restirMode = static_cast<RestirMode>(restirModeIndex);
+            changed = true;
+        }
+        tooltip("Hybrid ReSTIR direct-light mode. Classic NEE remains the reference baseline.");
+        const char* restirDiModeItems[] = {"Off", "Legacy", "Production", "Reference Validation", "Hybrid Compare"};
+        int restirDiModeIndex = static_cast<int>(settings.restirDiMode);
+        if (renderSettingsComboRow("ReSTIR DI Pipeline", &restirDiModeIndex, restirDiModeItems, 5)) {
+            settings.restirDiMode = static_cast<RestirDiMode>(restirDiModeIndex);
+            if (settings.restirDiMode == RestirDiMode::Off || settings.restirDiMode == RestirDiMode::Legacy) {
+                settings.restirDiReservoirLayout = RestirDiReservoirLayout::Legacy;
+            } else if (settings.restirDiMode == RestirDiMode::ReferenceValidation) {
+                settings.restirDiReservoirLayout = RestirDiReservoirLayout::ValidationFull;
+                settings.restirDiFinalVisibilityEnabled = true;
+                settings.restirDiProductionStabilizationEnabled = false;
+            } else if (settings.restirDiReservoirLayout == RestirDiReservoirLayout::Legacy) {
+                settings.restirDiReservoirLayout = RestirDiReservoirLayout::ProductionPacked;
             }
-            tooltip("Production Packed is the shipping ABI. Validation Full is the inspectable reference ABI.");
-            changed |= ImGui::Checkbox("DI Temporal Reuse", &settings.restirDiTemporalEnabled);
-            changed |= ImGui::Checkbox("DI Spatial Reuse", &settings.restirDiSpatialEnabled);
-            changed |= ImGui::Checkbox("DI Final Visibility", &settings.restirDiFinalVisibilityEnabled);
-            tooltip("Required in Reference Validation; traces current visibility before finalizing a reused sample.");
-            const uint32_t minRounds = 1u;
-            const uint32_t maxRounds = 16u;
-            const uint32_t minAge = 1u;
-            const uint32_t maxAge = 255u;
-            const uint32_t minM = 1u;
-            const uint32_t maxM = 255u;
-            const uint32_t minVisibilityRays = 0u;
-            const uint32_t maxVisibilityRays = 4u;
-            changed |= ImGui::SliderScalar("DI Spatial Rounds", ImGuiDataType_U32, &settings.restirDiSpatialRounds, &minRounds, &maxRounds);
-            changed |= ImGui::SliderFloat("DI Spatial Radius", &settings.restirDiSpatialRadius, 0.5f, 32.0f, "%.2f");
-            changed |= ImGui::SliderScalar("DI Temporal Max Age", ImGuiDataType_U32, &settings.restirDiTemporalMaxAge, &minAge, &maxAge);
-            changed |= ImGui::SliderScalar("DI Max M", ImGuiDataType_U32, &settings.restirDiMaxM, &minM, &maxM);
-            changed |= ImGui::SliderScalar("DI Visibility Ray Budget", ImGuiDataType_U32, &settings.restirDiVisibilityRayBudget, &minVisibilityRays, &maxVisibilityRays);
-            tooltip("Maximum shifted-sample visibility queries per pixel in each DI reuse stage. Zero falls back to the current-frame candidate.");
-            changed |= ImGui::Checkbox("DI Production Stabilization", &settings.restirDiProductionStabilizationEnabled);
-            tooltip("Biased temporal and luminance stabilization for production. Reference Validation disables it.");
-            changed |= ImGui::SliderFloat("DI Luminance Clamp", &settings.restirDiClampLuminance, 0.0f, 1000.0f, "%.1f");
-            ImGui::BeginDisabled();
-            bool sunOutside = false;
-            bool environmentOutside = false;
-            ImGui::Checkbox("Sample Sun In DI", &sunOutside);
-            ImGui::Checkbox("Sample Environment In DI", &environmentOutside);
-            ImGui::EndDisabled();
-            tooltip("Sun and environment use specialized samplers outside ReSTIR DI and are composed exactly once.");
+            changed = true;
         }
+        tooltip("Selects the rollback path, shipping ReSTIR DI pipeline, strict reference estimator, or comparison mode.");
+        if (settings.restirDiMode == RestirDiMode::Production ||
+            settings.restirDiMode == RestirDiMode::ReferenceValidation ||
+            settings.restirDiMode == RestirDiMode::HybridCompare) {
+            if (ImGui::CollapsingHeader("ReSTIR DI Tuning")) {
+                const char* layoutItems[] = {"Legacy", "Production Packed", "Validation Full"};
+                int layoutIndex = static_cast<int>(settings.restirDiReservoirLayout);
+                if (renderSettingsComboRow("DI Reservoir Layout", &layoutIndex, layoutItems, 3)) {
+                    const auto requested = static_cast<RestirDiReservoirLayout>(layoutIndex);
+                    if (requested != RestirDiReservoirLayout::Legacy &&
+                        (settings.restirDiMode != RestirDiMode::ReferenceValidation ||
+                         requested == RestirDiReservoirLayout::ValidationFull)) {
+                        settings.restirDiReservoirLayout = requested;
+                        changed = true;
+                    }
+                }
+                tooltip("Production Packed is the shipping ABI. Validation Full is the inspectable reference ABI.");
+                changed |= renderSettingsCheckboxRow("DI Temporal Reuse", &settings.restirDiTemporalEnabled);
+                changed |= renderSettingsCheckboxRow("DI Spatial Reuse", &settings.restirDiSpatialEnabled);
+                changed |= renderSettingsCheckboxRow("DI Final Visibility", &settings.restirDiFinalVisibilityEnabled);
+                tooltip("Required in Reference Validation; traces current visibility before finalizing a reused sample.");
+                const uint32_t minRounds = 1u;
+                const uint32_t maxRounds = 16u;
+                const uint32_t minAge = 1u;
+                const uint32_t maxAge = 255u;
+                const uint32_t minM = 1u;
+                const uint32_t maxM = 255u;
+                const uint32_t minVisibilityRays = 0u;
+                const uint32_t maxVisibilityRays = 4u;
+                changed |= renderSettingsSliderScalarRow("DI Spatial Rounds", ImGuiDataType_U32, &settings.restirDiSpatialRounds, &minRounds, &maxRounds);
+                changed |= renderSettingsSliderFloatRow("DI Spatial Radius", &settings.restirDiSpatialRadius, 0.5f, 32.0f, "%.2f");
+                changed |= renderSettingsSliderScalarRow("DI Temporal Max Age", ImGuiDataType_U32, &settings.restirDiTemporalMaxAge, &minAge, &maxAge);
+                changed |= renderSettingsSliderScalarRow("DI Max M", ImGuiDataType_U32, &settings.restirDiMaxM, &minM, &maxM);
+                changed |= renderSettingsSliderScalarRow("DI Visibility Ray Budget", ImGuiDataType_U32, &settings.restirDiVisibilityRayBudget, &minVisibilityRays, &maxVisibilityRays);
+                tooltip("Maximum shifted-sample visibility queries per pixel in each DI reuse stage. Zero falls back to the current-frame candidate.");
+                changed |= renderSettingsCheckboxRow("DI Production Stabilization", &settings.restirDiProductionStabilizationEnabled);
+                tooltip("Biased temporal and luminance stabilization for production. Reference Validation disables it.");
+                changed |= renderSettingsSliderFloatRow("DI Luminance Clamp", &settings.restirDiClampLuminance, 0.0f, 1000.0f, "%.1f");
+                ImGui::BeginDisabled();
+                bool sunOutside = false;
+                bool environmentOutside = false;
+                renderSettingsCheckboxRow("Sample Sun In DI", &sunOutside);
+                renderSettingsCheckboxRow("Sample Environment In DI", &environmentOutside);
+                ImGui::EndDisabled();
+                tooltip("Sun and environment use specialized samplers outside ReSTIR DI and are composed exactly once.");
+            }
+        }
+        ImGui::TreePop();
     }
-    if (ImGui::Checkbox("ReSTIR GI", &settings.restirGiEnabled)) {
+
+    if (ImGui::TreeNodeEx("Global Illumination", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth)) {
+    if (renderSettingsCheckboxRow("Enable ReSTIR GI", &settings.restirGiEnabled)) {
         settings.restirGiMode = settings.restirGiEnabled ? RestirGiMode::Production : RestirGiMode::Off;
         settings.restirGiReservoirLayout = settings.restirGiEnabled
             ? RestirGiReservoirLayout::ProductionPacked
@@ -388,7 +518,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             settings.restirGiMode = RestirGiMode::Production;
             changed = true;
         }
-        if (ImGui::Combo("GI Mode", &giMode, giModeItems, 4)) {
+        if (renderSettingsComboRow("GI Mode", &giMode, giModeItems, 4)) {
             settings.restirGiMode = static_cast<RestirGiMode>(giMode);
             if (settings.restirGiMode == RestirGiMode::Off ||
                 settings.restirGiMode == RestirGiMode::LegacyCache) {
@@ -414,7 +544,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             settings.restirGiMode == RestirGiMode::LegacyCache;
         const bool forceValidationLayout = settings.restirGiMode == RestirGiMode::ReferenceValidation;
         ImGui::BeginDisabled(forceLegacyLayout || forceValidationLayout);
-        if (ImGui::Combo("GI Reservoir Layout", &layout, layoutItems, 3)) {
+        if (renderSettingsComboRow("GI Reservoir Layout", &layout, layoutItems, 3)) {
             settings.restirGiReservoirLayout = static_cast<RestirGiReservoirLayout>(layout);
             changed = true;
         }
@@ -435,7 +565,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     if (ImGui::CollapsingHeader("ReSTIR GI Tuning")) {
         const char* presetItems[] = {"Custom", "Reference", "Balanced", "Performance"};
         int preset = 0;
-        if (ImGui::Combo("GI Preset", &preset, presetItems, 4) && preset != 0) {
+        if (renderSettingsComboRow("GI Preset", &preset, presetItems, 4) && preset != 0) {
             if (preset == 1) {
                 settings.restirGiTemporalMaxAge = 32;
                 settings.restirGiSpatialRounds = 6;
@@ -467,31 +597,36 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             changed = true;
         }
         tooltip("Applies ReSTIR GI reservoir reuse presets. Custom values remain editable below.");
-        changed |= ImGui::Checkbox("GI Final Stabilization", &settings.restirGiFinalStabilizationEnabled);
+        changed |= renderSettingsCheckboxRow("GI Final Stabilization", &settings.restirGiFinalStabilizationEnabled);
         tooltip("Applies confidence, motion, history, and luminance clamps to the final ReSTIR GI contribution. Disable for raw reservoir A/B checks.");
-        changed |= ImGui::Checkbox("GI Half Resolution Reuse", &settings.restirGiHalfResolution);
+        changed |= renderSettingsCheckboxRow("GI Half Resolution Reuse", &settings.restirGiHalfResolution);
         tooltip("Uses one spatial GI reservoir per 2x2 pixel group for the GI debug/final path.");
         int activeTileMaskMode = static_cast<int>(settings.restirGiActiveTileMaskMode);
-        if (ImGui::Combo("GI Active Tile Mask", &activeTileMaskMode, "Off\0On\0Auto\0")) {
+        if (renderSettingsComboRow("GI Active Tile Mask", &activeTileMaskMode, "Off\0On\0Auto\0")) {
             settings.restirGiActiveTileMaskMode = static_cast<RestirGiActiveTileMaskMode>(activeTileMaskMode);
             changed = true;
         }
         tooltip("Skips production GI reuse/final work on 16x16 tiles without reusable GI candidates. Auto probes off/on and keeps the faster mode.");
         int historyCopyMode = static_cast<int>(settings.restirHistoryCopyMode);
-        if (ImGui::Combo("ReSTIR History Copy", &historyCopyMode, "Copy\0Ping-pong\0")) {
+        if (renderSettingsComboRow("ReSTIR History Copy", &historyCopyMode, "Copy\0Ping-pong\0")) {
             settings.restirHistoryCopyMode = static_cast<RestirHistoryCopyMode>(historyCopyMode);
             changed = true;
         }
         tooltip("Experimental: ping-pong can avoid DI/GI history copies when supported. Copy remains the default.");
-        changed |= ImGui::SliderScalar("GI Temporal Max Age", ImGuiDataType_U32, &settings.restirGiTemporalMaxAge, &minRestirGiAge, &maxRestirGiAge);
-        changed |= ImGui::SliderScalar("GI Spatial Rounds", ImGuiDataType_U32, &settings.restirGiSpatialRounds, &minRestirGiRounds, &maxRestirGiRounds);
-        changed |= ImGui::SliderFloat("GI Spatial Radius", &settings.restirGiSpatialRadius, 1.0f, 8.0f, "%.2f");
-        changed |= ImGui::SliderFloat("GI Depth Threshold Scale", &settings.restirGiDepthThresholdScale, 0.5f, 2.0f, "%.2f");
-        changed |= ImGui::SliderFloat("GI Compatibility Cutoff", &settings.restirGiSpatialCompatibilityThreshold, 0.0f, 0.85f, "%.2f");
-        changed |= ImGui::SliderScalar("GI Visibility Rays", ImGuiDataType_U32, &settings.restirGiVisibilityRayBudget, &minRestirGiVisibilityRays, &maxRestirGiVisibilityRays);
+        changed |= renderSettingsSliderScalarRow("GI Temporal Max Age", ImGuiDataType_U32, &settings.restirGiTemporalMaxAge, &minRestirGiAge, &maxRestirGiAge);
+        changed |= renderSettingsSliderScalarRow("GI Spatial Rounds", ImGuiDataType_U32, &settings.restirGiSpatialRounds, &minRestirGiRounds, &maxRestirGiRounds);
+        changed |= renderSettingsSliderFloatRow("GI Spatial Radius", &settings.restirGiSpatialRadius, 1.0f, 8.0f, "%.2f");
+        changed |= renderSettingsSliderFloatRow("GI Depth Threshold Scale", &settings.restirGiDepthThresholdScale, 0.5f, 2.0f, "%.2f");
+        changed |= renderSettingsSliderFloatRow("GI Compatibility Cutoff", &settings.restirGiSpatialCompatibilityThreshold, 0.0f, 0.85f, "%.2f");
+        changed |= renderSettingsSliderScalarRow("GI Visibility Rays", ImGuiDataType_U32, &settings.restirGiVisibilityRayBudget, &minRestirGiVisibilityRays, &maxRestirGiVisibilityRays);
         tooltip("Ray-query visibility budget per pixel for temporal/spatial GI reuse. Zero validates all configured GI reuse candidates.");
     }
-    if (ImGui::CollapsingHeader("Renderer Roadmap")) {
+    ImGui::TreePop();
+    }
+    renderSettingsEndSection();
+    }
+
+    if (renderSettingsBeginSection("Advanced", 0, "kernel reuse reservoir material gpu ser opacity atmosphere camera exposure environment artifacts")) {
         const char* lightingReuseItems[] = {"Legacy DI/GI", "Legacy DI/GI + ReGIR", "Experimental ReSTIR PT", "Validate ReSTIR PT"};
         int lightingReuseIndex = static_cast<int>(settings.lightingReuseMode);
         if (lightingReuseIndex < 0 || lightingReuseIndex > 3) {
@@ -613,11 +748,14 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             changed |= ImGui::SliderFloat("Volumetric", &settings.adaptiveWeightVolumetric, 0.0f, 1.0f, "%.2f");
             ImGui::TreePop();
         }
+        renderSettingsEndSection();
     }
+    if (renderSettingsBeginSection("Temporal & Denoising", ImGuiTreeNodeFlags_DefaultOpen, "temporal upscaling dlss tsr taa denoiser sharpening reflex frame generation")) {
+    ImGui::SeparatorText("Upscaling");
     const char* tsrPresetItems[] = {"Native", "Quality", "Balanced", "Performance"};
     int tsrPreset = settings.renderResolutionScale >= 0.99f ? 0 :
         (settings.renderResolutionScale >= 0.74f ? 1 : (settings.renderResolutionScale >= 0.59f ? 2 : 3));
-    if (ImGui::Combo("TSR Preset", &tsrPreset, tsrPresetItems, 4)) {
+    if (renderSettingsComboRow("TSR Preset", &tsrPreset, tsrPresetItems, 4)) {
         const float presetScales[] = {1.0f, 0.77f, 0.67f, 0.50f};
         settings.renderResolutionScale = presetScales[tsrPreset];
         changed = true;
@@ -627,7 +765,8 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     if (temporalIndex < 0 || temporalIndex > 2) {
         temporalIndex = 0;
     }
-    if (ImGui::BeginCombo("Temporal Upscaler", temporalItems[temporalIndex])) {
+    renderSettingsBeginRow("Temporal Upscaler");
+    if (ImGui::BeginCombo("##value", temporalItems[temporalIndex])) {
         if (ImGui::Selectable("TAA / TSR", settings.temporalUpscaler == TemporalUpscaler::TaaTsr)) {
             settings.temporalUpscaler = TemporalUpscaler::TaaTsr;
             settings.dlssRayReconstructionEnabled = false;
@@ -648,20 +787,21 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         }
         ImGui::EndCombo();
     }
+    renderSettingsEndRow();
     tooltip(settings.temporalUpscaler == TemporalUpscaler::Dlss && !dlssCanRequest
         ? nvidiaStatus.dlssUnavailableReason.c_str()
         : (settings.temporalUpscaler == TemporalUpscaler::Nis
             ? nvidiaStatus.streamlineNis.unavailableReason.c_str()
-            : "Selects the post-denoise temporal resolve/upscale backend."));
+            : "Selects the post-denoise temporal resolve/upscale backend. Q5D fallback order keeps TAA/TSR as the safe default, uses DLSS only when requested/available, and treats DLSS RR as opt-in guide-validated mode."));
     ImGui::BeginDisabled(!dlssCanRequest);
-    changed |= ImGui::SliderFloat("DLSS Sharpening", &settings.dlssSharpeningStrength, 0.0f, 1.0f, "%.2f");
+    changed |= renderSettingsSliderFloatRow("DLSS Sharpening", &settings.dlssSharpeningStrength, 0.0f, 1.0f, "%.2f");
     ImGui::EndDisabled();
     tooltip(dlssCanRequest
         ? "Sharpening amount passed to DLSS Super Resolution."
         : nvidiaStatus.dlssUnavailableReason.c_str());
     bool rrEnabled = settings.dlssRayReconstructionEnabled;
     ImGui::BeginDisabled(!dlssRayReconstructionCanRequest);
-    if (ImGui::Checkbox("DLSS Ray Reconstruction", &rrEnabled)) {
+    if (renderSettingsCheckboxRow("DLSS Ray Reconstruction", &rrEnabled)) {
         settings.dlssRayReconstructionEnabled = rrEnabled;
         if (rrEnabled) {
             settings.temporalUpscaler = TemporalUpscaler::Dlss;
@@ -674,7 +814,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         : nvidiaStatus.dlssRayReconstructionUnavailableReason.c_str());
     bool fgEnabled = settings.dlssFrameGenerationEnabled;
     ImGui::BeginDisabled(!dlssFrameGenerationCanRequest);
-    if (ImGui::Checkbox("DLSS Frame Generation", &fgEnabled)) {
+    if (renderSettingsCheckboxRow("DLSS Frame Generation", &fgEnabled)) {
         settings.dlssFrameGenerationEnabled = fgEnabled;
         if (fgEnabled) {
             settings.temporalUpscaler = TemporalUpscaler::Dlss;
@@ -687,7 +827,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         : nvidiaStatus.dlssFrameGenerationUnavailableReason.c_str());
     bool reflexEnabled = settings.streamlineReflexEnabled;
     ImGui::BeginDisabled(!reflexCanRequest);
-    if (ImGui::Checkbox("Streamline Reflex", &reflexEnabled)) {
+    if (renderSettingsCheckboxRow("Streamline Reflex", &reflexEnabled)) {
         settings.streamlineReflexEnabled = reflexEnabled;
         changed = true;
     }
@@ -697,7 +837,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         : nvidiaStatus.streamlineReflex.unavailableReason.c_str());
     bool nvperfEnabled = settings.streamlineNvPerfEnabled;
     ImGui::BeginDisabled(!nvperfCanRequest);
-    if (ImGui::Checkbox("Streamline NvPerf", &nvperfEnabled)) {
+    if (renderSettingsCheckboxRow("Streamline NvPerf", &nvperfEnabled)) {
         settings.streamlineNvPerfEnabled = nvperfEnabled;
         changed = true;
     }
@@ -705,23 +845,24 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     tooltip(nvperfCanRequest
         ? "Requests Streamline NvPerf evaluation for Nsight Perf HUD and per-frame performance diagnostics."
         : nvidiaStatus.streamlineNvPerf.unavailableReason.c_str());
-    changed |= ImGui::SliderFloat("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
-    changed |= ImGui::SliderFloat("Material Anisotropy", &settings.materialTextureAnisotropy, 1.0f, 16.0f, "%.1fx");
+    changed |= renderSettingsSliderFloatRow("Render Resolution Scale", &settings.renderResolutionScale, 0.25f, 1.0f, "%.2f");
+    ImGui::SeparatorText("Material & GPU Features");
+    changed |= renderSettingsSliderFloatRow("Material Anisotropy", &settings.materialTextureAnisotropy, 1.0f, 16.0f, "%.1fx");
     tooltip("Anisotropic filtering level for material textures. Unsupported devices clamp to 1x.");
-    changed |= ImGui::Checkbox("Specular AA", &settings.specularAaEnabled);
+    changed |= renderSettingsCheckboxRow("Specular AA", &settings.specularAaEnabled);
     tooltip("Raises effective specular roughness for high-frequency normal maps without changing material roughness.");
     const OpacityMicromapDeviceInfo& ommInfo = state.renderer.opacityMicromapInfo();
     if (!ommInfo.supported) {
         settings.opacityMicromapsEnabled = false;
     }
     ImGui::BeginDisabled(!ommInfo.supported);
-    changed |= ImGui::Checkbox("Opacity Micromaps", &settings.opacityMicromapsEnabled);
+    changed |= renderSettingsCheckboxRow("Opacity Micromaps", &settings.opacityMicromapsEnabled);
     ImGui::EndDisabled();
     tooltip(ommInfo.supported
         ? "Builds hardware opacity micromaps for eligible alpha-tested BLAS geometry."
         : ommInfo.disabledReason.c_str());
     const SerDeviceInfo& serInfo = state.renderer.serInfo();
-    ImGui::Text("SER: %s", serInfo.supported ? "available" : "unavailable");
+    renderSettingsInfoRow("SER", serInfo.supported ? "available" : "unavailable");
     tooltip(serInfo.supported
         ? serReorderingHintName(serInfo.reorderingHint)
         : serInfo.disabledReason.c_str());
@@ -729,7 +870,7 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         settings.shaderExecutionReorderingEnabled = false;
     }
     ImGui::BeginDisabled(!serInfo.supported);
-    changed |= ImGui::Checkbox("Wavefront SER", &settings.shaderExecutionReorderingEnabled);
+    changed |= renderSettingsCheckboxRow("Wavefront SER", &settings.shaderExecutionReorderingEnabled);
     ImGui::EndDisabled();
     tooltip(serInfo.supported
         ? "Enables shader execution reordering hints for the opt-in wavefront trace raygen path."
@@ -739,15 +880,18 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
     if (adaptiveIndex < 0 || adaptiveIndex > 3) {
         adaptiveIndex = 0;
     }
-    if (ImGui::Combo("Adaptive Quality", &adaptiveIndex, adaptiveItems, 4)) {
+    if (renderSettingsComboRow("Adaptive Quality", &adaptiveIndex, adaptiveItems, 4)) {
         settings.adaptiveQualityMode = static_cast<AdaptiveQualityMode>(adaptiveIndex);
         changed = true;
     }
     tooltip("Dynamically lowers expensive path-tracing controls while moving or over the GPU frame target.");
-    changed |= ImGui::SliderFloat("Adaptive GPU Target", &settings.adaptiveGpuFrameTargetMs, 4.0f, 100.0f, "%.1f ms");
+    changed |= renderSettingsSliderFloatRow("Adaptive GPU Target", &settings.adaptiveGpuFrameTargetMs, 4.0f, 100.0f, "%.1f ms");
     tooltip("Target smoothed GPU frame time used by adaptive quality modes.");
+    renderSettingsEndSection();
+    }
 
-    if (ImGui::CollapsingHeader("Tone Mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (renderSettingsBeginSection("Appearance & Camera", 0, "tone mapper exposure camera depth of field bloom color")) {
+        ImGui::SeparatorText("Color & Exposure");
         const char* toneMapperItems2[] = {"Linear", "Reinhard", "Reinhard White", "ACES", "PBR Neutral", "AgX"};
         int toneMapperIndex2 = static_cast<int>(settings.toneMapper);
         if (toneMapperIndex2 < 0 || toneMapperIndex2 > 5) {
@@ -846,9 +990,10 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             tooltip("Controls the target percentile used by auto-exposure metering.");
             ImGui::TreePop();
         }
+        renderSettingsEndSection();
     }
 
-    if (ImGui::CollapsingHeader("Sun / Lighting", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (renderSettingsBeginSection("Scene Lighting", 0, "sun lighting lux direction")) {
         if (state.sceneDocument != nullptr) {
             const SunDerivedState sun = SunController::derivedState(*state.sceneDocument);
             ImGui::Text("Primary Sun: %s", SunController::primarySunEntity(*state.sceneDocument).valid() ? "Scene" : "Missing");
@@ -859,9 +1004,10 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 requests.sceneUpdate = SceneUpdateKind::LightOnly;
             }
         }
+        renderSettingsEndSection();
     }
 
-    if (ImGui::CollapsingHeader("Atmosphere")) {
+    if (renderSettingsBeginSection("Atmosphere & Sky")) {
         changed |= ImGui::SliderFloat("Sky Intensity", &settings.skyIntensity, 0.0f, 3.0f, "%.2f");
         tooltip("Multiplier for atmospheric sky radiance.");
         changed |= ImGui::SliderFloat("Rayleigh Scale Height", &settings.rayleighScaleHeight, 1000.0f, 20000.0f, "%.0f m");
@@ -872,23 +1018,27 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         tooltip("Forward/backward scattering asymmetry. Higher = more forward scattered light.");
         changed |= ImGui::SliderFloat("Ground Albedo", &settings.groundAlbedo, 0.0f, 1.0f, "%.2f");
         tooltip("Planetary ground reflectance. Affects atmospheric light bouncing off the terrain.");
+        renderSettingsEndSection();
     }
 
-    if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (renderSettingsBeginSection("Environment", 0, "environment hdri intensity rotation background")) {
         changed |= ImGui::Checkbox("Show Environment", &settings.environmentEnabled);
         changed |= ImGui::SliderFloat("Environment Intensity", &settings.environmentIntensity, 0.0f, 8.0f, "%.2f");
         changed |= ImGui::SliderFloat("Background Intensity", &settings.environmentBackgroundIntensity, 0.0f, 2.0f, "%.2f");
         changed |= ImGui::SliderFloat("Environment Rotation", &settings.environmentRotation, -6.28318f, 6.28318f, "%.2f");
+        renderSettingsEndSection();
     }
 
-    if (ImGui::CollapsingHeader("Denoiser / TAA", ImGuiTreeNodeFlags_DefaultOpen)) {
-        changed |= ImGui::Checkbox("Denoiser", &settings.denoiserEnabled);
+    if (renderSettingsBeginSection("Denoiser & TAA", 0, "denoiser nrd taa feedback history atrous sharpening")) {
+        ImGui::SeparatorText("Denoiser");
+        changed |= renderSettingsCheckboxRow("Denoiser", &settings.denoiserEnabled);
         const char* denoiserBackendItems[] = {"Engine", "NRD"};
         int denoiserBackendIndex = static_cast<int>(settings.denoiserBackend);
         if (denoiserBackendIndex < 0 || denoiserBackendIndex > 1) {
             denoiserBackendIndex = 0;
         }
-        if (ImGui::BeginCombo("Denoiser Backend", denoiserBackendItems[denoiserBackendIndex])) {
+        renderSettingsBeginRow("Denoiser Backend");
+        if (ImGui::BeginCombo("##value", denoiserBackendItems[denoiserBackendIndex])) {
             if (ImGui::Selectable("Engine", settings.denoiserBackend == DenoiserBackend::Engine)) {
                 settings.denoiserBackend = DenoiserBackend::Engine;
                 changed = true;
@@ -901,40 +1051,46 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
             ImGui::EndDisabled();
             ImGui::EndCombo();
         }
+        renderSettingsEndRow();
         tooltip(settings.denoiserBackend == DenoiserBackend::Nrd && !nrdCanRequest
             ? nvidiaStatus.nrdUnavailableReason.c_str()
-            : "Selects the active denoiser backend.");
-        changed |= ImGui::Checkbox("Denoise While Moving", &settings.denoiseWhileMoving);
-        changed |= ImGui::SliderScalar("A-trous Iterations", ImGuiDataType_U32, &settings.atrousIterations, &minAtrous, &maxAtrous);
+            : "Selects the active denoiser backend. Q5D fallback order is Engine + TAA/TSR, NRD + TAA/TSR when validated, Engine + DLSS, NRD + DLSS, then opt-in DLSS RR.");
+        changed |= renderSettingsCheckboxRow("Denoise While Moving", &settings.denoiseWhileMoving);
+        changed |= renderSettingsSliderScalarRow("A-trous Iterations", ImGuiDataType_U32, &settings.atrousIterations, &minAtrous, &maxAtrous);
         tooltip("Denoiser iterations. More is smoother and slower.");
-        changed |= ImGui::SliderFloat("Denoiser Strength", &settings.denoiserStrength, 0.05f, 4.0f, "%.2f");
+        changed |= renderSettingsSliderFloatRow("Denoiser Strength", &settings.denoiserStrength, 0.05f, 4.0f, "%.2f");
         tooltip("Higher values denoise more aggressively and may lose detail.");
         const uint32_t minHistory = 4;
         const uint32_t maxHistory = 256;
-        changed |= ImGui::SliderScalar("Max History Length", ImGuiDataType_U32, &settings.denoiserMaxHistoryLength, &minHistory, &maxHistory);
+        changed |= renderSettingsSliderScalarRow("Max History Length", ImGuiDataType_U32, &settings.denoiserMaxHistoryLength, &minHistory, &maxHistory);
         tooltip("Maximum temporal history length for moment tracking. Higher values stabilize static scenes more.");
-        changed |= ImGui::SliderFloat("Moment Validity Threshold", &settings.momentValidityThreshold, 0.05f, 0.75f, "%.2f");
+        changed |= renderSettingsSliderFloatRow("Moment Validity Threshold", &settings.momentValidityThreshold, 0.05f, 0.75f, "%.2f");
         tooltip("Threshold for moment history validity. Lower = more history, more ghosting. Higher = stricter, less ghosting, more noise.");
-        changed |= ImGui::Checkbox("TAA", &settings.taaEnabled);
+        ImGui::SeparatorText("Temporal AA");
+        changed |= renderSettingsCheckboxRow("TAA", &settings.taaEnabled);
         tooltip("HDR temporal anti-aliasing pass after denoising and before tone mapping.");
-        changed |= ImGui::SliderFloat("TAA Feedback", &settings.taaFeedback, 0.01f, 0.5f, "%.2f");
+        changed |= renderSettingsSliderFloatRow("TAA Feedback", &settings.taaFeedback, 0.01f, 0.5f, "%.2f");
         tooltip("Lower values keep more history; higher values react faster to motion and lighting changes.");
-        changed |= ImGui::SliderFloat("TAA Motion Feedback", &settings.taaMotionFeedback, 0.25f, 0.98f, "%.2f");
+        changed |= renderSettingsSliderFloatRow("TAA Motion Feedback", &settings.taaMotionFeedback, 0.25f, 0.98f, "%.2f");
         tooltip("Current-frame blend target while the camera is moving. Lower values stabilize noisy motion; higher values reduce ghosting.");
-        changed |= ImGui::SliderFloat("TAA Reactive Feedback", &settings.taaReactiveFeedback, 0.25f, 0.99f, "%.2f");
+        changed |= renderSettingsSliderFloatRow("TAA Reactive Feedback", &settings.taaReactiveFeedback, 0.25f, 0.99f, "%.2f");
         tooltip("Current-frame blend used for strong reactive or disocclusion cases while moving.");
-        changed |= ImGui::SliderFloat("TAA Sharpening", &settings.taaSharpeningStrength, 0.0f, 1.0f, "%.2f");
+        changed |= renderSettingsSliderFloatRow("TAA Sharpening", &settings.taaSharpeningStrength, 0.0f, 1.0f, "%.2f");
         tooltip("Unsharp mask amount applied by the TAA resolve.");
+        renderSettingsEndSection();
     }
 
-    if (ImGui::CollapsingHeader("Artifact Controls")) {
+    if (renderSettingsBeginSection("Artifact Controls", 0, "shadow bias firefly clamp artifact")) {
         changed |= ImGui::SliderFloat("Shadow Ray Bias", &settings.shadowRayBias, 0.00001f, 0.05f, "%.5f");
         tooltip("Surface offset used for secondary shadow rays.");
         changed |= ImGui::SliderFloat("Shadow Distance Bias", &settings.shadowDistanceBias, 0.0f, 0.1f, "%.5f");
         tooltip("Reduces the maximum distance of finite shadow rays to avoid self hits at the light.");
         changed |= ImGui::SliderFloat("Firefly Clamp", &settings.fireflyClamp, 1.0f, 512.0f, "%.1f");
         tooltip("Luminance clamp for single path samples before accumulation.");
+        renderSettingsEndSection();
     }
+
+    ImGui::PopStyleVar(2);
 
     if (changed) {
         if (!presetApplied) {

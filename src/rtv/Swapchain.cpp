@@ -25,6 +25,21 @@ uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, Vk
     throw std::runtime_error("Failed to find suitable memory type");
 }
 
+VkCompositeAlphaFlagBitsKHR chooseCompositeAlpha(VkCompositeAlphaFlagsKHR supported) {
+    constexpr std::array<VkCompositeAlphaFlagBitsKHR, 4> preferred{
+        VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+        VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+        VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+        VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+    };
+    for (VkCompositeAlphaFlagBitsKHR mode : preferred) {
+        if ((supported & mode) != 0) {
+            return mode;
+        }
+    }
+    throw std::runtime_error("Swapchain surface exposes no supported composite alpha mode");
+}
+
 } // namespace
 
 Swapchain::Swapchain(const VulkanContext& context, GLFWwindow* window)
@@ -33,7 +48,11 @@ Swapchain::Swapchain(const VulkanContext& context, GLFWwindow* window)
 }
 
 Swapchain::Swapchain(const VulkanContext& context, VkExtent2D extent)
-    : context_(context), headless_(true), imageFormat_(VK_FORMAT_B8G8R8A8_UNORM), extent_(extent) {
+    : context_(context),
+      headless_(true),
+      imageFormat_(VK_FORMAT_B8G8R8A8_UNORM),
+      imageUsage_(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT),
+      extent_(extent) {
     createHeadlessImages();
 }
 
@@ -100,6 +119,12 @@ Swapchain::SupportDetails Swapchain::querySupport() const {
 }
 
 VkSurfaceFormatKHR Swapchain::chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats) const {
+    if (formats.size() == 1 && formats.front().format == VK_FORMAT_UNDEFINED) {
+        return VkSurfaceFormatKHR{
+            VK_FORMAT_B8G8R8A8_UNORM,
+            formats.front().colorSpace,
+        };
+    }
     const auto preferred = std::find_if(formats.begin(), formats.end(), [](const VkSurfaceFormatKHR& format) {
         return format.format == VK_FORMAT_B8G8R8A8_UNORM &&
                format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
@@ -145,6 +170,14 @@ void Swapchain::create() {
     const VkPresentModeKHR presentMode = choosePresentMode(support.presentModes);
     extent_ = chooseExtent(support.capabilities);
 
+    if ((support.capabilities.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0) {
+        throw std::runtime_error("Swapchain surface does not support color-attachment images");
+    }
+    imageUsage_ = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if ((support.capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0) {
+        imageUsage_ |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    }
+
     uint32_t imageCount = support.capabilities.minImageCount + 1;
     if (support.capabilities.maxImageCount > 0) {
         imageCount = std::min(imageCount, support.capabilities.maxImageCount);
@@ -164,7 +197,7 @@ void Swapchain::create() {
     createInfo.imageColorSpace = surfaceFormat.colorSpace;
     createInfo.imageExtent = extent_;
     createInfo.imageArrayLayers = 1;
-    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    createInfo.imageUsage = imageUsage_;
     if (queues.graphics != queues.present) {
         createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
         createInfo.queueFamilyIndexCount = static_cast<uint32_t>(queueFamilyIndices.size());
@@ -173,7 +206,7 @@ void Swapchain::create() {
         createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     }
     createInfo.preTransform = support.capabilities.currentTransform;
-    createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    createInfo.compositeAlpha = chooseCompositeAlpha(support.capabilities.supportedCompositeAlpha);
     createInfo.presentMode = presentMode;
     createInfo.clipped = VK_TRUE;
 
@@ -226,7 +259,7 @@ void Swapchain::createHeadlessImages() {
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.usage = imageUsage_;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 

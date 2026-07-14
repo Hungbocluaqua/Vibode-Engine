@@ -65,6 +65,7 @@ constexpr uint32_t materialFlagManualEmissiveSrgb = 1u << 1u;
 constexpr uint32_t materialFlagNormalMapDirectX = 1u << 2u;
 constexpr uint32_t materialFlagSpecularGlossinessWorkflow = 1u << 3u;
 constexpr uint32_t materialFlagSpecularAlphaGlossiness = 1u << 4u;
+constexpr uint32_t materialFlagMayBeTransmissive = 1u << 5u;
 constexpr uint32_t materialParameterVec4Stride = 18u;
 constexpr uint32_t materialTextureTransformCount = 17u;
 constexpr uint32_t materialVec4Stride = materialParameterVec4Stride + materialTextureTransformCount * 2u;
@@ -793,6 +794,30 @@ void appendOpacityHeightTextureIndices(std::vector<glm::vec4>& materialData, flo
     materialData.push_back({opacityTexture, heightTexture, heightScale, 0.0f});
 }
 
+bool materialRowsMayBeTransmissive(const std::vector<glm::vec4>& materialData, size_t materialIndex) {
+    const size_t base = materialIndex * materialVec4Stride;
+    if (base + 12u >= materialData.size()) {
+        return false;
+    }
+    const glm::vec4& typeAndFlags = materialData[base + 1u];
+    const glm::vec4& transmission = materialData[base + 12u];
+    return static_cast<uint32_t>(std::lround(typeAndFlags.y)) == materialTypeDielectric ||
+        transmission.y > 1.0e-5f ||
+        static_cast<int32_t>(std::lround(transmission.z)) >= 0;
+}
+
+void encodeMaterialClassificationFlags(std::vector<glm::vec4>& materialData) {
+    const size_t materialCount = materialData.size() / materialVec4Stride;
+    for (size_t i = 0; i < materialCount; ++i) {
+        glm::vec4& typeAndFlags = materialData[i * materialVec4Stride + 1u];
+        uint32_t flags = static_cast<uint32_t>(std::lround(typeAndFlags.w));
+        if (materialRowsMayBeTransmissive(materialData, i)) {
+            flags |= materialFlagMayBeTransmissive;
+        }
+        typeAndFlags.w = static_cast<float>(flags);
+    }
+}
+
 void appendConductorOptics(std::vector<glm::vec4>& materialData, const CachedMaterialData& material) {
     const bool enabled = material.useConductorOptics != 0u;
     glm::vec3 eta = enabled ? nonnegativeRgb(material.conductorEta) : glm::vec3{0.0f};
@@ -864,15 +889,14 @@ std::vector<glm::vec4> buildCachedMaterialData(const CachedScene& cached) {
         appendOpacityHeightTextureIndices(materialData);
         appendMaterialTextureTransforms(materialData, nullptr);
     }
+    encodeMaterialClassificationFlags(materialData);
     return materialData;
 }
 
 bool materialDataContainsTransmission(const std::vector<glm::vec4>& materialData) {
     const size_t materialCount = materialData.size() / materialVec4Stride;
     for (size_t i = 0; i < materialCount; ++i) {
-        const size_t transmissionSlot = i * materialVec4Stride + 12u;
-        if (transmissionSlot < materialData.size() &&
-            materialData[transmissionSlot].y > materialTransmissionDielectricThreshold) {
+        if (materialRowsMayBeTransmissive(materialData, i)) {
             return true;
         }
     }
@@ -1607,8 +1631,7 @@ std::vector<uint8_t> transmissiveMaterialMaskFromRows(const std::vector<glm::vec
     const size_t materialCount = materialData.size() / materialVec4Stride;
     std::vector<uint8_t> mask(materialCount, 0u);
     for (size_t i = 0; i < materialCount; ++i) {
-        const glm::vec4& transmissionRow = materialData[i * materialVec4Stride + 12u];
-        if (transmissionRow.y > materialTransmissionDielectricThreshold) {
+        if (materialRowsMayBeTransmissive(materialData, i)) {
             mask[i] = 1u;
         }
     }
@@ -1639,6 +1662,29 @@ bool primitivesContainSidedness(
         const uint32_t primitiveIndex = primitiveOffset + i;
         if (primitiveIndex < primitiveRecords.size() &&
             (primitiveRecords[primitiveIndex].metadata.w != 0u) == doubleSided) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool materialDataReferencesTextures(const std::vector<glm::vec4>& materialData) {
+    constexpr std::array<std::pair<uint32_t, uint32_t>, 17> textureFields{{
+        {3u, 0u}, {3u, 1u}, {3u, 2u}, {3u, 3u},
+        {7u, 2u}, {9u, 0u}, {9u, 1u}, {10u, 2u}, {10u, 3u},
+        {11u, 2u}, {11u, 3u}, {12u, 0u}, {12u, 2u}, {13u, 3u},
+        {14u, 0u}, {14u, 1u}, {14u, 3u},
+    }};
+    const size_t materialCount = materialData.size() / materialVec4Stride;
+    for (size_t i = 0; i < materialCount; ++i) {
+        const size_t base = i * materialVec4Stride;
+        for (const auto& [row, component] : textureFields) {
+            if (materialData[base + row][component] >= 0.0f) {
+                return true;
+            }
+        }
+        const glm::vec4& opacityHeight = materialData[base + 17u];
+        if (opacityHeight.x >= 0.0f || opacityHeight.y >= 0.0f) {
             return true;
         }
     }
@@ -2020,7 +2066,7 @@ GpuScene::GpuScene(
             if (cached.has_value()) {
                 if (sceneCachePolicy_.mode == SceneCacheMode::FullReadWrite && importedScene->lights.empty()) {
                     if (hasValidGpuCache(*cached, *importedScene)) {
-                        createImportedSceneFromCache(uploader, *cached, importedScene->lights);
+                        createImportedSceneFromCache(uploader, *cached, *importedScene);
                         usedGpuCache = true;
                     } else {
                         std::cout << "GPU cache miss: full cache rejected for active scene signature.\n";
@@ -2281,6 +2327,27 @@ VkDescriptorImageInfo GpuScene::materialCombinedDescriptor(uint32_t slot) const 
     VkDescriptorImageInfo combined = texDescs[slot];
     combined.sampler = slot < materialTextureSamplers_.size() ? materialTextureSamplers_[slot] : materialSampler_;
     return combined;
+}
+
+bool GpuScene::streamedMaterialTextureDescriptor(
+    const SceneAsset& scene,
+    TextureAssetHandle texture,
+    const Image& image,
+    uint32_t& slotOut,
+    VkDescriptorImageInfo& descriptorOut) const {
+    const uint32_t slot = textureSlotIndexFor(scene, texture, materialTextureSlotCapacity_);
+    if (slot == UINT32_MAX || image.view() == VK_NULL_HANDLE) {
+        return false;
+    }
+    const VkSampler sampler = slot < materialTextureSamplers_.size()
+        ? materialTextureSamplers_[slot]
+        : materialSampler_;
+    if (sampler == VK_NULL_HANDLE) {
+        return false;
+    }
+    slotOut = slot;
+    descriptorOut = image.sampledDescriptor(sampler);
+    return descriptorOut.imageView != VK_NULL_HANDLE;
 }
 
 bool GpuScene::setEnvironmentControls(bool enabled, float intensity, float rotation, float backgroundIntensity) {
@@ -2685,6 +2752,7 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         appendMaterialTextureTransforms(materialData, material);
     }
 
+    encodeMaterialClassificationFlags(materialData);
     const VkDeviceSize byteSize = sizeof(glm::vec4) * materialData.size();
     if (byteSize == 0 || byteSize > materials_->size()) {
         return false;
@@ -2730,6 +2798,7 @@ bool GpuScene::updateImportedMaterials(BufferUploader& uploader, const SceneAsse
         primitiveRecordCpu_,
         transmissiveMaterialMaskFromRows(materialData));
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
+    hasMaterialTextures_ = materialDataReferencesTextures(materialData);
     if (meshParamsBuffer_ != nullptr) {
         meshParamsBuffer_->write(&meshParams_, sizeof(meshParams_));
         meshParamsBuffer_->flush(sizeof(meshParams_));
@@ -2963,11 +3032,19 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         {{0.95f, 0.96f, 0.97f}, 0.08f, 1.5f, 3, 1.0f, {}},
         {{0.95f, 0.93f, 0.88f}, 0.12f, 1.5f, 4, 0.0f, {}},
     };
-    const std::vector<bool> materialDoubleSided(mats.size(), true);
+    const std::vector<bool> materialDoubleSided = {
+        true,  // white walls are thin debug shell planes, so keep them visible from outside
+        true,  // red wall
+        true,  // green wall
+        true,  // ceiling light
+        true,  // glass sphere needs interior exits for refraction
+        true,  // metal sphere uses two-sided fallback hits for stable glossy reflections
+        true,  // dielectric/clearcoat sphere uses two-sided fallback hits for stable glossy reflections
+    };
 
     auto pushSphereMesh = [&](glm::vec3 center, float radius, uint32_t material) {
-        constexpr uint32_t longitude = 160;
-        constexpr uint32_t latitude = 80;
+        constexpr uint32_t longitude = 96;
+        constexpr uint32_t latitude = 48;
         const uint32_t base = static_cast<uint32_t>(vertices.size());
         for (uint32_t y = 0; y <= latitude; ++y) {
             const float v = static_cast<float>(y) / static_cast<float>(latitude);
@@ -3103,12 +3180,14 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
     std::vector<glm::vec4> materialData;
     std::vector<glm::vec3> materialEmissive;
     materialEmissive.reserve(mats.size());
-    for (const auto& m : mats) {
+    for (size_t materialIndex = 0; materialIndex < mats.size(); ++materialIndex) {
+        const auto& m = mats[materialIndex];
         materialData.push_back({m.color, m.roughness});
         materialData.push_back({m.ior, static_cast<float>(m.type), m.metallic, 0.0f});
         materialData.push_back({m.emissive, 1.0f});
         materialData.push_back({-1.0f, -1.0f, -1.0f, -1.0f});
-        materialData.push_back({0.5f, 0.0f, 1.0f, 0.0f});
+        const float doubleSided = materialIndex < materialDoubleSided.size() && materialDoubleSided[materialIndex] ? 1.0f : 0.0f;
+        materialData.push_back({0.5f, 0.0f, doubleSided, 0.0f});
         appendConductorOptics(materialData, nullptr);
         appendGltfMaterialExtensionData(
             materialData,
@@ -3126,7 +3205,9 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         appendMaterialTextureTransforms(materialData, nullptr);
         materialEmissive.push_back(m.emissive);
     }
+    encodeMaterialClassificationFlags(materialData);
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
+    hasMaterialTextures_ = materialDataReferencesTextures(materialData);
 
     std::vector<glm::vec4> sphereData;
 
@@ -3186,7 +3267,7 @@ void GpuScene::createCornellBox(BufferUploader& uploader) {
         uploadVectorBatched(batch, primitiveRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, primitiveRecords, "scene primitive records");
         uploadVectorBatched(batch, instanceRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceRecords, "scene instance records");
         uploadVectorBatched(batch, rtTriangleMaterialIds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rtTriangleMaterialIds, "scene rt triangle material ids");
-        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, lightRecords, "scene emissive light records");
+        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, lightRecords, "scene emissive light records");
         uploadVectorBatched(batch, localVertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localVertexData, "scene local mesh vertices");
         uploadVectorBatched(batch, localIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localIndices, "scene local mesh indices");
         uploadVectorBatched(batch, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "scene instance bounds");
@@ -3358,7 +3439,9 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         materialDoubleSided.push_back(false);
         materialAlphaClasses.push_back(kPrimitiveAlphaClassOpaque);
     }
+    encodeMaterialClassificationFlags(materialData);
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
+    hasMaterialTextures_ = materialDataReferencesTextures(materialData);
 
     std::unordered_map<uint32_t, uint32_t> materialIndexForAsset;
     materialIndexForAsset.reserve(materialHandles.size());
@@ -3807,7 +3890,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
         uploadVectorBatched(batch, primitiveRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, primitiveRecords, "imported primitive records");
         uploadVectorBatched(batch, instanceRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceRecords, "imported instance records");
         uploadVectorBatched(batch, rtTriangleMaterialIds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rtTriangleMaterialIds, "imported rt triangle material ids");
-        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, lightRecords, "imported emissive light records");
+        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, lightRecords, "imported emissive light records");
         uploadVectorBatched(batch, localVertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localVertexData, "imported local mesh vertices");
         uploadVectorBatched(batch, localIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localIndices, "imported local mesh indices");
         uploadVectorBatched(batch, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "imported instance bounds");
@@ -4122,7 +4205,7 @@ void GpuScene::createImportedScene(BufferUploader& uploader, const SceneAsset& i
     }
 }
 
-void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const CachedScene& cached, const std::vector<SceneLightAsset>& activeSceneLights) {
+void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const CachedScene& cached, const SceneAsset& activeScene) {
     std::cout << "GPU cache hit: restoring cached BVH data for " << cached.meshGpuRecords.size() << " meshes.\n";
     createCachedMaterialTextures(uploader, cached);
 
@@ -4164,7 +4247,8 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     }
     annotatePrimitiveAlphaClasses(primitiveRecords, materialAlphaClasses, &materialDoubleSided);
 
-    for (const auto& cachedMesh : cached.meshGpuRecords) {
+    for (size_t meshIndex = 0; meshIndex < cached.meshGpuRecords.size(); ++meshIndex) {
+        const CachedMeshGpuRecord& cachedMesh = cached.meshGpuRecords[meshIndex];
         GpuMeshRecord rec{};
         rec.vertexIndexData = cachedMesh.vertexIndexData;
         rec.primitiveData = cachedMesh.primitiveData;
@@ -4177,6 +4261,9 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         meshRecords.push_back(rec);
         rayTracingMeshes_.push_back(RayTracingMeshBuildInput{
             .meshIndex = static_cast<uint32_t>(meshRecords.size() - 1),
+            .sourceMeshHandleIndex = meshIndex < activeScene.meshes.size()
+                ? activeScene.meshes[meshIndex].index
+                : 0xffffffffu,
             .firstVertex = rec.vertexIndexData.x,
             .vertexCount = rec.vertexIndexData.y,
             .firstIndex = rec.vertexIndexData.z,
@@ -4282,7 +4369,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
     float lightSelectionWeight = emissiveTotalWeight;
     lightRecords = combineLightRecords(
         emissiveLightRecords_,
-        activeSceneLights,
+        activeScene.lights,
         emissiveTotalWeight,
         lightSelectionWeight);
     lightRecordCpu_ = lightRecords;
@@ -4304,6 +4391,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         primitiveRecords,
         transmissiveMaterialMaskFromRows(materialData));
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
+    hasMaterialTextures_ = materialDataReferencesTextures(materialData);
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
     primitiveRecordCpu_ = primitiveRecords;
@@ -4341,7 +4429,7 @@ void GpuScene::createImportedSceneFromCache(BufferUploader& uploader, const Cach
         uploadVectorBatched(batch, primitiveRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, primitiveRecords, "imported primitive records (cached)");
         uploadVectorBatched(batch, instanceRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceRecords, "imported instance records (cached)");
         uploadVectorBatched(batch, rtTriangleMaterialIds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rtTriangleMaterialIds, "imported rt triangle material ids (cached)");
-        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, lightRecords, "imported emissive light records (cached)");
+        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, lightRecords, "imported emissive light records (cached)");
 
         uploadVectorBatched(batch, localVertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localVertexData, "imported local mesh vertices (cached)");
         uploadVectorBatched(batch, localIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localIndices, "imported local mesh indices (cached)");
@@ -4617,6 +4705,7 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
         transmissiveMaterialMaskFromRows(materialData));
     applyLightRecordMetadataToMeshParams(meshParams_, lightRecords, lightSelectionWeight);
     hasTransmissiveMaterials_ = materialDataContainsTransmission(materialData);
+    hasMaterialTextures_ = materialDataReferencesTextures(materialData);
     rayTracingGeometryStats_ = computeRayTracingGeometryStats(meshRecords, primitiveRecords);
     primitiveRecordCpu_ = primitiveRecords;
     localVertexCpu_ = localVertexData;
@@ -4658,7 +4747,7 @@ void GpuScene::createImportedSceneGeometryFromCache(BufferUploader& uploader, co
         uploadVectorBatched(batch, primitiveRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, primitiveRecords, "imported primitive records (geometry cache)");
         uploadVectorBatched(batch, instanceRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceRecords, "imported instance records (geometry cache)");
         uploadVectorBatched(batch, rtTriangleMaterialIds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, rtTriangleMaterialIds, "imported rt triangle material ids (geometry cache)");
-        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, lightRecords, "imported emissive light records (geometry cache)");
+        uploadVectorBatched(batch, lightRecords_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, lightRecords, "imported emissive light records (geometry cache)");
         uploadVectorBatched(batch, localVertices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localVertexData, "imported local mesh vertices (geometry cache)");
         uploadVectorBatched(batch, localIndices_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, localIndices, "imported local mesh indices (geometry cache)");
         uploadVectorBatched(batch, instanceBounds_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, instanceBounds, "imported instance bounds (geometry cache)");
@@ -4770,7 +4859,7 @@ void GpuScene::uploadLightRecords(
         allocator_,
         uploader,
         lightRecords_,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         lightRecords.data(),
         sizeof(GpuLightRecord) * lightRecords.size(),
         "scene light records"), retireFrame);
