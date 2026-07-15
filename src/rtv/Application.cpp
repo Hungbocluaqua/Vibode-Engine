@@ -1758,6 +1758,12 @@ std::wstring widenAscii(std::string_view value) {
 void syncDocumentRenderSettings(SceneDocument& document, const RendererSettings& settings) {
     RenderSettings& render = document.renderSettings();
     render.renderPreset = settings.renderPreset;
+    render.rendererPipelineMode = settings.rendererPipelineMode;
+    render.rtxdiQualityPreset = settings.rtxdiQualityPreset;
+    render.rtxdiDirectLightingEnabled = settings.rtxdiDirectLightingEnabled;
+    render.rtxdiIndirectLightingEnabled = settings.rtxdiIndirectLightingEnabled;
+    render.rtxdiRestirPtEnabled = settings.rtxdiRestirPtEnabled;
+    render.rtxdiCheckerboardEnabled = settings.rtxdiCheckerboardEnabled;
     render.pathTracingEnabled = settings.pathTracingEnabled;
     render.cameraJitterEnabled = settings.cameraJitterEnabled;
     render.directLightingEnabled = settings.directLightingEnabled;
@@ -1906,6 +1912,12 @@ RendererSettings rendererSettingsFromDocument(const SceneDocument& document, Ren
     const RenderSettings& render = document.renderSettings();
     const Environment& environment = document.environment();
     settings.renderPreset = render.renderPreset;
+    settings.rendererPipelineMode = render.rendererPipelineMode;
+    settings.rtxdiQualityPreset = render.rtxdiQualityPreset;
+    settings.rtxdiDirectLightingEnabled = render.rtxdiDirectLightingEnabled;
+    settings.rtxdiIndirectLightingEnabled = render.rtxdiIndirectLightingEnabled;
+    settings.rtxdiRestirPtEnabled = render.rtxdiRestirPtEnabled;
+    settings.rtxdiCheckerboardEnabled = render.rtxdiCheckerboardEnabled;
     settings.pathTracingEnabled = render.pathTracingEnabled;
     settings.cameraJitterEnabled = render.cameraJitterEnabled;
     settings.directLightingEnabled = render.directLightingEnabled;

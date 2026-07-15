@@ -2,6 +2,7 @@
 
 #include "rtv/FreeListAllocator.h"
 #include "rtv/RenderGraph.h"
+#include "rtv/RtxdiRuntime.h"
 #include "rtv/passes/RestirGIPass.h"
 
 #include <Volk/volk.h>
@@ -130,12 +131,94 @@ bool testRestirGiHalfResolutionUpsampleContract(std::ostream& output) {
     return ok;
 }
 
+bool testRtxdiMediumRuntimeContract(std::ostream& output) {
+    RtxdiRuntime runtime({
+        .renderWidth = 1280u,
+        .renderHeight = 720u,
+        .qualityPreset = RtxdiQualityPreset::Medium,
+        .checkerboard = false,
+    });
+    runtime.beginFrame(7u);
+
+    const auto& di = runtime.context().GetReSTIRDIContext();
+    const auto initial = di.GetInitialSamplingParameters();
+    const auto temporal = di.GetTemporalResamplingParameters();
+    const auto spatial = di.GetSpatialResamplingParameters();
+    const auto& gi = runtime.context().GetReSTIRGIContext();
+    const auto giTemporal = gi.GetTemporalResamplingParameters();
+    const auto giSpatial = gi.GetSpatialResamplingParameters();
+    const auto& pt = runtime.context().GetReSTIRPTContext();
+    const auto ptInitial = pt.GetInitialSamplingParameters();
+    const auto ptTemporal = pt.GetTemporalResamplingParameters();
+    const auto ptSpatial = pt.GetSpatialResamplingParameters();
+    const auto memory = runtime.memoryRequirements();
+
+    bool ok = true;
+    ok &= check(di.GetFrameIndex() == 7u, "RTXDI frame index advances", output);
+    ok &= check(
+        di.GetResamplingMode() == rtxdi::ReSTIRDI_ResamplingMode::TemporalAndSpatial,
+        "RTXDI medium preset enables temporal and spatial DI",
+        output);
+    ok &= check(initial.numLocalLightSamples == 8u, "RTXDI medium preset uses eight local-light candidates", output);
+    ok &= check(initial.numBrdfSamples == 1u, "RTXDI medium preset uses one BRDF candidate", output);
+    ok &= check(
+        temporal.biasCorrectionMode == ReSTIRDI_TemporalBiasCorrectionMode::Raytraced,
+        "RTXDI medium preset uses ray-traced temporal correction",
+        output);
+    ok &= check(
+        spatial.biasCorrectionMode == ReSTIRDI_SpatialBiasCorrectionMode::Basic,
+        "RTXDI medium preset uses basic spatial correction",
+        output);
+    ok &= check(
+        gi.GetResamplingMode() == rtxdi::ReSTIRGI_ResamplingMode::TemporalAndSpatial &&
+            giTemporal.maxHistoryLength == 16u && giSpatial.numSamples == 2u,
+        "RTXDI medium preset configures GI temporal and spatial reuse",
+        output);
+    ok &= check(
+        pt.GetResamplingMode() == rtxdi::ReSTIRPT_ResamplingMode::TemporalAndSpatial &&
+            ptInitial.maxBounceDepth == 5u && ptTemporal.maxHistoryLength == 16u &&
+            ptSpatial.numSpatialSamples == 2u,
+        "RTXDI medium preset configures ReSTIR PT reuse",
+        output);
+    ok &= check(memory.diReservoirBytes > 0u, "RTXDI DI memory is reported", output);
+    ok &= check(memory.giReservoirBytes > 0u, "RTXDI GI memory is reported", output);
+    ok &= check(memory.ptReservoirBytes > 0u, "RTXDI PT memory is reported", output);
+    ok &= check(
+        memory.totalReservoirBytes == memory.diReservoirBytes + memory.giReservoirBytes + memory.ptReservoirBytes,
+        "RTXDI memory total matches its components",
+        output);
+    return ok;
+}
+
+bool testRtxdiSettingsContract(std::ostream& output) {
+    bool ok = true;
+    ok &= check(
+        parseRendererPipelineMode("hybrid-rtxdi") == RendererPipelineMode::HybridRtxdi,
+        "RTXDI hybrid pipeline name parses",
+        output);
+    ok &= check(
+        parseRendererPipelineMode("ReSTIR PT") == RendererPipelineMode::PathTracerRtxdi,
+        "RTXDI path tracer alias parses",
+        output);
+    ok &= check(
+        parseRtxdiQualityPreset("reference") == RtxdiQualityPreset::Reference,
+        "RTXDI reference quality parses",
+        output);
+    ok &= check(
+        std::string_view(rendererPipelineModeName(RendererPipelineMode::PathTracerRtxdi)) == "path-tracer-rtxdi",
+        "RTXDI path tracer name is stable",
+        output);
+    return ok;
+}
+
 } // namespace
 
 int runRendererCoreRegressionTests(std::ostream& output) {
     const bool ok = testFreeListAllocator(output) &&
         testRenderGraphReaderOrdering(output) &&
-        testRestirGiHalfResolutionUpsampleContract(output);
+        testRestirGiHalfResolutionUpsampleContract(output) &&
+        testRtxdiMediumRuntimeContract(output) &&
+        testRtxdiSettingsContract(output);
     output << (ok ? "Renderer core regression tests passed.\n" : "Renderer core regression tests failed.\n");
     return ok ? 0 : 1;
 }

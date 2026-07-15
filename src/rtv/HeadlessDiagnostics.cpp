@@ -1575,6 +1575,12 @@ void to_json(nlohmann::json& j, const ProfileReport::NvidiaIntegrationReport& n)
 
 void to_json(nlohmann::json& j, const RendererSettings& s) {
     j["render_preset"] = renderPresetName(s.renderPreset);
+    j["renderer_pipeline_mode"] = rendererPipelineModeName(s.rendererPipelineMode);
+    j["rtxdi_quality_preset"] = rtxdiQualityPresetName(s.rtxdiQualityPreset);
+    j["rtxdi_direct_lighting_enabled"] = s.rtxdiDirectLightingEnabled;
+    j["rtxdi_indirect_lighting_enabled"] = s.rtxdiIndirectLightingEnabled;
+    j["rtxdi_restir_pt_enabled"] = s.rtxdiRestirPtEnabled;
+    j["rtxdi_checkerboard_enabled"] = s.rtxdiCheckerboardEnabled;
     j["path_tracing_enabled"] = s.pathTracingEnabled;
     j["denoiser_enabled"] = s.denoiserEnabled;
     j["denoiser_backend"] = denoiserBackendName(s.denoiserBackend);
@@ -3799,12 +3805,17 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
         : static_cast<uint32_t>(validationErrors);
 
     profileReport_.settings = renderer->settings();
-    if (profileReport_.settings.lightingReuseMode == LightingReuseMode::ExperimentalRestirPT ||
+    const bool nativeRtxdiPtBridge =
+        profileReport_.settings.rendererPipelineMode == RendererPipelineMode::PathTracerRtxdi &&
+        profileReport_.settings.rtxdiIndirectLightingEnabled &&
+        profileReport_.settings.rtxdiRestirPtEnabled;
+    if ((profileReport_.settings.lightingReuseMode == LightingReuseMode::ExperimentalRestirPT &&
+         !nativeRtxdiPtBridge) ||
         profileReport_.settings.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy) {
         profileReport_.warnings.push_back(
             std::string("Lighting reuse mode '") +
             lightingReuseModeName(profileReport_.settings.lightingReuseMode) +
-            "' is requested, but only the legacy DI/GI path is currently effective.");
+            "' is requested, but the native RTXDI path-space bridge is not active for this configuration.");
     }
     if (profileReport_.settings.adaptiveSamplingMode == AdaptiveSamplingMode::Neural) {
         profileReport_.warnings.push_back(
@@ -4957,6 +4968,12 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     const bool giContractChecked = giProductionPassesActive && !profileReport_.restirGiCounters.empty();
     const bool giContractPassed = !giProductionPassesActive ||
         (giContractChecked && giContractViolationCount == 0ull);
+    const bool nativeRtxdiGiSpatial =
+        profileReport_.settings.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer &&
+        profileReport_.settings.rtxdiIndirectLightingEnabled && giProductionPassesActive;
+    const bool nativeRtxdiPtBridge = nativeRtxdiGiSpatial &&
+        profileReport_.settings.rendererPipelineMode == RendererPipelineMode::PathTracerRtxdi &&
+        profileReport_.settings.rtxdiRestirPtEnabled;
     j["restir_gi"] = {
         {"schema_version", 2},
         {"mode", restirGiModeName(profileReport_.settings.restirGiMode)},
@@ -5012,10 +5029,20 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"bias_correction", {
             {"schema_version", 1},
             {"temporal_reuse_mass_policy", "visibility-confidence-scales-weight-and-effective-M"},
-            {"spatial_reuse_mass_policy", "visibility-confidence-scales-weight-and-effective-M"},
-            {"visibility_confidence_shortcut", "production-only-unknown-safe-candidates-use-reduced-effective-proposal-mass"},
+            {"spatial_reuse_mass_policy", nativeRtxdiGiSpatial
+                ? "rtxdi-canonical-reservoir-normalization"
+                : "visibility-confidence-scales-weight-and-effective-M"},
+            {"visibility_confidence_shortcut", nativeRtxdiGiSpatial
+                ? "selected-reconnected-sample-is-validated-in-final-shading"
+                : "production-only-unknown-safe-candidates-use-reduced-effective-proposal-mass"},
             {"reference_validation_visibility", "conservative-visibility-required-before-reuse"},
             {"asymmetric_weight_sum_vs_m_damping", false},
+        }},
+        {"native_rtxdi", {
+            {"spatial_resampling", nativeRtxdiGiSpatial},
+            {"reservoir_core", nativeRtxdiPtBridge ? "restir-pt" : (nativeRtxdiGiSpatial ? "restir-gi" : "engine")},
+            {"path_space_bridge", nativeRtxdiPtBridge},
+            {"path_replay", false},
         }},
         {"effective_production_reuse", giProductionPassesActive},
         {"wavefront_current_frame_fallback", profileReport_.settings.wavefrontFinalOutputEnabled},
@@ -5192,7 +5219,10 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             profileReport_.settings.regirVisibilityReuse},
         {"regir_environment", profileReport_.regirGrid.environmentEffective},
         {"regir_sun", profileReport_.regirGrid.sunEffective},
-        {"restir_pt", false},
+        {"restir_pt",
+            profileReport_.settings.rendererPipelineMode == RendererPipelineMode::PathTracerRtxdi &&
+            profileReport_.settings.rtxdiIndirectLightingEnabled &&
+            profileReport_.settings.rtxdiRestirPtEnabled},
         {"adaptive_sampling",
             profileReport_.settings.adaptiveSamplingMode == AdaptiveSamplingMode::Heuristic &&
             (profileReport_.perPassGpuMs.adaptiveSamplingDiagnostics > 0.0f ||
@@ -5399,10 +5429,15 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     j["settings"]["native2b_direct_reuse_effective"] = native2BDirectReuseEffective
         ? native2BDirectReuseModeName(profileReport_.settings.native2BDirectReuseMode)
         : "off";
-    const LightingReuseMode effectiveLightingReuseMode =
-        profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR
-        ? LightingReuseMode::LegacyRestirDiGiPlusReGIR
-        : LightingReuseMode::LegacyRestirDiGi;
+    const bool nativeRtxdiPtEffective =
+        profileReport_.settings.rendererPipelineMode == RendererPipelineMode::PathTracerRtxdi &&
+        profileReport_.settings.rtxdiIndirectLightingEnabled &&
+        profileReport_.settings.rtxdiRestirPtEnabled;
+    const LightingReuseMode effectiveLightingReuseMode = nativeRtxdiPtEffective
+        ? LightingReuseMode::ExperimentalRestirPT
+        : (profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR
+            ? LightingReuseMode::LegacyRestirDiGiPlusReGIR
+            : LightingReuseMode::LegacyRestirDiGi);
     j["settings"]["lighting_reuse_mode_effective"] = lightingReuseModeName(effectiveLightingReuseMode);
     const bool regirRequested = passes::RegirPass::isRequested(profileReport_.settings);
     const bool regirSpatialReuseEffective =
@@ -5517,8 +5552,8 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         profileReport_.settings.adaptiveSamplingMode == AdaptiveSamplingMode::Heuristic
             ? adaptiveSamplingModeName(AdaptiveSamplingMode::Heuristic)
             : adaptiveSamplingModeName(AdaptiveSamplingMode::Disabled);
-    j["settings"]["path_reservoir_layout_effective"] =
-        reservoirLayoutName(ReservoirLayout::LegacyDI);
+    j["settings"]["path_reservoir_layout_effective"] = reservoirLayoutName(
+        nativeRtxdiPtEffective ? ReservoirLayout::PathSpaceCompressed : ReservoirLayout::LegacyDI);
     const bool nativeInternalExtent =
         profileReport_.resolution.renderWidth == profileReport_.resolution.displayWidth &&
         profileReport_.resolution.renderHeight == profileReport_.resolution.displayHeight;

@@ -4,6 +4,7 @@
 #include "rtv/AssetRegistry.h"
 #include "rtv/MeshAsset.h"
 #include "rtv/RendererDebug.h"
+#include "rtv/RtxdiSettings.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -242,6 +243,12 @@ struct WorldSettings {
 
 struct RenderSettings {
     RenderPreset renderPreset = RenderPreset::Balanced;
+    RendererPipelineMode rendererPipelineMode = RendererPipelineMode::LegacyPathTracer;
+    RtxdiQualityPreset rtxdiQualityPreset = RtxdiQualityPreset::Medium;
+    bool rtxdiDirectLightingEnabled = true;
+    bool rtxdiIndirectLightingEnabled = true;
+    bool rtxdiRestirPtEnabled = false;
+    bool rtxdiCheckerboardEnabled = false;
     bool pathTracingEnabled = true;
     bool cameraJitterEnabled = true;
     bool directLightingEnabled = true;

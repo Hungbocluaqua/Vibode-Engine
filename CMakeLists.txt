@@ -344,6 +344,50 @@ if(RTV_ENABLE_RTXDI)
     list(APPEND RTV_SHADER_OUTPUTS
         "${RTV_RTXDI_CONTRACT_SMOKE_OUTPUT}"
         "${RTV_RTXDI_CONTRACT_SMOKE_OUTPUT}.options")
+
+    set(RTV_RTXDI_DI_RESAMPLING_SOURCE "${RTV_SHADER_SOURCE_DIR}/rtxdi/rtxdi_di_fused_resampling.hlsl")
+    set(RTV_RTXDI_DI_RESAMPLING_OUTPUT "${RTV_SHADER_OUTPUT_DIR}/rtxdi_di_fused_resampling.comp.spv")
+    add_custom_command(
+        OUTPUT "${RTV_RTXDI_DI_RESAMPLING_OUTPUT}" "${RTV_RTXDI_DI_RESAMPLING_OUTPUT}.options"
+        COMMAND ${CMAKE_COMMAND}
+            "-DDXC=${RTV_DXC}"
+            "-DSOURCE=${RTV_RTXDI_DI_RESAMPLING_SOURCE}"
+            "-DOUTPUT=${RTV_RTXDI_DI_RESAMPLING_OUTPUT}"
+            "-DOUTPUT_DIR=${RTV_SHADER_OUTPUT_DIR}"
+            "-DINCLUDE_DIR=${RTXDI_LIBRARY_DIR}/Include"
+            "-DPROFILE=cs_6_6"
+            "-DENTRY_POINT=main"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileHlslShader.cmake"
+        DEPENDS
+            "${RTV_RTXDI_DI_RESAMPLING_SOURCE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileHlslShader.cmake"
+            ${RTV_RTXDI_SHADER_DEPENDENCIES}
+        VERBATIM)
+    list(APPEND RTV_SHADER_OUTPUTS
+        "${RTV_RTXDI_DI_RESAMPLING_OUTPUT}"
+        "${RTV_RTXDI_DI_RESAMPLING_OUTPUT}.options")
+
+    set(RTV_RTXDI_GI_RESAMPLING_SOURCE "${RTV_SHADER_SOURCE_DIR}/rtxdi/rtxdi_gi_spatial_resampling.hlsl")
+    set(RTV_RTXDI_GI_RESAMPLING_OUTPUT "${RTV_SHADER_OUTPUT_DIR}/rtxdi_gi_spatial_resampling.comp.spv")
+    add_custom_command(
+        OUTPUT "${RTV_RTXDI_GI_RESAMPLING_OUTPUT}" "${RTV_RTXDI_GI_RESAMPLING_OUTPUT}.options"
+        COMMAND ${CMAKE_COMMAND}
+            "-DDXC=${RTV_DXC}"
+            "-DSOURCE=${RTV_RTXDI_GI_RESAMPLING_SOURCE}"
+            "-DOUTPUT=${RTV_RTXDI_GI_RESAMPLING_OUTPUT}"
+            "-DOUTPUT_DIR=${RTV_SHADER_OUTPUT_DIR}"
+            "-DINCLUDE_DIR=${RTXDI_LIBRARY_DIR}/Include"
+            "-DPROFILE=cs_6_6"
+            "-DENTRY_POINT=main"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileHlslShader.cmake"
+        DEPENDS
+            "${RTV_RTXDI_GI_RESAMPLING_SOURCE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CompileHlslShader.cmake"
+            ${RTV_RTXDI_SHADER_DEPENDENCIES}
+        VERBATIM)
+    list(APPEND RTV_SHADER_OUTPUTS
+        "${RTV_RTXDI_GI_RESAMPLING_OUTPUT}"
+        "${RTV_RTXDI_GI_RESAMPLING_OUTPUT}.options")
 endif()
 
 function(rtv_add_shader_variant source suffix)

@@ -1255,8 +1255,10 @@ PathTracerRenderer::PathTracerRenderer(
     const auto restirGiUpsampleSpv = compileShader(shaderDirectory / "restir_gi_upsample.comp");
     const auto restirGiUpsampleValidationSpv = compileShaderVariant(
         shaderDirectory / "restir_gi_upsample.comp", ".gi_validation", restirGiValidationPassDefines);
+    const auto rtxdiGiSpatialResamplingSpv = shaderOutputDirectory / "rtxdi_gi_spatial_resampling.comp.spv";
     const auto restirDiTemporalSpv = compileShaderVariant(
         shaderDirectory / "restir_di_temporal.comp", ".di_packed", restirDiPackedDefines);
+    const auto rtxdiDiFusedResamplingSpv = shaderOutputDirectory / "rtxdi_di_fused_resampling.comp.spv";
     const auto restirDiTemporalFullSpv = compileShaderVariant(
         shaderDirectory / "restir_di_temporal.comp", ".di_full", restirDiFullDefines);
     const auto restirDiSpatialSpv = compileShaderVariant(
@@ -1473,7 +1475,15 @@ PathTracerRenderer::PathTracerRenderer(
     restirGiFinalValidationShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiFinalValidationSpv), "restir gi validation final compute");
     restirGiUpsampleShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiUpsampleSpv), "restir gi production upsample compute");
     restirGiUpsampleValidationShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirGiUpsampleValidationSpv), "restir gi validation upsample compute");
+    rtxdiGiSpatialResamplingShader_ = std::make_unique<ShaderModule>(
+        context_.device(),
+        ShaderCompiler::readSpirv(rtxdiGiSpatialResamplingSpv),
+        "RTXDI GI spatial resampling compute");
     restirDiTemporalShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiTemporalSpv), "restir di temporal compute");
+    rtxdiDiFusedResamplingShader_ = std::make_unique<ShaderModule>(
+        context_.device(),
+        ShaderCompiler::readSpirv(rtxdiDiFusedResamplingSpv),
+        "RTXDI DI fused resampling compute");
     restirDiTemporalFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiTemporalFullSpv), "restir di temporal full compute");
     restirDiSpatialShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiSpatialSpv), "restir di spatial compute");
     restirDiSpatialFullShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(restirDiSpatialFullSpv), "restir di spatial full compute");
@@ -1648,7 +1658,9 @@ PathTracerRenderer::PathTracerRenderer(
     restirGiTemporalSetLayout_ = createComputeMaterialTextureLayout(
         ShaderReflection::bindingsForSet({restirGiTemporalShader_->reflection()}, 0), false);
     restirGiSpatialProdSetLayout_ = createComputeMaterialTextureLayout(
-        ShaderReflection::bindingsForSet({restirGiSpatialProdShader_->reflection()}, 0), false);
+        ShaderReflection::bindingsForSet(
+            {restirGiSpatialProdShader_->reflection(), rtxdiGiSpatialResamplingShader_->reflection()}, 0),
+        false);
     restirGiFinalProdSetLayout_ = createComputeMaterialTextureLayout(
         ShaderReflection::bindingsForSet({restirGiFinalProdShader_->reflection()}, 0), false);
     restirGiUpsampleSetLayout_ = layoutCache_->createLayout(ShaderReflection::bindingsForSet({restirGiUpsampleShader_->reflection()}, 0));
@@ -1831,6 +1843,12 @@ PathTracerRenderer::PathTracerRenderer(
         std::vector<VkDescriptorSetLayout>{restirGiSpatialProdSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirGiSpatialProdShader_->reflection()}),
         *pipelineCache_);
+    rtxdiGiSpatialResamplingPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *rtxdiGiSpatialResamplingShader_,
+        std::vector<VkDescriptorSetLayout>{restirGiSpatialProdSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
+        ShaderReflection::mergePushConstants({rtxdiGiSpatialResamplingShader_->reflection()}),
+        *pipelineCache_);
     restirGiSpatialValidationPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
         *restirGiSpatialValidationShader_,
@@ -1866,6 +1884,12 @@ PathTracerRenderer::PathTracerRenderer(
         *restirDiTemporalShader_,
         std::vector<VkDescriptorSetLayout>{restirDiTemporalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
         ShaderReflection::mergePushConstants({restirDiTemporalShader_->reflection()}),
+        *pipelineCache_);
+    rtxdiDiFusedResamplingPipeline_ = std::make_unique<ComputePipeline>(
+        context_.device(),
+        *rtxdiDiFusedResamplingShader_,
+        std::vector<VkDescriptorSetLayout>{restirDiTemporalSetLayout_, emptySetLayout_, bindlessTextureHeap_.layout()},
+        ShaderReflection::mergePushConstants({rtxdiDiFusedResamplingShader_->reflection()}),
         *pipelineCache_);
     restirDiSpatialPipeline_ = std::make_unique<ComputePipeline>(
         context_.device(),
@@ -2911,6 +2935,20 @@ void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D renderExtent
                   << " ms, fullscreen=" << timings.fullscreenMs << " ms\n";
     }
     currentFrame_->beginFrame();
+    if (settings_.rendererPipelineMode == RendererPipelineMode::LegacyPathTracer) {
+        rtxdiRuntime_.reset();
+    } else if (!rtxdiRuntime_ ||
+               rtxdiRuntime_->config().renderWidth != renderExtent.width ||
+               rtxdiRuntime_->config().renderHeight != renderExtent.height ||
+               rtxdiRuntime_->config().qualityPreset != settings_.rtxdiQualityPreset ||
+               rtxdiRuntime_->config().checkerboard != settings_.rtxdiCheckerboardEnabled) {
+        rtxdiRuntime_ = std::make_unique<RtxdiRuntime>(RtxdiRuntimeConfig{
+            .renderWidth = renderExtent.width,
+            .renderHeight = renderExtent.height,
+            .qualityPreset = settings_.rtxdiQualityPreset,
+            .checkerboard = settings_.rtxdiCheckerboardEnabled,
+        });
+    }
     if (renderExtent.width != renderExtent_.width ||
         renderExtent.height != renderExtent_.height ||
         displayExtent.width != displayExtent_.width ||
@@ -2925,6 +2963,9 @@ void PathTracerRenderer::beginFrame(uint32_t frameIndex, VkExtent2D renderExtent
     bindWavefrontFrameResources();
     ++frameCount_;
     ++temporalFrameIndex_;
+    if (rtxdiRuntime_) {
+        rtxdiRuntime_->beginFrame(temporalFrameIndex_);
+    }
     if (temporalSystem_) {
         temporalSystem_->beginFrame(temporalFrameIndex_);
     }
@@ -3389,6 +3430,87 @@ RendererSettings PathTracerRenderer::normalizeSettingsForDevice(
     if (static_cast<uint32_t>(next.renderPreset) > static_cast<uint32_t>(RenderPreset::Native30)) {
         next.renderPreset = RenderPreset::Custom;
     }
+    if (static_cast<uint32_t>(next.rendererPipelineMode) > static_cast<uint32_t>(RendererPipelineMode::PathTracerRtxdi)) {
+        next.rendererPipelineMode = RendererPipelineMode::LegacyPathTracer;
+    }
+    if (static_cast<uint32_t>(next.rtxdiQualityPreset) > static_cast<uint32_t>(RtxdiQualityPreset::Reference)) {
+        next.rtxdiQualityPreset = RtxdiQualityPreset::Medium;
+    }
+    if (next.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer && next.rtxdiDirectLightingEnabled) {
+        if (next.rendererPipelineMode == RendererPipelineMode::HybridRtxdi) {
+            next.pathTracingEnabled = true;
+            next.samplesPerPixel = 1u;
+            next.maxBounces = std::min(next.maxBounces, 2u);
+            next.denoiserEnabled = true;
+            next.taaEnabled = true;
+            if (next.rtxdiIndirectLightingEnabled) {
+                next.restirGiEnabled = true;
+                next.restirGiMode = RestirGiMode::Production;
+                next.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
+                next.restirGiHalfResolution = next.rtxdiQualityPreset != RtxdiQualityPreset::Reference;
+            } else {
+                next.restirGiEnabled = false;
+                next.restirGiMode = RestirGiMode::Off;
+            }
+        } else {
+            uint32_t minimumPathBounces = 5u;
+            if (next.rtxdiQualityPreset == RtxdiQualityPreset::Fast) minimumPathBounces = 3u;
+            else if (next.rtxdiQualityPreset == RtxdiQualityPreset::Unbiased) minimumPathBounces = 6u;
+            else if (next.rtxdiQualityPreset == RtxdiQualityPreset::Ultra) minimumPathBounces = 8u;
+            else if (next.rtxdiQualityPreset == RtxdiQualityPreset::Reference) minimumPathBounces = 12u;
+            next.maxBounces = std::max(next.maxBounces, minimumPathBounces);
+            if (next.rtxdiIndirectLightingEnabled) {
+                next.restirGiEnabled = true;
+                next.restirGiMode = RestirGiMode::Production;
+                next.restirGiReservoirLayout = RestirGiReservoirLayout::ProductionPacked;
+                next.restirGiHalfResolution = next.rtxdiQualityPreset == RtxdiQualityPreset::Fast;
+            }
+            if (next.rtxdiRestirPtEnabled) {
+                next.lightingReuseMode = LightingReuseMode::ExperimentalRestirPT;
+                next.pathReservoirLayout = ReservoirLayout::PathSpaceCompressed;
+            }
+        }
+        next.restirMode = RestirMode::RestirOnly;
+        next.restirDiMode = RestirDiMode::Production;
+        next.restirDiTemporalEnabled = true;
+        next.restirDiSpatialEnabled = next.rendererPipelineMode == RendererPipelineMode::HybridRtxdi;
+        next.restirDiFinalVisibilityEnabled = true;
+        next.restirDiReservoirLayout = RestirDiReservoirLayout::ProductionPacked;
+        switch (next.rtxdiQualityPreset) {
+        case RtxdiQualityPreset::Fast:
+            next.restirDiTemporalMaxAge = 16u;
+            next.restirDiSpatialRounds = 1u;
+            next.restirDiSpatialRadius = 2.0f;
+            next.restirDiMaxM = 32u;
+            break;
+        case RtxdiQualityPreset::Medium:
+            next.restirDiTemporalMaxAge = 32u;
+            next.restirDiSpatialRounds = 1u;
+            next.restirDiSpatialRadius = 3.0f;
+            next.restirDiMaxM = 64u;
+            break;
+        case RtxdiQualityPreset::Unbiased:
+            next.restirDiTemporalMaxAge = 32u;
+            next.restirDiSpatialRounds = 1u;
+            next.restirDiSpatialRadius = 3.0f;
+            next.restirDiMaxM = 64u;
+            next.restirDiProductionStabilizationEnabled = false;
+            break;
+        case RtxdiQualityPreset::Ultra:
+            next.restirDiTemporalMaxAge = 48u;
+            next.restirDiSpatialRounds = 4u;
+            next.restirDiSpatialRadius = 5.0f;
+            next.restirDiMaxM = 128u;
+            break;
+        case RtxdiQualityPreset::Reference:
+            next.restirDiTemporalMaxAge = 64u;
+            next.restirDiSpatialRounds = 8u;
+            next.restirDiSpatialRadius = 8.0f;
+            next.restirDiMaxM = 255u;
+            next.restirDiProductionStabilizationEnabled = false;
+            break;
+        }
+    }
     if (static_cast<uint32_t>(next.blendedDecalShadowMode) > static_cast<uint32_t>(BlendedDecalShadowMode::AlphaCutoutProxy)) {
         next.blendedDecalShadowMode = BlendedDecalShadowMode::Exact;
     }
@@ -3406,6 +3528,12 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
 
     const bool changed =
         next.renderPreset != settings_.renderPreset ||
+        next.rendererPipelineMode != settings_.rendererPipelineMode ||
+        next.rtxdiQualityPreset != settings_.rtxdiQualityPreset ||
+        next.rtxdiDirectLightingEnabled != settings_.rtxdiDirectLightingEnabled ||
+        next.rtxdiIndirectLightingEnabled != settings_.rtxdiIndirectLightingEnabled ||
+        next.rtxdiRestirPtEnabled != settings_.rtxdiRestirPtEnabled ||
+        next.rtxdiCheckerboardEnabled != settings_.rtxdiCheckerboardEnabled ||
         next.pathTracingEnabled != settings_.pathTracingEnabled ||
         next.cameraJitterEnabled != settings_.cameraJitterEnabled ||
         next.denoiserEnabled != settings_.denoiserEnabled ||
@@ -3776,6 +3904,10 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         usesDlssGuideResources(next) != usesDlssGuideResources(settings_) ||
         next.dlssRayReconstructionEnabled != settings_.dlssRayReconstructionEnabled ||
         next.denoiserBackend != settings_.denoiserBackend;
+    const bool rtxdiResourceConfigChanged =
+        next.rendererPipelineMode != settings_.rendererPipelineMode ||
+        next.rtxdiQualityPreset != settings_.rtxdiQualityPreset ||
+        next.rtxdiCheckerboardEnabled != settings_.rtxdiCheckerboardEnabled;
     const bool regirActiveConfigChanged =
         regirResourceConfigChanged ||
         next.regirGridMode != settings_.regirGridMode;
@@ -3794,6 +3926,18 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         next.streamlineNvPerfEnabled;
 
     settings_ = next;
+    if (rtxdiResourceConfigChanged &&
+        settings_.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer &&
+        renderExtent_.width > 0u && renderExtent_.height > 0u) {
+        rtxdiRuntime_ = std::make_unique<RtxdiRuntime>(RtxdiRuntimeConfig{
+            .renderWidth = renderExtent_.width,
+            .renderHeight = renderExtent_.height,
+            .qualityPreset = settings_.rtxdiQualityPreset,
+            .checkerboard = settings_.rtxdiCheckerboardEnabled,
+        });
+    } else if (settings_.rendererPipelineMode == RendererPipelineMode::LegacyPathTracer) {
+        rtxdiRuntime_.reset();
+    }
     if (sunChanged) {
         ++lightVersionCounter_;
     }
@@ -3806,7 +3950,7 @@ bool PathTracerRenderer::applySettings(const RendererSettings& settings) {
         regirHashTablesValid_ = false;
         regirHashRotationPending_ = false;
     }
-    if ((regirResourceConfigChanged || optionalResolutionResourcesChanged) &&
+    if ((regirResourceConfigChanged || optionalResolutionResourcesChanged || rtxdiResourceConfigChanged) &&
         renderExtent_.width > 0u && renderExtent_.height > 0u) {
         retireResolutionResources();
         createResolutionResources(renderExtent_, displayExtent_);
@@ -10545,7 +10689,9 @@ void PathTracerRenderer::recordRestirGiSpatialProdPass(VkCommandBuffer commandBu
         .writeBuffer(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCountersBuffer_.descriptorInfo(
             passes::RestirGIPass::counterSlotByteOffset(temporalFrameIndex_, kRendererFramesInFlight),
             passes::RestirGIPass::counterSlotByteSize()))
-        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiActiveTileMaskBuffer_.descriptorInfo());
+        .writeBuffer(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiActiveTileMaskBuffer_.descriptorInfo())
+        .writeBuffer(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiTemporalReservoirBuffer_.descriptorInfo())
+        .writeBuffer(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiTemporalReservoirBuffer_.descriptorInfo());
     passes::RestirGIPass::writeSceneDescriptors(writer, passes::RestirGIPass::SceneDescriptorBindings{
         .meshParams = scene_.meshParamsBuffer().descriptorInfo(),
         .materials = scene_.materials().descriptorInfo(),
@@ -10567,7 +10713,8 @@ void PathTracerRenderer::recordRestirGiSpatialProdPass(VkCommandBuffer commandBu
         .frameIndex = sampleFrameIndex(),
         .enabled = (shouldUseNewRestirGi() ? 1u : 0u) |
             (shouldCollectRestirCounters() ? 4u : 0u) |
-            (shouldUseRestirGiActiveTileMask() ? 8u : 0u),
+            (shouldUseRestirGiActiveTileMask() ? 8u : 0u) |
+            (settings_.rtxdiRestirPtEnabled ? 16u : 0u),
         .spatialRounds = settings_.restirGiSpatialRounds,
         .halfResolution = effectiveRestirGiHalfResolution() ? 1u : 0u,
         .visibilityRayBudget = settings_.restirGiVisibilityRayBudget,
@@ -10578,9 +10725,11 @@ void PathTracerRenderer::recordRestirGiSpatialProdPass(VkCommandBuffer commandBu
         .cameraPosition = glm::vec4(glm::vec3(camera_.pos), 1.0f),
     };
 
+    const bool nativeRtxdi = settings_.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer &&
+        settings_.rtxdiIndirectLightingEnabled;
     ComputePipeline* pipeline = shouldUseRestirGiReferenceValidation()
         ? restirGiSpatialValidationPipeline_.get()
-        : restirGiSpatialProdPipeline_.get();
+        : (nativeRtxdi ? rtxdiGiSpatialResamplingPipeline_.get() : restirGiSpatialProdPipeline_.get());
     if (pipeline == nullptr) return;
     pipeline->bind(commandBuffer);
     const VkDescriptorSet descriptorSet = set.handle();
@@ -10755,9 +10904,13 @@ void PathTracerRenderer::recordRestirDiTemporal(VkCommandBuffer commandBuffer) {
 
 void PathTracerRenderer::recordRestirDiTemporalPass(VkCommandBuffer commandBuffer) {
     validationLog_.recordPass("restir di temporal");
-    ComputePipeline* pipeline = settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
-        ? restirDiTemporalFullPipeline_.get()
-        : restirDiTemporalPipeline_.get();
+    const bool nativeRtxdi = settings_.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer &&
+        settings_.rtxdiDirectLightingEnabled;
+    ComputePipeline* pipeline = nativeRtxdi
+        ? rtxdiDiFusedResamplingPipeline_.get()
+        : (settings_.restirDiReservoirLayout == RestirDiReservoirLayout::ValidationFull
+            ? restirDiTemporalFullPipeline_.get()
+            : restirDiTemporalPipeline_.get());
     if (pipeline == nullptr || restirDiTemporalSetLayout_ == VK_NULL_HANDLE) return;
 
     currentProfiler_->write(commandBuffer, GpuProfiler::RestirDiTemporalStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
@@ -15752,11 +15905,15 @@ bool PathTracerRenderer::shouldRunRestirGiTemporal() const {
 }
 
 bool PathTracerRenderer::shouldRunRestirGiSpatialProd() const {
+    const bool nativeRtxdi = settings_.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer &&
+        settings_.rtxdiIndirectLightingEnabled;
     return passes::RestirGIPass::canRunProductionSpatial(
         settings_,
         shouldUseRestirGiReferenceValidation(),
         passes::RestirGIPass::SpatialStageResources{
-            .pipelineReady = restirGiSpatialProdPipeline_ != nullptr,
+            .pipelineReady = nativeRtxdi
+                ? rtxdiGiSpatialResamplingPipeline_ != nullptr
+                : restirGiSpatialProdPipeline_ != nullptr,
             .descriptorLayoutReady = restirGiSpatialProdSetLayout_ != VK_NULL_HANDLE,
             .temporalReservoirReady = restirGiTemporalReservoirBuffer_.handle() != VK_NULL_HANDLE,
             .currentProductionHistoryReady = restirGiCurrentProductionHistoryBuffer().handle() != VK_NULL_HANDLE,
@@ -16018,11 +16175,15 @@ bool PathTracerRenderer::shouldRunRestirDiEstimator() const {
 }
 
 bool PathTracerRenderer::shouldRunRestirDiTemporal() const {
+    const bool nativeRtxdi = settings_.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer &&
+        settings_.rtxdiDirectLightingEnabled;
     return passes::RestirDIPass::canRunTemporalStage(
         settings_,
         shouldRunRestirDiEstimator(),
         passes::RestirDIPass::TemporalStageResources{
-            .pipelineReady = restirDiTemporalPipeline_ != nullptr,
+            .pipelineReady = nativeRtxdi
+                ? rtxdiDiFusedResamplingPipeline_ != nullptr
+                : restirDiTemporalPipeline_ != nullptr,
             .descriptorLayoutReady = restirDiTemporalSetLayout_ != VK_NULL_HANDLE,
             .currentReceiverReady = restirDiCurrentReceiverBuffer().handle() != VK_NULL_HANDLE,
             .initialReservoirReady = restirDiInitialReservoirBuffer_.handle() != VK_NULL_HANDLE,
@@ -16033,6 +16194,10 @@ bool PathTracerRenderer::shouldRunRestirDiTemporal() const {
 }
 
 bool PathTracerRenderer::shouldRunRestirDiSpatial() const {
+    if (settings_.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer &&
+        settings_.rtxdiDirectLightingEnabled) {
+        return false;
+    }
     return passes::RestirDIPass::canRunSpatialStage(
         settings_,
         shouldRunRestirDiEstimator(),

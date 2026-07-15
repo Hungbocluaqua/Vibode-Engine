@@ -2,6 +2,7 @@
 
 #include "rtv/OpacityMicromapPreprocess.h"
 #include "rtv/RendererDebug.h"
+#include "rtv/RtxdiSettings.h"
 
 #include <glm/glm.hpp>
 
@@ -21,6 +22,12 @@ enum class RestirCounterMode : uint32_t {
 
 struct RendererSettings {
     RenderPreset renderPreset = RenderPreset::Balanced;
+    RendererPipelineMode rendererPipelineMode = RendererPipelineMode::LegacyPathTracer;
+    RtxdiQualityPreset rtxdiQualityPreset = RtxdiQualityPreset::Medium;
+    bool rtxdiDirectLightingEnabled = true;
+    bool rtxdiIndirectLightingEnabled = true;
+    bool rtxdiRestirPtEnabled = false;
+    bool rtxdiCheckerboardEnabled = false;
     bool pathTracingEnabled = true;
     bool cameraJitterEnabled = true;
     bool denoiserEnabled = true;

@@ -862,6 +862,12 @@ bool SceneDocument::saveJson(const std::filesystem::path& path) const {
     };
     root["renderSettings"] = {
         {"renderPreset", static_cast<uint32_t>(renderSettings_.renderPreset)},
+        {"rendererPipelineMode", rendererPipelineModeName(renderSettings_.rendererPipelineMode)},
+        {"rtxdiQualityPreset", rtxdiQualityPresetName(renderSettings_.rtxdiQualityPreset)},
+        {"rtxdiDirectLightingEnabled", renderSettings_.rtxdiDirectLightingEnabled},
+        {"rtxdiIndirectLightingEnabled", renderSettings_.rtxdiIndirectLightingEnabled},
+        {"rtxdiRestirPtEnabled", renderSettings_.rtxdiRestirPtEnabled},
+        {"rtxdiCheckerboardEnabled", renderSettings_.rtxdiCheckerboardEnabled},
         {"pathTracingEnabled", renderSettings_.pathTracingEnabled},
         {"cameraJitterEnabled", renderSettings_.cameraJitterEnabled},
         {"directLightingEnabled", renderSettings_.directLightingEnabled},
@@ -1382,6 +1388,26 @@ bool SceneDocument::loadJson(const std::filesystem::path& path) {
         renderSettings_.renderPreset = render.contains("renderPreset")
             ? static_cast<RenderPreset>(render.value("renderPreset", static_cast<uint32_t>(renderSettings_.renderPreset)))
             : RenderPreset::Custom;
+        if (render.contains("rendererPipelineMode")) {
+            renderSettings_.rendererPipelineMode = render["rendererPipelineMode"].is_string()
+                ? parseRendererPipelineMode(render.value("rendererPipelineMode", "legacy-path-tracer"))
+                : static_cast<RendererPipelineMode>(render.value(
+                    "rendererPipelineMode", static_cast<uint32_t>(renderSettings_.rendererPipelineMode)));
+        }
+        if (render.contains("rtxdiQualityPreset")) {
+            renderSettings_.rtxdiQualityPreset = render["rtxdiQualityPreset"].is_string()
+                ? parseRtxdiQualityPreset(render.value("rtxdiQualityPreset", "medium"))
+                : static_cast<RtxdiQualityPreset>(render.value(
+                    "rtxdiQualityPreset", static_cast<uint32_t>(renderSettings_.rtxdiQualityPreset)));
+        }
+        renderSettings_.rtxdiDirectLightingEnabled = render.value(
+            "rtxdiDirectLightingEnabled", renderSettings_.rtxdiDirectLightingEnabled);
+        renderSettings_.rtxdiIndirectLightingEnabled = render.value(
+            "rtxdiIndirectLightingEnabled", renderSettings_.rtxdiIndirectLightingEnabled);
+        renderSettings_.rtxdiRestirPtEnabled = render.value(
+            "rtxdiRestirPtEnabled", renderSettings_.rtxdiRestirPtEnabled);
+        renderSettings_.rtxdiCheckerboardEnabled = render.value(
+            "rtxdiCheckerboardEnabled", renderSettings_.rtxdiCheckerboardEnabled);
         renderSettings_.pathTracingEnabled = render.value("pathTracingEnabled", renderSettings_.pathTracingEnabled);
         renderSettings_.cameraJitterEnabled = render.value("cameraJitterEnabled", renderSettings_.cameraJitterEnabled);
         renderSettings_.directLightingEnabled = render.value("directLightingEnabled", renderSettings_.directLightingEnabled);

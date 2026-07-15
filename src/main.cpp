@@ -2962,6 +2962,12 @@ int main(int argc, char** argv) {
         std::optional<float> dlssSharpeningOverride;
         std::optional<rtv::RestirMode> restirModeOverride;
         std::optional<rtv::RenderPreset> renderPresetOverride;
+        std::optional<rtv::RendererPipelineMode> rendererPipelineModeOverride;
+        std::optional<rtv::RtxdiQualityPreset> rtxdiQualityPresetOverride;
+        std::optional<bool> rtxdiDirectLightingOverride;
+        std::optional<bool> rtxdiIndirectLightingOverride;
+        std::optional<bool> rtxdiRestirPtOverride;
+        std::optional<bool> rtxdiCheckerboardOverride;
         std::optional<rtv::LightingReuseMode> lightingReuseModeOverride;
         std::optional<glm::uvec3> regirGridDimensionsOverride;
         std::optional<uint32_t> regirReservoirsPerCellOverride;
@@ -3256,6 +3262,24 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             std::string_view arg(argv[i]);
 
+            if (arg == "--renderer-pipeline" && i + 1 < argc) {
+                rendererPipelineModeOverride = rtv::parseRendererPipelineMode(argv[++i]);
+                continue;
+            }
+            if (arg == "--rtxdi-quality" && i + 1 < argc) {
+                rtxdiQualityPresetOverride = rtv::parseRtxdiQualityPreset(argv[++i]);
+                continue;
+            }
+            if ((arg == "--rtxdi-di" || arg == "--rtxdi-gi" || arg == "--rtxdi-pt" ||
+                 arg == "--rtxdi-checkerboard") && i + 1 < argc) {
+                const std::string_view value(argv[++i]);
+                const bool enabled = !(value == "off" || value == "false" || value == "0");
+                if (arg == "--rtxdi-di") rtxdiDirectLightingOverride = enabled;
+                else if (arg == "--rtxdi-gi") rtxdiIndirectLightingOverride = enabled;
+                else if (arg == "--rtxdi-pt") rtxdiRestirPtOverride = enabled;
+                else rtxdiCheckerboardOverride = enabled;
+                continue;
+            }
             if (arg == "--headless-width" && i + 1 < argc) {
                 diagConfig.headlessWidth = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
                 continue;
@@ -4525,6 +4549,34 @@ int main(int argc, char** argv) {
                 });
                 return value;
             };
+            if (rendererPipelineModeOverride.has_value() ||
+                rtxdiQualityPresetOverride.has_value() ||
+                rtxdiDirectLightingOverride.has_value() ||
+                rtxdiIndirectLightingOverride.has_value() ||
+                rtxdiRestirPtOverride.has_value() ||
+                rtxdiCheckerboardOverride.has_value()) {
+                rtv::RendererSettings settings = renderer->settings();
+                if (rendererPipelineModeOverride.has_value()) {
+                    settings.rendererPipelineMode = *rendererPipelineModeOverride;
+                }
+                if (rtxdiQualityPresetOverride.has_value()) {
+                    settings.rtxdiQualityPreset = *rtxdiQualityPresetOverride;
+                }
+                if (rtxdiDirectLightingOverride.has_value()) {
+                    settings.rtxdiDirectLightingEnabled = *rtxdiDirectLightingOverride;
+                }
+                if (rtxdiIndirectLightingOverride.has_value()) {
+                    settings.rtxdiIndirectLightingEnabled = *rtxdiIndirectLightingOverride;
+                }
+                if (rtxdiRestirPtOverride.has_value()) {
+                    settings.rtxdiRestirPtEnabled = *rtxdiRestirPtOverride;
+                }
+                if (rtxdiCheckerboardOverride.has_value()) {
+                    settings.rtxdiCheckerboardEnabled = *rtxdiCheckerboardOverride;
+                }
+                settings.renderPreset = rtv::RenderPreset::Custom;
+                renderer->applySettings(settings);
+            }
             if (diagConfig.fixedSeed.has_value()) {
                 rtv::RendererSettings settings = renderer->settings();
                 settings.fixedSeed = diagConfig.fixedSeed;

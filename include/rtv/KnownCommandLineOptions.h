@@ -10,7 +10,7 @@
 namespace rtv {
 
 // Generated from the option comparisons in src/main.cpp.
-inline constexpr std::array<std::string_view, 358> kKnownCommandLineOptions{{
+inline constexpr std::array<std::string_view, 364> kKnownCommandLineOptions{{
     "--adaptive-sampling",
     "--adaptive-sampling-budget",
     "--adaptive-sampling-mode",
@@ -206,6 +206,7 @@ inline constexpr std::array<std::string_view, 358> kKnownCommandLineOptions{{
     "--renderdoc-dll",
     "--renderer-only",
     "--renderer-only-linger-ms",
+    "--renderer-pipeline",
     "--render-preset",
     "--render-resolution-scale",
     "--render-scale",
@@ -244,6 +245,11 @@ inline constexpr std::array<std::string_view, 358> kKnownCommandLineOptions{{
     "--restir-gi-temporal-max-age",
     "--restir-gi-visibility-ray-budget",
     "--restir-gi-visibility-rays",
+    "--rtxdi-checkerboard",
+    "--rtxdi-di",
+    "--rtxdi-gi",
+    "--rtxdi-pt",
+    "--rtxdi-quality",
     "--restir-history-copy-mode",
     "--rt-diagnostic-counters",
     "--rtlevel",

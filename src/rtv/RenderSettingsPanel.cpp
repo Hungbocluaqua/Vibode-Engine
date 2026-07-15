@@ -163,6 +163,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         const RenderSettings& render = state.sceneDocument->renderSettings();
         const Environment& environment = state.sceneDocument->environment();
         settings.renderPreset = render.renderPreset;
+        settings.rendererPipelineMode = render.rendererPipelineMode;
+        settings.rtxdiQualityPreset = render.rtxdiQualityPreset;
+        settings.rtxdiDirectLightingEnabled = render.rtxdiDirectLightingEnabled;
+        settings.rtxdiIndirectLightingEnabled = render.rtxdiIndirectLightingEnabled;
+        settings.rtxdiRestirPtEnabled = render.rtxdiRestirPtEnabled;
+        settings.rtxdiCheckerboardEnabled = render.rtxdiCheckerboardEnabled;
         settings.pathTracingEnabled = render.pathTracingEnabled;
         settings.cameraJitterEnabled = render.cameraJitterEnabled;
         settings.directLightingEnabled = render.directLightingEnabled;
@@ -355,6 +361,32 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
         changed = true;
     }
     tooltip("Game-ready presets tune path tracing, ReSTIR, denoiser, TAA, and render scale together.");
+    const char* rendererPipelineItems[] = {"Legacy Path Tracer", "Hybrid RTXDI", "RTXDI Path Tracer"};
+    int rendererPipelineIndex = static_cast<int>(settings.rendererPipelineMode);
+    if (rendererPipelineIndex < 0 || rendererPipelineIndex > 2) {
+        rendererPipelineIndex = 0;
+    }
+    if (renderSettingsComboRow("Renderer Pipeline", &rendererPipelineIndex, rendererPipelineItems, 3)) {
+        settings.rendererPipelineMode = static_cast<RendererPipelineMode>(rendererPipelineIndex);
+        changed = true;
+    }
+    tooltip("Hybrid RTXDI uses the low-latency real-time path. RTXDI Path Tracer keeps multi-bounce path tracing and enables native DI/GI reuse; ReSTIR PT is an additional opt-in.");
+    if (settings.rendererPipelineMode != RendererPipelineMode::LegacyPathTracer) {
+        const char* rtxdiPresetItems[] = {"Fast", "Medium", "Unbiased", "Ultra", "Reference"};
+        int rtxdiPresetIndex = static_cast<int>(settings.rtxdiQualityPreset);
+        if (rtxdiPresetIndex < 0 || rtxdiPresetIndex > 4) {
+            rtxdiPresetIndex = 1;
+        }
+        if (renderSettingsComboRow("RTXDI Quality", &rtxdiPresetIndex, rtxdiPresetItems, 5)) {
+            settings.rtxdiQualityPreset = static_cast<RtxdiQualityPreset>(rtxdiPresetIndex);
+            changed = true;
+        }
+        changed |= renderSettingsCheckboxRow("RTXDI Direct Lighting", &settings.rtxdiDirectLightingEnabled);
+        changed |= renderSettingsCheckboxRow("RTXDI Indirect Lighting", &settings.rtxdiIndirectLightingEnabled);
+        changed |= renderSettingsCheckboxRow("Experimental ReSTIR PT", &settings.rtxdiRestirPtEnabled);
+        tooltip("Uses RTXDI's ReSTIR PT reservoir core for path-space spatial reuse. Full random-replay and hybrid-shift path retracing remain experimental.");
+        changed |= renderSettingsCheckboxRow("RTXDI Checkerboard", &settings.rtxdiCheckerboardEnabled);
+    }
     renderSettingsBeginRow("Debug View");
     editorDebugViewCombo("##value", settings, changed);
     renderSettingsEndRow();
@@ -1105,6 +1137,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 std::abs(environment.rotation - settings.environmentRotation) > 0.0001f ||
                 std::abs(environment.backgroundIntensity - settings.environmentBackgroundIntensity) > 0.0001f;
             const bool lightingChanged =
+                render.rendererPipelineMode != settings.rendererPipelineMode ||
+                render.rtxdiQualityPreset != settings.rtxdiQualityPreset ||
+                render.rtxdiDirectLightingEnabled != settings.rtxdiDirectLightingEnabled ||
+                render.rtxdiIndirectLightingEnabled != settings.rtxdiIndirectLightingEnabled ||
+                render.rtxdiRestirPtEnabled != settings.rtxdiRestirPtEnabled ||
+                render.rtxdiCheckerboardEnabled != settings.rtxdiCheckerboardEnabled ||
                 render.directLightingEnabled != settings.directLightingEnabled ||
                 render.environmentDirectSamples != settings.environmentDirectSamples ||
                 render.restirMode != settings.restirMode ||
@@ -1136,6 +1174,12 @@ void RenderSettingsPanel::draw(EditorRuntimeState& state, EditorRequests& reques
                 render.adaptiveSamplingMode != settings.adaptiveSamplingMode ||
                 std::abs(render.skyIntensity - settings.skyIntensity) > 0.0001f;
             render.renderPreset = settings.renderPreset;
+            render.rendererPipelineMode = settings.rendererPipelineMode;
+            render.rtxdiQualityPreset = settings.rtxdiQualityPreset;
+            render.rtxdiDirectLightingEnabled = settings.rtxdiDirectLightingEnabled;
+            render.rtxdiIndirectLightingEnabled = settings.rtxdiIndirectLightingEnabled;
+            render.rtxdiRestirPtEnabled = settings.rtxdiRestirPtEnabled;
+            render.rtxdiCheckerboardEnabled = settings.rtxdiCheckerboardEnabled;
             render.pathTracingEnabled = settings.pathTracingEnabled;
             render.cameraJitterEnabled = settings.cameraJitterEnabled;
             render.directLightingEnabled = settings.directLightingEnabled;

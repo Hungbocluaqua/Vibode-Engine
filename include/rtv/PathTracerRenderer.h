@@ -10,6 +10,7 @@
 #include "rtv/RendererDebug.h"
 #include "rtv/RendererSettings.h"
 #include "rtv/RayTracingScene.h"
+#include "rtv/RtxdiRuntime.h"
 #include "rtv/StreamlineRuntime.h"
 
 #include <Volk/volk.h>
@@ -646,6 +647,7 @@ public:
     };
     [[nodiscard]] MemoryPressureQualityState memoryPressureQualityState() const;
     [[nodiscard]] const TemporalSystem* temporalSystem() const { return temporalSystem_.get(); }
+    [[nodiscard]] const RtxdiRuntime* rtxdiRuntime() const { return rtxdiRuntime_.get(); }
     [[nodiscard]] AtmosphereLutStats atmosphereLutStats() const;
     [[nodiscard]] const GpuScene& scene() const { return scene_; }
     [[nodiscard]] VkDescriptorImageInfo viewportImageDescriptor() const;
@@ -1786,7 +1788,9 @@ private:
     std::unique_ptr<ShaderModule> restirGiSpatialValidationShader_;
     std::unique_ptr<ShaderModule> restirGiFinalValidationShader_;
     std::unique_ptr<ShaderModule> restirGiUpsampleValidationShader_;
+    std::unique_ptr<ShaderModule> rtxdiGiSpatialResamplingShader_;
     std::unique_ptr<ShaderModule> restirDiTemporalShader_;
+    std::unique_ptr<ShaderModule> rtxdiDiFusedResamplingShader_;
     std::unique_ptr<ShaderModule> restirDiSpatialShader_;
     std::unique_ptr<ShaderModule> restirDiFinalShader_;
     std::unique_ptr<ShaderModule> restirDiTemporalFullShader_;
@@ -1878,7 +1882,9 @@ private:
     std::unique_ptr<ComputePipeline> restirGiSpatialValidationPipeline_;
     std::unique_ptr<ComputePipeline> restirGiFinalValidationPipeline_;
     std::unique_ptr<ComputePipeline> restirGiUpsampleValidationPipeline_;
+    std::unique_ptr<ComputePipeline> rtxdiGiSpatialResamplingPipeline_;
     std::unique_ptr<ComputePipeline> restirDiTemporalPipeline_;
+    std::unique_ptr<ComputePipeline> rtxdiDiFusedResamplingPipeline_;
     std::unique_ptr<ComputePipeline> restirDiSpatialPipeline_;
     std::unique_ptr<ComputePipeline> restirDiFinalPipeline_;
     std::unique_ptr<ComputePipeline> restirDiTemporalFullPipeline_;
@@ -1937,6 +1943,7 @@ private:
     std::unique_ptr<RayTracingPipeline> wavefrontTraceSerPipeline_;
     std::unique_ptr<RayTracingScene> rayTracingScene_;
     std::unique_ptr<TemporalSystem> temporalSystem_;
+    std::unique_ptr<RtxdiRuntime> rtxdiRuntime_;
     PhysicalCamera physicalCamera_;
     VkDescriptorSetLayout atmosphereSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout rayTracingSetLayout_ = VK_NULL_HANDLE;

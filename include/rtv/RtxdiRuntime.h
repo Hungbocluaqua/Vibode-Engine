@@ -1,19 +1,13 @@
 #pragma once
 
+#include "rtv/RtxdiSettings.h"
+
 #include <Rtxdi/ImportanceSamplingContext.h>
 
 #include <cstdint>
 #include <memory>
 
 namespace rtv {
-
-enum class RtxdiQualityPreset : uint32_t {
-    Fast,
-    Medium,
-    Unbiased,
-    Ultra,
-    Reference,
-};
 
 struct RtxdiRuntimeConfig {
     uint32_t renderWidth = 0;
