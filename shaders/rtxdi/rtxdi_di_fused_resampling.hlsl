@@ -61,7 +61,7 @@ struct ResamplingConstants
     uint lightVersion;
     uint environmentVersion;
     uint rtxdiPtEnabled;
-    uint padding;
+    uint rtxdiPtReplayEnabled;
 };
 
 [[vk::binding(6, 0)]] ConstantBuffer<ResamplingConstants> g_Const;

@@ -35,7 +35,7 @@ layout(set = 0, binding = 61, std140) uniform RestirDiRaygenParams {
     uint lightVersion;
     uint environmentVersion;
     uint rtxdiPtEnabled;
-    uint padding;
+    uint rtxdiPtReplayEnabled;
 } restir_di_raygen_params;
 
 

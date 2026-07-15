@@ -4974,6 +4974,8 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
     const bool nativeRtxdiPtBridge = nativeRtxdiGiSpatial &&
         profileReport_.settings.rendererPipelineMode == RendererPipelineMode::PathTracerRtxdi &&
         profileReport_.settings.rtxdiRestirPtEnabled;
+    const bool nativeRtxdiPtReplay = nativeRtxdiPtBridge &&
+        profileReport_.settings.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy;
     j["restir_gi"] = {
         {"schema_version", 2},
         {"mode", restirGiModeName(profileReport_.settings.restirGiMode)},
@@ -5043,7 +5045,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"reservoir_core", nativeRtxdiPtBridge ? "restir-pt" : (nativeRtxdiGiSpatial ? "restir-gi" : "engine")},
             {"path_space_bridge", nativeRtxdiPtBridge},
             {"path_seed_stored", nativeRtxdiPtBridge},
-            {"path_replay", false},
+            {"path_replay", nativeRtxdiPtReplay},
         }},
         {"effective_production_reuse", giProductionPassesActive},
         {"wavefront_current_frame_fallback", profileReport_.settings.wavefrontFinalOutputEnabled},
@@ -5435,7 +5437,9 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         profileReport_.settings.rtxdiIndirectLightingEnabled &&
         profileReport_.settings.rtxdiRestirPtEnabled;
     const LightingReuseMode effectiveLightingReuseMode = nativeRtxdiPtEffective
-        ? LightingReuseMode::ExperimentalRestirPT
+        ? (profileReport_.settings.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy
+            ? LightingReuseMode::ValidateRestirPTAgainstLegacy
+            : LightingReuseMode::ExperimentalRestirPT)
         : (profileReport_.settings.lightingReuseMode == LightingReuseMode::LegacyRestirDiGiPlusReGIR
             ? LightingReuseMode::LegacyRestirDiGiPlusReGIR
             : LightingReuseMode::LegacyRestirDiGi);

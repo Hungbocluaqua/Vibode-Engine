@@ -1151,6 +1151,8 @@ PathTracerRenderer::PathTracerRenderer(
         {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
         {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
     };
+    auto restirPtReplayDefines = restirDiPackedDefines;
+    restirPtReplayDefines.emplace_back("RTV_RTXDI_PT_REPLAY_ENABLED", "1");
     const std::vector<std::pair<std::string, std::string>> genericBeautyFastDefines{
         {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
         {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "0"},
@@ -1194,6 +1196,8 @@ PathTracerRenderer::PathTracerRenderer(
         {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
         {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
     };
+    auto restirPtReplayGiFullDefines = restirGiFullDefines;
+    restirPtReplayGiFullDefines.emplace_back("RTV_RTXDI_PT_REPLAY_ENABLED", "1");
     const std::vector<std::pair<std::string, std::string>> restirGiValidationDefines{
         {"RTV_RESTIR_DI_VALIDATION_FULL", "0"},
         {"RTV_RESTIR_GI_UNCOMPRESSED_LAYOUT", "1"},
@@ -1293,6 +1297,10 @@ PathTracerRenderer::PathTracerRenderer(
 
     const auto raygenSpv = compileShaderVariant(
         shaderDirectory / "pathtrace.rgen", ".di_packed", restirDiPackedDefines);
+    const auto raygenPtReplaySpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen", ".pt_replay.di_packed", restirPtReplayDefines);
+    const auto raygenPtReplayGiFullSpv = compileShaderVariant(
+        shaderDirectory / "pathtrace.rgen", ".pt_replay.gi_full", restirPtReplayGiFullDefines);
     const auto raygenBeautyFastSpv = compileShaderVariant(
         shaderDirectory / "pathtrace.rgen", ".beauty_fast.di_packed", genericBeautyFastDefines);
     const auto raygenBeautyFastNoTexturesSpv = compileShaderVariant(
@@ -1511,6 +1519,14 @@ PathTracerRenderer::PathTracerRenderer(
     fullscreenVertexShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(vertSpv), "fullscreen vertex");
     fullscreenFragmentShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(fragSpv), "fullscreen fragment");
     raygenShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenSpv), "path trace raygen");
+    raygenPtReplayShader_ = std::make_unique<ShaderModule>(
+        context_.device(),
+        ShaderCompiler::readSpirv(raygenPtReplaySpv),
+        "path trace RTXDI PT replay raygen");
+    raygenPtReplayGiFullShader_ = std::make_unique<ShaderModule>(
+        context_.device(),
+        ShaderCompiler::readSpirv(raygenPtReplayGiFullSpv),
+        "path trace RTXDI PT replay GI-full raygen");
     raygenBeautyFastShader_ = std::make_unique<ShaderModule>(context_.device(), ShaderCompiler::readSpirv(raygenBeautyFastSpv), "path trace generic beauty fast raygen");
     raygenBeautyFastNoTexturesShader_ = std::make_unique<ShaderModule>(
         context_.device(),
@@ -2200,6 +2216,18 @@ void PathTracerRenderer::ensureRayTracingVariantPipelines(bool restirDiValidatio
         tracePathTraceRecordPhase("ensure_variants_create_full_generic_begin");
         rayTracingPipeline_ = makeRtPipeline(raygenShader_.get());
         tracePathTraceRecordPhase("ensure_variants_create_full_generic_end");
+    }
+    if (settings_.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy &&
+        !restirDiValidationFull && !settings_.motionBlurEnabled) {
+        if (restirGiInitialFull && rayTracingPtReplayGiFullPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_pt_replay_gi_full_begin");
+            rayTracingPtReplayGiFullPipeline_ = makeRtPipeline(raygenPtReplayGiFullShader_.get());
+            tracePathTraceRecordPhase("ensure_variants_create_pt_replay_gi_full_end");
+        } else if (!restirGiInitialFull && rayTracingPtReplayPipeline_ == nullptr) {
+            tracePathTraceRecordPhase("ensure_variants_create_pt_replay_begin");
+            rayTracingPtReplayPipeline_ = makeRtPipeline(raygenPtReplayShader_.get());
+            tracePathTraceRecordPhase("ensure_variants_create_pt_replay_end");
+        }
     }
     if (needsOnlyBasePipeline) {
         tracePathTraceRecordPhase("ensure_variants_noop");
@@ -3466,7 +3494,11 @@ RendererSettings PathTracerRenderer::normalizeSettingsForDevice(
                 next.restirGiHalfResolution = next.rtxdiQualityPreset == RtxdiQualityPreset::Fast;
             }
             if (next.rtxdiRestirPtEnabled) {
-                next.lightingReuseMode = LightingReuseMode::ExperimentalRestirPT;
+                // Preserve the explicit A/B validation mode so it can select the
+                // replay raygen variant; production PT still defaults to experimental.
+                if (next.lightingReuseMode != LightingReuseMode::ValidateRestirPTAgainstLegacy) {
+                    next.lightingReuseMode = LightingReuseMode::ExperimentalRestirPT;
+                }
                 next.pathReservoirLayout = ReservoirLayout::PathSpaceCompressed;
                 next.restirGiHalfResolution = false;
             }
@@ -7662,6 +7694,8 @@ void PathTracerRenderer::updateCamera() {
             .rawOutputIsCurrentSample = shouldRunDlssRayReconstruction(),
         });
     restirDiParams_.rtxdiPtEnabled = settings_.rtxdiRestirPtEnabled ? 1u : 0u;
+    restirDiParams_.rtxdiPtReplayEnabled =
+        settings_.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy ? 1u : 0u;
     frameUniforms.write(&restirDiParams_, sizeof(restirDiParams_), kFrameRestirDiParamsOffset);
     frameUniforms.flush(sizeof(restirDiParams_), kFrameRestirDiParamsOffset);
 
@@ -9062,7 +9096,9 @@ void PathTracerRenderer::recordPathTraceGraph(VkCommandBuffer commandBuffer) {
                 .addStorageRead(previousRestirGiReceiver, traceDomain);
         }
         if (rtxdiPtInitialReservoir.valid()) {
-            pathTracePass.addStorageWrite(rtxdiPtInitialReservoir, traceDomain);
+            pathTracePass
+                .addStorageWrite(rtxdiPtInitialReservoir, traceDomain)
+                .addStorageRead(rtxdiPtPreviousReservoir, traceDomain);
         }
         if (useNewRestirDi) {
             pathTracePass
@@ -11994,9 +12030,11 @@ void PathTracerRenderer::recordRenderGraphPlan() {
                 .addStorageRead(restirGiSpatialReservoir, traceDomain)
                 .addStorageWrite(restirGiReceiver, traceDomain)
                 .addStorageRead(previousRestirGiReceiver, traceDomain);
-            if (rtxdiPtInitialReservoir.valid()) {
-                pathTracePass.addStorageWrite(rtxdiPtInitialReservoir, traceDomain);
-            }
+        }
+        if (rtxdiPtInitialReservoir.valid()) {
+            pathTracePass
+                .addStorageWrite(rtxdiPtInitialReservoir, traceDomain)
+                .addStorageRead(rtxdiPtPreviousReservoir, traceDomain);
         }
         if (useNewRestirDi) {
             pathTracePass
@@ -12628,6 +12666,9 @@ void PathTracerRenderer::writeRayTracingDescriptors(
     const Buffer& rtxdiPtInitialBinding = rtxdiPtInitialReservoirBuffer_.handle() != VK_NULL_HANDLE
         ? rtxdiPtInitialReservoirBuffer_
         : pathDataBuffer_;
+    const Buffer& rtxdiPtPreviousBinding = rtxdiPtPreviousReservoirBuffer_.handle() != VK_NULL_HANDLE
+        ? rtxdiPtPreviousReservoirBuffer_
+        : pathDataBuffer_;
     writer
         .writeBuffer(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, accumulationBuffer_.descriptorInfo())
         .writeBuffer(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, currentFrame_->uniformRing().descriptorInfo(kFrameCameraUniformOffset, sizeof(CameraUniform)))
@@ -12666,6 +12707,7 @@ void PathTracerRenderer::writeRayTracingDescriptors(
         .writeBuffer(72, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, psrGuideBuffer_.descriptorInfo())
         .writeBuffer(73, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, psrGuideSignatureBuffer_.descriptorInfo())
         .writeBuffer(74, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rtxdiPtInitialBinding.descriptorInfo())
+        .writeBuffer(75, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rtxdiPtPreviousBinding.descriptorInfo())
         .writeBuffer(43, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiCurrentBinding.descriptorInfo())
         .writeBuffer(44, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, previousRestirGiBinding.descriptorInfo())
         .writeBuffer(45, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, restirGiSpatialBinding.descriptorInfo())
@@ -12751,7 +12793,20 @@ void PathTracerRenderer::recordHardwarePathTrace(VkCommandBuffer commandBuffer) 
         }
         motionPipeline = nullptr;
     }
-    if (shouldUseNative2BPathTraceKernel()) {
+    RayTracingPipeline* rtxdiPtReplayPipeline = restirGiInitialFull
+        ? rayTracingPtReplayGiFullPipeline_.get()
+        : rayTracingPtReplayPipeline_.get();
+    if (settings_.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy &&
+        !restirDiValidationFull && !settings_.motionBlurEnabled &&
+        rtxdiPtReplayPipeline != nullptr) {
+        basePipeline = rtxdiPtReplayPipeline;
+        motionPipeline = nullptr;
+    }
+    const bool useRtxdiPtReplay =
+        settings_.lightingReuseMode == LightingReuseMode::ValidateRestirPTAgainstLegacy &&
+        !restirDiValidationFull && !settings_.motionBlurEnabled &&
+        rtxdiPtReplayPipeline != nullptr;
+    if (shouldUseNative2BPathTraceKernel() && !useRtxdiPtReplay) {
         if (rayTracingDiagnosticCountersEnabled_ && rayTracingNative2BDiagnosticPipeline_ != nullptr) {
             basePipeline = rayTracingNative2BDiagnosticPipeline_.get();
         } else if (shouldSkipImportedEmissiveDirectSampling() &&

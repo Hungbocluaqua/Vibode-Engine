@@ -99,6 +99,12 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.secondary_ray_direction = normalize(ray.direction);
     components.first_local_pos = vec3(0.0);
     components.first_barycentrics = vec3(1.0, 0.0, 0.0);
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+    components.first_tangent = vec3(1.0, 0.0, 0.0);
+    components.first_bitangent = vec3(0.0, 0.0, 1.0);
+    components.first_uv = vec2(0.0);
+    components.first_uv1 = vec2(0.0);
+#endif
     components.first_material_id = 0xffffffffu;
     components.restir_gi_candidate_valid = 0u;
     components.restir_gi_candidate_position = vec3(0.0);
@@ -114,6 +120,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
     components.restir_gi_candidate_path_class = PROD_PATH_CLASS_INVALID;
     components.restir_gi_candidate_reuse_flags = 0u;
     components.restir_gi_candidate_material_id = 0xffffffffu;
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+    components.restir_gi_candidate_path_length = 0u;
+#endif
     components.bounce_count = 0u;
     components.instance_id = 0xffffffffu;
     components.mesh_id = 0xffffffffu;
@@ -442,6 +451,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     components.restir_gi_candidate_reuse_flags = PROD_FLAG_ENVIRONMENT |
                         (components.first_alpha_mode != 0u ? PROD_FLAG_ALPHA_TESTED : 0u);
                     components.restir_gi_candidate_material_id = components.first_material_id;
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+                    components.restir_gi_candidate_path_length = 2u;
+#endif
                 }
             }
             radiance += env;
@@ -466,6 +478,12 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
             components.restir_gi_receiver_position = hit.world_pos;
             components.first_local_pos = hit.local_pos;
             components.first_barycentrics = hit.barycentrics;
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+            components.first_tangent = hit.tangent;
+            components.first_bitangent = hit.bitangent;
+            components.first_uv = hit.uv;
+            components.first_uv1 = hit.uv1;
+#endif
             components.first_albedo = pbr_diffuse_reflectance(material);
             components.first_specular_albedo = pbr_specular_reflectance(material, max(dot(hit.normal, -ray.direction), 0.0));
             components.restir_di_base_color = clamp(material.color, vec3(0.0), vec3(1.0));
@@ -1046,6 +1064,9 @@ vec3 trace_path(Ray ray, inout uint rng, uint pixelIndex, ivec2 coords, ivec2 di
                     (components.first_alpha_mode != 0u || material.alpha_mode != 0u)
                     ? PROD_FLAG_ALPHA_TESTED : 0u;
                 components.restir_gi_candidate_material_id = components.first_material_id;
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+                components.restir_gi_candidate_path_length = min(255u, bounce + 2u);
+#endif
             }
         }
         components.emissive_light += throughput * emissiveDirect * atmosTransmittance * bounceContributionScale;

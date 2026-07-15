@@ -847,7 +847,7 @@ private:
         uint32_t lightVersion = 0;
         uint32_t environmentVersion = 0;
         uint32_t rtxdiPtEnabled = 0;
-        uint32_t padding = 0;
+        uint32_t rtxdiPtReplayEnabled = 0;
     };
 
     struct FogParams {
@@ -1815,6 +1815,8 @@ private:
     std::unique_ptr<ShaderModule> fullscreenVertexShader_;
     std::unique_ptr<ShaderModule> fullscreenFragmentShader_;
     std::unique_ptr<ShaderModule> raygenShader_;
+    std::unique_ptr<ShaderModule> raygenPtReplayShader_;
+    std::unique_ptr<ShaderModule> raygenPtReplayGiFullShader_;
     std::unique_ptr<ShaderModule> raygenBeautyFastShader_;
     std::unique_ptr<ShaderModule> raygenBeautyFastNoTexturesShader_;
     std::unique_ptr<ShaderModule> raygenRegirBeautyFastShader_;
@@ -1910,6 +1912,8 @@ private:
     std::unique_ptr<ComputePipeline> wavefrontSortPipeline_;
     std::unique_ptr<GraphicsPipeline> graphicsPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingPtReplayPipeline_;
+    std::unique_ptr<RayTracingPipeline> rayTracingPtReplayGiFullPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingBeautyFastPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingRegirBeautyFastPipeline_;
     std::unique_ptr<RayTracingPipeline> rayTracingRegirStochasticBeautyFastPipeline_;

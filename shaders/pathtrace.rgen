@@ -10,6 +10,9 @@
 #ifndef RTV_BEAUTY_OUTPUT_ONLY
 #define RTV_BEAUTY_OUTPUT_ONLY 0
 #endif
+#ifndef RTV_RTXDI_PT_REPLAY_ENABLED
+#define RTV_RTXDI_PT_REPLAY_ENABLED 0
+#endif
 #ifndef RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT
 #define RTV_GENERIC_SECONDARY_ONE_INFINITE_LIGHT 0
 #endif
@@ -42,6 +45,9 @@ struct PackedRtxdiPtReservoir {
 };
 layout(set = 0, binding = 74, std430) buffer RtxdiPtInitialReservoirBuffer {
     PackedRtxdiPtReservoir rtxdi_pt_initial_reservoirs[];
+};
+layout(set = 0, binding = 75, std430) readonly buffer RtxdiPtPreviousReservoirBuffer {
+    PackedRtxdiPtReservoir rtxdi_pt_previous_reservoirs[];
 };
 layout(location = 0) rayPayloadEXT RayPayload payload;
 layout(location = 1) rayPayloadEXT uint shadow_occluded;
@@ -133,6 +139,12 @@ struct PathComponents {
     vec3 secondary_ray_direction;
     vec3 first_local_pos;
     vec3 first_barycentrics;
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+    vec3 first_tangent;
+    vec3 first_bitangent;
+    vec2 first_uv;
+    vec2 first_uv1;
+#endif
     uint first_material_id;
     uint restir_gi_candidate_valid;
     vec3 restir_gi_candidate_position;
@@ -148,6 +160,9 @@ struct PathComponents {
     uint restir_gi_candidate_path_class;
     uint restir_gi_candidate_reuse_flags;
     uint restir_gi_candidate_material_id;
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+    uint restir_gi_candidate_path_length;
+#endif
     uint bounce_count;
     uint instance_id;
     uint mesh_id;
@@ -216,7 +231,13 @@ void store_rtxdi_pt_initial(uint pixelIndex, uint replaySeed, PathComponents com
     if (valid) {
         uvec2 packedNormal = encode_rtxdi_pt_snorm3x16(normalize(components.restir_gi_candidate_normal));
         float inversePdf = 1.0 / components.restir_gi_candidate_source_pdf;
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+        uint pathLength = components.restir_gi_candidate_path_length != 0u
+            ? components.restir_gi_candidate_path_length
+            : clamp(components.bounce_count + 1u, 2u, 255u);
+#else
         uint pathLength = clamp(components.bounce_count + 1u, 2u, 255u);
+#endif
         uint rcVertexLength = min(pathLength, 2u);
         packed.data0 = uvec4(
             floatBitsToUint(components.restir_gi_candidate_position),
@@ -235,6 +256,159 @@ void store_rtxdi_pt_initial(uint pixelIndex, uint replaySeed, PathComponents com
     }
     rtxdi_pt_initial_reservoirs[pixelIndex] = packed;
 }
+
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+bool replay_rtxdi_pt_one_bounce(
+    uint pixelIndex,
+    ivec2 coords,
+    ivec2 dims,
+    float rayTime,
+    vec3 receiverPosition,
+    vec3 receiverNormal,
+    float receiverDepth,
+    inout PathComponents components,
+    out uint replaySeedOut) {
+    replaySeedOut = 0u;
+    if (restir_di_raygen_params.rtxdiPtEnabled == 0u ||
+        restir_di_raygen_params.rtxdiPtReplayEnabled == 0u ||
+        ((pixelIndex ^ camera.temporal_frame_index) & 7u) != 0u ||
+        components.first_material_id == 0xffffffffu ||
+        components.first_roughness < 0.2 ||
+        components.first_transmission > 1.0e-5 ||
+        components.restir_gi_receiver_supported == 0u) {
+        return false;
+    }
+
+    PackedRtxdiPtReservoir previous = rtxdi_pt_previous_reservoirs[pixelIndex];
+    float previousM = unpackHalf2x16(previous.data1.y).y;
+    uint previousAge = previous.data2.w & 0x1fu;
+    uint previousPathLength = (previous.data2.w >> 16u) & 0xffu;
+    if (!(previousM > 0.0) || previousAge > 1u || previousPathLength != 2u) {
+        return false;
+    }
+
+    RayPayload primaryHit;
+    primaryHit.hit = 1u;
+    primaryHit.t = receiverDepth;
+    primaryHit.world_pos = receiverPosition;
+    primaryHit.material_id = components.first_material_id;
+    primaryHit.local_pos = components.first_local_pos;
+    primaryHit.geom_normal = components.first_geom_normal;
+    primaryHit.front_face = 1u;
+    primaryHit.normal = receiverNormal;
+    primaryHit.instance_id = components.instance_id;
+    primaryHit.mesh_id = components.mesh_id;
+    primaryHit.primitive_id = components.primitive_id;
+    primaryHit.picking = 0u;
+    primaryHit.barycentrics = components.first_barycentrics;
+    primaryHit.uv = components.first_uv;
+    primaryHit.uv1 = components.first_uv1;
+    primaryHit.tangent = components.first_tangent;
+    primaryHit.bitangent = components.first_bitangent;
+    primaryHit.vertex_color = vec4(1.0);
+
+    Material material = material_for_hit(primaryHit, -normalize(components.first_view_direction));
+    if (material_is_delta(material) || material_is_transmissive(material)) {
+        return false;
+    }
+
+    uint replayRng = previous.data3.w;
+    float bsdfPdf = 0.0;
+    vec3 wo = normalize(components.first_view_direction);
+    vec3 wi = sample_brdf(
+        replayRng,
+        material,
+        wo,
+        receiverNormal,
+        primaryHit.tangent,
+        primaryHit.bitangent,
+        bsdfPdf);
+    float nDotL = max(dot(receiverNormal, wi), 0.0);
+    if (!(bsdfPdf > 1.0e-6) || !(nDotL > 1.0e-6)) {
+        return false;
+    }
+
+    vec3 bsdf = eval_brdf(
+        material,
+        wo,
+        wi,
+        receiverNormal,
+        primaryHit.tangent,
+        primaryHit.bitangent);
+    vec3 primaryThroughput = bsdf * nDotL / bsdfPdf;
+    if (any(isnan(primaryThroughput)) || any(isinf(primaryThroughput)) ||
+        max(max(primaryThroughput.r, primaryThroughput.g), primaryThroughput.b) <= 0.0) {
+        return false;
+    }
+
+    Ray replayRay;
+    replayRay.origin = receiverPosition + receiverNormal * shadow_self_hit_epsilon();
+    replayRay.direction = wi;
+    replayRay.time = rayTime;
+    bool replayDidHit = false;
+    float replayDepth = 1.0e30;
+    vec3 replayNormal = vec3(0.0, 1.0, 0.0);
+    vec3 replayPosition = vec3(0.0);
+    PathComponents replayComponents;
+    vec3 replayRadiance = trace_path(
+        replayRay,
+        replayRng,
+        pixelIndex,
+        coords,
+        dims,
+        replayDidHit,
+        replayDepth,
+        replayNormal,
+        replayPosition,
+        replayComponents);
+    if (!replayDidHit || any(isnan(replayRadiance)) || any(isinf(replayRadiance))) {
+        return false;
+    }
+
+    float distance = length(replayPosition - receiverPosition);
+    vec3 sourceDirection = distance > 1.0e-4 ? (replayPosition - receiverPosition) / distance : vec3(0.0);
+    if (!(distance > 1.0e-4) || max(dot(replayNormal, -sourceDirection), 0.0) <= 1.0e-5) {
+        return false;
+    }
+
+    RestirGiReceiver sourceReceiver;
+    sourceReceiver.positionDepth = vec4(receiverPosition, receiverDepth);
+    sourceReceiver.normalRoughness = vec4(receiverNormal, components.first_roughness);
+    sourceReceiver.geometryNormalMetal = vec4(components.first_geom_normal, components.first_metallic);
+    sourceReceiver.albedoOcclusion = vec4(components.restir_di_base_color, components.first_occlusion);
+    sourceReceiver.materialIds = uvec4(components.first_material_id, components.instance_id, components.mesh_id, components.primitive_id);
+    sourceReceiver.motion = uvec4(0u);
+    vec3 receiverFactor = restir_gi_receiver_factor(sourceReceiver, camera.pos.xyz, sourceDirection);
+    float measurePdf = restir_gi_source_measure_pdf(bsdfPdf, sourceDirection, replayNormal, distance, false);
+    float measureFactor = max(dot(replayNormal, -sourceDirection), 0.0) / max(distance * distance, 1.0e-8);
+    vec3 selectedIntegrand = max(replayRadiance * primaryThroughput, vec3(0.0)) * measurePdf;
+    float targetPdf = restir_gi_luma(selectedIntegrand);
+    vec3 suffix = selectedIntegrand / max(receiverFactor * measureFactor, vec3(1.0e-8));
+    if (!(measurePdf > 1.0e-10) || !(targetPdf > 1.0e-8) || !restir_gi_finite3(suffix)) {
+        return false;
+    }
+
+    components.restir_gi_candidate_valid = 1u;
+    components.restir_gi_candidate_position = replayPosition;
+    components.restir_gi_candidate_normal = replayNormal;
+    components.restir_gi_candidate_radiance = selectedIntegrand;
+    components.restir_gi_candidate_suffix_radiance = suffix;
+    components.restir_gi_candidate_source_direction = sourceDirection;
+    components.restir_gi_receiver_position = receiverPosition;
+    components.restir_gi_candidate_roughness = replayComponents.first_roughness;
+    components.restir_gi_candidate_hit_distance = min(distance, 65504.0);
+    components.restir_gi_candidate_source_pdf = measurePdf;
+    components.restir_gi_candidate_target_pdf = targetPdf;
+    components.restir_gi_candidate_path_class = replayComponents.first_roughness < 0.65
+        ? PROD_PATH_CLASS_GLOSSY_REUSABLE
+        : PROD_PATH_CLASS_DIFFUSE_REUSABLE;
+    components.restir_gi_candidate_reuse_flags = 0u;
+    components.restir_gi_candidate_material_id = components.first_material_id;
+    components.restir_gi_candidate_path_length = 2u;
+    replaySeedOut = previous.data3.w;
+    return true;
+}
+#endif
 
 void main() {
     uvec2 pixel = gl_LaunchIDEXT.xy;
@@ -477,9 +651,29 @@ void main() {
             restirGiComponents.restir_gi_candidate_target_pdf =
                 max(luminance(max(restirGiComponents.restir_gi_candidate_radiance, vec3(0.0))), 1.0e-8);
         }
-        store_initial_restir_gi_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, restirGiComponents);
         store_restir_gi_receiver(pixel_index, ivec2(pixel), packedVelocity, components, hit_position, hit_normal, hit_depth, did_hit);
-        store_rtxdi_pt_initial(pixel_index, pathReplaySeed, restirGiComponents);
+#if RTV_RTXDI_PT_REPLAY_ENABLED
+        uint ptReplaySeed = pathReplaySeed;
+        if (did_hit && restir_di_raygen_params.rtxdiPtEnabled != 0u) {
+            uint replayedSeed = 0u;
+            if (replay_rtxdi_pt_one_bounce(
+                pixel_index,
+                ivec2(pixel),
+                ivec2(size),
+                ray.time,
+                hit_position,
+                hit_normal,
+                hit_depth,
+                restirGiComponents,
+                replayedSeed)) {
+                ptReplaySeed = replayedSeed;
+            }
+        }
+#else
+        uint ptReplaySeed = pathReplaySeed;
+#endif
+        store_initial_restir_gi_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, restirGiComponents);
+        store_rtxdi_pt_initial(pixel_index, ptReplaySeed, restirGiComponents);
     }
     if (restir_di_raygen_params.width != 0u) {
         store_new_restir_di(pixel_index, components, hit_position, hit_normal, hit_depth, did_hit);
