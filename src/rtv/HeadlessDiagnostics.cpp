@@ -5042,6 +5042,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"spatial_resampling", nativeRtxdiGiSpatial},
             {"reservoir_core", nativeRtxdiPtBridge ? "restir-pt" : (nativeRtxdiGiSpatial ? "restir-gi" : "engine")},
             {"path_space_bridge", nativeRtxdiPtBridge},
+            {"path_seed_stored", nativeRtxdiPtBridge},
             {"path_replay", false},
         }},
         {"effective_production_reuse", giProductionPassesActive},

@@ -333,6 +333,7 @@ void main() {
                 sample_components.caustic_blocked_paths);
 
             if (sppIndex == 0u) {
+                pathReplaySeed = sample_rng;
                 first_components = sample_components;
                 first_did_hit = sample_did_hit;
                 first_hit_depth = sample_hit_depth;
