@@ -34,6 +34,15 @@ uint restir_gi_receiver_material_id(RestirGiReceiver r) { return r.materialIds.x
 layout(set = 0, binding = 33) uniform accelerationStructureEXT topLevelAS;
 layout(set = 0, binding = 72, std430) buffer PsrGuideBuffer { PsrGuideRecord psr_guide_buffer[]; };
 layout(set = 0, binding = 73, std430) buffer PsrGuideSignatureBuffer { uint psr_guide_signature_buffer[]; };
+struct PackedRtxdiPtReservoir {
+    uvec4 data0;
+    uvec4 data1;
+    uvec4 data2;
+    uvec4 data3;
+};
+layout(set = 0, binding = 74, std430) buffer RtxdiPtInitialReservoirBuffer {
+    PackedRtxdiPtReservoir rtxdi_pt_initial_reservoirs[];
+};
 layout(location = 0) rayPayloadEXT RayPayload payload;
 layout(location = 1) rayPayloadEXT uint shadow_occluded;
 #if RTV_NATIVE2B_PIPELINE
@@ -179,6 +188,54 @@ PathDataRecord empty_adaptive_path_data() {
     return pathData;
 }
 
+uvec2 encode_rtxdi_pt_snorm3x16(vec3 value) {
+    uvec3 encoded = uvec3(round(clamp(value, vec3(-1.0), vec3(1.0)) * 32767.0 + 32767.0));
+    return uvec2(
+        (encoded.x & 0xffffu) | ((encoded.y & 0xffffu) << 16u),
+        encoded.z & 0xffffu);
+}
+
+void store_rtxdi_pt_initial(uint pixelIndex, uint replaySeed, PathComponents components) {
+    if (restir_di_raygen_params.rtxdiPtEnabled == 0u) {
+        return;
+    }
+
+    PackedRtxdiPtReservoir packed;
+    packed.data0 = uvec4(0u);
+    packed.data1 = uvec4(0u);
+    packed.data2 = uvec4(0u);
+    packed.data3 = uvec4(0u);
+
+    bool valid = components.restir_gi_candidate_valid != 0u &&
+        components.restir_gi_candidate_source_pdf > 1.0e-8 &&
+        components.restir_gi_candidate_target_pdf > 1.0e-8 &&
+        !any(isnan(components.restir_gi_candidate_radiance)) &&
+        !any(isinf(components.restir_gi_candidate_radiance)) &&
+        !any(isnan(components.restir_gi_candidate_suffix_radiance)) &&
+        !any(isinf(components.restir_gi_candidate_suffix_radiance));
+    if (valid) {
+        uvec2 packedNormal = encode_rtxdi_pt_snorm3x16(normalize(components.restir_gi_candidate_normal));
+        float inversePdf = 1.0 / components.restir_gi_candidate_source_pdf;
+        uint pathLength = clamp(components.bounce_count + 1u, 2u, 255u);
+        uint rcVertexLength = min(pathLength, 2u);
+        packed.data0 = uvec4(
+            floatBitsToUint(components.restir_gi_candidate_position),
+            floatBitsToUint(inversePdf));
+        packed.data1 = uvec4(
+            packedNormal.x,
+            packedNormal.y | (packHalf2x16(vec2(0.0, 1.0)) & 0xffff0000u),
+            floatBitsToUint(1.0),
+            floatBitsToUint(max(components.restir_gi_candidate_source_pdf, 1.0e-8)));
+        packed.data2 = uvec4(
+            floatBitsToUint(max(components.restir_gi_candidate_suffix_radiance, vec3(0.0))),
+            (rcVertexLength << 8u) | (pathLength << 16u));
+        packed.data3 = uvec4(
+            floatBitsToUint(max(components.restir_gi_candidate_radiance, vec3(0.0))),
+            replaySeed);
+    }
+    rtxdi_pt_initial_reservoirs[pixelIndex] = packed;
+}
+
 void main() {
     uvec2 pixel = gl_LaunchIDEXT.xy;
     uvec2 size = gl_LaunchSizeEXT.xy;
@@ -193,6 +250,7 @@ void main() {
         effectiveSpp = min(adaptive_sampling_sample_count[pixel_index], 64u);
     }
     uint rng = sample_dimension_seed(ivec2(pixel), camera.temporal_frame_index, 0u, SAMPLE_DIM_PATH_SEED);
+    uint pathReplaySeed = rng;
     Ray ray = make_camera_ray(pixel, size, ivec2(pixel), 0u);
     if (effectiveSpp == 0u) {
         uint packedVelocity = compute_sky_velocity(ray.direction, ivec2(size));
@@ -213,6 +271,10 @@ void main() {
         }
         if (restir_di_raygen_params.width != 0u) {
             restir_di_initial_reservoirs[pixel_index] = restir_di_empty_reservoir();
+        }
+        if (restir_di_raygen_params.rtxdiPtEnabled != 0u) {
+            rtxdi_pt_initial_reservoirs[pixel_index] = PackedRtxdiPtReservoir(
+                uvec4(0u), uvec4(0u), uvec4(0u), uvec4(0u));
         }
         return;
     }
@@ -416,6 +478,7 @@ void main() {
         }
         store_initial_restir_gi_reservoir(pixel_index, ivec2(pixel), ivec2(size), packedVelocity, restirGiComponents);
         store_restir_gi_receiver(pixel_index, ivec2(pixel), packedVelocity, components, hit_position, hit_normal, hit_depth, did_hit);
+        store_rtxdi_pt_initial(pixel_index, pathReplaySeed, restirGiComponents);
     }
     if (restir_di_raygen_params.width != 0u) {
         store_new_restir_di(pixel_index, components, hit_position, hit_normal, hit_depth, did_hit);

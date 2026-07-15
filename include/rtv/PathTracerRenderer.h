@@ -846,6 +846,8 @@ private:
         float shadowDistanceBias = 0.002f;
         uint32_t lightVersion = 0;
         uint32_t environmentVersion = 0;
+        uint32_t rtxdiPtEnabled = 0;
+        uint32_t padding = 0;
     };
 
     struct FogParams {
@@ -1734,6 +1736,9 @@ private:
     Buffer restirGiActiveTileMaskBuffer_;
     Buffer restirGiCountersBuffer_;
     Buffer restirGiCountersReadbackBuffer_;
+    Buffer rtxdiPtInitialReservoirBuffer_;
+    Buffer rtxdiPtCurrentReservoirBuffer_;
+    Buffer rtxdiPtPreviousReservoirBuffer_;
 
     // New ReSTIR DI buffers (plan Phase 1)
     Buffer restirDiReceiverBuffer_;

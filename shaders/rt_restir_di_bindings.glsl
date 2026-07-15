@@ -32,6 +32,10 @@ layout(set = 0, binding = 61, std140) uniform RestirDiRaygenParams {
     uint counterEnabled;
     uint rawOutputIsCurrentSample;
     float shadowDistanceBias;
+    uint lightVersion;
+    uint environmentVersion;
+    uint rtxdiPtEnabled;
+    uint padding;
 } restir_di_raygen_params;
 
 

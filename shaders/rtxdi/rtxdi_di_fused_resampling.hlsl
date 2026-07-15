@@ -60,6 +60,8 @@ struct ResamplingConstants
     float shadowDistanceBias;
     uint lightVersion;
     uint environmentVersion;
+    uint rtxdiPtEnabled;
+    uint padding;
 };
 
 [[vk::binding(6, 0)]] ConstantBuffer<ResamplingConstants> g_Const;
