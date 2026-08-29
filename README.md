@@ -38,3 +38,7 @@ Optional integrations are intentionally not vendored. Configure them with:
 
 The engine builds without these optional SDKs and falls back to its built-in
 runtime paths where supported.
+
+---
+
+[Support me on Ko-fi](https://ko-fi.com/hungchayqua)
