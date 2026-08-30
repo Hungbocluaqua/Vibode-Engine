@@ -60,6 +60,55 @@ RtxdiMemoryRequirements RtxdiRuntime::memoryRequirements() const {
     return result;
 }
 
+RtxdiRuntimeParameters RtxdiRuntime::runtimeParameters() const {
+    RtxdiRuntimeParameters result{};
+    const auto& di = context_->GetReSTIRDIContext();
+    const auto diInitial = di.GetInitialSamplingParameters();
+    const auto diTemporal = di.GetTemporalResamplingParameters();
+    const auto diSpatial = di.GetSpatialResamplingParameters();
+    result.diLocalLightSamples = diInitial.numLocalLightSamples;
+    result.diBrdfSamples = diInitial.numBrdfSamples;
+    result.diInfiniteLightSamples = diInitial.numInfiniteLightSamples;
+    result.diEnvironmentSamples = diInitial.numEnvironmentSamples;
+    const auto diReservoirParams = di.GetReservoirBufferParameters();
+    result.diReservoirBlockRowPitch = diReservoirParams.reservoirBlockRowPitch;
+    result.diReservoirArrayPitch = diReservoirParams.reservoirArrayPitch;
+    result.diTemporalHistoryLength = diTemporal.maxHistoryLength;
+    result.diSpatialSamples = diSpatial.numSamples;
+    result.diSpatialRadius = diSpatial.samplingRadius;
+    result.diDepthThreshold = diTemporal.depthThreshold;
+    result.diNormalThreshold = diTemporal.normalThreshold;
+
+    const auto& gi = context_->GetReSTIRGIContext();
+    const auto giReservoirParams = gi.GetReservoirBufferParameters();
+    result.giReservoirBlockRowPitch = giReservoirParams.reservoirBlockRowPitch;
+    result.giReservoirArrayPitch = giReservoirParams.reservoirArrayPitch;
+    const auto giTemporal = gi.GetTemporalResamplingParameters();
+    const auto giSpatial = gi.GetSpatialResamplingParameters();
+    result.giTemporalHistoryLength = giTemporal.maxHistoryLength;
+    result.giMaxReservoirAge = giTemporal.maxReservoirAge;
+    result.giSpatialSamples = giSpatial.numSamples;
+    result.giSpatialRadius = giSpatial.samplingRadius;
+    result.giDepthThreshold = giTemporal.depthThreshold;
+    result.giNormalThreshold = giTemporal.normalThreshold;
+
+    const auto& pt = context_->GetReSTIRPTContext();
+    const auto ptReservoirParams = pt.GetReservoirBufferParameters();
+    result.ptReservoirBlockRowPitch = ptReservoirParams.reservoirBlockRowPitch;
+    result.ptReservoirArrayPitch = ptReservoirParams.reservoirArrayPitch;
+    const auto ptTemporal = pt.GetTemporalResamplingParameters();
+    const auto ptSpatial = pt.GetSpatialResamplingParameters();
+    const auto ptInitial = pt.GetInitialSamplingParameters();
+    const auto ptHybrid = pt.GetHybridShiftParameters();
+    result.ptTemporalHistoryLength = ptTemporal.maxHistoryLength;
+    result.ptMaxReservoirAge = ptTemporal.maxReservoirAge;
+    result.ptSpatialSamples = ptSpatial.numSpatialSamples;
+    result.ptMaxBounceDepth = ptInitial.maxBounceDepth;
+    result.ptMaxRcVertexLength = ptHybrid.maxRcVertexLength;
+    result.activeCheckerboardField = di.GetRuntimeParams().activeCheckerboardField;
+    return result;
+}
+
 void RtxdiRuntime::applyQualityPreset() {
     auto& di = context_->GetReSTIRDIContext();
     auto initial = rtxdi::GetDefaultReSTIRDIInitialSamplingParams();

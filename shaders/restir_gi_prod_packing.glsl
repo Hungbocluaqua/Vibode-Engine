@@ -25,6 +25,19 @@ const uint PROD_FLAG_ENVIRONMENT = 1u << 4u;
 const uint PROD_FLAG_VISIBILITY_KNOWN = 1u << 5u;
 const uint PROD_FLAG_RECONNECTED_VISIBILITY = 1u << 6u;
 const uint PROD_FLAG_NON_FINITE = 1u << 7u;
+const uint RESTIR_GI_RESERVOIR_BLOCK_SIZE = 16u;
+
+uint restir_gi_reservoir_index(ivec2 pixel, uint width) {
+    uvec2 p = uvec2(pixel);
+    uvec2 block = p / RESTIR_GI_RESERVOIR_BLOCK_SIZE;
+    uvec2 inBlock = p % RESTIR_GI_RESERVOIR_BLOCK_SIZE;
+    uint blockRowPitch =
+        ((width + RESTIR_GI_RESERVOIR_BLOCK_SIZE - 1u) / RESTIR_GI_RESERVOIR_BLOCK_SIZE) *
+        RESTIR_GI_RESERVOIR_BLOCK_SIZE * RESTIR_GI_RESERVOIR_BLOCK_SIZE;
+    return block.y * blockRowPitch +
+        block.x * RESTIR_GI_RESERVOIR_BLOCK_SIZE * RESTIR_GI_RESERVOIR_BLOCK_SIZE +
+        inBlock.y * RESTIR_GI_RESERVOIR_BLOCK_SIZE + inBlock.x;
+}
 
 struct ProdRestirGiReservoir {
     vec4 x2PositionDistance;       // xyz = x2, or environment direction; w = distance, -1 for environment

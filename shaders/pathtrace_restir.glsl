@@ -72,6 +72,12 @@ void store_initial_restir_reservoir(uint pixelIndex, ivec2 coords, ivec2 dims, u
 }
 
 void store_new_restir_di(uint pixelIndex, PathComponents components, vec3 hit_position, vec3 hit_normal, float hit_depth, bool did_hit) {
+    // Checkerboard DI owns only one field per frame. The other full-resolution
+    // pixel remains available to final shading through the initial reservoir.
+    if (!restir_di_checkerboard_pixel_active(ivec2(gl_LaunchIDEXT.xy))) {
+        return;
+    }
+    pixelIndex = restir_di_reservoir_index(ivec2(gl_LaunchIDEXT.xy), gl_LaunchSizeEXT.x);
     if (restir_di_raygen_params.counterEnabled != 0u) {
         atomicAdd(restir_di_counters[RESTIR_DI_COUNTER_INITIAL_PIXELS], 1u);
     }

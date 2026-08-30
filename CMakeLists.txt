@@ -129,7 +129,7 @@ if(IMGUI_SOURCE_DIR STREQUAL "" OR NOT EXISTS "${IMGUI_SOURCE_DIR}/imgui.cpp")
 endif()
 
 add_library(volk STATIC "${VOLK_DIR}/volk.c")
-target_include_directories(volk PUBLIC "$ENV{VULKAN_SDK}/Include")
+target_include_directories(volk PUBLIC "$ENV{VULKAN_SDK}/Include" "${VOLK_DIR}")
 target_compile_definitions(volk PUBLIC VK_NO_PROTOTYPES)
 
 add_executable(rtvulkan

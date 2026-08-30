@@ -121,7 +121,8 @@ void main() {
     uint outWidth = pc.halfResolution != 0u ? (pc.width + 1u) / 2u : pc.width;
     uint outHeight = pc.halfResolution != 0u ? (pc.height + 1u) / 2u : pc.height;
     if (pixel.x >= int(outWidth) || pixel.y >= int(outHeight)) return;
-    uint pixelIndex = uint(pixel.y) * outWidth + uint(pixel.x);
+    uint pixelLinearIndex = uint(pixel.y) * outWidth + uint(pixel.x);
+    uint pixelIndex = restir_gi_reservoir_index(pixel, outWidth);
     if (!active_tile_contains(representative_full_pixel(pixel))) {
         spatial_reservoirs[pixelIndex] = temporal_reservoirs[pixelIndex];
         return;
@@ -156,12 +157,13 @@ void main() {
     uint raysUsed = 0u;
 
     for (uint roundIndex = 0u; roundIndex < pc.spatialRounds; ++roundIndex) {
-        float angle = rng01(pixelIndex, roundIndex * 2u) * 6.28318530718;
-        float radius = max(1.0, pc.spatialRadius) * sqrt(rng01(pixelIndex, roundIndex * 2u + 1u));
+        float angle = rng01(pixelLinearIndex, roundIndex * 2u) * 6.28318530718;
+        float radius = max(1.0, pc.spatialRadius) * sqrt(rng01(pixelLinearIndex, roundIndex * 2u + 1u));
         ivec2 offset = ivec2(round(vec2(cos(angle), sin(angle)) * radius));
         ivec2 neighborPixel = clamp(pixel + offset, ivec2(0), ivec2(int(outWidth) - 1, int(outHeight) - 1));
-        uint neighborIndex = uint(neighborPixel.y) * outWidth + uint(neighborPixel.x);
-        if (neighborIndex == pixelIndex) continue;
+        uint neighborLinearIndex = uint(neighborPixel.y) * outWidth + uint(neighborPixel.x);
+        uint neighborIndex = restir_gi_reservoir_index(neighborPixel, outWidth);
+        if (neighborLinearIndex == pixelLinearIndex) continue;
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_NEIGHBORS_TESTED], 1u);
 
         ProdRestirGiReservoir candidate = temporal_reservoirs[neighborIndex];
@@ -221,13 +223,17 @@ void main() {
         float reuseMassScale = visibilityConfidence;
         float candidateWeight = prod_shifted_reservoir_weight(
             candidate, candidateSourceTarget, prod_unpack_target(candidate)) * reuseMassScale;
-        if (!restir_gi_finite(candidateWeight) || candidateWeight <= 0.0) {
+        if (!restir_gi_finite(candidateWeight)) {
             GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_NON_FINITE], 1u);
+            continue;
+        }
+        if (candidateWeight <= 0.0) {
+            GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_REJECT_TARGET], 1u);
             continue;
         }
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_SPATIAL_ACCEPTED], 1u);
         float newWeight = totalWeight + candidateWeight;
-        if (rng01(pixelIndex, 64u + roundIndex) < candidateWeight / max(newWeight, 1.0e-10)) {
+        if (rng01(pixelLinearIndex, 64u + roundIndex) < candidateWeight / max(newWeight, 1.0e-10)) {
             selected = candidate;
             prod_set_meta(selected, prod_unpack_age(candidate), flags,
                 prod_unpack_path_class(candidate), prod_unpack_confidence(candidate) * visibilityConfidence);

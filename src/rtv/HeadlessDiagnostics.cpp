@@ -1099,6 +1099,11 @@ void to_json(nlohmann::json& j, const ProfileReport::MemoryReport& m) {
     j["restir_gi_counters_bytes"] = m.restirGiCountersBytes;
     j["restir_gi_receiver_bytes"] = m.restirGiReceiverBytes;
     j["restir_gi_previous_receiver_bytes"] = m.restirGiPreviousReceiverBytes;
+    j["restir_gi_effective_half_resolution"] = m.restirGiEffectiveHalfResolution;
+    j["restir_pt_initial_bytes"] = m.restirPtInitialBytes;
+    j["restir_pt_temporal_bytes"] = m.restirPtTemporalBytes;
+    j["restir_pt_current_bytes"] = m.restirPtCurrentBytes;
+    j["restir_pt_previous_bytes"] = m.restirPtPreviousBytes;
     j["staging_upload_total_bytes"] = m.stagingUploadTotalBytes;
     j["staging_upload_peak_bytes"] = m.stagingUploadPeakBytes;
     j["staging_upload_last_bytes"] = m.stagingUploadLastBytes;
@@ -3657,6 +3662,8 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.restirDiCountersBytes = static_cast<uint64_t>(reservoirBreakdown.diCountersBytes);
     profileReport_.memory.restirDiPhysicalBytes = static_cast<uint64_t>(reservoirBreakdown.diPhysicalBytes);
     profileReport_.memory.restirDiAliasSavingsBytes = static_cast<uint64_t>(reservoirBreakdown.diAliasSavingsBytes);
+    profileReport_.memory.restirDiReservoirPixelCount = static_cast<uint64_t>(reservoirBreakdown.diReservoirPixelCount);
+    profileReport_.memory.restirDiCheckerboardCompact = reservoirBreakdown.diCheckerboardCompact;
     profileReport_.memory.restirGiCurrentBytes = static_cast<uint64_t>(reservoirBreakdown.giCurrentBytes);
     profileReport_.memory.restirGiPreviousBytes = static_cast<uint64_t>(reservoirBreakdown.giPreviousBytes);
     profileReport_.memory.restirGiSpatialBytes = static_cast<uint64_t>(reservoirBreakdown.giSpatialBytes);
@@ -3668,6 +3675,11 @@ ProfileReport HeadlessDiagnostics::run(Application& app) {
     profileReport_.memory.restirGiCountersBytes = static_cast<uint64_t>(reservoirBreakdown.giCountersBytes);
     profileReport_.memory.restirGiReceiverBytes = static_cast<uint64_t>(reservoirBreakdown.giReceiverBytes);
     profileReport_.memory.restirGiPreviousReceiverBytes = static_cast<uint64_t>(reservoirBreakdown.giPreviousReceiverBytes);
+    profileReport_.memory.restirGiEffectiveHalfResolution = reservoirBreakdown.giHalfResolution;
+    profileReport_.memory.restirPtInitialBytes = static_cast<uint64_t>(reservoirBreakdown.ptInitialBytes);
+    profileReport_.memory.restirPtTemporalBytes = static_cast<uint64_t>(reservoirBreakdown.ptTemporalBytes);
+    profileReport_.memory.restirPtCurrentBytes = static_cast<uint64_t>(reservoirBreakdown.ptCurrentBytes);
+    profileReport_.memory.restirPtPreviousBytes = static_cast<uint64_t>(reservoirBreakdown.ptPreviousBytes);
     if (auto* uploader = app.bufferUploader()) {
         const auto& uploadStats = uploader->stats();
         profileReport_.memory.stagingUploadTotalBytes = uploadStats.totalUploadedBytes;
@@ -4655,11 +4667,18 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         (diContractChecked && diContractViolationCount == 0ull);
     const uint64_t diPixels = static_cast<uint64_t>(profileReport_.resolution.renderWidth) *
         static_cast<uint64_t>(profileReport_.resolution.renderHeight);
-    const uint64_t diReservoirStride = diPixels > 0ull && profileReport_.memory.restirDiInitialBytes > 0ull
-        ? profileReport_.memory.restirDiInitialBytes / diPixels
+    const uint64_t diStoragePixels = profileReport_.memory.restirDiReservoirPixelCount > 0ull
+        ? profileReport_.memory.restirDiReservoirPixelCount
+        : diPixels;
+    const uint64_t diLogicalReservoirPixels = profileReport_.memory.restirDiCheckerboardCompact
+        ? static_cast<uint64_t>((profileReport_.resolution.renderWidth + 1u) / 2u) *
+            profileReport_.resolution.renderHeight
+        : diPixels;
+    const uint64_t diReservoirStride = diStoragePixels > 0ull && profileReport_.memory.restirDiInitialBytes > 0ull
+        ? profileReport_.memory.restirDiInitialBytes / diStoragePixels
         : 0ull;
-    const uint64_t diReceiverStride = diPixels > 0ull && profileReport_.memory.restirDiReceiverBytes > 0ull
-        ? profileReport_.memory.restirDiReceiverBytes / diPixels
+    const uint64_t diReceiverStride = diStoragePixels > 0ull && profileReport_.memory.restirDiReceiverBytes > 0ull
+        ? profileReport_.memory.restirDiReceiverBytes / diStoragePixels
         : 0ull;
     const uint32_t diReservoirBufferCount = profileReport_.memory.restirDiInitialBytes > 0ull ? 5u : 0u;
     const uint32_t diReceiverBufferCount = profileReport_.memory.restirDiReceiverBytes > 0ull ? 2u : 0u;
@@ -4842,6 +4861,15 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"logical_bytes", diTotalBytes},
             {"physically_allocated_bytes", profileReport_.memory.restirDiPhysicalBytes},
             {"alias_savings_bytes", profileReport_.memory.restirDiAliasSavingsBytes},
+            {"reservoir_pixel_count", profileReport_.memory.restirDiReservoirPixelCount},
+            {"checkerboard_compact", profileReport_.memory.restirDiCheckerboardCompact},
+            {"addressing", profileReport_.memory.restirDiCheckerboardCompact
+                ? "rtxdi-block-linear-16x16"
+                : "linear"},
+            {"logical_reservoir_pixel_count", diLogicalReservoirPixels},
+            {"storage_padding_pixel_count", diStoragePixels > diLogicalReservoirPixels
+                ? diStoragePixels - diLogicalReservoirPixels
+                : 0ull},
             {"total_bytes", diTotalBytes},
         }},
         {"warnings", std::move(diWarnings)},
@@ -4913,16 +4941,35 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         passes::RestirGIPass::kActiveTileSize;
     const uint64_t giTileCount = giTileColumns * giTileRows;
     const uint64_t giReusePixels =
-        (profileReport_.settings.restirGiHalfResolution && giPixels > 0ull)
+        (profileReport_.memory.restirGiEffectiveHalfResolution && giPixels > 0ull)
             ? ((static_cast<uint64_t>(profileReport_.resolution.renderWidth) + 1ull) / 2ull) *
                 ((static_cast<uint64_t>(profileReport_.resolution.renderHeight) + 1ull) / 2ull)
             : giPixels;
-    const uint64_t giProductionStride = giReusePixels > 0ull && profileReport_.memory.restirGiProductionTemporalBytes > 0ull
-        ? profileReport_.memory.restirGiProductionTemporalBytes / giReusePixels
+    const uint64_t giReuseStoragePixels = passes::RestirGIPass::reservoirStoragePixelCount(
+        profileReport_.resolution.renderWidth,
+        profileReport_.resolution.renderHeight,
+        profileReport_.memory.restirGiEffectiveHalfResolution);
+    const uint64_t giFullStoragePixels = passes::RestirGIPass::reservoirStoragePixelCount(
+        profileReport_.resolution.renderWidth,
+        profileReport_.resolution.renderHeight,
+        false);
+    const uint64_t giProductionStride = giReuseStoragePixels > 0ull && profileReport_.memory.restirGiProductionTemporalBytes > 0ull
+        ? profileReport_.memory.restirGiProductionTemporalBytes / giReuseStoragePixels
         : 0ull;
     const uint64_t giReceiverStride = giPixels > 0ull && profileReport_.memory.restirGiReceiverBytes > 0ull
         ? profileReport_.memory.restirGiReceiverBytes / giPixels
         : 0ull;
+    const uint64_t ptReservoirStride = giFullStoragePixels > 0ull && profileReport_.memory.restirPtInitialBytes > 0ull
+        ? profileReport_.memory.restirPtInitialBytes / giFullStoragePixels
+        : 0ull;
+    const uint64_t ptTotalBytes =
+        profileReport_.memory.restirPtInitialBytes +
+        profileReport_.memory.restirPtTemporalBytes +
+        profileReport_.memory.restirPtCurrentBytes +
+        profileReport_.memory.restirPtPreviousBytes;
+    const bool ptActive = profileReport_.settings.rendererPipelineMode == RendererPipelineMode::PathTracerRtxdi &&
+        profileReport_.settings.rtxdiIndirectLightingEnabled &&
+        profileReport_.settings.rtxdiRestirPtEnabled;
     const uint64_t giTotalBytes =
         profileReport_.memory.restirGiCurrentBytes +
         profileReport_.memory.restirGiPreviousBytes +
@@ -5043,6 +5090,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"native_rtxdi", {
             {"spatial_resampling", nativeRtxdiGiSpatial},
             {"reservoir_core", nativeRtxdiPtBridge ? "restir-pt" : (nativeRtxdiGiSpatial ? "restir-gi" : "engine")},
+            {"reservoir_addressing", "rtxdi-block-linear-16x16"},
             {"path_space_bridge", nativeRtxdiPtBridge},
             {"path_seed_stored", nativeRtxdiPtBridge},
             {"path_replay", nativeRtxdiPtReplay},
@@ -5053,16 +5101,16 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
         {"counter_value_bits", 32},
         {"history_valid", profileReport_.restirGiHistoryValid},
         {"history_counter_evidence_available", !profileReport_.restirGiCounters.empty()},
-        {"half_resolution", profileReport_.settings.restirGiHalfResolution},
+        {"half_resolution", profileReport_.memory.restirGiEffectiveHalfResolution},
         {"render_extent", {
             {"width", profileReport_.resolution.renderWidth},
             {"height", profileReport_.resolution.renderHeight},
         }},
         {"reuse_extent", {
-            {"width", profileReport_.settings.restirGiHalfResolution
+            {"width", profileReport_.memory.restirGiEffectiveHalfResolution
                 ? (profileReport_.resolution.renderWidth + 1u) / 2u
                 : profileReport_.resolution.renderWidth},
-            {"height", profileReport_.settings.restirGiHalfResolution
+            {"height", profileReport_.memory.restirGiEffectiveHalfResolution
                 ? (profileReport_.resolution.renderHeight + 1u) / 2u
                 : profileReport_.resolution.renderHeight},
         }},
@@ -5070,7 +5118,7 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"temporal", giProductionPassesActive},
             {"spatial", profileReport_.settings.restirGiSpatialRounds > 0u &&
                 giProductionPassesActive},
-            {"upsample", profileReport_.settings.restirGiHalfResolution &&
+            {"upsample", profileReport_.memory.restirGiEffectiveHalfResolution &&
                 giProductionPassesActive},
             {"final", giProductionPassesActive},
         }},
@@ -5156,8 +5204,17 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"final_current_only_ratio", ratioOrNull(giPathFinalCurrentOnly, giPathFinalClassified)},
         }},
         {"memory", {
+            {"addressing", "rtxdi-block-linear-16x16"},
             {"production_reservoir_stride", giProductionStride},
             {"receiver_stride", giReceiverStride},
+            {"logical_reuse_reservoir_pixel_count", giReusePixels},
+            {"storage_reuse_reservoir_pixel_count", giReuseStoragePixels},
+            {"storage_reuse_padding_pixel_count", giReuseStoragePixels >= giReusePixels
+                ? giReuseStoragePixels - giReusePixels : 0ull},
+            {"logical_full_reservoir_pixel_count", giPixels},
+            {"storage_full_reservoir_pixel_count", giFullStoragePixels},
+            {"storage_full_padding_pixel_count", giFullStoragePixels >= giPixels
+                ? giFullStoragePixels - giPixels : 0ull},
             {"legacy_current_bytes", profileReport_.memory.restirGiCurrentBytes},
             {"legacy_previous_bytes", profileReport_.memory.restirGiPreviousBytes},
             {"legacy_spatial_bytes", profileReport_.memory.restirGiSpatialBytes},
@@ -5175,6 +5232,21 @@ void HeadlessDiagnostics::writeProfileJson(const std::filesystem::path& path) co
             {"total_bytes", giPhysicalBytes},
         }},
         {"warnings", std::move(giWarnings)},
+    };
+    j["restir_pt"] = {
+        {"schema_version", 1},
+        {"active", ptActive},
+        {"addressing", "rtxdi-block-linear-16x16"},
+        {"logical_reservoir_pixel_count", giPixels},
+        {"storage_reservoir_pixel_count", giFullStoragePixels},
+        {"storage_padding_pixel_count", giFullStoragePixels >= giPixels
+            ? giFullStoragePixels - giPixels : 0ull},
+        {"reservoir_stride", ptReservoirStride},
+        {"initial_bytes", profileReport_.memory.restirPtInitialBytes},
+        {"temporal_bytes", profileReport_.memory.restirPtTemporalBytes},
+        {"current_bytes", profileReport_.memory.restirPtCurrentBytes},
+        {"previous_bytes", profileReport_.memory.restirPtPreviousBytes},
+        {"total_bytes", ptTotalBytes},
     };
     j["adaptive_quality"] = profileReport_.adaptiveQuality;
     j["memory_pressure_quality"] = profileReport_.memoryPressureQuality;

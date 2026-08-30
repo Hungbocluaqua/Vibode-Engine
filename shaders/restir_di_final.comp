@@ -62,6 +62,16 @@ layout(set = 0, binding = 6, std140) uniform Params {
     float shadowDistanceBias;
     uint lightVersion;
     uint environmentVersion;
+    uint rtxdiPtEnabled;
+    uint rtxdiPtReplayEnabled;
+    uint rtxdiPtMaxReservoirAge;
+    uint rtxdiPtMaxBounceDepth;
+    uint rtxdiPtMaxRcVertexLength;
+    uint rtxdiCheckerboardField;
+    uint rtxdiDiLocalLightSamples;
+    uint rtxdiDiBrdfSamples;
+    uint rtxdiDiInfiniteLightSamples;
+    uint rtxdiDiEnvironmentSamples;
 } params;
 
 #define DI_COUNTER_ADD(counter, value) ((params.counterEnabled != 0u) ? atomicAdd(counter, value) : 0u)
@@ -112,6 +122,24 @@ layout(set = 0, binding = 25, std430) writeonly buffer FinalSourcePixels {
 };
 
 const uint RESTIR_DI_SOURCE_PIXEL_INVALID = 0xffffffffu;
+
+uint restir_di_reservoir_index(ivec2 pixel) {
+    if (params.rtxdiCheckerboardField == 0u) {
+        return uint(pixel.y) * params.width + uint(pixel.x);
+    }
+    const uint blockSize = 16u;
+    const uint reservoirWidth = (params.width + 1u) / 2u;
+    const uint widthBlocks = (reservoirWidth + blockSize - 1u) / blockSize;
+    const uint blockRowPitch = widthBlocks * blockSize * blockSize;
+    const uint reservoirX = uint(pixel.x) >> 1u;
+    const uint reservoirY = uint(pixel.y);
+    const uint blockX = reservoirX / blockSize;
+    const uint blockY = reservoirY / blockSize;
+    const uint inBlockX = reservoirX % blockSize;
+    const uint inBlockY = reservoirY % blockSize;
+    return blockY * blockRowPitch +
+        blockX * blockSize * blockSize + inBlockY * blockSize + inBlockX;
+}
 
 uint restir_di_pack_source_pixel(ivec2 p) {
     if (p.x < 0 || p.y < 0 || p.x > 65534 || p.y > 65534) {
@@ -504,11 +532,16 @@ void replace_direct_lighting(
 
 void main() {
     ivec2 coords = ivec2(gl_GlobalInvocationID.xy);
+    if (params.rtxdiCheckerboardField != 0u) {
+        coords.x = int(gl_GlobalInvocationID.x * 2u +
+            ((gl_GlobalInvocationID.y + params.rtxdiCheckerboardField) & 1u));
+    }
     if (coords.x >= int(params.width) || coords.y >= int(params.height)) {
         return;
     }
 
-    uint pixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    uint fullPixelIndex = uint(coords.y) * params.width + uint(coords.x);
+    uint pixelIndex = restir_di_reservoir_index(coords);
     final_source_pixels[pixelIndex] = RESTIR_DI_SOURCE_PIXEL_INVALID;
     DI_COUNTER_ADD(counters.values[RESTIR_DI_COUNTER_FINAL_PIXELS], 1u);
 
@@ -827,7 +860,7 @@ void main() {
             currentInitialDistanceTolerance;
     replace_direct_lighting(
         coords,
-        pixelIndex,
+        fullPixelIndex,
         initialContribution,
         finalContribution,
         selected,

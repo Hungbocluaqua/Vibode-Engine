@@ -299,7 +299,8 @@ void main() {
         : reusePixel;
     sourcePixel = clamp(sourcePixel, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
     uint sourceIndex = uint(sourcePixel.y) * pc.width + uint(sourcePixel.x);
-    uint outputIndex = uint(reusePixel.y) * outWidth + uint(reusePixel.x);
+    uint outputLinearIndex = uint(reusePixel.y) * outWidth + uint(reusePixel.x);
+    uint outputIndex = restir_gi_reservoir_index(reusePixel, outWidth);
     RestirGiReceiver receiver;
     ProdRestirGiReservoir current = prod_empty_reservoir();
     bool currentValid = false;
@@ -342,9 +343,8 @@ void main() {
         store_temporal_reservoir(outputIndex, current);
         return;
     }
-    uint historyIndex = pc.halfResolution != 0u
-        ? uint(historyFull.y / 2) * outWidth + uint(historyFull.x / 2)
-        : uint(historyFull.y) * outWidth + uint(historyFull.x);
+    ivec2 historyReusePixel = pc.halfResolution != 0u ? historyFull / 2 : historyFull;
+    uint historyIndex = restir_gi_reservoir_index(historyReusePixel, outWidth);
     ProdRestirGiReservoir previous = previous_reservoirs[historyIndex];
     if (!prod_reservoir_valid(previous)) {
         record_prod_contract_violation(previous);
@@ -410,13 +410,18 @@ void main() {
     previousWeight *= reuseMassScale;
 #endif
     float totalWeight = prod_unpack_weight_sum(current) + max(previousWeight, 0.0);
-    if (!restir_gi_finite(totalWeight) || totalWeight <= 0.0) {
+    if (!restir_gi_finite(totalWeight)) {
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_NON_FINITE], 1u);
         store_temporal_reservoir(outputIndex, current);
         return;
     }
+    if (totalWeight <= 0.0) {
+        GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_TEMPORAL_REJECT_TARGET], 1u);
+        store_temporal_reservoir(outputIndex, current);
+        return;
+    }
     GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_TEMPORAL_ACCEPTED], 1u);
-    bool selectPrevious = rng01(outputIndex) < previousWeight / totalWeight;
+    bool selectPrevious = rng01(outputLinearIndex) < previousWeight / totalWeight;
     ProdRestirGiReservoir selected = selectPrevious ? previous : current;
     if (selectPrevious) GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_TEMPORAL_MERGED], 1u);
     // Reliability damping changes the effective proposal mass. Applying it to

@@ -190,12 +190,11 @@ uint pathtrace_sbt_stride() {
     return native2b_kernel_enabled() ? 3u : 2u;
 }
 
-uint direct_light_ris_candidate_count() {
-    // The standalone DI reservoir stores one source proposal. Multi-candidate
-    // RIS has a sample-conditional effective PDF that cannot be reconstructed
-    // after shifting the sample to another receiver.
-    if (camera.restir_di_controls.x != 0u) {
-        return 1u;
+uint direct_light_ris_candidate_count(uint bounce) {
+    if (camera.restir_di_controls.x != 0u && bounce == 0u) {
+        // The finite-light RIS loop owns local-light candidates; environment
+        // and BRDF candidates are evaluated by their dedicated techniques.
+        return max(restir_di_raygen_params.rtxdiDiLocalLightSamples, 1u);
     }
     uint count = restir_mode() != 0u ? 4u : 1u;
     if (mesh_params.light_count > 65536u) {

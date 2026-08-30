@@ -25,7 +25,16 @@ layout(set = 0, binding = 5, std140) uniform DenoiserParams {
     uint debug_view;
     uint reset_history;
     uint frames_since_reset;
+    uint rtxdi_checkerboard_field;
 } params;
+
+bool rtxdi_checkerboard_pixel_active(ivec2 coords) {
+    if (params.rtxdi_checkerboard_field == 0u) {
+        return true;
+    }
+    return (uint(coords.x) & 1u) ==
+        ((uint(coords.y) + params.rtxdi_checkerboard_field) & 1u);
+}
 
 layout(set = 0, binding = 6, std430) readonly buffer WorldPosition { uvec2 world_position[]; };
 layout(set = 0, binding = 7, std430) readonly buffer PrevWorldPosition { uvec2 prev_world_position[]; };
@@ -668,6 +677,16 @@ void main() {
         mix(0.10, 0.26, specular_confidence);
     diffuse_history_weight = min(max(diffuse_history_weight, diffuse_motion_history_floor), 0.90);
     specular_history_weight = min(max(specular_history_weight, specular_motion_history_floor), 0.78);
+    if (!rtxdi_checkerboard_pixel_active(coords) && params.reset_history == 0u) {
+        // The previous frame contains the ReSTIR DI sample for this alternating
+        // field. Prefer that reprojected signal when geometry remains valid,
+        // while retaining the current full-resolution path-traced fallback on
+        // disocclusions and reactive/emissive surfaces.
+        float checkerboard_history_confidence = base_disocclusion_confidence *
+            (1.0 - reactive_mask) * motion_confidence;
+        diffuse_history_weight = max(diffuse_history_weight, checkerboard_history_confidence * 0.82);
+        specular_history_weight = max(specular_history_weight, checkerboard_history_confidence * 0.62);
+    }
     specular_history_weight = mix(
         specular_history_weight,
         max(specular_history_weight, 0.35),

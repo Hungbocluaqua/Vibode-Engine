@@ -3,14 +3,19 @@ setlocal
 
 cd /d "%~dp0"
 
-if not exist "build\Release\rtvulkan.exe" (
-    echo Release executable not found.
+set "RTV_EXE="
+for %%P in ("build\Release\rtvulkan.exe" "build-codex\Release\rtvulkan.exe" "build-rtxdi-clean\Release\rtvulkan.exe" "build-rtxdi-test\Release\rtvulkan.exe") do (
+    if not defined RTV_EXE if exist "%%~P" set "RTV_EXE=%%~P"
+)
+
+if not defined RTV_EXE (
+    echo Release executable not found in build, build-codex, or RTXDI build directories.
     echo Build it first with: cmake --build build --config Release
     pause
     exit /b 1
 )
 
-"build\Release\rtvulkan.exe" %*
+"%RTV_EXE%" %*
 set "RTV_EXIT_CODE=%ERRORLEVEL%"
 
 if not "%RTV_EXIT_CODE%"=="0" (

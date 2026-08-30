@@ -670,6 +670,8 @@ struct ProfileReport {
         uint64_t restirDiCountersBytes = 0;
         uint64_t restirDiPhysicalBytes = 0;
         uint64_t restirDiAliasSavingsBytes = 0;
+        uint64_t restirDiReservoirPixelCount = 0;
+        bool restirDiCheckerboardCompact = false;
         uint64_t restirGiCurrentBytes = 0;
         uint64_t restirGiPreviousBytes = 0;
         uint64_t restirGiSpatialBytes = 0;
@@ -681,6 +683,11 @@ struct ProfileReport {
         uint64_t restirGiCountersBytes = 0;
         uint64_t restirGiReceiverBytes = 0;
         uint64_t restirGiPreviousReceiverBytes = 0;
+        bool restirGiEffectiveHalfResolution = false;
+        uint64_t restirPtInitialBytes = 0;
+        uint64_t restirPtTemporalBytes = 0;
+        uint64_t restirPtCurrentBytes = 0;
+        uint64_t restirPtPreviousBytes = 0;
         uint64_t stagingUploadTotalBytes = 0;
         uint64_t stagingUploadPeakBytes = 0;
         uint64_t stagingUploadLastBytes = 0;

@@ -1116,9 +1116,9 @@ vec3 estimate_direct_lighting(
     vec3 lightingNormal = normalize(hit.geom_normal);
 #if RTV_REGIR_TRACE_ENABLED
     bool regirCandidateAvailable = bounce >= 2u && regir_finite_light_enabled();
-    uint risCandidateCount = regirCandidateAvailable ? 1u : direct_light_ris_candidate_count();
+    uint risCandidateCount = regirCandidateAvailable ? 1u : direct_light_ris_candidate_count(bounce);
 #else
-    uint risCandidateCount = direct_light_ris_candidate_count();
+    uint risCandidateCount = direct_light_ris_candidate_count(bounce);
 #endif
     vec3 selectedWi = vec3(0.0, 1.0, 0.0);
     vec3 selectedEmission = vec3(0.0);

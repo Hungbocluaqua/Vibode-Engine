@@ -29,6 +29,7 @@ struct RestirGIPass {
     };
 
     static constexpr uint32_t kActiveTileSize = 16u;
+    static constexpr uint32_t kReservoirBlockSize = 16u;
 
     static uint32_t reuseWidth(uint32_t renderWidth, bool halfResolution) {
         return halfResolution ? (renderWidth + 1u) / 2u : renderWidth;
@@ -36,6 +37,37 @@ struct RestirGIPass {
 
     static uint32_t reuseHeight(uint32_t renderHeight, bool halfResolution) {
         return halfResolution ? (renderHeight + 1u) / 2u : renderHeight;
+    }
+
+    static uint32_t reservoirBlockRowPitch(uint32_t renderWidth, bool halfResolution) {
+        const uint32_t width = reuseWidth(renderWidth, halfResolution);
+        const uint32_t blockColumns =
+            (width + kReservoirBlockSize - 1u) / kReservoirBlockSize;
+        return blockColumns * kReservoirBlockSize * kReservoirBlockSize;
+    }
+
+    static uint64_t reservoirStoragePixelCount(
+        uint32_t renderWidth,
+        uint32_t renderHeight,
+        bool halfResolution) {
+        const uint32_t height = reuseHeight(renderHeight, halfResolution);
+        const uint32_t blockRows =
+            (height + kReservoirBlockSize - 1u) / kReservoirBlockSize;
+        return static_cast<uint64_t>(reservoirBlockRowPitch(renderWidth, halfResolution)) * blockRows;
+    }
+
+    static uint64_t reservoirIndex(
+        uint32_t x,
+        uint32_t y,
+        uint32_t renderWidth,
+        bool halfResolution) {
+        const uint32_t blockX = x / kReservoirBlockSize;
+        const uint32_t blockY = y / kReservoirBlockSize;
+        const uint32_t inBlockX = x % kReservoirBlockSize;
+        const uint32_t inBlockY = y % kReservoirBlockSize;
+        return static_cast<uint64_t>(blockY) * reservoirBlockRowPitch(renderWidth, halfResolution) +
+            static_cast<uint64_t>(blockX) * kReservoirBlockSize * kReservoirBlockSize +
+            static_cast<uint64_t>(inBlockY) * kReservoirBlockSize + inBlockX;
     }
 
     static VkDeviceSize pixelByteSize(uint64_t pixelCount, VkDeviceSize strideBytes) {
@@ -47,9 +79,10 @@ struct RestirGIPass {
         uint32_t renderHeight,
         bool halfResolution,
         VkDeviceSize reservoirStrideBytes) {
-        return static_cast<VkDeviceSize>(reuseWidth(renderWidth, halfResolution)) *
-            static_cast<VkDeviceSize>(reuseHeight(renderHeight, halfResolution)) *
-            reservoirStrideBytes;
+        return static_cast<VkDeviceSize>(reservoirStoragePixelCount(
+            renderWidth,
+            renderHeight,
+            halfResolution)) * reservoirStrideBytes;
     }
 
     static VkDeviceSize activeTileMaskByteSize(uint32_t renderWidth, uint32_t renderHeight) {

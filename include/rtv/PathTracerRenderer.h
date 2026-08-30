@@ -672,6 +672,8 @@ public:
         VkDeviceSize diCountersBytes = 0;
         VkDeviceSize diPhysicalBytes = 0;
         VkDeviceSize diAliasSavingsBytes = 0;
+        VkDeviceSize diReservoirPixelCount = 0;
+        bool diCheckerboardCompact = false;
         VkDeviceSize giCurrentBytes = 0;
         VkDeviceSize giPreviousBytes = 0;
         VkDeviceSize giSpatialBytes = 0;
@@ -683,6 +685,11 @@ public:
         VkDeviceSize giCountersBytes = 0;
         VkDeviceSize giReceiverBytes = 0;
         VkDeviceSize giPreviousReceiverBytes = 0;
+        bool giHalfResolution = false;
+        VkDeviceSize ptInitialBytes = 0;
+        VkDeviceSize ptTemporalBytes = 0;
+        VkDeviceSize ptCurrentBytes = 0;
+        VkDeviceSize ptPreviousBytes = 0;
     };
     [[nodiscard]] RestirReservoirMemoryBreakdown restirReservoirMemoryBreakdown() const;
     [[nodiscard]] DescriptorAllocator::Stats descriptorPoolStats() const;
@@ -708,6 +715,7 @@ private:
         uint32_t debugView = 0;
         uint32_t resetHistory = 1;
         uint32_t framesSinceReset = 0;
+        uint32_t rtxdiCheckerboardField = 0;
     };
 
     struct MomentParams {
@@ -800,6 +808,7 @@ private:
         float inputPixelOffsetY = 0.0f;
         float clampingFactor = 1.3f;
         float maxRadiance = 200.0f;
+        uint32_t rtxdiCheckerboardField = 0;
     };
 
     struct RestirSpatialParams {
@@ -848,6 +857,14 @@ private:
         uint32_t environmentVersion = 0;
         uint32_t rtxdiPtEnabled = 0;
         uint32_t rtxdiPtReplayEnabled = 0;
+        uint32_t rtxdiPtMaxReservoirAge = 0;
+        uint32_t rtxdiPtMaxBounceDepth = 0;
+        uint32_t rtxdiPtMaxRcVertexLength = 0;
+        uint32_t rtxdiCheckerboardField = 0;
+        uint32_t rtxdiDiLocalLightSamples = 0;
+        uint32_t rtxdiDiBrdfSamples = 0;
+        uint32_t rtxdiDiInfiniteLightSamples = 0;
+        uint32_t rtxdiDiEnvironmentSamples = 0;
     };
 
     struct FogParams {
@@ -1250,6 +1267,7 @@ private:
     void recordRestirGiSpatialPass(VkCommandBuffer commandBuffer);
     void recordRestirGiFinalPass(VkCommandBuffer commandBuffer);
     void recordRestirGiTemporalPass(VkCommandBuffer commandBuffer);       // Phase 4
+    void recordRtxdiPtTemporalPass(VkCommandBuffer commandBuffer);
     void recordRestirGiSpatialProdPass(VkCommandBuffer commandBuffer);    // Phase 5 production
     void recordRestirGiFinalProdPass(VkCommandBuffer commandBuffer);      // Phase 6 production
     void recordRestirGiUpsamplePass(VkCommandBuffer commandBuffer);       // Phase 7
@@ -1269,7 +1287,7 @@ private:
         uint32_t width, height, frameIndex, enabled;
         uint32_t spatialRounds, halfResolution, visibilityRayBudget;
         float spatialRadius, depthThresholdScale, compatibilityThreshold;
-        float rawOutputIsCurrentSample;
+        float temporalMaxAge;
         alignas(16) glm::vec4 cameraPosition;       // offset 48
     };
     static_assert(sizeof(RestirGiSpatialProdPush) == 64, "SpatialProd push must be 64 bytes");
@@ -1436,6 +1454,7 @@ private:
     [[nodiscard]] bool shouldUseNewRestirDi() const;
     [[nodiscard]] bool shouldSkipImportedEmissiveDirectSampling() const;
     [[nodiscard]] bool shouldRunRestirDiEstimator() const;
+    [[nodiscard]] bool usesRtxdiCheckerboardReservoirs() const;
     [[nodiscard]] bool shouldRunRestirDiTemporal() const;
     [[nodiscard]] bool shouldRunRestirDiSpatial() const;
     [[nodiscard]] bool shouldRunRestirDiFinal() const;
@@ -1737,6 +1756,7 @@ private:
     Buffer restirGiCountersBuffer_;
     Buffer restirGiCountersReadbackBuffer_;
     Buffer rtxdiPtInitialReservoirBuffer_;
+    Buffer rtxdiPtTemporalReservoirBuffer_;
     Buffer rtxdiPtCurrentReservoirBuffer_;
     Buffer rtxdiPtPreviousReservoirBuffer_;
 

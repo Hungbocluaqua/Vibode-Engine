@@ -62,6 +62,14 @@ struct ResamplingConstants
     uint environmentVersion;
     uint rtxdiPtEnabled;
     uint rtxdiPtReplayEnabled;
+    uint rtxdiPtMaxReservoirAge;
+    uint rtxdiPtMaxBounceDepth;
+    uint rtxdiPtMaxRcVertexLength;
+    uint rtxdiCheckerboardField;
+    uint rtxdiDiLocalLightSamples;
+    uint rtxdiDiBrdfSamples;
+    uint rtxdiDiInfiniteLightSamples;
+    uint rtxdiDiEnvironmentSamples;
 };
 
 [[vk::binding(6, 0)]] ConstantBuffer<ResamplingConstants> g_Const;
@@ -135,6 +143,93 @@ float2 ReservoirTargetWeight(EngineReservoir reservoir)
         f16tof32(reservoir.reservoirMetadata.w >> 16u));
 }
 
+float4 DecodeUnorm4x8(uint value)
+{
+    return float4(
+        value & 0xffu,
+        (value >> 8u) & 0xffu,
+        (value >> 16u) & 0xffu,
+        (value >> 24u) & 0xffu) * (1.0f / 255.0f);
+}
+
+float3 ReceiverBaseColor(EngineReceiver receiver)
+{
+    return DecodeUnorm4x8(receiver.packedMaterialSurface.x).xyz;
+}
+
+float3 ReceiverSpecularColor(EngineReceiver receiver)
+{
+    return DecodeUnorm4x8(receiver.packedMaterialSurface.y).xyz;
+}
+
+float ReceiverMetallic(EngineReceiver receiver)
+{
+    return DecodeUnorm4x8(receiver.packedMaterialSurface.x).w;
+}
+
+float3 DecodeOctahedral(float2 encoded)
+{
+    float3 normal = float3(encoded, 1.0f - abs(encoded.x) - abs(encoded.y));
+    if (normal.z < 0.0f)
+        normal.xy = (1.0f - abs(normal.yx)) * sign(normal.xy);
+    return normalize(normal);
+}
+
+float3 ReceiverViewDirection(EngineReceiver receiver)
+{
+    const uint packed = receiver.packedMaterialSurface.w;
+    int2 value = int2(int(packed & 0xffffu), int((packed >> 16u) & 0xffffu));
+    value.x = value.x >= 32768 ? value.x - 65536 : value.x;
+    value.y = value.y >= 32768 ? value.y - 65536 : value.y;
+    return DecodeOctahedral(float2(value) / 32767.0f);
+}
+
+float3 FresnelSchlick(float cosTheta, float3 f0)
+{
+    return f0 + (1.0f - f0) * pow(1.0f - saturate(cosTheta), 5.0f);
+}
+
+float GgxDistribution(float nDotH, float alpha)
+{
+    const float a2 = alpha * alpha;
+    const float denominator = nDotH * nDotH * (a2 - 1.0f) + 1.0f;
+    return a2 / max(3.14159265359f * denominator * denominator, 1.0e-7f);
+}
+
+float SmithG1(float nDotV, float alpha)
+{
+    const float a2 = alpha * alpha;
+    return 2.0f * nDotV /
+        max(nDotV + sqrt(a2 + (1.0f - a2) * nDotV * nDotV), 1.0e-6f);
+}
+
+float EvaluateReceiverTarget(EngineReceiver receiver, float3 wi, float3 wo)
+{
+    const float3 normal = normalize(receiver.normalRoughness.xyz);
+    const float nDotL = max(dot(normal, wi), 0.0f);
+    const float nDotV = max(dot(normal, wo), 0.0f);
+    if (nDotL <= 1.0e-5f || nDotV <= 1.0e-5f)
+        return 0.0f;
+
+    const float3 halfVector = normalize(wi + wo);
+    const float nDotH = max(dot(normal, halfVector), 0.0f);
+    const float vDotH = max(dot(wo, halfVector), 0.0f);
+    const float roughness = max(saturate(receiver.normalRoughness.w), 0.045f);
+    const float alpha = roughness * roughness;
+    const float metallic = saturate(ReceiverMetallic(receiver));
+    const float3 baseColor = max(ReceiverBaseColor(receiver), 0.0f);
+    const float3 explicitSpecular = max(ReceiverSpecularColor(receiver), 0.0f);
+    const float3 f0 = max(lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic), explicitSpecular);
+    const float3 fresnel = FresnelSchlick(vDotH, f0);
+    const float distribution = GgxDistribution(nDotH, alpha);
+    const float geometry = SmithG1(nDotV, alpha) * SmithG1(nDotL, alpha);
+    const float specular = dot(max(fresnel * (distribution * geometry /
+        max(4.0f * nDotV * nDotL, 1.0e-6f)), 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+    const float diffuse = dot(max((1.0f - fresnel) * (1.0f - metallic) * baseColor, 0.0f),
+        float3(0.2126f, 0.7152f, 0.0722f)) / 3.14159265359f;
+    return max((specular + diffuse) * nDotL, 0.0f);
+}
+
 uint PackHalf2(float2 value)
 {
     const uint low = f32tof16(clamp(value.x, 0.0f, 65504.0f));
@@ -191,9 +286,21 @@ float TargetAtReceiver(
         sourceDirection = normalize(sourceToLight);
     }
 
-    const float sourceCosine = max(dot(normalize(sourceReceiver.normalRoughness.xyz), sourceDirection), 1e-4f);
-    const float targetCosine = max(dot(normalize(targetReceiver.normalRoughness.xyz), direction), 0.0f);
-    return min(sourceTarget * targetCosine / sourceCosine, sourceTarget * 16.0f);
+    const float sourceBrdf = EvaluateReceiverTarget(sourceReceiver, sourceDirection, ReceiverViewDirection(sourceReceiver));
+    const float targetBrdf = EvaluateReceiverTarget(targetReceiver, direction, ReceiverViewDirection(targetReceiver));
+    if (!(sourceBrdf > 1.0e-6f) || !(targetBrdf > 0.0f))
+        return 0.0f;
+
+    float geometryRatio = 1.0f;
+    if (kind != 2u && kind != 6u && kind != 7u)
+    {
+        const float3 sourceDelta = reservoir.samplePositionDistance.xyz - sourceReceiver.worldPositionDepth.xyz;
+        const float3 targetDelta = reservoir.samplePositionDistance.xyz - targetReceiver.worldPositionDepth.xyz;
+        geometryRatio = sqrt(max(dot(sourceDelta, sourceDelta), 1.0e-6f) /
+            max(dot(targetDelta, targetDelta), 1.0e-6f));
+    }
+
+    return min(sourceTarget * targetBrdf / sourceBrdf * geometryRatio, sourceTarget * 32.0f);
 }
 
 bool Compatible(EngineReceiver a, EngineReceiver b)
@@ -235,22 +342,54 @@ void StoreResult(
     g_SourcePixels[pixelIndex] = sourcePixel;
 }
 
-[numthreads(16, 16, 1)]
-void main(uint2 pixel : SV_DispatchThreadID)
+uint ReservoirWidth()
 {
+    return g_Const.rtxdiCheckerboardField != 0u
+        ? (g_Const.width + 1u) / 2u
+        : g_Const.width;
+}
+
+uint ReservoirIndex(uint2 fullPixel)
+{
+    if (g_Const.rtxdiCheckerboardField == 0u)
+    {
+        return fullPixel.y * g_Const.width + fullPixel.x;
+    }
+    const uint blockSize = RTXDI_RESERVOIR_BLOCK_SIZE;
+    const uint reservoirWidth = (g_Const.width + 1u) / 2u;
+    const uint widthBlocks = (reservoirWidth + blockSize - 1u) / blockSize;
+    const uint blockRowPitch = widthBlocks * blockSize * blockSize;
+    const uint2 reservoirPosition = uint2(fullPixel.x >> 1u, fullPixel.y);
+    const uint2 block = reservoirPosition / blockSize;
+    const uint2 inBlock = reservoirPosition % blockSize;
+    return block.y * blockRowPitch +
+        block.x * blockSize * blockSize + inBlock.y * blockSize + inBlock.x;
+}
+
+[numthreads(8, 8, 1)]
+void main(uint2 dispatchPixel : SV_DispatchThreadID)
+{
+    // Map the half-width checkerboard dispatch to the active full-resolution
+    // field. Reservoir/receiver arrays use RTXDI's 16x16 block-linear layout.
+    uint2 pixel = dispatchPixel;
+    if (g_Const.rtxdiCheckerboardField != 0u)
+    {
+        pixel.x = dispatchPixel.x * 2u + ((dispatchPixel.y + g_Const.rtxdiCheckerboardField) & 1u);
+    }
     if (pixel.x >= g_Const.width || pixel.y >= g_Const.height)
         return;
 
     const uint pixelIndex = pixel.y * g_Const.width + pixel.x;
-    EngineReservoir selected = g_InitialReservoirs[pixelIndex];
-    const EngineReceiver receiver = g_Receivers[pixelIndex];
+    const uint reservoirIndex = ReservoirIndex(pixel);
+    EngineReservoir selected = g_InitialReservoirs[reservoirIndex];
+    const EngineReceiver receiver = g_Receivers[reservoirIndex];
     uint selectedAge = 0u;
     uint sourcePixel = pixel.x | (pixel.y << 16u);
 
     if (g_Const.enabled == 0u || !ReservoirValid(selected) || !IsReusableSurface(receiver))
     {
-        g_OutputReservoirs[pixelIndex] = selected;
-        g_SourcePixels[pixelIndex] = sourcePixel;
+        g_OutputReservoirs[reservoirIndex] = selected;
+        g_SourcePixels[reservoirIndex] = sourcePixel;
         return;
     }
 
@@ -262,18 +401,26 @@ void main(uint2 pixel : SV_DispatchThreadID)
     if (g_Const.historyValid != 0u && g_Const.temporalMaxAge > 0u)
     {
         const float2 velocity = DecodeVelocity(g_Velocity[pixelIndex]);
-        const int2 previousPixel = int2(pixel) - int2(round(velocity));
-        if (all(previousPixel >= 0) && previousPixel.x < int(g_Const.width) && previousPixel.y < int(g_Const.height))
+        static const int2 temporalOffsets[5] = {
+            int2(0, 0), int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1)
+        };
+        [unroll]
+        for (uint temporalSample = 0u; temporalSample < 5u; ++temporalSample)
         {
-            const uint previousIndex = uint(previousPixel.y) * g_Const.width + uint(previousPixel.x);
+            const int2 previousPixel = int2(pixel) - int2(round(velocity)) + temporalOffsets[temporalSample];
+            if (any(previousPixel < 0) || previousPixel.x >= int(g_Const.width) || previousPixel.y >= int(g_Const.height))
+                continue;
+            const uint previousIndex = ReservoirIndex(uint2(previousPixel));
             const EngineReservoir previous = g_PreviousReservoirs[previousIndex];
             const EngineReceiver previousReceiver = g_PreviousReceivers[previousIndex];
             if (ReservoirValid(previous) && ReservoirAge(previous) < g_Const.temporalMaxAge && Compatible(receiver, previousReceiver))
             {
                 const float shiftedTarget = TargetAtReceiver(previous, previousReceiver, receiver);
+                if (!(shiftedTarget > 0.0f))
+                    continue;
                 RTXDI_DIReservoir temporal = ToRtxdi(previous, shiftedTarget);
                 const bool choseTemporal = RTXDI_CombineDIReservoirs(
-                    merged, temporal, Random01(pixel, 1u), shiftedTarget);
+                    merged, temporal, Random01(pixel, 1u + temporalSample), shiftedTarget);
                 representedM += temporal.M;
                 if (choseTemporal)
                 {
@@ -302,7 +449,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
         if (any(neighborPixel < 0) || neighborPixel.x >= int(g_Const.width) || neighborPixel.y >= int(g_Const.height))
             continue;
 
-        const uint neighborIndex = uint(neighborPixel.y) * g_Const.width + uint(neighborPixel.x);
+        const uint neighborIndex = ReservoirIndex(uint2(neighborPixel));
         const EngineReceiver neighborReceiver = g_Receivers[neighborIndex];
         const EngineReservoir neighbor = g_InitialReservoirs[neighborIndex];
         if (!ReservoirValid(neighbor) || !Compatible(receiver, neighborReceiver))
@@ -323,5 +470,5 @@ void main(uint2 pixel : SV_DispatchThreadID)
 
     merged.M = min(representedM, float(max(g_Const.spatialMaxM, 1u)));
     RTXDI_FinalizeResampling(merged, 1.0f, max(merged.M, 1.0f));
-    StoreResult(pixelIndex, selected, merged, selectedAge, sourcePixel);
+    StoreResult(reservoirIndex, selected, merged, selectedAge, sourcePixel);
 }

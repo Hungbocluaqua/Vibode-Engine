@@ -4,6 +4,7 @@
 #include "rtv/RenderGraph.h"
 #include "rtv/RtxdiRuntime.h"
 #include "rtv/passes/RestirGIPass.h"
+#include "rtv/passes/RestirDIPass.h"
 
 #include <Volk/volk.h>
 
@@ -128,6 +129,20 @@ bool testRestirGiHalfResolutionUpsampleContract(std::ostream& output) {
         !passes::RestirGIPass::requestsUpsample(settings, false, true),
         "disabled GI does not request upsample",
         output);
+    ok &= check(
+        passes::RestirGIPass::reservoirBlockRowPitch(17u, false) == 512u &&
+            passes::RestirGIPass::reservoirStoragePixelCount(17u, 17u, false) == 1024u &&
+            passes::RestirGIPass::reservoirIndex(16u, 16u, 17u, false) == 768u,
+        "full-resolution GI reservoirs use RTXDI 16x16 block-linear addressing",
+        output);
+    ok &= check(
+        passes::RestirGIPass::reuseWidth(33u, true) == 17u &&
+            passes::RestirGIPass::reuseHeight(17u, true) == 9u &&
+            passes::RestirGIPass::reservoirBlockRowPitch(33u, true) == 512u &&
+            passes::RestirGIPass::reservoirStoragePixelCount(33u, 17u, true) == 512u &&
+            passes::RestirGIPass::reservoirIndex(16u, 8u, 33u, true) == 384u,
+        "half-resolution GI reservoirs preserve RTXDI block rows over the reuse extent",
+        output);
     return ok;
 }
 
@@ -151,6 +166,7 @@ bool testRtxdiMediumRuntimeContract(std::ostream& output) {
     const auto ptInitial = pt.GetInitialSamplingParameters();
     const auto ptTemporal = pt.GetTemporalResamplingParameters();
     const auto ptSpatial = pt.GetSpatialResamplingParameters();
+    const auto runtimeParameters = runtime.runtimeParameters();
     const auto memory = runtime.memoryRequirements();
 
     bool ok = true;
@@ -162,6 +178,14 @@ bool testRtxdiMediumRuntimeContract(std::ostream& output) {
     ok &= check(initial.numLocalLightSamples == 8u, "RTXDI medium preset uses eight local-light candidates", output);
     ok &= check(initial.numBrdfSamples == 1u, "RTXDI medium preset uses one BRDF candidate", output);
     ok &= check(
+        runtimeParameters.diLocalLightSamples == initial.numLocalLightSamples &&
+            runtimeParameters.diBrdfSamples == initial.numBrdfSamples &&
+            runtimeParameters.diTemporalHistoryLength == temporal.maxHistoryLength &&
+            runtimeParameters.diReservoirBlockRowPitch == di.GetReservoirBufferParameters().reservoirBlockRowPitch &&
+            runtimeParameters.diReservoirArrayPitch == di.GetReservoirBufferParameters().reservoirArrayPitch,
+        "RTXDI initial and temporal parameters are exported to the renderer bridge",
+        output);
+    ok &= check(
         temporal.biasCorrectionMode == ReSTIRDI_TemporalBiasCorrectionMode::Raytraced,
         "RTXDI medium preset uses ray-traced temporal correction",
         output);
@@ -171,14 +195,23 @@ bool testRtxdiMediumRuntimeContract(std::ostream& output) {
         output);
     ok &= check(
         gi.GetResamplingMode() == rtxdi::ReSTIRGI_ResamplingMode::TemporalAndSpatial &&
-            giTemporal.maxHistoryLength == 16u && giSpatial.numSamples == 2u,
+            giTemporal.maxHistoryLength == 16u && giSpatial.numSamples == 2u &&
+            runtimeParameters.giReservoirBlockRowPitch == gi.GetReservoirBufferParameters().reservoirBlockRowPitch &&
+            runtimeParameters.giReservoirArrayPitch == gi.GetReservoirBufferParameters().reservoirArrayPitch,
         "RTXDI medium preset configures GI temporal and spatial reuse",
         output);
     ok &= check(
         pt.GetResamplingMode() == rtxdi::ReSTIRPT_ResamplingMode::TemporalAndSpatial &&
             ptInitial.maxBounceDepth == 5u && ptTemporal.maxHistoryLength == 16u &&
-            ptSpatial.numSpatialSamples == 2u,
+            ptSpatial.numSpatialSamples == 2u &&
+            runtimeParameters.ptReservoirBlockRowPitch == pt.GetReservoirBufferParameters().reservoirBlockRowPitch &&
+            runtimeParameters.ptReservoirArrayPitch == pt.GetReservoirBufferParameters().reservoirArrayPitch,
         "RTXDI medium preset configures ReSTIR PT reuse",
+        output);
+    ok &= check(
+        runtimeParameters.ptMaxBounceDepth == ptInitial.maxBounceDepth &&
+            runtimeParameters.ptMaxRcVertexLength == pt.GetHybridShiftParameters().maxRcVertexLength,
+        "RTXDI PT replay limits are exported to ray generation",
         output);
     ok &= check(memory.diReservoirBytes > 0u, "RTXDI DI memory is reported", output);
     ok &= check(memory.giReservoirBytes > 0u, "RTXDI GI memory is reported", output);
@@ -186,6 +219,52 @@ bool testRtxdiMediumRuntimeContract(std::ostream& output) {
     ok &= check(
         memory.totalReservoirBytes == memory.diReservoirBytes + memory.giReservoirBytes + memory.ptReservoirBytes,
         "RTXDI memory total matches its components",
+        output);
+    return ok;
+}
+
+bool testRtxdiCheckerboardAddressingContract(std::ostream& output) {
+    bool ok = true;
+    constexpr uint32_t width = 7u;
+    constexpr uint32_t height = 3u;
+    ok &= check(
+        passes::RestirDIPass::checkerboardReservoirWidth(width, 0u) == width,
+        "full-resolution DI reservoir width is preserved when checkerboard is disabled",
+        output);
+    ok &= check(
+        passes::RestirDIPass::checkerboardReservoirWidth(width, 1u) == 4u,
+        "checkerboard DI reservoir width rounds odd dimensions up",
+        output);
+    ok &= check(
+        passes::RestirDIPass::reservoirPixelCount(width, height, 2u) == 12u,
+        "checkerboard DI logical reservoir count uses half-width rows",
+        output);
+    ok &= check(
+        passes::RestirDIPass::reservoirBlockRowPitch(width, 1u) == 256u &&
+            passes::RestirDIPass::reservoirStoragePixelCount(width, height, 1u) == 256u,
+        "checkerboard DI allocation follows RTXDI 16x16 tiled pitches",
+        output);
+    ok &= check(
+        passes::RestirDIPass::reservoirIndex(6u, 2u, width, 1u) == 35u,
+        "checkerboard DI reservoir index follows RTXDI block-linear addressing",
+        output);
+    ok &= check(
+        passes::RestirDIPass::reservoirIndex(6u, 2u, width, 0u) == 20u,
+        "non-checkerboard DI reservoir index remains linear full resolution",
+        output);
+
+    RtxdiRuntime runtime({
+        .renderWidth = width,
+        .renderHeight = height,
+        .qualityPreset = RtxdiQualityPreset::Medium,
+        .checkerboard = true,
+    });
+    runtime.beginFrame(7u);
+    const auto runtimeParameters = runtime.runtimeParameters();
+    ok &= check(
+        runtimeParameters.activeCheckerboardField == 1u ||
+            runtimeParameters.activeCheckerboardField == 2u,
+        "RTXDI runtime selects an active checkerboard field",
         output);
     return ok;
 }
@@ -218,6 +297,7 @@ int runRendererCoreRegressionTests(std::ostream& output) {
         testRenderGraphReaderOrdering(output) &&
         testRestirGiHalfResolutionUpsampleContract(output) &&
         testRtxdiMediumRuntimeContract(output) &&
+        testRtxdiCheckerboardAddressingContract(output) &&
         testRtxdiSettingsContract(output);
     output << (ok ? "Renderer core regression tests passed.\n" : "Renderer core regression tests failed.\n");
     return ok ? 0 : 1;

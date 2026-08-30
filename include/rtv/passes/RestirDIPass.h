@@ -287,6 +287,60 @@ struct RestirDIPass {
         return pixelCount * strideBytes;
     }
 
+    // RTXDI stores checkerboard reservoirs at half horizontal resolution.
+    static constexpr uint32_t kRtxdiReservoirBlockSize = 16u;
+
+    static constexpr uint32_t checkerboardReservoirWidth(uint32_t fullWidth, uint32_t checkerboardField) {
+        return checkerboardField == 0u ? fullWidth : (fullWidth + 1u) / 2u;
+    }
+
+    static constexpr VkDeviceSize reservoirPixelCount(
+        uint32_t fullWidth,
+        uint32_t fullHeight,
+        uint32_t checkerboardField) {
+        return static_cast<VkDeviceSize>(checkerboardReservoirWidth(fullWidth, checkerboardField)) * fullHeight;
+    }
+
+    static constexpr uint32_t reservoirBlockRowPitch(uint32_t fullWidth, uint32_t checkerboardField) {
+        if (checkerboardField == 0u) {
+            return fullWidth;
+        }
+        const uint32_t reservoirWidth = checkerboardReservoirWidth(fullWidth, checkerboardField);
+        const uint32_t widthBlocks =
+            (reservoirWidth + kRtxdiReservoirBlockSize - 1u) / kRtxdiReservoirBlockSize;
+        return widthBlocks * kRtxdiReservoirBlockSize * kRtxdiReservoirBlockSize;
+    }
+
+    static constexpr VkDeviceSize reservoirStoragePixelCount(
+        uint32_t fullWidth,
+        uint32_t fullHeight,
+        uint32_t checkerboardField) {
+        if (checkerboardField == 0u) {
+            return static_cast<VkDeviceSize>(fullWidth) * fullHeight;
+        }
+        const uint32_t heightBlocks =
+            (fullHeight + kRtxdiReservoirBlockSize - 1u) / kRtxdiReservoirBlockSize;
+        return static_cast<VkDeviceSize>(reservoirBlockRowPitch(fullWidth, checkerboardField)) * heightBlocks;
+    }
+
+    static constexpr uint32_t reservoirIndex(
+        uint32_t pixelX,
+        uint32_t pixelY,
+        uint32_t fullWidth,
+        uint32_t checkerboardField) {
+        if (checkerboardField == 0u) {
+            return pixelY * fullWidth + pixelX;
+        }
+        const uint32_t reservoirX = pixelX >> 1u;
+        const uint32_t blockX = reservoirX / kRtxdiReservoirBlockSize;
+        const uint32_t blockY = pixelY / kRtxdiReservoirBlockSize;
+        const uint32_t inBlockX = reservoirX % kRtxdiReservoirBlockSize;
+        const uint32_t inBlockY = pixelY % kRtxdiReservoirBlockSize;
+        return blockY * reservoirBlockRowPitch(fullWidth, checkerboardField) +
+            blockX * kRtxdiReservoirBlockSize * kRtxdiReservoirBlockSize +
+            inBlockY * kRtxdiReservoirBlockSize + inBlockX;
+    }
+
     static constexpr VkDeviceSize receiverByteSize(VkDeviceSize pixelCount, RestirDiReservoirLayout layout) {
         return pixelByteSize(pixelCount, receiverStride(layout));
     }

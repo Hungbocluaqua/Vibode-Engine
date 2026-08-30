@@ -47,7 +47,16 @@ layout(set = 0, binding = 5, std140) uniform TaaParams {
     float input_pixel_offset_y;
     float clamping_factor;
     float max_radiance;
+    uint rtxdi_checkerboard_field;
 } params;
+
+bool rtxdi_checkerboard_pixel_active(ivec2 coords) {
+    if (params.rtxdi_checkerboard_field == 0u) {
+        return true;
+    }
+    return (uint(coords.x) & 1u) ==
+        ((uint(coords.y) + params.rtxdi_checkerboard_field) & 1u);
+}
 
 float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
@@ -281,6 +290,13 @@ vec3 resolve_taa_pixel(ivec2 coords, ivec2 displayDims, ivec2 renderDims, out fl
             blendWeight,
             max(motion * params.motion_feedback,
                 reactiveCurrentWeight)), 0.0, 1.0);
+        if (!rtxdi_checkerboard_pixel_active(renderCoords)) {
+            // Alternating checkerboard pixels have their higher-quality DI
+            // estimate in the previous frame. Prevent noise-driven reactivity
+            // from replacing that stable history on otherwise static surfaces.
+            float checkerboardCurrentCap = mix(0.18, 0.68, max(motionWeight, adaptiveReactive));
+            blendWeight = min(blendWeight, checkerboardCurrentCap);
+        }
         sharpenAmount = params.camera_moving != 0u
             ? 0.0
             : params.sharpen_strength * (1.0 - clamp(max(motion, adaptiveReactive), 0.0, 1.0) * 0.65);

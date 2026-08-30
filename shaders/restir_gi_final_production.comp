@@ -196,10 +196,11 @@ vec3 evaluate_final(
     record_prod_parity_violation(reservoir, sourceTarget, distance);
     float shiftedWeight = prod_shifted_reservoir_weight(
         reservoir, sourceTarget, prod_unpack_target(reservoir));
-    if (!restir_gi_finite(shiftedWeight) || shiftedWeight <= 0.0) {
+    if (!restir_gi_finite(shiftedWeight)) {
         GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_NON_FINITE], 1u);
         return vec3(0.0);
     }
+    if (shiftedWeight <= 0.0) return vec3(0.0);
     reservoir.reservoirData.x = shiftedWeight;
 
     uint flags = prod_unpack_flags(reservoir);
@@ -271,13 +272,16 @@ void main() {
 
     uint pixelIndex = uint(pixel.y) * pc.width + uint(pixel.x);
     uint halfWidth = (pc.width + 1u) / 2u;
-    uint currentIndex = pc.halfResolution != 0u
-        ? uint(pixel.y / 2) * halfWidth + uint(pixel.x / 2) : pixelIndex;
+    ivec2 currentPixel = pc.halfResolution != 0u ? pixel / 2 : pixel;
+    uint currentIndex = restir_gi_reservoir_index(
+        currentPixel,
+        pc.halfResolution != 0u ? halfWidth : pc.width);
+    uint spatialIndex = restir_gi_reservoir_index(pixel, pc.width);
     RestirGiReceiver receiver = receivers[pixelIndex];
     GI_COUNTER_ADD(restir_gi_counters[GI_COUNTER_FINAL_PIXELS], 1u);
 
     ProdRestirGiReservoir current = current_reservoirs[currentIndex];
-    ProdRestirGiReservoir spatial = spatial_reservoirs[pixelIndex];
+    ProdRestirGiReservoir spatial = spatial_reservoirs[spatialIndex];
     bool useSpatial = prod_reservoir_reusable(spatial);
     ProdRestirGiReservoir selected = useSpatial ? spatial : current;
     if (!debugGi && pc.referenceValidation == 0u &&

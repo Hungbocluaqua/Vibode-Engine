@@ -63,7 +63,7 @@ struct SpatialConstants
     float spatialRadius;
     float depthThresholdScale;
     float compatibilityThreshold;
-    float rawOutputIsCurrentSample;
+    float temporalMaxAge;
     float4 cameraPosition;
 };
 
@@ -334,6 +334,19 @@ bool ActiveTileContains(uint2 fullPixel)
     return g_ActiveTileMask[tileIndex] != 0u;
 }
 
+static const uint kReservoirBlockSize = 16u;
+
+uint ReservoirIndex(uint2 pixel, uint width)
+{
+    const uint2 block = pixel / kReservoirBlockSize;
+    const uint2 inBlock = pixel % kReservoirBlockSize;
+    const uint blockRowPitch =
+        ((width + kReservoirBlockSize - 1u) / kReservoirBlockSize) *
+        kReservoirBlockSize * kReservoirBlockSize;
+    return block.y * blockRowPitch + block.x * kReservoirBlockSize * kReservoirBlockSize +
+        inBlock.y * kReservoirBlockSize + inBlock.x;
+}
+
 void StoreFinal(
     uint pixelIndex,
     EngineGiReservoir selected,
@@ -361,7 +374,7 @@ void StoreFinal(
     g_SpatialReservoirs[pixelIndex] = selected;
 }
 
-[numthreads(16, 16, 1)]
+[numthreads(8, 8, 1)]
 void main(uint2 pixel : SV_DispatchThreadID)
 {
     const uint outputWidth = g_Const.halfResolution != 0u ? (g_Const.width + 1u) / 2u : g_Const.width;
@@ -370,15 +383,17 @@ void main(uint2 pixel : SV_DispatchThreadID)
         return;
 
     const uint pixelIndex = pixel.y * outputWidth + pixel.x;
-    EngineGiReservoir selected = g_TemporalReservoirs[pixelIndex];
+    const uint reservoirIndex = ReservoirIndex(pixel, outputWidth);
+    EngineGiReservoir selected = g_TemporalReservoirs[reservoirIndex];
     const uint2 fullPixel = RepresentativeFullPixel(pixel);
     const uint fullPixelIndex = fullPixel.y * g_Const.width + fullPixel.x;
+    const uint ptReservoirIndex = ReservoirIndex(fullPixel, g_Const.width);
     const bool pathSpaceResampling = (g_Const.enabled & kEnablePathSpaceResampling) != 0u;
     if (!ActiveTileContains(fullPixel))
     {
-        g_SpatialReservoirs[pixelIndex] = selected;
+        g_SpatialReservoirs[reservoirIndex] = selected;
         if (pathSpaceResampling)
-            g_CurrentPtReservoirs[fullPixelIndex] = g_InitialPtReservoirs[fullPixelIndex];
+            g_CurrentPtReservoirs[ptReservoirIndex] = g_InitialPtReservoirs[ptReservoirIndex];
         return;
     }
     CounterAdd(kCounterSpatialPixels, 1u);
@@ -388,9 +403,9 @@ void main(uint2 pixel : SV_DispatchThreadID)
     {
         if (!ReservoirReusable(selected))
             CounterAdd(kCounterCenterCurrentOnly, 1u);
-        g_SpatialReservoirs[pixelIndex] = selected;
+        g_SpatialReservoirs[reservoirIndex] = selected;
         if (pathSpaceResampling)
-            g_CurrentPtReservoirs[fullPixelIndex] = g_InitialPtReservoirs[fullPixelIndex];
+            g_CurrentPtReservoirs[ptReservoirIndex] = g_InitialPtReservoirs[ptReservoirIndex];
         return;
     }
 
@@ -398,7 +413,7 @@ void main(uint2 pixel : SV_DispatchThreadID)
     RTXDI_PTReservoir mergedPt = RTXDI_EmptyPTReservoir();
     if (pathSpaceResampling)
     {
-        RTXDI_PTReservoir currentPt = RTXDI_UnpackPTReservoir(g_InitialPtReservoirs[fullPixelIndex]);
+        RTXDI_PTReservoir currentPt = RTXDI_UnpackPTReservoir(g_InitialPtReservoirs[ptReservoirIndex]);
         if (!RTXDI_IsValidPTReservoir(currentPt) || !isfinite(currentPt.WeightSum))
             currentPt = ToRtxdiPt(selected, ReservoirTarget(selected));
         CombineReservoirs(
@@ -412,13 +427,17 @@ void main(uint2 pixel : SV_DispatchThreadID)
                 previousFullPixel.y < int(g_Const.height))
             {
                 const uint previousFullIndex = uint(previousFullPixel.y) * g_Const.width + uint(previousFullPixel.x);
-                const uint previousReuseIndex = g_Const.halfResolution != 0u
-                    ? uint(previousFullPixel.y / 2) * outputWidth + uint(previousFullPixel.x / 2)
-                    : previousFullIndex;
+                const uint previousPtReservoirIndex =
+                    ReservoirIndex(uint2(previousFullPixel), g_Const.width);
+                const uint2 previousReusePixel = g_Const.halfResolution != 0u
+                    ? uint2(previousFullPixel) / 2u
+                    : uint2(previousFullPixel);
+                const uint previousReuseIndex = ReservoirIndex(previousReusePixel, outputWidth);
                 EngineGiReservoir previousEngine = g_PreviousEngineReservoirs[previousReuseIndex];
-                RTXDI_PTReservoir previousPt = RTXDI_UnpackPTReservoir(g_PreviousPtReservoirs[previousFullIndex]);
+                RTXDI_PTReservoir previousPt =
+                    RTXDI_UnpackPTReservoir(g_PreviousPtReservoirs[previousPtReservoirIndex]);
                 const EngineGiReceiver previousReceiver = g_PreviousReceivers[previousFullIndex];
-                const uint maxAge = max(uint(round(g_Const.rawOutputIsCurrentSample)), 1u);
+                const uint maxAge = max(uint(round(g_Const.temporalMaxAge)), 1u);
                 if (RTXDI_IsValidPTReservoir(previousPt) && previousPt.Age < maxAge &&
                     ReservoirReusable(previousEngine) && ReceiversCompatible(center, previousReceiver))
                 {
@@ -458,8 +477,9 @@ void main(uint2 pixel : SV_DispatchThreadID)
             const int2 offset = int2(round(float2(cos(angle), sin(angle)) * radius));
             const int2 neighborPixel = clamp(int2(pixel) + offset, int2(0, 0),
                 int2(int(outputWidth) - 1, int(outputHeight) - 1));
-            const uint neighborIndex = uint(neighborPixel.y) * outputWidth + uint(neighborPixel.x);
-            if (neighborIndex == pixelIndex)
+            const uint neighborLinearIndex = uint(neighborPixel.y) * outputWidth + uint(neighborPixel.x);
+            const uint neighborIndex = ReservoirIndex(uint2(neighborPixel), outputWidth);
+            if (neighborLinearIndex == pixelIndex)
                 continue;
             CounterAdd(kCounterNeighborsTested, 1u);
 
@@ -492,13 +512,19 @@ void main(uint2 pixel : SV_DispatchThreadID)
             bool selectedCandidate = false;
             if (pathSpaceResampling)
             {
-                const uint neighborFullIndex = neighborFullPixel.y * g_Const.width + neighborFullPixel.x;
-                RTXDI_PTReservoir neighborReservoir = RTXDI_UnpackPTReservoir(g_InitialPtReservoirs[neighborFullIndex]);
+                const uint neighborPtReservoirIndex = ReservoirIndex(neighborFullPixel, g_Const.width);
+                RTXDI_PTReservoir neighborReservoir =
+                    RTXDI_UnpackPTReservoir(g_InitialPtReservoirs[neighborPtReservoirIndex]);
                 if (!RTXDI_IsValidPTReservoir(neighborReservoir))
                     neighborReservoir = ToRtxdiPt(candidate, sourceTarget);
-                if (!isfinite(neighborReservoir.WeightSum) || neighborReservoir.WeightSum <= 0.0f)
+                if (!isfinite(neighborReservoir.WeightSum))
                 {
                     CounterAdd(kCounterNonFinite, 1u);
+                    continue;
+                }
+                if (neighborReservoir.WeightSum <= 0.0f)
+                {
+                    CounterAdd(kCounterRejectedInvalid, 1u);
                     continue;
                 }
                 selectedCandidate = CombineReservoirs(
@@ -510,9 +536,14 @@ void main(uint2 pixel : SV_DispatchThreadID)
             else
             {
                 RTXDI_GIReservoir neighborReservoir = ToRtxdi(candidate, sourceTarget);
-                if (!isfinite(neighborReservoir.weightSum) || neighborReservoir.weightSum <= 0.0f)
+                if (!isfinite(neighborReservoir.weightSum))
                 {
                     CounterAdd(kCounterNonFinite, 1u);
+                    continue;
+                }
+                if (neighborReservoir.weightSum <= 0.0f)
+                {
+                    CounterAdd(kCounterRejectedTarget, 1u);
                     continue;
                 }
                 selectedCandidate = RTXDI_CombineGIReservoirs(
@@ -541,8 +572,8 @@ void main(uint2 pixel : SV_DispatchThreadID)
             mergedPt,
             1.0f,
             max(mergedPt.M, 1.0f) * max(selectedTarget, 1.0e-10f));
-        g_CurrentPtReservoirs[fullPixelIndex] = RTXDI_PackPTReservoir(mergedPt);
-        StoreFinal(pixelIndex, selected, mergedPt.WeightSum, mergedPt.M);
+        g_CurrentPtReservoirs[ptReservoirIndex] = RTXDI_PackPTReservoir(mergedPt);
+        StoreFinal(reservoirIndex, selected, mergedPt.WeightSum, mergedPt.M);
     }
     else
     {
@@ -550,6 +581,6 @@ void main(uint2 pixel : SV_DispatchThreadID)
             merged,
             1.0f,
             float(max(merged.M, 1u)) * max(selectedTarget, 1.0e-10f));
-        StoreFinal(pixelIndex, selected, merged.weightSum, float(merged.M));
+        StoreFinal(reservoirIndex, selected, merged.weightSum, float(merged.M));
     }
 }
